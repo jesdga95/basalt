@@ -7,8 +7,7 @@
 
 > **Native Windows x64 support** lives in this tree: the same engine, kernels and precision rules, plus a platform
 > layer for MSVC and CUDA 13. Build steps, the test recipe and the platform caveats are in
-> **[docs/WINDOWS.md](docs/WINDOWS.md)**; the pre-port audit that mapped every Linux-only call site is at
-> **[WINDOWS-PORT-AUDIT.md](WINDOWS-PORT-AUDIT.md)**. Every Windows change sits behind `#if defined(_WIN32)` /
+> **[docs/WINDOWS.md](docs/WINDOWS.md)**. Every Windows change sits behind `#if defined(_WIN32)` /
 > `if(WIN32)` guards: the Linux code path is unchanged.
 
 Basalt is a local inference engine for the **Qwen3.8-Flash-Next** mixture-of-experts model. It targets one thing: an

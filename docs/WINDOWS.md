@@ -135,8 +135,11 @@ pretending otherwise:
 
 ## Compiler notes worth knowing
 
-Four things about MSVC cost real time and are worth recording:
+The MSVC behaviour that differs from the GCC build, and what the port does about it:
 
+- `windows.h` defines `min`/`max` macros that break `std::min`/`std::max` in every file that
+  includes it, so every inclusion in this tree defines `NOMINMAX` first, including the widely
+  included headers before they pull Win32 types in.
 - `/arch:AVX2` defines `__AVX__` and `__AVX2__` but **not** `__F16C__`; `/arch:AVX512` adds
   `F`/`BW`/`VL`/`DQ` but not `F16C`, `VNNI` or `VBMI` - although the intrinsics for all of those
   compile anyway. The sources that branch on those macros therefore silently take the scalar path
