@@ -259,6 +259,25 @@ bool clear_error() { (void) cudaGetLastError(); return true; }
 
 
 namespace {
+#if defined(_WIN32)
+// How much of the arena the sliced registration may pin on Windows.  Page-locked memory that the GPU maps is charged
+// to the device's shared (non-local) segment, which is about half of installed RAM; pinned slice by slice until the
+// driver refuses one, that segment is left full and every later device allocation fails "out of memory".  The slice
+// loop stops at the segment's budget instead of at the refusal, keeping room for what the engine allocates after the
+// arena.  The exact budget needs a graphics query the engine does not make, so it comes from the RAM reading.
+// False when the OS gives no RAM reading, which leaves the limit to the driver.
+bool sliced_pin_limit(uint64_t& limit, std::string& why) {
+    constexpr uint64_t GiB = 1ull << 30;
+    const uint64_t ram = basalt::platform::total_physical_memory();
+    if (ram == 0) return false;
+    limit = ram / 2 > 8 * GiB ? ram / 2 - 8 * GiB : 0;
+    char buf[192];
+    std::snprintf(buf, sizeof buf, "the GPU's shared-memory budget, RAM/2 - 8 GiB of %.1f GiB RAM",
+                  (double) ram / (double) GiB);
+    why = buf;
+    return true;
+}
+#endif
 }  // namespace
 
 namespace {
@@ -303,6 +322,19 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             bool limited = capped;
             uint64_t limit = cap;
             std::string limit_why;
+#if defined(_WIN32)
+            // Stop below the shared-memory budget rather than at the driver's refusal, and only when the budget is
+            // actually smaller than the arena: an arena the segment can hold is pinned whole, as before.
+            if (!capped) {
+                uint64_t seg = 0;
+                std::string seg_why;
+                if (sliced_pin_limit(seg, seg_why) && seg < bytes) {
+                    limited = true;
+                    limit = seg;
+                    limit_why = std::move(seg_why);
+                }
+            }
+#endif
             for (size_t i = 0; i + 1 < bounds.size(); ++i) {
                 const uint64_t off = bounds[i], n = bounds[i + 1] - bounds[i];
                 if (limited && (off > limit || n > limit - off)) break;
