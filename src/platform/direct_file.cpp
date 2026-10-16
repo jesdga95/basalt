@@ -143,7 +143,7 @@ struct DirectFile::Impl {
                 if (inflight == 0) return;
             }
             DWORD bytes = 0;
-            ULONG key = 0;
+            ULONG_PTR key = 0;
             OVERLAPPED* ov = nullptr;
             if (!GetQueuedCompletionStatus(port, &bytes, &key, &ov, INFINITE)) return;
             if (ov == nullptr) continue;   // a posted wake or nudge: it carries no request
