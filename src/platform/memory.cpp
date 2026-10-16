@@ -245,11 +245,46 @@ bool ram_guard_low(uint64_t* avail, uint64_t* floor) {
 }
 
 #if defined(_WIN32)
-// Nothing to ask of the cache manager: the reads that want pages ahead are unbuffered overlapped reads that already
-// run several deep, and a mapped file's pages arrive through the same queue.
-bool read_ahead_enabled() { return false; }
-void advise_willneed(const void*, uint64_t) {}
-void advise_willneed(int, uint64_t, uint64_t) {}
+namespace {
+constexpr uint64_t kPrefetchStep = 128ull << 10;
+
+/// The page size, so a prefetch window starts on a page boundary.
+uintptr_t page_bytes() {
+    static const uintptr_t ps = [] {
+        SYSTEM_INFO si{};
+        GetSystemInfo(&si);
+        return si.dwPageSize > 0 ? (uintptr_t) si.dwPageSize : (uintptr_t) 4096;
+    }();
+    return ps;
+}
+}  // namespace
+
+bool read_ahead_enabled() { return true; }
+
+void advise_willneed(const void* p, uint64_t bytes) {
+    if (p == nullptr || bytes == 0 || !read_ahead_enabled()) return;
+    // A view of a file mapping takes its pages one fault at a time as they are touched, so asking for the range
+    // ahead of the access replaces those faults with large background reads.  The hint is best effort: a range the
+    // system will not serve is skipped without an error, and pages already in memory cost nothing.  The range is
+    // asked for in bounded windows, which keeps the reads in flight - and the memory they hold - bounded instead of
+    // asking for a whole layer at once.
+    const uintptr_t pg = page_bytes(), end = (uintptr_t) p + bytes;
+    for (uintptr_t a = (uintptr_t) p & ~(pg - 1); a < end; a += kPrefetchStep) {
+        WIN32_MEMORY_RANGE_ENTRY entry{};
+        entry.VirtualAddress = (PVOID) a;
+        entry.NumberOfBytes = (SIZE_T) std::min<uintptr_t>(kPrefetchStep, end - a);
+        (void) PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+    }
+}
+
+void advise_willneed(int fd, uint64_t offset, uint64_t bytes) {
+    // No descriptor-range hint on Windows: the cache manager takes no "will need" for an open handle.  Reads through
+    // a descriptor are cached reads unless the caller opted out of the cache, and the cache manager already reads
+    // ahead around the position a sequential reader is at.  Warming a range by reading it into a scratch buffer
+    // would move the bytes twice and cost the file cache the room, so nothing is asked.  A caller holding a mapped
+    // view of the same file gets the prefetch from the overload above.
+    (void) fd; (void) offset; (void) bytes;
+}
 #else
 namespace {
 constexpr uint64_t kAdviseStep = 128ull << 10;

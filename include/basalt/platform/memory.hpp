@@ -107,12 +107,17 @@ inline bool file_cache_keeps(uint64_t avail, uint64_t arena_bytes, uint64_t read
     return room >= read_bytes;
 }
 
-/// Whether `advise_willneed` asks the OS for anything.
+/// Whether `advise_willneed` asks the OS for anything: it does on both platforms.
 bool read_ahead_enabled();
-/// Asks the OS to start reading [p, p + bytes) of a file mapping, without waiting.  The kernel reads at most one
-/// readahead window per request, so the range is asked for in 128 KiB steps.
+/// Asks the OS to start bringing [p, p + bytes) of a mapped file view into memory, without waiting for the access.
+/// A hint, never an error: the system skips what it will not prefetch and says nothing about it, and without the
+/// hint the pages still arrive - one fault at a time, where they are touched.  The range is asked for in 128 KiB
+/// windows, which keeps the reads in flight bounded.  Only a mapped view is reached this way.
 void advise_willneed(const void* p, uint64_t bytes);
-/// The same for [offset, offset + bytes) of an open file.
+/// The same for [offset, offset + bytes) of an open descriptor.  Linux asks its page cache.  Windows asks nothing:
+/// the cache manager takes no range hint for a handle, and a read through a descriptor is a cached read unless the
+/// caller opted out of that cache - which already reads ahead around a sequential reader.  Bytes reached only
+/// through a descriptor are therefore warmed as they are read, not ahead of it.
 void advise_willneed(int fd, uint64_t offset, uint64_t bytes);
 
 }  // namespace basalt::platform
