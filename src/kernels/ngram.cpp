@@ -6,6 +6,7 @@
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/ngram/ple_reader.hpp"
+#include "basalt/platform/memory.hpp"
 
 #include <cerrno>
 #include <cmath>
@@ -237,14 +238,15 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         const uintptr_t a0 = (uintptr_t) impl_->data & ~(uintptr_t) (page - 1);
         const uintptr_t a1 = (uintptr_t) impl_->data + (uintptr_t) need;
 #if defined(_WIN32)
-        // A view of a file mapping is not the same kind of memory as a private allocation, so the lock can fail
-        // here even with the working-set room raised; touching the pages then gets them resident, which is what
-        // the decode path needs.
-        if (VirtualLock((void*) a0, a1 - a0)) {
-            impl_->locked = true;
-        } else {
-            std::fprintf(stderr, "basalt: PLE table VirtualLock failed (error %lu): touching its pages instead\n",
-                         (unsigned long) GetLastError());
+        // Locked pages count against the process working-set minimum, so that minimum is raised first and the
+        // range is then locked in chunks: that is what platform::lock_resident does, and it reports how far it
+        // got. A view of a file mapping can still refuse the lock; touching the pages then gets them resident,
+        // which is what the decode path needs.
+        const basalt::platform::LockResult lr = basalt::platform::lock_resident((void*) a0, a1 - a0);
+        impl_->locked = lr.ok && lr.locked_bytes >= a1 - a0;
+        if (!impl_->locked) {
+            std::fprintf(stderr, "basalt: PLE table lock incomplete (%s): touching its pages instead\n",
+                         lr.note.c_str());
             volatile uint8_t sink = 0;
             for (uintptr_t p = a0; p < a1; p += page) sink = sink + *(const volatile uint8_t*) p;
             (void) sink;
