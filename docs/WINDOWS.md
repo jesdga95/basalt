@@ -2,8 +2,9 @@
 
 Native Windows build of the engine: the C++/CUDA engine and the Python server, one RTX 5090
 (sm_120). This is a platform port - no kernel math, no weight format and no precision behaviour
-changed. The Linux build is the regression oracle, and every Windows change sits behind
-`#if defined(_WIN32)` / CMake `if(WIN32)` so the Linux code path is unchanged.
+changed. Windows support is community-supported: the engine logic is shared with Linux, which
+stays the regression oracle, and OS-specific code belongs to `src/platform/` and CMake `WIN32`
+blocks rather than to engine logic.
 
 ## Toolchain
 
