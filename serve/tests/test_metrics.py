@@ -236,11 +236,20 @@ class PerGpu(unittest.TestCase):
 class EngineStderr(unittest.TestCase):
     def test_without_a_log_file_the_engine_stderr_reaches_the_sink(self):
         with tempfile.TemporaryDirectory() as d:
-            engine_bin = os.path.join(d, "engine")
-            with open(engine_bin, "w") as f:
-                f.write(f"#!{sys.executable}\nimport sys\nprint('engine: hello', file=sys.stderr, flush=True)\n"
-                        "print('READY 4096 stop', flush=True)\nsys.stdin.readline()\n")
-            os.chmod(engine_bin, os.stat(engine_bin).st_mode | stat.S_IXUSR)
+            script = ("import sys\nprint('engine: hello', file=sys.stderr, flush=True)\n"
+                      "print('READY 4096 stop', flush=True)\nsys.stdin.readline()\n")
+            if os.name == "nt":                               # no shebangs on Windows: a .cmd runs the same script
+                py = os.path.join(d, "engine.py")
+                with open(py, "w") as f:
+                    f.write(script)
+                engine_bin = os.path.join(d, "engine.cmd")
+                with open(engine_bin, "w") as f:
+                    f.write(f'@"{sys.executable}" "{py}" %*\r\n')
+            else:
+                engine_bin = os.path.join(d, "engine")
+                with open(engine_bin, "w") as f:
+                    f.write(f"#!{sys.executable}\n{script}")
+                os.chmod(engine_bin, os.stat(engine_bin).st_mode | stat.S_IXUSR)
             logs = LogBuffer()
             ProcessEngine.stderr_sink = lambda line: logs.add("eng", line)
             try:
