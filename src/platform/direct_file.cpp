@@ -74,6 +74,13 @@ struct Req {
     OVERLAPPED ov;
     uint64_t tag;
 };
+
+/// The completion key of a posted packet that carries no request. A `wake` is turned into a WAKE_TAG completion
+/// for the caller; the nudge of an immediate completion only says the internal buffer has something in it, and
+/// never reaches the caller, so `wake()` keeps its meaning. The key of a real read is the one the file was
+/// associated with (0) and it always carries an OVERLAPPED.
+constexpr ULONG_PTR WAKE_KEY = 1;
+constexpr ULONG_PTR NUDGE_KEY = 2;
 }  // namespace
 
 struct DirectFile::Impl {
@@ -83,7 +90,8 @@ struct DirectFile::Impl {
     std::mutex mu;                      // guards everything below
     std::deque<Req*> free_reqs;
     std::vector<Req*> all_reqs;
-    std::deque<Completion> immediate;   // requests that completed without a port packet (end of file) or failed
+    std::deque<Completion> immediate;   // completions ready to hand out: a read that hit end of file or failed
+                                        // without a port packet, a wake, and any that did not fit the last wait
     std::deque<Pending> queue;          // submitted, not yet issued
     size_t inflight = 0;                // reads whose completion packet has not been retrieved yet
     std::condition_variable cv;
@@ -118,7 +126,7 @@ struct DirectFile::Impl {
                 free_reqs.push_back(r);
                 // at or past end of file: a zero-byte completion; anything else: a failed one
                 immediate.push_back(Completion{p.tag, 0, e == ERROR_HANDLE_EOF});
-                PostQueuedCompletionStatus(port, 0, 0, nullptr);   // wake a waiter to collect it
+                PostQueuedCompletionStatus(port, 0, NUDGE_KEY, nullptr);   // tell a waiter the buffer has work
                 return;
             }
         }
@@ -248,46 +256,63 @@ bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t
 }
 
 int DirectFile::wait(Completion* out, int max, int timeout_ms) {
+    if (max <= 0) return 0;
+    using clock = std::chrono::steady_clock;
+    const bool timed = timeout_ms >= 0;
+    const auto deadline = clock::now() + std::chrono::milliseconds(timed ? timeout_ms : 0);
     int n = 0;
-    {
-        std::lock_guard<std::mutex> lk(impl_->mu);
-        while (n < max && !impl_->immediate.empty()) {
-            out[n++] = impl_->immediate.front();
-            impl_->immediate.pop_front();
-        }
-    }
-    if (n == max || !is_open()) return n;
-    OVERLAPPED_ENTRY entries[64];
-    const ULONG want = (ULONG) (max - n < 64 ? max - n : 64);
-    ULONG got = 0;
-    const DWORD t = timeout_ms < 0 ? INFINITE : (DWORD) timeout_ms;
-    if (!GetQueuedCompletionStatusEx(impl_->port, entries, want, &got, n > 0 ? 0 : t, FALSE)) return n;
-    std::lock_guard<std::mutex> lk(impl_->mu);
-    for (ULONG i = 0; i < got; ++i) {
-        if (entries[i].lpOverlapped == nullptr) {   // a wake() packet, or the nudge of an immediate completion
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(impl_->mu);
             while (n < max && !impl_->immediate.empty()) {
                 out[n++] = impl_->immediate.front();
                 impl_->immediate.pop_front();
             }
-            if (n < max) out[n++] = Completion{WAKE_TAG, 0, true};
-            continue;
         }
-        Req* r = (Req*) entries[i].lpOverlapped;
-        const uint32_t status = (uint32_t) r->ov.Internal;   // an NTSTATUS
-        Completion c;
-        c.tag = r->tag;
-        c.bytes = entries[i].dwNumberOfBytesTransferred;
-        // STATUS_END_OF_FILE is a legal short read at the table's last page.
-        c.ok = status == 0 || status == 0xC0000011u;
-        out[n++] = c;
-        impl_->free_reqs.push_back(r);
-        --impl_->inflight;
+        if (n > 0 || !is_open()) return n;   // hand out whatever is ready rather than waiting to fill `max`
+        DWORD t = INFINITE;
+        if (timed) {
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - clock::now()).count();
+            t = (DWORD) (left > 0 ? left : 0);
+        }
+        // Packets are taken in batches of up to 64 whatever `max` is: a completion that does not fit the caller's
+        // array goes into the buffer for the next call, so `out` never holds more than `max` and one call leaves
+        // at most one batch behind in the buffer.
+        OVERLAPPED_ENTRY entries[64];
+        ULONG got = 0;
+        if (!GetQueuedCompletionStatusEx(impl_->port, entries, 64, &got, t, FALSE)) return n;
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        for (ULONG i = 0; i < got; ++i) {
+            if (entries[i].lpOverlapped == nullptr) {
+                // The nudge of an immediate completion is already represented by the buffered completion, so it
+                // is swallowed here; only a real wake is turned into a completion of its own.
+                if (entries[i].lpCompletionKey == WAKE_KEY) {
+                    Completion w{WAKE_TAG, 0, true};
+                    if (n < max) out[n++] = w;
+                    else impl_->immediate.push_back(w);
+                }
+                continue;
+            }
+            Req* r = (Req*) entries[i].lpOverlapped;
+            const uint32_t status = (uint32_t) r->ov.Internal;   // an NTSTATUS
+            Completion c;
+            c.tag = r->tag;
+            c.bytes = entries[i].dwNumberOfBytesTransferred;
+            // STATUS_END_OF_FILE is a legal short read at the table's last page.
+            c.ok = status == 0 || status == 0xC0000011u;
+            if (n < max) out[n++] = c;
+            else impl_->immediate.push_back(c);
+            impl_->free_reqs.push_back(r);
+            --impl_->inflight;
+        }
+        // A batch of nothing but nudges hands the caller nothing: keep waiting until the deadline instead of
+        // reporting a completion-less wait that had time left.
+        if (n > 0) return n;
     }
-    return n;
 }
 
 void DirectFile::wake() {
-    if (impl_->port != nullptr) PostQueuedCompletionStatus(impl_->port, 0, 0, nullptr);
+    if (impl_->port != nullptr) PostQueuedCompletionStatus(impl_->port, 0, WAKE_KEY, nullptr);
 }
 
 #else
