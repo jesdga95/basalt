@@ -309,7 +309,10 @@ public:
         // or the write end of the reply pipe, neither would ever report the other side gone.
         (void) SetHandleInformation(wr_in, HANDLE_FLAG_INHERIT, 0);
         (void) SetHandleInformation(rd_out, HANDLE_FLAG_INHERIT, 0);
-        HANDLE log = CreateFileA(log_path.c_str(), GENERIC_WRITE, 0, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        // The share mode is what lets the log be read while the run is going on; a share mode of 0 keeps it closed
+        // to any other process until the child exits. `sa` (bInheritHandle) is what hands the handle to the child.
+        HANDLE log = CreateFileA(log_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, &sa,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         STARTUPINFOA si{};
         si.cb = sizeof si;
         si.dwFlags = STARTF_USESTDHANDLES;
