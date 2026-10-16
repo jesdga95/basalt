@@ -60,8 +60,8 @@ struct Pending {
 };
 
 /// The number of issuing threads, clamped to 1..64. On Linux each thread does one blocking pread, so the thread
-/// count is the queue depth. On Windows a thread returns as soon as its read is queued, so fewer of them keep the
-/// drive equally deep.
+/// count is the queue depth. On Windows a read stays in flight after its issuing thread moves on, so the count
+/// only bounds how fast the submitted queue reaches the drive; the depth itself is what the caller queued.
 int io_threads(int dflt) { return std::clamp(dflt, 1, 64); }
 }  // namespace
 
@@ -85,6 +85,7 @@ struct DirectFile::Impl {
     std::vector<Req*> all_reqs;
     std::deque<Completion> immediate;   // requests that completed without a port packet (end of file) or failed
     std::deque<Pending> queue;          // submitted, not yet issued
+    size_t inflight = 0;                // reads whose completion packet has not been retrieved yet
     std::condition_variable cv;
     bool stop = false;
     std::vector<std::thread> pool;
@@ -118,7 +119,37 @@ struct DirectFile::Impl {
                 // at or past end of file: a zero-byte completion; anything else: a failed one
                 immediate.push_back(Completion{p.tag, 0, e == ERROR_HANDLE_EOF});
                 PostQueuedCompletionStatus(port, 0, 0, nullptr);   // wake a waiter to collect it
+                return;
             }
+        }
+        // A read that finishes before ReadFile returns still queues a completion packet, and a pending one queues
+        // its packet when it lands: either way the packet has to be retrieved before the request can be reused.
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            ++inflight;
+        }
+    }
+
+    /// Retrieve the packet of every read still in flight and hand its request back to the free list. A packet is
+    /// queued only once the kernel has stopped writing the OVERLAPPED and the caller's buffer, so after this no
+    /// late completion can land in memory the caller has released. Cancelling keeps a teardown from waiting out
+    /// reads nobody wants any more; a cancelled read still produces a packet.
+    void drain() {
+        if (file != INVALID_HANDLE_VALUE) CancelIoEx(file, nullptr);
+        if (port == nullptr) return;
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                if (inflight == 0) return;
+            }
+            DWORD bytes = 0;
+            ULONG key = 0;
+            OVERLAPPED* ov = nullptr;
+            if (!GetQueuedCompletionStatus(port, &bytes, &key, &ov, INFINITE)) return;
+            if (ov == nullptr) continue;   // a posted wake or nudge: it carries no request
+            std::lock_guard<std::mutex> lk(mu);
+            free_reqs.push_back((Req*) ov);
+            --inflight;
         }
     }
 
@@ -180,20 +211,23 @@ bool DirectFile::open(const std::string& path, std::string& err) {
         close();
         return false;
     }
-    const int n = io_threads(4);
+    const int n = io_threads(16);
     for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { impl_->worker(); });
     return true;
 }
 
 void DirectFile::close() {
-    impl_->stop_pool();
+    impl_->stop_pool();   // after this no thread is left that could issue another read
+    impl_->drain();       // ... and every read already in flight has finished writing
     if (impl_->port != nullptr) CloseHandle(impl_->port);
     if (impl_->file != INVALID_HANDLE_VALUE) CloseHandle(impl_->file);
     impl_->port = nullptr;
     impl_->file = INVALID_HANDLE_VALUE;
     impl_->size = 0;
+    std::lock_guard<std::mutex> lk(impl_->mu);
     impl_->immediate.clear();
     impl_->queue.clear();
+    impl_->inflight = 0;   // the port is gone, so no packet is left to retrieve
 }
 
 bool DirectFile::is_open() const { return impl_->file != INVALID_HANDLE_VALUE; }
@@ -247,6 +281,7 @@ int DirectFile::wait(Completion* out, int max, int timeout_ms) {
         c.ok = status == 0 || status == 0xC0000011u;
         out[n++] = c;
         impl_->free_reqs.push_back(r);
+        --impl_->inflight;
     }
     return n;
 }
