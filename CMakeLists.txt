@@ -37,22 +37,32 @@ set(_gpu_runtime_target CUDA::cudart)
 set(_gpu_blas_target CUDA::cublas)
 set(_gpu_include_directories ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 
+# MSVC reports __cplusplus as 199711L unless /Zc:__cplusplus is given. cuda.h applies alignas(TENSOR_MAP_ALIGN) to
+# CUtensorMap only when __cplusplus says C++11 or later, so without the option the type keeps the 8-byte alignment
+# of its single array member and the TMA descriptors inside a __grid_constant__ kernel-argument struct fault on a
+# misaligned address. The option has to be global: the alignment is decided in the translation unit that reads the
+# header, which is not necessarily one that links the target carrying a compile option.
+if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+  add_compile_options($<$<COMPILE_LANGUAGE:C>:/Zc:__cplusplus>)
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>)
+  # nvcc takes host-compiler options through -Xcompiler, and this reaches every CUDA target.
+  string(APPEND CMAKE_CUDA_FLAGS " -Xcompiler=/Zc:__cplusplus")
+endif()
+
 # Warnings live on an INTERFACE target the project's own C++ code links, NOT in add_compile_options: applied
 # globally they would also hit the extracted ggml C and CUDA sources, whose warnings are not this project's to fix.
 # The flags are guarded by COMPILE_LANGUAGE:CXX so nvcc never receives them as inputs, and by the compiler id:
 # MSVC reads -Wall/-Wextra as /Wall and the invalid /Wextra, so it takes its own spellings. The sources are UTF-8,
-# which MSVC only assumes when told (the Windows SDK's headers are not), hence /utf-8 for both languages. MSVC reports
-# __cplusplus as 199711L unless /Zc:__cplusplus is given; headers that gate alignment on that value then drop their
-# alignas entirely, which misaligns TMA descriptors packed into kernel argument structs.
+# which MSVC only assumes when told (the Windows SDK's headers are not), hence /utf-8 for both languages.
 add_library(warnings INTERFACE)
 target_compile_options(warnings INTERFACE
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/W4>
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/utf-8>
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/Zc:__cplusplus>
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wall>
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wextra>
-  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/utf-8>
-  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/Zc:__cplusplus>)
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/utf-8>)
 if(WERROR)
   target_compile_options(warnings INTERFACE
     $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/WX>
