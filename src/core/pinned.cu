@@ -46,6 +46,27 @@ struct SharedArenaHeader {
 };
 static_assert(sizeof(SharedArenaHeader) <= kSharedArenaHeaderBytes);
 
+#if defined(_WIN32)
+// A size in GiB, for the notes that have to say how big something was.
+std::string gib_size(uint64_t bytes) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%.1f GiB", (double) bytes / (double) (1ull << 30));
+    return buf;
+}
+
+// What the OS could still commit, for the note that has to say why the arena did not fit.  The commit charge is the
+// sum of RAM and the page file, so its free part is the headroom the arena has to fit into.  Empty when the OS
+// gives no reading.
+std::string commit_headroom_note() {
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (!GlobalMemoryStatusEx(&ms)) return "; the commit headroom is unknown";
+    return "; " + gib_size((uint64_t) ms.ullAvailPageFile) + " of commit charge free out of " +
+           gib_size((uint64_t) ms.ullTotalPageFile) + " (RAM plus page file), " +
+           gib_size((uint64_t) ms.ullTotalPhys) + " of RAM";
+}
+#endif
+
 // A 2 MB-aligned reservation.  Large pages first, then the largest alignment the OS will give us for free.
 // A non-empty shared_file instead maps one file whose first 4 KiB identify the pack and whose remaining bytes
 // are the resident arena.  This shared-file layout is intended for tmpfs (/dev/shm); hugetlbfs would need
@@ -94,7 +115,32 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         note = "this system has no large-page minimum; using 4 KB pages";
     }
     {
-        void* p = VirtualAlloc(nullptr, (SIZE_T) bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        // Reserve first, then commit in chunks.  A single MEM_COMMIT over the whole arena only ever says that the
+        // allocation failed, and whether it can succeed depends on RAM plus page file together, which is not known
+        // before the commit reaches that far.  Committing a chunk at a time makes the failure name the size it
+        // reached, and the region is released before anything is returned, so a half-committed arena is never
+        // handed to the caller and nothing is reported as pinned that was not.
+        void* p = VirtualAlloc(nullptr, (SIZE_T) bytes, MEM_RESERVE, PAGE_READWRITE);
+        if (p == nullptr) {
+            got = PageBacking::NormalPages;
+            note = "cannot reserve " + gib_size(bytes) + " of arena (VirtualAlloc error " +
+                   std::to_string((unsigned long long) GetLastError()) + ")" + commit_headroom_note() +
+                   "; the arena needs RAM plus page file; " + note;
+            return nullptr;
+        }
+        constexpr uint64_t kCommitChunk = 1ull << 30;
+        for (uint64_t off = 0; off < bytes; off += kCommitChunk) {
+            const uint64_t n = bytes - off < kCommitChunk ? bytes - off : kCommitChunk;
+            if (VirtualAlloc((uint8_t*) p + off, (SIZE_T) n, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+                const DWORD err = GetLastError();
+                VirtualFree(p, 0, MEM_RELEASE);
+                got = PageBacking::NormalPages;
+                note = "cannot commit the arena: " + gib_size(off) + " of " + gib_size(bytes) +
+                       " committed (VirtualAlloc error " + std::to_string((unsigned long long) err) + ")" +
+                       commit_headroom_note() + "; the arena needs RAM plus page file; " + note;
+                return nullptr;
+            }
+        }
         got = PageBacking::NormalPages;
         return p;
     }
