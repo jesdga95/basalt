@@ -15,7 +15,7 @@ The versions this was built with:
 | Visual Studio | Community 2022 (17.14) + Build Tools |
 | MSVC | 19.44.35222, toolset 14.44.35207 |
 | CUDA Toolkit | 13.0 (V13.0.88) |
-| NVIDIA driver | 566.x reported as driver/runtime 13040 |
+| NVIDIA driver | 616.92 |
 | CMake | 4.1.0-rc4 |
 | Ninja | 1.13.0 (kitware jobserver build) |
 | Python | 3.12.10 for the server; 3.11 also works |
@@ -118,7 +118,14 @@ reader keeps its 4 KiB request contract rather than relaxing the alignment asser
 These are the places where the platform layer gives out and the engine says so rather than
 pretending otherwise:
 
-- **Peer-GPU expert tiers** are excluded: the port targets one GPU, as the Linux baseline does.
+- **Peer-GPU expert tiers** are refused at start-up: the peer and multi-GPU flags stop the engine on
+  Windows rather than being ignored. The port targets one GPU, as the Linux baseline does.
+- **GPU recovery timeout (TDR)**: on a machine with a display attached, timeout detection and
+  recovery resets the GPU when one submission runs past the limit (two seconds by default), failing
+  long kernels. The `TdrDelay` (seconds) and `TdrLevel` (`0` disables recovery) values under
+  `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers` set that behaviour; a GPU driving no
+  display is off the desktop windowing path and is not reset the same way, so kernel length that is
+  safe on one machine is not on another.
 - **Shared arena files** are refused with a note. They exist to populate a `tmpfs` mapping shared
   between processes, and there is no counterpart to that arrangement here.
 - **Per-range release of mapped pages** (`madvise(MADV_DONTNEED)` / `posix_fadvise`) is a no-op.
