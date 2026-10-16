@@ -5,13 +5,13 @@
   </picture>
 </p>
 
-> **Native Windows x64 support** lives in this tree: the same engine, kernels and precision rules, plus a platform
-> layer for MSVC and CUDA 13. Build steps, the test recipe and the platform caveats are in
-> **[docs/WINDOWS.md](docs/WINDOWS.md)**. Every Windows change sits behind `#if defined(_WIN32)` /
-> `if(WIN32)` guards: the Linux code path is unchanged.
+> **Windows x64 is community-supported**: the same engine, kernels and precision rules, with the
+> Windows-specific code kept in a platform layer (MSVC + CUDA 13). Linux is the supported target and
+> the regression oracle; the Windows tier promises a build on one GPU, not performance. Build steps,
+> the test recipe and the platform caveats are in **[docs/WINDOWS.md](docs/WINDOWS.md)**.
 
 Basalt is a local inference engine for the **Qwen3.8-Flash-Next** mixture-of-experts model. It targets one thing: an
-NVIDIA Blackwell GPU (sm_120) under Linux or Windows x64. The experts that do not fit in VRAM live in system RAM (and optionally on
+NVIDIA Blackwell GPU (sm_120) under Linux; Windows x64 is community-supported. The experts that do not fit in VRAM live in system RAM (and optionally on
 a second GPU used as a peer expert tier), so a large MoE model runs on a single workstation.
 Ready-to-run `.basalt` packs: see [Models](#models).
 
@@ -36,8 +36,8 @@ It is a fork of [Strata](https://github.com/Niko1221/Strata) (MIT), stripped dow
 ## Requirements
 
 - Linux x86-64 with AVX2 (AVX-512 is used when present).
-- Windows x64 builds natively too (MSVC 2022 + CUDA 13, same sm_120 requirement); the working toolchain, the build
-  recipe and the test caveats are in [docs/WINDOWS.md](docs/WINDOWS.md).
+- Windows x64 builds natively as a community-supported target (MSVC 2022 + CUDA 13, same sm_120 requirement, one GPU);
+  the working toolchain, the build recipe and the test caveats are in [docs/WINDOWS.md](docs/WINDOWS.md).
 - An NVIDIA Blackwell GPU (compute capability 12.0) and CUDA 13.
 - CMake 3.24 or newer and a C++20 compiler.
 - Enough system RAM to hold the experts that do not fit in VRAM.
