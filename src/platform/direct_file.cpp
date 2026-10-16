@@ -114,6 +114,10 @@ struct DirectFile::Impl {
         {
             std::lock_guard<std::mutex> lk(mu);
             r = take();
+            // Counted before the read starts: a read that finishes at once can have its packet retrieved by a
+            // waiter before this thread would get the chance to record it, and a count that goes past zero leaves
+            // close() waiting for a packet that has already been taken.
+            ++inflight;
         }
         std::memset(&r->ov, 0, sizeof r->ov);
         r->ov.Offset = (DWORD) (p.offset & 0xFFFFFFFFull);
@@ -124,17 +128,12 @@ struct DirectFile::Impl {
             if (e != ERROR_IO_PENDING) {
                 std::lock_guard<std::mutex> lk(mu);
                 free_reqs.push_back(r);
+                --inflight;   // a read the kernel never took produces no packet
                 // at or past end of file: a zero-byte completion; anything else: a failed one
                 immediate.push_back(Completion{p.tag, 0, e == ERROR_HANDLE_EOF});
                 PostQueuedCompletionStatus(port, 0, NUDGE_KEY, nullptr);   // tell a waiter the buffer has work
                 return;
             }
-        }
-        // A read that finishes before ReadFile returns still queues a completion packet, and a pending one queues
-        // its packet when it lands: either way the packet has to be retrieved before the request can be reused.
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            ++inflight;
         }
     }
 
