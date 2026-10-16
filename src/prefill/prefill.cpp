@@ -41,16 +41,61 @@
 #include <BaseTsd.h>
 typedef SSIZE_T ssize_t;
 namespace {
-/// Positional read on a CRT descriptor. The offset rides in the OVERLAPPED structure, so several staging threads
-/// can share one descriptor without moving a shared file position.
+/// This thread's handle for reading `fd`. A handle opened without FILE_FLAG_OVERLAPPED serializes the I/O issued
+/// through it, so threads reading through one shared descriptor take turns rather than reading in parallel: each
+/// thread opens the same file again and gets a file object of its own. Returns the shared descriptor when the file
+/// cannot be reopened (its handle still reads correctly, only in turn).
+HANDLE read_handle(int fd) {
+    struct PerThread {
+        ~PerThread() { release(); }
+        void release() {
+            if (own) CloseHandle(h);   // the shared descriptor belongs to the CRT
+            h = INVALID_HANDLE_VALUE;
+            own = false;
+            for_fd = -1;
+        }
+        HANDLE h = INVALID_HANDLE_VALUE;
+        bool own = false;    // h was opened here, so closing it is ours to do
+        int for_fd = -1;     // the descriptor h was opened from; -1: nothing decided yet
+    };
+    thread_local PerThread pt;
+    if (pt.for_fd != fd) pt.release();
+    if (pt.for_fd < 0) {
+        pt.for_fd = fd;
+        wchar_t path[4096];
+        const DWORD len = GetFinalPathNameByHandleW(reinterpret_cast<HANDLE>(_get_osfhandle(fd)), path,
+                                                   (DWORD) (sizeof path / sizeof path[0]), VOLUME_NAME_DOS);
+        if (len != 0 && len < sizeof path / sizeof path[0])
+            pt.h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        pt.own = pt.h != INVALID_HANDLE_VALUE;
+    }
+    if (pt.h != INVALID_HANDLE_VALUE) return pt.h;
+    return reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+}
+/// Positional read on a CRT descriptor, one chunk per call: ReadFile takes a 32-bit byte count, so a request of
+/// 4 GiB or more is read in pieces and the caller's loop picks up where this one stopped. The offset rides in the
+/// OVERLAPPED structure, so the shared-descriptor fallback never moves a shared file position.
 ssize_t pread(int fd, void* dst, size_t n, uint64_t off) {
-    const HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+    const HANDLE h = read_handle(fd);
     if (h == INVALID_HANDLE_VALUE) return -1;
+    const DWORD want = (DWORD) (n < (size_t) (1ull << 30) ? n : (size_t) (1ull << 30));
     OVERLAPPED ov{};
     ov.Offset = (DWORD) (off & 0xFFFFFFFFull);
     ov.OffsetHigh = (DWORD) (off >> 32);
     DWORD got = 0;
-    if (!ReadFile(h, dst, (DWORD) n, &got, &ov)) return -1;
+    if (!ReadFile(h, dst, want, &got, &ov)) {
+        // A read that ran into the end of the file reports the bytes it did get as an error, so `got` stands.
+        // ERROR_IO_PENDING means the handle is an overlapped one: this thread has no other read outstanding on it,
+        // so waiting for that request is the whole of what a synchronous read would have done.
+        const DWORD e = GetLastError();
+        if (e == ERROR_IO_PENDING) {
+            got = 0;
+            if (!GetOverlappedResult(h, &ov, &got, TRUE) && GetLastError() != ERROR_HANDLE_EOF) return -1;
+        } else if (e != ERROR_HANDLE_EOF) {
+            return -1;
+        }
+    }
     return (ssize_t) got;
 }
 }  // namespace
