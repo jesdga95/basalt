@@ -895,9 +895,13 @@ if(BUILD_TESTING)
   target_link_libraries(pool_stress PRIVATE kernels_cpu)
   add_test(NAME pool_stress COMMAND pool_stress 20)
 
-  add_executable(direct_file_async_test tests/platform/direct_file_async.cpp src/platform/direct_file.cpp)
-  target_include_directories(direct_file_async_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_compile_definitions(direct_file_async_test PRIVATE BASALT_TEST_TMPDIR="${CMAKE_CURRENT_BINARY_DIR}")
-  target_link_libraries(direct_file_async_test PRIVATE Threads::Threads)
-  add_test(NAME direct_file_async_test COMMAND direct_file_async_test)
+  # DirectFile has a Linux backend and a Windows backend, and this test covers those two; macOS is not a platform
+  # the engine builds for.
+  if((UNIX AND NOT APPLE) OR WIN32)
+    add_executable(direct_file_async_test tests/platform/direct_file_async.cpp src/platform/direct_file.cpp)
+    target_include_directories(direct_file_async_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(direct_file_async_test PRIVATE BASALT_TEST_TMPDIR="${CMAKE_CURRENT_BINARY_DIR}")
+    target_link_libraries(direct_file_async_test PRIVATE Threads::Threads)
+    add_test(NAME direct_file_async_test COMMAND direct_file_async_test)
+  endif()
 endif()
