@@ -145,7 +145,11 @@ public:
 
     bool open() {
 #if defined(_WIN32)
-        h_ = (void*) LoadLibraryA("nvml.dll");
+        // A bare name is looked up in System32 only: the application and current directories are not searched, so
+        // an nvml.dll lying next to the executable cannot stand in for the driver's.
+        HMODULE m = LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (m == nullptr) m = load_nvsmi();
+        h_ = (void*) m;
 #else
         h_ = dlopen("libnvidia-ml.so.1", RTLD_NOW);
 #endif
@@ -200,6 +204,24 @@ public:
     }
 
 private:
+#if defined(_WIN32)
+    /// A driver that keeps nvml.dll outside System32: its NVSMI directory under one of the program-file roots. The
+    /// root comes from the environment as UTF-16, so the path never goes through the ANSI code page. The DLL's own
+    /// dependencies are looked up beside it.
+    static HMODULE load_nvsmi() {
+        static const wchar_t* const roots[] = { L"ProgramFiles", L"ProgramFiles(x86)" };
+        wchar_t dir[4096];
+        for (const wchar_t* root : roots) {
+            const DWORD n = GetEnvironmentVariableW(root, dir, (DWORD) (sizeof dir / sizeof dir[0]));
+            if (n == 0 || n >= sizeof dir / sizeof dir[0]) continue;
+            const std::wstring path = std::wstring(dir, n) + L"\\NVIDIA Corporation\\NVSMI\\nvml.dll";
+            const HMODULE m = LoadLibraryExW(path.c_str(), nullptr,
+                                             LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+            if (m != nullptr) return m;
+        }
+        return nullptr;
+    }
+#endif
     template <class F>
 #if defined(_WIN32)
     F sym(const char* n) const { return reinterpret_cast<F>(GetProcAddress((HMODULE) h_, n)); }
