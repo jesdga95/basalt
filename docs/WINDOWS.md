@@ -7,7 +7,7 @@ changed. The Linux build is the regression oracle, and every Windows change sits
 
 ## Toolchain
 
-The versions this was built with:
+The versions this port builds with:
 
 | component | version |
 | --- | --- |
@@ -102,8 +102,8 @@ What the engine reports is the honest answer, not an assumption:
   large-page minimum is detected (2 MiB) and the privilege enables, but the system's large-page
   pool declines (`ERROR_NO_SYSTEM_RESOURCES`, 1450): drivers and the OS take that pool at boot, so
   whether it is available is a machine property. The arena then falls back to ordinary 4 KiB pages
-  and `cudaHostRegister` still pins all of it - measured with a 4 GiB arena, which registered in a
-  single piece, so the per-slice fallback was not needed. The note names the size, the large-page
+  and `cudaHostRegister` still pins all of it: a 4 GiB arena registers in a
+  single piece, so the per-slice fallback stays unused. The note names the size, the large-page
   minimum and the `VirtualAlloc` error, because a declined pool (1450), a missing privilege (1314)
   and a size that is not a multiple of the minimum (87) need different fixes and look alike
   otherwise.
@@ -150,7 +150,7 @@ The MSVC behaviour that differs from the GCC build, and what the port does about
 - `/arch:AVX2` defines `__AVX__` and `__AVX2__` but **not** `__F16C__`; `/arch:AVX512` adds
   `F`/`BW`/`VL`/`DQ` but not `F16C`, `VNNI` or `VBMI` - although the intrinsics for all of those
   compile anyway. The sources that branch on those macros therefore silently take the scalar path
-  unless the macros are defined alongside the flag, which the build now does.
+  unless the macros are defined alongside the flag, which the build does.
 - MSVC gives the scalar F16C conversions `_cvtss_sh` and `_cvtsh_ss` no working code: its headers declare
   them nowhere, and with `__F16C__` defined the compiler claims the names as its own, so a definition
   compiled under that macro does not build as written. The pair is supplied by `src/kernels/cpu/ggml/
@@ -172,10 +172,10 @@ The MSVC behaviour that differs from the GCC build, and what the port does about
   `cp.async.bulk.tensor`/`prefetch.tensormap` faults with `cudaErrorMisalignedAddress`
   (compute-sanitizer reports it as "Misaligned shared or local address"), which surfaces in the
   engine as a stuck verify window. The build passes `/Zc:__cplusplus` to cl.exe and nvcc's host
-  pass for every Windows translation unit; the Linux build is untouched because GCC has always
-  reported the true standard version. Same class as CUTLASS issue 2905 and PyGPUkit issue 107.
+  pass for every Windows translation unit; Linux builds need nothing, because GCC reports the true
+  standard version. Same class as CUTLASS issue 2905 and PyGPUkit issue 107.
 
-`GGML_EXTENSION` (a GCC `__extension__`) had to be guarded: it breaks every CUDA translation unit
+`GGML_EXTENSION` (a GCC `__extension__`) is guarded: it breaks every CUDA translation unit
 that includes the block-layout header on the Windows front end.
 
 ## Benchmarks
@@ -196,14 +196,14 @@ power limit it was taken at.
 
 ## Machine-specific observations
 
-Recorded because they cost time and look like code defects when they are not:
+Machine-environment restrictions that look like code defects but are not:
 
-- An executable named `basalt-load.exe` could not be created under the workspace on this machine:
-  creating that exact filename is denied (`Access denied`) in that directory tree, while any other
+- Creating an executable named `basalt-load.exe` under the workspace on this machine is denied:
+  that exact filename is refused (`Access denied`) in that directory tree, while any other
   name is allowed. The program compiles and links fine under a different name. Check with a build
   of your own before treating that failure as a port defect.
-- A process started from under one particular folder on this machine was given a token that cannot
+- A process started from under one particular folder on this machine gets a token that cannot
   raise its own working-set quota (`ERROR_PRIVILEGE_NOT_HELD`, 1314), while the *same* executable
-  run from another folder locked 256 MiB successfully. `platform_memory_test` fails in the first
+  run from another folder locks 256 MiB successfully. `platform_memory_test` fails in the first
   location and passes in the second. If that test fails, run the same binary from somewhere else
   before believing the port is wrong.
