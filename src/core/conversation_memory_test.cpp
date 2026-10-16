@@ -50,9 +50,13 @@ int main() {
     // parking, so a probe dead on this OS fails here rather than silently in a serve run.
     check(available.has_value(), "provider returns a reading on this OS");
     // Admit reads only the bytes it is handed, so the same values decide the same on both OSes.
-    // Push this OS's own reading through the park arithmetic at its exact bounds.
-    check(conversation_memory_admit(available, *available, 0), "a park as large as the reading fits");
-    check(!conversation_memory_admit(available, *available, 1), "one byte of floor excludes that park");
+    // Push this OS's own reading through the park arithmetic at its exact bounds; those bounds
+    // checks read the value, so they run only when the provider gave one.
+    if (available) {
+        const uint64_t live = *available;
+        check(conversation_memory_admit(live, live, 0), "a park as large as the reading fits");
+        check(!conversation_memory_admit(live, live, 1), "one byte of floor excludes that park");
+    }
     constexpr uint64_t avail = 10ull << 30, park = 8ull << 30, floor = 2ull << 30;
     check(conversation_memory_admit(avail, park, floor), "fixed numbers admit park plus floor");
     check(!conversation_memory_admit(avail - 1, park, floor), "the same numbers reject one byte lower");
