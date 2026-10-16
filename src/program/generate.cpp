@@ -164,42 +164,13 @@ private:
         _mm_pause();   // a spin without this holds the core from its SMT sibling
 #endif
     }
-    // The decode loop's thread is pinned to one core, which it spins on; a thread it starts inherits that pin and would
-    // wait for the spinner to yield.  The worker takes the core's SMT sibling instead: the core is awake, so the
-    // worker starts at once, and the loop's thread is not preempted.
+    // The decode loop's thread is pinned to one core, which it spins on; a thread it starts inherits that pin and
+    // would wait for the spinner to yield.  The worker takes the core's SMT sibling instead: the core is awake, so the
+    // worker starts at once, and the loop's thread is not preempted.  That inheritance follows the placement a thread
+    // starts with: a host confined by a CPU Set instead leaves the new thread on the process's own assignment, so it
+    // never starts on the host core and there is no core to leave.
+#if !defined(_WIN32)
     static void leave_host_core() {
-#if defined(_WIN32)
-        GROUP_AFFINITY cur{};
-        if (!GetThreadGroupAffinity(GetCurrentThread(), &cur)) return;
-        int count = 0, host = -1;
-        for (int bit = 0; bit < 64; ++bit)
-            if (cur.Mask & (KAFFINITY(1) << bit)) { ++count; host = bit; }
-        if (count != 1) return;   // not pinned to a single processor: there is no core to leave
-        DWORD len = 0;
-        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
-        if (len == 0) return;
-        std::vector<char> buf(len);
-        if (!GetLogicalProcessorInformationEx(RelationProcessorCore,
-                                              (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len)) return;
-        for (const char *p = buf.data(), *end = buf.data() + len; p < end;) {
-            const auto* e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) p;
-            if (e->Relationship == RelationProcessorCore) {
-                for (WORD g = 0; g < e->Processor.GroupCount; ++g) {
-                    const GROUP_AFFINITY& gm = e->Processor.GroupMask[g];
-                    if (gm.Group != cur.Group || !(gm.Mask & (KAFFINITY(1) << host))) continue;
-                    const KAFFINITY siblings = gm.Mask & ~(KAFFINITY(1) << host);
-                    if (siblings != 0) {
-                        GROUP_AFFINITY target{};
-                        target.Group = cur.Group;
-                        target.Mask = siblings;
-                        (void) SetThreadGroupAffinity(GetCurrentThread(), &target, nullptr);
-                    }
-                    return;   // the core is found; without SMT there is nowhere to move
-                }
-            }
-            p += e->Size;
-        }
-#else
         const int n = (int) sysconf(_SC_NPROCESSORS_CONF);
         if (n <= 0) return;
         cpu_set_t* own = CPU_ALLOC(n);
@@ -234,10 +205,12 @@ private:
         }
         if (own != nullptr) CPU_FREE(own);
         if (sib != nullptr) CPU_FREE(sib);
-#endif
     }
+#endif
     void loop() {
+#if !defined(_WIN32)
         leave_host_core();
+#endif
         std::unique_lock<std::mutex> lk(m_);
         for (;;) {
             cv_.wait(lk, [this] { return has_ || stop_; });
