@@ -280,7 +280,10 @@ if(BUILD_TESTING)
   add_executable(conversation_cache_test src/core/conversation_cache_test.cpp)
   target_include_directories(conversation_cache_test PRIVATE include)
   add_test(NAME conversation_cache_test COMMAND conversation_cache_test)
-  add_executable(conversation_memory_test src/core/conversation_memory_test.cpp src/core/conversation_memory.cpp)
+  # conversation_memory.cpp asks the platform layer for the free RAM, so the probe comes along; it needs the system
+  # allocator and the OS memory query, and nothing from the GPU runtime.
+  add_executable(conversation_memory_test src/core/conversation_memory_test.cpp src/core/conversation_memory.cpp
+                 src/platform/memory.cpp)
   target_include_directories(conversation_memory_test PRIVATE include)
   add_test(NAME conversation_memory_test COMMAND conversation_memory_test)
   add_executable(conversation_validation_test src/core/conversation_validation_test.cpp)
