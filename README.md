@@ -260,8 +260,7 @@ python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPRO
 ## Models
 
 Ready-to-run `.basalt` packs are on [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt). A pack
-you convert yourself will be significantly slower than the official `.basalt` files. One community pack is hosted
-in its own repo and marked below.
+you convert yourself will be significantly slower than the official `.basalt` files.
 
 Quality measured with `basalt-bench --quality`: 20 chunks of wikitext-2 (512 tokens each), scored through the decode
 path against the Q8_0 reference. Lower KLD and higher top-1 agreement are closer to Q8_0. How precision is handled and how quality is measured:
@@ -277,25 +276,18 @@ path against the Q8_0 reference. Lower KLD and higher top-1 agreement are closer
 | GSQ-RCO IQ3_S | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 81.0 GiB | 46.8 GiB | 2.387 | 0.177 | 89.4% |
 | UD-Q3_K_XL | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 86.8 GiB | 52.0 GiB | 2.457 | 0.160 | 89.3% |
 | UD-Q4_K_XL | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 106.7 GiB | 71.7 GiB | 2.321 | 0.068 | 93.0% |
-| Uncensored Q4_K_M v2 [(pack)](https://huggingface.co/JSon-AI/Qwen3.8-Flash-Next-Basalt-Uncensored) | [orcarouter](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF) | 114.1 GiB | 75.0 GiB | | | |
 | Q8_0 | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 178.3 GiB | 119.5 GiB | 2.282 | reference | |
 
-The IQ3_S, IQ3_XXS, Q2_0 and Uncensored Q4_K_M packs carry an MTP layer fine-tuned on the model's own output
-(self-distillation), which raises draft acceptance; the Uncensored pack reuses the tuned layer and draft vocabulary
-from the published IQ3_S pack. Output is unchanged, because verify decides every token. Q4_K_XL
+The IQ3_S, IQ3_XXS and Q2_0 packs carry an MTP layer fine-tuned on the model's own output
+(self-distillation), which raises draft acceptance. Output is unchanged, because verify decides every token. Q4_K_XL
 and Q8_0 keep the original MTP layer. `--mtp-dense FILE` embeds that tuned layer (the `mtp/dense` section's raw bytes, checked against the
 source layout) and records it as self-distilled, with its SHA-256, in `meta.mtp`. The tuned layer ships with the
 packs, inside the model file; the converter input is only needed to build a pack yourself.
 
-The PPL/KLD/top-1 columns score against the original model's Q8_0 reference, which does not apply to a fine-tuned
-weights variant, so the Uncensored row is left blank; its fingerprints are in `meta.sources` for independent
-verification.
-
 The model files are derived from Qwen3.8-Flash-Next and are distributed under the
 [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE), not Basalt's MIT
 license. The GSQ-RCO quants come from IST Austria's Deep Algorithms and Systems Lab; please cite the
-[GSQ](https://arxiv.org/abs/2604.18556) and [RCO](https://arxiv.org/abs/2605.00649) papers if you use them. The
-Uncensored pack converts [orcarouter](https://huggingface.co/orcarouter)'s uncensored fine-tune.
+[GSQ](https://arxiv.org/abs/2604.18556) and [RCO](https://arxiv.org/abs/2605.00649) papers if you use them.
 
 ## Contributing
 
