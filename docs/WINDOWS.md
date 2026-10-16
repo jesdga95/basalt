@@ -189,11 +189,8 @@ llama-swap-equivalent config: 524288 context, yarn, `--kv int8`, `--spec 7 --spe
 - prefill: 64,437 prompt tokens read in 11 s (~5,860 tok/s)
 - decode: 12,299 tokens (reasoning + answer) in 56 s (~220 tok/s steady state)
 
-These are not a headline figure. The reference the port is checked against is the maintainer's WSL2
-setup on this same box (~214 tok/s at 524k context) and the published single-5090 Linux figures
-(585 tok/s structured decode, 316 tok/s prose decode, 7,317 tok/s prefill, 400 W power limit), which
-a maintainer run on Windows should match at its own power limit. Every number is labelled with the
-power limit it was taken at.
+These are not a headline figure: headline numbers are the maintainer's Linux runs. Every number
+here was measured on this machine at its 575 W power limit.
 
 ## Machine-specific observations
 
