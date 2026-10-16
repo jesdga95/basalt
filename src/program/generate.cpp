@@ -910,7 +910,8 @@ void usage() {
                  "                       layers across CUDA1..3 (default: stripe)\n"
                  "  --peer-device N      a second GPU as an adaptive expert-cache tier (rows over P2P; it also\n"
                  "                       computes its experts' prompt rows).  Not with --layer-split or\n"
-                 "                       --expert-cache-device1..3.  Default output unchanged without it.\n"
+                 "                       --expert-cache-device1..3; refused where a process has no GPU-to-GPU\n"
+                 "                       access between its devices.  Default output unchanged without it.\n"
                  "  --peer-exclusive     with --resident-experts: experts on the peer are held only there, not\n"
                  "                       also in RAM (less RAM).  The peer is filled from the file; swaps move\n"
                  "                       peer-held experts between the GPUs and RAM over P2P.\n"
@@ -1739,6 +1740,18 @@ int main(int argc, char** argv) {
         }
         }
     }
+    // The peer tier holds experts on a second GPU and moves them between the two over direct GPU-to-GPU access, which
+    // a process here is not given.  Refused with the options, before the model opens or a device context exists: a
+    // tier sized and then filled would fail partway through the load.
+#if defined(_WIN32)
+    if (o.peer_device >= 1) {
+        std::fprintf(stderr, "basalt generate: --peer-device is not available here: this platform gives a process no "
+                             "GPU-to-GPU access between its devices, so a second GPU cannot hold an expert tier; keep "
+                             "the experts on one GPU (--expert-cache, --resident-experts) and run without "
+                             "--peer-device\n");
+        return 2;
+    }
+#endif
     // ---- where every loader reads from: the sections of the .basalt file
     if (o.model.empty()) {
         std::fprintf(stderr, "basalt generate: --model FILE.basalt is required\n");
