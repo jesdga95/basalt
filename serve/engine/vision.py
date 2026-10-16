@@ -12,6 +12,8 @@ import urllib.request
 import queue
 from pathlib import Path
 
+from serve.engine.process import frame_pipes
+
 # Reads of the encoder's pipe have a timeout: a read that never returns would hold the request turn for good.
 # Generous: a cold model load or a slow encode is not a hang. A silent encoder is killed and the next request
 # starts a fresh one.
@@ -37,6 +39,7 @@ class Vision:
         t0 = time.time()
         self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log or subprocess.DEVNULL,
                                      text=True, encoding="utf-8", bufsize=1, env=env)
+        frame_pipes(self.proc, False)
         try:
             line = self._readline(VISION_READY_S, "the vision encoder did not start")
         except RuntimeError:                            # silent: it was ended, and is not left half-started
