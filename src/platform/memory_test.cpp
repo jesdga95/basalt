@@ -2,6 +2,8 @@
 // read-ahead hint on a mapped file view (CPU only, no GPU, no model; one temp file).
 #include "basalt/platform/memory.hpp"
 
+#include "basalt/platform/file.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -125,10 +127,8 @@ int read_ahead_cases() {
     // mapped the way the engine maps its file views: whole file, read-only
     const uint8_t* base = nullptr;
 #if defined(_WIN32)
-    const int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-    if (wlen > 0) {
-        std::wstring wpath((size_t) wlen, L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
+    const std::wstring wpath = basalt::platform::to_wide(path);
+    if (!wpath.empty()) {
         HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h != INVALID_HANDLE_VALUE) {

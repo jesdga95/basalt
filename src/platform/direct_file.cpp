@@ -1,6 +1,8 @@
 // src/platform/direct_file.cpp - see include/basalt/platform/direct_file.hpp.
 #include "basalt/platform/direct_file.hpp"
 
+#include "basalt/platform/file.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -194,12 +196,9 @@ DirectFile::~DirectFile() {
 
 bool DirectFile::open(const std::string& path, std::string& err) {
     close();
-    const int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-    std::wstring wpath((size_t) (wlen > 0 ? wlen : 1), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
     // NO_BUFFERING: the cache manager never holds these pages, so the table cannot grow into RAM.
     // RANDOM_ACCESS: no read-ahead. OVERLAPPED: many reads in flight, completed through the port below.
-    impl_->file = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+    impl_->file = CreateFileW(to_wide(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                               FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
     if (impl_->file == INVALID_HANDLE_VALUE) {
         err = "DirectFile: cannot open " + path + " (error " + std::to_string(GetLastError()) + ")";
