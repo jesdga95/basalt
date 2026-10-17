@@ -10,6 +10,9 @@
 // with the fixture name as one argument, and the child checks that the bytes it was given are the bytes the program
 // was compiled with. Windows decodes argv with the process's ANSI code page, which only becomes UTF-8 when the image
 // carries the application manifest (src/platform/basalt.exe.manifest), so this case fails in a build without it.
+// The fixture directory itself is made through `std::filesystem`, whose narrow strings the C++ library also reads
+// with the process code page: without the manifest that directory and the one the seam asks for are two different
+// places, so the cases above fail too, which is the point of the test.
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/process.hpp"
 

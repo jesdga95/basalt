@@ -152,21 +152,26 @@ pretending otherwise:
 - **A path is UTF-8 inside the engine and UTF-16 at the OS.** Every file the engine opens goes through
   `src/platform/file.cpp`, which converts the path and calls the wide entry point (`_wfopen`, `_wopen`,
   `CreateFileW`, `_wfullpath`, `_wchdir`, `GetModuleFileNameW`). The narrow calls (`fopen`, `_open`,
-  `_access`) read the machine's ANSI code page, and a character outside it arrives as `?`, so no path a
-  user typed is handed to one. The wide opens are what the port relies on; the manifest next is what makes
-  the narrow ones and `argv` agree with the engine.
+  `_access`) read the machine's ANSI code page, and `std::filesystem` converts a narrow path with it too,
+  so a character outside that code page arrives as `?`. The wide opens are what the engine relies on; the
+  manifest below is what makes the narrow spellings and `argv` agree with it.
 - **The programs that name a path on the command line - the engine, the bench, the vision sidecar and the
   file tests - carry an application manifest** (`src/platform/basalt.exe.manifest`, merged into the image by
-  `link.exe` with `/MANIFEST:EMBED` and `/MANIFESTINPUT:`): `activeCodePage` `UTF-8` and `longPathAware`. The code page needs **Windows 10 version 1903 (build 18362) or later**, and
-  it makes the process's ANSI code page **UTF-8 (65001)**: `argv` and any narrow CRT call then read the
+  `link.exe` with `/MANIFEST:EMBED` and `/MANIFESTINPUT:`): `activeCodePage` `UTF-8` and `longPathAware`.
+  The code page needs **Windows 10 version 1903 (build 18362) or later**, and it makes the process's ANSI
+  code page **UTF-8 (65001)**: `argv` and any narrow CRT call then read the
   same bytes the engine carries, and a pack path under a profile name with an accent survives being typed
   into a tool. On an older Windows the element is ignored and the machine's ANSI code page stays in force,
   so a character it cannot represent comes out of `argv` as `?` while the engine's own opens are unaffected,
   because those take the UTF-16 path. `longPathAware` needs **Windows 10 version 1607 (build 14393) or
   later** and lifts the 260-character limit for the wide opens; no `\\?\` prefix is used.
-  `tests/platform/path_utf8_test.cpp` checks the seam with a directory name carrying an accented Latin
-  letter, Japanese and Cyrillic, a path of 300 characters, and `argv` as seen by a child of the test: that
-  last half is what the manifest makes true, and it fails in a build without it.
+  `tests/platform/path_utf8_test.cpp` covers it: a directory name carrying an accented Latin letter,
+  Japanese and Cyrillic opened through every file seam, a path of 323 characters, and `argv` as a child of
+  the test sees it. Built **without** the manifest that test fails, and it fails unevenly, which is the
+  failure this change is about: `argv` arrives with the accented letter intact (CP1252 has a byte for it)
+  and the Japanese and the Cyrillic replaced by `?`; `std::filesystem` then makes one directory while
+  `CreateFileW` is asked for another, so the tool reports "cannot open"; and the 323-character path is
+  refused outright.
 - **`basalt serve` does not replace the process.** There is no `exec` here, so the Python server is started as a
   child, this process waits for it, and it ends with the child's exit code: a supervisor watching `basalt serve`
   sees the server's status rather than the wrapper's. On Linux the process is replaced.
