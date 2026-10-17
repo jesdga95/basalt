@@ -3,15 +3,14 @@
 #include "basalt/core/model_file.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/platform/file.hpp"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #else
-#include <fcntl.h>
 #include <sys/stat.h>
-#include <unistd.h>
 #endif
 
 #include <algorithm>
@@ -30,12 +29,8 @@ namespace {
 
 bool file_size_of(const std::string& path, uint64_t& size) {
 #if defined(_WIN32)
-    const int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-    if (wlen <= 0) return false;
-    std::wstring w((size_t) wlen, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, w.data(), wlen);
     WIN32_FILE_ATTRIBUTE_DATA d{};
-    if (!GetFileAttributesExW(w.c_str(), GetFileExInfoStandard, &d)) return false;
+    if (!GetFileAttributesExW(platform::to_wide(path).c_str(), GetFileExInfoStandard, &d)) return false;
     if (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return false;   // stat's S_ISREG, in the form Windows gives
     ULARGE_INTEGER sz;
     sz.HighPart = d.nFileSizeHigh;
@@ -50,51 +45,26 @@ bool file_size_of(const std::string& path, uint64_t& size) {
 #endif
 }
 
-#if defined(_WIN32)
-/// A file opened for reading. The path is UTF-8 everywhere in the engine, so it becomes UTF-16 here.
-struct OpenedFile {
-    HANDLE h = INVALID_HANDLE_VALUE;
-    bool open(const std::string& path) {
-        const int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-        if (wlen <= 0) return false;
-        std::wstring w((size_t) wlen, L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, w.data(), wlen);
-        h = CreateFileW(w.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        return h != INVALID_HANDLE_VALUE;
-    }
-    ~OpenedFile() { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
-};
-
-bool pread_all(HANDLE h, void* dst, uint64_t n, uint64_t off) {
-    LARGE_INTEGER where;
-    where.QuadPart = (LONGLONG) off;
-    if (!SetFilePointerEx(h, where, nullptr, FILE_BEGIN)) return false;
-    uint8_t* p = (uint8_t*) dst;
-    while (n > 0) {
-        const DWORD want = (DWORD) std::min<uint64_t>(n, 1ull << 30);
-        DWORD got = 0;
-        if (!ReadFile(h, p, want, &got, nullptr) || got == 0) return false;
-        p += got;
-        n -= got;
-    }
-    return true;
-}
-#else
+/// Reads `n` bytes at `off` through a descriptor, looping over the short counts one positional read answers with.
 bool pread_all(int fd, void* dst, uint64_t n, uint64_t off) {
     uint8_t* p = (uint8_t*) dst;
     while (n > 0) {
-        const size_t want = (size_t) std::min<uint64_t>(n, 1ull << 30);
-        const ssize_t got = ::pread(fd, p, want, (off_t) off);
-        if (got < 0 && errno == EINTR) continue;
-        if (got <= 0) return false;
+        const int64_t got = platform::pread(fd, p, std::min<uint64_t>(n, 1ull << 30), off);
+        if (got <= 0) {
+#if defined(_WIN32)
+            return false;
+#else
+            // A signal can interrupt a read before it has transferred anything; that one is restarted.
+            if (got < 0 && errno == EINTR) continue;
+            return false;
+#endif
+        }
         p += got;
         off += (uint64_t) got;
         n -= (uint64_t) got;
     }
     return true;
 }
-#endif
 
 }  // namespace
 
@@ -112,16 +82,10 @@ uint64_t FileRange::size() const {
 
 bool read_range_at(const FileRange& r, uint64_t off, void* dst, uint64_t n, std::string& err) {
     if (r.bytes != 0 && (off > r.bytes || n > r.bytes - off)) { err = "read past the end of a section of " + r.path; return false; }
-#if defined(_WIN32)
-    OpenedFile f;
-    if (!f.open(r.path)) { err = "cannot open " + r.path; return false; }
-    const bool ok = pread_all(f.h, dst, n, r.offset + off);
-#else
-    const int fd = ::open(r.path.c_str(), O_RDONLY);
+    const int fd = platform::open_fd_utf8(r.path);
     if (fd < 0) { err = "cannot open " + r.path; return false; }
     const bool ok = pread_all(fd, dst, n, r.offset + off);
-    ::close(fd);
-#endif
+    platform::close_fd(fd);
     if (!ok) err = "short read from " + r.path;
     return ok;
 }
@@ -330,16 +294,10 @@ bool ModelFile::open(const std::string& path, std::string& err) {
     if (actual < kHeaderBytes) { err = path + ": not a .basalt model file (too short)"; return false; }
     std::vector<uint8_t> head((size_t) kHeaderBytes);
     {
-#if defined(_WIN32)
-        OpenedFile f;
-        if (!f.open(path)) { err = "cannot open " + path; return false; }
-        const bool ok = pread_all(f.h, head.data(), kHeaderBytes, 0);
-#else
-        const int fd = ::open(path.c_str(), O_RDONLY);
+        const int fd = platform::open_fd_utf8(path);
         if (fd < 0) { err = "cannot open " + path; return false; }
         const bool ok = pread_all(fd, head.data(), kHeaderBytes, 0);
-        ::close(fd);
-#endif
+        platform::close_fd(fd);
         if (!ok) { err = "cannot read the header of " + path; return false; }
     }
     FileHeader h;
@@ -523,7 +481,7 @@ bool hc8_write(const std::string& path, const std::vector<Hc8Copy>& copies, std:
     h.version = 1;
     h.n_entries = (uint32_t) copies.size();
     const std::string tmp = path + ".tmp";
-    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    std::FILE* f = platform::open_file_utf8(tmp, "wb");
     if (f == nullptr) { err = "hc8: cannot create " + tmp; return false; }
     bool ok = std::fwrite(&h, sizeof h, 1, f) == 1 &&
               (entries.empty() || std::fwrite(entries.data(), sizeof(Hc8Entry), entries.size(), f) == entries.size());
