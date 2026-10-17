@@ -114,6 +114,14 @@ What the engine reports is the honest answer, not an assumption:
 `ReadFile` with `FILE_FLAG_NO_BUFFERING` requires 512-byte multiples, which is why the direct-file
 reader keeps its 4 KiB request contract rather than relaxing the alignment asserts.
 
+The pinned arena has a second guard. If the whole arena cannot be registered, the slices are pinned
+up to the GPU's shared-memory budget (`RAM/2 - 8 GiB`) rather than until the driver refuses one:
+page-locked memory the GPU maps is charged to the device's shared segment, and filling that segment
+makes later device allocations fail. The note says what was capped and to how much. The arena is
+reserved and then committed in 1 GiB chunks, so a refusal names the size the commit reached and the
+commit charge still free (RAM plus page file): a page-locked arena needs RAM and page file, and a
+machine with a small page file runs out of commit before it runs out of RAM.
+
 ## Platform differences that are visible from outside
 
 These are the places where the platform layer gives out and the engine says so rather than
@@ -132,6 +140,11 @@ pretending otherwise:
 - **Per-range release of mapped pages** (`madvise(MADV_DONTNEED)` / `posix_fadvise`) is a no-op.
   A Windows file mapping is released as a whole, and the pages of a read-only view are clean, so
   the OS can drop them on its own.
+- **Read-ahead of a mapped file** is a range hint to the cache manager (`PrefetchVirtualMemory`), so
+  experts read through the mapped expert file are prefetched there as they are with `madvise` on
+  Linux. The descriptor form (`posix_fadvise`) has no Windows counterpart and asks for nothing:
+  reads through a handle are cached reads, and the cache manager reads ahead around a sequential
+  reader itself.
 - **cgroup CPU and memory quotas** do not exist here. The engine reads the host's own numbers
   (`GlobalMemoryStatusEx`) and reports no container limit.
 - A file mapping view must start at an allocation-granularity offset, so the expert tiers map the
