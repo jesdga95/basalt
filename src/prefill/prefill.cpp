@@ -33,7 +33,30 @@
 #include "basalt/prefill/kernels.hpp"
 
 #include <cuda_runtime.h>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <io.h>
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+namespace {
+/// Positional read on a CRT descriptor. The offset rides in the OVERLAPPED structure, so several staging threads
+/// can share one descriptor without moving a shared file position.
+ssize_t pread(int fd, void* dst, size_t n, uint64_t off) {
+    const HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    OVERLAPPED ov{};
+    ov.Offset = (DWORD) (off & 0xFFFFFFFFull);
+    ov.OffsetHigh = (DWORD) (off >> 32);
+    DWORD got = 0;
+    if (!ReadFile(h, dst, (DWORD) n, &got, &ov)) return -1;
+    return (ssize_t) got;
+}
+}  // namespace
+#else
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -215,7 +238,12 @@ struct Stager {
     static bool read_file(const Job& jb, uint8_t* dst) {
         size_t done = 0;
         while (done < jb.bytes) {
+            // MSVC's off_t is 32 bits, so the offset stays a 64-bit value on that side of the call.
+#if defined(_WIN32)
+            const ssize_t n = pread(jb.fd, dst + done, jb.bytes - done, jb.off + done);
+#else
             const ssize_t n = pread(jb.fd, dst + done, jb.bytes - done, (off_t) (jb.off + done));
+#endif
             if (n < 0 && errno == EINTR) continue;
             if (n <= 0) return false;
             done += (size_t) n;

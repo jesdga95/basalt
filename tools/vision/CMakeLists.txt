@@ -29,10 +29,17 @@ add_library(vision_core STATIC
   ${VISION_ROOT}/src/vision/gemm_cpu.cpp
   ${VISION_ROOT}/src/vision/gemm_cpu_avx512.cpp)
 target_include_directories(vision_core PUBLIC ${VISION_ROOT}/include PRIVATE ${VISION_ROOT}/src/vision)
-set_source_files_properties(${VISION_ROOT}/src/vision/gemm_cpu.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
-# the AVX-512 BF16 file is only called after a run-time CPU check
-set_source_files_properties(${VISION_ROOT}/src/vision/gemm_cpu_avx512.cpp
-                            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512bf16;-mfma")
+if(MSVC)
+  # /arch: selects the baseline; the intrinsics used below are available to a function that uses them either way.
+  set_source_files_properties(${VISION_ROOT}/src/vision/gemm_cpu.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+  # the AVX-512 BF16 file is only called after a run-time CPU check
+  set_source_files_properties(${VISION_ROOT}/src/vision/gemm_cpu_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+else()
+  set_source_files_properties(${VISION_ROOT}/src/vision/gemm_cpu.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+  # the AVX-512 BF16 file is only called after a run-time CPU check
+  set_source_files_properties(${VISION_ROOT}/src/vision/gemm_cpu_avx512.cpp
+                              PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512bf16;-mfma")
+endif()
 target_link_libraries(vision_core PUBLIC Threads::Threads)
 
 # device side

@@ -15,8 +15,31 @@
 #include <string>
 #include <utility>
 #include <vector>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <fcntl.h>
+#include <io.h>
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+namespace basalt_ppl_gate_win {
+/// Positional read on a CRT descriptor, at an explicit offset.
+inline ssize_t pread(int fd, void* dst, size_t n, uint64_t off) {
+    const HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    OVERLAPPED ov{};
+    ov.Offset = (DWORD) (off & 0xFFFFFFFFull);
+    ov.OffsetHigh = (DWORD) (off >> 32);
+    DWORD got = 0;
+    if (!ReadFile(h, dst, (DWORD) n, &got, &ov)) return -1;
+    return (ssize_t) got;
+}
+}  // namespace basalt_ppl_gate_win
+#else
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
 namespace basalt::program {
 
@@ -68,7 +91,10 @@ public:
     bool finish(std::string& err) {
         const bool ok = wait(err);
         std::fflush(out_);
+#if !defined(_WIN32)
+        // Asking the page cache to release what was read has no counterpart here; the base rows are few and small.
         posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED);
+#endif
         return ok;
     }
 
@@ -81,7 +107,11 @@ private:
         const char* base = paths().first.c_str();
         const char* out = paths().second.c_str();
         if (paths().first.empty() || paths().second.empty()) return;
+#if defined(_WIN32)
+        fd_ = _open(base, _O_RDONLY | _O_BINARY);
+#else
         fd_ = ::open(base, O_RDONLY);
+#endif
         char magic[8];
         uint32_t n_ctx = 0;
         int32_t nv[2] = {0, 0};
@@ -106,13 +136,24 @@ private:
         close_fd();
     }
     void close_fd() {
-        if (fd_ >= 0) ::close(fd_);
+        if (fd_ >= 0) {
+#if defined(_WIN32)
+            _close(fd_);
+#else
+            ::close(fd_);
+#endif
+        }
         fd_ = -1;
     }
     bool read_at(void* dst, size_t bytes, uint64_t off) const {
         uint8_t* p = (uint8_t*) dst;
         while (bytes > 0) {
+            // MSVC's off_t is 32 bits, so the offset stays 64-bit on that side of the call.
+#if defined(_WIN32)
+            const ssize_t r = basalt_ppl_gate_win::pread(fd_, p, bytes, off);
+#else
             const ssize_t r = ::pread(fd_, p, bytes, (off_t) off);
+#endif
             if (r <= 0) return false;
             p += r;
             off += (uint64_t) r;

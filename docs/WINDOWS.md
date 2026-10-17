@@ -1,0 +1,199 @@
+# Basalt on Windows
+
+Native Windows build of the engine: the C++/CUDA engine and the Python server, one RTX 5090
+(sm_120). This is a platform port - no kernel math, no weight format and no precision behaviour
+changed. The Linux build is the regression oracle, and every Windows change sits behind
+`#if defined(_WIN32)` / CMake `if(WIN32)` so the Linux code path is unchanged.
+
+## Toolchain
+
+The versions this was built with:
+
+| component | version |
+| --- | --- |
+| Windows | 11 (26100), x64 |
+| Visual Studio | Community 2022 (17.14) + Build Tools |
+| MSVC | 19.44.35222, toolset 14.44.35207 |
+| CUDA Toolkit | 13.0 (V13.0.88) |
+| NVIDIA driver | 566.x reported as driver/runtime 13040 |
+| CMake | 4.1.0-rc4 |
+| Ninja | 1.13.0 (kitware jobserver build) |
+| Python | 3.12.10 for the server; 3.11 also works |
+
+CUDA architecture is fixed at 120 (Blackwell), as elsewhere in the project.
+
+## Building
+
+Open a **Developer command prompt** (or wrap any command in a `vcvarsall.bat x64` call - the
+compiler is not on `PATH` by itself):
+
+```bat
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build build -j
+```
+
+The configure step must run inside that developer environment: CMake probes the compiler, and
+`nvcc`'s host compiler has to be the `cl.exe` that `vcvarsall` put on `PATH`.
+
+Ninja's worker pool uses a named pipe. Anything that confines a process so it cannot create one
+(an antivirus filter driver, a sandboxed shell, a restricted token) makes the build stop at
+"Detecting C compiler ABI info" with no error. A bare `cl.exe` still works there, so the symptom
+is confusing: run the build from a normal shell if configure hangs.
+
+### Running the tests
+
+```bat
+set TEMP=E:\path\to\basalt\build\tmp
+set TMP=E:\path\to\basalt\build\tmp
+ctest --test-dir build -j 8 --output-on-failure
+```
+
+Several tests write fixtures through `std::filesystem::temp_directory_path()`. If the machine's
+temporary directory is denied to the test process - which a security product can arrange - the
+fixtures fail to open and the tests report a creation error rather than a numeric one. Pointing
+`TEMP`/`TMP` into the build tree avoids that.
+
+Two tests are not built on Windows at all, because they exercise a Linux-only surface: the cgroup
+CPU-quota probe (`cpu_quota_test`) and the Linux affinity backend (`pool_affinity_test`).
+
+### When a failure is the machine and not the code
+
+Most of what looks like a test failure on Windows is the environment. Two checks separate them
+before any debugging:
+
+- **Run the test binary from a directory outside the build tree.** A filtered token, a security
+  product's folder rule or a working-directory restriction can deny file creation to a child
+  process. The same binary in the same session then passes from another directory, which is the
+  proof that the code is fine. `gguf_reader_test`, `gguf_split_test`, `model_file_test`,
+  `expert_profile_save_test`, `native_dense_ple_key_test`, `file_expert_source_test`,
+  `ple_reader_selftest` and `dec_gdn_parity` all behave this way.
+- **Read the mechanism, not the verdict.** `platform_memory_test` prints its own diagnosis when it
+  fails: `lock_resident: ok=0 ... SetProcessWorkingSetSizeEx failed (error 1314); VirtualLock
+  stopped at 0 of 256 MiB (error 1453)`. Those are token-privilege errors, not parity errors, and
+  the test passes where the privileges are held.
+
+Two tests need an `experts.bin` fixture in the working directory that is a developer's local file
+and is not in the repository: `expert_parity` and `pool_test` fail with "cannot read expert 0
+(layer 0) from experts.bin" until one is supplied with `--file`.
+
+The real-weight tools (`ple_q5_parity`, `expert_parity --file`, `pool_test --file`) want a **raw
+GGUF or a raw `experts.bin`**, not a `.basalt` container. Handing them a container makes them
+decode arbitrary bytes: they either report nonsense or fault. `ple_q5_parity` exits with
+`0xc0000409` that way.
+
+## Memory residency
+
+Two different Windows limits matter, and they need two different privileges. Both are commonly
+assigned to the account and left **disabled** in the token of an interactive process; the engine
+enables them in its own token, but the right still has to be granted to the account, through
+*Local Security Policy -> User Rights Assignment*:
+
+- **Lock pages in memory** (`SeLockMemoryPrivilege`) - required for the large-page arena.
+- **Increase a process working set** (`SeIncreaseWorkingSetPrivilege`) - required to raise the
+  working-set minimum that `VirtualLock` counts against.
+
+What the engine reports is the honest answer, not an assumption:
+
+- The resident expert copy is locked through a raised working-set minimum plus chunked
+  `VirtualLock`. A quota that cannot be raised is reported in the note, and the lock is attempted
+  anyway: a partially locked region is still better than a pageable one.
+- The pinned arena asks for `MEM_LARGE_PAGES` first, like `hugetlb` on Linux. On this machine the
+  large-page minimum is detected (2 MiB) and the privilege enables, but the system's large-page
+  pool declines (`ERROR_NO_SYSTEM_RESOURCES`, 1450): drivers and the OS take that pool at boot, so
+  whether it is available is a machine property. The arena then falls back to ordinary 4 KiB pages
+  and `cudaHostRegister` still pins all of it - measured with a 4 GiB arena, which registered in a
+  single piece, so the per-slice fallback was not needed. The note names the size, the large-page
+  minimum and the `VirtualAlloc` error, because a declined pool (1450), a missing privilege (1314)
+  and a size that is not a multiple of the minimum (87) need different fixes and look alike
+  otherwise.
+- Never assume the backing from the code path: read the note the engine prints at startup. The
+  difference between large pages and 4 KiB pages is more than a factor of two in TLB reach.
+
+`ReadFile` with `FILE_FLAG_NO_BUFFERING` requires 512-byte multiples, which is why the direct-file
+reader keeps its 4 KiB request contract rather than relaxing the alignment asserts.
+
+## Platform differences that are visible from outside
+
+These are the places where the platform layer gives out and the engine says so rather than
+pretending otherwise:
+
+- **Peer-GPU expert tiers** are excluded: the port targets one GPU, as the Linux baseline does.
+- **Shared arena files** are refused with a note. They exist to populate a `tmpfs` mapping shared
+  between processes, and there is no counterpart to that arrangement here.
+- **Per-range release of mapped pages** (`madvise(MADV_DONTNEED)` / `posix_fadvise`) is a no-op.
+  A Windows file mapping is released as a whole, and the pages of a read-only view are clean, so
+  the OS can drop them on its own.
+- **cgroup CPU and memory quotas** do not exist here. The engine reads the host's own numbers
+  (`GlobalMemoryStatusEx`) and reports no container limit.
+- A file mapping view must start at an allocation-granularity offset, so the expert tiers map the
+  whole file and address the expert region inside the view, instead of mapping just that range.
+- `fopen` and the CRT low-level file API take the ANSI code page on Windows, so a pack path with
+  characters outside it cannot be opened through those calls; the paths the engine opens with
+  `CreateFileW` (the GGUF, the model file, the expert tiers) are decoded as UTF-8 and are fine.
+- `off_t` is 32 bits in MSVC. Every read that can land past 4 GiB uses an explicitly 64-bit offset.
+
+## Compiler notes worth knowing
+
+Four things about MSVC cost real time and are worth recording:
+
+- `/arch:AVX2` defines `__AVX__` and `__AVX2__` but **not** `__F16C__`; `/arch:AVX512` adds
+  `F`/`BW`/`VL`/`DQ` but not `F16C`, `VNNI` or `VBMI` - although the intrinsics for all of those
+  compile anyway. The sources that branch on those macros therefore silently take the scalar path
+  unless the macros are defined alongside the flag, which the build now does.
+- MSVC gives the scalar F16C conversions `_cvtss_sh` and `_cvtsh_ss` no working code: its headers declare
+  them nowhere, and with `__F16C__` defined the compiler claims the names as its own, so a definition
+  compiled under that macro does not build as written. The pair is supplied by `src/kernels/cpu/ggml/
+  f16c_scalar_msvc.c`, built from the vector intrinsics (the same instruction: `1.5` becomes `0x3E00` and
+  back; `0.1` becomes `0x2E66` and back to `0.0999756`). That file is compiled *without* `__F16C__`, and
+  the extracted ggml dots carry `#pragma function` plus prototypes for the names, so the calls reach the
+  definitions instead of compiler-generated code. Getting this wrong fails quietly: every stored block
+  scale reads as zero, the quants stay correct, and each CPU dot product lands ~1e13 off - the engine
+  still runs, on garbage numbers.
+- MSVC has no `_Float16`, and no `__builtin_cpu_supports`. The vision encoder's fp32-through-half
+  quantization uses the F16C intrinsic pair, and the BF16 kernel's run-time probe reads the same
+  CPUID leaves and XCR0 bits GCC's probe consults. The AVX-512 BF16 types themselves need no
+  change: MSVC spells `__m256bh` and `__m512bh` as typedefs of the integer vectors.
+- MSVC reports `__cplusplus` as `199711L` unless `/Zc:__cplusplus` is passed. The CUDA driver header
+  defines `CUtensorMap` with `alignas(TENSOR_MAP_ALIGN)` only when the reported value looks like
+  C++11 or later, so without that flag the type compiles with the natural 8-byte alignment instead of
+  64 (or 128, as reported by GCC). `hc_fused_kernel` passes six TMA descriptors in a
+  `__grid_constant__` argument struct; when the struct's alignment is wrong, every
+  `cp.async.bulk.tensor`/`prefetch.tensormap` faults with `cudaErrorMisalignedAddress`
+  (compute-sanitizer reports it as "Misaligned shared or local address"), which surfaces in the
+  engine as a stuck verify window. The build passes `/Zc:__cplusplus` to cl.exe and nvcc's host
+  pass for every Windows translation unit; the Linux build is untouched because GCC has always
+  reported the true standard version. Same class as CUTLASS issue 2905 and PyGPUkit issue 107.
+
+`GGML_EXTENSION` (a GCC `__extension__`) had to be guarded: it breaks every CUDA translation unit
+that includes the block-layout header on the Windows front end.
+
+## Benchmarks
+
+Not yet measured by the maintainer on Windows; a headline number is still pending. A development
+A/B run on this machine (RTX 5090, 575 W power limit; Windows 11, MSVC 19.44, CUDA 13.0; Q3 pack;
+llama-swap-equivalent config: 524288 context, yarn, `--kv int8`, `--spec 7 --spec-min-p 0.5`,
+`--ple-io ram`, `--kv-resident 32768`) measured, as a sanity check only:
+
+- prefill: 64,437 prompt tokens read in 11 s (~5,860 tok/s)
+- decode: 12,299 tokens (reasoning + answer) in 56 s (~220 tok/s steady state)
+
+These are not a headline figure. The reference the port is checked against is the maintainer's WSL2
+setup on this same box (~214 tok/s at 524k context) and the published single-5090 Linux figures
+(585 tok/s structured decode, 316 tok/s prose decode, 7,317 tok/s prefill, 400 W power limit), which
+a maintainer run on Windows should match at its own power limit. Every number is labelled with the
+power limit it was taken at.
+
+## Machine-specific observations
+
+Recorded because they cost time and look like code defects when they are not:
+
+- An executable named `basalt-load.exe` could not be created under the workspace on this machine:
+  creating that exact filename is denied (`Access denied`) in that directory tree, while any other
+  name is allowed. The program compiles and links fine under a different name. Check with a build
+  of your own before treating that failure as a port defect.
+- A process started from under one particular folder on this machine was given a token that cannot
+  raise its own working-set quota (`ERROR_PRIVILEGE_NOT_HELD`, 1314), while the *same* executable
+  run from another folder locked 256 MiB successfully. `platform_memory_test` fails in the first
+  location and passes in the second. If that test fails, run the same binary from somewhere else
+  before believing the port is wrong.

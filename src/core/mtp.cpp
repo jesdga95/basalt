@@ -57,6 +57,16 @@
 #include <immintrin.h>
 #endif
 
+// The 64-bit seek and the descriptor behind a FILE*, in the spelling each platform uses: the expert files are far
+// larger than 4 GiB, so a 32-bit fseek would wrap.
+#if defined(_WIN32)
+#define BASALT_FSEEK64(f, off, whence) _fseeki64((f), (long long) (off), (whence))
+#define BASALT_FILENO(f) _fileno(f)
+#else
+#define BASALT_FSEEK64(f, off, whence) fseeko((f), (off_t) (off), (whence))
+#define BASALT_FILENO(f) fileno(f)
+#endif
+
 namespace basalt::core {
 namespace {
 
@@ -124,8 +134,8 @@ bool read_file(const FileRange& r, std::vector<uint8_t>& out) {
         ~Closer() { if (f != nullptr) std::fclose(f); }
     } closer{f};
     const uint64_t n = r.size();
-    if (fseeko(f, (off_t) r.offset, SEEK_SET) != 0) return false;
-    basalt::platform::advise_willneed(fileno(f), r.offset, n);
+    if (BASALT_FSEEK64(f, r.offset, SEEK_SET) != 0) return false;
+    basalt::platform::advise_willneed(BASALT_FILENO(f), r.offset, n);
     out.resize((size_t) n);
     return n == 0 || std::fread(out.data(), 1, (size_t) n, f) == (size_t) n;
 }
@@ -303,7 +313,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
             return false;
         }
         FILE* f = std::fopen(files.experts.path.c_str(), "rb");
-        if (f == nullptr || fseeko(f, (off_t) files.experts.offset, SEEK_SET) != 0) {
+        if (f == nullptr || BASALT_FSEEK64(f, files.experts.offset, SEEK_SET) != 0) {
             if (f != nullptr) std::fclose(f);
             err = "mtp: cannot open " + files.experts.path;
             return false;
@@ -313,7 +323,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
             ~Closer() { if (f != nullptr) std::fclose(f); }
         } closer{f};
         if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
-        basalt::platform::advise_willneed(fileno(f), files.experts.offset, bytes);
+        basalt::platform::advise_willneed(BASALT_FILENO(f), files.experts.offset, bytes);
         std::vector<uint8_t> chunk(64u << 20);
         for (uint64_t off = 0; off < bytes;) {
             const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);

@@ -14,7 +14,9 @@
 #include <cstring>
 #include <optional>
 
+#if !defined(_WIN32)
 #include <unistd.h>
+#endif
 
 namespace basalt::core {
 namespace {
@@ -62,9 +64,22 @@ struct Seg {
 
 /// Read `n` bytes at `off`; a failure names what was being read.
 bool read_at(std::FILE* f, uint64_t off, void* dst, size_t n, std::string& err, const char* what) {
+#if defined(_WIN32)
+    if (_fseeki64(f, (long long) off, SEEK_SET) != 0) { err = std::string(what) + ": seek failed"; return false; }
+#else
     if (fseeko(f, (off_t) off, SEEK_SET) != 0) { err = std::string(what) + ": seek failed"; return false; }
+#endif
     if (std::fread(dst, 1, n, f) != n) { err = std::string(what) + ": short read"; return false; }
     return true;
+}
+
+/// The descriptor a std::FILE was opened on (read-ahead advice is asked of the file, not the stream).
+inline int fd_of(std::FILE* f) {
+#if defined(_WIN32)
+    return _fileno(f);
+#else
+    return fileno(f);
+#endif
 }
 
 /// The index's lines, one at a time (the index is a small text file).
@@ -298,7 +313,7 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
             // ask for this file's remaining rows up front so their reads overlap
             for (size_t j = row_i; j < rows.size(); ++j)
                 if (rows[j].file == r.file && !skipped[j])
-                    basalt::platform::advise_willneed(fileno(cur), cur_base + rows[j].src_off, rows[j].src_bytes);
+                    basalt::platform::advise_willneed(fd_of(cur), cur_base + rows[j].src_off, rows[j].src_bytes);
         }
 
         // ---- the segment list: what this tensor's bytes are, plane by plane, in both forms

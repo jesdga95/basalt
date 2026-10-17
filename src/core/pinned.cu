@@ -14,11 +14,17 @@
 #include <mutex>
 #include <thread>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <linux/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <linux/mman.h>
+#endif
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << 26)
 #endif
@@ -48,6 +54,51 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
               uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {
     mapping_base = nullptr;
     mapping_bytes = 0;
+#if defined(_WIN32)
+    if (!shared_file.empty()) {
+        note = "shared arena files are not available on Windows";
+        return nullptr;
+    }
+    // MEM_LARGE_PAGES needs SeLockMemoryPrivilege, and the account having it assigned is not enough: the process
+    // enables it in its own token first. An account without the assignment fails here and falls through to the
+    // ordinary allocation below, which is the expected outcome rather than an error.
+    {
+        HANDLE tok = nullptr;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
+            TOKEN_PRIVILEGES tp{};
+            tp.PrivilegeCount = 1;
+            if (LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege", &tp.Privileges[0].Luid)) {
+                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                (void) AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr);
+            }
+            CloseHandle(tok);
+        }
+    }
+    const SIZE_T large = GetLargePageMinimum();
+    if (large > 0) {
+        // The requested size must be an exact multiple of the large-page minimum; the slack is under one page.
+        const SIZE_T lbytes = (SIZE_T) (((SIZE_T) bytes + large - 1) / large * large);
+        void* p = VirtualAlloc(nullptr, lbytes, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+        if (p != nullptr) {
+            got = PageBacking::LargePages;
+            note = "large pages (" + std::to_string((unsigned long long) large) + " B)";
+            return p;
+        }
+        // ERROR_NO_SYSTEM_RESOURCES is the page pool declining, ERROR_PRIVILEGE_NOT_HELD is the token and
+        // ERROR_INVALID_PARAMETER a size that is not a multiple of the minimum. They need different fixes, so the
+        // note carries the number.
+        note = "large pages refused for " + std::to_string((unsigned long long) lbytes) +
+               " B (GetLargePageMinimum=" + std::to_string((unsigned long long) large) + ", VirtualAlloc error " +
+               std::to_string((unsigned long long) GetLastError()) + "); using 4 KB pages";
+    } else {
+        note = "this system has no large-page minimum; using 4 KB pages";
+    }
+    {
+        void* p = VirtualAlloc(nullptr, (SIZE_T) bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        got = PageBacking::NormalPages;
+        return p;
+    }
+#else
     if (!shared_file.empty()) {
         if (shared_hash == 0) {
             note = "shared arena requires a nonzero model hash";
@@ -178,11 +229,17 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         note += "; transparent huge pages requested (MADV_HUGEPAGE)";
     }
     return p;
+#endif
 }
 
 void release(void* p, uint64_t bytes) {
     if (!p) return;
+#if defined(_WIN32)
+    (void) bytes;   // one VirtualAlloc owns the whole region
+    VirtualFree(p, 0, MEM_RELEASE);
+#else
     munmap(p, bytes);
+#endif
 }
 
 }  // namespace
@@ -376,7 +433,11 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
             uint64_t pos = 0;
             uint64_t h = 1469598103934665603ull;
             // 64-bit seek: the file is far larger than 4 GiB, so a 32-bit `fseek` would wrap
+#if defined(_WIN32)
+            if (_fseeki64(f, (long long) (base + off), SEEK_SET) != 0) {
+#else
             if (fseeko(f, (off_t) (base + off), SEEK_SET) != 0) {
+#endif
                 std::lock_guard<std::mutex> g(err_mu);
                 err = "seek to " + std::to_string(off) + " B failed in layer " + std::to_string(L);
                 return;

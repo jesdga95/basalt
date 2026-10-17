@@ -33,10 +33,20 @@
 
 #include "basalt/artifact/gguf_split.hpp"
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+// This header is included widely, and windows.h min/max macros would break std::min/std::max in every file that
+// includes it.
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace basalt {
 
@@ -383,6 +393,35 @@ public:
 
 private:
     void open() {
+#if defined(_WIN32)
+        // A read-only file mapping stands in for the private mmap: the pages are the cache manager's, demand
+        // faulted, and nothing here writes to them.
+        const int wlen = MultiByteToWideChar(CP_UTF8, 0, path_.c_str(), -1, nullptr, 0);
+        std::wstring wpath((size_t) (wlen > 0 ? wlen : 1), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, path_.c_str(), -1, wpath.data(), wlen);
+        HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open " + path_);
+        LARGE_INTEGER li{};
+        if (!GetFileSizeEx(h, &li)) {
+            CloseHandle(h);
+            throw std::runtime_error("GetFileSizeEx failed");
+        }
+        size_ = (uint64_t) li.QuadPart;
+        HANDLE m = CreateFileMappingW(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (m == nullptr) {
+            CloseHandle(h);
+            throw std::runtime_error("CreateFileMapping failed");
+        }
+        base_ = (const uint8_t*) MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+        if (base_ == nullptr) {
+            CloseHandle(m);
+            CloseHandle(h);
+            throw std::runtime_error("MapViewOfFile failed");
+        }
+        map_ = m;
+        file_ = h;
+#else
         int fd = ::open(path_.c_str(), O_RDONLY);
         if (fd < 0) throw std::runtime_error("cannot open " + path_);
         fd_ = fd;
@@ -392,6 +431,7 @@ private:
         void* p = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
         if (p == MAP_FAILED) throw std::runtime_error("mmap failed");
         base_ = (const uint8_t*)p;
+#endif
         const auto& reg = gguf_virtual_registry();
         const auto it = reg.find(path_);
         if (it != reg.end()) {
@@ -406,8 +446,17 @@ private:
         parse();
     }
     void close() {
+#if defined(_WIN32)
+        if (base_ != nullptr) UnmapViewOfFile(base_);
+        if (map_ != nullptr) CloseHandle(map_);
+        if (file_ != nullptr) CloseHandle(file_);
+        base_ = nullptr;
+        map_ = nullptr;
+        file_ = nullptr;
+#else
         if (base_) munmap((void*)base_, size_);
         if (fd_ >= 0) ::close(fd_);
+#endif
     }
 
     void parse() {
@@ -454,7 +503,11 @@ private:
     const uint8_t* base_ = nullptr;
     uint64_t size_ = 0, data_start_ = 0, alignment_ = 32;
     uint32_t version_ = 0;
+#if defined(_WIN32)
+    HANDLE map_ = nullptr, file_ = nullptr;
+#else
     int fd_ = -1;
+#endif
     bool virtual_ = false;
     std::vector<TensorInfo> tensors_;
     std::map<std::string, MetaValue> meta_;

@@ -1,7 +1,8 @@
 // include/basalt/platform/memory.hpp - keep a large host region resident.
 //
 // An unlocked expert arena is trimmed under memory pressure, which makes the CPU pool's speed vary between
-// runs. With the n-gram table out of RAM there is headroom to lock it: mlock.
+// runs. With the n-gram table out of RAM there is headroom to lock it: mlock on Linux, the process working-set
+// minimum plus VirtualLock on Windows.
 #pragma once
 
 #include <cstdint>
@@ -24,7 +25,7 @@ void unlock_resident(void* p, uint64_t bytes);
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
 
-/// MemAvailable from /proc/meminfo in bytes (0 when unknown).
+/// The RAM the OS can hand out without paging, in bytes (0 when unknown).
 uint64_t available_memory();
 
 /// The RAM left alone by anything that locks or fills memory: the larger of 2 GiB and 5% of the machine's RAM.
@@ -75,11 +76,11 @@ inline uint64_t max_safe_copy(uint64_t avail, uint64_t late, uint64_t floor) {
     return avail > late + floor ? avail - late - floor : 0;
 }
 
-/// The RAM a page-locked or fully resident allocation may take now: MemAvailable less ram_margin().  `known` is
-/// false when /proc/meminfo cannot be read (nothing is refused then).
+/// The RAM a page-locked or fully resident allocation may take now: available_memory() less ram_margin().  `known`
+/// is false when the OS gives no reading (nothing is refused then).
 uint64_t ram_budget(bool* known = nullptr);
 
-/// Polls MemAvailable until `stop_memory_watchdog`.  Below `floor_bytes` it prints a `basalt error:` line and
+/// Polls available_memory() until `stop_memory_watchdog`.  Below `floor_bytes` it prints a `basalt error:` line and
 /// _exit(1)s, so a load that is exhausting RAM ends before the machine starts to swap.
 void start_memory_watchdog(uint64_t floor_bytes);
 /// Tells the watchdog the load builds a resident RAM copy of the experts (`resident`) and how big it is so far, so
@@ -87,10 +88,10 @@ void start_memory_watchdog(uint64_t floor_bytes);
 void watch_resident_ram(bool resident, uint64_t copy_bytes);
 void stop_memory_watchdog();
 
-/// Whether a MemAvailable reading `avail` is below `floor` (a reading of 0, unknown, is not).
+/// Whether an available-RAM reading of `avail` is below `floor` (a reading of 0, unknown, is not).
 inline bool ram_below_floor(uint64_t avail, uint64_t floor) { return avail > 0 && avail < floor; }
 
-/// While serving: polls MemAvailable and keeps whether it is below `floor_bytes`, for ram_guard_low.  The request
+/// While serving: polls available_memory() and keeps whether it is below `floor_bytes`, for ram_guard_low.  The request
 /// that is running then stops with an error instead of the machine swapping; nothing is shrunk or exited.
 void start_ram_guard(uint64_t floor_bytes);
 /// True while the last reading was below the guard's floor; `avail` and `floor` get that reading and the floor.

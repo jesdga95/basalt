@@ -34,7 +34,11 @@ bool read_blob(const char* path, long long index, std::vector<uint8_t>& out) {
     out.assign(cpu::BLOB, 0);
     std::FILE* f = std::fopen(path, "rb");
     if (!f) return false;
+#if defined(_WIN32)
+    if (_fseeki64(f, (long long) index * (long long) cpu::BLOB, SEEK_SET) != 0) { std::fclose(f); return false; }
+#else
     if (fseeko(f, (off_t) index * (off_t) cpu::BLOB, SEEK_SET) != 0) { std::fclose(f); return false; }
+#endif
     const size_t got = std::fread(out.data(), 1, out.size(), f);
     std::fclose(f);
     return got == out.size();

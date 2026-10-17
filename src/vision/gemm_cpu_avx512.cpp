@@ -44,7 +44,22 @@ inline void tile4(const uint16_t* x, const uint16_t* w, float* y, int m0, int ro
 
 }  // namespace
 
+#if defined(_MSC_VER)
+bool cpu_has_bf16() {
+    // The same readings GCC's run-time probe takes: the OS has to save the AVX-512 state, and leaf 7 subleaf 0
+    // names AVX512BW (EBX bit 30) and AVX512_BF16 (ECX bit 5).
+    unsigned r[4];
+    { int x[4]; __cpuidex(x, 0, 0); if ((unsigned) x[0] < 7u) return false; }
+    { int x[4]; __cpuidex(x, 1, 0); for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i]; }
+    if (!((r[2] >> 27) & 1u)) return false;                 // OSXSAVE
+    const unsigned long long xcr0 = _xgetbv(0);
+    if ((xcr0 & 0xE6) != 0xE6) return false;                // the OS saves the AVX-512 state
+    { int x[4]; __cpuidex(x, 7, 0); for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i]; }
+    return ((r[1] >> 30) & 1u) != 0 && ((r[2] >> 5) & 1u) != 0;   // AVX512BW, AVX512_BF16
+}
+#else
 bool cpu_has_bf16() { return __builtin_cpu_supports("avx512bf16") && __builtin_cpu_supports("avx512bw"); }
+#endif
 
 void gemm_bf16_avx512(const float* X, const uint16_t* W, float* Y, int M, int N, int K, int threads) {
     std::vector<uint16_t> xb((size_t) M * K);

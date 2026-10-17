@@ -31,10 +31,18 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <fcntl.h>   // _open
+#include <io.h>      // _close
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace basalt::core {
 
@@ -230,6 +238,18 @@ namespace detail {
 bool host_available_memory(HostMemory& m, const std::string& meminfo, const std::string& self_cgroup,
                            const std::string& cgroup_root) {
     m = HostMemory{};
+#if defined(_WIN32)
+    // No /proc/meminfo and no cgroup hierarchy here: the OS reading is the whole answer, and there is no container
+    // limit tighter than it.
+    (void) meminfo;
+    (void) self_cgroup;
+    (void) cgroup_root;
+    const uint64_t avail = basalt::platform::available_memory();
+    if (avail == 0) return false;
+    m.available = avail;
+    m.cgroup_limit = ~0ull;
+    return true;
+#else
     // MemAvailable includes reclaimable page cache, unlike _SC_AVPHYS_PAGES.
     std::ifstream info(meminfo);
     std::string line;
@@ -315,6 +335,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     }
     m.available = bytes;
     return true;
+#endif
 }
 
 }  // namespace detail
@@ -407,6 +428,40 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
         }
     }
     const std::string& path = experts.path;
+#if defined(_WIN32)
+    const int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    std::wstring wpath((size_t) (wlen > 0 ? wlen : 1), L'\0');
+    if (wlen > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
+    HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { err = "FileExpertSource: cannot open " + path; return false; }
+    LARGE_INTEGER li{};
+    if (!GetFileSizeEx(h, &li)) { CloseHandle(h); err = "FileExpertSource: cannot stat " + path; return false; }
+    const uint64_t fsize = (uint64_t) li.QuadPart;
+    // a whole file is exactly the experts; a section must be, and lie inside the file
+    const uint64_t have = experts.bytes != 0 ? experts.bytes : fsize;
+    if (experts.offset > fsize || have > fsize - experts.offset || have != want) {
+        char buf[400];
+        std::snprintf(buf, sizeof buf,
+                      "FileExpertSource: %s is %llu B but the loaded expert layout requires %llu B - this is not "
+                      "the pack this geometry came from",
+                      path.c_str(), (unsigned long long) have,
+                      (unsigned long long) want);
+        CloseHandle(h);
+        err = buf;
+        return false;
+    }
+    // MapViewOfFile takes only allocation-granularity offsets, so the file is mapped whole and the pointer moved by
+    // the section offset. That is address space only: the pages arrive as they are touched. The view keeps the
+    // section and the file alive, so both handles close here.
+    HANDLE mapping = CreateFileMappingW(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (mapping == nullptr) { CloseHandle(h); err = "FileExpertSource: mapping failed on " + path; return false; }
+    uint8_t* raw = (uint8_t*) MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(mapping);
+    CloseHandle(h);
+    if (raw == nullptr) { err = "FileExpertSource: mapping failed on " + path; return false; }
+    void* view = raw + experts.offset;
+#else
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) { err = "FileExpertSource: cannot open " + path; return false; }
     struct stat st{};
@@ -427,7 +482,15 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
     }
     void* view = mmap(nullptr, (size_t) want, PROT_READ, MAP_SHARED, fd, (off_t) experts.offset);
     if (view == MAP_FAILED) { ::close(fd); err = "FileExpertSource: mmap failed on " + path; return false; }
+#endif
+#if defined(_WIN32)
+    // A second, plain descriptor for the prompt path's positional reads: the view stays read-only for the compute,
+    // while the staging buffers are filled with reads that do not fault mapping pages in. A failure here is not
+    // fatal - the caller falls back to copying from the view.
+    fd_ = _open(path.c_str(), _O_RDONLY | _O_BINARY);
+#else
     fd_ = fd;
+#endif
     file_off_ = experts.offset;
     base_ = (const uint8_t*) view;
     blobs_ = (int64_t) blob_count;
@@ -488,8 +551,19 @@ void FileExpertSource::close() {
     ram_reads_.store(0);
     file_read_bytes_.store(0);
     file_us_.store(0);
-    if (base_ != nullptr) munmap((void*) base_, (size_t) mapped_bytes_);
+    if (base_ != nullptr) {
+#if defined(_WIN32)
+        // the view was taken at offset 0 and moved by file_off_, so it is released from its real start
+        UnmapViewOfFile(base_ - file_off_);
+#else
+        munmap((void*) base_, (size_t) mapped_bytes_);
+#endif
+    }
+#if defined(_WIN32)
+    if (fd_ >= 0) _close(fd_);
+#else
     if (fd_ >= 0) ::close(fd_);
+#endif
     fd_ = -1;
     base_ = nullptr;
     blobs_ = 0;
@@ -816,12 +890,14 @@ bool FileExpertSource::pin_cache_complement(
     }
 
     // Copied layer by layer on a few threads: the page faults of the mapped file are the cost, and they overlap.
+#if !defined(_WIN32)
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) {
         err = "FileExpertSource: cannot determine page size for mapped-page release";
         release();
         return false;
     }
+#endif
     std::atomic<int64_t> next_layer{0}, layers_done{0};
     std::atomic<uint64_t> copied{0};
     // Progress counts the experts the GPU cache does not hold (those it holds, kept here for the prompt path's
@@ -878,6 +954,10 @@ bool FileExpertSource::pin_cache_complement(
                 if (!on_gpu[index]) progress.add(blob_bytes);
             }
             {   // the layer's pages are not kept in the file cache once copied
+#if defined(_WIN32)
+            // No per-range release for a view of a file mapping: the pages are clean (the view is read-only), so
+            // the manager takes them back on pressure by itself. Nothing is claimed freed that was not.
+#else
             const uint64_t layer_offset = layer_offsets_[(size_t) layer];
             const uint64_t layer_bytes = blob_bytes * (uint64_t) n_expert_;
             const uint64_t layer_end = layer_offset + layer_bytes;
@@ -895,6 +975,7 @@ bool FileExpertSource::pin_cache_complement(
                 fail("FileExpertSource: posix_fadvise could not release expert layer " + std::to_string(layer));
                 return;
             }
+#endif
             }
             const int64_t done = layers_done.fetch_add(1) + 1;
             if (done % 8 == 0 || done == n_layers_)
@@ -1985,7 +2066,13 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
 }
 
 void ArenaExpertSource::close() {
-    if (map_ != nullptr) munmap(map_, (size_t) map_bytes_);
+    if (map_ != nullptr) {
+#if defined(_WIN32)
+        UnmapViewOfFile(map_);
+#else
+        munmap(map_, (size_t) map_bytes_);
+#endif
+    }
     map_ = nullptr;
     map_bytes_ = 0;
     if (arena_ != nullptr) {
@@ -1998,11 +2085,15 @@ void ArenaExpertSource::close() {
 }
 
 void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
+#if defined(_WIN32)
+    (void) layer; (void) expert;   // no per-range read-ahead for the arena; see platform::advise_willneed
+#else
     if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return;
     const auto& lay = basalt::kernels::cpu::expert_layout();
     const uint64_t off = lay.blob_offset(layer, expert) & ~(uint64_t) 4095;
     const uint64_t end = lay.blob_offset(layer, expert) + lay.blob_bytes(layer);
     madvise((uint8_t*) map_ + off, (size_t) (end - off), MADV_WILLNEED);
+#endif
 }
 
 // Only the pages wholly inside the blob: a page shared with a neighbour the CPU may still read stays.  MADV_DONTNEED
@@ -2010,6 +2101,10 @@ void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
 // back under pressure, and a minor fault away when the CPU needs the expert again (an adaptive swap evicts it).
 // Dropping them from the cache too (POSIX_FADV_DONTNEED) would make every eviction a re-read from the disk.
 uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
+#if defined(_WIN32)
+    (void) layer; (void) expert;
+    return 0;   // nothing is dropped, so nothing is reported dropped
+#else
     if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return 0;
     const auto& lay = basalt::kernels::cpu::expert_layout();
     const uint64_t off = (lay.blob_offset(layer, expert) + 4095) & ~(uint64_t) 4095;
@@ -2017,6 +2112,7 @@ uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
     if (end <= off) return 0;
     if (madvise((uint8_t*) map_ + off, (size_t) (end - off), MADV_DONTNEED) != 0) return 0;
     return end - off;
+#endif
 }
 
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {

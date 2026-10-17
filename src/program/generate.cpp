@@ -66,10 +66,21 @@
 #include "basalt/vision/encoder_cuda.hpp"
 #include "basalt/vision/mmproj.hpp"
 #include "basalt/vision/preprocess.hpp"
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <intrin.h>   // _mm_pause
+#include <io.h>       // _access, _execvp
+#include <direct.h>   // _chdir
+#else
 #include <unistd.h>
-#include <cerrno>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#endif
+#include <cerrno>
 
 #include <cuda_runtime.h>
 
@@ -79,9 +90,11 @@
 #include <iostream>
 #include <future>
 #include <thread>
+#if !defined(_WIN32)
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
+#endif
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -147,12 +160,46 @@ private:
     static void cpu_relax() {
 #if defined(__x86_64__)
         __builtin_ia32_pause();
+#elif defined(_M_X64) || defined(_M_IX86)
+        _mm_pause();   // a spin without this holds the core from its SMT sibling
 #endif
     }
     // The decode loop's thread is pinned to one core, which it spins on; a thread it starts inherits that pin and would
     // wait for the spinner to yield.  The worker takes the core's SMT sibling instead: the core is awake, so the
     // worker starts at once, and the loop's thread is not preempted.
     static void leave_host_core() {
+#if defined(_WIN32)
+        GROUP_AFFINITY cur{};
+        if (!GetThreadGroupAffinity(GetCurrentThread(), &cur)) return;
+        int count = 0, host = -1;
+        for (int bit = 0; bit < 64; ++bit)
+            if (cur.Mask & (KAFFINITY(1) << bit)) { ++count; host = bit; }
+        if (count != 1) return;   // not pinned to a single processor: there is no core to leave
+        DWORD len = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+        if (len == 0) return;
+        std::vector<char> buf(len);
+        if (!GetLogicalProcessorInformationEx(RelationProcessorCore,
+                                              (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len)) return;
+        for (const char *p = buf.data(), *end = buf.data() + len; p < end;) {
+            const auto* e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) p;
+            if (e->Relationship == RelationProcessorCore) {
+                for (WORD g = 0; g < e->Processor.GroupCount; ++g) {
+                    const GROUP_AFFINITY& gm = e->Processor.GroupMask[g];
+                    if (gm.Group != cur.Group || !(gm.Mask & (KAFFINITY(1) << host))) continue;
+                    const KAFFINITY siblings = gm.Mask & ~(KAFFINITY(1) << host);
+                    if (siblings != 0) {
+                        GROUP_AFFINITY target{};
+                        target.Group = cur.Group;
+                        target.Mask = siblings;
+                        (void) SetThreadGroupAffinity(GetCurrentThread(), &target, nullptr);
+                    }
+                    return;   // the core is found; without SMT there is nowhere to move
+                }
+            }
+            p += e->Size;
+        }
+#else
         const int n = (int) sysconf(_SC_NPROCESSORS_CONF);
         if (n <= 0) return;
         cpu_set_t* own = CPU_ALLOC(n);
@@ -187,6 +234,7 @@ private:
         }
         if (own != nullptr) CPU_FREE(own);
         if (sib != nullptr) CPU_FREE(sib);
+#endif
     }
     void loop() {
         leave_host_core();
@@ -629,7 +677,11 @@ int serve_subcommand(int argc, char** argv) {
     // the working directory changes below: the paths the server reads must not depend on it
     auto absolute = [](const std::string& path) {
         char real[4096];
+#if defined(_WIN32)
+        if (_fullpath(real, path.c_str(), sizeof real - 1) == nullptr) {
+#else
         if (::realpath(path.c_str(), real) == nullptr) {
+#endif
             std::fprintf(stderr, "basalt serve: cannot open %s\n", path.c_str());
             std::exit(1);
         }
@@ -653,15 +705,33 @@ int serve_subcommand(int argc, char** argv) {
         return 2;
     }
     char exe[4096];
+#if defined(_WIN32)
+    const DWORD exe_len = GetModuleFileNameA(nullptr, exe, (DWORD) sizeof exe - 1);
+    if (exe_len == 0 || exe_len >= sizeof exe - 1) {
+        std::fprintf(stderr, "basalt serve: cannot find this binary (GetModuleFileNameA)\n");
+        return 1;
+    }
+    exe[exe_len] = 0;
+#else
     const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof exe - 1);
     if (n <= 0) { std::fprintf(stderr, "basalt serve: cannot find this binary (/proc/self/exe)\n"); return 1; }
     exe[n] = 0;
+#endif
     const std::string src_dir = BASALT_SOURCE_DIR;
     if (python.empty()) {
+#if defined(_WIN32)
+        const std::string venv = src_dir + "/.venv/Scripts/python.exe";
+        python = _access(venv.c_str(), 0) == 0 ? venv : "python";
+#else
         const std::string venv = src_dir + "/.venv/bin/python";
         python = ::access(venv.c_str(), X_OK) == 0 ? venv : "python3";
+#endif
     }
+#if defined(_WIN32)
+    if (_chdir(src_dir.c_str()) != 0) {
+#else
     if (::chdir(src_dir.c_str()) != 0) {
+#endif
         std::fprintf(stderr, "basalt serve: cannot enter the source tree %s\n", src_dir.c_str());
         return 1;
     }
@@ -670,7 +740,12 @@ int serve_subcommand(int argc, char** argv) {
     std::vector<char*> cargs;
     for (std::string& s : args) cargs.push_back(s.data());
     cargs.push_back(nullptr);
+#if defined(_WIN32)
+    // _execvp replaces this process the way execvp does, and finds python on PATH the same way.
+    _execvp(python.c_str(), cargs.data());
+#else
     ::execvp(python.c_str(), cargs.data());
+#endif
     std::fprintf(stderr, "basalt serve: cannot run %s: %s\n", python.c_str(), std::strerror(errno));
     return 1;
 }
@@ -1059,6 +1134,10 @@ std::string stage_text() {
 
 // whether `path` is on a rotational disk (1), not (0) or unknown (-1), from sysfs; `dev` is the disk's name
 int on_rotational_disk(const std::string& path, std::string& dev) {
+#if defined(_WIN32)
+    (void) path; (void) dev;
+    return -1;   // sysfs names the queue here; unknown means the caller does not warn
+#else
     struct stat st{};
     if (::stat(path.c_str(), &st) != 0) return -1;
     char sys[64];
@@ -1074,11 +1153,15 @@ int on_rotational_disk(const std::string& path, std::string& dev) {
         }
     }
     return -1;
+#endif
 }
 
 // the engine's threads in uninterruptible sleep (state D - almost always waiting for the disk), and where
 // (wchan): many threads in blk_io_schedule is a disk that cannot keep up, not a deadlock in the engine
 void disk_wait_threads(std::FILE* f) {
+#if defined(_WIN32)
+    (void) f;   // state D and wchan are /proc readings; there is no per-thread wait address to list here
+#else
     std::map<std::string, int> where;
     int waiting = 0, threads = 0;
     std::error_code ec;
@@ -1102,6 +1185,7 @@ void disk_wait_threads(std::FILE* f) {
     std::fprintf(f, "  threads waiting on the disk (state D): %d of %d%s%s\n", waiting, threads, list.c_str(),
                  waiting > 0 ? " - the engine is waiting for the drive: a rotational or failing disk with --ple-io "
                                "direct (--ple-io ram), or a drive too slow for the reads asked of it" : "");
+#endif
 }
 
 void stall_report(std::FILE* f, uint64_t layers_during) {
@@ -1356,7 +1440,11 @@ int main(int argc, char** argv) {
     // loading, a kernel first used mid-prompt would find no VRAM left for its code and the engine would end ("out of
     // memory: cudaFuncSetAttribute").
     if (std::getenv("CUDA_MODULE_LOADING") == nullptr) {
+#if defined(_WIN32)
+        _putenv("CUDA_MODULE_LOADING=EAGER");
+#else
         setenv("CUDA_MODULE_LOADING", "EAGER", 0);
+#endif
     }
     Options o;
     std::string ppl_base, ppl_out;

@@ -1114,9 +1114,19 @@ void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const 
     int smem = 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * 16 * (n_in / 256) * std::max(sb_bytes_lq(t0), sb_bytes_lq(t1));
     static bool attr = false;
     if (!attr) {
+#if defined(_WIN32)
+        // The type is spelled out because the front end cannot deduce it from a braced list of these kernel
+        // pointers. Same six instantiations, same order, same attribute calls.
+        void (*const pair_kernels[])(PairMat, PairMat, const uint8_t*, int, int) = {
+            dense_tc_pair_kernel<false, false, false>, dense_tc_pair_kernel<true, false, false>,
+            dense_tc_pair_kernel<true, true, false>, dense_tc_pair_kernel<false, false, true>,
+            dense_tc_pair_kernel<true, false, true>, dense_tc_pair_kernel<true, true, true>};
+        for (auto k : pair_kernels)
+#else
         for (auto k : {dense_tc_pair_kernel<false, false, false>, dense_tc_pair_kernel<true, false, false>,
                        dense_tc_pair_kernel<true, true, false>, dense_tc_pair_kernel<false, false, true>,
                        dense_tc_pair_kernel<true, false, true>, dense_tc_pair_kernel<true, true, true>})
+#endif
             cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024);
         attr = true;
     }

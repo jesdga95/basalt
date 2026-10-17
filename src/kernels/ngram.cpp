@@ -13,7 +13,9 @@
 #include <cstring>
 #include <atomic>
 #include <mutex>
+#if !defined(_WIN32)
 #include <sys/mman.h>
+#endif
 #include <vector>
 #include <stdexcept>
 
@@ -234,6 +236,20 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         const uint64_t page = 4096;
         const uintptr_t a0 = (uintptr_t) impl_->data & ~(uintptr_t) (page - 1);
         const uintptr_t a1 = (uintptr_t) impl_->data + (uintptr_t) need;
+#if defined(_WIN32)
+        // A view of a file mapping is not the same kind of memory as a private allocation, so the lock can fail
+        // here even with the working-set room raised; touching the pages then gets them resident, which is what
+        // the decode path needs.
+        if (VirtualLock((void*) a0, a1 - a0)) {
+            impl_->locked = true;
+        } else {
+            std::fprintf(stderr, "basalt: PLE table VirtualLock failed (error %lu): touching its pages instead\n",
+                         (unsigned long) GetLastError());
+            volatile uint8_t sink = 0;
+            for (uintptr_t p = a0; p < a1; p += page) sink = sink + *(const volatile uint8_t*) p;
+            (void) sink;
+        }
+#else
         madvise((void*) a0, a1 - a0, MADV_WILLNEED);
         if (mlock((const void*) a0, a1 - a0) == 0) {
             impl_->locked = true;
@@ -244,6 +260,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
             for (uintptr_t p = a0; p < a1; p += page) sink = sink + *(const volatile uint8_t*) p;
             (void) sink;
         }
+#endif
     }
     impl_->mode = io.mode;
     return true;
