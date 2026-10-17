@@ -69,6 +69,20 @@ if(WERROR)
     $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Werror>)
 endif()
 
+# The application manifest, for every program that names a file path in its command line. Windows decodes argv and
+# the CRT's narrow opens in the machine's ANSI code page unless the image says otherwise, so the same pack path
+# opens at one call site and fails at another. The manifest says the process code page is UTF-8 and that long paths
+# are in use; `link.exe` merges the file into the RT_MANIFEST resource it already writes, so there is no mt.exe step
+# and no external .manifest beside the exe. Nothing changes on Linux, where a path is bytes.
+set(_basalt_manifest ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/basalt.exe.manifest)
+function(basalt_embed_manifest target)
+  if(MSVC)
+    target_link_options(${target} PRIVATE "/MANIFEST:EMBED" "/MANIFESTINPUT:${_basalt_manifest}")
+    # a manifest edit has to relink the program, and the link command is the only thing that reads the file
+    set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS ${_basalt_manifest})
+  endif()
+endfunction()
+
 # The vector-extension flags per file, in each compiler's spelling. MSVC has no per-feature ISA switches: /arch:
 # turns on the whole rung (and a TU built with it may use those instructions anywhere in itself, exactly as the
 # GNU flags do), so the run-time probe still decides which of these objects runs.
@@ -98,19 +112,23 @@ target_link_libraries(artifact INTERFACE platform warnings)
 
 add_executable(basalt-gguf src/artifact/gguf_reader.cpp)
 target_link_libraries(basalt-gguf PRIVATE artifact)
+basalt_embed_manifest(basalt-gguf)
 
 add_executable(basalt-dequant src/artifact/dequant.cpp)
 target_link_libraries(basalt-dequant PRIVATE artifact)
+basalt_embed_manifest(basalt-dequant)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(basalt-dequant PRIVATE DEQUANT_SELFTEST)
 if(BUILD_TESTING)
   # the reader refuses a duplicate tensor name at open, naming it (a synthetic GGUF: no model, no GPU)
   add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE artifact)
+  basalt_embed_manifest(gguf_reader_test)
   add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
   # a split model's shards and their joint view: missing shard, split keys, duplicates, truncation (synthetic)
   add_executable(gguf_split_test tests/core/gguf_split_test.cpp)
   target_link_libraries(gguf_split_test PRIVATE artifact)
+  basalt_embed_manifest(gguf_split_test)
   add_test(NAME gguf_split_test COMMAND gguf_split_test)
   # the logit_bias protocol key: what parses and what is refused (host only)
   add_executable(logit_bias_test tests/core/logit_bias_test.cpp)
@@ -262,6 +280,7 @@ target_link_libraries(engine PUBLIC core kernels kernels_cpu ${_gpu_runtime_targ
 if(BUILD_TESTING)
   add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)
   target_link_libraries(file_expert_source_test PRIVATE engine)
+  basalt_embed_manifest(file_expert_source_test)
   add_test(NAME file_expert_source_test COMMAND file_expert_source_test)
   set_tests_properties(file_expert_source_test PROPERTIES TIMEOUT 60)
 endif()
@@ -269,6 +288,7 @@ endif()
 if(BUILD_TESTING)
   add_executable(expert_profile_save_test tests/core/expert_profile_save_test.cpp)
   target_link_libraries(expert_profile_save_test PRIVATE engine)
+  basalt_embed_manifest(expert_profile_save_test)
   add_test(NAME expert_profile_save_test COMMAND expert_profile_save_test)
   set_tests_properties(expert_profile_save_test PROPERTIES TIMEOUT 60)
 endif()
@@ -316,11 +336,13 @@ if(BUILD_TESTING)
   # the .basalt reader: table, meta JSON, the GGUF view of the source tensors, the layout text, the hc8 table
   add_executable(model_file_test tests/core/model_file_test.cpp)
   target_link_libraries(model_file_test PRIVATE engine)
+  basalt_embed_manifest(model_file_test)
   add_test(NAME model_file_test COMMAND model_file_test)
   set_tests_properties(model_file_test PROPERTIES TIMEOUT 60)
   # a PLE key held unquantized in the dense index stays in the arena; a quantized key row loads as before
   add_executable(native_dense_ple_key_test tests/core/native_dense_ple_key_test.cpp)
   target_link_libraries(native_dense_ple_key_test PRIVATE engine)
+  basalt_embed_manifest(native_dense_ple_key_test)
   add_test(NAME native_dense_ple_key_test COMMAND native_dense_ple_key_test)
   set_tests_properties(native_dense_ple_key_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   # per-layer admission on a sized cache starts each layer in its own range
@@ -349,6 +371,7 @@ add_executable(basalt src/program/generate.cpp)
 set_target_properties(basalt PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
 target_link_libraries(basalt PRIVATE engine prefill spec ${_gpu_runtime_target})
+basalt_embed_manifest(basalt)
 # `basalt serve` runs the Python server from the source tree
 target_compile_definitions(basalt PRIVATE BASALT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
@@ -370,6 +393,7 @@ target_link_libraries(basalt PRIVATE vision_cuda)
 add_dependencies(basalt-bench basalt git_stamp)
 target_include_directories(basalt-bench PRIVATE ${CMAKE_BINARY_DIR}/stamp)
 target_link_libraries(basalt-bench PRIVATE platform warnings ${CMAKE_DL_LIBS})
+basalt_embed_manifest(basalt-bench)
 target_compile_definitions(basalt-bench PRIVATE
   BASALT_BENCH_ENGINE="$<TARGET_FILE:basalt>"
   BASALT_BENCH_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/data/bench"
@@ -392,6 +416,7 @@ add_test(NAME s2_gemv_parity COMMAND s2_gemv_parity --selftest)
 add_executable(iq_parity src/kernels/iq_parity.cpp)
 target_include_directories(iq_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(iq_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_embed_manifest(iq_parity)
 # the i-quant fixtures are generated, not shipped.  tools/iq_fixture.py needs python3 + numpy
 # and the repository's vendored gguf-py (no pip installs); it writes deterministic fixtures into the
 # BUILD directory (the source tree is not touched).  The CTest fixture makes generation-to-test order
@@ -667,6 +692,7 @@ add_test(NAME s2_expert_grouped_parity COMMAND s2_expert_grouped_parity --selfte
 # working-set lock of a host region (CPU only).
 add_executable(platform_memory_test src/platform/memory_test.cpp)
 target_link_libraries(platform_memory_test PRIVATE core ${_gpu_runtime_target})
+basalt_embed_manifest(platform_memory_test)
 add_test(NAME platform_memory_test COMMAND platform_memory_test)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -679,6 +705,7 @@ endif()
 add_executable(ple_reader_test src/ngram/ple_reader_test.cpp)
 target_include_directories(ple_reader_test PRIVATE ${_gpu_include_directories})
 target_link_libraries(ple_reader_test PRIVATE kernels core ${_gpu_runtime_target})
+basalt_embed_manifest(ple_reader_test)
 add_test(NAME ple_reader_selftest COMMAND ple_reader_test --selftest)
 
 # The GPU test runs ON THE TARGET PC. `--selftest` allocates
@@ -912,6 +939,7 @@ if(BUILD_TESTING)
     target_include_directories(direct_file_async_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_definitions(direct_file_async_test PRIVATE BASALT_TEST_TMPDIR="${CMAKE_CURRENT_BINARY_DIR}")
     target_link_libraries(direct_file_async_test PRIVATE platform Threads::Threads)
+    basalt_embed_manifest(direct_file_async_test)
     add_test(NAME direct_file_async_test COMMAND direct_file_async_test)
   endif()
 endif()
