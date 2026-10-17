@@ -18,7 +18,9 @@
 #include "basalt/core/coupled_draft.hpp"
 #include "basalt/core/expert_source.hpp"
 #include "basalt/core/pinned.hpp"
+#include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
+#include "basalt/platform/process.hpp"
 #include "basalt/core/remote_experts.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/peer_experts.hpp"
@@ -73,9 +75,8 @@
 #endif
 #include <windows.h>
 #include <intrin.h>   // _mm_pause
-#include <io.h>       // _access, _execvp
+#include <io.h>       // _fileno, _setmode
 #include <fcntl.h>    // _O_BINARY
-#include <direct.h>   // _chdir
 #else
 #include <unistd.h>
 #include <sys/stat.h>
@@ -651,16 +652,12 @@ int serve_subcommand(int argc, char** argv) {
     bool have_model = false;
     // the working directory changes below: the paths the server reads must not depend on it
     auto absolute = [](const std::string& path) {
-        char real[4096];
-#if defined(_WIN32)
-        if (_fullpath(real, path.c_str(), sizeof real - 1) == nullptr) {
-#else
-        if (::realpath(path.c_str(), real) == nullptr) {
-#endif
+        std::string real;
+        if (!basalt::platform::absolute_path(path, real)) {
             std::fprintf(stderr, "basalt serve: cannot open %s\n", path.c_str());
             std::exit(1);
         }
-        return std::string(real);
+        return real;
     };
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -679,48 +676,27 @@ int serve_subcommand(int argc, char** argv) {
         std::fprintf(stderr, "usage: basalt serve --config FILE | MODEL.basalt [--python PY] [server args...]\n");
         return 2;
     }
-    char exe[4096];
-#if defined(_WIN32)
-    const DWORD exe_len = GetModuleFileNameA(nullptr, exe, (DWORD) sizeof exe - 1);
-    if (exe_len == 0 || exe_len >= sizeof exe - 1) {
-        std::fprintf(stderr, "basalt serve: cannot find this binary (GetModuleFileNameA)\n");
-        return 1;
-    }
-    exe[exe_len] = 0;
-#else
-    const std::ptrdiff_t n = ::readlink("/proc/self/exe", exe, sizeof exe - 1);
-    if (n <= 0) { std::fprintf(stderr, "basalt serve: cannot find this binary (/proc/self/exe)\n"); return 1; }
-    exe[n] = 0;
-#endif
+    const std::string exe = basalt::platform::module_path();
+    if (exe.empty()) { std::fprintf(stderr, "basalt serve: cannot find this binary\n"); return 1; }
     const std::string src_dir = BASALT_SOURCE_DIR;
     if (python.empty()) {
 #if defined(_WIN32)
         const std::string venv = src_dir + "/.venv/Scripts/python.exe";
-        python = _access(venv.c_str(), 0) == 0 ? venv : "python";
+        python = basalt::platform::path_executable(venv) ? venv : "python";
 #else
         const std::string venv = src_dir + "/.venv/bin/python";
-        python = ::access(venv.c_str(), X_OK) == 0 ? venv : "python3";
+        python = basalt::platform::path_executable(venv) ? venv : "python3";
 #endif
     }
-#if defined(_WIN32)
-    if (_chdir(src_dir.c_str()) != 0) {
-#else
-    if (::chdir(src_dir.c_str()) != 0) {
-#endif
+    if (basalt::platform::set_working_dir(src_dir) != 0) {
         std::fprintf(stderr, "basalt serve: cannot enter the source tree %s\n", src_dir.c_str());
         return 1;
     }
     std::vector<std::string> args = {python, "-m", "serve.server", "--engine-bin", exe};
     args.insert(args.end(), extra.begin(), extra.end());
-    std::vector<char*> cargs;
-    for (std::string& s : args) cargs.push_back(s.data());
-    cargs.push_back(nullptr);
-#if defined(_WIN32)
-    // _execvp replaces this process the way execvp does, and finds python on PATH the same way.
-    _execvp(python.c_str(), cargs.data());
-#else
-    ::execvp(python.c_str(), cargs.data());
-#endif
+    // Does not return when it works. Windows has no exec, so this process waits for the server and ends with the
+    // server's exit code. Reaching the line below means the server never started, and errno says why.
+    basalt::platform::exec_replacing(args);
     std::fprintf(stderr, "basalt serve: cannot run %s: %s\n", python.c_str(), std::strerror(errno));
     return 1;
 }
