@@ -10,6 +10,7 @@
 
 #include "basalt/core/native_head.hpp"
 #include "basalt/core/peer_experts.hpp"
+#include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
@@ -55,16 +56,6 @@
 #include <vector>
 #if   defined(__x86_64__)
 #include <immintrin.h>
-#endif
-
-// The 64-bit seek and the descriptor behind a FILE*, in the spelling each platform uses: the expert files are far
-// larger than 4 GiB, so a 32-bit fseek would wrap.
-#if defined(_WIN32)
-#define BASALT_FSEEK64(f, off, whence) _fseeki64((f), (long long) (off), (whence))
-#define BASALT_FILENO(f) _fileno(f)
-#else
-#define BASALT_FSEEK64(f, off, whence) fseeko((f), (off_t) (off), (whence))
-#define BASALT_FILENO(f) fileno(f)
 #endif
 
 namespace basalt::core {
@@ -126,7 +117,7 @@ basalt::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
 bool read_file(const FileRange& r, std::vector<uint8_t>& out) {
     if (r.empty() || !r.exists()) return false;
     // `fread` passes a request bigger than the stream buffer straight to the read call.
-    FILE* f = std::fopen(r.path.c_str(), "rb");
+    FILE* f = basalt::platform::open_file_utf8(r.path, "rb");
     if (f == nullptr) return false;
     // A `FILE*` has no destructor and the short-read path below returns early: the guard closes on every path.
     struct Closer {
@@ -134,8 +125,9 @@ bool read_file(const FileRange& r, std::vector<uint8_t>& out) {
         ~Closer() { if (f != nullptr) std::fclose(f); }
     } closer{f};
     const uint64_t n = r.size();
-    if (BASALT_FSEEK64(f, r.offset, SEEK_SET) != 0) return false;
-    basalt::platform::advise_willneed(BASALT_FILENO(f), r.offset, n);
+    // The expert files are far larger than 4 GiB, so the seek has to be a 64-bit one.
+    if (basalt::platform::fseek64(f, r.offset, SEEK_SET) != 0) return false;
+    basalt::platform::advise_willneed(basalt::platform::file_fd(f), r.offset, n);
     out.resize((size_t) n);
     return n == 0 || std::fread(out.data(), 1, (size_t) n, f) == (size_t) n;
 }
@@ -312,8 +304,8 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
             err = "mtp: " + files.experts.path + " is missing or shorter than the draft layer's experts";
             return false;
         }
-        FILE* f = std::fopen(files.experts.path.c_str(), "rb");
-        if (f == nullptr || BASALT_FSEEK64(f, files.experts.offset, SEEK_SET) != 0) {
+        FILE* f = basalt::platform::open_file_utf8(files.experts.path, "rb");
+        if (f == nullptr || basalt::platform::fseek64(f, files.experts.offset, SEEK_SET) != 0) {
             if (f != nullptr) std::fclose(f);
             err = "mtp: cannot open " + files.experts.path;
             return false;
@@ -323,7 +315,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
             ~Closer() { if (f != nullptr) std::fclose(f); }
         } closer{f};
         if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
-        basalt::platform::advise_willneed(BASALT_FILENO(f), files.experts.offset, bytes);
+        basalt::platform::advise_willneed(basalt::platform::file_fd(f), files.experts.offset, bytes);
         std::vector<uint8_t> chunk(64u << 20);
         for (uint64_t off = 0; off < bytes;) {
             const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
