@@ -149,9 +149,27 @@ pretending otherwise:
   (`GlobalMemoryStatusEx`) and reports no container limit.
 - A file mapping view must start at an allocation-granularity offset, so the expert tiers map the
   whole file and address the expert region inside the view, instead of mapping just that range.
-- `fopen` and the CRT low-level file API take the ANSI code page on Windows, so a pack path with
-  characters outside it cannot be opened through those calls; the paths the engine opens with
-  `CreateFileW` (the GGUF, the model file, the expert tiers) are decoded as UTF-8 and are fine.
+- **A path is UTF-8 inside the engine and UTF-16 at the OS.** Every file the engine opens goes through
+  `src/platform/file.cpp`, which converts the path and calls the wide entry point (`_wfopen`, `_wopen`,
+  `CreateFileW`, `_wfullpath`, `_wchdir`, `GetModuleFileNameW`). The narrow calls (`fopen`, `_open`,
+  `_access`) read the machine's ANSI code page, and a character outside it arrives as `?`, so no path a
+  user typed is handed to one. The wide opens are what the port relies on; the manifest next is what makes
+  the narrow ones and `argv` agree with the engine.
+- **The programs that name a path on the command line - the engine, the bench, the vision sidecar and the
+  file tests - carry an application manifest** (`src/platform/basalt.exe.manifest`, merged into the image by
+  `link.exe` with `/MANIFEST:EMBED` and `/MANIFESTINPUT:`): `activeCodePage` `UTF-8` and `longPathAware`. The code page needs **Windows 10 version 1903 (build 18362) or later**, and
+  it makes the process's ANSI code page **UTF-8 (65001)**: `argv` and any narrow CRT call then read the
+  same bytes the engine carries, and a pack path under a profile name with an accent survives being typed
+  into a tool. On an older Windows the element is ignored and the machine's ANSI code page stays in force,
+  so a character it cannot represent comes out of `argv` as `?` while the engine's own opens are unaffected,
+  because those take the UTF-16 path. `longPathAware` needs **Windows 10 version 1607 (build 14393) or
+  later** and lifts the 260-character limit for the wide opens; no `\\?\` prefix is used.
+  `tests/platform/path_utf8_test.cpp` checks the seam with a directory name carrying an accented Latin
+  letter, Japanese and Cyrillic, a path of 300 characters, and `argv` as seen by a child of the test: that
+  last half is what the manifest makes true, and it fails in a build without it.
+- **`basalt serve` does not replace the process.** There is no `exec` here, so the Python server is started as a
+  child, this process waits for it, and it ends with the child's exit code: a supervisor watching `basalt serve`
+  sees the server's status rather than the wrapper's. On Linux the process is replaced.
 - `off_t` is 32 bits in MSVC. Every read that can land past 4 GiB uses an explicitly 64-bit offset.
 
 ## Compiler notes worth knowing
