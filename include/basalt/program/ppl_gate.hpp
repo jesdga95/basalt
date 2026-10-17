@@ -6,6 +6,8 @@
 // A serve request with `ppl=K` reads chunk K's first half as its prompt and then teacher-forces the rest through
 // the verify windows; every scored row is compared with the base row here and written as one line to
 // --ppl-out: chunk pos target nll nll_base kld same_top top top_base dlogp_top_base.
+#include "basalt/platform/file.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -15,31 +17,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#include <fcntl.h>
-#include <io.h>
-#include <BaseTsd.h>
-typedef SSIZE_T ssize_t;
-namespace basalt_ppl_gate_win {
-/// Positional read on a CRT descriptor, at an explicit offset.
-inline ssize_t pread(int fd, void* dst, size_t n, uint64_t off) {
-    const HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
-    if (h == INVALID_HANDLE_VALUE) return -1;
-    OVERLAPPED ov{};
-    ov.Offset = (DWORD) (off & 0xFFFFFFFFull);
-    ov.OffsetHigh = (DWORD) (off >> 32);
-    DWORD got = 0;
-    if (!ReadFile(h, dst, (DWORD) n, &got, &ov)) return -1;
-    return (ssize_t) got;
-}
-}  // namespace basalt_ppl_gate_win
-#else
-#include <fcntl.h>
-#include <unistd.h>
-#endif
 
 namespace basalt::program {
 
@@ -91,10 +68,7 @@ public:
     bool finish(std::string& err) {
         const bool ok = wait(err);
         std::fflush(out_);
-#if !defined(_WIN32)
-        // Asking the page cache to release what was read has no counterpart here; the base rows are few and small.
-        posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED);
-#endif
+        basalt::platform::advise_dontneed(fd_, 0, 0);   // the rows this chunk read need not stay cached
         return ok;
     }
 
@@ -107,11 +81,7 @@ private:
         const char* base = paths().first.c_str();
         const char* out = paths().second.c_str();
         if (paths().first.empty() || paths().second.empty()) return;
-#if defined(_WIN32)
-        fd_ = _open(base, _O_RDONLY | _O_BINARY);
-#else
-        fd_ = ::open(base, O_RDONLY);
-#endif
+        fd_ = basalt::platform::open_fd_utf8(paths().first);
         char magic[8];
         uint32_t n_ctx = 0;
         int32_t nv[2] = {0, 0};
@@ -125,7 +95,7 @@ private:
         n_vocab_ = nv[0];
         n_chunk_ = nv[1];
         row_u16_ = 2 * ((n_vocab_ + 1) / 2) + 4;
-        out_ = std::fopen(out, "ab");
+        out_ = basalt::platform::open_file_utf8(paths().second, "ab");
         if (out_ == nullptr) {
             std::fprintf(stderr, "basalt ppl: cannot write %s\n", out);
             close_fd();
@@ -136,24 +106,13 @@ private:
         close_fd();
     }
     void close_fd() {
-        if (fd_ >= 0) {
-#if defined(_WIN32)
-            _close(fd_);
-#else
-            ::close(fd_);
-#endif
-        }
+        basalt::platform::close_fd(fd_);
         fd_ = -1;
     }
     bool read_at(void* dst, size_t bytes, uint64_t off) const {
         uint8_t* p = (uint8_t*) dst;
         while (bytes > 0) {
-            // MSVC's off_t is 32 bits, so the offset stays 64-bit on that side of the call.
-#if defined(_WIN32)
-            const ssize_t r = basalt_ppl_gate_win::pread(fd_, p, bytes, off);
-#else
-            const ssize_t r = ::pread(fd_, p, bytes, (off_t) off);
-#endif
+            const int64_t r = basalt::platform::pread(fd_, p, bytes, off);
             if (r <= 0) return false;
             p += r;
             off += (uint64_t) r;
