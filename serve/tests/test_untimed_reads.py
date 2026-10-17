@@ -60,7 +60,7 @@ class UntimedReads(unittest.TestCase):
     def test_vision_encode_read_times_out(self):
         silent = Silent()
         v = Vision.__new__(Vision)
-        v.dir, v.lock, v.cache = Path(tempfile.mkdtemp(prefix="basalt-vision-test-")), threading.Lock(), {}
+        v.dir, v.lock, v.cache, v.cache_bytes, v.pinned = Path(tempfile.mkdtemp(prefix="basalt-vision-test-")), threading.Lock(), {}, 0, {}
         v.stopped = False
         v.proc = SimpleNamespace(stdin=io.StringIO(), stdout=silent, kill=silent.kill,
                                  poll=lambda: 1 if silent.killed else None)
@@ -69,7 +69,7 @@ class UntimedReads(unittest.TestCase):
                     mock.patch.object(Vision, "load", return_value=b""), \
                     mock.patch.object(Vision, "normalize", return_value=b"png"):
                 with self.assertRaises(ValueError) as cm:
-                    v.encode("x")
+                    v.encode(["x"])
             self.assertIn("said nothing for", str(cm.exception))
             self.assertTrue(silent.killed)                      # ended: the next request starts a fresh one
             self.assertFalse(v.alive())

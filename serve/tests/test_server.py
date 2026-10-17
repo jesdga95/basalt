@@ -226,8 +226,33 @@ class ImageMarkers(unittest.TestCase):
             self.rows = self.dir / "img.sve"
             self.rows.write_bytes(b"rows")
 
-        def encode(self, source):
-            return self.rows, 3
+        def encode(self, sources):
+            return self.rows, [3] * len(sources)
+
+    def test_combined_file_removed_when_prepare_raises(self):
+        import tempfile
+        tok = ByteTokenizer()
+
+        class Fresh(self.FakeVision):
+            extra = 0
+
+            def encode(self, sources):
+                combined = self.dir / "req-test.sve"
+                combined.write_bytes(b"rows")
+                return combined, [3] * (len(sources) + self.extra)
+
+        msgs = [{"role": "user", "content": [{"type": "text", "text": "look"}, {"type": "image", "source": "x.png"}]}]
+        with tempfile.TemporaryDirectory() as d:
+            for case, extra, ctx in (("images and markers differ", 1, CTX), ("context too small", 0, 8)):
+                with self.subTest(case=case):
+                    vision = Fresh(d)
+                    vision.extra = extra
+                    svc = Service(MockEngine(tok, "ok", max_context=ctx), tok,
+                                  ChatTemplate(ROOT / "serve/chat_template.jinja"), vision=vision)
+                    with self.assertRaises(ValueError):
+                        svc.prepare(msgs, None, {})
+                    self.assertFalse((Path(d) / "req-test.sve").exists())
+                    self.assertIsNone(svc.embeddings.path)
 
     def test_literal_marker_with_an_image(self):
         import tempfile
@@ -253,8 +278,8 @@ class ImageMarkers(unittest.TestCase):
         quoted = "the template writes <|vision_start|><|image_pad|><|vision_end|> per picture"
 
         class TwoPictures(self.FakeVision):
-            def encode(self, source):
-                return self.rows, {"a.png": 2, "b.png": 5}[source]
+            def encode(self, sources):
+                return self.rows, [{"a.png": 2, "b.png": 5}[src] for src in sources]
 
         def holds(ids, part):
             return any(ids[i:i + len(part)] == part for i in range(len(ids) - len(part) + 1))
@@ -976,12 +1001,12 @@ class ClientShapes(unittest.TestCase):
                 raise BrokenPipeError("the encoder is gone")
 
         v = Vision.__new__(Vision)
-        v.dir, v.lock, v.cache = Path(tempfile.mkdtemp(prefix="basalt-vision-test-")), threading.Lock(), {}
+        v.dir, v.lock, v.cache, v.cache_bytes, v.pinned = Path(tempfile.mkdtemp(prefix="basalt-vision-test-")), threading.Lock(), {}, 0, {}
         v.proc = mock.Mock(stdin=Gone())
         with mock.patch.object(Vision, "load", return_value=b""), mock.patch.object(Vision, "normalize",
                                                                                    return_value=b"png"):
             with self.assertRaises(BrokenPipeError):
-                v.encode("x")
+                v.encode(["x"])
         self.assertEqual(list(v.dir.iterdir()), [])
         v.dir.rmdir()
 
@@ -1082,13 +1107,13 @@ class GpuChoice(unittest.TestCase):
         try:
             with mock.patch.object(EngineVision, "load", side_effect=lambda s: s.encode()), \
                     mock.patch.object(EngineVision, "normalize", side_effect=lambda d: d):
-                first = v.encode_many(["a", "b", "a"])
+                _, first = v.encode(["a", "b", "a"])
                 self.assertEqual(len(sent), 1)
                 self.assertEqual(len(sent[0]), 2)                       # the repeat is one image
-                self.assertEqual([n for _, n in first], [10, 11, 10])
-                v.encode_many(["b", "a"])                               # cached: the engine is not asked again
+                self.assertEqual(first, [10, 11, 10])
+                v.encode(["b", "a"])                               # cached: the engine is not asked again
                 self.assertEqual(len(sent), 1)
-                self.assertEqual(v.encode("c")[1], 10)
+                self.assertEqual(v.encode(["c"])[1], [10])
                 self.assertEqual(len(sent), 2)
             self.assertEqual(list(v.dir.glob("*.img")), [])             # the temporary images are removed
             self.assertTrue(v.alive())

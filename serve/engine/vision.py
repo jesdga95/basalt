@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import uuid
 import queue
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from serve.engine.flags import flag_value
 # starts a fresh one.
 VISION_READY_S = 300.0
 VISION_ENCODE_S = 300.0
+VISION_CACHE_BYTES = 1 << 30                    # room for about 64 images
 
 
 class Vision:
@@ -32,7 +34,9 @@ class Vision:
         self.ready_s = 0.0                              # last start's time to READY
         self._start()
         self.lock = threading.Lock()
-        self.cache: dict[str, tuple[Path, int]] = {}
+        self.cache: dict[str, tuple[Path, int, int]] = {}  # LRU cache: file, image tokens, bytes
+        self.cache_bytes = 0
+        self.pinned: dict[str, int] = {}                # image -> requests using it
 
     def _start(self):
         args, log, env = self.spawn
@@ -144,11 +148,38 @@ class Vision:
         im.save(out, format="PNG")
         return out.getvalue()
 
-    def encode(self, source: str) -> tuple[Path, int]:
-        """Return (embeddings file, image token count)."""
+    def encode(self, sources: list[str]) -> tuple[Path, list[int]]:
+        """Encode a request's images into one embeddings file; return it and each image's token count."""
+        pins = []
+        try:
+            encoded = self._encode_pinned(sources, pins)
+            combined = self.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
+            with open(combined, "wb") as f:
+                for path, _, _ in encoded:
+                    f.write(path.read_bytes())
+            return combined, [n for _, n, _ in encoded]
+        finally:
+            with self.lock:
+                for k in pins:
+                    self.pinned[k] -= 1
+                    if not self.pinned[k]:
+                        del self.pinned[k]
+                self._evict()
+
+    def _pin(self, key: str, pins: list[str]) -> None:
+        self.pinned[key] = self.pinned.get(key, 0) + 1
+        pins.append(key)
+        if key in self.cache:
+            self.cache[key] = self.cache.pop(key)
+
+    def _encode_pinned(self, sources: list[str], pins: list[str]) -> list[tuple[Path, int, int]]:
+        return [self._encode_one(src, pins) for src in sources]
+
+    def _encode_one(self, source: str, pins: list[str]) -> tuple[Path, int, int]:
         data = self.normalize(self.load(source))
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
+            self._pin(key, pins)
             if key in self.cache:
                 return self.cache[key]
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
@@ -172,16 +203,20 @@ class Vision:
             self.stopped = True                         # alive() is False, so the next request starts it again
             raise ValueError(str(e)) from None
 
-    def _remember(self, key: str, out: Path, n: int) -> tuple[Path, int]:
-        self.cache[key] = (out, n)
-        if len(self.cache) > 64:                                       # oldest first
-            old = next(iter(self.cache))
-            self.cache.pop(old)[0].unlink(missing_ok=True)
+    def _remember(self, key: str, out: Path, n: int) -> tuple[Path, int, int]:
+        size = out.stat().st_size
+        self.cache[key] = (out, n, size)
+        self.cache_bytes += size
+        self._evict()
         return self.cache[key]
 
-    def encode_many(self, sources: list[str]) -> list[tuple[Path, int]]:
-        """`encode` for each image of a request, in order."""
-        return [self.encode(src) for src in sources]
+    def _evict(self) -> None:
+        for k in [k for k in self.cache if k not in self.pinned]:
+            if self.cache_bytes <= VISION_CACHE_BYTES:
+                break
+            path, _, size = self.cache.pop(k)
+            path.unlink(missing_ok=True)
+            self.cache_bytes -= size
 
     def close(self):
         try:
@@ -203,7 +238,9 @@ class EngineVision(Vision):
         self.stopped = False
         self.ready_s = 0.0
         self.lock = threading.Lock()
-        self.cache: dict[str, tuple[Path, int]] = {}
+        self.cache: dict[str, tuple[Path, int, int]] = {}
+        self.cache_bytes = 0
+        self.pinned: dict[str, int] = {}
 
     def attach(self, engine) -> None:
         self.engine = engine
@@ -220,10 +257,7 @@ class EngineVision(Vision):
     def close(self):
         pass
 
-    def encode(self, source: str) -> tuple[Path, int]:
-        return self.encode_many([source])[0]
-
-    def encode_many(self, sources: list[str]) -> list[tuple[Path, int]]:
+    def _encode_pinned(self, sources: list[str], pins: list[str]) -> list[tuple[Path, int, int]]:
         """Every image not cached yet goes to the engine in one ENC, so it borrows its slots once."""
         keys, datas = [], {}
         for src in sources:
@@ -232,6 +266,8 @@ class EngineVision(Vision):
             keys.append(key)
             datas[key] = data
         with self.lock:
+            for k in keys:
+                self._pin(k, pins)
             todo = [k for k in dict.fromkeys(keys) if k not in self.cache]
             jobs = [(self.dir / f"{k}.img", self.dir / f"{k}.sve") for k in todo]
             try:
