@@ -29,79 +29,11 @@
 #include "basalt/prefill/moe_fused_iq.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/core/peer_experts.hpp"
+#include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/prefill/kernels.hpp"
 
 #include <cuda_runtime.h>
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#include <io.h>
-#include <BaseTsd.h>
-typedef SSIZE_T ssize_t;
-namespace {
-/// This thread's handle for reading `fd`. A handle opened without FILE_FLAG_OVERLAPPED serializes the I/O issued
-/// through it, so threads reading through one shared descriptor take turns rather than reading in parallel: each
-/// thread opens the same file again and gets a file object of its own. Returns the shared descriptor when the file
-/// cannot be reopened (its handle still reads correctly, only in turn).
-HANDLE read_handle(int fd) {
-    struct PerThread {
-        ~PerThread() { release(); }
-        void release() {
-            if (own) CloseHandle(h);   // the shared descriptor belongs to the CRT
-            h = INVALID_HANDLE_VALUE;
-            own = false;
-            for_fd = -1;
-        }
-        HANDLE h = INVALID_HANDLE_VALUE;
-        bool own = false;    // h was opened here, so closing it is ours to do
-        int for_fd = -1;     // the descriptor h was opened from; -1: nothing decided yet
-    };
-    thread_local PerThread pt;
-    if (pt.for_fd != fd) pt.release();
-    if (pt.for_fd < 0) {
-        pt.for_fd = fd;
-        wchar_t path[4096];
-        const DWORD len = GetFinalPathNameByHandleW(reinterpret_cast<HANDLE>(_get_osfhandle(fd)), path,
-                                                   (DWORD) (sizeof path / sizeof path[0]), VOLUME_NAME_DOS);
-        if (len != 0 && len < sizeof path / sizeof path[0])
-            pt.h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        pt.own = pt.h != INVALID_HANDLE_VALUE;
-    }
-    if (pt.h != INVALID_HANDLE_VALUE) return pt.h;
-    return reinterpret_cast<HANDLE>(_get_osfhandle(fd));
-}
-/// Positional read on a CRT descriptor, one chunk per call: ReadFile takes a 32-bit byte count, so a request of
-/// 4 GiB or more is read in pieces and the caller's loop picks up where this one stopped. The offset rides in the
-/// OVERLAPPED structure, so the shared-descriptor fallback never moves a shared file position.
-ssize_t pread(int fd, void* dst, size_t n, uint64_t off) {
-    const HANDLE h = read_handle(fd);
-    if (h == INVALID_HANDLE_VALUE) return -1;
-    const DWORD want = (DWORD) (n < (size_t) (1ull << 30) ? n : (size_t) (1ull << 30));
-    OVERLAPPED ov{};
-    ov.Offset = (DWORD) (off & 0xFFFFFFFFull);
-    ov.OffsetHigh = (DWORD) (off >> 32);
-    DWORD got = 0;
-    if (!ReadFile(h, dst, want, &got, &ov)) {
-        // A read that ran into the end of the file reports the bytes it did get as an error, so `got` stands.
-        // ERROR_IO_PENDING means the handle is an overlapped one: this thread has no other read outstanding on it,
-        // so waiting for that request is the whole of what a synchronous read would have done.
-        const DWORD e = GetLastError();
-        if (e == ERROR_IO_PENDING) {
-            got = 0;
-            if (!GetOverlappedResult(h, &ov, &got, TRUE) && GetLastError() != ERROR_HANDLE_EOF) return -1;
-        } else if (e != ERROR_HANDLE_EOF) {
-            return -1;
-        }
-    }
-    return (ssize_t) got;
-}
-}  // namespace
-#else
-#include <unistd.h>
-#endif
 
 #include <algorithm>
 #include <chrono>
@@ -283,12 +215,8 @@ struct Stager {
     static bool read_file(const Job& jb, uint8_t* dst) {
         size_t done = 0;
         while (done < jb.bytes) {
-            // MSVC's off_t is 32 bits, so the offset stays a 64-bit value on that side of the call.
-#if defined(_WIN32)
-            const ssize_t n = pread(jb.fd, dst + done, jb.bytes - done, jb.off + done);
-#else
-            const ssize_t n = pread(jb.fd, dst + done, jb.bytes - done, (off_t) (jb.off + done));
-#endif
+            // One chunk per call, so a count short of the rest is normal and this loop picks up where it stopped.
+            const int64_t n = basalt::platform::pread(jb.fd, dst + done, jb.bytes - done, jb.off + done);
             if (n < 0 && errno == EINTR) continue;
             if (n <= 0) return false;
             done += (size_t) n;
