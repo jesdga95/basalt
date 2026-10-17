@@ -1,6 +1,8 @@
 // src/vision/mmproj.cpp - see basalt/vision/mmproj.hpp.
 #include "basalt/vision/mmproj.hpp"
 
+#include "basalt/platform/file.hpp"
+
 #include <cstring>
 
 #if defined(_WIN32)
@@ -8,10 +10,8 @@
 #define NOMINMAX
 #include <windows.h>
 #else
-#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <unistd.h>
 #endif
 
 namespace basalt::vision {
@@ -103,12 +103,10 @@ Mmproj::~Mmproj() { release(); }
 
 bool Mmproj::open(const std::string& path, std::string& err) {
 #if defined(_WIN32)
-    const int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-    if (wlen <= 0) { err = "cannot read " + path; return false; }
-    std::wstring wpath((size_t) wlen, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
-    HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    // The projector is read through a file mapping, so this open stays the wide Win32 one the section needs.
+    HANDLE h = CreateFileW(platform::to_wide(path).c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) { err = "cannot open " + path; return false; }
     LARGE_INTEGER li{};
     if (!GetFileSizeEx(h, &li) || li.QuadPart < 32) {
@@ -129,13 +127,13 @@ bool Mmproj::open(const std::string& path, std::string& err) {
     CloseHandle(h);
     if (map_ == nullptr) { err = "cannot map " + path; return false; }
 #else
-    const int fd = ::open(path.c_str(), O_RDONLY);
+    const int fd = platform::open_fd_utf8(path);
     if (fd < 0) { err = "cannot open " + path; return false; }
     struct stat st{};
-    if (fstat(fd, &st) != 0 || st.st_size < 32) { ::close(fd); err = "cannot read " + path; return false; }
+    if (fstat(fd, &st) != 0 || st.st_size < 32) { platform::close_fd(fd); err = "cannot read " + path; return false; }
     size_ = (size_t) st.st_size;
     map_ = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
+    platform::close_fd(fd);
     if (map_ == MAP_FAILED) { map_ = nullptr; err = "cannot map " + path; return false; }
 #endif
     const uint8_t* base = (const uint8_t*) map_;

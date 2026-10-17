@@ -32,7 +32,10 @@
 #include <algorithm>
 
 #include "basalt/artifact/gguf_split.hpp"
+#include "basalt/platform/file.hpp"
 
+// The file mapping below is Windows code in a header-only reader, so the Win32 include cannot leave this header; the
+// `NOMINMAX` guard keeps its min/max macros out of every file that includes the reader.
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
@@ -395,12 +398,10 @@ private:
     void open() {
 #if defined(_WIN32)
         // A read-only file mapping stands in for the private mmap: the pages are the cache manager's, demand
-        // faulted, and nothing here writes to them.
-        const int wlen = MultiByteToWideChar(CP_UTF8, 0, path_.c_str(), -1, nullptr, 0);
-        std::wstring wpath((size_t) (wlen > 0 ? wlen : 1), L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, path_.c_str(), -1, wpath.data(), wlen);
-        HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                               FILE_ATTRIBUTE_NORMAL, nullptr);
+        // faulted, and nothing here writes to them. The section is taken on a file handle, so this open stays the
+        // wide Win32 one; handle and section live as long as the view does.
+        HANDLE h = CreateFileW(platform::to_wide(path_).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open " + path_);
         LARGE_INTEGER li{};
         if (!GetFileSizeEx(h, &li)) {
@@ -422,13 +423,12 @@ private:
         map_ = m;
         file_ = h;
 #else
-        int fd = ::open(path_.c_str(), O_RDONLY);
-        if (fd < 0) throw std::runtime_error("cannot open " + path_);
-        fd_ = fd;
+        fd_ = platform::open_fd_utf8(path_);
+        if (fd_ < 0) throw std::runtime_error("cannot open " + path_);
         struct stat st{};
-        if (fstat(fd, &st) != 0) throw std::runtime_error("fstat failed");
+        if (fstat(fd_, &st) != 0) throw std::runtime_error("fstat failed");
         size_ = (uint64_t)st.st_size;
-        void* p = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
+        void* p = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
         if (p == MAP_FAILED) throw std::runtime_error("mmap failed");
         base_ = (const uint8_t*)p;
 #endif
@@ -455,7 +455,7 @@ private:
         file_ = nullptr;
 #else
         if (base_) munmap((void*)base_, size_);
-        if (fd_ >= 0) ::close(fd_);
+        platform::close_fd(fd_);
 #endif
     }
 
@@ -504,7 +504,8 @@ private:
     uint64_t size_ = 0, data_start_ = 0, alignment_ = 32;
     uint32_t version_ = 0;
 #if defined(_WIN32)
-    HANDLE map_ = nullptr, file_ = nullptr;
+    void* map_ = nullptr;   // the section the view was taken from
+    void* file_ = nullptr;  // and the file handle that section was made on
 #else
     int fd_ = -1;
 #endif
