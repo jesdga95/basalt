@@ -74,6 +74,7 @@
 #include <windows.h>
 #include <intrin.h>   // _mm_pause
 #include <io.h>       // _access, _execvp
+#include <fcntl.h>    // _O_BINARY
 #include <direct.h>   // _chdir
 #else
 #include <unistd.h>
@@ -1733,6 +1734,16 @@ int main(int argc, char** argv) {
     }
     // a load that exhausts the RAM ends here instead of swapping the machine to a halt; stopped at READY
     if (o.serve) basalt::platform::start_memory_watchdog(1ull << 30);
+#if defined(_WIN32)
+    // The CRT puts the three standard descriptors in text mode, which turns each "\n" the serve protocol writes
+    // into "\r\n" and folds a "\r\n" in a request to "\n" behind the reader's back. The pipes carry bytes, so the
+    // protocol's newlines are the engine's own. Console output keeps its text mode: it needs the CR.
+    if (o.serve) {
+        _setmode(_fileno(stdin), _O_BINARY);
+        _setmode(_fileno(stdout), _O_BINARY);
+        _setmode(_fileno(stderr), _O_BINARY);
+    }
+#endif
     basalt::core::ModelSources srcs;
     basalt::core::ModelFile model_file;
     {
