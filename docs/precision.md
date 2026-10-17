@@ -394,6 +394,43 @@ This is not a CPU-tier effect: the 4-chunk Q8_0 result holds whatever share of e
 0.0488 at the default placement, 0.0466 with 79% on the CPU). Other causes tested and excluded: KV mode, window width T,
 `--gr-fp32-activations`, dense_tc against native_mmvq (bit-identical), and refitting the hc8 scales.
 
+## Compiler parity
+
+The CPU expert kernel and the expert pool are compiled by whatever compiler the platform uses, so the two supported
+platforms do not run the same object code: MSVC on Windows, GCC on Linux. What that costs in accuracy is measured, not
+assumed. Both builds of one commit run the same two programs against the same extracted expert section — `expert_parity`
+for the Q2_0 expert kernel and its AVX-512 VNNI path, `pool_test` for the pool that dispatches them:
+
+| check | MSVC 19.44 (Windows) | GCC 13.3 (Linux) |
+| --- | --- | --- |
+| `expert_parity` | 0 failures | 0 failures |
+| blob decodes to live scales | 40/40 non-zero, \|s\| in [0.0179, 0.03564] | same |
+| the next expert is different data | 96.9% of bytes differ | same |
+| VNNI vs scalar, INT8 activations | rel 1.111e-06 | rel 9.412e-07 |
+| VNNI vs scalar, FP32 activations | rel 1.209e-02 | rel 1.139e-02 |
+| `pool_test` | 0 failures | 0 failures |
+| pool output vs the serial run | 0 of 25600 differ, worst \|d\| 0.000e+00 | same |
+
+The structural checks and the pool output are identical, the pool to the bit. The two cross-compiler figures agree to
+the third significant figure, which is the range FMA contraction and reduction order can move, and each sits three to
+four orders of magnitude inside the 3e-3 tolerance the kernel asserts. The FP32 row is reported by the test, not
+asserted: it is the cost of the Q8_1 activation contract, and it is the same cost on both compilers. No kernel in this
+port changed, so the Linux numbers are unchanged from before it.
+
+Scope: these two programs cover the Q2_0 expert kernel and the expert pool. The quantized kernels (`iq_avx512`,
+`iq_avx2`, `kq_avx2`, `kq_avx1`, `native_expert`, `ggml_cpu_dots`) are compiled by both toolchains as well but no
+program here exercises them with real weights, so this table is not evidence about them.
+
+Both programs read a flat expert section: 512 blobs of 1,382,400 bytes, the Q2_0 layout they were written for. A pack
+carries one in its `mtp/experts` section, which copies out unmodified, so the same bytes run on either build:
+
+```sh
+python3 -c "import sys; sys.path.insert(0,'tools'); from model_file import ModelFile; \
+  open('experts.bin','wb').write(ModelFile('PACK.basalt').read('mtp/experts'))"
+./expert_parity --file experts.bin
+./pool_test --file experts.bin
+```
+
 ## Reproduce
 
 Build llama.cpp, then the Q8_0 base from the Q8_0 GGUF (100 chunks):
