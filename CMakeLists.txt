@@ -94,7 +94,7 @@ endif()
 # duplicate-symbol or missing-declaration bug into code that is already validated against the real artifact.
 add_library(artifact INTERFACE)
 target_include_directories(artifact INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(artifact INTERFACE warnings)
+target_link_libraries(artifact INTERFACE platform warnings)
 
 add_executable(basalt-gguf src/artifact/gguf_reader.cpp)
 target_link_libraries(basalt-gguf PRIVATE artifact)
@@ -127,14 +127,22 @@ target_link_libraries(plan INTERFACE warnings)
 add_executable(basalt-plan src/plan/plan_main.cpp)
 target_link_libraries(basalt-plan PRIVATE plan)
 
+# ---- platform (host OS boundary) ------------------------------------
+# The file, memory and process calls the engine makes, so the Win32 and POSIX spellings live in one place.
+# Host-only: no CUDA runtime, which is why the header-only `artifact` target, the vision library, the bench and the
+# standalone test programs can all link it.
+add_library(platform STATIC src/platform/file.cpp src/platform/memory.cpp src/platform/direct_file.cpp src/platform/process.cpp)
+target_include_directories(platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(platform PUBLIC warnings)
+
 # ---- core (GPU runtime) ---------------------------------------------
-add_library(core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/platform/file.cpp src/platform/process.cpp src/core/graph.cpp src/core/weights.cpp
+add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/graph.cpp src/core/weights.cpp
                              src/core/layout.cpp src/core/model_file.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
 # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
 # linker error ("unresolved external symbol cudaGraphInstantiate") names the function rather than the cause.
-target_link_libraries(core PUBLIC plan artifact warnings ${_gpu_runtime_target})
+target_link_libraries(core PUBLIC plan artifact platform warnings ${_gpu_runtime_target})
 
 add_executable(basalt-device src/core/device_main.cpp)
 target_link_libraries(basalt-device PRIVATE core)
@@ -203,8 +211,7 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/dense_tc.cu
                         src/kernels/cuda/iq_kernels.cu
                         src/kernels/ngram.cpp
-                        src/ngram/ple_reader.cpp
-                        src/platform/direct_file.cpp)
+                        src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
 target_sources(kernels PRIVATE src/kernels/cuda/hc_fused.cu src/kernels/cuda/hc8_gr.cu)
 # the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
@@ -282,9 +289,9 @@ if(BUILD_TESTING)
   add_test(NAME conversation_cache_test COMMAND conversation_cache_test)
   # conversation_memory.cpp asks the platform layer for the free RAM, so the probe comes along; it needs the system
   # allocator and the OS memory query, and nothing from the GPU runtime.
-  add_executable(conversation_memory_test src/core/conversation_memory_test.cpp src/core/conversation_memory.cpp
-                 src/platform/memory.cpp)
+  add_executable(conversation_memory_test src/core/conversation_memory_test.cpp src/core/conversation_memory.cpp)
   target_include_directories(conversation_memory_test PRIVATE include)
+  target_link_libraries(conversation_memory_test PRIVATE platform)
   add_test(NAME conversation_memory_test COMMAND conversation_memory_test)
   add_executable(conversation_validation_test src/core/conversation_validation_test.cpp)
   target_link_libraries(conversation_validation_test PRIVATE engine)
@@ -362,7 +369,7 @@ add_subdirectory(tools/vision)
 target_link_libraries(basalt PRIVATE vision_cuda)
 add_dependencies(basalt-bench basalt git_stamp)
 target_include_directories(basalt-bench PRIVATE ${CMAKE_BINARY_DIR}/stamp)
-target_link_libraries(basalt-bench PRIVATE warnings ${CMAKE_DL_LIBS})
+target_link_libraries(basalt-bench PRIVATE platform warnings ${CMAKE_DL_LIBS})
 target_compile_definitions(basalt-bench PRIVATE
   BASALT_BENCH_ENGINE="$<TARGET_FILE:basalt>"
   BASALT_BENCH_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/data/bench"
@@ -883,15 +890,15 @@ if(BUILD_TESTING)
   target_link_libraries(expert_multi_test PRIVATE kernels_cpu)
   add_test(NAME expert_multi_test COMMAND expert_multi_test)
 
-  add_executable(expert_parity src/kernels/cpu/expert_parity.cpp src/platform/file.cpp)
-  target_link_libraries(expert_parity PRIVATE kernels_cpu)
+  add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)
+  target_link_libraries(expert_parity PRIVATE kernels_cpu platform)
   # The experts section (extracted to experts.bin) is a REQUIRED input: this test compares against a real expert blob, and a
   # missing file would otherwise be reported as a pass by a test that skipped everything.
   add_test(NAME expert_parity COMMAND expert_parity --selftest
            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
-  add_executable(pool_test src/kernels/cpu/pool_test.cpp src/platform/file.cpp)
-  target_link_libraries(pool_test PRIVATE kernels_cpu)
+  add_executable(pool_test src/kernels/cpu/pool_test.cpp)
+  target_link_libraries(pool_test PRIVATE kernels_cpu platform)
   add_test(NAME pool_test COMMAND pool_test --selftest WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   # tiny batches with sleeping workers, as on a big-VRAM card; a hang fails it
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
@@ -901,10 +908,10 @@ if(BUILD_TESTING)
   # DirectFile has a Linux backend and a Windows backend, and this test covers those two; macOS is not a platform
   # the engine builds for.
   if((UNIX AND NOT APPLE) OR WIN32)
-    add_executable(direct_file_async_test tests/platform/direct_file_async.cpp src/platform/direct_file.cpp)
+    add_executable(direct_file_async_test tests/platform/direct_file_async.cpp)
     target_include_directories(direct_file_async_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_definitions(direct_file_async_test PRIVATE BASALT_TEST_TMPDIR="${CMAKE_CURRENT_BINARY_DIR}")
-    target_link_libraries(direct_file_async_test PRIVATE Threads::Threads)
+    target_link_libraries(direct_file_async_test PRIVATE platform Threads::Threads)
     add_test(NAME direct_file_async_test COMMAND direct_file_async_test)
   endif()
 endif()

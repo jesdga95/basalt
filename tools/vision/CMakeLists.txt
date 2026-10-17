@@ -40,7 +40,7 @@ else()
   set_source_files_properties(${VISION_ROOT}/src/vision/gemm_cpu_avx512.cpp
                               PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512bf16;-mfma")
 endif()
-target_link_libraries(vision_core PUBLIC Threads::Threads)
+target_link_libraries(vision_core PUBLIC platform Threads::Threads)
 
 # device side
 add_library(vision_cuda STATIC
