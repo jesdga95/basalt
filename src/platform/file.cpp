@@ -48,48 +48,20 @@ std::string to_utf8(const wchar_t* w) {
     return s;
 }
 
-/// This thread's handle for reading `fd`. A handle opened without FILE_FLAG_OVERLAPPED serializes the I/O issued
-/// through it, so threads reading through one shared descriptor take turns rather than reading in parallel: each
-/// thread opens the same file again and gets a file object of its own. Returns the shared descriptor's handle when
-/// the file cannot be reopened (it still reads correctly, only in turn).
-HANDLE read_handle(int fd) {
-    // What the handle was opened for has to be checked, not only the descriptor: a closed descriptor's number comes
-    // back as the next open's number, and the handle value it carried can come back with it. The volume and the
-    // file index inside it say which file this is.
-    struct PerThread {
-        ~PerThread() { release(); }
-        void release() {
-            if (own != INVALID_HANDLE_VALUE) CloseHandle(own);   // the shared descriptor belongs to the CRT
-            own = INVALID_HANDLE_VALUE;
-        }
-        bool holds(const BY_HANDLE_FILE_INFORMATION& i) const {
-            return own != INVALID_HANDLE_VALUE && i.dwVolumeSerialNumber == vol &&
-                   i.nFileIndexHigh == hi && i.nFileIndexLow == lo;
-        }
-        HANDLE own = INVALID_HANDLE_VALUE;   // opened here, so closing it is ours to do
-        DWORD vol = 0, hi = 0, lo = 0;       // the file `own` was opened for
-    };
-    thread_local PerThread pt;
-    const HANDLE cur = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
-    BY_HANDLE_FILE_INFORMATION info{};
-    if (cur != INVALID_HANDLE_VALUE && GetFileInformationByHandle(cur, &info)) {
-        if (pt.holds(info)) return pt.own;
-        pt.release();
-        wchar_t path[4096];
-        const DWORD cap = (DWORD) (sizeof path / sizeof path[0]);
-        const DWORD len = GetFinalPathNameByHandleW(cur, path, cap, VOLUME_NAME_DOS);
-        if (len != 0 && len < cap) {
-            pt.own = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (pt.own != INVALID_HANDLE_VALUE) {
-                pt.vol = info.dwVolumeSerialNumber;
-                pt.hi = info.nFileIndexHigh;
-                pt.lo = info.nFileIndexLow;
-                return pt.own;
-            }
-        }
-    }
-    return cur;
+/// This thread's handle for reading `fd`, valid until the read that asked for it is done. A handle opened without
+/// FILE_FLAG_OVERLAPPED serializes the I/O issued through it, so threads reading through one shared descriptor would
+/// take turns: each read opens the same file again and gets a file object of its own. The handle is not kept - a
+/// caller that closed its descriptor has to have let go of the file, or nothing can replace it. Returns the shared
+/// descriptor's handle when the file cannot be reopened (it still reads correctly, only in turn).
+HANDLE read_handle(HANDLE cur) {
+    if (cur == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
+    wchar_t path[4096];
+    const DWORD cap = (DWORD) (sizeof path / sizeof path[0]);
+    const DWORD len = GetFinalPathNameByHandleW(cur, path, cap, VOLUME_NAME_DOS);
+    if (len == 0 || len >= cap) return cur;
+    const HANDLE own = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                   nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    return own == INVALID_HANDLE_VALUE ? cur : own;
 }
 }  // namespace
 
@@ -146,7 +118,8 @@ std::string temp_dir() {
 
 int64_t pread(int fd, void* dst, size_t n, uint64_t off) {
     if (fd < 0) return -1;   // asking the CRT for a negative descriptor's handle stops the process here
-    const HANDLE h = read_handle(fd);
+    const HANDLE shared = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+    const HANDLE h = read_handle(shared);
     if (h == INVALID_HANDLE_VALUE) return -1;
     const DWORD want = (DWORD) (n < (size_t) (1ull << 30) ? n : (size_t) (1ull << 30));
     OVERLAPPED ov{};
@@ -160,11 +133,16 @@ int64_t pread(int fd, void* dst, size_t n, uint64_t off) {
         const DWORD e = GetLastError();
         if (e == ERROR_IO_PENDING) {
             got = 0;
-            if (!GetOverlappedResult(h, &ov, &got, TRUE) && GetLastError() != ERROR_HANDLE_EOF) return -1;
+            if (!GetOverlappedResult(h, &ov, &got, TRUE) && GetLastError() != ERROR_HANDLE_EOF) {
+                if (h != shared) CloseHandle(h);
+                return -1;
+            }
         } else if (e != ERROR_HANDLE_EOF) {
+            if (h != shared) CloseHandle(h);
             return -1;
         }
     }
+    if (h != shared) CloseHandle(h);   // the read is done: the file is no longer this call's to hold open
     return (int64_t) got;
 }
 

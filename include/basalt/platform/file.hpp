@@ -61,10 +61,11 @@ std::string temp_dir();
 /// bytes read (0 at the end of the file), or -1 on failure - Linux sets errno as pread(2) does, Windows reports it
 /// by the return value alone.
 /// A count short of `n` is not an error and every caller loops over it. Windows reads at most 1 GiB in one call,
-/// because its read call takes a 32-bit byte count, and reads through a handle of the calling thread's own: a
-/// handle opened without overlapped I/O serializes the reads issued through it, so threads sharing one descriptor
-/// would take turns. When the file cannot be reopened the shared descriptor is used, which still reads correctly,
-/// only in turn.
+/// because its read call takes a 32-bit byte count, and issues the read through a handle of its own for the
+/// duration of it: a handle opened without overlapped I/O serializes the reads issued through it, so threads sharing
+/// one descriptor would take turns, and a handle the call kept would keep the file open after its descriptor was
+/// closed. When the file cannot be reopened the shared descriptor is used, which still reads correctly, only in
+/// turn.
 /// A descriptor this process has already closed is not a value to hand here: finding a descriptor's handle is what
 /// Windows does first, and the CRT stops the process for a number it knows is closed. `fd` < 0 says -1 instead.
 /// `dst` has to hold everything `n` asks for: on Windows that is up to the 1 GiB the cap gives, so a caller asking
