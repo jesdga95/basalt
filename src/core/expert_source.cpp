@@ -6,6 +6,7 @@
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
 #include "basalt/core/pinned.hpp"
+#include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/quantize_act.hpp"
@@ -35,13 +36,10 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#include <fcntl.h>   // _open
-#include <io.h>      // _close
 #else
-#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <unistd.h>
+#include <unistd.h>   // sysconf
 #endif
 
 namespace basalt::core {
@@ -429,11 +427,11 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
     }
     const std::string& path = experts.path;
 #if defined(_WIN32)
-    const int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-    std::wstring wpath((size_t) (wlen > 0 ? wlen : 1), L'\0');
-    if (wlen > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
-    HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    // The mapping is taken on a file handle, so this open is the wide one the mapping needs; the section offset is
+    // not an offset a view can start at (see below), so the handle outlives the open call.
+    HANDLE h = CreateFileW(platform::to_wide(path).c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) { err = "FileExpertSource: cannot open " + path; return false; }
     LARGE_INTEGER li{};
     if (!GetFileSizeEx(h, &li)) { CloseHandle(h); err = "FileExpertSource: cannot stat " + path; return false; }
@@ -462,10 +460,10 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
     if (raw == nullptr) { err = "FileExpertSource: mapping failed on " + path; return false; }
     void* view = raw + experts.offset;
 #else
-    const int fd = ::open(path.c_str(), O_RDONLY);
+    const int fd = platform::open_fd_utf8(path);
     if (fd < 0) { err = "FileExpertSource: cannot open " + path; return false; }
     struct stat st{};
-    if (fstat(fd, &st) != 0) { ::close(fd); err = "FileExpertSource: cannot stat " + path; return false; }
+    if (fstat(fd, &st) != 0) { platform::close_fd(fd); err = "FileExpertSource: cannot stat " + path; return false; }
     // a whole file is exactly the experts; a section must be, and lie inside the file
     const uint64_t have = experts.bytes != 0 ? experts.bytes : (st.st_size < 0 ? 0 : (uint64_t) st.st_size);
     if (st.st_size < 0 || have != want || experts.offset > (uint64_t) st.st_size ||
@@ -476,18 +474,18 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
                       "the pack this geometry came from",
                       path.c_str(), (unsigned long long) have,
                       (unsigned long long) want);
-        ::close(fd);
+        platform::close_fd(fd);
         err = buf;
         return false;
     }
     void* view = mmap(nullptr, (size_t) want, PROT_READ, MAP_SHARED, fd, (off_t) experts.offset);
-    if (view == MAP_FAILED) { ::close(fd); err = "FileExpertSource: mmap failed on " + path; return false; }
+    if (view == MAP_FAILED) { platform::close_fd(fd); err = "FileExpertSource: mmap failed on " + path; return false; }
 #endif
 #if defined(_WIN32)
     // A second, plain descriptor for the prompt path's positional reads: the view stays read-only for the compute,
     // while the staging buffers are filled with reads that do not fault mapping pages in. A failure here is not
     // fatal - the caller falls back to copying from the view.
-    fd_ = _open(path.c_str(), _O_RDONLY | _O_BINARY);
+    fd_ = platform::open_fd_utf8(path);
 #else
     fd_ = fd;
 #endif
@@ -559,11 +557,7 @@ void FileExpertSource::close() {
         munmap((void*) base_, (size_t) mapped_bytes_);
 #endif
     }
-#if defined(_WIN32)
-    if (fd_ >= 0) _close(fd_);
-#else
-    if (fd_ >= 0) ::close(fd_);
-#endif
+    platform::close_fd(fd_);
     fd_ = -1;
     base_ = nullptr;
     blobs_ = 0;
@@ -971,10 +965,7 @@ bool FileExpertSource::pin_cache_complement(
                 fail("FileExpertSource: madvise could not release mapped expert layer " + std::to_string(layer));
                 return;
             }
-            if (posix_fadvise(fd_, (off_t) (file_off_ + layer_offset), (off_t) layer_bytes, POSIX_FADV_DONTNEED) != 0) {
-                fail("FileExpertSource: posix_fadvise could not release expert layer " + std::to_string(layer));
-                return;
-            }
+            basalt::platform::advise_dontneed(fd_, file_off_ + layer_offset, layer_bytes);
 #endif
             }
             const int64_t done = layers_done.fetch_add(1) + 1;
