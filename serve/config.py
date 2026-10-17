@@ -17,6 +17,7 @@ ENGINE_DEFAULT_CONTEXT = 4096     # the engine's context without --max-context
 ENGINE_PASSTHROUGH = ("spec", "spec-min-p", "mtp-max-t", "peer-exclusive", "max-context")
 PARALLEL_MAX = 8                            # the engine's batch slots
 CONFIG_PATHS = ("model", "tokenizer")       # relative to the config file
+ENGINE_WORDS = {"--control-vector-layer-range": 2}   # engine flags that take several values: --flag A B
 
 
 def engine_flags_of(engine_bin: str) -> set[str] | None:
@@ -36,15 +37,22 @@ def server_options(ap: argparse.ArgumentParser) -> dict:
 
 
 def split_engine_extras(extras: list[str]) -> dict:
-    """Engine flags among the unknown command-line words: `--flag VALUE`, `--flag=VALUE` or a bare switch;
-    ValueError for a stray word."""
+    """Engine flags among the unknown command-line words: `--flag VALUE`, `--flag=VALUE`, `--flag A B` for the
+    flags in ENGINE_WORDS (a list), or a bare switch; ValueError for a stray word."""
     out, i = {}, 0
     while i < len(extras):
         word = extras[i]
         if not word.startswith("--") or len(word) < 3:
             raise ValueError(f"unexpected {word!r}")
         flag, eq, value = word.partition("=")
-        if eq:
+        if flag in ENGINE_WORDS:
+            n = ENGINE_WORDS[flag]
+            words = extras[i + 1:i + 1 + n]
+            if eq or len(words) < n or any(w.startswith("--") for w in words):
+                raise ValueError(f"{flag} takes {n} values: {flag} " + " ".join(f"V{k + 1}" for k in range(n)))
+            out[flag] = words
+            i += n
+        elif eq:
             out[flag] = value
         elif i + 1 < len(extras) and not extras[i + 1].startswith("--"):
             out[flag] = extras[i + 1]
@@ -116,7 +124,13 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> tuple[list[str],
         flag = "--" + str(key).strip().lower().replace("_", "-").removeprefix("--")
         if flag[2:] in known and flag[2:] not in ENGINE_PASSTHROUGH:
             raise ValueError(f'engine.{key}: a server option, set it under "server"')
-        if isinstance(value, bool) or (isinstance(value, (str, int, float)) and str(value).strip() != ""):
+        if flag in ENGINE_WORDS:
+            n = ENGINE_WORDS[flag]
+            if not (isinstance(value, list) and len(value) == n
+                    and all(isinstance(v, (str, int, float)) and not isinstance(v, bool) for v in value)):
+                raise ValueError(f"engine.{key}: a list of {n} values, not {value!r}")
+            engine[flag] = [str(v) for v in value]
+        elif isinstance(value, bool) or (isinstance(value, (str, int, float)) and str(value).strip() != ""):
             engine[flag] = value
         else:
             raise ValueError(f"engine.{key}: expected a string or number, or true/false for a switch, not {value!r}")
@@ -179,7 +193,8 @@ def engine_line(flags: dict, sources: dict, config: bool = True, shared: tuple[i
         if v is False:
             return f"no {f} ({sources[f]})"
         note = f"{sources[f]}: {shared[0]} / {shared[1]} slots" if shared and f == "--max-context" else sources[f]
-        return f"{f}{'' if v is True else f' {v}'} ({note})"
+        shown_v = " ".join(v) if isinstance(v, list) else v
+        return f"{f}{'' if v is True else f' {shown_v}'} ({note})"
     shown = ", ".join(one(f, v) for f, v in flags.items())
     if config:
         return f"[server] engine: {shown}" if shown else "[server] engine: config sets nothing, built-in defaults"

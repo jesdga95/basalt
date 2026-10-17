@@ -100,10 +100,16 @@ def vision_config(mf: ModelFile, engine_bin: str, sidecar: bool = True) -> dict:
 
 
 def with_arg(args: list[str], flag: str, value) -> list[str]:
-    """`args` with `flag value` replaced, or appended when absent; a value of True is a bare switch."""
+    """`args` with `flag value` replaced, or appended when absent; a value of True is a bare switch, a list is the
+    flag's several values."""
     out = list(args)
     if value is True:
         return out if flag in out else out + [flag]
+    if isinstance(value, list):
+        if flag in out:
+            i = out.index(flag)
+            del out[i:i + 1 + len(value)]
+        return out + [flag, *map(str, value)]
     if flag in out:
         out[out.index(flag) + 1] = str(value)
     else:

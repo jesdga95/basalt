@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from serve.engine.modelfile import with_arg  # noqa: E402
-from serve.config import ENGINE_PASSTHROUGH, build_parser, check_engine_flags, engine_flags_of, engine_line, engine_settings, load_config_file, parallel_count, parse_settings, server_options, split_engine_extras  # noqa: E402
+from serve.config import ENGINE_PASSTHROUGH, ENGINE_WORDS, build_parser, check_engine_flags, engine_flags_of, engine_line, engine_settings, load_config_file, parallel_count, parse_settings, server_options, split_engine_extras  # noqa: E402
 from serve.security import exposed_without_key  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -59,6 +59,40 @@ class ConfigFile(unittest.TestCase):
         self.assertEqual(argv, ["--port", "9000", "--vision", "on", "--allowed-host", "a", "--allowed-host", "b",
                                 "--gpu", "0,1"])
         self.assertEqual(engine, {"--max-context": 32768, "--kv": "int8", "--resident-experts": True})
+
+    def test_engine_flag_with_several_values(self):
+        # --control-vector-layer-range A B: two separate words to the engine, from the file or the command line
+        _, engine = load_config_file(conf({"engine": {"control-vector-layer-range": [4, 44], "cvec-mode": "project"}}),
+                                     build_parser())
+        self.assertEqual(engine, {"--control-vector-layer-range": ["4", "44"], "--cvec-mode": "project"})
+        self.assertEqual(split_engine_extras(["--control-vector-layer-range", "4", "44", "--cvec-mode", "project"]),
+                         engine)
+        args = ["--model", "m"]
+        for flag, value in engine.items():
+            args = with_arg(args, flag, value)
+        self.assertEqual(args, ["--model", "m", "--control-vector-layer-range", "4", "44", "--cvec-mode", "project"])
+        self.assertEqual(with_arg(args, "--control-vector-layer-range", ["1", "8"]),
+                         ["--model", "m", "--cvec-mode", "project", "--control-vector-layer-range", "1", "8"])
+        self.assertIn("--control-vector-layer-range 4 44 (config)",
+                      engine_line({"--control-vector-layer-range": ["4", "44"]},
+                                  {"--control-vector-layer-range": "config"}))
+        for bad in ("4 44", 4, [4], [4, 44, 50], [4, None], [True, 1]):
+            with self.assertRaisesRegex(ValueError, "a list of 2 values", msg=str(bad)):
+                load_config_file(conf({"engine": {"control-vector-layer-range": bad}}), build_parser())
+        for words in (["--control-vector-layer-range", "4"], ["--control-vector-layer-range=4", "44"],
+                      ["--control-vector-layer-range", "4", "--cvec-mode", "project"]):
+            with self.assertRaisesRegex(ValueError, "takes 2 values", msg=str(words)):
+                split_engine_extras(words)
+        with self.assertRaisesRegex(ValueError, "expected a string or number"):  # other flags: one value, as before
+            load_config_file(conf({"engine": {"spec": [7, 8]}}), build_parser())
+
+    def test_engine_words_match_the_engine(self):
+        # every engine flag that reads more than one value is in ENGINE_WORDS, with its count
+        src = (ROOT / "src/program/generate.cpp").read_text()
+        reads = {}
+        for flag in re.findall(r'next\("(--[a-z0-9-]+)"\)', src):
+            reads[flag] = reads.get(flag, 0) + 1
+        self.assertEqual({f: n for f, n in reads.items() if n > 1}, ENGINE_WORDS)
 
     def test_paths_are_relative_to_the_file(self):
         p = conf({"server": {"model": "m/x.basalt", "tokenizer": "tok"}})
@@ -222,13 +256,18 @@ class EveryOption(unittest.TestCase):
                 with self.assertRaises(ValueError, msg=flag):
                     load_config_file(conf({"engine": {flag: 1}}), build_parser())
                 continue
-            cli = [flag, "5"] if takes_value else [flag]
-            cfgv = 5 if takes_value else True
+            n = ENGINE_WORDS.get(flag, 1)
+            cli = [flag] + ["5"] * n if takes_value else [flag]
+            cfgv = (5 if n == 1 else [5] * n) if takes_value else True
             _, _, _, cli_engine = parse(cli)
             _, _, file_engine, _ = parse([], {"engine": {flag: cfgv}})
             self.assertEqual(list(cli_engine), [flag])
-            self.assertEqual(float(cli_engine[flag]) if takes_value else cli_engine[flag], 5.0 if takes_value else True, flag)
-            self.assertEqual(file_engine, {flag: cfgv}, flag)
+            if n > 1:
+                self.assertEqual(cli_engine[flag], ["5"] * n, flag)
+                self.assertEqual(file_engine, {flag: ["5"] * n}, flag)
+            else:
+                self.assertEqual(float(cli_engine[flag]) if takes_value else cli_engine[flag], 5.0 if takes_value else True, flag)
+                self.assertEqual(file_engine, {flag: cfgv}, flag)
             check_engine_flags(cli_engine, known, "cli")
             check_engine_flags(file_engine, known, "config")
             args = with_arg(["--model", "m"], flag, {**file_engine, **cli_engine}[flag])
