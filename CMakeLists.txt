@@ -695,6 +695,16 @@ target_link_libraries(platform_memory_test PRIVATE core ${_gpu_runtime_target})
 basalt_embed_manifest(platform_memory_test)
 add_test(NAME platform_memory_test COMMAND platform_memory_test)
 
+# A path carried as UTF-8 reaching the OS intact: the seam in both directions, and a path past 260 chars
+# (longPathAware). The program also runs itself as a child with a non-ASCII name as one argument, which is how a
+# pack path typed by a user arrives; on Windows argv is decoded with the process code page, so that case only
+# passes because this executable carries the application manifest.
+add_executable(path_utf8_test tests/platform/path_utf8_test.cpp)
+target_link_libraries(path_utf8_test PRIVATE platform)
+basalt_embed_manifest(path_utf8_test)
+add_test(NAME path_utf8_test COMMAND path_utf8_test)
+set_tests_properties(path_utf8_test PROPERTIES TIMEOUT 60)
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)
   target_link_libraries(pinned_shared_test PRIVATE core ${_gpu_runtime_target})
