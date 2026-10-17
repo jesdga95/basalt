@@ -159,6 +159,16 @@ uint64_t ram_margin() {
 }
 #endif
 
+uint64_t commit_headroom() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    return GlobalMemoryStatusEx(&ms) ? (uint64_t) ms.ullAvailPageFile : 0;
+#else
+    return available_memory();
+#endif
+}
+
 uint64_t ram_budget(bool* known) {
     const uint64_t avail = available_memory();
     if (known) *known = avail > 0;
