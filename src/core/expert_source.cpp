@@ -427,8 +427,7 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
     }
     const std::string& path = experts.path;
 #if defined(_WIN32)
-    // The mapping is taken on a file handle, so this open is the wide one the mapping needs; the section offset is
-    // not an offset a view can start at (see below), so the handle outlives the open call.
+    // The section is taken on a file handle, so this open is the wide Win32 one: the file seam has no mapping call.
     HANDLE h = CreateFileW(platform::to_wide(path).c_str(), GENERIC_READ,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                            FILE_ATTRIBUTE_NORMAL, nullptr);

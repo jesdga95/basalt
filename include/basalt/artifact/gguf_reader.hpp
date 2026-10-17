@@ -34,8 +34,8 @@
 #include "basalt/artifact/gguf_split.hpp"
 #include "basalt/platform/file.hpp"
 
-// The file mapping below is Windows code in a header-only reader, so the Win32 include cannot leave this header; the
-// `NOMINMAX` guard keeps its min/max macros out of every file that includes the reader.
+// The reader maps its file inside this header (the artifact target has no source file of its own), so the Win32
+// include for that mapping is here too.
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
