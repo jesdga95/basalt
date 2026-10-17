@@ -82,6 +82,7 @@
 #include <sys/sysmacros.h>
 #endif
 #include <cerrno>
+#include <cstddef>   // std::ptrdiff_t
 
 #include <cuda_runtime.h>
 
@@ -687,7 +688,7 @@ int serve_subcommand(int argc, char** argv) {
     }
     exe[exe_len] = 0;
 #else
-    const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof exe - 1);
+    const std::ptrdiff_t n = ::readlink("/proc/self/exe", exe, sizeof exe - 1);
     if (n <= 0) { std::fprintf(stderr, "basalt serve: cannot find this binary (/proc/self/exe)\n"); return 1; }
     exe[n] = 0;
 #endif
@@ -5980,7 +5981,7 @@ int main(int argc, char** argv) {
                         buf.erase(0, nlpos + 1);
                         return true;
                     }
-                    const ssize_t n = ::read(0, chunk, sizeof chunk);
+                    const std::ptrdiff_t n = ::read(0, chunk, sizeof chunk);
                     if (n < 0 && errno == EINTR) continue;
                     if (n <= 0) {
                         if (buf.empty()) return false;
