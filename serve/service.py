@@ -7,7 +7,6 @@ import ctypes
 import subprocess
 import threading
 import time
-import uuid
 from pathlib import Path
 from typing import Iterator
 
@@ -473,29 +472,24 @@ class Service:
             with self.fifo:
                 if getattr(self.vision, "in_engine", False):   # the encoder lives in the engine: it must be running
                     self.ensure_loaded()
-                many = getattr(self.vision, "encode_many", None)
-                encoded = many(images) if many else [self.vision.encode(src) for src in images]
+                combined, counts = self.vision.encode(images)
             # expand each image's pad to one per image token; a pad not after <|vision_start|> is message text
             literal = self.tok.encode(IMAGE_PAD, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
                 if t == pad and j > 0 and ids[j - 1] == start:
                     # more markers than images
-                    if k == len(encoded):
+                    if k == len(counts):
                         raise ValueError("the prompt and its images do not match")
-                    out += [pad] * encoded[k][1]
+                    out += [pad] * counts[k]
                     k += 1
                 elif t == pad:
                     out += literal
                 else:
                     out.append(t)
-            if k != len(encoded):
+            if k != len(counts):
                 raise ValueError("the prompt and its images do not match")
             ids = out
-            combined = self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
-            with open(combined, "wb") as f:
-                for path, _ in encoded:
-                    f.write(path.read_bytes())
             self.embeddings.path = combined
         ctx = self.engine.max_context
         if ctx <= 0:
