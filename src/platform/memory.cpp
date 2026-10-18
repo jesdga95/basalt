@@ -9,31 +9,138 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <malloc.h>   // _aligned_malloc, _aligned_free
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 namespace basalt::platform {
+
+#if defined(_WIN32)
+namespace {
+/// Enables one privilege in this process's token. A privilege can be assigned to the account and still be absent
+/// from the token until the process asks for it, which is the normal state for an interactive one.
+void enable_privilege(LPCWSTR name) {
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) return;
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    if (LookupPrivilegeValueW(nullptr, name, &tp.Privileges[0].Luid)) {
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        (void) AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr);
+    }
+    CloseHandle(tok);
+}
+}  // namespace
+#endif
 
 LockResult lock_resident(void* p, uint64_t bytes) {
     LockResult r;
     if (p == nullptr || bytes == 0) { r.note = "nothing to lock"; return r; }
+#if defined(_WIN32)
+    enable_privilege(L"SeIncreaseWorkingSetPrivilege");   // to raise this process's working set
+    enable_privilege(L"SeLockMemoryPrivilege");          // and to lock pages in it
+    HANDLE self = GetCurrentProcess();
+    SIZE_T min_ws = 0, max_ws = 0;
+    DWORD flags = 0;
+    // Locked pages count against the minimum working set, so it has to grow by the region plus room for the rest of
+    // the process first. Both limits are soft, so raising the minimum reserves without pinning the process to it.
+    // A quota that cannot be raised is reported and the lock tried anyway: whatever the existing quota covers is
+    // still worth having.
+    std::string quota_note;
+    if (!GetProcessWorkingSetSizeEx(self, &min_ws, &max_ws, &flags)) {
+        quota_note = "GetProcessWorkingSetSizeEx failed (error " + std::to_string(GetLastError()) + ")";
+    } else {
+        const SIZE_T margin = (SIZE_T) 512 << 20;
+        const SIZE_T new_min = min_ws + (SIZE_T) bytes + margin;
+        const SIZE_T new_max = max_ws > new_min + margin ? max_ws : new_min + margin;
+        if (!SetProcessWorkingSetSizeEx(self, new_min, new_max,
+                                        QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE))
+            quota_note = "SetProcessWorkingSetSizeEx(" + std::to_string((unsigned long long) (new_min >> 20)) +
+                         " MiB) failed (error " + std::to_string(GetLastError()) + ")";
+    }
+    // Chunked, because one call over the whole region loses everything past the first page that does not fit.
+    const uint64_t chunk = 1ull << 30;
+    uint8_t* base = (uint8_t*) p;
+    for (uint64_t off = 0; off < bytes; off += chunk) {
+        const uint64_t n = bytes - off < chunk ? bytes - off : chunk;
+        if (!VirtualLock(base + off, (SIZE_T) n)) {
+            r.note = (quota_note.empty() ? "" : quota_note + "; ") + "VirtualLock stopped at " +
+                     std::to_string((unsigned long long) (off >> 20)) + " of " +
+                     std::to_string((unsigned long long) (bytes >> 20)) + " MiB (error " +
+                     std::to_string(GetLastError()) + ")";
+            r.ok = off > 0;   // what it did lock stays locked; the rest of the region is merely pageable
+            return r;
+        }
+        r.locked_bytes = off + n;
+    }
+    r.ok = true;
+    const std::string locked = std::to_string((unsigned long long) (bytes >> 20)) + " MiB";
+    r.note = quota_note.empty() ? "locked " + locked + " via working-set minimum + VirtualLock"
+                                : quota_note + "; locked " + locked + " with the quota already in place";
+    return r;
+#else
     if (mlock(p, bytes) != 0) { r.note = "mlock failed (raise ulimit -l)"; return r; }
     r.ok = true;
     r.locked_bytes = bytes;
     r.note = "mlock";
     return r;
+#endif
 }
 
 void unlock_resident(void* p, uint64_t bytes) {
-    if (p != nullptr && bytes != 0) munlock(p, bytes);
+    if (p == nullptr || bytes == 0) return;
+#if defined(_WIN32)
+    const uint64_t chunk = 1ull << 30;
+    for (uint64_t off = 0; off < bytes; off += chunk)
+        VirtualUnlock((uint8_t*) p + off, (SIZE_T) (bytes - off < chunk ? bytes - off : chunk));
+#else
+    munlock(p, bytes);
+#endif
 }
 
 uint64_t total_physical_memory() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    return GlobalMemoryStatusEx(&ms) ? (uint64_t) ms.ullTotalPhys : 0;
+#else
     const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
     return pages > 0 && page > 0 ? (uint64_t) pages * (uint64_t) page : 0;
+#endif
 }
 
+#if defined(_WIN32)
+namespace {
+/// The two figures the sizing reads, from one query: available and total physical RAM in bytes. Both are 0 when the
+/// query fails, which the callers read as unknown rather than as none.
+void memory_status(uint64_t& avail, uint64_t& total) {
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (!GlobalMemoryStatusEx(&ms)) { avail = 0; total = 0; return; }
+    avail = (uint64_t) ms.ullAvailPhys;
+    total = (uint64_t) ms.ullTotalPhys;
+}
+}  // namespace
+
+uint64_t available_memory() {
+    uint64_t avail = 0, total = 0;
+    memory_status(avail, total);
+    return avail;
+}
+
+uint64_t ram_margin() {
+    uint64_t avail = 0, total = 0;
+    memory_status(avail, total);
+    return std::max<uint64_t>(2ull << 30, total / 20);
+}
+#else
 namespace {
 // One "<key>: <n> kB" line of /proc/meminfo in bytes (0 when absent).
 uint64_t meminfo_bytes(const char* key) {
@@ -50,6 +157,17 @@ uint64_t available_memory() { return meminfo_bytes("MemAvailable"); }
 
 uint64_t ram_margin() {
     return std::max<uint64_t>(2ull << 30, meminfo_bytes("MemTotal") / 20);
+}
+#endif
+
+uint64_t commit_headroom() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    return GlobalMemoryStatusEx(&ms) ? (uint64_t) ms.ullAvailPageFile : 0;
+#else
+    return available_memory();
+#endif
 }
 
 uint64_t ram_budget(bool* known) {
@@ -137,6 +255,48 @@ bool ram_guard_low(uint64_t* avail, uint64_t* floor) {
     return g_guard_low.load(std::memory_order_relaxed);
 }
 
+#if defined(_WIN32)
+namespace {
+constexpr uint64_t kPrefetchStep = 128ull << 10;
+
+/// The page size, so a prefetch window starts on a page boundary.
+uintptr_t page_bytes() {
+    static const uintptr_t ps = [] {
+        SYSTEM_INFO si{};
+        GetSystemInfo(&si);
+        return si.dwPageSize > 0 ? (uintptr_t) si.dwPageSize : (uintptr_t) 4096;
+    }();
+    return ps;
+}
+}  // namespace
+
+bool read_ahead_enabled() { return true; }
+
+void advise_willneed(const void* p, uint64_t bytes) {
+    if (p == nullptr || bytes == 0 || !read_ahead_enabled()) return;
+    // A view of a file mapping takes its pages one fault at a time as they are touched, so asking for the range
+    // ahead of the access replaces those faults with large background reads.  The hint is best effort: a range the
+    // system will not serve is skipped without an error, and pages already in memory cost nothing.  The range is
+    // asked for in bounded windows, which keeps the reads in flight - and the memory they hold - bounded instead of
+    // asking for a whole layer at once.
+    const uintptr_t pg = page_bytes(), end = (uintptr_t) p + bytes;
+    for (uintptr_t a = (uintptr_t) p & ~(pg - 1); a < end; a += kPrefetchStep) {
+        WIN32_MEMORY_RANGE_ENTRY entry{};
+        entry.VirtualAddress = (PVOID) a;
+        entry.NumberOfBytes = (SIZE_T) std::min<uintptr_t>(kPrefetchStep, end - a);
+        (void) PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+    }
+}
+
+void advise_willneed(int fd, uint64_t offset, uint64_t bytes) {
+    // No descriptor-range hint on Windows: the cache manager takes no "will need" for an open handle.  Reads through
+    // a descriptor are cached reads unless the caller opted out of the cache, and the cache manager already reads
+    // ahead around the position a sequential reader is at.  Warming a range by reading it into a scratch buffer
+    // would move the bytes twice and cost the file cache the room, so nothing is asked.  A caller holding a mapped
+    // view of the same file gets the prefetch from the overload above.
+    (void) fd; (void) offset; (void) bytes;
+}
+#else
 namespace {
 constexpr uint64_t kAdviseStep = 128ull << 10;
 }
@@ -155,6 +315,51 @@ void advise_willneed(int fd, uint64_t offset, uint64_t bytes) {
     if (fd < 0 || !read_ahead_enabled()) return;
     for (uint64_t at = 0; at < bytes; at += kAdviseStep)
         (void) posix_fadvise(fd, (off_t) (offset + at), (off_t) std::min(kAdviseStep, bytes - at), POSIX_FADV_WILLNEED);
+}
+#endif
+
+void* alloc_aligned(size_t bytes, size_t alignment) {
+    if (bytes == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0) return nullptr;
+#if defined(_WIN32)
+    return _aligned_malloc(bytes, alignment);
+#else
+    void* p = nullptr;
+    if (posix_memalign(&p, alignment, bytes) != 0) return nullptr;
+    return p;
+#endif
+}
+
+void free_aligned(void* p) {
+    if (p == nullptr) return;
+#if defined(_WIN32)
+    _aligned_free(p);
+#else
+    std::free(p);
+#endif
+}
+
+bool drop_mapped_view(const void* base, uint64_t view_bytes, uint64_t off, uint64_t bytes) {
+    if (base == nullptr || bytes == 0) return true;
+#if defined(_WIN32)
+    // A view of a file mapping has no per-range release. Its pages are clean, so the manager takes them back on
+    // pressure by itself, and nothing here claims they were freed.
+    (void) view_bytes; (void) off;
+    return true;
+#else
+    // Only whole pages can be given back: a page the range shares with a neighbour still holds bytes the caller may
+    // read. So the range is widened to the page boundaries and then clipped to the view.
+    const long ps = sysconf(_SC_PAGE_SIZE);
+    if (ps <= 0) return false;
+    const uint64_t page = (uint64_t) ps;
+    const uint64_t end = off + bytes;
+    if (end > view_bytes) return false;
+    const uint64_t start = off - off % page;
+    const uint64_t remainder = end % page;
+    const uint64_t extra = remainder == 0 ? 0 : page - remainder;
+    const uint64_t wide = extra > view_bytes - end ? view_bytes : end + extra;
+    if (wide <= start) return true;
+    return madvise((void*) ((const uint8_t*) base + (size_t) start), (size_t) (wide - start), MADV_DONTNEED) == 0;
+#endif
 }
 
 }  // namespace basalt::platform

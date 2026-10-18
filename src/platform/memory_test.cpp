@@ -1,10 +1,26 @@
-// src/platform/memory_test.cpp - lock_resident on a 256 MiB region, the RAM floor and the file cache decisions (CPU
-// only, no GPU, no model).
+// src/platform/memory_test.cpp - lock_resident on a 256 MiB region, the RAM floor, the file cache decisions and the
+// read-ahead hint on a mapped file view (CPU only, no GPU, no model; one temp file).
 #include "basalt/platform/memory.hpp"
+
+#include "basalt/platform/file.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <vector>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 
 namespace {
@@ -85,10 +101,94 @@ int ram_floor_cases() {
     }
     return fail;
 }
+// The read-ahead seam on a real mapped file view. Whether the OS actually prefetched is not observable portably and
+// is not what the seam promises, so what is checked is that every range shape returns without faulting and that the
+// mapping's bytes stay exactly as written.
+int read_ahead_cases() {
+    using namespace basalt::platform;
+    int fail = 0;
+    const bool on = read_ahead_enabled();
+    std::printf("read-ahead %-58s -> %s%s\n", "read_ahead_enabled (both platforms)", on ? "on" : "off",
+                on ? "" : "   <-- WRONG");
+    fail |= !on;
+
+    const uint64_t bytes = 256ull << 10;   // spans more than one 128 KiB hint window
+    std::vector<uint8_t> pattern(bytes);
+    for (uint64_t i = 0; i < bytes; ++i) pattern[i] = (uint8_t) (i * 13u + (i >> 8) * 7u);
+    const std::string path = (std::filesystem::temp_directory_path() / "basalt_memory_test_view.bin").string();
+    {
+        std::ofstream f(path, std::ios::binary);
+        f.write((const char*) pattern.data(), (std::streamsize) bytes);
+        if (!f) {
+            std::printf("read-ahead %-58s   <-- cannot write %s\n", "temp file", path.c_str());
+            return fail | 1;
+        }
+    }
+    // mapped the way the engine maps its file views: whole file, read-only
+    const uint8_t* base = nullptr;
+#if defined(_WIN32)
+    const std::wstring wpath = basalt::platform::to_wide(path);
+    if (!wpath.empty()) {
+        HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            HANDLE m = CreateFileMappingW(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
+            base = (const uint8_t*) MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+            // the view holds the section and the file open, so both handles go now
+            CloseHandle(m);
+            CloseHandle(h);
+        }
+    }
+#else
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd >= 0) {
+        void* view = mmap(nullptr, (size_t) bytes, PROT_READ, MAP_PRIVATE, fd, 0);
+        ::close(fd);
+        if (view != MAP_FAILED) base = (const uint8_t*) view;
+    }
+#endif
+    if (base == nullptr) {
+        std::printf("read-ahead %-58s   <-- cannot map %s\n", "read-only view", path.c_str());
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        return fail | 1;
+    }
+    auto spots_intact = [&](const char* when) {
+        bool ok = true;
+        for (const uint64_t off : {(uint64_t) 0, (uint64_t) 1234, bytes / 2, bytes - 1}) ok &= base[off] == pattern[off];
+        std::printf("read-ahead %-58s -> %s%s\n", when, ok ? "bytes intact" : "bytes CHANGED", ok ? "" : "   <-- WRONG");
+        fail |= !ok;
+    };
+    spots_intact("view reads back as written, before the hints");
+    struct HintCase { const char* what; const void* p; uint64_t n; };
+    const HintCase cases[] = {
+        {"whole view", base, bytes},
+        {"page-unaligned interior range", base + 1234, 8ull << 10},
+        {"one-byte range", base + bytes / 2, 1},
+        {"range running past the end of the view", base + bytes - 100, 1ull << 20},
+        {"null pointer", nullptr, 4096},
+        {"zero length", base, 0},
+    };
+    for (const HintCase& c : cases) {
+        // the hint is void and silent: reaching the print at all (no fault) and the identical read-back after the
+        // whole sequence are what these cases assert
+        advise_willneed(c.p, c.n);
+        std::printf("read-ahead %-58s -> returned\n", c.what);
+    }
+    spots_intact("view reads back as written, after every hint");
+#if defined(_WIN32)
+    UnmapViewOfFile((void*) base);
+#else
+    munmap((void*) base, (size_t) bytes);
+#endif
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    return fail;
+}
 }  // namespace
 
 int main() {
-    int fail_keeps = file_cache_keeps_cases() | ram_floor_cases();
+    int fail_keeps = file_cache_keeps_cases() | ram_floor_cases() | read_ahead_cases();
     const uint64_t bytes = 256ull << 20;
     void* p = std::malloc(bytes);
     if (p == nullptr) return 2;
