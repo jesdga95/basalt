@@ -96,9 +96,14 @@ std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAff
 /// worker's core or its SMT sibling, which costs the pool bandwidth.
 ///
 /// The previous host placement. `valid` is false when querying or setting placement failed.  The complete,
-/// dynamically sized native CPU mask is stored, including CPU IDs above 63.
+/// dynamically sized native placement is stored, including CPU IDs above 63: Linux keeps the CPU mask, Windows the
+/// selected CPU Set IDs (unsigned long, so this header stays free of windows.h).
 struct ThreadAffinity {
+#if defined(_WIN32)
+    std::vector<unsigned long> cpu_sets;
+#else
     std::vector<unsigned long> mask;
+#endif
     bool valid = false;
 };
 
