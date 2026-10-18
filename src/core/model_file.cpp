@@ -3,10 +3,15 @@
 #include "basalt/core/model_file.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/platform/file.hpp"
 
-#include <fcntl.h>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <sys/stat.h>
-#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -14,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace basalt::core {
 
@@ -22,19 +28,37 @@ namespace basalt::core {
 namespace {
 
 bool file_size_of(const std::string& path, uint64_t& size) {
+#if defined(_WIN32)
+    WIN32_FILE_ATTRIBUTE_DATA d{};
+    if (!GetFileAttributesExW(platform::to_wide(path).c_str(), GetFileExInfoStandard, &d)) return false;
+    if (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return false;   // stat's S_ISREG, in the form Windows gives
+    ULARGE_INTEGER sz;
+    sz.HighPart = d.nFileSizeHigh;
+    sz.LowPart = d.nFileSizeLow;
+    size = sz.QuadPart;
+    return true;
+#else
     struct stat st{};
     if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) return false;
     size = (uint64_t) st.st_size;
     return true;
+#endif
 }
 
+/// Reads `n` bytes at `off` through a descriptor, looping over the short counts one positional read answers with.
 bool pread_all(int fd, void* dst, uint64_t n, uint64_t off) {
     uint8_t* p = (uint8_t*) dst;
     while (n > 0) {
-        const size_t want = (size_t) std::min<uint64_t>(n, 1ull << 30);
-        const ssize_t got = ::pread(fd, p, want, (off_t) off);
-        if (got < 0 && errno == EINTR) continue;
-        if (got <= 0) return false;
+        const int64_t got = platform::pread(fd, p, std::min<uint64_t>(n, 1ull << 30), off);
+        if (got <= 0) {
+#if defined(_WIN32)
+            return false;
+#else
+            // A signal can interrupt a read before it has transferred anything; that one is restarted.
+            if (got < 0 && errno == EINTR) continue;
+            return false;
+#endif
+        }
         p += got;
         off += (uint64_t) got;
         n -= (uint64_t) got;
@@ -58,10 +82,10 @@ uint64_t FileRange::size() const {
 
 bool read_range_at(const FileRange& r, uint64_t off, void* dst, uint64_t n, std::string& err) {
     if (r.bytes != 0 && (off > r.bytes || n > r.bytes - off)) { err = "read past the end of a section of " + r.path; return false; }
-    const int fd = ::open(r.path.c_str(), O_RDONLY);
+    const int fd = platform::open_fd_utf8(r.path);
     if (fd < 0) { err = "cannot open " + r.path; return false; }
     const bool ok = pread_all(fd, dst, n, r.offset + off);
-    ::close(fd);
+    platform::close_fd(fd);
     if (!ok) err = "short read from " + r.path;
     return ok;
 }
@@ -270,10 +294,10 @@ bool ModelFile::open(const std::string& path, std::string& err) {
     if (actual < kHeaderBytes) { err = path + ": not a .basalt model file (too short)"; return false; }
     std::vector<uint8_t> head((size_t) kHeaderBytes);
     {
-        const int fd = ::open(path.c_str(), O_RDONLY);
+        const int fd = platform::open_fd_utf8(path);
         if (fd < 0) { err = "cannot open " + path; return false; }
         const bool ok = pread_all(fd, head.data(), kHeaderBytes, 0);
-        ::close(fd);
+        platform::close_fd(fd);
         if (!ok) { err = "cannot read the header of " + path; return false; }
     }
     FileHeader h;
@@ -457,7 +481,7 @@ bool hc8_write(const std::string& path, const std::vector<Hc8Copy>& copies, std:
     h.version = 1;
     h.n_entries = (uint32_t) copies.size();
     const std::string tmp = path + ".tmp";
-    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    std::FILE* f = platform::open_file_utf8(tmp, "wb");
     if (f == nullptr) { err = "hc8: cannot create " + tmp; return false; }
     bool ok = std::fwrite(&h, sizeof h, 1, f) == 1 &&
               (entries.empty() || std::fwrite(entries.data(), sizeof(Hc8Entry), entries.size(), f) == entries.size());

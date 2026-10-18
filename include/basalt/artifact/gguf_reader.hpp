@@ -32,11 +32,24 @@
 #include <algorithm>
 
 #include "basalt/artifact/gguf_split.hpp"
+#include "basalt/platform/file.hpp"
 
+// The reader maps its file inside this header (the artifact target has no source file of its own), so the Win32
+// include for that mapping is here too.
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+// This header is included widely, and windows.h min/max macros would break std::min/std::max in every file that
+// includes it.
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace basalt {
 
@@ -387,15 +400,42 @@ public:
 
 private:
     void open() {
-        int fd = ::open(path_.c_str(), O_RDONLY);
-        if (fd < 0) throw std::runtime_error("cannot open " + path_);
-        fd_ = fd;
+#if defined(_WIN32)
+        // A read-only file mapping stands in for the private mmap: the pages are the cache manager's, demand
+        // faulted, and nothing here writes to them. The section is taken on a file handle, so this open stays the
+        // wide Win32 one; handle and section live as long as the view does.
+        HANDLE h = CreateFileW(platform::to_wide(path_).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open " + path_);
+        LARGE_INTEGER li{};
+        if (!GetFileSizeEx(h, &li)) {
+            CloseHandle(h);
+            throw std::runtime_error("GetFileSizeEx failed");
+        }
+        size_ = (uint64_t) li.QuadPart;
+        HANDLE m = CreateFileMappingW(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (m == nullptr) {
+            CloseHandle(h);
+            throw std::runtime_error("CreateFileMapping failed");
+        }
+        base_ = (const uint8_t*) MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+        if (base_ == nullptr) {
+            CloseHandle(m);
+            CloseHandle(h);
+            throw std::runtime_error("MapViewOfFile failed");
+        }
+        map_ = m;
+        file_ = h;
+#else
+        fd_ = platform::open_fd_utf8(path_);
+        if (fd_ < 0) throw std::runtime_error("cannot open " + path_);
         struct stat st{};
-        if (fstat(fd, &st) != 0) throw std::runtime_error("fstat failed");
+        if (fstat(fd_, &st) != 0) throw std::runtime_error("fstat failed");
         size_ = (uint64_t)st.st_size;
-        void* p = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
+        void* p = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
         if (p == MAP_FAILED) throw std::runtime_error("mmap failed");
         base_ = (const uint8_t*)p;
+#endif
         const auto& reg = gguf_virtual_registry();
         const auto it = reg.find(path_);
         if (it != reg.end()) {
@@ -410,8 +450,17 @@ private:
         parse();
     }
     void close() {
+#if defined(_WIN32)
+        if (base_ != nullptr) UnmapViewOfFile(base_);
+        if (map_ != nullptr) CloseHandle(map_);
+        if (file_ != nullptr) CloseHandle(file_);
+        base_ = nullptr;
+        map_ = nullptr;
+        file_ = nullptr;
+#else
         if (base_) munmap((void*)base_, size_);
-        if (fd_ >= 0) ::close(fd_);
+        platform::close_fd(fd_);
+#endif
     }
 
     void parse() {
@@ -458,7 +507,12 @@ private:
     const uint8_t* base_ = nullptr;
     uint64_t size_ = 0, data_start_ = 0, alignment_ = 32;
     uint32_t version_ = 0;
+#if defined(_WIN32)
+    void* map_ = nullptr;   // the section the view was taken from
+    void* file_ = nullptr;  // and the file handle that section was made on
+#else
     int fd_ = -1;
+#endif
     bool virtual_ = false;
     std::vector<TensorInfo> tensors_;
     std::map<std::string, MetaValue> meta_;
