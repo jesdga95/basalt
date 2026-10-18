@@ -1,5 +1,7 @@
 #include "basalt/core/conversation_memory.hpp"
 
+#include "basalt/platform/memory.hpp"
+
 #include <charconv>
 #include <fstream>
 #include <limits>
@@ -28,9 +30,17 @@ std::optional<uint64_t> conversation_mem_available(std::istream& meminfo) {
 }
 
 std::optional<uint64_t> conversation_available_memory() {
+#if defined(_WIN32)
+    // No /proc/meminfo here: take the platform probe's physical-RAM reading, in bytes. It reports
+    // 0 when the query gives no reading, which stays unknown so admission fails closed.
+    const uint64_t avail = basalt::platform::available_memory();
+    if (avail == 0) return {};
+    return avail;
+#else
     std::ifstream meminfo("/proc/meminfo");
     if (!meminfo) return {};
     return conversation_mem_available(meminfo);
+#endif
 }
 
 } // namespace basalt::core
