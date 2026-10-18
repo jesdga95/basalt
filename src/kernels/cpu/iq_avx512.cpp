@@ -28,6 +28,17 @@ inline uint32_t u32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); retur
 inline uint16_t u16(const uint8_t* p) { uint16_t v; std::memcpy(&v, p, 2); return v; }
 inline uint64_t u64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
 
+// the index of the lowest set bit of a nonzero mask: the compiler's own scan
+inline int lowest_bit(unsigned m) {
+#if defined(_MSC_VER)
+    unsigned long i = 0;
+    _BitScanForward(&i, m);
+    return (int) i;
+#else
+    return __builtin_ctz(m);
+#endif
+}
+
 // software prefetch distance in bytes: the rows are streamed from DRAM, so ask for them a few blocks ahead
 constexpr int prefetch_ahead = 2048;
 
@@ -250,7 +261,7 @@ void quantize_q8_K_avx512(const float* x, void* dst, int64_t k) {
         float mx = 0.f;
         for (int j = 0; j < QK_K / 16; ++j) {
             const __mmask16 m = _mm512_cmp_ps_mask(_mm512_abs_ps(v[j]), amv, _CMP_EQ_OQ);
-            if (m != 0) { mx = x[16 * j + __builtin_ctz((unsigned) m)]; break; }
+            if (m != 0) { mx = x[16 * j + lowest_bit((unsigned) m)]; break; }
         }
         const float iscale = -127.f / mx;
         const __m512 is = _mm512_set1_ps(iscale);

@@ -17,6 +17,7 @@
 // finite, non-zero scales, and the blob at a DIFFERENT layer must be different data - which is what a wrong
 // stride would break.
 #include "basalt/kernels/cpu/expert.hpp"
+#include "basalt/platform/file.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -43,9 +44,10 @@ double rel_l1(const float* a, const float* b, int n, double* mag_out = nullptr) 
 
 bool read_blob(const char* path, long long index, std::vector<uint8_t>& out) {
     out.assign(cpu::BLOB, 0);
-    std::FILE* f = std::fopen(path, "rb");
+    std::FILE* f = basalt::platform::open_file_utf8(path, "rb");
     if (!f) return false;
-    if (fseeko(f, (off_t) index * (off_t) cpu::BLOB, SEEK_SET) != 0) { std::fclose(f); return false; }
+    // The blob a layer index points at can sit past 4 GiB, so the seek has to be a 64-bit one.
+    if (basalt::platform::fseek64(f, index * (long long) cpu::BLOB, SEEK_SET) != 0) { std::fclose(f); return false; }
     const size_t got = std::fread(out.data(), 1, out.size(), f);
     std::fclose(f);
     return got == out.size();

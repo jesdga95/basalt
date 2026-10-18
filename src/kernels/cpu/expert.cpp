@@ -4,7 +4,12 @@
 #include "basalt/kernels/cpu/expert.hpp"
 
 #include <immintrin.h>
+#if defined(_MSC_VER)
+// MSVC has no cpuid.h; CPUID is the __cpuidex intrinsic, with the subleaf passed in ECX.
+#include <intrin.h>
+#else
 #include <cpuid.h>
+#endif
 
 #include <cmath>
 #include <atomic>
@@ -309,9 +314,17 @@ CpuFeatures cpu_features() {
     CpuFeatures f;
     int reg[4] = {0, 0, 0, 0};
     unsigned r[4] = {0, 0, 0, 0};
+#if defined(_MSC_VER)
+    { int x[4]; __cpuidex(x, 0, 0); for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i]; }
+#else
     __cpuid_count(0, 0, r[0], r[1], r[2], r[3]);
+#endif
     if (r[0] < 7) return f;
+#if defined(_MSC_VER)
+    { int x[4]; __cpuidex(x, 7, 0); for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i]; }
+#else
     __cpuid_count(7, 0, r[0], r[1], r[2], r[3]);
+#endif
     for (int i = 0; i < 4; ++i) reg[i] = (int) r[i];
     const unsigned ebx = (unsigned) reg[1], ecx = (unsigned) reg[2];
     f.avx512f = (ebx >> 16) & 1u;

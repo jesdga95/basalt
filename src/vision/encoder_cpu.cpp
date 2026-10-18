@@ -6,11 +6,25 @@
 #include <cstring>
 #include <thread>
 
+#if defined(_MSC_VER)
+#include <immintrin.h>
+#endif
+
 #include "gemm_cpu.hpp"
 
 namespace basalt::vision {
 
 namespace {
+
+// The fp32 -> half -> fp32 round trip the reference quantizes with. Where the compiler has a half type it does the
+// conversion; MSVC has none, and its F16C intrinsic pair is the same instruction with the same rounding.
+#if defined(_MSC_VER)
+float f16_round(float x) {
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtps_ph(_mm_set_ss(x), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)));
+}
+#else
+float f16_round(float x) { return (float) (_Float16) x; }
+#endif
 
 void parallel_for(int threads, int n, const std::function<void(int, int)>& fn) {
     threads = std::max(1, std::min(threads, n));
@@ -31,7 +45,7 @@ float gelu_exact(float x) {
 float gelu_f16(float x) {
     if (x <= -10.f) return 0.f;
     if (x >= 10.f) return x;
-    return (float) (_Float16) gelu_exact((float) (_Float16) x);
+    return f16_round(gelu_exact(f16_round(x)));
 }
 
 void layer_norm(const float* x, const float* w, const float* b, float* y, int rows, int n, float eps, int threads) {
@@ -111,7 +125,7 @@ bool CpuEncoder::encode(const std::vector<float>& patches, Size canvas, std::vec
 
     // patch embedding + bilinear position embedding, rows in merge order
     std::vector<float> p16(patches);
-    if (f16_) for (float& v : p16) v = (float) (_Float16) v;
+    if (f16_) for (float& v : p16) v = f16_round(v);
     gemm_f32w(p16.data(), wpatch_.data(), x.data(), n, E, 768, T);
     {
         const int S = 48;
