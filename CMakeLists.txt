@@ -37,15 +37,69 @@ set(_gpu_runtime_target CUDA::cudart)
 set(_gpu_blas_target CUDA::cublas)
 set(_gpu_include_directories ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 
+# MSVC reports __cplusplus as 199711L unless /Zc:__cplusplus is given. cuda.h applies alignas(TENSOR_MAP_ALIGN) to
+# CUtensorMap only when __cplusplus says C++11 or later, so without the option the type keeps the 8-byte alignment
+# of its single array member and the TMA descriptors inside a __grid_constant__ kernel-argument struct fault on a
+# misaligned address. The option has to be global: the alignment is decided in the translation unit that reads the
+# header, which is not necessarily one that links the target carrying a compile option.
+if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+  add_compile_options($<$<COMPILE_LANGUAGE:C>:/Zc:__cplusplus>)
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>)
+  # nvcc takes host-compiler options through -Xcompiler, and this reaches every CUDA target.
+  string(APPEND CMAKE_CUDA_FLAGS " -Xcompiler=/Zc:__cplusplus")
+endif()
+
 # Warnings live on an INTERFACE target the project's own C++ code links, NOT in add_compile_options: applied
 # globally they would also hit the extracted ggml C and CUDA sources, whose warnings are not this project's to fix.
-# The flags are guarded by COMPILE_LANGUAGE:CXX so nvcc never receives them as inputs.
+# The flags are guarded by COMPILE_LANGUAGE:CXX so nvcc never receives them as inputs, and by the compiler id:
+# MSVC reads -Wall/-Wextra as /Wall and the invalid /Wextra, so it takes its own spellings. The sources are UTF-8,
+# which MSVC only assumes when told (the Windows SDK's headers are not), hence /utf-8 for both languages.
 add_library(warnings INTERFACE)
 target_compile_options(warnings INTERFACE
-  $<$<COMPILE_LANGUAGE:CXX>:-Wall>
-  $<$<COMPILE_LANGUAGE:CXX>:-Wextra>)
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/W4>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/utf-8>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wall>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wextra>
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/utf-8>)
 if(WERROR)
-  target_compile_options(warnings INTERFACE $<$<COMPILE_LANGUAGE:CXX>:-Werror>)
+  target_compile_options(warnings INTERFACE
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/WX>
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Werror>)
+endif()
+
+# The application manifest, for every program that names a file path in its command line. Windows decodes argv and
+# the CRT's narrow opens in the machine's ANSI code page unless the image says otherwise, so the same pack path
+# opens at one call site and fails at another. The manifest says the process code page is UTF-8 and that long paths
+# are in use; `link.exe` merges the file into the RT_MANIFEST resource it already writes, so there is no mt.exe step
+# and no external .manifest beside the exe. Nothing changes on Linux, where a path is bytes.
+set(_basalt_manifest ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/basalt.exe.manifest)
+function(basalt_embed_manifest target)
+  if(MSVC)
+    target_link_options(${target} PRIVATE "/MANIFEST:EMBED" "/MANIFESTINPUT:${_basalt_manifest}")
+    # a manifest edit has to relink the program, and the link command is the only thing that reads the file
+    set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS ${_basalt_manifest})
+  endif()
+endfunction()
+
+# The vector-extension flags per file, in each compiler's spelling. MSVC has no per-feature ISA switches: /arch:
+# turns on the whole rung (and a TU built with it may use those instructions anywhere in itself, exactly as the
+# GNU flags do), so the run-time probe still decides which of these objects runs.
+#
+# /arch:AVX512 predefines __AVX__, __AVX2__ and __AVX512F/BW/VL/DQ__ but leaves __F16C__, __AVX512VNNI__ and
+# __AVX512VBMI__ undefined, while accepting the intrinsics of all three. The sources branch on those macros (the
+# ggml dot products pick their VNNI form by __AVX512VNNI__), so they are defined to match what the GNU flags give:
+# without it a file compiles down its no-VNNI path and runs slower than the same build on Linux. __BMI2__ is left
+# alone because -mavx2 and -mavx512* do not enable BMI2 either, so that branch is out on both platforms.
+if(MSVC)
+  set(_isa_avx512_flags "/arch:AVX512;-D__F16C__=1;-D__AVX512VNNI__=1;-D__AVX512VBMI__=1")
+  set(_isa_avx2_flags "/arch:AVX2;-D__F16C__=1")
+  set(_isa_avx1_flags "/arch:AVX")
+else()
+  set(_isa_avx512_flags "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+  set(_isa_avx2_flags "-mavx2;-mfma;-mf16c")
+  set(_isa_avx1_flags "-mavx")
 endif()
 
 # ---- artifact -------------------------------------------------------
@@ -54,23 +108,27 @@ endif()
 # duplicate-symbol or missing-declaration bug into code that is already validated against the real artifact.
 add_library(artifact INTERFACE)
 target_include_directories(artifact INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(artifact INTERFACE warnings)
+target_link_libraries(artifact INTERFACE platform warnings)
 
 add_executable(basalt-gguf src/artifact/gguf_reader.cpp)
 target_link_libraries(basalt-gguf PRIVATE artifact)
+basalt_embed_manifest(basalt-gguf)
 
 add_executable(basalt-dequant src/artifact/dequant.cpp)
 target_link_libraries(basalt-dequant PRIVATE artifact)
+basalt_embed_manifest(basalt-dequant)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(basalt-dequant PRIVATE DEQUANT_SELFTEST)
 if(BUILD_TESTING)
   # the reader refuses a duplicate tensor name at open, naming it (a synthetic GGUF: no model, no GPU)
   add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE artifact)
+  basalt_embed_manifest(gguf_reader_test)
   add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
   # a split model's shards and their joint view: missing shard, split keys, duplicates, truncation (synthetic)
   add_executable(gguf_split_test tests/core/gguf_split_test.cpp)
   target_link_libraries(gguf_split_test PRIVATE artifact)
+  basalt_embed_manifest(gguf_split_test)
   add_test(NAME gguf_split_test COMMAND gguf_split_test)
   # the logit_bias protocol key: what parses and what is refused (host only)
   add_executable(logit_bias_test tests/core/logit_bias_test.cpp)
@@ -87,14 +145,22 @@ target_link_libraries(plan INTERFACE warnings)
 add_executable(basalt-plan src/plan/plan_main.cpp)
 target_link_libraries(basalt-plan PRIVATE plan)
 
+# ---- platform (host OS boundary) ------------------------------------
+# The file, memory and process calls the engine makes, so the Win32 and POSIX spellings live in one place.
+# Host-only: no CUDA runtime, which is why the header-only `artifact` target, the vision library, the bench and the
+# standalone test programs can all link it.
+add_library(platform STATIC src/platform/file.cpp src/platform/memory.cpp src/platform/direct_file.cpp src/platform/process.cpp)
+target_include_directories(platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(platform PUBLIC warnings)
+
 # ---- core (GPU runtime) ---------------------------------------------
-add_library(core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
+add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
                              src/core/layout.cpp src/core/model_file.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
 # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
 # linker error ("unresolved external symbol cudaGraphInstantiate") names the function rather than the cause.
-target_link_libraries(core PUBLIC plan artifact warnings ${_gpu_runtime_target})
+target_link_libraries(core PUBLIC plan artifact platform warnings ${_gpu_runtime_target})
 
 add_executable(basalt-device src/core/device_main.cpp)
 target_link_libraries(basalt-device PRIVATE core)
@@ -163,8 +229,7 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/dense_tc.cu
                         src/kernels/cuda/iq_kernels.cu
                         src/kernels/ngram.cpp
-                        src/ngram/ple_reader.cpp
-                        src/platform/direct_file.cpp)
+                        src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
 target_sources(kernels PRIVATE src/kernels/cuda/hc_fused.cu src/kernels/cuda/hc8_gr.cu)
 # the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
@@ -217,6 +282,7 @@ target_link_libraries(engine PUBLIC core kernels kernels_cpu ${_gpu_runtime_targ
 if(BUILD_TESTING)
   add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)
   target_link_libraries(file_expert_source_test PRIVATE engine)
+  basalt_embed_manifest(file_expert_source_test)
   add_test(NAME file_expert_source_test COMMAND file_expert_source_test)
   set_tests_properties(file_expert_source_test PROPERTIES TIMEOUT 60)
 endif()
@@ -224,6 +290,7 @@ endif()
 if(BUILD_TESTING)
   add_executable(direct_upload_test tests/core/direct_upload_test.cpp)
   target_link_libraries(direct_upload_test PRIVATE core)
+  basalt_embed_manifest(direct_upload_test)
   add_test(NAME direct_upload_test COMMAND direct_upload_test)
   set_tests_properties(direct_upload_test PROPERTIES TIMEOUT 60)
 endif()
@@ -231,6 +298,7 @@ endif()
 if(BUILD_TESTING)
   add_executable(expert_profile_save_test tests/core/expert_profile_save_test.cpp)
   target_link_libraries(expert_profile_save_test PRIVATE engine)
+  basalt_embed_manifest(expert_profile_save_test)
   add_test(NAME expert_profile_save_test COMMAND expert_profile_save_test)
   set_tests_properties(expert_profile_save_test PROPERTIES TIMEOUT 60)
 endif()
@@ -249,20 +317,28 @@ if(BUILD_TESTING)
   add_executable(conversation_cache_test src/core/conversation_cache_test.cpp)
   target_include_directories(conversation_cache_test PRIVATE include)
   add_test(NAME conversation_cache_test COMMAND conversation_cache_test)
+  # conversation_memory.cpp asks the platform layer for the free RAM, so the probe comes along; it needs the system
+  # allocator and the OS memory query, and nothing from the GPU runtime.
   add_executable(conversation_memory_test src/core/conversation_memory_test.cpp src/core/conversation_memory.cpp)
   target_include_directories(conversation_memory_test PRIVATE include)
+  target_link_libraries(conversation_memory_test PRIVATE platform)
   add_test(NAME conversation_memory_test COMMAND conversation_memory_test)
   add_executable(conversation_validation_test src/core/conversation_validation_test.cpp)
   target_link_libraries(conversation_validation_test PRIVATE engine)
   add_test(NAME conversation_validation_test COMMAND conversation_validation_test)
   set_tests_properties(conversation_validation_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
-  add_executable(conversation_transfer_test src/core/conversation_validation_test.cpp)
-  target_compile_definitions(conversation_transfer_test PRIVATE CONVERSATION_TEST_TRANSFERS)
-  target_link_options(conversation_transfer_test PRIVATE
-    -Wl,--wrap=cudaMemcpy -Wl,--wrap=cudaDeviceSynchronize -Wl,--wrap=cudaGetLastError)
-  target_link_libraries(conversation_transfer_test PRIVATE engine)
-  add_test(NAME conversation_transfer_test COMMAND conversation_transfer_test)
-  set_tests_properties(conversation_transfer_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
+  # The transfer-failure paths are reached by GNU ld's --wrap, which symbolizes the three runtime calls. The Windows
+  # linker has no equivalent, so that one program is not built here; the same source builds the ordinary snapshot
+  # test above, which does port.
+  if(NOT WIN32)
+    add_executable(conversation_transfer_test src/core/conversation_validation_test.cpp)
+    target_compile_definitions(conversation_transfer_test PRIVATE CONVERSATION_TEST_TRANSFERS)
+    target_link_options(conversation_transfer_test PRIVATE
+      -Wl,--wrap=cudaMemcpy -Wl,--wrap=cudaDeviceSynchronize -Wl,--wrap=cudaGetLastError)
+    target_link_libraries(conversation_transfer_test PRIVATE engine)
+    add_test(NAME conversation_transfer_test COMMAND conversation_transfer_test)
+    set_tests_properties(conversation_transfer_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
+  endif()
   add_executable(conversation_snapshot_test src/core/conversation_snapshot_test.cpp)
   target_link_libraries(conversation_snapshot_test PRIVATE engine)
   add_test(NAME conversation_snapshot_test COMMAND conversation_snapshot_test)
@@ -270,11 +346,13 @@ if(BUILD_TESTING)
   # the .basalt reader: table, meta JSON, the GGUF view of the source tensors, the layout text, the hc8 table
   add_executable(model_file_test tests/core/model_file_test.cpp)
   target_link_libraries(model_file_test PRIVATE engine)
+  basalt_embed_manifest(model_file_test)
   add_test(NAME model_file_test COMMAND model_file_test)
   set_tests_properties(model_file_test PROPERTIES TIMEOUT 60)
   # a PLE key held unquantized in the dense index stays in the arena; a quantized key row loads as before
   add_executable(native_dense_ple_key_test tests/core/native_dense_ple_key_test.cpp)
   target_link_libraries(native_dense_ple_key_test PRIVATE engine)
+  basalt_embed_manifest(native_dense_ple_key_test)
   add_test(NAME native_dense_ple_key_test COMMAND native_dense_ple_key_test)
   set_tests_properties(native_dense_ple_key_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   # per-layer admission on a sized cache starts each layer in its own range
@@ -303,6 +381,7 @@ add_executable(basalt src/program/generate.cpp)
 set_target_properties(basalt PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
 target_link_libraries(basalt PRIVATE engine prefill spec ${_gpu_runtime_target})
+basalt_embed_manifest(basalt)
 # `basalt serve` runs the Python server from the source tree
 target_compile_definitions(basalt PRIVATE BASALT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
@@ -323,7 +402,8 @@ add_subdirectory(tools/vision)
 target_link_libraries(basalt PRIVATE vision_cuda)
 add_dependencies(basalt-bench basalt git_stamp)
 target_include_directories(basalt-bench PRIVATE ${CMAKE_BINARY_DIR}/stamp)
-target_link_libraries(basalt-bench PRIVATE warnings ${CMAKE_DL_LIBS})
+target_link_libraries(basalt-bench PRIVATE platform warnings ${CMAKE_DL_LIBS})
+basalt_embed_manifest(basalt-bench)
 target_compile_definitions(basalt-bench PRIVATE
   BASALT_BENCH_ENGINE="$<TARGET_FILE:basalt>"
   BASALT_BENCH_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/data/bench"
@@ -346,6 +426,7 @@ add_test(NAME s2_gemv_parity COMMAND s2_gemv_parity --selftest)
 add_executable(iq_parity src/kernels/iq_parity.cpp)
 target_include_directories(iq_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(iq_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_embed_manifest(iq_parity)
 # the i-quant fixtures are generated, not shipped.  tools/iq_fixture.py needs python3 + numpy
 # and the repository's vendored gguf-py (no pip installs); it writes deterministic fixtures into the
 # BUILD directory (the source tree is not touched).  The CTest fixture makes generation-to-test order
@@ -626,7 +707,18 @@ add_test(NAME s2_expert_grouped_parity COMMAND s2_expert_grouped_parity --selfte
 # working-set lock of a host region (CPU only).
 add_executable(platform_memory_test src/platform/memory_test.cpp)
 target_link_libraries(platform_memory_test PRIVATE core ${_gpu_runtime_target})
+basalt_embed_manifest(platform_memory_test)
 add_test(NAME platform_memory_test COMMAND platform_memory_test)
+
+# A path carried as UTF-8 reaching the OS intact: the seam in both directions, and a path past 260 chars
+# (longPathAware). The program also runs itself as a child with a non-ASCII name as one argument, which is how a
+# pack path typed by a user arrives; on Windows argv is decoded with the process code page, so that case only
+# passes because this executable carries the application manifest.
+add_executable(path_utf8_test tests/platform/path_utf8_test.cpp)
+target_link_libraries(path_utf8_test PRIVATE platform)
+basalt_embed_manifest(path_utf8_test)
+add_test(NAME path_utf8_test COMMAND path_utf8_test)
+set_tests_properties(path_utf8_test PROPERTIES TIMEOUT 60)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)
@@ -638,6 +730,7 @@ endif()
 add_executable(ple_reader_test src/ngram/ple_reader_test.cpp)
 target_include_directories(ple_reader_test PRIVATE ${_gpu_include_directories})
 target_link_libraries(ple_reader_test PRIVATE kernels core ${_gpu_runtime_target})
+basalt_embed_manifest(ple_reader_test)
 add_test(NAME ple_reader_selftest COMMAND ple_reader_test --selftest)
 
 # The GPU test runs ON THE TARGET PC. `--selftest` allocates
@@ -692,8 +785,8 @@ target_include_directories(kernels_cpu PUBLIC include)
 # and the engine picks the kernels at run time (cpu_avx512_ok).
 # `-mavx512vnni` alone is not enough: VBMI is a separate feature bit.
 set_source_files_properties(src/kernels/cpu/expert.cpp
-                            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
-set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+                            PROPERTIES COMPILE_OPTIONS "${_isa_avx512_flags}")
+set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
 find_package(Threads REQUIRED)
 target_link_libraries(kernels_cpu PUBLIC Threads::Threads)
 
@@ -707,8 +800,8 @@ target_include_directories(ggml_quants PUBLIC include PRIVATE src/kernels/cpu/gg
 set_target_properties(ggml_quants PROPERTIES C_STANDARD 11 C_EXTENSIONS ON POSITION_INDEPENDENT_CODE ON)
 # The CPU dot products are built for AVX2 and for AVX-512, each with its own name for the table lookup;
 # ggml_cpu_dispatch.cpp picks one at run time (cpu_avx512_ok / cpu_avx2_ok).
-set(_ggml_dots_avx2_flags -mavx2 -mfma -mf16c)
-set(_ggml_dots_avx512_flags -mavx2 -mfma -mf16c -mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mavx512vbmi)
+set(_ggml_dots_avx2_flags ${_isa_avx2_flags})
+set(_ggml_dots_avx512_flags ${_isa_avx512_flags})
 foreach(_isa avx2 avx512)
   add_library(ggml_dots_${_isa} OBJECT src/kernels/cpu/ggml/ggml_cpu_dots.c)
   target_include_directories(ggml_dots_${_isa} PRIVATE include src/kernels/cpu/ggml)
@@ -725,14 +818,24 @@ target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels
                                          src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/ggml/ggml_cpu_dispatch.cpp
                                          $<TARGET_OBJECTS:ggml_dots_avx2> $<TARGET_OBJECTS:ggml_dots_avx512>)
 set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
-                            "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+                            "${_isa_avx512_flags}")
 set_source_files_properties(src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS
-                            "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
-set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+                            "${_isa_avx512_flags}")
+set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
 # the router lookahead's AVX1 dot (called behind cpu_avx1_ok)
-set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx")
+set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx1_flags}")
+# MSVC gives the scalar F16C conversions no working code: its headers declare them nowhere, and with
+# __F16C__ defined the compiler claims the names as its own, so a definition compiled under that macro does not
+# build as written. The file below supplies the pair from the vector intrinsics, which are the same instruction,
+# and it must be compiled without __F16C__ for its definitions to survive; the callers carry prototypes and
+# #pragma function so the calls reach it. The file is empty for every other compiler, and it is not added to the
+# library at all there.
+if(MSVC)
+  target_sources(kernels_cpu PRIVATE src/kernels/cpu/ggml/f16c_scalar_msvc.c)
+  set_source_files_properties(src/kernels/cpu/ggml/f16c_scalar_msvc.c PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+endif()
 target_link_libraries(kernels_cpu PUBLIC ggml_quants)
   # the router lookahead's dot on each rung this CPU has (AVX2, the older CPUs' AVX1) against a double reference
 add_executable(router_dot_parity src/kernels/cpu/router_dot_parity.cpp)
@@ -752,6 +855,10 @@ foreach(_t IN LISTS _mmq_types)
 endforeach()
 target_include_directories(mmq PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
+# MSVC's COFF object holds 65536 sections; the instantiated MMQ formats exceed that in one TU without /bigobj.
+if(MSVC)
+  target_compile_options(mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
+endif()
 target_link_libraries(mmq PUBLIC ggml_quants ${_gpu_runtime_target})
 target_link_libraries(prefill PUBLIC mmq)
 # the FP4 block-scaled tensor-core experts (need the a-variant of the architecture)
@@ -858,12 +965,16 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING)
-  add_executable(cpu_quota_test src/kernels/cpu/cpu_quota_test.cpp)
-  target_link_libraries(cpu_quota_test PRIVATE kernels_cpu)
-  add_test(NAME cpu_quota_test COMMAND cpu_quota_test)
-  add_executable(pool_affinity_test src/kernels/cpu/pool_affinity_linux_test.cpp)
-  target_link_libraries(pool_affinity_test PRIVATE kernels_cpu)
-  add_test(NAME pool_affinity_test COMMAND pool_affinity_test)
+  # Both programs test a Linux-only surface: the cgroup quota files and the Linux affinity backend's headers.
+  # Neither exists on Windows, so neither is built or run there.
+  if(NOT WIN32)
+    add_executable(cpu_quota_test src/kernels/cpu/cpu_quota_test.cpp)
+    target_link_libraries(cpu_quota_test PRIVATE kernels_cpu)
+    add_test(NAME cpu_quota_test COMMAND cpu_quota_test)
+    add_executable(pool_affinity_test src/kernels/cpu/pool_affinity_linux_test.cpp)
+    target_link_libraries(pool_affinity_test PRIVATE kernels_cpu)
+    add_test(NAME pool_affinity_test COMMAND pool_affinity_test)
+  endif()
   # one expert applied to several tokens, bitwise vs the single-token kernel (synthetic, CPU only).
   # the device dequantizers vs the artifact's CPU dequantizers on the real shards (not a ctest: needs
   # the full model; run it by hand)
@@ -879,24 +990,28 @@ if(BUILD_TESTING)
   add_test(NAME expert_multi_test COMMAND expert_multi_test)
 
   add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)
-  target_link_libraries(expert_parity PRIVATE kernels_cpu)
+  target_link_libraries(expert_parity PRIVATE kernels_cpu platform)
   # The experts section (extracted to experts.bin) is a REQUIRED input: this test compares against a real expert blob, and a
   # missing file would otherwise be reported as a pass by a test that skipped everything.
   add_test(NAME expert_parity COMMAND expert_parity --selftest
            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
   add_executable(pool_test src/kernels/cpu/pool_test.cpp)
-  target_link_libraries(pool_test PRIVATE kernels_cpu)
+  target_link_libraries(pool_test PRIVATE kernels_cpu platform)
   add_test(NAME pool_test COMMAND pool_test --selftest WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   # tiny batches with sleeping workers, as on a big-VRAM card; a hang fails it
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE kernels_cpu)
   add_test(NAME pool_stress COMMAND pool_stress 20)
 
-  if(UNIX AND NOT APPLE)
-    add_executable(direct_file_async_test tests/platform/direct_file_async.cpp src/platform/direct_file.cpp)
+  # DirectFile has a Linux backend and a Windows backend, and this test covers those two; macOS is not a platform
+  # the engine builds for.
+  if((UNIX AND NOT APPLE) OR WIN32)
+    add_executable(direct_file_async_test tests/platform/direct_file_async.cpp)
     target_include_directories(direct_file_async_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(direct_file_async_test PRIVATE Threads::Threads)
+    target_compile_definitions(direct_file_async_test PRIVATE BASALT_TEST_TMPDIR="${CMAKE_CURRENT_BINARY_DIR}")
+    target_link_libraries(direct_file_async_test PRIVATE platform Threads::Threads)
+    basalt_embed_manifest(direct_file_async_test)
     add_test(NAME direct_file_async_test COMMAND direct_file_async_test)
   endif()
 endif()
