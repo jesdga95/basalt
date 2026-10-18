@@ -12,9 +12,13 @@
 #include <cstdio>
 #include <cstdlib>
 
+#if defined(_WIN32)
+#include "pool_affinity_win.hpp"
+#else
 #include <pthread.h>
 #include <sched.h>
 #include "pool_affinity_linux.hpp"
+#endif
 
 namespace basalt::kernels::cpu {
 
@@ -26,6 +30,117 @@ constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
 
 CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
     CpuTopology topo;
+#if defined(_WIN32)
+    // Ask the OS rather than assuming a layout: hardware_concurrency() counts LOGICAL processors, and on an SMT
+    // machine half of them are siblings, so one worker on each of the first N would put two workers on one core.
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    if (len == 0) {
+        // No detailed topology available: keep the group identity and treat every processor as its own core.
+        const WORD groups = GetActiveProcessorGroupCount();
+        for (WORD group = 0; group < groups; ++group) {
+            const DWORD count = GetActiveProcessorCount(group);
+            if (count == 0 || count == (DWORD) -1 || count > 64) continue;
+            for (DWORD i = 0; i < count; ++i) topo.worker_cores.push_back((int) group * 64 + (int) i);
+        }
+        if (skip_first && !topo.worker_cores.empty()) {
+            topo.host_core = topo.worker_cores.front();
+            topo.worker_cores.erase(topo.worker_cores.begin());
+        }
+        topo.p_threads = (int) topo.worker_cores.size();
+        topo.p_cores = topo.p_threads;
+        return topo;
+    }
+    std::vector<char> buf(len);
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore,
+                                          (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len)) {
+        // The size probe succeeded but the read did not (the layout changed underneath, say). Same answer as no
+        // topology at all: one worker per logical processor is never wrong, just not always optimal.
+        const DWORD n = (DWORD) std::thread::hardware_concurrency();
+        for (DWORD i = 0; i < n; ++i) topo.worker_cores.push_back((int) i);
+        if (skip_first && !topo.worker_cores.empty()) {
+            topo.host_core = topo.worker_cores.front();
+            topo.worker_cores.erase(topo.worker_cores.begin());
+        }
+        topo.p_threads = (int) topo.worker_cores.size();
+        topo.p_cores = topo.p_threads;
+        return topo;
+    }
+    struct CoreDesc {
+        uint8_t efficiency = 0;
+        bool has_smt = false;
+        std::vector<int> lps;
+    };
+    std::vector<CoreDesc> descs;
+    for (const char *p = buf.data(), *end = buf.data() + len; p < end;) {
+        const auto* e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) p;
+        if (e->Relationship == RelationProcessorCore) {
+            CoreDesc cd;
+            cd.efficiency = e->Processor.EfficiencyClass;
+            cd.has_smt = (e->Processor.Flags & LTP_PC_SMT) != 0;
+            for (WORD g = 0; g < e->Processor.GroupCount; ++g) {
+                const GROUP_AFFINITY& ga = e->Processor.GroupMask[g];
+                for (int bit = 0; bit < 64; ++bit)
+                    if (ga.Mask & (KAFFINITY(1) << bit)) cd.lps.push_back((int) (ga.Group * 64 + bit));
+            }
+            if (!cd.lps.empty()) descs.push_back(std::move(cd));
+        }
+        p += e->Size;
+    }
+    uint8_t min_eff = 255, max_eff = 0;
+    for (const auto& c : descs) {
+        min_eff = (std::min)(min_eff, c.efficiency);
+        max_eff = (std::max)(max_eff, c.efficiency);
+    }
+    topo.is_hybrid = (max_eff > min_eff);
+    if (topo.is_hybrid) {
+        for (const auto& c : descs) {
+            if (c.efficiency == max_eff) {
+                topo.p_cores++;
+                topo.p_threads += (int) c.lps.size();
+            } else {
+                topo.e_cores++;
+            }
+        }
+    } else {
+        topo.p_cores = (int) descs.size();
+        for (const auto& c : descs) topo.p_threads += (int) c.lps.size();
+    }
+    if (affinity == PoolAffinity::All || !topo.is_hybrid) {
+        // On a hybrid CPU the P-cores come first, so a pool smaller than the core count runs on the P-cores rather
+        // than on whatever the OS happened to number first. All cores alike: the order is unchanged.
+        if (topo.is_hybrid)
+            std::stable_sort(descs.begin(), descs.end(),
+                             [](const CoreDesc& x, const CoreDesc& y) { return x.efficiency > y.efficiency; });
+        for (const auto& c : descs) topo.worker_cores.push_back(c.lps[0]);
+        if (skip_first && !topo.worker_cores.empty()) {
+            topo.host_core = topo.worker_cores.front();
+            topo.worker_cores.erase(topo.worker_cores.begin());
+        }
+        return topo;
+    }
+    // Hybrid with Auto or PCores affinity: one logical processor per P-core first (an SMT sibling would contend for
+    // the same core's bandwidth), then the P-core siblings, then the E-cores as overflow.
+    std::vector<int> p_primaries, p_siblings, e_cores;
+    for (const auto& c : descs) {
+        if (c.efficiency == max_eff) {
+            p_primaries.push_back(c.lps[0]);
+            for (size_t s = 1; s < c.lps.size(); ++s) p_siblings.push_back(c.lps[s]);
+        } else {
+            for (int lp : c.lps) e_cores.push_back(lp);
+        }
+    }
+    if (skip_first && !p_primaries.empty()) {
+        topo.host_core = p_primaries.front();
+        p_primaries.erase(p_primaries.begin());
+    }
+    for (int cpu : p_primaries) topo.worker_cores.push_back(cpu);
+    for (int cpu : p_siblings) topo.worker_cores.push_back(cpu);
+    if (affinity != PoolAffinity::PCores) {
+        for (int cpu : e_cores) topo.worker_cores.push_back(cpu);
+    }
+    return topo;
+#else
     // The logical CPUs this process may run on, ONE PER PHYSICAL CORE: SMT siblings share a core's load/store
     // bandwidth, so a worker on each would put two workers on one core.  sysfs names each CPU's (package, core); the
     // first allowed CPU of each pair is kept, so a taskset that leaves out the first sibling still gets its core.
@@ -143,7 +258,7 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
         for (int cpu : e_cores) topo.worker_cores.push_back(cpu);
     }
     return topo;
-    return topo;
+#endif
 }
 
 std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity) {
@@ -154,17 +269,33 @@ namespace {
 
 bool pin_this_thread(int core, [[maybe_unused]] int worker = -1) {
     if (core < 0) return false;
+#if defined(_WIN32)
+    return detail::set_thread_group_affinity(core, worker);
+#else
     const int error = detail::pin_thread_to_cpu(core);
     if (error != 0)
         std::fprintf(stderr, "basalt cpu pool: affinity for worker %d (CPU %d) failed: %d; previous affinity kept\n",
                      worker, core, error);
     return error == 0;
+#endif
 }
 
 }  // namespace
 
 ThreadAffinity pin_current_thread(int core) {
     if (core < 0) return {};
+#if defined(_WIN32)
+    ThreadAffinity previous;
+    ULONG target = 0;
+    if (!detail::get_thread_cpu_sets(previous.cpu_sets) || !detail::cpu_set_for_core(core, target) ||
+        !SetThreadSelectedCpuSets(GetCurrentThread(), &target, 1)) {
+        std::fprintf(stderr, "basalt cpu pool: host CPU Set selection for processor %d failed: %lu; previous placement kept\n",
+                     core, (unsigned long) GetLastError());
+        return {};
+    }
+    previous.valid = true;
+    return previous;
+#else
     ThreadAffinity previous;
     int error = detail::get_thread_affinity(previous.mask);
     if (error == 0) error = detail::pin_thread_to_cpu(core);
@@ -174,13 +305,23 @@ ThreadAffinity pin_current_thread(int core) {
     }
     previous.valid = true;
     return previous;
+#endif
 }
 
 void restore_thread_affinity(const ThreadAffinity& previous) {
     if (!previous.valid) return;
+#if defined(_WIN32)
+    // Clearing an originally empty selection restores the process default rather than turning the caller's implicit
+    // all-group placement into an explicit single-group hard mask.
+    if (!SetThreadSelectedCpuSets(GetCurrentThread(), previous.cpu_sets.empty() ? nullptr : previous.cpu_sets.data(),
+                                  (ULONG) previous.cpu_sets.size()))
+        std::fprintf(stderr, "basalt cpu pool: host CPU Set restoration failed: %lu\n",
+                     (unsigned long) GetLastError());
+#else
     const int error = detail::set_thread_affinity(previous.mask);
     if (error != 0)
         std::fprintf(stderr, "basalt cpu pool: host affinity restoration failed: %d\n", error);
+#endif
 }
 
 namespace {
