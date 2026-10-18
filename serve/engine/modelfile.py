@@ -16,6 +16,13 @@ from model_file import ModelFile  # noqa: E402
 VISION_EXE = "basalt-vision"
 
 
+def peer_tier_supported() -> bool:
+    """Whether the engine on this platform takes a peer expert tier. It refuses `--peer-device` where a process is
+    given no GPU-to-GPU access between its devices, so offering that flag as a default there would stop the server
+    from starting on a machine that merely has two cards in it."""
+    return os.name != "nt"
+
+
 def cache_root() -> Path:
     return Path(os.environ.get("BASALT_CACHE") or Path.home() / ".cache" / "basalt")
 
@@ -104,13 +111,13 @@ def model_config(path: str, engine_bin: str, gpus: int | None = None, vision: bo
     """The engine settings the file implies; `engine_words` follow its arguments as given (the engine's parser lets a
     later flag win), `vision` (True, "peer"
     or "cpu") adds the sidecar and "dynamic" the in-engine encoder (ValueError if it cannot be set up). A second
-    visible GPU becomes the peer tier."""
+    visible GPU becomes the peer tier, where the engine takes one."""
     mf = ModelFile(path)
     meta = json.loads(mf.read("meta"))
     path = os.path.abspath(path)
     words = list(engine_words or [])
     args = ["--model", path]   # settings come from the engine defaults and the server
-    if "--peer-device" not in words and (gpu_count() if gpus is None else gpus) > 1:
+    if peer_tier_supported() and "--peer-device" not in words and (gpu_count() if gpus is None else gpus) > 1:
         args += ["--peer-device", "1"]
     args += words
     cdir = cache_dir(mf)
