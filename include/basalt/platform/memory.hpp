@@ -1,7 +1,8 @@
 // include/basalt/platform/memory.hpp - keep a large host region resident.
 //
 // An unlocked expert arena is trimmed under memory pressure, which makes the CPU pool's speed vary between
-// runs. With the n-gram table out of RAM there is headroom to lock it: mlock.
+// runs. With the n-gram table out of RAM there is headroom to lock it: mlock on Linux, the process working-set
+// minimum plus VirtualLock on Windows.
 #pragma once
 
 #include <cstdint>
@@ -21,11 +22,30 @@ LockResult lock_resident(void* p, uint64_t bytes);
 /// Undo lock_resident for the same region (best effort).
 void unlock_resident(void* p, uint64_t bytes);
 
+/// Host memory whose address is a multiple of `alignment`, which has to be a power of two: a range registered with
+/// the driver as a whole, or filled by reads that bypass the OS cache, needs its first byte on a boundary.
+/// `free_aligned` releases what this returns, and only what this returns. nullptr when the memory is not there.
+void* alloc_aligned(size_t bytes, size_t alignment);
+/// The matching release for `alloc_aligned`. A null is fine.
+void free_aligned(void* p);
+
+/// Asks the OS to give back what it holds for [off, off + bytes) of a mapped file view that starts at `base` and is
+/// `view_bytes` long: the range widened to whole pages, because those are what can be given back, and clipped to the
+/// view. False when the OS refused. Windows has no per-range release for a view of a file mapping - its pages are
+/// clean, since the view is read-only, so the manager takes them back on pressure by itself - and reports success
+/// without claiming anything.
+bool drop_mapped_view(const void* base, uint64_t view_bytes, uint64_t off, uint64_t bytes);
+
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
 
-/// MemAvailable from /proc/meminfo in bytes (0 when unknown).
+/// The RAM the OS can hand out without paging, in bytes (0 when unknown).
 uint64_t available_memory();
+
+/// What the OS could still commit, in bytes. A page-locked or fully reserved region is charged against RAM and the
+/// page file together, so on Windows this is the free part of that pair - the reading a refused allocation names.
+/// Linux keeps no separate charge, so there it is the available-RAM reading (0 when unknown).
+uint64_t commit_headroom();
 
 /// The RAM left alone by anything that locks or fills memory: the larger of 2 GiB and 5% of the machine's RAM.
 uint64_t ram_margin();
@@ -75,11 +95,11 @@ inline uint64_t max_safe_copy(uint64_t avail, uint64_t late, uint64_t floor) {
     return avail > late + floor ? avail - late - floor : 0;
 }
 
-/// The RAM a page-locked or fully resident allocation may take now: MemAvailable less ram_margin().  `known` is
-/// false when /proc/meminfo cannot be read (nothing is refused then).
+/// The RAM a page-locked or fully resident allocation may take now: available_memory() less ram_margin().  `known`
+/// is false when the OS gives no reading (nothing is refused then).
 uint64_t ram_budget(bool* known = nullptr);
 
-/// Polls MemAvailable until `stop_memory_watchdog`.  Below `floor_bytes` it prints a `basalt error:` line and
+/// Polls available_memory() until `stop_memory_watchdog`.  Below `floor_bytes` it prints a `basalt error:` line and
 /// _exit(1)s, so a load that is exhausting RAM ends before the machine starts to swap.
 void start_memory_watchdog(uint64_t floor_bytes);
 /// Tells the watchdog the load builds a resident RAM copy of the experts (`resident`) and how big it is so far, so
@@ -87,10 +107,10 @@ void start_memory_watchdog(uint64_t floor_bytes);
 void watch_resident_ram(bool resident, uint64_t copy_bytes);
 void stop_memory_watchdog();
 
-/// Whether a MemAvailable reading `avail` is below `floor` (a reading of 0, unknown, is not).
+/// Whether an available-RAM reading of `avail` is below `floor` (a reading of 0, unknown, is not).
 inline bool ram_below_floor(uint64_t avail, uint64_t floor) { return avail > 0 && avail < floor; }
 
-/// While serving: polls MemAvailable and keeps whether it is below `floor_bytes`, for ram_guard_low.  The request
+/// While serving: polls available_memory() and keeps whether it is below `floor_bytes`, for ram_guard_low.  The request
 /// that is running then stops with an error instead of the machine swapping; nothing is shrunk or exited.
 void start_ram_guard(uint64_t floor_bytes);
 /// True while the last reading was below the guard's floor; `avail` and `floor` get that reading and the floor.
@@ -106,12 +126,17 @@ inline bool file_cache_keeps(uint64_t avail, uint64_t arena_bytes, uint64_t read
     return room >= read_bytes;
 }
 
-/// Whether `advise_willneed` asks the OS for anything.
+/// Whether `advise_willneed` asks the OS for anything: it does on both platforms.
 bool read_ahead_enabled();
-/// Asks the OS to start reading [p, p + bytes) of a file mapping, without waiting.  The kernel reads at most one
-/// readahead window per request, so the range is asked for in 128 KiB steps.
+/// Asks the OS to start bringing [p, p + bytes) of a mapped file view into memory, without waiting for the access.
+/// A hint, never an error: the system skips what it will not prefetch and says nothing about it, and without the
+/// hint the pages still arrive - one fault at a time, where they are touched.  The range is asked for in 128 KiB
+/// windows, which keeps the reads in flight bounded.  Only a mapped view is reached this way.
 void advise_willneed(const void* p, uint64_t bytes);
-/// The same for [offset, offset + bytes) of an open file.
+/// The same for [offset, offset + bytes) of an open descriptor.  Linux asks its page cache.  Windows asks nothing:
+/// the cache manager takes no range hint for a handle, and a read through a descriptor is a cached read unless the
+/// caller opted out of that cache - which already reads ahead around a sequential reader.  Bytes reached only
+/// through a descriptor are therefore warmed as they are read, not ahead of it.
 void advise_willneed(int fd, uint64_t offset, uint64_t bytes);
 
 }  // namespace basalt::platform
