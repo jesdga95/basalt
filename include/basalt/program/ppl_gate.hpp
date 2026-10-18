@@ -6,6 +6,8 @@
 // A serve request with `ppl=K` reads chunk K's first half as its prompt and then teacher-forces the rest through
 // the verify windows; every scored row is compared with the base row here and written as one line to
 // --ppl-out: chunk pos target nll nll_base kld same_top top top_base dlogp_top_base.
+#include "basalt/platform/file.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -15,8 +17,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <fcntl.h>
-#include <unistd.h>
 
 namespace basalt::program {
 
@@ -68,7 +68,7 @@ public:
     bool finish(std::string& err) {
         const bool ok = wait(err);
         std::fflush(out_);
-        posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED);
+        basalt::platform::advise_dontneed(fd_, 0, 0);   // the rows this chunk read need not stay cached
         return ok;
     }
 
@@ -81,7 +81,7 @@ private:
         const char* base = paths().first.c_str();
         const char* out = paths().second.c_str();
         if (paths().first.empty() || paths().second.empty()) return;
-        fd_ = ::open(base, O_RDONLY);
+        fd_ = basalt::platform::open_fd_utf8(paths().first);
         char magic[8];
         uint32_t n_ctx = 0;
         int32_t nv[2] = {0, 0};
@@ -95,7 +95,7 @@ private:
         n_vocab_ = nv[0];
         n_chunk_ = nv[1];
         row_u16_ = 2 * ((n_vocab_ + 1) / 2) + 4;
-        out_ = std::fopen(out, "ab");
+        out_ = basalt::platform::open_file_utf8(paths().second, "ab");
         if (out_ == nullptr) {
             std::fprintf(stderr, "basalt ppl: cannot write %s\n", out);
             close_fd();
@@ -106,13 +106,13 @@ private:
         close_fd();
     }
     void close_fd() {
-        if (fd_ >= 0) ::close(fd_);
+        basalt::platform::close_fd(fd_);
         fd_ = -1;
     }
     bool read_at(void* dst, size_t bytes, uint64_t off) const {
         uint8_t* p = (uint8_t*) dst;
         while (bytes > 0) {
-            const ssize_t r = ::pread(fd_, p, bytes, (off_t) off);
+            const int64_t r = basalt::platform::pread(fd_, p, bytes, off);
             if (r <= 0) return false;
             p += r;
             off += (uint64_t) r;
