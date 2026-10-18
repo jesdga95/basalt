@@ -1159,9 +1159,19 @@ void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const 
     static std::atomic<bool> attr[64];
     const int dev = opt_in_device("dense_tc_pair");
     if (!attr[dev].load(std::memory_order_acquire)) {
+#if defined(_WIN32)
+        // The type is spelled out because the front end cannot deduce it from a braced list of these kernel
+        // pointers. Same six instantiations, same order.
+        void (*const pair_kernels[])(PairMat, PairMat, const uint8_t*, int, int) = {
+            dense_tc_pair_kernel<false, false, false>, dense_tc_pair_kernel<true, false, false>,
+            dense_tc_pair_kernel<true, true, false>, dense_tc_pair_kernel<false, false, true>,
+            dense_tc_pair_kernel<true, false, true>, dense_tc_pair_kernel<true, true, true>};
+        for (auto k : pair_kernels)
+#else
         for (auto k : {dense_tc_pair_kernel<false, false, false>, dense_tc_pair_kernel<true, false, false>,
                        dense_tc_pair_kernel<true, true, false>, dense_tc_pair_kernel<false, false, true>,
                        dense_tc_pair_kernel<true, false, true>, dense_tc_pair_kernel<true, true, true>})
+#endif
             opt_in_check(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024),
                          "dense_tc_pair");
         attr[dev].store(true, std::memory_order_release);
