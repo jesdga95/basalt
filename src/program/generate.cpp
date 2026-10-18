@@ -18,7 +18,9 @@
 #include "basalt/core/coupled_draft.hpp"
 #include "basalt/core/expert_source.hpp"
 #include "basalt/core/pinned.hpp"
+#include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
+#include "basalt/platform/process.hpp"
 #include "basalt/core/remote_experts.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/peer_experts.hpp"
@@ -68,10 +70,22 @@
 #include "basalt/vision/encoder_cuda.hpp"
 #include "basalt/vision/mmproj.hpp"
 #include "basalt/vision/preprocess.hpp"
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <intrin.h>   // _mm_pause
+#include <io.h>       // _fileno, _setmode
+#include <fcntl.h>    // _O_BINARY
+#else
 #include <unistd.h>
-#include <cerrno>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#endif
+#include <cerrno>
+#include <cstddef>   // std::ptrdiff_t
 
 #include <cuda_runtime.h>
 
@@ -81,9 +95,11 @@
 #include <iostream>
 #include <future>
 #include <thread>
+#if !defined(_WIN32)
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
+#endif
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -149,11 +165,16 @@ private:
     static void cpu_relax() {
 #if defined(__x86_64__)
         __builtin_ia32_pause();
+#elif defined(_M_X64) || defined(_M_IX86)
+        _mm_pause();   // a spin without this holds the core from its SMT sibling
 #endif
     }
-    // The decode loop's thread is pinned to one core, which it spins on; a thread it starts inherits that pin and would
-    // wait for the spinner to yield.  The worker takes the core's SMT sibling instead: the core is awake, so the
-    // worker starts at once, and the loop's thread is not preempted.
+    // The decode loop's thread is pinned to one core, which it spins on; a thread it starts inherits that pin and
+    // would wait for the spinner to yield.  The worker takes the core's SMT sibling instead: the core is awake, so the
+    // worker starts at once, and the loop's thread is not preempted.  That inheritance follows the placement a thread
+    // starts with: a host confined by a CPU Set instead leaves the new thread on the process's own assignment, so it
+    // never starts on the host core and there is no core to leave.
+#if !defined(_WIN32)
     static void leave_host_core() {
         const int n = (int) sysconf(_SC_NPROCESSORS_CONF);
         if (n <= 0) return;
@@ -190,8 +211,11 @@ private:
         if (own != nullptr) CPU_FREE(own);
         if (sib != nullptr) CPU_FREE(sib);
     }
+#endif
     void loop() {
+#if !defined(_WIN32)
         leave_host_core();
+#endif
         std::unique_lock<std::mutex> lk(m_);
         for (;;) {
             cv_.wait(lk, [this] { return has_ || stop_; });
@@ -631,12 +655,12 @@ int serve_subcommand(int argc, char** argv) {
     bool have_model = false;
     // the working directory changes below: the paths the server reads must not depend on it
     auto absolute = [](const std::string& path) {
-        char real[4096];
-        if (::realpath(path.c_str(), real) == nullptr) {
+        std::string real;
+        if (!basalt::platform::absolute_path(path, real)) {
             std::fprintf(stderr, "basalt serve: cannot open %s\n", path.c_str());
             std::exit(1);
         }
-        return std::string(real);
+        return real;
     };
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -655,25 +679,27 @@ int serve_subcommand(int argc, char** argv) {
         std::fprintf(stderr, "usage: basalt serve --config FILE | MODEL.basalt [--python PY] [server args...]\n");
         return 2;
     }
-    char exe[4096];
-    const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof exe - 1);
-    if (n <= 0) { std::fprintf(stderr, "basalt serve: cannot find this binary (/proc/self/exe)\n"); return 1; }
-    exe[n] = 0;
+    const std::string exe = basalt::platform::module_path();
+    if (exe.empty()) { std::fprintf(stderr, "basalt serve: cannot find this binary\n"); return 1; }
     const std::string src_dir = BASALT_SOURCE_DIR;
     if (python.empty()) {
+#if defined(_WIN32)
+        const std::string venv = src_dir + "/.venv/Scripts/python.exe";
+        python = basalt::platform::path_executable(venv) ? venv : "python";
+#else
         const std::string venv = src_dir + "/.venv/bin/python";
-        python = ::access(venv.c_str(), X_OK) == 0 ? venv : "python3";
+        python = basalt::platform::path_executable(venv) ? venv : "python3";
+#endif
     }
-    if (::chdir(src_dir.c_str()) != 0) {
+    if (basalt::platform::set_working_dir(src_dir) != 0) {
         std::fprintf(stderr, "basalt serve: cannot enter the source tree %s\n", src_dir.c_str());
         return 1;
     }
     std::vector<std::string> args = {python, "-m", "serve.server", "--engine-bin", exe};
     args.insert(args.end(), extra.begin(), extra.end());
-    std::vector<char*> cargs;
-    for (std::string& s : args) cargs.push_back(s.data());
-    cargs.push_back(nullptr);
-    ::execvp(python.c_str(), cargs.data());
+    // Does not return when it works. Windows has no exec, so this process waits for the server and ends with the
+    // server's exit code. Reaching the line below means the server never started, and errno says why.
+    basalt::platform::exec_replacing(args);
     std::fprintf(stderr, "basalt serve: cannot run %s: %s\n", python.c_str(), std::strerror(errno));
     return 1;
 }
@@ -860,8 +886,9 @@ void usage() {
                  "                       layers across CUDA1..3 (default: stripe)\n"
                  "  --peer-device N      a second GPU as an adaptive expert-cache tier (rows over P2P; it also\n"
                  "                       computes its experts' prompt rows).  Not with --layer-split or\n"
-                 "                       --expert-cache-device1..3.  Off by default; the server sets 1 when two or\n"
-                 "                       more GPUs are visible.\n"
+                  "                       --expert-cache-device1..3; refused where a process has no GPU-to-GPU\n"
+                  "                       access between its devices.  Off by default; the server sets 1 when two\n"
+                  "                       or more GPUs are visible.\n"
                  "  --peer-exclusive     with --resident-experts: experts on the peer are held only there, not\n"
                  "                       also in RAM (less RAM).  The peer is filled from the file; swaps move\n"
                  "                       peer-held experts between the GPUs and RAM over P2P.\n"
@@ -1094,6 +1121,10 @@ std::string stage_text() {
 
 // whether `path` is on a rotational disk (1), not (0) or unknown (-1), from sysfs; `dev` is the disk's name
 int on_rotational_disk(const std::string& path, std::string& dev) {
+#if defined(_WIN32)
+    (void) path; (void) dev;
+    return -1;   // sysfs names the queue here; unknown means the caller does not warn
+#else
     struct stat st{};
     if (::stat(path.c_str(), &st) != 0) return -1;
     char sys[64];
@@ -1109,11 +1140,15 @@ int on_rotational_disk(const std::string& path, std::string& dev) {
         }
     }
     return -1;
+#endif
 }
 
 // the engine's threads in uninterruptible sleep (state D - almost always waiting for the disk), and where
 // (wchan): many threads in blk_io_schedule is a disk that cannot keep up, not a deadlock in the engine
 void disk_wait_threads(std::FILE* f) {
+#if defined(_WIN32)
+    (void) f;   // state D and wchan are /proc readings; there is no per-thread wait address to list here
+#else
     std::map<std::string, int> where;
     int waiting = 0, threads = 0;
     std::error_code ec;
@@ -1137,6 +1172,7 @@ void disk_wait_threads(std::FILE* f) {
     std::fprintf(f, "  threads waiting on the disk (state D): %d of %d%s%s\n", waiting, threads, list.c_str(),
                  waiting > 0 ? " - the engine is waiting for the drive: a rotational or failing disk with --ple-io "
                                "direct (--ple-io ram), or a drive too slow for the reads asked of it" : "");
+#endif
 }
 
 void stall_report(std::FILE* f, uint64_t layers_during) {
@@ -1391,7 +1427,7 @@ int main(int argc, char** argv) {
     // hundred MiB of device memory for code that never runs.  The expert cache's sizing keeps back room for what loads
     // later (`kLazyKernelsMib`).  CUDA_MODULE_LOADING=EAGER restores the up-front load.
     if (std::getenv("CUDA_MODULE_LOADING") == nullptr) {
-        setenv("CUDA_MODULE_LOADING", "LAZY", 0);
+        basalt::platform::set_env("CUDA_MODULE_LOADING", "LAZY");
     }
     Options o;
     std::string ppl_base, ppl_out;
@@ -1687,6 +1723,18 @@ int main(int argc, char** argv) {
         }
         }
     }
+    // The peer tier holds experts on a second GPU and moves them between the two over direct GPU-to-GPU access, which
+    // a process here is not given.  Refused with the options, before the model opens or a device context exists: a
+    // tier sized and then filled would fail partway through the load.
+#if defined(_WIN32)
+    if (o.peer_device >= 1) {
+        std::fprintf(stderr, "basalt generate: --peer-device is not available here: this platform gives a process no "
+                             "GPU-to-GPU access between its devices, so a second GPU cannot hold an expert tier; keep "
+                             "the experts on one GPU (--expert-cache, --resident-experts) and run without "
+                             "--peer-device\n");
+        return 2;
+    }
+#endif
     // ---- where every loader reads from: the sections of the .basalt file
     if (o.model.empty()) {
         std::fprintf(stderr, "basalt generate: --model FILE.basalt is required\n");
@@ -1695,6 +1743,16 @@ int main(int argc, char** argv) {
     }
     // a load that exhausts the RAM ends here instead of swapping the machine to a halt; stopped at READY
     if (o.serve) basalt::platform::start_memory_watchdog(1ull << 30);
+#if defined(_WIN32)
+    // The CRT puts the three standard descriptors in text mode, which turns each "\n" the serve protocol writes
+    // into "\r\n" and folds a "\r\n" in a request to "\n" behind the reader's back. The pipes carry bytes, so the
+    // protocol's newlines are the engine's own. Console output keeps its text mode: it needs the CR.
+    if (o.serve) {
+        _setmode(_fileno(stdin), _O_BINARY);
+        _setmode(_fileno(stdout), _O_BINARY);
+        _setmode(_fileno(stderr), _O_BINARY);
+    }
+#endif
     basalt::core::ModelSources srcs;
     basalt::core::ModelFile model_file;
     {
@@ -5972,7 +6030,7 @@ int main(int argc, char** argv) {
                         buf.erase(0, nlpos + 1);
                         return true;
                     }
-                    const ssize_t n = ::read(0, chunk, sizeof chunk);
+                    const std::ptrdiff_t n = ::read(0, chunk, sizeof chunk);
                     if (n < 0 && errno == EINTR) continue;
                     if (n <= 0) {
                         if (buf.empty()) return false;

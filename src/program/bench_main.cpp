@@ -21,11 +21,26 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <io.h>
+#include <fcntl.h>
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+// The CRT spells read, write and close with a leading underscore; the inline aliases let this file keep one spelling.
+#pragma warning(disable : 4996)
+inline long getpid() { return (long) GetCurrentProcessId(); }
+inline FILE* popen(const char* command, const char* mode) { return _popen(command, mode); }
+inline int pclose(FILE* stream) { return _pclose(stream); }
+#else
 #include <dlfcn.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
+#include <errno.h>
 
 #ifndef BASALT_VERSION
 #define BASALT_VERSION "unknown"
@@ -129,7 +144,15 @@ public:
     };
 
     bool open() {
+#if defined(_WIN32)
+        // A bare name is looked up in System32 only: the application and current directories are not searched, so
+        // an nvml.dll lying next to the executable cannot stand in for the driver's.
+        HMODULE m = LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (m == nullptr) m = load_nvsmi();
+        h_ = (void*) m;
+#else
         h_ = dlopen("libnvidia-ml.so.1", RTLD_NOW);
+#endif
         if (h_ == nullptr) return false;
         init_ = sym<int (*)()>("nvmlInit_v2");
         shut_ = sym<int (*)()>("nvmlShutdown");
@@ -181,8 +204,30 @@ public:
     }
 
 private:
+#if defined(_WIN32)
+    /// A driver that keeps nvml.dll outside System32: its NVSMI directory under one of the program-file roots. The
+    /// root comes from the environment as UTF-16, so the path never goes through the ANSI code page. The DLL's own
+    /// dependencies are looked up beside it.
+    static HMODULE load_nvsmi() {
+        static const wchar_t* const roots[] = { L"ProgramFiles", L"ProgramFiles(x86)" };
+        wchar_t dir[4096];
+        for (const wchar_t* root : roots) {
+            const DWORD n = GetEnvironmentVariableW(root, dir, (DWORD) (sizeof dir / sizeof dir[0]));
+            if (n == 0 || n >= sizeof dir / sizeof dir[0]) continue;
+            const std::wstring path = std::wstring(dir, n) + L"\\NVIDIA Corporation\\NVSMI\\nvml.dll";
+            const HMODULE m = LoadLibraryExW(path.c_str(), nullptr,
+                                             LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+            if (m != nullptr) return m;
+        }
+        return nullptr;
+    }
+#endif
     template <class F>
+#if defined(_WIN32)
+    F sym(const char* n) const { return reinterpret_cast<F>(GetProcAddress((HMODULE) h_, n)); }
+#else
     F sym(const char* n) const { return reinterpret_cast<F>(dlsym(h_, n)); }
+#endif
     void* h_ = nullptr;
     bool ok_ = false;
     std::vector<void*> dev_;
@@ -201,9 +246,37 @@ private:
 // ---------------------------------------------------------------------------------------------- engine child
 
 volatile sig_atomic_t g_child = -1;
+#if defined(_WIN32)
+HANDLE g_child_handle = nullptr;
+
+// Argument quoting for CreateProcessA, which takes one command line rather than a vector: backslashes before a
+// quote are doubled, a run of backslashes before the closing quote is doubled, and anything with a space or a
+// quote is wrapped.
+std::string quote_arg(const std::string& s) {
+    if (s.empty()) return "\"\"";
+    if (s.find_first_of(" \t\"") == std::string::npos) return s;
+    std::string out = "\"";
+    size_t backslashes = 0;
+    for (char c : s) {
+        if (c == '\\') { ++backslashes; out += c; continue; }
+        if (c == '"') { out.append(backslashes + 1, '\\'); out += '"'; backslashes = 0; continue; }
+        backslashes = 0;
+        out += c;
+    }
+    out.append(backslashes, '\\');
+    out += '"';
+    return out;
+}
+#endif
 
 void on_signal(int) {
-    if (g_child > 0) kill((pid_t) g_child, SIGTERM);
+    if (g_child > 0) {
+#if defined(_WIN32)
+        if (g_child_handle != nullptr) (void) TerminateProcess(g_child_handle, 1);
+#else
+        kill((pid_t) g_child, SIGTERM);
+#endif
+    }
     _exit(130);
 }
 
@@ -223,6 +296,49 @@ public:
 
     bool start(const std::string& engine_bin, const std::vector<std::string>& args, const std::string& log_path,
                std::string& err) {
+#if defined(_WIN32)
+        SECURITY_ATTRIBUTES sa{};
+        sa.nLength = sizeof sa;
+        sa.bInheritHandle = TRUE;
+        HANDLE rd_in = nullptr, wr_in = nullptr, rd_out = nullptr, wr_out = nullptr;
+        if (!CreatePipe(&rd_in, &wr_in, &sa, 0) || !CreatePipe(&rd_out, &wr_out, &sa, 0)) {
+            err = "pipe failed";
+            return false;
+        }
+        // The parent keeps only the ends it uses, un-inherited: if the child held the read end of the request pipe
+        // or the write end of the reply pipe, neither would ever report the other side gone.
+        (void) SetHandleInformation(wr_in, HANDLE_FLAG_INHERIT, 0);
+        (void) SetHandleInformation(rd_out, HANDLE_FLAG_INHERIT, 0);
+        // The share mode is what lets the log be read while the run is going on; a share mode of 0 keeps it closed
+        // to any other process until the child exits. `sa` (bInheritHandle) is what hands the handle to the child.
+        HANDLE log = CreateFileA(log_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, &sa,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        STARTUPINFOA si{};
+        si.cb = sizeof si;
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = rd_in;
+        si.hStdOutput = wr_out;
+        si.hStdError = log != INVALID_HANDLE_VALUE ? log : wr_out;
+        std::string cmd = quote_arg(engine_bin) + " --serve";
+        for (const auto& a : args) cmd += " " + quote_arg(a);
+        PROCESS_INFORMATION pi{};
+        if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
+            err = "CreateProcess failed (error " + std::to_string(GetLastError()) + ")";
+            CloseHandle(rd_in); CloseHandle(wr_in); CloseHandle(rd_out); CloseHandle(wr_out);
+            if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
+            return false;
+        }
+        CloseHandle(pi.hThread);
+        proc_ = pi.hProcess;
+        g_child = 1;
+        g_child_handle = proc_;
+        // The parent's ends become CRT descriptors, so the request and reply loops are the same code either way.
+        in_ = _open_osfhandle((intptr_t) wr_in, _O_BINARY | _O_WRONLY);
+        out_ = _open_osfhandle((intptr_t) rd_out, _O_BINARY | _O_RDONLY);
+        CloseHandle(rd_in);              // the child owns the request pipe's read end
+        CloseHandle(wr_out);             // the child owns the reply pipe's write end
+        if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
+#else
         int in[2], out[2];
         if (pipe(in) != 0 || pipe(out) != 0) { err = "pipe failed"; return false; }
         const pid_t pid = fork();
@@ -249,6 +365,7 @@ public:
         out_ = out[0];
         pid_ = pid;
         g_child = pid;
+#endif
         log_path_ = log_path;
         std::string line;
         while (read_line(line)) {
@@ -313,15 +430,28 @@ public:
 
     // QUIT and wait: the engine flushes its logs on a normal exit.
     void stop() {
+#if defined(_WIN32)
+        if (proc_ == nullptr) return;
+#else
         if (pid_ <= 0) return;
+#endif
         const std::string q = "QUIT\n";
         if (in_ >= 0) { (void) !write(in_, q.data(), q.size()); close(in_); in_ = -1; }
         for (int i = 0; i < 600; ++i) {
+#if defined(_WIN32)
+            if (WaitForSingleObject(proc_, 0) == WAIT_OBJECT_0) { reap(); return; }
+            Sleep(100);
+#else
             int st = 0;
             if (waitpid(pid_, &st, WNOHANG) == pid_) { finish_reap(); return; }
             usleep(100000);
+#endif
         }
+#if defined(_WIN32)
+        (void) TerminateProcess(proc_, 1);
+#else
         kill(pid_, SIGTERM);
+#endif
         reap();
     }
 
@@ -357,20 +487,33 @@ private:
         }
     }
     void reap() {
+#if defined(_WIN32)
+        if (proc_ != nullptr) (void) WaitForSingleObject(proc_, 10000);
+#else
         if (pid_ > 0) {
             int st = 0;
             waitpid(pid_, &st, 0);
         }
+#endif
         finish_reap();
     }
     void finish_reap() {
         if (in_ >= 0) close(in_);
         if (out_ >= 0) close(out_);
         in_ = out_ = -1;
+#if defined(_WIN32)
+        if (proc_ != nullptr) { CloseHandle(proc_); proc_ = nullptr; }
+        g_child_handle = nullptr;
+#else
         pid_ = -1;
+#endif
         g_child = -1;
     }
+#if defined(_WIN32)
+    HANDLE proc_ = nullptr;
+#else
     pid_t pid_ = -1;
+#endif
     int in_ = -1, out_ = -1;
     std::string buf_, log_path_;
     size_t rpos_ = 0;
@@ -834,7 +977,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "basalt-bench: %s\n", err.c_str());
         return 2;
     }
-    std::signal(SIGPIPE, SIG_IGN);
+#if !defined(_WIN32)
+    std::signal(SIGPIPE, SIG_IGN);   // no SIGPIPE here: a closed pipe surfaces as a failed write
+#endif
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
@@ -859,7 +1004,11 @@ int main(int argc, char** argv) {
     std::vector<std::string> args;
     if (!o.model.empty()) {
         args = {"--model", fs::absolute(o.model).string()};
+        // A second GPU can hold an expert tier only where a process is given GPU-to-GPU access between its
+        // devices; the engine refuses --peer-device without it, so the bench does not offer one.
+#if !defined(_WIN32)
         if (!has_arg(args, "--peer-device") && visible_gpus() > 1) set_arg(args, "--peer-device", "1");
+#endif
     }
     if (engine_bin.empty()) engine_bin = BASALT_BENCH_ENGINE;
     if (o.engine.empty() && std::string(BASALT_BENCH_ENGINE).size() > 0 && fs::exists(BASALT_BENCH_ENGINE)) engine_bin = BASALT_BENCH_ENGINE;
@@ -921,7 +1070,13 @@ int main(int argc, char** argv) {
     std::string work = o.logs;
     bool temp_work = false;
     if (work.empty()) {
+#if defined(_WIN32)
+        char tmp[MAX_PATH] = {};
+        if (GetTempPathA(sizeof tmp, tmp) == 0) tmp[0] = '.';
+        work = fmt("%sbasalt-bench-%d", tmp, (int) getpid());
+#else
         work = fmt("/tmp/basalt-bench-%d", (int) getpid());
+#endif
         temp_work = true;
     }
     std::error_code ec;
@@ -1121,7 +1276,11 @@ int main(int argc, char** argv) {
         if (all_digits(power)) power += " W";
     } else if (!gpus_start.empty() && gpus_start[0].power_limit_w > 0) {
         power = fmt("%.0f W", gpus_start[0].power_limit_w);
+#if defined(_WIN32)
+    } else if (FILE* pf = popen("nvidia-smi -i 0 --query-gpu=power.limit --format=csv,noheader,nounits 2>nul", "r")) {
+#else
     } else if (FILE* pf = popen("nvidia-smi -i 0 --query-gpu=power.limit --format=csv,noheader,nounits 2>/dev/null", "r")) {
+#endif
         char b[64] = {0};
         if (std::fgets(b, sizeof b, pf) != nullptr && std::atof(b) > 0) power = fmt("%.0f W", std::atof(b));
         pclose(pf);
