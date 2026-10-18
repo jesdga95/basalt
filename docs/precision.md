@@ -421,6 +421,28 @@ Scope: these two programs cover the Q2_0 expert kernel and the expert pool. The 
 `iq_avx2`, `kq_avx2`, `kq_avx1`, `native_expert`, `ggml_cpu_dots`) are compiled by both toolchains as well but no
 program here exercises them with real weights, so this table is not evidence about them.
 
+### Greedy tokens are not identical across the two builds
+
+Agreement to a tolerance is not the same as bitwise identity, and the token stream shows it. The same pack, the same
+commit, temperature 0, expert tiers pinned (`--expert-cache 4096 --resident-experts`), adaptive swaps off, the two
+builds place experts identically (VRAM 10.2 GiB, RAM 36.7 GiB, 5341 slots) and generate the three bench prompts for
+300 tokens each: `struct` is token-identical, `conv` diverges at token 23, `prose` at token 44. Run twice, one build
+against itself under the same flags, all three prompts are token-identical, so the difference follows the build rather
+than the run.
+
+Two things follow. The port does not promise byte identity with Linux, and this is the measurement of what that means.
+It also does not attribute the difference to the compiler alone: the expert rows are computed by MSVC-compiled code on
+one side and GCC-compiled code on the other, while the GPU half was built by CUDA 13.0 on Windows and CUDA 13.4 on
+Linux, and both halves decide a token. Isolating the CPU side is what `expert_parity` and `pool_test` above do, and
+they agree.
+
+Adaptive swaps must be **off** for any of this to mean anything: with them on, one build does not reproduce its own
+tokens between runs, because the tier exchanges experts while it decodes.
+
+The quality gate is the check that decides whether such a divergence is acceptable, and it needs a KL-divergence base
+built by llama.cpp from the Q8_0 weights. No base exists on the machine these numbers were taken from, so the gate was
+not run here.
+
 Both programs read a flat expert section: 512 blobs of 1,382,400 bytes, the Q2_0 layout they were written for. A pack
 carries one in its `mtp/experts` section, which copies out unmodified, so the same bytes run on either build:
 
