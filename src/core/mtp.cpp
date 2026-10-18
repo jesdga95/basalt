@@ -11,6 +11,7 @@
 
 #include "basalt/core/native_head.hpp"
 #include "basalt/core/peer_experts.hpp"
+#include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
@@ -117,7 +118,7 @@ basalt::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
 bool read_file(const FileRange& r, std::vector<uint8_t>& out) {
     if (r.empty() || !r.exists()) return false;
     // `fread` passes a request bigger than the stream buffer straight to the read call.
-    FILE* f = std::fopen(r.path.c_str(), "rb");
+    FILE* f = basalt::platform::open_file_utf8(r.path, "rb");
     if (f == nullptr) return false;
     // A `FILE*` has no destructor and the short-read path below returns early: the guard closes on every path.
     struct Closer {
@@ -125,8 +126,9 @@ bool read_file(const FileRange& r, std::vector<uint8_t>& out) {
         ~Closer() { if (f != nullptr) std::fclose(f); }
     } closer{f};
     const uint64_t n = r.size();
-    if (fseeko(f, (off_t) r.offset, SEEK_SET) != 0) return false;
-    basalt::platform::advise_willneed(fileno(f), r.offset, n);
+    // The expert files are far larger than 4 GiB, so the seek has to be a 64-bit one.
+    if (basalt::platform::fseek64(f, r.offset, SEEK_SET) != 0) return false;
+    basalt::platform::advise_willneed(basalt::platform::file_fd(f), r.offset, n);
     out.resize((size_t) n);
     return n == 0 || std::fread(out.data(), 1, (size_t) n, f) == (size_t) n;
 }

@@ -6,6 +6,7 @@
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
 #include "basalt/core/pinned.hpp"
+#include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/quantize_act.hpp"
@@ -31,10 +32,15 @@
 #include <utility>
 #include <vector>
 
-#include <fcntl.h>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace basalt::core {
 
@@ -230,6 +236,18 @@ namespace detail {
 bool host_available_memory(HostMemory& m, const std::string& meminfo, const std::string& self_cgroup,
                            const std::string& cgroup_root) {
     m = HostMemory{};
+#if defined(_WIN32)
+    // No /proc/meminfo and no cgroup hierarchy here: the OS reading is the whole answer, and there is no container
+    // limit tighter than it.
+    (void) meminfo;
+    (void) self_cgroup;
+    (void) cgroup_root;
+    const uint64_t avail = basalt::platform::available_memory();
+    if (avail == 0) return false;
+    m.available = avail;
+    m.cgroup_limit = ~0ull;
+    return true;
+#else
     // MemAvailable includes reclaimable page cache, unlike _SC_AVPHYS_PAGES.
     std::ifstream info(meminfo);
     std::string line;
@@ -315,6 +333,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     }
     m.available = bytes;
     return true;
+#endif
 }
 
 }  // namespace detail
@@ -407,10 +426,43 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
         }
     }
     const std::string& path = experts.path;
-    const int fd = ::open(path.c_str(), O_RDONLY);
+#if defined(_WIN32)
+    // The section is taken on a file handle, so this open is the wide Win32 one: the file seam has no mapping call.
+    HANDLE h = CreateFileW(platform::to_wide(path).c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { err = "FileExpertSource: cannot open " + path; return false; }
+    LARGE_INTEGER li{};
+    if (!GetFileSizeEx(h, &li)) { CloseHandle(h); err = "FileExpertSource: cannot stat " + path; return false; }
+    const uint64_t fsize = (uint64_t) li.QuadPart;
+    // a whole file is exactly the experts; a section must be, and lie inside the file
+    const uint64_t have = experts.bytes != 0 ? experts.bytes : fsize;
+    if (experts.offset > fsize || have > fsize - experts.offset || have != want) {
+        char buf[400];
+        std::snprintf(buf, sizeof buf,
+                      "FileExpertSource: %s is %llu B but the loaded expert layout requires %llu B - this is not "
+                      "the pack this geometry came from",
+                      path.c_str(), (unsigned long long) have,
+                      (unsigned long long) want);
+        CloseHandle(h);
+        err = buf;
+        return false;
+    }
+    // MapViewOfFile takes only allocation-granularity offsets, so the file is mapped whole and the pointer moved by
+    // the section offset. That is address space only: the pages arrive as they are touched. The view keeps the
+    // section and the file alive, so both handles close here.
+    HANDLE mapping = CreateFileMappingW(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (mapping == nullptr) { CloseHandle(h); err = "FileExpertSource: mapping failed on " + path; return false; }
+    uint8_t* raw = (uint8_t*) MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(mapping);
+    CloseHandle(h);
+    if (raw == nullptr) { err = "FileExpertSource: mapping failed on " + path; return false; }
+    void* view = raw + experts.offset;
+#else
+    const int fd = platform::open_fd_utf8(path);
     if (fd < 0) { err = "FileExpertSource: cannot open " + path; return false; }
     struct stat st{};
-    if (fstat(fd, &st) != 0) { ::close(fd); err = "FileExpertSource: cannot stat " + path; return false; }
+    if (fstat(fd, &st) != 0) { platform::close_fd(fd); err = "FileExpertSource: cannot stat " + path; return false; }
     // a whole file is exactly the experts; a section must be, and lie inside the file
     const uint64_t have = experts.bytes != 0 ? experts.bytes : (st.st_size < 0 ? 0 : (uint64_t) st.st_size);
     if (st.st_size < 0 || have != want || experts.offset > (uint64_t) st.st_size ||
@@ -421,13 +473,21 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
                       "the pack this geometry came from",
                       path.c_str(), (unsigned long long) have,
                       (unsigned long long) want);
-        ::close(fd);
+        platform::close_fd(fd);
         err = buf;
         return false;
     }
     void* view = mmap(nullptr, (size_t) want, PROT_READ, MAP_SHARED, fd, (off_t) experts.offset);
-    if (view == MAP_FAILED) { ::close(fd); err = "FileExpertSource: mmap failed on " + path; return false; }
+    if (view == MAP_FAILED) { platform::close_fd(fd); err = "FileExpertSource: mmap failed on " + path; return false; }
+#endif
+#if defined(_WIN32)
+    // A second, plain descriptor for the prompt path's positional reads: the view stays read-only for the compute,
+    // while the staging buffers are filled with reads that do not fault mapping pages in. A failure here is not
+    // fatal - the caller falls back to copying from the view.
+    fd_ = platform::open_fd_utf8(path);
+#else
     fd_ = fd;
+#endif
     file_off_ = experts.offset;
     base_ = (const uint8_t*) view;
     blobs_ = (int64_t) blob_count;
@@ -446,7 +506,7 @@ void FileExpertSource::close() {
             if (complement_partial_) (void) cudaHostUnregister(complement_arena_);
             if (complement_locked_ > 0)
                 basalt::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
-            std::free(complement_arena_);
+            basalt::platform::free_aligned(complement_arena_);
         }
     }
     if (top_arena_ != nullptr) {
@@ -488,8 +548,15 @@ void FileExpertSource::close() {
     ram_reads_.store(0);
     file_read_bytes_.store(0);
     file_us_.store(0);
-    if (base_ != nullptr) munmap((void*) base_, (size_t) mapped_bytes_);
-    if (fd_ >= 0) ::close(fd_);
+    if (base_ != nullptr) {
+#if defined(_WIN32)
+        // the view was taken at offset 0 and moved by file_off_, so it is released from its real start
+        UnmapViewOfFile(base_ - file_off_);
+#else
+        munmap((void*) base_, (size_t) mapped_bytes_);
+#endif
+    }
+    platform::close_fd(fd_);
     fd_ = -1;
     base_ = nullptr;
     blobs_ = 0;
@@ -539,14 +606,11 @@ bool FileExpertSource::read_blobs(const std::pair<int32_t, int32_t>* pairs, int6
                                   std::string& err) {
     constexpr uint64_t kAlign = 4096;
     int dfd = -1;
-    if (n > 0 && !complement_ready_ && base_ != nullptr && fd_ >= 0) {
-        const std::string self = "/proc/self/fd/" + std::to_string(fd_);
-        dfd = ::open(self.c_str(), O_RDONLY | O_DIRECT);
-    }
+    if (n > 0 && !complement_ready_ && base_ != nullptr && fd_ >= 0) dfd = basalt::platform::open_unbuffered(fd_);
     uint64_t max_blob = 0;
     for (int64_t i = 0; dfd >= 0 && i < n; ++i) {
         const int64_t l = pairs[i].first;
-        if (l < 0 || l >= n_layers_) { ::close(dfd); dfd = -1; break; }
+        if (l < 0 || l >= n_layers_) { basalt::platform::close_fd(dfd); dfd = -1; break; }
         max_blob = std::max(max_blob, layer_blob_bytes_[(size_t) l]);
     }
     // one staging buffer per reader: the blob's block-aligned span, pinned so the copy to a GPU runs at link speed
@@ -558,14 +622,14 @@ bool FileExpertSource::read_blobs(const std::pair<int32_t, int32_t>* pairs, int6
         int& fd;
         ~Free() {
             for (uint8_t* p : v) if (p) cudaFreeHost(p);
-            if (fd >= 0) ::close(fd);
+            if (fd >= 0) basalt::platform::close_fd(fd);
         }
     } cleanup{stage, dfd};
     for (int w = 0; dfd >= 0 && w < readers; ++w) {
         void* m = nullptr;
         if (cudaHostAlloc(&m, stage_bytes, cudaHostAllocPortable) != cudaSuccess) {
             (void) cudaGetLastError();
-            ::close(dfd);
+            basalt::platform::close_fd(dfd);
             dfd = -1;
             break;
         }
@@ -591,7 +655,7 @@ bool FileExpertSource::read_blobs(const std::pair<int32_t, int32_t>* pairs, int6
                 const uint64_t pos = file_off_ + (uint64_t) (mapped - base_);
                 const uint64_t a0 = pos - pos % kAlign;
                 const uint64_t a1 = (pos + bytes + kAlign - 1) / kAlign * kAlign;
-                const ssize_t got = ::pread(dfd, stage[(size_t) w], (size_t) (a1 - a0), (off_t) a0);
+                const int64_t got = basalt::platform::pread(dfd, stage[(size_t) w], (size_t) (a1 - a0), a0);
                 const uint8_t* data = got > 0 && (uint64_t) got >= pos + bytes - a0 ? stage[(size_t) w] + (pos - a0)
                                                                                     : mapped;   // short read: mapped copy
                 if (sink(i, w, data, msg)) continue;
@@ -882,8 +946,8 @@ bool FileExpertSource::pin_cache_complement(
     // The experts the GPU cache was filled from sit in the file cache and the mapping; give them back first, so the
     // arena below does not have to reclaim them while the drive is being read.
     if (bytes > 0) {
-        (void) madvise((void*) base_, (size_t) mapped_bytes_, MADV_DONTNEED);
-        (void) posix_fadvise(fd_, (off_t) file_off_, (off_t) mapped_bytes_, POSIX_FADV_DONTNEED);
+        (void) basalt::platform::drop_mapped_view(base_, mapped_bytes_, 0, mapped_bytes_);
+        basalt::platform::advise_dontneed(fd_, file_off_, mapped_bytes_);
     }
 
     void* arena = nullptr;
@@ -895,13 +959,15 @@ bool FileExpertSource::pin_cache_complement(
     bool register_after = false;   ///< the arena is registered with the driver after it is filled
     uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
     std::string note;
+    // One alignment for both arena paths, so one call releases it whichever way it was chosen.
+    constexpr size_t kArenaAlign = 2ull << 20;
     auto release = [&]() {
         if (arena == nullptr) return;
         if (pinned_ok) (void) cudaFreeHost(arena);
         else {
             if (partial_pin > 0) (void) cudaHostUnregister(arena);
             if (locked > 0) basalt::platform::unlock_resident((uint8_t*) arena + lock_off, locked);
-            std::free(arena);
+            basalt::platform::free_aligned(arena);
         }
         arena = nullptr;
     };
@@ -913,19 +979,16 @@ bool FileExpertSource::pin_cache_complement(
             // Ordinary memory, aligned and padded to 2 MiB (whole large pages, so the registered range ends on a page
             // boundary), registered with the driver once it is filled: the reads fault the pages in while the drive
             // works, instead of the driver zeroing and locking all of it before the first read.
-            constexpr size_t kHuge = 2ull << 20;
-            const size_t padded = ((size_t) bytes + kHuge - 1) / kHuge * kHuge;
-            void* mem = nullptr;
-            if (posix_memalign(&mem, kHuge, padded) == 0 && mem != nullptr) {
-                arena = mem;
+            const size_t padded = ((size_t) bytes + kArenaAlign - 1) / kArenaAlign * kArenaAlign;
+            arena = basalt::platform::alloc_aligned(padded, kArenaAlign);
+            if (arena != nullptr) {
                 register_after = true;
             } else {
-                arena = nullptr;
                 note = "no aligned memory for registration";
             }
         }
         if (arena == nullptr) {
-            arena = std::malloc((size_t) bytes);
+            arena = basalt::platform::alloc_aligned((size_t) bytes, kArenaAlign);
             if (arena == nullptr) {
                 err = "FileExpertSource: pageable resident complement allocation failed";
                 return false;
@@ -950,18 +1013,11 @@ bool FileExpertSource::pin_cache_complement(
     // Experts are read straight into the arena with unbuffered reads, so the file cache neither copies them nor
     // evicts anything; ranges that are not block-aligned, or a file system without unbuffered reads, take the mapped copy.
     constexpr uint64_t kDirectAlign = 4096, kDirectChunk = 16ull << 20;
+    // A descriptor whose reads bypass the OS cache, or -1 where the platform offers none: the copy then comes from
+    // the mapping for every range, which is what the file's pages were read through before.
     int direct_fd = -1;
-    if (bytes > 0) {
-        const std::string self = "/proc/self/fd/" + std::to_string(fd_);
-        direct_fd = ::open(self.c_str(), O_RDONLY | O_DIRECT);
-    }
+    if (bytes > 0) direct_fd = basalt::platform::open_unbuffered(fd_);
     // Copied layer by layer on a few threads; the layer's contiguous experts are read as one range.
-    const long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) {
-        err = "FileExpertSource: cannot determine page size for mapped-page release";
-        release();
-        return false;
-    }
     std::atomic<int64_t> next_layer{0}, layers_done{0};
     std::atomic<uint64_t> copied{0};
     std::atomic<uint64_t> direct_bytes{0};
@@ -992,7 +1048,7 @@ bool FileExpertSource::pin_cache_complement(
     };
     auto worker = [&]() {
         uint8_t* stage = nullptr;   // staging for ranges that are not block-aligned
-        struct StageFree { uint8_t*& p; ~StageFree() { std::free(p); } } stage_free{stage};
+        struct StageFree { uint8_t*& p; ~StageFree() { basalt::platform::free_aligned(p); } } stage_free{stage};
         for (;;) {
             const int64_t layer = next_layer.fetch_add(1);
             if (layer >= n_layers_ || failed.load()) return;
@@ -1034,22 +1090,21 @@ bool FileExpertSource::pin_cache_complement(
                     if (aligned) {   // straight into the arena
                         while (done_bytes < r.len) {
                             const uint64_t n = std::min<uint64_t>(kDirectChunk, r.len - done_bytes);
-                            const ssize_t got = ::pread(direct_fd, dst + done_bytes, (size_t) n,
-                                                        (off_t) (r.file_pos + done_bytes));
+                            const int64_t got = basalt::platform::pread(direct_fd, dst + done_bytes, (size_t) n,
+                                                                        r.file_pos + done_bytes);
                             if (got <= 0 || (uint64_t) got % kDirectAlign != 0) break;   // the rest takes the mapped copy
                             done_bytes += (uint64_t) got;
                         }
                     } else {   // block-aligned reads into a staging buffer, then the wanted bytes are copied out
-                        if (stage == nullptr) {
-                            void* m = nullptr;
-                            if (posix_memalign(&m, kDirectAlign, kDirectChunk + 2 * kDirectAlign) == 0) stage = (uint8_t*) m;
-                        }
+                        if (stage == nullptr)
+                            stage = (uint8_t*) basalt::platform::alloc_aligned(kDirectChunk + 2 * kDirectAlign,
+                                                                              kDirectAlign);
                         while (stage != nullptr && done_bytes < r.len) {
                             const uint64_t pos = r.file_pos + done_bytes;
                             const uint64_t n = std::min<uint64_t>(kDirectChunk, r.len - done_bytes);
                             const uint64_t a0 = pos - pos % kDirectAlign;
                             const uint64_t a1 = (pos + n + kDirectAlign - 1) / kDirectAlign * kDirectAlign;
-                            const ssize_t got = ::pread(direct_fd, stage, (size_t) (a1 - a0), (off_t) a0);
+                            const int64_t got = basalt::platform::pread(direct_fd, stage, (size_t) (a1 - a0), a0);
                             if (got <= 0 || (uint64_t) got < pos + n - a0) break;
                             std::memcpy(dst + done_bytes, stage + (pos - a0), (size_t) n);
                             done_bytes += n;
@@ -1072,23 +1127,13 @@ bool FileExpertSource::pin_cache_complement(
                 }
             }
             if (mapped_used) {   // the layer's pages are not kept in the file cache once copied
-            const uint64_t layer_offset = layer_offsets_[(size_t) layer];
-            const uint64_t layer_bytes = blob_bytes * (uint64_t) n_expert_;
-            const uint64_t layer_end = layer_offset + layer_bytes;
-            const uint64_t page = (uint64_t) page_size;
-            const uint64_t advice_start = layer_offset - layer_offset % page;
-            const uint64_t end_remainder = layer_end % page;
-            const uint64_t extra = end_remainder == 0 ? 0 : page - end_remainder;
-            const uint64_t advice_end = extra > mapped_bytes_ - layer_end ? mapped_bytes_ : layer_end + extra;
-            if (advice_end > advice_start &&
-                madvise((void*) (base_ + (size_t) advice_start), (size_t) (advice_end - advice_start), MADV_DONTNEED) != 0) {
-                fail("FileExpertSource: madvise could not release mapped expert layer " + std::to_string(layer));
-                return;
-            }
-            if (posix_fadvise(fd_, (off_t) (file_off_ + layer_offset), (off_t) layer_bytes, POSIX_FADV_DONTNEED) != 0) {
-                fail("FileExpertSource: posix_fadvise could not release expert layer " + std::to_string(layer));
-                return;
-            }
+                const uint64_t layer_offset = layer_offsets_[(size_t) layer];
+                const uint64_t layer_bytes = blob_bytes * (uint64_t) n_expert_;
+                if (!basalt::platform::drop_mapped_view(base_, mapped_bytes_, layer_offset, layer_bytes)) {
+                    fail("FileExpertSource: could not release mapped expert layer " + std::to_string(layer));
+                    return;
+                }
+                basalt::platform::advise_dontneed(fd_, file_off_ + layer_offset, layer_bytes);
             }
             const int64_t done = layers_done.fetch_add(1) + 1;
             if (done % 8 == 0 || done == n_layers_)
@@ -1105,7 +1150,7 @@ bool FileExpertSource::pin_cache_complement(
         for (auto& t : pool) t.join();
     }
     std::fflush(stderr);
-    if (direct_fd >= 0) ::close(direct_fd);
+    if (direct_fd >= 0) basalt::platform::close_fd(direct_fd);
     const double read_done_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count();
     if (register_after && !failed.load()) {
         constexpr size_t kHuge = 2ull << 20;
@@ -2207,7 +2252,13 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
 }
 
 void ArenaExpertSource::close() {
-    if (map_ != nullptr) munmap(map_, (size_t) map_bytes_);
+    if (map_ != nullptr) {
+#if defined(_WIN32)
+        UnmapViewOfFile(map_);
+#else
+        munmap(map_, (size_t) map_bytes_);
+#endif
+    }
     map_ = nullptr;
     map_bytes_ = 0;
     if (arena_ != nullptr) {
@@ -2220,11 +2271,15 @@ void ArenaExpertSource::close() {
 }
 
 void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
+#if defined(_WIN32)
+    (void) layer; (void) expert;   // no per-range read-ahead for the arena; see platform::advise_willneed
+#else
     if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return;
     const auto& lay = basalt::kernels::cpu::expert_layout();
     const uint64_t off = lay.blob_offset(layer, expert) & ~(uint64_t) 4095;
     const uint64_t end = lay.blob_offset(layer, expert) + lay.blob_bytes(layer);
     madvise((uint8_t*) map_ + off, (size_t) (end - off), MADV_WILLNEED);
+#endif
 }
 
 // Only the pages wholly inside the blob: a page shared with a neighbour the CPU may still read stays.  MADV_DONTNEED
@@ -2232,6 +2287,10 @@ void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
 // back under pressure, and a minor fault away when the CPU needs the expert again (an adaptive swap evicts it).
 // Dropping them from the cache too (POSIX_FADV_DONTNEED) would make every eviction a re-read from the disk.
 uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
+#if defined(_WIN32)
+    (void) layer; (void) expert;
+    return 0;   // nothing is dropped, so nothing is reported dropped
+#else
     if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return 0;
     const auto& lay = basalt::kernels::cpu::expert_layout();
     const uint64_t off = (lay.blob_offset(layer, expert) + 4095) & ~(uint64_t) 4095;
@@ -2239,6 +2298,7 @@ uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
     if (end <= off) return 0;
     if (madvise((uint8_t*) map_ + off, (size_t) (end - off), MADV_DONTNEED) != 0) return 0;
     return end - off;
+#endif
 }
 
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {

@@ -4,6 +4,7 @@
 #include "basalt/core/load_progress.hpp"
 
 #include "basalt/kernels/f16_bits.hpp"
+#include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 
 #include <cuda_runtime.h>
@@ -14,8 +15,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
-
-#include <unistd.h>
 
 namespace basalt::core {
 namespace {

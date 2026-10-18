@@ -1,6 +1,8 @@
 // DirectUploader: ranges at unaligned offsets and lengths, smaller and larger than a chunk, land byte for byte.
 #include "basalt/core/direct_upload.hpp"
 
+#include "basalt/platform/file.hpp"
+
 #include <cuda_runtime.h>
 
 #include <cstdio>
@@ -9,7 +11,6 @@
 #include <random>
 #include <string>
 #include <vector>
-#include <unistd.h>
 
 int main() {
     const std::string path = "direct_upload_test.bin";
@@ -17,7 +18,7 @@ int main() {
     std::vector<uint8_t> data(size);
     std::mt19937_64 rng(7);
     for (auto& b : data) b = (uint8_t) rng();
-    if (FILE* f = std::fopen(path.c_str(), "wb")) {
+    if (FILE* f = basalt::platform::open_file_utf8(path, "wb")) {
         std::fwrite(data.data(), 1, size, f);
         std::fclose(f);
     } else {
@@ -49,7 +50,7 @@ int main() {
     }
     std::string err;
     if (up.upload(path, size - 10, 100, nullptr, err)) { std::fprintf(stderr, "a read past the end succeeded\n"); ++bad; }
-    ::unlink(path.c_str());
+    (void) std::remove(path.c_str());
     std::printf("direct_upload_test: %s (%s reads)\n", bad ? "FAIL" : "ok", up.unbuffered() ? "unbuffered" : "buffered");
     return bad ? 1 : 0;
 }
