@@ -125,7 +125,14 @@ typedef half2 ggml_half2;
 
 #endif // GGML_COMMON_DECL_CUDA
 
+// Marks the anonymous unions below as an accepted extension. It is a syntax marker only: the member layout is
+// what the size checks further down pin, and the compilers without the keyword (MSVC, and nvcc with an MSVC host
+// front end) allow the same unions on their own.
+#if defined(__GNUC__) || defined(__clang__)
 #define GGML_EXTENSION __extension__
+#else
+#define GGML_EXTENSION
+#endif
 
 #define QK2_0 64
 typedef struct {

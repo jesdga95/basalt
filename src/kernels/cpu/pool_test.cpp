@@ -15,6 +15,7 @@
 //      nothing and `n > workers` is the real case (10 experts, 5 workers).
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
+#include "basalt/platform/file.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -32,9 +33,10 @@ namespace {
 
 bool read_blob(const char* path, long long index, std::vector<uint8_t>& out) {
     out.assign(cpu::BLOB, 0);
-    std::FILE* f = std::fopen(path, "rb");
+    std::FILE* f = basalt::platform::open_file_utf8(path, "rb");
     if (!f) return false;
-    if (fseeko(f, (off_t) index * (off_t) cpu::BLOB, SEEK_SET) != 0) { std::fclose(f); return false; }
+    // The blob a layer index points at can sit past 4 GiB, so the seek has to be a 64-bit one.
+    if (basalt::platform::fseek64(f, index * (long long) cpu::BLOB, SEEK_SET) != 0) { std::fclose(f); return false; }
     const size_t got = std::fread(out.data(), 1, out.size(), f);
     std::fclose(f);
     return got == out.size();

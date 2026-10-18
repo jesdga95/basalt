@@ -29,6 +29,17 @@ inline uint32_t u32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); retur
 inline uint16_t u16(const uint8_t* p) { uint16_t v; std::memcpy(&v, p, 2); return v; }
 inline uint64_t u64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
 
+// the index of the lowest set bit of a nonzero mask: the compiler's own scan
+inline int lowest_bit(unsigned m) {
+#if defined(_MSC_VER)
+    unsigned long i = 0;
+    _BitScanForward(&i, m);
+    return (int) i;
+#else
+    return __builtin_ctz(m);
+#endif
+}
+
 // 32 sign bits -> 32 bytes of -1 (bit set) / +1: ggml's bit_selector pattern, shared by all tokens.
 inline __m256i sgn_vec(uint32_t m) {
     const __m128i bm = _mm_set1_epi32((int) m);
@@ -407,7 +418,7 @@ void quantize_q8_K_avx2(const float* x, void* dst, int64_t k) {
         float mx = 0.f;
         for (int j = 0; j < QK_K / 8; ++j) {
             const int m = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_and_ps(v[j], absmask), amv, _CMP_EQ_OQ));
-            if (m != 0) { mx = x[8 * j + __builtin_ctz((unsigned) m)]; break; }
+            if (m != 0) { mx = x[8 * j + lowest_bit((unsigned) m)]; break; }
         }
         const float iscale = -127.f / mx;
         const __m256 is = _mm256_set1_ps(iscale);
