@@ -165,6 +165,14 @@ struct HcLaunch {
     CUtensorMap tm[6];   // q_down, s_down, q_inject, s_inject by four rows; q_up, s_up
 };
 
+// cuda.h gives the descriptor its alignas only when the compiler reports a C++11 __cplusplus, which MSVC does not
+// unless the build passes /Zc:__cplusplus. A descriptor off the boundary faults when the kernel reads it, so the build
+// says so at compile time rather than at launch. The boundary is named here rather than taken from the header, whose
+// spelling of it changed between toolkit versions; 64 is what the hardware requires, and the newer toolkits align
+// the type more strictly, which satisfies it.
+static_assert(alignof(CUtensorMap) >= 64, "CUtensorMap lost its alignas: the build needs /Zc:__cplusplus");
+static_assert(offsetof(HcLaunch, tm) % 64 == 0, "the TMA descriptors must sit on the map boundary");
+
 // ---------------------------------------------------------------- primitives
 __device__ __forceinline__ unsigned smem_u32(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
 __device__ __forceinline__ void mbar_init(uint64_t* bar, unsigned count) {
