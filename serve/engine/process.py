@@ -14,6 +14,7 @@ Protocol (one line each):
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import queue
@@ -68,11 +69,28 @@ def echo_requests(log_path: str, offset: int) -> None:
                                                  m["tg"]), flush=True)
 
 
+def engine_line(line: str) -> str:
+    """Drop the `\r` a text-mode stream puts before a line's final `\n`; the line keeps its `\n`."""
+    return line[:-2] + "\n" if line.endswith("\r\n") else line
+
+
+def frame_pipes(proc, stderr_pipe: bool) -> None:
+    """Frame a child's pipes on `\n` alone, both directions: the text-mode default for a pipe writes `\r\n` on
+    Windows, and ends a line at a `\r` that belongs to the line rather than ending it.  Only Popen's own text
+    wrappers carry that default; a stream the caller made is left as it is."""
+    if isinstance(proc.stdin, io.TextIOWrapper):
+        proc.stdin.reconfigure(newline="\n", write_through=True, line_buffering=True)
+    if isinstance(proc.stdout, io.TextIOWrapper):
+        proc.stdout.reconfigure(newline="\n")
+    if stderr_pipe and isinstance(proc.stderr, io.TextIOWrapper):
+        proc.stderr.reconfigure(newline="\n")
+
+
 def pump_lines(stream, sink) -> None:
     """Pass each line of a child's pipe to `sink` until it closes."""
     try:
         for line in stream:
-            sink(line)
+            sink(engine_line(line))
     except (OSError, ValueError):
         pass
 
@@ -153,6 +171,7 @@ class ProcessEngine:
         self.proc = subprocess.Popen([engine_bin, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE if sink else self.log, text=True, encoding="utf-8",
                                      bufsize=1, env=env)
+        frame_pipes(self.proc, sink is not None)
         if sink:
             threading.Thread(target=pump_lines, args=(self.proc.stderr, sink), daemon=True).start()
         # the lines come from a thread up to READY, so the read can time out and the rest of the stream stays for _pump
@@ -247,6 +266,7 @@ class ProcessEngine:
         done = False
         try:
             for line in proc.stdout:
+                line = engine_line(line)
                 out.put(line)
                 if line.startswith("READY"):
                     done = True
@@ -262,6 +282,7 @@ class ProcessEngine:
         slot_q = self.slot_q
         line = None
         for line in proc.stdout:
+            line = engine_line(line)
             if line.startswith(FATAL_PREFIXES):         # before batch routing
                 if self.proc is proc:
                     self.silent_note = "unrecoverable verification failure: " + line[4:].strip()

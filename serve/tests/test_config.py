@@ -63,8 +63,8 @@ class ConfigFile(unittest.TestCase):
     def test_paths_are_relative_to_the_file(self):
         p = conf({"server": {"model": "m/x.basalt", "tokenizer": "tok"}})
         argv, _ = load_config_file(p, build_parser())
-        here = str(Path(p).resolve().parent)
-        self.assertEqual(argv, ["--model", f"{here}/m/x.basalt", "--tokenizer", f"{here}/tok"])
+        here = Path(p).resolve().parent
+        self.assertEqual(argv, ["--model", str(here / "m" / "x.basalt"), "--tokenizer", str(here / "tok")])
 
     def test_errors(self):
         ap = build_parser()
@@ -294,7 +294,9 @@ class EveryOption(unittest.TestCase):
             return 0.25
         if act.dest in SAMPLING_KEYS:                      # the model file's checks apply
             return 0.5 if SAMPLING_KEYS[act.dest][0] is float else 7
-        return "/x" if act.dest in ("model", "tokenizer") else "x"
+        # a path the config file resolves against its own directory: absolute in this platform's own form, so the
+        # resolution leaves it as it is
+        return str(Path(TMP.name) / "x") if act.dest in ("model", "tokenizer") else "x"
 
     def test_every_server_option_by_both_paths(self):
         ap = build_parser()
