@@ -431,17 +431,17 @@ against itself under the same flags, all three prompts are token-identical, so t
 than the run.
 
 Two things follow. The port does not promise byte identity with Linux, and this is the measurement of what that means.
-It also does not attribute the difference to the compiler alone: the expert rows are computed by MSVC-compiled code on
-one side and GCC-compiled code on the other, while the GPU half was built by CUDA 13.0 on Windows and CUDA 13.4 on
-Linux, and both halves decide a token. Isolating the CPU side is what `expert_parity` and `pool_test` above do, and
-they agree.
+And it is the host compiler that is being measured, not the GPU toolchain: the Linux side was then rebuilt with CUDA
+13.0 — the same toolkit release the Windows build used — and it diverges at the same two tokens with the same ids, so
+the toolkit version accounts for none of it. What remains between the two builds is GCC against MSVC on the CPU, where
+78% of the expert rows are computed, and the figures in the table above say how far apart they are.
 
 Adaptive swaps must be **off** for any of this to mean anything: with them on, one build does not reproduce its own
 tokens between runs, because the tier exchanges experts while it decodes.
 
 The quality gate is the check that decides whether such a divergence is acceptable, and it needs a KL-divergence base
-built by llama.cpp from the Q8_0 weights. No base exists on the machine these numbers were taken from, so the gate was
-not run here.
+built by llama.cpp from a Q8_0 copy of the model. That base needs the Q8_0 weights, which were not available on the
+machine these numbers were taken from, so the gate was not run here.
 
 Both programs read a flat expert section: 512 blobs of 1,382,400 bytes, the Q2_0 layout they were written for. A pack
 carries one in its `mtp/experts` section, which copies out unmodified, so the same bytes run on either build:
