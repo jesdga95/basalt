@@ -14,11 +14,17 @@
 #include <mutex>
 #include <thread>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <linux/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <linux/mman.h>
+#endif
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << 26)
 #endif
@@ -40,6 +46,27 @@ struct SharedArenaHeader {
 };
 static_assert(sizeof(SharedArenaHeader) <= kSharedArenaHeaderBytes);
 
+#if defined(_WIN32)
+// A size in GiB, for the notes that have to say how big something was.
+std::string gib_size(uint64_t bytes) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%.1f GiB", (double) bytes / (double) (1ull << 30));
+    return buf;
+}
+
+// What the OS could still commit, for the note that has to say why the arena did not fit.  The commit charge is the
+// sum of RAM and the page file, so its free part is the headroom the arena has to fit into.  Empty when the OS
+// gives no reading.
+std::string commit_headroom_note() {
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (!GlobalMemoryStatusEx(&ms)) return "; the commit headroom is unknown";
+    return "; " + gib_size((uint64_t) ms.ullAvailPageFile) + " of commit charge free out of " +
+           gib_size((uint64_t) ms.ullTotalPageFile) + " (RAM plus page file), " +
+           gib_size((uint64_t) ms.ullTotalPhys) + " of RAM";
+}
+#endif
+
 // A 2 MB-aligned reservation.  Large pages first, then the largest alignment the OS will give us for free.
 // A non-empty shared_file instead maps one file whose first 4 KiB identify the pack and whose remaining bytes
 // are the resident arena.  This shared-file layout is intended for tmpfs (/dev/shm); hugetlbfs would need
@@ -48,6 +75,76 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
               uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {
     mapping_base = nullptr;
     mapping_bytes = 0;
+#if defined(_WIN32)
+    if (!shared_file.empty()) {
+        note = "shared arena files are not available on Windows";
+        return nullptr;
+    }
+    // MEM_LARGE_PAGES needs SeLockMemoryPrivilege, and the account having it assigned is not enough: the process
+    // enables it in its own token first. An account without the assignment fails here and falls through to the
+    // ordinary allocation below, which is the expected outcome rather than an error.
+    {
+        HANDLE tok = nullptr;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
+            TOKEN_PRIVILEGES tp{};
+            tp.PrivilegeCount = 1;
+            if (LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege", &tp.Privileges[0].Luid)) {
+                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                (void) AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr);
+            }
+            CloseHandle(tok);
+        }
+    }
+    const SIZE_T large = GetLargePageMinimum();
+    if (large > 0) {
+        // The requested size must be an exact multiple of the large-page minimum; the slack is under one page.
+        const SIZE_T lbytes = (SIZE_T) (((SIZE_T) bytes + large - 1) / large * large);
+        void* p = VirtualAlloc(nullptr, lbytes, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+        if (p != nullptr) {
+            got = PageBacking::LargePages;
+            note = "large pages (" + std::to_string((unsigned long long) large) + " B)";
+            return p;
+        }
+        // ERROR_NO_SYSTEM_RESOURCES is the page pool declining, ERROR_PRIVILEGE_NOT_HELD is the token and
+        // ERROR_INVALID_PARAMETER a size that is not a multiple of the minimum. They need different fixes, so the
+        // note carries the number.
+        note = "large pages refused for " + std::to_string((unsigned long long) lbytes) +
+               " B (GetLargePageMinimum=" + std::to_string((unsigned long long) large) + ", VirtualAlloc error " +
+               std::to_string((unsigned long long) GetLastError()) + "); using 4 KB pages";
+    } else {
+        note = "this system has no large-page minimum; using 4 KB pages";
+    }
+    {
+        // Reserve first, then commit in chunks.  A single MEM_COMMIT over the whole arena only ever says that the
+        // allocation failed, and whether it can succeed depends on RAM plus page file together, which is not known
+        // before the commit reaches that far.  Committing a chunk at a time makes the failure name the size it
+        // reached, and the region is released before anything is returned, so a half-committed arena is never
+        // handed to the caller and nothing is reported as pinned that was not.
+        void* p = VirtualAlloc(nullptr, (SIZE_T) bytes, MEM_RESERVE, PAGE_READWRITE);
+        if (p == nullptr) {
+            got = PageBacking::NormalPages;
+            note = "cannot reserve " + gib_size(bytes) + " of arena (VirtualAlloc error " +
+                   std::to_string((unsigned long long) GetLastError()) + ")" + commit_headroom_note() +
+                   "; the arena needs RAM plus page file; " + note;
+            return nullptr;
+        }
+        constexpr uint64_t kCommitChunk = 1ull << 30;
+        for (uint64_t off = 0; off < bytes; off += kCommitChunk) {
+            const uint64_t n = bytes - off < kCommitChunk ? bytes - off : kCommitChunk;
+            if (VirtualAlloc((uint8_t*) p + off, (SIZE_T) n, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+                const DWORD err = GetLastError();
+                VirtualFree(p, 0, MEM_RELEASE);
+                got = PageBacking::NormalPages;
+                note = "cannot commit the arena: " + gib_size(off) + " of " + gib_size(bytes) +
+                       " committed (VirtualAlloc error " + std::to_string((unsigned long long) err) + ")" +
+                       commit_headroom_note() + "; the arena needs RAM plus page file; " + note;
+                return nullptr;
+            }
+        }
+        got = PageBacking::NormalPages;
+        return p;
+    }
+#else
     if (!shared_file.empty()) {
         if (shared_hash == 0) {
             note = "shared arena requires a nonzero model hash";
@@ -178,11 +275,17 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         note += "; transparent huge pages requested (MADV_HUGEPAGE)";
     }
     return p;
+#endif
 }
 
 void release(void* p, uint64_t bytes) {
     if (!p) return;
+#if defined(_WIN32)
+    (void) bytes;   // one VirtualAlloc owns the whole region
+    VirtualFree(p, 0, MEM_RELEASE);
+#else
     munmap(p, bytes);
+#endif
 }
 
 }  // namespace
@@ -202,6 +305,25 @@ bool clear_error() { (void) cudaGetLastError(); return true; }
 
 
 namespace {
+#if defined(_WIN32)
+// How much of the arena the sliced registration may pin on Windows.  Page-locked memory that the GPU maps is charged
+// to the device's shared (non-local) segment, which is about half of installed RAM; pinned slice by slice until the
+// driver refuses one, that segment is left full and every later device allocation fails "out of memory".  The slice
+// loop stops at the segment's budget instead of at the refusal, keeping room for what the engine allocates after the
+// arena.  The exact budget needs a graphics query the engine does not make, so it comes from the RAM reading.
+// False when the OS gives no RAM reading, which leaves the limit to the driver.
+bool sliced_pin_limit(uint64_t& limit, std::string& why) {
+    constexpr uint64_t GiB = 1ull << 30;
+    const uint64_t ram = basalt::platform::total_physical_memory();
+    if (ram == 0) return false;
+    limit = ram / 2 > 8 * GiB ? ram / 2 - 8 * GiB : 0;
+    char buf[192];
+    std::snprintf(buf, sizeof buf, "the GPU's shared-memory budget, RAM/2 - 8 GiB of %.1f GiB RAM",
+                  (double) ram / (double) GiB);
+    why = buf;
+    return true;
+}
+#endif
 }  // namespace
 
 namespace {
@@ -246,6 +368,19 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             bool limited = capped;
             uint64_t limit = cap;
             std::string limit_why;
+#if defined(_WIN32)
+            // Stop below the shared-memory budget rather than at the driver's refusal, and only when the budget is
+            // actually smaller than the arena: an arena the segment can hold is pinned whole, as before.
+            if (!capped) {
+                uint64_t seg = 0;
+                std::string seg_why;
+                if (sliced_pin_limit(seg, seg_why) && seg < bytes) {
+                    limited = true;
+                    limit = seg;
+                    limit_why = std::move(seg_why);
+                }
+            }
+#endif
             for (size_t i = 0; i + 1 < bounds.size(); ++i) {
                 const uint64_t off = bounds[i], n = bounds[i + 1] - bounds[i];
                 if (limited && (off > limit || n > limit - off)) break;
@@ -376,7 +511,11 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
             uint64_t pos = 0;
             uint64_t h = 1469598103934665603ull;
             // 64-bit seek: the file is far larger than 4 GiB, so a 32-bit `fseek` would wrap
+#if defined(_WIN32)
+            if (_fseeki64(f, (long long) (base + off), SEEK_SET) != 0) {
+#else
             if (fseeko(f, (off_t) (base + off), SEEK_SET) != 0) {
+#endif
                 std::lock_guard<std::mutex> g(err_mu);
                 err = "seek to " + std::to_string(off) + " B failed in layer " + std::to_string(L);
                 return;
