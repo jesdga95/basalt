@@ -113,7 +113,7 @@ jobs:
           -DPython3_EXECUTABLE="$(python -c 'import sys;print(sys.executable.replace(chr(92),"/"))')"
 
       - name: Build
-        run: cmake --build build -j "$(nproc)"
+        run: cmake --build build -j "$(nproc)" -- -k 0
 
       - name: Every test carries a cpu or gpu label
         run: |
