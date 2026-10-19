@@ -131,6 +131,9 @@ jobs:
             exit 1
           fi
 
+      - name: AVX-512 stays inside the dispatched kernels
+        run: python tools/check_isa_isolation.py build
+
       - name: CPU tests
         run: |
           mkdir -p build/tmp
