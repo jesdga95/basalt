@@ -1,0 +1,146 @@
+name: ci
+
+# Pull requests run the same jobs as main. Fork pull requests get a read-only token and no secrets (none are used).
+# No GPU is available: the engine is compiled for sm_120 and only the `cpu`-labelled tests run.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * *"   # keeps the compiler caches from expiring
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CUDA_VERSION: "13.0.2"
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Platform boundary
+        run: tools/check_platform_boundary.sh
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-test.txt
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements-test.txt pytest
+      - name: Server tests
+        run: python -m pytest serve/tests -q
+      - name: Tool tests
+        run: python -m pytest tools/test_bench_flags.py tools/test_serve_launcher.py tools/test_tokenizer.py -q
+      - name: Converter tests
+        run: python -m unittest discover -s tools/convert -p "test_*.py"
+
+  build-test:
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: CUDA toolkit (Linux)
+        if: runner.os == 'Linux'
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas-dev", "nvrtc-dev"]'
+          use-github-cache: true
+
+      - name: CUDA toolkit (Windows)
+        if: runner.os == 'Windows'
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas_dev", "nvrtc_dev", "visual_studio_integration"]'
+          use-github-cache: true
+
+      - name: MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      - name: Ninja
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+        with:
+          key: ${{ matrix.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: ${{ matrix.os }}-
+          max-size: 1G
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON
+          -DCMAKE_CUDA_ARCHITECTURES=120
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+          -DPython3_EXECUTABLE="$(python -c 'import sys;print(sys.executable.replace(chr(92),"/"))')"
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Every test carries a cpu or gpu label
+        run: |
+          total=$(ctest --test-dir build -N | sed -n 's/^Total Tests: //p')
+          cpu=$(ctest --test-dir build -N -L cpu | sed -n 's/^Total Tests: //p')
+          gpu=$(ctest --test-dir build -N -L gpu | sed -n 's/^Total Tests: //p')
+          echo "total=${total} cpu=${cpu} gpu=${gpu}"
+          if [ "$((cpu + gpu))" -ne "${total}" ]; then
+            echo "a test has no cpu or gpu label (register it with basalt_cpu_test or basalt_gpu_test)" >&2
+            ctest --test-dir build -N | sed -n 's/^  Test *#[0-9]*: //p' | sort > all.txt
+            { ctest --test-dir build -N -L cpu; ctest --test-dir build -N -L gpu; } | sed -n 's/^  Test *#[0-9]*: //p' | sort > labelled.txt
+            comm -23 all.txt labelled.txt >&2
+            exit 1
+          fi
+
+      - name: CPU tests
+        run: |
+          mkdir -p build/tmp
+          export TEMP="$PWD/build/tmp" TMP="$PWD/build/tmp" TMPDIR="$PWD/build/tmp"
+          ctest --test-dir build -L cpu -j 4 --output-on-failure --timeout 300
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-logs-${{ matrix.os }}
+          path: build/Testing/Temporary/
+          if-no-files-found: ignore
