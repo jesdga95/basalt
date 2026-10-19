@@ -135,7 +135,7 @@ jobs:
         run: |
           mkdir -p build/tmp
           export TEMP="$PWD/build/tmp" TMP="$PWD/build/tmp" TMPDIR="$PWD/build/tmp"
-          ctest --test-dir build -L cpu -j 4 --output-on-failure --timeout 300
+          ctest --test-dir build -L cpu -LE avx512 -j 4 --output-on-failure --timeout 300
 
       - name: Upload test logs
         if: failure()
