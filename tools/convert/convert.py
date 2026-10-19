@@ -340,7 +340,7 @@ def convert(a) -> None:
         w.close()
         ok = True
     except S.ConvertError as e:
-        die(str(e))
+        err = str(e)
     finally:
         if not ok:
             try:
@@ -348,6 +348,10 @@ def convert(a) -> None:
             except OSError:
                 pass
             partial.unlink(missing_ok=True)
+    if err is not None:
+        model = dense = experts = mtp = job = None
+        gc.collect()
+        die(err)
     os.replace(partial, out)
     total = out.stat().st_size
     print(f"done: {len(job.rows)} sections, {total / (1 << 30):.3f} GiB, {time.time() - job.t0:.1f} s -> {out}")
