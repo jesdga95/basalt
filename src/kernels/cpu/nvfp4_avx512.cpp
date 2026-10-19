@@ -14,27 +14,26 @@
 #include <immintrin.h>
 
 #include <cmath>
+#include <bit>
 #include <cstring>
 
 namespace basalt::kernels::cpu {
 namespace {
 
-// UE4M3 scale as ggml's dot decodes it (nvfp4_scale in ggml_cpu_dots.c), one entry per 7-bit code.
+// UE4M3 scale as ggml's dot decodes it (nvfp4_scale in ggml_cpu_dots.c), one entry per 7-bit code.  Built at compile
+// time: this file is compiled for AVX-512, and a static constructor here would run before the CPU is checked.
 struct ScaleLut {
     float v[128];
-    ScaleLut() {
+    constexpr ScaleLut() : v{} {
         for (uint32_t x = 0; x < 128; ++x) {
             const uint32_t e = x >> 3, m = x & 7;
             if (x == 0 || x == 0x7F) v[x] = 0.0f;
             else if (e == 0) v[x] = (float) m * (1.0f / 1024.0f);
-            else {
-                const uint32_t bits = ((e + 119) << 23) | (m << 20);
-                std::memcpy(&v[x], &bits, 4);
-            }
+            else v[x] = std::bit_cast<float>((uint32_t) (((e + 119) << 23) | (m << 20)));
         }
     }
 };
-const ScaleLut kLut;
+constexpr ScaleLut kLut{};
 
 // Largest row the per-token scale buffer covers (values), and the tokens one pass takes.
 constexpr int kMaxN = 16384;
