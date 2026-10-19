@@ -77,7 +77,7 @@ jobs:
         with:
           cuda: ${{ env.CUDA_VERSION }}
           method: network
-          sub-packages: '["nvcc", "cudart", "crt", "cublas_dev", "nvrtc_dev", "visual_studio_integration"]'
+          sub-packages: '["nvcc", "cudart", "crt", "nvvm", "cublas_dev", "nvrtc_dev", "visual_studio_integration"]'
           use-github-cache: true
 
       - name: MSVC environment
@@ -117,14 +117,15 @@ jobs:
 
       - name: Every test carries a cpu or gpu label
         run: |
-          total=$(ctest --test-dir build -N | sed -n 's/^Total Tests: //p')
-          cpu=$(ctest --test-dir build -N -L cpu | sed -n 's/^Total Tests: //p')
-          gpu=$(ctest --test-dir build -N -L gpu | sed -n 's/^Total Tests: //p')
-          echo "total=${total} cpu=${cpu} gpu=${gpu}"
-          if [ "$((cpu + gpu))" -ne "${total}" ]; then
-            echo "a test has no cpu or gpu label (register it with basalt_cpu_test or basalt_gpu_test)" >&2
-            ctest --test-dir build -N | sed -n 's/^  Test *#[0-9]*: //p' | sort > all.txt
-            { ctest --test-dir build -N -L cpu; ctest --test-dir build -N -L gpu; } | sed -n 's/^  Test *#[0-9]*: //p' | sort > labelled.txt
+          names() { sed -n 's/^  Test *#[0-9]*: //p' | sort -u; }
+          ctest --test-dir build -N | names > all.txt
+          ctest --test-dir build -N -L cpu | names > cpu.txt
+          ctest --test-dir build -N -L gpu | names > gpu.txt
+          echo "total=$(wc -l < all.txt) cpu=$(wc -l < cpu.txt) gpu=$(wc -l < gpu.txt)"
+          # a fixture setup test is pulled into a label set by the tests that need it, so the union is what counts
+          sort -u cpu.txt gpu.txt > labelled.txt
+          if [ -n "$(comm -23 all.txt labelled.txt)" ]; then
+            echo "tests with no cpu or gpu label (register them with basalt_cpu_test or basalt_gpu_test):" >&2
             comm -23 all.txt labelled.txt >&2
             exit 1
           fi
