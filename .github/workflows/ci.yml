@@ -77,7 +77,7 @@ jobs:
         with:
           cuda: ${{ env.CUDA_VERSION }}
           method: network
-          sub-packages: '["nvcc", "cudart", "crt", "cccl", "cublas_dev", "nvrtc_dev", "visual_studio_integration"]'
+          sub-packages: '["nvcc", "cudart", "crt", "cublas_dev", "nvrtc_dev", "visual_studio_integration"]'
           use-github-cache: true
 
       - name: MSVC environment
