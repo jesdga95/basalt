@@ -117,6 +117,7 @@ jobs:
 
       - name: Every test carries a cpu or gpu label
         run: |
+          export LC_ALL=C
           names() { sed -n 's/^  Test *#[0-9]*: //p' | sort -u; }
           ctest --test-dir build -N | names > all.txt
           ctest --test-dir build -N -L cpu | names > cpu.txt
