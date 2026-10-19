@@ -41,7 +41,7 @@ class Checkpoint:
         cfg = self.dir / "config.json"
         if not cfg.is_file():
             raise S.ConvertError(f"{cfg} not found")
-        self.config = json.loads(cfg.read_text())
+        self.config = json.loads(cfg.read_text(encoding="utf-8"))
         self.text = self.config.get("text_config", self.config)
         self.files = sorted(self.dir.glob("*.safetensors"))
         self.shards = [p for p in self.files if re.fullmatch(r"model-\d+-of-\d+\.safetensors", p.name)]
@@ -491,7 +491,7 @@ def tokenizer_kv(ck: Checkpoint) -> dict:
         v = v.get("content") if isinstance(v, dict) else v
         return ids.get(v) if v else None
 
-    gen = json.loads((d / "generation_config.json").read_text()) if (d / "generation_config.json").is_file() else {}
+    gen = json.loads((d / "generation_config.json").read_text(encoding="utf-8")) if (d / "generation_config.json").is_file() else {}
     kv = {"tokenizer.ggml.model": "gpt2", "tokenizer.ggml.pre": "qwen35", "tokenizer.ggml.tokens": tokens,
           "tokenizer.ggml.token_type": types, "tokenizer.ggml.merges": merges}
     eos, pad = token_id("eos_token"), token_id("pad_token")
@@ -516,7 +516,7 @@ def model_kv(ck: Checkpoint, ple_dim: int, file_type: int, name: str | None) -> 
         raise S.ConvertError(f"config.json: model_type {tc.get('model_type')}, expected qwen4_exp_text")
     A = "qwen4exp."
     d = ck.dir
-    gen = json.loads((d / "generation_config.json").read_text()) if (d / "generation_config.json").is_file() else {}
+    gen = json.loads((d / "generation_config.json").read_text(encoding="utf-8")) if (d / "generation_config.json").is_file() else {}
     card = front_matter(d / "README.md")
     kinds = tc["layer_types"]
     rope = tc.get("rope_parameters", {})

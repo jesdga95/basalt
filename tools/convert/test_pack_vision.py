@@ -29,8 +29,10 @@ class Pack(unittest.TestCase):
     def test_sections(self):
         with tempfile.TemporaryDirectory() as d:
             mm, shard = os.path.join(d, "mm.gguf"), os.path.join(d, "s1.gguf")
-            open(mm, "wb").write(b"M" * 10)
-            open(shard, "wb").write(gguf(ENTRIES, b"T" * 100, n_tensors=1))
+            with open(mm, "wb") as f:
+                f.write(b"M" * 10)
+            with open(shard, "wb") as f:
+                f.write(gguf(ENTRIES, b"T" * 100, n_tensors=1))
             (n1, b1, p1, o1, z1), (n2, b2, p2, o2, z2) = vision_sections(mm, [shard])
             self.assertEqual((n1, b1, p1, o1, z1), ("vision/mmproj", None, mm, 0, 10))
             self.assertEqual((n2, p2, o2, z2), ("vision/text_vocab", None, 0, len(b2)))
@@ -43,8 +45,10 @@ class Pack(unittest.TestCase):
     def test_no_tokenizer(self):
         with tempfile.TemporaryDirectory() as d:
             mm, shard = os.path.join(d, "mm.gguf"), os.path.join(d, "s1.gguf")
-            open(mm, "wb").write(b"M")
-            open(shard, "wb").write(gguf(ENTRIES[:1]))
+            with open(mm, "wb") as f:
+                f.write(b"M")
+            with open(shard, "wb") as f:
+                f.write(gguf(ENTRIES[:1]))
             with self.assertRaises(ValueError):
                 vision_sections(mm, [shard])
 

@@ -85,7 +85,7 @@ class PieceMemo(unittest.TestCase):
             for t, i in vocab.items():
                 toks[i] = t
             cls.real = (toks, (d / "merges.txt").read_text(encoding="utf-8").split("\n"),
-                        json.loads((d / "token_type.json").read_text()))
+                        json.loads((d / "token_type.json").read_text(encoding="utf-8")))
 
     def check_identical(self, data):
         plain = make(*data, cap=0)          # a full memo: nothing is remembered

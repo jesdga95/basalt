@@ -51,6 +51,7 @@ Sections are listed in include/basalt/core/model_format.hpp. Everything is strea
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import math
@@ -207,6 +208,7 @@ def convert(a) -> None:
     if a.profile and a.profile_from:
         die("give --profile or --profile-from, not both")
 
+    err = None
     try:
         print("reading the source GGUFs ...", flush=True)
         model = S.SourceModel(source_paths(a.gguf))
@@ -233,7 +235,12 @@ def convert(a) -> None:
                                            experts.n_layers, experts.n_expert)
         prof = S.profile_info(profile_blob, experts.n_layers, experts.n_expert)
     except S.ConvertError as e:
-        die(str(e))
+        err = str(e)
+    if err is not None:
+        # Drop every view of the source files so they are unmapped (and deletable) before the process exits.
+        model = dense = experts = mtp = None
+        gc.collect()
+        die(err)
 
     vision_extra = []
     if not a.no_vision and base is None:

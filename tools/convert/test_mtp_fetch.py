@@ -121,7 +121,7 @@ class Ranges(FetchCase):
     def test_fetch_from_an_honest_mirror(self):
         self.fetch(Mirror())
         self.assertEqual((self.tensor("mtp.a"), self.tensor("mtp.b")), (A, B))
-        manifest = json.loads((self.out / "mtp-manifest.json").read_text())
+        manifest = json.loads((self.out / "mtp-manifest.json").read_text(encoding="utf-8"))
         self.assertEqual({r["name"]: r["sha256"] for r in manifest}, HASHES)
         self.assertEqual(M.verify(str(self.out)), [])
 
@@ -142,16 +142,16 @@ class Ranges(FetchCase):
 
     def test_an_inventory_from_another_revision_is_read_again(self):
         self.fetch(Mirror())
-        inv = json.loads((self.out / "mtp-inventory.json").read_text())
+        inv = json.loads((self.out / "mtp-inventory.json").read_text(encoding="utf-8"))
         inv["repo"] = "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/"
         for r in inv["tensors"]:
             r["start"] += 1                        # that revision's ranges: not this one's
             r["end"] += 1
-        (self.out / "mtp-inventory.json").write_text(json.dumps(inv))
+        (self.out / "mtp-inventory.json").write_text(json.dumps(inv), encoding="utf-8")
         (self.out / "tensors" / "mtp.b.bin").write_bytes(B[:10])     # half a tensor from that revision
         mirror = Mirror()
         self.fetch(mirror)
-        self.assertEqual(json.loads((self.out / "mtp-inventory.json").read_text())["repo"], M.REPO)
+        self.assertEqual(json.loads((self.out / "mtp-inventory.json").read_text(encoding="utf-8"))["repo"], M.REPO)
         self.assertEqual((self.tensor("mtp.a"), self.tensor("mtp.b")), (A, B))
         fetched = [r for r in mirror.ranges if r[2] - r[1] + 1 in (len(A), len(B))]
         self.assertEqual(fetched, [("model-2.safetensors",) + Mirror.span("model-2.safetensors", "mtp.b")],
@@ -160,7 +160,7 @@ class Ranges(FetchCase):
     def test_verify_keeps_its_verdict_and_skips_other_revisions(self):
         self.fetch(Mirror())
         self.assertEqual(M.verify(str(self.out)), [])
-        stamps = json.loads((self.out / "tensors" / "verified.json").read_text())
+        stamps = json.loads((self.out / "tensors" / "verified.json").read_text(encoding="utf-8"))
         self.assertEqual(sorted(stamps), ["mtp.a", "mtp.b"])
         with mock.patch.object(M, "sha256_of", side_effect=AssertionError("hashed an unchanged file")):
             self.assertEqual(M.verify(str(self.out)), [])

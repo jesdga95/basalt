@@ -179,7 +179,7 @@ class ConvertTest(unittest.TestCase):
         self.assertIsNone(meta["mtp"])
         lic = meta["license"]
         self.assertEqual(lic["name"], "Qwen Community License 1.0")
-        self.assertEqual(lic["text"], (Path(convert.__file__).parent / "qwen-community-license-1.0.txt").read_text())
+        self.assertEqual(lic["text"], (Path(convert.__file__).parent / "qwen-community-license-1.0.txt").read_text(encoding="utf-8"))
         self.assertEqual(lic["quantized_by"], "Someone")
         self.assertEqual(set(lic), {"name", "text", "quantized_by"})
 
