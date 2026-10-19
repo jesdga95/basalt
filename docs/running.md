@@ -1,6 +1,6 @@
 # Running the server
 
-The long-form notes behind the settings in [configuration.md](configuration.md): concurrent requests, the KV cache, prompt chunks, memory floors and image input.
+The long-form notes behind the settings in [configuration](configuration/index.md): concurrent requests, the KV cache, prompt chunks, memory floors and image input.
 
 ## Concurrent requests: `--parallel N`
 
@@ -51,7 +51,7 @@ the slots that did fit; if fewer than two fit, `--batch is off` and the server r
 - `"relaxed-drafting": 0.3` (or `true` for the default 0.5; `--relaxed-drafting [P]` on the command line) trades
   exactness for speed under sampling: a draft the model gives probability P or more is kept even when the model's own
   draw would have been another token. Lower P is faster and further from the model's true sampling distribution; the
-  measured speed and cost per value are in [docs/precision.md](precision.md#relaxed-drafting). Off by default:
+  measured speed and cost per value are in [precision/features.md](precision/features.md#relaxed-drafting). Off by default:
   without it, speculative decoding returns exactly what plain sampling would. Greedy (temperature 0) requests,
   `logit_bias`, JSON `response_format`, control tokens and everything inside a tool call stay exact. A request can set
   its own value with `"relaxed_drafting": P` (or `false` for exact). Single-stream decoding only; `--parallel` slots

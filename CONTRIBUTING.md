@@ -5,7 +5,7 @@ Basalt is a single-purpose engine: Qwen3.8-Flash-Next on Linux with NVIDIA Black
 ## Scope
 
 - **CUDA on Blackwell (sm_120) only.** No ROCm/HIP, no AMD, no Intel/SYCL/oneAPI, no Apple/Metal, no CPU-only main path (a CPU fallback is fine where the GPU path is the default, like the experts held in RAM or `--vision cpu`), and no older NVIDIA architectures (Hopper sm_90 and earlier). No compatibility layers or `#if` branches for them. Pull requests adding another backend or architecture will be closed.
-- **Linux is the supported target; Windows x64 is community-supported.** The Windows tier promises a build, on one GPU, with no performance claims. Linux changes do not have to be tested on Windows, but must not remove the platform seams (`src/platform/`, CMake `if(WIN32)`) the Windows build hangs off. Windows-only issues get a `windows` label. Headline benchmark numbers stay with the maintainer's Linux runs.
+- **Linux and Windows x64 are both supported; Linux is where we test.** CI compiles and CPU-tests Windows on every pull request. Windows runs on one GPU, with no performance claims, and the Windows limitations are in `docs/platforms.md`. Changes must not remove the platform seams (`src/platform/`, CMake `if(WIN32)`). Windows-only issues get a `windows` label. Headline benchmark numbers stay with the maintainer's Linux runs.
 - **Engine code is platform-neutral.** Outside `src/platform/` and `include/basalt/platform/` there is no `_WIN32`, `_MSC_VER`, `__linux__`, `<windows.h>`, `<sys/mman.h>`, `<unistd.h>` or raw OS call (mmap, madvise, pread, pthread/affinity, fork/exec/pipe, dlopen, /proc or /sys reads). Call the platform layer; when a seam is missing, add it there with a Linux body and a Windows body, the Linux body being the code you would have written anyway, and a test in `tests/platform/` that runs on both. Paths are UTF-8 and go through the platform file calls. `tools/check_platform_boundary.sh` enforces this.
 - **No `.bat` or PowerShell scripts** are added to the tree. A documented build recipe that calls the toolchain's own scripts (`vcvarsall.bat`, say) from a shell is not one.
 - **One fast path.** No per-user tuning flags or alternative kernels selected at run time. A change that wins replaces the old path; a change that doesn't win isn't merged. A/B and diagnostic flags are off by default and are not documented as settings. User-facing settings are limited to model, context, multi-GPU and serving options.
@@ -35,6 +35,7 @@ Basalt is a single-purpose engine: Qwen3.8-Flash-Next on Linux with NVIDIA Black
 - Small, logical commits with the message style `area: what it does`. Each commit must build.
 - Never amend or force-push shared branches; add new commits.
 - No notes, scratch files or generated reports in the repo.
+- Docs: no file over 300 lines; split a longer topic into a folder of files; keep docs short, stateless and free of duplication.
 - A PR description lists: what changed, the parity results, the microbench and `basalt-bench` before/after (with the power limit), and the quality-check result.
 
 ## License

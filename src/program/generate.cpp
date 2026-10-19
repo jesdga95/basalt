@@ -465,7 +465,7 @@ struct Options {
     int spec = 0;
     /// --relaxed-drafting [P]: under sampling, a draft the target gives probability >= P is kept even when the target's
     /// own draw differs (0 = exact; the flag alone = kRelaxedDraftingDefault).  This changes the output distribution:
-    /// docs/precision.md.  Solo decode only; a request's relax=P key overrides it.
+    /// docs/precision/features.md.  Solo decode only; a request's relax=P key overrides it.
     float relaxed_drafting = 0.0f;
     /// Never relaxed: the added tokens (control and tool tags, ids from relax_special_from on) and every token
     /// between the tool-call tags, so tool calls are sampled exactly.
@@ -749,7 +749,7 @@ void usage() {
                  "                       least probability P under the drafter (default 0 = always N-1 drafts)\n"
                  "  --relaxed-drafting [P]  sampled requests keep a draft the target gives probability >= P even when\n"
                  "                       the target's own draw differs: faster, but NOT the exact sampling distribution\n"
-                 "                       (docs/precision.md).  P in (0, 1]; lower is faster and further from exact;\n"
+                 "                       (docs/precision/features.md).  P in (0, 1]; lower is faster and further from exact;\n"
                  "                       the flag alone = 0.5.  Tool calls, control tokens, logit_bias and greedy\n"
                  "                       requests stay exact.  Default off (exact)\n"
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"

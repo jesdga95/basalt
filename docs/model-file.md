@@ -28,7 +28,7 @@ python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPRO
 
 ## Packs
 
-A pack you convert yourself from a GGUF, without the official files' expert profile, hc8 copies and tuned drafter, will be significantly slower than the official `.basalt` files. How precision is handled and how quality is measured: [precision.md](precision.md).
+A pack you convert yourself from a GGUF, without the official files' expert profile, hc8 copies and tuned drafter, will be significantly slower than the official `.basalt` files. How precision is handled and how quality is measured: [precision](precision/index.md).
 
 ## NVFP4 pack
 
@@ -71,4 +71,4 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-UD-Q4_K_XL.basalt --
 ```
 
 The output is about 122 GiB (the 8-bit variant 123 GiB). How NVFP4 is computed on each tier:
-[precision.md](precision.md).
+[precision](precision/index.md).

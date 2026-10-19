@@ -1,7 +1,7 @@
 <p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png"><img src="assets/basalt-lockup-light.png" alt="Basalt" width="480"></picture></p>
 
 Basalt is a local inference engine for the **Qwen3.8-Flash-Next** mixture-of-experts model.
-It runs on Linux with an NVIDIA Blackwell GPU (sm_120); Windows x64 is [community-supported](docs/WINDOWS.md).
+It runs on Linux and Windows with an NVIDIA Blackwell GPU (sm_120); see [platforms](docs/platforms.md) for limitations.
 
 Experts that do not fit in VRAM live in system RAM, and optionally on a second GPU used as a peer expert tier.
 A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compatible API.
@@ -50,11 +50,11 @@ A model is one file: weights, tokenizer, MTP drafter, expert profile and vision 
 
 ## Docs
 
-- [Configuration](docs/configuration.md): every setting.
+- [Configuration](docs/configuration/index.md): every setting.
 - [Running](docs/running.md): parallel requests, prompt chunks, memory floors, image input.
 - [The .basalt model file](docs/model-file.md): the layout, and building a pack yourself (including NVFP4).
-- [Windows x64](docs/WINDOWS.md): the community-supported build, its recipe and its caveats.
-- [Building and testing](docs/building.md), [Precision and quality](docs/precision.md), [Contributing](CONTRIBUTING.md).
+- [Platforms](docs/platforms.md): Linux and Windows requirements, the build steps and the Windows limitations.
+- [Building and testing](docs/building.md), [Precision and quality](docs/precision/index.md), [Contributing](CONTRIBUTING.md).
 
 ## Credits
 

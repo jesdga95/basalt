@@ -2,7 +2,7 @@
 
 Every setting a user can pass to Basalt: the server options, the engine flags, the per-request sampling fields and
 the model file's sampling defaults. For what a setting does to speed, memory and output precision see the
-[running.md](running.md) and [precision.md](precision.md).
+[running](../running.md) and [precision](../precision/index.md).
 
 - [How settings are given](#how-settings-are-given)
 - [Server](#server)
@@ -17,7 +17,7 @@ the model file's sampling defaults. For what a setting does to speed, memory and
 - [Logging and diagnostics](#logging-and-diagnostics)
 - [Control vectors](#control-vectors)
 - [Sampling](#sampling)
-- [Example configurations](#example-configurations)
+- [Example configurations](examples.md)
 
 ## How settings are given
 
@@ -107,7 +107,7 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
 | `max-context` | engine | integer tokens | 4096 | The longest context the engine allows. Raise it for long prompts; the KV cache grows with it. With `parallel`, this is shared by the slots. |
-| `kv` | engine | `fp16`, `int8`, `q4_0`, `k8v4` | `fp16` | KV storage. `int8` halves the VRAM. `q4_0` is 4-bit after a Hadamard rotation, half of `int8` again, slightly lower precision. `k8v4` keeps K in int8 and V in rotated 4-bit (816 B per cell against `int8`'s 1056); not with `kv-resident`. Use `int8` for long contexts; go lower when VRAM is short. See [precision.md](precision.md). |
+| `kv` | engine | `fp16`, `int8`, `q4_0`, `k8v4` | `fp16` | KV storage. `int8` halves the VRAM. `q4_0` is 4-bit after a Hadamard rotation, half of `int8` again, slightly lower precision. `k8v4` keeps K in int8 and V in rotated 4-bit (816 B per cell against `int8`'s 1056); not with `kv-resident`. Use `int8` for long contexts; go lower when VRAM is short. See [precision](../precision/index.md). |
 | `kv-resident` | engine | integer cells, minimum 20480, or `0` | 0 (all KV in VRAM) | Keep only this many cells of each attention layer's KV in VRAM and the whole K/V in pinned RAM; the freed VRAM goes to expert slots. A context that fits in N cells is not streamed. For very long contexts on a small card. |
 | `rope-scaling` | engine | `none`, `linear`, `yarn` | the model file's, else `none` | Extend the context past the trained length. Fixed for the run: K in the cache is stored after RoPE. |
 | `rope-scale` | engine | number | the model file's, else 1 | The extension factor for `linear` and `yarn`. |
@@ -117,7 +117,7 @@ Server options. Command line `--name`, config `server` block `"name"`.
 
 A server with `max-context` above 32768 has an elastic KV cache: each session backs its first 32768 cells at startup and
 takes more from the expert cache only when a request needs it. It is off when the model is split over GPUs with
-`layer-split` (a peer card is fine) and with `kv-resident` or `vram-elastic`. See [running.md](running.md#concurrent-requests---parallel-n).
+`layer-split` (a peer card is fine) and with `kv-resident` or `vram-elastic`. See [running](../running.md#concurrent-requests---parallel-n).
 
 ## Expert cache and memory
 
@@ -157,7 +157,7 @@ each round every count is multiplied by `adapt-decay`, so recent routing outweig
 1 / (1 - decay) times the routing per round, so the decay sets how long the tier remembers: 0.93 is roughly the last 14
 rounds, 0.85 the last 7. Copies run on a side stream and land a few windows later; a window can wait for a landing while the tier is adapting. With `adapt-every 0` or `adapt-swaps 0`
 the tiers stay as loaded (`expert-profile-save` then has nothing to learn). Adaptation moves experts between the CPU and
-the GPUs, so output is not bit-identical from run to run; see [precision.md](precision.md).
+the GPUs, so output is not bit-identical from run to run; see [precision](../precision/index.md).
 
 A tuning note: on the NVIDIA NVFP4 pack (6-bit dense) with an RTX 5090 and an RTX 5060 Ti as the peer, both at a 400 W
 power limit, `--adapt-every 1 --adapt-decay 0.85` measured prose right after a topic switch 233.2 to 241.5 tok/s
@@ -166,7 +166,7 @@ processes per arm. A longer memory (`adapt-decay` 0.97 and up) looked 3 to 6% sl
 3% run-to-run noise).
 
 The startup lines `RAM floor ...` and `RAM ... free, guard ...` give the figures behind the memory floors. See the
-[running.md](running.md#memory-floors).
+[running](../running.md#memory-floors).
 
 ## Prefill
 
@@ -187,7 +187,7 @@ plain decoding would give.
 | `spec-min-p` | engine | number 0..1 | 0 (always draft to the cap; not set by the model file) | The drafter's cutoff: a draft enters the window only while it, and every draft before it, has at least this probability under the drafter. Higher values draft fewer, surer tokens. This is not the sampling `min_p` below. |
 | `mtp-max-t` | engine | integer | 0 (= `spec`) | Cap on the drafter's own window; longer windows then come from `suffix-draft` matches. |
 | `suffix-draft` | engine | integer tokens | 3 (`0` = drafter only) | Draft from an earlier repeat of the last N or more tokens of context (code edits, quoted text, tool-call JSON) when that is likelier to pay than the drafter. |
-| `relaxed-drafting` | engine (`[P]`) | `true`, or a number in (0, 1] | off | Optional, and it changes output. Under sampling, a draft the model gives probability P or more is kept even when the model's own draw would have been another token. Faster, but no longer the model's exact sampling distribution; lower P is faster and further from exact. Bare `true` or flag alone is 0.5. Greedy requests, `logit_bias`, JSON `response_format`, control tokens and tool calls stay exact. Single-stream only. Numbers: [precision.md](precision.md#relaxed-drafting). |
+| `relaxed-drafting` | engine (`[P]`) | `true`, or a number in (0, 1] | off | Optional, and it changes output. Under sampling, a draft the model gives probability P or more is kept even when the model's own draw would have been another token. Faster, but no longer the model's exact sampling distribution; lower P is faster and further from exact. Bare `true` or flag alone is 0.5. Greedy requests, `logit_bias`, JSON `response_format`, control tokens and tool calls stay exact. Single-stream only. Numbers: [precision](../precision/features.md#relaxed-drafting). |
 
 ## Parallel slots
 
@@ -213,7 +213,7 @@ plain decoding would give.
 
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
-| `vision` | server | `off`, `on`, `peer`, `dynamic`, `cpu` | `off` | Image input; booleans are refused. `on`: encoder sidecar on the main GPU (about 2.2 GiB of expert cache). `peer`: the sidecar on the second `gpu` card. `dynamic`: inside the engine, borrowing expert-cache slots only while it reads an image. `cpu`: sidecar on the CPU, no VRAM, slow. Latencies: [running.md](running.md#vision---vision). `on` and `peer` need the `basalt-vision` binary next to `bin/basalt`. Needs a model file with a vision projector. |
+| `vision` | server | `off`, `on`, `peer`, `dynamic`, `cpu` | `off` | Image input; booleans are refused. `on`: encoder sidecar on the main GPU (about 2.2 GiB of expert cache). `peer`: the sidecar on the second `gpu` card. `dynamic`: inside the engine, borrowing expert-cache slots only while it reads an image. `cpu`: sidecar on the CPU, no VRAM, slow. Latencies: [running](../running.md#vision---vision). `on` and `peer` need the `basalt-vision` binary next to `bin/basalt`. Needs a model file with a vision projector. |
 
 ## Logging and diagnostics
 
@@ -227,7 +227,7 @@ plain decoding would give.
 | `draft-log` | engine | file path | off | Diagnostic: one line per decode window, for studying draft policy. |
 | `stop-eos` | engine | switch | off | Stop when the model emits an end-of-turn token; the server handles stopping itself. |
 | `eos-ids` | engine | comma-separated token ids | 248044,248046 | The end-of-turn tokens `stop-eos` looks for. Setting it implies `stop-eos`. |
-| `exp` | engine | `NAME=VALUE[,...]` | none | Diagnostics. `concur9_logit_hash=1` prints a hash of each accepted row's logits on stderr, for the identity checks in [precision.md](precision.md#reproduce). |
+| `exp` | engine | `NAME=VALUE[,...]` | none | Diagnostics. `concur9_logit_hash=1` prints a hash of each accepted row's logits on stderr, for the identity checks in [precision](../precision/builds.md#reproduce). |
 
 ## Control vectors
 
@@ -287,88 +287,3 @@ A bad value stops the server at startup; an unknown key is named in a warning an
 are printed at startup as `[server] sampling defaults: ...`, each marked `(command line)` or `(config)` when a launch
 option set it and unmarked when it comes from the model file. A launch option overrides the model file's value for
 that key; the others stay.
-
-## Example configurations
-
-The model path is relative to the config file. Start the server with `bin/basalt serve --config basalt_config.json`.
-
-### One GPU (32 GB) and RAM
-
-The experts the card cannot hold stay in page-locked RAM.
-
-```json
-{
-  "server": {
-    "model": "model.basalt",
-    "gpu": "0",
-    "host": "127.0.0.1",
-    "port": 8080
-  },
-  "engine": {
-    "expert-cache": "auto",
-    "prefill": "auto",
-    "spec": 7,
-    "spec-min-p": 0.5,
-    "max-context": 262144,
-    "kv": "int8",
-    "resident-experts": true,
-    "vram-reserve-mib": 700
-  }
-}
-```
-
-### A GPU and a second, smaller card as the peer expert tier
-
-Listing two cards makes the second one the peer tier. `vision: peer` puts the image encoder there too, and
-`peer-exclusive` keeps the peer's experts out of RAM.
-
-```json
-{
-  "server": {
-    "model": "model.basalt",
-    "gpu": "0,1",
-    "host": "127.0.0.1",
-    "port": 8080,
-    "vision": "peer"
-  },
-  "engine": {
-    "expert-cache": "auto",
-    "prefill": "auto",
-    "spec": 7,
-    "spec-min-p": 0.5,
-    "max-context": 262144,
-    "kv": "int8",
-    "resident-experts": true,
-    "peer-exclusive": true,
-    "vram-reserve-mib": 700
-  }
-}
-```
-
-### A low-VRAM card
-
-A smaller KV format and a shorter context leave more VRAM for experts; the rest stay in RAM.
-
-```json
-{
-  "server": {
-    "model": "model.basalt",
-    "gpu": "0",
-    "host": "127.0.0.1",
-    "port": 8080
-  },
-  "engine": {
-    "expert-cache": "auto",
-    "prefill": "auto",
-    "spec": 5,
-    "spec-min-p": 0.5,
-    "max-context": 65536,
-    "kv": "q4_0",
-    "resident-experts": true,
-    "vram-reserve-mib": 1024
-  }
-}
-```
-
-Optional on any of them: `"relaxed-drafting": 0.5` in `engine` trades exactness under sampling for speed (see
-[Speculative decoding](#speculative-decoding-mtp)).
