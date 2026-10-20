@@ -328,8 +328,10 @@ def hadamard_text(meta: dict, layout, n_embd: int, n_ff: int):
     for l, r in enumerate(roles):
         if bool(r & 1) != bool(r & 2):
             raise ConvertError("layer %d: prism.hadamard folds only one of gate/up (they share one input)" % l)
-        if (r & 3 and layout[l][1] == 42) or (r & 4 and layout[l][2] == 42):
-            raise ConvertError("layer %d: a Hadamard-folded Q2_0 expert (the engine's Q2_0 rows cannot rotate)" % l)
+        bad = [t for t, on in ((layout[l][1], r & 3), (layout[l][2], r & 4)) if on and not 144 <= t <= 149]
+        if bad:
+            raise ConvertError("layer %d: a Hadamard-folded expert of type %d (the engine rotates the inputs of the "
+                               "trellis types 144-149 only)" % (l, bad[0]))
     widths = {n_embd for r in roles if r & 3} | {n_ff for r in roles if r & 4}
     if any(w % block for w in widths):
         raise ConvertError("prism.hadamard block %d does not divide the expert widths %s" % (block, sorted(widths)))

@@ -1,6 +1,7 @@
 // src/kernels/cpu/expert_layout.cpp - the per-layer expert table.  See the header.
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/cpu/hadamard.hpp"
+#include "basalt/kernels/cpu/tq_cpu.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -218,9 +219,11 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
                   "'s expert widths";
             return false;
         }
-        // the Q2_0 rows quantize their activations with act_quant_any, which does not rotate
-        if ((f.had_gu && f.gu_type == 42) || (f.had_d && f.d_type == 42)) {
-            err = "experts.hadamard: layer " + std::to_string(l) + " folds a Q2_0 expert, which this engine cannot rotate";
+        // only the trellis types: the Q2_0 rows and the prompt path's MMQ and FP4 kernels quantize unrotated inputs
+        if ((f.had_gu && !tq_supported(f.gu_type)) || (f.had_d && !tq_supported(f.d_type))) {
+            err = "experts.hadamard: layer " + std::to_string(l) + " folds an expert of type " +
+                  std::to_string(f.had_gu && !tq_supported(f.gu_type) ? f.gu_type : f.d_type) +
+                  "; this engine rotates the inputs of the trellis types only";
             return false;
         }
         f.gu_signs = f.had_gu ? hadamard_signs((int) f.n_embd) : nullptr;
