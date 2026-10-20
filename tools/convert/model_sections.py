@@ -2,6 +2,7 @@
 
   dense / dense.index       float tensors in the form the engine reads, and the table of every non-expert tensor
   experts / experts.layout  per layer, n_expert blobs of [gate | up | down] rows, and where each layer starts
+  experts.hadamard          which layers' experts are Hadamard-folded and their sign vectors (prism.hadamard only)
   mtp/dense, mtp/dense.index, mtp/experts  the draft layer from the BF16 `mtp.*` tensors (tools/convert/mtp_fetch.py)
   profile                   the expert ranking from routing traces or an existing profile
 
@@ -286,6 +287,76 @@ class Dense:
 
 
 # ------------------------------------------------------------------ experts
+HADAMARD_ROLE = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
+
+
+def hadamard_text(meta: dict, layout, n_embd: int, n_ff: int):
+    """prism.hadamard.* (routed experts stored in a block-Hadamard-rotated basis; the engine rotates their input
+        activations, include/basalt/kernels/cpu/hadamard.hpp) -> the `experts.hadamard` section's text, or None for a
+        model without the metadata.  Anything the engine cannot apply is refused: a folded weight run on unrotated
+        activations computes plausible garbage."""
+    if "prism.hadamard.version" not in meta:
+        return None
+    if int(meta["prism.hadamard.version"]) != 1:
+        raise ConvertError("unsupported prism.hadamard.version %s" % meta["prism.hadamard.version"])
+    block = int(meta.get("prism.hadamard.block_size", 0))
+    if block < 32 or block > 1024 or block & (block - 1):
+        raise ConvertError("prism.hadamard.block_size %r is not a power of two in [32, 1024]" % block)
+    if meta.get("prism.hadamard.transform") != "normalized-sylvester-walsh-hadamard":
+        raise ConvertError("unsupported prism.hadamard.transform %r" % meta.get("prism.hadamard.transform"))
+    if meta.get("prism.hadamard.axis") != "input-last-dimension":
+        raise ConvertError("unsupported prism.hadamard.axis %r" % meta.get("prism.hadamard.axis"))
+    mode = meta.get("prism.hadamard.sign_mode")
+    if mode not in ("identity", "explicit"):
+        raise ConvertError("unsupported prism.hadamard.sign_mode %r" % mode)
+    if meta.get("prism.hadamard.inverse_weight_names"):
+        raise ConvertError("prism.hadamard.inverse_weight_names (a rotated token embedding) is not supported: %s"
+                           % ", ".join(meta["prism.hadamard.inverse_weight_names"][:4]))
+    names = meta.get("prism.hadamard.weight_names") or []
+    if not names:
+        raise ConvertError("prism.hadamard.weight_names is empty")
+    roles = [0] * len(layout)
+    for name in names:
+        m = HADAMARD_ROLE.match(name)
+        if not m or int(m.group(1)) >= len(layout):
+            raise ConvertError("prism.hadamard folds %s; the engine rotates the routed experts' inputs only "
+                               "(blk.N.ffn_{gate,up,down}_exps)" % name)
+        bit = {"gate": 1, "up": 2, "down": 4}[m.group(2)]
+        if roles[int(m.group(1))] & bit:
+            raise ConvertError("duplicate prism.hadamard weight %s" % name)
+        roles[int(m.group(1))] |= bit
+    for l, r in enumerate(roles):
+        if bool(r & 1) != bool(r & 2):
+            raise ConvertError("layer %d: prism.hadamard folds only one of gate/up (they share one input)" % l)
+        if (r & 3 and layout[l][1] == 42) or (r & 4 and layout[l][2] == 42):
+            raise ConvertError("layer %d: a Hadamard-folded Q2_0 expert (the engine's Q2_0 rows cannot rotate)" % l)
+    widths = {n_embd for r in roles if r & 3} | {n_ff for r in roles if r & 4}
+    if any(w % block for w in widths):
+        raise ConvertError("prism.hadamard block %d does not divide the expert widths %s" % (block, sorted(widths)))
+    lines = ["# basalt hadamard v1: prism.hadamard (normalized-sylvester-walsh-hadamard, input-last-dimension, "
+             "sign_mode %s)" % mode, "block %d" % block]
+    if mode == "explicit":
+        sw = [int(w) for w in meta.get("prism.hadamard.sign_widths") or []]
+        sv = [int(v) for v in meta.get("prism.hadamard.sign_values") or []]
+        if not sw or sum(sw) != len(sv) or any(w <= 0 or w % block for w in sw) or len(set(sw)) != len(sw):
+            raise ConvertError("prism.hadamard sign_widths / sign_values are inconsistent")
+        if any(v not in (1, -1) for v in sv):
+            raise ConvertError("prism.hadamard sign values must be +1/-1")
+        at, table = 0, {}
+        for w in sw:
+            table[w] = sv[at:at + w]
+            at += w
+        missing = sorted(widths - set(table))
+        if missing:
+            raise ConvertError("prism.hadamard has no sign vector for width(s) %s" % missing)
+        for w in sorted(table):
+            lines.append("signs %d %s" % (w, " ".join(str(v) for v in table[w])))
+    for l, r in enumerate(roles):
+        if r:
+            lines.append("layer %d %d %d %d" % (l, r & 1, (r >> 1) & 1, (r >> 2) & 1))
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 class Experts:
     """The `experts` section and its `experts.layout`; each role is resolved by name in the shard that holds it."""
 
@@ -316,10 +387,17 @@ class Experts:
             self.layout.append((l, ts[0].type_id, ts[2].type_id, offset, blob, names))
             offset += blob * self.n_expert
         self.total = offset
+        meta = {}
+        for g in model.files:
+            for k, v in g.metadata.items():
+                meta.setdefault(k, v)
+        t0 = [T[n] for n in self.layout[0][5]]
+        # `experts.hadamard`: Hadamard-folded experts (v7 layout), None for every other model
+        self.hadamard = hadamard_text(meta, self.layout, int(t0[0].shape[0]), int(t0[2].shape[0]))
 
     def layout_text(self) -> bytes:
-        head = ("# experts v5: layer gu_type d_type offset blob_bytes (n_expert %d, total %d)\n"
-                % (self.n_expert, self.total))
+        head = ("# experts v%d: layer gu_type d_type offset blob_bytes (n_expert %d, total %d)\n"
+                % (7 if self.hadamard is not None else 5, self.n_expert, self.total))
         return (head + "".join("%d %d %d %d %d\n" % (l, gt, dt, off, blob)
                                for l, gt, dt, off, blob, _ in self.layout)).encode("utf-8")
 
