@@ -17,6 +17,7 @@
 
 #include "tq_states.hpp"
 
+#include <cstring>
 #include <immintrin.h>
 
 namespace basalt::kernels::cpu::tq_detail {
@@ -105,16 +106,21 @@ inline __m512i tqp_state_shifts(int j0) {
     return _mm512_set1_epi64((long long) q);
 }
 
-// eight table entries into one YMM: broadcast loads blended in (no gather: slow on Zen)
+// eight table entries into one YMM: broadcast loads blended in (no gather: slow on Zen); the indices two per load
 inline __m256i points8(const int* cb, const uint32_t* p) {
-    __m256i v = _mm256_set1_epi32(cb[p[0]]);
-    v = _mm256_blend_epi32(v, _mm256_set1_epi32(cb[p[1]]), 0x02);
-    v = _mm256_blend_epi32(v, _mm256_set1_epi32(cb[p[2]]), 0x04);
-    v = _mm256_blend_epi32(v, _mm256_set1_epi32(cb[p[3]]), 0x08);
-    v = _mm256_blend_epi32(v, _mm256_set1_epi32(cb[p[4]]), 0x10);
-    v = _mm256_blend_epi32(v, _mm256_set1_epi32(cb[p[5]]), 0x20);
-    v = _mm256_blend_epi32(v, _mm256_set1_epi32(cb[p[6]]), 0x40);
-    return _mm256_blend_epi32(v, _mm256_set1_epi32(cb[p[7]]), 0x80);
+    uint64_t i01, i23, i45, i67;
+    std::memcpy(&i01, p + 0, 8);
+    std::memcpy(&i23, p + 2, 8);
+    std::memcpy(&i45, p + 4, 8);
+    std::memcpy(&i67, p + 6, 8);
+    __m256i v = _mm256_set1_epi32(cb[(uint32_t) i01]);
+    v = _mm256_blend_epi32(v, _mm256_set1_epi32(cb[i01 >> 32]), 0x02);
+    v = _mm256_blend_epi32(v, _mm256_set1_epi32(cb[(uint32_t) i23]), 0x04);
+    v = _mm256_blend_epi32(v, _mm256_set1_epi32(cb[i23 >> 32]), 0x08);
+    v = _mm256_blend_epi32(v, _mm256_set1_epi32(cb[(uint32_t) i45]), 0x10);
+    v = _mm256_blend_epi32(v, _mm256_set1_epi32(cb[i45 >> 32]), 0x20);
+    v = _mm256_blend_epi32(v, _mm256_set1_epi32(cb[(uint32_t) i67]), 0x40);
+    return _mm256_blend_epi32(v, _mm256_set1_epi32(cb[i67 >> 32]), 0x80);
 }
 
 template <int K>
