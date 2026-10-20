@@ -36,6 +36,7 @@
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/cpu/tq_cpu.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/dec_moe.hpp"
@@ -488,7 +489,7 @@ struct Options {
     int64_t mtp_window = 32768;   ///< the draft layer attends to the last N cells (0 = every cell)
     /// The share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the pinned arena while the
     /// CPU computes the rest (verify windows).
-    double pcie_frac = -1.0;   ///< < 0: the default (0.55), scaled down on a slow link
+    double pcie_frac = -1.0;   ///< < 0: the default (0.55, 0.65 for trellis experts), scaled down on a slow link
     std::string pcie_mode = "auto";   ///< auto | dma | kernel | direct
     /// Every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into the VRAM tier in
     /// place of the least-routed resident ones (decayed counts).  0 = static residency.
@@ -799,8 +800,9 @@ void usage() {
                  "  --vram-reserve-mib N  VRAM left free on the primary GPU for graphs, scratch and the head when\n"
                  "                       --expert-cache auto sizes the tier (default 700; at least 256)\n"
                  "  --pcie-frac F        the share (0..1) of each layer's missed experts the GPU reads over PCIe from\n"
-                 "                       the pinned RAM copy while the CPU computes the rest (default 0.55, scaled\n"
-                 "                       down on a slow link; 0 keeps every miss on the CPU)\n"
+                 "                       the pinned RAM copy while the CPU computes the rest (default 0.55, 0.65\n"
+                 "                       for trellis experts, scaled down on a slow link; 0 keeps every miss on the\n"
+                 "                       CPU)\n"
                  "  --pcie-mode auto|dma|kernel|direct  how that share reaches the GPU: dma = copy engine into staging,\n"
                  "                       kernel = a copy kernel inside the graph, direct = the grouped kernel reads the\n"
                  "                       mapped arena; auto (default) = kernel\n"
@@ -1276,6 +1278,15 @@ double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
 // x16 share costs.  Continuous, so a reading near either edge does not move the share by a large part of its range.
 double pcie_frac_for_gbps(double gbps, double base) {
     return gbps <= 0.0 ? base : base * std::min(1.0, gbps / 20.0);
+}
+
+// The share for a link of 20 GB/s or more: the link's throughput against the CPU pool's.  The trellis experts' CPU
+// rows cost more per byte than the i-quants' (their decode is bound by the cores, not by memory), so the link takes a
+// larger share of their misses.
+double pcie_base_share() {
+    for (const auto& f : basalt::kernels::cpu::expert_layout().fmt)
+        if (basalt::kernels::cpu::tq_supported(f.gu_type) || basalt::kernels::cpu::tq_supported(f.d_type)) return 0.65;
+    return 0.55;
 }
 
 }  // namespace
@@ -1977,10 +1988,12 @@ int main(int argc, char** argv) {
     // windows only (--spec) and its dense projections, head and embedding come from the source tensors.
     {
         const basalt::core::ModelGeometry g0;
-        std::vector<uint8_t> text;
+        std::vector<uint8_t> text, had;
         bool layout_ok = basalt::core::read_range(srcs.experts_layout, text, err) &&
+                         (srcs.experts_hadamard.empty() || basalt::core::read_range(srcs.experts_hadamard, had, err)) &&
                          basalt::kernels::cpu::expert_layout_load_text(std::string(text.begin(), text.end()), g0.n_layers,
-                                                                       g0.n_expert, err);
+                                                                       g0.n_expert, err,
+                                                                       std::string(had.begin(), had.end()));
         if (!layout_ok) {
             return fatal_start_error(err);
         }
@@ -2044,7 +2057,7 @@ int main(int argc, char** argv) {
     // slower link it must shrink or the window waits for it.  The real H2D bandwidth is probed once; from 20 GB/s up
     // the default stays.
     if (o.pcie_frac < 0.0) {
-        const double base = 0.55;
+        const double base = pcie_base_share();
         std::string bursts;
         const double bw = probe_pcie_h2d_gbps(&bursts);
         if (bw > 0.0) {
@@ -2745,7 +2758,7 @@ int main(int argc, char** argv) {
         if (!pcie_given) {
             std::string bursts;
             const double bw = probe_pcie_h2d_gbps(&bursts);
-            if (bw > 0.0) st.pcie_frac = pcie_frac_for_gbps(bw, 0.55);
+            if (bw > 0.0) st.pcie_frac = pcie_frac_for_gbps(bw, pcie_base_share());
             std::fprintf(stderr, "basalt generate: layer split: CUDA%d PCIe probe %.1f GB/s (best of %s) -> pcie_frac "
                                  "%.2f\n", st.dev, bw, bursts.c_str(), st.pcie_frac);
         }

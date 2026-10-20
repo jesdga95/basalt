@@ -486,6 +486,9 @@ struct Prefill::Impl {
     size_t grp_n = 0, grp_tk = 0;        // int32s allocated; T_max * K (the offset of slot, and of src past it)
     uint16_t* dq_gu[DQ] = {};
     uint16_t* dq_d[DQ] = {};
+    // Hadamard-folded experts: per layer, this device's gate/up (n_embd) and down (n_ff) sign vectors, resolved in
+    // init so a prompt chunk reads a pointer
+    std::vector<const float*> had_sx, had_sh;
     uint8_t* stage_dev[RING_MAX] = {};
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
     std::unique_ptr<Stager> stager;          // the unpinned experts' host copies
@@ -783,6 +786,20 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         err = "prefill: geometry differs from the artifact's"; return false;
     }
     cudaGetDevice(&m.device);
+    {
+        const auto& lay = basalt::kernels::cpu::expert_layout();
+        m.had_sx.assign(lay.native ? lay.fmt.size() : 0, nullptr);
+        m.had_sh.assign(m.had_sx.size(), nullptr);
+        for (size_t l = 0; l < m.had_sx.size(); ++l) {
+            const auto& f = lay.fmt[l];
+            if ((f.had_gu || f.had_d) && (f.n_embd != N || f.n_ff != 640)) {
+                err = "prefill: layer " + std::to_string(l) + "'s folded experts are not " + std::to_string(N) + " x 640";
+                return false;
+            }
+            m.had_sx[l] = basalt::kernels::native_expert_gu_signs(f);
+            m.had_sh[l] = basalt::kernels::native_expert_layout(f).d_signs;
+        }
+    }
     if (stage_le_ < 0) stage_le_ = g.n_layers;
     if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers || (stage_le_ < g.n_layers) != (next_ != nullptr)) {
         err = "prefill: the stage's layer range is wrong";
@@ -2135,6 +2152,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                         } else {
                             gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
+                            // Hadamard-folded gate/up take H (s * x); Xs is this layer's private gathered copy
+                            if (lay.native && lay.fmt[(size_t) l].had_gu)
+                                basalt::kernels::hadamard_rows_f16(m.Xs, T * K, N, lay.fmt[(size_t) l].had_block,
+                                                                   m.had_sx[(size_t) l], m.cs);
                         }
                         // multi-GPU: the peer's share, enqueued before the primary's own experts so both cards work at once
                         peer_now = use_mmq && !order_peer.empty();
@@ -2459,6 +2480,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
                             m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
                             swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
+                            if (lay.native && lay.fmt[(size_t) l].had_d)   // folded down weights take H (s * h)
+                                basalt::kernels::hadamard_rows_f16(m.Hh + o0 * 640, ne, 640, lay.fmt[(size_t) l].had_block,
+                                                                   m.had_sh[(size_t) l], m.cs);
                             m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
                             return true;
                         };

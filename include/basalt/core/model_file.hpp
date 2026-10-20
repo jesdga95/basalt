@@ -114,7 +114,7 @@ private:
 
 /// Where each loader reads from: the sections of the .basalt.
 struct ModelSources {
-    FileRange dense, dense_index, experts, experts_layout, profile, hc8;
+    FileRange dense, dense_index, experts, experts_layout, experts_hadamard, profile, hc8;
     FileRange mtp_dense, mtp_dense_index, mtp_experts, mtp_draft_vocab;
     /// The file that serves the source GGUF tensors and metadata when they come from a .basalt, else empty.
     std::string model_path;

@@ -59,8 +59,12 @@ void act_quant_any(const float* x, int n, ActQ& a);
 const ExpertLayout& expert_layout();
 /// Loads the layout from its text (the model's `experts.layout` section: "# experts vN: ..." then one line per layer,
 /// `layer gu_type d_type offset blob_bytes`; further columns are ignored).  A newer version is refused.
-bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err);
-/// The newest layout version this engine reads.
-inline constexpr int kExpertLayoutVersion = 6;   // v6: NVFP4 blobs end in a 16-byte scale tail
+/// `hadamard`: the `experts.hadamard` section's text (hadamard.hpp), empty when the model has none; a v7 layout
+/// requires it and an older one refuses it, so folded experts never run on unrotated activations.
+bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err,
+                             const std::string& hadamard = std::string());
+/// The newest layout version this engine reads.  v6: NVFP4 blobs end in a 16-byte scale tail.  v7: the experts
+/// are Hadamard-folded (the `experts.hadamard` section), written only for such models.
+inline constexpr int kExpertLayoutVersion = 7;
 
 }  // namespace basalt::kernels::cpu

@@ -10,7 +10,8 @@ The layout diagram is in the [README](../README.md#models).
   size and SHA-256), then the sections, each aligned to 2 MiB so it can be memory-mapped or read with `O_DIRECT`.
 - **Sections:** `meta` (JSON: geometry, the source GGUF metadata, every tensor's type, shape and offset,
   sampling, provenance and license), `tokenizer/*`, `dense`, `experts` and `experts.layout` (the routed
-  experts, laid out per layer), `gguf` (every non-expert source tensor), `mtp/*` (the drafter), `profile`, `hc8` and
+  experts, laid out per layer), `experts.hadamard` (Hadamard-folded experts only: which layers are folded and with
+  what signs), `gguf` (every non-expert source tensor), `mtp/*` (the drafter), `profile`, `hc8` and
   `vision/*`. The authoritative description is [include/basalt/core/model_format.hpp](../include/basalt/core/model_format.hpp).
 - **Weights as published:** a pack built from a GGUF copies every tensor byte for byte, except with `--compat-bf16`,
   for GGUFs that store the small projections the engine reads as BF16 in another type (it converts them and records

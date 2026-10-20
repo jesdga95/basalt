@@ -826,7 +826,8 @@ if(BUILD_TESTING)
 endif()
 
 add_library(kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/cpu_quota.cpp src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
+            src/kernels/cpu/cpu_quota.cpp src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp
+            src/kernels/cpu/hadamard.cpp)
 target_include_directories(kernels_cpu PUBLIC include)
 # only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
@@ -863,7 +864,11 @@ target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels
                                          src/kernels/cpu/nvfp4_avx2.cpp
                                          src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
                                          src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/ggml/ggml_cpu_dispatch.cpp
+                                         src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp
                                          $<TARGET_OBJECTS:ggml_dots_avx2> $<TARGET_OBJECTS:ggml_dots_avx512>)
+# the APR trellis experts' CPU kernels (tq_cpu.hpp): tq_cpu.cpp runs on any x86-64 and picks one at run time
+set_source_files_properties(src/kernels/cpu/tq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+set_source_files_properties(src/kernels/cpu/tq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx512_flags}")
 set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
                             "${_isa_avx512_flags}")
 set_source_files_properties(src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS
@@ -973,6 +978,14 @@ endif()
 add_executable(native_expert_parity src/kernels/native_expert_parity.cpp)
 target_include_directories(native_expert_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(native_expert_parity PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})
+# the APR trellis experts and their Hadamard fold: CPU and GPU paths against a float reference (--bench: timings)
+add_executable(tq_expert_parity src/kernels/tq_expert_parity.cpp)
+target_include_directories(tq_expert_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(tq_expert_parity PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})
+if(BUILD_TESTING)
+  basalt_gpu_test(NAME tq_expert_parity COMMAND tq_expert_parity)
+  set_tests_properties(tq_expert_parity PROPERTIES TIMEOUT 300)
+endif()
 add_executable(native_expert_bench src/kernels/native_expert_bench.cpp)
 target_include_directories(native_expert_bench PRIVATE ${_gpu_include_directories})
 target_link_libraries(native_expert_bench PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})

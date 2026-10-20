@@ -487,6 +487,7 @@ bool Verifier::dm_init(std::string& err) {
     for (int64_t l = 0; why == nullptr && l < g.n_layers; ++l) {
         const auto& f = lay.fmt[(size_t) l];
         if (!dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff)) why = "an expert format the kernels do not cover";
+        else if (f.had_gu || f.had_d) why = "Hadamard-folded experts";
     }
     if (why != nullptr) {
         std::fprintf(stderr, "basalt verify: the device-planned MoE tail is off: %s\n", why);
@@ -544,7 +545,7 @@ bool Verifier::dm_init(std::string& err) {
         std::vector<NativeExpertLayout> ls((size_t) g.n_layers);
         for (int64_t l = 0; l < g.n_layers; ++l) {
             const auto& f = lay.fmt[(size_t) l];
-            ls[(size_t) l] = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+            ls[(size_t) l] = native_expert_layout(f);
             d->pq2 |= f.gu_type == 42;
         }
         d->pblocks = dec_moe_peer_blocks(d->pq2);
@@ -1032,6 +1033,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
+    // the Hadamard-folded layers' device sign vectors, made now: never inside a graph capture
+    for (const auto& f : basalt::kernels::cpu::expert_layout().fmt) {
+        basalt::kernels::native_expert_layout(f);
+        basalt::kernels::native_expert_gu_signs(f);
+    }
     sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
     (void) TS;
@@ -1865,7 +1871,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         glue_on[grp] = false;
         if (pk_ring && dm_->ptab0 != nullptr && dec_hc && router_multi && hc_fused_q8_rows_ok()) {
             const auto& f = basalt::kernels::cpu::expert_layout().fmt[(size_t) l];
-            glue_on[grp] = dm_->vram < 0 && dec_moe_glue_ok(native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff));
+            glue_on[grp] = dm_->vram < 0 && dec_moe_glue_ok(native_expert_layout(f));
             if (!glue_on[grp]) note_fallback("glue off for the layer's experts", f.gu_type, f.d_type);
         }
         {
@@ -1990,8 +1996,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         }
         if (dm) {}   // the route kernel wrote nat_xq_
-        else if (basalt::kernels::cpu::expert_layout().native)
-            quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+        else if (basalt::kernels::cpu::expert_layout().native) {
+            const auto& f = basalt::kernels::cpu::expert_layout().fmt[(size_t) l];
+            if (f.had_gu)   // Hadamard-folded gate/up: their input is H (s * x)
+                hadamard_q8_1_rows(xm, n, N, f.had_block, native_expert_gu_signs(f), nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+            else
+                quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+        }
         else
             quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
         stamp(l, 18, grp);
@@ -2023,7 +2034,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
-                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                const NativeExpertLayout L = native_expert_layout(f);
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
                                       nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, dst_buf, cs, gy);
             } else {
@@ -2034,7 +2045,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (dm) {   // CUDA0's entries straight into their parts rows; the other tiers are read by the combine
             stamp(l, 19, grp);
             const auto& f = lay.fmt[(size_t) l];
-            const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+            const NativeExpertLayout L = native_expert_layout(f);
             DmPlan* P = dm_->plan;
             if (glue_on[grp]) {
                 DmGlueArgs ga;

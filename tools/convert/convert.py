@@ -266,6 +266,8 @@ def convert(a) -> None:
             job.bytes("dense.index", dense.index_text())
             job.chunks("experts", experts.chunks())
             job.bytes("experts.layout", experts.layout_text())
+            if experts.hadamard is not None:
+                job.bytes("experts.hadamard", experts.hadamard)
             t = time.time()
             offs = w.add_parts("gguf", [(src, off, size) for _, src, off, size, _ in tensors], TENSOR_ALIGN)
             job._report("gguf", w.entries[-1][2], time.time() - t)

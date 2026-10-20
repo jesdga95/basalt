@@ -59,6 +59,30 @@ first 20 chunks read higher than the 100-chunk set (higher KLD and higher top-1 
 which uses 20 chunks, reads higher than the 100-chunk numbers; the 100-chunk numbers are the ones to compare. The one gap
 is UD-Q4_K_XL at 20 chunks (0.068 vs 0.0579), explained in the next section.
 
+### APR trellis pack (Gyro-L)
+
+Two 20-chunk bases written by `llama-perplexity --kl-divergence-base` from the Q8_0 GGUF (wikitext-2, and a technical
+prose and code text), `tools/ppl_gate.py --chunks 20 --t 3 --expert-cache auto`, one RTX 5060 Ti at 180 W and 62 GB of
+RAM, no peer GPU (a development measurement):
+
+| Pack | Text | Engine | PPL | KLD mean | KLD median | KLD p99 | Same top-1 |
+|---|---|---|---|---|---|---|---|
+| Gyro-L TQ3_0 | wikitext-2 | Basalt | 2.3646 | 0.13066 | 0.01121 | 1.857 | 91.00% |
+| GSQ-RCO IQ3_S | wikitext-2 | Basalt | 2.3893 | 0.18149 | 0.01634 | 2.289 | 88.67% |
+| Gyro-L TQ3_0 | wikitext-2 | llama.cpp (agention fork) | – | 0.1247 | – | – | 91.28% |
+| GSQ-RCO IQ3_S | wikitext-2 | llama.cpp (agention fork) | – | 0.1808 | – | – | 88.73% |
+| Gyro-L TQ3_0 | technical + code | Basalt | 2.3629 | 0.08371 | 0.00216 | 0.914 | 92.76% |
+| GSQ-RCO IQ3_S | technical + code | Basalt | 2.3913 | 0.11378 | 0.00297 | 1.214 | 91.10% |
+| Gyro-L TQ3_0 | technical + code | llama.cpp (agention fork) | – | 0.0763 | – | – | 92.78% |
+| GSQ-RCO IQ3_S | technical + code | llama.cpp (agention fork) | – | 0.1119 | – | – | 90.94% |
+
+Paired on the same tokens, Gyro-L's KLD is lower by 0.0508 on wikitext-2 (chunk t -6.2, lower in 19 of 20 chunks) and
+by 0.0301 on the technical text (chunk t -5.3, 18 of 20). IQ3_S agrees between the engines to 0.002 KLD. Gyro-L's gap
+(about 0.006) is the reference noise of the next section: its hc matrices are Q8_0, as the reference's are, and
+llama.cpp quantizes the hc read's activations as the reference does, so the noise cancels for it (as for UD-Q4_K_XL),
+while Basalt reads them as BF16 copies of the Q8_0 values (`--compat-bf16`, at most 2^-9 relative) with fp32
+activations.
+
 ## Why Q8_0 against Q8_0 is not zero
 
 The Basalt Q8_0 pack scores KLD 0.0456 and top-1 95.6% (4 chunks, fp16 KV) against the stock llama.cpp Q8_0 base. This

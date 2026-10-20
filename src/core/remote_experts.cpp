@@ -307,9 +307,13 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
     if (!staged) return false;
     const auto& lay = basalt::kernels::cpu::expert_layout();
     if (lay.native) {
-        basalt::kernels::quantize_q8_1_rows(zero_copy_ ? z_x_ : d_x_, n_tok, H, d_q8_, s);
         const auto& fmt = lay.fmt[(size_t) layer];
-        auto L = basalt::kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
+        if (fmt.had_gu)
+            basalt::kernels::hadamard_q8_1_rows(zero_copy_ ? z_x_ : d_x_, n_tok, H, fmt.had_block,
+                                                basalt::kernels::native_expert_gu_signs(fmt), d_q8_, s);
+        else
+            basalt::kernels::quantize_q8_1_rows(zero_copy_ ? z_x_ : d_x_, n_tok, H, d_q8_, s);
+        auto L = basalt::kernels::native_expert_layout(fmt);
         basalt::kernels::native_expert_grouped(L, d_ptr_, d_start_, d_count_, d_dst_, d_tok_,
                                                groups_, (int64_t) dst_.size(), d_q8_, d_scratch_, zero_copy_ && !reduce ? z_out_ : d_out_, s);
     } else {
