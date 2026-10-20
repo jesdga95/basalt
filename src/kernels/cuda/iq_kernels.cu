@@ -2082,8 +2082,8 @@ __global__ void __launch_bounds__(256, 2) mmvq_iq3s_mma_kernel(const uint8_t* __
 }
 
 // APR (prism.hadamard): y = H_block (signs * x) per block of each row, block = blockDim.x (a power of two <= 1024),
-// one thread block per (row block, row).  The butterflies are the CPU's (hadamard.cpp) in the same order, so the
-// rotated values are the same floats.
+// one thread block per (row, row block): blockIdx.x the row, as prompt chunks have more rows than gridDim.y takes.
+// The butterflies are the CPU's (hadamard.cpp) in the same order, so the rotated values are the same floats.
 // One block's butterflies in shared memory: thread i holds value i on entry and returns its unscaled transform.
 __device__ __forceinline__ float hadamard_block_sm(float v, float* hbuf, int i, int n) {
     hbuf[i] = v;
@@ -2107,7 +2107,7 @@ __global__ void hadamard_rows_kernel(const T* __restrict__ x, T* __restrict__ y,
                                      const float* __restrict__ signs, float scale) {
     extern __shared__ float hbuf[];
     const int n = blockDim.x, i = threadIdx.x;
-    const int64_t col = (int64_t) blockIdx.x * n + i, at = (int64_t) blockIdx.y * width + col;
+    const int64_t col = (int64_t) blockIdx.y * n + i, at = (int64_t) blockIdx.x * width + col;
     float v = ld_f<T>(x + at);
     if (signs) v *= signs[col];
     st_f<T>(y + at, __fmul_rn(hadamard_block_sm(v, hbuf, i, n), scale));
@@ -2416,14 +2416,14 @@ __global__ void hadamard_q8_1_rows_kernel(const float* __restrict__ x, int64_t w
                                           float scale, block_q8_1* __restrict__ y) {
     extern __shared__ float hbuf[];
     const int n = blockDim.x, i = threadIdx.x;
-    const int64_t col = (int64_t) blockIdx.x * n + i, at = (int64_t) blockIdx.y * width + col;
+    const int64_t col = (int64_t) blockIdx.y * n + i, at = (int64_t) blockIdx.x * width + col;
     float v = x[at];
     if (signs) v *= signs[col];
     q8_1_store(__fmul_rn(hadamard_block_sm(v, hbuf, i, n), scale), y, at);
 }
 
 // swiglu_q8_1_entries_kernel for Hadamard-folded down weights: SwiGLU, H_block (signs * h), q8_1, over the call's
-// own entries (blockIdx.y: entry grp_start[0] + y; blockIdx.x: the block of n_ff).  The values are
+// own entries (blockIdx.x: entry grp_start[0] + x; blockIdx.y: the block of n_ff).  The values are
 // swiglu_entries_kernel's, hadamard_rows_kernel's and quantize_q8_1_kernel's.
 __global__ void swiglu_hadamard_q8_1_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up,
                                                     const int32_t* __restrict__ grp_start,
@@ -2431,9 +2431,9 @@ __global__ void swiglu_hadamard_q8_1_entries_kernel(const float* __restrict__ ga
                                                     const float* __restrict__ signs, float scale,
                                                     block_q8_1* __restrict__ hq) {
     extern __shared__ float hbuf[];
-    const long long e = (long long) grp_start[0] + blockIdx.y;
+    const long long e = (long long) grp_start[0] + blockIdx.x;
     if (e >= grp_start[*n_groups]) return;
-    const int n = blockDim.x, i = threadIdx.x, col = (int) blockIdx.x * n + i;
+    const int n = blockDim.x, i = threadIdx.x, col = (int) blockIdx.y * n + i;
     const long long at = e * n_ff + col;
     const float g = gate[at];
     float v = __fmul_rn(g / (1.0f + __expf(-g)), up[at]);
@@ -3117,7 +3117,7 @@ bool hadamard_block_ok(int block, int64_t width) {
 void hadamard_rows(const float* x, float* y, int64_t rows, int64_t width, int block, const float* signs, void* stream) {
     if (rows <= 0) return;
     if (!hadamard_block_ok(block, width)) hadamard_bad_block("hadamard_rows", block, width);
-    hadamard_rows_kernel<float><<<dim3((unsigned) (width / block), (unsigned) rows), block, block * sizeof(float),
+    hadamard_rows_kernel<float><<<dim3((unsigned) rows, (unsigned) (width / block)), block, block * sizeof(float),
                                   (cudaStream_t) stream>>>(x, y, width, signs, 1.0f / std::sqrt((float) block));
     check("hadamard_rows");
 }
@@ -3125,7 +3125,7 @@ void hadamard_rows(const float* x, float* y, int64_t rows, int64_t width, int bl
 void hadamard_rows_f16(uint16_t* x, int64_t rows, int64_t width, int block, const float* signs, void* stream) {
     if (rows <= 0) return;
     if (!hadamard_block_ok(block, width)) hadamard_bad_block("hadamard_rows_f16", block, width);
-    hadamard_rows_kernel<__half><<<dim3((unsigned) (width / block), (unsigned) rows), block, block * sizeof(float),
+    hadamard_rows_kernel<__half><<<dim3((unsigned) rows, (unsigned) (width / block)), block, block * sizeof(float),
                                    (cudaStream_t) stream>>>((const __half*) x, (__half*) x, width, signs,
                                                             1.0f / std::sqrt((float) block));
     check("hadamard_rows_f16");
@@ -3135,7 +3135,7 @@ void hadamard_q8_1_rows(const float* x, int64_t rows, int64_t width, int block, 
                         void* stream) {
     if (rows <= 0) return;
     if (!hadamard_block_ok(block, width) || block % 32) hadamard_bad_block("hadamard_q8_1_rows", block, width);
-    hadamard_q8_1_rows_kernel<<<dim3((unsigned) (width / block), (unsigned) rows), block, block * sizeof(float),
+    hadamard_q8_1_rows_kernel<<<dim3((unsigned) rows, (unsigned) (width / block)), block, block * sizeof(float),
                                 (cudaStream_t) stream>>>(x, width, signs, 1.0f / std::sqrt((float) block),
                                                          (block_q8_1*) y);
     check("hadamard_q8_1_rows");
@@ -3244,7 +3244,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const bool sw_v1 = v1;
     if (L.had_block > 0) {   // Hadamard-folded down weights: their input is rotated too
         if (!hadamard_block_ok(L.had_block, L.n_ff) || L.had_block % 32) hadamard_bad_block("native_expert_grouped", L.had_block, L.n_ff);
-        swiglu_hadamard_q8_1_entries_kernel<<<dim3((unsigned) (L.n_ff / L.had_block), (unsigned) cap_entries), L.had_block,
+        swiglu_hadamard_q8_1_entries_kernel<<<dim3((unsigned) cap_entries, (unsigned) (L.n_ff / L.had_block)), L.had_block,
                                               L.had_block * sizeof(float), s>>>(
             gate, up, grp_start, n_groups, (int) L.n_ff, L.d_signs, 1.0f / std::sqrt((float) L.had_block), hq);
     } else if (sw_v1) {

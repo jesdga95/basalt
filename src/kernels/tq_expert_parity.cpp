@@ -350,6 +350,29 @@ int main(int argc, char** argv) {
     int failures = 0;
     for (const auto& p : pairs)
         for (bool had : { false, true }) failures += check_pair(p[0], p[1], had, g, s);
+    {   // a prompt chunk's expert rows (T * K) outnumber gridDim.y: the f16 rotation of that many rows
+        const int64_t rows = 70000, w = 128;
+        std::vector<float> x((size_t) (rows * w)), xr;
+        std::mt19937 rng(9);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        for (auto& v : x) v = nd(rng);
+        std::vector<uint16_t> xh(x.size()), xo(x.size());
+        for (size_t i = 0; i < x.size(); ++i) xh[i] = f16_bits(x[i]);
+        for (size_t i = 0; i < x.size(); ++i) { __half hv; std::memcpy(&hv, &xh[i], 2); x[i] = __half2float(hv); }
+        xr = x;
+        for (int64_t r = 0; r < rows; ++r) cpu::hadamard_rotate(xr.data() + r * w, (int) w, 128, nullptr);
+        uint16_t* d = nullptr;
+        CK(cudaMalloc(&d, xh.size() * 2));
+        CK(cudaMemcpy(d, xh.data(), xh.size() * 2, cudaMemcpyHostToDevice));
+        k::hadamard_rows_f16(d, rows, w, 128, nullptr, s);
+        CK(cudaMemcpyAsync(xo.data(), d, xo.size() * 2, cudaMemcpyDeviceToHost, s));
+        CK(cudaStreamSynchronize(s));
+        cudaFree(d);
+        std::vector<float> xf(x.size());
+        for (size_t i = 0; i < xf.size(); ++i) { __half hv; std::memcpy(&hv, &xo[i], 2); xf[i] = __half2float(hv); }
+        std::printf("hadamard_rows_f16 over %lld rows vs cpu float rotation: rel %.2e\n", (long long) rows, rel(xf, xr));
+        if (!(rel(xf, xr) < 2e-3)) ++failures;
+    }
     std::printf("%s (%d failed check%s)\n", failures ? "FAIL" : "PASS", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;
 }
