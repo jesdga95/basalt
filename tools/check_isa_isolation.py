@@ -13,7 +13,7 @@ import subprocess
 import sys
 
 # Objects built with AVX-512 flags on purpose; their kernels are reached through a run-time CPU check.
-AVX512_OBJECTS = ("iq_avx512", "nvfp4_avx512", "ggml_dots_avx512", "gemm_cpu_avx512", "src/kernels/cpu/expert.cpp")
+AVX512_OBJECTS = ("iq_avx512", "nvfp4_avx512", "tq_avx512", "ggml_dots_avx512", "gemm_cpu_avx512", "src/kernels/cpu/expert.cpp")
 # EVEX-encoded instructions start with byte 0x62 in 64-bit mode, whatever registers they name.
 # A long instruction wraps onto continuation lines that carry no mnemonic, so the mnemonic is required.
 EVEX = re.compile(r"^\s*[0-9a-f]+:[\t ]+62 [0-9a-f ]*\t\s*[a-z]")

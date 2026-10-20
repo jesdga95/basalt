@@ -1,5 +1,6 @@
 // src/kernels/cpu/expert_layout.cpp - the per-layer expert table.  See the header.
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/cpu/hadamard.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -127,7 +128,8 @@ void act_quant_any(const float* x, int n, ActQ& a) {
 }
 
 
-bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err) {
+bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err,
+                             const std::string& hadamard) {
     ExpertLayout L;
     L.n_layers = n_layers;
     L.n_expert = n_expert;
@@ -192,6 +194,43 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
         at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;
     }
     L.total = at;
+    // v7: Hadamard-folded experts.  The model must say which layers are rotated and with what signs; a v7 layout
+    // without the section (or the reverse) is refused, never run unrotated.
+    if (L.version >= 7 && hadamard.empty()) {
+        err = "the expert layout is v7 (Hadamard-folded experts) but the model has no experts.hadamard section";
+        return false;
+    }
+    if (!hadamard.empty() && L.version < 7) {
+        err = "the model has an experts.hadamard section but its expert layout is v" + std::to_string(L.version);
+        return false;
+    }
+    HadamardSpec hs;
+    if (!hadamard.empty() && !hadamard_parse(hadamard, n_layers, hs, err)) return false;
+    hadamard_set(std::move(hs));
+    const HadamardSpec& h = hadamard_spec();
+    for (int64_t l = 0; h.any() && l < n_layers; ++l) {
+        NativeFmt& f = L.fmt[(size_t) l];
+        f.had_block = h.block;
+        f.had_gu = h.gu(l);
+        f.had_d = h.down(l);
+        if ((f.had_gu && f.n_embd % h.block) || (f.had_d && f.n_ff % h.block)) {
+            err = "experts.hadamard: block " + std::to_string(h.block) + " does not divide layer " + std::to_string(l) +
+                  "'s expert widths";
+            return false;
+        }
+        // the Q2_0 rows quantize their activations with act_quant_any, which does not rotate
+        if ((f.had_gu && f.gu_type == 42) || (f.had_d && f.d_type == 42)) {
+            err = "experts.hadamard: layer " + std::to_string(l) + " folds a Q2_0 expert, which this engine cannot rotate";
+            return false;
+        }
+        f.gu_signs = f.had_gu ? hadamard_signs((int) f.n_embd) : nullptr;
+        f.d_signs = f.had_d ? hadamard_signs((int) f.n_ff) : nullptr;
+        // explicit signs are per width: a width without a vector would silently mean identity signs
+        if (!h.signs.empty() && ((f.had_gu && !f.gu_signs) || (f.had_d && !f.d_signs))) {
+            err = "experts.hadamard: no sign vector for layer " + std::to_string(l) + "'s expert width";
+            return false;
+        }
+    }
     g_layout = L;
     return true;
 }

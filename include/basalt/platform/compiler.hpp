@@ -22,6 +22,14 @@
 #define BASALT_TARGET_AVX2_FMA_F16C __attribute__((target("avx2,fma,f16c")))
 #endif
 
+// Asks for the next loop to be unrolled n times. MSVC has no such pragma and decides by itself.
+#define BASALT_PRAGMA_(x) _Pragma(#x)
+#if defined(_MSC_VER) && !defined(__clang__)
+#define BASALT_UNROLL(n)
+#else
+#define BASALT_UNROLL(n) BASALT_PRAGMA_(GCC unroll n)
+#endif
+
 namespace basalt::platform {
 
 /// CPUID leaf `leaf`, subleaf `sub`: r[0..3] = EAX, EBX, ECX, EDX.

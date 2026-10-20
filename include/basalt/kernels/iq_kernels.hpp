@@ -47,8 +47,19 @@ struct NativeExpertLayout {
     size_t gu_row = 0, d_row = 0;       // bytes per row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob (NVFP4: with its 16-byte FP32 scale tail)
+    // APR (prism.hadamard): the down weights are Hadamard-folded, so native_expert_grouped rotates h before
+    // quantizing it (hadamard_rows).  had_block 0 = none; d_signs is a DEVICE vector of n_ff signs or nullptr.
+    int had_block = 0;
+    const float* d_signs = nullptr;
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
+namespace cpu { struct NativeFmt; }
+/// A layer's layout with its Hadamard fold (had_block, d_signs).  The device sign vectors are made on first use
+/// (hadamard_device_signs): call it for every layer at setup, before any graph capture.
+NativeExpertLayout native_expert_layout(const cpu::NativeFmt& f);
+/// The device sign vector of a layer's gate/up input when its gate/up are Hadamard-folded, else nullptr (the same
+/// first-use rule).
+const float* native_expert_gu_signs(const cpu::NativeFmt& f);
 /// Whether `native_expert_grouped` has kernels for this gate/up and down type pair at these dimensions, and the
 /// prompt path's dequantizer takes both (checked for every layer at startup, before anything is allocated).
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept;
@@ -80,6 +91,18 @@ void native_grouped_set_gu2(int mode);
 /// The bench only: the kernel layout (EXP_MODE values; -1 = the environment's) and the phase
 /// (0 all, 1 gate/up + SwiGLU + quantize, 2 down).
 void native_expert_set_mode(int mode, int phase);
+
+/// APR (prism.hadamard): y = H_block (signs * x) per block of `block` values of each of `rows` rows of `width`
+/// (x == y allowed).  `signs`: a device vector of `width` signs, or nullptr (identity).  The same floats as the CPU's
+/// hadamard_rotate.  The f16 form rotates in place, computing in float.
+void hadamard_rows(const float* x, float* y, int64_t rows, int64_t width, int block, const float* signs, void* stream);
+void hadamard_rows_f16(uint16_t* x, int64_t rows, int64_t width, int block, const float* signs, void* stream);
+/// hadamard_rows then quantize_q8_1_rows in one pass (the same q8_1 bytes); `block` a multiple of 32.
+void hadamard_q8_1_rows(const float* x, int64_t rows, int64_t width, int block, const float* signs, void* y,
+                        void* stream);
+/// A device copy (on the current device) of the host sign vector `host` of `width` signs, made on first use and
+/// kept for the process.  Call it at setup, not inside a CUDA graph capture.  nullptr for a nullptr `host`.
+const float* hadamard_device_signs(const float* host, int width);
 /// `iq_mmvq` and `native_expert_grouped` decode each weight part once and apply it to every column / entry;
 /// true selects the older kernels that decode it again per column (OLD_IQ_MMVQ=1 at startup).  Both give
 /// bitwise the same results.  Set before graph capture; captured graphs keep the kernels they captured.

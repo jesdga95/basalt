@@ -4,7 +4,8 @@
 // IQ3_S gate/up; Q2_0 or IQ4_NL down) whose values cannot be re-expressed in the Q2_0 pack form.  A native expert
 // blob is the three GGUF slices back to back, [gate rows | up rows | down rows], and the arithmetic is ggml's
 // own (`ggml_get_type_traits_cpu`, extracted in src/kernels/cpu/ggml): the activation is quantized with the weight type's `vec_dot_type` and each row
-// is one `vec_dot`, exactly what llama.cpp's CPU backend computes for the same tensor.
+// is one `vec_dot`, exactly what llama.cpp's CPU backend computes for the same tensor.  The APR trellis types
+// (TQ2_T .. TQP7, 144-149) run on the engine's own kernels (tq_cpu.hpp) against Q8_0 activations.
 #pragma once
 
 #include <cstddef>
@@ -28,6 +29,12 @@ struct NativeFmt {
     size_t bytes = 0;                   ///< the whole blob
     size_t tail = 0;                    ///< NVFP4: the blob's last 16 bytes, FP32 {s_gate, s_up, s_down, 0}
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, n_ff of d_act)
+    /// Hadamard-folded experts (hadamard.hpp): native_quant_act / native_quant_h apply y = H_block (signs * x)
+    /// before quantizing.  had_block 0 = none.
+    int had_block = 0;
+    bool had_gu = false, had_d = false;
+    const float* gu_signs = nullptr;    ///< n_embd signs for x (nullptr: identity)
+    const float* d_signs = nullptr;     ///< n_ff signs for h (nullptr: identity)
 };
 
 /// Whether this build has the ggml dot-product path.

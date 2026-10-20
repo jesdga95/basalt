@@ -100,6 +100,18 @@ inline const char* ggml_type_name(uint32_t t) {
         return "Q1_0";
     case 42:
         return "Q2_0";
+    case 144:   // the APR trellis expert types (agention llama.cpp fork)
+        return "TQ2_T";
+    case 145:
+        return "TQK6";
+    case 146:
+        return "TQK7";
+    case 147:
+        return "TQP5";
+    case 148:
+        return "TQP6";
+    case 149:
+        return "TQP7";
     default:
         return "?";
     }
@@ -205,6 +217,19 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 64;
         bytes = 18;
         return true;
+    // APR trellis types: 128 values = fp16 scale + 32 steps of K bits (K = 8 TQ2_T, 6 TQK6, 7 TQK7) or 64 steps
+    // of K bits (K = 5 TQP5, 6 TQP6, 7 TQP7)
+    case 144:
+    case 145:
+    case 146:
+    case 147:
+    case 148:
+    case 149: {
+        static constexpr int kStepBits[6] = { 32 * 8, 32 * 6, 32 * 7, 64 * 5, 64 * 6, 64 * 7 };
+        elems = 128;
+        bytes = 2 + kStepBits[t - 144] / 8;
+        return true;
+    }
     default:
         return false;
     }
