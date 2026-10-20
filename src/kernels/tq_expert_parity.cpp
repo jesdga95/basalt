@@ -2,6 +2,7 @@
 //
 //     build/tq_expert_parity            random trellis blobs at the model's geometry, plain and Hadamard-folded
 //     build/tq_expert_parity --bench    the grouped decode kernels: us per call and weight GB/s
+//     build/tq_expert_parity --cpu-bench   the CPU rows per ISA on one core: us per expert and GB/s
 //
 // (a) float reference: the kernels' own decode to float (tq_dequant_row, the fp16 codebook times the block scale),
 // the rotation by hadamard_rotate, a SwiGLU expert in double.  (b) the CPU path (native_quant_act / native_gu_rows /
@@ -324,9 +325,61 @@ void bench(int gu, int dn, bool had, int groups, int per, cudaStream_t s) {
     cudaFree(blobs); cudaFree(x); cudaFree(xq); cudaFree(scr); cudaFree(out); cudaFree(ptr); cudaFree(start);
     cudaFree(count); cudaFree(idx); cudaFree(tok);
 }
+// the CPU rows on one core: `ne` distinct experts (beyond the caches), every row of each, `nt` tokens
+void cpu_bench(int type, cpu::TqIsa isa, int nt) {
+    constexpr int ne = 48;
+    const size_t gu_row = k::iq_row_bytes(type, H), d_row = k::iq_row_bytes(type, FF);
+    const size_t blob = 2 * FF * gu_row + H * d_row;
+    std::vector<uint8_t> w(blob * ne);
+    std::mt19937 rng(1);
+    for (int e = 0; e < ne; ++e) {
+        random_rows(type, w.data() + blob * e, 2 * FF, H, rng);
+        random_rows(type, w.data() + blob * e + 2 * FF * gu_row, H, FF, rng);
+    }
+    std::vector<std::vector<uint8_t>> act(cpu::kTqMaxTokens, std::vector<uint8_t>(cpu::kNativeActBytes)),
+        hq(cpu::kTqMaxTokens, std::vector<uint8_t>(cpu::kNativeHBytes));
+    cpu::NativeFmt f;
+    std::string err;
+    cpu::native_fmt(type, type, H, FF, f, err);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> x((size_t) H), h((size_t) FF), o((size_t) cpu::kTqMaxTokens * 2 * FF);
+    for (auto& v : x) v = nd(rng);
+    for (auto& v : h) v = nd(rng);
+    const void* a[cpu::kTqMaxTokens];
+    const void* hp[cpu::kTqMaxTokens];
+    float* op[cpu::kTqMaxTokens];
+    for (int t = 0; t < nt; ++t) {
+        cpu::native_quant_act(f, x.data(), act[(size_t) t].data());
+        cpu::native_quant_h(f, h.data(), hq[(size_t) t].data());
+        a[t] = act[(size_t) t].data();
+        hp[t] = hq[(size_t) t].data();
+        op[t] = o.data() + (size_t) t * 2 * FF;
+    }
+    auto pass = [&] {
+        for (int e = 0; e < ne; ++e) {
+            const uint8_t* b = w.data() + blob * e;
+            cpu::tq_rows(isa, type, b, gu_row, (int) H, a, nt, op, 0, (int) (2 * FF));
+            cpu::tq_rows(isa, type, b + 2 * FF * gu_row, d_row, (int) FF, hp, nt, op, 0, (int) H);
+        }
+    };
+    pass();
+    const int it = 4;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < it; ++i) pass();
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / (it * ne);
+    std::printf("cpu bench %s %s, %d token%s: %.0f us per expert, %.2f GB/s on one core\n", type_name(type),
+                cpu::tq_isa_name(isa), nt, nt == 1 ? "" : "s", us, (double) blob / (us * 1e3));
+}
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--cpu-bench") {
+        for (int type : { 147, 148, 149 })
+            for (cpu::TqIsa isa : { cpu::TqIsa::scalar, cpu::TqIsa::avx2, cpu::TqIsa::avx512 })
+                for (int nt : { 1, 2, 4 })
+                    if (cpu::tq_isa_ok(isa)) cpu_bench(type, isa, nt);
+        return 0;
+    }
     const bool do_bench = argc > 1 && std::string(argv[1]) == "--bench";
     cudaStream_t s;
     CK(cudaStreamCreate(&s));
