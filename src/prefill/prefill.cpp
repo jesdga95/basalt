@@ -129,6 +129,16 @@ struct Alloc {
     }
 };
 
+// The hc up product and the mix: one kernel from kUpMixMinT tokens up (the gate rows never reach memory), else the
+// product into `gated` and gr_mix_r.  The same bits either way.
+void up_mix(Gemm& gm, const uint16_t* w_up, const uint16_t* lo16, float* gated, const float* R, const float* rs,
+            const float* w_norm, float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream) {
+    const uint16_t* w = T >= kUpMixMinT ? gm.bf16_rows(w_up, D, LR) : nullptr;
+    if (w != nullptr && gr_up_mix(lo16, w, R, rs, w_norm, mixed, mixed16, T, stream, mixed_h)) return;
+    gm.bf16_w(lo16, w_up, gated, T, D, LR);
+    gr_mix_r(R, rs, w_norm, gated, mixed, mixed16, T, stream, mixed_h);
+}
+
 }  // namespace
 
 // The experts the arena could not pin are copied into pinned buffers by these threads, ahead of the launches.  Copied
@@ -1180,8 +1190,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         gr_norm_rs(Rm, w_hn, EPS, grs, xn16, nb, m.cs);
         m.gemm.bf16_w(xn16, w_dn, lo, nb, LR, HCN);
         gr_silu(lo, lo16, nb, m.cs);
-        m.gemm.bf16_w(lo16, w_up, gated, nb, HCN, LR);
-        gr_mix_r(Rm, grs, w_hn, gated, mixed, nullptr, nb, m.cs, mixed_h);
+        up_mix(m.gemm, w_up, lo16, gated, Rm, grs, w_hn, mixed, nullptr, mixed_h, nb, m.cs);
         // K and V into the drafter's cache, as the prompt path's QSA layers append theirs
         proj(mixed, mixed_h, w_k, Kc, nb, KV, Nn, 0);
         proj(mixed, mixed_h, w_v, Vc, nb, KV, Nn, 0);
@@ -1844,9 +1853,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 normed = false;
                 if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err)) return false;
                 gr_silu(m.lo, m.lo16, T, m.cs);
-                if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err)) return false;
+                if (wu->kind != core::WeightKind::Bf16InF32 || !wu->data || wu->ne1 != D || wu->ne0 != LR) {
+                    err = "prefill: " + su + " is not a resident BF16 tensor of the hc shape";
+                    return false;
+                }
+                // the attention half reads only the BF16 and FP16 images of the mixed rows
+                up_mix(m.gemm, (const uint16_t*) wu->data, m.lo16, m.gated, m.R, m.grs, (const float*) wn->data,
+                       half == 0 ? nullptr : m.mixed, m.mixed_bf, m.mixed_h, T, m.cs);
                 if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err)) return false;
-                gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
 
                 if (half == 0 && !core::is_qsa_layer(g, l)) {
                     // ======================= GDN =======================

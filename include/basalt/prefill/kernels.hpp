@@ -20,9 +20,17 @@ void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t
 /// F-1: gr_norm without its FP32 output: the row scales rs[t*4 + c] and the BF16 image; gr_mix_r then reads R.
 void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint16_t* xn16, int64_t T, void* stream,
                 uint16_t* xn16_lo = nullptr);
-/// gr_mix with xn recomputed from R, rs and w_norm exactly as gr_norm computes it (the same bits).
+/// gr_mix with xn recomputed from R, rs and w_norm exactly as gr_norm computes it (the same bits); `mixed` may be null.
 void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed, uint16_t* mixed16,
               int64_t T, void* stream, uint16_t* mixed_h = nullptr, uint16_t* mixed16_lo = nullptr);
+/// The up product gated = lo16 [T, 320] . w_up [10240, 320]^T (BF16 in, FP32 accumulate) and gr_mix_r in one kernel:
+/// the gate rows stay in registers.  Each gate value is one m16n8k16 chain over k from zero, the chain cuBLAS runs
+/// for this product from kUpMixMinT tokens up (it adds k in another order below), so there the outputs are the two
+/// steps' bits.  Any output may be null.  false: a pointer is not aligned for the kernel's vector accesses (nothing ran).
+constexpr int64_t kUpMixMinT = 33;
+bool gr_up_mix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
+               float* mixed, uint16_t* mixed16, int64_t T, void* stream, uint16_t* mixed_h = nullptr,
+               uint16_t* mixed16_lo = nullptr);
 /// F-2: gr_write, then gr_norm_rs of the next half (its norm weights) over the rows just written - the same bits as
 /// the two calls, without reading R back.
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,

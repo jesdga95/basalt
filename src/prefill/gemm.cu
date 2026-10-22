@@ -155,6 +155,14 @@ void Gemm::bf16_w(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int
     bf16(X, W, Y, T, N, K, ldy);
 }
 
+const uint16_t* Gemm::bf16_rows(const uint16_t* W, int64_t N, int64_t K) {
+    basalt::kernels::Hc8View v;
+    if (!basalt::kernels::hc8_view(W, v) || !v.owned) return W;
+    if (v.rows != N || v.cols != K || scratch_ == nullptr || N * K > scratch_elems_) return nullptr;
+    basalt::kernels::hc8_dequant_bf16(v, 0, N, scratch_, stream_);
+    return scratch_;
+}
+
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                float beta) {
     if (T <= 0 || N <= 0) return;

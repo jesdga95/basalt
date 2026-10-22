@@ -114,13 +114,157 @@ __global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __rest
         s = fmaf(x, sigm(g[j]), s);
     }
     s /= (float) HC;
-    mixed[i] = s;
+    if (mixed) mixed[i] = s;
     if (mixed16) {
         const uint16_t h = bf(s);
         mixed16[i] = h;
         if (mixed16_lo) mixed16_lo[i] = bf_lo(s, h);
     }
     if (mixed_h) mixed_h[i] = hf(s);
+}
+// The up product and gr_mix_r in one pass (gr_up_mix): a block takes UM_BM tokens and UM_BD columns d of all HC
+// streams (rows c * N + d of w_up), so the FP32 gate rows stay in registers.  Every gate value is one m16n8k16 chain
+// over k in order from zero, the chain cuBLAS runs for this product, and the mix is gr_mix_r_kernel's arithmetic.
+constexpr int UM_BM = 128, UM_BD = 32, UM_BN = HC * UM_BD, UM_BK = 32, UM_ST = 3, UM_KT = LR / UM_BK;
+constexpr int UM_SMEM = UM_ST * (UM_BM + UM_BN) * UM_BK * 2;
+static_assert(LR % UM_BK == 0 && N % UM_BD == 0 && UM_KT >= UM_ST - 1, "gr_up_mix tiles");
+
+__device__ __forceinline__ void um_cp16(void* smem, const void* gmem, bool valid) {
+    const unsigned sa = (unsigned) __cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(sa), "l"(gmem), "r"(valid ? 16 : 0));
+}
+__device__ __forceinline__ void um_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+__device__ __forceinline__ void um_ldsm4(uint32_t (&r)[4], const void* smem) {
+    const unsigned sa = (unsigned) __cvta_generic_to_shared(smem);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(sa));
+}
+__device__ __forceinline__ void um_mma(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+// a tile row (UM_BK bf16) is four 16-byte chunks, the chunk index XORed with the row's bits 1-2 so that the eight rows
+// of an ldmatrix read sit in distinct banks
+__device__ __forceinline__ int um_at(int row, int chunk) { return row * UM_BK + ((chunk ^ ((row >> 1) & 3)) << 3); }
+
+__device__ void gr_up_mix_block(const uint16_t* __restrict__ lo16, const uint16_t* __restrict__ w_up,
+                                const float* __restrict__ R, const float* __restrict__ rs, const float* __restrict__ w,
+                                float* __restrict__ mixed, uint16_t* __restrict__ mixed16,
+                                uint16_t* __restrict__ mixed_h, uint16_t* __restrict__ mixed16_lo, int64_t T, int bd,
+                                int64_t bm, uint16_t* smem) {
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int wm = warp & 3, wn = warp >> 2;          // a warp: 32 tokens x 16 columns d, all HC streams
+    const int64_t t0 = bm * UM_BM;
+    const int d0 = bd * UM_BD;
+    uint16_t* As = smem;                              // [UM_ST][UM_BM][UM_BK]: lo16 rows
+    uint16_t* Bs = smem + UM_ST * UM_BM * UM_BK;      // [UM_ST][UM_BN][UM_BK]: row c * UM_BD + j = w_up row c * N + d0 + j
+    auto load = [&](int st, int kt) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int id = tid + i * 256, row = id >> 2, ch = id & 3;
+            const bool ok = t0 + row < T;
+            um_cp16(As + st * UM_BM * UM_BK + um_at(row, ch), lo16 + (ok ? (t0 + row) * LR : 0) + kt * UM_BK + ch * 8, ok);
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int id = tid + i * 256, row = id >> 2, ch = id & 3;
+            const int64_t wr = (int64_t) (row / UM_BD) * N + d0 + row % UM_BD;
+            um_cp16(Bs + st * UM_BN * UM_BK + um_at(row, ch), w_up + wr * LR + kt * UM_BK + ch * 8, true);
+        }
+        um_commit();
+    };
+    // the residual rows the mix reads, into L2 while the product runs
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int id = tid + i * 256;
+        const int64_t t = t0 + (id >> 2);
+        if (t < T) asm volatile("prefetch.global.L2 [%0];\n" ::"l"(R + t * D + (id & 3) * N + d0));
+    }
+    float acc[2][HC][2][4];
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+        for (int c = 0; c < HC; ++c)
+#pragma unroll
+            for (int db = 0; db < 2; ++db)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) acc[mt][c][db][e] = 0.0f;
+#pragma unroll
+    for (int s = 0; s < UM_ST - 1; ++s) load(s, s);
+#pragma unroll 1
+    for (int kt = 0; kt < UM_KT; ++kt) {
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(UM_ST - 2));
+        __syncthreads();
+        if (kt + UM_ST - 1 < UM_KT) load((kt + UM_ST - 1) % UM_ST, kt + UM_ST - 1);
+        else um_commit();
+        const uint16_t* a_s = As + (kt % UM_ST) * UM_BM * UM_BK;
+        const uint16_t* b_s = Bs + (kt % UM_ST) * UM_BN * UM_BK;
+#pragma unroll
+        for (int kk = 0; kk < UM_BK / 16; ++kk) {
+            uint32_t a[2][4], b[HC][4];
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt) um_ldsm4(a[mt], a_s + um_at(wm * 32 + mt * 16 + (lane & 15), kk * 2 + (lane >> 4)));
+#pragma unroll
+            for (int c = 0; c < HC; ++c)
+                um_ldsm4(b[c], b_s + um_at(c * UM_BD + wn * 16 + (lane & 7) + ((lane >> 4) << 3), kk * 2 + ((lane >> 3) & 1)));
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+                for (int c = 0; c < HC; ++c)
+#pragma unroll
+                    for (int db = 0; db < 2; ++db) um_mma(acc[mt][c][db], a[mt], b[c][db * 2], b[c][db * 2 + 1]);
+        }
+    }
+    // the mix: a thread holds tokens g and g + 8 of each 16-token tile and columns 2q, 2q + 1 of each 8-column tile,
+    // for every stream
+    const int g = lane >> 2, q = lane & 3;
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+        for (int rh = 0; rh < 2; ++rh) {
+            const int64_t t = t0 + wm * 32 + mt * 16 + rh * 8 + g;
+            if (t >= T) continue;
+            const float4 r4 = *reinterpret_cast<const float4*>(rs + t * HC);
+            const float rsc[HC] = {r4.x, r4.y, r4.z, r4.w};
+#pragma unroll
+            for (int db = 0; db < 2; ++db) {
+                const int d = d0 + wn * 16 + db * 8 + 2 * q;
+                float s0 = 0.0f, s1 = 0.0f;
+#pragma unroll
+                for (int c = 0; c < HC; ++c) {
+                    const float2 r = *reinterpret_cast<const float2*>(R + t * D + c * N + d);
+                    const float2 wv = *reinterpret_cast<const float2*>(w + c * N + d);
+                    const float x0 = r.x * rsc[c] * wv.x, x1 = r.y * rsc[c] * wv.y;   // gr_norm_kernel's value
+                    s0 = fmaf(x0, sigm(acc[mt][c][db][rh * 2]), s0);
+                    s1 = fmaf(x1, sigm(acc[mt][c][db][rh * 2 + 1]), s1);
+                }
+                s0 /= (float) HC;
+                s1 /= (float) HC;
+                const int64_t i = t * N + d;
+                if (mixed) *reinterpret_cast<float2*>(mixed + i) = make_float2(s0, s1);
+                if (mixed16) {
+                    const uint16_t h0 = bf(s0), h1 = bf(s1);
+                    *reinterpret_cast<uint32_t*>(mixed16 + i) = (uint32_t) h0 | ((uint32_t) h1 << 16);
+                    if (mixed16_lo)
+                        *reinterpret_cast<uint32_t*>(mixed16_lo + i) =
+                            (uint32_t) bf_lo(s0, h0) | ((uint32_t) bf_lo(s1, h1) << 16);
+                }
+                if (mixed_h) *reinterpret_cast<uint32_t*>(mixed_h + i) = (uint32_t) hf(s0) | ((uint32_t) hf(s1) << 16);
+            }
+        }
+}
+__global__ void __launch_bounds__(256, 2) gr_up_mix_kernel(const uint16_t* __restrict__ lo16,
+                                                          const uint16_t* __restrict__ w_up, const float* __restrict__ R,
+                                                          const float* __restrict__ rs, const float* __restrict__ w,
+                                                          float* __restrict__ mixed, uint16_t* __restrict__ mixed16,
+                                                          uint16_t* __restrict__ mixed_h,
+                                                          uint16_t* __restrict__ mixed16_lo, int64_t T) {
+    extern __shared__ __align__(16) uint16_t um_smem[];
+    gr_up_mix_block(lo16, w_up, R, rs, w, mixed, mixed16, mixed_h, mixed16_lo, T, (int) blockIdx.x,
+                    (int64_t) blockIdx.y, um_smem);
 }
 // F-2: gr_write_kernel for one row (t, c), then gr_norm_rs_kernel's reduction over it with the next half's norm
 // weights - the same thread-to-element mapping (256 threads, stride 256) and block_sum, so rs and the BF16 image are
@@ -514,6 +658,19 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
     gr_mix_r_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm, gated, mixed, mixed16, T,
                                                                           mixed_h, mixed16_lo);
     check("gr_mix_r");
+}
+bool gr_up_mix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
+               float* mixed, uint16_t* mixed16, int64_t T, void* stream, uint16_t* mixed_h, uint16_t* mixed16_lo) {
+    const auto al = [](const void* p, uintptr_t a) { return ((uintptr_t) p & (a - 1)) == 0; };
+    if (!al(lo16, 16) || !al(w_up, 16) || !al(R, 8) || !al(rs, 16) || !al(w_norm, 8) || !al(mixed, 8) ||
+        !al(mixed16, 4) || !al(mixed_h, 4) || !al(mixed16_lo, 4))
+        return false;
+    if (T <= 0) return true;
+    const dim3 grid(N / UM_BD, (unsigned) ((T + UM_BM - 1) / UM_BM));
+    gr_up_mix_kernel<<<grid, 256, UM_SMEM, (cudaStream_t) stream>>>(lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h,
+                                                                    mixed16_lo, T);
+    check("gr_up_mix");
+    return true;
 }
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
                       float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo) {

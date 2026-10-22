@@ -38,6 +38,11 @@ public:
     /// in VRAM (hc_fused.hpp), the same product with W's row slices dequantized to BF16 in the scratch.
     void bf16_w(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0);
 
+    /// W [N, K] as BF16 rows for a kernel of the caller's own, the values `bf16_w` multiplies by: W itself, or its 8-bit
+    /// copy dequantized into the scratch (valid until the next product that uses the scratch).  nullptr: the
+    /// scratch cannot hold the N rows at once.
+    const uint16_t* bf16_rows(const uint16_t* W, int64_t N, int64_t K);
+
     /// Y = X . W^T with both in FP16 (bits).
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
