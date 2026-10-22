@@ -7939,15 +7939,26 @@ int main(int argc, char** argv) {
                 const int ring_now = (int) basalt::prefill::Prefill::ring_slots_for(want);
                 for (PfPart& p : pf_parts) {
                     if (p.first < 0) continue;
+                    const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
                     if (!p.lent.empty()) {
                         if (want <= p.lent_chunk && p.sp->ring_depth() == ring_now && !ov_copied) continue;   // its loan covers this
+                        // the slots the new loan takes again are not refilled first (their experts would be
+                        // overwritten by the new layout): only their table entries go back, and the loop below
+                        // lends them again; the new loan's refill brings their experts back after the prompt
+                        if (!ov_copied) {
+                            std::vector<std::pair<int32_t, int32_t>> back;
+                            for (const auto& [i, slot] : p.lent) {
+                                if (slot >= first) host_res[(size_t) i] = slot;
+                                else back.emplace_back(i, slot);
+                            }
+                            p.lent = std::move(back);
+                        }
                         // ONLY this participant's loan goes back: `refill` would return the other participants'
                         // loans too, and their buffers are still laid out in their caches - marking those slots
                         // resident again would hand the next window a prompt buffer in place of an expert
                         if (!refill_one(p, e)) return false;
                     }
                     const basalt::core::OnDevice on(p.dev);
-                    const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
                     if (want != p.sp->chunk() || first != p.first_now || p.sp->ring_depth() != ring_now) {
                         if (!p.sp->relayout(want, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
