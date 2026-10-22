@@ -1,7 +1,7 @@
 // include/basalt/platform/direct_file.hpp - unbuffered asynchronous file reads.
 //
 // The n-gram table (26.8 GiB) stays on the SSD and must never occupy RAM, including the OS file cache. A memory
-// map cannot promise that; an unbuffered read can. Linux reads it with O_DIRECT preads issued from a small thread
+// map cannot promise that; an unbuffered read can. Linux reads it with O_DIRECT preads issued from a thread
 // pool (submit only queues), so many reads are in flight. Windows reads the same file with FILE_FLAG_NO_BUFFERING
 // overlapped reads completed through an I/O completion port; the queue of reads is the same either way.
 //

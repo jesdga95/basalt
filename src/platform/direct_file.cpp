@@ -59,10 +59,10 @@ struct Pending {
     uint64_t tag;
 };
 
-/// The number of issuing threads, clamped to 1..64. On Linux each thread does one blocking pread, so the thread
+/// The number of issuing threads, clamped to 1..256. On Linux each thread does one blocking pread, so the thread
 /// count is the queue depth. On Windows a read stays in flight after its issuing thread moves on, so the count
 /// only bounds how fast the submitted queue reaches the drive; the depth itself is what the caller queued.
-int io_threads(int dflt) { return std::clamp(dflt, 1, 64); }
+int io_threads(int dflt) { return std::clamp(dflt, 1, 256); }
 }  // namespace
 
 #if defined(_WIN32)
@@ -335,8 +335,10 @@ struct DirectFile::Impl {
             lk.unlock();
             const ssize_t got = pread(fd, p.buffer, p.length, (off_t) p.offset);
             lk.lock();
+            // only a waiter that found the list empty is blocked, so only the first completion needs to wake it
+            const bool was_empty = done.empty();
             done.push_back(Completion{p.tag, got < 0 ? 0u : (uint32_t) got, got >= 0});
-            cv_done.notify_all();
+            if (was_empty) cv_done.notify_all();
         }
     }
 
@@ -362,7 +364,8 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     struct stat st;
     if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
     impl_->size = (uint64_t) st.st_size;
-    const int n = io_threads(16);
+    // one blocking read per thread: a drive serves random pages at its full rate only with a deep queue
+    const int n = io_threads(128);
     for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { impl_->worker(); });
     return true;
 }
