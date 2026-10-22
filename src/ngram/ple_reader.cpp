@@ -406,17 +406,23 @@ uint32_t PleReader::row_bytes() const { return impl_->row_bytes; }
 
 PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_raw) {
     Impl& m = *impl_;
+    // A row the cache misses, by the page it starts on.
+    struct Miss {
+        uint64_t first;
+        uint32_t length;
+        uint32_t in_page;
+        uint32_t row;
+        uint8_t* dst;
+    };
+    std::vector<Miss> miss;
     std::unique_lock<std::mutex> lk(m.mu);
     const uint32_t id = m.next_ticket++;
     if (m.next_ticket == 0) m.next_ticket = 1;
     const double now = now_us();
     const bool rearm = m.keep_us > 0 && (m.last_issue_us <= 0 || now - m.last_issue_us > m.keep_window_us);
     m.last_issue_us = now;
-    TicketState& ts = m.tickets[id];
-    std::unordered_map<uint64_t, size_t> by_page;     // aligned offset -> index in `jobs`
-    std::vector<Job> jobs;
+    const uint32_t rb = m.row_bytes;
     for (size_t i = 0; i < n; ++i) {
-        const uint32_t rb = m.row_bytes;
         uint8_t* dst = out_raw + i * rb;
         ++m.stats.requests;
         if (rows[i] >= m.n_rows) {
@@ -430,35 +436,65 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
         }
         const uint64_t at = m.table_offset + (uint64_t) rows[i] * rb;
         const uint64_t first = at / PAGE * PAGE;
-        const uint32_t length = (uint32_t) ((at + rb - 1) / PAGE * PAGE - first + PAGE);
-        auto f = by_page.find(first);
-        if (f != by_page.end()) {
-            Job& j = jobs[f->second];
-            j.length = std::max(j.length, length);
-            j.uses.push_back(Use{rows[i], (uint32_t) (at - first), dst});
-            ++m.stats.dedup_rows;
+        miss.push_back(Miss{first, (uint32_t) ((at + rb - 1) / PAGE * PAGE - first + PAGE), (uint32_t) (at - first),
+                            rows[i], dst});
+    }
+    // the ticket is known before its reads are planned; it completes once every page it counts is read
+    m.tickets[id].pending = 1;
+    lk.unlock();
+    // Sorted by page (rows of one page in request order): the reads go out in near-sequential order, one per page.
+    std::stable_sort(miss.begin(), miss.end(), [](const Miss& x, const Miss& y) { return x.first < y.first; });
+    size_t pages = 0;
+    for (size_t i = 0; i < miss.size(); ++i) pages += i == 0 || miss[i].first != miss[i - 1].first;
+    // Planned reads go to the worker in batches while the rest are planned, so the drive starts at once.
+    constexpr size_t kBatch = 1024;
+    std::vector<Job> jobs;
+    jobs.reserve(std::min(pages, kBatch));
+    bool first_batch = true;
+    auto flush = [&](bool last) {
+        lk.lock();
+        TicketState& ts = m.tickets[id];
+        if (first_batch) ts.pending = (uint32_t) pages;
+        first_batch = false;
+        // after a read failed the reader takes no more work: these pages count as done (collect reports it)
+        const bool failed = !m.error.empty();
+        if (failed) ts.pending -= std::min<uint32_t>(ts.pending, (uint32_t) jobs.size());
+        else for (Job& j : jobs) m.queue.push_back(std::move(j));
+        const bool any = !failed && !jobs.empty();
+        if (failed) m.cv_done.notify_all();
+        jobs.clear();
+        lk.unlock();
+        if (any) {
+            m.cv_work.notify_one();
+            m.file.wake();                         // in case the worker is blocked in the port
+        } else if (last && pages == 0) {
+            m.cv_done.notify_all();
+        }
+    };
+    uint64_t dedup = 0;
+    for (size_t i = 0; i < miss.size(); ++i) {
+        const Miss& x = miss[i];
+        if (i > 0 && x.first == miss[i - 1].first) {
+            Job& j = jobs.back();
+            j.length = std::max(j.length, x.length);
+            j.uses.push_back(Use{x.row, x.in_page, x.dst});
+            ++dedup;
             continue;
         }
-        by_page.emplace(first, jobs.size());
+        if (jobs.size() == kBatch) flush(false);
         Job j;
-        j.offset = first;
-        j.length = length;
+        j.offset = x.first;
+        j.length = x.length;
         j.ticket = id;
-        j.uses.push_back(Use{rows[i], (uint32_t) (at - first), dst});
+        j.uses.push_back(Use{x.row, x.in_page, x.dst});
         jobs.push_back(std::move(j));
     }
-    // Sorted by offset: prefill chunks then read the SSD in near-sequential order.
-    std::sort(jobs.begin(), jobs.end(), [](const Job& a, const Job& b) { return a.offset < b.offset; });
-    ts.pending = (uint32_t) jobs.size();
-    const bool has_jobs = ts.pending > 0;
-    for (Job& j : jobs) m.queue.push_back(std::move(j));
-    lk.unlock();
-    if (has_jobs) {
-        m.cv_work.notify_one();
-        m.file.wake();                             // in case the worker is blocked in the port
-    } else if (rearm) {
-        m.cv_work.notify_one();                    // the keep-alive had lapsed: start it again
+    flush(true);
+    {
+        std::lock_guard<std::mutex> g(m.mu);
+        m.stats.dedup_rows += dedup;
     }
+    if (pages == 0 && rearm) m.cv_work.notify_one();   // the keep-alive had lapsed: start it again
     return Ticket{id};
 }
 
