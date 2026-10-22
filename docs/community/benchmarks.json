@@ -107,6 +107,31 @@
       "decode_tps": 77.5,
       "link": "https://github.com/jesdga95/basalt/issues/17",
       "notes": "single RTX 5080 16GB, WSL2/Docker; 72.3 GiB experts all in an 88 GiB VM (0 SSD spill) - the community gate passes on a 16GB card"
+    },
+    {
+      "submitter": "KimDaeHwan99",
+      "date": "2026-10-22",
+      "commit": "78ca1d6bd6",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180
+        },
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180
+        }
+      ],
+      "ram_gib": 60,
+      "os": "Linux",
+      "quant": "IQ3_S",
+      "prefill_16k_tps": 2369.8,
+      "prefill_64k_tps": 2459.0,
+      "decode_tps": 161.3,
+      "notes": "2x RTX 5060 Ti 16GB (PCIe 5.0 x8/x8, no P2P; 2nd card as the peer tier), Ryzen 5 9600X, 64GB DDR5-6400; 0 SSD spill"
     }
   ]
 }
