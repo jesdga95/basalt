@@ -1,8 +1,8 @@
 // include/basalt/prefill/moe_fp4.hpp - the prompt path's NVFP4 experts on the FP4 block-scaled tensor cores.
 // Weights stay in the pack's NVFP4 blocks (read in place from each expert's blob); activations are rounded to FP4
-// codes with a UE4M3 scale per 16 values and one FP32 scale per token (W4A4).  Activation planes are laid out per
-// 64-token tile of one expert (each expert's rows padded to whole tiles), so a tile's codes and scales are one
-// contiguous, bank-swizzled run.
+// codes with a UE4M3 scale per 16 values and one FP32 scale per token (W4A4).  A layer's input is rounded once per
+// token (token planes: the gate/up product reads each row's token); H is laid out per 64-token tile of one expert
+// (each expert's rows padded to whole tiles), so a tile's codes and scales are one contiguous, bank-swizzled run.
 #pragma once
 
 #include <cstddef>
@@ -32,9 +32,20 @@ void rebase(const int32_t* bounds, int n, int32_t* out, void* stream);
 void quantize(const float* x, const int32_t* ids, const int32_t* bounds, const int32_t* tile_off, int n, void* a4,
               float* gs, int64_t cols, int64_t ld, int64_t rows, void* stream);
 
+/// Bytes of the token planes of `tokens` rows of `cols` values: the codes [tokens][cols / 2] (each 16 values' 8 bytes
+/// in order), then the UE4M3 scales [tokens][cols / 16].
+size_t token_bytes(int64_t tokens, int64_t cols);
+/// Rounds each of `tokens` rows of x (`ld` floats apart) to FP4 once, into the token planes `a4` and the token scales
+/// gs[tokens]: the same codes and scales quantize() gives every row that reads that token.
+void quantize_tokens(const float* x, int64_t tokens, int64_t cols, int64_t ld, void* a4, float* gs, void* stream);
+
 /// n experts' products: expert j's matrix [w_rows, w_cols] of NVFP4 blocks starts at blob[j] + w_off; its rows
 /// [bounds[j], bounds[j+1]) of the planes go to dst rows of the same indices (dst + row * ld_dst).  The result is the
 /// plain product (no per-expert tail scale).  `max_rows`: the most rows one segment has.
+/// `swiglu` (the gate/up product: gate rows, then as many up rows): row i reads token ids[i] of token planes over
+/// `tokens` rows (a4, gs from quantize_tokens; no tile_off), and dst gets [w_rows / 2] values per row, the tail-scaled
+/// SwiGLU silu(g s_gate) (u s_up) s_down of the blob's 16-byte tail at tail_off, the same bits as the plain product
+/// followed by mmq::swiglu.
 struct Product {
     const uint8_t* blob[kMaxExperts] = {};
     size_t w_off = 0;
@@ -46,36 +57,40 @@ struct Product {
     const int32_t* tile_off = nullptr;
     float* dst = nullptr;
     int64_t ld_dst = 0, max_rows = 0;
+    bool swiglu = false;
+    const int32_t* ids = nullptr;
+    int64_t tokens = 0;
+    size_t tail_off = 0;
 };
 void run(const Product& p, void* stream);
 /// The 16-byte scale tail at `tail_off` of each of p's n blobs to dst[4 j .. 4 j + 3] (the tail swiglu reads).
 void gather_tails(const Product& p, size_t tail_off, float* dst, void* stream);
 
-/// A group of up to kMaxExperts consecutive experts of one layer, as the prompt path runs them: the layer's
-/// activation planes (already rounded to FP4, planned over every expert of the layer) and, per run of the group, the
-/// gate/up product, the tail-scaled SwiGLU, the FP4 rounding of H and the down product.  `gu` and `h` hold one run's
-/// rows only (their row 0 is the run's first row); `dm` is the layer's own output, indexed by absolute row.
+/// A group of up to kMaxExperts consecutive experts of one layer, as the prompt path runs them: the layer's token
+/// planes (already rounded to FP4) and, per run of the group, the gate/up product as the tail-scaled SwiGLU, the FP4
+/// rounding of H and the down product.  `h` holds one run's rows only (its row 0 is the run's first row); `dm` is the
+/// layer's own output, indexed by absolute row.
 struct Group {
     int n = 0;
     const uint8_t* blob[kMaxExperts] = {};
     const int32_t* bounds_host = nullptr;   ///< n + 1 absolute row bounds, on the host
     const int32_t* bounds_dev = nullptr;    ///< the same bounds on the device
-    const void* a4x = nullptr;              ///< the layer's activation planes, scales and tile table (this group's first
-    const float* gsx = nullptr;             ///< expert's entry of the table)
-    const int32_t* tox = nullptr;
+    const int32_t* ids = nullptr;           ///< the layer's token of each absolute row
+    const void* a4x = nullptr;              ///< the layer's token planes and token scales (quantize_tokens)
+    const float* gsx = nullptr;
+    int64_t tokens = 0;
     size_t down_off = 0, tail_off = 0;      ///< the down matrix and the 16-byte scale tail inside a blob
-    float *gu = nullptr, *h = nullptr, *dm = nullptr;
+    float *h = nullptr, *dm = nullptr;
     void* a4h = nullptr;                    ///< a run's H planes, token scales, tile table and relative bounds
     float* gsh = nullptr;
     int32_t *toh = nullptr, *rel = nullptr; ///< kMaxExperts + 1 entries each
-    float* tails = nullptr;                 ///< 4 floats per expert of a run: {s_gate, s_up, s_down, 0}
 };
 /// Runs consecutive experts [i0, i0 + n) of the group (n >= 1): rows of `bounds_host` rows [i0, i0 + n].
 void run_experts(const Group& g, int i0, int n, void* stream);
 /// How many experts from i0 form the next run: as many consecutive ones as hold at most `row_cap` rows, and at least
 /// one (an expert's rows are never split).
 int run_length(const Group& g, int i0, int64_t row_cap);
-/// The whole group as runs of at most `row_cap` rows each (GU and H hold a run's rows); returns the number of runs.
+/// The whole group as runs of at most `row_cap` rows each (H holds a run's rows); returns the number of runs.
 int run_group(const Group& g, int64_t row_cap, void* stream);
 
 /// The rows of n consecutive experts ([bounds[j], bounds[j + 1]), on the host) in pieces for buffers of `cap` rows

@@ -8,9 +8,12 @@
 //   - MMQ: `same`, double-precision math on MMQ's own int8 roundings (gate/up RMS 1e-5, worst row 1e-4; after the down
 //     product RMS 2e-4, worst row 1e-2); `double` on the unrounded activations (RMS 2.5e-2); the FP16 fallback it
 //     replaced (RMS 2e-2).  The per-expert gather and the grouped gather give bitwise equal outputs; a zero token stays 0.
-// The group path (`fp4::run_group`, what prefill.cpp runs) with GU and H holding only a run's rows must equal the
-// absolute-row sequence bitwise, and so must every split of a group into runs (a row cap from one expert to none),
-// on two routings with hot experts, with nothing written past the run's rows.  Edge activations: zero sub-blocks
+// The production gate/up reads each row's token from token planes (fp4::quantize_tokens) and leaves the tail-scaled
+// SwiGLU from its epilogue: the planes must hold the bytes quantize() puts in the tiles, H the bits of the plain
+// product followed by mmq::swiglu (and the A4 reference in double to RMS 1e-5).  The group path (`fp4::run_group`, what
+// prefill.cpp runs) with H holding only a run's rows must equal the absolute-row sequence of the plain kernels bitwise,
+// and so must every split of a group into runs (a row cap from one expert to none), on two routings with hot experts,
+// with nothing written past the run's rows.  Edge activations: zero sub-blocks
 // next to non-zero ones, tokens scaled by 1e-30 and 1e30, one huge sub-block in a tiny token: finite, zero stays zero,
 // and the gate/up product follows the A4 reference.  Then a microbench line (--no-bench skips it).  With a second
 // device, the peer card's share of a streamed chunk (its experts' rows in pieces of a row cap, each group planned on
@@ -276,6 +279,13 @@ std::vector<float> download(const Dev& d, size_t n) {
     ck(cudaMemcpy(h.data(), d.p, n * 4, cudaMemcpyDeviceToHost), "download");
     return h;
 }
+// FNV-1a over a float array's bytes: a build's outputs on this layer, to compare builds bit for bit
+uint64_t fnv(const std::vector<float>& v) {
+    uint64_t h = 1469598103934665603ull;
+    const auto* b = (const unsigned char*) v.data();
+    for (size_t i = 0; i < v.size() * 4; ++i) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
 
 // the same layer through the FP4 tensor-core path
 struct F4 {
@@ -317,16 +327,76 @@ void run_fp4(F4& f, Bufs& b, const Layer& L, const float* x_dev, const int32_t* 
     }
 }
 
+// The token planes against the tiles: every row's codes, sub-block scales and token scale must be the bytes quantize()
+// put in its tile (the tile's 16-byte code chunks swizzled by row).
+bool token_planes_match(const F4& f, const Layer& L, const float* x_dev, const int32_t* src_dev, cudaStream_t s) {
+    const int64_t rows = (int64_t) L.T * K;
+    const size_t n = L.order.size();
+    constexpr int NKT = N / 128, ST = 4608;
+    Dev a4t(fp4::token_bytes(L.T, N)), gst((size_t) L.T * 4), bounds((n + 1) * 4);
+    ck(cudaMemcpyAsync(bounds.p, L.bh.data(), (n + 1) * 4, cudaMemcpyHostToDevice, s), "bounds");
+    fp4::plan(bounds.as<int32_t>(), (int) n, f.tox.as<int32_t>(), s);
+    fp4::quantize(x_dev, src_dev, bounds.as<int32_t>(), f.tox.as<int32_t>(), (int) n, f.a4x.p, f.gsx.as<float>(), N, N,
+                  rows, s);
+    fp4::quantize_tokens(x_dev, L.T, N, N, a4t.p, gst.as<float>(), s);
+    ck(cudaStreamSynchronize(s), "sync planes");
+    std::vector<uint8_t> tiles(f.a4x.bytes), tok(a4t.bytes);
+    std::vector<float> gs(f.gsx.bytes / 4), gt((size_t) L.T);
+    std::vector<int32_t> tox(n + 1);
+    ck(cudaMemcpy(tiles.data(), f.a4x.p, tiles.size(), cudaMemcpyDeviceToHost), "d");
+    ck(cudaMemcpy(tok.data(), a4t.p, tok.size(), cudaMemcpyDeviceToHost), "d");
+    ck(cudaMemcpy(gs.data(), f.gsx.p, gs.size() * 4, cudaMemcpyDeviceToHost), "d");
+    ck(cudaMemcpy(gt.data(), gst.p, gt.size() * 4, cudaMemcpyDeviceToHost), "d");
+    ck(cudaMemcpy(tox.data(), f.tox.p, tox.size() * 4, cudaMemcpyDeviceToHost), "d");
+    const uint8_t* scales = tok.data() + (size_t) L.T * (N / 2);
+    int64_t bad = 0;
+    for (size_t j = 0; j < n; ++j)
+        for (int32_t r = L.bh[j]; r < L.bh[j + 1]; ++r) {
+            const int64_t pos = (int64_t) tox[j] * 64 + (r - L.bh[j]), tile = pos / 64;
+            const int rr = (int) (pos % 64);
+            const int32_t t = L.src[(size_t) r];
+            bad += std::memcmp(&gs[(size_t) pos], &gt[(size_t) t], 4) != 0;
+            for (int kt = 0; kt < NKT; ++kt) {
+                const uint8_t* tp = tiles.data() + (size_t) (tile * NKT + kt) * ST;
+                for (int q = 0; q < 4; ++q)
+                    bad += std::memcmp(tp + rr * 64 + ((q ^ ((rr >> 1) & 3)) << 4),
+                                       tok.data() + (size_t) t * (N / 2) + kt * 64 + 16 * q, 16) != 0;
+                bad += std::memcmp(tp + 4096 + rr * 8, scales + (size_t) t * (N / 16) + kt * 8, 8) != 0;
+            }
+        }
+    std::printf("  token planes == the tiles' codes, scales and token scales (bitwise, %lld rows): %s\n", (long long) rows,
+                bad == 0 ? "yes" : "NO");
+    return bad == 0;
+}
+
+// The gate/up product from the token planes with the SwiGLU in its epilogue, every group at once into absolute H rows.
+void run_fused_h(const F4& f, Bufs& b, const Layer& L, const float* x_dev, const int32_t* src_dev,
+                 const std::vector<const uint8_t*>& blob, float* h_abs, cudaStream_t s) {
+    const size_t n = L.order.size();
+    ck(cudaMemcpyAsync(b.bounds.p, L.bh.data(), L.bh.size() * 4, cudaMemcpyHostToDevice, s), "bounds");
+    fp4::quantize_tokens(x_dev, L.T, N, N, f.a4x.p, f.gsx.as<float>(), s);
+    for (size_t j0 = 0; j0 < n; j0 += GROUP) {
+        const size_t j1 = std::min(n, j0 + GROUP);
+        int64_t maxr = 0;
+        for (size_t i = j0; i < j1; ++i) maxr = std::max<int64_t>(maxr, L.cnt[(size_t) L.order[i]]);
+        fp4::Product gu;
+        for (size_t q = j0; q < j1; ++q) gu.blob[q - j0] = blob[(size_t) L.order[q]];
+        gu.w_off = 0; gu.w_rows = 1280; gu.w_cols = N; gu.n = (int) (j1 - j0); gu.a4 = f.a4x.p; gu.gs = f.gsx.as<float>();
+        gu.bounds = b.bounds.as<int32_t>() + j0; gu.ids = src_dev; gu.tokens = L.T; gu.swiglu = true; gu.tail_off = TAIL_OFF;
+        gu.dst = h_abs; gu.ld_dst = FF; gu.max_rows = maxr;
+        fp4::run(gu, s);
+    }
+}
+
 // The production sequence: `fp4::run_group` over each group of up to 16 experts, GU and H holding only a run's rows,
 // in runs of at most `row_cap` rows.  Buffers past the run rows carry guard bytes that must stay untouched.
 constexpr size_t kGuardRows = 64, kGuardBytes = 4096;
 struct F4Run {
     int64_t cap_rows;
-    Dev gu, h, a4h, gsh, th;
+    Dev h, a4h, gsh, th;
     F4Run(int64_t rows)
-        : cap_rows(rows), gu((size_t) (rows + kGuardRows) * 1280 * 4), h((size_t) (rows + kGuardRows) * FF * 4),
-          a4h(fp4::a4_bytes(rows, FF, GROUP) + kGuardBytes), gsh(fp4::scale_count(rows, GROUP) * 4 + kGuardBytes),
-          th(2 * (GROUP + 1) * 4) {}
+        : cap_rows(rows), h((size_t) (rows + kGuardRows) * FF * 4), a4h(fp4::a4_bytes(rows, FF, GROUP) + kGuardBytes),
+          gsh(fp4::scale_count(rows, GROUP) * 4 + kGuardBytes), th(2 * (GROUP + 1) * 4) {}
 };
 bool guard_clear(const void* base, size_t from, size_t to) {
     std::vector<uint8_t> v(to - from);
@@ -334,19 +404,12 @@ bool guard_clear(const void* base, size_t from, size_t to) {
     for (uint8_t c : v) if (c != 0xff) return false;
     return true;
 }
-// returns the number of runs; `guards` is cleared when anything wrote past a run's rows
-int run_fp4_group(F4& f, F4Run& r, Bufs& b, const Layer& L, const float* x_dev, const int32_t* src_dev,
-                  const std::vector<const uint8_t*>& blob, int64_t row_cap, bool& guards, cudaStream_t s) {
-    const int64_t rows = (int64_t) L.T * K;
+// prefill.cpp's FP4 sequence for one layer: the token planes, then each group in runs of at most `row_cap` rows
+int enqueue_fp4_group(F4& f, F4Run& r, Bufs& b, const Layer& L, const float* x_dev, const int32_t* src_dev,
+                      const std::vector<const uint8_t*>& blob, int64_t row_cap, cudaStream_t s) {
     const size_t n = L.order.size();
     ck(cudaMemcpyAsync(b.bounds.p, L.bh.data(), L.bh.size() * 4, cudaMemcpyHostToDevice, s), "bounds");
-    fp4::plan(b.bounds.as<int32_t>(), (int) n, f.tox.as<int32_t>(), s);
-    fp4::quantize(x_dev, src_dev, b.bounds.as<int32_t>(), f.tox.as<int32_t>(), (int) n, f.a4x.p, f.gsx.as<float>(), N, N,
-                  rows, s);
-    ck(cudaMemsetAsync(r.gu.p, 0xff, r.gu.bytes, s), "guard");
-    ck(cudaMemsetAsync(r.h.p, 0xff, r.h.bytes, s), "guard");
-    ck(cudaMemsetAsync(r.a4h.p, 0xff, r.a4h.bytes, s), "guard");
-    ck(cudaMemsetAsync(r.gsh.p, 0xff, r.gsh.bytes, s), "guard");
+    fp4::quantize_tokens(x_dev, L.T, N, N, f.a4x.p, f.gsx.as<float>(), s);
     int runs = 0;
     for (size_t j0 = 0; j0 < n; j0 += GROUP) {
         const int ngx = (int) std::min<size_t>(GROUP, n - j0);
@@ -355,16 +418,23 @@ int run_fp4_group(F4& f, F4Run& r, Bufs& b, const Layer& L, const float* x_dev, 
         for (int q = 0; q < ngx; ++q) g.blob[q] = blob[(size_t) L.order[j0 + (size_t) q]];
         g.bounds_host = L.bh.data() + j0;
         g.bounds_dev = b.bounds.as<int32_t>() + j0;
-        g.a4x = f.a4x.p; g.gsx = f.gsx.as<float>(); g.tox = f.tox.as<int32_t>() + j0;
+        g.ids = src_dev; g.a4x = f.a4x.p; g.gsx = f.gsx.as<float>(); g.tokens = L.T;
         g.down_off = DOWN_OFF; g.tail_off = TAIL_OFF;
-        g.gu = r.gu.as<float>(); g.h = r.h.as<float>(); g.dm = b.dm.as<float>();
+        g.h = r.h.as<float>(); g.dm = b.dm.as<float>();
         g.a4h = r.a4h.p; g.gsh = r.gsh.as<float>(); g.toh = r.th.as<int32_t>(); g.rel = g.toh + (GROUP + 1);
-        g.tails = b.scales();
         runs += fp4::run_group(g, row_cap, s);
     }
+    return runs;
+}
+// returns the number of runs; `guards` is cleared when anything wrote past a run's rows
+int run_fp4_group(F4& f, F4Run& r, Bufs& b, const Layer& L, const float* x_dev, const int32_t* src_dev,
+                  const std::vector<const uint8_t*>& blob, int64_t row_cap, bool& guards, cudaStream_t s) {
+    ck(cudaMemsetAsync(r.h.p, 0xff, r.h.bytes, s), "guard");
+    ck(cudaMemsetAsync(r.a4h.p, 0xff, r.a4h.bytes, s), "guard");
+    ck(cudaMemsetAsync(r.gsh.p, 0xff, r.gsh.bytes, s), "guard");
+    const int runs = enqueue_fp4_group(f, r, b, L, x_dev, src_dev, blob, row_cap, s);
     ck(cudaStreamSynchronize(s), "sync group");
-    guards = guard_clear(r.gu.p, (size_t) r.cap_rows * 1280 * 4, r.gu.bytes) &&
-             guard_clear(r.h.p, (size_t) r.cap_rows * FF * 4, r.h.bytes) &&
+    guards = guard_clear(r.h.p, (size_t) r.cap_rows * FF * 4, r.h.bytes) &&
              guard_clear(r.a4h.p, fp4::a4_bytes(r.cap_rows, FF, GROUP), r.a4h.bytes) &&
              guard_clear(r.gsh.p, fp4::scale_count(r.cap_rows, GROUP) * 4, r.gsh.bytes);
     return runs;
@@ -493,26 +563,22 @@ bool edge_activations(const std::vector<std::vector<uint8_t>>& host, const std::
         L.order = {0};
         L.bh = {0, RK, 0, RK};
         // rows = T * K in the helpers: this layer has RK rows, so describe it with K = 1 rows by hand
-        Dev src_dev((size_t) RK * 4), bdev(L.bh.size() * 4), dm((size_t) RK * N * 4), tails(64);
+        Dev src_dev((size_t) RK * 4), bdev(L.bh.size() * 4), dm((size_t) RK * N * 4);
         ck(cudaMemcpy(src_dev.p, L.src.data(), RK * 4, cudaMemcpyHostToDevice), "src");
         ck(cudaMemcpy(bdev.p, L.bh.data(), L.bh.size() * 4, cudaMemcpyHostToDevice), "bounds");
         F4 fk(RK, 1);
-        fp4::plan(bdev.as<int32_t>(), 1, fk.tox.as<int32_t>(), s);
-        fp4::quantize(xk_dev.as<float>(), src_dev.as<int32_t>(), bdev.as<int32_t>(), fk.tox.as<int32_t>(), 1, fk.a4x.p,
-                      fk.gsx.as<float>(), N, N, RK, s);
+        fp4::quantize_tokens(xk_dev.as<float>(), RK, N, N, fk.a4x.p, fk.gsx.as<float>(), s);
         F4Run r(RK);
-        ck(cudaMemset(r.gu.p, 0, r.gu.bytes), "clr");
         ck(cudaMemset(dm.p, 0xff, dm.bytes), "clr");
         fp4::Group g;
         g.n = 1;
         g.blob[0] = blob[0];
         g.bounds_host = L.bh.data();
         g.bounds_dev = bdev.as<int32_t>();
-        g.a4x = fk.a4x.p; g.gsx = fk.gsx.as<float>(); g.tox = fk.tox.as<int32_t>();
+        g.ids = src_dev.as<int32_t>(); g.a4x = fk.a4x.p; g.gsx = fk.gsx.as<float>(); g.tokens = RK;
         g.down_off = DOWN_OFF; g.tail_off = TAIL_OFF;
-        g.gu = r.gu.as<float>(); g.h = r.h.as<float>(); g.dm = dm.as<float>();
+        g.h = r.h.as<float>(); g.dm = dm.as<float>();
         g.a4h = r.a4h.p; g.gsh = r.gsh.as<float>(); g.toh = r.th.as<int32_t>(); g.rel = g.toh + (GROUP + 1);
-        g.tails = tails.as<float>();
         fp4::run_group(g, 1 << 20, s);
         ck(cudaStreamSynchronize(s), "sync edge path");
         const std::vector<float> o = download(dm, (size_t) RK * N);
@@ -536,35 +602,32 @@ bool edge_activations(const std::vector<std::vector<uint8_t>>& host, const std::
 }
 
 // The streamed walk's FP4 sequence on the current device: the experts `order` (absolute row bounds `bh`, n + 1, rows
-// laid out by `src`: row -> token) planned and rounded as one layer, then run in groups of GROUP experts.
+// laid out by `src`: row -> token) over the `T` tokens' activations rounded once, then run in groups of GROUP experts.
 std::vector<float> primary_rows(const std::vector<int32_t>& order, const std::vector<int32_t>& bh, int64_t rows,
-                                const float* x_dev, const std::vector<int32_t>& src,
+                                const float* x_dev, int64_t T, const std::vector<int32_t>& src,
                                 const std::vector<const uint8_t*>& blob, int64_t row_cap, cudaStream_t s) {
     const int n = (int) order.size();
     int64_t maxcnt = 0;
     for (int j = 0; j < n; ++j) maxcnt = std::max<int64_t>(maxcnt, bh[(size_t) j + 1] - bh[(size_t) j]);
     const int64_t gr = std::min(rows, std::max(row_cap, maxcnt));   // GU and H hold a run's rows
-    Dev src_dev(src.size() * 4 + 4), bd((size_t) (n + 1) * 4), a4x(fp4::a4_bytes(rows, N, n)),
-        gsx(fp4::scale_count(rows, n) * 4), tox((size_t) (n + 1) * 4), gu((size_t) gr * 1280 * 4),
+    Dev src_dev(src.size() * 4 + 4), bd((size_t) (n + 1) * 4), a4x(fp4::token_bytes(T, N)),
+        gsx((size_t) T * 4),
         h((size_t) gr * FF * 4), a4h(fp4::a4_bytes(gr, FF, GROUP)), gsh(fp4::scale_count(gr, GROUP) * 4),
-        th(2 * (GROUP + 1) * 4), tails(GROUP * 16), dm((size_t) rows * N * 4);
+        th(2 * (GROUP + 1) * 4), dm((size_t) rows * N * 4);
     ck(cudaMemcpy(src_dev.p, src.data(), src.size() * 4, cudaMemcpyHostToDevice), "src");
     ck(cudaMemcpy(bd.p, bh.data(), (size_t) (n + 1) * 4, cudaMemcpyHostToDevice), "bounds");
     ck(cudaMemset(dm.p, 0xff, dm.bytes), "clr");
-    fp4::plan(bd.as<int32_t>(), n, tox.as<int32_t>(), s);
-    fp4::quantize(x_dev, src_dev.as<int32_t>(), bd.as<int32_t>(), tox.as<int32_t>(), n, a4x.p, gsx.as<float>(), N, N,
-                  rows, s);
+    fp4::quantize_tokens(x_dev, T, N, N, a4x.p, gsx.as<float>(), s);
     for (int j0 = 0; j0 < n; j0 += GROUP) {
         fp4::Group g;
         g.n = std::min(GROUP, n - j0);
         for (int q = 0; q < g.n; ++q) g.blob[q] = blob[(size_t) order[(size_t) (j0 + q)]];
         g.bounds_host = bh.data() + j0;
         g.bounds_dev = bd.as<int32_t>() + j0;
-        g.a4x = a4x.p; g.gsx = gsx.as<float>(); g.tox = tox.as<int32_t>() + j0;
+        g.ids = src_dev.as<int32_t>(); g.a4x = a4x.p; g.gsx = gsx.as<float>(); g.tokens = T;
         g.down_off = DOWN_OFF; g.tail_off = TAIL_OFF;
-        g.gu = gu.as<float>(); g.h = h.as<float>(); g.dm = dm.as<float>();
+        g.h = h.as<float>(); g.dm = dm.as<float>();
         g.a4h = a4h.p; g.gsh = gsh.as<float>(); g.toh = th.as<int32_t>(); g.rel = g.toh + (GROUP + 1);
-        g.tails = tails.as<float>();
         fp4::run_group(g, row_cap, s);
     }
     ck(cudaStreamSynchronize(s), "sync primary rows");
@@ -572,10 +635,10 @@ std::vector<float> primary_rows(const std::vector<int32_t>& order, const std::ve
 }
 
 // The peer card's sequence (prefill.cpp, no direct access between the cards): its experts `order` (bounds `bh`
-// relative to its block, rows laid out by `src`) in pieces of at most `cap` rows (fp4::cut_pieces), each group planned
-// and rounded from the activations on its own, into buffers of `cap` rows.  `ms`: the compute alone, timed again.
+// relative to its block, rows laid out by `src`) in pieces of at most `cap` rows (fp4::cut_pieces), from the `T`
+// tokens' activations rounded once, into buffers of `cap` rows.  `ms`: the compute alone, timed again.
 std::vector<float> peer_rows(const std::vector<int32_t>& order, const std::vector<int32_t>& bh, int64_t rows,
-                             const float* x_dev, const std::vector<int32_t>& src,
+                             const float* x_dev, int64_t T, const std::vector<int32_t>& src,
                              const std::vector<const uint8_t*>& blob, int64_t cap, cudaStream_t s, float& ms,
                              int& npieces, int& ngroups) {
     fp4::Pieces pc;
@@ -589,29 +652,26 @@ std::vector<float> peer_rows(const std::vector<int32_t>& order, const std::vecto
         for (int i = pc.group[(size_t) g]; i <= pc.group[(size_t) g + 1]; ++i)
             rel.push_back(pc.bounds[(size_t) i] - pc.bounds[(size_t) pc.group[(size_t) g]]);
     }
-    Dev src_dev(src.size() * 4 + 4), rd(rel.size() * 4 + 4), a4x(fp4::a4_bytes(cap, N, GROUP)),
-        gsx(fp4::scale_count(cap, GROUP) * 4), tox((GROUP + 1) * 4), gu((size_t) cap * 1280 * 4),
+    Dev src_dev(src.size() * 4 + 4), rd(rel.size() * 4 + 4), a4x(fp4::token_bytes(T, N)), gsx((size_t) T * 4),
         h((size_t) cap * FF * 4), a4h(fp4::a4_bytes(cap, FF, GROUP)), gsh(fp4::scale_count(cap, GROUP) * 4),
-        th(2 * (GROUP + 1) * 4), tails(GROUP * 16), dm((size_t) cap * N * 4);
+        th(2 * (GROUP + 1) * 4), dm((size_t) cap * N * 4);
     ck(cudaMemcpy(src_dev.p, src.data(), src.size() * 4, cudaMemcpyHostToDevice), "src");
     ck(cudaMemcpy(rd.p, rel.data(), rel.size() * 4, cudaMemcpyHostToDevice), "bounds");
     std::vector<float> out((size_t) rows * N);
+    fp4::quantize_tokens(x_dev, T, N, N, a4x.p, gsx.as<float>(), s);
     auto group = [&](int g) {
         const int p0 = pc.group[(size_t) g], ns = pc.group[(size_t) g + 1] - p0;
         const int64_t r0 = pc.bounds[(size_t) p0], nr = pc.bounds[(size_t) p0 + ns] - r0;
         const int32_t* rb = rd.as<int32_t>() + rel_at[(size_t) g];
-        fp4::plan(rb, ns, tox.as<int32_t>(), s);
-        fp4::quantize(x_dev, src_dev.as<int32_t>() + r0, rb, tox.as<int32_t>(), ns, a4x.p, gsx.as<float>(), N, N, nr, s);
         fp4::Group fg;
         fg.n = ns;
         for (int i = 0; i < ns; ++i) fg.blob[i] = blob[(size_t) order[(size_t) pc.expert[(size_t) (p0 + i)]]];
         fg.bounds_host = rel.data() + rel_at[(size_t) g];
         fg.bounds_dev = rb;
-        fg.a4x = a4x.p; fg.gsx = gsx.as<float>(); fg.tox = tox.as<int32_t>();
+        fg.ids = src_dev.as<int32_t>() + r0; fg.a4x = a4x.p; fg.gsx = gsx.as<float>(); fg.tokens = T;
         fg.down_off = DOWN_OFF; fg.tail_off = TAIL_OFF;
-        fg.gu = gu.as<float>(); fg.h = h.as<float>(); fg.dm = dm.as<float>();
+        fg.h = h.as<float>(); fg.dm = dm.as<float>();
         fg.a4h = a4h.p; fg.gsh = gsh.as<float>(); fg.toh = th.as<int32_t>(); fg.rel = fg.toh + (GROUP + 1);
-        fg.tails = tails.as<float>();
         if (fp4::run_group(fg, cap, s) != 1) throw std::runtime_error("a peer group took more than one run");
         return std::make_pair(r0, nr);
     };
@@ -684,9 +744,9 @@ bool peer_share(int d0, int d1, const PeerShape& sh, const std::vector<const uin
     {
         Dev x0(x.size() * 4);
         ck(cudaMemcpy(x0.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
-        ref = primary_rows(L.order, bh_all, rows, x0.as<float>(), L.src, blob0, row_cap, s0);
+        ref = primary_rows(L.order, bh_all, rows, x0.as<float>(), sh.T, L.src, blob0, row_cap, s0);
         const std::vector<int32_t> src_l(src2.begin(), src2.begin() + rows_local);
-        loc = primary_rows(order_l, bh_l, rows_local, x0.as<float>(), src_l, blob0, row_cap, s0);
+        loc = primary_rows(order_l, bh_l, rows_local, x0.as<float>(), sh.T, src_l, blob0, row_cap, s0);
     }
     cudaStreamDestroy(s0);
     // the peer: its own copy of the activations (the same bytes, through the host)
@@ -700,7 +760,7 @@ bool peer_share(int d0, int d1, const PeerShape& sh, const std::vector<const uin
         Dev x1(x.size() * 4);
         ck(cudaMemcpy(x1.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
         const std::vector<int32_t> src_p(src2.begin() + rows_local, src2.end());
-        per = peer_rows(order_p, bh_p, rows - rows_local, x1.as<float>(), src_p, blob1, sh.cap, s1, ms, npieces, ngroups);
+        per = peer_rows(order_p, bh_p, rows - rows_local, x1.as<float>(), sh.T, src_p, blob1, sh.cap, s1, ms, npieces, ngroups);
     }
     cudaStreamDestroy(s1);
     ck(cudaSetDevice(d0), "device 0");
@@ -800,12 +860,24 @@ int parity(cudaStream_t s) {
     ck(cudaMemset(b.gu.p, 0, (size_t) rows * 1280 * 4), "clr");
     run_fp4(f4, b, L, x_dev.as<float>(), src_dev.as<int32_t>(), blob, s);
     ck(cudaStreamSynchronize(s), "sync fp4");
-    const std::vector<float> fy = download(b.dm, (size_t) rows * N), fgu = download(b.gu, (size_t) rows * 1280);
+    const std::vector<float> fy = download(b.dm, (size_t) rows * N), fgu = download(b.gu, (size_t) rows * 1280),
+                             fh = download(b.h, (size_t) rows * FF);
     const bool same_gather = std::memcmp(y.data(), y1.data(), y.size() * 4) == 0;
+    // the production gate/up: token planes, SwiGLU in the epilogue; H must be the plain product + mmq::swiglu's bits
+    const bool planes_ok = token_planes_match(f4, L, x_dev.as<float>(), src_dev.as<int32_t>(), s);
+    Dev hf_dev((size_t) rows * FF * 4);
+    ck(cudaMemset(hf_dev.p, 0xff, hf_dev.bytes), "clr");
+    run_fused_h(f4, b, L, x_dev.as<float>(), src_dev.as<int32_t>(), blob, hf_dev.as<float>(), s);
+    ck(cudaStreamSynchronize(s), "sync fused");
+    const std::vector<float> hf = download(hf_dev, (size_t) rows * FF);
+    const bool fused_same = std::memcmp(hf.data(), fh.data(), hf.size() * 4) == 0;
+    std::printf("  fused SwiGLU H == plain gate/up product + mmq::swiglu (bitwise, %lld x %d): %s\n", (long long) rows, FF,
+                fused_same ? "yes" : "NO");
 
     // the references, an expert at a time on all cores
     std::vector<float> r_same((size_t) rows * N), r_dbl((size_t) rows * N), r_f16((size_t) rows * N),
-                       r_gu((size_t) rows * 1280), r_gu4((size_t) rows * 1280), r_dn4((size_t) rows * N);
+                       r_gu((size_t) rows * 1280), r_gu4((size_t) rows * 1280), r_dn4((size_t) rows * N),
+                       r_h4((size_t) rows * FF);
     const auto* tr = ggml_get_type_traits(GGML_TYPE_NVFP4);
     parallel(E, [&](int e) {
         if (L.cnt[(size_t) e] == 0) return;
@@ -844,6 +916,7 @@ int parity(cudaStream_t s) {
                 r_gu4[(size_t) p * 1280 + FF + k] = (float) u4;
                 g4 *= sg; u4 *= su;
                 h4[(size_t) k] = (float) (g4 / (1.0 + std::exp(-g4)) * u4 * sd);
+                r_h4[(size_t) p * FF + k] = h4[(size_t) k];
                 g *= sg; u *= su; gd *= sg; ud *= su;
                 h[(size_t) k] = (float) (g / (1.0 + std::exp(-g)) * u * sd);   // MMQ's H carries s_down
                 hd[(size_t) k] = (float) (gd / (1.0 + std::exp(-gd)) * ud);
@@ -934,6 +1007,20 @@ int parity(cudaStream_t s) {
     std::printf("  FP4 gate/up vs A4-rounding reference: rms %.3e (tol 1e-5)\n", f4gu);
     std::printf("  FP4 down vs A4-rounding reference:    rms %.3e worst row %.3e (tol rms 1e-4)\n", f4dn.rms, f4dn.worst);
     std::printf("  FP4 output independent of tile position and neighbours (bitwise): %s\n", indep ? "yes" : "NO");
+    std::printf("  FP4 output hashes (FNV-1a): H %016llx, layer %016llx\n", (unsigned long long) fnv(fh),
+                (unsigned long long) fnv(fy));
+    double h2 = 0, hr2 = 0, hw = 0;
+    for (int64_t p = 0; p < rows; ++p) {
+        double me = 0, mr = 0;
+        for (int k = 0; k < FF; ++k) {
+            const double d = (double) hf[(size_t) p * FF + k] - r_h4[(size_t) p * FF + k];
+            h2 += d * d; hr2 += (double) r_h4[(size_t) p * FF + k] * r_h4[(size_t) p * FF + k];
+            me = std::max(me, std::fabs(d)); mr = std::max(mr, (double) std::fabs(r_h4[(size_t) p * FF + k]));
+        }
+        if (mr > 0) hw = std::max(hw, me / mr);
+    }
+    const double hrms = hr2 > 0 ? std::sqrt(h2 / hr2) : 0;
+    std::printf("  fused SwiGLU H vs A4-rounding reference: rms %.3e worst row %.3e (tol rms 1e-5)\n", hrms, hw);
     bool zero_ok = true;
     for (int64_t p = 0; p < rows; ++p)
         if (L.src[(size_t) p] == ZERO)
@@ -952,7 +1039,7 @@ int parity(cudaStream_t s) {
     const bool edge_ok = edge_activations(host, blob, s);
     const bool ok = split_ok && edge_ok && fe.rms <= 0.2 && fm.rms <= 0.2 && grms <= 1e-5 && gworst <= 1e-4 && es.rms <= 2e-4 && es.worst <= 1e-2 && ed.rms <= 2.5e-2 &&
                     ef.rms <= 2e-2 && same_gather && zero_ok &&
-                    f4gu <= 1e-5 && f4dn.rms <= 1e-4 && indep;
+                    f4gu <= 1e-5 && f4dn.rms <= 1e-4 && indep && planes_ok && fused_same && hrms <= 1e-5;
     std::printf("parity: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
@@ -1015,6 +1102,20 @@ void bench(cudaStream_t s) {
     };
     std::printf("bench: FP4 layer %.1f us (x%.2f vs MMQ); rel rms fp4 vs mmq: gate/up %.3e (tail-free), down %.3e\n",
                 1e3 * ms4 / R, ms / ms4, rel(f_gu, m_gu), rel(f_dm, m_dm));
+    // the production path: token planes, the gate/up product with the SwiGLU in its epilogue, a group per run
+    F4Run run(rows);
+    auto prod = [&]() { enqueue_fp4_group(f, run, b, L, x_dev.as<float>(), src_dev.as<int32_t>(), blob, (int64_t) 1 << 40, s); };
+    for (int w = 0; w < 2; ++w) prod();
+    cudaEventRecord(e0, s);
+    for (int r = 0; r < R; ++r) prod();
+    cudaEventRecord(e1, s);
+    ck(cudaEventSynchronize(e1), "bench production");
+    float msp = 0;
+    cudaEventElapsedTime(&msp, e0, e1);
+    const double flop4 = 2.0 * (double) rows * (1280.0 * N + (double) N * FF);
+    std::printf("bench: FP4 expert path, %d tokens x top %d over %d experts: quantize per row + plain gate/up + SwiGLU "
+                "%.1f us (%.1f TFLOP/s), token planes + fused SwiGLU %.1f us (%.1f TFLOP/s), x%.2f\n", T, K, E,
+                1e3 * ms4 / R, flop4 / (1e3 * ms4 / R) * 1e-6, 1e3 * msp / R, flop4 / (1e3 * msp / R) * 1e-6, ms4 / msp);
     std::printf("bench: NVFP4 MMQ layer, %d tokens x top %d over %d experts (%zu with rows): %.1f us, %.1f TFLOP/s "
                 "(gathers + q8_1 + gate/up + SwiGLU + down)\n", T, K, E, L.order.size(), us, flop / us * 1e-6);
 }

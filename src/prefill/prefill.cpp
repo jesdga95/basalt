@@ -344,13 +344,11 @@ struct PeerPrefill {
     // through pinned host buffers on streams of their own, so neither card's issuing thread waits for a staged copy.
     int prim = -1;                        // the primary's device
     int64_t T_fp4 = 0;
-    void* f_a4x = nullptr;                // one group's activation planes, token scales and tile table
+    void* f_a4x = nullptr;                // the layer's token planes and token scales (fp4::quantize_tokens)
     float* f_gsx = nullptr;
-    int32_t* f_tox = nullptr;
     void* f_a4h = nullptr;                // a run's H planes, token scales, tile table and relative bounds
     float* f_gsh = nullptr;
     int32_t* f_toh = nullptr;
-    float* f_tails = nullptr;
     int32_t* f_rel = nullptr;             // every group's piece bounds of a layer, relative to the group's first row
     size_t f_rel_cap = 0;
     std::vector<int32_t> f_rel_host;
@@ -796,16 +794,15 @@ MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused) {
 struct Fp4Ptrs {
     uint8_t *a4x, *a4h;
     float *gsx, *gsh;
-    int32_t *tox, *toh, *rel;
+    int32_t *toh, *rel;
 };
-// Where the FP4 path's tables sit in Xq (the layer's activations) and Hq (a group's H), as moe_bufs sized them.
+// Where the FP4 path's tables sit in Xq (the layer's token planes) and Hq (a group's H), as moe_bufs sized them.
 Fp4Ptrs fp4_ptrs(void* xq, void* hq, int64_t T, int64_t n_expert) {
     const size_t rows = (size_t) (T * K), ne = (size_t) n_expert;
     Fp4Ptrs p;
     uint8_t* x = (uint8_t*) xq;
     p.a4x = x;
     p.gsx = (float*) (x + al256(fp4::a4_bytes((int64_t) rows, N, (int) ne)));
-    p.tox = (int32_t*) ((uint8_t*) p.gsx + al256(fp4::scale_count((int64_t) rows, (int) ne) * 4));
     uint8_t* h = (uint8_t*) hq;
     p.a4h = h;
     const size_t hrows = group_rows_cap((size_t) T);
@@ -1288,13 +1285,11 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
     pp->grp_d = (uint8_t*) take(MMQ_GROUP * mp.d_max + MMQ_TAIL + MMQ_SCALES);
     if (tf > 0) {   // the FP4 share's group buffers (GU, H and the result rows are the MMQ group's)
         const int64_t Gr = pp->G;
-        pp->f_a4x = take(fp4::a4_bytes(Gr, N, MMQ_GROUP));
-        pp->f_gsx = (float*) take(fp4::scale_count(Gr, MMQ_GROUP) * 4);
-        pp->f_tox = (int32_t*) take((size_t) (MMQ_GROUP + 1) * 4);
+        pp->f_a4x = take(fp4::token_bytes(Tp, N));
+        pp->f_gsx = (float*) take((size_t) Tp * 4);
         pp->f_a4h = take(fp4::a4_bytes(Gr, 640, MMQ_GROUP));
         pp->f_gsh = (float*) take(fp4::scale_count(Gr, MMQ_GROUP) * 4);
         pp->f_toh = (int32_t*) take((size_t) 2 * (MMQ_GROUP + 1) * 4);
-        pp->f_tails = (float*) take((size_t) MMQ_GROUP * 16);
         // a piece per expert and one per whole tile run cut off a long one, and per group one bound more
         pp->f_rel_cap = (size_t) 2 * (NE + Tp * K / fp4::kTileTokens + 1);
         pp->f_rel = (int32_t*) take(pp->f_rel_cap * 4);
@@ -2280,11 +2275,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 cudaMemcpyAsync(m.bounds_dev, m.bounds_host.data(), m.bounds_host.size() * 4,
                                                 cudaMemcpyHostToDevice, m.cs);
                             }
-                            if (fp4_l) {   // the activations as FP4 tiles in expert order
+                            if (fp4_l) {   // the activations as FP4, once per token: the gate/up product reads a row's token
                                 const Fp4Ptrs fp = fp4_ptrs(m.Xq, m.Hq, m.T, m.g->n_expert);
-                                fp4::plan(m.bounds_dev, (int) n, fp.tox, m.cs);
-                                fp4::quantize(m.mixed, m.src_dev, m.bounds_dev, fp.tox, (int) n, fp.a4x, fp.gsx, N, N,
-                                              rows_local, m.cs);
+                                fp4::quantize_tokens(m.mixed, T, N, N, fp.a4x, fp.gsx, m.cs);
                             }
                         } else {
                             gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
@@ -2333,14 +2326,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             cudaEventRecord(P.ev_hx_free, ps);
                             cudaMemcpyAsync(P.src, src_h + rows_local, (size_t) rows_peer * 4, cudaMemcpyHostToDevice, ps);
                             cudaMemcpyAsync(P.f_rel, P.f_rel_host.data(), P.f_rel_host.size() * 4, cudaMemcpyHostToDevice, ps);
+                            // the layer's activations as FP4, once per token (the primary's bytes)
+                            fp4::quantize_tokens(P.mixed, T, N, N, P.f_a4x, P.f_gsx, ps);
                             const auto& f = lay.fmt[(size_t) l];
                             for (int g2 = 0; g2 < ngr; ++g2) {
                                 const int i0 = pc.group[(size_t) g2], ns = pc.group[(size_t) g2 + 1] - i0;
                                 const int64_t r0 = pc.bounds[(size_t) i0], nr = pc.bounds[(size_t) (i0 + ns)] - r0;
                                 const int32_t* rb = P.f_rel + P.f_rel_at[(size_t) g2];
-                                // the group's rows to FP4 tiles on their own (per-row roundings: the primary's bytes)
-                                fp4::plan(rb, ns, P.f_tox, ps);
-                                fp4::quantize(P.mixed, P.src + r0, rb, P.f_tox, ns, P.f_a4x, P.f_gsx, N, N, nr, ps);
                                 const int b = g2 & 1;
                                 if (P.dm_live[b]) cudaStreamWaitEvent(ps, P.ev_dm[b], 0);   // its last rows have left
                                 fp4::Group fg;
@@ -2349,12 +2341,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     fg.blob[i] = P.peer->slot_ptr(l, order_peer[(size_t) pc.expert[(size_t) (i0 + i)]]);
                                 fg.bounds_host = P.f_rel_host.data() + P.f_rel_at[(size_t) g2];
                                 fg.bounds_dev = rb;
-                                fg.a4x = P.f_a4x; fg.gsx = P.f_gsx; fg.tox = P.f_tox;
+                                fg.ids = P.src + r0; fg.a4x = P.f_a4x; fg.gsx = P.f_gsx; fg.tokens = T;
                                 fg.down_off = f.down_off;
                                 fg.tail_off = f.bytes - f.tail;
-                                fg.gu = P.GU_g; fg.h = P.H_g; fg.dm = P.Dm_b[b];
+                                fg.h = P.H_g; fg.dm = P.Dm_b[b];
                                 fg.a4h = P.f_a4h; fg.gsh = P.f_gsh; fg.toh = P.f_toh; fg.rel = P.f_toh + (MMQ_GROUP + 1);
-                                fg.tails = P.f_tails;
                                 fp4::run_group(fg, P.G, ps);
                                 // the rows back through a host buffer whose last rows have reached Dm
                                 const int hb = g2 % PeerPrefill::kRes;
@@ -2570,19 +2561,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (fp4_n == 0) return;
                             if (gg_nslots > 0) cudaStreamWaitEvent(m.cs, m.copied[gg_slots[gg_nslots - 1]], 0);
                             const Fp4Ptrs fp = fp4_ptrs(m.Xq, m.Hq, m.T, m.g->n_expert);
-                            // runs of consecutive experts of at most the rows GU and H hold: GU and H index a run's own
-                            // rows, the layer's Dm and activation planes the absolute ones
+                            // runs of consecutive experts of at most the rows H holds: H indexes a run's own rows, the
+                            // layer's Dm and row -> token table the absolute ones
                             fp4::Group fg;
                             fg.n = fp4_n;
                             for (int i = 0; i < fp4_n; ++i) fg.blob[i] = fp4_blob[i];
                             fg.bounds_host = m.bounds_host.data() + fp4_j0;
                             fg.bounds_dev = m.bounds_dev + fp4_j0;
-                            fg.a4x = fp.a4x; fg.gsx = fp.gsx; fg.tox = fp.tox + fp4_j0;
+                            fg.ids = m.src_dev; fg.a4x = fp.a4x; fg.gsx = fp.gsx; fg.tokens = T;
                             fg.down_off = lay.fmt[(size_t) l].down_off;
                             fg.tail_off = lay.fmt[(size_t) l].bytes - lay.fmt[(size_t) l].tail;
-                            fg.gu = m.GU; fg.h = m.H; fg.dm = m.Dm;
+                            fg.h = m.H; fg.dm = m.Dm;
                             fg.a4h = fp.a4h; fg.gsh = fp.gsh; fg.toh = fp.toh; fg.rel = fp.rel;
-                            fg.tails = grp_scales(m.grp_d);
                             fp4::run_group(fg, (int64_t) group_rows_cap((size_t) m.T), m.cs);
                             if (gg_nslots > 0) {   // the blobs are read: give the ring slots back
                                 const int rel_slot = gg_slots[gg_nslots - 1];
