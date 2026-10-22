@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ENGINE = Path(os.environ.get("BASALT_BIN", ROOT / "bin" / "basalt"))
 BENCH = Path(os.environ.get("BASALT_BENCH_BIN", ROOT / "bin" / "basalt-bench"))
 # bench's own options that share an engine flag's name
-BENCH_OWNED = {"--help", "--model", "--engine", "--spec", "--set"}
+BENCH_OWNED = {"--help", "--model", "--engine", "--spec", "--set", "--seed"}
 
 
 def engine_flags() -> list[str]:
@@ -58,10 +58,17 @@ class BenchFlags(unittest.TestCase):
         self.assertEqual(cmd.count("--max-context"), 1)
 
     def test_a_switch_does_not_take_the_next_option(self):
-        cmd = self.command("--peer-exclusive", "-p", "16384", "-t", "prose", "--seed", "-1")
+        cmd = self.command("--peer-exclusive", "-p", "16384", "-t", "prose", "--vram-reserve-mib", "-1")
         self.assertIn("--peer-exclusive", cmd)
         self.assertNotIn("-p", cmd)
-        self.assertEqual(cmd[cmd.index("--seed") + 1], "-1")
+        self.assertEqual(cmd[cmd.index("--vram-reserve-mib") + 1], "-1")
+
+    def test_seed_is_the_benchs_and_is_not_passed_to_the_engine(self):
+        cmd = self.command("--seed", "7")
+        self.assertNotIn("--seed", cmd)
+        for bad in ("0", "-3", "x"):
+            r = subprocess.run([str(BENCH), "--model", "m.basalt", "--seed", bad], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2)
 
     def test_built_ins_are_minimal(self):
         cmd = self.command()
@@ -81,7 +88,7 @@ class BenchFlags(unittest.TestCase):
         return r.stdout.split()
 
     def test_community_refuses_anything_that_changes_the_workload(self):
-        for extra in (["--spec", "0"], ["--kv", "int8"], ["-t", "conv"], ["-p", "16384"], ["-r", "2"], ["--quality"],
+        for extra in (["--spec", "0"], ["--kv", "int8"], ["-t", "conv"], ["-p", "16384"], ["-r", "2"], ["--quality"], ["--seed", "7"],
                       ["--set", "--kv int8"], ["-o", "json"], ["--engine", "x"], ["--", "--spec", "3"]):
             with self.subTest(extra=extra):
                 r = subprocess.run([str(BENCH), "--model", "m.basalt", "--community", *extra],

@@ -242,6 +242,7 @@ struct Options {
     bool community = false;
     std::string submitter = "YOUR_GITHUB_HANDLE";
     int quality_chunks = 20, quality_t = 3;
+    unsigned long long seed = 0;         // --seed N: the sampling seed of every decode request (0: the engine seeds from the clock)
 };
 
 void usage(const std::string& engine) {
@@ -261,6 +262,9 @@ void usage(const std::string& engine) {
         "                     only the gate; with -p / -t it runs after them\n"
         "  --kld-base FILE    llama.cpp KL-divergence base for the quality gate\n"
         "  --quality-t T      tokens per verify window in the quality gate (default 3)\n"
+        "  --seed N           sampling seed (N >= 1) sent with every decode request, so the sampled fixtures\n"
+        "                     (conv, prose) give the same text on every run; without it each request is seeded\n"
+        "                     from the clock\n"
         "\n"
         "community row\n"
         "  --community        the fixed preset \"community-1\" for the public benchmark table: the three decode\n"
@@ -362,7 +366,11 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else if (a == "--kld-base") o.kld_base = next("--kld-base");
         else if (a == "--no-windows") o.no_windows = true;
         else if (a == "-r") o.reps = std::atoi(next("-r").c_str());
-        else if (a == "--quality-t") o.quality_t = std::atoi(next("--quality-t").c_str());
+        else if (a == "--seed") {
+            const std::string v = next("--seed");
+            if (!all_digits(v.c_str()) || std::strtoull(v.c_str(), nullptr, 10) == 0) { err = "--seed needs an integer >= 1"; return false; }
+            o.seed = std::strtoull(v.c_str(), nullptr, 10);
+        } else if (a == "--quality-t") o.quality_t = std::atoi(next("--quality-t").c_str());
         else if (a == "-p") {
             o.sel_prefill = true;
             for (const auto& d : split(next("-p"), ',')) {
@@ -399,7 +407,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
     if (o.community) {
         const char* bad = o.sel_decode || o.sel_prefill ? "-t / -p" : o.reps != 1 ? "-r" : o.quality ? "--quality"
                         : !o.spec.empty() ? "--spec" : !o.sets.empty() ? "--set" : !o.engine.empty() ? "--engine"
-                        : !o.power_label.empty() ? "--power-label" : o.no_windows ? "--no-windows"
+                        : !o.power_label.empty() ? "--power-label" : o.seed ? "--seed" : o.no_windows ? "--no-windows"
                         : o.format != "md" ? "-o" : !o.passthrough.empty() ? o.passthrough[0].c_str() : nullptr;
         if (bad != nullptr) {
             err = std::string("--community runs the fixed preset: ") + bad + " would make the row incomparable";
@@ -442,10 +450,11 @@ constexpr long long kPrefillBase = 16384;   // the base body's depth in tokens
 constexpr long long kCommunityPrefillShort = 16384, kCommunityPrefillLong = 65536;   // the community preset's depths
 constexpr long long kPrefillBaseDecode = 32;
 
-std::string sampling_keys(double temperature) {
+std::string sampling_keys(double temperature, unsigned long long seed) {
     std::string k;
     if (temperature > 0.0) k += fmt(" temperature=%.17g", temperature);
     k += " top_p=0.95 top_k=20";
+    if (seed) k += " seed=" + std::to_string(seed);
     return k;
 }
 
@@ -804,7 +813,7 @@ int main(int argc, char** argv) {
                 Result r;
                 r.name = kDecode[i].name;
                 r.run = run;
-                if (!eng.request(sampling_keys(kDecode[i].temperature), kDecode[i].max_new, decode_ids[i], r.d)) {
+                if (!eng.request(sampling_keys(kDecode[i].temperature, o.seed), kDecode[i].max_new, decode_ids[i], r.d)) {
                     std::fprintf(stderr, "basalt-bench: %s (run %d): %s\n", r.name.c_str(), run, r.d.err.c_str());
                     failed = true;
                     break;
