@@ -196,6 +196,7 @@ int main(int argc, char** argv) {
     const std::string log_path = (fs::path(work) / "engine.log").string();
 
     Engine eng;
+    eng.label = "basalt-probe";
     std::fprintf(stderr, "basalt-probe: starting the engine\n");
     if (!eng.start(engine_bin, args, log_path, err)) {
         std::fprintf(stderr, "basalt-probe: %s\n", err.c_str());

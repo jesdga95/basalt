@@ -86,6 +86,14 @@ void prefer_oom_victim() {}
 
 bool gpu_peer_access() { return false; }
 
+bool stderr_is_terminal() {
+    if (!_isatty(_fileno(stderr))) return false;
+    const HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    DWORD mode = 0;
+    if (h == INVALID_HANDLE_VALUE || !GetConsoleMode(h, &mode)) return false;
+    return (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0 || SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
+}
+
 void set_stdio_binary() {
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
@@ -129,6 +137,8 @@ void prefer_oom_victim() {
 }
 
 bool gpu_peer_access() { return true; }
+
+bool stderr_is_terminal() { return isatty(STDERR_FILENO) != 0; }
 
 void set_stdio_binary() {}
 

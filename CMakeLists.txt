@@ -420,9 +420,10 @@ add_custom_target(git_stamp
 execute_process(COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DOUT=${_git_stamp}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/git_stamp.cmake)
 # the engine driven as a child process and the report logic, shared by basalt-bench and basalt-probe
-add_library(engine_session STATIC src/program/engine_session.cpp src/program/probe_report.cpp src/program/probe_derive.cpp src/program/auto_plan.cpp)
+add_library(engine_session STATIC src/program/engine_session.cpp src/program/load_summary.cpp src/program/probe_report.cpp src/program/probe_derive.cpp src/program/auto_plan.cpp)
 target_include_directories(engine_session PUBLIC include)
-target_link_libraries(engine_session PUBLIC platform)
+find_package(Threads REQUIRED)
+target_link_libraries(engine_session PUBLIC platform Threads::Threads)
 # the GBNF grammar engine and the JSON-schema and tool-call grammar builders (CPU only, no engine dependency)
 add_library(grammar STATIC src/program/grammar/grammar.cpp src/program/grammar/schema.cpp src/program/grammar/json_schema.cpp
             src/program/grammar/schema_convert.cpp src/program/grammar/guard.cpp)
@@ -813,6 +814,13 @@ foreach(_t cpu_test compiler_test region_test process_pipe_test system_test)
   basalt_cpu_test(NAME platform_${_t} COMMAND platform_${_t})
   set_tests_properties(platform_${_t} PROPERTIES TIMEOUT 120)
 endforeach()
+
+# the engine's load lines condensed for basalt-bench: lines, throttling, terminal mode (CPU only)
+add_executable(load_summary_test tests/program/load_summary_test.cpp)
+target_link_libraries(load_summary_test PRIVATE engine_session warnings)
+basalt_embed_manifest(load_summary_test)
+basalt_cpu_test(NAME load_summary_test COMMAND load_summary_test)
+set_tests_properties(load_summary_test PROPERTIES TIMEOUT 60)
 
 # basalt-probe's report: rates block and layout (CPU only)
 add_executable(probe_report_test tests/program/probe_report_test.cpp)

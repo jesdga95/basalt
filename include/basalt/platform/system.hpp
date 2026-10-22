@@ -36,6 +36,10 @@ bool gpu_peer_access();
 /// streams are pipes carrying bytes; a console wants its text mode. Nothing to do where text and binary are the same.
 void set_stdio_binary();
 
+/// Whether standard error is a terminal that takes ANSI line control (a status line rewritten in place); false for a
+/// pipe or a file.
+bool stderr_is_terminal();
+
 /// Where the OS keeps its memory accounting as text files, for the readers that parse them: the system's
 /// `meminfo`, this process's cgroup membership and the cgroup mount. Empty where there is no such file, and the OS
 /// call (`available_memory`) is the reading.

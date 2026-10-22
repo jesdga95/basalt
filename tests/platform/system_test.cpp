@@ -20,6 +20,7 @@ void check(bool ok, const std::string& what) {
 int main() {
     using namespace basalt::platform;
     check(process_id() > 0, "process_id is positive");
+    (void) stderr_is_terminal();   // either answer is valid; the call must not fail
 
     const std::string mi = meminfo_path();
     if (!mi.empty()) {

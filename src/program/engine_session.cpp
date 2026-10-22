@@ -2,8 +2,15 @@
 #include "basalt/program/engine_session.hpp"
 
 #include "basalt/platform/file.hpp"
+#include "basalt/platform/system.hpp"
+#include "basalt/program/load_summary.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <cstdio>
+#include <mutex>
+#include <thread>
 #include <cmath>
 #include <cctype>
 #include <chrono>
@@ -16,6 +23,72 @@ namespace basalt::program {
 namespace {
 using Clock = std::chrono::steady_clock;
 double secs(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double>(b - a).count(); }
+
+// Follows the engine's log file while the start waits for READY and prints the load summary.
+class LogFollower {
+public:
+    LogFollower(const std::string& path, const std::string& label)
+        : path_(path), t0_(Clock::now()), sum_(label, basalt::platform::stderr_is_terminal(), 0.0),
+          thread_([this] { run(); }) {}
+    ~LogFollower() { stop(false); }
+    void stop(bool ready) {
+        if (stopped_) return;
+        stopped_ = true;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            quit_ = true;
+        }
+        cv_.notify_all();
+        thread_.join();
+        poll();
+        emit(sum_.finish(now(), ready));
+    }
+
+private:
+    double now() const { return secs(t0_, Clock::now()); }
+    static void emit(const std::string& s) {
+        if (s.empty()) return;
+        std::fputs(s.c_str(), stderr);
+        std::fflush(stderr);
+    }
+    void poll() {
+        std::ifstream f(path_, std::ios::binary);
+        if (f) {
+            f.seekg(offset_);
+            char tmp[16384];
+            while (f.read(tmp, sizeof tmp) || f.gcount() > 0) {
+                partial_.append(tmp, (size_t) f.gcount());
+                offset_ += (std::streamoff) f.gcount();
+            }
+        }
+        size_t nl;
+        while ((nl = partial_.find('\n')) != std::string::npos) {
+            std::string l = partial_.substr(0, nl);
+            partial_.erase(0, nl + 1);
+            if (!l.empty() && l.back() == '\r') l.pop_back();
+            emit(sum_.feed(l, now()));
+        }
+        emit(sum_.tick(now()));
+    }
+    void run() {
+        std::unique_lock<std::mutex> lk(mu_);
+        while (!quit_) {
+            lk.unlock();
+            poll();
+            lk.lock();
+            cv_.wait_for(lk, std::chrono::milliseconds(200), [this] { return quit_; });
+        }
+    }
+
+    std::string path_, partial_;
+    Clock::time_point t0_;
+    basalt::program::LoadSummary sum_;
+    std::streamoff offset_ = 0;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool quit_ = false, stopped_ = false;
+    std::thread thread_;
+};
 }  // namespace
 
 bool Engine::start(const std::string& engine_bin, const std::vector<std::string>& args, const std::string& log_path,
@@ -26,6 +99,7 @@ bool Engine::start(const std::string& engine_bin, const std::vector<std::string>
     basalt::platform::set_stop_child(child_.child);
     log_path_ = log_path;
     std::string line;
+    LogFollower follower(log_path, label);
     while (read_line(line)) {
         if (line.rfind("INFO ", 0) == 0) {
             std::istringstream is(line.substr(5));
@@ -35,9 +109,11 @@ bool Engine::start(const std::string& engine_bin, const std::vector<std::string>
                 if (eq != std::string::npos) info[kv.substr(0, eq)] = kv.substr(eq + 1);
             }
         } else if (line.rfind("READY", 0) == 0) {
+            follower.stop(true);
             return true;
         }
     }
+    follower.stop(false);
     err = "the engine exited before READY" + engine_failure(log_path);
     reap();
     return false;

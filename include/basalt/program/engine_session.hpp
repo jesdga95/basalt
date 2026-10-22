@@ -25,7 +25,7 @@ class Engine {
 public:
     ~Engine() { stop(); }
 
-    /// Starts the engine and waits for READY; `info` holds the key=value pairs of its INFO line.
+    /// Starts the engine and waits for READY, printing a summary of its load progress meanwhile; `info` holds the key=value pairs of its INFO line.
     bool start(const std::string& engine_bin, const std::vector<std::string>& args, const std::string& log_path,
                std::string& err);
 
@@ -41,6 +41,8 @@ public:
     void stop();
 
     std::map<std::string, std::string> info;
+    /// Prefix of the load-progress lines `start` prints to stderr while it waits for READY.
+    std::string label = "basalt-bench";
 
 private:
     bool write_all(const std::string& s);

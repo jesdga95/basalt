@@ -779,7 +779,7 @@ int main(int argc, char** argv) {
         const Session& sess = sessions[si];
         const std::string log_path = (fs::path(work) / (si == 0 ? "engine.log" : fmt("engine-%zu.log", si))).string();
         Engine eng;
-        std::fprintf(stderr, "basalt-bench: starting %s\n", engine_bin.c_str());
+        std::fprintf(stderr, "basalt-bench: starting %s (log: %s)\n", engine_bin.c_str(), log_path.c_str());
         if (!eng.start(engine_bin, perf_args, log_path, err)) {
             std::fprintf(stderr, "basalt-bench: %s\n", err.c_str());
             return 1;
