@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace basalt::prefill::fp4 {
 
@@ -76,5 +77,15 @@ void run_experts(const Group& g, int i0, int n, void* stream);
 int run_length(const Group& g, int i0, int64_t row_cap);
 /// The whole group as runs of at most `row_cap` rows each (GU and H hold a run's rows); returns the number of runs.
 int run_group(const Group& g, int64_t row_cap, void* stream);
+
+/// The rows of n consecutive experts ([bounds[j], bounds[j + 1]), on the host) in pieces for buffers of `cap` rows
+/// (cap >= kTileTokens): an expert above the cap is cut at whole tiles from its first row, so each piece's tiles hold
+/// the rows the expert's own tiles hold.  The pieces form groups of up to kMaxExperts pieces and at most `cap` rows.
+struct Pieces {
+    std::vector<int32_t> expert;   ///< per piece: its expert's index j
+    std::vector<int32_t> bounds;   ///< per piece its first row, then the last piece's end
+    std::vector<int32_t> group;    ///< per group its first piece, then the piece count
+};
+void cut_pieces(const int32_t* bounds, int n, int64_t cap, Pieces& out);
 
 }  // namespace basalt::prefill::fp4
