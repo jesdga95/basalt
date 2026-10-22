@@ -41,7 +41,14 @@ class BenchFlags(unittest.TestCase):
         return r.stdout.split()
 
     def test_the_flag_list_is_found(self):
-        self.assertGreater(len(engine_flags()), 100)
+        # Every flag the help lists is one the engine parser accepts; an empty or cut-short list would make the
+        # per-flag test vacuous.
+        flags = engine_flags()
+        parsed = set(re.findall(r'a == "(--[a-z0-9-]+)"', (ROOT / "src/program/generate.cpp").read_text()))
+        self.assertTrue(parsed)
+        self.assertEqual(sorted(set(flags) - parsed), [])
+        for known in ("--spec", "--kv", "--max-context", "--peer-device"):
+            self.assertIn(known, flags)
 
     def test_every_engine_flag_reaches_the_engine(self):
         for flag in engine_flags():
