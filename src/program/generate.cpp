@@ -5340,6 +5340,9 @@ int main(int argc, char** argv) {
             return true;
         };
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
+        // the end of the part being read when the part loop saves a checkpoint there (else -1): the periodic
+        // checkpoint skips that cell, the loop's copy runs beside what follows
+        int64_t pp_part_ckpt = -1;
         // the position the prompt pass has read up to (a chunk's or a window's end): what a request cancelled mid-read
         // reports as read, instead of the whole prompt
         int64_t pp_reached = 0;
@@ -5439,6 +5442,10 @@ int main(int argc, char** argv) {
             basalt::core::progress_beat();
             std::fflush(stdout);
             if (o.prompt_cache_every > 0 && done >= pp_next_check) {
+                if (done == pp_part_ckpt && !multi_gpu) {
+                    pp_next_check = done + o.prompt_cache_every;
+                    return true;
+                }
                 bool saved = false;
                 if (multi_gpu) {   // the stages' parts, saved when each of them read this chunk
                     std::vector<ConvCheckpoint> parts;
@@ -8330,7 +8337,9 @@ int main(int argc, char** argv) {
                     return true;
                 };
                 const auto tsp = Clock::now();
+                pp_part_ckpt = (to == turn_at || to == root_at) ? to : -1;
                 const bool sp_ok = win ? read_windows(at, to, err) : read_part(at, to, err);
+                pp_part_ckpt = -1;
                 if (sp_ok && win && !ov_window()) { std::printf("ERR %s\n", err.c_str()); return 1; }
                 if (!sp_ok) {
                     if (yielded_at < 0 && (batch_fatal || !(stop_req.load() || stdin_lost.load() || ram_stop.load()))) {
