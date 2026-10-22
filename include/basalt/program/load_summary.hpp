@@ -28,13 +28,13 @@ private:
         std::string name;
         bool copy = false, reported = false;
         unsigned long long plan = 0, done = 0, last = 0, seen = 0;   // done: finished phases; last: current phase
-        double start = -1;
+        double start = -1, end = 0;
         unsigned long long have() const { return done + last; }
-        unsigned long long size() const { return plan > have() ? plan : have(); }
+        unsigned long long size() const { return reported || have() > plan ? have() : plan; }
     };
     Target& target(const std::string& name, bool copy);
     std::string running() const;                    // "t d / p GiB" for the targets still loading, with percent
-    std::string all_targets(double now) const;      // the terminal status line (without the label)
+    std::string all_targets(double now, bool final) const;      // the terminal status line (without the label)
     std::string line(const std::string& text) const { return label_ + ": " + text + "\n"; }
     std::string redraw(double now);
 

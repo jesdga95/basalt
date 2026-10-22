@@ -65,6 +65,14 @@ int main() {
         is(s.feed(ld("cuda0", 6.0, 6.0), 3.0), "basalt-bench: loading cuda0 10.0 / 10.0 GiB done (3 s)\n",
            "the next phase adds on and completes the plan");
     }
+    {   // a plan above what the phases place: the target is done when the next one starts
+        LoadSummary s("basalt-bench", false, 0.0);
+        s.feed(gb("plan cuda0", 10.0), 0.0);
+        s.feed(ld("cuda0", 0, 9.8), 0.0);
+        is(s.feed(ld("cuda0", 9.8, 9.8), 4.0), "", "a phase below its plan is not reported on its own");
+        is(s.feed(ld("ram", 0, 3.0), 5.0), "basalt-bench: loading cuda0 9.8 / 9.8 GiB done (4 s)\n",
+           "and is reported done when the next target starts");
+    }
     {   // a failure prints no ready line
         LoadSummary s("basalt-probe", false, 0.0);
         is(s.finish(5.0, false), "", "a failed start prints no ready line");
@@ -86,7 +94,7 @@ int main() {
         is(s.feed("basalt error: bad", 1.3), "\r\x1b[2Kbasalt-bench: engine: bad\n", "an error clears the line and prints its own");
         s.feed(ld("ram", 21.0, 38.0), 2.0);
         is(s.finish(41.0, true),
-           "\r\x1b[2Kbasalt-bench: loading cuda0 14.0/14.0 GiB \xC2\xB7 ram 21.0/38.0 GiB \xC2\xB7 67% \xC2\xB7 41 s\n"
+           "\r\x1b[2Kbasalt-bench: loading cuda0 14.0/14.0 GiB \xC2\xB7 ram 21.0/21.0 GiB \xC2\xB7 100% \xC2\xB7 41 s\n"
            "basalt-bench: engine ready in 41 s\n",
            "READY leaves the last status line and adds the ready line");
     }

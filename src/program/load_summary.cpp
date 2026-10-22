@@ -49,7 +49,7 @@ std::string LoadSummary::running() const {
     return list.empty() ? "" : "loading " + list + " (" + pct(d, p) + ")";
 }
 
-std::string LoadSummary::all_targets(double now) const {
+std::string LoadSummary::all_targets(double now, bool final) const {
     std::string list;
     unsigned long long d = 0, whole = total_;
     for (const auto& t : targets_) {
@@ -60,11 +60,11 @@ std::string LoadSummary::all_targets(double now) const {
             if (!total_) whole += t.size();
         }
     }
-    return list.empty() ? "" : "loading " + list + kDot + pct(d, whole) + kDot + secs(now - t0_);
+    return list.empty() ? "" : "loading " + list + kDot + (final ? "100%" : pct(d, whole)) + kDot + secs(now - t0_);
 }
 
 std::string LoadSummary::redraw(double now) {
-    const std::string s = all_targets(now);
+    const std::string s = all_targets(now, false);
     if (s.empty()) return "";
     drawn_ = true;
     last_out_ = now;
@@ -100,7 +100,17 @@ std::string LoadSummary::feed(const std::string& raw, double now) {
     if (w.size() != 3 || !number(w[1], a) || !number(w[2], b)) return "";
 
     Target& t = target(w[0], copy);
-    if (t.start < 0) t.start = now;
+    std::string out;
+    if (t.start < 0) {
+        t.start = now;
+        // phases run one after another: a target whose last phase ended is done, whatever its plan said
+        for (auto& o : targets_)
+            if (&o != &t && o.copy == copy && o.start >= 0 && !o.reported && o.seen && o.last >= o.seen) {
+                o.reported = true;
+                if (!tty_) out += line("loading " + label_of(o.name, o.copy) + " " + gib(o.have()) + " / " + gib(o.size()) + " GiB done (" + secs(o.end - o.start) + ")");
+            }
+    }
+    t.end = now;
     if (t.seen != b || a < t.last) {   // a new phase: the previous one is complete
         t.done += t.seen ? t.last : 0;
         t.last = 0;
@@ -108,14 +118,13 @@ std::string LoadSummary::feed(const std::string& raw, double now) {
         t.reported = false;
     }
     t.last = a < b ? a : b;
-    if (b == 0) return "";
+    if (b == 0) return out;
 
     const bool complete = a >= b && (t.plan == 0 || t.have() >= t.plan);
     if (tty_) {
         if (!drawn_ || now - last_out_ >= redraw_ || complete) return redraw(now);
         return "";
     }
-    std::string out;
     if (!header_) {
         header_ = true;
         std::string parts;
@@ -146,7 +155,8 @@ std::string LoadSummary::tick(double now) {
 std::string LoadSummary::finish(double now, bool ready) {
     std::string out;
     if (tty_ && drawn_) {
-        out = std::string(kClear) + label_ + ": " + all_targets(now) + "\n";
+        for (auto& t : targets_) t.reported = t.reported || ready;
+        out = std::string(kClear) + label_ + ": " + all_targets(now, ready) + "\n";
         drawn_ = false;
     }
     if (ready) out += line("engine ready in " + secs(now - t0_));
