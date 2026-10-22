@@ -366,6 +366,16 @@ bool PleTable::gather_rows(const uint32_t* rows, size_t n_tokens, float* out, st
     return true;
 }
 
+bool PleTable::warm_rows(const uint32_t* rows, size_t n_tokens, std::string& err) {
+    if (impl_->mode != PleIo::Direct) return true;
+    std::vector<uint8_t> raw(n_tokens * (size_t) PLE_N_HEADS * impl_->rb);
+    return impl_->reader.collect(impl_->reader.issue(rows, n_tokens * (size_t) PLE_N_HEADS, raw.data()), err);
+}
+
+uint64_t PleTable::cache_rows() const {
+    return impl_->mode == PleIo::Direct && impl_->reader.is_open() ? impl_->reader.cache_capacity() : 0;
+}
+
 bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err) {
     const size_t n = n_tokens * (size_t) PLE_N_HEADS;
     if (impl_->mode != PleIo::Direct) {

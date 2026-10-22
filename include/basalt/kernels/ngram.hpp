@@ -149,6 +149,12 @@ public:
     /// prefetch ring or the single-token slot, so a prompt read on another thread cannot collect, or wait on,
     /// the decode path's prefetches. Safe to call concurrently with the decode path's methods.
     bool gather_rows(const uint32_t* rows, size_t n_tokens, float* out, std::string& err);
+    /// Reads the rows of `n_tokens` tokens (16 each) into the reader's row cache and discards them, so a later
+    /// `gather_rows` of the same rows is served from memory.  Direct mode only (no-op otherwise); the gathered
+    /// values are unchanged.  Safe to call concurrently with `gather_rows`.
+    bool warm_rows(const uint32_t* rows, size_t n_tokens, std::string& err);
+    /// Capacity of the row cache in rows (0 when there is none).
+    uint64_t cache_rows() const;
 
     /// Fault injection (Direct mode): every row read completes no earlier than `us` after issue.
     void set_injected_delay_us(double us);

@@ -111,6 +111,11 @@ public:
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
 
+    /// For the next `run` (which must start at `run_pos0`): once its first chunk's n-gram rows have landed, the rows of
+    /// `tokens[from, to)` (the prompt's later parts) are read into the row cache on a thread, so the runs that read
+    /// them find the rows in memory.  Needs `from >= 2`; `to` is cut to what the cache holds.  Cleared by that run.
+    void set_ple_warm(const int64_t* tokens, int64_t run_pos0, int64_t from, int64_t to);
+
     const PrefillStats& stats() const { return stats_; }
 
     /// Starts counting, per (layer, expert), the routed entries of the prompt rows this stage and the stages after it

@@ -8276,6 +8276,14 @@ int main(int argc, char** argv) {
                 turn_at = -1;
                 root_at = -1;
             }
+            // the parts after the first read their n-gram rows from memory: once the first part has its own, the rest
+            // are read into the row cache beside it
+            {
+                int64_t first_to = 0;
+                for (const int64_t to : {root_at, turn_at, n - 1})
+                    if (to > read_from) { first_to = to; break; }
+                sp.set_ple_warm(ids.data(), read_from, first_to, n - 1);
+            }
             int64_t at = read_from;
             for (const int64_t to : {root_at, turn_at, n - 1}) {
                 if (to <= at) continue;

@@ -516,6 +516,13 @@ struct Prefill::Impl {
     std::unique_ptr<PeerPrefill> pp;         // multi-GPU: the peer GPU's expert share (set_peer)
     core::PeerExperts* ring_peer = nullptr;  // --peer-exclusive: experts held only there are copied from its memory
     PeerStage peer_stage;                    // the asynchronous host-staged copy of those experts
+    // row-cache warm-up of the prompt's later parts (set_ple_warm)
+    struct PleWarm {
+        std::vector<int64_t> tok;            // tokens[from - 2, to)
+        int64_t run_pos0 = 0, to = 0;
+        bool pending = false;
+        std::future<void> fut;
+    } warm;
 };
 
 namespace {
@@ -558,6 +565,7 @@ void Prefill::reset() {
 
 void Prefill::release() {
     if (!impl_) return;
+    if (impl_->warm.fut.valid()) impl_->warm.fut.wait();
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
     for (int i = 0; i < RING_MAX; ++i) {
@@ -1471,6 +1479,28 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 });
             }
             ple_buf ^= 1;
+            if (m.warm.pending && m.warm.run_pos0 == pos0) {
+                m.warm.pending = false;
+                m.warm.fut = std::async(std::launch::async, [&m, sess = m.ss] {
+                    try {
+                        constexpr size_t kSlice = 2048;   // tokens per request, so the reader is shared with the chunk reads
+                        const std::vector<int64_t>& w = m.warm.tok;
+                        std::vector<uint32_t> rows;
+                        std::string e;
+                        for (size_t a = 2; a < w.size(); a += kSlice) {
+                            const size_t b = std::min(a + kSlice, w.size());
+                            rows.resize((b - a) * basalt::kernels::PLE_N_HEADS);
+                            for (size_t i = a; i < b; ++i) {
+                                const int32_t tok = (int32_t) w[i];
+                                const int32_t pv[2] = {(int32_t) w[i - 2], (int32_t) w[i - 1]};
+                                basalt::kernels::ngram_rows(&tok, pv, 1, sess->ple.consts,
+                                                            rows.data() + (i - a) * basalt::kernels::PLE_N_HEADS);
+                            }
+                            if (!sess->ple.table->warm_rows(rows.data(), b - a, e)) return;
+                        }
+                    } catch (const std::exception&) {}   // only a warm-up: the later read fetches what is missing
+                });
+            }
             stats_.ms_ple += ms_since(tp);
             return true;
         };
@@ -2672,8 +2702,25 @@ bool Prefill::route_hist_take(std::vector<uint32_t>& out, int64_t& tokens) {
     return true;
 }
 
+void Prefill::set_ple_warm(const int64_t* tokens, int64_t run_pos0, int64_t from, int64_t to) {
+    Impl& m = *impl_;
+    if (m.warm.fut.valid()) m.warm.fut.wait();
+    m.warm.pending = false;
+    if (m.ss == nullptr || !m.ss->ple.ready() || m.ss->ple.table == nullptr || from < 2) return;
+    const int64_t cap = (int64_t) (m.ss->ple.table->cache_rows() / (2 * basalt::kernels::PLE_N_HEADS));
+    to = std::min(to, from + cap);
+    if (to <= from) return;
+    m.warm.tok.assign(tokens + from - 2, tokens + to);
+    m.warm.run_pos0 = run_pos0;
+    m.warm.to = to;
+    m.warm.pending = true;
+}
+
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     const bool body_ok = run_impl(tokens, n, pos0, err);
+    // the tokens the warm-up reads belong to this request: wait for it once the run that reads them is over
+    impl_->warm.pending = false;
+    if (impl_->warm.fut.valid() && (!body_ok || pos0 + n >= impl_->warm.to)) impl_->warm.fut.wait();
 
     std::string drain_err;
     const bool drain_ok = drain_pipeline(drain_err);
