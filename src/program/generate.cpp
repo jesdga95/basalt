@@ -6661,6 +6661,7 @@ int main(int argc, char** argv) {
         // so it keeps the conversation it holds
         auto batch_step = [&]() -> bool {
             constexpr int MR = basalt::kernels::kVerifyMaxT;
+            const int MB = std::min(MR, ver.max_t());   // the row budget is this verifier capacity; MR only sizes the arrays
             int S = 0, R = 0;
             int rows[MR] = {}, lens[MR] = {}, n_keep[MR] = {}, r0s[MR] = {};
             int32_t tok[MR] = {}, outb[MR] = {};
@@ -6694,7 +6695,7 @@ int main(int argc, char** argv) {
             const bool real = batch_spec && !scripted;
             if (real) {
                 // each slot's window as the solo rule makes it (the drafts that clear the cumulative or min-p cut, or a
-                // prompt-lookup run the policy prefers); the rows beyond MR go to the slots whose last kept draft is the
+                // prompt-lookup run the policy prefers); the rows beyond the budget go to the slots whose last kept draft is the
                 // least likely to be accepted
                 int Tw[MR] = {};
                 float val[MR][8] = {};
@@ -6724,13 +6725,13 @@ int main(int argc, char** argv) {
                 }
                 int sum = 0;
                 for (int sg = 0; sg < S; ++sg) sum += Tw[sg];
-                if (sum > MR) {
+                if (sum > MB) {
                     // every slot keeps one row, and none takes more than an equal share of the window unless the others
                     // want less: the slots wanting least are served in full, the rest split what is left
                     int ord[MR];
                     for (int sg = 0; sg < S; ++sg) ord[sg] = sg;
                     std::sort(ord, ord + S, [&](int x1, int x2) { return Tw[x1] < Tw[x2]; });
-                    int left_rows = MR;
+                    int left_rows = MB;
                     for (int i = 0; i < S; ++i) {
                         const int share = std::max(1, (left_rows + (S - i) - 1) / (S - i));
                         Tw[ord[i]] = std::min(Tw[ord[i]], share);
@@ -6739,7 +6740,7 @@ int main(int argc, char** argv) {
                     sum = 0;
                     for (int sg = 0; sg < S; ++sg) sum += Tw[sg];
                 }
-                while (sum > MR) {
+                while (sum > MB) {
                     int pick = -1;
                     for (int sg = 0; sg < S; ++sg)
                         if (Tw[sg] > 1 && (pick < 0 || val[sg][Tw[sg] - 2] < val[pick][Tw[pick] - 2])) pick = sg;
@@ -6753,7 +6754,7 @@ int main(int argc, char** argv) {
                     drafts[sg].assign(src, src + (Tw[sg] - 1));
                 }
             } else {   // the rows beyond one per slot go to the scripted slots, as many drafts as the script and the context allow
-                int extra = MR - S;
+                int extra = MB - S;
                 const int first = (int) (bs[(size_t) rows[0]].rng() % (uint64_t) S);
                 for (int i = 0; i < S && extra > 0; ++i) {
                     const int sg = (first + i) % S;
