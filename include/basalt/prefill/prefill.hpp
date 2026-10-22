@@ -127,7 +127,8 @@ public:
 
     /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk (up to `cap_rows` routed
     /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
-    /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
+    /// chunks of up to init's `chunk` tokens.  Without P2P: the routed-only chunks, and the streamed ones up to a fixed
+    /// size on the FP4 experts (the same bits as this GPU's), with the rows crossing through host memory.
     bool set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err);
     /// --peer-exclusive: experts only `peer` holds have no host copy; the prompt path reads them from its memory
     /// over P2P (into the ring, or in place).  Independent of set_peer.

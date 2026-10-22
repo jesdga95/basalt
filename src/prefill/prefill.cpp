@@ -338,6 +338,34 @@ struct PeerPrefill {
     mmq::Context* run_ctx = nullptr;      // the context its products run in: ctx, or a layer split helper stage's
     std::vector<int32_t> bounds_host;
     std::vector<void*> owned;
+    // WITHOUT DIRECT ACCESS, a streamed chunk of up to T_fp4 tokens: the primary leaves the experts the peer holds out
+    // of its stream, and the peer computes their rows with the primary's FP4 kernels (the same bits) from its own copy
+    // of the activations, in pieces of at most G rows (fp4::cut_pieces).  The activations and the result rows cross
+    // through pinned host buffers on streams of their own, so neither card's issuing thread waits for a staged copy.
+    int prim = -1;                        // the primary's device
+    int64_t T_fp4 = 0;
+    void* f_a4x = nullptr;                // one group's activation planes, token scales and tile table
+    float* f_gsx = nullptr;
+    int32_t* f_tox = nullptr;
+    void* f_a4h = nullptr;                // a run's H planes, token scales, tile table and relative bounds
+    float* f_gsh = nullptr;
+    int32_t* f_toh = nullptr;
+    float* f_tails = nullptr;
+    int32_t* f_rel = nullptr;             // every group's piece bounds of a layer, relative to the group's first row
+    size_t f_rel_cap = 0;
+    std::vector<int32_t> f_rel_host;
+    std::vector<size_t> f_rel_at;
+    fp4::Pieces pieces;
+    float* hx = nullptr;                  // pinned: the layer's activations on their way to the peer
+    static constexpr int kRes = 4;
+    float* hres[kRes] = {};               // pinned: a group's result rows on their way back
+    cudaStream_t x_out = nullptr, res_in = nullptr;   // on the primary: the activations' download, the rows' upload
+    cudaEvent_t ev_hx = nullptr;          // primary: hx holds the layer's activations
+    cudaEvent_t ev_hx_free = nullptr;     // peer: its upload from hx is done
+    cudaEvent_t ev_d2h[kRes] = {};        // peer: hres[b] holds a group's rows
+    cudaEvent_t ev_h2d[kRes] = {};        // primary: hres[b]'s rows are in Dm
+    cudaEvent_t ev_res = nullptr;         // primary: the layer's peer rows are in Dm
+    bool hx_live = false, res_live[kRes] = {};
     ~PeerPrefill() {
         if (dev < 0) return;
         int prev = 0;
@@ -350,14 +378,23 @@ struct PeerPrefill {
         if (s_out) cudaStreamSynchronize(s_out);
         for (cudaEvent_t e : ev_grp) if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : ev_dm) if (e) cudaEventDestroy(e);
+        if (ev_hx_free) cudaEventDestroy(ev_hx_free);
+        for (cudaEvent_t e : ev_d2h) if (e) cudaEventDestroy(e);
         if (s_cp) cudaStreamSynchronize(s_cp);
         for (cudaEvent_t e : pcopied) if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : pused) if (e) cudaEventDestroy(e);
         if (s_cp) cudaStreamDestroy(s_cp);
         if (s_out) cudaStreamDestroy(s_out);
         if (s) cudaStreamDestroy(s);
-        cudaSetDevice(prev);
+        cudaSetDevice(prim >= 0 ? prim : prev);
+        for (cudaStream_t st : {x_out, res_in})
+            if (st) { cudaStreamSynchronize(st); cudaStreamDestroy(st); }
+        for (cudaEvent_t e : {ev_hx, ev_res}) if (e) cudaEventDestroy(e);
+        for (cudaEvent_t e : ev_h2d) if (e) cudaEventDestroy(e);
         if (ev_in) cudaEventDestroy(ev_in);
+        if (hx) cudaFreeHost(hx);
+        for (float* h : hres) if (h) cudaFreeHost(h);
+        cudaSetDevice(prev);
     }
 };
 
@@ -702,6 +739,15 @@ bool fp4_pack() {
 }
 // A chunk shorter than this leaves most expert tiles nearly empty and the per-expert launches dominate: MMQ is faster.
 constexpr int64_t FP4_MIN_TOKENS = 1024;
+// Without direct access between the cards, the peer computes its experts' rows of a streamed chunk of up to this many
+// tokens (PeerPrefill::T_fp4).  The layer's activations go to it and its rows come back through host memory, and the
+// layer's end waits for that round trip; it grows with the chunk while the blobs it saves do not, so a longer chunk
+// streams the blobs instead.
+constexpr int64_t kPeerFp4Tokens = 5120;
+// In such a chunk the issuing thread keeps at most this many expert copies queued on the primary's link (the ring still
+// runs as far ahead): copies on one link are served in the order they were queued, and the peer's result rows, which
+// the layer's end waits for, would otherwise queue behind the copies for the layers after it.
+constexpr int kPeerInFlight = 16;
 constexpr size_t al256(size_t v) { return (v + 255) & ~(size_t) 255; }
 size_t fp4_x_bytes(size_t rows, int64_t ne) {
     return al256(fp4::a4_bytes((int64_t) rows, N, (int) ne)) + al256(fp4::scale_count((int64_t) rows, (int) ne) * 4) +
@@ -1167,24 +1213,33 @@ void Prefill::set_ring_peer(core::PeerExperts* peer) {
     impl_->ring_peer = peer != nullptr && peer->valid() ? peer : nullptr;
 }
 
-bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err) {
-    Impl& m = *impl_;
-    if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
-    // Without P2P the peer still takes the rows of the routed-only chunks (below stream_all_min()): the activations and
-    // result rows cross through host staging (cudaMemcpyPeerAsync) and the streamed ring stays off.
-    if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
+// The peer's prompt share for chunks of up to `T_max` tokens (set_peer); `tf`: PeerPrefill::T_fp4, 0 for none.
+static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, int64_t tf,
+                      std::unique_ptr<PeerPrefill>& out, std::string& err) {
     auto pp = std::make_unique<PeerPrefill>();
     pp->peer = peer;
-    pp->T_max = peer->p2p() ? m.T_max : std::min<int64_t>(m.T_max, stream_all_min() - 1);
-    pp->cap_rows = std::max<int64_t>(1, std::min<int64_t>(cap_rows, pp->T_max * K));
+    pp->T_max = peer->p2p() ? T_max : std::min<int64_t>(T_max, stream_all_min() - 1);
+    pp->T_fp4 = tf;
+    const int64_t Tp = std::max(pp->T_max, tf);   // the longest chunk the peer takes
+    pp->cap_rows = std::max<int64_t>(1, std::min<int64_t>(cap_rows, Tp * K));
     const MmqPlan& mp = mmq_plan();
+    cudaGetDevice(&pp->prim);
     if (cudaEventCreateWithFlags(&pp->ev_in, cudaEventDisableTiming) != cudaSuccess) { err = "prefill peer: event"; return false; }
-    int prev = 0;
-    cudaGetDevice(&prev);
+    bool ok = true;
+    if (tf > 0) {   // the primary's side of the FP4 share
+        int lo = 0, hi = 0;   // the rows' upload at the greatest priority: the layer's end waits for it
+        cudaDeviceGetStreamPriorityRange(&lo, &hi);
+        ok = cudaStreamCreateWithFlags(&pp->x_out, cudaStreamNonBlocking) == cudaSuccess &&
+             cudaStreamCreateWithPriority(&pp->res_in, cudaStreamNonBlocking, hi) == cudaSuccess &&
+             cudaEventCreateWithFlags(&pp->ev_hx, cudaEventDisableTiming) == cudaSuccess &&
+             cudaEventCreateWithFlags(&pp->ev_res, cudaEventDisableTiming) == cudaSuccess;
+        for (int b = 0; ok && b < PeerPrefill::kRes; ++b)
+            ok = cudaEventCreateWithFlags(&pp->ev_h2d[b], cudaEventDisableTiming) == cudaSuccess;
+    }
     pp->dev = peer->device();
     cudaSetDevice(pp->dev);
-    bool ok = cudaStreamCreateWithFlags(&pp->s, cudaStreamNonBlocking) == cudaSuccess &&
-              cudaEventCreateWithFlags(&pp->ev_done, cudaEventDisableTiming) == cudaSuccess;
+    ok = ok && cudaStreamCreateWithFlags(&pp->s, cudaStreamNonBlocking) == cudaSuccess &&
+         cudaEventCreateWithFlags(&pp->ev_done, cudaEventDisableTiming) == cudaSuccess;
     if (ok) {
         ok = cudaStreamCreateWithFlags(&pp->s_out, cudaStreamNonBlocking) == cudaSuccess;
         for (int i = 0; ok && i < PeerPrefill::kGrpEv; ++i)
@@ -1196,9 +1251,9 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         pp->owned.push_back(p);
         return p;
     };
-    pp->mixed = (float*) take((size_t) pp->T_max * N * 4);
+    pp->mixed = (float*) take((size_t) Tp * N * 4);
     {
-        pp->cap_rows = pp->T_max * K;   // no row cap: only the row tables grow with it
+        pp->cap_rows = Tp * K;          // no row cap: only the row tables grow with it
         pp->G = pp->T_max;              // one expert never has more rows than the chunk has tokens
         const int64_t Gr = pp->G;
         pp->Xq_g = take(mmq::q8_bytes(Gr, N));
@@ -1209,7 +1264,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         pp->Dm_b[1] = (float*) take((size_t) Gr * N * 4);
         for (int b = 0; b < 2 && ok; ++b) ok = cudaEventCreateWithFlags(&pp->ev_dm[b], cudaEventDisableTiming) == cudaSuccess;
         pp->ps_frac = 0.35;   // the share of the primary's streamed experts the peer streams
-        if (!mp.fallback && pp->T_max >= stream_all_min()) {
+        if (!mp.fallback && peer->p2p() && pp->T_max >= stream_all_min()) {
             pp->RP = 48;
             pp->pstage.assign((size_t) pp->RP, nullptr);
             pp->pcopied.assign((size_t) pp->RP, nullptr);
@@ -1231,6 +1286,22 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     pp->bounds = (int32_t*) take((size_t) (2 * (NE + NE / MMQ_GROUP + 2)) * 4);
     pp->grp_gu = (uint8_t*) take(MMQ_GROUP * mp.gu_max + MMQ_TAIL);
     pp->grp_d = (uint8_t*) take(MMQ_GROUP * mp.d_max + MMQ_TAIL + MMQ_SCALES);
+    if (tf > 0) {   // the FP4 share's group buffers (GU, H and the result rows are the MMQ group's)
+        const int64_t Gr = pp->G;
+        pp->f_a4x = take(fp4::a4_bytes(Gr, N, MMQ_GROUP));
+        pp->f_gsx = (float*) take(fp4::scale_count(Gr, MMQ_GROUP) * 4);
+        pp->f_tox = (int32_t*) take((size_t) (MMQ_GROUP + 1) * 4);
+        pp->f_a4h = take(fp4::a4_bytes(Gr, 640, MMQ_GROUP));
+        pp->f_gsh = (float*) take(fp4::scale_count(Gr, MMQ_GROUP) * 4);
+        pp->f_toh = (int32_t*) take((size_t) 2 * (MMQ_GROUP + 1) * 4);
+        pp->f_tails = (float*) take((size_t) MMQ_GROUP * 16);
+        // a piece per expert and one per whole tile run cut off a long one, and per group one bound more
+        pp->f_rel_cap = (size_t) 2 * (NE + Tp * K / fp4::kTileTokens + 1);
+        pp->f_rel = (int32_t*) take(pp->f_rel_cap * 4);
+        ok = ok && cudaEventCreateWithFlags(&pp->ev_hx_free, cudaEventDisableTiming) == cudaSuccess;
+        for (int b = 0; ok && b < PeerPrefill::kRes; ++b)
+            ok = cudaEventCreateWithFlags(&pp->ev_d2h[b], cudaEventDisableTiming) == cudaSuccess;
+    }
     if (ok) {
         pp->ctx = std::make_unique<mmq::Context>();
         pp->run_ctx = pp->ctx.get();
@@ -1239,13 +1310,45 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     }
     size_t fb = 0, tb = 0;
     cudaMemGetInfo(&fb, &tb);
-    cudaSetDevice(prev);
-    if (!ok) { err = "prefill peer: the peer's buffers do not fit (raise --peer-reserve-mib or lower --peer-prefill-rows)"; return false; }
-    std::fprintf(stderr, "basalt prefill: peer GPU %d computes its experts' rows of each prompt chunk, with compact group "
+    cudaSetDevice(pp->prim);
+    if (ok && tf > 0) {   // pinned for both cards
+        ok = cudaHostAlloc((void**) &pp->hx, (size_t) Tp * N * 4, cudaHostAllocPortable) == cudaSuccess;
+        for (int b = 0; ok && b < PeerPrefill::kRes; ++b)
+            ok = cudaHostAlloc((void**) &pp->hres[b], (size_t) pp->G * N * 4, cudaHostAllocPortable) == cudaSuccess;
+    }
+    if (!ok) {
+        cudaGetLastError();
+        err = "prefill peer: the peer's buffers do not fit (raise --peer-reserve-mib or lower --peer-prefill-rows)";
+        return false;
+    }
+    std::fprintf(stderr, "basalt prefill: peer GPU %d computes its experts' rows of each prompt chunk%s, with compact group "
                          "buffers%s; %zu MiB left free on it\n", pp->dev,
+                 peer->p2p() ? "" : (" up to " + std::to_string(Tp) + " tokens" +
+                                     (tf > 0 ? " (a streamed one with the primary's FP4 kernels)" : "")).c_str(),
                  pp->ps_frac > 0.0 ? (", streaming " + std::to_string((int) (pp->ps_frac * 100 + 0.5)) +
                                       "% of the primary's streamed experts through a " + std::to_string(pp->RP) + "-slot ring").c_str()
                                    : "", fb >> 20);
+    out = std::move(pp);
+    return true;
+}
+
+bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err) {
+    Impl& m = *impl_;
+    if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
+    // Without P2P the peer still takes the rows of the routed-only chunks (below stream_all_min()): the activations and
+    // result rows cross through host staging (cudaMemcpyPeerAsync) and the streamed ring stays off.  It also takes
+    // those of a streamed chunk of up to kPeerFp4Tokens (PeerPrefill::T_fp4) where those buffers fit too.
+    if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
+    const int64_t t_fp4 = peer->p2p() || !fp4_every_layer() || fused_ring() || stream_all_min() < FP4_MIN_TOKENS
+                              ? 0 : std::min<int64_t>(m.T_max, kPeerFp4Tokens);
+    std::unique_ptr<PeerPrefill> pp;
+    bool ok = make_peer(peer, m.T_max, cap_rows, t_fp4 >= stream_all_min() ? t_fp4 : 0, pp, err);
+    if (!ok && t_fp4 >= stream_all_min()) {   // the routed-only chunks alone
+        pp.reset();
+        err.clear();
+        ok = make_peer(peer, m.T_max, cap_rows, 0, pp, err);
+    }
+    if (!ok) return false;
     m.pp = std::move(pp);
     return true;
 }
@@ -1396,8 +1499,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     for (int64_t c0 = 0; c0 < n; c0 += m.T) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
-        // the peer takes the rows of a chunk only up to its buffers' size
-        PeerPrefill* const ppc = (m.pp && T <= m.pp->T_max) ? m.pp.get() : nullptr;
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);
         ++stats_.chunks;
         // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
@@ -1526,6 +1627,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const basalt::kernels::cpu::ExpertLayout& lay0 = basalt::kernels::cpu::expert_layout();
         const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
+        // the peer takes the rows of a chunk only up to its buffers' size; without direct access a streamed chunk only up
+        // to T_fp4, and then on the FP4 kernels (PeerPrefill::T_fp4)
+        PeerPrefill* const ppc =
+            m.pp && (T <= m.pp->T_max || (stream_all && T <= m.pp->T_fp4)) ? m.pp.get() : nullptr;
+        const bool peer_fp4 = ppc && stream_all && ppc->T_fp4 > 0;
         const bool ps_on = stream_all && ppc && ppc->ps_frac > 0.0;
         if (ppc && !ps_on) ppc->ps_flag.clear();
         // multi-GPU: the peer's ring - issue its copies up to `limit` / give entries back (the peer device is current)
@@ -1631,6 +1737,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (a_stop.load(std::memory_order_acquire)) return;
                         std::this_thread::yield();
                     }
+                    // with the peer's share, only a few copies queue on the link at a time: the peer's result rows
+                    // then wait behind a few blobs, not behind the whole run-ahead into the next layers
+                    if (peer_fp4 && idx >= (size_t) kPeerInFlight)
+                        while (cudaEventQuery(m.copied[(idx - kPeerInFlight) % (size_t) m.ring]) == cudaErrorNotReady) {
+                            if (a_stop.load(std::memory_order_acquire)) return;
+                            std::this_thread::yield();
+                        }
                     const StreamEntry& en = seq[idx];
                     const int sl = (int) (idx % (size_t) m.ring);
                     const auto th = Clock::now();
@@ -2178,7 +2291,91 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         // multi-GPU: the peer's share, enqueued before the primary's own experts so both cards work at once
                         peer_now = use_mmq && !order_peer.empty();
-                        if (peer_now) {
+                        if (peer_now && peer_fp4) {
+                            // without direct access, a streamed chunk: the FP4 kernels in pieces (PeerPrefill::T_fp4)
+                            PeerPrefill& P = *ppc;
+                            if (!fp4_l) {
+                                err = "prefill: the peer's share of a streamed chunk needs the FP4 experts";
+                                return false;
+                            }
+                            // the peer's experts' rows, relative to its block, in pieces of at most G rows
+                            const size_t n = order_peer.size();
+                            P.bounds_host.resize(n + 1);
+                            for (size_t j = 0; j < n; ++j) P.bounds_host[j] = m.off[(size_t) order_peer[j]] - (int32_t) rows_local;
+                            P.bounds_host[n] = (int32_t) rows_peer;
+                            fp4::cut_pieces(P.bounds_host.data(), (int) n, P.G, P.pieces);
+                            const fp4::Pieces& pc = P.pieces;
+                            const int ngr = (int) pc.group.size() - 1;
+                            P.f_rel_host.clear();
+                            P.f_rel_at.clear();
+                            for (int g2 = 0; g2 < ngr; ++g2) {
+                                P.f_rel_at.push_back(P.f_rel_host.size());
+                                for (int i = pc.group[(size_t) g2]; i <= pc.group[(size_t) g2 + 1]; ++i)
+                                    P.f_rel_host.push_back(pc.bounds[(size_t) i] - pc.bounds[(size_t) pc.group[(size_t) g2]]);
+                            }
+                            if (P.f_rel_host.size() > P.f_rel_cap) {
+                                err = "prefill: the peer's piece table is too small";
+                                return false;
+                            }
+                            // the activations to the host once the router has read them (the host buffer is free
+                            // once the peer's upload of the last layer's is done)
+                            cudaEventRecord(P.ev_in, m.cs);
+                            cudaStreamWaitEvent(P.x_out, P.ev_in, 0);
+                            if (P.hx_live) cudaStreamWaitEvent(P.x_out, P.ev_hx_free, 0);
+                            cudaMemcpyAsync(P.hx, m.mixed, (size_t) T * N * 4, cudaMemcpyDeviceToHost, P.x_out);
+                            cudaEventRecord(P.ev_hx, P.x_out);
+                            P.hx_live = true;
+                            const int prevd = m.device;
+                            cudaSetDevice(P.dev);
+                            const cudaStream_t ps = P.s;
+                            cudaStreamWaitEvent(ps, P.ev_hx, 0);
+                            cudaMemcpyAsync(P.mixed, P.hx, (size_t) T * N * 4, cudaMemcpyHostToDevice, ps);
+                            cudaEventRecord(P.ev_hx_free, ps);
+                            cudaMemcpyAsync(P.src, src_h + rows_local, (size_t) rows_peer * 4, cudaMemcpyHostToDevice, ps);
+                            cudaMemcpyAsync(P.f_rel, P.f_rel_host.data(), P.f_rel_host.size() * 4, cudaMemcpyHostToDevice, ps);
+                            const auto& f = lay.fmt[(size_t) l];
+                            for (int g2 = 0; g2 < ngr; ++g2) {
+                                const int i0 = pc.group[(size_t) g2], ns = pc.group[(size_t) g2 + 1] - i0;
+                                const int64_t r0 = pc.bounds[(size_t) i0], nr = pc.bounds[(size_t) (i0 + ns)] - r0;
+                                const int32_t* rb = P.f_rel + P.f_rel_at[(size_t) g2];
+                                // the group's rows to FP4 tiles on their own (per-row roundings: the primary's bytes)
+                                fp4::plan(rb, ns, P.f_tox, ps);
+                                fp4::quantize(P.mixed, P.src + r0, rb, P.f_tox, ns, P.f_a4x, P.f_gsx, N, N, nr, ps);
+                                const int b = g2 & 1;
+                                if (P.dm_live[b]) cudaStreamWaitEvent(ps, P.ev_dm[b], 0);   // its last rows have left
+                                fp4::Group fg;
+                                fg.n = ns;
+                                for (int i = 0; i < ns; ++i)
+                                    fg.blob[i] = P.peer->slot_ptr(l, order_peer[(size_t) pc.expert[(size_t) (i0 + i)]]);
+                                fg.bounds_host = P.f_rel_host.data() + P.f_rel_at[(size_t) g2];
+                                fg.bounds_dev = rb;
+                                fg.a4x = P.f_a4x; fg.gsx = P.f_gsx; fg.tox = P.f_tox;
+                                fg.down_off = f.down_off;
+                                fg.tail_off = f.bytes - f.tail;
+                                fg.gu = P.GU_g; fg.h = P.H_g; fg.dm = P.Dm_b[b];
+                                fg.a4h = P.f_a4h; fg.gsh = P.f_gsh; fg.toh = P.f_toh; fg.rel = P.f_toh + (MMQ_GROUP + 1);
+                                fg.tails = P.f_tails;
+                                fp4::run_group(fg, P.G, ps);
+                                // the rows back through a host buffer whose last rows have reached Dm
+                                const int hb = g2 % PeerPrefill::kRes;
+                                cudaEventRecord(P.ev_grp[g2 % PeerPrefill::kGrpEv], ps);
+                                cudaStreamWaitEvent(P.s_out, P.ev_grp[g2 % PeerPrefill::kGrpEv], 0);
+                                if (P.res_live[hb]) cudaStreamWaitEvent(P.s_out, P.ev_h2d[hb], 0);
+                                cudaMemcpyAsync(P.hres[hb], P.Dm_b[b], (size_t) nr * N * 4, cudaMemcpyDeviceToHost, P.s_out);
+                                cudaEventRecord(P.ev_dm[b], P.s_out);
+                                P.dm_live[b] = true;
+                                cudaEventRecord(P.ev_d2h[hb], P.s_out);
+                                cudaSetDevice(prevd);
+                                cudaStreamWaitEvent(P.res_in, P.ev_d2h[hb], 0);
+                                cudaMemcpyAsync(m.Dm + (size_t) (rows_local + r0) * N, P.hres[hb], (size_t) nr * N * 4,
+                                                cudaMemcpyHostToDevice, P.res_in);
+                                cudaEventRecord(P.ev_h2d[hb], P.res_in);
+                                P.res_live[hb] = true;
+                                cudaSetDevice(P.dev);
+                            }
+                            cudaSetDevice(prevd);
+                            cudaEventRecord(P.ev_res, P.res_in);
+                        } else if (peer_now) {
                             PeerPrefill& P = *ppc;
                             cudaEventRecord(P.ev_in, m.cs);
                             int prevd = 0;
@@ -2571,7 +2768,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         stats_.cpu_share = m.cpu_share_now;
                     }
                     if (peer_now) {   // multi-GPU: the peer's rows are in Dm (or, without P2P, in host memory)
-                        cudaStreamWaitEvent(m.cs, ppc->ev_done, 0);
+                        cudaStreamWaitEvent(m.cs, peer_fp4 ? ppc->ev_res : ppc->ev_done, 0);
                     }
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                 }
