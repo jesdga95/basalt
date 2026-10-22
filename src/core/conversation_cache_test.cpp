@@ -334,5 +334,38 @@ int main() {
         CheckpointBytes small(100, 3), copy = small;
         check(copy.size() == 100 && copy[99] == 3, "small buffers still copy and fill");
     }
+    {
+        // The bulk (memcmp) key compare against the element-wise reference: every divergence index, a full match, and
+        // the lengths around a page boundary.  A key is int32; a prompt may be either width, and the prefix has to
+        // answer the same for both.
+        auto fill = [](size_t n, int32_t seed) {
+            std::vector<int32_t> v(n);
+            for (size_t i = 0; i < n; ++i) v[i] = (int32_t) ((i * 7 + (size_t) seed) % 97) - 3;
+            return v;
+        };
+        check(conversation_ids_equal(nullptr, 0, (const int32_t*) nullptr), "an empty slice is equal");
+        for (size_t len : {size_t(0), size_t(1), size_t(2), size_t(3), size_t(7), size_t(127), size_t(128),
+                           size_t(129), size_t(1024), size_t(4097)}) {
+            const std::vector<int32_t> key = fill(len, 1);
+            for (size_t at = 0; at <= len; ++at) {          // `at == len`: the prompt starts with the whole key
+                std::vector<int32_t> prompt = fill(len + 3, 1);
+                if (at < len) prompt[at] = (int32_t) (prompt[at] + 1);   // differs exactly at `at`
+                const bool want = conversation_ids_equal_linear(key.data(), len, prompt.data());
+                check(conversation_ids_equal(key.data(), len, prompt.data()) == want,
+                      "bulk token equality matches the element-wise reference");
+                ConversationCheckpoint c;
+                c.ids = key;
+                const std::vector<int64_t> wide(prompt.begin(), prompt.end());
+                check(conversation_prefix(c, prompt, {}) == conversation_prefix(c, wide, {}),
+                      "an int32 prompt and an int64 one give the same prefix");
+            }
+            // the empty-slice boundary: no key, and a key as long as the prompt (the last token is never reused)
+            ConversationCheckpoint c;
+            c.ids = key;
+            check(conversation_prefix(c, std::vector<int32_t>{}, {}) == 0, "an empty prompt matches nothing");
+            std::vector<int32_t> exact = fill(len, 1);
+            check(conversation_prefix(c, exact, {}) == 0, "a prompt as long as the key cannot consume its last token");
+        }
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
