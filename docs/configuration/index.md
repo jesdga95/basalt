@@ -54,7 +54,7 @@ A config file is one JSON object with two optional blocks:
   the command line's, and a flag given twice takes its last value.
 - An engine flag in `server`, or a server option in `engine`, stops the server at startup, as does an unknown name.
 - `api-key` cannot be set in a config file; a file that sets it is refused.
-- The built-in defaults pick the fastest settings that need no knowledge of the machine (speculation 7 with a drafter,
+- The built-in defaults pick the fastest settings that need no knowledge of the machine (speculation 8 with a drafter,
   expert cache auto, prefill auto, resident experts when the RAM holds them, adaptive rounds every window), and keep
   the settings that change output or memory use (4096 context, fp16 KV). A config file sets those. The startup line `[server] engine: ...` lists what came from the file or the command line.
 

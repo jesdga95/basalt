@@ -118,6 +118,11 @@ grammar form) is not enforced.
 Verify guarantees that a token's logits are bit for bit those of plain decode, whatever the window width
 (verify.hpp:3-8). This section tests that end to end.
 
+The default window is 8 tokens (`--spec 8`; an explicit `--spec N` is used as given). Greedy decoding with the drafter
+stays exact at any window. A sampled request is still drawn from the model's own distribution, but the window length
+sets which random draw each position uses, so a seeded sampled request can return different text than under another
+window. The tables below were measured with `--spec 7`; the exactness argument does not depend on the width.
+
 **Method.** 275 prompts: 272 chat-templated prompts with thinking off (152 prose, 60 chat, 60 code) plus the 3
 `data/bench` decode prompts (conv, struct, prose). 256 new tokens each, temperature 0, one engine session per
 configuration, same prompt order. A logit-hash diagnostic prints an FNV-1a hash of the full-vocabulary fp32 head logits

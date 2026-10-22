@@ -684,7 +684,7 @@ void usage() {
                  "  --spec N             speculative decoding: verify windows of at most N tokens (the last accepted\n"
                  "                       token plus up to N-1 MTP drafts, sized per window by the drafts' joint chance\n"
                  "                       of acceptance against a threshold adapted per request); 0 or 1 = no\n"
-                 "                       speculation (default 7 when the pack has a drafter, else 0)\n"
+                 "                       speculation (default 8 when the pack has a drafter, else 0)\n"
                  "  --relaxed-drafting [P]  sampled requests keep a draft the target gives probability >= P even when\n"
                  "                       the target's own draw differs: faster, but NOT the exact sampling distribution\n"
                  "                       (docs/precision/features.md).  P in (0, 1]; lower is faster and further from exact;\n"
@@ -1606,7 +1606,7 @@ int main(int argc, char** argv) {
     // Speculation needs the pack's drafter; prompt chunks are sized from what the expert cache can lend; the experts
     // the GPU does not hold go to page-locked RAM when they fit (a plain file mapping when not); the adaptive tier
     // of a server on one card runs a round every window.  An explicit flag always wins.
-    if (!o.spec_given && !o.mtp.empty()) o.spec = 7;
+    if (!o.spec_given && !o.mtp.empty()) o.spec = 8;
     if (!o.prefill_given) {
         o.prefill_auto = o.prefill_auto_fit = true;
         o.prefill_auto_max = 32768;
@@ -1723,7 +1723,7 @@ int main(int argc, char** argv) {
         o.mtp.clear();
     }
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
-    // up to 2 tokens longer; the draft policy (basalt/spec/draft_policy.hpp) takes one only where it pays.
+    // up to 2 tokens longer (at most the verifier width); the draft policy (basalt/spec/draft_policy.hpp) takes one only where it pays.
     // --suffix-draft 0 turns it off.
     if (o.suffix_draft > 0 && o.spec >= 2 && o.mtp_max_t == 0) {
         o.mtp_max_t = o.spec;
