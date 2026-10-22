@@ -337,6 +337,76 @@ int q8_decode_check() {
     return bad ? 1 : 0;
 }
 
+template <class T> void put(std::vector<uint8_t>& b, T v) {
+    const auto n = b.size();
+    b.resize(n + sizeof(T));
+    std::memcpy(b.data() + n, &v, sizeof(T));
+}
+
+// PleTable::warm_rows on a synthetic one-tensor GGUF (Q8_0 rows): rows read ahead come back byte-identical to the
+// mapped table's, are served from the row cache (a read held back by injected delay is not waited for), and in
+// Mmap mode the call does nothing.
+int warm_rows_check(const std::string& dir) {
+    constexpr uint32_t N = 20000;
+    const std::string path = dir + "/ple_warm_rows_selftest.gguf";
+    std::mt19937 rng(5);
+    {
+        std::vector<uint8_t> b;
+        put<uint32_t>(b, 0x46554747u);   // "GGUF"
+        put<uint32_t>(b, 3);
+        put<uint64_t>(b, 1);             // tensors
+        put<uint64_t>(b, 0);             // metadata
+        const std::string name = "per_layer_token_embd.weight";
+        put<uint64_t>(b, name.size());
+        b.insert(b.end(), name.begin(), name.end());
+        put<uint32_t>(b, 2);
+        put<uint64_t>(b, k::PLE_HEAD_DIM);
+        put<uint64_t>(b, N);
+        put<uint32_t>(b, 8);             // Q8_0
+        put<uint64_t>(b, 0);
+        b.resize((b.size() + 31) / 32 * 32);
+        for (uint32_t r = 0; r < N; ++r)
+            for (int blk = 0; blk < k::PLE_HEAD_DIM / 32; ++blk) {
+                put<uint16_t>(b, (uint16_t) (0x2800 + rng() % 0x800));   // a finite scale
+                for (int i = 0; i < 32; ++i) put<uint8_t>(b, (uint8_t) rng());
+            }
+        std::ofstream(path, std::ios::binary).write((const char*) b.data(), (std::streamsize) b.size());
+    }
+    std::string err;
+    k::PleTable mm, direct;
+    k::PleIoOptions mo, dopt;
+    mo.mode = k::PleIo::Mmap;
+    dopt.cache_rows = 1u << 16;
+    CHECK(mm.open(path, err, mo), "mmap open: %s", err.c_str());
+    CHECK(direct.open(path, err, dopt), "direct open: %s", err.c_str());
+    constexpr size_t T = 64;
+    std::vector<uint32_t> warmed(T * k::PLE_N_HEADS), cold(T * k::PLE_N_HEADS);
+    for (auto& r : warmed) r = rng() % (N / 2);
+    for (auto& r : cold) r = N / 2 + rng() % (N / 2);
+    std::vector<float> want(T * k::NG_N_EMBD), got(T * k::NG_N_EMBD);
+    CHECK(direct.cache_rows() == dopt.cache_rows && mm.cache_rows() == 0, "cache_rows: %llu / %llu",
+          (unsigned long long) direct.cache_rows(), (unsigned long long) mm.cache_rows());
+    CHECK(mm.warm_rows(warmed.data(), T, err), "mmap warm_rows: %s", err.c_str());   // no-op
+    CHECK(mm.gather_rows(warmed.data(), T, want.data(), err), "mmap gather: %s", err.c_str());
+    CHECK(direct.warm_rows(warmed.data(), T, err), "warm_rows: %s", err.c_str());
+    direct.set_injected_delay_us(100000);
+    double t0 = now_us();
+    CHECK(direct.gather_rows(warmed.data(), T, got.data(), err), "warmed gather: %s", err.c_str());
+    const double t_warm = now_us() - t0;
+    CHECK(!std::memcmp(want.data(), got.data(), want.size() * sizeof(float)), "warmed rows differ from the mapped table's");
+    CHECK(t_warm < 50000, "warmed rows were not served from the cache (%.0f us)", t_warm);
+    t0 = now_us();
+    CHECK(direct.gather_rows(cold.data(), T, got.data(), err), "cold gather: %s", err.c_str());
+    CHECK(now_us() - t0 >= 100000, "unwarmed rows were not read (%.0f us)", now_us() - t0);
+    CHECK(mm.gather_rows(cold.data(), T, want.data(), err), "mmap gather: %s", err.c_str());
+    CHECK(!std::memcmp(want.data(), got.data(), want.size() * sizeof(float)), "cold rows differ from the mapped table's");
+    mm.close();
+    direct.close();
+    std::filesystem::remove(path);
+    std::printf("PleTable::warm_rows: %s\n", g_fail ? "FAILED" : "OK");
+    return g_fail ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -367,7 +437,8 @@ int main(int argc, char** argv) {
         const int r110 = selftest(dir, k::PLE_ROW_BYTES_Q5_0);
         const int r170 = selftest(dir, k::PLE_ROW_BYTES_Q8_0);
         const int q8 = q8_decode_check();
-        return r90 != 0 ? r90 : r110 != 0 ? r110 : r170 != 0 ? r170 : q8;
+        const int warm = warm_rows_check(dir);
+        return r90 != 0 ? r90 : r110 != 0 ? r110 : r170 != 0 ? r170 : q8 != 0 ? q8 : warm;
     }
     if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, stress_secs);
     std::fprintf(stderr, "nothing to do\n");
