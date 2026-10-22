@@ -202,10 +202,14 @@ CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
         all_cpus.push_back(cl);
     }
 
-    topo.is_hybrid = (max_cap > 0 && max_cap > min_cap);
+    // A core class is a capacity band, not one value: cores of one class report different capacities.
+    // Cores above the midpoint of the extremes are the fast class; a gap under 10% is one class.
+    const long mid_cap = (max_cap + min_cap) / 2;
+    const bool cap_gap = max_cap > 0 && (long long) max_cap * 10 > (long long) min_cap * 11;
+    topo.is_hybrid = cap_gap;
     if (topo.is_hybrid) {
         for (const auto& cl : all_cpus) {
-            if (cl.cap == max_cap) {
+            if (cl.cap > mid_cap) {
                 if (!cl.is_sibling) topo.p_cores++;
                 topo.p_threads++;
             } else {
@@ -237,7 +241,7 @@ CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
     std::vector<int> e_cores;
 
     for (const auto& cl : all_cpus) {
-        if (cl.cap == max_cap) {
+        if (cl.cap > mid_cap) {
             if (!cl.is_sibling) p_primaries.push_back(cl.cpu);
             else p_siblings.push_back(cl.cpu);
         } else {

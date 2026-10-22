@@ -134,6 +134,60 @@ static bool topology_respects_current_mask() {
     return true;
 }
 
+// The fast-class count against the OS's own numbers: one capacity per PHYSICAL core (a sibling shares its core's), the
+// fast class being the cores above the midpoint between the extremes.  Reading the capacities here rather than trusting
+// the topology is the point - a class whose cores do not all sit at the maximum must still be one class.
+static bool topology_core_classes() {
+    auto read = [](const std::string& path) -> long {
+        long v = -1;
+        if (std::FILE* f = std::fopen(path.c_str(), "r")) {
+            if (std::fscanf(f, "%ld", &v) != 1) v = -1;
+            std::fclose(f);
+        }
+        return v;
+    };
+    std::vector<int> allowed;
+    if (!get_affinity(allowed)) return false;
+    std::vector<std::pair<long, long>> seen;
+    std::vector<long> caps;
+    for (int id : allowed) {
+        const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(id);
+        const long capacity = read(base + "/cpu_capacity");
+        if (capacity <= 0) continue;   // this CPU publishes no capacity: nothing to compare against
+        const long pkg = read(base + "/topology/physical_package_id");
+        const long core = read(base + "/topology/core_id");
+        if (pkg >= 0 && core >= 0) {
+            const std::pair<long, long> key{pkg, core};
+            if (std::find(seen.begin(), seen.end(), key) != seen.end()) continue;
+            seen.push_back(key);
+        }
+        caps.push_back(capacity);
+    }
+    if (caps.size() < 2) {
+        std::puts("SKIP core classes: fewer than two cores publish a capacity");
+        return true;
+    }
+    const long lo = *std::min_element(caps.begin(), caps.end());
+    const long hi = *std::max_element(caps.begin(), caps.end());
+    const long mid = (lo + hi) / 2;
+    const size_t fast = (size_t) std::count_if(caps.begin(), caps.end(), [mid](long c) { return c > mid; });
+    const auto topology = cpu::detect_cpu_topology(false, cpu::PoolAffinity::Auto);
+    if (!topology.is_hybrid) {
+        std::printf("core classes: one class (%zu cores, capacity %ld..%ld)\n", caps.size(), lo, hi);
+        return true;
+    }
+    if ((size_t) topology.p_cores != fast || (size_t) topology.e_cores + (size_t) topology.p_cores != caps.size()) {
+        std::fprintf(stderr,
+                     "affinity test: %zu cores above the capacity midpoint %ld (%ld..%ld) but the topology counted %d "
+                     "fast / %d slow of %zu\n",
+                     fast, mid, lo, hi, topology.p_cores, topology.e_cores, caps.size());
+        return false;
+    }
+    std::printf("core classes: %d fast / %d slow, matching the capacities (%ld..%ld, midpoint %ld)\n", topology.p_cores,
+                topology.e_cores, lo, hi, mid);
+    return true;
+}
+
 static bool topology_under_masks(const std::vector<int>& allowed, bool require_high) {
     if (!topology_respects_current_mask()) return false;
     if (allowed.size() >= 2) {
@@ -186,7 +240,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    const bool ok = topology_under_masks(allowed, require_high);
+    const bool ok = topology_under_masks(allowed, require_high) && topology_core_classes();
     const bool restored = original.restore() && expect_affinity(allowed, "final original affinity cleanup");
     if (!ok || !restored) return 1;
 
