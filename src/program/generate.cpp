@@ -7476,6 +7476,9 @@ int main(int argc, char** argv) {
                 wait_before[(size_t) r] = remote_experts[(size_t) r].ms_wait();
             }
             cur = ids;
+            // The conversation cache's keys are int32: one narrow view per request, so a parked entry or a checkpoint
+            // is matched by one bulk compare over the slice instead of a per-token scan.
+            const std::vector<int32_t> ids32(ids.begin(), ids.end());
             const Clock::time_point r0 = Clock::now();
             if (!drive.d.usage.empty()) sp.route_hist_reset();   // counts this request's prompt rows for the usage seed
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
@@ -7483,8 +7486,7 @@ int main(int argc, char** argv) {
             auto starts_with = [&](const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) -> bool {
                 const int64_t L = (int64_t) pre.size();
                 if (L < 1 || L > n - 1) return false;
-                for (int64_t i = 0; i < L; ++i)
-                    if ((int32_t) ids[(size_t) i] != pre[(size_t) i]) return false;
+                if (!basalt::core::conversation_ids_equal(pre.data(), pre.size(), ids32.data())) return false;
                 return imgs_below(req_imgs, L) == pre_imgs;
             };
             const bool want_cvec = basalt::kernels::cvec().loaded() ? req_cvec != 0 : true;
@@ -7585,7 +7587,7 @@ int main(int argc, char** argv) {
                             slot_ck = &c;
                         }
                 }
-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            const auto parked = conversations.best(ids32, req_imgs, want_cvec);
             std::optional<basalt::core::SavedConversation> incoming;
             if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
             if (incoming) slot_source = -1;
@@ -8031,8 +8033,8 @@ int main(int argc, char** argv) {
                 sl.partial_from0 = read_from == 0 || resumed_from0;
                 sl.cvec = cvec_cached;
                 for (const ConvCheckpoint& c : checks)   // the root / periodic checkpoints of this read
-                    if ((int64_t) c.ids.size() <= q && std::equal(c.ids.begin(), c.ids.end(), ids.begin(),
-                            [](int32_t x, int64_t y) { return (int64_t) x == y; }))
+                    if ((int64_t) c.ids.size() <= q &&
+                        basalt::core::conversation_ids_equal(c.ids.data(), c.ids.size(), ids32.data()))
                         sl.checks.push_back(c);
                 yielded_at = q;
                 yielded_slot = ys;
@@ -8950,7 +8952,7 @@ int main(int argc, char** argv) {
                     const ConvCheckpoint* best = nullptr;
                     for (const ConvCheckpoint& c : checks)
                         if (c.ids.size() < live.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&
-                            std::equal(c.ids.begin(), c.ids.end(), live.begin()))
+                            basalt::core::conversation_ids_equal(c.ids.data(), c.ids.size(), live.data()))
                             best = &c;
                     if (best != nullptr) sl.checks.push_back(*best);
                     std::fprintf(stderr, "basalt batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,

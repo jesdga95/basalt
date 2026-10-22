@@ -8,9 +8,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <new>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -201,12 +203,29 @@ struct SavedConversation {
     }
 };
 
+/// Element-by-element token equality, any token width.  Every caller only asks "equal or not", so this is the shape
+/// the bulk path below has to agree with.
+template<class Token>
+bool conversation_ids_equal_linear(const int32_t* ids, size_t n, const Token* prompt) {
+    for (size_t i = 0; i < n; ++i)
+        if (!(ids[i] == prompt[i])) return false;
+    return true;
+}
+
+/// The same answer as `conversation_ids_equal_linear`.  A key is `int32`, and a prompt is `int32` in the serving path,
+/// so that case compares in bulk (`memcmp` over the slice); any other token width falls back to the element-wise loop.
+template<class Token>
+bool conversation_ids_equal(const int32_t* ids, size_t n, const Token* prompt) {
+    if constexpr (std::is_same_v<Token, int32_t>) return std::memcmp(ids, prompt, n * sizeof(int32_t)) == 0;
+    else return conversation_ids_equal_linear(ids, n, prompt);
+}
+
 template<class Token>
 int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<Token>& prompt,
                             const std::vector<ConversationImageKey>& images) {
     const size_t n = c.ids.size();
     // The last prompt token always starts the next verify window.
-    if (n == 0 || n >= prompt.size() || !std::equal(c.ids.begin(), c.ids.end(), prompt.begin())) return 0;
+    if (n == 0 || n >= prompt.size() || !conversation_ids_equal(c.ids.data(), n, prompt.data())) return 0;
     size_t j = 0;
     for (const auto& image : images) {
         if (image.start >= (int64_t) n) continue;
