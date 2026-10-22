@@ -790,24 +790,19 @@ bool FileExpertSource::pin_cache_complement(
             return false;
         }
         budget_physical = physical;
-        const uint64_t room = physical > headroom_bytes ? physical - headroom_bytes : 0;
+        const uint64_t room = detail::resident_room(physical, headroom_bytes);
         if (budget_bytes > room) {
-            // 256 MiB under the room, so the engine's own allocations after this reading still leave the headroom (a
-            // budget clamped to exactly the room could fail the safety check below on a slightly lower reading).  An
-            // unclamped budget is unchanged.
-            const uint64_t margin = 256ull << 20;
-            const uint64_t clamped = room > margin ? room - margin : 0;
             if (what_fits)
                 std::fprintf(stderr, "FileExpertSource: RAM room for the complement: %.2f GiB (%.2f GiB available "
-                                     "minus %.0f GiB headroom and a 0.25 GiB margin)\n",
-                             (double) clamped / 1073741824.0, (double) physical / 1073741824.0,
+                                     "minus %.0f GiB headroom and the page overhead)\n",
+                             (double) room / 1073741824.0, (double) physical / 1073741824.0,
                              (double) headroom_bytes / 1073741824.0);
             else
                 std::fprintf(stderr, "FileExpertSource: --resident-budget-gib %.2f is more than the RAM has room for "
-                                     "(%.2f GiB available minus %.0f GiB headroom and a 0.25 GiB margin): %.2f GiB\n",
+                                     "(%.2f GiB available minus %.0f GiB headroom and the page overhead): %.2f GiB\n",
                              (double) budget_bytes / 1073741824.0, (double) physical / 1073741824.0,
-                             (double) headroom_bytes / 1073741824.0, (double) clamped / 1073741824.0);
-            budget_bytes = clamped;
+                             (double) headroom_bytes / 1073741824.0, (double) room / 1073741824.0);
+            budget_bytes = room;
         }
         std::vector<uint64_t> ranked(offsets.size(), kNoComplement);
         uint64_t at = 0;
@@ -845,11 +840,7 @@ bool FileExpertSource::pin_cache_complement(
             err = "FileExpertSource: cannot determine available RAM for the resident-memory safety check";
             return false;
         }
-        // The arena is ordinary 4 KiB pages: their page tables and the driver's per-page records come on top of its
-        // bytes, so the copy leaves room for them as well.
-        const uint64_t page_overhead = physical / 256;
-        const uint64_t reserve = headroom_bytes + page_overhead;
-        budget = physical > reserve ? physical - reserve : 0;
+        budget = detail::resident_room(physical, headroom_bytes);
         if (bytes > budget) {
             char message[320];
             std::snprintf(message, sizeof message,

@@ -182,6 +182,40 @@ void test_resident_lend_region() {
     require(choose_resident_keep_from({}, 0, 0, 0) == 0, "an empty cache");
 }
 
+void test_resident_room() {
+    using namespace basalt::core::detail;
+    constexpr uint64_t kGiB = 1ull << 30;
+    constexpr uint64_t kBlob = 17407795;   // one expert, bytes
+    // The gate and the keep-what-fits budget share resident_room(); the budget packs whole experts into it, so what it
+    // keeps always passes the gate, and the copy loses the shortfall plus less than one expert.
+    auto kept = [&](uint64_t physical, uint64_t headroom, uint64_t complement) {
+        const uint64_t room = resident_room(physical, headroom);
+        const uint64_t budget = std::min(room, complement);
+        return budget / kBlob * kBlob;
+    };
+    const uint64_t physical = 78 * kGiB + kGiB / 6, headroom = 15 * kGiB;
+    const uint64_t room = resident_room(physical, headroom);
+    require(room == physical - headroom - physical / 256, "the room is the available RAM less the headroom and overhead");
+    require(resident_room(10 * kGiB, 15 * kGiB) == 0, "a headroom above the RAM leaves no room");
+    // the whole complement fits
+    const uint64_t whole = 60 * kGiB;
+    require(whole <= room && kept(physical, headroom, whole) > whole - kBlob, "a complement that fits was cut");
+    // a small shortfall (about 1.8 GiB): the hottest experts that fit are kept, and the gate accepts them
+    const uint64_t small = 64 * kGiB + 700 * (1ull << 20);
+    uint64_t k = kept(physical, headroom, small);
+    require(small > room && k > 0 && k <= room, "a small shortfall must keep what fits");
+    require(small - k < (small - room) + kBlob, "a small shortfall lost more than the shortfall");
+    // a big shortfall keeps the room, not nothing
+    const uint64_t big = 120 * kGiB;
+    k = kept(physical, headroom, big);
+    require(k <= room && room - k < kBlob, "a big shortfall must keep the whole room");
+    // across readings: the kept bytes never exceed the gate's room
+    for (uint64_t gb = 20; gb <= 120; ++gb)
+        for (uint64_t h = 4; h <= 16; h += 3)
+            require(kept(gb * kGiB + 12345, h * kGiB, 200 * kGiB) <= resident_room(gb * kGiB + 12345, h * kGiB),
+                    "kept bytes failed the gate");
+}
+
 void test_resident_exchange() {
     using namespace basalt::core;
     using namespace basalt::core::detail;
@@ -422,6 +456,7 @@ int main() {
         test_complement_plan();
         test_resident_lend_region();
         test_resident_exchange();
+        test_resident_room();
         test_cgroup_memory_budget();
         test_cgroup_memory_stat_text();
         test_host_memory();

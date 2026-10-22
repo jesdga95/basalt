@@ -116,6 +116,14 @@ int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint6
 int64_t choose_resident_room(const std::vector<uint64_t>& slot_bytes, uint64_t base_bytes, uint64_t budget,
                              int64_t lend_from, uint64_t spare_bytes, bool& spares_fit);
 
+/// The RAM a resident copy may take with `physical` bytes available and `headroom` left free.  The arena is ordinary
+/// 4 KiB pages, so their page tables and the driver's per-page records (physical / 256) come on top of its bytes.  The
+/// whole copy's safety check and the keep-what-fits budget are both sized by this one figure.
+inline uint64_t resident_room(uint64_t physical, uint64_t headroom) {
+    const uint64_t reserve = headroom + physical / 256;
+    return physical > reserve ? physical - reserve : 0;
+}
+
 /// The adaptive tier swapped `in` into a GPU slot and `out` out of it: `out` takes `in`'s place in the compact copy
 /// (the caller copies out's bytes there).  False, and nothing changed, unless `in` is in the copy and `out` is not.
 bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t out);
