@@ -69,7 +69,7 @@ int main(int argc, char** argv) {
         ss.qsa_states = &qs;
         for (int64_t stream_min : {int64_t{1024}, int64_t{6144}}) {
             Prefill::set_stream_all_min(stream_min);
-            for (int ring : {9, 40, 256}) {
+            for (int ring : {9, 40, 256, 384}) {
                 Prefill::set_ring_depth(ring);
                 for (int64_t T : {1, 63, 256, 1023, 1024, 1025, 2048, 4096, 6143, 6144, 8192, 16384, 16385, 32768}) {
                     for (bool src : {true, false}) {

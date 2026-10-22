@@ -66,16 +66,20 @@ constexpr int STAGE = 8;           // host->device expert staging ring (chunks b
 // From the chunk size stream_all_min() on, every non-resident expert of every layer streams in a fixed order through a
 // ring_slots()-slot ring (nearly every expert is routed at such a chunk), so the copy engine keeps working through the
 // attention halves instead of waiting for each layer's routing.
-constexpr int RING_MAX = 256;           // the arrays; the ring itself is ring_slots()
+constexpr int RING_MAX = 384;           // the arrays; the ring itself is ring_slots()
 // The chunk size from which every expert streams: below it only the routed experts are staged.  Staging every
 // non-resident expert costs the same whatever the chunk, so it pays only once most of them are routed anyway.
 int64_t g_stream_all_min = 6144;
 inline int64_t stream_all_min() { return g_stream_all_min; }
-// The streamed ring's slots (one whole expert blob each): the most a layout holds (the same for every pack), and the
-// depth the next layout is laid out with (a prompt read beside decoding slots lends fewer cache slots with a shallower
-// ring).
+// The streamed ring's slots (one whole expert blob each, the same for every pack).  g_ring_depth caps the depth the
+// next layout is laid out with (a prompt read beside decoding slots lends fewer cache slots with a shallower ring).
 constexpr int kPrefillRing = 256;
-int g_ring_depth = kPrefillRing;
+// From kDeepRingTokens tokens on, a layer's attention half outlasts the copies a kPrefillRing-slot ring holds: the copy
+// engine stops until the layer's experts start, and their walk then waits for the layer's last copies.  Such a chunk
+// streams through a deeper ring (its slots come out of the same loan).
+constexpr int kPrefillRingDeep = 384;
+constexpr int64_t kDeepRingTokens = 16384;
+int g_ring_depth = kPrefillRingDeep;
 // Whether the fused experts' buffers apply: a streamed chunk of a pack the fused kernels cover.
 inline bool fused_ring() {
     if (!fused::enabled()) return false;
@@ -92,7 +96,12 @@ inline bool fused_ring() {
     }();
     return all;
 }
-inline int ring_slots(size_t T) { return (int64_t) T >= stream_all_min() ? g_ring_depth : STAGE; }
+// (a prompt peer's streamed share and the fused kernels' batches follow the ring's size: those keep 256)
+inline int ring_slots(size_t T) {
+    if ((int64_t) T < stream_all_min()) return STAGE;
+    const bool deep = (int64_t) T >= kDeepRingTokens && !core::prompt_peer() && !fused_ring();
+    return std::min(g_ring_depth, deep ? kPrefillRingDeep : kPrefillRing);
+}
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
@@ -1248,7 +1257,7 @@ void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
 void Prefill::set_stream_all_min(int64_t tokens) { g_stream_all_min = tokens; }
 void Prefill::set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
 void Prefill::set_cpu_share(double share) { impl_->cpu_share_now = std::max(0.0, std::min(share, 1.0)); }
-void Prefill::set_ring_depth(int slots) { g_ring_depth = std::max(STAGE + 1, std::min(slots, kPrefillRing)); }
+void Prefill::set_ring_depth(int slots) { g_ring_depth = std::max(STAGE + 1, std::min(slots, kPrefillRingDeep)); }
 int Prefill::ring_depth() const { return impl_->ring; }
 double Prefill::pinned_share() { return g_pinned_share; }
 
