@@ -1,9 +1,13 @@
-// src/kernels/hc_fused_parity.cpp - hc_fused_read against the kernels it replaces (fused_gr_read_multi, then the
-// MMVF router GEMV and the native top-10), bit for bit on every output, with real geometry and random inputs; then
-// the time of both with the weights hot in L2 and cold (L2 overwritten before every read).  DEC_HC8=1: the
-// fused read on 8-bit copies of the matrices (run with --tol).
+// src/kernels/hc_fused_parity.cpp - hc_fused_read against the kernels it replaces (fused_gr_read_multi on the 8-bit
+// copies, then the MMVF router GEMV and the native top-10), with real geometry and random inputs.  The fused read
+// has its own reduction order and fast exponentials, so against those kernels each output must agree within
+// kRelTol of its largest value and pick the same experts; against itself it must be bitwise: repeated launches,
+// every window width, reversed token order and overlapped launches (--stress).  Then the time of both with the
+// weights hot in L2 and cold (L2 overwritten before every read).
 //
-//     build/hc_fused_parity [iters] [T min] [T max]
+//     build/hc_fused_parity [iters] [T min] [T max] [--tol] [--check-only] [--stress N]
+//
+// --tol prints every case's differences against the plain kernels, not only the failing ones.
 #include "basalt/core/diag.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/fused_gr.hpp"
@@ -27,6 +31,9 @@
 
 namespace K = basalt::kernels;
 
+
+// the fused read's largest deviation from the plain kernels, relative to the output's largest value
+constexpr double kRelTol = 2e-6;
 
 static uint16_t bf16(float x) {
     uint32_t u;
@@ -259,7 +266,7 @@ int main(int argc, char** argv) {
                 }
                 cudaStreamSynchronize(s);
                 const std::vector<float> v2 = fetch(1, T);
-                if (tol) {
+                {
                     double mx[8] = {0}, ref[8] = {0}, sum[8] = {0};
                     size_t cnt[8] = {0};
                     for (size_t i = 0; i < v[0].size(); ++i) {
@@ -280,7 +287,15 @@ int main(int argc, char** argv) {
                                 idiff += found ? 0 : 1;
                             }
                     }
-                    std::printf("T %d mode %d apply %d:", T, mode, apply);
+                    bool bad = std::memcmp(v[1].data(), v2.data(), v[1].size() * 4) != 0 || idiff != 0;
+                    for (int pt : {0, 1, 2, 3, 4, 5, 6})
+                        if (cnt[pt] && ref[pt] > 0 && mx[pt] > kRelTol * ref[pt]) bad = true;
+                    if (bad) ++failures;
+                    if (!tol && !bad) {
+                        if (mode == 1 && apply == 1) by_t[T] = v[1];
+                        continue;
+                    }
+                    std::printf("T %d mode %d apply %d%s:", T, mode, apply, bad ? " FAIL" : "");
                     for (int pt : {0, 1, 4, 5, 6})
                         if (cnt[pt]) std::printf(" %s max %.2e (rel %.2e) mean %.2e |", part_name[pt], mx[pt],
                                                  ref[pt] > 0 ? mx[pt] / ref[pt] : 0.0, sum[pt] / cnt[pt]);
@@ -293,28 +308,10 @@ int main(int argc, char** argv) {
                     std::printf(" routed experts differing %d of %d | hash %016llx\n", idiff, router ? T * KT : 0,
                                 (unsigned long long) hsh);
                     if (mode == 1 && apply == 1) by_t[T] = v[1];
-                    continue;
-                }
-                size_t ndiff = 0, first = 0;
-                for (size_t i = 0; i < v[0].size(); ++i) {
-                    if (!inject && part_of(i, T) == 3) continue;
-                    if (!router && part_of(i, T) >= 5) continue;
-                    uint32_t u0, u1, u2;
-                    std::memcpy(&u0, &v[0][i], 4);
-                    std::memcpy(&u1, &v[1][i], 4);
-                    std::memcpy(&u2, &v2[i], 4);
-                    if (u0 != u1 || u1 != u2) {
-                        if (ndiff++ == 0) first = i;
-                    }
-                }
-                if (ndiff) {
-                    ++failures;
-                    std::printf("T %d mode %d apply %d: %zu values differ, first in %s (index %zu): %a vs %a\n", T, mode,
-                                apply, ndiff, part_name[part_of(first, T)], first, v[0][first], v[1][first]);
                 }
             }
         }
-    if (tol && !by_t[t_hi].empty()) {   // token k of a window of T against token k of the widest window
+    if (!by_t[t_hi].empty()) {   // token k of a window of T against token k of the widest window
         int bad = 0;
         const int TH = t_hi;
         const size_t szh[8] = {(size_t) TH * D, (size_t) TH * LR, (size_t) TH * HC, (size_t) TH * HC, (size_t) TH * N,
