@@ -3,8 +3,8 @@
   "runs": [
     {
       "submitter": "jesdga95",
-      "date": "2026-10-21",
-      "commit": "942ccf3aac",
+      "date": "2026-10-23",
+      "commit": "0751113739",
       "preset": "community-1",
       "gpus": [
         {
@@ -21,9 +21,9 @@
       "ram_gib": 121,
       "os": "Linux",
       "quant": "NVFP4",
-      "prefill_16k_tps": 6706.3,
-      "prefill_64k_tps": 8116.6,
-      "decode_tps": 416.6
+      "prefill_16k_tps": 7637.6,
+      "prefill_64k_tps": 9117.7,
+      "decode_tps": 422.3
     },
     {
       "submitter": "jesdga95",
