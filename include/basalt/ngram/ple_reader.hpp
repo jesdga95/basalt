@@ -8,8 +8,9 @@
 //     ...                                           // embedding, layer 0
 //     reader.collect(t);                            // before layer 1 reads the rows
 //
-// `issue` also serves prefill: pass all 16 x N rows of a chunk; pages are deduplicated, sorted by offset and
-// kept at most `max_inflight` deep, so a chunk's reads can run while the previous chunk computes.
+// `issue` also serves prefill: pass all 16 x N rows of a chunk; pages are deduplicated, read one page per request
+// in a scattered order and kept at most `max_inflight` deep, so a chunk's reads can run while the previous chunk
+// computes.
 //
 // THE ROW CACHE IS NOT THE TABLE. It keeps rows this process has already fetched (90 bytes each, bounded,
 // clock eviction). Within one long prompt a fraction of rows recur. Capacity 0 disables it.
