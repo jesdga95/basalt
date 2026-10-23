@@ -65,6 +65,7 @@
 #include <cstring>
 #include <exception>
 #include <immintrin.h>
+#include "basalt/log.hpp"
 
 namespace basalt::core {
 
@@ -374,7 +375,7 @@ void note_fallback(const char* what, int a, int b) {
     static std::set<std::tuple<std::string, int, int>> seen;
     std::lock_guard<std::mutex> lk(mu);
     if (seen.insert({what, a, b}).second)
-        std::fprintf(stderr, "basalt verify: fallback: %s (types %d / %d)\n", what, a, b);
+        basalt::log::warn("basalt verify", "fallback: %s (types %d / %d)", what, a, b);
 }
 // a dense projection of the window: dense_tc where dense_tc_mask has the projection's bit and the type, else
 // native_mmvq (either one for every window width, so a column's value never depends on T)
@@ -488,7 +489,7 @@ bool Verifier::dm_init(std::string& err) {
         if (!dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff)) why = "an expert format the kernels do not cover";
     }
     if (why != nullptr) {
-        std::fprintf(stderr, "basalt verify: the device-planned MoE tail is off: %s\n", why);
+        basalt::log::warn("basalt verify", "the device-planned MoE tail is off: %s", why);
         return true;
     }
     DecMoe* d = new DecMoe;
@@ -561,7 +562,7 @@ bool Verifier::dm_init(std::string& err) {
         if (!ok) { err = "verify: device-planned MoE peer buffers"; return false; }
         d->shadow1.assign((size_t) LE, INT32_MIN);
         if (!router_ok || !warm_router(rq_h, rs_h, &d->rq, &d->rs))
-            std::fprintf(stderr, "basalt verify: the peer's L2 warm-up is off (a router the predictor does not cover)\n");
+            basalt::log::warn("basalt verify", "the peer's L2 warm-up is off (a router the predictor does not cover)");
     }
     if (cpu_warm && router_ok) {
         CpuWarm* w = new CpuWarm;
@@ -573,11 +574,11 @@ bool Verifier::dm_init(std::string& err) {
         w->logits.assign((size_t) kVerifyMaxT * g.n_expert, 0.0f);
         d->warm = w;
     }
-    std::fprintf(stderr, "basalt verify: the MoE tail planned on the device%s\n",
+    basalt::log::info("basalt verify", "the MoE tail planned on the device%s",
                  d->pdev >= 0 ? (", the peer card served by a persistent kernel (" + std::to_string(d->pblocks) +
                                  " blocks)").c_str() : "");
     if (d->warm != nullptr)
-        std::fprintf(stderr, "basalt verify: the CPU pool warms its likeliest next-layer expert between doorbells\n");
+        basalt::log::info("basalt verify", "the CPU pool warms its likeliest next-layer expert between doorbells");
     return true;
 }
 
@@ -811,7 +812,7 @@ void Verifier::prepare_hc8(const WeightTable& wt, const ModelGeometry& g) {
     }
     progress.finish();
     (void) from_table;
-    std::fprintf(stderr, "basalt hc8: 8-bit hyper-connection copies, %.0f MiB of VRAM\n",
+    basalt::log::info("basalt hc8", "8-bit hyper-connection copies, %.0f MiB of VRAM",
                  (double) basalt::kernels::hc8_bytes() / 1048576.0);
 }
 
@@ -839,7 +840,7 @@ bool hc8_dump(const WeightTable& wt, const ModelGeometry& g, const std::vector<s
     for (const auto& [name, key] : extra) add(name, key);
     if (copies.empty()) { err = "hc8: there are no 8-bit copies to write"; return false; }
     if (!hc8_write(path, copies, err)) return false;
-    std::fprintf(stderr, "basalt hc8: wrote %zu copies to %s\n", copies.size(), path.c_str());
+    basalt::log::info("basalt hc8", "wrote %zu copies to %s", copies.size(), path.c_str());
     return true;
 }
 
@@ -1054,7 +1055,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             err = "verify: side stream create failed";
             return false;
         }
-        std::fprintf(stderr, "basalt verify: side branches at stream priority %d\n", greatest);
+        basalt::log::info("basalt verify", "side branches at stream priority %d", greatest);
     }
     if (cudaStreamCreateWithPriority(&cm_, cudaStreamNonBlocking, cs_prio) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_commit_go_, cudaEventDisableTiming) != cudaSuccess ||
@@ -1115,7 +1116,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
     }
     if (!dm_init(err)) return false;
-    std::fprintf(stderr, "basalt verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
+    basalt::log::info("basalt verify", "window up to %d tokens, %.1f MiB of device buffers%s", max_t,
                  (double) count.used / 1048576.0,
                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
     return true;
@@ -2260,7 +2261,7 @@ void Verifier::refresh_ar() {
     const bool off = lo < 0;
     if (off == ar_off_) return;
     ar_off_ = off;
-    std::fprintf(stderr, "basalt verify: layers [%lld, %lld) %s\n", (long long) lb_,
+    basalt::log::info("basalt verify", "layers [%lld, %lld) %s", (long long) lb_,
                  (long long) (le_ < 0 ? g_->n_layers : le_),
                  off ? "have experts out of VRAM: the doorbell graph runs the windows"
                      : "are 100% VRAM resident again: the zero-doorbell graph");
@@ -2272,7 +2273,7 @@ bool Verifier::capture(int T, std::string& err) {
     const bool pdl_try = basalt::kernels::pdl_requested() && !pdl_off_;
     // a window that does not capture or instantiate with programmatic dependent launch is captured again without it
     auto retry_plain = [&](const std::string& why) {
-        std::fprintf(stderr, "basalt verify: the %d-token window failed with programmatic dependent launch (%s): capturing it without\n", T,
+        basalt::log::warn("basalt verify", "the %d-token window failed with programmatic dependent launch (%s): capturing it without", T,
                      why.c_str());
         (void) cudaGetLastError();
         pdl_off_ = true;
@@ -2312,10 +2313,10 @@ bool Verifier::capture(int T, std::string& err) {
     const cudaError_t ue = cudaGraphUpload(exec_t, cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
     if (pdl_try)
-        std::fprintf(stderr, "basalt verify: captured the %d-token window (upload %s, sync %s), %ld programmatic "
-                             "dependent launches\n", T, cudaGetErrorString(ue), cudaGetErrorString(us), pdl_n);
+        basalt::log::info("basalt verify", "captured the %d-token window (upload %s, sync %s), %ld programmatic "
+                             "dependent launches", T, cudaGetErrorString(ue), cudaGetErrorString(us), pdl_n);
     else
-        std::fprintf(stderr, "basalt verify: captured the %d-token window (upload %s, sync %s)\n", T,
+        basalt::log::info("basalt verify", "captured the %d-token window (upload %s, sync %s)", T,
                      cudaGetErrorString(ue), cudaGetErrorString(us));
     return true;
 }
@@ -2914,7 +2915,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         cudaMemcpy(w.data(), dm_->wstat, w.size() * 8, cudaMemcpyDeviceToHost);
         cudaMemset(dm_->wstat, 0, w.size() * 8);
         const double nw = (double) dm_->wstat_windows;
-        std::fprintf(stderr, "basalt verify: dm_wait over %lld windows (avg T %.2f):\n%s", (long long) dm_->wstat_windows,
+        basalt::log::raw("basalt verify: dm_wait over %lld windows (avg T %.2f):\n%s", (long long) dm_->wstat_windows,
                      dm_->wstat_t / nw, basalt::kernels::dec_moe_stats_text(w.data(), nw).c_str());
         dm_->wstat_windows = 0;
         dm_->wstat_t = 0;
@@ -3142,7 +3143,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     slots_ = slots;
     batch_dm_ = dm_ != nullptr;
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
-    std::fprintf(stderr, "basalt verify: batch windows of up to %lld sequences (layers [%lld, %lld))\n", (long long) S,
+    basalt::log::info("basalt verify", "batch windows of up to %lld sequences (layers [%lld, %lld))", (long long) S,
                  (long long) lb_, (long long) le_);
     return true;
 }
@@ -3154,8 +3155,8 @@ bool Verifier::capture_batch(int R, int hbase, std::string& err) {
     const bool pdl_try = basalt::kernels::pdl_requested() && !pdl_off_;
     // a window that does not capture or instantiate with programmatic dependent launch is captured again without it
     auto retry_plain = [&](const std::string& why) {
-        std::fprintf(stderr, "basalt verify: the %d-row batch window failed with programmatic dependent launch (%s): "
-                             "capturing it without\n", R, why.c_str());
+        basalt::log::warn("basalt verify", "the %d-row batch window failed with programmatic dependent launch (%s): "
+                             "capturing it without", R, why.c_str());
         (void) cudaGetLastError();
         pdl_off_ = true;
         ex = nullptr;
@@ -3185,7 +3186,7 @@ bool Verifier::capture_batch(int R, int hbase, std::string& err) {
         if (pdl_try) return retry_plain(err);
         return false;
     }
-    std::fprintf(stderr, "basalt verify: captured the batch window for %d rows\n", R);
+    basalt::log::info("basalt verify", "captured the batch window for %d rows", R);
     return true;
 }
 

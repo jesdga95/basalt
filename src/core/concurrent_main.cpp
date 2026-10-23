@@ -23,12 +23,13 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "basalt/log.hpp"
 
 namespace {
 
 void check(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+        basalt::log::error("basalt", "%s: %s", what, cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -55,7 +56,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&]() -> const char* {
-            if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", a.c_str()); std::exit(2); }
+            if (i + 1 >= argc) { basalt::log::error("basalt", "%s needs a value", a.c_str()); std::exit(2); }
             return argv[++i];
         };
         if (a == "--file") path = val();
@@ -63,26 +64,26 @@ int main(int argc, char** argv) {
         else if (a == "--cpu-threads") cpu_threads = std::atoi(val());
         else if (a == "--gpu-roles") gpu_roles = std::atoi(val());
         else {
-            std::fprintf(stderr, "usage: basalt-concurrent --file experts.bin [--experts N] "
-                                 "[--cpu-threads N] [--gpu-roles N]\n");
+            basalt::log::error("basalt", "usage: basalt-concurrent --file experts.bin [--experts N] "
+                                 "[--cpu-threads N] [--gpu-roles N]");
             return 2;
         }
     }
-    if (path.empty()) { std::fprintf(stderr, "--file is required\n"); return 2; }
+    if (path.empty()) { basalt::log::error("basalt", "--file is required"); return 2; }
 
     const long long n_in = 2560, n_out = 640;
     const uint64_t role_codes = (uint64_t) n_out * n_in / 4;
     const uint64_t plane_bytes = role_codes;      // the CPU loop reads the same planes
 
     basalt::core::PinnedArena arena((uint64_t) experts * role_codes);
-    if (!arena.valid()) { std::fprintf(stderr, "arena allocation failed\n"); return 1; }
+    if (!arena.valid()) { basalt::log::error("basalt", "arena allocation failed"); return 1; }
     {
         std::ifstream f(path, std::ios::binary);
-        if (!f) { std::fprintf(stderr, "cannot open %s\n", path.c_str()); return 1; }
+        if (!f) { basalt::log::error("basalt", "cannot open %s", path.c_str()); return 1; }
         for (int i = 0; i < experts; ++i) {
             f.seekg((std::streamoff) i * 1382400);
             f.read((char*) arena.data() + (uint64_t) i * role_codes, (std::streamsize) role_codes);
-            if ((uint64_t) f.gcount() != role_codes) { std::fprintf(stderr, "short read\n"); return 1; }
+            if ((uint64_t) f.gcount() != role_codes) { basalt::log::error("basalt", "short read"); return 1; }
         }
     }
     std::printf("arena %.2f GiB pinned; %d CPU threads; %d GPU roles\n",

@@ -38,6 +38,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include "basalt/log.hpp"
 namespace basalt::core {
 namespace { bool g_shared_early = true; bool g_fused_gr = false; }
 namespace {constexpr int Q8K_BYTES_PER_BLOCK = 292;
@@ -490,7 +491,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     // mtp.cpp). Streamed mode is refused outright; generate.cpp validates it too, this is the backstop.
     if (g_kv_hybrid && ring_cells <= 0) {
         if (p.mode == 1) {
-            std::fprintf(stderr, "basalt: hybrid K8V4 KV does not support --kv-resident streaming\n");
+            basalt::log::error("basalt", "hybrid K8V4 KV does not support --kv-resident streaming");
             return 0;
         }
         st.kv_hybrid = true;
@@ -535,7 +536,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         KvArena* a = new KvArena();
         std::string err;
         if (!a->open(page_bytes, pages, s.page_size, err, tails)) {
-            std::fprintf(stderr, "basalt: elastic KV: %s\n", err.c_str());
+            basalt::log::error("basalt", "elastic KV: %s", err.c_str());
             delete a;
             return 0;
         }
@@ -544,7 +545,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             a->set_contents(n_kv + 2, std::move(rope_sin_host));
         }
         if (!a->map(std::min(g_kv_elastic, max_cells), err)) {
-            std::fprintf(stderr, "basalt: elastic KV: %s\n", err.c_str());
+            basalt::log::error("basalt", "elastic KV: %s", err.c_str());
             delete a;
             return 0;
         }
@@ -627,8 +628,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
             // the driver may pin only a small amount of host memory in all, which is less than a long context of
             // 8-bit KV needs
-            if (p.mode == 1) std::fprintf(stderr, "basalt: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
-                                 "(%.2f GiB pinned so far) - lower the context, or run without --kv-resident)\n", (double) bytes / 1073741824.0,
+            if (p.mode == 1) basalt::log::error("basalt", "KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
+                                 "(%.2f GiB pinned so far) - lower the context, or run without --kv-resident)", (double) bytes / 1073741824.0,
                                  (double) g_kv_host_bytes / 1073741824.0);
             return 0;
         }
@@ -813,18 +814,18 @@ void stage_timing_report(int64_t n_layers) {
     }
     double sum = 0;
     for (int s = 0; s < g_st.nslots; ++s) sum += tot[s];
-    std::fprintf(stderr, "\nper-stage GPU time, summed over %lld layers (one token):\n", (long long) n_layers);
+    basalt::log::raw("\nper-stage GPU time, summed over %lld layers (one token):\n", (long long) n_layers);
     for (int s = 0; s < g_st.nslots; ++s) {
-        std::fprintf(stderr, "  %-22s %8.3f ms/token   %6.3f ms/layer   %5.1f%%\n",
+        basalt::log::raw("  %-22s %8.3f ms/token   %6.3f ms/layer   %5.1f%%\n",
                      g_st.names[s] ? g_st.names[s] : "(unnamed)", tot[s], tot[s] / (double) n_layers,
                      sum > 0 ? 100.0 * tot[s] / sum : 0.0);
     }
-    std::fprintf(stderr, "  %-22s %8.3f ms/token\n", "sum of stages", sum);
+    basalt::log::raw("  %-22s %8.3f ms/token\n", "sum of stages", sum);
     // ---- THE PER-LAYER SPLIT, because the attention block is 55% of the token and the engine mixes two
     // entirely different attention implementations: GDN on 36 layers and QSA on the twelve where
     // `full_attention_interval` divides the index.  A single total cannot say which one is expensive, and the
     // two have nothing in common to optimise.
-    std::fprintf(stderr, "\nper-layer, the attention block (ms).  A `*` marks a QSA layer:\n");
+    basalt::log::raw("\nper-layer, the attention block (ms).  A `*` marks a QSA layer:\n");
     double gdn = 0, qsa = 0;
     int ng = 0, nq = 0;
     for (int64_t l = 0; l < n_layers && l < 64; ++l) {
@@ -832,11 +833,11 @@ void stage_timing_report(int64_t n_layers) {
         if (cudaEventElapsedTime(&ms, g_st.a[l][1], g_st.b[l][1]) != cudaSuccess) continue;
         const bool is_qsa = (l % 4) == 3;
         if (is_qsa) { qsa += ms; ++nq; } else { gdn += ms; ++ng; }
-        std::fprintf(stderr, "  %s%2lld %7.3f%s", is_qsa ? "*" : " ", (long long) l, (double) ms,
+        basalt::log::raw("  %s%2lld %7.3f%s", is_qsa ? "*" : " ", (long long) l, (double) ms,
                      ((l + 1) % 8 == 0) ? "\n" : "");
     }
-    std::fprintf(stderr, "\n  GDN: %d layers, %.3f ms total, %.4f ms/layer\n", ng, gdn, ng ? gdn / ng : 0.0);
-    std::fprintf(stderr, "  QSA: %d layers, %.3f ms total, %.4f ms/layer\n", nq, qsa, nq ? qsa / nq : 0.0);
+    basalt::log::raw("\n  GDN: %d layers, %.3f ms total, %.4f ms/layer\n", ng, gdn, ng ? gdn / ng : 0.0);
+    basalt::log::raw("  QSA: %d layers, %.3f ms total, %.4f ms/layer\n", nq, qsa, nq ? qsa / nq : 0.0);
 }
 
 // Declared here because `qsa_layer` is defined above `block_layer_pre`, where the body lives.  The dump buffer
@@ -970,7 +971,7 @@ namespace {}
 uint64_t doorbell_init(const ModelGeometry& g, int64_t k, Doorbell& db) {    db.n_embd = g.n_embd;    db.k = k;    uint64_t bytes = 0;
 // ONE region per field, each MAPPED PINNED, so the device and the host have different pointers to the same
 // bytes and no copy is needed to publish them.
-auto alloc = [&](size_t n, void** h, void** d, const char* what) {        if (cudaHostAlloc(h, n, cudaHostAllocMapped) != cudaSuccess) {            std::fprintf(stderr, "doorbell_init: cudaHostAlloc(%s) failed\n", what);            return false;        }        if (cudaHostGetDevicePointer(d, *h, 0) != cudaSuccess) {            std::fprintf(stderr, "doorbell_init: cudaHostGetDevicePointer(%s) failed\n", what);            return false;        }        std::memset(*h, 0, n);        bytes += n;        return true;    };    if (!alloc((size_t) g.n_embd * 4, (void**) &db.h_x_f, (void**) &db.d_x_f, "x_f")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_ids, (void**) &db.d_ids, "ids")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_weights, (void**) &db.d_weights, "weights")) return 0;    if (!alloc(4, (void**) &db.h_seq, (void**) &db.d_seq, "seq")) return 0;    if (!alloc(4, (void**) &db.h_flag, (void**) &db.d_flag, "flag")) return 0;    return bytes;}
+auto alloc = [&](size_t n, void** h, void** d, const char* what) {        if (cudaHostAlloc(h, n, cudaHostAllocMapped) != cudaSuccess) {            basalt::log::error("basalt", "doorbell_init: cudaHostAlloc(%s) failed", what);            return false;        }        if (cudaHostGetDevicePointer(d, *h, 0) != cudaSuccess) {            basalt::log::error("basalt", "doorbell_init: cudaHostGetDevicePointer(%s) failed", what);            return false;        }        std::memset(*h, 0, n);        bytes += n;        return true;    };    if (!alloc((size_t) g.n_embd * 4, (void**) &db.h_x_f, (void**) &db.d_x_f, "x_f")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_ids, (void**) &db.d_ids, "ids")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_weights, (void**) &db.d_weights, "weights")) return 0;    if (!alloc(4, (void**) &db.h_seq, (void**) &db.d_seq, "seq")) return 0;    if (!alloc(4, (void**) &db.h_flag, (void**) &db.d_flag, "flag")) return 0;    return bytes;}
 void doorbell_free(Doorbell& db) {    if (db.h_x_f) cudaFreeHost(db.h_x_f);    if (db.h_ids) cudaFreeHost(db.h_ids);    if (db.h_weights) cudaFreeHost(db.h_weights);    if (db.h_seq) cudaFreeHost(db.h_seq);    if (db.h_flag) cudaFreeHost(db.h_flag);    db = Doorbell{};}
 void doorbell_reset(const Doorbell& db) {
     if (db.h_seq) *db.h_seq = 0;

@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include "basalt/log.hpp"
 
 int main(int argc, char** argv) {
     std::string path;
@@ -23,7 +24,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&]() -> const char* {
-            if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", a.c_str()); std::exit(2); }
+            if (i + 1 >= argc) { basalt::log::error("basalt", "%s needs a value", a.c_str()); std::exit(2); }
             return argv[++i];
         };
         if (a == "--file") path = val();
@@ -37,11 +38,11 @@ int main(int argc, char** argv) {
                         "                   [--no-pin]\n");
             return 0;
         } else {
-            std::fprintf(stderr, "unknown argument: %s\n", a.c_str());
+            basalt::log::error("basalt", "unknown argument: %s", a.c_str());
             return 2;
         }
     }
-    if (path.empty()) { std::fprintf(stderr, "--file is required\n"); return 2; }
+    if (path.empty()) { basalt::log::error("basalt", "--file is required"); return 2; }
 
     const uint64_t bytes = layers * blobs_per_layer * blob_bytes;
     std::printf("expert arena: %llu layers x %llu blobs x %llu B = %.3f GiB\n", (unsigned long long) layers,
@@ -54,18 +55,18 @@ int main(int argc, char** argv) {
         // constructed in place so the note from the constructor can be printed before the load
         new (&arena) basalt::core::PinnedArena(bytes);
         std::printf("backing: %s\n", arena.note.c_str());
-        if (!arena.valid()) { std::fprintf(stderr, "arena allocation failed\n"); return 1; }
+        if (!arena.valid()) { basalt::log::error("basalt", "arena allocation failed"); return 1; }
         dst = arena.data();
     } else {
         dst = (uint8_t*) std::malloc((size_t) bytes);
-        if (!dst) { std::fprintf(stderr, "malloc failed\n"); return 1; }
+        if (!dst) { basalt::log::error("basalt", "malloc failed"); return 1; }
         std::printf("backing: malloc, NOT pinned (--no-pin)\n");
     }
 
     const basalt::core::LoadStats st =
         basalt::core::load_experts(path, dst, blob_bytes, blobs_per_layer, layers, threads, chunk);
     if (!st.ok) {
-        std::fprintf(stderr, "loading the experts failed: %s\n", st.error.empty() ? "unknown" : st.error.c_str());
+        basalt::log::error("basalt", "loading the experts failed: %s", st.error.empty() ? "unknown" : st.error.c_str());
         return 1;
     }
 

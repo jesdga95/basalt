@@ -14,6 +14,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <stdexcept>
+#include "basalt/log.hpp"
 
 namespace basalt::core {
 
@@ -445,7 +446,7 @@ bool PeerExperts::issue_pending(bool wait) {
         if (b == nullptr ||
             cudaMemcpyAsync(cache_.device_slot(x.slot), b, (size_t) lay.blob_bytes(x.layer), cudaMemcpyHostToDevice,
                             refill_) != cudaSuccess) {
-            std::fprintf(stderr, "peer experts: an exclusive swap failed (layer %d, expert %d)\n", (int) x.layer,
+            basalt::log::error("basalt", "peer experts: an exclusive swap failed (layer %d, expert %d)", (int) x.layer,
                          (int) x.in);
             continue;
         }

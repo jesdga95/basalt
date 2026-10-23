@@ -32,6 +32,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include "basalt/log.hpp"
 
 namespace basalt::core {
 
@@ -806,13 +807,13 @@ bool FileExpertSource::pin_cache_complement(
         const uint64_t room = detail::resident_room(physical, headroom_bytes);
         if (budget_bytes > room) {
             if (what_fits)
-                std::fprintf(stderr, "FileExpertSource: RAM room for the complement: %.2f GiB (%.2f GiB available "
-                                     "minus %.0f GiB headroom and the page overhead)\n",
+                basalt::log::info("basalt", "FileExpertSource: RAM room for the complement: %.2f GiB (%.2f GiB available "
+                                     "minus %.0f GiB headroom and the page overhead)",
                              (double) room / 1073741824.0, (double) physical / 1073741824.0,
                              (double) headroom_bytes / 1073741824.0);
             else
-                std::fprintf(stderr, "FileExpertSource: --resident-budget-gib %.2f is more than the RAM has room for "
-                                     "(%.2f GiB available minus %.0f GiB headroom and the page overhead): %.2f GiB\n",
+                basalt::log::warn("basalt", "FileExpertSource: --resident-budget-gib %.2f is more than the RAM has room for "
+                                     "(%.2f GiB available minus %.0f GiB headroom and the page overhead): %.2f GiB",
                              (double) budget_bytes / 1073741824.0, (double) physical / 1073741824.0,
                              (double) headroom_bytes / 1073741824.0, (double) room / 1073741824.0);
             budget_bytes = room;
@@ -835,8 +836,8 @@ bool FileExpertSource::pin_cache_complement(
             err = "FileExpertSource: the RAM has no room for any expert of the complement";
             return false;
         }
-        std::fprintf(stderr, "FileExpertSource: RAM budget %.2f GiB: %lld of the %.2f GiB of experts the GPU cache does "
-                             "not hold, by profile rank; the rest are read from the files\n",
+        basalt::log::info("basalt", "FileExpertSource: RAM budget %.2f GiB: %lld of the %.2f GiB of experts the GPU cache does "
+                             "not hold, by profile rank; the rest are read from the files",
                      (double) budget_bytes / 1073741824.0, (long long) held, (double) bytes / 1073741824.0);
         offsets.swap(ranked);
         bytes = at;
@@ -933,9 +934,8 @@ bool FileExpertSource::pin_cache_complement(
         arena = nullptr;
     };
     if (bytes > 0) {
-        std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
+        basalt::log::info("basalt", "FileExpertSource: allocating %.2f GiB %s cache complement",
                      (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
-        std::fflush(stderr);
         if (pin) {
             // Ordinary memory, aligned and padded to 2 MiB (whole large pages, so the registered range ends on a page
             // boundary), registered with the driver once it is filled: the reads fault the pages in while the drive
@@ -1098,7 +1098,7 @@ bool FileExpertSource::pin_cache_complement(
             }
             const int64_t done = layers_done.fetch_add(1) + 1;
             if (done % 8 == 0 || done == n_layers_)
-                std::fprintf(stderr, "FileExpertSource: copied cache complement through layer %lld/%lld (%.2f GiB, %.0f s)\n",
+                basalt::log::info("basalt", "FileExpertSource: copied cache complement through layer %lld/%lld (%.2f GiB, %.0f s)",
                              (long long) done, (long long) n_layers_, (double) copied.load() / 1073741824.0,
                              std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count());
         }
@@ -1110,7 +1110,6 @@ bool FileExpertSource::pin_cache_complement(
         worker();
         for (auto& t : pool) t.join();
     }
-    std::fflush(stderr);
     if (direct_fd >= 0) basalt::platform::close_fd(direct_fd);
     const double read_done_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count();
     if (register_after && !failed.load()) {
@@ -1140,7 +1139,7 @@ bool FileExpertSource::pin_cache_complement(
     progress.finish();
     {
         const double read_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count();
-        std::fprintf(stderr, "FileExpertSource: cache complement: allocation %.1f s, read %.1f s (%.2f GB/s, %.1f%% unbuffered), registration %.1f s\n",
+        basalt::log::info("basalt", "FileExpertSource: cache complement: allocation %.1f s, read %.1f s (%.2f GB/s, %.1f%% unbuffered), registration %.1f s",
                      alloc_s, read_done_s, read_done_s > 0 ? (double) copied.load() / 1e9 / read_done_s : 0.0,
                      copied.load() > 0 ? 100.0 * (double) direct_bytes.load() / (double) copied.load() : 0.0,
                      read_s - read_done_s);
@@ -1163,26 +1162,25 @@ bool FileExpertSource::pin_cache_complement(
         for (const auto& [b, n] : spare_sizes)
             for (int64_t i = 0; i < n; ++i, at += b) spare_free_.emplace_back(at, b);
         if (!spare_sizes.empty())
-            std::fprintf(stderr, "FileExpertSource: %lld free places for the adaptive swaps (%zu blob sizes, %.0f MiB)\n",
+            basalt::log::info("basalt", "FileExpertSource: %lld free places for the adaptive swaps (%zu blob sizes, %.0f MiB)",
                          (long long) spare_free_.size(), spare_sizes.size(), (double) (at - spare_at) / 1048576.0);
     }
     complement_ready_ = true;
-    std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB in %.0f s%s%s\n",
+    basalt::log::info("basalt", "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB in %.0f s%s%s",
                  complement_pinned_ ? "mapped pinned" : pin ? "locked resident" : "pageable resident",
                  (double) resident_bytes() / 1073741824.0, (double) pinned_bytes() / 1073741824.0,
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - pin_t0).count(),
                  note.empty() ? "" : "; ", note.c_str());
     if (lend)
-        std::fprintf(stderr, "FileExpertSource: %lld of the prompt path's %lld lendable slots keep their experts in RAM "
-                             "too%s\n", (long long) complement_lent_slots_, (long long) (n_slots - lend_from_slot),
+        basalt::log::info("basalt", "FileExpertSource: %lld of the prompt path's %lld lendable slots keep their experts in RAM "
+                             "too%s", (long long) complement_lent_slots_, (long long) (n_slots - lend_from_slot),
                      complement_lent_slots_ < n_slots - lend_from_slot
                          ? " (the others are read from the file when lent: not enough RAM for them)" : "");
     if (!additional_gpu_pairs.empty()) {
-        std::fprintf(stderr, "FileExpertSource: %zu experts held only by another GPU are not kept here (read from the "
-                             "file when needed)\n",
+        basalt::log::info("basalt", "FileExpertSource: %zu experts held only by another GPU are not kept here (read from the "
+                             "file when needed)",
                      additional_gpu_pairs.size());
     }
-    std::fflush(stderr);
     return true;
 }
 
@@ -1794,7 +1792,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (d.peer != nullptr && !ext) {         // multi-GPU: start the second GPU's share before the CPU's own work
         std::string perr;
         if (!d.peer->launch(d.layers, x_f, ids, n_tok, k, kind, perr, out)) {
-            std::fprintf(stderr, "basalt: %s (layer %lld)\n", perr.c_str(), (long long) d.layers);
+            basalt::log::error("basalt", "%s (layer %lld)", perr.c_str(), (long long) d.layers);
             d.failed = true;
             d.fail = "the peer GPU's experts could not be launched";
             d.fail_layer = d.layers;
@@ -1893,7 +1891,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (d.peer != nullptr && !ext) {         // multi-GPU: the second GPU's rows, into the same mapped rows
         std::string perr;
         if (!d.peer->finish(out, perr)) {
-            std::fprintf(stderr, "basalt: %s (layer %lld)\n", perr.c_str(), (long long) d.layers);
+            basalt::log::error("basalt", "%s (layer %lld)", perr.c_str(), (long long) d.layers);
             d.failed = true;
             d.fail = "the peer GPU's experts failed";
             d.fail_layer = d.layers;
@@ -2172,7 +2170,7 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
     if (!unbuffered || (!st.ok && st.error.empty()))   // unaligned ranges: the buffered reader
         st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20,
                                  files_in.experts.offset);
-    std::fprintf(stderr, "basalt generate: expert arena read %s (%s)\n", unbuffered ? "unbuffered" : "through the file cache",
+    basalt::log::info("basalt generate", "expert arena read %s (%s)", unbuffered ? "unbuffered" : "through the file cache",
                  why.c_str());
     if (!st.ok) {
         delete a;

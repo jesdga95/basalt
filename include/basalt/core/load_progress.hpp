@@ -29,6 +29,7 @@
 #include <mutex>
 #include <string>
 #include <utility>
+#include "basalt/log.hpp"
 
 namespace basalt::core {
 
@@ -49,7 +50,7 @@ public:
     /// Announces what a target's phases will add up to (a copy target: bytes another tier already holds).
     static void plan(const std::string& target, uint64_t bytes, bool copy = false) {
         std::lock_guard<std::mutex> lk(total_mu());
-        std::fprintf(stderr, "basalt load: plan %s%s %llu\n", copy ? "copy " : "", target.c_str(),
+        basalt::log::info("basalt load", "plan %s%s %llu", copy ? "copy " : "", target.c_str(),
                      (unsigned long long) bytes);
     }
     /// Reports the session state allocated on a device (not part of any load total).
@@ -57,7 +58,7 @@ public:
     static void kv(const std::string& target, uint64_t bytes, int64_t tokens, const char* kind = "",
                    uint64_t max_bytes = 0) {
         std::lock_guard<std::mutex> lk(total_mu());
-        std::fprintf(stderr, "basalt load: kv %s%s%s %llu %lld %llu\n", kind, kind[0] ? " " : "", target.c_str(),
+        basalt::log::info("basalt load", "kv %s%s%s %llu %lld %llu", kind, kind[0] ? " " : "", target.c_str(),
                      (unsigned long long) bytes, (long long) tokens,
                      (unsigned long long) (max_bytes > bytes ? max_bytes : bytes));
     }
@@ -96,7 +97,7 @@ private:
         emit_locked(std::chrono::steady_clock::now());
     }
     void emit_locked(std::chrono::steady_clock::time_point now) {
-        std::fprintf(stderr, "basalt load: %s%s %llu %llu\n", copy_ ? "copy " : "", target_.c_str(),
+        basalt::log::info("basalt load", "%s%s %llu %llu", copy_ ? "copy " : "", target_.c_str(),
                      (unsigned long long) done_, (unsigned long long) total_);
         last_done_ = done_;
         last_ = now;
@@ -106,7 +107,7 @@ private:
     static bool& announced() { static bool a = false; return a; }
     static uint64_t& total_value() { static uint64_t t = 0; return t; }
     static void print_total_locked() {
-        std::fprintf(stderr, "basalt load: total %llu\n", (unsigned long long) total_value());
+        basalt::log::info("basalt load", "total %llu", (unsigned long long) total_value());
     }
 
     std::string target_;

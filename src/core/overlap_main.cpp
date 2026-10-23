@@ -20,12 +20,13 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include "basalt/log.hpp"
 
 namespace {
 
 void check(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+        basalt::log::error("basalt", "%s: %s", what, cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -44,18 +45,18 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&]() -> const char* {
-            if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", a.c_str()); std::exit(2); }
+            if (i + 1 >= argc) { basalt::log::error("basalt", "%s needs a value", a.c_str()); std::exit(2); }
             return argv[++i];
         };
         if (a == "--file") path = val();
         else if (a == "--experts") experts = std::atoi(val());
         else if (a == "--tpr") threads_per_row = std::atoi(val());
         else {
-            std::fprintf(stderr, "usage: basalt-overlap --file experts.bin [--experts N] [--tpr N]\n");
+            basalt::log::error("basalt", "usage: basalt-overlap --file experts.bin [--experts N] [--tpr N]");
             return 2;
         }
     }
-    if (path.empty()) { std::fprintf(stderr, "--file is required\n"); return 2; }
+    if (path.empty()) { basalt::log::error("basalt", "--file is required"); return 2; }
 
     // One ROLE's worth of S2 weights: gate is [n_embd 2560] x [ff 640] = 1,638,400 weights = 460,800 B of
     // codes at 4 codes per byte, plus 40 scales per row.
@@ -66,17 +67,17 @@ int main(int argc, char** argv) {
 
     // host side: `experts` blobs read into a pinned arena, and the S2 planes the GEMV will read
     basalt::core::PinnedArena arena((uint64_t) experts * role_codes);
-    if (!arena.valid()) { std::fprintf(stderr, "arena allocation failed\n"); return 1; }
+    if (!arena.valid()) { basalt::log::error("basalt", "arena allocation failed"); return 1; }
     {
         std::ifstream f(path, std::ios::binary);
-        if (!f) { std::fprintf(stderr, "cannot open %s\n", path.c_str()); return 1; }
+        if (!f) { basalt::log::error("basalt", "cannot open %s", path.c_str()); return 1; }
         // take the first `experts` blobs' worth of CODE bytes, pretending each is a role's plane: the bytes
         // are real Q2_0 codes, so the kernel decodes real data and no cache-friendly pattern is invented
         for (int i = 0; i < experts; ++i) {
             f.seekg((std::streamoff) i * 1382400);
             f.read((char*) arena.data() + (uint64_t) i * role_codes, (std::streamsize) role_codes);
             if ((uint64_t) f.gcount() != role_codes) {
-                std::fprintf(stderr, "short read on expert %d\n", i);
+                basalt::log::error("basalt", "short read on expert %d", i);
                 return 1;
             }
         }

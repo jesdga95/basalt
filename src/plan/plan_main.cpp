@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include "basalt/log.hpp"
 
 int main(int argc, char** argv) {
     uint64_t ctx = 20480;
@@ -19,7 +20,7 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         auto next = [&](uint64_t& out) {
             if (i + 1 >= argc) {
-                std::fprintf(stderr, "%s needs a value\n", a.c_str());
+                basalt::log::error("basalt", "%s needs a value", a.c_str());
                 std::exit(2);
             }
             out = std::strtoull(argv[++i], nullptr, 10);
@@ -49,7 +50,7 @@ int main(int argc, char** argv) {
                         "  non-evictable state.\n");
             return 0;
         } else {
-            std::fprintf(stderr, "unknown argument: %s\n", a.c_str());
+            basalt::log::error("basalt", "unknown argument: %s", a.c_str());
             return 2;
         }
     }
@@ -67,7 +68,7 @@ int main(int argc, char** argv) {
         std::printf("%s", basalt::plan::to_string(p).c_str());
         return 0;
     } catch (const basalt::plan::DoesNotClose& e) {
-        std::fprintf(stderr, "basalt-plan: %s\n", e.what());
+        basalt::log::error("basalt-plan", "%s", e.what());
         return 1;
     }
 }

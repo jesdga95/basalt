@@ -55,6 +55,7 @@
 #include <sstream>
 #include <vector>
 #include "basalt/platform/compiler.hpp"
+#include "basalt/log.hpp"
 
 namespace basalt::core {
 namespace {
@@ -268,8 +269,8 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
                 t.off = off;
             }
             blob.swap(kept);
-            std::fprintf(stderr, "basalt hc8: the draft layer's hyper-connection matrices as 8-bit copies only (%.1f MiB "
-                                 "of bf16 left out)\n", (double) staged / 1048576.0);
+            basalt::log::info("basalt hc8", "the draft layer's hyper-connection matrices as 8-bit copies only (%.1f MiB "
+                                 "of bf16 left out)", (double) staged / 1048576.0);
         }
         const cudaError_t alloc = cudaMalloc((void**) &dense_, blob.size());
         if (alloc != cudaSuccess) {
@@ -329,7 +330,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
         if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
-        std::fprintf(stderr, "basalt mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
+        basalt::log::warn("basalt mtp", "no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM");
         cudaGetLastError();
         cudaFree(state_arena_);
         st_ = QsaState{};
@@ -351,7 +352,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
         KvArr lay[4];
         const int na = kv_layout(lay);
         if (st_.kv_mode != 0 || na == 0) {
-            std::fprintf(stderr, "basalt mtp: batch windows need the draft layer's K/V fully resident; no drafts there\n");
+            basalt::log::warn("basalt mtp", "batch windows need the draft layer's K/V fully resident; no drafts there");
             n_stores_ = cur_ = 0;
         } else {
             stores_.assign((size_t) n_stores_ + 1, std::array<void*, 4>{});
@@ -482,7 +483,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     if (basalt::core::diagnostics().profile && cudaMalloc((void**) &gstamp_, 16) == cudaSuccess)
         cudaMemset(gstamp_, 0, 16);
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
-    std::fprintf(stderr, "basalt mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
+    basalt::log::info("basalt mtp", "draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)",
                  (double) vram_ / 1048576.0, (double) g.n_expert * basalt::kernels::cpu::BLOB / 1048576.0,
                  (double) tensors_.back().off / 1048576.0, files_s,
                  files_s > 0 ? ((double) g.n_expert * basalt::kernels::cpu::BLOB + (double) tensors_.back().off) /
@@ -532,10 +533,10 @@ void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
         std::snprintf(b, sizeof(b), " and %.0f MiB is free", (double) free_b / 1048576.0);
         free_s = b;
     }
-    std::fprintf(stderr, "basalt mtp: the draft head over %lld tokens needs %.0f MiB of VRAM%s.\n",
+    basalt::log::warn("basalt mtp", "the draft head over %lld tokens needs %.0f MiB of VRAM%s.",
                  (long long) n_tokens, (double) (n_tokens * row_bytes) / 1048576.0, free_s.c_str());
-    std::fprintf(stderr, "basalt mtp: hint: a smaller draft vocabulary (--draft-vocab when converting the model), "
-                         "a smaller --max-context, or closing what else uses the GPU leaves it room.\n");
+    basalt::log::info("basalt mtp", "hint: a smaller draft vocabulary (--draft-vocab when converting the model), "
+                         "a smaller --max-context, or closing what else uses the GPU leaves it room.");
 }
 }  // namespace
 
@@ -588,7 +589,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             cudaMemcpy(dvocab_, map.data(), map.size() * 4, cudaMemcpyHostToDevice);
             if (exp_flag("spec_log", 0) != 0) diag_map_ = map;
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + map.size() * 4 + (uint64_t) n_xcap_ * 4;
-            std::fprintf(stderr, "basalt mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
+            basalt::log::info("basalt mtp", "draft head over %lld tokens (%.1f MiB)", (long long) n_dvocab_,
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
             n_tier1_ = n_base + n_xcap_;
             if (head->type() == 13 || head->type() == 14) {   // the 2-bit copy of the leading rows: a fraction of the bytes
@@ -610,7 +611,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 in_sub_.assign((size_t) n_vocab_, 0);
                 for (int64_t i = 0; i < n_raw; ++i)
                     if (ids[i] >= 0 && ids[i] < n_vocab_) in_sub_[(size_t) ids[i]] = 1;
-                std::fprintf(stderr, "basalt mtp: draft head context rows: %lld\n", (long long) n_xcap_);
+                basalt::log::info("basalt mtp", "draft head context rows: %lld", (long long) n_xcap_);
             }
             if (n_base < n_raw) {
                 tier2_.assign((size_t) n_vocab_, 0);
@@ -618,8 +619,8 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                     if (ids[i] >= 0 && ids[i] < n_vocab_) tier2_[(size_t) ids[i]] = 1;
                 for (int64_t i = 0; i < n_base; ++i)
                     if (ids[i] >= 0 && ids[i] < n_vocab_) tier2_[(size_t) ids[i]] = 0;
-                std::fprintf(stderr, "basalt mtp: draft head tiers: %lld base rows, %lld added rows read after an "
-                                     "added token\n", (long long) n_base, (long long) (n_raw - n_base));
+                basalt::log::info("basalt mtp", "draft head tiers: %lld base rows, %lld added rows read after an "
+                                     "added token", (long long) n_base, (long long) (n_raw - n_base));
             }
         }
     }
@@ -1214,8 +1215,8 @@ bool MtpDrafter::capture_cond(int T, int steps) {
     }
     if (!ok) {
         const cudaError_t e = cudaGetLastError();
-        std::fprintf(stderr, "basalt mtp: the conditional draft graph failed (%s%s%s); one graph per "
-                             "step from now on\n",
+        basalt::log::warn("basalt mtp", "the conditional draft graph failed (%s%s%s); one graph per "
+                             "step from now on",
                      cudaGetErrorString(e), err.empty() ? "" : ", ", err.c_str());
         if (exec) cudaGraphExecDestroy(exec);
         exec = nullptr;
@@ -1554,7 +1555,7 @@ bool MtpDrafter::copy_store(int from, int to, int64_t cells, std::string& err) {
 
 QsaState& MtpDrafter::kv_state_rw() {
     std::string e;
-    if (!use_main(e)) std::fprintf(stderr, "basalt mtp: %s\n", e.c_str());
+    if (!use_main(e)) basalt::log::error("basalt mtp", "%s", e.c_str());
     note_cells(0, prompt_len_ > 0 ? prompt_len_ : st_.max_cells);
     return st_;
 }
