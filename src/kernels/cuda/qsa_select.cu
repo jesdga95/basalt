@@ -370,18 +370,40 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
         __syncthreads();
         if (t < 256) {                                // fold the warps' histograms into warp 0's
             int s = 0;
+#pragma unroll
             for (int w2 = 0; w2 < TK_T / 32; ++w2) s += hist[w2][t];
             hist[0][t] = s;
         }
         __syncthreads();
-        if (t == 0) {
-            int cum = above, d = 255;
-            for (; d > 0; --d) {
-                if (cum + hist[0][d] >= width) break;
-                cum += hist[0][d];
+        if (warp == 0) {
+            // the largest digit d with above + (bins over d) + hist[d] >= width (0 if none), as a warp scan:
+            // lane l holds bins 8l..8l+7
+            int h[8], loc = 0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { h[i] = hist[0][lane * 8 + i]; loc += h[i]; }
+            int sfx = loc;                            // inclusive sum over lanes >= this one
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int y = __shfl_down_sync(0xffffffffu, sfx, o);
+                if (lane + o < 32) sfx += y;
             }
-            s_digit = d;
-            s_above = cum;
+            int cum = above + sfx - loc;              // above plus the bins over this lane's
+            int d = -1, ca = 0;
+#pragma unroll
+            for (int i = 7; i >= 0; --i) {
+                if (d < 0 && cum + h[i] >= width) { d = lane * 8 + i; ca = cum; }
+                cum += h[i];
+            }
+            const unsigned hit = __ballot_sync(0xffffffffu, d >= 0);
+            if (hit) {
+                const int src = 31 - __clz(hit);      // the highest lane with a hit holds the largest digit
+                d = __shfl_sync(0xffffffffu, d, src);
+                ca = __shfl_sync(0xffffffffu, ca, src);
+            } else {
+                d = 0;
+                ca = above + sfx - h[0];                  // read on lane 0: every bin over 0
+            }
+            if (lane == 0) { s_digit = d; s_above = ca; }
         }
         __syncthreads();
         prefix |= (uint32_t) s_digit << shift;
