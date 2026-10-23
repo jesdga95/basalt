@@ -146,6 +146,26 @@
       "prefill_16k_tps": 2674.5,
       "prefill_64k_tps": 2970.3,
       "decode_tps": 65.9
+    },
+    {
+      "submitter": "giveen",
+      "date": "2026-10-23",
+      "commit": "9c3692e7f5",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 475
+        }
+      ],
+      "ram_gib": 247,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 9556.4,
+      "prefill_64k_tps": 10541.5,
+      "decode_tps": 311.8,
+      "notes": "single RTX 5090 at a 475 W limit (below the card's 575 W default), 247 GB DDR5; 0 SSD spill"
     }
   ]
 }
