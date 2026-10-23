@@ -39,7 +39,7 @@ header .names { display: flex; flex-direction: column; gap: 7px; }
 body { background: var(--bg); }
 .wrap { background: var(--bg); }
 p.lede { color: var(--fg-2); max-width: 72ch; margin: 8px 0 20px; }
-p.lede code, .how code { font-family: var(--font-mono); color: var(--fg); background: var(--panel); padding: 1px 6px; border-radius: 4px; }
+p.lede code { font-family: var(--font-mono); color: var(--fg); background: var(--panel); padding: 1px 6px; border-radius: 4px; }
 .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
 .controls input, .ms > button {
   background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--fg);
@@ -61,6 +61,7 @@ p.lede code, .how code { font-family: var(--font-mono); color: var(--fg); backgr
   box-shadow: 0 12px 32px rgba(0, 0, 0, .45);
 }
 .ms:not([data-open]) .pop { display: none; }
+.ms .pop.flip { left: auto; right: 0; }
 .ms .opt {
   display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 10px; border-radius: 5px;
   font: 400 13.5px/1 var(--font-mono); color: var(--fg-2); white-space: nowrap; cursor: pointer; text-align: left;
@@ -75,34 +76,86 @@ p.lede code, .how code { font-family: var(--font-mono); color: var(--fg); backgr
 .ms .n { margin-left: auto; padding-left: 16px; color: var(--fg-3); font-size: 12px; }
 .ms .clear { display: block; width: 100%; margin-top: 4px; padding: 8px 10px; border-top: 1px solid var(--line); border-radius: 0; color: var(--fg-3); font: 400 12.5px/1 var(--font-sans); text-align: left; cursor: pointer; background: none; border-left: 0; border-right: 0; border-bottom: 0; }
 .ms .clear:hover { color: var(--accent); }
-.count { font: 400 13px/1 var(--font-mono); color: var(--fg-3); align-self: center; margin-left: auto; }
-.wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
-table { border-collapse: collapse; width: 100%; font: 400 13.5px/1.4 var(--font-mono); font-variant-numeric: tabular-nums; }
-th, td { padding: 10px 12px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--line-soft); }
-th { color: var(--fg-3); font-weight: 500; font-family: var(--font-sans); font-size: 13px; background: var(--panel); position: sticky; top: 0; cursor: pointer; user-select: none; }
-th:hover { color: var(--fg); }
-th[aria-sort="ascending"]::after { content: " ↑"; color: var(--accent); }
-th[aria-sort="descending"]::after { content: " ↓"; color: var(--accent); }
-th.num, td.num { text-align: right; }
-tbody tr:hover { background: var(--panel); }
-tbody tr:last-child td { border-bottom: 0; }
-td.hi { color: var(--accent); }
-td.dim { color: var(--fg-3); }
-td a { color: var(--fg-2); }
-tr.x { cursor: pointer; }
-.chev { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; margin-right: 6px; vertical-align: -2px; color: var(--fg-3); transition: transform .15s; }
-.chev svg { width: 10px; height: 10px; }
-tr.x[aria-expanded="true"] .chev { transform: rotate(90deg); color: var(--accent); }
-.more { color: var(--fg-3); }
-tr.detail td { background: var(--panel); padding: 4px 12px 12px 32px; }
-tr.detail:hover { background: none; }
-.cards { display: grid; grid-template-columns: auto auto auto auto; gap: 4px 28px; justify-content: start; color: var(--fg-2); }
-.cards .h { color: var(--fg-3); font-family: var(--font-sans); font-size: 12px; }
-.cards .r { text-align: right; }
+.sort { display: flex; margin-left: auto; }
+.sort .pop { max-height: none; }
+.ms.single .opt .box { border-color: transparent; background: none; }
+.ms.single .opt[aria-checked="true"] .box { background: none; border-color: transparent; }
+.ms.single .box svg path { stroke: var(--accent); }
+.ms.single .opt[aria-checked="true"] { color: var(--accent); }
+.sort .ms > button { border-radius: 6px 0 0 6px; height: 100%; }
+.sort > button { display: grid; place-items: center; width: 42px; padding: 0; background: var(--panel); border: 1px solid var(--line); border-left: 0; border-radius: 0 6px 6px 0; color: var(--accent); font: 400 15px/1 var(--font-mono); cursor: pointer; }
+.sort > button:focus-visible { outline: none; border-color: var(--accent); }
+
+/* Runs: one card per run. The header is the whole click target; the open card shows a memory bar and the run's details. */
+:root { --t1: 12px; --t2: 15px; --t3: 24px; --seg1: #E9ECEE; --seg2: #B7BEC4; --seg3: #8A949C; --seg4: #5E6872; --segram: #2A333C; }
+.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.ico { width: 16px; height: 16px; flex: none; display: block; }
+.list { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+.run { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; }
+.run:hover { border-color: var(--raised); background: color-mix(in srgb, var(--panel), var(--fg) 3%); }
+.run > button { display: grid; width: 100%; text-align: left; background: none; border: 0; color: inherit; font: inherit; cursor: pointer; align-items: start;
+  grid-template-columns: minmax(0, 1fr) 16px; grid-template-areas: "id chev" "stats stats"; gap: 18px 14px; padding: 20px 18px; border-radius: 14px; }
+.run > button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.id { grid-area: id; min-width: 0; }
+.gpu { font: 600 var(--t3)/1.2 var(--font-sans); letter-spacing: -.01em; overflow-wrap: anywhere; }
+.gpu .extra { color: var(--fg-3); font-weight: 500; }
+.m2 { display: flex; align-items: center; gap: 12px; margin-top: 10px; min-width: 0; }
+.pill { flex: 0 1 auto; min-width: 0; max-width: 160px; font: 500 var(--t1)/1 var(--font-mono); color: var(--fg-2); background: var(--raised); border-radius: 6px; padding: 6px 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sub { font: 400 var(--t1)/1.3 var(--font-mono); color: var(--fg-3); }
+.sub .num { font-size: var(--t1); }
+.stats { grid-area: stats; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.st { min-width: 0; }
+.st .l { display: block; font: 400 var(--t1)/1.2 var(--font-sans); color: var(--fg-2); }
+.st .v { display: block; margin-top: 8px; font: 500 var(--t3)/1.1 var(--font-mono); font-variant-numeric: tabular-nums; color: var(--fg); white-space: nowrap; }
+.st .v.hi { color: var(--accent); }
+.chev { grid-area: chev; width: 16px; height: 16px; margin-top: 6px; color: var(--fg-3); transform: rotate(90deg); transition: transform .15s, color .15s; }
+.chev .ico { width: 100%; height: 100%; }
+.run[data-open] .chev { transform: rotate(-90deg); }
+.run:hover .chev { color: var(--fg); }
+.run > button:focus-visible .chev { color: var(--accent); }
+.detail { padding: 0 18px 20px; display: grid; gap: 18px; }
+.segs, .labels { display: flex; gap: 4px; }
+.seg { flex: var(--g) 1 0; min-width: 4px; height: 10px; border-radius: 5px; background: var(--c); }
+.labels { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 28px; margin-top: 16px; }
+.lab { display: flex; align-items: center; gap: 10px; min-width: 0; white-space: nowrap; }
+.lab i { width: 10px; height: 10px; border-radius: 3px; background: var(--c); flex: none; }
+.lab .tx { display: flex; align-items: baseline; gap: 10px; min-width: 0; flex: 1; }
+.lab .n { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; font: 600 var(--t2)/1.3 var(--font-sans); color: var(--fg); }
+.lab .s { flex: none; font: 400 var(--t1)/1.3 var(--font-mono); color: var(--fg-3); }
+.foot { margin: 0; padding-top: 16px; border-top: 1px solid var(--line-soft); font: 400 var(--t2)/1.3 var(--font-sans); color: var(--fg); }
+.foot .l { display: flex; flex-wrap: wrap; gap: 6px 20px; align-items: baseline; }
+.foot .by { color: var(--fg-3); }
+.foot .who { color: var(--fg); overflow-wrap: anywhere; }
+.foot .dt { font: 400 var(--t1)/1.3 var(--font-mono); color: var(--fg-3); }
+.foot .hash { font: 400 var(--t1)/1.3 var(--font-mono); color: var(--fg-2); text-decoration: underline; text-underline-offset: 3px; }
+.clamp { margin: 0; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; font: 400 var(--t2)/1.5 var(--font-sans); color: var(--fg-2); overflow-wrap: anywhere; white-space: pre-wrap; }
+.clamp.full { display: block; }
+.moretoggle { background: none; border: 0; padding: 4px 0 0; color: var(--accent); font: 500 var(--t1)/1 var(--font-sans); cursor: pointer; }
+.moretoggle[hidden] { display: none; }
+.moretoggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.pager { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; justify-content: center; margin: 20px 0 8px; }
+.pager button { min-width: 40px; height: 40px; padding: 0 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--fg-2); font: 400 13.5px/1 var(--font-mono); cursor: pointer; }
+.pager button:hover { color: var(--fg); border-color: var(--raised); }
+.pager button:focus-visible { outline: none; border-color: var(--accent); }
+.pager button[aria-current="page"], .pager button[aria-current="page"]:hover { color: var(--accent); border-color: rgba(255, 122, 61, .45); background: var(--bg); }
+.pages { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; align-items: center; }
+.pages[hidden], .sep[hidden] { display: none; }
+.pages .gap { min-width: 20px; text-align: center; color: var(--fg-3); font: 400 13.5px/1 var(--font-mono); }
+.sep { width: 1px; height: 24px; background: var(--line); }
+.pager.wrapped .sep { display: none; }
+.range { font: 400 13px/1.4 var(--font-mono); color: var(--fg-3); }
 .empty { padding: 32px; text-align: center; color: var(--fg-3); }
-.how { margin-top: 28px; color: var(--fg-2); max-width: 72ch; }
-.how h2 { font-size: 15px; color: var(--fg); margin: 0 0 6px; }
-.how ol { margin: 0; padding-left: 20px; }
+@media (min-width: 760px) {
+  .run > button { grid-template-columns: minmax(0, 1fr) auto 16px; grid-template-areas: "id stats chev"; gap: 24px; padding: 24px 28px; }
+  .gpu { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .stats { display: flex; gap: 48px; }
+  .st { min-width: 90px; }
+  .chev { align-self: center; margin-top: 0; }
+  .detail { padding: 0 28px 26px; }
+}
+@media (max-width: 559px) {
+  .labels { grid-template-columns: 1fr; }
+}
 </style>
 </head>
 <body>
@@ -117,64 +170,83 @@ tr.detail:hover { background: none; }
   </header>
   <p class="lede">Performance submitted by users, all from the same preset (<code id="preset">basalt-bench --community</code>).</p>
 
+
   <div class="controls">
     <input id="q" type="search" placeholder="Search GPU, quant, submitter…" aria-label="Search">
     <div class="ms" id="f-gpu"></div>
     <div class="ms" id="f-n"></div>
     <div class="ms" id="f-quant"></div>
     <div class="ms" id="f-os"></div>
-    <span class="count" id="count"></span>
+    <div class="sort"><div class="ms" id="f-sort"></div><button id="sortdir" type="button"></button></div>
   </div>
 
-  <div class="wrap">
-    <table>
-      <thead><tr id="head"></tr></thead>
-      <tbody id="rows"></tbody>
-    </table>
-  </div>
-
-  <section class="how">
-    <h2>Add your run</h2>
-    <ol>
-      <li>Stop any running Basalt server, run <code>basalt-bench --community</code> and copy the JSON row it prints.</li>
-      <li>Open a pull request that adds the row to <code>docs/community/benchmarks.json</code>.</li>
-    </ol>
-  </section>
+  <ul class="list" id="rows"></ul>
+  <nav class="pager" id="pager" aria-label="Pages"><div class="pages" id="pages"></div><span class="sep" id="sep" aria-hidden="true"></span><span class="range" id="range"></span></nav>
 </main>
 <script>
-const COLS = [
-  { key: "_rig", label: "GPUs", html: r => (r._n > 1 ? `<span class="chev"><svg viewBox="0 0 10 10" aria-hidden="true"><path d="M3.5 1.5 7 5 3.5 8.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>` : `<span class="chev"></span>`) + r._short },
-  { key: "_vram", label: "VRAM", num: true, fmt: v => v + " GiB" },
-  { key: "_power", label: "Power", num: true, fmt: v => v.toLocaleString("en-US") + " W" },
-  { key: "ram_gib", label: "RAM", num: true, fmt: v => v + " GiB" },
-  { key: "os", label: "System" },
-  { key: "quant", label: "Quant" },
-  { key: "prefill_16k_tps", label: "Prefill 16K", num: true, hi: true, fmt: v => v.toLocaleString("en-US") },
-  { key: "prefill_64k_tps", label: "Prefill 64K", num: true, hi: true, fmt: v => v.toLocaleString("en-US") },
-  { key: "decode_tps", label: "Decode tok/s", num: true, hi: true, fmt: v => v.toLocaleString("en-US", { maximumFractionDigits: 1 }) },
-  { key: "commit", label: "Commit" },
-  { key: "date", label: "Date" },
-  { key: "submitter", label: "By", by: true },
-];
+const $ = id => document.getElementById(id);
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+const SVGNS = "http://www.w3.org/2000/svg";
+const ICONS = { chev: [["path", { d: "M9 6l6 6-6 6" }]] };
+function icon(name, cls) {
+  const s = document.createElementNS(SVGNS, "svg");
+  s.setAttribute("viewBox", "0 0 24 24"); s.setAttribute("aria-hidden", "true"); s.setAttribute("class", cls || "ico");
+  s.setAttribute("fill", "none"); s.setAttribute("stroke", "currentColor"); s.setAttribute("stroke-width", "1.7");
+  s.setAttribute("stroke-linecap", "round"); s.setAttribute("stroke-linejoin", "round");
+  for (const [t, a] of ICONS[name]) { const p = document.createElementNS(SVGNS, t); for (const [k, v] of Object.entries(a)) p.setAttribute(k, v); s.append(p); }
+  return s;
+}
+function checkIcon() {
+  const s = document.createElementNS(SVGNS, "svg"); s.setAttribute("viewBox", "0 0 10 10"); s.setAttribute("aria-hidden", "true");
+  const p = document.createElementNS(SVGNS, "path");
+  for (const [k, v] of Object.entries({ d: "M1.5 5.2 4 7.6 8.5 2.6", fill: "none", stroke: "#0E1114", "stroke-width": "1.8", "stroke-linecap": "round", "stroke-linejoin": "round" })) p.setAttribute(k, v);
+  s.append(p); return s;
+}
+// Build children from parts: a plain string is words, [string] is a number or hash set in mono.
+function rich(parent, parts) {
+  parts.forEach(p => parent.append(Array.isArray(p) ? el("span", "num", p[0]) : document.createTextNode(p)));
+  return parent;
+}
+const f0 = v => Number(v).toLocaleString("en-US", { maximumFractionDigits: 0 });
+const f1 = v => Number(v).toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+const shortName = n => String(n).replace(/\b(NVIDIA|GeForce|Workstation Edition|Server Edition|Max-Q)\b/g, "").replace(/\s+/g, " ").trim();
+const trunc = (s, n) => { s = String(s); return s.length > n ? s.slice(0, n - 1).trimEnd() + "…" : s; };
+function whoEl(name) { const s = el("span", "who", trunc(name, 24)); s.title = name; return s; }
 
-let runs = [];
+let runs = [], page = 1;
+const PER = 20;
 let sort = { key: "decode_tps", dir: -1 };
 const open = new Set();
-const $ = id => document.getElementById(id);
+const SORTS = [
+  { key: "decode_tps", label: "Decode tok/s", num: true },
+  { key: "prefill_16k_tps", label: "Prefill 16K", num: true },
+  { key: "prefill_64k_tps", label: "Prefill 64K", num: true },
+  { key: "_vram", label: "Total VRAM", num: true },
+  { key: "_power", label: "Total power", num: true },
+  { key: "ram_gib", label: "RAM", num: true },
+  { key: "_rig", label: "GPUs" },
+  { key: "quant", label: "Quant" },
+  { key: "os", label: "System" },
+  { key: "date", label: "Date" },
+  { key: "submitter", label: "Submitter" },
+];
+const SEARCH = ["_rig", "quant", "os", "submitter", "commit", "date", "preset", "notes"];
 
-function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
-
-// Multi-select: picks within one filter are OR'd, filters are AND'd. Each option shows how many runs have it.
 const filters = {};
 function multiSelect(id, all, options) {
   const root = $(id), picked = new Set();
   filters[id] = picked;
-  root.innerHTML = `<button type="button" aria-haspopup="true" aria-expanded="false"></button>` +
-    `<div class="pop" role="menu">` +
-    options.map(o => `<button type="button" class="opt" role="menuitemcheckbox" aria-checked="false" data-v="${esc(o.value)}">` +
-      `<span class="box"><svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1.5 5.2 4 7.6 8.5 2.6" fill="none" stroke="#0E1114" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span>${esc(o.label)}<span class="n">${o.count}</span></button>`).join("") +
-    `<button type="button" class="clear">Clear</button></div>`;
-  const btn = root.firstElementChild;
+  root.replaceChildren();
+  const btn = el("button"); btn.type = "button"; btn.setAttribute("aria-haspopup", "true"); btn.setAttribute("aria-expanded", "false");
+  const pop = el("div", "pop"); pop.setAttribute("role", "menu");
+  options.forEach(o => {
+    const b = el("button", "opt"); b.type = "button"; b.setAttribute("role", "menuitemcheckbox"); b.setAttribute("aria-checked", "false"); b.dataset.v = o.value;
+    const box = el("span", "box"); box.append(checkIcon());
+    b.append(box, document.createTextNode(o.label), el("span", "n", String(o.count)));
+    pop.append(b);
+  });
+  const clr = el("button", "clear", "Clear"); clr.type = "button"; pop.append(clr);
+  root.append(btn, pop);
   const label = () => {
     const sel = options.filter(o => picked.has(o.value));
     btn.textContent = !sel.length ? all : sel.length === 1 ? sel[0].label : `${sel.length} selected · ${all.replace(/^All |^Any /, "")}`;
@@ -184,13 +256,10 @@ function multiSelect(id, all, options) {
     document.querySelectorAll(".ms[data-open]").forEach(m => { if (m !== root) { m.removeAttribute("data-open"); m.firstElementChild.setAttribute("aria-expanded", "false"); } });
     on ? root.setAttribute("data-open", "") : root.removeAttribute("data-open");
     btn.setAttribute("aria-expanded", String(on));
+    if (on) placePop(root);
   };
-  btn.addEventListener("click", () => {
-    const on = !root.hasAttribute("data-open");
-    setOpen(on);
-    if (on) root.querySelector(".opt")?.focus();
-  });
-  root.querySelector(".pop").addEventListener("click", e => {
+  btn.addEventListener("click", () => { const on = !root.hasAttribute("data-open"); setOpen(on); if (on) root.querySelector(".opt")?.focus(); });
+  pop.addEventListener("click", e => {
     const opt = e.target.closest(".opt");
     if (opt) {
       const v = opt.dataset.v;
@@ -216,7 +285,58 @@ function multiSelect(id, all, options) {
 document.addEventListener("click", e => {
   if (!e.target.closest(".ms")) document.querySelectorAll(".ms[data-open]").forEach(m => { m.removeAttribute("data-open"); m.firstElementChild.setAttribute("aria-expanded", "false"); });
 });
-
+// Single-select: the same component, one choice. Picking closes the panel and returns focus to the button.
+function singleSelect(id, options, initial, onPick) {
+  const root = $(id);
+  root.classList.add("single");
+  let value = initial;
+  root.replaceChildren();
+  const btn = el("button"); btn.type = "button"; btn.setAttribute("aria-haspopup", "true"); btn.setAttribute("aria-expanded", "false");
+  const pop = el("div", "pop"); pop.setAttribute("role", "menu");
+  options.forEach(o => {
+    const b = el("button", "opt"); b.type = "button"; b.setAttribute("role", "menuitemradio"); b.setAttribute("aria-checked", "false"); b.dataset.v = o.value;
+    const box = el("span", "box"); box.append(checkIcon());
+    b.append(box, document.createTextNode(o.label));
+    pop.append(b);
+  });
+  root.append(btn, pop);
+  const sync = () => {
+    pop.querySelectorAll(".opt").forEach(o => o.setAttribute("aria-checked", String(o.dataset.v === value)));
+    btn.textContent = options.find(o => o.value === value).label;
+  };
+  const setOpen = on => {
+    document.querySelectorAll(".ms[data-open]").forEach(m => { if (m !== root) { m.removeAttribute("data-open"); m.firstElementChild.setAttribute("aria-expanded", "false"); } });
+    on ? root.setAttribute("data-open", "") : root.removeAttribute("data-open");
+    btn.setAttribute("aria-expanded", String(on));
+    if (on) placePop(root);
+  };
+  btn.addEventListener("click", () => {
+    const on = !root.hasAttribute("data-open");
+    setOpen(on);
+    if (on) (pop.querySelector('.opt[aria-checked="true"]') || pop.querySelector(".opt"))?.focus();
+  });
+  pop.addEventListener("click", e => {
+    const opt = e.target.closest(".opt"); if (!opt) return;
+    value = opt.dataset.v; sync(); setOpen(false); btn.focus(); onPick(value);
+  });
+  root.addEventListener("keydown", e => {
+    const opts = [...root.querySelectorAll(".opt")], k = opts.indexOf(document.activeElement);
+    if (e.key === "Escape") { setOpen(false); btn.focus(); }
+    else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (!root.hasAttribute("data-open")) { setOpen(true); (pop.querySelector('.opt[aria-checked="true"]') || opts[0])?.focus(); return; }
+      opts[(k + (e.key === "ArrowDown" ? 1 : -1) + opts.length) % opts.length]?.focus();
+    }
+  });
+  sync();
+  return { set(v) { value = v; sync(); } };
+}
+// A panel that would run past the right edge opens right-aligned instead, so the page never scrolls sideways.
+function placePop(root) {
+  const pop = root.querySelector(".pop");
+  pop.classList.remove("flip");
+  if (pop.getBoundingClientRect().right > document.documentElement.clientWidth - 8) pop.classList.add("flip");
+}
 function countBy(values) {
   const m = new Map();
   values.forEach(v => m.set(v, (m.get(v) || 0) + 1));
@@ -224,16 +344,19 @@ function countBy(values) {
 }
 const any = (id, test) => !filters[id]?.size || [...filters[id]].some(test);
 
-// Full rig label for search; the cell shows a short one ("2× RTX 5080", "RTX 5090 +3") and the
-// expanded row lists every card. Totals drive sorting.
+// _rig is the full label (search, sort, title); _main and _extra are the shortened header name and its "+ N".
 function rig(r, i) {
   const g = r.gpus || [];
-  const counts = new Map();
-  g.forEach(x => counts.set(x.name, (counts.get(x.name) || 0) + 1));
-  const parts = [...counts].map(([n, k]) => (k > 1 ? k + "× " : "") + n);
+  const group = names => {
+    const counts = new Map();
+    names.forEach(n => counts.set(n, (counts.get(n) || 0) + 1));
+    return [...counts].map(([n, k]) => (k > 1 ? k + "× " : "") + n);
+  };
+  const full = group(g.map(x => x.name)), short = group(g.map(x => shortName(x.name)));
   r._id = i;
-  r._rig = parts.join(" + ");
-  r._short = parts.length > 1 ? esc(g[0].name) + ` <span class="more">+${g.length - 1}</span>` : esc(r._rig);
+  r._rig = full.join(" + ");
+  r._main = short.length > 2 ? short[0] : short.join(" + ");
+  r._extra = short.length > 2 ? g.length - 1 : 0;
   r._names = g.map(x => x.name);
   r._n = g.length;
   r._vram = g.reduce((s, x) => s + (x.vram_gib || 0), 0);
@@ -241,65 +364,113 @@ function rig(r, i) {
   return r;
 }
 
-function detail(r) {
-  const cells = r.gpus.map((x, k) =>
-    `<span>GPU ${k}</span><span>${esc(x.name)}</span><span class="r">${x.vram_gib} GiB</span><span class="r">${x.power_w} W</span>`).join("");
-  return `<tr class="detail"><td colspan="${COLS.length}"><div class="cards">` +
-    `<span class="h">#</span><span class="h">Card</span><span class="h r">VRAM</span><span class="h r">Power limit</span>` +
-    cells + `</div></td></tr>`;
+function quantPill(r, cls) { const p = el("span", "pill " + (cls || ""), r.quant); p.title = r.quant; return p; }
+
+// Notes: clamped to two lines; the toggle appears only when the text overflows.
+function notesBlock(text) {
+  const w = el("div", "notes");
+  const p = el("p", "clamp", text);
+  const b = el("button", "moretoggle", "More"); b.type = "button"; b.hidden = true; b.setAttribute("aria-expanded", "false");
+  b.addEventListener("click", e => { e.stopPropagation(); const on = p.classList.toggle("full"); b.textContent = on ? "Less" : "More"; b.setAttribute("aria-expanded", String(on)); });
+  w.append(p, b); return w;
+}
+function wireNotes(root) {
+  root.querySelectorAll(".notes").forEach(w => {
+    const p = w.querySelector(".clamp"), b = w.querySelector(".moretoggle");
+    if (p.classList.contains("full")) return;
+    b.hidden = p.scrollHeight <= p.clientHeight + 1;
+  });
 }
 
-function renderHead() {
-  $("head").innerHTML = COLS.map(c => {
-    const s = sort.key === c.key ? (sort.dir > 0 ? "ascending" : "descending") : "none";
-    return `<th data-key="${c.key}" class="${c.num ? "num" : ""}" aria-sort="${s}" scope="col">${c.label}</th>`;
-  }).join("");
+function row(r) {
+  const isOpen = open.has(r._id);
+  const li = el("li", "run"); if (isOpen) li.setAttribute("data-open", "");
+  const b = el("button"); b.type = "button"; b.dataset.id = r._id; b.setAttribute("aria-expanded", String(isOpen)); b.setAttribute("aria-controls", "d" + r._id);
+  b.append(...buildHead(r));
+  li.append(b);
+  if (isOpen) li.append(buildDetail(r));
+  return li;
 }
 
-function render() {
+function render(keepPage) {
+  if (!keepPage) page = 1;
   const q = $("q").value.trim().toLowerCase();
   const shown = runs.filter(r =>
     any("f-gpu", v => r._names.includes(v)) && any("f-n", v => v === String(Math.min(r._n, 3))) &&
     any("f-quant", v => r.quant === v) && any("f-os", v => r.os === v) &&
-    (!q || COLS.some(c => String(r[c.key] ?? "").toLowerCase().includes(q)) || String(r.preset ?? "").toLowerCase().includes(q)));
+    (!q || SEARCH.some(k => String(r[k] ?? "").toLowerCase().includes(q))));
   shown.sort((a, b) => {
     const x = a[sort.key], y = b[sort.key];
     return (typeof x === "number" ? x - y : String(x).localeCompare(String(y))) * sort.dir;
   });
-  $("rows").innerHTML = shown.length ? shown.map(r => {
-    const multi = r._n > 1, isOpen = multi && open.has(r._id);
-    const tr = multi ? `<tr class="x" data-id="${r._id}" aria-expanded="${isOpen}" tabindex="0">` : "<tr>";
-    return tr + COLS.map(c => {
-      const v = r[c.key] ?? "";
-      let text = c.html ? c.html(r) : esc(c.fmt ? c.fmt(v) : v);
-      if (c.by) text = `<span data-by="${r._id}"></span>`;
-      const cls = [c.num && "num", c.hi && "hi"].filter(Boolean).join(" ");
-      return `<td class="${cls}">${text}</td>`;
-    }).join("") + "</tr>" + (isOpen ? detail(r) : "");
-  }).join("")
-    : `<tr><td class="empty" colspan="${COLS.length}">${runs.length ? "No runs match." : "No runs yet. Be the first: see below."}</td></tr>`;
-  $("rows").querySelectorAll("[data-by]").forEach(el => { el.textContent = runs[+el.dataset.by].submitter; });
-  $("count").textContent = `${shown.length} of ${runs.length} runs`;
+  const pages = Math.max(1, Math.ceil(shown.length / PER));
+  page = Math.min(page, pages);
+  const from = (page - 1) * PER, slice = shown.slice(from, from + PER);
+  const list = $("rows");
+  list.replaceChildren();
+  if (slice.length) slice.forEach(r => list.append(row(r)));
+  else list.append(el("li", "empty", runs.length ? "No runs match." : "No runs yet. Be the first: see below."));
+  wireNotes(list);
+  drawPager(pages);
+  const total = runs.length;
+  $("range").textContent = !shown.length ? "0 of " + total + " runs"
+    : (pages > 1 ? `${from + 1}\u2013${from + slice.length} of ${shown.length} runs` : shown.length + (shown.length === 1 ? " run" : " runs")) + (shown.length < total ? ` (${total} in total)` : "");
 }
 
-$("head").addEventListener("click", e => {
-  const th = e.target.closest("th"); if (!th) return;
-  const key = th.dataset.key, col = COLS.find(c => c.key === key);
-  sort = sort.key === key ? { key, dir: -sort.dir } : { key, dir: col.num ? -1 : 1 };
-  renderHead(); render();
-});
-function toggle(e) {
-  const tr = e.target.closest("tr.x");
-  if (!tr || e.target.closest("a")) return;
-  if (e.type === "keydown" && e.key !== "Enter" && e.key !== " ") return;
-  e.preventDefault();
-  const id = +tr.dataset.id;
-  open.has(id) ? open.delete(id) : open.add(id);
-  render();
+function pageItems(pages) {
+  const set = new Set([1, pages, page - 1, page, page + 1]);
+  const nums = [...set].filter(n => n >= 1 && n <= pages).sort((a, b) => a - b);
+  const out = [];
+  nums.forEach((n, i) => { if (i && n - nums[i - 1] > 1) out.push(n - nums[i - 1] === 2 ? n - 1 : 0); out.push(n); });
+  return out;
 }
-$("rows").addEventListener("click", toggle);
-$("rows").addEventListener("keydown", toggle);
+function drawPager(pages) {
+  const wrap = $("pages");
+  wrap.replaceChildren();
+  wrap.hidden = $("sep").hidden = pages <= 1;
+  if (pages > 1) pageItems(pages).forEach(n => {
+    if (!n) { wrap.append(el("span", "gap", "\u2026")); return; }
+    const b = el("button", null, String(n)); b.type = "button"; b.setAttribute("aria-label", "Page " + n);
+    if (n === page) b.setAttribute("aria-current", "page");
+    b.addEventListener("click", () => { page = n; render(true); requestAnimationFrame(toToolbar); });
+    wrap.append(b);
+  });
+  wirePager();
+}
+// After a page change, jump so the toolbar sits just under the top edge; an instant jump cannot be cut short by the new page's height.
+function toToolbar() {
+  const top = document.querySelector(".controls").getBoundingClientRect().top + window.scrollY - 12;
+  window.scrollTo({ top: Math.max(0, top), left: 0, behavior: "instant" });
+}
+// When the range text wraps under the numbers, the divider is dropped.
+function wirePager() {
+  const nav = $("pager");
+  nav.classList.remove("wrapped");
+  if (!$("pages").hidden && $("range").getBoundingClientRect().top >= $("pages").getBoundingClientRect().bottom - 2) nav.classList.add("wrapped");
+}
+window.addEventListener("resize", wirePager);
+
+function setupSort() {
+  const dir = $("sortdir");
+  const arrow = () => { dir.textContent = sort.dir > 0 ? "\u2191" : "\u2193"; dir.setAttribute("aria-label", sort.dir > 0 ? "Ascending" : "Descending"); };
+  singleSelect("f-sort", SORTS.map(s => ({ value: s.key, label: s.label })), sort.key, key => {
+    const s = SORTS.find(x => x.key === key); sort = { key: s.key, dir: s.num ? -1 : 1 }; arrow(); render();
+  });
+  dir.addEventListener("click", () => { sort.dir = -sort.dir; arrow(); render(); });
+  arrow();
+}
+
+$("rows").addEventListener("click", e => {
+  const b = e.target.closest(".run > button"); if (!b) return;
+  const id = +b.dataset.id;
+  open.has(id) ? open.delete(id) : open.add(id);
+  const li = b.parentElement, on = open.has(id);
+  b.setAttribute("aria-expanded", String(on));
+  on ? li.setAttribute("data-open", "") : li.removeAttribute("data-open");
+  if (on) { li.append(buildDetail(runs[id])); wireNotes(li); } else li.querySelector(".detail")?.remove();
+});
 $("q").addEventListener("input", render);
+window.addEventListener("resize", () => wireNotes($("rows")));
 
 fetch("benchmarks.json").then(r => r.json()).then(data => {
   runs = (data.runs || []).map((r, i) => rig(r, i));
@@ -309,8 +480,49 @@ fetch("benchmarks.json").then(r => r.json()).then(data => {
     .map(o => ({ ...o, label: o.value === "1" ? "1 GPU" : o.value === "3" ? "3+ GPUs" : o.value + " GPUs" })));
   multiSelect("f-quant", "All quants", countBy(runs.map(r => r.quant)));
   multiSelect("f-os", "All systems", countBy(runs.map(r => r.os)));
-  renderHead(); render();
-}).catch(() => { $("rows").innerHTML = `<tr><td class="empty" colspan="12">Could not load benchmarks.json.</td></tr>`; });
+  setupSort(); render();
+}).catch(() => { $("rows").replaceChildren(el("li", "empty", "Could not load benchmarks.json.")); });
+const SEGCOL = ["var(--seg1)", "var(--seg2)", "var(--seg3)", "var(--seg4)"];
+function st(label, v, hi) { const s = el("div", "st"); s.append(el("span", "l", label), el("span", "v" + (hi ? " hi" : ""), v)); return s; }
+function buildHead(r) {
+  const id = el("div", "id");
+  const gpu = el("div", "gpu", r._main); gpu.title = r._rig;
+  if (r._extra) gpu.append(document.createTextNode(" "), el("span", "extra", "+ " + r._extra));
+  const m = el("div", "m2");
+  const sub = el("span", "sub");
+  rich(sub, [...(r._n > 1 ? [r._n + " GPUs · "] : []), [f0(r._vram) + " GiB"], " · ", [f0(r._power) + " W"]]);
+  m.append(quantPill(r), sub);
+  id.append(gpu, m);
+  const stats = el("div", "stats");
+  stats.append(st("Prefill 16K", f0(r.prefill_16k_tps)), st("Prefill 64K", f0(r.prefill_64k_tps)), st("Decode tok/s", f1(r.decode_tps), true));
+  const chev = el("span", "chev"); chev.append(icon("chev", "ico"));
+  return [id, stats, chev];
+}
+function buildDetail(r) {
+  const d = el("div", "detail"); d.id = "d" + r._id;
+  const segsData = r.gpus.map((x, k) => ({ name: x.name, sub: x.vram_gib + " GiB · " + x.power_w + " W", gib: x.vram_gib, c: SEGCOL[Math.min(k, 3)] }));
+  if (r.ram_gib != null) segsData.push({ name: "System RAM", sub: r.ram_gib + " GiB", gib: r.ram_gib, c: "var(--segram)" });
+  const bars = el("div", "bars"); bars.setAttribute("role", "img");
+  bars.setAttribute("aria-label", segsData.map(s => s.name + " " + s.sub).join(", "));
+  const segs = el("div", "segs"), labels = el("div", "labels");
+  segsData.forEach(s => {
+    const seg = el("span", "seg"); seg.style.setProperty("--g", s.gib); seg.style.setProperty("--c", s.c); seg.title = s.name + ", " + s.sub;
+    const lab = el("div", "lab"); lab.style.setProperty("--g", s.gib); lab.style.setProperty("--c", s.c);
+    const tx = el("div", "tx"); const nm = el("span", "n", s.name); nm.title = s.name; tx.append(nm, el("span", "s", s.sub)); lab.append(el("i"), tx);
+    segs.append(seg); labels.append(lab);
+  });
+  bars.append(segs, labels);
+  d.append(bars);
+  const f = el("p", "foot");
+  const l = el("span", "l");
+  if (r.os) l.append(el("span", null, r.os));
+  const by = el("span", "by"); by.append(document.createTextNode("by "), Object.assign(whoEl(r.submitter), { className: "who" }));
+  l.append(by, el("span", "dt", r.date), el("span", "hash", r.commit));
+  f.append(l);
+  d.append(f);
+  if (r.notes) d.append(notesBlock(r.notes));
+  return d;
+}
 </script>
 </body>
 </html>
