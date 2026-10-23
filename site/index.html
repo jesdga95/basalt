@@ -154,7 +154,7 @@ const COLS = [
   { key: "decode_tps", label: "Decode tok/s", num: true, hi: true, fmt: v => v.toLocaleString("en-US", { maximumFractionDigits: 1 }) },
   { key: "commit", label: "Commit" },
   { key: "date", label: "Date" },
-  { key: "submitter", label: "By", link: true },
+  { key: "submitter", label: "By", by: true },
 ];
 
 let runs = [];
@@ -272,12 +272,13 @@ function render() {
     return tr + COLS.map(c => {
       const v = r[c.key] ?? "";
       let text = c.html ? c.html(r) : esc(c.fmt ? c.fmt(v) : v);
-      if (c.link && r.link) text = `<a href="${esc(r.link)}" rel="noopener">${text}</a>`;
+      if (c.by) text = `<span data-by="${r._id}"></span>`;
       const cls = [c.num && "num", c.hi && "hi"].filter(Boolean).join(" ");
       return `<td class="${cls}">${text}</td>`;
     }).join("") + "</tr>" + (isOpen ? detail(r) : "");
   }).join("")
     : `<tr><td class="empty" colspan="${COLS.length}">${runs.length ? "No runs match." : "No runs yet. Be the first: see below."}</td></tr>`;
+  $("rows").querySelectorAll("[data-by]").forEach(el => { el.textContent = runs[+el.dataset.by].submitter; });
   $("count").textContent = `${shown.length} of ${runs.length} runs`;
 }
 

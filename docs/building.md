@@ -40,7 +40,7 @@ process, with no warm-up pass and no repetition, so every number is the cold fir
 prints the usual table, then one JSON row to paste into `docs/community/benchmarks.json`:
 
 ```sh
-bin/basalt-bench --community --model Qwen3.8-FN-NVFP4.basalt --submitter YOUR_GITHUB_HANDLE
+bin/basalt-bench --community --model Qwen3.8-FN-NVFP4.basalt --submitter YOUR_NAME
 ```
 
 `prefill_16k_tps` and `prefill_64k_tps` are the engine tokens per second of those two prompts; `decode_tps` is the generated tokens of conv, struct and prose over their summed decode time (token-weighted). The row

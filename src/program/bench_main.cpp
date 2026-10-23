@@ -240,7 +240,7 @@ struct Options {
     int reps = 1;
     bool quality = false, no_windows = false, print_command = false;
     bool community = false;
-    std::string submitter = "YOUR_GITHUB_HANDLE";
+    std::string submitter = "YOUR_NAME";
     int quality_chunks = 20, quality_t = 3;
     unsigned long long seed = 0;         // --seed N: the sampling seed of every decode request (0: the engine seeds from the clock)
 };
@@ -276,7 +276,7 @@ void usage(const std::string& engine) {
         "                     summed over conv, struct and prose (token-weighted). Needs NVML for the GPU names, VRAM and enforced power limits. Only\n"
         "                     --model, --submitter, --fixtures, --logs and --print-command may be given with it:\n"
         "                     any other option or engine flag would make rows incomparable and is refused\n"
-        "  --submitter NAME   the GitHub handle written into the row (default: the placeholder to replace)\n"
+        "  --submitter NAME   the name shown in the table, written into the row (default: the placeholder to replace)\n"
         "\n"
         "engine\n"
         "  --model FILE       a .basalt model file; --peer-device 1 is added when a second GPU is visible. Every\n"
@@ -1080,7 +1080,7 @@ int main(int argc, char** argv) {
         for (const std::string& g : gpu_json) gj += (gj.empty() ? "" : ", ") + g;
         community_row = fmt("{\"submitter\": %s, \"date\": \"%s\", \"commit\": \"%s\", \"preset\": \"community-1\", "
                             "\"gpus\": [%s], \"ram_gib\": %.0f, \"os\": \"%s\", \"quant\": %s, "
-                            "\"prefill_16k_tps\": %.1f, \"prefill_64k_tps\": %.1f, \"decode_tps\": %.1f, \"link\": \"\"}",
+                            "\"prefill_16k_tps\": %.1f, \"prefill_64k_tps\": %.1f, \"decode_tps\": %.1f}",
                             json_quote(o.submitter).c_str(), day, BASALT_BENCH_GIT, gj.c_str(),
                             (double) ram_b / (double) (1ull << 30), basalt::platform::host_os_name().c_str(),
                             json_quote(info.count("quant") ? info["quant"] : "unknown").c_str(),
@@ -1221,7 +1221,7 @@ int main(int argc, char** argv) {
     }
     std::fputs(rep.c_str(), stdout);
     if (!community_row.empty()) {
-        std::printf("\nCOMMUNITY ROW (one line; set submitter to your GitHub handle):\n%s\n"
+        std::printf("\nCOMMUNITY ROW (one line; set submitter to the name you want shown):\n%s\n"
                     "Submit it: add the row to the runs list in docs/community/benchmarks.json and open a pull request (docs/community.md).\n",
                     community_row.c_str());
     }

@@ -23,8 +23,7 @@
       "quant": "NVFP4",
       "prefill_16k_tps": 6706.3,
       "prefill_64k_tps": 8116.6,
-      "decode_tps": 416.6,
-      "link": ""
+      "decode_tps": 416.6
     },
     {
       "submitter": "jesdga95",
@@ -43,8 +42,7 @@
       "quant": "NVFP4",
       "prefill_16k_tps": 6420.0,
       "prefill_64k_tps": 8102.0,
-      "decode_tps": 303.8,
-      "link": ""
+      "decode_tps": 303.8
     },
     {
       "submitter": "jesdga95",
@@ -63,8 +61,7 @@
       "quant": "IQ3_S",
       "prefill_16k_tps": 2093.7,
       "prefill_64k_tps": 2220.3,
-      "decode_tps": 111.9,
-      "link": ""
+      "decode_tps": 111.9
     },
     {
       "submitter": "lindworm-hermes2026",
@@ -84,7 +81,6 @@
       "prefill_16k_tps": 3179.8,
       "prefill_64k_tps": 4351.7,
       "decode_tps": 137.9,
-      "link": "https://github.com/jesdga95/basalt/issues/17",
       "notes": "single RTX 5080 16GB, WSL2/Docker; 46.8 GiB experts, VRAM 18% + RAM copy, no SSD spill; engine 57909606c2 clean tree"
     },
     {
@@ -105,7 +101,6 @@
       "prefill_16k_tps": 2834.8,
       "prefill_64k_tps": 3608.2,
       "decode_tps": 77.5,
-      "link": "https://github.com/jesdga95/basalt/issues/17",
       "notes": "single RTX 5080 16GB, WSL2/Docker; 72.3 GiB experts all in an 88 GiB VM (0 SSD spill) - the community gate passes on a 16GB card"
     },
     {
@@ -150,8 +145,7 @@
       "quant": "UD-Q6_K_XL",
       "prefill_16k_tps": 2674.5,
       "prefill_64k_tps": 2970.3,
-      "decode_tps": 65.9,
-      "link": ""
+      "decode_tps": 65.9
     }
   ]
 }

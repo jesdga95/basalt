@@ -6,10 +6,10 @@ import sys
 
 REQUIRED = {"submitter", "date", "commit", "preset", "gpus", "ram_gib", "os",
             "quant", "prefill_16k_tps", "prefill_64k_tps", "decode_tps"}
-OPTIONAL = {"link", "notes"}
+OPTIONAL = {"notes"}
 GPU_KEYS = {"name", "vram_gib", "power_w"}
-PLACEHOLDER = "YOUR_GITHUB_HANDLE"
-USERNAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}")
+PLACEHOLDER = "YOUR_NAME"
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 SYSTEMS = ("Linux", "Windows", "WSL2")
 
 
@@ -44,16 +44,19 @@ def check_row(r, err):
         return
     for key in sorted(REQUIRED - set(r)):
         err(f"missing required key '{key}'")
-    for key in sorted(set(r) - REQUIRED - OPTIONAL):
+    if "link" in r:
+        err("'link' is no longer a field; remove it")
+    for key in sorted(set(r) - REQUIRED - OPTIONAL - {"link"}):
         err(f"unknown key '{key}'")
     if "submitter" in r:
         if not is_text(r["submitter"]):
             err("submitter must be a non-empty string")
-        elif r["submitter"].strip().lstrip("@").strip().upper() == PLACEHOLDER:
-            err(f"submitter is still the placeholder {PLACEHOLDER}; use your GitHub username")
-        elif not USERNAME.fullmatch(r["submitter"]):
-            err("submitter must be a GitHub username: 1-39 letters, digits or single hyphens, "
-                "starting and ending with a letter or digit, no spaces or '@'")
+        elif r["submitter"].strip().upper() == PLACEHOLDER:
+            err(f"submitter is still the placeholder {PLACEHOLDER}; use the name you want shown")
+        elif len(r["submitter"]) > 40:
+            err("submitter must be at most 40 characters")
+        elif CONTROL.search(r["submitter"]):
+            err("submitter must not contain control characters")
     if "date" in r:
         d = r["date"]
         ok = isinstance(d, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d)
@@ -83,10 +86,6 @@ def check_row(r, err):
         err("os must be one of " + ", ".join(SYSTEMS))
     if "quant" in r and not is_text(r["quant"]):
         err("quant must be a non-empty string")
-    if "link" in r:
-        v = r["link"]
-        if not (isinstance(v, str) and (v == "" or (v.startswith("https://") and len(v) > 8 and not re.search(r"\s", v)))):
-            err("link must be empty or an https URL")
     if "notes" in r and not (isinstance(r["notes"], str) and len(r["notes"]) <= 200):
         err("notes must be a string of at most 200 characters")
 
