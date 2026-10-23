@@ -19,7 +19,13 @@ const char* auto_affinity_name(AutoAffinity a) {
 }
 
 int auto_pool_workers(const AutoInputs& in, AutoAffinity affinity) {
-    int n = in.hybrid && affinity != AutoAffinity::All ? (std::max)(1, in.p_cores - 1) : in.worker_cores;
+    int n = in.worker_cores;
+    if (in.hybrid && affinity != AutoAffinity::All) {
+        // The P-cores but the host's. The auto affinity adds half the E-cores: they run the expert kernels slower,
+        // but a layer's CPU share is split into many small tasks, so each one still shortens it.
+        n = (std::max)(1, in.p_cores - 1);
+        if (affinity == AutoAffinity::Auto) n += in.e_cores / 2;
+    }
     // A CPU quota throttles the whole group once spent: the workers and the host thread together must fit it.
     if (in.cpu_quota > 0) {
         const int fit = (std::max)(1, (int) in.cpu_quota - 1);

@@ -66,7 +66,7 @@ int main() {
     {
         AutoInputs in = base(128, false);
         in.hybrid = true; in.p_cores = 8; in.e_cores = 16; in.worker_cores = 23;
-        CHECK(choose_auto(in).pool_workers == 7);   // auto affinity: P-cores - 1
+        CHECK(choose_auto(in).pool_workers == 15);   // auto affinity: P-cores - 1, plus half the E-cores
         in.given.pool_affinity = true; in.given.pool_affinity_value = AutoAffinity::All;
         CHECK(choose_auto(in).pool_workers == 23);
         in.given.pool_affinity_value = AutoAffinity::PCores;
@@ -88,7 +88,10 @@ int main() {
         CHECK(choose_auto(in).pool_workers == 4);   // and the all-cores count
         CHECK(auto_pool_workers(in, AutoAffinity::PCores) == 4);
         in.cpu_quota = 0;
-        CHECK(auto_pool_workers(in, AutoAffinity::All) == 23 && auto_pool_workers(in, AutoAffinity::Auto) == 7);
+        CHECK(auto_pool_workers(in, AutoAffinity::All) == 23 && auto_pool_workers(in, AutoAffinity::Auto) == 15);
+        CHECK(auto_pool_workers(in, AutoAffinity::PCores) == 7);
+        in.p_cores = 6; in.e_cores = 4; in.worker_cores = 9;
+        CHECK(auto_pool_workers(in, AutoAffinity::Auto) == 7);   // 5 P-cores and 2 of the 4 E-cores
     }
     // Each setting given: it is kept, marked Given, and left out of the line.
     {

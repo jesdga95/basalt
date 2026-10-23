@@ -71,7 +71,7 @@ wins and is never changed.
 | `peer-exclusive` | on only with a peer card and `--serve`, when the full expert set does not fit in free RAM but the set without the peer card's share does; otherwise off. |
 | `resident` | the free RAM above the safety floor, capped at the experts the GPUs do not hold. |
 | `pool-affinity` | `auto`. |
-| `pool-workers` | the physical cores minus the host thread; on a hybrid CPU with `auto` or `p-cores`, the P-cores minus one; fitted to a container CPU quota. |
+| `pool-workers` | the physical cores minus the host thread; on a hybrid CPU with `auto`, the P-cores minus one plus half the E-cores, with `p-cores` the P-cores minus one; fitted to a container CPU quota. |
 
 The engine prints one line naming only the picked settings, in the order above, and the server relays it once per start:
 
