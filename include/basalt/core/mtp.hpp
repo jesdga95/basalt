@@ -5,6 +5,10 @@
 // rope position i (vLLM's convention); its output predicts the token at position i+2, and its own residual feeds
 // the next draft step.
 //
+// Because a cell is a pair, this layer's cached K/V is keyed by bigrams, not by tokens: a conversation prefix of N
+// tokens names cells [0, N-1) (core::draft_cells).  Cell N-1's pair reaches the token at N, which the prefix does not
+// name, so a saved draft K/V never publishes it - the boundary cell belongs to the next slice.
+//
 //   e = fc_embedding(rms(embed(tok)) * (1+w))           h = fc_hidden per stream(rms_10240(R) * (1+w))
 //   R = h + e  ->  attention hyper-connection  ->  QSA attention (own K/V)  ->  MLP hyper-connection  ->
 //   MoE (512 experts, top-10, shared expert)  ->  R += y * 2 sigmoid(inject / hc)  ->  final mixer  ->  head

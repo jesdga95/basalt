@@ -9,6 +9,8 @@
 #include <functional>
 #include <limits>
 #include <cstring>
+#include <map>
+#include <vector>
 
 #if defined(CONVERSATION_TEST_TRANSFERS)
 // GNU/ELF link wrapping exercises the actual restore control flow without
@@ -17,10 +19,18 @@
 namespace {
 int copy_calls = 0, sync_calls = 0, fail_copy = 0, fail_sync = 0;
 size_t copied_bytes = 0;
+// Direction per copy, so a test can assert that a slot save/restore is D2D and that a hit copies no H2D state.
+std::vector<cudaMemcpyKind> copy_kinds;
+size_t copied_kind_bytes[5] = {};
+int d2d_copies = 0;            // how many device-to-device copies a call made: the recurrence's own copy is one
+size_t d2d_bytes = 0;
 }
-extern "C" cudaError_t __wrap_cudaMemcpy(void* dst, const void* src, size_t n, cudaMemcpyKind) {
+extern "C" cudaError_t __wrap_cudaMemcpy(void* dst, const void* src, size_t n, cudaMemcpyKind kind) {
     if (++copy_calls == fail_copy) return cudaErrorInvalidValue;
     copied_bytes += n;
+    copy_kinds.push_back(kind);
+    copied_kind_bytes[(int) kind] += n;
+    if (kind == cudaMemcpyDeviceToDevice) { ++d2d_copies; d2d_bytes += n; }
     std::memcpy(dst, src, n);
     return cudaSuccess;
 }
@@ -58,14 +68,23 @@ struct Pools {
         st.idx_pooled = (float*) data[4].data(); st.idx_tail = (float*) data[5].data();
         st.idx_dead = (float*) data[6].data(); st.idx_block_pos = (int32_t*) data[7].data();
     }
-    ConversationKv image(const ModelGeometry& g, bool index) const {
+    /// The image a save produces for a `tokens`-token key: whole pages for the draft layer, the token count rounded up
+    /// otherwise.  Sizes follow the same layout, so a fixture cannot encode an extent the engine does not use.
+    ConversationKv image(const ModelGeometry& g, bool index, int64_t tokens = 9) const {
+        const auto s = basalt::kernels::qsa_real_shapes();
+        const size_t per = st.kv_q4 ? basalt::kernels::kv_q4_bytes_per_head((int) g.head_dim)
+                                    : (size_t) g.head_dim * (st.kv_int8 ? 1 : 2);
+        const int64_t cells = index ? ((tokens + s.page_size - 1) / s.page_size) * s.page_size
+                                    : draft_published_cells(tokens, s.page_size);
+        const int64_t pooled = index && tokens > 0 ? tokens / s.idx_block + 1 : 0;
+        const size_t scale_per = st.kv_int8 && !st.kv_q4 ? (size_t) (g.head_dim / 64) * 2 : 0;
         ConversationKv k;
-        k.format = qsa_kv_format(st); k.cells = 12; k.page_size = 4;
+        k.format = qsa_kv_format(st); k.cells = cells; k.page_size = s.page_size;
         k.heads = g.n_head_kv; k.head_dim = g.head_dim; k.idx_dim = g.idx_key_dim;
-        k.pooled_rows = index ? 3 : 0;
-        k.k.resize(data[0].size() / 8, 13); k.v = k.k;
-        k.k_scale.resize(data[2].size() / 8, 13); k.v_scale = k.k_scale;
-        k.pooled.resize(k.pooled_rows * g.idx_key_dim * 4, 13);
+        k.pooled_rows = pooled;
+        k.k.resize((size_t) cells * (size_t) g.n_head_kv * per, 13); k.v = k.k;
+        k.k_scale.resize((size_t) cells * (size_t) g.n_head_kv * scale_per, 13); k.v_scale = k.k_scale;
+        k.pooled.resize((size_t) pooled * (size_t) g.idx_key_dim * 4, 13);
         return k;
     }
 };
@@ -166,6 +185,42 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     check(!conversation_state_sizes(bad_geometry,z,error), "zero layer interval rejected before division");
     bad_geometry = g; bad_geometry.n_head_kv = std::numeric_limits<int64_t>::max();
     check(conversation_kv_bytes(draft.st,bad_geometry,9,false)==0, "KV byte overflow rejected");
+    {
+        // The draft image publishes the cells its key names, whole pages only: the page holding the boundary cell is
+        // not published. The main layers keep rounding up - their last page is entirely the key's own.  The byte
+        // count is a sum of buffers whose allocation rounds up, so it is compared across token counts that publish
+        // the SAME cells: equal there, and strictly larger for a larger extent, is exactly "the extent is the cells".
+        const int64_t page = basalt::kernels::qsa_real_shapes().page_size;
+        std::map<int64_t, size_t> by_cells;
+        for (int64_t n : {page - 1, page, page + 1, 2 * page, 2 * page + 1, 3 * page + 2, int64_t(45), int64_t(48),
+                          int64_t(49)}) {
+            if (n < 1 || n > draft.st.max_cells) continue;   // past the fixture's capacity is a different rule
+            const int64_t want_cells = draft_published_cells(n, page);
+            const size_t bytes = conversation_kv_bytes(draft.st, g, n, false);
+            check(want_cells == draft_cells(n) / page * page, "the draft publishes whole pages of the cells its key names");
+            const auto found = by_cells.find(want_cells);
+            if (found == by_cells.end()) {
+                // A prefix shorter than one page names fewer cells than a page holds, so it publishes nothing at all.
+                check(want_cells == 0 ? bytes == 0 : bytes > 0,
+                      "a published extent has an image and a short prefix has none");
+                by_cells.emplace(want_cells, bytes);
+            } else {
+                check(found->second == bytes,
+                      "two token counts that publish the same cells cost the same image");
+            }
+            check(conversation_kv_bytes(first.st, g, n, true) > 0, "a main layer still sizes its image by the token count");
+        }
+        check(by_cells.size() > 1, "the loop covers more than one published extent");
+        size_t previous = 0;
+        for (const auto& [cells, bytes] : by_cells) {
+            if (previous != 0) check(bytes > previous, "a larger published extent is a larger image");
+            previous = bytes;
+        }
+        // Past the state's capacity the extent is refused outright, whatever the token count: that is the backing
+        // rule, not the publishing rule, so it is asserted separately.
+        check(conversation_kv_bytes(draft.st, g, draft.st.max_cells + 1, false) == 0,
+              "an extent past the state's capacity has no image");
+    }
 #if defined(CONVERSATION_TEST_TRANSFERS)
     auto reset = [&] {
         for (auto* p : {&first,&last,&draft}) for (auto& bytes : p->data) std::fill(bytes.begin(),bytes.end(),0xa5);
@@ -230,6 +285,68 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     SavedConversation unpublished;
     check(!conversation_snapshot_save(unpublished,view,ss,g,draft.st,error,std::move(reuse)), "incremental capture copy failure is reported");
     check(unpublished.kv.empty() && unpublished.live.ids.empty(), "failed incremental capture cannot publish a partial image");
+    {
+        // The GDN slot path's direction and content, end to end:
+        //   save  copies slot <- state, so afterwards the slot holds the state's bytes and `gdn` stays empty;
+        //   hit   copies state <- slot, so afterwards the state holds the slot's bytes and the slot is untouched.
+        // The previous block leaves the fault-injection counters carried over, so this block starts clean.
+        auto reset_copies = [&] {
+            copy_calls = sync_calls = copied_bytes = d2d_copies = d2d_bytes = 0;
+            fail_copy = fail_sync = 0;
+            copy_kinds.clear();
+            for (auto& n : copied_kind_bytes) n = 0;
+        };
+        auto check_why = [&](bool ok, const char* what) {   // a refused call must say why, not only that it returned false
+            if (!ok) std::fprintf(stderr, "  (GDN slot: %s)\n", error.empty() ? "no error text" : error.c_str());
+            check(ok, what);
+        };
+        // Names the first byte that does not hold `want`, so a content failure is self-describing.
+        auto check_all = [&](const char* what, const std::vector<uint8_t>& v, uint8_t want) {
+            for (size_t i = 0; i < v.size(); ++i)
+                if (v[i] != want) {
+                    std::fprintf(stderr, "  (GDN slot: %s: byte %zu of %zu is 0x%02x, expected 0x%02x)\n", what, i,
+                                 v.size(), (unsigned) v[i], (unsigned) want);
+                    break;
+                }
+            check(std::all_of(v.begin(), v.end(), [&](uint8_t b) { return b == want; }), what);
+        };
+        ConversationStateSizes zs, zc;
+        check(conversation_state_sizes(g, zs, error), "slot direction fixture sizes");
+        check_why(conversation_session_sizes(g, ss, zc, error), "the session's carve sizes");
+        check(zc.gdn > 0 && zc.gdn <= zs.gdn, "the GDN payload is non-empty and inside the whole-model size");
+        // The restore recomputes z.gdn itself; the buffers are sized from the same call, and the D2D byte count below
+        // pins that the two agree - a short copy would leave a tail of the state uncompared.
+        std::vector<uint8_t> state(zc.gdn, 0x11), slot(zc.gdn, 0x22);
+        ss.gdn_state = (float*) state.data();
+        // The slot this checkpoint names belongs to a book, as the engine's does: the save and the restore read the
+        // buffer through the index, and the checkpoint stays the one that holds it.
+        GdnSlotBook pool;
+        pool.reset(1);
+        ConversationCheckpoint c;
+        c.ids = {1, 2};
+        check(c.gdn_slot.acquire(pool, 2) && c.gdn_slot.index() == 0, "the fixture takes the pool's only slot");
+        reset_copies();
+        check_why(conversation_checkpoint_save(c, ss, g, error, slot.data()), "a slotted checkpoint saves");
+        check(c.gdn.empty(), "a slotted checkpoint keeps no host copy of the recurrence");
+        check(c.gdn_slot.index() == 0 && pool.used() == 1, "the save kept the slot it was given");
+        check(d2d_copies == 1 && d2d_bytes == zc.gdn && copied_kind_bytes[cudaMemcpyDeviceToHost] == 0,
+              "the GDN slot capture is one D2D copy of exactly the recurrence's bytes");
+        check(!copy_kinds.empty() && copy_kinds[0] == cudaMemcpyDeviceToDevice, "the first slot copy is D2D");
+        check_all("the save left the slot holding the state's bytes", slot, 0x11);   // the mirror, byte for byte
+        check_why(conversation_checkpoint_validate(c, ss, g, error), "a slotted checkpoint validates");
+        c.gdn.assign(zc.gdn, 3);
+        check(!conversation_checkpoint_validate(c, ss, g, error), "a checkpoint with a slot and host bytes is refused");
+        c.gdn.clear();
+        // A slot holding a state the session does not have (another conversation's would), so the hit is observable.
+        std::fill(slot.begin(), slot.end(), 0x22);
+        reset_copies();
+        check_why(conversation_checkpoint_restore(c, ss, g, error, slot.data()), "a slotted checkpoint restores");
+        check(d2d_copies == 1 && d2d_bytes == zc.gdn && copied_kind_bytes[cudaMemcpyHostToDevice] == 0,
+              "the GDN slot hit is exactly one D2D copy and no host bytes");
+        check(c.gdn.empty(), "the hit read no host bytes");
+        check_all("the hit wrote the slot's bytes into the state", state, 0x22);
+        check_all("the hit left the slot intact", slot, 0x22);
+    }
 #endif
 }
 }

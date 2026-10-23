@@ -38,6 +38,16 @@ bool copy(void* dst, const void* src, size_t bytes, std::string& error) {
     return false;
 }
 
+// A copy whose direction is stated rather than inferred: a device slot's mirror and its restore.
+bool copy_kind(void* dst, const void* src, size_t bytes, cudaMemcpyKind kind, std::string& error) {
+    if (!bytes) return true;
+    if (!dst || !src) return fail(error, "missing running-state buffer");
+    const auto status = cudaMemcpy(dst, src, bytes, kind);
+    if (status == cudaSuccess) return true;
+    error = std::string("conversation snapshot running-state copy: ") + cudaGetErrorString(status);
+    return false;
+}
+
 // The session's carve: `qsa_states` keeps global ordinals and holds the owned ones
 // [qsa_ord0, qsa_ord0 + qsa_alloc); `gdn_state` holds `gdn_alloc` rows. A whole-model session owns every layer.
 size_t owned_qsa(const SessionState& ss) { return (size_t) std::max<int64_t>(ss.qsa_alloc, 0); }
@@ -144,7 +154,10 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const Ses
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss);
-    if (c.gdn.size() != z.gdn || c.ple.size() != (ss.ple_hist ? z.ple : 0) ||
+    // A checkpoint keeps its recurrence in a device slot or in host bytes, never both.
+    if (c.gdn_slot.index() >= 0 ? !c.gdn.empty() : c.gdn.size() != z.gdn)
+        return fail(error, "invalid checkpoint GDN state: a slot and host bytes are exclusive");
+    if (c.ple.size() != (ss.ple_hist ? z.ple : 0) ||
         c.tails.size() != layers * z.tail || c.dead.size() != layers * z.dead ||
         c.block_pos.size() != layers * z.block_pos || !image_keys(c.imgs, c.ids.size()))
         return fail(error, "invalid checkpoint running-state payload");
@@ -152,14 +165,21 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const Ses
 }
 
 bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState& ss,
-                                  const ModelGeometry& g, std::string& error) {
+                                  const ModelGeometry& g, std::string& error, void* gdn_dev) {
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss);
-    c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
+    c.ple.resize(ss.ple_hist ? z.ple : 0);
     c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
-    if (!copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error) ||
-        !copy(c.ple.data(), ss.ple_hist, c.ple.size(), error)) return false;
+    // A slot mirrors the state device to device; without one the state goes to host bytes.
+    if (gdn_dev != nullptr) {
+        c.gdn.clear();
+        if (!copy_kind(gdn_dev, ss.gdn_state, z.gdn, cudaMemcpyDeviceToDevice, error)) return false;
+    } else {
+        c.gdn.resize(z.gdn);
+        if (!copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error)) return false;
+    }
+    if (!copy(c.ple.data(), ss.ple_hist, c.ple.size(), error)) return false;
     for (size_t j = 0; j < layers; ++j) {
         const auto& st = owned(ss, j);
         if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error) ||
@@ -234,12 +254,16 @@ bool ConversationCheckpointDeferral::finish(std::string& error) {
 }
 
 bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionState& ss,
-                                     const ModelGeometry& g, std::string& error) {
+                                     const ModelGeometry& g, std::string& error, const void* gdn_dev) {
     if (!conversation_checkpoint_validate(c, ss, g, error)) return false;
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
-    if (!copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error) ||
-        !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
+    // A slotted checkpoint restores device to device; the slot is a mirror, so it stays as it is for the next hit.
+    if (c.gdn_slot.index() >= 0 && gdn_dev == nullptr)
+        return fail(error, "a checkpoint's GDN slot was not resolved");
+    if (c.gdn_slot.index() >= 0 ? !copy_kind(ss.gdn_state, gdn_dev, z.gdn, cudaMemcpyDeviceToDevice, error)
+                                : !copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error)) return false;
+    if (!copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
     for (size_t j = 0; j < owned_qsa(ss); ++j) {
         const auto& st = owned(ss, j);
         if (!copy(st.idx_tail, c.tails.data() + j * z.tail, z.tail, error) ||
@@ -329,10 +353,12 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
                                   unchanged, reused_bytes)) return false;
-    // The draft's final cell may not have been computed when the output cap was
-    // reached. Refresh that page even when the main prefix continued unchanged.
-    if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error,
-                                       std::max<int64_t>(0, unchanged - 1), reused_bytes)) return false;
+    // The draft layer's K/V is keyed by bigrams, not tokens: the key is the first `upto` tokens and the cells it
+    // names are [0, draft_cells(upto)), published as whole pages only.  The page holding the boundary cell is never
+    // published, so the unchanged prefix needs no off-by-one refresh for the draft: every published cell was
+    // computed.  `conversation_kv_save` caps the prefix by the extent for that reason.
+    if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error, unchanged, reused_bytes))
+        return false;
     image = std::move(captured);
     return true;
 }
