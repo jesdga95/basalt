@@ -404,7 +404,7 @@ target_link_libraries(prefill PUBLIC engine ${_gpu_blas_target} ${_gpu_runtime_t
 add_executable(basalt src/program/generate.cpp src/program/probe_rates.cpp)
 set_target_properties(basalt PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
-target_link_libraries(basalt PRIVATE engine engine_session grammar prefill spec ${_gpu_runtime_target})
+target_link_libraries(basalt PRIVATE engine engine_session grammar tokenizer prefill spec ${_gpu_runtime_target})
 basalt_embed_manifest(basalt)
 # `basalt serve` runs the Python server from the source tree
 target_compile_definitions(basalt PRIVATE BASALT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -429,6 +429,20 @@ add_library(grammar STATIC src/program/grammar/grammar.cpp src/program/grammar/s
             src/program/grammar/schema_convert.cpp src/program/grammar/guard.cpp)
 target_include_directories(grammar PUBLIC include)
 target_link_libraries(grammar PRIVATE warnings)
+
+# the C++ byte-level BPE tokenizer the engine runs on request text (CPU only)
+add_library(tokenizer STATIC src/program/tokenizer/bpe.cpp src/program/tokenizer/pretok_qwen35.cpp
+            src/program/tokenizer/unicode_flags.cpp)
+target_include_directories(tokenizer PUBLIC include PRIVATE src/program/tokenizer)
+target_link_libraries(tokenizer PRIVATE warnings)
+add_executable(tokenizer_test tests/program/tokenizer_test.cpp)
+target_link_libraries(tokenizer_test PRIVATE tokenizer warnings)
+basalt_embed_manifest(tokenizer_test)
+add_executable(tokenizer_bench src/program/tokenizer/tokenizer_bench.cpp)
+target_link_libraries(tokenizer_bench PRIVATE tokenizer warnings)
+basalt_embed_manifest(tokenizer_bench)
+basalt_cpu_test(NAME tokenizer_test COMMAND tokenizer_test)
+set_tests_properties(tokenizer_test PROPERTIES TIMEOUT 60)
 add_executable(basalt-bench src/program/bench_main.cpp)
 set_target_properties(basalt-bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 # the image encoder sidecar, bin/basalt-vision (its own project, built with this one)
@@ -497,6 +511,15 @@ basalt_embed_manifest(iq_parity)
 # BUILD directory (the source tree is not touched).  The CTest fixture makes generation-to-test order
 # explicit even under parallel execution; a fixture-generation failure fails iq_parity with it.
 find_package(Python3 COMPONENTS Interpreter QUIET)
+
+# the C++ tokenizer's ids against tools/tokenizer.py over a corpus
+# (-DBASALT_TOKENIZER_DIR=<a pack's extracted tokenizer/ directory>, with python3 and the regex package)
+if(BASALT_TOKENIZER_DIR AND Python3_Interpreter_FOUND)
+  basalt_cpu_test(NAME tokenizer_parity
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/tokenizer_parity.py
+                          $<TARGET_FILE:tokenizer_test> ${BASALT_TOKENIZER_DIR} ${BASALT_TOKENIZER_BIG})
+  set_tests_properties(tokenizer_parity PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
+endif()
 # the generator needs an interpreter WITH numpy: probe the configured one, a .venv, and the
 # system python3; -DIQ_FIXTURE_PYTHON=... overrides the search outright.
 set(_iq_python "")

@@ -32,7 +32,10 @@ Extracted from llama.cpp commit 3cf03257f219afbe7334045ff7c6a06ac68c627d into
   include/basalt/ggml/, src/kernels/cpu/ggml/ and src/prefill/mmq/;
 kernels adapted from it elsewhere in src/ (src/kernels/cuda/, src/prefill/, src/kernels/cpu/);
 the GBNF grammar engine and the JSON-schema-to-grammar builder, reworked from src/llama-grammar.cpp and
-  common/json-schema-to-grammar.cpp into include/basalt/program/grammar/ and src/program/grammar/
+  common/json-schema-to-grammar.cpp into include/basalt/program/grammar/ and src/program/grammar/;
+the Qwen3.5 pre-tokenizer and the Unicode category table, reworked from src/unicode.cpp
+  (unicode_regex_split_custom_qwen35, by Kabir Potdar) and src/unicode-data.cpp (unicode_ranges_flags) at commit
+  f5027fb21 into src/program/tokenizer/
 Both projects publish the same licence text, reproduced once below.
 ================================================================================
 

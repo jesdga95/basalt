@@ -25,6 +25,11 @@ The server tests run with `python -m unittest discover -s serve/tests -t .` afte
 vocabulary and skip without a pack; the same checks run on a synthetic vocabulary in the same file. The test that runs
 the built engine with every flag needs `bin/basalt`.
 
+The engine tokenizes request text itself (`GENT`). `tokenizer_test` checks the C++ tokenizer on a synthetic vocabulary;
+`tokenizer_parity` compares its ids with `tools/tokenizer.py` over a corpus, and is registered when cmake gets
+`-DBASALT_TOKENIZER_DIR=<a pack's extracted tokenizer/ directory>` (with python3 and the `regex` package; `-DBASALT_TOKENIZER_BIG`
+adds `--big FILE...` to the corpus). `tokenizer_bench DIR FILE...` times a cold and a warm encode.
+
 `basalt-bench` reads its pre-tokenized prompts from `data/bench` (token ids for the Qwen3.8-Flash-Next tokenizer: the
 three decode prompts and a prefill filler); run it from the repository root or pass `--fixtures DIR`. `basalt-bench
 --help` says how the files are made.
