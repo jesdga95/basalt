@@ -37,6 +37,7 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/program/auto_plan.hpp"
+#include "basalt/program/tokenizer.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
@@ -5854,6 +5855,28 @@ int main(int argc, char** argv) {
         };
         // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
         // away, or pressed Esc): the flag is checked between prompt chunks and between verify windows.
+        // GENT: the request text arrives as bytes and the reader thread turns it into ids, from the pack's tokenizer tables
+        basalt::program::Tokenizer text_tokenizer;
+        std::string text_tokenizer_note = "this pack has no qwen35 tokenizer tables";
+        {
+            std::vector<uint8_t> vj, mj, tj, cj;
+            std::string terr;
+            if (basalt::core::read_range(model_file.range("tokenizer/vocab.json"), vj, terr) &&
+                basalt::core::read_range(model_file.range("tokenizer/merges.txt"), mj, terr) &&
+                basalt::core::read_range(model_file.range("tokenizer/token_type.json"), tj, terr) &&
+                basalt::core::read_range(model_file.range("tokenizer/tokenizer.json"), cj, terr) &&
+                std::string_view((const char*) cj.data(), cj.size()).find("\"pre\": \"qwen35\"") != std::string_view::npos) {
+                if (text_tokenizer.load(std::string_view((const char*) vj.data(), vj.size()),
+                                        std::string_view((const char*) mj.data(), mj.size()),
+                                        std::string_view((const char*) tj.data(), tj.size()), terr))
+                    text_tokenizer_note.clear();
+                else
+                    text_tokenizer_note = terr;
+            }
+        }
+        std::mutex gent_mu;
+        std::map<uint64_t, std::vector<int32_t>> gent_ids;   // tokenized prompts waiting for their request line, by sequence
+        uint64_t gent_seq = 0;
         std::atomic<bool> stop_req{false};
         std::atomic<bool> stdin_lost{false};   // set once at EOF: the peer is gone, so no request keeps running
         std::mutex in_mu;
@@ -5885,9 +5908,79 @@ int main(int argc, char** argv) {
                     buf.append(chunk, (size_t) n);
                 }
             };
+            // exactly n raw bytes: what the line reader already holds, then the pipe
+            auto read_exact = [&](size_t n, std::string& out) -> bool {
+                while (buf.size() < n) {
+                    const std::ptrdiff_t got = (std::ptrdiff_t) basalt::platform::pipe_read(0, chunk, sizeof chunk);
+                    if (got < 0 && errno == EINTR) continue;
+                    if (got <= 0) return false;
+                    buf.append(chunk, (size_t) got);
+                }
+                out.assign(buf, 0, n);
+                buf.erase(0, n);
+                return true;
+            };
+            // GENT/SGENT/BGENT <...> <max_new> [k=v ...] <nbytes> [plain=a:b,...] + nbytes of UTF-8: tokenize here and hand
+            // the main loop the matching GEN/SGEN/BGEN line, with "@<seq>" where the ids would be.  False: the input ends
+            // inside the payload.
+            auto take_text = [&](const std::string& head_line, std::string& line_out) -> bool {
+                std::vector<std::string> tk;
+                {
+                    std::istringstream is(head_line);
+                    for (std::string w; is >> w;) tk.push_back(w);
+                }
+                const size_t lead = tk[0] == "GENT" ? 2 : 3;   // the command, [the slot,] max_new
+                std::string head = tk[0].substr(0, tk[0].size() - 1);
+                long long nbytes = -1;
+                std::string plain_text;
+                for (size_t i = 1; i < tk.size(); ++i) {
+                    if (i < lead) head += " " + tk[i];
+                    else if (tk[i].rfind("plain=", 0) == 0) plain_text = tk[i].substr(6);
+                    else if (tk[i].find('=') != std::string::npos) head += " " + tk[i];
+                    else if (nbytes < 0) nbytes = std::atoll(tk[i].c_str());
+                }
+                if (tk.size() < lead || nbytes < 0 || nbytes > (1LL << 31)) {
+                    line_out = "ERR_GENT bad header: GENT <max_new> [k=v ...] <nbytes> [plain=a:b,...]";
+                    return true;
+                }
+                std::string payload;
+                if (!read_exact((size_t) nbytes, payload)) { line_out = "ERR_GENT the prompt text was cut short"; return false; }
+                if (!text_tokenizer_note.empty()) { line_out = "ERR_GENT " + text_tokenizer_note; return true; }
+                std::vector<basalt::program::Tokenizer::Span> spans;
+                for (size_t p = 0; p < plain_text.size();) {
+                    char* e1 = nullptr;
+                    const unsigned long long a = std::strtoull(plain_text.c_str() + p, &e1, 10);
+                    if (*e1 != ':') break;
+                    char* e2 = nullptr;
+                    const unsigned long long b = std::strtoull(e1 + 1, &e2, 10);
+                    spans.push_back({(size_t) a, (size_t) b});
+                    p = (size_t) (e2 - plain_text.c_str());
+                    if (p < plain_text.size() && plain_text[p] == ',') ++p;
+                }
+                std::vector<int32_t> tids;
+                std::string terr;
+                if (!text_tokenizer.encode(payload, true, spans, tids, terr)) { line_out = "ERR_GENT tokenizer: " + terr; return true; }
+                std::lock_guard<std::mutex> lk(gent_mu);
+                const uint64_t seq = ++gent_seq;
+                gent_ids[seq] = std::move(tids);
+                while (gent_ids.size() > 8) gent_ids.erase(gent_ids.begin());   // a request that never claimed its ids
+                line_out = head + " @" + std::to_string(seq);
+                return true;
+            };
             while (getline_fd(l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { stop_req.store(true); continue; }
+                if (l.rfind("GENT ", 0) == 0 || l.rfind("SGENT ", 0) == 0 || l.rfind("BGENT ", 0) == 0) {
+                    std::string rewritten;
+                    const bool framed = take_text(l, rewritten);
+                    l = rewritten;
+                    if (!framed) {   // the input ended inside the payload: report it
+                        std::lock_guard<std::mutex> lk(in_mu);
+                        in_lines.push_back(l);
+                        in_cv.notify_one();
+                        break;
+                    }
+                }
                 std::lock_guard<std::mutex> lk(in_mu);
                 in_lines.push_back(l);
                 in_cv.notify_one();
@@ -5986,6 +6079,7 @@ int main(int argc, char** argv) {
                                        " solo_any_slot=" + std::to_string(slot0_is_solo ? 1 : 0)).c_str() : "",
                         quant_label.c_str(), gpu_ids.c_str());
         }
+        if (text_tokenizer_note.empty()) std::printf("INFO text_prompt=1\n");
         // a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on a flag nobody
         // will raise - end the engine with where it was, so the server starts it again instead of the GPU spinning
         // forever.  Before it does, it reports what every part was doing (stall_report), so one occurrence says where
@@ -7209,6 +7303,11 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 continue;
             }
+            if (line.rfind("ERR_GENT ", 0) == 0) {
+                std::printf("ERR %s\n", line.c_str() + 9);
+                std::fflush(stdout);
+                continue;
+            }
             admit_slot = -1;
             solo_slot = -1;
             if (line.rfind("SGEN ", 0) == 0 || line.rfind("SGENI ", 0) == 0) {   // SGEN <slot> <max_new> ...: a GEN in that slot
@@ -7255,11 +7354,11 @@ int main(int argc, char** argv) {
             if (mtp_on && !mtp.use_main(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }   // (batch windows swap the draft K/V)
             const bool geni = line.rfind("GENI ", 0) == 0;
             if (!geni && line.rfind("GEN ", 0) != 0) {
-                std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
+                std::printf("ERR expected: GEN <max_new> <id,id,...>, GENI <max_new> <file> <id,id,...> or GENT <max_new> <nbytes> + text\n");
                 continue;
             }
             char* endp = nullptr;
-            const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
+            long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
             // optional sampling keys between max_new and the ids: temperature=F, top_p=F, top_k=N, min_p=F,
             // penalty_last_n=N, penalty_repeat=F, penalty_freq=F, penalty_present=F, seed=N (text requests
             // only).  Absent keys keep today's behavior: greedy, no penalties.
@@ -7276,6 +7375,7 @@ int main(int argc, char** argv) {
             // ppl=K [ppl_t=T]: quality gate (basalt/program/ppl_gate.hpp) - chunk K of --ppl-base, the rest of
             // the chunk teacher-forced through verify windows of T tokens, every token committed
             int req_ppl = -1, req_ppl_t = 3;
+            int req_clip = 0;   // clip=1 (GENT): max_new is a cap, cut to the room the context leaves after the prompt
             if (endp != nullptr) {   // GENI takes the same keys (image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -7301,6 +7401,7 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "relax") req_relax = std::clamp(fv, 0.0f, 1.0f);
+                    else if (key == "clip") req_clip = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ppl") req_ppl = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ppl_t") req_ppl_t = std::atoi(tok.c_str() + eq + 1);
                     // unknown keys are skipped: the ids start at the first token without '='
@@ -7321,7 +7422,25 @@ int main(int argc, char** argv) {
             }
             std::vector<int64_t> ids;
             std::string pe;
-            if (max_new < 1 || endp == nullptr || (geni && emb_path.empty()) || !parse_i64_list(endp, ids, pe)) {
+            bool ids_ok = false;
+            bool from_text = false;   // the ids came from a GENT request's text
+            if (endp != nullptr) {
+                while (*endp == ' ') ++endp;
+                if (*endp == '@') {
+                    std::lock_guard<std::mutex> lk(gent_mu);
+                    const auto it = gent_ids.find(std::strtoull(endp + 1, nullptr, 10));
+                    if (it != gent_ids.end()) {
+                        ids.assign(it->second.begin(), it->second.end());
+                        gent_ids.erase(it);
+                        ids_ok = from_text = true;
+                    } else {
+                        pe = "the tokenized prompt is gone";
+                    }
+                } else {
+                    ids_ok = parse_i64_list(endp, ids, pe);
+                }
+            }
+            if (max_new < 1 || endp == nullptr || (geni && emb_path.empty()) || !ids_ok) {
                 std::printf("ERR bad request: %s\n", pe.empty() ? "max_new" : pe.c_str());
                 continue;
             }
@@ -7443,6 +7562,16 @@ int main(int argc, char** argv) {
                 mrope_identity = !geni;
             }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
+            if (from_text && req_clip && admit_slot < 0) {
+                const long long room = (long long) (o.max_context - 8 - n);
+                if (room < 1) {
+                    std::printf("ERR prompt (%lld tokens) leaves no room to answer in the context (%lld)\n", (long long) n,
+                                (long long) o.max_context);
+                    std::fflush(stdout);
+                    continue;
+                }
+                max_new = std::min(max_new, room);
+            }
             {
                 const int64_t ctx = admit_slot >= 0 ? slot_cap[(size_t) admit_slot] : o.max_context;
                 const long long want = admit_slot >= 0 ? admit_max_new : (long long) max_new;   // a slot's request: its own max_new
@@ -7458,6 +7587,7 @@ int main(int argc, char** argv) {
                     continue;
                 }
             }
+            if (from_text) { std::printf("PT %lld %lld\n", (long long) n, (long long) max_new); std::fflush(stdout); }
             bool bad = false;
             for (int64_t t : ids) bad = bad || t < 0 || t >= n_vocab;
             if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); continue; }
