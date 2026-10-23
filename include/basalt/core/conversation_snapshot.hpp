@@ -43,8 +43,11 @@ bool conversation_session_sizes(const ModelGeometry& g, const SessionState& sess
                                 std::string& error);
 bool conversation_checkpoint_validate(const ConversationCheckpoint& checkpoint, const SessionState& session,
                                       const ModelGeometry& g, std::string& error);
+/// `gdn_dev`: a device slot (GdnSlots) to mirror the recurrence into, device to device, instead of copying it to the
+/// checkpoint's host bytes.  The slot is a copy of the state, never the state itself.  The caller sets
+/// `checkpoint.gdn_slot` when it passes one, and a checkpoint with a slot keeps no host copy of the recurrence.
 bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const SessionState& session,
-                                  const ModelGeometry& g, std::string& error);
+                                  const ModelGeometry& g, std::string& error, void* gdn_dev = nullptr);
 /// Saves a checkpoint's GDN recurrences off the caller's critical path: the device state is copied into a spare
 /// device buffer at device bandwidth, and a helper thread moves it to the checkpoint's host bytes while the caller
 /// carries on.  The checkpoint's `gdn` bytes are valid only once finish() has returned true; nothing may read,
@@ -72,8 +75,10 @@ private:
     const void* dst_ = nullptr;
     int status_ = 0;
 };
+/// `gdn_dev`: the device slot `checkpoint.gdn_slot` names (null when it has none).  A slotted checkpoint restores its
+/// recurrence device to device and the slot is left as it is; a checkpoint without one restores its host bytes.
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
-                                     const ModelGeometry& g, std::string& error);
+                                     const ModelGeometry& g, std::string& error, const void* gdn_dev = nullptr);
 
 struct ConversationView {
     const std::vector<int32_t>& ids;

@@ -1,4 +1,5 @@
 #include "basalt/core/conversation_cache.hpp"
+#include "basalt/core/gdn_slot_book.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -333,6 +334,150 @@ int main() {
         check(b[0] == 9 && b[big - 1] == 4, "a reused buffer is not zeroed");
         CheckpointBytes small(100, 3), copy = small;
         check(copy.size() == 100 && copy[99] == 3, "small buffers still copy and fill");
+    }
+    {
+        // The bulk (memcmp) key compare against the element-wise reference: every divergence index, a full match, and
+        // the lengths around a page boundary.  A key is int32; a prompt may be either width, and the prefix has to
+        // answer the same for both.
+        auto fill = [](size_t n, int32_t seed) {
+            std::vector<int32_t> v(n);
+            for (size_t i = 0; i < n; ++i) v[i] = (int32_t) ((i * 7 + (size_t) seed) % 97) - 3;
+            return v;
+        };
+        check(conversation_ids_equal(nullptr, 0, (const int32_t*) nullptr), "an empty slice is equal");
+        for (size_t len : {size_t(0), size_t(1), size_t(2), size_t(3), size_t(7), size_t(127), size_t(128),
+                           size_t(129), size_t(1024), size_t(4097)}) {
+            const std::vector<int32_t> key = fill(len, 1);
+            for (size_t at = 0; at <= len; ++at) {          // `at == len`: the prompt starts with the whole key
+                std::vector<int32_t> prompt = fill(len + 3, 1);
+                if (at < len) prompt[at] = (int32_t) (prompt[at] + 1);   // differs exactly at `at`
+                const bool want = conversation_ids_equal_linear(key.data(), len, prompt.data());
+                check(conversation_ids_equal(key.data(), len, prompt.data()) == want,
+                      "bulk token equality matches the element-wise reference");
+                ConversationCheckpoint c;
+                c.ids = key;
+                const std::vector<int64_t> wide(prompt.begin(), prompt.end());
+                check(conversation_prefix(c, prompt, {}) == conversation_prefix(c, wide, {}),
+                      "an int32 prompt and an int64 one give the same prefix");
+            }
+            // the empty-slice boundary: no key, and a key as long as the prompt (the last token is never reused)
+            ConversationCheckpoint c;
+            c.ids = key;
+            check(conversation_prefix(c, std::vector<int32_t>{}, {}) == 0, "an empty prompt matches nothing");
+            std::vector<int32_t> exact = fill(len, 1);
+            check(conversation_prefix(c, exact, {}) == 0, "a prompt as long as the key cannot consume its last token");
+        }
+    }
+    {
+        // The GDN slot book: which slot holds which seqlen, and which are free.
+        GdnSlotBook b;
+        b.reset(2);
+        check(b.slots() == 2 && b.used() == 0, "two GDN slots, none holding a state");
+        const int x = b.take(40), y = b.take(41);
+        check(x >= 0 && y >= 0 && x != y && b.used() == 2, "two checkpoints take distinct slots");
+        check(b.seqlen(x) == 40 && b.seqlen(y) == 41, "each slot records the seqlen it holds");
+        check(b.take(42) == -1, "no slot while both are taken");
+        b.release(x);
+        check(b.used() == 1 && b.seqlen(x) == -1, "releasing a slot frees it");
+        check(b.take(42) == x, "the freed slot is handed out again");
+        b.release(y);
+        b.release(y);
+        check(b.used() == 1, "releasing twice frees once");
+        b.release(-1);
+        b.release(99);
+        check(b.used() == 1, "releasing an invalid slot is a no-op");
+        check(b.seqlen(-1) == -1 && b.seqlen(99) == -1, "an invalid slot holds nothing");
+        b.reset(0);
+        check(b.slots() == 0 && b.take(1) == -1, "no pool: no slot, and the caller keeps host bytes");
+        // Who holds a slot.  A checkpoint holds one for as long as it lives; a copy of it holds none, so the chain
+        // the copy came from keeps its index and an image or another chain carries host bytes only.
+        b.reset(1);
+        ConversationCheckpoint c;
+        check(c.gdn_slot.index() == -1, "a fresh checkpoint holds no slot");
+        check(c.gdn_slot.acquire(b, 7) && c.gdn_slot.index() == 0 && b.seqlen(0) == 7 && b.used() == 1,
+              "a chain checkpoint takes a slot with its seqlen");
+        c.gdn.assign(4, 9);
+        const ConversationCheckpoint copy = c;
+        check(copy.gdn_slot.index() == -1 && c.gdn_slot.index() == 0 && b.used() == 1,
+              "a copy holds no slot: the source keeps it and the book is unchanged");
+        check(copy.gdn == c.gdn, "a copy carries the source's host bytes");
+        ConversationCheckpoint third = copy;   // the copy the request path fills from the source's slot
+        check(third.gdn == c.gdn && third.gdn_slot.index() == -1 && b.used() == 1 && c.gdn_slot.index() == 0,
+              "cloning on carries the same bytes and takes no slot");
+        c.gdn_slot.release();
+        check(c.gdn_slot.index() == -1 && b.used() == 0 && b.seqlen(0) == -1 && c.gdn.size() == 4,
+              "releasing returns the slot and leaves the host bytes in place");
+        check(b.take(7) == 0, "the released slot is handed out again");
+        b.release(0);
+        check(c.gdn_slot.acquire(b, 8) && b.used() == 1, "a checkpoint can take a slot again");
+        c.gdn_slot.release();
+        c.gdn_slot.release();
+        check(b.used() == 0 && b.free() == 1, "releasing twice frees once");
+        ConversationCheckpoint none;   // never slotted
+        none.gdn_slot.release();
+        check(none.gdn_slot.index() == -1 && b.used() == 0, "a checkpoint without a slot releases nothing");
+        b.reset(0);   // no slots at all
+        check(!none.gdn_slot.acquire(b, 1) && none.gdn_slot.index() == -1,
+              "an empty pool takes no slot: the caller keeps host bytes");
+        // A chain that stops existing gives its slots back: the pool holds two, so a leak on any of these paths
+        // leaves every later checkpoint on host bytes for the rest of the process.  The shapes below are the ones the
+        // request path uses - a growth, a prune, a replace, a slot reset, a chain going out of scope.
+        const auto slotted = [](GdnSlotBook& pool, size_t tokens) {
+            ConversationCheckpoint k;
+            k.ids.assign(tokens, (int32_t) tokens);
+            k.gdn_slot.acquire(pool, (int64_t) tokens);
+            return k;
+        };
+        {
+            GdnSlotBook pool;
+            pool.reset(2);
+            std::vector<ConversationCheckpoint> checks;
+            checks.push_back(slotted(pool, 5));
+            checks.push_back(slotted(pool, 9));
+            checks.push_back(slotted(pool, 13));   // none free: this one keeps host bytes
+            check(pool.used() == 2 && pool.free() == 0, "a chain of three holds both slots, the third unslotted");
+            check(checks[0].gdn_slot.index() >= 0 && checks[1].gdn_slot.index() >= 0 &&
+                  checks[0].gdn_slot.index() != checks[1].gdn_slot.index() &&
+                  checks[2].gdn_slot.index() == -1,
+                  "a chain that grew by moving still names one distinct slot per slotted checkpoint");
+            // the prune a shorter resume runs: the victim rule of the request path, ids longer than the resume point
+            const int64_t resume = 6;
+            std::vector<size_t> victims;
+            for (size_t i = 0; i < checks.size(); ++i)
+                if ((int64_t) checks[i].ids.size() > resume) victims.push_back(i);
+            for (size_t n = victims.size(); n-- > 0;) checks.erase(checks.begin() + (std::ptrdiff_t) victims[n]);
+            check(checks.size() == 1 && victims.size() == 2, "a shorter resume drops the checkpoints past it");
+            check(pool.free() == 1 && pool.used() == 1, "erasing a pruned checkpoint returns its slot");
+            // the replace: a restored parked conversation takes the chain's place
+            std::vector<ConversationCheckpoint> incoming;
+            incoming.push_back(slotted(pool, 21));
+            checks = std::move(incoming);
+            check(pool.used() == 1 && pool.free() == 1,
+                  "the replacement chain holds what it brought, and the replaced checkpoint gave its slot back");
+            // the not-cached path: nothing moves in, so the old chain is simply destroyed
+            checks = std::vector<ConversationCheckpoint>{};
+            check(pool.free() == 2, "replacing a chain with an empty one returns the slots it held");
+            // the batch slot's reset: `sb = BSlot{}` destroys the previous occupant's chain
+            struct Slot { std::vector<ConversationCheckpoint> checks; } sb;
+            sb.checks.push_back(slotted(pool, 7));
+            sb.checks.push_back(slotted(pool, 8));
+            check(pool.free() == 0, "a parked batch slot's chain holds both slots");
+            sb = Slot{};
+            check(pool.free() == 2, "resetting a batch slot returns its chain's slots");
+            check(pool.take(9) >= 0, "a later checkpoint can still take a slot after the drop");
+        }
+        {
+            // a chain that only goes out of scope: the request's bookkeeping at the end of the serve loop
+            GdnSlotBook pool;
+            pool.reset(2);
+            {
+                std::vector<ConversationCheckpoint> checks;
+                checks.push_back(slotted(pool, 3));
+                checks.push_back(slotted(pool, 4));
+                check(pool.free() == 0, "both slots taken inside the scope");
+            }
+            check(pool.free() == 2 && pool.used() == 0, "a chain going out of scope returns every slot");
+        }
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

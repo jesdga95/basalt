@@ -9,6 +9,7 @@
 #include <functional>
 #include <limits>
 #include <cstring>
+#include <vector>
 
 #if defined(CONVERSATION_TEST_TRANSFERS)
 // GNU/ELF link wrapping exercises the actual restore control flow without
@@ -17,10 +18,18 @@
 namespace {
 int copy_calls = 0, sync_calls = 0, fail_copy = 0, fail_sync = 0;
 size_t copied_bytes = 0;
+// Direction per copy, so a test can assert that a slot save/restore is D2D and that a hit copies no H2D state.
+std::vector<cudaMemcpyKind> copy_kinds;
+size_t copied_kind_bytes[5] = {};
+int d2d_copies = 0;            // how many device-to-device copies a call made: the recurrence's own copy is one
+size_t d2d_bytes = 0;
 }
-extern "C" cudaError_t __wrap_cudaMemcpy(void* dst, const void* src, size_t n, cudaMemcpyKind) {
+extern "C" cudaError_t __wrap_cudaMemcpy(void* dst, const void* src, size_t n, cudaMemcpyKind kind) {
     if (++copy_calls == fail_copy) return cudaErrorInvalidValue;
     copied_bytes += n;
+    copy_kinds.push_back(kind);
+    copied_kind_bytes[(int) kind] += n;
+    if (kind == cudaMemcpyDeviceToDevice) { ++d2d_copies; d2d_bytes += n; }
     std::memcpy(dst, src, n);
     return cudaSuccess;
 }
@@ -230,6 +239,68 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     SavedConversation unpublished;
     check(!conversation_snapshot_save(unpublished,view,ss,g,draft.st,error,std::move(reuse)), "incremental capture copy failure is reported");
     check(unpublished.kv.empty() && unpublished.live.ids.empty(), "failed incremental capture cannot publish a partial image");
+    {
+        // The GDN slot path's direction and content, end to end:
+        //   save  copies slot <- state, so afterwards the slot holds the state's bytes and `gdn` stays empty;
+        //   hit   copies state <- slot, so afterwards the state holds the slot's bytes and the slot is untouched.
+        // The previous block leaves the fault-injection counters carried over, so this block starts clean.
+        auto reset_copies = [&] {
+            copy_calls = sync_calls = copied_bytes = d2d_copies = d2d_bytes = 0;
+            fail_copy = fail_sync = 0;
+            copy_kinds.clear();
+            for (auto& n : copied_kind_bytes) n = 0;
+        };
+        auto check_why = [&](bool ok, const char* what) {   // a refused call must say why, not only that it returned false
+            if (!ok) std::fprintf(stderr, "  (GDN slot: %s)\n", error.empty() ? "no error text" : error.c_str());
+            check(ok, what);
+        };
+        // Names the first byte that does not hold `want`, so a content failure is self-describing.
+        auto check_all = [&](const char* what, const std::vector<uint8_t>& v, uint8_t want) {
+            for (size_t i = 0; i < v.size(); ++i)
+                if (v[i] != want) {
+                    std::fprintf(stderr, "  (GDN slot: %s: byte %zu of %zu is 0x%02x, expected 0x%02x)\n", what, i,
+                                 v.size(), (unsigned) v[i], (unsigned) want);
+                    break;
+                }
+            check(std::all_of(v.begin(), v.end(), [&](uint8_t b) { return b == want; }), what);
+        };
+        ConversationStateSizes zs, zc;
+        check(conversation_state_sizes(g, zs, error), "slot direction fixture sizes");
+        check_why(conversation_session_sizes(g, ss, zc, error), "the session's carve sizes");
+        check(zc.gdn > 0 && zc.gdn <= zs.gdn, "the GDN payload is non-empty and inside the whole-model size");
+        // The restore recomputes z.gdn itself; the buffers are sized from the same call, and the D2D byte count below
+        // pins that the two agree - a short copy would leave a tail of the state uncompared.
+        std::vector<uint8_t> state(zc.gdn, 0x11), slot(zc.gdn, 0x22);
+        ss.gdn_state = (float*) state.data();
+        // The slot this checkpoint names belongs to a book, as the engine's does: the save and the restore read the
+        // buffer through the index, and the checkpoint stays the one that holds it.
+        GdnSlotBook pool;
+        pool.reset(1);
+        ConversationCheckpoint c;
+        c.ids = {1, 2};
+        check(c.gdn_slot.acquire(pool, 2) && c.gdn_slot.index() == 0, "the fixture takes the pool's only slot");
+        reset_copies();
+        check_why(conversation_checkpoint_save(c, ss, g, error, slot.data()), "a slotted checkpoint saves");
+        check(c.gdn.empty(), "a slotted checkpoint keeps no host copy of the recurrence");
+        check(c.gdn_slot.index() == 0 && pool.used() == 1, "the save kept the slot it was given");
+        check(d2d_copies == 1 && d2d_bytes == zc.gdn && copied_kind_bytes[cudaMemcpyDeviceToHost] == 0,
+              "the GDN slot capture is one D2D copy of exactly the recurrence's bytes");
+        check(!copy_kinds.empty() && copy_kinds[0] == cudaMemcpyDeviceToDevice, "the first slot copy is D2D");
+        check_all("the save left the slot holding the state's bytes", slot, 0x11);   // the mirror, byte for byte
+        check_why(conversation_checkpoint_validate(c, ss, g, error), "a slotted checkpoint validates");
+        c.gdn.assign(zc.gdn, 3);
+        check(!conversation_checkpoint_validate(c, ss, g, error), "a checkpoint with a slot and host bytes is refused");
+        c.gdn.clear();
+        // A slot holding a state the session does not have (another conversation's would), so the hit is observable.
+        std::fill(slot.begin(), slot.end(), 0x22);
+        reset_copies();
+        check_why(conversation_checkpoint_restore(c, ss, g, error, slot.data()), "a slotted checkpoint restores");
+        check(d2d_copies == 1 && d2d_bytes == zc.gdn && copied_kind_bytes[cudaMemcpyHostToDevice] == 0,
+              "the GDN slot hit is exactly one D2D copy and no host bytes");
+        check(c.gdn.empty(), "the hit read no host bytes");
+        check_all("the hit wrote the slot's bytes into the state", state, 0x22);
+        check_all("the hit left the slot intact", slot, 0x22);
+    }
 #endif
 }
 }
