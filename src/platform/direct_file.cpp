@@ -365,7 +365,7 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
     impl_->size = (uint64_t) st.st_size;
     // one blocking read per thread: a drive serves random pages at its full rate only with a deep queue
-    const int n = io_threads(128);
+    const int n = io_threads(256);
     for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { impl_->worker(); });
     return true;
 }
