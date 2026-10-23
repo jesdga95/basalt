@@ -165,6 +165,19 @@ class ProcessEngine:
             tl = self.__dict__.setdefault("_tl", threading.local())
             tl.last = value
 
+    # `read_ms`: prompt-read time of the request in progress, summed over its engine runs (per thread with batch slots).
+    @property
+    def read_ms(self) -> float:
+        if self.batch:
+            return getattr(self.__dict__.setdefault("_tl", threading.local()), "read_ms", 0.0)
+        return self.__dict__.get("_read_ms", 0.0)
+
+    @read_ms.setter
+    def read_ms(self, value: float):
+        self.__dict__["_read_ms"] = value
+        if self.batch:
+            self.__dict__.setdefault("_tl", threading.local()).read_ms = value
+
     def __init__(self, engine_bin: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False):
         self.spawn = (engine_bin, list(args), cwd, log, env)   # to start it again
@@ -431,6 +444,7 @@ class ProcessEngine:
 
     def _parse_done(self, line):
         f = line.split()
+        self.read_ms = getattr(self, "read_ms", 0.0) + float(f[3])
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
                      "decode_ms": float(f[4]), "finish": f[5]}
         if len(f) >= 9:                                   # conversation cache fields
@@ -756,11 +770,14 @@ class ProcessEngine:
             first.append(last["reused"])
 
     def _carry_run(self, carry: list[int], first: list, last0, final: bool):
-        """After an engine run: carry the draft counts and, at the request's last run, report the first run's reuse."""
+        """After an engine run: carry the draft counts and, at the request's last run, report the first run's reuse
+        and the prompt-read time of all its runs (a later run only re-reads the token the slot lacks)."""
         self._note_first_reused(first, last0)
         last = self.last
         if final and first and isinstance(last, dict) and last is not last0:
             last["reused"] = first[0]
+            if self.read_ms > 0:
+                last["prompt_ms"] = self.read_ms
             first.clear()
         self._carry_drafts(carry, final)
 
@@ -847,6 +864,7 @@ class ProcessEngine:
         yields, solo_again = 0, 0
         carry = [0, 0]            # draft counts (accepted, offered) of the runs before the current one
         first, last0 = [], self.last   # reused prefix of the first run; `last` before this request's first DONE
+        self.read_ms = 0.0             # the prompt-read time of every run this request makes
         try:
             while True:   # loops when a request alone in a slot returns to solo
                 if not holding:

@@ -35,6 +35,8 @@ STEP = 0.02
 s0 = "--slot0solo" in args           # slot 0 is the solo session: GEN copies the best slot's conversation over slot 0
 CH = 4096 if s0 else 32
 sstore = {}                           # slot -> the stream its storage holds (s0 only)
+pms = "--pms" in args                 # a run that extends an earlier prompt re-reads next to nothing (0.4 ms), else 500 ms
+seen = []                             # prompts (as id lists) of earlier runs
 keep = "--reuse" in args              # a conversation cache: a prompt reuses the longest start some earlier stream had
 held = []                             # streams (prompt + tokens read so far) of earlier requests
 def lcp(a, b):
@@ -164,7 +166,10 @@ while True:
             time.sleep(STEP)
         fin = "stop" if out and toks[out - 1] == 257 else ("cancel" if stop.is_set() else "length")
         dc = f"{out} {2 * out}" if "--draft-counts" in args and bslot is None else "0 0"   # a solo run drafts
-        print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} {dc} {reused}", flush=True)
+        mine_ids = [int(x) for x in ids]
+        pm = (0.4 if any(mine_ids[:len(h)] == h for h in seen) else 500.0) if pms else 5.0
+        seen.append(mine_ids)
+        print(f"DONE {out} {len(ids)} {pm} {out * STEP * 1000:.1f} {fin} {dc} {reused}", flush=True)
         if s0:
             sstore[0 if slot is None else slot] = [int(x) for x in ids] + toks[:-1]
         if keep:
@@ -212,7 +217,7 @@ class ParallelService(unittest.TestCase):
     """The real ProcessEngine and Service over HTTP, the fake engine behind them."""
 
     def start(self, slots, fit=None, slot_cache=False, fail=False, ready=None, multi=None, drafts=False, counts=False,
-              nopp=False, reuse=False, slot0_solo=False, solo_any=False):
+              nopp=False, reuse=False, slot0_solo=False, solo_any=False, pms=False):
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_engine.py"
         script.write_text(FAKE_BATCH, encoding="utf-8")
@@ -229,6 +234,7 @@ class ParallelService(unittest.TestCase):
         extra += ["--reuse"] if reuse else []
         extra += ["--slot0solo"] if slot0_solo else []
         extra += ["--soloany"] if solo_any else []
+        extra += ["--pms"] if pms else []
         with mock.patch.object(subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = ProcessEngine("basalt", extra)
@@ -740,6 +746,21 @@ class ParallelService(unittest.TestCase):
         self.assertEqual(kinds, ["GEN", "BGEN", "BGEN", "GEN"], kinds)    # solo, a slot (and the other's), solo again
         self.check_counts(got[:1], 1)
         self.check_counts(got[1:], 1)
+
+    def test_the_prompt_time_of_a_request_that_moves_between_solo_and_slots_is_its_read_not_the_last_run(self):
+        """A request that goes solo -> slot -> solo again reads its prompt once; the runs after the first re-read one
+        token, and their ~0 ms must not become the request's prompt time (a huge tok/s in the done line)."""
+        from serve.service import done_line
+        self.start(2, counts=True, slot_cache=True, pms=True)
+        got = self.timed_chats(["blocker LONGREPLY", "second one"], gap=0.1, max_tokens=400)
+        kinds = [l.split()[0] for l in self.log.read_text().splitlines()]
+        self.assertEqual(kinds, ["GEN", "BGEN", "BGEN", "GEN"], kinds)
+        t = got[0]
+        self.assertGreaterEqual(t["prompt_ms"], 500.0)
+        self.assertLess(t["prompt_ms"], 502.0)
+        self.assertLess(t["prompt_per_second"], t["prompt_n"] * 2.0)         # n tokens in ~0.5 s
+        self.assertIn(" in 0.5 s,", done_line(t["prompt_n"], 1, "stop", False, t, 0.5, 1.0))
+        self.assertEqual(got[1]["prompt_ms"], 500.0)                          # the other request read its own once
 
     def test_old_bdone_without_counts_keeps_drafts_unknown(self):
         self.start(2)
