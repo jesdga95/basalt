@@ -92,6 +92,23 @@ def relay_auto_flags(line: str) -> bool:
     return True
 
 
+# First words of the stdout lines the server reads (or knowingly ignores); any other line is the engine talking to
+# its log, such as a device-side trap message.
+PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "READY", "T ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR", "BADM ",
+                  "BT ", "BDONE ", "YIELDED ", "VRAM ", "ENC ")
+
+
+def log_unparsed(line: str, log) -> None:
+    """Write an engine stdout line the server does not parse to the engine log, as it came."""
+    if line.startswith(PROTOCOL_LINES) or not line.strip() or not hasattr(log, "write"):
+        return
+    try:
+        log.write(line if line.endswith("\n") else line + "\n")
+        log.flush()
+    except (OSError, ValueError):                       # the log is gone (the engine is being replaced)
+        pass
+
+
 def frame_pipes(proc, stderr_pipe: bool) -> None:
     """Frame a child's pipes on `\n` alone, both directions: the text-mode default for a pipe writes `\r\n` on
     Windows, and ends a line at a `\r` that belongs to the line rather than ending it.  Only Popen's own text
@@ -203,7 +220,7 @@ class ProcessEngine:
             threading.Thread(target=pump_lines, args=(self.proc.stderr, sink), daemon=True).start()
         # the lines come from a thread up to READY, so the read can time out and the rest of the stream stays for _pump
         ready_q: queue.Queue = queue.Queue()
-        threading.Thread(target=self._ready_pump, args=(self.proc, ready_q), daemon=True).start()
+        threading.Thread(target=self._ready_pump, args=(self.proc, ready_q, self.log), daemon=True).start()
         ready_deadline = time.monotonic() + ENGINE_READY_S
         timed_out = False
         while True:
@@ -289,12 +306,13 @@ class ProcessEngine:
         self.pump.start()
 
     @staticmethod
-    def _ready_pump(proc, out: queue.Queue) -> None:
+    def _ready_pump(proc, out: queue.Queue, log=None) -> None:
         """The engine's first lines up to READY, for a read that can time out; None when its output closed first."""
         done = False
         try:
             for line in proc.stdout:
                 line = engine_line(line)
+                log_unparsed(line, log)
                 out.put(line)
                 if line.startswith("READY"):
                     done = True
@@ -306,11 +324,12 @@ class ProcessEngine:
                 out.put(None)
 
     def _pump(self):
-        proc, lines = self.proc, self.lines             # a restart replaces both
+        proc, lines, log = self.proc, self.lines, self.log   # a restart replaces all three
         slot_q = self.slot_q
         line = None
         for line in proc.stdout:
             line = engine_line(line)
+            log_unparsed(line, log)
             if line.startswith(AUTO_FLAGS):             # printed once, before READY; never a reply line
                 continue
             if line.startswith(FATAL_PREFIXES):         # before batch routing
