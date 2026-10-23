@@ -306,6 +306,17 @@ def parallel_count(text: str) -> int:
     return n
 
 
+def budget_count(text: str) -> int:
+    """argparse type: a thinking budget in tokens, a whole number >= 0 (0: none)."""
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a whole number >= 0, not {text!r}") from None
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"expected a whole number >= 0, not {n}")
+    return n
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                  allow_abbrev=False)
@@ -377,4 +388,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"default {key.replace('-', '_')} for requests that leave it out, over the model file's: {text}")
     ap.add_argument("--min-free-vram-mib", type=int, default=None,
                     help="load an unloaded model only when this much VRAM is free, else answer 503")
+    ap.add_argument("--reasoning-budget-tokens", type=budget_count, default=None, metavar="N",
+                    help="default thinking budget for requests that leave reasoning_budget_tokens out (0 = none): at "
+                         "the budget the thinking is closed and the answer starts, so set it below the request's "
+                         "max_tokens")
     return ap

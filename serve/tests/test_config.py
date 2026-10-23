@@ -13,7 +13,21 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from serve.config import build_parser, check_engine_flags, engine_flags_of, engine_line, load_config_file, parallel_count, parse_settings, SAMPLING_KEYS, sampling_defaults_from_config, sampling_line, server_options, split_engine_extras  # noqa: E402
+from serve.config import (  # noqa: E402
+    SAMPLING_KEYS,
+    budget_count,
+    build_parser,
+    check_engine_flags,
+    engine_flags_of,
+    engine_line,
+    load_config_file,
+    parallel_count,
+    parse_settings,
+    sampling_defaults_from_config,
+    sampling_line,
+    server_options,
+    split_engine_extras,
+)
 from serve.engine.flags import flag_value  # noqa: E402
 from serve.security import exposed_without_key  # noqa: E402
 
@@ -243,6 +257,19 @@ class SamplingOptions(unittest.TestCase):
                          "[server] sampling defaults: temperature=0.8 (command line), top_k=20 (config), top_p=0.9")
 
 
+class ThinkingBudget(unittest.TestCase):
+    """reasoning-budget-tokens is the launch default for the request field of the same name; the field itself and
+    what a budget does to a reply are covered in test_server's ThinkingBudget (Service level)."""
+
+    def test_left_out_the_request_decides(self):
+        self.assertIsNone(parse([])[0].reasoning_budget_tokens)
+
+    def test_a_bad_budget_is_refused(self):
+        for bad in ("-1", "-3072", "lots", "1.5", ""):
+            with self.subTest(value=bad), self.assertRaises(SystemExit):
+                parse(["--reasoning-budget-tokens", bad])
+
+
 class SlotContext(unittest.TestCase):
     """--max-context is shared by the --parallel slots unless --slot-full-context."""
 
@@ -288,7 +315,7 @@ class EveryOption(unittest.TestCase):
             return True
         if act.choices:
             return [c for c in act.choices][-1]
-        if act.type is int or act.type is parallel_count:
+        if act.type is int or act.type is parallel_count or act.type is budget_count:
             return 7
         if act.type is float:
             return 0.25

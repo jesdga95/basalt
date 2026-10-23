@@ -112,6 +112,9 @@ class Service:
         value = req.get("reasoning_budget_tokens")
         if value is None:                               # llama.cpp's name for the same budget
             value = req.get("thinking_budget_tokens")
+        if value is None:                               # Anthropic's, which also names a level by its size
+            thinking = req.get("thinking")
+            value = thinking.get("budget_tokens") if isinstance(thinking, dict) else None
         if value is None:
             value = self.reasoning_budget_tokens
         if isinstance(value, float) and value.is_integer():
@@ -893,7 +896,8 @@ class Service:
                                   flush=True)
                             if finish == "length" and parser.state == "reasoning":
                                 print("[server] warning: max tokens reached while thinking, no answer "
-                                      "(set reasoning_budget_tokens)", flush=True)
+                                      "(set reasoning_budget_tokens, or start with --reasoning-budget-tokens)",
+                                      flush=True)
                             if DEBUG and raw_ids:
                                 print(f"[server] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                         st["busy"] = False

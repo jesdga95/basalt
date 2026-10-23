@@ -103,6 +103,7 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | `debug` | switch | off | One log line per request and the raw model text after each reply. |
 | `request-lines` | switch | off | Echo the engine's per-request summary on stdout, for a supervisor that sees only that output. |
 | `temperature`, `top-p`, `top-k`, `min-p`, `presence-penalty`, `frequency-penalty`, `repetition-penalty`, `penalty-last-n`, `seed` | number (`top-k`, `penalty-last-n`, `seed`: integer) | the model file's `sampling` value, else the engine's | The sampling default for a request that leaves that field out, over the model file's. Same meaning and allowed values as the [model file's sampling keys](#the-model-files-sampling-defaults). The server applies them to each request; the engine never sees them. |
+| `reasoning-budget-tokens` | integer | `0` (none) | The thinking budget for a request that names none (see [Sampling](#sampling)). At the budget the thinking is closed and the answer starts. It only helps when it sits below the request's `max_tokens`: at or above it the request runs to `max_tokens` in thinking and answers nothing. A request's own field wins, and `0` there turns it off. |
 | `tokenizer` | path | `pack/full/tokenizer` in the source tree (a byte tokenizer if absent) | Tokenizer directory. Mock engine only. |
 | `mock-engine`, `script` | switch, string (repeatable) | off, a short greeting | Testing: run a scripted engine instead of the model, for clients and tests (no `model` needed); `script` is its answer, and given more than once, requests get them in turn. |
 | `config` | path | none | The config file. Command line only. |
@@ -233,8 +234,9 @@ reports the defaults in effect.
 
 Other request fields the API reads: `max_tokens` / `max_completion_tokens` (the Anthropic `max_tokens`; `0` or
 `-1` means the rest of the context), `stop` / `stop_sequences`, `logit_bias`, `reasoning_effort`, `enable_thinking`
-and `reasoning_budget_tokens` (a cap on thinking tokens; `0` is none; `thinking_budget_tokens` is accepted as
-the same field, and `reasoning_budget_tokens` wins when both are sent).
+and `reasoning_budget_tokens` (a cap on thinking tokens; `0` is none). Anthropic's `thinking.budget_tokens` and
+llama.cpp's `thinking_budget_tokens` are the same budget, and `reasoning_budget_tokens` wins when more than one is
+sent. A request that names none of them takes the server's [`reasoning-budget-tokens`](#server).
 
 ### The model file's sampling defaults
 

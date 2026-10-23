@@ -2638,13 +2638,37 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(len(self.engine.prompts), 1)
 
     def test_the_config_default_and_a_request_that_turns_it_off(self):
-        self.svc.reasoning_budget_tokens = 20
+        self.svc.reasoning_budget_tokens = 20                          # what --reasoning-budget-tokens sets
         code, b = self.openai()
         self.assertEqual(len(self.engine.prompts), 2)
         self.assertTrue(b["choices"][0]["message"]["reasoning_content"].startswith(ThinkingEngine.THOUGHT[:20] + "\n"))
         code, b = self.openai(reasoning_budget_tokens=0)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
         self.assertEqual(len(self.engine.prompts), 3)
+
+    def test_the_launch_default_applies_on_the_anthropic_path_too(self):
+        self.svc.reasoning_budget_tokens = 20
+        code, raw = self.post("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 400, "stream": True,
+                                                "messages": [{"role": "user", "content": "2+2?"}]})
+        self.assertEqual(code, 200)
+        self.assertEqual(self.anthropic_thinking(raw).startswith(ThinkingEngine.THOUGHT[:20]), True)
+
+    def anthropic_thinking(self, raw):
+        evs = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
+        return "".join(e["delta"].get("thinking", "") for e in evs if e["type"] == "content_block_delta")
+
+    def test_anthropics_budget_tokens_is_the_same_budget(self):
+        from serve.service import REASONING_WRAP_UP
+        wrap = REASONING_WRAP_UP.split("</think>")[0]
+        body = {"model": "qwen3.8-flash-next", "max_tokens": 400, "stream": True,
+                "messages": [{"role": "user", "content": "2+2?"}]}
+        code, raw = self.post("/v1/messages", {**body, "thinking": {"type": "enabled", "budget_tokens": 30}})
+        self.assertEqual(code, 200)
+        self.assertEqual(self.anthropic_thinking(raw), ThinkingEngine.THOUGHT[:30] + wrap)
+        # a budget the request spells out itself wins over Anthropic's
+        code, raw = self.post("/v1/messages", {**body, "reasoning_budget_tokens": 10,
+                                               "thinking": {"type": "enabled", "budget_tokens": 30}})
+        self.assertEqual(self.anthropic_thinking(raw), ThinkingEngine.THOUGHT[:10] + wrap)
 
     def test_without_thinking_there_is_nothing_to_limit(self):
         self.engine.THOUGHT = ""

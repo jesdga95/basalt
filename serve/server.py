@@ -211,6 +211,7 @@ def main() -> int:
                  "; warning: any web page can use the model (--api-key KEY)"), flush=True)
     svc.idle_unload_s = a.idle_unload or 0
     svc.min_free_vram_mib = a.min_free_vram_mib or 0
+    svc.reasoning_budget_tokens = a.reasoning_budget_tokens or 0
     svc.gpu_indices = gpus_in_play(cfg, engine_args(cfg) if not a.mock_engine else [])   # the cards /metrics reads
     svc.gpu_index = svc.gpu_indices[0]
     httpd = serve(svc, host=a.host, port=a.port)
