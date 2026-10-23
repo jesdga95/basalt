@@ -184,6 +184,100 @@ int read_ahead_cases() {
     std::filesystem::remove(path, ec);
     return fail;
 }
+// drop_mapped_view on a real mapped view: ranges of every shape return, bad ranges are refused, and the bytes read
+// back as written after the pages were given up (they are re-read from the file when touched again).
+int drop_view_cases() {
+    using namespace basalt::platform;
+    int fail = 0;
+    const uint64_t bytes = 1ull << 20;
+    std::vector<uint8_t> pattern(bytes);
+    for (uint64_t i = 0; i < bytes; ++i) pattern[i] = (uint8_t) (i * 31u + (i >> 9) * 5u);
+    const std::string path = (std::filesystem::temp_directory_path() / "basalt_memory_test_drop.bin").string();
+    {
+        std::ofstream f(path, std::ios::binary);
+        f.write((const char*) pattern.data(), (std::streamsize) bytes);
+        if (!f) return 1;
+    }
+    const uint8_t* base = nullptr;
+#if defined(_WIN32)
+    const std::wstring wpath = basalt::platform::to_wide(path);
+    HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        HANDLE m = CreateFileMappingW(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        base = (const uint8_t*) MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+        CloseHandle(m);
+        CloseHandle(h);
+    }
+#else
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd >= 0) {
+        void* view = mmap(nullptr, (size_t) bytes, PROT_READ, MAP_PRIVATE, fd, 0);
+        ::close(fd);
+        if (view != MAP_FAILED) base = (const uint8_t*) view;
+    }
+#endif
+    if (base == nullptr) {
+        std::printf("drop view %-58s   <-- cannot map\n", "read-only view");
+        std::filesystem::remove(path);
+        return 1;
+    }
+    auto intact = [&]() {
+        for (uint64_t i = 0; i < bytes; i += 997) if (base[i] != pattern[i]) return false;
+        return base[bytes - 1] == pattern[bytes - 1];
+    };
+    struct Case { const char* what; uint64_t off, n; bool want; };
+    const Case cases[] = {
+        {"whole view", 0, bytes, true},
+        {"page-unaligned interior range", 1234, 300ull << 10, true},
+        {"one byte", bytes / 2, 1, true},
+        {"the last byte", bytes - 1, 1, true},
+        {"zero length", 5, 0, true},
+        {"range past the end of the view", bytes - 100, 200, false},
+        {"offset past the end of the view", bytes + 1, 1, false},
+    };
+    for (const Case& c : cases) {
+        volatile uint8_t sink = 0;
+        for (uint64_t i = 0; i < bytes; i += 4096) sink = (uint8_t) (sink + base[i]);   // pages in, so there is something to give up
+        const bool got = drop_mapped_view(base, bytes, c.off, c.n);
+        const bool ok = got == c.want && intact();
+        std::printf("drop view %-58s -> %s%s\n", c.what, got ? "ok" : "refused", ok ? "" : "   <-- WRONG");
+        fail |= !ok;
+    }
+    const bool null_ok = drop_mapped_view(nullptr, 0, 0, 4096);
+    std::printf("drop view %-58s -> %s%s\n", "null base", null_ok ? "ok" : "refused", null_ok ? "" : "   <-- WRONG");
+    fail |= !null_ok;
+#if defined(_WIN32)
+    UnmapViewOfFile((void*) base);
+#else
+    munmap((void*) base, (size_t) bytes);
+#endif
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    return fail;
+}
+// The watchdog's line: the budget flag is named only when the resident copy is big enough for it to shrink.
+int exhausted_message_cases() {
+    using basalt::platform::ram_exhausted_message;
+    int fail = 0;
+    const uint64_t margin = gib(4.0);
+    struct Case { const char* what; bool resident; double copy_gib; bool names_budget; bool names_mmap; };
+    const Case cases[] = {
+        {"mapped experts, nothing resident", false, 0.0, false, true},
+        {"tiny resident copy", true, 0.008, false, false},
+        {"empty resident copy", true, 0.0, false, false},
+        {"large resident copy", true, 60.0, true, false},
+    };
+    for (const Case& c : cases) {
+        const std::string m = ram_exhausted_message(gib(1.0), c.resident, gib(c.copy_gib), margin);
+        const bool budget = m.find("--resident-budget-gib") != std::string::npos;
+        const bool mmap = m.find("--mmap-experts") != std::string::npos;
+        const bool ok = budget == c.names_budget && mmap == c.names_mmap && m.find("1024 MiB free") != std::string::npos;
+        std::printf("ram message %-56s -> %s%s\n", c.what, m.c_str(), ok ? "" : "   <-- WRONG");
+        fail |= !ok;
+    }
+    return fail;
+}
 // The size lock_resident is exercised with: the full 256 MiB where the locked-memory limit allows it, otherwise half
 // of what the limit leaves. Zero means the limit is too low to lock anything meaningful.
 uint64_t lock_test_bytes(bool& reduced) {
@@ -206,7 +300,8 @@ uint64_t lock_test_bytes(bool& reduced) {
 }  // namespace
 
 int main() {
-    int fail_keeps = file_cache_keeps_cases() | ram_floor_cases() | read_ahead_cases();
+    int fail_keeps = file_cache_keeps_cases() | ram_floor_cases() | read_ahead_cases() | drop_view_cases() |
+                    exhausted_message_cases();
     bool reduced = false;
     const uint64_t bytes = lock_test_bytes(reduced);
     if (bytes == 0) {

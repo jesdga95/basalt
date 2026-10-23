@@ -36,9 +36,8 @@ void free_aligned(void* p);
 
 /// Asks the OS to give back what it holds for [off, off + bytes) of a mapped file view that starts at `base` and is
 /// `view_bytes` long: the range widened to whole pages, because those are what can be given back, and clipped to the
-/// view. False when the OS refused. Windows has no per-range release for a view of a file mapping - its pages are
-/// clean, since the view is read-only, so the manager takes them back on pressure by itself - and reports success
-/// without claiming anything.
+/// view. False when the OS refused or the range leaves the view. Windows takes the pages out of the process's working
+/// set (they then wait on the standby list as available memory) and does not report a refusal: it is a hint there.
 bool drop_mapped_view(const void* base, uint64_t view_bytes, uint64_t off, uint64_t bytes);
 
 /// What backs a host region from `alloc_region`.
@@ -131,6 +130,9 @@ void start_memory_watchdog(uint64_t floor_bytes);
 /// Tells the watchdog the load builds a resident RAM copy of the experts (`resident`) and how big it is so far, so
 /// its error names the copy's cap instead of the resident mode.
 void watch_resident_ram(bool resident, uint64_t copy_bytes);
+/// The line the watchdog prints when RAM runs out: `avail` bytes free, `resident` for the resident-copy mode with a
+/// copy of `copy_bytes`, `margin` the free RAM to keep. A budget flag is named only when it could shrink the copy.
+std::string ram_exhausted_message(uint64_t avail, bool resident, uint64_t copy_bytes, uint64_t margin);
 void stop_memory_watchdog();
 
 /// Whether an available-RAM reading of `avail` is below `floor` (a reading of 0, unknown, is not).

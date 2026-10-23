@@ -592,7 +592,20 @@ bool FileExpertSource::read_blobs(const std::pair<int32_t, int32_t>* pairs, int6
         }
         stage[(size_t) w] = (uint8_t*) m;
     }
-    if (dfd < 0) return ExpertSource::read_blobs(pairs, n, sink, err);
+    if (dfd < 0) {
+        // Without unbuffered reads the blobs come through the mapping, whose pages stay in this process after the copy.
+        // Each is given back once the sink has it, so a fill of every expert does not leave the whole file resident.
+        const bool give_back = n > 0 && !complement_ready_ && base_ != nullptr;
+        if (!give_back) return ExpertSource::read_blobs(pairs, n, sink, err);
+        const BlobSink and_drop = [&](int64_t i, int w, const uint8_t* blob, std::string& e) {
+            if (!sink(i, w, blob, e)) return false;
+            if (blob >= base_ && blob < base_ + mapped_bytes_)
+                (void) basalt::platform::drop_mapped_view(base_, mapped_bytes_, (uint64_t) (blob - base_),
+                                                          layer_blob_bytes_[(size_t) pairs[i].first]);
+            return true;
+        };
+        return ExpertSource::read_blobs(pairs, n, and_drop, err);
+    }
 
     std::atomic<int64_t> next{0};
     std::atomic<bool> failed{false};

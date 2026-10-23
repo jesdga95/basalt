@@ -204,6 +204,26 @@ std::atomic<bool> g_resident_mode{false};
 std::atomic<uint64_t> g_resident_copy{0};
 }  // namespace
 
+std::string ram_exhausted_message(uint64_t avail, bool resident, uint64_t copy_bytes, uint64_t margin) {
+    const unsigned long long mib = (unsigned long long) (avail >> 20);
+    char buf[384];
+    if (!resident) {
+        std::snprintf(buf, sizeof buf, "basalt error: RAM ran out loading (%llu MiB free); use "
+                                       "--resident-experts or --mmap-experts", mib);
+    } else if (copy_bytes < (1ull << 30)) {
+        // a budget of 1 GiB or more would not shrink a copy this small, so it is not offered
+        std::snprintf(buf, sizeof buf, "basalt error: RAM ran out loading (%llu MiB free); the resident copy is only "
+                                       "%llu MiB, so something else is holding the memory (other programs, or file "
+                                       "pages read while loading)", mib, (unsigned long long) (copy_bytes >> 20));
+    } else {
+        // the copy shrunk by what the margin is short of leaves the margin free again
+        const uint64_t keep = copy_bytes - std::min(copy_bytes, margin > avail ? margin - avail : 0);
+        std::snprintf(buf, sizeof buf, "basalt error: RAM ran out loading (%llu MiB free); use --resident-budget-gib %llu",
+                      mib, (unsigned long long) std::max<uint64_t>(1, keep >> 30));
+    }
+    return buf;
+}
+
 void watch_resident_ram(bool resident, uint64_t copy_bytes) {
     g_resident_mode = resident;
     g_resident_copy = copy_bytes;
@@ -216,17 +236,8 @@ void start_memory_watchdog(uint64_t floor_bytes) {
         while (!g_watch_stop.load()) {
             const uint64_t avail = available_memory();
             if (avail > 0 && avail < floor_bytes) {
-                const unsigned long long mib = (unsigned long long) (avail >> 20);
-                if (g_resident_mode.load()) {
-                    // the copy shrunk by what the margin is short of leaves the margin free again
-                    const uint64_t copy = g_resident_copy.load(), margin = ram_margin();
-                    const uint64_t keep = copy - std::min(copy, margin > avail ? margin - avail : 0);
-                    std::fprintf(stderr, "basalt error: RAM ran out loading (%llu MiB free); use "
-                                         "--resident-budget-gib %llu\n", mib, (unsigned long long) std::max<uint64_t>(1, keep >> 30));
-                } else {
-                    std::fprintf(stderr, "basalt error: RAM ran out loading (%llu MiB free); use "
-                                         "--resident-experts or --mmap-experts\n", mib);
-                }
+                std::fprintf(stderr, "%s\n", ram_exhausted_message(avail, g_resident_mode.load(), g_resident_copy.load(),
+                                                                   ram_margin()).c_str());
                 std::fflush(stderr);
                 _exit(1);
             }
@@ -360,9 +371,17 @@ void free_aligned(void* p) {
 bool drop_mapped_view(const void* base, uint64_t view_bytes, uint64_t off, uint64_t bytes) {
     if (base == nullptr || bytes == 0) return true;
 #if defined(_WIN32)
-    // A view of a file mapping has no per-range release. Its pages are clean, so the manager takes them back on
-    // pressure by itself, and nothing here claims they were freed.
-    (void) view_bytes; (void) off;
+    // Unlocking a range that is not locked takes its pages out of this process's working set, which is the only
+    // per-range release a view has: a clean page then waits on the standby list, counted as available, and is read
+    // back from the file if touched again. The call reports ERROR_NOT_LOCKED for pages that were never locked even
+    // though they were released, so its result carries nothing and a range the OS declines is simply left alone.
+    if (off > view_bytes || bytes > view_bytes - off) return false;
+    const uintptr_t pg = page_bytes();
+    const uintptr_t first = ((uintptr_t) base + (uintptr_t) off) & ~(pg - 1);
+    const uintptr_t last = ((uintptr_t) base + (uintptr_t) (off + bytes) + pg - 1) & ~(pg - 1);
+    constexpr uintptr_t kStep = (uintptr_t) 1 << 30;
+    for (uintptr_t a = first; a < last; a += kStep)
+        (void) VirtualUnlock((LPVOID) a, (SIZE_T) std::min<uintptr_t>(kStep, last - a));
     return true;
 #else
     // Only whole pages can be given back: a page the range shares with a neighbour still holds bytes the caller may
