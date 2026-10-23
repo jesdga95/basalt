@@ -5,6 +5,8 @@ import sys
 import threading
 import time
 
+from serve.util.loglevel import ERR, WARN, engine_line
+
 
 DRAFT_HEAD_FAIL = "the draft head does not fit"
 DRAFT_HEAD_HINT = "free VRAM, or run without the drafter (--spec 0)"
@@ -22,8 +24,9 @@ def start_failure_hint(log: str | None, offset: int) -> str:
         return ""
     if DRAFT_HEAD_FAIL not in text:
         return ""
-    said = [x.strip()[len("basalt mtp: "):] for x in text.splitlines()
-            if x.strip().startswith("basalt mtp: ") and ("draft head over" in x or "hint:" in x)]
+    said = [e.text for x in text.splitlines()
+            if (e := engine_line(x.strip())) is not None and e.tag == "basalt mtp"
+            and ("draft head over" in e.text or "hint:" in e.text)]
     return ". mtp: " + DRAFT_HEAD_FAIL + ". " + (" ".join(said) if said else "Hint: " + DRAFT_HEAD_HINT)
 
 
@@ -42,8 +45,9 @@ def start_last_line(log: str | None, offset: int) -> str:
     lines = text.splitlines()[1 if start > offset else 0:]   # not a line cut in half
     for x in reversed(lines):
         x = x.strip()
-        if x and not x.startswith("basalt warning:"):
-            return x.removeprefix("basalt generate: ").removeprefix("basalt serve: ")
+        e = engine_line(x) if x else None
+        if x and (e is None or e.level != WARN):
+            return x if e is None else e.text
     return ""
 
 
@@ -280,29 +284,27 @@ def load_total(line: str):
 
 
 def engine_warning(line: str):
-    """The text of an engine `basalt warning: <text>` line, else None."""
-    if line.startswith("basalt warning: ") and line[16:].strip():
-        return line[16:].strip()
-    return None
+    """The text of an engine warning line, else None."""
+    e = engine_line(line)
+    return e.text.strip() if e is not None and e.level == WARN and e.text.strip() else None
 
 
 def engine_ram_floor(line: str):
     """The text after `RAM floor ` of an engine `basalt generate: RAM floor ...` line, else None."""
-    head = "basalt generate: RAM floor "
-    if line.startswith(head) and line[len(head):].strip():
-        return line[len(head):].strip()
+    e = engine_line(line)
+    if e is not None and e.tag == "basalt generate" and e.text.startswith("RAM floor ") and e.text[10:].strip():
+        return e.text[10:].strip()
     return None
 
 
 def engine_error(line: str):
-    """The text of an engine `basalt error: <text>` line, else None."""
-    if line.startswith("basalt error: ") and line[14:].strip():
-        return line[14:].strip()
-    return None
+    """The text of an engine error line, else None."""
+    e = engine_line(line)
+    return e.text.strip() if e is not None and e.level == ERR and e.text.strip() else None
 
 
 def start_errors(log: str | None, offset: int) -> list[str]:
-    """The engine's `basalt error:` lines this start wrote to its log."""
+    """The engine's error lines this start wrote to its log."""
     if not log:
         return []
     try:

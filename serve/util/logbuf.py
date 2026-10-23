@@ -7,19 +7,12 @@ import re
 import threading
 import time
 
+from serve.util.loglevel import ERR, WARN, LevelReader
+
 CAPACITY = 2000
 MAX_LINE = 2000
 ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
-ERR = re.compile(r"\b(?:error|failed|fatal|exception|traceback|died|abort)\b", re.I)
-WARN = re.compile(r"\b(?:warn|warning|stuck|timeout|retry|retrying|slow)\b", re.I)
 SERVER_PREFIX = "[server] "
-
-
-def level(text: str) -> str:
-    """"err", "warn" or "info", by the words in the line."""
-    if ERR.search(text):
-        return "err"
-    return "warn" if WARN.search(text) else "info"
 
 
 class LogBuffer:
@@ -29,17 +22,21 @@ class LogBuffer:
         self.lock = threading.Lock()
         self.lines: collections.deque = collections.deque(maxlen=capacity)
         self.last = 0
+        self.readers: dict[str, LevelReader] = {}      # per source: a traceback spans lines
 
     def add(self, src: str, text: str) -> None:
-        """Add each non-empty line of `text` (ANSI codes removed, long lines cut) from source `src`."""
+        """Add each non-empty line of `text` (ANSI codes removed, long lines cut) from source `src`. A line's level is
+        read from its marker (serve/util/loglevel.py); a `[server] ` prefix is dropped after that."""
         now = round(time.time(), 3)
         for raw in ANSI.sub("", text or "").splitlines():
             msg = raw.rstrip()[:MAX_LINE]
             if not msg.strip():
                 continue
             with self.lock:
+                lvl = self.readers.setdefault(src, LevelReader()).read(msg)
                 self.last += 1
-                self.lines.append({"id": self.last, "t": now, "src": src, "lvl": level(msg), "msg": msg})
+                self.lines.append({"id": self.last, "t": now, "src": src, "lvl": lvl,
+                                   "msg": msg.removeprefix(SERVER_PREFIX)})
 
     def since(self, after_id: int = 0, limit: int = 500) -> tuple[list[dict], int]:
         """Return (the newest `limit` lines above `after_id`, oldest first; the newest id)."""
@@ -64,7 +61,7 @@ class TeeStream:
                 self._partial += text
                 *done, self._partial = self._partial.split("\n")
             for line in done:
-                self._buffer.add(self._src, line[len(SERVER_PREFIX):] if line.startswith(SERVER_PREFIX) else line)
+                self._buffer.add(self._src, line)
         return n
 
     def __getattr__(self, name):
@@ -72,13 +69,11 @@ class TeeStream:
 
 
 class ColorStream:
-    """Wraps a terminal stream: whole lines with `error:` or a server "refused" are red, with `warning:` yellow.
+    """Wraps a terminal stream: error lines are red and warning lines yellow, by the markers of serve/util/loglevel.py.
     Off a terminal, or with NO_COLOR set, the stream is returned unwrapped. Text that moves the cursor (escape
     codes, carriage returns) is passed through at once so in-place redraws keep working."""
 
     RED, YELLOW, RESET = "\x1b[31m", "\x1b[33m", "\x1b[0m"
-    RED_LINE = re.compile(r"\berror:|^\s*\[server\] refused\b")
-    YELLOW_LINE = re.compile(r"\bwarning:")
 
     @classmethod
     def wrap(cls, stream):
@@ -92,9 +87,11 @@ class ColorStream:
         self._stream = stream
         self._partial = ""
         self._lock = threading.Lock()
+        self._reader = LevelReader()
 
     def paint(self, line: str) -> str:
-        color = self.RED if self.RED_LINE.search(line) else self.YELLOW if self.YELLOW_LINE.search(line) else ""
+        lvl = self._reader.read(ANSI.sub("", line))
+        color = self.RED if lvl == ERR else self.YELLOW if lvl == WARN else ""
         return color + line + self.RESET if color else line
 
     def write(self, text):

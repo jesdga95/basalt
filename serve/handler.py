@@ -60,7 +60,7 @@ def make_handler(svc: Service):
             host = self.headers.get("Host")
             if svc.api_key or host_allowed(host, svc.host_names, "*" in svc.allowed_hosts):
                 return True
-            print(f"[server] refused Host {host!r} from {self.client_address[0]} "
+            print(f"[server] error: refused Host {host!r} from {self.client_address[0]} "
                   f"(--api-key KEY, or --allowed-host)",
                   flush=True)
             self._json(403, {"error": {"type": "forbidden", "message":
@@ -132,7 +132,7 @@ def make_handler(svc: Service):
                 return False
             if not origin_allowed(origin, self.headers.get("Host"), svc.host_names,
                                   [*svc.trusted_origins, *svc.cors_origins]):
-                print(f"[server] refused a request from web page {origin!r} "
+                print(f"[server] error: refused a request from web page {origin!r} "
                       f"(--api-key KEY, --allowed-host, --cors-origin)", flush=True)
                 self._json(403, {"error": {"type": "forbidden", "message":
                                  f"web pages of {origin} may not use this server without an API key; start the server with --api-key KEY, "

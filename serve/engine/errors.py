@@ -8,7 +8,7 @@ class EngineDied(RuntimeError):
 
 
 class EngineStartError(EngineDied):
-    """The engine ended before READY; the message is its `basalt error:` lines, else its last log line."""
+    """The engine ended before READY; the message is its error lines, else its last log line."""
 
     def __init__(self, message: str, log: str | None = None):
         super().__init__(message)

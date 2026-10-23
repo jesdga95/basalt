@@ -1534,6 +1534,40 @@ class StartFailureLog(unittest.TestCase):
         self.assertIsNone(engine_error("basalt error: "))
         self.assertIsNone(engine_error("basalt warning: x"))
 
+    def test_marked_lines_of_any_area(self):
+        from serve.engine.progress import engine_error, engine_ram_floor, engine_warning, start_errors
+        self.assertEqual(engine_error("basalt generate: error: the weight arena failed"), "the weight arena failed")
+        self.assertEqual(engine_error("basalt: error: dec_moe_vram: formats 1 / 2"), "dec_moe_vram: formats 1 / 2")
+        self.assertIsNone(engine_error("basalt generate: warning: x"))
+        self.assertIsNone(engine_error("basalt generate: no error here, nothing failed"))
+        self.assertIsNone(engine_error("CUDA error: out of memory"))
+        self.assertEqual(engine_warning("basalt serve: warning: model 60.0 GiB"), "model 60.0 GiB")
+        self.assertEqual(engine_warning("basalt warning: older form"), "older form")
+        self.assertIsNone(engine_warning("basalt generate: WARNING: not a marker"))
+        self.assertIsNone(engine_warning("basalt serve: warning: "))
+        self.assertEqual(engine_ram_floor("basalt generate: RAM floor 4.0 GiB"), "4.0 GiB")
+        self.assertIsNone(engine_ram_floor("basalt serve: RAM floor 4.0 GiB"))
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "engine.log"
+            log.write_text("basalt generate: error: an earlier start\n", encoding="utf-8")
+            off = log.stat().st_size
+            with open(log, "a", encoding="utf-8") as f:
+                f.write("basalt generate: GPU 0\nbasalt generate: warning: slow\nbasalt generate: error: first\n"
+                        "basalt serve: error: second\nbasalt serve: no error\n")
+            self.assertEqual(start_errors(str(log), off), ["first", "second"])
+            from serve.engine.progress import start_last_line
+            self.assertEqual(start_last_line(str(log), off), "no error")
+
+    def test_the_draft_head_hint_reads_marked_lines(self):
+        d = tempfile.mkdtemp()
+        p = Path(d) / "engine.log"
+        p.write_text("basalt mtp: warning: the draft head over 106299 tokens needs 348 MiB of VRAM and 120 MiB is free.\n"
+                     "basalt mtp: hint: free VRAM (...)\n"
+                     "basalt serve: error: mtp: the draft head does not fit\n", encoding="utf-8")
+        h = start_failure_hint(str(p), 0)
+        self.assertIn("348 MiB", h)
+        self.assertIn("free VRAM", h)
+
 
 class Tty(io.StringIO):
     def isatty(self):

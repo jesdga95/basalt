@@ -8,20 +8,64 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from serve.util.logbuf import CAPACITY, MAX_LINE, ColorStream, LogBuffer, TeeStream, level, tail_file
+from serve.util.logbuf import CAPACITY, MAX_LINE, ColorStream, LogBuffer, TeeStream, tail_file
+from serve.util.loglevel import LevelReader, engine_line
 
 
 class Levels(unittest.TestCase):
-    def test_words_decide(self):
-        for text in ("CUDA error: out of memory", "request Failed", "FATAL: no device", "Traceback (most recent call last):",
-                     "the engine died", "abort called", "an Exception was raised"):
-            self.assertEqual(level(text), "err", text)
-        for text in ("warning: low on RAM", "WARN cache", "request timeout", "retrying in 15 s", "engine stuck",
-                     "slow read"):
-            self.assertEqual(level(text), "warn", text)
-        for text in ("ready", "reading the prompt: 12 of 100 tokens", "errors=0", "slowly", "prefailed"):
-            self.assertEqual(level(text), "info", text)
-        self.assertEqual(level("a warning and an error"), "err")          # the worse one wins
+    """The level is read from the marker the writer put on the line, never from the words of the message."""
+
+    def read(self, *lines):
+        r = LevelReader()
+        return [r.read(x) for x in lines]
+
+    def test_engine_markers(self):
+        self.assertEqual(self.read("basalt generate: ready", "basalt generate: warning: low", "basalt serve: error: x",
+                                   "basalt: error: CUDA out of memory", "basalt batch adapt: window 3: 2 swaps",
+                                   "basalt-bench: warning: NVML is unavailable"),
+                         ["info", "warn", "err", "err", "info", "warn"])
+
+    def test_older_engine_markers(self):
+        self.assertEqual(self.read("basalt error: boom", "basalt warning: slow disk"), ["err", "warn"])
+
+    def test_words_decide_nothing(self):
+        for text in ("basalt serve: no error, 0 failures", "basalt generate: failed over to the CPU path",
+                     "basalt load: cuda0 10 100", "basalt serve: prompt 5 tokens = 0 reused, error=0",
+                     "request failed with a timeout", "WARNING: low on RAM", "CUDA error: out of memory",
+                     "a fatal exception was aborted", "[server] stuck? no, retrying is not a marker"):
+            self.assertEqual(self.read(text), ["info"], text)
+
+    def test_server_markers(self):
+        self.assertEqual(self.read("[server] ready", "[server] warning: no API key", "[server] error: boom",
+                                   "[server] error-free run"), ["info", "warn", "err", "info"])
+
+    def test_a_traceback_is_an_error_to_its_last_line(self):
+        self.assertEqual(self.read("ready", "Traceback (most recent call last):", '  File "x.py", line 3, in f',
+                                   "    g()", "ValueError: nope", "[server] ready"),
+                         ["info", "err", "err", "err", "err", "info"])
+        self.assertEqual(self.read("Traceback (most recent call last):", "  x", "KeyError: 1",
+                                   "During handling of the above exception, another exception occurred:",
+                                   "Traceback (most recent call last):", "  y", "OSError: 2", "ok"),
+                         ["err"] * 7 + ["info"])
+
+    def test_engine_line_parts(self):
+        e = engine_line("basalt mtp: warning: the draft head over 5 tokens")
+        self.assertEqual((e.tag, e.level, e.text), ("basalt mtp", "warn", "the draft head over 5 tokens"))
+        self.assertEqual(engine_line("basalt error: x"), ("basalt", "err", "x"))
+        self.assertIsNone(engine_line("CUDA error: x"))
+        self.assertIsNone(engine_line("  chunk share 0.50: 12 ms"))
+
+    def test_the_buffer_reads_markers_and_keeps_traceback_state_per_source(self):
+        b = LogBuffer()
+        b.add("eng", "basalt generate: error: no GPU\nbasalt generate: no error here\nFATAL: not a marker")
+        b.add("srv", "Traceback (most recent call last):")
+        b.add("eng", "basalt load: cuda0 1 2")            # another source: not part of the server's traceback
+        b.add("srv", '  File "a.py", line 1\nOSError: x\n[server] warning: low RAM')
+        self.assertEqual([(x["lvl"], x["msg"]) for x in b.since(0)[0]],
+                         [("err", "basalt generate: error: no GPU"), ("info", "basalt generate: no error here"),
+                          ("info", "FATAL: not a marker"), ("err", "Traceback (most recent call last):"),
+                          ("info", "basalt load: cuda0 1 2"), ("err", '  File "a.py", line 1'), ("err", "OSError: x"),
+                          ("warn", "warning: low RAM")])
 
 
 class Buffer(unittest.TestCase):
@@ -87,7 +131,7 @@ class Tee(unittest.TestCase):
         self.assertEqual([x["msg"] for x in b.since(0)[0]], ["model unloaded"])     # prefix stripped, no partial line
         tee.write("ial\nnext: failed\n")
         self.assertEqual([(x["msg"], x["lvl"], x["src"]) for x in b.since(0)[0]][1:],
-                         [("partial", "info", "srv"), ("next: failed", "err", "srv")])
+                         [("partial", "info", "srv"), ("next: failed", "info", "srv")])    # words decide nothing
         self.assertEqual(out.getvalue(), "[server] model unloaded\npartial\nnext: failed\n")
         tee.flush()
         self.assertFalse(tee.closed)                                                  # the stream's own attributes
@@ -135,8 +179,8 @@ class Tty(io.StringIO):
         return True
 
 
-LINES = ("[server] warning: model 76.9 GiB\nbasalt error: boom\n[server] refused Host 'x'\n"
-         "[server] listening\nbasalt warning: low\n")
+LINES = ("[server] warning: model 76.9 GiB\nbasalt generate: error: boom\n[server] error: refused Host 'x'\n"
+         "[server] listening\nbasalt serve: warning: low\nbasalt serve: no error here\n")
 
 
 class Color(unittest.TestCase):
@@ -160,8 +204,9 @@ class Color(unittest.TestCase):
             w.write(ch)
         w.flush()
         y, r, z = "\x1b[33m", "\x1b[31m", "\x1b[0m"
-        self.assertEqual(out.getvalue(), f"{y}[server] warning: model 76.9 GiB{z}\n{r}basalt error: boom{z}\n"
-                         f"{r}[server] refused Host 'x'{z}\n[server] listening\n{y}basalt warning: low{z}\n")
+        self.assertEqual(out.getvalue(), f"{y}[server] warning: model 76.9 GiB{z}\n{r}basalt generate: error: boom{z}\n"
+                         f"{r}[server] error: refused Host 'x'{z}\n[server] listening\n{y}basalt serve: warning: low{z}\n"
+                         f"basalt serve: no error here\n")
 
     def test_no_color_disables(self):
         out = Tty()
