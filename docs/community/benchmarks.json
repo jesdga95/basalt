@@ -132,6 +132,26 @@
       "prefill_64k_tps": 2459.0,
       "decode_tps": 161.3,
       "notes": "2x RTX 5060 Ti 16GB (PCIe 5.0 x8/x8, no P2P; 2nd card as the peer tier), Ryzen 5 9600X, 64GB DDR5-6400; 0 SSD spill"
+    },
+    {
+      "submitter": "foolio",
+      "date": "2026-10-23",
+      "commit": "702c08f783",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX PRO 4000 Blackwell",
+          "vram_gib": 24,
+          "power_w": 145
+        }
+      ],
+      "ram_gib": 123,
+      "os": "Linux",
+      "quant": "UD-Q6_K_XL",
+      "prefill_16k_tps": 2674.5,
+      "prefill_64k_tps": 2970.3,
+      "decode_tps": 65.9,
+      "link": ""
     }
   ]
 }
