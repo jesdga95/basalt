@@ -42,6 +42,7 @@
 #endif
 #if __has_include("basalt_git.h")
 #include "basalt_git.h"
+#include "basalt/log.hpp"
 #endif
 #ifndef BASALT_BENCH_GIT
 #define BASALT_BENCH_GIT "unknown"
@@ -617,7 +618,7 @@ int main(int argc, char** argv) {
     Options o;
     std::string err;
     if (!parse_args(argc, argv, o, err)) {
-        std::fprintf(stderr, "basalt-bench: %s\n", err.c_str());
+        basalt::log::error("basalt-bench", "%s", err.c_str());
         return 2;
     }
     basalt::platform::ignore_broken_pipe();   // a closed pipe surfaces as a failed write
@@ -638,7 +639,7 @@ int main(int argc, char** argv) {
     const bool do_prefill = !o.depths.empty();
     const bool do_perf = do_decode || do_prefill;
     if (do_quality && o.kld_base.empty()) {
-        std::fprintf(stderr, "basalt-bench: the quality gate needs --kld-base FILE\n");
+        basalt::log::error("basalt-bench", "the quality gate needs --kld-base FILE");
         return 2;
     }
 
@@ -655,7 +656,7 @@ int main(int argc, char** argv) {
     if (engine_bin.empty()) engine_bin = BASALT_BENCH_ENGINE;
     if (o.engine.empty() && std::string(BASALT_BENCH_ENGINE).size() > 0 && fs::exists(BASALT_BENCH_ENGINE)) engine_bin = BASALT_BENCH_ENGINE;
     if (engine_bin.empty() || !fs::exists(engine_bin)) {
-        std::fprintf(stderr, "basalt-bench: the engine binary %s does not exist (--engine BIN)\n", engine_bin.c_str());
+        basalt::log::error("basalt-bench", "the engine binary %s does not exist (--engine BIN)", engine_bin.c_str());
         return 2;
     }
     for (const auto& kv : o.sets) set_arg(args, kv.first, kv.second);
@@ -672,14 +673,14 @@ int main(int argc, char** argv) {
             if (!wants(kDecode[i].name)) continue;
             std::vector<std::vector<int64_t>> lines;
             if (!read_id_lines((fs::path(o.fixtures) / kDecode[i].file).string(), lines, err) || lines.empty()) {
-                std::fprintf(stderr, "basalt-bench: %s\n", err.empty() ? (std::string(kDecode[i].file) + " is empty").c_str() : err.c_str());
+                basalt::log::error("basalt-bench", "%s", err.empty() ? (std::string(kDecode[i].file) + " is empty").c_str() : err.c_str());
                 return 2;
             }
             for (auto& l : lines) decode_ids[i].insert(decode_ids[i].end(), l.begin(), l.end());
         }
     if (do_prefill) {
         if (!read_id_lines((fs::path(o.fixtures) / "prefill.ids").string(), prefill_parts, err) || prefill_parts.size() != 3) {
-            std::fprintf(stderr, "basalt-bench: %s\n", err.empty() ? "prefill.ids needs three lines (before, body, after)" : err.c_str());
+            basalt::log::error("basalt-bench", "%s", err.empty() ? "prefill.ids needs three lines (before, body, after)" : err.c_str());
             return 2;
         }
     }
@@ -714,7 +715,7 @@ int main(int argc, char** argv) {
     }
     std::error_code ec;
     fs::create_directories(work, ec);
-    if (ec) { std::fprintf(stderr, "basalt-bench: cannot create %s\n", work.c_str()); return 2; }
+    if (ec) { basalt::log::error("basalt-bench", "cannot create %s", work.c_str()); return 2; }
     struct Cleanup {
         std::string dir;
         bool on;
@@ -728,18 +729,18 @@ int main(int argc, char** argv) {
 
     Nvml nvml;
     const bool have_nvml = nvml.open();
-    if (!have_nvml) std::fprintf(stderr, "basalt-bench: NVML is unavailable: power limits and clocks are NOT recorded\n");
+    if (!have_nvml) basalt::log::warn("basalt-bench", "NVML is unavailable: power limits and clocks are NOT recorded");
     if (o.community && (!have_nvml || nvml.count() == 0)) {
-        std::fprintf(stderr, "basalt-bench: --community needs NVML (the NVIDIA driver's management library) to read the GPU names, "
-                             "VRAM and enforced power limits for the row; it could not be loaded\n");
+        basalt::log::error("basalt-bench", "--community needs NVML (the NVIDIA driver's management library) to read the GPU names, "
+                             "VRAM and enforced power limits for the row; it could not be loaded");
         return 1;
     }
     if (o.community && std::string(BASALT_BENCH_GIT).find_first_not_of("0123456789abcdef") != std::string::npos) {
-        std::fprintf(stderr, "basalt-bench: --community needs a build from a git checkout: the row records the commit\n");
+        basalt::log::error("basalt-bench", "--community needs a build from a git checkout: the row records the commit");
         return 1;
     }
     if (o.community && BASALT_BENCH_DIRTY)
-        std::fprintf(stderr, "basalt-bench: WARNING: tracked files differ from commit %s; the row names that commit\n", BASALT_BENCH_GIT);
+        basalt::log::warn("basalt-bench", "tracked files differ from commit %s; the row names that commit", BASALT_BENCH_GIT);
     std::vector<Nvml::Snap> gpus_start;
     for (size_t i = 0; i < nvml.count(); ++i) gpus_start.push_back(nvml.snap(i));
 
@@ -779,9 +780,9 @@ int main(int argc, char** argv) {
         const Session& sess = sessions[si];
         const std::string log_path = (fs::path(work) / (si == 0 ? "engine.log" : fmt("engine-%zu.log", si))).string();
         Engine eng;
-        std::fprintf(stderr, "basalt-bench: starting %s (log: %s)\n", engine_bin.c_str(), log_path.c_str());
+        basalt::log::info("basalt-bench", "starting %s (log: %s)", engine_bin.c_str(), log_path.c_str());
         if (!eng.start(engine_bin, perf_args, log_path, err)) {
-            std::fprintf(stderr, "basalt-bench: %s\n", err.c_str());
+            basalt::log::error("basalt-bench", "%s", err.c_str());
             return 1;
         }
         if (o.community) {
@@ -791,12 +792,11 @@ int main(int argc, char** argv) {
             if (spill != 0.0) {
                 eng.stop();
                 if (spill < 0)
-                    std::fprintf(stderr, "basalt-bench: the engine did not report where the experts live; cannot check for SSD spill\n");
+                    basalt::log::warn("basalt-bench", "the engine did not report where the experts live; cannot check for SSD spill");
                 else
-                    std::fprintf(stderr,
-                                 "basalt-bench: this run would read %.1f GiB of experts from the SSD. Community runs need every "
+                    basalt::log::error("basalt-bench", "this run would read %.1f GiB of experts from the SSD. Community runs need every "
                                  "expert in VRAM, the peer GPU or RAM: free roughly %.0f GiB more RAM (close other programs) "
-                                 "and run again. No row was written.\n", spill, std::ceil(spill));
+                                 "and run again. No row was written.", spill, std::ceil(spill));
                 return 1;
             }
         }
@@ -814,7 +814,7 @@ int main(int argc, char** argv) {
                 r.name = kDecode[i].name;
                 r.run = run;
                 if (!eng.request(sampling_keys(kDecode[i].temperature, o.seed), kDecode[i].max_new, decode_ids[i], r.d)) {
-                    std::fprintf(stderr, "basalt-bench: %s (run %d): %s\n", r.name.c_str(), run, r.d.err.c_str());
+                    basalt::log::error("basalt-bench", "%s (run %d): %s", r.name.c_str(), run, r.d.err.c_str());
                     failed = true;
                     break;
                 }
@@ -824,7 +824,7 @@ int main(int argc, char** argv) {
                 r.checksum_bad = r.name == "struct" && r.d.generated != kStructTokens;
                 ++n_requests;
                 ++n_decode_requests;
-                std::fprintf(stderr, "  run %d %-7s %.1f tok/s, %lld tokens\n", run, r.name.c_str(), tok_s(r.d), r.d.generated);
+                basalt::log::raw("  run %d %-7s %.1f tok/s, %lld tokens\n", run, r.name.c_str(), tok_s(r.d), r.d.generated);
                 results.push_back(std::move(r));
             }
             for (size_t pi = 0; pi < sess.depths.size() && !failed; ++pi) {
@@ -844,7 +844,7 @@ int main(int argc, char** argv) {
                 r.run = run;
                 r.depth = depth;
                 if (!eng.request(" top_p=0.95 top_k=20", depth == kPrefillBase ? kPrefillBaseDecode : 1, ids, r.d)) {
-                    std::fprintf(stderr, "basalt-bench: pp%lld (run %d): %s\n", depth, run, r.d.err.c_str());
+                    basalt::log::error("basalt-bench", "pp%lld (run %d): %s", depth, run, r.d.err.c_str());
                     failed = true;
                     break;
                 }
@@ -852,7 +852,7 @@ int main(int argc, char** argv) {
                 r.sm_mhz = s.sm_mhz;
                 r.mem_mhz = s.mem_mhz;
                 ++n_requests;
-                std::fprintf(stderr, "  run %d pp%lld %lld tokens, %.0f t/s engine, %.0f t/s wall\n", run, depth, r.d.prompt,
+                basalt::log::raw("  run %d pp%lld %lld tokens, %.0f t/s engine, %.0f t/s wall\n", run, depth, r.d.prompt,
                              prefill_engine_ts(r.d), prefill_wall_ts(r.d));
                 results.push_back(std::move(r));
             }
@@ -862,7 +862,7 @@ int main(int argc, char** argv) {
         eng.stop();
         for (size_t i = 0; i < gpus_end.size() && i < gpus_start.size(); ++i)
             if (gpus_end[i].power_limit_w != gpus_start[i].power_limit_w)
-                std::fprintf(stderr, "basalt-bench: WARNING: the power limit of GPU %zu changed during the run (%.0f W -> %.0f W)\n", i,
+                basalt::log::warn("basalt-bench", "the power limit of GPU %zu changed during the run (%.0f W -> %.0f W)", i,
                              gpus_start[i].power_limit_w, gpus_end[i].power_limit_w);
         }
         if (failed) return 1;
@@ -877,7 +877,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < results.size(); ++i)
                     if (results[i].name != "prefill") order.push_back(i);
             } else {
-                std::fprintf(stderr, "basalt-bench: the draft log has %zu request blocks for %d requests: window statistics skipped\n",
+                basalt::log::warn("basalt-bench", "the draft log has %zu request blocks for %d requests: window statistics skipped",
                              blocks.size(), n_requests);
             }
             for (size_t k = 0; k < order.size(); ++k) results[order[k]].win = window_stats(blocks[k]);
@@ -892,7 +892,7 @@ int main(int argc, char** argv) {
         quality.t = o.quality_t;
         quality.n_chunks_asked = o.quality_chunks;
         if (!read_kld_base(o.kld_base, n_ctx, n_vocab, n_chunk, chunks, o.quality_chunks, quality.err)) {
-            std::fprintf(stderr, "basalt-bench: %s\n", quality.err.c_str());
+            basalt::log::error("basalt-bench", "%s", quality.err.c_str());
         } else {
             std::vector<std::string> qa = args;
             set_arg(qa, "--spec", "5");
@@ -907,9 +907,9 @@ int main(int argc, char** argv) {
             for (const auto& a : qa) quality.args += (quality.args.empty() ? "" : " ") + a;
             Engine eng;
             const auto t0 = Clock::now();
-            std::fprintf(stderr, "basalt-bench: starting the engine for the quality gate\n");
+            basalt::log::info("basalt-bench", "starting the engine for the quality gate");
             if (!eng.start(engine_bin, qa, (fs::path(work) / "engine-quality.log").string(), quality.err)) {
-                std::fprintf(stderr, "basalt-bench: %s\n", quality.err.c_str());
+                basalt::log::error("basalt-bench", "%s", quality.err.c_str());
             } else {
                 quality.load_s = secs(t0, Clock::now());
                 const auto t1 = Clock::now();
@@ -927,7 +927,7 @@ int main(int argc, char** argv) {
                     }
                     pp_ms += d.prompt_ms;
                     dec_ms += d.decode_ms;
-                    if ((k + 1) % 10 == 0) std::fprintf(stderr, "  quality %zu/%zu chunks, %.0f s\n", k + 1, chunks.size(), secs(t1, Clock::now()));
+                    if ((k + 1) % 10 == 0) basalt::log::raw("  quality %zu/%zu chunks, %.0f s\n", k + 1, chunks.size(), secs(t1, Clock::now()));
                 }
                 quality.run_s = secs(t1, Clock::now());
                 eng.stop();
@@ -956,7 +956,7 @@ int main(int argc, char** argv) {
                smi && std::atof(smi->c_str()) > 0) {
         power = fmt("%.0f W", std::atof(smi->c_str()));
     }
-    if (power == "unknown") std::fprintf(stderr, "basalt-bench: WARNING: the power limit could not be read; pass --power-label W\n");
+    if (power == "unknown") basalt::log::warn("basalt-bench", "the power limit could not be read; pass --power-label W");
 
     // one table row per test: values over the repetitions
     struct Row {
@@ -1069,7 +1069,7 @@ int main(int argc, char** argv) {
         if (gpu_err.empty() && (pre_tps[0] <= 0 || pre_tps[1] <= 0 || dec_ms <= 0)) gpu_err = "a request reported no time";
         if (gpu_err.empty() && ram_b == 0) gpu_err = "the system RAM size could not be read";
         if (!gpu_err.empty()) {
-            std::fprintf(stderr, "basalt-bench: cannot write the community row: %s\n", gpu_err.c_str());
+            basalt::log::error("basalt-bench", "cannot write the community row: %s", gpu_err.c_str());
             std::fputs(rep.c_str(), stdout);
             return 1;
         }

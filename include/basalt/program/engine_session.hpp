@@ -67,7 +67,7 @@ std::string arg_value(const std::vector<std::string>& args, const std::string& f
 /// FLAG [VALUE] words added to `args`: a flag already there takes the new value, else both are appended.
 void merge_args(std::vector<std::string>& args, const std::vector<std::string>& add);
 
-/// The engine's own `basalt error:` lines from its log, else the last few lines.
+/// The engine's own error lines from its log, else the last few lines.
 std::string engine_failure(const std::string& log_path);
 
 /// A fixture file: one comma-separated token-id list per line.

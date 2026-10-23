@@ -54,6 +54,10 @@ int main() {
            "and finishes");
         is(s.feed("basalt error: out of memory on cuda0", 34.0), "basalt-bench: engine: out of memory on cuda0\n",
            "an error line is shown at once without its prefix");
+        is(s.feed("basalt generate: error: the weight arena failed", 34.5), "basalt-bench: engine: the weight arena failed\n",
+           "a line of any area marked error is shown the same way");
+        is(s.feed("basalt generate: warning: the cache is short", 34.6), "", "a warning is not an error");
+        is(s.feed("basalt generate: no error here", 34.7), "", "the word error in a message is not a marker");
         is(s.finish(80.0, true), "basalt-bench: engine ready in 80 s\n", "READY prints the ready line");
     }
     {   // several phases of one target add up against the plan

@@ -8,6 +8,7 @@
 
 #include "basalt/program/grammar/schema.hpp"
 #include "basalt/program/json_scan.hpp"
+#include "basalt/log.hpp"
 
 namespace basalt::program::grammar {
 
@@ -138,7 +139,7 @@ bool Guard::take(int32_t token) {
     const auto t0 = std::chrono::steady_clock::now();
     const bool ok = feed(token);
     if (!ok) {
-        std::fprintf(stderr, "basalt grammar: a masked draw was refused by the grammar; enforcement is off for this request\n");
+        basalt::log::warn("basalt grammar", "a masked draw was refused by the grammar; enforcement is off for this request");
         on_ = false;
     }
     ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();

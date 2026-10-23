@@ -1,4 +1,5 @@
 // src/program/engine_session.cpp - see engine_session.hpp.
+#include "basalt/log.hpp"
 #include "basalt/program/engine_session.hpp"
 
 #include "basalt/platform/file.hpp"
@@ -48,8 +49,7 @@ private:
     double now() const { return secs(t0_, Clock::now()); }
     static void emit(const std::string& s) {
         if (s.empty()) return;
-        std::fputs(s.c_str(), stderr);
-        std::fflush(stderr);
+        basalt::log::raw_text(s);
     }
     void poll() {
         std::ifstream f(path_, std::ios::binary);
@@ -283,7 +283,7 @@ void merge_args(std::vector<std::string>& args, const std::vector<std::string>& 
     }
 }
 
-// The engine's own `basalt error:` lines from its log, else the last few lines.
+// The engine's own error lines from its log, else the last few lines.
 std::string engine_failure(const std::string& log_path) {
     std::ifstream f(log_path);
     std::vector<std::string> lines, errors;
@@ -291,7 +291,8 @@ std::string engine_failure(const std::string& log_path) {
     while (std::getline(f, line)) {
         if (line.empty()) continue;
         lines.push_back(line);
-        if (line.rfind("basalt error: ", 0) == 0) errors.push_back(line);
+        basalt::log::Parsed p;
+        if (basalt::log::parse(line, p) && p.level == basalt::log::Level::error) errors.push_back(line);
     }
     if (errors.empty() && lines.size() > 8) lines.erase(lines.begin(), lines.end() - 8);
     std::string r;

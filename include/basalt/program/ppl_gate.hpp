@@ -17,6 +17,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "basalt/log.hpp"
 
 namespace basalt::program {
 
@@ -87,7 +88,7 @@ private:
         int32_t nv[2] = {0, 0};
         if (fd_ < 0 || !read_at(magic, 8, 0) || std::memcmp(magic, "_logits_", 8) != 0 || !read_at(&n_ctx, 4, 8) ||
             !read_at(nv, 8, 12) || n_ctx < 4 || nv[0] <= 0 || nv[1] <= 0) {
-            std::fprintf(stderr, "basalt ppl: %s is not a llama.cpp KL-divergence base\n", base);
+            basalt::log::error("basalt ppl", "%s is not a llama.cpp KL-divergence base", base);
             close_fd();
             return;
         }
@@ -97,7 +98,7 @@ private:
         row_u16_ = 2 * ((n_vocab_ + 1) / 2) + 4;
         out_ = basalt::platform::open_file_utf8(paths().second, "ab");
         if (out_ == nullptr) {
-            std::fprintf(stderr, "basalt ppl: cannot write %s\n", out);
+            basalt::log::error("basalt ppl", "cannot write %s", out);
             close_fd();
         }
     }

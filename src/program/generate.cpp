@@ -110,6 +110,7 @@
 #include <string>
 #include <set>
 #include <vector>
+#include "basalt/log.hpp"
 
 namespace {
 // One unit of background work at a time, on a persistent worker thread (starting a thread per job costs more than
@@ -190,7 +191,7 @@ std::string gib_text(uint64_t bytes) {
 
 // A start-ending failure: one `basalt error:` line, which the server shows as the reason.  Returns the exit code.
 int fatal_start_error(const std::string& text) {
-    std::fprintf(stderr, "basalt error: %s\n", text.c_str());
+    basalt::log::error("basalt", "%s", text.c_str());
     return 1;
 }
 // " (N MiB of M MiB VRAM free on this GPU)" for an allocation's failure message (clears the error first)
@@ -553,7 +554,7 @@ int serve_subcommand(int argc, char** argv) {
     auto absolute = [](const std::string& path) {
         std::string real;
         if (!basalt::platform::absolute_path(path, real)) {
-            std::fprintf(stderr, "basalt serve: cannot open %s\n", path.c_str());
+            basalt::log::error("basalt serve", "cannot open %s", path.c_str());
             std::exit(1);
         }
         return real;
@@ -561,7 +562,7 @@ int serve_subcommand(int argc, char** argv) {
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         auto value = [&]() -> std::string {
-            if (i + 1 >= argc) { std::fprintf(stderr, "basalt serve: %s needs a value\n", a.c_str()); std::exit(2); }
+            if (i + 1 >= argc) { basalt::log::error("basalt serve", "%s needs a value", a.c_str()); std::exit(2); }
             return argv[++i];
         };
         if (a == "--python") python = value();
@@ -572,15 +573,15 @@ int serve_subcommand(int argc, char** argv) {
         else extra.push_back(a);
     }
     if (extra.empty()) {
-        std::fprintf(stderr, "usage: basalt serve --config FILE | MODEL.basalt [--python PY] [server args...]\n");
+        basalt::log::error("basalt", "usage: basalt serve --config FILE | MODEL.basalt [--python PY] [server args...]");
         return 2;
     }
     const std::string exe = basalt::platform::module_path();
-    if (exe.empty()) { std::fprintf(stderr, "basalt serve: cannot find this binary\n"); return 1; }
+    if (exe.empty()) { basalt::log::error("basalt serve", "cannot find this binary"); return 1; }
     const std::string src_dir = BASALT_SOURCE_DIR;
     if (python.empty()) python = basalt::platform::python_interpreter(src_dir);
     if (basalt::platform::set_working_dir(src_dir) != 0) {
-        std::fprintf(stderr, "basalt serve: cannot enter the source tree %s\n", src_dir.c_str());
+        basalt::log::error("basalt serve", "cannot enter the source tree %s", src_dir.c_str());
         return 1;
     }
     std::vector<std::string> args = {python, "-m", "serve.server", "--engine-bin", exe};
@@ -588,13 +589,12 @@ int serve_subcommand(int argc, char** argv) {
     // Does not return when it works. Windows has no exec, so this process waits for the server and ends with the
     // server's exit code. Reaching the line below means the server never started, and errno says why.
     basalt::platform::exec_replacing(args);
-    std::fprintf(stderr, "basalt serve: cannot run %s: %s\n", python.c_str(), std::strerror(errno));
+    basalt::log::error("basalt serve", "cannot run %s: %s", python.c_str(), std::strerror(errno));
     return 1;
 }
 
 void usage() {
-    std::fprintf(stderr,
-                 "basalt serve --config FILE [--python PY] [server args...]\n"
+    basalt::log::raw("basalt serve --config FILE [--python PY] [server args...]\n"
                  "basalt serve MODEL.basalt [--python PY] [server args...]\n"
                  "    runs the Python server (serve/) over this binary: the server reads its options and the engine flags\n"
                  "    from the config file and the command line (the model is the config's or MODEL.basalt, which stands\n"
@@ -840,7 +840,7 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
         // the layer index, which is exactly what a cache profile is, would be wrong.
         const int32_t layer_idx = (int32_t) (t->d.layers - 1);
         if (layer_idx < 0 || layer_idx >= 48) {
-            std::fprintf(stderr, "basalt generate: the routing trace saw layer %d, outside 0..47\n", layer_idx);
+            basalt::log::warn("basalt generate", "the routing trace saw layer %d, outside 0..47", layer_idx);
             return;
         }
         const int32_t rec[2] = {layer_idx, (int32_t) k};
@@ -966,7 +966,7 @@ void disk_wait_threads(std::FILE* f) {
 
 void stall_report(std::FILE* f, uint64_t layers_during) {
     basalt::core::Progress& p = basalt::core::progress();
-    std::fprintf(f, "basalt serve: stall report (engine %s): stage \"%s\" for %lld s; %llu layers served since the "
+    std::fprintf(f, "basalt serve: error: stall report (engine %s): stage \"%s\" for %lld s; %llu layers served since the "
                     "last finished step (0 = stopped, more = slow)\n", BASALT_VERSION, stage_text().c_str(),
                  (long long) ((basalt::core::progress_now_ms() - p.since_ms.load()) / 1000),
                  (unsigned long long) layers_during);
@@ -1055,7 +1055,7 @@ uint64_t serve_growth_bytes(const Options& o, const basalt::core::ModelGeometry&
 bool checkpoint_save(ConvCheckpoint& c, const basalt::core::SessionState& ss, const basalt::core::ModelGeometry& g) {
     std::string error;
     if (basalt::core::conversation_checkpoint_save(c, ss, g, error)) return true;
-    std::fprintf(stderr, "basalt serve: checkpoint save: %s\n", error.c_str());   // the caller's ERR has no reason
+    basalt::log::error("basalt serve", "checkpoint save: %s", error.c_str());   // the caller's ERR has no reason
     return false;
 }
 
@@ -1063,7 +1063,7 @@ bool checkpoint_save(ConvCheckpoint& c, const basalt::core::SessionState& ss, co
 bool checkpoint_restore(const ConvCheckpoint& c, basalt::core::SessionState& ss, const basalt::core::ModelGeometry& g) {
     std::string error;
     if (basalt::core::conversation_checkpoint_restore(c, ss, g, error)) return true;
-    std::fprintf(stderr, "basalt serve: checkpoint restore: %s\n", error.c_str());
+    basalt::log::error("basalt serve", "checkpoint restore: %s", error.c_str());
     return false;
 }
 
@@ -1084,7 +1084,7 @@ bool load_control_vectors(const Options& o, const basalt::core::ModelGeometry& g
             }
             const basalt::MetaValue* hint = f.get("controlvector.model_hint");
             if (hint != nullptr && hint->s != "qwen4exp")
-                std::fprintf(stderr, "basalt generate: %s was made for '%s', not qwen4exp\n", path.c_str(), hint->s.c_str());
+                basalt::log::warn("basalt generate", "%s was made for '%s', not qwen4exp", path.c_str(), hint->s.c_str());
             int found = 0;
             for (const basalt::TensorInfo& t : f.tensors()) {
                 if (t.name.rfind("direction.", 0) != 0) continue;
@@ -1136,7 +1136,7 @@ bool load_control_vectors(const Options& o, const basalt::core::ModelGeometry& g
     summary = std::string(o.cvec_mode == 0 ? "project" : "add") + ":" + std::to_string(first) + "-" + std::to_string(last) +
               (single >= 0 ? ":single" + std::to_string(single) : "");
     // the line llama.cpp's patched build prints, so a log shows the same thing
-    std::fprintf(stderr, "basalt generate: control vector mode = %s, dir = %s, layers %d..%d (%d steered)\n",
+    basalt::log::info("basalt generate", "control vector mode = %s, dir = %s, layers %d..%d (%d steered)",
                  o.cvec_mode == 0 ? "project" : "add", single >= 0 ? "single" : "per-layer", first, last, steered);
     return true;
 }
@@ -1224,7 +1224,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
-            if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", what); std::exit(2); }
+            if (i + 1 >= argc) { basalt::log::error("basalt", "%s needs a value", what); std::exit(2); }
             return argv[++i];
         };
         bool parsed = true;
@@ -1232,20 +1232,20 @@ int main(int argc, char** argv) {
         else if (a == "--model") o.model = next("--model");
         else if (a == "--dump-hc8") o.dump_hc8 = next("--dump-hc8");
         else if (a == "--tokens") {
-            if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }
+            if (have_tokens) { basalt::log::error("basalt", "supply one token input only"); return 2; }
             std::string e;
-            if (!parse_i64_list(next("--tokens"), o.tokens, e)) { std::fprintf(stderr, "%s\n", e.c_str()); return 2; }
+            if (!parse_i64_list(next("--tokens"), o.tokens, e)) { basalt::log::error("basalt", "%s", e.c_str()); return 2; }
             have_tokens = true;
         }
         else if (a == "--tokens-file") {
-            if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }
+            if (have_tokens) { basalt::log::error("basalt", "supply one token input only"); return 2; }
             std::ifstream input(next("--tokens-file"));
-            if (!input) { std::fprintf(stderr, "cannot open token file\n"); return 2; }
+            if (!input) { basalt::log::error("basalt", "cannot open token file"); return 2; }
             std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-            if (input.bad()) { std::fprintf(stderr, "cannot read token file\n"); return 2; }
+            if (input.bad()) { basalt::log::error("basalt", "cannot read token file"); return 2; }
             std::string error;
             if (text.find('\0') != std::string::npos || !parse_i64_list(text.c_str(), o.tokens, error)) {
-                std::fprintf(stderr, "malformed token file: %s\n", error.c_str()); return 2;
+                basalt::log::error("basalt", "malformed token file: %s", error.c_str()); return 2;
             }
             have_tokens = true;
         }
@@ -1267,9 +1267,9 @@ int main(int argc, char** argv) {
         else if (a == "--temperature") o.temperature = (float) std::atof(next("--temperature"));
         else if (a == "--dump-logits") o.dump_logits = next("--dump-logits");
         else if (a == "--logits-stride") {
-            if (have_logits_stride) { std::fprintf(stderr, "--logits-stride must be supplied only once\n"); return 2; }
+            if (have_logits_stride) { basalt::log::error("basalt", "--logits-stride must be supplied only once"); return 2; }
             if (!basalt::program::logits_selection::parse_stride(next("--logits-stride"), o.logits_stride)) {
-                std::fprintf(stderr, "--logits-stride requires a positive decimal int64\n"); return 2;
+                basalt::log::error("basalt", "--logits-stride requires a positive decimal int64"); return 2;
             }
             have_logits_stride = true;
         }
@@ -1297,7 +1297,7 @@ int main(int argc, char** argv) {
             else if (v == "p-cores" || v == "pcores") o.pool_affinity = basalt::kernels::cpu::PoolAffinity::PCores;
             else if (v == "all") o.pool_affinity = basalt::kernels::cpu::PoolAffinity::All;
             else {
-                std::fprintf(stderr, "basalt generate: unknown --pool-affinity value '%s' (expected auto, p-cores, or all)\n", v.c_str());
+                basalt::log::error("basalt generate", "unknown --pool-affinity value '%s' (expected auto, p-cores, or all)", v.c_str());
                 return 2;
             }
         }
@@ -1350,14 +1350,14 @@ int main(int argc, char** argv) {
                 const float v = std::strtof(argv[i + 1], &e);
                 if (e != argv[i + 1] && *e == '\0') {
                     ++i;
-                    if (!(v > 0.0f && v <= 1.0f)) { std::fprintf(stderr, "--relaxed-drafting: P must be in (0, 1]\n"); return 2; }
+                    if (!(v > 0.0f && v <= 1.0f)) { basalt::log::error("basalt", "--relaxed-drafting: P must be in (0, 1]"); return 2; }
                     o.relaxed_drafting = v;
                 }
             }
         }
         else if (a == "--grammar") {
             const std::string v = next("--grammar");
-            if (v != "on" && v != "off") { std::fprintf(stderr, "--grammar: on or off\n"); return 2; }
+            if (v != "on" && v != "off") { basalt::log::error("basalt", "--grammar: on or off"); return 2; }
             o.grammar = v == "on";
         }
         else if (a == "--stop-eos") o.stop_eos = true;
@@ -1375,7 +1375,7 @@ int main(int argc, char** argv) {
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
             const int64_t limit = a == "--conversation-cache-slots" ? INT32_MAX : INT64_MAX / (1024 * 1024);
             if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
-                std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
+                basalt::log::error("basalt", "%s needs a nonnegative integer within range", a.c_str());
                 return 2;
             }
             if (a == "--conversation-cache-mib") o.conversation_cache_mib = number;
@@ -1399,7 +1399,7 @@ int main(int argc, char** argv) {
                 char* end = nullptr;
                 const float sc = colon == std::string::npos ? 0.0f : std::strtof(item.c_str() + colon + 1, &end);
                 if (colon == std::string::npos || colon == 0 || end == item.c_str() + colon + 1 || *end != '\0') {
-                    std::fprintf(stderr, "--control-vector-scaled: expected FILE:SCALE, got '%s'\n", item.c_str());
+                    basalt::log::error("basalt", "--control-vector-scaled: expected FILE:SCALE, got '%s'", item.c_str());
                     return 2;
                 }
                 o.cvec_files.push_back({item.substr(0, colon), sc});
@@ -1413,17 +1413,17 @@ int main(int argc, char** argv) {
             const std::string m = next("--cvec-mode");
             if (m == "project") o.cvec_mode = 0;
             else if (m == "add") o.cvec_mode = 1;
-            else { std::fprintf(stderr, "--cvec-mode: add or project, got '%s'\n", m.c_str()); return 2; }
+            else { basalt::log::error("basalt", "--cvec-mode: add or project, got '%s'", m.c_str()); return 2; }
         }
         else if (a == "--cvec-dir") {
             const std::string d = next("--cvec-dir");
             if (d == "per-layer") o.cvec_single = -1;
             else if (d.rfind("single:", 0) == 0) o.cvec_single = std::atoi(d.c_str() + 7);
-            else { std::fprintf(stderr, "--cvec-dir: per-layer or single:L, got '%s'\n", d.c_str()); return 2; }
+            else { basalt::log::error("basalt", "--cvec-dir: per-layer or single:L, got '%s'", d.c_str()); return 2; }
         }
         else if (a == "--eos-ids") {
             std::string e;
-            if (!parse_i64_list(next("--eos-ids"), o.eos_ids, e)) { std::fprintf(stderr, "--eos-ids: %s\n", e.c_str()); return 2; }
+            if (!parse_i64_list(next("--eos-ids"), o.eos_ids, e)) { basalt::log::error("basalt", "--eos-ids: %s", e.c_str()); return 2; }
             o.stop_eos = true;
         }
         else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(next("--adapt-swaps"));
@@ -1446,7 +1446,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--resident-budget-gib") {
             const double gib = std::atof(next("--resident-budget-gib"));
-            if (!(gib > 0.0)) { std::fprintf(stderr, "basalt generate: --resident-budget-gib needs N > 0\n"); return 2; }
+            if (!(gib > 0.0)) { basalt::log::error("basalt generate", "--resident-budget-gib needs N > 0"); return 2; }
             o.resident_budget = (uint64_t) (gib * 1073741824.0);
             o.resident_budget_given = true;
             o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
@@ -1465,7 +1465,7 @@ int main(int argc, char** argv) {
                 const std::string kv = list.substr(at, end - at);
                 at = end + 1;
                 const size_t eq = kv.find('=');
-                if (eq == std::string::npos || eq == 0) { std::fprintf(stderr, "basalt generate: --exp needs NAME=VALUE\n"); return 2; }
+                if (eq == std::string::npos || eq == 0) { basalt::log::error("basalt generate", "--exp needs NAME=VALUE"); return 2; }
                 basalt::core::diagnostics().exp[kv.substr(0, eq)] = std::atof(kv.c_str() + eq + 1);
             }
         }
@@ -1474,7 +1474,7 @@ int main(int argc, char** argv) {
         else {
             // An unknown flag is an ERROR and not a warning: a typo'd `--max-neww` that silently generated 16
             // tokens would look like a working run.
-            std::fprintf(stderr, "unknown argument: %s\n", a.c_str());
+            basalt::log::error("basalt", "unknown argument: %s", a.c_str());
             usage();
             return 2;
         }
@@ -1488,15 +1488,15 @@ int main(int argc, char** argv) {
     // a process here is not given.  Refused with the options, before the model opens or a device context exists: a
     // tier sized and then filled would fail partway through the load.
     if (o.peer_device >= 1 && !basalt::platform::gpu_peer_access()) {
-        std::fprintf(stderr, "basalt generate: --peer-device is not available here: this platform gives a process no "
+        basalt::log::error("basalt generate", "--peer-device is not available here: this platform gives a process no "
                              "GPU-to-GPU access between its devices, so a second GPU cannot hold an expert tier; keep "
                              "the experts on one GPU (--expert-cache, --resident-experts) and run without "
-                             "--peer-device\n");
+                             "--peer-device");
         return 2;
     }
     // ---- where every loader reads from: the sections of the .basalt file
     if (o.model.empty()) {
-        std::fprintf(stderr, "basalt generate: --model FILE.basalt is required\n");
+        basalt::log::error("basalt generate", "--model FILE.basalt is required");
         usage();
         return 2;
     }
@@ -1544,7 +1544,7 @@ int main(int argc, char** argv) {
     };
     set_stream_all_min();
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
-        std::fprintf(stderr, "basalt serve: warning: conversation caching is disabled by %s\n",
+        basalt::log::warn("basalt serve", "conversation caching is disabled by %s",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
     // parking with --layer-split saves every stage (SavedConversation::stage_images)
     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
@@ -1580,12 +1580,12 @@ int main(int argc, char** argv) {
         if (ok && !split_auto && split_devs.empty() && split_at.size() == 1) split_devs.push_back(0);   // one GPU
         split_same = ok && split_devs.size() == 1 && split_devs[0] == 0 && !split_auto;
         if (split_same && o.conversation_cache_mib > 0 && o.conversation_cache_slots > 0 && o.prompt_cache > 0) {
-            std::fprintf(stderr, "basalt serve: conversation parking does not support a layer split on one GPU "
-                                 "(--split-device 0); disable parking with --conversation-cache-mib 0\n");
+            basalt::log::error("basalt serve", "conversation parking does not support a layer split on one GPU "
+                                 "(--split-device 0); disable parking with --conversation-cache-mib 0");
             return 2;
         }
         if (ok && split_auto && split_devs.empty()) {
-            std::fprintf(stderr, "basalt generate: --layer-split auto: one GPU visible, so no split\n");
+            basalt::log::info("basalt generate", "--layer-split auto: one GPU visible, so no split");
             o.layer_split.clear();
             split_auto = false;
         } else if (ok) {
@@ -1597,10 +1597,10 @@ int main(int argc, char** argv) {
             }
         }
         if (!ok) {
-            std::fprintf(stderr, "basalt generate: --layer-split K[,K2..]|auto needs --serve, rising K from 2, and one "
+            basalt::log::error("basalt generate", "--layer-split K[,K2..]|auto needs --serve, rising K from 2, and one "
                                  "distinct GPU per K in --split-device (1..%d; or 0 with one K: the same GPU). K is the "
                                  "FIRST LAYER of each later GPU, not a count of layers per card: \"24,36,42\" for 4 "
-                                 "GPUs, not \"24,12,6,6\" (got \"%s\")\n", n_dev - 1, o.layer_split.c_str());
+                                 "GPUs, not \"24,12,6,6\" (got \"%s\")", n_dev - 1, o.layer_split.c_str());
             return 2;
         }
     }
@@ -1622,11 +1622,11 @@ int main(int argc, char** argv) {
     }
     if (!o.adapt_every_given && o.serve && !multi_gpu && !o.remote_expert_opt) o.adapt_every = 1;
     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
-        std::fprintf(stderr, "basalt generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
+        basalt::log::error("basalt generate", "--shared-expert-arena backs the resident arena and cannot be used with --mmap-experts");
         return 2;
     }
     if (o.resident_cpu_experts && (!o.mmap_experts || o.expert_profile.empty())) {
-        std::fprintf(stderr, "basalt generate: --resident-cpu-experts requires --mmap-experts and a model with an expert profile\n");
+        basalt::log::error("basalt generate", "--resident-cpu-experts requires --mmap-experts and a model with an expert profile");
         return 2;
     }
     const bool remote_caches = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
@@ -1636,14 +1636,14 @@ int main(int argc, char** argv) {
         // --resident-experts with a layer split runs as the plain
         // mmap mode instead of refusing.  Exactly --mmap-experts: nothing else reads these flags (the headroom only
         // sizes the copy).
-        std::fprintf(stderr, "basalt generate: WARNING: the resident RAM mode (--resident-experts) does not support a "
+        basalt::log::warn("basalt generate", "the resident RAM mode (--resident-experts) does not support a "
                              "layer split yet: the experts the GPUs do not hold are read through the OS file cache "
-                             "(--mmap-experts), and RAM may fill up during long prompts\n");
+                             "(--mmap-experts), and RAM may fill up during long prompts");
         o.resident_cpu_experts = o.resident_pin = o.resident_soft = false;
         o.resident_headroom = 8ull << 30;
     }
     if (o.resident_cpu_experts && (!o.layer_split.empty() || remote_caches)) {
-        std::fprintf(stderr, "basalt generate: --resident-cpu-experts does not support layer splits or remote expert caches\n");
+        basalt::log::error("basalt generate", "--resident-cpu-experts does not support layer splits or remote expert caches");
         return 2;
     }
     if (o.serve) basalt::platform::watch_resident_ram(o.resident_cpu_experts, 0);
@@ -1652,7 +1652,7 @@ int main(int argc, char** argv) {
     int remote_dev[3] = {1, 2, 3};
     if (multi_gpu) {
         if (o.expert_profile.empty()) {
-            std::fprintf(stderr, "basalt generate: a layer split across GPUs needs a model with an expert profile\n");
+            basalt::log::error("basalt generate", "a layer split across GPUs needs a model with an expert profile");
             return 2;
         }
         // A stage's prompt path borrows from that stage's own expert cache: the loan is the tail of the stage's own
@@ -1667,15 +1667,15 @@ int main(int argc, char** argv) {
             while (next_free < n_vis &&
                    std::find(split_devs.begin(), split_devs.end(), next_free) != split_devs.end()) ++next_free;
             if (next_free >= n_vis) {
-                std::fprintf(stderr, "basalt generate: --expert-cache-remote with a layer split needs a GPU that runs no "
-                                     "stage (%d visible, %zu used by the split)\n", n_vis, split_devs.size() + 1);
+                basalt::log::error("basalt generate", "--expert-cache-remote with a layer split needs a GPU that runs no "
+                                     "stage (%d visible, %zu used by the split)", n_vis, split_devs.size() + 1);
                 return 2;
             }
             remote_dev[r] = next_free++;
         }
         std::string devs;
         for (const int d : split_devs) devs += (devs.empty() ? "" : ",") + std::to_string(d);
-        std::fprintf(stderr, "basalt generate: layer split across %zu GPUs: CUDA0, then CUDA%s (split %s)\n",
+        basalt::log::info("basalt generate", "layer split across %zu GPUs: CUDA0, then CUDA%s (split %s)",
                      split_devs.size() + 1, devs.c_str(), o.layer_split.c_str());
     }
     if (o.prefill_auto && o.expert_profile.empty()) {
@@ -1689,31 +1689,31 @@ int main(int argc, char** argv) {
         o.stop_eos = true;
     }
     if (!have_tokens) {
-        std::fprintf(stderr, "basalt generate: --tokens is required (this build has no tokenizer; see the "
-                             "header of src/program/generate.cpp)\n");
+        basalt::log::error("basalt generate", "--tokens is required (this build has no tokenizer; see the "
+                             "header of src/program/generate.cpp)");
         usage();
         return 2;
     }
 
     if ((o.ple_io != "direct" && o.ple_io != "ram") || o.ple_row_cache < 0 || o.ple_inflight < 1 ||
         o.ple_inflight > 1024 || !(o.ple_delay_us >= 0)) {
-        std::fprintf(stderr, "basalt generate: invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us\n");
+        basalt::log::error("basalt generate", "invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us");
         return 2;
     }
     if (o.kv == "q4") o.kv = "q4_0";
     if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4") {
-        std::fprintf(stderr, "basalt generate: --kv must be fp16, int8, q4_0 or k8v4\n");
+        basalt::log::error("basalt generate", "--kv must be fp16, int8, q4_0 or k8v4");
         return 2;
     }
     basalt::core::qsa_set_kv_int8(o.kv == "int8");
     basalt::core::qsa_set_kv_q4(o.kv == "q4_0");   // 4-bit codes after a Hadamard rotation (kv_q4.hpp)
     basalt::core::qsa_set_kv_hybrid(o.kv == "k8v4");   // K8V4: INT8 K + rotated Q4_0 V, 816 B/cell
     if (o.kv_resident < 0) {
-        std::fprintf(stderr, "basalt generate: --kv-resident must be >= 0\n");
+        basalt::log::error("basalt generate", "--kv-resident must be >= 0");
         return 2;
     }
     if (o.kv == "k8v4" && o.kv_resident > 0) {
-        std::fprintf(stderr, "basalt generate: --kv k8v4 does not support --kv-resident streaming (yet)\n");
+        basalt::log::error("basalt generate", "--kv k8v4 does not support --kv-resident streaming (yet)");
         return 2;
     }
     basalt::core::qsa_set_kv_resident(o.kv_resident);
@@ -1738,26 +1738,26 @@ int main(int argc, char** argv) {
         try {
             const basalt::GgufModel model(o.native_shards);
             if (model.find("per_layer_token_embd.weight") == nullptr) {
-                std::fprintf(stderr, "basalt generate: %s has no per_layer_token_embd.weight\n", o.model.c_str());
+                basalt::log::error("basalt generate", "%s has no per_layer_token_embd.weight", o.model.c_str());
                 return 2;
             }
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "basalt generate: %s: %s\n", o.model.c_str(), e.what());
+            basalt::log::error("basalt generate", "%s: %s", o.model.c_str(), e.what());
             return 2;
         }
     }
     if (o.logits_stride > 1 && (o.max_new != 1 || o.dump_logits.empty())) {
-        std::fprintf(stderr, "basalt generate: --logits-stride > 1 requires --max-new 1 and --dump-logits\n");
+        basalt::log::error("basalt generate", "--logits-stride > 1 requires --max-new 1 and --dump-logits");
         return 2;
     }
     // positions, cells and pooled-block indices are cast to int32 on the device path.
     if (o.max_context > 2147483647LL - 8) {
-        std::fprintf(stderr, "basalt generate: --max-context must be below 2^31\n");
+        basalt::log::error("basalt generate", "--max-context must be below 2^31");
         return 2;
     }
     if (o.max_new <= 0 || o.max_context <= 0 || o.max_new > o.max_context ||
         o.tokens.size() > (size_t) (o.max_context - o.max_new)) {
-        std::fprintf(stderr, "basalt generate: positive --max-new and --max-context must fit the prompt and generation\n");
+        basalt::log::error("basalt generate", "positive --max-new and --max-context must fit the prompt and generation");
         return 2;
     }
     // THE ROPE KNOBS (rope_scaling.hpp).  Anything invalid dies here, at second zero, rather than becoming a
@@ -1772,7 +1772,7 @@ int main(int argc, char** argv) {
         else if (o.rope_scaling == "linear") rope_cfg.type = RST::Linear;
         else if (o.rope_scaling == "yarn") rope_cfg.type = RST::YaRN;
         else if (!o.rope_scaling.empty()) {
-            std::fprintf(stderr, "basalt generate: --rope-scaling must be none, linear or yarn (got '%s')\n",
+            basalt::log::error("basalt generate", "--rope-scaling must be none, linear or yarn (got '%s')",
                          o.rope_scaling.c_str());
             return 2;
         }
@@ -1780,23 +1780,23 @@ int main(int argc, char** argv) {
         for (const double v : {o.rope_scale, o.rope_freq_base, o.rope_freq_scale, o.yarn_orig_ctx, o.yarn_ext_factor,
                                o.yarn_attn_factor, o.yarn_beta_fast, o.yarn_beta_slow})
             if (!std::isfinite(v)) {
-                std::fprintf(stderr, "basalt generate: a rope scaling knob is not a finite number (%g)\n", v);
+                basalt::log::error("basalt generate", "a rope scaling knob is not a finite number (%g)", v);
                 return 2;
             }
         // 0 is the absent default; an explicit factor must extend, not shrink
         if (o.rope_scale != 0 && o.rope_scale < 1.0) {
-            std::fprintf(stderr, "basalt generate: --rope-scale %g must be >= 1 (it extends the context, not shrinks it)\n",
+            basalt::log::error("basalt generate", "--rope-scale %g must be >= 1 (it extends the context, not shrinks it)",
                          o.rope_scale);
             return 2;
         }
         if (o.rope_freq_base != 0 && o.rope_freq_base <= 1.0) {
-            std::fprintf(stderr, "basalt generate: --rope-freq-base must be a base above 1 (0 = the model's)\n");
+            basalt::log::error("basalt generate", "--rope-freq-base must be a base above 1 (0 = the model's)");
             return 2;
         }
         if (o.rope_freq_scale < 0 || o.yarn_orig_ctx < 0 || o.yarn_ext_factor < -1.0 || o.yarn_attn_factor <= 0 ||
             o.yarn_beta_fast <= 0 || o.yarn_beta_slow <= 0) {
-            std::fprintf(stderr, "basalt generate: invalid rope scaling knob (see usage: --yarn-ext-factor <0 = auto, "
-                                 "--yarn-orig-ctx 0 = default, the rest positive)\n");
+            basalt::log::error("basalt generate", "invalid rope scaling knob (see usage: --yarn-ext-factor <0 = auto, "
+                                 "--yarn-orig-ctx 0 = default, the rest positive)");
             return 2;
         }
     }
@@ -1806,34 +1806,34 @@ int main(int argc, char** argv) {
                                            [](int slots) { return slots < 0; }) ||
         (o.expert_cache_remote[1] > 0 && o.expert_cache_remote[0] == 0) ||
         (o.expert_cache_remote[2] > 0 && o.expert_cache_remote[1] == 0)) {
-        std::fprintf(stderr, "basalt generate: invalid sampling or resource parameter\n");
+        basalt::log::error("basalt generate", "invalid sampling or resource parameter");
         return 2;
     }
     if (!(o.prefill_cpu_share >= 0.0 && o.prefill_cpu_share <= 1.0)) {
-        std::fprintf(stderr, "basalt generate: --prefill-cpu-share must be a number from 0 to 1\n");
+        basalt::log::error("basalt generate", "--prefill-cpu-share must be a number from 0 to 1");
         return 2;
     }
     if (o.vram_reserve_given && o.vram_reserve_mib < kVramStallMib) {
-        std::fprintf(stderr, "basalt error: --vram-reserve-mib %d leaves less VRAM free than the engine needs to keep "
-                             "requests from stalling; the smallest safe value is %d\n", o.vram_reserve_mib, kVramStallMib);
+        basalt::log::error("basalt", "--vram-reserve-mib %d leaves less VRAM free than the engine needs to keep "
+                             "requests from stalling; the smallest safe value is %d", o.vram_reserve_mib, kVramStallMib);
         return 2;
     }
     if (o.expert_cache_remote_placement != "stripe" && o.expert_cache_remote_placement != "layer") {
-        std::fprintf(stderr, "basalt generate: --expert-cache-remote-placement must be stripe or layer\n");
+        basalt::log::error("basalt generate", "--expert-cache-remote-placement must be stripe or layer");
         return 2;
     }
     if (o.remote_expert_opt && !o.serve) {
-        std::fprintf(stderr, "basalt generate: --remote-expert-opt requires --serve\n");
+        basalt::log::error("basalt generate", "--remote-expert-opt requires --serve");
         return 2;
     }
     if (o.peer_exclusive && (o.peer_device < 1 || !o.resident_cpu_experts || !o.serve)) {
-        std::fprintf(stderr, "basalt generate: --peer-exclusive needs --peer-device, --resident-experts and --serve\n");
+        basalt::log::error("basalt generate", "--peer-exclusive needs --peer-device, --resident-experts and --serve");
         return 2;
     }
     // the peer tier is the second card's only user: a layer split or a remote expert cache would put a second engine
     // part (and a second copy of the same experts) on it
     if (o.peer_device >= 1 && (!o.layer_split.empty() || o.expert_cache_remote[0] > 0)) {
-        std::fprintf(stderr, "basalt generate: --peer-device cannot be combined with %s\n",
+        basalt::log::error("basalt generate", "--peer-device cannot be combined with %s",
                      !o.layer_split.empty() ? "--layer-split (use one or the other)"
                                             : "--expert-cache-device1..3 (the peer tier already caches experts there)");
         return 2;
@@ -1843,8 +1843,8 @@ int main(int argc, char** argv) {
     // CUDA0's own range - the answer would read another stage's state.  Refused here rather than at the call, so
     // the reason is visible before the model is loaded.
     if (multi_gpu && (o.gpu_only_full || o.gpu_stages)) {
-        std::fprintf(stderr, "basalt generate: --gpu-only-full and --gpu-stages replay the whole model through one "
-                             "session, which a layer split does not have; run them without --layer-split\n");
+        basalt::log::error("basalt generate", "--gpu-only-full and --gpu-stages replay the whole model through one "
+                             "session, which a layer split does not have; run them without --layer-split");
         return 2;
     }
 
@@ -1854,8 +1854,8 @@ int main(int argc, char** argv) {
     // ... and nothing runs on a CPU without AVX2: every CPU expert kernel is AVX2 at least (the AVX-512 ones are
     // chosen above it), and so is ggml-cpu, which the native pack's layout load initializes next.  Refused here, by name, rather than an illegal instruction in the first expert.
     if (!basalt::kernels::cpu::cpu_avx2_ok()) {
-        std::fprintf(stderr, "basalt generate: this CPU (%s) does not support AVX2 with FMA and F16C, which this engine's "
-                             "CPU expert kernels need\n",
+        basalt::log::error("basalt generate", "this CPU (%s) does not support AVX2 with FMA and F16C, which this engine's "
+                             "CPU expert kernels need",
                      basalt::kernels::cpu::cpu_name().c_str());
         return 2;
     }
@@ -1907,7 +1907,7 @@ int main(int argc, char** argv) {
             while (e + 1 < (int64_t) lay.fmt.size() && lay.fmt[(size_t) e + 1].gu_type == f.gu_type &&
                    lay.fmt[(size_t) e + 1].d_type == f.d_type)
                 ++e;
-            std::fprintf(stderr, "basalt generate: experts %s/%s, layers %lld-%lld: decode %s, prefill %s, CPU tier dot\n",
+            basalt::log::info("basalt generate", "experts %s/%s, layers %lld-%lld: decode %s, prefill %s, CPU tier dot",
                          basalt::ggml_type_name((uint32_t) f.gu_type), basalt::ggml_type_name((uint32_t) f.d_type),
                          (long long) l, (long long) e,
                          basalt::kernels::dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff)
@@ -1925,7 +1925,7 @@ int main(int argc, char** argv) {
         if (!basalt::core::RemoteExperts::preflight(remote_dev[r], free_gib, err)) {
             return fatal_start_error(err);
         }
-        std::fprintf(stderr, "basalt generate: CUDA%d context ready, %.2f GiB free before expert arena registration\n",
+        basalt::log::info("basalt generate", "CUDA%d context ready, %.2f GiB free before expert arena registration",
                      remote_dev[r], free_gib);
     }
     // The PCIe share of the missed experts.  The GPU's SMs read that share over the link (the copy kernel), so on a
@@ -1937,16 +1937,16 @@ int main(int argc, char** argv) {
         const double bw = probe_pcie_h2d_gbps(&bursts);
         if (bw > 0.0) {
             o.pcie_frac = pcie_frac_for_gbps(bw, base);
-            std::fprintf(stderr, "basalt generate: PCIe probe: %.1f GB/s host->device (best of %s) -> pcie_frac %.2f "
-                                 "(default %.2f)\n", bw, bursts.c_str(), o.pcie_frac, base);
+            basalt::log::info("basalt generate", "PCIe probe: %.1f GB/s host->device (best of %s) -> pcie_frac %.2f "
+                                 "(default %.2f)", bw, bursts.c_str(), o.pcie_frac, base);
         } else {
             o.pcie_frac = base;
-            std::fprintf(stderr, "basalt generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
+            basalt::log::warn("basalt generate", "PCIe probe failed -> pcie_frac default %.2f", base);
         }
     }
     if (!basalt::kernels::cpu::cpu_avx512_ok())
-        std::fprintf(stderr, "basalt generate: this CPU has no AVX-512: the expert kernels run on %s "
-                             "(multi-token for the i-quant gate/up rows)\n",
+        basalt::log::warn("basalt generate", "this CPU has no AVX-512: the expert kernels run on %s "
+                             "(multi-token for the i-quant gate/up rows)",
                      !basalt::kernels::cpu::cpu_avx2_ok() ? "ggml-cpu vec_dot (no AVX2)" : "AVX-2");
     basalt::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
     int64_t K = 10;
@@ -1973,7 +1973,7 @@ int main(int argc, char** argv) {
                 if (const basalt::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.original_context_length"))
                     gguf_rope_orig_ctx = v->num();
             } catch (const std::exception& e) {
-                std::fprintf(stderr, "basalt generate: reading the model's expert shape from %s: %s\n",
+                basalt::log::error("basalt generate", "reading the model's expert shape from %s: %s",
                              o.model.c_str(), e.what());
                 return 1;
             }
@@ -1988,7 +1988,7 @@ int main(int argc, char** argv) {
             if (gguf_rope_type == "linear") rope_cfg.type = RST::Linear;
             else if (gguf_rope_type == "yarn") rope_cfg.type = RST::YaRN;
             else if (gguf_rope_type != "none") {
-                std::fprintf(stderr, "basalt generate: %s carries rope.scaling.type '%s' - none, linear or yarn only\n",
+                basalt::log::error("basalt generate", "%s carries rope.scaling.type '%s' - none, linear or yarn only",
                              o.model.c_str(), gguf_rope_type.c_str());
                 return 2;
             }
@@ -2015,15 +2015,15 @@ int main(int argc, char** argv) {
             rope_cfg = basalt::kernels::RopeScaling{};
             rope_cfg.freq_base = base;
             if (knobs)
-                std::fprintf(stderr, "basalt generate: note: no rope scaling is active (none), so --rope-scale, "
-                                     "--rope-freq-scale and the --yarn-* knobs have no effect\n");
+                basalt::log::info("basalt generate", "note: no rope scaling is active (none), so --rope-scale, "
+                                     "--rope-freq-scale and the --yarn-* knobs have no effect");
         }
         // THE RESOLVED CONFIG IS VALIDATED AS A WHOLE, with the one rule every rotation site also applies
         // (rope_scaling.hpp): the CLI ranges above cannot see a model-file value, nor a combination such as a
         // --rope-freq-scale that turns the resolved factor non-finite.
         if (const char* why = basalt::kernels::rope_scaling_invalid(rope_cfg)) {
-            std::fprintf(stderr, "basalt generate: invalid rope scaling configuration: %s (type %s, factor %g, "
-                                 "freq_scale %g, base %g, original context %g)\n",
+            basalt::log::error("basalt generate", "invalid rope scaling configuration: %s (type %s, factor %g, "
+                                 "freq_scale %g, base %g, original context %g)",
                          why, rope_cfg.type == RST::YaRN ? "yarn" : rope_cfg.type == RST::Linear ? "linear" : "none",
                          rope_cfg.factor, rope_cfg.freq_scale(), rope_cfg.freq_base, rope_cfg.orig_ctx);
             return 2;
@@ -2031,30 +2031,27 @@ int main(int argc, char** argv) {
         basalt::kernels::rope_scaling_set(rope_cfg);
         if (rope_cfg.type != RST::None) {
             const char* tn = rope_cfg.type == RST::YaRN ? "yarn" : "linear";
-            std::fprintf(stderr,
-                         "basalt generate: rope scaling %s, factor %.6g (freq_scale %.6g, base %.6g, mscale %.6f), "
-                         "--max-context %lld against a trained context of %.0f\n",
+            basalt::log::info("basalt generate", "rope scaling %s, factor %.6g (freq_scale %.6g, base %.6g, mscale %.6f), "
+                         "--max-context %lld against a trained context of %.0f",
                          tn, rope_cfg.factor, rope_cfg.freq_scale(), rope_cfg.freq_base, rope_cfg.mscale(),
                          (long long) o.max_context, rope_cfg.orig_ctx);
             if ((double) o.max_context <= rope_cfg.orig_ctx)
-                std::fprintf(stderr,
-                             "basalt generate: note: the context is within the trained %.0f - no position needs the "
-                             "extension, and the resolved scaling still applies to every angle\n",
+                basalt::log::info("basalt generate", "note: the context is within the trained %.0f - no position needs the "
+                             "extension, and the resolved scaling still applies to every angle",
                              rope_cfg.orig_ctx);
             // only when there IS a magnitude correction: YaRN's log term (ext_factor != 0) or an explicit
             // --yarn-attn-factor; plain linear (mscale 1) has none, and saying otherwise was TODO 22
             if (rope_cfg.mscale() != 1.0)
-                std::fprintf(stderr,
-                             "basalt generate: note: the %s magnitude correction scales cos and sin by %.6f "
-                             "at every position\n",
+                basalt::log::info("basalt generate", "note: the %s magnitude correction scales cos and sin by %.6f "
+                             "at every position",
                              rope_cfg.type == RST::YaRN ? "YaRN" : "--yarn-attn-factor", rope_cfg.mscale());
         }
     }
     basalt::core::NativeEmbed native_embed;
     {
         if ((o.spec < 2 && !no_spec) || (o.prefill_chunk <= 0 && o.tokens.size() > 1)) {
-            std::fprintf(stderr, "basalt generate: %s runs its experts in verify windows: it needs --spec T (T >= 2; "
-                                 "--serve also takes 0) and --prefill CHUNK\n", o.model.c_str());
+            basalt::log::error("basalt generate", "%s runs its experts in verify windows: it needs --spec T (T >= 2; "
+                                 "--serve also takes 0) and --prefill CHUNK", o.model.c_str());
             return 2;
         }
         const basalt::core::ModelGeometry g0;
@@ -2063,8 +2060,8 @@ int main(int argc, char** argv) {
             return fatal_start_error(err);
         }
         basalt::core::set_native_embed(&native_embed);
-        std::fprintf(stderr, "basalt generate: %s experts (largest blob %.2f MB), token embedding "
-                             "%s in mapped host memory (%.0f MiB, %.1f s), its first %lld rows in VRAM (%.1f MiB)\n",
+        basalt::log::info("basalt generate", "%s experts (largest blob %.2f MB), token embedding "
+                             "%s in mapped host memory (%.0f MiB, %.1f s), its first %lld rows in VRAM (%.1f MiB)",
                      o.model.c_str(), (double) basalt::kernels::cpu::expert_layout().max_blob / 1e6,
                      basalt::ggml_type_name((uint32_t) native_embed.type()), (double) native_embed.bytes() / 1048576.0,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - embed_t0).count(),
@@ -2090,7 +2087,7 @@ int main(int argc, char** argv) {
     // --trim-stage-weights
     const bool stage_trim = multi_gpu && !split_auto && !split_at.empty() && o.trim_stage_weights;
     if (o.trim_stage_weights && !stage_trim)
-        std::fprintf(stderr, "basalt generate: --trim-stage-weights needs an explicit --layer-split (ignored)\n");
+        basalt::log::warn("basalt generate", "--trim-stage-weights needs an explicit --layer-split (ignored)");
     auto add_foreign = [&](int64_t lb, int64_t le, std::set<std::string>& out) {
         for_each_index_name(pack_files.index, [&](const std::string& n) {
             if (n.rfind("blk.", 0) != 0 || n.find("ple") != std::string::npos) return;
@@ -2101,7 +2098,7 @@ int main(int argc, char** argv) {
     if (stage_trim) {
         add_foreign(0, split_at[0], skip);
         basalt::core::NativeDense::set_layer_range(0, (int) split_at[0]);
-        std::fprintf(stderr, "basalt generate: layer split: CUDA0 loads the dense weights of layers 0-%lld only\n",
+        basalt::log::info("basalt generate", "layer split: CUDA0 loads the dense weights of layers 0-%lld only",
                      (long long) split_at[0] - 1);
     }
     // One GPU: the hyper-connection down/up matrices are held only as 8-bit copies - the arena leaves their bf16 form
@@ -2132,8 +2129,8 @@ int main(int argc, char** argv) {
         bool known = false;
         const uint64_t budget = basalt::platform::ram_budget(&known);
         if (known && expert_total_bytes > budget) {
-            std::fprintf(stderr, "basalt error: the experts need %.1f GiB of RAM, %.1f GiB is available; use "
-                                 "--resident-experts or --mmap-experts\n",
+            basalt::log::error("basalt", "the experts need %.1f GiB of RAM, %.1f GiB is available; use "
+                                 "--resident-experts or --mmap-experts",
                          (double) expert_total_bytes / 1073741824.0,
                          (double) basalt::platform::available_memory() / 1073741824.0);
             return 1;
@@ -2158,7 +2155,7 @@ int main(int argc, char** argv) {
             basalt::core::LoadProgress::plan("cuda0", cuda0_fixed_bytes);
             if (!o.mmap_experts) basalt::core::LoadProgress::plan("ram", expert_total_bytes);
         } else {
-            std::fprintf(stderr, "basalt generate: load total not computed: %s\n", err.c_str());
+            basalt::log::warn("basalt generate", "load total not computed: %s", err.c_str());
         }
     }
     void* arena = nullptr;
@@ -2168,10 +2165,10 @@ int main(int argc, char** argv) {
         cudaGetLastError();
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        std::fprintf(stderr, "basalt generate: cudaMalloc(%llu) for the weight arena failed (%s): %llu MiB of %llu "
+        basalt::log::error("basalt generate", "cudaMalloc(%llu) for the weight arena failed (%s): %llu MiB of %llu "
                              "MiB VRAM free on this GPU. The arena is allocated first, before the KV and expert "
                              "caches: another program (or an engine that is still exiting) holds the rest - "
-                             "nvidia-smi / rocm-smi lists them\n",
+                             "nvidia-smi / rocm-smi lists them",
                      (unsigned long long) pool_bytes, cudaGetErrorString(ce), (unsigned long long) (free_b >> 20),
                      (unsigned long long) (total_b >> 20));
         return 1;
@@ -2191,8 +2188,8 @@ int main(int argc, char** argv) {
     if (!basalt::core::check_all(wt, g, err)) {
         return fatal_start_error(o.model + ": " + err);
     }
-    std::fprintf(stderr, "basalt generate: %llu MiB of weights loaded from %s in %.1f s (%zu tensors "
-                         "skipped: served from the source tensors)\n",
+    basalt::log::info("basalt generate", "%llu MiB of weights loaded from %s in %.1f s (%zu tensors "
+                         "skipped: served from the source tensors)",
                  (unsigned long long) (pool_bytes >> 20), o.model.c_str(), load_s(), skip.size());
     if (!hc8_names.empty()) {
         // the copies the model file holds are registered as they are; the rest are quantized from their bf16 matrices,
@@ -2204,7 +2201,7 @@ int main(int argc, char** argv) {
             const void* q = r0 ? basalt::core::hc8_table_adopt(n, nullptr, (int) r0->ne1, (int) r0->ne0) : nullptr;
             if (q == nullptr) { staged_names.insert(n); continue; }
             if (!wt.rebind(n, q)) {
-                std::fprintf(stderr, "basalt generate: hc8: no 8-bit copy of %s\n", n.c_str());
+                basalt::log::error("basalt generate", "hc8: no 8-bit copy of %s", n.c_str());
                 return 1;
             }
             ++n_done;
@@ -2218,7 +2215,7 @@ int main(int argc, char** argv) {
         basalt::core::WeightTable staged;
         if (!basalt::core::WeightTable::pool_bytes(pack_files, stage_bytes, err, &others) ||
             cudaMalloc(&stage, stage_bytes) != cudaSuccess || !staged.load(pack_files, stage, stage_bytes, err, &others, false)) {
-            std::fprintf(stderr, "basalt generate: hc8: staging the hyper-connection matrices failed%s%s\n",
+            basalt::log::error("basalt generate", "hc8: staging the hyper-connection matrices failed%s%s",
                          err.empty() ? "" : ": ", err.c_str());
             return 1;
         }
@@ -2228,7 +2225,7 @@ int main(int argc, char** argv) {
                                 ? basalt::kernels::hc8_adopt((const uint16_t*) r->data, (int) r->ne1, (int) r->ne0)
                                 : nullptr;
             if (q == nullptr || !wt.rebind(n, q)) {
-                std::fprintf(stderr, "basalt generate: hc8: no 8-bit copy of %s\n", n.c_str());
+                basalt::log::error("basalt generate", "hc8: no 8-bit copy of %s", n.c_str());
                 return 1;
             }
             ++n_done;
@@ -2241,8 +2238,8 @@ int main(int argc, char** argv) {
                                                   (int) kv.second.ne0) == nullptr)
                     basalt::kernels::hc8_prepare((const uint16_t*) kv.second.data, (int) kv.second.ne1, (int) kv.second.ne0);
             }
-        std::fprintf(stderr, "basalt hc8: %zu hyper-connection matrices held only as 8-bit copies (%.0f MiB of bf16 "
-                             "left out of VRAM, %.0f MiB of copies) in %.1f s\n",
+        basalt::log::info("basalt hc8", "%zu hyper-connection matrices held only as 8-bit copies (%.0f MiB of bf16 "
+                             "left out of VRAM, %.0f MiB of copies) in %.1f s",
                      n_done, (double) stage_bytes / 1048576.0, (double) basalt::kernels::hc8_bytes() / 1048576.0,
                      load_s());
     }
@@ -2250,10 +2247,10 @@ int main(int argc, char** argv) {
     basalt::core::NativeDense native_dense;
     {
         if (!native_dense.load(o.native_shards, wt, err, true)) {
-            std::fprintf(stderr, "basalt generate: native dense projections: %s\n", err.c_str());
+            basalt::log::error("basalt generate", "native dense projections: %s", err.c_str());
             return 1;
         }
-        std::fprintf(stderr, "basalt generate: %zu native projection matrices, %.2f MiB of weights, in %.1f s\n",
+        basalt::log::info("basalt generate", "%zu native projection matrices, %.2f MiB of weights, in %.1f s",
                      native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0), load_s());
     }
 
@@ -2273,7 +2270,7 @@ int main(int argc, char** argv) {
         if (cudaMalloc(&d_mrope, mrope_host.size() * sizeof(int32_t)) != cudaSuccess ||
             cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
                 cudaSuccess) {
-            std::fprintf(stderr, "basalt generate: cannot allocate the image position table\n");
+            basalt::log::error("basalt generate", "cannot allocate the image position table");
             return 1;
         }
         basalt::kernels::mrope_table_set(d_mrope);
@@ -2283,12 +2280,12 @@ int main(int argc, char** argv) {
     if (!o.cvec_files.empty()) {
         std::string ce;
         if (!load_control_vectors(o, g, cvec_summary, ce)) {
-            std::fprintf(stderr, "basalt generate: control vector: %s\n", ce.c_str());
+            basalt::log::error("basalt generate", "control vector: %s", ce.c_str());
             return 2;
         }
     }
     if (o.max_context < (int64_t) o.tokens.size() + o.max_new) {
-        std::fprintf(stderr, "basalt generate: --max-context %lld cannot hold %zu prompt + %lld new tokens\n",
+        basalt::log::error("basalt generate", "--max-context %lld cannot hold %zu prompt + %lld new tokens",
                      (long long) o.max_context, o.tokens.size(), (long long) o.max_new);
         return 2;
     }
@@ -2300,7 +2297,7 @@ int main(int argc, char** argv) {
     // because a launch through stream 0 carries a large fixed per-launch cost.
     cudaStream_t main_stream = nullptr;
     if (cudaStreamCreateWithFlags(&main_stream, cudaStreamNonBlocking) != cudaSuccess) {
-        std::fprintf(stderr, "basalt generate: cannot create the main stream\n");
+        basalt::log::error("basalt generate", "cannot create the main stream");
         return 1;
     }
     void* const main_cs = (void*) main_stream;
@@ -2318,12 +2315,12 @@ int main(int argc, char** argv) {
     if (!o.dump_halves.empty()) {
         half_dump = std::fopen(o.dump_halves.c_str(), "wb");
         if (half_dump == nullptr) {
-            std::fprintf(stderr, "basalt generate: cannot write %s\n", o.dump_halves.c_str());
+            basalt::log::error("basalt generate", "cannot write %s", o.dump_halves.c_str());
             return 1;
         }
         const size_t n = (size_t) g.n_layers * (size_t) half_stride;
         if (cudaHostAlloc((void**) &half_stage, n * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
-            std::fprintf(stderr, "basalt generate: cannot pin the half-dump staging buffer\n");
+            basalt::log::error("basalt generate", "cannot pin the half-dump staging buffer");
             return 1;
         }
         ss.block.dump = half_stage;
@@ -2331,7 +2328,7 @@ int main(int argc, char** argv) {
 
     basalt::core::Doorbell db;
     if (basalt::core::doorbell_init(g, K, db) == 0) {
-        std::fprintf(stderr, "basalt generate: doorbell_init failed\n");
+        basalt::log::error("basalt generate", "doorbell_init failed");
         return 1;
     }
     ss.db = &db;
@@ -2368,21 +2365,20 @@ int main(int argc, char** argv) {
             // longer than the stall watchdog's limit for one prompt chunk's rows.  Recommended, not forced.
             std::string dev;
             if (basalt::platform::disk_rotational(o.model, dev) == 1)
-                std::fprintf(stderr, "basalt generate: WARNING: the n-gram table (%s) is on a rotational disk (%s): "
+                basalt::log::warn("basalt generate", "the n-gram table (%s) is on a rotational disk (%s): "
                                      "--ple-io direct reads it at random and can stall a prompt for minutes. "
                                      "--ple-io ram (it then needs RAM for the table) or the model on an SSD is "
-                                     "recommended\n", o.model.c_str(), dev.c_str());
+                                     "recommended", o.model.c_str(), dev.c_str());
         }
         if (pio.lock)
-            std::fprintf(stderr, "basalt generate: PLE table %s (--ple-io ram) in %.1f s\n",
+            basalt::log::info("basalt generate", "PLE table %s (--ple-io ram) in %.1f s",
                          ple_table.locked() ? "locked in RAM" : "loaded (not locked)",
                          std::chrono::duration<double>(Clock::now() - tpl).count());
         if (pio.keepalive_ms > 0)
-            std::fprintf(stderr, "basalt generate: the SSD is kept awake while rows are read: one page of the table after "
-                                 "%.0f ms without a read, until %.0f s after the last request "
-                                 "\n", pio.keepalive_ms, pio.keepalive_window_s);
+            basalt::log::info("basalt generate", "the SSD is kept awake while rows are read: one page of the table after "
+                                 "%.0f ms without a read, until %.0f s after the last request ", pio.keepalive_ms, pio.keepalive_window_s);
         else if (pio.mode == basalt::kernels::PleIo::Direct)
-            std::fprintf(stderr, "basalt generate: SSD keep-alive off: the SSD may fall asleep between reads\n");
+            basalt::log::info("basalt generate", "SSD keep-alive off: the SSD may fall asleep between reads");
         const basalt::core::WeightRef* wk = wt.find("blk.1.ple_key.weight");
         const basalt::core::WeightRef* wv = wt.find("blk.1.ple_value.weight");
         const basalt::core::WeightRef* wnk = wt.find("blk.1.ple_norm_key.weight");
@@ -2390,7 +2386,7 @@ int main(int argc, char** argv) {
         const basalt::core::WeightRef* wnc = wt.find("blk.1.ple_norm_conv.weight");
         const basalt::core::WeightRef* wc = wt.find("blk.1.ple_conv1d.weight");
         if (!wk || !wv || !wnk || !wnq || !wnc || !wc) {
-            std::fprintf(stderr, "basalt generate: the model has no blk.1.ple_* tensors, so the PLE cannot be wired\n");
+            basalt::log::error("basalt generate", "the model has no blk.1.ple_* tensors, so the PLE cannot be wired");
             return 1;
         }
         // `ple_key` is S2 and the loader has already widened its scales to f32, so the two planes are located
@@ -2405,7 +2401,7 @@ int main(int argc, char** argv) {
         if (wk->quantized()) {
             if (!wk->native_data || (wk->native_type != 42 && wk->native_type != 18 && wk->native_type != 23 &&
                                      wk->native_type != 8) || !wk->native_q8_1) {
-                std::fprintf(stderr, "basalt generate: native PLE key is absent or incompatible\n");
+                basalt::log::error("basalt generate", "native PLE key is absent or incompatible");
                 return 1;
             }
             ss.ple.w.key_native_data = wk->native_data;
@@ -2423,9 +2419,9 @@ int main(int argc, char** argv) {
         const bool f16 = wc->kind == basalt::core::WeightKind::F16InF32 ||
                          (wc->kind == basalt::core::WeightKind::Verbatim && wc->code_bits == 0);
         if (!f16 || wc->bytes != (uint64_t) wc->elements * 2) {
-            std::fprintf(stderr, "basalt generate: blk.1.ple_conv1d.weight is not stored as F16 (index kind %d, "
+            basalt::log::error("basalt generate", "blk.1.ple_conv1d.weight is not stored as F16 (index kind %d, "
                                  "%llu B for %lld values); the PLE conv1d kernel reads F16 - convert the model again "
-                                 "with tools/convert/convert.py\n",
+                                 "with tools/convert/convert.py",
                          (int) wc->kind, (unsigned long long) wc->bytes, (long long) wc->elements);
             return 1;
         }
@@ -2440,7 +2436,7 @@ int main(int argc, char** argv) {
         ss.ple.emb_host = ple_emb_host.data();
         if (cudaMalloc((void**) &ple_emb_dev, (size_t) basalt::kernels::NG_N_EMBD * 4) != cudaSuccess ||
             cudaMalloc((void**) &ple_scratch, basalt::core::ple_run_scratch_bytes()) != cudaSuccess) {
-            std::fprintf(stderr, "basalt generate: the PLE buffers failed\n");
+            basalt::log::error("basalt generate", "the PLE buffers failed");
             return 1;
         }
         ss.ple.emb_dev = ple_emb_dev;
@@ -2457,14 +2453,14 @@ int main(int argc, char** argv) {
         std::string verr;
         basalt::vision::Mmproj mp;
         if (!mp.open(o.vision_mmproj, verr) || !vis_enc.stage(mp, true, verr) || !vis_enc.create(verr)) {
-            std::fprintf(stderr, "basalt generate: the image encoder: %s\n", verr.c_str());
+            basalt::log::error("basalt generate", "the image encoder: %s", verr.c_str());
             return 1;
         }
         mp.release();
         void* tmp = nullptr;
         const size_t tmp_bytes = vis_enc.arena_bytes(vis_max_tokens);
         if (cudaMalloc(&tmp, tmp_bytes) != cudaSuccess || !vis_enc.attach(tmp, tmp_bytes, vis_max_tokens, verr)) {
-            std::fprintf(stderr, "basalt generate: the image encoder warm-up: %s\n", verr.empty() ? "out of device memory" : verr.c_str());
+            basalt::log::error("basalt generate", "the image encoder warm-up: %s", verr.empty() ? "out of device memory" : verr.c_str());
             return 1;
         }
         const basalt::vision::Image gray{2048, 2048, std::vector<uint8_t>((size_t) 2048 * 2048 * 3, 128)};
@@ -2477,11 +2473,11 @@ int main(int argc, char** argv) {
         vis_enc.detach();
         cudaFree(tmp);
         if (!warm) {
-            std::fprintf(stderr, "basalt generate: the image encoder warm-up failed: %s\n", vis_enc.last_error().c_str());
+            basalt::log::error("basalt generate", "the image encoder warm-up failed: %s", vis_enc.last_error().c_str());
             return 1;
         }
-        std::fprintf(stderr, "basalt serve: image encoder staged: %.0f MiB of weights in pinned memory, %.2f GiB of expert-cache "
-                             "slots borrowed per image at most (%.1f s)\n",
+        basalt::log::info("basalt serve", "image encoder staged: %.0f MiB of weights in pinned memory, %.2f GiB of expert-cache "
+                             "slots borrowed per image at most (%.1f s)",
                      (double) vis_enc.weights_bytes() / 1048576.0, (double) tmp_bytes / 1073741824.0,
                      std::chrono::duration<double>(Clock::now() - t0).count());
     }
@@ -2489,7 +2485,7 @@ int main(int argc, char** argv) {
     float* d_parts = nullptr;
     if (cudaMalloc(&d_parts, (size_t) K * g.n_embd * 4) != cudaSuccess ||
         cudaMemset(d_parts, 0, (size_t) K * g.n_embd * 4) != cudaSuccess) {
-        std::fprintf(stderr, "basalt generate: the parts buffer failed\n");
+        basalt::log::error("basalt generate", "the parts buffer failed");
         return 1;
     }
 
@@ -2504,7 +2500,7 @@ int main(int argc, char** argv) {
         const bool remote = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
         if (remote || o.expert_profile.empty() ||
             !basalt::core::read_expert_profile(srcs.profile, g.n_layers, g.n_expert, prof, pslots, perr)) {
-            std::fprintf(stderr, "basalt generate: --split-skip-if-fits: %s; the split stays\n",
+            basalt::log::info("basalt generate", "--split-skip-if-fits: %s; the split stays",
                          remote ? "remote expert caches are in use" : perr.empty() ? "no expert profile" : perr.c_str());
         } else {
             const auto& lay = basalt::kernels::cpu::expert_layout();
@@ -2519,9 +2515,9 @@ int main(int argc, char** argv) {
             cudaDeviceProp dp{};
             cudaGetDeviceProperties(&dp, 0);
             if (pairs_bytes <= room) {
-                std::fprintf(stderr, "basalt generate: layer split skipped (--split-skip-if-fits): CUDA0 (%s) holds all "
+                basalt::log::info("basalt generate", "layer split skipped (--split-skip-if-fits): CUDA0 (%s) holds all "
                                      "%zu profiled pairs (%.2f GiB) with the session (%.2f GiB, %lld-token context), "
-                                     "the drafter and the reserve: %.2f GiB free, %.2f GiB to spare - one GPU\n",
+                                     "the drafter and the reserve: %.2f GiB free, %.2f GiB to spare - one GPU",
                              dp.name, prof.size(), (double) pairs_bytes / 1073741824.0, (double) session / 1073741824.0,
                              (long long) o.max_context, (double) fb / 1073741824.0,
                              (double) (room - pairs_bytes) / 1073741824.0);
@@ -2531,9 +2527,9 @@ int main(int argc, char** argv) {
                 split_at.clear();
                 o.layer_split.clear();
             } else {
-                std::fprintf(stderr, "basalt generate: --split-skip-if-fits: CUDA0 (%s) would hold only %.2f of the "
+                basalt::log::info("basalt generate", "--split-skip-if-fits: CUDA0 (%s) would hold only %.2f of the "
                                      "profile's %.2f GiB (%.2f GiB free, %.2f GiB for the session, drafter and "
-                                     "reserve): the split stays\n", dp.name,
+                                     "reserve): the split stays", dp.name,
                              (double) std::max<int64_t>(room, 0) / 1073741824.0, (double) pairs_bytes / 1073741824.0,
                              (double) fb / 1073741824.0, (double) held_back / 1073741824.0);
             }
@@ -2561,7 +2557,7 @@ int main(int argc, char** argv) {
             if (!basalt::core::WeightTable::pool_bytes(pack_files, pool_s, err, &skip_s)) {
                 return fatal_start_error(err);
             }
-            std::fprintf(stderr, "basalt generate: layer split: CUDA%d loads the dense weights of layers %lld-%lld only\n",
+            basalt::log::info("basalt generate", "layer split: CUDA%d loads the dense weights of layers %lld-%lld only",
                          st.dev, (long long) lb, (long long) le - 1);
         } else {
             skip_s = skip;
@@ -2572,15 +2568,15 @@ int main(int argc, char** argv) {
             cudaGetLastError();
             size_t free_b = 0, total_b = 0;   // what that card had free
             cudaMemGetInfo(&free_b, &total_b);
-            std::fprintf(stderr, "basalt generate: layer split, CUDA%d weights: %s (%llu MiB needed, %llu MiB of %llu "
-                                 "MiB free on that card)\n", st.dev,
+            basalt::log::error("basalt generate", "layer split, CUDA%d weights: %s (%llu MiB needed, %llu MiB of %llu "
+                                 "MiB free on that card)", st.dev,
                          err.empty() ? "the weight arena does not fit" : err.c_str(),
                          (unsigned long long) (pool_s >> 20), (unsigned long long) (free_b >> 20),
                          (unsigned long long) (total_b >> 20));
             return 1;
         }
         if (!st.dense.load(o.native_shards, st.wt, err, true)) {
-            std::fprintf(stderr, "basalt generate: layer split, CUDA%d native dense projections: %s\n", st.dev,
+            basalt::log::error("basalt generate", "layer split, CUDA%d native dense projections: %s", st.dev,
                          err.c_str());
             return 1;
         }
@@ -2590,12 +2586,12 @@ int main(int argc, char** argv) {
         if (cudaStreamCreateWithFlags(&st.stream, cudaStreamNonBlocking) != cudaSuccess ||
             cudaStreamCreateWithFlags(&st.adapt_stream, cudaStreamNonBlocking) != cudaSuccess ||
             cudaEventCreateWithFlags(&st.adapt_ev, cudaEventDisableTiming) != cudaSuccess) {
-            std::fprintf(stderr, "basalt generate: layer split, CUDA%d: its streams failed\n", st.dev);
+            basalt::log::error("basalt generate", "layer split, CUDA%d: its streams failed", st.dev);
             return 1;
         }
         // a control vector (the speed projection): its tables on this device too - the stage's layers apply it here
         if (!basalt::kernels::cvec_replicate(err)) {
-            std::fprintf(stderr, "basalt generate: layer split, CUDA%d: %s\n", st.dev, err.c_str());
+            basalt::log::error("basalt generate", "layer split, CUDA%d: %s", st.dev, err.c_str());
             return 1;
         }
         // --vision: this device's image-position table (the identity until a picture request), read by every rope
@@ -2604,7 +2600,7 @@ int main(int argc, char** argv) {
             if (cudaMalloc(&st.mrope, mrope_host.size() * sizeof(int32_t)) != cudaSuccess ||
                 cudaMemcpy(st.mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
                     cudaSuccess) {
-                std::fprintf(stderr, "basalt generate: layer split, CUDA%d: the image position table failed\n", st.dev);
+                basalt::log::error("basalt generate", "layer split, CUDA%d: the image position table failed", st.dev);
                 return 1;
             }
             basalt::kernels::mrope_table_set(st.mrope);
@@ -2615,13 +2611,13 @@ int main(int argc, char** argv) {
             std::string bursts;
             const double bw = probe_pcie_h2d_gbps(&bursts);
             if (bw > 0.0) st.pcie_frac = pcie_frac_for_gbps(bw, 0.55);
-            std::fprintf(stderr, "basalt generate: layer split: CUDA%d PCIe probe %.1f GB/s (best of %s) -> pcie_frac "
-                                 "%.2f\n", st.dev, bw, bursts.c_str(), st.pcie_frac);
+            basalt::log::info("basalt generate", "layer split: CUDA%d PCIe probe %.1f GB/s (best of %s) -> pcie_frac "
+                                 "%.2f", st.dev, bw, bursts.c_str(), st.pcie_frac);
         }
         size_t fb = 0, tb = 0;
         cudaMemGetInfo(&fb, &tb);
-        std::fprintf(stderr, "basalt generate: layer split: CUDA%d holds its weights; %.2f GiB free (its session "
-                             "follows the split search)\n", st.dev, (double) fb / 1073741824.0);
+        basalt::log::info("basalt generate", "layer split: CUDA%d holds its weights; %.2f GiB free (its session "
+                             "follows the split search)", st.dev, (double) fb / 1073741824.0);
     }
     GpuStage* const last_st = stages.empty() ? nullptr : stages.back().get();
 
@@ -2657,11 +2653,11 @@ int main(int argc, char** argv) {
                 out.insert(out.end(), moved.begin(), moved.end());
                 out.insert(out.end(), profile.begin() + (long) fill, profile.end());
                 profile.swap(out);
-                std::fprintf(stderr, "basalt generate: peer hot share %.2f: %zu of the first %zu ranked pairs moved "
-                                     "behind rank %zu (the peer's)\n", f, n_moved, at, fill);
+                basalt::log::info("basalt generate", "peer hot share %.2f: %zu of the first %zu ranked pairs moved "
+                                     "behind rank %zu (the peer's)", f, n_moved, at, fill);
             }
         }
-        std::fprintf(stderr, "basalt generate: profile %s: %zu ranked pairs, built for %lld slots\n",
+        basalt::log::info("basalt generate", "profile %s: %zu ranked pairs, built for %lld slots",
                      o.expert_profile.c_str(), profile.size(), (long long) pslots);
     }
     // the whole ranking as loaded, the prior of --expert-profile-save's order (a layer split keeps only CUDA0's pairs
@@ -2702,7 +2698,7 @@ int main(int argc, char** argv) {
         const basalt::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
         if (const cudaError_t e = cudaMemGetInfo(&fb, &tb); e != cudaSuccess)
-            std::fprintf(stderr, "basalt generate: layer split: CUDA%d free memory: %s\n", dev < 0 ? 0 : dev,
+            basalt::log::warn("basalt generate", "layer split: CUDA%d free memory: %s", dev < 0 ? 0 : dev,
                          cudaGetErrorString(e));
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + split_pf_mib + (later ? kWindowMib : 0) +
                                  (drafter ? kDrafterMib : 0)) << 20;
@@ -2722,8 +2718,8 @@ int main(int argc, char** argv) {
             cudaGetLastError();
             const double speed = std::max(1.0, (double) sms * (double) khz / 1e6);   // SMs x GHz
             layer_ms[(size_t) i] = 0.33 * (84.0 * 2.617) / speed;
-            std::fprintf(stderr, "basalt generate: layer split auto: CUDA%d %d SMs at %.2f GHz -> %.2f ms per layer, "
-                                 "%.2f GiB free before its session carve\n", dev, sms, khz / 1e6, layer_ms[(size_t) i],
+            basalt::log::info("basalt generate", "layer split auto: CUDA%d %d SMs at %.2f GHz -> %.2f ms per layer, "
+                                 "%.2f GiB free before its session carve", dev, sms, khz / 1e6, layer_ms[(size_t) i],
                          (double) cap[(size_t) i] / 1073741824.0);
         }
         const double miss_ms = 190.0;
@@ -2795,13 +2791,13 @@ int main(int argc, char** argv) {
         split_at = best;
         std::string ks;
         for (const int64_t k : split_at) ks += (ks.empty() ? "" : ",") + std::to_string(k);
-        std::fprintf(stderr, "basalt generate: layer split auto: K=%s - predicted %.1f ms per decode window; the caches "
-                             "hold %lld of %zu profiled pairs (~%.1f%% of the routed mass)\n", ks.c_str(), best_ms,
+        basalt::log::info("basalt generate", "layer split auto: K=%s - predicted %.1f ms per decode window; the caches "
+                             "hold %lld of %zu profiled pairs (~%.1f%% of the routed mass)", ks.c_str(), best_ms,
                      (long long) best_held, profile.size(), 100.0 * best_mass);
     }
     for (size_t i = 0; i < split_at.size(); ++i)
         if (split_at[i] >= g.n_layers) {
-            std::fprintf(stderr, "basalt generate: --layer-split: layer %lld is past the last (%lld)\n",
+            basalt::log::error("basalt generate", "--layer-split: layer %lld is past the last (%lld)",
                          (long long) split_at[i], (long long) (g.n_layers - 1));
             return 2;
         }
@@ -2841,17 +2837,17 @@ int main(int argc, char** argv) {
         const basalt::core::OnDevice on0(0);
         const int64_t hi0 = multi_gpu ? split_at[0] : -1;
         if (cudaMalloc(&sbuf, basalt::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
-            std::fprintf(stderr, "basalt generate: session state allocation failed\n");
+            basalt::log::error("basalt generate", "session state allocation failed");
             return 1;
         }
         solo_kv_bytes = basalt::core::session_bytes(g, o.max_context, K, 0, hi0);
         if (basalt::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
-            std::fprintf(stderr, "basalt generate: session_init failed\n");
+            basalt::log::error("basalt generate", "session_init failed");
             return 1;
         }
         if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1)
-            std::fprintf(stderr, "basalt generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
-                                 "%.2f GiB of pinned RAM\n",
+            basalt::log::info("basalt generate", "KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
+                                 "%.2f GiB of pinned RAM",
                          (long long) (ss.qsa_states[ss.qsa_primary()].n_slots * 4),
                          (long long) o.max_context, (double) basalt::core::qsa_kv_host_bytes() / 1073741824.0);
         // the PLE block above built everything but the history, which session_init has just carved
@@ -2860,14 +2856,14 @@ int main(int argc, char** argv) {
         // the verifier reads it (--serve zeroes it per request when nothing is reused)
         basalt::core::session_zero(ss, g, nullptr, main_cs);
         if (cudaDeviceSynchronize() != cudaSuccess) {
-            std::fprintf(stderr, "basalt generate: zeroing the session state failed\n");
+            basalt::log::error("basalt generate", "zeroing the session state failed");
             return 1;
         }
         if (!ss.ple.ready()) {
-            std::fprintf(stderr, "basalt generate: the PLE run is not ready after construction\n");
+            basalt::log::error("basalt generate", "the PLE run is not ready after construction");
             return 1;
         }
-        std::fprintf(stderr, "basalt generate: PLE on, table %llu rows of %s\n",
+        basalt::log::info("basalt generate", "PLE on, table %llu rows of %s",
                      (unsigned long long) ple_table.rows(), o.model.c_str());
     }
     for (size_t i = 0; i < stages.size(); ++i) {
@@ -2876,7 +2872,7 @@ int main(int argc, char** argv) {
         void* sbuf_s = nullptr;
         if (cudaMalloc(&sbuf_s, basalt::core::session_bytes(g, o.max_context, K, st.lb, st.le)) != cudaSuccess ||
             basalt::core::session_init(g, o.max_context, K, sbuf_s, st.ss, st.lb, st.le) == 0) {
-            std::fprintf(stderr, "basalt generate: layer split, CUDA%d: the session state failed\n", st.dev);
+            basalt::log::error("basalt generate", "layer split, CUDA%d: the session state failed", st.dev);
             return 1;
         }
         basalt::core::LoadProgress::kv(basalt::core::LoadProgress::cuda(st.dev),
@@ -2885,15 +2881,15 @@ int main(int argc, char** argv) {
         const basalt::core::WeightRef* wo_s = st.wt.find("output.weight");
         if (wo_s == nullptr ||
             (last && !st.head.load(o.native_shards, g.n_embd, wo_s->ne1, err))) {
-            std::fprintf(stderr, "basalt generate: layer split, CUDA%d head: %s%s\n", st.dev,
+            basalt::log::error("basalt generate", "layer split, CUDA%d head: %s%s", st.dev,
                          wo_s == nullptr ? "output.weight is missing" : err.c_str(),
                          wo_s == nullptr ? "" : vram_free_note().c_str());
             return 1;
         }
         size_t fb = 0, tb = 0;
         cudaMemGetInfo(&fb, &tb);
-        std::fprintf(stderr, "basalt generate: layer split: CUDA%d holds its weights, session [%lld, %lld)%s; "
-                             "%.2f GiB free\n", st.dev, (long long) st.lb, (long long) st.le,
+        basalt::log::info("basalt generate", "layer split: CUDA%d holds its weights, session [%lld, %lld)%s; "
+                             "%.2f GiB free", st.dev, (long long) st.lb, (long long) st.le,
                      last ? " and the head" : "", (double) fb / 1073741824.0);
     }
 
@@ -2910,17 +2906,17 @@ int main(int argc, char** argv) {
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
                         : split_same ? "it needs each stage of a layer split on its own GPU" : nullptr;
         if (off != nullptr) {
-            std::fprintf(stderr, "basalt generate: WARNING: --batch %d is off: %s\n", o.batch, off);
+            basalt::log::warn("basalt generate", "--batch %d is off: %s", o.batch, off);
             o.batch = 0;
         } else if (o.batch > cap) {
-            std::fprintf(stderr, "basalt generate: WARNING: --batch %d: a batch window holds at most %d rows, so %d "
-                                 "slots\n", o.batch, cap, cap);
+            basalt::log::warn("basalt generate", "--batch %d: a batch window holds at most %d rows, so %d "
+                                 "slots", o.batch, cap, cap);
             o.batch = cap;
         }
     }
     if (o.batch > 0 && o.batch_groups > 1 && (stages.empty() || o.batch % o.batch_groups != 0)) {
-        std::fprintf(stderr, "basalt generate: WARNING: --batch-groups %d needs a layer split and to divide --batch %d; "
-                             "one group\n", o.batch_groups, o.batch);
+        basalt::log::warn("basalt generate", "--batch-groups %d needs a layer split and to divide --batch %d; "
+                             "one group", o.batch_groups, o.batch);
         o.batch_groups = 1;
     }
     if (o.batch > 0) {
@@ -2938,7 +2934,7 @@ int main(int argc, char** argv) {
                 const uint64_t bytes = basalt::core::session_bytes(g, slot_cap[(size_t) b], K, lo, hi);
                 if (k == 0 && b == 0 && slot0_is_solo) {
                     bslot_ss[0].push_back(SlotSession(&ss, SlotDelete{false}));
-                    std::fprintf(stderr, "basalt generate: --batch: slot 0 on CUDA%d is the solo session (%.2f GiB)\n", dev,
+                    basalt::log::info("basalt generate", "--batch: slot 0 on CUDA%d is the solo session (%.2f GiB)", dev,
                                  (double) bytes / 1073741824.0);
                     continue;
                 }
@@ -2949,8 +2945,8 @@ int main(int argc, char** argv) {
                     if (buf != nullptr) cudaFree(buf);
                     size_t fb = 0, tb = 0;
                     cudaMemGetInfo(&fb, &tb);
-                    std::fprintf(stderr, "basalt generate: WARNING: --batch %d: slot %d's session does not fit on CUDA%d "
-                                         "(%.2f GiB, %.2f GiB free); %d slot%s\n", o.batch, b, dev,
+                    basalt::log::warn("basalt generate", "--batch %d: slot %d's session does not fit on CUDA%d "
+                                         "(%.2f GiB, %.2f GiB free); %d slot%s", o.batch, b, dev,
                                  (double) bytes / 1073741824.0, (double) fb / 1073741824.0, b, b == 1 ? "" : "s");
                     fit = b;
                     break;
@@ -2958,19 +2954,19 @@ int main(int argc, char** argv) {
                 basalt::core::session_zero(*u, g, nullptr, nullptr);
                 bslot_ss[k].push_back(std::move(u));
                 total += bytes;
-                std::fprintf(stderr, "basalt generate: --batch: slot %d on CUDA%d holds %lld tokens (%.2f GiB)\n", b, dev,
+                basalt::log::info("basalt generate", "--batch: slot %d on CUDA%d holds %lld tokens (%.2f GiB)", b, dev,
                              (long long) slot_cap[(size_t) b], (double) bytes / 1073741824.0);
             }
             cudaDeviceSynchronize();
             size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
-            std::fprintf(stderr, "basalt generate: --batch: %d slot sessions on CUDA%d (%.2f GiB in all); %.2f GiB free\n",
+            basalt::log::info("basalt generate", "--batch: %d slot sessions on CUDA%d (%.2f GiB in all); %.2f GiB free",
                          (int) bslot_ss[k].size(), dev, (double) total / 1073741824.0, (double) fb / 1073741824.0);
         }
         for (auto& v : bslot_ss) if ((int) v.size() > fit) v.resize((size_t) fit);   // the same count on every stage
         if (fit < 2) {
-            std::fprintf(stderr, "basalt generate: WARNING: --batch is off: not two slot sessions fit (a smaller "
-                                 "--max-context, or KV streaming, --kv-resident, makes them smaller)\n");
+            basalt::log::warn("basalt generate", "--batch is off: not two slot sessions fit (a smaller "
+                                 "--max-context, or KV streaming, --kv-resident, makes them smaller)");
             bslot_ss.clear();
             slot_cap.clear();
             o.batch = 0;
@@ -2997,9 +2993,9 @@ int main(int argc, char** argv) {
                 kept += basalt::core::session_bytes(g, slot_cap[(size_t) b], K, 0, multi_gpu ? split_at[0] : -1);
             slot_kv_cuda0 = kept;
             const uint64_t per_slot = basalt::core::session_bytes(g, slot_cap[0], K, 0, multi_gpu ? split_at[0] : -1);
-            std::fprintf(stderr, "basalt generate: --batch %d: %.2f GiB of KV cache and state per slot (%lld tokens), "
+            basalt::log::info("basalt generate", "--batch %d: %.2f GiB of KV cache and state per slot (%lld tokens), "
                                  "%.2f GiB in all; the slots beyond the solo one take %.2f GiB of VRAM on CUDA0 that "
-                                 "the expert cache would otherwise hold\n", o.batch, (double) per_slot / 1073741824.0,
+                                 "the expert cache would otherwise hold", o.batch, (double) per_slot / 1073741824.0,
                          (long long) slot_cap[0], (double) (per_slot * (uint64_t) o.batch) / 1073741824.0,
                          (double) kept / 1073741824.0);
         }
@@ -3023,7 +3019,7 @@ int main(int argc, char** argv) {
         static const basalt::core::ModelGeometry draft_geometry{};
         // with a layer split across GPUs the drafter reads the last stage's residual: it lives on that device
         const basalt::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
-        if (!o.mtp.empty() && !mtp.load(basalt::core::MtpFiles::from(srcs), draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "basalt generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
+        if (!o.mtp.empty() && !mtp.load(basalt::core::MtpFiles::from(srcs), draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
     }
     basalt::core::qsa_set_kv_elastic(0);   // every later state: whole
@@ -3034,7 +3030,7 @@ int main(int argc, char** argv) {
     // head, and the head is not refused after the expert arena has registered tens of GiB of host pages, like the
     // drafter above.
     const basalt::core::WeightRef* wo = wt.find("output.weight");
-    if (wo == nullptr) { std::fprintf(stderr, "basalt generate: output.weight is missing\n"); return 1; }
+    if (wo == nullptr) { basalt::log::error("basalt generate", "output.weight is missing"); return 1; }
     const int64_t n_vocab = wo->ne1;
     // --grammar on: the token texts the grammar walks, read from the pack's tokenizer files
     std::optional<basalt::program::grammar::PackVocab> grammar_vocab;
@@ -3057,10 +3053,10 @@ int main(int argc, char** argv) {
     if (!multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
         if (!native_head.load(o.native_shards, g.n_embd, n_vocab, err)) {
-            std::fprintf(stderr, "basalt generate: %s%s\n", err.c_str(), vram_free_note().c_str());
+            basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str());
             return 1;
         }
-        std::fprintf(stderr, "basalt generate: experimental native Q5_K head, %llu bytes, in %.1f s\n",
+        basalt::log::info("basalt generate", "experimental native Q5_K head, %llu bytes, in %.1f s",
                      (unsigned long long) native_head.weight_bytes(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
     }
@@ -3068,7 +3064,7 @@ int main(int argc, char** argv) {
     float* d_logits = nullptr;
     if (cudaMalloc(&d_logits, (size_t) n_vocab * 4) != cudaSuccess) {
         (void) cudaGetLastError();
-        std::fprintf(stderr, "basalt generate: the logits buffer failed%s\n", vram_free_note().c_str());
+        basalt::log::error("basalt generate", "the logits buffer failed%s", vram_free_note().c_str());
         return 1;
     }
     // Create the additional contexts after MTP has secured CUDA0 memory, but
@@ -3078,7 +3074,7 @@ int main(int argc, char** argv) {
         if (!basalt::core::RemoteExperts::preflight(remote_dev[r], free_gib, err)) {
             return fatal_start_error(err);
         }
-        std::fprintf(stderr, "basalt generate: CUDA%d context ready, %.2f GiB free before expert arena registration\n",
+        basalt::log::info("basalt generate", "CUDA%d context ready, %.2f GiB free before expert arena registration",
                      remote_dev[r], free_gib);
     }
 
@@ -3103,22 +3099,22 @@ int main(int argc, char** argv) {
         const bool named = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess;
         if (!named) cudaGetLastError();
         const char* name = named && p.name[0] ? p.name : "(an unnamed GPU)";
-        std::fprintf(stderr, "basalt generate: GPU %d: %s, compute capability %d.%d\n", dev, name,
+        basalt::log::info("basalt generate", "GPU %d: %s, compute capability %d.%d", dev, name,
                      p.major, p.minor);
         {   // a build whose libcudart is older than its headers (a CUDA 13 kit with a dangling libcudart.so that
             // CMake resolved to the system's CUDA 12 one) reads cudaDeviceProp shifted - silently, and slowly
             int rt = 0;
             if (cudaRuntimeGetVersion(&rt) == cudaSuccess && rt / 1000 != CUDART_VERSION / 1000)
-                std::fprintf(stderr, "basalt generate: WARNING: this engine was compiled with CUDA %d.%d headers but "
+                basalt::log::warn("basalt generate", "this engine was compiled with CUDA %d.%d headers but "
                                      "loaded a CUDA %d.%d runtime (libcudart): GPU properties can read wrong and some "
                                      "kernels go unused. Rebuild it against one toolkit (cmake -DCUDAToolkit_ROOT=<the "
-                                     "toolkit>, with its libcudart.so present)\n",
+                                     "toolkit>, with its libcudart.so present)",
                              CUDART_VERSION / 1000, CUDART_VERSION % 1000 / 10, rt / 1000, rt % 1000 / 10);
         }
         const std::string e = basalt::core::device_code_error();
         if (!e.empty()) {
-            std::fprintf(stderr, "basalt generate: this engine has no code for %s (sm_%d%d): %s - rebuild it for this "
-                                 "card (build it for this GPU's architecture)\n", name, p.major, p.minor, e.c_str());
+            basalt::log::error("basalt generate", "this engine has no code for %s (sm_%d%d): %s - rebuild it for this "
+                                 "card (build it for this GPU's architecture)", name, p.major, p.minor, e.c_str());
             return 1;
         }
     }
@@ -3130,7 +3126,7 @@ int main(int argc, char** argv) {
         if (!src.open(expert_files.experts, g.n_layers, g.n_expert, err)) {
             return fatal_start_error(err);
         }
-        std::fprintf(stderr, "basalt generate: experts via mmap (--mmap-experts)\n");
+        basalt::log::info("basalt generate", "experts via mmap (--mmap-experts)");
         srcp = &src;
     } else {
         const uint64_t pin_limit = 0;   // the whole arena is pinned
@@ -3139,9 +3135,9 @@ int main(int argc, char** argv) {
             return fatal_start_error(err);
         }
         if (!arena_src.ram_warning().empty())   // said before the load's numbers, which it explains
-            std::fprintf(stderr, "basalt generate: WARNING: %s\n", arena_src.ram_warning().c_str());
-        std::fprintf(stderr, "basalt generate: expert arena: %s\n", arena_src.note().c_str());
-        std::fprintf(stderr, "basalt generate: loaded %.2f GiB at %.2f GiB/s\n",
+            basalt::log::warn("basalt generate", "%s", arena_src.ram_warning().c_str());
+        basalt::log::info("basalt generate", "expert arena: %s", arena_src.note().c_str());
+        basalt::log::info("basalt generate", "loaded %.2f GiB at %.2f GiB/s",
                      (double) basalt::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
                      arena_src.load_gib_per_second());
         srcp = &arena_src;
@@ -3159,7 +3155,7 @@ int main(int argc, char** argv) {
         cudaDeviceSynchronize();
         const auto extra = o.mtp.empty() ? std::vector<std::pair<std::string, const void*>>{} : mtp.hc8_keys();
         if (!basalt::core::hc8_dump(wt, g, extra, o.dump_hc8, err)) {
-            std::fprintf(stderr, "basalt generate: --dump-hc8: %s\n", err.c_str());
+            basalt::log::error("basalt generate", "--dump-hc8: %s", err.c_str());
             return 1;
         }
         return 0;
@@ -3219,8 +3215,8 @@ int main(int argc, char** argv) {
         int64_t slots = ((int64_t) free_b - reserve) / blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
-        std::fprintf(stderr, "basalt generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
-                             "draft head, +%lld MiB for what loads after) -> %d slots\n",
+        basalt::log::info("basalt generate", "expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
+                             "draft head, +%lld MiB for what loads after) -> %d slots",
                      (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20),
                      (long long) (late_b >> 20), o.expert_cache);
         // The batch slots' sessions came out of the same VRAM: say when that leaves the cache short of the expert set
@@ -3230,9 +3226,9 @@ int main(int argc, char** argv) {
             if (!profile.empty()) without = std::min<int64_t>(without, (int64_t) profile.size());
             const bool swaps = !profile.empty() && o.expert_cache < (int64_t) profile.size() && without >= (int64_t) profile.size();
             if (without > 0 && (swaps || o.expert_cache * 2 < without))
-                std::fprintf(stderr, "basalt warning: the %d batch slots' sessions (the first is the solo one) take %.1f GiB of CUDA0 beyond it, leaving an "
+                basalt::log::warn("basalt", "the %d batch slots' sessions (the first is the solo one) take %.1f GiB of CUDA0 beyond it, leaving an "
                                      "expert cache of %d slots (%.1f GiB) where %lld would fit without them%s. Lower "
-                                     "--max-context or drop --slot-full-context (or use fewer --parallel slots)\n",
+                                     "--max-context or drop --slot-full-context (or use fewer --parallel slots)",
                              o.batch, (double) slot_kv_cuda0 / 1073741824.0, o.expert_cache,
                              (double) o.expert_cache * (double) blob / 1073741824.0, (long long) without,
                              swaps ? "; the configured expert set no longer fits, so experts swap per token" : "");
@@ -3255,8 +3251,8 @@ int main(int argc, char** argv) {
                 const int r = (int) std::min<int64_t>(fit_mib, o.vram_reserve_mib);
                 int64_t s2 = ((int64_t) free_b - ((((int64_t) r + prefill_mib) << 20) + mtp_bind + late_b)) / blob;
                 if (!profile.empty()) s2 = std::min<int64_t>(s2, (int64_t) profile.size());
-                std::fprintf(stderr, "basalt generate: expert cache auto: the %d MiB reserve leaves too few slots on "
-                                     "this card (a working cache needs %lld): a %d MiB reserve instead -> %lld slots\n",
+                basalt::log::warn("basalt generate", "expert cache auto: the %d MiB reserve leaves too few slots on "
+                                     "this card (a working cache needs %lld): a %d MiB reserve instead -> %lld slots",
                              o.vram_reserve_mib, (long long) min_slots, r, (long long) s2);
                 o.vram_reserve_mib = r;
                 o.expert_cache = (int) s2;
@@ -3275,11 +3271,11 @@ int main(int argc, char** argv) {
                     ? ", a smaller --vram-reserve-mib (" + std::to_string(o.vram_reserve_mib) + " now; " +
                           std::to_string(kSmallReserveMib) + " is enough on a small card)"
                     : std::string();
-            std::fprintf(stderr, "basalt generate: no VRAM is left for the expert cache: it needs at least %lld slots "
+            basalt::log::error("basalt generate", "no VRAM is left for the expert cache: it needs at least %lld slots "
                                  "(%lld MiB), about %lld MiB more than this card has free. To make room: a smaller "
                                  "--max-context (the session, mostly its KV cache, takes %lld MiB at %lld tokens), "
                                  "--kv q4_0, a smaller draft vocabulary (the draft head takes "
-                                 "%lld MiB now)%s, images on the CPU, or close other programs that use the GPU%s\n",
+                                 "%lld MiB now)%s, images on the CPU, or close other programs that use the GPU%s",
                          (long long) min_slots, (long long) ((min_slots * blob) >> 20), (long long) short_mib,
                          (long long) session_mib, (long long) o.max_context, (long long) (mtp_bind >> 20),
                          reserve_tip.c_str(),
@@ -3297,9 +3293,9 @@ int main(int argc, char** argv) {
         const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) basalt::kernels::cpu::expert_layout().max_blob, 0);
         if (o.expert_cache > fit) {
             // a WARNING that names the knob: the user asked for this size, and gets fewer slots
-            std::fprintf(stderr, "basalt generate: WARNING: layer split: --expert-cache %d leaves no room for the "
+            basalt::log::warn("basalt generate", "layer split: --expert-cache %d leaves no room for the "
                                  "prompt path's buffers (%lld MiB) and the %d MiB reserve on CUDA0: %lld slots instead "
-                                 "(a smaller --vram-reserve-mib leaves more of them)\n", o.expert_cache,
+                                 "(a smaller --vram-reserve-mib leaves more of them)", o.expert_cache,
                          (long long) prefill_mib, o.vram_reserve_mib, (long long) fit);
             o.expert_cache = (int) fit;
         }
@@ -3332,7 +3328,7 @@ int main(int argc, char** argv) {
                                       [](int n) { return n > 0; }) ? "the helper caches on other GPUs"
                         : o.vram_segment_mib < 64 ? "--vram-segment-mib is below 64" : nullptr;
         if (why != nullptr) {
-            std::fprintf(stderr, "basalt generate: --vram-elastic is off: %s\n", why);
+            basalt::log::warn("basalt generate", "--vram-elastic is off: %s", why);
             o.vram_elastic = false;
         } else {
             xcache.set_segment_bytes(o.vram_segment_mib << 20);
@@ -3394,7 +3390,7 @@ int main(int argc, char** argv) {
                 char commit[96] = "";
                 if (auto_cache && failed < 8 && shrink_to(cache_bytes() / 4 * 3)) {
                     ++failed;
-                    std::fprintf(stderr, "basalt generate: %s%s; trying a smaller expert cache: %d slots\n", err.c_str(),
+                    basalt::log::warn("basalt generate", "%s%s; trying a smaller expert cache: %d slots", err.c_str(),
                                  commit, o.expert_cache);
                     continue;
                 }
@@ -3413,37 +3409,36 @@ int main(int argc, char** argv) {
             if (free_b < ((size_t) 16 << 20))
                 give = std::max<int64_t>(give, ++zero_reads <= 2 ? 1ll << 30 : xcache.bytes() / 4);
             const int64_t keep_bytes = xcache.bytes() - give;
-            std::fprintf(stderr, "basalt generate: only %lld MiB free once the slots are written (reserve %d MiB); "
-                                 "shrinking the expert cache\n", (long long) (free_b >> 20), o.vram_reserve_mib);
+            basalt::log::warn("basalt generate", "only %lld MiB free once the slots are written (reserve %d MiB); "
+                                 "shrinking the expert cache", (long long) (free_b >> 20), o.vram_reserve_mib);
             xcache.close();
             if (!shrink_to(keep_bytes)) break;
         }
         if (failed > 0 && o.expert_cache > 0)
-            std::fprintf(stderr, "basalt generate: expert cache: %d slots (%.2f GiB) after %d smaller tries - a bigger "
-                                 "page file lets it use more of the free VRAM\n",
+            basalt::log::warn("basalt generate", "expert cache: %d slots (%.2f GiB) after %d smaller tries - a bigger "
+                                 "page file lets it use more of the free VRAM",
                          o.expert_cache, (double) xcache.bytes() / 1073741824.0, failed);
     }
     // the slots wholly or partly in the elastic tail: the ones the KV may take back
     const int64_t kv_tail_slots = xcache.valid() && xcache.elastic_bytes() > 0
         ? xcache.full_slots() - xcache.slots_within(xcache.full_bytes() - xcache.elastic_bytes()) : 0;
     if (kv_tail_slots > 0)
-        std::fprintf(stderr, "basalt generate: elastic KV: %lld cells backed per session, the other %.2f GiB of KV are "
-                             "the expert cache's last %lld slots until a request needs them\n",
+        basalt::log::info("basalt generate", "elastic KV: %lld cells backed per session, the other %.2f GiB of KV are "
+                             "the expert cache's last %lld slots until a request needs them",
                      (long long) kv_floor, (double) kv_tail_bytes / 1073741824.0, (long long) kv_tail_slots);
     if (o.expert_cache > 0) {
-        std::fprintf(stderr, "basalt generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
+        basalt::log::info("basalt generate", "expert cache %lld slots, %.2f GiB of VRAM; policy is",
                      (long long) xcache.slots(), xcache.gib());
         xcache.set_per_layer_admission(false);
         // A GPU expert and the CPU's compute the same quantized expert with different float order, so a near-tie can
         // flip against a cache-off run; neither output is more correct than the other.  (native_expert_parity,
         // expert_parity and the grouped kernels' tests check the kernels themselves.)
-        std::fprintf(stderr,
-                     "basalt generate: the GPU computes the experts in the cache; it rounds differently from the CPU,\n"
-                     "                 so a reply can differ slightly from a run without the cache (same quality).\n");
+        basalt::log::info("basalt generate", "the GPU computes the experts in the cache; it rounds differently from the CPU,\n"
+                     "                 so a reply can differ slightly from a run without the cache (same quality).");
         if (profile.empty()) {
-            std::fprintf(stderr, "                 compulsory-miss (fills with whatever the run routes first).\n");
+            basalt::log::raw("                 compulsory-miss (fills with whatever the run routes first).\n");
         } else {
-            std::fprintf(stderr, "                 PROFILE, ranked by routing frequency, no eviction.\n");
+            basalt::log::raw("                 PROFILE, ranked by routing frequency, no eviction.\n");
         }
     }
     // ---- fill the tier from the profile.  This is the only place the plan is applied, and it runs
@@ -3517,8 +3512,8 @@ int main(int argc, char** argv) {
                 }
                 ram = std::min(ram, outside);
                 if (model_bytes > vram + peer_vram + ram)
-                    std::fprintf(stderr, "basalt warning: model %.1f GiB, free VRAM + RAM %.1f GiB: the rest is read from "
-                                         "the SSD while generating (slow)\n",
+                    basalt::log::warn("basalt", "model %.1f GiB, free VRAM + RAM %.1f GiB: the rest is read from "
+                                         "the SSD while generating (slow)",
                                  (double) model_bytes / 1073741824.0,
                                  (double) (vram + peer_vram + ram) / 1073741824.0);
             }
@@ -3561,7 +3556,7 @@ int main(int argc, char** argv) {
         if (!basalt::core::fill_cache_slots(*srcp, xcache, 0, fill_pairs.data(), fill_slots.data(),
                                             (int64_t) fill_pairs.size(),
                                             [&](uint64_t bytes) { fill_progress.add(bytes); }, err)) {
-            std::fprintf(stderr, "basalt generate: the profile fill failed: %s\n", err.c_str());
+            basalt::log::error("basalt generate", "the profile fill failed: %s", err.c_str());
             return 1;
         }
         prefilled += (int64_t) fill_pairs.size();
@@ -3575,8 +3570,8 @@ int main(int argc, char** argv) {
                                 (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
             return fatal_start_error(err);
         }
-        std::fprintf(stderr, "basalt generate: pre-filled %lld of %lld slots from the profile in %.1f s (%.0f MB/s); "
-                             "slot 0 verified\n",
+        basalt::log::info("basalt generate", "pre-filled %lld of %lld slots from the profile in %.1f s (%.0f MB/s); "
+                             "slot 0 verified",
                      (long long) prefilled, (long long) (per_layer ? xcache.slots() : want), fill_s,
                      fill_s > 0 ? (double) fill_bytes / 1e6 / fill_s : 0.0);
     }
@@ -3591,7 +3586,7 @@ int main(int argc, char** argv) {
         {
             size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
-            std::fprintf(stderr, "basalt generate: layer split, CUDA%d: %.2f GiB free of %.2f, room for experts %.2f GiB\n",
+            basalt::log::info("basalt generate", "layer split, CUDA%d: %.2f GiB free of %.2f, room for experts %.2f GiB",
                          st.dev, (double) fb / 1073741824.0, (double) tb / 1073741824.0, (double) room / 1073741824.0);
         }
         std::vector<int64_t> sized;
@@ -3604,7 +3599,7 @@ int main(int argc, char** argv) {
         }
         if (sized.empty() ||
             !st.cache.open_sized(sized, g.n_layers, g.n_expert, err)) {
-            std::fprintf(stderr, "basalt generate: layer split, CUDA%d expert cache: %s\n", st.dev,
+            basalt::log::error("basalt generate", "layer split, CUDA%d expert cache: %s", st.dev,
                          sized.empty() ? "no room" : err.c_str());
             return 1;
         }
@@ -3626,24 +3621,24 @@ int main(int argc, char** argv) {
         if (!basalt::core::fill_cache_slots(*srcp, st.cache, st.dev, stage_pairs.data(), stage_slots.data(),
                                             (int64_t) stage_pairs.size(),
                                             [&](uint64_t bytes) { stage_progress.add(bytes); }, err)) {
-            std::fprintf(stderr, "basalt generate: layer split, CUDA%d profile fill failed: %s\n", st.dev, err.c_str());
+            basalt::log::error("basalt generate", "layer split, CUDA%d profile fill failed: %s", st.dev, err.c_str());
             return 1;
         }
         stage_progress.finish();
         if (filled == 0 || !st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
                                                  srcp->blob(st.profile[0].first, st.profile[0].second), err,
                                                  (int64_t) lay.blob_bytes(st.profile[0].first))) {
-            std::fprintf(stderr, "basalt generate: layer split, CUDA%d expert cache: %s\n", st.dev,
+            basalt::log::error("basalt generate", "layer split, CUDA%d expert cache: %s", st.dev,
                          filled == 0 ? "nothing filled" : err.c_str());
             return 1;
         }
-        std::fprintf(stderr, "basalt generate: layer split: CUDA%d runs layers %lld-%lld, expert cache %lld slots "
-                             "(%.2f GiB), %lld of its %zu profiled pairs; slot 0 verified\n",
+        basalt::log::info("basalt generate", "layer split: CUDA%d runs layers %lld-%lld, expert cache %lld slots "
+                             "(%.2f GiB), %lld of its %zu profiled pairs; slot 0 verified",
                      st.dev, (long long) st.lb, (long long) (st.le - 1), (long long) st.cache.slots(), st.cache.gib(),
                      (long long) filled, st.profile.size());
     }
     if (multi_gpu)
-        std::fprintf(stderr, "basalt generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
+        basalt::log::info("basalt generate", "layer split: CUDA0 runs layers 0-%lld", (long long) (split_at[0] - 1));
 
     std::array<basalt::core::RemoteExperts, 3> remote_experts;
     std::unique_ptr<basalt::core::RemoteExpertOpt> remote_opt;
@@ -3651,8 +3646,8 @@ int main(int argc, char** argv) {
     const bool multi_remote = o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
     if (o.expert_cache_remote[0] > 0) {
         if (o.expert_cache <= 0 || profile.empty() || o.no_pool) {
-            std::fprintf(stderr, "basalt generate: remote experts need an expert profile, "
-                                 "a CUDA0 expert cache and the expert pool\n");
+            basalt::log::error("basalt generate", "remote experts need an expert profile, "
+                                 "a CUDA0 expert cache and the expert pool");
             return 2;
         }
         std::vector<std::pair<int32_t, int32_t>> ranked = profile;
@@ -3674,8 +3669,8 @@ int main(int argc, char** argv) {
                 for (int64_t l = 0; l < g.n_layers; ++l)
                     if (!seen[(size_t) l * (size_t) g.n_expert + (size_t) e])
                         ranked.emplace_back((int32_t) l, (int32_t) e);
-            std::fprintf(stderr, "basalt generate: remote ranking: %zu profiled pairs, "
-                                 "%zu other pairs to fill CUDA1..3\n", profile.size(), ranked.size() - profile.size());
+            basalt::log::info("basalt generate", "remote ranking: %zu profiled pairs, "
+                                 "%zu other pairs to fill CUDA1..3", profile.size(), ranked.size() - profile.size());
         }
         std::array<std::vector<std::pair<int32_t, int32_t>>, 3> by_device;
         if (multi_remote) {
@@ -3709,7 +3704,7 @@ int main(int argc, char** argv) {
                 by_device[(size_t) target].push_back(pair);
                 next = (target + 1) % devices;
             }
-            std::fprintf(stderr, "basalt generate: remote ranks %s across %d CUDA devices\n",
+            basalt::log::info("basalt generate", "remote ranks %s across %d CUDA devices",
                          o.expert_cache_remote_placement == "layer" ? "grouped by layer" : "striped", devices);
         } else {
             by_device[0] = std::move(ranked);
@@ -3726,8 +3721,8 @@ int main(int argc, char** argv) {
                      o.expert_cache_remote_auto[(size_t) r])) {
                 return fatal_start_error(err);
             }
-            std::fprintf(stderr, "basalt generate: CUDA%d: %lld additional experts, %.2f GiB; "
-                                 "results return through pinned host rows\n", remote_dev[r],
+            basalt::log::info("basalt generate", "CUDA%d: %lld additional experts, %.2f GiB; "
+                                 "results return through pinned host rows", remote_dev[r],
                          (long long) remote_experts[(size_t) r].resident(), remote_experts[(size_t) r].gib());
         }
     }
@@ -3735,11 +3730,11 @@ int main(int argc, char** argv) {
     // ---- Multi-GPU: the second GPU's expert tier (filled after the RAM complement below, from it)
     basalt::core::PeerExperts peer;
     if (o.peer_device >= 1 && (profile.empty() || srcp == nullptr || o.expert_cache <= 0)) {
-        std::fprintf(stderr, "basalt generate: --peer-device needs an expert profile and the expert cache\n");
+        basalt::log::error("basalt generate", "--peer-device needs an expert profile and the expert cache");
         return 1;
     }
 
-    if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "basalt generate: %s\n", err.c_str()); return 1; }
+    if (remote_opt && !remote_opt->init(err)) { basalt::log::error("basalt generate", "%s", err.c_str()); return 1; }
     Drive drive;
     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
         drive.d.remote[drive.d.remote_count++] = &remote_experts[(size_t) r];
@@ -3766,7 +3761,7 @@ int main(int argc, char** argv) {
             // every chunk that would change the tokens when the cache is enabled.
             cudaMalloc((void**) &d_hit_q8_scale, (size_t) (g.n_embd / 32) * sizeof(float)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_out, (size_t) K * g.n_embd * 4) != cudaSuccess) {
-            std::fprintf(stderr, "basalt generate: the hit path could not allocate its device buffers\n");
+            basalt::log::error("basalt generate", "the hit path could not allocate its device buffers");
             return 1;
         }
         drive.d.cache = &xcache;
@@ -3786,12 +3781,12 @@ int main(int argc, char** argv) {
         drive.d.h_slot.resize((size_t) K);
         cudaEvent_t hit_done = nullptr;
         if (cudaEventCreate(&hit_done) != cudaSuccess) {
-            std::fprintf(stderr, "basalt generate: the hit path could not create its probe event\n");
+            basalt::log::error("basalt generate", "the hit path could not create its probe event");
             return 1;
         }
         drive.d.hit_done = (void*) hit_done;
         drive.d.h_dst.resize((size_t) K);
-        std::fprintf(stderr, "basalt generate: R4 hit path ON - resident experts are computed on the GPU\n");
+        basalt::log::info("basalt generate", "R4 hit path ON - resident experts are computed on the GPU");
     }
     // ---- the routing trace.  Only meaningful with the pool running, because the ids arrive through the doorbell that
     // the pool consumes - so `--no-pool` is refused rather than silently producing an empty file that would read as
@@ -3801,13 +3796,13 @@ int main(int argc, char** argv) {
     // Refusing is the fix.
     if (o.stage_timing) {
         if (!o.no_capture) {
-            std::fprintf(stderr, "basalt generate: --stage-timing records CUDA events inside the layer path, "
+            basalt::log::error("basalt generate", "--stage-timing records CUDA events inside the layer path, "
                                  "and an event record inside a stream capture is silently dropped. Pass "
-                                 "--no-capture as well.\n");
+                                 "--no-capture as well.");
             return 2;
         }
         if (!basalt::core::stage_timing_enable()) {
-            std::fprintf(stderr, "basalt generate: stage_timing_enable failed\n");
+            basalt::log::error("basalt generate", "stage_timing_enable failed");
             return 1;
         }
         basalt::core::stage_timing_name(0, "gr_read (attn)");
@@ -3831,13 +3826,13 @@ int main(int argc, char** argv) {
     std::FILE* routing = nullptr;
     if (!o.dump_routing.empty()) {
         if (o.no_pool) {
-            std::fprintf(stderr, "basalt generate: --dump-routing needs the expert pool; the routed ids reach "
-                                 "the host through the doorbell the pool reads. Drop --no-pool.\n");
+            basalt::log::error("basalt generate", "--dump-routing needs the expert pool; the routed ids reach "
+                                 "the host through the doorbell the pool reads. Drop --no-pool.");
             return 2;
         }
         routing = std::fopen(o.dump_routing.c_str(), "wb");
         if (routing == nullptr) {
-            std::fprintf(stderr, "basalt generate: cannot write %s\n", o.dump_routing.c_str());
+            basalt::log::error("basalt generate", "cannot write %s", o.dump_routing.c_str());
             return 1;
         }
         drive.routing = routing;
@@ -3867,29 +3862,26 @@ int main(int argc, char** argv) {
     //
     // Refusing is the fix.  `--no-pool` is the explicit way to say "I want the GPU-only floor".
     if (o.no_capture && !o.no_pool) {
-        std::fprintf(stderr,
-                     "basalt generate: --no-capture runs `session_token`, which has NO CPU expert pool hook, so "
+        basalt::log::error("basalt generate", "--no-capture runs `session_token`, which has NO CPU expert pool hook, so "
                      "the routed experts would silently contribute nothing. Pass --no-pool as well if the "
-                     "GPU-only floor is what you want.\n");
+                     "GPU-only floor is what you want.");
         return 2;
     }
     // The ladder is written by `session_loop`, and `session_token` does not touch the staging buffer at all - so
     // accepting the flag there would produce a file of uninitialised memory, which reads as a wrong answer rather
     // than as a mistake.  `--no-capture` without `--no-pool` is already refused above, so this catches the pair.
     if (o.no_capture && !o.dump_layers.empty()) {
-        std::fprintf(stderr,
-                     "basalt generate: --dump-layers is written by `session_loop`; `--no-capture` runs "
-                     "`session_token` instead, which never fills the staging buffer. Drop one of the two.\n");
+        basalt::log::error("basalt generate", "--dump-layers is written by `session_loop`; `--no-capture` runs "
+                     "`session_token` instead, which never fills the staging buffer. Drop one of the two.");
         return 2;
     }
     if (o.no_capture && !o.dump_halves.empty()) {
-        std::fprintf(stderr,
-                     "basalt generate: --dump-halves is CAPTURED into the layer graphs, so it needs the "
-                     "captured path; `--no-capture` never records it. Drop one of the two.\n");
+        basalt::log::error("basalt generate", "--dump-halves is CAPTURED into the layer graphs, so it needs the "
+                     "captured path; `--no-capture` never records it. Drop one of the two.");
         return 2;
     }
 
-    std::fprintf(stderr, "basalt generate: session is up (engine %s)\n", BASALT_VERSION);
+    basalt::log::info("basalt generate", "session is up (engine %s)", BASALT_VERSION);
     auto run_head = [&](void* stream) -> bool {
         if (!native_head.loaded())
             return basalt::core::lm_head(wt, g, ss.block, d_logits, stream, err);
@@ -3898,7 +3890,7 @@ int main(int argc, char** argv) {
     };
     float* d_emb = nullptr;
     if (cudaMalloc(&d_emb, (size_t) g.n_embd * 4) != cudaSuccess) {
-        std::fprintf(stderr, "basalt generate: the embedding buffer failed\n");
+        basalt::log::error("basalt generate", "the embedding buffer failed");
         return 1;
     }
     // **`sample_tokens` TAKES DEVICE POINTERS.**  It is a kernel launch; `logits` and `out` are both read and
@@ -3907,7 +3899,7 @@ int main(int argc, char** argv) {
     // illegal access on a weight plane.  Nothing in the parameter names said device.
     int* d_next = nullptr;
     if (cudaMalloc(&d_next, sizeof(int)) != cudaSuccess) {
-        std::fprintf(stderr, "basalt generate: the sampler output buffer failed\n");
+        basalt::log::error("basalt generate", "the sampler output buffer failed");
         return 1;
     }
 
@@ -3917,7 +3909,7 @@ int main(int argc, char** argv) {
     // broadcast is done directly.  Getting this wrong is invisible for exactly one token.
     auto put_input = [&](int64_t tok, int64_t pos) -> bool {
         if (!basalt::core::embed_row(wt, g, tok, d_emb, main_cs, err)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
+            basalt::log::error("basalt generate", "%s", err.c_str());
             return false;
         }
         if (pos == 0) {
@@ -3926,7 +3918,7 @@ int main(int argc, char** argv) {
             for (int64_t c = 0; c < g.hc; ++c)
                 if (cudaMemcpyAsync(ss.R + (size_t) c * g.n_embd, d_emb, (size_t) g.n_embd * 4,
                                     cudaMemcpyDeviceToDevice, (cudaStream_t) main_cs) != cudaSuccess) {
-                    std::fprintf(stderr, "basalt generate: the residual broadcast failed\n");
+                    basalt::log::error("basalt generate", "the residual broadcast failed");
                     return false;
                 }
         }
@@ -3943,9 +3935,9 @@ int main(int argc, char** argv) {
     // per request instead
     if (!o.serve) {
         if (sp.greedy || sp.temperature <= 0.0f)
-            std::fprintf(stderr, "basalt generate: sampling greedy\n");
+            basalt::log::info("basalt generate", "sampling greedy");
         else
-            std::fprintf(stderr, "basalt generate: sampling temperature=%g top_k=%d top_p=%g seed=%llu\n",
+            basalt::log::info("basalt generate", "sampling temperature=%g top_k=%d top_p=%g seed=%llu",
                          (double) sp.temperature, sp.top_k > 0 && sp.top_k < 64 ? sp.top_k : 64, (double) sp.top_p,
                          (unsigned long long) sp.seed);
     }
@@ -3958,12 +3950,12 @@ int main(int argc, char** argv) {
     const int64_t dump_positions = (int64_t) o.tokens.size() - 1 + o.max_new;
     if (!o.dump_logits.empty()) {
         if (dump_positions > INT32_MAX || n_vocab > INT32_MAX) {
-            std::fprintf(stderr, "basalt generate: logits dump dimensions exceed int32\n");
+            basalt::log::error("basalt generate", "logits dump dimensions exceed int32");
             return 2;
         }
         dump = std::fopen(o.dump_logits.c_str(), "wb");
         if (dump == nullptr) {
-            std::fprintf(stderr, "basalt generate: cannot write %s\n", o.dump_logits.c_str());
+            basalt::log::error("basalt generate", "cannot write %s", o.dump_logits.c_str());
             return 1;
         }
         // THE COUNT IS `n_prompt - 1 + max_new`, NOT `n_prompt + max_new`.  The loop writes one row per position from
@@ -3985,12 +3977,12 @@ int main(int argc, char** argv) {
     if (!o.dump_layers.empty()) {
         layer_dump = std::fopen(o.dump_layers.c_str(), "wb");
         if (layer_dump == nullptr) {
-            std::fprintf(stderr, "basalt generate: cannot write %s\n", o.dump_layers.c_str());
+            basalt::log::error("basalt generate", "cannot write %s", o.dump_layers.c_str());
             return 1;
         }
         if (cudaHostAlloc((void**) &layer_stage, layer_floats * sizeof(float), cudaHostAllocDefault) !=
             cudaSuccess) {
-            std::fprintf(stderr, "basalt generate: cannot pin the layer-dump staging buffer\n");
+            basalt::log::error("basalt generate", "cannot pin the layer-dump staging buffer");
             return 1;
         }
     }
@@ -4028,7 +4020,7 @@ int main(int argc, char** argv) {
         double mix = 0, ffn = 0, post = 0;
         if (!basalt::core::session_replay_stages(g, 0, 0, ss, gr, main_cs, mix, ffn, post, err)) {
             // no per-layer graphs are captured; the serve path times its window's stages
-            std::fprintf(stderr, "basalt generate: %s%s\n", err.c_str(),
+            basalt::log::error("basalt generate", "%s%s", err.c_str(),
                          " - there are no per-layer graphs to replay. The decode window's GPU "
                          "stages are printed per request by the serve path instead: --profile "
                          "--decode-timing with --serve");
@@ -4166,23 +4158,23 @@ int main(int argc, char** argv) {
         basalt::core::doorbell_reset(db);
         // one warm pass so the first launch does not pay for page mapping
         if (!basalt::core::session_replay(g, 0, 0, ss, gr, main_cs, err)) {
-            std::fprintf(stderr, "basalt generate: session_replay warm: %s\n", err.c_str());
+            basalt::log::error("basalt generate", "session_replay warm: %s", err.c_str());
             return 1;
         }
         if (cudaDeviceSynchronize() != cudaSuccess) {
-            std::fprintf(stderr, "basalt generate: session_replay warm faulted\n");
+            basalt::log::error("basalt generate", "session_replay warm faulted");
             return 1;
         }
         const int reps = 20;
         const Clock::time_point t0 = Clock::now();
         for (int r = 0; r < reps; ++r) {
             if (!basalt::core::session_replay(g, 0, 0, ss, gr, main_cs, err)) {
-                std::fprintf(stderr, "basalt generate: session_replay: %s\n", err.c_str());
+                basalt::log::error("basalt generate", "session_replay: %s", err.c_str());
                 return 1;
             }
         }
         if (cudaDeviceSynchronize() != cudaSuccess) {
-            std::fprintf(stderr, "basalt generate: session_replay faulted: %s\n", cudaGetErrorString(cudaGetLastError()));
+            basalt::log::error("basalt generate", "session_replay faulted: %s", cudaGetErrorString(cudaGetLastError()));
             return 1;
         }
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count() / (double) reps;
@@ -4204,22 +4196,22 @@ int main(int argc, char** argv) {
         for (int r = -1; r < reps; ++r) {          // r == -1 is the warm pass, not counted
             const Clock::time_point t0 = Clock::now();
             if (!basalt::core::session_replay_full(g, 0, 0, ss, gr, main_cs, err)) {
-                std::fprintf(stderr, "basalt generate: session_replay_full: %s\n", err.c_str());
+                basalt::log::error("basalt generate", "session_replay_full: %s", err.c_str());
                 return 1;
             }
             // The sync is INSIDE the interval on purpose: it is the wait for the GPU, so t1 - t0 is GPU time.
             if (cudaStreamSynchronize((cudaStream_t) main_cs) != cudaSuccess) {
-                std::fprintf(stderr, "basalt generate: gpu-only-full layers faulted: %s\n",
+                basalt::log::error("basalt generate", "gpu-only-full layers faulted: %s",
                              cudaGetErrorString(cudaGetLastError()));
                 return 1;
             }
             const Clock::time_point t1 = Clock::now();
             if (!run_head(main_cs)) {
-                std::fprintf(stderr, "basalt generate: gpu-only-full lm_head: %s\n", err.c_str());
+                basalt::log::error("basalt generate", "gpu-only-full lm_head: %s", err.c_str());
                 return 1;
             }
             if (cudaStreamSynchronize((cudaStream_t) main_cs) != cudaSuccess) {
-                std::fprintf(stderr, "basalt generate: gpu-only-full head faulted: %s\n",
+                basalt::log::error("basalt generate", "gpu-only-full head faulted: %s",
                              cudaGetErrorString(cudaGetLastError()));
                 return 1;
             }
@@ -4289,7 +4281,7 @@ int main(int argc, char** argv) {
         if (cudaMalloc((void**) &d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_count, sizeof(int32_t)) != cudaSuccess ||
             res_put(d_res) != cudaSuccess) {
-            std::fprintf(stderr, "basalt generate: the device residency table could not be staged\n");
+            basalt::log::error("basalt generate", "the device residency table could not be staged");
             return 1;
         }
         thits.d_res = d_res;
@@ -4304,7 +4296,7 @@ int main(int argc, char** argv) {
                 if (host_res[i] != basalt::core::kNotResident)
                     released += srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
             if (released > 0)
-                std::fprintf(stderr, "basalt generate: expert arena: %.2f GiB of VRAM-held experts handed back to the OS\n",
+                basalt::log::info("basalt generate", "expert arena: %.2f GiB of VRAM-held experts handed back to the OS",
                              (double) released / (1024.0 * 1024.0 * 1024.0));
             int64_t pf = 0;
             for (size_t i = 0; i < host_res.size(); ++i)
@@ -4319,7 +4311,7 @@ int main(int argc, char** argv) {
             if (cudaMalloc((void**) &st->d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
                 res_put(st->d_res) !=
                     cudaSuccess) {
-                std::fprintf(stderr, "basalt generate: layer split: CUDA%d residency table failed\n", st->dev);
+                basalt::log::error("basalt generate", "layer split: CUDA%d residency table failed", st->dev);
                 return 1;
             }
         }
@@ -4333,7 +4325,7 @@ int main(int argc, char** argv) {
         thits.scratch = drive.d.hit_scratch;
         thits.hit_out = drive.d.hit_out;
         drive.d.host_res = host_res.data();
-        std::fprintf(stderr, "basalt generate: token graph hit path: %lld resident experts, decided on the device\n",
+        basalt::log::info("basalt generate", "token graph hit path: %lld resident experts, decided on the device",
                      (long long) resident);
     }
 
@@ -4457,11 +4449,11 @@ int main(int argc, char** argv) {
         const auto tp0 = Clock::now();
         if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, o.peer_reserve_mib, o.peer_slots,
                        err, exclusive)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
+            basalt::log::error("basalt generate", "%s", err.c_str());
             return false;
         }
-        std::fprintf(stderr, "basalt generate: peer GPU %d: %lld experts, %.2f GiB (filled in %.1f s); with the primary's "
-                             "%lld that is %lld of %lld on the GPUs\n", o.peer_device, (long long) peer.resident(), peer.gib(),
+        basalt::log::info("basalt generate", "peer GPU %d: %lld experts, %.2f GiB (filled in %.1f s); with the primary's "
+                             "%lld that is %lld of %lld on the GPUs", o.peer_device, (long long) peer.resident(), peer.gib(),
                      std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) xcache.slots(),
                      (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
         return true;
@@ -4567,19 +4559,19 @@ int main(int argc, char** argv) {
         if (!line.empty()) {
             // the server reads the engine's status lines on stdout
             if (o.serve) { std::printf("%s\n", line.c_str()); std::fflush(stdout); }
-            else std::fprintf(stderr, "basalt generate: %s\n", line.c_str());
+            else basalt::log::info("basalt generate", "%s", line.c_str());
         }
         auto& pool = pool_store.emplace(plan.pool_workers, affinity);
         if (pool.is_hybrid() && pool.affinity() != cpu::PoolAffinity::All) {
             const char* aff_str = pool.affinity() == cpu::PoolAffinity::PCores ? "p-cores" : "auto";
-            std::fprintf(stderr, "basalt generate: hybrid CPU detected (%d P-cores / %d threads, %d E-cores), pool workers: %d, affinity: %s\n",
+            basalt::log::info("basalt generate", "hybrid CPU detected (%d P-cores / %d threads, %d E-cores), pool workers: %d, affinity: %s",
                          pool.p_cores(), pool.p_threads(), pool.e_cores(), pool.workers(), aff_str);
         }
         char quota_note[64] = "";
         if (plan.pool_workers_src == bp::AutoSource::Auto && in.cpu_quota > 0 &&
             plan.pool_workers == (std::max)(1, (int) in.cpu_quota - 1))
             std::snprintf(quota_note, sizeof quota_note, " (quota %.2f CPUs)", in.cpu_quota);
-        std::fprintf(stderr, "basalt generate: %d expert-pool workers%s + the host thread%s\n", pool.workers(), quota_note,
+        basalt::log::info("basalt generate", "%d expert-pool workers%s + the host thread%s", pool.workers(), quota_note,
                      o.no_pool ? " (UNUSED: --no-pool)" : "");
         drive.d.pool = &pool;
     }
@@ -4636,8 +4628,8 @@ int main(int argc, char** argv) {
                         gib_text(safe));
                 }
                 resident_headroom = std::max(resident_headroom, ram_floor_bytes + late);
-                std::fprintf(stderr, "basalt generate: RAM floor %.1f GiB (%.1f margin + %.1f cache), %.1f GiB "
-                                     "experts on SSD, RAM copy <= %.1f of %.1f GiB\n",
+                basalt::log::info("basalt generate", "RAM floor %.1f GiB (%.1f margin + %.1f cache), %.1f GiB "
+                                     "experts on SSD, RAM copy <= %.1f of %.1f GiB",
                              (double) ram_floor_bytes / kGiB, (double) margin / kGiB,
                              (double) (ram_floor_bytes - margin) / kGiB, (double) file_bytes / kGiB,
                              (double) (o.resident_budget > 0 ? std::min(o.resident_budget, safe) : safe) / kGiB,
@@ -4655,8 +4647,8 @@ int main(int argc, char** argv) {
             resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, peer_only, -1, resident_headroom,
                                                    basalt::core::FileExpertSource::kResidentWhatFits, &profile);
             if (resident_ok) {
-                std::fprintf(stderr, "basalt generate: the whole complement does not fit in RAM (%s); the hottest %.2f GiB "
-                                     "are kept in RAM\n", whole_err.c_str(), (double) src.resident_bytes() / 1073741824.0);
+                basalt::log::warn("basalt generate", "the whole complement does not fit in RAM (%s); the hottest %.2f GiB "
+                                     "are kept in RAM", whole_err.c_str(), (double) src.resident_bytes() / 1073741824.0);
             }
             else
                 err = whole_err + "; " + err;
@@ -4675,25 +4667,25 @@ int main(int argc, char** argv) {
             if (o.serve) basalt::platform::watch_resident_ram(true, src.resident_bytes());
             if (o.adapt_every > 0 && o.adapt_swaps > 0 && !adapt_fast_on &&
                 !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
-                std::fprintf(stderr, "basalt error: CPU expert residency: %s\n", err.c_str());
+                basalt::log::error("basalt", "CPU expert residency: %s", err.c_str());
                 return 1;
             }
-            std::fprintf(stderr, "basalt generate: resident RAM mode: %.2f GiB of experts in RAM (%s), %lld in the GPU "
-                                 "cache; adaptive swaps %s\n",
+            basalt::log::info("basalt generate", "resident RAM mode: %.2f GiB of experts in RAM (%s), %lld in the GPU "
+                                 "cache; adaptive swaps %s",
                          (double) src.resident_bytes() / 1073741824.0,
                          src.complement_pinned() ? "page-locked" : src.locked_bytes() > 0 ? "locked" : "pageable",
                          (long long) xcache.resident(),
                          o.adapt_every > 0 && o.adapt_swaps > 0 ? "exchange them with the GPU cache (no file reads)"
                                                                 : "off");
         } else if (o.resident_soft) {
-            std::fprintf(stderr, "basalt generate: the resident RAM mode does not fit (%s)\n", err.c_str());
+            basalt::log::warn("basalt generate", "the resident RAM mode does not fit (%s)", err.c_str());
         } else if (o.resident_budget > 0) {
             // a RAM budget that cannot be kept is not a reason to stop - the experts it would have held are read from
             // the files like the ones outside it (pin_cache_complement leaves nothing half-built)
-            std::fprintf(stderr, "basalt generate: the RAM budget (--resident-budget-gib) cannot be kept (%s)\n",
+            basalt::log::warn("basalt generate", "the RAM budget (--resident-budget-gib) cannot be kept (%s)",
                          err.c_str());
         } else {
-            std::fprintf(stderr, "basalt generate: CPU expert residency: %s\n", err.c_str());
+            basalt::log::error("basalt generate", "CPU expert residency: %s", err.c_str());
             return 1;
         }
     }
@@ -4739,8 +4731,8 @@ int main(int argc, char** argv) {
         // RAM is the loaded copy (the bytes the loader reports); the top-up added after the load is shown beside it
         char top[48] = "";
         if (b_top > 0) std::snprintf(top, sizeof top, " + %.1f GiB topped up", (double) b_top / kGiB);
-        std::fprintf(stderr, "basalt generate: experts live in VRAM %.1f GiB (%.0f%%), peer GPU %.1f GiB (%.0f%%), RAM "
-                             "%.1f GiB%s (%.0f%%), file (SSD) %.1f GiB (%.0f%%); %.1f GiB in all\n",
+        basalt::log::info("basalt generate", "experts live in VRAM %.1f GiB (%.0f%%), peer GPU %.1f GiB (%.0f%%), RAM "
+                             "%.1f GiB%s (%.0f%%), file (SSD) %.1f GiB (%.0f%%); %.1f GiB in all",
                      (double) b_vram / kGiB, pct(b_vram), (double) b_peer / kGiB, pct(b_peer), (double) b_ram / kGiB, top,
                      pct(b_ram + b_top), (double) b_file / kGiB, pct(b_file), total / kGiB);
         // The file holds the coldest experts (the tiers fill in profile order), so its share of the bytes is well above
@@ -4751,17 +4743,17 @@ int main(int argc, char** argv) {
         if (o.peer_device < 1) levers += ", a second GPU as the peer tier (--peer-device)";
         if (o.batch > 1) levers += ", fewer --parallel slots or no --slot-full-context (the slots hold " +
                                    std::to_string((slot_kv_cuda0 + (1u << 29)) >> 30) + " GiB of KV beyond the solo one)";
-        std::fprintf(stderr, "basalt warning: %.0f%% of the experts (%.1f GiB) are only in the file: decode reads them "
-                             "from the SSD and may be much slower. To fit them: %s\n",
+        basalt::log::warn("basalt", "%.0f%% of the experts (%.1f GiB) are only in the file: decode reads them "
+                             "from the SSD and may be much slower. To fit them: %s",
                      pct(b_file), (double) b_file / kGiB, levers.c_str());
     };
     if (!o.serve) report_expert_tiers();
     if (o.serve) {
         if ((!no_spec && (o.spec < 2 || o.mtp.empty())) || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
-            std::fprintf(stderr, "basalt serve: needs --spec T (0 for none; T >= 2 also needs the model's draft layer) "
+            basalt::log::error("basalt serve", "needs --spec T (0 for none; T >= 2 also needs the model's draft layer) "
                                  "and --prefill CHUNK (and a fillable "
-                                 "--expert-cache; the graphed hit path additionally needs an expert profile)\n");
+                                 "--expert-cache; the graphed hit path additionally needs an expert profile)");
             return 2;
         }
         basalt::prefill::Prefill sp;
@@ -4861,15 +4853,15 @@ int main(int argc, char** argv) {
                     }
                     const std::string pct =
                         o.prefill_auto ? ", and lend at most " + std::to_string(kAutoLendPct) + "%" : "";
-                    std::fprintf(stderr, "basalt serve: WARNING: prompt chunk %lld tokens, not %lld: CUDA%d (%s) "
+                    basalt::log::warn("basalt serve", "prompt chunk %lld tokens, not %lld: CUDA%d (%s) "
                                          "has %lld expert-cache slots, and a %lld-token chunk borrows %lld of them "
-                                         "(it must keep 128%s) - prompts read slower than on CUDA0 alone\n",
+                                         "(it must keep 128%s) - prompts read slower than on CUDA0 alone",
                                  (long long) chunk, (long long) alone, dev, prop.name,
                                  (long long) p.cache->slots(), (long long) alone,
                                  (long long) part_slots(p, alone), pct.c_str());
                     // the helper tiers start at CUDA1 without a split (and are enabled in order)
-                    std::fprintf(stderr, "basalt serve:   a card this small can serve as a helper expert cache "
-                                         "instead of a split stage: without --layer-split, with %s\n",
+                    basalt::log::info("basalt serve", "  a card this small can serve as a helper expert cache "
+                                         "instead of a split stage: without --layer-split, with %s",
                                  dev == 1 ? "--expert-cache-device1 N" : "--expert-cache-device1..3 N, in order");
                 }
             }
@@ -4877,12 +4869,12 @@ int main(int argc, char** argv) {
                 if (o.prefill_auto)
                     // the RESOLVED ring: a chunk under stream_all_min() gets STAGE.  This is what `init` lays out,
                     // and what the INFO line reports to the Monitor tab.
-                    std::fprintf(stderr, "basalt serve: prompt chunk auto: %lld tokens, a %lld-slot ring\n",
+                    basalt::log::info("basalt serve", "prompt chunk auto: %lld tokens, a %lld-slot ring",
                                  (long long) chunk,
                                  (long long) basalt::prefill::Prefill::ring_slots_for(chunk));
                 else if (chunk != o.prefill_chunk)
-                    std::fprintf(stderr, "basalt serve: prompt chunk %lld -> %lld tokens so its buffers fit in "
-                                         "every expert cache\n", (long long) o.prefill_chunk, (long long) chunk);
+                    basalt::log::info("basalt serve", "prompt chunk %lld -> %lld tokens so its buffers fit in "
+                                         "every expert cache", (long long) o.prefill_chunk, (long long) chunk);
                 o.prefill_chunk = chunk;
                 for (PfPart& p : pf_parts) {
                     p.first = (int32_t) (p.cache->slots() - part_slots(p, chunk));
@@ -4900,8 +4892,8 @@ int main(int argc, char** argv) {
                         if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); continue; }
                         const uint64_t need = basalt::prefill::Prefill::bytes_needed(g, *p.ses, chunk);
                         if ((uint64_t) fb >= need + (3ull << 29)) {
-                            std::fprintf(stderr, "basalt serve:   CUDA%d keeps its own prompt buffers (%.2f GiB of "
-                                                 "%.2f GiB free): no loan\n", p.dev < 0 ? 0 : p.dev,
+                            basalt::log::info("basalt serve", "  CUDA%d keeps its own prompt buffers (%.2f GiB of "
+                                                 "%.2f GiB free): no loan", p.dev < 0 ? 0 : p.dev,
                                          (double) need / 1073741824.0, (double) fb / 1073741824.0);
                             p.first = -1;
                             p.first_now = -1;
@@ -4918,11 +4910,11 @@ int main(int argc, char** argv) {
                 // here and so do we, rather than refusing to start - but say what every stage has, because a split
                 // stage that has to allocate these on top of a cache that already filled its VRAM will not fit,
                 // and `init` would otherwise report only that the buffers do not fit.
-                std::fprintf(stderr, "basalt serve: no stage can lend the prompt path its %lld-token buffers, so "
-                                     "each stage allocates its own:\n", (long long) o.prefill_chunk);
+                basalt::log::info("basalt serve", "no stage can lend the prompt path its %lld-token buffers, so "
+                                     "each stage allocates its own:", (long long) o.prefill_chunk);
                 for (const PfPart& p : pf_parts)
-                    std::fprintf(stderr, "basalt serve:   CUDA%d has %lld slots, and a %lld-token chunk needs "
-                                         "the last %lld of them\n", p.dev < 0 ? 0 : p.dev,
+                    basalt::log::info("basalt serve", "  CUDA%d has %lld slots, and a %lld-token chunk needs "
+                                         "the last %lld of them", p.dev < 0 ? 0 : p.dev,
                                  (long long) p.cache->slots(), (long long) o.prefill_chunk,
                                  (long long) part_slots(p, o.prefill_chunk));
             }
@@ -4933,15 +4925,15 @@ int main(int argc, char** argv) {
         for (size_t i = 1; i < pf_parts.size(); ++i) any_loan = any_loan || pf_parts[i].first >= 0;
         if (any_loan) {
             if (borrow != nullptr)
-                std::fprintf(stderr, "basalt serve: the prompt path borrows %lld CUDA0 cache slots (%.2f GiB)\n",
+                basalt::log::info("basalt serve", "the prompt path borrows %lld CUDA0 cache slots (%.2f GiB)",
                              (long long) (xcache.slots() - lend_first), (double) borrow_bytes / 1073741824.0);
             for (size_t i = 1; i < pf_parts.size(); ++i)   // one loan per stage, from that stage's own cache
-                if (pf_parts[i].first >= 0) std::fprintf(stderr, "basalt serve:   CUDA%d prompt path borrows %lld of its %lld slots (%.2f GiB)\n",
+                if (pf_parts[i].first >= 0) basalt::log::info("basalt serve", "  CUDA%d prompt path borrows %lld of its %lld slots (%.2f GiB)",
                              pf_parts[i].dev, (long long) (pf_parts[i].cache->slots() - pf_parts[i].first),
                              (long long) pf_parts[i].cache->slots(),
                              (double) part_bytes(pf_parts[i], pf_parts[i].first) / 1073741824.0);
         } else {
-            std::fprintf(stderr, "basalt serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
+            basalt::log::info("basalt serve", "the prompt path allocates its own buffers (too few cache slots to borrow)");
         }
         // layer split across GPUs: a prompt path per stage, each handing its chunk's rows to the next.
         // THE CHUNK STEPS DOWN INSTEAD OF EXITING.  A split's stage caches are sized after the arena is registered, and
@@ -5004,8 +4996,8 @@ int main(int argc, char** argv) {
                     if (s < o.prefill_chunk && own_fits(s, d2, n2, f2)) { c = s; break; }
                 }
                 if (c > 0) {
-                    std::fprintf(stderr, "basalt serve: a %lld-token chunk's prompt buffers need %lld MiB on CUDA%d, "
-                                         "%lld MiB free: %lld-token chunks\n", (long long) o.prefill_chunk,
+                    basalt::log::warn("basalt serve", "a %lld-token chunk's prompt buffers need %lld MiB on CUDA%d, "
+                                         "%lld MiB free: %lld-token chunks", (long long) o.prefill_chunk,
                                  (long long) (need >> 20), dev, (long long) (fb >> 20), (long long) c);
                     o.prefill_chunk = c;
                 }
@@ -5018,7 +5010,7 @@ int main(int argc, char** argv) {
             for (const int64_t c : kStepChunks)
                 if (c < o.prefill_chunk) { next = c; break; }
             if (r == 2 && next > 0) {
-                std::fprintf(stderr, "basalt serve: %s: trying a %lld-token chunk\n", err.c_str(), (long long) next);
+                basalt::log::warn("basalt serve", "%s: trying a %lld-token chunk", err.c_str(), (long long) next);
                 // start the prompt paths over (a failed init may hold buffers), and consume the failed allocation's
                 // error: it is sticky, and the next launch check would report "out of memory" for a kernel
                 for (auto& stp : stages) {
@@ -5042,18 +5034,18 @@ int main(int argc, char** argv) {
                 err.clear();
                 continue;
             }
-            std::fprintf(stderr, "basalt serve: %s\n", err.c_str());
+            basalt::log::error("basalt serve", "%s", err.c_str());
             if (err.find("fit") != std::string::npos)   // say what frees VRAM
-                std::fprintf(stderr, "basalt serve: the GPU has too little free VRAM for the prompt path: move images "
+                basalt::log::error("basalt serve", "the GPU has too little free VRAM for the prompt path: move images "
                                      "to the CPU (--vision cpu) or off, close other programs using the GPU, use a shorter "
-                                     "context, or read prompts in smaller chunks (--prefill 512)\n");
+                                     "context, or read prompts in smaller chunks (--prefill 512)");
             return 1;
         }
         if (peer.valid() && o.peer_exclusive) sp.set_ring_peer(&peer);
         if (peer.valid() && o.peer_prefill_rows != 0) {
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
             if (!sp.set_peer(&peer, rows, err)) {
-                std::fprintf(stderr, "basalt serve: %s - the prompt path stays on the primary GPU\n", err.c_str());
+                basalt::log::warn("basalt serve", "%s - the prompt path stays on the primary GPU", err.c_str());
                 err.clear();
             }
         }
@@ -5067,7 +5059,7 @@ int main(int argc, char** argv) {
         std::vector<int32_t> hist_stage(kHistSlots, -1);
         const int hist_dev = last_st ? last_st->dev : -1;   // with the head: the last stage's device
         if (const basalt::core::OnDevice on_h(hist_dev); cudaMalloc(&d_hist, kHistSlots * sizeof(int32_t)) != cudaSuccess) {
-            std::fprintf(stderr, "basalt serve: the penalty-history allocation failed\n");
+            basalt::log::error("basalt serve", "the penalty-history allocation failed");
             return 1;
         }
         basalt::core::Verifier ver;
@@ -5096,7 +5088,7 @@ int main(int argc, char** argv) {
                 float* hh = nullptr;
                 if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
                     cudaHostGetDevicePointer((void**) &h, hh, 0) != cudaSuccess) {
-                    std::fprintf(stderr, "basalt serve: the layer-split hand-off allocation failed\n");
+                    basalt::log::error("basalt serve", "the layer-split hand-off allocation failed");
                     return 1;
                 }
                 std::memset(hh, 0, hb);
@@ -5132,7 +5124,7 @@ int main(int argc, char** argv) {
                     split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
                 }
                 if (!ok_s) {
-                    std::fprintf(stderr, "basalt serve: layer split, stage %d: %s\n", st + 1, err.c_str());
+                    basalt::log::error("basalt serve", "layer split, stage %d: %s", st + 1, err.c_str());
                     return 1;
                 }
             }
@@ -5141,7 +5133,7 @@ int main(int argc, char** argv) {
             for (int st = 1; st < n_stages; ++st)
                 plan_s += ", " + std::to_string(split_at[(size_t) st - 1]) + "-" + std::to_string(split_drive.end[st] - 1) +
                           " (CUDA" + std::to_string(split_same ? 0 : stages[(size_t) st - 1]->dev) + ")";
-            std::fprintf(stderr, "basalt serve: layer split: layers %s, one hand-off per window\n", plan_s.c_str());
+            basalt::log::info("basalt serve", "layer split: layers %s, one hand-off per window", plan_s.c_str());
         }
         ver.set_remote_expert_opt(remote_opt.get());
         ver.set_main_priority(o.batch > 0);   // beside a prompt read the slots' windows must win the SMs
@@ -5149,7 +5141,7 @@ int main(int argc, char** argv) {
         ver.set_cpu_warm(drive.d.pool, drive.d.src);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err) ||
             (mtp_on && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err))) {
-            std::fprintf(stderr, "basalt serve: %s\n", err.c_str());
+            basalt::log::error("basalt serve", "%s", err.c_str());
             return 1;
         }
         // each stage's verifier gets its stage's slot sessions
@@ -5160,7 +5152,7 @@ int main(int argc, char** argv) {
                 basalt::core::Verifier& vk = k == 0 ? ver : stages[k - 1]->ver;
                 const basalt::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (!vk.init_slots(ptrs, err)) {
-                    std::fprintf(stderr, "basalt serve: --batch, stage %zu: %s\n", k + 1, err.c_str());
+                    basalt::log::error("basalt serve", "--batch, stage %zu: %s", k + 1, err.c_str());
                     return 1;
                 }
             }
@@ -5198,7 +5190,7 @@ int main(int argc, char** argv) {
             if (o.prompt_cache > 0 && !multi_gpu) {
                 std::string ce;
                 if (!ckd.reserve(zw.gdn, ce))
-                    std::fprintf(stderr, "basalt serve: deferred checkpoint copy off: %s\n", ce.c_str());
+                    basalt::log::warn("basalt serve", "deferred checkpoint copy off: %s", ce.c_str());
             }
         }
         // finishes the in-flight host copy; a failed one drops its checkpoint
@@ -5207,7 +5199,7 @@ int main(int argc, char** argv) {
             if (dst == nullptr) return;
             std::string ce;
             if (ckd.finish(ce)) return;
-            std::fprintf(stderr, "basalt serve: %s\n", ce.c_str());
+            basalt::log::error("basalt serve", "%s", ce.c_str());
             checks.erase(std::remove_if(checks.begin(), checks.end(),
                                         [&](const ConvCheckpoint& k) { return k.gdn.data() == dst; }), checks.end());
         };
@@ -5228,8 +5220,8 @@ int main(int argc, char** argv) {
             // before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold nothing
             // the outgoing chain does not, apart from the tail this conversation rewrote)
             if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
-                std::fprintf(stderr, "basalt serve: conversation cache: dropped %zu superseded cop%s of this "
-                             "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
+                basalt::log::info("basalt serve", "conversation cache: dropped %zu superseded cop%s of this "
+                             "conversation; parked=%zu", dropped, dropped == 1 ? "y" : "ies", conversations.size());
             // A layer split parks one image per stage: the first stage's (with the draft layer's K/V) and one per
             // later stage (without it - the draft ring is saved once).  The checkpoints are MOVED apart into their
             // stage parts for the capture and put back together whichever way this ends (no running state copied).
@@ -5257,7 +5249,7 @@ int main(int argc, char** argv) {
                 const basalt::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
                 size_t b = 0;
                 if (!basalt::core::conversation_snapshot_bytes(view_k, st->ss, g, draft_of(k), b, err)) {
-                    std::fprintf(stderr, "basalt serve: conversation cache: skip parking (stage CUDA%d: %s)\n",
+                    basalt::log::warn("basalt serve", "conversation cache: skip parking (stage CUDA%d: %s)",
                                  st->dev, err.c_str());
                     err.clear();
                     return true;
@@ -5277,7 +5269,7 @@ int main(int argc, char** argv) {
             }
             size_t estimate = 0;
             if (!basalt::core::conversation_snapshot_bytes(view, *rsp, g, draft0, estimate, err)) {
-                std::fprintf(stderr, "basalt serve: conversation cache: skip parking (%s)\n", err.c_str());
+                basalt::log::warn("basalt serve", "conversation cache: skip parking (%s)", err.c_str());
                 err.clear(); // A recoverable miss must not poison the batched draft prefill's error channel.
                 return true;
             }
@@ -5296,7 +5288,7 @@ int main(int argc, char** argv) {
             // capacity and directories, and put() charges that same true size -
             // a capped figure would under-evict and overfill the budget.
             if (!conversations.make_room(estimate, held)) {
-                std::fprintf(stderr, "basalt serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
+                basalt::log::info("basalt serve", "conversation cache: skip parking (snapshot %zu MiB exceeds available budget)",
                              estimate >> 20);
                 return true;
             }
@@ -5307,7 +5299,7 @@ int main(int argc, char** argv) {
                 const size_t additional = estimate > retained ? estimate - retained : 0;
                 if (!basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(),
                         additional, floor)) {
-                    std::fprintf(stderr, "basalt serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, or telemetry unavailable)\n",
+                    basalt::log::info("basalt serve", "conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, or telemetry unavailable)",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib);
                     return true;
                 }
@@ -5327,19 +5319,19 @@ int main(int argc, char** argv) {
                     image.stage_images.push_back(std::move(part));
                 }
                 if (!basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), 0, floor)) {
-                    std::fprintf(stderr, "basalt serve: conversation cache: skip parking (physical RAM floor after capture, or telemetry unavailable)\n");
+                    basalt::log::info("basalt serve", "conversation cache: skip parking (physical RAM floor after capture, or telemetry unavailable)");
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
                 const bool stored = conversations.put(std::move(image), held);
-                std::fprintf(stderr, "basalt serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
+                basalt::log::info("basalt serve", "conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu",
                              stored ? "parked" : "skipped", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes);
             } catch (const std::bad_alloc&) {
                 // The active state has not been touched. Continue with normal
                 // prompt processing rather than killing a serving process.
-                std::fprintf(stderr, "basalt serve: conversation cache: allocation failed; skip parking\n");
+                basalt::log::warn("basalt serve", "conversation cache: allocation failed; skip parking");
             }
             return true;
         };
@@ -5396,7 +5388,7 @@ int main(int argc, char** argv) {
                 if (!gpu_sync_ok()) return false;
                 std::string ce;
                 if (defer && stages.empty()) {
-                    if (!ckd.save(c, *rsp, g, ce)) { std::fprintf(stderr, "basalt serve: checkpoint save: %s\n", ce.c_str()); return false; }
+                    if (!ckd.save(c, *rsp, g, ce)) { basalt::log::error("basalt serve", "checkpoint save: %s", ce.c_str()); return false; }
                 } else if (!checkpoint_save(c, *rsp, g)) return false;
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
                     const basalt::core::OnDevice on(st->dev);
@@ -5501,15 +5493,15 @@ int main(int argc, char** argv) {
         std::vector<double> heat;
         if (!o.expert_profile_save.empty() && !all_experts_resident) {
             if (drive.d.usage.empty() || host_res.empty())
-                std::fprintf(stderr, "basalt serve: --expert-profile-save needs the adaptive tier (--adapt-every and "
-                                     "--adapt-swaps above 0) and an expert profile: nothing will be saved\n");
+                basalt::log::warn("basalt serve", "--expert-profile-save needs the adaptive tier (--adapt-every and "
+                                     "--adapt-swaps above 0) and an expert profile: nothing will be saved");
             else
                 heat.assign(drive.d.usage.size(), 0.0);
         }
         Clock::time_point profile_saved_at = Clock::now();
         cudaStream_t adapt_stream = nullptr;
         if (cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
-            std::fprintf(stderr, "basalt serve: cannot create the refill stream\n");
+            basalt::log::error("basalt serve", "cannot create the refill stream");
             return 1;
         }
         // swaps in flight - (residency index, slot) admitted when adapt_ev has completed
@@ -5554,7 +5546,7 @@ int main(int argc, char** argv) {
             for (const auto& p : promoted) {
                 std::string perr;
                 if (!peer.reassign(p[0], p[1], p[2], srcp->blob(p[0], p[2]), perr))
-                    std::fprintf(stderr, "basalt serve: %s\n", perr.c_str());
+                    basalt::log::error("basalt serve", "%s", perr.c_str());
             }
             promoted.clear();
         };
@@ -5630,7 +5622,7 @@ int main(int argc, char** argv) {
                     cudaMemcpyAsync(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
                                     (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(s.layer),
                                     cudaMemcpyHostToDevice, gs ? gs->adapt_stream : adapt_stream) != cudaSuccess) {
-                    std::fprintf(stderr, "basalt serve: adaptive swap copy failed (layer %d, slot %d): %s\n",
+                    basalt::log::error("basalt serve", "adaptive swap copy failed (layer %d, slot %d): %s",
                                  (int) s.layer, (int) slot, cudaGetErrorString(cudaGetLastError()));
                     return false;
                 }
@@ -5657,7 +5649,7 @@ int main(int argc, char** argv) {
                 std::string perr;
                 if (!peer.adapt(drive.d.usage.data(), r0.data(),
                                 o.peer_adapt_swaps >= 0 ? o.peer_adapt_swaps : o.adapt_swaps, perr)) {
-                    std::fprintf(stderr, "basalt serve: %s\n", perr.c_str());
+                    basalt::log::error("basalt serve", "%s", perr.c_str());
                     return false;
                 }
             }
@@ -5725,7 +5717,7 @@ int main(int argc, char** argv) {
                     if (dst == nullptr) { ++n_noplace; return true; }   // no free place: a later round
                     if (cudaMemcpyAsync(dst, xcache.device_slot(slot), (size_t) lay.blob_bytes(s.layer),
                                         cudaMemcpyDeviceToHost, adapt_stream) != cudaSuccess) {
-                        std::fprintf(stderr, "basalt serve: an eviction copy failed (layer %d, slot %d): %s\n",
+                        basalt::log::error("basalt serve", "an eviction copy failed (layer %d, slot %d): %s",
                                      (int) s.layer, (int) slot, cudaGetErrorString(cudaGetLastError()));
                         return false;
                     }
@@ -5746,7 +5738,7 @@ int main(int argc, char** argv) {
                 std::string perr;
                 if (!peer.adapt(drive.d.usage.data(), r0.data(),
                                 o.peer_adapt_swaps >= 0 ? o.peer_adapt_swaps : o.adapt_swaps, perr)) {
-                    std::fprintf(stderr, "basalt serve: %s\n", perr.c_str());
+                    basalt::log::error("basalt serve", "%s", perr.c_str());
                     return false;
                 }
                 if (swaps.size() > n_base) peer_takes = peer.incoming();
@@ -5772,7 +5764,7 @@ int main(int argc, char** argv) {
             if (xq_stage == 1) {
                 for (const XSwap& x : xq) {
                     if (x.xchg && !src.spare_land(x.layer, x.out, x.off)) {
-                        std::fprintf(stderr, "basalt serve: an evicted expert has no RAM place (layer %d, expert %d)\n",
+                        basalt::log::error("basalt serve", "an evicted expert has no RAM place (layer %d, expert %d)",
                                      (int) x.layer, (int) x.out);
                         return false;
                     }
@@ -5780,7 +5772,7 @@ int main(int argc, char** argv) {
                 }
                 {   // the residency uploads go ahead of the incoming copies in the copy queue
                     std::string perr;
-                    if (!ver.dm_presync(perr)) std::fprintf(stderr, "basalt serve: %s\n", perr.c_str());
+                    if (!ver.dm_presync(perr)) basalt::log::error("basalt serve", "%s", perr.c_str());
                     res_upload();
                     ver.dm_fence(adapt_stream);
                 }
@@ -5789,7 +5781,7 @@ int main(int argc, char** argv) {
                     std::string perr;
                     if (x.p2p) {
                         if (!peer.copy_to(x.layer, x.in, xcache.device_slot(x.slot), adapt_stream, perr)) {
-                            std::fprintf(stderr, "basalt serve: %s\n", perr.c_str());
+                            basalt::log::error("basalt serve", "%s", perr.c_str());
                             return false;
                         }
                         continue;
@@ -5804,7 +5796,7 @@ int main(int argc, char** argv) {
                             const uint8_t* b = srcp->blob(x.layer, x.in);
                             if (b == nullptr || cudaMemcpyAsync(xcache.device_slot(x.slot), b, (size_t) lay2.blob_bytes(x.layer),
                                                                 cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess)
-                                std::fprintf(stderr, "basalt serve: adaptive swap copy failed (layer %d, slot %d): %s\n",
+                                basalt::log::error("basalt serve", "adaptive swap copy failed (layer %d, slot %d): %s",
                                              (int) x.layer, (int) x.slot, cudaGetErrorString(cudaGetLastError()));
                         }
                         cudaEventRecord(adapt_ev, adapt_stream);
@@ -5825,7 +5817,7 @@ int main(int argc, char** argv) {
                 if (!x.promo) continue;
                 std::string perr;
                 if (!peer.reassign(x.layer, x.in, x.out, srcp->blob(x.layer, x.out), perr))
-                    std::fprintf(stderr, "basalt serve: %s\n", perr.c_str());
+                    basalt::log::error("basalt serve", "%s", perr.c_str());
             }
             xq.clear();
             xq_stage = 0;
@@ -5847,10 +5839,10 @@ int main(int argc, char** argv) {
             const auto ranked = basalt::core::rank_learned_profile(g.n_layers, g.n_expert, resident, heat,
                                                                    profile_loaded);
             if (basalt::core::write_expert_profile(o.expert_profile_save, g.n_layers, g.n_expert, ranked, e))
-                std::fprintf(stderr, "basalt serve: expert profile saved to %s (%s)\n", o.expert_profile_save.c_str(),
+                basalt::log::info("basalt serve", "expert profile saved to %s (%s)", o.expert_profile_save.c_str(),
                              why);
             else
-                std::fprintf(stderr, "basalt serve: the expert profile was not saved: %s\n", e.c_str());
+                basalt::log::error("basalt serve", "the expert profile was not saved: %s", e.c_str());
             profile_saved_at = Clock::now();
         };
         // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
@@ -6016,10 +6008,10 @@ int main(int argc, char** argv) {
             cudaMemGetInfo(&free_b, &total_b);
             const int64_t free_mib = (int64_t) (free_b >> 20);
             if (free_mib >= kVramStallMib) {
-                std::fprintf(stderr, "basalt serve: %lld MiB of VRAM free with everything loaded\n", (long long) free_mib);
+                basalt::log::info("basalt serve", "%lld MiB of VRAM free with everything loaded", (long long) free_mib);
             } else {
-                std::fprintf(stderr, "basalt warning: only %lld MiB of VRAM free, requests may stall; close other "
-                                     "programs that use the GPU\n", (long long) free_mib);
+                basalt::log::warn("basalt", "only %lld MiB of VRAM free, requests may stall; close other "
+                                     "programs that use the GPU", (long long) free_mib);
             }
         }
         // what the server's Monitor tab shows (the server skips unknown lines until READY)
@@ -6097,12 +6089,11 @@ int main(int argc, char** argv) {
                         const uint64_t b = p.beats.load();
                         if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; continue; }
                         if (now - since < std::chrono::seconds(limit)) continue;
-                        std::fprintf(stderr, "basalt serve: no progress for %d s during a request (%s) - stopping "
-                                             "the engine so the server starts it again\n",
+                        basalt::log::error("basalt serve", "no progress for %d s during a request (%s) - stopping "
+                                             "the engine so the server starts it again",
                                      limit, stage_text().c_str());
-                        stall_report(stderr, p.ticks.load() - ticks_at);
-                        basalt::core::release_gpu_waits(stderr);   // no spin kernel outlives the process
-                        std::fflush(stderr);
+                        stall_report(basalt::log::stream(), p.ticks.load() - ticks_at);
+                        basalt::core::release_gpu_waits(basalt::log::stream());   // no spin kernel outlives the process
                         std::abort();
                     }
                 }).detach();
@@ -6119,7 +6110,7 @@ int main(int argc, char** argv) {
             }, o.resident_pin, n_top, later);
             if (add > 0) {
                 basalt::platform::watch_resident_ram(true, src.resident_bytes() + add);
-                std::fprintf(stderr, "basalt generate: RAM top-up: +%.2f GiB, %lld experts (total %.2f GiB)\n",
+                basalt::log::info("basalt generate", "RAM top-up: +%.2f GiB, %lld experts (total %.2f GiB)",
                              (double) add / 1073741824.0, (long long) n_top,
                              (double) (src.resident_bytes() + add) / 1073741824.0);
             }
@@ -6130,7 +6121,7 @@ int main(int argc, char** argv) {
         const uint64_t guard_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), tier_file_bytes);
         basalt::platform::start_ram_guard(guard_floor);
         if (const uint64_t avail = basalt::platform::available_memory(); avail > 0)
-            std::fprintf(stderr, "basalt serve: RAM %.2f GiB free, guard %.2f GiB, %.2f GiB kept for serving\n",
+            basalt::log::info("basalt serve", "RAM %.2f GiB free, guard %.2f GiB, %.2f GiB kept for serving",
                          (double) avail / 1073741824.0, (double) guard_floor / 1073741824.0,
                          (double) serve_growth_bytes(o, g) / 1073741824.0);
         // a view of the solo session carrying slot b's state: what the request path and the solo verifier work on for a
@@ -6150,7 +6141,7 @@ int main(int argc, char** argv) {
         };
         // every window width's graph is captured before READY, not by the first request that needs it
         if (o.serve && stages.empty() && !ver.warm_graphs(err)) {
-            std::fprintf(stderr, "basalt serve: capturing the verify windows failed: %s\n", err.c_str());
+            basalt::log::error("basalt serve", "capturing the verify windows failed: %s", err.c_str());
             return 1;
         }
         // the solo windows of every slot session, so a lone request in any slot runs the solo path in place
@@ -6161,13 +6152,13 @@ int main(int argc, char** argv) {
             for (int b = 1; b < o.batch; ++b) {
                 make_view(rviews[(size_t) b], b);
                 if (!ver.warm_session(&rviews[(size_t) b], err)) {
-                    std::fprintf(stderr, "basalt serve: capturing slot %d's solo windows failed: %s\n", b, err.c_str());
+                    basalt::log::error("basalt serve", "capturing slot %d's solo windows failed: %s", b, err.c_str());
                     return 1;
                 }
             }
             size_t free1 = 0;
             cudaMemGetInfo(&free1, &total0);
-            std::fprintf(stderr, "basalt serve: solo windows of %d more slot sessions captured in %.0f ms (%.1f MiB of VRAM)\n",
+            basalt::log::info("basalt serve", "solo windows of %d more slot sessions captured in %.0f ms (%.1f MiB of VRAM)",
                          o.batch - 1, std::chrono::duration<double, std::milli>(Clock::now() - tw).count(),
                          (double) ((int64_t) free0 - (int64_t) free1) / 1048576.0);
         }
@@ -6175,7 +6166,7 @@ int main(int argc, char** argv) {
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
         if (mtp_on && S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
         if (mtp_on && !mtp.prewarm(err)) {
-            std::fprintf(stderr, "basalt serve: capturing the draft graphs failed: %s\n", err.c_str());
+            basalt::log::error("basalt serve", "capturing the draft graphs failed: %s", err.c_str());
             return 1;
         }
         std::printf("INFO file_experts_bytes=%llu\n", (unsigned long long) tier_file_bytes);   // experts only the file holds
@@ -6305,8 +6296,8 @@ int main(int argc, char** argv) {
             }
             relend();
             cudaMemGetInfo(&free_b, &total_b);
-            std::fprintf(stderr, "basalt serve: VRAM %lld MiB kept free: the expert cache %lld -> %lld of %lld slots "
-                                 "(%.2f of %.2f GiB), %lld MiB free now, prompt chunk %lld, in %.0f ms%s\n",
+            basalt::log::info("basalt serve", "VRAM %lld MiB kept free: the expert cache %lld -> %lld of %lld slots "
+                                 "(%.2f of %.2f GiB), %lld MiB free now, prompt chunk %lld, in %.0f ms%s",
                          reserve, (long long) before, (long long) xcache.slots(), (long long) xcache.full_slots(),
                          (double) xcache.mapped_bytes() / 1073741824.0, (double) xcache.full_bytes() / 1073741824.0,
                          (long long) (free_b >> 20), (long long) o.prefill_chunk,
@@ -6414,8 +6405,8 @@ int main(int argc, char** argv) {
             }
             if (!basalt::core::session_kv_map(s, cells, e)) { e = "elastic KV: " + e; return false; }
             ++kv_moves;
-            std::fprintf(stderr, "basalt serve: elastic KV: %lld cells backed (+%.0f MiB), the expert cache %lld -> %lld "
-                                 "slots, in %.1f ms\n", (long long) basalt::core::session_kv_cells(s),
+            basalt::log::info("basalt serve", "elastic KV: %lld cells backed (+%.0f MiB), the expert cache %lld -> %lld "
+                                 "slots, in %.1f ms", (long long) basalt::core::session_kv_cells(s),
                          (double) add / 1048576.0, (long long) before, (long long) xcache.slots(),
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
             return true;
@@ -6431,8 +6422,8 @@ int main(int argc, char** argv) {
             if (!basalt::core::session_kv_unmap(s, cells, e)) { e = "elastic KV: " + e; return false; }
             if (!cache_regrow(e)) return false;
             ++kv_moves;
-            std::fprintf(stderr, "basalt serve: elastic KV: %lld -> %lld cells backed, the expert cache %lld -> %lld "
-                                 "slots, in %.1f ms\n", (long long) had, (long long) basalt::core::session_kv_cells(s),
+            basalt::log::info("basalt serve", "elastic KV: %lld -> %lld cells backed, the expert cache %lld -> %lld "
+                                 "slots, in %.1f ms", (long long) had, (long long) basalt::core::session_kv_cells(s),
                          (long long) before, (long long) xcache.slots(),
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
             return true;
@@ -6644,8 +6635,8 @@ int main(int argc, char** argv) {
             p.first_now = -1;   // the prompt path lays its buffers out again at its next loan
             res_upload();
             const auto ms = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-            std::fprintf(stderr, "basalt serve: image encoder: %zu image(s) up to %d tokens in %lld cache slots (%.2f GiB), "
-                                 "%lld expert rows lent; decode %.0f ms, lend %.0f ms, weights %.0f ms, encode %.0f ms, refill %.0f ms\n",
+            basalt::log::info("basalt serve", "image encoder: %zu image(s) up to %d tokens in %lld cache slots (%.2f GiB), "
+                                 "%lld expert rows lent; decode %.0f ms, lend %.0f ms, weights %.0f ms, encode %.0f ms, refill %.0f ms",
                          jobs.size(), tokens, (long long) k, (double) vis_enc.arena_bytes(tokens) / 1073741824.0, (long long) n_lent,
                          ms(t0, t_dec), ms(t_dec, t_lent), ms(t_lent, t_up), ms(t_up, t_enc), ms(t_enc, Clock::now()));
             if (!ok) { reply_err(eerr); return; }
@@ -6909,13 +6900,13 @@ int main(int argc, char** argv) {
                     }
                 }
                 std::string perr;
-                if (ok && acted && !ver.dm_presync(perr)) std::fprintf(stderr, "basalt serve: %s\n", perr.c_str());
+                if (ok && acted && !ver.dm_presync(perr)) basalt::log::error("basalt serve", "%s", perr.c_str());
                 if (!ok) { std::printf("ERR an adaptive refill failed\n"); return false; }
                 ba_ms += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
                 if (ba_win % 2000 == 0 && ba_win > 0) {   // the swap rate and the hit rate over the last 2000 windows
                     const int64_t h = drive.d.cache_hits, m = drive.d.multi_misses;
-                    std::fprintf(stderr, "basalt batch adapt: window %lld: %lld swaps in %lld rounds, VRAM hits %.2f and CPU "
-                                         "experts %.2f per layer-window\n", (long long) ba_win, (long long) (ba_swaps - ba_swaps_l),
+                    basalt::log::info("basalt batch adapt", "window %lld: %lld swaps in %lld rounds, VRAM hits %.2f and CPU "
+                                         "experts %.2f per layer-window", (long long) ba_win, (long long) (ba_swaps - ba_swaps_l),
                                  (long long) (ba_rounds - ba_rounds_l), (double) (h - ba_h_l) / (2000.0 * g.n_layers),
                                  (double) (m - ba_m_l) / (2000.0 * g.n_layers));
                     ba_swaps_l = ba_swaps; ba_rounds_l = ba_rounds; ba_h_l = h; ba_m_l = m;
@@ -6950,7 +6941,7 @@ int main(int argc, char** argv) {
             if (logit_hash)
                 for (int sg = 0; sg < S; ++sg)
                     for (int e = 0; e < n_keep[sg]; ++e)
-                        std::fprintf(stderr, "LH %d %lld %016llx\n", rows[sg], (long long) (bs[(size_t) rows[sg]].p + e),
+                        basalt::log::raw("LH %d %lld %016llx\n", rows[sg], (long long) (bs[(size_t) rows[sg]].p + e),
                                      (unsigned long long) row_hash(r0s[sg] + e));
             // the commit runs beside the drafts when nothing reads the committed state meanwhile
             const bool overlap = real && !bdigest;
@@ -7069,31 +7060,31 @@ int main(int argc, char** argv) {
             if (!batch_on() && bt_windows > 0) {
                 const double w = (double) bt_windows, wall = msd(bt_start, Clock::now());
                 const double L = (double) g.n_layers;
-                std::fprintf(stderr, "basalt batch: %lld windows, avg %.2f rows, %.2f ms/window = run %.2f (CUDA0 GPU-reach "
+                basalt::log::info("basalt batch", "%lld windows, avg %.2f rows, %.2f ms/window = run %.2f (CUDA0 GPU-reach "
                                      "wait %.2f + CPU experts %.2f) + commit %.2f + emit %.2f; per layer-window: CPU experts "
                                      "%.2f, VRAM hits %.2f, PCIe %.2f; %.1f rows/s over %.0f ms of wall time (admissions "
-                                     "included)\n",
+                                     "included)",
                              (long long) bt_windows, bt_rows / w, (bt_run + bt_commit + bt_emit + bt_draft) / w, bt_run / w,
                              (ver.ms_wait - bt_wait0) / w, (ver.ms_pool - bt_pool0) / w, bt_commit / w, bt_emit / w,
                              (drive.d.multi_misses - bt_miss0) / (w * L), (drive.d.cache_hits - bt_hits0) / (w * L),
                              (drive.d.pcie_experts - bt_pcie0) / (w * L), 1000.0 * bt_rows / std::max(wall, 1e-9), wall);
                 if (batch_adapt) {
-                    std::fprintf(stderr, "basalt batch adapt: %lld rounds, %lld swaps queued (%.1f per round), %.3f ms/window of host "
-                                         "time, peer swaps total %lld\n", (long long) ba_rounds, (long long) ba_swaps,
+                    basalt::log::info("basalt batch adapt", "%lld rounds, %lld swaps queued (%.1f per round), %.3f ms/window of host "
+                                         "time, peer swaps total %lld", (long long) ba_rounds, (long long) ba_swaps,
                                  ba_rounds > 0 ? (double) ba_swaps / (double) ba_rounds : 0.0, ba_ms / w,
                                  (long long) (peer.valid() ? peer.swaps() : 0));
                     ba_swaps = ba_rounds = ba_swaps_l = ba_rounds_l = 0;
                     ba_ms = 0;
                 }
                 if (bt_slotwin > 0)
-                    std::fprintf(stderr, "basalt batch spec: %.2f tokens/window/slot (%.2f slots/window, %.2f rows/window), "
+                    basalt::log::info("basalt batch spec", "%.2f tokens/window/slot (%.2f slots/window, %.2f rows/window), "
                                          "drafts %lld accepted of %lld, draft %.2f ms/window (%.2f ms/slot-window), %.1f "
-                                         "tokens/s\n", (double) bt_tokens / (double) bt_slotwin, (double) bt_slotwin / w,
+                                         "tokens/s", (double) bt_tokens / (double) bt_slotwin, (double) bt_slotwin / w,
                                  bt_rows / w, (long long) bt_dr_acc, (long long) bt_dr_off, bt_draft / w,
                                  bt_draft / (double) bt_slotwin, 1000.0 * (double) bt_tokens / std::max(wall, 1e-9));
                 for (size_t k = 0; k <= stages.size(); ++k) {
                     const std::string pr = (k == 0 ? ver : stages[k - 1]->ver).profile_report();
-                    if (!pr.empty()) std::fprintf(stderr, "basalt batch GPU stages, stage %zu (ms/window):%s\n", k + 1, pr.c_str());
+                    if (!pr.empty()) basalt::log::raw("basalt batch GPU stages, stage %zu (ms/window):%s\n", k + 1, pr.c_str());
                 }
                 bt_run = bt_commit = bt_emit = bt_draft = 0;
                 bt_windows = bt_rows = bt_tokens = bt_slotwin = bt_dr_off = bt_dr_acc = 0;
@@ -7206,12 +7197,12 @@ int main(int argc, char** argv) {
             if (drive.d.failed) { std::printf("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed"); return false; }
             if (!pipe_inflight() && !batch_on() && bt_windows > 0) {   // all idle: the timing line, as batch_step
                 const double w = (double) bt_windows, wall = std::chrono::duration<double, std::milli>(Clock::now() - bt_start).count();
-                std::fprintf(stderr, "basalt batch (pipelined, %d groups of %d): %lld group-steps, %lld rows in %.0f ms = "
+                basalt::log::raw("basalt batch (pipelined, %d groups of %d): %lld group-steps, %lld rows in %.0f ms = "
                                      "%.1f rows/s (admissions included)\n", o.batch_groups, GS, (long long) bt_windows,
                              (long long) bt_rows, wall, 1000.0 * bt_rows / std::max(wall, 1e-9));
                 for (int k = 0; k < n_pipe; ++k) {
                     const std::string pr = stage_verifier(k).profile_report();
-                    if (!pr.empty()) std::fprintf(stderr, "basalt batch GPU stages, stage %d (ms/window):%s\n", k + 1, pr.c_str());
+                    if (!pr.empty()) basalt::log::raw("basalt batch GPU stages, stage %d (ms/window):%s\n", k + 1, pr.c_str());
                 }
                 bt_windows = bt_rows = 0;
                 basalt::core::progress().busy.store(false);
@@ -7456,7 +7447,7 @@ int main(int argc, char** argv) {
                 }
                 if (!gerr.empty()) { std::printf("ERR grammar: %s\n", gerr.c_str()); continue; }
             } else if (!req_grammar_text.empty()) {
-                std::fprintf(stderr, "basalt grammar: the request has a grammar but this engine runs with --grammar off; ignored\n");
+                basalt::log::warn("basalt grammar", "the request has a grammar but this engine runs with --grammar off; ignored");
             }
             std::vector<float> grammar_bias;
             int64_t grammar_resamples = 0;
@@ -7725,14 +7716,14 @@ int main(int argc, char** argv) {
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
             if (incoming && incoming->stage_images.size() != stages.size()) {
-                std::fprintf(stderr, "basalt serve: conversation cache: discard snapshot (stage count)\n");
+                basalt::log::info("basalt serve", "conversation cache: discard snapshot (stage count)");
                 incoming.reset();
             }
             if (incoming) for (size_t i = 0; i < stages.size(); ++i) {
                 const basalt::core::OnDevice on(stages[i]->dev);
                 if (!basalt::core::conversation_snapshot_validate(incoming->stage_images[i], stages[i]->ss, g,
                         i + 1 == stages.size() ? mtp_kv : nullptr, err)) {   // the draft: the last stage's
-                    std::fprintf(stderr, "basalt serve: conversation cache: discard invalid stage snapshot (%s)\n",
+                    basalt::log::warn("basalt serve", "conversation cache: discard invalid stage snapshot (%s)",
                                  err.c_str());
                     incoming.reset();
                     err.clear();
@@ -7741,7 +7732,7 @@ int main(int argc, char** argv) {
             }
             if (incoming && !basalt::core::conversation_snapshot_validate(*incoming, *rsp, g,
                     stages.empty() ? mtp_kv : nullptr, err)) {
-                std::fprintf(stderr, "basalt serve: conversation cache: discard invalid snapshot (%s)\n", err.c_str());
+                basalt::log::warn("basalt serve", "conversation cache: discard invalid snapshot (%s)", err.c_str());
                 incoming.reset();
                 err.clear();
             }
@@ -7763,7 +7754,7 @@ int main(int argc, char** argv) {
                 const auto t0 = Clock::now();
                 if (!copy_from_slot(slot_source, slot_ck, err)) {
                     // the main session may be half written: read this prompt from the start
-                    std::fprintf(stderr, "basalt batch: restoring slot %d failed (%s); reading the prompt\n",
+                    basalt::log::warn("basalt batch", "restoring slot %d failed (%s); reading the prompt",
                                  slot_source, err.c_str());
                     err.clear();
                     live.clear();
@@ -7791,8 +7782,8 @@ int main(int argc, char** argv) {
                     live_imgs = slot_ck != nullptr ? slot_ck->imgs : bs[(size_t) slot_source].imgs;
                     resume = slot_tokens;
                     from_live = true;
-                    std::fprintf(stderr, "basalt batch: slot %d gave back %lld tokens of this conversation (%s) in "
-                                 "%.1f ms\n", slot_source, (long long) slot_tokens,
+                    basalt::log::info("basalt batch", "slot %d gave back %lld tokens of this conversation (%s) in "
+                                 "%.1f ms", slot_source, (long long) slot_tokens,
                                  slot_ck != nullptr ? "its turn checkpoint" : "all it holds",
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 }
@@ -7815,8 +7806,8 @@ int main(int argc, char** argv) {
                     if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR stage sync\n"); return 1; }
                 }
                 if (!restored) {
-                    std::fprintf(stderr, "basalt serve: conversation cache: restoring a parked conversation failed%s "
-                                 "(%s); reading the prompt from the start\n",
+                    basalt::log::warn("basalt serve", "conversation cache: restoring a parked conversation failed%s "
+                                 "(%s); reading the prompt from the start",
                                  failed_stage >= 0 ? (" on CUDA" + std::to_string(failed_stage)).c_str() : "",
                                  err.c_str());
                     (void) cudaGetLastError();
@@ -7848,7 +7839,7 @@ int main(int argc, char** argv) {
                 for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
                 conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv), rsp);
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
-                std::fprintf(stderr, "basalt serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
+                basalt::log::info("basalt serve", "conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu",
                              (long long) resume, from_live ? "live" : "checkpoint",
                              std::chrono::duration<double, std::milli>(Clock::now() - restore_t0).count(),
                              conversations.size(), conversations.bytes());
@@ -8219,7 +8210,7 @@ int main(int argc, char** argv) {
                                 yield_slot = ys;
                                 abort_read.store(true);
                             } else {
-                                std::fprintf(stderr, "basalt batch: BYIELD %d not taken at %lld of %lld\n", ys,
+                                basalt::log::info("basalt batch", "BYIELD %d not taken at %lld of %lld", ys,
                                              (long long) (p0 + T), (long long) n);
                             }
                         };
@@ -8289,8 +8280,8 @@ int main(int argc, char** argv) {
                     }
                     th.join();
                     ov_active = false;
-                    std::fprintf(stderr, "basalt batch: overlapped prompt read: %lld windows (%.1f ms avg, %.0f ms max) beside "
-                                         "%lld chunk jobs run between windows (%.1f ms avg, %.0f ms max)\n",
+                    basalt::log::info("basalt batch", "overlapped prompt read: %lld windows (%.1f ms avg, %.0f ms max) beside "
+                                         "%lld chunk jobs run between windows (%.1f ms avg, %.0f ms max)",
                                  (long long) ov_wins, ov_wins ? ov_win_ms / (double) ov_wins : 0.0, ov_win_max,
                                  (long long) ov_jobs, ov_jobs ? ov_job_ms / (double) ov_jobs : 0.0, ov_job_max);
                     sp.on_chunk = std::move(orig_chunk);
@@ -8306,8 +8297,8 @@ int main(int argc, char** argv) {
                             e = "BYIELD: parking the prompt read failed: " + ye;
                             return false;
                         }
-                        std::fprintf(stderr, "basalt batch: the prompt read gives way at %lld of %lld tokens; slot %d "
-                                             "holds it (copied in %.1f ms)\n", (long long) yield_q, (long long) n, yield_slot,
+                        basalt::log::info("basalt batch", "the prompt read gives way at %lld of %lld tokens; slot %d "
+                                             "holds it (copied in %.1f ms)", (long long) yield_q, (long long) n, yield_slot,
                                      std::chrono::duration<double, std::milli>(Clock::now() - ty).count());
                         e = "yield";
                         return false;
@@ -8346,13 +8337,13 @@ int main(int argc, char** argv) {
                         std::string ye;
                         const auto ty = Clock::now();
                         if (can_yield(q, b0, ys) && park_read(q, ys, ye)) {
-                            std::fprintf(stderr, "basalt batch: the prompt read gives way at %lld of %lld tokens; slot %d "
-                                                 "holds it (copied in %.1f ms)\n", (long long) q, (long long) n, ys,
+                            basalt::log::info("basalt batch", "the prompt read gives way at %lld of %lld tokens; slot %d "
+                                                 "holds it (copied in %.1f ms)", (long long) q, (long long) n, ys,
                                          std::chrono::duration<double, std::milli>(Clock::now() - ty).count());
                             e = "yield";
                             return false;
                         }
-                        std::fprintf(stderr, "basalt batch: BYIELD %d not taken at %lld of %lld%s%s\n", ys, (long long) q,
+                        basalt::log::info("basalt batch", "BYIELD %d not taken at %lld of %lld%s%s", ys, (long long) q,
                                      (long long) n, ye.empty() ? "" : ": ", ye.c_str());
                     }
                     if (decode_share <= 0.0 || !batch_on()) continue;
@@ -8489,13 +8480,12 @@ int main(int argc, char** argv) {
                 if (sp_ok && win && !ov_window()) { std::printf("ERR %s\n", err.c_str()); return 1; }
                 if (!sp_ok) {
                     if (yielded_at < 0 && (batch_fatal || !(stop_req.load() || stdin_lost.load() || ram_stop.load()))) {
-                        std::fprintf(stderr, "basalt serve: %s\n", err.c_str());
+                        basalt::log::error("basalt serve", "%s", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
                         // a CUDA fault (an illegal address) poisons the context for the whole process, and unwinding
                         // the destructors on it could hang until the watchdog: leave at once
                         if (cudaPeekAtLastError() != cudaSuccess) {
                             std::fflush(stdout);
-                            std::fflush(stderr);
                             std::_Exit(1);
                         }
                         return 1;
@@ -8515,8 +8505,8 @@ int main(int argc, char** argv) {
                 return 1;
             }
             if (il_parts > 0)
-                std::fprintf(stderr, "basalt batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "
-                                     "them\n", (long long) il_parts + 1, il_ms);
+                basalt::log::info("basalt batch", "the prompt was read in %lld parts, the slots decoding %.0f ms between "
+                                     "them", (long long) il_parts + 1, il_ms);
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
@@ -8697,7 +8687,7 @@ int main(int argc, char** argv) {
                         outv[(size_t) miss] = gtok;
                         a = miss;
                         if (!gguard->take(gtok))
-                            std::fprintf(stderr, "basalt grammar: the masked draw at row %d of %d was token %d\n", miss, T, (int) gtok);
+                            basalt::log::info("basalt grammar", "the masked draw at row %d of %d was token %d", miss, T, (int) gtok);
                         ++grammar_resamples;
                     }
                 }
@@ -8713,7 +8703,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (logit_hash)   // the accepted rows' logits, per position (equality of the batch rows with these)
-                    for (int t = 0; t <= a; ++t) std::fprintf(stderr, "LH -1 %lld %016llx\n", (long long) (p + t), (unsigned long long) row_hash(t));
+                    for (int t = 0; t <= a; ++t) basalt::log::raw("LH -1 %lld %016llx\n", (long long) (p + t), (unsigned long long) row_hash(t));
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (tk_log != nullptr && tk_valid && !from_sfx && ppl == nullptr && req_temperature > 0.0) {
                     std::vector<float> lg((size_t) n_vocab);
@@ -8769,7 +8759,7 @@ int main(int argc, char** argv) {
                             adapt_ok = xq_stage != 0 ? xq_advance() : xq_round();
                             basalt::core::decode_events().stamp(6);
                             std::string perr;
-                            if (adapt_ok && !ver.dm_presync(perr)) std::fprintf(stderr, "basalt serve: %s\n", perr.c_str());
+                            if (adapt_ok && !ver.dm_presync(perr)) basalt::log::error("basalt serve", "%s", perr.c_str());
                             basalt::core::decode_events().stamp(7);
                             basalt::core::decode_gaps().hms[20] += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
                         });
@@ -8782,7 +8772,7 @@ int main(int argc, char** argv) {
                         adapt_ok = adapt();
                         if (chain && adapt_ok) {   // the evictions' residency, uploaded beside the draft
                             std::string perr;
-                            if (!ver.dm_presync(perr)) std::fprintf(stderr, "basalt serve: %s\n", perr.c_str());
+                            if (!ver.dm_presync(perr)) basalt::log::error("basalt serve", "%s", perr.c_str());
                         }
                         basalt::core::decode_gaps().hms[20] += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
                     });
@@ -8817,7 +8807,7 @@ int main(int argc, char** argv) {
                                 if (boundary) {
                                     apply_pending(true, false);
                                     std::string perr;
-                                    if (!ver.dm_presync(perr)) std::fprintf(stderr, "basalt serve: %s\n", perr.c_str());
+                                    if (!ver.dm_presync(perr)) basalt::log::error("basalt serve", "%s", perr.c_str());
                                 }
                                 if (copies) copy_done = !src.exchanges_staged() || src.copy_exchanges(8ull << 20);
                             });
@@ -8959,7 +8949,7 @@ int main(int argc, char** argv) {
                 p += a + 1;
             }
             if (gguard != nullptr)
-                std::fprintf(stderr, "basalt grammar: %lld windows checked, %lld masked resamples, %.3f ms in grammar code (%.2f us/window)\n",
+                basalt::log::info("basalt grammar", "%lld windows checked, %lld masked resamples, %.3f ms in grammar code (%.2f us/window)",
                              (long long) gguard->windows(), (long long) grammar_resamples, gguard->ms(),
                              gguard->windows() > 0 ? gguard->ms() * 1000.0 / (double) gguard->windows() : 0.0);
             if (apply_thr.joinable()) apply_thr.join();
@@ -8984,10 +8974,10 @@ int main(int argc, char** argv) {
                 const DecSnap d1 = dec_snap();
                 const double w = (double) dec_windows, L = (double) g.n_layers;
                 auto fmt2 = [](double v) { char b[32]; std::snprintf(b, sizeof b, "%.2f", v); return std::string(b); };
-                std::fprintf(stderr, "basalt decode timing: %lld windows, avg T %.2f, %.2f tokens/window, %.2f ms/window = "
+                basalt::log::info("basalt decode timing", "%lld windows, avg T %.2f, %.2f tokens/window, %.2f ms/window = "
                                      "verify %.2f (GPU-reach wait %.2f + per-layer host %.2f [plan %.2f actq %.2f jobs %.2f "
                                      "CPU %.2f] + stage %.2f) + commit/emit %.2f + draft %.2f; per layer-window: CPU experts "
-                                     "%.2f (%.2f entries), VRAM hits %.2f, PCIe %.2f%s\n",
+                                     "%.2f (%.2f entries), VRAM hits %.2f, PCIe %.2f%s",
                              (long long) dec_windows, dec_T / w, produced_n / w, decode_ms / w, dt_run / w,
                              (d1.wait - ds0.wait) / w, (d1.pool - ds0.pool) / w, (d1.plan - ds0.plan) / w,
                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
@@ -8997,9 +8987,9 @@ int main(int argc, char** argv) {
                                                              " (the pool waits " + fmt2((d1.peer_wait - ds0.peer_wait) / w) +
                                                              " ms/window for it)").c_str());
                 const std::string evr = basalt::core::decode_events().report();
-                if (!evr.empty()) std::fprintf(stderr, "%s\n", evr.c_str());
+                if (!evr.empty()) basalt::log::raw("%s\n", evr.c_str());
                 const std::string pr = ver.profile_report();
-                if (!pr.empty()) std::fprintf(stderr, "basalt decode GPU stages (ms/window):%s\n", pr.c_str());
+                if (!pr.empty()) basalt::log::raw("basalt decode GPU stages (ms/window):%s\n", pr.c_str());
             }
             if (!cancelled) {
                 // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
@@ -9030,8 +9020,7 @@ int main(int argc, char** argv) {
                 std::snprintf(msg, sizeof msg, "RAM low (%llu MiB free < %llu MiB guard): request stopped; lower "
                                                "--resident-budget-gib",
                               (unsigned long long) (avail >> 20), (unsigned long long) (floor >> 20));
-                std::fprintf(stderr, "basalt error: %s\n", msg);
-                std::fflush(stderr);
+                basalt::log::error("basalt", "%s", msg);
                 std::printf("ERR %s\n", msg);
             }
             if (!ram_out && yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
@@ -9050,7 +9039,7 @@ int main(int argc, char** argv) {
                 const auto tc0 = Clock::now();
                 // the draft layer's cell for the prompt's last token (it pairs with the first generated one), then its K/V
                 if (cont && !in_slot && batch_spec && !mtp.prefill(ver.final_R_all(), &x, 1, p - 1, err)) {
-                    std::fprintf(stderr, "basalt serve: batch admission failed: %s\n", err.c_str());
+                    basalt::log::error("basalt serve", "batch admission failed: %s", err.c_str());
                     cont = false;
                 }
                 if (cont && in_slot) {   // the slot holds the prompt already; only its draft K/V is staged
@@ -9059,11 +9048,11 @@ int main(int argc, char** argv) {
                     t.ple_prev[1] = rview.ple_prev[1];
                     t.ple_token = rview.ple_token;
                     if (batch_spec && !mtp.copy_store(mtp.main_store(), admit_slot, (int64_t) live.size(), err)) {
-                        std::fprintf(stderr, "basalt serve: batch admission failed: %s\n", err.c_str());
+                        basalt::log::error("basalt serve", "batch admission failed: %s", err.c_str());
                         cont = false;
                     }
                 } else if (cont && !copy_to_slot(admit_slot, live, err)) {
-                    std::fprintf(stderr, "basalt serve: batch admission failed: %s\n", err.c_str());
+                    basalt::log::error("basalt serve", "batch admission failed: %s", err.c_str());
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
                     cont = false;
                 }
@@ -9096,7 +9085,7 @@ int main(int argc, char** argv) {
                             basalt::core::conversation_ids_equal(c.ids.data(), c.ids.size(), live.data()))
                             best = &c;
                     if (best != nullptr) sl.checks.push_back(*best);
-                    std::fprintf(stderr, "basalt batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
+                    basalt::log::info("basalt batch", "slot %d takes %lld tokens (copied in %.1f ms)", admit_slot,
                                  (long long) live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
                 }
                 if (!ram_out)   // (after ERR the server reads no BADM)
@@ -9144,14 +9133,14 @@ int main(int argc, char** argv) {
                 std::snprintf(read_txt, sizeof(read_txt), "%lld of %lld", (long long) read_n, (long long) fresh);
             else
                 std::snprintf(read_txt, sizeof(read_txt), "%lld", (long long) fresh);
-            std::fprintf(stderr, "basalt serve: prompt %lld tokens = %lld reused + %s read in %.0f ms (%.1f tok/s), "
-                                 "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, %zu checkpoints%s\n",
+            basalt::log::info("basalt serve", "prompt %lld tokens = %lld reused + %s read in %.0f ms (%.1f tok/s), "
+                                 "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, %zu checkpoints%s",
                          (long long) n, (long long) resume, read_txt, prompt_ms,
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
             if (relax_on)
-                std::fprintf(stderr, "basalt serve: relaxed drafting %.2f: %lld of the %lld accepted drafts were kept by it\n",
+                basalt::log::info("basalt serve", "relaxed drafting %.2f: %lld of the %lld accepted drafts were kept by it",
                              (double) req_relax, (long long) relaxed_kept, (long long) draft_accepted);
             // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU to
             // read are in neither count, so that share is said beside it
@@ -9162,21 +9151,21 @@ int main(int argc, char** argv) {
                                   "all %lld routed)", (long long) req_offload,
                                   100.0 * (double) req_offload / (double) (req_look + req_offload),
                                   (long long) (req_look + req_offload));
-                std::fprintf(stderr, "basalt serve: decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)%s\n",
+                basalt::log::info("basalt serve", "decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)%s",
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look, off);
             }
             // the resident RAM mode, cumulative: experts read from the experts section since the copy was made (what the plain
             // mmap mode reads through the OS file cache, from the SSD when the RAM could not keep it)
             if (src.complement_ready())
-                std::fprintf(stderr, "basalt serve: resident RAM: %.2f GiB of experts in RAM, %lld exchanged with the "
-                                     "VRAM tier, %lld blob reads from the file\n",
+                basalt::log::info("basalt serve", "resident RAM: %.2f GiB of experts in RAM, %lld exchanged with the "
+                                     "VRAM tier, %lld blob reads from the file",
                              (double) src.resident_bytes() / 1073741824.0, (long long) src.exchanges(),
                              (long long) src.file_reads());
             // CS-T: the tiers, cumulative - GPU cache hits (the decode lookups above), RAM copy, files (SSD / OS cache)
             if (srcp == &src)
-                std::fprintf(stderr, "basalt serve: expert tiers: GPU %lld hits this request; since the start RAM %lld blobs, files %lld blobs "
-                                     "%.1f MB read\n", (long long) req_hits, (long long) src.ram_reads(),
+                basalt::log::info("basalt serve", "expert tiers: GPU %lld hits this request; since the start RAM %lld blobs, files %lld blobs "
+                                     "%.1f MB read", (long long) req_hits, (long long) src.ram_reads(),
                              (long long) src.file_reads(), (double) src.file_read_bytes() / 1e6);
             if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {
                 // KV streaming, cumulative over the process: blocks the selections named vs blocks read from RAM
@@ -9188,18 +9177,18 @@ int main(int argc, char** argv) {
                         basalt::kernels::kv_stream_counters(ss.qsa_states[ss.qsa_ord0 + j].map);
                     miss += c.misses; look += c.lookups; over = over || c.overflow;
                 }
-                std::fprintf(stderr, "basalt serve: KV streaming: %.2f%% of %llu block reads hit VRAM, %.1f MiB read "
-                                     "from RAM%s\n", look ? 100.0 * (double) (look - miss) / (double) look : 100.0,
+                basalt::log::info("basalt serve", "KV streaming: %.2f%% of %llu block reads hit VRAM, %.1f MiB read "
+                                     "from RAM%s", look ? 100.0 * (double) (look - miss) / (double) look : 100.0,
                              (unsigned long long) look, (double) miss * 4224.0 / 1048576.0,
                              over ? " - OVERFLOW (too few resident cells)" : "");
             }
             if (sfx_windows > 0)
-                std::fprintf(stderr, "basalt serve: suffix drafts: %lld windows, %lld of %lld drafts accepted\n",
+                basalt::log::info("basalt serve", "suffix drafts: %lld windows, %lld of %lld drafts accepted",
                              (long long) sfx_windows, (long long) sfx_ok, (long long) sfx_drafts);
             for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
-                std::fprintf(stderr, "basalt serve: CUDA%d: %lld expert entries, %lld active layer launches, %.1f MiB returned "
+                basalt::log::info("basalt serve", "CUDA%d: %lld expert entries, %lld active layer launches, %.1f MiB returned "
                                      "(%.1f MiB with full rows) in this request; host %.0f ms staging+launching, %.0f ms "
-                                     "waiting for it in this request\n", r + 1,
+                                     "waiting for it in this request", r + 1,
                              (long long) (remote_experts[(size_t) r].computed() - remote_before[(size_t) r]),
                              (long long) (remote_experts[(size_t) r].launched_layers() - launches_before[(size_t) r]),
                              (double) (remote_experts[(size_t) r].returned_bytes() - compact_before[(size_t) r]) / 1048576.0,
@@ -9236,7 +9225,7 @@ int main(int argc, char** argv) {
             }
             if (o.prefill_auto) {
                 o.prefill_chunk = k > 0 ? chunk : request_chunk(n_batched, 1024);
-                std::fprintf(stderr, "basalt generate: prompt chunk auto: %lld tokens\n", (long long) o.prefill_chunk);
+                basalt::log::info("basalt generate", "prompt chunk auto: %lld tokens", (long long) o.prefill_chunk);
             } else if (chunk != o.prefill_chunk) {
                 k = 0;                                 // a fixed chunk that does not fit: its own buffers, as before
             }
@@ -9252,12 +9241,12 @@ int main(int argc, char** argv) {
                 borrow = xcache.device_slot(first);
                 borrow_bytes = xcache.slot_offsets() ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[first])
                                                      : (uint64_t) k * (uint64_t) blob;
-                std::fprintf(stderr, "basalt generate: prompt path borrows %lld cache slots (%.2f GiB)\n", (long long) k,
+                basalt::log::info("basalt generate", "prompt path borrows %lld cache slots (%.2f GiB)", (long long) k,
                              (double) borrow_bytes / 1073741824.0);
             }
         }
         if (borrow == nullptr)
-            std::fprintf(stderr, "basalt generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
+            basalt::log::info("basalt generate", "prompt path allocates its own buffers (no cache slots to borrow)");
         if (!multi_gpu && o.batch <= 0 && !o.no_pool) { prefill.set_cpu_pool(&pool); prefill.set_cpu_share(o.prefill_cpu_share); }
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
@@ -9287,17 +9276,17 @@ int main(int argc, char** argv) {
                 const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
                 const int64_t nb = (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                 if (b == nullptr || !(xcache.fill_slot_queued(slot, b, err, nb))) {
-                    std::fprintf(stderr, "basalt generate: refilling a lent slot failed: %s\n", err.c_str());
+                    basalt::log::error("basalt generate", "refilling a lent slot failed: %s", err.c_str());
                     return 1;
                 }
                 host_res[(size_t) i] = slot;
             }
             if (!xcache.sync_queued(err)) {
-                std::fprintf(stderr, "basalt generate: refilling the lent slots failed: %s\n", err.c_str());
+                basalt::log::error("basalt generate", "refilling the lent slots failed: %s", err.c_str());
                 return 1;
             }
             res_put(d_res);
-            std::fprintf(stderr, "basalt generate: %zu lent slots refilled in %.1f ms\n", lent.size(),
+            basalt::log::info("basalt generate", "%zu lent slots refilled in %.1f ms", lent.size(),
                          std::chrono::duration<double, std::milli>(Clock::now() - tr).count());
         }
         prefill_batched_ms = std::chrono::duration<double, std::milli>(Clock::now() - tp0).count();
@@ -9308,8 +9297,8 @@ int main(int argc, char** argv) {
         ss.ple_prev[0] = pos_start >= 2 ? (int32_t) o.tokens[(size_t) (pos_start - 2)] : -1;
         ss.ple_prev[1] = pos_start >= 1 ? (int32_t) o.tokens[(size_t) (pos_start - 1)] : -1;
         const basalt::prefill::PrefillStats& ps = prefill.stats();
-        std::fprintf(stderr, "basalt generate: prefill %lld tokens in %lld chunks, %.1f ms (%.1f tok/s); experts "
-                             "streamed %lld (%lld by DMA, host %.1f ms), resident %lld, on the CPU %lld (share %.2f); PLE %.1f ms\n",
+        basalt::log::info("basalt generate", "prefill %lld tokens in %lld chunks, %.1f ms (%.1f tok/s); experts "
+                             "streamed %lld (%lld by DMA, host %.1f ms), resident %lld, on the CPU %lld (share %.2f); PLE %.1f ms",
                      (long long) ps.tokens, (long long) ps.chunks, ps.ms_total,
                      ps.ms_total > 0 ? 1000.0 * (double) ps.tokens / ps.ms_total : 0.0, (long long) ps.experts_streamed,
                      (long long) ps.experts_dma, ps.ms_experts_host, (long long) ps.experts_resident,
@@ -9333,13 +9322,13 @@ int main(int argc, char** argv) {
             std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
             std::string e;
             if (!in || !parse_i64_list(text.c_str(), oracle, e)) {
-                std::fprintf(stderr, "basalt generate: cannot read --spec-oracle %s\n", o.spec_oracle.c_str());
+                basalt::log::error("basalt generate", "cannot read --spec-oracle %s", o.spec_oracle.c_str());
                 return 2;
             }
         }
         if (thits.d_res == nullptr) {
-            std::fprintf(stderr, "basalt generate: --spec needs the device residency table (an expert profile, "
-                                 "--expert-cache and the token graph)\n");
+            basalt::log::error("basalt generate", "--spec needs the device residency table (an expert profile, "
+                                 "--expert-cache and the token graph)");
             return 2;
         }
         basalt::core::Verifier ver;
@@ -9373,7 +9362,7 @@ int main(int argc, char** argv) {
         double ms_adapt = 0;
         cudaStream_t adapt_stream = nullptr;
         if (!drive.d.usage.empty() && cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
-            std::fprintf(stderr, "basalt generate: cannot create the refill stream\n");
+            basalt::log::error("basalt generate", "cannot create the refill stream");
             return 1;
         }
         // swaps in flight - (residency index, slot) admitted when adapt_ev has completed
@@ -9430,7 +9419,7 @@ int main(int argc, char** argv) {
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
             if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) {
-                std::fprintf(stderr, "basalt generate: an adaptive refill failed (copying evicted experts back)\n");
+                basalt::log::error("basalt generate", "an adaptive refill failed (copying evicted experts back)");
                 return false;
             }
             for (const Swap& s : swaps) {
@@ -9441,7 +9430,7 @@ int main(int argc, char** argv) {
                 if (slot < 0 || b == nullptr ||
                     cudaMemcpyAsync(xcache.device_slot(slot), b, (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(s.layer),
                                     cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) {
-                    std::fprintf(stderr, "basalt generate: an adaptive refill failed\n");
+                    basalt::log::error("basalt generate", "an adaptive refill failed");
                     return false;
                 }
                 host_res[out] = basalt::core::kNotResident;   // evicted now: the CPU computes it meanwhile
@@ -9469,7 +9458,7 @@ int main(int argc, char** argv) {
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         if (use_mtp && !mtp.prewarm(err)) {
-            std::fprintf(stderr, "mtp: capturing the draft graphs failed: %s\n", err.c_str());
+            basalt::log::error("basalt", "mtp: capturing the draft graphs failed: %s", err.c_str());
             return 1;
         }
         basalt::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
@@ -9503,7 +9492,7 @@ int main(int argc, char** argv) {
             const bool timed_round = !first_window;
             ++window_hist[(size_t) T];
             if (p + T > o.max_context) {
-                std::fprintf(stderr, "basalt generate: ran out of context at position %lld\n", (long long) p);
+                basalt::log::error("basalt generate", "ran out of context at position %lld", (long long) p);
                 return 2;
             }
             window[0] = x;
@@ -9524,7 +9513,7 @@ int main(int argc, char** argv) {
                 return fatal_start_error(err);
             }
             if (drive.d.failed) {
-                std::fprintf(stderr, "basalt generate: the expert pool failed at layer %lld expert %lld: %s\n",
+                basalt::log::error("basalt generate", "the expert pool failed at layer %lld expert %lld: %s",
                              (long long) drive.d.fail_layer, (long long) drive.d.fail_expert,
                              drive.d.fail ? drive.d.fail : "(no message)");
                 return 1;
@@ -9576,7 +9565,7 @@ int main(int argc, char** argv) {
             total_ms += round_ms;
             if (timed_round) policy.observe(from_sfx, T, a, sfx_match, round_ms);
             if (rounds % 64 == 0)
-                std::fprintf(stderr, "basalt generate: position %lld, %lld tokens, %lld rounds\n", (long long) p,
+                basalt::log::info("basalt generate", "position %lld, %lld tokens, %lld rounds", (long long) p,
                              (long long) produced.size(), (long long) rounds);
         }
         // the last commit (set_commit_async) before anything reads the session again
@@ -9637,7 +9626,7 @@ int main(int argc, char** argv) {
     }
 
     if (dump != nullptr && std::fclose(dump) != 0) {
-        std::fprintf(stderr, "basalt generate: cannot finish logits dump\n");
+        basalt::log::error("basalt generate", "cannot finish logits dump");
         return 1;
     }
     if (layer_dump != nullptr) {
@@ -9677,12 +9666,12 @@ int main(int argc, char** argv) {
         std::vector<float> mx((size_t) g.n_embd);
         if (cudaMemcpy(mx.data(), ss.block.mixed, mx.size() * sizeof(float), cudaMemcpyDeviceToHost) !=
             cudaSuccess) {
-            std::fprintf(stderr, "basalt generate: reading mixed back failed\n");
+            basalt::log::error("basalt generate", "reading mixed back failed");
             return 1;
         }
         std::FILE* mf = std::fopen(o.dump_mixed.c_str(), "wb");
         if (mf == nullptr) {
-            std::fprintf(stderr, "basalt generate: cannot write %s\n", o.dump_mixed.c_str());
+            basalt::log::error("basalt generate", "cannot write %s", o.dump_mixed.c_str());
             return 1;
         }
         std::fwrite(mx.data(), sizeof(float), mx.size(), mf);
@@ -9697,12 +9686,12 @@ int main(int argc, char** argv) {
     if (!o.dump_residual.empty()) {
         std::vector<float> R((size_t) g.hc * g.n_embd);
         if (cudaMemcpy(R.data(), ss.R, R.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
-            std::fprintf(stderr, "basalt generate: reading R back failed\n");
+            basalt::log::error("basalt generate", "reading R back failed");
             return 1;
         }
         std::FILE* rf = std::fopen(o.dump_residual.c_str(), "wb");
         if (rf == nullptr) {
-            std::fprintf(stderr, "basalt generate: cannot write %s\n", o.dump_residual.c_str());
+            basalt::log::error("basalt generate", "cannot write %s", o.dump_residual.c_str());
             return 1;
         }
         const int32_t hdr[2] = {(int32_t) g.hc, (int32_t) g.n_embd};

@@ -17,6 +17,7 @@
 #include "basalt/program/engine_session.hpp"
 #include "basalt/program/probe_derive.hpp"
 #include "basalt/program/probe_report.hpp"
+#include "basalt/log.hpp"
 
 #ifndef BASALT_BENCH_ENGINE
 #define BASALT_BENCH_ENGINE ""
@@ -124,13 +125,13 @@ double measure_share(Engine& eng, const std::vector<std::vector<int64_t>>& fixtu
         for (size_t j = 0; j < ids.size(); ++j) ids[j] = pool[(off + j) % pool.size()];
         Done d;
         if (!eng.request(" temperature=0", 1, ids, d) || d.prompt_ms <= 0) { err = d.err; return false; }
-        std::fprintf(stderr, "  chunk share %.2f: %.0f ms (%.0f tok/s)%s%s\n", share, d.prompt_ms, 1000.0 * (double) d.prompt / d.prompt_ms,
+        basalt::log::raw("  chunk share %.2f: %.0f ms (%.0f tok/s)%s%s\n", share, d.prompt_ms, 1000.0 * (double) d.prompt / d.prompt_ms,
                      d.reused > 0 ? ", prefix reused" : "", keep ? "" : " (warm-up)");
         if (keep) trials.push_back({share, d.prompt_ms});
         return d.reused == 0;
     };
     if (!run(base, false) || !run(0.0, true) || !run(1.0, true)) {
-        std::fprintf(stderr, "basalt-probe: prefill share: %s\n", err.c_str());
+        basalt::log::error("basalt-probe", "prefill share: %s", err.c_str());
         return -1;
     }
     const double star = balance_share(mean_ms_at(trials, 0.0), mean_ms_at(trials, 1.0));
@@ -144,7 +145,7 @@ int main(int argc, char** argv) {
     Options o;
     std::string err;
     if (!parse_args(argc, argv, o, err)) {
-        std::fprintf(stderr, "basalt-probe: %s\n", err.c_str());
+        basalt::log::error("basalt-probe", "%s", err.c_str());
         return 2;
     }
     basalt::platform::ignore_broken_pipe();
@@ -152,7 +153,7 @@ int main(int argc, char** argv) {
 
     std::string engine_bin = o.engine.empty() ? std::string(BASALT_BENCH_ENGINE) : o.engine;
     if (engine_bin.empty() || !fs::exists(engine_bin)) {
-        std::fprintf(stderr, "basalt-probe: the engine binary %s does not exist (--engine BIN)\n", engine_bin.c_str());
+        basalt::log::error("basalt-probe", "the engine binary %s does not exist (--engine BIN)", engine_bin.c_str());
         return 2;
     }
 
@@ -165,7 +166,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < 3; ++i) {
         std::vector<std::vector<int64_t>> lines;
         if (!read_id_lines((fs::path(o.fixtures) / kFixtures[i].file).string(), lines, err) || lines.empty()) {
-            std::fprintf(stderr, "basalt-probe: %s\n", err.empty() ? (std::string(kFixtures[i].file) + " is empty").c_str() : err.c_str());
+            basalt::log::error("basalt-probe", "%s", err.empty() ? (std::string(kFixtures[i].file) + " is empty").c_str() : err.c_str());
             return 2;
         }
         for (auto& l : lines) ids[i].insert(ids[i].end(), l.begin(), l.end());
@@ -182,7 +183,7 @@ int main(int argc, char** argv) {
     }
     std::error_code ec;
     fs::create_directories(work, ec);
-    if (ec) { std::fprintf(stderr, "basalt-probe: cannot create %s\n", work.c_str()); return 2; }
+    if (ec) { basalt::log::error("basalt-probe", "cannot create %s", work.c_str()); return 2; }
     struct Cleanup {
         std::string dir;
         bool on;
@@ -197,9 +198,9 @@ int main(int argc, char** argv) {
 
     Engine eng;
     eng.label = "basalt-probe";
-    std::fprintf(stderr, "basalt-probe: starting the engine\n");
+    basalt::log::info("basalt-probe", "starting the engine");
     if (!eng.start(engine_bin, args, log_path, err)) {
-        std::fprintf(stderr, "basalt-probe: %s\n", err.c_str());
+        basalt::log::error("basalt-probe", "%s", err.c_str());
         return 1;
     }
     const auto t_ready = Clock::now();
@@ -208,7 +209,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> block;
     ProbeRates rates;
     if (!eng.command("PROBE rates", "PROBE end", block, err) || !parse_probe_rates(block, rates)) {
-        std::fprintf(stderr, "basalt-probe: PROBE rates failed: %s\n", err.empty() ? "no GPU in the reply" : err.c_str());
+        basalt::log::error("basalt-probe", "PROBE rates failed: %s", err.empty() ? "no GPU in the reply" : err.c_str());
         return 1;
     }
 
@@ -231,11 +232,11 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < 3; ++i) {
         Done d;
         if (!eng.request(" temperature=0 top_p=0.95 top_k=20", kTokens, ids[i], d) || d.generated <= 0) {
-            std::fprintf(stderr, "basalt-probe: %s: %s\n", kFixtures[i].name, d.err.empty() ? "no tokens generated" : d.err.c_str());
+            basalt::log::error("basalt-probe", "%s: %s", kFixtures[i].name, d.err.empty() ? "no tokens generated" : d.err.c_str());
             return 1;
         }
         const double ts = d.decode_ms > 0 ? (double) d.generated / (d.decode_ms / 1000.0) : 0.0;
-        std::fprintf(stderr, "  cold %-6s %.1f tok/s, %lld tokens\n", kFixtures[i].name, ts, d.generated);
+        basalt::log::raw("  cold %-6s %.1f tok/s, %lld tokens\n", kFixtures[i].name, ts, d.generated);
         speeds[i].name = kFixtures[i].name;
         speeds[i].cold = ts;
     }
@@ -247,7 +248,7 @@ int main(int argc, char** argv) {
             const std::string s = suggest_workers(rates, wp);
             if (!s.empty()) {
                 suggested.push_back(s);
-                std::fprintf(stderr, "basalt-probe: pool pick %d frees %d cores\n", wp.workers,
+                basalt::log::info("basalt-probe", "pool pick %d frees %d cores", wp.workers,
                              (rates.active_workers > 0 ? rates.active_workers : rates.pool_workers) - wp.workers);
             }
         }
@@ -257,12 +258,12 @@ int main(int argc, char** argv) {
             std::vector<ShareTrial> trials;
             const double star = measure_share(eng, ids, base, trials);
             const double gain = share_gain(trials, base, star);
-            std::fprintf(stderr, "basalt-probe: prefill share: balance %.2f, %+.1f%% over %.2f\n", star, gain * 100.0, base);
+            basalt::log::info("basalt-probe", "prefill share: balance %.2f, %+.1f%% over %.2f", star, gain * 100.0, base);
             if (star >= 0 && gain > kShareMinGain) suggested.push_back(suggest_share(star, base, gain));
         }
     }
     eng.stop();
-    std::fprintf(stderr, "basalt-probe: %.1f s after READY\n", std::chrono::duration<double>(Clock::now() - t_ready).count());
+    basalt::log::info("basalt-probe", "%.1f s after READY", std::chrono::duration<double>(Clock::now() - t_ready).count());
 
     ReportInput in;
     in.command_line = "basalt-probe";

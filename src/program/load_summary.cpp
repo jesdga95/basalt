@@ -1,6 +1,8 @@
 // src/program/load_summary.cpp - see load_summary.hpp.
 #include "basalt/program/load_summary.hpp"
 
+#include "basalt/log.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
@@ -72,12 +74,13 @@ std::string LoadSummary::redraw(double now) {
 }
 
 std::string LoadSummary::feed(const std::string& raw, double now) {
-    static const std::string err_tag = "basalt error: ", tag = "basalt load: ";
-    if (raw.rfind(err_tag, 0) == 0) {
+    static const std::string tag = "basalt load: ";
+    basalt::log::Parsed p;
+    if (basalt::log::parse(raw, p) && p.level == basalt::log::Level::error) {
         const std::string pre = drawn_ ? kClear : "";
         drawn_ = false;
         last_out_ = now;
-        return pre + line("engine: " + raw.substr(err_tag.size()));
+        return pre + line("engine: " + p.text);
     }
     if (raw.rfind(tag, 0) != 0) return "";
     std::istringstream is(raw.substr(tag.size()));
