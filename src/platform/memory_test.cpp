@@ -225,6 +225,16 @@ int main() {
                 (unsigned long long) (r.locked_bytes >> 10), (unsigned long long) (bytes >> 10), r.note.c_str());
     int fail = !(r.ok && r.locked_bytes == bytes) | fail_keeps;
     basalt::platform::unlock_resident(p, bytes);
+    // With a progress callback the lock runs in chunks: the counts only rise and the last one is the whole region.
+    std::vector<uint64_t> seen;
+    const basalt::platform::LockResult rp =
+        basalt::platform::lock_resident(p, bytes, [&](uint64_t done) { seen.push_back(done); });
+    bool rising = !seen.empty() && seen.back() == bytes;
+    for (size_t i = 1; i < seen.size(); ++i) rising = rising && seen[i] > seen[i - 1];
+    std::printf("lock_resident with progress: ok=%d %zu reports%s\n", (int) rp.ok, seen.size(),
+                rising ? "" : "   <-- WRONG");
+    fail |= !(rp.ok && rp.locked_bytes == bytes && rising);
+    basalt::platform::unlock_resident(p, bytes);
     std::free(p);
     std::printf("platform_memory_test: %s\n", fail ? "FAILED" : "OK");
     return fail;

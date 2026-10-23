@@ -1636,6 +1636,23 @@ class LoadProgress(unittest.TestCase):
         bars.update("ram", 0, 2 << 30)
         self.assertEqual([r.split(" [")[0].split()[-1] for r in bars.lines()], ["cuda2", "cuda3", "ram"])
 
+    def test_the_ngram_table_lock_is_its_own_row_outside_the_total(self):
+        from serve.engine.progress import LoadBars, load_progress
+        self.assertEqual(load_progress("basalt load: ngram 1073741824 3221225472"), ("ngram", 1 << 30, 3 << 30, False))
+        out = Tty()
+        bars = LoadBars(out, gpus=[2, 3])
+        bars.set_total(2 << 30)
+        bars.set_plan("cuda0", 2 << 30)
+        bars.update("cuda0", 2 << 30, 2 << 30)
+        bars.update("ngram", 1 << 30, 3 << 30)                          # no plan line: the total is the plan
+        rows = [r.split("\x1b[2K")[-1] for r in out.getvalue().splitlines()[-2:]]
+        self.assertEqual(rows[0], "[server] loading weights into cuda2".ljust(49) + " [" + "=" * 24 + "]   2.0/2.0 GiB")
+        self.assertEqual(rows[1], "[server] loading the n-gram table into system ram [" + "=" * 8 + ">" + " " * 15 + "]   1.0/3.0 GiB")
+        bars.update("ngram", 3 << 30, 3 << 30)
+        bars.finish()
+        self.assertIn("[server] loaded 2.0 GiB in ", out.getvalue())     # the table is not part of the loaded bytes
+        self.assertIn("(cuda2 2.0 GiB)", out.getvalue())
+
     def test_kv_is_a_line_after_the_result_and_not_a_load(self):
         from serve.engine.progress import LoadBars, load_kv, load_progress
         self.assertEqual(load_kv("basalt load: kv cuda0 4509715660 262144"), ("cuda0", 4509715660, 262144, "", 4509715660))

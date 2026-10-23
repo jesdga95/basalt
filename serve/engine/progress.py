@@ -53,6 +53,7 @@ class LoadBars:
     terminal only that line is printed."""
 
     WIDTH = 24
+    TABLE = "ngram"                                    # the n-gram table locked into RAM: its own row, outside the total
 
     def __init__(self, out=None, gpus=None):
         self.out = out or sys.stdout
@@ -76,7 +77,7 @@ class LoadBars:
         return self.targets.setdefault((target, copy), {"plan": 0, "done": 0, "last": 0, "seen": 0, "start": None})
 
     def done(self) -> int:
-        return sum(t["done"] + t["last"] for (_, c), t in self.targets.items() if not c)
+        return sum(t["done"] + t["last"] for (tg, c), t in self.targets.items() if not c and tg != self.TABLE)
 
     @staticmethod
     def _bar(done: int, total: int, width: int) -> str:
@@ -91,6 +92,9 @@ class LoadBars:
             have = t["done"] + t["last"]
             if t["plan"] <= 0 and not have:
                 continue                               # planned to hold nothing
+            if target == self.TABLE:
+                rows.append(("[server] loading the n-gram table into system ram", have, t["plan"]))
+                continue
             verb = "copying experts to" if copy else "loading weights into"
             rows.append((f"[server] {verb} {self.name(target)}", have, t["plan"]))
         pad = max((len(r[0]) for r in rows), default=0)
@@ -181,6 +185,8 @@ class LoadBars:
             t["last"] = 0
             t["seen"] = total
         t["last"] = done
+        if target == self.TABLE:
+            t["plan"] = total
         self._erase()
         self._draw()
 
@@ -188,11 +194,11 @@ class LoadBars:
         """The engine is up: replace the bars with the result line."""
         self._erase()
         done = self.done()
-        want = self.total or sum(t["plan"] for (_, c), t in self.targets.items() if not c)
+        want = self.total or sum(t["plan"] for (tg, c), t in self.targets.items() if not c and tg != self.TABLE)
         if done > 0 and done >= want:                  # a failed start is reported elsewhere
             def part(copy):
                 return {tg: t["done"] + t["last"] for (tg, c), t in self.targets.items()
-                        if c == copy and t["done"] + t["last"]}
+                        if c == copy and tg != self.TABLE and t["done"] + t["last"]}
             parts = ", ".join(f"{self.name(tg)} {b / 2**30:.1f} GiB" for tg, b in part(False).items())
             extra = "".join(f"; {self.name(tg)} copy {b / 2**30:.1f} GiB" for tg, b in part(True).items())
             self.out.write(f"[server] loaded {done / 2**30:.1f} GiB in {time.time() - self.t0:.1f} s "

@@ -67,10 +67,10 @@ void MappedFile::prefetch(uint64_t, uint64_t) const {}   // no per-range read-ah
 
 uint64_t MappedFile::release(uint64_t, uint64_t) const { return 0; }   // nothing is dropped, so nothing is reported
 
-LockResult lock_view(void* p, uint64_t bytes) {
+LockResult lock_view(void* p, uint64_t bytes, const LockProgress& progress) {
     // Locked pages count against the process working-set minimum, which lock_resident raises first. A view of a file
     // mapping can still refuse the lock; the caller then touches the pages to get them resident.
-    return lock_resident(p, bytes);
+    return lock_resident(p, bytes, progress);
 }
 
 #else
@@ -132,9 +132,9 @@ uint64_t MappedFile::release(uint64_t off, uint64_t len) const {
     return end - start;
 }
 
-LockResult lock_view(void* p, uint64_t bytes) {
+LockResult lock_view(void* p, uint64_t bytes, const LockProgress& progress) {
     if (p != nullptr && bytes != 0) madvise(p, (size_t) bytes, MADV_WILLNEED);
-    return lock_resident(p, bytes);
+    return lock_resident(p, bytes, progress);
 }
 
 #endif

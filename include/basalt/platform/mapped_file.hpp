@@ -69,6 +69,6 @@ private:
 
 /// Locks [p, p + bytes) of a mapped view into RAM after asking the OS to read it in, and reports how far it got
 /// (see lock_resident). Used for a table that decode touches at random.
-LockResult lock_view(void* p, uint64_t bytes);
+LockResult lock_view(void* p, uint64_t bytes, const LockProgress& progress = nullptr);
 
 }  // namespace basalt::platform

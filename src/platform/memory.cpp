@@ -42,7 +42,7 @@ void enable_privilege(LPCWSTR name) {
 }  // namespace
 #endif
 
-LockResult lock_resident(void* p, uint64_t bytes) {
+LockResult lock_resident(void* p, uint64_t bytes, const LockProgress& progress) {
     LockResult r;
     if (p == nullptr || bytes == 0) { r.note = "nothing to lock"; return r; }
 #if defined(_WIN32)
@@ -68,7 +68,7 @@ LockResult lock_resident(void* p, uint64_t bytes) {
                          " MiB) failed (error " + std::to_string(GetLastError()) + ")";
     }
     // Chunked, because one call over the whole region loses everything past the first page that does not fit.
-    const uint64_t chunk = 1ull << 30;
+    const uint64_t chunk = progress ? 256ull << 20 : 1ull << 30;
     uint8_t* base = (uint8_t*) p;
     for (uint64_t off = 0; off < bytes; off += chunk) {
         const uint64_t n = bytes - off < chunk ? bytes - off : chunk;
@@ -81,6 +81,7 @@ LockResult lock_resident(void* p, uint64_t bytes) {
             return r;
         }
         r.locked_bytes = off + n;
+        if (progress) progress(r.locked_bytes);
     }
     r.ok = true;
     const std::string locked = std::to_string((unsigned long long) (bytes >> 20)) + " MiB";
@@ -88,9 +89,25 @@ LockResult lock_resident(void* p, uint64_t bytes) {
                                 : quota_note + "; locked " + locked + " with the quota already in place";
     return r;
 #else
-    if (mlock(p, bytes) != 0) { r.note = "mlock failed (raise ulimit -l)"; return r; }
+    if (!progress) {
+        if (mlock(p, bytes) != 0) { r.note = "mlock failed (raise ulimit -l)"; return r; }
+        r.ok = true;
+        r.locked_bytes = bytes;
+        r.note = "mlock";
+        return r;
+    }
+    const uint64_t chunk = 256ull << 20;
+    for (uint64_t off = 0; off < bytes; off += chunk) {
+        const uint64_t n = bytes - off < chunk ? bytes - off : chunk;
+        if (mlock((uint8_t*) p + off, (size_t) n) != 0) {
+            r.note = "mlock failed (raise ulimit -l)";
+            r.ok = off > 0;   // what it did lock stays locked; the rest of the region is merely pageable
+            return r;
+        }
+        r.locked_bytes = off + n;
+        progress(r.locked_bytes);
+    }
     r.ok = true;
-    r.locked_bytes = bytes;
     r.note = "mlock";
     return r;
 #endif

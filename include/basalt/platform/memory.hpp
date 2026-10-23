@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace basalt::platform {
@@ -16,8 +17,12 @@ struct LockResult {
     std::string note;            ///< what was done or why it failed, for the startup print
 };
 
-/// Lock [p, p + bytes) into physical memory. Partial success is reported, not hidden.
-LockResult lock_resident(void* p, uint64_t bytes);
+/// Called with the bytes locked so far, after each chunk of a lock that was given one.
+using LockProgress = std::function<void(uint64_t done)>;
+
+/// Lock [p, p + bytes) into physical memory. Partial success is reported, not hidden. With `progress` the region is
+/// locked in chunks (a prefix stays locked when a later chunk is refused) and `progress` hears each one finish.
+LockResult lock_resident(void* p, uint64_t bytes, const LockProgress& progress = nullptr);
 
 /// Undo lock_resident for the same region (best effort).
 void unlock_resident(void* p, uint64_t bytes);
