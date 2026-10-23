@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -998,7 +999,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
                       bool skip_identity) {
     if (nq <= 0) return;
     if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > 65535) {
-        std::fprintf(stderr, "qsa_block_scores: unsupported indexer geometry\n");
+        basalt::log::error("basalt", "qsa_block_scores: unsupported indexer geometry");
         std::exit(1);
     }
     // a block past a query's n_bid returns at once: the grid need only reach the batch's largest n_bid (C-1)
@@ -1022,7 +1023,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
             launch_pdl(block_scores_rg_kernel<8>, g, dim3(SCORE_WARPS * 32), 0, (cudaStream_t) stream, pooled, dead, q_idx,
                        steps, (int) nq, max_blocks, scores, skip_identity ? 1 : 0);
         const cudaError_t e = cudaGetLastError();
-        if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores rg: %s\n", cudaGetErrorString(e)); std::exit(1); }
+        if (e != cudaSuccess) { basalt::log::error("basalt", "qsa_block_scores rg: %s", cudaGetErrorString(e)); std::exit(1); }
         return;
     }
     const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
@@ -1030,20 +1031,20 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     block_scores_kernel<<<grid, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, max_blocks,
                                                                               scores);
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { basalt::log::error("basalt", "qsa_block_scores: %s", cudaGetErrorString(e)); std::exit(1); }
 }
 
 void qsa_block_scores_seg(const QsaSegTable& t, const float* q_idx, const int32_t* steps, int64_t nq, int64_t max_blocks,
                           const QsaShapes& s, float* scores, void* stream, bool skip_identity) {
     if (nq <= 0) return;
     if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > MQS || t.n_rows < nq) {
-        std::fprintf(stderr, "qsa_block_scores_seg: unsupported indexer geometry or row count\n");
+        basalt::log::error("basalt", "qsa_block_scores_seg: unsupported indexer geometry or row count");
         std::exit(1);
     }
     launch_pdl(block_scores_seg_kernel, dim3(256), dim3(SCORE_WARPS * 32), 0, (cudaStream_t) stream, t, q_idx, steps,
                (int) nq, max_blocks, scores, skip_identity ? 1 : 0);
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_seg: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { basalt::log::error("basalt", "qsa_block_scores_seg: %s", cudaGetErrorString(e)); std::exit(1); }
 }
 
 bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
@@ -1083,7 +1084,7 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
                                                                          scores);
     block_scores_tail_kernel<<<(unsigned) nq, 32, 0, (cudaStream_t) stream>>>(dead, q_idx, steps, max_blocks, scores);
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_tc: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { basalt::log::error("basalt", "qsa_block_scores_tc: %s", cudaGetErrorString(e)); std::exit(1); }
     return true;
 }
 
@@ -1091,12 +1092,12 @@ void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, i
                         const QsaShapes& s, int32_t* ids, void* stream) {
     if (nq <= 0) return;
     if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s)) {
-        std::fprintf(stderr, "qsa_block_topk: unsupported geometry or cap\n");
+        basalt::log::error("basalt", "qsa_block_topk: unsupported geometry or cap");
         std::exit(1);
     }
     block_topk_kernel<<<(unsigned) nq, TOPK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { basalt::log::error("basalt", "qsa_block_topk: %s", cudaGetErrorString(e)); std::exit(1); }
 }
 
 namespace {
@@ -1165,7 +1166,7 @@ bool topk_cluster_launch(const float* scores, const int32_t* steps, int64_t nq, 
         cfg.numAttrs = 2;
     }
     const cudaError_t e = cudaLaunchKernelEx(&cfg, kern, scores, steps, max_blocks, cap, ids);
-    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk cluster: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { basalt::log::error("basalt", "qsa_block_topk cluster: %s", cudaGetErrorString(e)); std::exit(1); }
     return true;
 }
 }  // namespace
@@ -1190,7 +1191,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         return;
     }
     if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s)) {
-        std::fprintf(stderr, "qsa_block_topk: unsupported geometry or cap\n");
+        basalt::log::error("basalt", "qsa_block_topk: unsupported geometry or cap");
         std::exit(1);
     }
     if (reach > fit)   // past the register kernel's reach
@@ -1201,7 +1202,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     else
         block_topk_reg_kernel<TK_PER_MAX><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { basalt::log::error("basalt", "qsa_block_topk: %s", cudaGetErrorString(e)); std::exit(1); }
 }
 
 }  // namespace basalt::kernels

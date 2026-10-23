@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels::cpu {
 
@@ -162,7 +163,7 @@ int ExpertPool::claim(uint32_t epoch) {
 
 uint32_t ExpertPool::begin_batch(int n) {
     if (n < 0 || n > 0xffff) {
-        std::fprintf(stderr, "basalt: expert pool batch of %d jobs is out of range\n", n);
+        basalt::log::error("basalt", "expert pool batch of %d jobs is out of range", n);
         std::abort();
     }
     // Every job of the previous batch has completed (`wait_done`), and a claim of it can no longer succeed, so
@@ -185,11 +186,10 @@ void ExpertPool::wait_parked(const char* what) {
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u) t0 = now;
         else if (now - t0 > kStall) {
-            std::fprintf(stderr, "basalt: the CPU expert pool stalled %s (%u of %d workers parked) - stopping the engine "
-                                 "so the server can start it again\n",
+            basalt::log::error("basalt", "the CPU expert pool stalled %s (%u of %d workers parked) - stopping the engine "
+                                 "so the server can start it again",
                          what, parked_.load(), n_);
-            basalt::core::release_gpu_waits(stderr);   // the GPU may be spinning on this layer's flag
-            std::fflush(stderr);
+            basalt::core::release_gpu_waits(basalt::log::stream());   // the GPU may be spinning on this layer's flag
             std::abort();
         }
     }
@@ -208,11 +208,10 @@ void ExpertPool::wait_done(int n) {
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u || d != seen) { t0 = now; seen = d; }     // progress restarts the clock
         else if (now - t0 > kStall) {
-            std::fprintf(stderr, "basalt: the CPU expert pool stalled: %u of %d jobs done, %u of %d workers parked - "
-                                 "stopping the engine so the server can start it again\n",
+            basalt::log::error("basalt", "the CPU expert pool stalled: %u of %d jobs done, %u of %d workers parked - "
+                                 "stopping the engine so the server can start it again",
                          d, n, parked_.load(), n_);
-            basalt::core::release_gpu_waits(stderr);
-            std::fflush(stderr);
+            basalt::core::release_gpu_waits(basalt::log::stream());
             std::abort();
         }
     }

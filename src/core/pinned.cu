@@ -14,6 +14,7 @@
 #include <fstream>
 #include <mutex>
 #include <thread>
+#include "basalt/log.hpp"
 
 namespace basalt::core {
 
@@ -256,7 +257,7 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
     for (auto& t : pool) t.join();
 
     if (!err.empty()) {
-        std::fprintf(stderr, "load_experts: %s\n", err.c_str());
+        basalt::log::error("basalt", "load_experts: %s", err.c_str());
         st.seconds = -1.0;
         st.ok = false;
         st.error = err;
@@ -277,7 +278,7 @@ StreamStats stream_bandwidth(const uint8_t* src, uint64_t bytes, uint64_t chunk,
     uint8_t* dst = nullptr;
     cudaStream_t s{};
     if (cudaMalloc(&dst, (size_t) chunk) != cudaSuccess) {
-        std::fprintf(stderr, "stream_bandwidth: cudaMalloc failed for %llu B\n", (unsigned long long) chunk);
+        basalt::log::error("basalt", "stream_bandwidth: cudaMalloc failed for %llu B", (unsigned long long) chunk);
         st.seconds = -1.0;
         return st;
     }

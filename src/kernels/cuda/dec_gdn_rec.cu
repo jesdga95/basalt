@@ -21,6 +21,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace cg = cooperative_groups;
 
@@ -355,7 +356,7 @@ __global__ void __launch_bounds__(128) rec_norm_kernel(const DecRecArgs a, int T
 #ifndef FZ_DEV_ONLY   // host side: another translation unit (the mid chain) takes only the device code
 void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream) {
     if (n_tok < 1 || n_tok > kDecMaxT || a.n_embd != 32 * 8 * NJ || a.h_k <= 0 || a.h_v % a.h_k != 0) {
-        std::fprintf(stderr, "dec_gdn_rec: invalid arguments\n");
+        basalt::log::error("basalt", "dec_gdn_rec: invalid arguments");
         std::exit(1);
     }
     const dim3 grid((unsigned) (a.h_v * 4)), block(S);
@@ -364,13 +365,13 @@ void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream) {
     else if (n_tok <= 4) launch_pdl(rec_kernel<4>, grid, block, 0, s, a, n_tok);
     else launch_pdl(rec_kernel<kDecMaxT>, grid, block, 0, s, a, n_tok);
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "dec_gdn_rec: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { basalt::log::error("basalt", "dec_gdn_rec: %s", cudaGetErrorString(e)); std::exit(1); }
 }
 
 void dec_gdn_rec_seg(const DecRecArgs& a, const SegRow* rows, size_t state_off, int n_rows, int max_n, void* stream) {
     if (n_rows < 1 || max_n < 1 || max_n > kDecMaxT || !rows || a.n_embd != 32 * 8 * NJ || a.h_k <= 0 ||
         a.h_v % a.h_k != 0) {
-        std::fprintf(stderr, "dec_gdn_rec_seg: invalid arguments\n");
+        basalt::log::error("basalt", "dec_gdn_rec_seg: invalid arguments");
         std::exit(1);
     }
     const dim3 grid((unsigned) (a.h_v * 4), (unsigned) n_rows), block(S);
@@ -379,12 +380,12 @@ void dec_gdn_rec_seg(const DecRecArgs& a, const SegRow* rows, size_t state_off, 
     else if (max_n <= 4) launch_pdl(rec_seg_kernel<4>, grid, block, 0, s, a, rows, state_off);
     else launch_pdl(rec_seg_kernel<kDecMaxT>, grid, block, 0, s, a, rows, state_off);
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "dec_gdn_rec_seg: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { basalt::log::error("basalt", "dec_gdn_rec_seg: %s", cudaGetErrorString(e)); std::exit(1); }
 }
 
 void dec_gdn_rec_split(const DecRecArgs& a, int n_tok, void* stream) {
     if (n_tok < 1 || n_tok > kDecMaxT || a.n_embd != 32 * 8 * NJ || a.h_k <= 0 || a.h_v % a.h_k != 0 || !a.o) {
-        std::fprintf(stderr, "dec_gdn_rec_split: invalid arguments\n");
+        basalt::log::error("basalt", "dec_gdn_rec_split: invalid arguments");
         std::exit(1);
     }
     const dim3 grid((unsigned) (a.h_v * 4)), block(S);
@@ -393,14 +394,14 @@ void dec_gdn_rec_split(const DecRecArgs& a, int n_tok, void* stream) {
     else if (n_tok <= 4) launch_pdl(rec_split_kernel<4>, grid, block, 0, s, a, n_tok);
     else launch_pdl(rec_split_kernel<kDecMaxT>, grid, block, 0, s, a, n_tok);
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "dec_gdn_rec_split: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { basalt::log::error("basalt", "dec_gdn_rec_split: %s", cudaGetErrorString(e)); std::exit(1); }
 }
 
 void dec_gdn_rec_norm(const DecRecArgs& a, int n_tok, void* stream) {
     const unsigned blocks = (unsigned) ((n_tok * a.h_v + 3) / 4);
     launch_pdl(rec_norm_kernel, dim3(blocks), dim3(128), 0, (cudaStream_t) stream, a, n_tok);
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "dec_gdn_rec_norm: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { basalt::log::error("basalt", "dec_gdn_rec_norm: %s", cudaGetErrorString(e)); std::exit(1); }
 }
 
 #endif

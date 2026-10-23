@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 
@@ -14,7 +15,7 @@ inline int opt_in_device(const char* who) {
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= 64) {
-        std::fprintf(stderr, "%s: device %d out of range\n", who, dev);
+        basalt::log::error("basalt", "%s: device %d out of range", who, dev);
         std::abort();
     }
     return dev;
@@ -22,7 +23,7 @@ inline int opt_in_device(const char* who) {
 
 inline void opt_in_check(cudaError_t e, const char* who) {
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: shared-memory opt-in failed: %s\n", who, cudaGetErrorString(e));
+        basalt::log::error("basalt", "%s: shared-memory opt-in failed: %s", who, cudaGetErrorString(e));
         std::abort();
     }
 }

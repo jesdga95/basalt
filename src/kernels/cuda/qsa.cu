@@ -54,6 +54,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -61,14 +62,14 @@ namespace {
 constexpr int THREADS = 128;
 
 void fail(const char* what) {
-    std::fprintf(stderr, "qsa: %s\n", what);
+    basalt::log::error("basalt", "qsa: %s", what);
     std::exit(1);
 }
 
 void check_launch(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "qsa: %s launch: %s\n", what, cudaGetErrorString(e));
+        basalt::log::error("basalt", "qsa: %s launch: %s", what, cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -79,7 +80,7 @@ void check_launch(const char* what) {
 void check_sync(const char* what) {
     const cudaError_t e = cudaDeviceSynchronize();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "qsa: %s (synchronise): %s\n", what, cudaGetErrorString(e));
+        basalt::log::error("basalt", "qsa: %s (synchronise): %s", what, cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -89,26 +90,26 @@ void check_sync(const char* what) {
 void validate(const QsaShapes& s, const char* who) {
     if (s.n_head <= 0 || s.n_head_kv <= 0 || s.head_dim <= 0 || s.idx_dim <= 0 || s.idx_n_head <= 0 ||
         s.idx_block < 2 || s.page_size < 1) {
-        std::fprintf(stderr, "qsa: %s: geometry is not set up\n", who);
+        basalt::log::error("basalt", "qsa: %s: geometry is not set up", who);
         std::exit(1);
     }
     if (s.n_head % s.n_head_kv != 0) {
-        std::fprintf(stderr, "qsa: %s: n_head %lld is not a multiple of n_head_kv %lld\n", who,
+        basalt::log::error("basalt", "qsa: %s: n_head %lld is not a multiple of n_head_kv %lld", who,
                      (long long) s.n_head, (long long) s.n_head_kv);
         std::exit(1);
     }
     if (s.head_dim % 4 != 0) {
-        std::fprintf(stderr, "qsa: %s: head_dim %lld must be a multiple of 4 (the gather copies uint2)\n", who,
+        basalt::log::error("basalt", "qsa: %s: head_dim %lld must be a multiple of 4 (the gather copies uint2)", who,
                      (long long) s.head_dim);
         std::exit(1);
     }
     if (s.n_rot <= 0 || s.n_rot % 2 != 0 || s.n_rot > s.head_dim || s.n_rot > s.idx_dim) {
-        std::fprintf(stderr, "qsa: %s: n_rot %lld must be even and <= head_dim %lld and idx_dim %lld\n", who,
+        basalt::log::error("basalt", "qsa: %s: n_rot %lld must be even and <= head_dim %lld and idx_dim %lld", who,
                      (long long) s.n_rot, (long long) s.head_dim, (long long) s.idx_dim);
         std::exit(1);
     }
     if (s.idx_n_head > 32) {
-        std::fprintf(stderr, "qsa: %s: idx_n_head %lld > 32 (one warp per indexer head)\n", who,
+        basalt::log::error("basalt", "qsa: %s: idx_n_head %lld > 32 (one warp per indexer head)", who,
                      (long long) s.idx_n_head);
         std::exit(1);
     }
@@ -539,7 +540,7 @@ int32_t* step_scratch() {
     static int32_t* d_step = nullptr;
     if (d_step == nullptr) {
         if (cudaMalloc(&d_step, qsa_step_bytes()) != cudaSuccess) {
-            std::fprintf(stderr, "qsa: step upload: cudaMalloc failed\n");
+            basalt::log::error("basalt", "qsa: step upload: cudaMalloc failed");
             std::exit(1);
         }
     }
@@ -549,7 +550,7 @@ int32_t* step_scratch() {
 void step_upload_raw(const int32_t* h_step) {
     int32_t* d = step_scratch();
     if (cudaMemcpy(d, h_step, qsa_step_bytes(), cudaMemcpyHostToDevice) != cudaSuccess) {
-        std::fprintf(stderr, "qsa: step upload: cudaMemcpy failed\n");
+        basalt::log::error("basalt", "qsa: step upload: cudaMemcpy failed");
         std::exit(1);
     }
 }
@@ -563,7 +564,7 @@ const int32_t* step_upload(int64_t pos, int64_t n_kv_hint, const QsaShapes& s) {
     // inconsistency `qsa_step_fill` exists to make impossible, so it is worth an exit rather than a silent
     // preference for one of the two.
     if (n_kv_hint >= 0 && n_kv_hint != (int64_t) h[kStepNKv]) {
-        std::fprintf(stderr, "qsa: step upload: n_kv %lld disagrees with pos+1 = %d\n", (long long) n_kv_hint,
+        basalt::log::error("basalt", "qsa: step upload: n_kv %lld disagrees with pos+1 = %d", (long long) n_kv_hint,
                      h[kStepNKv]);
         std::exit(1);
     }
@@ -627,7 +628,7 @@ void topk_512_step(const float* cell_scores, const QsaShapes& s, int64_t cap, co
     // `n_kv <= kTopkMaxCells`, so this is the most the kernel can ever write.
     const int64_t width_max = qsa_selection_width(kTopkMaxCells, s);
     if (cap < width_max) {
-        std::fprintf(stderr, "qsa: topk_512: cap %lld < the largest possible selection width %lld\n",
+        basalt::log::error("basalt", "qsa: topk_512: cap %lld < the largest possible selection width %lld",
                      (long long) cap, (long long) width_max);
         std::exit(1);
     }
@@ -674,14 +675,14 @@ void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* 
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&max_shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
         if ((int) smem > max_shared) {
-            std::fprintf(stderr, "qsa: qsa_attend: max_ids %lld needs %zu B of shared, over the %d B limit\n",
+            basalt::log::error("basalt", "qsa: qsa_attend: max_ids %lld needs %zu B of shared, over the %d B limit",
                          (long long) max_ids, smem, max_shared);
             std::exit(1);
         }
         const cudaError_t e =
             cudaFuncSetAttribute(qsa_attend_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
         if (e != cudaSuccess) {
-            std::fprintf(stderr, "qsa: qsa_attend: shared opt-in: %s\n", cudaGetErrorString(e));
+            basalt::log::error("basalt", "qsa: qsa_attend: shared opt-in: %s", cudaGetErrorString(e));
             std::exit(1);
         }
         s_configured = smem;
@@ -743,7 +744,7 @@ void qsa_index(const float* pooled, int64_t n_bid, const float* q_idx, const flo
     // `n_kv`, `n_bid` and `width` are DERIVED from one position, so this refuses a caller whose two arguments
     // disagree rather than launching a kernel that would score the wrong number of blocks.
     if ((n_kv / s.idx_block) != n_bid) {
-        std::fprintf(stderr, "qsa: qsa_index: n_bid %lld is not n_kv %lld / r %lld\n", (long long) n_bid,
+        basalt::log::error("basalt", "qsa: qsa_index: n_bid %lld is not n_kv %lld / r %lld", (long long) n_bid,
                      (long long) n_kv, (long long) s.idx_block);
         std::exit(1);
     }
@@ -757,7 +758,7 @@ void topk_512(const float* cell_scores, int64_t n_kv, const QsaShapes& s, int64_
     validate(s, "topk_512");
     if (n_kv <= 0) return;
     if (n_kv > kTopkMaxCells) {
-        std::fprintf(stderr, "qsa: topk_512: n_kv %lld > kTopkMaxCells %lld (one block; phase 3 replaces this)\n",
+        basalt::log::error("basalt", "qsa: topk_512: n_kv %lld > kTopkMaxCells %lld (one block; phase 3 replaces this)",
                      (long long) n_kv, (long long) kTopkMaxCells);
         std::exit(1);
     }

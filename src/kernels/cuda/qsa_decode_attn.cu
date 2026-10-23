@@ -9,6 +9,7 @@
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -215,7 +216,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     if (n_q <= 0) return;
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
         !pools.page_table || n_q > 65535) {
-        std::fprintf(stderr, "qsa_decode_attn_batch: unsupported geometry or missing buffers\n");
+        basalt::log::error("basalt", "qsa_decode_attn_batch: unsupported geometry or missing buffers");
         std::exit(1);
     }
     const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
@@ -245,7 +246,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
                                                                                   attn, stride);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "qsa_decode_attn_batch: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "qsa_decode_attn_batch: %s", cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -259,7 +260,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, void* stream) {
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !step ||
         !pools.page_table) {
-        std::fprintf(stderr, "qsa_decode_attn: unsupported geometry or missing buffers\n");
+        basalt::log::error("basalt", "qsa_decode_attn: unsupported geometry or missing buffers");
         std::exit(1);
     }
     const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
@@ -267,7 +268,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     if (kv_mode == 3 ? (!pools.k_scale || !pools.v_q4)
                      : (kv_mode == 2 ? (!pools.v_q4) : (kv_mode == 1 ? (!pools.v_q || !pools.k_scale || !pools.v_scale)
                                                                      : (!pools.k_pool || !pools.v_pool)))) {
-        std::fprintf(stderr, "qsa_decode_attn: incomplete KV pools\n");
+        basalt::log::error("basalt", "qsa_decode_attn: incomplete KV pools");
         std::exit(1);
     }
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
@@ -292,7 +293,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     attn_merge_kernel<<<(unsigned) s.n_head, HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, attn);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "qsa_decode_attn: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "qsa_decode_attn: %s", cudaGetErrorString(e));
         std::exit(1);
     }
 }

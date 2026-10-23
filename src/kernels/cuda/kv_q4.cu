@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -15,7 +16,7 @@ namespace {
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "kv_q4: %s: %s\n", what, cudaGetErrorString(e));
+        basalt::log::error("basalt", "kv_q4: %s: %s", what, cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -174,7 +175,7 @@ __global__ void kv_gather_q4_kernel(const uint8_t* __restrict__ k_q4, const uint
 
 void need_256(const QsaShapes& s, const char* what) {
     if (s.head_dim != 256) {
-        std::fprintf(stderr, "%s: head_dim must be 256 (the Hadamard transform's size)\n", what);
+        basalt::log::error("basalt", "%s: head_dim must be 256 (the Hadamard transform's size)", what);
         std::exit(1);
     }
 }

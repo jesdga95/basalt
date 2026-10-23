@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -272,7 +273,7 @@ RopeArgs rope_args(const RopeScaling& scaling) {
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+        basalt::log::error("basalt", "%s: %s", what, cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -287,7 +288,7 @@ bool qsa_dec_fused_supported(const QsaShapes& s) {
 void qsa_dec_kv_post(const QsaDecKvPost& a, int n, const QsaShapes& s, const RopeScaling& scaling, void* stream) {
     if (n <= 0) return;
     if (!qsa_dec_fused_supported(s) || rope_scaling_invalid(scaling) != nullptr) {
-        std::fprintf(stderr, "qsa_dec_kv_post: unsupported geometry or scaling\n");
+        basalt::log::error("basalt", "qsa_dec_kv_post: unsupported geometry or scaling");
         std::exit(1);
     }
     const RopeArgs ra = rope_args(scaling);
@@ -305,7 +306,7 @@ void qsa_dec_kv_post_seg(const QsaDecKvPost& a, const QsaSegTable& t, int n, con
                          const RopeScaling& scaling, void* stream) {
     if (n <= 0) return;
     if (!qsa_dec_fused_supported(s) || rope_scaling_invalid(scaling) != nullptr || t.n_seg <= 0 || t.n_seg > n) {
-        std::fprintf(stderr, "qsa_dec_kv_post_seg: unsupported geometry, scaling or table\n");
+        basalt::log::error("basalt", "qsa_dec_kv_post_seg: unsupported geometry, scaling or table");
         std::exit(1);
     }
     const RopeArgs ra = rope_args(scaling);
@@ -322,7 +323,7 @@ void qsa_dec_kv_post_seg(const QsaDecKvPost& a, const QsaSegTable& t, int n, con
 void qsa_dec_q_post(const QsaDecQPost& a, int n, const QsaShapes& s, const RopeScaling& scaling, void* stream) {
     if (n <= 0) return;
     if (!qsa_dec_fused_supported(s) || rope_scaling_invalid(scaling) != nullptr) {
-        std::fprintf(stderr, "qsa_dec_q_post: unsupported geometry or scaling\n");
+        basalt::log::error("basalt", "qsa_dec_q_post: unsupported geometry or scaling");
         std::exit(1);
     }
     const RopeArgs ra = rope_args(scaling);

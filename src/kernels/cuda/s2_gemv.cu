@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -47,7 +48,7 @@ void s2_gemv(const uint16_t* x, const uint8_t* codes, const float* scales, float
              int64_t n_out) {
     if (n_in <= 0 || n_out <= 0) return;
     if (n_in % QK != 0) {
-        std::fprintf(stderr, "s2_gemv: n_in %lld is not a multiple of %d\n", (long long) n_in, QK);
+        basalt::log::error("basalt", "s2_gemv: n_in %lld is not a multiple of %d", (long long) n_in, QK);
         std::exit(1);
     }
     const int threads = 128;
@@ -55,7 +56,7 @@ void s2_gemv(const uint16_t* x, const uint8_t* codes, const float* scales, float
     s2_gemv_kernel<<<(unsigned) blocks, threads>>>(x, codes, scales, y, n_in, n_out);
     const cudaError_t e = cudaDeviceSynchronize();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "s2_gemv: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "s2_gemv: %s", cudaGetErrorString(e));
         std::exit(1);
     }
 }

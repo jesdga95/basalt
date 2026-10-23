@@ -31,6 +31,7 @@
 #include <cstring>
 #include <mutex>
 #include <vector>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -1250,7 +1251,7 @@ bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* 
     cfg.gridDim = dim3(kAmCtas, (unsigned) n_tokens, 1);
     const cudaError_t e = cudaLaunchKernelEx(&cfg, sampler_greedy_cluster_kernel, logits, n_vocab, out);
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "sample_tokens cluster launch: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "sample_tokens cluster launch: %s", cudaGetErrorString(e));
         std::exit(1);
     }
     return true;
@@ -1294,7 +1295,7 @@ bool sample_greedy_top_prob(const float* logits, int n_tokens, int n_vocab, cons
     const cudaError_t e = cudaLaunchKernelEx(&cfg, sampler_greedy_top_prob_cluster_kernel, logits, n_vocab, map, out,
                                              probs);
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "sample_greedy_top_prob launch: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "sample_greedy_top_prob launch: %s", cudaGetErrorString(e));
         std::exit(1);
     }
     return true;
@@ -1317,7 +1318,7 @@ void sample_tokens_impl(int split, const float* logits, int n_tokens, int n_voca
     if (n_tokens <= 0 || n_vocab <= 0) return;
     if (qprob == nullptr) n_query = 0;
     if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) {
-        std::fprintf(stderr, "sample_tokens: penalty_last_n %d needs a history (got %p, len %d)\n",
+        basalt::log::error("basalt", "sample_tokens: penalty_last_n %d needs a history (got %p, len %d)",
                      p.penalty_last_n, (const void*) history, history_len);
         std::exit(1);
     }
@@ -1364,7 +1365,7 @@ void sample_tokens_impl(int split, const float* logits, int n_tokens, int n_voca
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "sample_tokens launch: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "sample_tokens launch: %s", cudaGetErrorString(e));
         std::exit(1);
     }
     if (stream == nullptr) cudaDeviceSynchronize();

@@ -13,6 +13,7 @@
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 // `ushort` comes from the POSIX sys/types.h where there is one; redeclaring the same type is harmless.
 using ushort = unsigned short;
@@ -749,7 +750,7 @@ void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids,
                   float* attn_gated, void* xq) {
     if (n_q <= 0) return;
     if (!qsa_dec_attn_supported(pools, s) || cap <= 0 || !scratch || !ids || !steps || n_q > 65535) {
-        std::fprintf(stderr, "qsa_dec_attn: unsupported geometry, pools or buffers\n");
+        basalt::log::error("basalt", "qsa_dec_attn: unsupported geometry, pools or buffers");
         std::exit(1);
     }
     const int mode = kv_mode_of(pools);
@@ -791,7 +792,7 @@ void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids,
     else launch_pdl(attn_merge_v2, dim3((unsigned) s.n_head, (unsigned) n_q), dim3(THREADS), mbytes, st, a);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "qsa_dec_attn: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "qsa_dec_attn: %s", cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -802,7 +803,7 @@ void qsa_dec_attn_seg(const float* q, const QsaSegTable& t, bool int8, const int
     if (n_q <= 0) return;
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
         n_q > 65535 || t.n_rows < n_q) {
-        std::fprintf(stderr, "qsa_dec_attn_seg: unsupported geometry, table or buffers\n");
+        basalt::log::error("basalt", "qsa_dec_attn_seg: unsupported geometry, table or buffers");
         std::exit(1);
     }
     AttnArgs a;
@@ -830,7 +831,7 @@ void qsa_dec_attn_seg(const float* q, const QsaSegTable& t, bool int8, const int
     launch_pdl(attn_merge_v2, dim3((unsigned) s.n_head, (unsigned) n_q), dim3(THREADS), mbytes, st, a);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "qsa_dec_attn_seg: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "qsa_dec_attn_seg: %s", cudaGetErrorString(e));
         std::exit(1);
     }
 }

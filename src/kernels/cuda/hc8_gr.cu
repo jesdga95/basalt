@@ -15,6 +15,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -250,14 +251,14 @@ bool hc8_gr_read_multi(const FusedGrArgs* a, int n_tok, int64_t n_embd, int64_t 
     const bool have = hc8_view(a[0].w_up, vu) && (!inj || hc8_view(a[0].w_inject, vi));
     if (!have) {
         if (vd.owned || vu.owned) {
-            std::fprintf(stderr, "hc8_gr_read: a read's matrices are not all 8-bit copies\n");
+            basalt::log::error("basalt", "hc8_gr_read: a read's matrices are not all 8-bit copies");
             std::exit(1);
         }
         return false;
     }
     if (n_tok > MT || hc < 1 || hc > MAX_HC || vd.cols != D || vu.rows != D || vu.cols != vd.rows || vd.rows > MAX_LR ||
         (inj && (vi.rows != hc || vi.cols != D)) || n_embd % G8 != 0) {
-        std::fprintf(stderr, "hc8_gr_read: unsupported geometry (%d tokens, n_embd %lld, hc %lld, lr %d)\n", n_tok,
+        basalt::log::error("basalt", "hc8_gr_read: unsupported geometry (%d tokens, n_embd %lld, hc %lld, lr %d)", n_tok,
                      (long long) n_embd, (long long) hc, vd.rows);
         std::exit(1);
     }
@@ -267,7 +268,7 @@ bool hc8_gr_read_multi(const FusedGrArgs* a, int n_tok, int64_t n_embd, int64_t 
         if (!x.R || !x.w_norm || !x.lo || !x.rs || !x.mixed || (inj && !x.inject_out) || x.apply != a[0].apply ||
             (x.apply && (!x.bo_prev || !x.inj_prev || !x.R_out)) || x.w_down != a[0].w_down || x.w_up != a[0].w_up ||
             x.w_inject != a[0].w_inject || x.w_norm != a[0].w_norm) {
-            std::fprintf(stderr, "hc8_gr_read: invalid arguments for token %d\n", t);
+            basalt::log::error("basalt", "hc8_gr_read: invalid arguments for token %d", t);
             std::exit(1);
         }
         p.R[t] = x.R; p.R_out[t] = x.R_out; p.bo[t] = x.bo_prev; p.inj_prev[t] = x.inj_prev;
@@ -285,7 +286,7 @@ bool hc8_gr_read_multi(const FusedGrArgs* a, int n_tok, int64_t n_embd, int64_t 
     hc8_up_kernel<<<(unsigned) ((n_embd + UP_THREADS / 32 - 1) / (UP_THREADS / 32)), UP_THREADS, 0, st>>>(p);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "hc8_gr_read: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "hc8_gr_read: %s", cudaGetErrorString(e));
         std::exit(1);
     }
     return true;

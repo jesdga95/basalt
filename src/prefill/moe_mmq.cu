@@ -7,13 +7,14 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::prefill::mmq {
 namespace {
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "prefill mmq: %s: %s\n", what, cudaGetErrorString(e));
+        basalt::log::error("basalt", "prefill mmq: %s: %s", what, cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -153,9 +154,8 @@ bool fits(int t, int64_t w_rows) {
             static bool said[GGML_TYPE_COUNT] = {};
             if (t >= 0 && t < GGML_TYPE_COUNT && !said[t]) {
                 said[t] = true;
-                std::fprintf(stderr, "basalt: prompt kernels: llama.cpp's MMQ has no tile for %s (%lld rows) on GPU %d "
-                                     "(%zu bytes of shared memory per block): that product takes the non-MMQ path "
-                                     "\n", ggml_type_name((ggml_type) t), (long long) w_rows, id, smpbo);
+                basalt::log::warn("basalt", "prompt kernels: llama.cpp's MMQ has no tile for %s (%lld rows) on GPU %d "
+                                     "(%zu bytes of shared memory per block): that product takes the non-MMQ path ", ggml_type_name((ggml_type) t), (long long) w_rows, id, smpbo);
             }
             return false;
         }
@@ -214,7 +214,7 @@ void Context::run(const Product& p, void* stream) {
         case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, a, s); break;
         case GGML_TYPE_NVFP4: mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, a, s); break;
         default:
-            std::fprintf(stderr, "prefill mmq: type %d is not covered\n", (int) t);
+            basalt::log::error("basalt", "prefill mmq: type %d is not covered", (int) t);
             std::exit(1);
     }
     ck(cudaGetLastError(), "mul_mat_q");

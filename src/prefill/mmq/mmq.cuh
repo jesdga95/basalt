@@ -9,6 +9,7 @@
 
 #include <climits>
 #include <cstdint>
+#include "basalt/log.hpp"
 
 #define MMQ_ITER_K             256
 #define MMQ_NWARPS               8
@@ -951,7 +952,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             launch_mul_mat_q<type, 128, fallback>(ctx, args, stream);
             break;
         default:
-            fprintf(stderr, "J_best=%d\n", J_best);
+            basalt::log::error("basalt", "J_best=%d", J_best);
             GGML_ABORT("fatal error");
             break;
     }

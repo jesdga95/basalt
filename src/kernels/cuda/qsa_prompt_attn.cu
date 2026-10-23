@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <type_traits>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -790,7 +791,7 @@ bool launch_i8(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "qsa_prompt_attn_batch: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "qsa_prompt_attn_batch: %s", cudaGetErrorString(e));
         std::exit(1);
     }
     return true;
@@ -821,7 +822,7 @@ bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "qsa_prompt_attn_batch: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "qsa_prompt_attn_batch: %s", cudaGetErrorString(e));
         std::exit(1);
     }
     return true;

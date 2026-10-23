@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -13,14 +14,14 @@ namespace {
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "kv_q8: %s: %s\n", what, cudaGetErrorString(e));
+        basalt::log::error("basalt", "kv_q8: %s: %s", what, cudaGetErrorString(e));
         std::exit(1);
     }
 }
 
 void validate(const QsaShapes& s, const char* what) {
     if (s.head_dim % KV_Q8_GROUP != 0 || s.n_head_kv <= 0 || s.page_size <= 0) {
-        std::fprintf(stderr, "kv_q8: %s: head_dim %lld must be a multiple of %d\n", what, (long long) s.head_dim,
+        basalt::log::error("basalt", "kv_q8: %s: head_dim %lld must be a multiple of %d", what, (long long) s.head_dim,
                      KV_Q8_GROUP);
         std::exit(1);
     }

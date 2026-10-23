@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -114,7 +115,7 @@ void sync_if_needed(void* stream, const char* what) {
     if (stream != nullptr) return;
     const cudaError_t e = cudaDeviceSynchronize();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+        basalt::log::error("basalt", "%s: %s", what, cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -122,7 +123,7 @@ void sync_if_needed(void* stream, const char* what) {
 bool check_launch(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s launch: %s\n", what, cudaGetErrorString(e));
+        basalt::log::error("basalt", "%s launch: %s", what, cudaGetErrorString(e));
         std::exit(1);
     }
     return true;
@@ -235,7 +236,7 @@ __global__ void scatter_rows_kernel(const float4* __restrict__ src, float4* dst,
 void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t n, int64_t width, void* stream) {
     if (n <= 0) return;
     if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
-        std::fprintf(stderr, "scatter_rows_f32: width must be a multiple of 4 and both pointers 16-byte aligned\n");
+        basalt::log::error("basalt", "scatter_rows_f32: width must be a multiple of 4 and both pointers 16-byte aligned");
         std::exit(1);
     }
     scatter_rows_kernel<<<(unsigned) n, 128, 0, (cudaStream_t) stream>>>((const float4*) src, (float4*) dst, rows, width / 4);
@@ -244,7 +245,7 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
                            const int32_t* count, void* stream) {
     if (rows <= 0) return;
     if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
-        std::fprintf(stderr, "copy_rows_from_mapped: width must be a multiple of 4 and both pointers 16-byte aligned\n");
+        basalt::log::error("basalt", "copy_rows_from_mapped: width must be a multiple of 4 and both pointers 16-byte aligned");
         std::exit(1);
     }
     copy_rows_from_mapped_kernel<<<(unsigned) rows, 128, 0, (cudaStream_t) stream>>>((float4*) dst, (const volatile float4*) src,
@@ -253,7 +254,7 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     if (n <= 0) return;
     if ((n & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
-        std::fprintf(stderr, "copy_from_mapped: n must be a multiple of 4 and both pointers 16-byte aligned\n");
+        basalt::log::error("basalt", "copy_from_mapped: n must be a multiple of 4 and both pointers 16-byte aligned");
         std::exit(1);
     }
     const int64_t n4 = n / 4;
@@ -317,14 +318,14 @@ __global__ void doorbell_publish_value_kernel(const float* __restrict__ x, const
 void doorbell_publish_value(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k,
                             float* x_out, int32_t* ids_out, float* weights_out, uint32_t* d_seq, uint32_t value,
                             void* stream) {
-    if (k > 1024) { std::fprintf(stderr, "doorbell_publish: k too large\n"); std::exit(1); }
+    if (k > 1024) { basalt::log::error("basalt", "doorbell_publish: k too large"); std::exit(1); }
     doorbell_publish_value_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, ids, weights, (int) n, (int) k, x_out,
                                                                           ids_out, weights_out, d_seq, value);
 }
 
 void doorbell_publish(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k, float* x_out,
                       int32_t* ids_out, float* weights_out, uint32_t* d_seq, void* stream) {
-    if (k > 1024) { std::fprintf(stderr, "doorbell_publish: k too large\n"); std::exit(1); }
+    if (k > 1024) { basalt::log::error("basalt", "doorbell_publish: k too large"); std::exit(1); }
     doorbell_publish_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, ids, weights, (int) n, (int) k, x_out, ids_out,
                                                                     weights_out, d_seq);
     check_launch("doorbell_publish");
@@ -332,7 +333,7 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
 
 void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_res, int n_expert, int64_t n, int64_t k,
                           float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream) {
-    if (k > 1024) { std::fprintf(stderr, "doorbell_publish_res: k too large\n"); std::exit(1); }
+    if (k > 1024) { basalt::log::error("basalt", "doorbell_publish_res: k too large"); std::exit(1); }
     doorbell_publish_res_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, ids, d_res, n_expert, (int) n, (int) k,
                                                                         x_out, ids_out, d_seq);
     check_launch("doorbell_publish_res");

@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -154,7 +155,7 @@ void gdn_step(float* state, const float* q, const float* k, const float* v, cons
               const float* beta, float* o, const GdnShapes& s, void* stream) {
     if (s.S <= 0 || s.h_k <= 0 || s.h_v <= 0) return;
     if (s.S > 128) {
-        std::fprintf(stderr, "gdn_step: S = %lld exceeds the staged 128 (`ks`/`qs` are [8][128])\n",
+        basalt::log::error("basalt", "gdn_step: S = %lld exceeds the staged 128 (`ks`/`qs` are [8][128])",
                      (long long) s.S);
         std::exit(1);
     }
@@ -165,7 +166,7 @@ void gdn_step(float* state, const float* q, const float* k, const float* v, cons
     if (stream == nullptr) {
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {
-            std::fprintf(stderr, "gdn_step: %s\n", cudaGetErrorString(e));
+            basalt::log::error("basalt", "gdn_step: %s", cudaGetErrorString(e));
             std::exit(1);
         }
     }
@@ -180,7 +181,7 @@ void gdn_conv_step(float* conv_state, const float* x, const float* kW, float* ou
     if (stream == nullptr) {
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {
-            std::fprintf(stderr, "gdn_conv_step: %s\n", cudaGetErrorString(e));
+            basalt::log::error("basalt", "gdn_conv_step: %s", cudaGetErrorString(e));
             std::exit(1);
         }
     }
@@ -189,14 +190,14 @@ void gdn_conv_step(float* conv_state, const float* x, const float* kW, float* ou
 void gdn_l2_norm(float* x, int64_t rows, int64_t cols, float eps, void* stream) {
     if (rows <= 0 || cols <= 0) return;
     if (cols > 1024) {
-        std::fprintf(stderr, "gdn_l2_norm: cols = %lld exceeds the 1024-wide warp reduction\n", (long long) cols);
+        basalt::log::error("basalt", "gdn_l2_norm: cols = %lld exceeds the 1024-wide warp reduction", (long long) cols);
         std::exit(1);
     }
     gdn_l2_kernel<<<(unsigned) rows, 32, 0, (cudaStream_t) stream>>>(x, (int) cols, eps);
     if (stream == nullptr) {
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {
-            std::fprintf(stderr, "gdn_l2_norm: %s\n", cudaGetErrorString(e));
+            basalt::log::error("basalt", "gdn_l2_norm: %s", cudaGetErrorString(e));
             std::exit(1);
         }
     }
@@ -209,7 +210,7 @@ void gdn_out_norm(const float* o, const float* z, const float* ssm_norm, float* 
     if (stream == nullptr) {
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {
-            std::fprintf(stderr, "gdn_out_norm: %s\n", cudaGetErrorString(e));
+            basalt::log::error("basalt", "gdn_out_norm: %s", cudaGetErrorString(e));
             std::exit(1);
         }
     }

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -396,7 +397,7 @@ bool q5k_head_top1(const void* weights, const void* x_q8_1, float* y, int n_in, 
                (const Q81Block*) x_q8_1, y, n_out, map, out_id, out_prob, part, count);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "q5k_head_top1: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "q5k_head_top1: %s", cudaGetErrorString(e));
         std::exit(1);
     }
     return true;
@@ -416,7 +417,7 @@ void q5k_head_mask_unmapped(float* y, const int32_t* map, int n, void* stream) {
 
 void q5k_head_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
     if (!q5k_head_supported(n_in, ncols) || n_out <= 0 || !weights || !x_q8_1 || !y) {
-        std::fprintf(stderr, "q5k_head_mmvq: unsupported shape (n_in %d, ncols %d)\n", n_in, ncols);
+        basalt::log::error("basalt", "q5k_head_mmvq: unsupported shape (n_in %d, ncols %d)", n_in, ncols);
         std::exit(1);
     }
     const auto s = (cudaStream_t) stream;
@@ -432,7 +433,7 @@ void q5k_head_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, 
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "q5k_head_mmvq: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "q5k_head_mmvq: %s", cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -514,7 +515,7 @@ void q5k_proxy_pack(const void* q5k_rows, int64_t row0, int64_t n, void* proxy, 
         (const uint8_t*) q5k_rows, row0, n, (uint4*) proxy, px::scales(proxy, n_cap));
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "q5k_proxy_pack: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "q5k_proxy_pack: %s", cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -534,7 +535,7 @@ bool q5k_proxy_top1(const void* proxy, const void* q5k_rows, const void* x_q8_1,
                (const Q81Block*) x_q8_1, tiles, map, (const float2*) cand, (const float2*) part, out_id, out_prob);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "q5k_proxy_top1: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "q5k_proxy_top1: %s", cudaGetErrorString(e));
         std::exit(1);
     }
     return true;

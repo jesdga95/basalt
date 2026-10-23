@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::prefill {
 namespace {
@@ -58,7 +59,7 @@ __device__ float block_sum(float v, float* sh) {
 }
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "prefill %s: %s\n", what, cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { basalt::log::error("basalt", "prefill %s: %s", what, cudaGetErrorString(e)); std::exit(1); }
 }
 unsigned blocks_for(int64_t n, int t = 256) { return (unsigned) ((n + t - 1) / t); }
 
@@ -790,7 +791,7 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
     // The engine validates the resolved config at startup with the same rule (generate.cpp), so this only
     // fires for a caller that bypassed it; the prompt path has no error return here, so it stops the process.
     if (const char* why = basalt::kernels::rope_scaling_invalid(scaling)) {
-        std::fprintf(stderr, "prefill rope: invalid rope scaling: %s\n", why);
+        basalt::log::error("basalt", "prefill rope: invalid rope scaling: %s", why);
         std::exit(1);
     }
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / 64.0f);

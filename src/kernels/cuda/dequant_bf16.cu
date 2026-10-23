@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -208,7 +209,7 @@ template <typename T>
 void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, T* out, void* stream) {
     int be = 0, bb = 0;
     if (!geometry(type, be, bb) || cols % be != 0 || rows <= 0) {
-        std::fprintf(stderr, "dequant: unsupported type %d or shape %lld x %lld\n", type, (long long) rows,
+        basalt::log::error("basalt", "dequant: unsupported type %d or shape %lld x %lld", type, (long long) rows,
                      (long long) cols);
         std::exit(1);
     }
@@ -236,7 +237,7 @@ const bool vec = (reinterpret_cast<uintptr_t>(out) & 15) == 0;
     }
 #undef DEQUANT_CASE
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { basalt::log::error("basalt", "dequant launch: %s", cudaGetErrorString(e)); std::exit(1); }
 }
 
 }  // namespace

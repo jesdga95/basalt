@@ -27,6 +27,7 @@ using namespace basalt::kernels;
 #include "attn_chain_bound.cuh"
 #define mkc mkmid
 #include "attn_chain_kernel.cuh"
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 bool tmap_2d(CUtensorMap* m, const void* base, CUtensorMapDataType ty, uint64_t cols, uint64_t rows, uint64_t stride, uint32_t box_c, uint32_t box_r);
@@ -478,7 +479,7 @@ void mid_chain_init() {
     cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
     if (!hc_fused_supported() || sms < kMidCtas || optin < SMEM_MAX) {
-        std::fprintf(stderr, "mid_chain: device not covered (%d SMs, %d B optin smem; need %d, %d): the unfused kernels run\n", sms, optin, kMidCtas, SMEM_MAX);
+        basalt::log::warn("basalt", "mid_chain: device not covered (%d SMs, %d B optin smem; need %d, %d): the unfused kernels run", sms, optin, kMidCtas, SMEM_MAX);
         return;
     }
     bool ok = cudaMalloc((void**) &d.cnt, (2 * NCTR + 1) * 4) == cudaSuccess &&
@@ -495,7 +496,7 @@ void mid_chain_init() {
     cudaDeviceSynchronize();
     d.ok = ok && cudaGetLastError() == cudaSuccess;
     if (!d.ok) {
-        std::fprintf(stderr, "mid_chain: FATAL: kernel initialisation failed on a covered device (%s)\n", cudaGetErrorString(cudaGetLastError()));
+        basalt::log::error("basalt", "mid_chain: FATAL: kernel initialisation failed on a covered device (%s)", cudaGetErrorString(cudaGetLastError()));
         std::exit(1);
     }
 }
@@ -514,7 +515,7 @@ bool mid_chain_supported(const MidChainArgs& a) {
 void mid_chain(const MidChainArgs& a, void* stream) {
     MidDev& d = mid_dev();
     if (!mid_chain_supported(a)) {
-        std::fprintf(stderr, "mid_chain: unsupported arguments or device\n");
+        basalt::log::error("basalt", "mid_chain: unsupported arguments or device");
         std::exit(1);
     }
     MP p{};
@@ -534,7 +535,7 @@ void mid_chain(const MidChainArgs& a, void* stream) {
     p.lay = a.ord;
     CUtensorMap stm_map;
     if (!tmap_2d(&stm_map, a.rec.state, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, (uint64_t) R_HV * S, S, (uint64_t) R_HV * S * 4, S, S)) {
-        std::fprintf(stderr, "mid_chain: the state's tensor map failed\n");
+        basalt::log::error("basalt", "mid_chain: the state's tensor map failed");
         std::exit(1);
     }
     std::memcpy(&p.stm, &stm_map, sizeof stm_map);
@@ -545,7 +546,7 @@ void mid_chain(const MidChainArgs& a, void* stream) {
     launch_pdl(mid_pick(a.T, a.type_q, a.type_z, a.type_o, a.stamps != nullptr), dim3(kMidCtas), dim3(CT), (size_t) SMEM_MAX, (cudaStream_t) stream, p);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "mid_chain: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "mid_chain: %s", cudaGetErrorString(e));
         std::exit(1);
     }
 }

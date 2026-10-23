@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::prefill::fp4 {
 namespace {
@@ -31,7 +32,7 @@ constexpr int kThreads = 256;
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "prefill fp4: %s: %s\n", what, cudaGetErrorString(e));
+        basalt::log::error("basalt", "prefill fp4: %s: %s", what, cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -397,7 +398,7 @@ void quantize(const float* x, const int32_t* ids, const int32_t* bounds, const i
     const cudaStream_t s = (cudaStream_t) stream;
     if (cols == 2560) quantize_kernel<5, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
     else if (cols == 640) quantize_kernel<2, false><<<grid, 256, 0, s>>>(x, ids, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
-    else { std::fprintf(stderr, "prefill fp4: %lld columns\n", (long long) cols); std::exit(1); }
+    else { basalt::log::error("basalt", "prefill fp4: %lld columns", (long long) cols); std::exit(1); }
     ck(cudaGetLastError(), "quantize");
 }
 
@@ -409,7 +410,7 @@ void quantize_tokens(const float* x, int64_t tokens, int64_t cols, int64_t ld, v
     const cudaStream_t s = (cudaStream_t) stream;
     if (cols == 2560) quantize_kernel<5, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
     else if (cols == 640) quantize_kernel<2, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
-    else { std::fprintf(stderr, "prefill fp4: %lld columns\n", (long long) cols); std::exit(1); }
+    else { basalt::log::error("basalt", "prefill fp4: %lld columns", (long long) cols); std::exit(1); }
     ck(cudaGetLastError(), "quantize tokens");
 }
 
@@ -437,7 +438,7 @@ template <bool GATHER, bool SWIGLU> void launch(const GemmArgs& a, dim3 grid, cu
 void run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
     if ((p.ids != nullptr) != p.swiglu) {
-        std::fprintf(stderr, "prefill fp4: token rows go with the SwiGLU output only\n");
+        basalt::log::error("basalt", "prefill fp4: token rows go with the SwiGLU output only");
         std::exit(1);
     }
     GemmArgs a{};

@@ -32,6 +32,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 
@@ -117,7 +118,7 @@ void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int
                      const float* sin_tab, const int* pos, void* stream) {
     if (rows <= 0 || n_rot <= 0) return;
     if (n_rot % 2 != 0 || n_rot > head_dim) {
-        std::fprintf(stderr, "rope_neox_apply: n_rot %d must be even and <= head_dim %d\n", n_rot, head_dim);
+        basalt::log::error("basalt", "rope_neox_apply: n_rot %d must be even and <= head_dim %d", n_rot, head_dim);
         std::exit(1);
     }
     const int threads = 128;
@@ -126,7 +127,7 @@ void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int
                                                                  sin_tab, pos, mrope_table());
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "rope_neox_apply launch: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "rope_neox_apply launch: %s", cudaGetErrorString(e));
         std::exit(1);
     }
     if (stream == nullptr) cudaDeviceSynchronize();

@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -367,7 +368,7 @@ constexpr int THREADS = 256;
 void check(const char* who, void* stream) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s launch: %s\n", who, cudaGetErrorString(e));
+        basalt::log::error("basalt", "%s launch: %s", who, cudaGetErrorString(e));
         std::exit(1);
     }
     // Deliberately NOT synchronising for a non-null stream: this is called once per layer from a captured
@@ -557,7 +558,7 @@ __global__ void add_hits_kernel(float* __restrict__ parts, const float* __restri
 
 void moe_hit_select(const int32_t* ids, const int32_t* res_row, int k, int n_expert, int32_t* slot, int32_t* dst,
                     int32_t* count, void* stream) {
-    if (k < 1 || k > 32) { std::fprintf(stderr, "moe_hit_select: k must be 1..32\n"); std::exit(1); }
+    if (k < 1 || k > 32) { basalt::log::error("basalt", "moe_hit_select: k must be 1..32"); std::exit(1); }
     hit_select_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(ids, res_row, k, n_expert, slot, dst, count);
     check("moe_hit_select", stream);
 }
@@ -594,7 +595,7 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
 
 void moe_hit_select_multi(const int32_t* ids, const int32_t* res_row, int n, int n_expert, int32_t* slot, int32_t* dst,
                           int32_t* count, void* stream) {
-    if (n < 1 || n > 128) { std::fprintf(stderr, "moe_hit_select_multi: n must be 1..128\n"); std::exit(1); }
+    if (n < 1 || n > 128) { basalt::log::error("basalt", "moe_hit_select_multi: n must be 1..128"); std::exit(1); }
     hit_select_multi_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ids, res_row, n, n_expert, slot, dst, count);
     check("moe_hit_select_multi", stream);
 }
@@ -972,7 +973,7 @@ __global__ void group_resident_kernel(const int32_t* __restrict__ ids, int n, in
 void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t* base, int64_t blob,
                         unsigned long long* grp_ptr, int32_t* grp_start, int32_t* counts, int32_t* ent_dst,
                         int32_t* ent_tok, void* stream) {
-    if (n < 1 || n > 128) { std::fprintf(stderr, "moe_group_resident: n must be 1..128\n"); std::exit(1); }
+    if (n < 1 || n > 128) { basalt::log::error("basalt", "moe_group_resident: n must be 1..128"); std::exit(1); }
     group_resident_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ids, n, k_per_tok, base, (long long) blob, grp_ptr,
                                                                grp_start, counts, ent_dst, ent_tok);
     check("moe_group_resident", stream);

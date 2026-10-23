@@ -26,13 +26,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include "basalt/log.hpp"
 
 namespace basalt::prefill::fused {
 namespace {
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "prefill fused experts: %s: %s\n", what, cudaGetErrorString(e));
+        basalt::log::error("basalt", "prefill fused experts: %s: %s", what, cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -411,7 +412,7 @@ void quantize_act(const float* x, int64_t rows, int64_t cols, void* xa, void* st
 void group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, int32_t* slot, int32_t* src,
            void* stream) {
     if (n_expert < 1 || n_expert > 1024) {
-        std::fprintf(stderr, "prefill fused experts: %d experts (the grouping takes 1 to 1024)\n", n_expert);
+        basalt::log::error("basalt", "prefill fused experts: %d experts (the grouping takes 1 to 1024)", n_expert);
         std::exit(1);
     }
     const cudaStream_t s = (cudaStream_t) stream;

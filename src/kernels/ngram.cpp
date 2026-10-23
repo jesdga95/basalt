@@ -18,6 +18,7 @@
 #include <mutex>
 #include <vector>
 #include <stdexcept>
+#include "basalt/log.hpp"
 
 
 namespace basalt::kernels {
@@ -237,7 +238,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
             (void*) a0, a1 - a0, [&](uint64_t done) { prog.add(done - reported); reported = done; });
         impl_->locked = lr.ok && lr.locked_bytes >= a1 - a0;
         if (!impl_->locked) {
-            std::fprintf(stderr, "basalt: PLE table lock incomplete (%s): touching its pages instead\n",
+            basalt::log::warn("basalt", "PLE table lock incomplete (%s): touching its pages instead",
                          lr.note.c_str());
             volatile uint8_t sink = 0;
             for (uintptr_t p = a0 + (uintptr_t) reported; p < a1; p += page) {
@@ -448,7 +449,7 @@ void PleTable::gather(const uint32_t* rows16, float* out2560) const {
         PleTable* self = const_cast<PleTable*>(this);
         std::string err;
         if (!self->issue(rows16) || !self->collect(out2560, err)) {
-            std::fprintf(stderr, "PleTable::gather: %s\n", err.empty() ? "a token is already in flight" : err.c_str());
+            basalt::log::error("basalt", "PleTable::gather: %s", err.empty() ? "a token is already in flight" : err.c_str());
             std::memset(out2560, 0, (size_t) NG_N_EMBD * sizeof(float));
         }
         return;

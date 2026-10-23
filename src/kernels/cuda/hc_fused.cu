@@ -24,6 +24,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -1275,7 +1276,7 @@ bool hc8_make(const uint16_t* w, int rows, int cols, Hc8Copy& c) {
     c.srow = srow;
     if (hc8_alloc((void**) &c.q, c.bytes) != cudaSuccess) {
         cudaGetLastError();
-        std::fprintf(stderr, "basalt hc8: no VRAM for an 8-bit copy (%zu bytes)\n", c.bytes);
+        basalt::log::error("basalt hc8", "no VRAM for an 8-bit copy (%zu bytes)", c.bytes);
         return false;
     }
     c.s = reinterpret_cast<uint16_t*>(c.q + n);
@@ -1348,7 +1349,7 @@ const void* hc8_upload(const uint16_t* w, const int8_t* q, const uint16_t* s, in
     c.bytes = (size_t) n + (size_t) rows * c.srow * 2;
     if (hc8_alloc((void**) &c.q, c.bytes) != cudaSuccess) {
         cudaGetLastError();
-        std::fprintf(stderr, "basalt hc8: no VRAM for an 8-bit copy (%zu bytes)\n", c.bytes);
+        basalt::log::error("basalt hc8", "no VRAM for an 8-bit copy (%zu bytes)", c.bytes);
         return nullptr;
     }
     c.s = reinterpret_cast<uint16_t*>(c.q + n);
@@ -1468,7 +1469,7 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     if (!d.ok || a.T < 1 || a.T > MAXT || !a.R || !a.R_out || !a.w_norm || !a.w_down || !a.w_up || !a.lo || !a.rs ||
         !a.mixed || !a.xn || (a.w_inject && !a.inject_out) || (a.apply && (!a.bo_prev || !a.inj_prev)) ||
         (a.w_router && (!a.logits || !a.ids || !a.weights)) || (a.apply && a.inj_prev == a.inject_out)) {
-        std::fprintf(stderr, "hc_fused_read: invalid arguments or unsupported device\n");
+        basalt::log::error("basalt", "hc_fused_read: invalid arguments or unsupported device");
         std::exit(1);
     }
     HcLaunch L{};
@@ -1498,7 +1499,7 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
                  (a.w_inject == nullptr || (h.q_inject != nullptr && h.s_inject != nullptr));
         }
         if (!q8) {
-            std::fprintf(stderr, "hc_fused_read: the matrices need their 8-bit copies (hc8_prepare)\n");
+            basalt::log::error("basalt", "hc_fused_read: the matrices need their 8-bit copies (hc8_prepare)");
             std::exit(1);
         }
         if (a.w_inject == nullptr) h.q_inject = nullptr;
@@ -1508,7 +1509,7 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     L.lg64 = d.lg + (size_t) L.slot * MAXT * NE;
     CUtensorMap maps[6];
     if (!cn_maps(L.a, maps)) {
-        std::fprintf(stderr, "hc_fused_read: the tensor maps of the 8-bit matrices failed\n");
+        basalt::log::error("basalt", "hc_fused_read: the tensor maps of the 8-bit matrices failed");
         std::exit(1);
     }
     std::memcpy(L.tm, maps, sizeof L.tm);
@@ -1517,7 +1518,7 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
                (cudaStream_t) stream, L);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "hc_fused_read: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "hc_fused_read: %s", cudaGetErrorString(e));
         std::exit(1);
     }
 }

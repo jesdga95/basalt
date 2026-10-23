@@ -50,13 +50,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include "basalt/log.hpp"
 
 namespace basalt::prefill::fused {
 namespace {
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "prefill fused experts (native): %s: %s\n", what, cudaGetErrorString(e));
+        basalt::log::error("basalt", "prefill fused experts (native): %s: %s", what, cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -872,7 +873,7 @@ template <bool GU> bool setup_v2(int& occ) {
         o < 1)
         return false;
     occ = std::min(occ, o);
-    std::fprintf(stderr, "basalt: prompt experts, v2 %s kernel: %d registers, %zu bytes local, %d bytes shared\n",
+    basalt::log::info("basalt", "prompt experts, v2 %s kernel: %d registers, %zu bytes local, %d bytes shared",
                  GU ? "gate/up" : "down", fa.numRegs, (size_t) fa.localSizeBytes, V2<GU>::SMEM);
     return true;
 }
@@ -917,7 +918,7 @@ int v2_occ() {
             d.v2 = 1;
             d.v2_occ = occ;
         } else {
-            std::fprintf(stderr, "basalt: the v2 fused prompt kernels do not run on this device; the native kernels stay\n");
+            basalt::log::warn("basalt", "the v2 fused prompt kernels do not run on this device; the native kernels stay");
         }
         cudaGetLastError();
     }
@@ -978,7 +979,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
     if (b.e1 <= b.e0 || n <= 0) return;
     const DevInfo& d = dev_info();
     if (!d.ok || !gu_covered(g.gu_type) || !d_covered(g.d_type)) {
-        std::fprintf(stderr, "prefill fused experts (native): types %d / %d are not covered here\n", g.gu_type, g.d_type);
+        basalt::log::error("basalt", "prefill fused experts (native): types %d / %d are not covered here", g.gu_type, g.d_type);
         std::exit(1);
     }
     const cudaStream_t s = (cudaStream_t) stream;
@@ -998,7 +999,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         ck(cudaMemsetAsync(ctr, 0, 2 * sizeof(int), s), "v2 counters");
         static std::atomic<bool> said{false};
         if (!said.exchange(true))
-            std::fprintf(stderr, "basalt: prompt experts on the v2 native kernels\n");
+            basalt::log::info("basalt", "prompt experts on the v2 native kernels");
     }
     if (v2_gu) {
         const unsigned gr = (unsigned) std::min<int64_t>(tiles * V2<true>::NFB, (int64_t) d.sms * occ2);

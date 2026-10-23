@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -198,7 +199,7 @@ __global__ void dequant_q8_K_kernel(const uint8_t* __restrict__ blocks, float* _
 void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     if (n <= 0) return;
     if (n % QK8_0 != 0) {
-        std::fprintf(stderr, "quantize_q8_0: n %lld is not a multiple of %d\n", (long long) n, QK8_0);
+        basalt::log::error("basalt", "quantize_q8_0: n %lld is not a multiple of %d", (long long) n, QK8_0);
         std::exit(1);
     }
     const long long nb = n / QK8_0;
@@ -207,7 +208,7 @@ void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     quantize_q8_0_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(x, blocks, nb);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "quantize_q8_0 launch: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "quantize_q8_0 launch: %s", cudaGetErrorString(e));
         std::exit(1);
     }
     if (stream == nullptr) cudaDeviceSynchronize();
@@ -219,11 +220,11 @@ void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
 void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_t n, void* stream) {
     if (n <= 0) return;
     if (n % QK8_0 != 0) {
-        std::fprintf(stderr, "quantize_q8_0_scaled: n %lld is not a multiple of %d\n", (long long) n, QK8_0);
+        basalt::log::error("basalt", "quantize_q8_0_scaled: n %lld is not a multiple of %d", (long long) n, QK8_0);
         std::exit(1);
     }
     if (scales == nullptr) {
-        std::fprintf(stderr, "quantize_q8_0_scaled: scales is null\n");
+        basalt::log::error("basalt", "quantize_q8_0_scaled: scales is null");
         std::exit(1);
     }
     const long long nb = n / QK8_0;
@@ -231,7 +232,7 @@ void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_
     quantize_q8_0_scaled_warp_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(x, blocks, scales, nb);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "quantize_q8_0_scaled launch: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "quantize_q8_0_scaled launch: %s", cudaGetErrorString(e));
         std::exit(1);
     }
     if (stream == nullptr) cudaDeviceSynchronize();
@@ -245,7 +246,7 @@ void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream) {
     dequant_q8_0_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(blocks, x, nb);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "dequant_q8_0 launch: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "dequant_q8_0 launch: %s", cudaGetErrorString(e));
         std::exit(1);
     }
     if (stream == nullptr) cudaDeviceSynchronize();
@@ -254,7 +255,7 @@ void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream) {
 void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     if (n <= 0) return;
     if (n % QK_K != 0) {
-        std::fprintf(stderr, "quantize_q8_K: n %lld is not a multiple of %d\n", (long long) n, QK_K);
+        basalt::log::error("basalt", "quantize_q8_K: n %lld is not a multiple of %d", (long long) n, QK_K);
         std::exit(1);
     }
     const long long nb = n / QK_K;
@@ -263,7 +264,7 @@ void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     quantize_q8_K_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(x, blocks, nb);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "quantize_q8_K launch: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "quantize_q8_K launch: %s", cudaGetErrorString(e));
         std::exit(1);
     }
     if (stream == nullptr) cudaDeviceSynchronize();
@@ -277,7 +278,7 @@ void dequant_q8_K(const uint8_t* blocks, float* x, int64_t n, void* stream) {
     dequant_q8_K_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(blocks, x, nb);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "dequant_q8_K launch: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "dequant_q8_K launch: %s", cudaGetErrorString(e));
         std::exit(1);
     }
     if (stream == nullptr) cudaDeviceSynchronize();

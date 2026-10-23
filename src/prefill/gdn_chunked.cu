@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::prefill {
 namespace {
@@ -393,7 +394,7 @@ __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "basalt: %s: %s\n", what, cudaGetErrorString(e));
+        basalt::log::error("basalt", "%s: %s", what, cudaGetErrorString(e));
         std::abort();
     }
 }
@@ -417,11 +418,11 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
         static std::atomic<bool> attr[64];
         int dev = 0;
         cudaGetDevice(&dev);
-        if (dev < 0 || dev >= 64) { std::fprintf(stderr, "gdn_recurrence: device %d out of range\n", dev); std::abort(); }
+        if (dev < 0 || dev >= 64) { basalt::log::error("basalt", "gdn_recurrence: device %d out of range", dev); std::abort(); }
         if (!attr[dev].load(std::memory_order_acquire)) {
             if (cudaFuncSetAttribute(gdn_chunk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                      (int) sizeof(ChunkShared)) != cudaSuccess) {
-                std::fprintf(stderr, "gdn_recurrence: shared-memory opt-in failed\n");
+                basalt::log::error("basalt", "gdn_recurrence: shared-memory opt-in failed");
                 std::abort();
             }
             attr[dev].store(true, std::memory_order_release);

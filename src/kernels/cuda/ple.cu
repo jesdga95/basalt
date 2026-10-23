@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -49,7 +50,7 @@ __global__ void history_advance_kernel(float* __restrict__ history, const float*
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "ple_block: %s: %s\n", what, cudaGetErrorString(e));
+        basalt::log::error("basalt", "ple_block: %s: %s", what, cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -100,7 +101,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
     // inside a stream capture, and the token path makes no allocations.
     const size_t q8_bytes = (size_t) (n_embd / 32) * 34;
     if (scratch == nullptr) {
-        std::fprintf(stderr, "ple_block: scratch is null; the caller owns it (see ple_block_scratch_bytes)\n");
+        basalt::log::error("basalt", "ple_block: scratch is null; the caller owns it (see ple_block_scratch_bytes)");
         std::exit(1);
     }
     const struct Export { const float* pointer; size_t count; const char* name; } exports[] = {

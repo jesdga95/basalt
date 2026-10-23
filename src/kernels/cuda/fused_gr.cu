@@ -15,6 +15,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -673,7 +674,7 @@ std::atomic<int> g_variant[64];
 void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
                          int stamp_i0) {
     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
-        std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
+        basalt::log::error("basalt", "fused_gr_read_multi: invalid arguments");
         std::exit(1);
     }
     GrMulti m;
@@ -683,7 +684,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         if (!x.R || !x.w_norm || !x.w_down || !x.w_up || !x.lo || !x.rs || !x.mixed || (x.w_inject && !x.inject_out) ||
             (x.apply && (!x.bo_prev || !x.inj_prev || !x.R_out)) || x.w_down != a[0].w_down || x.w_up != a[0].w_up ||
             x.w_inject != a[0].w_inject || x.w_norm != a[0].w_norm) {
-            std::fprintf(stderr, "fused_gr_read_multi: invalid arguments for token %d\n", t);
+            basalt::log::error("basalt", "fused_gr_read_multi: invalid arguments for token %d", t);
             std::exit(1);
         }
     }
@@ -695,7 +696,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     launch_multi(m, fused_gr_variant(), st, stamp_buf, stamp_i0);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "fused_gr_read_multi: %s", cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -708,7 +709,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
     if (!a.R || !a.w_norm || !a.w_down || !a.w_up || !a.lo || !a.rs || !a.mixed ||
         (a.w_inject && !a.inject_out) || (a.apply && (!a.bo_prev || !a.inj_prev || !a.R_out)) ||
         (a.apply && a.inj_prev == a.inject_out)) {
-        std::fprintf(stderr, "fused_gr_read: invalid arguments\n");
+        basalt::log::error("basalt", "fused_gr_read: invalid arguments");
         std::exit(1);
     }
     if (hc8_gr_read_multi(&a, 1, N, HC, stream)) return;
@@ -717,7 +718,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
     gr_up_kernel<<<UP_BLOCKS, THREADS, 0, st>>>(a);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "fused_gr_read: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "fused_gr_read: %s", cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -884,17 +885,17 @@ void fused_gr_check() {
     else if (okv[kHcSplit]) use = kHcSplit;
     g_variant[dev].store(use);
     if (!ran)
-        std::fprintf(stderr, "basalt hc: CUDA%d: the check of split/staged could not run (%s)\n", dev, why[0].c_str());
+        basalt::log::warn("basalt hc", "CUDA%d: the check of split/staged could not run (%s)", dev, why[0].c_str());
     static const char* const name[4] = {"", "plain", "split", "staged"};
     for (int v = kHcStaged; v >= kHcSplit; --v)
         if (v <= want && !okv[v] && ran)
-            std::fprintf(stderr, "basalt hc: CUDA%d: the %s read differs from the plain read on this card - not used: "
-                                 "%s\n", dev, name[v], why[v].c_str());
+            basalt::log::warn("basalt hc", "CUDA%d: the %s read differs from the plain read on this card - not used: "
+                                 "%s", dev, name[v], why[v].c_str());
     static const char* const what[4] = {
         "", "the plain read (the norm per token, the down projection on 41 blocks)",
         "split (the norm per token and stream, then the plain read's down projection)",
         "staged (the norm per token and stream, the down projection's activations staged ahead by cp.async)"};
-    std::fprintf(stderr, "basalt hc: CUDA%d: the hyper-connection read runs as %s%s\n", dev, what[use],
+    basalt::log::info("basalt hc", "CUDA%d: the hyper-connection read runs as %s%s", dev, what[use],
                  use >= kHcSplit ? "; checked bit for bit against the plain read on this card" : "");
 }
 

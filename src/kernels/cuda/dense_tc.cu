@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -1003,14 +1004,14 @@ static int opt_in_device(const char* who) {
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= 64) {
-        std::fprintf(stderr, "%s: device %d out of range\n", who, dev);
+        basalt::log::error("basalt", "%s: device %d out of range", who, dev);
         std::abort();
     }
     return dev;
 }
 static void opt_in_check(cudaError_t e, const char* who) {
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: shared-memory opt-in failed: %s\n", who, cudaGetErrorString(e));
+        basalt::log::error("basalt", "%s: shared-memory opt-in failed: %s", who, cudaGetErrorString(e));
         std::abort();
     }
 }
@@ -1089,7 +1090,7 @@ void launch(const void* w, const void* x, float* y, int n_in, int n_out, int nco
         return;
     }
     if constexpr (TYPE == 21) {
-        std::fprintf(stderr, "dense_tc: IQ3_S n_in %d n_out %d needs the one-tile path\n", n_in, n_out);
+        basalt::log::error("basalt", "dense_tc: IQ3_S n_in %d n_out %d needs the one-tile path", n_in, n_out);
         std::exit(1);
     } else {
     if (aligned && 2 * 16 * (n_in / 256) * Fmt<TYPE>::SB <= 90 * 1024) {
@@ -1123,7 +1124,7 @@ bool dense_tc_type_on(int t) noexcept {
 void dense_tc(int type, const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* stream) {
     if (!dense_tc_supported(type, n_in, n_out, w) || ncols < 1 || ncols > kMaxCols || n_out < 1 || ((uintptr_t) w & 3) != 0 ||
         ((uintptr_t) x & 3) != 0) {
-        std::fprintf(stderr, "dense_tc: type %d n_in %d n_out %d ncols %d not supported\n", type, n_in, n_out, ncols);
+        basalt::log::error("basalt", "dense_tc: type %d n_in %d n_out %d ncols %d not supported", type, n_in, n_out, ncols);
         std::exit(1);
     }
     const auto s = (cudaStream_t) stream;
@@ -1139,7 +1140,7 @@ void dense_tc(int type, const void* w, const void* x, float* y, int n_in, int n_
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "dense_tc: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "dense_tc: %s", cudaGetErrorString(e));
         std::exit(1);
     }
 }
@@ -1155,7 +1156,7 @@ void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const 
                    const void* x_q8_1, int n_in, int ncols, void* stream) {
     if (!dense_tc_pair_supported(t0, t1, n_in) || ncols < 1 || ncols > kMaxCols || n_out0 < 1 || n_out1 < 1 ||
         ((uintptr_t) w0 & 15) != 0 || ((uintptr_t) w1 & 15) != 0 || ((uintptr_t) x_q8_1 & 3) != 0) {
-        std::fprintf(stderr, "dense_tc_pair: types %d/%d n_in %d not supported\n", t0, t1, n_in);
+        basalt::log::error("basalt", "dense_tc_pair: types %d/%d n_in %d not supported", t0, t1, n_in);
         std::exit(1);
     }
     int smem = 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * 16 * (n_in / 256) * std::max(sb_bytes_lq(t0), sb_bytes_lq(t1));
@@ -1193,7 +1194,7 @@ void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const 
                (const uint8_t*) x_q8_1, n_in, ncols);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "dense_tc_pair: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "dense_tc_pair: %s", cudaGetErrorString(e));
         std::exit(1);
     }
 }

@@ -21,6 +21,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -76,7 +77,7 @@ void s2_gemv_q8(const uint8_t* act, const uint8_t* codes, const float* scales, f
                 int64_t n_out, int threads_per_row, void* stream) {
     if (n_in <= 0 || n_out <= 0) return;
     if (n_in % QK8_0 != 0 || n_in % QK_S2 != 0) {
-        std::fprintf(stderr, "s2_gemv_q8: n_in %lld must be a multiple of %d\n", (long long) n_in, QK_S2);
+        basalt::log::error("basalt", "s2_gemv_q8: n_in %lld must be a multiple of %d", (long long) n_in, QK_S2);
         std::exit(1);
     }
     const size_t smem = (size_t) threads_per_row * sizeof(float);
@@ -85,7 +86,7 @@ void s2_gemv_q8(const uint8_t* act, const uint8_t* codes, const float* scales, f
                                                                                          threads_per_row);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "s2_gemv_q8 launch: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "s2_gemv_q8 launch: %s", cudaGetErrorString(e));
         std::exit(1);
     }
     if (stream == nullptr) cudaDeviceSynchronize();

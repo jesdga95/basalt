@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -68,13 +69,13 @@ __global__ void bf16_gemv_split_kernel(const uint16_t* __restrict__ x, const uin
 inline void finish(void* stream, const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s launch: %s\n", what, cudaGetErrorString(e));
+        basalt::log::error("basalt", "%s launch: %s", what, cudaGetErrorString(e));
         std::exit(1);
     }
     if (stream != nullptr) return;
     const cudaError_t s = cudaDeviceSynchronize();
     if (s != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(s));
+        basalt::log::error("basalt", "%s: %s", what, cudaGetErrorString(s));
         std::exit(1);
     }
 }
@@ -121,8 +122,8 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
         return;
     }
     if (threads_per_row <= 0 || (threads_per_row & (threads_per_row - 1)) != 0) {
-        std::fprintf(stderr, "bf16_gemv_split: threads_per_row %d must be a power of two (32 selects the "
-                             "warp-per-row path)\n", threads_per_row);
+        basalt::log::error("basalt", "bf16_gemv_split: threads_per_row %d must be a power of two (32 selects the "
+                             "warp-per-row path)", threads_per_row);
         std::exit(1);
     }
     const unsigned grid = (unsigned) n_out;

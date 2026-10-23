@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels::cpu {
 namespace {
@@ -219,10 +220,9 @@ CpuFeatures cpu_features() {
 void cpu_require_expert_support() {
     const CpuFeatures f = cpu_features();
     if (f.usable()) return;
-    std::fprintf(stderr,
-                 "basalt: this CPU cannot run the expert kernel: %s.\n"
+    basalt::log::error("basalt", "this CPU cannot run the expert kernel: %s.\n"
                  "        The engine needs AVX512-VNNI and AVX512-VBMI.\n"
-                 "        The scalar fallback exists for tests only and is far too slow to decode with.\n",
+                 "        The scalar fallback exists for tests only and is far too slow to decode with.",
                  f.reason());
     std::exit(1);
 }

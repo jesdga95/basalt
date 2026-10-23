@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -23,7 +24,7 @@ constexpr int RPG = S / RG;
 
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { basalt::log::error("basalt", "%s: %s", what, cudaGetErrorString(e)); std::exit(1); }
 }
 
 __global__ void __launch_bounds__(S) gdn_conv_l2_multi_kernel(const float* __restrict__ hist,
@@ -381,7 +382,7 @@ __device__ __forceinline__ void spin_until_eq(const uint32_t* p, uint32_t want) 
         while (ld_acquire(p) != want) {
             __nanosleep(64);
             if (globaltimer() - t0 > 2000000000ull) {
-                printf("commit finisher: block %d waited 2 s for %u (word %u)\n", (int) blockIdx.x, want, ld_acquire(p));
+                printf("basalt: error: commit finisher: block %d waited 2 s for %u (word %u)\n", (int) blockIdx.x, want, ld_acquire(p));
                 __trap();
             }
         }
@@ -747,7 +748,7 @@ __global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int
 
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
     if (cap <= 0) return;
-    if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs: blob size must be a multiple of 16\n"); std::exit(1); }
+    if (blob_bytes % 16 != 0) { basalt::log::error("basalt", "fetch_blobs: blob size must be a multiple of 16"); std::exit(1); }
     fetch_blobs_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
     check("fetch_blobs");
 }
@@ -764,7 +765,7 @@ void add_streams_broadcast(const float* h, const float* e, float* R, int64_t n_e
 }
 
 void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t* count, void* stream) {
-    if (n < 1 || n > 1024) { std::fprintf(stderr, "ident_hits: n out of range\n"); std::exit(1); }
+    if (n < 1 || n > 1024) { basalt::log::error("basalt", "ident_hits: n out of range"); std::exit(1); }
     ident_hits_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(ids, n, slot, dst, count);
     check("ident_hits");
 }
@@ -832,7 +833,7 @@ __global__ void mtp_draft_cond_kernel(CondHandles hs, int n, const float* __rest
 
 bool mtp_draft_cond(const unsigned long long* h, int n, const float* probs, const int32_t* row,
                     const int32_t* th_bits, void* stream, const float* hist, int j) {
-    if (n < 1 || n > 8) { std::fprintf(stderr, "mtp_draft_cond: n out of range\n"); std::exit(1); }
+    if (n < 1 || n > 8) { basalt::log::error("basalt", "mtp_draft_cond: n out of range"); std::exit(1); }
     CondHandles hs{};
     for (int k = 0; k < n; ++k) hs.h[k] = h[k];
     mtp_draft_cond_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(hs, n, probs, row, th_bits, hist, j);
@@ -869,7 +870,7 @@ __global__ void mtp_stage_kernel(MtpStageArgs a) {
 
 void mtp_stage(const MtpStageSeg* segs, int n_segs, float* f_dst, const float* f_src, int64_t n_f, void* stream) {
     if (n_segs < 0 || n_segs > 6 || n_f % 4 != 0 || ((uintptr_t) f_dst | (uintptr_t) f_src) % 16 != 0) {
-        std::fprintf(stderr, "mtp_stage: bad arguments\n");
+        basalt::log::error("basalt", "mtp_stage: bad arguments");
         std::exit(1);
     }
     MtpStageArgs a{};
@@ -915,7 +916,7 @@ bool mtp_step_end(const int32_t* ids, const int32_t* row_dev, int32_t* tok_dst, 
 #if !(defined(CUDART_VERSION) && CUDART_VERSION >= 12040)
     if (n > 0) return false;
 #endif
-    if (n > 8) { std::fprintf(stderr, "mtp_step_end: n out of range\n"); std::exit(1); }
+    if (n > 8) { basalt::log::error("basalt", "mtp_step_end: n out of range"); std::exit(1); }
     StepEndCond hs{};
     for (int k = 0; k < n; ++k) hs.h[k] = h[k];
     mtp_step_end_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids, row_dev, tok_dst, out, j, probs, out_p, hs, n, th_bits,
@@ -951,7 +952,7 @@ void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream) {
 void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels,
                        int qk_heads, float eps, int n_tok, void* stream, int t_begin) {
     if (!history || !qkv || !conv_w || !h || channels % S != 0 || n_tok < 1 || n_tok > kVerifyMaxT) {
-        std::fprintf(stderr, "gdn_conv_l2_multi: invalid arguments\n");
+        basalt::log::error("basalt", "gdn_conv_l2_multi: invalid arguments");
         std::exit(1);
     }
     launch_pdl(gdn_conv_l2_multi_kernel, dim3((unsigned) (channels / S), (unsigned) n_tok), dim3(S), 0,
@@ -962,7 +963,7 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
 void gdn_conv_l2_seg(const SegRow* rows, size_t hist_off, const float* qkv, const float* conv_w, float* h, int channels,
                      int qk_heads, float eps, int n_rows, void* stream) {
     if (!rows || !qkv || !conv_w || !h || channels % S != 0 || n_rows < 1) {
-        std::fprintf(stderr, "gdn_conv_l2_seg: invalid arguments\n");
+        basalt::log::error("basalt", "gdn_conv_l2_seg: invalid arguments");
         std::exit(1);
     }
     launch_pdl(gdn_conv_l2_seg_kernel, dim3((unsigned) (channels / S), (unsigned) n_rows), dim3(S), 0,
@@ -974,7 +975,7 @@ void gdn_step_norm_seg(const SegRow* rows, size_t state_off, const float* h, int
                        const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
                        int n_rows, void* stream) {
     if (!rows || !h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k || n_rows < 1) {
-        std::fprintf(stderr, "gdn_step_norm_seg: invalid arguments\n");
+        basalt::log::error("basalt", "gdn_step_norm_seg: invalid arguments");
         std::exit(1);
     }
     launch_pdl(gdn_step_norm_seg_kernel, dim3((unsigned) h_v, (unsigned) n_rows), dim3(S, RG), 0, (cudaStream_t) stream,
@@ -1028,7 +1029,7 @@ void gdn_conv_commit(float* history, const float* qkv, int channels, const int32
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream) {
     if (n_embd % 8 != 0 || n_tok < 1 || n_tok > kVerifyMaxT) {
-        std::fprintf(stderr, "gdn_ab_multi: invalid arguments\n");
+        basalt::log::error("basalt", "gdn_ab_multi: invalid arguments");
         std::exit(1);
     }
     const unsigned blocks = (unsigned) ((2 * h_v + 1) / 2);
@@ -1057,7 +1058,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
                          const int32_t* n_keep, void* stream, int t_out_begin) {
     if (!state || !h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k || n_tok < 1 ||
         n_tok > kVerifyMaxT) {
-        std::fprintf(stderr, "gdn_step_norm_multi: invalid arguments\n");
+        basalt::log::error("basalt", "gdn_step_norm_multi: invalid arguments");
         std::exit(1);
     }
     if (n_keep != nullptr && t_out_begin >= n_tok) {

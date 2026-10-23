@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 
@@ -67,11 +68,11 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
              float* inject, void* stream) {
     if (s.n_embd <= 0 || s.hc <= 0 || s.hc_lr <= 0) return;
     if (ws.xn == nullptr || ws.gated == nullptr || ws.lo == nullptr) {
-        std::fprintf(stderr, "gr_read: GrWorkspace is not initialised (see gr_workspace_init)\n");
+        basalt::log::error("basalt", "gr_read: GrWorkspace is not initialised (see gr_workspace_init)");
         std::exit(1);
     }
     if (ws.bytes < gr_workspace_bytes(s)) {
-        std::fprintf(stderr, "gr_read: GrWorkspace is %zu bytes but this geometry needs %zu\n",
+        basalt::log::error("basalt", "gr_read: GrWorkspace is %zu bytes but this geometry needs %zu",
                      ws.bytes, gr_workspace_bytes(s));
         std::exit(1);
     }
@@ -81,7 +82,7 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
         fa.eps = eps; fa.lo = ws.lo; fa.rs = ws.gated; fa.inject_out = inject; fa.mixed = mixed;
         if (hc8_gr_read_multi(&fa, 1, s.n_embd, s.hc, stream)) {
             if (stream == nullptr && cudaDeviceSynchronize() != cudaSuccess) {
-                std::fprintf(stderr, "gr_read: the 8-bit read failed\n");
+                basalt::log::error("basalt", "gr_read: the 8-bit read failed");
                 std::exit(1);
             }
             return;
@@ -104,13 +105,13 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
 
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "gr_read launch: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "gr_read launch: %s", cudaGetErrorString(e));
         std::exit(1);
     }
     if (stream == nullptr) {
         const cudaError_t se = cudaDeviceSynchronize();
         if (se != cudaSuccess) {
-            std::fprintf(stderr, "gr_read: %s\n", cudaGetErrorString(se));
+            basalt::log::error("basalt", "gr_read: %s", cudaGetErrorString(se));
             std::exit(1);
         }
     }
@@ -123,7 +124,7 @@ void gr_write(const float* R, const float* block_out, const float* inject, const
     if (stream == nullptr) {
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {
-            std::fprintf(stderr, "gr_write: %s\n", cudaGetErrorString(e));
+            basalt::log::error("basalt", "gr_write: %s", cudaGetErrorString(e));
             std::exit(1);
         }
     }

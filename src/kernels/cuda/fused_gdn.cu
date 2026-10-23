@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -127,38 +128,38 @@ __global__ void __launch_bounds__(256) gdn_ab_kernel(const float* __restrict__ x
 void fused_gdn_conv_l2(float* history, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,
                        float eps, void* stream) {
     if (!history || !qkv || !conv_w || !h || channels % S != 0 || qk_heads < 0 || qk_heads > channels / S) {
-        std::fprintf(stderr, "fused_gdn_conv_l2: invalid arguments\n");
+        basalt::log::error("basalt", "fused_gdn_conv_l2: invalid arguments");
         std::exit(1);
     }
     gdn_conv_l2_kernel<<<(unsigned) (channels / S), S, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, qk_heads, eps);
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "fused_gdn_conv_l2: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { basalt::log::error("basalt", "fused_gdn_conv_l2: %s", cudaGetErrorString(e)); std::exit(1); }
 }
 
 void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, void* stream) {
     if (!x || !w_alpha || !w_beta || !dt || !ssm_a || !gate || !beta || n_embd % 8 != 0 || h_v <= 0) {
-        std::fprintf(stderr, "fused_gdn_ab: invalid arguments\n");
+        basalt::log::error("basalt", "fused_gdn_ab: invalid arguments");
         std::exit(1);
     }
     gdn_ab_kernel<<<(unsigned) ((2 * h_v + 7) / 8), 256, 0, (cudaStream_t) stream>>>(x, w_alpha, w_beta, dt, ssm_a, gate,
                                                                                      beta, n_embd, h_v);
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "fused_gdn_ab: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { basalt::log::error("basalt", "fused_gdn_ab: %s", cudaGetErrorString(e)); std::exit(1); }
 }
 
 void fused_gdn_step_norm(float* state, const float* q, const float* k, const float* v, const float* gate,
                          const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
                          void* stream) {
     if (!state || !q || !k || !v || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v <= 0 || h_v % h_k) {
-        std::fprintf(stderr, "fused_gdn_step_norm: invalid arguments\n");
+        basalt::log::error("basalt", "fused_gdn_step_norm: invalid arguments");
         std::exit(1);
     }
     gdn_step_norm_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, q, k, v, gate, beta, z,
                                                                                    gamma, eps, y, h_k, h_v);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "fused_gdn_step_norm: %s\n", cudaGetErrorString(e));
+        basalt::log::error("basalt", "fused_gdn_step_norm: %s", cudaGetErrorString(e));
         std::exit(1);
     }
 }

@@ -51,6 +51,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include "basalt/log.hpp"
 
 
 namespace basalt::prefill {
@@ -413,7 +414,7 @@ struct PeerStage {
     // a failed call here would let a buffer be reused early and corrupt weights silently: stop instead
     static void must(cudaError_t e, const char* what) {
         if (e != cudaSuccess) {
-            std::fprintf(stderr, "prefill peer stage: %s: %s\n", what, cudaGetErrorString(e));
+            basalt::log::error("basalt", "prefill peer stage: %s: %s", what, cudaGetErrorString(e));
             std::exit(1);
         }
     }
@@ -705,7 +706,7 @@ const MmqPlan& mmq_plan() {
             if (!mmq::fits(gt, 1280) || !mmq::fits(dt, N)) {
                 // Q6_K experts never take the FP16 path: a build without their MMQ instance refuses the pack
                 if (gt == 14 || dt == 14) {
-                    std::fprintf(stderr, "prefill: layer %lld has Q6_K experts and no MMQ kernel takes them\n", (long long) l);
+                    basalt::log::error("basalt", "prefill: layer %lld has Q6_K experts and no MMQ kernel takes them", (long long) l);
                     std::exit(1);
                 }
                 p.fallback = true;
@@ -1325,8 +1326,8 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
         err = "prefill peer: the peer's buffers do not fit (raise --peer-reserve-mib or lower --peer-prefill-rows)";
         return false;
     }
-    std::fprintf(stderr, "basalt prefill: peer GPU %d computes its experts' rows of each prompt chunk%s, with compact group "
-                         "buffers%s; %zu MiB left free on it\n", pp->dev,
+    basalt::log::info("basalt prefill", "peer GPU %d computes its experts' rows of each prompt chunk%s, with compact group "
+                         "buffers%s; %zu MiB left free on it", pp->dev,
                  peer->p2p() ? "" : (" up to " + std::to_string(Tp) + " tokens" +
                                      (tf > 0 ? " (a streamed one with the primary's FP4 kernels)" : "")).c_str(),
                  pp->ps_frac > 0.0 ? (", streaming " + std::to_string((int) (pp->ps_frac * 100 + 0.5)) +
@@ -2028,7 +2029,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (fused_l) {
                         if (static bool said = false; !said) {
                             said = true;
-                            std::fprintf(stderr, "basalt: prompt experts on the fused int8 kernels\n");
+                            basalt::log::info("basalt", "prompt experts on the fused int8 kernels");
                         }
                         // the layer's input to int8 once per token; the rows of each expert from the router's ids
                         if (fused_nat) fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);

@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include "basalt/log.hpp"
 
 
 namespace basalt::prefill {
@@ -23,14 +24,14 @@ namespace {
 
 void ck(cublasStatus_t s, const char* what) {
     if (s != CUBLAS_STATUS_SUCCESS) {
-        std::fprintf(stderr, "prefill gemm: %s: cuBLAS status %d\n", what, (int) s);
+        basalt::log::error("basalt", "prefill gemm: %s: cuBLAS status %d", what, (int) s);
         std::exit(1);
     }
 }
 
 // A setup call whose failure the engine survives (the handle keeps its defaults), but says so.
 void note(cublasStatus_t s, const char* what) {
-    if (s != CUBLAS_STATUS_SUCCESS) std::fprintf(stderr, "prefill gemm: %s: cuBLAS status %d (continuing)\n", what, (int) s);
+    if (s != CUBLAS_STATUS_SUCCESS) basalt::log::warn("basalt", "prefill gemm: %s: cuBLAS status %d (continuing)", what, (int) s);
 }
 
 
@@ -135,14 +136,14 @@ void Gemm::bf16_w(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int
     basalt::kernels::Hc8View v;
     if (basalt::kernels::hc8_view(W, v) && v.owned) {
         if (v.rows != N || v.cols != K) {
-            std::fprintf(stderr, "prefill gemm: an 8-bit copy is %d x %d, the product wants %lld x %lld\n", v.rows,
+            basalt::log::error("basalt", "prefill gemm: an 8-bit copy is %d x %d, the product wants %lld x %lld", v.rows,
                          v.cols, (long long) N, (long long) K);
             std::exit(1);
         }
         if (ldy <= 0) ldy = N;
         const int64_t rows = std::min<int64_t>(N, scratch_elems_ / K);
         if (rows <= 0 || scratch_ == nullptr) {
-            std::fprintf(stderr, "prefill gemm: no scratch for an 8-bit matrix (K=%lld)\n", (long long) K);
+            basalt::log::error("basalt", "prefill gemm: no scratch for an 8-bit matrix (K=%lld)", (long long) K);
             std::exit(1);
         }
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
@@ -179,7 +180,7 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices.
         const int64_t rows = scratch_elems_ / K;
-        if (rows <= 0) { std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K); std::exit(1); }
+        if (rows <= 0) { basalt::log::error("basalt", "prefill gemm: scratch too small for K=%lld", (long long) K); std::exit(1); }
         if (ldy <= 0) ldy = N;
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = (N - r0 < rows) ? N - r0 : rows;
