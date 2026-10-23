@@ -75,6 +75,9 @@ public:
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
     bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
     int64_t chunk() const;
+    /// The next runs read their first chunk with at most `tokens` tokens (0: every chunk is `chunk()` long), so the
+    /// rows it waits for before layer 1 are few; the chunks after it are `chunk()` long.
+    void set_head_chunk(int64_t tokens) { head_chunk_ = tokens; }
     /// Points the prompt path at another session's state (a view of `ss` with a batch slot's state fields) for the
     /// next runs; the buffers and the layer range stay.
     void set_session(core::SessionState& ss);
@@ -184,6 +187,7 @@ private:
 
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;
     int64_t stage_lb_ = 0, stage_le_ = -1;
+    int64_t head_chunk_ = 0;
     Prefill* next_ = nullptr;
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)

@@ -4416,6 +4416,7 @@ int main(int argc, char** argv) {
     // complement to size it from, so it stays at 8192.
     // The largest chunk a bare `auto` reads a prompt in: past it a chunk's cost per token stops falling.
     // A pass streams every expert blob once, so a pack with bigger blobs amortizes the pass over more tokens.
+    constexpr int64_t kHeadChunk = 16384;   // the first chunk of a prompt above the chunk cap
     const int64_t kMaxAutoChunk = basalt::kernels::cpu::expert_layout().max_blob > (3u << 19) ? 32768 : 16384;
     int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
     if (o.prefill_auto_fit && !o.resident_cpu_experts) auto_ceiling = 8192;
@@ -7942,6 +7943,16 @@ int main(int argc, char** argv) {
                     const int64_t parts = (tokens + cap - 1) / cap;
                     want_full = request_chunk((tokens + parts - 1) / parts, cap);
                 }
+                // A long prompt starts with a short chunk: the first chunk waits for its PLE rows before layer 1 with
+                // nothing to overlap, so a short one shrinks that wait; the rest are equal chunks of at most `cap`.
+                int64_t head_tok = 0;
+                if (o.prefill_auto_fit && tokens > cap && tokens >= 2 * kHeadChunk && cap > kHeadChunk && !batch_on() &&
+                    stages.empty()) {
+                    const int64_t rem = tokens - kHeadChunk, parts = (rem + cap - 1) / cap;
+                    want_full = request_chunk((rem + parts - 1) / parts, cap);
+                    head_tok = kHeadChunk;
+                }
+                sp.set_head_chunk(head_tok);
                 const int64_t want = want_full;
                 if (want <= 0) {
                     e = "prefill: cannot lend buffers for an empty request segment";

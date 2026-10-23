@@ -1470,6 +1470,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
     const bool single_chunk = hand_in_ == nullptr ? n <= m.T : single_chunk_;
+    // the first chunk may be shorter (head_chunk_); the rest are m.T long
+    const int64_t head = hand_in_ == nullptr && n > m.T ? std::min(head_chunk_, m.T) : 0;
+    auto chunk_len = [&m, n, head](int64_t at) { return std::min(at == 0 && head > 0 ? head : m.T, n - at); };
     const cudaStream_t cs = (cudaStream_t) m.cs;
     // the MMQ row table lives in the borrowed cache slots, which the refill after a prompt overwrites with experts:
     // write it again for every prompt (a layout is reused as long as the chunk and the slots are the same)
@@ -1483,8 +1486,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
                            m.region_bytes / ((uint64_t) (3 * basalt::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
-    auto ple_gather = [&m, &ss, tokens, n, prev0](int64_t c0, int buf, std::string& e) -> bool {
-        const int64_t T = std::min(m.T, n - c0);
+    auto ple_gather = [&m, &ss, tokens, n, prev0, &chunk_len](int64_t c0, int buf, std::string& e) -> bool {
+        const int64_t T = chunk_len(c0);
         auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };   // prev0, then the tokens
         int32_t pv[2] = {at(c0), at(c0 + 1)};
         for (int64_t t = 0; t < T; ++t) {
@@ -1500,9 +1503,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
     int ple_buf = 0;
 
-    for (int64_t c0 = 0; c0 < n; c0 += m.T) {
+    for (int64_t c0 = 0; c0 < n; c0 += chunk_len(c0)) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
-        const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
+        const int64_t T = chunk_len(c0), p0 = pos0 + c0;
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);
         ++stats_.chunks;
         // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
@@ -1582,13 +1585,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
-            if (c0 + m.T < n) {
+            if (c0 + T < n) {
                 // the other buffer's upload (a chunk ago) is done before the SSD thread refills it
                 if (cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]) != cudaSuccess) {
                     err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
-                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
+                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + T, b = ple_buf ^ 1] {
                     return ple_gather(c1, b, ple_next_err);
                 });
             }

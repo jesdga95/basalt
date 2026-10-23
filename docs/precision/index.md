@@ -151,6 +151,15 @@ whose expert blobs exceed 1.5 MB (NVFP4). A chunk's GEMM tiles set the rounding 
 tokens on such a pack is chunked differently and its K/V can differ in the last bits; prompts up to 16384 tokens and the
 256-token prompt half of the quality gate chunk as before, so the gate's numbers do not move.
 
+**Short first chunk.** A prompt above the chunk cap (and at least 32,768 tokens) reads its first 16,384 tokens as one
+chunk and the rest in equal chunks of at most the cap, so the first chunk waits for fewer PLE rows. This moves the chunk
+boundaries (GEMM tiles, so the rounding of the K/V) and nothing else: prompts up to the cap and the quality gate's
+256-token prompt half chunk as before (the 20-chunk gate is identical to the previous build: PPL 2.2924, KLD 0.06989,
+top-1 92.86%, 400 W, NVIDIA-checkpoint pack). Long-context check, 65,515-token prompt, the first 64 greedy tokens
+teacher-forced with the previous chunking's tokens, spec 1, int8 KV, 400 W: KLD of the next-token distribution against
+the previous chunking has mean 0.0032, median 0.00013, max 0.038, and the same top-1 at 64 of 64 positions. The 16-token
+greedy text of the 64K benchmark prompt differs at one near-tie word.
+
 **K-quant experts on MMQ.** `tests/cuda/prefill_mmq_kq_test.cpp` runs MMQ and the FP16 dequant + cuBLAS path it
 replaced on random zero-centred experts at the model's geometry against a double-precision reference. Relative RMS
 error of the expert outputs, MMQ / FP16 path: 1.08e-2 / 5e-4 with plain activations (Q4_K/Q5_1, Q4_K/Q8_0, Q5_K/Q8_0),
