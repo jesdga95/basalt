@@ -15,6 +15,7 @@ from serve.engine.mock import Engine
 from serve.frontend import ChatTemplate, Event, OutputParser, images_of, literal_tags, mark_think_literals, unmark_think_literals
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
+from serve.prompt import CTX_SLACK, PromptText, overflow_error, room_error
 from serve.util.text import Detokenizer, IM_END, StopMatcher, control_literals, stop_strings
 from serve.engine.vision import Vision
 from serve.api.grammar import grammar_spec, unenforced
@@ -37,7 +38,6 @@ REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my 
 REASONING_CLOSE = "\n</think>\n\n"
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often
 KEEPALIVE_S = 10.0          # a stream quiet this long (a held-back tool argument) gets a keep-alive
-CTX_SLACK = 8               # the engine rejects prompt + max_new + 8 > context
 # live tok/s is a windowed rate: a mean since the first token spikes at the start of an answer
 RATE_WINDOW_S = 2.0
 LOG_FIRST_LINES = 300        # lines /api/logs returns to a client with none
@@ -470,14 +470,20 @@ class Service:
         tail = "" if off else EFFORT_TURN.format(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
         return history + tail + full[len(mine):]
 
-    def encode_prompt(self, messages, tools, kwargs) -> list[int]:
-        """The rendered, tokenized prompt. Think tags and control-token text inside messages stay plain text; only
-        the template's own are special."""
+    def render_text(self, messages, tools, kwargs) -> tuple[str, list]:
+        """The rendered prompt and the character spans in it where special-token text stays plain text: think tags
+        and control-token text inside messages are text; only the template's own are special."""
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         if not changed:
+            return prompt, []
+        return unmark_think_literals(prompt, self.literals)
+
+    def encode_prompt(self, messages, tools, kwargs) -> list[int]:
+        """The rendered, tokenized prompt (see render_text)."""
+        prompt, plain = self.render_text(messages, tools, kwargs)
+        if not plain:
             return self.tok.encode(prompt, parse_special=True)
-        prompt, plain = unmark_think_literals(prompt, self.literals)
         return self.tok.encode(prompt, parse_special=True, plain=plain)
 
     def prepare(self, messages, tools, kwargs, max_new=None, force=None):
@@ -493,7 +499,28 @@ class Service:
                 self.embeddings.path = None
             raise
 
+    def _prepare_text(self, messages, tools, kwargs, max_new, force):
+        """The text path: the engine tokenizes, so the server sends the rendered prompt as it is and settles the
+        answer cap with the engine (clip: cut to the room the context leaves)."""
+        text, plain = self.render_text(messages, tools, kwargs)
+        tail = force if force and kwargs.get("enable_thinking", True) is False else ""
+        ctx = self.engine.max_context
+        if ctx <= 0:
+            if getattr(self.engine, "starting", False):
+                raise EngineStarting("the engine is starting (a minute or two); try again shortly")
+            ctx = getattr(self.engine, "known_ctx", 0)
+            if ctx <= 0:
+                raise EngineStarting("the engine is starting (a minute or two); try again shortly")
+        unset = max_new is None or max_new <= 0
+        if unset:
+            max_new = ctx - CTX_SLACK
+        prompt = PromptText(self.tok, text + tail, plain, tail, clip=unset or self.fit_max_tokens)
+        prompt.max_new = max_new
+        return prompt, kwargs.get("enable_thinking", True) is not False, max_new
+
     def _prepare(self, messages, tools, kwargs, max_new, force):
+        if getattr(self.engine, "takes_text", False) and not images_of(messages) and not getattr(self.engine, "batch", 0):
+            return self._prepare_text(messages, tools, kwargs, max_new, force)
         ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
@@ -537,18 +564,11 @@ class Service:
         room = ctx - CTX_SLACK - len(ids)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
-                raise ValueError("request exceeds the context window: "
-                                 f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
-                                 f"({ctx}); requests are never truncated")
+                raise room_error(len(ids), ctx)
             max_new = room
         elif max_new > room:
             if not self.fit_max_tokens:
-                raise ValueError("request exceeds the context window: "
-                                 f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
-                                 f"({ctx}); requests are never truncated. Send a smaller "
-                                 f"max_tokens (at most {max(0, room)} here), or start the server with "
-                                 "--fit-max-tokens (or set \"fit-max-tokens\": true in the \"server\" section of "
-                                 "the --config file) to shorten it to the room left")
+                raise overflow_error(len(ids), max_new, ctx)
             max_new = max(1, room)          # fit_max_tokens: shorten rather than 400
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
@@ -691,6 +711,8 @@ class Service:
                     for ev in opening:
                         yield "event", ev
                     while True:
+                        if isinstance(ids, PromptText) and ids.max_new:
+                            max_new = ids.max_new       # settled by the engine at PT (a clipped cap)
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
@@ -701,6 +723,9 @@ class Service:
                             last_out = time.monotonic()
                             for t in gen:
                                 if t is None:               # heartbeat
+                                    if isinstance(ids, PromptText) and ids.n is not None and st.get("prompt_tokens") != ids.n:
+                                        with self.status_lock:  # the engine has counted the prompt
+                                            st.update(prompt_tokens=ids.n, max_tokens=ids.max_new or max_new)
                                     last_print = self._progress(last_print, st=st)
                                     last_out = time.monotonic()
                                     yield "ping", None

@@ -20,6 +20,7 @@ from serve.util.text import ByteTokenizer
 
 
 class ResidentEngine(ProcessEngine):
+    takes_text = False      # its generate() is the mock engine's: ids only
     def __init__(self, tok):
         self.reply = MockEngine(tok, "Hello.", max_context=4096)
         self.max_context, self.info, self.last = 4096, {}, {}

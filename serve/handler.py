@@ -21,6 +21,7 @@ from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, checked as checked_bia
 from serve.frontend import anthropic_to_messages, forced_call, openai_to_messages
 from serve.api.openai import openai_chunks, openai_collect
 from serve.api.responses import ResponsesError
+from serve.prompt import primed
 from serve.security import host_allowed, host_names_for, key_matches, origin_allowed
 from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, Service, _debug_req
 from serve.api.structured import anthropic_format, check_format
@@ -526,7 +527,7 @@ def make_handler(svc: Service):
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, force=force)
+            chunks = primed(openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, force=force), ids)
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
             self._sse()
@@ -573,7 +574,11 @@ def make_handler(svc: Service):
                         done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
                     yield from asm.finish(done)
-            items = events()
+            try:
+                items = primed(events(), ids)
+            except ValueError as e:                          # too long for the context: found when the engine counted
+                err = ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None)
+                return self._json(err.status, err.body())
             if not req.get("stream"):
                 try:
                     result = responses_api.collect(items)
@@ -693,7 +698,7 @@ def make_handler(svc: Service):
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
+            events = primed(anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force), ids)
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
             self._sse()

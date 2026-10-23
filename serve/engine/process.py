@@ -4,6 +4,10 @@ Protocol (one line each):
   * start: stdout `INFO k=v ...` lines, then `READY <ctx> [stop]` (stop: STOP is honoured mid-request).
   * solo: `GEN <max_new> [k=v ...] <ids>` (GENI with embeddings) -> `T <id>`, `PP <read> <total> ...`,
     `RESUME <n>`, then `DONE ...`; `STOP` ends it early. `ERR ...` is a failure.
+  * solo, text (INFO text_prompt=1): `GENT <max_new> [k=v ...] <nbytes> [plain=a:b,...]`, a newline, then nbytes of
+    raw UTF-8: the engine tokenizes (control literals on; `plain` byte spans are text) and answers like a GEN, with
+    `PT <n> <max_new>` before the first PP line. `clip=1` cuts max_new to the room the context leaves after the prompt.
+    The slot and batch forms are SGENT and BGENT; the server uses only GENT.
   * batch slots: `BGEN <slot> ...` -> `BADM <slot> <continues>`, `BT <slot> <id>`, `BDONE <slot> ...`;
     `BSTOP <slot>`; `BYIELD <slot>` makes a long prompt read give way (answered by `YIELDED <slot> <n>`).
   * solo in a slot (INFO solo_any_slot=1): `SGEN <slot> <max_new> [k=v ...] <ids>` (SGENI with embeddings) is a GEN on
@@ -30,6 +34,7 @@ from serve.engine import lifeline
 from serve.engine.flags import flag_value
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStuck
 from serve.engine.slots import AdmissionQueue
+from serve.prompt import PromptText
 from serve.engine.progress import narrate_start, start_errors, start_failure_hint, start_last_line
 
 
@@ -123,6 +128,7 @@ class ProcessEngine:
     last_err = None                      # an ERR that was the last stdout line
     slot_drafts = {}                     # batch slot -> (accepted, offered, time) of its last BDONE, counts None when absent
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
+    takes_text = True                    # generate() accepts a PromptText (sent as GENT when the engine can tokenize)
     stderr_sink = None                   # callable(line): engine stderr when there is no log file
 
     # `last`: figures of the last DONE line; per thread with batch slots, since requests run concurrently.
@@ -1110,6 +1116,10 @@ class ProcessEngine:
         `cancel` makes the engine STOP."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
+        text = ids if isinstance(ids, PromptText) else None
+        if text is not None and (getattr(self, "batch", 0) or embeddings or not self.info.get("text_prompt")):
+            ids, max_new = text.resolve(int(max_new), self.max_context)    # this engine takes ids
+            text = None
         if getattr(self, "batch", 0):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
             return
@@ -1118,7 +1128,15 @@ class ProcessEngine:
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
         try:
-            self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
+            if text is not None:
+                body = text.text
+                spans = text.byte_spans()
+                plain = " plain=" + ",".join(f"{a}:{b}" for a, b in spans) if spans else ""
+                clip = " clip=1" if text.clip else ""
+                self.proc.stdin.write(f"GENT {int(max_new)}{self.sampling_keys(sampling or {})}{clip} "
+                                      f"{len(body.encode('utf-8'))}{plain}\n{body}")
+            else:
+                self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
         except OSError:                                  # the pipe is gone: the engine died
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
@@ -1158,6 +1176,12 @@ class ProcessEngine:
                     if cancel.is_set():
                         return
                     yield int(line[2:])
+                elif line.startswith("PT ") and text is not None:   # the engine tokenized the text
+                    f = line.split()
+                    if len(f) >= 3 and f[1].isdigit() and f[2].lstrip("-").isdigit():
+                        text.set_counted(int(f[1]), int(f[2]))
+                        allow = silence + min(int(f[1]), PP_CHUNK_MAX) / PP_FLOOR_TOK_S if silence > 0 else 0.0
+                    yield None
                 elif line.startswith("PP "):
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
@@ -1186,7 +1210,8 @@ class ProcessEngine:
                     return
                 elif line.startswith("ERR"):
                     done = True
-                    raise ValueError(line[4:].strip())
+                    err = line[4:].strip()
+                    raise ValueError(text.explain(err) if text is not None else err)
         finally:
             if not done:                                  # consumer left early: STOP and drain to DONE
                 if self.can_stop:
