@@ -182,6 +182,14 @@ int main(int argc, char** argv) {
         ops.push_back({"Q2_0 down", "avx2", dbytes, NH, [=](const uint8_t* b, int r0, int r1, int) { cpu::q2_0_gguf_rows_multi_avx2(b, drow, NFF / 64, ph1, NT, out, r0, r1); }, dbytes});
     }
 
+    // a CPU without AVX-512 times only the sets it can run
+    const bool avx512 = cpu::cpu_avx512_ok();
+    if (!avx512) {
+        ops.erase(std::remove_if(ops.begin(), ops.end(), [](const Op& op) { return std::string(op.isa) == "avx512"; }),
+                  ops.end());
+        std::printf("no AVX-512 on this CPU: its rows are left out\n");
+    }
+
     {   // activation quantizers, one token: us per call
         auto time_us = [&](const std::function<void()>& f) {
             for (int i = 0; i < 2000; ++i) f();
@@ -191,18 +199,19 @@ int main(int argc, char** argv) {
             return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / R;
         };
         std::vector<uint8_t> q(ggml_row_size(GGML_TYPE_Q8_K, NH));
+        auto time_512 = [&](const std::function<void()>& f) { return avx512 ? time_us(f) : NAN; };
         std::printf("q8_K quantize 2560   ggml scalar %.2f us   avx2 %.2f us   avx512 %.2f us\n",
                     time_us([&] { tq8k->from_float(xs[0].data(), q.data(), NH); }),
                     time_us([&] { cpu::quantize_q8_K_avx2(xs[0].data(), q.data(), NH); }),
-                    time_us([&] { cpu::quantize_q8_K_avx512(xs[0].data(), q.data(), NH); }));
+                    time_512([&] { cpu::quantize_q8_K_avx512(xs[0].data(), q.data(), NH); }));
         std::vector<uint8_t> q0(ggml_row_size(GGML_TYPE_Q8_0, NH));
         std::printf("q8_0 quantize 2560   ggml avx2 %.2f us   ggml avx512 %.2f us\n",
                     time_us([&] { tq80->from_float(xs[0].data(), q0.data(), NH); }),
-                    time_us([&] { ggml_get_type_traits_cpu_avx512(GGML_TYPE_Q8_0)->from_float(xs[0].data(), q0.data(), NH); }));
+                    time_512([&] { ggml_get_type_traits_cpu_avx512(GGML_TYPE_Q8_0)->from_float(xs[0].data(), q0.data(), NH); }));
         cpu::ActQ aq;
         std::printf("q8_1 quantize  640   avx2 %.2f us   avx512 %.2f us\n",
                     time_us([&] { cpu::act_quant_q8_1_avx2(hs[0].data(), NFF, aq); }),
-                    time_us([&] { cpu::act_quant_q8_1(hs[0].data(), NFF, aq); }));
+                    time_512([&] { cpu::act_quant_q8_1(hs[0].data(), NFF, aq); }));
     }
 
     std::vector<uint8_t> proto;
