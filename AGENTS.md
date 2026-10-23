@@ -8,6 +8,7 @@ Basalt is a local inference engine for the Qwen3.8-Flash-Next mixture-of-experts
 
 - **Commits:** small and logical, message style `area: what it does`. Never amend and never force-push; always make new commits. End each message with the co-author line your tool's instructions specify.
 - **Platform code:** engine code never names an OS or a compiler. No `_WIN32`, `_MSC_VER`, `__linux__`, `<windows.h>`, `<sys/mman.h>`, `<unistd.h>` or raw OS calls (mmap, pread, pthread, fork/exec, dlopen, /proc, /sys) outside `src/platform/` and `include/basalt/platform/`. A missing seam is added there with a Linux and a Windows body; the Linux body is the code you would have written anyway. `tools/check_platform_boundary.sh` enforces it.
+- **Log lines:** every engine stderr line goes through `include/basalt/log.hpp` with its real level (`info`, `warn`, `error`); never `fprintf(stderr, ...)`. Do not change the text of lines the server parses. `tools/check_stderr_logging.sh` enforces it.
 - **Code comments:** brief and stateless. Say what the code does and why. No hardware names, measured numbers, dates or history in comments.
 - **Don't push or publish anywhere** (GitHub, HF, any remote) without the maintainer's approval.
 - **Don't write tools nobody asked for.**

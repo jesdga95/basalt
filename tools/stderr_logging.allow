@@ -1,0 +1,4 @@
+# Files under src/ and include/ that still name stderr, with their hit counts (see tools/check_stderr_logging.sh).
+1 src/program/bench_main.cpp
+1 src/program/generate.cpp
+2 src/platform/system.cpp

@@ -36,10 +36,10 @@ At startup the server prints one `[server] kv cache:` line per device with all t
 example `12.5 GiB on cuda2 (solo 262144 tokens + 2 slots x 262144 tokens + draft K/V 0.5 GiB)`. With elastic KV (the
 default for a server whose `--max-context` is above 32768) it reads `0.6 / 4.4 GiB on cuda0 (elastic)`: the memory backed at startup, and what the cache can
 grow to at `--max-context`. Because that memory is
-taken from the expert cache, the engine warns (`basalt warning: the N batch slots' sessions ... take X GiB of CUDA0
+taken from the expert cache, the engine warns (`warning: the N batch slots' sessions ... take X GiB of CUDA0
 ...`) when it leaves the cache short of the expert set, or at under half of what it would hold without the slots, and
 names the remedies: a smaller `--max-context`, no `--slot-full-context`, fewer `--parallel` slots. If a slot's session
-does not fit at all, the engine says which slot (`WARNING: --batch N: slot K's session does not fit`) and starts with
+does not fit at all, the engine says which slot (`warning: --batch N: slot K's session does not fit`) and starts with
 the slots that did fit; if fewer than two fit, `--batch is off` and the server runs one request at a time.
 
 - `server` holds the server's options (`python -m serve.server --help`), named as the flags without the dashes:

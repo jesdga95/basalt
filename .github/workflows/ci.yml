@@ -40,6 +40,8 @@ jobs:
           persist-credentials: false
       - name: Platform boundary
         run: tools/check_platform_boundary.sh
+      - name: Engine log lines
+        run: tools/check_stderr_logging.sh
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
