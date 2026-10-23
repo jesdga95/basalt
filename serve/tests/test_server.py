@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1652,6 +1653,74 @@ class LoadProgress(unittest.TestCase):
         bars.finish()
         self.assertIn("[server] loaded 2.0 GiB in ", out.getvalue())     # the table is not part of the loaded bytes
         self.assertIn("(cuda2 2.0 GiB)", out.getvalue())
+
+    @staticmethod
+    def _screen(raw: str) -> list[str]:
+        """What a terminal shows after `raw`: cursor-up and erase-line moves applied to the written lines."""
+        rows, r = [""], 0
+        for part in re.split(r"(\x1b\[1A|\x1b\[2K|\n)", raw):
+            if part == "\x1b[1A":
+                r = max(0, r - 1)
+            elif part == "\x1b[2K":
+                rows[r] = ""
+            elif part == "\n":
+                r += 1
+                rows += [""] * (r + 1 - len(rows))
+            else:
+                rows[r] += part
+        return [x for x in rows if x]
+
+    def _ple_ram_start(self, out, foreign):
+        """The line sequence of a start with the n-gram table in RAM: the table rows come while cuda0 is loading."""
+        from serve.engine import progress
+        from serve.engine.progress import LoadBars
+        G = 1 << 30
+        bars = progress._active = LoadBars(out, gpus=[0, 1])
+        try:
+            bars.set_total(40 * G)
+            bars.set_plan("cuda0", 30 * G)
+            bars.set_plan("ram", 10 * G)
+            for k in range(1, 6):
+                bars.update("cuda0", 5 * G * k, 30 * G)
+            for k in range(0, 4):
+                bars.update("ngram", 18 * G * k // 3 * 1, 18 * G)
+                bars.update("cuda0", (25 + k) * G, 30 * G)
+            bars.update("cuda0", 30 * G, 30 * G)
+            bars.update("ram", 10 * G, 10 * G)
+            bars.update("ngram", 18 * G, 18 * G)
+            if foreign:
+                progress.server_line("[server] auto flags: spec 7")
+            bars.finish()
+        finally:
+            progress._active = None
+
+    def test_no_live_row_is_left_after_the_loaded_line(self):
+        for foreign in (False, True):
+            out = Tty()
+            self._ple_ram_start(out, foreign)
+            shown = self._screen(out.getvalue())
+            self.assertEqual(len([x for x in shown if "loading" in x]), 0, shown)
+            self.assertTrue(shown[0].startswith("[server] auto flags") if foreign else shown[0].startswith("[server] loaded"), shown)
+            self.assertTrue(any(x.startswith("[server] loaded") for x in shown), shown)
+
+    def test_the_ngram_row_is_drawn_while_the_table_loads(self):
+        out = Tty()
+        from serve.engine.progress import LoadBars
+        bars = LoadBars(out)
+        bars.set_plan("cuda0", 4 << 30)
+        bars.update("cuda0", 3 << 30, 4 << 30)
+        bars.update("ngram", 1 << 30, 3 << 30)
+        shown = self._screen(out.getvalue())
+        self.assertEqual([x.split(" [")[0].rstrip() for x in shown],
+                         ["[server] loading weights into cuda0", "[server] loading the n-gram table into system ram"])
+
+    def test_off_a_terminal_only_the_result_line_prints(self):
+        out = io.StringIO()
+        self._ple_ram_start(out, True)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 2, lines)
+        self.assertTrue(lines[0].startswith("[server] auto flags") and lines[1].startswith("[server] loaded 40.0 GiB"))
+        self.assertNotIn("\x1b", out.getvalue())
 
     def test_kv_is_a_line_after_the_result_and_not_a_load(self):
         from serve.engine.progress import LoadBars, load_kv, load_progress

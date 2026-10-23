@@ -57,6 +57,7 @@ class LoadBars:
 
     def __init__(self, out=None, gpus=None):
         self.out = out or sys.stdout
+        self.lock = threading.RLock()                  # the narrator and a thread printing a server line share the screen
         self.gpus = list(gpus or [])                   # CUDA ordinal -> nvidia-smi number
         self.tty = self.out.isatty()
         self.total = 0                                 # announced total bytes (0: none)
@@ -123,9 +124,10 @@ class LoadBars:
 
     def say(self, text: str) -> None:
         """A line printed above the bars."""
-        self._erase()
-        self.out.write(text + "\n")
-        self._draw()
+        with self.lock:
+            self._erase()
+            self.out.write(text + "\n")
+            self._draw()
 
     def set_kv(self, target: str, nbytes: int, tokens: int, kind: str = "", max_bytes: int = 0) -> None:
         self.kv.append((target, nbytes, tokens, kind, max(max_bytes, nbytes)))
@@ -168,46 +170,61 @@ class LoadBars:
     def set_plan(self, target: str, plan: int, copy: bool = False) -> None:
         if self.t0 is None:
             self.t0 = time.time()
-        self._target(target, copy)["plan"] = plan
-        self._erase()
-        self._draw()
+        with self.lock:
+            self._target(target, copy)["plan"] = plan
+            self._erase()
+            self._draw()
 
     def update(self, target: str, done: int, total: int, copy: bool = False) -> None:
         if self.t0 is None:
             self.t0 = time.time()
-        t = self._target(target, copy)
-        if t["start"] is None:
-            t["start"] = self.started
-            self.started += 1
-        done = min(done, total)
-        if t["seen"] != total or done < t["last"]:     # new phase: the last is complete
-            t["done"] += t["last"] if t["seen"] else 0
-            t["last"] = 0
-            t["seen"] = total
-        t["last"] = done
-        if target == self.TABLE:
-            t["plan"] = total
-        self._erase()
-        self._draw()
+        with self.lock:
+            t = self._target(target, copy)
+            if t["start"] is None:
+                t["start"] = self.started
+                self.started += 1
+            done = min(done, total)
+            if t["seen"] != total or done < t["last"]:     # new phase: the last is complete
+                t["done"] += t["last"] if t["seen"] else 0
+                t["last"] = 0
+                t["seen"] = total
+            t["last"] = done
+            if target == self.TABLE:
+                t["plan"] = total
+            self._erase()
+            self._draw()
 
     def finish(self) -> None:
         """The engine is up: replace the bars with the result line."""
-        self._erase()
-        done = self.done()
-        want = self.total or sum(t["plan"] for (tg, c), t in self.targets.items() if not c and tg != self.TABLE)
-        if done > 0 and done >= want:                  # a failed start is reported elsewhere
-            def part(copy):
-                return {tg: t["done"] + t["last"] for (tg, c), t in self.targets.items()
-                        if c == copy and tg != self.TABLE and t["done"] + t["last"]}
-            parts = ", ".join(f"{self.name(tg)} {b / 2**30:.1f} GiB" for tg, b in part(False).items())
-            extra = "".join(f"; {self.name(tg)} copy {b / 2**30:.1f} GiB" for tg, b in part(True).items())
-            self.out.write(f"[server] loaded {done / 2**30:.1f} GiB in {time.time() - self.t0:.1f} s "
-                           f"({parts}{extra})\n")
-        for line in self.kv_lines():
-            self.out.write(line + "\n")
-        self.kv.clear()
-        self.targets.clear()
-        self.out.flush()
+        with self.lock:
+            self._erase()
+            done = self.done()
+            want = self.total or sum(t["plan"] for (tg, c), t in self.targets.items() if not c and tg != self.TABLE)
+            if done > 0 and done >= want:                  # a failed start is reported elsewhere
+                def part(copy):
+                    return {tg: t["done"] + t["last"] for (tg, c), t in self.targets.items()
+                            if c == copy and tg != self.TABLE and t["done"] + t["last"]}
+                parts = ", ".join(f"{self.name(tg)} {b / 2**30:.1f} GiB" for tg, b in part(False).items())
+                extra = "".join(f"; {self.name(tg)} copy {b / 2**30:.1f} GiB" for tg, b in part(True).items())
+                self.out.write(f"[server] loaded {done / 2**30:.1f} GiB in {time.time() - self.t0:.1f} s "
+                               f"({parts}{extra})\n")
+            for line in self.kv_lines():
+                self.out.write(line + "\n")
+            self.kv.clear()
+            self.targets.clear()
+            self.out.flush()
+
+
+_active: "LoadBars | None" = None                     # the bars on screen during a start
+
+
+def server_line(text: str) -> None:
+    """Print a `[server]` line; while load bars are on screen it goes above them, so they are redrawn in place."""
+    bars = _active
+    if bars is not None:
+        bars.say(text)
+    else:
+        print(text, flush=True)
 
 
 def load_progress(line: str):
@@ -299,7 +316,8 @@ def start_errors(log: str | None, offset: int) -> list[str]:
 
 def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=20.0, out=None, gpus=None) -> None:
     """Show load progress and warnings from the engine log, with a heartbeat while idle."""
-    bars = LoadBars(out, gpus)
+    global _active
+    bars = _active = LoadBars(out, gpus)
     t0 = last = time.time()
     pos = offset
     while True:
@@ -331,6 +349,8 @@ def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=2
                     bars.say(f"[server] RAM floor: {r}")
         if stop:
             bars.finish()
+            if _active is bars:
+                _active = None
             return
         if time.time() - last > heartbeat:
             last = time.time()

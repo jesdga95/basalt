@@ -35,7 +35,7 @@ from serve.engine.flags import flag_value
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStuck
 from serve.engine.slots import AdmissionQueue
 from serve.prompt import PromptText
-from serve.engine.progress import narrate_start, start_errors, start_failure_hint, start_last_line
+from serve.engine.progress import narrate_start, server_line, start_errors, start_failure_hint, start_last_line
 
 
 # A running request whose engine prints nothing for this long is out of step: the engine is ended and the request
@@ -88,7 +88,7 @@ def relay_auto_flags(line: str) -> bool:
     """Print the engine's auto-picked flags as a server line; False when the line is not that line."""
     if not line.startswith(AUTO_FLAGS):
         return False
-    print("[server] " + line.rstrip("\n"), flush=True)
+    server_line("[server] " + line.rstrip("\n"))
     return True
 
 
