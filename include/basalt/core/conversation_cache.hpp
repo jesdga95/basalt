@@ -3,14 +3,17 @@
 #pragma once
 
 #include "basalt/core/conversation_buffer.hpp"
+#include "basalt/core/gdn_slot_book.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <new>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -85,6 +88,10 @@ struct ConversationCheckpoint {
     std::vector<ConversationImageKey> imgs;
     CheckpointBytes gdn, ple, tails, dead, block_pos;
     uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
+    // A device slot mirroring `gdn` (GdnSlotRef): while it holds one, `gdn` is empty and a restore reads the
+    // recurrence device to device.  A copy of a checkpoint holds none, so an image or another chain carries host
+    // bytes only, and a chain that is replaced or dropped gives its slots back by itself.
+    GdnSlotRef gdn_slot;
     // Ordinary layer-split checkpoints retain each device's running state.
     // Whole-session parking is currently single-GPU and rejects these parts.
     std::vector<ConversationCheckpoint> stage_parts;
@@ -201,12 +208,46 @@ struct SavedConversation {
     }
 };
 
+/// Cells of the draft layer a token-prefix key of `tokens` tokens names.  The drafter's cell i pairs the main
+/// model's residual at position i with the token at i + 1, so its key is a bigram sequence: N tokens are N - 1
+/// bigrams, and a key of N tokens names cells [0, N - 1).  Cell N - 1 pairs with the token at N, which the key does
+/// not contain: it belongs to the next slice and shares this slice's boundary token.  Cached draft-path K/V is keyed
+/// by this count, never by the token count; what a key may publish is `draft_published_cells` below.
+inline int64_t draft_cells(int64_t tokens) { return tokens > 0 ? tokens - 1 : 0; }
+
+/// Cells of the draft layer a token-prefix key may PUBLISH: `draft_cells(tokens)` rounded down to whole pages.  The
+/// boundary cell sits inside the page that holds it, so a page-granular image cannot leave the cell out without
+/// leaving its page out; rounding down keeps that page outside the published range, and a restore invalidates the
+/// trailing pages it did not publish.  This is not floor(tokens/page)*page: the count derives from the cells the key
+/// names, so a page-aligned token count still publishes one page fewer.
+inline int64_t draft_published_cells(int64_t tokens, int64_t page) {
+    if (page <= 0) return draft_cells(tokens);
+    return draft_cells(tokens) / page * page;
+}
+
+/// Element-by-element token equality, any token width.  Every caller only asks "equal or not", so this is
+/// the shape the bulk path below has to agree with.
+template<class Token>
+bool conversation_ids_equal_linear(const int32_t* ids, size_t n, const Token* prompt) {
+    for (size_t i = 0; i < n; ++i)
+        if (!(ids[i] == prompt[i])) return false;
+    return true;
+}
+
+/// The same answer as `conversation_ids_equal_linear`.  A key is `int32`, and a prompt is `int32` in the serving path,
+/// so that case compares in bulk (`memcmp` over the slice); any other token width falls back to the element-wise loop.
+template<class Token>
+bool conversation_ids_equal(const int32_t* ids, size_t n, const Token* prompt) {
+    if constexpr (std::is_same_v<Token, int32_t>) return std::memcmp(ids, prompt, n * sizeof(int32_t)) == 0;
+    else return conversation_ids_equal_linear(ids, n, prompt);
+}
+
 template<class Token>
 int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<Token>& prompt,
                             const std::vector<ConversationImageKey>& images) {
     const size_t n = c.ids.size();
     // The last prompt token always starts the next verify window.
-    if (n == 0 || n >= prompt.size() || !std::equal(c.ids.begin(), c.ids.end(), prompt.begin())) return 0;
+    if (n == 0 || n >= prompt.size() || !conversation_ids_equal(c.ids.data(), n, prompt.data())) return 0;
     size_t j = 0;
     for (const auto& image : images) {
         if (image.start >= (int64_t) n) continue;

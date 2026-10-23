@@ -309,7 +309,11 @@ int main() {
             }
         }
         for (int64_t upto : {0,1,3,4,5,63,64,65,96}) {
-            const bool index=mode!=2;
+            // A main-layer image's extent rounds up to whole pages; a draft image publishes only the whole pages of
+            // the cells its key names.  Both extents are exercised wherever a fixture has them, because the tail a
+            // draft key does not publish has to be invalidated in all three residency modes, not only in the ring.
+            const std::vector<bool> extents = mode==2 ? std::vector<bool>{false} : std::vector<bool>{true,false};
+            for (const bool index : extents) {
             std::string err;
             f.fill(13);
             ConversationKv a,b,restored;
@@ -318,7 +322,11 @@ int main() {
             check(a.bytes()==conversation_kv_bytes(f.state,f.g,upto,index),"size estimate equals snapshot payload");
             f.fill(177);
             check(conversation_kv_save(b,f.state,f.g,upto,index,err),"save B");
-            check(upto==0 || !equal(a,b),"fixture changes state");
+            // A draft image publishes whole pages of the cells its key names, so a short prefix publishes nothing and
+            // two saves at the same prefix are both empty; that is the rule, not a fixture that failed to change.
+            const int64_t published = index ? upto : draft_published_cells(upto, a.page_size ? a.page_size : 1);
+            if (published == 0) check(a.k.empty() && b.k.empty(), "a prefix with no whole page publishes no cells");
+            else check(!equal(a,b),"fixture changes state");
             check(conversation_kv_restore(a,f.state,f.g,upto,index,err),"restore A over B");
             cuda_check(cudaDeviceSynchronize());
             check(conversation_kv_save(restored,f.state,f.g,upto,index,err),"read back restored A");
@@ -330,19 +338,68 @@ int main() {
                 cuda_check(cudaMemcpy(table.data(),f.state.page_table,table.size()*4,cudaMemcpyDeviceToHost));
                 check(std::all_of(table.begin(),table.end(),[](int32_t x){return x==-1;}),"stale VRAM pages invalidated");
             }
-            if (mode==2 && upto>0) {
+            if (upto>0) {
                 const auto s=qsa_real_shapes();
-                const int64_t b1=(upto+s.page_size-1)/s.page_size,b0=std::max<int64_t>(0,b1-f.state.n_slots);
                 const size_t block=kv_block_bytes(s,fmt)/2;
-                // Codes and scales are separate in INT8; check code bytes here.
-                const size_t code_block=fmt==kKvInt8 ? s.page_size*s.n_head_kv*s.head_dim : block;
-                const void* slots=fmt==kKvQ4?(void*)f.state.k_q4:fmt==kKvInt8?(void*)f.state.k_q:(void*)f.state.k_pool;
-                std::vector<uint8_t> got(code_block);
-                for (int64_t page=b0;page<b1;++page) {
-                    cuda_check(cudaMemcpy(got.data(),(const uint8_t*)slots+(page%f.state.n_slots)*code_block,code_block,cudaMemcpyDeviceToHost));
-                    std::vector<uint8_t> expected(code_block);
-                    check(a.k.read(expected.data(), page*code_block, code_block),"read segmented expected draft page");
-                    check(got == expected,"draft ring contains restored pages");
+                // Codes and scales are separate in INT8, and hybrid K8V4 keeps its K as INT8: check code bytes here.
+                const size_t code_block=(fmt==kKvInt8 || fmt==3) ? s.page_size*s.n_head_kv*s.head_dim : block;
+                const void* slots=fmt==kKvQ4?(void*)f.state.k_q4
+                                   :(fmt==kKvInt8 || fmt==3)?(void*)f.state.k_q:(void*)f.state.k_pool;
+                const int64_t published=a.cells/a.page_size;              // pages the image publishes
+                const int64_t token_pages=(upto+s.page_size-1)/s.page_size;   // pages the key names
+                std::vector<uint8_t> got(code_block), zero(code_block,0);
+                // A page the image does not publish must not stay readable, in EVERY residency mode: mode 0's
+                // authoritative side is the resident pool the attention reads, modes 1 and 2 keep it in the host copy
+                // the refills load from.  Read the buffer pools() selects for this format - through the exposed
+                // selector, not a second copy of the branch - and expect zeros where the outgoing tenant's bytes were.
+                // The authoritative side, read through the exposed selector: the host copy for the streaming and ring
+                // modes, the resident device pool for mode 0 (there is no second copy there).  Read it with a copy,
+                // not a dereference: for mode 0 that pointer is device memory.
+                const void* auth_k = conversation_kv_pools(f.state, false)[0];
+                for (int64_t page=published;page<token_pages;++page) {
+                    if (auth_k != nullptr)
+                        cuda_check(cudaMemcpy(got.data(), (const uint8_t*) auth_k + page * code_block, code_block,
+                                              cudaMemcpyDefault));
+                    check(auth_k != nullptr && got == zero,
+                          "the unpublished tail page is zeroed in the authoritative copy, in every mode");
+                    if (mode==2) {
+                        cuda_check(cudaMemcpy(got.data(),(const uint8_t*)slots+(page%f.state.n_slots)*code_block,code_block,cudaMemcpyDeviceToHost));
+                        check(got==zero,"the unpublished tail page is invalidated in the ring, not left stale");
+                    }
+                }
+                if (mode==2) {
+                    // The ring's window is the TOKEN COUNT's, [token_pages - n_slots, token_pages): the restore refills the
+                    // gap page too (zeroed), so it evicts the published page `published - n_slots`.  Every ring walker -
+                    // this loop and conversation_kv_verify - starts at token_pages - n_slots, never at published - n_slots.
+                    const int64_t ring0=std::max<int64_t>(0,token_pages-f.state.n_slots);
+                    for (int64_t page=ring0;page<published;++page) {
+                        cuda_check(cudaMemcpy(got.data(),(const uint8_t*)slots+(page%f.state.n_slots)*code_block,code_block,cudaMemcpyDeviceToHost));
+                        std::vector<uint8_t> expected(code_block);
+                        check(a.k.read(expected.data(), page*code_block, code_block),"read segmented expected draft page");
+                        check(got == expected,"draft ring contains restored pages");
+                    }
+                    // The page the gap evicted is EXPECTED to be gone: its slot now holds the gap page, and asserting it is
+                    // still there would encode the image's window rather than the ring's.
+                    if (ring0 > std::max<int64_t>(0,published-f.state.n_slots)) {
+                        const int64_t evicted=published-f.state.n_slots;
+                        cuda_check(cudaMemcpy(got.data(),(const uint8_t*)slots+(evicted%f.state.n_slots)*code_block,code_block,cudaMemcpyDeviceToHost));
+                        std::vector<uint8_t> expected(code_block);
+                        check(a.k.read(expected.data(), evicted*code_block, code_block),"read the evicted page's image");
+                        check(got != expected,"the gap page evicts the oldest published page from the ring");
+                    }
+                }
+                // Continuing past the page boundary republishes that page: the next image carries the zeros, never the
+                // outgoing conversation's bytes.  A shorter prefix that published `published` pages leaves the page
+                // `published` out; one token past it is the shortest prefix that cannot.
+                const int64_t next=(published+1)*s.page_size+1;
+                if (token_pages>published && next<=f.state.max_cells) {
+                    ConversationKv later;
+                    check(conversation_kv_save(later,f.state,f.g,next,false,err),"save a longer draft prefix");
+                    check(later.cells>=(published+1)*s.page_size,
+                          "a longer draft prefix publishes the page the shorter one left out");
+                    std::vector<uint8_t> republished(code_block);
+                    check(later.k.read(republished.data(),published*code_block,code_block),"read the republished page");
+                    check(republished==zero,"a longer prefix republishes the invalidated page as zeros");
                 }
             }
             auto bad=a; bad.head_dim++;
@@ -361,6 +418,7 @@ int main() {
             if (!a.k.empty()) {
                 bad=a; bad.k.pop_back();
                 check(!conversation_kv_restore(bad,f.state,f.g,upto,index,err),"reject malformed payload");
+            }
             }
         }
     }

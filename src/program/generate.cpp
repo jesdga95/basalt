@@ -15,6 +15,7 @@
 #include "basalt/core/remote_expert_opt.hpp"
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/conversation_snapshot.hpp"
+#include "basalt/core/gdn_slots.hpp"
 #include "basalt/core/conversation_memory.hpp"
 #include "basalt/core/expert_source.hpp"
 #include "basalt/core/pinned.hpp"
@@ -441,6 +442,8 @@ struct Options {
     /// runs one group while stage k+1 runs another).  1 = every slot in one window, stage after stage.
     int batch_groups = 1;
     std::string spec_oracle;
+    /// Diagnostic: the request's GDN recurrent state, written when it ends, for the per-token oracle comparison.
+    std::string dump_gdn;
     int spec_corrupt = 0;
     /// Names the model's draft layer when it has one (the file); empty means no drafter.
     std::string mtp;
@@ -1050,6 +1053,38 @@ uint64_t serve_growth_bytes(const Options& o, const basalt::core::ModelGeometry&
     return bytes;
 }
 
+/// The checkpoint chain's GDN slots: device-resident mirrors of the recurrent state, so a hit copies device to
+/// device instead of over the host.  One pool per process; the serve loop is its only writer.
+basalt::core::GdnSlots g_gdn_slots;
+
+/// --dump-gdn: the base name for the byte-exact pair written beside a slot copy, and the GDN byte count a slot holds.
+std::string g_gdn_dump_base;
+size_t g_gdn_dump_bytes = 0;
+
+/// Writes `<base>.slot` and `<base>.state` for one slot copy: the two buffers a save or a restore has just made equal.
+/// Called immediately after the copy and with nothing in between, so equal files are the whole claim and any byte that
+/// differs is a defect in the pool.  Reads only; never advances either buffer.
+void gdn_dump_pair(const char* tag, const void* slot, const void* state, size_t bytes) {
+    if (g_gdn_dump_base.empty() || slot == nullptr || state == nullptr || bytes == 0) return;
+    std::vector<uint8_t> host(bytes);
+    const std::pair<const char*, const void*> halves[2] = {{".slot", slot}, {".state", state}};
+    for (const auto& half : halves) {
+        const std::string path = g_gdn_dump_base + half.first;
+        std::FILE* f = nullptr;
+        if (cudaMemcpy(host.data(), half.second, bytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
+            (f = std::fopen(path.c_str(), "wb")) != nullptr && std::fwrite(host.data(), 1, bytes, f) == bytes) {
+            std::fclose(f);
+            continue;
+        }
+        if (f != nullptr) std::fclose(f);
+        (void) cudaGetLastError();
+        std::fprintf(stderr, "basalt serve: GDN %s dump failed (%s)\n", tag, path.c_str());
+        return;
+    }
+    std::fprintf(stderr, "basalt serve: GDN %s: .slot and .state written beside %s (%zu bytes each)\n", tag,
+                 g_gdn_dump_base.c_str(), bytes);
+}
+
 /// Copies the running state out (this session's carve only).  The caller has synchronized the device.
 bool checkpoint_save(ConvCheckpoint& c, const basalt::core::SessionState& ss, const basalt::core::ModelGeometry& g) {
     std::string error;
@@ -1061,9 +1096,55 @@ bool checkpoint_save(ConvCheckpoint& c, const basalt::core::SessionState& ss, co
 /// Puts a checkpoint's running state back; the positional cells below it are the caller's to guarantee.
 bool checkpoint_restore(const ConvCheckpoint& c, basalt::core::SessionState& ss, const basalt::core::ModelGeometry& g) {
     std::string error;
-    if (basalt::core::conversation_checkpoint_restore(c, ss, g, error)) return true;
+    const void* slot = g_gdn_slots.ptr(c.gdn_slot.index());
+    if (basalt::core::diagnostics().profile) {   // which copy the state comes from: a slot is D2D, else host bytes
+        const std::string where = c.gdn_slot.index() >= 0
+                                          ? "slot " + std::to_string(c.gdn_slot.index()) + " (D2D)" : "host bytes";
+        std::fprintf(stderr, "basalt serve: checkpoint restore at %lld: %s\n", (long long) c.ids.size(), where.c_str());
+    }
+    if (basalt::core::conversation_checkpoint_restore(c, ss, g, error, slot)) {
+        if (slot != nullptr) gdn_dump_pair("restore", slot, ss.gdn_state, g_gdn_dump_bytes);   // right after the copy
+        return true;
+    }
     std::fprintf(stderr, "basalt serve: checkpoint restore: %s\n", error.c_str());
     return false;
+}
+
+/// Reads a checkpoint's recurrence out of its device slot into host bytes and gives the slot back.  Only a chain
+/// member calls this: it is the owner, so releasing is its right.  A failure leaves the slot in place (the
+/// checkpoint stays restorable) and reports false, so the caller drops whatever it was about to publish.
+bool checkpoint_materialise(ConvCheckpoint& c, size_t gdn_bytes) {
+    if (c.gdn_slot.index() < 0) return true;
+    const void* src = g_gdn_slots.ptr(c.gdn_slot.index());
+    if (src == nullptr || gdn_bytes == 0) return false;
+    c.gdn.resize(gdn_bytes);
+    const cudaError_t e = cudaMemcpy(c.gdn.data(), src, gdn_bytes, cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "basalt serve: checkpoint slot copy: %s\n", cudaGetErrorString(e));
+        c.gdn.clear();
+        return false;
+    }
+    c.gdn_slot.release();
+    return true;
+}
+
+/// Fills a copy of a chain checkpoint - `dst`, already copied from `src` - with the recurrence the source's slot
+/// holds, and touches no ownership: the source keeps its slot and the copy never takes one.  A copy of an
+/// unslotted source already carries its host bytes, so there is nothing to read.  On failure the copy is left with
+/// no recurrence and reports false, so the caller drops it: a miss, never a state read through an index the source's
+/// chain still owns.
+bool checkpoint_clone(ConvCheckpoint& dst, const ConvCheckpoint& src, size_t gdn_bytes) {
+    if (src.gdn_slot.index() < 0) return true;
+    const void* slot = g_gdn_slots.ptr(src.gdn_slot.index());
+    if (slot == nullptr || gdn_bytes == 0) return false;
+    dst.gdn.resize(gdn_bytes);
+    const cudaError_t e = cudaMemcpy(dst.gdn.data(), slot, gdn_bytes, cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "basalt serve: checkpoint slot copy: %s\n", cudaGetErrorString(e));
+        dst.gdn.clear();
+        return false;
+    }
+    return true;
 }
 
 // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
@@ -1337,6 +1418,7 @@ int main(int argc, char** argv) {
         else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
         else if (a == "--batch-groups") o.batch_groups = std::atoi(next("--batch-groups"));
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
+        else if (a == "--dump-gdn") o.dump_gdn = next("--dump-gdn");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--adapt-every") { o.adapt_every = std::atoi(next("--adapt-every")); o.adapt_every_given = true; }
@@ -5199,6 +5281,28 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "basalt serve: deferred checkpoint copy off: %s\n", ce.c_str());
             }
         }
+        // The chain's GDN slots: two device mirrors, taken out of the reserve like the deferral's spare buffer, so the
+        // expert cache's tier is unchanged.  A checkpoint whose slot cannot be had keeps host bytes.
+        size_t gdn_state_bytes = 0;
+        {
+            const ConvStateSizes zz = conv_state_sizes(g, ss);
+            std::string se;
+            if (o.prompt_cache > 0 && stages.empty() && zz.gdn > 0 && g_gdn_slots.reserve(2, zz.gdn, se)) {
+                gdn_state_bytes = zz.gdn;
+                size_t free_b = 0, total_b = 0;
+                (void) cudaMemGetInfo(&free_b, &total_b);
+                std::fprintf(stderr, "basalt serve: GDN state pool: %d slots x %.0f MiB = %.0f MiB, %.0f MiB device "
+                                     "memory free after it\n", g_gdn_slots.slots(), (double) zz.gdn / 1048576.0,
+                             (double) g_gdn_slots.bytes() / 1048576.0, (double) free_b / 1048576.0);
+            } else if (o.prompt_cache > 0 && stages.empty()) {
+                std::fprintf(stderr, "basalt serve: GDN state pool off (%s): checkpoints keep host bytes and a hit "
+                                     "copies over the host\n",
+                             se.empty() ? "no GDN layers, no device memory, or a layer split" : se.c_str());
+            }
+        }
+        // --dump-gdn: the per-request state file, plus the byte-exact pair each slot copy writes beside it
+        g_gdn_dump_base = o.dump_gdn;
+        g_gdn_dump_bytes = gdn_state_bytes;
         // finishes the in-flight host copy; a failed one drops its checkpoint
         auto ckd_finish = [&]() {
             const void* dst = ckd.pending();
@@ -5220,9 +5324,20 @@ int main(int argc, char** argv) {
             (size_t) o.conversation_cache_slots);
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
+        // A chain that is dropped gives its slots back: a slot is owned by exactly one chain, and the pool never
+        // grows.  Clearing does it - a checkpoint returns the slot it holds when it is destroyed - and every other
+        // way a chain stops existing (an assignment, a slot handed back to the batch) gives them back the same way.
+        auto drop_chain = [&](std::vector<ConvCheckpoint>& chain) { chain.clear(); };
         auto park_current = [&](size_t held) -> bool {
             ckd_finish();
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            // A checkpoint that leaves the chain keeps no slot: the image carries host bytes, so materialise first and
+            // drop the park rather than publish an image whose slot the pool may hand out again.
+            for (ConvCheckpoint& c : checks)
+                if (!checkpoint_materialise(c, gdn_state_bytes)) {
+                    std::fprintf(stderr, "basalt serve: conversation cache: skip parking (materialise)\n");
+                    return true;
+                }
             // before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold nothing
             // the outgoing chain does not, apart from the tail this conversation rewrote)
             if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
@@ -5393,9 +5508,27 @@ int main(int argc, char** argv) {
             } else {
                 if (!gpu_sync_ok()) return false;
                 std::string ce;
-                if (defer && stages.empty()) {
+                // A free slot mirrors the recurrence device to device; without one the state goes to host bytes.
+                const bool slotted = gdn_state_bytes > 0 && stages.empty() &&
+                                     c.gdn_slot.acquire(g_gdn_slots.book(), (int64_t) c.ids.size());
+                if (slotted) {
+                    if (!basalt::core::conversation_checkpoint_save(c, *rsp, g, ce,
+                            g_gdn_slots.ptr(c.gdn_slot.index()))) {
+                        c.gdn_slot.release();   // a failed mirror gives the slot back
+                        std::fprintf(stderr, "basalt serve: checkpoint save: %s\n", ce.c_str());
+                        return false;
+                    }
+                    gdn_dump_pair("save", g_gdn_slots.ptr(c.gdn_slot.index()), rsp->gdn_state,   // right after
+                                  g_gdn_dump_bytes);
+                } else if (defer && stages.empty()) {
                     if (!ckd.save(c, *rsp, g, ce)) { std::fprintf(stderr, "basalt serve: checkpoint save: %s\n", ce.c_str()); return false; }
                 } else if (!checkpoint_save(c, *rsp, g)) return false;
+                if (basalt::core::diagnostics().profile) {   // which copy the state went to: a slot is D2D, else host bytes
+                    const std::string where = c.gdn_slot.index() >= 0
+                                                      ? "slot " + std::to_string(c.gdn_slot.index()) + " (D2D)"
+                                                      : "host bytes";
+                    std::fprintf(stderr, "basalt serve: checkpoint save at %lld: %s\n", (long long) L, where.c_str());
+                }
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
                     const basalt::core::OnDevice on(st->dev);
                     ConvCheckpoint part;
@@ -5413,7 +5546,7 @@ int main(int argc, char** argv) {
                 const size_t victim = basalt::program::conv_cache::eviction_victim(stamps.data(), stamps.size(),
                                                                                    o.prompt_cache);
                 if (checks[victim].gdn.data() == ckd.pending()) ckd_finish();
-                checks.erase(checks.begin() + (std::ptrdiff_t) victim);
+                checks.erase(checks.begin() + (std::ptrdiff_t) victim);   // the victim's slot goes back with it
             }
             return true;
         };
@@ -6600,7 +6733,14 @@ int main(int argc, char** argv) {
                 const basalt::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
                 if (at != nullptr) {
-                    if (!basalt::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, e))
+                    // A chain parked in a slot may hold its recurrence in a pool slot; resolve it, so resuming from
+                    // that checkpoint is a device-to-device read and not a refusal.  The pool is only reserved where
+                    // there is no layer split, so the index names a buffer on the device this restore runs on, and a
+                    // stage part never holds one.  ptr() answers null for a checkpoint that holds no slot, and the
+                    // host bytes are used.
+                    const ConvCheckpoint& src = k == 0 ? *at : at->stage_parts[k - 1];
+                    if (!basalt::core::conversation_checkpoint_restore(
+                                src, to, g, e, g_gdn_slots.ptr(src.gdn_slot.index())))
                         return false;
                 } else {
                     basalt::core::ConversationCheckpoint ck;
@@ -6841,9 +6981,13 @@ int main(int argc, char** argv) {
             const char* fin_of[MR] = {};
             for (int sg = 0; sg < S; ++sg) {
                 const BSlot& sl = bs[(size_t) rows[sg]];
-                int k = 1;
-                while (k < lens[sg] && outb[r0s[sg] + k - 1] == drafts[sg][(size_t) k - 1]) ++k;
-                for (int e = 0; e < k; ++e) {
+                int accepted = 1;
+                while (accepted < lens[sg] && outb[r0s[sg] + accepted - 1] == drafts[sg][(size_t) accepted - 1]) ++accepted;
+                // The stop-token and token-cap rules are the serve path's, shared so the two cannot drift: both commit
+                // `e + 1` rows, and the stop token is the pick at row `e + 1`, never a committed row.
+                int k = basalt::program::conv_cache::reply_keep(outb + r0s[sg], accepted, o.eos_ids.data(),
+                                                               o.eos_ids.size(), sl.produced, sl.max_new);
+                for (int e = 0; e < k; ++e) {   // the batch's own two conditions, around the shared ones
                     const int32_t y = outb[r0s[sg] + e];
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     fin_of[sg] = eos ? "stop" : sl.stop ? "cancel" : sl.produced + e + 1 >= sl.max_new ? "length"
@@ -7445,7 +7589,7 @@ int main(int argc, char** argv) {
             {
                 const int64_t ctx = admit_slot >= 0 ? slot_cap[(size_t) admit_slot] : o.max_context;
                 const long long want = admit_slot >= 0 ? admit_max_new : (long long) max_new;   // a slot's request: its own max_new
-                if (n + want + 8 > ctx) {
+                if (!basalt::program::conv_cache::context_admits(n, want, ctx)) {
                     if (admit_slot >= 0)
                         std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds slot %d's context (%lld)\n", (long long) n,
                                     want, admit_slot, (long long) ctx);
@@ -7476,6 +7620,9 @@ int main(int argc, char** argv) {
                 wait_before[(size_t) r] = remote_experts[(size_t) r].ms_wait();
             }
             cur = ids;
+            // The conversation cache's keys are int32: one narrow view per request, so a parked entry or a checkpoint
+            // is matched by one bulk compare over the slice instead of a per-token scan.
+            const std::vector<int32_t> ids32(ids.begin(), ids.end());
             const Clock::time_point r0 = Clock::now();
             if (!drive.d.usage.empty()) sp.route_hist_reset();   // counts this request's prompt rows for the usage seed
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
@@ -7483,8 +7630,7 @@ int main(int argc, char** argv) {
             auto starts_with = [&](const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) -> bool {
                 const int64_t L = (int64_t) pre.size();
                 if (L < 1 || L > n - 1) return false;
-                for (int64_t i = 0; i < L; ++i)
-                    if ((int32_t) ids[(size_t) i] != pre[(size_t) i]) return false;
+                if (!basalt::core::conversation_ids_equal(pre.data(), pre.size(), ids32.data())) return false;
                 return imgs_below(req_imgs, L) == pre_imgs;
             };
             const bool want_cvec = basalt::kernels::cvec().loaded() ? req_cvec != 0 : true;
@@ -7513,7 +7659,7 @@ int main(int argc, char** argv) {
                 BSlot& sb = bs[(size_t) slot_b];
                 live.clear();
                 live_imgs.clear();
-                checks.clear();
+                drop_chain(checks);
                 live_ok = false;
                 cvec_cached = sb.cvec;
                 if (sb.cached) {
@@ -7528,7 +7674,7 @@ int main(int argc, char** argv) {
                 }
                 sb.cached = false;
                 sb.partial = false;
-                sb.checks.clear();
+                drop_chain(sb.checks);   // a discarded chain gives its slots back
                 make_view(rview, slot_b);
                 rsp = &rview;
                 if (solo_req && !ver.bind_session(&rview, err)) {
@@ -7585,7 +7731,7 @@ int main(int argc, char** argv) {
                             slot_ck = &c;
                         }
                 }
-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            const auto parked = conversations.best(ids32, req_imgs, want_cvec);
             std::optional<basalt::core::SavedConversation> incoming;
             if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
             if (incoming) slot_source = -1;
@@ -7635,23 +7781,34 @@ int main(int argc, char** argv) {
                     err.clear();
                     live.clear();
                     live_imgs.clear();
-                    checks.clear();
+                    drop_chain(checks);   // a discarded chain gives its slots back
                     resume = 0;
                     from_live = false;
                 } else {
-                    checks.clear();   // the main session's checkpoints were of the conversation it held before
+                    drop_chain(checks);   // the main session's checkpoints were of the conversation it held before
                     conversations.limit_reuse(0);   // its cells now hold the slot's conversation, not the retained buffers'
                     // a read that gave way, the same request again (into its own slot): on with it - its segments and
                     // checkpoints as if it had not stopped
                     if (slot_ck == nullptr && bs[(size_t) slot_source].partial && admit_slot == slot_source) {
                         resumed_from0 = bs[(size_t) slot_source].partial_from0;
-                        for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks) checks.push_back(c);
+                        for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks) {
+                            // a copy keeps host bytes only: the slot's chain still owns its slot
+                            ConvCheckpoint copy = c;
+                            if (checkpoint_clone(copy, c, gdn_state_bytes)) checks.push_back(std::move(copy));
+                        }
                         bs[(size_t) slot_source].partial = false;
                     }
                     if (slot_ck != nullptr) {
                         live = slot_ck->ids;
-                        checks.push_back(*slot_ck);   // the main session's chain has it now
-                        checks.back().used = ++check_clock;
+                        ConvCheckpoint copy = *slot_ck;   // the main session's chain has it now
+                        if (checkpoint_clone(copy, *slot_ck, gdn_state_bytes)) {
+                            checks.push_back(std::move(copy));
+                            checks.back().used = ++check_clock;
+                        } else {
+                            // the slot's state could not be read out: the checkpoint is dropped, the read goes on
+                            std::fprintf(stderr, "basalt serve: conversation cache: slot checkpoint dropped "
+                                                 "(clone)\n");
+                        }
                     } else {
                         live = bs[(size_t) slot_source].ids;
                     }
@@ -7692,7 +7849,7 @@ int main(int argc, char** argv) {
                     incoming.reset();
                     live.clear();
                     live_imgs.clear();
-                    checks.clear();
+                    drop_chain(checks);
                     resume = 0;
                     from_live = false;
                 }
@@ -7723,15 +7880,21 @@ int main(int argc, char** argv) {
             ckd_finish();
             if (want_cvec != cvec_cached) {
                 live_ok = false;
-                checks.clear();
+                drop_chain(checks);
                 cvec_cached = want_cvec;
             }
             if (basalt::kernels::cvec().loaded()) basalt::kernels::cvec_set_enabled(want_cvec);
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
-            // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
-            checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
-                             return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
-                         }), checks.end());
+            // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new.  A
+            // dropped checkpoint gives its GDN slot back as it goes, and the pool holds two, so a leak here would
+            // stop any later checkpoint from ever taking one.
+            {
+                std::vector<size_t> victims;
+                for (size_t i = 0; i < checks.size(); ++i)
+                    if ((int64_t) checks[i].ids.size() > resume || !starts_with(checks[i].ids, checks[i].imgs))
+                        victims.push_back(i);
+                for (size_t n = victims.size(); n-- > 0;) checks.erase(checks.begin() + (std::ptrdiff_t) victims[n]);
+            }
             live_ok = false;   // until this request has finished, the session is in between
             if (resume == 0) {
                 basalt::core::session_zero(*rsp, g, nullptr, main_cs);
@@ -7741,7 +7904,7 @@ int main(int argc, char** argv) {
                     basalt::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
                     cudaStreamSynchronize(st->stream);
                 }
-                checks.clear();
+                drop_chain(checks);
             } else if (!from_live) {
                 ConvCheckpoint* c = nullptr;
                 for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;
@@ -8006,7 +8169,8 @@ int main(int argc, char** argv) {
             // way afterwards (more than a chunk and a short read left), text only, and the slot is not decoding
             auto can_yield = [&](int64_t q, int64_t b0, int ys) -> bool {
                 return ys >= 0 && ys < (int) bs.size() && !bs[(size_t) ys].active &&
-                       n + (admit_slot >= 0 ? admit_max_new : (long long) max_new) + 8 <= slot_cap[(size_t) ys] &&
+                       basalt::program::conv_cache::context_admits(
+                               n, admit_slot >= 0 ? admit_max_new : (long long) max_new, slot_cap[(size_t) ys]) &&
                        (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
                        (!in_slot || ys == slot_b) && b0 - q > std::max<int64_t>(std::max<int64_t>(sp.chunk(), 1), o.short_read);
             };
@@ -8031,9 +8195,13 @@ int main(int argc, char** argv) {
                 sl.partial_from0 = read_from == 0 || resumed_from0;
                 sl.cvec = cvec_cached;
                 for (const ConvCheckpoint& c : checks)   // the root / periodic checkpoints of this read
-                    if ((int64_t) c.ids.size() <= q && std::equal(c.ids.begin(), c.ids.end(), ids.begin(),
-                            [](int32_t x, int64_t y) { return (int64_t) x == y; }))
-                        sl.checks.push_back(c);
+                    if ((int64_t) c.ids.size() <= q &&
+                        basalt::core::conversation_ids_equal(c.ids.data(), c.ids.size(), ids32.data())) {
+                        // the slot's chain gets host bytes: a copy never holds the index the session's chain owns.
+                        // Without the bytes the entry is dropped - a miss, not an alias.
+                        ConvCheckpoint copy = c;
+                        if (checkpoint_clone(copy, c, gdn_state_bytes)) sl.checks.push_back(std::move(copy));
+                    }
                 yielded_at = q;
                 yielded_slot = ys;
                 return true;
@@ -8571,6 +8739,10 @@ int main(int argc, char** argv) {
                 }
                 if (logit_hash)   // the accepted rows' logits, per position (equality of the batch rows with these)
                     for (int t = 0; t <= a; ++t) std::fprintf(stderr, "LH -1 %lld %016llx\n", (long long) (p + t), (unsigned long long) row_hash(t));
+                // The state ends where the reply ends: a stop token and the accepted tokens after it are not part of
+                // it, so the commit and `live` are one frontier.  (The scoring path commits every row.)
+                const int n_keep = basalt::program::conv_cache::reply_keep(
+                        outv.data(), a + 1, o.eos_ids.data(), ppl == nullptr ? o.eos_ids.size() : 0, produced_n, max_new);
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (tk_log != nullptr && tk_valid && !from_sfx && ppl == nullptr && req_temperature > 0.0) {
                     std::vector<float> lg((size_t) n_vocab);
@@ -8681,11 +8853,11 @@ int main(int argc, char** argv) {
                         }
                     };
                     basalt::core::decode_events().stamp(9);
-                    if (!ver.commit(a + 1, err, 2)) {
+                    if (!ver.commit(n_keep, err, 2)) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
                     }
-                    for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+                    for (int i = 0; i < n_keep; ++i) consumed.push_back(window[(size_t) i]);
                     draft_offered += T - 1;
                     draft_accepted += a;
                     first_window = false;
@@ -8693,7 +8865,7 @@ int main(int argc, char** argv) {
                     std::string cerr;
                     auto after_launch = [&] {
                         after_ran = true;
-                        commit_ok = ver.commit(a + 1, cerr, 1);
+                        commit_ok = ver.commit(n_keep, cerr, 1);
                         adapt_side();
                         for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
                             std::printf("T %d\n", (int) outv[(size_t) i]);
@@ -8733,7 +8905,10 @@ int main(int argc, char** argv) {
                             std::fprintf(draft_log, "W %d %d %d %.3f %.3f %.3f", T, a, from_sfx ? 1 : 0, msd(round0, tw0),
                                          msd(tw0, tw1), msd(tw1, tw3));
                             for (int i = 0; i < wprob_n; ++i) std::fprintf(draft_log, " %.4f", wprob[i]);
-                            std::fputc('\n', draft_log);
+                            // Appended after the probability block, never before it: the block's presence is what
+                            // distinguishes the two line shapes, so a field in front of it would change every parse.
+                            // A lookup window carries the match length its observe() needs; an MTP window has none.
+                            std::fprintf(draft_log, " %d\n", from_sfx ? sfx_match : -1);
                         }
                     }
                     if (adapt_thr.joinable()) adapt_thr.join();
@@ -8763,13 +8938,13 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 spawn_adapt();
-                if (!ver.commit(a + 1, err)) {
+                if (!ver.commit(n_keep, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
-                // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
-                for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+                // the window's first n_keep tokens are in the session now (the last output is not: it is next x)
+                for (int i = 0; i < n_keep; ++i) consumed.push_back(window[(size_t) i]);
                 draft_offered += T - 1;
                 draft_accepted += a;
                 first_window = false;
@@ -8836,6 +9011,20 @@ int main(int argc, char** argv) {
             if (!ver.wait_commit(err)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
+            }
+            if (!o.dump_gdn.empty()) {   // the recurrent state as this request left it, for the per-token oracle
+                const size_t bytes = conv_state_sizes(g, *rsp).gdn;
+                std::vector<uint8_t> host(bytes);
+                std::FILE* f = bytes ? std::fopen(o.dump_gdn.c_str(), "wb") : nullptr;
+                if (f != nullptr && cudaMemcpy(host.data(), rsp->gdn_state, bytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                    std::fwrite(host.data(), 1, bytes, f) == bytes) {
+                    std::fclose(f);
+                    std::fprintf(stderr, "basalt serve: GDN state dumped: %zu bytes after %zu tokens -> %s\n", bytes,
+                                 consumed.size(), o.dump_gdn.c_str());
+                } else {
+                    if (f != nullptr) std::fclose(f);
+                    std::fprintf(stderr, "basalt serve: GDN state dump failed: %s\n", o.dump_gdn.c_str());
+                }
             }
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();
@@ -8950,9 +9139,13 @@ int main(int argc, char** argv) {
                     const ConvCheckpoint* best = nullptr;
                     for (const ConvCheckpoint& c : checks)
                         if (c.ids.size() < live.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&
-                            std::equal(c.ids.begin(), c.ids.end(), live.begin()))
+                            basalt::core::conversation_ids_equal(c.ids.data(), c.ids.size(), live.data()))
                             best = &c;
-                    if (best != nullptr) sl.checks.push_back(*best);
+                    if (best != nullptr) {   // the slot's chain gets host bytes, never an index the pool may reuse
+                        ConvCheckpoint copy = *best;
+                        if (checkpoint_clone(copy, *best, gdn_state_bytes)) sl.checks.push_back(std::move(copy));
+                        else std::fprintf(stderr, "basalt batch: slot %d keeps no checkpoint (clone)\n", admit_slot);
+                    }
                     std::fprintf(stderr, "basalt batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
                                  (long long) live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
                 }

@@ -40,4 +40,31 @@ inline size_t eviction_victim(const uint64_t* stamps, size_t n, int64_t cap) {
     return v;
 }
 
+/// How many of a verify window's accepted rows the running state keeps: one past the row the reply's last produced
+/// token came from.  A pick is one position ahead of its row - pick i is the token at row i+1 - so the rows kept here
+/// hold every token before the last pick and never the pick itself.  A stop token ends the reply and is never kept
+/// (it is pick e, row e+1, one past this), and the accepted tokens after it were never emitted; a reply that reaches
+/// its own token cap has the same shape, its cap token being the last pick.  `picks` are the window's accepted
+/// outputs, `produced` the tokens the reply held before the window, `max_new` its cap.  Never 0: the first row is
+/// always kept.  `n_stops == 0` ignores stops (the scoring path commits every row).
+/// Pure, so conv_cache_test.cpp walks the cases.
+inline int reply_keep(const int32_t* picks, int accepted, const int64_t* stops, size_t n_stops, int64_t produced,
+                      int64_t max_new) {
+    for (int i = 0; i < accepted; ++i) {
+        for (size_t s = 0; s < n_stops; ++s)
+            if ((int64_t) picks[i] == stops[s]) return i + 1;
+        if (produced + i + 1 >= max_new) return i + 1;
+    }
+    return accepted;
+}
+
+/// Whether a request's prompt and its generation budget fit the context it will run in.  `kAdmitSlack` tokens are held
+/// back past the prompt and the budget (the last prompt token starts a window, and a window of drafts runs ahead of
+/// it), so the test is `n + want + slack > ctx` and a request EXACTLY at `ctx` is admitted - the boundary is the first
+/// count past it, not `ctx` itself.  Pure, so conv_cache_test.cpp covers the boundary rather than the middle.
+inline constexpr int64_t kAdmitSlack = 8;
+inline bool context_admits(int64_t prompt, int64_t want, int64_t ctx) {
+    return prompt + want + kAdmitSlack <= ctx;
+}
+
 }  // namespace basalt::program::conv_cache

@@ -300,7 +300,7 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
 add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
   src/core/remote_expert_opt.cu
   src/core/expert_cache.cpp src/core/vmm.cpp src/core/kv_arena.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
-  src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp)
+  src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/gdn_slots.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp)
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(engine PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
 if(BUILD_TESTING)
@@ -913,6 +913,10 @@ if(BUILD_TESTING)
   add_executable(controller_test src/spec/controller_test.cpp)
   target_link_libraries(controller_test PRIVATE spec)
   basalt_cpu_test(NAME controller_test COMMAND controller_test)
+  add_executable(draft_log_test src/spec/draft_log_test.cpp)
+  target_include_directories(draft_log_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/spec)
+  target_link_libraries(draft_log_test PRIVATE spec)
+  basalt_cpu_test(NAME draft_log_test COMMAND draft_log_test)
   add_executable(draft_policy_test src/spec/draft_policy_test.cpp)
   target_link_libraries(draft_policy_test PRIVATE spec)
   basalt_cpu_test(NAME draft_policy_test COMMAND draft_policy_test)
