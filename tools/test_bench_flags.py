@@ -90,7 +90,7 @@ class BenchFlags(unittest.TestCase):
 
     def command_community(self) -> list[str]:
         r = subprocess.run([str(BENCH), "--model", "m.basalt", "--fixtures", str(self.fixtures), "--print-command",
-                            "--community"], capture_output=True, text=True)
+                            "--community", "--submitter", "test"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout.split()
 
