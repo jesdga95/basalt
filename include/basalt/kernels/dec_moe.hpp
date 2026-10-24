@@ -121,7 +121,7 @@ struct DmPeerArgs {
     void* scratch = nullptr;                     ///< peer device: dec_moe_peer_scratch_bytes
     unsigned int* arrive = nullptr;              ///< peer device: 16 words zeroed before the launch (arrivals, barrier,
                                                  ///< abort, the warm-up's words)
-    unsigned long long* stamps_m = nullptr;      ///< tests: block 0's phase times per ring (8 each), or null
+    unsigned long long* stamps_m = nullptr;      ///< tests: block 0's phase times per ring (8 each), then the mixer item's per ring, or null
     int gu2 = 0;                                 ///< the grid formats' gate/up two rows a warp (DEC_GU2 sets it)
     uint32_t* diag_m = nullptr;                  ///< mapped, kDmDiagWords zeroed words: the abort record, or null
     /// The next ring's L2 warm-up: peer device, [n_layers][n_expert][n_embd] the router rows in int8 and one scale per

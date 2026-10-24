@@ -1364,6 +1364,7 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
             if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
             if (hdr->n_tok < 0) return;          // released
             const int mt = hdr->n_tok;
+            if constexpr (MIX) stamp(a.steps + s, 0);   // the mixer's phases: after the doorbell and each phase
             if constexpr (MIX) if (mt > 0) {   // the peer's key heads: qkv + z, the recurrence, the norm, the out partial
                 const DmMixLayer& L = a.mixl[s];
                 const DecRecArgs& R = L.rec;
@@ -1373,12 +1374,14 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
                 dm_mix_rows(L.tq, L.wqkv, R.C, a.n_embd, xin, mt, (float*) R.qkv, R.C, gw, nw, lane);
                 dm_mix_rows(L.tz, L.wz, ZV, a.n_embd, xin, mt, (float*) R.z, ZV, ((gw - R.C) % nw + nw) % nw, nw, lane);
                 if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
+                stamp(a.steps + s, 1);
                 if (tid < 128)   // one 128-thread item per (value head, rank), grid-strided
                     for (int it = blockIdx.x; it < 4 * R.h_v; it += nb) {
                         if (it != (int) blockIdx.x) rec_sync<true>();
                         rec_block<kDecMaxT, true, true>(R, mt, it >> 2, it & 3, su.r, nullptr);
                     }
                 if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
+                stamp(a.steps + s, 2);
                 for (int u = gw; u < mt * R.h_v; u += nw) {   // the gated norm and q8_1, one warp per (token, head)
                     const int t = u / R.h_v, head = u % R.h_v;
                     const size_t base = (size_t) t * ZV + head * 128 + lane;
@@ -1393,10 +1396,12 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
                         norm_q8(R, t, head, R.h_v, r, lane, oc[r], ss, R.gamma[32 * r + lane], R.z[base + 32 * r]);
                 }
                 if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
+                stamp(a.steps + s, 3);
                 dm_mix_rows(L.to, L.wo, a.n_embd, ZV, (const block_q8_1*) R.yq, mt, a.part_m, a.n_embd, gw, nw, lane);
                 __threadfence_system();
             }
             if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
+            if constexpr (MIX) stamp(a.steps + s, 4);
             if (blockIdx.x == 0 && tid == 0) {
                 __threadfence_system();
                 *(volatile uint32_t*) a.mdone_m = ring;

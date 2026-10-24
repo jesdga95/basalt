@@ -363,6 +363,7 @@ std::vector<float> run_peer_item(const Card& k, int T, cudaStream_t s, bool& ok,
     uint32_t* h_diag = hmap<uint32_t>(kDmDiagWords);
     DmRing* h_ring = hmap<DmRing>(1);
     float* h_rows = hmap<float>((size_t) kDmCap * N);
+    unsigned long long* h_st = hmap<unsigned long long>(16);   // the ring's stamps, then the mixer's
     CK(cudaMemcpy(h_xq, k.xq, native_q8_1_bytes(N, T), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(h_x, k.x, (size_t) T * N * 4, cudaMemcpyDefault));
     float *qkv, *z, *h, *ga, *be, *o, *x;
@@ -392,7 +393,7 @@ std::vector<float> run_peer_item(const Card& k, int T, cudaStream_t s, bool& ok,
     pa.rows_m = h_rows; pa.n_expert = 512; pa.k = 10; pa.n_embd = N; pa.n_ff = kFf; pa.steps = 1; pa.scratch = scr;
     pa.arrive = arr; pa.diag_m = h_diag;
     pa.mix = d_mix; pa.mseq_m = h_w + 48; pa.mdone_m = h_w + 52; pa.mxq_m = h_xq; pa.mxq = mxq;
-    pa.mx_m = h_x; pa.mixl = d_m; pa.part_m = h_part;
+    pa.mx_m = h_x; pa.mixl = d_m; pa.part_m = h_part; pa.stamps_m = h_st;
     if (!dec_moe_peer_launch(pa, dec_moe_peer_blocks(false), s, false)) {
         std::printf("    peer item: no launch\n");
         ok = false;
@@ -403,12 +404,14 @@ std::vector<float> run_peer_item(const Card& k, int T, cudaStream_t s, bool& ok,
         std::printf("    peer item: done %u %s\n", h_w[52], dg.c_str());
         ok = false;
     }
+    std::printf("    peer item phases us: qkv+z %.1f, recurrence %.1f, norm %.1f, out %.1f\n", (h_st[9] - h_st[8]) * 1e-3,
+                (h_st[10] - h_st[9]) * 1e-3, (h_st[11] - h_st[10]) * 1e-3, (h_st[12] - h_st[11]) * 1e-3);
     std::vector<float> part(h_part, h_part + (size_t) T * N);
     yq_out = down((const uint8_t*) yq, (size_t) T * (k.zv / 32) * Q81);
     for (void* q : {(void*) qkv, (void*) z, (void*) h, (void*) ga, (void*) be, (void*) o, (void*) x, yq, mxq, scr,
                     (void*) arr, (void*) d_m, (void*) d_mix})
         CK(cudaFree(q));
-    for (void* q : {(void*) h_xq, (void*) h_x, (void*) h_part, (void*) h_w, (void*) h_diag, (void*) h_ring, (void*) h_rows})
+    for (void* q : {(void*) h_xq, (void*) h_x, (void*) h_part, (void*) h_w, (void*) h_diag, (void*) h_ring, (void*) h_rows, (void*) h_st})
         CK(cudaFreeHost(q));
     return part;
 }
@@ -508,6 +511,19 @@ bool parity() {
                         flips += dq != 0;
                         max_step = std::max(max_step, dq);
                     }
+                // the block scales the same way: a tie in a block's largest value moves its fp16 scale one step
+                long long scale_steps = 0;
+                int max_scale_step = 0;
+                for (size_t b = 0; b < pyq.size(); b += Q81) {
+                    const int ds = std::abs((int) basalt::read_u16(&pyq[b]) - (int) basalt::read_u16(&kyq[b]));
+                    if (ds != 0) {
+                        std::printf("    scale step: block %zu (token %zu) d %.6g vs %.6g, %d fp16 steps\n", b / Q81,
+                                    b / Q81 / (k1.zv / 32), basalt::fp16_to_fp32(basalt::read_u16(&pyq[b])),
+                                    basalt::fp16_to_fp32(basalt::read_u16(&kyq[b])), ds);
+                        ++scale_steps;
+                        max_scale_step = std::max(max_scale_step, ds);
+                    }
+                }
                 double i_abs = 0, se_item = 0, mc_i = 0;   // the item's partial vs the slice's kernels; combined vs CPU
                 for (size_t i = 0; i < wo.size(); ++i) {
                     i_abs = std::max(i_abs, std::fabs((double) pi[i] - p1[i]));
@@ -534,12 +550,12 @@ bool parity() {
                 // the split only reorders the out projection's sum: its error against the CPU stays the whole layer's
                 const double rms_i = std::sqrt(se_item / wo.size());
                 // exact activations: the whole layer's error against the CPU; otherwise only one-step flips, few
-                const bool pass_i = item_ok && max_step <= 1 && flips * 1000 <= vals &&
-                                    (flips > 0 || (rms_i <= 1.5 * rms_w + 1e-9 && mc_i <= 2.0 * mc_w + 1e-9));
+                const bool pass_i = item_ok && max_step <= 1 && max_scale_step <= 1 && (flips + scale_steps) * 1000 <= vals &&
+                                    (flips + scale_steps > 0 || (rms_i <= 1.5 * rms_w + 1e-9 && mc_i <= 2.0 * mc_w + 1e-9));
                 const bool pass = d == 0 && dm == 0 && rt && rms_s <= 1.5 * rms_w + 1e-9 && mc_s <= 2.0 * mc_w + 1e-9 && pass_i;
-                std::printf("%-6s %-6s %-6s share %d/8 T=%d: peer item q8_1 flips %lld of %lld (max step %d), partial vs slice "
+                std::printf("%-6s %-6s %-6s share %d/8 T=%d: peer item q8_1 flips %lld of %lld (max step %d), scale steps %lld, partial vs slice "
                             "kernels max abs %.3g; combined vs CPU RMS %.3g max rel %.3g%s\n",
-                            fmt(cb[0]).name, fmt(cb[1]).name, fmt(cb[2]).name, peer8, T, flips, vals, max_step, i_abs, rms_i,
+                            fmt(cb[0]).name, fmt(cb[1]).name, fmt(cb[2]).name, peer8, T, flips, vals, max_step, scale_steps, i_abs, rms_i,
                             mc_i, pass_i ? "" : "  FAIL");
                 std::printf("%-6s %-6s %-6s share %d/8 T=%d: slices %s, in place %s, state round trip %s; out (RMS %.3g) vs whole max "
                             "abs %.3g max rel %.3g bit-equal %.0f%%; vs CPU RMS split %.3g whole %.3g, max rel split %.3g "
