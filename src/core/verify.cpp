@@ -1036,6 +1036,7 @@ bool Verifier::gs_move(bool to_peer, std::string& err) {
     const size_t full_f = (size_t) S * HV * S + (size_t) g.ssm_conv_channels * HIST;
     const size_t part_f = basalt::core::gdn_slice_state_floats(sl, HIST), nl = (size_t) gs_ca_.n_layers;
     SessionState& ss = to_peer ? *ss_ : *gs_ss_;
+    const auto t0 = std::chrono::steady_clock::now();
     int64_t gdn_index = 0;
     for (int64_t l = 0; l < lb_; ++l) gdn_index += is_qsa_layer(g, l) ? 0 : 1;
     float* const full_d = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * full_f;
@@ -1067,6 +1068,10 @@ bool Verifier::gs_move(bool to_peer, std::string& err) {
         return false;
     }
     gs_live_ = to_peer;
+    if (diagnostics().decode_timing)
+        basalt::log::info("basalt verify", "the GDN state slice moved %s in %.1f ms (%.0f MiB)", to_peer ? "to the peer" : "back",
+                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                          (double) (full.size() + part.size()) * 4 / (1 << 20));
     return true;
 }
 
