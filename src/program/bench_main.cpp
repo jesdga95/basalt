@@ -944,15 +944,21 @@ int main(int argc, char** argv) {
     // ---- report
     const std::string model = arg_value(args, "--model");
 
-    // the power limit of the primary GPU: as set now, or the label the caller gave
+    // the power limit of the primary GPU (the first card the engine reports, by PCI bus id): as set now, or the label the caller gave
+    std::string primary_bus;
+    if (info.count("gpus")) primary_bus = info["gpus"].substr(0, info["gpus"].find(','));
+    Nvml::Snap primary;
+    const bool have_primary = !primary_bus.empty() && nvml.snap_bus(primary_bus, primary);
     std::string power = "unknown";
     if (!o.power_label.empty()) {
         power = o.power_label;
         if (all_digits(power)) power += " W";
-    } else if (!gpus_start.empty() && gpus_start[0].power_limit_w > 0) {
+    } else if (have_primary && primary.power_limit_w > 0) {
+        power = fmt("%.0f W", primary.power_limit_w);
+    } else if (primary_bus.empty() && !gpus_start.empty() && gpus_start[0].power_limit_w > 0) {
         power = fmt("%.0f W", gpus_start[0].power_limit_w);
     } else if (const auto smi = basalt::platform::capture_output(
-                   {"nvidia-smi", "-i", "0", "--query-gpu=power.limit", "--format=csv,noheader,nounits"}, false);
+                   {"nvidia-smi", "-i", primary_bus.empty() ? "0" : primary_bus, "--query-gpu=power.limit", "--format=csv,noheader,nounits"}, false);
                smi && std::atof(smi->c_str()) > 0) {
         power = fmt("%.0f W", std::atof(smi->c_str()));
     }
