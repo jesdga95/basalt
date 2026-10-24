@@ -33,13 +33,13 @@ inline void write_all(const std::string& s) {
 inline std::string format(const char* fmt, std::va_list ap) {
     std::va_list again;
     va_copy(again, ap);
-    char small[512];
-    const int n = std::vsnprintf(small, sizeof small, fmt, ap);
+    char stack_buf[512];
+    const int n = std::vsnprintf(stack_buf, sizeof stack_buf, fmt, ap);
     std::string out;
     if (n < 0) {
         out = fmt;
-    } else if ((size_t) n < sizeof small) {
-        out.assign(small, (size_t) n);
+    } else if ((size_t) n < sizeof stack_buf) {
+        out.assign(stack_buf, (size_t) n);
     } else {
         out.resize((size_t) n + 1);
         std::vsnprintf(&out[0], out.size(), fmt, again);
