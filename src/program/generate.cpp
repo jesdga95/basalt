@@ -6576,6 +6576,9 @@ int main(int argc, char** argv) {
             // (script[0] is its first token); the windows draft from it, some drafts wrong, and keep what matches
             std::vector<int32_t> script;
             std::mt19937_64 rng;
+            // the request's grammar (the batch windows' form of the solo loop's `gguard`): the window's kept picks are
+            // scanned, the first refused one is resampled under the mask, and the segment ends there
+            std::unique_ptr<basalt::program::grammar::Guard> guard;
             // the MTP drafter's side of the slot (the draft K/V is the drafter's store of the same index): the drafts and
             // their probabilities for the slot's next window, the request's draft-length rule state, its prompt-lookup
             // history and last proposal
@@ -7048,18 +7051,40 @@ int main(int argc, char** argv) {
             const Clock::time_point w1 = Clock::now();
             // per segment: the drafts the picks confirm, then how far the request goes (stop token, limits) within them
             const char* fin_of[MR] = {};
+            auto fin_at = [&](const BSlot& sl, int b, int32_t y, int e) -> const char* {   // how the request ends at pick e
+                const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                return eos ? "stop" : sl.stop ? "cancel" : sl.produced + e + 1 >= sl.max_new ? "length"
+                     : sl.p + e + 2 > slot_cap[(size_t) b] ? "length" : nullptr;
+            };
             for (int sg = 0; sg < S; ++sg) {
                 const BSlot& sl = bs[(size_t) rows[sg]];
                 int k = 1;
                 while (k < lens[sg] && outb[r0s[sg] + k - 1] == drafts[sg][(size_t) k - 1]) ++k;
                 for (int e = 0; e < k; ++e) {
-                    const int32_t y = outb[r0s[sg] + e];
-                    const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
-                    fin_of[sg] = eos ? "stop" : sl.stop ? "cancel" : sl.produced + e + 1 >= sl.max_new ? "length"
-                               : sl.p + e + 2 > slot_cap[(size_t) rows[sg]] ? "length" : nullptr;
+                    fin_of[sg] = fin_at(sl, rows[sg], outb[r0s[sg] + e], e);
                     if (fin_of[sg] != nullptr) { k = e + 1; break; }
                 }
                 n_keep[sg] = k;
+            }
+            // grammar: a slot with a guard scans its kept picks; the first one the grammar refuses is drawn again
+            // under the mask (the solo rule) and the segment ends at that row, which stays committed
+            std::vector<float> grammar_bias;
+            for (int sg = 0; sg < S; ++sg) {
+                BSlot& sl = bs[(size_t) rows[sg]];
+                if (sl.guard == nullptr || !sl.guard->on()) continue;
+                const int miss = sl.guard->scan(outb + r0s[sg], n_keep[sg]);
+                    if (miss < 0) continue;
+                sl.guard->mask_bias({}, grammar_bias);
+                int32_t gtok = 0;
+                if (!ver.resample_row(r0s[sg] + miss, p0s[sg], grammar_bias, gtok, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return false;
+                }
+                outb[r0s[sg] + miss] = gtok;
+                if (!sl.guard->take(gtok))
+                    basalt::log::info("basalt grammar", "slot %d: the masked draw at row %d was token %d", rows[sg], miss, (int) gtok);
+                n_keep[sg] = miss + 1;
+                fin_of[sg] = fin_at(sl, rows[sg], gtok, miss);
             }
             if (logit_hash)
                 for (int sg = 0; sg < S; ++sg)
@@ -7118,6 +7143,7 @@ int main(int argc, char** argv) {
                                 (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
                     sl.active = false;
                     sl.cached = o.prompt_cache > 0;   // its sessions hold sl.ids for the next turn
+                    sl.guard.reset();
                 } else {
                     sl.x = outb[r0s[sg] + k - 1];
                     sl.p += k;
@@ -7483,6 +7509,7 @@ int main(int argc, char** argv) {
             int req_penalty_last_n = 0;
             std::string req_bias_text;   // logit_bias=id:value,...: added to the verifier's logits (see ver.set_logit_bias)
             bool req_bias_present = false;
+            int64_t req_gprompt = -1;       // gprompt=N: the first N ids are the prompt, the rest tokens the request has already generated
             std::string req_grammar_text;   // grammar=<compact ASCII JSON, spaces as \u0020>: the request's grammar (--grammar on)
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
             float req_relax = o.relaxed_drafting;   // relax=P: this request's --relaxed-drafting (0 = exact)
@@ -7504,6 +7531,7 @@ int main(int argc, char** argv) {
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
                     else if (key == "grammar") req_grammar_text = tok.substr(eq + 1);
+                    else if (key == "gprompt") req_gprompt = std::atoll(tok.c_str() + eq + 1);
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
@@ -7562,10 +7590,18 @@ int main(int argc, char** argv) {
             std::unique_ptr<basalt::program::grammar::Guard> gguard;
             if (!req_grammar_text.empty() && grammar_vocab) {
                 std::string gerr;
-                if (o.batch > 0) gerr = "continuous batching is not supported";
+                if (o.batch > 0 && piped) gerr = "pipelined batch groups are not supported";
                 else {
                     gguard = std::make_unique<basalt::program::grammar::Guard>(*grammar_vocab);
-                    if (!gguard->begin(req_grammar_text, ids.data(), ids.size(), gerr)) gguard.reset();
+                    const size_t gp = req_gprompt > 0 && (size_t) req_gprompt < ids.size() ? (size_t) req_gprompt : ids.size();
+                    if (!gguard->begin(req_grammar_text, ids.data(), gp, gerr)) gguard.reset();
+                    else if (gp < ids.size() && gguard->on()) {
+                        const std::vector<int32_t> done(ids.begin() + (std::ptrdiff_t) gp, ids.end());
+                        if (gguard->scan(done.data(), (int) done.size()) >= 0) {
+                            gerr = "the tokens already generated do not satisfy the grammar";
+                            gguard.reset();
+                        }
+                    }
                     else if (!gguard->on()) gguard.reset();
                 }
                 if (!gerr.empty()) { std::printf("ERR grammar: %s\n", gerr.c_str()); continue; }
@@ -9220,6 +9256,7 @@ int main(int argc, char** argv) {
                     sl.ids = live;
                     sl.cvec = cvec_cached;
                     sl.imgs = live_imgs;
+                                    sl.guard = std::move(gguard);   // the request's grammar, already past the tokens the request decoded here
                     const ConvCheckpoint* best = nullptr;
                     for (const ConvCheckpoint& c : checks)
                         if (c.ids.size() < live.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&

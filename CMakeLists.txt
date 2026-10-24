@@ -495,6 +495,16 @@ if(BASALT_GRAMMAR_MODEL AND Python3_Interpreter_FOUND)
   set_tests_properties(grammar_engine_test PROPERTIES TIMEOUT 900)
 endif()
 
+# grammar requests under --batch: each slot held to its own grammar (starts the server on a model pack, same
+# -DBASALT_GRAMMAR_MODEL, with python3; -DBASALT_GRAMMAR_BATCH_ARGS=<server args>)
+if(BASALT_GRAMMAR_MODEL AND Python3_Interpreter_FOUND)
+  add_test(NAME grammar_batch_test
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/grammar_batch_test.py
+                   $<TARGET_FILE:basalt> ${BASALT_GRAMMAR_MODEL} ${BASALT_GRAMMAR_BATCH_ARGS})
+  set_property(TEST grammar_batch_test APPEND PROPERTY LABELS gpu)
+  set_tests_properties(grammar_batch_test PROPERTIES TIMEOUT 1500)
+endif()
+
 add_executable(dequant_s2_parity src/kernels/dequant_s2_parity.cpp)
 # The tests are HOST C++ files that call cudaMalloc/cudaMemcpy themselves, so they need the toolkit headers
 # and cudart explicitly: enabling the CUDA language gives those to .cu sources automatically, but a .cpp

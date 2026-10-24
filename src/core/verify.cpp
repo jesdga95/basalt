@@ -4196,11 +4196,21 @@ bool Verifier::resample_row(int t, int64_t pos0, const std::vector<float>& bias,
         err = "resample_row: the bias upload failed";
         return false;
     }
-    basalt::kernels::SamplerParams sp = sampling_;
+    // a batch window's row draws with its own slot's sampling and position, as the window drew it
+    basalt::kernels::SamplerParams sp;
+    const int32_t* hist = nullptr;
+    int hist_n = 0;
+    if (last_batch_ && t < last_t_) {
+        sp = slot_sp_[(size_t) last_rows_[t]];
+        sp.counter = (uint64_t) last_pos_b_[t];
+        sp.penalty_last_n = 0;
+    } else {
+        sp = sampling_;
+        sp.counter = (uint64_t) pos0 + (uint64_t) t;
+        if (hist_d_ != nullptr) { hist = hist_d_ + (size_t) t * (size_t) hist_len_; hist_n = (int) hist_len_; }
+    }
     sp.logit_bias = row_bias_device_;
-    sp.counter = (uint64_t) pos0 + (uint64_t) t;
-    basalt::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_,
-                  hist_d_ != nullptr ? hist_d_ + (size_t) t * (size_t) hist_len_ : nullptr, hist_d_ != nullptr ? hist_len_ : 0, sp,
+    basalt::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, hist, hist_n, sp,
                   m_out_, cs_);
     if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "resample_row: the sampling failed"; return false; }
     token = ((volatile int32_t*) h_out_)[0];

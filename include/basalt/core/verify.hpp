@@ -165,7 +165,8 @@ public:
     bool set_logit_bias(const std::vector<float>& bias, std::string& err);
     /// Draws row `t` of the window just run again, with `bias` (one float per vocabulary entry, -inf bans) in place of
     /// the request's logit_bias; the penalties, the filters and the position's draw are the window's own. `pos0` is the
-    /// window's first position. The token is in `token`; the window's other rows are untouched.
+    /// window's first position; a batch window's row ignores it and draws with its own slot's sampling and position.
+    /// The token is in `token`; the window's other rows are untouched.
     bool resample_row(int t, int64_t pos0, const std::vector<float>& bias, int32_t& token, std::string& err);
 
     /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len` int32
