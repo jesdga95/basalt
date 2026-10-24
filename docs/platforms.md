@@ -42,9 +42,10 @@ process code page UTF-8 and lifts the path length limit.
 - Pinned memory is capped by the driver under WDDM. When the whole arena cannot be registered,
   the pinned slices are limited to the GPU's shared-memory budget (`RAM/2 - 8 GiB`), and the
   start-up note says what was capped.
-- Large pages need the "Lock pages in memory" privilege, and locking the resident expert copy
-  needs "Increase a process working set". Grant both under Local Security Policy, User Rights
-  Assignment. Without them the engine falls back to 4 KiB pages and says so at start-up.
+- Large pages need the "Lock pages in memory" privilege, which is granted to Administrators by
+  default; locking the resident expert copy needs "Increase a process working set", which is
+  granted to Users, so it works without elevation. The engine enables whichever its token holds.
+  Without large pages it falls back to 4 KiB pages and says so at start-up.
 - Shared arena files and cgroup quotas do not exist. The engine refuses the first and reports no
   container limit.
 - `basalt serve` runs the Python server as a child and exits with its status; Linux replaces

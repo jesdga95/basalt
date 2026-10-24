@@ -53,9 +53,8 @@ LockResult lock_resident(void* p, uint64_t bytes, const LockProgress& progress) 
     SIZE_T min_ws = 0, max_ws = 0;
     DWORD flags = 0;
     // Locked pages count against the minimum working set, so it has to grow by the region plus room for the rest of
-    // the process first. Both limits are soft, so raising the minimum reserves without pinning the process to it.
-    // A quota that cannot be raised is reported and the lock tried anyway: whatever the existing quota covers is
-    // still worth having.
+    // the process first: VirtualLock can lock no more pages than that minimum holds. A quota that cannot be raised
+    // is reported and the lock tried anyway: whatever the existing quota covers is still worth having.
     std::string quota_note;
     if (!GetProcessWorkingSetSizeEx(self, &min_ws, &max_ws, &flags)) {
         quota_note = "GetProcessWorkingSetSizeEx failed (error " + std::to_string(GetLastError()) + ")";
@@ -63,8 +62,10 @@ LockResult lock_resident(void* p, uint64_t bytes, const LockProgress& progress) 
         const SIZE_T margin = (SIZE_T) 512 << 20;
         const SIZE_T new_min = min_ws + (SIZE_T) bytes + margin;
         const SIZE_T new_max = max_ws > new_min + margin ? max_ws : new_min + margin;
+        // The minimum goes in as the hard limit: only a hard minimum keeps the locked pages from being trimmed back
+        // out. The maximum stays soft, so the process can still grow past it.
         if (!SetProcessWorkingSetSizeEx(self, new_min, new_max,
-                                        QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE))
+                                        QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE))
             quota_note = "SetProcessWorkingSetSizeEx(" + std::to_string((unsigned long long) (new_min >> 20)) +
                          " MiB) failed (error " + std::to_string(GetLastError()) + ")";
     }
