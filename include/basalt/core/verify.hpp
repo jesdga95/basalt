@@ -335,6 +335,9 @@ private:
     // the GDN mixer split by key head with the peer card, when the peer streams the mixer's bytes faster than CUDA0
     void gs_init();
     void gs_free();
+    // the peer's heads of every GDN layer between CUDA0's full state and gs_state_: to the peer before the first split
+    // window, back before anything reads the whole state (wait_commit, a batch window); between windows only
+    bool gs_move(bool to_peer, std::string& err);
     bool dm_sync(std::string& err);        ///< the residency tables to the devices, before a window
     bool dm_begin(std::string& err, DecodeGaps* gm);   ///< the tail's window start (tables, flags, the peer window)
     bool dm_end(std::string& err);         ///< the peer window's end
@@ -565,6 +568,11 @@ private:
     basalt::kernels::DmMixLayer* gs_mixl_ = nullptr;
     float* gs_pscr_ = nullptr;
     float *gs_qkv0_ = nullptr, *gs_z0_ = nullptr;
+    // the peer's commit of its heads (the window's rows in gs_pscr_); live: gs_state_ holds the truth of its heads for
+    // session gs_ss_ (CUDA0's copies of them are stale); split: the last window ran split
+    basalt::kernels::GdnCommitLayers gs_ca_;
+    bool gs_live_ = false, gs_split_ = false;
+    SessionState* gs_ss_ = nullptr;
     uint8_t* vhead_scratch_ = nullptr;   // the two-stage head's histogram and row list (q6k_vhead)
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM

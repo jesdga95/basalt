@@ -963,6 +963,11 @@ void Verifier::gs_init() {
                 ++i;
             }
         }
+        gs_ca_ = basalt::kernels::GdnCommitLayers{};
+        gs_ca_.state = gs_state_; gs_ca_.qkv = gs_pscr_; gs_ca_.h = gs_pscr_ + MT * C1;
+        gs_ca_.gate = gs_pscr_ + 2 * MT * C1; gs_ca_.beta = gs_ca_.gate + MT * V1;
+        gs_ca_.state_stride = basalt::core::gdn_slice_state_floats(sl, HIST); gs_ca_.h_stride = per; gs_ca_.gb_stride = per;
+        gs_ca_.C = (int) C1; gs_ca_.h_k = HK - nk0; gs_ca_.h_v = (int) V1; gs_ca_.n_layers = (int) nl;
         ok = ok && cudaMalloc((void**) &gs_mixl_, tab.size() * sizeof(tab[0])) == cudaSuccess &&
              cudaMemcpy(gs_mixl_, tab.data(), tab.size() * sizeof(tab[0]), cudaMemcpyHostToDevice) == cudaSuccess;
     }
@@ -1014,11 +1019,55 @@ void Verifier::gs_free() {
         if (h) cudaFreeHost(h);
     gs_h_x_ = gs_m_x_ = gs_h_part_ = gs_m_part_ = nullptr;
     gs_mixl_ = nullptr; gs_pscr_ = nullptr; gs_qkv0_ = gs_z0_ = nullptr;
+    gs_live_ = gs_split_ = false;
+    gs_ss_ = nullptr;
     gs_layers_.clear();
     gs_state_ = nullptr;
     gs_mix_ = nullptr; gs_pxq_ = nullptr; gs_h_xq_ = nullptr; gs_m_xq_ = nullptr;
     gs_nk0_ = 0;
     gs_dev_ = -1;
+}
+
+bool Verifier::gs_move(bool to_peer, std::string& err) {
+    using basalt::core::GdnHeadSlice;
+    const ModelGeometry& g = *g_;
+    const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, S = (int) g.ssm_state_size, HIST = (int) g.ssm_d_conv - 1;
+    const GdnHeadSlice sl{HK, HV, S, gs_nk0_, HK - gs_nk0_};
+    const size_t full_f = (size_t) S * HV * S + (size_t) g.ssm_conv_channels * HIST;
+    const size_t part_f = basalt::core::gdn_slice_state_floats(sl, HIST), nl = (size_t) gs_ca_.n_layers;
+    SessionState& ss = to_peer ? *ss_ : *gs_ss_;
+    int64_t gdn_index = 0;
+    for (int64_t l = 0; l < lb_; ++l) gdn_index += is_qsa_layer(g, l) ? 0 : 1;
+    float* const full_d = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * full_f;
+    std::vector<float> full(full_f * nl), part(part_f * nl);
+    bool ok;
+    {
+        const OnDevice on(device_);
+        ok = cudaStreamSynchronize(cs_) == cudaSuccess && cudaStreamSynchronize(cm_) == cudaSuccess &&
+             cudaMemcpy(full.data(), full_d, full.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+    }
+    if (to_peer) {
+        for (size_t i = 0; i < nl; ++i) basalt::core::gdn_slice_state(sl, HIST, full.data() + full_f * i, part.data() + part_f * i);
+        const OnDevice on(gs_dev_);
+        ok = ok && cudaStreamSynchronize(dm_->ps) == cudaSuccess &&
+             cudaMemcpy(gs_state_, part.data(), part.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+        gs_ss_ = ss_;
+    } else {
+        {
+            const OnDevice on(gs_dev_);
+            ok = ok && cudaStreamSynchronize(dm_->ps) == cudaSuccess &&
+                 cudaMemcpy(part.data(), gs_state_, part.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+        }
+        for (size_t i = 0; i < nl; ++i) basalt::core::gdn_unslice_state(sl, HIST, part.data() + part_f * i, full.data() + full_f * i);
+        const OnDevice on(device_);
+        ok = ok && cudaMemcpy(full_d, full.data(), full.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+    }
+    if (!ok) {
+        err = std::string("verify: the GDN state slice did not move: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    gs_live_ = to_peer;
+    return true;
 }
 
 void Verifier::dm_free() {
@@ -3168,6 +3217,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     gm.mark(12);
+    gs_split_ = dm_ != nullptr && gs_mixl_ != nullptr;
+    if (gs_split_ && !gs_live_ && !gs_move(true, err)) return false;
     if (dm_ != nullptr) {   // this window's residency, then the peer window ahead of CUDA0's
         if (!dm_begin(err, &gm)) return false;
     }
@@ -3433,6 +3484,11 @@ bool Verifier::commit(int n_keep, std::string& err, int parts) {
         decode_events().record(DecodeEvents::kCommitPre, cm_);
         const cudaError_t le = cudaGraphLaunch(commit_exec_, cm_);
         decode_events().record(DecodeEvents::kCommitPost, cm_);
+        if (gs_split_ && gs_live_) {   // the peer's heads, on its stream behind its window
+            const OnDevice on(gs_dev_);
+            gs_ca_.n_keep = h_commit_;
+            basalt::kernels::gdn_commit_layers(gs_ca_, dm_->ps, kCommitBlocks);
+        }
         if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
         // set_commit_async: no wait here - the next window's first node waits for the epoch (the host names it in
         // h_pend_), and the drafter (its own stream) reads only this window's final rows and its own K/V.  h_commit_ is
@@ -3465,6 +3521,7 @@ bool Verifier::wait_commit(std::string& err) {
         const cudaError_t se = cudaEventSynchronize(commit_done_);
         if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     }
+    if (gs_live_ && !gs_move(false, err)) return false;
     return next_ == nullptr || next_->wait_commit(err);
 }
 
@@ -3839,6 +3896,8 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     using namespace basalt::kernels;
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
+    if (gs_live_ && !gs_move(false, err)) return false;
+    gs_split_ = false;
     if (!stage_batch(rows, lens, S, 0, tokens, pos, err)) return false;
     const int R = last_t_;   // the window's rows
     const bool dm = dm_ != nullptr && batch_dm_;
@@ -3984,6 +4043,8 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
     int rows[8] = {};
     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
+    if (gs_live_ && !gs_move(false, err)) return false;
+    gs_split_ = false;
     if (!stage_batch(rows, nullptr, S, base, tokens, pos, err)) return false;
     order_after_commit();
     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(S, base)], cs_);
