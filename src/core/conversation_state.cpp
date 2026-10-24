@@ -230,6 +230,8 @@ bool ConversationCheckpointDeferral::save(ConversationCheckpoint& c, const Sessi
             !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error) ||
             !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
     }
+    // the helper's stream is non-blocking: the copy into the spare buffer is complete before it reads it
+    if (!sync(error)) return false;
     int dev = 0;
     cudaGetDevice(&dev);
     dst_ = c.gdn.data();
