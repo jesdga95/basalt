@@ -10,13 +10,21 @@ namespace basalt::program {
 struct CommunityGpu {
     std::string name;
     double vram_gib = 0, power_w = 0;
+    std::string pcie;          ///< maximum generation and current width, e.g. "5.0 x16"; omitted when empty
+    double h2d_gbps = 0;       ///< pinned host-to-device copy speed; omitted when 0
 };
 
 struct CommunityRow {
     std::string submitter, date, commit, preset, os, quant, notes;   // notes is omitted when empty
     std::vector<CommunityGpu> gpus;
-    double ram_gib = 0, prefill_16k_tps = 0, prefill_64k_tps = 0, decode_tps = 0;
+    std::string cpu;           ///< "AMD Ryzen 9 9950X, 16 cores"; omitted when empty
+    double ram_gib = 0, ram_gbps = 0;   ///< ram_gbps (host read speed) is omitted when 0
+    double prefill_16k_tps = 0, prefill_64k_tps = 0, decode_tps = 0;
 };
+
+/// The cpu field from the OS's processor string and physical core count: trademark marks, the clock, "N-Core
+/// Processor" and the like are dropped, then ", N cores" is added. Empty when the name is empty.
+std::string cpu_label(const std::string& raw_name, int physical_cores);
 
 /// A JSON string literal, quoted the way json.dumps(ensure_ascii=False) does.
 std::string json_quote(const std::string& s);

@@ -10,4 +10,11 @@
 
 You need enough free RAM that no expert is read from the SSD; the bench checks this and refuses to print a row otherwise.
 
+Optional fields, recorded by `--community` before the engine starts (`basalt-bench --hardware` prints them alone):
+
+- `cpu`: the processor and its physical core count, e.g. "AMD Ryzen 9 9950X, 16 cores".
+- `ram_gbps`: host RAM read speed in GB/s, one thread per physical core streaming a 2 GiB buffer, best of several passes.
+- per GPU, `pcie`: the link as the driver reports it, e.g. "5.0 x16": the maximum generation (the current one drops at idle) and the current width (the maximum width is the card's, not the slot's, so a slot shared between two cards reads x8).
+- per GPU, `h2d_gbps`: pinned host-to-device copy speed in GB/s, best of several 256 MiB copies.
+
 The bench writes the file in the house format. After a hand edit, run `python3 tools/check_benchmarks.py --fix docs/community/benchmarks.json`; it rewrites the file in the house format and validates it. CI runs the same checker without `--fix` and fails on any other format. A benchmark-only pull request skips the full build.

@@ -22,12 +22,14 @@
 #include <string>
 #include <vector>
 
+#include "basalt/platform/cpu.hpp"
 #include "basalt/platform/dynlib.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/platform/process.hpp"
 #include "basalt/platform/system.hpp"
 #include "basalt/program/community_row.hpp"
+#include "basalt/program/host_rates.hpp"
 #include "basalt/program/engine_session.hpp"
 
 #include <errno.h>
@@ -123,6 +125,8 @@ public:
         double power_enforced_w = -1;   // the limit the driver applies now (the management limit when it cannot say)
         double vram_gib = -1;
         int sm_mhz = -1, mem_mhz = -1;
+        int pcie_gen = -1, pcie_width = -1;   // the link's maximum generation and its current width: the generation drops at idle, the width does not, and the
+                                          // maximum width is the card's, not the slot's
     };
 
     bool open() {
@@ -141,6 +145,8 @@ public:
         enf_ = lib_.sym<int (*)(void*, unsigned*)>("nvmlDeviceGetEnforcedPowerLimit");
         mem_ = lib_.sym<int (*)(void*, MemInfo*)>("nvmlDeviceGetMemoryInfo");
         bus_ = lib_.sym<int (*)(const char*, void**)>("nvmlDeviceGetHandleByPciBusId_v2");
+        maxgen_ = lib_.sym<int (*)(void*, unsigned*)>("nvmlDeviceGetMaxPcieLinkGeneration");
+        maxwid_ = lib_.sym<int (*)(void*, unsigned*)>("nvmlDeviceGetCurrPcieLinkWidth");
         if (!init_ || !count_ || !handle_ || init_() != 0) return false;
         unsigned n = 0;
         if (count_(&n) != 0) return false;
@@ -194,6 +200,8 @@ private:
         unsigned c = 0;
         if (clk_ && clk_(h, 1, &c) == 0) s.sm_mhz = (int) c;    // NVML_CLOCK_SM
         if (clk_ && clk_(h, 2, &c) == 0) s.mem_mhz = (int) c;   // NVML_CLOCK_MEM
+        if (maxgen_ && maxgen_(h, &c) == 0) s.pcie_gen = (int) c;
+        if (maxwid_ && maxwid_(h, &c) == 0) s.pcie_width = (int) c;
         return s;
     }
     basalt::platform::DynLib lib_;
@@ -202,6 +210,8 @@ private:
     int (*enf_)(void*, unsigned*) = nullptr;
     int (*mem_)(void*, MemInfo*) = nullptr;
     int (*bus_)(const char*, void**) = nullptr;
+    int (*maxgen_)(void*, unsigned*) = nullptr;
+    int (*maxwid_)(void*, unsigned*) = nullptr;
     int (*init_)() = nullptr;
     int (*shut_)() = nullptr;
     int (*drv_)(char*, unsigned) = nullptr;
@@ -226,7 +236,7 @@ struct Options {
     bool sel_decode = false, sel_prefill = false;
     int reps = 1;
     bool quality = false, no_windows = false, print_command = false;
-    bool community = false;
+    bool community = false, hardware = false;
     std::string submitter;
     std::string community_file;          // --community-file: the table the row is added to
     int quality_chunks = 20, quality_t = 3;
@@ -260,13 +270,17 @@ void usage(const std::string& engine) {
         "                     and the engine's own defaults otherwise (no warm-up, no repetition, drafting at its\n"
         "                     default). The decode fixtures and each prefill run in their own fresh engine process, so\n"
         "                     every number is cold. Prints the table, adds the row to benchmarks.json and prints it. prefill_16k_tps and\n"
-        "                     prefill_64k_tps = engine tokens/s of those requests; decode_tps = tokens / decode time\n"
+        "                     prefill_64k_tps = engine tokens/s of those requests; the row also records the CPU, the RAM read speed and, per GPU, the\n"
+        "                     PCIe link (maximum generation and width) and the pinned host-to-device copy speed, measured before the engine starts; decode_tps = tokens / decode time\n"
         "                     summed over conv, struct and prose (token-weighted). Needs NVML for the GPU names, VRAM and enforced power limits. Only\n"
         "                     --model, --submitter, --community-file, --fixtures, --logs and --print-command may be given with it:\n"
         "                     any other option or engine flag would make rows incomparable and is refused\n"
         "  --submitter NAME   the name shown in the table, written into the row (required with --community)\n"
         "  --community-file PATH  the benchmarks.json the row is added to (default: docs/community/benchmarks.json of the\n"
         "                     checkout this build came from); when it cannot be written the row is printed instead\n"
+        "\n"
+        "  --hardware         measure and print this machine's CPU, RAM read speed and, per GPU, PCIe link and\n"
+        "                     host-to-device copy speed (the figures --community records), then exit; no model, no engine\n"
         "\n"
         "engine\n"
         "  --model FILE       a .basalt model file; --peer-device 1 is added when a second GPU is visible. Every\n"
@@ -348,6 +362,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else if (a == "--engine") o.engine = next("--engine");
         else if (a == "--spec") o.spec = next("--spec");
         else if (a == "--community") o.community = true;
+        else if (a == "--hardware") o.hardware = true;
         else if (a == "--submitter") o.submitter = next("--submitter");
         else if (a == "--community-file") o.community_file = next("--community-file");
         else if (a == "--fixtures") o.fixtures = next("--fixtures");
@@ -421,7 +436,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
             err = "-t: unknown fixture " + s + " (conv, struct, prose)";
             return false;
         }
-    if (o.model.empty() && o.passthrough.empty()) {
+    if (o.model.empty() && o.passthrough.empty() && !o.hardware) {
         err = "give --model FILE or engine arguments after --";
         return false;
     }
@@ -607,6 +622,55 @@ bool read_kld_base(const std::string& path, uint32_t& n_ctx, int32_t& n_vocab, i
     return true;
 }
 
+// ---------------------------------------------------------------------------------------------- hardware
+
+// The host figures a community row records, measured while no engine runs.
+struct Hardware {
+    std::string cpu;
+    double ram_gbps = 0;
+    std::vector<std::pair<std::string, double>> h2d;   // PCI bus id as the runtime spells it, GB/s
+};
+
+Hardware measure_hardware() {
+    Hardware h;
+    const basalt::platform::CpuInfo c = basalt::platform::cpu_info();
+    h.cpu = basalt::program::cpu_label(c.name, c.physical_cores);
+    h.ram_gbps = basalt::program::measure_ram_read_gbps();
+    const std::string dev = BASALT_BENCH_DEVICE;
+    if (!dev.empty() && fs::exists(dev))
+        if (const auto out = basalt::platform::capture_output({dev, "--link-rates"}, false)) h.h2d = basalt::program::parse_link_rates(*out);
+    return h;
+}
+
+double h2d_of(const Hardware& h, const std::string& bus_id) {
+    const std::string k = basalt::program::normalize_bus_id(bus_id);
+    for (const auto& x : h.h2d)
+        if (basalt::program::normalize_bus_id(x.first) == k) return x.second;
+    return 0;
+}
+
+std::string pcie_text(const Nvml::Snap& s) { return s.pcie_gen > 0 && s.pcie_width > 0 ? fmt("%d.0 x%d", s.pcie_gen, s.pcie_width) : ""; }
+
+std::string short_card(std::string n) {
+    for (const char* v : {"NVIDIA ", "GeForce "})
+        if (n.rfind(v, 0) == 0) n.erase(0, std::strlen(v));
+    return n;
+}
+
+// "hardware" block: one line each for the CPU, the RAM and every GPU in `cards` (bus id, snapshot, h2d).
+std::string hardware_text(const Hardware& h, const std::vector<std::pair<std::string, Nvml::Snap>>& cards) {
+    std::string t = "hardware (measured before the engine starts)\n";
+    t += "  CPU   " + (h.cpu.empty() ? std::string("unknown") : h.cpu) + "\n";
+    t += h.ram_gbps > 0 ? fmt("  RAM   read %.1f GB/s\n", h.ram_gbps) : std::string("  RAM   read speed not measured\n");
+    for (const auto& c : cards) {
+        const double g = h2d_of(h, c.first);
+        const std::string link = pcie_text(c.second);
+        t += "  GPU   " + short_card(c.second.name) + "  PCIe " + (link.empty() ? std::string("unknown") : link) +
+             (g > 0 ? fmt("  host-to-device %.1f GB/s", g) : std::string("  host-to-device not measured")) + "\n";
+    }
+    return t;
+}
+
 // ---------------------------------------------------------------------------------------------- main
 
 }  // namespace
@@ -620,6 +684,20 @@ int main(int argc, char** argv) {
     }
     basalt::platform::ignore_broken_pipe();   // a closed pipe surfaces as a failed write
     basalt::platform::install_child_stop_signals();
+
+    if (o.hardware) {
+        Nvml nvml;
+        if (!nvml.open()) basalt::log::warn("basalt-bench", "NVML is unavailable: PCIe links are NOT recorded");
+        const Hardware hw = measure_hardware();
+        std::vector<std::pair<std::string, Nvml::Snap>> cards;
+        for (const auto& x : hw.h2d) {
+            Nvml::Snap sn;
+            nvml.snap_bus(x.first, sn);
+            cards.emplace_back(x.first, sn);
+        }
+        std::fputs(hardware_text(hw, cards).c_str(), stdout);
+        return 0;
+    }
 
     if (o.community) o.no_windows = true;   // the draft log is analysis, not part of the preset
 
@@ -738,6 +816,13 @@ int main(int argc, char** argv) {
     }
     if (o.community && BASALT_BENCH_DIRTY)
         basalt::log::warn("basalt-bench", "tracked files differ from commit %s; the row names that commit", BASALT_BENCH_GIT);
+    Hardware hw;
+    if (o.community) {
+        hw = measure_hardware();
+        if (hw.cpu.empty()) basalt::log::warn("basalt-bench", "the CPU could not be read; the row has no cpu");
+        if (hw.ram_gbps <= 0) basalt::log::warn("basalt-bench", "the RAM read speed could not be measured (needs 3 GiB free); the row has no ram_gbps");
+        if (hw.h2d.empty()) basalt::log::warn("basalt-bench", "the host-to-device copy speed could not be measured; the rows' gpus have no h2d_gbps");
+    }
     std::vector<Nvml::Snap> gpus_start;
     for (size_t i = 0; i < nvml.count(); ++i) gpus_start.push_back(nvml.snap(i));
 
@@ -1055,6 +1140,7 @@ int main(int argc, char** argv) {
             }
         }
         std::string gpu_err;
+        std::vector<std::pair<std::string, Nvml::Snap>> cards;
         std::istringstream ids(info.count("gpus") ? info["gpus"] : "");
         for (std::string id; std::getline(ids, id, ',');) {
             Nvml::Snap g;
@@ -1062,9 +1148,9 @@ int main(int argc, char** argv) {
                 gpu_err = "NVML could not read the GPU at " + id;
                 break;
             }
-            for (const char* v : {"NVIDIA ", "GeForce "})
-                if (g.name.rfind(v, 0) == 0) g.name.erase(0, std::strlen(v));
-            crow.gpus.push_back({g.name, g.vram_gib, g.power_enforced_w});
+            g.name = short_card(g.name);
+            crow.gpus.push_back({g.name, g.vram_gib, g.power_enforced_w, pcie_text(g), h2d_of(hw, id)});
+            cards.emplace_back(id, g);
         }
         const uint64_t ram_b = basalt::platform::total_physical_memory();
         if (gpu_err.empty() && crow.gpus.empty()) gpu_err = "the engine did not report which GPUs it used";
@@ -1083,12 +1169,15 @@ int main(int argc, char** argv) {
         crow.commit = BASALT_BENCH_GIT;
         crow.preset = "community-1";
         crow.ram_gib = (double) ram_b / (double) (1ull << 30);
+        crow.cpu = hw.cpu;
+        crow.ram_gbps = hw.ram_gbps;
         crow.os = basalt::platform::host_os_name();
         crow.quant = info.count("quant") ? info["quant"] : "unknown";
         crow.prefill_16k_tps = pre_tps[0];
         crow.prefill_64k_tps = pre_tps[1];
         crow.decode_tps = dec_tok / (dec_ms / 1000.0);
         community_row = basalt::program::community_row_text(crow);
+        rep += "\n" + hardware_text(hw, cards);
         rep += fmt("\ncommunity-1: prefill 16K %.1f t/s (%.1f s), prefill 64K %.1f t/s (%.1f s), decode %.1f t/s (%.0f tokens in %.1f s), "
                    "each measured cold\n",
                    pre_tps[0], pre_s[0], pre_tps[1], pre_s[1], dec_tok / (dec_ms / 1000.0), dec_tok, dec_ms / 1000.0);

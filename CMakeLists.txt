@@ -177,6 +177,9 @@ add_library(platform STATIC src/platform/file.cpp src/platform/memory.cpp src/pl
 target_include_directories(platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # dlopen (DynLib) lives in libdl before glibc 2.34
 target_link_libraries(platform PUBLIC warnings ${CMAKE_DL_LIBS})
+if(WIN32)
+  target_link_libraries(platform PUBLIC advapi32)   # the processor name in the registry
+endif()
 
 # ---- core (GPU runtime) ---------------------------------------------
 add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
@@ -425,7 +428,7 @@ add_custom_target(git_stamp
 execute_process(COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DOUT=${_git_stamp}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/git_stamp.cmake)
 # the engine driven as a child process and the report logic, shared by basalt-bench and basalt-probe
-add_library(engine_session STATIC src/program/engine_session.cpp src/program/load_summary.cpp src/program/probe_report.cpp src/program/probe_derive.cpp src/program/auto_plan.cpp src/program/community_row.cpp)
+add_library(engine_session STATIC src/program/engine_session.cpp src/program/load_summary.cpp src/program/probe_report.cpp src/program/probe_derive.cpp src/program/auto_plan.cpp src/program/community_row.cpp src/program/host_rates.cpp)
 target_include_directories(engine_session PUBLIC include)
 find_package(Threads REQUIRED)
 target_link_libraries(engine_session PUBLIC platform Threads::Threads)
@@ -453,12 +456,13 @@ set_target_properties(basalt-bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_S
 # the image encoder sidecar, bin/basalt-vision (its own project, built with this one)
 add_subdirectory(tools/vision)
 target_link_libraries(basalt PRIVATE vision_cuda)
-add_dependencies(basalt-bench basalt git_stamp)
+add_dependencies(basalt-bench basalt basalt-device git_stamp)
 target_include_directories(basalt-bench PRIVATE ${CMAKE_BINARY_DIR}/stamp)
 target_link_libraries(basalt-bench PRIVATE engine_session platform warnings ${CMAKE_DL_LIBS})
 basalt_embed_manifest(basalt-bench)
 target_compile_definitions(basalt-bench PRIVATE
   BASALT_BENCH_ENGINE="$<TARGET_FILE:basalt>"
+  BASALT_BENCH_DEVICE="$<TARGET_FILE:basalt-device>"
   BASALT_BENCH_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/data/bench"
   BASALT_BENCH_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
   BASALT_BENCH_BUILD_TYPE="${CMAKE_BUILD_TYPE}"

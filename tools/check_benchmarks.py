@@ -9,8 +9,9 @@ import sys
 
 REQUIRED = {"submitter", "date", "commit", "preset", "gpus", "ram_gib", "os",
             "quant", "prefill_16k_tps", "prefill_64k_tps", "decode_tps"}
-OPTIONAL = {"notes"}
-GPU_KEYS = {"name", "vram_gib", "power_w"}
+OPTIONAL = {"notes", "cpu", "ram_gbps"}
+GPU_KEYS = {"name", "vram_gib", "power_w", "pcie", "h2d_gbps"}
+PCIE = re.compile(r"[1-9](\.0)? x(1|2|4|8|16|32)")
 PLACEHOLDER = "YOUR_NAME"
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 SYSTEMS = ("Linux", "Windows", "WSL2")
@@ -39,6 +40,10 @@ def check_gpu(g, k, err):
     for key in ("vram_gib", "power_w"):
         if not is_pos(g.get(key)):
             err(f"gpus[{k}].{key} must be a number > 0")
+    if "pcie" in g and not (isinstance(g["pcie"], str) and PCIE.fullmatch(g["pcie"])):
+        err(f"gpus[{k}].pcie must look like '5.0 x16'")
+    if "h2d_gbps" in g and not is_pos(g["h2d_gbps"]):
+        err(f"gpus[{k}].h2d_gbps must be a number > 0")
 
 
 def check_row(r, err):
@@ -85,6 +90,10 @@ def check_row(r, err):
     for key in ("ram_gib", "prefill_16k_tps", "prefill_64k_tps", "decode_tps"):
         if key in r and not is_pos(r[key]):
             err(f"{key} must be a number > 0")
+    if "ram_gbps" in r and not is_pos(r["ram_gbps"]):
+        err("ram_gbps must be a number > 0")
+    if "cpu" in r and not (is_text(r["cpu"]) and len(r["cpu"]) <= 80 and not CONTROL.search(r["cpu"])):
+        err("cpu must be a non-empty string of at most 80 characters, without control characters")
     if "os" in r and r["os"] not in SYSTEMS:
         err("os must be one of " + ", ".join(SYSTEMS))
     if "quant" in r and not is_text(r["quant"]):
@@ -93,9 +102,9 @@ def check_row(r, err):
         err("notes must be a string of at most 200 characters")
 
 
-ROW_ORDER = ("submitter", "date", "commit", "preset", "gpus", "ram_gib", "os",
+ROW_ORDER = ("submitter", "date", "commit", "preset", "gpus", "ram_gib", "cpu", "ram_gbps", "os",
              "quant", "prefill_16k_tps", "prefill_64k_tps", "decode_tps", "notes")
-GPU_ORDER = ("name", "vram_gib", "power_w")
+GPU_ORDER = ("name", "vram_gib", "power_w", "pcie", "h2d_gbps")
 TOP_ORDER = ("preset", "runs")
 FIX_HINT = "python3 tools/check_benchmarks.py --fix docs/community/benchmarks.json"
 

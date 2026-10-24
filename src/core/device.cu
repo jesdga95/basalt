@@ -3,6 +3,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -48,6 +49,57 @@ bool device_summary(int ordinal, std::string& name, std::string& detail) {
     name = p.name;
     detail = buf;
     return true;
+}
+
+bool device_pci_bus_id(int ordinal, std::string& id) {
+    char buf[64] = {};
+    if (ordinal < 0 || cudaDeviceGetPCIBusId(buf, sizeof buf, ordinal) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    id = buf;
+    return true;
+}
+
+double device_h2d_gbps(int ordinal) {
+    constexpr size_t kBytes = 256ull << 20;
+    constexpr int kCopies = 6;
+    int prev = 0;
+    if (ordinal < 0 || ordinal >= device_count() || cudaGetDevice(&prev) != cudaSuccess || cudaSetDevice(ordinal) != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
+    }
+    void* host = nullptr;
+    void* dev = nullptr;
+    cudaStream_t st = nullptr;
+    cudaEvent_t ev[kCopies + 1] = {};
+    bool ok = cudaHostAlloc(&host, kBytes, cudaHostAllocPortable) == cudaSuccess;
+    ok = ok && cudaMalloc(&dev, kBytes) == cudaSuccess && cudaStreamCreate(&st) == cudaSuccess;
+    for (cudaEvent_t& e : ev) ok = ok && cudaEventCreate(&e) == cudaSuccess;
+    double best = 0;
+    if (ok) {
+        cudaMemcpyAsync(dev, host, kBytes, cudaMemcpyHostToDevice, st);   // the copy engine and the link up
+        cudaStreamSynchronize(st);
+        cudaEventRecord(ev[0], st);
+        for (int i = 0; i < kCopies; ++i) {
+            cudaMemcpyAsync(dev, host, kBytes, cudaMemcpyHostToDevice, st);
+            cudaEventRecord(ev[i + 1], st);
+        }
+        if (cudaEventSynchronize(ev[kCopies]) == cudaSuccess)
+            for (int i = 0; i < kCopies; ++i) {
+                float ms = 0.f;
+                if (cudaEventElapsedTime(&ms, ev[i], ev[i + 1]) == cudaSuccess && ms > 0.01f)
+                    best = std::max(best, (double) kBytes / ((double) ms * 1e-3) / 1e9);
+            }
+    }
+    for (cudaEvent_t e : ev)
+        if (e) cudaEventDestroy(e);
+    if (st) cudaStreamDestroy(st);
+    if (dev) cudaFree(dev);
+    if (host) cudaFreeHost(host);
+    cudaGetLastError();
+    cudaSetDevice(prev);
+    return best;
 }
 
 }  // namespace basalt::core

@@ -1,6 +1,7 @@
 // src/program/community_row.cpp - appends a community benchmark row to docs/community/benchmarks.json.
 #include "basalt/program/community_row.hpp"
 
+#include <cctype>
 #include <cstdio>
 
 #include "basalt/platform/file.hpp"
@@ -37,6 +38,34 @@ std::string num(double v, int decimals) {
 }
 }  // namespace
 
+std::string cpu_label(const std::string& raw_name, int physical_cores) {
+    std::string n = raw_name;
+    const auto erase_all = [&](const std::string& what) {
+        for (size_t p; (p = n.find(what)) != std::string::npos;) n.erase(p, what.size());
+    };
+    for (const char* m : {"(R)", "(TM)", "(r)", "(tm)", " with Radeon Graphics", " Processor"}) erase_all(m);
+    if (const size_t at = n.find(" @ "); at != std::string::npos) n.erase(at);   // the clock
+    for (size_t p = 0; (p = n.find("-Core", p)) != std::string::npos;) {   // "16-Core"
+        size_t b = p;
+        while (b > 0 && std::isdigit((unsigned char) n[b - 1])) --b;
+        n.erase(b, p + 5 - b);
+        p = b;
+    }
+    if (n.size() >= 4 && n.compare(n.size() - 4, 4, " CPU") == 0) n.erase(n.size() - 4);
+    std::string out;
+    for (char c : n) {   // single spaces, no edge spaces
+        if (std::isspace((unsigned char) c)) {
+            if (!out.empty() && out.back() != ' ') out += ' ';
+        } else {
+            out += c;
+        }
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    if (out.empty()) return out;
+    if (physical_cores > 0) out += ", " + std::to_string(physical_cores) + (physical_cores == 1 ? " core" : " cores");
+    return out;
+}
+
 std::string community_row_text(const CommunityRow& r) {
     std::string t = "    {\n";
     t += "      \"submitter\": " + json_quote(r.submitter) + ",\n";
@@ -49,11 +78,16 @@ std::string community_row_text(const CommunityRow& r) {
         t += "        {\n";
         t += "          \"name\": " + json_quote(g.name) + ",\n";
         t += "          \"vram_gib\": " + num(g.vram_gib, 0) + ",\n";
-        t += "          \"power_w\": " + num(g.power_w, 0) + "\n";
+        t += "          \"power_w\": " + num(g.power_w, 0);
+        if (!g.pcie.empty()) t += ",\n          \"pcie\": " + json_quote(g.pcie);
+        if (g.h2d_gbps > 0) t += ",\n          \"h2d_gbps\": " + num(g.h2d_gbps, 1);
+        t += "\n";
         t += i + 1 < r.gpus.size() ? "        },\n" : "        }\n";
     }
     t += "      ],\n";
     t += "      \"ram_gib\": " + num(r.ram_gib, 0) + ",\n";
+    if (!r.cpu.empty()) t += "      \"cpu\": " + json_quote(r.cpu) + ",\n";
+    if (r.ram_gbps > 0) t += "      \"ram_gbps\": " + num(r.ram_gbps, 1) + ",\n";
     t += "      \"os\": " + json_quote(r.os) + ",\n";
     t += "      \"quant\": " + json_quote(r.quant) + ",\n";
     t += "      \"prefill_16k_tps\": " + num(r.prefill_16k_tps, 1) + ",\n";
