@@ -70,6 +70,54 @@ std::string json_schema_to_gbnf(const std::string& schema_json, std::string& err
 
 namespace {
 
+// True when the schema is a type that is raw text in a parameter: "string", or a type list naming "string".
+bool is_text_type(const JsonValue& t) {
+    if (t.is(Type::String)) return t.s == "string";
+    return t.is(Type::Array) && std::any_of(t.items.begin(), t.items.end(),
+                                            [](const JsonValue& v) { return v.is(Type::String) && v.s == "string"; });
+}
+
+// One branch of an anyOf/oneOf/allOf: a plain string (type "string" or a list of string and null, no enum/const/
+// structure) or null. `has_text` is set when it can be text.
+bool plain_text_branch(const JsonValue* b, bool& has_text) {
+    if (!b || !b->is(Type::Object)) return false;
+    for (const char* k : {"enum", "const", "anyOf", "oneOf", "allOf", "properties", "items", "$ref"})
+        if (b->get(k)) return false;
+    const JsonValue* t = b->get("type");
+    if (!t) return false;
+    if (t->is(Type::String)) {
+        if (t->s == "string") has_text = true;
+        return t->s == "string" || t->s == "null";
+    }
+    if (!t->is(Type::Array)) return false;
+    for (const JsonValue& v : t->items) {
+        if (!v.is(Type::String) || (v.s != "string" && v.s != "null")) return false;
+        if (v.s == "string") has_text = true;
+    }
+    return true;
+}
+
+// A parameter written as anyOf/oneOf (or a one-branch allOf) whose every branch is a plain string or null, with at
+// least one string: it takes raw text like a string, and `null` is just text it may write.
+bool text_union(const JsonValue* ps, const JsonValue* root) {
+    if (!ps || !ps->is(Type::Object) || ps->get("type") || ps->get("enum") || ps->get("const") ||
+        ps->get("properties") || ps->get("items"))
+        return false;
+    const JsonValue* u = nullptr;
+    for (const char* k : {"anyOf", "oneOf", "allOf"}) {
+        if (const JsonValue* v = ps->get(k)) {
+            if (u || !v->is(Type::Array) || v->items.empty()) return false;
+            if (k[0] == 'a' && k[1] == 'l' && v->items.size() != 1) return false;
+            u = v;
+        }
+    }
+    if (!u) return false;
+    bool has_text = false;
+    for (const JsonValue& b : u->items)
+        if (!plain_text_branch(deref(root, &b), has_text)) return false;
+    return has_text;
+}
+
 std::string hex_escape(unsigned char c) {
     static const char* h = "0123456789abcdef";
     return std::string("\\x") + h[c >> 4] + h[c & 15];
@@ -151,11 +199,9 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
                         value = c.add_rule(fn_id + "-" + m.first + "-enum", "(" + join(vals, " | ") + ")");
                         raw = true;
                     }
-                } else if (ty && ty->is(Type::String) && ty->s == "string") {
+                } else if (ty && is_text_type(*ty)) {
                     raw = true;
-                } else if (ty && ty->is(Type::Array) &&
-                           std::any_of(ty->items.begin(), ty->items.end(),
-                                       [](const JsonValue& v) { return v.is(Type::String) && v.s == "string"; })) {
+                } else if (text_union(ps, params)) {
                     raw = true;
                 } else if (!ty && !typed) {
                     raw = true;

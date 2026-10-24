@@ -184,6 +184,56 @@ static void test_tools() {
     CHECK(tool_call_gbnf("[{\"parameters\":{}}]", ToolGrammarOptions{}, err).empty());
 }
 
+static void test_text_unions() {
+    std::string err;
+    auto tool = [&](const std::string& param) {
+        return Grammar::parse(tool_call_gbnf(R"([{"name":"w","parameters":{"type":"object","properties":{"p":)" + param +
+                                                 R"(},"required":["p"]}}])", ToolGrammarOptions{}, err), err);
+    };
+    const std::string head = "<tool_call>\n<function=w>\n<parameter=p>\n";
+    const std::string tail = "\n</parameter>\n</function>\n</tool_call>";
+    // anyOf/oneOf of a string and null (a nullable string): raw text, `null` and constraints included
+    for (const char* form : {R"({"anyOf":[{"type":"string","minLength":1,"maxLength":1000},{"type":"null"}],"title":"P"})",
+                             R"({"oneOf":[{"type":"string"},{"type":"null"}]})",
+                             R"({"anyOf":[{"type":"null"},{"type":"string"}]})",
+                             R"({"anyOf":[{"type":"string"}]})",
+                             R"({"anyOf":[{"type":"string"},{"type":["string","null"]}]})",
+                             R"({"allOf":[{"type":"string"}]})"}) {
+        auto g = tool(form);
+        CHECK(g);
+        if (!g) continue;
+        CHECK(call_ok(g, head + "notes/diagnostics/x.txt" + tail));
+        CHECK(call_ok(g, head + "null" + tail));
+        CHECK(call_ok(g, head + "123" + tail));
+        CHECK(call_ok(g, head + "nope\nline 2 <b>" + tail));
+        CHECK(!pre(g, head + "a</parameter>\n<parameter=q>"));      // the closing tag still ends the value
+    }
+    // not a plain string: stays the JSON value
+    for (const char* form : {R"({"anyOf":[{"type":"string"},{"type":"integer"}]})",
+                             R"({"anyOf":[{"type":"integer"},{"type":"null"}]})",
+                             R"({"anyOf":[{"type":"string","enum":["a","b"]},{"type":"null"}]})",
+                             R"({"anyOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}]})",
+                             R"({"allOf":[{"type":"string"},{"minLength":1}]})"}) {
+        auto g = tool(form);
+        CHECK(g);
+        if (!g) continue;
+        CHECK(!pre(g, head + "notes/x.txt"));
+    }
+    auto mixed = tool(R"({"anyOf":[{"type":"string"},{"type":"integer"}]})");
+    CHECK(mixed && call_ok(mixed, head + "\"x\"" + tail) && call_ok(mixed, head + "5" + tail));
+    auto num = tool(R"({"anyOf":[{"type":"integer"},{"type":"null"}]})");
+    CHECK(num && call_ok(num, head + "null" + tail) && call_ok(num, head + "7" + tail) && !pre(num, head + "x"));
+    // the type-list forms are unchanged
+    auto lst = tool(R"({"type":["string","null"]})");
+    CHECK(lst && call_ok(lst, head + "notes/x.txt" + tail) && call_ok(lst, head + "null" + tail));
+    auto plain = tool(R"({"type":"string"})");
+    CHECK(plain && call_ok(plain, head + "notes/x.txt" + tail));
+    // a $ref to a nullable string
+    auto ref = Grammar::parse(tool_call_gbnf(R"([{"name":"w","parameters":{"type":"object","properties":{"p":{"$ref":"#/$defs/s"}},
+        "required":["p"],"$defs":{"s":{"type":"string"}}}}])", ToolGrammarOptions{}, err), err);
+    CHECK(ref && call_ok(ref, head + "notes/x.txt" + tail));
+}
+
 static void test_request() {
     std::string err;
     auto r = grammar_from_request(R"({"kind":"tools","tool_choice":"auto","tools":[{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}}},{"type":"function","function":{"name":"pong","parameters":{"type":"object","properties":{}}}}]})", err);
@@ -215,6 +265,7 @@ int main() {
     test_array_nested();
     test_ref();
     test_tools();
+    test_text_unions();
     if (g_fail) { std::printf("grammar_schema_test: %d failures\n", g_fail); return 1; }
     std::printf("grammar_schema_test: ok\n");
     return 0;
