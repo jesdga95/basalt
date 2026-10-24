@@ -8,10 +8,11 @@ Basalt is a local inference engine for the Qwen3.8-Flash-Next mixture-of-experts
 
 - **Commits:** small and logical, message style `area: what it does`. Never amend and never force-push; always make new commits. End each message with the co-author line your tool's instructions specify.
 - **Platform code:** engine code never names an OS or a compiler. No `_WIN32`, `_MSC_VER`, `__linux__`, `<windows.h>`, `<sys/mman.h>`, `<unistd.h>` or raw OS calls (mmap, pread, pthread, fork/exec, dlopen, /proc, /sys) outside `src/platform/` and `include/basalt/platform/`. A missing seam is added there with a Linux and a Windows body; the Linux body is the code you would have written anyway. `tools/check_platform_boundary.sh` enforces it.
-- **Log lines:** every engine stderr line goes through `include/basalt/log.hpp` with its real level (`info`, `warn`, `error`); never `fprintf(stderr, ...)`. Do not change the text of lines the server parses. `tools/check_stderr_logging.sh` enforces it.
+- **Log lines:** every engine stderr line goes through `include/basalt/log.hpp` with its real level (`info`, `warn`, `error`); never `fprintf(stderr, ...)`. Do not change the text of lines the server parses. `tools/check_stderr_logging.sh` enforces it. Engine and server log lines are terse facts (what was decided, its value, at most the flag to change it), not prose explanations.
 - **Code comments:** brief and stateless. Say what the code does and why. No hardware names, measured numbers, dates or history in comments.
 - **Don't push or publish anywhere** (GitHub, HF, any remote) without the maintainer's approval.
 - **Don't write tools nobody asked for.**
+- **No shims for removed things.** A removed or renamed flag, option, field or code path is simply gone: no alias, no fallback, no "was retired" message or list. The normal unknown-flag error covers it.
 - **Linux and Windows are both supported; Linux is where we test, and CI compiles and CPU-tests Windows.** Changes must not remove the platform seams (`src/platform/`, CMake `if(WIN32)`); see `CONTRIBUTING.md` and `docs/platforms.md`.
 - **Headline benchmark numbers come from the maintainer's own runs.** Agent benches are development A/Bs only. Label every number with its GPU power limit.
 - **Quality gate:** PPL/KLD against the Q8_0 reference, through the decode path (`basalt-bench --quality`). Byte identity with old output is not required, but say whenever numerics change. Bitwise-neutral refactors need only the greedy-identity check.
