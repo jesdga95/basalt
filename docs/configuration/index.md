@@ -113,7 +113,7 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
 | `gpu` | server | list of GPU numbers, e.g. `"0"` or `"0,1"` | every visible GPU | The cards to use, numbered as `nvidia-smi` numbers them. The first runs the model. A second card becomes the peer expert tier. Set it to keep other cards free or to pick which card is the main one. |
-| `peer-device` | engine | integer | off; the server sets `1` when two or more cards are visible | A second GPU as an adaptive expert-cache tier: it holds experts and computes their prompt rows. Rarely set by hand; `gpu` does it. Not with `layer-split` or `expert-cache-device1..3`. |
+| `peer-device` | engine | integer | off; the server sets `1` when two or more cards are visible | A second GPU as an adaptive expert-cache tier: it holds experts and computes their prompt rows. When its memory bandwidth makes it worth it, it also computes a share of the verify head's vocabulary rows (decided at start, one log line, same logits). Rarely set by hand; `gpu` does it. Not with `layer-split` or `expert-cache-device1..3`. |
 | `peer-slots` | engine | integer | as many as fit | Expert slots on the peer card. Lower it to leave the card room for something else. |
 | `layer-split` | engine | layer number, `K1,K2,...` or `auto` | off (one GPU) | Advanced: run the model in stages across GPUs, each stage a block of layers. The peer tier is the usual way to use a second card. |
 | `split-device` | engine | GPU numbers | the next visible GPUs | With `layer-split`, the devices of the later stages. |
