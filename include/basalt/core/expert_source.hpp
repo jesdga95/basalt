@@ -509,7 +509,9 @@ public:
     // each expert from its slot into `dst[k]`, waits for the copies, and calls `homes_commit`: the experts are then
     // read from RAM like the compact copy's.  `homes_abort` drops an uncommitted take.  When an expert goes back
     // into a slot, `home_release` frees its place (false when its copy is not in a home region); `homes_reclaim`
-    // returns the regions no expert uses to the OS.  Only between requests, with no swap in flight.
+    // returns the regions no expert uses to the OS.  Only on the main thread between requests, with no swap in flight
+    // and no pool, keep-alive or read-ahead thread reading `blob()`; the place space only grows (a freed region's
+    // places are not reused).
     bool homes_take(const std::vector<std::pair<int32_t, int32_t>>& experts, std::string& err, std::vector<uint8_t*>& dst);
     void homes_commit();
     void homes_abort();
@@ -519,6 +521,8 @@ public:
     /// free less than a region or the RAM cannot take the copy).  Only with no exchange in flight.
     uint64_t homes_compact();
     uint64_t homes_bytes() const;
+    /// RAM above the margin that a take leaves free (the server's guard floor and the engine's later allocations).
+    void set_homes_reserve(uint64_t bytes) { homes_reserve_ = bytes; }
     /// Debug: whether `bytes` equal the expert's bytes in the model files.
     bool equals_file(int64_t layer, int64_t expert, const uint8_t* bytes) const;
     /// With the compact copy ready: blobs read from the mapped file since (what the plain mmap mode may read from
@@ -579,6 +583,8 @@ private:
     uint64_t top_bytes_ = 0, top_locked_ = 0;
     bool top_pinned_ = false;
     std::vector<detail::HomeRegion> homes_;
+    uint64_t homes_reserve_ = 0;
+    bool exchange_live() const;   // a staged exchange's buffer is still read in place of a slot
     uint64_t homes_next_ = 0;   // the next region's base (0: none yet)
     std::vector<std::pair<size_t, uint64_t>> homes_pending_;   // (expert index, place) of an uncommitted take
     uint64_t homes_start() const { return complement_bytes_ + top_bytes_; }
