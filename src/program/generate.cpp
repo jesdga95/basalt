@@ -6197,18 +6197,24 @@ int main(int argc, char** argv) {
         // adaptive tier carries on from there.
         std::vector<std::pair<int32_t, int32_t>> vram_evicted;   // (residency index, slot) the shrinks took
         const int64_t chunk_full = o.prefill_chunk;              // the loan's chunk with the whole cache
-        auto relend = [&]() {   // the prompt path's loan: the end of the slots left, its chunk as large as fits
-            if (pf_parts.empty() || pf_parts[0].first < 0) return;
+        // the prompt path's loan with `live` slots: its chunk as large as fits, and the first slot it covers
+        auto loan_plan = [&](int64_t live, int64_t& chunk) -> int32_t {
             PfPart& p = pf_parts[0];
-            const int64_t live = xcache.slots();
             auto fits = [&](int64_t c) {
                 const int64_t k = part_slots(p, c);
                 return k > 0 && k + 128 <= live && !(o.prefill_auto && k * 100 > kAutoLendPct * live);
             };
             int64_t c = chunk_full;
             while (c > 256 && !fits(c)) c = std::max<int64_t>(256, c / 2 / 256 * 256);
+            chunk = c;
+            return (int32_t) std::max<int64_t>(0, live - part_slots(p, c));
+        };
+        auto relend = [&]() {   // the prompt path's loan: the end of the slots left, its chunk as large as fits
+            if (pf_parts.empty() || pf_parts[0].first < 0) return;
+            PfPart& p = pf_parts[0];
+            int64_t c = 0;
+            p.first = loan_plan(xcache.slots(), c);
             o.prefill_chunk = c;
-            p.first = (int32_t) std::max<int64_t>(0, live - part_slots(p, c));
             p.first_now = -1;   // laid out again at the next loan
         };
         // The resident RAM mode holds only the experts no slot holds, so an expert in a slot about to go has no RAM
@@ -6216,11 +6222,17 @@ int main(int argc, char** argv) {
         // (nothing copied) when the RAM above the floor cannot take them.  `live`: the slots that stay.
         auto home_given_up = [&](int64_t live, std::string& e) -> bool {
             if (!src.complement_ready()) return true;
+            // the slots the loan will overwrite keep a RAM copy too, so a prompt never costs a file read
+            int64_t from = live;
+            if (!pf_parts.empty() && pf_parts[0].first >= 0) {
+                int64_t c = 0;
+                from = std::min<int64_t>(live, loan_plan(live, c));
+            }
             std::vector<std::pair<int32_t, int32_t>> give;
             std::vector<int32_t> slots;
             for (size_t i = 0; i < host_res.size(); ++i) {
                 const int64_t layer = (int64_t) i / g.n_expert, ex = (int64_t) i % g.n_expert;
-                if (host_res[i] >= live && !src.has_resident(layer, ex)) {
+                if (host_res[i] >= from && !src.has_resident(layer, ex)) {
                     give.emplace_back((int32_t) layer, (int32_t) ex);
                     slots.push_back(host_res[i]);
                 }
@@ -6303,6 +6315,7 @@ int main(int argc, char** argv) {
                 std::string ferr;
                 std::vector<std::pair<int32_t, int32_t>> keep_out;
                 std::vector<std::pair<int64_t, int64_t>> homes_back;
+                std::vector<int32_t> homes_slot;
                 for (const auto& [i, slot] : vram_evicted) {
                     if (slot >= live) { keep_out.emplace_back(i, slot); continue; }
                     const int64_t layer = i / g.n_expert;
@@ -6326,13 +6339,18 @@ int main(int argc, char** argv) {
                     }
                     host_res[(size_t) pick] = slot;
                     homes_back.emplace_back(layer, pick % g.n_expert);
+                    homes_slot.push_back(slot);
                 }
                 vram_evicted.swap(keep_out);
                 if (!xcache.sync_queued(ferr)) { e = "VRAM: " + ferr; return false; }
-                // the slots hold them again: the RAM homes of those experts go (the copy is the slots' now)
-                for (const auto& [l, ex] : homes_back) (void) src.home_release(l, ex);
-                (void) src.homes_reclaim();
                 res_upload();
+                relend();
+                // the slots hold them again: the RAM homes of those experts go (the copy is the slots' now), except
+                // under the prompt path's loan, which overwrites its slots and so needs the RAM copy
+                const int64_t loan_from = pf_parts.empty() || pf_parts[0].first < 0 ? INT64_MAX : pf_parts[0].first;
+                for (size_t k = 0; k < homes_back.size(); ++k)
+                    if (homes_slot[k] < loan_from) (void) src.home_release(homes_back[k].first, homes_back[k].second);
+                (void) src.homes_reclaim();
             }
             relend();
             cudaMemGetInfo(&free_b, &total_b);

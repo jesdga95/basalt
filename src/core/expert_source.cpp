@@ -1226,10 +1226,8 @@ bool FileExpertSource::homes_take(const std::vector<std::pair<int32_t, int32_t>>
     dst.clear();
     if (!complement_ready_ || !homes_pending_.empty()) { err = "no resident copy to give homes to"; return false; }
     uint64_t total = 0;
-    std::vector<uint64_t> at;
     for (const auto& [l, e] : experts) {
         if (l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) { err = "an expert outside the model"; return false; }
-        at.push_back(total);
         total += layer_blob_bytes_[(size_t) l];
     }
     if (total == 0) return true;
@@ -1239,35 +1237,52 @@ bool FileExpertSource::homes_take(const std::vector<std::pair<int32_t, int32_t>>
               " MiB of RAM, and " + std::to_string(budget >> 20) + " MiB are free above the RAM floor";
         return false;
     }
-    detail::HomeRegion r;
-    r.bytes = total;
-    if (complement_pinned_ || top_pinned_) {
-        void* arena = nullptr;
-        if (cudaHostAlloc(&arena, (size_t) total, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) {
-            void* alias = nullptr;
-            if (cudaHostGetDevicePointer(&alias, arena, 0) == cudaSuccess && alias != nullptr) {
-                r.arena = arena;
-                r.device = (const uint8_t*) alias;
-                r.pinned = true;
-            } else {
-                (void) cudaFreeHost(arena);
-            }
-        }
-        (void) cudaGetLastError();
-    }
-    if (r.arena == nullptr) {
-        r.arena = std::malloc((size_t) total);
-        if (r.arena == nullptr) { err = "the RAM for the experts the cache gives back could not be allocated"; return false; }
-        r.locked = basalt::platform::lock_resident(r.arena, total).locked_bytes;
-    }
+    // regions of a bounded size: one that no expert uses any more can then be returned on its own
+    constexpr uint64_t kRegionBytes = 96ull << 20;
     if (homes_next_ < homes_start()) homes_next_ = homes_start();
-    r.base = homes_next_;
-    homes_next_ += total;
-    homes_.push_back(r);
-    for (size_t k = 0; k < experts.size(); ++k) {
-        const size_t i = (size_t) experts[k].first * (size_t) n_expert_ + (size_t) experts[k].second;
-        homes_pending_.emplace_back(i, r.base + at[k]);
-        dst.push_back((uint8_t*) r.arena + (size_t) at[k]);
+    size_t k = 0;
+    while (k < experts.size()) {
+        uint64_t bytes = 0;
+        size_t n = 0;
+        while (k + n < experts.size() && (n == 0 || bytes < kRegionBytes))
+            bytes += layer_blob_bytes_[(size_t) experts[k + n++].first];
+        detail::HomeRegion r;
+        r.bytes = bytes;
+        if (complement_pinned_ || top_pinned_) {
+            void* arena = nullptr;
+            if (cudaHostAlloc(&arena, (size_t) bytes, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) {
+                void* alias = nullptr;
+                if (cudaHostGetDevicePointer(&alias, arena, 0) == cudaSuccess && alias != nullptr) {
+                    r.arena = arena;
+                    r.device = (const uint8_t*) alias;
+                    r.pinned = true;
+                } else {
+                    (void) cudaFreeHost(arena);
+                }
+            }
+            (void) cudaGetLastError();
+        }
+        if (r.arena == nullptr) {
+            r.arena = std::malloc((size_t) bytes);
+            if (r.arena == nullptr) {
+                err = "the RAM for the experts the cache gives back could not be allocated";
+                dst.clear();
+                homes_abort();
+                return false;
+            }
+            r.locked = basalt::platform::lock_resident(r.arena, bytes).locked_bytes;
+        }
+        r.base = homes_next_;
+        homes_next_ += bytes;
+        homes_.push_back(r);
+        uint64_t at = 0;
+        for (size_t m = 0; m < n; ++m) {
+            const auto& [l, e] = experts[k + m];
+            homes_pending_.emplace_back((size_t) l * (size_t) n_expert_ + (size_t) e, r.base + at);
+            dst.push_back((uint8_t*) r.arena + (size_t) at);
+            at += layer_blob_bytes_[(size_t) l];
+        }
+        k += n;
     }
     return true;
 }
