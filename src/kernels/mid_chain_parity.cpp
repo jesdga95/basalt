@@ -54,7 +54,7 @@ std::vector<float> randn(size_t n, float sd, std::mt19937& r) {
     for (auto& x : v) x = nd(r);
     return v;
 }
-int sb_bytes(int type) { return type == 12 ? 144 : type == 13 ? 176 : type == 14 ? 210 : type == 21 ? 110 : 136; }
+int sb_bytes(int type) { return type == 12 ? 144 : type == 13 ? 176 : type == 14 ? 210 : type == 21 ? 110 : type == 8 ? 272 : 136; }
 // random super-blocks of a type with finite scales (d, and dmin for Q4_K / Q5_K; Q6_K's d is its last 2 bytes)
 std::vector<uint8_t> rand_type_host(int type, size_t nb, std::mt19937& r) {
     const int sb = sb_bytes(type);
@@ -62,7 +62,8 @@ std::vector<uint8_t> rand_type_host(int type, size_t nb, std::mt19937& r) {
     for (auto& v : w) v = (uint8_t) (r() & 0xff);
     for (size_t k = 0; k < nb; ++k) {
         const uint16_t h = sane_half(r), h2 = sane_half(r);
-        if (type == 14) std::memcpy(&w[k * sb + 208], &h, 2);
+        if (type == 8) { for (int j = 0; j < 8; ++j) { const uint16_t hj = sane_half(r); std::memcpy(&w[k * sb + 34 * j], &hj, 2); } }   // eight Q8_0 blocks
+        else if (type == 14) std::memcpy(&w[k * sb + 208], &h, 2);
         else { std::memcpy(&w[k * sb], &h, 2); if (type == 12 || type == 13) std::memcpy(&w[k * sb + 2], &h2, 2); }
     }
     return w;
@@ -225,9 +226,10 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     CK(cudaStreamCreate(&s));
     int bad = 0;
+    auto ref_names_n = [](size_t n) { return n + 1; };
 
     // the pair ring alternates its tiles between two groups: its slot count is even for every type triple
-    for (int q : {12, 13, 14, 21, 23}) for (int z : {12, 13, 14, 21, 23}) for (int o : {12, 13, 14, 21, 23}) {
+    for (int q : {8, 12, 13, 14, 21, 23}) for (int z : {8, 12, 13, 14, 21, 23}) for (int o : {8, 12, 13, 14, 21, 23}) {
         const int ns = K::mid_chain_ring_slots(q, z, o);
         if (ns < 2 || (ns & 1)) { std::printf("types %d/%d/%d: ring of %d slots\n", q, z, o, ns); ++bad; }
     }
@@ -236,7 +238,7 @@ int main(int argc, char** argv) {
     const std::vector<std::array<int, 3>> triples = {{14, 14, 14}, {23, 21, 12}, {14, 12, 14}, {13, 14, 14}, {12, 12, 14}, {14, 21, 23},
                                                      {23, 23, 14}, {13, 13, 13}, {12, 21, 21}, {14, 23, 12}, {23, 14, 13}, {13, 23, 14},
                                                      {13, 12, 14}, {13, 13, 14}, {13, 14, 13}, {14, 12, 12}, {14, 13, 12}, {14, 13, 14}, {14, 14, 13}, {14, 23, 13}, {14, 23, 14}, {23, 14, 14},
-                                                     {21, 21, 21}};
+                                                     {21, 21, 21}, {8, 8, 8}};
     std::vector<Layer> layers;
     for (const auto& t : triples) layers.push_back(make_layer(t[0], t[1], t[2], t[0] == 14 && t[1] == 14 && t[2] == 14));
     for (size_t l = 0; l < layers.size(); ++l) {
@@ -245,13 +247,14 @@ int main(int argc, char** argv) {
         for (int alias = 1; alias >= 0; --alias) {
             std::vector<std::vector<std::vector<uint8_t>>> got(TM + 1);
             size_t tot = 0;
+            std::vector<size_t> perk(outs.size() + 2, 0);
             for (int T = 1; T <= TM; ++T) {
                 reset(); run(w, T, alias, false, s); CK(cudaStreamSynchronize(s));
                 const auto ref = snap(T, alias);
                 for (int it = 0; it < iters; ++it) {
                     reset(); run(w, T, alias, true, s); CK(cudaStreamSynchronize(s));
                     const auto g = snap(T, alias);
-                    for (size_t k = 0; k < ref.size(); ++k) for (size_t j = 0; j < ref[k].size(); ++j) tot += ref[k][j] != g[k][j];
+                    for (size_t k = 0; k < ref.size(); ++k) for (size_t j = 0; j < ref[k].size(); ++j) { const size_t d = ref[k][j] != g[k][j]; tot += d; perk[k] += d; }
                     if (it == 0) got[T] = g;
                 }
             }
@@ -265,6 +268,7 @@ int main(int argc, char** argv) {
             for (int T = 1; T < TM; ++T)   // the recurrence's q8_1 rows (token-major)
                 for (size_t j = 0; j < (size_t) T * (ZV / 32) * 36; ++j) prefix += got[T][outs.size()][j] != got[TM][outs.size()][j];
             std::printf("types %2d/%2d/%2d %s: T1-T4 x%d vs today's kernels %zu differing bytes, T-prefix %zu\n", w.tq, w.tz, w.to, alias ? "yq in xq" : "yq apart", iters, tot, prefix);
+            if (tot) { std::printf("  differing bytes by output:"); for (size_t k = 0; k < ref_names_n(outs.size()); ++k) std::printf(" %s %zu", k < outs.size() ? outs[k].name : "yq", perk[k]); std::printf("\n"); }
             bad += (int) (tot + prefix);
         }
     }

@@ -196,7 +196,8 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
         pfence();
         STP(true, ST_OUT_REQ0);
         mbar_expect_tx(&P.ofull, 16 * P.geo.orb);
-        for (int r = 0; r < 16; ++r) bulk_w2s(sm + r * P.geo.ors, P.lwo + (size_t) (b * 16 + r) * P.geo.orb, P.geo.orb, &P.ofull);
+        for (int r = 0; r < 16; ++r) bulk_w2s(sm + r * P.geo.ors, P.lwo + (size_t) (b * 16 + r) * P.geo.orow, P.geo.orb, &P.ofull);
+        if constexpr (FO == 8) for (int r = 0; r < 16; ++r) pf_l2(P.lwo + (size_t) (b * 16 + r) * P.geo.orow + P.geo.orb, P.geo.orow - P.geo.orb);   // the row tails
         STP(true, ST_OUT_REQ1);
     }
     // ======== rec (48 CTAs, head = b - R_CTA0; rec_rank's code with RecS)
@@ -275,7 +276,8 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
             pfence();
             STP(true, ST_OUT_REQ0);
             mbar_expect_tx(&P.ofull, 16 * P.geo.orb);
-            for (int r = 0; r < 16; ++r) bulk_w2s(sm + r * P.geo.ors, P.lwo + (size_t) (b * 16 + r) * P.geo.orb, P.geo.orb, &P.ofull);
+            for (int r = 0; r < 16; ++r) bulk_w2s(sm + r * P.geo.ors, P.lwo + (size_t) (b * 16 + r) * P.geo.orow, P.geo.orb, &P.ofull);
+            if constexpr (FO == 8) for (int r = 0; r < 16; ++r) pf_l2(P.lwo + (size_t) (b * 16 + r) * P.geo.orow + P.geo.orb, P.geo.orow - P.geo.orb);   // the row tails
             STP(true, ST_OUT_REQ1);
         }
         float wsum_t = 0.0f;
@@ -343,57 +345,108 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
         MW(&P.ofull, PB_OW);
         STP(tid == 0, ST_OFULL);
         const uint8_t* slot = reinterpret_cast<const uint8_t*>(sm);
-        for (int lw = wp; lw < O_NLW; lw += 16) {
-            const int hb = lw & 3, sbi = hb >> 1, n = hb & 1;
-            const uint8_t* rowA = slot + g * ors + sbi * osb;
-            const uint8_t* rowB = slot + (g + 8) * ors + sbi * osb;
-            float acc[4] = {0.f, 0.f, 0.f, 0.f};
-            XFrag xf[2];
+        if constexpr (FO == 8) {
+            // Q8_0: the warp order of the one-kernel projection it replaces (dense_tc's 1024-value chunks over two warp
+            // groups): warp 4 * ks + hb adds its half super-block of the 512-value chunks 2 j + ks in order
+            if (wp < 8) {
+                const int hb = wp & 3, ks = wp >> 2, sbi = hb >> 1, n = hb & 1;
+                const uint8_t* rowA = slot + g * ors + sbi * osb;
+                const uint8_t* rowB = slot + (g + 8) * ors + sbi * osb;
+                float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll 1
+                for (int j = 0; j < O_NIN / 1024; ++j) {
+                    const int cch = 2 * j + ks;
+                    XFrag xf;
 #pragma unroll
-            for (int cc = 0; cc < 2; ++cc) {
-                const int cch = (lw >> 2) + cc * (O_NLW / 4);
+                    for (int k4 = 0; k4 < 4; ++k4) {
+                        const int k = 16 * cch + 4 * hb + k4;
+                        xf.b0[k4] = xf.b1[k4] = 0;
+                        if (g < T) {
+                            const uint8_t* xb = xsm + ((size_t) g * nb32 + k) * kQ81;
+                            if (oxs) {
+                                xf.b0[k4] = *(reinterpret_cast<const unsigned int*>(xb + 4) + t);
+                                xf.b1[k4] = *(reinterpret_cast<const unsigned int*>(xb + 20) + t);
+                            } else {
+                                xf.b0[k4] = ldca32(xb + 4 + 4 * t);
+                                xf.b1[k4] = ldca32(xb + 20 + 4 * t);
+                            }
+                        }
 #pragma unroll
-                for (int k4 = 0; k4 < 4; ++k4) {
-                    const int k = 16 * cch + 4 * hb + k4;
-                    xf[cc].b0[k4] = xf[cc].b1[k4] = 0;
-                    if (g < T) {
-                        const uint8_t* xb = xsm + ((size_t) g * nb32 + k) * kQ81;
-                        if (oxs) {
-                            xf[cc].b0[k4] = *(reinterpret_cast<const unsigned int*>(xb + 4) + t);
-                            xf[cc].b1[k4] = *(reinterpret_cast<const unsigned int*>(xb + 20) + t);
-                        } else {
-                            xf[cc].b0[k4] = ldca32(xb + 4 + 4 * t);
-                            xf[cc].b1[k4] = ldca32(xb + 20 + 4 * t);
+                        for (int e2 = 0; e2 < 2; ++e2) {
+                            const int col = 2 * t + e2;
+                            const uint8_t* xd = xsm + ((size_t) col * nb32 + k) * kQ81;
+                            xf.d8[k4][e2] = col < T ? (oxs ? __low2float(*reinterpret_cast<const half2*>(xd)) : __half2float(__ushort_as_half(ldca16(xd)))) : 0.0f;
                         }
                     }
-#pragma unroll
-                    for (int e2 = 0; e2 < 2; ++e2) {
-                        const int col = 2 * t + e2;
-                        const uint8_t* xd = xsm + ((size_t) col * nb32 + k) * kQ81;
-                        xf[cc].d8[k4][e2] = col < T ? (oxs ? __low2float(*reinterpret_cast<const half2*>(xd)) : __half2float(__ushort_as_half(ldca16(xd)))) : 0.0f;
+                    constexpr int SB = Fmt<8>::SB;
+                    const uint8_t* pp[2] = {rowA + cch * 2 * SB, rowB + cch * 2 * SB};
+                    if (cch >= O_Q8_SMEM_CH) {   // past the smem part: this CTA's rows in the weights (prefetched to L2)
+                        const uint8_t* gw = P.lwo + (size_t) (b * 16) * P.geo.orow + sbi * osb + cch * 2 * SB;
+                        pp[0] = gw + (size_t) g * P.geo.orow; pp[1] = gw + (size_t) (g + 8) * P.geo.orow;
                     }
+                    half_sb_terms<8>(acc, pp, n, t, xf, 0u, 0u, 0u, 0u, P.grid);
+                }
+                float* rw = red + wp * 16 * RC;
+                if (2 * t + 1 < RC) {
+                    rw[g * RC + 2 * t] = acc[0];
+                    rw[g * RC + 2 * t + 1] = acc[1];
+                    rw[(g + 8) * RC + 2 * t] = acc[2];
+                    rw[(g + 8) * RC + 2 * t + 1] = acc[3];
                 }
             }
-            by_to<FO>(P.geo.to, [&](auto TY) {
-                constexpr int TT = decltype(TY)::value, SB = Fmt<TT>::SB;
-                uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
-                if constexpr (TT == 23) {
-                    const uint32_t* tbl = reinterpret_cast<const uint32_t*>(dtc_iq4nl);
-                    t0 = tbl[0]; t1 = tbl[1]; t2 = tbl[2]; t3 = tbl[3];
-                }
-#pragma unroll
+        } else {
+            for (int lw = wp; lw < O_NLW; lw += 16) {
+                const int hb = lw & 3, sbi = hb >> 1, n = hb & 1;
+                const uint8_t* rowA = slot + g * ors + sbi * osb;
+                const uint8_t* rowB = slot + (g + 8) * ors + sbi * osb;
+                float acc[4] = {0.f, 0.f, 0.f, 0.f};
+                XFrag xf[2];
+    #pragma unroll
                 for (int cc = 0; cc < 2; ++cc) {
                     const int cch = (lw >> 2) + cc * (O_NLW / 4);
-                    const uint8_t* const pp[2] = {rowA + cch * 2 * SB, rowB + cch * 2 * SB};
-                    half_sb_terms<TT>(acc, pp, n, t, xf[cc], t0, t1, t2, t3, P.grid);
+    #pragma unroll
+                    for (int k4 = 0; k4 < 4; ++k4) {
+                        const int k = 16 * cch + 4 * hb + k4;
+                        xf[cc].b0[k4] = xf[cc].b1[k4] = 0;
+                        if (g < T) {
+                            const uint8_t* xb = xsm + ((size_t) g * nb32 + k) * kQ81;
+                            if (oxs) {
+                                xf[cc].b0[k4] = *(reinterpret_cast<const unsigned int*>(xb + 4) + t);
+                                xf[cc].b1[k4] = *(reinterpret_cast<const unsigned int*>(xb + 20) + t);
+                            } else {
+                                xf[cc].b0[k4] = ldca32(xb + 4 + 4 * t);
+                                xf[cc].b1[k4] = ldca32(xb + 20 + 4 * t);
+                            }
+                        }
+    #pragma unroll
+                        for (int e2 = 0; e2 < 2; ++e2) {
+                            const int col = 2 * t + e2;
+                            const uint8_t* xd = xsm + ((size_t) col * nb32 + k) * kQ81;
+                            xf[cc].d8[k4][e2] = col < T ? (oxs ? __low2float(*reinterpret_cast<const half2*>(xd)) : __half2float(__ushort_as_half(ldca16(xd)))) : 0.0f;
+                        }
+                    }
                 }
-            });
-            float* rw = red + lw * 16 * RC;
-            if (2 * t + 1 < RC) {
-                rw[g * RC + 2 * t] = acc[0];
-                rw[g * RC + 2 * t + 1] = acc[1];
-                rw[(g + 8) * RC + 2 * t] = acc[2];
-                rw[(g + 8) * RC + 2 * t + 1] = acc[3];
+                by_to<FO>(P.geo.to, [&](auto TY) {
+                    constexpr int TT = decltype(TY)::value, SB = Fmt<TT>::SB;
+                    uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+                    if constexpr (TT == 23) {
+                        const uint32_t* tbl = reinterpret_cast<const uint32_t*>(dtc_iq4nl);
+                        t0 = tbl[0]; t1 = tbl[1]; t2 = tbl[2]; t3 = tbl[3];
+                    }
+    #pragma unroll
+                    for (int cc = 0; cc < 2; ++cc) {
+                        const int cch = (lw >> 2) + cc * (O_NLW / 4);
+                        const uint8_t* const pp[2] = {rowA + cch * 2 * SB, rowB + cch * 2 * SB};
+                        half_sb_terms<TT>(acc, pp, n, t, xf[cc], t0, t1, t2, t3, P.grid);
+                    }
+                });
+                float* rw = red + lw * 16 * RC;
+                if (2 * t + 1 < RC) {
+                    rw[g * RC + 2 * t] = acc[0];
+                    rw[g * RC + 2 * t + 1] = acc[1];
+                    rw[(g + 8) * RC + 2 * t] = acc[2];
+                    rw[(g + 8) * RC + 2 * t + 1] = acc[3];
+                }
             }
         }
         cbar();
@@ -402,15 +455,20 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
             if (col < T) {
                 constexpr int WS = 16 * RC;
                 const float* rr2 = red + row * RC + col;
-                float h[4];
+                float bov;
+                if constexpr (FO == 8) {   // ((hb0 + hb1) + hb2) + hb3 per warp group, then the groups
+                    bov = (((rr2[0] + rr2[WS]) + rr2[2 * WS]) + rr2[3 * WS]) + (((rr2[4 * WS] + rr2[5 * WS]) + rr2[6 * WS]) + rr2[7 * WS]);
+                } else {
+                    float h[4];
 #pragma unroll
-                for (int q = 0; q < 4; ++q) {
-                    float v = rr2[q * WS];
+                    for (int q = 0; q < 4; ++q) {
+                        float v = rr2[q * WS];
 #pragma unroll
-                    for (int j = 1; j < O_NLW / 4; ++j) v += rr2[(4 * j + q) * WS];
-                    h[q] = v;
+                        for (int j = 1; j < O_NLW / 4; ++j) v += rr2[(4 * j + q) * WS];
+                        h[q] = v;
+                    }
+                    bov = (h[0] + h[1]) + (h[2] + h[3]);
                 }
-                const float bov = (h[0] + h[1]) + (h[2] + h[3]);
                 P.lbo[(size_t) col * O_NOUT + b * 16 + row] = bov;
             }
         }
@@ -442,11 +500,17 @@ MidDev& mid_dev() {
 
 constexpr int kMidCtas = R_CTA0 + R_HV;
 using MFn = void (*)(MP);
-bool type_ok(int t) { return t == 12 || t == 13 || t == 14 || t == 21 || t == 23; }
+bool type_ok(int t) { return t == 8 || t == 12 || t == 13 || t == 14 || t == 21 || t == 23; }
+// Q8_0 has its own instance: all three types Q8_0, not the stamping build
+bool types_ok(const MidChainArgs& a) {
+    if (!type_ok(a.type_q) || !type_ok(a.type_z) || !type_ok(a.type_o)) return false;
+    const int n8 = (a.type_q == 8) + (a.type_z == 8) + (a.type_o == 8);
+    return n8 == 0 || (n8 == 3 && a.stamps == nullptr);
+}
 
 // One kernel per (window rows, projection types) for the projection type triples of the packs, and the generic one (the
 // types picked at run time) for any other.
-#define MID_TRIPLES X(14, 14, 14) X(23, 21, 12)
+#define MID_TRIPLES X(14, 14, 14) X(23, 21, 12) X(8, 8, 8)
 template <int T>
 MFn mid_pick_t(int q, int z, int o) {
 #define X(a, b, c) if (q == a && z == b && o == c) return k_mid<T, a, b, c, false>;
@@ -505,7 +569,7 @@ int mid_chain_ring_slots(int type_q, int type_z, int type_o) { return make_geo(t
 
 bool mid_chain_supported(const MidChainArgs& a) {
     const MidDev& d = mid_dev();
-    return d.ok && a.T >= 1 && a.T <= kMidChainMaxT && type_ok(a.type_q) && type_ok(a.type_z) && type_ok(a.type_o) &&
+    return d.ok && a.T >= 1 && a.T <= kMidChainMaxT && types_ok(a) &&
            a.xq != nullptr && a.bo != nullptr && a.rec.yq != nullptr && a.rec.qkv != nullptr && a.rec.z != nullptr &&
            ((uintptr_t) a.wq & 15) == 0 && ((uintptr_t) a.wz & 15) == 0 && ((uintptr_t) a.wo & 15) == 0 &&
            ((uintptr_t) a.rec.state & 15) == 0 && ((uintptr_t) a.xq & 3) == 0 && a.rec.n_embd == 2560 && a.rec.h_v == R_HV &&
