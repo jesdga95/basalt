@@ -3,7 +3,7 @@
 // programmatic dependent launch, is compared), with real geometry, random inputs and every projection-type triple of the
 // packs, the recurrence's q8_1 output aliasing the read's rows as the engine has it and apart; a token's outputs must not
 // depend on the window width (a T-row launch against its T'-row prefix); the projections against a double-precision CPU
-// reference (Q6_K); then the time per layer with the weights hot in L2 and cold (distinct weights over more layers than
+// reference (Q6_K and Q8_0); then the time per layer with the weights hot in L2 and cold (distinct weights over more layers than
 // L2 holds), next to the three kernels, in a graph with PDL.  The replaced kernels are checked against CPU references by
 // dense_tc_parity and dec_gdn_parity.
 //
@@ -67,6 +67,14 @@ std::vector<uint8_t> rand_type_host(int type, size_t nb, std::mt19937& r) {
         else { std::memcpy(&w[k * sb], &h, 2); if (type == 12 || type == 13) std::memcpy(&w[k * sb + 2], &h2, 2); }
     }
     return w;
+}
+// one Q8_0 super-block (eight blocks of a half scale and 32 values)'s 256 values
+void deq_q80(const uint8_t* b, float* y) {
+    for (int j = 0; j < 8; ++j) {
+        uint16_t dh;
+        std::memcpy(&dh, b + 34 * j, 2);
+        for (int i = 0; i < 32; ++i) y[32 * j + i] = half_to_float(dh) * (int8_t) b[34 * j + 2 + i];
+    }
 }
 // one Q6_K super-block's 256 values
 void deq_q6k(const uint8_t* b, float* y) {
@@ -240,7 +248,7 @@ int main(int argc, char** argv) {
                                                      {13, 12, 14}, {13, 13, 14}, {13, 14, 13}, {14, 12, 12}, {14, 13, 12}, {14, 13, 14}, {14, 14, 13}, {14, 23, 13}, {14, 23, 14}, {23, 14, 14},
                                                      {21, 21, 21}, {8, 8, 8}};
     std::vector<Layer> layers;
-    for (const auto& t : triples) layers.push_back(make_layer(t[0], t[1], t[2], t[0] == 14 && t[1] == 14 && t[2] == 14));
+    for (const auto& t : triples) layers.push_back(make_layer(t[0], t[1], t[2], (t[0] == 14 && t[1] == 14 && t[2] == 14) || (t[0] == 8 && t[1] == 8 && t[2] == 8)));
     for (size_t l = 0; l < layers.size(); ++l) {
         const Layer& w = layers[l];
         if (!K::mid_chain_supported(mid_args(w, 1, true))) { std::printf("types %d/%d/%d: not supported by the mid chain\n", w.tq, w.tz, w.to); ++bad; continue; }
@@ -273,9 +281,11 @@ int main(int argc, char** argv) {
         }
     }
 
-    // the projections against a double-precision CPU reference (Q6_K), from the q8_1 rows the kernels read
-    {
-        const Layer& w = layers[0];
+    // the projections against a double-precision CPU reference (Q6_K, then the Q8_0 triple), from the q8_1 rows the kernels read
+    for (const size_t li : {(size_t) 0, layers.size() - 1}) {
+        const Layer& w = layers[li];
+        const bool q8 = w.tq == 8;
+        const int sbb = q8 ? 272 : 210;
         const int T = 3;
         reset(); run(w, T, true, true, s); CK(cudaStreamSynchronize(s));
         std::vector<uint8_t> xq((size_t) T * (N / 32) * 36);
@@ -295,7 +305,7 @@ int main(int argc, char** argv) {
             y.assign(rows, 0.0);
             std::vector<float> row(nin);
             for (int r = 0; r < rows; ++r) {
-                for (int k = 0; k < nin / 256; ++k) deq_q6k(&wt[((size_t) r * (nin / 256) + k) * 210], &row[k * 256]);
+                for (int k = 0; k < nin / 256; ++k) { const uint8_t* sbp = &wt[((size_t) r * (nin / 256) + k) * sbb]; if (q8) deq_q80(sbp, &row[k * 256]); else deq_q6k(sbp, &row[k * 256]); }
                 double a = 0; for (int i = 0; i < nin; ++i) a += (double) row[i] * x[i];
                 y[r] = a;
             }
@@ -317,19 +327,21 @@ int main(int argc, char** argv) {
             proj(w.ho, 2560, NO_IN, yq, t, y);
             for (int r = 0; r < 2560; ++r) { e_o = std::max(e_o, std::fabs(y[r] - bo[(size_t) t * N + r])); n_o = std::max(n_o, std::fabs(y[r])); }
         }
-        std::printf("CPU double reference (Q6_K, T=3, vs the q8_1 rows the kernel reads): max abs error qkv %.3g (max |y| %.3g), z %.3g (%.3g), out %.3g (%.3g)\n", e_q, n_q, e_z, n_z, e_o, n_o);
+        std::printf("CPU double reference (%s, T=3, vs the q8_1 rows the kernel reads): max abs error qkv %.3g (max |y| %.3g), z %.3g (%.3g), out %.3g (%.3g)\n", q8 ? "Q8_0" : "Q6_K", e_q, n_q, e_z, n_z, e_o, n_o);
         if (e_q > 1e-3 * n_q || e_z > 1e-3 * n_z || e_o > 1e-3 * n_o) { std::printf("CPU reference: too far\n"); ++bad; }
     }
 
     // time per layer: hot (one layer repeated) and cold (distinct weights over more layers than L2 holds), in a graph of
     // `nl` layers with PDL; the middle is the three kernels, mid_chain, nothing (the two reads alone), the pair alone of
     // each (the risk gate's pair phase)
-    {
+    for (const int tt : {14, 8}) {
         const int T = 3;
         const int NCOLD = 48;
         std::vector<Layer> cold;
-        for (int i = 0; i < NCOLD; ++i) cold.push_back(make_layer(14, 14, 14, false));
-        const double bytes = (double) NQ * 10 * sb_bytes(14) + (double) NZ * 10 * sb_bytes(14) + 2560.0 * (NO_IN / 256) * sb_bytes(14);
+        for (int i = 0; i < NCOLD; ++i) cold.push_back(make_layer(tt, tt, tt, false));
+        const Layer& hot = tt == 8 ? layers.back() : layers[0];
+        std::printf("%s triple:\n", tt == 8 ? "Q8_0" : "Q6_K");
+        const double bytes = (double) NQ * 10 * sb_bytes(tt) + (double) NZ * 10 * sb_bytes(tt) + 2560.0 * (NO_IN / 256) * sb_bytes(tt);
         const double state_bytes = (double) S * HV * S * 4 + (double) C * 3 * 4;
         cudaEvent_t e0, e1;
         CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
@@ -354,7 +366,7 @@ int main(int argc, char** argv) {
             K::hc_fused_read(hcargs(1, T), st);
         };
         for (int cold_run = 0; cold_run < 2; ++cold_run) {
-            const std::vector<Layer>& set = cold_run ? cold : std::vector<Layer>(NCOLD, layers[0]);
+            const std::vector<Layer>& set = cold_run ? cold : std::vector<Layer>(NCOLD, hot);
             double us[5] = {};
             for (int m = 0; m < 5; ++m) {
                 reset();
