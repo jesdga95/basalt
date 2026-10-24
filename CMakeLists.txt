@@ -615,6 +615,13 @@ target_include_directories(gdn_head_split_parity PRIVATE ${_gpu_include_director
 target_link_libraries(gdn_head_split_parity PRIVATE kernels artifact ${_gpu_runtime_target})
 basalt_gpu_test(NAME gdn_head_split_parity COMMAND gdn_head_split_parity)
 set_tests_properties(gdn_head_split_parity PROPERTIES SKIP_RETURN_CODE 77)
+# the peer table update by kernel and the counter zeroing against the span copy and memset they replace, bitwise
+# (GPU, synthetic, no model; --bench times each behind a burst of expert copies on another stream)
+add_executable(dm_table_put_parity src/kernels/dm_table_put_parity.cpp)
+target_include_directories(dm_table_put_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(dm_table_put_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME dm_table_put_parity COMMAND dm_table_put_parity)
+set_tests_properties(dm_table_put_parity PROPERTIES SKIP_RETURN_CODE 77)
 # dense_tc (DEC_DTC) against native_mmvq: its columns' T contract bitwise, its error vs the dp4a kernels
 add_executable(dense_tc_parity src/kernels/dense_tc_parity.cpp)
 target_include_directories(dense_tc_parity PRIVATE ${_gpu_include_directories})

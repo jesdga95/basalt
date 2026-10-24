@@ -159,6 +159,7 @@ struct DecMoe {
     size_t pin_stride = 0;
     int pin_i = 0;
     static constexpr int kPinSlots = 8;
+    std::vector<uint32_t> put_i;             ///< dm_sync: the peer entries that changed
 };
 
 namespace {
@@ -596,6 +597,7 @@ bool Verifier::dm_init(std::string& err) {
         }
         d->pblocks = dec_moe_peer_blocks(d->pq2);
         ok = d->pblocks > 0 && cudaStreamCreateWithFlags(&d->ps, cudaStreamNonBlocking) == cudaSuccess &&
+             basalt::kernels::dec_moe_table_load(d->ps) &&
              cudaMalloc((void**) &d->ptab, (size_t) LE * 8) == cudaSuccess &&
              cudaMemset(d->ptab, 0, (size_t) LE * 8) == cudaSuccess &&
              cudaMalloc((void**) &d->lay, ls.size() * sizeof(NativeExpertLayout)) == cudaSuccess &&
@@ -638,6 +640,7 @@ bool Verifier::dm_init(std::string& err) {
                 const OnDevice onx(x.dev);
                 x.pblocks = std::max(1, dec_moe_peer_blocks(d->pq2) / sharing(x.dev));
                 ok = ok && cudaStreamCreateWithFlags(&x.ps, cudaStreamNonBlocking) == cudaSuccess &&
+                     basalt::kernels::dec_moe_table_load(x.ps) &&
                      cudaMalloc((void**) &x.ptab, (size_t) LE * 8) == cudaSuccess &&
                      cudaMemset(x.ptab, 0, (size_t) LE * 8) == cudaSuccess &&
                      cudaMalloc((void**) &x.lay, ls.size() * sizeof(NativeExpertLayout)) == cudaSuccess &&
@@ -727,7 +730,20 @@ bool Verifier::dm_sync(std::string& err) {
             return false;
         }
     }
-    if (d->pdev >= 0 && span(peer_->residency().data(), d->shadow1, a, b)) {
+    std::vector<uint32_t>& ch = d->put_i;
+    ch.clear();
+    if (d->pdev >= 0) {
+        const int32_t* now = peer_->residency().data();
+        if (std::memcmp(now, d->shadow1.data(), LE * 4) != 0)
+            for (size_t i = 0; i < LE; ++i)
+                if (now[i] != d->shadow1[i]) ch.push_back((uint32_t) i);
+        if (!ch.empty()) {
+            a = ch.front();
+            b = (size_t) ch.back() + 1;
+            std::memcpy(d->shadow1.data() + a, now + a, (b - a) * 4);
+        }
+    }
+    if (!ch.empty()) {
         decode_events().tag(1u << 5);
         const int32_t* src = d->shadow1.data() + a;
         if (pin) { std::memcpy(pin_res1 + a, src, (b - a) * 4); src = pin_res1 + a; }
@@ -735,31 +751,77 @@ bool Verifier::dm_sync(std::string& err) {
             err = "verify: device-planned MoE peer residency upload";
             return false;
         }
-        std::vector<unsigned long long> pv;
-        unsigned long long* p = pin_ptab1 + a;
-        if (!pin) { pv.resize(b - a); p = pv.data(); }
-        for (size_t i = a; i < b; ++i)
-            p[i - a] = d->shadow1[i] >= 0 ? (unsigned long long) peer_->slot_address(d->shadow1[i]) : 0ull;
+        auto addr = [&](size_t i) {
+            return d->shadow1[i] >= 0 ? (unsigned long long) peer_->slot_address(d->shadow1[i]) : 0ull;
+        };
         const OnDevice on(d->pdev);
-        if (cudaMemcpyAsync(d->ptab + a, p, (b - a) * 8, cudaMemcpyHostToDevice, d->ps) != cudaSuccess) {
-            err = "verify: device-planned MoE peer table upload";
-            return false;
+        if (ch.size() > (size_t) basalt::kernels::kDmTablePutMax * 4) {   // a wholesale change (the first window)
+            std::vector<unsigned long long> pv;
+            unsigned long long* p = pin_ptab1 + a;
+            if (!pin) { pv.resize(b - a); p = pv.data(); }
+            for (size_t i = a; i < b; ++i) p[i - a] = addr(i);
+            if (cudaMemcpyAsync(d->ptab + a, p, (b - a) * 8, cudaMemcpyHostToDevice, d->ps) != cudaSuccess) {
+                err = "verify: device-planned MoE peer table upload";
+                return false;
+            }
+        } else {
+            // the changed entries ride in kernel arguments: the peer window behind them on the stream never waits
+            // for the refill copies queued ahead of it on the card's copy engine
+            basalt::kernels::DmTablePut tp;
+            tp.tab = d->ptab;
+            for (size_t k = 0; k < ch.size(); k += (size_t) basalt::kernels::kDmTablePutMax) {
+                tp.n = (int) std::min(ch.size() - k, (size_t) basalt::kernels::kDmTablePutMax);
+                for (int j = 0; j < tp.n; ++j) {
+                    tp.idx[j] = ch[k + (size_t) j];
+                    tp.val[j] = addr(ch[k + (size_t) j]);
+                }
+                if (!basalt::kernels::dec_moe_table_put(tp, d->ps)) {
+                    err = "verify: device-planned MoE peer table update";
+                    return false;
+                }
+            }
         }
     }
     // further peers: pageable sources, so each copy has taken its bytes when the call returns
     for (DecMoe::XPeer& x : d->xp) {
-        if (!span(x.peer->residency().data(), x.shadow, a, b)) continue;
+        ch.clear();
+        const int32_t* now = x.peer->residency().data();
+        if (std::memcmp(now, x.shadow.data(), LE * 4) != 0)
+            for (size_t i = 0; i < LE; ++i)
+                if (now[i] != x.shadow[i]) ch.push_back((uint32_t) i);
+        if (ch.empty()) continue;
+        a = ch.front();
+        b = (size_t) ch.back() + 1;
+        std::memcpy(x.shadow.data() + a, now + a, (b - a) * 4);
         if (cudaMemcpyAsync(x.res + a, x.shadow.data() + a, (b - a) * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
             err = "verify: device-planned MoE residency upload of a further peer";
             return false;
         }
-        std::vector<unsigned long long> pv(b - a);
-        for (size_t i = a; i < b; ++i)
-            pv[i - a] = x.shadow[i] >= 0 ? (unsigned long long) x.peer->slot_address(x.shadow[i]) : 0ull;
+        auto addr = [&](size_t i) {
+            return x.shadow[i] >= 0 ? (unsigned long long) x.peer->slot_address(x.shadow[i]) : 0ull;
+        };
         const OnDevice on(x.dev);
-        if (cudaMemcpyAsync(x.ptab + a, pv.data(), (b - a) * 8, cudaMemcpyHostToDevice, x.ps) != cudaSuccess) {
-            err = "verify: device-planned MoE table upload of a further peer";
-            return false;
+        if (ch.size() > (size_t) basalt::kernels::kDmTablePutMax * 4) {   // a wholesale change (the first window)
+            std::vector<unsigned long long> pv(b - a);
+            for (size_t i = a; i < b; ++i) pv[i - a] = addr(i);
+            if (cudaMemcpyAsync(x.ptab + a, pv.data(), (b - a) * 8, cudaMemcpyHostToDevice, x.ps) != cudaSuccess) {
+                err = "verify: device-planned MoE table upload of a further peer";
+                return false;
+            }
+            continue;
+        }
+        basalt::kernels::DmTablePut tp;
+        tp.tab = x.ptab;
+        for (size_t k = 0; k < ch.size(); k += (size_t) basalt::kernels::kDmTablePutMax) {
+            tp.n = (int) std::min(ch.size() - k, (size_t) basalt::kernels::kDmTablePutMax);
+            for (int j = 0; j < tp.n; ++j) {
+                tp.idx[j] = ch[k + (size_t) j];
+                tp.val[j] = addr(ch[k + (size_t) j]);
+            }
+            if (!basalt::kernels::dec_moe_table_put(tp, x.ps)) {
+                err = "verify: device-planned MoE table update of a further peer";
+                return false;
+            }
         }
     }
     return true;
@@ -3349,7 +3411,7 @@ bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
             pa.mxq_m = gs_h_xq_; pa.mxq = gs_pxq_;
             pa.mx_m = gs_h_x_; pa.mixl = gs_mixl_; pa.part_m = gs_h_part_;
         }
-        if (cudaMemsetAsync(dm_->parr, 0, 64, dm_->ps) != cudaSuccess ||
+        if (!basalt::kernels::dec_moe_zero_words(dm_->parr, 16, dm_->ps) ||
             !basalt::kernels::dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps, dm_->pq2)) {
             err = "verify: the peer window did not launch";
             return false;
@@ -3367,7 +3429,7 @@ bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
         pa.n_embd = (int) g_->n_embd; pa.n_ff = (int) basalt::kernels::cpu::expert_layout().fmt[0].n_ff;
         pa.steps = (int) dm_->rings; pa.scratch = x.pscr; pa.arrive = x.parr; pa.diag_m = x.h_w + 32;
         pa.rq = x.rq; pa.rs = x.rs;
-        if (cudaMemsetAsync(x.parr, 0, 64, x.ps) != cudaSuccess ||
+        if (!basalt::kernels::dec_moe_zero_words(x.parr, 16, x.ps) ||
             !basalt::kernels::dec_moe_peer_launch(pa, x.pblocks, x.ps, dm_->pq2)) {
             err = "verify: a further peer's window did not launch";
             return false;

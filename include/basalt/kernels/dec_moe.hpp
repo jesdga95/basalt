@@ -176,6 +176,23 @@ int dec_moe_peer_blocks(bool q2 = false);
 bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 /// Launches the peer window (cooperative) on `stream` of the current device; false on a launch error.
 bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream, bool q2 = false);
+/// Entries one dec_moe_table_put launch carries in its arguments.
+constexpr int kDmTablePutMax = 320;
+/// Changes to a device table of blob addresses: tab[idx[i]] = val[i] for i < n.
+struct DmTablePut {
+    unsigned long long* tab = nullptr;
+    int n = 0, pad = 0;
+    uint32_t idx[kDmTablePutMax];
+    unsigned long long val[kDmTablePutMax];
+};
+/// Applies `a` with a one-block kernel on `stream` of the current device.  The changes travel in the launch's
+/// arguments, so unlike a host-to-device copy the update never queues behind copies on the card's copy engine.
+bool dec_moe_table_put(const DmTablePut& a, void* stream);
+/// Zeroes n (at most 256) words at p with a kernel on `stream` of the current device (no copy engine either).
+bool dec_moe_zero_words(unsigned int* p, int n, void* stream);
+/// Launches both on `stream` with nothing to do, so their code is loaded now: with lazy module loading a first launch
+/// loads it through the copy engine and would wait behind any refill copies queued by then.
+bool dec_moe_table_load(void* stream);
 
 /// DM_WAIT_STATS: per layer, the times of the doorbell, CUDA0's own work done and each tier landed (CUDA0's
 /// clock), summed per peer-entry count and per layer.  Words: [0, 4) the layer's times; kDmStatBucket + 8 b + j for
