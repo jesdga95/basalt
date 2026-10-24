@@ -113,10 +113,28 @@ __device__ __forceinline__ float ab_one(const DecRecArgs& a, const uint4* __rest
     return sp * sa;
 }
 
-// The gated RMS norm of one lane's value (ss: the head's sum of squares) and the q8_1 of its 32-value block.
-__device__ __forceinline__ void norm_q8(const DecRecArgs& a, int t, int head, int rank, int lane, float oc, float ss,
-                                        float gam, float z) {
-    const int value_dim = S * a.h_v, col = rank * 32 + lane;
+// The launch's value head `head` under the head map (dec_gdn.hpp): gh the layer's value head, qh its key head, lq
+// the card's key head, nkl / nvl the card's key and value heads, cl the card's qkv channels.
+struct HeadMap {
+    int gh, qh, lq, nkl, nvl, cl;
+};
+__device__ __forceinline__ HeadMap head_map(const DecRecArgs& a, int head) {
+    HeadMap m;
+    if (a.nk > 0) {
+        m.nkl = a.nk; m.nvl = a.nk * (a.h_v / a.h_k); m.lq = head % a.nk;
+        m.gh = (head / a.nk) * a.h_k + a.k0 + m.lq; m.qh = a.k0 + m.lq;
+        m.cl = (2 * m.nkl + m.nvl) * S;
+    } else {
+        m.nkl = a.h_k; m.nvl = a.h_v; m.lq = head % a.h_k; m.gh = head; m.qh = m.lq; m.cl = a.C;
+    }
+    return m;
+}
+
+// The gated RMS norm of one lane's value (ss: the head's sum of squares) and the q8_1 of its 32-value block; head
+// and nvl are the card's (packed) value head and value-head count.
+__device__ __forceinline__ void norm_q8(const DecRecArgs& a, int t, int head, int nvl, int rank, int lane, float oc,
+                                        float ss, float gam, float z) {
+    const int value_dim = S * nvl, col = rank * 32 + lane;
     const float scale = rsqrtf(ss / (float) S + a.eps);
     const float yv = oc * scale * gam * (1.0f / (1.0f + __expf(-z)));
     if (a.y) a.y[(size_t) t * value_dim + head * S + col] = yv;
@@ -139,7 +157,7 @@ __device__ __forceinline__ float sq32(float v) {
     return q;
 }
 
-// One block of a head's cluster.  `head` = value head, `rank` = its column group.  SPLIT: no cluster and no z; the
+// One block of a head's cluster.  `head` = the launch's value head (head_map), `rank` = its column group.  SPLIT: no cluster and no z; the
 // head's raw output goes to a.o for dec_gdn_rec_norm.
 template<int MAXT, bool SPLIT>
 __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, int rank, RecSmem& sm,
@@ -147,18 +165,20 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     const int rg = threadIdx.x / 32, lane = threadIdx.x % 32, tid = threadIdx.x;
     stamp(a, 0);
     const int col = rank * 32 + lane;
-    const int qh = head % a.h_k;
+    const HeadMap hm = head_map(a, head);
+    const int qh = hm.qh, gh = hm.gh;
     const int qk = S * a.h_k;
-    const int value_dim = S * a.h_v;
-    const int C = a.C;
+    const int value_dim = S * hm.nvl;   // the card's z / output stride
+    const int C = a.C, CL = hm.cl;
     // ---- constants (the state too: the window does not write it)
     float s[RPG];
-    const float* base = a.state + ((size_t) (rg * RPG) * a.h_v + head) * S + col;
+    const float* base = a.state + ((size_t) (rg * RPG) * a.h_v + gh) * S + col;
     const size_t row_stride = (size_t) a.h_v * S;
 #pragma unroll
     for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
     const float* hist = a.state + (size_t) S * a.h_v * S;
-    const int cq = qh * S + tid, ck = qk + qh * S + tid, cv = 2 * qk + head * S + col;
+    const int cq = qh * S + tid, ck = qk + qh * S + tid, cv = 2 * qk + gh * S + col;
+    const int lcq = hm.lq * S + tid, lck = hm.nkl * S + hm.lq * S + tid, lcv = 2 * hm.nkl * S + head * S + col;
     float wq[4], wk[4], wv[4], hq[3], hk[3], hv[3];
 #pragma unroll
     for (int j = 0; j < 4; ++j) { wq[j] = a.conv_w[cq * 4 + j]; wk[j] = a.conv_w[ck * 4 + j]; wv[j] = a.conv_w[cv * 4 + j]; }
@@ -166,12 +186,12 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     for (int j = 0; j < 3; ++j) { hq[j] = hist[cq * 3 + j]; hk[j] = hist[ck * 3 + j]; hv[j] = hist[cv * 3 + j]; }
     for (int i = tid; i < 2 * 32 * NJ; i += S) {   // the alpha/beta rows into shared memory
         const int r = i / (32 * NJ), k = i % (32 * NJ);
-        const uint4* src = reinterpret_cast<const uint4*>((r ? a.w_beta : a.w_alpha) + (size_t) head * a.n_embd) + k;
+        const uint4* src = reinterpret_cast<const uint4*>((r ? a.w_beta : a.w_alpha) + (size_t) gh * a.n_embd) + k;
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"((uint32_t) __cvta_generic_to_shared(&sm.wab[r][k])),
                      "l"(src) : "memory");
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
-    const float dt = a.dt[head], sa = a.ssm_a[head], gam = a.gamma[col];
+    const float dt = a.dt[gh], sa = a.ssm_a[gh], gam = a.gamma[col];
     stamp(a, 1);
     if (a.early_trigger) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");   // the out projection may stage its weights
     // this block has started: the barrier the ranks wait on before writing into each other's shared memory
@@ -193,12 +213,21 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     float xq[MAXT], xk[MAXT], xv[MAXT], zz[MAXT];
 #pragma unroll
     for (int t = 0; t < MAXT; ++t) {
-        xq[t] = t < T ? a.qkv[(size_t) t * C + cq] : 0.0f;
-        xk[t] = t < T ? a.qkv[(size_t) t * C + ck] : 0.0f;
-        xv[t] = t < T && rg == 1 ? a.qkv[(size_t) t * C + cv] : 0.0f;
+        xq[t] = t < T ? a.qkv[(size_t) t * CL + lcq] : 0.0f;
+        xk[t] = t < T ? a.qkv[(size_t) t * CL + lck] : 0.0f;
+        xv[t] = t < T && rg == 1 ? a.qkv[(size_t) t * CL + lcv] : 0.0f;
         zz[t] = t < T && rg == 0 && !SPLIT ? a.z[(size_t) t * value_dim + head * S + col] : 0.0f;
     }
     stamp(a, 3);
+    if (a.qkv_out != nullptr) {   // the raw channels at the full layout, for the commit
+        const bool own_qk = rank == 0 && head < hm.nkl;
+#pragma unroll
+        for (int t = 0; t < MAXT; ++t) {
+            if (t >= T) break;
+            if (own_qk) { a.qkv_out[(size_t) t * C + cq] = xq[t]; a.qkv_out[(size_t) t * C + ck] = xk[t]; }
+            if (rg == 1) a.qkv_out[(size_t) t * C + cv] = xv[t];
+        }
+    }
 
     // ---- conv + SiLU of the head's q and k channels (L2-normalized) and of the block's v columns
     float yq[MAXT], yk[MAXT];
@@ -220,7 +249,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
         }
     }
     __syncthreads();
-    const bool write_qk = rank == 0 && head < a.h_k;
+    const bool write_qk = rank == 0 && head < hm.nkl;
 #pragma unroll
     for (int t = 0; t < MAXT; ++t) {
         if (t >= T) break;
@@ -236,8 +265,8 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
         }
     }
     if (tid < T) {   // the gates, for the commit
-        if (rank == 0) a.gate[(size_t) tid * a.h_v + head] = sm.g[tid];
-        if (rank == 1) a.beta[(size_t) tid * a.h_v + head] = sm.b[tid];
+        if (rank == 0) a.gate[(size_t) tid * a.h_v + gh] = sm.g[tid];
+        if (rank == 1) a.beta[(size_t) tid * a.h_v + gh] = sm.b[tid];
     }
     stamp(a, 4);
     __syncthreads();
@@ -293,7 +322,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
         for (int t = 0; t < MAXT; ++t) {
             if (t >= T) break;
             const float ss = sm.wsum[t][0] + sm.wsum[t][1] + sm.wsum[t][2] + sm.wsum[t][3];
-            norm_q8(a, t, head, rank, lane, sm.oc[t][lane], ss, gam, zz[t]);
+            norm_q8(a, t, head, hm.nvl, rank, lane, sm.oc[t][lane], ss, gam, zz[t]);
         }
     }
     stamp(a, 8);
@@ -337,9 +366,10 @@ __global__ void __launch_bounds__(128) rec_norm_kernel(const DecRecArgs a, int T
     if (a.early_trigger) pdl_launch_dependents();   // the out projection may stage its weights
     pdl_wait();
     const int w = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x % 32;
-    if (w >= T * a.h_v) return;
-    const int t = w / a.h_v, head = w % a.h_v;
-    const size_t base = (size_t) t * S * a.h_v + head * S + lane;
+    const int nvl = a.nk > 0 ? a.nk * (a.h_v / a.h_k) : a.h_v;
+    if (w >= T * nvl) return;
+    const int t = w / nvl, head = w % nvl;
+    const size_t base = (size_t) t * S * nvl + head * S + lane;
     float oc[4], q[4];
 #pragma unroll
     for (int r = 0; r < 4; ++r) oc[r] = a.o[base + 32 * r];
@@ -348,18 +378,26 @@ __global__ void __launch_bounds__(128) rec_norm_kernel(const DecRecArgs a, int T
     const float ss = q[0] + q[1] + q[2] + q[3];
 #pragma unroll
     for (int r = 0; r < 4; ++r)
-        norm_q8(a, t, head, r, lane, oc[r], ss, a.gamma[32 * r + lane], a.z[base + 32 * r]);
+        norm_q8(a, t, head, nvl, r, lane, oc[r], ss, a.gamma[32 * r + lane], a.z[base + 32 * r]);
 }
 
 }  // namespace
 
 #ifndef FZ_DEV_ONLY   // host side: another translation unit (the mid chain) takes only the device code
+// the launch's value heads under the head map; -1 when the map is out of range
+static int mapped_heads(const DecRecArgs& a) {
+    if (a.nk == 0) return a.h_v;
+    if (a.nk < 0 || a.k0 < 0 || a.k0 + a.nk > a.h_k) return -1;
+    return a.nk * (a.h_v / a.h_k);
+}
+
 void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream) {
-    if (n_tok < 1 || n_tok > kDecMaxT || a.n_embd != 32 * 8 * NJ || a.h_k <= 0 || a.h_v % a.h_k != 0) {
+    if (n_tok < 1 || n_tok > kDecMaxT || a.n_embd != 32 * 8 * NJ || a.h_k <= 0 || a.h_v % a.h_k != 0 ||
+        mapped_heads(a) < 1) {
         basalt::log::error("basalt", "dec_gdn_rec: invalid arguments");
         std::exit(1);
     }
-    const dim3 grid((unsigned) (a.h_v * 4)), block(S);
+    const dim3 grid((unsigned) (mapped_heads(a) * 4)), block(S);
     const cudaStream_t s = (cudaStream_t) stream;
     if (n_tok <= 2) launch_pdl(rec_kernel<2>, grid, block, 0, s, a, n_tok);
     else if (n_tok <= 4) launch_pdl(rec_kernel<4>, grid, block, 0, s, a, n_tok);
@@ -370,7 +408,7 @@ void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream) {
 
 void dec_gdn_rec_seg(const DecRecArgs& a, const SegRow* rows, size_t state_off, int n_rows, int max_n, void* stream) {
     if (n_rows < 1 || max_n < 1 || max_n > kDecMaxT || !rows || a.n_embd != 32 * 8 * NJ || a.h_k <= 0 ||
-        a.h_v % a.h_k != 0) {
+        a.h_v % a.h_k != 0 || a.nk != 0) {
         basalt::log::error("basalt", "dec_gdn_rec_seg: invalid arguments");
         std::exit(1);
     }
@@ -384,11 +422,12 @@ void dec_gdn_rec_seg(const DecRecArgs& a, const SegRow* rows, size_t state_off, 
 }
 
 void dec_gdn_rec_split(const DecRecArgs& a, int n_tok, void* stream) {
-    if (n_tok < 1 || n_tok > kDecMaxT || a.n_embd != 32 * 8 * NJ || a.h_k <= 0 || a.h_v % a.h_k != 0 || !a.o) {
+    if (n_tok < 1 || n_tok > kDecMaxT || a.n_embd != 32 * 8 * NJ || a.h_k <= 0 || a.h_v % a.h_k != 0 || !a.o ||
+        mapped_heads(a) < 1) {
         basalt::log::error("basalt", "dec_gdn_rec_split: invalid arguments");
         std::exit(1);
     }
-    const dim3 grid((unsigned) (a.h_v * 4)), block(S);
+    const dim3 grid((unsigned) (mapped_heads(a) * 4)), block(S);
     const cudaStream_t s = (cudaStream_t) stream;
     if (n_tok <= 2) launch_pdl(rec_split_kernel<2>, grid, block, 0, s, a, n_tok);
     else if (n_tok <= 4) launch_pdl(rec_split_kernel<4>, grid, block, 0, s, a, n_tok);
@@ -398,7 +437,7 @@ void dec_gdn_rec_split(const DecRecArgs& a, int n_tok, void* stream) {
 }
 
 void dec_gdn_rec_norm(const DecRecArgs& a, int n_tok, void* stream) {
-    const unsigned blocks = (unsigned) ((n_tok * a.h_v + 3) / 4);
+    const unsigned blocks = (unsigned) ((n_tok * mapped_heads(a) + 3) / 4);
     launch_pdl(rec_norm_kernel, dim3(blocks), dim3(128), 0, (cudaStream_t) stream, a, n_tok);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { basalt::log::error("basalt", "dec_gdn_rec_norm: %s", cudaGetErrorString(e)); std::exit(1); }

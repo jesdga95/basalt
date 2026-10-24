@@ -319,7 +319,7 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
             for (int t = 0; t < XT; ++t) {
                 if (t >= T) break;
                 const float ss = RS_.wsum[t][0] + RS_.wsum[t][1] + RS_.wsum[t][2] + RS_.wsum[t][3];
-                norm_q8(a, t, head, rank, lane, RS_.oc[rank][t][lane], ss, gam, zz[t]);
+                norm_q8(a, t, head, a.h_v, rank, lane, RS_.oc[rank][t][lane], ss, gam, zz[t]);
             }
         }
         cbar();
@@ -573,7 +573,7 @@ bool mid_chain_supported(const MidChainArgs& a) {
            a.xq != nullptr && a.bo != nullptr && a.rec.yq != nullptr && a.rec.qkv != nullptr && a.rec.z != nullptr &&
            ((uintptr_t) a.wq & 15) == 0 && ((uintptr_t) a.wz & 15) == 0 && ((uintptr_t) a.wo & 15) == 0 &&
            ((uintptr_t) a.rec.state & 15) == 0 && ((uintptr_t) a.xq & 3) == 0 && a.rec.n_embd == 2560 && a.rec.h_v == R_HV &&
-           a.rec.h_k == R_HK && a.rec.C == R_C;
+           a.rec.h_k == R_HK && a.rec.C == R_C && a.rec.nk == 0;
 }
 
 void mid_chain(const MidChainArgs& a, void* stream) {

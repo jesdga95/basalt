@@ -10,7 +10,9 @@
 // (qkv, z, h, gate, beta, the q8_1 of y) must equal the whole layer's bit for bit and the state stays untouched;
 // the combined output is compared with the whole layer's (max abs / rel, bit-equal share) and both with a CPU
 // reference in double over the same q8_1 activations (RMS).  The slicing round trip of the state is checked on the
-// CPU.  Real geometry, random weights (random bytes, sane fp16 scales), random activations and state.  With one
+// CPU.  Each rank's heads also run in place on card 0 through dec_gdn_rec's head map (the layer's state and weights,
+// packed qkv/z rows in, h, gates and raw qkv at the full layout, y packed; one-launch and split recurrence): every
+// output equals the whole layer's bit for bit.  Real geometry, random weights (random bytes, sane fp16 scales), random activations and state.  With one
 // card both ranks run on it.
 //
 // --bench: per card, the whole layer and each share's slice as CUDA graphs over eight layers' distinct weights, in
@@ -272,6 +274,74 @@ long long check_slice(const Card& whole, const Card& k, const GdnHeadSlice& g, i
     return d;
 }
 
+// rows `runs` of each of T tokens of a row-major output, packed
+template<typename V>
+std::vector<V> pack_rows(const std::vector<V>& full, size_t row, const std::vector<GdnRun>& runs, int T) {
+    const size_t n = (size_t) basalt::core::gdn_runs_len(runs);
+    std::vector<V> out((size_t) T * n);
+    for (int t = 0; t < T; ++t)
+        basalt::core::gdn_gather_rows(full.data() + (size_t) t * row, sizeof(V), runs, out.data() + (size_t) t * n);
+    return out;
+}
+
+// the slice run in place on the whole layer's card through dec_gdn_rec's head map (rank 0's engine path): the slice's
+// packed qkv/z rows in; the layer's state, conv and gate weights; h, the gates and the raw qkv written at the full
+// layout, y packed.  The one-launch and the split recurrence; bytes that differ from the whole layer's outputs.
+long long check_mapped(const Card& whole, const GdnHeadSlice& g, int T, const std::vector<float>& st0, cudaStream_t s) {
+    using namespace basalt::core;
+    CK(cudaSetDevice(whole.dev));
+    CK(cudaStreamSynchronize(s));
+    const std::vector<GdnRun> qr = gdn_qkv_runs(g), v1 = gdn_vhead_runs(g, 1), vs = gdn_vhead_runs(g, S),
+                              vb = gdn_vhead_runs(g, S / 32);
+    const auto wq = down(whole.qkv, (size_t) T * C), wz = down(whole.z, (size_t) T * ZV), wh = down(whole.h, (size_t) T * C),
+               wg = down(whole.gate, (size_t) T * HV), wb = down(whole.beta, (size_t) T * HV);
+    const auto wy = down((const uint8_t*) whole.yq, (size_t) T * (ZV / 32) * Q81);
+    float* pq = upload(pack_rows(wq, C, qr, T));
+    float* pz = upload(pack_rows(wz, ZV, vs, T));
+    float *h, *ga, *be, *qo, *o;
+    void *y1, *y2;
+    const size_t zv = (size_t) g.zv(), yb = (size_t) T * (zv / 32) * Q81;
+    CK(cudaMalloc(&h, sizeof(float) * T * C)); CK(cudaMalloc(&qo, sizeof(float) * T * C));
+    CK(cudaMalloc(&ga, sizeof(float) * T * HV)); CK(cudaMalloc(&be, sizeof(float) * T * HV));
+    CK(cudaMalloc(&o, sizeof(float) * T * zv)); CK(cudaMalloc(&y1, yb)); CK(cudaMalloc(&y2, yb));
+    long long d = 0;
+    for (int split = 0; split < 2; ++split) {
+        CK(cudaMemsetAsync(h, 0xff, sizeof(float) * T * C, s)); CK(cudaMemsetAsync(qo, 0xff, sizeof(float) * T * C, s));
+        CK(cudaMemsetAsync(ga, 0xff, sizeof(float) * T * HV, s)); CK(cudaMemsetAsync(be, 0xff, sizeof(float) * T * HV, s));
+        void* y = split ? y2 : y1;
+        CK(cudaMemsetAsync(y, 0xff, yb, s));
+        DecRecArgs a;
+        a.state = whole.state; a.qkv = pq; a.conv_w = whole.conv_w; a.x = whole.x; a.w_alpha = whole.wa;
+        a.w_beta = whole.wb; a.dt = whole.dt; a.ssm_a = whole.ssm_a; a.z = pz; a.gamma = whole.gamma; a.h = h;
+        a.gate = ga; a.beta = be; a.yq = y; a.C = C; a.n_embd = N; a.h_k = HK; a.h_v = HV; a.eps = EPS;
+        a.early_trigger = false; a.k0 = g.k0; a.nk = g.nk; a.qkv_out = qo;
+        if (split) {
+            a.o = o;
+            dec_gdn_rec_split(a, T, s);
+            dec_gdn_rec_norm(a, T, s);
+        } else {
+            dec_gdn_rec(a, T, s);
+        }
+        CK(cudaStreamSynchronize(s));
+        const auto mh = pack_rows(down(h, (size_t) T * C), C, qr, T), mq = pack_rows(down(qo, (size_t) T * C), C, qr, T);
+        const auto mg = pack_rows(down(ga, (size_t) T * HV), HV, v1, T), mb = pack_rows(down(be, (size_t) T * HV), HV, v1, T);
+        const auto my = down((const uint8_t*) y, yb);
+        const size_t c = (size_t) g.c(), nv = (size_t) g.nv();
+        d += diff_slice(wh.data(), C * 4, mh.data(), c * 4, 4, qr, T);
+        d += diff_slice(wq.data(), C * 4, mq.data(), c * 4, 4, qr, T);
+        d += diff_slice(wg.data(), HV * 4, mg.data(), nv * 4, 4, v1, T);
+        d += diff_slice(wb.data(), HV * 4, mb.data(), nv * 4, 4, v1, T);
+        d += diff_slice(wy.data(), (ZV / 32) * Q81, my.data(), (zv / 32) * Q81, Q81, vb, T);
+    }
+    if (std::memcmp(down(whole.state, st0.size()).data(), st0.data(), st0.size() * 4) != 0) {
+        std::printf("    state written in place\n");
+        ++d;
+    }
+    for (void* p : {(void*) pq, (void*) pz, (void*) h, (void*) ga, (void*) be, (void*) qo, (void*) o, y1, y2})
+        CK(cudaFree(p));
+    return d;
+}
+
 // the whole layer's out projection in double from its own q8_1 activations
 std::vector<double> cpu_out(const HostLayer& L, const std::vector<uint8_t>& yq, int T) {
     const Fmt& f = fmt(L.to);
@@ -343,6 +413,8 @@ bool parity() {
                 CK(cudaSetDevice(0));
                 CK(cudaStreamSynchronize(s0));
                 const long long d = check_slice(whole, k0, g0, T, L0.state) + check_slice(whole, k1, g1, T, L1.state);
+                // both ranks' heads in place on card 0 through the head map
+                const long long dm = check_mapped(whole, g0, T, L.state, s0) + check_mapped(whole, g1, T, L.state, s0);
                 CK(cudaSetDevice(0));
                 const auto wo = down(whole.out, (size_t) T * N), p0 = down(k0.out, (size_t) T * N);
                 const auto wyq = down((const uint8_t*) whole.yq, (size_t) T * (ZV / 32) * Q81);
@@ -366,11 +438,11 @@ bool parity() {
                 const double rms_s = std::sqrt(se_split / wo.size()), rms_w = std::sqrt(se_whole / wo.size()),
                              rms_r = std::sqrt(se_ref / wo.size());
                 // the split only reorders the out projection's sum: its error against the CPU stays the whole layer's
-                const bool pass = d == 0 && rt && rms_s <= 1.5 * rms_w + 1e-9 && mc_s <= 2.0 * mc_w + 1e-9;
-                std::printf("%-6s %-6s %-6s share %d/8 T=%d: slices %s, state round trip %s; out (RMS %.3g) vs whole max "
+                const bool pass = d == 0 && dm == 0 && rt && rms_s <= 1.5 * rms_w + 1e-9 && mc_s <= 2.0 * mc_w + 1e-9;
+                std::printf("%-6s %-6s %-6s share %d/8 T=%d: slices %s, in place %s, state round trip %s; out (RMS %.3g) vs whole max "
                             "abs %.3g max rel %.3g bit-equal %.0f%%; vs CPU RMS split %.3g whole %.3g, max rel split %.3g "
                             "whole %.3g%s\n",
-                            fmt(cb[0]).name, fmt(cb[1]).name, fmt(cb[2]).name, peer8, T, d == 0 ? "bitwise" : "DIFF",
+                            fmt(cb[0]).name, fmt(cb[1]).name, fmt(cb[2]).name, peer8, T, d == 0 ? "bitwise" : "DIFF", dm == 0 ? "bitwise" : "DIFF",
                             rt ? "ok" : "FAIL", rms_r, max_abs, max_rel, 100.0 * eq / wo.size(), rms_s, rms_w, mc_s, mc_w,
                             pass ? "" : "  FAIL");
                 ok = ok && pass;
