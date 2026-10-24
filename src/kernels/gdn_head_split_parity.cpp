@@ -20,6 +20,7 @@
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/core/gdn_head_split.hpp"
 #include "basalt/kernels/dec_gdn.hpp"
+#include "basalt/kernels/dec_moe.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
 
@@ -342,6 +343,76 @@ long long check_mapped(const Card& whole, const GdnHeadSlice& g, int T, const st
     return d;
 }
 
+template<typename V>
+V* hmap(size_t n) {
+    V* p = nullptr;
+    CK(cudaHostAlloc((void**) &p, n * sizeof(V) + 256, cudaHostAllocMapped | cudaHostAllocPortable));
+    std::memset((void*) p, 0, n * sizeof(V) + 256);
+    return p;
+}
+
+// The peer's mixer item: dm_peer_kernel over one ring with a mixer doorbell and no expert entries, on a slice card's
+// layer (its q8_1 and fp32 rows as CUDA0 publishes them); returns the item's out-projection partial, T rows of N
+std::vector<float> run_peer_item(const Card& k, int T, cudaStream_t s, bool& ok, std::vector<uint8_t>& yq_out) {
+    CK(cudaSetDevice(k.dev));
+    const size_t xq_stride = (size_t) kVerifyMaxT * (N / 32) * Q81;
+    uint8_t* h_xq = hmap<uint8_t>(xq_stride);
+    float* h_x = hmap<float>((size_t) kVerifyMaxT * N);
+    float* h_part = hmap<float>((size_t) kVerifyMaxT * N);
+    uint32_t* h_w = hmap<uint32_t>(64);
+    uint32_t* h_diag = hmap<uint32_t>(kDmDiagWords);
+    DmRing* h_ring = hmap<DmRing>(1);
+    float* h_rows = hmap<float>((size_t) kDmCap * N);
+    CK(cudaMemcpy(h_xq, k.xq, native_q8_1_bytes(N, T), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(h_x, k.x, (size_t) T * N * 4, cudaMemcpyDefault));
+    float *qkv, *z, *h, *ga, *be, *o, *x;
+    void *yq, *mxq, *scr;
+    unsigned int* arr;
+    CK(cudaMalloc(&qkv, sizeof(float) * kDecMaxT * k.c)); CK(cudaMalloc(&h, sizeof(float) * kDecMaxT * k.c));
+    CK(cudaMalloc(&z, sizeof(float) * kDecMaxT * k.zv)); CK(cudaMalloc(&o, sizeof(float) * kDecMaxT * k.zv));
+    CK(cudaMalloc(&ga, sizeof(float) * kDecMaxT * k.hv)); CK(cudaMalloc(&be, sizeof(float) * kDecMaxT * k.hv));
+    CK(cudaMalloc(&x, sizeof(float) * kDecMaxT * N));
+    CK(cudaMalloc(&yq, native_q8_1_bytes(k.zv, kDecMaxT))); CK(cudaMalloc(&mxq, xq_stride));
+    constexpr int kFf = 1024;
+    CK(cudaMalloc(&scr, dec_moe_peer_scratch_bytes(N, kFf)));
+    CK(cudaMalloc(&arr, 64));
+    DmMixLayer m;
+    m.wqkv = k.wqkv; m.wz = k.wz; m.wo = k.wo; m.tq = k.tq; m.tz = k.tz; m.to = k.to;
+    DecRecArgs& r = m.rec;
+    r.state = k.state; r.qkv = qkv; r.conv_w = k.conv_w; r.x = x; r.w_alpha = k.wa; r.w_beta = k.wb; r.dt = k.dt;
+    r.ssm_a = k.ssm_a; r.z = z; r.gamma = k.gamma; r.h = h; r.gate = ga; r.beta = be; r.o = o; r.yq = yq;
+    r.C = k.c; r.n_embd = N; r.h_k = k.hk; r.h_v = k.hv; r.eps = EPS; r.early_trigger = false;
+    DmMixLayer* d_m = upload(std::vector<DmMixLayer>{m});
+    uint8_t* d_mix = upload(std::vector<uint8_t>{1});
+    CK(cudaMemsetAsync(arr, 0, 64, s));
+    h_w[0] = 1u;                                         // the expert ring: no entries for the peer
+    h_w[48] = 1u | (uint32_t) T << 16 | 1u << 30;        // the mixer doorbell with work
+    DmPeerArgs pa;
+    pa.rings_m = h_ring; pa.xq_m = h_xq; pa.xq_stride = xq_stride; pa.seq_m = h_w; pa.done_m = h_w + 16;
+    pa.rows_m = h_rows; pa.n_expert = 512; pa.k = 10; pa.n_embd = N; pa.n_ff = kFf; pa.steps = 1; pa.scratch = scr;
+    pa.arrive = arr; pa.diag_m = h_diag;
+    pa.mix = d_mix; pa.mseq_m = h_w + 48; pa.mdone_m = h_w + 52; pa.mxq_m = h_xq; pa.mxq = mxq;
+    pa.mx_m = h_x; pa.mixl = d_m; pa.part_m = h_part;
+    if (!dec_moe_peer_launch(pa, dec_moe_peer_blocks(false), s, false)) {
+        std::printf("    peer item: no launch\n");
+        ok = false;
+    }
+    CK(cudaStreamSynchronize(s));
+    const std::string dg = dec_moe_peer_diag(h_diag);
+    if (!dg.empty() || h_w[52] != 1u) {
+        std::printf("    peer item: done %u %s\n", h_w[52], dg.c_str());
+        ok = false;
+    }
+    std::vector<float> part(h_part, h_part + (size_t) T * N);
+    yq_out = down((const uint8_t*) yq, (size_t) T * (k.zv / 32) * Q81);
+    for (void* q : {(void*) qkv, (void*) z, (void*) h, (void*) ga, (void*) be, (void*) o, (void*) x, yq, mxq, scr,
+                    (void*) arr, (void*) d_m, (void*) d_mix})
+        CK(cudaFree(q));
+    for (void* q : {(void*) h_xq, (void*) h_x, (void*) h_part, (void*) h_w, (void*) h_diag, (void*) h_ring, (void*) h_rows})
+        CK(cudaFreeHost(q));
+    return part;
+}
+
 // the whole layer's out projection in double from its own q8_1 activations
 std::vector<double> cpu_out(const HostLayer& L, const std::vector<uint8_t>& yq, int T) {
     const Fmt& f = fmt(L.to);
@@ -421,6 +492,29 @@ bool parity() {
                 CK(cudaSetDevice(g_dev1));
                 const auto p1 = down(k1.out, (size_t) T * N);
                 const std::vector<double> ref = cpu_out(L, wyq, T);
+                bool item_ok = true;
+                std::vector<uint8_t> pyq;
+                const std::vector<float> pi = run_peer_item(k1, T, s1, item_ok, pyq);
+                // the item's q8_1 activations against the slice kernels': its projections sum in another order, so a
+                // value at a rounding tie may land one step away
+                CK(cudaSetDevice(g_dev1));
+                const auto kyq = down((const uint8_t*) k1.yq, pyq.size());
+                long long flips = 0, vals = 0;
+                int max_step = 0;
+                for (size_t b = 0; b < pyq.size(); b += Q81)
+                    for (size_t j = 4; j < Q81; ++j) {
+                        ++vals;
+                        const int dq = std::abs((int) (int8_t) pyq[b + j] - (int) (int8_t) kyq[b + j]);
+                        flips += dq != 0;
+                        max_step = std::max(max_step, dq);
+                    }
+                double i_abs = 0, se_item = 0, mc_i = 0;   // the item's partial vs the slice's kernels; combined vs CPU
+                for (size_t i = 0; i < wo.size(); ++i) {
+                    i_abs = std::max(i_abs, std::fabs((double) pi[i] - p1[i]));
+                    const float c = p0[i] + pi[i];
+                    se_item += (c - ref[i]) * (c - ref[i]);
+                    mc_i = std::max(mc_i, std::fabs(c - ref[i]) / (1.0 + std::fabs(ref[i])));
+                }
                 double max_abs = 0, max_rel = 0, se_split = 0, se_whole = 0, se_ref = 0, mc_s = 0, mc_w = 0;
                 long long eq = 0;
                 for (size_t i = 0; i < wo.size(); ++i) {
@@ -438,7 +532,15 @@ bool parity() {
                 const double rms_s = std::sqrt(se_split / wo.size()), rms_w = std::sqrt(se_whole / wo.size()),
                              rms_r = std::sqrt(se_ref / wo.size());
                 // the split only reorders the out projection's sum: its error against the CPU stays the whole layer's
-                const bool pass = d == 0 && dm == 0 && rt && rms_s <= 1.5 * rms_w + 1e-9 && mc_s <= 2.0 * mc_w + 1e-9;
+                const double rms_i = std::sqrt(se_item / wo.size());
+                // exact activations: the whole layer's error against the CPU; otherwise only one-step flips, few
+                const bool pass_i = item_ok && max_step <= 1 && flips * 1000 <= vals &&
+                                    (flips > 0 || (rms_i <= 1.5 * rms_w + 1e-9 && mc_i <= 2.0 * mc_w + 1e-9));
+                const bool pass = d == 0 && dm == 0 && rt && rms_s <= 1.5 * rms_w + 1e-9 && mc_s <= 2.0 * mc_w + 1e-9 && pass_i;
+                std::printf("%-6s %-6s %-6s share %d/8 T=%d: peer item q8_1 flips %lld of %lld (max step %d), partial vs slice "
+                            "kernels max abs %.3g; combined vs CPU RMS %.3g max rel %.3g%s\n",
+                            fmt(cb[0]).name, fmt(cb[1]).name, fmt(cb[2]).name, peer8, T, flips, vals, max_step, i_abs, rms_i,
+                            mc_i, pass_i ? "" : "  FAIL");
                 std::printf("%-6s %-6s %-6s share %d/8 T=%d: slices %s, in place %s, state round trip %s; out (RMS %.3g) vs whole max "
                             "abs %.3g max rel %.3g bit-equal %.0f%%; vs CPU RMS split %.3g whole %.3g, max rel split %.3g "
                             "whole %.3g%s\n",
