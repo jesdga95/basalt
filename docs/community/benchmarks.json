@@ -186,6 +186,66 @@
       "prefill_64k_tps": 3511.3,
       "decode_tps": 187.3,
       "notes": "Swift GSQ-RCO IQ3_S GGUF converted to .basalt (--sections-from a verified pack); single RTX PRO 4000 Blackwell, weights on SATA SSD"
+    },
+    {
+      "submitter": "drakiss79",
+      "date": "2026-10-24",
+      "commit": "588a4776ed",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 500
+        }
+      ],
+      "ram_gib": 62,
+      "os": "Linux",
+      "quant": "IQ3_S",
+      "prefill_16k_tps": 8858.9,
+      "prefill_64k_tps": 9500.8,
+      "decode_tps": 374.8,
+      "notes": "RTX 5090 at a 500 W limit (below the card's 575 W default), 62 GiB DDR5, i9-13900K; 46.8 GiB of experts, 0 SSD spill"
+    },
+    {
+      "submitter": "drakiss79",
+      "date": "2026-10-24",
+      "commit": "588a4776ed",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 500
+        }
+      ],
+      "ram_gib": 62,
+      "os": "Linux",
+      "quant": "IQ3_XXS",
+      "prefill_16k_tps": 8784.2,
+      "prefill_64k_tps": 9326.3,
+      "decode_tps": 564.5,
+      "notes": "RTX 5090 at a 500 W limit (below the card's 575 W default), 62 GiB DDR5, i9-13900K; 40.0 GiB of experts, 0 SSD spill"
+    },
+    {
+      "submitter": "drakiss79",
+      "date": "2026-10-24",
+      "commit": "588a4776ed",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 500
+        }
+      ],
+      "ram_gib": 62,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 9288.7,
+      "prefill_64k_tps": 10095.3,
+      "decode_tps": 305.4,
+      "notes": "RTX 5090 at a 500 W limit (below the card's 575 W default), 62 GiB DDR5, i9-13900K; 63.3 GiB of experts fit beside the VRAM cache with no SSD spill at 62 GiB RAM"
     }
   ]
 }
