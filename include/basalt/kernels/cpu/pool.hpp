@@ -119,6 +119,10 @@ public:
     /// the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
     static constexpr int kMaxSplitMulti = 96;
+    /// Row-range tasks per thread in each phase of the multi-token paths.  The cores differ in speed, so a thread
+    /// that finishes early claims another: the more and smaller the tasks, the shorter the wait for the slowest one
+    /// at the end of a phase, until the claim traffic and the short streams cost more than the tail they remove.
+    static constexpr int kTasksPerThread = 12;
     /// Work for the parked workers between batches (not the host thread): `fn(ctx, worker, workers, stop)` runs once
     /// per worker index and must return soon after `stop` reads true.  Returns at once.  The next batch, `idle_stop`
     /// or the destructor raises `stop` and waits for the workers to park, so the work never overlaps a batch; it must
