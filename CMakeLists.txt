@@ -846,6 +846,13 @@ basalt_embed_manifest(load_summary_test)
 basalt_cpu_test(NAME load_summary_test COMMAND load_summary_test)
 set_tests_properties(load_summary_test PROPERTIES TIMEOUT 60)
 
+# the engine as a child process: an error line in a healthy start does not fail it, an exit before READY does (CPU only)
+add_executable(engine_session_test tests/program/engine_session_test.cpp)
+target_link_libraries(engine_session_test PRIVATE engine_session warnings)
+basalt_embed_manifest(engine_session_test)
+basalt_cpu_test(NAME engine_session_test COMMAND engine_session_test)
+set_tests_properties(engine_session_test PROPERTIES TIMEOUT 60)
+
 # the engine log helper: the line each level renders (CPU only)
 add_executable(log_test tests/core/log_test.cpp)
 target_include_directories(log_test PRIVATE include)
