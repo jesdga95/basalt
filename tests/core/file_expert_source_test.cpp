@@ -247,6 +247,25 @@ void test_resident_exchange() {
     require(offsets == before, "exchanging back did not restore the plan");
 }
 
+void test_home_regions() {
+    using namespace basalt::core::detail;
+    // two regions after a 1000-byte complement: [1000, 1300) and [1300, 1400)
+    std::vector<HomeRegion> regions(2);
+    regions[0].base = 1000; regions[0].bytes = 300;
+    regions[1].base = 1300; regions[1].bytes = 100;
+    require(home_region_find(regions, 1000, 100) == 0 && home_region_find(regions, 1200, 100) == 0, "a place in region 0");
+    require(home_region_find(regions, 1300, 100) == 1, "a place in region 1");
+    require(home_region_find(regions, 1250, 100) == -1, "a place straddling two regions was found");
+    require(home_region_find(regions, 999, 10) == -1 && home_region_find(regions, 1400, 1) == -1, "a place outside every region");
+    // a region is used while any expert's place lies in it
+    std::vector<uint64_t> offsets = {0, kNoCacheComplement, 1100, kNoCacheComplement};
+    require(home_region_used(regions[0], offsets) && !home_region_used(regions[1], offsets), "region use");
+    offsets[2] = kNoCacheComplement;   // the expert went back into a slot: its place is released
+    require(!home_region_used(regions[0], offsets), "a region with no expert is still used");
+    offsets[3] = 1399;
+    require(home_region_used(regions[1], offsets), "the last byte of a region");
+}
+
 void test_cgroup_memory_budget() {
     using namespace basalt::core::detail;
     constexpr uint64_t GiB = 1ull << 30;
@@ -453,6 +472,7 @@ void test_host_memory_namespaced() {
 
 int main() {
     try {
+        test_home_regions();
         test_complement_plan();
         test_resident_lend_region();
         test_resident_exchange();
