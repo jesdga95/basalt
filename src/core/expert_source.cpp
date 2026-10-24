@@ -1332,6 +1332,36 @@ uint64_t FileExpertSource::homes_reclaim() {
     return freed;
 }
 
+uint64_t FileExpertSource::homes_compact() {
+    if (!complement_ready_ || homes_.empty() || !homes_pending_.empty() || !override_.empty() || !staged_.empty()) return 0;
+    std::vector<std::pair<int32_t, int32_t>> live;
+    uint64_t used = 0;
+    for (size_t i = 0; i < complement_offsets_.size(); ++i) {
+        if (complement_offsets_[i] == kNoComplement || complement_offsets_[i] < homes_start()) continue;
+        const int32_t l = (int32_t) (i / (size_t) n_expert_);
+        live.emplace_back(l, (int32_t) (i % (size_t) n_expert_));
+        used += layer_blob_bytes_[(size_t) l];
+    }
+    constexpr uint64_t kSlackBytes = 96ull << 20;   // one region of slack is not worth a copy
+    const uint64_t held = homes_bytes();
+    if (held < used + kSlackBytes) return 0;
+    if (live.empty()) return homes_reclaim();
+    std::string err;
+    std::vector<uint8_t*> dst;
+    if (!homes_take(live, err, dst)) return 0;
+    // the copies are made from the old places; the offsets move only at the commit
+    for (size_t k = 0; k < live.size(); ++k) {
+        const size_t i = (size_t) live[k].first * (size_t) n_expert_ + (size_t) live[k].second;
+        const uint64_t bytes = layer_blob_bytes_[(size_t) live[k].first];
+        const uint8_t* from = host_at(complement_offsets_[i], bytes);
+        if (from == nullptr) { homes_abort(); return 0; }
+        std::memcpy(dst[k], from, (size_t) bytes);
+    }
+    homes_commit();
+    const uint64_t freed = homes_reclaim();
+    return freed;
+}
+
 uint64_t FileExpertSource::homes_bytes() const {
     uint64_t n = 0;
     for (const auto& r : homes_) n += r.bytes;

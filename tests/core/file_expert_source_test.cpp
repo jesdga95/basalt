@@ -264,6 +264,12 @@ void test_home_regions() {
     require(!home_region_used(regions[0], offsets), "a region with no expert is still used");
     offsets[3] = 1399;
     require(home_region_used(regions[1], offsets), "the last byte of a region");
+    // a release that leaves one expert in a region keeps the region; only the last release frees it
+    offsets = {1000, 1100, 1200, 1300};
+    offsets[0] = offsets[1] = kNoCacheComplement;
+    require(home_region_used(regions[0], offsets), "a region with one expert left was called unused");
+    offsets[2] = kNoCacheComplement;
+    require(!home_region_used(regions[0], offsets) && home_region_used(regions[1], offsets), "release of the last expert");
 }
 
 void test_cgroup_memory_budget() {
