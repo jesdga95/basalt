@@ -1277,6 +1277,44 @@ __device__ __forceinline__ void dm_mix_rows(int type, const void* w, int rows, i
     }
 }
 
+// dm_mix_rows_t for an output in mapped memory: the block's warps take kDmThreads / 32 consecutive rows, their sums
+// meet in shared memory and leave as one contiguous run per token, so each store is a whole segment, not 4 bytes.
+template<int TY>
+__device__ __forceinline__ void dm_mix_rows_m_t(const uint8_t* w, size_t rb, int rows, int n_in, const block_q8_1* x,
+                                                int xs, int nt, float* out, int ld, float (*sp)[kDmThreads / 32]) {
+    constexpr int WB = kDmThreads / 32;
+    const int nbk = n_in / Fmt<TY>::qk, lane = threadIdx.x & 31, wi = threadIdx.x / 32;
+    int off[kDecMaxT];
+#pragma unroll
+    for (int c = 0; c < kDecMaxT; ++c) off[c] = min(c, nt - 1) * xs;
+    for (int r0 = blockIdx.x * WB; r0 < rows; r0 += gridDim.x * WB) {
+        const int r = r0 + wi;
+        if (r < rows) {
+            float s[kDecMaxT];
+            row_dot_multi<TY, kDecMaxT>(w + (size_t) r * rb, x, off, nt, nbk, lane, s);
+#pragma unroll
+            for (int c = 0; c < kDecMaxT; ++c)
+                if (c < nt && lane == c) sp[c][wi] = s[c];
+        }
+        __syncthreads();
+        const int c = threadIdx.x / WB, j = threadIdx.x % WB;
+        if (c < nt && r0 + j < rows) out[(size_t) c * ld + r0 + j] = sp[c][j];
+        __syncthreads();
+    }
+}
+
+__device__ __forceinline__ void dm_mix_rows_m(int type, const void* w, int rows, int n_in, const block_q8_1* x, int nt,
+                                              float* out, int ld, float (*sp)[kDmThreads / 32]) {
+    const int xs = n_in / 32;
+    switch (type) {
+        case 12: dm_mix_rows_m_t<12>((const uint8_t*) w, (size_t) (n_in / 256) * sizeof(block_q4_K), rows, n_in, x, xs, nt, out, ld, sp); break;
+        case 13: dm_mix_rows_m_t<13>((const uint8_t*) w, (size_t) (n_in / 256) * sizeof(block_q5_K), rows, n_in, x, xs, nt, out, ld, sp); break;
+        case 14: dm_mix_rows_m_t<14>((const uint8_t*) w, (size_t) (n_in / 256) * sizeof(block_q6_K), rows, n_in, x, xs, nt, out, ld, sp); break;
+        case 23: dm_mix_rows_m_t<23>((const uint8_t*) w, (size_t) (n_in / 256) * sizeof(block_iq4_xs), rows, n_in, x, xs, nt, out, ld, sp); break;
+        default: break;
+    }
+}
+
 // The peer's shared memory: the expert rings' or the mixer recurrence's (never both at once in a block).
 union DmPeerShared {
     DmShared d;
@@ -1296,6 +1334,7 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
     DmShared& sm = su.d;
     __shared__ uint32_t s_seq;
     __shared__ int32_t s_ok;
+    __shared__ float s_part[MIX ? kDecMaxT : 1][kDmThreads / 32];
     const int tid = threadIdx.x;
     const int nb = gridDim.x;
     float* gate = (float*) a.scratch;
@@ -1397,7 +1436,7 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
                 }
                 if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
                 stamp(a.steps + s, 3);
-                dm_mix_rows(L.to, L.wo, a.n_embd, ZV, (const block_q8_1*) R.yq, mt, a.part_m, a.n_embd, gw, nw, lane);
+                dm_mix_rows_m(L.to, L.wo, a.n_embd, ZV, (const block_q8_1*) R.yq, mt, a.part_m, a.n_embd, s_part);
                 __threadfence_system();
             }
             if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
