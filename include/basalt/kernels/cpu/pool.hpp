@@ -165,6 +165,11 @@ private:
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
     void run_phase(int mode, int n_tasks);
+    /// Rows [r0, r1) of expert `e` of the native batch: gate/up with SwiGLU into the split buffer, the intermediate's
+    /// quantization, and the down projection into the job's outputs.
+    void native_gu_range(int e, int r0, int r1);
+    void native_quantize(int e);
+    void native_down_range(int e, int r0, int r1);
     /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
     int claim(uint32_t epoch);
     /// Publish the batch whose description the caller has just written: reset `done`, then `head`, then the epoch.
@@ -227,7 +232,7 @@ private:
         ActQ a2;
     };
     std::vector<SplitBuf> split_;
-    // run_split_multi state: mode 3 = gate/up row parts, 4 = down row parts
+    // run_split_multi state: mode 3 = gate/up row parts, 4 = down row parts (mode 8, the native path, is below)
     ExpertJobMulti* mjobs_ = nullptr;
     int64_t mrows_ = 0;   // rows of the current multi phase across all its experts (n * FF, then n * H)
     int mtasks_ = 1;   // equal row ranges the phase is cut into
@@ -237,6 +242,14 @@ private:
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // native down activations
     };
     const NativeFmt* nfmt_ = nullptr;
+    // run_split_multi_native's one batch per layer (mode 8): per expert, the gate/up parts left to do and whether its
+    // intermediate is quantized
+    struct alignas(64) FusedExpert {
+        std::atomic<int> gu_left{0};
+        std::atomic<int> ready{0};
+    };
+    std::unique_ptr<FusedExpert[]> fused_;
+    int fused_n_ = 0, fused_gu_parts_ = 1, fused_d_parts_ = 1;
     std::vector<SplitBufMulti> split_multi_;
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;

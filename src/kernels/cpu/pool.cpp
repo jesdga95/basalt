@@ -70,6 +70,7 @@ ExpertPool::ExpertPool(int n_workers, PoolAffinity affinity)
     basalt::core::diag_pool_fn().store(&diag_active_pool);
     split_.resize((size_t) kMaxSplit);
     split_multi_.resize((size_t) kMaxSplitMulti);
+    fused_.reset(new FusedExpert[(size_t) kMaxSplitMulti]);
     threads_.reserve((size_t) n_);
     for (int i = 0; i < n_; ++i) {
         threads_.emplace_back([this, i] { worker(i); });
@@ -238,42 +239,22 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int e = (int) i / parts_b_, part = (int) i % parts_b_;
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
-        } else if (mode_ >= 5) {
-            // native layers, 5 = gate/up rows, 6 = down rows
-            const int per = mode_ == 5 ? FF : H;
-            const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
-            for (int64_t r = g0; r < g1;) {
-                const int e = (int) (r / per), r0 = (int) (r % per);
-                const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
-                SplitBufMulti& sb = split_multi_[(size_t) e];
-                if (mode_ == 5 && q2_native_kernels(nfmt_->gu_type)) {
-                    // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
-                    thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
-                    float* gp[MAXT];
-                    float* up[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
-                    const int nbk = (int) (nfmt_->n_embd / 64);
-                    q2_rows_any(mjobs_[e].blob, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
-                    q2_rows_any(mjobs_[e].blob + nfmt_->up_off, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
-                    for (int t = 0; t < mjobs_[e].nt; ++t)
-                        for (int r = r0; r < r1; ++r)
-                            sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
-                } else if (mode_ == 5) {
-                    float* ff[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
-                    native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
-                } else if (q2_native_kernels(nfmt_->d_type)) {
-                    // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
-                    const ActQ* a2[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
-                    q2_rows_any(mjobs_[e].blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2,
-                                mjobs_[e].nt, mjobs_[e].out, r0, r1);
-                } else {
-                    const void* hq[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
-                    native_down_rows(*nfmt_, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+        } else if (mode_ == 8) {
+            // a native layer in one batch: gate/up parts, then down parts, each down part after its expert's quantize
+            const int n = fused_n_, pg = fused_gu_parts_, pd = fused_d_parts_;
+            if ((int) i < n * pg) {
+                const int e = (int) i / pg, part = (int) i % pg;
+                native_gu_range(e, FF * part / pg, FF * (part + 1) / pg);
+                FusedExpert& fe = fused_[(size_t) e];
+                if (fe.gu_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    native_quantize(e);
+                    fe.ready.store(1, std::memory_order_release);
                 }
-                r += r1 - r0;
+            } else {
+                const int k = (int) i - n * pg, e = k / pd, part = k % pd;
+                // every gate/up task is claimed before any down task, and a claimed task always finishes
+                while (fused_[(size_t) e].ready.load(std::memory_order_acquire) == 0) _mm_pause();
+                native_down_range(e, H * part / pd, H * (part + 1) / pd);
             }
         } else {
             // an equal range of the phase's rows across ALL its experts (a range may span two)
@@ -297,6 +278,50 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         }
         done_.fetch_add(1, std::memory_order_release);
     }
+}
+
+void ExpertPool::native_gu_range(int e, int r0, int r1) {
+    SplitBufMulti& sb = split_multi_[(size_t) e];
+    const ExpertJobMulti& j = mjobs_[e];
+    if (q2_native_kernels(nfmt_->gu_type)) {
+        // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
+        thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
+        float* gp[MAXT];
+        float* up[MAXT];
+        for (int t = 0; t < j.nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
+        const int nbk = (int) (nfmt_->n_embd / 64);
+        q2_rows_any(j.blob, nfmt_->gu_row, nbk, j.act, j.nt, gp, r0, r1);
+        q2_rows_any(j.blob + nfmt_->up_off, nfmt_->gu_row, nbk, j.act, j.nt, up, r0, r1);
+        for (int t = 0; t < j.nt; ++t)
+            for (int r = r0; r < r1; ++r)
+                sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
+        return;
+    }
+    float* ff[MAXT];
+    for (int t = 0; t < j.nt; ++t) ff[t] = sb.ff[t];
+    native_gu_rows(*nfmt_, j.blob, j.nact, j.nt, ff, r0, r1);
+}
+
+void ExpertPool::native_down_range(int e, int r0, int r1) {
+    SplitBufMulti& sb = split_multi_[(size_t) e];
+    const ExpertJobMulti& j = mjobs_[e];
+    if (q2_native_kernels(nfmt_->d_type)) {
+        // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
+        const ActQ* a2[MAXT];
+        for (int t = 0; t < j.nt; ++t) a2[t] = &sb.a2[t];
+        q2_rows_any(j.blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2, j.nt, j.out, r0, r1);
+        return;
+    }
+    const void* hq[MAXT];
+    for (int t = 0; t < j.nt; ++t) hq[t] = sb.hq[t];
+    native_down_rows(*nfmt_, j.blob, hq, j.nt, j.out, r0, r1);
+}
+
+void ExpertPool::native_quantize(int e) {
+    SplitBufMulti& sb = split_multi_[(size_t) e];
+    for (int t = 0; t < mjobs_[e].nt; ++t)
+        if (q2_native_kernels(nfmt_->d_type)) act_quant_any(sb.ff[t], FF, sb.a2[t]);
+        else native_quant_h(*nfmt_, sb.ff[t], sb.hq[t]);
 }
 
 int ExpertPool::set_active_workers(int k) {
@@ -415,25 +440,26 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
+        const auto a = std::chrono::steady_clock::now();
         mjobs_ = jobs + b0;
         nfmt_ = &f;
         const int threads = active_.load(std::memory_order_relaxed) + 1;
-        mtasks_ = kTasksPerThread * threads;
-        mrows_ = (int64_t) nb * FF;
-        const auto a = std::chrono::steady_clock::now();
-        run_phase(5, mtasks_);
-        const auto b = std::chrono::steady_clock::now();
-        for (int e = 0; e < nb; ++e)
-            for (int t = 0; t < mjobs_[e].nt; ++t)
-                if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
-                else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
-        const auto c = std::chrono::steady_clock::now();
-        mrows_ = (int64_t) nb * H;
-        run_phase(6, mtasks_);
-        const auto d = std::chrono::steady_clock::now();
-        ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
-        ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
-        ms_multi_down += std::chrono::duration<double, std::milli>(d - c).count();
+        // One batch for the whole layer: an expert's down rows start once its own gate/up rows are done and quantized,
+        // so there is no barrier between the three steps and the cores' speed differences cost one tail, not two.
+        // The share of tasks follows the share of bytes of the two projections.
+        const double gu_share = (double) (2 * f.up_off) / (double) (2 * f.up_off + f.d_row * (size_t) H);
+        fused_n_ = nb;
+        fused_gu_parts_ = (std::min)(FF, (std::max)(1, (int) std::lround(kTasksPerThread * threads * gu_share / nb)));
+        fused_d_parts_ = (std::min)(H, (std::max)(1, (int) std::lround(kTasksPerThread * threads * (1.0 - gu_share) / nb)));
+        for (int e = 0; e < nb; ++e) {
+            fused_[(size_t) e].gu_left.store(fused_gu_parts_, std::memory_order_relaxed);
+            fused_[(size_t) e].ready.store(0, std::memory_order_relaxed);
+        }
+        run_phase(8, nb * (fused_gu_parts_ + fused_d_parts_));
+        // the three steps are not timed apart: the batch's time is shared out by the bytes of the two projections
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+        ms_multi_gu += ms * gu_share;
+        ms_multi_down += ms * (1.0 - gu_share);
     }
     multi_bytes += (int64_t) n * (int64_t) f.bytes;
     mode_ = 0;
