@@ -772,7 +772,9 @@ void Verifier::hs_free() {
 // The key heads CUDA0 keeps when the GDN mixer splits by key head between CUDA0 (dev0) and the peer (dev1); 0 when the
 // split is not taken.  Units of key heads whose out-projection columns fill whole 256-value blocks; the peer's units
 // follow the two cards' memory bandwidth, taken only from a quarter of them.
-static int gs_plan(const ModelGeometry& g, int dev0, int dev1) {
+static bool g_gs_off = false;   // set by Verifier::gs_decide when the split does not pay
+
+static int gs_plan_bw(const ModelGeometry& g, int dev0, int dev1) {
     const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, S = (int) g.ssm_state_size, HIST = (int) g.ssm_d_conv - 1;
     const int64_t N = g.n_embd, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;
     constexpr int kBlockCols = 256;
@@ -787,6 +789,50 @@ static int gs_plan(const ModelGeometry& g, int dev0, int dev1) {
     const int u1 = std::min(units - 1, (int) std::floor(units * bw1 / (bw0 + bw1)));
     if (u1 * 4 < units) return 0;
     return HK - u1 * unit;
+}
+
+static int gs_plan(const ModelGeometry& g, int dev0, int dev1) { return g_gs_off ? 0 : gs_plan_bw(g, dev0, dev1); }
+
+// The split's start-time price, in ms per verify window.  It saves the main card's stream of the peer's heads' mixer
+// weights at its achieved bandwidth, less the peer item's growth per window token beyond the first.  Its reserve
+// displaces the same bytes of experts from the peer to RAM, which decode pays as CPU-tier misses.  The prompt path is
+// not priced: it streams the displaced experts with the rest of a chunk's, at no measurable cost.
+bool Verifier::gs_decide(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1, int max_t,
+                         int64_t displaced) {
+    g_gs_off = false;
+    if (dev1 < 0 || dev1 == dev0) return false;
+    const int nk0 = gs_plan_bw(g, dev0, dev1);
+    if (nk0 == 0) return false;
+    constexpr double kMainEff = 0.71;        // the main card's achieved share of its bandwidth on the mixer
+    constexpr double kTokGrowth = 0.71;      // the peer item's growth per token, in units of its weight stream
+    constexpr double kMissMsPerGB = 0.263;   // decode CPU-tier misses per window per GB of displaced experts
+    const int64_t HK = g.ssm_k_heads, N = g.n_embd, nk1 = HK - nk0;
+    const int64_t C1 = g.ssm_conv_channels / HK * nk1, Z1 = g.ssm_value_dim / HK * nk1;
+    double bm = 0.0;
+    int layers = 0;
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        if (is_qsa_layer(g, l)) continue;
+        const LayerView v(wt, l);
+        const WeightRef *q = v.get("attn_qkv.weight"), *z = v.get("attn_gate.weight"), *o = v.get("ssm_out.weight");
+        if (!q || !z || !o) return false;
+        bm += (double) basalt::kernels::native_mmvq_weight_bytes(q->native_type, (int) N, (int) C1) +
+              (double) basalt::kernels::native_mmvq_weight_bytes(z->native_type, (int) N, (int) Z1) +
+              (double) basalt::kernels::native_mmvq_weight_bytes(o->native_type, (int) Z1, (int) N);
+        ++layers;
+    }
+    if (layers == 0) return false;
+    bm /= layers;
+    const double bw0 = card_bandwidth(dev0), bw1 = card_bandwidth(dev1);
+    const double t_exp = std::max(1.0, (max_t + 2) / 3.0);   // the expected window: a third of the drafted run
+    const double save = layers * (bm / (kMainEff * bw0) - kTokGrowth * (t_exp - 1.0) * bm / bw1) * 1e3;
+    const double dgb = (double) std::max<int64_t>(displaced, 0) / 1e9;
+    const double miss = kMissMsPerGB * dgb;
+    const bool take = save - miss > 0.0;
+    g_gs_off = !take;
+    basalt::log::info("basalt verify", "GDN mixer split by key head: saves %.2f ms per %.1f-token window, costs %.2f "
+                         "(%.2f GB of experts off the peer, read as decode misses) -> %s",
+                 save, t_exp, miss, dgb, take ? "split" : "whole on CUDA0");
+    return take;
 }
 
 int64_t Verifier::gs_cuda0_bytes(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1) {
