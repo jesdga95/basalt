@@ -1289,7 +1289,8 @@ union DmPeerShared {
 // Every wait inside a ring is bounded: a down wait past kDmWaitLimitNs, a corrupt ring or the host's release aborts
 // the window (a record in diag_m, done_m past every ring) and the kernel exits.
 // Q2: Q2_0 gate/up rows two a warp as well (a build of its own, so the other formats' kernel stays as it was)
-template<bool Q2>
+// MIX: the GDN mixer split's item (a build of its own, so the window without the split keeps its kernel)
+template<bool Q2, bool MIX>
 __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
     __shared__ DmPeerShared su;
     DmShared& sm = su.d;
@@ -1348,7 +1349,7 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
                     if (tid == 0) hdr->n_tok = -1;
                 } else {
                     const int nt = min((int) ((v >> 16) & 0xffu), kVerifyMaxT);
-                    if ((v >> 30) & 1u) {   // the q8_1 rows and the fp32 rows (the gates' input)
+                    if (MIX && ((v >> 30) & 1u)) {   // the q8_1 rows and the fp32 rows (the gates' input)
                         const uint4* xs = (const uint4*) (a.mxq_m + (size_t) s * a.xq_stride);
                         const int n16 = nt * (a.n_embd / 32) * (int) sizeof(block_q8_1) / 16;
                         for (int i = tid; i < n16; i += kDmThreads) ((uint4*) a.mxq)[i] = __ldcv(xs + i);
@@ -1363,7 +1364,7 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
             if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
             if (hdr->n_tok < 0) return;          // released
             const int mt = hdr->n_tok;
-            if (mt > 0) {   // the peer's key heads: qkv + z, the recurrence, the gated norm, the out projection's partial
+            if constexpr (MIX) if (mt > 0) {   // the peer's key heads: qkv + z, the recurrence, the norm, the out partial
                 const DmMixLayer& L = a.mixl[s];
                 const DecRecArgs& R = L.rec;
                 const int lane = tid & 31, gw = blockIdx.x * (kDmThreads / 32) + tid / 32, nw = nb * (kDmThreads / 32);
@@ -2066,8 +2067,9 @@ bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
     return pair && gu && d && n_ff == 640 && n_embd % 256 == 0 && !g_old_kernels && !g_grouped_v1;
 }
 
-static const void* dm_peer_fn(bool q2) {
-    return q2 ? (const void*) dm_peer_kernel<true> : (const void*) dm_peer_kernel<false>;
+static const void* dm_peer_fn(bool q2, bool mix = false) {
+    if (mix) return q2 ? (const void*) dm_peer_kernel<true, true> : (const void*) dm_peer_kernel<false, true>;
+    return q2 ? (const void*) dm_peer_kernel<true, false> : (const void*) dm_peer_kernel<false, false>;
 }
 
 int dec_moe_peer_blocks(bool q2) {
@@ -2086,7 +2088,7 @@ bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream, bool q2)
     DmPeerArgs args = a;
     args.gu2 = 1;
     void* params[] = {&args};
-    const cudaError_t e = cudaLaunchCooperativeKernel(dm_peer_fn(q2),
+    const cudaError_t e = cudaLaunchCooperativeKernel(dm_peer_fn(q2, a.mixl != nullptr),
                                                       dim3((unsigned) blocks),
                                                       dim3(kDmThreads), params, 0, (cudaStream_t) stream);
     if (e != cudaSuccess) {
