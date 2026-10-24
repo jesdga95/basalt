@@ -77,6 +77,8 @@ bool cpu_avxvnni_ok() {
         unsigned r[4] = {0, 0, 0, 0};
         platform::cpuid(0, 0, r);
         if (r[0] < 7) return false;
+        platform::cpuid(7, 0, r);
+        if (r[0] < 1) return false;                        // leaf 7 has no sub-leaf 1
         platform::cpuid(7, 1, r);
         return ((r[0] >> 4) & 1u) != 0;                    // AVX-VNNI
     }();

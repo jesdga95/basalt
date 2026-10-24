@@ -186,6 +186,61 @@ int main(int argc, char** argv) {
         std::printf("  IQ4_NL down rows: vs double reference: max abs %.3g rel %.3g\n", st.max_abs, st.max_rel);
         if (st.max_rel > 1e-3) { std::printf("REFERENCE ERROR too large for IQ4_NL down\n"); ++bad; }
     }
+    // ---- IQ4_NL down rows, the extreme grid: weight nibbles and activation codes pinned to their largest magnitudes, so the
+    // four-wise sums the VNNI build takes in one step are the ones a saturating pair sum would clip first
+    if (vnni) {
+        cpu::NativeFmt f;
+        std::string err;
+        if (!cpu::native_fmt(22, 20, H, FF, f, err)) return 1;
+        int grid_bad = 0, grid_n = 0;
+        for (int wmode = 0; wmode < 5; ++wmode) {        // random, all nibbles 0, 15, and both mixed
+            std::vector<uint8_t> blob(f.d_row * (size_t) H);
+            fill(blob, 20, 1700 + (uint64_t) wmode, 0);
+            if (wmode > 0) {
+                const uint8_t pat = wmode == 1 ? 0x00 : wmode == 2 ? 0xFF : wmode == 3 ? 0x0F : 0xF0;
+                for (size_t b = 0; b + 18 <= blob.size(); b += 18)
+                    for (int i = 2; i < 18; ++i) blob[b + (size_t) i] = pat;
+            }
+            for (int amode = 0; amode < 5; ++amode) {    // random, all 127, all -128, all -127, random 127 / -128
+                std::vector<std::vector<uint8_t>> hq(MAXT, std::vector<uint8_t>(cpu::kNativeHBytes, 0));
+                for (int t = 0; t < MAXT; ++t)
+                    for (int b = 0; b < FF / 32; ++b) {   // block_q8_0: fp16 scale, 32 int8 codes
+                        uint8_t* blk = hq[(size_t) t].data() + (size_t) b * 34;
+                        const uint16_t d = (uint16_t) (0x2800 + t);
+                        std::memcpy(blk, &d, 2);
+                        for (int i = 0; i < 32; ++i) {
+                            int8_t q = 0;
+                            switch (amode) {
+                                case 0: q = (int8_t) ((int) (rng() % 255) - 127); break;
+                                case 1: q = 127; break;
+                                case 2: q = -128; break;
+                                case 3: q = -127; break;
+                                default: q = (rng() & 1) ? 127 : -128; break;
+                            }
+                            blk[2 + i] = (uint8_t) q;
+                        }
+                    }
+                for (int nt = 1; nt <= MAXT; ++nt) {
+                    const void* hp[MAXT];
+                    for (int t = 0; t < nt; ++t) hp[t] = hq[(size_t) t].data();
+                    for (auto range : {std::pair<int, int>{0, H}, {1, 200}, {2047, H}}) {
+                        std::vector<std::vector<float>> ob(nt, std::vector<float>(H, 0.f)), ov(nt, std::vector<float>(H, 0.f));
+                        float *pb[MAXT], *pv[MAXT];
+                        for (int t = 0; t < nt; ++t) { pb[t] = ob[(size_t) t].data(); pv[t] = ov[(size_t) t].data(); }
+                        cpu::iq4nl256_down_rows_base(blob.data(), f.d_row, FF, hp, nt, pb, range.first, range.second);
+                        cpu::iq4nl256_down_rows_vnni(blob.data(), f.d_row, FF, hp, nt, pv, range.first, range.second);
+                        for (int t = 0; t < nt; ++t) {
+                            ++grid_n;
+                            if (std::memcmp(pb[t], pv[t], H * 4)) { ++grid_bad; std::printf("MISMATCH IQ4_NL extreme grid w %d a %d nt %d\n", wmode, amode, nt); }
+                        }
+                    }
+                }
+            }
+        }
+        std::printf("  IQ4_NL down, extreme weights x extreme activations: %d comparisons, %d mismatches\n", grid_n, grid_bad);
+        compared += grid_n;
+        bad += grid_bad;
+    }
     std::printf("iq_avx2_test: %d base/vnni comparisons, %d failures\n", compared, bad);
 
     if (bench) {   // 200 gate/up rows (the pool's task) per call, the arena far larger than the caches

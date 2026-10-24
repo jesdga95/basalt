@@ -54,6 +54,7 @@ struct Format {
     cpu::NativeFmt f;
     std::vector<std::vector<uint8_t>> blobs;
     std::vector<std::vector<uint8_t>> nact;   // one gate/up activation per token slot
+    std::vector<cpu::ActQ> actq;              // the same inputs for a Q2_0 gate/up
 };
 
 // One expert for `nt` tokens on a single thread: the definition of the right answer.
@@ -63,7 +64,19 @@ void serial_expert(const Format& fm, const uint8_t* blob, int nt, float* const* 
     float* ffp[MAXT];
     const void* act[MAXT];
     for (int t = 0; t < nt; ++t) { ffp[t] = ff[t]; act[t] = fm.nact[(size_t) t].data(); }
-    cpu::native_gu_rows(f, blob, act, nt, ffp, 0, FF);
+    if (cpu::q2_native_kernels(f.gu_type)) {
+        alignas(64) float gate[MAXT][FF], up[MAXT][FF];
+        float *gp[MAXT], *upp[MAXT];
+        const cpu::ActQ* ap[MAXT];
+        for (int t = 0; t < nt; ++t) { gp[t] = gate[t]; upp[t] = up[t]; ap[t] = &fm.actq[(size_t) t]; }
+        const int nbk = (int) (f.n_embd / 64);
+        cpu::q2_rows_any(blob, f.gu_row, nbk, ap, nt, gp, 0, FF);
+        cpu::q2_rows_any(blob + f.up_off, f.gu_row, nbk, ap, nt, upp, 0, FF);
+        for (int t = 0; t < nt; ++t)
+            for (int r = 0; r < FF; ++r) ff[t][r] = (gate[t][r] / (1.f + std::exp(-gate[t][r]))) * up[t][r];
+    } else {
+        cpu::native_gu_rows(f, blob, act, nt, ffp, 0, FF);
+    }
     if (cpu::q2_native_kernels(f.d_type)) {
         cpu::ActQ a2[MAXT];
         const cpu::ActQ* ap[MAXT];
@@ -90,7 +103,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     std::vector<Format> formats;
-    for (auto g : {std::pair<int, int>{22, 20}, {18, 20}, {21, 20}, {23, 20}, {22, 42}, {21, 42}}) {
+    for (auto g : {std::pair<int, int>{22, 20}, {18, 20}, {21, 20}, {23, 20}, {22, 42}, {21, 42}, {42, 20}, {42, 42}}) {
         Format fm;
         fm.gu = g.first;
         fm.d = g.second;
@@ -108,9 +121,11 @@ int main(int argc, char** argv) {
         std::normal_distribution<float> nd(0.f, 1.f);
         std::vector<float> x(H);
         fm.nact.assign(MAXT, std::vector<uint8_t>(cpu::kNativeActBytes));
+        fm.actq.resize(MAXT);
         for (int t = 0; t < MAXT; ++t) {
             for (auto& v : x) v = nd(rng);
             cpu::native_quant_act(fm.f, x.data(), fm.nact[(size_t) t].data());
+            cpu::act_quant_any(x.data(), H, fm.actq[(size_t) t]);
         }
         formats.push_back(std::move(fm));
     }
@@ -139,6 +154,7 @@ int main(int argc, char** argv) {
                 j.nt = nts[(size_t) e];
                 for (int t = 0; t < j.nt; ++t) {
                     j.nact[t] = fm.nact[(size_t) t].data();
+                    j.act[t] = &fm.actq[(size_t) t];
                     j.out[t] = got[(size_t) e * MAXT + (size_t) t].data();
                 }
             }
@@ -172,6 +188,7 @@ int main(int argc, char** argv) {
                 float* o[MAXT];
                 for (int t = 0; t < 2; ++t) {
                     j.nact[t] = fm.nact[(size_t) t].data();
+                    j.act[t] = &fm.actq[(size_t) t];
                     j.out[t] = got[(size_t) e * MAXT + (size_t) t].data();
                     o[t] = want[(size_t) e * MAXT + (size_t) t].data();
                 }
@@ -191,27 +208,33 @@ int main(int argc, char** argv) {
     }
     std::printf("pool_native_test: %d runs over %zu formats, %d mismatches\n", checked, formats.size(), bad);
 
-    if (bench) {   // one layer, 15 experts of 2 tokens, far apart in memory
+    if (bench) {   // a decode layer (15 experts x 2 tokens) and a prompt-sized one (96 x 8), experts far apart in memory
         for (const Format& fm : formats) {
-            const int n = 15, reps = 200;
-            std::vector<std::vector<float>> got((size_t) n * 2, std::vector<float>(H));
-            std::vector<cpu::ExpertJobMulti> jobs((size_t) n);
-            std::vector<double> us;
-            for (int r = 0; r < reps; ++r) {
-                for (int e = 0; e < n; ++e) {
-                    cpu::ExpertJobMulti& j = jobs[(size_t) e];
-                    j.blob = fm.blobs[(size_t) ((r * n + e) % kBlobs)].data();
-                    j.nt = 2;
-                    for (int t = 0; t < 2; ++t) { j.nact[t] = fm.nact[(size_t) t].data(); j.out[t] = got[(size_t) e * 2 + (size_t) t].data(); }
+            for (auto shape : {std::pair<int, int>{15, 2}, {96, 8}}) {
+                const int n = shape.first, nt = shape.second, reps = n > 32 ? 40 : 200;
+                std::vector<std::vector<float>> got((size_t) n * (size_t) nt, std::vector<float>(H));
+                std::vector<cpu::ExpertJobMulti> jobs((size_t) n);
+                std::vector<double> us;
+                for (int r = 0; r < reps; ++r) {
+                    for (int e = 0; e < n; ++e) {
+                        cpu::ExpertJobMulti& j = jobs[(size_t) e];
+                        j.blob = fm.blobs[(size_t) ((r * n + e) % kBlobs)].data();
+                        j.nt = nt;
+                        for (int t = 0; t < nt; ++t) {
+                            j.nact[t] = fm.nact[(size_t) t].data();
+                            j.act[t] = &fm.actq[(size_t) t];
+                            j.out[t] = got[(size_t) e * (size_t) nt + (size_t) t].data();
+                        }
+                    }
+                    const double t0 = now_ms();
+                    pool.run_split_multi_native(fm.f, jobs.data(), n);
+                    us.push_back((now_ms() - t0) * 1e3);
                 }
-                const double t0 = now_ms();
-                pool.run_split_multi_native(fm.f, jobs.data(), n);
-                us.push_back((now_ms() - t0) * 1e3);
+                std::sort(us.begin(), us.end());
+                const double med = us[us.size() / 2];
+                std::printf("  gu %2d down %2d: %2d experts x %d tokens, %d workers + host: median %.1f us (%.1f GB/s)\n", fm.gu, fm.d, n, nt,
+                            pool.workers(), med, (double) n * (double) fm.f.bytes / (med * 1e3));
             }
-            std::sort(us.begin(), us.end());
-            const double med = us[us.size() / 2];
-            std::printf("  gu %2d down %2d: %d experts x 2 tokens, %d workers + host: median %.1f us (%.1f GB/s)\n", fm.gu, fm.d, n,
-                        pool.workers(), med, (double) n * (double) fm.f.bytes / (med * 1e3));
         }
     }
     return bad == 0 ? 0 : 1;
