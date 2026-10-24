@@ -1462,7 +1462,11 @@ __device__ int dm_experts_tma(DmTmaShared& sm, int ng, const block_q8_1* __restr
     for (; b + k * nb < total; ++k) {
         const int it = b + k * nb;
         if (k > 0) __syncthreads();              // stage (k - 1) is consumed: refill it
-        if (tid == 0) issue(k + kTmaStages - 1);
+        if (tid == 0) {
+            // the warps read the stage with generic loads; the refill is an async-proxy write
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            issue(k + kTmaStages - 1);
+        }
         const int st = (base + k) % kTmaStages;
         const uint32_t parity = (uint32_t) (((base + k) / kTmaStages) & 1);
         const uint8_t* rows = sm.stage[st];
