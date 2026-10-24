@@ -257,6 +257,41 @@ static void test_request() {
     CHECK(!grammar_from_request(R"({"kind":"nope"})", err).grammar && !err.empty());
 }
 
+// A pattern or an enum string can decode (a "\u0000" JSON escape) to raw control bytes. They must reach the
+// grammar text as \xNN escapes: the parser walks the text as a C string, so a raw NUL ends it mid-rule.
+static void test_control_escapes() {
+    std::string err;
+    // a nested-object parameter whose string property has a control-byte character class (pi's interactive_shell)
+    std::string gbnf = tool_call_gbnf(R"([
+      {"name":"send","parameters":{"type":"object","properties":{
+          "cfg":{"type":"object","properties":{
+              "input":{"type":"string","pattern":"^[^\u0000-\u001f\u007f;&|`$<>]+$"},
+              "k":{"type":"string","enum":["a\u0000b","c"]}},
+            "required":["input"]}},
+        "required":["cfg"]}}
+    ])", ToolGrammarOptions{}, err);
+    CHECK(!gbnf.empty() && err.empty());
+    CHECK(gbnf.find('\0') == std::string::npos);
+    auto g = Grammar::parse(gbnf, err);
+    if (!g) std::printf("%s\n--- grammar ---\n%s\n", err.c_str(), gbnf.c_str());
+    CHECK(g);
+    if (g) {
+        const std::string head = "<tool_call>\n<function=send>\n<parameter=cfg>\n";
+        CHECK(ok(g, head + R"({"input":"hello world","k":"c"})" + "\n</parameter>\n</function>\n</tool_call>"));
+        CHECK(!pre(g, head + R"({"input":"bad|pipe")"));   // the pattern excludes |
+    }
+    // a schema pattern naming raw control points directly
+    auto p = build(R"({"type":"string","pattern":"^[A\u0000]+$"})");
+    CHECK(p);
+    if (p) {
+        const std::string nul = std::string(1, '\0');
+        CHECK(ok(p, "\"" + nul + "A\"") && ok(p, "\"A\"") && !pre(p, "\"x\""));
+    }
+    // Grammar::parse says what a raw NUL is instead of "unexpected end of input"
+    err.clear();
+    CHECK(!Grammar::parse("root ::= \"" + std::string(1, '\0') + "\"", err) && err.find("NUL") != std::string::npos);
+}
+
 int main() {
     test_request();
     test_scalars();
@@ -266,6 +301,7 @@ int main() {
     test_ref();
     test_tools();
     test_text_unions();
+    test_control_escapes();
     if (g_fail) { std::printf("grammar_schema_test: %d failures\n", g_fail); return 1; }
     std::printf("grammar_schema_test: ok\n");
     return 0;

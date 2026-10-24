@@ -402,6 +402,12 @@ std::shared_ptr<const Grammar> Grammar::parse(const std::string& gbnf, std::stri
 }
 
 std::shared_ptr<const Grammar> Grammar::parse(const std::string& gbnf, std::string& err, const ParseOptions& opt) {
+    // The parser walks the text as a C string; a raw NUL (a generator that forgot to escape, e.g. a decoded \u0000
+    // from a JSON pattern) would otherwise surface as a cryptic "unexpected end of input" at the byte.
+    if (gbnf.find('\0') != std::string::npos) {
+        err = "grammar: the grammar text contains a raw NUL byte";
+        return nullptr;
+    }
     GrammarParser p;
     p.opt = opt;
     try {
