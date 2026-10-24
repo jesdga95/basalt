@@ -10,15 +10,21 @@
         {
           "name": "RTX 5090",
           "vram_gib": 32,
-          "power_w": 400
+          "power_w": 400,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.9
         },
         {
           "name": "RTX 5060 Ti",
           "vram_gib": 16,
-          "power_w": 180
+          "power_w": 180,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.8
         }
       ],
       "ram_gib": 121,
+      "cpu": "AMD Ryzen 9 9950X, 16 cores",
+      "ram_gbps": 58.5,
       "os": "Linux",
       "quant": "NVFP4",
       "prefill_16k_tps": 7637.6,
@@ -34,10 +40,14 @@
         {
           "name": "RTX 5090",
           "vram_gib": 32,
-          "power_w": 400
+          "power_w": 400,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.9
         }
       ],
       "ram_gib": 121,
+      "cpu": "AMD Ryzen 9 9950X, 16 cores",
+      "ram_gbps": 58.5,
       "os": "Linux",
       "quant": "NVFP4",
       "prefill_16k_tps": 6420.0,
@@ -53,10 +63,14 @@
         {
           "name": "RTX 5060 Ti",
           "vram_gib": 16,
-          "power_w": 180
+          "power_w": 180,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.8
         }
       ],
       "ram_gib": 121,
+      "cpu": "AMD Ryzen 9 9950X, 16 cores",
+      "ram_gbps": 58.5,
       "os": "Linux",
       "quant": "IQ3_S",
       "prefill_16k_tps": 2093.7,
