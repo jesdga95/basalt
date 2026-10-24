@@ -5,6 +5,7 @@
 #include "basalt/core/remote_expert_opt.hpp"
 
 #include "basalt/core/native_head.hpp"
+#include "basalt/core/gdn_head_split.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/core/peer_experts.hpp"
@@ -564,7 +565,10 @@ bool Verifier::dm_init(std::string& err) {
         if (!router_ok || !warm_router(rq_h, rs_h, &d->rq, &d->rs))
             basalt::log::warn("basalt verify", "the peer's L2 warm-up is off (a router the predictor does not cover)");
     }
-    if (d->pdev >= 0) hs_init();
+    if (d->pdev >= 0) {
+        hs_init();
+        gs_init();
+    }
     if (cpu_warm && router_ok) {
         CpuWarm* w = new CpuWarm;
         w->rq = std::move(rq_h);
@@ -744,10 +748,135 @@ void Verifier::hs_free() {
     hs_in_ = hs_out_ = nullptr;
 }
 
+// The GDN mixer splits by key head when the peer card streams the mixer's bytes faster than CUDA0.  The unit is the
+// fewest key heads whose value-head runs fill whole out-projection blocks; the peer's share of the units follows both
+// cards' memory bandwidth, rounded down, and is taken only from a quarter up, CUDA0 keeping at least one unit.  The
+// peer holds its heads' weights and state in gdn_head_split.hpp's layout.
+void Verifier::gs_init() {
+    using basalt::core::GdnHeadSlice;
+    if (dm_ == nullptr || dm_->pdev < 0 || wt_ == nullptr) return;
+    const ModelGeometry& g = *g_;
+    const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, S = (int) g.ssm_state_size, HIST = (int) g.ssm_d_conv - 1;
+    const int64_t N = g.n_embd, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;
+    constexpr int kBlockCols = 256;
+    int unit = 1;
+    while (unit <= HK && (unit * S) % kBlockCols != 0) ++unit;
+    if (HK <= 0 || HV % HK != 0 || unit > HK || HK % unit != 0 || N % kBlockCols != 0 || HIST < 1 ||
+        C != (int64_t) (2 * HK + HV) * S || ZV != (int64_t) HV * S)
+        return;
+    const double bw0 = card_bandwidth(device_), bw1 = card_bandwidth(dm_->pdev);
+    if (bw0 <= 0.0 || bw1 <= 0.0) return;
+    const int units = HK / unit;
+    const int u1 = std::min(units - 1, (int) std::floor(units * bw1 / (bw0 + bw1)));
+    if (u1 * 4 < units) return;
+    const int nk0 = HK - u1 * unit;
+    const GdnHeadSlice sl{HK, HV, S, nk0, HK - nk0};
+    auto blocked = [](int t) { return t == 11 || t == 12 || t == 13 || t == 14 || t == 23; };   // 256-value blocks
+    // every GDN layer's tensors, as the verify window reads them
+    struct Src {
+        const WeightRef *qkv, *z, *out, *a, *b, *conv, *norm, *dt, *sa;
+    };
+    std::vector<Src> src;
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        if (is_qsa_layer(g, l)) continue;
+        const LayerView v(*wt_, l);
+        Src s{v.get("attn_qkv.weight"), v.get("attn_gate.weight"), v.get("ssm_out.weight"), v.get("ssm_alpha.weight"),
+              v.get("ssm_beta.weight"), v.get("ssm_conv1d.weight"), v.get("ssm_norm.weight"), v.get("ssm_dt.bias"),
+              v.get("ssm_a")};
+        if (!s.qkv || !s.z || !s.out || !s.a || !s.b || !s.conv || !s.norm || !s.dt || !s.sa || !s.qkv->native_data ||
+            !s.z->native_data || !s.out->native_data || !blocked(s.qkv->native_type) || !blocked(s.z->native_type) ||
+            !blocked(s.out->native_type) || s.conv->bytes != (uint64_t) C * (HIST + 1) * 4 ||
+            s.a->bytes != (uint64_t) HV * N * 2 || s.b->bytes != (uint64_t) HV * N * 2 ||
+            s.dt->bytes != (uint64_t) HV * 4 || s.sa->bytes != (uint64_t) HV * 4 || s.norm->bytes != (uint64_t) S * 4) {
+            basalt::log::warn("basalt verify", "the GDN mixer stays whole on CUDA0: a layer the split does not cover");
+            return;
+        }
+        src.push_back(s);
+    }
+    if (src.empty()) return;
+    // each tensor comes down from CUDA0, is sliced on the host and goes up to the peer
+    std::vector<uint8_t> full, part;
+    size_t peer_bytes = 0;
+    bool ok = true;
+    auto down = [&](const void* d, size_t n) {
+        full.resize(n);
+        const OnDevice on(device_);
+        ok = ok && cudaMemcpy(full.data(), d, n, cudaMemcpyDeviceToHost) == cudaSuccess;
+    };
+    auto up = [&](size_t n, void** dst) {
+        const OnDevice on(dm_->pdev);
+        ok = ok && cudaMalloc(dst, n) == cudaSuccess && cudaMemcpy(*dst, part.data(), n, cudaMemcpyHostToDevice) == cudaSuccess;
+        peer_bytes += n;
+    };
+    auto rows = [&](const void* d, size_t row_bytes, int64_t n_rows, const std::vector<basalt::core::GdnRun>& runs,
+                    void** dst) {
+        if (!ok) return;
+        down(d, row_bytes * (size_t) n_rows);
+        part.resize(row_bytes * (size_t) basalt::core::gdn_runs_len(runs));
+        basalt::core::gdn_gather_rows(full.data(), row_bytes, runs, part.data());
+        up(part.size(), dst);
+    };
+    const std::vector<basalt::core::GdnRun> qr = basalt::core::gdn_qkv_runs(sl), v1 = basalt::core::gdn_vhead_runs(sl, 1),
+                                           vs = basalt::core::gdn_vhead_runs(sl, S);
+    gs_layers_.assign(src.size(), GsLayer{});
+    gs_dev_ = dm_->pdev;
+    for (size_t i = 0; i < src.size() && ok; ++i) {
+        const Src& s = src[i];
+        GsLayer& L = gs_layers_[i];
+        L.tq = s.qkv->native_type; L.tz = s.z->native_type; L.to = s.out->native_type;
+        rows(s.qkv->native_data, basalt::kernels::native_mmvq_weight_bytes(L.tq, (int) N, 1), C, qr, &L.wqkv);
+        rows(s.z->native_data, basalt::kernels::native_mmvq_weight_bytes(L.tz, (int) N, 1), ZV, vs, &L.wz);
+        rows(s.conv->data, (size_t) (HIST + 1) * 4, C, qr, (void**) &L.conv_w);
+        rows(s.a->data, (size_t) N * 2, HV, v1, (void**) &L.wa);
+        rows(s.b->data, (size_t) N * 2, HV, v1, (void**) &L.wb);
+        rows(s.dt->data, 4, HV, v1, (void**) &L.dt);
+        rows(s.sa->data, 4, HV, v1, (void**) &L.ssm_a);
+        rows(s.norm->data, (size_t) S * 4, 1, {{0, 1}}, (void**) &L.gamma);
+        if (ok) {   // the out projection's columns of the peer's value heads
+            const size_t rb = basalt::kernels::native_mmvq_weight_bytes(L.to, (int) ZV, 1);
+            down(s.out->native_data, rb * (size_t) N);
+            part.resize(basalt::kernels::native_mmvq_weight_bytes(L.to, (int) sl.zv(), (int) N));
+            basalt::core::gdn_gather_cols(full.data(), N, ZV, kBlockCols, rb / (size_t) (ZV / kBlockCols), vs, part.data());
+            up(part.size(), &L.wo);
+        }
+    }
+    const size_t state_bytes = basalt::core::gdn_slice_state_floats(sl, HIST) * 4 * src.size();
+    if (ok) {
+        const OnDevice on(dm_->pdev);
+        ok = cudaMalloc((void**) &gs_state_, state_bytes) == cudaSuccess && cudaMemset(gs_state_, 0, state_bytes) == cudaSuccess;
+        peer_bytes += state_bytes;
+    }
+    if (!ok) {
+        cudaGetLastError();
+        gs_free();
+        basalt::log::warn("basalt verify", "the GDN mixer stays whole on CUDA0: no room for the peer's share");
+        return;
+    }
+    gs_nk0_ = nk0;
+    basalt::log::info("basalt verify", "the GDN mixer is split by key head: CUDA0 %d of %d key heads, the peer %d (%.0f MiB)",
+                      nk0, HK, HK - nk0, peer_bytes / 1048576.0);
+}
+
+void Verifier::gs_free() {
+    if (gs_dev_ >= 0) {
+        const OnDevice on(gs_dev_);
+        for (GsLayer& L : gs_layers_)
+            for (void* p : {L.wqkv, L.wz, L.wo, (void*) L.conv_w, (void*) L.dt, (void*) L.ssm_a, (void*) L.gamma,
+                            (void*) L.wa, (void*) L.wb})
+                if (p) cudaFree(p);
+        if (gs_state_) cudaFree(gs_state_);
+    }
+    gs_layers_.clear();
+    gs_state_ = nullptr;
+    gs_nk0_ = 0;
+    gs_dev_ = -1;
+}
+
 void Verifier::dm_free() {
     DecMoe* d = dm_;
     if (d == nullptr) return;
     hs_free();
+    gs_free();
     if (d->warm != nullptr) {
         warm_pool_->idle_stop();
         delete d->warm;

@@ -322,6 +322,9 @@ private:
     // the head split by vocabulary with the peer card, when the peer streams its rows faster than CUDA0 does
     void hs_init();
     void hs_free();
+    // the GDN mixer split by key head with the peer card, when the peer streams the mixer's bytes faster than CUDA0
+    void gs_init();
+    void gs_free();
     bool dm_sync(std::string& err);        ///< the residency tables to the devices, before a window
     bool dm_begin(std::string& err, DecodeGaps* gm);   ///< the tail's window start (tables, flags, the peer window)
     bool dm_end(std::string& err);         ///< the peer window's end
@@ -531,6 +534,16 @@ private:
     cudaStream_t hs_s_ = nullptr;    // peer
     cudaEvent_t hs_in_ = nullptr;    // CUDA0: the input is staged
     cudaEvent_t hs_out_ = nullptr;   // peer: its logits are staged
+    // GDN mixer split by key head: CUDA0 owns key heads [0, gs_nk0_), the peer the rest; gs_nk0_ 0 means no split
+    struct GsLayer {   // peer: one GDN layer's weights for its heads (gdn_head_split.hpp layout)
+        void *wqkv = nullptr, *wz = nullptr, *wo = nullptr;
+        float *conv_w = nullptr, *dt = nullptr, *ssm_a = nullptr, *gamma = nullptr;
+        uint16_t *wa = nullptr, *wb = nullptr;
+        int tq = -1, tz = -1, to = -1;
+    };
+    int gs_nk0_ = 0, gs_dev_ = -1;
+    std::vector<GsLayer> gs_layers_;   // by GDN layer index
+    float* gs_state_ = nullptr;        // peer: its heads' recurrent state and conv history, per GDN layer
     uint8_t* vhead_scratch_ = nullptr;   // the two-stage head's histogram and row list (q6k_vhead)
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
