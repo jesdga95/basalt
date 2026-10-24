@@ -3468,7 +3468,8 @@ int main(int argc, char** argv) {
             o.peer_device < count && cudaSetDevice(o.peer_device) == cudaSuccess) {
             if (cudaMemGetInfo(&pfree, &ptotal) == cudaSuccess) {
                 const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
-                                         basalt::core::PeerExperts::device_overhead_bytes();
+                                         basalt::core::PeerExperts::device_overhead_bytes() +
+                                         (uint64_t) basalt::core::Verifier::gs_peer_bytes(wt, g, cur, o.peer_device);
                 room = (uint64_t) pfree > reserve ? (uint64_t) pfree - reserve : 0;
                 if (o.peer_slots > 0)
                     room = std::min<uint64_t>(room, (uint64_t) o.peer_slots * basalt::kernels::cpu::expert_layout().max_blob);
@@ -4454,7 +4455,12 @@ int main(int argc, char** argv) {
     // peer's experts out, so they are read from the file here and held only on the peer.
     auto open_peer = [&](bool exclusive) -> bool {
         const auto tp0 = Clock::now();
-        if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, o.peer_reserve_mib, o.peer_slots,
+        // the GDN mixer split loads the peer's key heads after its tier is filled
+        int d0 = 0;
+        cudaGetDevice(&d0);
+        const int peer_reserve = o.peer_reserve_mib +
+                                 (int) ((basalt::core::Verifier::gs_peer_bytes(wt, g, d0, o.peer_device) + (1 << 20) - 1) >> 20);
+        if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, peer_reserve, o.peer_slots,
                        err, exclusive)) {
             basalt::log::error("basalt generate", "%s", err.c_str());
             return false;

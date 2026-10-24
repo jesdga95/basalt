@@ -208,6 +208,9 @@ public:
     /// The CUDA0 bytes the GDN mixer split by key head loads after the expert cache is sized (CUDA0's packed rows and
     /// columns of its key heads), for CUDA0 on dev0 and the peer on dev1; 0 when the split is not taken.
     static int64_t gs_cuda0_bytes(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1);
+    /// The peer bytes the split loads after the peer's expert tier is filled (its key heads' rows, columns, gates,
+    /// state slices and the mixer's rows); 0 when the split is not taken.
+    static int64_t gs_peer_bytes(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1);
     /// The bytes prepare_hc8 will place when `has` names the tensors the model holds (0 with the copies off).
     static uint64_t hc8_plan_bytes(const std::function<bool(const std::string&)>& has, const ModelGeometry& g);
 

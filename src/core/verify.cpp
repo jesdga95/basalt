@@ -792,6 +792,30 @@ int64_t Verifier::gs_cuda0_bytes(const WeightTable& wt, const ModelGeometry& g, 
     return b;
 }
 
+int64_t Verifier::gs_peer_bytes(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1) {
+    if (dev1 < 0 || dev1 == dev0) return 0;
+    const int nk0 = gs_plan(g, dev0, dev1);
+    if (nk0 == 0) return 0;
+    const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, S = (int) g.ssm_state_size, HIST = (int) g.ssm_d_conv - 1;
+    const basalt::core::GdnHeadSlice sl{HK, HV, S, nk0, HK - nk0};
+    const int64_t N = g.n_embd, C1 = sl.c(), Z1 = sl.zv(), V1 = sl.nv();
+    int64_t b = 0, layers = 0;
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        if (is_qsa_layer(g, l)) continue;
+        const LayerView v(wt, l);
+        const WeightRef *q = v.get("attn_qkv.weight"), *z = v.get("attn_gate.weight"), *o = v.get("ssm_out.weight");
+        if (!q || !z || !o) return 0;
+        b += (int64_t) basalt::kernels::native_mmvq_weight_bytes(q->native_type, (int) N, (int) C1) +
+             (int64_t) basalt::kernels::native_mmvq_weight_bytes(z->native_type, (int) N, (int) Z1) +
+             (int64_t) basalt::kernels::native_mmvq_weight_bytes(o->native_type, (int) Z1, (int) N) +
+             C1 * (HIST + 1) * 4 + V1 * N * 2 * 2 + V1 * 4 * 2 + (int64_t) S * 4 +
+             (int64_t) basalt::core::gdn_slice_state_floats(sl, HIST) * 4;
+        ++layers;
+    }
+    // the mixer's rows and per-allocation rounding
+    return b + layers * (2 << 20);
+}
+
 void Verifier::gs_init() {
     using basalt::core::GdnHeadSlice;
     if (dm_ == nullptr || dm_->pdev < 0 || wt_ == nullptr) return;
