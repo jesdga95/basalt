@@ -2350,10 +2350,11 @@ int main(int argc, char** argv) {
         pio.max_inflight = (uint32_t) o.ple_inflight;
         pio.cache_rows = (uint64_t) o.ple_row_cache;
         // Keep the SSD awake while rows are being asked for (PleReader::set_keepalive): some SSDs stall the first reads
-        // after a short idle period.  The keepalive reads one page anyway after a read-free interval, and goes on for a
-        // window after the last row request; then the SSD may sleep until the next request.
+        // after a short idle period.  The keepalive reads one page after a read-free interval, from the table open
+        // on and for a window after the last row request; then the SSD may sleep until the next request.  The
+        // interval is well under the idle period after which the SSD drops its power state.
         {
-            pio.keepalive_ms = 100.0;
+            pio.keepalive_ms = 40.0;
             pio.keepalive_window_s = 60.0;
             if (pio.mode != basalt::kernels::PleIo::Direct) pio.keepalive_ms = 0;
         }

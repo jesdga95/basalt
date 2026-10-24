@@ -72,7 +72,8 @@ public:
     bool collect(Ticket t, std::string& err);
 
     /// Keep the SSD awake while the table is in use (call after `open`): when no read has
-    /// gone out for `period_ms`, the worker reads one page of the table, until `window_s` after the last `issue`.
+    /// gone out for `period_ms`, the worker reads one page of the table, until `window_s` after the last `issue`
+    /// (after this call when there has been none).
     /// Some SSDs drop into a power state after ~250 ms without a command and stall the next reads 50-150 ms
     ///, which in
     /// decode happens after a few rounds whose rows all came from the row cache. 0 turns it off (the reader's

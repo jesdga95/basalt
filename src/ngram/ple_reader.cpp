@@ -565,6 +565,8 @@ void PleReader::set_keepalive(double period_ms, double window_s) {
         std::lock_guard<std::mutex> lk(m.mu);
         m.keep_us = period_ms > 0 ? period_ms * 1000.0 : 0.0;
         m.keep_window_us = window_s > 0 ? window_s * 1e6 : 0.0;
+        // The window starts now, so the first request after load finds the SSD awake too.
+        if (m.keep_us > 0 && m.last_issue_us <= 0) m.last_issue_us = now_us();
     }
     m.cv_work.notify_all();
 }
