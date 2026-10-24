@@ -25,6 +25,29 @@ std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity) {
 }
 
 namespace {
+/// The clock of one wait: the time is read every 1024 spins, and `progress` (any number that changes when the wait is
+/// getting somewhere) restarts it.  `expired` is true once ExpertPool::kStall has passed without any.  It is armed by its
+/// first reading, so it does not depend on how many spins that takes to come round.
+class StallClock {
+public:
+    bool expired(uint32_t progress) {
+        if ((++spins_ & 1023u) != 0) return false;
+        const auto now = std::chrono::steady_clock::now();
+        if (!armed_ || progress != seen_) {
+            armed_ = true;
+            seen_ = progress;
+            t0_ = now;
+            return false;
+        }
+        return now - t0_ > ExpertPool::kStall;
+    }
+
+private:
+    uint32_t spins_ = 0, seen_ = 0;
+    bool armed_ = false;
+    std::chrono::steady_clock::time_point t0_{};
+};
+
 std::atomic<const ExpertPool*> g_diag_pool{nullptr};
 void diag_active_pool(std::FILE* f) {
     if (const ExpertPool* p = g_diag_pool.load()) p->diag(f);
@@ -176,22 +199,22 @@ uint32_t ExpertPool::begin_batch(int n) {
     return e;
 }
 
+void ExpertPool::stalled() {
+    basalt::core::release_gpu_waits(basalt::log::stream());   // the GPU may be spinning on this layer's flag
+    std::abort();
+}
+
 void ExpertPool::wait_parked(const char* what) {
     hstate_.store(kWaitParked, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
-    uint32_t spins = 0;
-    std::chrono::steady_clock::time_point t0{};
+    StallClock clock;
     while (parked_.load(std::memory_order_acquire) != (uint32_t) n_) {
         _mm_pause();
-        if ((++spins & 1023u) != 0) continue;
-        const auto now = std::chrono::steady_clock::now();
-        if (spins == 1024u) t0 = now;
-        else if (now - t0 > kStall) {
+        if (clock.expired(parked_.load(std::memory_order_relaxed))) {
             basalt::log::error("basalt", "the CPU expert pool stalled %s (%u of %d workers parked) - stopping the engine "
                                  "so the server can start it again",
                          what, parked_.load(), n_);
-            basalt::core::release_gpu_waits(basalt::log::stream());   // the GPU may be spinning on this layer's flag
-            std::abort();
+            stalled();
         }
     }
 }
@@ -199,21 +222,16 @@ void ExpertPool::wait_parked(const char* what) {
 void ExpertPool::wait_done(int n) {
     hstate_.store(kWaitDone, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
-    uint32_t spins = 0, seen = 0;
-    std::chrono::steady_clock::time_point t0{};
+    StallClock clock;
     for (;;) {
         const uint32_t d = done_.load(std::memory_order_acquire);
         if (d >= (uint32_t) n) return;                                // `>=`: never a wait that an overshoot outlives
         _mm_pause();
-        if ((++spins & 1023u) != 0) continue;
-        const auto now = std::chrono::steady_clock::now();
-        if (spins == 1024u || d != seen) { t0 = now; seen = d; }     // progress restarts the clock
-        else if (now - t0 > kStall) {
+        if (clock.expired(d)) {                                       // progress restarts the clock
             basalt::log::error("basalt", "the CPU expert pool stalled: %u of %d jobs done, %u of %d workers parked - "
                                  "stopping the engine so the server can start it again",
                          d, n, parked_.load(), n_);
-            basalt::core::release_gpu_waits(basalt::log::stream());
-            std::abort();
+            stalled();
         }
     }
 }
