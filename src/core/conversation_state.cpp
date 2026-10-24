@@ -1,8 +1,10 @@
 #include "basalt/core/conversation_snapshot.hpp"
+#include "basalt/log.hpp"
 #include "conversation_checked.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
 
 namespace basalt::core {
@@ -173,6 +175,7 @@ ConversationCheckpointDeferral::~ConversationCheckpointDeferral() {
     if (worker_.joinable()) worker_.join();
     if (stream_) cudaStreamDestroy(static_cast<cudaStream_t>(stream_));
     if (spare_) cudaFree(spare_);
+    if (pinned_) cudaFreeHost(pinned_);
 }
 
 bool ConversationCheckpointDeferral::reserve(size_t bytes, std::string& error) {
@@ -187,6 +190,13 @@ bool ConversationCheckpointDeferral::reserve(size_t bytes, std::string& error) {
         spare_ = nullptr;
         cudaStreamDestroy(s);
         return fail(error, "cannot allocate the deferred checkpoint buffer");
+    }
+    // The host copy goes through page-locked memory: a copy into a pageable vector holds the CUDA driver for its whole
+    // duration and stalls the next call of the request thread.
+    if (cudaHostAlloc(&pinned_, bytes, cudaHostAllocDefault) != cudaSuccess) {
+        cudaGetLastError();
+        pinned_ = nullptr;
+        basalt::log::warn("basalt serve", "the deferred checkpoint copy has no pinned buffer: it copies into pageable memory");
     }
     stream_ = s;
     cap_ = bytes;
@@ -217,8 +227,9 @@ bool ConversationCheckpointDeferral::save(ConversationCheckpoint& c, const Sessi
     worker_ = std::thread([this, dev, n = z.gdn] {
         cudaSetDevice(dev);
         auto s = static_cast<cudaStream_t>(stream_);
-        int st = cudaMemcpyAsync(const_cast<void*>(dst_), spare_, n, cudaMemcpyDeviceToHost, s);
+        int st = cudaMemcpyAsync(pinned_ ? pinned_ : const_cast<void*>(dst_), spare_, n, cudaMemcpyDeviceToHost, s);
         if (st == cudaSuccess) st = cudaStreamSynchronize(s);
+        if (st == cudaSuccess && pinned_) std::memcpy(const_cast<void*>(dst_), pinned_, n);
         status_ = st;
     });
     return true;

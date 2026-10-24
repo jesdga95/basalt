@@ -155,6 +155,22 @@ void full_session(int fmt, int mode, int experts) {
               std::equal(deferred.dead.begin(),deferred.dead.end(),checkpoint.dead.begin()) &&
               std::equal(deferred.block_pos.begin(),deferred.block_pos.end(),checkpoint.block_pos.begin()),
               "deferred checkpoint bytes match the plain save");
+        // the same buffers again with different state: the bounce is reused, and each copy matches its own plain save
+        for (uint8_t salt : {uint8_t(41), uint8_t(97)}) {
+            cuda_check(cudaMemset(ss.gdn_state,salt,sizes.gdn));
+            cuda_check(cudaDeviceSynchronize());
+            ConversationCheckpoint plain;
+            plain.ids=checkpoint.ids;
+            check(conversation_checkpoint_save(plain,ss,g,err),"plain save of another state");
+            ConversationCheckpoint again;
+            again.ids=checkpoint.ids;
+            check(deferral.save(again,ss,g,err),"issue a second deferred save");
+            cuda_check(cudaMemset(ss.gdn_state,0x33,sizes.gdn));
+            cuda_check(cudaDeviceSynchronize());
+            check(deferral.finish(err) && again.gdn==plain.gdn && again.ple==plain.ple && again.tails==plain.tails &&
+                  again.dead==plain.dead && again.block_pos==plain.block_pos,
+                  "a reused deferral matches the plain save of its own state");
+        }
         cuda_check(cudaMemset(ss.gdn_state,13,sizes.gdn));
         cuda_check(cudaDeviceSynchronize());
     }

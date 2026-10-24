@@ -47,8 +47,8 @@ bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const Sess
                                   const ModelGeometry& g, std::string& error);
 /// Saves a checkpoint's GDN recurrences off the caller's critical path: the device state is copied into a spare
 /// device buffer at device bandwidth, and a helper thread moves it to the checkpoint's host bytes while the caller
-/// carries on.  The checkpoint's `gdn` bytes are valid only once finish() has returned true; nothing may read,
-/// move-from or free them before then.  The caller synchronizes the device before save(), as for a plain save.
+/// carries on (through a page-locked bounce buffer when one could be allocated).  The checkpoint's `gdn` bytes are
+/// valid only once finish() has returned true; nothing may read, move-from or free them before then.  The caller synchronizes the device before save(), as for a plain save.
 class ConversationCheckpointDeferral {
 public:
     ConversationCheckpointDeferral() = default;
@@ -66,6 +66,7 @@ public:
 
 private:
     void* spare_ = nullptr;
+    void* pinned_ = nullptr;
     void* stream_ = nullptr;
     size_t cap_ = 0;
     std::thread worker_;
