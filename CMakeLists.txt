@@ -425,7 +425,7 @@ add_custom_target(git_stamp
 execute_process(COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DOUT=${_git_stamp}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/git_stamp.cmake)
 # the engine driven as a child process and the report logic, shared by basalt-bench and basalt-probe
-add_library(engine_session STATIC src/program/engine_session.cpp src/program/load_summary.cpp src/program/probe_report.cpp src/program/probe_derive.cpp src/program/auto_plan.cpp)
+add_library(engine_session STATIC src/program/engine_session.cpp src/program/load_summary.cpp src/program/probe_report.cpp src/program/probe_derive.cpp src/program/auto_plan.cpp src/program/community_row.cpp)
 target_include_directories(engine_session PUBLIC include)
 find_package(Threads REQUIRED)
 target_link_libraries(engine_session PUBLIC platform Threads::Threads)
@@ -460,6 +460,7 @@ basalt_embed_manifest(basalt-bench)
 target_compile_definitions(basalt-bench PRIVATE
   BASALT_BENCH_ENGINE="$<TARGET_FILE:basalt>"
   BASALT_BENCH_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/data/bench"
+  BASALT_BENCH_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
   BASALT_BENCH_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
   BASALT_BENCH_CUDA="${CMAKE_CUDA_COMPILER_VERSION}")
 
@@ -516,6 +517,20 @@ basalt_embed_manifest(iq_parity)
 # BUILD directory (the source tree is not touched).  The CTest fixture makes generation-to-test order
 # explicit even under parallel execution; a fixture-generation failure fails iq_parity with it.
 find_package(Python3 COMPONENTS Interpreter QUIET)
+
+# appending a community row to docs/community/benchmarks.json: formatting cases, and a byte comparison with
+# tools/check_benchmarks.py --fix (python3)
+add_executable(community_row_test tests/program/community_row_test.cpp)
+target_link_libraries(community_row_test PRIVATE engine_session platform warnings)
+basalt_embed_manifest(community_row_test)
+basalt_cpu_test(NAME community_row_test COMMAND community_row_test)
+set_tests_properties(community_row_test PROPERTIES TIMEOUT 60)
+if(Python3_Interpreter_FOUND)
+  basalt_cpu_test(NAME community_row_fix_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/community_row_fix_test.py
+                          $<TARGET_FILE:community_row_test> ${CMAKE_CURRENT_SOURCE_DIR})
+  set_tests_properties(community_row_fix_test PROPERTIES TIMEOUT 60)
+endif()
 
 # the C++ tokenizer's ids against tools/tokenizer.py over a corpus
 # (-DBASALT_TOKENIZER_DIR=<a pack's extracted tokenizer/ directory>, with python3 and the regex package)

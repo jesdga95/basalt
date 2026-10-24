@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Validate docs/community/benchmarks.json (stdlib only). Exits 1 with per-row messages."""
+"""Validate docs/community/benchmarks.json (stdlib only). Exits 1 with per-row messages.
+
+--fix rewrites a valid-JSON file in the canonical format, then validates it.
+"""
 import json
 import re
 import sys
@@ -90,14 +93,35 @@ def check_row(r, err):
         err("notes must be a string of at most 200 characters")
 
 
-def main(argv):
-    path = argv[1] if len(argv) > 1 else "docs/community/benchmarks.json"
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError) as e:
-        print(f"{path}: {e}")
-        return 1
+ROW_ORDER = ("submitter", "date", "commit", "preset", "gpus", "ram_gib", "os",
+             "quant", "prefill_16k_tps", "prefill_64k_tps", "decode_tps", "notes")
+GPU_ORDER = ("name", "vram_gib", "power_w")
+TOP_ORDER = ("preset", "runs")
+FIX_HINT = "python3 tools/check_benchmarks.py --fix docs/community/benchmarks.json"
+
+
+def ordered(d, order):
+    """Known keys in the fixed order, unknown keys after them in file order."""
+    if not isinstance(d, dict):
+        return d
+    return {**{k: d[k] for k in order if k in d}, **{k: v for k, v in d.items() if k not in order}}
+
+
+def canonical(data):
+    """The one accepted file form: fixed key order, 2-space indent, no trailing newline."""
+    data = ordered(data, TOP_ORDER)
+    if isinstance(data.get("runs"), list) if isinstance(data, dict) else False:
+        rows = []
+        for r in data["runs"]:
+            r = ordered(r, ROW_ORDER)
+            if isinstance(r, dict) and isinstance(r.get("gpus"), list):
+                r["gpus"] = [ordered(g, GPU_ORDER) for g in r["gpus"]]
+            rows.append(r)
+        data["runs"] = rows
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+def validate(data):
     problems = []
     if not isinstance(data, dict):
         problems.append("top level must be an object")
@@ -112,6 +136,30 @@ def main(argv):
             who = r.get("submitter") if isinstance(r, dict) else None
             label = f"runs[{i}]" + (f" ({who})" if isinstance(who, str) and who else "")
             check_row(r, lambda m, label=label: problems.append(f"{label}: {m}"))
+    return problems
+
+
+def main(argv):
+    args = argv[1:]
+    fix = "--fix" in args
+    args = [a for a in args if a != "--fix"]
+    path = args[0] if args else "docs/community/benchmarks.json"
+    try:
+        with open(path, encoding="utf-8", newline="") as f:
+            text = f.read()
+        data = json.loads(text)
+    except (OSError, ValueError) as e:
+        print(f"{path}: {e}")
+        return 1
+    problems = validate(data)
+    want = canonical(data)
+    if fix and text != want:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(want)
+        print(f"{path}: rewritten in the canonical format")
+        text = want
+    elif text != want:
+        problems.append(f"not in the canonical format; run: {FIX_HINT}")
     for p in problems:
         print(f"{path}: {p}")
     if problems:

@@ -27,6 +27,7 @@
 #include "basalt/platform/memory.hpp"
 #include "basalt/platform/process.hpp"
 #include "basalt/platform/system.hpp"
+#include "basalt/program/community_row.hpp"
 #include "basalt/program/engine_session.hpp"
 
 #include <errno.h>
@@ -80,22 +81,7 @@ std::string fmt(const char* f, ...) {
 
 double secs(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double>(b - a).count(); }
 
-std::string json_quote(const std::string& s) {
-    std::string o = "\"";
-    for (unsigned char c : s) {
-        switch (c) {
-            case '"': o += "\\\""; break;
-            case '\\': o += "\\\\"; break;
-            case '\n': o += "\\n"; break;
-            case '\t': o += "\\t"; break;
-            case '\r': o += "\\r"; break;
-            default:
-                if (c < 0x20) o += fmt("\\u%04x", (unsigned) c);
-                else o += (char) c;
-        }
-    }
-    return o + "\"";
-}
+using basalt::program::json_quote;
 
 // Streaming JSON writer: commas and key/value pairing are tracked here.
 class JW {
@@ -241,7 +227,8 @@ struct Options {
     int reps = 1;
     bool quality = false, no_windows = false, print_command = false;
     bool community = false;
-    std::string submitter = "YOUR_NAME";
+    std::string submitter;
+    std::string community_file;          // --community-file: the table the row is added to
     int quality_chunks = 20, quality_t = 3;
     unsigned long long seed = 0;         // --seed N: the sampling seed of every decode request (0: the engine seeds from the clock)
 };
@@ -272,12 +259,14 @@ void usage(const std::string& engine) {
         "                     fixtures, a 16384-token prefill and a 65536-token prefill, once each, with int8 KV cache\n"
         "                     and the engine's own defaults otherwise (no warm-up, no repetition, drafting at its\n"
         "                     default). The decode fixtures and each prefill run in their own fresh engine process, so\n"
-        "                     every number is cold. Prints the table, then one JSON row. prefill_16k_tps and\n"
+        "                     every number is cold. Prints the table, adds the row to benchmarks.json and prints it. prefill_16k_tps and\n"
         "                     prefill_64k_tps = engine tokens/s of those requests; decode_tps = tokens / decode time\n"
         "                     summed over conv, struct and prose (token-weighted). Needs NVML for the GPU names, VRAM and enforced power limits. Only\n"
-        "                     --model, --submitter, --fixtures, --logs and --print-command may be given with it:\n"
+        "                     --model, --submitter, --community-file, --fixtures, --logs and --print-command may be given with it:\n"
         "                     any other option or engine flag would make rows incomparable and is refused\n"
-        "  --submitter NAME   the name shown in the table, written into the row (default: the placeholder to replace)\n"
+        "  --submitter NAME   the name shown in the table, written into the row (required with --community)\n"
+        "  --community-file PATH  the benchmarks.json the row is added to (default: docs/community/benchmarks.json of the\n"
+        "                     checkout this build came from); when it cannot be written the row is printed instead\n"
         "\n"
         "engine\n"
         "  --model FILE       a .basalt model file; --peer-device 1 is added when a second GPU is visible. Every\n"
@@ -360,6 +349,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else if (a == "--spec") o.spec = next("--spec");
         else if (a == "--community") o.community = true;
         else if (a == "--submitter") o.submitter = next("--submitter");
+        else if (a == "--community-file") o.community_file = next("--community-file");
         else if (a == "--fixtures") o.fixtures = next("--fixtures");
         else if (a == "-o") o.format = next("-o");
         else if (a == "--power-label") o.power_label = next("--power-label");
@@ -415,7 +405,14 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
             return false;
         }
         if (o.model.empty()) { err = "--community needs --model FILE"; return false; }
+        std::string who = o.submitter;
+        for (char& c : who) c = (char) std::toupper((unsigned char) c);
+        if (who.find_first_not_of(" \t") == std::string::npos || who == "YOUR_NAME") {
+            err = "--community needs --submitter NAME, the name shown in the table";
+            return false;
+        }
     }
+    if (!o.community_file.empty() && !o.community) { err = "--community-file needs --community"; return false; }
     if (o.reps < 1) { err = "-r needs N >= 1"; return false; }
     if (o.format != "md" && o.format != "json") { err = "-o takes md or json"; return false; }
     if (o.quality_chunks < 1 || o.quality_t < 1) { err = "--quality and --quality-t need values >= 1"; return false; }
@@ -1043,6 +1040,7 @@ int main(int argc, char** argv) {
                 rep += fmt("\nnote: struct produced %lld tokens, the expected count is %lld\n", x.d.generated, kStructTokens);
     }
     std::string community_row;
+    basalt::program::CommunityRow crow;
     if (o.community) {
         // one aggregate per direction over the single cold pass: tokens over time summed across requests
         double pre_tps[2] = {0, 0}, pre_s[2] = {0, 0}, dec_tok = 0, dec_ms = 0;
@@ -1056,7 +1054,6 @@ int main(int argc, char** argv) {
                 dec_ms += x.d.decode_ms;
             }
         }
-        std::vector<std::string> gpu_json;
         std::string gpu_err;
         std::istringstream ids(info.count("gpus") ? info["gpus"] : "");
         for (std::string id; std::getline(ids, id, ',');) {
@@ -1067,11 +1064,10 @@ int main(int argc, char** argv) {
             }
             for (const char* v : {"NVIDIA ", "GeForce "})
                 if (g.name.rfind(v, 0) == 0) g.name.erase(0, std::strlen(v));
-            gpu_json.push_back(fmt("{\"name\": %s, \"vram_gib\": %.0f, \"power_w\": %.0f}", json_quote(g.name).c_str(),
-                                   g.vram_gib, g.power_enforced_w));
+            crow.gpus.push_back({g.name, g.vram_gib, g.power_enforced_w});
         }
         const uint64_t ram_b = basalt::platform::total_physical_memory();
-        if (gpu_err.empty() && gpu_json.empty()) gpu_err = "the engine did not report which GPUs it used";
+        if (gpu_err.empty() && crow.gpus.empty()) gpu_err = "the engine did not report which GPUs it used";
         if (gpu_err.empty() && (pre_tps[0] <= 0 || pre_tps[1] <= 0 || dec_ms <= 0)) gpu_err = "a request reported no time";
         if (gpu_err.empty() && ram_b == 0) gpu_err = "the system RAM size could not be read";
         if (!gpu_err.empty()) {
@@ -1082,15 +1078,17 @@ int main(int argc, char** argv) {
         std::time_t now = std::time(nullptr);
         char day[16] = {};
         std::strftime(day, sizeof day, "%Y-%m-%d", std::localtime(&now));
-        std::string gj;
-        for (const std::string& g : gpu_json) gj += (gj.empty() ? "" : ", ") + g;
-        community_row = fmt("{\"submitter\": %s, \"date\": \"%s\", \"commit\": \"%s\", \"preset\": \"community-1\", "
-                            "\"gpus\": [%s], \"ram_gib\": %.0f, \"os\": \"%s\", \"quant\": %s, "
-                            "\"prefill_16k_tps\": %.1f, \"prefill_64k_tps\": %.1f, \"decode_tps\": %.1f}",
-                            json_quote(o.submitter).c_str(), day, BASALT_BENCH_GIT, gj.c_str(),
-                            (double) ram_b / (double) (1ull << 30), basalt::platform::host_os_name().c_str(),
-                            json_quote(info.count("quant") ? info["quant"] : "unknown").c_str(),
-                            pre_tps[0], pre_tps[1], dec_tok / (dec_ms / 1000.0));
+        crow.submitter = o.submitter;
+        crow.date = day;
+        crow.commit = BASALT_BENCH_GIT;
+        crow.preset = "community-1";
+        crow.ram_gib = (double) ram_b / (double) (1ull << 30);
+        crow.os = basalt::platform::host_os_name();
+        crow.quant = info.count("quant") ? info["quant"] : "unknown";
+        crow.prefill_16k_tps = pre_tps[0];
+        crow.prefill_64k_tps = pre_tps[1];
+        crow.decode_tps = dec_tok / (dec_ms / 1000.0);
+        community_row = basalt::program::community_row_text(crow);
         rep += fmt("\ncommunity-1: prefill 16K %.1f t/s (%.1f s), prefill 64K %.1f t/s (%.1f s), decode %.1f t/s (%.0f tokens in %.1f s), "
                    "each measured cold\n",
                    pre_tps[0], pre_s[0], pre_tps[1], pre_s[1], dec_tok / (dec_ms / 1000.0), dec_tok, dec_ms / 1000.0);
@@ -1227,9 +1225,18 @@ int main(int argc, char** argv) {
     }
     std::fputs(rep.c_str(), stdout);
     if (!community_row.empty()) {
-        std::printf("\nCOMMUNITY ROW (one line; set submitter to the name you want shown):\n%s\n"
-                    "Submit it: add the row to the runs list in docs/community/benchmarks.json and open a pull request (docs/community.md).\n",
-                    community_row.c_str());
+        const std::string path = o.community_file.empty() ? std::string(BASALT_BENCH_SOURCE_DIR) + "/docs/community/benchmarks.json"
+                                                          : o.community_file;
+        std::string why;
+        std::printf("\nCOMMUNITY ROW:\n%s\n", community_row.c_str());
+        std::fflush(stdout);
+        if (basalt::program::community_add_row_file(path, crow, why))
+            basalt::log::info("basalt-bench", "the row was added to %s; review it, commit it and open a pull request (docs/community.md)",
+                              path.c_str());
+        else
+            basalt::log::warn("basalt-bench", "the row was not added to %s (%s); paste it at the end of the runs list of docs/community/benchmarks.json, "
+                              "run python3 tools/check_benchmarks.py --fix on it and open a pull request (docs/community.md)",
+                              path.c_str(), why.c_str());
     }
     return do_quality && !quality.ran ? 1 : 0;
 }
