@@ -564,6 +564,7 @@ bool Verifier::dm_init(std::string& err) {
         if (!router_ok || !warm_router(rq_h, rs_h, &d->rq, &d->rs))
             basalt::log::warn("basalt verify", "the peer's L2 warm-up is off (a router the predictor does not cover)");
     }
+    if (d->pdev >= 0) hs_init();
     if (cpu_warm && router_ok) {
         CpuWarm* w = new CpuWarm;
         w->rq = std::move(rq_h);
@@ -665,9 +666,88 @@ bool Verifier::dm_fence(cudaStream_t s) {
     return cudaEventRecord(fence_ev_, cs_) == cudaSuccess && cudaStreamWaitEvent(s, fence_ev_, 0) == cudaSuccess;
 }
 
+// Memory bandwidth of a card from its attributes, bytes per second.
+static double card_bandwidth(int dev) {
+    int khz = 0, bits = 0;
+    if (cudaDeviceGetAttribute(&khz, cudaDevAttrMemoryClockRate, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&bits, cudaDevAttrGlobalMemoryBusWidth, dev) != cudaSuccess) {
+        cudaGetLastError();
+        return 0.0;
+    }
+    return 2.0 * khz * 1e3 * bits / 8.0;
+}
+
+// The head's rows are split by the time each card takes for its share: CUDA0 streams its rows, the peer streams
+// its rows and its logits cross PCIe twice (to the host, to CUDA0).  A split that leaves CUDA0 most of the rows
+// does not pay for its two hand-offs, so it is taken only when the peer's share is large.
+void Verifier::hs_init() {
+    if (head_ == nullptr || !head_->loaded() || head_->vproxy() != nullptr || dm_ == nullptr || dm_->pdev < 0) return;
+    const int N = (int) g_->n_embd, V = (int) n_vocab_, T = max_t_;
+    if (head_->type() == 13 ? !basalt::kernels::q5k_head_supported(N, T) : head_->type() == 14) return;
+    const double bw0 = card_bandwidth(device_), bw1 = card_bandwidth(dm_->pdev);
+    const size_t rb = head_->row_bytes();
+    if (bw0 <= 0.0 || bw1 <= 0.0 || rb == 0) return;
+    const double pcie = 25e9, cols = 3.0;   // the hand-off rate and a typical window
+    const double c0 = (double) rb / bw0, c1 = (double) rb / bw1 + 2.0 * cols * 4.0 / pcie;
+    const double share0 = c1 / (c0 + c1);
+    if (share0 > 0.75) return;
+    const int rows = (int) (share0 * V) / 256 * 256;
+    if (rows <= 0 || rows >= V) return;
+    const int r1 = V - rows;
+    const size_t xb = basalt::kernels::native_q8_1_bytes(N, T);
+    bool ok;
+    {
+        const OnDevice on(dm_->pdev);
+        ok = cudaMalloc(&hs_w_, (size_t) r1 * rb) == cudaSuccess && cudaMalloc(&hs_xq_, xb) == cudaSuccess &&
+             cudaMalloc((void**) &hs_y_, (size_t) T * r1 * 4) == cudaSuccess &&
+             cudaStreamCreateWithFlags(&hs_s_, cudaStreamNonBlocking) == cudaSuccess &&
+             cudaEventCreateWithFlags(&hs_out_, cudaEventDisableTiming) == cudaSuccess;
+        ok = ok && cudaMemcpyPeer(hs_w_, dm_->pdev, (const uint8_t*) head_->weights() + (size_t) rows * rb, device_,
+                                  (size_t) r1 * rb) == cudaSuccess;
+    }
+    {
+        const OnDevice on(device_);
+        ok = ok && cudaMalloc((void**) &hs_y0_, (size_t) T * rows * 4) == cudaSuccess &&
+             cudaEventCreateWithFlags(&hs_in_, cudaEventDisableTiming) == cudaSuccess &&
+             cudaHostAlloc(&hs_hxq_, xb, cudaHostAllocPortable) == cudaSuccess &&
+             cudaHostAlloc((void**) &hs_hy_, (size_t) T * r1 * 4, cudaHostAllocPortable) == cudaSuccess;
+    }
+    if (!ok) {
+        cudaGetLastError();
+        hs_free();
+        basalt::log::warn("basalt verify", "the head stays whole on CUDA0: no room for the peer's share");
+        return;
+    }
+    hs_rows_ = rows;
+    hs_dev_ = dm_->pdev;
+    basalt::log::info("basalt verify", "the head is split by vocabulary: CUDA0 %d rows, the peer %d rows", rows, r1);
+}
+
+void Verifier::hs_free() {
+    if (hs_dev_ >= 0 || hs_w_ != nullptr || hs_s_ != nullptr) {
+        const OnDevice on(dm_ != nullptr && dm_->pdev >= 0 ? dm_->pdev : hs_dev_);
+        if (hs_s_) { cudaStreamSynchronize(hs_s_); cudaStreamDestroy(hs_s_); }
+        if (hs_out_) cudaEventDestroy(hs_out_);
+        for (void* p : {hs_w_, hs_xq_, (void*) hs_y_}) if (p) cudaFree(p);
+    }
+    {
+        const OnDevice on(device_);
+        if (hs_y0_) cudaFree(hs_y0_);
+        if (hs_in_) cudaEventDestroy(hs_in_);
+        if (hs_hxq_) cudaFreeHost(hs_hxq_);
+        if (hs_hy_) cudaFreeHost(hs_hy_);
+    }
+    hs_rows_ = 0; hs_dev_ = -1;
+    hs_w_ = hs_xq_ = hs_hxq_ = nullptr;
+    hs_y_ = hs_y0_ = hs_hy_ = nullptr;
+    hs_s_ = nullptr;
+    hs_in_ = hs_out_ = nullptr;
+}
+
 void Verifier::dm_free() {
     DecMoe* d = dm_;
     if (d == nullptr) return;
+    hs_free();
     if (d->warm != nullptr) {
         warm_pool_->idle_stop();
         delete d->warm;
@@ -2167,7 +2247,37 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (head_ != nullptr && head_->loaded()) {
             try {
                 native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
-                if (head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits, one wave
+                // rows [0, n) of `w` into y (T rows of n); the same kernel and bits as the whole head
+                auto head_rows = [&](const void* w, float* y, int n, cudaStream_t s) {
+                    const void* x = s == cs ? (const void*) xq_ : hs_xq_;
+                    if (head_->type() == 13 && q5k_head_supported((int) N, T))
+                        q5k_head_mmvq(w, x, y, (int) N, n, T, s);
+                    else if (head_->type() == 14 && q6k_head_supported((int) N, T))
+                        q6k_head_mmvq(w, x, y, (int) N, n, T, s);
+                    else
+                        native_mmvq(head_->type(), w, x, y, (int) N, n, T, s);
+                };
+                if (hs_rows_ > 0) {   // the peer's rows while CUDA0 does its own; its logits land beside CUDA0's
+                    const int r0 = hs_rows_, r1 = (int) n_vocab_ - r0;
+                    const size_t xb = native_q8_1_bytes((int) N, T);
+                    bool ok = cudaMemcpyAsync(hs_hxq_, xq_, xb, cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
+                              cudaEventRecord(hs_in_, cs) == cudaSuccess;
+                    {
+                        const OnDevice on(hs_dev_);
+                        ok = ok && cudaStreamWaitEvent(hs_s_, hs_in_, 0) == cudaSuccess &&
+                             cudaMemcpyAsync(hs_xq_, hs_hxq_, xb, cudaMemcpyHostToDevice, hs_s_) == cudaSuccess;
+                        if (ok) head_rows(hs_w_, hs_y_, r1, hs_s_);
+                        ok = ok && cudaMemcpyAsync(hs_hy_, hs_y_, (size_t) T * r1 * 4, cudaMemcpyDeviceToHost, hs_s_) == cudaSuccess &&
+                             cudaEventRecord(hs_out_, hs_s_) == cudaSuccess;
+                    }
+                    head_rows(head_->weights(), hs_y0_, r0, cs);
+                    ok = ok && cudaMemcpy2DAsync(head_logits_, (size_t) n_vocab_ * 4, hs_y0_, (size_t) r0 * 4, (size_t) r0 * 4, T,
+                                                 cudaMemcpyDeviceToDevice, cs) == cudaSuccess &&
+                         cudaStreamWaitEvent(cs, hs_out_, 0) == cudaSuccess &&
+                         cudaMemcpy2DAsync(head_logits_ + r0, (size_t) n_vocab_ * 4, hs_hy_, (size_t) r1 * 4, (size_t) r1 * 4, T,
+                                           cudaMemcpyHostToDevice, cs) == cudaSuccess;
+                    if (!ok) { err = "verify: the split head's hand-off failed"; return false; }
+                } else if (head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits, one wave
                     q5k_head_mmvq(head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
                 else if (head_->type() == 14 && vhead_scratch_ != nullptr && q6k_vhead_supported((int) N, (int) n_vocab_, T))
                     q6k_vhead(head_->vproxy(), head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T,

@@ -319,6 +319,9 @@ private:
     ExpertSource* warm_src_ = nullptr;
     DecMoe* dm_ = nullptr;   // the device-planned MoE tail (null: off)
     bool dm_init(std::string& err);
+    // the head split by vocabulary with the peer card, when the peer streams its rows faster than CUDA0 does
+    void hs_init();
+    void hs_free();
     bool dm_sync(std::string& err);        ///< the residency tables to the devices, before a window
     bool dm_begin(std::string& err, DecodeGaps* gm);   ///< the tail's window start (tables, flags, the peer window)
     bool dm_end(std::string& err);         ///< the peer window's end
@@ -517,6 +520,17 @@ private:
     float* hit_xs_ = nullptr;
     void* hit_scratch_ = nullptr;
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
+    // head split: CUDA0 computes rows [0, hs_rows_), the peer the rest; hs_rows_ 0 means no split
+    int hs_rows_ = 0, hs_dev_ = -1;
+    void* hs_w_ = nullptr;           // peer: head rows [hs_rows_, n_vocab_)
+    void* hs_xq_ = nullptr;          // peer: the head's q8_1 input
+    float* hs_y_ = nullptr;          // peer: its logits, T rows of n_vocab_ - hs_rows_
+    float* hs_y0_ = nullptr;         // CUDA0: its logits, T rows of hs_rows_
+    void* hs_hxq_ = nullptr;         // pinned staging of the input
+    float* hs_hy_ = nullptr;         // pinned staging of the peer's logits
+    cudaStream_t hs_s_ = nullptr;    // peer
+    cudaEvent_t hs_in_ = nullptr;    // CUDA0: the input is staged
+    cudaEvent_t hs_out_ = nullptr;   // peer: its logits are staged
     uint8_t* vhead_scratch_ = nullptr;   // the two-stage head's histogram and row list (q6k_vhead)
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
