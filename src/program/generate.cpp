@@ -3459,6 +3459,14 @@ int main(int argc, char** argv) {
     // RAM copy the room past the headroom.  With the file-backed modes the rest is read from the SSD (the default
     // arena mode was checked against the RAM above).
     // what the peer card can hold of experts: its free memory less its buffers and reserve, capped by --peer-slots
+    // what the verify window's splits (the head by vocabulary, the GDN mixer by key head) load on the peer after its
+    // expert tier is filled
+    auto peer_split_bytes = [&](int dev0) -> int64_t {
+        const int64_t hs = native_head.loaded()
+            ? basalt::core::Verifier::hs_peer_bytes(native_head.row_bytes(), native_head.type(), n_vocab, g.n_embd,
+                                                    std::max({o.spec, o.batch, 2}), dev0, o.peer_device) : 0;
+        return hs + basalt::core::Verifier::gs_peer_bytes(wt, g, dev0, o.peer_device);
+    };
     auto peer_expert_room = [&]() -> uint64_t {
         uint64_t room = 0;
         if (o.peer_device < 1) return 0;
@@ -3469,7 +3477,7 @@ int main(int argc, char** argv) {
             if (cudaMemGetInfo(&pfree, &ptotal) == cudaSuccess) {
                 const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
                                          basalt::core::PeerExperts::device_overhead_bytes() +
-                                         (uint64_t) basalt::core::Verifier::gs_peer_bytes(wt, g, cur, o.peer_device);
+                                         (uint64_t) peer_split_bytes(cur);
                 room = (uint64_t) pfree > reserve ? (uint64_t) pfree - reserve : 0;
                 if (o.peer_slots > 0)
                     room = std::min<uint64_t>(room, (uint64_t) o.peer_slots * basalt::kernels::cpu::expert_layout().max_blob);
@@ -4458,8 +4466,7 @@ int main(int argc, char** argv) {
         // the GDN mixer split loads the peer's key heads after its tier is filled
         int d0 = 0;
         cudaGetDevice(&d0);
-        const int peer_reserve = o.peer_reserve_mib +
-                                 (int) ((basalt::core::Verifier::gs_peer_bytes(wt, g, d0, o.peer_device) + (1 << 20) - 1) >> 20);
+        const int peer_reserve = o.peer_reserve_mib + (int) ((peer_split_bytes(d0) + (1 << 20) - 1) >> 20);
         if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, peer_reserve, o.peer_slots,
                        err, exclusive)) {
             basalt::log::error("basalt generate", "%s", err.c_str());

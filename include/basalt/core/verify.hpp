@@ -211,6 +211,9 @@ public:
     /// The peer bytes the split loads after the peer's expert tier is filled (its key heads' rows, columns, gates,
     /// state slices and the mixer's rows); 0 when the split is not taken.
     static int64_t gs_peer_bytes(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1);
+    /// The peer bytes the head split by vocabulary loads after the peer's expert tier is filled, for a head of
+    /// `row_bytes` per row and native `type`, windows of up to max_t tokens; 0 when the split is not taken.
+    static int64_t hs_peer_bytes(size_t row_bytes, int type, int64_t n_vocab, int64_t n_embd, int max_t, int dev0, int dev1);
     /// The bytes prepare_hc8 will place when `has` names the tensors the model holds (0 with the copies off).
     static uint64_t hc8_plan_bytes(const std::function<bool(const std::string&)>& has, const ModelGeometry& g);
 

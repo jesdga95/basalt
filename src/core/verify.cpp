@@ -686,19 +686,34 @@ static double card_bandwidth(int dev) {
 // The head's rows are split by the time each card takes for its share: CUDA0 streams its rows, the peer streams
 // its rows and its logits cross PCIe twice (to the host, to CUDA0).  A split that leaves CUDA0 most of the rows
 // does not pay for its two hand-offs, so it is taken only when the peer's share is large.
-void Verifier::hs_init() {
-    if (head_ == nullptr || !head_->loaded() || head_->vproxy() != nullptr || dm_ == nullptr || dm_->pdev < 0) return;
-    const int N = (int) g_->n_embd, V = (int) n_vocab_, T = max_t_;
-    if (head_->type() == 13 ? !basalt::kernels::q5k_head_supported(N, T) : head_->type() == 14) return;
-    const double bw0 = card_bandwidth(device_), bw1 = card_bandwidth(dm_->pdev);
-    const size_t rb = head_->row_bytes();
-    if (bw0 <= 0.0 || bw1 <= 0.0 || rb == 0) return;
+// CUDA0's rows of the head split by vocabulary (0: no split), from the cards' bandwidths.
+static int hs_plan(size_t rb, int type, int V, int N, int T, int dev0, int dev1) {
+    if (type == 13 ? !basalt::kernels::q5k_head_supported(N, T) : type == 14) return 0;
+    const double bw0 = card_bandwidth(dev0), bw1 = card_bandwidth(dev1);
+    if (bw0 <= 0.0 || bw1 <= 0.0 || rb == 0) return 0;
     const double pcie = 25e9, cols = 3.0;   // the hand-off rate and a typical window
     const double c0 = (double) rb / bw0, c1 = (double) rb / bw1 + 2.0 * cols * 4.0 / pcie;
     const double share0 = c1 / (c0 + c1);
-    if (share0 > 0.75) return;
+    if (share0 > 0.75) return 0;
     const int rows = (int) (share0 * V) / 256 * 256;
-    if (rows <= 0 || rows >= V) return;
+    return rows <= 0 || rows >= V ? 0 : rows;
+}
+
+int64_t Verifier::hs_peer_bytes(size_t row_bytes, int type, int64_t n_vocab, int64_t n_embd, int max_t, int dev0, int dev1) {
+    if (dev1 < 0 || dev1 == dev0) return 0;
+    const int rows = hs_plan(row_bytes, type, (int) n_vocab, (int) n_embd, max_t, dev0, dev1);
+    if (rows == 0) return 0;
+    const int64_t r1 = n_vocab - rows;
+    return r1 * (int64_t) row_bytes + (int64_t) basalt::kernels::native_q8_1_bytes((int) n_embd, max_t) +
+           (int64_t) max_t * r1 * 4;
+}
+
+void Verifier::hs_init() {
+    if (head_ == nullptr || !head_->loaded() || head_->vproxy() != nullptr || dm_ == nullptr || dm_->pdev < 0) return;
+    const int N = (int) g_->n_embd, V = (int) n_vocab_, T = max_t_;
+    const size_t rb = head_->row_bytes();
+    const int rows = hs_plan(rb, head_->type(), V, N, T, device_, dm_->pdev);
+    if (rows == 0) return;
     const int r1 = V - rows;
     const size_t xb = basalt::kernels::native_q8_1_bytes(N, T);
     bool ok;
