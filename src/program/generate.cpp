@@ -6249,7 +6249,13 @@ int main(int argc, char** argv) {
                 const int64_t k = part_slots(p, c);
                 return k > 0 && k + 128 <= live && !(o.prefill_auto && k * 100 > kAutoLendPct * live);
             };
+            // auto: the largest chunk on the start-up's 256-token grid, so a few slots lent away cost a few tokens
+            // of chunk, not half of it
             int64_t c = chunk_full;
+            if (o.prefill_auto && !fits(c)) {
+                c = biggest_chunk(chunk_full, fits);
+                if (c == 0) c = 256;
+            }
             while (c > 256 && !fits(c)) c = std::max<int64_t>(256, c / 2 / 256 * 256);
             chunk = c;
             return (int32_t) std::max<int64_t>(0, live - part_slots(p, c));
