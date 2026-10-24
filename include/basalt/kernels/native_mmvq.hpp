@@ -51,6 +51,10 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
 void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,
                                  int n_in, int ncols, void* stream);
 
+// native_q8_0_mmvq at one column with the weights read cache-streaming (first in line for L2 eviction): for a
+// matrix read once per use, so it does not push out what the kernels around it read again. The same bits.
+void native_q8_0_mmvq_stream(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, void* stream);
+
 void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream);
 

@@ -713,7 +713,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             pscope_off();
             if (!(have_pre_ && full)) record_hidden(Rin_, T, xq_, cs);
             if (par_) join(cs);
-            pf_fork(cs);
+            // the round's catch-up brings the attention weights into L2; a chain step prefetches none, so with its
+            // query and head weights streamed the layer's other weights stay in L2 from step to step
+            if (!full) pf_fork(cs);
             pscope(false);
             add_streams_broadcast(h2_, e2_, R_, N, (int) HC, T, cs);
             // ---- the attention hyper-connection
@@ -775,7 +777,10 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         }
         if (!full) return true;
         pscope(false);   // the query follows the hc read (or its quantize)
-        native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
+        if (T == 1)   // read once a step: streamed past the layer's other weights in L2
+            native_q8_0_mmvq_stream(q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), cs);
+        else
+            native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
         if (!st_.kv_rot && qsa_dec_fused_supported(s)) {
             QsaDecQPost qp;   // the query split, norm and RoPE in one launch
             qp.q_full = qfull_; qp.qcur = qcur_; qp.pos_q = pos; qp.q_norm = f32("self_attn.q_norm.weight"); qp.eps = EPS;
@@ -928,6 +933,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             return true;
         if (head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits
             q5k_head_mmvq(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
+        else if (head_->type() == GGML_Q8_0 && T == 1)   // read once a step: streamed past the layer's other weights
+            native_q8_0_mmvq_stream(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, cs);
         else
             native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         if (sub && n_xcap_ > 0)   // rows without a token never win
@@ -1425,6 +1432,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             }
         };
         wait_step(0);
+        // every draft arrived: the graph's kernels are done, only its skipped steps' conditional nodes remain
+        bool arrived = cond && ((volatile int32_t*) h_out_)[0] >= 0;
         drafts[0] = ((volatile int32_t*) h_out_)[0];
         float pr[basalt::kernels::kVerifyMaxT];
         float pj = ((volatile float*) h_prob_)[0];
@@ -1441,7 +1450,10 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             }
             prefetch_ple(drafts[j - 1]);
             wait_step(j);
-            if (cond && ((volatile int32_t*) h_out_)[j] < 0) break;   // the graph ended without it: the sync says why
+            if (cond && ((volatile int32_t*) h_out_)[j] < 0) {   // the graph ended without it: the sync says why
+                arrived = false;
+                break;
+            }
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             pj = ((volatile float*) h_prob_)[j];
             pr[j] = pj;
@@ -1452,7 +1464,9 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         // PLE collect wait for its SSD read
         if (draft_keep(pr, n - 1, cum_th)) prefetch_ple(drafts[n - 1]);
         decode_gaps().mark(8);
-        if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        // the skipped steps' nodes finish beside the next window; the profile stamps and the logits copy need the end
+        const bool sync = !arrived || gstamp_ != nullptr || diag_ != nullptr;
+        if (sync && cudaStreamSynchronize(cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }

@@ -748,6 +748,35 @@ __device__ __forceinline__ float small_q8_dot(const Q80Block* __restrict__ w,
     return d0 * d1 * float(sumi);
 }
 
+// Q8_0 weight words and scales, plain or (Stream) cache-streaming; the same values either way.
+template<bool Stream> __device__ __forceinline__ int q80_word(const int8_t* qs, int i32) {
+    if constexpr (Stream) {
+        const auto* x = reinterpret_cast<const unsigned short*>(qs);
+        int value = __ldcs(x + 2 * i32);
+        value |= __ldcs(x + 2 * i32 + 1) << 16;
+        return value;
+    } else {
+        return load_int_b2(qs, i32);
+    }
+}
+template<bool Stream> __device__ __forceinline__ float q80_scale(const Q80Block* b) {
+    if constexpr (Stream) return __half2float(__ldcs(&b->d));
+    else return b->d;
+}
+template<bool Stream> __device__ __forceinline__ float small_q8_dot_s(const Q80Block* __restrict__ w,
+                                                                    const Q81Block* __restrict__ x, int iqs) {
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int v = q80_word<Stream>(w->qs, iqs + i);
+        const int u = reinterpret_cast<const int*>(x->qs)[iqs + i];
+        sumi = DP4A(v, u, sumi);
+    }
+    const float d0 = q80_scale<Stream>(w);
+    const float d1 = __low2float(x->ds);
+    return d0 * d1 * float(sumi);
+}
+
 __device__ __forceinline__ float small_q8_dot(const IQ4NLBlock* __restrict__ w,
                                              const Q81Block* __restrict__ x, int iqs) {
     const int* q8 = reinterpret_cast<const int*>(x->qs) + iqs;
@@ -804,8 +833,8 @@ __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
 
 // The Q8_0 one-column kernel: the same per-row arithmetic as native_small_mmvq_kernel, with the first weight blocks
 // loaded before pdl_wait (weights are constant) and the dependents let in at the start, so the launch overlaps the
-// previous kernel's tail. Plain launches run it unchanged.
-template<bool SmallK>
+// previous kernel's tail. Plain launches run it unchanged. Stream: the weights are read cache-streaming.
+template<bool SmallK, bool Stream = false>
 __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_small_q80_kernel(const Q80Block* __restrict__ w,
                                         const Q81Block* __restrict__ x,
@@ -828,9 +857,9 @@ __global__ void native_small_q80_kernel(const Q80Block* __restrict__ w,
         for (int i = 0; i < ROWS; ++i) {
             if (kbx < blocks_per_row && row0 + i < n_out) {
                 const Q80Block* b = w + std::size_t(row0 + i) * blocks_per_row + kbx;
-                v0[i][p] = load_int_b2(b->qs, kqs);
-                v1[i][p] = load_int_b2(b->qs, kqs + 1);
-                d0[i][p] = b->d;
+                v0[i][p] = q80_word<Stream>(b->qs, kqs);
+                v1[i][p] = q80_word<Stream>(b->qs, kqs + 1);
+                d0[i][p] = q80_scale<Stream>(b);
             }
         }
     }
@@ -859,7 +888,7 @@ __global__ void native_small_q80_kernel(const Q80Block* __restrict__ w,
         for (int i = 0; i < ROWS; ++i) {
             if (row0 + i < n_out) {
                 const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
-                tmp[i] += small_q8_dot(w + block, x + kbx, kqs);
+                tmp[i] += small_q8_dot_s<Stream>(w + block, x + kbx, kqs);
             }
         }
     }
@@ -1839,6 +1868,25 @@ void native_q5_0_f32(const void* weights, const float* x, void* scratch_q8_1,
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
     small_mmvq<Q80Block, 8>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
+}
+
+void native_q8_0_mmvq_stream(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, void* stream) {
+    validate_shape(n_in, 1, 32);
+    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+    validate_pointer(weights);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    const auto* w = static_cast<const Q80Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    const dim3 threads(WARP, WARPS);
+    if (n_in / 32 < 2 * WARPS * WARP / 8)   // small_mmvq<Q80Block, 8>'s choice, so the same layout
+        launch_pdl(native_small_q80_kernel<true, true>, dim3(unsigned((std::size_t(n_out) + WARPS - 1) / WARPS)), threads,
+                   0, s, w, x, y, n_in, n_out);
+    else
+        launch_pdl(native_small_q80_kernel<false, true>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out);
+    launch_check();
 }
 
 void native_q8_0_f32(const void* weights, const float* x, void* scratch_q8_1,
