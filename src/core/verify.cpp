@@ -974,6 +974,12 @@ void Verifier::gs_init() {
     ok = ok && mapped((size_t) dm_->rings * dm_->xq_stride, (void**) &gs_h_xq_, (void**) &gs_m_xq_) &&
          mapped((size_t) dm_->rings * dm_->x_stride * 4, (void**) &gs_h_x_, (void**) &gs_m_x_) &&
          mapped((size_t) max_t_ * N * 4, (void**) &gs_h_part_, (void**) &gs_m_part_);
+    if (ok) {   // gs_move's staging, pinned so the moves run at the bus rate
+        const size_t full_f = (size_t) S * HV * S + (size_t) C * HIST, nl = (size_t) gs_ca_.n_layers;
+        ok = cudaHostAlloc((void**) &gs_h_full_, full_f * nl * 4, cudaHostAllocPortable) == cudaSuccess &&
+             cudaHostAlloc((void**) &gs_h_slice_, basalt::core::gdn_slice_state_floats(sl, HIST) * nl * 4,
+                           cudaHostAllocPortable) == cudaSuccess;
+    }
     for (const Src& s : src)
         ok = ok && basalt::kernels::dec_moe_mix_type_ok(s.qkv->native_type) &&
              basalt::kernels::dec_moe_mix_type_ok(s.z->native_type) && basalt::kernels::dec_moe_mix_type_ok(s.out->native_type);
@@ -1015,8 +1021,9 @@ void Verifier::gs_free() {
         if (gs_qkv0_) cudaFree(gs_qkv0_);
         if (gs_z0_) cudaFree(gs_z0_);
     }
-    for (void* h : {(void*) gs_h_xq_, (void*) gs_h_x_, (void*) gs_h_part_})
+    for (void* h : {(void*) gs_h_xq_, (void*) gs_h_x_, (void*) gs_h_part_, (void*) gs_h_full_, (void*) gs_h_slice_})
         if (h) cudaFreeHost(h);
+    gs_h_full_ = gs_h_slice_ = nullptr;
     gs_h_x_ = gs_m_x_ = gs_h_part_ = gs_m_part_ = nullptr;
     gs_mixl_ = nullptr; gs_pscr_ = nullptr; gs_qkv0_ = gs_z0_ = nullptr;
     gs_live_ = gs_split_ = false;
@@ -1040,28 +1047,30 @@ bool Verifier::gs_move(bool to_peer, std::string& err) {
     int64_t gdn_index = 0;
     for (int64_t l = 0; l < lb_; ++l) gdn_index += is_qsa_layer(g, l) ? 0 : 1;
     float* const full_d = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * full_f;
-    std::vector<float> full(full_f * nl), part(part_f * nl);
+    float* const full = gs_h_full_;
+    float* const part = gs_h_slice_;
+    const size_t full_n = full_f * nl, part_n = part_f * nl;
     bool ok;
     {
         const OnDevice on(device_);
         ok = cudaStreamSynchronize(cs_) == cudaSuccess && cudaStreamSynchronize(cm_) == cudaSuccess &&
-             cudaMemcpy(full.data(), full_d, full.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+             cudaMemcpy(full, full_d, full_n * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
     }
     if (to_peer) {
-        for (size_t i = 0; i < nl; ++i) basalt::core::gdn_slice_state(sl, HIST, full.data() + full_f * i, part.data() + part_f * i);
+        for (size_t i = 0; i < nl; ++i) basalt::core::gdn_slice_state(sl, HIST, full + full_f * i, part + part_f * i);
         const OnDevice on(gs_dev_);
         ok = ok && cudaStreamSynchronize(dm_->ps) == cudaSuccess &&
-             cudaMemcpy(gs_state_, part.data(), part.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+             cudaMemcpy(gs_state_, part, part_n * 4, cudaMemcpyHostToDevice) == cudaSuccess;
         gs_ss_ = ss_;
     } else {
         {
             const OnDevice on(gs_dev_);
             ok = ok && cudaStreamSynchronize(dm_->ps) == cudaSuccess &&
-                 cudaMemcpy(part.data(), gs_state_, part.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+                 cudaMemcpy(part, gs_state_, part_n * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
         }
-        for (size_t i = 0; i < nl; ++i) basalt::core::gdn_unslice_state(sl, HIST, part.data() + part_f * i, full.data() + full_f * i);
+        for (size_t i = 0; i < nl; ++i) basalt::core::gdn_unslice_state(sl, HIST, part + part_f * i, full + full_f * i);
         const OnDevice on(device_);
-        ok = ok && cudaMemcpy(full_d, full.data(), full.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+        ok = ok && cudaMemcpy(full_d, full, full_n * 4, cudaMemcpyHostToDevice) == cudaSuccess;
     }
     if (!ok) {
         err = std::string("verify: the GDN state slice did not move: ") + cudaGetErrorString(cudaGetLastError());
@@ -1071,7 +1080,7 @@ bool Verifier::gs_move(bool to_peer, std::string& err) {
     if (diagnostics().decode_timing)
         basalt::log::info("basalt verify", "the GDN state slice moved %s in %.1f ms (%.0f MiB)", to_peer ? "to the peer" : "back",
                           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
-                          (double) (full.size() + part.size()) * 4 / (1 << 20));
+                          (double) (full_n + part_n) * 4 / (1 << 20));
     return true;
 }
 

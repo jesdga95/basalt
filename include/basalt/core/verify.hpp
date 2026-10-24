@@ -573,6 +573,7 @@ private:
     basalt::kernels::GdnCommitLayers gs_ca_;
     bool gs_live_ = false, gs_split_ = false;
     SessionState* gs_ss_ = nullptr;
+    float *gs_h_full_ = nullptr, *gs_h_slice_ = nullptr;   // pinned staging for gs_move: CUDA0's whole layers, the slice
     uint8_t* vhead_scratch_ = nullptr;   // the two-stage head's histogram and row list (q6k_vhead)
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
