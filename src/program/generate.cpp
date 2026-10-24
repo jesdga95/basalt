@@ -8442,10 +8442,18 @@ int main(int argc, char** argv) {
                 sp.set_ple_warm(ids.data(), read_from, first_to, n - 1);
             }
             int64_t at = read_from;
+            // the last window of the last windowed part carries the last prompt token too: the first generated
+            // token is sampled from it, and the draft layer takes its rows like any accepted window
+            int64_t fold_p0 = n - 1;
             for (const int64_t to : {root_at, turn_at, n - 1}) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
+                int64_t rto = to;
+                if (win && to == n - 1 && to != turn_at && to != root_at && ppl == nullptr && gguard == nullptr) {
+                    const int64_t p0 = at + (int64_t) S * ((to - at) / S);
+                    if (!mtp_on || n - p0 <= S_mtp) { rto = p0; fold_p0 = p0; }
+                }
                 if (win && !refill(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
@@ -8477,7 +8485,7 @@ int main(int argc, char** argv) {
                 };
                 const auto tsp = Clock::now();
                 pp_part_ckpt = (to == turn_at || to == root_at) ? to : -1;
-                const bool sp_ok = win ? read_windows(at, to, err) : read_part(at, to, err);
+                const bool sp_ok = win ? (rto <= at || read_windows(at, rto, err)) : read_part(at, to, err);
                 pp_part_ckpt = -1;
                 if (sp_ok && win && !ov_window()) { std::printf("ERR %s\n", err.c_str()); return 1; }
                 if (!sp_ok) {
@@ -8512,10 +8520,10 @@ int main(int argc, char** argv) {
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
-            // the verify windows: the first holds the last prompt token alone
+            // the verify windows: the first holds the last prompt token, with the rest of the last window
             if (mtp_on && !mtp.use_main(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }   // the windows between prompt chunks swapped it
-            int64_t p = n - 1;
-            int32_t x = (int32_t) ids[(size_t) (n - 1)];
+            int64_t p = fold_p0;
+            int32_t x = (int32_t) ids[(size_t) fold_p0];
             {   // a request decoded here starts its adaptation from the experts its own prompt routed to
                 std::vector<uint32_t> hist;
                 int64_t hist_tokens = 0;
@@ -8536,7 +8544,7 @@ int main(int argc, char** argv) {
             // what the session holds once this request is done: the prompt read so far, then every committed token
             std::vector<int32_t> consumed;
             consumed.reserve((size_t) (n + max_new + S));
-            for (int64_t i = 0; i < n - 1; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
+            for (int64_t i = 0; i < fold_p0; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
             // --decode-timing: where a request's decode time goes (one line per request)
@@ -8584,7 +8592,8 @@ int main(int argc, char** argv) {
             while (!cancelled && produced_n < max_new && (!in_slot || solo_req)) {   // (a batch slot's first token comes from the batch window)
                 int T = 1;
                 while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_adapt.th())) ++T;
-                if (first_window) T = 1;
+                if (first_window) T = (int) (n - fold_p0);
+                const int e0 = first_window ? T - 1 : 0;   // rows before it are prompt tokens: forced, not emitted
                 if (ppl != nullptr) {
                     if (p >= ppl->end()) break;
                     T = (int) std::min<int64_t>(req_ppl_t, ppl->end() - p);
@@ -8606,6 +8615,8 @@ int main(int argc, char** argv) {
                 if (p + T > o.max_context) break;
                 window[0] = x;
                 for (int i = 1; i < T; ++i) window[(size_t) i] = from_sfx ? sbuf[(size_t) i - 1] : drafts[(size_t) i - 1];
+                if (e0 > 0)
+                    for (int i = 1; i < T; ++i) window[(size_t) i] = (int32_t) ids[(size_t) (p + i)];
                 if (ppl != nullptr)
                     for (int i = 0; i < T; ++i) window[(size_t) i] = ppl->token(p + i);
                 drive.d.layers = 0;
@@ -8656,7 +8667,14 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 int a = 0;
-                if (relax_on) {
+                if (e0 > 0) {
+                    for (int i = 0; i < e0; ++i) outv[(size_t) i] = window[(size_t) i + 1];
+                    a = T - 1;
+                    if (relax_on) {
+                        if (outv[(size_t) a] == o.relax_call_open) in_call = true;
+                        else if (outv[(size_t) a] == o.relax_call_close) in_call = false;
+                    }
+                } else if (relax_on) {
                     // a draft the target's draw disagrees with is kept when the target gives it probability >= P,
                     // outside tool calls and never for an added token; the row then emits the draft
                     bool call = in_call;
@@ -8783,7 +8801,7 @@ int main(int argc, char** argv) {
                     // the draft launches first; the commit, the adaptive round and the output go in its shadow
                     int n_emit = 0;
                     bool eos_pre = false;
-                    for (int i = 0; i <= a && produced_n + n_emit < max_new && !eos_pre; ++i) {
+                    for (int i = e0; i <= a && produced_n + n_emit < max_new && !eos_pre; ++i) {
                         ++n_emit;
                         eos_pre = ppl == nullptr &&
                                   std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
@@ -8821,8 +8839,8 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                     for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
-                    draft_offered += T - 1;
-                    draft_accepted += a;
+                    draft_offered += T - 1 - e0;
+                    draft_accepted += a - e0;
                     first_window = false;
                     bool commit_ok = true, after_ran = false, eos = false;
                     std::string cerr;
@@ -8830,7 +8848,7 @@ int main(int argc, char** argv) {
                         after_ran = true;
                         commit_ok = ver.commit(a + 1, cerr, 1);
                         adapt_side();
-                        for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
+                        for (int i = e0; i <= a && produced_n < max_new && !eos; ++i) {
                             std::printf("T %d\n", (int) outv[(size_t) i]);
                             basalt::core::progress_beat();
                             ++produced_n;
@@ -8843,7 +8861,7 @@ int main(int argc, char** argv) {
                     ++rounds;
                     const Clock::time_point tw2 = Clock::now();
                     basalt::core::decode_gaps().mark(5);
-                    if (!from_sfx) cum_adapt.observe(dprob.data(), T - 1, a);
+                    if (!from_sfx && e0 == 0) cum_adapt.observe(dprob.data(), T - 1, a);
                     mtp.set_cum_th(cum_adapt.th());
                     bool drafted = true;
                     if (will_draft && mtp_on) {
@@ -8905,11 +8923,11 @@ int main(int argc, char** argv) {
                 }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
-                draft_offered += T - 1;
-                draft_accepted += a;
+                draft_offered += T - 1 - e0;
+                draft_accepted += a - e0;
                 first_window = false;
                 bool eos = false;
-                for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
+                for (int i = e0; i <= a && produced_n < max_new && !eos; ++i) {
                     std::printf("T %d\n", (int) outv[(size_t) i]);
                     basalt::core::progress_beat();
                     ++produced_n;
@@ -8921,7 +8939,7 @@ int main(int argc, char** argv) {
                 ++rounds;
                 const Clock::time_point tw2 = Clock::now();
                 basalt::core::decode_gaps().mark(5);
-                if (!from_sfx) cum_adapt.observe(dprob.data(), T - 1, a);
+                if (!from_sfx && e0 == 0) cum_adapt.observe(dprob.data(), T - 1, a);
                 mtp.set_cum_th(cum_adapt.th());
                 const bool drafted = eos || produced_n >= max_new || !mtp_on ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data());
