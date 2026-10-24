@@ -935,8 +935,50 @@ void Verifier::gs_init() {
         ok = ok && cudaMalloc((void**) &gs_mix_, mix.size()) == cudaSuccess &&
              cudaMemcpy(gs_mix_, mix.data(), mix.size(), cudaMemcpyHostToDevice) == cudaSuccess &&
              cudaMalloc(&gs_pxq_, dm_->xq_stride) == cudaSuccess;
+        // the peer's scratch: per layer qkv, h, gate, beta (kept for its commit); shared x, z, o, yq
+        const int64_t MT = max_t_, C1 = sl.c(), Z1 = sl.zv(), V1 = sl.nv();
+        const size_t per = (size_t) (MT * (2 * C1 + 2 * V1)), shared = (size_t) (MT * (N + 2 * Z1) + MT * Z1 / 32 * 9);
+        const size_t nl = src.size();
+        ok = ok && cudaMalloc((void**) &gs_pscr_, (per * nl + shared) * 4) == cudaSuccess;
+        peer_bytes += (per * nl + shared) * 4;
+        std::vector<basalt::kernels::DmMixLayer> tab((size_t) dm_->rings);
+        if (ok) {
+            float* sh = gs_pscr_ + per * nl;
+            float *px = sh, *pz = px + MT * N, *po = pz + MT * Z1;
+            void* pyq = po + MT * Z1;
+            size_t i = 0;
+            for (int64_t l = lb_; l < le_; ++l) {
+                if (is_qsa_layer(g, l)) continue;
+                const GsLayer& L = gs_layers_[i];
+                basalt::kernels::DmMixLayer& m = tab[(size_t) (l - lb_)];
+                m.wqkv = L.wqkv; m.wz = L.wz; m.wo = L.wo; m.tq = L.tq; m.tz = L.tz; m.to = L.to;
+                basalt::kernels::DecRecArgs& r = m.rec;
+                float* pl = gs_pscr_ + per * i;
+                r.state = gs_state_ + basalt::core::gdn_slice_state_floats(sl, HIST) * i;
+                r.qkv = pl; r.h = pl + MT * C1; r.gate = pl + 2 * MT * C1; r.beta = r.gate + MT * V1;
+                r.conv_w = L.conv_w; r.x = px; r.w_alpha = L.wa; r.w_beta = L.wb; r.dt = L.dt; r.ssm_a = L.ssm_a;
+                r.z = pz; r.gamma = L.gamma; r.o = po; r.yq = pyq;
+                r.C = (int) C1; r.n_embd = (int) N; r.h_k = HK - nk0; r.h_v = (int) V1; r.eps = EPS;
+                r.early_trigger = false;
+                ++i;
+            }
+        }
+        ok = ok && cudaMalloc((void**) &gs_mixl_, tab.size() * sizeof(tab[0])) == cudaSuccess &&
+             cudaMemcpy(gs_mixl_, tab.data(), tab.size() * sizeof(tab[0]), cudaMemcpyHostToDevice) == cudaSuccess;
     }
-    ok = ok && mapped((size_t) dm_->rings * dm_->xq_stride, (void**) &gs_h_xq_, (void**) &gs_m_xq_);
+    ok = ok && mapped((size_t) dm_->rings * dm_->xq_stride, (void**) &gs_h_xq_, (void**) &gs_m_xq_) &&
+         mapped((size_t) dm_->rings * dm_->x_stride * 4, (void**) &gs_h_x_, (void**) &gs_m_x_) &&
+         mapped((size_t) max_t_ * N * 4, (void**) &gs_h_part_, (void**) &gs_m_part_);
+    for (const Src& s : src)
+        ok = ok && basalt::kernels::dec_moe_mix_type_ok(s.qkv->native_type) &&
+             basalt::kernels::dec_moe_mix_type_ok(s.z->native_type) && basalt::kernels::dec_moe_mix_type_ok(s.out->native_type);
+    if (ok) {
+        const OnDevice on(device_);
+        const GdnHeadSlice s0{HK, HV, S, 0, nk0};
+        ok = cudaMalloc((void**) &gs_qkv0_, (size_t) max_t_ * s0.c() * 4) == cudaSuccess &&
+             cudaMalloc((void**) &gs_z0_, (size_t) max_t_ * s0.zv() * 4) == cudaSuccess;
+        own_bytes += (size_t) max_t_ * (s0.c() + s0.zv()) * 4;
+    }
     if (!ok) {
         cudaGetLastError();
         gs_free();
@@ -959,12 +1001,19 @@ void Verifier::gs_free() {
         if (gs_state_) cudaFree(gs_state_);
         if (gs_mix_) cudaFree(gs_mix_);
         if (gs_pxq_) cudaFree(gs_pxq_);
+        if (gs_mixl_) cudaFree(gs_mixl_);
+        if (gs_pscr_) cudaFree(gs_pscr_);
         const OnDevice on0(device_);
         for (GsLayer& L : gs_layers_)
             for (void* p : {L.wqkv0, L.wz0, L.wo0})
                 if (p) cudaFree(p);
+        if (gs_qkv0_) cudaFree(gs_qkv0_);
+        if (gs_z0_) cudaFree(gs_z0_);
     }
-    if (gs_h_xq_) cudaFreeHost(gs_h_xq_);
+    for (void* h : {(void*) gs_h_xq_, (void*) gs_h_x_, (void*) gs_h_part_})
+        if (h) cudaFreeHost(h);
+    gs_h_x_ = gs_m_x_ = gs_h_part_ = gs_m_part_ = nullptr;
+    gs_mixl_ = nullptr; gs_pscr_ = nullptr; gs_qkv0_ = gs_z0_ = nullptr;
     gs_layers_.clear();
     gs_state_ = nullptr;
     gs_mix_ = nullptr; gs_pxq_ = nullptr; gs_h_xq_ = nullptr; gs_m_xq_ = nullptr;
@@ -1667,9 +1716,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const bool router_multi = w_router != nullptr && NE == 512 && K == 10;
         // a GDN layer's middle as one persistent kernel (mid_chain.hpp) between the layer's two hc reads: the qkv + z pair,
         // the recurrence and the output projection, bitwise the kernels it replaces
+        // the GDN mixer split by key head: the layer's q8_1 rows and a doorbell for the peer's key heads; in a batch
+        // window CUDA0 runs the whole layer and the doorbell only passes
+        const bool gs_ring = dm && gs_nk0_ > 0 && !is_qsa_layer(g, l);
+        const bool gs_split = gs_ring && !batch_rec_;
         bool mid_ok = false;
         MidChainArgs ma;
-        if (dec_hc && read_q8 && router_multi && !is_qsa_layer(g, l) && !prof_on_ && !batch_rec_ &&
+        if (dec_hc && read_q8 && router_multi && !is_qsa_layer(g, l) && !prof_on_ && !batch_rec_ && !gs_split &&
             n <= kMidChainMaxT && N == 2560 && dec_gdnf_mode() != 0 && (dense_tc_mask() & 4)) {
             const WeightRef *wqkv = v.get("attn_qkv.weight"), *wg = v.get("attn_gate.weight"),
                             *wout = v.get("ssm_out.weight"), *wa = v.get("ssm_alpha.weight"),
@@ -1722,13 +1775,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         }
         stamp(l, 1);
-        // the GDN mixer split: the layer's q8_1 rows and doorbell for the peer's key heads
-        const bool gs_ring = dm && gs_nk0_ > 0 && !is_qsa_layer(g, l);
         if (gs_ring) {
             if (!read_q8) native_quantize_q8_1(mixed_, xq_, (int) N, n, cs);
             const int64_t r = l - lb_;
-            dec_moe_mix_publish(xq_, n, (int) N, gs_m_xq_ + (size_t) r * dm_->xq_stride, dm_->m_w + 48,
-                                (uint32_t) (r + 1), !batch_rec_, cs);
+            dec_moe_mix_publish(xq_, mixed_, n, (int) N, gs_m_xq_ + (size_t) r * dm_->xq_stride,
+                                gs_m_x_ + (size_t) r * dm_->x_stride, dm_->m_w + 48, (uint32_t) (r + 1), gs_split, cs);
         }
         if (mid_ok) {
             // the first read's dependent: its first pair tiles are already issued by the time the read ends (PDL)
@@ -1759,6 +1810,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 float* gate = gate_L_ + (size_t) gi * MT * HV;
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
                 PdlScope ps(pdl);   // the layer's GDN kernels, after the hc read
+                if (gs_split) {   // CUDA0's key heads in place (dec_gdn_rec's head map); the peer's arrive in the combine
+                    const GsLayer& GL = gs_layers_[(size_t) gi];
+                    const int C0 = (int) (C / HK * gs_nk0_), Z0 = (int) (ZV / HK * gs_nk0_);
+                    kernels::dense_tc_pair(GL.tq, GL.wqkv0, gs_qkv0_, C0, GL.tz, GL.wz0, gs_z0_, Z0, xq_, (int) N, n, cs);
+                    DecRecArgs ra;
+                    ra.state = state; ra.qkv = gs_qkv0_; ra.conv_w = (const float*) wc->data; ra.x = xm;
+                    ra.w_alpha = (const uint16_t*) wa->data; ra.w_beta = (const uint16_t*) wb->data;
+                    ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = gs_z0_;
+                    ra.gamma = (const float*) wnm->data; ra.h = hb; ra.gate = gate; ra.beta = beta; ra.yq = xq_;
+                    ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
+                    ra.k0 = 0; ra.nk = gs_nk0_; ra.qkv_out = qkv;
+                    dec_gdn_rec(ra, n, cs);
+                    dense_proj(4, GL.to, GL.wo0, xq_, bo_, Z0, (int) N, n, cs);
+                    goto gdn_done;
+                }
                 // conv, gates, recurrence, gated norm and the output's q8_1 in dec_gdn_rec's one or two launches; at
                 // 2/3 the z projection runs on the side stream beside the recurrence (dec_gdn.hpp)
                 {
@@ -2147,7 +2213,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();
             return false;
         }
-        if (gs_ring) dec_moe_mix_wait(dm_->m_w + 52, (uint32_t) (l - lb_ + 1), cs);   // the peer's share has landed
+        if (gs_split)   // the peer's key heads added after CUDA0's
+            dec_moe_mix_combine(dm_->m_w + 52, (uint32_t) (l - lb_ + 1), gs_m_part_, bo_, n * (int) N, cs);
+        else if (gs_ring)
+            dec_moe_mix_wait(dm_->m_w + 52, (uint32_t) (l - lb_ + 1), cs);
         stamp(l, 16);
         bool routed = false;   // the fused read ran the router too
         const bool sh_fork = !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr &&
@@ -3043,6 +3112,7 @@ bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
         if (gs_nk0_ > 0) {
             pa.mix = gs_mix_; pa.mseq_m = dm_->h_w + 48; pa.mdone_m = dm_->h_w + 52;
             pa.mxq_m = gs_h_xq_; pa.mxq = gs_pxq_;
+            pa.mx_m = gs_h_x_; pa.mixl = gs_mixl_; pa.part_m = gs_h_part_;
         }
         if (cudaMemsetAsync(dm_->parr, 0, 64, dm_->ps) != cudaSuccess ||
             !basalt::kernels::dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps, dm_->pq2)) {

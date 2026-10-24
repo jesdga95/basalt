@@ -42,6 +42,7 @@
 #include <vector>
 
 namespace basalt::kernels::cpu { class ExpertPool; }
+namespace basalt::kernels { struct DmMixLayer; }
 
 namespace basalt::core {
 
@@ -558,6 +559,12 @@ private:
     uint8_t *gs_h_xq_ = nullptr, *gs_m_xq_ = nullptr;
     uint8_t* gs_mix_ = nullptr;
     void* gs_pxq_ = nullptr;
+    // mapped: the fp32 rows per ring and the peer's out-projection partial; peer: the layer table and its scratch;
+    // CUDA0: its heads' packed qkv / z
+    float *gs_h_x_ = nullptr, *gs_m_x_ = nullptr, *gs_h_part_ = nullptr, *gs_m_part_ = nullptr;
+    basalt::kernels::DmMixLayer* gs_mixl_ = nullptr;
+    float* gs_pscr_ = nullptr;
+    float *gs_qkv0_ = nullptr, *gs_z0_ = nullptr;
     uint8_t* vhead_scratch_ = nullptr;   // the two-stage head's histogram and row list (q6k_vhead)
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM

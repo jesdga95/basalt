@@ -157,9 +157,16 @@ __device__ __forceinline__ float sq32(float v) {
     return q;
 }
 
+// The block's barrier.  SUB: only threads [0, S) of a larger block run the head (named barrier 1).
+template<bool SUB>
+__device__ __forceinline__ void rec_sync() {
+    if (SUB) asm volatile("bar.sync 1, %0;" ::"n"(S) : "memory");
+    else __syncthreads();
+}
+
 // One block of a head's cluster.  `head` = the launch's value head (head_map), `rank` = its column group.  SPLIT: no cluster and no z; the
 // head's raw output goes to a.o for dec_gdn_rec_norm.
-template<int MAXT, bool SPLIT>
+template<int MAXT, bool SPLIT, bool SUB = false>
 __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, int rank, RecSmem& sm,
                                           cg::cluster_group* cluster) {
     const int rg = threadIdx.x / 32, lane = threadIdx.x % 32, tid = threadIdx.x;
@@ -199,7 +206,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     // alpha and beta read only the hc output and constants, both complete before this kernel can launch (its
     // predecessor passed its own wait on the hc read), so they are computed while the projections still run
     asm volatile("cp.async.wait_all;" ::: "memory");
-    __syncthreads();
+    rec_sync<SUB>();
     for (int job = rg; job < 2 * T; job += RG) {   // (gate, token) jobs over the four warps
         const int t = job >> 1;
         const bool is_beta = job & 1;
@@ -248,7 +255,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
             a.h[(size_t) t * C + cv] = yv;
         }
     }
-    __syncthreads();
+    rec_sync<SUB>();
     const bool write_qk = rank == 0 && head < hm.nkl;
 #pragma unroll
     for (int t = 0; t < MAXT; ++t) {
@@ -269,7 +276,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
         if (rank == 1) a.beta[(size_t) tid * a.h_v + gh] = sm.b[tid];
     }
     stamp(a, 4);
-    __syncthreads();
+    rec_sync<SUB>();
     stamp(a, 5);
 
     // ---- the recurrence: gdn_step_norm_multi_kernel's sums
@@ -280,7 +287,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
 #pragma unroll
         for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sm.kn[t][rg * RPG + r], kv);
         sm.red_kv[rg][lane] = kv;
-        __syncthreads();
+        rec_sync<SUB>();
         const float kv_col = sm.red_kv[0][lane] + sm.red_kv[1][lane] + sm.red_kv[2][lane] + sm.red_kv[3][lane];
         const float delta = (sm.v[t][lane] - g * kv_col) * sm.b[t];
         float o = 0.0f;
@@ -290,7 +297,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
             o = fmaf(s[r], sm.qn[t][rg * RPG + r], o);
         }
         sm.red_o[rg][lane] = o;
-        __syncthreads();
+        rec_sync<SUB>();
         if (rg == 0) {
             const float oc = (sm.red_o[0][lane] + sm.red_o[1][lane] + sm.red_o[2][lane] + sm.red_o[3][lane]) *
                              rsqrtf((float) S);

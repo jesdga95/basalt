@@ -1247,6 +1247,42 @@ __device__ __noinline__ void dm_warm(const DmPeerArgs& a, DmShared& sm, const bl
     if (x == 0x9e3779b9u) a.arrive[kDmWarmSink] = x;
 }
 
+// The mixer item's projections: rows [0, rows) of w (rb bytes each) against the item's nt q8_1 rows (xs blocks
+// apart), one warp a row; token t's sum to out[t * ld + r].
+template<int TY>
+__device__ __forceinline__ void dm_mix_rows_t(const uint8_t* w, size_t rb, int rows, int n_in, const block_q8_1* x, int xs,
+                                              int nt, float* out, int ld, int gw, int nw, int lane) {
+    const int nbk = n_in / Fmt<TY>::qk;
+    int off[kDecMaxT];
+#pragma unroll
+    for (int c = 0; c < kDecMaxT; ++c) off[c] = min(c, nt - 1) * xs;
+    for (int r = gw; r < rows; r += nw) {
+        float s[kDecMaxT];
+        row_dot_multi<TY, kDecMaxT>(w + (size_t) r * rb, x, off, nt, nbk, lane, s);
+#pragma unroll
+        for (int c = 0; c < kDecMaxT; ++c)
+            if (c < nt && lane == c) out[(size_t) c * ld + r] = s[c];
+    }
+}
+
+__device__ __forceinline__ void dm_mix_rows(int type, const void* w, int rows, int n_in, const block_q8_1* x, int nt,
+                                            float* out, int ld, int gw, int nw, int lane) {
+    const int xs = n_in / 32;
+    switch (type) {
+        case 12: dm_mix_rows_t<12>((const uint8_t*) w, (size_t) (n_in / 256) * sizeof(block_q4_K), rows, n_in, x, xs, nt, out, ld, gw, nw, lane); break;
+        case 13: dm_mix_rows_t<13>((const uint8_t*) w, (size_t) (n_in / 256) * sizeof(block_q5_K), rows, n_in, x, xs, nt, out, ld, gw, nw, lane); break;
+        case 14: dm_mix_rows_t<14>((const uint8_t*) w, (size_t) (n_in / 256) * sizeof(block_q6_K), rows, n_in, x, xs, nt, out, ld, gw, nw, lane); break;
+        case 23: dm_mix_rows_t<23>((const uint8_t*) w, (size_t) (n_in / 256) * sizeof(block_iq4_xs), rows, n_in, x, xs, nt, out, ld, gw, nw, lane); break;
+        default: break;
+    }
+}
+
+// The peer's shared memory: the expert rings' or the mixer recurrence's (never both at once in a block).
+union DmPeerShared {
+    DmShared d;
+    RecSmem r;
+};
+
 // The peer window.  Per ring: block 0 waits for CUDA0's doorbell and copies the ring's header and q8_1 rows to the
 // device (only block 0 reads host memory); a grid barrier; every block groups the peer's entries (the same lists) and
 // runs its work items with the rows written straight to mapped memory; the last block to finish raises `done`.
@@ -1255,7 +1291,8 @@ __device__ __noinline__ void dm_warm(const DmPeerArgs& a, DmShared& sm, const bl
 // Q2: Q2_0 gate/up rows two a warp as well (a build of its own, so the other formats' kernel stays as it was)
 template<bool Q2>
 __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
-    __shared__ DmShared sm;
+    __shared__ DmPeerShared su;
+    DmShared& sm = su.d;
     __shared__ uint32_t s_seq;
     __shared__ int32_t s_ok;
     const int tid = threadIdx.x;
@@ -1311,10 +1348,13 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
                     if (tid == 0) hdr->n_tok = -1;
                 } else {
                     const int nt = min((int) ((v >> 16) & 0xffu), kVerifyMaxT);
-                    if ((v >> 30) & 1u) {
+                    if ((v >> 30) & 1u) {   // the q8_1 rows and the fp32 rows (the gates' input)
                         const uint4* xs = (const uint4*) (a.mxq_m + (size_t) s * a.xq_stride);
                         const int n16 = nt * (a.n_embd / 32) * (int) sizeof(block_q8_1) / 16;
                         for (int i = tid; i < n16; i += kDmThreads) ((uint4*) a.mxq)[i] = __ldcv(xs + i);
+                        const uint4* fs = (const uint4*) (a.mx_m + (size_t) s * (a.xq_stride / sizeof(block_q8_1) * 32));
+                        float* xd = (float*) a.mixl[s].rec.x;
+                        for (int i = tid; i < nt * a.n_embd / 4; i += kDmThreads) ((uint4*) xd)[i] = __ldcv(fs + i);
                     }
                     if (tid == 0) hdr->n_tok = (v >> 30) & 1u ? nt : 0;
                 }
@@ -1322,7 +1362,39 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
             }
             if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
             if (hdr->n_tok < 0) return;          // released
-            // the peer's heads of the layer go here (hdr->n_tok rows in a.mxq)
+            const int mt = hdr->n_tok;
+            if (mt > 0) {   // the peer's key heads: qkv + z, the recurrence, the gated norm, the out projection's partial
+                const DmMixLayer& L = a.mixl[s];
+                const DecRecArgs& R = L.rec;
+                const int lane = tid & 31, gw = blockIdx.x * (kDmThreads / 32) + tid / 32, nw = nb * (kDmThreads / 32);
+                const int ZV = R.h_v * 128;
+                const block_q8_1* xin = (const block_q8_1*) a.mxq;
+                dm_mix_rows(L.tq, L.wqkv, R.C, a.n_embd, xin, mt, (float*) R.qkv, R.C, gw, nw, lane);
+                dm_mix_rows(L.tz, L.wz, ZV, a.n_embd, xin, mt, (float*) R.z, ZV, ((gw - R.C) % nw + nw) % nw, nw, lane);
+                if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
+                if (tid < 128)   // one 128-thread item per (value head, rank), grid-strided
+                    for (int it = blockIdx.x; it < 4 * R.h_v; it += nb) {
+                        if (it != (int) blockIdx.x) rec_sync<true>();
+                        rec_block<kDecMaxT, true, true>(R, mt, it >> 2, it & 3, su.r, nullptr);
+                    }
+                if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
+                for (int u = gw; u < mt * R.h_v; u += nw) {   // the gated norm and q8_1, one warp per (token, head)
+                    const int t = u / R.h_v, head = u % R.h_v;
+                    const size_t base = (size_t) t * ZV + head * 128 + lane;
+                    float oc[4], q[4];
+#pragma unroll
+                    for (int r = 0; r < 4; ++r) oc[r] = R.o[base + 32 * r];
+#pragma unroll
+                    for (int r = 0; r < 4; ++r) q[r] = sq32(oc[r]);
+                    const float ss = q[0] + q[1] + q[2] + q[3];
+#pragma unroll
+                    for (int r = 0; r < 4; ++r)
+                        norm_q8(R, t, head, R.h_v, r, lane, oc[r], ss, R.gamma[32 * r + lane], R.z[base + 32 * r]);
+                }
+                if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
+                dm_mix_rows(L.to, L.wo, a.n_embd, ZV, (const block_q8_1*) R.yq, mt, a.part_m, a.n_embd, gw, nw, lane);
+                __threadfence_system();
+            }
             if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
             if (blockIdx.x == 0 && tid == 0) {
                 __threadfence_system();
@@ -1837,8 +1909,10 @@ void dec_moe_wait(const DmPlan* plan, const volatile uint32_t* peer_done_m, cons
 }
 
 // One block: the rows to mapped memory, then the doorbell after them.
-__global__ void dm_mix_publish_kernel(const uint4* __restrict__ xq, int n16, uint4* xq_m, uint32_t* seq_m, uint32_t word) {
+__global__ void dm_mix_publish_kernel(const uint4* __restrict__ xq, int n16, const uint4* __restrict__ x, int x16, uint4* xq_m,
+                                      uint4* x_m, uint32_t* seq_m, uint32_t word) {
     for (int i = threadIdx.x; i < n16; i += blockDim.x) xq_m[i] = xq[i];
+    for (int i = threadIdx.x; i < x16; i += blockDim.x) x_m[i] = x[i];
     __syncthreads();
     if (threadIdx.x == 0) {
         __threadfence_system();
@@ -1851,12 +1925,28 @@ __global__ void dm_mix_wait_kernel(const volatile uint32_t* done_m, uint32_t rin
     __threadfence_system();
 }
 
-void dec_moe_mix_publish(const void* xq, int n_tok, int n_embd, uint8_t* xq_m, uint32_t* seq_m, uint32_t ring, bool work,
-                         void* stream) {
+void dec_moe_mix_publish(const void* xq, const float* x, int n_tok, int n_embd, uint8_t* xq_m, float* x_m, uint32_t* seq_m,
+                         uint32_t ring, bool work, void* stream) {
     const int n16 = n_tok * (n_embd / 32) * (int) sizeof(block_q8_1) / 16;
+    const int x16 = work ? n_tok * n_embd / 4 : 0;
     const uint32_t word = ring | (uint32_t) n_tok << 16 | (work ? 1u << 30 : 0u);
-    dm_mix_publish_kernel<<<1, 256, 0, (cudaStream_t) stream>>>((const uint4*) xq, n16, (uint4*) xq_m, seq_m, word);
+    dm_mix_publish_kernel<<<1, 256, 0, (cudaStream_t) stream>>>((const uint4*) xq, n16, (const uint4*) x, x16, (uint4*) xq_m,
+                                                                (uint4*) x_m, seq_m, word);
     check("dec_moe_mix_publish");
+}
+
+__global__ void dm_mix_combine_kernel(const volatile uint32_t* done_m, uint32_t ring, const float* part_m, float* out, int count) {
+    if (threadIdx.x == 0)
+        while (*done_m < ring) spin_pause();
+    __syncthreads();
+    __threadfence_system();
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += gridDim.x * blockDim.x) out[i] += __ldcv(part_m + i);
+}
+
+void dec_moe_mix_combine(const volatile uint32_t* done_m, uint32_t ring, const float* part_m, float* out, int count,
+                         void* stream) {
+    dm_mix_combine_kernel<<<(count + 255) / 256, 256, 0, (cudaStream_t) stream>>>(done_m, ring, part_m, out, count);
+    check("dec_moe_mix_combine");
 }
 
 void dec_moe_mix_wait(const volatile uint32_t* done_m, uint32_t ring, void* stream) {

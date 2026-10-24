@@ -11,6 +11,7 @@
 // tier gives the same bits as before; only the PCIe share is gone (those entries go to the CPU pool).
 #pragma once
 
+#include "basalt/kernels/dec_gdn.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 
 #include <cstddef>
@@ -93,6 +94,17 @@ bool dec_moe_glue_ok(const NativeExpertLayout& L);
 /// `scratch` / `out` / `cap` as native_expert_grouped's (entries cap, rows into out at the entry's index).
 void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a, void* scratch, float* out, int cap, void* stream);
 
+/// The peer's key heads of one GDN layer (gdn_head_split.hpp's packed layout): qkv and z rows and the out
+/// projection's columns in native formats (Q4_K, Q5_K, Q6_K, IQ4_XS), and the recurrence's arguments on the slice
+/// (nk 0, its h_k / h_v / C) with qkv, z, o, yq and x in the peer's scratch.
+struct DmMixLayer {
+    const void *wqkv = nullptr, *wz = nullptr, *wo = nullptr;
+    int tq = 0, tz = 0, to = 0;
+    DecRecArgs rec;
+};
+/// Whether the peer's mixer item covers a native weight type.
+inline bool dec_moe_mix_type_ok(int t) { return t == 12 || t == 13 || t == 14 || t == 23; }
+
 /// The peer card's window: one persistent kernel serves `steps` rings.
 struct DmPeerArgs {
     const DmRing* rings_m = nullptr;             ///< mapped: ring s at rings_m[s]
@@ -126,10 +138,16 @@ struct DmPeerArgs {
     uint32_t* mdone_m = nullptr;                 ///< mapped
     const uint8_t* mxq_m = nullptr;              ///< mapped
     void* mxq = nullptr;                         ///< peer device: kVerifyMaxT q8_1 rows
+    const float* mx_m = nullptr;                 ///< mapped: ring s's fp32 rows, as many per ring as xq_stride holds q8_1 rows
+    const DmMixLayer* mixl = nullptr;            ///< peer device: [steps] (the layer's slice; rec.x is the rows' copy)
+    float* part_m = nullptr;                     ///< mapped: the out projection's partial, token t at t * n_embd
 };
 /// CUDA0: the mixer doorbell of `ring` (DmPeerArgs::mix): n_tok q8_1 rows of n_embd from xq to xq_m, then seq_m.
 /// `work`: the peer computes its heads (bit 30).
-void dec_moe_mix_publish(const void* xq, int n_tok, int n_embd, uint8_t* xq_m, uint32_t* seq_m, uint32_t ring, bool work,
+void dec_moe_mix_publish(const void* xq, const float* x, int n_tok, int n_embd, uint8_t* xq_m, float* x_m, uint32_t* seq_m,
+                         uint32_t ring, bool work, void* stream);
+/// CUDA0: out[i] += part_m[i] for i < count once done_m >= ring (the peer's share added after CUDA0's own).
+void dec_moe_mix_combine(const volatile uint32_t* done_m, uint32_t ring, const float* part_m, float* out, int count,
                          void* stream);
 /// CUDA0: spins until done_m >= ring (the peer's mixer share of that ring has landed or the window was released).
 void dec_moe_mix_wait(const volatile uint32_t* done_m, uint32_t ring, void* stream);
