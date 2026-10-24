@@ -3186,6 +3186,12 @@ int main(int argc, char** argv) {
             constexpr int64_t kLazyKernelsMib = 96;
             if (ml == nullptr || std::strcmp(ml, "EAGER") != 0) late_b += kLazyKernelsMib << 20;
         }
+        // the GDN mixer split by key head loads CUDA0's share of the GDN layers after the cache is sized
+        if (o.peer_device >= 1) {
+            int d0 = 0;
+            cudaGetDevice(&d0);
+            late_b += basalt::core::Verifier::gs_cuda0_bytes(wt, g, d0, o.peer_device);
+        }
         // the deferred checkpoint copy's spare device buffer is allocated after the cache, so it comes out of the reserve
         if (o.serve && o.prompt_cache > 0 && !multi_gpu) {
             basalt::core::ConversationStateSizes zc;

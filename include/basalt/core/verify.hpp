@@ -205,6 +205,9 @@ public:
     /// The 8-bit copies of every layer's hyper-connection matrices (and the head's) on the current device; called
     /// before the expert cache takes the free memory.
     static void prepare_hc8(const WeightTable& wt, const ModelGeometry& g);
+    /// The CUDA0 bytes the GDN mixer split by key head loads after the expert cache is sized (CUDA0's packed rows and
+    /// columns of its key heads), for CUDA0 on dev0 and the peer on dev1; 0 when the split is not taken.
+    static int64_t gs_cuda0_bytes(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1);
     /// The bytes prepare_hc8 will place when `has` names the tensors the model holds (0 with the copies off).
     static uint64_t hc8_plan_bytes(const std::function<bool(const std::string&)>& has, const ModelGeometry& g);
 
@@ -537,6 +540,7 @@ private:
     // GDN mixer split by key head: CUDA0 owns key heads [0, gs_nk0_), the peer the rest; gs_nk0_ 0 means no split
     struct GsLayer {   // peer: one GDN layer's weights for its heads (gdn_head_split.hpp layout)
         void *wqkv = nullptr, *wz = nullptr, *wo = nullptr;
+        void *wqkv0 = nullptr, *wz0 = nullptr, *wo0 = nullptr;   // CUDA0: its heads' packed qkv/z rows, out columns
         float *conv_w = nullptr, *dt = nullptr, *ssm_a = nullptr, *gamma = nullptr;
         uint16_t *wa = nullptr, *wb = nullptr;
         int tq = -1, tz = -1, to = -1;

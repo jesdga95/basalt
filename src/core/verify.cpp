@@ -752,10 +752,10 @@ void Verifier::hs_free() {
 // fewest key heads whose value-head runs fill whole out-projection blocks; the peer's share of the units follows both
 // cards' memory bandwidth, rounded down, and is taken only from a quarter up, CUDA0 keeping at least one unit.  The
 // peer holds its heads' weights and state in gdn_head_split.hpp's layout.
-void Verifier::gs_init() {
-    using basalt::core::GdnHeadSlice;
-    if (dm_ == nullptr || dm_->pdev < 0 || wt_ == nullptr) return;
-    const ModelGeometry& g = *g_;
+// The key heads CUDA0 keeps when the GDN mixer splits by key head between CUDA0 (dev0) and the peer (dev1); 0 when the
+// split is not taken.  Units of key heads whose out-projection columns fill whole 256-value blocks; the peer's units
+// follow the two cards' memory bandwidth, taken only from a quarter of them.
+static int gs_plan(const ModelGeometry& g, int dev0, int dev1) {
     const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, S = (int) g.ssm_state_size, HIST = (int) g.ssm_d_conv - 1;
     const int64_t N = g.n_embd, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;
     constexpr int kBlockCols = 256;
@@ -763,13 +763,42 @@ void Verifier::gs_init() {
     while (unit <= HK && (unit * S) % kBlockCols != 0) ++unit;
     if (HK <= 0 || HV % HK != 0 || unit > HK || HK % unit != 0 || N % kBlockCols != 0 || HIST < 1 ||
         C != (int64_t) (2 * HK + HV) * S || ZV != (int64_t) HV * S)
-        return;
-    const double bw0 = card_bandwidth(device_), bw1 = card_bandwidth(dm_->pdev);
-    if (bw0 <= 0.0 || bw1 <= 0.0) return;
+        return 0;
+    const double bw0 = card_bandwidth(dev0), bw1 = card_bandwidth(dev1);
+    if (bw0 <= 0.0 || bw1 <= 0.0) return 0;
     const int units = HK / unit;
     const int u1 = std::min(units - 1, (int) std::floor(units * bw1 / (bw0 + bw1)));
-    if (u1 * 4 < units) return;
-    const int nk0 = HK - u1 * unit;
+    if (u1 * 4 < units) return 0;
+    return HK - u1 * unit;
+}
+
+int64_t Verifier::gs_cuda0_bytes(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1) {
+    if (dev1 < 0 || dev1 == dev0) return 0;
+    const int nk0 = gs_plan(g, dev0, dev1);
+    if (nk0 == 0) return 0;
+    const int64_t HK = g.ssm_k_heads, N = g.n_embd, C0 = g.ssm_conv_channels / HK * nk0, Z0 = g.ssm_value_dim / HK * nk0;
+    int64_t b = 0;
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        if (is_qsa_layer(g, l)) continue;
+        const LayerView v(wt, l);
+        const WeightRef *q = v.get("attn_qkv.weight"), *z = v.get("attn_gate.weight"), *o = v.get("ssm_out.weight");
+        if (!q || !z || !o) return 0;
+        b += (int64_t) basalt::kernels::native_mmvq_weight_bytes(q->native_type, (int) N, (int) C0) +
+             (int64_t) basalt::kernels::native_mmvq_weight_bytes(z->native_type, (int) N, (int) Z0) +
+             (int64_t) basalt::kernels::native_mmvq_weight_bytes(o->native_type, (int) Z0, (int) N);
+    }
+    return b;
+}
+
+void Verifier::gs_init() {
+    using basalt::core::GdnHeadSlice;
+    if (dm_ == nullptr || dm_->pdev < 0 || wt_ == nullptr) return;
+    const ModelGeometry& g = *g_;
+    const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, S = (int) g.ssm_state_size, HIST = (int) g.ssm_d_conv - 1;
+    const int64_t N = g.n_embd, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;
+    constexpr int kBlockCols = 256;
+    const int nk0 = gs_plan(g, device_, dm_->pdev);
+    if (nk0 == 0) return;
     const GdnHeadSlice sl{HK, HV, S, nk0, HK - nk0};
     auto blocked = [](int t) { return t == 11 || t == 12 || t == 13 || t == 14 || t == 23; };   // 256-value blocks
     // every GDN layer's tensors, as the verify window reads them
@@ -803,42 +832,56 @@ void Verifier::gs_init() {
         const OnDevice on(device_);
         ok = ok && cudaMemcpy(full.data(), d, n, cudaMemcpyDeviceToHost) == cudaSuccess;
     };
-    auto up = [&](size_t n, void** dst) {
-        const OnDevice on(dm_->pdev);
+    size_t own_bytes = 0;
+    auto up = [&](size_t n, void** dst, int dev) {
+        const OnDevice on(dev);
         ok = ok && cudaMalloc(dst, n) == cudaSuccess && cudaMemcpy(*dst, part.data(), n, cudaMemcpyHostToDevice) == cudaSuccess;
-        peer_bytes += n;
+        (dev == device_ ? own_bytes : peer_bytes) += n;
     };
     auto rows = [&](const void* d, size_t row_bytes, int64_t n_rows, const std::vector<basalt::core::GdnRun>& runs,
-                    void** dst) {
+                    void** dst, int dev) {
         if (!ok) return;
         down(d, row_bytes * (size_t) n_rows);
         part.resize(row_bytes * (size_t) basalt::core::gdn_runs_len(runs));
         basalt::core::gdn_gather_rows(full.data(), row_bytes, runs, part.data());
-        up(part.size(), dst);
+        up(part.size(), dst, dev);
     };
+    // the out projection's columns of a slice's value heads
+    auto cols = [&](const void* d, int type, const GdnHeadSlice& h, void** dst, int dev) {
+        if (!ok) return;
+        const size_t rb = basalt::kernels::native_mmvq_weight_bytes(type, (int) ZV, 1);
+        down(d, rb * (size_t) N);
+        part.resize(basalt::kernels::native_mmvq_weight_bytes(type, (int) h.zv(), (int) N));
+        basalt::core::gdn_gather_cols(full.data(), N, ZV, kBlockCols, rb / (size_t) (ZV / kBlockCols),
+                                      basalt::core::gdn_vhead_runs(h, S), part.data());
+        up(part.size(), dst, dev);
+    };
+    const int P = dm_->pdev, D0 = device_;
+    // CUDA0 runs its own heads in place in the full state (dec_gdn_rec's head map) from packed qkv/z rows and out columns
+    const GdnHeadSlice sl0{HK, HV, S, 0, nk0};
     const std::vector<basalt::core::GdnRun> qr = basalt::core::gdn_qkv_runs(sl), v1 = basalt::core::gdn_vhead_runs(sl, 1),
-                                           vs = basalt::core::gdn_vhead_runs(sl, S);
+                                           vs = basalt::core::gdn_vhead_runs(sl, S),
+                                           qr0 = basalt::core::gdn_qkv_runs(sl0), vs0 = basalt::core::gdn_vhead_runs(sl0, S);
     gs_layers_.assign(src.size(), GsLayer{});
     gs_dev_ = dm_->pdev;
     for (size_t i = 0; i < src.size() && ok; ++i) {
         const Src& s = src[i];
         GsLayer& L = gs_layers_[i];
         L.tq = s.qkv->native_type; L.tz = s.z->native_type; L.to = s.out->native_type;
-        rows(s.qkv->native_data, basalt::kernels::native_mmvq_weight_bytes(L.tq, (int) N, 1), C, qr, &L.wqkv);
-        rows(s.z->native_data, basalt::kernels::native_mmvq_weight_bytes(L.tz, (int) N, 1), ZV, vs, &L.wz);
-        rows(s.conv->data, (size_t) (HIST + 1) * 4, C, qr, (void**) &L.conv_w);
-        rows(s.a->data, (size_t) N * 2, HV, v1, (void**) &L.wa);
-        rows(s.b->data, (size_t) N * 2, HV, v1, (void**) &L.wb);
-        rows(s.dt->data, 4, HV, v1, (void**) &L.dt);
-        rows(s.sa->data, 4, HV, v1, (void**) &L.ssm_a);
-        rows(s.norm->data, (size_t) S * 4, 1, {{0, 1}}, (void**) &L.gamma);
-        if (ok) {   // the out projection's columns of the peer's value heads
-            const size_t rb = basalt::kernels::native_mmvq_weight_bytes(L.to, (int) ZV, 1);
-            down(s.out->native_data, rb * (size_t) N);
-            part.resize(basalt::kernels::native_mmvq_weight_bytes(L.to, (int) sl.zv(), (int) N));
-            basalt::core::gdn_gather_cols(full.data(), N, ZV, kBlockCols, rb / (size_t) (ZV / kBlockCols), vs, part.data());
-            up(part.size(), &L.wo);
-        }
+        const size_t rq = basalt::kernels::native_mmvq_weight_bytes(L.tq, (int) N, 1),
+                     rz = basalt::kernels::native_mmvq_weight_bytes(L.tz, (int) N, 1);
+        rows(s.qkv->native_data, rq, C, qr, &L.wqkv, P);
+        rows(s.z->native_data, rz, ZV, vs, &L.wz, P);
+        rows(s.conv->data, (size_t) (HIST + 1) * 4, C, qr, (void**) &L.conv_w, P);
+        rows(s.a->data, (size_t) N * 2, HV, v1, (void**) &L.wa, P);
+        rows(s.b->data, (size_t) N * 2, HV, v1, (void**) &L.wb, P);
+        rows(s.dt->data, 4, HV, v1, (void**) &L.dt, P);
+        rows(s.sa->data, 4, HV, v1, (void**) &L.ssm_a, P);
+        rows(s.norm->data, (size_t) S * 4, 1, {{0, 1}}, (void**) &L.gamma, P);
+        cols(s.out->native_data, L.to, sl, &L.wo, P);
+        rows(s.qkv->native_data, rq, C, qr0, &L.wqkv0, D0);
+        rows(s.z->native_data, rz, ZV, vs0, &L.wz0, D0);
+        cols(s.out->native_data, L.to, sl0, &L.wo0, D0);
     }
     const size_t state_bytes = basalt::core::gdn_slice_state_floats(sl, HIST) * 4 * src.size();
     if (ok) {
@@ -853,8 +896,9 @@ void Verifier::gs_init() {
         return;
     }
     gs_nk0_ = nk0;
-    basalt::log::info("basalt verify", "the GDN mixer is split by key head: CUDA0 %d of %d key heads, the peer %d (%.0f MiB)",
-                      nk0, HK, HK - nk0, peer_bytes / 1048576.0);
+    basalt::log::info("basalt verify",
+                      "the GDN mixer is split by key head: CUDA0 %d of %d key heads (%.0f MiB), the peer %d (%.0f MiB)",
+                      nk0, HK, own_bytes / 1048576.0, HK - nk0, peer_bytes / 1048576.0);
 }
 
 void Verifier::gs_free() {
@@ -865,6 +909,10 @@ void Verifier::gs_free() {
                             (void*) L.wa, (void*) L.wb})
                 if (p) cudaFree(p);
         if (gs_state_) cudaFree(gs_state_);
+        const OnDevice on0(device_);
+        for (GsLayer& L : gs_layers_)
+            for (void* p : {L.wqkv0, L.wz0, L.wo0})
+                if (p) cudaFree(p);
     }
     gs_layers_.clear();
     gs_state_ = nullptr;
