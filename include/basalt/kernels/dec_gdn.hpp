@@ -34,11 +34,19 @@ struct DecRecArgs {
     void* yq = nullptr;              // q8_1 of the output, token t at block t * h_v * S / 32
     int C = 0, n_embd = 0, h_k = 0, h_v = 0;
     float eps = 0.0f;
+    // Head map (gdn_head_split.hpp): with nk > 0 the launch runs only key heads [k0, k0 + nk) and their value heads,
+    // in place in the layer's full state, conv weights, gates and h (strides C, h_v).  qkv and z are then the card's
+    // packed rows (qkv stride (2 nk + nv) S, z stride nv S), and y, o and yq are written packed (stride nv S).
+    // qkv_out, when set, gets the raw qkv channels of these heads at the full layout (the commit's conv history).
+    // nk = 0: every head, the layer's own layout.
+    int k0 = 0, nk = 0;
+    float* qkv_out = nullptr;
     unsigned long long* stamps = nullptr;   // bench: 10 per-phase timestamps per block
     bool early_trigger = true;   // let the next kernel launch once the constants are loaded
 };
 
-/// The recurrence of tokens [0, n_tok) from the untouched state; one cluster of four blocks per value head.
+/// The recurrence of tokens [0, n_tok) from the untouched state; one cluster of four blocks per value head (of the
+/// head map's value heads when a.nk > 0).
 void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream);
 
 /// dec_gdn_rec over a segmented window (verify_kernels.hpp SegRow): each segment's tokens from its own state (the

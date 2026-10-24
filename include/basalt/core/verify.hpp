@@ -42,6 +42,7 @@
 #include <vector>
 
 namespace basalt::kernels::cpu { class ExpertPool; }
+namespace basalt::kernels { struct DmMixLayer; }
 
 namespace basalt::core {
 
@@ -164,7 +165,8 @@ public:
     bool set_logit_bias(const std::vector<float>& bias, std::string& err);
     /// Draws row `t` of the window just run again, with `bias` (one float per vocabulary entry, -inf bans) in place of
     /// the request's logit_bias; the penalties, the filters and the position's draw are the window's own. `pos0` is the
-    /// window's first position. The token is in `token`; the window's other rows are untouched.
+    /// window's first position; a batch window's row ignores it and draws with its own slot's sampling and position.
+    /// The token is in `token`; the window's other rows are untouched.
     bool resample_row(int t, int64_t pos0, const std::vector<float>& bias, int32_t& token, std::string& err);
 
     /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len` int32
@@ -205,6 +207,19 @@ public:
     /// The 8-bit copies of every layer's hyper-connection matrices (and the head's) on the current device; called
     /// before the expert cache takes the free memory.
     static void prepare_hc8(const WeightTable& wt, const ModelGeometry& g);
+    /// The CUDA0 bytes the GDN mixer split by key head loads after the expert cache is sized (CUDA0's packed rows and
+    /// columns of its key heads), for CUDA0 on dev0 and the peer on dev1; 0 when the split is not taken.
+    static int64_t gs_cuda0_bytes(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1);
+    /// The peer bytes the split loads after the peer's expert tier is filled (its key heads' rows, columns, gates,
+    /// state slices and the mixer's rows); 0 when the split is not taken.
+    static int64_t gs_peer_bytes(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1);
+    /// Prices the GDN mixer split at start and keeps it only when its modelled decode saving beats its cost: the
+    /// `displaced` expert bytes its peer reserve pushes off the peer.  Windows of up to max_t tokens.  Call before
+    /// gs_cuda0_bytes / gs_peer_bytes; true when the split is taken.
+    static bool gs_decide(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1, int max_t, int64_t displaced);
+    /// The peer bytes the head split by vocabulary loads after the peer's expert tier is filled, for a head of
+    /// `row_bytes` per row and native `type`, windows of up to max_t tokens; 0 when the split is not taken.
+    static int64_t hs_peer_bytes(size_t row_bytes, int type, int64_t n_vocab, int64_t n_embd, int max_t, int dev0, int dev1);
     /// The bytes prepare_hc8 will place when `has` names the tensors the model holds (0 with the copies off).
     static uint64_t hc8_plan_bytes(const std::function<bool(const std::string&)>& has, const ModelGeometry& g);
 
@@ -319,6 +334,15 @@ private:
     ExpertSource* warm_src_ = nullptr;
     DecMoe* dm_ = nullptr;   // the device-planned MoE tail (null: off)
     bool dm_init(std::string& err);
+    // the head split by vocabulary with the peer card, when the peer streams its rows faster than CUDA0 does
+    void hs_init();
+    void hs_free();
+    // the GDN mixer split by key head with the peer card, when the peer streams the mixer's bytes faster than CUDA0
+    void gs_init();
+    void gs_free();
+    // the peer's heads of every GDN layer between CUDA0's full state and gs_state_: to the peer before the first split
+    // window, back before anything reads the whole state (wait_commit, a batch window); between windows only
+    bool gs_move(bool to_peer, std::string& err);
     bool dm_sync(std::string& err);        ///< the residency tables to the devices, before a window
     bool dm_begin(std::string& err, DecodeGaps* gm);   ///< the tail's window start (tables, flags, the peer window)
     bool dm_end(std::string& err);         ///< the peer window's end
@@ -517,6 +541,44 @@ private:
     float* hit_xs_ = nullptr;
     void* hit_scratch_ = nullptr;
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
+    // head split: CUDA0 computes rows [0, hs_rows_), the peer the rest; hs_rows_ 0 means no split
+    int hs_rows_ = 0, hs_dev_ = -1;
+    void* hs_w_ = nullptr;           // peer: head rows [hs_rows_, n_vocab_)
+    void* hs_xq_ = nullptr;          // peer: the head's q8_1 input
+    float* hs_y_ = nullptr;          // peer: its logits, T rows of n_vocab_ - hs_rows_
+    float* hs_y0_ = nullptr;         // CUDA0: its logits, T rows of hs_rows_
+    void* hs_hxq_ = nullptr;         // pinned staging of the input
+    float* hs_hy_ = nullptr;         // pinned staging of the peer's logits
+    cudaStream_t hs_s_ = nullptr;    // peer
+    cudaEvent_t hs_in_ = nullptr;    // CUDA0: the input is staged
+    cudaEvent_t hs_out_ = nullptr;   // peer: its logits are staged
+    // GDN mixer split by key head: CUDA0 owns key heads [0, gs_nk0_), the peer the rest; gs_nk0_ 0 means no split
+    struct GsLayer {   // peer: one GDN layer's weights for its heads (gdn_head_split.hpp layout)
+        void *wqkv = nullptr, *wz = nullptr, *wo = nullptr;
+        void *wqkv0 = nullptr, *wz0 = nullptr, *wo0 = nullptr;   // CUDA0: its heads' packed qkv/z rows, out columns
+        float *conv_w = nullptr, *dt = nullptr, *ssm_a = nullptr, *gamma = nullptr;
+        uint16_t *wa = nullptr, *wb = nullptr;
+        int tq = -1, tz = -1, to = -1;
+    };
+    int gs_nk0_ = 0, gs_dev_ = -1;
+    std::vector<GsLayer> gs_layers_;   // by GDN layer index
+    float* gs_state_ = nullptr;        // peer: its heads' recurrent state and conv history, per GDN layer
+    // the mixer doorbell (DmPeerArgs::mix): mapped q8_1 rows per ring; peer: which rings have one, the rows' copy
+    uint8_t *gs_h_xq_ = nullptr, *gs_m_xq_ = nullptr;
+    uint8_t* gs_mix_ = nullptr;
+    void* gs_pxq_ = nullptr;
+    // mapped: the fp32 rows per ring and the peer's out-projection partial; peer: the layer table and its scratch;
+    // CUDA0: its heads' packed qkv / z
+    float *gs_h_x_ = nullptr, *gs_m_x_ = nullptr, *gs_h_part_ = nullptr, *gs_m_part_ = nullptr;
+    basalt::kernels::DmMixLayer* gs_mixl_ = nullptr;
+    float* gs_pscr_ = nullptr;
+    float *gs_qkv0_ = nullptr, *gs_z0_ = nullptr;
+    // the peer's commit of its heads (the window's rows in gs_pscr_); live: gs_state_ holds the truth of its heads for
+    // session gs_ss_ (CUDA0's copies of them are stale); split: the last window ran split
+    basalt::kernels::GdnCommitLayers gs_ca_;
+    bool gs_live_ = false, gs_split_ = false;
+    SessionState* gs_ss_ = nullptr;
+    float *gs_h_full_ = nullptr, *gs_h_slice_ = nullptr;   // pinned staging for gs_move: CUDA0's whole layers, the slice
     uint8_t* vhead_scratch_ = nullptr;   // the two-stage head's histogram and row list (q6k_vhead)
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM

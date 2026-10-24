@@ -111,6 +111,23 @@ int main() {
         CHECK(g.begin(R"({"kind":"tools","tools":[{"name":"f","parameters":{}}],"tool_choice":"none"})", nullptr, 0, err));
         CHECK(!g.on());
     }
+    {   // a slot's guard is its own: two interleaved windows, one refused row each, the states stay apart
+        Guard a(pv), b(pv);
+        CHECK(a.begin(jo, nullptr, 0, err) && b.begin(jo, nullptr, 0, err));
+        const int32_t wa[] = {0, 2, 12, 4};   // refused at row 2
+        const int32_t wb[] = {0, 2, 3, 4};
+        CHECK(a.scan(wa, 4) == 2);
+        CHECK(b.scan(wb, 4) == -1);
+        std::vector<float> bias;
+        a.mask_bias({}, bias);
+        CHECK(bias[3] == 0.0f && std::isinf(bias[12]));
+        CHECK(a.take(3));
+        const int32_t na[] = {4, 1};
+        CHECK(a.scan(na, 2) == -1);   // the corrected row 3 is what the slot continues from
+        const int32_t nb[] = {1};
+        CHECK(b.scan(nb, 1) == -1);
+        CHECK(a.misses() == 1 && b.misses() == 0);
+    }
     {
         Guard g(pv);
         CHECK(!g.begin("{", nullptr, 0, err));

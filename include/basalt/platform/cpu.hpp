@@ -4,6 +4,7 @@
 // than 64 logical processors has several processor groups.
 #pragma once
 
+#include <string>
 #include <vector>
 
 namespace basalt::platform {
@@ -27,5 +28,14 @@ struct CpuTopology {
 /// The processors this process may run on, one per physical core (SMT siblings share a core's load/store bandwidth),
 /// ordered for `affinity`. `skip_first` takes the first one out of `worker_cores` and names it `host_core`.
 CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity = CpuAffinity::All);
+
+/// What the machine's processor is called and how many physical cores it has, for a benchmark row. `name` is the
+/// vendor string as the OS gives it (empty when it gives none); `physical_cores` counts every core the OS lists,
+/// whether or not this process may run on it (0 when unknown).
+struct CpuInfo {
+    std::string name;
+    int physical_cores = 0;
+};
+CpuInfo cpu_info();
 
 }  // namespace basalt::platform

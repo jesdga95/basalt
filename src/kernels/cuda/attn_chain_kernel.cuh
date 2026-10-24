@@ -1,14 +1,15 @@
 namespace mkc {
 constexpr int CT = 512, XT = 4, SMEM_MAX = 101376;
 // ---- pair
-// the projections' types are per layer: Q4_K 12, Q5_K 13, Q6_K 14, IQ3_S 21, IQ4_XS 23 (sb_bytes: a
-// 256-value super-block's bytes)
+// the projections' types are per layer: Q8_0 8, Q4_K 12, Q5_K 13, Q6_K 14, IQ3_S 21, IQ4_XS 23 (sb_bytes: a
+// 256-value super-block's bytes; Q8_0 is eight 34-byte blocks)
 constexpr int P_NIN = 2560, P_NQ = 10240, P_NZ = 6144, P_NTQ = P_NQ / 16, P_NT = P_NTQ + P_NZ / 16;
 constexpr int P_SLOTS = 4, OFF_PRED = 87040;   // the ring: up to 4 slots of the layer's larger tile below OFF_PRED
 // ---- rec
 constexpr int R_HV = 48, R_HK = 16, R_C = 2 * R_HK * S + R_HV * S, R_ZV = R_HV * S, R_CTA0 = 122;   // [0, 64 KB): the head's state tile
 // ---- out
 // out: the tile [0, 16 * row stride), red (4 columns) after it, x staged after red where it fits below OFF_PERM
+constexpr int O_Q8_SMEM_CH = 9;   // Q8_0 out: 512-value chunks of a row kept in smem (of 12)
 constexpr int O_NIN = 6144, O_NOUT = 2560, O_NLW = 24, O_RC = 4, O_REDB = O_NLW * 16 * O_RC * 4;
 // ---- permanent tail: barriers + the IQ3_S grid
 constexpr int OFF_PERM = SMEM_MAX - 4096;
@@ -17,7 +18,8 @@ struct Geo {
     int tq, tz, to;     // types
     int tbq, tbz;       // pair tile bytes (16 rows)
     int ns, slotb;      // pair ring: slots, slot bytes
-    int orb, ors, ored, ox;   // out: row bytes, row stride, red offset, staged x offset
+    int orb, ors, ored, ox;   // out: row bytes in smem, row stride, red offset, staged x offset
+    int orow;           // out: a row's bytes in the weights (orb, or more when the row's tail is read from L2)
 };
 __host__ __device__ constexpr Geo make_geo(int tq, int tz, int to) {
     Geo g{};
@@ -28,7 +30,10 @@ __host__ __device__ constexpr Geo make_geo(int tq, int tz, int to) {
     // the two tile groups take alternate tiles: an odd ring would give a slot its consecutive tiles from different groups,
     // and one group's mbarrier wait for the slot's second use would pass before the first use's data arrived
     if (g.ns & 1) --g.ns;
-    g.orb = (O_NIN / 256) * sb_bytes(to); g.ors = one_row_stride(g.orb);
+    g.orow = (O_NIN / 256) * sb_bytes(to);
+    // Q8_0 rows (6528 bytes) do not fit 16 to a tile: the first O_Q8_SMEM_CH chunks go to smem, the rest is prefetched to
+    // L2 and read from there
+    g.orb = to == 8 ? O_Q8_SMEM_CH * 2 * sb_bytes(8) : g.orow; g.ors = one_row_stride(g.orb);
     g.ored = (16 * g.ors + 127) & ~127; g.ox = g.ored + O_REDB;
     return g;
 }
@@ -93,6 +98,7 @@ struct RecS {   // rec_rank's RecSmem for T <= XT, the alpha/beta rows shared by
 };
 constexpr int OFF_REC = (OFF_PERM - (int) sizeof(RecS)) & ~127;
 static_assert(OFF_REC >= 16 * 5040, "rec above the largest out tile (Q6_K)");
+static_assert(OFF_REC >= 16 * one_row_stride(O_Q8_SMEM_CH * 2 * 272), "rec above the Q8_0 out tile");
 
 extern __shared__ __align__(128) char sm_dyn[];
 // weight copies: L2 evict-first policy (read once per layer; keeps the kernel's code and the activations in L2)

@@ -217,6 +217,14 @@ int64_t ExpertCache::slots_within(int64_t bytes) const {
     return (int64_t) (std::upper_bound(off_.begin() + 1, off_.end(), (uint64_t) bytes) - (off_.begin() + 1));
 }
 
+int64_t ExpertCache::slots_after_shrink(int64_t keep_bytes) const {
+    int64_t keep = 0;
+    while (keep < (int64_t) segs_.size() && seg_off_[(size_t) keep] < keep_bytes) ++keep;
+    if (segs_.empty() || keep >= mapped_segs_) return slots();
+    const int64_t kept = keep > 0 ? seg_off_[(size_t) keep - 1] + seg_size_[(size_t) keep - 1] : 0;
+    return slots_within(kept);
+}
+
 bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
     if (segs_.empty()) {
         err = "the expert cache is not segmented (the engine needs --vram-elastic)";

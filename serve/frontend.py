@@ -572,6 +572,46 @@ def forced_call(tool_choice, tools: list[dict] | None) -> tuple[list[dict] | Non
     return tools, CALL_START + (f"\n<function={name}>\n" if name else "\n<function=")
 
 
+def _text_kinds(schema) -> tuple[bool, bool]:
+    """(text, null) for a parameter schema: whether the grammar lets the model write it as raw text (type "string",
+    a type list naming "string", or an anyOf/oneOf/one-branch allOf of plain strings and null), and whether null is
+    one of its types."""
+    if not isinstance(schema, dict):
+        return False, False
+    t = schema.get("type")
+    if isinstance(t, str):
+        return t == "string", t == "null"
+    if isinstance(t, list):
+        return "string" in t, "null" in t
+    if t is not None or any(k in schema for k in ("enum", "const", "properties", "items")):
+        return False, False
+    union = [schema[k] for k in ("anyOf", "oneOf", "allOf") if isinstance(schema.get(k), list)]
+    if len(union) != 1 or not union[0] or ("allOf" in schema and len(union[0]) != 1):
+        return False, False
+    text = null = False
+    for b in union[0]:
+        bt = b.get("type") if isinstance(b, dict) else None
+        types = bt if isinstance(bt, list) else [bt]
+        if (not types or any(x not in ("string", "null") for x in types)
+                or any(k in b for k in ("enum", "const", "anyOf", "oneOf", "allOf", "properties", "items", "$ref"))):
+            return False, False
+        text = text or "string" in types
+        null = null or "null" in types
+    return text, null
+
+
+def _decode_param(value: str, schema) -> object:
+    """A parameter's raw text as its declared value: kept as text when the schema allows a string (`null` is None only
+    where null is a type), else JSON-decoded when it parses (text when it does not)."""
+    text, null = _text_kinds(schema)
+    if text:
+        return None if null and value.strip() == "null" else value
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """`<function=NAME>...</function>` -> ToolCall. Values are JSON-decoded when the schema says non-string
     (without a schema: when they parse as JSON objects, arrays, numbers or booleans)."""
@@ -593,14 +633,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
             value = value[1:]
         if value.endswith("\n"):
             value = value[:-1]
-        declared = (props.get(pname) or {}).get("type")
-        if declared == "string":
-            args[pname] = value
-        else:
-            try:
-                args[pname] = json.loads(value)
-            except ValueError:
-                args[pname] = value
+        args[pname] = _decode_param(value, props.get(pname))
     return ToolCall(name=name, arguments=args)
 
 
@@ -650,6 +683,7 @@ class OutputParser:
         self.sfirst = True
         self.sval_started = False
         self.sdeclared = {}
+        self.spname = ""
 
     def _scan(self) -> list[Event]:
         """Advance the streaming view of the call body."""
@@ -668,7 +702,7 @@ class OutputParser:
                 name = rest[a + 10:b]
                 self.scall = ToolCall(name=name, arguments={})
                 props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
-                self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
+                self.sdeclared = props
                 out.append(Event("tool_start", call=self.scall))
                 args("{")
                 self.sp += b + 1
@@ -684,7 +718,9 @@ class OutputParser:
                     args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
                     self.sfirst = False
                     self.sp += b + 1
-                    if self.sdeclared.get(pname) == "string":
+                    self.spname = pname
+                    text, null = _text_kinds(self.sdeclared.get(pname))
+                    if text and not null:
                         args('"')
                         self.ss, self.sval_started = "str", False
                     else:
@@ -729,11 +765,7 @@ class OutputParser:
                     value = value[1:]
                 if value.endswith("\n"):
                     value = value[:-1]
-                try:
-                    v = json.loads(value)
-                except ValueError:
-                    v = value
-                args(json.dumps(v, ensure_ascii=False))
+                args(json.dumps(_decode_param(value, self.sdeclared.get(self.spname)), ensure_ascii=False))
                 self.sp += end + len(PARAM_END)
                 self.ss = "between"
             else:

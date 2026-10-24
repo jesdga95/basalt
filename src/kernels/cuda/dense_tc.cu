@@ -730,7 +730,7 @@ struct PairMat {
     int type, n_out;
 };
 __host__ __device__ constexpr int sb_bytes(int type) {
-    return type == 12 ? 144 : type == 13 ? 176 : type == 14 ? 210 : type == 21 ? 110 : 136;
+    return type == 12 ? 144 : type == 13 ? 176 : type == 14 ? 210 : type == 21 ? 110 : type == 8 ? 272 : 136;
 }
 // with Q3_K, Q2_0 and Q8_0 (dense_tc_pair_kernel's LQ build)
 __host__ __device__ constexpr int sb_bytes_lq(int type) {

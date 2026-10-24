@@ -107,6 +107,10 @@ A request with a `grammar` key (engine started with `--grammar on`) is checked o
 The tokens are fed to the grammar in order; at the first one it refuses, that row is drawn again with the grammar's
 mask added to the request's logit bias (same filters, penalties and position draw), and the window ends there, so the
 drafts after it are dropped like a rejection. A window the grammar accepts is untouched: no extra launch or sync.
+Under `--batch` each slot holds its own guard and the same rule runs per slot: its kept picks are scanned, the first
+refused row is drawn again with that slot's sampling and position under the mask, and the slot's segment ends at that
+row. A request that moves from the solo run into a slot replays its generated tokens through the grammar first. Slots
+and requests without a grammar run the unchanged path.
 Tool-call grammars start at the call opener, JSON grammars at the first token after the thinking block. Relaxed
 drafting is off for a request with a grammar. The prompt is never constrained. Requests without the key, and the engine
 with `--grammar off`, run the unchanged path. The schema grammar is llama.cpp's (integer bounds, string length, patterns,

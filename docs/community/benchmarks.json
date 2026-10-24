@@ -10,15 +10,21 @@
         {
           "name": "RTX 5090",
           "vram_gib": 32,
-          "power_w": 400
+          "power_w": 400,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.9
         },
         {
           "name": "RTX 5060 Ti",
           "vram_gib": 16,
-          "power_w": 180
+          "power_w": 180,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.8
         }
       ],
       "ram_gib": 121,
+      "cpu": "AMD Ryzen 9 9950X, 16 cores",
+      "ram_gbps": 58.5,
       "os": "Linux",
       "quant": "NVFP4",
       "prefill_16k_tps": 7637.6,
@@ -34,10 +40,14 @@
         {
           "name": "RTX 5090",
           "vram_gib": 32,
-          "power_w": 400
+          "power_w": 400,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.9
         }
       ],
       "ram_gib": 121,
+      "cpu": "AMD Ryzen 9 9950X, 16 cores",
+      "ram_gbps": 58.5,
       "os": "Linux",
       "quant": "NVFP4",
       "prefill_16k_tps": 6420.0,
@@ -53,10 +63,14 @@
         {
           "name": "RTX 5060 Ti",
           "vram_gib": 16,
-          "power_w": 180
+          "power_w": 180,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.8
         }
       ],
       "ram_gib": 121,
+      "cpu": "AMD Ryzen 9 9950X, 16 cores",
+      "ram_gbps": 58.5,
       "os": "Linux",
       "quant": "IQ3_S",
       "prefill_16k_tps": 2093.7,
@@ -188,7 +202,7 @@
       "notes": "Swift GSQ-RCO IQ3_S GGUF converted to .basalt (--sections-from a verified pack); single RTX PRO 4000 Blackwell, weights on SATA SSD"
     },
     {
-      "submitter": "neuro",
+      "submitter": "knoopx",
       "date": "2026-10-24",
       "commit": "588a4776ed",
       "preset": "community-1",
@@ -196,21 +210,47 @@
         {
           "name": "RTX 5090",
           "vram_gib": 32,
-          "power_w": 500
+          "power_w": 575
+        }
+      ],
+      "ram_gib": 62,
+      "os": "Linux",
+      "quant": "IQ3_S",
+      "prefill_16k_tps": 5677.1,
+      "prefill_64k_tps": 5806.4,
+      "decode_tps": 376.1,
+      "notes": "single RTX 5090 at its 575 W limit, 62 GB RAM; weights 28.1 GiB in VRAM and 22.8 GiB in RAM, 0 SSD spill"
+    },
+    {
+      "submitter": "neuro",
+      "date": "2026-10-24",
+      "commit": "4ac80f68f6",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 500,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 25.9
         },
         {
           "name": "RTX 5090",
           "vram_gib": 32,
-          "power_w": 500
+          "power_w": 500,
+          "pcie": "4.0 x4",
+          "h2d_gbps": 7.2
         }
       ],
       "ram_gib": 123,
+      "cpu": "13th Gen Intel Core i9-13900F, 24 cores",
+      "ram_gbps": 79.5,
       "os": "Linux",
       "quant": "NVFP4",
-      "prefill_16k_tps": 7697.6,
-      "prefill_64k_tps": 9590.6,
-      "decode_tps": 460.8,
-      "notes": "2x RTX 5090 at a 500 W limit each (below the cards' 575 W default), 123 GB DDR5; 0 SSD spill"
+      "prefill_16k_tps": 7740.4,
+      "prefill_64k_tps": 9607.9,
+      "decode_tps": 461.3,
+      "notes": "2x RTX 5090 at a 500 W limit each (below the cards' 575 W default), 123 GB DDR5; the peer card is on a 4.0 x4 slot; 0 SSD spill"
     }
   ]
 }

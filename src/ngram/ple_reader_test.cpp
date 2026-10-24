@@ -179,6 +179,16 @@ int selftest(const std::string& dir, uint32_t rb) {
         const uint64_t k4 = rd.snapshot().keepalive_reads;
         nap(200);
         CHECK(rd.snapshot().keepalive_reads <= k4 + 1, "keep-alive went on after it was turned off");
+        // a window that lapsed with no request starts again on rearm_keepalive, with no issue
+        rd.set_keepalive(20.0, 0.3);
+        nap(500);
+        const uint64_t k5 = rd.snapshot().keepalive_reads;
+        nap(150);
+        CHECK(rd.snapshot().keepalive_reads == k5, "keep-alive went on after the window lapsed");
+        rd.rearm_keepalive();
+        nap(150);
+        CHECK(rd.snapshot().keepalive_reads >= k5 + 3, "rearm_keepalive did not start the window again (%llu -> %llu)",
+              (unsigned long long) k5, (unsigned long long) rd.snapshot().keepalive_reads);
         rd.reset_stats();
         CHECK(rd.snapshot().keepalive_reads == 0 && rd.snapshot().keepalive_us_max == 0, "reset_stats kept keep-alive counts");
     }

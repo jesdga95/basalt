@@ -4,6 +4,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <set>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -134,6 +137,28 @@ CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
     return topo;
 }
 
+CpuInfo cpu_info() {
+    CpuInfo info;
+    char name[256] = {};
+    DWORD size = sizeof name;
+    if (RegGetValueA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "ProcessorNameString",
+                     RRF_RT_REG_SZ, nullptr, name, &size) == ERROR_SUCCESS)
+        info.name = name;
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    if (len > 0) {
+        std::vector<char> buf(len);
+        if (GetLogicalProcessorInformationEx(RelationProcessorCore, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len)) {
+            for (const char *p = buf.data(), *end = buf.data() + len; p < end;) {
+                const auto* e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) p;
+                if (e->Relationship == RelationProcessorCore) ++info.physical_cores;
+                p += e->Size;
+            }
+        }
+    }
+    return info;
+}
+
 #else
 // --------------------------------------------------------------------------------------------- Linux
 
@@ -260,6 +285,35 @@ CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
         for (int cpu : e_cores) topo.worker_cores.push_back(cpu);
     }
     return topo;
+}
+
+CpuInfo cpu_info() {
+    CpuInfo info;
+    // /proc/cpuinfo lists every logical CPU; a core is one (physical id, core id) pair
+    std::ifstream f("/proc/cpuinfo");
+    std::set<std::pair<std::string, std::string>> cores;
+    std::string line, pkg, core;
+    const auto value = [](const std::string& l) {
+        const size_t c = l.find(':');
+        if (c == std::string::npos) return std::string();
+        const size_t b = l.find_first_not_of(" \t", c + 1);
+        return b == std::string::npos ? std::string() : l.substr(b);
+    };
+    const auto flush = [&] {
+        if (!core.empty()) cores.insert({pkg, core});
+        pkg.clear();
+        core.clear();
+    };
+    while (std::getline(f, line)) {
+        if (line.empty()) flush();
+        else if (line.rfind("model name", 0) == 0 && info.name.empty()) info.name = value(line);
+        else if (line.rfind("physical id", 0) == 0) pkg = value(line);
+        else if (line.rfind("core id", 0) == 0) core = value(line);
+    }
+    flush();
+    info.physical_cores = (int) cores.size();
+    if (info.physical_cores == 0) info.physical_cores = (int) detect_cpu_topology(false).worker_cores.size();
+    return info;
 }
 
 #endif

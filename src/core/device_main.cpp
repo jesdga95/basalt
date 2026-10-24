@@ -21,18 +21,30 @@ static std::string human(uint64_t b) {
 int main(int argc, char** argv) {
     bool selftest = false;
     bool list_devices = false;
+    bool link_rates = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
         else if (std::strcmp(argv[i], "--list-devices") == 0) list_devices = true;
+        else if (std::strcmp(argv[i], "--link-rates") == 0) link_rates = true;
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-            std::printf("usage: basalt-device [--selftest] [--list-devices]\n"
+            std::printf("usage: basalt-device [--selftest] [--list-devices] [--link-rates]\n"
                         "  --list-devices  every GPU the runtime enumerates, numbered as\n"
-                        "                  CUDA_VISIBLE_DEVICES numbers them, and whether this binary can run it\n");
+                        "                  CUDA_VISIBLE_DEVICES numbers them, and whether this binary can run it\n"
+                        "  --link-rates    per GPU, one line \"pcie_h2d BUS_ID GB_PER_S\": pinned host-to-device copy speed\n");
             return 0;
         } else {
             basalt::log::error("basalt", "unknown argument: %s", argv[i]);
             return 2;
         }
+    }
+
+    if (link_rates) {
+        for (int ordinal = 0; ordinal < basalt::core::device_count(); ++ordinal) {
+            std::string bus;
+            const double gbps = basalt::core::device_h2d_gbps(ordinal);
+            if (basalt::core::device_pci_bus_id(ordinal, bus) && gbps > 0) std::printf("pcie_h2d %s %.1f\n", bus.c_str(), gbps);
+        }
+        return 0;
     }
 
     // Every card the runtime enumerates, without the arch check `device_info` applies.  Format:

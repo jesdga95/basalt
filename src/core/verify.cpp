@@ -5,6 +5,7 @@
 #include "basalt/core/remote_expert_opt.hpp"
 
 #include "basalt/core/native_head.hpp"
+#include "basalt/core/gdn_head_split.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/core/peer_experts.hpp"
@@ -401,6 +402,8 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     if (dm_ != nullptr) {   // the peer window stops at its next ring; CUDA0's waits on it pass
         *(volatile uint32_t*) (dm_->h_w + 0) = UINT32_MAX;
         *(volatile uint32_t*) (dm_->h_w + 16) = UINT32_MAX;
+        *(volatile uint32_t*) (dm_->h_w + 48) = UINT32_MAX;   // the mixer's doorbell and done word
+        *(volatile uint32_t*) (dm_->h_w + 52) = UINT32_MAX;
         dm_->tag_dirty = true;
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -564,6 +567,10 @@ bool Verifier::dm_init(std::string& err) {
         if (!router_ok || !warm_router(rq_h, rs_h, &d->rq, &d->rs))
             basalt::log::warn("basalt verify", "the peer's L2 warm-up is off (a router the predictor does not cover)");
     }
+    if (d->pdev >= 0) {
+        hs_init();
+        gs_init();
+    }
     if (cpu_warm && router_ok) {
         CpuWarm* w = new CpuWarm;
         w->rq = std::move(rq_h);
@@ -665,9 +672,469 @@ bool Verifier::dm_fence(cudaStream_t s) {
     return cudaEventRecord(fence_ev_, cs_) == cudaSuccess && cudaStreamWaitEvent(s, fence_ev_, 0) == cudaSuccess;
 }
 
+// Memory bandwidth of a card from its attributes, bytes per second.
+static double card_bandwidth(int dev) {
+    int khz = 0, bits = 0;
+    if (cudaDeviceGetAttribute(&khz, cudaDevAttrMemoryClockRate, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&bits, cudaDevAttrGlobalMemoryBusWidth, dev) != cudaSuccess) {
+        cudaGetLastError();
+        return 0.0;
+    }
+    return 2.0 * khz * 1e3 * bits / 8.0;
+}
+
+// The head's rows are split by the time each card takes for its share: CUDA0 streams its rows, the peer streams
+// its rows and its logits cross PCIe twice (to the host, to CUDA0).  A split that leaves CUDA0 most of the rows
+// does not pay for its two hand-offs, so it is taken only when the peer's share is large.
+// CUDA0's rows of the head split by vocabulary (0: no split), from the cards' bandwidths.
+static int hs_plan(size_t rb, int type, int V, int N, int T, int dev0, int dev1) {
+    if (type == 13 ? !basalt::kernels::q5k_head_supported(N, T) : type == 14) return 0;
+    const double bw0 = card_bandwidth(dev0), bw1 = card_bandwidth(dev1);
+    if (bw0 <= 0.0 || bw1 <= 0.0 || rb == 0) return 0;
+    const double pcie = 25e9, cols = 3.0;   // the hand-off rate and a typical window
+    const double c0 = (double) rb / bw0, c1 = (double) rb / bw1 + 2.0 * cols * 4.0 / pcie;
+    const double share0 = c1 / (c0 + c1);
+    if (share0 > 0.75) return 0;
+    const int rows = (int) (share0 * V) / 256 * 256;
+    return rows <= 0 || rows >= V ? 0 : rows;
+}
+
+int64_t Verifier::hs_peer_bytes(size_t row_bytes, int type, int64_t n_vocab, int64_t n_embd, int max_t, int dev0, int dev1) {
+    if (dev1 < 0 || dev1 == dev0) return 0;
+    const int rows = hs_plan(row_bytes, type, (int) n_vocab, (int) n_embd, max_t, dev0, dev1);
+    if (rows == 0) return 0;
+    const int64_t r1 = n_vocab - rows;
+    return r1 * (int64_t) row_bytes + (int64_t) basalt::kernels::native_q8_1_bytes((int) n_embd, max_t) +
+           (int64_t) max_t * r1 * 4;
+}
+
+void Verifier::hs_init() {
+    if (head_ == nullptr || !head_->loaded() || head_->vproxy() != nullptr || dm_ == nullptr || dm_->pdev < 0) return;
+    const int N = (int) g_->n_embd, V = (int) n_vocab_, T = max_t_;
+    const size_t rb = head_->row_bytes();
+    const int rows = hs_plan(rb, head_->type(), V, N, T, device_, dm_->pdev);
+    if (rows == 0) return;
+    const int r1 = V - rows;
+    const size_t xb = basalt::kernels::native_q8_1_bytes(N, T);
+    bool ok;
+    {
+        const OnDevice on(dm_->pdev);
+        ok = cudaMalloc(&hs_w_, (size_t) r1 * rb) == cudaSuccess && cudaMalloc(&hs_xq_, xb) == cudaSuccess &&
+             cudaMalloc((void**) &hs_y_, (size_t) T * r1 * 4) == cudaSuccess &&
+             cudaStreamCreateWithFlags(&hs_s_, cudaStreamNonBlocking) == cudaSuccess &&
+             cudaEventCreateWithFlags(&hs_out_, cudaEventDisableTiming) == cudaSuccess;
+        ok = ok && cudaMemcpyPeer(hs_w_, dm_->pdev, (const uint8_t*) head_->weights() + (size_t) rows * rb, device_,
+                                  (size_t) r1 * rb) == cudaSuccess;
+    }
+    {
+        const OnDevice on(device_);
+        ok = ok && cudaMalloc((void**) &hs_y0_, (size_t) T * rows * 4) == cudaSuccess &&
+             cudaEventCreateWithFlags(&hs_in_, cudaEventDisableTiming) == cudaSuccess &&
+             cudaHostAlloc(&hs_hxq_, xb, cudaHostAllocPortable) == cudaSuccess &&
+             cudaHostAlloc((void**) &hs_hy_, (size_t) T * r1 * 4, cudaHostAllocPortable) == cudaSuccess;
+    }
+    if (!ok) {
+        cudaGetLastError();
+        hs_free();
+        basalt::log::warn("basalt verify", "the head stays whole on CUDA0: no room for the peer's share");
+        return;
+    }
+    hs_rows_ = rows;
+    hs_dev_ = dm_->pdev;
+    basalt::log::info("basalt verify", "the head is split by vocabulary: CUDA0 %d rows, the peer %d rows", rows, r1);
+}
+
+void Verifier::hs_free() {
+    if (hs_dev_ >= 0 || hs_w_ != nullptr || hs_s_ != nullptr) {
+        const OnDevice on(dm_ != nullptr && dm_->pdev >= 0 ? dm_->pdev : hs_dev_);
+        if (hs_s_) { cudaStreamSynchronize(hs_s_); cudaStreamDestroy(hs_s_); }
+        if (hs_out_) cudaEventDestroy(hs_out_);
+        for (void* p : {hs_w_, hs_xq_, (void*) hs_y_}) if (p) cudaFree(p);
+    }
+    {
+        const OnDevice on(device_);
+        if (hs_y0_) cudaFree(hs_y0_);
+        if (hs_in_) cudaEventDestroy(hs_in_);
+        if (hs_hxq_) cudaFreeHost(hs_hxq_);
+        if (hs_hy_) cudaFreeHost(hs_hy_);
+    }
+    hs_rows_ = 0; hs_dev_ = -1;
+    hs_w_ = hs_xq_ = hs_hxq_ = nullptr;
+    hs_y_ = hs_y0_ = hs_hy_ = nullptr;
+    hs_s_ = nullptr;
+    hs_in_ = hs_out_ = nullptr;
+}
+
+// The GDN mixer splits by key head when the peer card streams the mixer's bytes faster than CUDA0.  The unit is the
+// fewest key heads whose value-head runs fill whole out-projection blocks; the peer's share of the units follows both
+// cards' memory bandwidth, rounded down, and is taken only from a quarter up, CUDA0 keeping at least one unit.  The
+// peer holds its heads' weights and state in gdn_head_split.hpp's layout.
+// The key heads CUDA0 keeps when the GDN mixer splits by key head between CUDA0 (dev0) and the peer (dev1); 0 when the
+// split is not taken.  Units of key heads whose out-projection columns fill whole 256-value blocks; the peer's units
+// follow the two cards' memory bandwidth, taken only from a quarter of them.
+static bool g_gs_off = false;   // set by Verifier::gs_decide when the split does not pay
+
+static int gs_plan_bw(const ModelGeometry& g, int dev0, int dev1) {
+    const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, S = (int) g.ssm_state_size, HIST = (int) g.ssm_d_conv - 1;
+    const int64_t N = g.n_embd, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;
+    constexpr int kBlockCols = 256;
+    int unit = 1;
+    while (unit <= HK && (unit * S) % kBlockCols != 0) ++unit;
+    if (HK <= 0 || HV % HK != 0 || unit > HK || HK % unit != 0 || N % kBlockCols != 0 || HIST < 1 ||
+        C != (int64_t) (2 * HK + HV) * S || ZV != (int64_t) HV * S)
+        return 0;
+    const double bw0 = card_bandwidth(dev0), bw1 = card_bandwidth(dev1);
+    if (bw0 <= 0.0 || bw1 <= 0.0) return 0;
+    const int units = HK / unit;
+    const int u1 = std::min(units - 1, (int) std::floor(units * bw1 / (bw0 + bw1)));
+    if (u1 * 4 < units) return 0;
+    return HK - u1 * unit;
+}
+
+static int gs_plan(const ModelGeometry& g, int dev0, int dev1) { return g_gs_off ? 0 : gs_plan_bw(g, dev0, dev1); }
+
+// The split's start-time price, in ms per verify window.  It saves the main card's stream of the peer's heads' mixer
+// weights at its achieved bandwidth, less the peer item's growth per window token beyond the first.  Its reserve
+// displaces the same bytes of experts from the peer to RAM, which decode pays as CPU-tier misses.  The prompt path is
+// not priced: it streams the displaced experts with the rest of a chunk's, at no measurable cost.
+bool Verifier::gs_decide(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1, int max_t,
+                         int64_t displaced) {
+    g_gs_off = false;
+    if (dev1 < 0 || dev1 == dev0) return false;
+    const int nk0 = gs_plan_bw(g, dev0, dev1);
+    if (nk0 == 0) return false;
+    constexpr double kMainEff = 0.71;        // the main card's achieved share of its bandwidth on the mixer
+    constexpr double kTokGrowth = 0.71;      // the peer item's growth per token, in units of its weight stream
+    constexpr double kMissMsPerGB = 0.263;   // decode CPU-tier misses per window per GB of displaced experts
+    const int64_t HK = g.ssm_k_heads, N = g.n_embd, nk1 = HK - nk0;
+    const int64_t C1 = g.ssm_conv_channels / HK * nk1, Z1 = g.ssm_value_dim / HK * nk1;
+    double bm = 0.0;
+    int layers = 0;
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        if (is_qsa_layer(g, l)) continue;
+        const LayerView v(wt, l);
+        const WeightRef *q = v.get("attn_qkv.weight"), *z = v.get("attn_gate.weight"), *o = v.get("ssm_out.weight");
+        if (!q || !z || !o) return false;
+        bm += (double) basalt::kernels::native_mmvq_weight_bytes(q->native_type, (int) N, (int) C1) +
+              (double) basalt::kernels::native_mmvq_weight_bytes(z->native_type, (int) N, (int) Z1) +
+              (double) basalt::kernels::native_mmvq_weight_bytes(o->native_type, (int) Z1, (int) N);
+        ++layers;
+    }
+    if (layers == 0) return false;
+    bm /= layers;
+    const double bw0 = card_bandwidth(dev0), bw1 = card_bandwidth(dev1);
+    const double t_exp = std::max(1.0, (max_t + 2) / 3.0);   // the expected window: a third of the drafted run
+    const double save = layers * (bm / (kMainEff * bw0) - kTokGrowth * (t_exp - 1.0) * bm / bw1) * 1e3;
+    const double dgb = (double) std::max<int64_t>(displaced, 0) / 1e9;
+    const double miss = kMissMsPerGB * dgb;
+    const bool take = save - miss > 0.0;
+    g_gs_off = !take;
+    basalt::log::info("basalt verify", "GDN mixer split by key head: saves %.2f ms per %.1f-token window, costs %.2f "
+                         "(%.2f GB of experts off the peer, read as decode misses) -> %s",
+                 save, t_exp, miss, dgb, take ? "split" : "whole on CUDA0");
+    return take;
+}
+
+int64_t Verifier::gs_cuda0_bytes(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1) {
+    if (dev1 < 0 || dev1 == dev0) return 0;
+    const int nk0 = gs_plan(g, dev0, dev1);
+    if (nk0 == 0) return 0;
+    const int64_t HK = g.ssm_k_heads, N = g.n_embd, C0 = g.ssm_conv_channels / HK * nk0, Z0 = g.ssm_value_dim / HK * nk0;
+    int64_t b = 0;
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        if (is_qsa_layer(g, l)) continue;
+        const LayerView v(wt, l);
+        const WeightRef *q = v.get("attn_qkv.weight"), *z = v.get("attn_gate.weight"), *o = v.get("ssm_out.weight");
+        if (!q || !z || !o) return 0;
+        b += (int64_t) basalt::kernels::native_mmvq_weight_bytes(q->native_type, (int) N, (int) C0) +
+             (int64_t) basalt::kernels::native_mmvq_weight_bytes(z->native_type, (int) N, (int) Z0) +
+             (int64_t) basalt::kernels::native_mmvq_weight_bytes(o->native_type, (int) Z0, (int) N);
+    }
+    return b;
+}
+
+int64_t Verifier::gs_peer_bytes(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1) {
+    if (dev1 < 0 || dev1 == dev0) return 0;
+    const int nk0 = gs_plan(g, dev0, dev1);
+    if (nk0 == 0) return 0;
+    const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, S = (int) g.ssm_state_size, HIST = (int) g.ssm_d_conv - 1;
+    const basalt::core::GdnHeadSlice sl{HK, HV, S, nk0, HK - nk0};
+    const int64_t N = g.n_embd, C1 = sl.c(), Z1 = sl.zv(), V1 = sl.nv();
+    int64_t b = 0, layers = 0;
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        if (is_qsa_layer(g, l)) continue;
+        const LayerView v(wt, l);
+        const WeightRef *q = v.get("attn_qkv.weight"), *z = v.get("attn_gate.weight"), *o = v.get("ssm_out.weight");
+        if (!q || !z || !o) return 0;
+        b += (int64_t) basalt::kernels::native_mmvq_weight_bytes(q->native_type, (int) N, (int) C1) +
+             (int64_t) basalt::kernels::native_mmvq_weight_bytes(z->native_type, (int) N, (int) Z1) +
+             (int64_t) basalt::kernels::native_mmvq_weight_bytes(o->native_type, (int) Z1, (int) N) +
+             C1 * (HIST + 1) * 4 + V1 * N * 2 * 2 + V1 * 4 * 2 + (int64_t) S * 4 +
+             (int64_t) basalt::core::gdn_slice_state_floats(sl, HIST) * 4;
+        ++layers;
+    }
+    // the mixer's rows and per-allocation rounding
+    return b + layers * (2 << 20);
+}
+
+void Verifier::gs_init() {
+    using basalt::core::GdnHeadSlice;
+    if (dm_ == nullptr || dm_->pdev < 0 || wt_ == nullptr) return;
+    const ModelGeometry& g = *g_;
+    const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, S = (int) g.ssm_state_size, HIST = (int) g.ssm_d_conv - 1;
+    const int64_t N = g.n_embd, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;
+    constexpr int kBlockCols = 256;
+    const int nk0 = gs_plan(g, device_, dm_->pdev);
+    if (nk0 == 0) return;
+    const GdnHeadSlice sl{HK, HV, S, nk0, HK - nk0};
+    auto blocked = [](int t) { return t == 11 || t == 12 || t == 13 || t == 14 || t == 23; };   // 256-value blocks
+    // every GDN layer's tensors, as the verify window reads them
+    struct Src {
+        const WeightRef *qkv, *z, *out, *a, *b, *conv, *norm, *dt, *sa;
+    };
+    std::vector<Src> src;
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        if (is_qsa_layer(g, l)) continue;
+        const LayerView v(*wt_, l);
+        Src s{v.get("attn_qkv.weight"), v.get("attn_gate.weight"), v.get("ssm_out.weight"), v.get("ssm_alpha.weight"),
+              v.get("ssm_beta.weight"), v.get("ssm_conv1d.weight"), v.get("ssm_norm.weight"), v.get("ssm_dt.bias"),
+              v.get("ssm_a")};
+        if (!s.qkv || !s.z || !s.out || !s.a || !s.b || !s.conv || !s.norm || !s.dt || !s.sa || !s.qkv->native_data ||
+            !s.z->native_data || !s.out->native_data || !blocked(s.qkv->native_type) || !blocked(s.z->native_type) ||
+            !blocked(s.out->native_type) || s.conv->bytes != (uint64_t) C * (HIST + 1) * 4 ||
+            s.a->bytes != (uint64_t) HV * N * 2 || s.b->bytes != (uint64_t) HV * N * 2 ||
+            s.dt->bytes != (uint64_t) HV * 4 || s.sa->bytes != (uint64_t) HV * 4 || s.norm->bytes != (uint64_t) S * 4) {
+            basalt::log::warn("basalt verify", "the GDN mixer stays whole on CUDA0: a layer the split does not cover");
+            return;
+        }
+        src.push_back(s);
+    }
+    if (src.empty()) return;
+    // each tensor comes down from CUDA0, is sliced on the host and goes up to the peer
+    std::vector<uint8_t> full, part;
+    size_t peer_bytes = 0;
+    bool ok = true;
+    auto down = [&](const void* d, size_t n) {
+        full.resize(n);
+        const OnDevice on(device_);
+        ok = ok && cudaMemcpy(full.data(), d, n, cudaMemcpyDeviceToHost) == cudaSuccess;
+    };
+    size_t own_bytes = 0;
+    auto up = [&](size_t n, void** dst, int dev) {
+        const OnDevice on(dev);
+        ok = ok && cudaMalloc(dst, n) == cudaSuccess && cudaMemcpy(*dst, part.data(), n, cudaMemcpyHostToDevice) == cudaSuccess;
+        (dev == device_ ? own_bytes : peer_bytes) += n;
+    };
+    auto rows = [&](const void* d, size_t row_bytes, int64_t n_rows, const std::vector<basalt::core::GdnRun>& runs,
+                    void** dst, int dev) {
+        if (!ok) return;
+        down(d, row_bytes * (size_t) n_rows);
+        part.resize(row_bytes * (size_t) basalt::core::gdn_runs_len(runs));
+        basalt::core::gdn_gather_rows(full.data(), row_bytes, runs, part.data());
+        up(part.size(), dst, dev);
+    };
+    // the out projection's columns of a slice's value heads
+    auto cols = [&](const void* d, int type, const GdnHeadSlice& h, void** dst, int dev) {
+        if (!ok) return;
+        const size_t rb = basalt::kernels::native_mmvq_weight_bytes(type, (int) ZV, 1);
+        down(d, rb * (size_t) N);
+        part.resize(basalt::kernels::native_mmvq_weight_bytes(type, (int) h.zv(), (int) N));
+        basalt::core::gdn_gather_cols(full.data(), N, ZV, kBlockCols, rb / (size_t) (ZV / kBlockCols),
+                                      basalt::core::gdn_vhead_runs(h, S), part.data());
+        up(part.size(), dst, dev);
+    };
+    const int P = dm_->pdev, D0 = device_;
+    // CUDA0 runs its own heads in place in the full state (dec_gdn_rec's head map) from packed qkv/z rows and out columns
+    const GdnHeadSlice sl0{HK, HV, S, 0, nk0};
+    const std::vector<basalt::core::GdnRun> qr = basalt::core::gdn_qkv_runs(sl), v1 = basalt::core::gdn_vhead_runs(sl, 1),
+                                           vs = basalt::core::gdn_vhead_runs(sl, S),
+                                           qr0 = basalt::core::gdn_qkv_runs(sl0), vs0 = basalt::core::gdn_vhead_runs(sl0, S);
+    gs_layers_.assign(src.size(), GsLayer{});
+    gs_dev_ = dm_->pdev;
+    for (size_t i = 0; i < src.size() && ok; ++i) {
+        const Src& s = src[i];
+        GsLayer& L = gs_layers_[i];
+        L.tq = s.qkv->native_type; L.tz = s.z->native_type; L.to = s.out->native_type;
+        const size_t rq = basalt::kernels::native_mmvq_weight_bytes(L.tq, (int) N, 1),
+                     rz = basalt::kernels::native_mmvq_weight_bytes(L.tz, (int) N, 1);
+        rows(s.qkv->native_data, rq, C, qr, &L.wqkv, P);
+        rows(s.z->native_data, rz, ZV, vs, &L.wz, P);
+        rows(s.conv->data, (size_t) (HIST + 1) * 4, C, qr, (void**) &L.conv_w, P);
+        rows(s.a->data, (size_t) N * 2, HV, v1, (void**) &L.wa, P);
+        rows(s.b->data, (size_t) N * 2, HV, v1, (void**) &L.wb, P);
+        rows(s.dt->data, 4, HV, v1, (void**) &L.dt, P);
+        rows(s.sa->data, 4, HV, v1, (void**) &L.ssm_a, P);
+        rows(s.norm->data, (size_t) S * 4, 1, {{0, 1}}, (void**) &L.gamma, P);
+        cols(s.out->native_data, L.to, sl, &L.wo, P);
+        rows(s.qkv->native_data, rq, C, qr0, &L.wqkv0, D0);
+        rows(s.z->native_data, rz, ZV, vs0, &L.wz0, D0);
+        cols(s.out->native_data, L.to, sl0, &L.wo0, D0);
+    }
+    const size_t state_bytes = basalt::core::gdn_slice_state_floats(sl, HIST) * 4 * src.size();
+    if (ok) {
+        const OnDevice on(dm_->pdev);
+        ok = cudaMalloc((void**) &gs_state_, state_bytes) == cudaSuccess && cudaMemset(gs_state_, 0, state_bytes) == cudaSuccess;
+        peer_bytes += state_bytes;
+        // the mixer doorbell: one per GDN layer's ring
+        std::vector<uint8_t> mix((size_t) dm_->rings, 0);
+        for (int64_t l = lb_; l < le_; ++l) mix[(size_t) (l - lb_)] = is_qsa_layer(g, l) ? 0 : 1;
+        ok = ok && cudaMalloc((void**) &gs_mix_, mix.size()) == cudaSuccess &&
+             cudaMemcpy(gs_mix_, mix.data(), mix.size(), cudaMemcpyHostToDevice) == cudaSuccess &&
+             cudaMalloc(&gs_pxq_, dm_->xq_stride) == cudaSuccess;
+        // the peer's scratch: per layer qkv, h, gate, beta (kept for its commit); shared x, z, o, yq
+        const int64_t MT = max_t_, C1 = sl.c(), Z1 = sl.zv(), V1 = sl.nv();
+        const size_t per = (size_t) (MT * (2 * C1 + 2 * V1)), shared = (size_t) (MT * (N + 2 * Z1) + MT * Z1 / 32 * 9);
+        const size_t nl = src.size();
+        ok = ok && cudaMalloc((void**) &gs_pscr_, (per * nl + shared) * 4) == cudaSuccess;
+        peer_bytes += (per * nl + shared) * 4;
+        std::vector<basalt::kernels::DmMixLayer> tab((size_t) dm_->rings);
+        if (ok) {
+            float* sh = gs_pscr_ + per * nl;
+            float *px = sh, *pz = px + MT * N, *po = pz + MT * Z1;
+            void* pyq = po + MT * Z1;
+            size_t i = 0;
+            for (int64_t l = lb_; l < le_; ++l) {
+                if (is_qsa_layer(g, l)) continue;
+                const GsLayer& L = gs_layers_[i];
+                basalt::kernels::DmMixLayer& m = tab[(size_t) (l - lb_)];
+                m.wqkv = L.wqkv; m.wz = L.wz; m.wo = L.wo; m.tq = L.tq; m.tz = L.tz; m.to = L.to;
+                basalt::kernels::DecRecArgs& r = m.rec;
+                float* pl = gs_pscr_ + per * i;
+                r.state = gs_state_ + basalt::core::gdn_slice_state_floats(sl, HIST) * i;
+                r.qkv = pl; r.h = pl + MT * C1; r.gate = pl + 2 * MT * C1; r.beta = r.gate + MT * V1;
+                r.conv_w = L.conv_w; r.x = px; r.w_alpha = L.wa; r.w_beta = L.wb; r.dt = L.dt; r.ssm_a = L.ssm_a;
+                r.z = pz; r.gamma = L.gamma; r.o = po; r.yq = pyq;
+                r.C = (int) C1; r.n_embd = (int) N; r.h_k = HK - nk0; r.h_v = (int) V1; r.eps = EPS;
+                r.early_trigger = false;
+                ++i;
+            }
+        }
+        gs_ca_ = basalt::kernels::GdnCommitLayers{};
+        gs_ca_.state = gs_state_; gs_ca_.qkv = gs_pscr_; gs_ca_.h = gs_pscr_ + MT * C1;
+        gs_ca_.gate = gs_pscr_ + 2 * MT * C1; gs_ca_.beta = gs_ca_.gate + MT * V1;
+        gs_ca_.state_stride = basalt::core::gdn_slice_state_floats(sl, HIST); gs_ca_.h_stride = per; gs_ca_.gb_stride = per;
+        gs_ca_.C = (int) C1; gs_ca_.h_k = HK - nk0; gs_ca_.h_v = (int) V1; gs_ca_.n_layers = (int) nl;
+        ok = ok && cudaMalloc((void**) &gs_mixl_, tab.size() * sizeof(tab[0])) == cudaSuccess &&
+             cudaMemcpy(gs_mixl_, tab.data(), tab.size() * sizeof(tab[0]), cudaMemcpyHostToDevice) == cudaSuccess;
+    }
+    ok = ok && mapped((size_t) dm_->rings * dm_->xq_stride, (void**) &gs_h_xq_, (void**) &gs_m_xq_) &&
+         mapped((size_t) dm_->rings * dm_->x_stride * 4, (void**) &gs_h_x_, (void**) &gs_m_x_) &&
+         mapped((size_t) max_t_ * N * 4, (void**) &gs_h_part_, (void**) &gs_m_part_);
+    if (ok) {   // gs_move's staging, pinned so the moves run at the bus rate
+        const size_t full_f = (size_t) S * HV * S + (size_t) C * HIST, nl = (size_t) gs_ca_.n_layers;
+        ok = cudaHostAlloc((void**) &gs_h_full_, full_f * nl * 4, cudaHostAllocPortable) == cudaSuccess &&
+             cudaHostAlloc((void**) &gs_h_slice_, basalt::core::gdn_slice_state_floats(sl, HIST) * nl * 4,
+                           cudaHostAllocPortable) == cudaSuccess;
+    }
+    for (const Src& s : src)
+        ok = ok && basalt::kernels::dec_moe_mix_type_ok(s.qkv->native_type) &&
+             basalt::kernels::dec_moe_mix_type_ok(s.z->native_type) && basalt::kernels::dec_moe_mix_type_ok(s.out->native_type);
+    if (ok) {
+        const OnDevice on(device_);
+        const GdnHeadSlice s0{HK, HV, S, 0, nk0};
+        ok = cudaMalloc((void**) &gs_qkv0_, (size_t) max_t_ * s0.c() * 4) == cudaSuccess &&
+             cudaMalloc((void**) &gs_z0_, (size_t) max_t_ * s0.zv() * 4) == cudaSuccess;
+        own_bytes += (size_t) max_t_ * (s0.c() + s0.zv()) * 4;
+    }
+    if (!ok) {
+        cudaGetLastError();
+        gs_free();
+        basalt::log::warn("basalt verify", "the GDN mixer stays whole on CUDA0: no room for the peer's share");
+        return;
+    }
+    gs_nk0_ = nk0;
+    basalt::log::info("basalt verify",
+                      "the GDN mixer is split by key head: CUDA0 %d of %d key heads (%.0f MiB), the peer %d (%.0f MiB)",
+                      nk0, HK, own_bytes / 1048576.0, HK - nk0, peer_bytes / 1048576.0);
+}
+
+void Verifier::gs_free() {
+    if (gs_dev_ >= 0) {
+        const OnDevice on(gs_dev_);
+        for (GsLayer& L : gs_layers_)
+            for (void* p : {L.wqkv, L.wz, L.wo, (void*) L.conv_w, (void*) L.dt, (void*) L.ssm_a, (void*) L.gamma,
+                            (void*) L.wa, (void*) L.wb})
+                if (p) cudaFree(p);
+        if (gs_state_) cudaFree(gs_state_);
+        if (gs_mix_) cudaFree(gs_mix_);
+        if (gs_pxq_) cudaFree(gs_pxq_);
+        if (gs_mixl_) cudaFree(gs_mixl_);
+        if (gs_pscr_) cudaFree(gs_pscr_);
+        const OnDevice on0(device_);
+        for (GsLayer& L : gs_layers_)
+            for (void* p : {L.wqkv0, L.wz0, L.wo0})
+                if (p) cudaFree(p);
+        if (gs_qkv0_) cudaFree(gs_qkv0_);
+        if (gs_z0_) cudaFree(gs_z0_);
+    }
+    for (void* h : {(void*) gs_h_xq_, (void*) gs_h_x_, (void*) gs_h_part_, (void*) gs_h_full_, (void*) gs_h_slice_})
+        if (h) cudaFreeHost(h);
+    gs_h_full_ = gs_h_slice_ = nullptr;
+    gs_h_x_ = gs_m_x_ = gs_h_part_ = gs_m_part_ = nullptr;
+    gs_mixl_ = nullptr; gs_pscr_ = nullptr; gs_qkv0_ = gs_z0_ = nullptr;
+    gs_live_ = gs_split_ = false;
+    gs_ss_ = nullptr;
+    gs_layers_.clear();
+    gs_state_ = nullptr;
+    gs_mix_ = nullptr; gs_pxq_ = nullptr; gs_h_xq_ = nullptr; gs_m_xq_ = nullptr;
+    gs_nk0_ = 0;
+    gs_dev_ = -1;
+}
+
+bool Verifier::gs_move(bool to_peer, std::string& err) {
+    using basalt::core::GdnHeadSlice;
+    const ModelGeometry& g = *g_;
+    const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, S = (int) g.ssm_state_size, HIST = (int) g.ssm_d_conv - 1;
+    const GdnHeadSlice sl{HK, HV, S, gs_nk0_, HK - gs_nk0_};
+    const size_t full_f = (size_t) S * HV * S + (size_t) g.ssm_conv_channels * HIST;
+    const size_t part_f = basalt::core::gdn_slice_state_floats(sl, HIST), nl = (size_t) gs_ca_.n_layers;
+    SessionState& ss = to_peer ? *ss_ : *gs_ss_;
+    const auto t0 = std::chrono::steady_clock::now();
+    int64_t gdn_index = 0;
+    for (int64_t l = 0; l < lb_; ++l) gdn_index += is_qsa_layer(g, l) ? 0 : 1;
+    float* const full_d = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * full_f;
+    float* const full = gs_h_full_;
+    float* const part = gs_h_slice_;
+    const size_t full_n = full_f * nl, part_n = part_f * nl;
+    bool ok;
+    {
+        const OnDevice on(device_);
+        ok = cudaStreamSynchronize(cs_) == cudaSuccess && cudaStreamSynchronize(cm_) == cudaSuccess &&
+             cudaMemcpy(full, full_d, full_n * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+    }
+    if (to_peer) {
+        for (size_t i = 0; i < nl; ++i) basalt::core::gdn_slice_state(sl, HIST, full + full_f * i, part + part_f * i);
+        const OnDevice on(gs_dev_);
+        ok = ok && cudaStreamSynchronize(dm_->ps) == cudaSuccess &&
+             cudaMemcpy(gs_state_, part, part_n * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+        gs_ss_ = ss_;
+    } else {
+        {
+            const OnDevice on(gs_dev_);
+            ok = ok && cudaStreamSynchronize(dm_->ps) == cudaSuccess &&
+                 cudaMemcpy(part, gs_state_, part_n * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+        }
+        for (size_t i = 0; i < nl; ++i) basalt::core::gdn_unslice_state(sl, HIST, part + part_f * i, full + full_f * i);
+        const OnDevice on(device_);
+        ok = ok && cudaMemcpy(full_d, full, full_n * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+    }
+    if (!ok) {
+        err = std::string("verify: the GDN state slice did not move: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    gs_live_ = to_peer;
+    if (diagnostics().decode_timing)
+        basalt::log::info("basalt verify", "the GDN state slice moved %s in %.1f ms (%.0f MiB)", to_peer ? "to the peer" : "back",
+                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                          (double) (full_n + part_n) * 4 / (1 << 20));
+    return true;
+}
+
 void Verifier::dm_free() {
     DecMoe* d = dm_;
     if (d == nullptr) return;
+    hs_free();
+    gs_free();
     if (d->warm != nullptr) {
         warm_pool_->idle_stop();
         delete d->warm;
@@ -1358,9 +1825,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const bool router_multi = w_router != nullptr && NE == 512 && K == 10;
         // a GDN layer's middle as one persistent kernel (mid_chain.hpp) between the layer's two hc reads: the qkv + z pair,
         // the recurrence and the output projection, bitwise the kernels it replaces
+        // the GDN mixer split by key head: the layer's q8_1 rows and a doorbell for the peer's key heads; in a batch
+        // window CUDA0 runs the whole layer and the doorbell only passes
+        const bool gs_ring = dm && gs_nk0_ > 0 && !is_qsa_layer(g, l);
+        const bool gs_split = gs_ring && !batch_rec_;
         bool mid_ok = false;
         MidChainArgs ma;
-        if (dec_hc && read_q8 && router_multi && !is_qsa_layer(g, l) && !prof_on_ && !batch_rec_ &&
+        if (dec_hc && read_q8 && router_multi && !is_qsa_layer(g, l) && !prof_on_ && !batch_rec_ && !gs_split &&
             n <= kMidChainMaxT && N == 2560 && dec_gdnf_mode() != 0 && (dense_tc_mask() & 4)) {
             const WeightRef *wqkv = v.get("attn_qkv.weight"), *wg = v.get("attn_gate.weight"),
                             *wout = v.get("ssm_out.weight"), *wa = v.get("ssm_alpha.weight"),
@@ -1413,6 +1884,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         }
         stamp(l, 1);
+        if (gs_ring) {
+            if (!read_q8) native_quantize_q8_1(mixed_, xq_, (int) N, n, cs);
+            const int64_t r = l - lb_;
+            dec_moe_mix_publish(xq_, mixed_, n, (int) N, gs_m_xq_ + (size_t) r * dm_->xq_stride,
+                                gs_m_x_ + (size_t) r * dm_->x_stride, dm_->m_w + 48, (uint32_t) (r + 1), gs_split, cs);
+        }
         if (mid_ok) {
             // the first read's dependent: its first pair tiles are already issued by the time the read ends (PDL)
             PdlScope ps(pdl, mid_ord == 0);
@@ -1442,6 +1919,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 float* gate = gate_L_ + (size_t) gi * MT * HV;
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
                 PdlScope ps(pdl);   // the layer's GDN kernels, after the hc read
+                if (gs_split) {   // CUDA0's key heads in place (dec_gdn_rec's head map); the peer's arrive in the combine
+                    const GsLayer& GL = gs_layers_[(size_t) gi];
+                    const int C0 = (int) (C / HK * gs_nk0_), Z0 = (int) (ZV / HK * gs_nk0_);
+                    kernels::dense_tc_pair(GL.tq, GL.wqkv0, gs_qkv0_, C0, GL.tz, GL.wz0, gs_z0_, Z0, xq_, (int) N, n, cs);
+                    DecRecArgs ra;
+                    ra.state = state; ra.qkv = gs_qkv0_; ra.conv_w = (const float*) wc->data; ra.x = xm;
+                    ra.w_alpha = (const uint16_t*) wa->data; ra.w_beta = (const uint16_t*) wb->data;
+                    ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = gs_z0_;
+                    ra.gamma = (const float*) wnm->data; ra.h = hb; ra.gate = gate; ra.beta = beta; ra.yq = xq_;
+                    ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
+                    ra.k0 = 0; ra.nk = gs_nk0_; ra.qkv_out = qkv;
+                    dec_gdn_rec(ra, n, cs);
+                    dense_proj(4, GL.to, GL.wo0, xq_, bo_, Z0, (int) N, n, cs);
+                    goto gdn_done;
+                }
                 // conv, gates, recurrence, gated norm and the output's q8_1 in dec_gdn_rec's one or two launches; at
                 // 2/3 the z projection runs on the side stream beside the recurrence (dec_gdn.hpp)
                 {
@@ -1830,6 +2322,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();
             return false;
         }
+        if (gs_split)   // the peer's key heads added after CUDA0's
+            dec_moe_mix_combine(dm_->m_w + 52, (uint32_t) (l - lb_ + 1), gs_m_part_, bo_, n * (int) N, cs);
+        else if (gs_ring)
+            dec_moe_mix_wait(dm_->m_w + 52, (uint32_t) (l - lb_ + 1), cs);
         stamp(l, 16);
         bool routed = false;   // the fused read ran the router too
         const bool sh_fork = !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr &&
@@ -2167,7 +2663,37 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (head_ != nullptr && head_->loaded()) {
             try {
                 native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
-                if (head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits, one wave
+                // rows [0, n) of `w` into y (T rows of n); the same kernel and bits as the whole head
+                auto head_rows = [&](const void* w, float* y, int n, cudaStream_t s) {
+                    const void* x = s == cs ? (const void*) xq_ : hs_xq_;
+                    if (head_->type() == 13 && q5k_head_supported((int) N, T))
+                        q5k_head_mmvq(w, x, y, (int) N, n, T, s);
+                    else if (head_->type() == 14 && q6k_head_supported((int) N, T))
+                        q6k_head_mmvq(w, x, y, (int) N, n, T, s);
+                    else
+                        native_mmvq(head_->type(), w, x, y, (int) N, n, T, s);
+                };
+                if (hs_rows_ > 0) {   // the peer's rows while CUDA0 does its own; its logits land beside CUDA0's
+                    const int r0 = hs_rows_, r1 = (int) n_vocab_ - r0;
+                    const size_t xb = native_q8_1_bytes((int) N, T);
+                    bool ok = cudaMemcpyAsync(hs_hxq_, xq_, xb, cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
+                              cudaEventRecord(hs_in_, cs) == cudaSuccess;
+                    {
+                        const OnDevice on(hs_dev_);
+                        ok = ok && cudaStreamWaitEvent(hs_s_, hs_in_, 0) == cudaSuccess &&
+                             cudaMemcpyAsync(hs_xq_, hs_hxq_, xb, cudaMemcpyHostToDevice, hs_s_) == cudaSuccess;
+                        if (ok) head_rows(hs_w_, hs_y_, r1, hs_s_);
+                        ok = ok && cudaMemcpyAsync(hs_hy_, hs_y_, (size_t) T * r1 * 4, cudaMemcpyDeviceToHost, hs_s_) == cudaSuccess &&
+                             cudaEventRecord(hs_out_, hs_s_) == cudaSuccess;
+                    }
+                    head_rows(head_->weights(), hs_y0_, r0, cs);
+                    ok = ok && cudaMemcpy2DAsync(head_logits_, (size_t) n_vocab_ * 4, hs_y0_, (size_t) r0 * 4, (size_t) r0 * 4, T,
+                                                 cudaMemcpyDeviceToDevice, cs) == cudaSuccess &&
+                         cudaStreamWaitEvent(cs, hs_out_, 0) == cudaSuccess &&
+                         cudaMemcpy2DAsync(head_logits_ + r0, (size_t) n_vocab_ * 4, hs_hy_, (size_t) r1 * 4, (size_t) r1 * 4, T,
+                                           cudaMemcpyHostToDevice, cs) == cudaSuccess;
+                    if (!ok) { err = "verify: the split head's hand-off failed"; return false; }
+                } else if (head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits, one wave
                     q5k_head_mmvq(head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
                 else if (head_->type() == 14 && vhead_scratch_ != nullptr && q6k_vhead_supported((int) N, (int) n_vocab_, T))
                     q6k_vhead(head_->vproxy(), head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T,
@@ -2674,6 +3200,8 @@ bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
     *(volatile uint32_t*) (dm_->h_w + 0) = 0;
     *(volatile uint32_t*) (dm_->h_w + 16) = 0;
     *(volatile uint32_t*) (dm_->h_w + 32) = 0;
+    *(volatile uint32_t*) (dm_->h_w + 48) = 0;
+    *(volatile uint32_t*) (dm_->h_w + 52) = 0;
     if (dm_->tag && dm_->tag_dirty) {   // a released window left rows written: back to unwritten
         for (size_t i = 0; i < dm_->rows_words; ++i)
             ((volatile uint32_t*) dm_->h_rows)[i] = basalt::kernels::dec_moe_tag_word();
@@ -2690,6 +3218,11 @@ bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
         pa.n_embd = (int) g_->n_embd; pa.n_ff = (int) basalt::kernels::cpu::expert_layout().fmt[0].n_ff;
         pa.steps = (int) dm_->rings; pa.scratch = dm_->pscr; pa.arrive = dm_->parr; pa.diag_m = dm_->h_w + 32;
         pa.rq = dm_->rq; pa.rs = dm_->rs;
+        if (gs_nk0_ > 0) {
+            pa.mix = gs_mix_; pa.mseq_m = dm_->h_w + 48; pa.mdone_m = dm_->h_w + 52;
+            pa.mxq_m = gs_h_xq_; pa.mxq = gs_pxq_;
+            pa.mx_m = gs_h_x_; pa.mixl = gs_mixl_; pa.part_m = gs_h_part_;
+        }
         if (cudaMemsetAsync(dm_->parr, 0, 64, dm_->ps) != cudaSuccess ||
             !basalt::kernels::dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps, dm_->pq2)) {
             err = "verify: the peer window did not launch";
@@ -2744,6 +3277,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     gm.mark(12);
+    gs_split_ = dm_ != nullptr && gs_mixl_ != nullptr;
+    if (gs_split_ && !gs_live_ && !gs_move(true, err)) return false;
     if (dm_ != nullptr) {   // this window's residency, then the peer window ahead of CUDA0's
         if (!dm_begin(err, &gm)) return false;
     }
@@ -3009,6 +3544,11 @@ bool Verifier::commit(int n_keep, std::string& err, int parts) {
         decode_events().record(DecodeEvents::kCommitPre, cm_);
         const cudaError_t le = cudaGraphLaunch(commit_exec_, cm_);
         decode_events().record(DecodeEvents::kCommitPost, cm_);
+        if (gs_split_ && gs_live_) {   // the peer's heads, on its stream behind its window
+            const OnDevice on(gs_dev_);
+            gs_ca_.n_keep = h_commit_;
+            basalt::kernels::gdn_commit_layers(gs_ca_, dm_->ps, kCommitBlocks);
+        }
         if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
         // set_commit_async: no wait here - the next window's first node waits for the epoch (the host names it in
         // h_pend_), and the drafter (its own stream) reads only this window's final rows and its own K/V.  h_commit_ is
@@ -3041,6 +3581,7 @@ bool Verifier::wait_commit(std::string& err) {
         const cudaError_t se = cudaEventSynchronize(commit_done_);
         if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     }
+    if (gs_live_ && !gs_move(false, err)) return false;
     return next_ == nullptr || next_->wait_commit(err);
 }
 
@@ -3415,6 +3956,8 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     using namespace basalt::kernels;
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
+    if (gs_live_ && !gs_move(false, err)) return false;
+    gs_split_ = false;
     if (!stage_batch(rows, lens, S, 0, tokens, pos, err)) return false;
     const int R = last_t_;   // the window's rows
     const bool dm = dm_ != nullptr && batch_dm_;
@@ -3560,6 +4103,8 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
     int rows[8] = {};
     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
+    if (gs_live_ && !gs_move(false, err)) return false;
+    gs_split_ = false;
     if (!stage_batch(rows, nullptr, S, base, tokens, pos, err)) return false;
     order_after_commit();
     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(S, base)], cs_);
@@ -3651,11 +4196,21 @@ bool Verifier::resample_row(int t, int64_t pos0, const std::vector<float>& bias,
         err = "resample_row: the bias upload failed";
         return false;
     }
-    basalt::kernels::SamplerParams sp = sampling_;
+    // a batch window's row draws with its own slot's sampling and position, as the window drew it
+    basalt::kernels::SamplerParams sp;
+    const int32_t* hist = nullptr;
+    int hist_n = 0;
+    if (last_batch_ && t < last_t_) {
+        sp = slot_sp_[(size_t) last_rows_[t]];
+        sp.counter = (uint64_t) last_pos_b_[t];
+        sp.penalty_last_n = 0;
+    } else {
+        sp = sampling_;
+        sp.counter = (uint64_t) pos0 + (uint64_t) t;
+        if (hist_d_ != nullptr) { hist = hist_d_ + (size_t) t * (size_t) hist_len_; hist_n = (int) hist_len_; }
+    }
     sp.logit_bias = row_bias_device_;
-    sp.counter = (uint64_t) pos0 + (uint64_t) t;
-    basalt::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_,
-                  hist_d_ != nullptr ? hist_d_ + (size_t) t * (size_t) hist_len_ : nullptr, hist_d_ != nullptr ? hist_len_ : 0, sp,
+    basalt::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, hist, hist_n, sp,
                   m_out_, cs_);
     if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "resample_row: the sampling failed"; return false; }
     token = ((volatile int32_t*) h_out_)[0];

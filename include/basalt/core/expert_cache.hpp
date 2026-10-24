@@ -110,6 +110,8 @@ public:
     /// slots wholly inside what stays.  Waits for the device first.  False with `err` when not segmented or a driver
     /// call failed.
     bool shrink(int64_t keep_bytes, std::string& err);
+    /// `slots()` after `shrink(keep_bytes)`, without shrinking.
+    int64_t slots_after_shrink(int64_t keep_bytes) const;
     /// Maps segments again up to `want_bytes` (rounded DOWN to a segment, at most the arena; the last, shorter
     /// segment only when `want_bytes` covers the arena).  Stops at the first segment the driver cannot back (false,
     /// `err`: what was mapped by then stays).  The new slots are empty until the caller fills them.

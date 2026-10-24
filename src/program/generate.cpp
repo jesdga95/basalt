@@ -2350,10 +2350,11 @@ int main(int argc, char** argv) {
         pio.max_inflight = (uint32_t) o.ple_inflight;
         pio.cache_rows = (uint64_t) o.ple_row_cache;
         // Keep the SSD awake while rows are being asked for (PleReader::set_keepalive): some SSDs stall the first reads
-        // after a short idle period.  The keepalive reads one page anyway after a read-free interval, and goes on for a
-        // window after the last row request; then the SSD may sleep until the next request.
+        // after a short idle period.  The keepalive reads one page after a read-free interval, from the table open
+        // on and for a window after the last row request; then the SSD may sleep until the next request.  The
+        // interval is well under the idle period after which the SSD drops its power state.
         {
-            pio.keepalive_ms = 100.0;
+            pio.keepalive_ms = 40.0;
             pio.keepalive_window_s = 60.0;
             if (pio.mode != basalt::kernels::PleIo::Direct) pio.keepalive_ms = 0;
         }
@@ -3160,6 +3161,30 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
+    // the GDN mixer split is priced once, before either card sizes its experts: its peer reserve displaces experts
+    // only when the cards cannot hold them all
+    if (o.peer_device >= 1) {
+        int d0 = 0, count = 0;
+        size_t f0 = 0, t0 = 0, f1 = 0, t1 = 0;
+        cudaGetDevice(&d0);
+        cudaMemGetInfo(&f0, &t0);
+        if (cudaGetDeviceCount(&count) == cudaSuccess && o.peer_device < count && cudaSetDevice(o.peer_device) == cudaSuccess) {
+            cudaMemGetInfo(&f1, &t1);
+            (void) cudaSetDevice(d0);
+        }
+        (void) cudaGetLastError();
+        const int max_t = std::max({o.spec, o.batch, 2});
+        const int64_t hs = native_head.loaded()
+            ? basalt::core::Verifier::hs_peer_bytes(native_head.row_bytes(), native_head.type(), n_vocab, g.n_embd, max_t,
+                                                    d0, o.peer_device) : 0;
+        const int64_t peer_room = (int64_t) f1 - (((int64_t) std::max(o.peer_reserve_mib, 128) << 20) +
+                                                  (int64_t) basalt::core::PeerExperts::device_overhead_bytes() + hs);
+        // CUDA0's cache: its free memory less the reserve and what loads after the cache
+        const int64_t cache0 = std::max<int64_t>(0, (int64_t) f0 - (((int64_t) o.vram_reserve_mib + 1024) << 20));
+        const int64_t outside = std::max<int64_t>(0, (int64_t) expert_total_bytes - cache0 - std::max<int64_t>(peer_room, 0));
+        const int64_t split = basalt::core::Verifier::gs_peer_bytes(wt, g, d0, o.peer_device);
+        basalt::core::Verifier::gs_decide(wt, g, d0, o.peer_device, max_t, std::min(split, outside));
+    }
     basalt::core::ExpertCache xcache;
     // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena
     const bool auto_cache = o.expert_cache < 0;
@@ -3184,6 +3209,12 @@ int main(int argc, char** argv) {
             const char* ml = std::getenv("CUDA_MODULE_LOADING");
             constexpr int64_t kLazyKernelsMib = 96;
             if (ml == nullptr || std::strcmp(ml, "EAGER") != 0) late_b += kLazyKernelsMib << 20;
+        }
+        // the GDN mixer split by key head loads CUDA0's share of the GDN layers after the cache is sized
+        if (o.peer_device >= 1) {
+            int d0 = 0;
+            cudaGetDevice(&d0);
+            late_b += basalt::core::Verifier::gs_cuda0_bytes(wt, g, d0, o.peer_device);
         }
         // the deferred checkpoint copy's spare device buffer is allocated after the cache, so it comes out of the reserve
         if (o.serve && o.prompt_cache > 0 && !multi_gpu) {
@@ -3452,6 +3483,17 @@ int main(int argc, char** argv) {
     // RAM copy the room past the headroom.  With the file-backed modes the rest is read from the SSD (the default
     // arena mode was checked against the RAM above).
     // what the peer card can hold of experts: its free memory less its buffers and reserve, capped by --peer-slots
+    // what the verify window's splits (the head by vocabulary, the GDN mixer by key head) load on the peer after its
+    // expert tier is filled, when the GDN mixer split is taken; without it the head's peer rows fit in what the tier
+    // leaves free
+    auto peer_split_bytes = [&](int dev0) -> int64_t {
+        const int64_t gs = basalt::core::Verifier::gs_peer_bytes(wt, g, dev0, o.peer_device);
+        if (gs == 0) return 0;
+        const int64_t hs = native_head.loaded()
+            ? basalt::core::Verifier::hs_peer_bytes(native_head.row_bytes(), native_head.type(), n_vocab, g.n_embd,
+                                                    std::max({o.spec, o.batch, 2}), dev0, o.peer_device) : 0;
+        return hs + gs;
+    };
     auto peer_expert_room = [&]() -> uint64_t {
         uint64_t room = 0;
         if (o.peer_device < 1) return 0;
@@ -3461,7 +3503,8 @@ int main(int argc, char** argv) {
             o.peer_device < count && cudaSetDevice(o.peer_device) == cudaSuccess) {
             if (cudaMemGetInfo(&pfree, &ptotal) == cudaSuccess) {
                 const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
-                                         basalt::core::PeerExperts::device_overhead_bytes();
+                                         basalt::core::PeerExperts::device_overhead_bytes() +
+                                         (uint64_t) peer_split_bytes(cur);
                 room = (uint64_t) pfree > reserve ? (uint64_t) pfree - reserve : 0;
                 if (o.peer_slots > 0)
                     room = std::min<uint64_t>(room, (uint64_t) o.peer_slots * basalt::kernels::cpu::expert_layout().max_blob);
@@ -4447,7 +4490,11 @@ int main(int argc, char** argv) {
     // peer's experts out, so they are read from the file here and held only on the peer.
     auto open_peer = [&](bool exclusive) -> bool {
         const auto tp0 = Clock::now();
-        if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, o.peer_reserve_mib, o.peer_slots,
+        // the GDN mixer split loads the peer's key heads after its tier is filled
+        int d0 = 0;
+        cudaGetDevice(&d0);
+        const int peer_reserve = o.peer_reserve_mib + (int) ((peer_split_bytes(d0) + (1 << 20) - 1) >> 20);
+        if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, peer_reserve, o.peer_slots,
                        err, exclusive)) {
             basalt::log::error("basalt generate", "%s", err.c_str());
             return false;
@@ -6120,6 +6167,8 @@ int main(int argc, char** argv) {
         // from here a request that runs the RAM below the floor stops with an error instead of the machine swapping
         const uint64_t guard_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), tier_file_bytes);
         basalt::platform::start_ram_guard(guard_floor);
+        // a VRAM shrink's RAM homes leave the guard's floor above the margin and the top-up's own slack free
+        src.set_homes_reserve(guard_floor - std::min(guard_floor, basalt::platform::ram_margin()) + (256ull << 20));
         if (const uint64_t avail = basalt::platform::available_memory(); avail > 0)
             basalt::log::info("basalt serve", "RAM %.2f GiB free, guard %.2f GiB, %.2f GiB kept for serving",
                          (double) avail / 1073741824.0, (double) guard_floor / 1073741824.0,
@@ -6169,6 +6218,7 @@ int main(int argc, char** argv) {
             basalt::log::error("basalt serve", "capturing the draft graphs failed: %s", err.c_str());
             return 1;
         }
+        ple_table.rearm_keepalive();   // a long load must not lapse the SSD keep-alive window before the first request
         std::printf("INFO file_experts_bytes=%llu\n", (unsigned long long) tier_file_bytes);   // experts only the file holds
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
@@ -6188,25 +6238,83 @@ int main(int argc, char** argv) {
         // much VRAM is free for other programs, or grows it back towards its full size when more than that is free.
         // Never on its own: only this command (the server's POST /v1/vram) moves it.  A shrink gives back the cache's
         // LAST segments: the experts in their slots become CPU misses, as any expert outside the cache is (no output
-        // changes beyond what a smaller cache decodes), the prompt path's loan moves down to the end of what is left
+        // changes beyond what a smaller cache decodes; in the resident RAM mode each is first copied to a RAM home),
+        // the prompt path's loan moves down to the end of what is left
         // (a smaller chunk when it no longer fits).  A grow maps them again and puts each slot's expert back (or, when
         // the adaptive tier already brought that one back, the most-routed missing expert of the same layer); the
         // adaptive tier carries on from there.
         std::vector<std::pair<int32_t, int32_t>> vram_evicted;   // (residency index, slot) the shrinks took
         const int64_t chunk_full = o.prefill_chunk;              // the loan's chunk with the whole cache
-        auto relend = [&]() {   // the prompt path's loan: the end of the slots left, its chunk as large as fits
-            if (pf_parts.empty() || pf_parts[0].first < 0) return;
+        // the prompt path's loan with `live` slots: its chunk as large as fits, and the first slot it covers
+        auto loan_plan = [&](int64_t live, int64_t& chunk) -> int32_t {
             PfPart& p = pf_parts[0];
-            const int64_t live = xcache.slots();
             auto fits = [&](int64_t c) {
                 const int64_t k = part_slots(p, c);
                 return k > 0 && k + 128 <= live && !(o.prefill_auto && k * 100 > kAutoLendPct * live);
             };
+            // auto: the largest chunk on the start-up's 256-token grid, so a few slots lent away cost a few tokens
+            // of chunk, not half of it
             int64_t c = chunk_full;
+            if (o.prefill_auto && !fits(c)) {
+                c = biggest_chunk(chunk_full, fits);
+                if (c == 0) c = 256;
+            }
             while (c > 256 && !fits(c)) c = std::max<int64_t>(256, c / 2 / 256 * 256);
+            chunk = c;
+            return (int32_t) std::max<int64_t>(0, live - part_slots(p, c));
+        };
+        auto relend = [&]() {   // the prompt path's loan: the end of the slots left, its chunk as large as fits
+            if (pf_parts.empty() || pf_parts[0].first < 0) return;
+            PfPart& p = pf_parts[0];
+            int64_t c = 0;
+            p.first = loan_plan(xcache.slots(), c);
             o.prefill_chunk = c;
-            p.first = (int32_t) std::max<int64_t>(0, live - part_slots(p, c));
             p.first_now = -1;   // laid out again at the next loan
+        };
+        // The resident RAM mode holds only the experts no slot holds, so an expert in a slot about to go has no RAM
+        // copy: it is copied from its slot into a RAM home first and read from there like the compact copy's.  Refused
+        // (nothing copied) when the RAM above the floor cannot take them.  `live`: the slots that stay.
+        auto home_given_up = [&](int64_t live, std::string& e) -> bool {
+            if (!src.complement_ready()) return true;
+            // the slots the loan will overwrite keep a RAM copy too, so a prompt never costs a file read
+            int64_t from = live;
+            if (!pf_parts.empty() && pf_parts[0].first >= 0) {
+                int64_t c = 0;
+                from = std::min<int64_t>(live, loan_plan(live, c));
+            }
+            std::vector<std::pair<int32_t, int32_t>> give;
+            std::vector<int32_t> slots;
+            for (size_t i = 0; i < host_res.size(); ++i) {
+                const int64_t layer = (int64_t) i / g.n_expert, ex = (int64_t) i % g.n_expert;
+                if (host_res[i] >= from && !src.has_resident(layer, ex)) {
+                    give.emplace_back((int32_t) layer, (int32_t) ex);
+                    slots.push_back(host_res[i]);
+                }
+            }
+            if (give.empty()) return true;
+            std::vector<uint8_t*> dst;
+            if (!src.homes_take(give, e, dst)) return false;
+            for (size_t k = 0; k < give.size(); ++k) {
+                const size_t bytes = (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(give[k].first);
+                if (cudaMemcpyAsync(dst[k], xcache.device_slot(slots[k]), bytes, cudaMemcpyDeviceToHost, 0) != cudaSuccess) {
+                    e = std::string("copying an expert to RAM failed: ") + cudaGetErrorString(cudaGetLastError());
+                    (void) cudaDeviceSynchronize();   // queued copies stop writing before their regions are freed
+                    (void) cudaGetLastError();
+                    src.homes_abort();
+                    return false;
+                }
+            }
+            if (cudaDeviceSynchronize() != cudaSuccess) {
+                e = std::string("copying the experts to RAM failed: ") + cudaGetErrorString(cudaGetLastError());
+                (void) cudaDeviceSynchronize();
+                (void) cudaGetLastError();
+                src.homes_abort();
+                return false;
+            }
+            src.homes_commit();
+            basalt::log::info("basalt serve", "VRAM: %zu experts moved from the cache to RAM (%.0f MiB held)", give.size(),
+                         (double) src.homes_bytes() / 1048576.0);
+            return true;
         };
         auto vram_command = [&](const std::string& cmd, std::string& e) -> bool {
             // `VRAM` alone: the reserve the engine started with (--vram-reserve-mib)
@@ -6221,10 +6329,6 @@ int main(int argc, char** argv) {
             }
             if (!o.vram_elastic || !xcache.segmented()) {
                 e = "VRAM needs an engine started with --vram-elastic (one NVIDIA GPU, --serve)";
-                return false;
-            }
-            if (src.complement_ready()) {
-                e = "VRAM: not with the resident low-RAM mode (the cache holds experts RAM does not)";
                 return false;
             }
             if (peer.valid()) { e = "VRAM: not with --peer-device"; return false; }
@@ -6253,7 +6357,9 @@ int main(int argc, char** argv) {
                     keep = floor_b;
                     note = " (the cache keeps its smallest size: the prompt path's buffers)";
                 }
-                if (!xcache.shrink(keep, e)) return false;
+                if (!home_given_up(xcache.slots_after_shrink(keep), e)) { e = "VRAM: " + e + " (nothing changed)"; return false; }
+                // the homes are committed by now: whatever the shrink left or took is followed from the cache itself
+                const bool shrunk = xcache.shrink(keep, e);
                 const int64_t live = xcache.slots();
                 for (size_t i = 0; i < host_res.size(); ++i)
                     if (host_res[i] >= live) {
@@ -6261,6 +6367,7 @@ int main(int argc, char** argv) {
                         host_res[i] = basalt::core::kNotResident;
                     }
                 res_upload();
+                if (!shrunk) return false;
             } else if (mapped < xcache.full_bytes()) {
                 std::string gerr;
                 if (!xcache.grow(mapped + ((int64_t) free_b - want_free), gerr)) note = " (" + gerr + ")";
@@ -6276,7 +6383,7 @@ int main(int argc, char** argv) {
                         float best = -1.0f;
                         for (int64_t ex = 0; ex < g.n_expert; ++ex) {
                             const size_t j = (size_t) (layer * g.n_expert + ex);
-                            if (host_res[j] >= 0) continue;
+                            if (host_res[j] >= 0 || (src.complement_ready() && !src.has_resident(layer, ex))) continue;
                             const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[j];
                             if (u > best) { best = u; pick = (int64_t) j; }
                         }
@@ -6293,6 +6400,22 @@ int main(int argc, char** argv) {
                 vram_evicted.swap(keep_out);
                 if (!xcache.sync_queued(ferr)) { e = "VRAM: " + ferr; return false; }
                 res_upload();
+                relend();
+                // the slots hold the experts again: every expert in a slot below the loan has its RAM home freed (the
+                // copy is the slots' now: those given up, those the loan range kept, and those the adaptive tier moved
+                // back).  The loan's own slots keep theirs: a prompt overwrites them and reads those experts from RAM.
+                if (src.complement_ready()) {
+                    const int64_t loan_from = pf_parts.empty() || pf_parts[0].first < 0 ? INT64_MAX : pf_parts[0].first;
+                    size_t released = 0;
+                    for (size_t j = 0; j < host_res.size(); ++j)
+                        if (host_res[j] >= 0 && host_res[j] < loan_from &&
+                            src.home_release((int64_t) j / g.n_expert, (int64_t) j % g.n_expert))
+                            ++released;
+                    const uint64_t freed = src.homes_reclaim() + src.homes_compact();
+                    basalt::log::info("basalt serve", "VRAM: %zu RAM homes released, %.0f MiB freed, %.0f MiB kept for the "
+                                      "prompt loan (slots from %lld)", released, (double) freed / 1048576.0,
+                                      (double) src.homes_bytes() / 1048576.0, (long long) std::min<int64_t>(loan_from, live));
+                }
             }
             relend();
             cudaMemGetInfo(&free_b, &total_b);
@@ -6303,10 +6426,10 @@ int main(int argc, char** argv) {
                          (long long) (free_b >> 20), (long long) o.prefill_chunk,
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), note.c_str());
             std::printf("VRAM reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld expert_cache_mib=%lld "
-                        "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld\n", reserve,
+                        "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld ram_homes_mib=%lld\n", reserve,
                         (long long) xcache.slots(), (long long) xcache.full_slots(),
                         (long long) (xcache.mapped_bytes() >> 20), (long long) (xcache.full_bytes() >> 20),
-                        (long long) (free_b >> 20), (long long) o.prefill_chunk);
+                        (long long) (free_b >> 20), (long long) o.prefill_chunk, (long long) (src.homes_bytes() >> 20));
             return true;
         };
         // ---- the elastic KV (kKvElasticFloor): a session's K/V pools back their cells on demand, out of the expert
@@ -6453,6 +6576,9 @@ int main(int argc, char** argv) {
             // (script[0] is its first token); the windows draft from it, some drafts wrong, and keep what matches
             std::vector<int32_t> script;
             std::mt19937_64 rng;
+            // the request's grammar (the batch windows' form of the solo loop's `gguard`): the window's kept picks are
+            // scanned, the first refused one is resampled under the mask, and the segment ends there
+            std::unique_ptr<basalt::program::grammar::Guard> guard;
             // the MTP drafter's side of the slot (the draft K/V is the drafter's store of the same index): the drafts and
             // their probabilities for the slot's next window, the request's draft-length rule state, its prompt-lookup
             // history and last proposal
@@ -6925,18 +7051,40 @@ int main(int argc, char** argv) {
             const Clock::time_point w1 = Clock::now();
             // per segment: the drafts the picks confirm, then how far the request goes (stop token, limits) within them
             const char* fin_of[MR] = {};
+            auto fin_at = [&](const BSlot& sl, int b, int32_t y, int e) -> const char* {   // how the request ends at pick e
+                const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                return eos ? "stop" : sl.stop ? "cancel" : sl.produced + e + 1 >= sl.max_new ? "length"
+                     : sl.p + e + 2 > slot_cap[(size_t) b] ? "length" : nullptr;
+            };
             for (int sg = 0; sg < S; ++sg) {
                 const BSlot& sl = bs[(size_t) rows[sg]];
                 int k = 1;
                 while (k < lens[sg] && outb[r0s[sg] + k - 1] == drafts[sg][(size_t) k - 1]) ++k;
                 for (int e = 0; e < k; ++e) {
-                    const int32_t y = outb[r0s[sg] + e];
-                    const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
-                    fin_of[sg] = eos ? "stop" : sl.stop ? "cancel" : sl.produced + e + 1 >= sl.max_new ? "length"
-                               : sl.p + e + 2 > slot_cap[(size_t) rows[sg]] ? "length" : nullptr;
+                    fin_of[sg] = fin_at(sl, rows[sg], outb[r0s[sg] + e], e);
                     if (fin_of[sg] != nullptr) { k = e + 1; break; }
                 }
                 n_keep[sg] = k;
+            }
+            // grammar: a slot with a guard scans its kept picks; the first one the grammar refuses is drawn again
+            // under the mask (the solo rule) and the segment ends at that row, which stays committed
+            std::vector<float> grammar_bias;
+            for (int sg = 0; sg < S; ++sg) {
+                BSlot& sl = bs[(size_t) rows[sg]];
+                if (sl.guard == nullptr || !sl.guard->on()) continue;
+                const int miss = sl.guard->scan(outb + r0s[sg], n_keep[sg]);
+                    if (miss < 0) continue;
+                sl.guard->mask_bias({}, grammar_bias);
+                int32_t gtok = 0;
+                if (!ver.resample_row(r0s[sg] + miss, p0s[sg], grammar_bias, gtok, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return false;
+                }
+                outb[r0s[sg] + miss] = gtok;
+                if (!sl.guard->take(gtok))
+                    basalt::log::info("basalt grammar", "slot %d: the masked draw at row %d was token %d", rows[sg], miss, (int) gtok);
+                n_keep[sg] = miss + 1;
+                fin_of[sg] = fin_at(sl, rows[sg], gtok, miss);
             }
             if (logit_hash)
                 for (int sg = 0; sg < S; ++sg)
@@ -6995,6 +7143,7 @@ int main(int argc, char** argv) {
                                 (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
                     sl.active = false;
                     sl.cached = o.prompt_cache > 0;   // its sessions hold sl.ids for the next turn
+                    sl.guard.reset();
                 } else {
                     sl.x = outb[r0s[sg] + k - 1];
                     sl.p += k;
@@ -7360,6 +7509,7 @@ int main(int argc, char** argv) {
             int req_penalty_last_n = 0;
             std::string req_bias_text;   // logit_bias=id:value,...: added to the verifier's logits (see ver.set_logit_bias)
             bool req_bias_present = false;
+            int64_t req_gprompt = -1;       // gprompt=N: the first N ids are the prompt, the rest tokens the request has already generated
             std::string req_grammar_text;   // grammar=<compact ASCII JSON, spaces as \u0020>: the request's grammar (--grammar on)
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
             float req_relax = o.relaxed_drafting;   // relax=P: this request's --relaxed-drafting (0 = exact)
@@ -7381,6 +7531,7 @@ int main(int argc, char** argv) {
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
                     else if (key == "grammar") req_grammar_text = tok.substr(eq + 1);
+                    else if (key == "gprompt") req_gprompt = std::atoll(tok.c_str() + eq + 1);
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
@@ -7439,10 +7590,18 @@ int main(int argc, char** argv) {
             std::unique_ptr<basalt::program::grammar::Guard> gguard;
             if (!req_grammar_text.empty() && grammar_vocab) {
                 std::string gerr;
-                if (o.batch > 0) gerr = "continuous batching is not supported";
+                if (o.batch > 0 && piped) gerr = "pipelined batch groups are not supported";
                 else {
                     gguard = std::make_unique<basalt::program::grammar::Guard>(*grammar_vocab);
-                    if (!gguard->begin(req_grammar_text, ids.data(), ids.size(), gerr)) gguard.reset();
+                    const size_t gp = req_gprompt > 0 && (size_t) req_gprompt < ids.size() ? (size_t) req_gprompt : ids.size();
+                    if (!gguard->begin(req_grammar_text, ids.data(), gp, gerr)) gguard.reset();
+                    else if (gp < ids.size() && gguard->on()) {
+                        const std::vector<int32_t> done(ids.begin() + (std::ptrdiff_t) gp, ids.end());
+                        if (gguard->scan(done.data(), (int) done.size()) >= 0) {
+                            gerr = "the tokens already generated do not satisfy the grammar";
+                            gguard.reset();
+                        }
+                    }
                     else if (!gguard->on()) gguard.reset();
                 }
                 if (!gerr.empty()) { std::printf("ERR grammar: %s\n", gerr.c_str()); continue; }
@@ -8440,10 +8599,18 @@ int main(int argc, char** argv) {
                 sp.set_ple_warm(ids.data(), read_from, first_to, n - 1);
             }
             int64_t at = read_from;
+            // the last window of the last windowed part carries the last prompt token too: the first generated
+            // token is sampled from it, and the draft layer takes its rows like any accepted window
+            int64_t fold_p0 = n - 1;
             for (const int64_t to : {root_at, turn_at, n - 1}) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
+                int64_t rto = to;
+                if (win && to == n - 1 && to != turn_at && to != root_at && ppl == nullptr && gguard == nullptr) {
+                    const int64_t p0 = at + (int64_t) S * ((to - at) / S);
+                    if (!mtp_on || n - p0 <= S_mtp) { rto = p0; fold_p0 = p0; }
+                }
                 if (win && !refill(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
@@ -8475,7 +8642,7 @@ int main(int argc, char** argv) {
                 };
                 const auto tsp = Clock::now();
                 pp_part_ckpt = (to == turn_at || to == root_at) ? to : -1;
-                const bool sp_ok = win ? read_windows(at, to, err) : read_part(at, to, err);
+                const bool sp_ok = win ? (rto <= at || read_windows(at, rto, err)) : read_part(at, to, err);
                 pp_part_ckpt = -1;
                 if (sp_ok && win && !ov_window()) { std::printf("ERR %s\n", err.c_str()); return 1; }
                 if (!sp_ok) {
@@ -8510,10 +8677,10 @@ int main(int argc, char** argv) {
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
-            // the verify windows: the first holds the last prompt token alone
+            // the verify windows: the first holds the last prompt token, with the rest of the last window
             if (mtp_on && !mtp.use_main(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }   // the windows between prompt chunks swapped it
-            int64_t p = n - 1;
-            int32_t x = (int32_t) ids[(size_t) (n - 1)];
+            int64_t p = fold_p0;
+            int32_t x = (int32_t) ids[(size_t) fold_p0];
             {   // a request decoded here starts its adaptation from the experts its own prompt routed to
                 std::vector<uint32_t> hist;
                 int64_t hist_tokens = 0;
@@ -8534,7 +8701,7 @@ int main(int argc, char** argv) {
             // what the session holds once this request is done: the prompt read so far, then every committed token
             std::vector<int32_t> consumed;
             consumed.reserve((size_t) (n + max_new + S));
-            for (int64_t i = 0; i < n - 1; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
+            for (int64_t i = 0; i < fold_p0; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
             // --decode-timing: where a request's decode time goes (one line per request)
@@ -8582,7 +8749,8 @@ int main(int argc, char** argv) {
             while (!cancelled && produced_n < max_new && (!in_slot || solo_req)) {   // (a batch slot's first token comes from the batch window)
                 int T = 1;
                 while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_adapt.th())) ++T;
-                if (first_window) T = 1;
+                if (first_window) T = (int) (n - fold_p0);
+                const int e0 = first_window ? T - 1 : 0;   // rows before it are prompt tokens: forced, not emitted
                 if (ppl != nullptr) {
                     if (p >= ppl->end()) break;
                     T = (int) std::min<int64_t>(req_ppl_t, ppl->end() - p);
@@ -8604,6 +8772,8 @@ int main(int argc, char** argv) {
                 if (p + T > o.max_context) break;
                 window[0] = x;
                 for (int i = 1; i < T; ++i) window[(size_t) i] = from_sfx ? sbuf[(size_t) i - 1] : drafts[(size_t) i - 1];
+                if (e0 > 0)
+                    for (int i = 1; i < T; ++i) window[(size_t) i] = (int32_t) ids[(size_t) (p + i)];
                 if (ppl != nullptr)
                     for (int i = 0; i < T; ++i) window[(size_t) i] = ppl->token(p + i);
                 drive.d.layers = 0;
@@ -8654,7 +8824,14 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 int a = 0;
-                if (relax_on) {
+                if (e0 > 0) {
+                    for (int i = 0; i < e0; ++i) outv[(size_t) i] = window[(size_t) i + 1];
+                    a = T - 1;
+                    if (relax_on) {
+                        if (outv[(size_t) a] == o.relax_call_open) in_call = true;
+                        else if (outv[(size_t) a] == o.relax_call_close) in_call = false;
+                    }
+                } else if (relax_on) {
                     // a draft the target's draw disagrees with is kept when the target gives it probability >= P,
                     // outside tool calls and never for an added token; the row then emits the draft
                     bool call = in_call;
@@ -8781,7 +8958,7 @@ int main(int argc, char** argv) {
                     // the draft launches first; the commit, the adaptive round and the output go in its shadow
                     int n_emit = 0;
                     bool eos_pre = false;
-                    for (int i = 0; i <= a && produced_n + n_emit < max_new && !eos_pre; ++i) {
+                    for (int i = e0; i <= a && produced_n + n_emit < max_new && !eos_pre; ++i) {
                         ++n_emit;
                         eos_pre = ppl == nullptr &&
                                   std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
@@ -8819,8 +8996,8 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                     for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
-                    draft_offered += T - 1;
-                    draft_accepted += a;
+                    draft_offered += T - 1 - e0;
+                    draft_accepted += a - e0;
                     first_window = false;
                     bool commit_ok = true, after_ran = false, eos = false;
                     std::string cerr;
@@ -8828,7 +9005,7 @@ int main(int argc, char** argv) {
                         after_ran = true;
                         commit_ok = ver.commit(a + 1, cerr, 1);
                         adapt_side();
-                        for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
+                        for (int i = e0; i <= a && produced_n < max_new && !eos; ++i) {
                             std::printf("T %d\n", (int) outv[(size_t) i]);
                             basalt::core::progress_beat();
                             ++produced_n;
@@ -8841,7 +9018,7 @@ int main(int argc, char** argv) {
                     ++rounds;
                     const Clock::time_point tw2 = Clock::now();
                     basalt::core::decode_gaps().mark(5);
-                    if (!from_sfx) cum_adapt.observe(dprob.data(), T - 1, a);
+                    if (!from_sfx && e0 == 0) cum_adapt.observe(dprob.data(), T - 1, a);
                     mtp.set_cum_th(cum_adapt.th());
                     bool drafted = true;
                     if (will_draft && mtp_on) {
@@ -8903,11 +9080,11 @@ int main(int argc, char** argv) {
                 }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
-                draft_offered += T - 1;
-                draft_accepted += a;
+                draft_offered += T - 1 - e0;
+                draft_accepted += a - e0;
                 first_window = false;
                 bool eos = false;
-                for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
+                for (int i = e0; i <= a && produced_n < max_new && !eos; ++i) {
                     std::printf("T %d\n", (int) outv[(size_t) i]);
                     basalt::core::progress_beat();
                     ++produced_n;
@@ -8919,7 +9096,7 @@ int main(int argc, char** argv) {
                 ++rounds;
                 const Clock::time_point tw2 = Clock::now();
                 basalt::core::decode_gaps().mark(5);
-                if (!from_sfx) cum_adapt.observe(dprob.data(), T - 1, a);
+                if (!from_sfx && e0 == 0) cum_adapt.observe(dprob.data(), T - 1, a);
                 mtp.set_cum_th(cum_adapt.th());
                 const bool drafted = eos || produced_n >= max_new || !mtp_on ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data());
@@ -9079,6 +9256,7 @@ int main(int argc, char** argv) {
                     sl.ids = live;
                     sl.cvec = cvec_cached;
                     sl.imgs = live_imgs;
+                                    sl.guard = std::move(gguard);   // the request's grammar, already past the tokens the request decoded here
                     const ConvCheckpoint* best = nullptr;
                     for (const ConvCheckpoint& c : checks)
                         if (c.ids.size() < live.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&

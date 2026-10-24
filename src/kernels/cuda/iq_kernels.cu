@@ -2889,5 +2889,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 
 }  // namespace basalt::kernels
 
+#define FZ_DEV_ONLY
+#include "dec_gdn_rec.cu"   // the peer mixer item's recurrence (device code only)
+#undef FZ_DEV_ONLY
 #include "dec_moe.cuh"   // DEC_MOE: the decode MoE tail's kernels, on this file's row dots
 #include "pk_moe.cuh"   // persistent experts + combine, on the same device code

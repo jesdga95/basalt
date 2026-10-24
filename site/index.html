@@ -122,6 +122,10 @@ p.lede code { font-family: var(--font-mono); color: var(--fg); background: var(-
 .lab .tx { display: flex; align-items: baseline; gap: 10px; min-width: 0; flex: 1; }
 .lab .n { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; font: 600 var(--t2)/1.3 var(--font-sans); color: var(--fg); }
 .lab .s { flex: none; font: 400 var(--t1)/1.3 var(--font-mono); color: var(--fg-3); }
+.hw { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 28px; margin: 0; }
+.hw > div { min-width: 0; }
+.hw dt { font: 400 var(--t1)/1.3 var(--font-sans); color: var(--fg-3); }
+.hw dd { margin: 4px 0 0; font: 400 var(--t1)/1.4 var(--font-mono); color: var(--fg-2); overflow-wrap: anywhere; }
 .foot { margin: 0; padding-top: 16px; border-top: 1px solid var(--line-soft); font: 400 var(--t2)/1.3 var(--font-sans); color: var(--fg); }
 .foot .l { display: flex; flex-wrap: wrap; gap: 6px 20px; align-items: baseline; }
 .foot .by { color: var(--fg-3); }
@@ -154,7 +158,7 @@ p.lede code { font-family: var(--font-mono); color: var(--fg); background: var(-
   .detail { padding: 0 28px 26px; }
 }
 @media (max-width: 559px) {
-  .labels { grid-template-columns: 1fr; }
+  .labels, .hw { grid-template-columns: 1fr; }
 }
 </style>
 </head>
@@ -230,7 +234,7 @@ const SORTS = [
   { key: "date", label: "Date" },
   { key: "submitter", label: "Submitter" },
 ];
-const SEARCH = ["_rig", "quant", "os", "submitter", "commit", "date", "preset", "notes"];
+const SEARCH = ["_rig", "cpu", "quant", "os", "submitter", "commit", "date", "preset", "notes"];
 
 const filters = {};
 function multiSelect(id, all, options) {
@@ -513,6 +517,18 @@ function buildDetail(r) {
   });
   bars.append(segs, labels);
   d.append(bars);
+  const hw = [];
+  if (r.cpu) hw.push(["CPU", r.cpu]);
+  if (r.ram_gbps != null) hw.push(["RAM read", f1(r.ram_gbps) + " GB/s"]);
+  r.gpus.forEach(x => {
+    const v = [x.pcie ? "PCIe " + x.pcie : "", x.h2d_gbps != null ? f1(x.h2d_gbps) + " GB/s to GPU" : ""].filter(Boolean).join(" · ");
+    if (v) hw.push([shortName(x.name), v]);
+  });
+  if (hw.length) {
+    const dl = el("dl", "hw");
+    hw.forEach(([k, v]) => { const c = el("div"); c.append(el("dt", null, k), el("dd", null, v)); dl.append(c); });
+    d.append(dl);
+  }
   const f = el("p", "foot");
   const l = el("span", "l");
   if (r.os) l.append(el("span", null, r.os));

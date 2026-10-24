@@ -853,6 +853,9 @@ class ProcessEngine:
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
+
+        def gen_keys() -> str:      # a run that continues after tokens were generated tells the grammar where the prompt ends
+            return keys + (f" gprompt={len(ids)}" if out and " grammar=" in keys else "")
         ok = yield from self._take_control(cancel, len(prompt))
         if not ok:
             return
@@ -889,10 +892,10 @@ class ProcessEngine:
                             reserved = solo_slot
                 if alone and left > 1:
                     if solo_slot is not None:
-                        head = f"SGENI {solo_slot} {left}{keys} {embeddings}" if embeddings else \
-                            f"SGEN {solo_slot} {left}{keys}"
+                        head = f"SGENI {solo_slot} {left}{gen_keys()} {embeddings}" if embeddings else \
+                            f"SGEN {solo_slot} {left}{gen_keys()}"
                     else:
-                        head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
+                        head = f"GENI {left}{gen_keys()} {embeddings}" if embeddings else f"GEN {left}{gen_keys()}"
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     run0, yield_sent = len(out), False
                     if solo_slot is not None:
@@ -986,7 +989,7 @@ class ProcessEngine:
                     left = max(1, min(left, self.max_context - len(prompt) - SLOT_MARGIN))   # the slot's room
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
-                    head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
+                    head = f"BGENI {slot} {left}{gen_keys()} {embeddings}" if embeddings else f"BGEN {slot} {left}{gen_keys()}"
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_held[slot] = []               # admission overwrites the slot
                     phase = "admit"

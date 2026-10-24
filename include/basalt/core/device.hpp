@@ -38,6 +38,13 @@ int device_count();
 // the runtime cannot describe it.
 bool device_summary(int ordinal, std::string& name, std::string& detail);
 
+// The device's PCI bus id as the runtime spells it ("0000:01:00.0"); false when it cannot say.
+bool device_pci_bus_id(int ordinal, std::string& id);
+
+// Pinned host-to-device copy speed of the device in GB/s: the best of several 256 MiB copies. 0 when the copy could not
+// be set up or timed. Uses the device briefly and frees everything before it returns.
+double device_h2d_gbps(int ordinal);
+
 // Throws when there is no CUDA device.  The engine targets one architecture and must say so rather than
 // run slowly on something else: `CMakeLists.txt` refuses to COMPILE for another architecture, and
 // this is the matching check at run time (a binary can be carried to a different machine).

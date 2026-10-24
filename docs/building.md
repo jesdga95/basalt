@@ -42,10 +42,10 @@ with their MIT licence in `THIRD_PARTY_LICENSES`.
 the three decode fixtures, a 16384-token prefill and a 65536-token prefill, each once, with int8 KV cache and the
 engine's own defaults otherwise (drafting included). The decode fixtures and each prefill run in their own fresh engine
 process, with no warm-up pass and no repetition, so every number is the cold first run. It
-prints the usual table, then one JSON row to paste into `docs/community/benchmarks.json`:
+prints the usual table, adds its row to `docs/community/benchmarks.json` of the checkout the build came from (`--community-file PATH` picks another file) and prints it. Review the row, commit it and open a pull request:
 
 ```sh
-bin/basalt-bench --community --model Qwen3.8-FN-NVFP4.basalt --submitter YOUR_NAME
+bin/basalt-bench --community --model Qwen3.8-FN-NVFP4.basalt --submitter "Your Name"
 ```
 
 `prefill_16k_tps` and `prefill_64k_tps` are the engine tokens per second of those two prompts; `decode_tps` is the generated tokens of conv, struct and prose over their summed decode time (token-weighted). The row
