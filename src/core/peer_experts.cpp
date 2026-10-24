@@ -446,7 +446,7 @@ bool PeerExperts::issue_pending(bool wait) {
         if (b == nullptr ||
             cudaMemcpyAsync(cache_.device_slot(x.slot), b, (size_t) lay.blob_bytes(x.layer), cudaMemcpyHostToDevice,
                             refill_) != cudaSuccess) {
-            basalt::log::error("basalt", "peer experts: an exclusive swap failed (layer %d, expert %d)", (int) x.layer,
+            basalt::log::warn("basalt", "peer experts: an exclusive swap failed (layer %d, expert %d)", (int) x.layer,
                          (int) x.in);
             continue;
         }

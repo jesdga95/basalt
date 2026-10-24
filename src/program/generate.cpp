@@ -5546,7 +5546,7 @@ int main(int argc, char** argv) {
             for (const auto& p : promoted) {
                 std::string perr;
                 if (!peer.reassign(p[0], p[1], p[2], srcp->blob(p[0], p[2]), perr))
-                    basalt::log::error("basalt serve", "%s", perr.c_str());
+                    basalt::log::warn("basalt serve", "%s", perr.c_str());
             }
             promoted.clear();
         };
@@ -5772,7 +5772,7 @@ int main(int argc, char** argv) {
                 }
                 {   // the residency uploads go ahead of the incoming copies in the copy queue
                     std::string perr;
-                    if (!ver.dm_presync(perr)) basalt::log::error("basalt serve", "%s", perr.c_str());
+                    if (!ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
                     res_upload();
                     ver.dm_fence(adapt_stream);
                 }
@@ -5796,7 +5796,7 @@ int main(int argc, char** argv) {
                             const uint8_t* b = srcp->blob(x.layer, x.in);
                             if (b == nullptr || cudaMemcpyAsync(xcache.device_slot(x.slot), b, (size_t) lay2.blob_bytes(x.layer),
                                                                 cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess)
-                                basalt::log::error("basalt serve", "adaptive swap copy failed (layer %d, slot %d): %s",
+                                basalt::log::warn("basalt serve", "adaptive swap copy failed (layer %d, slot %d): %s",
                                              (int) x.layer, (int) x.slot, cudaGetErrorString(cudaGetLastError()));
                         }
                         cudaEventRecord(adapt_ev, adapt_stream);
@@ -5817,7 +5817,7 @@ int main(int argc, char** argv) {
                 if (!x.promo) continue;
                 std::string perr;
                 if (!peer.reassign(x.layer, x.in, x.out, srcp->blob(x.layer, x.out), perr))
-                    basalt::log::error("basalt serve", "%s", perr.c_str());
+                    basalt::log::warn("basalt serve", "%s", perr.c_str());
             }
             xq.clear();
             xq_stage = 0;
@@ -5842,7 +5842,7 @@ int main(int argc, char** argv) {
                 basalt::log::info("basalt serve", "expert profile saved to %s (%s)", o.expert_profile_save.c_str(),
                              why);
             else
-                basalt::log::error("basalt serve", "the expert profile was not saved: %s", e.c_str());
+                basalt::log::warn("basalt serve", "the expert profile was not saved: %s", e.c_str());
             profile_saved_at = Clock::now();
         };
         // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
@@ -6900,7 +6900,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 std::string perr;
-                if (ok && acted && !ver.dm_presync(perr)) basalt::log::error("basalt serve", "%s", perr.c_str());
+                if (ok && acted && !ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
                 if (!ok) { std::printf("ERR an adaptive refill failed\n"); return false; }
                 ba_ms += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
                 if (ba_win % 2000 == 0 && ba_win > 0) {   // the swap rate and the hit rate over the last 2000 windows
@@ -8759,7 +8759,7 @@ int main(int argc, char** argv) {
                             adapt_ok = xq_stage != 0 ? xq_advance() : xq_round();
                             basalt::core::decode_events().stamp(6);
                             std::string perr;
-                            if (adapt_ok && !ver.dm_presync(perr)) basalt::log::error("basalt serve", "%s", perr.c_str());
+                            if (adapt_ok && !ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
                             basalt::core::decode_events().stamp(7);
                             basalt::core::decode_gaps().hms[20] += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
                         });
@@ -8772,7 +8772,7 @@ int main(int argc, char** argv) {
                         adapt_ok = adapt();
                         if (chain && adapt_ok) {   // the evictions' residency, uploaded beside the draft
                             std::string perr;
-                            if (!ver.dm_presync(perr)) basalt::log::error("basalt serve", "%s", perr.c_str());
+                            if (!ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
                         }
                         basalt::core::decode_gaps().hms[20] += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
                     });
@@ -8807,7 +8807,7 @@ int main(int argc, char** argv) {
                                 if (boundary) {
                                     apply_pending(true, false);
                                     std::string perr;
-                                    if (!ver.dm_presync(perr)) basalt::log::error("basalt serve", "%s", perr.c_str());
+                                    if (!ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
                                 }
                                 if (copies) copy_done = !src.exchanges_staged() || src.copy_exchanges(8ull << 20);
                             });
