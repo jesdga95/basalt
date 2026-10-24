@@ -348,6 +348,27 @@ size_t gbnf_escape_length(const std::string& pattern, size_t pos) {
     return 2 + n_hex;
 }
 
+// Bytes below 0x20 and 0x7F as GBNF \xNN escapes; every other byte passes through untouched. A JSON schema can
+// carry a raw control byte (a decoded \u0000 escape in a pattern or an enum string), and the grammar parser reads its
+// text as a C string: a raw NUL would end the text mid-rule ("unexpected end of input"). The escape names the
+// same code point and keeps the grammar text free of control bytes.
+std::string gbnf_escape_ctl(const std::string& s) {
+    static const char* hexd = "0123456789abcdef";
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        unsigned char v = (unsigned char) c;
+        if (v < 0x20 || v == 0x7F) {
+            out += "\\x";
+            out += hexd[v >> 4];
+            out += hexd[v & 0xF];
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
 // UTF-8 code points of `s`; a malformed byte ends the walk.
 std::vector<uint32_t> utf8_points(const std::string& s) {
     std::vector<uint32_t> out;
@@ -439,7 +460,7 @@ std::string gbnf_format_literal(const std::string& literal) {
             case '\n': escaped += "\\n"; break;
             case '"': escaped += "\\\""; break;
             case '\\': escaped += "\\\\"; break;
-            default: escaped += c;
+            default: escaped += gbnf_escape_ctl(std::string(1, c));
         }
     }
     return "\"" + escaped + "\"";
@@ -605,7 +626,7 @@ struct SchemaConverter::Impl {
                             square_brackets += sub_pattern.substr(i, escape_length);
                             i += escape_length;
                         } else {
-                            square_brackets += sub_pattern[i];
+                            square_brackets += gbnf_escape_ctl(std::string(1, sub_pattern[i]));
                             i++;
                         }
                     }
@@ -684,7 +705,7 @@ struct SchemaConverter::Impl {
                         } else if (!non_literal(sub_pattern[i]) &&
                                    (i == length - 1 || literal.empty() || sub_pattern[i + 1] == '.' ||
                                     !non_literal(sub_pattern[i + 1]))) {
-                            literal += sub_pattern[i];
+                            literal += gbnf_escape_ctl(std::string(1, sub_pattern[i]));
                             i++;
                         } else {
                             break;
@@ -717,7 +738,7 @@ struct SchemaConverter::Impl {
             std::string rejects;
             auto first = true;
             for (const auto& kv : node.children) {
-                std::string c = cpt_to_utf8(kv.first);
+                std::string c = gbnf_escape_ctl(cpt_to_utf8(kv.first));
                 rejects += c;
                 if (first) {
                     first = false;
