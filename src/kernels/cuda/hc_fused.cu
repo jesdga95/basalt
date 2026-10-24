@@ -1069,6 +1069,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
             if (k < T)
                 hc_top10_item<DBG>(a.logits + (size_t) k * NE, a.ids + (size_t) k * KT, a.weights + (size_t) k * KT, tid & 31,
                                    cand, tid < 32 ? dbg : nullptr, b, L.lg64 + (size_t) k * NE, tag);
+            if (a.pub_ctr != nullptr) cta_signal(a.pub_ctr + 1, tid);   // the ids are out
             __syncthreads();
             stamp<DBG>(dbg, b, 6, tid);
         } else {
@@ -1090,6 +1091,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
                 const int nq = T * (N / 32), q0 = r * nq / NRT, q1 = (r + 1) * nq / NRT;
                 for (int q = q0 + (tid >> 5); q < q1; q += WARPS)
                     hc_q8_1_store(__ldcg(a.mixed + (size_t) q * 32 + (tid & 31)), static_cast<HcQ81*>(a.xq), q, tid & 31);
+                if (a.pub_ctr != nullptr) cta_signal(a.pub_ctr, tid);   // its share is out
             }
         }
         staged = false;
@@ -1147,6 +1149,8 @@ int g_slot = 0;
 #ifndef FZ_DEV_ONLY   // host side: another translation unit (the mid chain) takes only the device code
 
 bool hc_fused_q8_rows_ok() { return true; }
+
+unsigned hc_fused_pub_arrivals() { return NRT; }
 
 namespace {
 
@@ -1468,7 +1472,8 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     const DevInfo& d = dev_info();
     if (!d.ok || a.T < 1 || a.T > MAXT || !a.R || !a.R_out || !a.w_norm || !a.w_down || !a.w_up || !a.lo || !a.rs ||
         !a.mixed || !a.xn || (a.w_inject && !a.inject_out) || (a.apply && (!a.bo_prev || !a.inj_prev)) ||
-        (a.w_router && (!a.logits || !a.ids || !a.weights)) || (a.apply && a.inj_prev == a.inject_out)) {
+        (a.w_router && (!a.logits || !a.ids || !a.weights)) || (a.apply && a.inj_prev == a.inject_out) ||
+        (a.pub_ctr && (!a.w_router || !a.xq))) {
         basalt::log::error("basalt", "hc_fused_read: invalid arguments or unsupported device");
         std::exit(1);
     }

@@ -108,6 +108,8 @@ struct DecMoe {
     unsigned int* vsync = nullptr;           ///< its counters
     unsigned long long* wstat = nullptr;   // the per-layer wait counters (device), with --wait-stats
     unsigned long long* ptab0 = nullptr;   // [n_layers * n_expert] CUDA0 blob address or 0
+    unsigned int* pub = nullptr;           // [rings][2] the FFN read's counts for the ring's block (HcFusedArgs::pub_ctr)
+    unsigned int* cseen = nullptr;         // the combine's last ring whose CPU word it saw (dec_moe_combine's cpu_seen)
     int64_t wstat_windows = 0, wstat_t = 0;
     // mapped: per ring header, FFN input and q8_1 rows; [0] the peer's ring, [16] its done ring, [32] its abort
     // record (kDmDiagWords); the peer's rows
@@ -117,6 +119,7 @@ struct DecMoe {
     uint32_t* h_w = nullptr; uint32_t* m_w = nullptr;
     float* h_rows = nullptr; float* m_rows = nullptr;
     bool tag = false;       ///< the combine polls the peer's rows (each dword not yet written holds the tag word)
+    bool tags = false;      ///< the combine waits for the CPU pool's word itself: no wait launch (without --wait-stats)
     size_t rows_words = 0;
     bool tag_dirty = false; ///< a released window may have left written rows behind
     size_t x_stride = 0, xq_stride = 0;      ///< per ring, floats / bytes
@@ -559,7 +562,10 @@ bool Verifier::dm_init(std::string& err) {
               cudaMalloc(&d->vscr, dec_moe_vram_scratch_bytes((int) lay.fmt[0].n_ff)) == cudaSuccess &&
               cudaMalloc((void**) &d->vsync, (kDmCap + 1) * 4) == cudaSuccess &&
               cudaMemset(d->vsync, 0, (kDmCap + 1) * 4) == cudaSuccess &&
-              cudaMalloc(&d->xq_pub, d->xq_stride) == cudaSuccess;
+              cudaMalloc(&d->xq_pub, d->xq_stride) == cudaSuccess &&
+              cudaMalloc((void**) &d->pub, (size_t) d->rings * 8) == cudaSuccess &&
+              cudaMemset(d->pub, 0, (size_t) d->rings * 8) == cudaSuccess &&
+              cudaMalloc((void**) &d->cseen, 4) == cudaSuccess && cudaMemset(d->cseen, 0, 4) == cudaSuccess;
     d->vram = -1;
     if (ok && hits_.slot_off != nullptr && hits_.n_slots > 0)
         ok = cudaMalloc((void**) &d->slot_off, (size_t) hits_.n_slots * 8) == cudaSuccess &&
@@ -571,6 +577,8 @@ bool Verifier::dm_init(std::string& err) {
         ok = cudaMalloc((void**) &d->wstat, kDmStatWords * 8) == cudaSuccess &&
              cudaMemset(d->wstat, 0, kDmStatWords * 8) == cudaSuccess;
     if (!ok) { err = "verify: device-planned MoE buffers"; return false; }
+    d->rows_words = (size_t) (T * K * N);
+    d->tags = d->wstat == nullptr;
     d->shadow0.assign((size_t) LE, INT32_MIN);
     d->shadow1.assign((size_t) LE, -1);
     d->pin_stride = (size_t) LE * 24;   // [res0 | ptab0 | res1 | ptab1] per slot
@@ -606,7 +614,6 @@ bool Verifier::dm_init(std::string& err) {
              cudaMemset(d->pscr, 0, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
              cudaMalloc((void**) &d->parr, 64) == cudaSuccess;
         d->tag = true;
-        d->rows_words = (size_t) (T * K * N);
         for (size_t i = 0; i < d->rows_words; ++i) ((volatile uint32_t*) d->h_rows)[i] = basalt::kernels::dec_moe_tag_word();
         if (!ok) { err = "verify: device-planned MoE peer buffers"; return false; }
         d->shadow1.assign((size_t) LE, INT32_MIN);
@@ -1324,7 +1331,7 @@ void Verifier::dm_free() {
     }
     for (void* p : {(void*) d->res0, (void*) d->res1, (void*) d->plan, (void*) d->ctr, (void*) d->slot_off, d->vscr,
                     (void*) d->vsync, d->xq_pub, (void*) d->wstat,
-                    (void*) d->ptab0})
+                    (void*) d->ptab0, (void*) d->pub, (void*) d->cseen})
         if (p) cudaFree(p);
     if (d->pin) cudaFreeHost(d->pin);
     for (void* h : {(void*) d->h_ring, (void*) d->h_x, (void*) d->h_xq, (void*) d->h_w, (void*) d->h_rows})
@@ -2525,7 +2532,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (router_multi) {
                     h.w_router = (const uint16_t*) w_router->data;
                     h.logits = logits_; h.ids = ids_; h.weights = w_;
-                    if (glue_on) h.xq = nat_xq_;
+                    if (glue_on) {   // the ring's block starts with the read and follows its counts
+                        h.xq = nat_xq_;
+                        h.pub_ctr = dm_->pub + 2 * (l - lb_);
+                        h.next_early = true;
+                    }
                     routed = true;
                 }
                 const WeightRef* next_norm = nullptr;
@@ -2581,9 +2592,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             ra.peer_cap = 0;
             ra.rows = dm_->rq != nullptr || dm_->warm != nullptr;
             PdlScope pr(false);   // after the router's kernel: a plain launch
-            if (glue_on) {   // the ring's work inside post's gate/up launch
+            if (glue_on) {   // the ring's work inside post's gate/up launch, released by the read's counts
                 glue_ring = ra;
                 glue_ring.mode = 2; glue_ring.kinds = true;
+                glue_ring.pub_ctr = dm_->pub + 2 * r; glue_ring.pub_target = hc_fused_pub_arrivals();
                 ring_fork = false;
             } else if (pk_ring) {   // the ring beside, CUDA0's plan and rows here
                 cudaEventRecord(ev_ring_, cs);
@@ -2755,17 +2767,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         if (dm) {
             // the combine polls the peers' rows themselves (with further peers always: the wait counts one done word);
-            // one peer's done word also ends the poll, but with further peers only a release does (word 60)
-            const bool dm_tag = dm_->tag && (dm_->wstat == nullptr || !dm_->xp.empty());
-            {
+            // one peer's done word also ends the poll, but with further peers only a release does (word 60).  Without
+            // --wait-stats it also waits for the CPU pool's word itself, with no wait launch before it.
+            const bool dm_tag = dm_->tags || (dm_->tag && (dm_->wstat == nullptr || !dm_->xp.empty()));
+            const volatile uint32_t* tag_done = !dm_tag ? nullptr : dm_->xp.empty() ? dm_->m_w + 16 : dm_->m_w + 60;
+            if (!dm_->tags) {
                 PdlScope pw(false);
                 dec_moe_wait(dm_->plan, dm_->m_w + 16, m_flag_, ring, cs, dm_->wstat, (int) l, true, dm_tag);
             }   // true: the combine is the wait's programmatic dependent
             stamp(l, 23);
             try {
-                dec_moe_combine(parts_, dm_->m_rows, m_ymiss_, dm_->plan, w_,
-                                shared_, bo_, N, K, n, nullptr, nullptr, ring, cs, true,
-                                !dm_tag ? nullptr : dm_->xp.empty() ? dm_->m_w + 16 : dm_->m_w + 60);
+                dec_moe_combine(parts_, dm_->m_rows, m_ymiss_, dm_->plan, w_, shared_, bo_, N, K, n, nullptr, nullptr,
+                                ring, cs, !dm_->tags, tag_done, dm_->tags ? m_flag_ : nullptr, dm_->cseen);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else if (n > 1) {   // one launch for the window's rows
             try {

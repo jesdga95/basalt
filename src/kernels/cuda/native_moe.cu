@@ -116,23 +116,36 @@ __global__ void dm_combine_kernel(const float* __restrict__ parts, const float* 
     if (shared) sum += shared[tk * n_embd + col];
     output[tk * n_embd + col] = sum;
 }
+__device__ __forceinline__ unsigned ld_acquire_gpu(const unsigned* p) {
+    unsigned v;
+    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+__device__ __forceinline__ void st_release_gpu(unsigned* p, unsigned v) {
+    asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
 // DEC_GLUE & 4: the same sums, four columns a thread with every row loaded before the first add; DEP: a
 // programmatic dependent of dec_moe_wait - CUDA0's rows, the weights and the shared row (all final once the wait
-// kernel runs) are loaded before pdl_wait, only the mapped tiers' rows after it
-template<int KM, bool DEP, bool TAG = false>
+// kernel runs) are loaded before pdl_wait, only the mapped tiers' rows after it.  TAG: the peers' rows carry their
+// own arrival (a dword still holding the tag word is not yet written).  WAITC (with TAG, not DEP): no wait kernel runs
+// before this one; when the layer has CPU entries one thread of the launch waits for the CPU pool's word (cpu_done)
+// and passes the ring on through cpu_seen (device), and the others read the tiers' rows once it has.
+template<int KM, bool DEP, bool TAG = false, bool WAITC = false>
 __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float* peer_rows, const float* cpu_rows,
                                    const DmPlan* __restrict__ plan, const float* __restrict__ weights,
                                    const float* __restrict__ shared,
                                    float* __restrict__ output, int64_t n_embd, int k,
-                                   const volatile uint32_t* tag_done = nullptr, uint32_t ring = 0) {
+                                   const volatile uint32_t* tag_done = nullptr, uint32_t ring = 0,
+                                   const volatile uint32_t* cpu_done = nullptr, unsigned* cpu_seen = nullptr) {
+    static_assert(!WAITC || (TAG && !DEP), "the CPU pool's word is waited for inside a plain launch");
     __shared__ int s_kind[16];
     // the next kernel (the hc read) may start its blocks and stage weights while this one waits
-    if (DEP) pdl_launch_dependents();
+    if (DEP || WAITC) pdl_launch_dependents();
     const int64_t tk = blockIdx.y;
     if (threadIdx.x < k) s_kind[threadIdx.x] = plan->kind[tk * k + threadIdx.x];
     __syncthreads();
     const int64_t col = 4 * (int64_t(blockIdx.x) * blockDim.x + threadIdx.x);
-    if (col >= n_embd) return;
+    if (col >= n_embd) return;   // (thread 0 of block (0, 0), WAITC's waiter, has column 0)
     weights += tk * k;
     float4 v[KM];
     float w[KM];
@@ -153,6 +166,21 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
     }
     float4 h = shared ? *reinterpret_cast<const float4*>(shared + tk * n_embd + col) : make_float4(0.f, 0.f, 0.f, 0.f);
     if constexpr (DEP) pdl_wait();
+    if constexpr (WAITC) {
+        // as the wait kernel: every row after the pool's word when the layer has CPU entries (the peers' rows are not
+        // polled while the pool reads its experts).  cpu_seen only ever steps through a window's rings in order, so
+        // holding this ring means this ring's word was seen.
+        const bool cpu = plan->counts[3] > 0;
+        if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
+            if (cpu) {
+                while (*cpu_done < ring) __nanosleep(64);
+                __threadfence_system();
+            }
+            st_release_gpu(cpu_seen, ring);
+        }
+        if (cpu)
+            while (ld_acquire_gpu(cpu_seen) != ring) __nanosleep(32);
+    }
     // every other mapped row's load is issued before the first one is used
 #pragma unroll
     for (int j = 0; j < KM; ++j) {
@@ -162,8 +190,13 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
     }
     if constexpr (TAG) {
         // a peer row still holding the tag word is read again until none is; a released window (tag_done past ring)
-        // ends the poll after one more read, with whatever the rows hold
+        // ends the poll after one more read, with whatever the rows hold.  After a row that had to be waited for, the
+        // later peer rows still waiting are read again together, so their landing costs one round trip, not one each.
         constexpr unsigned tag = 0x7fa5a5a5u;
+        auto waiting = [&](const float4& x) {
+            return __float_as_uint(x.x) == tag || __float_as_uint(x.y) == tag || __float_as_uint(x.z) == tag ||
+                   __float_as_uint(x.w) == tag;
+        };
 #pragma unroll
         for (int j = 0; j < KM; ++j) {
             if (j >= k) break;
@@ -171,11 +204,17 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
             float4* const src = const_cast<float4*>(mapped_row(j, 2));
             unsigned spins = 0;
             bool rel = false;
-            while (__float_as_uint(v[j].x) == tag || __float_as_uint(v[j].y) == tag || __float_as_uint(v[j].z) == tag ||
-                   __float_as_uint(v[j].w) == tag) {
+            while (waiting(v[j])) {
                 if (rel) break;
                 if ((++spins & 63u) == 0u && *tag_done >= ring) { __threadfence_system(); rel = true; }
                 v[j] = __ldcv(src);
+            }
+            if (spins > 0) {
+#pragma unroll
+                for (int i = j + 1; i < KM; ++i) {
+                    if (i >= k) break;
+                    if (s_kind[i] >= 2 && waiting(v[i])) v[i] = __ldcv(mapped_row(i, 2));
+                }
             }
             __stcs(src, make_float4(__uint_as_float(tag), __uint_as_float(tag), __uint_as_float(tag), __uint_as_float(tag)));
         }
@@ -198,8 +237,10 @@ constexpr bool dm_combine4_on() { return true; }
 void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* cpu_rows_m, const DmPlan* plan,
                      const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k, int n_tok,
                      const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m, uint32_t ring,
-                     void* stream, bool dep, const volatile uint32_t* tag_done) {
-    if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1)
+                     void* stream, bool dep, const volatile uint32_t* tag_done, const volatile uint32_t* cpu_done,
+                     unsigned* cpu_seen) {
+    if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1 ||
+        (cpu_done != nullptr && (dep || tag_done == nullptr || cpu_seen == nullptr)))
         throw std::invalid_argument("dec_moe_combine requires a stream, width, 1..15 experts, tokens");
     if (dm_combine4_on() && peer_done_m == nullptr && n_embd % 4 == 0 && k <= 10) {
         cudaLaunchAttribute at[1];
@@ -212,17 +253,20 @@ void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* 
         cfg.attrs = at;
         cfg.numAttrs = dep ? 1 : 0;
         const int ki = int(k);
-        if (dep && tag_done != nullptr)
+        const volatile uint32_t* none = nullptr;
+        unsigned* nseen = nullptr;
+        if (cpu_done != nullptr)
+            (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, false, true, true>, parts, peer_rows_m, cpu_rows_m, plan,
+                                      weights, shared, output, n_embd, ki, tag_done, ring, cpu_done, cpu_seen);
+        else if (dep && tag_done != nullptr)
             (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, true, true>, parts, peer_rows_m, cpu_rows_m, plan, weights,
-                                      shared, output, n_embd, ki, tag_done, ring);
+                                      shared, output, n_embd, ki, tag_done, ring, none, nseen);
         else if (dep)
             (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, true>, parts, peer_rows_m, cpu_rows_m, plan, weights,
-                                      shared, output, n_embd, ki,
-                                      (const volatile uint32_t*) nullptr, 0u);
+                                      shared, output, n_embd, ki, none, 0u, none, nseen);
         else
             (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, false>, parts, peer_rows_m, cpu_rows_m, plan, weights,
-                                      shared, output, n_embd, ki,
-                                      (const volatile uint32_t*) nullptr, 0u);
+                                      shared, output, n_embd, ki, none, 0u, none, nseen);
         const auto error = cudaGetLastError();
         if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
         return;

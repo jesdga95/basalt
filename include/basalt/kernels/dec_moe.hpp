@@ -76,6 +76,12 @@ struct DmRouteArgs {
     const int32_t* xres[kDmMaxX] = {};
     DmRing* xring_m[kDmMaxX] = {};
     uint32_t* xseq_m[kDmMaxX] = {};
+    /// DEC_GLUE & 2 after a read that counts its progress (HcFusedArgs::pub_ctr, two device words): the ring's block
+    /// starts before the read ends, copies the q8_1 rows once pub_ctr[0] holds pub_target, routes once pub_ctr[1] is
+    /// set, rings the peers, then copies the FFN input rows of the tokens with CPU entries and rings the host; it
+    /// zeroes both words for the layer's next window
+    unsigned int* pub_ctr = nullptr;
+    unsigned int pub_target = 0;
 };
 /// Blocks dec_moe_route launches for `n_tok` rows (the arrival counter advances by this much).
 int dec_moe_route_blocks(int n_tok, int n_embd);
@@ -235,11 +241,14 @@ void dec_moe_peer_math_test(const NativeExpertLayout& L, const unsigned long lon
 /// dec_moe_wait ran before it.  Built with native_moe.cu's math.  `dep` (DEC_GLUE & 4, null words): a
 /// programmatic dependent of a dec_moe_wait launched with `trigger`.  `tag_done` (null words, dep): the peer's rows carry their own arrival, a row dword still holding dec_moe_tag_word() is not yet
 /// written; the combine polls them (tag_done >= ring ends the poll for a released window) and restores the word after
-/// reading, so dec_moe_wait runs with `skip_peer`.
+/// reading, so dec_moe_wait runs with `skip_peer`.  `cpu_done` (with tag_done, not dep): no dec_moe_wait runs before
+/// the combine; when the layer has CPU entries one of its threads waits for cpu_done >= ring and passes the ring on
+/// through `cpu_seen` (one device word, zeroed once: it steps through each window's rings in order) to the others.
 constexpr uint32_t dec_moe_tag_word() { return 0x7fa5a5a5u; }
 void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* cpu_rows_m, const DmPlan* plan,
                      const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k, int n_tok,
                      const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m, uint32_t ring,
-                     void* stream, bool dep = false, const volatile uint32_t* tag_done = nullptr);
+                     void* stream, bool dep = false, const volatile uint32_t* tag_done = nullptr,
+                     const volatile uint32_t* cpu_done = nullptr, unsigned int* cpu_seen = nullptr);
 
 }  // namespace basalt::kernels
