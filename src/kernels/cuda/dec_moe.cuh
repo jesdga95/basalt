@@ -881,6 +881,7 @@ struct DmWatch {
     uint32_t* diag_m = nullptr;
     const volatile uint32_t* seq_m = nullptr;
     uint32_t* done_m = nullptr;
+    uint32_t* mdone_m = nullptr;                           // the mixer's done word, or null
     uint32_t ring = 0;
     int layer = 0, n_tok = 0, n = 0;
     const int32_t* hdr_ids = nullptr;                      // the device copy of the ring's ids (the record's checksum)
@@ -901,6 +902,7 @@ __device__ void dm_abort(const DmWatch& w, const DmShared* sm, uint32_t reason, 
     if (atomicCAS(w.abort, 0u, 1u) != 0u) return;
     __threadfence_system();
     *(volatile uint32_t*) w.done_m = 0xffffffffu;   // CUDA0's waits on this window pass
+    if (w.mdone_m != nullptr) *(volatile uint32_t*) w.mdone_m = 0xffffffffu;
     __threadfence_system();
     if (w.diag_m == nullptr) return;
     uint32_t h0 = 0, h1 = 0;
@@ -1280,6 +1282,7 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
     }
     DmWatch w;
     w.abort = abort; w.diag_m = a.diag_m; w.seq_m = a.seq_m; w.done_m = a.done_m; w.hdr_ids = hdr->ids;
+    w.mdone_m = a.mix != nullptr ? a.mdone_m : nullptr;
     auto stamp = [&](int s, int i) {
         if (a.stamps_m != nullptr && blockIdx.x == 0 && threadIdx.x == 0) {
             unsigned long long t;
@@ -1291,6 +1294,43 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
         const uint32_t ring = (uint32_t) s + 1u;
         block_q8_1* xq = warm && (s & 1) ? xq2 : xq0;
         w.ring = ring; w.layer = -1; w.n_tok = 0; w.n = 0;
+        if (a.mix != nullptr && a.mix[s]) {   // the layer's mixer doorbell, ahead of its MoE ring
+            if (blockIdx.x == 0) {
+                if (tid == 0) {
+                    uint32_t v = 0xffffffffu;
+                    if (*(volatile unsigned int*) abort == 0u)
+                        while (((v = *a.mseq_m) & 0xffffu) < ring) spin_pause();
+                    __threadfence_system();
+                    s_seq = v;
+                    if (warm && s > 0)   // the warm-up stops
+                        atomicMax(a.arrive + kDmWarmGo, v == 0xffffffffu ? 0xffffffffu : ring);
+                }
+                __syncthreads();
+                const uint32_t v = s_seq;
+                if (v == 0xffffffffu) {
+                    if (tid == 0) hdr->n_tok = -1;
+                } else {
+                    const int nt = min((int) ((v >> 16) & 0xffu), kVerifyMaxT);
+                    if ((v >> 30) & 1u) {
+                        const uint4* xs = (const uint4*) (a.mxq_m + (size_t) s * a.xq_stride);
+                        const int n16 = nt * (a.n_embd / 32) * (int) sizeof(block_q8_1) / 16;
+                        for (int i = tid; i < n16; i += kDmThreads) ((uint4*) a.mxq)[i] = __ldcv(xs + i);
+                    }
+                    if (tid == 0) hdr->n_tok = (v >> 30) & 1u ? nt : 0;
+                }
+                __threadfence();
+            }
+            if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
+            if (hdr->n_tok < 0) return;          // released
+            // the peer's heads of the layer go here (hdr->n_tok rows in a.mxq)
+            if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
+            if (blockIdx.x == 0 && tid == 0) {
+                __threadfence_system();
+                *(volatile uint32_t*) a.mdone_m = ring;
+                __threadfence_system();
+                if (*(volatile unsigned int*) abort != 0u) *(volatile uint32_t*) a.mdone_m = 0xffffffffu;
+            }
+        }
         if (blockIdx.x == 0) {
             if (tid == 0) {
                 uint32_t v = 0xffffffffu;   // an aborted window stops here
@@ -1794,6 +1834,34 @@ void dec_moe_wait(const DmPlan* plan, const volatile uint32_t* peer_done_m, cons
     launch_pdl(dm_wait_kernel, dim3(1), dim3(1), 0, (cudaStream_t) stream, plan, peer_done_m, host_flag_m, ring, stats, layer,
                (trigger ? 1 : 0) | (skip_peer ? 2 : 0));
     check("dec_moe_wait");
+}
+
+// One block: the rows to mapped memory, then the doorbell after them.
+__global__ void dm_mix_publish_kernel(const uint4* __restrict__ xq, int n16, uint4* xq_m, uint32_t* seq_m, uint32_t word) {
+    for (int i = threadIdx.x; i < n16; i += blockDim.x) xq_m[i] = xq[i];
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        *(volatile uint32_t*) seq_m = word;
+    }
+}
+
+__global__ void dm_mix_wait_kernel(const volatile uint32_t* done_m, uint32_t ring) {
+    while (*done_m < ring) spin_pause();
+    __threadfence_system();
+}
+
+void dec_moe_mix_publish(const void* xq, int n_tok, int n_embd, uint8_t* xq_m, uint32_t* seq_m, uint32_t ring, bool work,
+                         void* stream) {
+    const int n16 = n_tok * (n_embd / 32) * (int) sizeof(block_q8_1) / 16;
+    const uint32_t word = ring | (uint32_t) n_tok << 16 | (work ? 1u << 30 : 0u);
+    dm_mix_publish_kernel<<<1, 256, 0, (cudaStream_t) stream>>>((const uint4*) xq, n16, (uint4*) xq_m, seq_m, word);
+    check("dec_moe_mix_publish");
+}
+
+void dec_moe_mix_wait(const volatile uint32_t* done_m, uint32_t ring, void* stream) {
+    dm_mix_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(done_m, ring);
+    check("dec_moe_mix_wait");
 }
 
 std::string dec_moe_stats_text(const unsigned long long* w, double windows) {

@@ -402,6 +402,8 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     if (dm_ != nullptr) {   // the peer window stops at its next ring; CUDA0's waits on it pass
         *(volatile uint32_t*) (dm_->h_w + 0) = UINT32_MAX;
         *(volatile uint32_t*) (dm_->h_w + 16) = UINT32_MAX;
+        *(volatile uint32_t*) (dm_->h_w + 48) = UINT32_MAX;   // the mixer's doorbell and done word
+        *(volatile uint32_t*) (dm_->h_w + 52) = UINT32_MAX;
         dm_->tag_dirty = true;
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -888,7 +890,14 @@ void Verifier::gs_init() {
         const OnDevice on(dm_->pdev);
         ok = cudaMalloc((void**) &gs_state_, state_bytes) == cudaSuccess && cudaMemset(gs_state_, 0, state_bytes) == cudaSuccess;
         peer_bytes += state_bytes;
+        // the mixer doorbell: one per GDN layer's ring
+        std::vector<uint8_t> mix((size_t) dm_->rings, 0);
+        for (int64_t l = lb_; l < le_; ++l) mix[(size_t) (l - lb_)] = is_qsa_layer(g, l) ? 0 : 1;
+        ok = ok && cudaMalloc((void**) &gs_mix_, mix.size()) == cudaSuccess &&
+             cudaMemcpy(gs_mix_, mix.data(), mix.size(), cudaMemcpyHostToDevice) == cudaSuccess &&
+             cudaMalloc(&gs_pxq_, dm_->xq_stride) == cudaSuccess;
     }
+    ok = ok && mapped((size_t) dm_->rings * dm_->xq_stride, (void**) &gs_h_xq_, (void**) &gs_m_xq_);
     if (!ok) {
         cudaGetLastError();
         gs_free();
@@ -909,13 +918,17 @@ void Verifier::gs_free() {
                             (void*) L.wa, (void*) L.wb})
                 if (p) cudaFree(p);
         if (gs_state_) cudaFree(gs_state_);
+        if (gs_mix_) cudaFree(gs_mix_);
+        if (gs_pxq_) cudaFree(gs_pxq_);
         const OnDevice on0(device_);
         for (GsLayer& L : gs_layers_)
             for (void* p : {L.wqkv0, L.wz0, L.wo0})
                 if (p) cudaFree(p);
     }
+    if (gs_h_xq_) cudaFreeHost(gs_h_xq_);
     gs_layers_.clear();
     gs_state_ = nullptr;
+    gs_mix_ = nullptr; gs_pxq_ = nullptr; gs_h_xq_ = nullptr; gs_m_xq_ = nullptr;
     gs_nk0_ = 0;
     gs_dev_ = -1;
 }
@@ -1670,6 +1683,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         }
         stamp(l, 1);
+        // the GDN mixer split: the layer's q8_1 rows and doorbell for the peer's key heads
+        const bool gs_ring = dm && gs_nk0_ > 0 && !is_qsa_layer(g, l);
+        if (gs_ring) {
+            if (!read_q8) native_quantize_q8_1(mixed_, xq_, (int) N, n, cs);
+            const int64_t r = l - lb_;
+            dec_moe_mix_publish(xq_, n, (int) N, gs_m_xq_ + (size_t) r * dm_->xq_stride, dm_->m_w + 48,
+                                (uint32_t) (r + 1), !batch_rec_, cs);
+        }
         if (mid_ok) {
             // the first read's dependent: its first pair tiles are already issued by the time the read ends (PDL)
             PdlScope ps(pdl, mid_ord == 0);
@@ -2087,6 +2108,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();
             return false;
         }
+        if (gs_ring) dec_moe_mix_wait(dm_->m_w + 52, (uint32_t) (l - lb_ + 1), cs);   // the peer's share has landed
         stamp(l, 16);
         bool routed = false;   // the fused read ran the router too
         const bool sh_fork = !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr &&
@@ -2961,6 +2983,8 @@ bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
     *(volatile uint32_t*) (dm_->h_w + 0) = 0;
     *(volatile uint32_t*) (dm_->h_w + 16) = 0;
     *(volatile uint32_t*) (dm_->h_w + 32) = 0;
+    *(volatile uint32_t*) (dm_->h_w + 48) = 0;
+    *(volatile uint32_t*) (dm_->h_w + 52) = 0;
     if (dm_->tag && dm_->tag_dirty) {   // a released window left rows written: back to unwritten
         for (size_t i = 0; i < dm_->rows_words; ++i)
             ((volatile uint32_t*) dm_->h_rows)[i] = basalt::kernels::dec_moe_tag_word();
@@ -2977,6 +3001,10 @@ bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
         pa.n_embd = (int) g_->n_embd; pa.n_ff = (int) basalt::kernels::cpu::expert_layout().fmt[0].n_ff;
         pa.steps = (int) dm_->rings; pa.scratch = dm_->pscr; pa.arrive = dm_->parr; pa.diag_m = dm_->h_w + 32;
         pa.rq = dm_->rq; pa.rs = dm_->rs;
+        if (gs_nk0_ > 0) {
+            pa.mix = gs_mix_; pa.mseq_m = dm_->h_w + 48; pa.mdone_m = dm_->h_w + 52;
+            pa.mxq_m = gs_h_xq_; pa.mxq = gs_pxq_;
+        }
         if (cudaMemsetAsync(dm_->parr, 0, 64, dm_->ps) != cudaSuccess ||
             !basalt::kernels::dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps, dm_->pq2)) {
             err = "verify: the peer window did not launch";

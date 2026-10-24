@@ -117,7 +117,22 @@ struct DmPeerArgs {
     /// ring's q8_1 rows and read the predicted blobs the peer holds; the rows computed are unchanged.
     const int8_t* rq = nullptr;
     const float* rs = nullptr;
+    /// The GDN mixer split by key head (null mix: off).  Ring s first serves a mixer doorbell when mix[s] is set:
+    /// CUDA0 raises mseq_m to ring | tokens << 16 (| 1 << 30 when the peer computes its heads) after the layer's q8_1
+    /// rows reach mxq_m + s * xq_stride (dec_moe_mix_publish); block 0 copies them to mxq and the peer raises mdone_m
+    /// to the ring when its share has landed.
+    const uint8_t* mix = nullptr;                ///< peer device: [steps]
+    const volatile uint32_t* mseq_m = nullptr;   ///< mapped
+    uint32_t* mdone_m = nullptr;                 ///< mapped
+    const uint8_t* mxq_m = nullptr;              ///< mapped
+    void* mxq = nullptr;                         ///< peer device: kVerifyMaxT q8_1 rows
 };
+/// CUDA0: the mixer doorbell of `ring` (DmPeerArgs::mix): n_tok q8_1 rows of n_embd from xq to xq_m, then seq_m.
+/// `work`: the peer computes its heads (bit 30).
+void dec_moe_mix_publish(const void* xq, int n_tok, int n_embd, uint8_t* xq_m, uint32_t* seq_m, uint32_t ring, bool work,
+                         void* stream);
+/// CUDA0: spins until done_m >= ring (the peer's mixer share of that ring has landed or the window was released).
+void dec_moe_mix_wait(const volatile uint32_t* done_m, uint32_t ring, void* stream);
 /// Router rows the warm-up's predictor covers.
 constexpr int kDmPredExperts = 512;
 /// A down wait inside a ring that does not end within this long aborts the window (so does a corrupt ring, or the host's

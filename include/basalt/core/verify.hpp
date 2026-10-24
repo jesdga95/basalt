@@ -548,6 +548,10 @@ private:
     int gs_nk0_ = 0, gs_dev_ = -1;
     std::vector<GsLayer> gs_layers_;   // by GDN layer index
     float* gs_state_ = nullptr;        // peer: its heads' recurrent state and conv history, per GDN layer
+    // the mixer doorbell (DmPeerArgs::mix): mapped q8_1 rows per ring; peer: which rings have one, the rows' copy
+    uint8_t *gs_h_xq_ = nullptr, *gs_m_xq_ = nullptr;
+    uint8_t* gs_mix_ = nullptr;
+    void* gs_pxq_ = nullptr;
     uint8_t* vhead_scratch_ = nullptr;   // the two-stage head's histogram and row list (q6k_vhead)
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
