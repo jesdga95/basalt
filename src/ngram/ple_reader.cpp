@@ -571,6 +571,15 @@ void PleReader::set_keepalive(double period_ms, double window_s) {
     m.cv_work.notify_all();
 }
 
+void PleReader::rearm_keepalive() {
+    Impl& m = *impl_;
+    {
+        std::lock_guard<std::mutex> lk(m.mu);
+        if (m.keep_us > 0) m.last_issue_us = now_us();
+    }
+    m.cv_work.notify_all();
+}
+
 void PleReader::set_injected_delay_us(double delay_us) {
     std::lock_guard<std::mutex> lk(impl_->mu);
     impl_->delay_us = delay_us < 0 ? 0 : delay_us;

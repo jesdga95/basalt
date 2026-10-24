@@ -6170,6 +6170,7 @@ int main(int argc, char** argv) {
             basalt::log::error("basalt serve", "capturing the draft graphs failed: %s", err.c_str());
             return 1;
         }
+        ple_table.rearm_keepalive();   // a long load must not lapse the SSD keep-alive window before the first request
         std::printf("INFO file_experts_bytes=%llu\n", (unsigned long long) tier_file_bytes);   // experts only the file holds
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);

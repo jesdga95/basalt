@@ -74,11 +74,14 @@ public:
     /// Keep the SSD awake while the table is in use (call after `open`): when no read has
     /// gone out for `period_ms`, the worker reads one page of the table, until `window_s` after the last `issue`
     /// (after this call when there has been none).
-    /// Some SSDs drop into a power state after ~250 ms without a command and stall the next reads 50-150 ms
-    ///, which in
+    /// Some SSDs drop into a low-power state after a short idle time and stall the next reads, which in
     /// decode happens after a few rounds whose rows all came from the row cache. 0 turns it off (the reader's
     /// default; generate turns it on, see SSD_KEEPALIVE). A keep-alive read that fails turns it off.
     void set_keepalive(double period_ms, double window_s);
+
+    /// Starts the keep-alive window again from now (no effect when it is off), so a long load that outlasted
+    /// the window from `set_keepalive` still finds the SSD awake at the first request.
+    void rearm_keepalive();
 
     /// Fault injection for tests and for the plan's P2 exit check: every read completes no earlier than
     /// `delay_us` after it was issued. 0 disables.
