@@ -3484,12 +3484,15 @@ int main(int argc, char** argv) {
     // arena mode was checked against the RAM above).
     // what the peer card can hold of experts: its free memory less its buffers and reserve, capped by --peer-slots
     // what the verify window's splits (the head by vocabulary, the GDN mixer by key head) load on the peer after its
-    // expert tier is filled
+    // expert tier is filled, when the GDN mixer split is taken; without it the head's peer rows fit in what the tier
+    // leaves free
     auto peer_split_bytes = [&](int dev0) -> int64_t {
+        const int64_t gs = basalt::core::Verifier::gs_peer_bytes(wt, g, dev0, o.peer_device);
+        if (gs == 0) return 0;
         const int64_t hs = native_head.loaded()
             ? basalt::core::Verifier::hs_peer_bytes(native_head.row_bytes(), native_head.type(), n_vocab, g.n_embd,
                                                     std::max({o.spec, o.batch, 2}), dev0, o.peer_device) : 0;
-        return hs + basalt::core::Verifier::gs_peer_bytes(wt, g, dev0, o.peer_device);
+        return hs + gs;
     };
     auto peer_expert_room = [&]() -> uint64_t {
         uint64_t room = 0;
