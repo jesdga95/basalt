@@ -34,27 +34,48 @@ def read(p):
         return f.read()
 
 
+def write(p, text):
+    with open(p, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+
+
+def load(p):
+    return json.loads(read(p).decode("utf-8"))
+
+
 failed = 0
 with tempfile.TemporaryDirectory() as d:
     empty = os.path.join(d, "empty.json")
-    with open(empty, "w", encoding="utf-8") as f:
-        json.dump({"preset": "basalt-bench --community", "runs": []}, f, indent=2)
-    for name, src in (("real", real), ("empty", empty)):
+    write(empty, json.dumps({"preset": "basalt-bench --community", "runs": []}, indent=2))
+    # the real file with CRLF line endings, as a checkout that translates them gives
+    crlf = os.path.join(d, "real_crlf.json")
+    with open(crlf, "wb") as f:
+        f.write(read(real).replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+    for name, src, eol in (("real", real, b"\n"), ("empty", empty, b"\n"), ("real-crlf", crlf, b"\r\n")):
         for case in ("plain", "odd"):
-            with open(src, encoding="utf-8") as f:
-                data = json.load(f)
+            data = load(src)
             data["runs"].append(row(case == "odd"))
             want = os.path.join(d, f"want_{name}_{case}.json")
-            with open(want, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False)
+            write(want, json.dumps(data, ensure_ascii=False))
             fix = subprocess.run([sys.executable, checker, "--fix", want], capture_output=True, text=True)
             got = os.path.join(d, f"got_{name}_{case}.json")
             ran = subprocess.run([exe, "--apply", src, got, case], capture_output=True, text=True)
-            same = ran.returncode == 0 and fix.returncode == 0 and read(got) == read(want)
-            check = subprocess.run([sys.executable, checker, got], capture_output=True, text=True)
+            want_bytes = read(want).replace(b"\n", eol)   # --fix writes LF; a CRLF input stays CRLF
+            same = ran.returncode == 0 and fix.returncode == 0 and read(got) == want_bytes
+            # the checker takes the LF result as it is, the CRLF one once converted back
+            lf = os.path.join(d, f"lf_{name}_{case}.json")
+            with open(lf, "wb") as f:
+                f.write(read(got).replace(b"\r\n", b"\n"))
+            check = subprocess.run([sys.executable, checker, lf], capture_output=True, text=True)
             ok = same and check.returncode == 0
             print(f"community_row_fix {name}/{case}: " + ("ok" if ok else "FAILED"))
             if not ok:
                 failed = 1
                 print(ran.stdout, ran.stderr, fix.stdout, check.stdout)
+    # a CRLF file is not canonical for the checker, and --fix turns it into LF without failing
+    bad = subprocess.run([sys.executable, checker, crlf], capture_output=True, text=True)
+    fixed = subprocess.run([sys.executable, checker, "--fix", crlf], capture_output=True, text=True)
+    ok = bad.returncode == 1 and fixed.returncode == 0 and b"\r" not in read(crlf)
+    print("community_row_fix crlf checker: " + ("ok" if ok else "FAILED"))
+    failed |= not ok
 sys.exit(failed)

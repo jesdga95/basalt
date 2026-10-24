@@ -98,19 +98,38 @@ std::string community_row_text(const CommunityRow& r) {
     return t;
 }
 
-bool community_add_row(const std::string& file, const CommunityRow& row, std::string& out, std::string& err) {
+bool community_add_row(const std::string& file_in, const CommunityRow& row, std::string& out, std::string& err) {
+    // The canonical form is LF; a file with CRLF line endings (a checkout that translated them) is edited as LF and
+    // written back as CRLF. Raw CR never occurs inside the JSON text itself, so the conversion is lossless.
+    const bool crlf = file_in.find("\r\n") != std::string::npos;
+    std::string file;
+    if (crlf) {
+        file.reserve(file_in.size());
+        for (size_t i = 0; i < file_in.size(); ++i)
+            if (file_in[i] != '\r' || i + 1 >= file_in.size() || file_in[i + 1] != '\n') file += file_in[i];
+    } else {
+        file = file_in;
+    }
     static const std::string tail = "\n    }\n  ]\n}", empty = "\n  \"runs\": []\n}", close = "\n  ]\n}";
     const auto ends = [&](const std::string& s) { return file.size() >= s.size() && file.compare(file.size() - s.size(), s.size(), s) == 0; };
     if (ends(tail)) {
         out = file.substr(0, file.size() - close.size()) + ",\n" + community_row_text(row) + close;
-        return true;
-    }
-    if (ends(empty)) {
+    } else if (ends(empty)) {
         out = file.substr(0, file.size() - 4) + "[\n" + community_row_text(row) + close;
-        return true;
+    } else {
+        err = "the file does not end in the canonical runs list (run python3 tools/check_benchmarks.py --fix on it first)";
+        return false;
     }
-    err = "the file does not end in the canonical runs list (run python3 tools/check_benchmarks.py --fix on it first)";
-    return false;
+    if (crlf) {
+        std::string t;
+        t.reserve(out.size() + out.size() / 20);
+        for (char ch : out) {
+            if (ch == '\n') t += '\r';
+            t += ch;
+        }
+        out.swap(t);
+    }
+    return true;
 }
 
 bool community_add_row_file(const std::string& path, const CommunityRow& row, std::string& err) {

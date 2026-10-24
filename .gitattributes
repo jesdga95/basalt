@@ -1,2 +1,4 @@
 # copies of real packs' native_experts.txt, parsed byte for byte by tests/core/expert_layout_test.cpp
 tests/data/native_experts/** -text
+# the table is checked byte for byte (tools/check_benchmarks.py), so it stays LF on every checkout
+docs/community/benchmarks.json text eol=lf
