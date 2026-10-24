@@ -186,6 +186,31 @@
       "prefill_64k_tps": 3511.3,
       "decode_tps": 187.3,
       "notes": "Swift GSQ-RCO IQ3_S GGUF converted to .basalt (--sections-from a verified pack); single RTX PRO 4000 Blackwell, weights on SATA SSD"
+    },
+    {
+      "submitter": "neuro",
+      "date": "2026-10-24",
+      "commit": "588a4776ed",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 500
+        },
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 500
+        }
+      ],
+      "ram_gib": 123,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 7697.6,
+      "prefill_64k_tps": 9590.6,
+      "decode_tps": 460.8,
+      "notes": "2x RTX 5090 at a 500 W limit each (below the cards' 575 W default), 123 GB DDR5; 0 SSD spill"
     }
   ]
 }
