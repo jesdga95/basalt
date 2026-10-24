@@ -1262,6 +1262,10 @@ if(BUILD_TESTING)
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE kernels_cpu)
   basalt_cpu_test(NAME pool_stress COMMAND pool_stress 20)
+  # the multi-token native path against a serial reference, bitwise, at several worker counts
+  add_executable(pool_native_test src/kernels/cpu/pool_native_test.cpp)
+  target_link_libraries(pool_native_test PRIVATE kernels_cpu platform)
+  basalt_cpu_test(NAME pool_native_test COMMAND pool_native_test)
 
   # DirectFile has a Linux backend and a Windows backend, and this test covers those two; macOS is not a platform
   # the engine builds for.
