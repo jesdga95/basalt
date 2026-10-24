@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -141,7 +142,7 @@ void full_session(int fmt, int mode, int experts) {
     check(conversation_checkpoint_save(checkpoint,ss,g,err),"save complete running checkpoint");
     {   // a deferred save equals the plain one, though the device state changes right after it is issued
         ConversationCheckpointDeferral deferral;
-        check(deferral.reserve(sizes.gdn,err),"reserve the deferred checkpoint buffer");
+        check(deferral.reserve(sizes.gdn,err,UINT64_MAX),"reserve the deferred checkpoint buffer");
         ConversationCheckpoint deferred;
         deferred.ids=checkpoint.ids;
         check(deferral.save(deferred,ss,g,err) && deferral.pending()==deferred.gdn.data(),"issue deferred checkpoint save");
@@ -155,21 +156,60 @@ void full_session(int fmt, int mode, int experts) {
               std::equal(deferred.dead.begin(),deferred.dead.end(),checkpoint.dead.begin()) &&
               std::equal(deferred.block_pos.begin(),deferred.block_pos.end(),checkpoint.block_pos.begin()),
               "deferred checkpoint bytes match the plain save");
-        // the same buffers again with different state: the bounce is reused, and each copy matches its own plain save
-        for (uint8_t salt : {uint8_t(41), uint8_t(97)}) {
+        // a deferral with the state `salt`, compared with the plain save of the same state; the device state is
+        // overwritten right after the copy is issued
+        auto plain_of=[&](uint8_t salt) {
             cuda_check(cudaMemset(ss.gdn_state,salt,sizes.gdn));
             cuda_check(cudaDeviceSynchronize());
             ConversationCheckpoint plain;
             plain.ids=checkpoint.ids;
             check(conversation_checkpoint_save(plain,ss,g,err),"plain save of another state");
-            ConversationCheckpoint again;
-            again.ids=checkpoint.ids;
-            check(deferral.save(again,ss,g,err),"issue a second deferred save");
+            return plain;
+        };
+        auto same=[](const ConversationCheckpoint& x, const ConversationCheckpoint& y) {
+            return x.gdn==y.gdn && x.ple==y.ple && x.tails==y.tails && x.dead==y.dead && x.block_pos==y.block_pos;
+        };
+        auto round_trip=[&](ConversationCheckpointDeferral& d, uint8_t salt, const char* label) {
+            const ConversationCheckpoint plain=plain_of(salt);
+            ConversationCheckpoint copy;
+            copy.ids=checkpoint.ids;
+            check(d.save(copy,ss,g,err),label);
             cuda_check(cudaMemset(ss.gdn_state,0x33,sizes.gdn));
             cuda_check(cudaDeviceSynchronize());
-            check(deferral.finish(err) && again.gdn==plain.gdn && again.ple==plain.ple && again.tails==plain.tails &&
-                  again.dead==plain.dead && again.block_pos==plain.block_pos,
-                  "a reused deferral matches the plain save of its own state");
+            check(d.finish(err) && same(copy,plain),label);
+        };
+        check(deferral.pinned(),"the deferral copies through a page-locked buffer");
+        // the same buffers again with different state: the bounce is reused, and each copy matches its own plain save
+        round_trip(deferral,41,"a reused deferral matches the plain save of its own state");
+        round_trip(deferral,97,"a reused deferral matches the plain save of another state");
+        {   // a save while the previous copy is still pending finishes that one first
+            const ConversationCheckpoint plain1=plain_of(59);
+            ConversationCheckpoint first;
+            first.ids=checkpoint.ids;
+            check(deferral.save(first,ss,g,err),"issue a save to leave pending");
+            const ConversationCheckpoint plain2=plain_of(83);
+            ConversationCheckpoint second;
+            second.ids=checkpoint.ids;
+            check(deferral.save(second,ss,g,err) && deferral.pending()==second.gdn.data(),"save over a pending copy");
+            check(same(first,plain1),"the pending copy was completed by the next save");
+            cuda_check(cudaMemset(ss.gdn_state,0x33,sizes.gdn));
+            cuda_check(cudaDeviceSynchronize());
+            check(deferral.finish(err) && same(second,plain2),"the save after a pending one matches its own state");
+        }
+        {   // a bounce buffer larger than the state: the copy uses its first bytes only
+            ConversationCheckpointDeferral large;
+            check(large.reserve(sizes.gdn*2,err,UINT64_MAX) && large.pinned(),"reserve a larger deferral");
+            round_trip(large,61,"a larger deferral matches the plain save");
+        }
+        {   // the RAM budget refuses the page-locked buffer: the copy goes to the pageable bytes
+            ConversationCheckpointDeferral refused;
+            check(refused.reserve(sizes.gdn,err,sizes.gdn-1) && !refused.pinned(),"a budget below the state refuses the pin");
+            round_trip(refused,73,"the pageable fallback matches the plain save");
+            ConversationCheckpointDeferral exact;
+            check(exact.reserve(sizes.gdn,err,sizes.gdn) && exact.pinned(),"a budget of exactly the state allows the pin");
+            ConversationCheckpointDeferral machine;   // the machine's own budget decides whether it pins; either way it works
+            check(machine.reserve(sizes.gdn,err),"reserve under the machine's RAM budget");
+            round_trip(machine,29,"a deferral under the machine's budget matches the plain save");
         }
         cuda_check(cudaMemset(ss.gdn_state,13,sizes.gdn));
         cuda_check(cudaDeviceSynchronize());

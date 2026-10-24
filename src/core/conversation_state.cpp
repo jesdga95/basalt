@@ -1,5 +1,6 @@
 #include "basalt/core/conversation_snapshot.hpp"
 #include "basalt/log.hpp"
+#include "basalt/platform/memory.hpp"
 #include "conversation_checked.hpp"
 
 #include <algorithm>
@@ -178,7 +179,7 @@ ConversationCheckpointDeferral::~ConversationCheckpointDeferral() {
     if (pinned_) cudaFreeHost(pinned_);
 }
 
-bool ConversationCheckpointDeferral::reserve(size_t bytes, std::string& error) {
+bool ConversationCheckpointDeferral::reserve(size_t bytes, std::string& error, std::optional<uint64_t> pin_budget) {
     if (spare_ || !bytes) return true;
     cudaStream_t s = nullptr;
     if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) {
@@ -192,12 +193,21 @@ bool ConversationCheckpointDeferral::reserve(size_t bytes, std::string& error) {
         return fail(error, "cannot allocate the deferred checkpoint buffer");
     }
     // The host copy goes through page-locked memory: a copy into a pageable vector holds the CUDA driver for its whole
-    // duration and stalls the next call of the request thread.
-    if (cudaHostAlloc(&pinned_, bytes, cudaHostAllocDefault) != cudaSuccess) {
+    // duration and stalls the next call of the request thread.  Like every page-locked allocation it is taken only
+    // from the RAM beyond the margin; without it the copy goes to the pageable bytes.
+    bool known = true;
+    const uint64_t budget = pin_budget ? *pin_budget : basalt::platform::ram_budget(&known);
+    const char* refused = nullptr;
+    if (known && bytes > budget) {
+        refused = "the RAM budget does not cover it";
+    } else if (cudaHostAlloc(&pinned_, bytes, cudaHostAllocDefault) != cudaSuccess) {
         cudaGetLastError();
         pinned_ = nullptr;
-        basalt::log::warn("basalt serve", "the deferred checkpoint copy has no pinned buffer: it copies into pageable memory");
+        refused = "the driver refused it";
     }
+    if (refused != nullptr)
+        basalt::log::warn("basalt serve", "the deferred checkpoint copy has no page-locked buffer (%s): it copies "
+                          "into pageable memory", refused);
     stream_ = s;
     cap_ = bytes;
     return true;

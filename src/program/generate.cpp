@@ -1024,8 +1024,9 @@ ConvStateSizes conv_state_sizes(const basalt::core::ModelGeometry& g, const basa
 
 /// Host RAM a server takes while it serves, beyond what it holds once ready: the conversation checkpoints (the solo
 /// session's and those a batch slot keeps, each the whole running state), the parked conversations, one image's
-/// host buffers at the largest canvas and a running request's own buffers.  The RAM copy of the experts leaves this
-/// free beside the margin, so serving stays above the RAM guard.
+/// host buffers at the largest canvas, a running request's own buffers and the page-locked buffer the deferred
+/// checkpoint copy goes through.  The RAM copy of the experts leaves this free beside the margin, so serving stays
+/// above the RAM guard.
 uint64_t serve_growth_bytes(const Options& o, const basalt::core::ModelGeometry& g) {
     if (!o.serve) return 0;
     uint64_t bytes = basalt::platform::kRequestHostBytes;
@@ -1035,6 +1036,7 @@ uint64_t serve_growth_bytes(const Options& o, const basalt::core::ModelGeometry&
         const uint64_t one = z.gdn + z.ple + (uint64_t) g.n_qsa_layers() * (z.tail + z.dead + z.block_pos);
         bytes += (uint64_t) (o.prompt_cache + 1) * (uint64_t) std::max(o.batch, 1) * one;
         bytes += (uint64_t) o.conversation_cache_mib << 20;
+        bytes += z.gdn;
     }
     if (!o.vision_mmproj.empty()) {
         // the canvas (8-bit RGB), its normalized planar floats and the patches
