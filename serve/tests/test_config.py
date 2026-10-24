@@ -27,6 +27,7 @@ from serve.config import (  # noqa: E402
     sampling_line,
     server_options,
     split_engine_extras,
+    vision_setting,
 )
 from serve.engine.flags import flag_value  # noqa: E402
 from serve.security import exposed_without_key  # noqa: E402
@@ -67,11 +68,11 @@ def engine_parser_flags() -> dict:
 class ConfigFile(unittest.TestCase):
     def test_server_and_engine_sections(self):
         ap = build_parser()
-        argv, engine = load_config_file(conf({"server": {"port": 9000, "vision": "on", "lazy": False,
+        argv, engine = load_config_file(conf({"server": {"port": 9000, "vision": 2, "lazy": False,
                                                          "allowed-host": ["a", "b"], "--gpu": "0,1"},
                                               "engine": {"max-context": 32768, "--kv": "int8",
                                                          "resident-experts": True}}), ap)
-        self.assertEqual(argv, ["--port", "9000", "--vision", "on", "--allowed-host", "a", "--allowed-host", "b",
+        self.assertEqual(argv, ["--port", "9000", "--vision", "2", "--allowed-host", "a", "--allowed-host", "b",
                                 "--gpu", "0,1"])
         self.assertEqual(engine, ["--max-context", "32768", "--kv", "int8", "--resident-experts"])
 
@@ -87,9 +88,9 @@ class ConfigFile(unittest.TestCase):
                          ({"server": {"nope": 1}}, "not a server option"),
                          ({"server": {"spec": 7}}, "not a server option \\(engine flags go under"),
                          ({"server": {"engine-bin": "/x/basalt"}}, "engine-bin is set by basalt serve"),
-                         ({"server": {"vision": "yes"}}, "vision: use one of on, off, peer, dynamic, cpu"),
-                         ({"server": {"vision": True}}, "vision: use one of on, off, peer, dynamic, cpu"),
-                         ({"server": {"vision": False}}, "vision: use one of on, off, peer, dynamic, cpu"),
+                         ({"server": {"vision": "yes"}}, "vision: use one of off, dynamic, cpu or a GPU number"),
+                         ({"server": {"vision": True}}, "vision: use one of off, dynamic, cpu or a GPU number"),
+                         ({"server": {"vision": False}}, "vision: use one of off, dynamic, cpu or a GPU number"),
                          ({"server": {"port": [1]}}, "one value"),
                          ({"server": {"config": "x"}}, "not a server option"),
                          ({"engine": {"port": 1}}, "a server option"),
@@ -323,6 +324,8 @@ class EveryOption(unittest.TestCase):
             return [c for c in act.choices][-1]
         if act.type is int or act.type is parallel_count or act.type is budget_count:
             return 7
+        if act.type is vision_setting:                      # --vision: a GPU number is a valid sample
+            return "1"
         if act.type is float:
             return 0.25
         if act.dest in SAMPLING_KEYS:                      # the model file's checks apply
