@@ -6314,8 +6314,6 @@ int main(int argc, char** argv) {
                 const int64_t live = xcache.slots();
                 std::string ferr;
                 std::vector<std::pair<int32_t, int32_t>> keep_out;
-                std::vector<std::pair<int64_t, int64_t>> homes_back;
-                std::vector<int32_t> homes_slot;
                 for (const auto& [i, slot] : vram_evicted) {
                     if (slot >= live) { keep_out.emplace_back(i, slot); continue; }
                     const int64_t layer = i / g.n_expert;
@@ -6338,19 +6336,24 @@ int main(int argc, char** argv) {
                         return false;
                     }
                     host_res[(size_t) pick] = slot;
-                    homes_back.emplace_back(layer, pick % g.n_expert);
-                    homes_slot.push_back(slot);
                 }
                 vram_evicted.swap(keep_out);
                 if (!xcache.sync_queued(ferr)) { e = "VRAM: " + ferr; return false; }
                 res_upload();
                 relend();
-                // the slots hold them again: the RAM homes of those experts go (the copy is the slots' now), except
-                // under the prompt path's loan, which overwrites its slots and so needs the RAM copy
+                // the slots hold the experts again: every expert in a slot below the loan has its RAM home freed (the
+                // copy is the slots' now: those given up, those the loan range kept, and those the adaptive tier moved
+                // back).  The loan's own slots keep theirs: a prompt overwrites them and reads those experts from RAM.
                 const int64_t loan_from = pf_parts.empty() || pf_parts[0].first < 0 ? INT64_MAX : pf_parts[0].first;
-                for (size_t k = 0; k < homes_back.size(); ++k)
-                    if (homes_slot[k] < loan_from) (void) src.home_release(homes_back[k].first, homes_back[k].second);
-                (void) src.homes_reclaim();
+                size_t released = 0;
+                for (size_t j = 0; j < host_res.size(); ++j)
+                    if (host_res[j] >= 0 && host_res[j] < loan_from &&
+                        src.home_release((int64_t) j / g.n_expert, (int64_t) j % g.n_expert))
+                        ++released;
+                const uint64_t freed = src.homes_reclaim() + src.homes_compact();
+                basalt::log::info("basalt serve", "VRAM: %zu RAM homes released, %.0f MiB freed, %.0f MiB kept for the "
+                                  "prompt loan (slots from %lld)", released, (double) freed / 1048576.0,
+                                  (double) src.homes_bytes() / 1048576.0, (long long) std::min<int64_t>(loan_from, live));
             }
             relend();
             cudaMemGetInfo(&free_b, &total_b);
