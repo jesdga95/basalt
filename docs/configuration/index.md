@@ -148,7 +148,7 @@ The model's experts live in VRAM (the expert cache), in RAM, or in the file. The
 | `shared-expert-arena` | engine | file path | off | Back the resident arena with one shared file so several processes use one copy. Put it on `/dev/shm`. |
 | `expert-profile-save` | engine | file path | off | Save what the adaptive tier learned (experts in VRAM and routing counts) to this file on exit and periodically. `tools/convert/convert.py --profile` reads it. |
 | `expert-profile-save-every` | engine | minutes | 10 (`0` = on exit only) | How often the profile is saved. |
-| `vram-elastic` | engine | switch | off | Hold the expert cache in segments so `POST /v1/vram` can lend VRAM to other programs between requests. |
+| `vram-elastic` | engine | switch | off | Hold the expert cache in segments so `POST /v1/vram` can lend VRAM to other programs between requests. Works with `resident-experts`: a shrink first copies the experts it gives back into RAM, so none is read from the file, and is refused (nothing changed) when the RAM above the floor cannot hold them; a grow frees those copies. |
 | `expert-cache-device1`, `-device2`, `-device3` | engine | integer or `auto` | off | Fill another GPU with experts directly, as a fixed tier. Not with `peer-device`. Advanced. |
 
 ### The adaptive tier

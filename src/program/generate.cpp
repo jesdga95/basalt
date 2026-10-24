@@ -6190,7 +6190,8 @@ int main(int argc, char** argv) {
         // much VRAM is free for other programs, or grows it back towards its full size when more than that is free.
         // Never on its own: only this command (the server's POST /v1/vram) moves it.  A shrink gives back the cache's
         // LAST segments: the experts in their slots become CPU misses, as any expert outside the cache is (no output
-        // changes beyond what a smaller cache decodes), the prompt path's loan moves down to the end of what is left
+        // changes beyond what a smaller cache decodes; in the resident RAM mode each is first copied to a RAM home),
+        // the prompt path's loan moves down to the end of what is left
         // (a smaller chunk when it no longer fits).  A grow maps them again and puts each slot's expert back (or, when
         // the adaptive tier already brought that one back, the most-routed missing expert of the same layer); the
         // adaptive tier carries on from there.
@@ -6210,6 +6211,41 @@ int main(int argc, char** argv) {
             p.first = (int32_t) std::max<int64_t>(0, live - part_slots(p, c));
             p.first_now = -1;   // laid out again at the next loan
         };
+        // The resident RAM mode holds only the experts no slot holds, so an expert in a slot about to go has no RAM
+        // copy: it is copied from its slot into a RAM home first and read from there like the compact copy's.  Refused
+        // (nothing copied) when the RAM above the floor cannot take them.  `live`: the slots that stay.
+        auto home_given_up = [&](int64_t live, std::string& e) -> bool {
+            if (!src.complement_ready()) return true;
+            std::vector<std::pair<int32_t, int32_t>> give;
+            std::vector<int32_t> slots;
+            for (size_t i = 0; i < host_res.size(); ++i) {
+                const int64_t layer = (int64_t) i / g.n_expert, ex = (int64_t) i % g.n_expert;
+                if (host_res[i] >= live && !src.has_resident(layer, ex)) {
+                    give.emplace_back((int32_t) layer, (int32_t) ex);
+                    slots.push_back(host_res[i]);
+                }
+            }
+            if (give.empty()) return true;
+            std::vector<uint8_t*> dst;
+            if (!src.homes_take(give, e, dst)) return false;
+            for (size_t k = 0; k < give.size(); ++k) {
+                const size_t bytes = (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(give[k].first);
+                if (cudaMemcpyAsync(dst[k], xcache.device_slot(slots[k]), bytes, cudaMemcpyDeviceToHost, 0) != cudaSuccess) {
+                    e = std::string("copying an expert to RAM failed: ") + cudaGetErrorString(cudaGetLastError());
+                    src.homes_abort();
+                    return false;
+                }
+            }
+            if (cudaDeviceSynchronize() != cudaSuccess) {
+                e = std::string("copying the experts to RAM failed: ") + cudaGetErrorString(cudaGetLastError());
+                src.homes_abort();
+                return false;
+            }
+            src.homes_commit();
+            basalt::log::info("basalt serve", "VRAM: %zu experts moved from the cache to RAM (%.0f MiB held)", give.size(),
+                         (double) src.homes_bytes() / 1048576.0);
+            return true;
+        };
         auto vram_command = [&](const std::string& cmd, std::string& e) -> bool {
             // `VRAM` alone: the reserve the engine started with (--vram-reserve-mib)
             char* end = nullptr;
@@ -6223,10 +6259,6 @@ int main(int argc, char** argv) {
             }
             if (!o.vram_elastic || !xcache.segmented()) {
                 e = "VRAM needs an engine started with --vram-elastic (one NVIDIA GPU, --serve)";
-                return false;
-            }
-            if (src.complement_ready()) {
-                e = "VRAM: not with the resident low-RAM mode (the cache holds experts RAM does not)";
                 return false;
             }
             if (peer.valid()) { e = "VRAM: not with --peer-device"; return false; }
@@ -6255,6 +6287,7 @@ int main(int argc, char** argv) {
                     keep = floor_b;
                     note = " (the cache keeps its smallest size: the prompt path's buffers)";
                 }
+                if (!home_given_up(xcache.slots_after_shrink(keep), e)) { e = "VRAM: " + e + " (nothing changed)"; return false; }
                 if (!xcache.shrink(keep, e)) return false;
                 const int64_t live = xcache.slots();
                 for (size_t i = 0; i < host_res.size(); ++i)
@@ -6269,6 +6302,7 @@ int main(int argc, char** argv) {
                 const int64_t live = xcache.slots();
                 std::string ferr;
                 std::vector<std::pair<int32_t, int32_t>> keep_out;
+                std::vector<std::pair<int64_t, int64_t>> homes_back;
                 for (const auto& [i, slot] : vram_evicted) {
                     if (slot >= live) { keep_out.emplace_back(i, slot); continue; }
                     const int64_t layer = i / g.n_expert;
@@ -6278,7 +6312,7 @@ int main(int argc, char** argv) {
                         float best = -1.0f;
                         for (int64_t ex = 0; ex < g.n_expert; ++ex) {
                             const size_t j = (size_t) (layer * g.n_expert + ex);
-                            if (host_res[j] >= 0) continue;
+                            if (host_res[j] >= 0 || (src.complement_ready() && !src.has_resident(layer, ex))) continue;
                             const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[j];
                             if (u > best) { best = u; pick = (int64_t) j; }
                         }
@@ -6291,9 +6325,13 @@ int main(int argc, char** argv) {
                         return false;
                     }
                     host_res[(size_t) pick] = slot;
+                    homes_back.emplace_back(layer, pick % g.n_expert);
                 }
                 vram_evicted.swap(keep_out);
                 if (!xcache.sync_queued(ferr)) { e = "VRAM: " + ferr; return false; }
+                // the slots hold them again: the RAM homes of those experts go (the copy is the slots' now)
+                for (const auto& [l, ex] : homes_back) (void) src.home_release(l, ex);
+                (void) src.homes_reclaim();
                 res_upload();
             }
             relend();
@@ -6305,10 +6343,10 @@ int main(int argc, char** argv) {
                          (long long) (free_b >> 20), (long long) o.prefill_chunk,
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), note.c_str());
             std::printf("VRAM reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld expert_cache_mib=%lld "
-                        "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld\n", reserve,
+                        "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld ram_homes_mib=%lld\n", reserve,
                         (long long) xcache.slots(), (long long) xcache.full_slots(),
                         (long long) (xcache.mapped_bytes() >> 20), (long long) (xcache.full_bytes() >> 20),
-                        (long long) (free_b >> 20), (long long) o.prefill_chunk);
+                        (long long) (free_b >> 20), (long long) o.prefill_chunk, (long long) (src.homes_bytes() >> 20));
             return true;
         };
         // ---- the elastic KV (kKvElasticFloor): a session's K/V pools back their cells on demand, out of the expert
