@@ -245,6 +245,9 @@ def free_port():
         return s.getsockname()[1]
 
 
+ONE_CARD = {"devices": "0", "cards": [{"smi": 0}], "notes": [], "warning": "", "error": ""}
+
+
 class EngineStart(unittest.TestCase):
     """What main() hands the engine when `grammar` comes from the config file or the command line."""
 
@@ -272,13 +275,14 @@ class EngineStart(unittest.TestCase):
             with mock.patch.object(sys, "argv", argv), \
                     mock.patch("serve.engine.modelfile.model_config", return_value=cfg), \
                     mock.patch.dict(sys.modules, {"tokenizer": types.SimpleNamespace(Tokenizer=lambda *a: ByteTokenizer())}), \
-                    mock.patch.object(server, "ProcessEngine", fake):
+                    mock.patch.object(server, "ProcessEngine", fake), \
+                    mock.patch.object(server, "gpu_plan", return_value=ONE_CARD):
                 server.main()
         return seen["args"]
 
     def test_config_file(self):
         for block in ({"grammar": True}, {"grammar": False}, {}):
-            self.assertEqual(self.engine_args(block), ["--serve", "--grammar", "on"], block)
+            self.assertEqual(self.engine_args(block), ["--serve", "--gpu", "0", "--grammar", "on"], block)
 
     def line(self, block, cli=()):
         import io
@@ -295,10 +299,10 @@ class EngineStart(unittest.TestCase):
         self.assertEqual(self.line({}, ["--grammar"]), "[server] engine: using default flags, grammar on (cli)")
 
     def test_command_line(self):
-        self.assertEqual(self.engine_args({}, ["--grammar"]), ["--serve", "--grammar", "on"])
+        self.assertEqual(self.engine_args({}, ["--grammar"]), ["--serve", "--gpu", "0", "--grammar", "on"])
 
     def test_engine_without_the_flag(self):
-        self.assertEqual(self.engine_args({"grammar": True}, flags=b"\0--kv\0"), ["--serve"])
+        self.assertEqual(self.engine_args({"grammar": True}, flags=b"\0--kv\0"), ["--serve", "--gpu", "0"])
 
 
 if __name__ == "__main__":

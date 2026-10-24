@@ -31,6 +31,7 @@
 #include "basalt/program/community_row.hpp"
 #include "basalt/program/host_rates.hpp"
 #include "basalt/program/engine_session.hpp"
+#include "basalt/program/gpu_select.hpp"
 
 #include <errno.h>
 
@@ -231,6 +232,7 @@ struct Options {
     std::vector<std::pair<std::string, std::string>> sets;
     std::vector<std::string> passthrough;
     std::string spec;                    // --spec N: the engine argument of the same name
+    std::string gpu;                     // --gpu: the cards (gpu_select.hpp); one after -- wins
     std::vector<std::string> decode;     // -t: conv, struct, prose
     std::vector<long long> depths;       // -p: prefill depths in tokens
     bool sel_decode = false, sel_prefill = false;
@@ -283,7 +285,8 @@ void usage(const std::string& engine) {
         "                     host-to-device copy speed (the figures --community records), then exit; no model, no engine\n"
         "\n"
         "engine\n"
-        "  --model FILE       a .basalt model file; --peer-device 1 is added when a second GPU is visible. Every\n"
+        "  --model FILE       a .basalt model file\n"
+        "  --gpu A,B,..|auto  the GPUs, as for the server and the engine (default: GPU 0 alone). Every\n"
         "                     other --flag is an engine flag, passed on as given (same names as `basalt`; the engine\n"
         "                     rejects a bad one at startup); --print-command shows the command and exits\n"
         "  --engine BIN       engine binary (default: the one built with this program)\n"
@@ -331,18 +334,6 @@ void usage(const std::string& engine) {
     }
 }
 
-// The GPUs this process can see: CUDA_VISIBLE_DEVICES when set, else what NVML lists.
-size_t visible_gpus() {
-    if (const char* v = std::getenv("CUDA_VISIBLE_DEVICES")) {
-        size_t n = 0;
-        for (const auto& d : split(v, ','))
-            if (d != "-1") ++n;
-        return n;
-    }
-    Nvml nvml;
-    return nvml.open() ? nvml.count() : 0;
-}
-
 bool parse_args(int argc, char** argv, Options& o, std::string& err) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -362,6 +353,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else if (a == "--engine") o.engine = next("--engine");
         else if (a == "--spec") o.spec = next("--spec");
         else if (a == "--community") o.community = true;
+        else if (a == "--gpu") o.gpu = next("--gpu");
         else if (a == "--hardware") o.hardware = true;
         else if (a == "--submitter") o.submitter = next("--submitter");
         else if (a == "--community-file") o.community_file = next("--community-file");
@@ -723,10 +715,6 @@ int main(int argc, char** argv) {
     std::vector<std::string> args;
     if (!o.model.empty()) {
         args = {"--model", fs::absolute(o.model).string()};
-        // A second GPU can hold an expert tier only where a process is given GPU-to-GPU access between its
-        // devices; the engine refuses --peer-device without it, so the bench does not offer one.
-        if (basalt::platform::gpu_peer_access() && !has_arg(args, "--peer-device") && visible_gpus() > 1)
-            set_arg(args, "--peer-device", "1");
     }
     if (engine_bin.empty()) engine_bin = BASALT_BENCH_ENGINE;
     if (o.engine.empty() && std::string(BASALT_BENCH_ENGINE).size() > 0 && fs::exists(BASALT_BENCH_ENGINE)) engine_bin = BASALT_BENCH_ENGINE;
@@ -739,6 +727,17 @@ int main(int argc, char** argv) {
     if (o.model.empty()) for (const auto& a : o.passthrough) args.push_back(a);
     else merge_args(args, o.passthrough);
     if (!o.community && !has_arg(args, "--spec")) set_arg(args, "--spec", "0");
+    // the GPUs, chosen here once as the server chooses them: the engine sees only those cards and says nothing again
+    if (!o.model.empty()) {
+        std::string gpu_value, gerr;
+        std::vector<basalt::program::GpuCard> used;
+        const std::string want = has_arg(args, "--gpu") ? arg_value(args, "--gpu") : o.gpu;
+        if (!basalt::program::select_gpus(want, "basalt-bench", gpu_value, used, gerr)) {
+            basalt::log::error("basalt-bench", "%s", gerr.c_str());
+            return 2;
+        }
+        set_arg(args, "--gpu", gpu_value);
+    }
 
     // fixtures, read before anything is started
     std::vector<std::vector<int64_t>> decode_ids(3);

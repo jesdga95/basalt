@@ -144,17 +144,53 @@ __device__ __forceinline__ void dm_group_keys(const int32_t* s_key, int n, int t
     rank_out = rank;
 }
 
+// The tier of entry `tid`: CUDA0, the peer, a further peer (3 + q) or the CPU pool (-1).
+__device__ __forceinline__ int dm_tier(const DmRouteArgs& a, int32_t e) {
+    if (a.res0[e] >= 0) return 0;
+    if (a.res1 != nullptr && a.res1[e] >= 0) return 2;
+    for (int q = 0; q < a.n_x; ++q)
+        if (a.xres[q][e] >= 0) return 3 + q;
+    return -1;
+}
+
+// The further peers' ring headers: each holds its own entries as kind 2 and every other GPU's as 0.
+__device__ void dm_xring_headers(const DmRouteArgs& a, const int32_t* ids, const int32_t* kind, int n, int tid,
+                                 const int32_t* nx, int n_vram, int n_cpu) {
+    for (int q = 0; q < a.n_x; ++q) {
+        DmRing* r = a.xring_m[q];
+        if (tid < n) {
+            const int32_t kd = kind[tid];
+            r->ids[tid] = ids[tid];
+            r->kind[tid] = kd == 3 + q ? 2 : kd >= 0 ? 0 : -1;
+        }
+        if (tid == 0) {
+            r->n_tok = a.n_tok;
+            r->layer = a.layer;
+            r->n_vram = n_vram;
+            r->n_peer = nx[q];
+            r->n_cpu = n_cpu;
+        }
+    }
+}
+
+__device__ void dm_xring_doorbells(const DmRouteArgs& a, const int32_t* nx) {
+    for (int q = 0; q < a.n_x; ++q)
+        *(volatile uint32_t*) a.xseq_m[q] = a.ring | (uint32_t) a.n_tok << 16 | (nx[q] > 0 ? 1u << 28 : 0u) |
+                                            (a.rows ? 1u << 29 : 0u);
+}
+
 // Block 0 plans CUDA0's groups and publishes the ring's header; the other blocks quantize the FFN input (256 values
 // each) into the device q8_1 rows and, for the tiers that need them, into mapped memory.  The last block to finish
 // rings both doorbells.  Mode 1 keeps only the plan and the device rows, mode 2 only the ring (DmRouteArgs::mode).
 __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
     __shared__ int32_t s_ids[kDmCap], s_kind[kDmCap], s_first[kDmCap], s_cnt[kDmCap], s_gstart[kDmCap];
     __shared__ int32_t s_gidx[kDmCap], s_pos[kDmCap];
-    __shared__ int32_t s_ncpu, s_npeer, s_ng, s_ne;
+    __shared__ int32_t s_ncpu, s_npeer, s_ng, s_ne, s_nx[kDmMaxX];
     if (a.sh_gw != nullptr) pdl_trigger();   // the next kernel may start (only weights before its wait)
     const int tid = threadIdx.x, n = a.n_tok * a.k;
     pdl_wait();   // DEC_PDL2: launched during the router's tail
     if (tid == 0) { s_ncpu = 0; s_npeer = 0; }
+    if (tid < kDmMaxX) s_nx[tid] = 0;
     if (tid < n) s_ids[tid] = a.ids[tid];
     __syncthreads();
     if (tid < n) {
@@ -163,12 +199,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
         // one entry per token (kDmMaxEnt, the persistent kernels' shared rows)
         bool ok = e >= 0 && e < a.n_expert;
         for (int j = tid - tid % a.k; ok && j < tid; ++j) ok = s_ids[j] != e;
-        int kd = -1;
-        if (ok) {
-            if (a.res0[e] >= 0) kd = 0;
-            else if (a.res1 != nullptr && a.res1[e] >= 0) kd = 2;
-        }
-        s_kind[tid] = kd;
+        s_kind[tid] = ok ? dm_tier(a, e) : -1;
     }
     __syncthreads();
     if (a.peer_cap > 0) {   // the peer's groups past peer_cap (distinct ids in routing order) go to the CPU pool
@@ -190,8 +221,11 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
     if (tid < n) {
         if (s_kind[tid] < 0) atomicAdd(&s_ncpu, 1);
         else if (s_kind[tid] == 2) atomicAdd(&s_npeer, 1);
+        else if (s_kind[tid] >= 3) atomicAdd(&s_nx[s_kind[tid] - 3], 1);
     }
     __syncthreads();
+    int npeers = s_npeer;   // every peer's entries
+    for (int q = 0; q < a.n_x; ++q) npeers += s_nx[q];
     const bool plan = a.mode != 2, pub = a.mode != 1;
     if (blockIdx.x == 0 && !plan) {   // the ring's header only
         if (tid < n) {
@@ -200,12 +234,12 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
             if (a.kinds) a.plan->kind[tid] = s_kind[tid];
         }
         if (a.kinds && tid == 0) {
-            a.plan->counts[2] = s_npeer;
+            a.plan->counts[2] = npeers;
             a.plan->counts[3] = s_ncpu;
         }
+        int ne = 0;
+        for (int j = 0; j < n; ++j) ne += s_kind[j] == 0;
         if (tid == 0) {
-            int ne = 0;
-            for (int j = 0; j < n; ++j) ne += s_kind[j] == 0;
             DmRing* r = a.ring_m;
             r->n_tok = a.n_tok;
             r->layer = a.layer;
@@ -213,6 +247,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
             r->n_peer = s_npeer;
             r->n_cpu = s_ncpu;
         }
+        dm_xring_headers(a, s_ids, s_kind, n, tid, s_nx, ne, s_ncpu);
     } else if (blockIdx.x == 0) {
         DmPlan* p = a.plan;
         dm_group(s_ids, s_kind, n, 0, tid, s_first, s_cnt, s_gstart, s_gidx, s_pos, p->start, &s_ng, &s_ne);
@@ -236,7 +271,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
         if (tid == 0) {
             p->counts[0] = s_ng;
             p->counts[1] = s_ne;
-            p->counts[2] = s_npeer;
+            p->counts[2] = npeers;
             p->counts[3] = s_ncpu;
         }
         if (tid == 0 && pub) {
@@ -247,13 +282,17 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
             r->n_peer = s_npeer;
             r->n_cpu = s_ncpu;
         }
+        if (pub) {
+            __syncthreads();   // s_ne is final
+            dm_xring_headers(a, s_ids, s_kind, n, tid, s_nx, s_ne, s_ncpu);
+        }
     } else {
         const long long i = (long long) (blockIdx.x - 1) * kDmThreads + tid;
         const long long nv = (long long) a.n_tok * a.n_embd;
         void* xq = plan ? a.xq : a.xq_pub;
         if (i < nv) {   // n_embd is a multiple of 256: whole warps
             const float xi = a.x[i];
-            if (plan || s_npeer > 0 || a.rows) q8_1_store(xi, (block_q8_1*) xq, i);
+            if (plan || npeers > 0 || a.rows) q8_1_store(xi, (block_q8_1*) xq, i);
             if (pub && s_ncpu > 0) a.x_m[i] = xi;
         }
         if (plan && a.sh_gw != nullptr) {   // the shared expert's gate: this block's 256 products, warps summed in order
@@ -270,7 +309,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
                 a.sh_part[blockIdx.x - 1] = gs;
             }
         }
-        if (pub && (s_npeer > 0 || a.rows)) {
+        if (pub && (npeers > 0 || a.rows)) {
             __syncthreads();
             // this block's 8 q8_1 blocks (288 bytes) to mapped memory, 16 bytes per thread
             const long long b0 = (long long) (blockIdx.x - 1) * (kDmThreads / 32);
@@ -293,6 +332,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
             // the peer's word: the ring, the tokens and whether it has entries (it fetches nothing otherwise)
             *(volatile uint32_t*) a.peer_seq_m = a.ring | (uint32_t) a.n_tok << 16 | (s_npeer > 0 ? 1u << 28 : 0u) |
                                                  (a.rows ? 1u << 29 : 0u);
+            dm_xring_doorbells(a, s_nx);
             *(volatile uint32_t*) a.host_seq_m = a.ring;
             __threadfence_system();
         }
@@ -333,9 +373,10 @@ __global__ void dm_wait_kernel(const DmPlan* plan, const volatile uint32_t* peer
 // same q8_1_store bits); called after the block's pdl_wait
 __device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
     __shared__ int32_t r_ids[kDmCap], r_kind[kDmCap], r_pf[kDmCap];
-    __shared__ int32_t r_ncpu, r_npeer, r_nvram;
+    __shared__ int32_t r_ncpu, r_npeer, r_nvram, r_nx[kDmMaxX];
     const int n = a.n_tok * a.k;
     if (tid == 0) { r_ncpu = 0; r_npeer = 0; r_nvram = 0; }
+    if (tid < kDmMaxX) r_nx[tid] = 0;
     const int n16 = a.n_tok * (a.n_embd / 32) * 36 / 16;
     if (tid < n) r_ids[tid] = __ldcg(a.ids + tid);
     __syncthreads();
@@ -343,12 +384,7 @@ __device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
         const int32_t e = r_ids[tid];
         bool ok = e >= 0 && e < a.n_expert;
         for (int j = tid - tid % a.k; ok && j < tid; ++j) ok = r_ids[j] != e;
-        int kd = -1;
-        if (ok) {
-            if (a.res0[e] >= 0) kd = 0;
-            else if (a.res1 != nullptr && a.res1[e] >= 0) kd = 2;
-        }
-        r_kind[tid] = kd;
+        r_kind[tid] = ok ? dm_tier(a, e) : -1;
     }
     __syncthreads();
     if (a.peer_cap > 0) {   // dm_route_kernel's cap: the peer's groups past peer_cap go to the CPU pool
@@ -369,9 +405,13 @@ __device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
     if (tid < n) {
         if (r_kind[tid] < 0) atomicAdd(&r_ncpu, 1);
         else if (r_kind[tid] == 2) atomicAdd(&r_npeer, 1);
+        else if (r_kind[tid] >= 3) atomicAdd(&r_nx[r_kind[tid] - 3], 1);
         else atomicAdd(&r_nvram, 1);
     }
     __syncthreads();
+    int npeers = r_npeer;   // every peer's entries
+    for (int q = 0; q < a.n_x; ++q) npeers += r_nx[q];
+    dm_xring_headers(a, r_ids, r_kind, n, tid, r_nx, r_nvram, r_ncpu);
     if (tid < n) {
         a.ring_m->ids[tid] = r_ids[tid];
         a.ring_m->kind[tid] = r_kind[tid];
@@ -385,11 +425,11 @@ __device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
         r->n_peer = r_npeer;
         r->n_cpu = r_ncpu;
         if (a.kinds) {
-            a.plan->counts[2] = r_npeer;
+            a.plan->counts[2] = npeers;
             a.plan->counts[3] = r_ncpu;
         }
     }
-    if (r_npeer > 0 || a.rows) {   // the q8_1 rows, 16 bytes at a time (a row is n_embd / 32 blocks of 36 bytes)
+    if (npeers > 0 || a.rows) {   // the q8_1 rows, 16 bytes at a time (a row is n_embd / 32 blocks of 36 bytes)
         for (int i = tid; i < n16; i += blockDim.x) ((uint4*) a.xq_m)[i] = __ldcg((const uint4*) xq + i);
     }
     if (r_ncpu > 0) {
@@ -403,6 +443,7 @@ __device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
         __threadfence_system();
         *(volatile uint32_t*) a.peer_seq_m = a.ring | (uint32_t) a.n_tok << 16 | (r_npeer > 0 ? 1u << 28 : 0u) |
                                              (a.rows ? 1u << 29 : 0u);
+        dm_xring_doorbells(a, r_nx);
         *(volatile uint32_t*) a.host_seq_m = a.ring;
         __threadfence_system();
     }

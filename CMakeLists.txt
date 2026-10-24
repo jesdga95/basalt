@@ -428,7 +428,8 @@ add_custom_target(git_stamp
 execute_process(COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DOUT=${_git_stamp}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/git_stamp.cmake)
 # the engine driven as a child process and the report logic, shared by basalt-bench and basalt-probe
-add_library(engine_session STATIC src/program/engine_session.cpp src/program/load_summary.cpp src/program/probe_report.cpp src/program/probe_derive.cpp src/program/auto_plan.cpp src/program/community_row.cpp src/program/host_rates.cpp)
+add_library(engine_session STATIC src/program/engine_session.cpp src/program/load_summary.cpp src/program/probe_report.cpp src/program/probe_derive.cpp src/program/auto_plan.cpp src/program/community_row.cpp src/program/host_rates.cpp
+            src/program/gpu_select.cpp)
 target_include_directories(engine_session PUBLIC include)
 find_package(Threads REQUIRED)
 target_link_libraries(engine_session PUBLIC platform Threads::Threads)
@@ -908,6 +909,13 @@ target_link_libraries(probe_report_test PRIVATE engine_session warnings)
 basalt_embed_manifest(probe_report_test)
 basalt_cpu_test(NAME probe_report_test COMMAND probe_report_test)
 set_tests_properties(probe_report_test PROPERTIES TIMEOUT 60)
+
+# the gpu setting: parsing, the card choice and the roles, over fake card tables (CPU only)
+add_executable(gpu_select_test tests/program/gpu_select_test.cpp)
+target_link_libraries(gpu_select_test PRIVATE engine_session warnings)
+basalt_embed_manifest(gpu_select_test)
+basalt_cpu_test(NAME gpu_select_test COMMAND gpu_select_test)
+set_tests_properties(gpu_select_test PROPERTIES TIMEOUT 60)
 
 # basalt-probe's suggested values: the worker pick, the balance share and the suggestion lines (CPU only)
 add_executable(probe_derive_test tests/program/probe_derive_test.cpp)

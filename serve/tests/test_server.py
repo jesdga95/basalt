@@ -1157,7 +1157,6 @@ class GpuChoice(unittest.TestCase):
                          "[server] vision mode: dynamic, GPU 0 (card0), loads per image")
 
     def test_vision_device(self):
-        from unittest import mock
         from serve.engine.vision import child_env, vision_env
         cfg = {"gpu": "0,1"}
         env = child_env(cfg)
@@ -1170,11 +1169,33 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(main["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
         self.assertIs(vision_env({"gpu": "0"}, env), env)   # one card listed: the engine's environment
         self.assertIs(vision_env({"gpu": "0"}, env, "on"), env)
-        with mock.patch("serve.engine.modelfile.gpu_count", return_value=1):
-            self.assertIs(vision_env({}, env), env)         # none listed, one card
-        with mock.patch("serve.engine.modelfile.gpu_count", return_value=2):
-            self.assertEqual(vision_env({}, env)["CUDA_VISIBLE_DEVICES"], "1")
-            self.assertIs(vision_env({}, env, "on"), env)
+        self.assertIs(vision_env({}, env), env)             # none chosen: the engine's environment
+        self.assertIs(vision_env({}, env, "on"), env)
+        swapped = {"gpu": "1,0"}                            # the order chosen: the peer is the second
+        self.assertEqual(vision_env(swapped, child_env(swapped))["CUDA_VISIBLE_DEVICES"], "0")
+        self.assertEqual(child_env(swapped)["CUDA_VISIBLE_DEVICES"], "1,0")
+
+    def test_gpu_plan(self):
+        from serve.engine.vision import check_gpu, gpu_plan, gpu_text
+        self.assertEqual(gpu_text([0, 1]), "0,1")
+        self.assertEqual(gpu_text(1), "1")
+        self.assertEqual(gpu_text(None), "")
+        for good in (None, "", "auto", "0", "1,0", [0, 1]):
+            check_gpu(good)
+        for bad in ("a,b", "0,0", "-1", "0,"):
+            with self.assertRaises(ValueError):
+                check_gpu(bad)
+        ok = mock.Mock(stdout='{"devices":"1,0","cards":[{"smi":1},{"smi":0}],"notes":[],"warning":"","error":""}\n')
+        with mock.patch("subprocess.run", return_value=ok) as run:
+            self.assertEqual(gpu_plan("/x/basalt", "1,0")["devices"], "1,0")
+            self.assertEqual(run.call_args.args[0], ["/x/basalt", "--gpu-plan", "--gpu", "1,0"])
+            gpu_plan("/x/basalt", None)
+            self.assertEqual(run.call_args.args[0], ["/x/basalt", "--gpu-plan"])
+        bad = mock.Mock(stdout='{"devices":"","cards":[],"notes":[],"warning":"","error":"gpu 2: 2 GPUs are visible (0-1)"}')
+        with mock.patch("subprocess.run", return_value=bad), self.assertRaisesRegex(ValueError, "2 GPUs are visible"):
+            gpu_plan("/x/basalt", "2")
+        with mock.patch("subprocess.run", side_effect=OSError), self.assertRaisesRegex(ValueError, "--gpu-plan"):
+            gpu_plan("/x/basalt", "auto")
 
     def test_vision_modes(self):
         from serve.engine.vision import vision_mode

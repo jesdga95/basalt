@@ -50,6 +50,12 @@ public:
     bool open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
               ExpertSource& src, int64_t n_layers, int64_t n_expert, int reserve_mib, int64_t max_slots,
               std::string& err, bool exclusive = false);
+    /// `open` in two steps, for several peers sharing out one ranking: `prepare` takes the card's buffers (no slots),
+    /// `fill` sizes the slots for exactly `pick` and copies those experts in.
+    bool prepare(int device, ExpertSource& src, int64_t n_layers, int64_t n_expert, std::string& err);
+    bool fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std::string& err, bool exclusive = false);
+    /// A slot's bytes for an expert of `layer`.
+    static uint64_t slot_bytes(int64_t layer);
     void close();
     /// The device bytes `open` allocates besides the expert slots (buffers and kernel scratch), taken before the
     /// slots are sized from what is left.

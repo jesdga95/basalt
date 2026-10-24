@@ -13,7 +13,7 @@ tests and the quality gate run on a machine with a card.
 | CUDA | 13 | 13 |
 | Build | CMake 3.24+ | CMake 3.24+ and Ninja |
 | Python | 3.10+ | 3.10+ |
-| GPU | NVIDIA Blackwell (sm_120); optional second GPU as a peer expert tier | NVIDIA Blackwell (sm_120), one GPU |
+| GPU | NVIDIA Blackwell (sm_120); optional second GPU as a peer expert tier (`gpu 0,1`) | NVIDIA Blackwell (sm_120), one GPU |
 
 ## Platform code
 
@@ -38,7 +38,7 @@ process code page UTF-8 and lifts the path length limit.
 
 ## Windows limitations
 
-- One GPU. The peer and multi-GPU flags stop the engine at start-up.
+- One GPU. With `gpu` listing more cards, the ones after the main card stay idle and a start-up warning says so.
 - Pinned memory is capped by the driver under WDDM. When the whole arena cannot be registered,
   the pinned slices are limited to the GPU's shared-memory budget (`RAM/2 - 8 GiB`), and the
   start-up note says what was capped.

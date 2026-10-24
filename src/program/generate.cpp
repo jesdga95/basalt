@@ -37,6 +37,7 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/program/auto_plan.hpp"
+#include "basalt/program/gpu_select.hpp"
 #include "basalt/program/tokenizer.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/ngram.hpp"
@@ -92,6 +93,7 @@
 #include <condition_variable>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <new>
@@ -371,6 +373,9 @@ struct Options {
     /// there, `peer_slots` caps its size (0 = as many as fit), `peer_adapt_swaps` per adaptive round
     /// (-1 = adapt_swaps).
     int peer_device = -1;
+    /// every expert tier's device, the first one peer_device, and each card's memory bandwidth (GB/s, 0 unknown)
+    std::vector<int> peer_devices;
+    std::vector<double> peer_gbps;
     int peer_reserve_mib = 600;
     int64_t peer_slots = 0;
     int peer_adapt_swaps = -1;
@@ -436,8 +441,8 @@ struct Options {
     /// sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual path, then
     /// continues in slot <slot> of the batch windows (`BT <slot> <id> [<id> ...]` lines, then `BDONE <slot> ...`).
     int batch = 0;
-    /// With an explicit --layer-split, every GPU loads only its own layers' dense weights instead of the whole
-    /// model's: the VRAM they took goes back to the expert cache (opt-in)
+    /// With an explicit layer split, every GPU loads only its own layers' dense weights instead of the whole
+    /// model's: the VRAM they took goes back to the expert cache (the automatic split leaves it off)
     bool trim_stage_weights = false;
     /// The --batch slots in this many groups pipelined through the stages of a layer split (stage k
     /// runs one group while stage k+1 runs another).  1 = every slot in one window, stage after stage.
@@ -470,10 +475,13 @@ struct Options {
     /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
     /// GPU, sharing everything - the bit-exact A/B of the hand-off)
     std::string split_device;
-    /// --split-skip-if-fits (opt-in; the server passes it for a config's "split_skip_if_fits"): with --layer-split auto,
+    /// With the automatic layer split (set from --gpu):
     /// run on CUDA0 alone when it holds every profiled expert pair plus the whole session (KV), the drafter and the
     /// reserve - a split then only adds hand-offs
     bool split_skip_if_fits = false;
+    /// --gpu: the cards this run uses (gpu_select.hpp); empty = GPU 0 alone.  --gpu-plan prints the choice and exits.
+    std::string gpu;
+    bool gpu_plan = false;
     /// Stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
@@ -626,11 +634,10 @@ void usage() {
                  "  --serve              stay resident and take requests on stdin (the server's mode)\n"
                  "  --exp NAME=VALUE[,...]  diagnostics; concur9_logit_hash=1 prints a hash of each accepted row's\n"
                  "                       logits on stderr\n"
-                 "  --layer-split K|K1,K2,...|auto  --serve: run the model in stages across GPUs, each a block of layers\n"
-                 "                       not with --peer-device\n"
-                 "  --split-device D1,D2,..  with --layer-split: the later stages' GPUs (default: the next visible ones)\n"
-                 "  --split-skip-if-fits with --layer-split auto: run on CUDA0 alone when it holds every profiled expert,\n"
-                 "                       the session, the drafter and the reserve\n"
+                 "  --gpu A,B,..|auto    the GPUs to use, as nvidia-smi numbers them (within CUDA_VISIBLE_DEVICES when\n"
+                 "                       set): exactly these, the first the main card; the engine gives the rest their\n"
+                 "                       roles.  auto = every Blackwell card, the fastest as main.  Default: GPU 0 alone\n"
+                 "  --gpu-plan           print the --gpu choice as one JSON line and exit (no model needed)\n"
                  "  --mtp-window N       the drafter attends to the last N cells (default 32768; 0 = every cell)\n"
                  "  --stop-eos           stop when the model emits an end-of-turn token\n"
                  "  --eos-ids LIST       the end-of-turn token ids for --stop-eos (default 248044,248046); implies it\n"
@@ -672,8 +679,6 @@ void usage() {
                  "                       give VRAM back to other programs between requests and take it back later\n"
                  "  --batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8),\n"
                  "                       each slot with its own session (VRAM like the main one)\n"
-                 "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
-                 "  --trim-stage-weights an explicit --layer-split: each GPU loads only its own layers' dense weights\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
                  "  --tail-role-token ID --serve: a turn of this role right before the last turn is left out of\n"
@@ -731,23 +736,11 @@ void usage() {
                  "                       left after the weights, the session and --vram-reserve-mib\n"
                  "  --vram-reserve-mib N  VRAM left free on the primary GPU for graphs, scratch and the head when\n"
                  "                       --expert-cache auto sizes the tier (default 700; at least 256)\n"
-                 "  --expert-cache-device1 N|auto  fill CUDA1 with N experts or as many as fit\n"
-                 "  --expert-cache-device2 N|auto  fill CUDA2 with more experts\n"
-                 "  --expert-cache-device3 N|auto  fill CUDA3 with more experts\n"
-                 "  --remote-expert-opt   enable remote-expert decode optimizations (serve mode)\n"
-                 "  --expert-cache-remote-placement stripe|layer  distribute expert ranks or whole\n"
-                 "                       layers across CUDA1..3 (default: stripe)\n"
-                 "  --peer-device N      a second GPU as an adaptive expert-cache tier (rows over P2P; it also\n"
-                 "                       computes its experts' prompt rows).  Not with --layer-split or\n"
-                  "                       --expert-cache-device1..3; refused where a process has no GPU-to-GPU\n"
-                  "                       access between its devices.  Off by default; the server sets 1 when two\n"
-                  "                       or more GPUs are visible.\n"
                  "  --peer-exclusive     with --resident-experts: experts on the peer are held only there, not\n"
                  "                       also in RAM (less RAM).  The peer is filled from the file; swaps move\n"
                  "                       peer-held experts between the GPUs and RAM over P2P.  Auto when not set\n"
                  "                       (on only when it keeps every expert off the SSD).\n"
                  "  --peer-reserve-mib N  VRAM the peer tier leaves free on its card (default 600)\n"
-                 "  --peer-slots N       expert slots on the peer (default: what fits)\n"
                  "  --adapt-every N      adaptive expert tier: a round every N decode windows (default 1 for a\n"
                  "                       server on one GPU, else 4;\n"
                  "                       0 = the VRAM experts stay as loaded)\n"
@@ -1308,15 +1301,8 @@ int main(int argc, char** argv) {
             const std::string v = next("--expert-cache");
             o.expert_cache = (v == "auto") ? -1 : std::atoi(v.c_str());
         }
-        else if (a == "--expert-cache-device1" || a == "--expert-cache-device2" || a == "--expert-cache-device3") {
-            const size_t r = (size_t) (a.back() - '1');
-            const std::string v = next(a.c_str());
-            o.expert_cache_remote_auto[r] = v == "auto";
-            o.expert_cache_remote[r] = v == "auto" ? std::numeric_limits<int>::max() : std::atoi(v.c_str());
-        }
-        else if (a == "--remote-expert-opt") o.remote_expert_opt = true;
-        else if (a == "--expert-cache-remote-placement")
-            o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
+        else if (a == "--gpu") o.gpu = next("--gpu");
+        else if (a == "--gpu-plan") o.gpu_plan = true;
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
         else if (a == "--prefill") {
             const std::string v = next("--prefill");
@@ -1335,8 +1321,6 @@ int main(int argc, char** argv) {
         else if (a == "--spec") { o.spec = std::atoi(next("--spec")); o.spec_given = true; }
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
         else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
-        else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
-        else if (a == "--batch-groups") o.batch_groups = std::atoi(next("--batch-groups"));
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
@@ -1361,9 +1345,6 @@ int main(int argc, char** argv) {
             o.grammar = v == "on";
         }
         else if (a == "--stop-eos") o.stop_eos = true;
-        else if (a == "--layer-split") o.layer_split = next("--layer-split");
-        else if (a == "--split-device") o.split_device = next("--split-device");
-        else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
         else if (a == "--vision-mmproj") { o.vision_mmproj = next("--vision-mmproj"); o.vision = true; }
@@ -1427,10 +1408,8 @@ int main(int argc, char** argv) {
             o.stop_eos = true;
         }
         else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(next("--adapt-swaps"));
-        else if (a == "--peer-device") o.peer_device = std::atoi(next("--peer-device"));
         else if (a == "--peer-exclusive") { o.peer_exclusive = true; o.peer_exclusive_given = true; }
         else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib"));
-        else if (a == "--peer-slots") o.peer_slots = std::atoll(next("--peer-slots"));
         else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
         else if (a == "--peer-prefill-rows") o.peer_prefill_rows = std::atoll(next("--peer-prefill-rows"));
         else if (a == "--expert-profile-save") o.expert_profile_save = next("--expert-profile-save");
@@ -1484,15 +1463,59 @@ int main(int argc, char** argv) {
     // synchronizes the context and can wait on a window kernel that waits on the load, so batched serving loads every
     // kernel up front.  An explicit CUDA_MODULE_LOADING wins.
     if (o.serve && o.batch >= 2 && !module_loading_set) basalt::platform::set_env("CUDA_MODULE_LOADING", "EAGER");
-    // The peer tier holds experts on a second GPU and moves them between the two over direct GPU-to-GPU access, which
-    // a process here is not given.  Refused with the options, before the model opens or a device context exists: a
-    // tier sized and then filled would fail partway through the load.
-    if (o.peer_device >= 1 && !basalt::platform::gpu_peer_access()) {
-        basalt::log::error("basalt generate", "--peer-device is not available here: this platform gives a process no "
-                             "GPU-to-GPU access between its devices, so a second GPU cannot hold an expert tier; keep "
-                             "the experts on one GPU (--expert-cache, --resident-experts) and run without "
-                             "--peer-device");
-        return 2;
+    // ---- the GPUs: chosen before any CUDA call, which then sees only them, the main card as device 0
+    {
+        namespace bp = basalt::program;
+        bp::GpuSpec spec;
+        std::string gerr;
+        if (!bp::parse_gpu_spec(o.gpu, spec, gerr)) {
+            if (o.gpu_plan) {
+                bp::GpuChoice bad;
+                bad.error = gerr;
+                std::printf("%s\n", bp::gpu_plan_json({}, bad).c_str());
+            } else {
+                basalt::log::error("basalt", "%s", gerr.c_str());
+            }
+            return 2;
+        }
+        bool known = false;
+        const std::vector<bp::GpuCard> visible = bp::visible_gpus(known);
+        const bp::GpuChoice choice = bp::choose_gpus(spec, visible, known);
+        if (o.gpu_plan) {
+            std::printf("%s\n", bp::gpu_plan_json(visible, choice).c_str());
+            return choice.error.empty() ? 0 : 2;
+        }
+        if (!choice.error.empty()) { basalt::log::error("basalt", "%s", choice.error.c_str()); return 2; }
+        for (const std::string& s : choice.notes) basalt::log::info("basalt", "%s", s.c_str());
+        if (!choice.warning.empty()) basalt::log::warn("basalt", "%s", choice.warning.c_str());
+        bp::apply_gpus(visible, choice.cards);
+        int seen = 0;
+        if (cudaGetDeviceCount(&seen) != cudaSuccess || seen < (int) choice.cards.size()) {
+            basalt::log::error("basalt", "gpu %s: CUDA sees %d of the %zu GPUs chosen", o.gpu.empty() ? "0" : o.gpu.c_str(),
+                               seen, choice.cards.size());
+            return 2;
+        }
+        bp::RoleInputs ri;
+        for (int i : choice.cards) ri.cards.push_back((size_t) i < visible.size() ? visible[(size_t) i] : bp::GpuCard{});
+        ri.peer_access = basalt::platform::gpu_peer_access();
+        ri.max_expert_tiers = basalt::kernels::kDmMaxX + 1;   // the device-planned tail's peer windows
+        const std::vector<bp::GpuRole> roles = bp::choose_roles(ri);
+        std::string line;
+        for (size_t d = 0; d < roles.size(); ++d) {
+            const bp::GpuCard& c = ri.cards[d];
+            line += std::string(d ? ", " : "") + (c.name.empty() ? "GPU" : c.name) +
+                    (c.smi >= 0 ? " (nvidia-smi " + std::to_string(c.smi) + ")" : "") + " " + bp::gpu_role_name(roles[d]);
+            if (roles[d] == bp::GpuRole::ExpertTier) {
+                o.peer_devices.push_back((int) d);
+                o.peer_gbps.push_back(c.mem_gbps);
+            }
+        }
+        basalt::log::info("basalt", "gpus: %s", line.c_str());
+        if (std::count(roles.begin(), roles.end(), bp::GpuRole::Idle) > 0)
+            basalt::log::warn("basalt", "%s", ri.peer_access
+                ? ("expert tiers max " + std::to_string(ri.max_expert_tiers) + "; later cards idle").c_str()
+                : "no GPU-to-GPU access; cards after the main idle");
+        if (!o.peer_devices.empty()) o.peer_device = o.peer_devices[0];
     }
     // ---- where every loader reads from: the sections of the .basalt file
     if (o.model.empty()) {
@@ -1827,7 +1850,11 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (o.peer_exclusive && (o.peer_device < 1 || !o.resident_cpu_experts || !o.serve)) {
-        basalt::log::error("basalt generate", "--peer-exclusive needs --peer-device, --resident-experts and --serve");
+        basalt::log::error("basalt generate", "--peer-exclusive needs a second GPU (--gpu 0,1), --resident-experts and --serve");
+        return 2;
+    }
+    if (o.peer_exclusive && o.peer_devices.size() > 1) {
+        basalt::log::error("basalt generate", "--peer-exclusive runs with one expert tier card (--gpu 0,1)");
         return 2;
     }
     // the peer tier is the second card's only user: a layer split or a remote expert cache would put a second engine
@@ -1844,7 +1871,7 @@ int main(int argc, char** argv) {
     // the reason is visible before the model is loaded.
     if (multi_gpu && (o.gpu_only_full || o.gpu_stages)) {
         basalt::log::error("basalt generate", "--gpu-only-full and --gpu-stages replay the whole model through one "
-                             "session, which a layer split does not have; run them without --layer-split");
+                             "session, which a layer split does not have; run them on one GPU (--gpu 0)");
         return 2;
     }
 
@@ -2501,7 +2528,7 @@ int main(int argc, char** argv) {
         const bool remote = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
         if (remote || o.expert_profile.empty() ||
             !basalt::core::read_expert_profile(srcs.profile, g.n_layers, g.n_expert, prof, pslots, perr)) {
-            basalt::log::info("basalt generate", "--split-skip-if-fits: %s; the split stays",
+            basalt::log::info("basalt generate", "layer split: %s; the split stays",
                          remote ? "remote expert caches are in use" : perr.empty() ? "no expert profile" : perr.c_str());
         } else {
             const auto& lay = basalt::kernels::cpu::expert_layout();
@@ -2516,7 +2543,7 @@ int main(int argc, char** argv) {
             cudaDeviceProp dp{};
             cudaGetDeviceProperties(&dp, 0);
             if (pairs_bytes <= room) {
-                basalt::log::info("basalt generate", "layer split skipped (--split-skip-if-fits): CUDA0 (%s) holds all "
+                basalt::log::info("basalt generate", "layer split skipped: CUDA0 (%s) holds all "
                                      "%zu profiled pairs (%.2f GiB) with the session (%.2f GiB, %lld-token context), "
                                      "the drafter and the reserve: %.2f GiB free, %.2f GiB to spare - one GPU",
                              dp.name, prof.size(), (double) pairs_bytes / 1073741824.0, (double) session / 1073741824.0,
@@ -2528,7 +2555,7 @@ int main(int argc, char** argv) {
                 split_at.clear();
                 o.layer_split.clear();
             } else {
-                basalt::log::info("basalt generate", "--split-skip-if-fits: CUDA0 (%s) would hold only %.2f of the "
+                basalt::log::info("basalt generate", "layer split: CUDA0 (%s) would hold only %.2f of the "
                                      "profile's %.2f GiB (%.2f GiB free, %.2f GiB for the session, drafter and "
                                      "reserve): the split stays", dp.name,
                              (double) std::max<int64_t>(room, 0) / 1073741824.0, (double) pairs_bytes / 1073741824.0,
@@ -3498,19 +3525,24 @@ int main(int argc, char** argv) {
         uint64_t room = 0;
         if (o.peer_device < 1) return 0;
         int cur = 0, count = 0;
-        size_t pfree = 0, ptotal = 0;
-        if (cudaGetDevice(&cur) == cudaSuccess && cudaGetDeviceCount(&count) == cudaSuccess &&
-            o.peer_device < count && cudaSetDevice(o.peer_device) == cudaSuccess) {
-            if (cudaMemGetInfo(&pfree, &ptotal) == cudaSuccess) {
-                const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
-                                         basalt::core::PeerExperts::device_overhead_bytes() +
-                                         (uint64_t) peer_split_bytes(cur);
-                room = (uint64_t) pfree > reserve ? (uint64_t) pfree - reserve : 0;
-                if (o.peer_slots > 0)
-                    room = std::min<uint64_t>(room, (uint64_t) o.peer_slots * basalt::kernels::cpu::expert_layout().max_blob);
-            }
-            (void) cudaSetDevice(cur);
+        if (cudaGetDevice(&cur) != cudaSuccess || cudaGetDeviceCount(&count) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return 0;
         }
+        std::vector<int> seen;   // each card once; its tiers share its free memory
+        for (int dev : o.peer_devices) {
+            if (dev >= count || std::find(seen.begin(), seen.end(), dev) != seen.end()) continue;
+            seen.push_back(dev);
+            const uint64_t tiers = (uint64_t) std::count(o.peer_devices.begin(), o.peer_devices.end(), dev);
+            size_t pfree = 0, ptotal = 0;
+            if (cudaSetDevice(dev) == cudaSuccess && cudaMemGetInfo(&pfree, &ptotal) == cudaSuccess) {
+                const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
+                                         tiers * basalt::core::PeerExperts::device_overhead_bytes() +
+                                         (dev == o.peer_device ? (uint64_t) peer_split_bytes(cur) : 0);
+                room += (uint64_t) pfree > reserve ? (uint64_t) pfree - reserve : 0;
+            }
+        }
+        (void) cudaSetDevice(cur);
         (void) cudaGetLastError();
         return room;
     };
@@ -3770,10 +3802,12 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---- Multi-GPU: the second GPU's expert tier (filled after the RAM complement below, from it)
+    // ---- Multi-GPU: the second GPU's expert tier (filled after the RAM complement below, from it), and the further
+    // cards' tiers beside it
     basalt::core::PeerExperts peer;
+    std::vector<std::unique_ptr<basalt::core::PeerExperts>> xpeers;
     if (o.peer_device >= 1 && (profile.empty() || srcp == nullptr || o.expert_cache <= 0)) {
-        basalt::log::error("basalt generate", "--peer-device needs an expert profile and the expert cache");
+        basalt::log::error("basalt generate", "a second GPU as expert tier needs an expert profile and the expert cache; run on one GPU (--gpu 0)");
         return 1;
     }
 
@@ -4494,15 +4528,67 @@ int main(int argc, char** argv) {
         int d0 = 0;
         cudaGetDevice(&d0);
         const int peer_reserve = o.peer_reserve_mib + (int) ((peer_split_bytes(d0) + (1 << 20) - 1) >> 20);
-        if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, peer_reserve, o.peer_slots,
-                       err, exclusive)) {
-            basalt::log::error("basalt generate", "%s", err.c_str());
-            return false;
+        if (o.peer_devices.size() <= 1) {
+            if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, peer_reserve, o.peer_slots,
+                           err, exclusive)) {
+                basalt::log::error("basalt generate", "%s", err.c_str());
+                return false;
+            }
+            basalt::log::info("basalt generate", "peer GPU %d: %lld experts, %.2f GiB (filled in %.1f s); with the primary's "
+                                 "%lld that is %lld of %lld on the GPUs", o.peer_device, (long long) peer.resident(), peer.gib(),
+                         std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) xcache.slots(),
+                         (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
+            return true;
         }
-        basalt::log::info("basalt generate", "peer GPU %d: %lld experts, %.2f GiB (filled in %.1f s); with the primary's "
-                             "%lld that is %lld of %lld on the GPUs", o.peer_device, (long long) peer.resident(), peer.gib(),
-                     std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) xcache.slots(),
-                     (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
+        // several tiers: every card's buffers first, then the pairs the primary does not hold dealt out by room and
+        // bandwidth (gpu_select.hpp), each card's room shared by the tiers it holds
+        const size_t np = o.peer_devices.size();
+        xpeers.clear();
+        for (size_t i = 1; i < np; ++i) xpeers.push_back(std::make_unique<basalt::core::PeerExperts>());
+        auto tier = [&](size_t i) -> basalt::core::PeerExperts& { return i == 0 ? peer : *xpeers[i - 1]; };
+        for (size_t i = 0; i < np; ++i)
+            if (!tier(i).prepare(o.peer_devices[i], *srcp, g.n_layers, g.n_expert, err)) {
+                basalt::log::error("basalt generate", "%s", err.c_str());
+                return false;
+            }
+        std::vector<basalt::program::TierRoom> rooms(np);
+        for (size_t i = 0; i < np; ++i) {
+            const int dev = o.peer_devices[i];
+            size_t fb = 0, tb = 0;
+            {
+                const basalt::core::OnDevice on(dev);
+                cudaMemGetInfo(&fb, &tb);
+            }
+            const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
+                                     (dev == o.peer_device ? (uint64_t) peer_split_bytes(d0) : 0);
+            const uint64_t share = (uint64_t) std::count(o.peer_devices.begin(), o.peer_devices.end(), dev);
+            rooms[i].bytes = fb > reserve ? ((uint64_t) fb - reserve) / share : 0;
+            rooms[i].gbps = o.peer_gbps[i];
+        }
+        std::vector<std::pair<int32_t, int32_t>> ranked;
+        std::vector<uint64_t> bytes;
+        for (const auto& pr : profile)
+            if (xcache.slot_of(pr.first, pr.second) < 0) {
+                ranked.push_back(pr);
+                bytes.push_back(basalt::core::PeerExperts::slot_bytes(pr.first));
+            }
+        const std::vector<int> owner = basalt::program::spread_experts(bytes, rooms);
+        int64_t held = xcache.slots();
+        for (size_t i = 0; i < np; ++i) {
+            std::vector<std::pair<int32_t, int32_t>> pick;
+            for (size_t j = 0; j < ranked.size(); ++j)
+                if (owner[j] == (int) i) pick.push_back(ranked[j]);
+            if (!tier(i).fill(pick, err)) {
+                basalt::log::error("basalt generate", "%s", err.c_str());
+                return false;
+            }
+            held += tier(i).resident();
+            basalt::log::info("basalt generate", "peer GPU %d: %lld experts, %.2f GiB (tier %zu of %zu)", o.peer_devices[i],
+                              (long long) tier(i).resident(), tier(i).gib(), i + 1, np);
+        }
+        basalt::log::info("basalt generate", "%zu peer tiers filled in %.1f s; with the primary's %lld that is %lld of %lld "
+                             "on the GPUs", np, std::chrono::duration<double>(Clock::now() - tp0).count(),
+                          (long long) xcache.slots(), (long long) held, (long long) (g.n_layers * g.n_expert));
         return true;
     };
     // every expert of the largest layer: what one prompt layer can read from the file (see platform::file_cache_floor)
@@ -4548,7 +4634,7 @@ int main(int argc, char** argv) {
         in.ram_available = basalt::platform::available_memory();
         if (basalt::core::detail::HostMemory hm; basalt::core::detail::host_available_memory(hm) && hm.available > 0)
             in.ram_available = in.ram_available > 0 ? std::min(in.ram_available, hm.available) : hm.available;
-        in.peer = o.peer_device >= 1 && o.resident_cpu_experts;
+        in.peer = o.peer_devices.size() == 1 && o.resident_cpu_experts;   // peer-exclusive: one tier card
         in.serve = o.serve;
         in.worker_cores = (int) topo.worker_cores.size();
         in.p_cores = topo.p_cores;
@@ -4762,8 +4848,10 @@ int main(int argc, char** argv) {
                 bool on_gpu = (i < host_res.size() && host_res[i] >= 0);
                 for (const auto& st : stages) on_gpu = on_gpu || st->cache.slot_of(l, e) >= 0;
                 for (const auto& r : remote_experts) on_gpu = on_gpu || (r.resident() > 0 && r.owns((int64_t) i));
+                bool on_peer = peer.valid() && peer.has(l, e);
+                for (const auto& xpe : xpeers) on_peer = on_peer || (xpe->valid() && xpe->has(l, e));
                 if (on_gpu) b_vram += blob;
-                else if (peer.valid() && peer.has(l, e)) b_peer += blob;
+                else if (on_peer) b_peer += blob;
                 else if (arena_ok) b_ram += blob;
                 else if (ram_ok && src.has_resident(l, e)) (src.resident_in_top_up(l, e) ? b_top : b_ram) += blob;
                 else b_file += blob;
@@ -4787,7 +4875,7 @@ int main(int argc, char** argv) {
         if (pct(b_file) < 2.0) return;
         std::string levers = "a smaller quant, more RAM";
         if (!o.resident_cpu_experts) levers += ", --resident-experts";
-        if (o.peer_device < 1) levers += ", a second GPU as the peer tier (--peer-device)";
+        if (o.peer_device < 1) levers += ", a second GPU as the peer tier (--gpu 0,1)";
         if (o.batch > 1) levers += ", fewer --parallel slots or no --slot-full-context (the slots hold " +
                                    std::to_string((slot_kv_cuda0 + (1u << 29)) >> 30) + " GiB of KV beyond the solo one)";
         basalt::log::warn("basalt", "%.0f%% of the experts (%.1f GiB) are only in the file: decode reads them "
@@ -5185,6 +5273,8 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         ver.set_main_priority(o.batch > 0);   // beside a prompt read the slots' windows must win the SMs
         if (peer.valid()) ver.set_peer(&peer);   // the window drives the peer tier itself
+        for (const auto& xpe : xpeers)
+            if (xpe->valid()) ver.add_peer(xpe.get());
         ver.set_cpu_warm(drive.d.pool, drive.d.src);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err) ||
             (mtp_on && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err))) {
@@ -5567,11 +5657,41 @@ int main(int argc, char** argv) {
         };
         // the peer's swaps land a window after their copies are queued, so no window waits for a copy
         bool peer_landing = false;
+        std::vector<uint8_t> xlanding(xpeers.size(), 0);
+        // the peer tiers take the next most-routed CPU misses: each passes over what the primary (r0) or another tier
+        // holds or takes in this round; with one tier r0 is its whole view
+        auto adapt_peers = [&](const std::vector<int32_t>& r0, std::string& perr) -> bool {
+            const int swaps_each = o.peer_adapt_swaps >= 0 ? o.peer_adapt_swaps : o.adapt_swaps;
+            if (xpeers.empty()) return peer.adapt(drive.d.usage.data(), r0.data(), swaps_each, perr);
+            const size_t nt = 1 + xpeers.size();
+            auto tier = [&](size_t i) -> basalt::core::PeerExperts& { return i == 0 ? peer : *xpeers[i - 1]; };
+            for (size_t t = 0; t < nt; ++t) {
+                if (!tier(t).valid()) continue;
+                std::vector<int32_t> seen = r0;
+                for (size_t u = 0; u < nt; ++u) {
+                    if (u == t || !tier(u).valid()) continue;
+                    const std::vector<int32_t>& ru = tier(u).residency();
+                    for (size_t i = 0; i < seen.size() && i < ru.size(); ++i)
+                        if (ru[i] >= 0) seen[i] = 0;
+                    for (size_t i : tier(u).incoming())
+                        if (i < seen.size()) seen[i] = 0;
+                }
+                if (!tier(t).adapt(drive.d.usage.data(), seen.data(), swaps_each, perr)) return false;
+            }
+            return true;
+        };
         auto apply_pending = [&](bool wait, bool exchanges = true) {
             if (peer.valid()) {
                 if (!wait) peer.apply_pending(wait);
                 else if (peer_landing) { peer.apply_pending(true); peer_landing = false; }
                 else if (peer.has_pending()) { peer.issue_pending(true); peer_landing = true; }
+            }
+            for (size_t q = 0; q < xpeers.size(); ++q) {
+                basalt::core::PeerExperts& x = *xpeers[q];
+                if (!x.valid()) continue;
+                if (!wait) x.apply_pending(wait);
+                else if (xlanding[q]) { x.apply_pending(true); xlanding[q] = 0; }
+                else if (x.has_pending()) { x.issue_pending(true); xlanding[q] = 1; }
             }
             if (pending.empty()) return;
             if (wait) cudaEventSynchronize(adapt_ev);
@@ -5690,12 +5810,11 @@ int main(int argc, char** argv) {
             // the routing counted since the start (each count adds up to 1 / (1 - --adapt-decay) over its decays: the
             // sum is proportional to the routing itself) - only with --expert-profile-save, else `heat` is empty
             for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
-            if (peer.valid()) {                   // multi-GPU: the peer takes the next most-routed CPU misses
+            if (peer.valid()) {                   // multi-GPU: the peer tiers take the next most-routed CPU misses
                 std::vector<int32_t> r0 = host_res;
                 for (const auto& [i, slot] : pending) r0[(size_t) i] = slot;   // swapped into the primary already
                 std::string perr;
-                if (!peer.adapt(drive.d.usage.data(), r0.data(),
-                                o.peer_adapt_swaps >= 0 ? o.peer_adapt_swaps : o.adapt_swaps, perr)) {
+                if (!adapt_peers(r0, perr)) {
                     basalt::log::error("basalt serve", "%s", perr.c_str());
                     return false;
                 }
@@ -5779,16 +5898,20 @@ int main(int argc, char** argv) {
                 if (!plan(swaps[i])) return false;
             for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
             std::vector<size_t> peer_takes;
-            if (peer.valid()) {   // the peer takes the next most-routed CPU misses (not the ones moving to CUDA0)
+            if (peer.valid()) {   // the peer tiers take the next most-routed CPU misses (not the ones moving to CUDA0)
                 std::vector<int32_t> r0 = host_res;
                 for (const XSwap& x : xq) r0[(size_t) x.layer * g.n_expert + x.in] = x.slot;
                 std::string perr;
-                if (!peer.adapt(drive.d.usage.data(), r0.data(),
-                                o.peer_adapt_swaps >= 0 ? o.peer_adapt_swaps : o.adapt_swaps, perr)) {
+                if (!adapt_peers(r0, perr)) {
                     basalt::log::error("basalt serve", "%s", perr.c_str());
                     return false;
                 }
-                if (swaps.size() > n_base) peer_takes = peer.incoming();
+                if (swaps.size() > n_base) {
+                    peer_takes = peer.incoming();
+                    for (const auto& xpe : xpeers)
+                        if (xpe->valid())
+                            for (size_t i : xpe->incoming()) peer_takes.push_back(i);
+                }
                 std::sort(peer_takes.begin(), peer_takes.end());
             }
             for (size_t i = n_base; i < swaps.size(); ++i) {
@@ -6331,7 +6454,7 @@ int main(int argc, char** argv) {
                 e = "VRAM needs an engine started with --vram-elastic (one NVIDIA GPU, --serve)";
                 return false;
             }
-            if (peer.valid()) { e = "VRAM: not with --peer-device"; return false; }
+            if (peer.valid()) { e = "VRAM: not with a second GPU as expert tier"; return false; }
             for (const PfPart& p : pf_parts)
                 if (!p.lent.empty()) { e = "VRAM: a prompt's loan is still out"; return false; }
             if (!ver.wait_commit(e)) return false;

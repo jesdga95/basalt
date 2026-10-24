@@ -21,17 +21,19 @@
 namespace basalt::kernels {
 
 constexpr int kDmCap = 128;          ///< entries per window: kVerifyMaxT tokens x top-10 fit
+constexpr int kDmMaxX = 2;           ///< peer cards past the first, each with its own ring, doorbell and done word
 
 /// One ring (layer) as the route kernel publishes it to mapped memory.
 struct DmRing {
     int32_t n_tok = 0, layer = 0, n_vram = 0, n_peer = 0, n_cpu = 0, pad[3] = {};
     int32_t ids[kDmCap] = {};
-    int32_t kind[kDmCap] = {};       ///< 0: CUDA0's VRAM tier, 2: the peer card, -1: the CPU pool
+    int32_t kind[kDmCap] = {};       ///< 0: CUDA0's VRAM tier, 2: the peer card, 3 + q: further peer q, -1: the CPU
+                                     ///< pool; a further peer's own ring holds its entries as 2 and every other GPU's as 0
 };
 
 /// CUDA0's grouped plan (native_expert_grouped's lists) and every entry's tier, on the device.
 struct DmPlan {
-    int32_t counts[4];               ///< [0] VRAM groups, [1] VRAM entries, [2] peer entries, [3] CPU entries
+    int32_t counts[4];               ///< [0] VRAM groups, [1] VRAM entries, [2] every peer's entries, [3] CPU entries
     int32_t start[kDmCap + 1];
     int32_t dst[kDmCap];
     int32_t tok[kDmCap];
@@ -68,6 +70,12 @@ struct DmRouteArgs {
     unsigned long long* stats = nullptr;   ///< DM_WAIT_STATS (kDmStatWords, device) or null: the doorbell's time
     int peer_cap = 0;                ///< PEER_CAP: the peer's groups past this many go to the CPU pool (0: no cap)
     bool kinds = false;              ///< mode 2: also every entry's tier into plan->kind and counts[2], counts[3]
+    /// further peers: their residency rows (an entry no tier before holds goes to the first that does), their rings
+    /// (written like ring_m) and their doorbells (rung like peer_seq_m)
+    int n_x = 0;
+    const int32_t* xres[kDmMaxX] = {};
+    DmRing* xring_m[kDmMaxX] = {};
+    uint32_t* xseq_m[kDmMaxX] = {};
 };
 /// Blocks dec_moe_route launches for `n_tok` rows (the arrival counter advances by this much).
 int dec_moe_route_blocks(int n_tok, int n_embd);

@@ -294,11 +294,7 @@ class ProcessEngine:
         self.batch = int(self.info.get("batch_slots") or 0)
         if asked and self.batch != asked:
             print(f"[server] warning: {asked} parallel requests asked, the engine runs {self.batch or 'one'}", flush=True)
-        groups = int(flag_value(args, "--batch-groups") or 1)
-        groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
-        gs = self.batch // groups if self.batch else 0
-        # slot order that spreads requests over the groups first: 0, gs, 2gs, .., 1, gs+1, ..
-        self.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
+        self.slot_order = list(range(self.batch))
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
         # tokens each slot holds (for prefix reuse by a conversation's next turn) and when it was last used

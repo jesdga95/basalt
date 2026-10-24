@@ -120,6 +120,9 @@ public:
     /// The peer expert tier the window drives itself (persistent kernel, mapped rings) instead of the pool launching it
     /// per layer.  Before init.
     void set_peer(PeerExperts* peer) { peer_ = peer; }
+    /// A further peer card's expert tier, served like the first by a persistent kernel of its own (its own ring,
+    /// doorbell and done word); only with the device-planned MoE tail.  Before init, after set_peer.
+    void add_peer(PeerExperts* peer) { xpeers_.push_back(peer); }
     /// The CPU pool and the expert source the window's CPU tier runs on: between doorbells the parked workers predict
     /// the next layer's CPU experts (its router on this layer's FFN input) and read the likeliest into their caches.
     /// Before init; only with the device-planned MoE tail.
@@ -330,6 +333,7 @@ private:
     RemoteExpertOpt* remote_opt_ = nullptr;
     bool main_high_ = false;
     PeerExperts* peer_ = nullptr;
+    std::vector<PeerExperts*> xpeers_;
     basalt::kernels::cpu::ExpertPool* warm_pool_ = nullptr;
     ExpertSource* warm_src_ = nullptr;
     DecMoe* dm_ = nullptr;   // the device-planned MoE tail (null: off)

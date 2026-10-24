@@ -175,9 +175,15 @@ class Precedence(unittest.TestCase):
                                                   "--control-vector-layer-range", "1", "2"])
 
     def test_negative_value_words(self):
-        _, _, _, cli_words = parse(["--peer-device", "-1", "--x=-2"])
-        self.assertEqual(cli_words, ["--peer-device", "-1", "--x", "-2"])
-        check_engine_flags(cli_words, {"--peer-device", "--x"}, "cli")
+        _, _, _, cli_words = parse(["--vram-reserve-mib", "-1", "--x=-2"])
+        self.assertEqual(cli_words, ["--vram-reserve-mib", "-1", "--x", "-2"])
+        check_engine_flags(cli_words, {"--vram-reserve-mib", "--x"}, "cli")
+
+    def test_gpu_is_a_server_setting(self):
+        with self.assertRaisesRegex(ValueError, "cli: --peer-device is not an engine flag"):
+            check_engine_flags(["--peer-device", "1"], {"--gpu"}, "cli")
+        with self.assertRaisesRegex(ValueError, "gpu is a server setting"):
+            check_engine_flags(["--gpu", "0,1"], {"--gpu"}, "--config c.json")
 
     def test_extras(self):
         self.assertEqual(split_engine_extras(["--kv", "int8", "--resident-experts", "--seed=3", "--x", "-1"]),

@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ENGINE = Path(os.environ.get("BASALT_BIN", ROOT / "bin" / "basalt"))
 BENCH = Path(os.environ.get("BASALT_BENCH_BIN", ROOT / "bin" / "basalt-bench"))
 # bench's own options that share an engine flag's name
-BENCH_OWNED = {"--help", "--model", "--engine", "--spec", "--set", "--seed"}
+BENCH_OWNED = {"--help", "--model", "--engine", "--spec", "--set", "--seed", "--gpu"}
 
 
 def engine_flags() -> list[str]:
@@ -47,7 +47,7 @@ class BenchFlags(unittest.TestCase):
         parsed = set(re.findall(r'a == "(--[a-z0-9-]+)"', (ROOT / "src/program/generate.cpp").read_text()))
         self.assertTrue(parsed)
         self.assertEqual(sorted(set(flags) - parsed), [])
-        for known in ("--spec", "--kv", "--max-context", "--peer-device"):
+        for known in ("--spec", "--kv", "--max-context", "--gpu"):
             self.assertIn(known, flags)
 
     def test_every_engine_flag_reaches_the_engine(self):

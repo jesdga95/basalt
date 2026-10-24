@@ -116,6 +116,33 @@ uint64_t PeerExperts::device_overhead_bytes() {
 bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
                        ExpertSource& src, int64_t n_layers, int64_t n_expert, int reserve_mib, int64_t max_slots,
                        std::string& err, bool exclusive) {
+    if (!prepare(device, src, n_layers, n_expert, err)) return false;
+    // the pairs the primary does not hold, in rank order, as many as fit
+    On on(device);
+    size_t free_b = 0, total_b = 0;
+    if (!ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo", err)) { close(); return false; }
+    const uint64_t reserve = (uint64_t) std::max(reserve_mib, 128) << 20;
+    const uint64_t budget = free_b > reserve ? free_b - reserve : 0;
+    std::vector<std::pair<int32_t, int32_t>> pick;
+    uint64_t used = 0;
+    for (const auto& pr : ranked) {
+        if (primary.slot_of(pr.first, pr.second) >= 0) continue;
+        const uint64_t b256 = slot_bytes(pr.first);
+        if (used + b256 > budget) break;
+        if (max_slots > 0 && (int64_t) pick.size() >= max_slots) break;
+        used += b256;
+        pick.push_back(pr);
+    }
+    return fill(pick, err, exclusive);
+}
+
+uint64_t PeerExperts::slot_bytes(int64_t layer) {
+    const auto& lay = basalt::kernels::cpu::expert_layout();
+    const uint64_t b = lay.blob_bytes(layer);
+    return lay.native ? (b + 255) / 256 * 256 : lay.max_blob;
+}
+
+bool PeerExperts::prepare(int device, ExpertSource& src, int64_t n_layers, int64_t n_expert, std::string& err) {
     close();
     int count = 0;
     if (!ck(cudaGetDeviceCount(&count), "cudaGetDeviceCount", err)) return false;
@@ -124,7 +151,6 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
               " devices; set CUDA_VISIBLE_DEVICES)";
         return false;
     }
-    const auto& lay = basalt::kernels::cpu::expert_layout();
     n_layers_ = n_layers;
     n_expert_ = n_expert;
     src_ = &src;
@@ -163,26 +189,18 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
         ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (H / 32) * 36), "activations", err) &&
         ck(cudaMalloc(&d_scratch_, scratch), "scratch", err);
     if (!alloc_ok) { close(); return false; }
+    return true;
+}
 
-    // the pairs the primary does not hold, in rank order, as many as fit
-    size_t free_b = 0, total_b = 0;
-    if (!ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo", err)) { close(); return false; }
-    const uint64_t reserve = (uint64_t) std::max(reserve_mib, 128) << 20;
-    const uint64_t budget = free_b > reserve ? free_b - reserve : 0;
-    std::vector<std::pair<int32_t, int32_t>> pick;
-    std::vector<int64_t> sizes;
-    uint64_t used = 0;
-    for (const auto& pr : ranked) {
-        if (primary.slot_of(pr.first, pr.second) >= 0) continue;
-        const uint64_t b = lay.blob_bytes(pr.first);
-        const uint64_t b256 = lay.native ? (b + 255) / 256 * 256 : lay.max_blob;
-        if (used + b256 > budget) break;
-        if (max_slots > 0 && (int64_t) pick.size() >= max_slots) break;
-        used += b256;
-        pick.push_back(pr);
-        sizes.push_back((int64_t) b);
-    }
+bool PeerExperts::fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std::string& err, bool exclusive) {
+    const auto& lay = basalt::kernels::cpu::expert_layout();
+    const int device = device_;
+    const int64_t n_layers = n_layers_, n_expert = n_expert_;
+    ExpertSource& src = *src_;
+    On on(device);
     if (pick.empty()) { err = "peer experts: no room or no expert left for the peer"; close(); return false; }
+    std::vector<int64_t> sizes;
+    for (const auto& pr : pick) sizes.push_back((int64_t) lay.blob_bytes(pr.first));
     const bool opened = lay.native ? cache_.open_sized(sizes, n_layers, n_expert, err)
                                    : cache_.open((int64_t) pick.size(), n_layers, n_expert, (int64_t) lay.max_blob, err);
     if (!opened) { err = "peer experts: " + err; close(); return false; }

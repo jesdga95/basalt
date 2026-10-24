@@ -107,7 +107,7 @@ __global__ void dm_combine_kernel(const float* __restrict__ parts, const float* 
         const int64_t off = (tk * k + j) * n_embd + col;
         const int kd = s_kind[j];
         if (kd == 0) return __fadd_rn(0.0f, parts[off]);
-        return __ldcv(kd == 2 ? peer_rows + off : cpu_rows + off);
+        return __ldcv(kd >= 2 ? peer_rows + off : cpu_rows + off);
     };
     float sum = row(0) * weights[0];
     for (int expert = 1; expert < k; ++expert) {
@@ -138,7 +138,7 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
     float w[KM];
     // the mapped rows are read in place; a peer row's own words say it arrived, so its first read needs no wait
     auto mapped_row = [&](int j, int kd) {
-        return reinterpret_cast<const float4*>((kd == 2 ? peer_rows : cpu_rows) + (tk * k + j) * n_embd + col);
+        return reinterpret_cast<const float4*>((kd >= 2 ? peer_rows : cpu_rows) + (tk * k + j) * n_embd + col);
     };
 #pragma unroll
     for (int j = 0; j < KM; ++j) {
@@ -147,7 +147,7 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
         if (s_kind[j] == 0) {
             const float4 p = *reinterpret_cast<const float4*>(parts + (tk * k + j) * n_embd + col);
             v[j] = make_float4(__fadd_rn(0.0f, p.x), __fadd_rn(0.0f, p.y), __fadd_rn(0.0f, p.z), __fadd_rn(0.0f, p.w));
-        } else if (TAG && s_kind[j] == 2) {
+        } else if (TAG && s_kind[j] >= 2) {
             v[j] = __ldcv(mapped_row(j, 2));
         }
     }
@@ -158,7 +158,7 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
     for (int j = 0; j < KM; ++j) {
         if (j >= k) break;
         const int kd = s_kind[j];
-        if (kd != 0 && !(TAG && kd == 2)) v[j] = __ldcv(mapped_row(j, kd));
+        if (kd != 0 && !(TAG && kd >= 2)) v[j] = __ldcv(mapped_row(j, kd));
     }
     if constexpr (TAG) {
         // a peer row still holding the tag word is read again until none is; a released window (tag_done past ring)
@@ -167,7 +167,7 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
 #pragma unroll
         for (int j = 0; j < KM; ++j) {
             if (j >= k) break;
-            if (s_kind[j] != 2) continue;
+            if (s_kind[j] < 2) continue;
             float4* const src = const_cast<float4*>(mapped_row(j, 2));
             unsigned spins = 0;
             bool rel = false;

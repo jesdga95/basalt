@@ -81,7 +81,7 @@ Basalt's numbers, and the forced-window identity check (run with `--t` 1, 3 and 
 
 ```sh
 python3 tools/ppl_gate.py --model PACK.basalt --engine-bin bin/basalt --base flashnext-q8-base.kld \
-    --chunks 20 --t {1|3|7} --out DIR --expert-cache N --peer-slots M --kv int8 --resident-experts \
+    --chunks 20 --t {1|3|7} --out DIR --expert-cache N --kv int8 --resident-experts \
     --peer-exclusive --prefill auto
 python3 tools/ppl_gate.py --diff DIR1/rows.tsv DIR7/rows.tsv
 ```
@@ -90,8 +90,8 @@ MTP on/off identity: one engine session per configuration, driven over `--serve`
 
 ```sh
 bin/basalt --serve --model MODEL.basalt {--spec 0 | --spec 7} \
-    --expert-cache N --peer-slots M --prefill auto --kv int8 --vram-reserve-mib 700 --resident-experts \
-    --peer-exclusive --peer-device 1 --max-context 8192 --adapt-swaps 0 --peer-adapt-swaps 0 \
+    --expert-cache N --prefill auto --kv int8 --vram-reserve-mib 700 --resident-experts \
+    --peer-exclusive --gpu 0,1 --max-context 8192 --adapt-swaps 0 --peer-adapt-swaps 0 \
     --exp concur9_logit_hash=1
 ```
 

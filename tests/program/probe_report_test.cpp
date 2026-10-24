@@ -77,13 +77,13 @@ int main() {
     in.engine_context = 8192;
     in.speeds = speeds(120, 130, 125);
     in.suggested = {"--pool-workers 8 (52 us/expert, best 51 us)"};
-    in.config = "--peer-device 1";
+    in.config = "--gpu 0,1";
     const std::string rep = format_report(in);
     CHECK(rep.find("  5090 1542 GB/s | 5060 Ti 390 GB/s | PCIe 28.9 GB/s | RAM 56 GB/s\n") != std::string::npos);
     CHECK(rep.find("  experts 5090 9460 / 5060 Ti 5704 / RAM rest | KV int8 | ctx 8k\n") != std::string::npos);
     CHECK(rep.find("  decode cold  prose 125 conv 120 struct 130 tok/s (measured)\n") != std::string::npos);
     CHECK(rep.find("warm") == std::string::npos && rep.find("PASS") == std::string::npos && rep.find("predicted") == std::string::npos);
-    CHECK(rep.find("  suggested: --pool-workers 8 (52 us/expert, best 51 us)\n  config: --peer-device 1\n") != std::string::npos);
+    CHECK(rep.find("  suggested: --pool-workers 8 (52 us/expert, best 51 us)\n  config: --gpu 0,1\n") != std::string::npos);
     CHECK(rep.find(kProbeDisclaimer) != std::string::npos);
 
     if (failures) return 1;

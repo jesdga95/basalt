@@ -266,20 +266,19 @@ class EngineStderr(unittest.TestCase):
 
 
 class GpusInPlay(unittest.TestCase):
-    def test_the_peer_card_is_read_too(self):
-        cfg = {"gpu": "0,1"}
-        self.assertEqual(gpus_in_play(cfg, ["--peer-device", "1", "--context", "4096"]), [0, 1])
-        self.assertEqual(gpus_in_play(cfg, ["--peer-device=1"]), [0, 1])
-        self.assertEqual(gpus_in_play(cfg, []), [0])
+    def test_every_chosen_card_is_read(self):
+        self.assertEqual(gpus_in_play({"gpu": "0,1"}), [0, 1])
+        self.assertEqual(gpus_in_play({"gpu": "1,3"}), [1, 3])
+        self.assertEqual(gpus_in_play({"gpu": "1,0"}), [1, 0])
 
-    def test_the_peer_is_the_nth_listed_card(self):
-        self.assertEqual(gpus_in_play({"gpu": "1,3"}, ["--peer-device", "1"]), [1, 3])
+    def test_the_plan_numbers_win(self):
+        # a card the environment named by UUID: the engine's plan carries its nvidia-smi number
+        self.assertEqual(gpus_in_play({"gpu": "GPU-ab,1", "gpu_smi": [2, 1]}), [2, 1])
 
     def test_defaults(self):
-        self.assertEqual(gpus_in_play({"gpu": "0,2"}, []), [0])
-        self.assertEqual(gpus_in_play({}, []), [0])
-        self.assertEqual(gpus_in_play({"gpu": 2}, []), [2])
-        self.assertEqual(gpus_in_play({"gpu": 2}, ["--peer-device"]), [2])                  # a flag with no value
+        self.assertEqual(gpus_in_play({}), [0])
+        self.assertEqual(gpus_in_play({"gpu": 2}), [2])
+        self.assertEqual(gpus_in_play({"gpu": "auto"}), [0])
 
 
 if __name__ == "__main__":

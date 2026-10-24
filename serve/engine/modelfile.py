@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -14,13 +13,6 @@ sys.path.insert(0, str(ROOT / "tools"))
 from model_file import ModelFile  # noqa: E402
 
 VISION_EXE = "basalt-vision"
-
-
-def peer_tier_supported() -> bool:
-    """Whether the engine on this platform takes a peer expert tier. It refuses `--peer-device` where a process is
-    given no GPU-to-GPU access between its devices, so offering that flag as a default there would stop the server
-    from starting on a machine that merely has two cards in it."""
-    return os.name != "nt"
 
 
 def cache_root() -> Path:
@@ -77,18 +69,6 @@ def extract_tokenizer(mf: ModelFile) -> Path:
     return out
 
 
-def gpu_count(visible_env: str | None = None) -> int:
-    """The NVIDIA GPUs this process can see: CUDA_VISIBLE_DEVICES when set, else what nvidia-smi lists."""
-    v = os.environ.get("CUDA_VISIBLE_DEVICES") if visible_env is None else visible_env
-    if v is not None:
-        return len([x for x in v.split(",") if x.strip() and x.strip() != "-1"])
-    try:
-        out = subprocess.run(["nvidia-smi", "--list-gpus"], capture_output=True, text=True, timeout=10).stdout
-    except (OSError, subprocess.SubprocessError):
-        return 0
-    return sum(1 for line in out.splitlines() if line.startswith("GPU "))
-
-
 def vision_config(mf: ModelFile, engine_bin: str, sidecar: bool = True) -> dict:
     """The vision sidecar's config (the projector alone without `sidecar`); ValueError names what is missing."""
     side = Path(engine_bin).resolve().parent / VISION_EXE
@@ -106,19 +86,16 @@ def vision_config(mf: ModelFile, engine_bin: str, sidecar: bool = True) -> dict:
     return {"vision_bin": str(side), "mmproj": str(mmproj), "model": str(vocab)}
 
 
-def model_config(path: str, engine_bin: str, gpus: int | None = None, vision: bool | str = False,
+def model_config(path: str, engine_bin: str, vision: bool | str = False,
                  engine_words: list[str] | None = None) -> dict:
     """The engine settings the file implies; `engine_words` follow its arguments as given (the engine's parser lets a
     later flag win), `vision` (True, "peer"
-    or "cpu") adds the sidecar and "dynamic" the in-engine encoder (ValueError if it cannot be set up). A second
-    visible GPU becomes the peer tier, where the engine takes one."""
+    or "cpu") adds the sidecar and "dynamic" the in-engine encoder (ValueError if it cannot be set up)."""
     mf = ModelFile(path)
     meta = json.loads(mf.read("meta"))
     path = os.path.abspath(path)
     words = list(engine_words or [])
     args = ["--model", path]   # settings come from the engine defaults and the server
-    if peer_tier_supported() and "--peer-device" not in words and (gpu_count() if gpus is None else gpus) > 1:
-        args += ["--peer-device", "1"]
     args += words
     cdir = cache_dir(mf)
     cdir.mkdir(parents=True, exist_ok=True)

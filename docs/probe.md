@@ -12,7 +12,8 @@ basalt-probe --model PACK.basalt -- ENGINE FLAGS...
 |---|---|
 | `--model FILE` | the model file |
 | `--engine BIN`, `--fixtures DIR`, `--logs DIR` | as for `basalt-bench` |
-| `-- ARGS` | engine flags, as for `basalt-bench` (`--peer-device`, `--kv`, `--spec`, `--expert-cache`, ...). Nothing is added except a `--max-context` that fits the fixtures when none is given: the report prints the flags that produced its numbers |
+| `--gpu A,B,..` or `--gpu auto` | the cards, as for the server ([GPUs](configuration/gpus.md)); default GPU 0 alone |
+| `-- ARGS` | engine flags, as for `basalt-bench` (`--kv`, `--spec`, `--expert-cache`, ...). Nothing is added except a `--max-context` that fits the fixtures when none is given: the report prints the flags that produced its numbers |
 
 ## What it does
 
@@ -56,7 +57,7 @@ basalt-probe
   decode cold  prose 194 conv 255 struct 223 tok/s (measured)
   suggested: --pool-workers 8 (52 us/expert, best 51 us)
   suggested: --prefill-cpu-share 0.45 (prefill +9%)
-  config: --peer-device 1 --kv int8 ...
+  config: --gpu 0,1 --kv int8 ...
   Measured on this machine. Hand-tuned settings can still beat these.
 ```
 

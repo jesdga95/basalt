@@ -18,8 +18,8 @@ solo session of the same length, come out of the expert cache.
 
 Every chat, messages and responses request must name the served model in `model`: the alias (or the model's name) that `/v1/models` lists, or the model file's name. An unknown or missing name is a 404 in the API's own error shape, and replies always carry the served name.
 
-With `--max-context` above 32768 the KV cache is elastic (not when the model is split over GPUs with `--layer-split`, a peer
-card is fine, and not with `--kv-resident` or `--vram-elastic`): each session backs its first 32768
+With `--max-context` above 32768 the KV cache is elastic (not with `--kv-resident` or `--vram-elastic`; a peer card is
+fine): each session backs its first 32768
 cells at startup (the K/V pools, the indexer's block keys, the RoPE tables and the draft layer's K/V alike), and the
 rest of that VRAM holds the expert cache's last slots until a request needs it. A request backs its prompt plus 16384 cells before the prompt is read (and 16384 more whenever decode runs past that) by taking
 those slots back; their experts become CPU misses read from their RAM copies, which the RAM copy keeps for exactly this.

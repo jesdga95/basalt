@@ -15,6 +15,7 @@
 #include "basalt/platform/process.hpp"
 #include "basalt/platform/system.hpp"
 #include "basalt/program/engine_session.hpp"
+#include "basalt/program/gpu_select.hpp"
 #include "basalt/program/probe_derive.hpp"
 #include "basalt/program/probe_report.hpp"
 #include "basalt/log.hpp"
@@ -52,7 +53,8 @@ void usage() {
         "  --engine BIN          engine binary (default: the one built with this program)\n"
         "  --fixtures DIR        fixture ids (default %s)\n"
         "  --logs DIR            keep the engine log there\n"
-        "  -- ARGS...            engine flags, as for basalt-bench (--peer-device, --kv, --spec, ...)\n"
+        "  --gpu A,B,..|auto     the GPUs, as for the server and the engine (default: GPU 0 alone)\n"
+        "  -- ARGS...            engine flags, as for basalt-bench (--kv, --spec, ...)\n"
         "\n"
         "It runs conv, struct and prose once each (cold: the first request after load counts), %lld tokens each,\n"
         "greedy. Nothing is saved.\n",
@@ -80,6 +82,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else if (a == "--engine") o.engine = next("--engine");
         else if (a == "--fixtures") o.fixtures = next("--fixtures");
         else if (a == "--logs") o.logs = next("--logs");
+        else if (a == "--gpu") o.passthrough.insert(o.passthrough.end(), {a, next("--gpu")});
         else err = "unknown argument " + a + " (engine flags go after --; see --help)";
         if (!err.empty()) return false;
     }
@@ -159,6 +162,16 @@ int main(int argc, char** argv) {
 
     std::vector<std::string> args = {"--model", fs::absolute(o.model).string()};
     merge_args(args, o.passthrough);
+    // the GPUs, chosen here once as the server chooses them: the engine sees only those cards and says nothing again
+    {
+        std::string gpu_value;
+        std::vector<GpuCard> used;
+        if (!select_gpus(arg_value(args, "--gpu"), "basalt-probe", gpu_value, used, err)) {
+            basalt::log::error("basalt-probe", "%s", err.c_str());
+            return 2;
+        }
+        set_arg(args, "--gpu", gpu_value);
+    }
 
     // fixtures
     std::vector<std::vector<int64_t>> ids(3);

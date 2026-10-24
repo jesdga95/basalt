@@ -4,7 +4,7 @@ The decode-path tables are in [index.md](index.md); the quality method is in [qu
 
 ## What the split changes
 
-With a peer card (`--peer-device`) whose memory is faster than the main card's, the start plans each GDN layer's mixer
+With a peer card (`gpu 0,1`) whose memory is faster than the main card's, the start plans each GDN layer's mixer
 (qkv and z projections, recurrence, gated norm, out projection) split by key head: the peer takes a share that follows
 both cards' memory bandwidth, in whole key-head units (a quarter at least, the main card keeps one at least), and one
 start line says so. The split is taken only when the decode time it saves on the main card beats the cost of the experts its peer reserve
