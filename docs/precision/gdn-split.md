@@ -7,7 +7,8 @@ The decode-path tables are in [index.md](index.md); the quality method is in [qu
 With a peer card (`--peer-device`) whose memory is faster than the main card's, the start plans each GDN layer's mixer
 (qkv and z projections, recurrence, gated norm, out projection) split by key head: the peer takes a share that follows
 both cards' memory bandwidth, in whole key-head units (a quarter at least, the main card keeps one at least), and one
-start line says so. With a slower peer, the usual card order, the split is not taken: the whole mixer stays on the main
+start line says so. The split is taken only when the decode time it saves on the main card beats the cost of the experts its peer reserve
+displaces to RAM (priced once at start; the prompt path is not priced). With a slower peer, the usual card order, it is not taken: the whole mixer stays on the main
 card and the output is bitwise what it was before the split existed (greedy identical, 1,200 tokens over 3 requests,
 NVFP4 pack, 400 W main card and 180 W peer). Every change below applies only when the split is on.
 
