@@ -177,6 +177,8 @@ private:
     /// The host's waits, bounded by `kStall`.
     void wait_parked(const char* what);
     void wait_done(int n);
+    /// The wait of a fused batch's down part for its expert's quantized intermediate, bounded the same way.
+    void wait_ready(int e);
     /// After a stall was logged: release the GPU's waits, then stop the process.
     [[noreturn]] static void stalled();
     /// Bump `epoch_`, and wake the workers that went to sleep.  Every publish goes through here.

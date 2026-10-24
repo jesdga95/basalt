@@ -236,6 +236,20 @@ void ExpertPool::wait_done(int n) {
     }
 }
 
+void ExpertPool::wait_ready(int e) {
+    StallClock clock;
+    while (fused_[(size_t) e].ready.load(std::memory_order_acquire) == 0) {
+        _mm_pause();
+        if (clock.expired(done_.load(std::memory_order_relaxed))) {
+            basalt::log::error("basalt", "the CPU expert pool stalled: the gate/up rows of expert %d of the batch did not finish "
+                                 "(%u of %d tasks done, %u of %d workers parked) - stopping the engine so the server can "
+                                 "start it again",
+                         e, done_.load(), njobs_, parked_.load(), n_);
+            stalled();
+        }
+    }
+}
+
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     (void) id;
     for (;;) {
@@ -270,8 +284,8 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 }
             } else {
                 const int k = (int) i - n * pg, e = k / pd, part = k % pd;
-                // every gate/up task is claimed before any down task, and a claimed task always finishes
-                while (fused_[(size_t) e].ready.load(std::memory_order_acquire) == 0) _mm_pause();
+                // every gate/up task is claimed before any down task, so this waits only for tasks already running
+                if (fused_[(size_t) e].ready.load(std::memory_order_acquire) == 0) wait_ready(e);
                 native_down_range(e, H * part / pd, H * (part + 1) / pd);
             }
         } else {
