@@ -6121,6 +6121,8 @@ int main(int argc, char** argv) {
         // from here a request that runs the RAM below the floor stops with an error instead of the machine swapping
         const uint64_t guard_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), tier_file_bytes);
         basalt::platform::start_ram_guard(guard_floor);
+        // a VRAM shrink's RAM homes leave the guard's floor above the margin and the top-up's own slack free
+        src.set_homes_reserve(guard_floor - std::min(guard_floor, basalt::platform::ram_margin()) + (256ull << 20));
         if (const uint64_t avail = basalt::platform::available_memory(); avail > 0)
             basalt::log::info("basalt serve", "RAM %.2f GiB free, guard %.2f GiB, %.2f GiB kept for serving",
                          (double) avail / 1073741824.0, (double) guard_floor / 1073741824.0,
@@ -6244,12 +6246,16 @@ int main(int argc, char** argv) {
                 const size_t bytes = (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(give[k].first);
                 if (cudaMemcpyAsync(dst[k], xcache.device_slot(slots[k]), bytes, cudaMemcpyDeviceToHost, 0) != cudaSuccess) {
                     e = std::string("copying an expert to RAM failed: ") + cudaGetErrorString(cudaGetLastError());
+                    (void) cudaDeviceSynchronize();   // queued copies stop writing before their regions are freed
+                    (void) cudaGetLastError();
                     src.homes_abort();
                     return false;
                 }
             }
             if (cudaDeviceSynchronize() != cudaSuccess) {
                 e = std::string("copying the experts to RAM failed: ") + cudaGetErrorString(cudaGetLastError());
+                (void) cudaDeviceSynchronize();
+                (void) cudaGetLastError();
                 src.homes_abort();
                 return false;
             }
@@ -6300,7 +6306,8 @@ int main(int argc, char** argv) {
                     note = " (the cache keeps its smallest size: the prompt path's buffers)";
                 }
                 if (!home_given_up(xcache.slots_after_shrink(keep), e)) { e = "VRAM: " + e + " (nothing changed)"; return false; }
-                if (!xcache.shrink(keep, e)) return false;
+                // the homes are committed by now: whatever the shrink left or took is followed from the cache itself
+                const bool shrunk = xcache.shrink(keep, e);
                 const int64_t live = xcache.slots();
                 for (size_t i = 0; i < host_res.size(); ++i)
                     if (host_res[i] >= live) {
@@ -6308,6 +6315,7 @@ int main(int argc, char** argv) {
                         host_res[i] = basalt::core::kNotResident;
                     }
                 res_upload();
+                if (!shrunk) return false;
             } else if (mapped < xcache.full_bytes()) {
                 std::string gerr;
                 if (!xcache.grow(mapped + ((int64_t) free_b - want_free), gerr)) note = " (" + gerr + ")";
@@ -6344,16 +6352,18 @@ int main(int argc, char** argv) {
                 // the slots hold the experts again: every expert in a slot below the loan has its RAM home freed (the
                 // copy is the slots' now: those given up, those the loan range kept, and those the adaptive tier moved
                 // back).  The loan's own slots keep theirs: a prompt overwrites them and reads those experts from RAM.
-                const int64_t loan_from = pf_parts.empty() || pf_parts[0].first < 0 ? INT64_MAX : pf_parts[0].first;
-                size_t released = 0;
-                for (size_t j = 0; j < host_res.size(); ++j)
-                    if (host_res[j] >= 0 && host_res[j] < loan_from &&
-                        src.home_release((int64_t) j / g.n_expert, (int64_t) j % g.n_expert))
-                        ++released;
-                const uint64_t freed = src.homes_reclaim() + src.homes_compact();
-                basalt::log::info("basalt serve", "VRAM: %zu RAM homes released, %.0f MiB freed, %.0f MiB kept for the "
-                                  "prompt loan (slots from %lld)", released, (double) freed / 1048576.0,
-                                  (double) src.homes_bytes() / 1048576.0, (long long) std::min<int64_t>(loan_from, live));
+                if (src.complement_ready()) {
+                    const int64_t loan_from = pf_parts.empty() || pf_parts[0].first < 0 ? INT64_MAX : pf_parts[0].first;
+                    size_t released = 0;
+                    for (size_t j = 0; j < host_res.size(); ++j)
+                        if (host_res[j] >= 0 && host_res[j] < loan_from &&
+                            src.home_release((int64_t) j / g.n_expert, (int64_t) j % g.n_expert))
+                            ++released;
+                    const uint64_t freed = src.homes_reclaim() + src.homes_compact();
+                    basalt::log::info("basalt serve", "VRAM: %zu RAM homes released, %.0f MiB freed, %.0f MiB kept for the "
+                                      "prompt loan (slots from %lld)", released, (double) freed / 1048576.0,
+                                      (double) src.homes_bytes() / 1048576.0, (long long) std::min<int64_t>(loan_from, live));
+                }
             }
             relend();
             cudaMemGetInfo(&free_b, &total_b);
