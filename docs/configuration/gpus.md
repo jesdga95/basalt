@@ -49,3 +49,19 @@ Only cards that match (memory bandwidth and VRAM within 10%) may pick a mechanis
 when it prices at least 5% below it. Unlike cards always use the expert tier. The prices are estimates fitted to
 measured windows (a 5090 with a 5060 Ti: tier 8.0 ms, layer split 13.8 ms at the best cut; two 5080s: 147 tok/s
 reported against 141 priced), good for the choice and not for forecasting a rate.
+
+## Two 16 GB cards
+
+`gpu "0,1"` with two cards of 16 GB (two RTX 5080s, say) runs the expert tier: each card holds experts in what its VRAM has
+left, and the second card also reads its experts' share of each prompt. The engine sizes the second card's tier to leave
+room for the buffers of that share (about 200 MiB, the size is computed, not a setting) and `peer-reserve-mib` more
+(default 600 MiB; at least 128) for everything else the card needs after its experts are in. If the start prints
+`prefill peer: the peer's buffers do not fit`, raise `peer-reserve-mib` (the card shows a display or another program using
+its VRAM) and the second card's experts shrink by the same amount. The start line `peer GPU 1: N experts` says how many
+it holds.
+
+## The engine log
+
+The server writes the engine's output, the `basalt ...` lines the engine prints at start and while it runs, to
+`~/.cache/basalt/<id>/engine.log`, one folder per model file (`<id>` is 16 hex digits taken from the model file).
+`[server] engine log: PATH` names it when the engine stops. The `[server]` lines are the server's own and go to its terminal.
