@@ -210,6 +210,7 @@ struct Options {
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
+    int conversation_cache_min_tokens = 0;   ///< --serve: park only conversations of at least N tokens (0 = park every one)
     /// --serve: the folder of the disk tier (the server names one inside the model cache folder): a conversation
     /// that leaves the session or the RAM cache, and every one the process holds when it ends, is written there and
     /// read back when a prompt starts with it, after a restart too (conversation_store.hpp)

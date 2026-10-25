@@ -103,6 +103,13 @@ bool Runtime::capture_admit(uint64_t need, uint64_t floor) {
 bool Runtime::park_current(size_t held, int64_t kept) {
     ckd_finish();
     if ((!conversations->enabled() && !disk.enabled()) || !live_ok || live.empty()) return true;
+    // the short one-shot requests of agent traffic park, take a slot and - make_room evicts oldest-first -
+    // push out the conversation whose reuse pays; below the minimum they store nothing and evict nothing
+    if (o.conversation_cache_min_tokens > 0 && (int) live.size() < o.conversation_cache_min_tokens) {
+        basalt::log::info("basalt serve", "conversation cache: skip parking (%zu tokens, below the %d "
+                     "minimum; parked=%zu)", live.size(), o.conversation_cache_min_tokens, conversations->size());
+        return true;
+    }
     // the disk tier takes the image when there is no RAM tier or it cannot make room, unless the conversation is
     // short or stored already, or the request goes on from the chain's deepest checkpoint (the same
     // conversation's next turn: all it drops is the last reply)
