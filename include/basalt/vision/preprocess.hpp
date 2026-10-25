@@ -1,9 +1,8 @@
 // basalt/vision/preprocess.hpp - an image to the encoder's input: decode, fit to the token budget, normalise.
 //
-// The picture is resized (Pillow-style bicubic) to a multiple of 32 pixels on each side inside the token budget,
-// letterboxed in black when the rounded size is not its aspect ratio, normalised to [-1, 1] and cut into 16x16
-// patches ordered by 2x2 merge group.  Every step is deterministic integer or float math so the result is
-// reproducible bit for bit.
+// The picture is resized (Pillow-style bicubic) straight to a multiple of 32 pixels on each side inside the token
+// budget, normalised to [-1, 1] and cut into 16x16 patches ordered by 2x2 merge group.  Every step is deterministic
+// integer or floating-point math so the result is reproducible bit for bit.
 #pragma once
 
 #include <cstddef>
@@ -36,7 +35,7 @@ bool decode_image(const uint8_t* data, size_t len, Image& out, std::string& err)
 /// The canvas size for a w x h picture: a multiple of patch * merge, within [min_tokens, max_tokens] merged tokens.
 Size fit_size(int w, int h, const Geometry& g);
 
-/// The picture on a `target` canvas: scaled to fit (never beyond the canvas), centred, black elsewhere.
+/// The picture resized to the `target` canvas, each side on its own (no padding).
 Image to_canvas(const Image& src, Size target);
 
 /// The canvas as planar float [3][h][w], (v / 255 - 0.5) / 0.5.
