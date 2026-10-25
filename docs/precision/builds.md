@@ -27,7 +27,9 @@ port changed, so the Linux numbers are unchanged from before it.
 
 Scope: these two programs cover the Q2_0 expert kernel and the expert pool. The quantized kernels (`iq_avx512`,
 `iq_avx2`, `kq_avx2`, `kq_avx1`, `native_expert`, `ggml_cpu_dots`) are compiled by both toolchains as well but no
-program here exercises them with real weights, so this table is not evidence about them.
+program here exercises them with real weights, so this table is not evidence about them. (`iq_avx2_test` and
+`pool_native_test` run the AVX2 i-quant rows and the pool's native path on random blobs with the model's geometry, on any
+AVX2 CPU; their results are not in this table.)
 
 ### Greedy tokens are not identical across the two builds
 

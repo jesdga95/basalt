@@ -118,10 +118,12 @@ endfunction()
 if(MSVC)
   set(_isa_avx512_flags "/arch:AVX512;-D__F16C__=1;-D__AVX512VNNI__=1;-D__AVX512VBMI__=1")
   set(_isa_avx2_flags "/arch:AVX2;-D__F16C__=1")
+  set(_isa_avxvnni_flags "/arch:AVX2;-D__F16C__=1")
   set(_isa_avx1_flags "/arch:AVX")
 else()
   set(_isa_avx512_flags "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
   set(_isa_avx2_flags "-mavx2;-mfma;-mf16c")
+  set(_isa_avxvnni_flags "-mavx2;-mfma;-mf16c;-mavxvnni")
   set(_isa_avx1_flags "-mavx")
 endif()
 
@@ -1072,7 +1074,8 @@ endforeach()
 target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
                                          src/kernels/cpu/nvfp4_avx512.cpp
                                          src/kernels/cpu/nvfp4_avx2.cpp
-                                         src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
+                                         src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/iq_avx2_vnni.cpp
+                                         src/kernels/cpu/kq_avx2.cpp
                                          src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/ggml/ggml_cpu_dispatch.cpp
                                          $<TARGET_OBJECTS:ggml_dots_avx2> $<TARGET_OBJECTS:ggml_dots_avx512>)
 set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
@@ -1080,6 +1083,8 @@ set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPT
 set_source_files_properties(src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS
                             "${_isa_avx512_flags}")
 set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+# the same rows with the AVX-VNNI instructions, called only behind cpu_avxvnni_ok()
+set_source_files_properties(src/kernels/cpu/iq_avx2_vnni.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnni_flags}")
 set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
 set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
 # the router lookahead's AVX1 dot (called behind cpu_avx1_ok)
@@ -1269,6 +1274,14 @@ if(BUILD_TESTING)
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE kernels_cpu)
   basalt_cpu_test(NAME pool_stress COMMAND pool_stress 20)
+  # the multi-token native path against a serial reference, bitwise, at several worker counts
+  add_executable(pool_native_test src/kernels/cpu/pool_native_test.cpp)
+  target_link_libraries(pool_native_test PRIVATE kernels_cpu platform)
+  basalt_cpu_test(NAME pool_native_test COMMAND pool_native_test)
+  # the AVX2 i-quant rows: the madd build against the AVX-VNNI build (bitwise) and a double reference
+  add_executable(iq_avx2_test src/kernels/cpu/iq_avx2_test.cpp)
+  target_link_libraries(iq_avx2_test PRIVATE kernels_cpu platform)
+  basalt_cpu_test(NAME iq_avx2_test COMMAND iq_avx2_test)
 
   # DirectFile has a Linux backend and a Windows backend, and this test covers those two; macOS is not a platform
   # the engine builds for.
