@@ -4,7 +4,7 @@
 //
 // `run_split_multi_native` cuts a layer's experts into row ranges and hands them to the workers; whatever the
 // cut, every output row must be bitwise what one thread computes alone (the gate/up rows, the intermediate's
-// quantization, the down rows).  The check runs the formats of the i-quant packs on random blobs, 1 to 130
+// quantization, the down rows).  The check runs the formats of the i-quant and NVFP4 packs on random blobs, 1 to 130
 // experts (more than the pool's buffers too), 1 to 8 tokens per expert, at several active worker counts, with a
 // pause longer than the workers' spin in the middle, and fails on the first differing word or untouched output.
 // `--bench` prints the time and rate of one layer of 15 experts.
@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -31,8 +32,31 @@ namespace {
 constexpr int H = cpu::H, FF = cpu::FF, MAXT = cpu::MAXT;
 constexpr int kBlobs = 48;   // distinct blobs per format; experts index into them
 
+// NVFP4: rows quantized from random values with a spread of block scales, and the blob's FP32 scale tail.
+void fill_nvfp4_blob(uint8_t* p, const cpu::NativeFmt& f, uint64_t seed) {
+    std::mt19937 rng((uint32_t) seed);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::uniform_real_distribution<float> ex(-6.f, 2.f), ts(0.004f, 0.03f);
+    const auto* tr = ggml_get_type_traits(GGML_TYPE_NVFP4);
+    std::vector<float> row((size_t) std::max(f.n_embd, f.n_ff));
+    auto fill = [&](uint8_t* dst, int rows, int cols, size_t row_bytes) {
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; c += 16) {
+                const float m = std::exp2(ex(rng));
+                for (int j = 0; j < 16; ++j) row[(size_t) (c + j)] = nd(rng) * m;
+            }
+            tr->from_float_ref(row.data(), dst + (size_t) r * row_bytes, cols);
+        }
+    };
+    fill(p, 2 * FF, (int) f.n_embd, f.gu_row);
+    fill(p + f.down_off, H, (int) f.n_ff, f.d_row);
+    const float tail[4] = {ts(rng), ts(rng), ts(rng), 0.f};
+    std::memcpy(p + f.bytes - cpu::kNvfp4Tail, tail, sizeof tail);
+}
+
 // Random bytes with a valid small fp16 scale at the start of every block of the gate/up and down parts.
 void fill_blob(uint8_t* p, const cpu::NativeFmt& f, uint64_t seed) {
+    if (f.gu_type == GGML_TYPE_NVFP4) { fill_nvfp4_blob(p, f, seed); return; }
     std::mt19937_64 rng(seed);
     for (size_t i = 0; i + 8 <= f.bytes; i += 8) {
         const uint64_t v = rng();
@@ -103,7 +127,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     std::vector<Format> formats;
-    for (auto g : {std::pair<int, int>{22, 20}, {18, 20}, {21, 20}, {23, 20}, {22, 42}, {21, 42}, {42, 20}, {42, 42}}) {
+    for (auto g : {std::pair<int, int>{22, 20}, {18, 20}, {21, 20}, {23, 20}, {22, 42}, {21, 42}, {42, 20}, {42, 42}, {40, 40}}) {
         Format fm;
         fm.gu = g.first;
         fm.d = g.second;
