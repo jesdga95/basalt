@@ -471,8 +471,8 @@ __device__ __forceinline__ unsigned dm_ld_acquire(const unsigned* p) {
 // residency rows into shared memory (s_res: 2 * n_expert words); once the router items have written xq, its q8_1 rows
 // to mapped memory while the top-10 runs; once the ids are out, the kinds and the header, the peers' doorbells, then
 // the FFN input rows of the tokens with CPU entries and the host's doorbell.  It reads nothing the read writes before
-// those counts, so it needs no pdl_wait; it zeroes them for the layer's next window.
-__device__ void dm_glue_ring_pub(const DmRouteArgs& a, const void* xq, int tid, int32_t* s_res) {
+// those counts, so it needs no pdl_wait; with `reset` it zeroes them for the layer's next window.
+__device__ void dm_glue_ring_pub(const DmRouteArgs& a, const void* xq, int tid, int32_t* s_res, bool reset) {
     __shared__ int32_t r_ids[kDmCap], r_kind[kDmCap], r_pf[kDmCap], r_cnt[3 + kDmMaxX];
     __shared__ uint32_t r_tok;   // bit t: token t has CPU entries
     const int n = a.n_tok * a.k;
@@ -492,8 +492,10 @@ __device__ void dm_glue_ring_pub(const DmRouteArgs& a, const void* xq, int tid, 
     for (int i = tid; i < n16; i += blockDim.x) ((uint4*) a.xq_m)[i] = __ldcg((const uint4*) xq + i);
     if (tid == 0) {
         while (dm_ld_acquire(a.pub_ctr + 1) == 0u) __nanosleep(32);
-        a.pub_ctr[0] = 0u;
-        a.pub_ctr[1] = 0u;
+        if (reset) {
+            a.pub_ctr[0] = 0u;
+            a.pub_ctr[1] = 0u;
+        }
     }
     __syncthreads();
     if (tid < n) r_ids[tid] = __ldcg(a.ids + tid);
@@ -553,7 +555,7 @@ __global__ void __launch_bounds__(256, 2) dm_glue_gu_kernel(DmGlueArgs a, Native
     const int nwork = (int) gridDim.x - (a.ring_on ? 1 : 0);
     if (a.ring_on && (int) blockIdx.x == nwork) {   // the ring's block
         if (a.ring.pub_ctr != nullptr) {
-            dm_glue_ring_pub(a.ring, a.xq, tid, (int32_t*) s_tab);
+            dm_glue_ring_pub(a.ring, a.xq, tid, (int32_t*) s_tab, true);
             return;
         }
         if (tid < 32 && tid * 32 < a.n_expert) {   // the layer's residency rows into L2
@@ -745,9 +747,27 @@ __global__ void __launch_bounds__(256, 4) dm_glue_gu1_kernel(DmGlueArgs a, Nativ
     const bool lead = blockIdx.x == 0;
     if (!lead) pdl_trigger();
     const int nwork = (int) gridDim.x - (a.ring_on ? 1 : 0);
+    // after a read that counts its progress the blocks start on its counts, not its end, and the last block of the
+    // launch to finish (the ring's block among them) zeroes the counts
+    const bool counted = a.ring_on && a.ring.pub_ctr != nullptr;
+    const unsigned finishers = (unsigned) nwork + (counted ? 1u : 0u);
+    auto finish = [&] {
+        if (tid == 0) {
+            __threadfence();
+            if (atomicAdd(&g_dm_glue1_work[1], 1u) == finishers - 1u) {
+                g_dm_glue1_work[0] = 0u;
+                g_dm_glue1_work[1] = 0u;
+                if (counted) {
+                    a.ring.pub_ctr[0] = 0u;
+                    a.ring.pub_ctr[1] = 0u;
+                }
+            }
+        }
+    };
     if (a.ring_on && blockIdx.x == 1) {   // the ring's block
-        if (a.ring.pub_ctr != nullptr) {
-            dm_glue_ring_pub(a.ring, a.xq, tid, (int32_t*) s_tab);
+        if (counted) {
+            dm_glue_ring_pub(a.ring, a.xq, tid, (int32_t*) s_tab, false);
+            finish();
             return;
         }
         if (tid < 32 && tid * 32 < a.n_expert) {   // the layer's residency rows into L2
@@ -764,8 +784,16 @@ __global__ void __launch_bounds__(256, 4) dm_glue_gu1_kernel(DmGlueArgs a, Nativ
     if (tid == 0 && wb * 16 < a.n_expert)   // the layer's table into L2
         asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ptab + wb * 16));
     const int tok = tid / a.k, warp = tid >> 5, lane = tid & 31;
-    __syncthreads();
-    pdl_wait();
+    if (counted) {   // xq and the ids are out once both counts are in
+        if (tid == 0) {
+            while (dm_ld_acquire(a.ring.pub_ctr) < a.ring.pub_target) __nanosleep(32);
+            while (dm_ld_acquire(a.ring.pub_ctr + 1) == 0u) __nanosleep(32);
+        }
+        __syncthreads();
+    } else {
+        __syncthreads();
+        pdl_wait();
+    }
     const int32_t e0 = tid < n ? __ldcg(a.ids + tid) : -1;
     const bool inr = e0 >= 0 && e0 < a.n_expert;
     const unsigned long long praw = inr ? a.ptab[e0] : 0ull;
@@ -842,13 +870,7 @@ __global__ void __launch_bounds__(256, 4) dm_glue_gu1_kernel(DmGlueArgs a, Nativ
         __syncthreads();
         it = s_next[i & 1];
     }
-    if (tid == 0) {
-        __threadfence();
-        if (atomicAdd(&g_dm_glue1_work[1], 1u) == (unsigned) nwork - 1u) {
-            g_dm_glue1_work[0] = 0u;
-            g_dm_glue1_work[1] = 0u;
-        }
-    }
+    finish();
 }
 
 template<int TG> int dm_glue1_blocks() {

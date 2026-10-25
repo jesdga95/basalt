@@ -463,6 +463,8 @@ private:
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
     cudaStream_t sh_hi_ = nullptr;   // the shared expert's side stream at the greatest priority
+    cudaStream_t sh_hi2_ = nullptr;  // its up projection's, beside the gate projection
+    cudaEvent_t ev_sh2_ = nullptr;
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
     cudaStream_t qs_[3] = {nullptr, nullptr, nullptr};   // a QSA layer's branches
     cudaEvent_t qev_[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};

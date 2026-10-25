@@ -41,6 +41,7 @@ constexpr int WARPS = THREADS / 32;
 constexpr int NRT = 81;              // router items: the experts split over this many CTAs
 constexpr int SMEM = 98 * 1024;      // dynamic shared memory per CTA
 constexpr int RT_MAX_ROWS = (NE + NRT - 1) / NRT;   // router rows per router item
+static_assert(NE / NRT < RT_MAX_ROWS, "router item 0 has a spare row");
 
 // down items over half-streams (no norm tasks)
 constexpr int CN_HS = 2 * HC;                  // half-streams
@@ -759,10 +760,12 @@ __device__ __forceinline__ float warp_sum16_ftz(float (&v)[16], int lane) {
 // Router rows [e0, e1) (at most RT_MAX_ROWS, their weights at wsm): bf16_f32_mmvf_multi_kernel<256, *>'s per-row
 // order - thread t's pairs t + 256 j, two ordered FMAs each, the warp's xor tree, then the tree over the 8 warp sums
 // and 24 zeros - for every row and token at once; the xor trees run 16 values at a time (warp_sum16_ftz).
+// `sh`: one row more at wsm, the shared expert's gate input, whose dot gives gate_sh (shared_expert_multi's sigmoid).
 template <int T, int RMAX = RT_MAX_ROWS>
 __device__ void hc_router_rows(const HcFusedArgs& a, const uint16_t* wsm, int e0, int e1, int tid,
-                               float* partials /* [RMAX * T][WARPS] */, unsigned long long* lg64, unsigned tag) {
-    const int lane = tid & 31, warp = tid >> 5, ne = e1 - e0;
+                               float* partials /* [RMAX * T][WARPS] */, unsigned long long* lg64, unsigned tag,
+                               bool sh) {
+    const int lane = tid & 31, warp = tid >> 5, ne = e1 - e0, nr = ne + (sh ? 1 : 0);
     constexpr int PAIRS = N / 2 / THREADS;   // 5
     constexpr int TG = T < 4 ? T : 4;        // tokens per pass
     constexpr int NV = RMAX * TG;            // values per lane per pass (28 at most: two rounds of 16)
@@ -784,7 +787,7 @@ __device__ void hc_router_rows(const HcFusedArgs& a, const uint16_t* wsm, int e0
             uint32_t wr[PAIRS];
 #pragma unroll
             for (int j = 0; j < PAIRS; ++j)
-                wr[j] = e < ne ? reinterpret_cast<const uint32_t*>(wsm + (size_t) e * N)[tid + THREADS * j] : 0u;
+                wr[j] = e < nr ? reinterpret_cast<const uint32_t*>(wsm + (size_t) e * N)[tid + THREADS * j] : 0u;
 #pragma unroll
             for (int q = 0; q < TG; ++q) {
                 float s = 0.0f;
@@ -825,6 +828,8 @@ __device__ void hc_router_rows(const HcFusedArgs& a, const uint16_t* wsm, int e0
                 if ((lane & 1) == 0 && m < NV && e < ne && k0 + q < T) {
                     a.logits[(size_t) (k0 + q) * NE + e0 + e] = sum;
                     st_tagged(lg64 + (size_t) (k0 + q) * NE + e0 + e, sum, tag);
+                } else if ((lane & 1) == 0 && m < NV && e == ne && sh && k0 + q < T) {
+                    a.gate_sh[k0 + q] = __fdividef(1.0f, 1.0f + __expf(-sum));
                 }
             }
         }
@@ -1074,25 +1079,31 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
             stamp<DBG>(dbg, b, 6, tid);
         } else {
             const int r = item - it.rt, e0 = r * NE / NRT, e1 = (r + 1) * NE / NRT;
+            const bool sh = r == 0 && a.w_gate_sh != nullptr;   // item 0's spare row: the shared expert's gate input
             char* const rt_p = smem + RT_MAX_ROWS * N * 2;
             if (tid == 0) {   // the rows into shared memory while the up slices run
                 const unsigned bytes = (unsigned) (e1 - e0) * N * 2;
-                mbar_expect_tx(&bars[1], bytes);
+                mbar_expect_tx(&bars[1], bytes + (sh ? N * 2 : 0));
                 bulk_g2s(smem, a.w_router + (size_t) e0 * N, bytes, &bars[1]);
+                if (sh) bulk_g2s(smem + bytes, a.w_gate_sh, N * 2, &bars[1]);
             }
             cta_wait(&sy->up.v, (unsigned) it.nu, tid, false);
             mbar_wait(&bars[1], rt_ph);
             rt_ph ^= 1u;
             stamp<DBG>(dbg, b, 4, tid);
             hc_router_rows<T>(a, reinterpret_cast<const uint16_t*>(smem), e0, e1, tid, reinterpret_cast<float*>(rt_p), L.lg64,
-                              tag);
+                              tag, sh);
             stamp<DBG>(dbg, b, 5, tid);
+            const int nq = T * (N / 32), q0 = r * nq / NRT, q1 = (r + 1) * nq / NRT;
             if (a.xq != nullptr) {   // the item's share of mixed's q8_1 blocks, while the top-10 runs
-                const int nq = T * (N / 32), q0 = r * nq / NRT, q1 = (r + 1) * nq / NRT;
                 for (int q = q0 + (tid >> 5); q < q1; q += WARPS)
                     hc_q8_1_store(__ldcg(a.mixed + (size_t) q * 32 + (tid & 31)), static_cast<HcQ81*>(a.xq), q, tid & 31);
                 if (a.pub_ctr != nullptr) cta_signal(a.pub_ctr, tid);   // its share is out
             }
+            if (a.xq_sh != nullptr)   // the same blocks for the shared expert, after the count
+                for (int q = q0 + (tid >> 5); q < q1; q += WARPS)
+                    hc_q8_1_store_native(__ldcg(a.mixed + (size_t) q * 32 + (tid & 31)), static_cast<HcQ81*>(a.xq_sh), q,
+                                         tid & 31);
         }
         staged = false;
         __syncthreads();
@@ -1473,7 +1484,9 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     if (!d.ok || a.T < 1 || a.T > MAXT || !a.R || !a.R_out || !a.w_norm || !a.w_down || !a.w_up || !a.lo || !a.rs ||
         !a.mixed || !a.xn || (a.w_inject && !a.inject_out) || (a.apply && (!a.bo_prev || !a.inj_prev)) ||
         (a.w_router && (!a.logits || !a.ids || !a.weights)) || (a.apply && a.inj_prev == a.inject_out) ||
-        (a.pub_ctr && (!a.w_router || !a.xq))) {
+        (a.pub_ctr && (!a.w_router || !a.xq)) ||
+        (a.w_gate_sh && (!a.w_router || !a.gate_sh || (reinterpret_cast<uintptr_t>(a.w_gate_sh) & 15u) != 0)) ||
+        (a.xq_sh && !a.w_router)) {
         basalt::log::error("basalt", "hc_fused_read: invalid arguments or unsupported device");
         std::exit(1);
     }

@@ -7,6 +7,7 @@
 //   lo[k] = silu((w_down[k] . xn) / hc),  inject[c] = w_inject[c] . xn
 //   mixed[d] = mean_c xn[c,d] * sigmoid(w_up[c*n_embd + d] . lo),  R <- R'
 //   logits = w_router . mixed,  (ids, weights) = top-10 of softmax(logits)   (when w_router)
+//   gate_sh = sigmoid(w_gate_sh . mixed)                                       (when w_gate_sh)
 //
 // One CTA per SM; the work is a queue of items in dependency order, handed on through counters in global memory
 // instead of kernel boundaries: 88 down items (the matrices' 8-bit rows over half-streams of the stream rows, each
@@ -47,6 +48,13 @@ struct HcFusedArgs {
     /// mixed's q8_1 rows (36-byte blocks, [T][n_embd / 32]), or null: written by the router items, or without a
     /// router by the up slices
     void* xq = nullptr;
+    /// With a router: the shared expert's gate-input row (bf16 [n_embd], 16-byte aligned), or null.  The router items
+    /// dot it with mixed as a router row (the MMVF's arithmetic) and write sigmoid of the dot per token to gate_sh, as
+    /// shared_expert_multi's gate kernel does.
+    const uint16_t* w_gate_sh = nullptr;
+    float* gate_sh = nullptr;           ///< [T]
+    /// With a router: mixed's q8_1 rows as native_quantize_q8_1 writes them ([T][n_embd / 32]), or null
+    void* xq_sh = nullptr;
     const void* pf[4] = {nullptr, nullptr, nullptr, nullptr};
     size_t pf_bytes[4] = {0, 0, 0, 0};
     /// let the next kernel in at the start (its blocks take the SMs this read's blocks leave)

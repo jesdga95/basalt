@@ -907,6 +907,58 @@ int main(int argc, char** argv) {
                 cudaFree(d_bo4);
                 cudaFree(d_seen);
             }
+            {   // the shared expert's gate applied in the combine (each variant) against the same combine of a shared
+                // row gated before it (one IEEE product per value, as the shared expert's own gate kernel makes it)
+                std::vector<float> g(T), shg(sh.size());
+                for (auto& v : g) v = 1.0f / (1.0f + std::exp(-nd(rng)));
+                for (int t = 0; t < T; ++t)
+                    for (int c = 0; c < (int) H; ++c) {
+                        volatile float p = sh[(size_t) t * H + c] * g[t];
+                        shg[(size_t) t * H + c] = p;
+                    }
+                float* d_g = dmal<float>(MT);
+                float* d_shg = dmal<float>((size_t) MT * H);
+                float* d_b0 = dmal<float>((size_t) MT * H);
+                float* d_b1 = dmal<float>((size_t) MT * H);
+                unsigned* d_seen = dmal<unsigned>(1);
+                ck(cudaMemcpy(d_g, g.data(), (size_t) T * 4, cudaMemcpyHostToDevice), "g");
+                ck(cudaMemcpy(d_shg, shg.data(), shg.size() * 4, cudaMemcpyHostToDevice), "shg");
+                for (int var = 0; var < 3; ++var) {   // 0: no wait, 1: its own wait, 2: every block waits (peer_done)
+                    for (int gated = 0; gated < 2; ++gated) {
+                        const unsigned prev = 5;
+                        ck(cudaMemcpy(d_seen, &prev, 4, cudaMemcpyHostToDevice), "seen");
+                        *(volatile uint32_t*) (h_words + 32) = 6u;
+                        *(volatile uint32_t*) (h_words + 48) = 6u;
+                        std::atomic_thread_fence(std::memory_order_seq_cst);
+                        float* const out = gated ? d_b1 : d_b0;
+                        const float* const shr = gated ? d_sh : d_shg;
+                        const float* const gp = gated ? d_g : nullptr;
+                        if (var == 0)
+                            K::dec_moe_combine(d_parts, h_peer, h_cpu, d_plan, d_w, shr, out, H, KK, T, nullptr, nullptr, 6,
+                                               s0, false, nullptr, nullptr, nullptr, gp);
+                        else if (var == 1)
+                            K::dec_moe_combine(d_parts, h_peer, h_cpu, d_plan, d_w, shr, out, H, KK, T, nullptr, nullptr, 6,
+                                               s0, false, h_words + 32, h_words + 48, d_seen, gp);
+                        else
+                            K::dec_moe_combine(d_parts, h_peer, h_cpu, d_plan, d_w, shr, out, H, KK, T, h_words + 32,
+                                               h_words + 48, 6, s0, false, nullptr, nullptr, nullptr, gp);
+                        ck(cudaStreamSynchronize(s0), "gated combine");
+                        for (int i = 0; i < n; ++i)   // the own-wait variant leaves the tag word in the peer rows it read
+                            if (kind[i] == 2) std::memcpy(h_peer + (size_t) i * H, peer.data() + (size_t) i * H, H * 4);
+                    }
+                    const auto c0 = down(d_b0, (size_t) T * H), c1 = down(d_b1, (size_t) T * H);
+                    size_t ndg = 0;
+                    for (size_t i = 0; i < c0.size(); ++i) ndg += std::memcmp(&c0[i], &c1[i], 4) != 0;
+                    std::snprintf(what, sizeof what, "combine, gate inside (%s) T=%d",
+                                  var == 0 ? "no wait" : var == 1 ? "own wait" : "block waits", T);
+                    report(what, l, ndg, c0.size());
+                }
+                cudaFree(d_g);
+                cudaFree(d_shg);
+                cudaFree(d_b0);
+                cudaFree(d_b1);
+                cudaFree(d_seen);
+            }
 
             // DEC_GLUE: the plan built in the gate/up launch (+ the ring launch's kinds) vs the route's plan,
             // its rows vs native_expert_grouped's (d_parts2); needs DEC_GU2=2

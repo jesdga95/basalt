@@ -1351,6 +1351,7 @@ Verifier::~Verifier() {
     if (cm_) cudaStreamSynchronize(cm_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
     if (sh_hi_) cudaStreamSynchronize(sh_hi_);
+    if (sh_hi2_) cudaStreamSynchronize(sh_hi2_);
     if (ring_hi_) cudaStreamSynchronize(ring_hi_);
     for (cudaStream_t q : qs_)
         if (q) cudaStreamSynchronize(q);
@@ -1383,6 +1384,8 @@ Verifier::~Verifier() {
     if (commit_ctl_) cudaFree(commit_ctl_);
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (sh_hi_) cudaStreamDestroy(sh_hi_);
+    if (sh_hi2_) cudaStreamDestroy(sh_hi2_);
+    if (ev_sh2_) cudaEventDestroy(ev_sh2_);
     if (ring_hi_) cudaStreamDestroy(ring_hi_);
     if (ple_s_) cudaStreamDestroy(ple_s_);
     if (ev_ple_fork_) cudaEventDestroy(ev_ple_fork_);
@@ -1697,6 +1700,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         int least = 0, greatest = 0;
         if (cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess ||
             cudaStreamCreateWithPriority(&sh_hi_, cudaStreamNonBlocking, greatest) != cudaSuccess ||
+            cudaStreamCreateWithPriority(&sh_hi2_, cudaStreamNonBlocking, greatest) != cudaSuccess ||
+            cudaEventCreateWithFlags(&ev_sh2_, cudaEventDisableTiming) != cudaSuccess ||
             cudaStreamCreateWithPriority(&ring_hi_, cudaStreamNonBlocking, greatest) != cudaSuccess ||
             cudaEventCreateWithFlags(&ev_ring_, cudaEventDisableTiming) != cudaSuccess ||
             cudaEventCreateWithFlags(&ev_ring_join_, cudaEventDisableTiming) != cudaSuccess ||
@@ -1891,6 +1896,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     bool ring_fork = false;   // the group's ring stream is joined in post
     int mid_ord = 0;   // the mid chain's launches so far in this graph
     bool glue_on = false;   // post's gate/up launch plans the group's VRAM share
+    bool sh_read = false;   // the FFN read gave the shared expert its gate and q8_1 rows; post's combine gates it
     DmRouteArgs glue_ring;   // the ring's work for post's gate/up launch
     auto pre = [&](int64_t l) -> bool {
         const int n = T;
@@ -2525,6 +2531,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             glue_on = dm_->vram < 0 && dec_moe_glue_ok(native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff));
             if (!glue_on) note_fallback("glue off for the layer's experts", f.gu_type, f.d_type);
         }
+        // the read's router items also dot the shared expert's gate input and write its q8_1 rows: its side branch is
+        // its three projections (gate and up side by side), and post's combine applies the gate
+        const WeightRef* w_gi = v.get("ffn_gate_inp_shexp.weight");
+        sh_read = glue_on && w_gi != nullptr && w_gi->bytes == (uint64_t) N * 2 && ((uintptr_t) w_gi->data & 15u) == 0;
         {
             PdlScope ps(pdl);   // after the out projection's kernel
             if (dec_hc) {
@@ -2536,6 +2546,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         h.xq = nat_xq_;
                         h.pub_ctr = dm_->pub + 2 * (l - lb_);
                         h.next_early = true;
+                    }
+                    if (sh_read) {
+                        h.w_gate_sh = (const uint16_t*) w_gi->data;
+                        h.gate_sh = sh_g_;
+                        h.xq_sh = sh_xq_;
                     }
                     routed = true;
                 }
@@ -2551,6 +2566,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (sh_fork) {
             cudaEventRecord(ev_fork_, cs);
             cudaStreamWaitEvent(sh_stream, ev_fork_, 0);
+            if (sh_read) cudaStreamWaitEvent(sh_hi2_, ev_fork_, 0);
         }
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one top-10) instead of 2
         // per token; every row's arithmetic is the single-token call's
@@ -2646,8 +2662,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             {
             try {
                 PdlScope psh(false);   // the side chain's kernels follow each other
-                shared_expert_multi(n, xm, nsw, (const uint16_t*) wgi->data, sh_gate_,
-                                    sh_up_, sh_g_, shared_, N, g.n_ff, sh_stream);
+                if (sh_read)
+                    shared_expert_multi_rows(n, nsw, sh_gate_, sh_up_, shared_, N, g.n_ff, sh_stream, sh_hi2_,
+                                             ev_sh2_);
+                else
+                    shared_expert_multi(n, xm, nsw, (const uint16_t*) wgi->data, sh_gate_,
+                                        sh_up_, sh_g_, shared_, N, g.n_ff, sh_stream);
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();
                 return false;
@@ -2778,7 +2798,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 23);
             try {
                 dec_moe_combine(parts_, dm_->m_rows, m_ymiss_, dm_->plan, w_, shared_, bo_, N, K, n, nullptr, nullptr,
-                                ring, cs, !dm_->tags, tag_done, dm_->tags ? m_flag_ : nullptr, dm_->cseen);
+                                ring, cs, !dm_->tags, tag_done, dm_->tags ? m_flag_ : nullptr, dm_->cseen,
+                                sh_read ? sh_g_ : nullptr);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else if (n > 1) {   // one launch for the window's rows
             try {

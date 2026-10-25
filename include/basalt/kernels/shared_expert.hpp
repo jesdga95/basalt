@@ -65,6 +65,14 @@ void shared_expert_multi(int n_tok, const float* x, const NativeSharedWeights& n
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream);
 
+/// shared_expert_multi's projections alone, for a caller that has x's q8_1 rows (native_quantize_q8_1's) in
+/// `nw.q8_1` and applies the per-token gate itself: `out` = down(swiglu(gate, up)), bitwise shared_expert_multi's
+/// before its gate.  With `stream2` (and `join`, an event) the up projection runs there beside the gate projection;
+/// stream2 must already follow everything `nw.q8_1`'s rows wait for.
+void shared_expert_multi_rows(int n_tok, const NativeSharedWeights& nw, float* gate, float* up, float* out,
+                              int64_t n_embd, int64_t n_ff, void* stream, void* stream2 = nullptr,
+                              void* join = nullptr);
+
 /// The MoE block's final combination:
 ///
 ///     y = sum over the k routed experts of  w[k] * parts[k]  +  shared

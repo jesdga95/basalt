@@ -244,11 +244,14 @@ void dec_moe_peer_math_test(const NativeExpertLayout& L, const unsigned long lon
 /// reading, so dec_moe_wait runs with `skip_peer`.  `cpu_done` (with tag_done, not dep): no dec_moe_wait runs before
 /// the combine; when the layer has CPU entries one of its threads waits for cpu_done >= ring and passes the ring on
 /// through `cpu_seen` (one device word, zeroed once: it steps through each window's rings in order) to the others.
+/// `shared_gate` ([n_tok], or null): `shared` is the shared expert before its per-token gate, and the combine applies
+/// it as shared_expert_multi does (one IEEE product per value) before the add.
 constexpr uint32_t dec_moe_tag_word() { return 0x7fa5a5a5u; }
 void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* cpu_rows_m, const DmPlan* plan,
                      const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k, int n_tok,
                      const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m, uint32_t ring,
                      void* stream, bool dep = false, const volatile uint32_t* tag_done = nullptr,
-                     const volatile uint32_t* cpu_done = nullptr, unsigned int* cpu_seen = nullptr);
+                     const volatile uint32_t* cpu_done = nullptr, unsigned int* cpu_seen = nullptr,
+                     const float* shared_gate = nullptr);
 
 }  // namespace basalt::kernels
