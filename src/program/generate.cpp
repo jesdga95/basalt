@@ -4947,10 +4947,13 @@ int main(int argc, char** argv) {
                                            (uint64_t) basalt::kernels::cpu::expert_layout().max_blob;
         };
         std::vector<PfPart> pf_parts;
-        // While slots decode, a prompt read lends at most this many cache slots, so their experts stay in the cache,
-        // and its streamed ring is this deep (the loan shrinks with it); otherwise the ring is full depth.
+        // A prompt read beside decoding slots lends at most this many cache slots, so their experts stay in the
+        // cache, and its streamed ring is this deep (the loan shrinks with it); otherwise the ring is full depth.
         constexpr int64_t kLendCapDecoding = 1216;
         constexpr int kRingDecoding = 64;
+        // A read of at most this many tokens runs alone even while slots decode: they wait for it (a few seconds at
+        // most) and it lends and reads as on an idle engine.  A longer read goes beside them, within the limits above.
+        constexpr int64_t kReadAlone = 16384;
         // a cache too small to lend the prompt path its buffers would make it allocate them on top - on a card
         // whose cache already filled its reserve, that is the over-subscription the auto sizing avoids - so the
         // chunk is the largest one EVERY participant can lend (a smaller chunk only reads slower)
@@ -8436,7 +8439,8 @@ int main(int argc, char** argv) {
                 const auto t_ln = Clock::now();
                 // the ring depth this read's layout uses; every size computed below (and the layout) follows it, and
                 // the full depth is restored on the way out for the sizing done elsewhere
-                basalt::prefill::Prefill::set_ring_depth(batch_on() ? kRingDecoding : 1 << 20);
+                const bool beside = batch_on() && tokens > kReadAlone;
+                basalt::prefill::Prefill::set_ring_depth(beside ? kRingDecoding : 1 << 20);
                 struct RingReset { ~RingReset() { basalt::prefill::Prefill::set_ring_depth(1 << 20); } } ring_reset;
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
                 // prompt needs, so a large chunk costs a short prompt nothing
@@ -8447,14 +8451,14 @@ int main(int argc, char** argv) {
                 // a prompt's K/V; the answers can differ from another chunking by greedy near-ties.)
                 int64_t cap = o.prefill_auto_fit ? std::min<int64_t>(o.prefill_chunk, kMaxAutoChunk)
                                                  : o.prefill_chunk;
-                // Loan limits, only while slots decode: the loan stays within kLendCapDecoding slots (they keep their
-                // experts in the cache), and takes only slots whose expert has a RAM copy (a lent slot is refilled
-                // from RAM, never read from the file).  A read alone may refill lent slots from the file, so a larger
-                // chunk is worth it.  The chunk shrinks to the loan, but not below the smallest chunk the prompt path
-                // runs.
+                // Loan limits while slots decode: the loan takes only slots whose expert has a RAM copy (a lent slot
+                // is refilled from RAM, never read from the file, before the slots decode again), and a read beside
+                // them stays within kLendCapDecoding slots (they keep their experts in the cache).  A read on an idle
+                // engine may refill lent slots from the file, so a larger chunk is worth it.  The chunk shrinks to the
+                // loan, but not below the smallest chunk the prompt path runs.
                 int64_t loan_lim = std::numeric_limits<int64_t>::max();
                 if (batch_on()) {
-                    loan_lim = kLendCapDecoding;
+                    if (beside) loan_lim = kLendCapDecoding;
                     // the RAM-backed slots are the cache's last ones: those still live after the KV took its share
                     if (src.complement_ready())
                         loan_lim = std::min<int64_t>(loan_lim, std::max<int64_t>(0, src.resident_lent_slots() -
@@ -8476,7 +8480,7 @@ int main(int argc, char** argv) {
                 // A long prompt starts with a short chunk: the first chunk waits for its PLE rows before layer 1 with
                 // nothing to overlap, so a short one shrinks that wait; the rest are equal chunks of at most `cap`.
                 int64_t head_tok = 0;
-                if (o.prefill_auto_fit && tokens > cap && tokens >= 2 * kHeadChunk && cap > kHeadChunk && !batch_on() &&
+                if (o.prefill_auto_fit && tokens > cap && tokens >= 2 * kHeadChunk && cap > kHeadChunk && !beside &&
                     stages.empty()) {
                     const int64_t rem = tokens - kHeadChunk, parts = (rem + cap - 1) / cap;
                     want_full = request_chunk((rem + parts - 1) / parts, cap);
@@ -8536,9 +8540,6 @@ int main(int argc, char** argv) {
             // slots' windows then see the cache without the slots this prompt borrowed (marked missing: those experts
             // run on the CPU), never a prompt buffer.
             constexpr double decode_share = 0.5;
-            // A read of at most this many tokens runs alone even while slots decode: they wait for it (a few seconds at
-            // most) and its first token comes as soon as on an idle engine.  A longer read goes beside them.
-            constexpr int64_t kReadAlone = 16384;
             bool batch_fatal = false;
             int64_t il_parts = 0;   // the slots' windows run between this prompt's chunks
             double il_ms = 0;

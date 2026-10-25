@@ -153,7 +153,9 @@ access the cutoff stays at 2,560 (4,096 with `--peer-exclusive`).
 **Prompt chunk size.** A bare `--prefill auto` reads a prompt in equal chunks of at most 16384 tokens, or 32768 for packs
 whose expert blobs exceed 1.5 MB (NVFP4). A chunk's GEMM tiles set the rounding of its K/V, so a prompt longer than 16384
 tokens on such a pack is chunked differently and its K/V can differ in the last bits; prompts up to 16384 tokens and the
-256-token prompt half of the quality gate chunk as before, so the gate's numbers do not move.
+256-token prompt half of the quality gate chunk as before, so the gate's numbers do not move. With `--parallel` a
+read that runs alone chunks as the single-stream path does; a read beside decoding slots takes the smaller chunk its
+capped loan allows, so the same prompt's K/V can differ in the last bits between the two.
 
 **Short first chunk.** A prompt above the chunk cap (and at least 32,768 tokens) reads its first 16,384 tokens as one
 chunk and the rest in equal chunks of at most the cap, so the first chunk waits for fewer PLE rows. This moves the chunk

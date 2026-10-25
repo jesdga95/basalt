@@ -28,8 +28,8 @@ decodes with the cache a 32k context would have, whatever `--max-context` is. Th
 how much of the cache is lent this way, and each move is logged (`elastic KV: N cells backed ...`).
 
 While other slots are decoding, a new prompt of up to 16384 tokens is read at once: the slots wait for it (a few
-seconds at most) and the CPU pool takes its share of the prompt's experts as in the single-stream path, so its
-first token comes about as soon as on an idle engine. A longer prompt is read beside them:
+seconds at most), and it is read as in the single-stream path: the same chunks and streamed ring, the CPU pool's
+share of its experts. Its first token so comes about as soon as on an idle engine. A longer prompt is read beside them:
 the prompt path runs on its own thread, the slots' decode windows keep running (their kernels take the higher stream
 priority), and the few steps that touch the draft layer or the output run between two windows, so a long prompt does
 not stop the other requests. A prompt that arrives while no other slot is decoding is read as in the single-stream
