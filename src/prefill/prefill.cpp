@@ -1202,6 +1202,38 @@ void Prefill::set_ring_peer(core::PeerExperts* peer) {
 }
 
 // The peer's prompt share for chunks of up to `T_max` tokens (set_peer); `tf`: PeerPrefill::T_fp4, 0 for none.
+// The peer card's prompt buffers for chunks of up to `Tp` tokens (`tf` > 0: with the FP4 share's), each from `take(bytes)`,
+// in one place so that the tier's reserve and the allocation count the same bytes.
+template <class Take>
+static void peer_layout(PeerPrefill& pp, int64_t Tp, int64_t tf, const MmqPlan& mp, Take&& take) {
+    pp.mixed = (float*) take((size_t) Tp * N * 4);
+    pp.cap_rows = Tp * K;         // no row cap: only the row tables grow with it
+    pp.G = pp.T_max;              // one expert never has more rows than the chunk has tokens
+    const int64_t Gr = pp.G;
+    pp.Xq_g = take(mmq::q8_bytes(Gr, N));
+    pp.Hq_g = take(mmq::q8_bytes(Gr, 640));
+    pp.GU_g = (float*) take((size_t) Gr * 1280 * 4);
+    pp.H_g = (float*) take((size_t) Gr * 640 * 4);
+    pp.Dm_b[0] = (float*) take((size_t) Gr * N * 4);
+    pp.Dm_b[1] = (float*) take((size_t) Gr * N * 4);
+    const int64_t Rt = pp.cap_rows;
+    pp.src = (int32_t*) take((size_t) Rt * 4);
+    pp.ident = (int32_t*) take((size_t) Rt * 4);
+    pp.bounds = (int32_t*) take((size_t) (2 * (NE + NE / MMQ_GROUP + 2)) * 4);
+    pp.grp_gu = (uint8_t*) take(MMQ_GROUP * mp.gu_max + MMQ_TAIL);
+    pp.grp_d = (uint8_t*) take(MMQ_GROUP * mp.d_max + MMQ_TAIL + MMQ_SCALES);
+    if (tf > 0) {   // the FP4 share's group buffers (GU, H and the result rows are the MMQ group's)
+        pp.f_a4x = take(fp4::token_bytes(Tp, N));
+        pp.f_gsx = (float*) take((size_t) Tp * 4);
+        pp.f_a4h = take(fp4::a4_bytes(Gr, 640, MMQ_GROUP));
+        pp.f_gsh = (float*) take(fp4::scale_count(Gr, MMQ_GROUP) * 4);
+        pp.f_toh = (int32_t*) take((size_t) 2 * (MMQ_GROUP + 1) * 4);
+        // a piece per expert and one per whole tile run cut off a long one, and per group one bound more
+        pp.f_rel_cap = (size_t) 2 * (NE + Tp * K / fp4::kTileTokens + 1);
+        pp.f_rel = (int32_t*) take(pp.f_rel_cap * 4);
+    }
+}
+
 static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, int64_t tf,
                       std::unique_ptr<PeerPrefill>& out, std::string& err) {
     auto pp = std::make_unique<PeerPrefill>();
@@ -1239,35 +1271,9 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
         pp->owned.push_back(p);
         return p;
     };
-    pp->mixed = (float*) take((size_t) Tp * N * 4);
-    {
-        pp->cap_rows = Tp * K;          // no row cap: only the row tables grow with it
-        pp->G = pp->T_max;              // one expert never has more rows than the chunk has tokens
-        const int64_t Gr = pp->G;
-        pp->Xq_g = take(mmq::q8_bytes(Gr, N));
-        pp->Hq_g = take(mmq::q8_bytes(Gr, 640));
-        pp->GU_g = (float*) take((size_t) Gr * 1280 * 4);
-        pp->H_g = (float*) take((size_t) Gr * 640 * 4);
-        pp->Dm_b[0] = (float*) take((size_t) Gr * N * 4);
-        pp->Dm_b[1] = (float*) take((size_t) Gr * N * 4);
-        for (int b = 0; b < 2 && ok; ++b) ok = cudaEventCreateWithFlags(&pp->ev_dm[b], cudaEventDisableTiming) == cudaSuccess;
-    }
-    const int64_t Rt = pp->cap_rows;
-    pp->src = (int32_t*) take((size_t) Rt * 4);
-    pp->ident = (int32_t*) take((size_t) Rt * 4);
-    pp->bounds = (int32_t*) take((size_t) (2 * (NE + NE / MMQ_GROUP + 2)) * 4);
-    pp->grp_gu = (uint8_t*) take(MMQ_GROUP * mp.gu_max + MMQ_TAIL);
-    pp->grp_d = (uint8_t*) take(MMQ_GROUP * mp.d_max + MMQ_TAIL + MMQ_SCALES);
-    if (tf > 0) {   // the FP4 share's group buffers (GU, H and the result rows are the MMQ group's)
-        const int64_t Gr = pp->G;
-        pp->f_a4x = take(fp4::token_bytes(Tp, N));
-        pp->f_gsx = (float*) take((size_t) Tp * 4);
-        pp->f_a4h = take(fp4::a4_bytes(Gr, 640, MMQ_GROUP));
-        pp->f_gsh = (float*) take(fp4::scale_count(Gr, MMQ_GROUP) * 4);
-        pp->f_toh = (int32_t*) take((size_t) 2 * (MMQ_GROUP + 1) * 4);
-        // a piece per expert and one per whole tile run cut off a long one, and per group one bound more
-        pp->f_rel_cap = (size_t) 2 * (NE + Tp * K / fp4::kTileTokens + 1);
-        pp->f_rel = (int32_t*) take(pp->f_rel_cap * 4);
+    peer_layout(*pp, Tp, tf, mp, take);
+    for (int b = 0; b < 2 && ok; ++b) ok = cudaEventCreateWithFlags(&pp->ev_dm[b], cudaEventDisableTiming) == cudaSuccess;
+    if (tf > 0) {
         ok = ok && cudaEventCreateWithFlags(&pp->ev_hx_free, cudaEventDisableTiming) == cudaSuccess;
         for (int b = 0; ok && b < PeerPrefill::kRes; ++b)
             ok = cudaEventCreateWithFlags(&pp->ev_d2h[b], cudaEventDisableTiming) == cudaSuccess;
@@ -1298,6 +1304,19 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
                  "", fb >> 20);
     out = std::move(pp);
     return true;
+}
+
+uint64_t Prefill::peer_bytes(int64_t chunk) {
+    if (!mmq_plan().any) return 0;
+    PeerPrefill pp;
+    pp.T_max = std::min<int64_t>(chunk, stream_all_min() - 1);
+    const int64_t t_fp4 = !fp4_every_layer() || fused_ring() || stream_all_min() < FP4_MIN_TOKENS
+                              ? 0 : std::min<int64_t>(chunk, kPeerFp4Tokens);
+    const int64_t tf = t_fp4 >= stream_all_min() ? t_fp4 : 0;
+    const int64_t Tp = std::max(pp.T_max, tf);
+    uint64_t sum = 0;
+    peer_layout(pp, Tp, tf, mmq_plan(), [&](size_t bytes) -> void* { sum += (bytes + 255) & ~size_t(255); return nullptr; });
+    return sum;
 }
 
 bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err) {

@@ -3205,6 +3205,10 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
+    // what the peer's prompt buffers take on its card: they are allocated after its tier is filled, so the tier leaves them free
+    auto peer_prompt_bytes = [&]() -> uint64_t {
+        return o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0 ? basalt::prefill::Prefill::peer_bytes(o.prefill_chunk) : 0;
+    };
     // the GDN mixer split is priced once, before either card sizes its experts: its peer reserve displaces experts
     // only when the cards cannot hold them all
     if (o.peer_device >= 1) {
@@ -3222,7 +3226,8 @@ int main(int argc, char** argv) {
             ? basalt::core::Verifier::hs_peer_bytes(native_head.row_bytes(), native_head.type(), n_vocab, g.n_embd, max_t,
                                                     d0, o.peer_device) : 0;
         const int64_t peer_room = (int64_t) f1 - (((int64_t) std::max(o.peer_reserve_mib, 128) << 20) +
-                                                  (int64_t) basalt::core::PeerExperts::device_overhead_bytes() + hs);
+                                                  (int64_t) basalt::core::PeerExperts::device_overhead_bytes() + hs +
+                                                  (int64_t) peer_prompt_bytes());
         // CUDA0's cache: its free memory less the reserve and what loads after the cache
         const int64_t cache0 = std::max<int64_t>(0, (int64_t) f0 - (((int64_t) o.vram_reserve_mib + 1024) << 20));
         const int64_t outside = std::max<int64_t>(0, (int64_t) expert_total_bytes - cache0 - std::max<int64_t>(peer_room, 0));
@@ -3554,6 +3559,7 @@ int main(int argc, char** argv) {
             size_t pfree = 0, ptotal = 0;
             if (cudaSetDevice(dev) == cudaSuccess && cudaMemGetInfo(&pfree, &ptotal) == cudaSuccess) {
                 const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
+                                         (dev == o.peer_device ? peer_prompt_bytes() : 0) +
                                          tiers * basalt::core::PeerExperts::device_overhead_bytes() +
                                          (dev == o.peer_device ? (uint64_t) peer_split_bytes(cur) : 0);
                 room += (uint64_t) pfree > reserve ? (uint64_t) pfree - reserve : 0;
@@ -4544,7 +4550,7 @@ int main(int argc, char** argv) {
         // the GDN mixer split loads the peer's key heads after its tier is filled
         int d0 = 0;
         cudaGetDevice(&d0);
-        const int peer_reserve = o.peer_reserve_mib + (int) ((peer_split_bytes(d0) + (1 << 20) - 1) >> 20);
+        const int peer_reserve = o.peer_reserve_mib + (int) ((peer_split_bytes(d0) + peer_prompt_bytes() + (1 << 20) - 1) >> 20);
         if (o.peer_devices.size() <= 1) {
             if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, peer_reserve, o.peer_slots,
                            err, exclusive)) {
@@ -4577,7 +4583,7 @@ int main(int argc, char** argv) {
                 cudaMemGetInfo(&fb, &tb);
             }
             const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
-                                     (dev == o.peer_device ? (uint64_t) peer_split_bytes(d0) : 0);
+                                     (dev == o.peer_device ? (uint64_t) peer_split_bytes(d0) + peer_prompt_bytes() : 0);
             const uint64_t share = (uint64_t) std::count(o.peer_devices.begin(), o.peer_devices.end(), dev);
             rooms[i].bytes = fb > reserve ? ((uint64_t) fb - reserve) / share : 0;
             rooms[i].gbps = o.peer_gbps[i];
