@@ -413,6 +413,30 @@
       "prefill_64k_tps": 4193.3,
       "decode_tps": 130.6,
       "notes": "official HF pack (SHA 264e2f6b00d01dd32f68a401c9d7ec8256f4b15b58cf23b23bfdfa8803d08ae3), weights on NVMe"
+    },
+    {
+      "submitter": "HenryPDT",
+      "date": "2026-10-25",
+      "commit": "8d73a39477",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 500,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.9
+        }
+      ],
+      "ram_gib": 191,
+      "cpu": "AMD Ryzen 7 7800X3D, 8 cores",
+      "ram_gbps": 57.6,
+      "os": "Windows",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 2431.2,
+      "prefill_64k_tps": 5600.8,
+      "decode_tps": 199.1,
+      "notes": "single RTX 5090 at a 500 W limit (default 575 W), 8-core 7800X3D, 192 GB DDR5, native Windows 11; 0 SSD spill"
     }
   ]
 }
