@@ -1,4 +1,4 @@
-"""Deterministic i-quant fixtures for src/kernels/iq_parity.cpp.
+"""Deterministic i-quant fixtures for tests/kernels/iq_parity.cpp.
 
 For each of the ten types iq_parity tests, writes `<out>/<name>.bin` (int32 header: the KERNEL type id,
 rows, cols - then the raw GGUF block bytes) and `<out>/<name>.f32` (rows*cols float32 reference values,
