@@ -382,5 +382,60 @@ class TokenizerKvTest(unittest.TestCase):
                 C.tokenizer_kv(C.Checkpoint(d))
 
 
+class PleBf16Test(unittest.TestCase):
+    """The BF16 n-gram table path: shards over several files, the values as stored, Q8_0 rows."""
+
+    P = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding."
+
+    def build(self, d, keys):
+        rng = np.random.default_rng(7)
+        rows = sum(n for _, n in keys)
+        x = (np.round((rng.random(rows * 160).astype(np.float32) * 4 - 2) * 128) / 128).astype(np.float32)
+        u = bf16(x).reshape(rows, 160)
+        at = 0
+        for i, (key, n) in enumerate(keys):
+            write_safetensors(d / f"ple-{i}.safetensors",
+                              {self.P + key: ("BF16", (n, 160), u[at:at + n].tobytes())})
+            at += n
+        return x.reshape(rows, 160)
+
+    def ck(self, d):
+        (d / "config.json").write_text(json.dumps({"text_config": {}}))
+        (d / "model-00001-of-00001.safetensors").write_bytes(struct.pack("<Q", 2) + b"{}")
+        return C.Checkpoint(d)
+
+    def test_shards_over_files_become_q8_0_rows(self):
+        import multiprocessing
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            x = self.build(d, [("shard_0.weight", 5), ("shard_1.weight", 3)])
+            ple = C.ple_table(self.ck(d))
+            self.assertIsInstance(ple, S.PleBf16)
+            self.assertEqual(ple.rows, 8)
+            self.assertEqual(ple.nbytes, 8 * 170)
+            self.assertEqual([p.name for p in ple.sources], ["ple-0.safetensors", "ple-1.safetensors"])
+            with multiprocessing.Pool(2) as pool:
+                got = b"".join(ple.chunks(pool, depth=2))
+            self.assertEqual(got, S.q8_0(x))
+            self.assertEqual(ple.conversion["src_type"], "BF16")
+
+    def test_shard_gap_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            self.build(d, [("shard_0.weight", 5), ("shard_2.weight", 3)])
+            with self.assertRaisesRegex(S.ConvertError, "shards are 0..2 of 2"):
+                C.ple_table(self.ck(d))
+
+    def test_non_bf16_shard_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            x = self.build(d, [("shard_0.weight", 5)])
+            write_safetensors(d / "ple-0.safetensors",
+                              {self.P + "shard_0.weight":
+                               ("F16", (5, 160), x.astype(np.float16).tobytes())})
+            with self.assertRaisesRegex(S.ConvertError, "BF16 rows of 160"):
+                C.ple_table(self.ck(d))
+
+
 if __name__ == "__main__":
     unittest.main()

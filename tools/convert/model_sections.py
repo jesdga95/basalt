@@ -673,6 +673,16 @@ class PleFp8:
         self.row_bytes = PLE_DIM // 32 * 34
         self.nbytes = self.rows * self.row_bytes
 
+    @property
+    def conversion(self) -> dict:
+        return {"name": "per_layer_token_embd.weight", "src_type": "F8_E4M3", "dst_type": "Q8_0",
+                "method": "fp8 code x per-tensor BF16 scale, Q8_0 blocks of 32 (ggml reference rounding)",
+                "scale": self.scale}
+
+    @property
+    def sources(self) -> list:
+        return [pathlib.Path(self.path)]
+
     def jobs(self):
         for off, rows in self.shards:
             for r in range(0, rows, self.chunk_rows):
@@ -682,6 +692,58 @@ class PleFp8:
     def chunks(self, pool, depth: int = 16):
         """The Q8_0 rows in order, made on `pool` with at most `depth` chunks in flight."""
         yield from bounded_imap(pool, _ple_job, self.jobs(), depth)
+
+
+class PleBf16:
+    """The PLE n-gram table of a checkpoint that stores it as BF16 shards (`...ngram_embedding.shard_K.weight`,
+    the values as they are), as Q8_0 rows. The shards live in the files named by `paths`."""
+
+    def __init__(self, paths, chunk_rows: int = 65536):
+        self.paths = [pathlib.Path(p) for p in paths]
+        self.chunk_rows = chunk_rows
+        shards = {}
+        for p in self.paths:
+            head, base = read_safetensors_header(p)
+            for k, t in head.items():
+                m = re.search(r"ngram_embedding\.shard_(\d+)\.weight$", k)
+                if m is None:
+                    continue
+                if t["dtype"] != "BF16" or len(t["shape"]) != 2 or t["shape"][1] != PLE_DIM:
+                    raise ConvertError(f"{p}: {k} is {t['dtype']} {t['shape']}; a BF16 n-gram shard is "
+                                       f"BF16 rows of {PLE_DIM}")
+                shards[int(m.group(1))] = (p, base + t["data_offsets"][0], t["shape"][0])
+        if not shards:
+            raise ConvertError("no ngram_embedding.shard_K.weight tensors")
+        if sorted(shards) != list(range(len(shards))):
+            raise ConvertError(f"the n-gram table shards are {min(shards)}..{max(shards)} of {len(shards)}")
+        self.shards = [shards[k] for k in sorted(shards)]
+        self.rows = sum(r for _, _, r in self.shards)
+        self.row_bytes = PLE_DIM // 32 * 34
+        self.nbytes = self.rows * self.row_bytes
+
+    @property
+    def conversion(self) -> dict:
+        return {"name": "per_layer_token_embd.weight", "src_type": "BF16", "dst_type": "Q8_0",
+                "method": "bf16 -> f32 (exact), Q8_0 blocks of 32 (ggml reference rounding)"}
+
+    @property
+    def sources(self) -> list:
+        return sorted({p for p, _, _ in self.shards})
+
+    def jobs(self):
+        for p, off, rows in self.shards:
+            for r in range(0, rows, self.chunk_rows):
+                yield (str(p), off + r * PLE_DIM, min(self.chunk_rows, rows - r))
+
+    def chunks(self, pool, depth: int = 16):
+        """The Q8_0 rows in order, made on `pool` with at most `depth` chunks in flight."""
+        yield from bounded_imap(pool, _ple_bf16_job, self.jobs(), depth)
+
+
+def _ple_bf16_job(args):
+    path, off, rows = args
+    u = np.fromfile(path, dtype="<u2", count=rows * PLE_DIM, offset=off)
+    return q8_0(_bf16_to_f32(u))
 
 
 # ------------------------------------------------------------------ Q6_K requantization of the dense projections
