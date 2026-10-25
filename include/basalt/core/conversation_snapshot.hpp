@@ -4,6 +4,8 @@
 #include "basalt/core/layer.hpp"
 #include "basalt/core/session.hpp"
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -47,16 +49,22 @@ bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const Sess
                                   const ModelGeometry& g, std::string& error);
 /// Saves a checkpoint's GDN recurrences off the caller's critical path: the device state is copied into a spare
 /// device buffer at device bandwidth, and a helper thread moves it to the checkpoint's host bytes while the caller
-/// carries on.  The checkpoint's `gdn` bytes are valid only once finish() has returned true; nothing may read,
-/// move-from or free them before then.  The caller synchronizes the device before save(), as for a plain save.
+/// carries on (through a page-locked bounce buffer when the RAM budget allows one).  The checkpoint's `gdn` bytes are
+/// valid only once finish() has returned true; nothing may read, move-from or free them before then.  The caller
+/// synchronizes the device before save(), as for a plain save.
 class ConversationCheckpointDeferral {
 public:
     ConversationCheckpointDeferral() = default;
     ~ConversationCheckpointDeferral();
     ConversationCheckpointDeferral(const ConversationCheckpointDeferral&) = delete;
     ConversationCheckpointDeferral& operator=(const ConversationCheckpointDeferral&) = delete;
-    /// Allocates the spare buffer on the current device; save() falls back to a plain save without one.
-    bool reserve(size_t bytes, std::string& error);
+    /// Allocates the spare buffer on the current device; save() falls back to a plain save without one.  The bounce
+    /// buffer is page-locked host memory of the same size, taken only if it fits `pin_budget` (default: the RAM
+    /// platform::ram_budget() allows now) and the driver grants it; otherwise the helper copies into the checkpoint's
+    /// own pageable bytes, with one warning.
+    bool reserve(size_t bytes, std::string& error, std::optional<uint64_t> pin_budget = std::nullopt);
+    /// Whether the helper copies through a page-locked buffer.
+    bool pinned() const { return pinned_ != nullptr; }
     bool save(ConversationCheckpoint& checkpoint, const SessionState& session, const ModelGeometry& g,
               std::string& error);
     /// The host bytes still being written (null: none in flight).
@@ -66,6 +74,7 @@ public:
 
 private:
     void* spare_ = nullptr;
+    void* pinned_ = nullptr;
     void* stream_ = nullptr;
     size_t cap_ = 0;
     std::thread worker_;
