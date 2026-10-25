@@ -2046,7 +2046,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                             *wnm = v.get("ssm_norm.weight"), *wdt = v.get("ssm_dt.bias"), *wsa = v.get("ssm_a");
             if (wqkv && wg && wout && wa && wb && wc && wnm && wdt && wsa && wqkv->native_data && wg->native_data &&
                 wout->native_data && dense_tc_pair_supported(wqkv->native_type, wg->native_type, (int) N) &&
-                dense_tc_supported(wout->native_type, (int) ZV, (int) N, wout->native_data) &&
+                dense_tc_supported(wout->native_type, (int) ZV) &&
                 dense_tc_type_on(wout->native_type)) {
                 const int64_t gi = gdn_idx[(size_t) l];
                 ma.T = n;

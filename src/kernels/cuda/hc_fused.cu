@@ -961,7 +961,7 @@ __device__ __noinline__ void hc_top10_item(const float* logits, int32_t* ids, fl
 struct Items {
     int nu, up, rt, t10, end;
     __device__ Items(int nb, int nu_, bool router) {
-        nu = nu_ > 0 ? nu_ : nb - CN_ND;
+        nu = nu_ > 0 ? nu_ : (nb - CN_ND > CN_MIN_NU ? nb - CN_ND : CN_MIN_NU);   // CTAs claim several items when the grid is smaller
         up = CN_ND;
         rt = up + nu;
         t10 = rt + (router ? NRT : 0);
@@ -1202,7 +1202,7 @@ const DevInfo& dev_info() {
             cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
             cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
             d.sms = sms;
-            d.ok = major == 12 && sms - CN_ND >= CN_MIN_NU && optin >= SMEM + 1024 &&
+            d.ok = major == 12 && optin >= SMEM + 1024 &&
                    cudaMalloc((void**) &d.t10, ((size_t) NE + (size_t) sms * 2 * KT) * 4) == cudaSuccess &&
                    cudaMalloc((void**) &d.cn, (size_t) NSLOT * CN_SLOT * 4) == cudaSuccess &&
                    cudaMalloc((void**) &d.lg, (size_t) NSLOT * MAXT * NE * 8) == cudaSuccess &&

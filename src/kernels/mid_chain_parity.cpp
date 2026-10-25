@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace K = basalt::kernels;
@@ -181,8 +182,10 @@ int main(int argc, char** argv) {
         }
         return a;
     };
+    int grid = 0;   // the mid chain's grid (0: the device's)
     auto mid_args = [&](const Layer& w, int T, bool alias) {
         K::MidChainArgs a;
+        a.ctas = grid;
         a.T = T; a.xq = b.xq1; a.wq = w.wq; a.wz = w.wz; a.wo = w.wo; a.type_q = w.tq; a.type_z = w.tz; a.type_o = w.to;
         a.rec = w.rec; a.rec.yq = alias ? b.xq1 : b.yq; a.bo = b.bo2;
         return a;
@@ -233,6 +236,10 @@ int main(int argc, char** argv) {
     };
     cudaStream_t s;
     CK(cudaStreamCreate(&s));
+    int dev = 0, sms = 0;
+    CK(cudaGetDevice(&dev));
+    CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    const bool big = sms >= 160;   // the output projection has its one-tile kernel
     int bad = 0;
     auto ref_names_n = [](size_t n) { return n + 1; };
 
@@ -249,20 +256,39 @@ int main(int argc, char** argv) {
                                                      {21, 21, 21}, {8, 8, 8}};
     std::vector<Layer> layers;
     for (const auto& t : triples) layers.push_back(make_layer(t[0], t[1], t[2], (t[0] == 14 && t[1] == 14 && t[2] == 14) || (t[0] == 8 && t[1] == 8 && t[2] == 8)));
-    for (size_t l = 0; l < layers.size(); ++l) {
+    // the device's grid with every triple; then smaller grids (the fewer-SM devices' split: tiles round-robin, several rec
+    // heads and out tiles per CTA) with a few triples
+    for (const int gr : {0, 120, 84, 70, 48, 36, 20, 16}) for (size_t l = 0; l < layers.size(); ++l) {
         const Layer& w = layers[l];
+        grid = gr;
+        if (gr != 0 && l != 0 && l != 1 && l + 1 != layers.size()) continue;
+        if (gr != 0 && !K::mid_chain_supported(mid_args(w, 1, true))) continue;
         if (!K::mid_chain_supported(mid_args(w, 1, true))) { std::printf("types %d/%d/%d: not supported by the mid chain\n", w.tq, w.tz, w.to); ++bad; continue; }
         for (int alias = 1; alias >= 0; --alias) {
             std::vector<std::vector<std::vector<uint8_t>>> got(TM + 1);
             size_t tot = 0;
             std::vector<size_t> perk(outs.size() + 2, 0);
+            // the reference: today's kernels on the device's grid; a smaller grid, or a device whose output projection is not
+            // the one-tile kernel's, takes the mid chain on the device's grid (a tile's bits do not depend on its CTA).  A
+            // device without the one-tile output projection has another reduction order there: its comparison with today's
+            // kernels covers what comes before the output projection, the CPU reference below the projection itself.
+            const bool unf = gr == 0 && (big || w.to != 21);
+            std::vector<bool> use(outs.size() + 2, true);
+            if (unf && !big)
+                for (size_t k = 0; k < outs.size(); ++k) {
+                    const std::string nm = outs[k].name;
+                    use[k] = nm == "mixed1" || nm == "qkv" || nm == "z" || nm == "h" || nm == "gate" || nm == "beta" || nm == "y";
+                }
             for (int T = 1; T <= TM; ++T) {
-                reset(); run(w, T, alias, false, s); CK(cudaStreamSynchronize(s));
+                reset();
+                if (unf) run(w, T, alias, false, s);
+                else { grid = 0; run(w, T, alias, true, s); grid = gr; }
+                CK(cudaStreamSynchronize(s));
                 const auto ref = snap(T, alias);
                 for (int it = 0; it < iters; ++it) {
                     reset(); run(w, T, alias, true, s); CK(cudaStreamSynchronize(s));
                     const auto g = snap(T, alias);
-                    for (size_t k = 0; k < ref.size(); ++k) for (size_t j = 0; j < ref[k].size(); ++j) { const size_t d = ref[k][j] != g[k][j]; tot += d; perk[k] += d; }
+                    for (size_t k = 0; k < ref.size(); ++k) { if (!use[k]) continue; for (size_t j = 0; j < ref[k].size(); ++j) { const size_t d = ref[k][j] != g[k][j]; tot += d; perk[k] += d; } }
                     if (it == 0) got[T] = g;
                 }
             }
@@ -275,12 +301,13 @@ int main(int argc, char** argv) {
                 }
             for (int T = 1; T < TM; ++T)   // the recurrence's q8_1 rows (token-major)
                 for (size_t j = 0; j < (size_t) T * (ZV / 32) * 36; ++j) prefix += got[T][outs.size()][j] != got[TM][outs.size()][j];
-            std::printf("types %2d/%2d/%2d %s: T1-T4 x%d vs today's kernels %zu differing bytes, T-prefix %zu\n", w.tq, w.tz, w.to, alias ? "yq in xq" : "yq apart", iters, tot, prefix);
+            std::printf("grid %3d types %2d/%2d/%2d %s: T1-T4 x%d vs %s %zu differing bytes, T-prefix %zu\n", gr, w.tq, w.tz, w.to, alias ? "yq in xq" : "yq apart", iters, unf ? "today's kernels" : "the device's grid", tot, prefix);
             if (tot) { std::printf("  differing bytes by output:"); for (size_t k = 0; k < ref_names_n(outs.size()); ++k) std::printf(" %s %zu", k < outs.size() ? outs[k].name : "yq", perk[k]); std::printf("\n"); }
             bad += (int) (tot + prefix);
         }
     }
 
+    grid = 0;
     // the projections against a double-precision CPU reference (Q6_K, then the Q8_0 triple), from the q8_1 rows the kernels read
     for (const size_t li : {(size_t) 0, layers.size() - 1}) {
         const Layer& w = layers[li];
@@ -399,7 +426,7 @@ int main(int argc, char** argv) {
     }
     // the phase ledger of mid_chain (cold weights, a graph of distinct layers with PDL, the stamping instances): times in us
     // from the first CTA's pass of the grid-dependency wait, medians over the layers; first / median / last over the CTAs
-    {
+    if (sms >= K::kMidStampCtas) {   // the ledger's roles are those of the full-size grid
         using K::kMidStampCtas;
         using K::kMidStampPts;
         const int NL = 48;

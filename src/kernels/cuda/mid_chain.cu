@@ -116,14 +116,22 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
     STP(tid == 0, ST_ENTRY);
     unsigned PH = 0;   // mbarrier parities (PB_*)
     unsigned* c = p.cnt + (size_t) p.par * NCTR;
-    const PSplit ps = p_split(b, G, -3);
+    // the full-size grid keeps its tuned split; a smaller one (fewer SMs) deals the tiles round-robin, puts the rec heads on
+    // the last min(heads, G) CTAs (a CTA takes several heads when there are fewer) and gives a CTA several out tiles
+    const bool full = G == R_CTA0 + R_HV;
+    const PSplit ps = full ? p_split(b, G, -3) : p_split(b, G, -1);
     const int mine = ps.n;
-    const bool rec_role = b >= R_CTA0 && b < R_CTA0 + R_HV, out_role = b < O_NOUT / 16;
+    const int rec_n = G < R_HV ? G : R_HV, rec0 = G - rec_n;
+    const bool rec_role = b >= rec0;
+    const int n_heads = rec_role ? (R_HV - (b - rec0) + rec_n - 1) / rec_n : 0;
+    constexpr int O_TILES = O_NOUT / 16;
+    const int n_out = b < O_TILES ? (O_TILES - b + G - 1) / G : 0;
+    const bool out_role = n_out > 0;
     // the weights do not depend on the first read: the CTA's first pair tiles and the rec head's state and conv history
     // are requested before the grid dependency wait
     if (tid == 0) { pfence(); for (int k = 0; k < P.geo.ns && k < mine; ++k) m_fill(p, P, ps, k, sm); }
     if (rec_role && tid == 96) {
-        const int head = b - R_CTA0, qh = head % R_HK, qk = S * R_HK;
+        const int head = b - rec0, qh = head % R_HK, qk = S * R_HK;
         const float* st0 = p.rec.state;
         const float* hist = st0 + (size_t) S * R_HV * S;
         pf_l2(st0 + (size_t) head * S * S, (size_t) S * S * 4);
@@ -131,6 +139,16 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
         pf_l2(hist + (size_t) (qk + qh * S) * 3, (size_t) S * 3 * 4);
         pf_l2(hist + (size_t) (2 * qk + head * S) * 3, (size_t) S * 3 * 4);
     }
+    // the out tile `ot` (16 rows) into the tile region; the next one is prefetched to L2
+    auto out_req = [&](int ot) {
+        pfence();
+        STP(true, ST_OUT_REQ0);
+        mbar_expect_tx(&P.ofull, 16 * P.geo.orb);
+        for (int r = 0; r < 16; ++r) bulk_w2s(sm + r * P.geo.ors, P.lwo + (size_t) (ot * 16 + r) * P.geo.orow, P.geo.orb, &P.ofull);
+        if constexpr (FO == 8) for (int r = 0; r < 16; ++r) pf_l2(P.lwo + (size_t) (ot * 16 + r) * P.geo.orow + P.geo.orb, P.geo.orow - P.geo.orb);   // the row tails
+        if (ot + G < O_TILES) pf_l2(P.lwo + (size_t) ((ot + G) * 16) * P.geo.orow, (size_t) 16 * P.geo.orow);
+        STP(true, ST_OUT_REQ1);
+    };
     pdl_wait();
     STP(tid == 0, ST_WAIT);
     if (b == 0 && tid == 0) for (int k = 0; k < NCTR; ++k) p.cnt[(1 - p.par) * NCTR + k] = 0;   // the set the next launch uses
@@ -144,7 +162,19 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
 #pragma unroll
         for (int j = 0; j < 3; ++j)
             if (mine > 0 && (lw >> 2) + 2 * j < nchunk) pair_xfrag_cg(xs[j], (lw >> 2) + 2 * j, hb, g, t, p.xq, nb32, T);
-        if (ltid == 0 && (gi >= mine || ps.tile(gi) >= P_NTQ)) { STP(true, ST_PAIR_REL + gi); redrel(&c[C_PAIR]); }   // no qkv tile in this group
+        // the rec heads' alpha/beta (job = head * 2T + 2t + beta), dealt over the CTAs of the second group
+        auto ab_jobs = [&]() {
+            const int j0 = full ? (b - Q3_0) * 8 : b * 8, js = full ? 320 : G * 8;
+            for (int j = j0 + lw; j < R_HV * 2 * T; j += js) {
+                const int head = j / (2 * T), r = j % (2 * T);
+                const float v = ab_one_g(P.ra, head, r & 1, r >> 1, lane);
+                if (lane == 0) p.abv[head * 2 * XT + r] = v;
+            }
+            barn(2 + gi, 256);
+        };
+        const bool no_qkv = gi >= mine || ps.tile(gi) >= P_NTQ;   // no qkv tile in this group
+        if (!full && gi == 1 && no_qkv) ab_jobs();
+        if (ltid == 0 && no_qkv) { STP(true, ST_PAIR_REL + gi); redrel(&c[C_PAIR]); }
         for (int k = gi; k < mine; k += 2) {
             const int ns = P.geo.ns, slot = k % ns;
             const uint8_t* s; int by, ty, no, row0; float* y;
@@ -173,14 +203,7 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
                 }
             }
             barn(2 + gi, 256);
-            if (b >= Q3_0 && b < Q3_0 + 40 && gi == 1 && k == 1) {   // the rec heads' alpha/beta (job = head * 2T + 2t + beta)
-                for (int j = (b - Q3_0) * 8 + lw; j < R_HV * 2 * T; j += 320) {
-                    const int head = j / (2 * T), r = j % (2 * T);
-                    const float v = ab_one_g(P.ra, head, r & 1, r >> 1, lane);
-                    if (lane == 0) p.abv[head * 2 * XT + r] = v;
-                }
-                barn(2 + gi, 256);
-            }
+            if (gi == 1 && (full ? (b >= Q3_0 && b < Q3_0 + 40 && k == 1) : qrel)) ab_jobs();
             if (ltid == 0 && qrel) { STP(true, ST_PAIR_REL + gi); redrel(&c[C_PAIR]); }
             if (ltid == 0 && k + ns < mine && qrel) { pfence(); m_fill(p, P, ps, k + ns, sm); }   // after the release
         }
@@ -192,18 +215,11 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
     }
     if (p.pair_only != 0) return;
     // ======== out tile into smem (the pair's ring is free; rec lives above it)
-    if (out_role && !rec_role && tid == 32) {
-        pfence();
-        STP(true, ST_OUT_REQ0);
-        mbar_expect_tx(&P.ofull, 16 * P.geo.orb);
-        for (int r = 0; r < 16; ++r) bulk_w2s(sm + r * P.geo.ors, P.lwo + (size_t) (b * 16 + r) * P.geo.orow, P.geo.orb, &P.ofull);
-        if constexpr (FO == 8) for (int r = 0; r < 16; ++r) pf_l2(P.lwo + (size_t) (b * 16 + r) * P.geo.orow + P.geo.orb, P.geo.orow - P.geo.orb);   // the row tails
-        STP(true, ST_OUT_REQ1);
-    }
-    // ======== rec (48 CTAs, head = b - R_CTA0; rec_rank's code with RecS)
-    if (rec_role) {
+    if (out_role && !rec_role && tid == 32) out_req(b);
+    // ======== rec (the heads over the last CTAs; rec_rank's code with RecS)
+    for (int hi = 0; hi < n_heads; ++hi) {
         const DecRecArgs& a = P.ra;
-        const int head = b - R_CTA0, rank = tid / 128, ltid = tid % 128, rg = ltid / 32, bid = 8 + rank, col = rank * 32 + lane;
+        const int head = b - rec0 + hi * rec_n, rank = tid / 128, ltid = tid % 128, rg = ltid / 32, bid = 8 + rank, col = rank * 32 + lane;
         const int qh = head % a.h_k, qk = S * a.h_k, value_dim = S * a.h_v, Cc = a.C;
         const int cq = qh * S + ltid, ck = qk + qh * S + ltid, cv = 2 * qk + head * S + col;
         float wq[4], wk[4], wv[4], hq[3], hk[3], hv[3];
@@ -272,14 +288,7 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
             for (int r = 0; r < RPG; ++r) sreg[r] = stile[(rg * RPG + r) * S + col];
         }
         cbar();   // the state tile is consumed (the out tile lands there); also the ranks' qn/kn
-        if (out_role && tid == 32) {
-            pfence();
-            STP(true, ST_OUT_REQ0);
-            mbar_expect_tx(&P.ofull, 16 * P.geo.orb);
-            for (int r = 0; r < 16; ++r) bulk_w2s(sm + r * P.geo.ors, P.lwo + (size_t) (b * 16 + r) * P.geo.orow, P.geo.orb, &P.ofull);
-            if constexpr (FO == 8) for (int r = 0; r < 16; ++r) pf_l2(P.lwo + (size_t) (b * 16 + r) * P.geo.orow + P.geo.orb, P.geo.orow - P.geo.orb);   // the row tails
-            STP(true, ST_OUT_REQ1);
-        }
+        if (out_role && hi == n_heads - 1 && tid == 32) out_req(b);
         float wsum_t = 0.0f;
         for (int t = 0; t < T; ++t) {
             const float gg = __expf(RS_.g[rank][t]);
@@ -342,6 +351,9 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
             cbar();
         }
         STP(tid == 0, ST_O_REC);
+#pragma unroll 1
+        for (int oj = 0; oj < n_out; ++oj) {
+        const int ot = b + oj * G;
         MW(&P.ofull, PB_OW);
         STP(tid == 0, ST_OFULL);
         const uint8_t* slot = reinterpret_cast<const uint8_t*>(sm);
@@ -381,7 +393,7 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
                     constexpr int SB = Fmt<8>::SB;
                     const uint8_t* pp[2] = {rowA + cch * 2 * SB, rowB + cch * 2 * SB};
                     if (cch >= O_Q8_SMEM_CH) {   // past the smem part: this CTA's rows in the weights (prefetched to L2)
-                        const uint8_t* gw = P.lwo + (size_t) (b * 16) * P.geo.orow + sbi * osb + cch * 2 * SB;
+                        const uint8_t* gw = P.lwo + (size_t) (ot * 16) * P.geo.orow + sbi * osb + cch * 2 * SB;
                         pp[0] = gw + (size_t) g * P.geo.orow; pp[1] = gw + (size_t) (g + 8) * P.geo.orow;
                     }
                     half_sb_terms<8>(acc, pp, n, t, xf, 0u, 0u, 0u, 0u, P.grid);
@@ -450,6 +462,7 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
             }
         }
         cbar();
+        if (oj + 1 < n_out && tid == 32) out_req(ot + G);   // the tile region is free
         if (tid < 16 * RC) {
             const int row = tid / RC, col = tid % RC;
             if (col < T) {
@@ -469,8 +482,10 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
                     }
                     bov = (h[0] + h[1]) + (h[2] + h[3]);
                 }
-                P.lbo[(size_t) col * O_NOUT + b * 16 + row] = bov;
+                P.lbo[(size_t) col * O_NOUT + ot * 16 + row] = bov;
             }
+        }
+        cbar();   // the reduction has read this tile's partial sums
         }
         STP(tid == 0, ST_O_DONE);
     }
@@ -486,6 +501,7 @@ using namespace mkmid;
 
 struct MidDev {
     bool checked = false, ok = false;
+    int ctas = 0;              // the grid: one CTA per SM, at most kMidCtas
     unsigned* cnt = nullptr;   // [2][NCTR] hand-off counters, then the arrival ticket
     float* abv = nullptr;
 };
@@ -498,7 +514,8 @@ MidDev& mid_dev() {
     return g_mid[dev];
 }
 
-constexpr int kMidCtas = R_CTA0 + R_HV;
+constexpr int kMidCtas = R_CTA0 + R_HV;   // the grid that keeps the tuned split; a device with fewer SMs gets one CTA per SM
+constexpr int kMidMinCtas = 16;
 using MFn = void (*)(MP);
 bool type_ok(int t) { return t == 8 || t == 12 || t == 13 || t == 14 || t == 21 || t == 23; }
 // Q8_0 has its own instance: all three types Q8_0, not the stamping build
@@ -542,10 +559,11 @@ void mid_chain_init() {
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-    if (!hc_fused_supported() || sms < kMidCtas || optin < SMEM_MAX) {
-        basalt::log::warn("basalt", "mid_chain: device not covered (%d SMs, %d B optin smem; need %d, %d): the unfused kernels run", sms, optin, kMidCtas, SMEM_MAX);
+    if (!hc_fused_supported() || sms < kMidMinCtas || optin < SMEM_MAX) {
+        basalt::log::warn("basalt", "mid_chain: device not covered (%d SMs, %d B optin smem; need %d, %d): the unfused kernels run", sms, optin, kMidMinCtas, SMEM_MAX);
         return;
     }
+    d.ctas = sms < kMidCtas ? sms : kMidCtas;
     bool ok = cudaMalloc((void**) &d.cnt, (2 * NCTR + 1) * 4) == cudaSuccess &&
               cudaMemset(d.cnt, 0, (2 * NCTR + 1) * 4) == cudaSuccess &&
               cudaMalloc((void**) &d.abv, (size_t) R_HV * 2 * XT * 4) == cudaSuccess;
@@ -569,7 +587,7 @@ int mid_chain_ring_slots(int type_q, int type_z, int type_o) { return make_geo(t
 
 bool mid_chain_supported(const MidChainArgs& a) {
     const MidDev& d = mid_dev();
-    return d.ok && a.T >= 1 && a.T <= kMidChainMaxT && types_ok(a) &&
+    return d.ok && a.ctas >= 0 && a.ctas <= d.ctas && (a.ctas == 0 || a.ctas >= kMidMinCtas) && a.T >= 1 && a.T <= kMidChainMaxT && types_ok(a) &&
            a.xq != nullptr && a.bo != nullptr && a.rec.yq != nullptr && a.rec.qkv != nullptr && a.rec.z != nullptr &&
            ((uintptr_t) a.wq & 15) == 0 && ((uintptr_t) a.wz & 15) == 0 && ((uintptr_t) a.wo & 15) == 0 &&
            ((uintptr_t) a.rec.state & 15) == 0 && ((uintptr_t) a.xq & 3) == 0 && a.rec.n_embd == 2560 && a.rec.h_v == R_HV &&
@@ -607,7 +625,7 @@ void mid_chain(const MidChainArgs& a, void* stream) {
     // set the next one uses once their predecessor has completed (see the kernel)
     p.par = (unsigned) (a.ord & 1);
     if (a.ord == 0) cudaMemsetAsync(d.cnt, 0, (2 * NCTR + 1) * 4, (cudaStream_t) stream);
-    launch_pdl(mid_pick(a.T, a.type_q, a.type_z, a.type_o, a.stamps != nullptr), dim3(kMidCtas), dim3(CT), (size_t) SMEM_MAX, (cudaStream_t) stream, p);
+    launch_pdl(mid_pick(a.T, a.type_q, a.type_z, a.type_o, a.stamps != nullptr), dim3(a.ctas > 0 ? a.ctas : d.ctas), dim3(CT), (size_t) SMEM_MAX, (cudaStream_t) stream, p);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         basalt::log::error("basalt", "mid_chain: %s", cudaGetErrorString(e));

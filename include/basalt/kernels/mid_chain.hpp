@@ -3,7 +3,7 @@
 // qkv + z projections -> recurrence -> output projection, the same operations (and bits) as dense_tc_pair,
 // dec_gdn_rec and dense_tc in sequence.  It runs between the layer's two hc reads (which stay hc_fused_read): its input
 // is the first read's q8_1 rows and mixed output, its result the output projection's `bo`, which the second read adds.
-// One CTA per SM; the phases hand over through counters in global memory.  The kernel needs every CTA resident, so it
+// One CTA per SM (a device with fewer than 170 SMs runs fewer, each taking more tiles and heads); the phases hand over through counters in global memory.  The kernel needs every CTA resident, so it
 // must be launched with the stream drained of kernels that wait on later work (it is a programmatic dependent of the
 // first read and the second read is its dependent).
 #pragma once
@@ -24,6 +24,7 @@ struct MidChainArgs {
     DecRecArgs rec;                  ///< rec.qkv / rec.z are the projections' outputs; rec.yq may alias xq
     float* bo = nullptr;             ///< the output projection's result, row t at bo + t * 2560
     int ord = 0;                     ///< launch ordinal within the graph (0 = the first: it zeroes the hand-off counters first)
+    int ctas = 0;                    ///< bench/test: a grid smaller than the device's (0: one CTA per SM, at most 170)
     bool pair_only = false;          ///< bench: stop after the projection pair
     unsigned long long* stamps = nullptr;   ///< bench: [ord][kMidStampCtas][kMidStampPts] phase times (null: no stamping)
 };

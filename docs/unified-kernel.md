@@ -11,6 +11,7 @@ Two pieces of the unified-kernel work are in the engine; the full-layer kernel i
 
 - The mid chain runs for windows of one to four rows, on every pack whose GDN projection triple (qkv, z, out) `mid_chain_supported` accepts. Types accepted for each of the three: Q4_K, Q5_K, Q6_K, IQ3_S, IQ4_XS. `(14, 14, 14)` and `(23, 21, 12)` have specialised instances; any other combination of those types uses the generic one. A pack with Q8_0 or another type in a GDN projection keeps the three separate kernels.
 - The pair ring always has an even slot count, because the two tile groups take alternate tiles: an odd ring would give a slot consecutive tiles from different groups, and one group could pass its wait before the data arrived. The parity test checks the ring size for every type triple.
+- The grid is one CTA per SM, at most 170. Below 170 SMs the pair tiles are dealt round-robin, the recurrence heads go to the last min(48, SMs) CTAs (several per CTA when there are fewer) and a CTA takes several output tiles; a tile's bits do not depend on which CTA computes it. `hc_fused_read` claims its work items from a queue, so it runs on any SM count too. A device with fewer than 160 SMs has no one-tile output projection in the unfused path: there the mid chain's output projection uses the one-tile reduction order, which differs from that device's unfused kernels (and matches the larger device's).
 - QSA layers, windows of five or more rows, batched windows and profiled runs keep the separate kernels.
 - Arithmetic and reduction order are those of the kernels it replaces: bitwise identical output and state, no numerics change.
 - The kernel needs every CTA resident, so it is a programmatic dependent of the first read and the second read is its dependent. The attention-chain header keeps the phase code (pair, recurrence, output) and the bounded waits (`attn_chain_bound.cuh` traps instead of hanging).
@@ -18,7 +19,7 @@ Two pieces of the unified-kernel work are in the engine; the full-layer kernel i
 
 ## Tests
 
-- `mid_chain_parity`: the kernel against `dense_tc_pair`, `dec_gdn_rec` and `dense_tc` in sequence, bitwise, every type triple, windows of one to four rows; it prints the phase ledger and has a microbench.
+- `mid_chain_parity`: the kernel against `dense_tc_pair`, `dec_gdn_rec` and `dense_tc` in sequence, bitwise, every type triple, windows of one to four rows, then smaller grids against the device's own; it prints the phase ledger and has a microbench.
 - `dec_commit_parity` and `dec_commit_finisher` (`--finisher`): the finisher run before, during and after the commit, with a microbench.
 - `dec_commit_lazy` (`--lazy`): the in-window commit against the commit kernel and a CPU reference, and its read-ahead, with a microbench.
 
