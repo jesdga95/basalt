@@ -393,6 +393,26 @@
       "prefill_16k_tps": 3892.1,
       "prefill_64k_tps": 4215.1,
       "decode_tps": 243.0
+    },
+    {
+      "submitter": "foolio",
+      "date": "2026-10-24",
+      "commit": "702c08f783",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX PRO 4000 Blackwell",
+          "vram_gib": 24,
+          "power_w": 145
+        }
+      ],
+      "ram_gib": 123,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 4072.5,
+      "prefill_64k_tps": 4193.3,
+      "decode_tps": 130.6,
+      "notes": "official HF pack (SHA 264e2f6b00d01dd32f68a401c9d7ec8256f4b15b58cf23b23bfdfa8803d08ae3), weights on NVMe"
     }
   ]
 }
