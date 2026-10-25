@@ -14,7 +14,10 @@ path, used while one request runs alone, has the same length, so a request that 
 one that does not is refused with a 400 naming that length. `/slots`, `/props` and `/v1/models` report the context
 each slot has. `--slot-full-context` (also `"slot-full-context"` in the config's `server` section) gives every slot
 the whole `--max-context` instead, at N times the KV cache; the startup line says so. The slots' KV cache, and one
-solo session of the same length, come out of the expert cache.
+solo session of the same length, come out of the expert cache. Each slot keeps two conversation checkpoints, the end
+of its system prompt and its last turn (each when at least `--prompt-cache-root` tokens lie before it), and a new
+request reads only what follows the longest start it shares with any slot's checkpoint, decoding or idle: requests that
+share a long system prompt read it once.
 
 Every chat, messages and responses request must name the served model in `model`: the alias (or the model's name) that `/v1/models` lists, or the model file's name. An unknown or missing name is a 404 in the API's own error shape, and replies always carry the served name.
 

@@ -8109,11 +8109,16 @@ int main(int argc, char** argv) {
             int64_t slot_tokens = 0;
             bool resumed_from0 = false;   // a prompt read parked in a slot (BYIELD) that had started at token 0
             const ConvCheckpoint* slot_ck = nullptr;   // the slot's checkpoint the prompt continues from (else its end)
-            if (o.prompt_cache > 0 && !in_slot)
+            // the slot this request reads into: its own conversation is `live` already
+            const int own_slot = in_slot ? slot_b : slot0_is_solo ? 0 : -1;
+            // A decoding slot's checkpoints are sources too: the K/V before a checkpoint never changes, so requests that
+            // share a start (a system prompt) read it once, whichever slot holds it.
+            if (o.prompt_cache > 0)
                 for (int b = 0; b < (int) bs.size(); ++b) {
                     const BSlot& sl = bs[(size_t) b];
-                    if (sl.active || !sl.cached || sl.cvec != want_cvec) continue;
-                    if ((int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, sl.imgs)) {
+                    if (b == own_slot || (!sl.active && !sl.cached) || sl.cvec != want_cvec) continue;
+                    if (!in_slot && !sl.active && (int64_t) sl.ids.size() > std::max(resume, slot_tokens) &&
+                        starts_with(sl.ids, sl.imgs)) {
                         slot_source = b;
                         slot_tokens = (int64_t) sl.ids.size();
                         slot_ck = nullptr;
@@ -8125,6 +8130,14 @@ int main(int argc, char** argv) {
                             slot_ck = &c;
                         }
                 }
+            // a request in another slot: the solo session's chain is slot 0's conversation, a source like the rest
+            if (o.prompt_cache > 0 && in_slot && slot0_is_solo && solo_book.cvec == want_cvec)
+                for (const ConvCheckpoint& c : solo_book.checks)
+                    if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) && starts_with(c.ids, c.imgs)) {
+                        slot_source = 0;
+                        slot_tokens = (int64_t) c.ids.size();
+                        slot_ck = &c;
+                    }
             const auto parked = conversations.best(ids32, req_imgs, want_cvec);
             std::optional<basalt::core::SavedConversation> incoming;
             if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
@@ -8860,10 +8873,16 @@ int main(int argc, char** argv) {
                         break;
                     }
             // A short read into a slot beside decoding slots is not split: each part pays the lend, refill and
-            // side-thread costs again, and a checkpoint stalls the windows.
+            // side-thread costs again, and a checkpoint stalls the windows.  One that runs alone stops at its root,
+            // and at its turn boundary only past --prompt-cache-root tokens since the root: a short history is
+            // cheaper to read again than the extra part costs.
             if (in_slot && batch_on() && n - 1 - read_from <= std::max<int64_t>(sp.chunk(), 1)) {
-                turn_at = -1;
-                root_at = -1;
+                if (n - 1 - read_from > kReadAlone) {
+                    turn_at = -1;
+                    root_at = -1;
+                } else if (turn_at - std::max(read_from, root_at) < o.prompt_cache_root) {
+                    turn_at = -1;
+                }
             }
             // the parts after the first read their n-gram rows from memory: once the first part has its own, the rest
             // are read into the row cache beside it
@@ -9634,11 +9653,16 @@ int main(int argc, char** argv) {
                     sl.cvec = cvec_cached;
                     sl.imgs = live_imgs;
                                     sl.guard = std::move(gguard);   // the request's grammar, already past the tokens the request decoded here
-                    const ConvCheckpoint* best = nullptr;
+                    // the slot keeps its conversation's longest checkpoint (its next turn) and its shortest (the
+                    // system prompt, which other requests may share)
+                    const ConvCheckpoint *best = nullptr, *root = nullptr;
                     for (const ConvCheckpoint& c : checks)
-                        if (c.ids.size() < live.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&
-                            basalt::core::conversation_ids_equal(c.ids.data(), c.ids.size(), live.data()))
-                            best = &c;
+                        if (c.ids.size() < live.size() &&
+                            basalt::core::conversation_ids_equal(c.ids.data(), c.ids.size(), live.data())) {
+                            if (best == nullptr || c.ids.size() > best->ids.size()) best = &c;
+                            if (root == nullptr || c.ids.size() < root->ids.size()) root = &c;
+                        }
+                    if (root != nullptr && root != best) sl.checks.push_back(*root);
                     if (best != nullptr) sl.checks.push_back(*best);
                     basalt::log::info("basalt batch", "slot %d takes %lld tokens (copied in %.1f ms)", admit_slot,
                                  (long long) live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
