@@ -1147,33 +1147,25 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(vision_line(None, {}), "[server] vision mode: off")
         cpu = vision_line({"gpu": False, "mode": "cpu"}, {}, 2.34)
         self.assertRegex(cpu, r"^\[server\] vision mode: cpu, \d+ threads, ready in 2\.3 s$")
-        self.assertEqual(vision_line({"gpu": True, "mode": "peer"}, {"gpu": "0,1"}, 5.0, name=name),
-                         "[server] vision mode: peer, GPU 1 (card1), ready in 5.0 s")
-        self.assertEqual(vision_line({"gpu": True, "mode": "peer"}, {"gpu": "0"}, 5.0, name=lambda i: None),
-                         "[server] vision mode: peer, GPU 0, ready in 5.0 s")
-        self.assertEqual(vision_line({"gpu": True, "mode": "on"}, {"gpu": "0,1"}, 5.0, name=name),
-                         "[server] vision mode: on, GPU 0 (card0), ready in 5.0 s")
+        self.assertEqual(vision_line({"gpu": True, "mode": "1"}, {"gpu": "0,1"}, 5.0, name=name),
+                         "[server] vision mode: GPU 1 (card1), ready in 5.0 s")
+        self.assertEqual(vision_line({"gpu": True, "mode": "2"}, {"gpu": "0"}, 5.0, name=lambda i: None),
+                         "[server] vision mode: GPU 2, ready in 5.0 s")
         self.assertEqual(vision_line({"gpu": True, "mode": "dynamic"}, {"gpu": "0,1"}, 0.0, name=name),
                          "[server] vision mode: dynamic, GPU 0 (card0), loads per image")
 
     def test_vision_device(self):
-        from serve.engine.vision import child_env, vision_env
-        cfg = {"gpu": "0,1"}
-        env = child_env(cfg)
-        venv = vision_env(cfg, env)                         # peer: the second card
-        self.assertEqual(venv["CUDA_VISIBLE_DEVICES"], "1")
-        self.assertEqual(venv["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
-        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1")
-        main = vision_env(cfg, env, "on")                 # true: the model's own card
-        self.assertEqual(main["CUDA_VISIBLE_DEVICES"], "0")
-        self.assertEqual(main["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
-        self.assertIs(vision_env({"gpu": "0"}, env), env)   # one card listed: the engine's environment
-        self.assertIs(vision_env({"gpu": "0"}, env, "on"), env)
-        self.assertIs(vision_env({}, env), env)             # none chosen: the engine's environment
-        self.assertIs(vision_env({}, env, "on"), env)
-        swapped = {"gpu": "1,0"}                            # the order chosen: the peer is the second
-        self.assertEqual(vision_env(swapped, child_env(swapped))["CUDA_VISIBLE_DEVICES"], "0")
-        self.assertEqual(child_env(swapped)["CUDA_VISIBLE_DEVICES"], "1,0")
+        from serve.engine.vision import child_env, vision_card, vision_env
+        env = child_env({"gpu": "0,1"})
+        pinned = vision_env(env, "2")                       # the sidecar's own card, in gpu's numbering
+        self.assertEqual(pinned["CUDA_VISIBLE_DEVICES"], "2")
+        self.assertEqual(pinned["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+        self.assertEqual(vision_env(env, 2)["CUDA_VISIBLE_DEVICES"], "2")   # a number as well as a string
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1")                # the engine's environment untouched
+        self.assertIs(vision_env(env, "cpu"), env)                          # the other modes inherit it
+        self.assertIs(vision_env(env, "dynamic"), env)
+        self.assertIsNone(vision_card("off"))
+        self.assertEqual(vision_card("3"), 3)
 
     def test_gpu_plan(self):
         from serve.engine.vision import check_gpu, gpu_plan, gpu_text
@@ -1199,11 +1191,11 @@ class GpuChoice(unittest.TestCase):
 
     def test_vision_modes(self):
         from serve.engine.vision import vision_mode
-        for given, want in ((None, "off"), ("off", "off"), ("on", "on"), ("Peer", "peer"), ("dynamic", "dynamic"),
-                            ("cpu", "cpu")):
+        for given, want in ((None, "off"), ("off", "off"), ("dynamic", "dynamic"), ("cpu", "cpu"),
+                            ("2", "2"), (1, "1"), ("01", "1")):
             self.assertEqual(vision_mode(given), want)
-        for bad in (True, False, "true", "false", "gpu"):
-            with self.assertRaisesRegex(ValueError, "vision: use one of on, off, peer, dynamic, cpu"):
+        for bad in (True, False, "true", "false", "gpu", "on", "peer", "-1", "1.5", "٢", "²"):
+            with self.assertRaisesRegex(ValueError, "vision: use one of off, dynamic, cpu or a GPU number"):
                 vision_mode(bad)
 
 

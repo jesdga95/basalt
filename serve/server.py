@@ -30,7 +30,7 @@ from serve.engine.flags import flag_index  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.engine.process import ProcessEngine  # noqa: E402
 from serve.engine.vision import (EngineVision, Vision, check_gpu, child_env, engine_args, gpu_plan,  # noqa: E402
-                                 gpu_text, gpus_in_play, peer_card, vision_env, vision_line)
+                                 gpu_text, gpus_in_play, vision_card, vision_env, vision_line)
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.handler import Server, serve  # noqa: E402
 from serve.security import (LOOPBACK_NAMES, allowed_hosts_of, api_key_of, exposed_without_key,  # noqa: E402
@@ -111,6 +111,12 @@ def main() -> int:
                 plan = gpu_plan(a.engine_bin, a.gpu)
             except ValueError as e:
                 fail(f"gpu: {e}")
+            card = vision_card(mode)
+            if card is not None:                       # a numbered sidecar card, checked like gpu before it starts
+                try:
+                    gpu_plan(a.engine_bin, str(card))
+                except ValueError as e:
+                    fail(f"vision: {e}")
             for note in plan.get("notes") or []:
                 print(f"[server] {note}", flush=True)
             if plan.get("warning"):
@@ -157,14 +163,11 @@ def main() -> int:
             del cfg["vision"]
         if cfg.get("vision"):
             mode = cfg["vision"].get("mode")
-            if mode == "peer" and peer_card(cfg) is None:
-                print("[server] warning: --vision peer needs a second GPU in --gpu; the encoder is loaded on the "
-                      "only GPU", flush=True)
             if mode == "dynamic":
                 vision = EngineVision(cfg["vision"])
             else:
                 vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                                env=vision_env(cfg, env, "on" if mode == "on" else "peer"))
+                                env=vision_env(env, mode))
         print(vision_line(cfg.get("vision"), cfg, vision.ready_s if vision else 0.0), flush=True)
         if lazy:
             print("[server] model unloaded, the first request loads it", flush=True)

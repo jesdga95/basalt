@@ -355,38 +355,35 @@ def child_env(cfg: dict) -> dict:
     return env
 
 
-VISION_MODES = ("on", "off", "peer", "dynamic", "cpu")
-VISION_USAGE = "vision: use one of " + ", ".join(VISION_MODES)
+VISION_MODES = ("off", "dynamic", "cpu")
+VISION_USAGE = "vision: use one of " + ", ".join(VISION_MODES) + " or a GPU number, as nvidia-smi numbers them"
 
 
 def vision_mode(value) -> str:
-    """The --vision setting as one of VISION_MODES (None: "off"); booleans and anything else are a ValueError."""
+    """The --vision setting: one of VISION_MODES (None: "off") or a GPU number as a string (the sidecar's own
+    card); booleans and anything else are a ValueError."""
     if value is None:
         return "off"
     text = str(value).strip().lower()
-    if isinstance(value, bool) or text not in VISION_MODES:
-        raise ValueError(f"{VISION_USAGE} (got {value!r})")
-    return text
+    if text in VISION_MODES:
+        return text
+    if text.isascii() and text.isdigit():                 # odd Unicode digits are the error, not int()'s guess
+        return str(int(text))
+    raise ValueError(f"{VISION_USAGE} (got {value!r})")
 
 
-def peer_card(cfg: dict):
-    """The card the peer tier runs on (the second chosen card); None without a second card."""
-    gpus = gpu_list(cfg)
-    return gpus[1] if len(gpus) >= 2 else None
+def vision_card(mode) -> int | None:
+    """The GPU number a vision mode names (the sidecar's own card); None for off, dynamic and cpu."""
+    text = str(mode).strip()
+    return int(text) if text.isascii() and text.isdigit() else None
 
 
-def vision_env(cfg: dict, env: dict, mode: str = "peer") -> dict:
-    """The encoder process's environment: `peer` puts it on the second card alone (the engine's when there is none),
-    `on` on the model's own card alone."""
-    gpus = gpu_list(cfg)
-    if mode == "on":
-        if len(gpus) < 2:
-            return env
-        card = gpus[0]
-    else:
-        if len(gpus) < 2:
-            return env
-        card = gpus[1]
+def vision_env(env: dict, mode) -> dict:
+    """The encoder process's environment: a GPU-numbered vision mode runs the sidecar on that card alone; the
+    other modes inherit the engine's environment."""
+    card = vision_card(mode)
+    if card is None:
+        return env
     env = dict(env)
     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     env["CUDA_VISIBLE_DEVICES"] = str(card)
@@ -409,18 +406,16 @@ def vision_line(vision: dict | None, cfg: dict, ready_s: float = 0.0, name=gpu_c
     if not vision:
         return "[server] vision mode: off"
     took = f"ready in {ready_s:.1f} s"
-    mode = vision.get("mode") or ("peer" if vision.get("gpu") else "cpu")
+    mode = vision.get("mode") or "cpu"
     listed = gpu_list(cfg)
     main = listed[0] if listed else 0
 
     def card(i):
         n = name(i)
         return f"GPU {i}{f' ({n})' if n else ''}"
-    if mode == "cpu" or not vision.get("gpu"):
-        return f"[server] vision mode: cpu, {max(1, (os.cpu_count() or 2) // 2)} threads, {took}"
+    gpu = vision_card(mode)
+    if gpu is not None:
+        return f"[server] vision mode: {card(gpu)}, {took}"
     if mode == "dynamic":
         return f"[server] vision mode: dynamic, {card(main)}, loads per image"
-    if mode == "on":
-        return f"[server] vision mode: on, {card(main)}, {took}"
-    other = peer_card(cfg)
-    return f"[server] vision mode: peer, {card(other if other is not None else main)}, {took}"
+    return f"[server] vision mode: cpu, {max(1, (os.cpu_count() or 2) // 2)} threads, {took}"

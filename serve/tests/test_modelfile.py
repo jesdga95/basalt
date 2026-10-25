@@ -138,13 +138,13 @@ class Vision(Tmp):
     def test_gpu_or_cpu_encoder(self):
         path = self.build(vision=True)
         (self.engine_bin.parent / "basalt-vision").write_text("")
-        self.assertTrue(modelfile.model_config(path, str(self.engine_bin), vision=True)["vision"]["gpu"])
+        self.assertTrue(modelfile.model_config(path, str(self.engine_bin), vision="1")["vision"]["gpu"])
         self.assertFalse(modelfile.model_config(path, str(self.engine_bin), vision="cpu")["vision"]["gpu"])
 
     def test_modes_name_the_encoder(self):
         path = self.build(vision=True)
         (self.engine_bin.parent / "basalt-vision").write_text("")
-        for mode, name in (("on", "on"), (True, "on"), ("peer", "peer"), ("cpu", "cpu"), ("dynamic", "dynamic")):
+        for mode, name in (("1", "1"), ("0", "0"), ("cpu", "cpu"), ("dynamic", "dynamic")):
             self.assertEqual(modelfile.model_config(path, str(self.engine_bin), vision=mode)["vision"]["mode"], name)
 
     def test_dynamic_gives_the_engine_the_projector_and_needs_no_sidecar(self):
@@ -155,12 +155,12 @@ class Vision(Tmp):
         self.assertIn("--vision", cfg["args"])
         self.assertNotIn("--vision-mmproj", modelfile.model_config(path, str(self.engine_bin))["args"])
         with self.assertRaisesRegex(ValueError, "basalt-vision"):
-            modelfile.model_config(path, str(self.engine_bin), vision="peer")
+            modelfile.model_config(path, str(self.engine_bin), vision="1")
 
     def test_error_when_the_sidecar_is_missing(self):
         path = self.build(vision=True)
         with self.assertRaisesRegex(ValueError, "basalt-vision"):
-            modelfile.model_config(path, str(self.engine_bin), vision=True)
+            modelfile.model_config(path, str(self.engine_bin), vision="1")
 
     def test_error_when_the_model_has_no_projector(self):
         path = self.build(vision=False)
@@ -194,7 +194,7 @@ class Cli(Tmp):
         from serve import server
         path = self.build(vision=True)
         base = ["--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0"]
-        for flags, want in (([], False), (["--vision", "on"], "on"), (["--vision", "peer"], "peer"),
+        for flags, want in (([], False), (["--vision", "1"], "1"),
                             (["--vision", "dynamic"], "dynamic"), (["--vision", "cpu"], "cpu"), (["--vision", "off"], False)):
             with mock.patch.object(modelfile, "model_config", side_effect=ValueError("stop")) as mc, \
                     mock.patch("sys.stderr", io.StringIO()):
@@ -205,9 +205,26 @@ class Cli(Tmp):
         path = self.build(vision=True)
         err = io.StringIO()
         with mock.patch("sys.stderr", err):
-            e = self.run_main("--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0", "--vision", "on")
+            e = self.run_main("--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0", "--vision", "1")
         self.assertEqual(getattr(e, "code", None), 2)
         self.assertIn("basalt-vision", err.getvalue())
+
+    def test_vision_numbered_card_is_checked_at_startup(self):
+        path = self.build(vision=True)
+        (self.engine_bin.parent / "basalt-vision").write_text("")
+        base = ["--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0"]
+
+        def plan(engine_bin, value):                     # a fake --gpu-plan: card 0 Blackwell, card 9 refused
+            if str(value) == "9":
+                raise ValueError("GPU 9 is sm_86, not sm_120")
+            return {"devices": [0], "cards": [{"smi": 0}], "notes": [], "warning": None}
+        with mock.patch("serve.server.gpu_plan", side_effect=plan), mock.patch("sys.stderr", io.StringIO()) as err:
+            e = self.run_main(*base, "--vision", "9")
+        self.assertEqual(getattr(e, "code", None), 2)
+        self.assertIn("vision: GPU 9 is sm_86, not sm_120", err.getvalue())
+        with mock.patch("serve.server.gpu_plan", side_effect=plan):
+            e = self.run_main(*base, "--vision", "0")   # a visible card gets through to the Server
+        self.assertIsInstance(e, RuntimeError)
 
 
 if __name__ == "__main__":

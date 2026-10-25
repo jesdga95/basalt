@@ -25,7 +25,7 @@ The experts the card cannot hold stay in page-locked RAM.
 
 ## A GPU and a second, smaller card as the peer expert tier
 
-Listing two cards makes the second one the peer tier. `vision: peer` puts the image encoder there too.
+Listing two cards makes the second one the peer tier. `"vision": 1` runs the image encoder on that card too.
 
 ```json
 {
@@ -34,7 +34,7 @@ Listing two cards makes the second one the peer tier. `vision: peer` puts the im
     "gpu": "0,1",
     "host": "127.0.0.1",
     "port": 8080,
-    "vision": "peer"
+    "vision": 1
   },
   "engine": {
     "max-context": 262144,
