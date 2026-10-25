@@ -9,6 +9,7 @@ the model file's sampling defaults. For what a setting does to speed, memory and
 - [Model and GPUs](#model-and-gpus)
 - [Context and KV cache](#context-and-kv-cache)
 - [Expert cache and memory](#expert-cache-and-memory)
+- [Prompt processing](#prompt-processing)
 - [Speculative decoding (MTP)](#speculative-decoding-mtp)
 - [Parallel slots](#parallel-slots)
 - [Conversation cache](#conversation-cache)
@@ -144,6 +145,9 @@ The model's experts live in VRAM (the expert cache), in RAM, or in the file. The
 | `expert-profile-save` | engine | file path | off | Save what the adaptive tier learned (experts in VRAM and routing counts) to this file on exit and periodically. `tools/convert/convert.py --profile` reads it. |
 | `expert-profile-save-every` | engine | minutes | 10 (`0` = on exit only) | How often the profile is saved. |
 | `vram-elastic` | engine | switch | off | Hold the expert cache in segments so `POST /v1/vram` can lend VRAM to other programs between requests. Works with `resident-experts`: a shrink first copies the experts it gives back into RAM, so none is read from the file, and is refused (nothing changed) when the RAM above the floor cannot hold them; a grow frees those copies. |
+| `expert-cache` | engine | `auto`, or an integer count of expert blobs | `auto` (on packs with an expert profile) | Keep this many expert blobs in VRAM and compute their rows on the GPU. `auto` takes as many as fit in the VRAM left after the weights, the session and `vram-reserve-mib`. |
+| `adapt-swaps` | engine | integer | 96 (`0` = off) | Most experts one adaptive round swaps into the main GPU. `0` turns the swaps off. |
+| `peer-adapt-swaps` | engine | integer | the value of `adapt-swaps` | Peer card cache swaps per adaptation step. Only with a peer card. |
 
 ### The adaptive tier
 
@@ -157,6 +161,16 @@ engine diagnostic flags; with adaptation off the tiers stay as loaded and `exper
 The startup lines `RAM floor ...` and `RAM ... free, guard ...` give the figures behind the memory floors. See the
 [running](../running.md#memory-floors).
 
+## Prompt processing
+
+The prompt is read in batched chunks. These settings set the chunk size and how the streamed experts are shared.
+
+| Setting | Where | Type, values | Default | What it does and when to change it |
+| --- | --- | --- | --- | --- |
+| `prefill` | engine | `auto`, `auto:N` (N = 8192, 16384 or 32768), or a chunk size in tokens | `auto` | Read the prompt in chunks of this many tokens. `auto` takes the largest chunk the expert cache can lend, up to a ceiling; `auto:N` sets that ceiling. |
+| `prefill-cpu-share` | engine | number from 0 to 1 | 0.6 | Share of the streamed prompt experts the CPU computes; `0` has the GPU stream them all. Fixed, so the output is the same from run to run. A weaker CPU may prefer a lower value. |
+| `peer-prefill-rows` | engine | integer rows per layer | half of chunk x top-k | Prompt rows per layer the peer card computes. `0` keeps the prompt path on the main card. |
+
 ## Speculative decoding (MTP)
 
 The drafter proposes tokens and the model verifies them. Unless `relaxed-drafting` is on, the output is exactly what
@@ -164,6 +178,7 @@ plain decoding would give.
 
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
+| `spec` | engine | integer | 8 with a drafter, else 0 | Verify windows of at most N tokens: the last accepted token plus up to N-1 drafts. `0` or `1` turns speculation off. |
 | `relaxed-drafting` | engine (`[P]`) | `true`, or a number in (0, 1] | off | Optional, and it changes output. Under sampling, a draft the model gives probability P or more is kept even when the model's own draw would have been another token. Faster, but no longer the model's exact sampling distribution; lower P is faster and further from exact. Bare `true` or flag alone is 0.5. Greedy requests, `logit_bias`, JSON `response_format`, control tokens and tool calls stay exact. Single-stream only. Numbers: [precision](../precision/features.md#relaxed-drafting). |
 
 ## Parallel slots
