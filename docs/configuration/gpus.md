@@ -21,8 +21,10 @@ expert tier`:
   decode window and follows the conversation like the main card's cache does. The experts are dealt out hottest first,
   each to the tier with the least work so far for its memory bandwidth, until every tier is full. Every tier computes
   its experts with the main card's kernels, so where an expert sits does not change its rows. The second card also
-  computes its experts' share of each prompt, and when its memory is faster than the main card's it takes a share of
-  each GDN mixer and of the head (one start line each; see [the GDN split](../precision/gdn-split.md)).
+  computes its experts' share of each prompt chunk: of any chunk when it is as fast as the main card, of chunks up to
+  2,559 rows when it is slower (a slower card costs a longer chunk more than the experts it saves the main card's link).
+  When its memory is faster than the main card's it takes a share of each GDN mixer and of the head (one start line
+  each; see [the GDN split](../precision/gdn-split.md)).
 - **Idle.** Where a process gets no GPU-to-GPU access (Windows), the cards after the main one stay idle and a warning
   says so. The engine runs up to three expert tiers: a fifth card and later ones stay idle.
 

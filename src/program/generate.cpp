@@ -1572,13 +1572,16 @@ int main(int argc, char** argv) {
             o.peer_device = -1;
         }
     }
+    // the peer card takes expert rows of a long prompt chunk only when it is as fast as the main one: a slower card costs the
+    // chunk more than the experts it saves the main card's link, so it keeps to the short chunks it helps
+    const bool peer_streamed_share = chosen_cards.size() >= 2 && basalt::program::cards_alike(chosen_cards[0], chosen_cards[1]);
     basalt::core::set_peer_portable(o.peer_device >= 1 || !o.layer_split.empty());   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     // Chunks below this take the routed-only path with the peer card computing its experts' rows; from it on
     // every expert streams through the ring.  The routed-only path costs ~0.3 ms per token, streaming ~0.12 ms
     // plus the time to move the experts the primary lacks over its link; with --peer-exclusive that includes the
     // peer-only experts, staged through the host, so streaming loses until later.
     auto set_stream_all_min = [&]() {
-        if (o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0)
+        if (o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0 && peer_streamed_share)
             basalt::prefill::Prefill::set_stream_all_min(o.peer_exclusive ? 4096 : 2560);
     };
     set_stream_all_min();
@@ -3207,7 +3210,8 @@ int main(int argc, char** argv) {
     }
     // what the peer's prompt buffers take on its card: they are allocated after its tier is filled, so the tier leaves them free
     auto peer_prompt_bytes = [&]() -> uint64_t {
-        return o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0 ? basalt::prefill::Prefill::peer_bytes(o.prefill_chunk) : 0;
+        return o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0
+                   ? basalt::prefill::Prefill::peer_bytes(o.prefill_chunk, peer_streamed_share) : 0;
     };
     // the GDN mixer split is priced once, before either card sizes its experts: its peer reserve displaces experts
     // only when the cards cannot hold them all
@@ -5202,7 +5206,7 @@ int main(int argc, char** argv) {
         if (peer.valid() && o.peer_exclusive) sp.set_ring_peer(&peer);
         if (peer.valid() && o.peer_prefill_rows != 0) {
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
-            if (!sp.set_peer(&peer, rows, err)) {
+            if (!sp.set_peer(&peer, rows, peer_streamed_share, err)) {
                 basalt::log::warn("basalt serve", "%s - the prompt path stays on the primary GPU", err.c_str());
                 err.clear();
             }

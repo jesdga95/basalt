@@ -734,6 +734,8 @@ constexpr int64_t FP4_MIN_TOKENS = 1024;
 // layer's end waits for that round trip; it grows with the chunk while the blobs it saves do not, so a longer chunk
 // streams the blobs instead.
 constexpr int64_t kPeerFp4Tokens = 5120;
+// A peer card slower than the main one takes the rows of routed-only chunks up to this size, no more.
+constexpr int64_t kPeerSlowRows = 2559;
 // In such a chunk the issuing thread keeps at most this many expert copies queued on the primary's link (the ring still
 // runs as far ahead): copies on one link are served in the order they were queued, and the peer's result rows, which
 // the layer's end waits for, would otherwise queue behind the copies for the layers after it.
@@ -1306,11 +1308,11 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
     return true;
 }
 
-uint64_t Prefill::peer_bytes(int64_t chunk) {
+uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share) {
     if (!mmq_plan().any) return 0;
     PeerPrefill pp;
-    pp.T_max = std::min<int64_t>(chunk, stream_all_min() - 1);
-    const int64_t t_fp4 = !fp4_every_layer() || fused_ring() || stream_all_min() < FP4_MIN_TOKENS
+    pp.T_max = std::min<int64_t>(chunk, streamed_share ? stream_all_min() - 1 : kPeerSlowRows);
+    const int64_t t_fp4 = !streamed_share || !fp4_every_layer() || fused_ring() || stream_all_min() < FP4_MIN_TOKENS
                               ? 0 : std::min<int64_t>(chunk, kPeerFp4Tokens);
     const int64_t tf = t_fp4 >= stream_all_min() ? t_fp4 : 0;
     const int64_t Tp = std::max(pp.T_max, tf);
@@ -1319,21 +1321,22 @@ uint64_t Prefill::peer_bytes(int64_t chunk) {
     return sum;
 }
 
-bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err) {
+bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_share, std::string& err) {
     Impl& m = *impl_;
     if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
     // The peer takes the rows of the routed-only chunks (below stream_all_min()): the activations and
     // result rows cross through host staging (cudaMemcpyPeerAsync) and the streamed ring stays off.  It also takes
     // those of a streamed chunk of up to kPeerFp4Tokens (PeerPrefill::T_fp4) where those buffers fit too.
     if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
-    const int64_t t_fp4 = !fp4_every_layer() || fused_ring() || stream_all_min() < FP4_MIN_TOKENS
+    const int64_t t_fp4 = !streamed_share || !fp4_every_layer() || fused_ring() || stream_all_min() < FP4_MIN_TOKENS
                               ? 0 : std::min<int64_t>(m.T_max, kPeerFp4Tokens);
     std::unique_ptr<PeerPrefill> pp;
-    bool ok = make_peer(peer, m.T_max, cap_rows, t_fp4 >= stream_all_min() ? t_fp4 : 0, pp, err);
+    const int64_t t_routed = streamed_share ? m.T_max : std::min<int64_t>(m.T_max, kPeerSlowRows);
+    bool ok = make_peer(peer, t_routed, cap_rows, t_fp4 >= stream_all_min() ? t_fp4 : 0, pp, err);
     if (!ok && t_fp4 >= stream_all_min()) {   // the routed-only chunks alone
         pp.reset();
         err.clear();
-        ok = make_peer(peer, m.T_max, cap_rows, 0, pp, err);
+        ok = make_peer(peer, t_routed, cap_rows, 0, pp, err);
     }
     if (!ok) return false;
     m.pp = std::move(pp);
