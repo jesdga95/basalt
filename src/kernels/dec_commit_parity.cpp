@@ -375,7 +375,14 @@ void contention(cudaStream_t s) {
 // ---------------------------------------------------------------------------------------------------------------
 // the finisher
 
-constexpr int FIN_BLOCKS = 170;
+// the engine launches the finisher with one block per SM
+static int fin_blocks() {
+    int dev = 0, sms = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    return sms;
+}
+static const int FIN_BLOCKS = fin_blocks();
 constexpr int64_t HS = (int64_t) basalt::kernels::NG_HIST * basalt::kernels::NG_HC_DIM;
 
 template<typename T> T* mapped(size_t n, T** dev) {
