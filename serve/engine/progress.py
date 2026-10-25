@@ -1,6 +1,8 @@
 """Engine start narration from its log: load bars, warnings, errors and start-failure hints."""
 from __future__ import annotations
 
+import os
+import re
 import sys
 import threading
 import time
@@ -54,10 +56,16 @@ def start_last_line(log: str | None, offset: int) -> str:
 class LoadBars:
     """One progress bar per `basalt load:` target against its planned size (a byte counter before the plan).
     `copy` targets are counted apart from the total. finish() collapses the bars into one result line. Off a
-    terminal the rows print as text once per heartbeat, only while their bytes move."""
+    terminal the rows print as text once per heartbeat, only while their bytes move.
+
+    A row's MB/s comes from the times its byte counts were read: over the latest >= WINDOW s while it moves,
+    over the engine's last phase for it once it is complete, and none while it stands still unfinished."""
 
     WIDTH = 24
     TABLE = "ngram"                                    # the n-gram table locked into RAM: its own row, outside the total
+    STILL = 1.0                                        # s without new bytes: the stretch of movement ended
+    WINDOW = 1.0                                       # s of the latest bytes a moving row's rate covers
+    MIN_SPAN = 0.5                                     # s: a shorter span gives no rate
 
     def __init__(self, out=None, gpus=None):
         self.out = out or sys.stdout
@@ -65,11 +73,12 @@ class LoadBars:
         self.gpus = list(gpus or [])                   # CUDA ordinal -> nvidia-smi number
         self.tty = self.out.isatty()
         self.total = 0                                 # announced total bytes (0: none)
-        self.targets: dict[tuple[str, bool], dict] = {}   # (target, copy) -> {plan, done, last, seen, start}
+        self.targets: dict[tuple[str, bool], dict] = {}   # (target, copy) -> {plan, done, last, seen, start, ...}
         self._beat_seen: dict[tuple[str, bool], int] = {}  # bytes each row showed at the previous busy heartbeat
         self.started = 0                               # targets begun
         self.t0 = None
         self.drawn = 0                                 # lines of bars on screen
+        self.shown: list[str] = []                     # the rows on screen
         self.kv: list[tuple[str, int, int, str, int]] = []  # (target, bytes, tokens, kind, max bytes): allocated only
 
     def name(self, target: str) -> str:
@@ -80,8 +89,40 @@ class LoadBars:
         return target
 
     def _target(self, target: str, copy: bool) -> dict:
+        # moves: (time, bytes) read while moving, the first one >= WINDOW before the last; phase: the first bytes
+        # of the engine's current phase for the target; moved: when its bytes last changed
         return self.targets.setdefault((target, copy), {"plan": 0, "done": 0, "last": 0, "seen": 0, "start": None,
-                                                        "rate_bytes": 0, "rate_time": 0.0})
+                                                        "moves": [], "phase": None, "moved": None})
+
+    def _sample(self, t: dict, before: int, now: float) -> None:
+        """Record the target's bytes as read at `now`; `before` is what it held until this line."""
+        have = t["done"] + t["last"]
+        if have == before:
+            return
+        moves = t["moves"]
+        if t["phase"] is None:                         # the phase's first bytes: its rate counts from here
+            t["phase"] = (now, have)
+            moves.clear()
+        elif now - t["moved"] > self.STILL:            # moving again after standing still: a fresh window
+            moves.clear()
+        moves.append((now, have))
+        while len(moves) > 2 and moves[1][0] <= now - self.WINDOW:
+            moves.pop(0)
+        t["moved"] = now
+
+    def _rate(self, t: dict, have: int, now: float) -> str:
+        if t["moved"] is None:
+            return ""
+        if t["plan"] > 0 and have >= t["plan"] and t["phase"] is not None:   # complete: its last phase's rate
+            since, base = t["phase"]
+        elif now - t["moved"] <= self.STILL:           # moving: the latest window
+            since, base = t["moves"][0]
+        else:
+            return ""
+        span = t["moved"] - since
+        if span < self.MIN_SPAN or have <= base:
+            return ""
+        return f"  {(have - base) / 1e6 / span:.0f} MB/s"
 
     def done(self) -> int:
         return sum(t["done"] + t["last"] for (tg, c), t in self.targets.items() if not c and tg != self.TABLE)
@@ -92,22 +133,16 @@ class LoadBars:
         n = int(f * width)
         return "=" * n + (">" if n < width else "") + " " * (width - n - 1)
 
-    def _rows(self) -> list[tuple[tuple[str, bool], str]]:
-        """(key, row) per started target, oldest start first. The rate suffix is the bytes since this
-        target's last sample over the elapsed window, shown once the window reaches >= 1 s; a target
-        is sampled here, never at a phase switch."""
+    def _rows(self, bar: int = WIDTH) -> list[tuple[tuple[str, bool], str]]:
+        """(key, row) per started target, oldest start first, with bars `bar` wide."""
         rows = []
         started = [kv for kv in self.targets.items() if kv[1]["start"] is not None]
-        now = time.time()
+        now = time.monotonic()
         for (target, copy), t in sorted(started, key=lambda kv: kv[1]["start"]):
-            rate = ""
             have = t["done"] + t["last"]
-            if t["rate_time"] and now - t["rate_time"] >= 1.0 and have >= t["rate_bytes"]:
-                rate = f"  {(have - t['rate_bytes']) / 1e6 / (now - t['rate_time']):.0f} MB/s"
-            if t["rate_time"] == 0.0 or now - t["rate_time"] >= 1.0:
-                t["rate_bytes"], t["rate_time"] = have, now
             if t["plan"] <= 0 and not have:
                 continue                               # planned to hold nothing
+            rate = self._rate(t, have, now)
             if target == self.TABLE:
                 rows.append(((target, copy), "[server] loading the n-gram table into system ram",
                              have, t["plan"], rate))
@@ -121,7 +156,7 @@ class LoadBars:
                 out.append((key, f"{label.ljust(pad)}  {have / 2**30:5.1f} GiB{rate}"))
             else:
                 plan = max(plan, have)
-                out.append((key, f"{label.ljust(pad)} [{self._bar(have, plan, self.WIDTH)}] "
+                out.append((key, f"{label.ljust(pad)} [{self._bar(have, plan, bar)}] "
                                  f"{have / 2**30:5.1f}/{plan / 2**30:.1f} GiB{rate}"))
         return out
 
@@ -138,6 +173,27 @@ class LoadBars:
             self._beat_seen = have
             return [text for key, text in rows if previous.get(key) != have[key]]
 
+    def _fitted(self) -> list[str]:
+        """The rows within the terminal width: shorter bars first, then without the rate, then cut. A wrapped row
+        would take two lines and the erase, which counts rows, would leave its first half behind."""
+        rows = self.lines()
+        try:
+            width = os.get_terminal_size(self.out.fileno()).columns - 1
+        except (AttributeError, OSError, ValueError):
+            width = 0
+        if width <= 0 or all(len(r) <= width for r in rows):   # no size known, or it fits
+            return rows
+        bar = max(8, self.WIDTH - (max(map(len, rows)) - width))
+        rows = [text for _, text in self._rows(bar)]
+        return [r if len(r) <= width else re.sub(r"  \d+ MB/s$", "", r)[:width] for r in rows]
+
+    def refresh(self) -> None:
+        """Redraw the bars when time alone changed them (a rate that ended)."""
+        with self.lock:
+            if self.tty and self.drawn and self._fitted() != self.shown:
+                self._erase()
+                self._draw()
+
     def _erase(self):
         if self.drawn:
             self.out.write("\x1b[1A\x1b[2K" * self.drawn)
@@ -145,10 +201,11 @@ class LoadBars:
 
     def _draw(self):
         if self.tty:
-            rows = self.lines()
+            rows = self._fitted()
             for r in rows:
                 self.out.write("\x1b[2K" + r + "\n")
             self.drawn = len(rows)
+            self.shown = rows
         self.out.flush()
 
     def say(self, text: str) -> None:
@@ -209,6 +266,7 @@ class LoadBars:
             self.t0 = time.time()
         with self.lock:
             t = self._target(target, copy)
+            before = t["done"] + t["last"]
             if t["start"] is None:
                 t["start"] = self.started
                 self.started += 1
@@ -217,9 +275,11 @@ class LoadBars:
                 t["done"] += t["last"] if t["seen"] else 0
                 t["last"] = 0
                 t["seen"] = total
+                t["phase"] = None
             t["last"] = done
             if target == self.TABLE:
                 t["plan"] = total
+            self._sample(t, before, time.monotonic())
             self._erase()
             self._draw()
 
@@ -349,7 +409,7 @@ def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=2
     beat = t0                                # last busy heartbeat
     pos = offset
     while True:
-        stop = done.wait(0.25)
+        stop = done.wait(0.05)               # often: a row's rate is timed by when its lines are read
         try:
             with open(log_path, "rb") as f:
                 f.seek(pos)
@@ -375,6 +435,7 @@ def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=2
                     bars.say(f"[server] warning: {w}")
                 elif (r := engine_ram_floor(line)) is not None:
                     bars.say(f"[server] RAM floor: {r}")
+        bars.refresh()
         if stop:
             bars.finish()
             if _active is bars:
