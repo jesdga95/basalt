@@ -81,7 +81,8 @@ Basalt refuses settings that would leave the machine without memory, and never s
   states the RAM free and the largest safe value ('max').
 - While serving, a request that finds MemAvailable below the margin plus 3.5 GiB (the margin alone when no expert is
   read from the SSD) stops with an error (`RAM low (... free < ... guard): request stopped`, also returned to the
-  client); the server keeps running and takes the next request.
+  client); the server keeps running and takes the next request. Windows does not count the pages read through the
+  mapped expert file as available, so within 1 GiB of the guard the engine gives them back first and reads again.
 
 ## Vision: `--vision`
 

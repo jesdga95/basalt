@@ -143,6 +143,12 @@ inline bool ram_below_floor(uint64_t avail, uint64_t floor) { return avail > 0 &
 void start_ram_guard(uint64_t floor_bytes);
 /// True while the last reading was below the guard's floor; `avail` and `floor` get that reading and the floor.
 bool ram_guard_low(uint64_t* avail = nullptr, uint64_t* floor = nullptr);
+/// A mapped file view the guard gives back (drop_mapped_view) when a reading comes within 1 GiB of its floor, then
+/// reads again, at most once every few seconds and only after the reading has risen above that lead since.
+/// Windows keeps a view's pages in the process once read and does not count them as available, where Linux counts
+/// them in MemAvailable; without this the guard would stop a request over pages the OS can reclaim.
+/// A null `base` withdraws the view; once that returns, the guard no longer touches it, so it can be unmapped.
+void ram_guard_reclaim_view(const void* base, uint64_t bytes);
 
 /// Whether the OS file cache could keep the `read_bytes` the expert file is read for, beside
 /// `arena_bytes` of RAM held by the engine's own copy of the experts and `margin` for everything else, with `avail`

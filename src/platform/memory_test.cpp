@@ -4,16 +4,19 @@
 
 #include "basalt/platform/file.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
 #include "basalt/platform/win.hpp"
+#include <psapi.h>   // QueryWorkingSetEx
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -256,6 +259,114 @@ int drop_view_cases() {
     std::filesystem::remove(path, ec);
     return fail;
 }
+// The serve guard with a view handed to it: with a reading within its lead of the floor the guard gives the view's
+// pages back (Windows; Linux leaves them to MemAvailable) and they read back as written; once the view is withdrawn
+// the guard leaves it alone. The floor is left at 0 afterwards, so the guard thread never reads low again.
+int guard_reclaim_cases() {
+    using namespace basalt::platform;
+    int fail = 0;
+    const uint64_t bytes = 64ull << 20;
+    std::vector<uint8_t> pattern(bytes);
+    for (uint64_t i = 0; i < bytes; ++i) pattern[i] = (uint8_t) (i * 29u + (i >> 10) * 3u);
+    const std::string path = (std::filesystem::temp_directory_path() / "basalt_memory_test_guard.bin").string();
+    {
+        std::ofstream f(path, std::ios::binary);
+        f.write((const char*) pattern.data(), (std::streamsize) bytes);
+        if (!f) return 1;
+    }
+    const uint8_t* base = nullptr;
+#if defined(_WIN32)
+    const std::wstring wpath = basalt::platform::to_wide(path);
+    HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        HANDLE m = CreateFileMappingW(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        base = (const uint8_t*) MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+        CloseHandle(m);
+        CloseHandle(h);
+    }
+#else
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd >= 0) {
+        void* view = mmap(nullptr, (size_t) bytes, PROT_READ, MAP_PRIVATE, fd, 0);
+        ::close(fd);
+        if (view != MAP_FAILED) base = (const uint8_t*) view;
+    }
+#endif
+    if (base == nullptr) {
+        std::printf("guard view %-57s   <-- cannot map\n", "read-only view");
+        std::filesystem::remove(path);
+        return 1;
+    }
+    auto touch = [&]() {
+        volatile uint8_t sink = 0;
+        for (uint64_t i = 0; i < bytes; i += 4096) sink = (uint8_t) (sink + base[i]);
+    };
+    auto intact = [&]() {
+        for (uint64_t i = 0; i < bytes; i += 997) if (base[i] != pattern[i]) return false;
+        return base[bytes - 1] == pattern[bytes - 1];
+    };
+    // the share of the view's pages in the process's working set; -1 where it is not measured
+    auto resident = [&]() -> double {
+#if defined(_WIN32)
+        const uint64_t pages = bytes / 4096;
+        std::vector<PSAPI_WORKING_SET_EX_INFORMATION> ws(pages);
+        for (uint64_t i = 0; i < pages; ++i) ws[i].VirtualAddress = (PVOID) (base + i * 4096);
+        if (!QueryWorkingSetEx(GetCurrentProcess(), ws.data(), (DWORD) (pages * sizeof ws[0]))) return 0.0;
+        uint64_t in = 0;
+        for (const PSAPI_WORKING_SET_EX_INFORMATION& w : ws) in += w.VirtualAttributes.Valid;
+        return (double) in / (double) pages;
+#else
+        return -1.0;
+#endif
+    };
+    // half a GiB under the reading: inside the guard's lead without reading as low; set again on every poll, so the
+    // machine's own drift does not carry the reading out of the lead
+    auto near_floor = [] {
+        const uint64_t a = available_memory();
+        return a > (512ull << 20) ? a - (512ull << 20) : 0;
+    };
+    auto report = [&](const char* what, double share, bool ok) {
+        if (share < 0) std::printf("guard view %-57s -> %s%s\n", what, ok ? "ok" : "failed", ok ? "" : "   <-- WRONG");
+        else std::printf("guard view %-57s -> %.0f%% resident%s\n", what, share * 100.0, ok ? "" : "   <-- WRONG");
+        fail |= !ok;
+    };
+    const bool measured = resident() >= 0;
+
+    touch();
+    const double before = resident();
+    report("read, before the guard has it", before, !measured || before > 0.9);
+
+    ram_guard_reclaim_view(base, bytes);
+    double given = before;
+    for (int i = 0; i < 60; ++i) {
+        start_ram_guard(near_floor());
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        given = resident();
+        if (measured && given < 0.1) break;
+    }
+    report("handed to the guard, reading within the lead", given, !measured || given < 0.1);
+    report("given back, the bytes read as written", -1.0, intact());
+
+    ram_guard_reclaim_view(nullptr, 0);
+    touch();
+    for (int i = 0; i < 10; ++i) {
+        start_ram_guard(near_floor());
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    const double kept = resident();
+    report("withdrawn, read again, reading within the lead", kept, !measured || kept > 0.9);
+    start_ram_guard(0);
+
+#if defined(_WIN32)
+    UnmapViewOfFile((void*) base);
+#else
+    munmap((void*) base, (size_t) bytes);
+#endif
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    return fail;
+}
 // The watchdog's line: the budget flag is named only when the resident copy is big enough for it to shrink.
 int exhausted_message_cases() {
     using basalt::platform::ram_exhausted_message;
@@ -301,7 +412,7 @@ uint64_t lock_test_bytes(bool& reduced) {
 
 int main() {
     int fail_keeps = file_cache_keeps_cases() | ram_floor_cases() | read_ahead_cases() | drop_view_cases() |
-                    exhausted_message_cases();
+                    guard_reclaim_cases() | exhausted_message_cases();
     bool reduced = false;
     const uint64_t bytes = lock_test_bytes(reduced);
     if (bytes == 0) {

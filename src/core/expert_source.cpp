@@ -537,6 +537,7 @@ void FileExpertSource::close() {
     ram_reads_.store(0);
     file_read_bytes_.store(0);
     file_us_.store(0);
+    basalt::platform::ram_guard_reclaim_view(nullptr, 0);   // before the view is unmapped
     view_.reset();
     platform::close_fd(fd_);
     fd_ = -1;
@@ -1190,6 +1191,8 @@ bool FileExpertSource::pin_cache_complement(
                          (long long) spare_free_.size(), spare_sizes.size(), (double) (at - spare_at) / 1048576.0);
     }
     complement_ready_ = true;
+    // The GPU cache's experts are not in the complement: refilling a lent slot reads them through the view again.
+    basalt::platform::ram_guard_reclaim_view(base_, mapped_bytes_);
     basalt::log::info("basalt", "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB in %.0f s%s%s",
                  complement_pinned_ ? "mapped pinned" : pin ? "locked resident" : "pageable resident",
                  (double) resident_bytes() / 1073741824.0, (double) pinned_bytes() / 1073741824.0,
