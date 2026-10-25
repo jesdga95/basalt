@@ -129,7 +129,8 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | `yarn-orig-ctx`, `yarn-ext-factor`, `yarn-attn-factor`, `yarn-beta-fast`, `yarn-beta-slow` | engine | number | 0 (262144), auto, 1, 32, 1 | YaRN's own parameters, as in llama.cpp. |
 
 A server with `max-context` above 32768 has an elastic KV cache: each session backs its first 32768 cells at startup and
-takes more from the expert cache only when a request needs it. It is off with `kv-resident` or `vram-elastic`. See [running](../running.md#concurrent-requests---parallel-n).
+takes more from the expert cache only when a request needs it. With `parallel`, each slot whose share is above 4096
+tokens does the same from 4096 cells, growing by 4096. It is off with `kv-resident` or `vram-elastic`. See [running](../running.md#concurrent-requests---parallel-n).
 
 ## Expert cache and memory
 

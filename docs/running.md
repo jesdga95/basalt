@@ -24,7 +24,9 @@ cells at startup (the K/V pools, the indexer's block keys, the RoPE tables and t
 rest of that VRAM holds the expert cache's last slots until a request needs it. A request backs its prompt plus 16384 cells before the prompt is read (and 16384 more whenever decode runs past that) by taking
 those slots back; their experts become CPU misses read from their RAM copies, which the RAM copy keeps for exactly this.
 The next request that needs less gives the cells back and the cache refills the slots from RAM. A short request so
-decodes with the cache a 32k context would have, whatever `--max-context` is. The startup line `elastic KV: ...` says
+decodes with the cache a 32k context would have, whatever `--max-context` is. With `--parallel` every slot is elastic
+once its share of the context is above 4096 tokens: it backs 4096 cells at startup and grows by 4096, so idle and short
+slots leave their VRAM to the expert cache. The startup line `elastic KV: ...` says
 how much of the cache is lent this way, and each move is logged (`elastic KV: N cells backed ...`).
 
 While other slots are decoding, a new prompt of up to 16384 tokens is read at once: the slots wait for it (a few
@@ -37,7 +39,7 @@ path.
 
 At startup the server prints one `[server] kv cache:` line per device with all the session state placed there, for
 example `12.5 GiB on cuda2 (solo 262144 tokens + 2 slots x 262144 tokens + draft K/V 0.5 GiB)`. With elastic KV (the
-default for a server whose `--max-context` is above 32768) it reads `0.6 / 4.4 GiB on cuda0 (elastic)`: the memory backed at startup, and what the cache can
+default for a server whose `--max-context` is above 32768, or with `--parallel` for slots above 4096 tokens) it reads `0.6 / 4.4 GiB on cuda0 (elastic)`: the memory backed at startup, and what the cache can
 grow to at `--max-context`. Because that memory is
 taken from the expert cache, the engine warns (`warning: the N batch slots' sessions ... take X GiB of CUDA0
 ...`) when it leaves the cache short of the expert set, or at under half of what it would hold without the slots, and

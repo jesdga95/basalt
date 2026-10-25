@@ -2850,9 +2850,12 @@ int main(int argc, char** argv) {
     // start; the rest of their VRAM goes to the expert cache as its tail, and a request that needs more cells takes
     // them back from that tail (kv_fit below), so a short request decodes with the larger cache.  Not with KV
     // streaming (its pools are a fixed set of VRAM pages) nor with --vram-elastic (that resizes the same tail).
-    constexpr int64_t kKvElasticFloor = 32768;
+    // With --batch a session's base is smaller: the slots' sessions are many, and an idle or short one would hold its
+    // whole base out of the expert cache.
+    constexpr int64_t kKvElasticFloor = 32768, kKvElasticFloorBatch = 4096;
+    const int64_t kv_base = o.batch > 0 ? kKvElasticFloorBatch : kKvElasticFloor;
     const int64_t kv_floor = o.serve && !multi_gpu && o.kv_resident == 0 && !o.vram_elastic &&
-                             o.max_context > kKvElasticFloor ? kKvElasticFloor : 0;
+                             o.max_context > kv_base ? kv_base : 0;
     basalt::core::qsa_set_kv_elastic(kv_floor);
     // ---- CUDA0's session, and the stages' sessions: sized to each device's own layer range (the carve).  A
     // stage that runs [lb, le) carves only those layers' GDN rows and QSA pools - before the carve every stage
@@ -6690,7 +6693,8 @@ int main(int argc, char** argv) {
         // the cache gives back its last segments (their experts become CPU misses, read from their RAM copies), and the
         // pools map that VRAM, zeroed.  `kv_release` gives a session's cells past `cells` back and the cache maps its
         // tail again, each returned slot refilled from RAM.  Both run between windows, never inside one.
-        constexpr int64_t kKvGrowCells = 16384;   // a request's room past its prompt, and each later step
+        // a request's room past its prompt, and each later step (batch slots: a smaller step, as their base)
+        const int64_t kKvGrowCells = o.batch > 0 ? 4096 : 16384;
         int64_t kv_moves = 0;
         auto kv_drain = [&](std::string& e) -> bool {
             if (!ver.wait_commit(e)) return false;
