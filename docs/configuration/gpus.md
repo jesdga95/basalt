@@ -33,7 +33,7 @@ second one. Reports from machines with three or four cards are welcome (see [com
 
 With two or more cards the engine prices three mechanisms at start, as milliseconds per decode window, from the cards'
 memory bandwidth, their VRAM and the model's size, and prints one line, for example
-`multi-gpu: 2 cards unlike; ms per window: expert tier 7.9, layer split 14.0, tensor parallel 9.0 (not built); picked
+`multi-gpu: 2 cards unlike; ms per window: expert tier 7.9, layer split 13.5, tensor parallel 9.0 (not built); picked
 expert tier`. The line appears for every multi-card setting, alike cards or not. With one card (unset, or one number)
 there is no choice: nothing is priced and no other card is used or even visible to the process.
 
@@ -47,7 +47,7 @@ there is no choice: nothing is priced and no other card is used or even visible 
 
 Only cards that match (memory bandwidth and VRAM within 10%) may pick a mechanism other than the expert tier, and only
 when it prices at least 5% below it. Unlike cards always use the expert tier. The prices are estimates fitted to
-measured windows (a 5090 with a 5060 Ti: tier 8.0 ms, layer split 13.8 ms at the best cut; two 5080s: 147 tok/s
+measured windows (a 5090 with a 5060 Ti: tier 8.0 ms, layer split 13.5 ms at the best cut; two 5080s: 147 tok/s
 reported against 141 priced), good for the choice and not for forecasting a rate.
 
 ## Two 16 GB cards

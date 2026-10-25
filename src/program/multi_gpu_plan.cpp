@@ -15,7 +15,8 @@ constexpr double kGpuGB = 11.9;          // bytes a window moves on its GPUs at 
 constexpr double kMissMs = 18.1;         // host tail per unit of read mass no card holds
 constexpr double kHitExponent = 1.0 / 6.0;
 constexpr double kDenseShare = 0.35;     // the part of the GPU bytes that is dense weights (the rest are experts)
-constexpr double kSplitFixedMs = 4.4;    // a layer split plans every layer's experts on the host and hands off per window
+constexpr double kSplitHandoffMs = 0.7;  // a layer split's hand-off and the commits of its stages, per window
+constexpr double kLastCardMs = 3.2;      // the head and the drafter on the last card, at 448 GB/s
 constexpr double kExchangeUs = 5.4;      // one mailbox exchange of 10 KiB between two cards
 constexpr double kWinMargin = 0.95;      // a mechanism beyond the expert tier must beat it by 5%
 
@@ -69,7 +70,7 @@ MgPlan plan_multi_gpu(const std::vector<GpuCard>& cards, const MgModel& m) {
             gpu += f[i] * kGpuGB / bw[i] * 1000.0;
             miss += f[i] * kMissMs * (1.0 - read_share(slots[i], pairs * f[i]));
         }
-        return gpu + miss + kSplitFixedMs;
+        return gpu + miss + kSplitHandoffMs + kLastCardMs * 448.0 / bw[n - 1];
     };
     std::vector<double> f(n, 0.0);
     double split_best = 1e30;

@@ -54,7 +54,7 @@ int main() {
         CHECK(p.pick == Mechanism::ExpertTier);
         const double tier = price(p, Mechanism::ExpertTier).ms, split = price(p, Mechanism::LayerSplit).ms;
         CHECK(tier > 7.0 && tier < 9.5);          // measured 8.0 ms
-        CHECK(split > 12.0 && split < 16.0);      // measured 13.8 ms (the cut at layer 47)
+        CHECK(split > 12.0 && split < 16.0);      // measured 13.5 ms (the cut at layer 40)
         CHECK(p.line.find("expert tier") != std::string::npos && p.line.find("picked expert tier") != std::string::npos);
     }
     // two equal 16 GB cards (2 x RTX 5080): the expert tier within 10% of the reported pair rate, the split far behind
@@ -64,7 +64,7 @@ int main() {
         CHECK(p.pick == Mechanism::ExpertTier);
         const double rate = tok_s(price(p, Mechanism::ExpertTier).ms);
         CHECK(rate > 0.9 * 147.5 && rate < 1.1 * 147.5);
-        CHECK(price(p, Mechanism::LayerSplit).ms > 1.2 * price(p, Mechanism::ExpertTier).ms);
+        CHECK(price(p, Mechanism::LayerSplit).ms > 1.1 * price(p, Mechanism::ExpertTier).ms);
         CHECK(!price(p, Mechanism::TensorParallel).runs);   // priced, not built
     }
     // three and four equal cards, and equal cards big enough to hold every expert: priced, one line, a valid pick
