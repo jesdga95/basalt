@@ -373,7 +373,7 @@ int main(int argc, char** argv) {
         unsigned* dpc = nullptr;
         cudaMalloc(&dxq, qb);
         cudaMalloc(&dxq0, qb);
-        cudaMalloc((void**) &dpc, 8);
+        cudaMalloc((void**) &dpc, 12);
         // hc_q8_1_store on the CPU: the butterfly sum of the 32 values, d = amax / 127, q = round(x / d)
         auto q8_ref = [&](const float* x, uint8_t* blk) {
             float v[32], amax = 0.f;
@@ -398,10 +398,10 @@ int main(int argc, char** argv) {
         for (int T = t_lo; T <= t_hi; ++T) {
             std::vector<std::vector<float>> v(2);
             std::vector<uint8_t> q[2];
-            unsigned cnt[2] = {0, 0};
+            unsigned cnt[3] = {0, 0, 0};
             for (int counted = 0; counted < 2; ++counted) {
                 void* const xqd = counted ? dxq : dxq0;
-                cudaMemset(dpc, 0, 8);
+                cudaMemset(dpc, 0, 12);
                 cudaMemset(xqd, 0xee, qb);
                 reset(1);
                 Out& x = o[1];
@@ -422,7 +422,7 @@ int main(int argc, char** argv) {
                 v[counted] = fetch(1, T);
                 q[counted].resize((size_t) T * (N / 32) * 36);
                 cudaMemcpy(q[counted].data(), xqd, q[counted].size(), cudaMemcpyDeviceToHost);
-                cudaMemcpy(cnt, dpc, 8, cudaMemcpyDeviceToHost);
+                cudaMemcpy(cnt, dpc, 12, cudaMemcpyDeviceToHost);
             }
             std::vector<float> mix((size_t) T * N);
             cudaMemcpy(mix.data(), o[1].mix, mix.size() * 4, cudaMemcpyDeviceToHost);
@@ -431,9 +431,10 @@ int main(int argc, char** argv) {
             const bool bad = std::memcmp(v[0].data(), v[1].data(), v[0].size() * 4) != 0 ||
                              std::memcmp(q[0].data(), q[1].data(), q[0].size()) != 0 ||
                              std::memcmp(qr.data(), q[1].data(), qr.size()) != 0 ||
-                             cnt[0] != K::hc_fused_pub_arrivals() || cnt[1] != 1u ||
+                             cnt[0] != K::hc_fused_pub_arrivals() || cnt[1] != 1u || cnt[2] != 1u ||
                              (!by_t[T].empty() && std::memcmp(v[1].data(), by_t[T].data(), v[1].size() * 4) != 0);
-            if (bad) std::printf("T %d: a counting read differs (counts %u of %u, %u)\n", T, cnt[0], K::hc_fused_pub_arrivals(), cnt[1]);
+            if (bad) std::printf("T %d: a counting read differs (counts %u of %u, %u, %u)\n", T, cnt[0], K::hc_fused_pub_arrivals(), cnt[1],
+                                 cnt[2]);
             pbad += bad;
         }
         std::printf("hc_fused_parity: %d window sizes where a counting read's outputs, xq or counts differ (must be 0)\n",

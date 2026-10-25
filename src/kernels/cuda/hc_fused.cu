@@ -1055,7 +1055,16 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
             if (lst) lo_ph ^= 1u;
             if (a.xq != nullptr && a.w_router == nullptr && !up_q8_inline(a, sl.c0, sl.nc))
                 hc_up_q8<T>(a, sl.c0, sl.nc, tid, g_hc_q8cnt[L.slot]);
-            if (a.w_router != nullptr) cta_signal(&sy->up.v, tid);   // nothing waits on it without a router
+            if (a.w_router != nullptr) {   // nothing waits on it without a router
+                __syncthreads();
+                if (tid == 0) {
+                    __threadfence();
+                    if (atomicAdd(&sy->up.v, 1u) == (unsigned) it.nu - 1u && a.pub_ctr != nullptr) {
+                        __threadfence();   // the last slice: mixed is complete
+                        atomicAdd(a.pub_ctr + 2, 1u);
+                    }
+                }
+            }
             stamp<DBG>(dbg, b, 3, tid);
         } else if (item >= it.t10) {
             // the top-10 once every router row has stored its logits: warp k takes token k

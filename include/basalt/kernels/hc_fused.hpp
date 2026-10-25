@@ -59,9 +59,10 @@ struct HcFusedArgs {
     size_t pf_bytes[4] = {0, 0, 0, 0};
     /// let the next kernel in at the start (its blocks take the SMs this read's blocks leave)
     bool next_early = false;
-    /// A read with a router and xq may also count its progress for a kernel that starts before it ends (device, two
+    /// A read with a router and xq may also count its progress for a kernel that starts before it ends (device, three
     /// words): each router item adds one to pub_ctr[0] once its share of xq is written (hc_fused_pub_arrivals() in
-    /// all), the top-10 adds one to pub_ctr[1] once the ids and weights are.  Null: no counts.
+    /// all), the top-10 adds one to pub_ctr[1] once the ids and weights are, and the last up slice adds one to
+    /// pub_ctr[2] once mixed is complete.  Null: no counts.
     unsigned* pub_ctr = nullptr;
     /// 8-bit copies of w_down / w_up / w_inject (int8, one f16 scale per 32 consecutive values of a row); null: found
     /// from the copies hc8_prepare / hc8_upload registered for the bf16 matrices (every read needs them).

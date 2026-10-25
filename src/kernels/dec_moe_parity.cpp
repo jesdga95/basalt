@@ -1024,15 +1024,15 @@ int main(int argc, char** argv) {
                     std::snprintf(what, sizeof what, "glue ring rows T=%d", T);
                     report(what, l, ndiff_rows(a4, c4, rows), rows.size() * H);
                     // the ring's block started with the read and released by its counts (verify's call): the same header,
-                    // kinds, words and q8_1 rows, the FFN input rows of the tokens with CPU entries, the counts zeroed
+                    // kinds, words and q8_1 rows, every token's FFN input rows, the counts zeroed
                     {
                         std::memset(h_xq + 5 * xq_stride, 0, nq);
                         std::memset(h_x + (size_t) 5 * MT * H, 0, (size_t) T * H * 4);
                         std::memset(h_rings + 5, 0, sizeof(K::DmRing));
                         h_words[0] = h_words[16] = 0;
-                        unsigned int* d_pc = dmal<unsigned int>(2);
-                        const unsigned int counts[2] = {81, 1};
-                        ck(cudaMemcpy(d_pc, counts, 8, cudaMemcpyHostToDevice), "counts");
+                        unsigned int* d_pc = dmal<unsigned int>(3);
+                        const unsigned int counts[3] = {81, 1, 1};
+                        ck(cudaMemcpy(d_pc, counts, 12, cudaMemcpyHostToDevice), "counts");
                         ck(cudaMemsetAsync(d_plan, 0xee, sizeof(K::DmPlan), s0), "memset");
                         ck(cudaMemsetAsync(d_p4, 0, (size_t) K::kDmCap * H * 4, s0), "memset");
                         K::DmGlueArgs gp = ga;
@@ -1041,20 +1041,18 @@ int main(int argc, char** argv) {
                         ck(cudaStreamSynchronize(s0), "glue ring, counted");
                         K::DmPlan P5;
                         ck(cudaMemcpy(&P5, d_plan, sizeof P5, cudaMemcpyDeviceToHost), "plan");
-                        unsigned int left[2] = {1, 1};
-                        ck(cudaMemcpy(left, d_pc, 8, cudaMemcpyDeviceToHost), "counts");
-                        size_t bad5 = std::memcmp(P.counts, P5.counts, sizeof P.counts) != 0 || left[0] != 0 || left[1] != 0;
+                        unsigned int left[3] = {1, 1, 1};
+                        ck(cudaMemcpy(left, d_pc, 12, cudaMemcpyDeviceToHost), "counts");
+                        size_t bad5 = std::memcmp(P.counts, P5.counts, sizeof P.counts) != 0 || left[0] != 0 || left[1] != 0 ||
+                                      left[2] != 0;
                         for (int g = 0; g <= P.counts[0]; ++g) bad5 += P.start[g] != P5.start[g] || (g < P.counts[0] && P.ptr[g] != P5.ptr[g]);
                         for (int e = 0; e < P.counts[1]; ++e) bad5 += P.dst[e] != P5.dst[e] || P.tok[e] != P5.tok[e];
                         for (int i = 0; i < n; ++i) bad5 += P.kind[i] != P5.kind[i];
                         bad5 += std::memcmp(ring0.data(), h_rings + 5, ring0.size()) != 0;
                         bad5 += std::memcmp(q1.data(), h_xq + 5 * xq_stride, nq) != 0;
-                        for (int t = 0; t < T; ++t) {   // a CPU token's row is the FFN input; any other row is untouched
-                            bool cpu_tok = false;
-                            for (int j = 0; j < (int) KK; ++j) cpu_tok |= kind[t * KK + j] < 0;
+                        for (int t = 0; t < T; ++t) {   // every token's row is the FFN input
                             const float* row = h_x + (size_t) 5 * MT * H + (size_t) t * H;
-                            if (cpu_tok) bad5 += std::memcmp(row, x.data() + (size_t) t * H, H * 4) != 0;
-                            else bad5 += std::any_of(row, row + H, [](float f) { return f != 0.f; });
+                            bad5 += std::memcmp(row, x.data() + (size_t) t * H, H * 4) != 0;
                         }
                         bad5 += h_words[0] != 6 || (h_words[16] & 0xffffu) != 6 || ((h_words[16] >> 16) & 0xffu) != (uint32_t) T ||
                                 ((h_words[16] >> 28) & 1u) != (np > 0 ? 1u : 0u);

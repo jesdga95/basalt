@@ -76,10 +76,10 @@ struct DmRouteArgs {
     const int32_t* xres[kDmMaxX] = {};
     DmRing* xring_m[kDmMaxX] = {};
     uint32_t* xseq_m[kDmMaxX] = {};
-    /// DEC_GLUE & 2 after a read that counts its progress (HcFusedArgs::pub_ctr, two device words): the ring's block
-    /// starts before the read ends, copies the q8_1 rows once pub_ctr[0] holds pub_target, routes once pub_ctr[1] is
-    /// set, rings the peers, then copies the FFN input rows of the tokens with CPU entries and rings the host; it
-    /// zeroes both words for the layer's next window
+    /// DEC_GLUE & 2 after a read that counts its progress (HcFusedArgs::pub_ctr, three device words): the ring's block
+    /// starts before the read ends, copies every token's FFN input rows once pub_ctr[2] is set, the q8_1 rows once
+    /// pub_ctr[0] holds pub_target, routes once pub_ctr[1] is set and rings the peers and the host; it zeroes the words
+    /// for the layer's next window
     unsigned int* pub_ctr = nullptr;
     unsigned int pub_target = 0;
 };

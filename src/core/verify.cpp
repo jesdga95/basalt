@@ -108,7 +108,7 @@ struct DecMoe {
     unsigned int* vsync = nullptr;           ///< its counters
     unsigned long long* wstat = nullptr;   // the per-layer wait counters (device), with --wait-stats
     unsigned long long* ptab0 = nullptr;   // [n_layers * n_expert] CUDA0 blob address or 0
-    unsigned int* pub = nullptr;           // [rings][2] the FFN read's counts for the ring's block (HcFusedArgs::pub_ctr)
+    unsigned int* pub = nullptr;           // [rings][4] the FFN read's counts for the ring's block (HcFusedArgs::pub_ctr)
     unsigned int* cseen = nullptr;         // the combine's last ring whose CPU word it saw (dec_moe_combine's cpu_seen)
     int64_t wstat_windows = 0, wstat_t = 0;
     // mapped: per ring header, FFN input and q8_1 rows; [0] the peer's ring, [16] its done ring, [32] its abort
@@ -563,8 +563,8 @@ bool Verifier::dm_init(std::string& err) {
               cudaMalloc((void**) &d->vsync, (kDmCap + 1) * 4) == cudaSuccess &&
               cudaMemset(d->vsync, 0, (kDmCap + 1) * 4) == cudaSuccess &&
               cudaMalloc(&d->xq_pub, d->xq_stride) == cudaSuccess &&
-              cudaMalloc((void**) &d->pub, (size_t) d->rings * 8) == cudaSuccess &&
-              cudaMemset(d->pub, 0, (size_t) d->rings * 8) == cudaSuccess &&
+              cudaMalloc((void**) &d->pub, (size_t) d->rings * 16) == cudaSuccess &&
+              cudaMemset(d->pub, 0, (size_t) d->rings * 16) == cudaSuccess &&
               cudaMalloc((void**) &d->cseen, 4) == cudaSuccess && cudaMemset(d->cseen, 0, 4) == cudaSuccess;
     d->vram = -1;
     if (ok && hits_.slot_off != nullptr && hits_.n_slots > 0)
@@ -2544,7 +2544,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     h.logits = logits_; h.ids = ids_; h.weights = w_;
                     if (glue_on) {   // the ring's block starts with the read and follows its counts
                         h.xq = nat_xq_;
-                        h.pub_ctr = dm_->pub + 2 * (l - lb_);
+                        h.pub_ctr = dm_->pub + 4 * (l - lb_);
                         h.next_early = true;
                     }
                     if (sh_read) {
@@ -2611,7 +2611,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (glue_on) {   // the ring's work inside post's gate/up launch, released by the read's counts
                 glue_ring = ra;
                 glue_ring.mode = 2; glue_ring.kinds = true;
-                glue_ring.pub_ctr = dm_->pub + 2 * r; glue_ring.pub_target = hc_fused_pub_arrivals();
+                glue_ring.pub_ctr = dm_->pub + 4 * r; glue_ring.pub_target = hc_fused_pub_arrivals();
                 ring_fork = false;
             } else if (pk_ring) {   // the ring beside, CUDA0's plan and rows here
                 cudaEventRecord(ev_ring_, cs);

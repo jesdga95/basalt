@@ -468,13 +468,12 @@ __device__ __forceinline__ unsigned dm_ld_acquire(const unsigned* p) {
 }
 
 // The ring's block after a read that counts its progress (DmRouteArgs::pub_ctr), started with the read: the layer's
-// residency rows into shared memory (s_res: 2 * n_expert words); once the router items have written xq, its q8_1 rows
-// to mapped memory while the top-10 runs; once the ids are out, the kinds and the header, the peers' doorbells, then
-// the FFN input rows of the tokens with CPU entries and the host's doorbell.  It reads nothing the read writes before
-// those counts, so it needs no pdl_wait; with `reset` it zeroes them for the layer's next window.
+// residency rows into shared memory (s_res: 2 * n_expert words); once the up slices are through, every token's FFN
+// input rows to mapped memory while the router runs; once the router items have written xq, its q8_1 rows while the
+// top-10 runs; once the ids are out, the kinds and the header, then one fence and every doorbell.  It reads nothing the
+// read writes before those counts, so it needs no pdl_wait; with `reset` it zeroes them for the layer's next window.
 __device__ void dm_glue_ring_pub(const DmRouteArgs& a, const void* xq, int tid, int32_t* s_res, bool reset) {
     __shared__ int32_t r_ids[kDmCap], r_kind[kDmCap], r_pf[kDmCap], r_cnt[3 + kDmMaxX];
-    __shared__ uint32_t r_tok;   // bit t: token t has CPU entries
     const int n = a.n_tok * a.k;
     int32_t* const res0 = s_res;
     int32_t* const res1 = a.res1 != nullptr ? s_res + a.n_expert : nullptr;
@@ -483,10 +482,13 @@ __device__ void dm_glue_ring_pub(const DmRouteArgs& a, const void* xq, int tid, 
         if (res1 != nullptr) res1[i] = a.res1[i];
     }
     if (tid < 3 + kDmMaxX) r_cnt[tid] = 0;
-    if (tid == 0) {
-        r_tok = 0u;
+    if (tid == 0)
+        while (dm_ld_acquire(a.pub_ctr + 2) == 0u) __nanosleep(32);
+    __syncthreads();
+    const int n4 = a.n_tok * (a.n_embd / 4);   // the FFN input rows the CPU pool reads, 16 bytes at a time
+    for (int i = tid; i < n4; i += blockDim.x) ((float4*) a.x_m)[i] = __ldcg((const float4*) a.x + i);
+    if (tid == 0)
         while (dm_ld_acquire(a.pub_ctr) < a.pub_target) __nanosleep(32);
-    }
     __syncthreads();
     const int n16 = a.n_tok * (a.n_embd / 32) * 36 / 16;   // the q8_1 rows, 16 bytes at a time
     for (int i = tid; i < n16; i += blockDim.x) ((uint4*) a.xq_m)[i] = __ldcg((const uint4*) xq + i);
@@ -495,6 +497,7 @@ __device__ void dm_glue_ring_pub(const DmRouteArgs& a, const void* xq, int tid, 
         if (reset) {
             a.pub_ctr[0] = 0u;
             a.pub_ctr[1] = 0u;
+            a.pub_ctr[2] = 0u;
         }
     }
     __syncthreads();
@@ -503,29 +506,14 @@ __device__ void dm_glue_ring_pub(const DmRouteArgs& a, const void* xq, int tid, 
     dm_ring_head(a, res0, res1, tid, r_ids, r_kind, r_pf, r_cnt);
     __threadfence_system();
     __syncthreads();
-    const bool x_rows = r_cnt[0] > 0;
     if (tid == 0) {
         if (a.stats != nullptr) a.stats[0] = dm_clock();
         *(volatile uint32_t*) a.peer_seq_m = a.ring | (uint32_t) a.n_tok << 16 | (r_cnt[1] > 0 ? 1u << 28 : 0u) |
                                              (a.rows ? 1u << 29 : 0u);
         dm_xring_doorbells(a, r_cnt + 3);
-        if (!x_rows) *(volatile uint32_t*) a.host_seq_m = a.ring;
-    }
-    if (x_rows) {   // the rows the CPU pool reads, 16 bytes at a time, then its doorbell
-        if (tid < n && r_kind[tid] < 0) atomicOr(&r_tok, 1u << (tid / a.k));
-        __syncthreads();
-        const uint32_t m = r_tok;
-        const int n4 = a.n_embd / 4;
-        for (int t = 0; t < a.n_tok; ++t) {
-            if ((m >> t & 1u) == 0u) continue;
-            for (int i = tid; i < n4; i += blockDim.x)
-                ((float4*) a.x_m)[(size_t) t * n4 + i] = __ldcg((const float4*) a.x + (size_t) t * n4 + i);
-        }
+        *(volatile uint32_t*) a.host_seq_m = a.ring;
         __threadfence_system();
-        __syncthreads();
-        if (tid == 0) *(volatile uint32_t*) a.host_seq_m = a.ring;
     }
-    if (tid == 0) __threadfence_system();
 }
 
 // native_gu2_kernel's rows with the VRAM plan built in the block (dm_route_kernel's kinds and dm_group for the VRAM
@@ -760,6 +748,7 @@ __global__ void __launch_bounds__(256, 4) dm_glue_gu1_kernel(DmGlueArgs a, Nativ
                 if (counted) {
                     a.ring.pub_ctr[0] = 0u;
                     a.ring.pub_ctr[1] = 0u;
+                    a.ring.pub_ctr[2] = 0u;
                 }
             }
         }

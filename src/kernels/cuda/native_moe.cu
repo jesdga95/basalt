@@ -151,12 +151,25 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
     if (DEP || WAITC) pdl_launch_dependents();
     const int64_t tk = blockIdx.y;
     if (threadIdx.x < k) s_kind[threadIdx.x] = plan->kind[tk * k + threadIdx.x];
-    __syncthreads();
     const int64_t col = 4 * (int64_t(blockIdx.x) * blockDim.x + threadIdx.x);
-    if (col >= n_embd) return;   // (thread 0 of block (0, 0), WAITC's waiter, has column 0)
+    const bool live = col < n_embd;
     weights += tk * k;
     float4 v[KM];
     float w[KM];
+    // every entry's CUDA0 row and weight, the shared row and its gate load in one round with the kinds (a tier entry's
+    // CUDA0 row is read and not used), so no load waits for an earlier one to arrive
+#pragma unroll
+    for (int j = 0; j < KM; ++j) {
+        if (live && j < k) {
+            w[j] = weights[j];
+            v[j] = *reinterpret_cast<const float4*>(parts + (tk * k + j) * n_embd + col);
+        }
+    }
+    float4 h = shared && live ? *reinterpret_cast<const float4*>(shared + tk * n_embd + col)
+                              : make_float4(0.f, 0.f, 0.f, 0.f);
+    const float gt = shared && sh_gate ? sh_gate[tk] : 1.0f;
+    __syncthreads();
+    if (!live) return;   // (thread 0 of block (0, 0), WAITC's waiter, has column 0)
     // the mapped rows are read in place; a peer row's own words say it arrived, so its first read needs no wait
     auto mapped_row = [&](int j, int kd) {
         return reinterpret_cast<const float4*>((kd >= 2 ? peer_rows : cpu_rows) + (tk * k + j) * n_embd + col);
@@ -164,19 +177,14 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
 #pragma unroll
     for (int j = 0; j < KM; ++j) {
         if (j >= k) break;
-        w[j] = weights[j];
-        if (s_kind[j] == 0) {
-            const float4 p = *reinterpret_cast<const float4*>(parts + (tk * k + j) * n_embd + col);
-            v[j] = make_float4(__fadd_rn(0.0f, p.x), __fadd_rn(0.0f, p.y), __fadd_rn(0.0f, p.z), __fadd_rn(0.0f, p.w));
-        } else if (TAG && s_kind[j] >= 2) {
+        if (s_kind[j] == 0)
+            v[j] = make_float4(__fadd_rn(0.0f, v[j].x), __fadd_rn(0.0f, v[j].y), __fadd_rn(0.0f, v[j].z),
+                               __fadd_rn(0.0f, v[j].w));
+        else if (TAG && s_kind[j] >= 2)
             v[j] = __ldcv(mapped_row(j, 2));
-        }
     }
-    float4 h = shared ? *reinterpret_cast<const float4*>(shared + tk * n_embd + col) : make_float4(0.f, 0.f, 0.f, 0.f);
-    if (shared && sh_gate) {   // the shared expert's gate, as its own kernel applied it
-        const float gt = sh_gate[tk];
+    if (shared && sh_gate)   // the shared expert's gate, as its own kernel applied it
         h = make_float4(sh_mul(h.x, gt), sh_mul(h.y, gt), sh_mul(h.z, gt), sh_mul(h.w, gt));
-    }
     if constexpr (DEP) pdl_wait();
     if constexpr (WAITC) {
         // as the wait kernel: every row after the pool's word when the layer has CPU entries (the peers' rows are not
