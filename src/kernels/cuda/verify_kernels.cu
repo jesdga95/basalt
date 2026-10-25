@@ -455,6 +455,7 @@ __global__ void gdn_commit_begin_kernel(CommitCtl* ctl, const int32_t* __restric
     *ctl_word(ctl, (int) (e & 1u), 0) = 0;
     *ctl_word(ctl, (int) (e & 1u), 1) = 0;
     ctl->w[kCtlWords * 8] = e;
+    ctl->w[kCtlWords * 10] = 0;   // the lazy layers' claims (gdn_commit_lazy)
     __threadfence();
     st_release(ctl_word(ctl, (int) (e & 1u), 2), e);
     *begun = e;
@@ -497,6 +498,41 @@ __global__ void __launch_bounds__(32 * RG) gdn_commit_layers_pipe_kernel(GdnComm
     const int n = min(*a.n_keep, kVerifyMaxT);
     if (n <= 0) return;
     commit_layers_body(a, n, conv_blocks);
+}
+
+// The lazy layers' items (layer-major), claimed from the epoch's lazy counter (line 10, reset by the begin kernel): every
+// item of the first `must_layers`, then more while *stop != stop_value.  A block claims only after that check, and
+// commits every item it claims.
+__global__ void __launch_bounds__(32 * RG) gdn_commit_lazy_kernel(GdnCommitLayers a, int conv_blocks, CommitCtl* ctl,
+                                                                  int must_layers, const uint32_t* stop,
+                                                                  uint32_t stop_value) {
+    const int per_state = a.h_v * (S / 32), per_layer = per_state + conv_blocks, total = per_layer * a.n_layers;
+    const int must = per_layer * must_layers;
+    uint32_t* const claim = ctl->w + (size_t) kCtlWords * 10;
+    __shared__ int s_i;
+    const bool lead = threadIdx.x == 0 && threadIdx.y == 0;
+    const int n = min(__ldcg(a.n_keep), kVerifyMaxT);
+    for (;;) {
+        if (lead) {
+            const int c = (int) min(__ldcg(claim), (uint32_t) total);
+            const bool more = c < must || (stop != nullptr && ld_acquire(stop) != stop_value);
+            s_i = c < total && more ? (int) atomicAdd(claim, 1u) : total;
+        }
+        __syncthreads();
+        const int i = s_i;
+        __syncthreads();
+        if (i >= total) break;
+        const int l = i / per_layer, j = i - l * per_layer;
+        if (j < per_state) {
+            CommitPre p;
+            commit_pre_load(a, per_layer, n, i, p);
+            commit_pre_run(a, per_layer, n, i, p);
+        } else {
+            gdn_conv_commit_n(a.state + (size_t) l * a.state_stride + (size_t) S * a.h_v * S,
+                              a.qkv + (size_t) l * a.h_stride, a.C, n,
+                              (j - per_state) * 32 * RG + threadIdx.y * 32 + threadIdx.x);
+        }
+    }
 }
 
 // the same over a segmented window: blockIdx.y = the window row whose segment it commits (only a segment's first row)
@@ -1018,6 +1054,20 @@ void gdn_commit_layers(const GdnCommitLayers& a, void* stream, int blocks) {
     gdn_commit_layers_pipe_kernel<<<(unsigned) (blocks > 0 ? blocks : 1), dim3(32, RG), 0, (cudaStream_t) stream>>>(
         a, conv_blocks);
     check("gdn_commit_layers");
+}
+
+void gdn_commit_lazy(const GdnCommitLayers& a, CommitCtl* ctl, int must_layers, const uint32_t* stop,
+                     uint32_t stop_value, void* stream, int blocks) {
+    if (a.n_layers <= 0) return;
+    const int conv_blocks = (a.C + 32 * RG - 1) / (32 * RG);
+    gdn_commit_lazy_kernel<<<(unsigned) (blocks > 0 ? blocks : 1), dim3(32, RG), 0, (cudaStream_t) stream>>>(
+        a, conv_blocks, ctl, must_layers, stop, stop_value);
+    check("gdn_commit_lazy");
+}
+
+bool gdn_commit_lazy_none(CommitCtl* ctl) {
+    const uint32_t none = 0x40000000u;
+    return cudaMemcpy(ctl->w + (size_t) kCtlWords * 10, &none, 4, cudaMemcpyHostToDevice) == cudaSuccess;
 }
 
 void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream) {

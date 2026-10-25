@@ -1382,6 +1382,9 @@ Verifier::~Verifier() {
     if (cm_) cudaStreamDestroy(cm_);
     if (ev_commit_go_) cudaEventDestroy(ev_commit_go_);
     if (commit_ctl_) cudaFree(commit_ctl_);
+    if (lz_s_) cudaStreamDestroy(lz_s_);
+    if (lz_fork_) cudaEventDestroy(lz_fork_);
+    if (lz_join_) cudaEventDestroy(lz_join_);
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (sh_hi_) cudaStreamDestroy(sh_hi_);
     if (sh_hi2_) cudaStreamDestroy(sh_hi2_);
@@ -1725,6 +1728,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device_ >= 0 ? device_ : 0);
         fin_blocks_ = sms;
     }
+    if (!basalt::kernels::gdn_commit_lazy_none(commit_ctl_) ||
+        cudaStreamCreateWithPriority(&lz_s_, cudaStreamNonBlocking, cs_prio) != cudaSuccess ||
+        cudaEventCreateWithFlags(&lz_fork_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&lz_join_, cudaEventDisableTiming) != cudaSuccess) {
+        err = "verify: lazy commit stream create failed";
+        return false;
+    }
     *(volatile uint32_t*) h_pend_ = 0;
     if (cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess ||
@@ -1891,6 +1901,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             else gdn_idx[(size_t) l] = gi++;
         }
     }
+    // a lazy GDN layer: one after the stage's first, in a solo window (lazy_on)
+    int64_t gdn_first = -1;
+    for (int64_t l = lb_; l < le_ && gdn_first < 0; ++l) gdn_first = gdn_idx[(size_t) l];
+    const bool lazy = lazy_on() && !batch_rec_ && cs == cs_ && dm;
+    auto lazy_layer = [&](int64_t l) { return lazy && l < le_ && gdn_idx[(size_t) l] > gdn_first; };
+    const GdnCommitLayers lazy_args = lazy ? commit_gdn_lazy_args() : GdnCommitLayers{};
 
     // ---------------------------------------------------------------- pre(l, group): up to the ring
     bool ring_fork = false;   // the group's ring stream is joined in post
@@ -2080,6 +2096,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             dec_moe_mix_publish(xq_, mixed_, n, (int) N, gs_m_xq_ + (size_t) r * dm_->xq_stride,
                                 gs_m_x_ + (size_t) r * dm_->x_stride, dm_->m_w + 48, (uint32_t) (r + 1), gs_split, cs);
         }
+        if (lazy_layer(l)) cudaStreamWaitEvent(cs, lz_join_, 0);   // the layer's commit, forked in the previous post
         if (mid_ok) {
             // the first read's dependent: its first pair tiles are already issued by the time the read ends (PDL)
             PdlScope ps(pdl, mid_ord == 0);
@@ -2722,6 +2739,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             const auto& f = lay.fmt[(size_t) l];
             const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
             DmPlan* P = dm_->plan;
+            if (lazy_layer(l + 1)) {   // the next GDN layer's commit, then later ones while this layer waits for the CPU
+                cudaEventRecord(lz_fork_, cs);
+                cudaStreamWaitEvent(lz_s_, lz_fork_, 0);
+                gdn_commit_lazy(lazy_args, commit_ctl_, (int) (gdn_idx[(size_t) (l + 1)] - gdn_first),
+                                dm_->tags ? dm_->cseen : nullptr, ring,
+                                lz_s_, fin_blocks_);
+                cudaEventRecord(lz_join_, lz_s_);
+            }
             if (glue_on) {
                 DmGlueArgs ga;
                 ga.ids = ids_; ga.ptab = dm_->ptab0 + l * g.n_expert;
@@ -3068,28 +3093,61 @@ bool Verifier::capture(int T, std::string& err) {
     return true;
 }
 
-basalt::kernels::GdnCommitLayers Verifier::commit_gdn_args() const {
+basalt::kernels::GdnCommitLayers Verifier::commit_gdn_layer(int64_t gdn_index) const {
     using namespace basalt::kernels;
     const ModelGeometry& g = *g_;
     const SessionState& ss = *ss_;
     const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, MT = max_t_;
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
-    int64_t gdn_index = 0;
-    for (int64_t l = 0; l < lb_; ++l) gdn_index += is_qsa_layer(g, l) ? 0 : 1;
     GdnCommitLayers ga;
     ga.state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
     ga.h = h_L_ + (size_t) gdn_index * MT * C; ga.qkv = qkv_L_ + (size_t) gdn_index * MT * C;
     ga.gate = gate_L_ + (size_t) gdn_index * MT * HV; ga.beta = beta_L_ + (size_t) gdn_index * MT * HV;
     ga.state_stride = gdn_floats; ga.h_stride = (size_t) MT * C; ga.gb_stride = (size_t) MT * HV;
     ga.C = (int) C; ga.h_k = (int) g.ssm_k_heads; ga.h_v = (int) HV; ga.n_keep = commit_;
+    ga.n_layers = 1;
+    return ga;
+}
+
+// the stage's GDN layers from its first (only that one when the later ones are lazy)
+basalt::kernels::GdnCommitLayers Verifier::commit_gdn_args() const {
+    const ModelGeometry& g = *g_;
+    int64_t gdn_index = 0;
+    for (int64_t l = 0; l < lb_; ++l) gdn_index += is_qsa_layer(g, l) ? 0 : 1;
+    basalt::kernels::GdnCommitLayers ga = commit_gdn_layer(gdn_index);
+    ga.n_layers = 0;
     for (int64_t l = lb_; l < le_; ++l) ga.n_layers += is_qsa_layer(g, l) ? 0 : 1;
+    if (lazy_on()) ga.n_layers = std::min(ga.n_layers, 1);
     return ga;
 }
 
 bool Verifier::finisher_on() const {
     return g_commit_async && next_ == nullptr && lb_ == 0 && le_ >= g_->n_layers && commit_ctl_ != nullptr &&
            fin_blocks_ > 0;
+}
+
+bool Verifier::lazy_on() const { return finisher_on() && dm_ != nullptr && gs_nk0_ == 0 && lz_s_ != nullptr; }
+
+// the stage's GDN layers after its first, the lazy ones
+basalt::kernels::GdnCommitLayers Verifier::commit_gdn_lazy_args() const {
+    const ModelGeometry& g = *g_;
+    int64_t gdn_index = 0, n = 0;
+    for (int64_t l = 0; l < lb_; ++l) gdn_index += is_qsa_layer(g, l) ? 0 : 1;
+    for (int64_t l = lb_; l < le_; ++l) n += is_qsa_layer(g, l) ? 0 : 1;
+    basalt::kernels::GdnCommitLayers ga = commit_gdn_layer(gdn_index + 1);
+    ga.n_layers = (int) std::max<int64_t>(n - 1, 0);
+    return ga;
+}
+
+// every lazy layer the last commit still owes, on the commit's stream (what a window already took is done)
+void Verifier::apply_lazy() {
+    if (!lz_pending_) return;
+    lz_pending_ = false;
+    const basalt::kernels::GdnCommitLayers la = commit_gdn_lazy_args();
+    basalt::kernels::gdn_commit_lazy(la, commit_ctl_, la.n_layers, nullptr, 0, cm_, fin_blocks_);
+    cudaEventRecord(commit_done_, cm_);
+    commit_pending_ = true;
 }
 
 bool Verifier::commit_begun() const {
@@ -3100,7 +3158,8 @@ bool Verifier::commit_begun() const {
     return true;
 }
 
-void Verifier::order_after_commit() {
+void Verifier::order_after_commit(bool solo) {
+    if (!solo) apply_lazy();
     if (commit_pending_) cudaStreamWaitEvent(cs_, commit_done_, 0);
 }
 
@@ -3542,11 +3601,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // an async commit still running: the window's first node waits for it once the commit's begin kernel has run (the
     // device then knows the epoch); if that does not happen within moments, the window follows the commit on the device
     if (!finisher_on() || (commit_pending_ && !commit_begun()))
-        order_after_commit();
+        order_after_commit(true);
     const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
     if (next_ == nullptr) dev.record(DecodeEvents::kVerifyPost, cs_);
     ms_launch += ms_since(tl);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+    lz_pending_ = false;   // the window applies the lazy layers (lazy_on) before their GDN kernels
     // a sampled or penalized request's head sampling queued behind the window now, not after a sync
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     const bool biased = sampling_.logit_bias != nullptr;
@@ -3812,6 +3872,7 @@ bool Verifier::commit(int n_keep, std::string& err, int parts) {
             if (re != cudaSuccess) { err = std::string("verify: commit event: ") + cudaGetErrorString(re); return false; }
             (void) cudaStreamQuery(cm_);
             commit_pending_ = true;
+            lz_pending_ = lazy_on();   // its later GDN layers: the next window, or apply_lazy
         }
         decode_gaps().mark(4);
     }
@@ -3825,8 +3886,9 @@ bool Verifier::commit(int n_keep, std::string& err, int parts) {
 }
 
 bool Verifier::wait_commit(std::string& err) {
-    if (commit_pending_) {
+    if (commit_pending_ || lz_pending_) {
         const OnDevice on_device(device_);
+        apply_lazy();
         commit_pending_ = false;
         const cudaError_t se = cudaEventSynchronize(commit_done_);
         if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }

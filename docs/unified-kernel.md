@@ -7,7 +7,7 @@ Two pieces of the unified-kernel work are in the engine; the full-layer kernel i
 | Piece | Source | What it does |
 |---|---|---|
 | Mid chain (`k_mid`) | `mid_chain.cu`, `attn_chain_kernel.cuh`, `attn_chain_bound.cuh` | A GDN layer's middle in one persistent launch: the qkv + z projection pair, the recurrence and the output projection. It runs between the layer's two hyper-connection reads, which stay `hc_fused_read`. |
-| Commit finisher | `verify_kernels.cu` | The GDN commit claims its items from a counter on its own stream; the next window starts with a finisher that takes what is left. |
+| Commit finisher | `verify_kernels.cu` | The GDN commit claims its items from a counter on its own stream; the next window starts with a finisher that takes what is left. With the device-planned tail and a whole GDN mixer, the commit stream takes only the first GDN layer: the later ones are claimed inside the next window, each before its own GDN kernels and ahead while the window waits for the CPU tier. |
 
 - The mid chain runs for windows of one to four rows, on every pack whose GDN projection triple (qkv, z, out) `mid_chain_supported` accepts. Types accepted for each of the three: Q4_K, Q5_K, Q6_K, IQ3_S, IQ4_XS. `(14, 14, 14)` and `(23, 21, 12)` have specialised instances; any other combination of those types uses the generic one. A pack with Q8_0 or another type in a GDN projection keeps the three separate kernels.
 - The pair ring always has an even slot count, because the two tile groups take alternate tiles: an odd ring would give a slot consecutive tiles from different groups, and one group could pass its wait before the data arrived. The parity test checks the ring size for every type triple.
@@ -20,6 +20,7 @@ Two pieces of the unified-kernel work are in the engine; the full-layer kernel i
 
 - `mid_chain_parity`: the kernel against `dense_tc_pair`, `dec_gdn_rec` and `dense_tc` in sequence, bitwise, every type triple, windows of one to four rows; it prints the phase ledger and has a microbench.
 - `dec_commit_parity` and `dec_commit_finisher` (`--finisher`): the finisher run before, during and after the commit, with a microbench.
+- `dec_commit_lazy` (`--lazy`): the in-window commit against the commit kernel and a CPU reference, with a microbench.
 
 ## What was retired
 

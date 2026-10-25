@@ -509,10 +509,21 @@ private:
     uint32_t* h_pend_ = nullptr; uint32_t* m_pend_ = nullptr;   // the epoch the commit's begin kernel last started
     uint32_t commit_epoch_ = 0;
     int fin_blocks_ = 0;
+    // Lazy GDN layers (lazy_on): the commit graph and the finisher take only the first GDN layer; the later ones are
+    // committed inside the next solo window, on lz_s_ from the previous layer's FFN read (that layer's own items and,
+    // until the previous layer's combine has its CPU rows, later ones), joined before the layer's GDN kernels.
+    cudaStream_t lz_s_ = nullptr;
+    cudaEvent_t lz_fork_ = nullptr, lz_join_ = nullptr;
+    bool lz_pending_ = false;                       ///< a commit whose lazy layers no window has applied yet
     bool finisher_on() const;                        ///< solo windows start with the finisher
+    bool lazy_on() const;                            ///< the GDN layers after the first are committed lazily
     bool commit_begun() const;                       ///< the begin kernel of the last async commit has run
-    void order_after_commit();                       ///< a launch on cs_ outside the solo windows follows the async commit
+    /// a launch on cs_ outside the solo windows follows the async commit (and its lazy layers, unless `solo`)
+    void order_after_commit(bool solo = false);
+    void apply_lazy();                               ///< the pending lazy layers on cm_, before commit_done_
     basalt::kernels::GdnCommitLayers commit_gdn_args() const;
+    basalt::kernels::GdnCommitLayers commit_gdn_layer(int64_t gdn_index) const;   ///< one GDN layer's commit
+    basalt::kernels::GdnCommitLayers commit_gdn_lazy_args() const;              ///< the lazy layers' commit
     static void raise_flag_b(void* ctx);
     static void raise_flag(uint32_t* flag, uint32_t value);
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)

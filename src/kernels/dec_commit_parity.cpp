@@ -1,6 +1,6 @@
 // src/kernels/dec_commit_parity.cpp - DEC_COMMIT's two launches against the commit graph's per-layer calls.
 //
-//     build/dec_commit_parity [--bench | --finisher [--bench]]
+//     build/dec_commit_parity [--bench | --finisher [--bench] | --lazy [--bench]]
 //
 // GDN: gdn_commit_layers against gdn_conv_commit + gdn_step_norm_multi (state-only commit) per layer; QSA:
 // native_qsa_indexer_commit_layers against the tail restore + n_tok native_qsa_indexer_append calls per layer.
@@ -12,6 +12,10 @@
 // during and after it: what the finisher's stream sees when it returns - every GDN state, conv history, indexer buffer
 // and PLE history - must match bit for bit, for n_keep 1..8, over 200 epochs of both counter sets, and with nothing
 // pending it touches nothing.  With --bench: the finisher's cost with nothing pending and its drain of what is left.
+// --lazy: gdn_commit_lazy against the commit kernel (bit for bit) and a CPU reference (within rounding), for n_keep 1..8:
+// one launch owing every layer, one launch per layer with and without further items, a stop word turned mid-launch, two
+// epochs in a row, and nothing owed before the first epoch or after an epoch is done.  With --bench: its throughput
+// against the commit kernel and the cost of a launch with nothing owed.
 #include "basalt/kernels/native_qsa_indexer.hpp"
 #include "basalt/kernels/qsa.hpp"
 #include "basalt/kernels/rope_scaling.hpp"
@@ -21,7 +25,9 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <thread>
 #include <cstdint>
 #include <cstdio>
@@ -698,6 +704,234 @@ void finisher_bench(cudaStream_t) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// the lazy layers (gdn_commit_lazy)
+
+// The GDN commit on the CPU (state rows r, head, column col; the conv history's last three inputs): the reference the
+// GPU forms must meet within rounding (__expf).
+void gdn_cpu(const std::vector<float>& st0, const std::vector<float>& h, const std::vector<float>& qkv,
+             const std::vector<float>& gate, const std::vector<float>& beta, int nl, int n, std::vector<float>& out) {
+    out = st0;
+    const int qk = S * HK;
+    for (int l = 0; l < nl; ++l) {
+        float* st = out.data() + (size_t) l * GDN_FLOATS;
+        const float* hl = h.data() + (size_t) l * MT * C;
+        for (int head = 0; head < HV; ++head) {
+            const int qh = head % HK;
+            for (int col = 0; col < S; ++col) {
+                float s[S];
+                for (int r = 0; r < S; ++r) s[r] = st[((size_t) r * HV + head) * S + col];
+                for (int t = 0; t < n; ++t) {
+                    const float* ht = hl + (size_t) t * C;
+                    const float g = std::exp(gate[((size_t) l * MT + t) * HV + head]);
+                    const float b = beta[((size_t) l * MT + t) * HV + head];
+                    double kv = 0;
+                    for (int r = 0; r < S; ++r) kv += (double) s[r] * ht[qk + qh * S + r];
+                    const float delta = (float) ((ht[2 * qk + head * S + col] - g * kv) * b);
+                    for (int r = 0; r < S; ++r) s[r] = g * s[r] + ht[qk + qh * S + r] * delta;
+                }
+                for (int r = 0; r < S; ++r) st[((size_t) r * HV + head) * S + col] = s[r];
+            }
+        }
+        float* hist = st + (size_t) S * HV * S;
+        const float* ql = qkv.data() + (size_t) l * MT * C;
+        for (int c = 0; c < C; ++c) {
+            float seq[3];
+            for (int j = 0; j < 3; ++j) {
+                const int src = n + j;
+                seq[j] = src < 3 ? hist[c * 3 + src] : ql[(size_t) (src - 3) * C + c];
+            }
+            for (int j = 0; j < 3; ++j) hist[c * 3 + j] = seq[j];
+        }
+    }
+}
+
+struct Lazy {
+    Gdn g;
+    int32_t* commit = nullptr;
+    CommitCtl* ctl = nullptr;
+    uint32_t *h_begun = nullptr, *d_begun = nullptr;
+    int32_t *h_epoch = nullptr, *d_epoch = nullptr;
+    uint32_t* stop = nullptr;   // the stand-in for the combine's word
+    uint32_t epoch = 0;
+};
+GdnCommitLayers lazy_args(const Lazy& z) {
+    GdnCommitLayers a;
+    a.state = z.g.state; a.h = z.g.h; a.qkv = z.g.qkv; a.gate = z.g.gate; a.beta = z.g.beta;
+    a.state_stride = GDN_FLOATS; a.h_stride = (size_t) MT * C; a.gb_stride = (size_t) MT * HV;
+    a.C = C; a.h_k = HK; a.h_v = HV; a.n_layers = z.g.nl; a.n_keep = z.commit;
+    return a;
+}
+void lazy_init(Lazy& z, std::mt19937& rng, int nl) {
+    z.g = make_gdn(rng, nl);
+    CK(cudaMalloc(&z.commit, (2 + MT) * 4));
+    CK(cudaMalloc(&z.ctl, sizeof(CommitCtl)));
+    CK(cudaMemset(z.ctl, 0, sizeof(CommitCtl)));
+    if (!gdn_commit_lazy_none(z.ctl)) { std::printf("gdn_commit_lazy_none failed\n"); std::exit(1); }
+    z.h_begun = mapped<uint32_t>(1, &z.d_begun);
+    z.h_epoch = mapped<int32_t>(1, &z.d_epoch);
+    CK(cudaMalloc(&z.stop, 4));
+    CK(cudaMemset(z.stop, 0, 4));
+}
+void lazy_begin(Lazy& z, cudaStream_t s) {
+    z.h_epoch[0] = (int32_t) ++z.epoch;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    gdn_commit_begin(z.ctl, z.d_epoch, z.d_begun, s);
+}
+// the window's launches: one per layer, layer i's own items first; `go` bit i: launch i takes further items too
+void lazy_pass(Lazy& z, cudaStream_t s, uint32_t go, int blocks) {
+    for (int i = 0; i < z.g.nl; ++i) {
+        const uint32_t v = (go >> i & 1u) ? 1u : 0u;   // *stop is 0: launch i goes on while its stop value is 1
+        gdn_commit_lazy(lazy_args(z), z.ctl, i + 1, z.stop, v, s, blocks);
+    }
+}
+
+bool lazy_tests(cudaStream_t s) {
+    std::mt19937 rng(23);
+    constexpr int NL = 5;
+    Lazy z;
+    lazy_init(z, rng, NL);
+    const size_t bytes = (size_t) NL * GDN_FLOATS * 4;
+    auto reset = [&] {
+        CK(cudaMemcpy(z.g.state, z.g.state0, bytes, cudaMemcpyDeviceToDevice));
+        CK(cudaDeviceSynchronize());
+    };
+    bool ok = true;
+    // nothing owed before the first epoch, and nothing touched
+    reset();
+    set_commit(z.commit, 3, 100);
+    gdn_commit_lazy(lazy_args(z), z.ctl, NL, nullptr, 0, s, 170);
+    CK(cudaStreamSynchronize(s));
+    if (host(z.g.state, bytes) != host(z.g.state0, bytes)) { std::printf("  lazy: a launch before any epoch changed the state\n"); ok = false; }
+    std::vector<float> st0(NL * GDN_FLOATS), hh((size_t) NL * MT * C), qq((size_t) NL * MT * C), ga((size_t) NL * MT * HV),
+        be((size_t) NL * MT * HV);
+    CK(cudaMemcpy(st0.data(), z.g.state0, bytes, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(hh.data(), z.g.h, hh.size() * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(qq.data(), z.g.qkv, qq.size() * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(ga.data(), z.g.gate, ga.size() * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(be.data(), z.g.beta, be.size() * 4, cudaMemcpyDeviceToHost));
+    std::uniform_int_distribution<uint32_t> bits(0, (1u << NL) - 1);
+    int cases = 0;
+    double worst = 0;
+    for (int n_keep = 1; n_keep <= MT; ++n_keep) {
+        set_commit(z.commit, n_keep, 100);
+        // the current commit kernel's result
+        reset();
+        gdn_new(z.g, z.commit, s, 32);
+        CK(cudaStreamSynchronize(s));
+        const auto ref = host(z.g.state, bytes);
+        // the CPU's, within rounding
+        {
+            std::vector<float> cpu, gpu(NL * GDN_FLOATS);
+            gdn_cpu(st0, hh, qq, ga, be, NL, n_keep, cpu);
+            std::memcpy(gpu.data(), ref.data(), bytes);
+            for (size_t i = 0; i < cpu.size(); ++i) {
+                const double d = std::fabs((double) gpu[i] - cpu[i]) / std::max(1.0, std::fabs((double) cpu[i]));
+                worst = std::max(worst, d);
+            }
+        }
+        for (int blocks : {1, 7, 32, 170}) {
+            // one launch owing every layer; then the window's form with each go pattern class
+            for (int form = 0; form < 4; ++form) {
+                reset();
+                lazy_begin(z, s);
+                if (form == 0) gdn_commit_lazy(lazy_args(z), z.ctl, NL, nullptr, 0, s, blocks);
+                else lazy_pass(z, s, form == 1 ? 0u : form == 2 ? (1u << NL) - 1 : bits(rng), blocks);
+                CK(cudaStreamSynchronize(s));
+                const auto got = host(z.g.state, bytes);
+                ++cases;
+                if (got != ref) {
+                    std::printf("  lazy n_keep=%d blocks=%d form %d: the state differs from the commit kernel's\n", n_keep, blocks, form);
+                    ok = false;
+                }
+                // the epoch is done: a further launch owes nothing and touches nothing
+                gdn_commit_lazy(lazy_args(z), z.ctl, NL, nullptr, 0, s, blocks);
+                CK(cudaStreamSynchronize(s));
+                if (host(z.g.state, bytes) != got) {
+                    std::printf("  lazy n_keep=%d blocks=%d form %d: a launch after the epoch changed the state\n", n_keep, blocks, form);
+                    ok = false;
+                }
+            }
+        }
+        // two epochs in a row: the second commits the result of the first
+        reset();
+        gdn_new(z.g, z.commit, s, 32);
+        gdn_new(z.g, z.commit, s, 32);
+        CK(cudaStreamSynchronize(s));
+        const auto ref2 = host(z.g.state, bytes);
+        reset();
+        for (int e = 0; e < 2; ++e) {
+            lazy_begin(z, s);
+            lazy_pass(z, s, bits(rng), 170);
+        }
+        CK(cudaStreamSynchronize(s));
+        ++cases;
+        if (host(z.g.state, bytes) != ref2) { std::printf("  lazy n_keep=%d: two epochs differ from two commits\n", n_keep); ok = false; }
+    }
+    // the stop word turned while a launch takes further items (another stream lowers it after a spin)
+    {
+        set_commit(z.commit, 4, 100);
+        reset();
+        gdn_new(z.g, z.commit, s, 32);
+        CK(cudaStreamSynchronize(s));
+        const auto ref = host(z.g.state, bytes);
+        cudaStream_t o;
+        CK(cudaStreamCreateWithFlags(&o, cudaStreamNonBlocking));
+        for (int rep = 0; rep < 20; ++rep) {
+            reset();
+            CK(cudaMemset(z.stop, 0, 4));
+            lazy_begin(z, s);
+            CK(cudaStreamSynchronize(s));
+            gdn_commit_lazy(lazy_args(z), z.ctl, 1, z.stop, 1u, s, 170);   // goes on while *stop != 1
+            std::this_thread::sleep_for(std::chrono::microseconds(rep * 3));
+            const uint32_t one = 1;
+            CK(cudaMemcpyAsync(z.stop, &one, 4, cudaMemcpyHostToDevice, o));
+            for (int i = 1; i < NL; ++i) gdn_commit_lazy(lazy_args(z), z.ctl, i + 1, z.stop, 1u, s, 170);
+            CK(cudaDeviceSynchronize());
+            ++cases;
+            if (host(z.g.state, bytes) != ref) { std::printf("  lazy stop turned at %d us: the state differs\n", rep * 3); ok = false; }
+        }
+        CK(cudaStreamDestroy(o));
+    }
+    std::printf("dec_commit lazy (n_keep 1..8, %d cases, launch forms, stop words, epochs): %s; GPU vs CPU max rel diff %.2e\n",
+                cases, ok ? "BITWISE" : "FAILED", worst);
+    if (worst > 1e-4) { std::printf("  lazy: the commit is off the CPU reference\n"); ok = false; }
+    return ok;
+}
+
+// Microbench: the lazy launch over a window's 35 lazy layers owing everything, against the commit kernel at 32 and
+// 170 blocks; and a launch with nothing owed (the window's idle launches).
+void lazy_bench(cudaStream_t s) {
+    std::mt19937 rng(29);
+    Lazy z;
+    lazy_init(z, rng, 35);
+    set_commit(z.commit, 3, 100);
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+    auto timed = [&](auto&& f, int reps) {
+        double sum = 0;
+        for (int r = 0; r < reps + 3; ++r) {
+            CK(cudaDeviceSynchronize());
+            CK(cudaEventRecord(e0, s));
+            f();
+            CK(cudaEventRecord(e1, s));
+            CK(cudaEventSynchronize(e1));
+            float ms = 0;
+            CK(cudaEventElapsedTime(&ms, e0, e1));
+            if (r >= 3) sum += ms * 1000.0;
+        }
+        return sum / reps;
+    };
+    const double gb = 2.0 * 35 * (double) S * HV * S * 4 / 1e9;
+    const double a32 = timed([&] { gdn_new(z.g, z.commit, s, 32); }, 20);
+    const double a170 = timed([&] { gdn_new(z.g, z.commit, s, 170); }, 20);
+    const double lz = timed([&] { lazy_begin(z, s); gdn_commit_lazy(lazy_args(z), z.ctl, 35, nullptr, 0, s, 170); }, 20);
+    const double idle = timed([&] { gdn_commit_lazy(lazy_args(z), z.ctl, 35, nullptr, 0, s, 170); }, 50);
+    std::printf("bench lazy (35 layers, n_keep 3): commit kernel 32 blocks %.1f us (%.0f GB/s), 170 blocks %.1f us (%.0f GB/s); "
+                "lazy 170 blocks %.1f us (%.0f GB/s); lazy with nothing owed %.2f us\n",
+                a32, gb / (a32 * 1e-6), a170, gb / (a170 * 1e-6), lz, gb / (lz * 1e-6), idle);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -709,6 +943,10 @@ int main(int argc, char** argv) {
     if (mode == "--finisher") {
         ok = finisher_tests(s) && ok;
         if (argc > 2 && std::string(argv[2]) == "--bench") finisher_bench(s);
+    }
+    if (mode == "--lazy") {
+        ok = lazy_tests(s) && ok;
+        if (argc > 2 && std::string(argv[2]) == "--bench") lazy_bench(s);
     }
     return ok ? 0 : 1;
 }
