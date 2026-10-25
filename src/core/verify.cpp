@@ -1907,6 +1907,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const bool lazy = lazy_on() && !batch_rec_ && cs == cs_ && dm;
     auto lazy_layer = [&](int64_t l) { return lazy && l < le_ && gdn_idx[(size_t) l] > gdn_first; };
     const GdnCommitLayers lazy_args = lazy ? commit_gdn_lazy_args() : GdnCommitLayers{};
+    bool lz_open = false;   // a lazy launch not joined yet
 
     // ---------------------------------------------------------------- pre(l, group): up to the ring
     bool ring_fork = false;   // the group's ring stream is joined in post
@@ -2096,7 +2097,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             dec_moe_mix_publish(xq_, mixed_, n, (int) N, gs_m_xq_ + (size_t) r * dm_->xq_stride,
                                 gs_m_x_ + (size_t) r * dm_->x_stride, dm_->m_w + 48, (uint32_t) (r + 1), gs_split, cs);
         }
-        if (lazy_layer(l)) cudaStreamWaitEvent(cs, lz_join_, 0);   // the layer's commit, forked in the previous post
+        if (lazy_layer(l)) {   // the layer's commit, forked in the previous post
+            cudaStreamWaitEvent(cs, lz_join_, 0);
+            lz_open = false;
+        }
         if (mid_ok) {
             // the first read's dependent: its first pair tiles are already issued by the time the read ends (PDL)
             PdlScope ps(pdl, mid_ord == 0);
@@ -2739,13 +2743,39 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             const auto& f = lay.fmt[(size_t) l];
             const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
             DmPlan* P = dm_->plan;
-            if (lazy_layer(l + 1)) {   // the next GDN layer's commit, then later ones while this layer waits for the CPU
+            // the next GDN layer's commit (and later ones while this layer waits for the CPU), and the next layer's
+            // projection weights into L2 while this layer's combine waits
+            const bool lz_next = lazy && l + 1 < le_ && (lazy_layer(l + 1) || is_qsa_layer(g, l + 1));
+            if (lz_next) {
+                GdnLazyPf pf;
+                {
+                    const LayerView nv(wt, l + 1);
+                    const char* names_gdn[] = {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight"};
+                    const char* names_qsa[] = {"attn_q.weight", "attn_k.weight", "attn_v.weight", "indexer.q_proj.weight",
+                                               "indexer.k_proj.weight", "attn_output.weight"};
+                    const bool qsa = is_qsa_layer(g, l + 1);
+                    const int nr = qsa ? 6 : 3;
+                    int r = 0;
+                    auto add = [&](const void* p, uint64_t b) {
+                        if (p != nullptr && (b & ~15ull) != 0 && r < kLazyPfRanges) { pf.p[r] = p; pf.n[r++] = b & ~15ull; }
+                    };
+                    for (int i = 0; i < nr; ++i) {
+                        const WeightRef* w = nv.get(qsa ? names_qsa[i] : names_gdn[i]);
+                        if (w == nullptr) continue;
+                        if (w->native_data != nullptr)
+                            add(w->native_data, (uint64_t) iq_row_bytes(w->native_type, w->ne0) * (uint64_t) w->ne1);
+                        else
+                            add(w->data, w->bytes);
+                    }
+                    pf.ids = ids_; pf.n_ids = n * (int) K; pf.n_expert = (int) g.n_expert; pf.ptab = dm_->ptab0 + l * g.n_expert;
+                }
                 cudaEventRecord(lz_fork_, cs);
                 cudaStreamWaitEvent(lz_s_, lz_fork_, 0);
-                gdn_commit_lazy(lazy_args, commit_ctl_, (int) (gdn_idx[(size_t) (l + 1)] - gdn_first),
-                                dm_->tags ? dm_->cseen : nullptr, ring,
-                                lz_s_, fin_blocks_);
+                gdn_commit_lazy(lazy_args, commit_ctl_,
+                                lazy_layer(l + 1) ? (int) (gdn_idx[(size_t) (l + 1)] - gdn_first) : 0,
+                                dm_->tags ? dm_->cseen : nullptr, ring, lz_s_, fin_blocks_, &pf);
                 cudaEventRecord(lz_join_, lz_s_);
+                lz_open = true;
             }
             if (glue_on) {
                 DmGlueArgs ga;
@@ -2855,6 +2885,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (!post(l)) return false;
         if (l + 1 < le_ && !pre(l + 1)) return false;
     }
+    if (lz_open) cudaStreamWaitEvent(cs, lz_join_, 0);
     if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
         float* hout = hand_out_ + (size_t) hrow0 * HB;
         copy_from_mapped(hout, R_, (int64_t) T * HC * N, cs);

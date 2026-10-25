@@ -511,7 +511,9 @@ private:
     int fin_blocks_ = 0;
     // Lazy GDN layers (lazy_on): the commit graph and the finisher take only the first GDN layer; the later ones are
     // committed inside the next solo window, on lz_s_ from the previous layer's FFN read (that layer's own items and,
-    // until the previous layer's combine has its CPU rows, later ones), joined before the layer's GDN kernels.
+    // until the previous layer's combine has its CPU rows, later ones), joined before the layer's GDN kernels.  The
+    // same launches (and one before each QSA layer) read the next layer's projection weights into L2 while the
+    // previous layer's combine waits for the CPU pool.
     cudaStream_t lz_s_ = nullptr;
     cudaEvent_t lz_fork_ = nullptr, lz_join_ = nullptr;
     bool lz_pending_ = false;                       ///< a commit whose lazy layers no window has applied yet

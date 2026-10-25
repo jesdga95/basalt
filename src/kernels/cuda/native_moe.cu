@@ -193,6 +193,7 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
         const bool cpu = plan->counts[3] > 0;
         if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
             if (cpu) {
+                st_release_gpu(cpu_seen, ring | 0x80000000u);   // waiting for the pool
                 while (*cpu_done < ring) __nanosleep(64);
                 __threadfence_system();
             }

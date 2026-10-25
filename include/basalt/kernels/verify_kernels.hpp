@@ -57,8 +57,19 @@ void gdn_commit_finish(const GdnCommitLayers& a, CommitCtl* ctl, void* stream, i
 /// The newest epoch's commit of the layers in `a` (as gdn_commit_layers), its items claimed in order from the epoch's
 /// lazy counter: every item of the first `must_layers` not claimed yet, then further ones while *stop != stop_value
 /// (device word; null: none).  A launch after the epoch's earlier ones finds their items done.
+/// `pf` (or null): what the launch also reads into L2 for the next layer while the layer it runs beside waits for the
+/// CPU pool: once *stop holds stop_value with its top bit (the combine waits) and while it still does, if the layer has
+/// entries off CUDA0 at all (ids against ptab, that layer's CUDA0 blob table).
+constexpr int kLazyPfRanges = 8;
+struct GdnLazyPf {
+    const void* p[kLazyPfRanges] = {};   ///< byte ranges (16-byte multiples) in the order they are used; empty ones last
+    uint64_t n[kLazyPfRanges] = {};
+    const int32_t* ids = nullptr;
+    int n_ids = 0, n_expert = 0;
+    const unsigned long long* ptab = nullptr;
+};
 void gdn_commit_lazy(const GdnCommitLayers& a, CommitCtl* ctl, int must_layers, const uint32_t* stop,
-                     uint32_t stop_value, void* stream, int blocks);
+                     uint32_t stop_value, void* stream, int blocks, const GdnLazyPf* pf = nullptr);
 /// The lazy counter of a new CommitCtl: nothing owed until the first begin kernel.
 bool gdn_commit_lazy_none(CommitCtl* ctl);
 /// A window of several sequences ("segments"): each segment is n consecutive rows with its own GDN state.  The table

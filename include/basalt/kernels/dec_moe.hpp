@@ -243,7 +243,8 @@ void dec_moe_peer_math_test(const NativeExpertLayout& L, const unsigned long lon
 /// written; the combine polls them (tag_done >= ring ends the poll for a released window) and restores the word after
 /// reading, so dec_moe_wait runs with `skip_peer`.  `cpu_done` (with tag_done, not dep): no dec_moe_wait runs before
 /// the combine; when the layer has CPU entries one of its threads waits for cpu_done >= ring and passes the ring on
-/// through `cpu_seen` (one device word, zeroed once: it steps through each window's rings in order) to the others.
+/// through `cpu_seen` (one device word, zeroed once: it steps through each window's rings in order, holding the ring
+/// with its top bit set while that thread waits) to the others.
 /// `shared_gate` ([n_tok], or null): `shared` is the shared expert before its per-token gate, and the combine applies
 /// it as shared_expert_multi does (one IEEE product per value) before the add.
 constexpr uint32_t dec_moe_tag_word() { return 0x7fa5a5a5u; }
