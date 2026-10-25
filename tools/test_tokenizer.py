@@ -1,4 +1,4 @@
-"""The tokenizer's piece memo changes speed, never ids.
+"""The tokenizer's piece memo changes speed, never ids; the files it extracts are the same bytes on every OS.
 
     python3 -m unittest tools.test_tokenizer
     BASALT_TOKENIZER_DIR=<pack>/tokenizer python3 -m unittest tools.test_tokenizer   # also the real vocabulary
@@ -6,6 +6,7 @@
 import json
 import os
 import sys
+import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
@@ -128,6 +129,19 @@ class PieceMemo(unittest.TestCase):
         a = memo.encode("hello world")
         a.append(-1)
         self.assertEqual(memo.encode("hello world")[-1] == -1, False)
+
+
+class Extract(unittest.TestCase):
+    def test_line_endings(self):
+        # the engine splits merges.txt on LF: a CR left at a line's end would name a token outside the vocabulary
+        tokens, merges, types = synthetic(CORPUS)
+        md = {"tokenizer.ggml.model": "gpt2", "tokenizer.ggml.tokens": tokens, "tokenizer.ggml.merges": merges,
+              "tokenizer.ggml.token_type": types, "tokenizer.chat_template": "{{ a }}\n{{ b }}\n"}
+        with tempfile.TemporaryDirectory() as d:
+            T.extract_metadata(md, d)
+            for name in ("merges.txt", "tokenizer.json", "chat_template.jinja"):
+                data = (Path(d) / "tokenizer" / name).read_bytes()
+                self.assertTrue(b"\n" in data and b"\r" not in data, "%s: lines do not end in LF alone" % name)
 
 
 if __name__ == "__main__":

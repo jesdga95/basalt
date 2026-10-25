@@ -258,9 +258,11 @@ def extract_metadata(md: dict, out_dir) -> dict:
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
-                                              sorted(tk.ranks.items(), key=lambda kv: kv[1])), encoding="utf-8")
+                                              sorted(tk.ranks.items(), key=lambda kv: kv[1])), encoding="utf-8",
+                                    newline="\n")
     (out / "token_type.json").write_text(json.dumps(tk.token_types), encoding="utf-8")
-    (out / "tokenizer.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+    (out / "tokenizer.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8",
+                                        newline="\n")
     # fine-tunes change the chat template, so the model's own is shipped
     tpl = md.get("tokenizer.chat_template")
     if tpl:
