@@ -53,5 +53,5 @@ records the engine commit, the GPUs the engine used (main first) with VRAM and e
 RAM, the OS (`Linux`, `Windows` or `WSL2`), the pack's quant label. Every expert must sit in VRAM, the peer GPU or RAM: if the engine would read any from the SSD, the bench stops before measuring, says how many GiB would spill and roughly how much more free RAM is needed, exits non-zero and prints no row. NVML is required;
 without it, or without a git build, the run stops with a message. Only `--model`, `--submitter`, `--fixtures` (the
 repository's `data/bench`), `--logs` and `--print-command` are accepted: any other bench option or engine flag changes
-the workload and is refused. A second visible GPU is used as the peer tier, as in the plain bench; hide it with
-`CUDA_VISIBLE_DEVICES=0` for a single-GPU row. The preset's version changes whenever the workload does.
+the workload and is refused. The run uses every visible Blackwell GPU (`--gpu auto`; `--gpu` is refused); pick the cards with
+`CUDA_VISIBLE_DEVICES`, for example `CUDA_VISIBLE_DEVICES=0` for a single-GPU row. The preset's version changes whenever the workload does.

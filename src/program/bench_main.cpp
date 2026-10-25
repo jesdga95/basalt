@@ -405,7 +405,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
     if (o.community) {
         const char* bad = o.sel_decode || o.sel_prefill ? "-t / -p" : o.reps != 1 ? "-r" : o.quality ? "--quality"
                         : !o.spec.empty() ? "--spec" : !o.sets.empty() ? "--set" : !o.engine.empty() ? "--engine"
-                        : !o.power_label.empty() ? "--power-label" : o.seed ? "--seed" : o.no_windows ? "--no-windows"
+                        : !o.gpu.empty() ? "--gpu" : !o.power_label.empty() ? "--power-label" : o.seed ? "--seed" : o.no_windows ? "--no-windows"
                         : o.format != "md" ? "-o" : !o.passthrough.empty() ? o.passthrough[0].c_str() : nullptr;
         if (bad != nullptr) {
             err = std::string("--community runs the fixed preset: ") + bad + " would make the row incomparable";
@@ -731,7 +731,8 @@ int main(int argc, char** argv) {
     if (!o.model.empty()) {
         std::string gpu_value, gerr;
         std::vector<basalt::program::GpuCard> used;
-        const std::string want = has_arg(args, "--gpu") ? arg_value(args, "--gpu") : o.gpu;
+        // a community run uses every visible card; CUDA_VISIBLE_DEVICES picks them
+        const std::string want = o.community ? "auto" : has_arg(args, "--gpu") ? arg_value(args, "--gpu") : o.gpu;
         if (!basalt::program::select_gpus(want, "basalt-bench", gpu_value, used, gerr)) {
             basalt::log::error("basalt-bench", "%s", gerr.c_str());
             return 2;

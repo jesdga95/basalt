@@ -2,6 +2,7 @@
 
     BASALT_BIN=bin/basalt BASALT_BENCH_BIN=bin/basalt-bench python3 -m unittest tools.test_bench_flags
 """
+import json
 import os
 import re
 import subprocess
@@ -102,6 +103,15 @@ class BenchFlags(unittest.TestCase):
                                    capture_output=True, text=True)
                 self.assertEqual(r.returncode, 2)
                 self.assertIn("incomparable", r.stderr)
+
+    def test_community_uses_every_visible_card_and_refuses_gpu(self):
+        cmd = self.command_community()
+        plan = subprocess.run([str(ENGINE), "--gpu-plan", "--gpu", "auto"], capture_output=True, text=True)
+        self.assertEqual(plan.returncode, 0, plan.stderr)
+        self.assertEqual(cmd[cmd.index("--gpu") + 1], json.loads(plan.stdout)["devices"])   # every visible card
+        r = subprocess.run([str(BENCH), "--model", "m.basalt", "--community", "--gpu", "0"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("incomparable", r.stderr)
 
     def test_help_lists_the_engine_flags(self):
         r = subprocess.run([str(BENCH), "--help", "--engine", str(ENGINE)], capture_output=True, text=True)
