@@ -311,6 +311,69 @@
       "prefill_64k_tps": 3174.9,
       "decode_tps": 76.8,
       "notes": "official HF pack, weights on NVMe"
+    },
+    {
+      "submitter": "drakiss79",
+      "date": "2026-10-24",
+      "commit": "588a4776ed",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 500
+        }
+      ],
+      "ram_gib": 62,
+      "cpu": "Intel Core Ultra 9 285K, 24 cores",
+      "os": "Linux",
+      "quant": "IQ3_S",
+      "prefill_16k_tps": 8858.9,
+      "prefill_64k_tps": 9500.8,
+      "decode_tps": 374.8,
+      "notes": "RTX 5090 at a 500 W limit (below the card's 575 W default), 62 GiB DDR5; 46.8 GiB of experts, 0 SSD spill"
+    },
+    {
+      "submitter": "drakiss79",
+      "date": "2026-10-24",
+      "commit": "588a4776ed",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 500
+        }
+      ],
+      "ram_gib": 62,
+      "cpu": "Intel Core Ultra 9 285K, 24 cores",
+      "os": "Linux",
+      "quant": "IQ3_XXS",
+      "prefill_16k_tps": 8784.2,
+      "prefill_64k_tps": 9326.3,
+      "decode_tps": 564.5,
+      "notes": "RTX 5090 at a 500 W limit (below the card's 575 W default), 62 GiB DDR5; 40.0 GiB of experts, 0 SSD spill"
+    },
+    {
+      "submitter": "drakiss79",
+      "date": "2026-10-24",
+      "commit": "588a4776ed",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 500
+        }
+      ],
+      "ram_gib": 62,
+      "cpu": "Intel Core Ultra 9 285K, 24 cores",
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 9288.7,
+      "prefill_64k_tps": 10095.3,
+      "decode_tps": 305.4,
+      "notes": "RTX 5090 at a 500 W limit (below the card's 575 W default), 62 GiB DDR5; 63.3 GiB of experts fit beside the VRAM cache with no SSD spill at 62 GiB RAM"
     }
   ]
 }
