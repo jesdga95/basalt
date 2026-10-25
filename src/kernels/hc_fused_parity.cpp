@@ -738,6 +738,9 @@ int main(int argc, char** argv) {
         cudaStream_t sb;
         cudaStreamCreateWithFlags(&sb, cudaStreamNonBlocking);
         const std::string bs = block_list;
+        int dev_sms = 0, dev_id = 0;
+        cudaGetDevice(&dev_id);
+        cudaDeviceGetAttribute(&dev_sms, cudaDevAttrMultiProcessorCount, dev_id);
         size_t p0 = 0;
         int stuck = 0;
         while (p0 < bs.size()) {
@@ -746,6 +749,7 @@ int main(int argc, char** argv) {
             int T = 2, k = 0;
             std::sscanf(bs.substr(p0, p1 - p0).c_str(), "%d:%d", &T, &k);
             p0 = p1 + 1;
+            if (k >= dev_sms) continue;   // every SM held: nothing could run the read
             *(volatile int*) h_go = 0;
             *(volatile int*) h_started = 0;
             reset(1);
