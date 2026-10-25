@@ -74,7 +74,7 @@ Q6_K x q8_1 in float:
 Margins 6 and 8 rescore 5,569-18,649 and 27,962-78,806 rows per column. Neither a least-squares scale for the copy nor a
 per-column correction of the tail's bias lowers the KLD (the tail's mass is unbiased; the cost is its noise).
 
-Quality gate (IQ3_S, 100 chunks, against the Q8_0 base, tiers pinned to `--expert-cache 9000 --peer-slots 7562`, 400 W;
+Quality gate (IQ3_S, 100 chunks, against the Q8_0 base, tiers pinned (expert cache 9000 slots, peer 7562), 400 W;
 the gate leaves the PCIe share dynamic, so two runs of one build differ):
 
 | Head | Run | PPL | KLD mean | KLD median | KLD p99 | Same top-1 |
@@ -133,7 +133,7 @@ configuration, same prompt order. A logit-hash diagnostic prints an FNV-1a hash 
 of every accepted row. Token ids and the hash at each generated position are compared between `--spec 0` and
 `--spec 7`.
 
-Expert tiers are pinned (`--adapt-swaps 0 --peer-adapt-swaps 0`, with `--expert-cache` and `--peer-slots`
+Expert tiers are pinned (`--adapt-swaps 0 --peer-adapt-swaps 0`, with the expert cache and the peer tier
 fixed to the sizes auto-sizing picks), so the same experts sit on the same device in both runs.
 
 | Pack | Prompts | Identical tokens | Logit rows compared | Bit-identical rows | First divergence | Accepted drafts | Decode tok/s, spec 0 → spec 7 |
