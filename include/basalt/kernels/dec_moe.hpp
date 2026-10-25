@@ -102,6 +102,12 @@ struct DmGlueArgs {
     /// copied from xq) instead of a route launch
     bool ring_on = false;
     DmRouteArgs ring;
+    /// device: the layer's landed word and the word it must reach (null: no wait).  An adaptive round's copies into
+    /// the slots are queued in layer order, each layer's followed by a 4-byte copy of the round's number into its word,
+    /// so the gate/up blocks read no blob of a round still landing.
+    const unsigned int* landed = nullptr;
+    const unsigned int* landed_need = nullptr;
+    const unsigned int* landed_stop = nullptr;   ///< mapped: UINT32_MAX ends the wait (a released window)
 };
 /// Whether dec_moe_glue covers L (the DEC_GU2=2 chain's formats and settings).
 bool dec_moe_glue_ok(const NativeExpertLayout& L);

@@ -467,6 +467,21 @@ __device__ __forceinline__ unsigned dm_ld_acquire(const unsigned* p) {
     return v;
 }
 
+// the layer's landed word, read at the kernel's start (`have`) and spun on only while it is short of `need`
+__device__ __forceinline__ void dm_landed_read(const DmGlueArgs& a, unsigned& need, unsigned& have) {
+    if (a.landed == nullptr) return;
+    need = __ldcg(a.landed_need);
+    have = dm_ld_acquire(a.landed);
+}
+// (the mapped stop word is read once in a while: every block polling it would crowd the link the copies come over)
+__device__ __forceinline__ void dm_landed_wait(const DmGlueArgs& a, unsigned need, unsigned have) {
+    if (a.landed == nullptr || have >= need) return;
+    for (unsigned i = 1; dm_ld_acquire(a.landed) < need; ++i) {
+        if ((i & 1023u) == 0u && a.landed_stop != nullptr && *(const volatile unsigned*) a.landed_stop == 0xffffffffu) break;
+        __nanosleep(128);
+    }
+}
+
 // The ring's block after a read that counts its progress (DmRouteArgs::pub_ctr), started with the read: the layer's
 // residency rows into shared memory (s_res: 2 * n_expert words); once the up slices are through, every token's FFN
 // input rows to mapped memory while the router runs; once the router items have written xq, its q8_1 rows while the
@@ -554,6 +569,8 @@ __global__ void __launch_bounds__(256, 2) dm_glue_gu_kernel(DmGlueArgs a, Native
         dm_glue_ring(a.ring, a.xq, tid);
         return;
     }
+    unsigned lw_need = 0u, lw_have = 0u;
+    if (tid == 0) dm_landed_read(a, lw_need, lw_have);
     for (int i = tid; i < a.n_expert; i += 256) s_tab[i] = 0u;
     if (tid == 0) s_dup = 0;
     const uint32_t* s_grid = gu2::stage_grid<TG>(s_grid_buf, tid);
@@ -562,6 +579,7 @@ __global__ void __launch_bounds__(256, 2) dm_glue_gu_kernel(DmGlueArgs a, Native
     const int tok = tid / a.k, warp = tid >> 5, lane = tid & 31;
     __syncthreads();   // the masks are zero before any entry marks one
     pdl_wait();
+    if (tid == 0) dm_landed_wait(a, lw_need, lw_have);   // before the plan: no launch after this one reads a blob early
     // the table entry is read at once; the marking and the barrier hide its latency
     const int32_t e0 = tid < n ? __ldcg(a.ids + tid) : -1;
     const bool inr = e0 >= 0 && e0 < a.n_expert;
@@ -768,6 +786,8 @@ __global__ void __launch_bounds__(256, 4) dm_glue_gu1_kernel(DmGlueArgs a, Nativ
         return;
     }
     const int wb = (int) blockIdx.x - (a.ring_on && blockIdx.x > 1 ? 1 : 0);   // the block's place among the workers
+    unsigned lw_need = 0u, lw_have = 0u;
+    if (tid == 0) dm_landed_read(a, lw_need, lw_have);
     for (int i = tid; i < a.n_expert; i += 256) s_tab[i] = 0u;
     if (tid == 0) s_dup = 0;
     if (tid == 0 && wb * 16 < a.n_expert)   // the layer's table into L2
@@ -777,11 +797,13 @@ __global__ void __launch_bounds__(256, 4) dm_glue_gu1_kernel(DmGlueArgs a, Nativ
         if (tid == 0) {
             while (dm_ld_acquire(a.ring.pub_ctr) < a.ring.pub_target) __nanosleep(32);
             while (dm_ld_acquire(a.ring.pub_ctr + 1) == 0u) __nanosleep(32);
+            dm_landed_wait(a, lw_need, lw_have);   // before the plan: no launch after this one reads a blob early
         }
         __syncthreads();
     } else {
         __syncthreads();
         pdl_wait();
+        if (tid == 0) dm_landed_wait(a, lw_need, lw_have);
     }
     const int32_t e0 = tid < n ? __ldcg(a.ids + tid) : -1;
     const bool inr = e0 >= 0 && e0 < a.n_expert;

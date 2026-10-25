@@ -1061,6 +1061,64 @@ int main(int argc, char** argv) {
                         const auto c5 = down(d_p4, (size_t) n * H);
                         std::snprintf(what, sizeof what, "glue ring rows, counted T=%d", T);
                         report(what, l, ndiff_rows(a4, c5, rows), rows.size() * H);
+                        // the landed words (an adaptive round's copies into the slots): with the layer's word at the
+                        // need the rows are the launch's without the words; with the word short, the blobs are garbage
+                        // until a copy on another stream puts them back and raises the word after them, and the launch
+                        // must still be waiting when that starts and end with the same rows
+                        {
+                            unsigned int* d_lw = dmal<unsigned int>(2);
+                            uint32_t* h_lw = nullptr;
+                            uint8_t* h_blobs = nullptr;
+                            ck(cudaHostAlloc((void**) &h_lw, 64, cudaHostAllocPortable), "pinned");
+                            ck(cudaHostAlloc((void**) &h_blobs, blobs.size(), cudaHostAllocPortable), "pinned");
+                            std::memcpy(h_blobs, blobs.data(), blobs.size());
+                            h_lw[0] = 1u;
+                            cudaStream_t sc;
+                            ck(cudaStreamCreateWithFlags(&sc, cudaStreamNonBlocking), "stream");
+                            cudaEvent_t e_glue, e_word;
+                            ck(cudaEventCreate(&e_glue), "event");
+                            ck(cudaEventCreate(&e_word), "event");
+                            for (int counted = 0; counted < 2; ++counted) {
+                                for (int late = 0; late < 2; ++late) {
+                                    K::DmGlueArgs gl = counted ? gp : gr;
+                                    gl.landed = d_lw;
+                                    gl.landed_need = d_lw + 1;
+                                    ck(cudaMemset(d_lw, 0, 8), "words");
+                                    if (late) {
+                                        ck(cudaMemcpy(d_lw + 1, h_lw, 4, cudaMemcpyHostToDevice), "need");
+                                        ck(cudaMemset(dv[0].blob, 0x5a, blobs.size()), "garble");
+                                    }
+                                    ck(cudaMemcpy(d_pc, counts, 12, cudaMemcpyHostToDevice), "counts");
+                                    ck(cudaMemsetAsync(d_p4, 0, (size_t) K::kDmCap * H * 4, s0), "memset");
+                                    ck(cudaDeviceSynchronize(), "landed setup");
+                                    K::dec_moe_glue(L, gl, dv[0].scr, d_p4, n, s0);
+                                    ck(cudaEventRecord(e_glue, s0), "event");
+                                    bool early = false;
+                                    if (late) {
+                                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                                        early = cudaEventQuery(e_glue) == cudaSuccess;
+                                        ck(cudaMemcpyAsync(dv[0].blob, h_blobs, blobs.size(), cudaMemcpyHostToDevice, sc), "blobs back");
+                                        ck(cudaMemcpyAsync(d_lw, h_lw, 4, cudaMemcpyHostToDevice, sc), "word");
+                                        ck(cudaEventRecord(e_word, sc), "event");
+                                    }
+                                    ck(cudaStreamSynchronize(s0), "landed glue");
+                                    ck(cudaStreamSynchronize(sc), "landed copies");
+                                    float after = 1.0f;
+                                    if (late) ck(cudaEventElapsedTime(&after, e_word, e_glue), "elapsed");
+                                    const auto c6 = down(d_p4, (size_t) n * H);
+                                    std::snprintf(what, sizeof what, "glue rows, landed%s%s T=%d", counted ? ", counted" : "",
+                                                  late ? " late" : "", T);
+                                    report(what, l, ndiff_rows(a4, c6, rows) + (early ? 1 : 0) + (after < 0.0f ? 1 : 0),
+                                           rows.size() * H);
+                                }
+                            }
+                            cudaEventDestroy(e_glue);
+                            cudaEventDestroy(e_word);
+                            cudaStreamDestroy(sc);
+                            cudaFreeHost(h_blobs);
+                            cudaFreeHost(h_lw);
+                            cudaFree(d_lw);
+                        }
                         cudaFree(d_pc);
                     }
                     std::memcpy(h_x + (size_t) 5 * MT * H, xm0.data(), xm0.size());
@@ -1074,9 +1132,16 @@ int main(int argc, char** argv) {
                         K::native_expert_grouped(L, d_plan->ptr, d_plan->start, d_plan->counts, d_plan->dst, d_plan->tok,
                                                  n, n, d_xq2, dv[0].scr, d_parts2, s0);
                     });
+                    unsigned int* d_lw0 = dmal<unsigned int>(2);   // landed words at their need: the check alone
+                    K::DmGlueArgs gw = ga;
+                    gw.landed = d_lw0;
+                    gw.landed_need = d_lw0 + 1;
+                    const double ul = time_us(s0, 200, [&] { K::dec_moe_glue(L, gw, dv[0].scr, d_p4, n, s0); });
+                    cudaFree(d_lw0);
                     const double mb = (double) P.counts[0] * (double) L.bytes / 1e6;   // the VRAM groups' expert bytes
-                    std::printf("  bench: T=%d route + grouped %.2f us, glue %.2f us (%d groups, %.1f MB: %.0f vs %.0f GB/s)\n",
-                                T, ur, ug, P.counts[0], mb, mb * 1e3 / ur, mb * 1e3 / ug);
+                    std::printf("  bench: T=%d route + grouped %.2f us, glue %.2f us, glue with landed words %.2f us (%d groups, "
+                                "%.1f MB: %.0f vs %.0f GB/s)\n",
+                                T, ur, ug, ul, P.counts[0], mb, mb * 1e3 / ur, mb * 1e3 / ug);
                 }
                 cudaFree(d_pt); cudaFree(d_p4); cudaFree(d_pub);
             } else {

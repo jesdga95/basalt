@@ -5849,8 +5849,9 @@ int main(int argc, char** argv) {
         // boundaries, with no host copy and no blocking copy on the decode path.  (1) The evicted experts' slots are
         // copied by DMA into free places of the RAM copy (they stay resident meanwhile).  (2) Those places become
         // theirs, the CPU computes them, and the incoming experts are copied into the slots.  (3) The incoming experts
-        // are resident and their RAM places free.  Each step waits for the previous one's copies, so where an expert
-        // runs depends only on the window count, as with the plain rounds.
+        // are resident and their RAM places free.  Step (2) waits for the eviction copies; at step (3) the next
+        // window's gate/up launches wait for their own layer's incoming copies (the landed words below), so the loop
+        // does not, and where an expert runs depends only on the window count, as with the plain rounds.
         const bool adapt_fast =
                                 !multi_gpu && !remote_opt;
         // Its rounds come every --adapt-every windows, so the counts decay less per round than the plain default
@@ -5862,7 +5863,35 @@ int main(int argc, char** argv) {
         std::vector<XSwap> xq;
         int xq_stage = 0;   // 0 idle, 1 evictions copying to RAM, 2 incoming experts copying to their slots
         bool xq_saturated = false;   // the last round had at least kSatRatio times --adapt-swaps misses to swap
+        // The landed words (Verifier::landed_words): a round's incoming copies are queued in layer order, each layer's
+        // followed by a 4-byte copy of the round's number into the layer's word.  The copies' sources are a pinned
+        // ring of rounds (every layer's word, then the round's number).
+        constexpr int kXqPinRounds = 4;
+        uint32_t xq_no = 0;
+        bool xq_words = false;   // the round in flight writes the landed words
+        uint32_t* xq_pin = nullptr;
+        if (ver.landed_words() != nullptr &&
+            cudaHostAlloc((void**) &xq_pin, (size_t) kXqPinRounds * (size_t) (g.n_layers + 1) * 4, cudaHostAllocPortable) !=
+                cudaSuccess) {
+            cudaGetLastError();
+            xq_pin = nullptr;
+        }
+        cudaEvent_t p2p_ev = nullptr;   // the copies out of the peer's slots, which a promotion's reassign refills
+        cudaEventCreateWithFlags(&p2p_ev, cudaEventDisableTiming);
+        // a round made resident before its copies were done: the bookkeeping that waits for them (the next round or
+        // a drain), and the RAM pages of its experts
+        bool xq_unsettled = false;
+        std::vector<std::pair<int32_t, int32_t>> xq_released;
+        auto xq_settle = [&]() {
+            if (!xq_unsettled) return;
+            cudaEventSynchronize(adapt_ev);
+            for (const auto& [l, e] : xq_released) srcp->release(l, e);
+            xq_released.clear();
+            res_upload();
+            xq_unsettled = false;
+        };
         auto xq_round = [&]() -> bool {
+            xq_settle();
             const auto at0 = Clock::now();
             const int64_t peer_sw0 = peer.valid() ? peer.swaps() : 0;
             std::vector<Swap> swaps;
@@ -5949,11 +5978,13 @@ int main(int argc, char** argv) {
             for (float& v : drive.d.usage) v *= fast_decay;
             return true;
         };
-        auto xq_advance = [&]() -> bool {
+        // `wait`: step (3) waits for the copies even with the landed words (the batch windows, a drain)
+        auto xq_advance = [&](bool wait) -> bool {
             if (xq_stage == 0) return true;
             const auto& lay = basalt::kernels::cpu::expert_layout();
             if (xq_stage == 2) ver.flush_post_launch();
-            cudaEventSynchronize(adapt_ev);
+            const bool nowait = xq_stage == 2 && xq_words && !wait;
+            if (!nowait) cudaEventSynchronize(adapt_ev);
             if (xq_stage == 1) {
                 for (const XSwap& x : xq) {
                     if (x.xchg && !src.spare_land(x.layer, x.out, x.off)) {
@@ -5969,7 +6000,7 @@ int main(int argc, char** argv) {
                     res_upload();
                     ver.dm_fence(adapt_stream);
                 }
-                bool deferred = false;
+                bool deferred = false, p2p = false;
                 for (const XSwap& x : xq) {   // stream order keeps each behind its slot's eviction copy
                     std::string perr;
                     if (x.p2p) {
@@ -5977,20 +6008,49 @@ int main(int argc, char** argv) {
                             basalt::log::error("basalt serve", "%s", perr.c_str());
                             return false;
                         }
+                        p2p = true;
                         continue;
                     }
                     deferred = true;
                 }
+                if (p2p) cudaEventRecord(p2p_ev, adapt_stream);
+                const uint32_t* pw = nullptr;   // this round's landed words and number
+                xq_words = xq_pin != nullptr && ver.landed_ok();
+                if (xq_words) {
+                    ++xq_no;
+                    uint32_t* w = xq_pin + (size_t) (xq_no % kXqPinRounds) * (size_t) (g.n_layers + 1);
+                    // a layer without an incoming RAM copy is in now (its copies out of the peer are ahead), the others
+                    // once their own copies are
+                    for (int64_t l = 0; l < g.n_layers; ++l) w[l] = xq_no;
+                    for (const XSwap& x : xq)
+                        if (!x.p2p) w[x.layer] = xq_no - 1;
+                    w[g.n_layers] = xq_no;
+                    if (cudaMemcpyAsync(ver.landed_words(), w, (size_t) g.n_layers * 4, cudaMemcpyHostToDevice, adapt_stream) !=
+                        cudaSuccess) {
+                        basalt::log::error("basalt serve", "the landed words' copy failed: %s", cudaGetErrorString(cudaGetLastError()));
+                        return false;
+                    }
+                    pw = w;
+                }
                 if (deferred) {   // the RAM copies are queued once the next window is launched, and run beside it
-                    ver.set_post_launch([&] {
+                    ver.set_post_launch([&, pw] {
                         const auto& lay2 = basalt::kernels::cpu::expert_layout();
-                        for (const XSwap& x : xq) {
-                            if (x.p2p) continue;
+                        std::vector<uint32_t> ord;   // layer order: a layer's word goes up right after its own copies
+                        for (uint32_t i = 0; i < (uint32_t) xq.size(); ++i)
+                            if (!xq[i].p2p) ord.push_back(i);
+                        std::stable_sort(ord.begin(), ord.end(), [&](uint32_t a, uint32_t b) { return xq[a].layer < xq[b].layer; });
+                        for (size_t k = 0; k < ord.size(); ++k) {
+                            const XSwap& x = xq[ord[k]];
                             const uint8_t* b = srcp->blob(x.layer, x.in);
                             if (b == nullptr || cudaMemcpyAsync(xcache.device_slot(x.slot), b, (size_t) lay2.blob_bytes(x.layer),
                                                                 cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess)
                                 basalt::log::warn("basalt serve", "adaptive swap copy failed (layer %d, slot %d): %s",
                                              (int) x.layer, (int) x.slot, cudaGetErrorString(cudaGetLastError()));
+                            if (pw != nullptr && (k + 1 == ord.size() || xq[ord[k + 1]].layer != x.layer) &&
+                                cudaMemcpyAsync(ver.landed_words() + x.layer, pw + g.n_layers, 4, cudaMemcpyHostToDevice,
+                                                adapt_stream) != cudaSuccess)
+                                basalt::log::warn("basalt serve", "the landed word's copy failed (layer %d): %s", (int) x.layer,
+                                             cudaGetErrorString(cudaGetLastError()));
                         }
                         cudaEventRecord(adapt_ev, adapt_stream);
                     });
@@ -6000,12 +6060,26 @@ int main(int argc, char** argv) {
                 xq_stage = 2;
                 return true;
             }
+            // with the landed words the incoming experts are resident from the next window on while their copies land:
+            // its gate/up launches wait for them, and what needs them done waits in xq_settle
+            if (nowait && std::any_of(xq.begin(), xq.end(), [](const XSwap& x) { return x.p2p; }))
+                cudaEventSynchronize(p2p_ev);   // a promotion's peer slot is refilled below
             for (const XSwap& x : xq) {
                 host_res[(size_t) x.layer * g.n_expert + x.in] = x.slot;
                 if (x.xchg && !x.p2p) src.spare_release(x.layer, x.in);
-                srcp->release(x.layer, x.in);
+                if (nowait) xq_released.emplace_back(x.layer, x.in);
+                else srcp->release(x.layer, x.in);
             }
-            res_upload();
+            if (nowait) {
+                std::string perr;
+                if (!ver.landed_need(xq_no, perr)) {
+                    basalt::log::error("basalt serve", "%s", perr.c_str());
+                    return false;
+                }
+                xq_unsettled = true;
+            } else {
+                res_upload();
+            }
             for (const XSwap& x : xq) {   // a promoted expert's peer slot takes the one CUDA0 gave up
                 if (!x.promo) continue;
                 std::string perr;
@@ -6018,7 +6092,8 @@ int main(int argc, char** argv) {
         };
         auto xq_drain = [&]() -> bool {
             while (xq_stage != 0)
-                if (!xq_advance()) return false;
+                if (!xq_advance(true)) return false;
+            xq_settle();
             return true;
         };
         // write the learned profile (between requests and at QUIT: a prompt's lent slots are back by then).  A swap
@@ -7157,7 +7232,7 @@ int main(int argc, char** argv) {
                     if (xq_stage != 0) {
                         if (cudaEventQuery(adapt_ev) == cudaSuccess) {
                             const int was = xq_stage;
-                            ok = xq_advance();
+                            ok = xq_advance(true);
                             if (ok && was == 1 && xq_stage == 2) {
                                 ba_thr.run([&] { ver.flush_post_launch(); });
                                 ba_job = true;
@@ -9079,7 +9154,7 @@ int main(int argc, char** argv) {
                         adapt_thr.run([&] {
                             const auto ta = Clock::now();
                             basalt::core::decode_events().stamp(8);
-                            adapt_ok = xq_stage != 0 ? xq_advance() : xq_round();
+                            adapt_ok = xq_stage != 0 ? xq_advance(false) : xq_round();
                             basalt::core::decode_events().stamp(6);
                             std::string perr;
                             if (adapt_ok && !ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());

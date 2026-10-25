@@ -236,6 +236,14 @@ public:
     /// Work queued on `s` after this call starts only once the window stream has run everything queued on it so far (the
     /// residency uploads of dm_presync), so a large copy on `s` cannot hold the small uploads back in the copy queue.
     bool dm_fence(cudaStream_t s);
+    /// The adaptive tier's landed words (DmGlueArgs::landed): device, one per layer, null without the device-planned
+    /// tail.  A round's copies into the slots write the round's number into a layer's word once that layer's are in.
+    unsigned int* landed_words() const;
+    /// Every window's gate/up launch waits for its layer's word (each window size captured, each layer's routed experts
+    /// through dec_moe_glue): a round's incoming experts may be resident before their copies are done.
+    bool landed_ok() const;
+    /// The windows from the next on wait for `round`'s copies (queued on the window stream).
+    bool landed_need(uint32_t round, std::string& err);
     /// `f` runs on the calling thread of the next `run`, right after the window's graph is launched.
     void set_post_launch(std::function<void()> f) { post_launch_ = std::move(f); }
     /// runs it now if no window has since (a request ending)
@@ -499,6 +507,7 @@ private:
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
     std::function<void()> post_launch_;
     cudaEvent_t fence_ev_ = nullptr;      // dm_fence
+    bool landed_glue_ = true;             // every device-planned layer captured so far ran dec_moe_glue
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
     bool commit_pending_ = false;
     // The async commit's own stream, after an event on cs_.  The next window's first node (the finisher) takes what the

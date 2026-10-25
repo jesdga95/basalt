@@ -110,6 +110,11 @@ struct DecMoe {
     unsigned long long* ptab0 = nullptr;   // [n_layers * n_expert] CUDA0 blob address or 0
     unsigned int* pub = nullptr;           // [rings][4] the FFN read's counts for the ring's block (HcFusedArgs::pub_ctr)
     unsigned int* cseen = nullptr;         // the combine's last ring whose CPU word it saw (dec_moe_combine's cpu_seen)
+    // [rings + 1]: per layer the last adaptive round whose copies into its slots are in, then the round the window's
+    // gate/up launches wait for (DmGlueArgs::landed)
+    unsigned int* landed = nullptr;
+    uint32_t* landed_pin = nullptr;        // pinned: the need copies' sources, a ring of kPinSlots
+    int landed_i = 0;
     int64_t wstat_windows = 0, wstat_t = 0;
     // mapped: per ring header, FFN input and q8_1 rows; [0] the peer's ring, [16] its done ring, [32] its abort
     // record (kDmDiagWords); the peer's rows
@@ -565,7 +570,13 @@ bool Verifier::dm_init(std::string& err) {
               cudaMalloc(&d->xq_pub, d->xq_stride) == cudaSuccess &&
               cudaMalloc((void**) &d->pub, (size_t) d->rings * 16) == cudaSuccess &&
               cudaMemset(d->pub, 0, (size_t) d->rings * 16) == cudaSuccess &&
-              cudaMalloc((void**) &d->cseen, 4) == cudaSuccess && cudaMemset(d->cseen, 0, 4) == cudaSuccess;
+              cudaMalloc((void**) &d->cseen, 4) == cudaSuccess && cudaMemset(d->cseen, 0, 4) == cudaSuccess &&
+              cudaMalloc((void**) &d->landed, (size_t) (d->rings + 1) * 4) == cudaSuccess &&
+              cudaMemset(d->landed, 0, (size_t) (d->rings + 1) * 4) == cudaSuccess;
+    if (ok && cudaHostAlloc((void**) &d->landed_pin, DecMoe::kPinSlots * 4, cudaHostAllocPortable) != cudaSuccess) {
+        cudaGetLastError();
+        d->landed_pin = nullptr;
+    }
     d->vram = -1;
     if (ok && hits_.slot_off != nullptr && hits_.n_slots > 0)
         ok = cudaMalloc((void**) &d->slot_off, (size_t) hits_.n_slots * 8) == cudaSuccess &&
@@ -687,6 +698,18 @@ bool Verifier::dm_init(std::string& err) {
     return true;
 }
 
+// A host-to-device upload in pieces of at most kSmallCopy bytes: a copy that small passes the expert copies queued on
+// the card's copy engine (an adaptive round's), a larger one waits behind all of them.
+constexpr size_t kSmallCopy = 16384;
+static cudaError_t copy_small(void* dst, const void* src, size_t bytes, cudaStream_t s) {
+    for (size_t o = 0; o < bytes; o += kSmallCopy) {
+        const cudaError_t e = cudaMemcpyAsync((uint8_t*) dst + o, (const uint8_t*) src + o, std::min(kSmallCopy, bytes - o),
+                                              cudaMemcpyHostToDevice, s);
+        if (e != cudaSuccess) return e;
+    }
+    return cudaSuccess;
+}
+
 // The residency tables the window classifies with: host_res and the peer's, as they are now (between windows).
 // Each upload is queued on the stream that reads it (CUDA0's window, the peer's): a plain cudaMemcpy from pageable
 // memory may return before its DMA lands, and the window's route kernel would then read a table half old, half new
@@ -717,7 +740,7 @@ bool Verifier::dm_sync(std::string& err) {
         decode_events().tag(1u << 4);
         const int32_t* src = d->shadow0.data() + a;
         if (pin) { std::memcpy(pin_res0 + a, src, (b - a) * 4); src = pin_res0 + a; }
-        if (cudaMemcpyAsync(d->res0 + a, src, (b - a) * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+        if (copy_small(d->res0 + a, src, (b - a) * 4, cs_) != cudaSuccess) {
             err = "verify: device-planned MoE residency upload";
             return false;
         }
@@ -732,7 +755,7 @@ bool Verifier::dm_sync(std::string& err) {
                                                                                              : (size_t) slot * hits_.blob))
                                  : 0ull;
         }
-        if (cudaMemcpyAsync(d->ptab0 + a, p, (b - a) * 8, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+        if (copy_small(d->ptab0 + a, p, (b - a) * 8, cs_) != cudaSuccess) {
             err = "verify: glue table upload";
             return false;
         }
@@ -754,7 +777,7 @@ bool Verifier::dm_sync(std::string& err) {
         decode_events().tag(1u << 5);
         const int32_t* src = d->shadow1.data() + a;
         if (pin) { std::memcpy(pin_res1 + a, src, (b - a) * 4); src = pin_res1 + a; }
-        if (cudaMemcpyAsync(d->res1 + a, src, (b - a) * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+        if (copy_small(d->res1 + a, src, (b - a) * 4, cs_) != cudaSuccess) {
             err = "verify: device-planned MoE peer residency upload";
             return false;
         }
@@ -800,7 +823,7 @@ bool Verifier::dm_sync(std::string& err) {
         a = ch.front();
         b = (size_t) ch.back() + 1;
         std::memcpy(x.shadow.data() + a, now + a, (b - a) * 4);
-        if (cudaMemcpyAsync(x.res + a, x.shadow.data() + a, (b - a) * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+        if (copy_small(x.res + a, x.shadow.data() + a, (b - a) * 4, cs_) != cudaSuccess) {
             err = "verify: device-planned MoE residency upload of a further peer";
             return false;
         }
@@ -830,6 +853,28 @@ bool Verifier::dm_sync(std::string& err) {
                 return false;
             }
         }
+    }
+    return true;
+}
+
+unsigned int* Verifier::landed_words() const { return dm_ != nullptr && dm_->landed_pin != nullptr ? dm_->landed : nullptr; }
+
+bool Verifier::landed_ok() const {
+    if (landed_words() == nullptr || !landed_glue_) return false;
+    for (int t = 1; t <= max_t_; ++t)
+        if ((ar_off_ ? exec_nr_[t] : exec_[t]) == nullptr) return false;
+    return true;
+}
+
+bool Verifier::landed_need(uint32_t round, std::string& err) {
+    if (landed_words() == nullptr) return true;
+    const OnDevice on_device(device_);
+    uint32_t* src = dm_->landed_pin + dm_->landed_i;
+    dm_->landed_i = (dm_->landed_i + 1) % DecMoe::kPinSlots;
+    *src = round;
+    if (cudaMemcpyAsync(dm_->landed + dm_->rings, src, 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+        err = "verify: the landed words' upload";
+        return false;
     }
     return true;
 }
@@ -1331,9 +1376,10 @@ void Verifier::dm_free() {
     }
     for (void* p : {(void*) d->res0, (void*) d->res1, (void*) d->plan, (void*) d->ctr, (void*) d->slot_off, d->vscr,
                     (void*) d->vsync, d->xq_pub, (void*) d->wstat,
-                    (void*) d->ptab0, (void*) d->pub, (void*) d->cseen})
+                    (void*) d->ptab0, (void*) d->pub, (void*) d->cseen, (void*) d->landed})
         if (p) cudaFree(p);
     if (d->pin) cudaFreeHost(d->pin);
+    if (d->landed_pin) cudaFreeHost(d->landed_pin);
     for (void* h : {(void*) d->h_ring, (void*) d->h_x, (void*) d->h_xq, (void*) d->h_w, (void*) d->h_rows})
         if (h) cudaFreeHost(h);
     delete d;
@@ -2783,13 +2829,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 ga.n_tok = n; ga.k = (int) K; ga.n_expert = (int) g.n_expert;
                 ga.plan = P; ga.xq = nat_xq_;
                 { ga.ring_on = true; ga.ring = glue_ring; }
+                if (dm_->landed_pin != nullptr) {
+                    ga.landed = dm_->landed + (l - lb_);
+                    ga.landed_need = dm_->landed + dm_->rings;
+                    ga.landed_stop = dm_->m_w + 60;
+                }
                 dec_moe_glue(L, ga, hit_scratch_, parts_out, (int) cap, cs);
-            } else if (dm_->vram >= 0)
+            } else if (dm_->vram >= 0) {
+                landed_glue_ = false;
                 dec_moe_vram(L, P, nat_xq_, dm_->vscr, parts_out, dm_->vsync, cs, dm_->vram,
                              (int) cap);
-            else
+            } else {
+                landed_glue_ = false;
                 native_expert_grouped(L, P->ptr, P->start, P->counts, P->dst, P->tok, cap, cap,
                                       nat_xq_, hit_scratch_, parts_out, cs);
+            }
             stamp(l, 20);
             stamp(l, 21);
             stamp(l, 22);
