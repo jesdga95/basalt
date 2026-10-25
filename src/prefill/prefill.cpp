@@ -66,6 +66,10 @@ inline int64_t MAXBLOB() { return (int64_t) basalt::kernels::cpu::expert_layout(
 // host->device expert staging ring of a chunk below stream_all_min(): two groups of MMQ_GROUP experts, so a slot is
 // copied into again only once the group that read it has run
 constexpr int STAGE = 32;
+// Such a chunk also holds, per layer parity, slots for the next layer's experts copied ahead of its routing, after the
+// STAGE slots: about as many as the link moves while a layer's attention half runs, which grows with the chunk.
+constexpr int kAheadSlots = 64;
+inline int ahead_slots(size_t T) { return (int) std::min<size_t>(kAheadSlots, T / 32); }
 // From the chunk size stream_all_min() on, every non-resident expert of every layer streams in a fixed order through a
 // ring_slots()-slot ring (nearly every expert is routed at such a chunk), so the copy engine keeps working through the
 // attention halves instead of waiting for each layer's routing.
@@ -100,7 +104,7 @@ inline bool fused_ring() {
 }
 // (a prompt peer's streamed share and the fused kernels' batches follow the ring's size: those keep 256)
 inline int ring_slots(size_t T) {
-    if ((int64_t) T < stream_all_min()) return STAGE;
+    if ((int64_t) T < stream_all_min()) return std::min(g_ring_depth, STAGE + 2 * ahead_slots(T));
     const bool deep = (int64_t) T >= kDeepRingTokens && !fused_ring();
     return std::min(g_ring_depth, deep ? kPrefillRingDeep : kPrefillRing);
 }
@@ -532,6 +536,16 @@ struct Prefill::Impl {
     // the event that releases each ring slot: its own `used`, or - when an MMQ group is gathered in one launch - the
     // `used` of the last slot gathered with it, recorded once for all of them (a later record only waits longer)
     int used_of[RING_MAX] = {};
+    // A chunk below stream_all_min(): the next layer's routing guessed from this layer's FFN rows (the next layer's router
+    // on them; on the device and in mapped host memory), the rows it gives each expert, and per layer parity the
+    // layer whose experts were copied ahead and each one's ring slot (-1: not copied ahead).
+    int32_t *guess_ids = nullptr, *guess_host = nullptr, *guess_host_dev = nullptr;
+    float* guess_w = nullptr;
+    int64_t guess_cap = 0, guess_layer = -1;
+    std::vector<int32_t> guess_rows;
+    std::vector<int32_t> ahead_slot[2];
+    int64_t ahead_layer[2] = {-1, -1};
+    cudaEvent_t ahead_ev = nullptr;          // where on the compute stream the copies ahead may start
     // PLE
     float* ple_emb = nullptr;
     std::vector<float> ple_pageable[2];      // the fallback when no more RAM can be pinned
@@ -620,8 +634,9 @@ void Prefill::release() {
     for (float* p : {impl_->cpu_x, impl_->cpu_rows})
         if (p) cudaFreeHost(p);
     if (impl_->cpu_s) cudaStreamDestroy(impl_->cpu_s);
-    for (cudaEvent_t e : {impl_->cpu_ev_in, impl_->cpu_ev_x, impl_->cpu_gev[0], impl_->cpu_gev[1]})
+    for (cudaEvent_t e : {impl_->cpu_ev_in, impl_->cpu_ev_x, impl_->cpu_gev[0], impl_->cpu_gev[1], impl_->ahead_ev})
         if (e) cudaEventDestroy(e);
+    if (impl_->guess_host) cudaFreeHost(impl_->guess_host);
     for (void* p : impl_->owned) cudaFree(p);
 }
 
@@ -905,6 +920,24 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (!m.ple_copied[b] && cudaEventCreateWithFlags(&m.ple_copied[b], cudaEventDisableTiming) != cudaSuccess)
             ok = false;
         m.ple_rows[b].resize(T * basalt::kernels::PLE_N_HEADS);
+    }
+    if (m.guess_host == nullptr) {   // the routing guess of a chunk below stream_all_min(), outside the loan
+        const int64_t rows = std::min<int64_t>(chunk, stream_all_min() - 1) * K;
+        void* hd = nullptr;
+        bool got = rows > 0 && cudaMalloc((void**) &m.guess_ids, (size_t) rows * 4) == cudaSuccess;
+        if (got) m.owned.push_back(m.guess_ids);
+        got = got && cudaMalloc((void**) &m.guess_w, (size_t) rows * 4) == cudaSuccess;
+        if (got) m.owned.push_back(m.guess_w);
+        got = got && cudaHostAlloc((void**) &m.guess_host, (size_t) rows * 4,
+                                   cudaHostAllocMapped | (core::peer_portable() ? cudaHostAllocPortable : 0)) == cudaSuccess &&
+              cudaHostGetDevicePointer(&hd, m.guess_host, 0) == cudaSuccess;
+        if (got) {
+            m.guess_host_dev = (int32_t*) hd;
+            m.guess_cap = rows;
+        } else {
+            cudaGetLastError();   // no guess: no copies ahead
+        }
+        for (int b = 0; b < 2; ++b) m.ahead_slot[b].assign((size_t) m.g->n_expert, -1);
     }
     if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
         const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
@@ -1727,6 +1760,60 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             while (a_issued.load(std::memory_order_acquire) <= k) std::this_thread::yield();
         };
         auto give_back = [&](size_t upto) { a_consumed.store(upto, std::memory_order_release); };
+        // A chunk below stream_all_min(): each layer's MoE half also runs the next layer's router on its FFN rows, and the
+        // experts that guess gives more rows than the CPU share takes (most first; not resident, not the peer's) are
+        // copied ahead into the ring's slots past STAGE for that layer's parity, once this layer has every input of its
+        // combine (the CPU's and the peer's rows cross the same link): the link then works through this layer's end and
+        // the next one's attention half, when it would idle.  The next layer reads the ones its routing picked in place;
+        // what was copied ahead never changes what is computed or in which order.
+        const int ahead_n = !stream_all && m.host_res != nullptr && m.cache != nullptr && m.src != nullptr &&
+                                    m.guess_cap >= T * K
+                                ? (m.ring - STAGE) / 2 : 0;
+        int64_t guess_for = -1;   // the layer whose routing this layer's half guessed
+        m.ahead_layer[0] = m.ahead_layer[1] = m.guess_layer = -1;
+        auto copy_ahead = [&](int64_t L) {
+            if (ahead_n <= 0 || L >= LE || m.guess_layer != L) return;
+            // a layer whose K/V streams from the host uploads it on the compute stream: no copies ahead of it
+            if (core::is_qsa_layer(g, L)) {
+                int64_t qi = 0;
+                for (int64_t i = 0; i < L; ++i) qi += core::is_qsa_layer(g, i) ? 1 : 0;
+                if (ss.qsa_states[(size_t) qi].kv_mode == 1) return;
+            }
+            if (m.ahead_ev == nullptr && cudaEventCreateWithFlags(&m.ahead_ev, cudaEventDisableTiming) != cudaSuccess) {
+                m.ahead_ev = nullptr;
+                return;
+            }
+            std::vector<std::pair<int32_t, int32_t>> want;   // (-rows, expert)
+            for (int32_t e = 0; e < (int32_t) m.g->n_expert; ++e) {
+                const int32_t c = m.guess_rows[(size_t) e];
+                if (c <= basalt::kernels::cpu::MAXT || m.host_res[(size_t) L * m.g->n_expert + e] >= 0) continue;
+                if (ppc && ppc->peer && ppc->peer->has(L, e)) continue;
+                if (m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(L, e)) continue;
+                if (!m.src->pinned(L, e)) continue;
+                want.emplace_back(-c, e);
+            }
+            std::sort(want.begin(), want.end());
+            const int b = (int) (L & 1);
+            std::vector<int32_t>& slot_of = m.ahead_slot[b];
+            std::fill(slot_of.begin(), slot_of.end(), -1);
+            m.ahead_layer[b] = L;
+            cudaEventRecord(m.ahead_ev, m.cs);
+            cudaStreamWaitEvent(m.copy, m.ahead_ev, 0);
+            int k = 0;
+            for (size_t i = 0; i < want.size() && k < ahead_n; ++i) {
+                const int32_t e = want[i].second;
+                const uint8_t* bl = m.src->blob(L, e);
+                if (bl == nullptr) continue;
+                const int sl = STAGE + b * ahead_n + k++;
+                if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
+                cudaMemcpyAsync(m.stage_dev[sl], bl, (size_t) lay0.blob_bytes(L), cudaMemcpyHostToDevice, m.copy);
+                cudaEventRecord(m.copied[sl], m.copy);
+                m.stage_live[sl] = true;
+                slot_of[(size_t) e] = sl;
+                ++stats_.experts_streamed;
+                ++stats_.experts_dma;
+            }
+        };
         bool normed = false;   // the previous half's write already normed R for this half (grs, xn16)
         for (int64_t l = LB; l < LE; ++l) {
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
@@ -1734,6 +1821,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             core::progress_at("reading the prompt (batched): layer", l, p0);   // a stall names layer and chunk
             const core::LayerView v(*m.wt, l);
             if (l == std::max<int64_t>(LB, 1) && !ple_land()) return false;   // the PLE rows, read from layer 1 on
+            if (l == 1 && LB == 0 && ple_on) copy_ahead(1);
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
             if (l == 1 && ple_on && ple_batch) {
                 // the whole chunk at once, in sub-batches carved from the idle scratch region: the key and value
@@ -1931,6 +2019,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
                     if (m.hist_on) route_count(m.ids, T * K, m.hist + l * m.g->n_expert, (int) m.g->n_expert, m.cs);
+                    if (ahead_n > 0 && l + 1 < LE) {   // the next layer's routing guessed (the logits are free again)
+                        const core::LayerView vn(*m.wt, l + 1);
+                        const core::WeightRef* wrn = vn.get("ffn_gate_inp.weight");
+                        std::string e2;
+                        if (wrn != nullptr && bf16_proj(m.gemm, wrn, m.mixed_bf, m.logits, T, vn.name("ffn_gate_inp.weight"), e2)) {
+                            route(m.logits, m.guess_ids, m.guess_w, T, m.g->n_expert, m.cs);
+                            copy_i32(m.guess_host_dev, m.guess_ids, T * K, m.cs);
+                            guess_for = l + 1;
+                        }
+                    }
                     // the shared expert and its scalar gate
                     if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
                     if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
@@ -2059,6 +2157,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           l, p0);
                         cudaStreamSynchronize(m.cs);
                         core::progress_at("reading the prompt (batched): layer", l, p0);
+                        if (guess_for == l + 1) {   // the guessed rows per expert of the next layer
+                            m.guess_rows.assign((size_t) m.g->n_expert, 0);
+                            for (int64_t i = 0; i < T * K; ++i) {
+                                const int32_t e = m.guess_host[(size_t) i];
+                                if (e >= 0 && e < (int32_t) m.g->n_expert) ++m.guess_rows[(size_t) e];
+                            }
+                            m.guess_layer = l + 1;
+                        }
                         std::fill(m.cnt.begin(), m.cnt.end(), 0);
                         for (int64_t i = 0; i < T * K; ++i) {
                             const int32_t e = ids_h[(size_t) i];
@@ -2427,6 +2533,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int32_t e = order[j];
                             const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
                             if (resident) return true;
+                            if (ahead_n > 0 && m.ahead_layer[l & 1] == l && m.ahead_slot[l & 1][(size_t) e] >= 0) {
+                                stage_of[j] = m.ahead_slot[l & 1][(size_t) e];   // copied ahead of the routing
+                                return true;
+                            }
                             const int sl = stage_next;
                             stage_next = (stage_next + 1) % STAGE;
                             const auto th = Clock::now();
@@ -2679,6 +2789,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (peer_now) {   // multi-GPU: the peer's rows are in Dm (or in host memory)
                         cudaStreamWaitEvent(m.cs, peer_fp4 ? ppc->ev_res : ppc->ev_done, 0);
                     }
+                    if (!(l == 0 && ple_on)) copy_ahead(l + 1);   // layer 1's upload of its PLE rows goes first
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                 }
                 // ---- the hyper-connection write of this half; fused with the next half's norm when nothing else

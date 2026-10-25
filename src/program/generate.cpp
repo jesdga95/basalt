@@ -5059,8 +5059,8 @@ int main(int argc, char** argv) {
             }
             if (chunk > 0) {
                 if (o.prefill_auto)
-                    // the RESOLVED ring: a chunk under stream_all_min() gets STAGE.  This is what `init` lays out,
-                    // and what the INFO line reports to the Monitor tab.
+                    // the RESOLVED ring: a chunk under stream_all_min() gets the staging slots and those for copies
+                    // ahead of its routing.  This is what `init` lays out, and what the INFO line reports to the Monitor tab.
                     basalt::log::info("basalt serve", "prompt chunk auto: %lld tokens, a %lld-slot ring",
                                  (long long) chunk,
                                  (long long) basalt::prefill::Prefill::ring_slots_for(chunk));

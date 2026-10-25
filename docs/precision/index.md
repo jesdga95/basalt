@@ -145,7 +145,9 @@ or more streams every non-resident expert through the ring and runs the fused ke
 whatever the chunk, so it only pays once most experts are hit anyway. In a chunk below the cutoff the FP4 experts run in groups of 16, as in the streamed walk,
 bitwise equal to one at a time (`prefill_fp4_test` checks every split of a group into runs); its 32 staging slots come
 out of the prompt's loan like its other buffers, so the experts the GPU holds during the read, and with them the CPU's
-share, follow the ring's size as they follow any tier layout. Chunks of 1,024
+share, follow the ring's size as they follow any tier layout. Each layer of such a chunk also runs the next layer's router on its own FFN rows, and the
+experts that guess gives more than 8 rows are copied ahead into slots of their own while the layer ends: that changes
+where an expert's bytes are read from, never what is computed. Chunks of 1,024
 to 6,143 tokens (a whole prompt of that length on a bare `--prefill auto`) take the MMQ path, where a lower cutoff would
 send them to the fused kernels (packs with fused kernels; an NVFP4 pack runs the same FP4 or MMQ products either way); the
 two paths' rounding differs as the tables above describe. The quality gate's 256-token prompt half is below both
