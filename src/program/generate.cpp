@@ -1556,10 +1556,6 @@ int main(int argc, char** argv) {
     }
     const basalt::core::PackFiles pack_files = basalt::core::PackFiles::from(srcs);
     const basalt::core::ExpertFiles expert_files = basalt::core::ExpertFiles::from(srcs);
-    // Two cards, the drafter and a server that takes one conversation at a time can overlap the windows of a layer split:
-    // a second chain of verifiers over the same sessions (a window's buffers on each card) and, on the first card, the
-    // snapshot a rolled-back guess needs.
-    const bool overlap_ok = chosen_cards.size() == 2 && !o.mtp.empty() && o.serve && o.batch <= 0 && (o.spec >= 2 || !o.spec_given);
     // ---- two or more cards: what they do together is priced and the cheapest mechanism the engine has runs (one card:
     // nothing to choose, and no other card is touched)
     if (chosen_cards.size() >= 2) {
@@ -1568,7 +1564,6 @@ int main(int argc, char** argv) {
         mm.blob_bytes = srcs.experts.bytes > 0 ? srcs.experts.bytes / (uint64_t) mm.pairs : mm.blob_bytes;
         mm.main_overhead = srcs.dense.bytes + (7ull << 29);
         mm.peer_overhead = 5ull << 28;
-        mm.overlapped = overlap_ok;
         const basalt::program::MgPlan mp = basalt::program::plan_multi_gpu(chosen_cards, mm);
         basalt::log::info("basalt", "%s", mp.line.c_str());
         if (mp.pick == basalt::program::Mechanism::LayerSplit && o.peer_device >= 1) {
@@ -1652,7 +1647,9 @@ int main(int argc, char** argv) {
         }
     }
     bool multi_gpu = !split_devs.empty() && !split_same;
-    const bool pipe_want = multi_gpu && split_devs.size() == 1 && overlap_ok;
+    // two stages with the drafter and one conversation at a time pipeline their windows: a second chain of verifiers over
+    // the same sessions (a window's buffers on each card) and, on the first card, the snapshot a rolled-back guess needs
+    const bool pipe_want = multi_gpu && split_devs.size() == 1 && !o.mtp.empty() && o.serve && o.batch <= 0;
     constexpr int kPairMib0 = 280, kPairMibLater = 160;
     if (pipe_want) o.vram_reserve_mib += kPairMib0;
     // Built-in defaults for what is given nowhere: the fastest settings that need no knowledge of the machine.

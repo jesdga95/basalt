@@ -76,21 +76,13 @@ MgPlan plan_multi_gpu(const std::vector<GpuCard>& cards, const MgModel& m) {
     MgPrice tier{Mechanism::ExpertTier, true, gpu_main + kMissMs * (1.0 - read_share(total_slots, pairs))};
     // layer split: each later card runs k layers (k equal on all of them, or by bandwidth) and holds those layers' experts;
     // the main card runs the rest. The cheapest cut is the one the engine's split search finds.
-    // With overlapped windows (two cards) a window whose successor already runs costs its slowest stage, the others
-    // its sum; `hold` of the windows find their successor running.
-    const bool overlapped = m.overlapped && n == 2;
     auto split_ms = [&](const std::vector<double>& f) {
-        double sum = 0, slowest = 0;
+        double gpu = 0, miss = 0;
         for (size_t i = 0; i < n; ++i) {
-            double stage = f[i] * kGpuGB / bw[i] * 1000.0 +
-                           f[i] * kMissMs * (1.0 - read_share(split_slots(i, f[i]), pairs * f[i]));
-            if (i == 0) stage += kDraftMs * 448.0 / bw[0] + kRelayMs;
-            if (i + 1 == n) stage += kHeadMs * 448.0 / bw[n - 1];
-            sum += stage;
-            slowest = std::max(slowest, stage);
+            gpu += f[i] * kGpuGB / bw[i] * 1000.0;
+            miss += f[i] * kMissMs * (1.0 - read_share(split_slots(i, f[i]), pairs * f[i]));
         }
-        const double fresh = sum + kSplitHandoffMs;
-        return overlapped ? (1.0 - m.hold) * fresh + m.hold * (slowest + kSplitHandoffMs) : fresh;
+        return gpu + miss + kSplitHandoffMs + kRelayMs + kHeadMs * 448.0 / bw[n - 1] + kDraftMs * 448.0 / bw[0];
     };
     std::vector<double> f(n, 0.0);
     double split_best = 1e30;
@@ -102,7 +94,7 @@ MgPlan plan_multi_gpu(const std::vector<GpuCard>& cards, const MgModel& m) {
         f[0] = rest;
         split_best = std::min(split_best, split_ms(f));
     }
-    MgPrice split{Mechanism::LayerSplit, true, split_best, overlapped};
+    MgPrice split{Mechanism::LayerSplit, true, split_best};
     // tensor parallel: the dense part of every layer is split across the cards (bandwidth adds up) and every layer pays its
     // exchanges between the cards; the experts stay as in the expert tier
     const double dense_saving = kDenseShare * kGpuGB * (1.0 / bw[0] - 1.0 / total_bw) * 1000.0;
@@ -116,9 +108,8 @@ MgPlan plan_multi_gpu(const std::vector<GpuCard>& cards, const MgModel& m) {
         for (const MgPrice& p : plan.prices)
             if (p.runs && p.mechanism != Mechanism::ExpertTier && p.ms < best * kWinMargin) { plan.pick = p.mechanism; best = p.ms; }
     char buf[256];
-    std::snprintf(buf, sizeof buf, "multi-gpu: %zu cards %s; ms per window: expert tier %.1f, layer split %.1f%s, tensor parallel %.1f%s; picked %s",
-                  n, plan.equal ? "alike" : "unlike", tier.ms, split.ms, split.overlapped ? " (windows overlapped)" : "", tp.ms,
-                  tp.runs ? "" : " (not built)", mechanism_name(plan.pick));
+    std::snprintf(buf, sizeof buf, "multi-gpu: %zu cards %s; ms per window: expert tier %.1f, layer split %.1f, tensor parallel %.1f%s; picked %s",
+                  n, plan.equal ? "alike" : "unlike", tier.ms, split.ms, tp.ms, tp.runs ? "" : " (not built)", mechanism_name(plan.pick));
     plan.line = buf;
     return plan;
 }

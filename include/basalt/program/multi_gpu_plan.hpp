@@ -26,10 +26,6 @@ struct MgModel {
     uint64_t peer_overhead = 0;         ///< the same on a card after the main one
     int tp_exchanges_per_layer = 2;     ///< all-reduces a layer needs when each layer is split across the cards
     double tokens = 3.0;                ///< rows in a decode window
-    /// The engine can overlap the windows of a layer split over two cards (it runs the drafter and a server, one
-    /// conversation at a time): the next window's first stage runs while the last stage still serves this one.
-    bool overlapped = false;
-    double hold = 0.45;                 ///< the share of windows that find their successor already running
 };
 
 /// The mechanism's figure for a card set.
@@ -37,7 +33,6 @@ struct MgPrice {
     Mechanism mechanism = Mechanism::ExpertTier;
     bool runs = false;                  ///< the engine has it; a mechanism it does not have is priced but never picked
     double ms = 0;                      ///< per decode window
-    bool overlapped = false;            ///< priced with overlapped windows
 };
 
 struct MgPlan {

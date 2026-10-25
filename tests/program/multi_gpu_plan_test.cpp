@@ -67,55 +67,6 @@ int main() {
         CHECK(price(p, Mechanism::LayerSplit).ms > 1.1 * price(p, Mechanism::ExpertTier).ms);
         CHECK(!price(p, Mechanism::TensorParallel).runs);   // priced, not built
     }
-    // overlapped windows: only two alike cards that can run them (a drafter, a server, one conversation) price the split
-    // that way, and the split is picked where it prices at least 5% below the tier
-    {
-        MgModel m = model();
-        m.overlapped = true;
-        const MgPlan unlike = plan_multi_gpu({card(0, "RTX 5090", 1792, 32), card(1, "RTX 5060 Ti", 448, 16)}, m);
-        CHECK(!unlike.equal && unlike.pick == Mechanism::ExpertTier);   // never picked, whatever the hold
-        for (double hold : {0.0, 0.5, 1.0}) {
-            m.hold = hold;
-            CHECK(plan_multi_gpu({card(0, "RTX 5090", 1792, 32), card(1, "RTX 5060 Ti", 448, 16)}, m).pick == Mechanism::ExpertTier);
-        }
-        m.hold = MgModel{}.hold;
-        const std::vector<GpuCard> two = {card(0, "RTX 5080", 960, 16), card(1, "RTX 5080", 960, 16)};
-        const MgPlan on = plan_multi_gpu(two, m);
-        const double tier = price(on, Mechanism::ExpertTier).ms, split = price(on, Mechanism::LayerSplit).ms;
-        CHECK(on.equal && price(on, Mechanism::LayerSplit).overlapped);
-        CHECK(split < 0.95 * tier && on.pick == Mechanism::LayerSplit);
-        CHECK(on.line.find("windows overlapped") != std::string::npos && on.line.find("picked layer split") != std::string::npos);
-        MgModel off = m;
-        off.overlapped = false;   // no drafter, no server or batch slots: the plain split, far behind the tier
-        const MgPlan plain = plan_multi_gpu(two, off);
-        CHECK(!price(plain, Mechanism::LayerSplit).overlapped && plain.pick == Mechanism::ExpertTier);
-        CHECK(price(plain, Mechanism::LayerSplit).ms > price(on, Mechanism::LayerSplit).ms);
-        MgModel low = m;
-        low.hold = 0.1;           // windows that seldom find their successor running do not pay
-        CHECK(plan_multi_gpu(two, low).pick == Mechanism::ExpertTier);
-        // three and four cards: the engine overlaps two stages only, so the split is priced plain
-        for (int n = 3; n <= 4; ++n) {
-            std::vector<GpuCard> v;
-            for (int i = 0; i < n; ++i) v.push_back(card(i, "RTX 5080", 960, 16));
-            const MgPlan p = plan_multi_gpu(v, m);
-            CHECK(!price(p, Mechanism::LayerSplit).overlapped && p.line.find("overlapped") == std::string::npos);
-        }
-    }
-    // for two to four alike cards of any size the pick follows the prices: the split exactly where it prices 5% below
-    // the tier, the tier otherwise; unlike cards never leave the tier
-    for (int n = 2; n <= 4; ++n)
-        for (const double gbps : {448.0, 672.0, 960.0, 1792.0})
-            for (const uint64_t gib : {8, 12, 16, 24, 32}) {
-                std::vector<GpuCard> v;
-                for (int i = 0; i < n; ++i) v.push_back(card(i, "RTX", gbps, gib));
-                MgModel m = model();
-                m.overlapped = true;
-                const MgPlan p = plan_multi_gpu(v, m);
-                const double tier = price(p, Mechanism::ExpertTier).ms, split = price(p, Mechanism::LayerSplit).ms;
-                CHECK(p.pick == (split < 0.95 * tier ? Mechanism::LayerSplit : Mechanism::ExpertTier));
-                v.back() = card(n - 1, "RTX", gbps / 2, gib);
-                CHECK(plan_multi_gpu(v, m).pick == Mechanism::ExpertTier);
-            }
     // three and four equal cards, and equal cards big enough to hold every expert: priced, one line, a valid pick
     for (int n = 2; n <= 4; ++n) {
         std::vector<GpuCard> v;

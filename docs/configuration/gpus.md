@@ -35,7 +35,7 @@ second one. Reports from machines with three or four cards are welcome (see [com
 
 With two or more cards the engine prices three mechanisms at start, as milliseconds per decode window, from the cards'
 memory bandwidth, their VRAM and the model's size, and prints one line, for example
-`multi-gpu: 2 cards unlike; ms per window: expert tier 7.9, layer split 11.3 (windows overlapped), tensor parallel 9.0
+`multi-gpu: 2 cards unlike; ms per window: expert tier 7.9, layer split 13.5, tensor parallel 9.0
 (not built); picked expert tier`. The line appears for every multi-card setting, alike cards or not. With one card (unset, or one number)
 there is no choice: nothing is priced and no other card is used or even visible to the process.
 
@@ -50,8 +50,8 @@ there is no choice: nothing is priced and no other card is used or even visible 
   holds a draft past it, the first card commits K as if every row were kept and starts window K+1 from the guess that K
   is accepted whole, while the second card still verifies K. A guess that holds sends K+1 on to the second card at once;
   one that fails puts the first card's state back and runs the window again, so the text is the same either way. The
-  price uses a fixed estimate of the share of windows that hold, and the split is picked only when it is at least 5%
-  below the expert tier. The engine log prints `pipelined windows: N launched, M held` per request.
+  price of the split does not count the overlap. The engine log prints `pipelined windows: N launched, M held` per
+  request.
 - **Tensor parallel**: every layer is split across the cards. It is priced and not built: the dense part is a third of
   a window's bytes, so splitting it saves about 2 ms between two cards and the exchanges between the cards (host-staged,
   about 5.4 us per 10 KiB) cost about as much; the expert tier already shares the experts.
