@@ -535,7 +535,6 @@ bool Verifier::dm_init(std::string& err) {
     const auto& lay = basalt::kernels::cpu::expert_layout();
     const char* why = nullptr;
     if (!lay.native) why = "the experts are not a native pack";
-    else if (lb_ != 0 || le_ != g.n_layers || hand_in_ != nullptr) why = "a layer split";
     else if (remote_opt_ != nullptr) why = "--remote-expert-opt";
     else if (all_resident_) why = "every expert is resident";
     else if (hits_.h_res == nullptr) why = "no host residency table";

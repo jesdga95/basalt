@@ -38,9 +38,9 @@ expert tier`. The line appears for every multi-card setting, alike cards or not.
 there is no choice: nothing is priced and no other card is used or even visible to the process.
 
 - **Expert tier**: the main card runs every layer and the other cards hold and compute experts (above).
-- **Layer split**: each card runs a block of layers, one after another. The cut is searched at start. It plans every
-  layer's experts on the host and hands the window to the next card, which costs a fixed few milliseconds per window,
-  so it only wins when that is smaller than what a second window in flight would hide. Windows are not overlapped.
+- **Layer split**: each card runs a block of layers, one after another. The cut is searched at start. Every card plans
+  its layers' experts on its own device, as a single card does, and the window is handed to the next card once, which
+  costs a fixed part of a window. Windows are not overlapped.
 - **Tensor parallel**: every layer is split across the cards. It is priced and not built: the dense part is a third of
   a window's bytes, so splitting it saves about 2 ms between two cards and the exchanges between the cards (host-staged,
   about 5.4 us per 10 KiB) cost about as much; the expert tier already shares the experts.
