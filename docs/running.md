@@ -27,10 +27,12 @@ The next request that needs less gives the cells back and the cache refills the 
 decodes with the cache a 32k context would have, whatever `--max-context` is. The startup line `elastic KV: ...` says
 how much of the cache is lent this way, and each move is logged (`elastic KV: N cells backed ...`).
 
-While other slots are decoding, a new prompt is read beside them: the prompt path runs on its own thread, the slots'
-decode windows keep running (their kernels take the higher stream priority), and the few steps that touch the draft
-layer or the output run between two windows. A long prompt therefore does not stop the other requests. A prompt that
-arrives while no other slot is decoding is read as in the single-stream path.
+While other slots are decoding, a new prompt of up to 16384 tokens is read at once: the slots wait for it (a few
+seconds at most), so its first token comes about as soon as on an idle engine. A longer prompt is read beside them:
+the prompt path runs on its own thread, the slots' decode windows keep running (their kernels take the higher stream
+priority), and the few steps that touch the draft layer or the output run between two windows, so a long prompt does
+not stop the other requests. A prompt that arrives while no other slot is decoding is read as in the single-stream
+path.
 
 At startup the server prints one `[server] kv cache:` line per device with all the session state placed there, for
 example `12.5 GiB on cuda2 (solo 262144 tokens + 2 slots x 262144 tokens + draft K/V 0.5 GiB)`. With elastic KV (the

@@ -8536,6 +8536,9 @@ int main(int argc, char** argv) {
             // slots' windows then see the cache without the slots this prompt borrowed (marked missing: those experts
             // run on the CPU), never a prompt buffer.
             constexpr double decode_share = 0.5;
+            // A read of at most this many tokens runs alone even while slots decode: they wait for it (a few seconds at
+            // most) and its first token comes as soon as on an idle engine.  A longer read goes beside them.
+            constexpr int64_t kReadAlone = 16384;
             bool batch_fatal = false;
             int64_t il_parts = 0;   // the slots' windows run between this prompt's chunks
             double il_ms = 0;
@@ -8583,7 +8586,8 @@ int main(int argc, char** argv) {
             };
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
                 // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
-                if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) return sp.run(ids.data() + a0, b0 - a0, a0, e);
+                if (o.batch <= 0 || piped || (!stages.empty() && !batch_on()) || b0 - a0 <= kReadAlone)
+                    return sp.run(ids.data() + a0, b0 - a0, a0, e);
                 if (batch_on() && stages.empty()) {
                     // the whole range is read on a side thread, in the prompt path's own chunks, while this thread keeps
                     // running the slots' windows; the work that touches the draft layer or the output runs here, between
