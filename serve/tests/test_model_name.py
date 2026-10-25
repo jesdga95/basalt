@@ -1,4 +1,5 @@
-"""A request must name the served model; unknown or missing is a 404 in the API's own shape (mock engine)."""
+"""A request must name the served model; unknown or missing is a 404 in the API's own shape (mock engine).
+the any-model-name option ignores the field, whatever it holds."""
 from __future__ import annotations
 
 import http.client
@@ -90,6 +91,50 @@ class ModelName(unittest.TestCase):
             _, raw = self.post("/v1/responses", {"model": FILE, "stream": stream, **PATHS["/v1/responses"]})
             self.assertIn(f'"model": "{ALIAS}"', raw)
             self.assertNotIn(FILE, raw)
+
+
+class AnyModelName(unittest.TestCase):
+    """any-model-name: a generation request is answered whatever model it names, or none (mock engine)."""
+
+    def setUp(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, ["Hello."], max_context=4096)
+        engine.model_path = "/packs/" + FILE
+        self.httpd = serve(Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), model_name=ALIAS,
+                                   any_model_name=True), port=0)
+        self.port = self.httpd.server_address[1]
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def post(self, path, body):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        try:
+            c.request("POST", path, body=json.dumps(body).encode(),
+                      headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+            r = c.getresponse()
+            return r.status, r.read().decode()
+        finally:
+            c.close()
+
+    def test_any_name_or_none_is_served(self):
+        for path, body in PATHS.items():
+            for name in ("gpt-x", "", FILE.upper(), ALIAS + "-other", 7, None):
+                with self.subTest(path=path, name=name):
+                    self.assertEqual(self.post(path, {"model": name, **body})[0], 200)
+            with self.subTest(path=path, name="the field absent"):
+                self.assertEqual(self.post(path, body)[0], 200)
+
+    def test_the_response_still_names_the_served_model(self):
+        for stream in (False, True):
+            _, raw = self.post("/v1/chat/completions",
+                               {"model": "gpt-x", "stream": stream, **PATHS["/v1/chat/completions"]})
+            self.assertIn(f'"model": "{ALIAS}"', raw)
+            self.assertNotIn("gpt-x", raw)
+
+    def test_the_control_routes_still_check_the_name(self):
+        self.assertEqual(self.post("/v1/load", {"model": "gpt-x"})[0], 404)
 
 
 if __name__ == "__main__":

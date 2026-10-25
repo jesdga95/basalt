@@ -16,7 +16,7 @@ each slot has. `--slot-full-context` (also `"slot-full-context"` in the config's
 the whole `--max-context` instead, at N times the KV cache; the startup line says so. The slots' KV cache, and one
 solo session of the same length, come out of the expert cache.
 
-Every chat, messages and responses request must name the served model in `model`: the alias (or the model's name) that `/v1/models` lists, or the model file's name. An unknown or missing name is a 404 in the API's own error shape, and replies always carry the served name.
+Every chat, messages and responses request must name the served model in `model`: the alias (or the model's name) that `/v1/models` lists, or the model file's name. An unknown or missing name is a 404 in the API's own error shape, and replies always carry the served name. With `any-model-name` the field is ignored and every request is answered; the reply still names the served model.
 
 With `--max-context` above 32768 the KV cache is elastic (not with `--kv-resident` or `--vram-elastic`; a peer card is
 fine): each session backs its first 32768

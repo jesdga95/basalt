@@ -89,6 +89,7 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | --- | --- | --- | --- |
 | `model` | path | none (required) | The `.basalt` model file. The weights, tokenizer, chat template, drafter, vision projector and default sampling all come from it. |
 | `alias` | string | the name stored in the model file | The model name the API reports. Change it when a client expects a particular name. |
+| `any-model-name` | switch | off | Answer a request whatever it names in `model`, or nothing at all, for a client that sends a fixed name. Replies still report the served name. Off: an unknown or missing name is a 404. `/v1/load`, `/v1/unload` and `/props` check the name either way. |
 | `host` | address | `127.0.0.1` | The address to listen on. `127.0.0.1` is this machine only; `0.0.0.0` also serves the network. Never listen beyond `127.0.0.1` without `api-key`. |
 | `port` | integer | `8080` | The TCP port. |
 | `api-key` | string | none | Require this key on `/v1/*` (`Authorization: Bearer ...` or `x-api-key`). Command line only. Set it whenever `host` is not `127.0.0.1`. |

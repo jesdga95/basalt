@@ -194,7 +194,8 @@ def main() -> int:
     tpl = tpath / "chat_template.jinja"
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
-                  sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
+                  sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens,
+                  any_model_name=a.any_model_name, grammar=a.grammar,
                   grammar_engine=bool(a.mock_engine or has_grammar))
     svc.logs = logs
     if any(x == "--api-key" and i + 1 < len(used_argv) and not used_argv[i + 1].strip() or x.strip() == "--api-key="
@@ -219,6 +220,8 @@ def main() -> int:
         print(f"[server] CORS on /v1/* for {', '.join(svc.cors_origins)}"
               + ("" if svc.api_key or "*" not in svc.cors_origins else
                  "; warning: any web page can use the model (--api-key KEY)"), flush=True)
+    if svc.any_model_name:
+        print("[server] any model name is accepted (--any-model-name)", flush=True)
     svc.idle_unload_s = a.idle_unload or 0
     svc.min_free_vram_mib = a.min_free_vram_mib or 0
     svc.reasoning_budget_tokens = a.reasoning_budget_tokens or 0

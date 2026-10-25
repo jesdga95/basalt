@@ -368,7 +368,7 @@ def make_handler(svc: Service):
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 requested = req.get("model")
-                if not (isinstance(requested, str) and requested in svc.served_names()):
+                if not svc.accepts_model(requested):
                     self._unknown_model(path, requested)
                     return
                 svc.request_ctx.path = path

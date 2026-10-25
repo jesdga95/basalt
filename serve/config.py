@@ -360,6 +360,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
     ap.add_argument("--fit-max-tokens", action="store_true",
                     help="clamp max_tokens to the remaining context instead of rejecting the request with 400")
+    ap.add_argument("--any-model-name", action="store_true",
+                    help="answer a request whatever model it names, or none at all (default: an unknown or "
+                         "missing name is a 404); replies still carry the served name")
     ap.add_argument("--grammar", action=argparse.BooleanOptionalAction, default=GRAMMAR_DEFAULT,
                     help="hold every tool call and JSON response format to a grammar in the engine (on by default; a request "
                          "with strict: true gets it either way); --no-grammar turns it off")
