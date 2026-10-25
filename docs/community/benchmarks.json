@@ -251,6 +251,66 @@
       "prefill_64k_tps": 9607.9,
       "decode_tps": 461.3,
       "notes": "2x RTX 5090 at a 500 W limit each (below the cards' 575 W default), 123 GB DDR5; the peer card is on a 4.0 x4 slot; 0 SSD spill"
+    },
+    {
+      "submitter": "foolio",
+      "date": "2026-10-23",
+      "commit": "702c08f783",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX PRO 4000 Blackwell",
+          "vram_gib": 24,
+          "power_w": 145
+        }
+      ],
+      "ram_gib": 123,
+      "os": "Linux",
+      "quant": "IQ3_XXS",
+      "prefill_16k_tps": 3168.7,
+      "prefill_64k_tps": 3425.4,
+      "decode_tps": 201.8,
+      "notes": "GSQ-RCO IQ3_XXS .basalt (self-converted, verified official-grade via probe); weights on SATA SSD"
+    },
+    {
+      "submitter": "foolio",
+      "date": "2026-10-23",
+      "commit": "702c08f783",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX PRO 4000 Blackwell",
+          "vram_gib": 24,
+          "power_w": 145
+        }
+      ],
+      "ram_gib": 123,
+      "os": "Linux",
+      "quant": "UD-Q4_K_XL",
+      "prefill_16k_tps": 2865.9,
+      "prefill_64k_tps": 3156.2,
+      "decode_tps": 104.3,
+      "notes": "converted from Unsloth UD-Q4_K_XL GGUF via --compat-bf16 --sections-from; weights on SATA SSD"
+    },
+    {
+      "submitter": "foolio",
+      "date": "2026-10-23",
+      "commit": "702c08f783",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX PRO 4000 Blackwell",
+          "vram_gib": 24,
+          "power_w": 145
+        }
+      ],
+      "ram_gib": 123,
+      "os": "Linux",
+      "quant": "UD-Q5_K_XL",
+      "prefill_16k_tps": 2981.3,
+      "prefill_64k_tps": 3174.9,
+      "decode_tps": 76.8,
+      "notes": "official HF pack, weights on NVMe"
     }
   ]
 }
