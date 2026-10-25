@@ -38,6 +38,7 @@
 #include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/program/auto_plan.hpp"
 #include "basalt/program/gpu_select.hpp"
+#include "basalt/program/multi_gpu_plan.hpp"
 #include "basalt/program/tokenizer.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/ngram.hpp"
@@ -1464,6 +1465,7 @@ int main(int argc, char** argv) {
     // kernel up front.  An explicit CUDA_MODULE_LOADING wins.
     if (o.serve && o.batch >= 2 && !module_loading_set) basalt::platform::set_env("CUDA_MODULE_LOADING", "EAGER");
     // ---- the GPUs: chosen before any CUDA call, which then sees only them, the main card as device 0
+    std::vector<basalt::program::GpuCard> chosen_cards;
     {
         namespace bp = basalt::program;
         bp::GpuSpec spec;
@@ -1516,6 +1518,7 @@ int main(int argc, char** argv) {
                 ? ("expert tiers max " + std::to_string(ri.max_expert_tiers) + "; later cards idle").c_str()
                 : "no GPU-to-GPU access; cards after the main idle");
         if (!o.peer_devices.empty()) o.peer_device = o.peer_devices[0];
+        chosen_cards = ri.cards;
     }
     // ---- where every loader reads from: the sections of the .basalt file
     if (o.model.empty()) {
@@ -1553,7 +1556,23 @@ int main(int argc, char** argv) {
     }
     const basalt::core::PackFiles pack_files = basalt::core::PackFiles::from(srcs);
     const basalt::core::ExpertFiles expert_files = basalt::core::ExpertFiles::from(srcs);
-    basalt::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
+    // ---- two or more cards: what they do together is priced and the cheapest mechanism the engine has runs (one card:
+    // nothing to choose, and no other card is touched)
+    if (chosen_cards.size() >= 2) {
+        basalt::program::MgModel mm;
+        mm.pairs = (int64_t) mm.layers * 512;
+        mm.blob_bytes = srcs.experts.bytes > 0 ? srcs.experts.bytes / (uint64_t) mm.pairs : mm.blob_bytes;
+        mm.main_overhead = srcs.dense.bytes + (7ull << 29);
+        mm.peer_overhead = 5ull << 28;
+        const basalt::program::MgPlan mp = basalt::program::plan_multi_gpu(chosen_cards, mm);
+        basalt::log::info("basalt", "%s", mp.line.c_str());
+        if (mp.pick == basalt::program::Mechanism::LayerSplit && o.peer_device >= 1) {
+            o.layer_split = "auto";
+            o.peer_devices.clear();
+            o.peer_device = -1;
+        }
+    }
+    basalt::core::set_peer_portable(o.peer_device >= 1 || !o.layer_split.empty());   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     // Chunks below this take the routed-only path with the peer card computing its experts' rows; from it on
     // every expert streams through the ring.  The routed-only path costs ~0.3 ms per token, streaming ~0.12 ms
     // plus the time to move the experts the primary lacks over its link; with --peer-exclusive that includes the

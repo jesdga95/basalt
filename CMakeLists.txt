@@ -429,7 +429,7 @@ execute_process(COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DOUT
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/git_stamp.cmake)
 # the engine driven as a child process and the report logic, shared by basalt-bench and basalt-probe
 add_library(engine_session STATIC src/program/engine_session.cpp src/program/load_summary.cpp src/program/probe_report.cpp src/program/probe_derive.cpp src/program/auto_plan.cpp src/program/community_row.cpp src/program/host_rates.cpp
-            src/program/gpu_select.cpp)
+            src/program/gpu_select.cpp src/program/multi_gpu_plan.cpp)
 target_include_directories(engine_session PUBLIC include)
 find_package(Threads REQUIRED)
 target_link_libraries(engine_session PUBLIC platform Threads::Threads)
@@ -924,6 +924,11 @@ target_link_libraries(gpu_select_test PRIVATE engine_session warnings)
 basalt_embed_manifest(gpu_select_test)
 basalt_cpu_test(NAME gpu_select_test COMMAND gpu_select_test)
 set_tests_properties(gpu_select_test PROPERTIES TIMEOUT 60)
+add_executable(multi_gpu_plan_test tests/program/multi_gpu_plan_test.cpp)
+target_link_libraries(multi_gpu_plan_test PRIVATE engine_session warnings)
+basalt_embed_manifest(multi_gpu_plan_test)
+basalt_cpu_test(NAME multi_gpu_plan_test COMMAND multi_gpu_plan_test)
+set_tests_properties(multi_gpu_plan_test PROPERTIES TIMEOUT 60)
 
 # basalt-probe's suggested values: the worker pick, the balance share and the suggestion lines (CPU only)
 add_executable(probe_derive_test tests/program/probe_derive_test.cpp)
