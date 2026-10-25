@@ -738,7 +738,7 @@ void usage() {
                  "                       --expert-cache auto sizes the tier (default 700; at least 256)\n"
                  "  --peer-exclusive     with --resident-experts: experts on the peer are held only there, not\n"
                  "                       also in RAM (less RAM).  The peer is filled from the file; swaps move\n"
-                 "                       peer-held experts between the GPUs and RAM over P2P.  Auto when not set\n"
+                 "                       peer-held experts between the GPUs and RAM through host memory.  Auto when not set\n"
                  "                       (on only when it keeps every expert off the SSD).\n"
                  "  --peer-reserve-mib N  VRAM the peer tier leaves free on its card (default 600)\n"
                  "  --adapt-every N      adaptive expert tier: a round every N decode windows (default 1 for a\n"
@@ -1554,15 +1554,12 @@ int main(int argc, char** argv) {
     const basalt::core::PackFiles pack_files = basalt::core::PackFiles::from(srcs);
     const basalt::core::ExpertFiles expert_files = basalt::core::ExpertFiles::from(srcs);
     basalt::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
-    // multi-GPU: without direct access the prompt path cannot take the peer, so it keeps the single-GPU kernels
-    basalt::core::set_prompt_peer(o.peer_device >= 1 && o.peer_prefill_rows != 0 &&
-                                  basalt::core::peers_access(o.peer_device));
     // Chunks below this take the routed-only path with the peer card computing its experts' rows; from it on
     // every expert streams through the ring.  The routed-only path costs ~0.3 ms per token, streaming ~0.12 ms
     // plus the time to move the experts the primary lacks over its link; with --peer-exclusive that includes the
     // peer-only experts, staged through the host, so streaming loses until later.
     auto set_stream_all_min = [&]() {
-        if (o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0 && !basalt::core::peers_access(o.peer_device))
+        if (o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0)
             basalt::prefill::Prefill::set_stream_all_min(o.peer_exclusive ? 4096 : 2560);
     };
     set_stream_all_min();

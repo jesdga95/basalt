@@ -21,17 +21,6 @@ namespace basalt::core {
 static bool g_peer_portable = false;
 void set_peer_portable(bool on) { g_peer_portable = on; }
 bool peer_portable() { return g_peer_portable; }
-static bool g_prompt_peer = false;
-void set_prompt_peer(bool on) { g_prompt_peer = on; }
-bool prompt_peer() { return g_prompt_peer; }
-bool peers_access(int device) {
-    int a = 0, b = 0;
-    if (cudaDeviceCanAccessPeer(&a, 0, device) != cudaSuccess || cudaDeviceCanAccessPeer(&b, device, 0) != cudaSuccess) {
-        cudaGetLastError();
-        return false;
-    }
-    return a && b;
-}
 
 namespace {
 
@@ -156,21 +145,6 @@ bool PeerExperts::prepare(int device, ExpertSource& src, int64_t n_layers, int64
     src_ = &src;
     res_.assign((size_t) (n_layers * n_expert), kNotResident);
     hold_.assign((size_t) (n_layers * n_expert), 0);
-    {   // direct access both ways (NVLink or another P2P path): the prompt path copies activations and results over it
-        int a = 0, b = 0;
-        cudaDeviceCanAccessPeer(&a, 0, device);
-        cudaDeviceCanAccessPeer(&b, device, 0);
-        p2p_ = a && b;
-        if (p2p_) {
-            On on0(0);
-            cudaError_t e0 = cudaDeviceEnablePeerAccess(device, 0);
-            if (e0 == cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); e0 = cudaSuccess; }
-            On on1(device);
-            cudaError_t e1 = cudaDeviceEnablePeerAccess(0, 0);
-            if (e1 == cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); e1 = cudaSuccess; }
-            p2p_ = e0 == cudaSuccess && e1 == cudaSuccess;
-        }
-    }
     On on(device);
     device_ = device;
     // scratch first, so the slots take what is really left

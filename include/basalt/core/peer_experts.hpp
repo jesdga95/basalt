@@ -31,11 +31,6 @@ namespace basalt::core {
 /// the peer card writes into are then allocated with cudaHostAllocPortable; without a peer the flag stays off.
 void set_peer_portable(bool on);
 bool peer_portable();
-/// multi-GPU: whether the prompt path can take the peer (direct access both ways); set at startup, before the
-/// prompt path sizes its ring and buffers.  Without it the prompt path is the single-GPU one.
-void set_prompt_peer(bool on);
-bool prompt_peer();
-bool peers_access(int device);
 
 class PeerExperts {
 public:
@@ -74,8 +69,6 @@ public:
     /// DEC_MOE: the residency table ([n_layers * n_expert] slot or -1) and a slot's device address.
     const std::vector<int32_t>& residency() const { return res_; }
     const uint8_t* slot_address(int32_t slot) { return cache_.device_slot(slot); }
-    /// Whether the primary (device 0) and the peer can read each other's memory directly (NVLink / PCIe P2P).
-    bool p2p() const { return p2p_; }
 
     /// Starts the peer's share of one layer: the entries i with kind[i] == 2 (x: n_tok rows of n_embd floats).
     /// multi-GPU: with `out` (pinned, portable host rows) the peer writes its rows straight into
@@ -103,7 +96,7 @@ public:
     void set_exclusive(FileExpertSource* fsrc) { fsrc_ = fsrc; }
     bool exclusive() const { return fsrc_ != nullptr; }
     /// Keeps (layer, expert) in its slot (adapt does not evict it) until `reassign` takes the slot: its bytes are
-    /// being copied out over P2P.
+    /// being copied out.
     void hold(int64_t layer, int64_t expert) { hold_[(size_t) (layer * n_expert_ + expert)] = 1; }
     /// Copies (layer, expert)'s bytes from the peer's slot into `dst` on device 0 (queued on `stream`).
     bool copy_to(int64_t layer, int64_t expert, uint8_t* dst, cudaStream_t stream, std::string& err);
@@ -122,7 +115,6 @@ public:
 
 private:
     int device_ = -1;
-    bool p2p_ = false;
     int64_t n_layers_ = 0, n_expert_ = 0;
     ExpertCache cache_;
     ExpertSource* src_ = nullptr;

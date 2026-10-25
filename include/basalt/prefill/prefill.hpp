@@ -129,12 +129,12 @@ public:
     bool route_hist_take(std::vector<uint32_t>& out, int64_t& tokens);
 
     /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk (up to `cap_rows` routed
-    /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
-    /// chunks of up to init's `chunk` tokens.  Without P2P: the routed-only chunks, and the streamed ones up to a fixed
-    /// size on the FP4 experts (the same bits as this GPU's), with the rows crossing through host memory.
+    /// rows per layer).  Allocates the peer's buffers for chunks of up to init's `chunk` tokens: the routed-only
+    /// chunks, and the streamed ones up to a fixed size on the FP4 experts (the same bits as this GPU's), with the rows
+    /// crossing through host memory.
     bool set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err);
-    /// --peer-exclusive: experts only `peer` holds have no host copy; the prompt path reads them from its memory
-    /// over P2P (into the ring, or in place).  Independent of set_peer.
+    /// --peer-exclusive: experts only `peer` holds have no host copy; the prompt path copies them from its memory
+    /// through host staging into the ring.  Independent of set_peer.
     void set_ring_peer(core::PeerExperts* peer);
 
     /// The CPU expert pool (idle while a prompt is read). A chunk below stream_all_min() tokens hands it the
