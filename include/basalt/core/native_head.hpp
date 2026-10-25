@@ -70,6 +70,7 @@ private:
     void* host_ = nullptr;
     const void* dev_ = nullptr;
     void* hot_ = nullptr;
+    int hot_device_ = -1;   ///< the device that holds hot_; the other devices read every row from the mapped table
     int64_t n_hot_ = 0;
     uint64_t bytes_ = 0;
     size_t row_ = 0;
