@@ -53,8 +53,8 @@ def start_last_line(log: str | None, offset: int) -> str:
 
 class LoadBars:
     """One progress bar per `basalt load:` target against its planned size (a byte counter before the plan).
-    `copy` targets are counted apart from the total. finish() collapses the bars into one result line; off a
-    terminal only that line is printed."""
+    `copy` targets are counted apart from the total. finish() collapses the bars into one result line. Off a
+    terminal the rows print as text once per heartbeat, only while their bytes move."""
 
     WIDTH = 24
     TABLE = "ngram"                                    # the n-gram table locked into RAM: its own row, outside the total
@@ -66,6 +66,7 @@ class LoadBars:
         self.tty = self.out.isatty()
         self.total = 0                                 # announced total bytes (0: none)
         self.targets: dict[tuple[str, bool], dict] = {}   # (target, copy) -> {plan, done, last, seen, start}
+        self._beat_seen: dict[tuple[str, bool], int] = {}  # bytes each row showed at the previous busy heartbeat
         self.started = 0                               # targets begun
         self.t0 = None
         self.drawn = 0                                 # lines of bars on screen
@@ -79,7 +80,8 @@ class LoadBars:
         return target
 
     def _target(self, target: str, copy: bool) -> dict:
-        return self.targets.setdefault((target, copy), {"plan": 0, "done": 0, "last": 0, "seen": 0, "start": None})
+        return self.targets.setdefault((target, copy), {"plan": 0, "done": 0, "last": 0, "seen": 0, "start": None,
+                                                        "rate_bytes": 0, "rate_time": 0.0})
 
     def done(self) -> int:
         return sum(t["done"] + t["last"] for (tg, c), t in self.targets.items() if not c and tg != self.TABLE)
@@ -90,28 +92,51 @@ class LoadBars:
         n = int(f * width)
         return "=" * n + (">" if n < width else "") + " " * (width - n - 1)
 
-    def lines(self) -> list[str]:
+    def _rows(self) -> list[tuple[tuple[str, bool], str]]:
+        """(key, row) per started target, oldest start first. The rate suffix is the bytes since this
+        target's last sample over the elapsed window, shown once the window reaches >= 1 s; a target
+        is sampled here, never at a phase switch."""
         rows = []
         started = [kv for kv in self.targets.items() if kv[1]["start"] is not None]
+        now = time.time()
         for (target, copy), t in sorted(started, key=lambda kv: kv[1]["start"]):
+            rate = ""
             have = t["done"] + t["last"]
+            if t["rate_time"] and now - t["rate_time"] >= 1.0 and have >= t["rate_bytes"]:
+                rate = f"  {(have - t['rate_bytes']) / 1e6 / (now - t['rate_time']):.0f} MB/s"
+            if t["rate_time"] == 0.0 or now - t["rate_time"] >= 1.0:
+                t["rate_bytes"], t["rate_time"] = have, now
             if t["plan"] <= 0 and not have:
                 continue                               # planned to hold nothing
             if target == self.TABLE:
-                rows.append(("[server] loading the n-gram table into system ram", have, t["plan"]))
+                rows.append(((target, copy), "[server] loading the n-gram table into system ram",
+                             have, t["plan"], rate))
                 continue
             verb = "copying experts to" if copy else "loading weights into"
-            rows.append((f"[server] {verb} {self.name(target)}", have, t["plan"]))
-        pad = max((len(r[0]) for r in rows), default=0)
+            rows.append(((target, copy), f"[server] {verb} {self.name(target)}", have, t["plan"], rate))
+        pad = max((len(r[1]) for r in rows), default=0)
         out = []
-        for label, have, plan in rows:
+        for key, label, have, plan, rate in rows:
             if plan <= 0:                              # no plan yet: a count, not a bar
-                out.append(f"{label.ljust(pad)}  {have / 2**30:5.1f} GiB")
+                out.append((key, f"{label.ljust(pad)}  {have / 2**30:5.1f} GiB{rate}"))
             else:
                 plan = max(plan, have)
-                out.append(f"{label.ljust(pad)} [{self._bar(have, plan, self.WIDTH)}] "
-                           f"{have / 2**30:5.1f}/{plan / 2**30:.1f} GiB")
+                out.append((key, f"{label.ljust(pad)} [{self._bar(have, plan, self.WIDTH)}] "
+                                 f"{have / 2**30:5.1f}/{plan / 2**30:.1f} GiB{rate}"))
         return out
+
+    def lines(self) -> list[str]:
+        return [text for _, text in self._rows()]
+
+    def moved_lines(self) -> list[str]:
+        """Rows for the heartbeat off a terminal: only the targets whose bytes moved since the
+        previous call; the first call shows every row."""
+        with self.lock:
+            rows = self._rows()
+            have = {(tg, c): t["done"] + t["last"] for (tg, c), t in self.targets.items()}
+            previous = self._beat_seen
+            self._beat_seen = have
+            return [text for key, text in rows if previous.get(key) != have[key]]
 
     def _erase(self):
         if self.drawn:
@@ -321,6 +346,7 @@ def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=2
     global _active
     bars = _active = LoadBars(out, gpus)
     t0 = last = time.time()
+    beat = t0                                # last busy heartbeat
     pos = offset
     while True:
         stop = done.wait(0.25)
@@ -354,6 +380,10 @@ def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=2
             if _active is bars:
                 _active = None
             return
+        if not bars.tty and time.time() - beat >= heartbeat:     # busy heartbeat: print only rows that moved
+            beat = time.time()
+            for r in bars.moved_lines():
+                bars.say(r)                                        # prints nothing when no bytes moved
         if time.time() - last > heartbeat:
             last = time.time()
             bars.say(f"[server] still starting, {time.time() - t0:.0f} s")
