@@ -2503,7 +2503,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             return m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(l, e) &&
                                    !(m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0);
                         };
-                        auto peer_direct = [&](int32_t e) { return peer_ring(e) && m.ring_peer->p2p(); };
+                        // FP4 products reread weight tiles; keep peer blobs in local staging memory.
+                        auto peer_direct = [&](int32_t e) { return !fp4_l && peer_ring(e) && m.ring_peer->p2p(); };
                         // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
                         int stage_next = 0;
                         std::vector<int> stage_of(order.size(), -1);
