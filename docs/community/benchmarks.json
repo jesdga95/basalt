@@ -2,82 +2,6 @@
   "preset": "basalt-bench --community",
   "runs": [
     {
-      "submitter": "jesdga95",
-      "date": "2026-10-23",
-      "commit": "0751113739",
-      "preset": "community-1",
-      "gpus": [
-        {
-          "name": "RTX 5090",
-          "vram_gib": 32,
-          "power_w": 400,
-          "pcie": "5.0 x8",
-          "h2d_gbps": 28.9
-        },
-        {
-          "name": "RTX 5060 Ti",
-          "vram_gib": 16,
-          "power_w": 180,
-          "pcie": "5.0 x8",
-          "h2d_gbps": 28.8
-        }
-      ],
-      "ram_gib": 121,
-      "cpu": "AMD Ryzen 9 9950X, 16 cores",
-      "ram_gbps": 58.5,
-      "os": "Linux",
-      "quant": "NVFP4",
-      "prefill_16k_tps": 7637.6,
-      "prefill_64k_tps": 9117.7,
-      "decode_tps": 422.3
-    },
-    {
-      "submitter": "jesdga95",
-      "date": "2026-10-21",
-      "commit": "942ccf3aac",
-      "preset": "community-1",
-      "gpus": [
-        {
-          "name": "RTX 5090",
-          "vram_gib": 32,
-          "power_w": 400,
-          "pcie": "5.0 x8",
-          "h2d_gbps": 28.9
-        }
-      ],
-      "ram_gib": 121,
-      "cpu": "AMD Ryzen 9 9950X, 16 cores",
-      "ram_gbps": 58.5,
-      "os": "Linux",
-      "quant": "NVFP4",
-      "prefill_16k_tps": 6420.0,
-      "prefill_64k_tps": 8102.0,
-      "decode_tps": 303.8
-    },
-    {
-      "submitter": "jesdga95",
-      "date": "2026-10-21",
-      "commit": "942ccf3aac",
-      "preset": "community-1",
-      "gpus": [
-        {
-          "name": "RTX 5060 Ti",
-          "vram_gib": 16,
-          "power_w": 180,
-          "pcie": "5.0 x8",
-          "h2d_gbps": 28.8
-        }
-      ],
-      "ram_gib": 121,
-      "cpu": "AMD Ryzen 9 9950X, 16 cores",
-      "ram_gbps": 58.5,
-      "os": "Linux",
-      "quant": "IQ3_S",
-      "prefill_16k_tps": 2093.7,
-      "prefill_64k_tps": 2220.3,
-      "decode_tps": 111.9
-    },
-    {
       "submitter": "lindworm-hermes2026",
       "date": "2026-10-22",
       "commit": "57909606c2",
@@ -529,6 +453,105 @@
       "prefill_16k_tps": 2983.3,
       "prefill_64k_tps": 3246.6,
       "decode_tps": 72.4
+    },
+    {
+      "submitter": "jesdga95",
+      "date": "2026-10-25",
+      "commit": "a57fade43e",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 400,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.9
+        },
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.8
+        }
+      ],
+      "ram_gib": 121,
+      "cpu": "AMD Ryzen 9 9950X, 16 cores",
+      "ram_gbps": 58.4,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 7741.2,
+      "prefill_64k_tps": 9239.3,
+      "decode_tps": 437.5
+    },
+    {
+      "submitter": "jesdga95",
+      "date": "2026-10-25",
+      "commit": "a57fade43e",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 400,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.9
+        }
+      ],
+      "ram_gib": 121,
+      "cpu": "AMD Ryzen 9 9950X, 16 cores",
+      "ram_gbps": 58.3,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 7732.5,
+      "prefill_64k_tps": 9229.4,
+      "decode_tps": 317.2
+    },
+    {
+      "submitter": "jesdga95",
+      "date": "2026-10-25",
+      "commit": "a57fade43e",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.8
+        }
+      ],
+      "ram_gib": 121,
+      "cpu": "AMD Ryzen 9 9950X, 16 cores",
+      "ram_gbps": 58.3,
+      "os": "Linux",
+      "quant": "IQ3_S",
+      "prefill_16k_tps": 2427.2,
+      "prefill_64k_tps": 2430.0,
+      "decode_tps": 137.0
+    },
+    {
+      "submitter": "jesdga95",
+      "date": "2026-10-25",
+      "commit": "a57fade43e",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.8
+        }
+      ],
+      "ram_gib": 121,
+      "cpu": "AMD Ryzen 9 9950X, 16 cores",
+      "ram_gbps": 58.7,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 2686.6,
+      "prefill_64k_tps": 2699.1,
+      "decode_tps": 91.9
     }
   ]
 }
