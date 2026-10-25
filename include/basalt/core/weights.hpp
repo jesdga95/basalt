@@ -120,6 +120,10 @@ public:
     /// With `skip`, the size of the compacted arena that holds every tensor EXCEPT the named ones.
     static bool pool_bytes(const PackFiles& pack, uint64_t& out, std::string& err,
                            const std::set<std::string>* skip = nullptr);
+    /// The compacted arena of `pool_bytes` split by block: `per_layer[l]` is the bytes of the `blk.<l>.` tensors that
+    /// are not in `skip`, `shared` those of every other tensor.
+    static bool pool_bytes_by_layer(const PackFiles& pack, int64_t n_layers, std::vector<uint64_t>& per_layer,
+                                    uint64_t& shared, std::string& err, const std::set<std::string>* skip = nullptr);
 
     /// The `code_bits` field of one row of the dense index, readable WITHOUT loading anything (0 = the
     /// file stores the tensor unquantized; -1 = no such row).  The loader needs this

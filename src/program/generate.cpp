@@ -442,9 +442,6 @@ struct Options {
     /// sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual path, then
     /// continues in slot <slot> of the batch windows (`BT <slot> <id> [<id> ...]` lines, then `BDONE <slot> ...`).
     int batch = 0;
-    /// With an explicit layer split, every GPU loads only its own layers' dense weights instead of the whole
-    /// model's: the VRAM they took goes back to the expert cache (the automatic split leaves it off)
-    bool trim_stage_weights = false;
     /// The --batch slots in this many groups pipelined through the stages of a layer split (stage k
     /// runs one group while stage k+1 runs another).  1 = every slot in one window, stage after stage.
     int batch_groups = 1;
@@ -476,10 +473,6 @@ struct Options {
     /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
     /// GPU, sharing everything - the bit-exact A/B of the hand-off)
     std::string split_device;
-    /// With the automatic layer split (set from --gpu):
-    /// run on CUDA0 alone when it holds every profiled expert pair plus the whole session (KV), the drafter and the
-    /// reserve - a split then only adds hand-offs
-    bool split_skip_if_fits = false;
     /// --gpu: the cards this run uses (gpu_select.hpp); empty = GPU 0 alone.  --gpu-plan prints the choice and exits.
     std::string gpu;
     bool gpu_plan = false;
@@ -1646,7 +1639,7 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    bool multi_gpu = !split_devs.empty() && !split_same;   // cleared by --split-skip-if-fits before any stage loads
+    bool multi_gpu = !split_devs.empty() && !split_same;
     // Built-in defaults for what is given nowhere: the fastest settings that need no knowledge of the machine.
     // Speculation needs the pack's drafter; prompt chunks are sized from what the expert cache can lend; the experts
     // the GPU does not hold go to page-locked RAM when they fit (a plain file mapping when not); the adaptive tier
@@ -1699,7 +1692,7 @@ int main(int argc, char** argv) {
         }
         // A stage's prompt path borrows from that stage's own expert cache: the loan is the tail of the stage's own
         // cache (see `PfPart` in the serve block), and outside the prompt that tail is expert cache, so a large chunk
-        // costs a stage nothing permanent.  --split-skip-if-fits keeps the loans (it can fall back to one GPU).
+        // costs a stage nothing permanent.
         int n_vis = 1;
         if (cudaGetDeviceCount(&n_vis) != cudaSuccess || n_vis < 1) n_vis = 1;
         cudaGetLastError();
@@ -2126,14 +2119,206 @@ int main(int argc, char** argv) {
         }
         skip.insert("token_embd.weight");
     }
-    // Layer split with explicit split points: every GPU holds only the dense weights of ITS layers (the PLE tensors
-    // stay everywhere).  Without this each card keeps a full copy that its stage never reads - VRAM the expert cache
-    // wants.  Opt-in via --trim-stage-weights.
+    std::vector<std::pair<int32_t, int32_t>> profile;
+    if (!o.expert_profile.empty()) {
+        int64_t pslots = 0;
+        if (!basalt::core::read_expert_profile(srcs.profile, g.n_layers, g.n_expert, profile, pslots, err)) {
+            return fatal_start_error(err);
+        }
+        // An explicit number truncates the ranked list ("what would 2,000 slots give" without rebuilding the file).
+        // `--expert-cache 0` means auto: the profile ranks every pair.
+        if (o.expert_cache == 0) o.expert_cache = -1;
+        // Multi-GPU: the peer card gets a share f (0.45) of the HOT pairs, so both cards compute routed experts every
+        // layer.  Of the first 8700 ranks (about the primary's slots), every pair with floor((r+1)f) > floor(rf) moves
+        // to just after that point: the primary fills past them, the peer (which takes what the primary does not hold,
+        // in order) gets them first.
+        if (o.peer_device >= 1) {   // the peer's share of the hot pairs
+            const double f = 0.45;
+            const size_t at = std::min(profile.size(), (size_t) 8700);
+            if (f > 0.0 && f < 1.0 && at > 0) {
+                std::vector<std::pair<int32_t, int32_t>> keep, moved;
+                for (size_t r = 0; r < at; ++r) {
+                    const bool to_peer = (int64_t) ((double) (r + 1) * f) > (int64_t) ((double) r * f);
+                    (to_peer ? moved : keep).push_back(profile[r]);
+                }
+                const size_t n_moved = moved.size();
+                // the primary's share continues with the ranks after `at` until it is full; then the moved ones
+                std::vector<std::pair<int32_t, int32_t>> out;
+                out.reserve(profile.size());
+                out.insert(out.end(), keep.begin(), keep.end());
+                const size_t fill = std::min(profile.size(), at + n_moved);   // what the primary still takes
+                out.insert(out.end(), profile.begin() + (long) at, profile.begin() + (long) fill);
+                out.insert(out.end(), moved.begin(), moved.end());
+                out.insert(out.end(), profile.begin() + (long) fill, profile.end());
+                profile.swap(out);
+                basalt::log::info("basalt generate", "peer hot share %.2f: %zu of the first %zu ranked pairs moved "
+                                     "behind rank %zu (the peer's)", f, n_moved, at, fill);
+            }
+        }
+        basalt::log::info("basalt generate", "profile %s: %zu ranked pairs, built for %lld slots",
+                     o.expert_profile.c_str(), profile.size(), (long long) pslots);
+    }
+    // the whole ranking as loaded, the prior of --expert-profile-save's order (a layer split keeps only CUDA0's pairs
+    // in `profile` below).  Empty without --expert-profile-save.
+    std::vector<std::pair<int32_t, int32_t>> profile_loaded;
+    if (!o.expert_profile_save.empty()) profile_loaded = profile;
+    // ---- layer split across GPUs: "auto" places the split points by a cost model of one decode window:
+    //   - every layer costs its GPU a time inversely proportional to SMs x clock (the per-layer round trip and
+    //     kernels, not the bytes);
+    //   - an expert no cache holds costs a fixed time per unit of routed mass: the CPU pool in decode and the PCIe
+    //     stream in prompts;
+    //   - which experts a cache holds: its layers' profiled pairs, hottest first, until its free VRAM (less the
+    //     reserve, the prompt path's buffers and, on a later GPU, room for its windows and the drafter) is used; the
+    //     routed mass of rank r is taken as (r+1)^-1.2.
+    // Up to 3 GPUs every placement is tried; beyond, the layers are shared in proportion to speed.
+    // THE PROMPT PATH'S BUFFERS ARE BORROWED FROM THE CACHE, NOT WITHHELD BESIDE IT.  With borrowing the cache is sized
+    // first and at full size, and the prompt path is laid out in the tail of it (`Prefill::relayout`), so it withholds
+    // no VRAM of its own and this reserve is zero.  Only without a profile to fill a cache from do the buffers take a reserve, and then this estimate stands in for buffers that cannot be
+    // priced exactly yet because the sessions do not exist.  `plan_lend` uses the exact `Prefill::bytes_needed` as
+    // soon as it can.
+    const bool pf_borrow = !o.expert_profile.empty();
+    // From 1024-token chunks the prompt path also holds a ring of whole expert blobs, which a split without borrowing
+    // books here (without it the cards would fill and the draft head no longer fit).
+    const int64_t split_ring_mib =
+        (multi_gpu && !pf_borrow && o.prefill_chunk >= 1024)
+            ? (int64_t) (((uint64_t) basalt::prefill::Prefill::ring_slots_for(o.prefill_chunk) *
+                              (uint64_t) basalt::kernels::cpu::expert_layout().max_blob + (1ull << 20) - 1) >> 20)
+            : 0;
+    const int64_t split_pf_mib =
+        (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 + split_ring_mib : 0;
+    // ---- WHAT A STAGE RESERVES, AND ON WHICH STAGE.  Every stage after the first books room for its verify windows,
+    // the first stage books room for the drafter and its head copy, the last for the head.  All of these allocations are
+    // already made before a stage's cache is sized, so what has to be held back here is the windows and, on those
+    // stages, the drafter and the head.
+    const int64_t kWindowMib = 96;       // the verify windows, with margin
+    const int64_t kDrafterMib = 1000;    // the MTP drafter and its copy of the head, on the first stage
+    const int64_t kHeadMib = 600;        // the head, on the last stage
+    const uint64_t kStage0OtherBytes = 100ull << 20;   // what CUDA0 holds beside its dense weights before the experts: buffers and tables
+    auto stage_room = [&](int dev, bool later, int64_t extra_mib) -> int64_t {
+        const basalt::core::OnDevice on(dev);
+        size_t fb = 0, tb = 0;
+        if (const cudaError_t e = cudaMemGetInfo(&fb, &tb); e != cudaSuccess)
+            basalt::log::warn("basalt generate", "layer split: CUDA%d free memory: %s", dev < 0 ? 0 : dev,
+                         cudaGetErrorString(e));
+        const int64_t reserve = ((int64_t) o.vram_reserve_mib + split_pf_mib + (later ? kWindowMib : 0) +
+                                 extra_mib) << 20;
+        return std::max<int64_t>((int64_t) fb - reserve, 0);
+    };
+    if (multi_gpu && split_auto) {
+        const auto& lay = basalt::kernels::cpu::expert_layout();
+        const int ns = (int) split_devs.size() + 1;
+        std::vector<int64_t> cap((size_t) ns), used((size_t) ns);
+        std::vector<double> layer_ms((size_t) ns);
+        for (int i = 0; i < ns; ++i) {
+            const int dev = i == 0 ? 0 : split_devs[(size_t) i - 1];
+            cap[(size_t) i] = stage_room(i == 0 ? -1 : dev, i > 0, i == 0 ? kDrafterMib : i + 1 == ns ? kHeadMib : 0);
+            int sms = 0, khz = 0;
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+            if (cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, dev) != cudaSuccess || khz <= 0) khz = 1800000;
+            cudaGetLastError();
+            const double speed = std::max(1.0, (double) sms * (double) khz / 1e6);   // SMs x GHz
+            layer_ms[(size_t) i] = 0.33 * (84.0 * 2.617) / speed;
+            basalt::log::info("basalt generate", "layer split auto: CUDA%d %d SMs at %.2f GHz -> %.2f ms per layer, "
+                                 "%.2f GiB free before its weights", dev, sms, khz / 1e6, layer_ms[(size_t) i],
+                         (double) cap[(size_t) i] / 1073741824.0);
+        }
+        // What a stage's card holds before its experts, by block: its layers' dense weights (the arena, the native
+        // projections, the 8-bit hyper-connection copies) and what every stage holds whatever its layers.
+        std::vector<uint64_t> pool_l, nat_l, hc8_l((size_t) g.n_layers, 0);
+        uint64_t pool_sh = 0, nat_sh = 0, hc8_sh = 0;
+        if (!basalt::core::WeightTable::pool_bytes_by_layer(pack_files, g.n_layers, pool_l, pool_sh, err, &skip) ||
+            !basalt::core::NativeDense::plan_bytes_by_layer(o.native_shards, true, g.n_layers, nat_l, nat_sh, err)) {
+            return fatal_start_error(err);
+        }
+        auto block_of = [](const std::string& n) -> long {
+            return n.rfind("blk.", 0) == 0 ? std::strtol(n.c_str() + 4, nullptr, 10) : -1;
+        };
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            hc8_l[(size_t) l] = basalt::core::Verifier::hc8_plan_bytes([&](const std::string& n) { return block_of(n) == l; }, g);
+        hc8_sh = basalt::core::Verifier::hc8_plan_bytes([&](const std::string& n) { return block_of(n) < 0; }, g);
+        auto dense_bytes = [&](int i, int64_t lb, int64_t le) -> int64_t {
+            uint64_t b = pool_sh + nat_sh + hc8_sh + (i == 0 ? kStage0OtherBytes : 0);
+            for (int64_t l = lb; l < le; ++l) b += pool_l[(size_t) l] + nat_l[(size_t) l] + hc8_l[(size_t) l];
+            return (int64_t) b;
+        };
+        const double miss_ms = 190.0;
+        std::vector<double> mass(profile.size());
+        double total_mass = 0;
+        for (size_t r = 0; r < profile.size(); ++r) total_mass += (mass[r] = std::pow((double) r + 1.0, -1.2));
+        auto cost = [&](int64_t l) -> int64_t {
+            return ((int64_t) lay.blob_bytes(l) + 255) / 256 * 256;
+        };
+        // the predicted window time (ms) of a placement, and the routed mass its caches hold
+        auto predict = [&](const std::vector<int64_t>& at, double& held_mass, int64_t& held) -> double {
+            // THE CARVE, PRICED: a placement gives stage i the layers [lb, le), and that range's session is a
+            // real cost on its device - subtracted here so the search knows what it leaves for experts.  This
+            // is why the sessions are allocated after the search: `session_bytes` is pure arithmetic.
+            std::vector<int64_t> capr((size_t) ns);
+            for (int i = 0; i < ns; ++i) {
+                const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1];
+                const int64_t le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
+                capr[(size_t) i] = cap[(size_t) i] - dense_bytes(i, lb, le) -
+                                   (int64_t) basalt::core::session_bytes(g, o.max_context, K, lb, le);
+            }
+            std::fill(used.begin(), used.end(), 0);
+            held_mass = 0;
+            held = 0;
+            std::vector<bool> full((size_t) ns, false);
+            for (size_t r = 0; r < profile.size(); ++r) {
+                const int64_t l = profile[r].first;
+                int st = 0;
+                while (st + 1 < ns && l >= at[(size_t) st]) ++st;
+                if (full[(size_t) st]) continue;
+                if (used[(size_t) st] + cost(l) > capr[(size_t) st]) { full[(size_t) st] = true; continue; }   // as the fill
+                used[(size_t) st] += cost(l);
+                held_mass += mass[r];
+                ++held;
+            }
+            held_mass /= std::max(total_mass, 1e-9);
+            double ms = miss_ms * (1.0 - held_mass);
+            for (int i = 0; i < ns; ++i) {
+                const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1], le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
+                ms += (double) (le - lb) * layer_ms[(size_t) i];
+            }
+            return ms;
+        };
+        std::vector<int64_t> best, at((size_t) ns - 1);
+        double best_ms = 1e30, best_mass = 0;
+        int64_t best_held = 0;
+        auto consider = [&]() {
+            double hm = 0;
+            int64_t held = 0;
+            const double ms = predict(at, hm, held);
+            if (ms < best_ms) { best = at; best_ms = ms; best_mass = hm; best_held = held; }
+        };
+        const int64_t L = g.n_layers;
+        if (ns == 2) {
+            for (int64_t k = 2; k < L; ++k) { at[0] = k; consider(); }
+        } else if (ns == 3) {
+            for (int64_t k1 = 2; k1 + 1 < L; ++k1)
+                for (int64_t k2 = k1 + 1; k2 < L; ++k2) { at[0] = k1; at[1] = k2; consider(); }
+        } else {
+            double total = 0;
+            for (const double c : layer_ms) total += 1.0 / c;
+            double acc = 0;
+            for (int i = 0; i + 1 < ns; ++i) {
+                acc += 1.0 / layer_ms[(size_t) i];
+                at[(size_t) i] = std::clamp<int64_t>((int64_t) std::llround(acc / total * (double) L),
+                                                     i == 0 ? 2 : at[(size_t) i - 1] + 1, L - (ns - 1 - i));
+            }
+            consider();
+        }
+        split_at = best;
+        std::string ks;
+        for (const int64_t k : split_at) ks += (ks.empty() ? "" : ",") + std::to_string(k);
+        basalt::log::info("basalt generate", "layer split auto: K=%s - predicted %.1f ms per decode window; the caches "
+                             "hold %lld of %zu profiled pairs (~%.1f%% of the routed mass)", ks.c_str(), best_ms,
+                     (long long) best_held, profile.size(), 100.0 * best_mass);
+    }
+    // Layer split: every GPU holds only the dense weights of ITS layers (the PLE tensors stay everywhere), the cut being
+    // known before any weight is placed.  The VRAM a full copy would take goes back to the expert cache.
     const std::set<std::string> skip_base = skip;
-    // --trim-stage-weights
-    const bool stage_trim = multi_gpu && !split_auto && !split_at.empty() && o.trim_stage_weights;
-    if (o.trim_stage_weights && !stage_trim)
-        basalt::log::warn("basalt generate", "--trim-stage-weights needs an explicit --layer-split (ignored)");
+    const bool stage_trim = multi_gpu;
     auto add_foreign = [&](int64_t lb, int64_t le, std::set<std::string>& out) {
         for_each_index_name(pack_files.index, [&](const std::string& n) {
             if (n.rfind("blk.", 0) != 0 || n.find("ple") != std::string::npos) return;
@@ -2536,52 +2721,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // ---- --split-skip-if-fits: before any later stage loads, does CUDA0 alone hold every profiled pair?  What it
-    // still has to allocate on one GPU is the whole session (the KV of every layer), the drafter and the head
-    // (kDrafterMib below), the verify windows and the reserve; the prompt path borrows from the cache.  If the
-    // profile's pairs fit in what is left, a split would only add the hand-offs: run on CUDA0 alone.
-    if (multi_gpu && split_auto && o.split_skip_if_fits) {
-        std::vector<std::pair<int32_t, int32_t>> prof;
-        int64_t pslots = 0;
-        std::string perr;
-        const bool remote = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
-        if (remote || o.expert_profile.empty() ||
-            !basalt::core::read_expert_profile(srcs.profile, g.n_layers, g.n_expert, prof, pslots, perr)) {
-            basalt::log::info("basalt generate", "layer split: %s; the split stays",
-                         remote ? "remote expert caches are in use" : perr.empty() ? "no expert profile" : perr.c_str());
-        } else {
-            const auto& lay = basalt::kernels::cpu::expert_layout();
-            int64_t pairs_bytes = 0;
-            for (const auto& pr : prof)
-                pairs_bytes += ((int64_t) lay.blob_bytes(pr.first) + 255) / 256 * 256;
-            size_t fb = 0, tb = 0;
-            cudaMemGetInfo(&fb, &tb);
-            const int64_t session = (int64_t) basalt::core::session_bytes(g, o.max_context, K, 0, g.n_layers);
-            const int64_t held_back = session + (((int64_t) o.vram_reserve_mib + 1000 + 96) << 20);   // + drafter/head, windows
-            const int64_t room = (int64_t) fb - held_back;
-            cudaDeviceProp dp{};
-            cudaGetDeviceProperties(&dp, 0);
-            if (pairs_bytes <= room) {
-                basalt::log::info("basalt generate", "layer split skipped: CUDA0 (%s) holds all "
-                                     "%zu profiled pairs (%.2f GiB) with the session (%.2f GiB, %lld-token context), "
-                                     "the drafter and the reserve: %.2f GiB free, %.2f GiB to spare - one GPU",
-                             dp.name, prof.size(), (double) pairs_bytes / 1073741824.0, (double) session / 1073741824.0,
-                             (long long) o.max_context, (double) fb / 1073741824.0,
-                             (double) (room - pairs_bytes) / 1073741824.0);
-                multi_gpu = false;
-                split_auto = false;
-                split_devs.clear();
-                split_at.clear();
-                o.layer_split.clear();
-            } else {
-                basalt::log::info("basalt generate", "layer split: CUDA0 (%s) would hold only %.2f of the "
-                                     "profile's %.2f GiB (%.2f GiB free, %.2f GiB for the session, drafter and "
-                                     "reserve): the split stays", dp.name,
-                             (double) std::max<int64_t>(room, 0) / 1073741824.0, (double) pairs_bytes / 1073741824.0,
-                             (double) fb / 1073741824.0, (double) held_back / 1073741824.0);
-            }
-        }
-    }
     basalt::core::Verifier::set_commit_async(!multi_gpu);   // see Verifier::set_commit_async
     // ---- layer split across GPUs: each later stage's own copy of the dense weights, its session and (the last) the
     // head, made on its device before the host arena is mapped (as the drafter below, for the same reason)
@@ -2669,181 +2808,6 @@ int main(int argc, char** argv) {
     }
     GpuStage* const last_st = stages.empty() ? nullptr : stages.back().get();
 
-    std::vector<std::pair<int32_t, int32_t>> profile;
-    if (!o.expert_profile.empty()) {
-        int64_t pslots = 0;
-        if (!basalt::core::read_expert_profile(srcs.profile, g.n_layers, g.n_expert, profile, pslots, err)) {
-            return fatal_start_error(err);
-        }
-        // An explicit number truncates the ranked list ("what would 2,000 slots give" without rebuilding the file).
-        // `--expert-cache 0` means auto: the profile ranks every pair.
-        if (o.expert_cache == 0) o.expert_cache = -1;
-        // Multi-GPU: the peer card gets a share f (0.45) of the HOT pairs, so both cards compute routed experts every
-        // layer.  Of the first 8700 ranks (about the primary's slots), every pair with floor((r+1)f) > floor(rf) moves
-        // to just after that point: the primary fills past them, the peer (which takes what the primary does not hold,
-        // in order) gets them first.
-        if (o.peer_device >= 1) {   // the peer's share of the hot pairs
-            const double f = 0.45;
-            const size_t at = std::min(profile.size(), (size_t) 8700);
-            if (f > 0.0 && f < 1.0 && at > 0) {
-                std::vector<std::pair<int32_t, int32_t>> keep, moved;
-                for (size_t r = 0; r < at; ++r) {
-                    const bool to_peer = (int64_t) ((double) (r + 1) * f) > (int64_t) ((double) r * f);
-                    (to_peer ? moved : keep).push_back(profile[r]);
-                }
-                const size_t n_moved = moved.size();
-                // the primary's share continues with the ranks after `at` until it is full; then the moved ones
-                std::vector<std::pair<int32_t, int32_t>> out;
-                out.reserve(profile.size());
-                out.insert(out.end(), keep.begin(), keep.end());
-                const size_t fill = std::min(profile.size(), at + n_moved);   // what the primary still takes
-                out.insert(out.end(), profile.begin() + (long) at, profile.begin() + (long) fill);
-                out.insert(out.end(), moved.begin(), moved.end());
-                out.insert(out.end(), profile.begin() + (long) fill, profile.end());
-                profile.swap(out);
-                basalt::log::info("basalt generate", "peer hot share %.2f: %zu of the first %zu ranked pairs moved "
-                                     "behind rank %zu (the peer's)", f, n_moved, at, fill);
-            }
-        }
-        basalt::log::info("basalt generate", "profile %s: %zu ranked pairs, built for %lld slots",
-                     o.expert_profile.c_str(), profile.size(), (long long) pslots);
-    }
-    // the whole ranking as loaded, the prior of --expert-profile-save's order (a layer split keeps only CUDA0's pairs
-    // in `profile` below).  Empty without --expert-profile-save.
-    std::vector<std::pair<int32_t, int32_t>> profile_loaded;
-    if (!o.expert_profile_save.empty()) profile_loaded = profile;
-    // ---- layer split across GPUs: "auto" places the split points by a cost model of one decode window:
-    //   - every layer costs its GPU a time inversely proportional to SMs x clock (the per-layer round trip and
-    //     kernels, not the bytes);
-    //   - an expert no cache holds costs a fixed time per unit of routed mass: the CPU pool in decode and the PCIe
-    //     stream in prompts;
-    //   - which experts a cache holds: its layers' profiled pairs, hottest first, until its free VRAM (less the
-    //     reserve, the prompt path's buffers and, on a later GPU, room for its windows and the drafter) is used; the
-    //     routed mass of rank r is taken as (r+1)^-1.2.
-    // Up to 3 GPUs every placement is tried; beyond, the layers are shared in proportion to speed.
-    // THE PROMPT PATH'S BUFFERS ARE BORROWED FROM THE CACHE, NOT WITHHELD BESIDE IT.  With borrowing the cache is sized
-    // first and at full size, and the prompt path is laid out in the tail of it (`Prefill::relayout`), so it withholds
-    // no VRAM of its own and this reserve is zero.  Only without a profile to fill a cache from do the buffers take a reserve, and then this estimate stands in for buffers that cannot be
-    // priced exactly yet because the sessions do not exist.  `plan_lend` uses the exact `Prefill::bytes_needed` as
-    // soon as it can.
-    const bool pf_borrow = !o.expert_profile.empty();
-    // From 1024-token chunks the prompt path also holds a ring of whole expert blobs, which a split without borrowing
-    // books here (without it the cards would fill and the draft head no longer fit).
-    const int64_t split_ring_mib =
-        (multi_gpu && !pf_borrow && o.prefill_chunk >= 1024)
-            ? (int64_t) (((uint64_t) basalt::prefill::Prefill::ring_slots_for(o.prefill_chunk) *
-                              (uint64_t) basalt::kernels::cpu::expert_layout().max_blob + (1ull << 20) - 1) >> 20)
-            : 0;
-    const int64_t split_pf_mib =
-        (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 + split_ring_mib : 0;
-    // ---- WHAT A STAGE RESERVES, AND ON WHICH STAGE.  Every stage after the first books room for its verify windows,
-    // the first stage books room for the drafter and its head copy, the last for the head.  All of these allocations are
-    // already made before a stage's cache is sized, so what has to be held back here is the windows and, on those
-    // stages, the drafter and the head.
-    const int64_t kWindowMib = 96;       // the verify windows, with margin
-    const int64_t kDrafterMib = 1000;    // the MTP drafter and its copy of the head, on the first stage
-    const int64_t kHeadMib = 600;        // the head, on the last stage
-    auto stage_room = [&](int dev, bool later, int64_t extra_mib) -> int64_t {
-        const basalt::core::OnDevice on(dev);
-        size_t fb = 0, tb = 0;
-        if (const cudaError_t e = cudaMemGetInfo(&fb, &tb); e != cudaSuccess)
-            basalt::log::warn("basalt generate", "layer split: CUDA%d free memory: %s", dev < 0 ? 0 : dev,
-                         cudaGetErrorString(e));
-        const int64_t reserve = ((int64_t) o.vram_reserve_mib + split_pf_mib + (later ? kWindowMib : 0) +
-                                 extra_mib) << 20;
-        return std::max<int64_t>((int64_t) fb - reserve, 0);
-    };
-    if (multi_gpu && split_auto) {
-        const auto& lay = basalt::kernels::cpu::expert_layout();
-        const int ns = (int) stages.size() + 1;
-        std::vector<int64_t> cap((size_t) ns), used((size_t) ns);
-        std::vector<double> layer_ms((size_t) ns);
-        for (int i = 0; i < ns; ++i) {
-            const int dev = i == 0 ? 0 : stages[(size_t) i - 1]->dev;
-            cap[(size_t) i] = stage_room(i == 0 ? -1 : dev, i > 0, i == 0 ? kDrafterMib : i + 1 == ns ? kHeadMib : 0);
-            int sms = 0, khz = 0;
-            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-            if (cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, dev) != cudaSuccess || khz <= 0) khz = 1800000;
-            cudaGetLastError();
-            const double speed = std::max(1.0, (double) sms * (double) khz / 1e6);   // SMs x GHz
-            layer_ms[(size_t) i] = 0.33 * (84.0 * 2.617) / speed;
-            basalt::log::info("basalt generate", "layer split auto: CUDA%d %d SMs at %.2f GHz -> %.2f ms per layer, "
-                                 "%.2f GiB free before its session carve", dev, sms, khz / 1e6, layer_ms[(size_t) i],
-                         (double) cap[(size_t) i] / 1073741824.0);
-        }
-        const double miss_ms = 190.0;
-        std::vector<double> mass(profile.size());
-        double total_mass = 0;
-        for (size_t r = 0; r < profile.size(); ++r) total_mass += (mass[r] = std::pow((double) r + 1.0, -1.2));
-        auto cost = [&](int64_t l) -> int64_t {
-            return ((int64_t) lay.blob_bytes(l) + 255) / 256 * 256;
-        };
-        // the predicted window time (ms) of a placement, and the routed mass its caches hold
-        auto predict = [&](const std::vector<int64_t>& at, double& held_mass, int64_t& held) -> double {
-            // THE CARVE, PRICED: a placement gives stage i the layers [lb, le), and that range's session is a
-            // real cost on its device - subtracted here so the search knows what it leaves for experts.  This
-            // is why the sessions are allocated after the search: `session_bytes` is pure arithmetic.
-            std::vector<int64_t> capr((size_t) ns);
-            for (int i = 0; i < ns; ++i) {
-                const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1];
-                const int64_t le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
-                capr[(size_t) i] = cap[(size_t) i] - (int64_t) basalt::core::session_bytes(g, o.max_context, K, lb, le);
-            }
-            std::fill(used.begin(), used.end(), 0);
-            held_mass = 0;
-            held = 0;
-            std::vector<bool> full((size_t) ns, false);
-            for (size_t r = 0; r < profile.size(); ++r) {
-                const int64_t l = profile[r].first;
-                int st = 0;
-                while (st + 1 < ns && l >= at[(size_t) st]) ++st;
-                if (full[(size_t) st]) continue;
-                if (used[(size_t) st] + cost(l) > capr[(size_t) st]) { full[(size_t) st] = true; continue; }   // as the fill
-                used[(size_t) st] += cost(l);
-                held_mass += mass[r];
-                ++held;
-            }
-            held_mass /= std::max(total_mass, 1e-9);
-            double ms = miss_ms * (1.0 - held_mass);
-            for (int i = 0; i < ns; ++i) {
-                const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1], le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
-                ms += (double) (le - lb) * layer_ms[(size_t) i];
-            }
-            return ms;
-        };
-        std::vector<int64_t> best, at((size_t) ns - 1);
-        double best_ms = 1e30, best_mass = 0;
-        int64_t best_held = 0;
-        auto consider = [&]() {
-            double hm = 0;
-            int64_t held = 0;
-            const double ms = predict(at, hm, held);
-            if (ms < best_ms) { best = at; best_ms = ms; best_mass = hm; best_held = held; }
-        };
-        const int64_t L = g.n_layers;
-        if (ns == 2) {
-            for (int64_t k = 2; k < L; ++k) { at[0] = k; consider(); }
-        } else if (ns == 3) {
-            for (int64_t k1 = 2; k1 + 1 < L; ++k1)
-                for (int64_t k2 = k1 + 1; k2 < L; ++k2) { at[0] = k1; at[1] = k2; consider(); }
-        } else {
-            double total = 0;
-            for (const double c : layer_ms) total += 1.0 / c;
-            double acc = 0;
-            for (int i = 0; i + 1 < ns; ++i) {
-                acc += 1.0 / layer_ms[(size_t) i];
-                at[(size_t) i] = std::clamp<int64_t>((int64_t) std::llround(acc / total * (double) L),
-                                                     i == 0 ? 2 : at[(size_t) i - 1] + 1, L - (ns - 1 - i));
-            }
-            consider();
-        }
-        split_at = best;
-        std::string ks;
-        for (const int64_t k : split_at) ks += (ks.empty() ? "" : ",") + std::to_string(k);
-        basalt::log::info("basalt generate", "layer split auto: K=%s - predicted %.1f ms per decode window; the caches "
-                             "hold %lld of %zu profiled pairs (~%.1f%% of the routed mass)", ks.c_str(), best_ms,
-                     (long long) best_held, profile.size(), 100.0 * best_mass);
-    }
     for (size_t i = 0; i < split_at.size(); ++i)
         if (split_at[i] >= g.n_layers) {
             basalt::log::error("basalt generate", "--layer-split: layer %lld is past the last (%lld)",
