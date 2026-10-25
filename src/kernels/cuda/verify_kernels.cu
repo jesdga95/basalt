@@ -548,10 +548,11 @@ __global__ void __launch_bounds__(32 * RG) gdn_commit_lazy_kernel(GdnCommitLayer
     }
     __syncthreads();
     if (s_i == 0 || !lead) return;
-    const uint32_t waiting = stop_value | 0x80000000u;
+    // the combine marks its wait: the ring with bit 31 (the CPU pool) or bit 30 (only the peers' rows)
+    auto tier_wait = [&](uint32_t w) { return w == (stop_value | 0x80000000u) || w == (stop_value | 0x40000000u); };
     uint32_t v;
-    while ((v = ld_acquire(stop)) != waiting && v != stop_value) __nanosleep(256);
-    if (v != waiting) return;
+    while (!tier_wait(v = ld_acquire(stop)) && v != stop_value) __nanosleep(256);
+    if (!tier_wait(v)) return;
     // step k of every block covers [k * blocks + b, +1) * step of the ranges laid end to end; after its requests a block
     // reads the step's last word (it lands once that part is in L2), then looks at the stop word again
     uint64_t total_b = 0;
@@ -576,7 +577,7 @@ __global__ void __launch_bounds__(32 * RG) gdn_commit_lazy_kernel(GdnCommitLayer
             const uint4 w = __ldcg((const uint4*) last);
             acc ^= w.x ^ w.y ^ w.z ^ w.w;
         }
-        if (ld_acquire(stop) != waiting) break;
+        if (!tier_wait(ld_acquire(stop))) break;
     }
     if (acc == 0x9e3779b9u) ctl->w[(size_t) kCtlWords * 10 + 1] = acc;   // keeps the reads (never in practice)
 }

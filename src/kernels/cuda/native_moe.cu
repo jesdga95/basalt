@@ -186,18 +186,20 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
     if (shared && sh_gate)   // the shared expert's gate, as its own kernel applied it
         h = make_float4(sh_mul(h.x, gt), sh_mul(h.y, gt), sh_mul(h.z, gt), sh_mul(h.w, gt));
     if constexpr (DEP) pdl_wait();
+    bool pmark = false;
     if constexpr (WAITC) {
         // as the wait kernel: every row after the pool's word when the layer has CPU entries (the peers' rows are not
         // polled while the pool reads its experts).  cpu_seen only ever steps through a window's rings in order, so
         // holding this ring means this ring's word was seen.
         const bool cpu = plan->counts[3] > 0;
+        pmark = !cpu && plan->counts[2] > 0;   // only the peers' rows to wait for
         if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
             if (cpu) {
                 st_release_gpu(cpu_seen, ring | 0x80000000u);   // waiting for the pool
                 while (*cpu_done < ring) __nanosleep(64);
                 __threadfence_system();
             }
-            st_release_gpu(cpu_seen, ring);
+            st_release_gpu(cpu_seen, pmark ? ring | 0x40000000u : ring);   // (pmark: waiting for the peers' rows)
         }
         if (cpu)
             while (ld_acquire_gpu(cpu_seen) != ring) __nanosleep(32);
@@ -239,6 +241,7 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
             }
             __stcs(src, make_float4(__uint_as_float(tag), __uint_as_float(tag), __uint_as_float(tag), __uint_as_float(tag)));
         }
+        if (pmark && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) st_release_gpu(cpu_seen, ring);   // its rows are in
     }
     float sx = v[0].x * w[0], sy = v[0].y * w[0], sz = v[0].z * w[0], sw = v[0].w * w[0];
 #pragma unroll
