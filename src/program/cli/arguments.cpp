@@ -163,11 +163,13 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-dir") o.conversation_cache_dir = next("--conversation-cache-dir");
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
-                 a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-disk-mib") {
+                 a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-disk-mib" ||
+                 a == "--conversation-cache-min-tokens") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
-            const int64_t limit = a == "--conversation-cache-slots" ? INT32_MAX : INT64_MAX / (1024 * 1024);
+            const int64_t limit = a == "--conversation-cache-slots" || a == "--conversation-cache-min-tokens"
+                                  ? INT32_MAX : INT64_MAX / (1024 * 1024);
             if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
                 basalt::log::error("basalt", "%s needs a nonnegative integer within range", a.c_str());
                 return 2;
@@ -175,6 +177,7 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
             if (a == "--conversation-cache-mib") o.conversation_cache_mib = number;
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
             else if (a == "--conversation-cache-disk-mib") o.conversation_cache_disk_mib = number;
+            else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = (int) number;
             else o.conversation_cache_slots = (int) number;
         }
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
