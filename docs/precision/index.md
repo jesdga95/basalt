@@ -142,7 +142,10 @@ read beside decoding slots runs every expert it streams on the GPU.
 **Expert path by chunk size.** A prompt chunk of fewer than 6,144 tokens stages only the experts its tokens route to and
 runs them on MMQ, or on the FP4 tensor cores for NVFP4 experts from 1,024 tokens (the FP4 row above), with the CPU pool taking the low-row non-resident ones; a chunk of 6,144 tokens
 or more streams every non-resident expert through the ring and runs the fused kernels (NVFP4 has none: it stays on the FP4 tensor cores, or MMQ below 1,024 tokens, so the cutoff there only changes which experts are staged). Staging everything costs the same
-whatever the chunk, so it only pays once most experts are hit anyway. Chunks of 1,024
+whatever the chunk, so it only pays once most experts are hit anyway. In a chunk below the cutoff the FP4 experts run in groups of 16, as in the streamed walk,
+bitwise equal to one at a time (`prefill_fp4_test` checks every split of a group into runs); its 32 staging slots come
+out of the prompt's loan like its other buffers, so the experts the GPU holds during the read, and with them the CPU's
+share, follow the ring's size as they follow any tier layout. Chunks of 1,024
 to 6,143 tokens (a whole prompt of that length on a bare `--prefill auto`) take the MMQ path, where a lower cutoff would
 send them to the fused kernels (packs with fused kernels; an NVFP4 pack runs the same FP4 or MMQ products either way); the
 two paths' rounding differs as the tables above describe. The quality gate's 256-token prompt half is below both

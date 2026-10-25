@@ -63,7 +63,9 @@ constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10, NE = 512;
 constexpr int64_t C = 10240, ZV = 6144, HV = 48;
 // staging holds the largest blob of the pack (a native pack's blobs differ per layer)
 inline int64_t MAXBLOB() { return (int64_t) basalt::kernels::cpu::expert_layout().max_blob; }
-constexpr int STAGE = 8;           // host->device expert staging ring (chunks below stream_all_min())
+// host->device expert staging ring of a chunk below stream_all_min(): two groups of MMQ_GROUP experts, so a slot is
+// copied into again only once the group that read it has run
+constexpr int STAGE = 32;
 // From the chunk size stream_all_min() on, every non-resident expert of every layer streams in a fixed order through a
 // ring_slots()-slot ring (nearly every expert is routed at such a chunk), so the copy engine keeps working through the
 // attention halves instead of waiting for each layer's routing.
@@ -661,6 +663,7 @@ uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_ba
 // is converted to GGUF Q2_0 blocks on the gather), whether any layer keeps the FP16 path (IQ1_M), and the largest
 // gate/up and down matrices a group buffer slot holds.
 constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the gather is per expert, as blobs arrive)
+static_assert(STAGE >= 2 * MMQ_GROUP, "the staging ring holds two groups");
 // MMQ reads up to one 256-value tile past a matrix's last row when the row length is not a multiple of it (the down
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
@@ -2529,9 +2532,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (fp4_n == 0) fp4_j0 = j;
                                 fp4_blob[fp4_n++] = blob_dev;
                                 if (slot >= 0) gg_slots[gg_nslots++] = slot;
-                                // a group at the walk's end of MMQ_GROUP experts; outside the streamed walk the staging
-                                // ring reuses a slot as soon as the next expert starts, so one expert at a time
-                                if (group_gather && j % MMQ_GROUP != MMQ_GROUP - 1 && j + 1 < order.size()) return true;
+                                // groups of MMQ_GROUP experts: the streamed walk's, and the staged walk's, whose ring
+                                // holds two groups (each copy is waited for before its expert joins the group)
+                                if ((group_gather || !stream_all) && j % MMQ_GROUP != MMQ_GROUP - 1 && j + 1 < order.size())
+                                    return true;
                                 fp4_flush();
                                 return true;
                             }
@@ -2606,7 +2610,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (cpu_maybe) cudaEventRecord(m.cpu_gev[0], m.cs);
                         if (!stream_all) {
                             size_t staged = 0;
-                            const size_t lookahead = STAGE - 1;
+                            // staged this far ahead, a slot is copied into again only after the group that read it
+                            const size_t lookahead = STAGE - MMQ_GROUP - 1;
                             for (size_t j = 0; j < order.size(); ++j) {
                                 while (staged < order.size() && staged <= j + lookahead) {
                                     if (!stage_one(staged)) return false;
