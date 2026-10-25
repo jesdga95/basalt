@@ -249,11 +249,11 @@ void seed_usage_from_prompt(std::vector<float>& usage, const std::vector<uint32_
 // them into `in`'s place in RAM.  The RAM copy then again holds exactly the experts no core slot does, and no swap
 // reads the file.  Swaps that need no exchange (`out` in the lend region is held in RAM already; or `in` is not) go
 // on as before; ones beyond the buffers' room wait for a later round.  Runs on the adaptive tier's thread while the
-// GPU commits and drafts: the copies back are on its stream, and waited for before the refills are queued.
-template <class Swap>
-bool resident_stage_swaps(basalt::core::FileExpertSource& src, basalt::core::ExpertCache& cache,
-                          const std::vector<int32_t>& host_res, int64_t n_expert, std::vector<Swap>& swaps,
-                          cudaStream_t stream) {
+// GPU commits and drafts: `copy_back(layer, slot, dst)` queues the copy of a slot of the layer's own cache (a layer
+// split keeps one cache per card) into the buffer, and `wait` waits for every queued copy before the refills are queued.
+template <class Swap, class CopyBack, class Wait>
+bool resident_stage_swaps(basalt::core::FileExpertSource& src, const std::vector<int32_t>& host_res, int64_t n_expert,
+                          std::vector<Swap>& swaps, CopyBack&& copy_back, Wait&& wait) {
     if (!src.complement_ready() || swaps.empty()) return true;
     struct Staged { int32_t layer, in, out; int64_t q; };
     std::vector<Staged> staged;
@@ -265,17 +265,51 @@ bool resident_stage_swaps(basalt::core::FileExpertSource& src, basalt::core::Exp
         if (q >= src.exchange_capacity()) continue;
         const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
         if (slot < 0) continue;
-        if (cudaMemcpyAsync(src.exchange_buffer(q), cache.device_slot(slot),
-                            (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(s.layer), cudaMemcpyDeviceToHost,
-                            stream) != cudaSuccess)
-            return false;
+        if (!copy_back(s.layer, slot, src.exchange_buffer(q))) return false;
         staged.push_back({s.layer, s.in, s.out, q});
         kept.push_back(s);
     }
     if (!staged.empty()) {
-        if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
+        if (!wait()) return false;
         for (const Staged& x : staged)
             if (!src.stage_exchange(x.layer, x.in, x.out, x.q)) return false;
+    }
+    swaps.swap(kept);
+    return true;
+}
+
+// The same with free places of the RAM copy instead of exchange buffers (see FileExpertSource::set_spares): each
+// evicted expert's slot is copied into a free place, which becomes its home once the copies have landed.  A swap with
+// no free place waits for a later round.  `released` gets the (layer, in) pairs whose places are free once the incoming
+// experts are resident on the GPU.
+template <class Swap, class CopyBack, class Wait>
+bool resident_spare_swaps(basalt::core::FileExpertSource& src, const std::vector<int32_t>& host_res, int64_t n_expert,
+                          std::vector<Swap>& swaps, CopyBack&& copy_back, Wait&& wait,
+                          std::vector<std::pair<int32_t, int32_t>>& released) {
+    if (!src.complement_ready() || swaps.empty()) return true;
+    struct Home { int32_t layer, out; uint64_t off; };
+    std::vector<Home> homes;
+    std::vector<Swap> kept;
+    kept.reserve(swaps.size());
+    for (const Swap& s : swaps) {
+        if (!src.has_resident(s.layer, s.in) || src.has_resident(s.layer, s.out)) { kept.push_back(s); continue; }
+        const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
+        if (slot < 0) continue;
+        uint64_t off = 0;
+        uint8_t* dst = src.spare_take(s.layer, off);
+        if (dst == nullptr) continue;
+        if (!copy_back(s.layer, slot, dst)) {
+            src.spare_return(s.layer, off);
+            return false;
+        }
+        homes.push_back({s.layer, s.out, off});
+        released.emplace_back(s.layer, s.in);
+        kept.push_back(s);
+    }
+    if (!homes.empty()) {
+        if (!wait()) return false;
+        for (const Home& h : homes)
+            if (!src.spare_land(h.layer, h.out, h.off)) return false;
     }
     swaps.swap(kept);
     return true;
@@ -1663,7 +1697,7 @@ int main(int argc, char** argv) {
         o.prefill_chunk = o.prefill_auto_max;
     }
     if (!o.mmap_experts && !o.resident_cpu_experts && o.shared_expert_arena.empty() && !o.expert_profile.empty() &&
-        !multi_gpu && o.expert_cache_remote[0] <= 0 && o.expert_cache_remote[1] <= 0 && o.expert_cache_remote[2] <= 0) {
+        o.expert_cache_remote[0] <= 0 && o.expert_cache_remote[1] <= 0 && o.expert_cache_remote[2] <= 0) {
         o.mmap_experts = o.resident_cpu_experts = o.resident_pin = o.resident_soft = true;
         o.resident_headroom = 0;
     }
@@ -1678,19 +1712,8 @@ int main(int argc, char** argv) {
     }
     const bool remote_caches = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
                                o.expert_cache_remote[2] > 0;
-    if (o.resident_cpu_experts && !o.layer_split.empty() && !remote_caches && o.resident_soft &&
-        !o.resident_cpu_explicit && o.resident_budget == 0) {
-        // --resident-experts with a layer split runs as the plain
-        // mmap mode instead of refusing.  Exactly --mmap-experts: nothing else reads these flags (the headroom only
-        // sizes the copy).
-        basalt::log::warn("basalt generate", "the resident RAM mode (--resident-experts) does not support a "
-                             "layer split yet: the experts the GPUs do not hold are read through the OS file cache "
-                             "(--mmap-experts), and RAM may fill up during long prompts");
-        o.resident_cpu_experts = o.resident_pin = o.resident_soft = false;
-        o.resident_headroom = 8ull << 30;
-    }
-    if (o.resident_cpu_experts && (!o.layer_split.empty() || remote_caches)) {
-        basalt::log::error("basalt generate", "--resident-cpu-experts does not support layer splits or remote expert caches");
+    if (o.resident_cpu_experts && remote_caches) {
+        basalt::log::error("basalt generate", "--resident-cpu-experts does not support remote expert caches");
         return 2;
     }
     if (o.serve) basalt::platform::watch_resident_ram(o.resident_cpu_experts, 0);
@@ -2832,7 +2855,9 @@ int main(int argc, char** argv) {
         while (st < (int) split_at.size() && l >= split_at[(size_t) st]) ++st;
         return st;
     };
+    std::vector<std::pair<int32_t, int32_t>> profile_all;   // a layer split: the whole ranking (`profile` keeps CUDA0's share)
     if (multi_gpu) {
+        profile_all = profile;
         std::vector<std::pair<int32_t, int32_t>> mine;
         for (const auto& pr : profile) {
             const int st = stage_of(pr.first);
@@ -3729,6 +3754,11 @@ int main(int argc, char** argv) {
     }
     if (multi_gpu)
         basalt::log::info("basalt generate", "layer split: CUDA0 runs layers 0-%lld", (long long) (split_at[0] - 1));
+    // the experts the stages' caches hold are on a GPU, so the RAM copy leaves them out
+    for (const auto& stp : stages)
+        for (const auto& pr : stp->profile)
+            if (stp->cache.slot_of(pr.first, pr.second) >= 0)
+                cache_fill_bytes += basalt::kernels::cpu::expert_layout().blob_bytes(pr.first);
 
     std::array<basalt::core::RemoteExperts, 3> remote_experts;
     std::unique_ptr<basalt::core::RemoteExpertOpt> remote_opt;
@@ -4463,18 +4493,19 @@ int main(int argc, char** argv) {
             }
         basalt::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
     }
-    // bytes -> slots for CUDA0's cache: exact when it knows its per-slot offsets (a native pack's blobs differ
+    // bytes -> slots for one cache: exact when it knows its per-slot offsets (a native pack's blobs differ
     // per layer), otherwise max_blob each.
-    auto slots_from_bytes = [&](uint64_t need) -> int64_t {
-        const int64_t blob = (int64_t) basalt::kernels::cpu::expert_layout().max_blob;
-        int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
-        if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
-            k = 0;
-            while (k < xcache.slots() &&
-                   (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[xcache.slots() - k]) < need) ++k;
+    auto cache_slots_for = [&](const basalt::core::ExpertCache& xc, uint64_t need) -> int64_t {
+        if (xc.slot_offsets() != nullptr) {   // sized slots: from the end until they hold `need`
+            int64_t k = 0;
+            while (k < xc.slots() &&
+                   (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[xc.slots() - k]) < need) ++k;
+            return k;
         }
-        return k;
+        const int64_t blob = (int64_t) basalt::kernels::cpu::expert_layout().max_blob;
+        return (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
     };
+    auto slots_from_bytes = [&](uint64_t need) -> int64_t { return cache_slots_for(xcache, need); };
     auto lend_slots = [&](int64_t c) -> int64_t {
         return slots_from_bytes(basalt::prefill::Prefill::bytes_needed(g, ss, c));
     };
@@ -4627,10 +4658,26 @@ int main(int argc, char** argv) {
                       exchange_bytes;   // what loads after the copy, and the buffers, fit beside the margin
     // the GPU cache's last slots are lent to the prompt path (and the elastic KV): their experts are kept in RAM too
     int64_t lend_from = -1;
+    int64_t lend_chunk = o.prefill_chunk;
     if (o.prefill_chunk > 0 && d_res != nullptr && xcache.slots() > 0) {
         int64_t chunk = o.prefill_chunk;
         const int64_t k = plan_lend(chunk);
-        if (k > 0) lend_from = xcache.slots() - k;
+        if (k > 0) { lend_from = xcache.slots() - k; lend_chunk = chunk; }
+    }
+    // a layer split: the stages' caches are GPU tiers the RAM copy leaves out, except each one's last slots, which the
+    // prompt path lends for the chunk the first card's loan was sized for
+    std::vector<std::pair<int32_t, int32_t>> stage_held;
+    uint64_t stage_lent_bytes = 0;
+    for (const auto& stp : stages) {
+        const int64_t first = lend_from >= 0
+            ? stp->cache.slots() - cache_slots_for(stp->cache, basalt::prefill::Prefill::bytes_needed(g, stp->ss, lend_chunk))
+            : stp->cache.slots();
+        for (const auto& pr : stp->profile) {
+            const int32_t slot = stp->cache.slot_of(pr.first, pr.second);
+            if (slot < 0) continue;
+            if (slot < first) stage_held.push_back(pr);
+            else stage_lent_bytes += basalt::kernels::cpu::expert_layout().blob_bytes(pr.first);
+        }
     }
     // the elastic KV's tail keeps its experts in RAM too (a slot lent to the KV becomes a CPU miss read from RAM),
     // below it the prompt path's lend region as before: the RAM decides how far down that goes, as it does today
@@ -4659,7 +4706,8 @@ int main(int argc, char** argv) {
         const uint64_t margin = basalt::platform::ram_margin();
         const uint64_t head = std::max(resident_headroom_base, margin);
         const uint64_t lent_bytes =
-            lend_from >= 0 ? (uint64_t) (xcache.slots() - lend_from) * basalt::kernels::cpu::expert_layout().max_blob : 0;
+            (lend_from >= 0 ? (uint64_t) (xcache.slots() - lend_from) * basalt::kernels::cpu::expert_layout().max_blob : 0) +
+            stage_lent_bytes;
         in.complement_full = expert_total_bytes - std::min(expert_total_bytes, cache_fill_bytes);
         in.complement_peer_excl = in.complement_full - std::min(in.complement_full, peer_expert_room());
         // the RAM copy also holds the free places the adaptive swaps use (see set_spares)
@@ -4784,16 +4832,19 @@ int main(int argc, char** argv) {
                              (double) avail / kGiB);
             }
         }
-        bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, peer_only, lend_from, resident_headroom,
-                                                    o.resident_budget, &profile);
+        std::vector<std::pair<int32_t, int32_t>> gpu_only = peer_only;
+        gpu_only.insert(gpu_only.end(), stage_held.begin(), stage_held.end());
+        const auto& rank = stages.empty() ? profile : profile_all;
+        bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, gpu_only, lend_from, resident_headroom,
+                                                    o.resident_budget, &rank);
         std::string whole_err;
         if (!resident_ok && o.resident_soft) {
             // the whole complement does not fit - keep what does, the hottest by the profile, through the budget
             // path (sized by the RAM alone) instead of none: the misses outside it read the same file bytes the mmap
             // fallback reads, so the answers are unchanged.  Nothing pinned: the fallback below.
             whole_err = err;
-            resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, peer_only, -1, resident_headroom,
-                                                   basalt::core::FileExpertSource::kResidentWhatFits, &profile);
+            resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, gpu_only, -1, resident_headroom,
+                                                   basalt::core::FileExpertSource::kResidentWhatFits, &rank);
             if (resident_ok) {
                 basalt::log::warn("basalt generate", "the whole complement does not fit in RAM (%s); the hottest %.2f GiB "
                                      "are kept in RAM", whole_err.c_str(), (double) src.resident_bytes() / 1073741824.0);
@@ -4927,18 +4978,6 @@ int main(int argc, char** argv) {
             int32_t first_now = -1;        // where its buffers are laid out now
             int64_t lent_chunk = 0;
             std::vector<std::pair<int32_t, int32_t>> lent;
-        };
-        // bytes -> slots for one cache: exact when it knows its per-slot offsets (a native pack's blobs differ
-        // per layer), otherwise max_blob each.
-        auto cache_slots_for = [&](const basalt::core::ExpertCache& xc, uint64_t need) -> int64_t {
-            if (xc.slot_offsets() != nullptr) {   // sized slots: from the end until they hold `need`
-                int64_t k = 0;
-                while (k < xc.slots() &&
-                       (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[xc.slots() - k]) < need) ++k;
-                return k;
-            }
-            const int64_t blob = (int64_t) basalt::kernels::cpu::expert_layout().max_blob;
-            return (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
         };
         auto part_slots = [&](const PfPart& p, int64_t c) -> int64_t {
             return cache_slots_for(*p.cache, basalt::prefill::Prefill::bytes_needed(g, *p.ses, c));
@@ -5738,6 +5777,7 @@ int main(int argc, char** argv) {
             }
             return true;
         };
+        std::vector<std::pair<int32_t, int32_t>> pending_spare;   // the RAM places the incoming experts free once resident
         auto apply_pending = [&](bool wait, bool exchanges = true) {
             if (peer.valid()) {
                 if (!wait) peer.apply_pending(wait);
@@ -5765,6 +5805,8 @@ int main(int argc, char** argv) {
                 host_res[(size_t) i] = slot;
                 srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);   // in VRAM now: RAM not needed
             }
+            for (const auto& [l, e] : pending_spare) src.spare_release(l, e);
+            pending_spare.clear();
             pending.clear();
             res_upload();
             // a promoted expert is CUDA0's now: its peer slot takes the expert CUDA0 gave up (in RAM since the commit)
@@ -5832,7 +5874,28 @@ int main(int argc, char** argv) {
             rank_swaps(swaps);
             n_ranked = swaps.size();
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
-            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) return false;
+            std::vector<int> staged_on;   // the devices whose adapt streams hold copies back (-1: CUDA0)
+            const auto copy_back = [&](int32_t layer, int32_t slot, uint8_t* dst) -> bool {
+                const int stn = multi_gpu ? stage_of(layer) : 0;
+                GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
+                const basalt::core::OnDevice on(gs ? gs->dev : -1);
+                staged_on.push_back(gs ? gs->dev : -1);
+                return cudaMemcpyAsync(dst, gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot),
+                                       (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer),
+                                       cudaMemcpyDeviceToHost, gs ? gs->adapt_stream : adapt_stream) == cudaSuccess;
+            };
+            const auto wait_copies = [&]() -> bool {
+                bool ok = true;
+                for (const auto& st : stages)
+                    if (std::find(staged_on.begin(), staged_on.end(), st->dev) != staged_on.end()) {
+                        const basalt::core::OnDevice on(st->dev);
+                        ok = cudaStreamSynchronize(st->adapt_stream) == cudaSuccess && ok;
+                    }
+                if (std::find(staged_on.begin(), staged_on.end(), -1) != staged_on.end())
+                    ok = cudaStreamSynchronize(adapt_stream) == cudaSuccess && ok;
+                return ok;
+            };
+            if (!resident_spare_swaps(src, host_res, g.n_expert, swaps, copy_back, wait_copies, pending_spare)) return false;
             n_kept = swaps.size();
             const auto at1 = Clock::now();
             bool main_live = false;
@@ -6408,7 +6471,7 @@ int main(int argc, char** argv) {
             // experts are read from the SSD (none when every expert has a tier)
             const uint64_t later = serve_growth_bytes(o, g) +
                                    (ram_floor_bytes - std::min(ram_floor_bytes, basalt::platform::ram_margin()));
-            const uint64_t add = src.top_up(profile, [&](int32_t l, int32_t e) {
+            const uint64_t add = src.top_up(stages.empty() ? profile : profile_all, [&](int32_t l, int32_t e) {
                 return host_res[(size_t) l * g.n_expert + (size_t) e] >= 0 || (peer.valid() && peer.has(l, e));
             }, o.resident_pin, n_top, later);
             if (add > 0) {
@@ -9997,7 +10060,13 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
-            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) {
+            const auto copy_back = [&](int32_t layer, int32_t slot, uint8_t* dst) -> bool {
+                return cudaMemcpyAsync(dst, xcache.device_slot(slot),
+                                       (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer),
+                                       cudaMemcpyDeviceToHost, adapt_stream) == cudaSuccess;
+            };
+            if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, copy_back,
+                                      [&]() { return cudaStreamSynchronize(adapt_stream) == cudaSuccess; })) {
                 basalt::log::error("basalt generate", "an adaptive refill failed (copying evicted experts back)");
                 return false;
             }

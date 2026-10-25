@@ -44,7 +44,8 @@ there is no choice: nothing is priced and no other card is used or even visible 
   is placed, and every card holds only the dense weights of its own layers, so its VRAM goes to experts as in the tier.
   Every card plans its layers' experts on its own device, as a single card does, and the window is handed to the next
   card once, which costs a fixed part of a window. The drafter stays on the first card and reads the last card's rows
-  of each window; the last card holds the head.
+  of each window; the last card holds the head. The experts no card holds are read from one pinned RAM copy that all
+  stages share (the resident RAM mode, as in the tier), and each card's adaptive swaps stay within its own layers.
 - **Layer split of alike cards, overlapped windows**: with two cards, a server and the drafter, one conversation at a
   time, the split also overlaps consecutive windows. Once the first card has served window K and the drafter's chain
   holds a draft past it, the first card commits K as if every row were kept and starts window K+1 from the guess that K
