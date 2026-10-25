@@ -35,22 +35,23 @@ second one. Reports from machines with three or four cards are welcome (see [com
 
 With two or more cards the engine prices three mechanisms at start, as milliseconds per decode window, from the cards'
 memory bandwidth, their VRAM and the model's size, and prints one line, for example
-`multi-gpu: 2 cards unlike; ms per window: expert tier 7.9, layer split 13.5, tensor parallel 9.0 (not built); picked
+`multi-gpu: 2 cards unlike; ms per window: expert tier 8.0, layer split 12.5, tensor parallel 9.0 (not built); picked
 expert tier`. The line appears for every multi-card setting, alike cards or not. With one card (unset, or one number)
 there is no choice: nothing is priced and no other card is used or even visible to the process.
 
 - **Expert tier**: the main card runs every layer and the other cards hold and compute experts (above).
 - **Layer split**: each card runs a block of layers, one after another. The cut is searched at start. Every card plans
   its layers' experts on its own device, as a single card does, and the window is handed to the next card once, which
-  costs a fixed part of a window. Windows are not overlapped.
+  costs a fixed part of a window. The drafter stays on the first card and reads the last card's rows of each window;
+  the last card holds the head. Windows are not overlapped.
 - **Tensor parallel**: every layer is split across the cards. It is priced and not built: the dense part is a third of
   a window's bytes, so splitting it saves about 2 ms between two cards and the exchanges between the cards (host-staged,
   about 5.4 us per 10 KiB) cost about as much; the expert tier already shares the experts.
 
 Only cards that match (memory bandwidth and VRAM within 10%) may pick a mechanism other than the expert tier, and only
 when it prices at least 5% below it. Unlike cards always use the expert tier. The prices are estimates fitted to
-measured windows (a 5090 with a 5060 Ti: tier 8.0 ms, layer split 13.5 ms at the best cut; two 5080s: 147 tok/s
-reported against 141 priced), good for the choice and not for forecasting a rate.
+measured windows (a 5090 with a 5060 Ti: tier 8.0 ms, layer split 12.5 ms priced against 13.4-13.7 ms measured at the
+cuts tried; two 5080s: 147 tok/s reported against 141 priced), good for the choice and not for forecasting a rate.
 
 ## Two 16 GB cards
 

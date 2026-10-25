@@ -2737,19 +2737,20 @@ int main(int argc, char** argv) {
     const int64_t split_pf_mib =
         (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 + split_ring_mib : 0;
     // ---- WHAT A STAGE RESERVES, AND ON WHICH STAGE.  Every stage after the first books room for its verify windows,
-    // and only the stage that carries the drafter and the head books room for those.  All of these allocations are
-    // already made before a stage's cache is sized, so what has to be held back here is the windows and - only on that
-    // stage - the drafter and the head.
+    // the first stage books room for the drafter and its head copy, the last for the head.  All of these allocations are
+    // already made before a stage's cache is sized, so what has to be held back here is the windows and, on those
+    // stages, the drafter and the head.
     const int64_t kWindowMib = 96;       // the verify windows, with margin
-    const int64_t kDrafterMib = 1000;    // the MTP drafter + the head, on the last stage only
-    auto stage_room = [&](int dev, bool later, bool drafter) -> int64_t {
+    const int64_t kDrafterMib = 1000;    // the MTP drafter and its copy of the head, on the first stage
+    const int64_t kHeadMib = 600;        // the head, on the last stage
+    auto stage_room = [&](int dev, bool later, int64_t extra_mib) -> int64_t {
         const basalt::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
         if (const cudaError_t e = cudaMemGetInfo(&fb, &tb); e != cudaSuccess)
             basalt::log::warn("basalt generate", "layer split: CUDA%d free memory: %s", dev < 0 ? 0 : dev,
                          cudaGetErrorString(e));
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + split_pf_mib + (later ? kWindowMib : 0) +
-                                 (drafter ? kDrafterMib : 0)) << 20;
+                                 extra_mib) << 20;
         return std::max<int64_t>((int64_t) fb - reserve, 0);
     };
     if (multi_gpu && split_auto) {
@@ -2759,7 +2760,7 @@ int main(int argc, char** argv) {
         std::vector<double> layer_ms((size_t) ns);
         for (int i = 0; i < ns; ++i) {
             const int dev = i == 0 ? 0 : stages[(size_t) i - 1]->dev;
-            cap[(size_t) i] = stage_room(i == 0 ? -1 : dev, i > 0, i + 1 == ns);
+            cap[(size_t) i] = stage_room(i == 0 ? -1 : dev, i > 0, i == 0 ? kDrafterMib : i + 1 == ns ? kHeadMib : 0);
             int sms = 0, khz = 0;
             cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
             if (cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, dev) != cudaSuccess || khz <= 0) khz = 1800000;
@@ -3065,9 +3066,9 @@ int main(int argc, char** argv) {
         // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
         // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
         static const basalt::core::ModelGeometry draft_geometry{};
-        // with a layer split across GPUs the drafter reads the last stage's residual: it lives on that device
-        const basalt::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
-        if (!o.mtp.empty() && !mtp.load(basalt::core::MtpFiles::from(srcs), draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str()); return 1; }
+        // with a layer split across GPUs the drafter stays on CUDA0 (the fastest card) and reads the last stage's
+        // residual rows through a relay
+        if (!o.mtp.empty() && !mtp.load(basalt::core::MtpFiles::from(srcs), draft_geometry, ss, o.spec, err, o.mtp_window)) { basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
     }
     basalt::core::qsa_set_kv_elastic(0);   // every later state: whole
@@ -3098,6 +3099,13 @@ int main(int argc, char** argv) {
         grammar_vocab = std::move(pv);
     }
     basalt::core::NativeHead native_head;
+    basalt::core::NativeHead mtp_head;   // a layer split: the drafter's copy of the head on CUDA0
+    if (multi_gpu && mtp_on) {
+        if (!mtp_head.load(o.native_shards, g.n_embd, n_vocab, err)) {
+            basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str());
+            return 1;
+        }
+    }
     if (!multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
         if (!native_head.load(o.native_shards, g.n_embd, n_vocab, err)) {
@@ -3251,8 +3259,9 @@ int main(int argc, char** argv) {
         // path lends cache slots instead (`pf_borrow`, hoisted above so both cache-size branches read the same one).
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
         // the draft layer's head and logits are allocated when it binds, after this, so they come out of the reserve
-        const int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
-                                     ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
+        const basalt::core::NativeHead& draft_head = multi_gpu ? mtp_head : native_head;
+        const int64_t mtp_bind = (!o.mtp.empty() && draft_head.loaded())
+                                     ? (int64_t) mtp.bind_bytes(draft_head.row_bytes(), n_vocab) : 0;
         // a server allocates its verify windows after the cache is sized: they come out of the reserve too, so the
         // free VRAM after loading is the reserve itself
         int64_t late_b = o.serve ? (kWindowMib << 20) : 0;
@@ -3683,7 +3692,7 @@ int main(int argc, char** argv) {
         const auto& lay = basalt::kernels::cpu::expert_layout();
         // the drafter and the head are already allocated by now (they load above, before this), so what is left
         // to hold back is the windows - and `free_b` has already lost the drafter.
-        const int64_t room = stage_room(st.dev, true, false);
+        const int64_t room = stage_room(st.dev, true, 0);
         const basalt::core::OnDevice on(st.dev);
         {
             size_t fb = 0, tb = 0;
@@ -5304,7 +5313,7 @@ int main(int argc, char** argv) {
             if (xpe->valid()) ver.add_peer(xpe.get());
         ver.set_cpu_warm(drive.d.pool, drive.d.src);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err) ||
-            (mtp_on && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err))) {
+            (mtp_on && !mtp.bind(wt, multi_gpu ? &mtp_head : &native_head, ver.final_R_all(), err))) {
             basalt::log::error("basalt serve", "%s", err.c_str());
             return 1;
         }
@@ -5386,14 +5395,12 @@ int main(int argc, char** argv) {
             if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
                 basalt::log::info("basalt serve", "conversation cache: dropped %zu superseded cop%s of this "
                              "conversation; parked=%zu", dropped, dropped == 1 ? "y" : "ies", conversations.size());
-            // A layer split parks one image per stage: the first stage's (with the draft layer's K/V) and one per
-            // later stage (without it - the draft ring is saved once).  The checkpoints are MOVED apart into their
+            // A layer split parks one image per stage: the first stage's (with the draft layer's K/V, the drafter
+            // runs on CUDA0) and one per later stage (without it).  The checkpoints are MOVED apart into their
             // stage parts for the capture and put back together whichever way this ends (no running state copied).
             const size_t n_st = stages.size();
-            // the draft layer's K/V lives on the last stage's GPU (the drafter is loaded there): with a split it is
-            // saved with that stage's image, under its device; stage 0's image holds none
-            const basalt::core::QsaState* draft0 = n_st > 0 ? nullptr : mtp_kv;
-            auto draft_of = [&](size_t k) -> const basalt::core::QsaState* { return k + 1 == n_st ? mtp_kv : nullptr; };
+            const basalt::core::QsaState* draft0 = mtp_kv;
+            auto draft_of = [&](size_t) -> const basalt::core::QsaState* { return nullptr; };
             basalt::core::ConversationCheckpointSplit cs;
             if (n_st > 0) cs = basalt::core::conversation_checkpoints_split(std::move(checks), n_st);
             struct MergeBack {
@@ -5471,7 +5478,7 @@ int main(int argc, char** argv) {
                 size_t reused_bytes = 0;
                 if (!basalt::core::conversation_snapshot_save(image, view, *rsp, g, draft0, err,
                         std::move(reuse), &reused_bytes)) return false;
-                for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
+                for (size_t k = 0; k < n_st; ++k) {   // the later stages
                     auto& st = stages[k];
                     const basalt::core::OnDevice on(st->dev);
                     if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
@@ -8106,7 +8113,7 @@ int main(int argc, char** argv) {
             if (incoming) for (size_t i = 0; i < stages.size(); ++i) {
                 const basalt::core::OnDevice on(stages[i]->dev);
                 if (!basalt::core::conversation_snapshot_validate(incoming->stage_images[i], stages[i]->ss, g,
-                        i + 1 == stages.size() ? mtp_kv : nullptr, err)) {   // the draft: the last stage's
+                        nullptr, err)) {
                     basalt::log::warn("basalt serve", "conversation cache: discard invalid stage snapshot (%s)",
                                  err.c_str());
                     incoming.reset();
@@ -8115,7 +8122,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (incoming && !basalt::core::conversation_snapshot_validate(*incoming, *rsp, g,
-                    stages.empty() ? mtp_kv : nullptr, err)) {
+                    mtp_kv, err)) {
                 basalt::log::warn("basalt serve", "conversation cache: discard invalid snapshot (%s)", err.c_str());
                 incoming.reset();
                 err.clear();
@@ -8176,12 +8183,12 @@ int main(int argc, char** argv) {
             if (incoming) {
                 // a snapshot that cannot be restored is dropped and the prompt read from the start
                 bool restored = basalt::core::conversation_snapshot_restore(*incoming, *rsp,
-                        g, stages.empty() ? mtp_kv : nullptr, err) == basalt::core::ConversationRestore::restored;
+                        g, mtp_kv, err) == basalt::core::ConversationRestore::restored;
                 int failed_stage = -1;
                 for (size_t i = 0; restored && i < stages.size(); ++i) {   // the later stages' parts
                     const basalt::core::OnDevice on(stages[i]->dev);
                     if (basalt::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
-                            i + 1 == stages.size() ? mtp_kv : nullptr, err) !=
+                            nullptr, err) !=
                         basalt::core::ConversationRestore::restored) {
                         restored = false;
                         failed_stage = stages[i]->dev;

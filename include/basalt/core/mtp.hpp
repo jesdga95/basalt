@@ -242,6 +242,14 @@ private:
     static constexpr int kKeepRows = 16;
     float* rkeep_ = nullptr;    ///< a window's rows, kept while the slots draft one after another
     float* rstage_ = nullptr;   ///< draft_seq's copy of the rows
+    // the window rows live on another GPU than the drafter (a layer split's last stage): `relay_src_` is where
+    // they are, `own_R_` takes the rows a round reads and `relay_` the blocks of a prompt's rows
+    const float* relay_src_ = nullptr;
+    float* own_R_ = nullptr;
+    float* relay_ = nullptr;
+    static constexpr int kRelayRows = 256;
+    bool draft_rows(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err, float* probs,
+                    int* n_drafts);   ///< `draft` with the rows already in the window buffer
     static constexpr int kPendRows = 32;
     std::vector<float*> pend_R_;                  ///< per sequence: the deferred rows
     std::vector<std::vector<int32_t>> pend_tok_;  ///< their next tokens

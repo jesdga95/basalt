@@ -145,6 +145,8 @@ MtpDrafter::~MtpDrafter() {
         for (void* a : st) if (a) cudaFree(a);
     if (rstage_) cudaFree(rstage_);
     if (rkeep_) cudaFree(rkeep_);
+    if (own_R_) cudaFree(own_R_);
+    if (relay_) cudaFree(relay_);
     for (float* r : pend_R_) if (r) cudaFree(r);
     for (auto& row : round_exec_)
         for (auto& e : row) if (e) cudaGraphExecDestroy(e);
@@ -545,6 +547,24 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     wt_ = &wt;
     head_ = head;
     window_R_ = window_R;
+    relay_src_ = nullptr;
+    if (window_R != nullptr) {
+        cudaPointerAttributes pa{};
+        if (cudaPointerGetAttributes(&pa, window_R) == cudaSuccess && pa.type == cudaMemoryTypeDevice &&
+            pa.device != device_) {
+            const size_t row = (size_t) (g_->hc * g_->n_embd) * sizeof(float);
+            if (own_R_ == nullptr &&
+                (cudaMalloc((void**) &own_R_, (size_t) max_t_ * row) != cudaSuccess ||
+                 cudaMalloc((void**) &relay_, (size_t) kRelayRows * row) != cudaSuccess)) {
+                err = "mtp: the row relay does not fit";
+                return false;
+            }
+            vram_ += (uint64_t) (max_t_ + kRelayRows) * row;
+            relay_src_ = window_R;
+            window_R_ = own_R_;
+        }
+        (void) cudaGetLastError();
+    }
     const WeightRef* wo = wt.find("output.weight");
     if (!wo) { err = "mtp: output.weight is missing"; return false; }
     n_vocab_ = wo->ne1;
@@ -1290,14 +1310,28 @@ bool MtpDrafter::prefill_cur(const float* R_rows, const int32_t* next_tokens, in
         const int32_t* d_tk = pf_dev_;
         const int32_t* d_stp = d_tk + n;
         const int32_t* d_ps = d_stp + 4 * n;
+        int64_t blk0 = -1;   // the first row of the block in `relay_` (rows on another GPU come over in blocks)
         for (int64_t c = 0; c < n; c += max_t_) {
             const int T = (int) std::min<int64_t>(max_t_, n - c);
             if (cell0 + c + T <= first_needed) continue;
+            const float* rows = R_rows + (size_t) c * HCN;
+            if (relay_ != nullptr && R_rows != own_R_) {
+                if (blk0 < 0 || c + T > blk0 + kRelayRows) {
+                    blk0 = c;
+                    const int64_t nb = std::min<int64_t>(kRelayRows, n - c);
+                    if (cudaMemcpyAsync(relay_, R_rows + (size_t) c * HCN, (size_t) nb * HCN * sizeof(float),
+                                        cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+                        err = "mtp prefill: relaying the rows failed";
+                        return false;
+                    }
+                }
+                rows = relay_ + (size_t) (c - blk0) * HCN;
+            }
             if (!capture_prefill_dev(T, err)) return false;
             if (cudaMemcpyAsync(tok_, d_tk + c, (size_t) T * 4, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
                 cudaMemcpyAsync(step_, d_stp + c * 4, (size_t) T * 16, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
                 cudaMemcpyAsync(pos_, d_ps + c * NHp, (size_t) (T * NHp) * 4, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
-                cudaMemcpyAsync(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
+                cudaMemcpyAsync(Rin_, rows, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
                                 cs_) != cudaSuccess ||
                 cudaGraphLaunch(prefill_dev_exec_[T], cs_) != cudaSuccess) {
                 err = std::string("mtp prefill: ") + cudaGetErrorString(cudaGetLastError());
@@ -1353,6 +1387,19 @@ void MtpDrafter::ctx_flush(cudaStream_t cs) {
 
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                        float* probs, int* n_drafts) {
+    if (relay_src_ != nullptr && T >= 1 && T <= max_t_) {
+        const OnDevice on_device(device_);
+        if (cudaMemcpyAsync(own_R_, relay_src_, (size_t) T * (size_t) (g_->hc * g_->n_embd) * sizeof(float),
+                            cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+            err = "mtp: relaying the window rows failed";
+            return false;
+        }
+    }
+    return draft_rows(T, tokens, p, a, drafts, err, probs, n_drafts);
+}
+
+bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
+                            float* probs, int* n_drafts) {
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     note_cells(p, p + T + max_t_ + 1);
@@ -1598,7 +1645,7 @@ bool MtpDrafter::draft_seq(int id, const float* R_rows, int T, const int32_t* to
             return false;
         }
     }
-    return draft(T, tokens, p, a, drafts, err, probs, n_drafts);
+    return draft_rows(T, tokens, p, a, drafts, err, probs, n_drafts);
 }
 
 bool MtpDrafter::flush(int id, std::string& err) {
@@ -1645,7 +1692,7 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
             return false;
         }
     std::vector<int32_t> toks((size_t) T, token);
-    return draft(T, toks.data(), cell, 0, drafts, err, probs, n_drafts);
+    return draft_rows(T, toks.data(), cell, 0, drafts, err, probs, n_drafts);
 }
 
 }  // namespace basalt::core

@@ -16,7 +16,10 @@ constexpr double kMissMs = 18.1;         // host tail per unit of read mass no c
 constexpr double kHitExponent = 1.0 / 6.0;
 constexpr double kDenseShare = 0.35;     // the part of the GPU bytes that is dense weights (the rest are experts)
 constexpr double kSplitHandoffMs = 0.7;  // a layer split's hand-off and the commits of its stages, per window
-constexpr double kLastCardMs = 3.2;      // the head and the drafter on the last card, at 448 GB/s
+constexpr double kHeadMs = 1.45;         // the head on the last card, at 448 GB/s
+constexpr double kDraftMs = 1.75;        // the drafter on the first card, at 448 GB/s
+constexpr double kRelayMs = 0.3;         // the last stage's window rows to the drafter's card
+constexpr uint64_t kHeadBytes = 600ull << 20;   // the head's copy on the last card, before its experts
 constexpr double kExchangeUs = 5.4;      // one mailbox exchange of 10 KiB between two cards
 constexpr double kWinMargin = 0.95;      // a mechanism beyond the expert tier must beat it by 5%
 
@@ -51,10 +54,12 @@ MgPlan plan_multi_gpu(const std::vector<GpuCard>& cards, const MgModel& m) {
     const double pairs = (double) m.pairs;
     plan.equal = true;
     for (size_t i = 1; i < n; ++i) plan.equal = plan.equal && cards_alike(cards[0], cards[i]);
-    std::vector<double> slots(n), bw(n);
+    std::vector<double> slots(n), split_slots(n), bw(n);
     double total_slots = 0, total_bw = 0;
     for (size_t i = 0; i < n; ++i) {
         slots[i] = room_slots(cards[i], i == 0 ? m.main_overhead : m.peer_overhead, m.blob_bytes);
+        split_slots[i] = room_slots(cards[i], i == 0 ? m.main_overhead : m.peer_overhead + (i + 1 == n ? kHeadBytes : 0),
+                                    m.blob_bytes);
         bw[i] = bandwidth(cards[i]);
         total_slots += slots[i];
         total_bw += bw[i];
@@ -68,9 +73,9 @@ MgPlan plan_multi_gpu(const std::vector<GpuCard>& cards, const MgModel& m) {
         double gpu = 0, miss = 0;
         for (size_t i = 0; i < n; ++i) {
             gpu += f[i] * kGpuGB / bw[i] * 1000.0;
-            miss += f[i] * kMissMs * (1.0 - read_share(slots[i], pairs * f[i]));
+            miss += f[i] * kMissMs * (1.0 - read_share(split_slots[i], pairs * f[i]));
         }
-        return gpu + miss + kSplitHandoffMs + kLastCardMs * 448.0 / bw[n - 1];
+        return gpu + miss + kSplitHandoffMs + kRelayMs + kHeadMs * 448.0 / bw[n - 1] + kDraftMs * 448.0 / bw[0];
     };
     std::vector<double> f(n, 0.0);
     double split_best = 1e30;
