@@ -174,6 +174,19 @@ against the base.
   same for spec 0 and spec 7.
 - Prompts are 19 to 395 tokens with 256 new tokens: this tests the decode path, not long context.
 
+### Overlapped windows on a layer split
+
+A two-card layer split can start window K+1 on the first card while the second card still verifies window K (see
+[GPUs](../configuration/gpus.md)). The first card commits K as if every row were kept, from a snapshot of the state that
+commit changes (recurrent state, conv history, the indexer's pooled rows and block position, the PLE history), and runs
+K+1 from the guess that K is accepted whole and that its last pick is the drafter's next token. When the guess fails the
+snapshot is put back and K+1 is run again as without the overlap; when it holds, the second card runs K+1 behind K's
+commit. Every row is computed by the same kernels on the same inputs, so greedy output is that of the plain split: the
+two builds write the same 400 tokens for conv, struct and prose and for 3-5K-token prompts when their expert caches are
+pinned (an expert on the CPU tier and the same expert on a GPU differ at 8e-8, which flips a near-tie token between
+unpinned runs). Scored (`--ppl`) requests, requests with a repetition penalty or a grammar, relaxed drafting and batch
+slots never overlap windows.
+
 ## Relaxed drafting
 
 `--relaxed-drafting P` (opt-in; off by default) gives up the guarantee above for sampled requests. In exact mode a draft

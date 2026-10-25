@@ -861,6 +861,12 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
     }
 }
 
+/// Pipelined windows: the least chance (the cumulative draft rule's product up to the guess) a window's successor is
+/// launched on, and how far below the window threshold the chain runs on past its window so there are drafts for it.
+constexpr float kPairTheta = 0.50f;
+constexpr float kPairChainScale = 0.25f;
+constexpr double kPairFull = 0.70;   ///< the share of windows accepted whole from which the chain runs on
+
 /// Layer split: every verify stage shares one Drive (its counters, usage and failure flags); the GPU plan, the expert
 /// cache and the PCIe share the pool uses for a layer are those of the stage that runs it.
 struct SplitDrive {
@@ -909,6 +915,7 @@ struct GpuStage {
     std::vector<std::pair<int32_t, int32_t>> profile;   ///< its layers' share of the profile, hottest first
     int32_t* d_res = nullptr;                            ///< the residency table on its device
     basalt::core::Verifier ver;
+    basalt::core::Verifier ver_b;                        ///< the second chain's verifier (pipelined windows)
     basalt::prefill::Prefill sp;
     cudaStream_t adapt_stream = nullptr;
     cudaEvent_t adapt_ev = nullptr;
@@ -1640,6 +1647,11 @@ int main(int argc, char** argv) {
         }
     }
     bool multi_gpu = !split_devs.empty() && !split_same;
+    // two stages with the drafter and one conversation at a time pipeline their windows: a second chain of verifiers over
+    // the same sessions (a window's buffers on each card) and, on the first card, the snapshot a rolled-back guess needs
+    const bool pipe_want = multi_gpu && split_devs.size() == 1 && !o.mtp.empty() && o.serve && o.batch <= 0;
+    constexpr int kPairMib0 = 280, kPairMibLater = 160;
+    if (pipe_want) o.vram_reserve_mib += kPairMib0;
     // Built-in defaults for what is given nowhere: the fastest settings that need no knowledge of the machine.
     // Speculation needs the pack's drafter; prompt chunks are sized from what the expert cache can lend; the experts
     // the GPU does not hold go to page-locked RAM when they fit (a plain file mapping when not); the adaptive tier
@@ -2200,7 +2212,7 @@ int main(int argc, char** argv) {
         if (const cudaError_t e = cudaMemGetInfo(&fb, &tb); e != cudaSuccess)
             basalt::log::warn("basalt generate", "layer split: CUDA%d free memory: %s", dev < 0 ? 0 : dev,
                          cudaGetErrorString(e));
-        const int64_t reserve = ((int64_t) o.vram_reserve_mib + split_pf_mib + (later ? kWindowMib : 0) +
+        const int64_t reserve = ((int64_t) o.vram_reserve_mib + split_pf_mib + (later ? kWindowMib + (pipe_want ? kPairMibLater : 0) : 0) +
                                  extra_mib) << 20;
         return std::max<int64_t>((int64_t) fb - reserve, 0);
     };
@@ -3032,7 +3044,7 @@ int main(int argc, char** argv) {
         static const basalt::core::ModelGeometry draft_geometry{};
         // with a layer split across GPUs the drafter stays on CUDA0 (the fastest card) and reads the last stage's
         // residual rows through a relay
-        if (!o.mtp.empty() && !mtp.load(basalt::core::MtpFiles::from(srcs), draft_geometry, ss, o.spec, err, o.mtp_window)) { basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str()); return 1; }
+        if (!o.mtp.empty() && !mtp.load(basalt::core::MtpFiles::from(srcs), draft_geometry, ss, pipe_want ? basalt::core::kMtpChainMax : o.spec, err, o.mtp_window)) { basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
     }
     basalt::core::qsa_set_kv_elastic(0);   // every later state: whole
@@ -5209,12 +5221,17 @@ int main(int argc, char** argv) {
         // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
         // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
         basalt::core::Verifier ver_same;
-        SplitDrive split_drive;
+        SplitDrive split_drive, split_drive_b;
+        basalt::core::Verifier ver_b;   // pipelined windows: the second chain over the same sessions (stage 0)
+        void* pair_snap = nullptr;
         auto stage_ver = [&](int st) -> basalt::core::Verifier& {
             return st == 0 ? ver : split_same ? ver_same : stages[(size_t) st - 1]->ver;
         };
         auto pcie_num_of = [](double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); };
         const int n_stages = split_devs.empty() ? 1 : (int) split_at.size() + 1;
+        // two stages, the drafter and one conversation at a time: windows are pipelined over two chains of verifiers
+        const bool pipe_on = pipe_want && n_stages == 2;
+        auto stage_verb = [&](int st) -> basalt::core::Verifier& { return st == 0 ? ver_b : stages[(size_t) st - 1]->ver_b; };
         if (n_stages > 1) {
             const size_t hb = (size_t) basalt::kernels::kVerifyMaxT *
                               (size_t) basalt::core::Verifier::handoff_floats(g) * sizeof(float);
@@ -5264,6 +5281,38 @@ int main(int argc, char** argv) {
                 }
             }
             for (int st = 0; st + 1 < n_stages; ++st) stage_ver(st).set_next(&stage_ver(st + 1), &split_drive);
+            if (pipe_on) {
+                GpuStage& gs = *stages[0];
+                float* hb_host = nullptr;
+                float* hand_b = nullptr;
+                if (cudaHostAlloc((void**) &hb_host, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                    cudaHostGetDevicePointer((void**) &hand_b, hb_host, 0) != cudaSuccess ||
+                    cudaMalloc(&pair_snap, basalt::core::Verifier::pair_snapshot_bytes(g, ss, 0, split_at[0])) != cudaSuccess) {
+                    basalt::log::error("basalt serve", "the pipelined windows' buffers failed");
+                    return 1;
+                }
+                std::memset(hb_host, 0, hb);
+                ver_b.set_stage(0, split_at[0], nullptr, hand_b);
+                gs.ver_b.set_stage(split_at[0], -1, hand_b, nullptr);
+                ver.set_pipelined(pair_snap);
+                ver_b.set_pipelined(pair_snap);
+                const basalt::core::OnDevice on(gs.dev);
+                basalt::core::VerifyHits vs;
+                vs.d_res = gs.d_res;
+                vs.h_res = host_res.empty() ? nullptr : host_res.data();
+                vs.cache_base = gs.cache.device_slot(0);
+                vs.blob = thits.blob;
+                vs.slot_off = gs.cache.slot_offsets();
+                vs.n_slots = gs.cache.slots();
+                gs.ver_b.set_remote_expert_opt(remote_opt.get());
+                if (!gs.ver_b.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, std::max({o.spec, o.batch, 2}), err)) {
+                    basalt::log::error("basalt serve", "pipelined windows, stage 2: %s", err.c_str());
+                    return 1;
+                }
+                ver_b.set_next(&gs.ver_b, &split_drive_b);
+                split_drive_b = split_drive;
+                basalt::log::info("basalt serve", "pipelined windows: on");
+            }
             std::string plan_s = "0-" + std::to_string(split_at[0] - 1) + " (CUDA0)";
             for (int st = 1; st < n_stages; ++st)
                 plan_s += ", " + std::to_string(split_at[(size_t) st - 1]) + "-" + std::to_string(split_drive.end[st] - 1) +
@@ -5281,6 +5330,10 @@ int main(int argc, char** argv) {
             basalt::log::error("basalt serve", "%s", err.c_str());
             return 1;
         }
+        if (pipe_on && !ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err)) {
+            basalt::log::error("basalt serve", "pipelined windows: %s", err.c_str());
+            return 1;
+        }
         // each stage's verifier gets its stage's slot sessions
         if (o.batch > 0) {
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
@@ -5296,6 +5349,7 @@ int main(int argc, char** argv) {
         }
         for (int st = 0; st < n_stages && n_stages > 1; ++st) {
             split_drive.plan[st] = stage_ver(st).plan_sink();
+            if (pipe_on) split_drive_b.plan[st] = stage_verb(st).plan_sink();
         }
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
         const basalt::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
@@ -6409,7 +6463,7 @@ int main(int argc, char** argv) {
         }
         const int S = o.spec;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
-        if (mtp_on && S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
+        if (mtp_on && (pipe_want || S_mtp < S)) mtp.set_max_drafts((pipe_on ? basalt::core::kMtpChainMax : S_mtp) - 1);
         if (mtp_on && !mtp.prewarm(err)) {
             basalt::log::error("basalt serve", "capturing the draft graphs failed: %s", err.c_str());
             return 1;
@@ -8750,6 +8804,16 @@ int main(int argc, char** argv) {
                                                ? drive.d.pcie_num : pcie_num_of(stages[(size_t) st - 1]->pcie_frac);
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
+            if (pipe_on) {   // the second chain draws the same way
+                if (!ver_b.set_logit_bias(req_bias, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    continue;
+                }
+                ver_b.set_sampling(req_sp);
+                ver_b.set_draft_probe(relax_on);
+                ver_b.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
+                for (int st = 0; st < split_drive_b.n; ++st) split_drive_b.pcie_num[st] = split_drive.pcie_num[st];
+            }
             bool cancelled = false;
             // The prompt is read in two parts when it has a turn boundary past `resume`: up to the last <|im_start|>
             // (the conversation so far), a checkpoint there, then the new turn's header.  The next request of the same
@@ -8883,8 +8947,8 @@ int main(int argc, char** argv) {
                 const bool seeded = !drive.d.usage.empty() && sp.route_hist_take(hist, hist_tokens) && (!in_slot || solo_req);
                 if (seeded) seed_usage_from_prompt(drive.d.usage, hist, hist_tokens, host_res, g.n_expert, peer);
             }
-            std::vector<int32_t> drafts((size_t) S, 0), window((size_t) S), outv((size_t) S);
-            std::vector<float> dprob((size_t) S, 0.0f);
+            std::vector<int32_t> drafts((size_t) std::max(S, basalt::core::kMtpChainMax), 0), window((size_t) S), outv((size_t) S);
+            std::vector<float> dprob((size_t) std::max(S, basalt::core::kMtpChainMax), 0.0f);
             basalt::core::DraftCumAdapt cum_adapt;   // this request's draft threshold
             std::vector<int32_t> sbuf((size_t) S, 0);
             if (o.suffix_draft > 0) {
@@ -8899,6 +8963,21 @@ int main(int argc, char** argv) {
             consumed.reserve((size_t) (n + max_new + S));
             for (int64_t i = 0; i < fold_p0; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             const char* finish = "length";
+            // pipelined windows: `cv` runs the next window, `ov` is the other chain; a guess that held leaves the next
+            // window's verdict in `held`
+            basalt::core::Verifier* cv = &ver;
+            basalt::core::Verifier* ov = &ver_b;
+            struct HeldWindow { bool on = false; int T = 0; std::vector<int32_t> win, out; } held;
+            held.win.assign((size_t) S, 0);
+            held.out.assign((size_t) S, 0);
+            std::vector<int32_t> win_b((size_t) S, 0);
+            int n_chain = 0;                       // drafts the last chain produced
+            double full_ema = 0.5;                 // how often windows are accepted whole
+            bool pair_hint = false;                // windows are accepted whole often enough to run the chain on for a guess
+            const bool pair_req = pipe_on && ppl == nullptr && !relax_on && gguard == nullptr && hist_n == 0 && !in_slot &&
+                                  kv_floor == 0;
+            if (pipe_on) mtp.set_max_drafts((pair_req ? basalt::core::kMtpChainMax : S_mtp) - 1);
+            int64_t pair_runs = 0, pair_holds = 0;
             const Clock::time_point d0 = Clock::now();
             // --decode-timing: where a request's decode time goes (one line per request)
             const bool dec_timing = basalt::core::diagnostics().decode_timing;
@@ -8944,6 +9023,8 @@ int main(int argc, char** argv) {
             if (tk_log != nullptr) { std::fprintf(tk_log, "R temp=%g S=%d\n", (double) req_temperature, S_mtp); std::fflush(tk_log); }
             while (!cancelled && produced_n < max_new && (!in_slot || solo_req)) {   // (a batch slot's first token comes from the batch window)
                 int T = 1;
+                if (held.on) T = held.T;
+                else
                 while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_adapt.th())) ++T;
                 if (first_window) T = (int) (n - fold_p0);
                 const int e0 = first_window ? T - 1 : 0;   // rows before it are prompt tokens: forced, not emitted
@@ -8955,7 +9036,7 @@ int main(int argc, char** argv) {
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
                 bool from_sfx = false;
                 int sfx_match = 0;
-                if (o.suffix_draft > 0 && !first_window && ppl == nullptr) {
+                if (o.suffix_draft > 0 && !first_window && ppl == nullptr && !held.on) {
                     const int k = sfx.propose(S - 1, sbuf.data());
                     sfx_match = sfx.last_match();
                     if (k > 0 && sbuf[0] == drafts[0]) {
@@ -8968,10 +9049,28 @@ int main(int argc, char** argv) {
                 if (p + T > o.max_context) break;
                 window[0] = x;
                 for (int i = 1; i < T; ++i) window[(size_t) i] = from_sfx ? sbuf[(size_t) i - 1] : drafts[(size_t) i - 1];
+                if (held.on)
+                    for (int i = 0; i < T; ++i) window[(size_t) i] = held.win[(size_t) i];
                 if (e0 > 0)
                     for (int i = 1; i < T; ++i) window[(size_t) i] = (int32_t) ids[(size_t) (p + i)];
                 if (ppl != nullptr)
                     for (int i = 0; i < T; ++i) window[(size_t) i] = ppl->token(p + i);
+                // the guess: this window is accepted whole and the target's next token is the chain's draft T - 1; the next
+                // window then holds that draft and the ones the chain made after it
+                int TB = 0;
+                const bool try_pair = pair_req && pair_hint && !held.on && !first_window && !from_sfx && e0 == 0 &&
+                                      p + T + S_mtp + 64 < o.max_context;
+                const std::function<int(int32_t*)> guess = [&](int32_t* wb) -> int {
+                    n_chain = mtp.draft_more(n_chain, drafts.data(), dprob.data());   // made beside this window's stage 0
+                    if (n_chain <= T || !basalt::core::draft_keep(dprob.data(), T - 1, kPairTheta)) return 0;
+                    int tb = 1;
+                    while (tb < S_mtp && T - 1 + tb < n_chain && basalt::core::draft_keep(dprob.data() + T, tb - 1, cum_adapt.th()))
+                        ++tb;
+                    if (tb < 2) return 0;
+                    wb[0] = drafts[(size_t) T - 1];
+                    for (int i = 1; i < tb; ++i) wb[i] = drafts[(size_t) T - 1 + (size_t) i];
+                    return tb;
+                };
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
@@ -9015,7 +9114,19 @@ int main(int argc, char** argv) {
                 basalt::core::decode_gaps().mark(19);
                 basalt::core::decode_events().stamp(3);
                 const Clock::time_point tw0 = Clock::now();
-                if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
+                void* const user_c = cv == &ver ? win_pool_user : (void*) &split_drive_b;
+                void* const user_o = cv == &ver ? (void*) &split_drive_b : win_pool_user;
+                const bool ran = held.on ? true
+                    : try_pair ? cv->run_pair(*ov, T, window.data(), p, guess, win_b.data(), TB, win_pool_fn, user_c, user_o,
+                                              outv.data(), err)
+                               : cv->run(T, window.data(), p, win_pool_fn, user_c, outv.data(), err);
+                const bool paired = TB > 0;
+                const bool held_run = held.on;
+                if (held.on) {
+                    for (int i = 0; i < T; ++i) outv[(size_t) i] = held.out[(size_t) i];
+                    held.on = false;
+                }
+                if (!ran || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
@@ -9034,7 +9145,7 @@ int main(int argc, char** argv) {
                     while (a < T - 1) {
                         const int32_t d = window[(size_t) a + 1];
                         if (d != outv[(size_t) a]) {
-                            if (call || d >= o.relax_special_from || ver.draft_prob(a) < req_relax) break;
+                            if (call || d >= o.relax_special_from || cv->draft_prob(a) < req_relax) break;
                             outv[(size_t) a] = d;
                             ++relaxed_kept;
                         }
@@ -9053,7 +9164,7 @@ int main(int argc, char** argv) {
                     if (miss >= 0) {
                         gguard->mask_bias(req_bias, grammar_bias);
                         int32_t gtok = 0;
-                        if (!ver.resample_row(miss, p, grammar_bias, gtok, err)) {
+                        if (!cv->resample_row(miss, p, grammar_bias, gtok, err)) {
                             std::printf("ERR %s\n", err.c_str());
                             return 1;
                         }
@@ -9068,11 +9179,29 @@ int main(int argc, char** argv) {
                     a = T - 1;
                     for (int t = 0; t < T; ++t) {
                         std::vector<float> lg((size_t) n_vocab);
-                        if (!ver.copy_logits(t, lg.data()) || !ppl->score(p + t, std::move(lg), err)) {
+                        if (!cv->copy_logits(t, lg.data()) || !ppl->score(p + t, std::move(lg), err)) {
                             std::printf("ERR ppl: %s\n", err.empty() ? "the head logits copy failed" : err.c_str());
                             return 1;
                         }
                         outv[(size_t) t] = ppl->token(p + t + 1);   // as if every draft were accepted: x, the MTP
+                    }
+                }
+                // the guess held when the window was accepted whole, its last pick is the next window's first token, and
+                // the request goes on past it
+                if (!from_sfx && e0 == 0 && !held_run) full_ema = 0.9 * full_ema + (a == T - 1 ? 0.1 : 0.0);
+                bool hold = false;
+                if (paired) {
+                    ++pair_runs;
+                    int n_emit_h = 0;
+                    bool eos_h = false;
+                    for (int i = e0; i <= a && produced_n + n_emit_h < max_new && !eos_h; ++i) {
+                        ++n_emit_h;
+                        eos_h = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                    }
+                    hold = a == T - 1 && outv[(size_t) a] == win_b[0] && !eos_h && produced_n + n_emit_h < max_new && !halted();
+                    if (!hold && !cv->pair_miss(*ov, win_pool_fn, user_o, err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
                     }
                 }
                 if (logit_hash)   // the accepted rows' logits, per position (equality of the batch rows with these)
@@ -9088,7 +9217,7 @@ int main(int argc, char** argv) {
                             std::fputc('\n', tk_log);
                             continue;
                         }
-                        if (!ver.copy_logits(j, lg.data())) break;
+                        if (!cv->copy_logits(j, lg.data())) break;
                         // top_k, top_p, then temperature over the survivors: the sampler chain without penalties
                         std::vector<int> ord((size_t) n_vocab);
                         for (int i = 0; i < n_vocab; ++i) ord[(size_t) i] = i;
@@ -9187,7 +9316,7 @@ int main(int argc, char** argv) {
                         }
                     };
                     basalt::core::decode_events().stamp(9);
-                    if (!ver.commit(a + 1, err, 2)) {
+                    if (!hold && !cv->commit(a + 1, err, 2)) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
                     }
@@ -9199,8 +9328,8 @@ int main(int argc, char** argv) {
                     std::string cerr;
                     auto after_launch = [&] {
                         after_ran = true;
-                        commit_ok = ver.commit(a + 1, cerr, 1);
-                        adapt_side();
+                        commit_ok = hold ? true : cv->commit(a + 1, cerr, 1);
+                        if (!hold) adapt_side();
                         for (int i = e0; i <= a && produced_n < max_new && !eos; ++i) {
                             std::printf("T %d\n", (int) outv[(size_t) i]);
                             basalt::core::progress_beat();
@@ -9217,10 +9346,44 @@ int main(int argc, char** argv) {
                     if (!from_sfx && e0 == 0) cum_adapt.observe(dprob.data(), T - 1, a);
                     mtp.set_cum_th(cum_adapt.th());
                     bool drafted = true;
-                    if (will_draft && mtp_on) {
+                    if (hold) {
+                        // the tokens go out; the next window's last stage runs behind this window's commit while its first
+                        // stage finishes, and the drafter (on the first card) takes this window's rows once that card is
+                        // free
+                        ++pair_holds;
+                        if (!cv->pair_hold_commit(T, err)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            return 1;
+                        }
+                        after_launch();
+                        const float* staged = nullptr;
+                        drafted = mtp.stage_rows(cv->final_R_all(), T, &staged, err);   // before the last card is busy again
+                        if (!drafted || !cv->pair_hold_begin(*ov, T, p, TB, win_b.data(), err) ||
+                            !cv->pair_hold_finish_first(*ov, win_pool_fn, user_o, err) ||
+                            !(drafted = mtp.prefill(staged, outv.data(), T, p, err))) {
+                            std::printf("ERR %s\n", err.c_str());
+                            return 1;
+                        }
+                        if (!cv->pair_hold_finish(*ov, win_pool_fn, user_o, held.out.data(), err) || drive.d.failed) {
+                            std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
+                            return 1;
+                        }
+                        held.on = true;
+                        held.T = TB;
+                        for (int i = 0; i < TB; ++i) held.win[(size_t) i] = win_b[(size_t) i];
+                        std::swap(cv, ov);
+                    } else if (will_draft && mtp_on) {
                         mtp.set_launch_hook(after_launch);
-                        drafted = mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data());
+                        pair_hint = pair_req && full_ema >= kPairFull;
+                        mtp.set_cum_th(pair_hint ? cum_adapt.th() * kPairChainScale : cum_adapt.th());
+                        mtp.set_host_th(cum_adapt.th());
+                        drafted = mtp.draft_from(cv->final_R_all(), T, outv.data(), p, a, drafts.data(), err, dprob.data(), &n_chain);
                         mtp.set_launch_hook(nullptr);
+                        if (drafted && pipe_on) {   // the next window's first stage starts after the chain's kernels
+                            const cudaEvent_t ev = mtp.done_event();
+                            ver.set_wait_event(ev);
+                            ver_b.set_wait_event(ev);
+                        }
                         if (tk_log != nullptr && drafted) {
                             for (int j = 0; j < 16 && j < S_mtp; ++j) {
                                 tk_prev[j].n = mtp.diag_top(j, 4, tk_prev[j].id, tk_prev[j].p);
@@ -9339,10 +9502,13 @@ int main(int argc, char** argv) {
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
-            if (!ver.wait_commit(err)) {
+            if (!ver.wait_commit(err) || (pipe_on && !ver_b.wait_commit(err))) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            if (pipe_on)
+                basalt::log::info("basalt serve", "pipelined windows: %lld launched, %lld held", (long long) pair_runs,
+                                  (long long) pair_holds);
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();
                 const double w = (double) dec_windows, L = (double) g.n_layers;

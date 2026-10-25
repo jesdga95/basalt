@@ -323,6 +323,30 @@ public:
     /// Captures every solo window width's graph and the commit for session `s` now.
     bool warm_session(SessionState* s, std::string& err);
 
+    // ---- PIPELINED WINDOWS (a layer split of two stages with two chains of verifiers over the same sessions, A and B).
+    // Window A runs; once its stage 0 is done, stage 0 commits A as if every row were kept (the state it reaches when the
+    // guess below holds) and starts window B, whose first token is the guess for A's next token, while stage 1 still runs
+    // A.  A held (every row accepted, and A's last pick is B's first token): stage 1 commits A and runs B (`pair_hold`).
+    // A missed: B's stage 0 drains and stage 0's state is put back as before that commit (`pair_miss`); the caller then
+    // commits A with its real count as for any window.  The head of each chain calls these.
+    /// Before init, on a chain's first stage: the verifier keeps a snapshot of its state in `snap` (`pair_snapshot_bytes`).
+    void set_pipelined(void* snap) { pair_snap_ = snap; }
+    /// The next window's graph on this verifier waits for `e` (then it forgets it): work on the same card it must not
+    /// overlap, such as the drafter's chain.
+    void set_wait_event(cudaEvent_t e) { wait_ev_ = e; }
+    static uint64_t pair_snapshot_bytes(const ModelGeometry& g, const SessionState& ss, int64_t lb, int64_t le);
+    /// `guess` runs once this window's stage 0 has served its last ring: it writes the next window's tokens to `tokb` and
+    /// returns their count, or 0 for no guess (then this is `run`).  `tb` gets that count.
+    bool run_pair(Verifier& b, int ta, const int32_t* toka, int64_t pa, const std::function<int(int32_t*)>& guess,
+                  int32_t* tokb, int& tb, PoolMultiFn pool, void* usera, void* userb, int32_t* outa, std::string& err);
+    bool pair_hold_commit(int ta, std::string& err);
+    bool pair_hold_begin(Verifier& b, int ta, int64_t pa, int tb, const int32_t* tokb, std::string& err);
+    /// The next window's first stage, served to its end (the card is then free for the drafter), and its last stage.
+    bool pair_hold_finish_first(Verifier& b, PoolMultiFn pool, void* userb, std::string& err);
+    bool pair_hold_finish(Verifier& b, PoolMultiFn pool, void* userb, int32_t* outb, std::string& err);
+    bool pair_miss(Verifier& b, PoolMultiFn pool, void* userb, std::string& err);
+
+    Verifier* next_stage() const { return next_; }
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
@@ -361,6 +385,34 @@ private:
     void dm_free();
     std::string peer_released();           ///< after a release: whether the peer window ended (see dm_note)
     bool capture(int T, std::string& err);
+    // run(), in three parts: the launch, the host's serving of the rings, the finish
+    bool run_begin(int T, const int32_t* tokens, int64_t pos0, std::string& err, cudaEvent_t after = nullptr);
+    bool run_serve(PoolMultiFn pool, void* user, std::string& err);
+    bool run_end(int32_t* out, std::string& err);
+    /// One step of the host's service of the window's rings: 1 = every ring served, 0 = the GPU has not reached the next
+    /// one, -1 = an error.
+    int serve_poll(PoolMultiFn pool, void* user, std::string& err);
+    struct WindowFlight {
+        int T = 0;
+        int64_t pos0 = 0;
+        bool do_ple = false, ple_early = false, sampled = false, biased = false, early_sample = false, probe = false;
+        std::vector<uint32_t> ple_rows;
+        int64_t k = 0;                      ///< the next ring to serve
+        bool waiting = false;               ///< the wait for ring k has started
+        uint32_t spins = 0;
+        std::chrono::steady_clock::time_point wait_t0, last_flush;
+    } fl_;
+    // the pair's snapshot and optimistic commit
+    void* pair_snap_ = nullptr;
+    cudaEvent_t wait_ev_ = nullptr;
+    cudaEvent_t ev_opt_ = nullptr;         ///< recorded behind an optimistic commit
+    int64_t snap_pos0_ = 0;
+    int32_t snap_ple_[2] = {-1, -1};
+    bool pl_save(std::string& err);
+    bool pl_qsa_copy(bool save, std::string& err);
+    static constexpr int kPairRows = 4;     ///< indexer pooled rows a commit of one window can complete
+    bool pl_restore(std::string& err);
+    bool pl_commit_opt(int n_keep, std::string& err);
     bool pdl_rec_ = false;   // record_window may use programmatic dependent launch
     bool pdl_off_ = false;                 ///< ... a window failed to capture with it: the later ones go without
     // batch windows (see init_slots)

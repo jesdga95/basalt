@@ -898,7 +898,7 @@ void mtp_take_row(float* R, int64_t R_stride, float* inj, int64_t inj_stride, fl
 
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12040
 namespace {
-struct CondHandles { unsigned long long h[8]; };
+struct CondHandles { unsigned long long h[16]; };
 __global__ void mtp_draft_cond_kernel(CondHandles hs, int n, const float* __restrict__ probs,
                                       const int32_t* __restrict__ row, const int32_t* __restrict__ th_bits,
                                       const float* hist, int j) {
@@ -915,7 +915,7 @@ __global__ void mtp_draft_cond_kernel(CondHandles hs, int n, const float* __rest
 
 bool mtp_draft_cond(const unsigned long long* h, int n, const float* probs, const int32_t* row,
                     const int32_t* th_bits, void* stream, const float* hist, int j) {
-    if (n < 1 || n > 8) { basalt::log::error("basalt", "mtp_draft_cond: n out of range"); std::exit(1); }
+    if (n < 1 || n > 16) { basalt::log::error("basalt", "mtp_draft_cond: n out of range"); std::exit(1); }
     CondHandles hs{};
     for (int k = 0; k < n; ++k) hs.h[k] = h[k];
     mtp_draft_cond_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(hs, n, probs, row, th_bits, hist, j);
@@ -967,7 +967,7 @@ void mtp_stage(const MtpStageSeg* segs, int n_segs, float* f_dst, const float* f
 }
 
 namespace {
-struct StepEndCond { unsigned long long h[8]; };
+struct StepEndCond { unsigned long long h[16]; };
 __global__ void mtp_step_end_kernel(const int32_t* __restrict__ ids, const int32_t* __restrict__ row_dev,
                                     int32_t* __restrict__ tok_dst, int32_t* out, int j, const float* probs, float* out_p,
                                     StepEndCond hs, int n, const int32_t* __restrict__ th_bits,
@@ -998,7 +998,7 @@ bool mtp_step_end(const int32_t* ids, const int32_t* row_dev, int32_t* tok_dst, 
 #if !(defined(CUDART_VERSION) && CUDART_VERSION >= 12040)
     if (n > 0) return false;
 #endif
-    if (n > 8) { basalt::log::error("basalt", "mtp_step_end: n out of range"); std::exit(1); }
+    if (n > 16) { basalt::log::error("basalt", "mtp_step_end: n out of range"); std::exit(1); }
     StepEndCond hs{};
     for (int k = 0; k < n; ++k) hs.h[k] = h[k];
     mtp_step_end_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids, row_dev, tok_dst, out, j, probs, out_p, hs, n, th_bits,
@@ -1318,6 +1318,32 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
     check("wait_flag_ge");
+}
+
+namespace {
+__global__ void signal_flag_kernel(volatile uint32_t* flag, uint32_t value) {
+    __threadfence_system();
+    *flag = value;
+    __threadfence_system();
+}
+}  // namespace
+
+namespace {
+__global__ void word_copy_list_kernel(WordCopyList l) {
+    const WordCopy e = l.e[blockIdx.x];
+    for (int i = threadIdx.x; i < e.n; i += blockDim.x) e.dst[i] = e.src[i];
+}
+}  // namespace
+
+void word_copy_list(const WordCopyList& l, void* stream) {
+    if (l.n <= 0) return;
+    word_copy_list_kernel<<<l.n, 128, 0, (cudaStream_t) stream>>>(l);
+    check("word_copy_list");
+}
+
+void signal_flag(uint32_t* flag, uint32_t value, void* stream) {
+    signal_flag_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    check("signal_flag");
 }
 
 void embedding_gather_dev(const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,

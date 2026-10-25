@@ -35,6 +35,10 @@ namespace basalt::core {
 
 class NativeHead;
 
+/// The longest draft chain (the drafter's `max_t`): a verify window holds at most kVerifyMaxT rows, a chain may run on
+/// past it so a window launched ahead has drafts.
+constexpr int kMtpChainMax = 16;
+
 /// The drafter's files: the `mtp/...` sections of a .basalt.
 struct MtpFiles {
     FileRange dense, index, experts, draft_vocab;   ///< dense, dense.index, experts, draft_vocab (optional)
@@ -75,8 +79,18 @@ public:
     /// Captures every conditional draft graph (each draft-head tier, each window width) now rather than at its first
     /// use. After `bind` and `set_max_drafts`.
     bool prewarm(std::string& err);
-    /// The cumulative draft rule's threshold for the next draft() chain (default: the rule's own).
+    /// The cumulative draft rule's threshold for the next draft() chain (default: the rule's own): the device stops the
+    /// chain where the rule fails with it.
     void set_cum_th(float th) { cum_th_ = th; }
+    /// The threshold the host waits by: draft() returns after the drafts this rule keeps while the device (a lower
+    /// `set_cum_th`) goes on with the chain; `draft_more` collects those.  Negative: the same as set_cum_th's.
+    void set_host_th(float th) { host_th_ = th; }
+    /// An event behind everything queued on the drafter's stream so far (a window on this card waits for it: the chain's
+    /// kernels and a window's co-resident kernels must not share the card's SMs).
+    cudaEvent_t done_event();
+    /// After draft(): the chain's later drafts (indices from `have`) that have arrived, and how many there are in all.
+    /// It never waits: the host may be holding up a window on the same card.
+    int draft_more(int have, int32_t* drafts, float* probs);
     uint64_t vram_bytes() const { return vram_; }
     /// The draft layer's K/V state (read-only: the serve state check hashes it)
     const QsaState& kv_state() const { return st_; }
@@ -98,6 +112,14 @@ public:
     /// accepted row) for T-1 drafts at cells p+a+1 ...  `drafts` gets T-1 tokens.
     bool draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                float* probs = nullptr, int* n_drafts = nullptr);
+
+    /// Rows on another GPU brought to the drafter's card now (at most `kRelayRows`): `*staged` is what `prefill` then
+    /// takes in their place, with no copy from the other card left to do.
+    bool stage_rows(const float* R_rows, int n, const float** staged, std::string& err);
+
+    /// `draft` from rows that live elsewhere on the drafter's device: copied into the buffer the graphs read first.
+    bool draft_from(const float* R_rows, int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
+                    float* probs = nullptr, int* n_drafts = nullptr);
 
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
@@ -163,7 +185,7 @@ private:
     bool record_step(int j, bool copy_records, std::string& err);
     bool capture_round(int T, std::string& err);
     bool capture_step(int j, std::string& err);
-    cudaGraphExec_t step_exec_[2][9] = {};   ///< [tier_]
+    cudaGraphExec_t step_exec_[2][kMtpChainMax + 1] = {};   ///< [tier_][chain step]
     /// The round and `steps - 1` chain steps in one graph, step j an IF node on draft j-1's
     /// probability passing the cumulative rule; false (with the per-step path from then on) where it cannot be built
     bool capture_cond(int T, int steps);
@@ -189,6 +211,7 @@ private:
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;
+    cudaEvent_t ev_done_ = nullptr;
     // the branch stream of the round and chain graphs, its fork / join events, its Q8_1 input;
     // par_ while those graphs are recorded, pre_next_ / have_pre_ for the next step's hidden input computed beside the
     // head, fork_open_ while that branch is not joined yet
@@ -196,7 +219,7 @@ private:
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
     uint8_t* xq2_ = nullptr;
     bool par_ = false, pre_next_ = false, have_pre_ = false, fork_open_ = false;
-    struct CondTail { unsigned long long h[8]; int n; };
+    struct CondTail { unsigned long long h[kMtpChainMax]; int n; };
     const CondTail* ctail_ = nullptr;   ///< the conditional handles the step being recorded ends with
     bool ctail_done_ = false;           ///< that step's end already set them
     bool step_end(int j);
@@ -263,6 +286,8 @@ private:
     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr, *h_row_ = nullptr, *m_row_ = nullptr;
     int32_t *h_out_ = nullptr, *m_out_ = nullptr;
     float cum_th_ = -1.0f;   // < 0: the rule's own threshold
+    float host_th_ = -1.0f;  // < 0: cum_th_
+    int chain_steps_ = 0;    ///< the steps the last draft() launched (its graph's)
     float *h_prob_ = nullptr, *m_prob_ = nullptr;   // each draft's probability under the draft layer
     float* diag_ = nullptr;                         ///< spec_log: the draft head's logits per chain step (pinned)
     int64_t diag_stride_ = 0;
