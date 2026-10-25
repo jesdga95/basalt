@@ -367,7 +367,7 @@ def vision_mode(value) -> str:
     text = str(value).strip().lower()
     if text in VISION_MODES:
         return text
-    if text.isdigit():
+    if text.isascii() and text.isdigit():                 # odd Unicode digits are the error, not int()'s guess
         return str(int(text))
     raise ValueError(f"{VISION_USAGE} (got {value!r})")
 
@@ -375,7 +375,7 @@ def vision_mode(value) -> str:
 def vision_card(mode) -> int | None:
     """The GPU number a vision mode names (the sidecar's own card); None for off, dynamic and cpu."""
     text = str(mode).strip()
-    return int(text) if text.isdigit() else None
+    return int(text) if text.isascii() and text.isdigit() else None
 
 
 def vision_env(env: dict, mode) -> dict:

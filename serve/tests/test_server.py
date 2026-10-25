@@ -1194,7 +1194,7 @@ class GpuChoice(unittest.TestCase):
         for given, want in ((None, "off"), ("off", "off"), ("dynamic", "dynamic"), ("cpu", "cpu"),
                             ("2", "2"), (1, "1"), ("01", "1")):
             self.assertEqual(vision_mode(given), want)
-        for bad in (True, False, "true", "false", "gpu", "on", "peer", "-1", "1.5"):
+        for bad in (True, False, "true", "false", "gpu", "on", "peer", "-1", "1.5", "٢", "²"):
             with self.assertRaisesRegex(ValueError, "vision: use one of off, dynamic, cpu or a GPU number"):
                 vision_mode(bad)
 

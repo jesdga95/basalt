@@ -209,6 +209,23 @@ class Cli(Tmp):
         self.assertEqual(getattr(e, "code", None), 2)
         self.assertIn("basalt-vision", err.getvalue())
 
+    def test_vision_numbered_card_is_checked_at_startup(self):
+        path = self.build(vision=True)
+        (self.engine_bin.parent / "basalt-vision").write_text("")
+        base = ["--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0"]
+
+        def plan(engine_bin, value):                     # a fake --gpu-plan: card 0 Blackwell, card 9 refused
+            if str(value) == "9":
+                raise ValueError("GPU 9 is sm_86, not sm_120")
+            return {"devices": [0], "cards": [{"smi": 0}], "notes": [], "warning": None}
+        with mock.patch("serve.server.gpu_plan", side_effect=plan), mock.patch("sys.stderr", io.StringIO()) as err:
+            e = self.run_main(*base, "--vision", "9")
+        self.assertEqual(getattr(e, "code", None), 2)
+        self.assertIn("vision: GPU 9 is sm_86, not sm_120", err.getvalue())
+        with mock.patch("serve.server.gpu_plan", side_effect=plan):
+            e = self.run_main(*base, "--vision", "0")   # a visible card gets through to the Server
+        self.assertIsInstance(e, RuntimeError)
+
 
 if __name__ == "__main__":
     unittest.main()
