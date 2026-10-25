@@ -134,7 +134,9 @@ the 256-token prompt half through this path: PPL 3.3727, KLD 0.15267, top-1 87.2
 for the build without it. The share is a fixed 0.6 of the streamed experts by default (`--prefill-cpu-share`), not a timing-driven value, so which experts the CPU computes depends
 only on the routing and the tiers, and prefill is reproducible bit for bit between runs of the same configuration
 (six identical greedy outputs on the NVFP4 pack and on Q4_K_XL). A different tier layout (cache size, peer slots) moves the
-CPU's experts and with them the rounding, so identity checks compare sessions of one configuration.
+CPU's experts and with them the rounding, so identity checks compare sessions of one configuration. With `--parallel`
+a prompt read that runs alone (up to 16384 tokens, or any read while no slot decodes) takes the same share; a longer
+read beside decoding slots runs every expert it streams on the GPU.
 
 **Expert path by chunk size.** A prompt chunk of fewer than 6,144 tokens stages only the experts its tokens route to and
 runs them on MMQ, or on the FP4 tensor cores for NVFP4 experts from 1,024 tokens (the FP4 row above), with the CPU pool taking the low-row non-resident ones; a chunk of 6,144 tokens

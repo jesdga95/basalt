@@ -8586,8 +8586,14 @@ int main(int argc, char** argv) {
             };
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
                 // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
-                if (o.batch <= 0 || piped || (!stages.empty() && !batch_on()) || b0 - a0 <= kReadAlone)
-                    return sp.run(ids.data() + a0, b0 - a0, a0, e);
+                if (o.batch <= 0 || piped || (!stages.empty() && !batch_on()) || b0 - a0 <= kReadAlone) {
+                    // no window runs meanwhile, so the CPU pool is free: it takes its share of the streamed experts
+                    const bool lend_pool = o.batch > 0 && !multi_gpu && !o.no_pool;
+                    if (lend_pool) { sp.set_cpu_pool(&pool); sp.set_cpu_share(o.prefill_cpu_share); }
+                    const bool ok = sp.run(ids.data() + a0, b0 - a0, a0, e);
+                    if (lend_pool) sp.set_cpu_pool(nullptr);
+                    return ok;
+                }
                 if (batch_on() && stages.empty()) {
                     // the whole range is read on a side thread, in the prompt path's own chunks, while this thread keeps
                     // running the slots' windows; the work that touches the draft layer or the output runs here, between
