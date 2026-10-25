@@ -437,6 +437,98 @@
       "prefill_64k_tps": 5600.8,
       "decode_tps": 199.1,
       "notes": "single RTX 5090 at a 500 W limit (default 575 W), 8-core 7800X3D, 192 GB DDR5, native Windows 11; 0 SSD spill"
+    },
+    {
+      "submitter": "fukc-gihtub",
+      "date": "2026-10-24",
+      "commit": "91bc15a580",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX PRO 4000 Blackwell",
+          "vram_gib": 24,
+          "power_w": 145,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 24.2
+        }
+      ],
+      "ram_gib": 126,
+      "cpu": "Intel Core i9-14900T, 24 cores",
+      "ram_gbps": 29.0,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 3315.6,
+      "prefill_64k_tps": 4015.6,
+      "decode_tps": 96.1
+    },
+    {
+      "submitter": "fukc-gihtub",
+      "date": "2026-10-24",
+      "commit": "91bc15a580",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX PRO 4000 Blackwell",
+          "vram_gib": 24,
+          "power_w": 145,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 24.2
+        }
+      ],
+      "ram_gib": 126,
+      "cpu": "Intel Core i9-14900T, 24 cores",
+      "ram_gbps": 29.0,
+      "os": "Linux",
+      "quant": "IQ3_XXS",
+      "prefill_16k_tps": 2893.9,
+      "prefill_64k_tps": 3423.3,
+      "decode_tps": 188.6
+    },
+    {
+      "submitter": "fukc-gihtub",
+      "date": "2026-10-25",
+      "commit": "91bc15a580",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX PRO 4000 Blackwell",
+          "vram_gib": 24,
+          "power_w": 145,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 24.2
+        }
+      ],
+      "ram_gib": 126,
+      "cpu": "Intel Core i9-14900T, 24 cores",
+      "ram_gbps": 29.0,
+      "os": "Linux",
+      "quant": "IQ3_S",
+      "prefill_16k_tps": 3236.0,
+      "prefill_64k_tps": 3577.8,
+      "decode_tps": 158.0
+    },
+    {
+      "submitter": "fukc-gihtub",
+      "date": "2026-10-25",
+      "commit": "91bc15a580",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX PRO 4000 Blackwell",
+          "vram_gib": 24,
+          "power_w": 145,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 24.2
+        }
+      ],
+      "ram_gib": 126,
+      "cpu": "Intel Core i9-14900T, 24 cores",
+      "ram_gbps": 29.0,
+      "os": "Linux",
+      "quant": "Q4_K_XL",
+      "prefill_16k_tps": 2983.3,
+      "prefill_64k_tps": 3246.6,
+      "decode_tps": 72.4
     }
   ]
 }
