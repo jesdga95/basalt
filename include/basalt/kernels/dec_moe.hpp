@@ -37,9 +37,18 @@ struct DmPlan {
     int32_t start[kDmCap + 1];
     int32_t dst[kDmCap];
     int32_t tok[kDmCap];
-    int32_t kind[kDmCap];
+    int32_t kind[kDmCap];            ///< 0 CUDA0's VRAM tier, 1 the staged share, 2 + the peers, -1 the CPU pool
     unsigned long long ptr[kDmCap];
+    /// the staged share (kind 1): CPU misses CUDA0 copies from host RAM into staging and computes; its own lists
+    int32_t scounts[2];              ///< [0] groups, [1] entries
+    int32_t sstart[kDmCap + 1];
+    int32_t sdst[kDmCap];
+    int32_t stok[kDmCap];
+    unsigned long long sptr[kDmCap]; ///< each group's blob in staging
 };
+
+/// Staged groups a layer takes at most (the staging slots).
+constexpr int kDmStageMax = 16;
 
 struct DmRouteArgs {
     const int32_t* ids = nullptr;    ///< device: n_tok * k routed experts
@@ -82,10 +91,20 @@ struct DmRouteArgs {
     /// for the layer's next window
     unsigned int* pub_ctr = nullptr;
     unsigned int pub_target = 0;
+    /// the staged share (a card without peers): this layer's [n_expert] host-RAM blob address (device alias) or 0,
+    /// and per count of the layer's distinct CPU misses the staged ones (kDmCap + 1 entries, device); null: none
+    const unsigned long long* stage_src = nullptr;
+    const int32_t* stage_k = nullptr;
 };
 /// Blocks dec_moe_route launches for `n_tok` rows (the arrival counter advances by this much).
 int dec_moe_route_blocks(int n_tok, int n_embd);
 void dec_moe_route(const DmRouteArgs& a, void* stream);
+/// The staged share of one layer: the same split the ring's kinds make (a.stage_src, a.stage_k, a.res0, a.ids),
+/// the staged blobs copied from host RAM into `staging` (slot q at q * stride, whole 128-byte lines, the blob at its
+/// source's offset within its first line), and their groups into a.plan's staged lists.
+void dec_moe_stage(const DmRouteArgs& a, uint8_t* staging, int64_t stride, int64_t blob_bytes, int blocks, void* stream);
+/// Bytes a staging slot needs for blobs of `blob_bytes`: whole 128-byte lines from an address 16-byte aligned.
+inline int64_t dec_moe_stage_stride(int64_t blob_bytes) { return (blob_bytes + 127 + 127) / 128 * 128; }
 
 /// DEC_GLUE & 1: CUDA0's grouped gate/up, SwiGLU and down launches (native_expert_grouped's DEC_GU2=2
 /// chain, the same bits) with the route's VRAM plan built inside the gate/up launch: every block groups the entries

@@ -527,6 +527,7 @@ void FileExpertSource::close() {
     complement_device_ = nullptr;
     complement_bytes_ = 0;
     complement_offsets_.clear();
+    ++places_gen_;
     complement_pinned_ = false;
     complement_partial_ = false;
     complement_pin_limit_ = 0;
@@ -1175,6 +1176,7 @@ bool FileExpertSource::pin_cache_complement(
     complement_device_ = device;
     complement_bytes_ = bytes;
     complement_offsets_ = std::move(offsets);
+    ++places_gen_;
     complement_pinned_ = (pinned_ok || partial_pin > 0) && bytes > 0;
     complement_pin_limit_ = pinned_ok ? bytes : partial_pin;
     complement_partial_ = !pinned_ok && partial_pin > 0;
@@ -1300,6 +1302,7 @@ void FileExpertSource::homes_commit() {
     for (const auto& [i, off] : homes_pending_)
         if (i < complement_offsets_.size()) complement_offsets_[i] = off;
     homes_pending_.clear();
+    ++places_gen_;
 }
 
 void FileExpertSource::homes_abort() {
@@ -1314,6 +1317,7 @@ bool FileExpertSource::home_release(int64_t layer, int64_t expert) {
         return false;
     spare_free_.emplace_back(complement_offsets_[i], layer_blob_bytes_[(size_t) layer]);
     complement_offsets_[i] = kNoComplement;
+    ++places_gen_;
     return true;
 }
 
@@ -1462,6 +1466,7 @@ uint64_t FileExpertSource::top_up(const std::vector<std::pair<int32_t, int32_t>>
     top_pinned_ = pinned_ok;
     for (size_t k = 0; k < pick.size(); ++k)
         complement_offsets_[(size_t) pick[k].first * (size_t) n_expert_ + (size_t) pick[k].second] = complement_bytes_ + at[k];
+    ++places_gen_;
     count = (int64_t) pick.size();
     return total;
 }
@@ -1534,6 +1539,7 @@ bool FileExpertSource::spare_land(int64_t layer, int64_t out, uint64_t off) {
         host_at(off, layer_blob_bytes_[(size_t) layer]) == nullptr) return false;
     complement_offsets_[i] = off;
     ++exchanges_;
+    ++places_gen_;
     return true;
 }
 
@@ -1543,6 +1549,7 @@ bool FileExpertSource::spare_release(int64_t layer, int64_t in) {
     if (i >= complement_offsets_.size() || complement_offsets_[i] == kNoComplement) return false;
     spare_free_.emplace_back(complement_offsets_[i], layer_blob_bytes_[(size_t) layer]);
     complement_offsets_[i] = kNoComplement;
+    ++places_gen_;
     return true;
 }
 
@@ -1609,6 +1616,7 @@ int64_t FileExpertSource::commit_exchanges() {
         }
         override_[x.out] = nullptr;
     }
+    if (!staged_.empty()) ++places_gen_;
     staged_.clear();
     exchanges_ += n;
     return n;

@@ -161,6 +161,17 @@ struct DecMoe {
         bool live = false;
     };
     std::vector<XPeer> xp;
+    // the staged share (a card without peers): every expert's host-RAM address (device alias) or 0, its host copy and
+    // the source's places it was read at, the staged count per count of distinct CPU misses, the copy's own stream
+    unsigned long long* stage_src = nullptr;
+    unsigned long long* stage_host = nullptr;
+    uint64_t stage_gen = 0;
+    int32_t* stage_k = nullptr;
+    cudaStream_t st_s = nullptr;
+    cudaEvent_t st_fork = nullptr, st_join = nullptr;
+    int64_t stage_stride = 0;
+    int stage_blocks = 0;
+    int stage_min = 0;   // the fewest distinct CPU misses a layer stages a share of
     // pinned staging of the residency uploads: the copies take their source from here, so the call does
     // not wait for the stream; a ring of slots, each reused only after the window's stream sync
     uint8_t* pin = nullptr;
@@ -695,6 +706,48 @@ bool Verifier::dm_init(std::string& err) {
         w->down_off = lay.fmt[0].down_off;
         w->logits.assign((size_t) kVerifyMaxT * g.n_expert, 0.0f);
         d->warm = w;
+    }
+    // The staged share: on one card, a batch window's layer with enough CPU misses sends some of them to CUDA0, copied
+    // over PCIe from their RAM copies into staging while the pool reads the rest.  An expert without a mapped RAM copy
+    // is never staged; the addresses are read again before a batch window when the source's places moved (a swap).
+    // The count staged for m misses balances the pool's time for the rest against the copy's, both reading host
+    // memory at once.
+    bool stage = d->pdev < 0 && d->xp.empty() && lb_ == 0 && le_ == g.n_layers && hand_in_ == nullptr &&
+                 warm_src_ != nullptr && staging_ != nullptr && warm_src_->pcie_layer(0) && lay.fmt[0].bytes % 16 == 0;
+    for (int64_t l = 1; stage && l < g.n_layers; ++l) stage = lay.fmt[(size_t) l].bytes == lay.fmt[0].bytes;
+    const int64_t blob = (int64_t) lay.fmt[0].bytes, stride = dec_moe_stage_stride(blob);
+    const int stage_slots =
+        (int) std::min<int64_t>(kDmStageMax, (int64_t) (kStagingBlobs * (int64_t) lay.max_blob) / stride);
+    if (stage && stage_slots >= 1) {
+        // per layer: the pool's experts after its doorbell, the staged ones after the copy, their own launches and
+        // the combine's wait for them
+        constexpr double kPoolBytesPerUs = 45e3, kLinkBytesPerUs = 18e3, kPoolFixUs = 15.0, kStageFixUs = 35.0;
+        const double cpu_us = (double) blob / kPoolBytesPerUs, link_us = (double) blob / kLinkBytesPerUs;
+        std::vector<int32_t> kt((size_t) kDmCap + 1, 0);
+        for (int m = 1; m <= kDmCap; ++m) {
+            double best = kPoolFixUs + m * cpu_us;
+            for (int k = 1; k <= std::min(m, stage_slots); ++k) {
+                const double t = std::max(kPoolFixUs + (m - k) * cpu_us, kStageFixUs + k * link_us);
+                if (t < best) { best = t; kt[(size_t) m] = k; }
+            }
+        }
+        int st_least = 0, st_greatest = 0;   // the copy's blocks go first as the FFN read's leave the SMs
+        bool sok = cudaMalloc((void**) &d->stage_src, (size_t) LE * 8) == cudaSuccess &&
+                   cudaMemset(d->stage_src, 0, (size_t) LE * 8) == cudaSuccess &&
+                   cudaMallocHost((void**) &d->stage_host, (size_t) LE * 8) == cudaSuccess &&
+                   cudaMalloc((void**) &d->stage_k, kt.size() * 4) == cudaSuccess &&
+                   cudaMemcpy(d->stage_k, kt.data(), kt.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+                   cudaDeviceGetStreamPriorityRange(&st_least, &st_greatest) == cudaSuccess &&
+                   cudaStreamCreateWithPriority(&d->st_s, cudaStreamNonBlocking, st_greatest) == cudaSuccess &&
+                   cudaEventCreateWithFlags(&d->st_fork, cudaEventDisableTiming) == cudaSuccess &&
+                   cudaEventCreateWithFlags(&d->st_join, cudaEventDisableTiming) == cudaSuccess;
+        if (!sok) { err = "verify: the staged share's buffers"; return false; }
+        std::memset(d->stage_host, 0, (size_t) LE * 8);
+        d->stage_gen = warm_src_->places_generation() + 1;   // read at the first batch window
+        d->stage_stride = stride;
+        d->stage_blocks = 8;
+        d->stage_min = 1;
+        while (d->stage_min < kDmCap && kt[(size_t) d->stage_min] == 0) ++d->stage_min;
     }
     std::string served;
     if (d->pdev >= 0) {
@@ -1384,10 +1437,15 @@ void Verifier::dm_free() {
         for (void* h : {(void*) x.h_ring, (void*) x.h_w})
             if (h) cudaFreeHost(h);
     }
+    if (d->st_s) { cudaStreamSynchronize(d->st_s); cudaStreamDestroy(d->st_s); }
+    for (cudaEvent_t e : {d->st_fork, d->st_join})
+        if (e) cudaEventDestroy(e);
     for (void* p : {(void*) d->res0, (void*) d->res1, (void*) d->plan, (void*) d->ctr, (void*) d->slot_off, d->vscr,
                     (void*) d->vsync, d->xq_pub, (void*) d->wstat,
-                    (void*) d->ptab0, (void*) d->pub, (void*) d->cseen, (void*) d->landed})
+                    (void*) d->ptab0, (void*) d->pub, (void*) d->cseen, (void*) d->landed,
+                    (void*) d->stage_src, (void*) d->stage_k})
         if (p) cudaFree(p);
+    if (d->stage_host) cudaFreeHost(d->stage_host);
     if (d->pin) cudaFreeHost(d->pin);
     if (d->landed_pin) cudaFreeHost(d->landed_pin);
     for (void* h : {(void*) d->h_ring, (void*) d->h_x, (void*) d->h_xq, (void*) d->h_w, (void*) d->h_rows})
@@ -2685,6 +2743,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             ra.stats = dm_->wstat;
             ra.peer_cap = 0;
             ra.rows = dm_->rq != nullptr || dm_->warm != nullptr;
+            if (dm_->stage_src != nullptr && batch_rec_) {   // batch windows: many rows, many misses
+                ra.stage_src = dm_->stage_src + l * g.n_expert;
+                ra.stage_k = dm_->stage_k;
+            }
             PdlScope pr(false);   // after the router's kernel: a plain launch
             if (glue_on) {   // the ring's work inside post's gate/up launch, released by the read's counts
                 glue_ring = ra;
@@ -2704,6 +2766,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 ra.mode = 1;
             }
             if (!glue_on) dec_moe_route(ra, cs);
+            if (ra.stage_src != nullptr) {   // the staged share's copy, beside the ring and CUDA0's own experts
+                cudaEventRecord(dm_->st_fork, cs);
+                cudaStreamWaitEvent(dm_->st_s, dm_->st_fork, 0);
+                PdlScope pst(false);
+                dec_moe_stage(ra, staging_, dm_->stage_stride,
+                              (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(l), dm_->stage_blocks, dm_->st_s);
+                cudaEventRecord(dm_->st_join, dm_->st_s);
+            }
         } else if (ar_on()) {
             resident_plan(ids_, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
@@ -2854,6 +2924,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 landed_glue_ = false;
                 native_expert_grouped(L, P->ptr, P->start, P->counts, P->dst, P->tok, cap, cap,
                                       nat_xq_, hit_scratch_, parts_out, cs);
+            }
+            if (dm_->stage_src != nullptr && batch_rec_) {   // the staged share, once its copy is in staging
+                cudaStreamWaitEvent(cs, dm_->st_join, 0);
+                PdlScope pst(false);
+                native_expert_grouped(L, P->sptr, P->sstart, P->scounts, P->sdst, P->stok, cap, cap, nat_xq_,
+                                      hit_scratch_, parts_out, cs, kPcieGroupRows);
             }
             stamp(l, 20);
             stamp(l, 21);
@@ -4371,6 +4447,9 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
     basalt::log::info("basalt verify", "batch windows of up to %lld sequences (layers [%lld, %lld))", (long long) S,
                  (long long) lb_, (long long) le_);
+    if (dm_ != nullptr && dm_->stage_src != nullptr)
+        basalt::log::info("basalt verify", "batch windows: a layer with %d+ CPU misses sends a share of them over PCIe to "
+                          "CUDA0", dm_->stage_min);
     return true;
 }
 
@@ -4636,6 +4715,31 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     return run_slot_segs(rows, nullptr, S, tokens, pos, pool, user, out, err);
 }
 
+// The staged share's RAM addresses (a mapped, 16-byte aligned copy or 0), read again when the source's places moved
+// since: between windows, on the window's stream ahead of it.  The last window synchronized its stream, so the host
+// copy is free to rewrite.
+bool Verifier::dm_stage_places(std::string& err) {
+    DecMoe* d = dm_;
+    if (d == nullptr || d->stage_src == nullptr) return true;
+    const uint64_t gen = warm_src_->places_generation();
+    if (gen == d->stage_gen) return true;
+    const ModelGeometry& g = *g_;
+    const int64_t LE = g.n_layers * g.n_expert;
+    bool changed = false;
+    for (int64_t i = 0; i < LE; ++i) {
+        const unsigned long long p = (unsigned long long) warm_src_->device_alias(i / g.n_expert, i % g.n_expert);
+        const unsigned long long v = (p & 15ull) == 0 ? p : 0ull;
+        changed = changed || d->stage_host[i] != v;
+        d->stage_host[i] = v;
+    }
+    d->stage_gen = gen;
+    if (changed && cudaMemcpyAsync(d->stage_src, d->stage_host, (size_t) LE * 8, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+        err = std::string("verify: the staged share's addresses: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
+}
+
 bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int32_t* tokens, const int64_t* pos,
                              PoolMultiFn pool, void* user, int32_t* out, std::string& err) {
     using namespace basalt::kernels;
@@ -4647,6 +4751,7 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     const int R = last_t_;   // the window's rows
     const bool dm = dm_ != nullptr && batch_dm_;
     if (dm && !dm_begin(err, nullptr)) return false;
+    if (dm && !dm_stage_places(err)) return false;
     order_after_commit();
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(R, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }

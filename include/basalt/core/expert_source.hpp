@@ -187,6 +187,9 @@ public:
 
     /// The DEVICE address of a pinned, mapped blob (the GPU can read it over PCIe), or null.
     virtual const uint8_t* device_alias(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
+    /// Changes whenever an expert's RAM place (so its `device_alias`) may have changed: a swap's exchange, a spare
+    /// place landing or freed, a RAM home, the top-up.  The places move only between verify windows.
+    virtual uint64_t places_generation() const { return 0; }
     /// A file-backed source: start reading this expert's pages now (it will be needed by the CPU); no-op elsewhere.
     virtual void prefetch(int64_t layer, int64_t expert) { (void) layer; (void) expert; }
     /// A file-backed source: queue the read of these experts' file pages now (a helper thread issues it, the caller
@@ -544,6 +547,7 @@ public:
     bool pinned(int64_t layer, int64_t expert) const override;
     bool file_extent(int64_t layer, int64_t expert, int& fd, uint64_t& offset) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
+    uint64_t places_generation() const override { return places_gen_; }
     bool pcie_layer(int64_t layer) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     /// Each blob read from the file with block-aligned unbuffered reads into small pinned staging buffers; a blob that
@@ -608,6 +612,7 @@ private:
     int64_t xstage_cap_ = 0;
     uint64_t xstage_blob_ = 0;
     int64_t exchanges_ = 0;
+    uint64_t places_gen_ = 0;   ///< places_generation
     int64_t spares_want_ = 0;
     std::vector<std::pair<uint64_t, uint64_t>> spare_free_;   // (offset, bytes) of free places
     std::atomic<int64_t> file_reads_{0};

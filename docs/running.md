@@ -40,6 +40,11 @@ priority), and the few steps that touch the draft layer or the output run betwee
 not stop the other requests. A prompt that arrives while no other slot is decoding is read as in the single-stream
 path.
 
+On one card, a batch window's layer with enough CPU misses sends a share of them over PCIe: CUDA0 copies them from
+their RAM copies into VRAM staging and computes them while the CPU pool computes the rest, both reading RAM at once.
+The startup line `batch windows: a layer with N+ CPU misses sends a share of them over PCIe to CUDA0` gives the
+threshold. A request decoding alone runs the single-stream path and is not affected.
+
 At startup the server prints one `[server] kv cache:` line per device with all the session state placed there, for
 example `12.5 GiB on cuda2 (solo 262144 tokens + 2 slots x 262144 tokens + draft K/V 0.5 GiB)`. With elastic KV (the
 default for a server whose `--max-context` is above 32768, or with `--parallel` for slots above 4096 tokens) it reads `0.6 / 4.4 GiB on cuda0 (elastic)`: the memory backed at startup, and what the cache can

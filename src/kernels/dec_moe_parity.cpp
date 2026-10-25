@@ -12,8 +12,12 @@
 //   window      (two cards) 48 rings through the peer kernel: the peer rows vs native_expert_grouped on the peer
 //   peers       two further peers: the route's kinds, every ring and doorbell (one launch, split, glue) vs a CPU
 //               reference, and the combine reading their rows as it reads the first peer's
+//   staged      (no peers) the share of CPU misses copied from host RAM into staging: the route's, the ring's, the
+//               glue's and the stage kernel's kinds vs a CPU reference of the split, the staged lists and bytes, and the
+//               tail against the same window with those experts resident in VRAM
 // All bitwise.  --bench adds: the VRAM share's grouped call (us, GB/s of expert bytes), and per ring on CUDA0 the
-// route + wait with and without peer entries, alone and behind the VRAM call (what CUDA0 waits for the peer).
+// route + wait with and without peer entries, alone and behind the VRAM call (what CUDA0 waits for the peer), and the
+// staged share's copy (us, GB/s over the link).
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/kernels/dec_moe.hpp"
 #include "basalt/kernels/elementwise.hpp"
@@ -1146,6 +1150,184 @@ int main(int argc, char** argv) {
                 cudaFree(d_pt); cudaFree(d_p4); cudaFree(d_pub);
             } else {
                 std::printf("  glue: skipped (DEC_GU2=2 not set or formats)\n");
+            }
+
+            // the staged share (no peers): the last stage_k[m] of a layer's m distinct CPU misses go to CUDA0, their blobs
+            // copied from host RAM into staging (dec_moe_stage) and computed by its grouped kernel.  The route's, the
+            // ring's, the glue's and the stage kernel's kinds against a CPU reference, the staged lists and bytes, and
+            // the tail against the same window with those experts resident in VRAM (the same bits)
+            if (L.bytes % 16 == 0) {
+                const int64_t stride = K::dec_moe_stage_stride((int64_t) L.bytes);
+                // host copies of the blobs, each 16-byte aligned at a varying offset within its 128-byte line
+                const size_t hstride = ((size_t) L.bytes + 255) / 128 * 128;
+                uint8_t* h_sb = hmap<uint8_t>((size_t) NX * hstride);
+                for (int x2 = 0; x2 < NX; ++x2)
+                    std::memcpy(h_sb + (size_t) x2 * hstride + (size_t) (x2 % 8) * 16, blobs.data() + (size_t) x2 * L.bytes,
+                                L.bytes);
+                uint8_t* d_alias = nullptr;
+                ck(cudaHostGetDevicePointer((void**) &d_alias, h_sb, 0), "host alias");
+                std::vector<unsigned long long> src(NE, 0ull);
+                for (int e = 0; e < NE; ++e)   // a few experts have no host address: never staged
+                    if (e % 11 != 7)
+                        src[e] = (unsigned long long) (d_alias + (size_t) (e % NX) * hstride + (size_t) ((e % NX) % 8) * 16);
+                unsigned long long* d_src = dmal<unsigned long long>(NE);
+                ck(cudaMemcpy(d_src, src.data(), NE * 8, cudaMemcpyHostToDevice), "stage src");
+                std::vector<int32_t> kt(K::kDmCap + 1, 0);
+                for (int m = 1; m <= K::kDmCap; ++m) kt[m] = std::min(K::kDmStageMax, (2 * m + 2) / 5);
+                int32_t* d_kt = dmal<int32_t>(K::kDmCap + 1);
+                ck(cudaMemcpy(d_kt, kt.data(), kt.size() * 4, cudaMemcpyHostToDevice), "stage k");
+                uint8_t* d_stg = dmal<uint8_t>((size_t) K::kDmStageMax * stride);
+                // the reference: CUDA0's kinds, then the last stage_k[m] distinct misses with a host address, every
+                // entry of theirs
+                std::vector<int32_t> rk(n);
+                for (int i = 0; i < n; ++i) rk[i] = res0[ids[i]] >= 0 ? 0 : -1;
+                std::vector<int> firsts;
+                for (int i = 0; i < n; ++i) {
+                    bool first = rk[i] < 0;
+                    for (int j = 0; first && j < i; ++j) first = !(ids[j] == ids[i] && rk[j] < 0);
+                    if (first) firsts.push_back(i);
+                }
+                const int m = (int) firsts.size(), kk = kt[(size_t) m];
+                std::vector<int> elig;
+                for (int i : firsts) if (src[(size_t) ids[i]] != 0ull) elig.push_back(i);
+                std::vector<int> staged;   // the staged experts
+                for (size_t q = elig.size() > (size_t) kk ? elig.size() - (size_t) kk : 0; q < elig.size(); ++q)
+                    staged.push_back(ids[elig[q]]);
+                auto is_staged = [&](int e) { return std::find(staged.begin(), staged.end(), e) != staged.end(); };
+                int rnc = 0;
+                for (int i = 0; i < n; ++i) {
+                    if (rk[i] < 0 && is_staged(ids[i])) rk[i] = 1;
+                    rnc += rk[i] < 0;
+                }
+                uint32_t* sw = hmap<uint32_t>(64);
+                K::DmRouteArgs rs = ra;
+                rs.res1 = nullptr;
+                rs.host_seq_m = sw; rs.peer_seq_m = sw + 16;
+                rs.stage_src = d_src; rs.stage_k = d_kt;
+                ck(cudaMemsetAsync(d_plan, 0xee, sizeof(K::DmPlan), s0), "memset");
+                std::memset((void*) (h_rings + 5), 0, sizeof(K::DmRing));
+                K::dec_moe_route(rs, s0);
+                K::dec_moe_stage(rs, d_stg, stride, (int64_t) L.bytes, 8, s0);
+                ck(cudaStreamSynchronize(s0), "staged route");
+                K::DmPlan S;
+                ck(cudaMemcpy(&S, d_plan, sizeof S, cudaMemcpyDeviceToHost), "plan");
+                size_t bst = 0;
+                for (int i = 0; i < n; ++i) bst += S.kind[i] != rk[i] || h_rings[5].kind[i] != rk[i];
+                bst += h_rings[5].n_cpu != rnc || S.counts[3] != rnc || S.scounts[0] != (int) staged.size();
+                const auto stg = down(d_stg, (size_t) K::kDmStageMax * stride);
+                std::vector<int> sseen(n, 0);
+                int nse = 0;
+                for (int g = 0; g < S.scounts[0] && g < K::kDmStageMax; ++g) {
+                    const int e0 = S.sstart[g], e1 = S.sstart[g + 1];
+                    const int ex = e1 > e0 && S.sdst[e0] >= 0 && S.sdst[e0] < n ? ids[S.sdst[e0]] : -1;
+                    bst += ex < 0 || !is_staged(ex);
+                    for (int e = e0; e < e1; ++e) {
+                        const int i = S.sdst[e];
+                        bst += i < 0 || i >= n || (i < n && ids[i] != ex) || S.stok[e] != i / KK;
+                        if (i >= 0 && i < n) ++sseen[i];
+                        ++nse;
+                    }
+                    const unsigned long long off = S.sptr[g] - (unsigned long long) (d_stg + (size_t) g * stride);
+                    bst += ex < 0 || off != (src[(size_t) ex] & 127ull);
+                    if (ex >= 0 && off < 128)
+                        bst += std::memcmp(stg.data() + (size_t) g * stride + off, blobs.data() + (size_t) (ex % NX) * L.bytes,
+                                           L.bytes) != 0;
+                }
+                bst += S.scounts[1] != nse;
+                for (int i = 0; i < n; ++i) bst += (rk[i] == 1) != (sseen[i] == 1);
+                std::snprintf(what, sizeof what, "staged split T=%d (%d of %d misses)", T, (int) staged.size(), m);
+                report(what, l, bst, (size_t) n);
+                // the tail: CUDA0's groups and the staged ones into parts, then the combine, against the window with the
+                // staged experts resident at the slots of their blobs
+                std::vector<int32_t> res2 = res0;
+                for (int e : staged) res2[(size_t) e] = e % NX;
+                int32_t* d_res2 = dmal<int32_t>(NE);
+                ck(cudaMemcpy(d_res2, res2.data(), NE * 4, cudaMemcpyHostToDevice), "res2");
+                K::DmPlan* d_plan2 = dmal<K::DmPlan>(1);
+                float* d_pa = dmal<float>((size_t) K::kDmCap * H);
+                float* d_pb = dmal<float>((size_t) K::kDmCap * H);
+                float* d_ba = dmal<float>((size_t) MT * H);
+                float* d_bb = dmal<float>((size_t) MT * H);
+                K::DmRouteArgs rr = ra;
+                rr.res0 = d_res2; rr.res1 = nullptr; rr.plan = d_plan2;
+                rr.ring_m = h_rings + 7; rr.x_m = h_x + (size_t) 7 * MT * H; rr.xq_m = h_xq + 7 * xq_stride;
+                rr.host_seq_m = sw + 32; rr.peer_seq_m = sw + 48;
+                K::dec_moe_route(rr, s0);
+                ck(cudaMemsetAsync(d_pa, 0xff, (size_t) K::kDmCap * H * 4, s0), "memset");
+                ck(cudaMemsetAsync(d_pb, 0xff, (size_t) K::kDmCap * H * 4, s0), "memset");
+                K::native_expert_grouped(L, d_plan->ptr, d_plan->start, d_plan->counts, d_plan->dst, d_plan->tok, n, n,
+                                         d_xq2, dv[0].scr, d_pa, s0);
+                K::native_expert_grouped(L, d_plan->sptr, d_plan->sstart, d_plan->scounts, d_plan->sdst, d_plan->stok, n,
+                                         n, d_xq2, dv[0].scr, d_pa, s0, 4);
+                K::native_expert_grouped(L, d_plan2->ptr, d_plan2->start, d_plan2->counts, d_plan2->dst, d_plan2->tok, n,
+                                         n, d_xq2, dv[0].scr, d_pb, s0);
+                h_words[32] = 6;
+                h_words[48] = 6;
+                K::dec_moe_combine(d_pa, h_peer, h_cpu, d_plan, d_w, d_sh, d_ba, H, KK, T, h_words + 32, h_words + 48, 6, s0);
+                K::dec_moe_combine(d_pb, h_peer, h_cpu, d_plan2, d_w, d_sh, d_bb, H, KK, T, h_words + 32, h_words + 48, 6,
+                                   s0);
+                ck(cudaStreamSynchronize(s0), "staged tail");
+                std::vector<int> srows;
+                for (int i = 0; i < n; ++i) if (rk[i] == 1) srows.push_back(i);
+                const auto pa = down(d_pa, (size_t) n * H), pb = down(d_pb, (size_t) n * H);
+                std::snprintf(what, sizeof what, "staged rows T=%d", T);
+                report(what, l, ndiff_rows(pa, pb, srows), srows.size() * H);
+                const auto ba = down(d_ba, (size_t) T * H), bb = down(d_bb, (size_t) T * H);
+                size_t ndt = 0;
+                for (size_t i = 0; i < ba.size(); ++i) ndt += std::memcmp(&ba[i], &bb[i], 4) != 0;
+                std::snprintf(what, sizeof what, "staged tail T=%d", T);
+                report(what, l, ndt, ba.size());
+                if (K::dec_moe_glue_ok(L)) {   // the ring's kinds made inside the glue launch split the same way
+                    std::vector<unsigned long long> pt(NE);
+                    for (int e = 0; e < NE; ++e)
+                        pt[(size_t) e] = res0[(size_t) e] >= 0 ? (unsigned long long) (dv[0].blob + (size_t) res0[(size_t) e] * L.bytes)
+                                                              : 0ull;
+                    unsigned long long* d_pt = dmal<unsigned long long>(NE);
+                    ck(cudaMemcpy(d_pt, pt.data(), NE * 8, cudaMemcpyHostToDevice), "ptab");
+                    void* d_pub = dmal<uint8_t>(xq_stride);
+                    float* d_p4 = dmal<float>((size_t) K::kDmCap * H);
+                    std::memset((void*) (h_rings + 5), 0, sizeof(K::DmRing));
+                    ck(cudaMemsetAsync(d_plan, 0xee, sizeof(K::DmPlan), s0), "memset");
+                    K::DmRouteArgs r2 = rs;
+                    r2.mode = 2; r2.xq_pub = d_pub; r2.kinds = true;
+                    K::DmGlueArgs gs;
+                    gs.ids = d_ids; gs.ptab = d_pt; gs.n_tok = T; gs.k = (int) KK; gs.n_expert = (int) NE;
+                    gs.plan = d_plan; gs.xq = d_xq2; gs.ring_on = true; gs.ring = r2;
+                    K::dec_moe_glue(L, gs, dv[0].scr, d_p4, n, s0);
+                    ck(cudaStreamSynchronize(s0), "staged glue");
+                    K::DmPlan G2;
+                    ck(cudaMemcpy(&G2, d_plan, sizeof G2, cudaMemcpyDeviceToHost), "plan");
+                    size_t badg = 0;
+                    for (int i = 0; i < n; ++i) badg += G2.kind[i] != rk[i] || h_rings[5].kind[i] != rk[i];
+                    badg += h_rings[5].n_cpu != rnc;
+                    std::snprintf(what, sizeof what, "staged glue kinds T=%d", T);
+                    report(what, l, badg, (size_t) n);
+                    cudaFree(d_pt); cudaFree(d_pub); cudaFree(d_p4);
+                }
+                if (bench && !staged.empty())   // the copy over the link alone, by the blocks it launches
+                    for (int blocks : {8, 16, 32, 64}) {
+                        const double us = time_us(s0, 100, [&] {
+                            K::dec_moe_stage(rs, d_stg, stride, (int64_t) L.bytes, blocks, s0);
+                        });
+                        const double mb = (double) staged.size() * (double) L.bytes / 1e6;
+                        std::printf("  bench: staged copy T=%d, %d blobs (%.1f MB), %d blocks: %.1f us, %.1f GB/s\n", T,
+                                    (int) staged.size(), mb, blocks, us, mb * 1e-3 / (us * 1e-6));
+                    }
+                if (bench && !staged.empty())   // the staged groups' compute, by the block rows it launches
+                    for (int rows : {4, 16}) {
+                        const double us = time_us(s0, 100, [&] {
+                            K::native_expert_grouped(L, d_plan->sptr, d_plan->sstart, d_plan->scounts, d_plan->sdst,
+                                                     d_plan->stok, n, n, d_xq2, dv[0].scr, d_pa, s0, rows);
+                        });
+                        std::printf("  bench: staged compute T=%d, %d groups, %d block rows: %.1f us\n", T, (int) staged.size(),
+                                    rows, us);
+                    }
+                for (void* q : {(void*) d_src, (void*) d_kt, (void*) d_stg, (void*) d_res2, (void*) d_plan2, (void*) d_pa,
+                                (void*) d_pb, (void*) d_ba, (void*) d_bb})
+                    cudaFree(q);
+                cudaFreeHost(h_sb);
+                cudaFreeHost(sw);
+                ck(cudaMemcpy(d_plan, &P, sizeof P, cudaMemcpyHostToDevice), "plan back");
             }
 
             // further peers: CPU-held experts split between two more tiers (some held by several: the first tier
