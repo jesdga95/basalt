@@ -69,6 +69,16 @@ public:
     /// DEC_MOE: the residency table ([n_layers * n_expert] slot or -1) and a slot's device address.
     const std::vector<int32_t>& residency() const { return res_; }
     const uint8_t* slot_address(int32_t slot) { return cache_.device_slot(slot); }
+    /// The tier's slots: a prompt-time stage on this card reads its experts there and lends the last ones.
+    const ExpertCache& cache() const { return cache_; }
+
+    /// A prompt-time stage on this card takes slots `first` and up for one prompt: their experts stop being resident,
+    /// and `lent` gets each one's residency index and slot.  No swap may be in flight (apply_pending first).
+    bool lend(int32_t first, std::vector<std::pair<int32_t, int32_t>>& lent, std::string& err);
+    /// Queues the copies that put the lent slots' experts back, from the expert source, on the refill stream.
+    bool give_back(const std::vector<std::pair<int32_t, int32_t>>& lent, std::string& err);
+    /// Waits for `give_back`'s copies and makes the experts resident again; `lent` is cleared.
+    bool give_back_wait(std::vector<std::pair<int32_t, int32_t>>& lent, std::string& err);
 
     /// Starts the peer's share of one layer: the entries i with kind[i] == 2 (x: n_tok rows of n_embd floats).
     /// multi-GPU: with `out` (pinned, portable host rows) the peer writes its rows straight into

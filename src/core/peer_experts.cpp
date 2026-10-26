@@ -416,6 +416,44 @@ bool PeerExperts::copy_to(int64_t layer, int64_t expert, uint8_t* dst, cudaStrea
                                   stream), "copy to the primary", err);
 }
 
+bool PeerExperts::lend(int32_t first, std::vector<std::pair<int32_t, int32_t>>& lent, std::string& err) {
+    lent.clear();
+    if (!pending_.empty() || !evicting_.empty()) { err = "peer experts: swaps are in flight"; return false; }
+    if (first < 0 || first > cache_.slots()) { err = "peer experts: no such slot to lend from"; return false; }
+    for (size_t i = 0; i < res_.size(); ++i)
+        if (res_[i] >= first) {
+            lent.emplace_back((int32_t) i, res_[i]);
+            res_[i] = kNotResident;
+        }
+    return true;
+}
+
+bool PeerExperts::give_back(const std::vector<std::pair<int32_t, int32_t>>& lent, std::string& err) {
+    if (lent.empty()) return true;
+    const auto& lay = basalt::kernels::cpu::expert_layout();
+    On on(device_);
+    for (const auto& [i, slot] : lent) {
+        const int64_t l = i / n_expert_, e = i % n_expert_;
+        const uint8_t* b = src_->blob(l, e);
+        if (b == nullptr) { err = "peer experts: a lent expert has no host copy"; return false; }
+        if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, refill_),
+                "give back", err))
+            return false;
+    }
+    return ck(cudaEventRecord(refill_ev_, refill_), "give back event", err);
+}
+
+bool PeerExperts::give_back_wait(std::vector<std::pair<int32_t, int32_t>>& lent, std::string& err) {
+    if (lent.empty()) return true;
+    {
+        On on(device_);
+        if (!ck(cudaEventSynchronize(refill_ev_), "give back", err)) return false;
+    }
+    for (const auto& [i, slot] : lent) res_[(size_t) i] = slot;
+    lent.clear();
+    return true;
+}
+
 bool PeerExperts::issue_pending(bool wait) {
     if (evicting_.empty()) return true;
     On on(device_);
