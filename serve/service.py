@@ -44,6 +44,9 @@ RATE_SAMPLES = 1024         # (time, generated) samples kept per request: the wi
 LOG_FIRST_LINES = 300        # lines /api/logs returns to a client with none
 LOG_MAX_LINES = 500          # ... and its maximum per answer
 REQUESTS_SHOWN = 12        # finished requests /metrics lists
+# the fastest whole request counts only when big enough that fixed costs do not decide it
+BEST_MIN_OUT = 256          # output tokens, for the best decode rate
+BEST_MIN_READ = 4096        # newly read prompt tokens, for the best prefill rate
 RATE_MIN_SPAN_S = 0.25      # below this span there is no rate yet: use the mean with the span floored
 # diagnostics, off unless the server flag sets them
 DEBUG = False            # --debug: one line per request plus the raw model text
@@ -87,6 +90,8 @@ class Service:
         self.live_reqs: dict[int, tuple[dict, collections.deque]] = {}
         self.request_ctx = threading.local()            # .path, .model: the API path and model name of this request
         self.slot_last: dict[int, dict] = {}            # per slot: context held and draft counts of its last request
+        self.waiting: dict[int, dict] = {}              # single stream: requests waiting for the turn
+        self.best: dict[str, dict] = {}                 # fastest whole request since start: "decode", "prefill"
         self.history = collections.deque(maxlen=500)    # finished requests, newest last
         self.requests_done = 0                           # finished requests since start
         self.last_timings = None                         # last request's timings
@@ -293,7 +298,8 @@ class Service:
         if getattr(self, "telemetry", None) is None:
             from serve.util.telemetry import Telemetry
             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(),
-                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean()},
+                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean(),
+                                                    "slot_tok_s": [r["tok_s"] for r in self.slot_table()[0]]},
                                        gpu_indices=getattr(self, "gpu_indices", None) or [0])
 
     def _tok_s(self):
@@ -364,7 +370,8 @@ class Service:
                     taken.add(st["slot"])
             by_slot = {st["slot"]: (dict(st), rates.get(id(st), [])) for st in running}
             queue = [{"api": st.get("api"), "model": st.get("model"), "prompt_tokens": st.get("prompt_tokens"),
-                      "waited_s": round(now - (st.get("started") or now), 1)} for st in waiting]
+                      "waited_s": round(now - (st.get("started") or now), 1)}
+                     for st in waiting + sorted(self.waiting.values(), key=lambda w: w["started"])]
             last = {k: dict(v) for k, v in self.slot_last.items()}
         reading = [i for i, (st, _) in by_slot.items() if st.get("first_token") is None]
         progress = getattr(self.engine, "progress", None)
@@ -375,7 +382,8 @@ class Service:
             if bd and bd[2] >= held.get("at", 0):      # a batch slot's own counts, when newer than a solo request's
                 held.update(accepted=bd[0], offered=bd[1])
             row = {"id": i, "n_ctx": self.engine.max_context, "is_processing": i in by_slot, "state": "idle",
-                   "api": None, "model": None, "tok_s": 0.0, "generated": 0, "prompt_tokens": 0, "prefill_done": 0,
+                   "api": None, "model": None, "tok_s": 0.0, "generated": 0, "max_tokens": None, "prompt_tokens": 0,
+                   "prefill_done": 0, "reused": None, "ttft_s": None, "draft_len": None,
                    "ctx_used": held.get("ctx", 0), "drafts_offered": held.get("offered"),
                    "drafts_accepted": held.get("accepted")}       # draft counts are the slot's last finished request's
             if i in by_slot:
@@ -383,9 +391,13 @@ class Service:
                 prompt, gen = int(st.get("prompt_tokens") or 0), int(st.get("generated") or 0)
                 decoding = st.get("first_token") is not None
                 done = prompt if decoding else (min(progress[0], prompt) if progress and reading == [i] else None)
+                windows = st.get("windows") or 0
                 row.update(state="decoding" if decoding else "prefill", api=st.get("api"), model=st.get("model"),
-                           tok_s=round(self._rate_of(st, rate), 1), generated=gen, prompt_tokens=prompt,
-                           prefill_done=done, ctx_used=prompt + gen)
+                           tok_s=round(self._rate_of(st, rate), 1), generated=gen, max_tokens=st.get("max_tokens"),
+                           prompt_tokens=prompt, prefill_done=done, ctx_used=prompt + gen, reused=st.get("reused"),
+                           ttft_s=round(st["first_token"] - st["started"], 2) if decoding and st.get("started")
+                           else None,
+                           draft_len=round(st.get("window_tokens", 0) / windows, 2) if windows else None)
             rows.append(row)
         return rows, queue
 
@@ -416,8 +428,23 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else \
             {"now": {"gpus": []}, "history": {}, "static": {"gpus": []}}
-        return {"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN],
+        with self.status_lock:
+            best = {k: dict(v) for k, v in self.best.items()}
+        return {"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN], "best": best,
                 "hardware": tel["now"], "hardware_static": tel["static"], "history": tel["history"]}
+
+    def _note_best(self, r: dict) -> None:
+        """Keep finished request `r` as the best decode or prefill when it is the fastest big enough one.
+        Call with status_lock held."""
+        if (r["output_tokens"] or 0) >= BEST_MIN_OUT and r["decode_tok_s"] and \
+                r["decode_tok_s"] > self.best.get("decode", {}).get("tok_s", 0):
+            self.best["decode"] = {"tok_s": r["decode_tok_s"], "id": r["id"], "time": r["time"],
+                                   "output_tokens": r["output_tokens"]}
+        read = (r["prompt_tokens"] or 0) - (r["reused"] or 0)
+        if read >= BEST_MIN_READ and r["prompt_ms"]:
+            rate = round(read / (r["prompt_ms"] / 1000), 1)
+            if rate > self.best.get("prefill", {}).get("tok_s", 0):
+                self.best["prefill"] = {"tok_s": rate, "id": r["id"], "time": r["time"], "read_tokens": read}
 
     def v1_status(self) -> dict:
         """GET /v1/status: model, context, APIs, activity and last timings, for clients that poll status."""
@@ -703,8 +730,13 @@ class Service:
         par = bool(getattr(self.engine, "batch", 0))
         st = {} if par else self.status
         rate = collections.deque(maxlen=RATE_SAMPLES) if par else self.rate
+        wait_key = object()                             # this request's entry in self.waiting
         with self.status_lock:
             self.status["queued"] += 1
+            if not par:
+                self.waiting[id(wait_key)] = {"api": "anthropic" if path == "/v1/messages" else "openai",
+                                              "model": getattr(self.request_ctx, "model", None) or self.model,
+                                              "prompt_tokens": len(ids), "started": time.time()}
         try:
             # batch slots run requests concurrently, so no fifo
             turn = contextlib.ExitStack()
@@ -724,10 +756,12 @@ class Service:
                 except BaseException:                    # the consumer closed us at a ping: no longer queued
                     with self.status_lock:
                         self.status["queued"] -= 1
+                        self.waiting.pop(id(wait_key), None)
                     raise
                 if not got:                              # cancelled while queued
                     with self.status_lock:
                         self.status["queued"] -= 1
+                        self.waiting.pop(id(wait_key), None)
                     yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
                                    "reasoning_tokens": 0}
                     return
@@ -735,13 +769,14 @@ class Service:
                 try:
                     with self.status_lock:
                         self.status["queued"] -= 1
+                        self.waiting.pop(id(wait_key), None)
                     # restart a dead or unloaded engine; parallel requests serialize this start on the fifo
                     with (self.fifo if par else contextlib.nullcontext()):
                         self.ensure_loaded()
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
-                                  max_tokens=max_new, slot=None,
+                                  max_tokens=max_new, slot=None, reused=None,
                                   api="anthropic" if path == "/v1/messages" else "openai",
                                   model=getattr(self.request_ctx, "model", None) or self.model)
                         if par:
@@ -797,6 +832,12 @@ class Service:
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
+                                if st.get("reused") is None:    # the prefix reuse, once the engine reports it
+                                    run_last = getattr(self.engine, "last", None)
+                                    if isinstance(run_last, dict) and run_last is not engine_last0 \
+                                            and run_last.get("reused") is not None:
+                                        with self.status_lock:
+                                            st["reused"] = min(int(run_last["reused"]), len(ids))
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
                                     yield "event", ev
@@ -911,8 +952,12 @@ class Service:
                             if st.get("slot") is not None:
                                 self.slot_last[st["slot"]] = {"ctx": seen + n, "offered": last.get("drafts_offered"),
                                                               "accepted": last.get("drafts_accepted"), "at": time.time()}
+                            ft = st.get("first_token")
+                            ttft = ft - st["started"] if ft and st.get("started") else None
+                            windows, window_tokens = st.get("windows") or 0, st.get("window_tokens") or 0
+                            dl = window_tokens / windows if windows else None
                             self.history.append({
-                                "id": f"r_{self.requests_done:04d}", "path": path,
+                                "id": f"r_{self.requests_done:04d}", "path": path, "slot": self._slot_of(st),
                                 "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
                                 "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
                                 "prompt_ms": last.get("prompt_ms"),
@@ -920,19 +965,17 @@ class Service:
                                 if n and last.get("generated") and last.get("decode_ms") else None,
                                 "hit_rate": hit_rate, "pcie_share": pcie_share,
                                 "drafts_offered": last.get("drafts_offered"),
-                                "drafts_accepted": last.get("drafts_accepted")})
+                                "drafts_accepted": last.get("drafts_accepted"),
+                                "ttft_s": round(ttft, 2) if ttft is not None else None,
+                                "draft_len": round(dl, 2) if dl is not None else None})
+                            self._note_best(self.history[-1])
                             fresh = getattr(self.engine, "last", None)
                             if fresh is not None and fresh is not before:      # a DONE line arrived for this request
                                 timings = request_timings(seen, n, last)
                                 self.last_timings = dict(timings, at=int(time.time())) if timings else None
                             self.last_request_at = time.time()
                             now = time.time()
-                            el = now - st.get("started", now)
-                            ft = st.get("first_token")
                             rate = n / max(1e-6, now - ft) if ft else 0.0
-                            ttft = ft - st["started"] if ft and st.get("started") else None
-                            windows, window_tokens = st.get("windows") or 0, st.get("window_tokens") or 0
-                            dl = window_tokens / windows if windows else None
                             print(done_line(self._slot_of(st), seen, n, finish, cancel.is_set(), timings, ttft, rate,
                                             dl, hit_rate, pcie_share), flush=True)
                             if finish == "length" and parser.state == "reasoning":

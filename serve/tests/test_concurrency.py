@@ -155,6 +155,8 @@ class SlotRows(Slots):
         self.assertEqual(sorted((r["api"], r["model"]) for r in busy), [("anthropic", "qwen3.8-flash-next"), ("openai", "qwen3.8-flash-next")])
         for r in busy:
             self.assertEqual(r["state"], "decoding")
+            self.assertEqual(r["max_tokens"], 200)
+            self.assertGreaterEqual(r["ttft_s"], 0.0)
             self.assertGreater(r["prompt_tokens"], 0)
             self.assertEqual(r["prefill_done"], r["prompt_tokens"])
             self.assertGreaterEqual(r["tok_s"], 0.0)
@@ -163,6 +165,7 @@ class SlotRows(Slots):
         idle = next(r for r in rows if not r["is_processing"])
         self.assertEqual((idle["state"], idle["api"], idle["model"], idle["tok_s"], idle["generated"], idle["prompt_tokens"]),
                          ("idle", None, None, 0.0, 0, 0))
+        self.assertEqual((idle["max_tokens"], idle["ttft_s"], idle["draft_len"], idle["reused"]), (None,) * 4)
         for t in ts:
             t.join(10)
         self.assertTrue(all(r["state"] == "idle" for r in self.get("/slots")))
