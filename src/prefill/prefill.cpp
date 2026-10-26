@@ -2870,6 +2870,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         if (next_ != nullptr && keep_last_ && c0 + T >= n) continue;   // kept: its later layers run on this card next
+        if (next_ != nullptr && keep_last_ && keep_here && keep_here(p0 + T)) break;   // kept, and the run ends with it
         if (next_ != nullptr) {
             if (T > m.hand_rows || m.hand[hand_buf_] == nullptr) {
                 err = "prefill: the layer split's hand-off buffers are too small for the chunk";

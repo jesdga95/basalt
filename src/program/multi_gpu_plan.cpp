@@ -131,64 +131,162 @@ double ps_bw(const PsCard& c, const PsCard& main) {
     return c.mem_gbps > 0 ? c.mem_gbps : main.mem_gbps > 0 ? main.mem_gbps : kPsRefGbps;
 }
 
-// one stage's chunk of `T` tokens around position `pos` over layers [l0, l1), in ms; `embeds`: the card embeds it
-double ps_stage(const PsCard& c, const PsCard& main, int64_t T, double pos, int l0, int l1, bool embeds) {
+// A card's expert stream over layers [l0, l1) per chunk, in ms, for every range: [l0 * (layers + 1) + l1]
+std::vector<double> ps_link_table(const PsCard& c, int layers) {
+    std::vector<double> t((size_t) (layers + 1) * (size_t) (layers + 1), 0.0);
+    for (int l0 = 0; l0 <= layers; ++l0) {
+        double bytes = 0;
+        for (int l1 = l0; l1 <= layers; ++l1) {
+            if (l1 > l0 && l1 - 1 < (int) c.stream_bytes.size()) bytes += c.stream_bytes[(size_t) (l1 - 1)];
+            t[(size_t) l0 * (size_t) (layers + 1) + (size_t) l1] =
+                c.link_gbps > 0 ? bytes / (kPsLinkEff * c.link_gbps * 1e9) * 1000.0 : 0.0;
+        }
+    }
+    return t;
+}
+
+// one stage's chunk of `T` tokens around position `pos` over layers [l0, l1), in ms; `embeds`: the card embeds it;
+// `link`: its ps_link_table
+double ps_stage(const PsCard& c, const PsCard& main, int64_t T, double pos, int l0, int l1, bool embeds,
+                const std::vector<double>& link, int layers) {
     const double scale = kPsRefGbps / ps_bw(c, main);
     const double us = (double) (l1 - l0) * kPsUsLayer * scale * (1.0 + kPsGrowth * pos) + (embeds ? kPsUsToken * scale : 0.0);
-    double bytes = 0;
-    for (int l = l0; l < l1 && l < (int) c.stream_bytes.size(); ++l) bytes += c.stream_bytes[(size_t) l];
-    const double link = c.link_gbps > 0 ? bytes / (kPsLinkEff * c.link_gbps * 1e9) * 1000.0 : 0.0;
-    return std::max((double) T * us / 1000.0, link);
+    return std::max((double) T * us / 1000.0, link[(size_t) l0 * (size_t) (layers + 1) + (size_t) l1]);
 }
 
 // `bytes` over a card's link, in ms
 double ps_link_ms(const PsCard& c, double bytes) {
     return c.link_gbps > 0 ? bytes / (kPsLinkEff * c.link_gbps * 1e9) * 1000.0 : 0.0;
 }
+
+// The split of `part` over the main card `m` and the tier cards `st` (stage 1 on, in pipeline order), cut at `cuts`
+// (stage k reads [cuts[k - 1], cuts[k] or `layers`)).  The main card reads chunk c's first layers and hands it on once
+// stage 1 is done with the one before; each stage hands on once the next is done with the one before.  The main card
+// keeps the last chunk and reads its later layers once every stage is done.
+double ps_pipeline(const PsCard& m, const std::vector<const PsCard*>& st, const std::vector<const std::vector<double>*>& links,
+                   const std::vector<double>& main_link, const int* cuts, const PsPart& part, int layers) {
+    const size_t ns = st.size();
+    double free_at[kPsMaxStages] = {};   // stage k + 1 takes a chunk from then on
+    double t = 0;
+    for (size_t k = 0; k < ns; ++k) t = std::max(t, st[k]->setup_ms);
+    int64_t at = part.cell0;
+    const size_t n = part.split_chunks.size();
+    for (size_t i = 0; i < n; ++i) {
+        const int64_t T = part.split_chunks[i];
+        const double pos = (double) at + 0.5 * (double) T;
+        const double a = ps_stage(m, m, T, pos, 0, cuts[0], true, main_link, layers) +
+                         (i == 0 ? kPsPleUsToken * (double) T / 1000.0 : 0.0);
+        const double hand = (double) T * (double) part.row_bytes;
+        if (i + 1 < n) {
+            double launch = std::max(t + a + ps_link_ms(m, hand), free_at[0]);
+            t = launch;
+            for (size_t k = 0; k < ns; ++k) {
+                const int l1 = k + 1 < ns ? cuts[k + 1] : layers;
+                const double done = launch + ps_link_ms(*st[k], hand) +
+                                    ps_stage(*st[k], m, T, pos, cuts[k], l1, false, *links[k], layers);
+                if (k + 1 < ns) {
+                    launch = std::max(done + ps_link_ms(*st[k], hand), free_at[k + 1]);
+                    free_at[k] = launch;
+                } else {
+                    free_at[k] = done;
+                }
+            }
+        } else {
+            t = std::max(t + a, free_at[ns - 1]) + (double) part.draft_rows * kPsDraftUsRow / 1000.0 +
+                ps_stage(m, m, T, pos, cuts[0], layers, false, main_link, layers);
+        }
+        at += T;
+    }
+    return t;
+}
 }  // namespace
 
-PsPrice price_prompt_split(const PsCard& main_tier, const PsCard& main_split, const PsCard& peer, const PsPart& part,
-                           int lb_min, int layers) {
+PsPrice price_prompt_split(const PsCard& main_tier, const PsCard& main_split, const std::vector<PsCard>& peers,
+                           const PsPart& part, int max_stages, int layers) {
     PsPrice p;
+    const std::vector<double> tier_link = ps_link_table(main_tier, layers);
     int64_t at = part.cell0;
     for (size_t i = 0; i < part.tier_chunks.size(); ++i) {
         const int64_t T = part.tier_chunks[i];
-        p.tier_ms += ps_stage(main_tier, main_tier, T, (double) at + 0.5 * (double) T, 0, layers, true) +
+        p.tier_ms += ps_stage(main_tier, main_tier, T, (double) at + 0.5 * (double) T, 0, layers, true, tier_link, layers) +
                      (i == 0 ? kPsPleUsToken * (double) T / 1000.0 : 0.0);
         at += T;
     }
-    const size_t n = part.split_chunks.size();
-    if (n < 2) return p;
-    double best = 0;
-    for (int lb = std::max(lb_min, 2); lb < layers; ++lb) {
-        // the main card reads chunk c's first layers, hands it on once the tier card is done with the one before, and
-        // reads on; it keeps the last chunk and reads its later layers once the tier card's last chunk is done
-        double t = part.setup_ms, b_end = 0;
-        at = part.cell0;
-        for (size_t i = 0; i < n; ++i) {
-            const int64_t T = part.split_chunks[i];
-            const double pos = (double) at + 0.5 * (double) T;
-            const double a = ps_stage(main_split, main_split, T, pos, 0, lb, true) +
-                             (i == 0 ? kPsPleUsToken * (double) T / 1000.0 : 0.0);
-            const double hand = (double) T * (double) part.row_bytes;
-            if (i + 1 < n) {
-                const double launch = std::max(t + a + ps_link_ms(main_split, hand), b_end);
-                b_end = launch + ps_link_ms(peer, hand) + ps_stage(peer, main_split, T, pos, lb, layers, false);
-                t = launch;
-            } else {
-                t = std::max(t + a, b_end) + (double) part.draft_rows * kPsDraftUsRow / 1000.0 +
-                    ps_stage(main_split, main_split, T, pos, lb, layers, false);
-            }
-            at += T;
+    const int s_max = std::min({max_stages, (int) peers.size() + 1, kPsMaxStages});
+    p.stage_ms.assign((size_t) std::max(s_max + 1, 0), 0.0);
+    p.stage_cuts.assign(p.stage_ms.size(), {});
+    if (part.split_chunks.size() < 2 || s_max < 2) return p;
+    const std::vector<double> main_link = ps_link_table(main_split, layers);
+    std::vector<std::vector<double>> peer_link;
+    for (const PsCard& c : peers) peer_link.push_back(ps_link_table(c, layers));
+    for (int s = 2; s <= s_max; ++s) {
+        // stage k on peers[s - 1 - k]
+        std::vector<const PsCard*> st;
+        std::vector<const std::vector<double>*> links;
+        for (int k = 1; k < s; ++k) {
+            st.push_back(&peers[(size_t) (s - 1 - k)]);
+            links.push_back(&peer_link[(size_t) (s - 1 - k)]);
         }
-        if (p.lb == 0 || t < best) {
-            best = t;
-            p.lb = lb;
+        auto lo_of = [&](int k) { return std::max(2, st[(size_t) k]->layer_lo); };   // stage k + 1's first layer, at least
+        auto hi_of = [&](int k) { return st[(size_t) k]->layer_hi > 0 ? std::min(st[(size_t) k]->layer_hi, layers) : layers; };
+        if (hi_of(s - 2) < layers) continue;   // the last stage ends at the last layer
+        // every cut in ascending order: cut k is stage k + 1's first layer, after cut k - 1 and before both cards' ends
+        int cuts[kPsMaxStages] = {};
+        double best = 0;
+        bool found = false;
+        std::vector<int> best_cuts;
+        auto rec = [&](auto&& self, int k) -> void {
+            if (k == s - 1) {
+                const double t = ps_pipeline(main_split, st, links, main_link, cuts, part, layers);
+                if (!found || t < best) {
+                    best = t;
+                    found = true;
+                    best_cuts.assign(cuts, cuts + (s - 1));
+                }
+                return;
+            }
+            const int from = std::max(lo_of(k), k > 0 ? cuts[k - 1] + 1 : 2);
+            // stage k (the main card's at k == 0) must end inside its card's layers; stage k + 1 needs a layer
+            const int to = std::min(k > 0 ? hi_of(k - 1) : layers - 1, layers - (s - 1 - k));
+            for (int c = from; c <= to; ++c) {
+                cuts[k] = c;
+                self(self, k + 1);
+            }
+        };
+        rec(rec, 0);
+        if (!found) continue;
+        p.stage_ms[(size_t) s] = best;
+        p.stage_cuts[(size_t) s] = best_cuts;
+        if (p.stages == 0 || best < p.split_ms) {
+            p.split_ms = best;
+            p.stages = s;
+            p.cuts = best_cuts;
         }
     }
-    p.split_ms = best;
-    p.split = p.lb > 0 && best < kPsMargin * p.tier_ms;
+    p.split = p.stages > 0 && p.split_ms < kPsMargin * p.tier_ms;
     return p;
+}
+
+std::vector<size_t> prompt_split_order(const std::vector<double>& mem_gbps) {
+    std::vector<size_t> order(mem_gbps.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return mem_gbps[a] > mem_gbps[b]; });
+    return order;
+}
+
+std::vector<std::pair<int, int>> prompt_split_windows(const PsPrice& ref, size_t n_peers, int margin, int layers) {
+    std::vector<std::pair<int, int>> w(n_peers, {0, 0});
+    for (size_t s = 2; s < ref.stage_ms.size(); ++s) {
+        if (ref.stage_ms[s] <= 0 || !(ref.stage_ms[s] < kPsMargin * ref.tier_ms) || ref.stage_cuts[s].size() + 1 != s) continue;
+        const std::vector<int>& c = ref.stage_cuts[s];
+        for (size_t k = 1; k < s && s - 1 - k < n_peers; ++k) {
+            const int lo = std::max(2, c[k - 1] - margin);
+            const int hi = k + 1 < s ? std::min(layers, c[k] + margin) : layers;
+            std::pair<int, int>& x = w[s - 1 - k];
+            x = x.second == 0 ? std::make_pair(lo, hi) : std::make_pair(std::min(x.first, lo), std::max(x.second, hi));
+        }
+    }
+    return w;
 }
 
 }  // namespace basalt::program

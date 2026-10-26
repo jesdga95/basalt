@@ -176,6 +176,9 @@ public:
 
     /// Checked before every chunk: true stops the prompt early (`run` returns false with err "cancelled").
     std::function<bool()> should_stop;
+    /// Layer split, a first stage with `set_keep_last`: checked at each chunk's end (the position reached) before the
+    /// chunk is handed on; true keeps that chunk as the last one and ends the run there.
+    std::function<bool(int64_t done)> keep_here;
 
     /// The vision path: HOST rows (n_embd floats) indexed by absolute position, read in place of the token
     /// embedding where non-null (an image's <|image_pad|> cells).  Null (default): every position embeds its token.
