@@ -38,6 +38,7 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/program/auto_plan.hpp"
+#include "basalt/program/community_row.hpp"
 #include "basalt/program/gpu_select.hpp"
 #include "basalt/program/multi_gpu_plan.hpp"
 #include "basalt/program/tokenizer.hpp"
@@ -6745,9 +6746,9 @@ int main(int argc, char** argv) {
                 for (const char* pre : {"NVIDIA-", "UD-"})
                     if (quant_label.rfind(pre, 0) == 0) quant_label.erase(0, std::strlen(pre));
                 if (quant_label.empty()) quant_label = "unknown";
-                for (int d : {0, o.peer_device >= 1 ? o.peer_device : 0}) {
+                for (int d : basalt::program::engine_gpu_order(o.peer_device, o.peer_devices,
+                                                               multi_gpu ? split_devs : std::vector<int>())) {
                     char bus[32] = {};
-                    if (!gpu_ids.empty() && d == 0) continue;
                     if (cudaDeviceGetPCIBusId(bus, sizeof bus, d) == cudaSuccess)
                         gpu_ids += (gpu_ids.empty() ? "" : ",") + std::string(bus);
                 }
