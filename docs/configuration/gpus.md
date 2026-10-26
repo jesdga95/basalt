@@ -76,8 +76,9 @@ and the experts each card holds, and reads it across the cards only when that is
 order of memory bandwidth, the fastest reading the last layers. At start each card gets the layers the stage counts
 worth it for a prompt of the context's length (up to 131,072 tokens) give it, plus a few. The start and request lines
 begin with `prompt split:` and print the prices. The chunks are the main card's own, so a part of one chunk (up to
-32,768 tokens) stays on the main card. On three or more cards it is off until measured on such a set; the start line
-prints what it would cost. Off with `--peer-exclusive`, without the RAM copy of the experts, with KV streaming, a
+32,768 tokens) stays on the main card. On three or more cards it runs when they all match (memory bandwidth and VRAM
+within 10%); on three or more unlike cards it is off until measured on such a set, and the start line prints what it
+would cost. Off with `--peer-exclusive`, without the RAM copy of the experts, with KV streaming, a
 control vector, experts other than NVFP4 (the price is fitted to those), or when RAM or a tier's slots are short. A
 prompt that arrives while other slots decode is read on the main card beside them, as before. A much shorter request
 that arrives during a read across the cards gets its turn at the end of the main card's current chunk: the main card

@@ -1403,10 +1403,13 @@ int main(int argc, char** argv) {
     // chunk more than the experts it saves the main card's link, so it keeps to the short chunks it helps
     const bool peer_streamed_share = chosen_cards.size() >= 2 && basalt::program::cards_alike(chosen_cards[0], chosen_cards[1]);
     // the prompt-time layer split over the expert tier cards (PromptStage), and the most stages it may use, the main
-    // card's included: on three or more cards none until measured there (--exp prompt_split=N: up to N stages).  With
-    // --batch a read splits only while no slot decodes.
+    // card's included: every card on two cards or on three or more alike ones, none on three or more unlike cards
+    // until measured on such a set.  With --batch a read splits only while no slot decodes.
     bool split_want = o.serve && o.peer_device >= 1;
-    const int split_cap = o.peer_devices.size() <= 1 ? 2 : (int) basalt::core::exp_flag("prompt_split", 1.0);
+    bool split_alike = true;
+    for (size_t i = 1; i < chosen_cards.size(); ++i)
+        split_alike = split_alike && basalt::program::cards_alike(chosen_cards[0], chosen_cards[i]);
+    const int split_cap = o.peer_devices.size() <= 1 ? 2 : split_alike ? (int) o.peer_devices.size() + 1 : 1;
     basalt::core::set_peer_portable(o.peer_device >= 1 || !o.layer_split.empty());   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     // Chunks below this take the routed-only path with the peer card computing its experts' rows; from it on
     // every expert streams through the ring.  The routed-only path costs ~0.3 ms per token, streaming ~0.12 ms
@@ -4881,11 +4884,11 @@ int main(int argc, char** argv) {
             basalt::log::info("basalt generate", "prompt split: off (a %lld-token context is too short for it)",
                               (long long) o.max_context);
         } else if (split_cap < 2) {
-            basalt::log::info("basalt generate", "prompt split: off on %zu cards until measured there (a %lld-token prompt: "
-                                 "%.0f ms on CUDA0, %.0f ms with %s%s; --exp prompt_split=%d reads across them)",
+            basalt::log::info("basalt generate", "prompt split: off on %zu unlike cards until measured there (a %lld-token "
+                                 "prompt: %.0f ms on CUDA0, %.0f ms with %s%s)",
                               pstages.size() + 1, (long long) longest, ref_all.price.tier_ms, ref_all.price.split_ms,
                               split_layers_text(ref_all.price.stages, ref_all.price.cuts).c_str(),
-                              split_stages_text(ref_all.price).c_str(), all);
+                              split_stages_text(ref_all.price).c_str());
         } else if (!ref.price.split) {
             basalt::log::info("basalt generate", "prompt split: off (a %lld-token prompt: %.0f ms on CUDA0, %.0f ms across%s)",
                               (long long) longest, ref.price.tier_ms, ref.price.split_ms, split_stages_text(ref.price).c_str());
