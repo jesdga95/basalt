@@ -10550,11 +10550,6 @@ int main(int argc, char** argv) {
             if (apply_thr.joinable()) apply_thr.join();
             if (copy_live) src.commit_exchanges();   // swaps applied early: the rest of their copies
             copy_live = false;
-            if (!xq_drain()) {   // no swap stays in flight between requests
-                std::printf("ERR an adaptive refill failed\n");
-                return 1;
-            }
-            xq_saturated = false;   // the next request starts at the base cap
             if (ppl != nullptr && !ppl->finish(err)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
@@ -10634,6 +10629,12 @@ int main(int argc, char** argv) {
                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
                         (long long) req_offload);
             std::fflush(stdout);
+            // no swap stays in flight between requests: the last round's copies land once the reply is out
+            if (!xq_drain()) {
+                std::printf("ERR an adaptive refill failed\n");
+                return 1;
+            }
+            xq_saturated = false;   // the next request starts at the base cap
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = ram_out ? false : in_slot ? !cancelled && (int64_t) live.size() == p
                                     : !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
