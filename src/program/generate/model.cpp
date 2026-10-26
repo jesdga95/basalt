@@ -194,6 +194,7 @@ int model(Context& context) {
     std::vector<std::pair<int32_t, int32_t>> profile_loaded;
     if (!o.expert_profile_save.empty()) profile_loaded = profile;
 
+    context.native_embed = &native_embed;
     context.g = &g;
     context.K = &K;
     context.skip = &skip;

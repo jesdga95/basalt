@@ -11,6 +11,7 @@ from unittest import mock
 from serve.engine import modelfile
 from serve.server import engine_args, gpus_in_play
 from model_file import ModelFile, ModelWriter  # noqa: E402
+from model_adapter import write_adapter  # noqa: E402
 
 META = {"name": "tiny-basalt",
         "sampling": {"temperature": 0.7, "top_p": 0.9}}
@@ -26,7 +27,9 @@ class Tmp(unittest.TestCase):
         patch = mock.patch.object(modelfile, "cache_root", lambda: self.dir / "cache")
         patch.start()
         self.addCleanup(patch.stop)
-        self.engine_bin = self.dir / "bin" / "basalt"
+        exe = ".exe" if sys.platform == "win32" else ""
+        self.engine_bin = self.dir / "bin" / ("basalt" + exe)
+        self.vision_bin = self.engine_bin.with_name("basalt-vision" + exe)
         self.engine_bin.parent.mkdir()
         self.engine_bin.write_text("")
 
@@ -103,6 +106,78 @@ class Derivation(Tmp):
         self.assertFalse((self.dir / "cache").exists())
 
 
+class AdapterCatalog(Tmp):
+    def adapter(self, filename, name=None):
+        path = self.dir / filename
+        write_adapter(path, {"some.native.target": ([1], 0, b"\0" * 4)}, name=name)
+        return str(path)
+
+    def test_ordered_compositions_and_alias_leave_base_first(self):
+        path = self.build()
+        a = self.adapter("a.basalt", "alpha")
+        b = self.adapter("b.basalt", "beta")
+        cfg = modelfile.model_config(path, str(self.engine_bin),
+                                     adapters=[[a], [b, a], [a, b]], alias="base")
+        self.assertEqual(cfg["model_name"], "base")
+        self.assertEqual(cfg["model_names"], ["base", "alpha", "beta+alpha", "alpha+beta"])
+
+    def test_missing_or_empty_names_use_file_stems(self):
+        path = self.build(meta={"name": ""})
+        a = self.adapter("unnamed.basalt")
+        b = self.adapter("empty.basalt", "")
+        cfg = modelfile.model_config(path, str(self.engine_bin), adapters=[[a], [b]])
+        self.assertEqual(cfg["model_names"], ["tiny", "unnamed", "empty"])
+
+    def test_base_only_catalog_and_alias(self):
+        path = self.build()
+        self.assertEqual(modelfile.model_config(path, str(self.engine_bin))["model_names"], ["tiny-basalt"])
+        cfg = modelfile.model_config(path, str(self.engine_bin), alias="named-base")
+        self.assertEqual((cfg["model_name"], cfg["model_names"]), ("named-base", ["named-base"]))
+
+    def test_duplicate_names_are_rejected_before_extraction(self):
+        path = self.build()
+        a = self.adapter("a.basalt", "same")
+        b = self.adapter("b.basalt", "same")
+        for groups, alias in (([[a], [b]], None), ([[a]], "same"), ([[a], [a]], None)):
+            with self.subTest(groups=groups, alias=alias), self.assertRaises(ValueError):
+                modelfile.model_config(path, str(self.engine_bin), adapters=groups, alias=alias)
+            self.assertFalse((self.dir / "cache").exists())
+
+    def test_composite_name_collision_is_rejected(self):
+        path = self.build()
+        a = self.adapter("a.basalt", "a")
+        b = self.adapter("b.basalt", "b")
+        ab = self.adapter("ab.basalt", "a+b")
+        with self.assertRaises(ValueError):
+            modelfile.model_config(path, str(self.engine_bin), adapters=[[a, b], [ab]])
+        self.assertFalse((self.dir / "cache").exists())
+
+    def test_base_filename_alias_is_reserved_even_with_alias(self):
+        path = self.build()
+        a = self.adapter("a.basalt", Path(path).name)
+        with self.assertRaises(ValueError):
+            modelfile.model_config(path, str(self.engine_bin), adapters=[[a]], alias="base")
+        self.assertFalse((self.dir / "cache").exists())
+
+    def test_malformed_groups_and_non_adapters_are_rejected_before_extraction(self):
+        path = self.build()
+        for groups in ([], [None], [[]], ["adapter.basalt"], [[None]], [[1]], [[""]], [[" "]], [[path]]):
+            with self.subTest(groups=groups), self.assertRaises(ValueError):
+                modelfile.model_config(path, str(self.engine_bin), adapters=groups)
+            self.assertFalse((self.dir / "cache").exists())
+
+    def test_invalid_adapter_metadata_is_rejected(self):
+        path = self.build()
+        adapter = self.dir / "bad.basalt"
+        w = ModelWriter(str(adapter))
+        w.add_bytes("meta", b'{"format":"basalt","kind":"adapter","version":1}')
+        w.add_bytes("adapter/data", b"\0" * 4)
+        w.close()
+        with self.assertRaises(ValueError):
+            modelfile.model_config(path, str(self.engine_bin), adapters=[[str(adapter)]])
+        self.assertFalse((self.dir / "cache").exists())
+
+
 class Peer(Tmp):
     def test_no_gpu_flag_is_added(self):
         # the engine picks each card's role from --gpu, which the server passes after resolving it
@@ -113,7 +188,7 @@ class Peer(Tmp):
 
     def test_vision_tells_the_engine(self):
         path = self.build(vision=True)
-        (self.engine_bin.parent / "basalt-vision").write_text("")
+        self.vision_bin.write_text("")
         cfg = modelfile.model_config(path, str(self.engine_bin), vision=True)
         self.assertIn("vision", cfg)
         self.assertIn("--vision", cfg["args"])
@@ -141,7 +216,7 @@ class Peer(Tmp):
 class Vision(Tmp):
     def test_sidecar_beside_the_engine_bin_and_sections_unpacked(self):
         path = self.build(vision=True)
-        side = self.engine_bin.parent / "basalt-vision"
+        side = self.vision_bin
         side.write_text("")
         v = modelfile.model_config(path, str(self.engine_bin), vision=True)["vision"]
         self.assertEqual(v["vision_bin"], str(side.resolve()))
@@ -151,7 +226,7 @@ class Vision(Tmp):
 
     def test_off_by_default(self):
         path = self.build(vision=True)
-        (self.engine_bin.parent / "basalt-vision").write_text("")
+        self.vision_bin.write_text("")
         cfg = modelfile.model_config(path, str(self.engine_bin))
         self.assertNotIn("vision", cfg)
         self.assertNotIn("--vision", cfg["args"])
@@ -185,7 +260,7 @@ class Vision(Tmp):
 
     def test_error_when_the_model_has_no_projector(self):
         path = self.build(vision=False)
-        (self.engine_bin.parent / "basalt-vision").write_text("")
+        self.vision_bin.write_text("")
         with self.assertRaisesRegex(ValueError, "projector"):
             modelfile.model_config(path, str(self.engine_bin), vision="cpu")
 

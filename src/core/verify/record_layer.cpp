@@ -56,12 +56,13 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
             copy_from_mapped(v_.ple_, v_.m_ple_, (int64_t) T * N, cs);
         }
         float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
-        const bool ple_batch_kv = n > 1 && ss.ple.w.key_bf16 != nullptr &&
+        const bool have_ple_key = ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr;
+        const bool ple_batch_kv = n > 1 && have_ple_key &&
                                   ss.ple.w.value_bf16 != nullptr;
         // the rows' write, post-ops, history advance and snapshots in two launches, the value
         // projection on the side stream beside the key's
         // (one row too: there the multi-row GEMVs are ple_block's own)
-        const bool ple_win = ple_batch_kv || (n == 1 && ss.ple.w.key_bf16 != nullptr && ss.ple.w.value_bf16 != nullptr);
+        const bool ple_win = ple_batch_kv || (n == 1 && have_ple_key && ss.ple.w.value_bf16 != nullptr);
         if (v_.batch_rec_) v_.batch_seg_ple_ = ple_win;
         cudaStream_t pside = v_.sh_hi_ != nullptr ? v_.sh_hi_ : v_.sh_cs_;
         const bool ple_fork = ple_win && pside != nullptr && v_.ev_fork_ != nullptr && v_.ev_join_ != nullptr;
@@ -77,8 +78,14 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
                                               v_.z_, N, N, N, n, pside);
                     cudaEventRecord(v_.ev_join_, pside);
                 }
-                bf16_gemv_fp32_mmvf_multi(v_.ple_, N, ss.ple.w.key_bf16,
-                                          v_.xn_, HC * N, N, HC * N, n, cs);
+                if (ss.ple.w.key_bf16 != nullptr) {
+                    bf16_gemv_fp32_mmvf_multi(v_.ple_, N, ss.ple.w.key_bf16,
+                                              v_.xn_, HC * N, N, HC * N, n, cs);
+                } else {
+                    native_quantize_q8_1(v_.ple_, v_.xq_, (int) N, n, cs);
+                    native_mmvq(ss.ple.w.key_native_type, ss.ple.w.key_native_data, v_.xq_,
+                                v_.xn_, (int) N, (int) (HC * N), n, cs);
+                }
                 if (ple_fork) cudaStreamWaitEvent(cs, v_.ev_join_, 0);
                 else bf16_gemv_fp32_mmvf_multi(v_.ple_, N, ss.ple.w.value_bf16,
                                                v_.z_, N, N, N, n, cs);

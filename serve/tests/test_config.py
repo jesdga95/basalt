@@ -82,6 +82,23 @@ class ConfigFile(unittest.TestCase):
         here = Path(p).resolve().parent
         self.assertEqual(argv, ["--model", str(here / "m" / "x.basalt"), "--tokenizer", str(here / "tok")])
 
+    def test_adapter_groups_resolve_paths_relative_to_config(self):
+        p = conf({"server": {"adapter": [["first/a.basalt", "b.basalt"], ["c.basalt"]]}})
+        a = parse_settings(build_parser(), ["--config", p])[0]
+        here = Path(p).resolve().parent
+        self.assertEqual(a.adapters, [[str(here / "first" / "a.basalt"), str(here / "b.basalt")],
+                                      [str(here / "c.basalt")]])
+
+    def test_adapter_groups_require_nonempty_lists_of_paths(self):
+        for value in (None, [], {}, "a.basalt", ["a.basalt"], [[]], [None], [[None]], [[True]], [[1]],
+                      [[""]], [[" "]], [["a.basalt"], []]):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                load_config_file(conf({"server": {"adapter": value}}), build_parser())
+        with self.assertRaises(ValueError):
+            load_config_file(conf({"adapter": [["a.basalt"]]}), build_parser())
+        with self.assertRaises(ValueError):
+            load_config_file(conf({"engine": {"adapter": [["a.basalt"]]}}), build_parser())
+
     def test_errors(self):
         ap = build_parser()
         for obj, msg in (({"spec": 7}, "not the key"),
@@ -143,6 +160,14 @@ class Precedence(unittest.TestCase):
         self.assertEqual(a.cors_origin, ["http://a"])
         a, *_ = parse(["--cors-origin", "http://b"], {"server": {"cors-origin": ["http://a"]}})
         self.assertEqual(a.cors_origin, ["http://b"])
+
+    def test_cli_adapter_groups_replace_all_config_groups_in_order(self):
+        cfg = {"server": {"adapter": [["old-a.basalt", "old-b.basalt"], ["old-c.basalt"]]}}
+        a = parse(["--adapter", "b.basalt", "a.basalt", "--adapter", "c.basalt"], cfg)[0]
+        self.assertEqual(a.adapters, [["b.basalt", "a.basalt"], ["c.basalt"]])
+        self.assertIsNone(parse([])[0].adapters)
+        with self.assertRaises(SystemExit):
+            parse(["--adapter"])
 
     def test_switch_true_and_false(self):
         self.assertTrue(parse([], {"server": {"lazy": True}})[0].lazy)
@@ -365,6 +390,8 @@ class EveryOption(unittest.TestCase):
             # grammar and answer-room are on by default: their no- forms differ (test_grammar, test_answer_room_switch)
             if name in ("api-key", "engine-bin", "grammar", "answer-room"):
                 continue
+            if name == "adapter":                        # compositions have dedicated path and precedence tests
+                continue
             v = "localhost" if name == "host" else self.sample(act)
             if isinstance(act, argparse._AppendAction):
                 cli, cfgv = ["--" + name, "x"], ["x"]
@@ -446,6 +473,13 @@ class Startup(unittest.TestCase):
         r = subprocess.run([sys.executable, "-m", "serve.server", "--config", conf(cfg), *own_port, *argv], cwd=ROOT,
                            capture_output=True, text=True, timeout=60, env=os.environ)
         return r.returncode, r.stderr
+
+    def test_adapters_need_a_real_model_even_with_mock_engine(self):
+        for cfg, argv in (({}, ["--adapter", "a.basalt"]),
+                          ({"server": {"mock-engine": True, "adapter": [["a.basalt"]]}}, [])):
+            with self.subTest(cfg=cfg, argv=argv):
+                code, _ = self.run_server(cfg, *argv)
+                self.assertEqual(code, 2)
 
     def test_requirements_apply_to_the_file(self):
         code, err = self.run_server({})

@@ -324,7 +324,8 @@ add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/exper
   src/core/mtp/draft.cpp
   src/core/mtp/stores.cpp
   src/core/mtp/batching.cpp
-  src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/conversation_store.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp)
+  src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/conversation_store.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp
+  src/core/runtime_adapters.cpp)
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(engine PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
 if(BUILD_TESTING)
@@ -412,6 +413,18 @@ if(BUILD_TESTING)
   basalt_embed_manifest(model_adapter_test)
   basalt_cpu_test(NAME model_adapter_test COMMAND model_adapter_test)
   set_tests_properties(model_adapter_test PROPERTIES TIMEOUT 60)
+  add_executable(runtime_adapters_validation_test src/core/runtime_adapters_validation_test.cpp)
+  target_link_libraries(runtime_adapters_validation_test PRIVATE engine)
+  basalt_cpu_test(NAME runtime_adapters_validation_test COMMAND runtime_adapters_validation_test)
+  set_tests_properties(runtime_adapters_validation_test PROPERTIES TIMEOUT 60)
+  add_executable(hc8_refresh_test tests/cuda/hc8_refresh_test.cpp)
+  target_link_libraries(hc8_refresh_test PRIVATE engine)
+  basalt_gpu_test(NAME hc8_refresh_test COMMAND hc8_refresh_test)
+  set_tests_properties(hc8_refresh_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+  add_executable(mtp_head_refresh_test tests/cuda/mtp_head_refresh_test.cpp)
+  target_link_libraries(mtp_head_refresh_test PRIVATE engine)
+  basalt_gpu_test(NAME mtp_head_refresh_test COMMAND mtp_head_refresh_test)
+  set_tests_properties(mtp_head_refresh_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   # a PLE key held unquantized in the dense index stays in the arena; a quantized key row loads as before
   add_executable(native_dense_ple_key_test tests/core/native_dense_ple_key_test.cpp)
   target_link_libraries(native_dense_ple_key_test PRIVATE engine)

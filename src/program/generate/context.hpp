@@ -2,6 +2,8 @@
 
 #include "helpers.hpp"
 
+#include "basalt/core/runtime_adapters.hpp"
+
 namespace basalt::program::generate {
 
 // Startup phases keep their resources on the stack until the following phases return.
@@ -12,6 +14,7 @@ struct Context {
     std::string* ppl_out = nullptr;
     std::vector<basalt::program::GpuCard>* chosen_cards = nullptr;
     basalt::core::ModelSources* srcs = nullptr;
+    basalt::core::RuntimeAdapters* adapters = nullptr;
     basalt::core::ModelFile* model_file = nullptr;
     const basalt::core::PackFiles* pack_files = nullptr;
     const basalt::core::ExpertFiles* expert_files = nullptr;
@@ -75,6 +78,7 @@ struct Context {
     const basalt::core::QsaState *const* mtp_kv = nullptr;
     const int64_t* n_vocab = nullptr;
     std::optional<basalt::program::grammar::PackVocab>* grammar_vocab = nullptr;
+    basalt::core::NativeEmbed* native_embed = nullptr;
     basalt::core::NativeHead* native_head = nullptr;
     basalt::core::NativeHead* mtp_head = nullptr;
     float ** d_logits = nullptr;

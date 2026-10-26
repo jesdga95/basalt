@@ -16,10 +16,18 @@ int run(int argc, char** argv) {
     if (const auto code = cli::prepare_model_process(o)) return *code;
     basalt::core::ModelSources srcs;
     basalt::core::ModelFile model_file;
+    basalt::core::RuntimeAdapters adapters;
     {
         std::string merr;
         if (!model_file.open(o.model, merr) || !model_file.load_meta(merr) || !model_file.register_gguf_view(merr)) {
             return fatal_start_error("--model: " + merr);
+        }
+        if (!o.adapters.empty() && !o.serve) {
+            basalt::log::error("basalt generate", "--adapter requires --serve");
+            return 2;
+        }
+        if (!adapters.open(model_file, o.adapters, merr)) {
+            return fatal_start_error("--adapter: " + merr);
         }
         basalt::core::model_sources(model_file, srcs);
         if (srcs.dense.empty() || srcs.dense_index.empty() || srcs.experts.empty() || srcs.experts_layout.empty()) {
@@ -313,6 +321,7 @@ int run(int argc, char** argv) {
     context.ppl_out = &ppl_out;
     context.chosen_cards = &chosen_cards;
     context.srcs = &srcs;
+    context.adapters = &adapters;
     context.model_file = &model_file;
     context.pack_files = &pack_files;
     context.expert_files = &expert_files;

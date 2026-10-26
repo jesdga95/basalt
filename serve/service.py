@@ -70,9 +70,30 @@ class Service:
     on_loaded = None                                    # called after each weights load or wake this service ran
     boot_error = None                                   # the start-up load's failure, for the requests queued behind it
 
+    @property
+    def model(self) -> str:
+        """The canonical model selected by this request's thread, or the base model."""
+        return self.model_names[getattr(self.request_ctx, "model_id", 0)]
+
+    def reset_request(self) -> None:
+        self.request_ctx.__dict__.clear()
+
+    def select_model(self, name: str) -> None:
+        """Resolve a public name to a trusted index; a filename alias always selects the base."""
+        if not isinstance(name, str):
+            raise ValueError("model not found")
+        try:
+            index = self.model_names.index(name)
+        except ValueError:
+            if name not in self.served_names():
+                raise ValueError("model not found") from None
+            index = 0
+        self.request_ctx.model_id = index
+        self.request_ctx.model = self.model_names[index]
+
     def served_names(self) -> list[str]:
-        """The model names a request may use: the one /v1/models lists, and the model file's own name."""
-        names = [self.model]
+        """Canonical model names and the base model file's own name."""
+        names = list(self.model_names)
         path = getattr(self.engine, "model_path", None)
         if isinstance(path, str) and path:
             names.append(path.replace("\\", "/").rsplit("/", 1)[-1])
@@ -80,8 +101,14 @@ class Service:
 
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True):
-        self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+                 fit_max_tokens: bool = False, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True,
+                 model_names: list[str] | None = None):
+        self.engine, self.tok, self.template, self.vision = engine, tokenizer, template, vision
+        self.model_names = list(model_names) if model_names is not None else [model_name]
+        if not self.model_names or any(not isinstance(n, str) or not n for n in self.model_names):
+            raise ValueError("model_names must contain nonempty model names")
+        if len(set(self.model_names)) != len(self.model_names):
+            raise ValueError("model_names must be unique")
         self.literals = literal_tags(control_literals(tokenizer))   # control texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # clamp the output cap instead of a 400
         self.grammar = grammar                        # the `grammar` option: every tool or JSON request gets one
@@ -890,6 +917,10 @@ class Service:
         if self.sampling_defaults:     # the request's own fields win
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**self.sampling_defaults, **req_values}
+        if len(self.model_names) > 1:
+            sampling = {**(sampling or {}), "_model_id": getattr(self.request_ctx, "model_id", 0)}
+        elif "_model_id" in (sampling or {}):
+            sampling = {k: v for k, v in sampling.items() if k != "_model_id"}
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         thinking_n = 0                                 # tokens written while thinking
@@ -1168,6 +1199,7 @@ class Service:
                             dl = window_tokens / windows if windows else None
                             self.history.append({
                                 "id": f"r_{self.requests_done:04d}", "path": path, "slot": self._slot_of(st),
+                                "model": st.get("model"),
                                 "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
                                 "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
                                 "prompt_ms": last.get("prompt_ms"),

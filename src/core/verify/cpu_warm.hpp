@@ -36,6 +36,8 @@ struct CpuWarm {
 
 namespace verify_detail {
 void warm_job(void* ctx, int w, int W, const std::atomic<bool>& stop);
+bool router_codes_layer(const WeightRef* w, const ModelGeometry& g, std::vector<uint16_t>& src,
+                        int8_t* q8, float* s8, uint8_t* q4, float* s4, std::string& err);
 bool router_codes(const WeightTable& wt, const ModelGeometry& g, std::vector<int8_t>* q8, std::vector<float>* s8,
                   std::vector<uint8_t>* q4, std::vector<float>* s4);
 bool warm_router(const std::vector<int8_t>& q, const std::vector<float>& sc, int8_t** rq, float** rs);

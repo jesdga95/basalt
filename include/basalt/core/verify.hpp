@@ -38,6 +38,7 @@
 #include <chrono>
 #include <map>
 #include <cstdint>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -151,6 +152,10 @@ public:
     /// `max_t` <= kVerifyMaxT.  `head` may be null (the canonical head is then run per token).
     bool init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
               const NativeHead* head, int max_t, std::string& err);
+    /// Refresh this stage's derived weights in place after WT and NativeHead uploads have completed. All inference,
+    /// commit and peer work must be drained. Does not forward to next_: call once for each stage. Restores the caller's
+    /// device and completes all copies before returning; graph pointers and recurrent state remain unchanged.
+    bool refresh_weights(const std::set<std::string>& changed, std::string& err);
     /// The window capacity in rows given to init.  A batch planner must never build a window with more rows than this;
     /// kVerifyMaxT only bounds the graphs, not this verifier.
     int max_t() const { return max_t_; }

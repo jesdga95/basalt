@@ -13,6 +13,7 @@ namespace basalt::program {
 
 struct Options {
     std::string model;                ///< --model: the .basalt file every loader reads from
+    std::vector<std::vector<std::string>> adapters; ///< --adapter: ordered adapter groups (repeatable)
     std::string dump_hc8;             ///< --dump-hc8: write the 8-bit hyper-connection copies here, then exit
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;

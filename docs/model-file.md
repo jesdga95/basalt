@@ -80,10 +80,32 @@ A standalone adapter is a `.basalt` file with `meta.kind = "adapter"`, a version
 `adapter/data` section. The outer `BASALTMF` version remains **1**. Model files without `meta.kind` mean `"model"`;
 adapters are not standalone models and cannot be passed as `--model` or converter base packs.
 
-This is the storage interface, not runtime attachment or model switching. It exposes replacement tensor ranges
-and exact encoded byte reads without loading a base model. It does not validate a base model's identity or
-geometry, rebuild derived weight copies, or attach replacements to inference. Runtime binding must check those
-contracts separately. Descriptive top-level metadata does not change replacement semantics.
+The storage reader exposes replacement ranges and exact encoded bytes without loading a base model.
+Descriptive top-level metadata does not change replacement semantics.
+
+### Runtime compositions
+
+The server keeps the base model and named adapter compositions in one engine:
+
+```sh
+python -m serve.server --model base.basalt \
+  --adapter edit.basalt --adapter edit.basalt style.basalt
+```
+
+Each `--adapter` group adds one model to `/v1/models`, named by joining the adapters' names with `+`
+(file stems when unnamed). Requests select it through `model`; `--alias` names the base model.
+Each group overlays the base independently. Within a group, the last replacement for a tensor wins.
+Config syntax is in [configuration](configuration/index.md).
+
+Runtime targets must have the base tensor's exact shape and original encoded type. Resident dense tensors,
+the output head and token embedding can change; routed experts, the PLE n-gram table and separate drafter
+tensors cannot. The tokenizer, chat template, sampling defaults, vision projector and drafter remain shared.
+The drafter's shared output head follows the selected model, including its separate copy on a split stage.
+
+Same-model requests run together. A different model waits for active requests to drain, replaces changed
+weights in place after draining draft streams, rebuilds derived weight copies, and clears live, prefix and parked-conversation state.
+Switching does not restart the engine. An upload or rebuild failure stops the engine: a partially replaced
+model is never used for generation.
 
 ### Manifest version 1
 

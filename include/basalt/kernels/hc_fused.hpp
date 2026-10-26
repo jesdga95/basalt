@@ -108,6 +108,10 @@ struct Hc8View {
     bool owned = false;
 };
 bool hc8_view(const void* w, Hc8View& v);
+/// Requantize staged_bf16 [rows][cols] into key's existing copy, keeping q/scales addresses and ownership unchanged.
+/// Both buffers must be on the current device and the shape must match. Call outside capture with readers idle.
+/// Returns false for an unknown key, invalid shape/device, or CUDA error; success waits for quantization completion.
+bool hc8_refresh(const void* key, const uint16_t* staged_bf16, int rows, int cols);
 /// Rows [row0, row0 + n) of w's copy as bf16 (q * scale rounded once), row-major `cols` per row, on `stream`.
 void hc8_dequant_bf16(const Hc8View& v, int64_t row0, int64_t n, uint16_t* out, void* stream);
 

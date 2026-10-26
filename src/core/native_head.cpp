@@ -2,6 +2,8 @@
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/direct_upload.hpp"
 #include "basalt/core/load_progress.hpp"
+#include "basalt/core/model_file.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/q6k_head.hpp"
@@ -17,6 +19,7 @@
 namespace basalt::core {
 
 NativeHead::~NativeHead() {
+    const OnDevice on_device(device_);
     if (vproxy_) cudaFree(vproxy_);
     if (scratch_) cudaFree(scratch_);
     if (weights_) cudaFree(weights_);
@@ -90,6 +93,7 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         n_in_ = (int) n_in;
         n_out_ = (int) n_out;
         type_ = (int) tensor->type;
+        device_ = dev;
         // the verify head's 2-bit copy, packed once from the uploaded rows (without it the exact head runs)
         if (type_ == 14 && basalt::kernels::q6k_vhead_supported((int) n_in, (int) n_out, 1)) {
             const size_t pb = basalt::kernels::q6k_vproxy_bytes(n_out);
@@ -107,6 +111,34 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         return true;
     } catch (const std::exception& error) {
         err = std::string("native head: ") + error.what();
+        return false;
+    }
+}
+
+bool NativeHead::replace(const FileRange& source, std::string& err) {
+    const OnDevice on_device(device_);
+    if (!loaded()) { err = "native head replace: weights are not loaded"; return false; }
+    if (!source.exists() || source.size() != bytes_) {
+        err = "native head replace: expected a readable range of exactly " + std::to_string(bytes_) + " bytes";
+        return false;
+    }
+    try {
+        if (!DirectUploader().upload(source.path, source.offset, bytes_, weights_, err)) {
+            err = "native head replace: " + err;
+            return false;
+        }
+        if (vproxy_) {
+            basalt::kernels::q6k_vproxy_pack(weights_, n_out_, vproxy_, nullptr);
+            cudaError_t status = cudaGetLastError();
+            if (status == cudaSuccess) status = cudaDeviceSynchronize();
+            if (status != cudaSuccess) {
+                err = std::string("native head replace: proxy pack: ") + cudaGetErrorString(status);
+                return false;
+            }
+        }
+        return true;
+    } catch (const std::exception& error) {
+        err = std::string("native head replace: ") + error.what();
         return false;
     }
 }
@@ -144,6 +176,7 @@ void set_native_embed(const NativeEmbed* e) { g_embed = e; }
 const NativeEmbed* native_embed() { return g_embed; }
 
 NativeEmbed::~NativeEmbed() {
+    const OnDevice on_device(device_);
     if (hot_) cudaFree(hot_);
     if (host_) cudaFreeHost(host_);
     else if (dev_) cudaFree(const_cast<void*>(dev_));   // the VRAM fallback below
@@ -151,6 +184,7 @@ NativeEmbed::~NativeEmbed() {
 
 bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err) {
     try {
+        cudaGetDevice(&device_);
         const basalt::GgufModel model(shards);
         err = basalt::check_architecture(model.meta());
         if (!err.empty()) { err = "native embedding: " + err; return false; }
@@ -218,6 +252,32 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
         err = std::string("native embedding: ") + e.what();
         return false;
     }
+}
+
+bool NativeEmbed::replace(const FileRange& source, std::string& err) {
+    const OnDevice on_device(device_);
+    if (!dev_ || bytes_ == 0) { err = "native embedding replace: table is not loaded"; return false; }
+    if (!source.exists() || source.size() != bytes_) {
+        err = "native embedding replace: expected a readable range of exactly " + std::to_string(bytes_) + " bytes";
+        return false;
+    }
+    if (host_) {
+        if (!read_range_at(source, 0, host_, bytes_, err)) {
+            err = "native embedding replace: " + err;
+            return false;
+        }
+        if (hot_ && n_hot_ > 0) {
+            const cudaError_t status = cudaMemcpy(hot_, host_, hot_bytes(), cudaMemcpyHostToDevice);
+            if (status != cudaSuccess) {
+                err = std::string("native embedding replace: hot rows: ") + cudaGetErrorString(status);
+                return false;
+            }
+        }
+    } else if (!DirectUploader().upload(source.path, source.offset, bytes_, const_cast<void*>(dev_), err)) {
+        err = "native embedding replace: " + err;
+        return false;
+    }
+    return true;
 }
 
 void NativeEmbed::gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const {

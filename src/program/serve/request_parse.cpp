@@ -37,6 +37,8 @@ Flow Request::parse() {
     req_ppl = -1;
     req_ppl_t = 3;
     req_clip = 0;   // clip=1 (GENT): max_new is a cap, cut to the room the context leaves after the prompt
+    req_model = 0;   // model=M: runtime adapter index (0 = base model)
+    bool req_model_ok = true;
     if (endp != nullptr) {   // GENI takes the same keys (image requests were always greedy); its
                              // embedding file path is the first token without an =
         for (;;) {
@@ -66,8 +68,24 @@ Flow Request::parse() {
             else if (key == "clip") req_clip = std::atoi(tok.c_str() + eq + 1);
             else if (key == "ppl") req_ppl = std::atoi(tok.c_str() + eq + 1);
             else if (key == "ppl_t") req_ppl_t = std::atoi(tok.c_str() + eq + 1);
+            else if (key == "model") {
+                char* m_end = nullptr;
+                const char* m_str = tok.c_str() + eq + 1;
+                const long long mv = std::strtoll(m_str, &m_end, 10);
+                if (m_str[0] == '\0' || m_end == nullptr || *m_end != '\0' || mv < 0 ||
+                    (uint64_t) mv >= runtime_.adapters.model_count()) {
+                    req_model_ok = false;
+                } else {
+                    req_model = (int64_t) mv;
+                }
+            }
             // unknown keys are skipped: the ids start at the first token without '='
         }
+    }
+
+    if (!req_model_ok) {
+        std::printf("ERR adapters: invalid model index\n");
+        return Flow::next;
     }
 
     // a sampling value out of range is refused, never changed (the server refuses it first: config.checked_sampling)

@@ -59,3 +59,26 @@ without it, or without a git build, the run stops with a message. Only `--model`
 repository's `data/bench`), `--logs` and `--print-command` are accepted: any other bench option or engine flag changes
 the workload and is refused. The run uses every visible Blackwell GPU (`--gpu auto`; `--gpu` is refused); pick the cards with
 `CUDA_VISIBLE_DEVICES`, for example `CUDA_VISIBLE_DEVICES=0` for a single-GPU row. The preset's version changes whenever the workload does.
+
+## Benchmarking adapters
+
+`--bench-model N` selects the resident model for every decode, prefill and quality-gate request:
+**0** is the base model (the default), **1** is the first `--adapter` group, **2** the second, and so on.
+Each group overlays the base independently; multiple files in one group apply in order.
+The selected index is printed as `bench model N` in markdown and as `bench_model` in JSON.
+The base file remains `model`; adapter paths remain in the engine arguments.
+
+Compare QFN with a compatible Swift adapter by loading the same files in both runs:
+
+```sh
+bin/basalt-bench --model base.basalt --bench-model 0 --seed 1 -r 3 \
+    --adapter Swift.basalt
+bin/basalt-bench --model base.basalt --bench-model 1 --seed 1 -r 3 \
+    --adapter Swift.basalt
+```
+
+`Swift.basalt` above is an [adapter file](model-file.md#runtime-compositions), not a standalone model.
+Use the same engine settings, fixed expert tiers (`--expert-cache N --adapt-every 0`) and GPU power limit;
+alternate the two commands for development A/Bs. Model selection is a request key, not an engine startup flag,
+so `--print-command` prints the same engine command for both selections. Adapter runs are not accepted by
+the fixed `--community` preset.

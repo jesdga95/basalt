@@ -20,6 +20,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
 bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                             float* probs, int* n_drafts) {
     const OnDevice on_device(device_);
+    n_drafted_ = 0;
     if (T < 1 || T > std::min(max_t_, basalt::kernels::kVerifyMaxT) || a < 0 || a >= T) {
         err = "mtp: draft arguments out of range";
         return false;
@@ -145,6 +146,7 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
     run_launch_hook();   // no graph ran: the hook still runs, once
     for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
     if (n_drafts) *n_drafts = n;
+    n_drafted_ = n;
     decode_gaps().mark(9);
     if (gstamp_ != nullptr) {   // --profile: the GPU's idle time before the round and the draft's span
         unsigned long long st[2] = {0, 0};
@@ -180,6 +182,7 @@ int MtpDrafter::draft_more(int have, int32_t* drafts, float* probs) {
         drafts[n] = ((volatile int32_t*) h_out_)[n];
         if (probs) probs[n] = ((volatile float*) h_prob_)[n];
     }
+    n_drafted_ = n;
     return n;
 }
 

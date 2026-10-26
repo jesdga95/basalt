@@ -10,6 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 from model_file import ModelFile  # noqa: E402
+from model_adapter import AdapterFile  # noqa: E402
 from serve.engine.flags import flag_value  # noqa: E402
 
 VISION_EXE = "basalt-vision.exe" if sys.platform == "win32" else "basalt-vision"
@@ -96,21 +97,50 @@ def vision_config(mf: ModelFile, engine_bin: str, sidecar: bool = True) -> dict:
 
 
 def model_config(path: str, engine_bin: str, vision: bool | str = False,
-                 engine_words: list[str] | None = None) -> dict:
+                 engine_words: list[str] | None = None, adapters: list[list[str]] | None = None,
+                 alias: str | None = None) -> dict:
     """The engine settings the file implies; `engine_words` follow its arguments as given (the engine's parser lets a
     later flag win), `vision` (a GPU number as a string, or "cpu") adds the sidecar and "dynamic" the in-engine
-    encoder (ValueError if it cannot be set up)."""
+    encoder (ValueError if it cannot be set up). Each adapter group adds an ordered composition to the base
+    model's API catalog."""
     mf = ModelFile(path)
     meta = mf.load_meta()
     if meta.get("kind", "model") != "model":
         raise ValueError(f"{path}: artifact kind {meta.get('kind')!r} is not a model")
     path = os.path.abspath(path)
+    model_name = alias or meta.get("name") or Path(path).stem
+    model_names = [model_name]
+    groups: list[list[str]] = []
+    if adapters is not None:
+        if (not isinstance(adapters, list) or not adapters
+                or any(not isinstance(group, list) or not group
+                       or any(not isinstance(p, str) or not p.strip() for p in group)
+                       for group in adapters)):
+            raise ValueError("adapters: expected a nonempty list of nonempty lists of paths")
+        for group in adapters:
+            paths, names = [], []
+            for adapter_path in group:
+                adapter_path = os.path.abspath(os.path.expanduser(adapter_path))
+                AdapterFile(adapter_path)
+                adapter_meta = ModelFile(adapter_path).load_meta()
+                paths.append(adapter_path)
+                names.append(adapter_meta.get("name") or Path(adapter_path).stem)
+            name = "+".join(names)
+            if name in model_names:
+                raise ValueError(f"duplicate model name: {name!r}")
+            if name == Path(path).name:
+                raise ValueError(f"adapter model name collides with base filename: {name!r}")
+            model_names.append(name)
+            groups.append(paths)
     cdir = cache_dir(mf)
     words = with_conversation_dir(list(engine_words or []), cdir)
     args = ["--model", path]   # settings come from the engine defaults and the server
     args += words
+    for group in groups:
+        args += ["--adapter", *group]
     cdir.mkdir(parents=True, exist_ok=True)
-    cfg = {"engine_bin": os.path.abspath(engine_bin), "args": args, "model_name": meta.get("name") or "basalt",
+    cfg = {"engine_bin": os.path.abspath(engine_bin), "args": args, "model_name": model_name,
+           "model_names": model_names,
            "sampling": dict(meta.get("sampling") or {}), "log": str(cdir / "engine.log"),
            "tokenizer": str(extract_tokenizer(mf))}
     v = vision_config(mf, engine_bin, sidecar=vision != "dynamic") if vision else None
