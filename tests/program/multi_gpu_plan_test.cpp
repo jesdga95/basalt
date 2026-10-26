@@ -224,6 +224,36 @@ int main() {
             for (double& ms : none.stage_ms) ms = ms > 0 ? none.tier_ms : 0;
             for (const auto& x : prompt_split_windows(none, 3, 3, 48)) CHECK(x.first == 0 && x.second == 0);
         }
+        // four alike 16 GB cards behind one host link, from reads of 133,205 and 266,381 tokens: the tier cards stream
+        // nine tenths of their layers' experts per chunk, the main card all of its own.  Each card's link alone gives the
+        // prices those reads were priced at; the cards streaming at once over the host's 54 GB/s give the reads
+        {
+            const PsCard m4 = side(960, 26.8, 0), t4 = side(960, 26.8, 2458, 60);
+            auto read = [&](int64_t n, int64_t cap, double host) {
+                PsPart lp;
+                lp.row_bytes = part.row_bytes;
+                lp.draft_rows = 8257;
+                lp.host_gbps = host;
+                lp.tier_chunks = lp.split_chunks = even(n, cap);
+                return price_prompt_split(m4, m4, {t4, t4, t4}, lp, 4, 48);
+            };
+            auto near = [](double a, double b, double tol) { return a > (1 - tol) * b && a < (1 + tol) * b; };
+            const PsPrice a1 = read(133205, 22528, 0), a2 = read(266381, 16384, 0);
+            CHECK(near(a1.stage_ms[2], 16141, 0.03) && near(a1.stage_ms[3], 14359, 0.03) && near(a1.stage_ms[4], 13562, 0.03));
+            CHECK(near(a2.stage_ms[2], 32158, 0.03) && near(a2.stage_ms[3], 24809, 0.03) && near(a2.stage_ms[4], 21118, 0.03));
+            const PsPrice b1 = read(133205, 22528, 54), b2 = read(266381, 16384, 54);
+            CHECK(near(b2.stage_ms[2], 32865, 0.06) && near(b2.stage_ms[3], 27270, 0.06) && near(b2.stage_ms[4], 25669, 0.06));
+            CHECK(b2.split && b2.stages == 4 && b2.stage_ms[4] < b2.stage_ms[3] && b2.stage_ms[3] < b2.stage_ms[2]);
+            CHECK(b1.stage_ms[4] >= 12891 && b1.stage_ms[4] < 1.1 * 12891 && b1.stages == 4);
+            // a host that feeds every card's link whole changes no price
+            const PsPrice c2 = read(266381, 16384, 4 * 26.8);
+            CHECK(c2.stage_ms == a2.stage_ms && c2.stage_cuts == a2.stage_cuts);
+            // nor does it on two cards whose links it can feed: the pair's price is the one each link alone gives
+            PsPart lp = part;
+            lp.host_gbps = 28.9 + 28.8;
+            const PsPrice d = price_prompt_split(main_tier, main_split, {slow}, lp, 2, 48);
+            CHECK(d.split_ms == price_prompt_split(main_tier, main_split, {slow}, part, 2, 48).split_ms);
+        }
         // mixed cards: the faster card joins first and reads the last layers; with a slow third card a long prompt
         // still gains from it, a shorter one keeps to two stages
         {

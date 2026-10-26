@@ -71,6 +71,7 @@ struct PsPart {
     std::vector<int64_t> split_chunks;  ///< the split
     uint64_t row_bytes = 0;             ///< one token's hand-off rows
     int64_t draft_rows = 0;             ///< rows of the split's chunks before the last that the draft layer reads back
+    double host_gbps = 0;               ///< host->device bandwidth with every card copying at once (probed); 0: no limit
 };
 
 /// The most stages a split is priced with, the main card's included.

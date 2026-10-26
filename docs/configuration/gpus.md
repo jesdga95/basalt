@@ -72,7 +72,8 @@ the tier cards have given their layers' state back and got their experts back. A
 buffers go into its tier's last slots for the read (its weights from a pinned RAM copy made at start), so outside a
 prompt the tiers hold what they held before and decode does not change. The engine prices each part on the main card
 alone and over every number of stages and every set of cuts, from each card's memory bandwidth, the probed link rates
-and the experts each card holds, and reads it across the cards only when that is at least 5% cheaper. Tier cards join in
+(each card's alone and all the cards' at once, which a shared switch or the RAM can hold below their sum) and the
+experts each card holds, and reads it across the cards only when that is at least 5% cheaper. Tier cards join in
 order of memory bandwidth, the fastest reading the last layers. At start each card gets the layers the stage counts
 worth it for a prompt of the context's length (up to 131,072 tokens) give it, plus a few. The start and request lines
 begin with `prompt split:` and print the prices. The chunks are the main card's own, so a part of one chunk (up to

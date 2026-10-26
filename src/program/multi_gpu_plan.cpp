@@ -118,6 +118,8 @@ namespace {
 // Prompt reads, fitted to cold reads of the pack on the main card alone and on the split.  A stage's chunk of T tokens:
 //   max(T x (layers x u(pos) + the embedding card's per-token part), the chunk's expert bytes / the link's share)
 //   u(pos) = kPsUsLayer x kPsRefGbps / the card's bandwidth x (1 + kPsGrowth x pos), per token and layer
+// In the split every card streams its layers' experts at once: a chunk takes no less than the bytes they all stream
+// for it over the host's bandwidth to all of them together (probed so; each card's gaps are the others' to fill).
 constexpr double kPsUsLayer = 1.69;      // us per token and layer at the start of the context, at kPsRefGbps
 constexpr double kPsRefGbps = 1792.0;
 constexpr double kPsGrowth = 2.5e-6;     // per cell of context before the token (the attention's block selection)
@@ -169,6 +171,11 @@ double ps_pipeline(const PsCard& m, const std::vector<const PsCard*>& st, const 
     double free_at[kPsMaxStages] = {};   // stage k + 1 takes a chunk from then on
     double t = 0;
     for (size_t k = 0; k < ns; ++k) t = std::max(t, st[k]->setup_ms);
+    // the main card starts a chunk no sooner than the host has streamed every card's bytes of the one before
+    double host_free = 0;
+    auto host_ms = [&](const PsCard& c, double link_ms) {
+        return part.host_gbps > 0 ? link_ms * kPsLinkEff * c.link_gbps / part.host_gbps : 0.0;
+    };
     int64_t at = part.cell0;
     const size_t n = part.split_chunks.size();
     for (size_t i = 0; i < n; ++i) {
@@ -177,6 +184,16 @@ double ps_pipeline(const PsCard& m, const std::vector<const PsCard*>& st, const 
         const double a = ps_stage(m, m, T, pos, 0, cuts[0], true, main_link, layers) +
                          (i == 0 ? kPsPleUsToken * (double) T / 1000.0 : 0.0);
         const double hand = (double) T * (double) part.row_bytes;
+        t = std::max(t, host_free);
+        if (i + 1 < n && part.host_gbps > 0) {
+            double shared = host_ms(m, main_link[(size_t) cuts[0]]);
+            for (size_t k = 0; k < ns; ++k) {
+                const int l1 = k + 1 < ns ? cuts[k + 1] : layers;
+                shared += host_ms(*st[k], (*links[k])[(size_t) cuts[k] * (size_t) (layers + 1) + (size_t) l1] +
+                                              ps_link_ms(*st[k], hand));
+            }
+            host_free = t + shared;
+        }
         if (i + 1 < n) {
             double launch = std::max(t + a + ps_link_ms(m, hand), free_at[0]);
             t = launch;
