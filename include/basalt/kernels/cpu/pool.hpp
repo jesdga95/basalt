@@ -133,12 +133,17 @@ public:
     /// contention being measured.
     long long pauses() const { return 0; }
 
-    /// **A PARKED WORKER SPINS FOR THIS LONG, THEN SLEEPS.**  The park is a `_mm_pause` spin because a layer's batches
-    /// are microseconds apart and a wake-up from the OS costs more than that.  But a spin that never ends keeps every
-    /// worker's core at 100% while the engine waits for a request.  Between requests the workers block on `sleep_cv_`.
+    /// **A PARKED WORKER WAITS THIS LONG, THEN SLEEPS.**  The park spins (then yields, see `kSpinBeforeYield`)
+    /// because a layer's batches are microseconds apart and a wake-up from the OS costs more than that.  But a wait
+    /// that never ends keeps every worker's core at 100% while the engine waits for a request.  Between requests the
+    /// workers block on `sleep_cv_`.
     /// NOT only between requests: with most experts in VRAM many layers have no CPU work, so the workers also sleep
     /// mid-request - which the claim protocol above must survive.
     static constexpr std::chrono::milliseconds kSpinBeforeSleep{20};
+    /// A parked worker spins this long, then yields its core on every check until the next batch or the sleep: a
+    /// short wait keeps the core, a long gap between batches gives it to any runnable thread, such as a worker the OS
+    /// put on this core in the middle of its task.  With nothing else runnable the yield returns at once.
+    static constexpr std::chrono::microseconds kSpinBeforeYield{50};
     /// A pool wait that sees no completion for this long is a bug; the engine stops with a message instead of
     /// spinning forever, and the server starts it again.
     static constexpr std::chrono::seconds kStall{60};
