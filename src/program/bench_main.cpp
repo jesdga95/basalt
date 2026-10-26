@@ -1141,8 +1141,7 @@ int main(int argc, char** argv) {
         }
         std::string gpu_err;
         std::vector<std::pair<std::string, Nvml::Snap>> cards;
-        std::istringstream ids(info.count("gpus") ? info["gpus"] : "");
-        for (std::string id; std::getline(ids, id, ',');) {
+        for (const std::string& id : basalt::program::split_gpu_ids(info.count("gpus") ? info["gpus"] : "")) {
             Nvml::Snap g;
             if (!nvml.snap_bus(id, g) || g.name.empty() || g.vram_gib <= 0 || g.power_enforced_w <= 0) {
                 gpu_err = "NVML could not read the GPU at " + id;

@@ -62,6 +62,19 @@ when it prices at least 5% below it. Unlike cards always use the expert tier. Th
 measured windows (a 5090 with a 5060 Ti: tier 7.9 ms, plain layer split 13.4-13.7 ms measured at the cuts
 tried; two 5080s: 147 tok/s reported against 141 priced), good for the choice and not for forecasting a rate.
 
+## Long prompts on two cards
+
+In the expert tier with one tier card and one conversation at a time, a long fresh part of a prompt can be read as a
+pipeline. The main card reads the first layers of each chunk and hands the chunk on; the tier card reads the last layers
+of it while the main card reads the next chunk, then gives its layers' state back and gets its experts back. Its weights,
+prompt state and buffers go into its tier's last slots for the read (its weights from a pinned RAM copy made at start), so
+outside a prompt the tier holds what it held before and decode does not change. The engine prices each part both ways
+from each card's memory bandwidth, the probed link rates and the experts each card holds, and reads it across the cards
+only when that is at least 5% cheaper; the start and request lines begin with `prompt split:`. The chunks are the main
+card's own, so a part of one chunk (up to 32,768 tokens) stays on the main card. Off with `--peer-exclusive`, without the
+RAM copy of the experts, with KV streaming, a control vector, `--parallel`, experts other than NVFP4 (the price is fitted
+to those), or when RAM or the tier's slots are short.
+
 ## Two 16 GB cards
 
 `gpu "0,1"` with two cards of 16 GB (two RTX 5080s, say) runs the expert tier: each card holds experts in what its VRAM has

@@ -261,7 +261,6 @@ std::atomic<uint64_t> g_guard_floor{0};
 #if defined(_WIN32)
 constexpr uint64_t kReclaimLead = 1ull << 30;       // how far above the floor the guard gives the view back
 constexpr uint64_t kReclaimChunk = 256ull << 20;    // bytes given back per lock hold
-constexpr auto kReclaimCooldown = std::chrono::seconds(5);
 std::mutex g_reclaim_mu;                            // held per chunk, so a withdrawn view is not touched afterwards
 const void* g_reclaim_base = nullptr;
 uint64_t g_reclaim_bytes = 0;
@@ -300,17 +299,18 @@ void start_ram_guard(uint64_t floor_bytes) {
     std::thread([] {
         bool was_low = false;
 #if defined(_WIN32)
-        bool rearmed = true, logged_reclaim = false;
-        auto last_reclaim = std::chrono::steady_clock::now() - kReclaimCooldown;
+        bool logged_reclaim = false;
+        uint64_t avail_after = 0;   // the reading right after the last give-back
+        auto last_reclaim = std::chrono::steady_clock::now();
 #endif
         for (;;) {
             uint64_t avail = available_memory();
             const uint64_t floor = g_guard_floor.load();
 #if defined(_WIN32)
-            // Give the view back at most once per cooldown, and again only after the reading has been above the lead.
-            if (!ram_below_floor(avail, floor + kReclaimLead)) {
-                rearmed = true;
-            } else if (rearmed && std::chrono::steady_clock::now() - last_reclaim >= kReclaimCooldown) {
+            // A later give-back waits for the view to be read in again, so a long prompt read keeps it in check.
+            const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - last_reclaim).count();
+            if (reclaim_due(avail, floor, kReclaimLead, avail_after, (uint64_t) since)) {
                 bool have;
                 {
                     std::lock_guard<std::mutex> lock(g_reclaim_mu);
@@ -324,7 +324,7 @@ void start_ram_guard(uint64_t floor_bytes) {
                     }
                     reclaim_view_now();
                     avail = available_memory();
-                    rearmed = false;
+                    avail_after = avail;
                     last_reclaim = std::chrono::steady_clock::now();
                 }
             }

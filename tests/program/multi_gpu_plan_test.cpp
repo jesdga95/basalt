@@ -110,6 +110,44 @@ int main() {
         const GpuChoice c = choose_gpus(s, v, true);
         CHECK(c.cards.size() == 2 && c.cards[0] == 2 && c.cards[1] == 1);
     }
+    // the prompt-time split: a main card and a tier card, the experts each streams per chunk spread evenly over layers
+    {
+        auto side = [](double gbps, double link, int64_t resident) {
+            PsCard c;
+            c.mem_gbps = gbps;
+            c.link_gbps = link;
+            c.stream_bytes.assign(48, (double) (48 * 512 - resident) * 2.76e6 / 48.0);
+            return c;
+        };
+        auto chunks = [](std::initializer_list<int64_t> v) { return std::vector<int64_t>(v); };
+        PsPart part;
+        part.row_bytes = 4 * 2560 * 4;
+        part.setup_ms = 40;
+        // a 64K prompt on a 32 GB main card with a 16 GB tier card of a quarter of its bandwidth: read across both, the
+        // tier card taking the last ten or so layers, both prices near what such a pair reads it in
+        part.tier_chunks = chunks({16384, 24576, 24575});
+        part.split_chunks = chunks({16384, 24576, 24575});
+        part.draft_rows = 8257;
+        const PsCard main_tier = side(1792, 28.9, 9460 - 3241), main_split = side(1792, 28.9, 9460 - 2883);
+        const PsCard slow = side(448, 28.8, 5650 - 2900);
+        PsPrice pr = price_prompt_split(main_tier, main_split, slow, part, 30, 48);
+        CHECK(pr.split && pr.lb >= 36 && pr.lb <= 40);
+        CHECK(pr.tier_ms > 0.95 * 7540 && pr.tier_ms < 1.05 * 7540);
+        CHECK(pr.split_ms > 0.95 * 6740 && pr.split_ms < 1.05 * 6740);
+        // the same prompt in one chunk and a short one: nothing to overlap
+        part.split_chunks = chunks({65535});
+        pr = price_prompt_split(main_tier, main_split, slow, part, 30, 48);
+        CHECK(!pr.split && pr.lb == 0);
+        // two alike cards: about half the layers each, and far cheaper than one card
+        part.split_chunks = chunks({16384, 24576, 24575});
+        const PsCard alike_tier = side(960, 25, 4000 - 2900), alike_split = side(960, 25, 4000 - 2883);
+        const PsCard alike_peer = side(960, 25, 4000 - 2900);
+        pr = price_prompt_split(alike_tier, alike_split, alike_peer, part, 8, 48);
+        CHECK(pr.split && pr.lb >= 18 && pr.lb <= 30 && pr.split_ms < 0.8 * pr.tier_ms);
+        // a tier card of a sixteenth of the bandwidth: not worth a split
+        pr = price_prompt_split(main_tier, main_split, side(112, 28.8, 2750), part, 30, 48);
+        CHECK(!pr.split);
+    }
     if (g_fail) { std::printf("multi_gpu_plan_test: %d failures\n", g_fail); return 1; }
     std::printf("multi_gpu_plan_test: ok\n");
     return 0;

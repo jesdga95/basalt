@@ -117,6 +117,22 @@ bool session_kv_unmap(SessionState& s, int64_t cells, std::string& err);
 /// from the reference's own `zeros()`.
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream);
 
+/// A prompt-time stage's session for layers [layer_lo, layer_hi): only what the prompt path reads and writes - the GDN
+/// recurrences, the QSA layers' K/V and indexers (qsa_prompt_state_carve), the PLE history and the PLE run's device
+/// buffers - at `max_cells`.  `prompt_session_carve` lays pointers out over `base` (DEVICE memory,
+/// `prompt_session_bytes` long) and writes nothing; it may be carved again (another size or place) between prompts.
+/// The PLE weights and table are the caller's to set.
+uint64_t prompt_session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t layer_lo, int64_t layer_hi);
+void prompt_session_carve(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
+                          int64_t layer_lo, int64_t layer_hi);
+/// Zeroes a carved prompt session, as `session_zero` a whole one, on `stream`.
+void prompt_session_clear(SessionState& s, const ModelGeometry& g, void* stream);
+/// Copies the state of layers [layer_lo, layer_hi) from `src` into `dst` through `copy`: the GDN rows, the QSA layers'
+/// cells [cell0, cell1) with their indexers, and the PLE history when the range holds layer 1.  Both sessions hold
+/// those layers whole in VRAM.
+bool session_copy_state(SessionState& dst, const SessionState& src, const ModelGeometry& g, int64_t layer_lo,
+                        int64_t layer_hi, int64_t cell0, int64_t cell1, const DeviceCopy& copy, std::string& err);
+
 /// One token: layers 0..47 in order, each a `block_layer`, and the residual is updated in place.
 ///
 /// `parts` is (k, n_embd) DEVICE memory, filled by the caller - by the CPU expert pool and the VRAM-resident experts.

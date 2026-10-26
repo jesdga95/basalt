@@ -721,6 +721,113 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     cudaMemsetAsync(st.idx_pooled, 0, (size_t) pooled_rows * s.idx_dim * 4, cs);
 }
 
+namespace {
+// The prompt-time state's layout, the pool part as qsa_state_init's whole-in-VRAM one
+uint64_t qsa_prompt_layout(const ModelGeometry& g, int64_t max_cells, uint8_t* base, QsaState& st) {
+    const QsaShapes s = qsa_shapes(g);
+    const int64_t pages = (max_cells + s.page_size - 1) / s.page_size;
+    Cursor c{base};
+    st = QsaState{};
+    st.kv_int8 = g_kv_int8 && !g_kv_q4;
+    st.kv_q4 = g_kv_q4;
+    if (g_kv_hybrid) {
+        st.kv_hybrid = true;
+        st.kv_int8 = false;
+        st.kv_q4 = false;
+    }
+    st.kv_rot = st.kv_q4;
+    st.kv_mode = 0;
+    st.n_slots = pages;
+    const uint64_t rows = (uint64_t) pages * s.n_head_kv * s.page_size;
+    const uint64_t q4_row = basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+    const uint64_t scales = rows * (s.head_dim / basalt::kernels::KV_Q8_GROUP);
+    if (st.kv_hybrid) {
+        st.k_q = c.take<int8_t>(rows * s.head_dim);
+        st.k_scale = c.take<uint16_t>(scales);
+        st.v_q4 = c.take<uint8_t>(rows * q4_row);
+    } else if (st.kv_q4) {
+        st.k_q4 = c.take<uint8_t>(rows * q4_row);
+        st.v_q4 = c.take<uint8_t>(rows * q4_row);
+    } else if (st.kv_int8) {
+        st.k_q = c.take<int8_t>(rows * s.head_dim);
+        st.v_q = c.take<int8_t>(rows * s.head_dim);
+        st.k_scale = c.take<uint16_t>(scales);
+        st.v_scale = c.take<uint16_t>(scales);
+    } else {
+        st.k_pool = c.take<uint16_t>(rows * s.head_dim);
+        st.v_pool = c.take<uint16_t>(rows * s.head_dim);
+    }
+    st.page_table = c.take<int32_t>((uint64_t) pages);
+    st.n_pages = pages;
+    st.max_cells = max_cells;
+    st.map.page_table = st.page_table;
+    st.map.n_blocks = pages;
+    st.map.n_slots = pages;
+    st.idx_tail = c.take<float>((uint64_t) (s.idx_block - 1) * s.idx_dim);
+    st.idx_dead = c.take<float>((uint64_t) s.idx_dim);
+    st.idx_pooled_rows = max_cells / s.idx_block + 2;
+    st.idx_pooled = c.take<float>((uint64_t) st.idx_pooled_rows * s.idx_dim);
+    st.idx_block_pos = c.take<int32_t>(1);
+    return c.used;
+}
+}  // namespace
+
+uint64_t qsa_prompt_state_bytes(const ModelGeometry& g, int64_t max_cells) {
+    QsaState st;
+    return align_up16(qsa_prompt_layout(g, max_cells, reinterpret_cast<uint8_t*>(uint64_t{1} << 20), st)) + 256;
+}
+
+uint64_t qsa_prompt_state_carve(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st) {
+    return qsa_prompt_layout(g, max_cells, (uint8_t*) base, st);
+}
+
+void qsa_prompt_state_clear(const QsaState& st, const ModelGeometry& g, void* stream) {
+    qsa_state_zero(st, g, stream);
+    basalt::kernels::kv_ring_table(st.page_table, st.n_pages, st.n_slots, stream);   // n_slots == n_pages: the identity
+}
+
+bool qsa_state_copy_cells(QsaState& dst, const QsaState& src, const ModelGeometry& g, int64_t cell0, int64_t cell1,
+                          const DeviceCopy& copy, std::string& err) {
+    const QsaShapes s = qsa_shapes(g);
+    if (dst.kv_mode != 0 || src.kv_mode != 0 || dst.kv_int8 != src.kv_int8 || dst.kv_q4 != src.kv_q4 ||
+        dst.kv_hybrid != src.kv_hybrid) {
+        err = "a QSA state copy needs two whole-in-VRAM states of one format";
+        return false;
+    }
+    if (cell0 < 0 || cell1 < cell0 || cell1 > dst.max_cells || cell1 > src.max_cells) {
+        err = "a QSA state copy past a state's cells";
+        return false;
+    }
+    if (cell1 == cell0) return true;
+    // the pools, page by page: each array holds a page's rows (kv heads x page cells) back to back
+    const uint64_t pr = (uint64_t) s.n_head_kv * s.page_size;
+    const uint64_t code = pr * s.head_dim, scale = pr * (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2;
+    const uint64_t q4 = pr * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+    struct Arr { void* d; const void* s; uint64_t page; };
+    std::vector<Arr> arrs;
+    if (src.kv_hybrid) arrs = {{dst.k_q, src.k_q, code}, {dst.k_scale, src.k_scale, scale}, {dst.v_q4, src.v_q4, q4}};
+    else if (src.kv_q4) arrs = {{dst.k_q4, src.k_q4, q4}, {dst.v_q4, src.v_q4, q4}};
+    else if (src.kv_int8)
+        arrs = {{dst.k_q, src.k_q, code}, {dst.v_q, src.v_q, code}, {dst.k_scale, src.k_scale, scale},
+                {dst.v_scale, src.v_scale, scale}};
+    else arrs = {{dst.k_pool, src.k_pool, code * 2}, {dst.v_pool, src.v_pool, code * 2}};
+    const int64_t p0 = cell0 / s.page_size, p1 = (cell1 + s.page_size - 1) / s.page_size;
+    bool ok = true;
+    for (const Arr& a : arrs)
+        ok = ok && copy((uint8_t*) a.d + (size_t) p0 * a.page, (const uint8_t*) a.s + (size_t) p0 * a.page,
+                        (uint64_t) (p1 - p0) * a.page);
+    // the pooled keys of the blocks the cells reach and the spare row after them, the tail, the spare, the block position
+    const uint64_t row = (uint64_t) s.idx_dim * 4;
+    const int64_t r0 = cell0 / s.idx_block;
+    const int64_t r1 = std::min<int64_t>({cell1 / s.idx_block + 2, dst.idx_pooled_rows, src.idx_pooled_rows});
+    if (r1 > r0) ok = ok && copy(dst.idx_pooled + (size_t) r0 * s.idx_dim, src.idx_pooled + (size_t) r0 * s.idx_dim,
+                                 (uint64_t) (r1 - r0) * row);
+    ok = ok && copy(dst.idx_tail, src.idx_tail, (uint64_t) (s.idx_block - 1) * row) &&
+         copy(dst.idx_dead, src.idx_dead, row) && copy(dst.idx_block_pos, src.idx_block_pos, 4);
+    if (!ok) err = "a QSA state copy could not be queued";
+    return ok;
+}
+
 basalt::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
     basalt::kernels::QsaAttnPools pools;
     pools.page_table = st.page_table;

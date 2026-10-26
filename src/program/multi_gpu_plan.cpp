@@ -114,4 +114,81 @@ MgPlan plan_multi_gpu(const std::vector<GpuCard>& cards, const MgModel& m) {
     return plan;
 }
 
+namespace {
+// Prompt reads, fitted to cold reads of the pack on the main card alone and on the split.  A stage's chunk of T tokens:
+//   max(T x (layers x u(pos) + the embedding card's per-token part), the chunk's expert bytes / the link's share)
+//   u(pos) = kPsUsLayer x kPsRefGbps / the card's bandwidth x (1 + kPsGrowth x pos), per token and layer
+constexpr double kPsUsLayer = 1.69;      // us per token and layer at the start of the context, at kPsRefGbps
+constexpr double kPsRefGbps = 1792.0;
+constexpr double kPsGrowth = 2.5e-6;     // per cell of context before the token (the attention's block selection)
+constexpr double kPsUsToken = 7.1;       // us per token on the card that embeds it (the embedding, the PLE block)
+constexpr double kPsLinkEff = 0.85;      // the share of the probed link a chunk's expert stream gets
+constexpr double kPsPleUsToken = 46.0;   // the first chunk's wait for its n-gram rows, per token (either way)
+constexpr double kPsDraftUsRow = 2.5;    // the draft layer's K/V of a row read back from the tier card
+constexpr double kPsMargin = 0.95;       // the split reads a part only when it is at least 5% cheaper
+
+double ps_bw(const PsCard& c, const PsCard& main) {
+    return c.mem_gbps > 0 ? c.mem_gbps : main.mem_gbps > 0 ? main.mem_gbps : kPsRefGbps;
+}
+
+// one stage's chunk of `T` tokens around position `pos` over layers [l0, l1), in ms; `embeds`: the card embeds it
+double ps_stage(const PsCard& c, const PsCard& main, int64_t T, double pos, int l0, int l1, bool embeds) {
+    const double scale = kPsRefGbps / ps_bw(c, main);
+    const double us = (double) (l1 - l0) * kPsUsLayer * scale * (1.0 + kPsGrowth * pos) + (embeds ? kPsUsToken * scale : 0.0);
+    double bytes = 0;
+    for (int l = l0; l < l1 && l < (int) c.stream_bytes.size(); ++l) bytes += c.stream_bytes[(size_t) l];
+    const double link = c.link_gbps > 0 ? bytes / (kPsLinkEff * c.link_gbps * 1e9) * 1000.0 : 0.0;
+    return std::max((double) T * us / 1000.0, link);
+}
+
+// `bytes` over a card's link, in ms
+double ps_link_ms(const PsCard& c, double bytes) {
+    return c.link_gbps > 0 ? bytes / (kPsLinkEff * c.link_gbps * 1e9) * 1000.0 : 0.0;
+}
+}  // namespace
+
+PsPrice price_prompt_split(const PsCard& main_tier, const PsCard& main_split, const PsCard& peer, const PsPart& part,
+                           int lb_min, int layers) {
+    PsPrice p;
+    int64_t at = part.cell0;
+    for (size_t i = 0; i < part.tier_chunks.size(); ++i) {
+        const int64_t T = part.tier_chunks[i];
+        p.tier_ms += ps_stage(main_tier, main_tier, T, (double) at + 0.5 * (double) T, 0, layers, true) +
+                     (i == 0 ? kPsPleUsToken * (double) T / 1000.0 : 0.0);
+        at += T;
+    }
+    const size_t n = part.split_chunks.size();
+    if (n < 2) return p;
+    double best = 0;
+    for (int lb = std::max(lb_min, 2); lb < layers; ++lb) {
+        // the main card reads chunk c's first layers, hands it on once the tier card is done with the one before, and
+        // reads on; it keeps the last chunk and reads its later layers once the tier card's last chunk is done
+        double t = part.setup_ms, b_end = 0;
+        at = part.cell0;
+        for (size_t i = 0; i < n; ++i) {
+            const int64_t T = part.split_chunks[i];
+            const double pos = (double) at + 0.5 * (double) T;
+            const double a = ps_stage(main_split, main_split, T, pos, 0, lb, true) +
+                             (i == 0 ? kPsPleUsToken * (double) T / 1000.0 : 0.0);
+            const double hand = (double) T * (double) part.row_bytes;
+            if (i + 1 < n) {
+                const double launch = std::max(t + a + ps_link_ms(main_split, hand), b_end);
+                b_end = launch + ps_link_ms(peer, hand) + ps_stage(peer, main_split, T, pos, lb, layers, false);
+                t = launch;
+            } else {
+                t = std::max(t + a, b_end) + (double) part.draft_rows * kPsDraftUsRow / 1000.0 +
+                    ps_stage(main_split, main_split, T, pos, lb, layers, false);
+            }
+            at += T;
+        }
+        if (p.lb == 0 || t < best) {
+            best = t;
+            p.lb = lb;
+        }
+    }
+    p.split_ms = best;
+    p.split = p.lb > 0 && best < kPsMargin * p.tier_ms;
+    return p;
+}
+
 }  // namespace basalt::program

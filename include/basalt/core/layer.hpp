@@ -41,6 +41,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include "basalt/log.hpp"
 
@@ -313,6 +314,19 @@ void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* i
 /// Zeroes the pools AND the indexer, so a fresh sequence matches the reference's own `zeros()`.  The KV pool
 /// matters even for cells that are never attended, because `kv_gather` reads whatever the selection names.
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream);
+/// A prompt-time stage's QSA state: the K/V of every cell in VRAM with the identity page table, and the indexer; none
+/// of the decode state (rope tables, per-token staging).  `qsa_prompt_state_carve` lays its pointers out over `base`
+/// (DEVICE memory, `qsa_prompt_state_bytes` long) and writes nothing; `qsa_prompt_state_clear` zeroes it and writes the
+/// page table, on `stream`.
+uint64_t qsa_prompt_state_bytes(const ModelGeometry& g, int64_t max_cells);
+uint64_t qsa_prompt_state_carve(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st);
+void qsa_prompt_state_clear(const QsaState& st, const ModelGeometry& g, void* stream);
+/// A queued copy of device memory between two sessions' cards (`dst`, `src`, bytes); false when it could not be queued.
+using DeviceCopy = std::function<bool(void* dst, const void* src, uint64_t bytes)>;
+/// Copies the K/V and pooled keys of cells [cell0, cell1), and the indexer's tail, spare and block position, from `src`
+/// into `dst` (both whole in VRAM, one format) through `copy`.
+bool qsa_state_copy_cells(QsaState& dst, const QsaState& src, const ModelGeometry& g, int64_t cell0, int64_t cell1,
+                          const DeviceCopy& copy, std::string& err);
 
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
 //

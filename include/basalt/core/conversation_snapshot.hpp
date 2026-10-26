@@ -45,6 +45,10 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& checkpoint, 
                                       const ModelGeometry& g, std::string& error);
 bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const SessionState& session,
                                   const ModelGeometry& g, std::string& error);
+/// Overwrites the running state of layers [layer_lo, layer_hi) in a whole-model checkpoint with `part`'s, a session
+/// that holds those layers (another card's share of a prompt read).  The caller has synchronized `part`'s device.
+bool conversation_checkpoint_save_layers(ConversationCheckpoint& checkpoint, const SessionState& part,
+                                         const ModelGeometry& g, int64_t layer_lo, int64_t layer_hi, std::string& error);
 /// Saves a checkpoint's GDN recurrences off the caller's critical path: the device state is copied into a spare
 /// device buffer at device bandwidth, and a helper thread moves it to the checkpoint's host bytes while the caller
 /// carries on.  The checkpoint's `gdn` bytes are valid only once finish() has returned true; nothing may read,

@@ -96,6 +96,8 @@ public:
     /// The ring depth of the current layout.
     int ring_depth() const;
     static double pinned_share();
+    /// The pack's prompt experts run on the FP4 tensor cores (NVFP4 gate/up and down in every layer).
+    static bool fp4_experts();
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
@@ -139,6 +141,13 @@ public:
     /// --peer-exclusive: experts only `peer` holds have no host copy; the prompt path copies them from its memory
     /// through host staging into the ring.  Independent of set_peer.
     void set_ring_peer(core::PeerExperts* peer);
+    /// A stage on another card than the main one: an expert with no pinned host copy that the cache on `device` holds
+    /// (`res`: n_layers x n_expert slot or -1, read at every chunk) is copied from that card through host staging into
+    /// the ring.  Null `res`: none.
+    void set_ring_remote(const int32_t* res, const core::ExpertCache* cache, int device);
+    /// Off: the peer card's share (set_peer) is skipped, every expert of a chunk stays on this card - while the peer
+    /// card runs a stage of the same prompt.
+    void set_peer_share(bool on);
 
     /// The CPU expert pool (idle while a prompt is read). A chunk below stream_all_min() tokens hands it the
     /// non-resident experts with a host copy that few of its tokens route to, instead of streaming them; their rows
@@ -176,10 +185,18 @@ public:
     /// device `init` runs on.  A stage that does not start at layer 0 reads each chunk's residual rows from the
     /// previous stage instead of embedding the tokens; a stage that does not end at the last layer copies its rows
     /// to pinned host buffers (two, allocated by `init`) and runs `next` on them - on a thread, so the next stage
-    /// reads chunk c while this one reads chunk c + 1.  `on_chunk` belongs on the last stage.  Set before `init`.
-    void set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
-        stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = next;
-    }
+    /// reads chunk c while this one reads chunk c + 1.  `on_chunk` belongs on the last stage.  Set before `init`, or
+    /// between runs (a successor set after `init` needs `reserve_hand_off` first).
+    void set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next);
+    /// The two pinned hand-off buffers for chunks of up to `rows` tokens, for a successor set after `init`.
+    bool reserve_hand_off(int64_t rows, std::string& err);
+    /// Layer split: the first stage keeps a run's last chunk - it reads that chunk's layers and neither hands it on nor
+    /// reports it - for its card to read the later layers too (`continue_in_place`) once the later stages are done.
+    void set_keep_last(bool on) { keep_last_ = on; }
+    /// The next run reads the rows this stage's own buffers hold (the chunk it kept), not tokens or a hand-off.
+    void continue_in_place() { rows_in_place_ = true; hand_in_ = nullptr; }
+    /// A later stage: the hand-off buffer it read its last chunk from (pinned host, the stage before's), or null.
+    const float* hand_in() const { return hand_in_; }
 
 
 private:
@@ -194,6 +211,8 @@ private:
     Prefill* next_ = nullptr;
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
+    bool rows_in_place_ = false;        ///< the next run's rows are in this stage's own buffers (continue_in_place)
+    bool keep_last_ = false;            ///< set_keep_last
 
     std::string next_err_;
     std::future<bool> next_run_;

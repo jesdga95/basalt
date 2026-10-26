@@ -29,6 +29,13 @@ std::string cpu_label(const std::string& raw_name, int physical_cores);
 /// A JSON string literal, quoted the way json.dumps(ensure_ascii=False) does.
 std::string json_quote(const std::string& s);
 
+/// The CUDA ordinals an engine computes on, primary first and each once: card 0, then `peer_device` (when >= 1), every
+/// expert-tier card and every layer-split stage card, in that order.
+std::vector<int> engine_gpu_order(int peer_device, const std::vector<int>& peer_devices, const std::vector<int>& split_devices);
+
+/// The comma-separated PCI bus ids of the INFO line's gpus= field as a list; empty items are dropped.
+std::vector<std::string> split_gpu_ids(const std::string& csv);
+
 /// The row as the file spells it: 4-space indent, fixed key order, gpus expanded, no trailing newline.
 std::string community_row_text(const CommunityRow& row);
 

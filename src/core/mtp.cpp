@@ -1334,7 +1334,7 @@ bool MtpDrafter::prefill_cur(const float* R_rows, const int32_t* next_tokens, in
             if (cudaMemcpyAsync(tok_, d_tk + c, (size_t) T * 4, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
                 cudaMemcpyAsync(step_, d_stp + c * 4, (size_t) T * 16, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
                 cudaMemcpyAsync(pos_, d_ps + c * NHp, (size_t) (T * NHp) * 4, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
-                cudaMemcpyAsync(Rin_, rows, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
+                cudaMemcpyAsync(Rin_, rows, (size_t) T * HCN * sizeof(float), cudaMemcpyDefault,   // (or pinned host rows)
                                 cs_) != cudaSuccess ||
                 cudaGraphLaunch(prefill_dev_exec_[T], cs_) != cudaSuccess) {
                 err = std::string("mtp prefill: ") + cudaGetErrorString(cudaGetLastError());
