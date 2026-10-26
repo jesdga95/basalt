@@ -170,6 +170,15 @@ class SlotRows(Slots):
             t.join(10)
         self.assertTrue(all(r["state"] == "idle" for r in self.get("/slots")))
 
+    def test_generating_while_a_later_request_waits(self):
+        self.start({"go": "word " * 80}, n=2, delay=0.03)
+        ts, _ = self.run_all([lambda: self.chat("go a"), lambda: self.chat("go b"), lambda: self.chat("go c")])
+        self.wait_for(lambda: self.get("/metrics")["live"]["queued"] >= 1 and
+                      sum(r["state"] == "decoding" for r in self.get("/slots")) == 2, "two decoding, one waiting")
+        self.assertEqual(self.get("/metrics")["live"]["state"], "generating")
+        for t in ts:
+            t.join(20)
+
     def test_a_slot_reads_before_it_decodes(self):
         self.start({"go": "word " * 5}, delay=0.4)
         ts, _ = self.run_all([lambda: self.chat("go slowly")])

@@ -407,9 +407,11 @@ class Service:
             s = dict(self.status)
             if self.live_reqs:                          # parallel: the newest request
                 s = {**s, **dict(list(self.live_reqs.values())[-1][0]), "queued": s.get("queued", 0)}
+            # parallel: generating while any slot decodes, though the newest request may still wait or read
+            decoding = any(st.get("first_token") is not None for st, _ in self.live_reqs.values())
             hist = list(self.history)
         busy = bool(s.get("busy"))
-        if busy and s.get("first_token") is None:
+        if busy and s.get("first_token") is None and not decoding:
             state = "reading"
         elif busy:
             state = "generating"
