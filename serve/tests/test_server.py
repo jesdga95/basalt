@@ -259,6 +259,23 @@ class ImageMarkers(unittest.TestCase):
                     self.assertFalse((Path(d) / "req-test.sve").exists())
                     self.assertIsNone(svc.embeddings.path)
 
+    def test_refused_image_is_logged(self):
+        import contextlib
+        import io
+        tok = ByteTokenizer()
+
+        class Refuses:
+            def encode(self, sources):
+                raise ValueError("the image could not be read: the image needs 528 expert-cache slots and 454 can be lent")
+
+        msgs = [{"role": "user", "content": [{"type": "text", "text": "look"}, {"type": "image", "source": "x.png"}]}]
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
+                      vision=Refuses())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaisesRegex(ValueError, "528 expert-cache slots"):
+            svc.prepare(msgs, None, {})
+        self.assertIn("[server] error: the image could not be read: the image needs 528", out.getvalue())
+
     def test_literal_marker_with_an_image(self):
         import tempfile
         tok = ByteTokenizer()

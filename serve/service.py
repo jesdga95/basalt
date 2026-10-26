@@ -570,7 +570,11 @@ class Service:
             with self.fifo:
                 if getattr(self.vision, "in_engine", False):   # the encoder lives in the engine: it must be running
                     self.ensure_loaded()
-                self.embeddings.path, counts = self.vision.encode(images)
+                try:
+                    self.embeddings.path, counts = self.vision.encode(images)
+                except ValueError as e:                 # a refused image: the client gets the 400, the log says why
+                    print(f"[server] error: {e}", flush=True)
+                    raise
             # expand each image's pad to one per image token; a pad not after <|vision_start|> is message text
             literal = self.tok.encode(IMAGE_PAD, parse_special=False)
             out, k = [], 0
