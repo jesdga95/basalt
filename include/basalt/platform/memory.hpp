@@ -138,13 +138,24 @@ void stop_memory_watchdog();
 /// Whether an available-RAM reading of `avail` is below `floor` (a reading of 0, unknown, is not).
 inline bool ram_below_floor(uint64_t avail, uint64_t floor) { return avail > 0 && avail < floor; }
 
+/// Whether the guard gives the mapped view back now.  `avail` is the reading, `after` the reading right after the last
+/// give-back (0 = none yet) and `since_ms` the time since it.  Within `lead` of `floor`, the first give-back is due at
+/// once; later ones need the cooldown over and the reading down by `refill` since `after`, i.e. the view has been
+/// read in again.  A reading that stays low with nothing refilling therefore causes no repeated give-backs.
+inline bool reclaim_due(uint64_t avail, uint64_t floor, uint64_t lead, uint64_t after, uint64_t since_ms,
+                        uint64_t refill = 256ull << 20, uint64_t cooldown_ms = 250) {
+    if (!ram_below_floor(avail, floor + lead)) return false;
+    if (after == 0) return true;
+    return since_ms >= cooldown_ms && avail + refill <= after;
+}
+
 /// While serving: polls available_memory() and keeps whether it is below `floor_bytes`, for ram_guard_low.  The request
 /// that is running then stops with an error instead of the machine swapping; nothing is shrunk or exited.
 void start_ram_guard(uint64_t floor_bytes);
 /// True while the last reading was below the guard's floor; `avail` and `floor` get that reading and the floor.
 bool ram_guard_low(uint64_t* avail = nullptr, uint64_t* floor = nullptr);
 /// A mapped file view the guard gives back (drop_mapped_view) when a reading comes within 1 GiB of its floor, then
-/// reads again, at most once every few seconds and only after the reading has risen above that lead since.
+/// reads again; see reclaim_due for when it gives back again.
 /// Windows keeps a view's pages in the process once read and does not count them as available, where Linux counts
 /// them in MemAvailable; without this the guard would stop a request over pages the OS can reclaim.
 /// A null `base` withdraws the view; once that returns, the guard no longer touches it, so it can be unmapped.

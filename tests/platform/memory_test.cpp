@@ -367,6 +367,25 @@ int guard_reclaim_cases() {
     std::filesystem::remove(path, ec);
     return fail;
 }
+// When the guard gives the mapped view back, on injected readings
+int reclaim_due_cases() {
+    using namespace basalt::platform;
+    int fail = 0;
+    const uint64_t floor = gib(6.0), lead = gib(1.0), after = gib(7.0), step = 256ull << 20;
+    auto check = [&](const char* what, bool got, bool want) {
+        std::printf("reclaim due %-62s %s%s\n", what, got ? "yes" : "no", got == want ? "" : "   <-- WRONG");
+        fail |= got != want;
+    };
+    check("above the lead: no", reclaim_due(floor + lead, floor, lead, 0, 0), false);
+    check("within the lead, none given yet: yes", reclaim_due(floor + lead - 1, floor, lead, 0, 0), true);
+    check("reading unknown: no", reclaim_due(0, floor, lead, 0, 0), false);
+    check("view refilled a chunk, cooldown over: yes", reclaim_due(after - step, floor, lead, after, 250), true);
+    check("view refilled a chunk, cooldown running: no", reclaim_due(after - step, floor, lead, after, 249), false);
+    check("less than a chunk refilled: no", reclaim_due(after - step + 1, floor, lead, after, 10000), false);
+    check("low and nothing refilling: no", reclaim_due(floor + lead - 1, floor, lead, floor + lead - 1, 10000), false);
+    check("rose above the lead, fell back a chunk: yes", reclaim_due(floor + lead - 1, floor, lead, gib(9.0), 250), true);
+    return fail;
+}
 // The watchdog's line: the budget flag is named only when the resident copy is big enough for it to shrink.
 int exhausted_message_cases() {
     using basalt::platform::ram_exhausted_message;
@@ -412,7 +431,7 @@ uint64_t lock_test_bytes(bool& reduced) {
 
 int main() {
     int fail_keeps = file_cache_keeps_cases() | ram_floor_cases() | read_ahead_cases() | drop_view_cases() |
-                    guard_reclaim_cases() | exhausted_message_cases();
+                    guard_reclaim_cases() | reclaim_due_cases() | exhausted_message_cases();
     bool reduced = false;
     const uint64_t bytes = lock_test_bytes(reduced);
     if (bytes == 0) {
