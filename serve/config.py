@@ -11,6 +11,7 @@ from pathlib import Path
 from serve import ROOT
 from serve.engine.flags import flag_index
 from serve.engine.vision import VISION_MODES, VISION_USAGE, vision_mode
+from serve.util.console import tagged
 
 
 MIN_SLOT_CONTEXT = 256          # the least context a slot is given when --max-context is shared
@@ -199,25 +200,38 @@ def engine_groups(words: list[str]) -> list[list[str]]:
     return groups
 
 
+ENGINE_NAMES = {"max-context": "ctx", "pool-workers": "pool"}      # flag -> the console's name
+UNIT_SUFFIXES = {"-mib": "MiB", "-gib": "GiB"}
+
+
+def engine_item(group: list[str]) -> str:
+    """One engine flag with its values as `name=value`; a switch is its bare name."""
+    name, values = group[0][2:], group[1:]
+    for suffix, unit in UNIT_SUFFIXES.items():
+        if name.endswith(suffix) and len(values) == 1:
+            return f"{name[:-len(suffix)]}={values[0]}{unit}"
+    name = ENGINE_NAMES.get(name, name)
+    return f"{name}={','.join(values)}" if values else name
+
+
 def engine_line(file_words: list[str], cli_words: list[str],
                 shared: tuple[int, int] | None = None, grammar: tuple[bool, str] | None = None) -> str:
-    """The startup line listing the engine words from --config and the command line, each flag with its values and
-    origin; with none it says the default flags are used. `shared` is (total, slots) when --max-context
-    was divided among the slots. `grammar` is (on, origin) with origin "config" or "cli", None when left at its default (no entry)."""
+    """The startup line listing the engine words from --config and the command line as key=value items, each origin's
+    items followed by `(from config)` or `(from cli)`; with none it says `defaults`. `shared` is (total, slots)
+    when --max-context was divided among the slots. `grammar` is (on, origin) with origin "config" or "cli", None when
+    left at its default (no entry)."""
     groups = [(g, "config") for g in engine_groups(file_words)] + [(g, "cli") for g in engine_groups(cli_words)]
     last_ctx = max((i for i, (g, _) in enumerate(groups) if g[0] == "--max-context"), default=None)
-    def one(i, g, src):
-        note = f"{src}: {shared[0]} / {shared[1]} slots" if shared and i == last_ctx else src
-        return f"{' '.join(g)} ({note})"
-    shown = ", ".join(one(i, g, src) for i, (g, src) in enumerate(groups))
+    items: dict[str, list[str]] = {"config": [], "cli": []}
+    for i, (g, src) in enumerate(groups):
+        item = engine_item(g)
+        if shared and i == last_ctx:
+            item += f" ({shared[0]}/{shared[1]} slots)"
+        items[src].append(item)
     if grammar is not None:
-        on, origin = grammar
-        entry = f"grammar {'on' if on else 'off'} ({origin})"
-        shown = f"{shown}, {entry}" if shown else entry
-        base = "using default flags, " + entry if not groups else shown
-    else:
-        base = shown or "using default flags"
-    return f"[server] engine: {base}"
+        items[grammar[1]].append(f"grammar={'on' if grammar[0] else 'off'}")
+    shown = "  ".join(f"{' '.join(v)} (from {src})" for src, v in items.items() if v)
+    return tagged("engine", shown or "defaults")
 
 
 def _num(v):
@@ -280,13 +294,17 @@ def sampling_option(key: str):
     return parse
 
 
+SAMPLING_NAMES = {"temperature": "temp", "presence_penalty": "pres", "frequency_penalty": "freq",
+                  "repetition_penalty": "rep"}      # the console's short names
+
+
 def sampling_line(effective: dict, cli: set[str], config: set[str]) -> str:
     """The startup line for the effective sampling defaults, each marked with where it came from: the keys in
     `cli` were typed on the command line, those in `config` come from the config file; the rest are the model
     file's."""
-    mark = lambda k: " (command line)" if k in cli else " (config)" if k in config else ""
-    shown = ", ".join(f"{k}={v}{mark(k)}" for k, v in effective.items())
-    return f"[server] sampling defaults: {shown}"
+    mark = lambda k: "(cli)" if k in cli else "(config)" if k in config else ""
+    shown = " ".join(f"{SAMPLING_NAMES.get(k, k)}={v}{mark(k)}" for k, v in effective.items())
+    return tagged("sampling", shown)
 
 
 def vision_setting(text: str) -> str:

@@ -93,6 +93,8 @@ class Service:
         self.last_request_at = None                      # last request start or finish
         self.started_at = time.time()
         self.status_lock = threading.Lock()
+        self.live_lock = threading.Lock()               # one combined live line per LIVE_EVERY_S, whichever request is first
+        self.live_at = 0.0
         # GPU sharing, all off by default: idle unload seconds, min free VRAM to load, a command run before loading
         self.idle_unload_s = 0
         self.min_free_vram_mib = 0
@@ -580,6 +582,9 @@ class Service:
         with self.status_lock:
             s = self.status if st is None else st
             s["generated"] = n
+            windows = getattr(self.engine, "window_stats", None)
+            if windows is not None:
+                s["windows"], s["window_tokens"] = windows()
             if s.get("first_token") is None:
                 s["first_token"] = time.time()
             (self.rate if rate is None else rate).append((time.time(), n))   # live rate window
@@ -594,25 +599,61 @@ class Service:
                     s["phase"] = "tool call complete"
                 s["tail"] = ((s.get("tail") or "") + (ev.text or ""))[-600:]
 
+    def _slot_of(self, st) -> int | None:
+        """The slot a running request holds, as the slot table shows it (the lowest free one, kept to its end).
+        Call with status_lock held."""
+        total = max(1, int(getattr(self.engine, "batch", 0) or 0))
+        if st.get("slot") is None or st["slot"] >= total:
+            taken = {o["slot"] for o, _ in self.live_reqs.values()
+                     if o is not st and o.get("slot") is not None and o["slot"] < total}
+            st["slot"] = next((i for i in range(total) if i not in taken), None)
+        return st["slot"]
+
+    def live_line(self, now: float) -> str | None:
+        """One line for every request that is generating; None when none is."""
+        with self.status_lock:
+            reqs = [st for st, _ in self.live_reqs.values()] or ([self.status] if self.status.get("busy") else [])
+            rows = []
+            for st in sorted(reqs, key=lambda x: x.get("started") or 0):
+                if not st.get("busy") or st.get("first_token") is None:
+                    continue
+                slot = self._slot_of(st)
+                rows.append((-1 if slot is None else slot, dict(st)))
+        if not rows:
+            return None
+        parts, total = [], 0.0
+        for slot, st in sorted(rows, key=lambda r: r[0]):
+            seen = now - st["first_token"]
+            rate = st["generated"] / seen if seen >= LIVE_MIN_S else None   # too soon after the first token for a rate
+            total += rate or 0.0
+            parts.append(f"{slot_tag(None if slot < 0 else slot)} tg={st['generated']}/{st.get('max_tokens')}"
+                         + (f" {rate:.1f}t/s" if rate is not None else ""))
+        return "[server] live | " + " | ".join(parts) + f" | total {total:.0f}t/s"
+
     def _progress(self, last_print, every=1.0, st=None):
-        """Print a progress line at most every `every` seconds while a request runs."""
+        """Print progress while a request runs: its prompt read, then the shared live line."""
         now = time.time()
         with self.status_lock:
             s = dict(self.status if st is None else st)
         if now - last_print < (READ_PRINT_EVERY if s.get("first_token") is None else every):
             return last_print
-        el = now - s.get("started", now)
         if s.get("first_token") is None:
             pr = getattr(self.engine, "progress", None)   # (position, prompt tokens); a reused prefix counts as read
-            done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read
+            done = f"{pr[0]}/{pr[1]}" if pr and pr[1] else f"{s.get('prompt_tokens', 0)}"   # as read
             # the engine's average over the tokens it read for this request (a reused prefix is not in it)
             pp = getattr(self.engine, "prefill_tok_s_mean", None) if pr and pr[1] else None
-            speed = f", {pp:,.0f} tok/s" if pp and pp > 0 else ""
-            print(f"[server] reading the prompt: {done} tokens{speed}, {el:.0f} s", flush=True)
+            speed = f" {pp:.0f}t/s" if pp and pp > 0 else ""
+            with self.status_lock:
+                slot = self._slot_of(st if st is not None else self.status)
+            print(f"[server] {slot_tag(slot)} read  pp={done}{speed} {now - s.get('started', now):.0f}s", flush=True)
         else:
-            rate = s["generated"] / max(1e-6, now - s["first_token"])
-            print(f"[server] {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
-                  f"{el:.0f} s", flush=True)
+            with self.live_lock:
+                due = now - self.live_at >= LIVE_EVERY_S
+                if due:
+                    self.live_at = now
+            line = self.live_line(now) if due else None
+            if line:
+                print(line, flush=True)
         return now
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
@@ -889,12 +930,11 @@ class Service:
                             el = now - st.get("started", now)
                             ft = st.get("first_token")
                             rate = n / max(1e-6, now - ft) if ft else 0.0
-                            hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
-                            if hit_msg and pcie_share:
-                                hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
                             ttft = ft - st["started"] if ft and st.get("started") else None
-                            print(done_line(seen, n, finish, cancel.is_set(), timings, ttft, rate) + hit_msg,
-                                  flush=True)
+                            windows, window_tokens = st.get("windows") or 0, st.get("window_tokens") or 0
+                            dl = window_tokens / windows if windows else None
+                            print(done_line(self._slot_of(st), seen, n, finish, cancel.is_set(), timings, ttft, rate,
+                                            dl, hit_rate, pcie_share), flush=True)
                             if finish == "length" and parser.state == "reasoning":
                                 print("[server] warning: max tokens reached while thinking, no answer "
                                       "(set reasoning_budget_tokens, or start with --reasoning-budget-tokens)",
@@ -935,27 +975,44 @@ def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
 
 
 READ_PRINT_EVERY = 5.0      # seconds between the prompt-reading lines
-MIN_RATE_TOKENS = 16     # a prompt read of fewer tokens shows its time, not a rate
+LIVE_EVERY_S = 2.0          # seconds between the live lines
+LIVE_MIN_S = 0.5            # seconds of generation before the live line shows a slot's rate
+MIN_RATE_TOKENS = 16        # a reply of fewer tokens shows no wall-clock rate
+MIN_PP_RATE_TOKENS = 512    # a prompt read of fewer newly read tokens shows its time, not a rate
 
 
-def done_line(prompt_total: int, generated: int, finish: str, cancelled: bool, timings: dict | None,
-              ttft: float | None, wall_rate: float) -> str:
-    """The request's closing log line: the prompt (read, reused, time, speed), the reply (count, speed) and the
-    time to the first token.  `timings` is request_timings(); None when the engine gave no clock."""
+def slot_tag(slot: int | None) -> str:
+    """A slot as the console names it: s1, s2, ..."""
+    return "s?" if slot is None else f"s{slot + 1}"
+
+
+def done_line(slot: int | None, prompt_total: int, generated: int, finish: str, cancelled: bool,
+              timings: dict | None, ttft: float | None, wall_rate: float, dl: float | None = None,
+              hit: float | None = None, pcie: float | None = None) -> str:
+    """The request's closing log line: slot, prompt (total, cached, read time, read rate), reply (count, rate,
+    drafts accepted, tokens per window), time to the first token, end, expert cache hit and PCIe share.
+    `timings` is request_timings(); None when the engine gave no clock."""
     t = timings or {}
-    prompt = f"prompt {prompt_total:,} tokens"
-    if t.get("cache_n"):
-        prompt += f" ({t['cache_n']:,} reused)"
+    pp = f"pp={prompt_total}/{t.get('cache_n') or 0}c"
     if t.get("prompt_ms") is not None:
-        prompt += f" in {t['prompt_ms'] / 1000:.1f} s"
-        if (t.get("prompt_n") or 0) >= MIN_RATE_TOKENS and t.get("prompt_per_second"):
-            prompt += f", {t['prompt_per_second']:,.0f} tok/s"
+        pp += f" {t['prompt_ms'] / 1000:.1f}s"
+        if (t.get("prompt_n") or 0) >= MIN_PP_RATE_TOKENS and t.get("prompt_per_second"):
+            pp += f" {t['prompt_per_second']:.0f}t/s"
     rate = t.get("predicted_per_second") or (wall_rate if generated >= MIN_RATE_TOKENS else 0.0)
-    reply = f"{generated} tokens" + (f" at {rate:.1f} tok/s" if generated and rate else "")
-    parts = [prompt, reply]
+    tg = f"tg={generated}" + (f" {rate:.1f}t/s" if generated and rate else "")
+    if t.get("draft_n"):
+        tg += f" acc={t['draft_n_accepted'] / t['draft_n'] * 100:.0f}%"
+        if dl is not None:
+            tg += f" dl={dl:.1f}"
+    groups = [pp, tg]
     if ttft is not None:
-        parts.append(f"first token after {ttft:.1f} s")
-    return f"[server] done: {'; '.join(parts)} ({finish}{', cancel=True' if cancelled else ''})"
+        groups.append(f"ttft={ttft:.1f}s")
+    groups.append("end=" + ("cancelled" if cancelled or finish == "cancel" else finish))
+    if hit is not None:
+        groups.append(f"hit={hit * 100:.1f}%")
+        if pcie is not None:
+            groups.append(f"pcie={pcie * 100:.1f}%")
+    return f"[server] {slot_tag(slot)} done  " + "  ".join(groups)
 
 
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:

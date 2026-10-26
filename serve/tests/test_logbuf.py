@@ -67,6 +67,12 @@ class Levels(unittest.TestCase):
                           ("info", "basalt load: cuda0 1 2"), ("err", '  File "a.py", line 1'), ("err", "OSError: x"),
                           ("warn", "warning: low RAM")])
 
+    def test_a_startup_block_warning_reads_as_a_warning(self):
+        b = LogBuffer()
+        b.add("srv", "[server] warning  no api key, open to the network\n[server] warnings=0 ok\n[server] error: x")
+        self.assertEqual([(x["lvl"], x["msg"]) for x in b.since(0)[0]],
+                         [("warn", "warning  no api key, open to the network"), ("info", "warnings=0 ok"), ("err", "error: x")])
+
 
 class Buffer(unittest.TestCase):
     def test_ids_lines_and_fields(self):

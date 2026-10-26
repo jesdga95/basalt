@@ -35,6 +35,7 @@ from serve.engine.flags import flag_value
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStuck
 from serve.engine.slots import AdmissionQueue
 from serve.prompt import PromptText
+from serve.util.console import tagged
 from serve.engine.progress import narrate_start, server_line, start_errors, start_failure_hint, start_last_line
 
 
@@ -82,13 +83,18 @@ def engine_line(line: str) -> str:
 
 
 AUTO_FLAGS = "auto flags: "
+AUTO_NAMES = {"peer-exclusive": "peer-excl", "pool-workers": "pool"}   # the console's short names
 
 
 def relay_auto_flags(line: str) -> bool:
     """Print the engine's auto-picked flags as a server line; False when the line is not that line."""
     if not line.startswith(AUTO_FLAGS):
         return False
-    server_line("[server] " + line.rstrip("\n"))
+    pairs = []
+    for item in line.rstrip("\n")[len(AUTO_FLAGS):].split(", "):
+        name, _, value = item.partition(" ")
+        pairs.append(f"{AUTO_NAMES.get(name, name)}={value.replace(' ', '')}" if value else name)
+    server_line(tagged("auto", " ".join(pairs)))
     return True
 
 
@@ -164,6 +170,20 @@ class ProcessEngine:
         if self.batch:
             tl = self.__dict__.setdefault("_tl", threading.local())
             tl.last = value
+
+    # Windows of the request in progress on this thread: (windows, tokens in them), counted from the batch slot's
+    # `BT` lines.
+    def window_stats(self) -> tuple[int, int]:
+        tl = self.__dict__.setdefault("_wtl", threading.local())
+        return getattr(tl, "windows", 0), getattr(tl, "tokens", 0)
+
+    def _count_window(self, tokens: int) -> None:
+        tl = self.__dict__.setdefault("_wtl", threading.local())
+        tl.windows, tl.tokens = getattr(tl, "windows", 0) + 1, getattr(tl, "tokens", 0) + tokens
+
+    def _reset_windows(self) -> None:
+        tl = self.__dict__.setdefault("_wtl", threading.local())
+        tl.windows = tl.tokens = 0
 
     # `read_ms`: prompt-read time of the request in progress, summed over its engine runs (per thread with batch slots).
     @property
@@ -845,6 +865,7 @@ class ProcessEngine:
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress = None
+        self._reset_windows()
         keys = self.sampling_keys(sampling or {})
         out: list[int] = []
         pending: list[int] = []
@@ -1037,6 +1058,7 @@ class ProcessEngine:
                         phase = "none"
                         raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
                     if line.startswith("BT "):
+                        self._count_window(len(line.split()) - 2)
                         for t in (int(x) for x in line.split()[2:]):    # a window's tokens for this slot, in order
                             out.append(t)
                             if cancel.is_set():

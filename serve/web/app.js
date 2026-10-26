@@ -343,7 +343,7 @@ function drawSlots(M, multi) {
     host.replaceChildren(head, ...sl.map(s => {
       const d = document.createElement("div"); d.className = "lane"; d.dataset.s = "idle";
       const ctxc = cell("l-ctx"), meter = cell("meter"); meter.append(document.createElement("i")); ctxc.append(meter, cell(""));
-      d.append(cell("l-id", `Slot ${s.id}`), cell("l-st"), cell("l-tps"), cell("l-tok"), ctxc, cell("l-acc"), cell("l-req"));
+      d.append(cell("l-id", `Slot ${s.id + 1}`), cell("l-st"), cell("l-tps"), cell("l-tok"), ctxc, cell("l-acc"), cell("l-req"));
       return d;
     }));
   }

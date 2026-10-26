@@ -5,7 +5,7 @@ Markers, one per kind of writer:
            basalt <area>: warning: <text>   warning
            basalt <area>: error: <text>     error      (older engines: "basalt warning: <text>", "basalt error: <text>")
   server   [server] <text>                  info
-           [server] warning: <text>         warning
+           [server] warning: <text>         warning    (a startup block line reads `warning  <text>`)
            [server] error: <text>           error
   python   a "Traceback (most recent call last):" block, and the exception line that ends it   error
   other    anything else (driver and library output, engine tables)                             info
@@ -19,7 +19,7 @@ INFO, WARN, ERR = "info", "warn", "err"
 _NAMES = {"warning": WARN, "error": ERR}
 ENGINE = re.compile(r"(?P<tag>basalt(?:-[a-z]+)?(?: [\w-]+)*):(?: (?P<lvl>warning|error):)? (?P<text>.*)", re.S)
 LEGACY = re.compile(r"basalt (?P<lvl>warning|error): (?P<text>.*)", re.S)
-SERVER = re.compile(r"\[server\] (?:(?P<lvl>warning|error): )?")
+SERVER = re.compile(r"\[server\] (?:(?P<lvl>warning|error)(?:: | {2,}))?")
 TRACEBACK = "Traceback (most recent call last):"
 CHAINED = ("During handling of the above exception", "The above exception was the direct cause")
 
