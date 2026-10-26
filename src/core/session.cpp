@@ -210,6 +210,91 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
     s.ple_token = -1;
 }
 
+namespace {
+// the prompt session's layout over `base`; `s` gets the pointers
+uint64_t prompt_session_layout(const ModelGeometry& g, int64_t max_cells, int64_t k, uint8_t* base, SessionState& s,
+                               int64_t layer_lo, int64_t layer_hi) {
+    if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
+    if (layer_lo < 0) layer_lo = 0;
+    uint64_t used = 0;
+    auto take = [&](uint64_t bytes) {
+        uint8_t* r = base + used;
+        used = align_up(used + bytes, SESSION_STATE_ALIGN);
+        return r;
+    };
+    const int64_t I = std::max<int64_t>(g.qsa_interval, 1);
+    const int64_t q_n_range = layer_hi / I - layer_lo / I;
+    s.max_cells = max_cells;
+    s.k = k;
+    s.layer_lo = layer_lo;
+    s.layer_hi = layer_hi;
+    s.qsa_ord0 = layer_lo / I;
+    s.qsa_alloc = std::max<int64_t>(q_n_range, g.n_qsa_layers() > 0 ? 1 : 0);   // the primary state, as session_init
+    s.gdn_ord0 = layer_lo - layer_lo / I;
+    s.gdn_alloc = std::max<int64_t>((layer_hi - layer_lo) - q_n_range, 0);
+    s.gdn_state = (float*) take((uint64_t) s.gdn_alloc * gdn_state_floats(g) * 4);
+    if (s.qsa_states == nullptr && g.n_qsa_layers() > 0) s.qsa_states = new QsaState[(size_t) g.n_qsa_layers()]();
+    const uint64_t per = qsa_prompt_state_bytes(g, max_cells);
+    for (int64_t j = 0; j < s.qsa_alloc; ++j) qsa_prompt_state_carve(g, max_cells, take(per), s.qsa_states[s.qsa_ord0 + j]);
+    s.ple_hist = (float*) take(ple_hist_bytes());
+    s.ple.hist = s.ple_hist;
+    s.ple.emb_dev = (float*) take((uint64_t) basalt::kernels::NG_N_EMBD * 4);
+    s.ple.scratch = (float*) take(ple_run_scratch_bytes());
+    s.ple.token = &s.ple_token;
+    s.ple.prev = s.ple_prev;
+    s.R = nullptr;
+    return used;
+}
+}  // namespace
+
+uint64_t prompt_session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t layer_lo, int64_t layer_hi) {
+    SessionState s;
+    const uint64_t n = prompt_session_layout(g, max_cells, 10, reinterpret_cast<uint8_t*>(uint64_t{1} << 20), s,
+                                             layer_lo, layer_hi);
+    delete[] s.qsa_states;
+    return align_up(n, SESSION_STATE_ALIGN) + 4096;
+}
+
+void prompt_session_carve(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
+                          int64_t layer_lo, int64_t layer_hi) {
+    prompt_session_layout(g, max_cells, k, (uint8_t*) base, s, layer_lo, layer_hi);
+}
+
+void prompt_session_clear(SessionState& s, const ModelGeometry& g, void* stream) {
+    cudaStream_t cs = (cudaStream_t) stream;
+    cudaMemsetAsync(s.gdn_state, 0, (size_t) s.gdn_alloc * gdn_state_floats(g) * 4, cs);
+    for (int64_t j = 0; j < s.qsa_alloc; ++j) qsa_prompt_state_clear(s.qsa_states[s.qsa_ord0 + j], g, stream);
+    cudaMemsetAsync(s.ple_hist, 0, (size_t) ple_hist_bytes(), cs);
+    s.ple_prev[0] = -1;
+    s.ple_prev[1] = -1;
+    s.ple_token = -1;
+}
+
+bool session_copy_state(SessionState& dst, const SessionState& src, const ModelGeometry& g, int64_t layer_lo,
+                        int64_t layer_hi, int64_t cell0, int64_t cell1, const DeviceCopy& copy, std::string& err) {
+    const int64_t I = std::max<int64_t>(g.qsa_interval, 1);
+    const int64_t g0 = layer_lo - layer_lo / I, g1 = layer_hi - layer_hi / I;   // the GDN ordinals of the range
+    const int64_t q0 = layer_lo / I, q1 = layer_hi / I;                         // and the QSA ones
+    if (g0 < dst.gdn_ord0 || g1 > dst.gdn_ord0 + dst.gdn_alloc || g0 < src.gdn_ord0 || g1 > src.gdn_ord0 + src.gdn_alloc ||
+        q0 < dst.qsa_ord0 || q1 > dst.qsa_ord0 + dst.qsa_alloc || q0 < src.qsa_ord0 || q1 > src.qsa_ord0 + src.qsa_alloc) {
+        err = "a session state copy of layers one of the sessions does not hold";
+        return false;
+    }
+    const uint64_t row = gdn_state_floats(g);
+    if (g1 > g0 && !copy(dst.gdn_state + (size_t) (g0 - dst.gdn_ord0) * row, src.gdn_state + (size_t) (g0 - src.gdn_ord0) * row,
+                         (uint64_t) (g1 - g0) * row * 4)) {
+        err = "a session state copy could not be queued";
+        return false;
+    }
+    for (int64_t q = q0; q < q1; ++q)
+        if (!qsa_state_copy_cells(dst.qsa_states[q], src.qsa_states[q], g, cell0, cell1, copy, err)) return false;
+    if (layer_lo <= 1 && 1 < layer_hi && !copy(dst.ple_hist, src.ple_hist, ple_hist_bytes())) {
+        err = "a session state copy could not be queued";
+        return false;
+    }
+    return true;
+}
+
 /// Sets `s.gdn.state`/`conv_state` for `layer`, which is what makes one layer's GDN state its own.  Shared by
 /// the direct and captured paths so the two cannot disagree about which slice a layer owns.
 void gdn_point_at(const ModelGeometry& g, int64_t layer, SessionState& s) {

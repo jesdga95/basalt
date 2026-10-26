@@ -305,7 +305,7 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
 add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
   src/core/remote_expert_opt.cu
   src/core/expert_cache.cpp src/core/vmm.cpp src/core/kv_arena.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
-  src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp)
+  src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp)
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(engine PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
 if(BUILD_TESTING)
@@ -372,6 +372,11 @@ if(BUILD_TESTING)
   target_link_libraries(conversation_snapshot_test PRIVATE engine)
   basalt_gpu_test(NAME conversation_snapshot_test COMMAND conversation_snapshot_test)
   set_tests_properties(conversation_snapshot_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+  # the prompt-time layer split's state moves (a layer range into a prompt session, back, into a checkpoint)
+  add_executable(prompt_split_state_test tests/core/prompt_split_state_test.cpp)
+  target_link_libraries(prompt_split_state_test PRIVATE engine)
+  basalt_gpu_test(NAME prompt_split_state_test COMMAND prompt_split_state_test)
+  set_tests_properties(prompt_split_state_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   # the .basalt reader: table, meta JSON, the GGUF view of the source tensors, the layout text, the hc8 table
   add_executable(model_file_test tests/core/model_file_test.cpp)
   target_link_libraries(model_file_test PRIVATE engine)

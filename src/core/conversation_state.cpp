@@ -169,6 +169,34 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     return true;
 }
 
+bool conversation_checkpoint_save_layers(ConversationCheckpoint& c, const SessionState& part, const ModelGeometry& g,
+                                         int64_t layer_lo, int64_t layer_hi, std::string& error) {
+    ConversationStateSizes z;
+    if (!conversation_state_sizes(g, z, error)) return false;
+    const int64_t I = std::max<int64_t>(g.qsa_interval, 1);
+    const int64_t g0 = layer_lo - layer_lo / I, g1 = layer_hi - layer_hi / I;   // the range's GDN ordinals
+    const int64_t q0 = layer_lo / I, q1 = layer_hi / I;                         // and its QSA ones
+    const size_t n_qsa = (size_t) g.n_qsa_layers();
+    if (layer_lo < 0 || layer_hi > g.n_layers || layer_lo >= layer_hi || c.gdn.size() != z.gdn ||
+        c.tails.size() != n_qsa * z.tail || c.dead.size() != n_qsa * z.dead || c.block_pos.size() != n_qsa * z.block_pos ||
+        g0 < part.gdn_ord0 || g1 > part.gdn_ord0 + part.gdn_alloc || q0 < part.qsa_ord0 ||
+        q1 > part.qsa_ord0 + part.qsa_alloc || (q1 > q0 && !part.qsa_states))
+        return fail(error, "a layer range's running state outside the checkpoint or the session");
+    const size_t row = g.n_gdn_layers() > 0 ? z.gdn / (size_t) g.n_gdn_layers() : 0;
+    if (g1 > g0 && !copy(c.gdn.data() + (size_t) g0 * row,
+                         reinterpret_cast<const uint8_t*>(part.gdn_state) + (size_t) (g0 - part.gdn_ord0) * row,
+                         (size_t) (g1 - g0) * row, error))
+        return false;
+    for (int64_t q = q0; q < q1; ++q) {
+        const QsaState& st = part.qsa_states[q];
+        if (!copy(c.tails.data() + (size_t) q * z.tail, st.idx_tail, z.tail, error) ||
+            !copy(c.dead.data() + (size_t) q * z.dead, st.idx_dead, z.dead, error) ||
+            !copy(c.block_pos.data() + (size_t) q * z.block_pos, st.idx_block_pos, z.block_pos, error))
+            return false;
+    }
+    return true;
+}
+
 ConversationCheckpointDeferral::~ConversationCheckpointDeferral() {
     if (worker_.joinable()) worker_.join();
     if (stream_) cudaStreamDestroy(static_cast<cudaStream_t>(stream_));
