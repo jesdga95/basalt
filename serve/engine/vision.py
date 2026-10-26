@@ -15,6 +15,7 @@ from pathlib import Path
 
 from serve.engine import lifeline
 from serve.engine.process import frame_pipes
+from serve.util.console import tagged
 
 # Reads of the encoder's pipe have a timeout: a read that never returns would hold the request turn for good.
 # Generous: a cold model load or a slow encode is not a hang. A silent encoder is killed and the next request
@@ -404,18 +405,18 @@ def gpu_card_name(index: int) -> str | None:
 def vision_line(vision: dict | None, cfg: dict, ready_s: float = 0.0, name=gpu_card_name) -> str:
     """The startup line about the encoder: off, or where it runs and its ready time."""
     if not vision:
-        return "[server] vision mode: off"
-    took = f"ready in {ready_s:.1f} s"
+        return tagged("vision", "mode=off")
+    took = f"ready={ready_s:.1f}s"
     mode = vision.get("mode") or "cpu"
     listed = gpu_list(cfg)
     main = listed[0] if listed else 0
 
     def card(i):
         n = name(i)
-        return f"GPU {i}{f' ({n})' if n else ''}"
+        return f"gpu={i}{f' ({n})' if n else ''}"
     gpu = vision_card(mode)
     if gpu is not None:
-        return f"[server] vision mode: {card(gpu)}, {took}"
+        return tagged("vision", f"mode=gpu {card(gpu)} {took}")
     if mode == "dynamic":
-        return f"[server] vision mode: dynamic, {card(main)}, loads per image"
-    return f"[server] vision mode: cpu, {max(1, (os.cpu_count() or 2) // 2)} threads, {took}"
+        return tagged("vision", f"mode=dynamic {card(main)} load=per-image")
+    return tagged("vision", f"mode=cpu threads={max(1, (os.cpu_count() or 2) // 2)} {took}")

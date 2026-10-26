@@ -57,7 +57,7 @@ class BusyHeartbeat(unittest.TestCase):
         busy = [l for l in cap.splitlines() if "GiB" in l and ("system ram" in l or "cuda0" in l)]
         ram = [l for l in busy if "system ram" in l]
         cuda = [l for l in busy if "cuda0" in l]
-        idle = [l for l in cap.splitlines() if "still starting" in l]
+        idle = [l for l in cap.splitlines() if l.startswith("[server] starting")]
         fin = [l for l in cap.splitlines() if l.startswith("[server] loaded")]
         self.assertGreaterEqual(len(ram), 3, cap)
         self.assertGreaterEqual(len(cuda), 1, cap)
@@ -65,7 +65,7 @@ class BusyHeartbeat(unittest.TestCase):
         self.assertTrue(any(" MB/s" in l for l in ram), cap)
         self.assertGreaterEqual(len(idle), 1, cap)
         self.assertEqual(len(fin), 1, cap)
-        self.assertIn(f"loaded {total / 2**30:.1f} GiB", fin[0])
+        self.assertIn(f"loaded   {total / 2**30:.1f}GiB", fin[0])
 
     def test_on_a_terminal_the_heartbeat_adds_no_rows(self):
         with tempfile.TemporaryDirectory() as d:

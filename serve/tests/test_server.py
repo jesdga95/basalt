@@ -1144,15 +1144,15 @@ class GpuChoice(unittest.TestCase):
     def test_vision_startup_line(self):
         from serve.engine.vision import vision_line
         name = lambda i: f"card{i}"
-        self.assertEqual(vision_line(None, {}), "[server] vision mode: off")
+        self.assertEqual(vision_line(None, {}), "[server] vision   mode=off")
         cpu = vision_line({"gpu": False, "mode": "cpu"}, {}, 2.34)
-        self.assertRegex(cpu, r"^\[server\] vision mode: cpu, \d+ threads, ready in 2\.3 s$")
+        self.assertRegex(cpu, r"^\[server\] vision   mode=cpu threads=\d+ ready=2\.3s$")
         self.assertEqual(vision_line({"gpu": True, "mode": "1"}, {"gpu": "0,1"}, 5.0, name=name),
-                         "[server] vision mode: GPU 1 (card1), ready in 5.0 s")
+                         "[server] vision   mode=gpu gpu=1 (card1) ready=5.0s")
         self.assertEqual(vision_line({"gpu": True, "mode": "2"}, {"gpu": "0"}, 5.0, name=lambda i: None),
-                         "[server] vision mode: GPU 2, ready in 5.0 s")
+                         "[server] vision   mode=gpu gpu=2 ready=5.0s")
         self.assertEqual(vision_line({"gpu": True, "mode": "dynamic"}, {"gpu": "0,1"}, 0.0, name=name),
-                         "[server] vision mode: dynamic, GPU 0 (card0), loads per image")
+                         "[server] vision   mode=dynamic gpu=0 (card0) load=per-image")
 
     def test_vision_device(self):
         from serve.engine.vision import child_env, vision_card, vision_env
@@ -1399,7 +1399,7 @@ class PcieShare(unittest.TestCase):
         rows = list(svc.history)
         self.assertEqual([r["hit_rate"] for r in rows], [0.6, 0.6, 0.6])
         self.assertEqual([r["pcie_share"] for r in rows], [0.2, 0.0, None])
-        self.assertIn("expert cache 60.0% hit (+20.0% of the routed experts over PCIe)", out.getvalue())
+        self.assertIn("end=length  hit=60.0%  pcie=20.0%", out.getvalue())
 
 
 class RepeatStop(unittest.TestCase):
@@ -1622,8 +1622,8 @@ class LoadProgress(unittest.TestCase):
         bars.finish()
         lines = out.getvalue().splitlines()
         self.assertEqual(len(lines), 1)
-        self.assertTrue(lines[0].startswith("[server] loaded 100.0 GiB in "))
-        self.assertTrue(lines[0].endswith("(system ram 100.0 GiB)"))
+        self.assertTrue(lines[0].startswith("[server] loaded   100.0GiB "))
+        self.assertTrue(lines[0].endswith("ram=100.0GiB"))
 
     def test_phases_add_up_to_one_result(self):
         from serve.engine.progress import LoadBars
@@ -1637,8 +1637,8 @@ class LoadProgress(unittest.TestCase):
         bars.update("cuda1", 2 << 30, 2 << 30, copy=True)
         bars.finish()
         line, = out.getvalue().splitlines()
-        self.assertTrue(line.startswith("[server] loaded 5.0 GiB in "))
-        self.assertTrue(line.endswith("(cuda2 5.0 GiB; cuda3 copy 2.0 GiB)"))
+        self.assertTrue(line.startswith("[server] loaded   5.0GiB "))
+        self.assertTrue(line.endswith("cuda2=5.0GiB cuda3-copy=2.0GiB"))
 
     def test_unfinished_start_is_not_reported(self):
         from serve.engine.progress import LoadBars
@@ -1698,8 +1698,8 @@ class LoadProgress(unittest.TestCase):
         self.assertEqual(rows[1], "[server] loading the n-gram table into system ram [" + "=" * 8 + ">" + " " * 15 + "]   1.0/3.0 GiB")
         bars.update("ngram", 3 << 30, 3 << 30)
         bars.finish()
-        self.assertIn("[server] loaded 2.0 GiB in ", out.getvalue())     # the table is not part of the loaded bytes
-        self.assertIn("(cuda2 2.0 GiB)", out.getvalue())
+        self.assertIn("[server] loaded   2.0GiB ", out.getvalue())     # the table is not part of the loaded bytes
+        self.assertIn("cuda2=2.0GiB", out.getvalue())
 
     @staticmethod
     def _screen(raw: str) -> list[str]:
@@ -1747,7 +1747,7 @@ class LoadProgress(unittest.TestCase):
             self._ple_ram_start(out, foreign)
             shown = self._screen(out.getvalue())
             self.assertEqual(len([x for x in shown if "loading" in x]), 0, shown)
-            self.assertTrue(shown[0].startswith("[server] auto flags") if foreign else shown[0].startswith("[server] loaded"), shown)
+            self.assertTrue(shown[0].startswith("[server] auto ") if foreign else shown[0].startswith("[server] loaded"), shown)
             self.assertTrue(any(x.startswith("[server] loaded") for x in shown), shown)
 
     def test_the_ngram_row_is_drawn_while_the_table_loads(self):
@@ -1766,7 +1766,7 @@ class LoadProgress(unittest.TestCase):
         self._ple_ram_start(out, True)
         lines = out.getvalue().splitlines()
         self.assertEqual(len(lines), 2, lines)
-        self.assertTrue(lines[0].startswith("[server] auto flags") and lines[1].startswith("[server] loaded 40.0 GiB"))
+        self.assertTrue(lines[0].startswith("[server] auto ") and lines[1].startswith("[server] loaded   40.0GiB"))
         self.assertNotIn("\x1b", out.getvalue())
 
     def test_kv_is_a_line_after_the_result_and_not_a_load(self):
@@ -1785,8 +1785,8 @@ class LoadProgress(unittest.TestCase):
         bars.update("cuda0", 2 << 30, 2 << 30)
         bars.finish()
         first, second = out.getvalue().splitlines()
-        self.assertTrue(first.startswith("[server] loaded 2.0 GiB in "))   # the allocation is not in the total
-        self.assertEqual(second, "[server] kv cache: 4.0 GiB on cuda2, 262144 tokens")
+        self.assertTrue(first.startswith("[server] loaded   2.0GiB "))   # the allocation is not in the total
+        self.assertEqual(second, "[server] kv       4.0GiB cuda2 tokens=262144")
 
     def test_kv_line_sums_solo_slots_and_draft_per_device(self):
         from serve.engine.progress import LoadBars
@@ -1797,19 +1797,19 @@ class LoadProgress(unittest.TestCase):
         bars.set_kv("cuda0", 1 << 29, 262144, "draft")
         bars.set_kv("cuda1", 1 << 30, 1000, "slot")
         self.assertEqual(bars.kv_lines(), [
-            "[server] kv cache: 12.5 GiB on cuda2 (solo 262144 tokens + 2 slots x 262144 tokens + draft K/V 0.5 GiB)",
-            "[server] kv cache: 1.0 GiB on cuda3 (1 slot x 1000 tokens)"])
+            "[server] kv       12.5GiB cuda2 solo=262144 slots=2x262144 draft=0.5GiB",
+            "[server] kv       1.0GiB cuda3 slots=1x1000"])
 
     def test_an_elastic_kv_line_reads_backed_over_most(self):
         from serve.engine.progress import LoadBars, load_kv
         bars = LoadBars(io.StringIO(), gpus=[2, 3])
         bars.set_kv(*load_kv("basalt load: kv cuda0 536870912 262144 4294967296"))
         bars.set_kv(*load_kv("basalt load: kv draft cuda0 107374182 262144 429496729"))
-        self.assertEqual(bars.kv_lines(), ["[server] kv cache: 0.6 / 4.4 GiB on cuda2 (elastic)"])
+        self.assertEqual(bars.kv_lines(), ["[server] kv       0.6/4.4GiB cuda2 elastic"])
         slots = LoadBars(io.StringIO())
         slots.set_kv("cuda0", 1 << 29, 262144, "slot", 4 << 30)
         slots.set_kv("cuda0", 1 << 29, 262144, "slot", 4 << 30)
-        self.assertEqual(slots.kv_lines(), ["[server] kv cache: 1.0 / 8.0 GiB on cuda0 (elastic, 2 slots)"])
+        self.assertEqual(slots.kv_lines(), ["[server] kv       1.0/8.0GiB cuda0 elastic slots=2"])
 
     def test_a_target_planned_empty_shows_nothing(self):
         from serve.engine.progress import LoadBars
@@ -1830,7 +1830,7 @@ class LoadProgress(unittest.TestCase):
         bars.update("cuda0", 4 << 30, 4 << 30)
         bars.set_total(4 << 30)                                         # the engine left 2 GiB on the file
         bars.finish()
-        self.assertTrue(out.getvalue().startswith("[server] loaded 4.0 GiB in "))
+        self.assertTrue(out.getvalue().startswith("[server] loaded   4.0GiB "))
 
     def test_names_follow_the_picked_cards(self):
         from serve.engine.progress import LoadBars
@@ -1856,8 +1856,8 @@ class LoadProgress(unittest.TestCase):
         lines = out.getvalue().splitlines()
         self.assertEqual(lines[0], "[server] warning: model 1.0 GiB, free VRAM + RAM 0.5 GiB: slow")
         self.assertEqual(len(lines), 2)
-        self.assertTrue(lines[1].startswith("[server] loaded 0.0 GiB in "))
-        self.assertTrue(lines[1].endswith("(cuda0 0.0 GiB, system ram 0.0 GiB; cuda1 copy 0.0 GiB)"))
+        self.assertTrue(lines[1].startswith("[server] loaded   0.0GiB "))
+        self.assertTrue(lines[1].endswith("cuda0=0.0GiB ram=0.0GiB cuda1-copy=0.0GiB"))
 
     def test_narrator_shows_the_ram_floor_line(self):
         from serve.engine.progress import engine_ram_floor, narrate_start
@@ -1875,7 +1875,7 @@ class LoadProgress(unittest.TestCase):
             time.sleep(0.6)
             done.set()
             t.join(5)
-        self.assertEqual(out.getvalue().splitlines()[0], "[server] RAM floor: " + text)
+        self.assertEqual(out.getvalue().splitlines()[0], "[server] ram      floor " + text)
 
     def test_an_older_engine_without_a_total_counts_bytes(self):
         from serve.engine.progress import narrate_start
@@ -1963,11 +1963,11 @@ class LiveRate(unittest.TestCase):
         from types import SimpleNamespace
         st = {"started": time.time() - 10, "first_token": None, "prompt_tokens": 3905}
         for eng, want in ((SimpleNamespace(progress=(2048, 3905), prefill_tok_s_mean=410.2),
-                           "reading the prompt: 2,048 of 3,905 tokens, 410 tok/s, 10 s"),
+                           "[server] s1 read  pp=2048/3905 410t/s 10s"),
                           (SimpleNamespace(progress=(2048, 3905), prefill_tok_s_mean=None),
-                           "reading the prompt: 2,048 of 3,905 tokens, 10 s"),
+                           "[server] s1 read  pp=2048/3905 10s"),
                           (SimpleNamespace(progress=None, prefill_tok_s_mean=410.2),
-                           "reading the prompt: 3,905 tokens, 10 s")):
+                           "[server] s1 read  pp=3905 10s")):
             self.svc.engine = eng
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 self.svc._progress(0, st=st)
@@ -1975,27 +1975,84 @@ class LiveRate(unittest.TestCase):
 
     def test_done_line_formats(self):
         from serve.service import done_line, request_timings
-        last = {"prompt_ms": 1200.0, "decode_ms": 8560.0, "generated": 412, "reused": 3700}
+        last = {"prompt_ms": 1200.0, "decode_ms": 8560.0, "generated": 412, "reused": 3700,
+                "drafts_offered": 100, "drafts_accepted": 65}
         tm = request_timings(3838, 412, last)
-        self.assertEqual(done_line(3838, 412, "stop", False, tm, 1.3, 40.0),
-                         "[server] done: prompt 3,838 tokens (3,700 reused) in 1.2 s, 115 tok/s; "
-                         "412 tokens at 48.1 tok/s; first token after 1.3 s (stop)")
-        # no reuse
+        # 138 newly read tokens: the time, no rate; drafts give acc and dl
+        self.assertEqual(done_line(0, 3838, 412, "stop", False, tm, 1.3, 40.0, 2.9, 0.897, 0.393),
+                         "[server] s1 done  pp=3838/3700c 1.2s  tg=412 48.1t/s acc=65% dl=2.9  ttft=1.3s  "
+                         "end=stop  hit=89.7%  pcie=39.3%")
+        # 512 or more newly read tokens: the read rate, and no cache
         tm = request_timings(2000, 5, {"prompt_ms": 4000.0, "decode_ms": 500.0, "generated": 5})
-        self.assertEqual(done_line(2000, 5, "length", True, tm, 4.1, 9.0),
-                         "[server] done: prompt 2,000 tokens in 4.0 s, 500 tok/s; "
-                         "5 tokens at 10.0 tok/s; first token after 4.1 s (length, cancel=True)")
-        # a one-token tail: the time, no rate
+        self.assertEqual(done_line(2, 2000, 5, "length", False, tm, 4.1, 9.0),
+                         "[server] s3 done  pp=2000/0c 4.0s 500t/s  tg=5 10.0t/s  ttft=4.1s  end=length")
+        tm = request_timings(512, 5, {"prompt_ms": 1000.0, "decode_ms": 500.0, "generated": 5})
+        self.assertIn(" 1.0s 512t/s", done_line(0, 512, 5, "stop", False, tm, 1.0, 9.0))
+        tm = request_timings(511, 5, {"prompt_ms": 1000.0, "decode_ms": 500.0, "generated": 5})
+        self.assertIn("pp=511/0c 1.0s  ", done_line(0, 511, 5, "stop", False, tm, 1.0, 9.0))
+        # no drafting: no acc, no dl; a cancel
         tm = request_timings(3839, 10, {"prompt_ms": 30.0, "decode_ms": 200.0, "generated": 10, "reused": 3838})
-        self.assertEqual(done_line(3839, 10, "stop", False, tm, 0.2, 50.0),
-                         "[server] done: prompt 3,839 tokens (3,838 reused) in 0.0 s; "
-                         "10 tokens at 50.0 tok/s; first token after 0.2 s (stop)")
-        # no engine clock: the wall rate, no prompt timing
-        self.assertEqual(done_line(100, 0, "stop", False, None, None, 0.0),
-                         "[server] done: prompt 100 tokens; 0 tokens (stop)")
-        self.assertEqual(done_line(100, 7, "stop", False, None, 0.5, 21.0),
-                         "[server] done: prompt 100 tokens; 7 tokens; first token after 0.5 s (stop)")
-        self.assertIn("20 tokens at 21.0 tok/s", done_line(100, 20, "stop", False, None, 0.5, 21.0))
+        self.assertEqual(done_line(0, 3839, 10, "cancel", True, tm, 0.2, 50.0, 3.0),
+                         "[server] s1 done  pp=3839/3838c 0.0s  tg=10 50.0t/s  ttft=0.2s  end=cancelled")
+        # no engine clock: the wall rate from 16 tokens, no prompt timing
+        self.assertEqual(done_line(0, 100, 0, "stop", False, None, None, 0.0),
+                         "[server] s1 done  pp=100/0c  tg=0  end=stop")
+        self.assertEqual(done_line(None, 100, 7, "error", False, None, 0.5, 21.0),
+                         "[server] s? done  pp=100/0c  tg=7  ttft=0.5s  end=error")
+        self.assertIn("tg=20 21.0t/s", done_line(0, 100, 20, "stop", False, None, 0.5, 21.0))
+
+    def live(self, rows, now):
+        """The live line for requests given as (slot, generated, max, started-ago, windows, window tokens)."""
+        from types import SimpleNamespace
+        self.svc.engine = SimpleNamespace(batch=4)
+        self.svc.live_reqs = {}
+        for i, (slot, n, mx, ago, w, wt) in enumerate(rows):
+            st = {"busy": True, "slot": slot, "generated": n, "max_tokens": mx, "started": now - ago - 1,
+                  "first_token": now - ago, "windows": w, "window_tokens": wt}
+            self.svc.live_reqs[i] = (st, [])
+        return self.svc.live_line(now)
+
+    def test_live_line_lists_every_generating_slot(self):
+        now = time.time()
+        self.assertEqual(self.live([(0, 454, 2048, 4.0, 150, 454)], now),
+                         "[server] live | s1 tg=454/2048 113.5t/s | total 114t/s")
+        line = self.live([(0, 400, 2048, 4.0, 100, 400), (1, 300, 1024, 3.0, 0, 0), (2, 100, 512, 2.0, 50, 100),
+                          (3, 0, 512, 1.0, 0, 0)], now)
+        self.assertEqual(line, "[server] live | s1 tg=400/2048 100.0t/s | s2 tg=300/1024 100.0t/s | "
+                               "s3 tg=100/512 50.0t/s | s4 tg=0/512 0.0t/s | total 250t/s")
+        self.assertIsNone(self.live([], now))
+        # just after the first token: no rate
+        self.assertEqual(self.live([(0, 1, 100, 0.1, 1, 1)], now), "[server] live | s1 tg=1/100 | total 0t/s")
+        self.assertNotIn("acc=", self.live([(0, 454, 2048, 4.0, 150, 454)], now))      # exact figures only on the done line
+
+    def test_the_engine_counts_windows_per_thread(self):
+        eng = ProcessEngine.__new__(ProcessEngine)
+        eng._reset_windows()
+        eng._count_window(3)
+        eng._count_window(2)
+        seen = []
+        t = threading.Thread(target=lambda: seen.append(eng.window_stats()))
+        t.start()
+        t.join()
+        self.assertEqual((eng.window_stats(), seen), ((2, 5), [(0, 0)]))
+
+    def test_a_request_still_reading_has_no_live_entry(self):
+        now = time.time()
+        self.live([(0, 400, 2048, 4.0, 0, 0)], now)
+        self.svc.live_reqs[9] = ({"busy": True, "slot": 1, "generated": 0, "max_tokens": 9, "started": now - 3,
+                                 "first_token": None}, [])
+        self.assertNotIn("s2", self.svc.live_line(now))
+
+    def test_the_live_line_prints_at_most_every_two_seconds(self):
+        now = time.time()
+        self.live([(0, 10, 100, 1.0, 0, 0)], now)
+        st = self.svc.live_reqs[0][0]
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.svc._progress(0, st=st)
+            self.svc._progress(0, st=st)
+            self.svc.live_at -= 2.1
+            self.svc._progress(0, st=st)
+        self.assertEqual(out.getvalue().count("[server] live |"), 2)
 
     def test_live_progress_lines(self):
         from types import SimpleNamespace
@@ -2010,8 +2067,8 @@ class LiveRate(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(self.svc._progress(time.time() - 2, st=st) > 0, True)
             self.svc._progress(time.time() - 6, st=st)
-        self.assertEqual(out.getvalue().count("reading the prompt"), 1)   # 2 s since the last line: too soon
-        self.assertIn("reading the prompt: 1,600 of 3,838 tokens, 410 tok/s, 6 s", out.getvalue())
+        self.assertEqual(out.getvalue().count(" read  pp="), 1)   # 2 s since the last line: too soon
+        self.assertIn("[server] s1 read  pp=1600/3838 410t/s 6s", out.getvalue())
 
     def test_prefill_rate_excludes_cached_tokens(self):
         import io

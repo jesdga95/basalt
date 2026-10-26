@@ -1,4 +1,4 @@
-"""The engine's `auto flags: <pairs>` line is relayed once per start as `[server] auto flags: <pairs>`, and never
+"""The engine's `auto flags: <pairs>` line is relayed once per start as `[server] auto     k=v ...`, and never
 reaches a reply."""
 from __future__ import annotations
 
@@ -59,23 +59,23 @@ class AutoFlagsLine(unittest.TestCase):
     def test_the_line_is_relayed_verbatim_once(self):
         with tempfile.TemporaryDirectory() as d:
             _, out, _ = self.start(d, LINE)
-            self.assertEqual(out.getvalue(), "[server] " + LINE + "\n")
+            self.assertEqual(out.getvalue(), "[server] auto     peer-excl=off resident=51.2GB pool-affinity=all pool=15\n")
 
     def test_no_line_prints_nothing(self):
         with tempfile.TemporaryDirectory() as d:
             _, out, _ = self.start(d, None)
-            self.assertNotIn("auto flags", out.getvalue())
+            self.assertNotIn("[server] auto", out.getvalue())
 
     def test_a_restart_relays_the_line_only_when_it_comes_again(self):
         with tempfile.TemporaryDirectory() as d:
             engine, out, auto = self.start(d, LINE)
             with contextlib.redirect_stdout(out):
                 engine.restart()
-            self.assertEqual(out.getvalue().count("[server] " + LINE + "\n"), 2)
+            self.assertEqual(out.getvalue().count("[server] auto     peer-excl=off"), 2)
             auto.unlink()
             with contextlib.redirect_stdout(out):
                 engine.restart()
-            self.assertEqual(out.getvalue().count("auto flags"), 2)
+            self.assertEqual(out.getvalue().count("[server] auto"), 2)
 
     def test_the_line_does_not_reach_a_reply(self):
         with tempfile.TemporaryDirectory() as d:

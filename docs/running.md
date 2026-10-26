@@ -45,9 +45,9 @@ their RAM copies into VRAM staging and computes them while the CPU pool computes
 The startup line `batch windows: a layer with N+ CPU misses sends a share of them over PCIe to CUDA0` gives the
 threshold. A request decoding alone runs the single-stream path and is not affected.
 
-At startup the server prints one `[server] kv cache:` line per device with all the session state placed there, for
-example `12.5 GiB on cuda2 (solo 262144 tokens + 2 slots x 262144 tokens + draft K/V 0.5 GiB)`. With elastic KV (the
-default for a server whose `--max-context` is above 32768, or with `--parallel` for slots above 4096 tokens) it reads `0.6 / 4.4 GiB on cuda0 (elastic)`: the memory backed at startup, and what the cache can
+At startup the server prints one `[server] kv` line per device with all the session state placed there, for
+example `12.5GiB cuda2 solo=262144 slots=2x262144 draft=0.5GiB`. With elastic KV (the
+default for a server whose `--max-context` is above 32768, or with `--parallel` for slots above 4096 tokens) it reads `0.6/4.4GiB cuda0 elastic`: the memory backed at startup, and what the cache can
 grow to at `--max-context`. Because that memory is
 taken from the expert cache, the engine warns (`warning: the N batch slots' sessions ... take X GiB of CUDA0
 ...`) when it leaves the cache short of the expert set, or at under half of what it would hold without the slots, and
@@ -71,8 +71,62 @@ the slots that did fit; if fewer than two fit, `--batch is off` and the server r
   `logit_bias`, a request with a grammar (JSON `response_format`, tools), control tokens and everything inside a tool call stay exact. A request can set
   its own value with `"relaxed_drafting": P` (or `false` for exact). Single-stream decoding only; `--parallel` slots
   stay exact.
-- The startup line `[server] engine: ...` lists the settings that came from the file or the command line, then the grammar state; with
-  none it says `using default flags` (with or without `--config`), e.g. `using default flags, grammar off (cli)`.
+- The startup line `[server] engine ...` lists the settings that came from the file or the command line, then the grammar state; with
+  none it says `defaults` (with or without `--config`), e.g. `grammar=off (from cli)`.
+
+## The console log
+
+Every server line starts with `[server]` and a label padded to a column; values are `key=value`. Rates are `t/s`,
+sizes `GiB`/`MiB`, times `s`. Startup prints one block, starting with a legend:
+
+```
+[server] legend   pp=prompt read  tg=generation  c=cached  acc=drafts accepted  dl=tokens per window  hit=expert cache  pcie=routed experts over PCIe
+[server] engine   ctx=262144 kv=int8 vram-reserve=500MiB pool=8 batch=4 (from config)
+[server] sampling temp=1.0 top_p=0.95 top_k=20 min_p=0.0 pres=0.0
+[server] vision   mode=dynamic gpu=0 (RTX 5090) load=per-image
+[server] auto     peer-excl=off resident=64.0GB pool-affinity=auto
+[server] loaded   68.4GiB 37.5s  cuda0=26.6GiB ram=41.2GiB cuda1=0.6GiB cuda1-copy=14.2GiB
+[server] kv       2.6/16.3GiB cuda0 elastic slots=4
+[server] slots    par=4 ctx/slot=262144 (slot-full-context), others queue
+[server] ready    http://127.0.0.1:8080/v1  openai+anthropic  ctx=262144 images=on
+[server] stats    http://127.0.0.1:8080/
+[server] network  http://192.168.2.205:8080/v1
+[server] warning  no api key, open to the network (--api-key KEY)
+```
+
+`sampling` marks a value set on the command line `(cli)` or in the config file `(config)`; `auto` is the engine's
+picked settings (see [configuration](configuration/index.md)). A warning or error that comes later reads
+`[server] warning: text` or `[server] error: text`.
+
+While a prompt is read, a slot prints `pp=<read>/<total>` with the read rate and the elapsed time about every 5 s:
+
+```
+[server] s2 read  pp=24576/66836 9150t/s 3s
+```
+
+While requests generate, one `live` line every 2 s covers every generating slot: `tg=<tokens>/<max> <rate>`.
+Slots are counted from 1, as on the stats page. `total` is the sum of the slots' rates. Acceptance is not shown
+live; the `done` line carries the engine's exact figures.
+
+```
+[server] live | s1 tg=454/2048 113.7t/s | s2 tg=436/2048 119.0t/s | total 233t/s
+```
+
+Each request ends with one slot-tagged `done` line:
+
+```
+[server] s1 done  pp=96/89c 0.1s  tg=1720 119.6t/s acc=65% dl=2.9  ttft=0.1s  end=stop  hit=89.7%  pcie=39.3%
+[server] s2 done  pp=66836/0c 7.3s 9204t/s  tg=512 281.0t/s acc=58% dl=2.7  ttft=7.3s  end=length
+```
+
+- `pp=<prompt tokens>/<cached>c <read time>`, with the read rate once at least 512 tokens were newly read; the rate
+  counts newly read tokens only.
+- `tg=<tokens> <rate>`. `acc` is drafts accepted over drafts offered for the request, `dl` the average tokens per
+  window; both are left out when the request did not draft.
+- `ttft` is the time to the first token; `end` is the finish reason (`stop`, `length`, `cancelled`, `disconnect`,
+  `error`).
+- `hit` is the expert cache hit rate and `pcie` the share of routed experts read over PCIe; both appear when the
+  engine reports them.
 
 ## Memory floors
 

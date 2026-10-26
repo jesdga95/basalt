@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 
+from serve.util.console import tagged
 from serve.util.loglevel import ERR, WARN, engine_line
 
 
@@ -87,6 +88,10 @@ class LoadBars:
         if target.startswith("cuda") and target[4:].isdigit() and int(target[4:]) < len(self.gpus):
             return f"cuda{self.gpus[int(target[4:])]}"
         return target
+
+    def key(self, target: str) -> str:
+        """The target's name as a key in a console line (no spaces)."""
+        return "ram" if target == "ram" else self.name(target)
 
     def _target(self, target: str, copy: bool) -> dict:
         # moves: (time, bytes) read while moving, the first one >= WINDOW before the last; phase: the first bytes
@@ -220,7 +225,7 @@ class LoadBars:
 
     def kv_lines(self) -> list[str]:
         """One line per device: all the session state allocated there (solo, batch slots, draft K/V).  An elastic
-        state reads `backed now / most it can take`."""
+        state reads `backed now/most it can take`."""
         out = []
         for target in dict.fromkeys(x[0] for x in self.kv):
             mine = [x for x in self.kv if x[0] == target]
@@ -229,24 +234,23 @@ class LoadBars:
             solo = [x[2] for x in mine if x[3] == ""]
             slots = [x[2] for x in mine if x[3] == "slot"]
             draft = sum(x[1] for x in mine if x[3] == "draft")
+            name = self.key(target)
             if peak > total:
                 tags = ["elastic"]
                 if slots:
-                    tags.append(("solo + " if solo else "") + f"{len(slots)} slot{'s' if len(slots) != 1 else ''}")
-                out.append(f"[server] kv cache: {total / 2**30:.1f} / {peak / 2**30:.1f} GiB on "
-                           f"{self.name(target)} ({', '.join(tags)})")
+                    tags.append((f"solo={solo[0]} " if solo else "") + f"slots={len(slots)}")
+                out.append(tagged("kv", f"{total / 2**30:.1f}/{peak / 2**30:.1f}GiB {name} {' '.join(tags)}"))
                 continue
-            head = f"[server] kv cache: {total / 2**30:.1f} GiB on {self.name(target)}"
+            head = f"{total / 2**30:.1f}GiB {name}"
             if not slots and not draft:
-                out.append(head + "".join(f", {tok} tokens" for tok in solo))
+                out.append(tagged("kv", head + "".join(f" tokens={tok}" for tok in solo)))
                 continue
-            parts = [f"solo {tok} tokens" for tok in solo]
-            for tok in dict.fromkeys(slots):           # slots of one size read as `2 slots x 262144 tokens`
-                n = slots.count(tok)
-                parts.append(f"{n} slot{'s' if n != 1 else ''} x {tok} tokens")
+            parts = [f"solo={tok}" for tok in solo]
+            for tok in dict.fromkeys(slots):           # slots of one size read as `slots=2x262144`
+                parts.append(f"slots={slots.count(tok)}x{tok}")
             if draft:
-                parts.append(f"draft K/V {draft / 2**30:.1f} GiB")
-            out.append(head + " (" + " + ".join(parts) + ")")
+                parts.append(f"draft={draft / 2**30:.1f}GiB")
+            out.append(tagged("kv", head + " " + " ".join(parts)))
         return out
 
     def set_total(self, total: int) -> None:
@@ -293,10 +297,9 @@ class LoadBars:
                 def part(copy):
                     return {tg: t["done"] + t["last"] for (tg, c), t in self.targets.items()
                             if c == copy and tg != self.TABLE and t["done"] + t["last"]}
-                parts = ", ".join(f"{self.name(tg)} {b / 2**30:.1f} GiB" for tg, b in part(False).items())
-                extra = "".join(f"; {self.name(tg)} copy {b / 2**30:.1f} GiB" for tg, b in part(True).items())
-                self.out.write(f"[server] loaded {done / 2**30:.1f} GiB in {time.time() - self.t0:.1f} s "
-                               f"({parts}{extra})\n")
+                parts = " ".join(f"{self.key(tg)}={b / 2**30:.1f}GiB" for tg, b in part(False).items())
+                extra = "".join(f" {self.key(tg)}-copy={b / 2**30:.1f}GiB" for tg, b in part(True).items())
+                self.out.write(tagged("loaded", f"{done / 2**30:.1f}GiB {time.time() - self.t0:.1f}s  {parts}{extra}") + "\n")
             for line in self.kv_lines():
                 self.out.write(line + "\n")
             self.kv.clear()
@@ -434,7 +437,7 @@ def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=2
                 elif (w := engine_warning(line)) is not None:
                     bars.say(f"[server] warning: {w}")
                 elif (r := engine_ram_floor(line)) is not None:
-                    bars.say(f"[server] RAM floor: {r}")
+                    bars.say(tagged("ram", f"floor {r}"))
         bars.refresh()
         if stop:
             bars.finish()
@@ -447,4 +450,4 @@ def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=2
                 bars.say(r)                                        # prints nothing when no bytes moved
         if time.time() - last > heartbeat:
             last = time.time()
-            bars.say(f"[server] still starting, {time.time() - t0:.0f} s")
+            bars.say(tagged("starting", f"{time.time() - t0:.0f}s"))

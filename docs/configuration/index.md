@@ -57,7 +57,7 @@ A config file is one JSON object with two optional blocks:
 - `api-key` cannot be set in a config file; a file that sets it is refused.
 - The built-in defaults pick the fastest settings that need no knowledge of the machine (speculation 8 with a drafter,
   expert cache auto, prefill auto, resident experts when the RAM holds them, adaptive rounds every window), and keep
-  the settings that change output or memory use (4096 context, fp16 KV). A config file sets those. The startup line `[server] engine: ...` lists what came from the file or the command line.
+  the settings that change output or memory use (4096 context, fp16 KV). A config file sets those. The startup line `[server] engine ...` lists what came from the file or the command line.
 
 In the tables, "default" is what applies when the setting is absent everywhere.
 
@@ -77,7 +77,7 @@ wins and is never changed.
 The engine prints one line naming only the picked settings, in the order above, and the server relays it once per start:
 
 ```
-[server] auto flags: peer-exclusive off, resident 51.2 GB, pool-affinity all, pool-workers 15
+[server] auto     peer-excl=off resident=51.2GB pool-affinity=all pool=15
 ```
 
 When every setting is given, no line is printed.
@@ -268,6 +268,6 @@ meaning:
 | `seed` | positive integer |
 
 A bad value stops the server at startup; an unknown key is named in a warning and ignored. The defaults in effect
-are printed at startup as `[server] sampling defaults: ...`, each marked `(command line)` or `(config)` when a launch
+are printed at startup as `[server] sampling ...`, each marked `(cli)` or `(config)` when a launch
 option set it and unmarked when it comes from the model file. A launch option overrides the model file's value for
 that key; the others stay.
