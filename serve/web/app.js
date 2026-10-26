@@ -13,6 +13,7 @@ const html = (el, h) => { if (drawn.get(el) !== h) { el.innerHTML = h; drawn.set
 const text = (el, v) => { if (el.textContent !== v) el.textContent = v; };
 const HIST = 60;
 const kt = n => n >= 100000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);   // 41.2k, 262k
+const lim = n => n >= 10000 ? kt(n) : fmt(n);   // token limit: 8,192, 41.2k, 262k
 const tick = n => n >= 1000 ? `${+(n / 1000).toFixed(1)}k` : String(Math.round(n));
 const API = { openai: "OpenAI", anthropic: "Anthropic" };
 const shortGpu = s => String(s || "").replace(/^NVIDIA\s+/i, "").replace(/^GeForce\s+/i, "");
@@ -232,7 +233,7 @@ function slotRows(rows, series) {
     const rate = !run ? "-" : pre ? (num(s.prefill_done) && s.prompt_tokens ? `${Math.min(100, Math.round(s.prefill_done / s.prompt_tokens * 100))}%` : "…") : fmt(s.tok_s);
     h += `<div class="rw${run ? "" : " idle"}"${pre ? ` title="Reading the prompt"` : ""}><span class="p nm" style="grid-column:1">Slot ${s.id + 1}${dense ? `<span class="u"> · ${run ? esc(api) : "Idle"}</span>` : ""}</span>`
       + `<span class="p rate e" style="grid-column:2">${rate}</span>${spark(a, max)}`
-      + `<span class="p e" style="grid-column:4">${run ? `${fmt(s.generated)}${num(s.max_tokens) ? `<span class="u">/${fmt(s.max_tokens)}</span>${bar(s.generated / s.max_tokens)}` : ""}` : "-"}</span>`
+      + `<span class="p e" style="grid-column:4">${run ? `${fmt(s.generated)}${num(s.max_tokens) ? `<span class="u">/${lim(s.max_tokens)}</span>${bar(s.generated / s.max_tokens)}` : ""}` : "-"}</span>`
       + `<span class="p e cx" style="grid-column:5">${kt(s.ctx_used || 0)}<span class="u">/${kt(s.n_ctx || 0)}</span>${bar(s.n_ctx ? s.ctx_used / s.n_ctx : 0)}</span>`
       + `<span class="p e" style="grid-column:6">${acc != null ? `${acc}<span class="u">%</span>` : "-"}</span>`
       + (dense ? "" : `<span class="s" style="grid-column:1">${run ? esc(api) : "Idle"}</span>`
