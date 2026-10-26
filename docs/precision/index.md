@@ -172,6 +172,17 @@ teacher-forced with the previous chunking's tokens, spec 1, int8 KV, 400 W: KLD 
 the previous chunking has mean 0.0032, median 0.00013, max 0.038, and the same top-1 at 64 of 64 positions. The 16-token
 greedy text of the 64K benchmark prompt differs at one near-tie word.
 
+**Prompt split across two cards.** With an expert tier card, a long fresh part of a prompt can be read across both cards
+([GPUs](../configuration/gpus.md)): the tier card reads the last layers of every chunk but the last. The chunks are the
+ones the main card alone reads, so no chunk boundary moves. On the tier card those layers read the hyper-connection
+down/up matrices as the pack's BF16 tensors (the main card reads its 8-bit copies, dequantized to BF16), and its cuBLAS
+products may run other kernels; the routed experts and the other products keep the main card's arithmetic. The draft
+layer builds its K/V on the main card from the tier card's rows, read back bit for bit. Parts the price keeps on the main
+card, parts of one chunk and the quality gate's 256-token prompt halves read as before. Long-context check,
+NVIDIA NVFP4 pack, int8 KV, spec 1, 400 W, the first 64 greedy tokens of a main-card read teacher-forced into the split
+read, full-vocabulary KLD: 65,535-token prompt mean 0.0008, median 0.0003, max 0.012, top-1 64 of 64; 122,879-token
+prompt mean 0.0005, median 0.0003, max 0.003, top-1 64 of 64.
+
 **K-quant experts on MMQ.** `tests/cuda/prefill_mmq_kq_test.cpp` runs MMQ and the FP16 dequant + cuBLAS path it
 replaced on random zero-centred experts at the model's geometry against a double-precision reference. Relative RMS
 error of the expert outputs, MMQ / FP16 path: 1.08e-2 / 5e-4 with plain activations (Q4_K/Q5_1, Q4_K/Q8_0, Q5_K/Q8_0),

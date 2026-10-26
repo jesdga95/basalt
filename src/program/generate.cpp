@@ -30,6 +30,7 @@
 #include "basalt/core/layer.hpp"
 #include "basalt/core/layout.hpp"
 #include "basalt/core/session.hpp"
+#include "basalt/core/staged_copy.hpp"
 #include "basalt/core/vmm.hpp"
 #include "basalt/core/weights.hpp"
 #include "basalt/core/model_file.hpp"
@@ -957,6 +958,33 @@ struct GpuStage {
     int32_t* mrope = nullptr;                            ///< --vision: the image-position table on its device
 };
 
+/// A prompt-time layer split on the expert tier's card: for a long prompt the main card reads layers [0, lb) of every
+/// chunk and hands the chunk on, the tier's card reads layers [lb, n_layers) of it while the main card reads the next,
+/// and the main card reads the last chunk's later layers itself once the tier's card has given its layers' state back.  The stage's
+/// dense weights (an image in pinned RAM), session and prompt buffers live in the tier's last slots, lent for the
+/// prompt and refilled after it, so outside a prompt the tier is as before.
+struct PromptStage {
+    int dev = -1;
+    int64_t lb_min = 0;                   ///< its weights cover layers [lb_min, n_layers); a read runs [lb, n_layers)
+    basalt::core::WeightTable wt;         ///< its rows point into the lent slots, where the image is copied
+    basalt::core::NativeDense dense;      ///< its native projections' rows (in the image) and their scratch
+    uint8_t* image = nullptr;             ///< pinned: the weights' bytes, the arena then the native blocks
+    uint64_t arena_bytes = 0, image_bytes = 0;
+    basalt::core::SessionState ss;        ///< carved per prompt in the lent slots
+    basalt::prefill::Prefill sp;
+    cudaStream_t stream = nullptr;
+    basalt::core::StagedCopy state_in, state_back;   ///< its layers' state from the main session and back to it
+    std::vector<int32_t> res;             ///< its layers' experts in the tier's slots (n_layers x n_expert, -1 elsewhere)
+    std::vector<std::pair<int32_t, int32_t>> lent;
+    std::vector<uint32_t> hist;           ///< the routed entries its layers counted in the last split read
+    int64_t hist_tokens = 0;
+    int64_t chunk_max = 0;
+    /// the final rows of its chunks the draft layer reads, in the hand-off buffers they came in: (first cell, cells, rows)
+    struct Relay { int64_t cell0, n; const float* rows; };
+    std::vector<Relay> relays;
+    bool ready = false;
+};
+
 // ---- what the watchdog prints before it stops a stalled engine
 struct MemSample {
     unsigned long long faults = 0, rss_mib = 0, avail_mib = 0, commit_mib = 0;   // faults: hard
@@ -1609,6 +1637,10 @@ int main(int argc, char** argv) {
     // the peer card takes expert rows of a long prompt chunk only when it is as fast as the main one: a slower card costs the
     // chunk more than the experts it saves the main card's link, so it keeps to the short chunks it helps
     const bool peer_streamed_share = chosen_cards.size() >= 2 && basalt::program::cards_alike(chosen_cards[0], chosen_cards[1]);
+    // the prompt-time layer split on the expert tier's card (PromptStage): wanted, and once priced at start the deepest
+    // first layer its stage may run from (0: none)
+    bool split_want = o.serve && o.peer_device >= 1 && o.peer_devices.size() == 1 && o.batch <= 0;
+    int64_t split_lb = 0;
     basalt::core::set_peer_portable(o.peer_device >= 1 || !o.layer_split.empty());   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     // Chunks below this take the routed-only path with the peer card computing its experts' rows; from it on
     // every expert streams through the ring.  The routed-only path costs ~0.3 ms per token, streaming ~0.12 ms
@@ -2005,10 +2037,12 @@ int main(int argc, char** argv) {
     // The PCIe share of the missed experts.  The GPU's SMs read that share over the link (the copy kernel), so on a
     // slower link it must shrink or the window waits for it.  The real H2D bandwidth is probed once; from 20 GB/s up
     // the default stays.
+    double main_link_gbps = 0;   // the probed host->device bandwidth (the prompt-time split's price reads it)
     if (o.pcie_frac < 0.0) {
         const double base = 0.55;
         std::string bursts;
         const double bw = probe_pcie_h2d_gbps(&bursts);
+        main_link_gbps = bw;
         if (bw > 0.0) {
             o.pcie_frac = pcie_frac_for_gbps(bw, base);
             basalt::log::info("basalt generate", "PCIe probe: %.1f GB/s host->device (best of %s) -> pcie_frac %.2f "
@@ -4534,6 +4568,34 @@ int main(int argc, char** argv) {
     // A pass streams every expert blob once, so a pack with bigger blobs amortizes the pass over more tokens.
     constexpr int64_t kHeadChunk = 16384;   // the first chunk of a prompt above the chunk cap
     const int64_t kMaxAutoChunk = basalt::kernels::cpu::expert_layout().max_blob > (3u << 19) ? 32768 : 16384;
+    // How one card reads a part of `tokens` in chunks of at most `cap`: equal chunks for the fewest chunks (every chunk
+    // streams the experts, so a short tail costs a whole stream), and a long part starts with a short chunk (`head_ok`):
+    // the first chunk waits for its PLE rows before layer 1 with nothing to overlap, so a short one shrinks that wait.
+    // The chunk, and the head chunk (0: none).
+    auto one_card_chunks = [&](int64_t tokens, int64_t cap, bool head_ok) -> std::pair<int64_t, int64_t> {
+        int64_t want = request_chunk(tokens, cap);
+        if (want > 0 && tokens > cap) {
+            const int64_t parts = (tokens + cap - 1) / cap;
+            want = request_chunk((tokens + parts - 1) / parts, cap);
+        }
+        int64_t head = 0;
+        if (head_ok && o.prefill_auto_fit && tokens > cap && tokens >= 2 * kHeadChunk && cap > kHeadChunk) {
+            const int64_t rem = tokens - kHeadChunk, parts = (rem + cap - 1) / cap;
+            want = request_chunk((rem + parts - 1) / parts, cap);
+            head = kHeadChunk;
+        }
+        return {want, head};
+    };
+    // the sizes of a part's chunks
+    auto chunk_list = [](int64_t tokens, int64_t chunk, int64_t head) {
+        std::vector<int64_t> v;
+        for (int64_t at = 0; chunk > 0 && at < tokens;) {
+            const int64_t T = std::min(at == 0 && head > 0 ? head : chunk, tokens - at);
+            v.push_back(T);
+            at += T;
+        }
+        return v;
+    };
     int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
     if (o.prefill_auto_fit && !o.resident_cpu_experts) auto_ceiling = 8192;
     // The auto scan bisects on the 256-token grid the prompt path works on (`request_chunk` rounds up to it):
@@ -4895,9 +4957,188 @@ int main(int argc, char** argv) {
     }
     // the peer's swaps keep their experts in RAM or on a GPU, never only in the file
     if (o.peer_exclusive && peer.valid() && srcp == &src && src.complement_ready()) peer.set_exclusive(&src);
+    // ---- the prompt-time split: what this engine can run it with, and the tier card's link (probed while the card is empty)
+    PromptStage pstage;
+    double peer_link_gbps = 0;
+    if (split_want) {
+        const char* off = o.peer_exclusive ? "the tier's experts have no RAM copy (--peer-exclusive)"
+                        : !src.complement_ready() ? "no RAM copy of the experts"
+                        : o.kv_resident > 0 ? "KV streaming"
+                        : !o.cvec_files.empty() ? "a control vector"
+                        : !basalt::prefill::Prefill::fp4_experts() ? "priced for NVFP4 experts only" : nullptr;
+        if (off == nullptr && main_link_gbps <= 0) main_link_gbps = probe_pcie_h2d_gbps();   // (a set --pcie-frac skips it)
+        if (off == nullptr) {
+            const basalt::core::OnDevice on(o.peer_device);
+            peer_link_gbps = probe_pcie_h2d_gbps();
+        }
+        if (off == nullptr && (main_link_gbps <= 0 || peer_link_gbps <= 0)) off = "a link probe failed";
+        if (off != nullptr) {
+            basalt::log::info("basalt generate", "prompt split: off (%s)", off);
+            split_want = false;
+        }
+    }
     // ---- the peer's experts: the ranked pairs the primary does not hold.  Without --peer-exclusive they are copies of
     // experts the RAM complement holds, so with the complement built they are read from it, not from the file.
     if (o.peer_device >= 1 && !peer.valid() && !open_peer(false)) return 1;
+    // ---- the prompt-time split's price (price_prompt_split): each card's side of a part read, from what its slots hold
+    // The largest chunk a read alone takes now (the loan's chunk follows the slots left: see relend).  The split reads a
+    // part in the chunks the main card alone would, so the chunk boundaries and the rounding of the K/V there are the same.
+    auto read_cap = [&]() -> int64_t {
+        return o.prefill_auto_fit ? std::min<int64_t>(o.prefill_chunk, kMaxAutoChunk) : o.prefill_chunk;
+    };
+    // the cells before a prompt's end the draft layer attends to (all of them without a window: no split then)
+    const int64_t draft_window = o.mtp.empty() ? 0 : o.mtp_window > 0 ? o.mtp_window + 64 : INT64_MAX / 4;
+    constexpr int64_t kSplitRefCells = 131072;   // the longest prompt the start prices the split for
+    // the main card with a loan for chunks of `chunk`: every expert of a layer not in its slots below the loan streams
+    auto split_main_side = [&](int64_t chunk) {
+        basalt::program::PsCard c;
+        c.mem_gbps = chosen_cards.empty() ? 0 : chosen_cards[0].mem_gbps;
+        c.link_gbps = main_link_gbps;
+        c.stream_bytes.assign((size_t) g.n_layers, 0.0);
+        const int64_t first = xcache.slots() - cache_slots_for(xcache, basalt::prefill::Prefill::bytes_needed(g, ss, chunk));
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            for (int64_t e = 0; e < g.n_expert; ++e) {
+                const int32_t r = host_res.empty() ? -1 : host_res[(size_t) (l * g.n_expert + e)];
+                if (r < 0 || r >= first) c.stream_bytes[(size_t) l] += (double) basalt::kernels::cpu::expert_layout().blob_bytes(l);
+            }
+        return c;
+    };
+    // the tier card with `region` bytes of its last slots lent to the stage: what its layers do not hold streams to it
+    auto split_peer_side = [&](uint64_t region) {
+        basalt::program::PsCard c;
+        c.mem_gbps = (size_t) o.peer_device < chosen_cards.size() ? chosen_cards[(size_t) o.peer_device].mem_gbps : 0;
+        c.link_gbps = peer_link_gbps;
+        c.stream_bytes.assign((size_t) g.n_layers, 0.0);
+        const basalt::core::ExpertCache& pc = peer.cache();
+        const int64_t first = pc.slots() - cache_slots_for(pc, region);
+        const std::vector<int32_t>& r = peer.residency();
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            for (int64_t e = 0; e < g.n_expert; ++e) {
+                const int32_t sl = r[(size_t) (l * g.n_expert + e)];
+                if (sl < 0 || sl >= first) c.stream_bytes[(size_t) l] += (double) basalt::kernels::cpu::expert_layout().blob_bytes(l);
+            }
+        return c;
+    };
+    // a part [a0, b0) of a prompt ending at `prompt_end`, with the stage's weights of `image` bytes: both prices, and
+    // the split's chunk and head chunk
+    struct SplitPricing { basalt::program::PsPrice price; int64_t chunk = 0, head = 0; };
+    auto split_price = [&](int64_t a0, int64_t b0, int64_t prompt_end, int64_t lb_min, uint64_t image) -> SplitPricing {
+        SplitPricing sp0;
+        const int64_t n_tok = b0 - a0;
+        // two chunks or more, the draft layer's window within the last two the main card hands on (their final rows
+        // come back for it in the hand-off buffers)
+        const auto [chunk, head] = one_card_chunks(n_tok, read_cap(), true);
+        if (chunk < 4096 || n_tok <= std::max(chunk, head) || 2 * chunk < draft_window) return sp0;
+        sp0.chunk = chunk;
+        sp0.head = head;
+        basalt::program::PsPart part;
+        part.cell0 = a0;
+        part.tier_chunks = chunk_list(n_tok, chunk, head);
+        part.split_chunks = part.tier_chunks;
+        part.row_bytes = (uint64_t) (g.hc * g.n_embd) * sizeof(float);
+        const int64_t c_last = b0 - part.split_chunks.back();
+        part.draft_rows = draft_window > 0 ? std::max<int64_t>(0, c_last - std::max(a0, prompt_end - draft_window)) : 0;
+        part.setup_ms = peer_link_gbps > 0 ? (double) image / (0.85 * peer_link_gbps * 1e9) * 1000.0 + 10.0 : 0.0;
+        const uint64_t region = image + basalt::core::prompt_session_bytes(g, b0 + 64, lb_min, g.n_layers) +
+                                basalt::prefill::Prefill::bytes_needed(g, ss, chunk);
+        const basalt::program::PsCard main_side = split_main_side(chunk);
+        sp0.price = basalt::program::price_prompt_split(main_side, main_side, split_peer_side(region), part, (int) lb_min,
+                                                        (int) g.n_layers);
+        return sp0;
+    };
+    // the deepest split a prompt could want: the best one for the longest prompt, a few layers deeper; none when even
+    // that one is not worth reading across the cards
+    std::set<std::string> split_skip;
+    uint64_t split_pool = 0;
+    if (split_want && peer.valid()) {
+        std::vector<uint64_t> pool_l, nat_l;
+        uint64_t pool_sh = 0, nat_sh = 0;
+        bool ok = basalt::core::WeightTable::pool_bytes_by_layer(pack_files, g.n_layers, pool_l, pool_sh, err, &skip_base) &&
+                  basalt::core::NativeDense::plan_bytes_by_layer(o.native_shards, true, g.n_layers, nat_l, nat_sh, err);
+        auto image_from = [&](int64_t lb) {
+            uint64_t b = pool_sh + nat_sh;
+            for (int64_t l = lb; l < g.n_layers; ++l) b += pool_l[(size_t) l] + nat_l[(size_t) l];
+            return b;
+        };
+        const int64_t longest = std::min<int64_t>(o.max_context, kSplitRefCells) - 1;
+        const SplitPricing ref = ok ? split_price(0, longest, longest, 2, image_from(g.n_layers / 2)) : SplitPricing{};
+        if (!ok) {
+            basalt::log::info("basalt generate", "prompt split: off (its weights' sizes: %s)", err.c_str());
+            err.clear();
+        } else if (ref.chunk <= 0) {
+            basalt::log::info("basalt generate", "prompt split: off (a %lld-token context is too short for it)",
+                              (long long) o.max_context);
+        } else if (!ref.price.split) {
+            basalt::log::info("basalt generate", "prompt split: off (a %lld-token prompt: %.0f ms on CUDA0, %.0f ms across)",
+                              (long long) longest, ref.price.tier_ms, ref.price.split_ms);
+        } else {
+            split_lb = std::max<int64_t>(2, ref.price.lb - 3);
+            // its layers' weights: the arena and the native projections
+            uint64_t native = 0;
+            split_skip = skip_base;
+            add_foreign(split_lb, g.n_layers, split_skip);
+            basalt::core::NativeDense::set_layer_range((int) split_lb, (int) g.n_layers);
+            ok = basalt::core::WeightTable::pool_bytes(pack_files, split_pool, err, &split_skip) &&
+                 basalt::core::NativeDense::plan_bytes(o.native_shards, true, 0, -1, native, err);
+            basalt::core::NativeDense::set_layer_range(-1, -1);
+            if (!ok) {
+                basalt::log::info("basalt generate", "prompt split: off (its weights' sizes)");
+                err.clear();
+                split_lb = 0;
+            } else {
+                pstage.dev = o.peer_device;
+                pstage.lb_min = split_lb;
+                pstage.arena_bytes = (split_pool + 255) / 256 * 256;
+                pstage.image_bytes = pstage.arena_bytes + basalt::core::NativeDense::slab_bytes(native);
+                // its pinned RAM (the weights' image, the main card's two hand-off buffers, the staging rings) comes
+                // out of what the RAM copy left free, never out of the copy: without the room the split is off
+                const uint64_t need = pstage.image_bytes + (256ull << 20) +
+                                      2ull * (uint64_t) read_cap() * (uint64_t) (g.hc * g.n_embd) * sizeof(float);
+                const uint64_t keep = basalt::platform::ram_margin() + basalt::platform::kLateHostBytes +
+                                      serve_growth_bytes(o, g);
+                const uint64_t avail = basalt::platform::available_memory();
+                if (avail < need + keep) {
+                    basalt::log::info("basalt generate", "prompt split: off (RAM: %.1f GiB free, it takes %.1f GiB beside "
+                                         "%.1f GiB kept)", (double) avail / 1073741824.0, (double) need / 1073741824.0,
+                                      (double) keep / 1073741824.0);
+                    split_lb = 0;
+                }
+            }
+        }
+    }
+    // the stage's weights are loaded where a split read places them, in tier slots lent for the load, copied into pinned
+    // RAM, and the slots get their experts back: the tier is as without the split
+    if (split_lb > 0 && peer.valid()) {
+        const basalt::core::OnDevice on(pstage.dev);
+        const basalt::core::ExpertCache& pc = peer.cache();
+        uint8_t* base = const_cast<uint8_t*>(pc.device_slot(0));
+        uint8_t* w_at = (uint8_t*) ((uintptr_t) (base + pc.bytes() - pstage.image_bytes) & ~(uintptr_t) 255);
+        const int64_t k = cache_slots_for(pc, (uint64_t) (base + pc.bytes() - w_at));
+        bool ok = k > 0 && k < pc.slots() / 2 && peer.lend((int32_t) (pc.slots() - k), pstage.lent, err) &&
+                  pstage.wt.load(pack_files, w_at, split_pool, err, &split_skip, false);
+        if (ok) {
+            basalt::core::NativeDense::set_layer_range((int) split_lb, (int) g.n_layers);
+            ok = pstage.dense.load(o.native_shards, pstage.wt, err, true, 0, -1, w_at + pstage.arena_bytes,
+                                   pstage.image_bytes - pstage.arena_bytes);
+            basalt::core::NativeDense::set_layer_range(-1, -1);
+        }
+        ok = ok && cudaDeviceSynchronize() == cudaSuccess &&   // (the uploads ran on their own streams)
+             cudaHostAlloc((void**) &pstage.image, pstage.image_bytes, cudaHostAllocPortable) == cudaSuccess &&
+             cudaMemcpy(pstage.image, w_at, pstage.image_bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+        std::string ge;
+        if (!(peer.give_back(pstage.lent, ge) && peer.give_back_wait(pstage.lent, ge))) {
+            basalt::log::error("basalt generate", "prompt split: refilling the tier: %s", ge.c_str());
+            return 1;
+        }
+        if (!ok) {
+            (void) cudaGetLastError();
+            basalt::log::warn("basalt generate", "prompt split: off (its weights: %s)", err.empty() ? "no memory" : err.c_str());
+            err.clear();
+            if (pstage.image != nullptr) cudaFreeHost(pstage.image);
+            pstage.image = nullptr;
+            split_lb = 0;
+        }
+    }
     drive.d.peer = peer.valid() ? &peer : nullptr;
     // Where the routed experts live, fastest tier first, and a warning when a share of them is only in the file (decode
     // reads those from the SSD).  Called once the tiers are final.
@@ -5239,6 +5480,56 @@ int main(int argc, char** argv) {
             if (!sp.set_peer(&peer, rows, peer_streamed_share, err)) {
                 basalt::log::warn("basalt serve", "%s - the prompt path stays on the primary GPU", err.c_str());
                 err.clear();
+            }
+        }
+        // ---- the prompt-time split's stage on the tier's card.  Its place, from the end of the tier's slots: the weights,
+        // the session (for the whole context here; for its prompt's cells at each read), then the prompt buffers.  The
+        // layout is made over live slots and writes nothing until a read lends them.
+        auto split_region = [&](int64_t cells, int64_t chunk, int64_t lb, uint8_t*& w_at, uint8_t*& s_at,
+                                uint8_t*& b_at) -> bool {
+            const basalt::core::ExpertCache& pc = peer.cache();
+            uint8_t* base = const_cast<uint8_t*>(pc.device_slot(0));
+            auto down = [](uint8_t* p) { return (uint8_t*) ((uintptr_t) p & ~(uintptr_t) 255); };
+            w_at = down(base + pc.bytes() - pstage.image_bytes);
+            s_at = down(w_at - basalt::core::prompt_session_bytes(g, cells, lb, g.n_layers));
+            basalt::core::prompt_session_carve(g, cells, K, s_at, pstage.ss, lb, g.n_layers);
+            b_at = down(s_at - basalt::prefill::Prefill::bytes_needed(g, pstage.ss, chunk));
+            // the loan leaves the tier a tenth of its slots, as the main card's
+            return b_at >= base + pc.bytes() / 10;
+        };
+        if (split_lb > 0 && peer.valid()) {
+            const basalt::core::OnDevice on(pstage.dev);
+            size_t fb0 = 0, tb0 = 0;
+            cudaMemGetInfo(&fb0, &tb0);
+            pstage.chunk_max = read_cap();   // its buffers' and the hand-off buffers' size; a larger chunk reads on CUDA0
+            uint8_t *w_at = nullptr, *s_at = nullptr, *b_at = nullptr;
+            // (a read of the longest prompt the start priced must fit; a longer one checks its own fit)
+            bool ok = pstage.chunk_max >= 1024 &&
+                      split_region(std::min<int64_t>(o.max_context, kSplitRefCells), pstage.chunk_max, pstage.lb_min,
+                                   w_at, s_at, b_at);
+            ok = ok && cudaStreamCreateWithFlags(&pstage.stream, cudaStreamNonBlocking) == cudaSuccess &&
+                 pstage.state_in.init(0, pstage.dev, 8u << 20, err) && pstage.state_back.init(pstage.dev, 0, 8u << 20, err);
+            if (ok) {
+                pstage.res.assign((size_t) (g.n_layers * g.n_expert), basalt::core::kNotResident);
+                pstage.sp.set_stage(pstage.lb_min, -1, nullptr);
+                ok = pstage.sp.init(pstage.wt, g, pstage.ss, srcp, &peer.cache(), pstage.res.data(), pstage.chunk_max,
+                                    (void*) pstage.stream, err, b_at, (uint64_t) (s_at - b_at));
+            }
+            // the main card hands its chunks on through two pinned buffers of the stage's chunk
+            ok = ok && sp.reserve_hand_off(pstage.chunk_max, err);
+            if (ok) {
+                pstage.sp.set_ring_remote(host_res.data(), &xcache, 0);
+                pstage.ready = true;
+                size_t fb = 0, tb = 0;
+                cudaMemGetInfo(&fb, &tb);
+                basalt::log::info("basalt serve", "prompt split: CUDA%d can take layers %lld-%lld of a long prompt (chunks up "
+                                     "to %lld tokens, links %.1f/%.1f GB/s); %zu MiB free on it (%zu before)", pstage.dev,
+                                  (long long) pstage.lb_min, (long long) g.n_layers - 1, (long long) pstage.chunk_max,
+                                  main_link_gbps, peer_link_gbps, fb >> 20, fb0 >> 20);
+            } else {
+                basalt::log::warn("basalt serve", "prompt split: off (%s)", err.empty() ? "too few tier slots" : err.c_str());
+                err.clear();
+                (void) cudaGetLastError();
             }
         }
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last `penalty_last_n`
@@ -8514,7 +8805,8 @@ int main(int argc, char** argv) {
             // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
             // participant's own cache, and marking only that participant's own layers
-            auto lend = [&](int64_t tokens, std::string& e) -> bool {
+            // `chunk` > 0: that chunk (a split read's), its first one `head` tokens (0: none)
+            auto lend = [&](int64_t tokens, std::string& e, int64_t chunk = 0, int64_t head = 0) -> bool {
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
                 const auto t_ln = Clock::now();
                 // the ring depth this read's layout uses; every size computed below (and the layout) follows it, and
@@ -8529,8 +8821,7 @@ int main(int argc, char** argv) {
                 // with the chunk, so the rule is the fewest equal parts of at most this size, never a small tail.
                 // `auto:N` and a fixed N keep the operator's number.  (Chunking changes the GEMM tiles and so the rounding of
                 // a prompt's K/V; the answers can differ from another chunking by greedy near-ties.)
-                int64_t cap = o.prefill_auto_fit ? std::min<int64_t>(o.prefill_chunk, kMaxAutoChunk)
-                                                 : o.prefill_chunk;
+                int64_t cap = read_cap();
                 // Loan limits while slots decode: the loan takes only slots whose expert has a RAM copy (a lent slot
                 // is refilled from RAM, never read from the file, before the slots decode again), and a read beside
                 // them stays within kLendCapDecoding slots (they keep their experts in the cache).  A read on an idle
@@ -8550,21 +8841,10 @@ int main(int argc, char** argv) {
                     }));
                     cap = std::min(cap, lc);
                 }
-                int64_t want_full = request_chunk(tokens, cap);
-                if (want_full > 0 && tokens > cap) {
-                    // equal chunks for the fewest chunks: every chunk streams the experts, so a short tail costs a
-                    // whole stream
-                    const int64_t parts = (tokens + cap - 1) / cap;
-                    want_full = request_chunk((tokens + parts - 1) / parts, cap);
-                }
-                // A long prompt starts with a short chunk: the first chunk waits for its PLE rows before layer 1 with
-                // nothing to overlap, so a short one shrinks that wait; the rest are equal chunks of at most `cap`.
-                int64_t head_tok = 0;
-                if (o.prefill_auto_fit && tokens > cap && tokens >= 2 * kHeadChunk && cap > kHeadChunk && !beside &&
-                    stages.empty()) {
-                    const int64_t rem = tokens - kHeadChunk, parts = (rem + cap - 1) / cap;
-                    want_full = request_chunk((rem + parts - 1) / parts, cap);
-                    head_tok = kHeadChunk;
+                auto [want_full, head_tok] = one_card_chunks(tokens, cap, !beside && stages.empty());
+                if (chunk > 0) {
+                    want_full = chunk;
+                    head_tok = head;
                 }
                 sp.set_head_chunk(head_tok);
                 const int64_t want = want_full;
@@ -8578,7 +8858,9 @@ int main(int argc, char** argv) {
                     if (p.first < 0) continue;
                     const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
                     if (!p.lent.empty()) {
-                        if (want <= p.lent_chunk && p.sp->ring_depth() == ring_now && !ov_copied) continue;   // its loan covers this
+                        if (want <= p.lent_chunk && p.sp->ring_depth() == ring_now && !ov_copied &&
+                            (chunk <= 0 || want == p.sp->chunk()))
+                            continue;   // its loan covers this (a split read's chunk must be the layout's)
                         // the slots the new loan takes again are not refilled first (their experts would be
                         // overwritten by the new layout): only their table entries go back, and the loop below
                         // lends them again; the new loan's refill brings their experts back after the prompt
@@ -8663,6 +8945,258 @@ int main(int argc, char** argv) {
                         sl.checks.push_back(c);
                 yielded_at = q;
                 yielded_slot = ys;
+                return true;
+            };
+            // ---- the prompt-time layer split: a long part of the prompt is read across the two cards when its price there
+            // (split_price) beats the main card's alone; the chunk, its head chunk and the tier card's first layer, or none
+            struct SplitPlan { int64_t chunk = 0, head = 0, lb = 0; };
+            auto split_plan = [&](int64_t a0, int64_t b0) -> SplitPlan {
+                SplitPlan plan;
+                if (!pstage.ready || rsp != &ss || batch_on() || !req_imgs.empty()) return plan;
+                const SplitPricing pr = split_price(a0, b0, n - 1, pstage.lb_min, pstage.image_bytes);
+                if (pr.chunk <= 0 || pr.chunk > pstage.chunk_max || pr.price.lb <= 0) return plan;
+                basalt::log::info("basalt serve", "prompt split: %lld tokens priced %.0f ms on CUDA0, %.0f ms with layers %d-%lld "
+                                     "on CUDA%d; read %s", (long long) (b0 - a0), pr.price.tier_ms, pr.price.split_ms,
+                                  pr.price.lb, (long long) g.n_layers - 1, pstage.dev, pr.price.split ? "across" : "on CUDA0");
+                if (!pr.price.split) return plan;
+                {
+                    const basalt::core::OnDevice on(pstage.dev);
+                    uint8_t *w_at = nullptr, *s_at = nullptr, *b_at = nullptr;
+                    if (!split_region(b0 + 64, pr.chunk, pr.price.lb, w_at, s_at, b_at)) {
+                        basalt::log::info("basalt serve", "prompt split: %lld tokens do not fit CUDA%d's slots; read on CUDA0",
+                                          (long long) (b0 - a0), pstage.dev);
+                        return plan;
+                    }
+                }
+                plan.chunk = pr.chunk;
+                plan.head = pr.head;
+                plan.lb = pr.price.lb;
+                return plan;
+            };
+            // [a0, b0) across the two cards in chunks of `chunk` tokens: the main card reads layers [0, lb) of each chunk
+            // and hands it on, the tier card reads layers [lb, n_layers) of it while the main card reads the next; the
+            // main card keeps the last chunk and reads its later layers once the tier card's state is back.  Main's loan
+            // is made by `lend`.
+            // `ran` stays false when it stopped before reading anything (the caller reads the part on the main card)
+            auto read_split = [&](int64_t a0, int64_t b0, int64_t chunk, int64_t head, int64_t lb, bool& ran,
+                                  std::string& e) -> bool {
+                ran = false;
+                const auto t0 = Clock::now();
+                const int64_t n_tok = b0 - a0;
+                // the last chunk's first cell: after the head chunk, chunks of `chunk`
+                const int64_t c_last = head > 0 ? a0 + head + ((n_tok - head - 1) / chunk) * chunk
+                                                : a0 + ((n_tok - 1) / chunk) * chunk;
+                if (sp.chunk() != chunk) {
+                    e = "prompt split: the main card's prompt buffers are not laid out for the split's chunk";
+                    return false;
+                }
+                const basalt::prefill::PrefillStats st0 = pstage.sp.stats(), sm0 = sp.stats();
+                // the tier's swaps land first: no copy may still write a slot the stage takes
+                peer.apply_pending(true);
+                peer_landing = false;
+                const basalt::core::ExpertCache& pc = peer.cache();
+                uint8_t *w_at = nullptr, *s_at = nullptr, *b_at = nullptr;
+                int64_t lent_slots = 0;
+                auto give_back_now = [&]() {
+                    std::string ge;
+                    const basalt::core::OnDevice on(pstage.dev);
+                    (void) cudaDeviceSynchronize();
+                    (void) cudaGetLastError();
+                    (void) (peer.give_back(pstage.lent, ge) && peer.give_back_wait(pstage.lent, ge));
+                };
+                {
+                    const basalt::core::OnDevice on(pstage.dev);
+                    if (lb >= g.n_layers || !split_region(b0 + 64, chunk, lb, w_at, s_at, b_at)) {
+                        e = "prompt split: too few tier slots for the prompt";
+                        return false;
+                    }
+                    uint8_t* base = const_cast<uint8_t*>(pc.device_slot(0));
+                    lent_slots = cache_slots_for(pc, (uint64_t) (base + pc.bytes() - b_at));
+                    const int32_t first = (int32_t) (pc.slots() - lent_slots);
+                    if (!peer.lend(first, pstage.lent, e)) return false;
+                    uint8_t* buf = base + (pc.slot_offsets() ? (size_t) pc.slot_offsets()[first]
+                                                             : (size_t) first * basalt::kernels::cpu::expert_layout().max_blob);
+                    // the stage's experts in the tier: its layers' that kept their slots
+                    const std::vector<int32_t>& r = peer.residency();
+                    std::fill(pstage.res.begin(), pstage.res.end(), basalt::core::kNotResident);
+                    std::copy(r.begin() + (std::ptrdiff_t) (lb * g.n_expert), r.end(),
+                              pstage.res.begin() + (std::ptrdiff_t) (lb * g.n_expert));
+                    if (cudaMemcpyAsync(w_at, pstage.image, (size_t) pstage.image_bytes, cudaMemcpyHostToDevice,
+                                        pstage.stream) != cudaSuccess) {
+                        e = std::string("prompt split: the weights' upload: ") + cudaGetErrorString(cudaGetLastError());
+                        give_back_now();
+                        return false;
+                    }
+                    basalt::core::prompt_session_clear(pstage.ss, g, (void*) pstage.stream);
+                    // a part after the start of the context: the stage's layers' state so far, every cell (after the clear)
+                    if (a0 > 0 &&
+                        (cudaStreamSynchronize(pstage.stream) != cudaSuccess ||
+                         !basalt::core::session_copy_state(pstage.ss, ss, g, lb, g.n_layers, 0, a0,
+                                                           [&](void* d, const void* sr, uint64_t n) {
+                                                               return pstage.state_in.copy(d, sr, n, e);
+                                                           }, e) ||
+                         !pstage.state_in.wait(e))) {
+                        if (e.empty()) e = "prompt split: the stage's state from the main session";
+                        give_back_now();
+                        return false;
+                    }
+                    // (relayout waits for the stream: the weights and the session are in place after it)
+                    pstage.sp.set_stage(lb, -1, nullptr);
+                    if (!pstage.sp.relayout(chunk, buf, (uint64_t) (s_at - buf), e)) {
+                        give_back_now();
+                        return false;
+                    }
+                }
+                const double ms_setup = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                ran = true;
+                // the main card: layers [0, lb) of every chunk, handing each but the last on; the tier card computes no
+                // rows of the main card's layers meanwhile
+                sp.set_peer_share(false);
+                sp.set_stage(0, lb, &pstage.sp);
+                sp.set_keep_last(true);
+                pstage.sp.should_stop = sp.should_stop;
+                if (!drive.d.usage.empty()) pstage.sp.route_hist_reset();   // its layers' routed entries, counted apart
+                // the tier card, after each chunk: the rows the draft layer reads, back into the hand-off buffer the chunk
+                // came in (the main card writes it again two chunks later, and not at all for the last); after its last
+                // chunk, its state to the main session and its slots' experts back, while the main card reads its own
+                // last chunk
+                const int64_t first_cell = mtp_on ? std::max<int64_t>(0, mtp.first_needed()) : INT64_MAX;
+                bool given = false;
+                double ms_copy = 0;
+                std::future<bool> refill_issue;   // the tier slots' copies, queued on a thread of their own
+                std::string refill_err;
+                pstage.relays.clear();
+                std::mutex relay_mu;
+                // mid-prompt checkpoints at the positions one card takes them: the main card saves its state when it
+                // hands such a chunk on, the tier card puts its layers' state in once it has read that chunk
+                const bool ck_on = o.prompt_cache > 0 && o.prompt_cache_every > 0;
+                int64_t ck_next = pp_next_check;
+                std::map<int64_t, ConvCheckpoint> ck_main;
+                sp.on_stage_chunk = [&](int64_t done, std::string& ce) -> bool {
+                    if (!ck_on || done < ck_next) return true;
+                    ck_next = done + o.prompt_cache_every;
+                    ConvCheckpoint part;   // (its stream is synchronized)
+                    part.ids.assign(cur.begin(), cur.begin() + done);
+                    if (!checkpoint_save(part, ss, g)) {
+                        ce = "saving a conversation checkpoint failed";
+                        return false;
+                    }
+                    std::lock_guard<std::mutex> lk(relay_mu);
+                    ck_main[done] = std::move(part);
+                    return true;
+                };
+                pstage.sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& ce) -> bool {
+                    const int64_t HCN = g.hc * g.n_embd;
+                    const int64_t r0 = std::max<int64_t>(0, first_cell - p0);
+                    if (r0 < T) {
+                        float* h = const_cast<float*>(pstage.sp.hand_in());
+                        if (h == nullptr || cudaMemcpy(h + (size_t) r0 * HCN, R_rows + (size_t) r0 * HCN,
+                                                       (size_t) (T - r0) * HCN * sizeof(float),
+                                                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+                            ce = "prompt split: reading the draft layer's rows back failed";
+                            return false;
+                        }
+                        std::lock_guard<std::mutex> lk(relay_mu);
+                        pstage.relays.push_back({p0 + r0, T - r0, h + (size_t) r0 * HCN});
+                    }
+                    std::vector<ConvCheckpoint> whole(1);
+                    {
+                        std::lock_guard<std::mutex> lk(relay_mu);
+                        const auto it = ck_main.find(p0 + T);
+                        if (it != ck_main.end()) {
+                            whole[0] = std::move(it->second);
+                            ck_main.erase(it);
+                        }
+                    }
+                    std::string se;
+                    if (!whole[0].ids.empty() &&
+                        (!basalt::core::conversation_checkpoint_save_layers(whole[0], pstage.ss, g, lb, g.n_layers, se) ||
+                         !checkpoint_at(p0 + T, &whole))) {
+                        ce = "saving a conversation checkpoint failed" + (se.empty() ? ckpt_why : ": " + se);
+                        return false;
+                    }
+                    if (p0 + T >= c_last) {   // its last chunk
+                        const auto tc = Clock::now();
+                        if (!basalt::core::session_copy_state(ss, pstage.ss, g, lb, g.n_layers, a0, c_last,
+                                                              [&](void* d, const void* sr, uint64_t n) {
+                                                                  return pstage.state_back.copy(d, sr, n, ce);
+                                                              }, ce) ||
+                            !pstage.state_back.wait(ce)) {
+                            if (ce.empty()) ce = "prompt split: the stage's state back to the main session";
+                            return false;
+                        }
+                        given = true;
+                        ms_copy = std::chrono::duration<double, std::milli>(Clock::now() - tc).count();
+                        refill_issue = std::async(std::launch::async, [&] { return peer.give_back(pstage.lent, refill_err); });
+                    }
+                    const int64_t done = p0 + T;
+                    pp_reached = done;
+                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
+                    std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) pp_total, ms,
+                                ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0);
+                    basalt::core::progress_at("reading the prompt (batched), done up to token", done);
+                    basalt::core::progress_beat();
+                    std::fflush(stdout);
+                    return true;
+                };
+                bool ok = sp.run(ids.data() + a0, n_tok, a0, e);   // (waits for the tier card's chunks)
+                if (ok && !given) {
+                    ok = false;
+                    e = "prompt split: the tier card's state did not come back";
+                }
+                sp.set_keep_last(false);
+                sp.on_stage_chunk = nullptr;
+                pstage.sp.on_chunk = nullptr;
+                pp_next_check = ck_next;   // the last chunk's check, on this card as on one card
+                const double ms_stages = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                // the draft layer's K/V of the tier card's rows, through this card's prompt path; then the last chunk's
+                // layers [lb, n_layers) here
+                const auto td = Clock::now();
+                for (const PromptStage::Relay& rl : pstage.relays) {
+                    if (!ok || !mtp_on) break;
+                    std::vector<int32_t> nxt((size_t) rl.n);
+                    for (int64_t t = 0; t < rl.n; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (rl.cell0 + t + 1)];
+                    const bool batched = sp.draft_kv(mtp, rl.rows, nxt.data(), rl.n, rl.cell0, e);
+                    ok = e.empty() && (batched || mtp.prefill(rl.rows, nxt.data(), rl.n, rl.cell0, e));
+                }
+                pstage.relays.clear();
+                const double ms_draft = std::chrono::duration<double, std::milli>(Clock::now() - td).count();
+                sp.set_stage(lb, -1, nullptr);
+                if (ok) {
+                    sp.continue_in_place();
+                    ok = sp.run(ids.data() + c_last, b0 - c_last, c_last, e);
+                }
+                sp.set_stage(0, -1, nullptr);
+                sp.set_peer_share(true);
+                {
+                    const basalt::core::OnDevice on(pstage.dev);
+                    std::string ge;
+                    const bool issued = refill_issue.valid() && refill_issue.get();
+                    if (!pstage.lent.empty() && !(ok && issued && peer.give_back_wait(pstage.lent, ge)))
+                        give_back_now();   // stopped early: nothing of the stage may still write the slots
+                }
+                pstage.hist.clear();
+                pstage.hist_tokens = 0;
+                if (!drive.d.usage.empty()) pstage.sp.route_hist_take(pstage.hist, pstage.hist_tokens);
+                if (!ok) return false;
+                const basalt::prefill::PrefillStats& st1 = pstage.sp.stats();
+                const basalt::prefill::PrefillStats& sm1 = sp.stats();
+                size_t pfree = 0, ptotal = 0;
+                {
+                    const basalt::core::OnDevice on(pstage.dev);
+                    if (cudaMemGetInfo(&pfree, &ptotal) != cudaSuccess) (void) cudaGetLastError();
+                }
+                basalt::log::info("basalt serve", "prompt split: %lld tokens in chunks of %lld (%lld on CUDA%d, layers %lld-%lld), "
+                                     "%.0f ms (setup %.1f, stages %.0f, state back %.0f, draft rows %.0f); CUDA%d %lld lent "
+                                     "slots, its stage %.0f ms, %lld experts streamed, %zu MiB free after; CUDA0 %.0f ms, %lld "
+                                     "streamed",
+                                  (long long) n_tok, (long long) chunk, (long long) (st1.chunks - st0.chunks), pstage.dev,
+                                  (long long) lb, (long long) g.n_layers - 1,
+                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), ms_setup, ms_stages,
+                                  ms_copy, ms_draft,
+                                  pstage.dev, (long long) lent_slots, st1.ms_total - st0.ms_total,
+                                  (long long) (st1.experts_streamed - st0.experts_streamed), pfree >> 20,
+                                  sm1.ms_total - sm0.ms_total, (long long) (sm1.experts_streamed - sm0.experts_streamed));
                 return true;
             };
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
@@ -8972,7 +9506,9 @@ int main(int argc, char** argv) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
-                if (!win && !lend(to - at, err)) {
+                const SplitPlan split = win ? SplitPlan{} : split_plan(at, to);
+                const int64_t split_c = split.chunk;
+                if (!win && !lend(to - at, err, split_c, split.head)) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
                     return 1;
                 }
@@ -8999,7 +9535,15 @@ int main(int argc, char** argv) {
                 };
                 const auto tsp = Clock::now();
                 pp_part_ckpt = (to == turn_at || to == root_at) ? to : -1;
-                const bool sp_ok = win ? (rto <= at || read_windows(at, rto, err)) : read_part(at, to, err);
+                bool split_ran = true;
+                bool sp_ok = win ? (rto <= at || read_windows(at, rto, err))
+                           : split_c > 0 ? read_split(at, to, split_c, split.head, split.lb, split_ran, err)
+                                         : read_part(at, to, err);
+                if (!sp_ok && !split_ran) {   // the split could not start: the main card reads the part
+                    basalt::log::warn("basalt serve", "%s; read on CUDA0", err.c_str());
+                    err.clear();
+                    sp_ok = read_part(at, to, err);
+                }
                 pp_part_ckpt = -1;
                 if (sp_ok && win && !ov_window()) { std::printf("ERR %s\n", err.c_str()); return 1; }
                 if (!sp_ok) {
@@ -9042,6 +9586,10 @@ int main(int argc, char** argv) {
                 std::vector<uint32_t> hist;
                 int64_t hist_tokens = 0;
                 const bool seeded = !drive.d.usage.empty() && sp.route_hist_take(hist, hist_tokens) && (!in_slot || solo_req);
+                // a split read counted its tier card's layers there
+                if (seeded && pstage.hist.size() == hist.size())
+                    for (size_t i = 0; i < hist.size(); ++i) hist[i] += pstage.hist[i];
+                pstage.hist.clear();
                 if (seeded) seed_usage_from_prompt(drive.d.usage, hist, hist_tokens, host_res, g.n_expert, peer);
             }
             std::vector<int32_t> drafts((size_t) std::max(S, basalt::core::kMtpChainMax), 0), window((size_t) S), outv((size_t) S);
