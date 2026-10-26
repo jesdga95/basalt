@@ -1403,8 +1403,9 @@ int main(int argc, char** argv) {
     // chunk more than the experts it saves the main card's link, so it keeps to the short chunks it helps
     const bool peer_streamed_share = chosen_cards.size() >= 2 && basalt::program::cards_alike(chosen_cards[0], chosen_cards[1]);
     // the prompt-time layer split over the expert tier cards (PromptStage), and the most stages it may use, the main
-    // card's included: on three or more cards none until measured there (--exp prompt_split=N: up to N stages)
-    bool split_want = o.serve && o.peer_device >= 1 && o.batch <= 0;
+    // card's included: on three or more cards none until measured there (--exp prompt_split=N: up to N stages).  With
+    // --batch a read splits only while no slot decodes.
+    bool split_want = o.serve && o.peer_device >= 1;
     const int split_cap = o.peer_devices.size() <= 1 ? 2 : (int) basalt::core::exp_flag("prompt_split", 1.0);
     basalt::core::set_peer_portable(o.peer_device >= 1 || !o.layer_split.empty());   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     // Chunks below this take the routed-only path with the peer card computing its experts' rows; from it on
@@ -8846,7 +8847,7 @@ int main(int argc, char** argv) {
             struct SplitPlan { int64_t chunk = 0, head = 0; int stages = 0; std::vector<int> cuts; };
             auto split_plan = [&](int64_t a0, int64_t b0) -> SplitPlan {
                 SplitPlan plan;
-                if (!split_ready || rsp != &ss || batch_on() || !req_imgs.empty()) return plan;
+                if (!split_ready || batch_on() || !req_imgs.empty()) return plan;
                 const SplitPricing pr = split_price(a0, b0, n - 1, split_stages);
                 if (pr.chunk <= 0 || pr.chunk > split_chunk_max || pr.price.stages < 2) return plan;
                 basalt::log::info("basalt serve", "prompt split: %lld tokens priced %.0f ms on CUDA0, %.0f ms with %s%s; read %s",
@@ -8956,7 +8957,7 @@ int main(int argc, char** argv) {
                     for (PromptStage* st : run) {
                         const basalt::core::OnDevice on(st->dev);
                         ok = ok && cudaStreamSynchronize(st->stream) == cudaSuccess &&
-                             basalt::core::session_copy_state(st->ss, ss, g, st->l0, st->l1, 0, a0,
+                             basalt::core::session_copy_state(st->ss, *rsp, g, st->l0, st->l1, 0, a0,
                                                               [&](void* d, const void* sr, uint64_t nb) {
                                                                   return st->state_in.copy(d, sr, nb, e);
                                                               }, e);
@@ -9014,7 +9015,7 @@ int main(int argc, char** argv) {
                     ck_next = done + o.prompt_cache_every;
                     ConvCheckpoint part;   // (its stream is synchronized)
                     part.ids.assign(cur.begin(), cur.begin() + done);
-                    if (!checkpoint_save(part, ss, g)) {
+                    if (!checkpoint_save(part, *rsp, g)) {
                         ce = "saving a conversation checkpoint failed";
                         return false;
                     }
@@ -9071,7 +9072,7 @@ int main(int argc, char** argv) {
                         const auto tc = Clock::now();
                         bool ok = true;
                         for (PromptStage* st : run)
-                            ok = ok && basalt::core::session_copy_state(ss, st->ss, g, st->l0, st->l1, a0, c_last,
+                            ok = ok && basalt::core::session_copy_state(*rsp, st->ss, g, st->l0, st->l1, a0, c_last,
                                                                         [&](void* d, const void* sr, uint64_t nb) {
                                                                             return st->state_back.copy(d, sr, nb, ce);
                                                                         }, ce);
