@@ -1204,9 +1204,11 @@ class ProcessEngine:
         live = report is None or report[0] == len(h)
         if h and live and len(h) < len(prompt) and prompt[:len(h)] == h:
             return (2, len(h))
-        n = max((n for n in self.slot_checkpoints[slot]
-                 if 0 < n < len(prompt) and prompt[:n] == h[:n]), default=0)
-        return (1, n) if n else (0, 0)
+        # Reports keep checkpoint lengths sorted; the first match is the longest.
+        for n in reversed(self.slot_checkpoints[slot]):
+            if 0 < n < len(prompt) and prompt[:n] == h[:n]:
+                return (1, n)
+        return (0, 0)
 
     def _resumes(self, slot: int, prompt: list[int]) -> bool:
         """Whether `slot` holds the start of `prompt`."""
@@ -1223,8 +1225,8 @@ class ProcessEngine:
         free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
-        best = max(free, key=lambda b: self._slot_match(b, prompt))
-        if self._resumes(best, prompt):
+        best, match = max(((b, self._slot_match(b, prompt)) for b in free), key=lambda item: item[1])
+        if match[0]:
             return best
         return min(free, key=lambda b: (bool(self.slot_held[b]), self.slot_used[b]))
 

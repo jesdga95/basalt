@@ -2,6 +2,7 @@
 
 A fake engine script speaking GEN / BGEN / BT / BDONE / BADM / BSTOP runs behind the real ProcessEngine and Service."""
 import json
+import random
 import subprocess
 import sys
 import tempfile
@@ -265,6 +266,49 @@ class PickSlot(unittest.TestCase):
         e.slot_held = [[1, 2], [1, 2, 3, 4, 9], []]
         e.slot_checkpoints[1] = [4]
         self.assertEqual(e.pick_slot([1, 2, 3, 4, 5]), 0)
+
+    def test_slot_scores_are_computed_once_and_ties_keep_slot_order(self):
+        e = self.engine(4)
+        e.slot_order = [2, 0, 3, 1]
+        e.slot_busy[3] = True
+        e.slot_held = [[1, 2]] * 4
+        with mock.patch.object(e, "_slot_match", wraps=e._slot_match) as score:
+            self.assertEqual(e.pick_slot([1, 2, 3]), 2)
+        self.assertEqual([call.args[0] for call in score.call_args_list], [2, 0, 1])
+
+    def test_longest_first_matches_exhaustive_checkpoint_scoring(self):
+        rng = random.Random(19)
+        for _ in range(200):
+            e = self.engine(4)
+            prompt = [rng.randrange(3) for _ in range(rng.randrange(1, 20))]
+            e.slot_order = rng.sample(range(4), 4)
+            e.slot_busy = [rng.choice([True, False]) for _ in range(4)]
+            e.slot_used = rng.sample(range(4), 4)
+            expected = []
+            for b in range(4):
+                h = prompt[:rng.randrange(len(prompt) + 1)] + [rng.randrange(3) for _ in range(rng.randrange(5))]
+                e.slot_held[b] = h
+                checks = sorted(rng.sample(range(1, len(h) + 1), rng.randrange(len(h) + 1)))
+                e.slot_checkpoints[b] = checks
+                e.slot_reports[b] = rng.choice([None, (len(h), checks), (len(h) + 2, checks)])
+                live = e.slot_reports[b] is None or e.slot_reports[b][0] == len(h)
+                n = max((n for n in checks if n < len(prompt) and prompt[:n] == h[:n]), default=0)
+                rank = (1, n) if n else (0, 0)
+                if h and live and len(h) < len(prompt) and prompt[:len(h)] == h:
+                    rank = (2, len(h))
+                self.assertEqual(e._slot_match(b, prompt), rank)
+                expected.append(rank)
+            free = [b for b in e.slot_order if not e.slot_busy[b]]
+            best = max(free, key=lambda b: expected[b]) if free else None
+            if best is not None and expected[best][0] == 0:
+                best = min(free, key=lambda b: (bool(e.slot_held[b]), e.slot_used[b]))
+            self.assertEqual(e.pick_slot(prompt), best)
+
+    def test_cache_report_normalizes_checkpoint_order(self):
+        reports = [None]
+        ProcessEngine._slot_report("SCACHE 0 9 7 2 4 7", reports)
+        held, checks = ProcessEngine._retained_slot(list(range(9)), reports[0])
+        self.assertEqual((held, checks), (list(range(9)), [2, 4, 7]))
 
     def test_cache_report_validation_and_zero_output(self):
         reports = [None, None]
