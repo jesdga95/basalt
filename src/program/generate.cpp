@@ -6821,6 +6821,37 @@ int main(int argc, char** argv) {
             int64_t drafts_accepted = 0, drafts_offered = 0;   ///< the request's draft tokens, for BDONE
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        // Routing feedback describes only idle state and checkpoints on its retained token/image branch.
+        auto report_cache = [&](int slot, bool cached, const std::vector<int32_t>& held,
+                                const std::vector<ImgKey>& images, const std::vector<ConvCheckpoint>& saved) {
+            cached = cached && o.prompt_cache > 0;
+            std::printf("SCACHE %d %zu", slot, cached ? held.size() : size_t(0));
+            // Shared system-prefix checkpoints are reusable, but do not establish conversation affinity.
+            size_t shared = 0;
+            std::string role;
+            if (cached && o.turn_token >= 0 && !held.empty() && held[0] == o.turn_token) {
+                if (text_tokenizer.loaded())
+                    for (size_t i = 1; i < held.size() && role.size() < 7; ++i) {
+                        const int32_t id = held[i];
+                        if (id < 0 || (size_t) id >= text_tokenizer.vocab_size()) break;
+                        role += text_tokenizer.token_bytes(id);
+                    }
+                // Without role bytes, do not guess whether this is a shared system prefix.
+                if (!text_tokenizer.loaded()) shared = held.size();
+            }
+            if (role.starts_with("system\n")) {
+                shared = held.size();
+                for (size_t i = 1; i < held.size(); ++i)
+                    if (held[i] == o.turn_token) { shared = i; break; }
+            }
+            if (cached)
+                for (const ConvCheckpoint& c : saved)
+                    if (c.ids.size() > shared && c.ids.size() <= held.size() &&
+                        basalt::core::conversation_ids_equal(c.ids.data(), c.ids.size(), held.data()) &&
+                        c.imgs == imgs_below(images, (int64_t) c.ids.size()))
+                        std::printf(" %zu", c.ids.size());
+            std::printf("\n");
+        };
         // the real MTP drafts in the batch windows (a draft K/V per slot); the scripted test drive keeps its own
         const bool batch_spec = mtp_on && mtp.main_store() > 0 && o.batch > 0;
         const int S_all = S;
@@ -7363,11 +7394,7 @@ int main(int argc, char** argv) {
                     std::printf("\n");
                 }
                 if (fin_of[sg] != nullptr) {
-                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                    std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin_of[sg], ms,
-                                (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
                     sl.active = false;
-                    sl.cached = o.prompt_cache > 0;   // its sessions hold sl.ids for the next turn
                     sl.guard.reset();
                 } else {
                     sl.x = outb[r0s[sg] + k - 1];
@@ -7430,6 +7457,17 @@ int main(int argc, char** argv) {
                 }
                 bt_commit += msd(c0, Clock::now());
             }
+            for (int sg = 0; sg < S; ++sg) {
+                if (fin_of[sg] == nullptr) continue;
+                const int b = rows[sg];
+                BSlot& sl = bs[(size_t) b];
+                sl.cached = o.prompt_cache > 0;   // the commit completed: its sessions hold sl.ids
+                report_cache(b, sl.cached, sl.ids, sl.imgs, sl.checks);
+                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+                std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin_of[sg], ms,
+                            (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
+            }
+            std::fflush(stdout);
             basalt::core::progress().busy.store(was_busy);
             if (!batch_on() && bt_windows > 0) {
                 const double w = (double) bt_windows, wall = msd(bt_start, Clock::now());
@@ -7518,9 +7556,10 @@ int main(int argc, char** argv) {
                     sl.ids.push_back(sl.x);
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld %s %.1f 0 0\n", gi * GS + t, (long long) sl.produced, fin, ms);
                         sl.active = false;
                         sl.cached = false;   // the pipeline's pad rows: a pipelined slot is not reused as a cache
+                        report_cache(gi * GS + t, false, sl.ids, sl.imgs, sl.checks);
+                        std::printf("BDONE %d %lld %s %.1f 0 0\n", gi * GS + t, (long long) sl.produced, fin, ms);
                     } else {
                         sl.x = y;
                         sl.p += 1;
@@ -9414,6 +9453,7 @@ int main(int argc, char** argv) {
             //      [offloaded]   (the decode's routed experts the GPU read over PCIe or another GPU computed;
             //                    not in [lookups])
             const bool ram_out = ram_stop.load();
+            std::string ram_error;
             if (ram_out) {
                 // the client gets the reason as the request's error; the engine stays up for the next request
                 uint64_t avail = 0, floor = 0;
@@ -9423,17 +9463,11 @@ int main(int argc, char** argv) {
                                                "--resident-budget-gib",
                               (unsigned long long) (avail >> 20), (unsigned long long) (floor >> 20));
                 basalt::log::error("basalt", "%s", msg);
-                std::printf("ERR %s\n", msg);
+                ram_error = msg;
             }
             if (!ram_out && yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
-            if (!ram_out) std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld\n",
-                        (long long) produced_n,
-                        (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
-                        (long long) resume, (long long) req_hits, (long long) req_look,
-                        (long long) (src.ram_reads() - ram0), (long long) (src.file_reads() - files0),
-                        (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
-                        (long long) req_offload);
-            std::fflush(stdout);
+            const int admitted_slot = admit_slot;
+            int admission_status = -1;
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = ram_out ? false : in_slot ? !cancelled && (int64_t) live.size() == p
                                     : !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
@@ -9491,9 +9525,7 @@ int main(int argc, char** argv) {
                     basalt::log::info("basalt batch", "slot %d takes %lld tokens (copied in %.1f ms)", admit_slot,
                                  (long long) live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
                 }
-                if (!ram_out)   // (after ERR the server reads no BADM)
-                    std::printf("BADM %d %d\n", admit_slot, cont ? (in_slot ? 2 : 1) : 0);   // 2: no token yet
-                std::fflush(stdout);
+                admission_status = cont ? (in_slot ? 2 : 1) : 0;   // 2: no token yet
                 admit_slot = -1;
             }
             if (solo_req) {   // the conversation stays in the slot it ran in
@@ -9529,6 +9561,33 @@ int main(int argc, char** argv) {
                 cvec_cached = solo_book.cvec;
                 checks = std::move(solo_book.checks);
             }
+            const int report_slot = slot_b >= 0 ? slot_b : 0;
+            if (yielded_at >= 0 && !ram_out) {
+                const BSlot& sl = bs[(size_t) yielded_slot];
+                report_cache(yielded_slot, sl.cached, sl.ids, sl.imgs, sl.checks);
+            }
+            if (yielded_slot != report_slot || ram_out) {
+                if (slot_b > 0 || (admitted_slot >= 0 && admission_status != 0) ||
+                    (slot0_is_solo && !bs.empty() && bs[0].cached)) {
+                    const BSlot& sl = bs[(size_t) report_slot];
+                    report_cache(report_slot, !ram_out && sl.cached && !sl.active, sl.ids, sl.imgs, sl.checks);
+                } else {
+                    report_cache(report_slot, !ram_out && live_ok, live, live_imgs, checks);
+                }
+            }
+            if (ram_out) {
+                std::printf("ERR %s\n", ram_error.c_str());
+            } else {
+                std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld\n",
+                            (long long) produced_n,
+                            (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
+                            (long long) resume, (long long) req_hits, (long long) req_look,
+                            (long long) (src.ram_reads() - ram0), (long long) (src.file_reads() - files0),
+                            (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
+                            (long long) req_offload);
+                if (admitted_slot >= 0) std::printf("BADM %d %d\n", admitted_slot, admission_status);
+            }
+            std::fflush(stdout);
             if (drive.routing != nullptr) std::fflush(drive.routing);   // the routing trace survives a crash and is watchable mid-session
             // "12288 of 98179" when cancelled mid-read, the rate from what was read
             char read_txt[64];

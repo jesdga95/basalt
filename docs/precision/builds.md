@@ -102,3 +102,17 @@ session. The logit hashes are printed on stderr as `LH` lines, one per accepted 
 Compare the token ids and the per-position hashes between the two sessions. With `--spec 0` there is one row per token;
 the `--spec 7` run may print extra rows past the end of a request, so match rows by position. The pinned sizes used here
 were N = 11582, M = 8876 for IQ3_XXS and N = 9979, M = 7562 for IQ3_S.
+
+### Cache Routing Feedback
+
+`SCACHE SLOT LIVE_LEN [CHECKPOINT_LEN ...]` precedes `DONE`/`BADM` or `BDONE`, after retained state and pending
+copies/commits are confirmed. `LIVE_LEN` counts processed inputs: normally `prompt + generated - 1`, including
+`prompt - 1` for zero generation; the final emitted token is unprocessed. `BYIELD` reports its actual parked prefix.
+Checkpoint lengths name retained token/image prefixes, excluding checkpoints inside the shared system prefix.
+The tokenizer identifies a leading `system` role; unavailable role tables conservatively suppress checkpoint affinity.
+`SCACHE SLOT 0` invalidates routing knowledge, including active admissions until their final `BDONE`.
+Consumers truncate the request's prompt-plus-output stream to `LIVE_LEN` and publish only at the terminal frame.
+When EOS ends emission inside a committed speculative window, `LIVE_LEN` may exceed that stream. Retain its
+known checkpoint prefixes, but do not advertise the shorter known stream as the complete live state.
+Never infer checkpoints from an LCP. The native matcher still validates tokens, images and control-vector state.
+This feedback changes routing and completion ordering, not checkpoint policy, kernels or arithmetic.
