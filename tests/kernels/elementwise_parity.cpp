@@ -468,6 +468,73 @@ int main(int argc, char** argv) {
         cudaFree(dx); cudaFree(dy); cudaFree(db); cudaFree(dq);
     }
 
+    // ---- the window's inputs out of mapped pinned host memory: three arrays in one launch against three launches, at
+    // the verify window's sizes (tokens T, steps T x 4, positions 8 x (24 + 2 + 4)), and one array empty
+    {
+        const int MT = 8, NPOS = MT * (24 + 2 + 4);
+        int32_t *h0 = nullptr, *h1 = nullptr, *h2 = nullptr, *m0 = nullptr, *m1 = nullptr, *m2 = nullptr;
+        check(cudaHostAlloc((void**) &h0, MT * 4, cudaHostAllocMapped), "h0");
+        check(cudaHostAlloc((void**) &h1, MT * 4 * 4, cudaHostAllocMapped), "h1");
+        check(cudaHostAlloc((void**) &h2, NPOS * 4, cudaHostAllocMapped), "h2");
+        check(cudaHostGetDevicePointer((void**) &m0, h0, 0), "m0");
+        check(cudaHostGetDevicePointer((void**) &m1, h1, 0), "m1");
+        check(cudaHostGetDevicePointer((void**) &m2, h2, 0), "m2");
+        std::mt19937 rng(23);
+        for (int i = 0; i < MT; ++i) h0[i] = (int32_t) rng();
+        for (int i = 0; i < MT * 4; ++i) h1[i] = (int32_t) rng();
+        for (int i = 0; i < NPOS; ++i) h2[i] = (int32_t) rng();
+        int32_t* d = nullptr;
+        check(cudaMalloc(&d, 2 * (MT + MT * 4 + NPOS) * 4), "d");
+        int32_t *a0 = d, *a1 = a0 + MT, *a2 = a1 + MT * 4, *b0 = a2 + NPOS, *b1 = b0 + MT, *b2 = b1 + MT * 4;
+        cudaStream_t st = nullptr;
+        check(cudaStreamCreate(&st), "stream");
+        int wrong = 0;
+        for (int t = 0; t <= MT; ++t) {   // t = 0: the token array empty
+            check(cudaMemsetAsync(d, 0x5a, 2 * (MT + MT * 4 + NPOS) * 4, st), "clear");
+            basalt::kernels::copy_i32_from_mapped(a0, m0, t, st);
+            basalt::kernels::copy_i32_from_mapped(a1, m1, (int64_t) t * 4, st);
+            basalt::kernels::copy_i32_from_mapped(a2, m2, NPOS, st);
+            basalt::kernels::copy_i32x3_from_mapped(b0, m0, t, b1, m1, (int64_t) t * 4, b2, m2, NPOS, st);
+            check(cudaStreamSynchronize(st), "copies");
+            std::vector<int32_t> got((size_t) 2 * (MT + MT * 4 + NPOS));
+            check(cudaMemcpy(got.data(), d, got.size() * 4, cudaMemcpyDeviceToHost), "down");
+            const int32_t* ga = got.data();
+            const int32_t* gb = ga + MT + MT * 4 + NPOS;
+            for (int i = 0; i < MT + MT * 4 + NPOS; ++i) {
+                const bool live = i < MT ? i < t : i < MT + MT * 4 ? i - MT < t * 4 : true;
+                const int32_t want = i < MT ? h0[i] : i < MT + MT * 4 ? h1[i - MT] : h2[i - MT - MT * 4];
+                if (ga[i] != gb[i] || (live && gb[i] != want)) ++wrong;
+            }
+        }
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0);
+        cudaEventCreate(&e1);
+        float ms3 = 0, ms1 = 0;
+        const int reps = 200;
+        cudaEventRecord(e0, st);
+        for (int r = 0; r < reps; ++r) {
+            basalt::kernels::copy_i32_from_mapped(a0, m0, 3, st);
+            basalt::kernels::copy_i32_from_mapped(a1, m1, 12, st);
+            basalt::kernels::copy_i32_from_mapped(a2, m2, NPOS, st);
+        }
+        cudaEventRecord(e1, st);
+        cudaEventSynchronize(e1);
+        cudaEventElapsedTime(&ms3, e0, e1);
+        cudaEventRecord(e0, st);
+        for (int r = 0; r < reps; ++r) basalt::kernels::copy_i32x3_from_mapped(b0, m0, 3, b1, m1, 12, b2, m2, NPOS, st);
+        cudaEventRecord(e1, st);
+        cudaEventSynchronize(e1);
+        cudaEventElapsedTime(&ms1, e0, e1);
+        std::printf("  %-44s %s (%d wrong); T 3: three launches %.1f us, one %.1f us\n", "window inputs, one mapped copy",
+                    wrong ? "*** FAIL ***" : "bitwise", wrong, 1e3 * ms3 / reps, 1e3 * ms1 / reps);
+        if (wrong) ++bad;
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+        cudaStreamDestroy(st);
+        cudaFree(d);
+        cudaFreeHost(h0); cudaFreeHost(h1); cudaFreeHost(h2);
+    }
+
     std::printf("\nelementwise: %d failures\n", bad);
     if (bad) return 1;
     if (selftest) std::printf("elementwise_parity OK\n");

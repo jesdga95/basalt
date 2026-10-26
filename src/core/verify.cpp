@@ -1999,14 +1999,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (fa.n_layers > 0) gdn_commit_finish(fa, commit_ctl_, cs, fin_blocks_);
     }
     // ---- the window's inputs, from mapped staging
-    copy_i32_from_mapped(tok_, m_tok_, T, cs);
+    copy_i32x3_from_mapped(tok_, m_tok_, T, step_, m_step_, (int64_t) T * kStepCount, pos_, m_pos_,
+                           (int64_t) MT * (NH + NKV + IQ), cs);
     if (batch_rec_) {   // the segment tables: which slot each row is
         copy_i32_from_mapped((int32_t*) segb_, (const int32_t*) m_segb_, (int64_t) T * 8, cs);
         copy_i32_from_mapped((int32_t*) d_qrows_, (const int32_t*) m_qseg_, (int64_t) (kQsaSegMaxRows + 8) * 4, cs);
         if (ple_on) ple_hist_gather(ple_work_, d_ple_slots_, segb_, HS, T, cs);
     }
-    copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
-    copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), cs);
     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
     const int32_t* pos_k = pos_ + MT * NH;
     const int32_t* pos_i = pos_ + MT * (NH + NKV);
