@@ -1,17 +1,26 @@
 "use strict";
 const $ = s => document.querySelector(s);
-const $$ = s => [...document.querySelectorAll(s)];
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const num = v => typeof v === "number" && Number.isFinite(v);
-const fmt = (v, d = 0) => num(v) ? v.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d }) : "—";
+const fmt = (v, d = 0) => num(v) ? v.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d }) : "-";
 const p2 = n => String(n).padStart(2, "0");
-const clock = ms => { const d = new Date(ms); return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, "0")}`; };
-const gib = n => num(n) ? (n / 1024 ** 3).toFixed(1) : "—";
+const clock = ms => { const d = new Date(ms); return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`; };
+const gib = n => num(n) ? (n / 1024 ** 3).toFixed(1) : "-";
+const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ESC[c]);
+const drawn = new WeakMap();
+const html = (el, h) => { if (drawn.get(el) !== h) { el.innerHTML = h; drawn.set(el, h); } };   // skip unchanged redraws
+const text = (el, v) => { if (el.textContent !== v) el.textContent = v; };
 const HIST = 60;
-let perStream = Array(HIST).fill(0);   // mean tok/s per decoding slot, one sample per poll
+const kt = n => n >= 100000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);   // 41.2k, 262k
+const tick = n => n >= 1000 ? `${+(n / 1000).toFixed(1)}k` : String(Math.round(n));
+const API = { openai: "OpenAI", anthropic: "Anthropic" };
+const shortGpu = s => String(s || "").replace(/^NVIDIA\s+/i, "").replace(/^GeForce\s+/i, "");
+const shortCpu = s => String(s || "").replace(/\((R|TM)\)/gi, "").replace(/\s+\d+-Core Processor$/i, "")
+  .replace(/\s+CPU\s+@.*$/i, "").replace(/\s+Processor$/i, "").replace(/\s+/g, " ").trim();
 
 let apiKey = sessionStorage.getItem("basalt.key") || "";
-let M = null;          // the last /metrics reading
+let M = null;          // the last /metrics reading, with .slots from /slots
 
 async function get(path) {
   const r = await fetch(path, { cache: "no-store", headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} });
@@ -20,384 +29,320 @@ async function get(path) {
   return r.json();
 }
 
-/* ---- views ---- */
-function view(v) {
-  $("#view-stats").hidden = v !== "stats";
-  $("#view-hardware").hidden = v !== "hardware";
-  $("#top").hidden = v !== "stats";
-  $$(".tabs .tab").forEach(t => t.setAttribute("aria-selected", String(t.dataset.view === v)));
-  if (location.hash.slice(1) !== v) history.replaceState(null, "", "#" + v);
-  if (v === "stats") scrollLog();
-}
-$$(".tabs .tab").forEach(t => t.onclick = () => view(t.dataset.view));
-
-/* ---- charts ---- */
-const CHARTS = [
-  { id: "decode", name: "Decode", short: "Decode", steps: [50, 100, 200, 250, 300, 400, 500, 600, 700, 800, 1000, 1200, 1500, 2000], hover: null, v: Array(HIST).fill(0), max: 400 },
-  { id: "prefill", name: "Prefill", short: "Prefill", steps: [2000, 4000, 8000, 16000, 32000], hover: null, v: Array(HIST).fill(0), max: 8000 }];
-const axis = n => n >= 1000 ? `${n / 1000}k` : String(n);
-// the fastest whole request this tab has seen (kept across reloads, cleared on a server restart or by Reset in its detail): a
-// request's own mean, not a burst, and only one big enough that fixed costs do not decide it
-const BEST_MIN_OUT = 256, BEST_MIN_READ = 4096;
-const ktok = n => n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}K` : String(n);
-const ktok3 = n => n >= 1000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1).replace(/\.0$/, "")}K` : String(n);
-let best = (() => { try { return JSON.parse(sessionStorage.getItem("basalt.best")) || {}; } catch (e) { return {}; } })();
-const saveBest = () => { try { sessionStorage.setItem("basalt.best", JSON.stringify(best)); } catch (e) { /* private mode */ } };
-function noteBest(reqs) {
-  const keep = (id, v, r, extra) => {
-    if (num(v) && v > 0 && !(best[id] && best[id].v >= v)) { best[id] = { v, t: r.time * 1000, id: r.id, ...extra }; saveBest(); }
-  };
-  for (const r of reqs) {
-    if (r.output_tokens >= BEST_MIN_OUT)
-      keep("decode", r.decode_tok_s, r, { out: r.output_tokens, ctx: (r.prompt_tokens || 0) + r.output_tokens,
-        acc: r.drafts_offered > 0 ? r.drafts_accepted / r.drafts_offered : null });
-    const read = (r.prompt_tokens || 0) - (r.reused || 0);
-    if (read >= BEST_MIN_READ && r.prompt_ms > 0) keep("prefill", read / (r.prompt_ms / 1000), r, { read });
-  }
-}
-let bestOpen = null;      // which best figure shows its detail
-function drawBest() {
-  $("#bests").hidden = !(best.decode || best.prefill);
-  if (!best[bestOpen]) bestOpen = null;
-  for (const id of ["decode", "prefill"]) {
-    const b = best[id], el = $("#pk-" + id), html = b ? `${fmt(b.v, id === "decode" ? 1 : 0)}<small>tok/s</small>` : "—";
-    el.setAttribute("aria-expanded", String(bestOpen === id));
-    const v = el.querySelector("b");
-    if (v.innerHTML !== html) v.innerHTML = html;
-  }
-  const b = best[bestOpen];
-  $("#best-detail").hidden = !b;
-  if (!b) return;
-  text("#bd-text", bestOpen === "decode"
-    ? `${fmt(b.out)} tok · ${num(b.acc) ? `${Math.round(b.acc * 100)}% accept · ` : ""}${ktok(b.ctx)} ctx`
-    : `${ktok(b.read)} read`);
-  $("#bd-text").title = `Fastest whole request this session (${b.id}, ${clock(b.t).slice(0, 8)}): `
-    + (bestOpen === "decode" ? `at least ${BEST_MIN_OUT} output tokens` : `at least ${fmt(BEST_MIN_READ)} newly read prompt tokens`)
-    + ". Kept in this tab until the server restarts.";
-}
-["decode", "prefill"].forEach(id => $("#pk-" + id).onclick = () => { bestOpen = bestOpen === id ? null : id; drawBest(); });
-$("#bd-reset").onclick = () => { delete best[bestOpen]; bestOpen = null; saveBest(); drawBest(); };
-const tail = a => { const v = (a || []).slice(-HIST).map(x => num(x) ? x : 0); while (v.length < HIST) v.unshift(0); return v; };
-
-function drawChart(c, now, last, lastNote) {
-  const el = $("#chart-" + c.id), [cur, dot, tip] = el.querySelectorAll(".cur, .cdot, .tip");
-  const label = $("#rd-" + c.id + "-l"), read = $("#rd-" + c.id), unit = "<small>tok/s</small>";
-  // the axis follows every plotted line (aggregate and per stream), with headroom, so nothing clips
-  const per = c.id === "decode" ? perStream : [];
-  const top = Math.max(...c.v, ...per, 0) * 1.05;
-  c.max = c.steps.find(s => s >= top) || Math.ceil(top / 500) * 500;
-  const pts = a => a.map((x, i) => `${i},${(100 - clamp(x, 0, c.max) / c.max * 100).toFixed(2)}`).join(" ");
-  $("#line-" + c.id).setAttribute("points", pts(c.v));
-  if (c.id === "decode") $("#line-per").setAttribute("points", pts(per));
-  el.querySelector(".y0").textContent = axis(c.max);
-  el.querySelector(".y1").textContent = axis(c.max / 2);
-  const h = c.hover;
-  [cur, dot, tip].forEach(e => e.hidden = h == null);
-  if (h == null) {
-    const live = num(now) && now > 0, shown = live ? now : last;
-    // short text for a phone; the full wording is the tooltip
-    label.textContent = live ? `${c.short} · now` : `${c.short}${lastNote ? ` · ${ktok3(lastNote)} tok` : ""}`;
-    label.title = `${c.name}, ${live ? "now" : `last request${lastNote ? ` · ${fmt(lastNote)} tokens` : ""}`}`;
-    read.innerHTML = num(shown) ? `${fmt(shown, c.id === "decode" ? 1 : 0)}${unit}` : "—";
-    return;
-  }
-  const v = c.v[h], x = h / (HIST - 1) * 100, y = 100 - clamp(v, 0, c.max) / c.max * 100, ago = HIST - 1 - h;
-  const when = ago ? `${ago} s ago` : "Now", val = v > 0 ? `${fmt(v, c.id === "decode" ? 1 : 0)} tok/s` : "Idle";
-  cur.style.left = x + "%";
-  dot.style.left = x + "%"; dot.style.top = y + "%";
-  tip.style.left = x + "%"; tip.style.top = clamp(y, 16, 84) + "%";
-  tip.classList.toggle("flip", h > 34);
-  tip.innerHTML = `<b>${val}</b><span>${when}</span>`;
-  label.textContent = `${c.short} · ${when.toLowerCase()}`;
-  label.title = `${c.name}, ${when.toLowerCase()}`;
-  read.innerHTML = v > 0 ? `${fmt(v, c.id === "decode" ? 1 : 0)}${unit}` : "Idle";
-}
-CHARTS.forEach(c => {
-  const el = $("#chart-" + c.id);
-  el.addEventListener("pointermove", e => {
-    const r = el.getBoundingClientRect();
-    c.hover = clamp(Math.round((e.clientX - r.left) / r.width * (HIST - 1)), 0, HIST - 1);
-    draw();
+/* ---- series and charts ---- */
+// the last HIST samples, padded at the start with null (no line) so the newest sample sits at the right edge
+const tail = a => { const v = (a || []).slice(-HIST).map(x => num(x) ? x : null); while (v.length < HIST) v.unshift(null); return v; };
+const stats = a => {
+  const v = a.filter(num);
+  return v.length ? { min: Math.min(...v), max: Math.max(...v), avg: v.reduce((t, x) => t + x, 0) / v.length, last: v[v.length - 1] } : null;
+};
+const busyStats = a => stats(a.map(x => x > 0 ? x : null));     // over the samples that ran
+const STEPS = [10, 20, 50, 100, 120, 150, 160, 200, 250, 300, 400, 500, 600, 800, 1000, 1200, 1500, 2000, 3000, 4000, 5000,
+  8000, 10000, 16000, 20000, 32000, 50000];
+const nice = v => STEPS.find(s => s >= v * 1.15) || Math.ceil(v * 1.15 / 10000) * 10000;
+// polyline points in a 0..W x 0..100 box; a null sample breaks the line
+function lines(a, y, W = 100) {
+  const out = []; let cur = [];
+  a.forEach((v, i) => {
+    if (v == null) { if (cur.length) out.push(cur); cur = []; return; }
+    cur.push(`${(i / (a.length - 1) * W).toFixed(2)},${y(v).toFixed(2)}`);
   });
-  el.addEventListener("pointerleave", () => { c.hover = null; draw(); });
+  if (cur.length) out.push(cur);
+  return out.map(c => c.length === 1 ? [c[0], c[0].replace(/^[\d.]+/, x => String(+x + .01))] : c);
+}
+const poly = (pts, attrs) => `<polyline points="${pts.join(" ")}" fill="none" vector-effect="non-scaling-stroke" stroke-linejoin="round" ${attrs}/>`;
+const area = (pts, fill) => `<polygon points="${pts[0].split(",")[0]},100 ${pts.join(" ")} ${pts[pts.length - 1].split(",")[0]},100" fill="${fill}"/>`;
+const baseLine = `<line x1="0" y1="100" x2="100" y2="100" stroke="var(--line)" stroke-width="1" vector-effect="non-scaling-stroke"/>`;
+let gid = 0;
+// a sidebar chart: filled line between lo and hi; `limit` draws a dashed line at the top
+function sbChart(a, lo, hi, accent, limit) {
+  const id = `sbg${++gid}`, tint = accent ? "255,122,61" : "154,164,173";
+  const segs = lines(a, v => clamp(100 - (v - lo) / (hi - lo) * 100, 1, 99));
+  return `<div class="sb-ch"><svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1">`
+    + `<stop offset="0" stop-color="rgba(${tint},.13)"/><stop offset="1" stop-color="rgba(${tint},.02)"/></linearGradient></defs>${baseLine}`
+    + (limit ? `<line x1="0" y1="1" x2="100" y2="1" stroke="var(--basalt-500)" stroke-width="1" stroke-dasharray="2 3" vector-effect="non-scaling-stroke"/>` : "")
+    + segs.map(p => area(p, `url(#${id})`) + poly(p, `stroke="${accent ? "var(--accent)" : "var(--fg-2)"}" stroke-width="1.5"`)).join("")
+    + `</svg></div>`;
+}
+function spark(a, max) {
+  const segs = lines(a.map(v => v == null ? null : v), v => 100 - Math.min(v, max) / max * 96 - 2);
+  return `<div class="spark"><svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">${baseLine}`
+    + segs.map(p => area(p, "rgba(154,164,173,.08)") + poly(p, `stroke="var(--fg-2)" stroke-width="1.4"`)).join("") + `</svg></div>`;
+}
+const gy = t => t ? 100 - t * 92 - 4 : 4;             // gridline height for a fraction of the axis
+const grid = fr => fr.map(t => `<line x1="0" x2="100" y1="${gy(t)}" y2="${gy(t)}" stroke="var(--line-soft)" vector-effect="non-scaling-stroke"/>`).join("");
+// small tick labels at the right edge, at the top and middle gridlines, skipped where an end label sits
+const ticks = (max, labels) => [[4, max], [50, max / 2]].filter(t => !labels.some(l => Math.abs(l - t[0]) < 12))
+  .map(t => `<span class="tk" style="top:${t[0]}%">${tick(t[1])}</span>`).join("");
+
+/* ---- top bar ---- */
+function setState(s, label) { $("#state").dataset.s = s; text($("#state"), label); }
+
+/* ---- sidebar ---- */
+const sbRow = (k, v, u, st) => `<div class="sb-row"><span class="k">${k}</span>${st ? `<span class="st">${st}</span>` : ""}<span class="num">${v}${u ? `<span class="u">${u}</span>` : ""}</span></div>`;
+const bar = f => `<div class="bar4"><i style="width:${(clamp(f || 0, 0, 1) * 100).toFixed(1)}%"></i></div>`;
+const r0 = v => num(v) ? String(Math.round(v)) : "-";
+function sbLoad(h, now, label = "Load") {
+  const s = stats(h);
+  return `<div class="sb-met grow">${sbRow(label, num(now) ? `${Math.round(now)}%` : "-", "", s ? `Min ${Math.round(s.min)} · Avg ${Math.round(s.avg)}%` : "")}${sbChart(h, 0, 100, true)}</div>`;
+}
+function sbPower(h, now, lim) {
+  const s = stats(h), top = num(lim) && lim > 0 ? lim : Math.max(1, s ? s.max : 1);
+  return `<div class="sb-met grow">${sbRow("Power", `${r0(now)}${num(lim) ? ` / ${Math.round(lim)}` : ""}`, "W", s ? `Avg ${Math.round(s.avg)} W` : "")}${sbChart(h, 0, top, false, num(lim))}</div>`;
+}
+function sbTemp(h, now) {
+  const s = stats(h), lo = Math.min(40, s ? Math.floor(s.min) - 5 : 40), hi = Math.max(85, s ? Math.ceil(s.max) + 5 : 85);
+  return `<div class="sb-met grow">${sbRow("Temp", r0(now), "°C", s ? `Min ${Math.round(s.min)} · Max ${Math.round(s.max)} °C` : "")}${sbChart(h, lo, hi, false)}</div>`;
+}
+const link = g => num(g.pcie_gen_max ?? g.pcie_gen) ? `Gen${g.pcie_gen_max ?? g.pcie_gen}${num(g.pcie_width) ? ` x${g.pcie_width}` : ""}` : "";
+const vramRow = g => `<div class="sb-met">${sbRow("VRAM", num(g.mem_used) ? `${gib(g.mem_used)} / ${gib(g.mem_total)}` : "-", "GiB")}${bar(num(g.mem_total) ? g.mem_used / g.mem_total : 0)}</div>`;
+function sbGpu(g, h, name, alone) {
+  const right = alone ? `<span class="num">${esc(link(g))}</span>`
+    : `<span class="num">${num(g.temp) ? `<b>${Math.round(g.temp)}</b><span class="u">°C</span>` : ""}${num(g.temp) && link(g) ? " · " : ""}${esc(link(g))}</span>`;
+  return `<div class="sb-gpu"><div class="sb-gt"><span>${esc(name)}</span>${right}</div>${vramRow(g)}`
+    + sbLoad(tail(h.util), g.util) + sbPower(tail(h.power), g.power, g.power_limit) + (alone ? sbTemp(tail(h.temp), g.temp) : "") + `</div>`;
+}
+function sbTable(G, H, names) {
+  let h = `<div class="sb-tbl"><div class="h l">Load</div><div class="h">VRAM GiB</div><div class="h">Power W</div><div class="h">°C</div>`;
+  G.forEach(g => {
+    h += `<div class="t"><span>${esc(names(g))}</span><span class="num">${esc(link(g))}</span></div>`
+      + `<div class="c l">${num(g.util) ? `${Math.round(g.util)}%` : "-"}</div>`
+      + `<div class="c"><span>${gib(g.mem_used)}<span class="u">/${gib(g.mem_total)}</span></span></div>`
+      + `<div class="c"><span>${r0(g.power)}<span class="u">/${r0(g.power_limit)}</span></span></div>`
+      + `<div class="c">${r0(g.temp)}</div>`;
+  });
+  // the mean load and total power of all cards, sample by sample
+  const series = k => tail(H[0] ? H[0][k] : []).map((_, i) => {
+    const v = H.map(x => tail(x[k])[i]).filter(num);
+    return v.length ? v.reduce((t, x) => t + x, 0) / (k === "util" ? v.length : 1) : null;
+  });
+  const sum = k => G.reduce((t, g) => t + (num(g[k]) ? g[k] : 0), 0);
+  const load = G.filter(g => num(g.util)), mean = load.length ? load.reduce((t, g) => t + g.util, 0) / load.length : null;
+  return h + `</div><div class="sb-agg"><div class="sb-gt"><span>All ${G.length} GPUs</span></div>`
+    + sbLoad(series("util"), mean, "Mean load") + sbPower(series("power"), sum("power"), sum("power_limit") || null) + `</div>`;
+}
+function drawSide(hw, st, hist, eng, r) {
+  gid = 0;
+  const G = hw.gpus || [], H = Object.fromEntries((hist.gpus || []).map(x => [x.index, x]));
+  const named = Object.fromEntries((st.gpus || []).map(g => [g.index, shortGpu(g.name)]));
+  const title = g => `GPU ${g.index} · ${named[g.index] || "GPU"}`;
+  html($("#gpus"), !G.length ? `<div class="sb-none">No GPU readings.</div>`
+    : G.length >= 3 ? sbTable(G, G.map(g => H[g.index] || {}), title)
+    : G.map(g => sbGpu(g, H[g.index] || {}, G.length === 1 ? named[g.index] || title(g) : title(g), G.length === 1)).join(""));
+
+  const cpu = shortCpu(st.cpu_name);
+  text($("#cpu-name"), cpu); $("#cpu-name").title = st.cpu_name || "";
+  html($("#sys"), sbRow("CPU", num(hw.cpu) ? `${Math.round(hw.cpu)}%` : "-")
+    + `<div class="sb-met">${sbRow("RAM", num(hw.ram_total) ? `${gib(hw.ram_used)} / ${gib(hw.ram_total)}` : "-", "GiB")}${bar(num(hw.ram_total) ? hw.ram_used / hw.ram_total : 0)}</div>`
+    + sbRow("Disk read", num(hw.disk_read_mb) ? hw.disk_read_mb.toFixed(1) : "-", "MB/s")
+    + (st.driver ? `<div class="sb-foot">Driver ${esc(st.driver)}${st.cuda ? ` · CUDA ${esc(st.cuda)}` : ""}</div>` : ""));
+
+  // the tier split of the last request's routed lookups; the peer tier shows only when the engine reports it
+  const peer = r && num(r.pcie_share) ? r.pcie_share : null, hit = r && num(r.hit_rate) ? r.hit_rate : null;
+  const tiers = [["VRAM", "var(--fg)", hit == null ? null : hit * (1 - (peer || 0))]];
+  if (peer != null) tiers.push(["Peer", "var(--fg-3)", peer]);
+  tiers.push(["CPU", "var(--basalt-500)", hit == null ? null : (1 - hit) * (1 - (peer || 0))]);
+  html($("#experts"), `<div class="sb-stack" aria-hidden="true">${tiers.map(t => `<i style="width:${((t[2] || 0) * 100).toFixed(1)}%;background:${t[1]}"></i>`).join("")}</div>`
+    + `<div class="sb-leg">${tiers.map(t => `<div style="--c:${t[1]}"><span>${t[0]}</span><b>${t[2] == null ? "-" : `${(t[2] * 100).toFixed(1)}%`}</b></div>`).join("")}</div>`);
+}
+
+/* ---- Speed ---- */
+const SC = ["#FF7A3D", "#FFB547", "#F3D3B5", "#D9582A", "#FFD08A", "#C98A6B", "#FF9A66", "#B8401A"], SD = ["", "7 3", "1.5 3", "8 3 1.5 3"];
+const off = new Set();       // decode lines switched off: "t" (total) and slot numbers
+let offFor = 0;              // the slot count `off` was set up for
+function drawHero(live, hist, reqs, best, slots, total) {
+  const multi = total > 1, generating = live.state === "generating", reading = live.state === "reading";
+  // the live rate while generating, else the newest finished request's that has one
+  const r = reqs[0], rd = reqs.find(x => num(x.decode_tok_s)), last = rd ? rd.decode_tok_s : null;
+  const liveDec = generating && num(live.tok_s), dec = liveDec ? live.tok_s : last;
+  text($("#dec-k"), liveDec ? (multi ? "Decode · All slots" : "Decode") : last != null ? "Decode · Last request" : "Decode");
+  html($("#dec-v"), num(dec) ? `${dec.toFixed(1)}<small>tok/s</small>` : "-");
+  $("#dec-v").classList.toggle("idle", !liveDec);
+
+  if (offFor !== total) { offFor = total; off.clear(); if (total >= 4) off.add("t"); }
+  const ss = multi ? Array.from({ length: total }, (_, k) => tail((hist.slot_tok_s || [])[k])) : [tail(hist.tok_s)];
+  const agg = tail(hist.tok_s);
+  $("#chips").hidden = !multi;
+  if (multi) {
+    const items = [["t", "Total", "var(--fg)", ""]].concat(ss.map((_, k) => [String(k), `s${k + 1}`, SC[k % 8], SD[k % 4]]));
+    html($("#chips"), `<div class="cks" role="group" aria-label="Decode lines">${items.map(x => `<button type="button" class="ck" data-k="${x[0]}" aria-pressed="${!off.has(x[0])}" style="color:${x[2]}"><i class="bx"></i>`
+      + `<svg viewBox="0 0 12 6"><line x1="0" x2="12" y1="3" y2="3" stroke="${x[2]}" stroke-width="1.8" ${x[3] ? `stroke-dasharray="${x[3]}"` : ""}/></svg>${x[1]}</button>`).join("")}</div>`);
+  }
+  const showT = multi && !off.has("t"), vis = ss.map((_, k) => !multi || !off.has(String(k)));
+  const peak = a => Math.max(0, ...a.filter(num));
+  const max = nice(Math.max(showT ? peak(agg) : 0, ...ss.map((a, k) => vis[k] ? peak(a) : 0), 40));
+  const y = v => 100 - 4 - Math.min(v, max) / max * 92;
+  let svg = grid([0, .25, .5, .75]);
+  const labels = [];
+  ss.forEach((a, k) => {
+    if (!vis[k]) return;
+    lines(a, y).forEach(p => { svg += poly(p, `stroke="${SC[k % 8]}" stroke-width="${multi ? 1.3 : 1.7}" ${multi && SD[k % 4] ? `stroke-dasharray="${SD[k % 4]}"` : ""}`); });
+  });
+  const anyS = vis.some(Boolean) && multi;
+  if (showT) lines(agg, y).forEach(p => { svg += poly(p, `stroke="${anyS ? "var(--fg)" : "var(--accent)"}" stroke-width="1.8"`); });
+  let lab = "";
+  const end = a => { const s = stats(a); return s ? y(s.last) : null; };
+  if (showT && end(agg) != null) { labels.push(end(agg)); lab += `<span class="cl" style="top:${end(agg).toFixed(1)}%;color:${anyS ? "var(--fg)" : "var(--accent)"}">All</span>`; }
+  if (!multi && end(ss[0]) != null) { labels.push(end(ss[0])); lab += `<span class="cl" style="top:${end(ss[0]).toFixed(1)}%;color:${SC[0]}">s1</span>`; }
+  html($("#dec-chart"), `<svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="Decode tokens per second, last 60 seconds">${svg}</svg>${lab}${ticks(max, labels)}`);
+
+  // the live read rate while reading, else the newest finished request's that read part of its prompt
+  const readOf = x => (x.prompt_tokens || 0) - (x.reused || 0);
+  const rp = reqs.find(x => x.prompt_ms > 0 && readOf(x) > 0), lastPre = rp ? readOf(rp) / (rp.prompt_ms / 1000) : null;
+  const livePre = reading && num(live.prefill_tok_s_mean) && live.prefill_tok_s_mean > 0;
+  const pre = livePre ? live.prefill_tok_s_mean : lastPre;
+  text($("#pre-k"), livePre ? "Prefill" : lastPre != null ? "Prefill · Last request" : "Prefill");
+  html($("#pre-v"), num(pre) ? `${fmt(pre)}<small>tok/s</small>` : "-");
+  const pa = tail(hist.prefill_tok_s_mean).map(v => v > 0 ? v : v === 0 ? 0 : null);
+  const pmax = nice(Math.max(1000, ...pa.filter(num)));
+  html($("#pre-chart"), `<svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="Prefill tokens per second, last 60 seconds">${grid([0, .5])}`
+    + lines(pa, v => 100 - 4 - Math.min(v, pmax) / pmax * 92).map(p => poly(p, `stroke="var(--fg)" stroke-width="1.6"`)).join("") + `</svg>${ticks(pmax, [])}`);
+  html($("#pre-last"), r && num(r.prompt_tokens) ? `<b>${fmt(r.prompt_tokens)}</b> tok${num(r.prompt_ms) ? ` in <b>${(r.prompt_ms / 1000).toFixed(2)}</b> s` : ""}` : "-");
+  text($("#pre-hit"), r && r.prompt_tokens > 0 && num(r.reused) ? `${Math.round(r.reused / r.prompt_tokens * 100)}%` : "-");
+
+  const bd = best.decode, bp = best.prefill, busy = slots.filter(s => s.is_processing).length;
+  html($("#foot-dec"), `${multi ? `${busy} of ${total} slots busy` : "Single slot"} · Best <b>${bd ? fmt(bd.tok_s, 1) : "-"}</b> tok/s`);
+  html($("#foot-pre"), `Best <b>${bp ? fmt(bp.tok_s) : "-"}</b> tok/s`);
+  $("#foot-dec").title = bd ? `Fastest whole request since the server started: ${bd.id}, ${fmt(bd.output_tokens)} tokens, ${clock(bd.time * 1000)}` : "";
+  $("#foot-pre").title = bp ? `Fastest prompt read since the server started: ${bp.id}, ${fmt(bp.read_tokens)} tokens read, ${clock(bp.time * 1000)}` : "";
+}
+$("#chips").addEventListener("click", e => {
+  const b = e.target.closest(".ck"); if (!b) return;
+  off.has(b.dataset.k) ? off.delete(b.dataset.k) : off.add(b.dataset.k);
+  draw();
 });
 
-/* ---- drawing the metrics ---- */
-function setState(s, label) { $("#state").dataset.s = s; text("#state", label); }
-const share = r => {      // the tier split of the routed lookups: [vram, peer, cpu] as fractions, or null
-  if (!r || !num(r.hit_rate)) return null;
-  const peer = num(r.pcie_share) ? r.pcie_share : 0;
-  return [r.hit_rate * (1 - peer), peer, (1 - r.hit_rate) * (1 - peer)];
+/* ---- main card: Slots | Requests | Queue ---- */
+let tab = sessionStorage.getItem("basalt.tab") || "slots";
+$("#tabs").addEventListener("click", e => {
+  const b = e.target.closest("button[data-t]"); if (!b) return;
+  tab = b.dataset.t; try { sessionStorage.setItem("basalt.tab", tab); } catch (err) { /* private mode */ }
+  draw();
+});
+const idleNote = ids => {
+  if (!ids.length) return "";
+  const n = ids.map(i => i + 1), run = n.every((x, i) => !i || x === n[i - 1] + 1);
+  return n.length === 1 ? `Slot ${n[0]} idle` : run ? `Slots ${n[0]} to ${n[n.length - 1]} idle` : `Slots ${n.join(", ")} idle`;
 };
-const pct = f => num(f) ? `${(f * 100).toFixed(1)}%` : "—";
-const text = (id, v) => { const e = $(id); if (e.textContent !== v) e.textContent = v; };
+const accept = s => s.drafts_offered > 20 ? Math.round(s.drafts_accepted / s.drafts_offered * 100) : null;
+const prefixHit = s => num(s.reused) && s.prompt_tokens > 0 ? Math.round(s.reused / s.prompt_tokens * 100) : null;
+const ACC_NOTE = "Accept: drafts accepted over offered, from the slot's last finished request";
+function slotRows(rows, series, idle) {
+  const dense = rows.length > 4, max = nice(Math.max(20, ...rows.flatMap(s => series[s.id].filter(num))));
+  let h = `<div class="sl${dense ? " dense" : ""}"><div class="rw h"><span style="grid-column:1">Slot</span><span class="e" style="grid-column:2">tok/s</span><span class="sk" style="grid-column:3">Last 60 s</span><span class="e" style="grid-column:4">Output tok</span><span class="e cx" style="grid-column:5">Context</span><span class="e" style="grid-column:6" title="${ACC_NOTE}">Accept</span></div>`;
+  rows.forEach(s => {
+    const a = series[s.id], st = busyStats(a), api = API[s.api] || s.api || "", acc = accept(s), hit = prefixHit(s);
+    const pre = s.state === "prefill", run = s.is_processing;
+    const rate = !run ? "-" : pre ? (num(s.prefill_done) && s.prompt_tokens ? `${Math.min(100, Math.round(s.prefill_done / s.prompt_tokens * 100))}%` : "…") : fmt(s.tok_s);
+    h += `<div class="rw${run ? "" : " idle"}"${pre ? ` title="Reading the prompt"` : ""}><span class="p nm" style="grid-column:1">Slot ${s.id + 1}${dense ? `<span class="u"> · ${run ? esc(api) : "Idle"}</span>` : ""}</span>`
+      + `<span class="p rate e" style="grid-column:2">${rate}</span>${spark(a, max)}`
+      + `<span class="p e" style="grid-column:4">${run ? `${fmt(s.generated)}${num(s.max_tokens) ? `<span class="u">/${fmt(s.max_tokens)}</span>${bar(s.generated / s.max_tokens)}` : ""}` : "-"}</span>`
+      + `<span class="p e cx" style="grid-column:5">${kt(s.ctx_used || 0)}<span class="u">/${kt(s.n_ctx || 0)}</span>${bar(s.n_ctx ? s.ctx_used / s.n_ctx : 0)}</span>`
+      + `<span class="p e" style="grid-column:6">${acc != null ? `${acc}<span class="u">%</span>` : "-"}</span>`
+      + (dense ? "" : `<span class="s" style="grid-column:1">${run ? esc(api) : "Idle"}</span>`
+        + `<span class="s e" style="grid-column:2">${pre ? "Read" : st ? `Avg ${Math.round(st.avg)}` : ""}</span>`
+        + `<span class="s e" style="grid-column:4">${num(s.ttft_s) ? `TTFT ${s.ttft_s.toFixed(1)} s` : ""}</span>`
+        + `<span class="s e cx" style="grid-column:5">${hit != null ? `Hit ${hit}%` : ""}</span>`
+        + `<span class="s e" style="grid-column:6">${num(s.draft_len) ? `Draft ${s.draft_len.toFixed(1)}` : ""}</span>`) + `</div>`;
+  });
+  return h + `</div>` + (idle.length ? `<div class="sp-foot">${idleNote(idle)}</div>` : "");
+}
+function slotOne(s, a, idle) {
+  const st = busyStats(a), acc = accept(s), hit = prefixHit(s), pre = s.state === "prefill";
+  const max = nice(Math.max(20, ...a.filter(num)));
+  const rate = pre ? (num(s.prefill_done) && s.prompt_tokens ? `${Math.min(100, Math.round(s.prefill_done / s.prompt_tokens * 100))}<small>% read</small>` : "…") : `${fmt(s.tok_s)}<small>tok/s</small>`;
+  return `<div class="one"><div class="top"><div><div class="nm">Slot ${s.id + 1}</div><div class="meta">${esc(API[s.api] || s.api || "")}${s.model ? ` · ${esc(s.model)}` : ""}</div></div><div class="rate">${rate}</div></div>`
+    + `<div class="cap"><span>Last 60 s · tok/s</span><span>${st ? `Min ${Math.round(st.min)} · Avg ${Math.round(st.avg)}` : ""}</span></div>${spark(a, max)}`
+    + `<div class="stats"><div><span class="k">Output tok</span><span class="v">${fmt(s.generated)}${num(s.max_tokens) ? `<span class="u"> / ${fmt(s.max_tokens)}</span>` : ""}</span>${num(s.max_tokens) ? bar(s.generated / s.max_tokens) : ""}</div>`
+    + `<div><span class="k">Context</span><span class="v">${kt(s.ctx_used || 0)}<span class="u"> / ${kt(s.n_ctx || 0)}</span></span>${bar(s.n_ctx ? s.ctx_used / s.n_ctx : 0)}</div>`
+    + `<div title="${ACC_NOTE}"><span class="k">Accept</span><span class="v">${acc != null ? `${acc}<span class="u">%</span>` : "-"}</span>${num(s.draft_len) ? `<span class="s2">Draft ${s.draft_len.toFixed(1)} tok</span>` : ""}</div>`
+    + `<div><span class="k">First token</span><span class="v">${num(s.ttft_s) ? `${s.ttft_s.toFixed(1)}<span class="u"> s</span>` : "-"}</span>${hit != null ? `<span class="s2">Prefix hit ${hit}%</span>` : ""}</div>`
+    + `</div></div>` + (idle.length ? `<div class="sp-foot">${idleNote(idle)}</div>` : "");
+}
+function requestsPane(live, reqs, multi) {
+  const rows = [];
+  if (!multi && (live.state === "reading" || live.state === "generating"))
+    rows.push({ t: Date.now() / 1000 - (live.elapsed_s || 0), id: "Running", path: "", out: live.generated, tps: live.tok_s, dur: live.elapsed_s, live: true });
+  reqs.forEach(r => rows.push({ t: r.time, id: r.id, slot: r.slot, path: r.path, out: r.output_tokens, tps: r.decode_tok_s, dur: r.duration_s, finish: r.finish }));
+  if (!rows.length) return `<div class="empty">No requests yet.</div>`;
+  const ep = p => String(p || "-").replace("/v1/", "").replace("chat/completions", "chat");
+  return `<table><thead><tr><th>Time</th><th>ID</th>${multi ? "<th>Slot</th>" : ""}<th>Endpoint</th><th class="r">Output</th><th class="r">Rate</th><th class="r">Duration</th></tr></thead><tbody>`
+    + rows.map(r => {
+      // a request that did not simply stop is marked on its id, with the reason
+      const odd = r.finish && r.finish !== "stop" ? (r.finish === "error" ? "err" : "warn") : "";
+      return `<tr${r.live ? ` class="live"` : ""}><td>${clock(r.t * 1000)}</td><td class="${odd}">${esc(r.id)}${odd ? ` · ${esc(r.finish)}` : ""}</td>`
+        + (multi ? `<td class="dim">${num(r.slot) ? `s${r.slot + 1}` : "-"}</td>` : "")
+        + `<td>${r.live ? "-" : esc(ep(r.path))}</td><td class="r">${num(r.out) ? fmt(r.out) : "-"}</td><td class="r">${num(r.tps) ? r.tps.toFixed(1) : "-"}</td>`
+        + `<td class="r">${num(r.dur) ? `${r.dur.toFixed(1)} s` : "-"}</td></tr>`;
+    }).join("") + `</tbody></table>`;
+}
+const mss = s => `${Math.floor(s / 60)}:${p2(Math.floor(s % 60))}`;
+function queuePane(live) {
+  const q = live.queue || [], n = live.queued || 0;
+  if (!n && !q.length) return `<div class="empty">No request is waiting.</div>`;
+  const toks = q.reduce((t, r) => t + (num(r.prompt_tokens) ? r.prompt_tokens : 0), 0);
+  return `<div class="qsum"><span><b>${fmt(Math.max(n, q.length))}</b> prompt${Math.max(n, q.length) === 1 ? "" : "s"} waiting</span><span><b>${fmt(toks)}</b> tok to read</span></div>`
+    + `<table><thead><tr><th>API</th><th class="r">Prompt tok</th><th class="r">Waiting</th></tr></thead><tbody>`
+    + q.map(r => `<tr><td>${esc(API[r.api] || r.api || "-")}</td><td class="r">${num(r.prompt_tokens) ? fmt(r.prompt_tokens) : "-"}</td><td class="r">${mss(r.waited_s || 0)}</td></tr>`).join("")
+    + `</tbody></table>`;
+}
+function drawMain(live, hist, reqs, slots, total) {
+  const multi = total > 1, n = live.queued || 0;
+  const T = (multi ? [["slots", "Slots"]] : []).concat([["req", "Requests"], ["queue", `Queue (${n})`]]);
+  const cur = T.some(t => t[0] === tab) ? tab : T[0][0];
+  html($("#tabs"), T.map(t => `<button type="button" role="tab" data-t="${t[0]}" aria-selected="${t[0] === cur}">${t[1]}</button>`).join(""));
+  let h;
+  if (cur === "slots") {
+    const series = slots.map((_, k) => tail((hist.slot_tok_s || [])[k]));
+    const busy = slots.filter(s => s.is_processing), idle = slots.filter(s => !s.is_processing).map(s => s.id);
+    h = busy.length === 1 ? slotOne(busy[0], series[busy[0].id], idle)
+      : slotRows(busy.length ? busy : slots, series, busy.length ? idle : []);
+  } else h = cur === "req" ? requestsPane(live, reqs, multi) : queuePane(live);
+  html($("#pane"), h);
+}
 
+/* ---- the whole page ---- */
 function draw() {
   if (!M) return;
-  const live = M.live || {}, eng = M.engine || {}, hw = M.hardware || {}, st = M.hardware_static || {};
-  const gpus = hw.gpus || [], g0 = gpus[0] || {}, names = Object.fromEntries((st.gpus || []).map(g => [g.index, g.name]));
-  const reqs = M.requests || [], r0 = reqs[0], busy = live.state === "reading" || live.state === "generating";
-  const generating = live.state === "generating";
-  const sl = live.slots || {}, multi = sl.total > 1, slotRows = M.slots || [], dec = slotRows.filter(s => s.state === "decoding").length;
-
+  const live = M.live || {}, eng = M.engine || {}, hist = M.history || {}, reqs = M.requests || [];
+  const total = (live.slots || {}).total || 1, slots = M.slots || [];
   const name = (live.state || "idle")[0].toUpperCase() + (live.state || "idle").slice(1);
   setState(live.state || "idle", live.queued > 0 ? `${name} · ${live.queued} queued` : name);
-  text("#model", eng.model || "");
-
-  const last = r0 && num(r0.decode_tok_s) ? r0.decode_tok_s : null, tok = generating && num(live.tok_s) ? live.tok_s : last;
-  $("#v-tok").textContent = num(tok) ? tok.toFixed(1) : "—";
-  $("#v-tok").classList.toggle("idle", !generating);
-  $("#heat").style.left = clamp((tok || 0) / 800, 0, 1) * 100 + "%";
-  CHARTS[0].name = multi ? "Tok/s (aggregate)" : "Decode";
-  text("#k-tok", multi ? "Tok/s (aggregate)" : "Tokens/s");
-  text("#speed-note", multi ? "Last 60 s · dashed: per stream" : "Last 60 s");
-  $("#line-per").style.display = multi ? "" : "none";
-  $("#s-busy").hidden = !multi;
-  $("#s-busy").innerHTML = `<b>${sl.active || 0}</b> of ${sl.total} slots busy${dec && num(live.tok_s) ? ` · ${fmt(live.tok_s / dec)} per stream` : ""}`;
-  text("#limit", num(g0.power_limit) ? `@ ${Math.round(g0.power_limit)} W` : "");
-  $("#v-acc").innerHTML = r0 && r0.drafts_offered > 0 ? `${(r0.drafts_accepted / r0.drafts_offered * 100).toFixed(0)}<small>%</small>` : "—";
-  const ctx = multi ? slotRows.reduce((a, s) => a + (s.is_processing ? s.ctx_used : 0), 0)
-    : busy ? (live.prompt_tokens || 0) + (live.generated || 0) : r0 ? (r0.prompt_tokens || 0) + (r0.output_tokens || 0) : null;
-  text("#v-ctx", num(ctx) ? fmt(ctx) : "—");
-  text("#s-ctx", num(eng.max_context) ? `of ${fmt(slotRows.length > 1 && num(slotRows[0].n_ctx) ? slotRows[0].n_ctx : eng.max_context)} tokens${slotRows.length > 1 ? " (per slot)" : ""}` : "");
-
-  const h = M.history || {};
-  CHARTS[0].v = tail(h.tok_s); CHARTS[1].v = tail(h.prefill_tok_s_mean);
-  const lastPrefill = r0 && r0.prompt_ms > 0 && r0.prompt_tokens > (r0.reused || 0) ? (r0.prompt_tokens - (r0.reused || 0)) / (r0.prompt_ms / 1000) : null;
-  drawChart(CHARTS[0], generating ? live.tok_s : null, last);
-  const lastRead = r0 ? (r0.prompt_tokens || 0) - (r0.reused || 0) : 0;   // short prompts are dominated by fixed cost, so show the size
-  drawChart(CHARTS[1], live.state === "reading" ? live.prefill_tok_s_mean : null, lastPrefill, lastPrefill != null ? lastRead : 0);
-  noteBest(reqs); drawBest();
-
-  text("#s-load", num(g0.util) ? `${Math.round(g0.util)}%` : "—");
-  text("#s-vram", num(g0.mem_used) ? `${gib(g0.mem_used)} / ${gib(g0.mem_total)} GiB` : "—");
-  text("#s-temp", num(g0.temp) ? `${Math.round(g0.temp)} °C` : "—");
-  text("#s-pow", num(g0.power) ? `${Math.round(g0.power)}${num(g0.power_limit) ? ` / ${Math.round(g0.power_limit)}` : ""} W` : "—");
-  text("#s-cpu", num(hw.cpu) ? `${Math.round(hw.cpu)}%` : "—");
-  text("#s-ram", num(hw.ram_total) ? `${gib(hw.ram_used)} / ${gib(hw.ram_total)} GiB` : "—");
-  text("#s-disk", num(hw.disk_read_mb) ? `${hw.disk_read_mb.toFixed(1)} MB/s` : "—");
-
-  const sh = share(r0);
-  [["vram", 0], ["peer", 1], ["cpu", 2]].forEach(([k, i]) => {
-    $("#tr-" + k).style.width = sh ? sh[i] * 100 + "%" : "0";
-    text("#tl-" + k, sh ? pct(sh[i]) : "—");
-  });
-
-  drawRequests(live, reqs, busy, multi);
-  drawSlots(M, multi);
-  drawHardware(eng, st, hw, gpus, names, sh);
+  text($("#model"), eng.model || "");
+  drawSide(M.hardware || {}, M.hardware_static || {}, hist, eng, reqs[0]);
+  drawHero(live, hist, reqs, M.best || {}, slots, total);
+  drawMain(live, hist, reqs, slots, total);
 }
 
-function drawRequests(live, reqs, busy, multi) {
-  const rows = [];
-  if (busy && !multi) rows.push({ t: Date.now() / 1000 - (live.elapsed_s || 0), id: "Running", path: "—", out: live.generated, tps: live.tok_s, dur: live.elapsed_s, live: true });
-  reqs.forEach(r => rows.push({ t: r.time, id: r.id, path: (r.path || "").replace("/v1/", "").replace("chat/completions", "chat"), out: r.output_tokens, tps: r.decode_tok_s, dur: r.duration_s, finish: r.finish }));
-  const total = rows.length; rows.length = Math.min(rows.length, 6);   // with slots, the lanes show what is running
-  const tb = $("#t-req"); tb.replaceChildren();
-  rows.forEach(r => {
-    const tr = document.createElement("tr"); if (r.live) tr.className = "live";
-    // a request that did not simply stop is marked on its id, with the engine's reason as the tooltip
-    const odd = r.finish && r.finish !== "stop" ? (r.finish === "error" ? "err" : "warn") : "";
-    const id = `${r.id || "—"}${odd ? ` · ${r.finish}` : ""}`;
-    [[clock(r.t * 1000).slice(0, 8), ""], [id, "f " + odd], [r.path || "—", ""], [num(r.out) ? fmt(r.out) : "—", "n"],
-     [num(r.tps) ? r.tps.toFixed(1) : "—", r.live ? "n f live" : "n f"], [num(r.dur) ? `${r.dur.toFixed(1)} s` : "—", "n"]].forEach(([t, c]) => {
-      const td = document.createElement("td"); td.textContent = t; if (c) td.className = c.trim(); tr.append(td);
-    });
-    tb.append(tr);
-  });
-  $("#req-empty").hidden = rows.length > 0;
-  PANE.req = String(total); text("#req-count", PANE.req); if (curPane() === "req") text("#pane-count", PANE.req);
-}
-
-function drawHardware(eng, st, hw, gpus, names, sh) {
-  const meter = f => `<div class="meter"><i style="width:${(clamp(f || 0, 0, 1) * 100).toFixed(1)}%"></i></div>`;
-  const val = (x, unit) => num(x) ? `<div class="dv">${Math.round(x)}${unit ? `<small>${unit}</small>` : ""}</div>` : `<div class="dv none">—</div>`;
-  const mem = (used, total, share) => {
-    const ok = num(used) && num(total) && total > 0;
-    return `<div class="dm"><span>${ok ? `${gib(used)} / ${gib(total)} GiB` : "—"}</span><i>${ok ? `${(used / total * 100).toFixed(0)}%` : ""}</i>${meter(ok ? used / total : 0)}
-      <div class="lk">${meter(share)}<i>${num(share) ? `${pct(share)} of lookups` : "No lookups yet"}</i></div></div>`;
-  };
-  const experts = (slots, mib, note) => num(mib) && mib > 0
-    ? `<div class="dx"><b>${num(slots) ? `${fmt(slots)} slots` : note}</b><span>${(mib / 1024).toFixed(1)} GiB${num(slots) ? "" : " pinned"}</span></div>`
-    : `<div class="dv none">—</div>`;
-  const peerSlots = (eng.expert_slots || 0) - (eng.expert_slots_primary || 0), peerMib = (eng.expert_cache_mib || 0) - (eng.expert_cache_primary_mib || 0);
-  const tier = [[eng.expert_slots_primary, eng.expert_cache_primary_mib, sh && sh[0]], [peerSlots, peerMib, sh && sh[1]]];
-  const label = [...gpus.map((g, i) => [names[g.index] || `CUDA${g.index}`, `CUDA${g.index} · ${i === 0 ? "Primary" : "Peer experts"}`]), ["System RAM", "Host · CPU load"]];
-  const row = cells => `<div class="dl"><div class="dn"><b></b><span></span></div>${cells}</div>`;
-  const rows = gpus.map((g, i) => row(
-      mem(g.mem_used, g.mem_total, tier[i] && tier[i][2]) + val(g.util, "%")
-      + (num(g.power) ? `<div class="dv">${Math.round(g.power)}<small>/ ${num(g.power_limit) ? Math.round(g.power_limit) : "—"} W</small></div>` : val(null))
-      + val(g.temp, "°C")
-      + (num(g.pcie_gen) ? `<div class="dv">Gen${g.pcie_gen}<small>x${g.pcie_width}</small></div>` : val(null))
-      + (tier[i] ? experts(tier[i][0], tier[i][1]) : val(null))));
-  rows.push(row(mem(hw.ram_used, hw.ram_total, sh && sh[2]) + val(hw.cpu, "%")
-      + val(null) + val(null) + val(null) + experts(null, eng.arena_mib, "Remainder")));
-  $("#h-dev").innerHTML = `<div class="dl head"><span>Device</span><span>Memory · routed lookups</span><span>Load</span><span>Power</span><span>Temperature</span><span>PCIe</span><span>Experts</span></div>` + rows.join("");
-  // device names come from the driver, so they are set as text
-  $$("#h-dev .dl:not(.head) .dn").forEach((d, i) => { d.querySelector("b").textContent = label[i][0]; d.querySelector("span").textContent = label[i][1]; });
-
-  text("#h-cpu", st.cpu_name || "—");
-  text("#h-cores", st.cores && st.threads ? `${st.cores} cores · ${st.threads} threads` : num(st.threads) ? `${st.threads} threads` : "—");
-  text("#h-load", num(hw.cpu) ? `${Math.round(hw.cpu)}%` : "—");
-  text("#h-driver", st.driver ? `${st.driver}${st.cuda ? ` · CUDA ${st.cuda}` : ""}` : "—");
-  text("#h-model", eng.model || "—");
-  text("#h-ctx", num(eng.max_context) ? `${fmt(eng.max_context)} tokens${eng.kv ? ` · kv ${eng.kv}` : ""}` : "—");
-  text("#h-draft", num(eng.spec) ? (eng.spec > 0 ? `Up to ${eng.spec} tokens` : "Off") : "—");
-  text("#h-build", eng.version || "—");
-}
-
-const PANE = { req: "0", log: "0 lines" };
-let paneOn = "req";
-// tabbed (several slots): one panel shows; split (one slot): both show, stacked
-function pane(p = paneOn) {
-  paneOn = p;
-  const split = $(".col-r").classList.contains("single");
-  $$("#reqs .tab").forEach(t => t.setAttribute("aria-selected", String(t.dataset.pane === p)));
-  $("#pane-req").hidden = !split && p !== "req"; $("#pane-log").hidden = !split && p !== "log";
-  text("#pane-count", PANE[p]);
-  scrollLog();
-}
-$$("#reqs .tab").forEach(t => t.onclick = () => pane(t.dataset.pane));
-const curPane = () => paneOn;
-
-/* ---- log ---- */
-const logs = [];
-const F = { lvl: "all", q: "", follow: true };
-const logEl = $("#log");
-const MAXDOM = matchMedia("(min-width: 981px)").matches ? 12 : 14;   // a desktop log shows the last few lines
-const passes = e => (F.lvl === "all" || (F.lvl === "warn" && e.lvl !== "info") || (F.lvl === "err" && e.lvl === "err"))
-  && (!F.q || e.msg.toLowerCase().includes(F.q.toLowerCase()));
-
-const NUM = /(?<![\w.])\d[\d,]*(?:\.\d+)?(?:\s?(?:tok\/s|tok|ms|MiB|GiB|MB\/s|%|s|W|slots))?(?![\w])/g;
-function numbers(str, into) {
-  let i = 0, m; NUM.lastIndex = 0;
-  while ((m = NUM.exec(str))) {
-    if (m.index > i) into.append(str.slice(i, m.index));
-    const s = document.createElement("span"); s.className = "n"; s.textContent = m[0]; into.append(s);
-    i = m.index + m[0].length;
-  }
-  if (i < str.length) into.append(str.slice(i));
-}
+/* ---- logs ---- */
+const logEl = $("#log"), MAXLOG = 400;
+let logCount = 0, follow = true;
 function lineEl(e) {
-  const d = document.createElement("div"); d.className = `ln ${e.lvl}`;
-  const mk = (c, t) => { const s = document.createElement("span"); s.className = c; s.textContent = t; return s; };
-  const msg = mk("msg", ""), q = F.q.toLowerCase(), low = e.msg.toLowerCase();
-  let from = 0, at;
-  while (q && (at = low.indexOf(q, from)) !== -1) {
-    numbers(e.msg.slice(from, at), msg);
-    const k = document.createElement("mark"); k.textContent = e.msg.slice(at, at + q.length); msg.append(k);
-    from = at + q.length;
-  }
-  numbers(e.msg.slice(from), msg);
-  d.append(mk("t", clock(e.t * 1000)), mk("s", e.src), mk("lv", e.lvl === "info" ? "INF" : e.lvl === "warn" ? "WRN" : "ERR"), msg);
+  const d = document.createElement("div");
+  if (e.lvl !== "info") d.className = e.lvl;
+  const t = document.createElement("i"); t.textContent = clock(e.t * 1000);
+  d.append(t, `  ${e.src === "srv" ? "[server] " : ""}${e.msg}`);
   return d;
 }
-const counts = () => { PANE.log = `${fmt(logs.length)} lines`; text("#log-count", PANE.log); if (curPane() === "log") text("#pane-count", PANE.log); };
-function rebuild() {
-  const out = [];
-  for (let i = logs.length - 1; i >= 0 && out.length < MAXDOM; i--) if (passes(logs[i])) out.push(logs[i]);
-  logEl.replaceChildren(...out.reverse().map(lineEl));
-  if (!out.length) { const d = document.createElement("div"); d.className = "empty"; d.textContent = logs.length ? "No lines match the filter." : "No log lines yet."; logEl.append(d); }
-  counts(); scrollLog();
-}
 function append(lines) {
-  logs.push(...lines); if (logs.length > 3000) logs.splice(0, logs.length - 3000);
-  const shown = lines.filter(passes);
-  if (shown.length) {
-    logEl.querySelector(".empty")?.remove();
-    logEl.append(...shown.map(lineEl));
-    while (logEl.childElementCount > MAXDOM) logEl.firstChild.remove();
-  }
-  counts(); if (F.follow) scrollLog();
+  logEl.querySelector(".empty")?.remove();
+  logEl.append(...lines.map(lineEl));
+  while (logEl.childElementCount > MAXLOG) logEl.firstChild.remove();
+  logCount += lines.length; text($("#log-count"), `${fmt(logCount)} lines`);
+  if (follow) logEl.scrollTop = logEl.scrollHeight;
 }
-function scrollLog() { logEl.scrollTop = logEl.scrollHeight; }
-logEl.addEventListener("scroll", () => {
-  const near = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 12;
-  if (!near && F.follow) setFollow(false);
-  if (near && !F.follow) setFollow(true);
-});
-function setFollow(on) { F.follow = on; $("#b-follow").setAttribute("aria-pressed", String(on)); $("#jump").hidden = on; if (on) scrollLog(); }
-$("#jump").onclick = () => setFollow(true);
-$("#b-follow").onclick = () => setFollow(!F.follow);
-$$("#lvl button").forEach(b => b.onclick = () => {
-  F.lvl = b.dataset.l; $$("#lvl button").forEach(x => x.setAttribute("aria-pressed", String(x === b))); rebuild();
-});
-$("#q").oninput = e => { F.q = e.target.value.trim(); rebuild(); };
-document.addEventListener("keydown", e => {
-  if (e.target.tagName === "INPUT") { if (e.key === "Escape") e.target.blur(); return; }
-  if (e.key === "/") { e.preventDefault(); view("stats"); pane("log"); $("#q").focus(); }
-  else if (e.key === "f") setFollow(!F.follow);
-});
-
-/* ---- slots and queue (only with more than one slot) ---- */
-const API = { openai: "OpenAI", anthropic: "Anthropic" };
-const kfmt = n => n >= 10000 ? (n / 1000).toFixed(n >= 100000 ? 0 : 1) + "k" : fmt(n);
-const STATE = { idle: "Idle", prefill: "Prefill", decoding: "Decoding" };
-const cell = (cls, text) => { const e = document.createElement("span"); e.className = cls; if (text != null) e.textContent = text; return e; };
-
-function drawSlots(M, multi) {
-  $("#slots").hidden = $("#queue").hidden = !multi;
-  const col = $(".col-r"); if (col.classList.contains("single") === multi) { col.classList.toggle("single", !multi); pane(); }
-  if (!multi) return;
-  const sl = M.slots || [], host = $("#lanes"), live = M.live, queue = live.queue || [];
-  if (host.dataset.n !== String(sl.length)) {
-    host.dataset.n = String(sl.length);
-    const head = document.createElement("div"); head.className = "lane head";
-    ["Slot", "State", "Tokens/s", "Output", "Context", "Accept", "Request"].forEach(t => head.append(cell(t === "Accept" ? "n" : "", t)));
-    host.replaceChildren(head, ...sl.map(s => {
-      const d = document.createElement("div"); d.className = "lane"; d.dataset.s = "idle";
-      const ctxc = cell("l-ctx"), meter = cell("meter"); meter.append(document.createElement("i")); ctxc.append(meter, cell(""));
-      d.append(cell("l-id", `Slot ${s.id + 1}`), cell("l-st"), cell("l-tps"), cell("l-tok"), ctxc, cell("l-acc"), cell("l-req"));
-      return d;
-    }));
-  }
-  const rows = host.querySelectorAll(".lane:not(.head)");
-  sl.forEach((s, i) => {
-    const el = rows[i]; if (!el) return;
-    const q = c => el.querySelector(c);
-    el.dataset.s = s.state;
-    const pre = s.state === "prefill" && num(s.prefill_done) && s.prompt_tokens;
-    text2(q(".l-st"), (STATE[s.state] || s.state) + (pre ? ` ${Math.min(100, Math.round(s.prefill_done / s.prompt_tokens * 100))}%` : ""));
-    q(".l-st").title = pre ? `${kfmt(s.prefill_done)} of ${kfmt(s.prompt_tokens)} prompt tokens read` : "";
-    const tps = q(".l-tps"); tps.replaceChildren();
-    if (s.state === "decoding") tps.append(fmt(s.tok_s), Object.assign(document.createElement("small"), { textContent: "tok/s" }));
-    else tps.append("—");
-    text2(q(".l-tok"), s.is_processing ? `${fmt(s.generated)} tokens` : "—");
-    const f = s.n_ctx ? s.ctx_used / s.n_ctx : 0, m = q(".meter");
-    m.firstChild.style.width = clamp(f, 0, 1) * 100 + "%"; m.classList.toggle("hot", f > .8);
-    text2(q(".l-ctx").lastChild, `${kfmt(s.ctx_used || 0)} / ${kfmt(s.n_ctx || 0)}`);
-    text2(q(".l-acc"), s.drafts_offered > 20 ? `${(s.drafts_accepted / s.drafts_offered * 100).toFixed(0)}%` : "—");
-    const rq = q(".l-req"); rq.replaceChildren();
-    if (s.is_processing) { const b = document.createElement("b"); b.textContent = API[s.api] || s.api || "—"; rq.append(b, ` · ${s.model || "—"}`); }
-    else rq.append("—");
-  });
-  text("#slot-count", `${(live.slots || {}).active || 0} of ${sl.length} busy`);
-  text("#slot-note", sl.length ? `${kfmt(sl[0].n_ctx)} context each` : "");
-
-  text("#q-count", String(live.queued || 0));
-  const tb = $("#t-queue"); tb.replaceChildren();
-  queue.slice(0, 3).forEach(r => {
-    const tr = document.createElement("tr");
-    [[`${(r.waited_s || 0).toFixed(1)} s`, "f"], [API[r.api] || r.api || "—", ""], [r.model || "—", ""], [num(r.prompt_tokens) ? fmt(r.prompt_tokens) : "—", "n"]].forEach(([t, c]) => {
-      const td = document.createElement("td"); td.textContent = t; if (c) td.className = c; tr.append(td);
-    });
-    tb.append(tr);
-  });
-  const more = (live.queued || 0) - Math.min(3, queue.length);
-  if (more > 0) { const tr = document.createElement("tr"), td = document.createElement("td"); td.colSpan = 4; td.textContent = `+${more} more`; tr.append(td); tb.append(tr); }
-  $("#q-empty").hidden = (live.queued || 0) > 0;
-  text2($("#q-empty"), "No request is waiting.");
+logEl.addEventListener("scroll", () => { follow = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 12; });
+function clearLog(note) {
+  logCount = 0; text($("#log-count"), "");
+  const d = document.createElement("div"); d.className = "empty"; d.textContent = note; logEl.replaceChildren(d);
 }
-const text2 = (e, v) => { if (e.textContent !== v) e.textContent = v; };
 
 /* ---- polling ---- */
 let lastLog = 0;
 async function pollMetrics() {
   try {
     const m = await get("metrics");
-    m.slots = m.live && m.live.slots && m.live.slots.total > 1 ? await get("slots").catch(() => []) : [];
-    const dec = m.slots.filter(s => s.state === "decoding").length;
-    perStream = perStream.slice(1).concat(dec ? (m.live.tok_s || 0) / dec : 0);
+    m.slots = await get("slots").catch(() => []);
     M = m; $("#auth").hidden = true; draw();
   } catch (e) {
     $("#auth").hidden = !e.locked; M = null;
@@ -408,9 +353,9 @@ async function pollMetrics() {
 async function pollLog() {
   try {
     const r = await get(`api/logs?after=${lastLog}`);
-    if (r.last < lastLog) { logs.length = 0; lastLog = 0; best = {}; saveBest(); rebuild(); }       // the server restarted
+    if (r.last < lastLog) { lastLog = 0; clearLog("The server restarted."); }
     else if (r.lines.length) { lastLog = r.last; append(r.lines); }
-    else if (!logs.length && !logEl.firstChild) rebuild();
+    else if (!logCount && !logEl.firstChild) clearLog("No log lines yet.");
   } catch (e) { /* the metrics poll reports the connection */ }
   setTimeout(pollLog, 1000);
 }
@@ -420,5 +365,4 @@ $("#auth").onsubmit = e => {
 
 $("#host").textContent = location.host;
 fetch("health").then(r => r.json()).then(h => { $("#keyed").hidden = !h.api_key; }).catch(() => {});
-view(location.hash === "#hardware" ? "hardware" : "stats");
 pollMetrics(); pollLog();

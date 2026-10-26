@@ -128,6 +128,25 @@ Each request ends with one slot-tagged `done` line:
 - `hit` is the expert cache hit rate and `pcie` the share of routed experts read over PCIe; both appear when the
   engine reports them.
 
+## The stats page
+
+The server's own address (`[server] stats` above) serves one page that reads `/metrics`, `/slots` and `/api/logs`
+once a second:
+
+- GPUs: every card the engine uses, with VRAM and 60 s charts of load and power (one card adds temperature; three or
+  more cards are a table with a chart of their mean load and total power). System: CPU, RAM, disk reads, driver and
+  CUDA. Experts: where the last request's routed lookups were served (VRAM, peer card, CPU).
+- Speed: decode and prefill rates with 60 s charts (one line per slot with `--parallel`), the last prompt and its prefix
+  cache hit, and the fastest whole request since the server started (at least 256 output tokens for decode, 4096
+  newly read prompt tokens for prefill).
+- Slots (with `--parallel`): each busy slot's rate, output against its limit, context, time to first token, prefix
+  hit and tokens per window; Accept is the slot's last finished request. Requests: the newest finished requests.
+  Queue: the requests waiting for a slot or for the single stream.
+- Logs: the console lines.
+
+`/metrics` carries the history behind the charts in `history` (`tok_s`, `prefill_tok_s_mean`, `slot_tok_s` one series
+per slot, `gpus` with `util`, `power` and `temp` per card) and the fastest requests in `best`.
+
 ## Memory floors
 
 Basalt refuses settings that would leave the machine without memory, and never shrinks what you asked for:
