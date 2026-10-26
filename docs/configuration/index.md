@@ -153,7 +153,9 @@ The model's experts live in VRAM (the expert cache), in RAM, or in the file. The
 ### The adaptive tier
 
 The engine counts how often each expert is routed to. Every few decode windows it runs a round: in each layer it swaps
-the most-used experts that are not in VRAM in for the least-used resident ones, when the gain is clear. The peer card
+the most-used experts that are not in VRAM in for the least-used resident ones, when the gain is clear. On one card
+without a peer tier the round ranks every layer together, so a layer that routes to more experts takes slots from the
+layers that route to fewer. The peer card
 takes the next most-used experts the main card does not hold. After each round every count is decayed, so recent routing
 outweighs old. Copies run on a side stream and land a few windows later. Adaptation moves experts between the CPU and
 the GPUs, so output is not bit-identical from run to run; see [precision](../precision/index.md). The round settings are

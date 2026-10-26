@@ -113,6 +113,7 @@
 #include <sstream>
 #include <string>
 #include <set>
+#include <tuple>
 #include <vector>
 #include "basalt/log.hpp"
 
@@ -6113,13 +6114,53 @@ int main(int argc, char** argv) {
         // CUDA0 (from their RAM copy, as any other swap) and its coldest go to the CPU
         // routings a peer expert needs above CUDA0's victim before it moves
         constexpr float promote_margin = 10.0f;
-        // the round's swaps, best first: per layer the most-routed missing experts against the least-routed resident ones
-        struct Swap { float gain; int32_t layer, in, out; };
+        // the round's swaps, best first: the most-routed missing experts against the least-routed resident ones, per
+        // layer, or over all layers (`across`: the incoming expert takes a slot of the outgoing one's layer `lout`)
+        struct Swap { float gain; int32_t layer, in, out, lout; };
         // a layer whose peer experts take more than this share of its 10 routed entries per token promotes them without
         // the margin (a layer's peer share, not the step's, sets how late the peer is)
         constexpr float promote_load = 0.0f;
-        auto rank_swaps = [&](std::vector<Swap>& swaps) {
+        // the profile's rank of each pair: of equally routed experts the better-ranked one comes in and the worse-ranked
+        // one leaves first
+        std::vector<int32_t> prof_rank((size_t) (g.n_layers * g.n_expert), (int32_t) profile.size());
+        for (size_t i = 0; i < profile.size(); ++i) {
+            const int64_t pl = profile[i].first, pe = profile[i].second;
+            if (pl >= 0 && pl < g.n_layers && pe >= 0 && pe < g.n_expert && prof_rank[(size_t) (pl * g.n_expert + pe)] == (int32_t) profile.size())
+                prof_rank[(size_t) (pl * g.n_expert + pe)] = (int32_t) i;
+        }
+        auto rank_swaps = [&](std::vector<Swap>& swaps, bool across) {
             swaps.clear();
+            if (across) {
+                // one ranking over every layer: a layer that routes more experts than its slots hold takes the slots of
+                // the least-routed experts of any layer, so the slots follow the request's layers; with every layer's
+                // residents to choose from, a missing expert is a candidate at a lower count
+                struct Ent { float u; int32_t rank, layer, e; };
+                std::vector<Ent> cand, vict;
+                for (int64_t l = 0; l < g.n_layers; ++l) {
+                    const float* u = drive.d.usage.data() + l * g.n_expert;
+                    const int32_t* r = host_res.data() + l * g.n_expert;
+                    for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                        const int32_t rk = prof_rank[(size_t) (l * g.n_expert + e)];
+                        if (r[e] >= 0) vict.push_back({u[e], rk, (int32_t) l, e});
+                        else if (u[e] >= 1.5f) cand.push_back({u[e], rk, (int32_t) l, e});
+                    }
+                }
+                if (cand.empty() || vict.empty()) return;
+                auto key = [](const Ent& x) { return std::make_tuple(x.rank, x.layer, x.e); };
+                std::sort(cand.begin(), cand.end(), [&](const Ent& a, const Ent& b) {
+                    return a.u != b.u ? a.u > b.u : key(a) < key(b);
+                });
+                const size_t nc = std::min(cand.size(), vict.size());
+                std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(), [&](const Ent& a, const Ent& b) {
+                    return a.u != b.u ? a.u < b.u : key(a) > key(b);
+                });
+                for (size_t i = 0; i < nc; ++i) {
+                    if (cand[i].u < vict[i].u + 1.5f) break;
+                    swaps.push_back({cand[i].u - vict[i].u, cand[i].layer, cand[i].e, vict[i].e, vict[i].layer});
+                }
+                std::stable_sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
+                return;
+            }
             std::vector<std::pair<float, int32_t>> cand, vict;
             for (int64_t l = 0; l < g.n_layers; ++l) {
                 cand.clear();
@@ -6150,7 +6191,7 @@ int main(int argc, char** argv) {
                                   [](auto& a, auto& b) { return a.first < b.first; });
                 for (size_t i = 0; i < nc; ++i) {
                     if (cand[i].first < vict[i].first + 1.5f) break;
-                    swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
+                    swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second, (int32_t) l});
                 }
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
@@ -6162,7 +6203,7 @@ int main(int argc, char** argv) {
             size_t n_ranked = 0, n_kept = 0, n_promoted = 0;
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             std::vector<Swap> swaps;
-            rank_swaps(swaps);
+            rank_swaps(swaps, false);
             n_ranked = swaps.size();
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
             std::vector<int> staged_on;   // the devices whose adapt streams hold copies back (-1: CUDA0)
@@ -6247,8 +6288,13 @@ int main(int argc, char** argv) {
         // (--adapt-decay when given, else 0.85): the routing counts stay large enough for the thresholds and the peer
         // margin.
         const float fast_decay = o.adapt_decay_set ? o.adapt_decay : 0.85f;
-        struct XSwap { int32_t layer, in, out, slot; uint64_t off; bool xchg, promo, p2p; };
+        struct XSwap { int32_t layer, in, out, lout, slot; uint64_t off; bool xchg, promo, p2p; };
         const bool peer_excl = o.peer_exclusive && peer.valid() && src.complement_ready();
+        // the rounds rank over all layers when no peer tier holds experts and every layer's blobs are one size (a slot
+        // then takes any layer's expert)
+        bool xq_across = !peer.valid() && xpeers.empty();
+        for (int64_t l = 1; xq_across && l < g.n_layers; ++l)
+            xq_across = basalt::kernels::cpu::expert_layout().blob_bytes(l) == basalt::kernels::cpu::expert_layout().blob_bytes(0);
         std::vector<XSwap> xq;
         int xq_stage = 0;   // 0 idle, 1 evictions copying to RAM, 2 incoming experts copying to their slots
         bool xq_saturated = false;   // the last round had at least kSatRatio times --adapt-swaps misses to swap
@@ -6284,7 +6330,7 @@ int main(int argc, char** argv) {
             const auto at0 = Clock::now();
             const int64_t peer_sw0 = peer.valid() ? peer.swaps() : 0;
             std::vector<Swap> swaps;
-            rank_swaps(swaps);
+            rank_swaps(swaps, xq_across);
             const size_t n_ranked = swaps.size();
             // the base share goes first, then the peer takes its own from the rest, then a saturated pipeline's extra
             // swaps take what the peer left: a large round never takes the peer's candidates
@@ -6296,7 +6342,7 @@ int main(int argc, char** argv) {
             size_t n_noplace = 0;
             const auto& lay = basalt::kernels::cpu::expert_layout();
             std::set<size_t> taken;   // the round's victims
-            for (const Swap& s : swaps) taken.insert((size_t) s.layer * g.n_expert + s.out);
+            for (const Swap& s : swaps) taken.insert((size_t) s.lout * g.n_expert + s.out);
             auto plan = [&](Swap s) -> bool {
                 // an expert only the peer holds is copied from its VRAM; it needs a RAM place for the one it replaces
                 const bool p2p = peer_excl && peer.has(s.layer, s.in) && !src.has_resident(s.layer, s.in);
@@ -6314,23 +6360,23 @@ int main(int argc, char** argv) {
                     taken.insert((size_t) s.layer * g.n_expert + best);
                     s.out = best;
                 }
-                const int32_t slot = host_res[(size_t) s.layer * g.n_expert + s.out];
+                const int32_t slot = host_res[(size_t) s.lout * g.n_expert + s.out];
                 if (slot < 0) return true;
                 const bool xchg = src.complement_ready() && (p2p || src.has_resident(s.layer, s.in)) &&
-                                  !src.has_resident(s.layer, s.out);
+                                  !src.has_resident(s.lout, s.out);
                 uint64_t off = 0;
                 if (xchg) {
-                    uint8_t* dst = src.spare_take(s.layer, off);
+                    uint8_t* dst = src.spare_take(s.lout, off);
                     if (dst == nullptr) { ++n_noplace; return true; }   // no free place: a later round
-                    if (cudaMemcpyAsync(dst, xcache.device_slot(slot), (size_t) lay.blob_bytes(s.layer),
+                    if (cudaMemcpyAsync(dst, xcache.device_slot(slot), (size_t) lay.blob_bytes(s.lout),
                                         cudaMemcpyDeviceToHost, adapt_stream) != cudaSuccess) {
                         basalt::log::error("basalt serve", "an eviction copy failed (layer %d, slot %d): %s",
-                                     (int) s.layer, (int) slot, cudaGetErrorString(cudaGetLastError()));
+                                     (int) s.lout, (int) slot, cudaGetErrorString(cudaGetLastError()));
                         return false;
                     }
                 }
                 if (p2p) peer.hold(s.layer, s.in);
-                xq.push_back({s.layer, s.in, s.out, slot, off, xchg,
+                xq.push_back({s.layer, s.in, s.out, s.lout, slot, off, xchg,
                               peer.valid() && peer.has(s.layer, s.in), p2p});
                 return true;
             };
@@ -6376,12 +6422,12 @@ int main(int argc, char** argv) {
             if (!nowait) cudaEventSynchronize(adapt_ev);
             if (xq_stage == 1) {
                 for (const XSwap& x : xq) {
-                    if (x.xchg && !src.spare_land(x.layer, x.out, x.off)) {
+                    if (x.xchg && !src.spare_land(x.lout, x.out, x.off)) {
                         basalt::log::error("basalt serve", "an evicted expert has no RAM place (layer %d, expert %d)",
-                                     (int) x.layer, (int) x.out);
+                                     (int) x.lout, (int) x.out);
                         return false;
                     }
-                    host_res[(size_t) x.layer * g.n_expert + x.out] = basalt::core::kNotResident;
+                    host_res[(size_t) x.lout * g.n_expert + x.out] = basalt::core::kNotResident;
                 }
                 {   // the residency uploads go ahead of the incoming copies in the copy queue
                     std::string perr;
