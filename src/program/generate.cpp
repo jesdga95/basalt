@@ -4861,14 +4861,29 @@ int main(int argc, char** argv) {
     };
     // a part [a0, b0) of a prompt ending at `prompt_end` over up to `max_stages` stages, each stage with its weights'
     // layers [lo, hi) and image bytes: both prices, and the split's chunk and head chunk
-    struct SplitPricing { basalt::program::PsPrice price; int64_t chunk = 0, head = 0; };
+    struct SplitPricing { basalt::program::PsPrice price; int64_t chunk = 0, head = 0; std::string why; };
     auto split_price = [&](int64_t a0, int64_t b0, int64_t prompt_end, int max_stages) -> SplitPricing {
         SplitPricing sp0;
         const int64_t n_tok = b0 - a0;
         // two chunks or more, the draft layer's window within the last two the main card hands on (their final rows
         // come back for it in the hand-off buffers)
         const auto [chunk, head] = one_card_chunks(n_tok, read_cap(), true);
-        if (chunk < 4096 || n_tok <= std::max(chunk, head) || 2 * chunk < draft_window) return sp0;
+        if (n_tok <= std::max(chunk, head)) return sp0;   // one chunk: read on the main card, no reason to give
+        char why[160];
+        if (chunk < 4096) {
+            std::snprintf(why, sizeof why, "chunks of %lld tokens, below the 4096 minimum", (long long) chunk);
+            sp0.why = why;
+            return sp0;
+        }
+        if (2 * chunk < draft_window) {
+            if (draft_window >= INT64_MAX / 4)
+                std::snprintf(why, sizeof why, "the draft layer attends to every cell");
+            else
+                std::snprintf(why, sizeof why, "chunks of %lld tokens: two do not cover the draft layer's %lld-cell window",
+                              (long long) chunk, (long long) draft_window);
+            sp0.why = why;
+            return sp0;
+        }
         sp0.chunk = chunk;
         sp0.head = head;
         basalt::program::PsPart part;
@@ -8976,9 +8991,29 @@ int main(int argc, char** argv) {
             struct SplitPlan { int64_t chunk = 0, head = 0; int stages = 0; std::vector<int> cuts; };
             auto split_plan = [&](int64_t a0, int64_t b0) -> SplitPlan {
                 SplitPlan plan;
-                if (!split_ready || batch_on() || !req_imgs.empty()) return plan;
+                if (!split_ready) return plan;   // (the start line said why)
+                // every part longer than a chunk that is not read across says why, with its numbers
+                auto decline = [&](const std::string& why) {
+                    basalt::log::info("basalt serve", "prompt split: %lld tokens read on CUDA0 (%s)", (long long) (b0 - a0),
+                                      why.c_str());
+                };
+                const char* skip = batch_on() ? "slots are decoding" : !req_imgs.empty() ? "the prompt has images" : nullptr;
+                if (skip != nullptr) {
+                    if (b0 - a0 > read_cap()) decline(skip);
+                    return plan;
+                }
                 const SplitPricing pr = split_price(a0, b0, n - 1, split_stages);
-                if (pr.chunk <= 0 || pr.chunk > split_chunk_max || pr.price.stages < 2) return plan;
+                if (!pr.why.empty()) decline(pr.why);
+                if (pr.chunk <= 0) return plan;
+                if (pr.chunk > split_chunk_max) {
+                    decline("chunks of " + std::to_string(pr.chunk) + " tokens, above the stages' " +
+                            std::to_string(split_chunk_max));
+                    return plan;
+                }
+                if (pr.price.stages < 2) {
+                    decline("no stage set fits the cards' layer windows");
+                    return plan;
+                }
                 basalt::log::info("basalt serve", "prompt split: %lld tokens priced %.0f ms on CUDA0, %.0f ms with %s%s; read %s",
                                   (long long) (b0 - a0), pr.price.tier_ms, pr.price.split_ms,
                                   split_layers_text(pr.price.stages, pr.price.cuts).c_str(),
