@@ -80,7 +80,10 @@ begin with `prompt split:` and print the prices. The chunks are the main card's 
 32,768 tokens) stays on the main card. On three or more cards it runs when they all match (memory bandwidth and VRAM
 within 10%); on three or more unlike cards it is off until measured on such a set, and the start line prints what it
 would cost. Off with `--peer-exclusive`, without the RAM copy of the experts, with KV streaming, a
-control vector, experts other than NVFP4 (the price is fitted to those), or when RAM or a tier's slots are short. A
+control vector, experts other than NVFP4 (the price is fitted to those), when RAM or a tier's slots are short, or when a
+tier card keeps under 256 MiB free beside its stage (a read loads its kernels there; `peer-reserve-mib` sets the room).
+Everything that grows with the prompt sits in the lent slots, so a longer prompt that does not fit them is read on the
+main card. A
 prompt that arrives while other slots decode is read on the main card beside them, as before. A much shorter request
 that arrives during a read across the cards gets its turn at the end of the main card's current chunk: the main card
 reads that chunk's later layers itself and the rest of the prompt is read later, as with a main-card read.

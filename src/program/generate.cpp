@@ -5417,10 +5417,17 @@ int main(int argc, char** argv) {
             // a stage that may hand its chunks on (every card but the one that reads the last layers) holds two pinned
             // buffers of the stage's chunk, as the main card does
             ok = ok && (j == 0 || st.sp.reserve_hand_off(split_chunk_max, err));
+            // a read's kernels and small buffers load on the card outside the lent slots: a card without room for them
+            // beside its stage declines here, before a read could fail on them
+            constexpr size_t kStageFreeMin = 256ull << 20;
+            size_t fb = 0, tb = 0;
+            if (ok && cudaMemGetInfo(&fb, &tb) == cudaSuccess && fb < kStageFreeMin) {
+                ok = false;
+                err = std::to_string(fb >> 20) + " MiB free beside its stage, a read needs " +
+                      std::to_string(kStageFreeMin >> 20) + "; --peer-reserve-mib";
+            }
             if (ok) {
                 st.sp.set_ring_remote(host_res.data(), &xcache, 0);
-                size_t fb = 0, tb = 0;
-                cudaMemGetInfo(&fb, &tb);
                 basalt::log::info("basalt serve", "prompt split: CUDA%d can take layers %lld-%lld of a long prompt (chunks up "
                                      "to %lld tokens, links %.1f/%.1f GB/s); %zu MiB free on it (%zu before)", st.dev,
                                   (long long) st.lo, (long long) st.hi - 1, (long long) split_chunk_max,
