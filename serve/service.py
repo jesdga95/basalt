@@ -40,6 +40,7 @@ QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep
 KEEPALIVE_S = 10.0          # a stream quiet this long (a held-back tool argument) gets a keep-alive
 # live tok/s is a windowed rate: a mean since the first token spikes at the start of an answer
 RATE_WINDOW_S = 2.0
+RATE_SAMPLES = 1024         # (time, generated) samples kept per request: the window at up to ~500 tok/s, one per token
 LOG_FIRST_LINES = 300        # lines /api/logs returns to a client with none
 LOG_MAX_LINES = 500          # ... and its maximum per answer
 REQUESTS_SHOWN = 12        # finished requests /metrics lists
@@ -81,7 +82,7 @@ class Service:
         self.allowed_hosts: list[str] = []
         self.host_names: set[str] = set(LOOPBACK_NAMES)
         self.status = {"busy": False, "queued": 0}      # what the model is doing now
-        self.rate = collections.deque(maxlen=32)        # (time, generated) samples
+        self.rate = collections.deque(maxlen=RATE_SAMPLES)   # (time, generated) samples
         # parallel mode: each running request's own status and rate window; self.status shows the newest
         self.live_reqs: dict[int, tuple[dict, collections.deque]] = {}
         self.request_ctx = threading.local()            # .path, .model: the API path and model name of this request
@@ -660,7 +661,7 @@ class Service:
         # parallel requests keep their own status and rate window; otherwise self.status / self.rate
         par = bool(getattr(self.engine, "batch", 0))
         st = {} if par else self.status
-        rate = collections.deque(maxlen=32) if par else self.rate
+        rate = collections.deque(maxlen=RATE_SAMPLES) if par else self.rate
         with self.status_lock:
             self.status["queued"] += 1
         try:

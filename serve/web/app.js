@@ -36,6 +36,21 @@ const CHARTS = [
   { id: "decode", name: "Decode", steps: [50, 100, 200, 250, 300, 400, 500, 600, 700, 800, 1000, 1200, 1500, 2000], hover: null, v: Array(HIST).fill(0), max: 400 },
   { id: "prefill", name: "Prefill", steps: [2000, 4000, 8000, 16000, 32000], hover: null, v: Array(HIST).fill(0), max: 8000 }];
 const axis = n => n >= 1000 ? `${n / 1000}k` : String(n);
+// the highest decode and prefill reading this tab has seen (kept across reloads, cleared on a server restart or a click)
+let peaks = (() => { try { return JSON.parse(sessionStorage.getItem("basalt.peaks")) || {}; } catch (e) { return {}; } })();
+const savePeaks = () => { try { sessionStorage.setItem("basalt.peaks", JSON.stringify(peaks)); } catch (e) { /* private mode */ } };
+function peak(id, ...vs) {
+  const v = Math.max(0, ...vs.filter(num));
+  if (v > 0 && !(peaks[id] && peaks[id].v >= v)) { peaks[id] = { v, t: Date.now() }; savePeaks(); }
+}
+function drawPeak(id, d) {
+  const p = peaks[id], el = $("#pk-" + id);
+  el.hidden = !p;
+  if (!p) return;
+  text2(el.querySelector("i"), `${fmt(p.v, d)} tok/s`);
+  el.title = `Highest reading this session (this tab, until the server restarts), at ${clock(p.t).slice(0, 8)}. Click to reset.`;
+}
+["decode", "prefill"].forEach(id => $("#pk-" + id).onclick = () => { delete peaks[id]; savePeaks(); draw(); });
 const tail = a => { const v = (a || []).slice(-HIST).map(x => num(x) ? x : 0); while (v.length < HIST) v.unshift(0); return v; };
 
 function drawChart(c, now, last, lastNote) {
@@ -123,6 +138,11 @@ function draw() {
   drawChart(CHARTS[0], generating ? live.tok_s : null, last);
   const lastRead = r0 ? (r0.prompt_tokens || 0) - (r0.reused || 0) : 0;   // short prompts are dominated by fixed cost, so show the size
   drawChart(CHARTS[1], live.state === "reading" ? live.prefill_tok_s_mean : null, lastPrefill, lastPrefill != null ? `${fmt(lastRead)} tokens` : "");
+  // the per-second history, the live reading and the last request's mean (a short prompt read can fall between
+  // samples), the last only for a request big enough to measure: a few tokens in a few ms would read as a spike
+  peak("decode", ...CHARTS[0].v, generating ? live.tok_s : null, r0 && r0.output_tokens >= 64 ? last : null);
+  peak("prefill", ...CHARTS[1].v, live.state === "reading" ? live.prefill_tok_s_mean : null, lastRead >= 512 ? lastPrefill : null);
+  drawPeak("decode", 1); drawPeak("prefill", 0);
 
   text("#s-load", num(g0.util) ? `${Math.round(g0.util)}%` : "—");
   text("#s-vram", num(g0.mem_used) ? `${gib(g0.mem_used)} / ${gib(g0.mem_total)} GiB` : "—");
@@ -363,7 +383,7 @@ async function pollMetrics() {
 async function pollLog() {
   try {
     const r = await get(`api/logs?after=${lastLog}`);
-    if (r.last < lastLog) { logs.length = 0; lastLog = 0; rebuild(); }       // the server restarted
+    if (r.last < lastLog) { logs.length = 0; lastLog = 0; peaks = {}; savePeaks(); rebuild(); }       // the server restarted
     else if (r.lines.length) { lastLog = r.last; append(r.lines); }
     else if (!logs.length && !logEl.firstChild) rebuild();
   } catch (e) { /* the metrics poll reports the connection */ }
