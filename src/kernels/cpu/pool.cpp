@@ -125,10 +125,8 @@ void ExpertPool::publish() {
 
 void ExpertPool::worker(int id) {
     uint32_t seen = 0;
-    // ARRIVE at the park before the first wait, so `parked_ == n_` is true from construction.  Counting only
-    // on the RETURN from a drain leaves `parked_` at 0 until each worker has finished one batch, and the first
-    // `run()` - which waits for `parked_ == n_` before publishing - then deadlocks.  It deadlocks on the very
-    // first call, which is the good case; a version that deadlocked on the second would be far worse.
+    // ARRIVE at the park before the first wait, so `parked_ == n_` is true from construction: a
+    // `set_active_workers` before the first batch waits for `parked_ == n_` and would otherwise never return.
     parked_.fetch_add(1, std::memory_order_acq_rel);
     for (;;) {
         // Park: wait for work.  `_mm_pause` rather than a bare spin because it yields the pipeline to the sibling
@@ -367,7 +365,6 @@ int ExpertPool::set_active_workers(int k) {
 void ExpertPool::idle_start(IdleFn fn, void* ctx) {
     if (n_ == 1 || fn == nullptr) return;
     idle_stop();
-    wait_parked("before idle work");
     idle_fn_ = fn;
     idle_ctx_ = ctx;
     idle_halt_.store(false, std::memory_order_relaxed);
@@ -381,7 +378,7 @@ void ExpertPool::idle_start(IdleFn fn, void* ctx) {
 void ExpertPool::idle_stop() {
     if (!idle_live_) return;
     idle_halt_.store(true, std::memory_order_release);
-    // no job of the idle batch can be claimed from here on (a late sleeper's claim fails), and the claimed ones end
+    // no job of the idle batch can be claimed from here on (a late worker's claim fails), and the claimed ones end
     // before the next batch resets `done`
     uint64_t h = head_.load(std::memory_order_acquire);
     uint32_t claimed = 0;
@@ -393,20 +390,17 @@ void ExpertPool::idle_stop() {
             break;
     }
     wait_done((int) claimed);
-    wait_parked("after idle work");
     idle_live_ = false;
     mode_ = 0;
 }
 
 void ExpertPool::run_phase(int mode, int n_tasks) {
     idle_stop();
-    wait_parked("before a phase");
     mode_ = mode;
     njobs_ = n_tasks;
     const uint32_t e = begin_batch(n_tasks);
     drain(-1, host_scratch_, e);
     wait_done(n_tasks);
-    wait_parked("after a phase");
     hstate_.store(kIdle, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
 }
@@ -414,7 +408,6 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
 void ExpertPool::run_split(ExpertJob* jobs, int n) {
     if (n <= 0) return;
     if (n > kMaxSplit || n_ == 1) { run(jobs, n); return; }
-    const auto t0 = std::chrono::steady_clock::now();
     jobs_ = jobs;
     const int threads = active_.load(std::memory_order_relaxed) + 1;
     // about three tasks per thread in each phase, so the tail is short
@@ -424,7 +417,6 @@ void ExpertPool::run_split(ExpertJob* jobs, int n) {
     for (int e = 0; e < n; ++e) act_quant_q8_1(split_[(size_t) e].ff, FF, split_[(size_t) e].a2);
     run_phase(2, n * parts_b_);
     mode_ = 0;
-    ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
 void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
@@ -463,12 +455,10 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     ms_multi_down += std::chrono::duration<double, std::milli>(t3 - t2).count();
     multi_bytes += (int64_t) n * (int64_t) BLOB;
     mode_ = 0;
-    ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
-    const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
@@ -495,7 +485,6 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
     }
     multi_bytes += (int64_t) n * (int64_t) f.bytes;
     mode_ = 0;
-    ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
 void ExpertPool::run(ExpertJob* jobs, int n) {
@@ -504,15 +493,7 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
         for (int i = 0; i < n; ++i) s2_expert_vnni_q(jobs[i].blob, *jobs[i].act, jobs[i].out, scratch_[0]);
         return;
     }
-    // Wait for every worker to be parked BEFORE touching the batch, so the publish below is the only thing
-    // that can move a worker into the drain loop.
-    //
-    // THE THREE PHASES ARE TIMED SEPARATELY.  They were one number, which cannot distinguish a pool that is
-    // slow at the WORK from one that is slow at the SYNCHRONISATION - and those need opposite fixes.
     idle_stop();
-    const auto t_a = std::chrono::steady_clock::now();
-    wait_parked("before a batch");
-    const auto t_b = std::chrono::steady_clock::now();
     jobs_ = jobs;
     njobs_ = n;
     mode_ = 0;
@@ -520,8 +501,7 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
 
     // ---- **THE HOST DRAINS TOO, INSTEAD OF SPINNING ON `done_`.**
     //
-    // The host is pinned to core 0 - the core `physical_cores(true)` deliberately keeps the workers off - so waiting
-    // on `done_` would leave that core idle for the whole drain.
+    // Waiting on `done_` would leave the host's core idle for the whole drain.
     //
     // The host claims through the SAME `head_` counter, so this is not a second scheduler and nothing about the
     // ordering changes: `head_` is a single `fetch_add`, every job is the same size, and a thread that arrives late
@@ -541,17 +521,8 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
     }
 
     wait_done(n);
-    // And park again, so the next `run` starts from a known state.  See the header for why `done` alone is
-    // not enough.
-    const auto t_c = std::chrono::steady_clock::now();
-    wait_parked("after a batch");
     hstate_.store(kIdle, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
-    const auto t_d = std::chrono::steady_clock::now();
-
-    ms_wait_park_ += std::chrono::duration<double, std::milli>(t_b - t_a).count();
-    ms_drain_ += std::chrono::duration<double, std::milli>(t_c - t_b).count();
-    ms_repark_ += std::chrono::duration<double, std::milli>(t_d - t_c).count();
 }
 
 }  // namespace basalt::kernels::cpu
