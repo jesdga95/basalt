@@ -4801,12 +4801,13 @@ int main(int argc, char** argv) {
         part.row_bytes = (uint64_t) (g.hc * g.n_embd) * sizeof(float);
         const int64_t c_last = b0 - part.split_chunks.back();
         part.draft_rows = draft_window > 0 ? std::max<int64_t>(0, c_last - std::max(a0, prompt_end - draft_window)) : 0;
-        part.setup_ms = peer_link_gbps > 0 ? (double) image / (0.85 * peer_link_gbps * 1e9) * 1000.0 + 10.0 : 0.0;
         const uint64_t region = image + basalt::core::prompt_session_bytes(g, b0 + 64, lb_min, g.n_layers) +
                                 basalt::prefill::Prefill::bytes_needed(g, ss, chunk);
         const basalt::program::PsCard main_side = split_main_side(chunk);
-        sp0.price = basalt::program::price_prompt_split(main_side, main_side, split_peer_side(region), part, (int) lb_min,
-                                                        (int) g.n_layers);
+        basalt::program::PsCard peer_side = split_peer_side(region);
+        peer_side.setup_ms = peer_link_gbps > 0 ? (double) image / (0.85 * peer_link_gbps * 1e9) * 1000.0 + 10.0 : 0.0;
+        peer_side.layer_lo = (int) lb_min;
+        sp0.price = basalt::program::price_prompt_split(main_side, main_side, {peer_side}, part, 2, (int) g.n_layers);
         return sp0;
     };
     // the deepest split a prompt could want: the best one for the longest prompt, a few layers deeper; none when even
@@ -4835,7 +4836,7 @@ int main(int argc, char** argv) {
             basalt::log::info("basalt generate", "prompt split: off (a %lld-token prompt: %.0f ms on CUDA0, %.0f ms across)",
                               (long long) longest, ref.price.tier_ms, ref.price.split_ms);
         } else {
-            split_lb = std::max<int64_t>(2, ref.price.lb - 3);
+            split_lb = std::max<int64_t>(2, ref.price.lb() - 3);
             // its layers' weights: the arena and the native projections
             uint64_t native = 0;
             split_skip = skip_base;
@@ -8762,15 +8763,15 @@ int main(int argc, char** argv) {
                 SplitPlan plan;
                 if (!pstage.ready || rsp != &ss || batch_on() || !req_imgs.empty()) return plan;
                 const SplitPricing pr = split_price(a0, b0, n - 1, pstage.lb_min, pstage.image_bytes);
-                if (pr.chunk <= 0 || pr.chunk > pstage.chunk_max || pr.price.lb <= 0) return plan;
+                if (pr.chunk <= 0 || pr.chunk > pstage.chunk_max || pr.price.lb() <= 0) return plan;
                 basalt::log::info("basalt serve", "prompt split: %lld tokens priced %.0f ms on CUDA0, %.0f ms with layers %d-%lld "
                                      "on CUDA%d; read %s", (long long) (b0 - a0), pr.price.tier_ms, pr.price.split_ms,
-                                  pr.price.lb, (long long) g.n_layers - 1, pstage.dev, pr.price.split ? "across" : "on CUDA0");
+                                  pr.price.lb(), (long long) g.n_layers - 1, pstage.dev, pr.price.split ? "across" : "on CUDA0");
                 if (!pr.price.split) return plan;
                 {
                     const basalt::core::OnDevice on(pstage.dev);
                     uint8_t *w_at = nullptr, *s_at = nullptr, *b_at = nullptr;
-                    if (!split_region(b0 + 64, pr.chunk, pr.price.lb, w_at, s_at, b_at)) {
+                    if (!split_region(b0 + 64, pr.chunk, pr.price.lb(), w_at, s_at, b_at)) {
                         basalt::log::info("basalt serve", "prompt split: %lld tokens do not fit CUDA%d's slots; read on CUDA0",
                                           (long long) (b0 - a0), pstage.dev);
                         return plan;
@@ -8778,7 +8779,7 @@ int main(int argc, char** argv) {
                 }
                 plan.chunk = pr.chunk;
                 plan.head = pr.head;
-                plan.lb = pr.price.lb;
+                plan.lb = pr.price.lb();
                 return plan;
             };
             // [a0, b0) across the two cards in chunks of `chunk` tokens: the main card reads layers [0, lb) of each chunk

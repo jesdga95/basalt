@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "basalt/program/gpu_select.hpp"
@@ -49,15 +50,18 @@ bool cards_alike(const GpuCard& a, const GpuCard& b);
 /// cards may pick another mechanism than the expert tier, and only when it is at least 5% cheaper.
 MgPlan plan_multi_gpu(const std::vector<GpuCard>& cards, const MgModel& model);
 
-// ---- the prompt-time layer split (expert tier mode).  A long part of a prompt is read as a pipeline: the main card
-// reads layers [0, lb) of each chunk and hands it on, the tier card reads layers [lb, layers) of it meanwhile, and the
-// main card reads the last chunk whole once the tier card's state is back.  Priced per part against the main card alone.
+// ---- the prompt-time layer split (expert tier mode).  A long part of a prompt is read as a pipeline of stages: the
+// main card reads layers [0, b1) of each chunk and hands it on, the first tier card layers [b1, b2) of it meanwhile, and
+// so on to the last layer; the main card reads the last chunk whole once the tier cards' state is back.  Priced per part
+// against the main card alone, for every number of stages and every set of cuts.
 
 /// One card's side of a prompt read.
 struct PsCard {
     double mem_gbps = 0;                ///< memory bandwidth, the card's prompt compute rate; 0: unknown
     double link_gbps = 0;               ///< host->device bandwidth (probed)
     std::vector<double> stream_bytes;   ///< per layer: the expert bytes each chunk streams to it (its experts not in VRAM)
+    double setup_ms = 0;                ///< a tier card: its stage made ready before the first chunk
+    int layer_lo = 0, layer_hi = 0;     ///< a tier card: the layers its stage's weights hold, [layer_lo, layer_hi); 0: any
 };
 
 /// A part of a prompt and how each way reads it.
@@ -67,19 +71,35 @@ struct PsPart {
     std::vector<int64_t> split_chunks;  ///< the split
     uint64_t row_bytes = 0;             ///< one token's hand-off rows
     int64_t draft_rows = 0;             ///< rows of the split's chunks before the last that the draft layer reads back
-    double setup_ms = 0;                ///< the tier card's stage made ready before the first chunk
 };
+
+/// The most stages a split is priced with, the main card's included.
+constexpr int kPsMaxStages = 8;
 
 struct PsPrice {
     double tier_ms = 0;                 ///< the main card alone
-    double split_ms = 0;                ///< the split at `lb`, the best first layer for the tier card
-    int lb = 0;                         ///< 0: no split point fits
+    double split_ms = 0;                ///< the cheapest split
+    int stages = 0;                     ///< its stages, the main card's included; 0: no split fits
+    std::vector<int> cuts;              ///< its cuts: stage k (1 .. stages - 1) reads [cuts[k - 1], cuts[k] or the last layer]
+    std::vector<double> stage_ms;       ///< [s]: the cheapest split over s stages, 0 where none fits
+    std::vector<std::vector<int>> stage_cuts;   ///< [s]: its cuts
     bool split = false;                 ///< the split is enough cheaper to read the part with
+    int lb() const { return cuts.empty() ? 0 : cuts[0]; }   ///< the main card's last layer + 1
 };
 
-/// The prices of `part`: `main_tier` and `main_split` are the main card with each way's loan of its slots, `peer` the
-/// tier card with the split's; the tier card's first layer is searched in [lb_min, layers).
-PsPrice price_prompt_split(const PsCard& main_tier, const PsCard& main_split, const PsCard& peer, const PsPart& part,
-                           int lb_min, int layers);
+/// The prices of `part`: `main_tier` and `main_split` are the main card with each way's loan of its slots, `peers` the
+/// tier cards with the split's, in the order they join: a split over s stages runs stage k (1 .. s - 1) on peers[s - 1 - k],
+/// so peers[0] always reads the last layers.  Every stage count up to `max_stages` and every cut each card's layers allow
+/// is priced; the cheapest wins, fewer stages on a tie.
+PsPrice price_prompt_split(const PsCard& main_tier, const PsCard& main_split, const std::vector<PsCard>& peers,
+                           const PsPart& part, int max_stages, int layers);
+
+/// The order tier cards join a split (peers[0] first): the higher memory bandwidth first, the given order between equals.
+std::vector<size_t> prompt_split_order(const std::vector<double>& mem_gbps);
+
+/// The layers each of `n_peers` cards' stage weights must hold for every stage count `ref` priced at least 5% below the
+/// main card alone, widened by `margin` layers on each side (a card's last stage ends at the last layer): [lo, hi) per
+/// card in join order, {0, 0} for a card none of them uses.
+std::vector<std::pair<int, int>> prompt_split_windows(const PsPrice& ref, size_t n_peers, int margin, int layers);
 
 }  // namespace basalt::program
