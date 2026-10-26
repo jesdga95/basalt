@@ -36,6 +36,36 @@ const CHARTS = [
   { id: "decode", name: "Decode", steps: [50, 100, 200, 250, 300, 400, 500, 600, 700, 800, 1000, 1200, 1500, 2000], hover: null, v: Array(HIST).fill(0), max: 400 },
   { id: "prefill", name: "Prefill", steps: [2000, 4000, 8000, 16000, 32000], hover: null, v: Array(HIST).fill(0), max: 8000 }];
 const axis = n => n >= 1000 ? `${n / 1000}k` : String(n);
+// the fastest whole request this tab has seen (kept across reloads, cleared on a server restart or a click): a
+// request's own mean, not a burst, and only one big enough that fixed costs do not decide it
+const BEST_MIN_OUT = 256, BEST_MIN_READ = 4096;
+const ktok = n => n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}K` : String(n);
+let best = (() => { try { return JSON.parse(sessionStorage.getItem("basalt.best")) || {}; } catch (e) { return {}; } })();
+const saveBest = () => { try { sessionStorage.setItem("basalt.best", JSON.stringify(best)); } catch (e) { /* private mode */ } };
+function noteBest(reqs) {
+  const keep = (id, v, r, extra) => {
+    if (num(v) && v > 0 && !(best[id] && best[id].v >= v)) { best[id] = { v, t: r.time * 1000, id: r.id, ...extra }; saveBest(); }
+  };
+  for (const r of reqs) {
+    if (r.output_tokens >= BEST_MIN_OUT)
+      keep("decode", r.decode_tok_s, r, { out: r.output_tokens, ctx: (r.prompt_tokens || 0) + r.output_tokens,
+        acc: r.drafts_offered > 0 ? r.drafts_accepted / r.drafts_offered : null });
+    const read = (r.prompt_tokens || 0) - (r.reused || 0);
+    if (read >= BEST_MIN_READ && r.prompt_ms > 0) keep("prefill", read / (r.prompt_ms / 1000), r, { read });
+  }
+}
+function drawBest(id) {
+  const b = best[id], el = $("#pk-" + id);
+  el.hidden = !b;
+  if (!b) return;
+  text2(el.querySelector("i"), id === "decode"
+    ? `${fmt(b.v, 1)} tok/s · ${fmt(b.out)} tok${num(b.acc) ? ` · ${Math.round(b.acc * 100)}% accept` : ""} · ${ktok(b.ctx)} ctx`
+    : `${fmt(b.v)} tok/s · ${ktok(b.read)} read`);
+  el.title = `Fastest whole request this session (${b.id}, ${clock(b.t).slice(0, 8)}): `
+    + (id === "decode" ? `at least ${BEST_MIN_OUT} output tokens` : `at least ${fmt(BEST_MIN_READ)} newly read prompt tokens`)
+    + ". Kept in this tab until the server restarts. Click to reset.";
+}
+["decode", "prefill"].forEach(id => $("#pk-" + id).onclick = () => { delete best[id]; saveBest(); draw(); });
 const tail = a => { const v = (a || []).slice(-HIST).map(x => num(x) ? x : 0); while (v.length < HIST) v.unshift(0); return v; };
 
 function drawChart(c, now, last, lastNote) {
@@ -123,6 +153,7 @@ function draw() {
   drawChart(CHARTS[0], generating ? live.tok_s : null, last);
   const lastRead = r0 ? (r0.prompt_tokens || 0) - (r0.reused || 0) : 0;   // short prompts are dominated by fixed cost, so show the size
   drawChart(CHARTS[1], live.state === "reading" ? live.prefill_tok_s_mean : null, lastPrefill, lastPrefill != null ? `${fmt(lastRead)} tokens` : "");
+  noteBest(reqs); drawBest("decode"); drawBest("prefill");
 
   text("#s-load", num(g0.util) ? `${Math.round(g0.util)}%` : "—");
   text("#s-vram", num(g0.mem_used) ? `${gib(g0.mem_used)} / ${gib(g0.mem_total)} GiB` : "—");
@@ -363,7 +394,7 @@ async function pollMetrics() {
 async function pollLog() {
   try {
     const r = await get(`api/logs?after=${lastLog}`);
-    if (r.last < lastLog) { logs.length = 0; lastLog = 0; rebuild(); }       // the server restarted
+    if (r.last < lastLog) { logs.length = 0; lastLog = 0; best = {}; saveBest(); rebuild(); }       // the server restarted
     else if (r.lines.length) { lastLog = r.last; append(r.lines); }
     else if (!logs.length && !logEl.firstChild) rebuild();
   } catch (e) { /* the metrics poll reports the connection */ }

@@ -1,4 +1,5 @@
 """GET /metrics and GET /api/logs - what the stats page reads - and the telemetry behind /metrics' hardware."""
+import collections
 import ctypes
 import json
 import os
@@ -17,7 +18,7 @@ from serve.util.logbuf import LogBuffer
 from serve.engine.mock import MockEngine
 from serve.engine.process import ProcessEngine
 from serve.handler import serve
-from serve.service import REQUESTS_SHOWN, Service
+from serve.service import RATE_SAMPLES, REQUESTS_SHOWN, Service
 from serve.util.text import ByteTokenizer
 from serve.engine.vision import gpus_in_play
 from serve.util.telemetry import GPU_KEYS, Telemetry
@@ -279,6 +280,24 @@ class GpusInPlay(unittest.TestCase):
         self.assertEqual(gpus_in_play({}), [0])
         self.assertEqual(gpus_in_play({"gpu": 2}), [2])
         self.assertEqual(gpus_in_play({"gpu": "auto"}), [0])
+
+
+
+class LiveRate(unittest.TestCase):
+    """The live tok/s is the rate over the last RATE_WINDOW_S, also at the speeds MTP reaches."""
+
+    def test_window_at_high_speed(self):
+        # 8 s at 300 tok/s, then 2 s at 150: the window reads ~150, not the 270 mean since the first token
+        now = time.time()
+        rate, n = collections.deque(maxlen=RATE_SAMPLES), 0
+        for i in range(2400):
+            n += 1
+            rate.append((now - 10 + i / 300, n))
+        for i in range(300):
+            n += 1
+            rate.append((now - 2 + (i + 1) / 150, n))
+        s = {"busy": True, "first_token": now - 10, "generated": n}
+        self.assertAlmostEqual(Service._rate_of(s, list(rate)), 150, delta=10)
 
 
 if __name__ == "__main__":
