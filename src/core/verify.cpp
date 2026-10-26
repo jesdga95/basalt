@@ -40,6 +40,7 @@
 #include "basalt/kernels/qsa_dec_fused.hpp"
 #include "basalt/kernels/q5k_head.hpp"
 #include "basalt/kernels/q6k_head.hpp"
+#include "basalt/kernels/q80_head.hpp"
 #include "basalt/kernels/qsa_select.hpp"
 #include "basalt/kernels/quantize_act.hpp"
 #include "basalt/kernels/rope.hpp"
@@ -3120,6 +3121,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         q5k_head_mmvq(w, x, y, (int) N, n, T, s);
                     else if (head_->type() == 14 && q6k_head_supported((int) N, T))
                         q6k_head_mmvq(w, x, y, (int) N, n, T, s);
+                    else if (head_->type() == 8 && T >= 4 && q80_head_supported((int) N, T))
+                        q80_head_mmvq(w, x, y, (int) N, n, T, s);
                     else
                         native_mmvq(head_->type(), w, x, y, (int) N, n, T, s);
                 };
@@ -3150,6 +3153,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                               vhead_scratch_, cs);
                 else if (head_->type() == 14 && q6k_head_supported((int) N, T))
                     q6k_head_mmvq(head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
+                else if (head_->type() == 8 && T >= 4 && q80_head_supported((int) N, T))   // four columns or more: the same bits as one wave
+                    q80_head_mmvq(head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
                 else
                     native_mmvq(head_->type(), head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
             } catch (const std::exception& e) {
