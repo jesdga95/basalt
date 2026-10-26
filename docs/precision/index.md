@@ -183,7 +183,10 @@ rows, read back bit for bit. Parts the price keeps on the main card, parts of on
 prompt halves read as before. Long-context check over two cards, NVIDIA NVFP4 pack, int8 KV, spec 1, 400 W, the first 64
 greedy tokens of a main-card read teacher-forced into the split read, full-vocabulary KLD: 65,535-token prompt mean
 0.0008, median 0.0003, max 0.012, top-1 64 of 64; 122,879-token prompt mean 0.0005, median 0.0003, max 0.003, top-1 64
-of 64.
+of 64. With `--parallel` slots all idle the read is the same: the 64 greedy tokens after a 122,879-token prompt are
+identical with one slot and with four (same expert cache). A read that gives way to a shorter request ends with the main
+card reading its kept chunk's later layers, as a main-card read does; the rest of the prompt is read later from there in
+its own chunks, as after a main-card read gives way.
 
 **K-quant experts on MMQ.** `tests/cuda/prefill_mmq_kq_test.cpp` runs MMQ and the FP16 dequant + cuBLAS path it
 replaced on random zero-centred experts at the model's geometry against a double-precision reference. Relative RMS

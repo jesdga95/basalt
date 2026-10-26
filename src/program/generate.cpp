@@ -8990,6 +8990,37 @@ int main(int argc, char** argv) {
                     st->sp.should_stop = sp.should_stop;
                     if (!drive.d.usage.empty()) st->sp.route_hist_reset();   // its layers' routed entries, counted apart
                 }
+                // `BYIELD <slot>` (a shorter request waits): at the end of a chunk's first layers the main card keeps that
+                // chunk as the last one and reads its later layers once the stages' state is back; the slot then holds
+                // the part read up to that chunk's end.  `c_cut`: the kept chunk's first cell.
+                int64_t main_done = a0, yield_q = -1;
+                int yield_ys = -1;
+                std::atomic<int64_t> c_cut{c_last};
+                sp.keep_here = [&](int64_t done) -> bool {
+                    if (done >= c_last) return false;
+                    int ys = -1;
+                    {
+                        std::lock_guard<std::mutex> lk(in_mu);
+                        for (auto it = in_lines.begin(); it != in_lines.end();) {
+                            if (it->rfind("BYIELD ", 0) == 0) {
+                                ys = std::atoi(it->c_str() + 7);
+                                it = in_lines.erase(it);
+                            } else {
+                                ++it;
+                            }
+                        }
+                    }
+                    if (ys < 0) return false;
+                    if (can_yield(done, b0, ys)) {
+                        yield_q = done;
+                        yield_ys = ys;
+                        c_cut.store(main_done);
+                        return true;
+                    }
+                    basalt::log::info("basalt batch", "BYIELD %d not taken at %lld of %lld", ys, (long long) done,
+                                      (long long) n);
+                    return false;
+                };
                 for (size_t k = 0; k + 1 < run.size(); ++k) run[k]->sp.set_stage(run[k]->l0, run[k]->l1, &run[k + 1]->sp);
                 // the last stage, after each chunk: the rows the draft layer reads, back into the hand-off buffer the chunk
                 // came in (the card before writes it again two chunks later, and not at all for the last); after its last
@@ -9011,6 +9042,7 @@ int main(int argc, char** argv) {
                 int64_t ck_next = pp_next_check;
                 std::map<int64_t, ConvCheckpoint> ck_main;
                 sp.on_stage_chunk = [&](int64_t done, std::string& ce) -> bool {
+                    main_done = done;
                     if (!ck_on || done < ck_next) return true;
                     ck_next = done + o.prompt_cache_every;
                     ConvCheckpoint part;   // (its stream is synchronized)
@@ -9038,6 +9070,30 @@ int main(int argc, char** argv) {
                         return true;
                     };
                 }
+                // every stage done with its chunks before the kept one at `c_end`: their state to the main session, and
+                // the slots' experts back on a thread while the main card reads the kept chunk
+                auto state_back = [&](int64_t c_end, std::string& ce) -> bool {
+                    const auto tc = Clock::now();
+                    bool ok = true;
+                    for (PromptStage* st : run)
+                        ok = ok && basalt::core::session_copy_state(*rsp, st->ss, g, st->l0, st->l1, a0, c_end,
+                                                                    [&](void* d, const void* sr, uint64_t nb) {
+                                                                        return st->state_back.copy(d, sr, nb, ce);
+                                                                    }, ce);
+                    for (PromptStage* st : run) ok = ok && st->state_back.wait(ce);
+                    if (!ok) {
+                        if (ce.empty()) ce = "prompt split: a stage's state back to the main session";
+                        return false;
+                    }
+                    given = true;
+                    ms_copy = std::chrono::duration<double, std::milli>(Clock::now() - tc).count();
+                    refill_issue = std::async(std::launch::async, [&] {
+                        bool issued = true;
+                        for (PromptStage* st : run) issued = st->tier->give_back(st->lent, refill_err) && issued;
+                        return issued;
+                    });
+                    return true;
+                };
                 last.sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& ce) -> bool {
                     const int64_t HCN = g.hc * g.n_embd;
                     const int64_t r0 = std::max<int64_t>(0, first_cell - p0);
@@ -9068,27 +9124,8 @@ int main(int argc, char** argv) {
                         ce = "saving a conversation checkpoint failed" + (se.empty() ? ckpt_why : ": " + se);
                         return false;
                     }
-                    if (p0 + T >= c_last) {   // its last chunk: every stage is done with its own
-                        const auto tc = Clock::now();
-                        bool ok = true;
-                        for (PromptStage* st : run)
-                            ok = ok && basalt::core::session_copy_state(*rsp, st->ss, g, st->l0, st->l1, a0, c_last,
-                                                                        [&](void* d, const void* sr, uint64_t nb) {
-                                                                            return st->state_back.copy(d, sr, nb, ce);
-                                                                        }, ce);
-                        for (PromptStage* st : run) ok = ok && st->state_back.wait(ce);
-                        if (!ok) {
-                            if (ce.empty()) ce = "prompt split: a stage's state back to the main session";
-                            return false;
-                        }
-                        given = true;
-                        ms_copy = std::chrono::duration<double, std::milli>(Clock::now() - tc).count();
-                        refill_issue = std::async(std::launch::async, [&] {
-                            bool issued = true;
-                            for (PromptStage* st : run) issued = st->tier->give_back(st->lent, refill_err) && issued;
-                            return issued;
-                        });
-                    }
+                    // its last chunk before the kept one: every stage is done with its own
+                    if (p0 + T >= c_cut.load() && !state_back(p0 + T, ce)) return false;
                     const int64_t done = p0 + T;
                     pp_reached = done;
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
@@ -9100,6 +9137,11 @@ int main(int argc, char** argv) {
                     return true;
                 };
                 bool ok = sp.run(ids.data() + a0, n_tok, a0, e);   // (waits for every stage's chunks)
+                sp.keep_here = nullptr;
+                // the kept chunk [c_end, b_end): the last one, or the one a read that gives way ends with (the stages may
+                // have been done before the cut)
+                const int64_t c_end = c_cut.load(), b_end = yield_q >= 0 ? yield_q : b0;
+                if (ok && !given && yield_q >= 0) ok = state_back(c_end, e);
                 if (ok && !given) {
                     ok = false;
                     e = "prompt split: the stages' state did not come back";
@@ -9128,7 +9170,7 @@ int main(int argc, char** argv) {
                 sp.set_stage(lb, -1, nullptr);
                 if (ok) {
                     sp.continue_in_place();
-                    ok = sp.run(ids.data() + c_last, b0 - c_last, c_last, e);
+                    ok = sp.run(ids.data() + c_end, b_end - c_end, c_end, e);
                 }
                 sp.set_stage(0, -1, nullptr);
                 sp.set_peer_share(true);
@@ -9145,6 +9187,23 @@ int main(int argc, char** argv) {
                 split_hist_tokens = 0;
                 if (!drive.d.usage.empty())
                     for (PromptStage* st : run) st->sp.route_hist_take(split_hist, split_hist_tokens);
+                if (ok && yield_q >= 0) {   // (a run that ends early leaves the token window of the PLE hash where it began)
+                    if (yield_q >= 2) {
+                        rsp->ple_prev[0] = (int32_t) ids[(size_t) yield_q - 2];
+                        rsp->ple_prev[1] = (int32_t) ids[(size_t) yield_q - 1];
+                    }
+                    std::string ye;
+                    const auto ty = Clock::now();
+                    if (!park_read(yield_q, yield_ys, ye)) {
+                        e = "BYIELD: parking the prompt read failed: " + ye;
+                        return false;
+                    }
+                    basalt::log::info("basalt batch", "the prompt read gives way at %lld of %lld tokens; slot %d holds it "
+                                         "(copied in %.1f ms)", (long long) yield_q, (long long) n, yield_ys,
+                                      std::chrono::duration<double, std::milli>(Clock::now() - ty).count());
+                    e = "yield";
+                    return false;
+                }
                 if (!ok) return false;
                 const basalt::prefill::PrefillStats& sm1 = sp.stats();
                 std::string where, cards;
