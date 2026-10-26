@@ -1,4 +1,4 @@
-// src/kernels/ngram.cpp - the PLE n-gram hash and the IQ4_NL table read.
+// src/kernels/ngram.cpp - the PLE n-gram hash and the per-layer token table read.
 //
 // See include/basalt/kernels/ngram.hpp for the semantics, the rival readings, and the note on MADV_RANDOM.
 #include "basalt/kernels/ngram.hpp"
@@ -7,6 +7,7 @@
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/ngram/ple_reader.hpp"
+#include "basalt/ngram/ple_ram_quant.hpp"
 #include "basalt/platform/mapped_file.hpp"
 #include "basalt/platform/memory.hpp"
 
@@ -18,6 +19,7 @@
 #include <mutex>
 #include <vector>
 #include <stdexcept>
+#include <limits>
 #include "basalt/log.hpp"
 
 
@@ -103,10 +105,11 @@ void iq4nl_dequant_row(const uint8_t* row, float* out160) {
 }
 
 // ---------------------------------------------------------------------------------------------------
-enum class PleFormat { IQ4_NL, Q5_0, Q8_0 };
+enum class PleFormat { IQ4_NL, Q5_0, Q8_0, BF16 };
 
 struct PleTable::Impl {
     GgufFile* file = nullptr;
+    std::unique_ptr<basalt::ngram::LockedPleBuffer> owned;
     const uint8_t* data = nullptr;
     uint64_t n_rows = 0;
     PleFormat fmt = PleFormat::IQ4_NL;
@@ -132,6 +135,9 @@ struct PleTable::Impl {
     uint32_t rb = PLE_ROW_BYTES;      // bytes per row
     void decode(const uint8_t* row, float* out160) const {
         switch (fmt) {
+        case PleFormat::BF16:
+            basalt::dequantize_bf16(row, out160, PLE_HEAD_DIM);
+            break;
         case PleFormat::Q5_0:
             for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) basalt::dequantize_q5_0(row + (size_t) b * 22, out160 + b * 32);
             break;
@@ -140,6 +146,16 @@ struct PleTable::Impl {
             break;
         default: iq4nl_dequant_row(row, out160); break;
         }
+    }
+    bool read_resident(uint32_t row, float* out160, std::string& err) const {
+        if (data == nullptr || row >= n_rows) {
+            std::memset(out160, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
+            return true;
+        }
+        if (owned && !owned->ensure_row(row, err)) return false;
+        decode(data + (size_t) row * rb, out160);
+        bytes_read += rb;
+        return true;
     }
 };
 
@@ -152,6 +168,10 @@ bool PleTable::open(const std::string& gguf_path, std::string& err) {
 
 bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoOptions& io) {
     close();
+    if (io.quantize_q8_0 && (io.mode != PleIo::Mmap || !io.lock)) {
+        err = "PLE RAM quantization requires --ple-io ram (locked Mmap mode)";
+        return false;
+    }
     try {
         impl_->file = new GgufFile(gguf_path);
     } catch (const std::exception& e) {
@@ -170,60 +190,76 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    // IQ4_NL, Q5_0 or Q8_0 rows
-    if (std::strcmp(t->type_name(), "IQ4_NL") == 0) impl_->fmt = PleFormat::IQ4_NL;
-    else if (std::strcmp(t->type_name(), "Q5_0") == 0) impl_->fmt = PleFormat::Q5_0;
-    else if (std::strcmp(t->type_name(), "Q8_0") == 0) impl_->fmt = PleFormat::Q8_0;
+    // Validate the stored geometry before forming a tensor pointer or publishing a runtime format.
+    PleFormat fmt;
+    if (std::strcmp(t->type_name(), "IQ4_NL") == 0) fmt = PleFormat::IQ4_NL;
+    else if (std::strcmp(t->type_name(), "Q5_0") == 0) fmt = PleFormat::Q5_0;
+    else if (std::strcmp(t->type_name(), "Q8_0") == 0) fmt = PleFormat::Q8_0;
+    else if (t->type == 30) fmt = PleFormat::BF16;
     else {
-        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL, Q5_0 or Q8_0";
+        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not BF16, IQ4_NL, Q5_0 or Q8_0";
         close();
         return false;
     }
-    impl_->rb = impl_->fmt == PleFormat::Q8_0 ? PLE_ROW_BYTES_Q8_0
-              : impl_->fmt == PleFormat::Q5_0 ? PLE_ROW_BYTES_Q5_0 : PLE_ROW_BYTES;
-    // PleReader's row_bytes is a runtime parameter: every format's rows go through the same generic path
-    // (ple_reader_test --selftest covers straddling, caching, in-flight tickets, keep-alive).
-    impl_->n_rows = t->shape[1];
-    impl_->data = impl_->file->tensor_data(*t);
-
-    // THE CHECK THAT MAKES THE OFFSET FALSIFIABLE.  The manifest's `shard2_tensor.offset` is 0, but that is
-    // the offset within the GGUF's DATA SECTION: the file's first 192 bytes are a header, and reading at 0
-    // would decode the header plus 192 bytes of shifted rows - still plausible IQ4_NL, and wrong for every
-    // row.  `GgufFile` parses the header, so `tensor_data` is already correct; this asserts the tensor
-    // exactly fills the file from there, which is what makes the whole arrangement checkable rather than
-    // assumed.  A wrong data offset would leave a different remainder.
-    // A shard may hold other tensors too (Swift 1.5's shard 1 holds layers 0-12 and the table): the table must
-    // then fit inside the file at its own offset; alone in its shard (the original's shard 2) it fills it exactly.
-    const uint64_t need = impl_->n_rows * (uint64_t) impl_->rb;
-    const uint64_t have = impl_->file->file_size() - impl_->file->data_start();
+    if (io.quantize_q8_0 && fmt != PleFormat::BF16) {
+        err = "PLE RAM quantization requires a BF16 source table";
+        close();
+        return false;
+    }
+    const uint32_t rb = fmt == PleFormat::BF16 ? PLE_ROW_BYTES_BF16
+                      : fmt == PleFormat::Q8_0 ? PLE_ROW_BYTES_Q8_0
+                      : fmt == PleFormat::Q5_0 ? PLE_ROW_BYTES_Q5_0 : PLE_ROW_BYTES;
+    const uint64_t n_rows = t->shape[1];
+    const uint64_t file_bytes = impl_->file->file_size();
+    const uint64_t data_start = impl_->file->data_start();
+    if (n_rows == 0 || n_rows > std::numeric_limits<uint64_t>::max() / rb || data_start > file_bytes) {
+        err = "PLE table size or data offset is invalid";
+        close();
+        return false;
+    }
+    const uint64_t need = n_rows * rb;
+    const uint64_t have = file_bytes - data_start;
     const bool alone = impl_->file->tensors().size() == 1;
-    if (alone ? need != have : t->offset + need > have) {
-        char buf[256];
-        std::snprintf(buf, sizeof buf,
-                      "PLE table size mismatch: %llu rows x %d B = %llu at offset %llu, but the file holds %llu from "
-                      "data_start %llu",
-                      (unsigned long long) impl_->n_rows, (int) impl_->rb, (unsigned long long) need,
-                      (unsigned long long) t->offset, (unsigned long long) have,
-                      (unsigned long long) impl_->file->data_start());
-        err = buf;
+    // Offsets are relative to the data section (absolute for a virtual GGUF). A table alone in its
+    // shard fills the remainder; with other tensors it must fit. Subtraction avoids wrapping an extent.
+    if (t->offset > have || need > have - t->offset ||
+        (alone && need != have - t->offset) || need > std::numeric_limits<size_t>::max()) {
+        err = "PLE table size mismatch or source range exceeds the file";
         close();
         return false;
     }
-    if (io.mode == PleIo::Direct) {
-        // The parse above is the validated source of the offset; the mapping itself is not kept, so no page of
-        // the table can enter this process's working set or the file cache through it.
-        const uint64_t table_offset = impl_->file->data_start() + t->offset;
-        const uint64_t n_rows = impl_->n_rows;
+    const uint64_t table_offset = data_start + t->offset;
+    if (io.quantize_q8_0) {
+        // Do not retain a live source section while DirectFile streams the BF16 table. The metadata
+        // pointer dies with the mapping, so all geometry above is kept in independent locals.
         delete impl_->file;
         impl_->file = nullptr;
-        impl_->data = nullptr;
-        if (!impl_->reader.open(gguf_path, table_offset, n_rows, io.max_inflight, io.cache_rows, err,
-                                impl_->rb)) {
+        impl_->owned = basalt::ngram::open_ple_q8_0(gguf_path, table_offset, n_rows, err, io.quant_workers);
+        if (!impl_->owned) {
+            close();
+            return false;
+        }
+        impl_->data = impl_->owned->data;
+        impl_->n_rows = n_rows;
+        impl_->fmt = PleFormat::Q8_0;
+        impl_->rb = PLE_ROW_BYTES_Q8_0;
+        impl_->locked = true;
+        impl_->mode = PleIo::Mmap;
+        return true;
+    }
+    impl_->fmt = fmt;
+    impl_->rb = rb;
+    impl_->n_rows = n_rows;
+    if (io.mode == PleIo::Direct) {
+        delete impl_->file;
+        impl_->file = nullptr;
+        if (!impl_->reader.open(gguf_path, table_offset, n_rows, io.max_inflight, io.cache_rows, err, rb)) {
             close();
             return false;
         }
         impl_->reader.set_keepalive(io.keepalive_ms, io.keepalive_window_s);
-        impl_->n_rows = n_rows;
+    } else {
+        impl_->data = impl_->file->tensor_data(*t);
     }
     if (io.mode == PleIo::Mmap && io.lock && impl_->data != nullptr) {
         const uint64_t page = 4096;
@@ -288,10 +324,11 @@ void PleTable::close() {
     wait_prefetches();
     impl_->reader.close();
     impl_->pending = false;
-    impl_->locked = false;   // the unmap below releases the lock
+    impl_->locked = false;   // the owned release or unmap below releases the lock
     impl_->mode = PleIo::Mmap;
     delete impl_->file;
     impl_->file = nullptr;
+    impl_->owned.reset();
     impl_->data = nullptr;
     impl_->n_rows = 0;
     impl_->rb = PLE_ROW_BYTES;
@@ -301,7 +338,8 @@ void PleTable::close() {
 bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
 bool PleTable::locked() const { return impl_->locked; }
 const char* PleTable::format() const {
-    return impl_->fmt == PleFormat::Q8_0 ? "Q8_0" : impl_->fmt == PleFormat::Q5_0 ? "Q5_0" : "IQ4_NL";
+    return impl_->fmt == PleFormat::BF16 ? "BF16"
+         : impl_->fmt == PleFormat::Q8_0 ? "Q8_0" : impl_->fmt == PleFormat::Q5_0 ? "Q5_0" : "IQ4_NL";
 }
 PleIo PleTable::mode() const { return impl_->mode; }
 uint64_t PleTable::rows() const { return impl_->n_rows; }
@@ -320,12 +358,8 @@ void PleTable::read_row(uint32_t row, float* out160) const {
         impl_->bytes_read += impl_->rb;
         return;
     }
-    if (impl_->data == nullptr || row >= impl_->n_rows) {
-        std::memset(out160, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
-        return;
-    }
-    impl_->decode(impl_->data + (size_t) row * impl_->rb, out160);
-    impl_->bytes_read += impl_->rb;
+    std::string err;
+    if (!impl_->read_resident(row, out160, err)) throw std::runtime_error(err);
 }
 
 bool PleTable::issue(const uint32_t* rows16) {
@@ -357,7 +391,8 @@ bool PleTable::collect(float* out2560, std::string& err) {
         impl_->bytes_read += (uint64_t) PLE_N_HEADS * impl_->rb;
         return true;
     }
-    for (int h = 0; h < PLE_N_HEADS; ++h) read_row(impl_->rows[h], out2560 + (size_t) h * PLE_HEAD_DIM);
+    for (int h = 0; h < PLE_N_HEADS; ++h)
+        if (!impl_->read_resident(impl_->rows[h], out2560 + (size_t) h * PLE_HEAD_DIM, err)) return false;
     return true;
 }
 
@@ -372,7 +407,8 @@ bool PleTable::gather_rows(const uint32_t* rows, size_t n_tokens, float* out, st
         impl_->bytes_read += (uint64_t) n * impl_->rb;
         return true;
     }
-    for (size_t i = 0; i < n; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
+    for (size_t i = 0; i < n; ++i)
+        if (!impl_->read_resident(rows[i], out + i * PLE_HEAD_DIM, err)) return false;
     return true;
 }
 
@@ -455,16 +491,7 @@ void PleTable::gather(const uint32_t* rows16, float* out2560) const {
         }
         return;
     }
-    // ================================ SIXTEEN SERIAL PAGE FAULTS ================================
-    //
-    // **THIS COSTS MILLISECONDS PER TOKEN.**  The table is 320,001,536 rows of `PLE_ROW_BYTES` = 90 B in a 26.8 GB
-    // mapping, so the sixteen rows a token needs are 1,440 B.  That is not bandwidth, it is latency: sixteen reads
-    // into sixteen different 4 KB pages scattered across 26.8 GB, taken ONE AT A TIME, and the table is not in
-    // the OS cache when the expert arena competes for RAM.  Sixteen serial NVMe reads add up to milliseconds.
-    //
-    // A prefetch issues all sixteen in ONE call and lets them complete in parallel.  It is a hint
-    // and cannot change the answer - a range it does not fetch is simply faulted in by the read that follows -
-    // so the only risk is that it does nothing.
+    // Mapped rows may fault independently; Direct mode issues their page reads together.
     // HEAD-SLOWEST, which is what `ggml_get_rows` does and what the source's own comment says: head h's 160
     // values occupy [h*160, (h+1)*160).  A head-fastest layout would put element (d, h) at d*16 + h and needs
     // a real transpose - a reshape of the same flat buffer compares equal and would make the check vacuous.

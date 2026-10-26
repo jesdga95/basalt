@@ -237,8 +237,9 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/wait_abort.cu
                         src/kernels/cuda/iq_kernels.cu
                         src/kernels/ngram.cpp
-                        src/ngram/ple_reader.cpp)
-target_link_libraries(kernels PUBLIC core artifact)
+                        src/ngram/ple_reader.cpp
+                        src/ngram/ple_ram_quant.cpp)
+target_link_libraries(kernels PUBLIC core artifact ggml_quants Threads::Threads)
 target_sources(kernels PRIVATE src/kernels/cuda/hc_fused.cu src/kernels/cuda/hc8_gr.cu)
 # the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
 if(BUILD_TESTING)
@@ -1156,6 +1157,13 @@ target_include_directories(ple_reader_test PRIVATE ${_gpu_include_directories})
 target_link_libraries(ple_reader_test PRIVATE kernels core ${_gpu_runtime_target})
 basalt_embed_manifest(ple_reader_test)
 basalt_gpu_test(NAME ple_reader_selftest COMMAND ple_reader_test --selftest)
+
+add_executable(ple_ram_quant_test tests/core/ple_ram_quant_test.cpp
+               src/kernels/ngram.cpp src/ngram/ple_reader.cpp src/ngram/ple_ram_quant.cpp)
+target_link_libraries(ple_ram_quant_test PRIVATE artifact platform ggml_quants Threads::Threads)
+basalt_embed_manifest(ple_ram_quant_test)
+basalt_cpu_test(NAME ple_ram_quant_test COMMAND ple_ram_quant_test)
+set_tests_properties(ple_ram_quant_test PROPERTIES TIMEOUT 120)
 
 # The GPU test runs ON THE TARGET PC. `--selftest` allocates
 # and writes real VRAM, so a machine without a device fails this test rather than skipping it silently -

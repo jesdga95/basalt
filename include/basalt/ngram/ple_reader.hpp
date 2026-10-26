@@ -1,8 +1,8 @@
 // include/basalt/ngram/ple_reader.hpp - the n-gram table read straight from the SSD.
 //
-// The table is 320,001,536 rows of 90 bytes (IQ4_NL, 26.8 GiB) or 160 (FP8 E4M3, 51.2 GB) and is never held in the
-// process's memory: every row comes from a 4 KiB read (platform::DirectFile, opened as a file mapped elsewhere, since
-// the table is a section of the model file). A token needs 16 rows on 16 different pages, and all 16 depend
+// Rows use the table's stored format: 90 bytes (IQ4_NL), 110 (Q5_0), 170 (Q8_0) or 320 (BF16). Each comes from
+// 4 KiB reads (platform::DirectFile, opened as a file mapped elsewhere, since the table is a section of the model file).
+// A token needs 16 rows, and all 16 depend
 // on the token itself, so the only time to hide them is the embedding plus layer 0. Hence the split API:
 //
 //     Ticket t = reader.issue(rows, n, out_raw);    // as soon as the token id is known
@@ -13,8 +13,8 @@
 // in a scattered order and kept at most `max_inflight` deep, so a chunk's reads can run while the previous chunk
 // computes.
 //
-// THE ROW CACHE IS NOT THE TABLE. It keeps rows this process has already fetched (90 bytes each, bounded,
-// clock eviction). Within one long prompt a fraction of rows recur. Capacity 0 disables it.
+// THE ROW CACHE IS NOT THE TABLE. It keeps fetched rows in their stored format with bounded, set-associative
+// replacement. Within one long prompt a fraction of rows recur. Capacity 0 disables it.
 #pragma once
 
 #include "basalt/platform/direct_file.hpp"
@@ -58,7 +58,7 @@ public:
     /// `table_offset` is the byte offset of row 0 in the file and `n_rows` the row count; both come from a
     /// validated GGUF parse (PleTable::open checks the table exactly fills the file from there).
     /// A worker thread submits and reaps reads, so `issue` costs the caller no ReadFile calls.
-    /// `row_bytes`: one row's size in the file (90 IQ4_NL, 160 FP8), at most one page.
+    /// `row_bytes`: one row's stored size (90 IQ4_NL, 110 Q5_0, 170 Q8_0, 320 BF16), at most one page.
     bool open(const std::string& path, uint64_t table_offset, uint64_t n_rows, uint32_t max_inflight,
               uint64_t cache_rows, std::string& err, uint32_t row_bytes = ROW_BYTES);
     uint32_t row_bytes() const;

@@ -24,6 +24,23 @@ int vision(Context& context) {
         basalt::kernels::PleIoOptions pio;
         pio.mode = o.ple_io == "ram" ? basalt::kernels::PleIo::Mmap : basalt::kernels::PleIo::Direct;
         pio.lock = o.ple_io == "ram";
+        pio.quantize_q8_0 = o.ple_ram_quant == "q8_0";
+        if (pio.quantize_q8_0) {
+            namespace bp = basalt::program;
+            const auto topo = basalt::platform::detect_cpu_topology(true, basalt::platform::CpuAffinity::All);
+            bp::AutoInputs in;
+            in.worker_cores = (int) topo.worker_cores.size();
+            in.p_cores = topo.p_cores;
+            in.e_cores = topo.e_cores;
+            in.hybrid = topo.is_hybrid;
+            in.cpu_quota = basalt::kernels::cpu::cgroup_cpu_quota();
+            const auto affinity = o.pool_affinity == basalt::kernels::cpu::PoolAffinity::All
+                                      ? bp::AutoAffinity::All
+                                  : o.pool_affinity == basalt::kernels::cpu::PoolAffinity::PCores
+                                      ? bp::AutoAffinity::PCores
+                                      : bp::AutoAffinity::Auto;
+            pio.quant_workers = o.pool_workers > 0 ? o.pool_workers : bp::auto_pool_workers(in, affinity);
+        }
         const auto tpl = Clock::now();
         pio.max_inflight = (uint32_t) o.ple_inflight;
         pio.cache_rows = (uint64_t) o.ple_row_cache;

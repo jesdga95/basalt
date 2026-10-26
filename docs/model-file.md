@@ -42,6 +42,10 @@ and scales into Basalt's blocks without changing a bit, quantizes each dense pro
 of the norm weights into F32, puts the GDN value heads in the order the engine reads them, and writes the metadata and
 tokenizer from NVIDIA's `config.json`, tokenizer files and model card. `meta.checkpoint` records each step.
 
+BF16 PLE shards stay unquantized; FP8 PLE shards still become Q8_0. This is independent of `--dense-q8-0`.
+Rebuild from BF16 sources rather than an existing Q8_0 table. Disk/RAM costs and precision:
+[BF16 PLE tables](precision/features.md#bf16-ple-tables).
+
 Build either variant yourself from NVIDIA's checkpoint. The base pack supplies only the drafter, vision projector and
 expert profile (and its `hc8` copies if it has any), copied byte for byte. The official file takes them from
 UD-Q4_K_XL, which has no `hc8`, so the engine makes the hyper-connection copies from NVIDIA's weights; use a base
@@ -70,5 +74,58 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-UD-Q4_K_XL.basalt --
     --out Qwen3.8-FN-NVIDIA-NVFP4.basalt --name "Qwen3.8-Flash-Next NVIDIA-NVFP4"
 ```
 
-The output is about 122 GiB (the 8-bit variant 123 GiB). How NVFP4 is computed on each tier:
+The output with BF16 PLE is about 167 GiB (the 8-bit dense variant 168 GiB). How NVFP4 is computed on each tier:
 [precision](precision/index.md).
+
+## CPU PLE quantization in RAM
+
+`--ple-ram-quant none|q8_0` defaults to `none`, leaving the stored PLE format unchanged.
+`q8_0` requires a BF16 source and `--ple-io ram`; other modes or source formats are errors.
+
+```sh
+basalt serve --model MODEL-BF16-PLE.basalt --ple-io ram --ple-ram-quant q8_0
+```
+
+In a server config, the engine entries are:
+
+```json
+{"engine": {"ple-io": "ram", "ple-ram-quant": "q8_0"}}
+```
+
+Startup allocates and locks the full Q8_0 destination, then returns while background workers stream the BF16 table
+through two bounded 80 MiB input buffers. A read of an unfinished 128-row region packs it on demand through a separate
+small read buffer. Atomic region ownership prevents duplicate writers; readers wait for publication before decoding.
+Both paths widen to fp32 and call the same reference Q8_0 encoder. Warm rows need only a readiness check, with no
+allocation or conversion. There is no full BF16/fp32 host copy or GPU conversion, and the source file is never written.
+Worker count follows `--pool-workers`, or the automatic topology, `--pool-affinity` and CPU-quota policy.
+
+For 320,001,536 rows of 160 values, BF16 uses 320 bytes per row and 95.368 GiB on disk; resident Q8_0 uses 170 bytes
+per row and 50.664 GiB. The output allocation rounds up to 2 MiB. Additional memory covers the input buffers,
+80 KiB scratch per worker plus the demand reader,
+region states and normal engine reserves. Large pages are inherently resident; ordinary pages must be completely
+OS-locked. Linux reserved huge pages are admitted separately from ordinary-RAM reserves. Allocation or partial locking
+failure is an error, not a pageable fallback. Full allocation and locking stay before expert-tier planning, so background
+packing cannot consume RAM already promised to experts. Conversion workers, source handles and temporary buffers end
+when packing completes; close cancels and joins unfinished work before releasing the table.
+
+Q8_0 is int8 codes with an FP16 scale per 32 values, not FP8. It is lossy relative to BF16 and uses the same rounding
+as CPU model-file quantization, not a new quantizer. The BF16-versus-Q8_0 PPL/KLD quality comparison is not measured.
+
+The independently converted, 54,400,261,120-byte offline Q8_0 reference has SHA-256
+`91743e33b6de2272b50a6269a6fe692f56244946fdecf19ca1eba0ba640b303f`.
+Background and on-demand packing match the CPU encoder over 1,031 fixture rows, with zero encoded or decoded
+mismatches. Against the synchronous loader, 300 greedy tokens each for conv, struct and prose match exactly with
+all 24,576 experts fixed in VRAM, spec 8, context 262,144 and Q8_0 RAM PLE.
+CPU tests cover reference-byte parity, concurrent demand/background reads, boundaries, duplicates, decoded gathers,
+validation failures, early close, reopen and source removal after completion.
+
+Development A/B on Windows, RTX PRO 6000, GPU power limit **396 W**, 15 workers: two alternating before/after pairs
+using the BF16-PLE UD-Q4_K_XL pack, one adapter, GPU-0 vision, FP16 KV, context 262,144 and all 24,576 experts in VRAM.
+These are local development measurements, not headline benchmarks.
+
+| Startup measure, 396 W | Before | Background PLE packing |
+|---|---:|---:|
+| PLE open on the startup thread | 29.9–32.0 s | 11.1–15.3 s |
+
+Background PLE packing completed before server readiness in both runs. On-demand behavior is covered by concurrent
+reader parity tests, not by these timings.
