@@ -119,6 +119,10 @@ public:
     /// the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
     static constexpr int kMaxSplitMulti = 96;
+    /// Row-range tasks per thread in each phase of the multi-token paths.  The cores differ in speed, so a thread
+    /// that finishes early claims another: the more and smaller the tasks, the shorter the wait for the slowest one
+    /// at the end of a phase, until the claim traffic and the short streams cost more than the tail they remove.
+    static constexpr int kTasksPerThread = 12;
     /// Work for the parked workers between batches (not the host thread): `fn(ctx, worker, workers, stop)` runs once
     /// per worker index and must return soon after `stop` reads true.  Returns at once.  The next batch, `idle_stop`
     /// or the destructor raises `stop` and waits for the workers to park, so the work never overlaps a batch; it must
@@ -161,6 +165,11 @@ private:
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
     void run_phase(int mode, int n_tasks);
+    /// Rows [r0, r1) of expert `e` of the native batch: gate/up with SwiGLU into the split buffer, the intermediate's
+    /// quantization, and the down projection into the job's outputs.
+    void native_gu_range(int e, int r0, int r1);
+    void native_quantize(int e);
+    void native_down_range(int e, int r0, int r1);
     /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
     int claim(uint32_t epoch);
     /// Publish the batch whose description the caller has just written: reset `done`, then `head`, then the epoch.
@@ -168,6 +177,10 @@ private:
     /// The host's waits, bounded by `kStall`.
     void wait_parked(const char* what);
     void wait_done(int n);
+    /// The wait of a fused batch's down part for its expert's quantized intermediate, bounded the same way.
+    void wait_ready(int e);
+    /// After a stall was logged: release the GPU's waits, then stop the process.
+    [[noreturn]] static void stalled();
     /// Bump `epoch_`, and wake the workers that went to sleep.  Every publish goes through here.
     void publish();
 
@@ -223,7 +236,7 @@ private:
         ActQ a2;
     };
     std::vector<SplitBuf> split_;
-    // run_split_multi state: mode 3 = gate/up row parts, 4 = down row parts
+    // run_split_multi state: mode 3 = gate/up row parts, 4 = down row parts (mode 8, the native path, is below)
     ExpertJobMulti* mjobs_ = nullptr;
     int64_t mrows_ = 0;   // rows of the current multi phase across all its experts (n * FF, then n * H)
     int mtasks_ = 1;   // equal row ranges the phase is cut into
@@ -233,6 +246,14 @@ private:
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // native down activations
     };
     const NativeFmt* nfmt_ = nullptr;
+    // run_split_multi_native's one batch per layer (mode 8): per expert, the gate/up parts left to do and whether its
+    // intermediate is quantized
+    struct alignas(64) FusedExpert {
+        std::atomic<int> gu_left{0};
+        std::atomic<int> ready{0};
+    };
+    std::unique_ptr<FusedExpert[]> fused_;
+    int fused_n_ = 0, fused_gu_parts_ = 1, fused_d_parts_ = 1;
     std::vector<SplitBufMulti> split_multi_;
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;

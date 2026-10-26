@@ -74,7 +74,7 @@ Q6_K x q8_1 in float:
 Margins 6 and 8 rescore 5,569-18,649 and 27,962-78,806 rows per column. Neither a least-squares scale for the copy nor a
 per-column correction of the tail's bias lowers the KLD (the tail's mass is unbiased; the cost is its noise).
 
-Quality gate (IQ3_S, 100 chunks, against the Q8_0 base, tiers pinned to `--expert-cache 9000 --peer-slots 7562`, 400 W;
+Quality gate (IQ3_S, 100 chunks, against the Q8_0 base, tiers pinned (expert cache 9000 slots, peer 7562), 400 W;
 the gate leaves the PCIe share dynamic, so two runs of one build differ):
 
 | Head | Run | PPL | KLD mean | KLD median | KLD p99 | Same top-1 |
@@ -133,7 +133,7 @@ configuration, same prompt order. A logit-hash diagnostic prints an FNV-1a hash 
 of every accepted row. Token ids and the hash at each generated position are compared between `--spec 0` and
 `--spec 7`.
 
-Expert tiers are pinned (`--adapt-swaps 0 --peer-adapt-swaps 0`, with `--expert-cache` and `--peer-slots`
+Expert tiers are pinned (`--adapt-swaps 0 --peer-adapt-swaps 0`, with the expert cache and the peer tier
 fixed to the sizes auto-sizing picks), so the same experts sit on the same device in both runs.
 
 | Pack | Prompts | Identical tokens | Logit rows compared | Bit-identical rows | First divergence | Accepted drafts | Decode tok/s, spec 0 → spec 7 |
@@ -173,6 +173,19 @@ against the base.
   routed experts were computed on the CPU (IQ3_XXS, default placement). The split is fixed per placement, so it is the
   same for spec 0 and spec 7.
 - Prompts are 19 to 395 tokens with 256 new tokens: this tests the decode path, not long context.
+
+### Overlapped windows on a layer split
+
+A two-card layer split can start window K+1 on the first card while the second card still verifies window K (see
+[GPUs](../configuration/gpus.md)). The first card commits K as if every row were kept, from a snapshot of the state that
+commit changes (recurrent state, conv history, the indexer's pooled rows and block position, the PLE history), and runs
+K+1 from the guess that K is accepted whole and that its last pick is the drafter's next token. When the guess fails the
+snapshot is put back and K+1 is run again as without the overlap; when it holds, the second card runs K+1 behind K's
+commit. Every row is computed by the same kernels on the same inputs, so greedy output is that of the plain split: the
+two builds write the same 400 tokens for conv, struct and prose and for 3-5K-token prompts when their expert caches are
+pinned (an expert on the CPU tier and the same expert on a GPU differ at 8e-8, which flips a near-tie token between
+unpinned runs). Scored (`--ppl`) requests, requests with a repetition penalty or a grammar, relaxed drafting and batch
+slots never overlap windows.
 
 ## Relaxed drafting
 

@@ -71,6 +71,20 @@ bool cpu_avx2_ok() {
     return ok;
 }
 
+bool cpu_avxvnni_ok() {
+    static const bool ok = [] {
+        if (!cpu_avx2_ok()) return false;
+        unsigned r[4] = {0, 0, 0, 0};
+        platform::cpuid(0, 0, r);
+        if (r[0] < 7) return false;
+        platform::cpuid(7, 0, r);
+        if (r[0] < 1) return false;                        // leaf 7 has no sub-leaf 1
+        platform::cpuid(7, 1, r);
+        return ((r[0] >> 4) & 1u) != 0;                    // AVX-VNNI
+    }();
+    return ok;
+}
+
 bool cpu_avx1_ok() {
     // AVX (Sandy Bridge, 2011): AVX + OSXSAVE with the OS saving the YMM state; FMA, F16C and AVX2 not needed.
     // From the upstream fork (rwkeyes).

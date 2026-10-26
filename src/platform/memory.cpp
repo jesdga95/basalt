@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <thread>
 #if defined(_WIN32)
@@ -257,15 +258,77 @@ std::atomic<bool> g_guard_on{false};
 std::atomic<bool> g_guard_low{false};
 std::atomic<uint64_t> g_guard_avail{0};
 std::atomic<uint64_t> g_guard_floor{0};
+#if defined(_WIN32)
+constexpr uint64_t kReclaimLead = 1ull << 30;       // how far above the floor the guard gives the view back
+constexpr uint64_t kReclaimChunk = 256ull << 20;    // bytes given back per lock hold
+constexpr auto kReclaimCooldown = std::chrono::seconds(5);
+std::mutex g_reclaim_mu;                            // held per chunk, so a withdrawn view is not touched afterwards
+const void* g_reclaim_base = nullptr;
+uint64_t g_reclaim_bytes = 0;
+
+// Gives the registered view back in chunks, releasing the lock between them so a withdrawal waits for one chunk.
+void reclaim_view_now() {
+    const void* base;
+    uint64_t bytes;
+    {
+        std::lock_guard<std::mutex> lock(g_reclaim_mu);
+        base = g_reclaim_base;
+        bytes = g_reclaim_bytes;
+    }
+    for (uint64_t off = 0; base != nullptr && off < bytes; off += kReclaimChunk) {
+        std::lock_guard<std::mutex> lock(g_reclaim_mu);
+        if (g_reclaim_base != base) return;
+        (void) drop_mapped_view(base, bytes, off, std::min(kReclaimChunk, bytes - off));
+    }
+}
+#endif
 }  // namespace
+
+void ram_guard_reclaim_view(const void* base, uint64_t bytes) {
+#if defined(_WIN32)
+    std::lock_guard<std::mutex> lock(g_reclaim_mu);
+    g_reclaim_base = bytes > 0 ? base : nullptr;
+    g_reclaim_bytes = g_reclaim_base != nullptr ? bytes : 0;
+#else
+    (void) base, (void) bytes;   // MemAvailable already counts a view's pages
+#endif
+}
 
 void start_ram_guard(uint64_t floor_bytes) {
     g_guard_floor = floor_bytes;
     if (g_guard_on.exchange(true)) return;
     std::thread([] {
         bool was_low = false;
+#if defined(_WIN32)
+        bool rearmed = true, logged_reclaim = false;
+        auto last_reclaim = std::chrono::steady_clock::now() - kReclaimCooldown;
+#endif
         for (;;) {
-            const uint64_t avail = available_memory(), floor = g_guard_floor.load();
+            uint64_t avail = available_memory();
+            const uint64_t floor = g_guard_floor.load();
+#if defined(_WIN32)
+            // Give the view back at most once per cooldown, and again only after the reading has been above the lead.
+            if (!ram_below_floor(avail, floor + kReclaimLead)) {
+                rearmed = true;
+            } else if (rearmed && std::chrono::steady_clock::now() - last_reclaim >= kReclaimCooldown) {
+                bool have;
+                {
+                    std::lock_guard<std::mutex> lock(g_reclaim_mu);
+                    have = g_reclaim_base != nullptr;
+                }
+                if (have) {
+                    if (!logged_reclaim) {
+                        basalt::log::info("basalt", "RAM guard: mapped experts view given back at %llu MiB free",
+                                     (unsigned long long) (avail >> 20));
+                        logged_reclaim = true;
+                    }
+                    reclaim_view_now();
+                    avail = available_memory();
+                    rearmed = false;
+                    last_reclaim = std::chrono::steady_clock::now();
+                }
+            }
+#endif
             const bool low = ram_below_floor(avail, floor);
             g_guard_avail = avail;
             g_guard_low = low;

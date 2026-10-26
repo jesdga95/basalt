@@ -121,6 +121,21 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+/// Sets *flag = value (a mapped host flag) behind everything queued on the stream, written out to the system first: the
+/// other end of a wait_flag_ge on another device.
+void signal_flag(uint32_t* flag, uint32_t value, void* stream);
+/// Up to kWordCopyMax disjoint device word ranges copied by one launch (the pipelined pair's state snapshot).
+constexpr int kWordCopyMax = 32;
+struct WordCopy {
+    const int32_t* src = nullptr;
+    int32_t* dst = nullptr;
+    int n = 0;
+};
+struct WordCopyList {
+    WordCopy e[kWordCopyMax];
+    int n = 0;
+};
+void word_copy_list(const WordCopyList& l, void* stream);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
 

@@ -93,6 +93,32 @@ bool NativeDense::plan_bytes(const std::vector<std::string>& shards, bool includ
     }
 }
 
+bool NativeDense::plan_bytes_by_layer(const std::vector<std::string>& shards, bool include_ple_key, int64_t n_layers,
+                                      std::vector<uint64_t>& per_layer, uint64_t& shared, std::string& err) {
+    per_layer.assign((size_t) n_layers, 0);
+    shared = 0;
+    try {
+        for (const auto& path : shards) {
+            basalt::GgufFile gguf(path);
+            for (const auto& tensor : gguf.tensors()) {
+                if (!eligible(tensor, include_ple_key) || !basalt::kernels::native_mmvq_supported(tensor.type) ||
+                    tensor.shape.size() != 2 || tensor.shape[0] == 0 || tensor.shape[0] > INT_MAX ||
+                    tensor.shape[1] == 0 || tensor.shape[1] > INT_MAX)
+                    continue;
+                const uint64_t bytes = basalt::kernels::native_mmvq_weight_bytes(tensor.type, (int) tensor.shape[0],
+                                                                                 (int) tensor.shape[1]);
+                const long l = std::strtol(tensor.name.c_str() + 4, nullptr, 10);
+                if (tensor.name.find("ple") == std::string::npos && l >= 0 && l < n_layers) per_layer[(size_t) l] += bytes;
+                else shared += bytes;
+            }
+        }
+        return true;
+    } catch (const std::exception& error) {
+        err = std::string("native dense: ") + error.what();
+        return false;
+    }
+}
+
 void NativeDense::set_layer_range(int lb, int le) { g_layer_lb = lb; g_layer_le = le; }
 bool NativeDense::keep_unquantized_ple_key(const PackFiles& pack, std::set<std::string>& skip, std::string& err) {
     const std::string key = "blk.1.ple_key.weight";

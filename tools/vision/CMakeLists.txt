@@ -62,8 +62,10 @@ if(MSVC)
 endif()
 
 if(BUILD_TESTING)
-  add_executable(vision_cpu_parity ${VISION_ROOT}/src/vision/cpu_parity.cpp)
+  add_executable(vision_cpu_parity ${VISION_ROOT}/tests/vision/cpu_parity.cpp)
   target_link_libraries(vision_cpu_parity PRIVATE vision_core)
-  add_executable(vision_cuda_parity ${VISION_ROOT}/src/vision/cuda_parity.cu)
+  add_executable(vision_cuda_parity ${VISION_ROOT}/tests/vision/cuda_parity.cu)
   target_link_libraries(vision_cuda_parity PRIVATE vision_cuda)
+  # the parity program is outside src/vision now and needs the private kernel header
+  target_include_directories(vision_cuda_parity PRIVATE ${VISION_ROOT}/src/vision)
 endif()

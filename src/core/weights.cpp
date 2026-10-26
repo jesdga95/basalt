@@ -119,6 +119,36 @@ bool WeightTable::pool_bytes(const PackFiles& pack, uint64_t& out, std::string& 
     return true;
 }
 
+bool WeightTable::pool_bytes_by_layer(const PackFiles& pack, int64_t n_layers, std::vector<uint64_t>& per_layer,
+                                      uint64_t& shared, std::string& err, const std::set<std::string>* skip) {
+    IndexText f;
+    if (!f.open(pack.index, err)) { err = "cannot open " + pack.index.path + (err.empty() ? "" : " (" + err + ")"); return false; }
+    per_layer.assign((size_t) n_layers, 0);
+    shared = 0;
+    char line[1024];
+    int align = 0;
+    while (f.next(line, sizeof line)) {
+        if (line[0] == '#') {
+            unsigned long long p = 0;
+            int a = 0, tensors = 0;
+            if (std::sscanf(line, "# align %d pool %llu tensors %d", &a, &p, &tensors) == 3) align = a;
+            continue;
+        }
+        char name[256] = {0};
+        unsigned long long dst_bytes = 0, dummy = 0;
+        int i1 = 0, i2 = 0;
+        if (std::sscanf(line, "%255s %d %d %llu %llu %llu %llu", name, &i1, &i2, &dummy, &dummy, &dummy, &dst_bytes) != 7)
+            continue;
+        if (skip != nullptr && skip->count(name)) continue;
+        const uint64_t a = align > 0 ? (uint64_t) align : 256;
+        const uint64_t bytes = (dst_bytes + a - 1) / a * a;
+        const long l = std::strncmp(name, "blk.", 4) == 0 ? std::strtol(name + 4, nullptr, 10) : -1;
+        if (l >= 0 && l < n_layers) per_layer[(size_t) l] += bytes;
+        else shared += bytes;
+    }
+    return true;
+}
+
 bool WeightTable::index_code_bits(const PackFiles& pack, const std::string& name, int& code_bits,
                                   std::string& err) {
     IndexText f;

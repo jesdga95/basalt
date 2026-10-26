@@ -138,6 +138,7 @@ constexpr int64_t kDraftCtxRows = 512;
 
 MtpDrafter::~MtpDrafter() {
     if (cs_) cudaStreamSynchronize(cs_);
+    if (ev_done_) cudaEventDestroy(ev_done_);
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : prefill_dev_exec_) if (e) cudaGraphExecDestroy(e);
     if (pf_dev_) cudaFree(pf_dev_);
@@ -145,6 +146,8 @@ MtpDrafter::~MtpDrafter() {
         for (void* a : st) if (a) cudaFree(a);
     if (rstage_) cudaFree(rstage_);
     if (rkeep_) cudaFree(rkeep_);
+    if (own_R_) cudaFree(own_R_);
+    if (relay_) cudaFree(relay_);
     for (float* r : pend_R_) if (r) cudaFree(r);
     for (auto& row : round_exec_)
         for (auto& e : row) if (e) cudaGraphExecDestroy(e);
@@ -233,7 +236,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     if (ple_ss_ == nullptr) ple_ss_ = &ss;
     max_t_ = max_t;
     draft_vocab_ = files.draft_vocab;
-    if (max_t < 1 || max_t > basalt::kernels::kVerifyMaxT) { err = "mtp: max_t out of range"; return false; }
+    if (max_t < 1 || max_t > kMtpChainMax) { err = "mtp: max_t out of range"; return false; }
     // the two reads below are the whole "drafter files" cost; reported apart from the rest of the stage
     const auto t_files = std::chrono::steady_clock::now();
     // the draft layer's dense weights and experts, as one load phase
@@ -545,6 +548,24 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     wt_ = &wt;
     head_ = head;
     window_R_ = window_R;
+    relay_src_ = nullptr;
+    if (window_R != nullptr) {
+        cudaPointerAttributes pa{};
+        if (cudaPointerGetAttributes(&pa, window_R) == cudaSuccess && pa.type == cudaMemoryTypeDevice &&
+            pa.device != device_) {
+            const size_t row = (size_t) (g_->hc * g_->n_embd) * sizeof(float);
+            if (own_R_ == nullptr &&
+                (cudaMalloc((void**) &own_R_, (size_t) max_t_ * row) != cudaSuccess ||
+                 cudaMalloc((void**) &relay_, (size_t) kRelayRows * row) != cudaSuccess)) {
+                err = "mtp: the row relay does not fit";
+                return false;
+            }
+            vram_ += (uint64_t) (max_t_ + kRelayRows) * row;
+            relay_src_ = window_R;
+            window_R_ = own_R_;
+        }
+        (void) cudaGetLastError();
+    }
     const WeightRef* wo = wt.find("output.weight");
     if (!wo) { err = "mtp: output.weight is missing"; return false; }
     n_vocab_ = wo->ne1;
@@ -1145,7 +1166,8 @@ bool MtpDrafter::prewarm(std::string& err) {
     bool ok = true;
     for (int tier = 0; ok && tier < (tier2_.empty() ? 1 : 2); ++tier) {
         tier_ = tier2_.empty() ? saved : tier;
-        for (int T = 1; ok && T <= max_t_ && !cond_off_; ++T) ok = capture_cond(T, max_steps);
+        for (int T = 1; ok && T <= std::min(max_t_, basalt::kernels::kVerifyMaxT) && !cond_off_; ++T)
+            ok = capture_cond(T, max_steps);
     }
     tier_ = saved;
     if (!ok && cond_off_) return true;   // the per-step graphs take over, as at a lazy failure
@@ -1163,9 +1185,9 @@ bool MtpDrafter::capture_cond(int T, int steps) {
     using namespace basalt::kernels;
     std::string err;
     cudaGraph_t top = nullptr;
-    cudaGraphConditionalHandle h[kVerifyMaxT] = {};
-    unsigned long long hv[kVerifyMaxT] = {};
-    bool ok = steps >= 2 && steps <= kVerifyMaxT - 1 && cudaGraphCreate(&top, 0) == cudaSuccess;
+    cudaGraphConditionalHandle h[kMtpChainMax] = {};
+    unsigned long long hv[kMtpChainMax] = {};
+    bool ok = steps >= 2 && steps <= kMtpChainMax - 1 && cudaGraphCreate(&top, 0) == cudaSuccess;
     for (int j = 1; ok && j < steps; ++j) {
         // reset to 0 at every launch: a skipped step leaves the next one's handle at 0
         ok = cudaGraphConditionalHandleCreate(&h[j], top, 0, cudaGraphCondAssignDefault) == cudaSuccess;
@@ -1290,14 +1312,29 @@ bool MtpDrafter::prefill_cur(const float* R_rows, const int32_t* next_tokens, in
         const int32_t* d_tk = pf_dev_;
         const int32_t* d_stp = d_tk + n;
         const int32_t* d_ps = d_stp + 4 * n;
-        for (int64_t c = 0; c < n; c += max_t_) {
-            const int T = (int) std::min<int64_t>(max_t_, n - c);
+        int64_t blk0 = -1;   // the first row of the block in `relay_` (rows on another GPU come over in blocks)
+        const int64_t batch = std::min<int64_t>(max_t_, basalt::kernels::kVerifyMaxT);
+        for (int64_t c = 0; c < n; c += batch) {
+            const int T = (int) std::min<int64_t>(batch, n - c);
             if (cell0 + c + T <= first_needed) continue;
+            const float* rows = R_rows + (size_t) c * HCN;
+            if (relay_ != nullptr && R_rows != own_R_ && R_rows != relay_) {
+                if (blk0 < 0 || c + T > blk0 + kRelayRows) {
+                    blk0 = c;
+                    const int64_t nb = std::min<int64_t>(kRelayRows, n - c);
+                    if (cudaMemcpyAsync(relay_, R_rows + (size_t) c * HCN, (size_t) nb * HCN * sizeof(float),
+                                        cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+                        err = "mtp prefill: relaying the rows failed";
+                        return false;
+                    }
+                }
+                rows = relay_ + (size_t) (c - blk0) * HCN;
+            }
             if (!capture_prefill_dev(T, err)) return false;
             if (cudaMemcpyAsync(tok_, d_tk + c, (size_t) T * 4, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
                 cudaMemcpyAsync(step_, d_stp + c * 4, (size_t) T * 16, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
                 cudaMemcpyAsync(pos_, d_ps + c * NHp, (size_t) (T * NHp) * 4, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
-                cudaMemcpyAsync(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
+                cudaMemcpyAsync(Rin_, rows, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
                                 cs_) != cudaSuccess ||
                 cudaGraphLaunch(prefill_dev_exec_[T], cs_) != cudaSuccess) {
                 err = std::string("mtp prefill: ") + cudaGetErrorString(cudaGetLastError());
@@ -1353,8 +1390,24 @@ void MtpDrafter::ctx_flush(cudaStream_t cs) {
 
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                        float* probs, int* n_drafts) {
+    if (relay_src_ != nullptr && T >= 1 && T <= max_t_) {
+        const OnDevice on_device(device_);
+        if (cudaMemcpyAsync(own_R_, relay_src_, (size_t) T * (size_t) (g_->hc * g_->n_embd) * sizeof(float),
+                            cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+            err = "mtp: relaying the window rows failed";
+            return false;
+        }
+    }
+    return draft_rows(T, tokens, p, a, drafts, err, probs, n_drafts);
+}
+
+bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
+                            float* probs, int* n_drafts) {
     const OnDevice on_device(device_);
-    if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
+    if (T < 1 || T > std::min(max_t_, basalt::kernels::kVerifyMaxT) || a < 0 || a >= T) {
+        err = "mtp: draft arguments out of range";
+        return false;
+    }
     note_cells(p, p + T + max_t_ + 1);
     if (n_xcap_ > 0) {   // the window's committed picks (rows 0..a) may hold names the subset lacks
         for (int t = 0; t <= a; ++t) ctx_note(tokens[t]);
@@ -1435,12 +1488,14 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         // every draft arrived: the graph's kernels are done, only its skipped steps' conditional nodes remain
         bool arrived = cond && ((volatile int32_t*) h_out_)[0] >= 0;
         drafts[0] = ((volatile int32_t*) h_out_)[0];
-        float pr[basalt::kernels::kVerifyMaxT];
+        float pr[kMtpChainMax];
         float pj = ((volatile float*) h_prob_)[0];
         pr[0] = pj;
         if (probs) probs[0] = pj;
         n = 1;
-        for (int j = 1; j < max_steps && draft_keep(pr, j - 1, cum_th); ++j) {
+        const float host_th = host_th_ >= 0.0f ? host_th_ : cum_th;
+        chain_steps_ = max_steps;
+        for (int j = 1; j < max_steps && draft_keep(pr, j - 1, host_th); ++j) {
             if (!cond) {   // the conditional graph runs step j on the device by the same comparison
                 if (cudaGraphLaunch(step_exec_[tier_][j], cs_) != cudaSuccess) {
                     err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
@@ -1462,7 +1517,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         }
         // the last draft is a window row only when it passed the cutoff; a row nobody needs would make the window's
         // PLE collect wait for its SSD read
-        if (draft_keep(pr, n - 1, cum_th)) prefetch_ple(drafts[n - 1]);
+        if (draft_keep(pr, n - 1, host_th)) prefetch_ple(drafts[n - 1]);
         decode_gaps().mark(8);
         // the skipped steps' nodes finish beside the next window; the profile stamps and the logits copy need the end
         const bool sync = !arrived || gstamp_ != nullptr || diag_ != nullptr;
@@ -1598,7 +1653,7 @@ bool MtpDrafter::draft_seq(int id, const float* R_rows, int T, const int32_t* to
             return false;
         }
     }
-    return draft(T, tokens, p, a, drafts, err, probs, n_drafts);
+    return draft_rows(T, tokens, p, a, drafts, err, probs, n_drafts);
 }
 
 bool MtpDrafter::flush(int id, std::string& err) {
@@ -1633,6 +1688,54 @@ bool MtpDrafter::catch_up(int id, const float* R_rows, const int32_t* next_token
     return prefill_cur(R_rows, next_tokens, n, cell0, err);
 }
 
+// The drafts the device made past the ones draft() waited for: its conditional graph runs the chain on while the host
+// does other work.  Those that have arrived are taken; the host never waits here, because a window on this card may be
+// holding its SMs until the host serves its rings, and the chain's kernels would wait behind it.
+cudaEvent_t MtpDrafter::done_event() {
+    const OnDevice on_device(device_);
+    if (ev_done_ == nullptr && cudaEventCreateWithFlags(&ev_done_, cudaEventDisableTiming) != cudaSuccess) return nullptr;
+    cudaEventRecord(ev_done_, cs_);
+    return ev_done_;
+}
+
+int MtpDrafter::draft_more(int have, int32_t* drafts, float* probs) {
+    int n = have;
+    for (; n < chain_steps_ && n < kMtpChainMax; ++n) {
+        if (((volatile int32_t*) h_out_)[n] < 0) break;
+        drafts[n] = ((volatile int32_t*) h_out_)[n];
+        if (probs) probs[n] = ((volatile float*) h_prob_)[n];
+    }
+    return n;
+}
+
+bool MtpDrafter::stage_rows(const float* R_rows, int n, const float** staged, std::string& err) {
+    *staged = R_rows;
+    if (relay_ == nullptr) return true;
+    if (n < 1 || n > kRelayRows) { err = "mtp: staging rows out of range"; return false; }
+    const OnDevice on_device(device_);
+    if (cudaMemcpyAsync(relay_, R_rows, (size_t) n * (size_t) (g_->hc * g_->n_embd) * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
+        cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = "mtp: staging the window rows failed";
+        return false;
+    }
+    *staged = relay_;
+    return true;
+}
+
+bool MtpDrafter::draft_from(const float* R_rows, int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts,
+                            std::string& err, float* probs, int* n_drafts) {
+    if (R_rows != window_R_) {
+        const OnDevice on_device(device_);
+        if (cudaMemcpyAsync((void*) window_R_, R_rows, (size_t) T * (size_t) (g_->hc * g_->n_embd) * sizeof(float),
+                            cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+            err = "mtp: staging the window rows failed";
+            return false;
+        }
+    }
+    return draft_rows(T, tokens, p, a, drafts, err, probs, n_drafts);
+}
+
 bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                              float* probs, int* n_drafts) {
     const OnDevice on_device(device_);
@@ -1645,7 +1748,7 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
             return false;
         }
     std::vector<int32_t> toks((size_t) T, token);
-    return draft(T, toks.data(), cell, 0, drafts, err, probs, n_drafts);
+    return draft_rows(T, toks.data(), cell, 0, drafts, err, probs, n_drafts);
 }
 
 }  // namespace basalt::core

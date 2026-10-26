@@ -144,6 +144,51 @@ __device__ __forceinline__ void dm_group_keys(const int32_t* s_key, int n, int t
     rank_out = rank;
 }
 
+// The staged share (a card without peers): of the layer's distinct CPU misses (an entry of kind -1 that is its expert's
+// first such entry), the last stage_k[m] in routing order whose blob has a host-RAM address go to kind 1 with every
+// entry of theirs (m: the layer's distinct CPU misses).  Every thread of the block calls it; q is kDmCap words of
+// block scratch.  The ring's kinds and the staged copy (dm_stage_kernel) make the same split from the same ids and
+// residency.
+__device__ void dm_stage_split(const DmRouteArgs& a, const int32_t* s_ids, int32_t* s_kind, int n, int tid, int32_t* q) {
+    if (a.stage_src == nullptr) return;
+    const bool in = tid < n;
+    const int32_t e = in ? s_ids[tid] : -1;
+    const bool miss = in && s_kind[tid] < 0 && e >= 0 && e < a.n_expert;
+    bool first = miss;
+    for (int j = 0; first && j < tid; ++j)
+        if (s_ids[j] == e && s_kind[j] < 0) first = false;
+    if (tid < kDmCap) q[tid] = first;
+    __syncthreads();
+    int m = 0;
+    for (int j = 0; j < n; ++j) m += q[j];
+    const int k = a.stage_k[m];
+    if (k <= 0) {
+        __syncthreads();
+        return;
+    }
+    bool el = first && a.stage_src[e] != 0ull;
+    for (int j = 0; el && j < n; ++j)   // a group holds one entry per token
+        if (j != tid && s_ids[j] == e && j / a.k == tid / a.k) el = false;
+    __syncthreads();
+    if (tid < kDmCap) q[tid] = el;
+    __syncthreads();
+    bool st = false;
+    if (el) {
+        int after = 0;
+        for (int j = tid + 1; j < n; ++j) after += q[j];
+        st = after < k;
+    }
+    __syncthreads();
+    if (tid < kDmCap) q[tid] = st;
+    __syncthreads();
+    bool staged = false;
+    for (int j = 0; miss && j < n; ++j)
+        if (q[j] && s_ids[j] == e) staged = true;
+    __syncthreads();
+    if (staged) s_kind[tid] = 1;
+    __syncthreads();
+}
+
 // The tier of expert e from CUDA0's and the peer's residency rows res0 / res1 (global or shared memory; res1 null: no
 // peer) and the further peers' rows: CUDA0, the peer, a further peer (3 + q) or the CPU pool (-1).
 __device__ __forceinline__ int dm_tier_rows(const DmRouteArgs& a, const int32_t* res0, const int32_t* res1, int32_t e) {
@@ -220,6 +265,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
         if (pe && rank >= a.peer_cap) s_kind[tid] = -1;
         __syncthreads();
     }
+    dm_stage_split(a, s_ids, s_kind, n, tid, s_first);
     if (tid < n) {
         if (s_kind[tid] < 0) atomicAdd(&s_ncpu, 1);
         else if (s_kind[tid] == 2) atomicAdd(&s_npeer, 1);
@@ -341,6 +387,62 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
     }
 }
 
+// The staged share's copy and plan (dec_moe_stage): every block derives the layer's kinds (the ring's on a card without
+// peers) and the split, then copies its part of each staged blob from host RAM into its staging slot, whole 128-byte
+// lines (a blob starts 16-byte aligned: its first line holds the bytes before it); block 0 writes the staged groups.
+constexpr int kDmStageUnroll = 4;
+__global__ void __launch_bounds__(kDmThreads) dm_stage_kernel(DmRouteArgs a, uint8_t* staging, long long stride,
+                                                              long long blob) {
+    __shared__ int32_t s_ids[kDmCap], s_kind[kDmCap], s_first[kDmCap], s_cnt[kDmCap], s_gstart[kDmCap];
+    __shared__ int32_t s_gidx[kDmCap], s_pos[kDmCap], s_start[kDmCap + 1];
+    __shared__ int32_t s_ng, s_ne;
+    __shared__ unsigned long long s_src[kDmStageMax];
+    const int tid = threadIdx.x, n = a.n_tok * a.k;
+    if (tid < n) s_ids[tid] = __ldcg(a.ids + tid);
+    __syncthreads();
+    if (tid < n) {
+        const int32_t e = s_ids[tid];
+        bool ok = e >= 0 && e < a.n_expert;
+        for (int j = tid - tid % a.k; ok && j < tid; ++j) ok = s_ids[j] != e;
+        s_kind[tid] = ok && a.res0[e] >= 0 ? 0 : -1;
+    }
+    __syncthreads();
+    dm_stage_split(a, s_ids, s_kind, n, tid, s_first);
+    dm_group(s_ids, s_kind, n, 1, tid, s_first, s_cnt, s_gstart, s_gidx, s_pos, s_start, &s_ng, &s_ne);
+    const int ng = min(s_ng, kDmStageMax);
+    if (tid < n && s_first[tid] && s_gidx[tid] < kDmStageMax) s_src[s_gidx[tid]] = a.stage_src[s_ids[tid]];
+    __syncthreads();
+    if (blockIdx.x == 0) {
+        DmPlan* p = a.plan;
+        if (tid < n && s_kind[tid] == 1 && s_pos[tid] >= 0) {
+            p->sdst[s_pos[tid]] = tid;
+            p->stok[s_pos[tid]] = tid / a.k;
+        }
+        if (tid <= ng) p->sstart[tid] = s_start[tid];
+        if (tid < ng) p->sptr[tid] = (unsigned long long) (staging + (long long) tid * stride) + (s_src[tid] & 127ull);
+        if (tid == 0) {
+            p->scounts[0] = ng;
+            p->scounts[1] = s_ne;
+        }
+    }
+    const long long step = (long long) gridDim.x * kDmThreads;
+    for (int g = 0; g < ng; ++g) {
+        const unsigned long long src = s_src[g];
+        const uint4* s = (const uint4*) (src & ~127ull);
+        uint4* d = (uint4*) (staging + (long long) g * stride);
+        const long long chunks = (long long) ((src + (unsigned long long) blob + 127ull) / 128ull - src / 128ull) * 8;
+        long long i = (long long) blockIdx.x * kDmThreads + tid;
+        for (; i + (kDmStageUnroll - 1) * step < chunks; i += kDmStageUnroll * step) {
+            uint4 v[kDmStageUnroll];
+#pragma unroll
+            for (int u = 0; u < kDmStageUnroll; ++u) v[u] = __ldcv(s + i + u * step);
+#pragma unroll
+            for (int u = 0; u < kDmStageUnroll; ++u) d[i + u * step] = v[u];
+        }
+        for (; i < chunks; i += step) d[i] = __ldcv(s + i);
+    }
+}
+
 // both tiers' words polled together, each one's landing time kept (S[2] the peer, S[4] the CPU pool, S[3] both)
 __device__ void dm_poll_tiers(const DmPlan* plan, const volatile uint32_t* peer_done, const volatile uint32_t* host_flag,
                               uint32_t ring, unsigned long long* S) {
@@ -400,6 +502,7 @@ __device__ void dm_ring_head(const DmRouteArgs& a, const int32_t* res0, const in
         if (pe && rank >= a.peer_cap) r_kind[tid] = -1;
         __syncthreads();
     }
+    dm_stage_split(a, r_ids, r_kind, n, tid, r_pf);
     if (tid < n) {
         if (r_kind[tid] < 0) atomicAdd(&r_cnt[0], 1);
         else if (r_kind[tid] == 2) atomicAdd(&r_cnt[1], 1);
@@ -2057,6 +2160,18 @@ void dec_moe_route(const DmRouteArgs& a, void* stream) {
     const dim3 grid((unsigned) dec_moe_route_blocks(a.n_tok, a.n_embd));
     dm_route_kernel<<<grid, kDmThreads, 0, (cudaStream_t) stream>>>(a);
     check("dec_moe_route");
+}
+
+void dec_moe_stage(const DmRouteArgs& a, uint8_t* staging, int64_t stride, int64_t blob_bytes, int blocks, void* stream) {
+    if (a.n_tok * a.k > kDmCap || a.stage_src == nullptr || a.stage_k == nullptr || blob_bytes % 16 != 0 ||
+        stride % 128 != 0 || stride < dec_moe_stage_stride(blob_bytes) || blocks < 1) {
+        basalt::log::error("basalt", "dec_moe_stage: %d entries, blob %lld, stride %lld", a.n_tok * a.k,
+                           (long long) blob_bytes, (long long) stride);
+        std::exit(1);
+    }
+    dm_stage_kernel<<<(unsigned) blocks, kDmThreads, 0, (cudaStream_t) stream>>>(a, staging, (long long) stride,
+                                                                                (long long) blob_bytes);
+    check("dec_moe_stage");
 }
 
 bool dec_moe_glue_ok(const NativeExpertLayout& L) {

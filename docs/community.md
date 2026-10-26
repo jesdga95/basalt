@@ -4,7 +4,7 @@
 
 ## Add your run
 
-1. Stop any running Basalt server (the GPUs must be free), then run `basalt-bench --community`. It starts its own engine (three times, once per measurement), shows the load progress on stderr while each one starts, adds its row to `docs/community/benchmarks.json` and prints it.
+1. Stop any running Basalt server (the GPUs must be free), then run `basalt-bench --community`. It starts its own engine (three times, once per measurement), shows the load progress on stderr while each one starts, adds its row to `docs/community/benchmarks.json` and prints it. It uses every visible Blackwell GPU: a second card is the peer, and `CUDA_VISIBLE_DEVICES=0` gives a single-card row.
 2. `--submitter NAME` is required: the name you want shown (any text, up to 40 characters; it is not verified). `notes` (up to 200 characters) is optional and added by hand.
 3. Review the row in `docs/community/benchmarks.json`, commit it and open a pull request. If the bench could not write the file, it prints the row and says where to paste it.
 
