@@ -134,8 +134,13 @@ NativeDense::~NativeDense() {
     for (void* p : allocs_) cudaFree(p);
 }
 
+namespace {
+constexpr uint64_t kSlabAlign = 256;   // matrices start at 256-byte offsets, as separate allocations do
+}
+uint64_t NativeDense::slab_bytes(uint64_t plan_total) { return plan_total + kSlabAlign * 1024; }
+
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi) {
+                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi, void* slab_at, uint64_t slab_cap) {
     auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
         if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
         const long l = std::strtol(name.c_str() + 4, nullptr, 10);
@@ -155,13 +160,19 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         DirectUploader uploader;   // unbuffered reads, overlapped with the copies
         // One allocation holds every matrix: separate cudaMalloc calls each round up to the allocator's granularity,
         // which costs about a MiB per matrix.  Matrices start at 256-byte offsets, as separate allocations do.
-        constexpr uint64_t kAlign = 256;
-        const uint64_t slab_bytes = plan_total + kAlign * 1024;
+        constexpr uint64_t kAlign = kSlabAlign;
+        const uint64_t slab_bytes = NativeDense::slab_bytes(plan_total);
+        if (slab_at != nullptr && slab_cap < slab_bytes) {
+            err = "native dense: the block given for the matrices is too small";
+            return false;
+        }
         DevicePtr slab;
-        {
+        void* slab_base = slab_at;
+        if (slab_base == nullptr) {
             void* a = nullptr;
             if (plan_total > 0 && cudaMalloc(&a, slab_bytes) == cudaSuccess) slab.reset(a);
             else (void) cudaGetLastError();
+            slab_base = slab.get();
         }
         uint64_t slab_used = 0;
         int max_in = 0;
@@ -250,9 +261,12 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
                 void* where = nullptr;
                 DevicePtr own;
-                if (slab && slab_used + bytes <= slab_bytes) {
-                    where = (char*) slab.get() + slab_used;
+                if (slab_base != nullptr && slab_used + bytes <= slab_bytes) {
+                    where = (char*) slab_base + slab_used;
                     slab_used += (bytes + kAlign - 1) / kAlign * kAlign;
+                } else if (slab_at != nullptr) {
+                    err = "native dense: the matrices outgrow the block given for them";
+                    return false;
                 } else {
                     void* allocation = nullptr;
                     if (cudaMalloc(&allocation, bytes) == cudaSuccess) own.reset(allocation);

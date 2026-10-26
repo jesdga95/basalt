@@ -22,8 +22,13 @@ public:
     NativeDense& operator=(const NativeDense&) = delete;
     /// With layer_hi >= 0, only the `blk.<l>.` matrices with layer_lo <= l < layer_hi are uploaded (a layer
     /// split's stage holds its own layers' projections, not the whole model's); the others keep data == nullptr.
+    /// `slab_at`: the device block (`slab_cap` bytes, `slab_bytes` long at least) the matrices go in instead of one this
+    /// object allocates and owns.
     bool load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-              bool include_ple_key = false, int64_t layer_lo = 0, int64_t layer_hi = -1);
+              bool include_ple_key = false, int64_t layer_lo = 0, int64_t layer_hi = -1, void* slab_at = nullptr,
+              uint64_t slab_cap = 0);
+    /// The bytes of the block the matrices of `plan_bytes`' total take (their alignment included).
+    static uint64_t slab_bytes(uint64_t plan_total);
     /// Plan v0.3 P1: the canonical tensor names `load` would serve natively from these shards (eligible name,
     /// supported type, 2-D), read from the GGUF headers only - so the canonical arena can skip them.
     static bool served_names(const std::vector<std::string>& shards, bool include_ple_key,
