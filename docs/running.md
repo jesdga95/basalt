@@ -183,9 +183,12 @@ of them give bitwise identical embeddings.
 | `dynamic` | inside the engine, on the main GPU | none at rest (0.85 GiB of pinned RAM) | 0.77 s, 1.45 s, 1.8 s |
 | `cpu` | sidecar on the CPU | none | about 6 s at 1k, 40 s at 3k, 70 s at 4k |
 
-`dynamic` borrows expert-cache slots per image (the prompt path's lend), uploads the weights from the
-pinned copy (about 30 ms), encodes on a side stream, and refills the same slots from RAM (about 70 ms), so the cache is
-identical afterwards. Other `--parallel` slots pause for the encode. An image already seen is served from the
+`dynamic` borrows the expert cache's last slots per image (any slot whose expert has a RAM copy), uploads the
+weights from the pinned copy (about 30 ms), encodes on a side stream, and refills the same slots from RAM (about 70 ms),
+so the cache is identical afterwards. Other `--parallel` slots pause for the encode. When a long conversation's elastic
+KV holds that room, the sessions first give back the KV cells they do not hold (idle slots first) and take them back
+as they grow. An image is refused only when the room cannot exist even then; the refusal is in the engine and server
+logs. An image already seen is served from the
 encoder cache in tens of milliseconds in every mode. The sidecar's card is named, not derived from `gpu`: any card
 works, whether or not it runs the engine, and the startup line names it.
 

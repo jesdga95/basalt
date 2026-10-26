@@ -41,6 +41,7 @@
 #include "basalt/program/auto_plan.hpp"
 #include "basalt/program/community_row.hpp"
 #include "basalt/program/gpu_select.hpp"
+#include "basalt/program/image_loan.hpp"
 #include "basalt/program/multi_gpu_plan.hpp"
 #include "basalt/program/tokenizer.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
@@ -2594,8 +2595,8 @@ int main(int argc, char** argv) {
             basalt::log::error("basalt generate", "the image encoder warm-up failed: %s", vis_enc.last_error().c_str());
             return 1;
         }
-        basalt::log::info("basalt serve", "image encoder staged: %.0f MiB of weights in pinned memory, %.2f GiB of expert-cache "
-                             "slots borrowed per image at most (%.1f s)",
+        basalt::log::info("basalt serve", "image encoder staged: %.0f MiB of weights in pinned memory, an image borrows up "
+                             "to %.2f GiB of expert-cache slots while it is read (%.1f s)",
                      (double) vis_enc.weights_bytes() / 1048576.0, (double) tmp_bytes / 1073741824.0,
                      std::chrono::duration<double>(Clock::now() - t0).count());
     }
@@ -7223,7 +7224,11 @@ int main(int argc, char** argv) {
         // image on its own stream, and the slots get their experts back from RAM before anything else reads the cache.
         // One reply line per image: `ENC OK <n> <nx> <ny> <ms>`, or a single `ENC ERR <message>`.
         auto enc_command = [&](const std::string& cmd) {
-            auto reply_err = [&](const std::string& m) { std::printf("ENC ERR %s\n", m.c_str()); std::fflush(stdout); };
+            auto reply_err = [&](const std::string& m, bool logged = false) {
+                if (!logged) basalt::log::warn("basalt serve", "image encoder: refused: %s", m.c_str());
+                std::printf("ENC ERR %s\n", m.c_str());
+                std::fflush(stdout);
+            };
             if (o.vision_mmproj.empty()) { reply_err("this engine was started without --vision-mmproj"); return; }
             if (pf_parts.size() != 1 || pf_parts[0].first < 0 || !stages.empty()) {
                 reply_err("the in-engine image encoder needs one GPU's expert cache with a prompt lend region");
@@ -7277,13 +7282,64 @@ int main(int argc, char** argv) {
             PfPart& p = pf_parts[0];
             if (!p.lent.empty()) { reply_err("a prompt's loan is still out"); return; }
             const int64_t k = cache_slots_for(*p.cache, vis_enc.arena_bytes(tokens));
-            int64_t room = p.cache->slots() - p.first;
-            if (batch_on()) room = std::min<int64_t>(room, kLendCapDecoding);
+            // the room: the cache's tail down to the first slot whose expert has no RAM copy to refill it from (never
+            // less than the prompt path's loan region, which always has one)
+            auto lendable = [&]() -> int64_t {
+                std::vector<uint8_t> in_ram;
+                if (srcp == &src && src.complement_ready()) {
+                    in_ram.resize(host_res.size());
+                    for (size_t i = 0; i < host_res.size(); ++i)
+                        in_ram[i] = src.resident_blob((int64_t) i / g.n_expert, (int64_t) i % g.n_expert) != nullptr;
+                }
+                const int64_t floor = basalt::program::image_lend_floor(host_res, in_ram, p.cache->slots());
+                int64_t r = p.cache->slots() - std::min<int64_t>(floor, p.first);
+                if (batch_on()) r = std::min<int64_t>(r, kLendCapDecoding);
+                return r;
+            };
+            int64_t room = lendable();
+            // short of room: the elastic KV gives back the cells no session holds (idle slots first), and the cache
+            // maps that VRAM again; the sessions take cells back on demand after the encode
+            int64_t kv_given = 0;
+            if (k > room && kv_floor > 0) {
+                std::vector<basalt::core::SessionState*> sess;
+                std::vector<basalt::program::KvHold> holds;
+                constexpr int64_t kWindowCells = 2 * basalt::kernels::kVerifyMaxT + 64;
+                auto add = [&](basalt::core::SessionState& s, int64_t keep, bool active) {
+                    for (size_t i = 0; i < sess.size(); ++i)
+                        if (sess[i] == &s) {
+                            holds[i].keep = std::max(holds[i].keep, keep);
+                            holds[i].active = holds[i].active || active;
+                            return;
+                        }
+                    sess.push_back(&s);
+                    holds.push_back({basalt::core::session_kv_cells(s), keep, active});
+                };
+                add(ss, (int64_t) live.size(), false);
+                for (size_t b = 0; !bslot_ss.empty() && b < bslot_ss[0].size() && b < bs.size(); ++b) {
+                    const BSlot& sb = bs[b];
+                    add(*bslot_ss[0][b], std::max<int64_t>((int64_t) sb.ids.size(), sb.active ? sb.p + kWindowCells : 0),
+                        sb.active);
+                }
+                for (const auto& [i, keep] : basalt::program::kv_giveback_order(holds, kv_floor)) {
+                    if (holds[(size_t) i].backed < 0) continue;
+                    if (!kv_release(*sess[(size_t) i], keep, e)) { reply_err(e); return; }
+                    kv_given += holds[(size_t) i].backed - basalt::core::session_kv_cells(*sess[(size_t) i]);
+                    room = lendable();
+                    if (k <= room) break;
+                }
+            }
             if (k <= 0 || k > room) {
+                basalt::log::warn("basalt serve", "image encoder: refused, %lld cache slots needed, %lld lendable "
+                                     "(cache %lld slots, %lld KV cells given back, the rest held by the sessions)",
+                             (long long) k, (long long) room, (long long) p.cache->slots(), (long long) kv_given);
                 reply_err("the image needs " + std::to_string((long long) k) + " expert-cache slots and " +
-                          std::to_string((long long) room) + " can be lent");
+                          std::to_string((long long) room) + " can be lent" +
+                          (kv_floor > 0 ? ", with every spare KV cell given back" : ""), true);
                 return;
             }
+            if (kv_given > 0)
+                basalt::log::info("basalt serve", "image encoder: %lld KV cells given back for %lld cache slots",
+                             (long long) kv_given, (long long) k);
             const int32_t first = (int32_t) (p.cache->slots() - k);
             for (int64_t l = p.lb; l < p.le; ++l)
                 for (int64_t ex = 0; ex < g.n_expert; ++ex) {
@@ -7323,13 +7379,17 @@ int main(int argc, char** argv) {
                 const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
                 const int64_t nb = (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                 if (b == nullptr || !p.cache->fill_slot_queued(slot, b, e, nb)) {
-                    std::printf("ENC ERR refilling the expert cache failed: %s\n", e.c_str());
-                    std::fflush(stdout);
+                    basalt::log::error("basalt serve", "image encoder: refilling the expert cache failed: %s", e.c_str());
+                    reply_err("refilling the expert cache failed: " + e, true);
                     return;
                 }
                 host_res[(size_t) i] = slot;
             }
-            if (!p.cache->sync_queued(e)) { std::printf("ENC ERR refilling the expert cache failed: %s\n", e.c_str()); std::fflush(stdout); return; }
+            if (!p.cache->sync_queued(e)) {
+                basalt::log::error("basalt serve", "image encoder: refilling the expert cache failed: %s", e.c_str());
+                reply_err("refilling the expert cache failed: " + e, true);
+                return;
+            }
             const int64_t n_lent = (int64_t) p.lent.size();
             p.lent.clear();
             p.lent_chunk = 0;
