@@ -273,6 +273,24 @@ int main() {
             CHECK(pr.cuts[1] - pr.cuts[0] < 48 - pr.cuts[1]);
         }
     }
+    // the draft layer's rows a split read holds back: two chunks in place, more past the chunk in both buffers
+    {
+        auto room = [](size_t n, int64_t chunk, int64_t hand) {
+            return prompt_split_draft_room(std::vector<int64_t>(n, chunk), chunk, hand);
+        };
+        CHECK(room(2, 16384, 16384) == 16384);
+        CHECK(room(3, 16384, 16384) == 32768);
+        CHECK(room(4, 16384, 16384) == 32768);
+        // a deep part: smaller chunks than the buffers were made for leave the rest of both buffers
+        std::vector<int64_t> deep(17, 14848);
+        deep.front() = 16384;
+        deep.back() = 9000;
+        CHECK(prompt_split_draft_room(deep, 14848, 27392) == 2 * 14848 + 2 * (27392 - 14848));
+        CHECK(prompt_split_draft_room(deep, 14848, 27392) >= 32832);
+        CHECK(2 * 14848 < 32832);   // the window the two chunks before the kept one alone could not hold
+        CHECK(room(4, 4096, 16128) == 2 * 4096 + 2 * (16128 - 4096));
+        CHECK(room(2, 4096, 2048) == 4096);
+    }
     if (g_fail) { std::printf("multi_gpu_plan_test: %d failures\n", g_fail); return 1; }
     std::printf("multi_gpu_plan_test: ok\n");
     return 0;

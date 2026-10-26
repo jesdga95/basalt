@@ -4862,6 +4862,7 @@ int main(int argc, char** argv) {
     // a part [a0, b0) of a prompt ending at `prompt_end` over up to `max_stages` stages, each stage with its weights'
     // layers [lo, hi) and image bytes: both prices, and the split's chunk and head chunk
     struct SplitPricing { basalt::program::PsPrice price; int64_t chunk = 0, head = 0; std::string why; };
+    int64_t split_hand_rows = 0;   // the rows each hand-off buffer holds (0 before they exist: a chunk's)
     auto split_price = [&](int64_t a0, int64_t b0, int64_t prompt_end, int max_stages) -> SplitPricing {
         SplitPricing sp0;
         const int64_t n_tok = b0 - a0;
@@ -4875,17 +4876,6 @@ int main(int argc, char** argv) {
             sp0.why = why;
             return sp0;
         }
-        if (2 * chunk < draft_window) {
-            if (draft_window >= INT64_MAX / 4)
-                std::snprintf(why, sizeof why, "the draft layer attends to every cell");
-            else
-                std::snprintf(why, sizeof why, "chunks of %lld tokens: two do not cover the draft layer's %lld-cell window",
-                              (long long) chunk, (long long) draft_window);
-            sp0.why = why;
-            return sp0;
-        }
-        sp0.chunk = chunk;
-        sp0.head = head;
         basalt::program::PsPart part;
         part.cell0 = a0;
         part.tier_chunks = chunk_list(n_tok, chunk, head);
@@ -4893,6 +4883,22 @@ int main(int argc, char** argv) {
         part.row_bytes = (uint64_t) (g.hc * g.n_embd) * sizeof(float);
         const int64_t c_last = b0 - part.split_chunks.back();
         part.draft_rows = draft_window > 0 ? std::max<int64_t>(0, c_last - std::max(a0, prompt_end - draft_window)) : 0;
+        // the draft layer's rows before the kept chunk come back in the hand-off buffers: the last two chunks handed on
+        // in place, earlier ones past `chunk` rows in either buffer (see read_split)
+        const int64_t kept_rows =
+            basalt::program::prompt_split_draft_room(part.split_chunks, chunk, std::max(split_hand_rows, chunk));
+        if (part.draft_rows > kept_rows) {
+            if (draft_window >= INT64_MAX / 4)
+                std::snprintf(why, sizeof why, "the draft layer attends to every cell");
+            else
+                std::snprintf(why, sizeof why, "chunks of %lld tokens: the draft layer's window needs %lld rows back, the "
+                              "hand-off buffers hold %lld", (long long) chunk, (long long) part.draft_rows,
+                              (long long) kept_rows);
+            sp0.why = why;
+            return sp0;
+        }
+        sp0.chunk = chunk;
+        sp0.head = head;
         part.host_gbps = split_host_gbps;
         std::vector<basalt::program::PsCard> peers;
         for (const auto& st : pstages) {
@@ -5457,6 +5463,7 @@ int main(int argc, char** argv) {
             }
         }
         // the main card hands its chunks on through two pinned buffers of the stage's chunk
+        if (split_ready) split_hand_rows = split_chunk_max;
         if (split_ready && !sp.reserve_hand_off(split_chunk_max, err)) {
             basalt::log::warn("basalt serve", "prompt split: off (%s)", err.c_str());
             err.clear();
@@ -9198,6 +9205,21 @@ int main(int argc, char** argv) {
                 // the final rows of the last stage's chunks the draft layer reads, in the hand-off buffers they came in
                 struct Relay { int64_t cell0, n; const float* rows; };
                 std::vector<Relay> relays;
+                // those of the last two chunks handed on stay where they came in; an earlier chunk's go past `chunk` rows
+                // in the card before's two hand-off buffers, which no chunk of this read writes
+                int64_t in_place_from = a0;
+                {
+                    const std::vector<int64_t> cl = chunk_list(n_tok, chunk, head);
+                    int64_t at = a0;
+                    for (size_t i = 0; i + 1 < cl.size(); ++i) {
+                        if (i + 3 == cl.size()) in_place_from = at;
+                        at += cl[i];
+                    }
+                }
+                const basalt::prefill::Prefill& before_last = run.size() >= 2 ? run[run.size() - 2]->sp : sp;
+                const int64_t aside_rows = std::max<int64_t>(0, before_last.hand_rows() - chunk);
+                int aside_buf = 0;
+                int64_t aside_at = 0;
                 std::mutex relay_mu;
                 // mid-prompt checkpoints at the positions one card takes them: the main card saves its state when it
                 // hands such a chunk on, each stage puts its layers' state in once it has read that chunk, the last one
@@ -9261,7 +9283,29 @@ int main(int argc, char** argv) {
                 last.sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& ce) -> bool {
                     const int64_t HCN = g.hc * g.n_embd;
                     const int64_t r0 = std::max<int64_t>(0, first_cell - p0);
-                    if (r0 < T) {
+                    for (int64_t r = r0; r < T && p0 < in_place_from;) {
+                        if (aside_at >= aside_rows) {
+                            if (++aside_buf > 1) {
+                                ce = "prompt split: the draft layer's rows do not fit the hand-off buffers";
+                                return false;
+                            }
+                            aside_at = 0;
+                            continue;
+                        }
+                        float* h = before_last.hand_buffer(aside_buf);
+                        const int64_t nr = std::min(aside_rows - aside_at, T - r);
+                        float* dst = h == nullptr ? nullptr : h + (size_t) (chunk + aside_at) * HCN;
+                        if (dst == nullptr || cudaMemcpy(dst, R_rows + (size_t) r * HCN, (size_t) nr * HCN * sizeof(float),
+                                                         cudaMemcpyDeviceToHost) != cudaSuccess) {
+                            ce = "prompt split: reading the draft layer's rows back failed";
+                            return false;
+                        }
+                        std::lock_guard<std::mutex> lk(relay_mu);
+                        relays.push_back({p0 + r, nr, dst});
+                        aside_at += nr;
+                        r += nr;
+                    }
+                    if (r0 < T && p0 >= in_place_from) {
                         float* h = const_cast<float*>(last.sp.hand_in());
                         if (h == nullptr || cudaMemcpy(h + (size_t) r0 * HCN, R_rows + (size_t) r0 * HCN,
                                                        (size_t) (T - r0) * HCN * sizeof(float),

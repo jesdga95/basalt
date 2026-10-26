@@ -306,4 +306,10 @@ std::vector<std::pair<int, int>> prompt_split_windows(const PsPrice& ref, size_t
     return w;
 }
 
+int64_t prompt_split_draft_room(const std::vector<int64_t>& chunks, int64_t chunk, int64_t hand_rows) {
+    int64_t room = 2 * std::max<int64_t>(0, hand_rows - chunk);
+    for (size_t i = chunks.size() >= 3 ? chunks.size() - 3 : 0; i + 1 < chunks.size(); ++i) room += chunks[i];
+    return room;
+}
+
 }  // namespace basalt::program

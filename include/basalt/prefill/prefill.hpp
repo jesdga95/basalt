@@ -200,6 +200,10 @@ public:
     void continue_in_place() { rows_in_place_ = true; hand_in_ = nullptr; }
     /// A later stage: the hand-off buffer it read its last chunk from (pinned host, the stage before's), or null.
     const float* hand_in() const { return hand_in_; }
+    /// A stage that hands chunks on: its hand-off buffer `b` (0 or 1, pinned host, null before any), and the rows of
+    /// the full residual width each holds.  A run writes a chunk's rows at the start of one of them.
+    float* hand_buffer(int b) const;
+    int64_t hand_rows() const;
 
 
 private:

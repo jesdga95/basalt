@@ -2922,6 +2922,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     return true;
 }
 
+float* Prefill::hand_buffer(int b) const { return b == 0 || b == 1 ? impl_->hand[b] : nullptr; }
+
+int64_t Prefill::hand_rows() const { return impl_->hand[0] != nullptr && impl_->hand[1] != nullptr ? impl_->hand_rows : 0; }
+
 bool Prefill::reserve_hand_off(int64_t rows, std::string& err) {
     Impl& m = *impl_;
     if (m.hand[0] != nullptr && m.hand[1] != nullptr && m.hand_rows >= rows) return true;

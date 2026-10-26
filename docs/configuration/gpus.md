@@ -76,8 +76,11 @@ alone and over every number of stages and every set of cuts, from each card's me
 experts each card holds, and reads it across the cards only when that is at least 5% cheaper. Tier cards join in
 order of memory bandwidth, the fastest reading the last layers. At start each card gets the layers the stage counts
 worth it for a prompt of the context's length (up to 131,072 tokens) give it, plus a few. The start and request lines
-begin with `prompt split:` and print the prices. The chunks are the main card's own, so a part of one chunk (up to
-32,768 tokens) stays on the main card. On three or more cards it runs when they all match (memory bandwidth and VRAM
+begin with `prompt split:` and print the prices; a part longer than one chunk that stays on the main card says why
+(`prompt split: N tokens read on CUDA0 (...)`). The chunks are the main card's own, so a part of one chunk (up to
+32,768 tokens) stays on the main card. The draft layer's rows of the prompt's last cells come back from the last card in
+the hand-off buffers (the last two chunks handed on where they came in, earlier ones past the chunk in both), so the
+smaller chunks of a deep prompt, whose KV leaves the main card fewer slots to lend, still split. On three or more cards it runs when they all match (memory bandwidth and VRAM
 within 10%); on three or more unlike cards it is off until measured on such a set, and the start line prints what it
 would cost. Off with `--peer-exclusive`, without the RAM copy of the experts, with KV streaming, a
 control vector, experts other than NVFP4 (the price is fitted to those), when RAM or a tier's slots are short, or when a

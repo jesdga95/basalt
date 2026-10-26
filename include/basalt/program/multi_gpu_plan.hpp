@@ -103,4 +103,9 @@ std::vector<size_t> prompt_split_order(const std::vector<double>& mem_gbps);
 /// card in join order, {0, 0} for a card none of them uses.
 std::vector<std::pair<int, int>> prompt_split_windows(const PsPrice& ref, size_t n_peers, int margin, int layers);
 
+/// The rows of the last card's output a split read can hold for the draft layer before the kept last chunk: the last
+/// two chunks handed on stay in the two hand-off buffers they came in, and earlier ones go past `chunk` rows in either
+/// buffer of `hand_rows` rows, which no chunk writes.  `chunks`: the part's chunk sizes, the kept last one included.
+int64_t prompt_split_draft_room(const std::vector<int64_t>& chunks, int64_t chunk, int64_t hand_rows);
+
 }  // namespace basalt::program
