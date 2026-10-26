@@ -62,18 +62,23 @@ when it prices at least 5% below it. Unlike cards always use the expert tier. Th
 measured windows (a 5090 with a 5060 Ti: tier 7.9 ms, plain layer split 13.4-13.7 ms measured at the cuts
 tried; two 5080s: 147 tok/s reported against 141 priced), good for the choice and not for forecasting a rate.
 
-## Long prompts on two cards
+## Long prompts across the cards
 
-In the expert tier with one tier card and one conversation at a time, a long fresh part of a prompt can be read as a
-pipeline. The main card reads the first layers of each chunk and hands the chunk on; the tier card reads the last layers
-of it while the main card reads the next chunk, then gives its layers' state back and gets its experts back. Its weights,
-prompt state and buffers go into its tier's last slots for the read (its weights from a pinned RAM copy made at start), so
-outside a prompt the tier holds what it held before and decode does not change. The engine prices each part both ways
+In the expert tier with one conversation at a time, a long fresh part of a prompt can be read as a pipeline over the main
+card and the tier cards. The main card reads the first layers of each chunk and hands the chunk on; each tier card reads
+the next block of layers of it while the cards before it read the next chunks, the last one ending at the last layer. The
+main card reads the last chunk's later layers itself once the tier cards have given their layers' state back and got
+their experts back. A tier card's weights, prompt state and buffers go into its tier's last slots for the read (its
+weights from a pinned RAM copy made at start), so outside a prompt the tiers hold what they held before and decode does
+not change. The engine prices each part on the main card alone and over every number of stages and every set of cuts,
 from each card's memory bandwidth, the probed link rates and the experts each card holds, and reads it across the cards
-only when that is at least 5% cheaper; the start and request lines begin with `prompt split:`. The chunks are the main
-card's own, so a part of one chunk (up to 32,768 tokens) stays on the main card. Off with `--peer-exclusive`, without the
-RAM copy of the experts, with KV streaming, a control vector, `--parallel`, experts other than NVFP4 (the price is fitted
-to those), or when RAM or the tier's slots are short.
+only when that is at least 5% cheaper. Tier cards join in order of memory bandwidth, the fastest reading the last layers.
+At start each card gets the layers the stage counts worth it for a prompt of the context's length (up to 131,072 tokens)
+give it, plus a few. The start and request lines begin with `prompt split:` and print the prices. The chunks are the
+main card's own, so a part of one chunk (up to 32,768 tokens) stays on the main card. On three or more cards it is off
+until measured on such a set; the start line prints what it would cost. Off with `--peer-exclusive`, without the RAM
+copy of the experts, with KV streaming, a control vector, `--parallel`, experts other than NVFP4 (the price is fitted
+to those), or when RAM or a tier's slots are short.
 
 ## Two 16 GB cards
 
