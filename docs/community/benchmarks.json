@@ -552,6 +552,29 @@
       "prefill_16k_tps": 2686.6,
       "prefill_64k_tps": 2699.1,
       "decode_tps": 91.9
+    },
+    {
+      "submitter": "RTX 5080 - Qwen3.8 Flash Next IQ3_S",
+      "date": "2026-10-26",
+      "commit": "b2fe96bf30",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.9
+        }
+      ],
+      "ram_gib": 60,
+      "cpu": "AMD Ryzen 9 9950X3D, 16 cores",
+      "ram_gbps": 71.1,
+      "os": "Linux",
+      "quant": "IQ3_S",
+      "prefill_16k_tps": 4876.9,
+      "prefill_64k_tps": 4961.0,
+      "decode_tps": 186.8
     }
   ]
 }
