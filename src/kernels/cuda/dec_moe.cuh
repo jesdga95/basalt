@@ -1359,8 +1359,9 @@ __device__ __forceinline__ unsigned int dm_ld(const unsigned int* p) { return *(
 // rows (int8 rows, a prediction only), every token's top k, the predicted experts the peer holds rank by rank (logits,
 // list: the scratch past the counters), then one plain-load pass over those blobs so the next ring's expert reads find
 // them in the L2.  Each part is skipped or cut short once the doorbell is in (kDmWarmGo).  Writes nothing the rings
-// read.  Not inlined: the rings' expert loop keeps its own register allocation.
-__device__ __noinline__ void dm_warm(const DmPeerArgs& a, DmShared& sm, const block_q8_1* xq, int n_tok, int layer,
+// read.  Not inlined: the rings' expert loop keeps its own register allocation.  `a` is taken by value: a reference to
+// the kernel parameter makes ptxas build a local copy that the non-inlined callee reads through an unset base.
+__device__ __noinline__ void dm_warm(DmPeerArgs a, DmShared& sm, const block_q8_1* xq, int n_tok, int layer,
                                      uint32_t next, float* logits, unsigned long long* list, unsigned int ring_arrivals) {
     __shared__ int32_t s_last, s_go;   // block-uniform decisions (go moves while the block reads it)
     __shared__ unsigned int s_n;
