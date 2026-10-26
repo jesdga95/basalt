@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace basalt::kernels {
 
@@ -88,6 +89,10 @@ void native_q4_k_f32(const void* weights, const float* x, void* scratch_q8_1,
 
 void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream);
+/// One column of native_q6_k_mmvq over selected rows: y[r] is weight row rows[r] (>= 0) times x, the same bits as that
+/// row's output of native_q6_k_mmvq.
+void native_q6_k_mmvq_rows(const void* weights, const int32_t* rows, const void* x_q8_1, float* y, int n_in, int n_out,
+                           void* stream);
 
 void native_q6_k_f32(const void* weights, const float* x, void* scratch_q8_1,
                      float* y, int n_in, int n_out, int ncols, void* stream);
