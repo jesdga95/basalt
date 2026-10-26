@@ -219,15 +219,11 @@ $("#tabs").addEventListener("click", e => {
   tab = b.dataset.t; try { sessionStorage.setItem("basalt.tab", tab); } catch (err) { /* private mode */ }
   draw();
 });
-const idleNote = ids => {
-  if (!ids.length) return "";
-  const n = ids.map(i => i + 1), run = n.every((x, i) => !i || x === n[i - 1] + 1);
-  return n.length === 1 ? `Slot ${n[0]} idle` : run ? `Slots ${n[0]} to ${n[n.length - 1]} idle` : `Slots ${n.join(", ")} idle`;
-};
 const accept = s => s.drafts_offered > 20 ? Math.round(s.drafts_accepted / s.drafts_offered * 100) : null;
 const prefixHit = s => num(s.reused) && s.prompt_tokens > 0 ? Math.round(s.reused / s.prompt_tokens * 100) : null;
 const ACC_NOTE = "Accept: drafts accepted over offered, from the slot's last finished request";
-function slotRows(rows, series, idle) {
+// every slot keeps its row: an idle one shows its last figures dimmed, so the grid never changes shape
+function slotRows(rows, series) {
   const dense = rows.length > 4, max = nice(Math.max(20, ...rows.flatMap(s => series[s.id].filter(num))));
   let h = `<div class="sl${dense ? " dense" : ""}"><div class="rw h"><span style="grid-column:1">Slot</span><span class="e" style="grid-column:2">tok/s</span><span class="sk" style="grid-column:3">Last 60 s</span><span class="e" style="grid-column:4">Output tok</span><span class="e cx" style="grid-column:5">Context</span><span class="e" style="grid-column:6" title="${ACC_NOTE}">Accept</span></div>`;
   rows.forEach(s => {
@@ -245,19 +241,7 @@ function slotRows(rows, series, idle) {
         + `<span class="s e cx" style="grid-column:5">${hit != null ? `Hit ${hit}%` : ""}</span>`
         + `<span class="s e" style="grid-column:6">${num(s.draft_len) ? `Draft ${s.draft_len.toFixed(1)}` : ""}</span>`) + `</div>`;
   });
-  return h + `</div>` + (idle.length ? `<div class="sp-foot">${idleNote(idle)}</div>` : "");
-}
-function slotOne(s, a, idle) {
-  const st = busyStats(a), acc = accept(s), hit = prefixHit(s), pre = s.state === "prefill";
-  const max = nice(Math.max(20, ...a.filter(num)));
-  const rate = pre ? (num(s.prefill_done) && s.prompt_tokens ? `${Math.min(100, Math.round(s.prefill_done / s.prompt_tokens * 100))}<small>% read</small>` : "…") : `${fmt(s.tok_s)}<small>tok/s</small>`;
-  return `<div class="one"><div class="top"><div><div class="nm">Slot ${s.id + 1}</div><div class="meta">${esc(API[s.api] || s.api || "")}${s.model ? ` · ${esc(s.model)}` : ""}</div></div><div class="rate">${rate}</div></div>`
-    + `<div class="cap"><span>Last 60 s · tok/s</span><span>${st ? `Min ${Math.round(st.min)} · Avg ${Math.round(st.avg)}` : ""}</span></div>${spark(a, max)}`
-    + `<div class="stats"><div><span class="k">Output tok</span><span class="v">${fmt(s.generated)}${num(s.max_tokens) ? `<span class="u"> / ${fmt(s.max_tokens)}</span>` : ""}</span>${num(s.max_tokens) ? bar(s.generated / s.max_tokens) : ""}</div>`
-    + `<div><span class="k">Context</span><span class="v">${kt(s.ctx_used || 0)}<span class="u"> / ${kt(s.n_ctx || 0)}</span></span>${bar(s.n_ctx ? s.ctx_used / s.n_ctx : 0)}</div>`
-    + `<div title="${ACC_NOTE}"><span class="k">Accept</span><span class="v">${acc != null ? `${acc}<span class="u">%</span>` : "-"}</span>${num(s.draft_len) ? `<span class="s2">Draft ${s.draft_len.toFixed(1)} tok</span>` : ""}</div>`
-    + `<div><span class="k">First token</span><span class="v">${num(s.ttft_s) ? `${s.ttft_s.toFixed(1)}<span class="u"> s</span>` : "-"}</span>${hit != null ? `<span class="s2">Prefix hit ${hit}%</span>` : ""}</div>`
-    + `</div></div>` + (idle.length ? `<div class="sp-foot">${idleNote(idle)}</div>` : "");
+  return h + `</div>`;
 }
 function requestsPane(live, reqs, multi) {
   const rows = [];
@@ -294,9 +278,7 @@ function drawMain(live, hist, reqs, slots, total) {
   let h;
   if (cur === "slots") {
     const series = slots.map((_, k) => tail((hist.slot_tok_s || [])[k]));
-    const busy = slots.filter(s => s.is_processing), idle = slots.filter(s => !s.is_processing).map(s => s.id);
-    h = busy.length === 1 ? slotOne(busy[0], series[busy[0].id], idle)
-      : slotRows(busy.length ? busy : slots, series, busy.length ? idle : []);
+    h = slotRows(slots, series);
   } else h = cur === "req" ? requestsPane(live, reqs, multi) : queuePane(live);
   html($("#pane"), h);
 }

@@ -181,6 +181,7 @@ tr.live td { color: var(--accent); }
 .rw .p.nm { font-family: var(--font-sans); }
 .rw .p.nm .u { font: 400 12px/1 var(--font-mono); }
 .rw .p.rate { color: var(--accent); }
+.rw.idle .p { color: var(--fg-2); }
 .rw.idle .p.rate, .rw.idle .p.nm { color: var(--fg-3); }
 .rw .s { grid-row: 3; margin-top: 14px; font: 400 11.5px/1 var(--font-mono); color: var(--fg-3); }
 .rw .p .bar4 { position: absolute; left: 0; right: 0; top: calc(100% + 5px); height: 3px; }
@@ -188,23 +189,6 @@ tr.live td { color: var(--accent); }
 .spark { position: relative; min-height: 0; }
 .rw .spark { grid-column: 3; grid-row: 1 / -1; align-self: stretch; margin: 12px 0; }
 .sl.dense .rw .spark { margin: 7px 0; }
-.sp-foot { flex: none; padding: 10px 20px; border-top: 1px solid var(--line-soft); font: 400 12px/1 var(--font-mono); color: var(--fg-3); white-space: nowrap; }
-/* One busy slot: a roomy card */
-.one { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
-.one .top { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; padding: 18px 20px 0; }
-.one .nm { font: 600 15px/1 var(--font-sans); }
-.one .meta { margin-top: 8px; font: 400 12.5px/1 var(--font-mono); color: var(--fg-3); white-space: nowrap; }
-.one .rate { font: 500 40px/1 var(--font-mono); font-variant-numeric: tabular-nums; color: var(--accent); letter-spacing: -.02em; white-space: nowrap; }
-.one .rate small { font-size: 14px; color: var(--fg-3); font-weight: 400; margin-left: 6px; letter-spacing: 0; }
-.one .cap { display: flex; justify-content: space-between; padding: 16px 20px 8px; font: 400 11.5px/1 var(--font-mono); color: var(--fg-3); white-space: nowrap; }
-.one .spark { flex: 1 1 auto; margin: 0 20px 18px; min-height: 40px; }
-.one .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--line-soft); flex: none; }
-.one .stats > div { padding: 14px 20px 16px; display: flex; flex-direction: column; gap: 8px; min-width: 0; white-space: nowrap; }
-.one .stats > div + div { border-left: 1px solid var(--line-soft); }
-.one .k { font: 400 12.5px/1 var(--font-sans); color: var(--fg-3); }
-.one .v { font: 500 15px/1 var(--font-mono); font-variant-numeric: tabular-nums; }
-.one .v .u { font-size: 12.5px; }
-.one .s2 { font: 400 11.5px/1 var(--font-mono); color: var(--fg-3); }
 
 /* Logs: wrapped, continuation lines indented past the time */
 .logs { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 12px 20px; font: 12.5px/1.8 var(--font-mono); color: var(--fg-2); white-space: pre-wrap; overflow-x: hidden; }
@@ -243,10 +227,6 @@ tr.live td { color: var(--accent); }
   .rw { flex: none; min-height: 72px; }
   .sl.dense .rw { min-height: 42px; }
   .sl .rw.h { min-height: 0; }
-  .one .spark { min-height: 80px; flex: none; }
-  .one .stats { grid-template-columns: 1fr 1fr; }
-  .one .stats > div:nth-child(3) { border-left: 0; }
-  .one .stats > div:nth-child(n+3) { border-top: 1px solid var(--line-soft); }
   .logs { height: 280px; flex: none; }
   .sb-gpu, .sb-agg, .sb-met.grow { flex: none; }
   .sb-ch { flex: none; height: 56px; }
