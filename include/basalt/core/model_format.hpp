@@ -14,6 +14,8 @@
 //                            (`gguf_kv`), the type, shape, size and offset in `gguf` of every source tensor (`tensors`), the engine's
 //                            default sampling (`sampling`), provenance (source
 //                            files, sizes, sha256, converter version) and the license / attribution text
+//                            `kind` defaults to "model"; "adapter" instead carries the versioned `adapter`
+//                            manifest described in model_adapter.hpp and docs/model-file.md
 //   tokenizer/<file>         the tokenizer directory's files (tokenizer.json, vocab.json, merges.txt,
 //                            token_type.json, chat_template.jinja)
 //   dense                    the dense weight pool
@@ -29,6 +31,8 @@
 //   hc8                      the 8-bit copies of the hyper-connection matrices, as `basalt --dump-hc8` writes them
 //   vision/mmproj            the vision projector GGUF, whole
 //   vision/<name>            anything else the vision sidecar reads
+//   adapter/data             raw replacement tensor blocks; the adapter manifest gives their target, type,
+//                            shape and kTensorAlign-aligned offset relative to this section
 #include <cstdint>
 
 namespace basalt::core {

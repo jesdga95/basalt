@@ -105,6 +105,22 @@ int main() {
         check(!bad.open(trunc, e2) && e2.find("truncated") != std::string::npos, "a truncated file is refused: " + e2);
         std::ofstream(d.path / "n.basalt") << std::string(70000, 'x');
         check(!bad.open((d.path / "n.basalt").string(), e2), "a file without the magic is refused");
+        check(!bad.open(write_model(d.path / "duplicate.basalt", {{"meta", meta}, {"meta", meta}}), e2),
+              "duplicate section names cannot shadow metadata");
+        check(!bad.open(write_model(d.path / "empty-name.basalt", {{"", meta}}), e2),
+              "empty section names are refused");
+        const std::string overlap = write_model(d.path / "overlap.basalt", {{"meta", meta}, {"gguf", gg}});
+        {
+            std::fstream file(overlap, std::ios::in | std::ios::out | std::ios::binary);
+            SectionEntry second{};
+            const auto at = static_cast<std::streamoff>(sizeof(FileHeader) + sizeof(SectionEntry));
+            file.seekg(at);
+            file.read(reinterpret_cast<char*>(&second), sizeof second);
+            second.offset = kSectionAlign;
+            file.seekp(at);
+            file.write(reinterpret_cast<const char*>(&second), sizeof second);
+        }
+        check(!bad.open(overlap, e2), "overlapping section ranges are refused");
     }
 
     std::printf("2. meta and the GGUF view\n");
@@ -125,6 +141,19 @@ int main() {
                   g.shard(0).tensor_data(*t)[0] == (uint8_t) 200,
               "a tensor is at the section offset + its own, and its bytes are in the mapping");
         check(g.in_bounds(*t, 0), "in_bounds");
+    }
+    {
+        ModelFile adapter;
+        const std::string adapter_path = write_model(d.path / "adapter.basalt",
+            {{"meta", "{\"kind\":\"adapter\"," + meta.substr(1)}, {"gguf", gg}});
+        check(adapter.open(adapter_path, err) && adapter.load_meta(err) && !adapter.register_gguf_view(err),
+              "adapter metadata cannot register a model view even when it includes model fields");
+        ModelFile exact;
+        const std::string exact_path = write_model(d.path / "integer.basalt",
+            {{"meta", R"({"limit":18446744073709551615})"}});
+        check(exact.open(exact_path, err) && exact.load_meta(err) &&
+                  exact.meta().get("limit")->u64() == 18446744073709551615ull,
+              "metadata preserves the full unsigned 64-bit integer range");
     }
 
     std::printf("3. the expert layout text and the hc8 table\n");

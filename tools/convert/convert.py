@@ -193,7 +193,9 @@ def convert(a) -> None:
         if a.mtp_source or a.mtp_dense or a.draft_vocab or a.profile or a.profile_from or a.hc8 or a.mmproj or a.no_vision:
             die("--sections-from supplies the drafter, profile, hc8 and vision sections; do not combine it with "
                 "--mtp-source, --mtp-dense, --draft-vocab, --profile, --profile-from, --hc8, --mmproj or --no-vision")
-        base_meta = json.loads(base.read("meta"))
+        base_meta = base.load_meta()
+        if base_meta.get("kind", "model") != "model":
+            die("--sections-from requires a model, not an adapter")
     mmproj = Path(a.mmproj) if a.mmproj else None
     side = [Path(x) for x in (a.hc8, a.draft_vocab, a.profile, a.mtp_dense) if x] + [Path(t) for t in (a.profile_from or [])]
     if not a.no_vision and base is None:
@@ -378,7 +380,9 @@ def from_checkpoint(a) -> None:
     if not src.is_file():
         die(f"missing input: {src}")
     base = ModelFile(str(src))
-    base_meta = json.loads(base.read("meta"))
+    base_meta = base.load_meta()
+    if base_meta.get("kind", "model") != "model":
+        die("--sections-from requires a model, not an adapter")
     q6k = not a.dense_q8_0
     try:
         ck = C.Checkpoint(a.checkpoint)
@@ -511,7 +515,9 @@ def requant_dense(a) -> None:
     if a.checkpoint and not Path(a.checkpoint).is_dir():
         die(f"missing input: {a.checkpoint}")
     base = ModelFile(str(src))
-    meta = json.loads(base.read("meta"))
+    meta = base.load_meta()
+    if meta.get("kind", "model") != "model":
+        die("--requant-dense-q6k requires a model, not an adapter")
     gguf_off, _ = base.section("gguf")
     tensors = meta["tensors"]
     try:

@@ -1,7 +1,6 @@
 """Engine settings, tokenizer and vision inputs for a .basalt model file, unpacked once into the cache directory."""
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import sys
@@ -102,7 +101,9 @@ def model_config(path: str, engine_bin: str, vision: bool | str = False,
     later flag win), `vision` (a GPU number as a string, or "cpu") adds the sidecar and "dynamic" the in-engine
     encoder (ValueError if it cannot be set up)."""
     mf = ModelFile(path)
-    meta = json.loads(mf.read("meta"))
+    meta = mf.load_meta()
+    if meta.get("kind", "model") != "model":
+        raise ValueError(f"{path}: artifact kind {meta.get('kind')!r} is not a model")
     path = os.path.abspath(path)
     cdir = cache_dir(mf)
     words = with_conversation_dir(list(engine_words or []), cdir)

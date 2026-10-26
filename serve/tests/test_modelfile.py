@@ -96,6 +96,12 @@ class Derivation(Tmp):
         with self.assertRaises(ValueError):
             modelfile.model_config(str(self.dir / "junk"), str(self.engine_bin))
 
+    def test_adapter_is_not_a_standalone_model(self):
+        path = self.build(meta={**META, "kind": "adapter"})
+        with self.assertRaisesRegex(ValueError, "not a model"):
+            modelfile.model_config(path, str(self.engine_bin))
+        self.assertFalse((self.dir / "cache").exists())
+
 
 class Peer(Tmp):
     def test_no_gpu_flag_is_added(self):
