@@ -80,9 +80,13 @@ class BenchFlags(unittest.TestCase):
 
     def test_built_ins_are_minimal(self):
         cmd = self.command()
-        self.assertEqual(cmd[cmd.index("--spec") + 1], "0")
+        self.assertNotIn("--spec", cmd)
         self.assertNotIn("--kv", cmd)
         self.assertNotIn("--resident-experts", cmd)
+
+    def test_spec_zero_is_passed_when_given(self):
+        cmd = self.command("--spec", "0")
+        self.assertEqual(cmd[cmd.index("--spec") + 1], "0")
 
     def test_community_keeps_the_engine_defaults(self):
         cmd = self.command_community()
