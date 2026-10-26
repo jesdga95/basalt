@@ -10,7 +10,10 @@
 // never be running once a batch or idle_stop has returned.  The active worker count changes at random between batches.  A watchdog thread turns a hang into a failure instead of a
 // frozen test.
 //
-//   pool_stress [seconds]        (default 20)
+//   pool_stress [seconds] [workers]   (default 20 s, one worker per physical core but the host's)
+//
+// More workers than cores makes the OS deschedule workers in the middle of a batch, the case the claim protocol must
+// survive without any wait for the workers to park.
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
@@ -32,6 +35,7 @@ namespace cpu = basalt::kernels::cpu;
 
 int main(int argc, char** argv) {
     const double seconds = argc > 1 ? std::atof(argv[1]) : 20.0;
+    const int workers = argc > 2 ? std::atoi(argv[2]) : (int) cpu::physical_cores(true).size();
     const cpu::CpuFeatures feat = cpu::cpu_features();
     const bool native = !feat.usable();
     if (native && !cpu::cpu_avx2_ok()) {
@@ -94,7 +98,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    cpu::ExpertPool pool((std::max)(1, (int) cpu::physical_cores(true).size()));
+    cpu::ExpertPool pool((std::max)(1, workers));
     std::printf("pool_stress: %d workers + host, %.0f s, %s\n", pool.workers(), seconds,
                 native ? "run_split_multi_native" : "run and run_split");
     if (native) pool.run_split_multi_native(fmt, mjobs.data(), NJ);
