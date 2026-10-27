@@ -253,12 +253,14 @@ void warm_select(CpuWarm& c) {
             score[e] += w[j] / sum;
         }
     }
-    for (int r = 0; r < CpuWarm::kPicks; ++r) {
+    // an expert without a RAM copy is passed over, so it does not end the read before the next likeliest
+    for (int r = 0; r < CpuWarm::kPicks;) {
         int best = -1;
         for (int e = 0; e < NE; ++e)
             if (score[e] > 0.0f && (best < 0 || score[e] > score[best])) best = e;
-        c.blob[r] = best >= 0 ? c.src->resident_blob(c.layer, best) : nullptr;
-        if (best >= 0) score[best] = 0.0f;
+        if (best < 0) break;
+        score[best] = 0.0f;
+        if (const uint8_t* b = c.src->resident_blob(c.layer, best)) c.blob[r++] = b;
     }
 }
 
