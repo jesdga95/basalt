@@ -19,8 +19,10 @@ expert tier`:
 
 - **Expert tier.** Each card after the main one holds experts the main card does not, computes their rows in every
   decode window and follows the conversation like the main card's cache does. The experts are dealt out hottest first,
-  each to the tier with the least work so far for its memory bandwidth, until every tier is full. Every tier computes
-  its experts with the main card's kernels, so where an expert sits does not change its rows. The second card also
+  each to the tier with the least work so far for its memory bandwidth, until every tier is full. On two cards a second
+  card at least as fast as the main one also takes a share of the hottest experts, so both compute routed experts in
+  every layer; a slower second card takes the experts after the main card's. Every tier computes its experts with the
+  main card's kernels, so where an expert sits does not change its rows. The second card also
   computes its experts' share of each prompt chunk: of any chunk when it is as fast as the main card, of chunks up to
   2,559 rows when it is slower (a slower card costs a longer chunk more than the experts it saves the main card's link).
   When its memory is faster than the main card's it takes a share of each GDN mixer and of the head (one start line

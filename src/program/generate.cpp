@@ -2015,11 +2015,16 @@ int main(int argc, char** argv) {
         // An explicit number truncates the ranked list ("what would 2,000 slots give" without rebuilding the file).
         // `--expert-cache 0` means auto: the profile ranks every pair.
         if (o.expert_cache == 0) o.expert_cache = -1;
-        // Multi-GPU: the peer card gets a share f (0.45) of the HOT pairs, so both cards compute routed experts every
-        // layer.  Of the first 8700 ranks (about the primary's slots), every pair with floor((r+1)f) > floor(rf) moves
-        // to just after that point: the primary fills past them, the peer (which takes what the primary does not hold,
-        // in order) gets them first.
-        if (o.peer_device >= 1) {   // the peer's share of the hot pairs
+        // Multi-GPU: a peer card as fast as the main one gets a share f (0.45) of the HOT pairs, so both cards compute
+        // routed experts every layer.  Of the first 8700 ranks (about the primary's slots), every pair with
+        // floor((r+1)f) > floor(rf) moves to just after that point: the primary fills past them, the peer (which takes
+        // what the primary does not hold, in order) gets them first.  A slower peer card takes the pairs after the
+        // primary's: its fixed hand-off plus a hot expert's entries at its bandwidth end the layer after the primary.
+        const bool slow_peer = chosen_cards.size() == 2 && chosen_cards[0].mem_gbps > 0 && chosen_cards[1].mem_gbps > 0 &&
+                               chosen_cards[1].mem_gbps < 0.9 * chosen_cards[0].mem_gbps;
+        if (o.peer_device >= 1 && slow_peer)
+            basalt::log::info("basalt generate", "peer hot share 0: the peer card's memory is slower than the main card's");
+        if (o.peer_device >= 1 && !slow_peer) {   // the peer's share of the hot pairs
             const double f = 0.45;
             const size_t at = std::min(profile.size(), (size_t) 8700);
             if (f > 0.0 && f < 1.0 && at > 0) {
