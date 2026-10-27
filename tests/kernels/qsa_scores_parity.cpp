@@ -183,6 +183,21 @@ int main(int argc, char** argv) {
                                           [&] { k::qsa_block_scores_seg(tab, d_q, d_steps, nq, MAXB, S_, d_a, st, true); });
                 std::printf("bench segment scores keys %-5s: %7.2f us/call\n", cold ? "cold" : "warm", us);
             }
+            for (int64_t ctx : {40960, 131072}) {   // the same 6 rows on 2 slots at the serving depths
+                for (int i = 0; i < nq; ++i) {
+                    const int64_t n = ctx - 1 - i % 3;
+                    steps[i * k::kStepCount + k::kStepNKv] = (int32_t) n;
+                    steps[i * k::kStepCount + k::kStepNBid] = (int32_t) (n / R);
+                    steps[i * k::kStepCount + k::kStepWidth] = (int) k::qsa_selection_width(n, S_);
+                }
+                up(d_steps, steps);
+                for (int cold = 0; cold < 2; ++cold) {
+                    const double us = time_us(st, iters, cold ? flush : nullptr, flush_n,
+                                              [&] { k::qsa_block_scores_seg(tab, d_q, d_steps, nq, MAXB, S_, d_a, st, true); });
+                    std::printf("bench segment scores 6 rows on 2 slots, %6lld cells, keys %-5s: %7.2f us/call\n",
+                                (long long) ctx, cold ? "cold" : "warm", us);
+                }
+            }
         }
     }
 
@@ -264,7 +279,7 @@ int main(int argc, char** argv) {
             std::printf("bench top-k nq=%d: %7.2f us/call\n", nq, us);
         }
     }
-    {   // microbench at the serving depths: 3 and 8 rows, the keys of 40K and 131K contexts, warm and flushed
+    {   // microbench at the serving depths: 3 to 8 rows, the keys of 40K and 131K contexts, warm and flushed
         const int64_t mb = 131072 / R + 1;
         std::vector<float> kh((size_t) mb * ID);
         for (auto& x : kh) x = nd(rng);

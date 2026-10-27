@@ -1028,9 +1028,12 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         else if (nq <= 4)
             launch_pdl(block_scores_rg_kernel<4>, g, dim3(SCORE_WARPS * 32), 0, (cudaStream_t) stream, pooled, dead, q_idx,
                        steps, (int) nq, max_blocks, scores, skip_identity ? 1 : 0);
-        else   // two rows of four queries side by side, one CTA of each per multiprocessor: the keys are read once
-            launch_pdl(block_scores_rg_kernel<4>, dim3(g.x / 2, 2), dim3(SCORE_WARPS * 32), 0, (cudaStream_t) stream, pooled,
-                       dead, q_idx, steps, (int) nq, max_blocks, scores, skip_identity ? 1 : 0);
+        else {   // rows of four queries side by side, the grid's CTAs split between them; a later row's key reads
+                 // mostly hit L2
+            const unsigned rows = (unsigned) ((nq + 3) / 4);
+            launch_pdl(block_scores_rg_kernel<4>, dim3(g.x / rows > 0 ? g.x / rows : 1u, rows), dim3(SCORE_WARPS * 32), 0,
+                       (cudaStream_t) stream, pooled, dead, q_idx, steps, (int) nq, max_blocks, scores, skip_identity ? 1 : 0);
+        }
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) { basalt::log::error("basalt", "qsa_block_scores rg: %s", cudaGetErrorString(e)); std::exit(1); }
         return;
