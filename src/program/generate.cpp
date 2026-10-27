@@ -4391,28 +4391,11 @@ int main(int argc, char** argv) {
     // the first chunk waits for its PLE rows before layer 1 with nothing to overlap, so a short one shrinks that wait.
     // The chunk, and the head chunk (0: none).
     auto one_card_chunks = [&](int64_t tokens, int64_t cap, bool head_ok) -> std::pair<int64_t, int64_t> {
-        int64_t want = request_chunk(tokens, cap);
-        if (want > 0 && tokens > cap) {
-            const int64_t parts = (tokens + cap - 1) / cap;
-            want = request_chunk((tokens + parts - 1) / parts, cap);
-        }
-        int64_t head = 0;
-        if (head_ok && o.prefill_auto_fit && tokens > cap && tokens >= 2 * kHeadChunk && cap > kHeadChunk) {
-            const int64_t rem = tokens - kHeadChunk, parts = (rem + cap - 1) / cap;
-            want = request_chunk((rem + parts - 1) / parts, cap);
-            head = kHeadChunk;
-        }
-        return {want, head};
+        return basalt::program::prompt_one_card_chunks(tokens, cap, head_ok && o.prefill_auto_fit, kHeadChunk);
     };
-    // the sizes of a part's chunks
+    // the sizes of a part's chunks, as the prompt path reads them
     auto chunk_list = [](int64_t tokens, int64_t chunk, int64_t head) {
-        std::vector<int64_t> v;
-        for (int64_t at = 0; chunk > 0 && at < tokens;) {
-            const int64_t T = std::min(at == 0 && head > 0 ? head : chunk, tokens - at);
-            v.push_back(T);
-            at += T;
-        }
-        return v;
+        return basalt::program::prompt_chunk_list(tokens, chunk, head);
     };
     int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
     if (o.prefill_auto_fit && !o.resident_cpu_experts) auto_ceiling = 8192;
@@ -9228,9 +9211,9 @@ int main(int argc, char** argv) {
                 const auto t0 = Clock::now();
                 const int64_t n_tok = b0 - a0, chunk = plan.chunk, head = plan.head;
                 const int64_t lb = plan.cuts[0];
-                // the last chunk's first cell: after the head chunk, chunks of `chunk`
-                const int64_t c_last = head > 0 ? a0 + head + ((n_tok - head - 1) / chunk) * chunk
-                                                : a0 + ((n_tok - 1) / chunk) * chunk;
+                // the last chunk's first cell, from the chunks the main card reads (the one it keeps)
+                const std::vector<int64_t> part_chunks = chunk_list(n_tok, chunk, head);
+                const int64_t c_last = b0 - (part_chunks.empty() ? 0 : part_chunks.back());
                 if (sp.chunk() != chunk) {
                     e = "prompt split: the main card's prompt buffers are not laid out for the split's chunk";
                     return false;
@@ -9342,6 +9325,7 @@ int main(int argc, char** argv) {
                 int64_t main_done = a0, yield_q = -1;
                 int yield_ys = -1;
                 std::atomic<int64_t> c_cut{c_last};
+                std::atomic<int64_t> last_end{a0};   // the end of the last chunk the last stage read
                 sp.keep_here = [&](int64_t done) -> bool {
                     if (done >= c_last) return false;
                     int ys = -1;
@@ -9374,6 +9358,7 @@ int main(int argc, char** argv) {
                 // its own last chunk
                 const int64_t first_cell = mtp_on ? std::max<int64_t>(0, mtp.first_needed()) : INT64_MAX;
                 bool given = false;
+                int64_t given_at = -1;   // the cell the stages' state came back up to
                 double ms_copy = 0;
                 std::future<bool> refill_issue;   // the tier slots' copies, queued on a thread of their own
                 std::string refill_err;
@@ -9447,6 +9432,7 @@ int main(int argc, char** argv) {
                         return false;
                     }
                     given = true;
+                    given_at = c_end;
                     ms_copy = std::chrono::duration<double, std::milli>(Clock::now() - tc).count();
                     refill_issue = std::async(std::launch::async, [&] {
                         bool issued = true;
@@ -9510,6 +9496,7 @@ int main(int argc, char** argv) {
                     // its last chunk before the kept one: every stage is done with its own
                     if (p0 + T >= c_cut.load() && !state_back(p0 + T, ce)) return false;
                     const int64_t done = p0 + T;
+                    last_end.store(done);
                     pp_reached = done;
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                     std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) pp_total, ms,
@@ -9523,11 +9510,17 @@ int main(int argc, char** argv) {
                 sp.keep_here = nullptr;
                 // the kept chunk [c_end, b_end): the last one, or the one a read that gives way ends with (the stages may
                 // have been done before the cut)
-                const int64_t c_end = c_cut.load(), b_end = yield_q >= 0 ? yield_q : b0;
+                const int64_t c_end = c_cut.load();
+                const int64_t b_end = yield_q >= 0 ? yield_q : b0;
                 if (ok && !given && yield_q >= 0) ok = state_back(c_end, e);
-                if (ok && !given) {
+                // the stages' state must come back exactly at the main card's kept chunk: anything else is an error
+                if (ok && (!given || (yield_q < 0 && given_at != c_end))) {
                     ok = false;
-                    e = "prompt split: the stages' state did not come back";
+                    e = "prompt split: the stages' state did not come back at the kept chunk (planned at " +
+                        std::to_string(c_end) + ", the stages ended at " + std::to_string(last_end.load()) +
+                        (given ? ", it came back at " + std::to_string(given_at) : std::string(", it never came back")) +
+                        "; " + std::to_string(n_tok) + " tokens in chunks of " + std::to_string(chunk) + ", head " +
+                        std::to_string(head) + ")";
                 }
                 sp.set_keep_last(false);
                 sp.on_stage_chunk = nullptr;
