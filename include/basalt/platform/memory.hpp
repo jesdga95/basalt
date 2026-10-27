@@ -53,6 +53,13 @@ enum class RegionBacking { LargePages, NormalPages };
 /// was allocated. nullptr on failure.
 void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
                    uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes);
+
+/// An anonymous region with room left for `reserve_bytes` of ordinary RAM and commit. Overflow or a known
+/// insufficient budget refuses before ordinary allocation. Linux reserved hugetlb pages are tried after checking
+/// only the ordinary reserve; ordinary-page fallback checks the entire region plus reserve. Windows checks both
+/// physical RAM and commit for either backing. This admits memory, but does not lock it; use lock_resident next.
+void* alloc_region_budgeted(uint64_t bytes, uint64_t reserve_bytes, RegionBacking& got, std::string& note,
+                            void*& mapping_base, uint64_t& mapping_bytes);
 /// Releases what `alloc_region` returned through `mapping_base` and `mapping_bytes`. A null is fine.
 void free_region(void* mapping_base, uint64_t mapping_bytes);
 
