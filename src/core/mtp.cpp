@@ -168,7 +168,6 @@ MtpDrafter::~MtpDrafter() {
     if (arena_) cudaFree(arena_);
     if (head_logits_) cudaFree(head_logits_);
     if (dhead_) cudaFree(dhead_);
-    if (sub_logits_) cudaFree(sub_logits_);
     if (dvocab_) cudaFree(dvocab_);
     if (top_scratch_) cudaFree(top_scratch_);
     if (proxy_) cudaFree(proxy_);
@@ -510,9 +509,8 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int head_type, int64_t 
             const long size = (long) draft_vocab_.size();
             if (size >= 4 && size % 4 == 0) {
                 const uint64_t xr = (uint64_t) kDraftCtxRows;
-                // a Q6_K head reads the main head's rows (and a multi-column step's subset logits); others copy them
-                bytes += head_type == 14 ? (uint64_t) max_t_ * (uint64_t) (size / 4) * sizeof(float)
-                                         : (uint64_t) (size / 4 + xr) * head_row_bytes;
+                // a Q6_K head reads the main head's rows; others copy them
+                if (head_type != 14) bytes += (uint64_t) (size / 4 + xr) * head_row_bytes;
                 bytes += (uint64_t) size + xr * 8;
                 std::vector<uint8_t> raw;   // the 2-bit copy of the leading rows (the base rows and the context rows)
                 if (read_file(draft_vocab_, raw) && raw.size() == (size_t) size) {
@@ -602,16 +600,15 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             const bool mapped = head->type() == 14 && n_xcap_ == 0;
             if (cudaMalloc((void**) &dvocab_, map.size() * 4) != cudaSuccess ||
                 (!mapped && cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != cudaSuccess) ||
-                (mapped && cudaMalloc((void**) &sub_logits_, (size_t) max_t_ * (size_t) n_dvocab_ * sizeof(float)) != cudaSuccess) ||
                 (n_xcap_ > 0 && cudaMalloc((void**) &dxids_, (size_t) n_xcap_ * 4) != cudaSuccess)) {
                 err = "mtp: the draft head does not fit";
-                draft_head_hint(n_dvocab_, mapped ? (int64_t) (max_t_ * sizeof(float)) : row_bytes);
+                draft_head_hint(n_dvocab_, mapped ? (int64_t) sizeof(int32_t) : row_bytes);
                 return false;
             }
             rows_mapped_ = mapped;
             if (mapped) {
                 cudaMemcpy(dvocab_, map.data(), map.size() * 4, cudaMemcpyHostToDevice);
-                vram_ += (uint64_t) max_t_ * (uint64_t) n_dvocab_ * sizeof(float) + map.size() * 4;
+                vram_ += map.size() * 4;
                 basalt::log::info("basalt mtp", "draft head over %lld tokens (rows read from the main head)",
                              (long long) n_dvocab_);
             } else {
@@ -967,21 +964,13 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                                                    (int) nv, n_tier1_, dvocab_, out_ids_, probs_, proxy_scratch_, cs,
                                                    rows_mapped_)))
             return true;
-        float* lg = head_logits_;   // the step's logits over its nv rows
         if (T == 1 && head_->type() == 13 && top_scratch_ != nullptr && diag_ == nullptr &&
             q5k_head_top1(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, sub ? dvocab_ : nullptr,
                           out_ids_, probs_, top_scratch_, cs))
             return true;
         if (rows_mapped_) {   // the subset's rows of the main head: the bits of the copy's rows
-            if (T == 1) {
-                native_q6_k_mmvq_rows(head_->weights(), dvocab_, xq_, head_logits_, (int) N, (int) nv, cs);
-            } else {   // every row (a row's output does not depend on the others), then the subset's
-                native_mmvq(head_->type(), head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
-                for (int t = 0; t < T; ++t)
-                    gather_rows((const uint8_t*) (head_logits_ + (size_t) t * n_vocab_), (int64_t) sizeof(float),
-                                dvocab_, nv, (uint8_t*) (sub_logits_ + (size_t) t * nv), cs);
-                lg = sub_logits_;
-            }
+            if (T != 1) { err = "mtp: a draft head read through its row map takes one row"; return false; }
+            native_q6_k_mmvq_rows(head_->weights(), dvocab_, xq_, head_logits_, (int) N, (int) nv, cs);
         } else if (head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits
             q5k_head_mmvq(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         else if (head_->type() == GGML_Q8_0 && T == 1)   // read once a step: streamed past the layer's other weights
@@ -991,15 +980,15 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         if (sub && n_xcap_ > 0)   // rows without a token never win
             for (int t = 0; t < T; ++t) q5k_head_mask_unmapped(head_logits_ + (size_t) t * nv, dvocab_, (int) nv, cs);
         if (diag_ != nullptr && T == 1)   // the step's logits to the host, for the draft-tree study
-            cudaMemcpyAsync(diag_ + (size_t) chain_j_ * (size_t) diag_stride_, lg, (size_t) nv * sizeof(float),
+            cudaMemcpyAsync(diag_ + (size_t) chain_j_ * (size_t) diag_stride_, head_logits_, (size_t) nv * sizeof(float),
                             cudaMemcpyDeviceToHost, cs);
-        if (sample_greedy_top_prob(lg, T, (int) nv, sub ? dvocab_ : nullptr, out_ids_, probs_, cs))
+        if (sample_greedy_top_prob(head_logits_, T, (int) nv, sub ? dvocab_ : nullptr, out_ids_, probs_, cs))
             return true;
         SamplerParams sp;
         sp.greedy = true;
         sp.temperature = 0.0f;
-        sample_tokens(lg, T, (int) nv, nullptr, 0, sp, out_ids_, cs);
-        row_top_prob(lg, T, (int) nv, out_ids_, probs_, cs);
+        sample_tokens(head_logits_, T, (int) nv, nullptr, 0, sp, out_ids_, cs);
+        row_top_prob(head_logits_, T, (int) nv, out_ids_, probs_, cs);
         if (sub) map_ids(out_ids_, dvocab_, T, cs);
     } catch (const std::exception& e) {
         err = std::string("mtp: ") + e.what();

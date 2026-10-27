@@ -296,7 +296,6 @@ private:
     // reads its rows from the main head through dvocab_ (rows_mapped_); other formats keep a copy in dhead_.
     uint8_t* dhead_ = nullptr;
     bool rows_mapped_ = false;
-    float* sub_logits_ = nullptr;   ///< rows_mapped_: a multi-column step's subset logits [max_t][n_dvocab]
     int32_t* dvocab_ = nullptr;
     int64_t n_dvocab_ = 0;
     // the subset's leading base rows (n_tier1_) serve the argmax drafts unless the text just held a
