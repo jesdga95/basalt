@@ -792,7 +792,7 @@ bool Verifier::dm_init(std::string& err) {
     }
     basalt::log::info("basalt verify", "the MoE tail planned on the device%s", served.c_str());
     if (d->warm != nullptr)
-        basalt::log::info("basalt verify", "the CPU pool warms its likeliest next-layer expert between doorbells");
+        basalt::log::info("basalt verify", "the CPU pool warms its three likeliest next-layer experts between doorbells");
     return true;
 }
 
