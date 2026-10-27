@@ -87,8 +87,12 @@ public:
     static void set_pinned_share(double share);
 
     /// The chunk size from which every expert streams (below it only the routed experts are staged and the peer card
-    /// computes the rows of its own); before init, which sizes the buffers by it.  Default 1024.
+    /// computes the rows of its own); before init, which sizes the buffers by it.
     static void set_stream_all_min(int64_t tokens);
+    /// The stream-all chunk size for a card whose non-resident experts hold `bytes` and whose host->device link moves
+    /// `gbps` GB/s: the smallest chunk on the 256-token grid whose extra routed-only time exceeds copying all of those
+    /// experts, between a floor and the default.  The default when the link is unknown.
+    static int64_t stream_all_min_for(uint64_t bytes, double gbps);
 
     /// The streamed ring's depth for the layouts made from now on (`relayout`, `bytes_needed`, `ring_slots_for`); at
     /// most the one `init` laid out.  A shallower ring takes fewer of the lent cache slots.

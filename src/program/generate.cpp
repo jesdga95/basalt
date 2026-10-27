@@ -1335,13 +1335,19 @@ int main(int argc, char** argv) {
         split_alike = split_alike && basalt::program::cards_alike(chosen_cards[0], chosen_cards[i]);
     const int split_cap = o.peer_devices.size() <= 1 ? 2 : split_alike ? (int) o.peer_devices.size() + 1 : 1;
     basalt::core::set_peer_portable(o.peer_device >= 1 || !o.layer_split.empty());   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
-    // Chunks below this take the routed-only path with the peer card computing its experts' rows; from it on
-    // every expert streams through the ring.  The routed-only path costs ~0.3 ms per token, streaming ~0.12 ms
-    // plus the time to move the experts the primary lacks over its link; with --peer-exclusive that includes the
-    // peer-only experts, staged through the host, so streaming loses until later.
+    // Chunks below this take the routed-only path; from it on every expert streams through the ring.  With a prompt
+    // peer the peer card computes its experts' rows on the routed path, and streaming also moves the experts the
+    // primary lacks over its link; with --peer-exclusive that includes the peer-only experts, staged through the host,
+    // so streaming loses until later.  On one card the size is priced from the non-resident experts' bytes and the
+    // probed link (Prefill::stream_all_min_for) once the tiers are placed: a fixed function of the placement and the
+    // link, never of a read's timing, since the two paths round differently.
+    int64_t stream_all_priced = 0;   // the one-card price, once known
+    auto prompt_peer = [&]() { return o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0 && peer_streamed_share; };
     auto set_stream_all_min = [&]() {
-        if (o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0 && peer_streamed_share)
+        if (prompt_peer())
             basalt::prefill::Prefill::set_stream_all_min(o.peer_exclusive ? 4096 : 2560);
+        else if (stream_all_priced > 0)
+            basalt::prefill::Prefill::set_stream_all_min(stream_all_priced);
     };
     set_stream_all_min();
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
@@ -4924,6 +4930,19 @@ int main(int argc, char** argv) {
                                  "and --prefill CHUNK (and a fillable "
                                  "--expert-cache; the graphed hit path additionally needs an expert profile)");
             return 2;
+        }
+        if (!multi_gpu && !prompt_peer() && main_link_gbps > 0.0) {   // before the loan and init, which size by it
+            uint64_t nonres = 0;
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e) {
+                    const size_t i = (size_t) (l * g.n_expert + e);
+                    if (i >= host_res.size() || host_res[i] < 0) nonres += basalt::kernels::cpu::expert_layout().blob_bytes(l);
+                }
+            stream_all_priced = basalt::prefill::Prefill::stream_all_min_for(nonres, main_link_gbps);
+            set_stream_all_min();
+            basalt::log::info("basalt serve", "prompt path: every expert streams from %lld-token chunks (%.1f GiB "
+                                 "non-resident, link %.1f GB/s)", (long long) stream_all_priced,
+                         (double) nonres / 1073741824.0, main_link_gbps);
         }
         basalt::prefill::Prefill sp;
         void* borrow = nullptr;
