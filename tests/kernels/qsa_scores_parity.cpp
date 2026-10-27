@@ -40,7 +40,7 @@ template <typename T> std::vector<T> down(const T* d, size_t n) {
 const k::QsaShapes S_ = k::qsa_real_shapes();
 const int IQ = (int) S_.idx_n_head, ID = (int) S_.idx_dim, R = (int) S_.idx_block;
 int g_fail = 0;
-const int64_t MAXB = 16384;   // 65,536 cells
+const int64_t MAXB = 32769;   // 131,076 cells
 
 double time_us(cudaStream_t st, int iters, char* flush, size_t flush_n, const std::function<void()>& call) {
     cudaEvent_t e0, e1;
@@ -84,6 +84,10 @@ int main(int argc, char** argv) {
         {"8 rows, mixed lengths", 8, {16000, 100, 31, 32, 33, 8000, 12500, 1}, {64001, 401, 126, 129, 134, 32002, 50000, 4}},
         {"2 rows, n_bid 0 and 1", 2, {0, 1}, {1, 5}},
         {"5 rows, 63..65 blocks", 5, {63, 64, 65, 95, 96}, {253, 257, 261, 383, 386}},
+        {"5 rows at 131K", 5, {32763, 32764, 32764, 32765, 32766}, {131055, 131057, 131058, 131063, 131066}},
+        {"6 rows at 131K, tails", 6, {32760, 32761, 32762, 32763, 32764, 32765}, {131040, 131045, 131050, 131053, 131059, 131063}},
+        {"7 rows at 131K and short", 7, {32766, 32766, 1000, 32767, 0, 32767, 32768}, {131064, 131065, 4001, 131068, 2, 131071, 131072}},
+        {"8 rows at 131K", 8, {32761, 32762, 32763, 32764, 32765, 32766, 32767, 32768}, {131044, 131049, 131053, 131058, 131061, 131066, 131070, 131072}},
     };
     for (const Case& c : cases) {
         std::vector<float> q((size_t) c.nq * IQ * ID);
@@ -272,7 +276,7 @@ int main(int argc, char** argv) {
         up(d_q, q);
         const size_t flush_n = 256u << 20;
         char* flush = dalloc<char>(flush_n);
-        for (int nq : {3, 8})
+        for (int nq : {3, 4, 5, 6, 7, 8})
         for (int64_t ctx : {40960, 131072}) {
             std::vector<int32_t> steps((size_t) nq * k::kStepCount, 0);
             for (int i = 0; i < nq; ++i) {
