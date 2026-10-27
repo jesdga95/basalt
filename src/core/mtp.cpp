@@ -979,10 +979,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             q5k_head_top1(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, sub ? dvocab_ : nullptr,
                           out_ids_, probs_, top_scratch_, cs))
             return true;
-        if (rows_mapped_) {   // the subset's rows of the main head: the bits of the copy's rows
-            if (T != 1) { err = "mtp: a draft head read through its row map takes one row"; return false; }
+        if (rows_mapped_)   // the subset's rows of the main head, one row a step: the bits of the copy's rows
             native_q6_k_mmvq_rows(head_->weights(), dvocab_, xq_, head_logits_, (int) N, (int) nv, cs);
-        } else if (head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits
+        else if (head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits
             q5k_head_mmvq(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         else if (head_->type() == GGML_Q8_0 && T == 1)   // read once a step: streamed past the layer's other weights
             native_q8_0_mmvq_stream(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, cs);
