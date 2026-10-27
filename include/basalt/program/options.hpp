@@ -91,6 +91,9 @@ struct Options {
     /// not hold that the expert profile ranks hottest are copied into RAM, the rest are read from the files in place
     /// (the GGUF shards when the model file has no experts section).  0 = the whole complement (--resident-experts).
     uint64_t resident_budget = 0;
+    /// `--resident-budget-override N`: same budget as `--resident-budget-gib`, but a value above the RAM floor
+    /// is kept instead of refused. For testing a budget the floor would reject.
+    bool resident_budget_override = false;
     /// Slots of VRAM-resident experts.  **0 = off, and off is the default.**  Switching the cache on moves work off the
     /// CPU pool (`src/kernels/cuda/s2_expert_grouped.cu`, wired via `expert_hit_run`).
     int expert_cache = 0;

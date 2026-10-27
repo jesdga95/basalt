@@ -574,7 +574,10 @@ void usage() {
                  "  --resident-budget-gib N  the resident mode with at most N GiB of experts in RAM (hottest first;\n"
                  "                       auto when not set: what fits);\n"
                  "                       a budget that would leave less than the RAM floor free is refused, naming\n"
-                 "                       the largest safe value.\n");
+                 "                       the largest safe value.\n"
+                 "  --resident-budget-override N  same as --resident-budget-gib, but N above that safe value is\n"
+                 "                       kept and a warning is logged. The file-cache floor is not held, so a spill\n"
+                 "                       can be read from the drive and the machine can start to swap.\n");
 }
 
 bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) {
@@ -1300,11 +1303,12 @@ int main(int argc, char** argv) {
             o.mmap_experts = o.resident_cpu_experts = o.resident_pin = o.resident_soft = true;
             o.resident_headroom = 0;
         }
-        else if (a == "--resident-budget-gib") {
-            const double gib = std::atof(next("--resident-budget-gib"));
-            if (!(gib > 0.0)) { basalt::log::error("basalt generate", "--resident-budget-gib needs N > 0"); return 2; }
+        else if (a == "--resident-budget-gib" || a == "--resident-budget-override") {
+            const double gib = std::atof(next(a.c_str()));
+            if (!(gib > 0.0)) { basalt::log::error("basalt generate", "%s needs N > 0", a.c_str()); return 2; }
             o.resident_budget = (uint64_t) (gib * 1073741824.0);
             o.resident_budget_given = true;
+            o.resident_budget_override = o.resident_budget_override || a == "--resident-budget-override";
             o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
             o.resident_headroom = 0;
         }
@@ -4684,19 +4688,29 @@ int main(int argc, char** argv) {
             if (avail > 0 && file_bytes > 0) {
                 const uint64_t safe = basalt::platform::max_safe_copy(avail, late, ram_floor_bytes);
                 constexpr double kGiB = 1073741824.0;
-                if (o.resident_budget > 0 && o.resident_budget > safe) {
+                const bool over = o.resident_budget > 0 && o.resident_budget > safe;
+                if (over && !o.resident_budget_override) {
                     return fatal_start_error(
                         "--resident-budget-gib " + gib_text(o.resident_budget) + " too high: " + gib_text(avail) +
                         " GiB free, " + gib_text(ram_floor_bytes) + " GiB floor" +
                         (late > 0 ? " + " + gib_text(late) + " GiB for serving" : std::string()) + "; max " +
                         gib_text(safe));
                 }
-                resident_headroom = std::max(resident_headroom, ram_floor_bytes + late);
+                if (over) {
+                    basalt::log::warn("basalt generate",
+                        "--resident-budget-override %.1f GiB is above the safe max %.1f GiB; the file-cache floor "
+                        "is not held",
+                        (double) o.resident_budget / kGiB, (double) safe / kGiB);
+                } else {
+                    resident_headroom = std::max(resident_headroom, ram_floor_bytes + late);
+                }
+                const uint64_t copy_cap = o.resident_budget > 0
+                    ? (over ? o.resident_budget : std::min(o.resident_budget, safe)) : safe;
                 basalt::log::info("basalt generate", "RAM floor %.1f GiB (%.1f margin + %.1f cache), %.1f GiB "
                                      "experts on SSD, RAM copy <= %.1f of %.1f GiB",
                              (double) ram_floor_bytes / kGiB, (double) margin / kGiB,
                              (double) (ram_floor_bytes - margin) / kGiB, (double) file_bytes / kGiB,
-                             (double) (o.resident_budget > 0 ? std::min(o.resident_budget, safe) : safe) / kGiB,
+                             (double) copy_cap / kGiB,
                              (double) avail / kGiB);
             }
         }

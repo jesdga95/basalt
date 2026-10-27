@@ -167,7 +167,9 @@ Basalt refuses settings that would leave the machine without memory, and never s
   swap quickly. The startup line `free places for the adaptive swaps` shows the count; if RAM is short, fewer are kept
   and a round swaps fewer.
 - An explicit `--resident-budget-gib` that would leave less than that floor free is refused at startup; the error
-  states the RAM free and the largest safe value ('max').
+  states the RAM free and the largest safe value ('max'). `--resident-budget-override N` is that same budget, but N
+  above the max is kept and a warning is logged. The file-cache floor is not held, so experts still on the SSD can
+  be read at drive speed and the machine can start to swap.
 - While serving, a request that finds MemAvailable below the margin plus 3.5 GiB (the margin alone when no expert is
   read from the SSD) stops with an error (`RAM low (... free < ... guard): request stopped`, also returned to the
   client); the server keeps running and takes the next request. Windows does not count the pages read through the
