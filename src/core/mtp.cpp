@@ -1579,7 +1579,6 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
     decode_gaps().mark(10);
     ms_draft += ms_since(t0);
     ++rounds;
-    if (tier_ != 0) ++rounds_added;
     return true;
 }
 
