@@ -583,6 +583,11 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         if (read_file(draft_vocab_, raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
             const int64_t n_raw = (int64_t) (raw.size() / 4);
             const int32_t* ids = (const int32_t*) raw.data();
+            for (int64_t i = 0; i < n_raw; ++i)
+                if (ids[i] < 0 || ids[i] >= n_vocab_) {
+                    err = "mtp: the draft vocabulary holds a token id outside the vocabulary";
+                    return false;
+                }
             // the base rows: the leading ids up to the first descent (added ids follow the base in id order)
             int64_t n_base = n_raw;
             for (int64_t i = 1; i < n_raw; ++i)
