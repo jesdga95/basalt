@@ -2,6 +2,8 @@
 #include "basalt/program/auto_plan.hpp"
 
 #include <cstdio>
+
+#include "basalt/platform/memory.hpp"
 #include <string>
 
 using namespace basalt::program;
@@ -132,6 +134,47 @@ int main() {
         AutoInputs in = base(16, false);
         in.floor_bytes = 100 * G;
         CHECK(choose_auto(in).resident_gb == 0.0);
+    }
+    // The optional copies (lent slots, spares) never decide whether the complement fits.
+    {
+        AutoInputs in = base(128, true);
+        in.complement_full = 40 * G; in.complement_peer_excl = 30 * G;
+        in.extra_full = 25 * G; in.extra_peer_excl = 25 * G;
+        in.ram_available = 52 * G;                  // 46 beside the 6 GiB floor: the bare 40 fits, 65 does not
+        AutoPlan p = choose_auto(in);
+        CHECK(!p.peer_exclusive);                   // the peer's experts keep their RAM copy
+        CHECK(p.resident_bytes == 46 * G);          // the optional copies take what is left
+        in.extra_full = 0;
+        CHECK(choose_auto(in).resident_bytes == 40 * G);
+    }
+    // Experts on the file: the floor follows what is left there, and the copy plus that floor fits the RAM.
+    {
+        AutoInputs in = base(128, false);
+        in.complement_full = 217 * G / 10;          // 21.7 GiB
+        in.extra_full = 49 * G / 10;
+        in.floor_bytes = 9 * G;
+        in.margin_bytes = 6 * G;
+        in.late_bytes = 3 * G;
+        in.layer_bytes = 5 * G / 4;
+        in.prompt_file_bytes = 7 * G / 2;
+        in.ram_available = 334 * G / 10;            // the bare complement fits beside the 9 GiB floor
+        AutoPlan p = choose_auto(in);
+        CHECK(p.resident_bytes == in.ram_available - 9 * G);
+        CHECK(p.resident_bytes > in.complement_full);
+        in.ram_available = 28 * G;                  // it does not: the rest is read from the file
+        p = choose_auto(in);
+        const uint64_t file = in.complement_full - p.resident_bytes;
+        const uint64_t floor = basalt::platform::ram_floor(in.margin_bytes, file, in.complement_full, in.layer_bytes,
+                                                           in.prompt_file_bytes) + in.late_bytes;
+        CHECK(p.resident_bytes < in.complement_full && file > 0);
+        CHECK(p.resident_bytes + floor <= in.ram_available);                  // never past the RAM
+        CHECK(p.resident_bytes + floor + (G >> 20) >= in.ram_available);      // and no more than a MiB short of it
+        // fewer lent slots to read, a smaller floor, a larger copy
+        const uint64_t before = p.resident_bytes;
+        in.prompt_file_bytes = 0;
+        CHECK(choose_auto(in).resident_bytes > before);
+        in.ram_available = 10 * G;                  // little RAM: a sane floor, not a negative copy
+        CHECK(choose_auto(in).resident_bytes == 0);
     }
     if (g_fail) { std::printf("auto_plan_test: %d failures\n", g_fail); return 1; }
     std::printf("auto_plan_test: ok\n");

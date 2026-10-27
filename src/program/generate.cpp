@@ -3479,7 +3479,8 @@ int main(int argc, char** argv) {
                                                               basalt::kernels::cpu::expert_layout().blob_bytes(l));
                 if (o.resident_cpu_experts && o.resident_budget == 0) {
                     file_headroom =
-                        std::max(headroom, basalt::platform::ram_floor(basalt::platform::ram_margin(), 1, largest) + late);
+                        std::max(headroom, basalt::platform::ram_floor(basalt::platform::ram_margin(), outside, outside, largest,
+                                                    basalt::platform::kPromptFileReadBytes) + late);
                     ram = *free_ram > file_headroom ? *free_ram - file_headroom : 0;
                     if (o.resident_soft) ram = ram > (256ull << 20) ? ram - (256ull << 20) : 0;
                 }
@@ -4511,6 +4512,8 @@ int main(int argc, char** argv) {
     for (int64_t l = 0; l < g.n_layers; ++l)
         largest_layer_bytes = std::max<uint64_t>(largest_layer_bytes,
                                                  (uint64_t) g.n_expert * basalt::kernels::cpu::expert_layout().blob_bytes(l));
+    // what a prompt chunk reads from the file for the lent slots the RAM copy leaves out (see platform::file_cache_floor)
+    uint64_t prompt_file_bytes = 0;
     // --serve: free places in the RAM copy take the evicted experts (no exchange buffers)
     const bool adapt_fast_on = o.serve && o.adapt_every > 0 && o.adapt_swaps > 0;
     // A server also leaves room for what it allocates after the RAM copy, before it is ready (the top-up below takes
@@ -4584,13 +4587,16 @@ int main(int argc, char** argv) {
         const uint64_t spares_full = adapt_fast_on ? (uint64_t) o.adapt_swaps * kSatBoost * blob : 0;
         const uint64_t spares_excl =
             adapt_fast_on ? (uint64_t) (o.adapt_swaps * kSatBoost + std::max(o.peer_adapt_swaps, o.adapt_swaps)) * blob : 0;
-        in.complement_full += lent_bytes + spares_full;
-        in.complement_peer_excl += lent_bytes + spares_excl;
-        auto fits_beside = [&](uint64_t c) { return in.ram_available > head && c <= in.ram_available - head; };
-        // the floor when the whole complement is placed is the headroom; with experts left on the SSD it adds the file cache's
-        in.floor_bytes = fits_beside(in.complement_full) || (in.peer && in.serve && fits_beside(in.complement_peer_excl))
-                             ? head
-                             : std::max(head, basalt::platform::ram_floor(margin, 1, largest_layer_bytes) + late);
+        // the lent slots' copies and the spares are kept as far as RAM allows: they do not decide whether the complement fits
+        in.extra_full = lent_bytes + spares_full;
+        in.extra_peer_excl = lent_bytes + spares_excl;
+        // the floor when the whole complement is placed is the headroom; with experts left on the SSD the plan adds the file cache's
+        in.floor_bytes = head;
+        in.margin_bytes = margin;
+        in.late_bytes = late;
+        in.layer_bytes = largest_layer_bytes;
+        prompt_file_bytes = std::min<uint64_t>(lent_bytes, basalt::platform::kPromptFileReadBytes);
+        in.prompt_file_bytes = prompt_file_bytes;
         bp::AutoGiven& gv = in.given;
         if (!(in.peer && in.serve) || o.peer_exclusive_given) {   // not applicable, or given
             gv.peer_exclusive = true;
@@ -4681,7 +4687,8 @@ int main(int argc, char** argv) {
             const uint64_t margin = basalt::platform::ram_margin();
             const uint64_t copy = std::min(o.resident_budget > 0 ? o.resident_budget : auto_resident_bytes, complement);
             const uint64_t file_bytes = complement - copy;
-            ram_floor_bytes = basalt::platform::ram_floor(margin, file_bytes, largest_layer_bytes);
+            ram_floor_bytes =
+                basalt::platform::ram_floor(margin, file_bytes, complement, largest_layer_bytes, prompt_file_bytes);
             if (avail > 0 && file_bytes > 0) {
                 const uint64_t safe = basalt::platform::max_safe_copy(avail, late, ram_floor_bytes);
                 constexpr double kGiB = 1073741824.0;
@@ -6764,7 +6771,7 @@ int main(int argc, char** argv) {
         report_expert_tiers();
         basalt::platform::stop_memory_watchdog();
         // from here a request that runs the RAM below the floor stops with an error instead of the machine swapping
-        const uint64_t guard_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), tier_file_bytes);
+        const uint64_t guard_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), tier_file_bytes, prompt_file_bytes);
         basalt::platform::start_ram_guard(guard_floor);
         // a VRAM shrink's RAM homes leave the guard's floor above the margin and the top-up's own slack free
         src.set_homes_reserve(guard_floor - std::min(guard_floor, basalt::platform::ram_margin()) + (256ull << 20));
