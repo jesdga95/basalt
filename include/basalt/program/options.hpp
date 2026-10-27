@@ -91,9 +91,9 @@ struct Options {
     /// not hold that the expert profile ranks hottest are copied into RAM, the rest are read from the files in place
     /// (the GGUF shards when the model file has no experts section).  0 = the whole complement (--resident-experts).
     uint64_t resident_budget = 0;
-    /// `--resident-budget-override N`: same budget as `--resident-budget-gib`, but a value above the RAM floor
-    /// is kept instead of refused. For testing a budget the floor would reject.
-    bool resident_budget_override = false;
+    /// `--resident-budget-floor-override N`: raises the largest budget the RAM floor will accept, to N bytes.
+    /// It does not replace a `--resident-budget-gib` already set. 0 = not set. With no budget yet, N is the budget.
+    uint64_t resident_budget_floor_override = 0;
     /// Slots of VRAM-resident experts.  **0 = off, and off is the default.**  Switching the cache on moves work off the
     /// CPU pool (`src/kernels/cuda/s2_expert_grouped.cu`, wired via `expert_hit_run`).
     int expert_cache = 0;
@@ -189,7 +189,8 @@ struct Options {
     int adapt_every = 4;
     bool adapt_every_given = false;   // --adapt-every on the command line
     bool peer_exclusive_given = false;   // --peer-exclusive on the command line
-    bool resident_budget_given = false;  // --resident-budget-gib on the command line
+    bool resident_budget_given = false;  // --resident-budget-gib or --resident-budget-floor-override
+    bool resident_budget_base = false;   // --resident-budget-gib, so a later floor override must not replace it
     bool pool_affinity_given = false;    // --pool-affinity on the command line
     bool pool_workers_given = false;     // --pool-workers on the command line
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)

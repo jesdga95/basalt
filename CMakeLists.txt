@@ -931,6 +931,14 @@ basalt_embed_manifest(log_test)
 basalt_cpu_test(NAME log_test COMMAND log_test)
 set_tests_properties(log_test PROPERTIES TIMEOUT 60)
 
+# resident budget vs the floor override: a later override raises the allowance and leaves the budget
+add_executable(resident_budget_test tests/program/resident_budget_test.cpp)
+target_include_directories(resident_budget_test PRIVATE include)
+target_link_libraries(resident_budget_test PRIVATE warnings)
+basalt_embed_manifest(resident_budget_test)
+basalt_cpu_test(NAME resident_budget_test COMMAND resident_budget_test)
+set_tests_properties(resident_budget_test PROPERTIES TIMEOUT 60)
+
 # basalt-probe's report: rates block and layout (CPU only)
 add_executable(probe_report_test tests/program/probe_report_test.cpp)
 target_link_libraries(probe_report_test PRIVATE engine_session warnings)

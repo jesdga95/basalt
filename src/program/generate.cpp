@@ -7,6 +7,7 @@
 // on the same ids on both sides.
 
 #include "basalt/program/options.hpp"
+#include "basalt/program/resident_budget.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/logit_bias.hpp"
 #include "basalt/program/grammar/guard.hpp"
@@ -575,9 +576,11 @@ void usage() {
                  "                       auto when not set: what fits);\n"
                  "                       a budget that would leave less than the RAM floor free is refused, naming\n"
                  "                       the largest safe value.\n"
-                 "  --resident-budget-override N  same as --resident-budget-gib, but N above that safe value is\n"
-                 "                       kept and a warning is logged. The file-cache floor is not held, so a spill\n"
-                 "                       can be read from the drive and the machine can start to swap.\n");
+                 "  --resident-budget-floor-override N\n"
+                 "                       raises the largest budget the floor will accept, to N GiB. It does not\n"
+                 "                       replace a --resident-budget-gib given before it. With no budget yet, N is\n"
+                 "                       the budget. A budget above the safe max but within N is kept, with a\n"
+                 "                       warning; the file-cache floor is not held.\n");
 }
 
 bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) {
@@ -1303,12 +1306,20 @@ int main(int argc, char** argv) {
             o.mmap_experts = o.resident_cpu_experts = o.resident_pin = o.resident_soft = true;
             o.resident_headroom = 0;
         }
-        else if (a == "--resident-budget-gib" || a == "--resident-budget-override") {
+        else if (a == "--resident-budget-gib" || a == "--resident-budget-floor-override") {
             const double gib = std::atof(next(a.c_str()));
             if (!(gib > 0.0)) { basalt::log::error("basalt generate", "%s needs N > 0", a.c_str()); return 2; }
-            o.resident_budget = (uint64_t) (gib * 1073741824.0);
+            basalt::program::ResidentBudgetChoice choice{
+                o.resident_budget, o.resident_budget_floor_override, o.resident_budget_base};
+            const uint64_t bytes = (uint64_t) (gib * 1073741824.0);
+            if (a == "--resident-budget-floor-override")
+                basalt::program::set_resident_budget_floor_override(choice, bytes);
+            else
+                basalt::program::set_resident_budget_gib(choice, bytes);
+            o.resident_budget = choice.budget;
+            o.resident_budget_floor_override = choice.floor_override;
+            o.resident_budget_base = choice.base;
             o.resident_budget_given = true;
-            o.resident_budget_override = o.resident_budget_override || a == "--resident-budget-override";
             o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
             o.resident_headroom = 0;
         }
@@ -4688,24 +4699,31 @@ int main(int argc, char** argv) {
             if (avail > 0 && file_bytes > 0) {
                 const uint64_t safe = basalt::platform::max_safe_copy(avail, late, ram_floor_bytes);
                 constexpr double kGiB = 1073741824.0;
-                const bool over = o.resident_budget > 0 && o.resident_budget > safe;
-                if (over && !o.resident_budget_override) {
+                const basalt::program::ResidentBudgetLimit limit = basalt::program::resident_budget_limit(
+                    o.resident_budget, safe, o.resident_budget_floor_override);
+                if (limit.refused && !(o.resident_budget_floor_override > safe)) {
                     return fatal_start_error(
                         "--resident-budget-gib " + gib_text(o.resident_budget) + " too high: " + gib_text(avail) +
                         " GiB free, " + gib_text(ram_floor_bytes) + " GiB floor" +
                         (late > 0 ? " + " + gib_text(late) + " GiB for serving" : std::string()) + "; max " +
                         gib_text(safe));
                 }
-                if (over) {
+                if (limit.refused) {
+                    return fatal_start_error(
+                        "--resident-budget-gib " + gib_text(o.resident_budget) +
+                        " too high for --resident-budget-floor-override " +
+                        gib_text(o.resident_budget_floor_override) + "; max " + gib_text(limit.allowed));
+                }
+                if (limit.above_safe) {
                     basalt::log::warn("basalt generate",
-                        "--resident-budget-override %.1f GiB is above the safe max %.1f GiB; the file-cache floor "
-                        "is not held",
-                        (double) o.resident_budget / kGiB, (double) safe / kGiB);
+                        "--resident-budget-gib %.1f GiB is above the safe max %.1f GiB; "
+                        "--resident-budget-floor-override %.1f GiB allows it; the file-cache floor is not held",
+                        (double) o.resident_budget / kGiB, (double) safe / kGiB,
+                        (double) o.resident_budget_floor_override / kGiB);
                 } else {
                     resident_headroom = std::max(resident_headroom, ram_floor_bytes + late);
                 }
-                const uint64_t copy_cap = o.resident_budget > 0
-                    ? (over ? o.resident_budget : std::min(o.resident_budget, safe)) : safe;
+                const uint64_t copy_cap = limit.copy_cap;
                 basalt::log::info("basalt generate", "RAM floor %.1f GiB (%.1f margin + %.1f cache), %.1f GiB "
                                      "experts on SSD, RAM copy <= %.1f of %.1f GiB",
                              (double) ram_floor_bytes / kGiB, (double) margin / kGiB,
