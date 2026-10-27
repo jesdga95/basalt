@@ -502,6 +502,13 @@ std::vector<std::pair<std::string, const void*>> MtpDrafter::hc8_keys() const {
     return out;
 }
 
+namespace {
+// a Q5_K draft head keeps context rows after its base rows; a Q6_K head (no context rows) reads the main head's rows
+// through its map instead of a copy
+bool draft_ctx_rows(int head_type) { return head_type == 13; }
+bool draft_rows_mapped(int head_type) { return head_type == 14 && !draft_ctx_rows(head_type); }
+}  // namespace
+
 uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int head_type, int64_t n_vocab) const {
     uint64_t bytes = head_logits_ ? 0 : (uint64_t) max_t_ * (uint64_t) n_vocab * sizeof(float);
     if (dhead_ == nullptr && !rows_mapped_) {
@@ -510,7 +517,7 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int head_type, int64_t 
             if (size >= 4 && size % 4 == 0) {
                 const uint64_t xr = (uint64_t) kDraftCtxRows;
                 // a Q6_K head reads the main head's rows; others copy them
-                if (head_type != 14) bytes += (uint64_t) (size / 4 + xr) * head_row_bytes;
+                if (!draft_rows_mapped(head_type)) bytes += (uint64_t) (size / 4 + xr) * head_row_bytes;
                 bytes += (uint64_t) size + xr * 8;
                 std::vector<uint8_t> raw;   // the 2-bit copy of the leading rows (the base rows and the context rows)
                 if (read_file(draft_vocab_, raw) && raw.size() == (size_t) size) {
@@ -593,7 +600,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             for (int64_t i = 1; i < n_raw; ++i)
                 if (ids[i] < ids[i - 1]) { n_base = i; break; }
             // context rows follow the base rows
-            if (head->type() == 13 && n_raw > 0) n_xcap_ = kDraftCtxRows;
+            if (draft_ctx_rows(head->type()) && n_raw > 0) n_xcap_ = kDraftCtxRows;
             xbase_ = n_base;
             std::vector<int32_t> map((size_t) (n_raw + n_xcap_));
             std::copy(ids, ids + n_base, map.begin());
@@ -601,8 +608,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             std::copy(ids + n_base, ids + n_raw, map.begin() + n_base + n_xcap_);
             n_dvocab_ = n_raw + n_xcap_;
             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
-            // a Q6_K head (no context rows) reads the main head's rows through the map: no copy
-            const bool mapped = head->type() == 14 && n_xcap_ == 0;
+            const bool mapped = draft_rows_mapped(head->type());
             if (cudaMalloc((void**) &dvocab_, map.size() * 4) != cudaSuccess ||
                 (!mapped && cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != cudaSuccess) ||
                 (n_xcap_ > 0 && cudaMalloc((void**) &dxids_, (size_t) n_xcap_ * 4) != cudaSuccess)) {
