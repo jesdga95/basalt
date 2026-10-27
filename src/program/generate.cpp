@@ -2973,7 +2973,8 @@ int main(int argc, char** argv) {
             basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str());
             return 1;
         }
-        basalt::log::info("basalt generate", "experimental native Q5_K head, %llu bytes, in %.1f s",
+        basalt::log::info("basalt generate", "native head: %s, %llu bytes, in %.1f s",
+                     basalt::ggml_type_name((uint32_t) native_head.type()),
                      (unsigned long long) native_head.weight_bytes(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
     }
