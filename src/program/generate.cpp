@@ -7036,7 +7036,18 @@ int main(int argc, char** argv) {
         // tail again, each returned slot refilled from RAM.  Both run between windows, never inside one.
         // a request's room past its prompt, and each later step (batch slots: a smaller step, as their base)
         const int64_t kKvGrowCells = o.batch > 0 ? 4096 : 16384;
+        constexpr int64_t kKvWindowCells = 2 * basalt::kernels::kVerifyMaxT + 64;   // a decoding session's next window
         int64_t kv_moves = 0;
+        // the expert cache never shrinks below the slots the prompt path's smallest loan needs (a 256-token chunk, and
+        // the 128 slots a loan leaves), so the next prompt can always be read
+        auto cache_floor_slots = [&]() -> int64_t {
+            if (pf_parts.empty() || pf_parts[0].first < 0) return 0;
+            const int64_t k = part_slots(pf_parts[0], 256);
+            int64_t f = k + 128;
+            if (o.prefill_auto) f = std::max<int64_t>(f, (k * 100 + kAutoLendPct - 1) / kAutoLendPct);
+            return std::min<int64_t>(f, xcache.full_slots());
+        };
+        bool kv_short = false;   // the last kv_fit refused: the cells would take the cache below its floor
         auto kv_drain = [&](std::string& e) -> bool {
             if (!ver.wait_commit(e)) return false;
             apply_pending(true);
@@ -7098,10 +7109,13 @@ int main(int argc, char** argv) {
         };
         // `shrink` false: only VRAM that is free now (a prompt read is running beside the windows, its loan in the
         // cache's last slots) - false with `e` empty when that is not enough
-        auto kv_fit = [&](basalt::core::SessionState& s, int64_t cells, std::string& e, bool shrink = true) -> bool {
+        // `min_cells`: when `cells` would take the cache below its floor, as many as leave it, down to these
+        auto kv_fit = [&](basalt::core::SessionState& s, int64_t cells, std::string& e, bool shrink = true,
+                          int64_t min_cells = -1) -> bool {
+            kv_short = false;
             if (kv_floor <= 0) return true;
             cells = std::min<int64_t>(std::max<int64_t>(cells, kv_floor), s.max_cells);
-            const int64_t add = (int64_t) basalt::core::session_kv_grow_bytes(s, cells);
+            int64_t add = (int64_t) basalt::core::session_kv_grow_bytes(s, cells);
             if (add <= 0) return true;
             const auto t0 = Clock::now();
             if (shrink && !kv_drain(e)) return false;
@@ -7110,6 +7124,41 @@ int main(int argc, char** argv) {
             cudaMemGetInfo(&free_b, &total_b);
             const int64_t room = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
             if (!shrink && add > room) { e.clear(); return false; }
+            if (add > room && xcache.segmented()) {
+                const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
+                auto keep_for = [&](int64_t a) {
+                    return std::max<int64_t>(0, (xcache.mapped_bytes() - (a - room)) / gran * gran);
+                };
+                const int64_t floor = cache_floor_slots();
+                auto leaves_floor = [&](int64_t c) {
+                    const int64_t a = (int64_t) basalt::core::session_kv_grow_bytes(s, c);
+                    return a <= room || xcache.slots_after_shrink(keep_for(a)) >= floor;
+                };
+                if (!leaves_floor(cells)) {
+                    // the most cells on the 256-cell grid that leave it, down to `min_cells`
+                    int64_t best = -1;
+                    if (min_cells > 0 && min_cells < cells && leaves_floor(min_cells)) {
+                        best = min_cells;
+                        for (int64_t lo = min_cells / 256 + 1, hi = cells / 256; lo <= hi;) {
+                            const int64_t mid = lo + (hi - lo) / 2;
+                            if (mid * 256 > min_cells && leaves_floor(mid * 256)) { best = mid * 256; lo = mid + 1; }
+                            else hi = mid - 1;
+                        }
+                    }
+                    if (best < 0) {
+                        kv_short = true;
+                        const int64_t want = min_cells > 0 && min_cells < cells ? min_cells : cells;
+                        e = "elastic KV: " + std::to_string(want) + " cells of KV (+" +
+                            std::to_string((int64_t) basalt::core::session_kv_grow_bytes(s, want) >> 20) +
+                            " MiB) would take the expert cache below the " + std::to_string(floor) +
+                            " slots the next prompt chunk needs (" + std::to_string(xcache.slots()) + " now, " +
+                            std::to_string(room >> 20) + " MiB free above the reserve)";
+                        return false;
+                    }
+                    cells = best;
+                    add = (int64_t) basalt::core::session_kv_grow_bytes(s, cells);
+                }
+            }
             if (add > room && xcache.segmented()) {
                 // whole tail segments: everything from the first one at or past `keep` goes
                 const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
@@ -7240,6 +7289,39 @@ int main(int argc, char** argv) {
             in_lines.pop_front();
             return true;
         };
+        // the elastic KV's spare cells back to the expert cache: every session keeps what it holds (the solo session
+        // `ss_keep` cells, a decoding slot its next window too), idle ones first; `skip` and slot `skip_slot` are left
+        // alone, and it stops once `enough` (if set) is true
+        auto kv_give_back = [&](int64_t ss_keep, const basalt::core::SessionState* skip, int skip_slot,
+                                const std::function<bool()>& enough, int64_t& given, std::string& e) -> bool {
+            std::vector<basalt::core::SessionState*> sess;
+            std::vector<basalt::program::KvHold> holds;
+            auto add = [&](basalt::core::SessionState& s, int64_t keep, bool active) {
+                if (&s == skip) return;
+                for (size_t i = 0; i < sess.size(); ++i)
+                    if (sess[i] == &s) {
+                        holds[i].keep = std::max(holds[i].keep, keep);
+                        holds[i].active = holds[i].active || active;
+                        return;
+                    }
+                sess.push_back(&s);
+                holds.push_back({basalt::core::session_kv_cells(s), keep, active});
+            };
+            add(ss, ss_keep, false);
+            for (size_t b = 0; !bslot_ss.empty() && b < bslot_ss[0].size() && b < bs.size(); ++b) {
+                if ((int) b == skip_slot) continue;
+                const BSlot& sb = bs[b];
+                add(*bslot_ss[0][b], std::max<int64_t>((int64_t) sb.ids.size(), sb.active ? sb.p + kKvWindowCells : 0),
+                    sb.active);
+            }
+            for (const auto& [i, keep] : basalt::program::kv_giveback_order(holds, kv_floor)) {
+                if (holds[(size_t) i].backed < 0) continue;
+                if (!kv_release(*sess[(size_t) i], keep, e)) return false;
+                given += holds[(size_t) i].backed - basalt::core::session_kv_cells(*sess[(size_t) i]);
+                if (enough && enough()) break;
+            }
+            return true;
+        };
         // ---- ENC <image> <out> [<image> <out> ...] (--vision-mmproj), between requests and between batch windows.  The
         // images are decoded on the host first; then the encoder borrows the last expert-cache slots (the prompt path's
         // way: their rows are marked missing for the time), uploads its weights from the pinned copy, encodes each
@@ -7322,33 +7404,10 @@ int main(int argc, char** argv) {
             // short of room: the elastic KV gives back the cells no session holds (idle slots first), and the cache
             // maps that VRAM again; the sessions take cells back on demand after the encode
             int64_t kv_given = 0;
-            if (k > room && kv_floor > 0) {
-                std::vector<basalt::core::SessionState*> sess;
-                std::vector<basalt::program::KvHold> holds;
-                constexpr int64_t kWindowCells = 2 * basalt::kernels::kVerifyMaxT + 64;
-                auto add = [&](basalt::core::SessionState& s, int64_t keep, bool active) {
-                    for (size_t i = 0; i < sess.size(); ++i)
-                        if (sess[i] == &s) {
-                            holds[i].keep = std::max(holds[i].keep, keep);
-                            holds[i].active = holds[i].active || active;
-                            return;
-                        }
-                    sess.push_back(&s);
-                    holds.push_back({basalt::core::session_kv_cells(s), keep, active});
-                };
-                add(ss, (int64_t) live.size(), false);
-                for (size_t b = 0; !bslot_ss.empty() && b < bslot_ss[0].size() && b < bs.size(); ++b) {
-                    const BSlot& sb = bs[b];
-                    add(*bslot_ss[0][b], std::max<int64_t>((int64_t) sb.ids.size(), sb.active ? sb.p + kWindowCells : 0),
-                        sb.active);
-                }
-                for (const auto& [i, keep] : basalt::program::kv_giveback_order(holds, kv_floor)) {
-                    if (holds[(size_t) i].backed < 0) continue;
-                    if (!kv_release(*sess[(size_t) i], keep, e)) { reply_err(e); return; }
-                    kv_given += holds[(size_t) i].backed - basalt::core::session_kv_cells(*sess[(size_t) i]);
-                    room = lendable();
-                    if (k <= room) break;
-                }
+            if (k > room && kv_floor > 0 &&
+                !kv_give_back((int64_t) live.size(), nullptr, -1, [&] { room = lendable(); return k <= room; }, kv_given, e)) {
+                reply_err(e);
+                return;
             }
             if (k <= 0 || k > room) {
                 basalt::log::warn("basalt serve", "image encoder: refused, %lld cache slots needed, %lld lendable "
@@ -7459,9 +7518,44 @@ int main(int argc, char** argv) {
         // slot b's sessions -> the main ones (the reverse of copy_to_slot): a request that continues the
         // conversation an idle slot holds reads on from there.  Every stage, the same calls.
         // `at`: one of the slot's checkpoints - only the K/V up to it is copied and its state restored instead
+        // a slot's conversation held in RAM (`hold_slot`) while its KV cells back the request that continues it, when the
+        // two do not fit side by side; copy_from_slot restores from it
+        struct SlotHeld {
+            int b = -1;
+            std::vector<basalt::core::ConversationCheckpoint> ck;
+            std::vector<std::vector<basalt::core::ConversationKv>> kv;
+        };
+        SlotHeld slot_held;
+        auto hold_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
+            slot_held = SlotHeld{};
+            const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
+            slot_held.ck.resize(bslot_ss.size());
+            slot_held.kv.resize(bslot_ss.size());
+            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                basalt::core::SessionState& from = *bslot_ss[k][(size_t) b];
+                const basalt::core::SessionState& to = k == 0 ? *rsp : stages[k - 1]->ss;
+                if (from.gdn_state == to.gdn_state) continue;
+                const basalt::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+                if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot hold: device sync failed"; return false; }
+                if (at == nullptr) {
+                    slot_held.ck[k].ids = bs[(size_t) b].ids;
+                    if (!basalt::core::conversation_checkpoint_save(slot_held.ck[k], from, g, e)) return false;
+                }
+                for (int64_t j = 0; j < from.qsa_alloc; ++j) {
+                    slot_held.kv[k].emplace_back();
+                    if (!basalt::core::conversation_kv_save(slot_held.kv[k].back(), from.qsa_states[from.qsa_ord0 + j], g,
+                                                            upto, true, e))
+                        return false;
+                    if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot hold: device sync failed"; return false; }
+                }
+            }
+            slot_held.b = b;
+            return true;
+        };
         auto copy_from_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
+            const bool held = slot_held.b == b;
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 basalt::core::SessionState& from = *bslot_ss[k][(size_t) b];
                 basalt::core::SessionState& to = k == 0 ? *rsp : stages[k - 1]->ss;
@@ -7471,6 +7565,8 @@ int main(int argc, char** argv) {
                 if (at != nullptr) {
                     if (!basalt::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, e))
                         return false;
+                } else if (held) {
+                    if (!basalt::core::conversation_checkpoint_restore(slot_held.ck[k], to, g, e)) return false;
                 } else {
                     basalt::core::ConversationCheckpoint ck;
                     ck.ids = bs[(size_t) b].ids;
@@ -7480,14 +7576,16 @@ int main(int argc, char** argv) {
                 }
                 for (int64_t j = 0; j < from.qsa_alloc; ++j) {
                     basalt::core::ConversationKv img;
-                    if (!basalt::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
+                    basalt::core::ConversationKv& src_img = held ? slot_held.kv[k][(size_t) j] : img;
+                    if (!held && !basalt::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
                         return false;
                     if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
-                    if (!basalt::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
+                    if (!basalt::core::conversation_kv_restore(src_img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                         return false;
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
             }
+            if (held) slot_held = SlotHeld{};
             if (batch_spec && !mtp.copy_store(b, mtp.main_store(), upto, e)) return false;
             return true;
         };
@@ -7549,7 +7647,19 @@ int main(int argc, char** argv) {
                     if (at + 2 * MR + 64 <= backed) continue;
                     std::string ke;
                     if (!ov_active && ba_job) { ba_thr.join(); ba_job = false; }   // its copies land before the drain
-                    if (kv_fit(u, at + kKvGrowCells, ke, !ov_active)) continue;
+                    if (kv_fit(u, at + kKvGrowCells, ke, !ov_active, at + 2 * MR + 64)) continue;
+                    if (!ke.empty() && kv_short) {   // the expert cache's floor: this slot's reply ends here
+                        BSlot& sl = bs[(size_t) b];
+                        basalt::log::warn("basalt batch", "slot %d stopped at %lld cells: %s", b, (long long) at, ke.c_str());
+                        std::printf("BDONE %d %lld length %.1f %lld %lld\n", b, (long long) sl.produced,
+                                    std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count(),
+                                    (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
+                        sl.active = false;
+                        sl.cached = o.prompt_cache > 0;   // its sessions hold sl.ids
+                        sl.guard.reset();
+                        kv_wait[(size_t) b] = 1;
+                        continue;
+                    }
                     if (!ke.empty()) { std::printf("ERR %s\n", ke.c_str()); return false; }
                     if (at + 2 * MR > backed) kv_wait[(size_t) b] = 1;
                 }
@@ -8448,6 +8558,7 @@ int main(int argc, char** argv) {
                 bool live_ok = false, cvec = true;
                 std::vector<ConvCheckpoint> checks;
             } solo_book;
+            bool solo_moved = false;   // the solo session gave its cells to this request (hold_slot): it holds nothing after
             if (in_slot) {
                 solo_book = {std::move(live), std::move(live_imgs), live_ok, cvec_cached, std::move(checks)};
                 BSlot& sb = bs[(size_t) slot_b];
@@ -8570,8 +8681,71 @@ int main(int argc, char** argv) {
             // the elastic KV: every cell this request writes is backed before anything (a restore, a slot's copy, the
             // read) writes it
             // (a restore writes the snapshot's whole live K/V, which can be longer than this prompt)
-            if (!kv_fit(*rsp, std::max<int64_t>(n, incoming ? (int64_t) incoming->live.ids.size() : 0) + kKvGrowCells,
-                        err)) {
+            const int64_t kv_need = std::max<int64_t>(n, incoming ? (int64_t) incoming->live.ids.size() : 0);
+            bool kv_ok = kv_fit(*rsp, kv_need + kKvGrowCells, err, true, kv_need + kKvWindowCells);
+            if (!kv_ok && kv_short) {   // the other sessions' spare cells first
+                int64_t given = 0;
+                std::string ge;
+                if (!kv_give_back(in_slot ? (int64_t) solo_book.live.size() : (int64_t) live.size(), rsp,
+                                  in_slot ? slot_b : -1, nullptr, given, ge)) {
+                    err = ge;
+                    kv_short = false;
+                } else if (given > 0) {
+                    err.clear();
+                    kv_ok = kv_fit(*rsp, kv_need + kKvGrowCells, err, true, kv_need + kKvWindowCells);
+                }
+            }
+            // the idle slot this request continues: its conversation waits in RAM and its cells come here, so the two
+            // copies never hold VRAM at once
+            if (!kv_ok && kv_short && slot_source >= 0 && !bs[(size_t) slot_source].active &&
+                (bslot_ss[0][(size_t) slot_source].get() != &ss || in_slot) &&
+                bslot_ss[0][(size_t) slot_source]->gdn_state != rsp->gdn_state) {
+                basalt::core::SessionState& from = *bslot_ss[0][(size_t) slot_source];
+                const int64_t had = basalt::core::session_kv_cells(from);
+                std::string he;
+                if (hold_slot(slot_source, slot_ck, he) && kv_release(from, 0, he)) {
+                    bs[(size_t) slot_source].cached = false;   // its cells are this request's now
+                    solo_moved = &from == &ss;
+                    basalt::log::info("basalt batch", "slot %d's conversation waits in RAM while its %lld KV cells back "
+                                      "this request", slot_source, (long long) (had - basalt::core::session_kv_cells(from)));
+                    err.clear();
+                    kv_ok = kv_fit(*rsp, kv_need + kKvGrowCells, err, true, kv_need + kKvWindowCells);
+                } else {
+                    slot_held = SlotHeld{};
+                    err = he;
+                    kv_short = false;
+                }
+            }
+            if (!kv_ok && kv_short) {
+                // declined: the engine stays up, the solo session and its bookkeeping as they were
+                slot_held = SlotHeld{};
+                basalt::log::warn("basalt serve", "prompt of %lld tokens refused: %s", (long long) n, err.c_str());
+                std::printf("ERR %s\n", err.c_str());
+                std::fflush(stdout);
+                if (in_slot) {
+                    if (solo_req && !ver.bind_session(&ss, err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    rsp = &ss;
+                    sp.set_session(ss);
+                    if (mtp_on) mtp.set_ple_session(&ss);
+                    live = std::move(solo_book.live);
+                    live_imgs = std::move(solo_book.live_imgs);
+                    live_ok = solo_book.live_ok;
+                    cvec_cached = solo_book.cvec;
+                    checks = std::move(solo_book.checks);
+                    if (solo_moved) {
+                        live.clear();
+                        live_imgs.clear();
+                        live_ok = false;
+                        checks.clear();
+                    }
+                }
+                admit_slot = -1;
+                continue;
+            }
+            if (!kv_ok) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
@@ -8586,6 +8760,7 @@ int main(int argc, char** argv) {
                     basalt::log::warn("basalt batch", "restoring slot %d failed (%s); reading the prompt",
                                  slot_source, err.c_str());
                     err.clear();
+                    slot_held = SlotHeld{};
                     live.clear();
                     live_imgs.clear();
                     checks.clear();
@@ -9849,6 +10024,7 @@ int main(int argc, char** argv) {
             consumed.reserve((size_t) (n + max_new + S));
             for (int64_t i = 0; i < fold_p0; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             const char* finish = "length";
+            std::string kv_stop;   // the elastic KV could not back the next window: the request ends on this error
             // pipelined windows: `cv` runs the next window, `ov` is the other chain; a guess that held leaves the next
             // window's verdict in `held`
             basalt::core::Verifier* cv = &ver;
@@ -9981,7 +10157,11 @@ int main(int argc, char** argv) {
                 if (kv_floor > 0 && p + T + 64 > basalt::core::session_kv_cells(*rsp)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     if (copy_live) { src.commit_exchanges(); copy_live = false; }   // as at the request's end
-                    if (!kv_fit(*rsp, p + kKvGrowCells, err)) {
+                    if (!kv_fit(*rsp, p + kKvGrowCells, err, true, p + kKvWindowCells)) {
+                        if (kv_short) {
+                            kv_stop = err;
+                            break;
+                        }
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
                     }
@@ -10436,8 +10616,12 @@ int main(int argc, char** argv) {
             //      [prompt tokens read]   (fewer than <prompt> - <reused> when a cancel stopped the read)
             //      [offloaded]   (the decode's routed experts the GPU read over PCIe or another GPU computed;
             //                    not in [lookups])
-            const bool ram_out = ram_stop.load();
-            if (ram_out) {
+            const bool ram_out = ram_stop.load() || !kv_stop.empty();
+            if (!kv_stop.empty()) {
+                basalt::log::warn("basalt serve", "request stopped after %lld tokens: %s", (long long) produced_n,
+                                  kv_stop.c_str());
+                std::printf("ERR %s\n", kv_stop.c_str());
+            } else if (ram_out) {
                 // the client gets the reason as the request's error; the engine stays up for the next request
                 uint64_t avail = 0, floor = 0;
                 (void) basalt::platform::ram_guard_low(&avail, &floor);
@@ -10556,6 +10740,12 @@ int main(int argc, char** argv) {
                 live_ok = solo_book.live_ok;
                 cvec_cached = solo_book.cvec;
                 checks = std::move(solo_book.checks);
+                if (solo_moved) {   // its cells went to this request (hold_slot)
+                    live.clear();
+                    live_imgs.clear();
+                    live_ok = false;
+                    checks.clear();
+                }
             }
             if (drive.routing != nullptr) std::fflush(drive.routing);   // the routing trace survives a crash and is watchable mid-session
             // "12288 of 98179" when cancelled mid-read, the rate from what was read

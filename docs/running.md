@@ -30,7 +30,10 @@ The next request that needs less gives the cells back and the cache refills the 
 decodes with the cache a 32k context would have, whatever `--max-context` is. With `--parallel` every slot is elastic
 once its share of the context is above 4096 tokens: it backs 4096 cells at startup and grows by 4096, so idle and short
 slots leave their VRAM to the expert cache. The startup line `elastic KV: ...` says
-how much of the cache is lent this way, and each move is logged (`elastic KV: N cells backed ...`).
+how much of the cache is lent this way, and each move is logged (`elastic KV: N cells backed ...`). The cache never goes
+below the slots a prompt chunk needs: a request whose KV would take it there, even after the other sessions give back
+the cells they do not hold, is refused with that error, and a reply that grows past it ends with it (a `--parallel`
+slot ends as at its length limit); the engine keeps running.
 
 While other slots are decoding, a new prompt of up to 16384 tokens is read at once: the slots wait for it (a few
 seconds at most), and it is read as in the single-stream path: the same chunks and streamed ring, the CPU pool's
