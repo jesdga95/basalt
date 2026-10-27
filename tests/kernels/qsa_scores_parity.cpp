@@ -260,6 +260,37 @@ int main(int argc, char** argv) {
             std::printf("bench top-k nq=%d: %7.2f us/call\n", nq, us);
         }
     }
+    {   // microbench at the serving depths: 3 and 8 rows, the keys of 40K and 131K contexts, warm and flushed
+        const int64_t mb = 131072 / R + 1;
+        std::vector<float> kh((size_t) mb * ID);
+        for (auto& x : kh) x = nd(rng);
+        float* d_k = dalloc<float>(kh.size());
+        up(d_k, kh);
+        float* d_s = dalloc<float>((size_t) 8 * mb);
+        std::vector<float> q((size_t) 8 * IQ * ID);
+        for (auto& x : q) x = nd(rng);
+        up(d_q, q);
+        const size_t flush_n = 256u << 20;
+        char* flush = dalloc<char>(flush_n);
+        for (int nq : {3, 8})
+        for (int64_t ctx : {40960, 131072}) {
+            std::vector<int32_t> steps((size_t) nq * k::kStepCount, 0);
+            for (int i = 0; i < nq; ++i) {
+                const int64_t nkv = ctx - nq + i;
+                steps[i * k::kStepCount + k::kStepNKv] = (int32_t) nkv;
+                steps[i * k::kStepCount + k::kStepNBid] = (int32_t) (nkv / R);
+                steps[i * k::kStepCount + k::kStepWidth] = (int) k::qsa_selection_width(nkv, S_);
+            }
+            up(d_steps, steps);
+            const double bytes = (double) (ctx / R) * ID * 4;
+            for (int cold = 0; cold < 2; ++cold) {
+                const double us = time_us(st, iters, cold ? flush : nullptr, flush_n,
+                                          [&] { k::qsa_block_scores(d_k, d_dead, d_q, d_steps, nq, mb, S_, d_s, st, -1, true); });
+                std::printf("bench scores %d rows, %6lld cells, keys %-5s: %7.2f us/call, keys %.1f MB = %.0f GB/s\n", nq,
+                            (long long) ctx, cold ? "cold" : "warm", us, bytes / 1e6, bytes / us / 1e3);
+            }
+        }
+    }
     std::printf("qsa_scores_parity: %s\n", g_fail ? "FAIL" : "OK");
     return g_fail ? 1 : 0;
 }
