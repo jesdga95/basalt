@@ -652,8 +652,7 @@ bool Verifier::dm_init(std::string& err) {
         d->pin = nullptr;
     }
     // the warm-ups' predictors, quantized once: every layer's router in int8 for the peer's, in 4-bit for the CPU pool's
-    const bool cpu_warm = warm_pool_ != nullptr && warm_src_ != nullptr && K <= 16 &&
-                          (int64_t) lay.fmt.size() >= g.n_layers;
+    const bool cpu_warm = warm_pool_ != nullptr && warm_src_ != nullptr && K <= 16;
     std::vector<int8_t> rq_h;
     std::vector<float> rs_h;
     std::vector<uint8_t> rq4_h;
