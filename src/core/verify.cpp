@@ -81,10 +81,10 @@ struct CpuWarm {
                               ///< and value i + 16 in its high nibble, each the code plus 8
     std::vector<float> rs;    ///< [n_layers][n_expert][n_embd / 32]
     int n_expert = 0, n_embd = 0, k = 0;
-    size_t bytes = 0, down_off = 0;   ///< a blob's bytes, where its down rows start
     ExpertSource* src = nullptr;
     // the job in flight
     int layer = 0, n_tok = 0;
+    size_t bytes = 0, down_off = 0;                   ///< the layer's blob bytes, where its down rows start
     const uint8_t* xq = nullptr;                      ///< the ring's q8_1 rows, tokens back to back
     const int32_t* res0 = nullptr, *res1 = nullptr;   ///< the layer's CUDA0 / peer residency (res1 may be null)
     std::vector<float> logits;                        ///< [kVerifyMaxT][n_expert]
@@ -646,9 +646,7 @@ bool Verifier::dm_init(std::string& err) {
     }
     // the warm-ups' predictors, quantized once: every layer's router in int8 for the peer's, in 4-bit for the CPU pool's
     const bool cpu_warm = warm_pool_ != nullptr && warm_src_ != nullptr && K <= 16 &&
-                          std::all_of(lay.fmt.begin(), lay.fmt.end(), [&](const basalt::kernels::cpu::NativeFmt& f) {
-                              return f.bytes == lay.fmt[0].bytes && f.down_off == lay.fmt[0].down_off;
-                          });
+                          (int64_t) lay.fmt.size() >= g.n_layers;
     std::vector<int8_t> rq_h;
     std::vector<float> rs_h;
     std::vector<uint8_t> rq4_h;
@@ -734,8 +732,6 @@ bool Verifier::dm_init(std::string& err) {
         w->rq = std::move(rq4_h);
         w->rs = std::move(rs4_h);
         w->n_expert = (int) g.n_expert; w->n_embd = (int) N; w->k = (int) K; w->src = warm_src_;
-        w->bytes = lay.fmt[0].bytes;
-        w->down_off = lay.fmt[0].down_off;
         w->logits.assign((size_t) kVerifyMaxT * g.n_expert, 0.0f);
         d->warm = w;
     }
@@ -3992,7 +3988,10 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
         if (dm_ != nullptr && dm_->warm != nullptr && l + 1 < le_) {   // the next layer's warm-up
             CpuWarm& w = *dm_->warm;
             warm_pool_->idle_stop();
+            const basalt::kernels::cpu::NativeFmt& f = basalt::kernels::cpu::expert_layout().fmt[(size_t) (l + 1)];
             w.layer = (int) (l + 1);
+            w.bytes = f.bytes;
+            w.down_off = f.down_off;
             w.n_tok = std::min(n, (int) kVerifyMaxT);
             w.xq = dm_->h_xq + (size_t) k * dm_->xq_stride;
             w.res0 = dm_->shadow0.data() + (size_t) (l + 1) * g.n_expert;
