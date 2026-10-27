@@ -4937,8 +4937,8 @@ int main(int argc, char** argv) {
         if (!multi_gpu && !prompt_peer() && main_link_gbps > 0.0) {   // before the loan and init, which size by it
             const bool ram_ok = srcp == &src && src.complement_ready();
             const bool arena_ok = srcp == &arena_src && arena_src.mapped();
-            uint64_t nonres = 0;
-            const char* off = basalt::prefill::Prefill::pinned_share() < 0.9 ? "experts outside pinned RAM" : nullptr;
+            uint64_t nonres = 0, pinned = 0;   // the bytes a streamed chunk copies, and those from pinned RAM
+            const char* off = nullptr;
             for (int64_t l = 0; l < g.n_layers && off == nullptr; ++l)
                 for (int64_t e = 0; e < g.n_expert; ++e) {
                     const size_t i = (size_t) (l * g.n_expert + e);
@@ -4947,17 +4947,22 @@ int main(int argc, char** argv) {
                         off = peer.valid() && peer.has(l, e) ? "peer-only experts" : "experts only in the file";
                         break;
                     }
-                    nonres += basalt::kernels::cpu::expert_layout().blob_bytes(l);
+                    const uint64_t b = basalt::kernels::cpu::expert_layout().blob_bytes(l);
+                    nonres += b;
+                    if (srcp->pinned(l, e)) pinned += b;
                 }
+            if (off == nullptr && (double) pinned < 0.9 * (double) nonres) off = "streamed experts outside pinned RAM";
             if (off == nullptr && nonres > 0) {
                 stream_all_priced = basalt::prefill::stream_all_min_for(nonres, main_link_gbps);
                 set_stream_all_min();
                 basalt::log::info("basalt serve", "prompt path: every expert streams from %lld-token chunks (%.1f GiB "
-                                     "non-resident, link %.1f GB/s)", (long long) stream_all_priced,
-                             (double) nonres / 1073741824.0, main_link_gbps);
+                                     "non-resident, %.0f%% pinned, link %.1f GB/s)", (long long) stream_all_priced,
+                             (double) nonres / 1073741824.0, 100.0 * (double) pinned / (double) nonres, main_link_gbps);
             } else {
-                basalt::log::info("basalt serve", "prompt path: every expert streams from %lld-token chunks (%s)",
-                             (long long) basalt::prefill::kStreamAllDefault, off != nullptr ? off : "every expert resident");
+                basalt::log::info("basalt serve", "prompt path: every expert streams from %lld-token chunks (%s; %.0f%% of "
+                                     "%.1f GiB pinned)", (long long) basalt::prefill::kStreamAllDefault,
+                             off != nullptr ? off : "every expert resident",
+                             nonres > 0 ? 100.0 * (double) pinned / (double) nonres : 0.0, (double) nonres / 1073741824.0);
             }
         }
         basalt::prefill::Prefill sp;
