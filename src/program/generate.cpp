@@ -10030,6 +10030,7 @@ int main(int argc, char** argv) {
             bool first_window = true;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             int64_t draft_offered = 0, draft_accepted = 0;
+            const int64_t mtp_rounds0 = mtp.rounds, mtp_added0 = mtp.rounds_added;
             // what the session holds once this request is done: the prompt read so far, then every committed token
             std::vector<int32_t> consumed;
             consumed.reserve((size_t) (n + max_new + S));
@@ -10818,6 +10819,9 @@ int main(int argc, char** argv) {
             if (sfx_windows > 0)
                 basalt::log::info("basalt serve", "suffix drafts: %lld windows, %lld of %lld drafts accepted",
                              (long long) sfx_windows, (long long) sfx_ok, (long long) sfx_drafts);
+            if (mtp.tiered() && mtp.rounds > mtp_rounds0)
+                basalt::log::info("basalt serve", "draft head: %lld of %lld rounds read the added rows",
+                             (long long) (mtp.rounds_added - mtp_added0), (long long) (mtp.rounds - mtp_rounds0));
             for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
                 basalt::log::info("basalt serve", "CUDA%d: %lld expert entries, %lld active layer launches, %.1f MiB returned "
                                      "(%.1f MiB with full rows) in this request; host %.0f ms staging+launching, %.0f ms "

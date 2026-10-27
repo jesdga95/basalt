@@ -158,6 +158,9 @@ public:
 
     double ms_draft = 0, ms_prefill = 0;
     int64_t rounds = 0;
+    int64_t rounds_added = 0;   ///< rounds whose drafts read the subset's added rows too (tier 1)
+    /// whether the draft head's subset has added rows (rounds_added counts)
+    bool tiered() const { return !tier2_.empty(); }
 
     /// the prompt path computes this layer's prompt K/V in batches (Prefill::draft_kv): its tensors, its K/V
     /// state, the first cell a round can still read, its device, and a wait for its own stream.
