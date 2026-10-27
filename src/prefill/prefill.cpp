@@ -1255,6 +1255,7 @@ void Prefill::set_ring_remote(const int32_t* res, const core::ExpertCache* cache
 }
 
 void Prefill::set_peer_share(bool on) { impl_->peer_share = on; }
+int64_t Prefill::peer_routed_rows_max() const { return impl_->pp ? impl_->pp->T_max : 0; }
 
 void Prefill::set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
     if (layer_end < 0 && impl_->g != nullptr) layer_end = impl_->g->n_layers;   // after init: resolved here

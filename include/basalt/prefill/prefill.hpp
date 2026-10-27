@@ -148,6 +148,8 @@ public:
     /// Off: the peer card's share (set_peer) is skipped, every expert of a chunk stays on this card - while the peer
     /// card runs a stage of the same prompt.
     void set_peer_share(bool on);
+    /// The longest routed-only chunk whose rows of its experts the peer computes (0: no peer share).
+    int64_t peer_routed_rows_max() const;
 
     /// The CPU expert pool (idle while a prompt is read). A chunk below stream_all_min() tokens hands it the
     /// non-resident experts with a host copy that few of its tokens route to, instead of streaming them; their rows

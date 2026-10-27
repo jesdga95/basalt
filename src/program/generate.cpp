@@ -4851,6 +4851,7 @@ int main(int argc, char** argv) {
     // layers [lo, hi) and image bytes: both prices, and the split's chunk and head chunk
     struct SplitPricing { basalt::program::PsPrice price; int64_t chunk = 0, head = 0; std::string why; };
     int64_t split_hand_rows = 0;   // the rows each hand-off buffer holds (0 before they exist: a chunk's)
+    int64_t split_peer_rows = 0;   // the longest routed-only chunk a slower tier card computes its experts' rows of
     auto split_price = [&](int64_t a0, int64_t b0, int64_t prompt_end, int max_stages) -> SplitPricing {
         SplitPricing sp0;
         const int64_t n_tok = b0 - a0;
@@ -4859,7 +4860,18 @@ int main(int argc, char** argv) {
         const auto [chunk, head] = one_card_chunks(n_tok, read_cap(), true);
         if (n_tok <= std::max(chunk, head)) return sp0;   // one chunk: read on the main card, no reason to give
         char why[160];
-        if (chunk < 4096) {
+        // a slower tier card that computes its experts' rows of the routed-only chunks of a CUDA0 read: the split
+        // gives that share up and the price does not count it, so those chunks stay on CUDA0; any other tier set keeps
+        // the 4096-token floor
+        if (!peer_streamed_share && split_peer_rows > 0) {
+            if (chunk <= split_peer_rows) {
+                std::snprintf(why, sizeof why, "chunks of %lld tokens: CUDA0 alone reads them with the tier card "
+                              "computing its experts' rows (up to %lld tokens)", (long long) chunk,
+                              (long long) split_peer_rows);
+                sp0.why = why;
+                return sp0;
+            }
+        } else if (chunk < 4096) {
             std::snprintf(why, sizeof why, "chunks of %lld tokens, below the 4096 minimum", (long long) chunk);
             sp0.why = why;
             return sp0;
@@ -5387,6 +5399,7 @@ int main(int argc, char** argv) {
                 basalt::log::warn("basalt serve", "%s - the prompt path stays on the primary GPU", err.c_str());
                 err.clear();
             }
+            split_peer_rows = sp.peer_routed_rows_max();
         }
         // ---- the prompt-time split's stages on the tier cards.  A stage's place, from the end of its tier's slots: the
         // weights, the session (for the whole context here; for its prompt's cells and layers at each read), then the

@@ -82,7 +82,9 @@ begin with `prompt split:` and print the prices; a part longer than one chunk th
 (`prompt split: N tokens read on CUDA0 (...)`). The chunks are the main card's own, so a part of one chunk (up to
 32,768 tokens) stays on the main card. The draft layer's rows of the prompt's last cells come back from the last card in
 the hand-off buffers (the last two chunks handed on where they came in, earlier ones past the chunk in both), so the
-smaller chunks of a deep prompt, whose KV leaves the main card fewer slots to lend, still split. On three or more cards it runs when they all match (memory bandwidth and VRAM
+smaller chunks of a deep prompt, whose KV leaves the main card fewer slots to lend, still split. With a slower tier card, a chunk short enough to be read
+routed-only with that card computing its experts' rows of it in a main-card read stays on the main card (the split would
+give that share up); with matched cards, a chunk under 4,096 tokens does. On three or more cards it runs when they all match (memory bandwidth and VRAM
 within 10%); on three or more unlike cards it is off until measured on such a set, and the start line prints what it
 would cost. Off with `--peer-exclusive`, without the RAM copy of the experts, with KV streaming, a
 control vector, experts other than NVFP4 (the price is fitted to those), when RAM or a tier's slots are short, or when a
