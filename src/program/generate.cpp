@@ -69,6 +69,7 @@
 #include "basalt/core/mtp.hpp"
 #include "basalt/prefill/gemm.hpp"
 #include "basalt/prefill/prefill.hpp"
+#include "basalt/prefill/stream_all.hpp"
 #include "basalt/core/native_dense.hpp"
 #include "basalt/program/logits_selection.hpp"
 #include "basalt/program/conv_cache.hpp"
@@ -1338,9 +1339,11 @@ int main(int argc, char** argv) {
     // Chunks below this take the routed-only path; from it on every expert streams through the ring.  With a prompt
     // peer the peer card computes its experts' rows on the routed path, and streaming also moves the experts the
     // primary lacks over its link; with --peer-exclusive that includes the peer-only experts, staged through the host,
-    // so streaming loses until later.  On one card the size is priced from the non-resident experts' bytes and the
-    // probed link (Prefill::stream_all_min_for) once the tiers are placed: a fixed function of the placement and the
-    // link, never of a read's timing, since the two paths round differently.
+    // so streaming loses until later.  On one card the serve path prices the size from the non-resident experts' bytes
+    // and the probed link (stream_all.hpp) once the tiers are placed: a fixed function of the placement and the link,
+    // never of a read's timing, since the two paths round differently.  Only a placement like the one the price was
+    // measured on is priced (every non-resident expert copied from pinned RAM); any other keeps the default, as does
+    // the one-shot path.
     int64_t stream_all_priced = 0;   // the one-card price, once known
     auto prompt_peer = [&]() { return o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0 && peer_streamed_share; };
     auto set_stream_all_min = [&]() {
@@ -4932,17 +4935,30 @@ int main(int argc, char** argv) {
             return 2;
         }
         if (!multi_gpu && !prompt_peer() && main_link_gbps > 0.0) {   // before the loan and init, which size by it
+            const bool ram_ok = srcp == &src && src.complement_ready();
+            const bool arena_ok = srcp == &arena_src && arena_src.mapped();
             uint64_t nonres = 0;
-            for (int64_t l = 0; l < g.n_layers; ++l)
+            const char* off = basalt::prefill::Prefill::pinned_share() < 0.9 ? "experts outside pinned RAM" : nullptr;
+            for (int64_t l = 0; l < g.n_layers && off == nullptr; ++l)
                 for (int64_t e = 0; e < g.n_expert; ++e) {
                     const size_t i = (size_t) (l * g.n_expert + e);
-                    if (i >= host_res.size() || host_res[i] < 0) nonres += basalt::kernels::cpu::expert_layout().blob_bytes(l);
+                    if (i < host_res.size() && host_res[i] >= 0) continue;
+                    if (!arena_ok && !(ram_ok && src.has_resident(l, e))) {
+                        off = peer.valid() && peer.has(l, e) ? "peer-only experts" : "experts only in the file";
+                        break;
+                    }
+                    nonres += basalt::kernels::cpu::expert_layout().blob_bytes(l);
                 }
-            stream_all_priced = basalt::prefill::Prefill::stream_all_min_for(nonres, main_link_gbps);
-            set_stream_all_min();
-            basalt::log::info("basalt serve", "prompt path: every expert streams from %lld-token chunks (%.1f GiB "
-                                 "non-resident, link %.1f GB/s)", (long long) stream_all_priced,
-                         (double) nonres / 1073741824.0, main_link_gbps);
+            if (off == nullptr && nonres > 0) {
+                stream_all_priced = basalt::prefill::stream_all_min_for(nonres, main_link_gbps);
+                set_stream_all_min();
+                basalt::log::info("basalt serve", "prompt path: every expert streams from %lld-token chunks (%.1f GiB "
+                                     "non-resident, link %.1f GB/s)", (long long) stream_all_priced,
+                             (double) nonres / 1073741824.0, main_link_gbps);
+            } else {
+                basalt::log::info("basalt serve", "prompt path: every expert streams from %lld-token chunks (%s)",
+                             (long long) basalt::prefill::kStreamAllDefault, off != nullptr ? off : "every expert resident");
+            }
         }
         basalt::prefill::Prefill sp;
         void* borrow = nullptr;

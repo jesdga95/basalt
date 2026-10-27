@@ -1,5 +1,6 @@
 // src/prefill/prefill.cpp - see include/basalt/prefill/prefill.hpp.
 #include "basalt/prefill/prefill.hpp"
+#include "basalt/prefill/stream_all.hpp"
 #include "basalt/core/mtp.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/core/diag.hpp"
@@ -74,13 +75,7 @@ inline int ahead_slots(size_t T) { return (int) std::min<size_t>(kAheadSlots, T 
 // ring_slots()-slot ring (nearly every expert is routed at such a chunk), so the copy engine keeps working through the
 // attention halves instead of waiting for each layer's routing.
 constexpr int RING_MAX = 384;           // the arrays; the ring itself is ring_slots()
-// The chunk size from which every expert streams: below it only the routed experts are staged.  Streaming copies
-// every non-resident expert over the link whatever the chunk, while the routed-only path spends more per token, so
-// streaming pays from the chunk whose extra routed-only time outlasts that copy (stream_all_min_for).  The default holds
-// when the link is unknown and caps the priced value, since the buffers are sized by it; the floor keeps the smallest
-// chunks, where few experts are routed, on the routed path.
-constexpr int64_t kStreamAllDefault = 6144, kStreamAllFloor = 2048;
-constexpr double kRoutedExtraMs = 0.24;   // the routed-only path's time per token beyond the streamed path's
+// The chunk size from which every expert streams: below it only the routed experts are staged (stream_all.hpp).
 int64_t g_stream_all_min = kStreamAllDefault;
 inline int64_t stream_all_min() { return g_stream_all_min; }
 // The streamed ring's slots (one whole expert blob each, the same for every pack).  g_ring_depth caps the depth the
@@ -1418,12 +1413,6 @@ double g_pinned_share = 1.0;
 }
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
 void Prefill::set_stream_all_min(int64_t tokens) { g_stream_all_min = tokens; }
-int64_t Prefill::stream_all_min_for(uint64_t bytes, double gbps) {
-    if (gbps <= 0.0) return kStreamAllDefault;
-    const double copy_ms = (double) bytes / (gbps * 1e6);
-    const int64_t t = (int64_t) std::ceil(copy_ms / kRoutedExtraMs / 256.0) * 256;
-    return std::min(std::max(t, kStreamAllFloor), kStreamAllDefault);
-}
 void Prefill::set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
 void Prefill::set_cpu_share(double share) { impl_->cpu_share_now = std::max(0.0, std::min(share, 1.0)); }
 void Prefill::set_ring_depth(int slots) { g_ring_depth = std::max(STAGE + 1, std::min(slots, kPrefillRingDeep)); }
