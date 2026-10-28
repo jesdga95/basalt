@@ -33,18 +33,20 @@ Size fit_size(int w, int h, const Geometry& g) {
     if (w <= 0 || h <= 0) return {0, 0};
     const int f = g.patch * g.merge;
     const int64_t min_px = (int64_t) g.min_tokens * f * f, max_px = (int64_t) g.max_tokens * f * f;
-    auto round_f = [f](float x) { return (int) std::round(x / (float) f) * f; };
-    auto ceil_f = [f](float x) { return (int) std::ceil(x / (float) f) * f; };
-    auto floor_f = [f](float x) { return (int) std::floor(x / (float) f) * f; };
-    int wb = std::max(f, round_f((float) w)), hb = std::max(f, round_f((float) h));
+    // the reference smart_resize's arithmetic: doubles, and Python round() (nearbyint rounds half to even in the
+    // default rounding mode)
+    auto round_f = [f](double x) { return (int) std::nearbyint(x / (double) f) * f; };
+    auto ceil_f = [f](double x) { return (int) std::ceil(x / (double) f) * f; };
+    auto floor_f = [f](double x) { return (int) std::floor(x / (double) f) * f; };
+    int wb = round_f((double) w), hb = round_f((double) h);
     if ((int64_t) hb * wb > max_px) {
-        const float beta = std::sqrt((float) h * (float) w / (float) max_px);
-        hb = std::max(f, floor_f((float) h / beta));
-        wb = std::max(f, floor_f((float) w / beta));
+        const double beta = std::sqrt((double) h * (double) w / (double) max_px);
+        hb = std::max(f, floor_f((double) h / beta));
+        wb = std::max(f, floor_f((double) w / beta));
     } else if ((int64_t) hb * wb < min_px) {
-        const float beta = std::sqrt((float) min_px / ((float) h * (float) w));
-        hb = ceil_f((float) h * beta);
-        wb = ceil_f((float) w * beta);
+        const double beta = std::sqrt((double) min_px / ((double) h * (double) w));
+        hb = ceil_f((double) h * beta);
+        wb = ceil_f((double) w * beta);
     }
     return {wb, hb};
 }
@@ -163,25 +165,7 @@ Image resize_bicubic(const Image& s, int ow, int oh) {
 }  // namespace
 
 Image to_canvas(const Image& src, Size target) {
-    if (src.w == target.w && src.h == target.h) return src;
-    const float sw = (float) target.w / src.w, sh = (float) target.h / src.h;
-    const float scale = std::min(sw, sh);
-    const int nw = std::min((int) std::ceil(src.w * scale), target.w);
-    const int nh = std::min((int) std::ceil(src.h * scale), target.h);
-    const Image r = resize_bicubic(src, nw, nh);
-    Image out;
-    out.w = target.w;
-    out.h = target.h;
-    out.rgb.assign((size_t) target.w * target.h * 3, 0);
-    const int ox = (target.w - nw) / 2, oy = (target.h - nh) / 2;
-    for (int y = 0; y < nh; ++y) {
-        if (y + oy < 0 || y + oy >= target.h) continue;
-        for (int x = 0; x < nw; ++x) {
-            if (x + ox < 0 || x + ox >= target.w) continue;
-            std::copy_n(&r.rgb[((size_t) y * nw + x) * 3], 3, &out.rgb[((size_t) (y + oy) * target.w + x + ox) * 3]);
-        }
-    }
-    return out;
+    return resize_bicubic(src, target.w, target.h);
 }
 
 void normalize_planar(const Image& c, std::vector<float>& out) {
