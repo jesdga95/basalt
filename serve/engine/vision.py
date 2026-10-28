@@ -23,6 +23,7 @@ from serve.util.console import tagged
 VISION_READY_S = 300.0
 VISION_ENCODE_S = 300.0
 VISION_CACHE_BYTES = 1 << 30                    # room for about 64 images
+IMAGE_MAX_PIXELS = 64 << 20                     # matches the decoder's kMaxImagePixels
 
 
 class Vision:
@@ -122,7 +123,8 @@ class Vision:
     @staticmethod
     def normalize(data: bytes) -> bytes:
         """Formats the decoder reads pass through; others are converted to PNG. A JPEG with an EXIF Orientation
-        other than 1 is turned upright first (needs Pillow)."""
+        other than 1 is turned upright first (needs Pillow). An image past IMAGE_MAX_PIXELS is refused before its
+        pixels are loaded; the decoder enforces the same budget for the formats it reads itself."""
         jpeg = data[:3] == b"\xff\xd8\xff"
         if (jpeg and not Vision._exif_rotated(data)) or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"BM" or \
                 data[:6] in (b"GIF87a", b"GIF89a"):
@@ -135,9 +137,17 @@ class Vision:
                              "GIF work without it") from None
         try:
             im = Image.open(io.BytesIO(data))
+            width, height = im.size
+            if width * height > IMAGE_MAX_PIXELS:
+                raise ValueError(f"the image is {width}x{height} pixels; the limit is "
+                                 f"{IMAGE_MAX_PIXELS >> 20} megapixels")
             im.load()
             from PIL import ImageOps
             im = ImageOps.exif_transpose(im)             # the camera's orientation tag, applied
+        except ValueError:
+            raise                                        # the pixel budget's own message
+        except Image.DecompressionBombError:
+            raise ValueError(f"the image is larger than {IMAGE_MAX_PIXELS >> 20} megapixels") from None
         except Exception as e:
             raise ValueError(f"the image could not be read ({e})") from None
         if im.mode in ("RGBA", "LA", "P") and "transparency" in im.info or im.mode in ("RGBA", "LA"):

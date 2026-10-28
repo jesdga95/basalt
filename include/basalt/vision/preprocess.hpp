@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+
 namespace basalt::vision {
 
 struct Image {
@@ -30,8 +31,15 @@ struct Size {
     bool operator==(const Size& o) const { return w == o.w && h == o.h; }
 };
 
-/// JPEG, PNG, BMP or GIF (first frame) from memory, three channels (alpha dropped).  False on a bad image.
-bool decode_image(const uint8_t* data, size_t len, Image& out, std::string& err);
+/// The most pixels one image may have.  A decode guard, not the model's input size: `fit_size` scales the picture
+/// into `max_tokens` merged tokens, so this only bounds the work one request can ask for.  64 MP accepts a phone
+/// camera's full-resolution photo.
+inline constexpr int64_t kMaxImagePixels = 64ll << 20;
+
+/// JPEG, PNG, BMP or GIF (first frame) from memory, three channels (alpha dropped).  False on a bad image, or on
+/// one whose header claims more than `max_pixels` - checked before any pixel buffer is allocated.
+bool decode_image(const uint8_t* data, size_t len, Image& out, std::string& err,
+                  int64_t max_pixels = kMaxImagePixels);
 
 /// The canvas size for a w x h picture: a multiple of patch * merge, within [min_tokens, max_tokens] merged tokens.
 Size fit_size(int w, int h, const Geometry& g);

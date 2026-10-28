@@ -208,6 +208,8 @@ products and flash attention with fp32 accumulation on the GPU, AVX-512/AVX2 on 
 mtmd encoder as a drop-in, is faster than it at every image size, and stays closer to an fp32 reference: mtmd's fp16
 attention drifts on large images, ours does not.
 
+One image is capped at 64 megapixels; a header past it is refused before it is decoded.
+
 ## `PROBE rates` (engine command)
 
 With `--serve`, the line `PROBE rates` on stdin, between requests, measures the machine's rates inside the loaded
