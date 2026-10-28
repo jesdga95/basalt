@@ -169,9 +169,16 @@ Basalt refuses settings that would leave the machine without memory, and never s
   and a round swaps fewer.
 - An explicit `--resident-budget-gib` that would leave less than that floor free is refused at startup; the error
   states the RAM free and the largest safe value ('max').
-- While serving, a request that finds MemAvailable below the margin plus a prompt chunk's file reads, up to 3.5 GiB (the margin alone when no expert is
-  read from the SSD) stops with an error (`RAM low (... free < ... guard): request stopped`, also returned to the
-  client); the server keeps running and takes the next request. Windows does not count the pages read through the
+- While serving, the RAM guard watches MemAvailable against the margin plus a prompt chunk's file reads, up to 3.5 GiB
+  (the margin alone when no expert is read from the SSD). Below it, the engine drops its parked conversations and
+  returns its free heap to the OS, and a request that arrives waits up to 30 s for the RAM to come back before it
+  starts. A running request continues; it stops with an error only when the RAM is critical: under 1 GiB free, or below
+  the guard while the kernel's memory pressure (`/proc/pressure/memory`, avg10) shows tasks stalled (some >= 40% or
+  full >= 10%). Without a pressure reading (Windows, or a kernel without PSI) below the guard is critical. The error
+  (`RAM low (... free < ... guard) ...: request stopped` or `RAM critical (... free < ... hard floor): request
+  stopped`, also returned to the client) names `--resident-budget-gib` only when the engine's own growth took the RAM,
+  otherwise how much other programs took. The server keeps running and takes the next request. Windows does not count
+  the pages read through the
   mapped expert file as available, so within 1 GiB of the guard the engine gives them back first and reads again.
 
 ## Vision: `--vision`

@@ -6445,12 +6445,12 @@ int main(int argc, char** argv) {
             in_lines.pop_front();
             return true;
         };
-        // a request also stops when the RAM guard reads MemAvailable below its floor; `ram_stop` keeps that it did, so
-        // the request ends on an error instead of a cancel
+        // a request also stops when the RAM guard judges the RAM critical; `ram_stop` keeps that it did, so the request
+        // ends on an error instead of a cancel
         std::atomic<bool> ram_stop{false};
         auto halted = [&]() -> bool {
             if (stop_req.load() || stdin_lost.load()) return true;
-            if (!basalt::platform::ram_guard_low()) return false;
+            if (basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Critical) return false;
             ram_stop.store(true);
             return true;
         };
@@ -6571,9 +6571,33 @@ int main(int argc, char** argv) {
         }
         report_expert_tiers();
         basalt::platform::stop_memory_watchdog();
-        // from here a request that runs the RAM below the floor stops with an error instead of the machine swapping
+        // from here the RAM guard watches: below its floor the engine sheds and new requests wait, and a running
+        // request stops only once the RAM is critical
         const uint64_t guard_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), tier_file_bytes, prompt_file_bytes);
         basalt::platform::start_ram_guard(guard_floor);
+        // what a stop's error compares against, to tell the engine's own growth from other programs'
+        const uint64_t ready_avail = basalt::platform::available_memory();
+        const uint64_t ready_rss = (uint64_t) basalt::platform::process_memory().rss_mib << 20;
+        // once per drop below the guard's floor, on the serve thread between steps: the parked conversations go and
+        // the heap's free pages return to the OS.  The checkpoints stay: a live request's rewind and the deferred
+        // copy in flight use them.
+        uint64_t shed_drop = 0;
+        auto shed_if_low = [&]() {
+            if (basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok) return;
+            const uint64_t drop = basalt::platform::ram_guard_drops();
+            if (drop == shed_drop) return;
+            shed_drop = drop;
+            const size_t parked = conversations.size();
+            const size_t freed = conversations.clear();
+            if (freed > 0)
+                basalt::log::info("basalt serve", "RAM guard: dropped %zu parked conversations (%zu MiB)", parked,
+                                  freed >> 20);
+            const uint64_t before = basalt::platform::available_memory();
+            basalt::platform::release_free_heap();
+            const uint64_t after = basalt::platform::available_memory();
+            basalt::log::info("basalt serve", "RAM guard: free heap returned to the OS, %lld MiB free now (%+lld MiB)",
+                              (long long) (after >> 20), ((long long) after - (long long) before) / (1ll << 20));
+        };
         // a VRAM shrink's RAM homes leave the guard's floor above the margin and the top-up's own slack free
         src.set_homes_reserve(guard_floor - std::min(guard_floor, basalt::platform::ram_margin()) + (256ull << 20));
         if (const uint64_t avail = basalt::platform::available_memory(); avail > 0)
@@ -8068,6 +8092,35 @@ int main(int argc, char** argv) {
             stop_req.store(false);   // a STOP that arrived between requests is stale
             ram_stop.store(false);
             err.clear();
+            // RAM below the guard's floor (another program's peak): shed, then let it come back before the request
+            // starts; a STOP ends the wait, and the request then ends as cancelled
+            if (!batch_on() && basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Ok) {
+                shed_if_low();
+                uint64_t avail = 0, floor = 0;
+                (void) basalt::platform::ram_guard_level(&avail, &floor);
+                basalt::log::info("basalt serve", "RAM low (%llu MiB free < %llu MiB guard): the request waits up to "
+                                  "%llu s", (unsigned long long) (avail >> 20), (unsigned long long) (floor >> 20),
+                                  (unsigned long long) (basalt::platform::kRamAdmitWaitMs / 1000));
+                basalt::core::progress_at("RAM wait");
+                const auto w0 = Clock::now();
+                auto waited = [&] {
+                    return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - w0).count();
+                };
+                while (!stop_req.load() && !stdin_lost.load() &&
+                       basalt::platform::ram_admit_waits(basalt::platform::ram_guard_level(), waited())) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    basalt::core::progress_beat();
+                }
+                const basalt::platform::RamLevel level = basalt::platform::ram_guard_level(&avail, &floor);
+                if (level == basalt::platform::RamLevel::Ok)
+                    basalt::log::info("basalt serve", "RAM back after %.1f s (%llu MiB free): the request starts",
+                                      waited() / 1000.0, (unsigned long long) (avail >> 20));
+                else if (!stop_req.load() && !stdin_lost.load())
+                    basalt::log::warn("basalt serve", "RAM still low after %.1f s (%llu MiB free < %llu MiB guard): the "
+                                      "request starts", waited() / 1000.0, (unsigned long long) (avail >> 20),
+                                      (unsigned long long) (floor >> 20));
+                basalt::core::progress_at("request");
+            }
             if (mtp_on && !mtp.use_main(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }   // (batch windows swap the draft K/V)
             const bool geni = line.rfind("GENI ", 0) == 0;
             if (!geni && line.rfind("GEN ", 0) != 0) {
@@ -10367,6 +10420,7 @@ int main(int argc, char** argv) {
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 basalt::core::decode_gaps().mark(17);
                 if (eos) { finish = "stop"; break; }
+                shed_if_low();
                 if (halted()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
                 p += a + 1;
@@ -10440,13 +10494,16 @@ int main(int argc, char** argv) {
             } else if (ram_out) {
                 // the client gets the reason as the request's error; the engine stays up for the next request
                 uint64_t avail = 0, floor = 0;
-                (void) basalt::platform::ram_guard_low(&avail, &floor);
-                char msg[320];
-                std::snprintf(msg, sizeof msg, "RAM low (%llu MiB free < %llu MiB guard): request stopped; lower "
-                                               "--resident-budget-gib",
-                              (unsigned long long) (avail >> 20), (unsigned long long) (floor >> 20));
-                basalt::log::error("basalt", "%s", msg);
-                std::printf("ERR %s\n", msg);
+                basalt::platform::MemoryStalls stalls;
+                (void) basalt::platform::ram_guard_level(&avail, &floor, &stalls);
+                // what the engine grew by since it was ready, and what the rest of the drop in free RAM went to
+                const uint64_t rss = (uint64_t) basalt::platform::process_memory().rss_mib << 20;
+                const uint64_t own = rss > ready_rss ? rss - ready_rss : 0;
+                const uint64_t drop = ready_avail > avail ? ready_avail - avail : 0;
+                const std::string msg = basalt::platform::ram_stop_message(avail, floor, basalt::platform::kRamHardFloor,
+                                                                           stalls, drop > own ? drop - own : 0, own);
+                basalt::log::error("basalt", "%s", msg.c_str());
+                std::printf("ERR %s\n", msg.c_str());
             }
             if (!ram_out && yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
             if (!ram_out) std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld\n",
