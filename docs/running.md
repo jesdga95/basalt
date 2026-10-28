@@ -40,7 +40,9 @@ seconds at most), and it is read as in the single-stream path: the same chunks a
 share of its experts. Its first token so comes about as soon as on an idle engine. A longer prompt is read beside them:
 the prompt path runs on its own thread, the slots' decode windows keep running (their kernels take the higher stream
 priority), and the few steps that touch the draft layer or the output run between two windows, so a long prompt does
-not stop the other requests. A prompt that arrives while no other slot is decoding is read as in the single-stream
+not stop the other requests. The cache slots its loan and its KV take hold, before they are taken, only experts the
+decoding slots route least: the ones they routed lately trade places with less-routed experts of their layer, so the
+slots keep their experts in VRAM while the prompt is read. A prompt that arrives while no other slot is decoding is read as in the single-stream
 path.
 
 On one card, a batch window's layer with enough CPU misses sends a share of them over PCIe: CUDA0 copies them from

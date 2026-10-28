@@ -6858,6 +6858,59 @@ int main(int argc, char** argv) {
             return std::min<int64_t>(f, xcache.full_slots());
         };
         bool kv_short = false;   // the last kv_fit refused: the cells would take the cache below its floor
+        bool kv_keep_routed = false;   // an admission while slots decode: a shrink keeps their routed experts
+        // The experts the decoding slots routed lately leave CUDA0's slots from `first` on, which a prompt's loan or the
+        // KV is about to take: each trades places with a less-routed expert of its layer below `first` that has a RAM
+        // copy (a slot keeps its layer's size; the experts from `first` on come back from RAM).  One blob copy per
+        // trade; the table is uploaded by the caller.  `why` names the taker for the log.
+        auto move_routed_below = [&](int64_t first, const char* why, std::string& e) -> bool {
+            if (drive.d.usage.empty() || srcp != &src || !src.complement_ready() || multi_gpu || first <= 0 ||
+                first >= xcache.slots())
+                return true;
+            const auto t0 = Clock::now();
+            const auto& lay = basalt::kernels::cpu::expert_layout();
+            int64_t moved = 0, routed = 0;
+            std::vector<int32_t> hot, cold;
+            for (int64_t l = 0; l < g.n_layers; ++l) {
+                const float* u = drive.d.usage.data() + (size_t) (l * g.n_expert);
+                int32_t* r = host_res.data() + (size_t) (l * g.n_expert);
+                hot.clear();
+                cold.clear();
+                for (int32_t ex = 0; ex < (int32_t) g.n_expert; ++ex) {
+                    if (r[ex] >= first) {
+                        if (u[ex] > 0.0f) hot.push_back(ex);
+                    } else if (r[ex] >= 0 && src.has_resident(l, ex)) {
+                        cold.push_back(ex);
+                    }
+                }
+                routed += (int64_t) hot.size();
+                if (hot.empty() || cold.empty()) continue;
+                std::sort(hot.begin(), hot.end(), [&](int32_t a, int32_t b) { return u[a] > u[b]; });
+                std::sort(cold.begin(), cold.end(), [&](int32_t a, int32_t b) {
+                    return u[a] != u[b] ? u[a] < u[b] : r[a] > r[b];   // then the profile's coldest
+                });
+                for (size_t k = 0; k < hot.size() && k < cold.size() && u[hot[k]] > u[cold[k]]; ++k) {
+                    const int32_t sh = r[hot[k]], sc = r[cold[k]];
+                    if (cudaMemcpyAsync(xcache.device_slot(sc), xcache.device_slot(sh), (size_t) lay.blob_bytes(l),
+                                        cudaMemcpyDeviceToDevice, adapt_stream) != cudaSuccess) {
+                        e = std::string("moving an expert out of the cache's tail: ") + cudaGetErrorString(cudaGetLastError());
+                        return false;
+                    }
+                    r[hot[k]] = sc;
+                    r[cold[k]] = sh;
+                    ++moved;
+                }
+            }
+            if (moved > 0 && cudaStreamSynchronize(adapt_stream) != cudaSuccess) {
+                e = std::string("moving experts out of the cache's tail: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            basalt::log::info("basalt batch", "%s: %lld of the %lld routed experts in the cache's last %lld slots moved "
+                                 "below them (%.1f ms)", why, (long long) moved, (long long) routed,
+                         (long long) (xcache.slots() - first),
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+            return true;
+        };
         auto kv_drain = [&](std::string& e) -> bool {
             if (!ver.wait_commit(e)) return false;
             apply_pending(true);
@@ -6973,6 +7026,7 @@ int main(int argc, char** argv) {
                 // whole tail segments: everything from the first one at or past `keep` goes
                 const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
                 const int64_t keep = std::max<int64_t>(0, (xcache.mapped_bytes() - (add - room)) / gran * gran);
+                if (kv_keep_routed && !move_routed_below(xcache.slots_after_shrink(keep), "elastic KV", e)) return false;
                 if (!xcache.shrink(keep, e)) return false;
                 const int64_t live = xcache.slots();
                 for (size_t i = 0; i < host_res.size(); ++i)
@@ -8492,6 +8546,11 @@ int main(int argc, char** argv) {
             // read) writes it
             // (a restore writes the snapshot's whole live K/V, which can be longer than this prompt)
             const int64_t kv_need = std::max<int64_t>(n, incoming ? (int64_t) incoming->live.ids.size() : 0);
+            struct KeepRouted {   // only this admission's fits, while slots decode
+                bool& on;
+                ~KeepRouted() { on = false; }
+            } keep_routed{kv_keep_routed};
+            kv_keep_routed = batch_on();
             bool kv_ok = kv_fit(*rsp, kv_need + kKvGrowCells, err, true, kv_need + kKvWindowCells);
             if (!kv_ok && kv_short) {   // the other sessions' spare cells first
                 int64_t given = 0;
@@ -8910,6 +8969,12 @@ int main(int argc, char** argv) {
                         if (!refill_one(p, e)) return false;
                     }
                     const basalt::core::OnDevice on(p.dev);
+                    if (beside && &p == &pf_parts[0] && p.lent.empty()) {
+                        if (ba_job) { ba_thr.join(); ba_job = false; }   // no adaptive copy lands in a slot it moves
+                        if (!xq_drain()) { e = "an adaptive refill failed"; return false; }
+                        if (!move_routed_below(first, "prompt loan", e)) return false;
+                        any = true;
+                    }
                     if (want != p.sp->chunk() || first != p.first_now || p.sp->ring_depth() != ring_now) {
                         if (!p.sp->relayout(want, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
