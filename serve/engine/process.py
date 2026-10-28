@@ -342,6 +342,10 @@ class ProcessEngine:
         # tokens each slot holds (for prefix reuse by a conversation's next turn) and when it was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
         self.slot_used = [0.0] * self.batch
+        # session identity (a load-balancer header) -> its slot: a conversation stays in one slot, so its next
+        # turn continues the K/V that is already there instead of being admitted wherever and copied in
+        self.slot_owner: dict[int, str] = {}
+        self.session_slot: dict[str, int] = {}
         # admission state outlives engine processes: restart() re-runs this while requests wait on it
         if "ctl" not in self.__dict__:
             self.waiting = 0                            # requests waiting for ctl
@@ -925,7 +929,7 @@ class ProcessEngine:
             return (sum(1 for b in self.slot_busy if not b) >= free and
                     any(e[0] * 2 <= plen for e in self.wait_lens))
 
-    def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         """--batch: run solo (GEN) while alone, move to a batch slot (BGEN) when others arrive, and return to solo
         when left alone. Prompt reads and admissions take the control lines one at a time; a long read may give way
         to a much shorter waiting one (BYIELD). An early-leaving consumer is STOPped/BSTOPped and drained."""
@@ -968,7 +972,7 @@ class ProcessEngine:
                     any_slot = bool(self.info.get("solo_any_slot"))
                     alone = not any(self.slot_busy) and self.waiting == 0 and (any_slot or not self.info.get("slot0_solo"))
                     if alone and left > 1 and any_slot:
-                        solo_slot = self.pick_slot(prompt)       # the slot holding the longest start, else a free one
+                        solo_slot = self.pick_slot(prompt, session)   # the slot holding the longest start, else a free one
                         if solo_slot is None:
                             alone = False
                         else:
@@ -1000,7 +1004,7 @@ class ProcessEngine:
                                     self._shorter_waiting(len(prompt), 2 if solo_slot is None else 1)):
                                 if solo_slot is None:
                                     with self.slot_cv:      # slot the partial read will wait in
-                                        reserved = self.pick_slot(prompt)
+                                        reserved = self.pick_slot(prompt, session)
                                         if reserved is not None:
                                             self.slot_busy[reserved] = True
                                 if reserved is not None:    # (a solo run in a slot parks its read in that slot)
@@ -1036,7 +1040,7 @@ class ProcessEngine:
                             ticket = self.admission.join()
                             try:
                                 while True:
-                                    slot = self.pick_slot(prompt)
+                                    slot = self.pick_slot(prompt, session)
                                     if slot is not None and self.admission.may_go(ticket, self._resumes(slot, prompt)):
                                         self.slot_busy[slot] = True
                                         break
@@ -1222,21 +1226,39 @@ class ProcessEngine:
         with self.slot_cv:
             return self.waiting + len(self.admission)
 
-    def pick_slot(self, prompt: list[int]) -> int | None:
-        """A free slot for `prompt` (caller holds slot_cv): longest held prefix, else an empty one, then the least
-        recently used; None when none is free."""
+    def pick_slot(self, prompt: list[int], session: str | None = None) -> int | None:
+        """A free slot for `prompt` (caller holds slot_cv): this session's own slot first (a conversation stays
+        where its K/V sits), then the longest held prefix, else an empty one, then the least recently used; None
+        when none is free.  A slot owned by another session is taken only when no unowned one is free: the owner
+        lost its conversation either way, and the least recently used goes first."""
         free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
-        def held_prefix(b):
-            h = self.slot_held[b]
-            return len(h) if h and len(h) < len(prompt) and prompt[:len(h)] == h else 0
-        best = max(free, key=held_prefix)
-        if held_prefix(best) > 0:
-            return best
-        return min(free, key=lambda b: (bool(self.slot_held[b]), self.slot_used[b]))
+        if not hasattr(self, "slot_owner"):   # a hand-built engine (tests) skipped the init that declares these
+            self.slot_owner: dict[int, str] = {}
+            self.session_slot: dict[str, int] = {}
+        own = self.session_slot.get(session) if session is not None else None
+        if own is not None and own in free:
+            slot = own
+        else:
+            def held_prefix(b):
+                h = self.slot_held[b]
+                return len(h) if h and len(h) < len(prompt) and prompt[:len(h)] == h else 0
+            pool = [b for b in free if b not in self.slot_owner.values()] or free
+            best = max(pool, key=held_prefix)
+            slot = best if held_prefix(best) > 0 else min(pool, key=lambda b: (bool(self.slot_held[b]), self.slot_used[b]))
+        if session is not None:
+            for s, o in list(self.session_slot.items()):    # anyone else owning this slot loses it
+                if o == slot:
+                    del self.session_slot[s]
+            old = self.session_slot.get(session)           # the session's previous slot, replaced
+            if old is not None and old != slot and self.slot_owner.get(old) == session:
+                del self.slot_owner[old]
+            self.slot_owner[slot] = session
+            self.session_slot[session] = slot
+        return slot
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         """Yield token ids, and None as a 10 s heartbeat while the engine is quiet. An early-leaving consumer or
         `cancel` makes the engine STOP."""
         if not self.alive():
@@ -1246,7 +1268,7 @@ class ProcessEngine:
             ids, max_new = text.resolve(int(max_new), self.max_context)    # this engine takes ids
             text = None
         if getattr(self, "batch", 0):
-            yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
+            yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings, session)
             return
         self.progress = None
         self.prefill_tok_s_mean = None
