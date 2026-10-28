@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cstdio>
 
+#include "basalt/platform/memory.hpp"
+
 namespace basalt::program {
 
 namespace {
@@ -11,6 +13,20 @@ constexpr double kGiB = 1073741824.0;
 
 bool fits(uint64_t complement, const AutoInputs& in) {
     return in.ram_available >= in.floor_bytes && complement <= in.ram_available - in.floor_bytes;
+}
+
+// The RAM that stays free beside a copy of up to `complement` bytes: the headroom when all of it fits, else the
+// file cache's floor, which depends on how much is left to the file, which depends on the floor.  The iteration
+// starts from everything on the file and only goes down, so the floor it ends on never undercounts.
+uint64_t floor_for(uint64_t complement, const AutoInputs& in) {
+    if (fits(complement, in)) return in.floor_bytes;
+    uint64_t file = complement, floor = in.floor_bytes;
+    for (int i = 0; i < 16; ++i) {
+        floor = (std::max)(in.floor_bytes, basalt::platform::ram_floor(in.margin_bytes, file, complement, in.layer_bytes,
+                                                                       in.prompt_file_bytes) + in.late_bytes);
+        file = complement - (std::min)(complement, in.ram_available > floor ? in.ram_available - floor : 0);
+    }
+    return floor;
 }
 }  // namespace
 
@@ -47,15 +63,17 @@ AutoPlan choose_auto(const AutoInputs& in) {
         p.peer_exclusive = in.peer && in.serve && !fits(in.complement_full, in) && fits(in.complement_peer_excl, in);
     }
 
-    // Resident: what fits, capped at the complement.
+    // Resident: what fits, capped at the complement and its optional copies.
     if (g.resident) {
         p.resident_gb = g.resident_gb;
         p.resident_bytes = (uint64_t) (g.resident_gb * kGiB);
         p.resident_src = AutoSource::Given;
     } else {
         const uint64_t complement = p.peer_exclusive ? in.complement_peer_excl : in.complement_full;
-        const uint64_t room = in.ram_available > in.floor_bytes ? in.ram_available - in.floor_bytes : 0;
-        p.resident_bytes = (std::min)(room, complement);
+        const uint64_t extra = p.peer_exclusive ? in.extra_peer_excl : in.extra_full;
+        const uint64_t floor = floor_for(complement, in);
+        const uint64_t room = in.ram_available > floor ? in.ram_available - floor : 0;
+        p.resident_bytes = (std::min)(room, complement + extra);
         p.resident_gb = (double) p.resident_bytes / kGiB;
     }
 

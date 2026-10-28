@@ -292,9 +292,10 @@ void usage(const std::string& engine) {
         "  --engine BIN       engine binary (default: the one built with this program)\n"
         "  --set \"F V ...\"    FLAG VALUE pairs that replace or add engine arguments (repeatable)\n"
         "  --spec N           speculation window for the engine (--spec N, e.g. 7; also --spec after --); without it\n"
-        "                     the run has no speculation (--spec 0): a clean baseline\n"
+        "                     the engine default (speculation with the pack drafter, window 8); --spec 0 is a\n"
+        "                     plain-decode baseline\n"
         "  -- ARGS...         the same engine arguments, after --: replacing and adding flags\n"
-        "  built in (only what the measurement needs, each replaced by giving the flag): --spec 0, --max-context sized\n"
+        "  built in (only what the measurement needs, each replaced by giving the flag): --max-context sized\n"
         "  to the fixtures\n"
         "\n"
         "output\n"
@@ -726,7 +727,6 @@ int main(int argc, char** argv) {
     if (!o.spec.empty()) set_arg(args, "--spec", o.spec);
     if (o.model.empty()) for (const auto& a : o.passthrough) args.push_back(a);
     else merge_args(args, o.passthrough);
-    if (!o.community && !has_arg(args, "--spec")) set_arg(args, "--spec", "0");
     // the GPUs, chosen here once as the server chooses them: the engine sees only those cards and says nothing again
     if (!o.model.empty()) {
         std::string gpu_value, gerr;

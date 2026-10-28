@@ -72,21 +72,30 @@ int ram_floor_cases() {
     const uint64_t margin = gib(2.0);
     const uint64_t layer_q4 = 512ull * 3170304;   // every expert of a layer of a 4-bit pack (1.51 GiB)
     const uint64_t layer_q2 = 512ull * 1382400;   // the same of the 2-bit pack (0.66 GiB)
-    check("nothing read from the file: the margin alone", ram_floor(margin, 0, layer_q4) / G, 2.0);
-    check("4-bit pack, experts read from the file: margin + 3.5 + 2 layers", ram_floor(margin, gib(15), layer_q4) / G,
-          2.0 + 3.5 + 2.0 * (double) layer_q4 / G);
-    check("2-bit pack: margin + 3.5 + 2 layers", ram_floor(margin, gib(1), layer_q2) / G,
-          2.0 + 3.5 + 2.0 * (double) layer_q2 / G);
-    check("small layers: the 4 GiB file cache minimum applies", file_cache_floor(1, gib(0.1)) / G, 4.0);
-    check("one byte from the file is enough to need the cache", file_cache_floor(1, layer_q4) / G,
+    const uint64_t prompt = kPromptFileReadBytes;
+    const uint64_t all_q4 = gib(15), all_q2 = gib(1);   // the experts no GPU tier holds
+    check("nothing read from the file: the margin alone", ram_floor(margin, 0, all_q4, layer_q4, prompt) / G, 2.0);
+    check("4-bit pack, every expert read from the file: margin + 3.5 + 2 layers",
+          ram_floor(margin, all_q4, all_q4, layer_q4, prompt) / G, 2.0 + 3.5 + 2.0 * (double) layer_q4 / G);
+    check("2-bit pack, every expert read from the file: margin + 3.5 + 2 layers",
+          ram_floor(margin, all_q2, all_q2, layer_q2, prompt) / G, 2.0 + 3.5 + 2.0 * (double) layer_q2 / G);
+    check("small layers: the 4 GiB file cache minimum applies", file_cache_floor(1, 1, gib(0.1), prompt) / G, 4.0);
+    check("one byte from the file is enough to need the cache", file_cache_floor(1, 1, layer_q4, prompt) / G,
           3.5 + 2.0 * (double) layer_q4 / G);
+    // a fifth of the experts on the file: the two layers' read-ahead is a fifth of two whole layers
+    check("a fifth on the file: two layers' file-held share",
+          file_cache_floor(all_q4 / 5, all_q4, layer_q4, prompt) / G, 3.5 + 2.0 * 0.2 * (double) layer_q4 / G + 0.0);
+    check("a sixteenth on the file: the 4 GiB minimum", file_cache_floor(all_q4 / 16, all_q4, layer_q4, prompt) / G, 4.0);
+    check("no lent slot left to the file: the layers alone, at the minimum",
+          file_cache_floor(all_q4 / 2, all_q4, layer_q4, 0) / G, 4.0);
     // a 30 GiB machine with 27 GiB available and 2 GiB taken by the server later
-    const uint64_t fl = ram_floor(margin, gib(15), layer_q4);
+    const uint64_t fl = ram_floor(margin, all_q4, all_q4, layer_q4, prompt);
     check("largest safe copy, 27 available, 2 late", max_safe_copy(gib(27), gib(2), fl) / G, 27.0 - 2.0 - fl / G);
     check("largest safe copy when the floor exceeds the RAM", max_safe_copy(gib(8), gib(2), fl) / G, 0.0);
-    const uint64_t guard = ram_guard_floor(margin, gib(15));
+    const uint64_t guard = ram_guard_floor(margin, all_q4, prompt);
     check("serve guard, experts read from the file: margin + 3.5", guard / G, 5.5);
-    check("serve guard, nothing read from the file: the margin", ram_guard_floor(margin, 0) / G, 2.0);
+    check("serve guard, only part of a chunk read from the file", ram_guard_floor(margin, all_q4, gib(1)) / G, 3.0);
+    check("serve guard, nothing read from the file: the margin", ram_guard_floor(margin, 0, prompt) / G, 2.0);
     struct Case { const char* what; double avail; bool low; };
     const Case cases[] = {
         {"well above the floor", 20.0, false},

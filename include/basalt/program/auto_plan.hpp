@@ -37,7 +37,14 @@ struct AutoInputs {
     // Pack sizes in bytes.
     uint64_t complement_full = 0;         ///< experts no GPU tier holds, with the peer's also in RAM
     uint64_t complement_peer_excl = 0;    ///< the same with the peer's experts held only on the peer
-    uint64_t floor_bytes = 0;             ///< RAM that must stay free beside the copy
+    uint64_t extra_full = 0;              ///< optional copies beside complement_full (lent slots, adapt spares): kept as far as RAM allows
+    uint64_t extra_peer_excl = 0;         ///< the same beside complement_peer_excl
+    uint64_t floor_bytes = 0;             ///< RAM that must stay free beside the copy when every complement expert is in it
+    // The floor when some experts are read from the file instead (platform::ram_floor, plus late_bytes).
+    uint64_t margin_bytes = 0;
+    uint64_t late_bytes = 0;              ///< RAM the engine takes after the copy
+    uint64_t layer_bytes = 0;             ///< every expert of the largest layer
+    uint64_t prompt_file_bytes = 0;       ///< what a prompt chunk reads from the file for lent slots the copy leaves out
     AutoGiven given;
 };
 

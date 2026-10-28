@@ -99,7 +99,7 @@ public:
     void kv_restore(int64_t upto);
     /// The VRAM bind() will allocate for a native head of `head_row_bytes` per vocabulary row: the draft logits and
     /// the draft head over rt/draft_vocab.bin's subset.  The expert cache is sized before bind(), so it reserves this.
-    uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const;
+    uint64_t bind_bytes(uint64_t head_row_bytes, int head_type, int64_t n_vocab) const;
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);
 
@@ -292,8 +292,10 @@ private:
     float* diag_ = nullptr;                         ///< spec_log: the draft head's logits per chain step (pinned)
     int64_t diag_stride_ = 0;
     std::vector<int32_t> diag_map_;                 ///< spec_log: the draft head's row -> token id
-    // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
+    // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head.  A Q6_K head
+    // reads its rows from the main head through dvocab_ (rows_mapped_); other formats keep a copy in dhead_.
     uint8_t* dhead_ = nullptr;
+    bool rows_mapped_ = false;
     int32_t* dvocab_ = nullptr;
     int64_t n_dvocab_ = 0;
     // the subset's leading base rows (n_tier1_) serve the argmax drafts unless the text just held a

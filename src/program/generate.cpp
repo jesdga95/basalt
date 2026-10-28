@@ -6,6 +6,8 @@
 // There is no tokenizer here: the prompt arrives as ids via `--tokens`, so a logit comparison against a reference runs
 // on the same ids on both sides.
 
+#include "engine_local.hpp"
+#include "serve/loans.hpp"
 #include "basalt/program/options.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/logit_bias.hpp"
@@ -41,6 +43,7 @@
 #include "basalt/program/auto_plan.hpp"
 #include "basalt/program/community_row.hpp"
 #include "basalt/program/gpu_select.hpp"
+#include "basalt/program/image_loan.hpp"
 #include "basalt/program/multi_gpu_plan.hpp"
 #include "basalt/program/tokenizer.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
@@ -120,65 +123,6 @@
 #include "basalt/log.hpp"
 
 namespace {
-// One unit of background work at a time, on a persistent worker thread (starting a thread per job costs more than
-// the job's wake-up).  `join` waits for the job in flight.
-class JobRunner {
-public:
-    JobRunner() = default;
-    JobRunner(const JobRunner&) = delete;
-    JobRunner& operator=(const JobRunner&) = delete;
-    ~JobRunner() {
-        join();
-        if (th_.joinable()) {
-            { std::lock_guard<std::mutex> lk(m_); stop_ = true; }
-            cv_.notify_one();
-            th_.join();
-        }
-    }
-    void run(std::function<void()> fn) {
-        if (!th_.joinable()) th_ = std::thread([this] { loop(); });
-        {
-            std::lock_guard<std::mutex> lk(m_);
-            fn_ = std::move(fn);
-            done_.store(false, std::memory_order_relaxed);
-            has_ = true;
-        }
-        busy_ = true;
-        cv_.notify_one();
-    }
-    bool joinable() const { return busy_; }
-    bool finished() const { return !busy_ || done_.load(std::memory_order_acquire); }
-    void join() {
-        if (!busy_) return;
-        // the caller has nothing else to do: poll rather than sleep, so the job's end is seen at once
-        for (unsigned spins = 0; !done_.load(std::memory_order_acquire); ++spins) {
-            if (spins < 20000) basalt::platform::cpu_relax();
-            else std::this_thread::yield();
-        }
-        busy_ = false;
-    }
-private:
-    void loop() {
-        std::unique_lock<std::mutex> lk(m_);
-        for (;;) {
-            cv_.wait(lk, [this] { return has_ || stop_; });
-            if (!has_) return;
-            std::function<void()> fn = std::move(fn_);
-            has_ = false;
-            lk.unlock();
-            fn();
-            done_.store(true, std::memory_order_release);
-            lk.lock();
-        }
-    }
-    bool busy_ = false;
-    bool has_ = false, stop_ = false;
-    std::atomic<bool> done_{true};
-    std::mutex m_;
-    std::condition_variable cv_;
-    std::function<void()> fn_;
-    std::thread th_;
-};
 
 // Below this much free VRAM a later allocation (a first-used window's buffers, the desktop, another program) can make
 // the driver page GPU memory, and a verify graph spinning on a host flag then never finishes.
@@ -322,6 +266,15 @@ bool resident_spare_swaps(basalt::core::FileExpertSource& src, const std::vector
 constexpr float kRelaxedDraftingDefault = 0.5f;   // --relaxed-drafting without a value
 
 using basalt::program::Options;
+namespace engine_local = basalt::program::engine_local;
+namespace serve_loans = basalt::program::serve;
+using engine_local::Drive;
+using engine_local::GpuStage;
+using engine_local::JobRunner;
+using engine_local::PromptStage;
+using engine_local::SlotDelete;
+using engine_local::SlotSession;
+using engine_local::SplitDrive;
 
 
 /// Calls `f` with the tensor name of every row of a pack index (the first field of each non-comment line).
@@ -596,17 +549,6 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
     return true;
 }
 
-/// The pool's adapter plus the wall-clock it spent, so the report can say how much of the token was the CPU.
-struct Drive {
-    basalt::core::ExpertDispatch d;
-    double cpu_ms = 0;
-    int64_t calls = 0;
-    /// THE ROUTING TRACE.  `drive_pool` is called once per layer from the main loop - the workers live inside
-    /// `expert_pool_dispatch` - so a single FILE* here needs no locking.  `d.layers` is the CURRENT layer on entry (the
-    /// adapter increments it as it walks the blob), which is why the layer index comes from there rather than from a
-    /// counter of our own.
-    std::FILE* routing = nullptr;
-};
 
 void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd, int64_t k,
                 float* out) {
@@ -665,18 +607,6 @@ constexpr float kPairTheta = 0.50f;
 constexpr float kPairChainScale = 0.25f;
 constexpr double kPairFull = 0.70;   ///< the share of windows accepted whole from which the chain runs on
 
-/// Layer split: every verify stage shares one Drive (its counters, usage and failure flags); the GPU plan, the expert
-/// cache and the PCIe share the pool uses for a layer are those of the stage that runs it.
-struct SplitDrive {
-    static constexpr int kMax = 8;
-    Drive* base = nullptr;
-    int n = 0;                                    ///< stages
-    int64_t end[kMax] = {};                       ///< stage i runs the layers from end[i - 1] (0) below end[i]
-    basalt::core::GpuPlanSink* plan[kMax] = {};
-    const uint8_t* cache_base[kMax] = {};
-    const uint64_t* cache_slot_off[kMax] = {};
-    int pcie_num[kMax] = {};
-};
 void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                       int64_t layer) {
     SplitDrive* s = (SplitDrive*) user;
@@ -694,61 +624,7 @@ void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t 
 /// expert cache for its layers, a verify window and a prompt path; the last one also holds the head (the drafter
 /// lives on its device too).
 /// A batch slot's session: owned, or (the first slot of a one-GPU --batch) the solo session itself.
-struct SlotDelete {
-    bool own = true;
-    void operator()(basalt::core::SessionState* p) const { if (own) delete p; }
-};
-using SlotSession = std::unique_ptr<basalt::core::SessionState, SlotDelete>;
 
-struct GpuStage {
-    int dev = 0;
-    int64_t lb = 0, le = 0;
-    double pcie_frac = 0.0;
-    basalt::core::WeightTable wt;
-    basalt::core::NativeDense dense;
-    basalt::core::NativeHead head;
-    basalt::core::SessionState ss;
-    cudaStream_t stream = nullptr;
-    basalt::core::ExpertCache cache;
-    std::vector<std::pair<int32_t, int32_t>> profile;   ///< its layers' share of the profile, hottest first
-    int32_t* d_res = nullptr;                            ///< the residency table on its device
-    basalt::core::Verifier ver;
-    basalt::core::Verifier ver_b;                        ///< the second chain's verifier (pipelined windows)
-    basalt::prefill::Prefill sp;
-    cudaStream_t adapt_stream = nullptr;
-    cudaEvent_t adapt_ev = nullptr;
-    bool adapt_live = false;                             ///< swaps of this request are in flight on it
-    int32_t* mrope = nullptr;                            ///< --vision: the image-position table on its device
-};
-
-/// One stage of a prompt-time layer split over the expert tier cards: for a long prompt the main card reads layers
-/// [0, b1) of every chunk and hands the chunk on, each tier card's stage reads the next block of layers of it while the
-/// cards before read the next chunks, and the main card reads the last chunk's later layers itself once the stages have
-/// given their layers' state back.  A stage's dense weights (an image in pinned RAM), session and prompt buffers live in
-/// its tier's last slots, lent for the prompt and refilled after it, so outside a prompt the tier is as before.
-struct PromptStage {
-    int dev = -1;
-    size_t tier_at = 0;                   ///< its tier among the expert tiers (0: the first)
-    basalt::core::PeerExperts* tier = nullptr;
-    double mem_gbps = 0, link_gbps = 0;   ///< its card's memory bandwidth and probed host->device link
-    int64_t lo = 0, hi = 0;               ///< its weights cover layers [lo, hi); a read runs a range inside them
-    int64_t l0 = 0, l1 = 0;               ///< the layers of the read in progress
-    std::set<std::string> skip;           ///< the tensors outside its layers
-    uint64_t pool = 0;                    ///< its arena's bytes
-    basalt::core::WeightTable wt;         ///< its rows point into the lent slots, where the image is copied
-    basalt::core::NativeDense dense;      ///< its native projections' rows (in the image) and their scratch
-    uint8_t* image = nullptr;             ///< pinned: the weights' bytes, the arena then the native blocks
-    uint64_t arena_bytes = 0, image_bytes = 0;
-    basalt::core::SessionState ss;        ///< carved per prompt in the lent slots
-    basalt::prefill::Prefill sp;
-    cudaStream_t stream = nullptr;
-    basalt::core::StagedCopy state_in, state_back;   ///< its layers' state from the main session and back to it
-    std::vector<int32_t> res;             ///< its layers' experts in the tier's slots (n_layers x n_expert, -1 elsewhere)
-    std::vector<std::pair<int32_t, int32_t>> lent;
-    int64_t lent_slots = 0;
-    uint8_t* buf = nullptr;               ///< the read's prompt buffers, `buf_bytes` long, below its session
-    uint64_t buf_bytes = 0;
-};
 
 // ---- what the watchdog prints before it stops a stalled engine
 struct MemSample {
@@ -1013,6 +889,54 @@ double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
     if (!ok) (void) cudaGetLastError();
     cudaFree(d);
     cudaFreeHost(h);
+    return bw;
+}
+
+// Host->device bandwidth with every card in `devs` copying at once from its own pinned buffer, in GB/s (the best of
+// two rounds); -1 when a buffer or a copy fails.  Cards that share a switch, a root port or the RAM read below the sum
+// of their own links.
+double probe_h2d_together_gbps(const std::vector<int>& devs) {
+    constexpr size_t kBytes = 256ull << 20;
+    constexpr int kBursts = 4;
+    struct Card { int dev; void* h = nullptr; void* d = nullptr; cudaStream_t s = nullptr; };
+    std::vector<Card> cards;
+    bool ok = !devs.empty();
+    for (int dev : devs) {
+        if (!ok) break;
+        const basalt::core::OnDevice on(dev);
+        Card c{dev};
+        ok = cudaHostAlloc(&c.h, kBytes, cudaHostAllocPortable) == cudaSuccess && cudaMalloc(&c.d, kBytes) == cudaSuccess &&
+             cudaStreamCreateWithFlags(&c.s, cudaStreamNonBlocking) == cudaSuccess;
+        if (c.h != nullptr) std::memset(c.h, 0, kBytes);   // fault the pages in before timing
+        ok = ok && cudaMemcpyAsync(c.d, c.h, kBytes, cudaMemcpyHostToDevice, c.s) == cudaSuccess &&   // warmup
+             cudaStreamSynchronize(c.s) == cudaSuccess;
+        cards.push_back(c);
+    }
+    double bw = -1.0;
+    for (int round = 0; ok && round < 2; ++round) {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int b = 0; ok && b < kBursts; ++b)
+            for (const Card& c : cards) {
+                const basalt::core::OnDevice on(c.dev);
+                ok = ok && cudaMemcpyAsync(c.d, c.h, kBytes, cudaMemcpyHostToDevice, c.s) == cudaSuccess;
+            }
+        for (const Card& c : cards) {
+            const basalt::core::OnDevice on(c.dev);
+            ok = cudaStreamSynchronize(c.s) == cudaSuccess && ok;
+        }
+        const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (ok && sec > 0) bw = std::max(bw, (double) kBytes * kBursts * (double) cards.size() / sec / 1e9);
+    }
+    for (const Card& c : cards) {
+        const basalt::core::OnDevice on(c.dev);
+        if (c.s != nullptr) cudaStreamDestroy(c.s);
+        if (c.d != nullptr) cudaFree(c.d);
+        if (c.h != nullptr) cudaFreeHost(c.h);
+    }
+    if (!ok) {
+        (void) cudaGetLastError();
+        return -1.0;
+    }
     return bw;
 }
 
@@ -1403,10 +1327,13 @@ int main(int argc, char** argv) {
     // chunk more than the experts it saves the main card's link, so it keeps to the short chunks it helps
     const bool peer_streamed_share = chosen_cards.size() >= 2 && basalt::program::cards_alike(chosen_cards[0], chosen_cards[1]);
     // the prompt-time layer split over the expert tier cards (PromptStage), and the most stages it may use, the main
-    // card's included: on three or more cards none until measured there (--exp prompt_split=N: up to N stages).  With
-    // --batch a read splits only while no slot decodes.
+    // card's included: every card on two cards or on three or more alike ones, none on three or more unlike cards
+    // until measured on such a set.  With --batch a read splits only while no slot decodes.
     bool split_want = o.serve && o.peer_device >= 1;
-    const int split_cap = o.peer_devices.size() <= 1 ? 2 : (int) basalt::core::exp_flag("prompt_split", 1.0);
+    bool split_alike = true;
+    for (size_t i = 1; i < chosen_cards.size(); ++i)
+        split_alike = split_alike && basalt::program::cards_alike(chosen_cards[0], chosen_cards[i]);
+    const int split_cap = o.peer_devices.size() <= 1 ? 2 : split_alike ? (int) o.peer_devices.size() + 1 : 1;
     basalt::core::set_peer_portable(o.peer_device >= 1 || !o.layer_split.empty());   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     // Chunks below this take the routed-only path with the peer card computing its experts' rows; from it on
     // every expert streams through the ring.  The routed-only path costs ~0.3 ms per token, streaming ~0.12 ms
@@ -1963,11 +1890,16 @@ int main(int argc, char** argv) {
         // An explicit number truncates the ranked list ("what would 2,000 slots give" without rebuilding the file).
         // `--expert-cache 0` means auto: the profile ranks every pair.
         if (o.expert_cache == 0) o.expert_cache = -1;
-        // Multi-GPU: the peer card gets a share f (0.45) of the HOT pairs, so both cards compute routed experts every
-        // layer.  Of the first 8700 ranks (about the primary's slots), every pair with floor((r+1)f) > floor(rf) moves
-        // to just after that point: the primary fills past them, the peer (which takes what the primary does not hold,
-        // in order) gets them first.
-        if (o.peer_device >= 1) {   // the peer's share of the hot pairs
+        // Multi-GPU: a peer card as fast as the main one gets a share f (0.45) of the HOT pairs, so both cards compute
+        // routed experts every layer.  Of the first 8700 ranks (about the primary's slots), every pair with
+        // floor((r+1)f) > floor(rf) moves to just after that point: the primary fills past them, the peer (which takes
+        // what the primary does not hold, in order) gets them first.  A slower peer card takes the pairs after the
+        // primary's: its fixed hand-off plus a hot expert's entries at its bandwidth end the layer after the primary.
+        const bool slow_peer = chosen_cards.size() == 2 && chosen_cards[0].mem_gbps > 0 && chosen_cards[1].mem_gbps > 0 &&
+                               chosen_cards[1].mem_gbps < 0.9 * chosen_cards[0].mem_gbps;
+        if (o.peer_device >= 1 && slow_peer)
+            basalt::log::info("basalt generate", "peer hot share 0: the peer card's memory is slower than the main card's");
+        if (o.peer_device >= 1 && !slow_peer) {   // the peer's share of the hot pairs
             const double f = 0.45;
             const size_t at = std::min(profile.size(), (size_t) 8700);
             if (f > 0.0 && f < 1.0 && at > 0) {
@@ -2543,8 +2475,8 @@ int main(int argc, char** argv) {
             basalt::log::error("basalt generate", "the image encoder warm-up failed: %s", vis_enc.last_error().c_str());
             return 1;
         }
-        basalt::log::info("basalt serve", "image encoder staged: %.0f MiB of weights in pinned memory, %.2f GiB of expert-cache "
-                             "slots borrowed per image at most (%.1f s)",
+        basalt::log::info("basalt serve", "image encoder staged: %.0f MiB of weights in pinned memory, an image borrows up "
+                             "to %.2f GiB of expert-cache slots while it is read (%.1f s)",
                      (double) vis_enc.weights_bytes() / 1048576.0, (double) tmp_bytes / 1073741824.0,
                      std::chrono::duration<double>(Clock::now() - t0).count());
     }
@@ -2916,7 +2848,8 @@ int main(int argc, char** argv) {
             basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str());
             return 1;
         }
-        basalt::log::info("basalt generate", "experimental native Q5_K head, %llu bytes, in %.1f s",
+        basalt::log::info("basalt generate", "native head: %s, %llu bytes, in %.1f s",
+                     basalt::ggml_type_name((uint32_t) native_head.type()),
                      (unsigned long long) native_head.weight_bytes(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
     }
@@ -3065,7 +2998,7 @@ int main(int argc, char** argv) {
         // the draft layer's head and logits are allocated when it binds, after this, so they come out of the reserve
         const basalt::core::NativeHead& draft_head = multi_gpu ? mtp_head : native_head;
         const int64_t mtp_bind = (!o.mtp.empty() && draft_head.loaded())
-                                     ? (int64_t) mtp.bind_bytes(draft_head.row_bytes(), n_vocab) : 0;
+                                     ? (int64_t) mtp.bind_bytes(draft_head.row_bytes(), draft_head.type(), n_vocab) : 0;
         // a server allocates its verify windows after the cache is sized: they come out of the reserve too, so the
         // free VRAM after loading is the reserve itself
         int64_t late_b = o.serve ? (kWindowMib << 20) : 0;
@@ -3421,7 +3354,8 @@ int main(int argc, char** argv) {
                                                               basalt::kernels::cpu::expert_layout().blob_bytes(l));
                 if (o.resident_cpu_experts && o.resident_budget == 0) {
                     file_headroom =
-                        std::max(headroom, basalt::platform::ram_floor(basalt::platform::ram_margin(), 1, largest) + late);
+                        std::max(headroom, basalt::platform::ram_floor(basalt::platform::ram_margin(), outside, outside, largest,
+                                                    basalt::platform::kPromptFileReadBytes) + late);
                     ram = *free_ram > file_headroom ? *free_ram - file_headroom : 0;
                     if (o.resident_soft) ram = ram > (256ull << 20) ? ram - (256ull << 20) : 0;
                 }
@@ -4293,107 +4227,16 @@ int main(int argc, char** argv) {
             }
         basalt::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
     }
-    // bytes -> slots for one cache: exact when it knows its per-slot offsets (a native pack's blobs differ
-    // per layer), otherwise max_blob each.
-    auto cache_slots_for = [&](const basalt::core::ExpertCache& xc, uint64_t need) -> int64_t {
-        if (xc.slot_offsets() != nullptr) {   // sized slots: from the end until they hold `need`
-            int64_t k = 0;
-            while (k < xc.slots() &&
-                   (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[xc.slots() - k]) < need) ++k;
-            return k;
-        }
-        const int64_t blob = (int64_t) basalt::kernels::cpu::expert_layout().max_blob;
-        return (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
-    };
-    auto slots_from_bytes = [&](uint64_t need) -> int64_t { return cache_slots_for(xcache, need); };
-    auto lend_slots = [&](int64_t c) -> int64_t {
-        return slots_from_bytes(basalt::prefill::Prefill::bytes_needed(g, ss, c));
-    };
-    // `lend_bytes` went with the single-cache serve loan: a participant's loan is priced by `part_bytes` from its
-    // OWN cache, and the only other user of the old helper was the serve path's own relayout.
-    auto request_chunk = [](int64_t tokens, int64_t max_chunk) -> int64_t {
-        if (tokens <= 0 || max_chunk <= 0) return 0;
-        const int64_t rounded = tokens > std::numeric_limits<int64_t>::max() - 255
-                                    ? tokens
-                                    : ((tokens + 255) / 256) * 256;
-        return std::min(max_chunk, rounded);
-    };
-    // The prompt path's chunk and the slots it borrows for its buffers: the requested chunk halved until it fits, or
-    // with --prefill auto the largest chunk whose buffers take at most kAutoLendPct % of the slots (a lent slot's
-    // expert is streamed during the prompt and refilled after it).  A request lends only what its own prompt needs
-    // (Prefill::relayout), so a big chunk costs short prompts nothing.  0 = none fits.
-    // At large chunks nearly every expert streams anyway, so a lent slot costs little: 90% when the copies are DMA
-    // from pinned RAM, 85% when host copies are the limit (lending more only streams more through them).
-    // Hoisted out of plan_lend: the serve path's per-stage loans obey the same cap, one participant at a time.
+    // The share of a cache a lent prompt chunk may take: 90% when the copies are DMA from pinned RAM, 85% when host
+    // copies are the limit (lending more only streams more through them).
     const int64_t kAutoLendPct = basalt::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85;
     // The largest chunk --prefill auto may pick: the operator's ceiling (--prefill auto:N) and never past the context,
     // but never below 8192.  A bare `auto` is cut back once the RAM complement is built (below) to what the lend can
     // fund, and again to the fewest-equal-chunks cap when a prompt is read; without the resident RAM mode there is no
     // complement to size it from, so it stays at 8192.
-    // The largest chunk a bare `auto` reads a prompt in: past it a chunk's cost per token stops falling.
-    // A pass streams every expert blob once, so a pack with bigger blobs amortizes the pass over more tokens.
-    constexpr int64_t kHeadChunk = 16384;   // the first chunk of a prompt above the chunk cap
     const int64_t kMaxAutoChunk = basalt::kernels::cpu::expert_layout().max_blob > (3u << 19) ? 32768 : 16384;
-    // How one card reads a part of `tokens` in chunks of at most `cap`: equal chunks for the fewest chunks (every chunk
-    // streams the experts, so a short tail costs a whole stream), and a long part starts with a short chunk (`head_ok`):
-    // the first chunk waits for its PLE rows before layer 1 with nothing to overlap, so a short one shrinks that wait.
-    // The chunk, and the head chunk (0: none).
-    auto one_card_chunks = [&](int64_t tokens, int64_t cap, bool head_ok) -> std::pair<int64_t, int64_t> {
-        int64_t want = request_chunk(tokens, cap);
-        if (want > 0 && tokens > cap) {
-            const int64_t parts = (tokens + cap - 1) / cap;
-            want = request_chunk((tokens + parts - 1) / parts, cap);
-        }
-        int64_t head = 0;
-        if (head_ok && o.prefill_auto_fit && tokens > cap && tokens >= 2 * kHeadChunk && cap > kHeadChunk) {
-            const int64_t rem = tokens - kHeadChunk, parts = (rem + cap - 1) / cap;
-            want = request_chunk((rem + parts - 1) / parts, cap);
-            head = kHeadChunk;
-        }
-        return {want, head};
-    };
-    // the sizes of a part's chunks
-    auto chunk_list = [](int64_t tokens, int64_t chunk, int64_t head) {
-        std::vector<int64_t> v;
-        for (int64_t at = 0; chunk > 0 && at < tokens;) {
-            const int64_t T = std::min(at == 0 && head > 0 ? head : chunk, tokens - at);
-            v.push_back(T);
-            at += T;
-        }
-        return v;
-    };
     int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
     if (o.prefill_auto_fit && !o.resident_cpu_experts) auto_ceiling = 8192;
-    // The auto scan bisects on the 256-token grid the prompt path works on (`request_chunk` rounds up to it):
-    // `bytes_needed` is a sum of (T x positive constant) terms plus a max of such sums, so it rises monotonically
-    // with T, and so does every test the scan applies - the largest size that fits is a bisection, one `bytes_needed`
-    // per probe.
-    auto biggest_chunk = [](int64_t ceiling, auto&& ok) -> int64_t {
-        if (ceiling < 256) return 0;
-        int64_t lo = 1, hi = ceiling / 256, best = 0;   // n = T / 256, and ok() is monotone in n
-        while (lo <= hi) {
-            const int64_t mid = lo + (hi - lo) / 2;
-            if (ok(mid * 256)) { best = mid * 256; lo = mid + 1; } else hi = mid - 1;
-        }
-        return best;
-    };
-    auto plan_lend = [&](int64_t& chunk) -> int64_t {
-        auto slots_for = lend_slots;
-        if (o.prefill_auto) {
-            // the largest chunk on the 256-token grid whose buffers fit the lend caps
-            const int64_t c = biggest_chunk(auto_ceiling, [&](int64_t t) -> bool {
-                const int64_t k = slots_for(t);
-                return k + 128 <= xcache.slots() && k * 100 <= kAutoLendPct * xcache.slots();
-            });
-            if (c > 0) { chunk = c; return slots_for(c); }
-            return 0;
-        }
-        for (int64_t c = chunk; c >= 256; c /= 2) {
-            const int64_t k = slots_for(c);
-            if (k + 128 <= xcache.slots()) { chunk = c; return k; }
-        }
-        return 0;
-    };
     // The peer tier's fill.  `exclusive` (--peer-exclusive): done before the RAM complement, which then leaves the
     // peer's experts out, so they are read from the file here and held only on the peer.
     auto open_peer = [&](bool exclusive) -> bool {
@@ -4470,6 +4313,8 @@ int main(int argc, char** argv) {
     for (int64_t l = 0; l < g.n_layers; ++l)
         largest_layer_bytes = std::max<uint64_t>(largest_layer_bytes,
                                                  (uint64_t) g.n_expert * basalt::kernels::cpu::expert_layout().blob_bytes(l));
+    // what a prompt chunk reads from the file for the lent slots the RAM copy leaves out (see platform::file_cache_floor)
+    uint64_t prompt_file_bytes = 0;
     // --serve: free places in the RAM copy take the evicted experts (no exchange buffers)
     const bool adapt_fast_on = o.serve && o.adapt_every > 0 && o.adapt_swaps > 0;
     // A server also leaves room for what it allocates after the RAM copy, before it is ready (the top-up below takes
@@ -4489,7 +4334,8 @@ int main(int argc, char** argv) {
     int64_t lend_chunk = o.prefill_chunk;
     if (o.prefill_chunk > 0 && d_res != nullptr && xcache.slots() > 0) {
         int64_t chunk = o.prefill_chunk;
-        const int64_t k = plan_lend(chunk);
+        const int64_t k = serve_loans::plan_lend(chunk, xcache, g, ss, o.prefill_auto, auto_ceiling,
+                                                (int) kAutoLendPct);
         if (k > 0) { lend_from = xcache.slots() - k; lend_chunk = chunk; }
     }
     // a layer split: the stages' caches are GPU tiers the RAM copy leaves out, except each one's last slots, which the
@@ -4498,7 +4344,7 @@ int main(int argc, char** argv) {
     uint64_t stage_lent_bytes = 0;
     for (const auto& stp : stages) {
         const int64_t first = lend_from >= 0
-            ? stp->cache.slots() - cache_slots_for(stp->cache, basalt::prefill::Prefill::bytes_needed(g, stp->ss, lend_chunk))
+            ? stp->cache.slots() - serve_loans::cache_slots_for(stp->cache, basalt::prefill::Prefill::bytes_needed(g, stp->ss, lend_chunk))
             : stp->cache.slots();
         for (const auto& pr : stp->profile) {
             const int32_t slot = stp->cache.slot_of(pr.first, pr.second);
@@ -4543,13 +4389,16 @@ int main(int argc, char** argv) {
         const uint64_t spares_full = adapt_fast_on ? (uint64_t) o.adapt_swaps * kSatBoost * blob : 0;
         const uint64_t spares_excl =
             adapt_fast_on ? (uint64_t) (o.adapt_swaps * kSatBoost + std::max(o.peer_adapt_swaps, o.adapt_swaps)) * blob : 0;
-        in.complement_full += lent_bytes + spares_full;
-        in.complement_peer_excl += lent_bytes + spares_excl;
-        auto fits_beside = [&](uint64_t c) { return in.ram_available > head && c <= in.ram_available - head; };
-        // the floor when the whole complement is placed is the headroom; with experts left on the SSD it adds the file cache's
-        in.floor_bytes = fits_beside(in.complement_full) || (in.peer && in.serve && fits_beside(in.complement_peer_excl))
-                             ? head
-                             : std::max(head, basalt::platform::ram_floor(margin, 1, largest_layer_bytes) + late);
+        // the lent slots' copies and the spares are kept as far as RAM allows: they do not decide whether the complement fits
+        in.extra_full = lent_bytes + spares_full;
+        in.extra_peer_excl = lent_bytes + spares_excl;
+        // the floor when the whole complement is placed is the headroom; with experts left on the SSD the plan adds the file cache's
+        in.floor_bytes = head;
+        in.margin_bytes = margin;
+        in.late_bytes = late;
+        in.layer_bytes = largest_layer_bytes;
+        prompt_file_bytes = std::min<uint64_t>(lent_bytes, basalt::platform::kPromptFileReadBytes);
+        in.prompt_file_bytes = prompt_file_bytes;
         bp::AutoGiven& gv = in.given;
         if (!(in.peer && in.serve) || o.peer_exclusive_given) {   // not applicable, or given
             gv.peer_exclusive = true;
@@ -4640,7 +4489,8 @@ int main(int argc, char** argv) {
             const uint64_t margin = basalt::platform::ram_margin();
             const uint64_t copy = std::min(o.resident_budget > 0 ? o.resident_budget : auto_resident_bytes, complement);
             const uint64_t file_bytes = complement - copy;
-            ram_floor_bytes = basalt::platform::ram_floor(margin, file_bytes, largest_layer_bytes);
+            ram_floor_bytes =
+                basalt::platform::ram_floor(margin, file_bytes, complement, largest_layer_bytes, prompt_file_bytes);
             if (avail > 0 && file_bytes > 0) {
                 const uint64_t safe = basalt::platform::max_safe_copy(avail, late, ram_floor_bytes);
                 constexpr double kGiB = 1073741824.0;
@@ -4687,8 +4537,8 @@ int main(int argc, char** argv) {
             // (kMaxAutoChunk) bounds the chunk, so the ceiling stops there too.
             const int64_t allow = std::max<int64_t>(0, src.resident_lent_slots() - kv_tail_slots) +
                                   (int64_t) (2 * basalt::platform::kPromptFileReadBytes / std::max<uint64_t>(1, basalt::kernels::cpu::expert_layout().max_blob));
-            auto_ceiling = std::max<int64_t>(8192, biggest_chunk(std::min<int64_t>(auto_ceiling, kMaxAutoChunk),
-                                                                 [&](int64_t t) { return lend_slots(t) <= allow; }));
+            auto_ceiling = std::max<int64_t>(8192, engine_local::biggest_chunk(std::min<int64_t>(auto_ceiling, kMaxAutoChunk),
+                                                                 [&](int64_t t) { return serve_loans::lend_slots(xcache, g, ss, t) <= allow; }));
         }
         if (resident_ok) {
             if (o.serve) basalt::platform::watch_resident_ram(true, src.resident_bytes());
@@ -4726,6 +4576,7 @@ int main(int argc, char** argv) {
     // ---- the prompt-time split: what this engine can run it with, and each tier card's link (probed while the cards are
     // empty).  The stages, in the order their cards join a split (prompt_split_order).
     std::vector<std::unique_ptr<PromptStage>> pstages;
+    double split_host_gbps = 0;   // the host's bandwidth to the main card and every tier card at once
     if (split_want) {
         const char* off = o.peer_exclusive ? "the tier's experts have no RAM copy (--peer-exclusive)"
                         : !src.complement_ready() ? "no RAM copy of the experts"
@@ -4748,6 +4599,15 @@ int main(int argc, char** argv) {
             }
         }
         if (off == nullptr && main_link_gbps <= 0) off = "a link probe failed";
+        if (off == nullptr) {
+            std::vector<int> devs = {0};
+            for (const auto& st : pstages) devs.push_back(st->dev);
+            split_host_gbps = probe_h2d_together_gbps(devs);
+            if (split_host_gbps <= 0) off = "a link probe failed";
+            else
+                basalt::log::info("basalt generate", "prompt split: %.1f GB/s host->device with %zu cards copying at once",
+                                  split_host_gbps, devs.size());
+        }
         if (off != nullptr) {
             basalt::log::info("basalt generate", "prompt split: off (%s)", off);
             split_want = false;
@@ -4773,7 +4633,7 @@ int main(int argc, char** argv) {
         c.mem_gbps = chosen_cards.empty() ? 0 : chosen_cards[0].mem_gbps;
         c.link_gbps = main_link_gbps;
         c.stream_bytes.assign((size_t) g.n_layers, 0.0);
-        const int64_t first = xcache.slots() - cache_slots_for(xcache, basalt::prefill::Prefill::bytes_needed(g, ss, chunk));
+        const int64_t first = xcache.slots() - serve_loans::cache_slots_for(xcache, basalt::prefill::Prefill::bytes_needed(g, ss, chunk));
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e) {
                 const int32_t r = host_res.empty() ? -1 : host_res[(size_t) (l * g.n_expert + e)];
@@ -4788,7 +4648,7 @@ int main(int argc, char** argv) {
         c.link_gbps = st.link_gbps;
         c.stream_bytes.assign((size_t) g.n_layers, 0.0);
         const basalt::core::ExpertCache& pc = st.tier->cache();
-        const int64_t first = pc.slots() - cache_slots_for(pc, region);
+        const int64_t first = pc.slots() - serve_loans::cache_slots_for(pc, region);
         const std::vector<int32_t>& r = st.tier->residency();
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e) {
@@ -4799,23 +4659,56 @@ int main(int argc, char** argv) {
     };
     // a part [a0, b0) of a prompt ending at `prompt_end` over up to `max_stages` stages, each stage with its weights'
     // layers [lo, hi) and image bytes: both prices, and the split's chunk and head chunk
-    struct SplitPricing { basalt::program::PsPrice price; int64_t chunk = 0, head = 0; };
-    auto split_price = [&](int64_t a0, int64_t b0, int64_t prompt_end, int max_stages) -> SplitPricing {
-        SplitPricing sp0;
+    int64_t split_hand_rows = 0;   // the rows each hand-off buffer holds (0 before they exist: a chunk's)
+    int64_t split_peer_rows = 0;   // the longest routed-only chunk a slower tier card computes its experts' rows of
+    auto split_price = [&](int64_t a0, int64_t b0, int64_t prompt_end, int max_stages) -> engine_local::SplitPricing {
+        engine_local::SplitPricing sp0;
         const int64_t n_tok = b0 - a0;
         // two chunks or more, the draft layer's window within the last two the main card hands on (their final rows
         // come back for it in the hand-off buffers)
-        const auto [chunk, head] = one_card_chunks(n_tok, read_cap(), true);
-        if (chunk < 4096 || n_tok <= std::max(chunk, head) || 2 * chunk < draft_window) return sp0;
-        sp0.chunk = chunk;
-        sp0.head = head;
+        const auto [chunk, head] = serve_loans::one_card_chunks(n_tok, read_cap(), true, o.prefill_auto_fit);
+        if (n_tok <= std::max(chunk, head)) return sp0;   // one chunk: read on the main card, no reason to give
+        char why[160];
+        // a slower tier card that computes its experts' rows of the routed-only chunks of a CUDA0 read: the split
+        // gives that share up and the price does not count it, so those chunks stay on CUDA0; any other tier set keeps
+        // the 4096-token floor
+        if (!peer_streamed_share && split_peer_rows > 0) {
+            if (chunk <= split_peer_rows) {
+                std::snprintf(why, sizeof why, "chunks of %lld tokens: CUDA0 alone reads them with the tier card "
+                              "computing its experts' rows (up to %lld tokens)", (long long) chunk,
+                              (long long) split_peer_rows);
+                sp0.why = why;
+                return sp0;
+            }
+        } else if (chunk < 4096) {
+            std::snprintf(why, sizeof why, "chunks of %lld tokens, below the 4096 minimum", (long long) chunk);
+            sp0.why = why;
+            return sp0;
+        }
         basalt::program::PsPart part;
         part.cell0 = a0;
-        part.tier_chunks = chunk_list(n_tok, chunk, head);
+        part.tier_chunks = serve_loans::chunk_list(n_tok, chunk, head);
         part.split_chunks = part.tier_chunks;
         part.row_bytes = (uint64_t) (g.hc * g.n_embd) * sizeof(float);
         const int64_t c_last = b0 - part.split_chunks.back();
         part.draft_rows = draft_window > 0 ? std::max<int64_t>(0, c_last - std::max(a0, prompt_end - draft_window)) : 0;
+        // the draft layer's rows before the kept chunk come back in the hand-off buffers: the last two chunks handed on
+        // in place, earlier ones past `chunk` rows in either buffer (see read_split)
+        const int64_t kept_rows =
+            basalt::program::prompt_split_draft_room(part.split_chunks, chunk, std::max(split_hand_rows, chunk));
+        if (part.draft_rows > kept_rows) {
+            if (draft_window >= INT64_MAX / 4)
+                std::snprintf(why, sizeof why, "the draft layer attends to every cell");
+            else
+                std::snprintf(why, sizeof why, "chunks of %lld tokens: the draft layer's window needs %lld rows back, the "
+                              "hand-off buffers hold %lld", (long long) chunk, (long long) part.draft_rows,
+                              (long long) kept_rows);
+            sp0.why = why;
+            return sp0;
+        }
+        sp0.chunk = chunk;
+        sp0.head = head;
+        part.host_gbps = split_host_gbps;
         std::vector<basalt::program::PsCard> peers;
         for (const auto& st : pstages) {
             const uint64_t region = st->image_bytes + basalt::core::prompt_session_bytes(g, b0 + 64, st->lo, st->hi) +
@@ -4871,8 +4764,8 @@ int main(int argc, char** argv) {
             st->hi = g.n_layers;
             st->image_bytes = ok ? image_from(g.n_layers / 2) : 0;
         }
-        const SplitPricing ref_all = ok ? split_price(0, longest, longest, all) : SplitPricing{};
-        const SplitPricing ref = ok && split_cap >= 2 && split_cap < all ? split_price(0, longest, longest, split_cap) : ref_all;
+        const engine_local::SplitPricing ref_all = ok ? split_price(0, longest, longest, all) : engine_local::SplitPricing{};
+        const engine_local::SplitPricing ref = ok && split_cap >= 2 && split_cap < all ? split_price(0, longest, longest, split_cap) : ref_all;
         for (auto& st : pstages) st->lo = st->hi = 0, st->image_bytes = 0;
         if (!ok) {
             basalt::log::info("basalt generate", "prompt split: off (its weights' sizes: %s)", err.c_str());
@@ -4881,11 +4774,11 @@ int main(int argc, char** argv) {
             basalt::log::info("basalt generate", "prompt split: off (a %lld-token context is too short for it)",
                               (long long) o.max_context);
         } else if (split_cap < 2) {
-            basalt::log::info("basalt generate", "prompt split: off on %zu cards until measured there (a %lld-token prompt: "
-                                 "%.0f ms on CUDA0, %.0f ms with %s%s; --exp prompt_split=%d reads across them)",
+            basalt::log::info("basalt generate", "prompt split: off on %zu unlike cards until measured there (a %lld-token "
+                                 "prompt: %.0f ms on CUDA0, %.0f ms with %s%s)",
                               pstages.size() + 1, (long long) longest, ref_all.price.tier_ms, ref_all.price.split_ms,
                               split_layers_text(ref_all.price.stages, ref_all.price.cuts).c_str(),
-                              split_stages_text(ref_all.price).c_str(), all);
+                              split_stages_text(ref_all.price).c_str());
         } else if (!ref.price.split) {
             basalt::log::info("basalt generate", "prompt split: off (a %lld-token prompt: %.0f ms on CUDA0, %.0f ms across%s)",
                               (long long) longest, ref.price.tier_ms, ref.price.split_ms, split_stages_text(ref.price).c_str());
@@ -4945,7 +4838,7 @@ int main(int argc, char** argv) {
         const basalt::core::ExpertCache& pc = st.tier->cache();
         uint8_t* base = const_cast<uint8_t*>(pc.device_slot(0));
         uint8_t* w_at = (uint8_t*) ((uintptr_t) (base + pc.bytes() - st.image_bytes) & ~(uintptr_t) 255);
-        const int64_t k = cache_slots_for(pc, (uint64_t) (base + pc.bytes() - w_at));
+        const int64_t k = serve_loans::cache_slots_for(pc, (uint64_t) (base + pc.bytes() - w_at));
         bool ok = k > 0 && k < pc.slots() / 2 && st.tier->lend((int32_t) (pc.slots() - k), st.lent, err) &&
                   st.wt.load(pack_files, w_at, st.pool, err, &st.skip, false);
         if (ok) {
@@ -5055,7 +4948,7 @@ int main(int argc, char** argv) {
             std::vector<std::pair<int32_t, int32_t>> lent;
         };
         auto part_slots = [&](const PfPart& p, int64_t c) -> int64_t {
-            return cache_slots_for(*p.cache, basalt::prefill::Prefill::bytes_needed(g, *p.ses, c));
+            return serve_loans::cache_slots_for(*p.cache, basalt::prefill::Prefill::bytes_needed(g, *p.ses, c));
         };
         auto part_bytes = [&](const PfPart& p, int32_t first) -> uint64_t {
             basalt::core::ExpertCache& xc = *p.cache;
@@ -5102,7 +4995,7 @@ int main(int argc, char** argv) {
                 }
                 // the largest chunk on the 256-token grid that `only` - or, with null, every stage - can lend, under
                 // the operator's ceiling (auto_ceiling keeps a bare `auto` at 8192)
-                return biggest_chunk(auto_ceiling, [&](int64_t t) -> bool { return fits(t, true, only); });
+                return engine_local::biggest_chunk(auto_ceiling, [&](int64_t t) -> bool { return fits(t, true, only); });
             };
             const int64_t chunk = scan(nullptr);
             // A small card in a layer split caps every stage's chunk.  Named when it bites, so the regression is one
@@ -5315,6 +5208,7 @@ int main(int argc, char** argv) {
                 basalt::log::warn("basalt serve", "%s - the prompt path stays on the primary GPU", err.c_str());
                 err.clear();
             }
+            split_peer_rows = sp.peer_routed_rows_max();
         }
         // ---- the prompt-time split's stages on the tier cards.  A stage's place, from the end of its tier's slots: the
         // weights, the session (for the whole context here; for its prompt's cells and layers at each read), then the
@@ -5355,10 +5249,17 @@ int main(int argc, char** argv) {
             // a stage that may hand its chunks on (every card but the one that reads the last layers) holds two pinned
             // buffers of the stage's chunk, as the main card does
             ok = ok && (j == 0 || st.sp.reserve_hand_off(split_chunk_max, err));
+            // a read's kernels and small buffers load on the card outside the lent slots: a card without room for them
+            // beside its stage declines here, before a read could fail on them
+            constexpr size_t kStageFreeMin = 256ull << 20;
+            size_t fb = 0, tb = 0;
+            if (ok && cudaMemGetInfo(&fb, &tb) == cudaSuccess && fb < kStageFreeMin) {
+                ok = false;
+                err = std::to_string(fb >> 20) + " MiB free beside its stage, a read needs " +
+                      std::to_string(kStageFreeMin >> 20) + "; --peer-reserve-mib";
+            }
             if (ok) {
                 st.sp.set_ring_remote(host_res.data(), &xcache, 0);
-                size_t fb = 0, tb = 0;
-                cudaMemGetInfo(&fb, &tb);
                 basalt::log::info("basalt serve", "prompt split: CUDA%d can take layers %lld-%lld of a long prompt (chunks up "
                                      "to %lld tokens, links %.1f/%.1f GB/s); %zu MiB free on it (%zu before)", st.dev,
                                   (long long) st.lo, (long long) st.hi - 1, (long long) split_chunk_max,
@@ -5372,6 +5273,7 @@ int main(int argc, char** argv) {
             }
         }
         // the main card hands its chunks on through two pinned buffers of the stage's chunk
+        if (split_ready) split_hand_rows = split_chunk_max;
         if (split_ready && !sp.reserve_hand_off(split_chunk_max, err)) {
             basalt::log::warn("basalt serve", "prompt split: off (%s)", err.c_str());
             err.clear();
@@ -6670,7 +6572,7 @@ int main(int argc, char** argv) {
         report_expert_tiers();
         basalt::platform::stop_memory_watchdog();
         // from here a request that runs the RAM below the floor stops with an error instead of the machine swapping
-        const uint64_t guard_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), tier_file_bytes);
+        const uint64_t guard_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), tier_file_bytes, prompt_file_bytes);
         basalt::platform::start_ram_guard(guard_floor);
         // a VRAM shrink's RAM homes leave the guard's floor above the margin and the top-up's own slack free
         src.set_homes_reserve(guard_floor - std::min(guard_floor, basalt::platform::ram_margin()) + (256ull << 20));
@@ -6761,7 +6663,7 @@ int main(int argc, char** argv) {
             // of chunk, not half of it
             int64_t c = chunk_full;
             if (o.prefill_auto && !fits(c)) {
-                c = biggest_chunk(chunk_full, fits);
+                c = engine_local::biggest_chunk(chunk_full, fits);
                 if (c == 0) c = 256;
             }
             while (c > 256 && !fits(c)) c = std::max<int64_t>(256, c / 2 / 256 * 256);
@@ -6944,7 +6846,18 @@ int main(int argc, char** argv) {
         // tail again, each returned slot refilled from RAM.  Both run between windows, never inside one.
         // a request's room past its prompt, and each later step (batch slots: a smaller step, as their base)
         const int64_t kKvGrowCells = o.batch > 0 ? 4096 : 16384;
+        constexpr int64_t kKvWindowCells = 2 * basalt::kernels::kVerifyMaxT + 64;   // a decoding session's next window
         int64_t kv_moves = 0;
+        // the expert cache never shrinks below the slots the prompt path's smallest loan needs (a 256-token chunk, and
+        // the 128 slots a loan leaves), so the next prompt can always be read
+        auto cache_floor_slots = [&]() -> int64_t {
+            if (pf_parts.empty() || pf_parts[0].first < 0) return 0;
+            const int64_t k = part_slots(pf_parts[0], 256);
+            int64_t f = k + 128;
+            if (o.prefill_auto) f = std::max<int64_t>(f, (k * 100 + kAutoLendPct - 1) / kAutoLendPct);
+            return std::min<int64_t>(f, xcache.full_slots());
+        };
+        bool kv_short = false;   // the last kv_fit refused: the cells would take the cache below its floor
         auto kv_drain = [&](std::string& e) -> bool {
             if (!ver.wait_commit(e)) return false;
             apply_pending(true);
@@ -7006,10 +6919,13 @@ int main(int argc, char** argv) {
         };
         // `shrink` false: only VRAM that is free now (a prompt read is running beside the windows, its loan in the
         // cache's last slots) - false with `e` empty when that is not enough
-        auto kv_fit = [&](basalt::core::SessionState& s, int64_t cells, std::string& e, bool shrink = true) -> bool {
+        // `min_cells`: when `cells` would take the cache below its floor, as many as leave it, down to these
+        auto kv_fit = [&](basalt::core::SessionState& s, int64_t cells, std::string& e, bool shrink = true,
+                          int64_t min_cells = -1) -> bool {
+            kv_short = false;
             if (kv_floor <= 0) return true;
             cells = std::min<int64_t>(std::max<int64_t>(cells, kv_floor), s.max_cells);
-            const int64_t add = (int64_t) basalt::core::session_kv_grow_bytes(s, cells);
+            int64_t add = (int64_t) basalt::core::session_kv_grow_bytes(s, cells);
             if (add <= 0) return true;
             const auto t0 = Clock::now();
             if (shrink && !kv_drain(e)) return false;
@@ -7018,6 +6934,41 @@ int main(int argc, char** argv) {
             cudaMemGetInfo(&free_b, &total_b);
             const int64_t room = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
             if (!shrink && add > room) { e.clear(); return false; }
+            if (add > room && xcache.segmented()) {
+                const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
+                auto keep_for = [&](int64_t a) {
+                    return std::max<int64_t>(0, (xcache.mapped_bytes() - (a - room)) / gran * gran);
+                };
+                const int64_t floor = cache_floor_slots();
+                auto leaves_floor = [&](int64_t c) {
+                    const int64_t a = (int64_t) basalt::core::session_kv_grow_bytes(s, c);
+                    return a <= room || xcache.slots_after_shrink(keep_for(a)) >= floor;
+                };
+                if (!leaves_floor(cells)) {
+                    // the most cells on the 256-cell grid that leave it, down to `min_cells`
+                    int64_t best = -1;
+                    if (min_cells > 0 && min_cells < cells && leaves_floor(min_cells)) {
+                        best = min_cells;
+                        for (int64_t lo = min_cells / 256 + 1, hi = cells / 256; lo <= hi;) {
+                            const int64_t mid = lo + (hi - lo) / 2;
+                            if (mid * 256 > min_cells && leaves_floor(mid * 256)) { best = mid * 256; lo = mid + 1; }
+                            else hi = mid - 1;
+                        }
+                    }
+                    if (best < 0) {
+                        kv_short = true;
+                        const int64_t want = min_cells > 0 && min_cells < cells ? min_cells : cells;
+                        e = "elastic KV: " + std::to_string(want) + " cells of KV (+" +
+                            std::to_string((int64_t) basalt::core::session_kv_grow_bytes(s, want) >> 20) +
+                            " MiB) would take the expert cache below the " + std::to_string(floor) +
+                            " slots the next prompt chunk needs (" + std::to_string(xcache.slots()) + " now, " +
+                            std::to_string(room >> 20) + " MiB free above the reserve)";
+                        return false;
+                    }
+                    cells = best;
+                    add = (int64_t) basalt::core::session_kv_grow_bytes(s, cells);
+                }
+            }
             if (add > room && xcache.segmented()) {
                 // whole tail segments: everything from the first one at or past `keep` goes
                 const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
@@ -7179,13 +7130,50 @@ int main(int argc, char** argv) {
             in_lines.pop_front();
             return true;
         };
+        // the elastic KV's spare cells back to the expert cache: every session keeps what it holds (the solo session
+        // `ss_keep` cells, a decoding slot its next window too), idle ones first; `skip` and slot `skip_slot` are left
+        // alone, and it stops once `enough` (if set) is true
+        auto kv_give_back = [&](int64_t ss_keep, const basalt::core::SessionState* skip, int skip_slot,
+                                const std::function<bool()>& enough, int64_t& given, std::string& e) -> bool {
+            std::vector<basalt::core::SessionState*> sess;
+            std::vector<basalt::program::KvHold> holds;
+            auto add = [&](basalt::core::SessionState& s, int64_t keep, bool active) {
+                if (&s == skip) return;
+                for (size_t i = 0; i < sess.size(); ++i)
+                    if (sess[i] == &s) {
+                        holds[i].keep = std::max(holds[i].keep, keep);
+                        holds[i].active = holds[i].active || active;
+                        return;
+                    }
+                sess.push_back(&s);
+                holds.push_back({basalt::core::session_kv_cells(s), keep, active});
+            };
+            add(ss, ss_keep, false);
+            for (size_t b = 0; !bslot_ss.empty() && b < bslot_ss[0].size() && b < bs.size(); ++b) {
+                if ((int) b == skip_slot) continue;
+                const BSlot& sb = bs[b];
+                add(*bslot_ss[0][b], std::max<int64_t>((int64_t) sb.ids.size(), sb.active ? sb.p + kKvWindowCells : 0),
+                    sb.active);
+            }
+            for (const auto& [i, keep] : basalt::program::kv_giveback_order(holds, kv_floor)) {
+                if (holds[(size_t) i].backed < 0) continue;
+                if (!kv_release(*sess[(size_t) i], keep, e)) return false;
+                given += holds[(size_t) i].backed - basalt::core::session_kv_cells(*sess[(size_t) i]);
+                if (enough && enough()) break;
+            }
+            return true;
+        };
         // ---- ENC <image> <out> [<image> <out> ...] (--vision-mmproj), between requests and between batch windows.  The
         // images are decoded on the host first; then the encoder borrows the last expert-cache slots (the prompt path's
         // way: their rows are marked missing for the time), uploads its weights from the pinned copy, encodes each
         // image on its own stream, and the slots get their experts back from RAM before anything else reads the cache.
         // One reply line per image: `ENC OK <n> <nx> <ny> <ms>`, or a single `ENC ERR <message>`.
         auto enc_command = [&](const std::string& cmd) {
-            auto reply_err = [&](const std::string& m) { std::printf("ENC ERR %s\n", m.c_str()); std::fflush(stdout); };
+            auto reply_err = [&](const std::string& m, bool logged = false) {
+                if (!logged) basalt::log::warn("basalt serve", "image encoder: refused: %s", m.c_str());
+                std::printf("ENC ERR %s\n", m.c_str());
+                std::fflush(stdout);
+            };
             if (o.vision_mmproj.empty()) { reply_err("this engine was started without --vision-mmproj"); return; }
             if (pf_parts.size() != 1 || pf_parts[0].first < 0 || !stages.empty()) {
                 reply_err("the in-engine image encoder needs one GPU's expert cache with a prompt lend region");
@@ -7238,14 +7226,42 @@ int main(int argc, char** argv) {
             if (cudaDeviceSynchronize() != cudaSuccess) { reply_err(std::string("device: ") + cudaGetErrorString(cudaGetLastError())); return; }
             PfPart& p = pf_parts[0];
             if (!p.lent.empty()) { reply_err("a prompt's loan is still out"); return; }
-            const int64_t k = cache_slots_for(*p.cache, vis_enc.arena_bytes(tokens));
-            int64_t room = p.cache->slots() - p.first;
-            if (batch_on()) room = std::min<int64_t>(room, kLendCapDecoding);
-            if (k <= 0 || k > room) {
-                reply_err("the image needs " + std::to_string((long long) k) + " expert-cache slots and " +
-                          std::to_string((long long) room) + " can be lent");
+            const int64_t k = serve_loans::cache_slots_for(*p.cache, vis_enc.arena_bytes(tokens));
+            // the room: the cache's tail down to the first slot whose expert has no RAM copy to refill it from (never
+            // less than the prompt path's loan region, which always has one)
+            auto lendable = [&]() -> int64_t {
+                std::vector<uint8_t> in_ram;
+                if (srcp == &src && src.complement_ready()) {
+                    in_ram.resize(host_res.size());
+                    for (size_t i = 0; i < host_res.size(); ++i)
+                        in_ram[i] = src.resident_blob((int64_t) i / g.n_expert, (int64_t) i % g.n_expert) != nullptr;
+                }
+                const int64_t floor = basalt::program::image_lend_floor(host_res, in_ram, p.cache->slots());
+                int64_t r = p.cache->slots() - std::min<int64_t>(floor, p.first);
+                if (batch_on()) r = std::min<int64_t>(r, kLendCapDecoding);
+                return r;
+            };
+            int64_t room = lendable();
+            // short of room: the elastic KV gives back the cells no session holds (idle slots first), and the cache
+            // maps that VRAM again; the sessions take cells back on demand after the encode
+            int64_t kv_given = 0;
+            if (k > room && kv_floor > 0 &&
+                !kv_give_back((int64_t) live.size(), nullptr, -1, [&] { room = lendable(); return k <= room; }, kv_given, e)) {
+                reply_err(e);
                 return;
             }
+            if (k <= 0 || k > room) {
+                basalt::log::warn("basalt serve", "image encoder: refused, %lld cache slots needed, %lld lendable "
+                                     "(cache %lld slots, %lld KV cells given back, the rest held by the sessions)",
+                             (long long) k, (long long) room, (long long) p.cache->slots(), (long long) kv_given);
+                reply_err("the image needs " + std::to_string((long long) k) + " expert-cache slots and " +
+                          std::to_string((long long) room) + " can be lent" +
+                          (kv_floor > 0 ? ", with every spare KV cell given back" : ""), true);
+                return;
+            }
+            if (kv_given > 0)
+                basalt::log::info("basalt serve", "image encoder: %lld KV cells given back for %lld cache slots",
+                             (long long) kv_given, (long long) k);
             const int32_t first = (int32_t) (p.cache->slots() - k);
             for (int64_t l = p.lb; l < p.le; ++l)
                 for (int64_t ex = 0; ex < g.n_expert; ++ex) {
@@ -7285,13 +7301,17 @@ int main(int argc, char** argv) {
                 const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
                 const int64_t nb = (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                 if (b == nullptr || !p.cache->fill_slot_queued(slot, b, e, nb)) {
-                    std::printf("ENC ERR refilling the expert cache failed: %s\n", e.c_str());
-                    std::fflush(stdout);
+                    basalt::log::error("basalt serve", "image encoder: refilling the expert cache failed: %s", e.c_str());
+                    reply_err("refilling the expert cache failed: " + e, true);
                     return;
                 }
                 host_res[(size_t) i] = slot;
             }
-            if (!p.cache->sync_queued(e)) { std::printf("ENC ERR refilling the expert cache failed: %s\n", e.c_str()); std::fflush(stdout); return; }
+            if (!p.cache->sync_queued(e)) {
+                basalt::log::error("basalt serve", "image encoder: refilling the expert cache failed: %s", e.c_str());
+                reply_err("refilling the expert cache failed: " + e, true);
+                return;
+            }
             const int64_t n_lent = (int64_t) p.lent.size();
             p.lent.clear();
             p.lent_chunk = 0;
@@ -7339,9 +7359,44 @@ int main(int argc, char** argv) {
         // slot b's sessions -> the main ones (the reverse of copy_to_slot): a request that continues the
         // conversation an idle slot holds reads on from there.  Every stage, the same calls.
         // `at`: one of the slot's checkpoints - only the K/V up to it is copied and its state restored instead
+        // a slot's conversation held in RAM (`hold_slot`) while its KV cells back the request that continues it, when the
+        // two do not fit side by side; copy_from_slot restores from it
+        struct SlotHeld {
+            int b = -1;
+            std::vector<basalt::core::ConversationCheckpoint> ck;
+            std::vector<std::vector<basalt::core::ConversationKv>> kv;
+        };
+        SlotHeld slot_held;
+        auto hold_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
+            slot_held = SlotHeld{};
+            const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
+            slot_held.ck.resize(bslot_ss.size());
+            slot_held.kv.resize(bslot_ss.size());
+            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                basalt::core::SessionState& from = *bslot_ss[k][(size_t) b];
+                const basalt::core::SessionState& to = k == 0 ? *rsp : stages[k - 1]->ss;
+                if (from.gdn_state == to.gdn_state) continue;
+                const basalt::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+                if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot hold: device sync failed"; return false; }
+                if (at == nullptr) {
+                    slot_held.ck[k].ids = bs[(size_t) b].ids;
+                    if (!basalt::core::conversation_checkpoint_save(slot_held.ck[k], from, g, e)) return false;
+                }
+                for (int64_t j = 0; j < from.qsa_alloc; ++j) {
+                    slot_held.kv[k].emplace_back();
+                    if (!basalt::core::conversation_kv_save(slot_held.kv[k].back(), from.qsa_states[from.qsa_ord0 + j], g,
+                                                            upto, true, e))
+                        return false;
+                    if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot hold: device sync failed"; return false; }
+                }
+            }
+            slot_held.b = b;
+            return true;
+        };
         auto copy_from_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
+            const bool held = slot_held.b == b;
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 basalt::core::SessionState& from = *bslot_ss[k][(size_t) b];
                 basalt::core::SessionState& to = k == 0 ? *rsp : stages[k - 1]->ss;
@@ -7351,6 +7406,8 @@ int main(int argc, char** argv) {
                 if (at != nullptr) {
                     if (!basalt::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, e))
                         return false;
+                } else if (held) {
+                    if (!basalt::core::conversation_checkpoint_restore(slot_held.ck[k], to, g, e)) return false;
                 } else {
                     basalt::core::ConversationCheckpoint ck;
                     ck.ids = bs[(size_t) b].ids;
@@ -7360,14 +7417,16 @@ int main(int argc, char** argv) {
                 }
                 for (int64_t j = 0; j < from.qsa_alloc; ++j) {
                     basalt::core::ConversationKv img;
-                    if (!basalt::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
+                    basalt::core::ConversationKv& src_img = held ? slot_held.kv[k][(size_t) j] : img;
+                    if (!held && !basalt::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
                         return false;
                     if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
-                    if (!basalt::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
+                    if (!basalt::core::conversation_kv_restore(src_img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                         return false;
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
             }
+            if (held) slot_held = SlotHeld{};
             if (batch_spec && !mtp.copy_store(b, mtp.main_store(), upto, e)) return false;
             return true;
         };
@@ -7429,7 +7488,20 @@ int main(int argc, char** argv) {
                     if (at + 2 * MR + 64 <= backed) continue;
                     std::string ke;
                     if (!ov_active && ba_job) { ba_thr.join(); ba_job = false; }   // its copies land before the drain
-                    if (kv_fit(u, at + kKvGrowCells, ke, !ov_active)) continue;
+                    if (kv_fit(u, at + kKvGrowCells, ke, !ov_active, at + 2 * MR + 64)) continue;
+                    if (!ke.empty() && kv_short) {   // the expert cache's floor: this slot's reply ends here
+                        BSlot& sl = bs[(size_t) b];
+                        basalt::log::warn("basalt batch", "slot %d stopped at %lld cells: %s", b, (long long) at, ke.c_str());
+                        sl.active = false;
+                        sl.cached = o.prompt_cache > 0;   // its sessions hold sl.ids
+                        sl.guard.reset();
+                        report_cache(b, sl.cached, sl.ids, sl.imgs, sl.checks);
+                        std::printf("BDONE %d %lld length %.1f %lld %lld\n", b, (long long) sl.produced,
+                                    std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count(),
+                                    (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
+                        kv_wait[(size_t) b] = 1;
+                        continue;
+                    }
                     if (!ke.empty()) { std::printf("ERR %s\n", ke.c_str()); return false; }
                     if (at + 2 * MR > backed) kv_wait[(size_t) b] = 1;
                 }
@@ -8336,6 +8408,7 @@ int main(int argc, char** argv) {
                 bool live_ok = false, cvec = true;
                 std::vector<ConvCheckpoint> checks;
             } solo_book;
+            bool solo_moved = false;   // the solo session gave its cells to this request (hold_slot): it holds nothing after
             if (in_slot) {
                 solo_book = {std::move(live), std::move(live_imgs), live_ok, cvec_cached, std::move(checks)};
                 BSlot& sb = bs[(size_t) slot_b];
@@ -8458,8 +8531,71 @@ int main(int argc, char** argv) {
             // the elastic KV: every cell this request writes is backed before anything (a restore, a slot's copy, the
             // read) writes it
             // (a restore writes the snapshot's whole live K/V, which can be longer than this prompt)
-            if (!kv_fit(*rsp, std::max<int64_t>(n, incoming ? (int64_t) incoming->live.ids.size() : 0) + kKvGrowCells,
-                        err)) {
+            const int64_t kv_need = std::max<int64_t>(n, incoming ? (int64_t) incoming->live.ids.size() : 0);
+            bool kv_ok = kv_fit(*rsp, kv_need + kKvGrowCells, err, true, kv_need + kKvWindowCells);
+            if (!kv_ok && kv_short) {   // the other sessions' spare cells first
+                int64_t given = 0;
+                std::string ge;
+                if (!kv_give_back(in_slot ? (int64_t) solo_book.live.size() : (int64_t) live.size(), rsp,
+                                  in_slot ? slot_b : -1, nullptr, given, ge)) {
+                    err = ge;
+                    kv_short = false;
+                } else if (given > 0) {
+                    err.clear();
+                    kv_ok = kv_fit(*rsp, kv_need + kKvGrowCells, err, true, kv_need + kKvWindowCells);
+                }
+            }
+            // the idle slot this request continues: its conversation waits in RAM and its cells come here, so the two
+            // copies never hold VRAM at once
+            if (!kv_ok && kv_short && slot_source >= 0 && !bs[(size_t) slot_source].active &&
+                (bslot_ss[0][(size_t) slot_source].get() != &ss || in_slot) &&
+                bslot_ss[0][(size_t) slot_source]->gdn_state != rsp->gdn_state) {
+                basalt::core::SessionState& from = *bslot_ss[0][(size_t) slot_source];
+                const int64_t had = basalt::core::session_kv_cells(from);
+                std::string he;
+                if (hold_slot(slot_source, slot_ck, he) && kv_release(from, 0, he)) {
+                    bs[(size_t) slot_source].cached = false;   // its cells are this request's now
+                    solo_moved = &from == &ss;
+                    basalt::log::info("basalt batch", "slot %d's conversation waits in RAM while its %lld KV cells back "
+                                      "this request", slot_source, (long long) (had - basalt::core::session_kv_cells(from)));
+                    err.clear();
+                    kv_ok = kv_fit(*rsp, kv_need + kKvGrowCells, err, true, kv_need + kKvWindowCells);
+                } else {
+                    slot_held = SlotHeld{};
+                    err = he;
+                    kv_short = false;
+                }
+            }
+            if (!kv_ok && kv_short) {
+                // declined: the engine stays up, the solo session and its bookkeeping as they were
+                slot_held = SlotHeld{};
+                basalt::log::warn("basalt serve", "prompt of %lld tokens refused: %s", (long long) n, err.c_str());
+                std::printf("ERR %s\n", err.c_str());
+                std::fflush(stdout);
+                if (in_slot) {
+                    if (solo_req && !ver.bind_session(&ss, err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    rsp = &ss;
+                    sp.set_session(ss);
+                    if (mtp_on) mtp.set_ple_session(&ss);
+                    live = std::move(solo_book.live);
+                    live_imgs = std::move(solo_book.live_imgs);
+                    live_ok = solo_book.live_ok;
+                    cvec_cached = solo_book.cvec;
+                    checks = std::move(solo_book.checks);
+                    if (solo_moved) {
+                        live.clear();
+                        live_imgs.clear();
+                        live_ok = false;
+                        checks.clear();
+                    }
+                }
+                admit_slot = -1;
+                continue;
+            }
+            if (!kv_ok) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
@@ -8474,6 +8610,7 @@ int main(int argc, char** argv) {
                     basalt::log::warn("basalt batch", "restoring slot %d failed (%s); reading the prompt",
                                  slot_source, err.c_str());
                     err.clear();
+                    slot_held = SlotHeld{};
                     live.clear();
                     live_imgs.clear();
                     checks.clear();
@@ -8770,12 +8907,13 @@ int main(int argc, char** argv) {
                                                                                      (xcache.full_slots() - xcache.slots())));
                 }
                 if (loan_lim != std::numeric_limits<int64_t>::max() && !pf_parts.empty() && pf_parts[0].first >= 0) {
-                    const int64_t lc = std::max<int64_t>(256, biggest_chunk(cap, [&](int64_t t) {
+                    const int64_t lc = std::max<int64_t>(256, engine_local::biggest_chunk(cap, [&](int64_t t) {
                         return part_slots(pf_parts[0], t) <= loan_lim;
                     }));
                     cap = std::min(cap, lc);
                 }
-                auto [want_full, head_tok] = one_card_chunks(tokens, cap, !beside && stages.empty());
+                auto [want_full, head_tok] = serve_loans::one_card_chunks(tokens, cap, !beside && stages.empty(),
+                                                                       o.prefill_auto_fit);
                 if (chunk > 0) {
                     want_full = chunk;
                     head_tok = head;
@@ -8886,9 +9024,29 @@ int main(int argc, char** argv) {
             struct SplitPlan { int64_t chunk = 0, head = 0; int stages = 0; std::vector<int> cuts; };
             auto split_plan = [&](int64_t a0, int64_t b0) -> SplitPlan {
                 SplitPlan plan;
-                if (!split_ready || batch_on() || !req_imgs.empty()) return plan;
-                const SplitPricing pr = split_price(a0, b0, n - 1, split_stages);
-                if (pr.chunk <= 0 || pr.chunk > split_chunk_max || pr.price.stages < 2) return plan;
+                if (!split_ready) return plan;   // (the start line said why)
+                // every part longer than a chunk that is not read across says why, with its numbers
+                auto decline = [&](const std::string& why) {
+                    basalt::log::info("basalt serve", "prompt split: %lld tokens read on CUDA0 (%s)", (long long) (b0 - a0),
+                                      why.c_str());
+                };
+                const char* skip = batch_on() ? "slots are decoding" : !req_imgs.empty() ? "the prompt has images" : nullptr;
+                if (skip != nullptr) {
+                    if (b0 - a0 > read_cap()) decline(skip);
+                    return plan;
+                }
+                const engine_local::SplitPricing pr = split_price(a0, b0, n - 1, split_stages);
+                if (!pr.why.empty()) decline(pr.why);
+                if (pr.chunk <= 0) return plan;
+                if (pr.chunk > split_chunk_max) {
+                    decline("chunks of " + std::to_string(pr.chunk) + " tokens, above the stages' " +
+                            std::to_string(split_chunk_max));
+                    return plan;
+                }
+                if (pr.price.stages < 2) {
+                    decline("no stage set fits the cards' layer windows");
+                    return plan;
+                }
                 basalt::log::info("basalt serve", "prompt split: %lld tokens priced %.0f ms on CUDA0, %.0f ms with %s%s; read %s",
                                   (long long) (b0 - a0), pr.price.tier_ms, pr.price.split_ms,
                                   split_layers_text(pr.price.stages, pr.price.cuts).c_str(),
@@ -8921,9 +9079,9 @@ int main(int argc, char** argv) {
                 const auto t0 = Clock::now();
                 const int64_t n_tok = b0 - a0, chunk = plan.chunk, head = plan.head;
                 const int64_t lb = plan.cuts[0];
-                // the last chunk's first cell: after the head chunk, chunks of `chunk`
-                const int64_t c_last = head > 0 ? a0 + head + ((n_tok - head - 1) / chunk) * chunk
-                                                : a0 + ((n_tok - 1) / chunk) * chunk;
+                // the last chunk's first cell, from the chunks the main card reads (the one it keeps)
+                const std::vector<int64_t> part_chunks = serve_loans::chunk_list(n_tok, chunk, head);
+                const int64_t c_last = b0 - (part_chunks.empty() ? 0 : part_chunks.back());
                 if (sp.chunk() != chunk) {
                     e = "prompt split: the main card's prompt buffers are not laid out for the split's chunk";
                     return false;
@@ -8967,7 +9125,7 @@ int main(int argc, char** argv) {
                         return false;
                     }
                     uint8_t* base = const_cast<uint8_t*>(pc.device_slot(0));
-                    st.lent_slots = cache_slots_for(pc, (uint64_t) (base + pc.bytes() - b_at));
+                    st.lent_slots = serve_loans::cache_slots_for(pc, (uint64_t) (base + pc.bytes() - b_at));
                     const int32_t first = (int32_t) (pc.slots() - st.lent_slots);
                     if (!st.tier->lend(first, st.lent, e)) {
                         give_back_all();
@@ -9035,6 +9193,7 @@ int main(int argc, char** argv) {
                 int64_t main_done = a0, yield_q = -1;
                 int yield_ys = -1;
                 std::atomic<int64_t> c_cut{c_last};
+                std::atomic<int64_t> last_end{a0};   // the end of the last chunk the last stage read
                 sp.keep_here = [&](int64_t done) -> bool {
                     if (done >= c_last) return false;
                     int ys = -1;
@@ -9067,12 +9226,28 @@ int main(int argc, char** argv) {
                 // its own last chunk
                 const int64_t first_cell = mtp_on ? std::max<int64_t>(0, mtp.first_needed()) : INT64_MAX;
                 bool given = false;
+                int64_t given_at = -1;   // the cell the stages' state came back up to
                 double ms_copy = 0;
                 std::future<bool> refill_issue;   // the tier slots' copies, queued on a thread of their own
                 std::string refill_err;
                 // the final rows of the last stage's chunks the draft layer reads, in the hand-off buffers they came in
                 struct Relay { int64_t cell0, n; const float* rows; };
                 std::vector<Relay> relays;
+                // those of the last two chunks handed on stay where they came in; an earlier chunk's go past `chunk` rows
+                // in the card before's two hand-off buffers, which no chunk of this read writes
+                int64_t in_place_from = a0;
+                {
+                    const std::vector<int64_t> cl = serve_loans::chunk_list(n_tok, chunk, head);
+                    int64_t at = a0;
+                    for (size_t i = 0; i + 1 < cl.size(); ++i) {
+                        if (i + 3 == cl.size()) in_place_from = at;
+                        at += cl[i];
+                    }
+                }
+                const basalt::prefill::Prefill& before_last = run.size() >= 2 ? run[run.size() - 2]->sp : sp;
+                const int64_t aside_rows = std::max<int64_t>(0, before_last.hand_rows() - chunk);
+                int aside_buf = 0;
+                int64_t aside_at = 0;
                 std::mutex relay_mu;
                 // mid-prompt checkpoints at the positions one card takes them: the main card saves its state when it
                 // hands such a chunk on, each stage puts its layers' state in once it has read that chunk, the last one
@@ -9125,6 +9300,7 @@ int main(int argc, char** argv) {
                         return false;
                     }
                     given = true;
+                    given_at = c_end;
                     ms_copy = std::chrono::duration<double, std::milli>(Clock::now() - tc).count();
                     refill_issue = std::async(std::launch::async, [&] {
                         bool issued = true;
@@ -9136,7 +9312,29 @@ int main(int argc, char** argv) {
                 last.sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& ce) -> bool {
                     const int64_t HCN = g.hc * g.n_embd;
                     const int64_t r0 = std::max<int64_t>(0, first_cell - p0);
-                    if (r0 < T) {
+                    for (int64_t r = r0; r < T && p0 < in_place_from;) {
+                        if (aside_at >= aside_rows) {
+                            if (++aside_buf > 1) {
+                                ce = "prompt split: the draft layer's rows do not fit the hand-off buffers";
+                                return false;
+                            }
+                            aside_at = 0;
+                            continue;
+                        }
+                        float* h = before_last.hand_buffer(aside_buf);
+                        const int64_t nr = std::min(aside_rows - aside_at, T - r);
+                        float* dst = h == nullptr ? nullptr : h + (size_t) (chunk + aside_at) * HCN;
+                        if (dst == nullptr || cudaMemcpy(dst, R_rows + (size_t) r * HCN, (size_t) nr * HCN * sizeof(float),
+                                                         cudaMemcpyDeviceToHost) != cudaSuccess) {
+                            ce = "prompt split: reading the draft layer's rows back failed";
+                            return false;
+                        }
+                        std::lock_guard<std::mutex> lk(relay_mu);
+                        relays.push_back({p0 + r, nr, dst});
+                        aside_at += nr;
+                        r += nr;
+                    }
+                    if (r0 < T && p0 >= in_place_from) {
                         float* h = const_cast<float*>(last.sp.hand_in());
                         if (h == nullptr || cudaMemcpy(h + (size_t) r0 * HCN, R_rows + (size_t) r0 * HCN,
                                                        (size_t) (T - r0) * HCN * sizeof(float),
@@ -9166,6 +9364,7 @@ int main(int argc, char** argv) {
                     // its last chunk before the kept one: every stage is done with its own
                     if (p0 + T >= c_cut.load() && !state_back(p0 + T, ce)) return false;
                     const int64_t done = p0 + T;
+                    last_end.store(done);
                     pp_reached = done;
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                     std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) pp_total, ms,
@@ -9179,11 +9378,17 @@ int main(int argc, char** argv) {
                 sp.keep_here = nullptr;
                 // the kept chunk [c_end, b_end): the last one, or the one a read that gives way ends with (the stages may
                 // have been done before the cut)
-                const int64_t c_end = c_cut.load(), b_end = yield_q >= 0 ? yield_q : b0;
+                const int64_t c_end = c_cut.load();
+                const int64_t b_end = yield_q >= 0 ? yield_q : b0;
                 if (ok && !given && yield_q >= 0) ok = state_back(c_end, e);
-                if (ok && !given) {
+                // the stages' state must come back exactly at the main card's kept chunk: anything else is an error
+                if (ok && (!given || (yield_q < 0 && given_at != c_end))) {
                     ok = false;
-                    e = "prompt split: the stages' state did not come back";
+                    e = "prompt split: the stages' state did not come back at the kept chunk (planned at " +
+                        std::to_string(c_end) + ", the stages ended at " + std::to_string(last_end.load()) +
+                        (given ? ", it came back at " + std::to_string(given_at) : std::string(", it never came back")) +
+                        "; " + std::to_string(n_tok) + " tokens in chunks of " + std::to_string(chunk) + ", head " +
+                        std::to_string(head) + ")";
                 }
                 sp.set_keep_last(false);
                 sp.on_stage_chunk = nullptr;
@@ -9680,6 +9885,7 @@ int main(int argc, char** argv) {
             consumed.reserve((size_t) (n + max_new + S));
             for (int64_t i = 0; i < fold_p0; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             const char* finish = "length";
+            std::string kv_stop;   // the elastic KV could not back the next window: the request ends on this error
             // pipelined windows: `cv` runs the next window, `ov` is the other chain; a guess that held leaves the next
             // window's verdict in `held`
             basalt::core::Verifier* cv = &ver;
@@ -9812,7 +10018,11 @@ int main(int argc, char** argv) {
                 if (kv_floor > 0 && p + T + 64 > basalt::core::session_kv_cells(*rsp)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     if (copy_live) { src.commit_exchanges(); copy_live = false; }   // as at the request's end
-                    if (!kv_fit(*rsp, p + kKvGrowCells, err)) {
+                    if (!kv_fit(*rsp, p + kKvGrowCells, err, true, p + kKvWindowCells)) {
+                        if (kv_short) {
+                            kv_stop = err;
+                            break;
+                        }
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
                     }
@@ -10208,11 +10418,6 @@ int main(int argc, char** argv) {
             if (apply_thr.joinable()) apply_thr.join();
             if (copy_live) src.commit_exchanges();   // swaps applied early: the rest of their copies
             copy_live = false;
-            if (!xq_drain()) {   // no swap stays in flight between requests
-                std::printf("ERR an adaptive refill failed\n");
-                return 1;
-            }
-            xq_saturated = false;   // the next request starts at the base cap
             if (ppl != nullptr && !ppl->finish(err)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
@@ -10267,9 +10472,13 @@ int main(int argc, char** argv) {
             //      [prompt tokens read]   (fewer than <prompt> - <reused> when a cancel stopped the read)
             //      [offloaded]   (the decode's routed experts the GPU read over PCIe or another GPU computed;
             //                    not in [lookups])
-            const bool ram_out = ram_stop.load();
+            const bool ram_out = ram_stop.load() || !kv_stop.empty();
             std::string ram_error;
-            if (ram_out) {
+            if (!kv_stop.empty()) {
+                basalt::log::warn("basalt serve", "request stopped after %lld tokens: %s", (long long) produced_n,
+                                  kv_stop.c_str());
+                ram_error = kv_stop;
+            } else if (ram_out) {
                 // the client gets the reason as the request's error; the engine stays up for the next request
                 uint64_t avail = 0, floor = 0;
                 (void) basalt::platform::ram_guard_low(&avail, &floor);
@@ -10380,6 +10589,12 @@ int main(int argc, char** argv) {
                 live_ok = solo_book.live_ok;
                 cvec_cached = solo_book.cvec;
                 checks = std::move(solo_book.checks);
+                if (solo_moved) {   // its cells went to this request (hold_slot)
+                    live.clear();
+                    live_imgs.clear();
+                    live_ok = false;
+                    checks.clear();
+                }
             }
             const int report_slot = slot_b >= 0 ? slot_b : 0;
             if (yielded_at >= 0 && !ram_out) {
@@ -10408,6 +10623,12 @@ int main(int argc, char** argv) {
                 if (admitted_slot >= 0) std::printf("BADM %d %d\n", admitted_slot, admission_status);
             }
             std::fflush(stdout);
+            // no swap stays in flight between requests: the last round's copies land once the reply is out
+            if (!xq_drain()) {
+                std::printf("ERR an adaptive refill failed\n");
+                return 1;
+            }
+            xq_saturated = false;   // the next request starts at the base cap
             if (drive.routing != nullptr) std::fflush(drive.routing);   // the routing trace survives a crash and is watchable mid-session
             // "12288 of 98179" when cancelled mid-read, the rate from what was read
             char read_txt[64];
@@ -10497,16 +10718,17 @@ int main(int argc, char** argv) {
         uint64_t borrow_bytes = 0;
         if (!host_res.empty() && d_res != nullptr) {
             int64_t chunk = o.prefill_chunk;
-            int64_t k = plan_lend(chunk);             // auto: the largest chunk that fits; fixed: halved to fit
-            const int64_t request_sized = request_chunk(n_batched, chunk);
+            int64_t k = serve_loans::plan_lend(chunk, xcache, g, ss, o.prefill_auto, auto_ceiling,
+                                               (int) kAutoLendPct);   // auto: the largest that fits; fixed: halved
+            const int64_t request_sized = serve_loans::request_chunk(n_batched, chunk);
             if (k > 0 && request_sized < chunk) {                     // no bigger than this prompt segment needs
                 chunk = request_sized;
-                k = lend_slots(chunk);
+                k = serve_loans::lend_slots(xcache, g, ss, chunk);
                 if (k + 128 > xcache.slots()) k = 0;
                 if (!o.prefill_auto) o.prefill_chunk = chunk;
             }
             if (o.prefill_auto) {
-                o.prefill_chunk = k > 0 ? chunk : request_chunk(n_batched, 1024);
+                o.prefill_chunk = k > 0 ? chunk : serve_loans::request_chunk(n_batched, 1024);
                 basalt::log::info("basalt generate", "prompt chunk auto: %lld tokens", (long long) o.prefill_chunk);
             } else if (chunk != o.prefill_chunk) {
                 k = 0;                                 // a fixed chunk that does not fit: its own buffers, as before

@@ -30,7 +30,10 @@ The next request that needs less gives the cells back and the cache refills the 
 decodes with the cache a 32k context would have, whatever `--max-context` is. With `--parallel` every slot is elastic
 once its share of the context is above 4096 tokens: it backs 4096 cells at startup and grows by 4096, so idle and short
 slots leave their VRAM to the expert cache. The startup line `elastic KV: ...` says
-how much of the cache is lent this way, and each move is logged (`elastic KV: N cells backed ...`).
+how much of the cache is lent this way, and each move is logged (`elastic KV: N cells backed ...`). The cache never goes
+below the slots a prompt chunk needs: a request whose KV would take it there, even after the other sessions give back
+the cells they do not hold, is refused with that error, and a reply that grows past it ends with it (a `--parallel`
+slot ends as at its length limit); the engine keeps running.
 
 While other slots are decoding, a new prompt of up to 16384 tokens is read at once: the slots wait for it (a few
 seconds at most), and it is read as in the single-stream path: the same chunks and streamed ring, the CPU pool's
@@ -128,6 +131,25 @@ Each request ends with one slot-tagged `done` line:
 - `hit` is the expert cache hit rate and `pcie` the share of routed experts read over PCIe; both appear when the
   engine reports them.
 
+## The stats page
+
+The server's own address (`[server] stats` above) serves one page that reads `/metrics`, `/slots` and `/api/logs`
+once a second:
+
+- GPUs: every card the engine uses, with VRAM and 60 s charts of load and power (one card adds temperature; three or
+  more cards are a table with a chart of their mean load and total power). System: CPU, RAM, disk reads, driver and
+  CUDA. Experts: where the last request's routed lookups were served (VRAM, peer card, CPU).
+- Speed: decode and prefill rates with 60 s charts (one line per slot with `--parallel`), the last prompt and its prefix
+  cache hit, and the fastest whole request since the server started (at least 256 output tokens for decode, 4096
+  newly read prompt tokens for prefill).
+- Slots (with `--parallel`): each busy slot's rate, output against its limit, context, time to first token, prefix
+  hit and tokens per window; Accept is the slot's last finished request. Requests: the newest finished requests.
+  Queue: the requests waiting for a slot or for the single stream.
+- Logs: the console lines.
+
+`/metrics` carries the history behind the charts in `history` (`tok_s`, `prefill_tok_s_mean`, `slot_tok_s` one series
+per slot, `gpus` with `util`, `power` and `temp` per card) and the fastest requests in `best`.
+
 ## Memory floors
 
 Basalt refuses settings that would leave the machine without memory, and never shrinks what you asked for:
@@ -135,9 +157,10 @@ Basalt refuses settings that would leave the machine without memory, and never s
 - `--vram-reserve-mib` below 256 is refused at startup: with less VRAM free once everything is loaded, a later
   allocation can make the driver page GPU memory and requests stall.
 - When some experts are read from the SSD (they fit in neither the GPUs nor the RAM copy), the RAM copy leaves a
-  floor free for the OS file cache: the RAM margin (2 GiB or 5% of the RAM, the larger) plus the larger of 3.5 GiB plus two layers'
-  experts (what one prompt chunk reads from the file) and 4 GiB. The startup line `RAM floor ...` gives the figures.
-  When every expert has a place, only the margin is kept, as before.
+  floor free for the OS file cache: the RAM margin (2 GiB or 5% of the RAM, the larger) plus the larger of 4 GiB and
+  what one prompt chunk reads from the file (up to 3.5 GiB for the lent GPU slots, plus the SSD-held experts of two
+  layers). The startup line `RAM floor ...` gives the figures. When every expert has a place, only the margin is kept;
+  the copies kept for the lent slots and the adaptive swaps do not count toward that: they take the RAM left over.
 - A server's RAM copy also leaves room for what serving takes after startup: the conversation checkpoints (each the
   model's whole running state, `--prompt-cache` of them per slot plus one), `--conversation-cache-mib`, one image's
   buffers and a request's own buffers. The startup line `RAM ... free, guard ...` gives the figures.
@@ -146,7 +169,7 @@ Basalt refuses settings that would leave the machine without memory, and never s
   and a round swaps fewer.
 - An explicit `--resident-budget-gib` that would leave less than that floor free is refused at startup; the error
   states the RAM free and the largest safe value ('max').
-- While serving, a request that finds MemAvailable below the margin plus 3.5 GiB (the margin alone when no expert is
+- While serving, a request that finds MemAvailable below the margin plus a prompt chunk's file reads, up to 3.5 GiB (the margin alone when no expert is
   read from the SSD) stops with an error (`RAM low (... free < ... guard): request stopped`, also returned to the
   client); the server keeps running and takes the next request. Windows does not count the pages read through the
   mapped expert file as available, so within 1 GiB of the guard the engine gives them back first and reads again.
@@ -164,9 +187,12 @@ of them give bitwise identical embeddings.
 | `dynamic` | inside the engine, on the main GPU | none at rest (0.85 GiB of pinned RAM) | 0.77 s, 1.45 s, 1.8 s |
 | `cpu` | sidecar on the CPU | none | about 6 s at 1k, 40 s at 3k, 70 s at 4k |
 
-`dynamic` borrows expert-cache slots per image (the prompt path's lend), uploads the weights from the
-pinned copy (about 30 ms), encodes on a side stream, and refills the same slots from RAM (about 70 ms), so the cache is
-identical afterwards. Other `--parallel` slots pause for the encode. An image already seen is served from the
+`dynamic` borrows the expert cache's last slots per image (any slot whose expert has a RAM copy), uploads the
+weights from the pinned copy (about 30 ms), encodes on a side stream, and refills the same slots from RAM (about 70 ms),
+so the cache is identical afterwards. Other `--parallel` slots pause for the encode. When a long conversation's elastic
+KV holds that room, the sessions first give back the KV cells they do not hold (idle slots first) and take them back
+as they grow. An image is refused only when the room cannot exist even then; the refusal is in the engine and server
+logs. An image already seen is served from the
 encoder cache in tens of milliseconds in every mode. The sidecar's card is named, not derived from `gpu`: any card
 works, whether or not it runs the engine, and the startup line names it.
 
@@ -181,6 +207,8 @@ The image encoder is Basalt's own, written for this model's vision tower (no lla
 products and flash attention with fp32 accumulation on the GPU, AVX-512/AVX2 on the CPU. It replaces llama.cpp's
 mtmd encoder as a drop-in, is faster than it at every image size, and stays closer to an fp32 reference: mtmd's fp16
 attention drifts on large images, ours does not.
+
+One image is capped at 64 megapixels; a header past it is refused before it is decoded.
 
 ## `PROBE rates` (engine command)
 

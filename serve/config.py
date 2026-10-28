@@ -119,7 +119,7 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> tuple[list[str],
         if act.nargs == 0:                                 # a switch
             if not isinstance(value, bool):
                 raise ValueError(f"server.{key}: true or false")
-            argv += [flag] if value else (["--no-grammar"] if name == "grammar" else [])
+            argv += [flag] if value else ([f"--no-{name}"] if isinstance(act, argparse.BooleanOptionalAction) else [])
             continue
         items = value if isinstance(value, list) else [value]
         if isinstance(value, list) and not isinstance(act, argparse._AppendAction):
@@ -412,4 +412,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="default thinking budget for requests that leave reasoning_budget_tokens out (0 = none): at "
                          "the budget the thinking is closed and the answer starts, so set it below the request's "
                          "max_tokens")
+    ap.add_argument("--answer-room", action=argparse.BooleanOptionalAction, default=True,
+                    help="reserve wrap-up and answer space when the output cap is at least 1024 tokens; "
+                         "an explicit request budget of 0 opts out")
     return ap

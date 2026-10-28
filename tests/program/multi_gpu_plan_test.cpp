@@ -224,6 +224,36 @@ int main() {
             for (double& ms : none.stage_ms) ms = ms > 0 ? none.tier_ms : 0;
             for (const auto& x : prompt_split_windows(none, 3, 3, 48)) CHECK(x.first == 0 && x.second == 0);
         }
+        // four alike 16 GB cards behind one host link, from reads of 133,205 and 266,381 tokens: the tier cards stream
+        // nine tenths of their layers' experts per chunk, the main card all of its own.  Each card's link alone gives the
+        // prices those reads were priced at; the cards streaming at once over the host's 54 GB/s give the reads
+        {
+            const PsCard m4 = side(960, 26.8, 0), t4 = side(960, 26.8, 2458, 60);
+            auto read = [&](int64_t n, int64_t cap, double host) {
+                PsPart lp;
+                lp.row_bytes = part.row_bytes;
+                lp.draft_rows = 8257;
+                lp.host_gbps = host;
+                lp.tier_chunks = lp.split_chunks = even(n, cap);
+                return price_prompt_split(m4, m4, {t4, t4, t4}, lp, 4, 48);
+            };
+            auto near = [](double a, double b, double tol) { return a > (1 - tol) * b && a < (1 + tol) * b; };
+            const PsPrice a1 = read(133205, 22528, 0), a2 = read(266381, 16384, 0);
+            CHECK(near(a1.stage_ms[2], 16141, 0.03) && near(a1.stage_ms[3], 14359, 0.03) && near(a1.stage_ms[4], 13562, 0.03));
+            CHECK(near(a2.stage_ms[2], 32158, 0.03) && near(a2.stage_ms[3], 24809, 0.03) && near(a2.stage_ms[4], 21118, 0.03));
+            const PsPrice b1 = read(133205, 22528, 54), b2 = read(266381, 16384, 54);
+            CHECK(near(b2.stage_ms[2], 32865, 0.06) && near(b2.stage_ms[3], 27270, 0.06) && near(b2.stage_ms[4], 25669, 0.06));
+            CHECK(b2.split && b2.stages == 4 && b2.stage_ms[4] < b2.stage_ms[3] && b2.stage_ms[3] < b2.stage_ms[2]);
+            CHECK(b1.stage_ms[4] >= 12891 && b1.stage_ms[4] < 1.1 * 12891 && b1.stages == 4);
+            // a host that feeds every card's link whole changes no price
+            const PsPrice c2 = read(266381, 16384, 4 * 26.8);
+            CHECK(c2.stage_ms == a2.stage_ms && c2.stage_cuts == a2.stage_cuts);
+            // nor does it on two cards whose links it can feed: the pair's price is the one each link alone gives
+            PsPart lp = part;
+            lp.host_gbps = 28.9 + 28.8;
+            const PsPrice d = price_prompt_split(main_tier, main_split, {slow}, lp, 2, 48);
+            CHECK(d.split_ms == price_prompt_split(main_tier, main_split, {slow}, part, 2, 48).split_ms);
+        }
         // mixed cards: the faster card joins first and reads the last layers; with a slow third card a long prompt
         // still gains from it, a shorter one keeps to two stages
         {
@@ -242,6 +272,69 @@ int main() {
             // the slower card's stage is the shorter one
             CHECK(pr.cuts[1] - pr.cuts[0] < 48 - pr.cuts[1]);
         }
+    }
+    // the draft layer's rows a split read holds back: two chunks in place, more past the chunk in both buffers
+    {
+        auto room = [](size_t n, int64_t chunk, int64_t hand) {
+            return prompt_split_draft_room(std::vector<int64_t>(n, chunk), chunk, hand);
+        };
+        CHECK(room(2, 16384, 16384) == 16384);
+        CHECK(room(3, 16384, 16384) == 32768);
+        CHECK(room(4, 16384, 16384) == 32768);
+        // a deep part: smaller chunks than the buffers were made for leave the rest of both buffers
+        std::vector<int64_t> deep(17, 14848);
+        deep.front() = 16384;
+        deep.back() = 9000;
+        CHECK(prompt_split_draft_room(deep, 14848, 27392) == 2 * 14848 + 2 * (27392 - 14848));
+        CHECK(prompt_split_draft_room(deep, 14848, 27392) >= 32832);
+        CHECK(2 * 14848 < 32832);   // the window the two chunks before the kept one alone could not hold
+        CHECK(room(4, 4096, 16128) == 2 * 4096 + 2 * (16128 - 4096));
+        CHECK(room(2, 4096, 2048) == 4096);
+    }
+    // a split read's chunks are the prompt path's: the main card keeps its last chunk, and the stages' state comes back
+    // once the last stage has read the chunk before it, so the planned last chunk must start where the prompt path's
+    // does, for every part length and cap (deep parts on smaller cards take caps just above the head chunk)
+    {
+        constexpr int64_t kHead = 16384;
+        auto path_chunks = [](int64_t n, int64_t T, int64_t head_set) {   // Prefill::run_impl's chunk_len
+            std::vector<int64_t> v;
+            const int64_t head = n > T ? std::min(head_set, T) : 0;
+            for (int64_t at = 0; T > 0 && at < n;) {
+                const int64_t t = std::min(at == 0 && head > 0 ? head : T, n - at);
+                v.push_back(t);
+                at += t;
+            }
+            return v;
+        };
+        int bad = 0, old_off = 0, cases = 0;
+        std::vector<int64_t> caps;
+        for (int64_t c = 12800; c <= 17920; c += 256) caps.push_back(c);
+        caps.push_back(27392);
+        caps.push_back(32768);
+        for (int64_t cap : caps)
+            for (int64_t n = 4096; n <= 560000; n += n < 200000 ? 997 : 61) {
+                const auto [chunk, head] = prompt_one_card_chunks(n, cap, true, kHead);
+                const std::vector<int64_t> cl = prompt_chunk_list(n, chunk, head);
+                const std::vector<int64_t> ref = path_chunks(n, chunk, head);
+                int64_t sum = 0;
+                for (int64_t t : cl) sum += t;
+                ++cases;
+                if (cl != ref || sum != n || chunk > cap || (head != 0 && head >= chunk)) ++bad;
+                // the old plan: the last chunk's start from a head the prompt path clamps to the chunk
+                if (head == 0 && n > chunk) {
+                    const int64_t h2 = n > cap && n >= 2 * kHead && cap > kHead ? kHead : 0;
+                    if (h2 > 0) {
+                        const int64_t old_last = h2 + ((n - h2 - 1) / chunk) * chunk;
+                        if (old_last != n - ref.back()) ++old_off;
+                    }
+                }
+            }
+        CHECK(cases > 100000);
+        CHECK(bad == 0);
+        CHECK(old_off > 0);   // the band the old arithmetic missed is inside this range
+        // one of the failing reads: a 16640-token cap, a 235161-token part
+        const auto [c1, h1] = prompt_one_card_chunks(235161, 16640, true, kHead);
+        CHECK(c1 < kHead && h1 == 0);
     }
     if (g_fail) { std::printf("multi_gpu_plan_test: %d failures\n", g_fail); return 1; }
     std::printf("multi_gpu_plan_test: ok\n");

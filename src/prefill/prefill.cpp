@@ -1255,6 +1255,7 @@ void Prefill::set_ring_remote(const int32_t* res, const core::ExpertCache* cache
 }
 
 void Prefill::set_peer_share(bool on) { impl_->peer_share = on; }
+int64_t Prefill::peer_routed_rows_max() const { return impl_->pp ? impl_->pp->T_max : 0; }
 
 void Prefill::set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
     if (layer_end < 0 && impl_->g != nullptr) layer_end = impl_->g->n_layers;   // after init: resolved here
@@ -2921,6 +2922,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     stats_.ms_total += ms_since(t_start);
     return true;
 }
+
+float* Prefill::hand_buffer(int b) const { return b == 0 || b == 1 ? impl_->hand[b] : nullptr; }
+
+int64_t Prefill::hand_rows() const { return impl_->hand[0] != nullptr && impl_->hand[1] != nullptr ? impl_->hand_rows : 0; }
 
 bool Prefill::reserve_hand_off(int64_t rows, std::string& err) {
     Impl& m = *impl_;

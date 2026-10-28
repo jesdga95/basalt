@@ -15,10 +15,6 @@
 <header class="bar">
   <div class="brand"><img src="web/mark.svg" alt=""><span class="wordmark">Basalt</span></div>
   <span class="model" id="model"></span>
-  <nav class="tabs" role="tablist" aria-label="Views">
-    <button class="tab" role="tab" id="tab-stats" data-view="stats" aria-selected="true">Stats</button>
-    <button class="tab" role="tab" id="tab-hardware" data-view="hardware" aria-selected="false">Hardware</button>
-  </nav>
   <span class="grow"></span>
   <span class="state" id="state" data-s="offline">Connecting</span>
   <span class="where" id="host"></span>
@@ -31,155 +27,51 @@
   <button>Connect</button>
 </form>
 
-<div class="top" id="top">
-<section class="strip" aria-label="Key figures">
-  <div class="m m-hero">
-    <div class="k"><span id="k-tok">Tokens/s</span><i id="limit"></i></div>
-    <div class="v" id="v-tok">—</div>
-    <div class="heat" aria-hidden="true"><i id="heat"></i></div>
-    <div class="sub" id="s-busy" hidden></div>
-  </div>
-  <div class="m"><div class="k"><span>Draft accept</span></div><div class="v" id="v-acc">—</div><div class="sub">Last request</div></div>
-  <div class="m"><div class="k"><span>Context</span></div><div class="v" id="v-ctx">—</div><div class="sub" id="s-ctx"></div></div>
-</section>
-<div class="sys" aria-label="System">
-  <span>GPU load <b id="s-load">—</b></span>
-  <span>VRAM <b id="s-vram">—</b></span>
-  <span>GPU temp <b id="s-temp">—</b></span>
-  <span>Power <b id="s-pow">—</b></span>
-  <span>CPU <b id="s-cpu">—</b></span>
-  <span>RAM <b id="s-ram">—</b></span>
-  <span>Disk read <b id="s-disk">—</b></span>
-</div>
-</div>
-
-<main>
-  <div class="view stats" id="view-stats" role="tabpanel" aria-labelledby="tab-stats">
-    <aside class="col col-l">
-      <section class="sec speed">
-        <div class="sh"><b>Speed</b><span class="grow"></span><span id="speed-note">Last 60 s</span></div>
-        <div class="head">
-          <div class="read"><span id="rd-decode-l">Decode</span><b id="rd-decode">—</b></div>
-          <div class="read"><span id="rd-prefill-l">Prefill</span><b id="rd-prefill">—</b></div>
-        </div>
-        <div class="cb">
-          <div class="chart" id="chart-decode">
-            <div class="g" style="top:0"><span class="y0"></span></div>
-            <div class="g" style="top:50%"><span class="y1"></span></div>
-            <div class="g" style="top:100%"><span>0</span></div>
-            <svg viewBox="0 0 59 100" preserveAspectRatio="none" role="img" aria-label="Decode tokens per second, last 60 seconds. Hover for values."><polyline id="line-per"/><polyline id="line-decode"/></svg>
-            <div class="cur" hidden></div><div class="cdot" hidden></div><div class="tip" hidden></div>
-          </div>
-        </div>
-        <div class="cb">
-          <div class="chart" id="chart-prefill">
-            <div class="g" style="top:0"><span class="y0"></span></div>
-            <div class="g" style="top:50%"><span class="y1"></span></div>
-            <div class="g" style="top:100%"><span>0</span></div>
-            <svg viewBox="0 0 59 100" preserveAspectRatio="none" role="img" aria-label="Prefill tokens per second, last 60 seconds. Hover for values."><polyline id="line-prefill"/></svg>
-            <div class="cur" hidden></div><div class="cdot" hidden></div><div class="tip" hidden></div>
-          </div>
-        </div>
-        <div class="bests" id="bests" hidden>
-          <button type="button" id="pk-decode" aria-expanded="false" aria-controls="best-detail"><span>Best decode</span><b></b></button>
-          <button type="button" id="pk-prefill" aria-expanded="false" aria-controls="best-detail"><span>Best prefill</span><b></b></button>
-        </div>
-        <div class="bdetail" id="best-detail" hidden><span id="bd-text"></span><button type="button" id="bd-reset">Reset</button></div>
-      </section>
-
-      <section class="sec">
-        <div class="sh"><b>Experts</b><span class="grow"></span><span>Routed lookups, last request</span></div>
-        <div class="pad">
-          <div class="stack" aria-hidden="true"><i class="s1" id="tr-vram"></i><i class="s2" id="tr-peer"></i><i class="s3" id="tr-cpu"></i></div>
-          <div class="leg">
-            <span style="--c:var(--fg)">VRAM <b id="tl-vram">—</b></span>
-            <span style="--c:var(--fg-3)">Peer <b id="tl-peer">—</b></span>
-            <span style="--c:var(--basalt-500)">CPU <b id="tl-cpu">—</b></span>
-          </div>
-        </div>
-      </section>
-
-      <section class="sec qsec" id="queue" hidden>
-        <div class="sh"><b>Queue</b><span id="q-count">0</span><span class="grow"></span><span>Waiting for a free slot</span></div>
-        <div class="tw">
-          <table>
-            <thead><tr><th>Waiting</th><th>API</th><th>Model</th><th class="n">Prompt</th></tr></thead>
-            <tbody id="t-queue"></tbody>
-          </table>
-          <div class="empty" id="q-empty">No request is waiting.</div>
-        </div>
-      </section>
-    </aside>
-
-    <div class="col col-r">
-      <section class="sec slots" id="slots" hidden>
-        <div class="sh"><b>Slots</b><span id="slot-count">0</span><span class="grow"></span><span id="slot-note"></span></div>
-        <div class="lanes" id="lanes"></div>
-      </section>
-
-      <section class="sec reqs tabsec" id="reqs">
-        <div class="sh tabhead" role="tablist" aria-label="Requests and logs">
-          <button class="tab" role="tab" id="tab-req" data-pane="req" aria-selected="true" aria-controls="pane-req">Requests</button>
-          <button class="tab" role="tab" id="tab-log" data-pane="log" aria-selected="false" aria-controls="pane-log">Logs</button>
-          <span class="cnt" id="pane-count">0</span>
-        </div>
-        <div id="pane-req" role="tabpanel" aria-labelledby="tab-req">
-          <div class="sh phead"><b>Requests</b><span class="cnt" id="req-count">0</span></div>
-          <div class="tw">
-            <table>
-              <thead><tr><th>Time</th><th>ID</th><th>Endpoint</th><th class="n">Output</th><th class="n">Tokens/s</th><th class="n">Duration</th></tr></thead>
-              <tbody id="t-req"></tbody>
-            </table>
-            <div class="empty" id="req-empty">No requests yet.</div>
-          </div>
-        </div>
-        <div id="pane-log" role="tabpanel" aria-labelledby="tab-log" hidden>
-          <div class="sh phead"><b>Log</b><span class="cnt" id="log-count">0 lines</span></div>
-          <div class="tools">
-            <div class="seg" id="lvl" role="group" aria-label="Level">
-              <button data-l="all" aria-pressed="true">All</button><button data-l="warn" aria-pressed="false">Warnings</button><button data-l="err" aria-pressed="false">Errors</button>
-            </div>
-            <input id="q" type="search" placeholder="Filter  ( / )" aria-label="Filter log" autocomplete="off" spellcheck="false">
-            <span class="grow"></span>
-            <div class="seg"><button id="b-follow" aria-pressed="true">Follow</button></div>
-          </div>
-          <div class="logwrap">
-            <div class="log" id="log" role="log" aria-live="off" tabindex="0"></div>
-            <button class="jump" id="jump" hidden>Latest</button>
-          </div>
-        </div>
-      </section>
+<main class="lay">
+  <aside class="a-side sb" aria-label="Hardware">
+    <div class="sb-h">GPUs<span>Charts · Last 60 s</span></div>
+    <div class="sb-gpus" id="gpus"></div>
+    <div class="sb-sys">
+      <div class="sb-h">System<span id="cpu-name"></span></div>
+      <div class="sb-body" id="sys"></div>
     </div>
-  </div>
-
-  <div class="view hw" id="view-hardware" role="tabpanel" aria-labelledby="tab-hardware" hidden>
-    <div class="hwgrid">
-      <section class="sec wide">
-        <div class="sh"><b>Devices</b></div>
-        <div class="tw"><div class="devs" id="h-dev"></div></div>
-      </section>
-
-      <section class="sec">
-        <div class="sh"><b>Host</b></div>
-        <dl class="kv">
-          <dt>CPU</dt><dd id="h-cpu">—</dd>
-          <dt>Cores</dt><dd id="h-cores">—</dd>
-          <dt>CPU load</dt><dd id="h-load">—</dd>
-          <dt>GPU driver</dt><dd id="h-driver">—</dd>
-        </dl>
-      </section>
-
-      <section class="sec">
-        <div class="sh"><b>Engine</b></div>
-        <dl class="kv">
-          <dt>Model</dt><dd id="h-model">—</dd>
-          <dt>Context</dt><dd id="h-ctx">—</dd>
-          <dt>Draft</dt><dd id="h-draft">—</dd>
-          <dt>Build</dt><dd id="h-build">—</dd>
-        </dl>
-      </section>
+    <div class="sb-exp">
+      <div class="sb-h">Experts<span>Last request</span></div>
+      <div class="sb-body" id="experts"></div>
     </div>
-  </div>
+  </aside>
+
+  <section class="a-hero card" aria-label="Speed">
+    <div class="hd"><b>Speed</b><span>Last 60 s</span></div>
+    <div class="trio">
+      <div class="dec">
+        <div class="k" id="dec-k">Decode</div>
+        <div class="v big" id="dec-v">-</div>
+        <div class="ch" id="chips" hidden></div>
+        <div class="cw" id="dec-chart"></div>
+      </div>
+      <div class="pre">
+        <div class="k" id="pre-k">Prefill</div>
+        <div class="v mid" id="pre-v">-</div>
+        <div class="pcw" id="pre-chart"></div>
+        <div class="pst">
+          <div><span>Last prompt</span><span id="pre-last">-</span></div>
+          <div><span>Prefix cache hit</span><b id="pre-hit">-</b></div>
+        </div>
+      </div>
+    </div>
+    <div class="hfoot"><div id="foot-dec"></div><div id="foot-pre"></div></div>
+  </section>
+
+  <section class="a-main card" aria-label="Slots and requests">
+    <div class="tabs" role="tablist" id="tabs"></div>
+    <div class="pane" id="pane" role="tabpanel"></div>
+  </section>
+
+  <section class="a-logs card" aria-label="Logs">
+    <div class="hd lh"><b>Logs</b><span id="log-count"></span></div>
+    <div class="logs" id="log" role="log" aria-live="off" tabindex="0"></div>
+  </section>
 </main>
 
 </body>

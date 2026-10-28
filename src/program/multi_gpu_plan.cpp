@@ -118,6 +118,8 @@ namespace {
 // Prompt reads, fitted to cold reads of the pack on the main card alone and on the split.  A stage's chunk of T tokens:
 //   max(T x (layers x u(pos) + the embedding card's per-token part), the chunk's expert bytes / the link's share)
 //   u(pos) = kPsUsLayer x kPsRefGbps / the card's bandwidth x (1 + kPsGrowth x pos), per token and layer
+// In the split every card streams its layers' experts at once: a chunk takes no less than the bytes they all stream
+// for it over the host's bandwidth to all of them together (probed so; each card's gaps are the others' to fill).
 constexpr double kPsUsLayer = 1.69;      // us per token and layer at the start of the context, at kPsRefGbps
 constexpr double kPsRefGbps = 1792.0;
 constexpr double kPsGrowth = 2.5e-6;     // per cell of context before the token (the attention's block selection)
@@ -169,6 +171,11 @@ double ps_pipeline(const PsCard& m, const std::vector<const PsCard*>& st, const 
     double free_at[kPsMaxStages] = {};   // stage k + 1 takes a chunk from then on
     double t = 0;
     for (size_t k = 0; k < ns; ++k) t = std::max(t, st[k]->setup_ms);
+    // the main card starts a chunk no sooner than the host has streamed every card's bytes of the one before
+    double host_free = 0;
+    auto host_ms = [&](const PsCard& c, double link_ms) {
+        return part.host_gbps > 0 ? link_ms * kPsLinkEff * c.link_gbps / part.host_gbps : 0.0;
+    };
     int64_t at = part.cell0;
     const size_t n = part.split_chunks.size();
     for (size_t i = 0; i < n; ++i) {
@@ -177,6 +184,16 @@ double ps_pipeline(const PsCard& m, const std::vector<const PsCard*>& st, const 
         const double a = ps_stage(m, m, T, pos, 0, cuts[0], true, main_link, layers) +
                          (i == 0 ? kPsPleUsToken * (double) T / 1000.0 : 0.0);
         const double hand = (double) T * (double) part.row_bytes;
+        t = std::max(t, host_free);
+        if (i + 1 < n && part.host_gbps > 0) {
+            double shared = host_ms(m, main_link[(size_t) cuts[0]]);
+            for (size_t k = 0; k < ns; ++k) {
+                const int l1 = k + 1 < ns ? cuts[k + 1] : layers;
+                shared += host_ms(*st[k], (*links[k])[(size_t) cuts[k] * (size_t) (layers + 1) + (size_t) l1] +
+                                              ps_link_ms(*st[k], hand));
+            }
+            host_free = t + shared;
+        }
         if (i + 1 < n) {
             double launch = std::max(t + a + ps_link_ms(m, hand), free_at[0]);
             t = launch;
@@ -287,6 +304,46 @@ std::vector<std::pair<int, int>> prompt_split_windows(const PsPrice& ref, size_t
         }
     }
     return w;
+}
+
+int64_t prompt_split_draft_room(const std::vector<int64_t>& chunks, int64_t chunk, int64_t hand_rows) {
+    int64_t room = 2 * std::max<int64_t>(0, hand_rows - chunk);
+    for (size_t i = chunks.size() >= 3 ? chunks.size() - 3 : 0; i + 1 < chunks.size(); ++i) room += chunks[i];
+    return room;
+}
+
+namespace {
+int64_t grid_chunk(int64_t tokens, int64_t cap) {   // `tokens` up on the 256-token grid, at most `cap`
+    if (tokens <= 0 || cap <= 0) return 0;
+    return std::min(cap, (tokens + 255) / 256 * 256);
+}
+}  // namespace
+
+std::pair<int64_t, int64_t> prompt_one_card_chunks(int64_t tokens, int64_t cap, bool head_ok, int64_t head_chunk) {
+    int64_t want = grid_chunk(tokens, cap);
+    if (want > 0 && tokens > cap) {
+        const int64_t parts = (tokens + cap - 1) / cap;
+        want = grid_chunk((tokens + parts - 1) / parts, cap);
+    }
+    int64_t head = 0;
+    if (head_ok && tokens > cap && tokens >= 2 * head_chunk && cap > head_chunk) {
+        const int64_t rem = tokens - head_chunk, parts = (rem + cap - 1) / cap;
+        want = grid_chunk((rem + parts - 1) / parts, cap);
+        head = head_chunk;
+    }
+    if (head >= want) head = 0;
+    return {want, head};
+}
+
+std::vector<int64_t> prompt_chunk_list(int64_t tokens, int64_t chunk, int64_t head) {
+    std::vector<int64_t> v;
+    const int64_t first = tokens > chunk && head > 0 ? std::min(head, chunk) : chunk;
+    for (int64_t at = 0; chunk > 0 && at < tokens;) {
+        const int64_t T = std::min(at == 0 ? first : chunk, tokens - at);
+        v.push_back(T);
+        at += T;
+    }
+    return v;
 }
 
 }  // namespace basalt::program

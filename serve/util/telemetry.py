@@ -166,6 +166,11 @@ class _CpuRamFallback:
 GPU_KEYS = ("util", "mem_used", "mem_total", "temp", "power", "power_limit", "pcie_gen", "pcie_gen_max", "pcie_width",
             "pcie_rx_mb", "pcie_tx_mb")
 SERIES = ("tok_s", "prefill_tok_s_mean")      # series kept as history
+GPU_SERIES = ("util", "power", "temp")         # per-card series kept as history
+
+
+def _r2(v):
+    return round(v, 2) if isinstance(v, float) else v
 
 
 class Telemetry:
@@ -177,7 +182,9 @@ class Telemetry:
         self.lock = threading.Lock()
         self.now: dict = {"gpus": [], "cpu": None, "ram_used": None, "ram_total": None, "disk_read_mb": None}
         self.hist = {k: collections.deque(maxlen=HISTORY) for k in SERIES}
+        self.slot_hist = collections.deque(maxlen=HISTORY)     # per sample: each slot's tok/s
         self.gpus = [(i, g) for i, g in ((i, gpu_factory(i)) for i in dict.fromkeys(gpu_indices or [0])) if g.ok()]
+        self.gpu_hist = {i: {k: collections.deque(maxlen=HISTORY) for k in GPU_SERIES} for i, _ in self.gpus}
         try:
             import psutil  # noqa: F401
             self.ps = sys.modules["psutil"]
@@ -237,17 +244,31 @@ class Telemetry:
                 pass
         return s
 
+    def record(self, s: dict) -> None:
+        """Make sample `s` the current reading and add it to the history."""
+        with self.lock:
+            self.now = s
+            for k in SERIES:
+                self.hist[k].append(_r2(s.get(k)))
+            if "slot_tok_s" in s:
+                self.slot_hist.append([_r2(v) for v in s.get("slot_tok_s") or []])
+            for g in s["gpus"]:
+                h = self.gpu_hist.get(g["index"])
+                if h:
+                    for k in GPU_SERIES:
+                        h[k].append(_r2(g.get(k)))
+
     def _loop(self):
         while True:
-            s = self.sample()
-            with self.lock:
-                self.now = s
-                for k in SERIES:
-                    v = s.get(k)
-                    self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
+            self.record(self.sample())
             time.sleep(1.0)
 
     def snapshot(self):
         with self.lock:
-            now = {k: v for k, v in self.now.items() if k not in SERIES}
-            return {"now": now, "history": {k: list(v) for k, v in self.hist.items()}, "static": dict(self.static)}
+            now = {k: v for k, v in self.now.items() if k not in SERIES and k != "slot_tok_s"}
+            hist = {k: list(v) for k, v in self.hist.items()}
+            # one series per slot, oldest first; a sample from before a slot existed is None
+            n = max((len(x) for x in self.slot_hist), default=0)
+            hist["slot_tok_s"] = [[x[j] if j < len(x) else None for x in self.slot_hist] for j in range(n)]
+            hist["gpus"] = [{"index": i, **{k: list(v) for k, v in h.items()}} for i, h in self.gpu_hist.items()]
+            return {"now": now, "history": hist, "static": dict(self.static)}
