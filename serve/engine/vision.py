@@ -30,6 +30,8 @@ class Vision:
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None):
         args = [cfg["vision_bin"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]] + (["--gpu"] if cfg.get("gpu") else [])
+        if cfg.get("max_tokens") is not None:
+            args += ["--max-tokens", str(cfg["max_tokens"])]
         self.dir = Path(tempfile.mkdtemp(prefix="basalt-vision-"))
         self.spawn = (args, log, env)                   # to start again
         self.stopped = False
@@ -182,6 +184,18 @@ class Vision:
     def _encode_pinned(self, sources: list[str], pins: list[str]) -> list[tuple[Path, int, int]]:
         return [self._encode_one(src, pins) for src in sources]
 
+    @staticmethod
+    def _unlink_image(path: Path) -> None:
+        """Allow a short-lived sharing lock to clear before removing an input image."""
+        for attempt in range(8):
+            try:
+                path.unlink(missing_ok=True)
+                return
+            except PermissionError as e:
+                if getattr(e, "winerror", None) not in (32, 33) or attempt == 7:
+                    raise
+                time.sleep(min(0.01 * 2**attempt, 0.1))
+
     def _encode_one(self, source: str, pins: list[str]) -> tuple[Path, int, int]:
         data = self.normalize(self.load(source))
         key = hashlib.sha256(data).hexdigest()[:32]
@@ -194,7 +208,7 @@ class Vision:
             try:
                 line = self._enc(img, out)
             finally:                                                   # also when the pipe is gone
-                img.unlink(missing_ok=True)
+                self._unlink_image(img)
             if not line.startswith("OK"):
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
                                                                      "the vision encoder stopped"))
@@ -286,7 +300,7 @@ class EngineVision(Vision):
                         self._remember(k, out, int(line.split()[1]))
             finally:
                 for img, _ in jobs:
-                    img.unlink(missing_ok=True)
+                    self._unlink_image(img)
             return [self.cache[k] for k in keys]
 
 

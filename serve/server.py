@@ -103,6 +103,7 @@ def main() -> int:
         try:
             cfg.update({k: v for k, v in modelfile.model_config(
                 a.model, a.engine_bin, vision=vision_arg,
+                vision_max_tokens=a.vision_max_tokens,
                 engine_words=file_engine + cli_engine).items()
                 if k not in cfg})
         except (OSError, ValueError, KeyError) as e:

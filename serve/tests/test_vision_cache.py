@@ -1,8 +1,10 @@
 """The encoded-image cache on the sidecar and `--vision dynamic` paths."""
 import hashlib
+import os
 import shutil
 import threading
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from serve.engine import vision
@@ -158,6 +160,75 @@ class VisionCache(unittest.TestCase):
                 v.encode(["a", "b"])
             self.assertEqual(list(v.dir.glob("req-*.sve")), [])
             self.assertEqual(v.pinned, {})
+
+    def test_input_cleanup_retries_sharing_violations(self):
+        for v in self.each_path():
+            unlink = Path.unlink
+            attempts = {}
+
+            def temporarily_locked(path, *args, **kwargs):
+                if path.suffix == ".img":
+                    attempts[path] = attempts.get(path, 0) + 1
+                    if attempts[path] < 3:
+                        error = PermissionError("image is still in use")
+                        error.winerror = 32 if attempts[path] == 1 else 33
+                        raise error
+                return unlink(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "unlink", temporarily_locked), mock.patch.object(vision.time, "sleep"):
+                self.assertTrue(self.readable(v, ["a", "b"]))
+            self.assertEqual(list(v.dir.glob("*.img")), [])
+            self.assertEqual(v.pinned, {})
+
+    def test_input_cleanup_does_not_hide_permanent_errors(self):
+        v = sidecar()
+        try:
+            image = v.dir / "input.img"
+            for code, expected_attempts in ((32, 8), (5, 1)):
+                with self.subTest(error=code):
+                    error = PermissionError("cannot remove image")
+                    error.winerror = code
+                    with mock.patch.object(Path, "unlink", side_effect=error) as unlink, \
+                            mock.patch.object(vision.time, "sleep") as sleep:
+                        with self.assertRaises(PermissionError):
+                            v._unlink_image(image)
+                    self.assertEqual(unlink.call_count, expected_attempts)
+                    self.assertEqual(sleep.call_count, expected_attempts - 1)
+        finally:
+            shutil.rmtree(v.dir)
+
+    @unittest.skipUnless(os.name == "nt", "Windows sharing locks")
+    def test_input_cleanup_waits_for_an_actual_open_handle(self):
+        import ctypes
+        from ctypes import wintypes
+        create = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+        create.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                           wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+        create.restype = wintypes.HANDLE
+        close = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+        close.argtypes = (wintypes.HANDLE,)
+        close.restype = wintypes.BOOL
+        v = sidecar()
+        timers = []
+        enc = v._enc
+
+        def locked(img, out):
+            handle = create(str(img), 0x80000000, 1, None, 3, 0, None)
+            self.assertNotEqual(handle, wintypes.HANDLE(-1).value)
+            timer = threading.Timer(0.05, close, (handle,))
+            timers.append(timer)
+            timer.start()
+            return enc(img, out)
+
+        v._enc = locked
+        try:
+            self.assertTrue(self.readable(v, ["locked-image"]))
+            self.assertEqual(list(v.dir.glob("*.img")), [])
+            self.assertEqual(v.pinned, {})
+        finally:
+            for timer in timers:
+                timer.join()
+            shutil.rmtree(v.dir)
 
 
 if __name__ == "__main__":

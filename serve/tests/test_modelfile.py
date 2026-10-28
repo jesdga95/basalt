@@ -118,6 +118,14 @@ class Peer(Tmp):
 
 
 class Vision(Tmp):
+    def test_image_token_limit_stays_out_of_the_text_engine(self):
+        path = self.build(vision=True)
+        (self.engine_bin.parent / "basalt-vision").write_text("")
+        cfg = modelfile.model_config(path, str(self.engine_bin), vision="1", vision_max_tokens=8192)
+        self.assertEqual(cfg["vision"]["max_tokens"], 8192)
+        self.assertNotIn("--max-tokens", cfg["args"])
+        self.assertNotIn("--vision-max-tokens", cfg["args"])
+
     def test_sidecar_beside_the_engine_bin_and_sections_unpacked(self):
         path = self.build(vision=True)
         side = self.engine_bin.parent / "basalt-vision"
@@ -200,6 +208,10 @@ class Cli(Tmp):
                     mock.patch("sys.stderr", io.StringIO()):
                 self.run_main(*base, *flags)
             self.assertEqual(mc.call_args.kwargs["vision"], want, flags)
+        with mock.patch.object(modelfile, "model_config", side_effect=ValueError("stop")) as mc, \
+                mock.patch("sys.stderr", io.StringIO()):
+            self.run_main(*base, "--vision", "1", "--vision-max-tokens", "8192")
+        self.assertEqual(mc.call_args.kwargs["vision_max_tokens"], 8192)
 
     def test_vision_without_sidecar_is_a_startup_error(self):
         path = self.build(vision=True)

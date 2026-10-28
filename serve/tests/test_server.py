@@ -1113,6 +1113,13 @@ class GpuChoice(unittest.TestCase):
             self.assertEqual(v.spawn[0], ["x", "--mmproj", "m", "--model", "t"] + want)
             shutil.rmtree(v.dir, ignore_errors=True)
 
+    def test_vision_sidecar_token_limit(self):
+        from serve.engine.vision import Vision
+        with mock.patch.object(Vision, "_start"):
+            v = Vision({"vision_bin": "x", "mmproj": "m", "model": "t", "gpu": True, "max_tokens": 8192})
+        self.addCleanup(shutil.rmtree, v.dir, ignore_errors=True)
+        self.assertEqual(v.spawn[0], ["x", "--mmproj", "m", "--model", "t", "--gpu", "--max-tokens", "8192"])
+
     def test_engine_vision_sends_one_enc_for_the_uncached_images(self):
         from serve.engine.vision import EngineVision
         sent = []

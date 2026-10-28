@@ -208,6 +208,7 @@ plain decoding would give.
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
 | `vision` | server | `off`, `dynamic`, `cpu`, a GPU number | `off` | Image input; booleans are refused. A GPU number, as `gpu` numbers them: encoder sidecar always on that card (about 2.2 GiB of its expert cache), whatever the engine's cards are and no engine role needed. `dynamic`: inside the engine, borrowing expert-cache slots only while it reads an image. `cpu`: sidecar on the CPU, no VRAM, slow. Latencies: [running](../running.md#vision---vision). A GPU number needs the `basalt-vision` binary next to `bin/basalt`. Needs a model file with a vision projector. |
+| `vision-max-tokens` | server | integer, at least 8 | 4096 | Maximum visual tokens per image for a GPU-numbered sidecar or `cpu`. A higher limit preserves more detail and reserves larger encoder buffers at startup. `dynamic` uses the engine's fixed limit. |
 
 Diagnostic flags: `bin/basalt --help`
 

@@ -7368,9 +7368,11 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < words.size(); i += 2) {
                 std::ifstream f(words[i], std::ios::binary);
                 const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                const bool read_ok = static_cast<bool>(f);
+                f.close();                              // release the input before any protocol reply
                 basalt::vision::Image img;
                 std::string ierr;
-                if (!f || bytes.empty() || !basalt::vision::decode_image(bytes.data(), bytes.size(), img, ierr)) {
+                if (!read_ok || bytes.empty() || !basalt::vision::decode_image(bytes.data(), bytes.size(), img, ierr)) {
                     reply_err("cannot read the image " + words[i]);
                     return;
                 }

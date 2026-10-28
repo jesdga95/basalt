@@ -130,6 +130,18 @@ class ConfigFile(unittest.TestCase):
 
 
 class Precedence(unittest.TestCase):
+    def test_vision_token_limit(self):
+        cfg = {"server": {"vision": "1", "vision-max-tokens": 8192}}
+        a, _, file_words, cli_words = parse([], cfg)
+        self.assertEqual(a.vision_max_tokens, 8192)
+        self.assertEqual(file_words + cli_words, [])
+        self.assertEqual(parse(["--vision-max-tokens", "4096"], cfg)[0].vision_max_tokens, 4096)
+        for value in (0, -1, 7):
+            with self.assertRaisesRegex(ValueError, "at least 8"):
+                parse(["--vision", "1", "--vision-max-tokens", str(value)])
+        with self.assertRaisesRegex(ValueError, "dynamic uses the engine's limit"):
+            parse(["--vision", "dynamic", "--vision-max-tokens", "8192"])
+
     def test_server_options(self):
         a, *_ = parse([], {"server": {"port": 9000, "alias": "cfg"}})
         self.assertEqual((a.port, a.alias), (9000, "cfg"))
@@ -318,6 +330,8 @@ class SlotContext(unittest.TestCase):
 
 class EveryOption(unittest.TestCase):
     def sample(self, act):
+        if act.dest == "vision_max_tokens":
+            return 8192
         if act.nargs == 0:
             return True
         if act.choices:
