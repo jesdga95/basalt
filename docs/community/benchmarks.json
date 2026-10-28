@@ -552,6 +552,37 @@
       "prefill_16k_tps": 2686.6,
       "prefill_64k_tps": 2699.1,
       "decode_tps": 91.9
+    },
+    {
+      "submitter": "SanGawku",
+      "date": "2026-10-26",
+      "commit": "471dc4ca04",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.0
+        },
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 27.8
+        }
+      ],
+      "ram_gib": 62,
+      "cpu": "Intel Core i5-14600K, 14 cores",
+      "ram_gbps": 76.0,
+      "os": "Linux",
+      "quant": "IQ3_XXS",
+      "prefill_16k_tps": 2756.0,
+      "prefill_64k_tps": 2740.8,
+      "decode_tps": 229.6,
+      "notes": "Build 471dc4ca04 = upstream 31aacda2 plus one local CLI flag (--no-peer-exclusive) that this preset does not use. Both GPUs overclocked (core +400, mem +5250 offset)."
     }
   ]
 }
