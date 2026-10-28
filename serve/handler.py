@@ -59,6 +59,19 @@ def make_handler(target: Service | Router):
         turn = None                                         # this request's router turn
         sse_open = False                                    # the stream's headers went out
 
+        # a request's session identity, the headers a load balancer names its flows by (tinyllb's order), then the
+        # request body's own field; the slot the engine runs a conversation in follows it
+        SESSION_HEADERS = ("x-llm-flow-id", "x-claude-code-session-id", "x-session-id", "x-session-affinity",
+                           "x-client-request-id")
+
+        def _session_id(self, req) -> str | None:
+            for h in self.SESSION_HEADERS:
+                v = (self.headers.get(h) or "").strip()
+                if v:
+                    return v
+            v = req.get("session_id") if isinstance(req, dict) else None
+            return v if isinstance(v, str) and v else None
+
         def log_message(self, fmt, *args):
             pass
 
@@ -660,7 +673,8 @@ def make_handler(target: Service | Router):
             def events():
                 yield from asm.start()
                 done = None
-                for kind, x in self.svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
+                for kind, x in self.svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
+                                            session=self._session_id(req)):
                     if kind == "ping":
                         yield None
                     elif kind == "event":
