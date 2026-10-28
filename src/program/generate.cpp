@@ -10365,6 +10365,7 @@ int main(int argc, char** argv) {
                                        std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                     basalt::core::decode_gaps().mark(17);
                     if (eos) { finish = "stop"; break; }
+                    shed_if_low();
                     if (halted()) { finish = "cancel"; break; }
                     x = outv[(size_t) a];
                     p += a + 1;
