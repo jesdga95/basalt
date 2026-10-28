@@ -650,12 +650,11 @@ __device__ __forceinline__ float q6_q8_dot(const Q6KBlock* __restrict__ w,
     return q6_q8_dot_impl(vl, vh, u, w->scales + scale_offset, w->d, d8);
 }
 
-// Q6_K generic MMVQ: QK=256, QI=32, VDR=1, four blocks per iteration.
-template<bool SmallK>
-__launch_bounds__(WARPS * WARP, 1)
-__global__ void native_q6_k_mmvq_kernel(const Q6KBlock* __restrict__ w,
-                                        const Q81Block* __restrict__ x,
-                                        float* __restrict__ y, int n_in, int n_out) {
+// Q6_K generic MMVQ: QK=256, QI=32, VDR=1, four blocks per iteration.  Mapped: output row r is weight row rows[r].
+template<bool SmallK, bool Mapped>
+__device__ __forceinline__ void q6_k_mmvq_body(const Q6KBlock* __restrict__ w, const Q81Block* __restrict__ x,
+                                               float* __restrict__ y, int n_in, int n_out,
+                                               const int32_t* __restrict__ rows) {
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = WARPS * WARP / 32;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
@@ -669,7 +668,8 @@ __global__ void native_q6_k_mmvq_kernel(const Q6KBlock* __restrict__ w,
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) {
             if (row0 + i < n_out) {
-                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                const int wr = Mapped ? __ldg(rows + row0 + i) : row0 + i;
+                const std::size_t block = std::size_t(wr) * blocks_per_row + kbx;
                 tmp[i] += q6_q8_dot(w + block, x + kby, kqs);
             }
         }
@@ -688,6 +688,20 @@ __global__ void native_q6_k_mmvq_kernel(const Q6KBlock* __restrict__ w,
         tmp[i] = warp_sum(tmp[i]);
         if (threadIdx.x == i && row0 + i < n_out) y[row0 + i] = tmp[i];
     }
+}
+template<bool SmallK>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_q6_k_mmvq_kernel(const Q6KBlock* __restrict__ w,
+                                        const Q81Block* __restrict__ x,
+                                        float* __restrict__ y, int n_in, int n_out) {
+    q6_k_mmvq_body<SmallK, false>(w, x, y, n_in, n_out, nullptr);
+}
+template<bool SmallK>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_q6_k_mmvq_rows_kernel(const Q6KBlock* __restrict__ w, const int32_t* __restrict__ rows,
+                                             const Q81Block* __restrict__ x, float* __restrict__ y, int n_in,
+                                             int n_out) {
+    q6_k_mmvq_body<SmallK, true>(w, x, y, n_in, n_out, rows);
 }
 
 // The four 32-element formats use native two-byte loads and VDR=2. The affine
@@ -1828,6 +1842,28 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         native_q6_k_mmvq_kernel<true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out);
     } else {
         native_q6_k_mmvq_kernel<false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
+    }
+    launch_check();
+}
+
+void native_q6_k_mmvq_rows(const void* weights, const int32_t* rows, const void* x_q8_1, float* y, int n_in, int n_out,
+                           void* stream) {
+    validate_shape(n_in, 1, 256);
+    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+    validate_pointer(weights);
+    validate_pointer(rows);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    const auto* w = static_cast<const Q6KBlock*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    const dim3 threads(WARP, WARPS);
+    if (n_in / 256 < WARPS * WARP / 32) {
+        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+        native_q6_k_mmvq_rows_kernel<true><<<blocks, threads, 0, s>>>(w, rows, x, y, n_in, n_out);
+    } else {
+        native_q6_k_mmvq_rows_kernel<false><<<unsigned(n_out), threads, 0, s>>>(w, rows, x, y, n_in, n_out);
     }
     launch_check();
 }

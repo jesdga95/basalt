@@ -502,14 +502,23 @@ std::vector<std::pair<std::string, const void*>> MtpDrafter::hc8_keys() const {
     return out;
 }
 
-uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const {
+namespace {
+// a Q5_K draft head keeps context rows after its base rows; a Q6_K head (no context rows) reads the main head's rows
+// through its map instead of a copy
+bool draft_ctx_rows(int head_type) { return head_type == 13; }
+bool draft_rows_mapped(int head_type) { return head_type == 14 && !draft_ctx_rows(head_type); }
+}  // namespace
+
+uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int head_type, int64_t n_vocab) const {
     uint64_t bytes = head_logits_ ? 0 : (uint64_t) max_t_ * (uint64_t) n_vocab * sizeof(float);
-    if (dhead_ == nullptr) {
+    if (dhead_ == nullptr && !rows_mapped_) {
         if (!draft_vocab_.empty() && draft_vocab_.exists()) {
             const long size = (long) draft_vocab_.size();
             if (size >= 4 && size % 4 == 0) {
                 const uint64_t xr = (uint64_t) kDraftCtxRows;
-                bytes += (uint64_t) (size / 4 + xr) * head_row_bytes + (uint64_t) size + xr * 8;
+                // a Q6_K head reads the main head's rows; others copy them
+                if (!draft_rows_mapped(head_type)) bytes += (uint64_t) (size / 4 + xr) * head_row_bytes;
+                bytes += (uint64_t) size + xr * 8;
                 std::vector<uint8_t> raw;   // the 2-bit copy of the leading rows (the base rows and the context rows)
                 if (read_file(draft_vocab_, raw) && raw.size() == (size_t) size) {
                     const int32_t* ids = (const int32_t*) raw.data();
@@ -527,7 +536,7 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const 
 
 namespace {
 // What to change when the draft head's token subset does not fit the VRAM left.  Text only, after the failure.
-void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
+void draft_head_hint(int64_t n_tokens, uint64_t bytes) {
     size_t free_b = 0, total_b = 0;
     const bool have_free = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
     std::string free_s;
@@ -537,7 +546,7 @@ void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
         free_s = b;
     }
     basalt::log::warn("basalt mtp", "the draft head over %lld tokens needs %.0f MiB of VRAM%s.",
-                 (long long) n_tokens, (double) (n_tokens * row_bytes) / 1048576.0, free_s.c_str());
+                 (long long) n_tokens, (double) bytes / 1048576.0, free_s.c_str());
     basalt::log::info("basalt mtp", "hint: a smaller draft vocabulary (--draft-vocab when converting the model), "
                          "a smaller --max-context, or closing what else uses the GPU leaves it room.");
 }
@@ -576,17 +585,22 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         return false;
     }
     // the draft head's token subset, when the model file carries one
-    if (dhead_ == nullptr) {
+    if (dhead_ == nullptr && !rows_mapped_) {
         std::vector<uint8_t> raw;
         if (read_file(draft_vocab_, raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
             const int64_t n_raw = (int64_t) (raw.size() / 4);
             const int32_t* ids = (const int32_t*) raw.data();
+            for (int64_t i = 0; i < n_raw; ++i)
+                if (ids[i] < 0 || ids[i] >= n_vocab_) {
+                    err = "mtp: the draft vocabulary holds a token id outside the vocabulary";
+                    return false;
+                }
             // the base rows: the leading ids up to the first descent (added ids follow the base in id order)
             int64_t n_base = n_raw;
             for (int64_t i = 1; i < n_raw; ++i)
                 if (ids[i] < ids[i - 1]) { n_base = i; break; }
             // context rows follow the base rows
-            if (head->type() == 13 && n_raw > 0) n_xcap_ = kDraftCtxRows;
+            if (draft_ctx_rows(head->type()) && n_raw > 0) n_xcap_ = kDraftCtxRows;
             xbase_ = n_base;
             std::vector<int32_t> map((size_t) (n_raw + n_xcap_));
             std::copy(ids, ids + n_base, map.begin());
@@ -594,24 +608,40 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             std::copy(ids + n_base, ids + n_raw, map.begin() + n_base + n_xcap_);
             n_dvocab_ = n_raw + n_xcap_;
             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
+            const bool mapped = draft_rows_mapped(head->type());
             if (cudaMalloc((void**) &dvocab_, map.size() * 4) != cudaSuccess ||
-                cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != cudaSuccess ||
+                (!mapped && cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != cudaSuccess) ||
                 (n_xcap_ > 0 && cudaMalloc((void**) &dxids_, (size_t) n_xcap_ * 4) != cudaSuccess)) {
                 err = "mtp: the draft head does not fit";
-                draft_head_hint(n_dvocab_, row_bytes);
+                // the map, the copy unless mapped, the context rows' ids and the leading rows' 2-bit copy
+                uint64_t need = map.size() * 4 + (uint64_t) n_xcap_ * 4;
+                if (!mapped) need += (uint64_t) (n_dvocab_ * row_bytes);
+                if (head->type() == 13 || head->type() == 14)
+                    need += basalt::kernels::q5k_proxy_bytes(n_base + n_xcap_) +
+                            basalt::kernels::q5k_proxy_scratch_bytes(n_base + n_xcap_);
+                draft_head_hint(n_dvocab_, need);
                 return false;
             }
-            // unused context rows read the first row's weights for the gather, then take their id -1
-            std::vector<int32_t> gmap = map;
-            for (int32_t& v : gmap) if (v < 0) v = ids[0];
-            cudaMemcpy(dvocab_, gmap.data(), gmap.size() * 4, cudaMemcpyHostToDevice);
-            basalt::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
-            cudaDeviceSynchronize();
-            cudaMemcpy(dvocab_, map.data(), map.size() * 4, cudaMemcpyHostToDevice);
+            rows_mapped_ = mapped;
+            if (mapped) {
+                cudaMemcpy(dvocab_, map.data(), map.size() * 4, cudaMemcpyHostToDevice);
+                vram_ += map.size() * 4;
+                basalt::log::info("basalt mtp", "draft head over %lld tokens (rows read from the main head)",
+                             (long long) n_dvocab_);
+            } else {
+                // unused context rows read the first row's weights for the gather, then take their id -1
+                std::vector<int32_t> gmap = map;
+                for (int32_t& v : gmap) if (v < 0) v = ids[0];
+                cudaMemcpy(dvocab_, gmap.data(), gmap.size() * 4, cudaMemcpyHostToDevice);
+                basalt::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_,
+                                             nullptr);
+                cudaDeviceSynchronize();
+                cudaMemcpy(dvocab_, map.data(), map.size() * 4, cudaMemcpyHostToDevice);
+                vram_ += (uint64_t) (n_dvocab_ * row_bytes) + map.size() * 4 + (uint64_t) n_xcap_ * 4;
+                basalt::log::info("basalt mtp", "draft head over %lld tokens (%.1f MiB)", (long long) n_dvocab_,
+                             (double) (n_dvocab_ * row_bytes) / 1048576.0);
+            }
             if (exp_flag("spec_log", 0) != 0) diag_map_ = map;
-            vram_ += (uint64_t) (n_dvocab_ * row_bytes) + map.size() * 4 + (uint64_t) n_xcap_ * 4;
-            basalt::log::info("basalt mtp", "draft head over %lld tokens (%.1f MiB)", (long long) n_dvocab_,
-                         (double) (n_dvocab_ * row_bytes) / 1048576.0);
             n_tier1_ = n_base + n_xcap_;
             if (head->type() == 13 || head->type() == 14) {   // the 2-bit copy of the leading rows: a fraction of the bytes
                 const size_t pb = basalt::kernels::q5k_proxy_bytes(n_tier1_);
@@ -619,6 +649,8 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 if (cudaMalloc((void**) &proxy_, pb) == cudaSuccess && cudaMalloc(&proxy_scratch_, sb) == cudaSuccess) {
                     cudaMemset(proxy_, 0, pb);
                     if (head->type() == 13) basalt::kernels::q5k_proxy_pack(dhead_, 0, n_tier1_, proxy_, n_tier1_, nullptr);
+                    else if (mapped)
+                        basalt::kernels::q6k_proxy_pack(head->weights(), 0, n_tier1_, proxy_, n_tier1_, nullptr, dvocab_);
                     else basalt::kernels::q6k_proxy_pack(dhead_, 0, n_tier1_, proxy_, n_tier1_, nullptr);
                     cudaDeviceSynchronize();
                     vram_ += pb + sb;
@@ -646,7 +678,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         }
     }
     if (diag_ == nullptr && exp_flag("spec_log", 0) != 0) {
-        diag_stride_ = dhead_ != nullptr ? n_dvocab_ : n_vocab_;
+        diag_stride_ = dvocab_ != nullptr ? n_dvocab_ : n_vocab_;
         if (cudaHostAlloc((void**) &diag_, (size_t) max_t_ * (size_t) diag_stride_ * sizeof(float), cudaHostAllocDefault) != cudaSuccess)
             diag_ = nullptr;
     }
@@ -936,7 +968,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         if (fold_write) fork_next_hidden();
         if (mixer_q8) pscope(false);   // the head follows the read
         if (!mixer_q8) native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
-        const bool sub = dhead_ != nullptr;
+        const bool sub = dvocab_ != nullptr;
         // the argmax drafts over the base rows only on tier 0
         const int64_t nv = sub ? (tier_ == 0 ? n_tier1_ : n_dvocab_) : n_vocab_;
         // The head, its argmax and the argmax's probability in one launch (the probability's sum in
@@ -945,14 +977,17 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             (head_->type() == 13
                  ? basalt::kernels::q5k_proxy_top1(proxy_, dhead_, xq_, (int) nv, n_tier1_, dvocab_, out_ids_, probs_,
                                                    proxy_scratch_, cs)
-                 : basalt::kernels::q6k_proxy_top1(proxy_, dhead_, xq_, (int) nv, n_tier1_, dvocab_, out_ids_, probs_,
-                                                   proxy_scratch_, cs)))
+                 : basalt::kernels::q6k_proxy_top1(proxy_, rows_mapped_ ? head_->weights() : (const void*) dhead_, xq_,
+                                                   (int) nv, n_tier1_, dvocab_, out_ids_, probs_, proxy_scratch_, cs,
+                                                   rows_mapped_)))
             return true;
         if (T == 1 && head_->type() == 13 && top_scratch_ != nullptr && diag_ == nullptr &&
             q5k_head_top1(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, sub ? dvocab_ : nullptr,
                           out_ids_, probs_, top_scratch_, cs))
             return true;
-        if (head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits
+        if (rows_mapped_)   // the subset's rows of the main head, one row a step: the bits of the copy's rows
+            native_q6_k_mmvq_rows(head_->weights(), dvocab_, xq_, head_logits_, (int) N, (int) nv, cs);
+        else if (head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits
             q5k_head_mmvq(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         else if (head_->type() == GGML_Q8_0 && T == 1)   // read once a step: streamed past the layer's other weights
             native_q8_0_mmvq_stream(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, cs);
@@ -1110,7 +1145,7 @@ bool MtpDrafter::step_end(int j) {
 
 int MtpDrafter::diag_top(int j, int k, int32_t* ids, float* probs) const {
     if (diag_ == nullptr || j < 0 || j >= max_t_) return 0;
-    const bool sub = dhead_ != nullptr;
+    const bool sub = dvocab_ != nullptr;
     const int64_t nv = sub ? (tier_ == 0 ? n_tier1_ : n_dvocab_) : n_vocab_;
     const float* l = diag_ + (size_t) j * (size_t) diag_stride_;
     std::vector<std::pair<float, int64_t>> best;

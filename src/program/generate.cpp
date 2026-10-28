@@ -3123,7 +3123,7 @@ int main(int argc, char** argv) {
         // the draft layer's head and logits are allocated when it binds, after this, so they come out of the reserve
         const basalt::core::NativeHead& draft_head = multi_gpu ? mtp_head : native_head;
         const int64_t mtp_bind = (!o.mtp.empty() && draft_head.loaded())
-                                     ? (int64_t) mtp.bind_bytes(draft_head.row_bytes(), n_vocab) : 0;
+                                     ? (int64_t) mtp.bind_bytes(draft_head.row_bytes(), draft_head.type(), n_vocab) : 0;
         // a server allocates its verify windows after the cache is sized: they come out of the reserve too, so the
         // free VRAM after loading is the reserve itself
         int64_t late_b = o.serve ? (kWindowMib << 20) : 0;

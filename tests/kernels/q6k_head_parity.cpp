@@ -1,10 +1,14 @@
 // tests/kernels/q6k_head_parity.cpp - q6k_head_mmvq against native_mmvq (Q6_K, the exact layout), bitwise, on random
-// Q6_K rows and quantized random columns, 1..8 columns; then a microbench of both at the head's shape.
+// Q6_K rows and quantized random columns, 1..8 columns; then a microbench of both at the head's shape.  Last, the draft
+// head read through a row map (rows of the whole head) against the same rows gathered into a copy, bitwise: the 2-bit
+// copy, the two-stage argmax, the one-column head, and the copy's 2..8-column head against the row map one column at a
+// time.
 //   q6k_head_parity [rows] [iters]
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/q5k_head.hpp"
 #include "basalt/kernels/q6k_head.hpp"
 #include "basalt/kernels/sampler.hpp"
+#include "basalt/kernels/verify_kernels.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -353,6 +357,106 @@ int main(int argc, char** argv) {
                     "cold: two-stage %.1f us, fused exact %.1f us, head + top-prob %.1f us\n",
                     rr, miss, trials, max_p_rel, sum_p_rel / trials, 1e3 * t_px, 1e3 * t_ex, 1e3 * t_pl);
         if (miss > trials / 50 || max_p_rel > 1.0) fail = 1;
+    }
+    // the draft head through a row map: a subset of distinct rows in shuffled order (as a draft vocabulary's base rows
+    // then its added rows), read from the whole head, against the same rows gathered into a copy
+    {
+        const int nsub = std::min(rows / 2, 106299), cap = nsub;
+        std::vector<int32_t> perm((size_t) rows);
+        for (int i = 0; i < rows; ++i) perm[(size_t) i] = i;
+        std::shuffle(perm.begin(), perm.end(), rng);
+        std::vector<int32_t> map(perm.begin(), perm.begin() + nsub);
+        int32_t* d_map = nullptr;
+        void *wg = nullptr, *pa = nullptr, *pb = nullptr, *scratch = nullptr, *xqm = nullptr;
+        float *ya = nullptr, *yb = nullptr, *pr = nullptr;
+        int* ids = nullptr;
+        const size_t rb = (size_t) bpr * blk;
+        ck(cudaMalloc(&d_map, map.size() * 4), "map");
+        ck(cudaMemcpy(d_map, map.data(), map.size() * 4, cudaMemcpyHostToDevice), "map up");
+        ck(cudaMalloc(&wg, (size_t) nsub * rb), "wg");
+        ck(cudaMalloc(&pa, k::q5k_proxy_bytes(cap)), "pa");
+        ck(cudaMalloc(&pb, k::q5k_proxy_bytes(cap)), "pb");
+        ck(cudaMemset(pa, 0, k::q5k_proxy_bytes(cap)), "pa0");
+        ck(cudaMemset(pb, 0, k::q5k_proxy_bytes(cap)), "pb0");
+        ck(cudaMalloc(&scratch, k::q5k_proxy_scratch_bytes(cap)), "scratch");
+        ck(cudaMalloc(&xqm, k::native_q8_1_bytes(n_in, MT)), "xqm");
+        ck(cudaMalloc(&ya, (size_t) MT * nsub * 4), "ya");
+        ck(cudaMalloc(&yb, (size_t) MT * nsub * 4), "yb");
+        ck(cudaMalloc(&ids, 4 * 4), "ids");
+        ck(cudaMalloc(&pr, 4 * 4), "pr");
+        k::gather_rows((const uint8_t*) w, (int64_t) rb, d_map, nsub, (uint8_t*) wg, s);
+        k::q6k_proxy_pack(wg, 0, nsub, pa, cap, s);
+        k::q6k_proxy_pack(w, 0, nsub, pb, cap, s, d_map);
+        ck(cudaStreamSynchronize(s), "pack");
+        std::vector<uint8_t> ha(k::q5k_proxy_bytes(cap)), hb(ha.size());
+        ck(cudaMemcpy(ha.data(), pa, ha.size(), cudaMemcpyDeviceToHost), "pa");
+        ck(cudaMemcpy(hb.data(), pb, hb.size(), cudaMemcpyDeviceToHost), "pb");
+        const bool pack_eq = std::memcmp(ha.data(), hb.data(), ha.size()) == 0;
+        int top_bad = 0, one_bad = 0, multi_bad = 0;
+        std::vector<float> a((size_t) MT * nsub), b(a.size());
+        for (int tr = 0; tr < 24; ++tr) {
+            std::vector<float> xh((size_t) MT * n_in);
+            for (auto& v : xh) v = nd(rng);
+            ck(cudaMemcpy(x, xh.data(), xh.size() * 4, cudaMemcpyHostToDevice), "x up");
+            k::native_quantize_q8_1(x, xqm, n_in, MT, s);
+            // the two-stage argmax on the copy's base rows
+            const int nb = nsub * 2 / 5;
+            k::q6k_proxy_top1(pa, wg, xqm, nb, cap, d_map, ids, pr, scratch, s);
+            k::q6k_proxy_top1(pb, w, xqm, nb, cap, d_map, ids + 1, pr + 1, scratch, s, true);
+            int hid[2];
+            float hp[2];
+            ck(cudaMemcpy(hid, ids, 8, cudaMemcpyDeviceToHost), "ids");
+            ck(cudaMemcpy(hp, pr, 8, cudaMemcpyDeviceToHost), "pr");
+            top_bad += hid[0] != hid[1] || std::memcmp(&hp[0], &hp[1], 4) != 0;
+            // one column over every subset row
+            k::native_mmvq(14, wg, xqm, ya, n_in, nsub, 1, s);
+            k::native_q6_k_mmvq_rows(w, d_map, xqm, yb, n_in, nsub, s);
+            ck(cudaMemcpy(a.data(), ya, (size_t) nsub * 4, cudaMemcpyDeviceToHost), "ya");
+            ck(cudaMemcpy(b.data(), yb, (size_t) nsub * 4, cudaMemcpyDeviceToHost), "yb");
+            one_bad += std::memcmp(a.data(), b.data(), (size_t) nsub * 4) != 0;
+            // 2..8 columns: the copy's head over T columns against the row map one column at a time
+            const int T = 2 + tr % 7;
+            k::native_mmvq(14, wg, xqm, ya, n_in, nsub, T, s);
+            for (int t = 0; t < T; ++t)
+                k::native_q6_k_mmvq_rows(w, d_map, (const char*) xqm + (size_t) t * k::native_q8_1_bytes(n_in, 1),
+                                         yb + (size_t) t * nsub, n_in, nsub, s);
+            ck(cudaMemcpy(a.data(), ya, (size_t) T * nsub * 4, cudaMemcpyDeviceToHost), "ya");
+            ck(cudaMemcpy(b.data(), yb, (size_t) T * nsub * 4, cudaMemcpyDeviceToHost), "yb");
+            multi_bad += std::memcmp(a.data(), b.data(), (size_t) T * nsub * 4) != 0;
+        }
+        // the layout of a draft vocabulary: base rows in ascending id order, then added rows in ascending id order
+        std::vector<int32_t> map2 = map;
+        const int nb2 = nsub == 106299 ? 40525 : nsub * 2 / 5;
+        std::sort(map2.begin(), map2.begin() + nb2);
+        std::sort(map2.begin() + nb2, map2.end());
+        int32_t* d_map2 = nullptr;
+        ck(cudaMalloc(&d_map2, map2.size() * 4), "map2");
+        ck(cudaMemcpy(d_map2, map2.data(), map2.size() * 4, cudaMemcpyHostToDevice), "map2 up");
+        // one column, hot: the copy against the row map (shuffled, and in a draft vocabulary's order)
+        float t_v[3] = {0, 0, 0};
+        auto one = [&](int v) {
+            if (v == 0) k::native_mmvq(14, wg, xqm, ya, n_in, nsub, 1, s);
+            else k::native_q6_k_mmvq_rows(w, v == 1 ? d_map : d_map2, xqm, yb, n_in, nsub, s);
+        };
+        for (int v = 0; v < 3; ++v) {
+            for (int i = 0; i < 5; ++i) one(v);
+            cudaEventRecord(e0, s);
+            for (int i = 0; i < iters; ++i) one(v);
+            cudaEventRecord(e1, s);
+            cudaEventSynchronize(e1);
+            float ms;
+            cudaEventElapsedTime(&ms, e0, e1);
+            t_v[v] = 1e3f * ms / iters;
+        }
+        const double gb = (double) nsub * rb / 1e3;
+        std::printf("draft head by row map, %d of %d rows: 2-bit copy %s, two-stage argmax %d of 24 differ, one column %d of 24 "
+                    "differ, 2..8 columns %d of 24 differ | one column: copy %.1f us (%.0f GB/s), row map shuffled %.1f us "
+                    "(%.0f GB/s), row map in draft vocabulary order (%d + %d ascending) %.1f us (%.0f GB/s)\n",
+                    nsub, rows, pack_eq ? "bitwise" : "DIFFERS", top_bad, one_bad, multi_bad, t_v[0], gb / t_v[0], t_v[1],
+                    gb / t_v[1], nb2, nsub - nb2, t_v[2], gb / t_v[2]);
+        if (!pack_eq || top_bad || one_bad || multi_bad) fail = 1;
+        for (void* p : {(void*) d_map, (void*) d_map2, wg, pa, pb, scratch, xqm, (void*) ya, (void*) yb, (void*) ids, (void*) pr})
+            cudaFree(p);
     }
     std::printf("%s\n", fail ? "q6k_head_parity: FAIL" : "q6k_head_parity: OK (bitwise)");
     return fail;
