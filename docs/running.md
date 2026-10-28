@@ -173,7 +173,8 @@ Basalt refuses settings that would leave the machine without memory, and never s
   (the margin alone when no expert is read from the SSD). Below it, the engine drops its parked conversations (except
   the one the next request continues) and returns its free heap to the OS, and a request that arrives waits up to 30 s
   for the RAM to come back before it starts; one that adds at most 256 tokens to the live conversation (the server's
-  wrap-up after a thinking budget) does not wait. A running request continues; it stops with an error only when the
+  wrap-up after a thinking budget) does not wait. A request cancelled during the wait ends there, before anything
+  moves for it. A running request continues; it stops with an error only when the
   RAM is critical: under 1 GiB free, or below the guard while the kernel's memory pressure (`/proc/pressure/memory`,
   avg10) shows tasks stalled most of the time (some >= 60% or full >= 40%). Without a pressure reading (Windows, or a
   kernel without PSI) below the guard is critical. The error (`RAM low (... free < ... guard) ...: request stopped` or
