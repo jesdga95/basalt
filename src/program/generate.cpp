@@ -6050,6 +6050,8 @@ int main(int argc, char** argv) {
         std::vector<XSwap> xq;
         int xq_stage = 0;   // 0 idle, 1 evictions copying to RAM, 2 incoming experts copying to their slots
         bool xq_saturated = false;   // the last round had at least kSatRatio times --adapt-swaps misses to swap
+        // since the start: the swaps the rounds queued, and those a round left for a later one (no free RAM place)
+        int64_t xq_swapped = 0, xq_noplace = 0;
         // The landed words (Verifier::landed_words): a round's incoming copies are queued in layer order, each layer's
         // followed by a 4-byte copy of the round's number into the layer's word.  The copies' sources are a pinned
         // ring of rounds (every layer's word, then the round's number).
@@ -6158,6 +6160,8 @@ int main(int argc, char** argv) {
                                        (size_t) swaps[i].layer * g.n_expert + swaps[i].in)) continue;
                 if (!plan(swaps[i])) return false;
             }
+            xq_swapped += (int64_t) xq.size();
+            xq_noplace += (int64_t) n_noplace;
             if (!xq.empty()) {
                 cudaEventRecord(adapt_ev, adapt_stream);
                 xq_stage = 1;
@@ -7132,6 +7136,7 @@ int main(int argc, char** argv) {
         // adaptive tier rounds in the batch windows (routing counts from every row of every slot)
         const bool batch_adapt = adapt_fast && !drive.d.usage.empty();
         int64_t ba_win = 0, ba_swaps = 0, ba_rounds = 0, ba_swaps_l = 0, ba_rounds_l = 0, ba_h_l = 0, ba_m_l = 0;
+        int64_t ba_noplace = 0;   // the batch rounds' swaps deferred for want of a free RAM place
         double ba_ms = 0;
         JobRunner ba_thr;       // queues the adaptive copies beside the windows
         bool ba_job = false;
@@ -7653,8 +7658,10 @@ int main(int argc, char** argv) {
                             acted = true;
                         }
                     } else if (ba_win % o.adapt_every == 0) {
+                        const int64_t np0 = xq_noplace;
                         ok = xq_round();
                         ba_swaps += (int64_t) xq.size();
+                        ba_noplace += xq_noplace - np0;
                         ++ba_rounds;
                         acted = true;
                     }
@@ -7852,11 +7859,13 @@ int main(int argc, char** argv) {
                              (drive.d.multi_misses - bt_miss0) / (w * L), (drive.d.cache_hits - bt_hits0) / (w * L),
                              (drive.d.pcie_experts - bt_pcie0) / (w * L), 1000.0 * bt_rows / std::max(wall, 1e-9), wall);
                 if (batch_adapt) {
-                    basalt::log::info("basalt batch adapt", "%lld rounds, %lld swaps queued (%.1f per round), %.3f ms/window of host "
-                                         "time, peer swaps total %lld", (long long) ba_rounds, (long long) ba_swaps,
-                                 ba_rounds > 0 ? (double) ba_swaps / (double) ba_rounds : 0.0, ba_ms / w,
+                    basalt::log::info("basalt batch adapt", "%lld rounds, %lld swaps queued (%.1f per round), %lld deferred "
+                                         "(no free RAM place), %.3f ms/window of host time, peer swaps total %lld",
+                                 (long long) ba_rounds, (long long) ba_swaps,
+                                 ba_rounds > 0 ? (double) ba_swaps / (double) ba_rounds : 0.0,
+                                 (long long) ba_noplace, ba_ms / w,
                                  (long long) (peer.valid() ? peer.swaps() : 0));
-                    ba_swaps = ba_rounds = ba_swaps_l = ba_rounds_l = 0;
+                    ba_swaps = ba_rounds = ba_swaps_l = ba_rounds_l = ba_noplace = 0;
                     ba_ms = 0;
                 }
                 if (bt_slotwin > 0)
