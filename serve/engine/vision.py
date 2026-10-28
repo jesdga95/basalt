@@ -1,17 +1,23 @@
-"""The image encoder process, and the GPU helpers the engine and encoder environments are built from."""
+"""The image encoder process, the image-source policy, and the GPU helpers the encoder environments are built from."""
 from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import os
+import socket
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import queue
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from serve.engine import lifeline
 from serve.engine.process import frame_pipes
@@ -23,24 +29,148 @@ from serve.util.console import tagged
 VISION_READY_S = 300.0
 VISION_ENCODE_S = 300.0
 VISION_CACHE_BYTES = 1 << 30                    # room for about 64 images
+IMAGE_MAX_BYTES = 32 << 20                      # one image's bytes, from any source
+
+
+@dataclass(frozen=True)
+class ImageSources:
+    """Where a request's images may come from: inline `data:` URLs always, plus the URL hosts and directories the
+    operator allows. Empty by default, so a remote client cannot make the server fetch a URL or read a file."""
+    url_hosts: tuple[str, ...] = ()
+    dirs: tuple[Path, ...] = ()
+    max_bytes: int = IMAGE_MAX_BYTES
+
+
+def _is_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _host_allowed(host: str, port: int, entry: str) -> bool:
+    """Whether `host:port` is the allowed entry (a bare host means its scheme's default port)."""
+    try:
+        parts = urllib.parse.urlsplit("//" + entry)
+        return parts.hostname == host and parts.port in (None, port)
+    except ValueError:
+        return False
+
+
+def _check_destination(host: str, port: int) -> None:
+    """Refuse a host name that resolves to this machine or a private network, so an allowed name cannot be pointed
+    at an internal address later (an IP literal entry is the operator naming the address itself)."""
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except OSError as e:
+        raise ValueError(f"the image host {host} could not be resolved ({e})") from None
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:                                     # a scoped address: not a public destination
+            raise ValueError(f"the image host {host} is not a public address") from None
+        if not ip.is_global:
+            raise ValueError(f"the image host {host} resolves to {ip}, which is this machine or a private "
+                             f"network; name the address itself in --image-url-host to allow it")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ValueError(f"the image URL redirected to {newurl}; name that host in --image-url-host instead")
+
+
+def _read_data(source: str, sources: ImageSources) -> bytes:
+    _, sep, payload = source.partition(",")
+    if not sep:
+        raise ValueError("a data: URL needs a comma before its payload")
+    if len(payload) > (sources.max_bytes + 2) // 3 * 4 + 4:      # base64 of the cap, before decoding it
+        raise ValueError(f"the image is larger than {sources.max_bytes} bytes")
+    try:
+        data = base64.b64decode(payload)
+    except ValueError:
+        raise ValueError("a data: URL's payload is not base64") from None
+    if len(data) > sources.max_bytes:
+        raise ValueError(f"the image is larger than {sources.max_bytes} bytes")
+    return data
+
+
+def _read_url(url: str, sources: ImageSources) -> bytes:
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError("an image URL must be http or https")
+    if parts.username or parts.password:
+        raise ValueError("an image URL may not carry a user name or password")
+    host = parts.hostname.lower()
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    if not any(_host_allowed(host, port, entry) for entry in sources.url_hosts):
+        raise ValueError(f"the image URL's host {host} is not allowed: start the server with "
+                         f"--image-url-host {host} to fetch images from it")
+    if not _is_ip(host):
+        _check_destination(host, port)
+    opener = urllib.request.build_opener(_NoRedirect())
+    opener.addheaders = [("User-Agent", "local-server")]
+    try:
+        with opener.open(url, timeout=60) as r:      # http(s) only: checked above
+            data = r.read(sources.max_bytes + 1)
+    except ValueError:
+        raise
+    except urllib.error.HTTPError as e:                 # after the redirect handler, so a 3xx is not here
+        raise ValueError(f"the image URL answered HTTP {e.code}") from None
+    except OSError as e:
+        raise ValueError(f"the image URL could not be read ({e})") from None
+    if len(data) > sources.max_bytes:
+        raise ValueError(f"the image is larger than {sources.max_bytes} bytes")
+    return data
+
+
+def _read_file(source: str, sources: ImageSources) -> bytes:
+    if not sources.dirs:
+        raise ValueError("local image files are disabled: start the server with --image-dir DIR to allow them")
+    if source.startswith("file://"):
+        parts = urllib.parse.urlsplit(source)
+        if parts.netloc not in ("", "localhost"):
+            raise ValueError("a file: URL may not name another host")
+        path = Path(urllib.request.url2pathname(parts.path))
+    else:
+        path = Path(source)
+    real = path.resolve()                              # symlinks resolved: containment means the real target
+    if not any(real.is_relative_to(root) for root in sources.dirs):
+        raise ValueError(f"the image file is outside the allowed directories ({', '.join(map(str, sources.dirs))})")
+    if not real.is_file():
+        raise ValueError("the image file does not exist")
+    if real.stat().st_size > sources.max_bytes:
+        raise ValueError(f"the image is larger than {sources.max_bytes} bytes")
+    return real.read_bytes()
+
+
+def load_image(source: str, sources: ImageSources | None = None) -> bytes:
+    """One request image: an inline `data:` URL, an allowed URL host, or a file under an allowed directory."""
+    s = sources or ImageSources()
+    if source.startswith("data:"):
+        return _read_data(source, s)
+    if source.startswith(("http://", "https://")):
+        return _read_url(source, s)
+    return _read_file(source, s)
 
 
 class Vision:
     """The resident `basalt-vision` encoder: `ENC <image> <out>` lines in, embeddings out, cached by image hash."""
 
-    def __init__(self, cfg: dict, log=None, env: dict | None = None):
+    def __init__(self, cfg: dict, log=None, env: dict | None = None, sources: ImageSources | None = None):
         args = [cfg["vision_bin"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]] + (["--gpu"] if cfg.get("gpu") else [])
+        self.sources = sources or ImageSources()
         self.dir = Path(tempfile.mkdtemp(prefix="basalt-vision-"))
         self.spawn = (args, log, env)                   # to start again
         self.stopped = False
         self.ready_s = 0.0                              # last start's time to READY
-        self._start()
+        self.proc: subprocess.Popen = self._start()
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int, int]] = {}  # LRU cache: file, image tokens, bytes
         self.cache_bytes = 0
         self.pinned: dict[str, int] = {}                # image -> requests using it
 
-    def _start(self):
+    def _start(self) -> subprocess.Popen:
         args, log, env = self.spawn
         t0 = time.time()
         self.proc = lifeline.popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log or subprocess.DEVNULL,
@@ -55,16 +185,21 @@ class Vision:
             raise RuntimeError("the vision encoder did not start: " + line.strip())
         self.ready_s = time.time() - t0
         self.stopped = False
+        return self.proc
 
     def _readline(self, timeout: float, what: str) -> str:
         """One line from the encoder, waiting at most `timeout` s. On a timeout the encoder is killed, so the next
         request starts a fresh one, and the read raises RuntimeError instead of holding the request turn."""
         proc = self.proc
+        stdout = proc.stdout
         got: queue.Queue = queue.Queue()
 
         def read():
+            if stdout is None:
+                got.put("")
+                return
             try:
-                got.put(proc.stdout.readline())
+                got.put(stdout.readline())
             except (OSError, ValueError):               # killed under the read
                 got.put("")
 
@@ -92,20 +227,10 @@ class Vision:
             self.proc.kill()
         except OSError:
             pass
-        self._start()
+        self.proc = self._start()
 
-    @staticmethod
-    def load(source: str) -> bytes:
-        if source.startswith("data:"):
-            return base64.b64decode(source.split(",", 1)[1])
-        if source.startswith(("http://", "https://")):
-            req = urllib.request.Request(source, headers={"User-Agent": "local-server"})
-            with urllib.request.urlopen(req, timeout=60) as r:
-                return r.read()
-        path = source[7:] if source.startswith("file://") else source
-        if path and os.path.isfile(path):
-            return Path(path).read_bytes()
-        raise ValueError("an image must be a data: URL, an http(s) URL or a local file path")
+    def load(self, source: str) -> bytes:
+        return load_image(source, self.sources)
 
     @staticmethod
     def _exif_rotated(data: bytes) -> bool:
@@ -202,8 +327,11 @@ class Vision:
 
     def _enc(self, img: Path, out: Path) -> str:
         """One ENC round trip with the sidecar: its `OK <n> ...` or `ERR ...` line."""
-        self.proc.stdin.write(f"ENC {img} {out}\n")
-        self.proc.stdin.flush()
+        stdin = self.proc.stdin
+        if stdin is None:
+            raise ValueError("the vision encoder's input is closed")
+        stdin.write(f"ENC {img} {out}\n")
+        stdin.flush()
         try:
             return self._readline(VISION_ENCODE_S, "the image could not be read").strip()
         except RuntimeError as e:                       # silent: the encoder was ended
@@ -226,12 +354,19 @@ class Vision:
             self.cache_bytes -= size
 
     def close(self):
+        stdin = self.proc.stdin
         try:
-            self.proc.stdin.write("QUIT\n")
-            self.proc.stdin.flush()
+            if stdin is not None:
+                stdin.write("QUIT\n")
+                stdin.flush()
             self.proc.wait(timeout=10)
         except Exception:
             self.proc.kill()
+
+
+class _ImageEncoder(Protocol):
+    """The engine side of `--vision dynamic`: one ENC for a batch of images, one `OK ...` line each."""
+    def encode_images(self, jobs: list[tuple[Path, Path]]) -> list[str]: ...
 
 
 class EngineVision(Vision):
@@ -239,9 +374,10 @@ class EngineVision(Vision):
     borrows expert-cache slots for the encode and gives them back. Same cache, same files as the sidecar's."""
     in_engine = True
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, sources: ImageSources | None = None):
+        self.sources = sources or ImageSources()
         self.dir = Path(tempfile.mkdtemp(prefix="basalt-vision-"))
-        self.engine = None                              # set by attach() once the engine exists
+        self.engine: _ImageEncoder | None = None         # set by attach() once the engine exists
         self.stopped = False
         self.ready_s = 0.0
         self.lock = threading.Lock()
@@ -249,7 +385,7 @@ class EngineVision(Vision):
         self.cache_bytes = 0
         self.pinned: dict[str, int] = {}
 
-    def attach(self, engine) -> None:
+    def attach(self, engine: _ImageEncoder) -> None:
         self.engine = engine
 
     def alive(self) -> bool:                            # the engine's life is the engine's business
@@ -281,7 +417,10 @@ class EngineVision(Vision):
                 for (img, _), k in zip(jobs, todo):
                     img.write_bytes(datas[k])
                 if jobs:
-                    lines = self.engine.encode_images(jobs)
+                    engine = self.engine
+                    if engine is None:
+                        raise ValueError("the image encoder inside the engine is not attached")
+                    lines = engine.encode_images(jobs)
                     for k, (_, out), line in zip(todo, jobs, lines):
                         self._remember(k, out, int(line.split()[1]))
             finally:

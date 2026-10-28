@@ -18,6 +18,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from typing import NoReturn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable as a script
@@ -29,8 +30,8 @@ from serve.engine.errors import EngineStartError  # noqa: E402
 from serve.engine.flags import flag_index  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.engine.process import ProcessEngine  # noqa: E402
-from serve.engine.vision import (EngineVision, Vision, check_gpu, child_env, engine_args, gpu_plan,  # noqa: E402
-                                 gpu_text, gpus_in_play, vision_card, vision_env, vision_line)
+from serve.engine.vision import (EngineVision, ImageSources, Vision, check_gpu, child_env, engine_args,  # noqa: E402
+                                 gpu_plan, gpu_text, gpus_in_play, vision_card, vision_env, vision_line)
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.handler import Server, serve  # noqa: E402
 from serve.security import (LOOPBACK_NAMES, allowed_hosts_of, api_key_of, exposed_without_key,  # noqa: E402
@@ -41,9 +42,15 @@ from serve.util.console import LEGEND, tagged  # noqa: E402
 from serve.util.text import ByteTokenizer  # noqa: E402
 
 
-def fail(msg: str) -> None:
+def err(msg: str) -> None:
+    """One line on stderr through the tee, flushed (the stream may be a pipe's)."""
+    sys.stderr.write(msg + "\n")
+    sys.stderr.flush()
+
+
+def fail(msg: str) -> NoReturn:
     """Print a startup error and exit with status 2."""
-    print(f"[server] error: {msg}", file=sys.stderr)
+    err(f"[server] error: {msg}")
     raise SystemExit(2)
 
 
@@ -66,6 +73,20 @@ def grammar_entry(on: bool, cli: list[str], used: list[str]) -> tuple[bool, str]
     names = ("--grammar", "--no-grammar")
     origin = "cli" if any(w in names for w in cli) else "config" if any(w in names for w in used) else ""
     return (on, origin) if origin else None
+
+
+def image_sources(a) -> ImageSources:
+    """The image-source policy from --image-url-host and --image-dir; a bad directory is a start error."""
+    dirs = []
+    for d in a.image_dir:
+        try:
+            p = Path(d).expanduser().resolve(strict=True)
+        except OSError:
+            fail(f"--image-dir {d}: no such directory")
+        if not p.is_dir():
+            fail(f"--image-dir {d}: not a directory")
+        dirs.append(p)
+    return ImageSources(url_hosts=tuple(a.image_url_host), dirs=tuple(dirs))
 
 
 def main() -> int:
@@ -143,7 +164,8 @@ def main() -> int:
     if not a.mock_engine and not (tpath / "vocab.json").exists():
         fail(f"tokenizer missing: {tpath / 'vocab.json'}")
     if (tpath / "vocab.json").exists():
-        import tokenizer as ST
+        # tools/ is on sys.path (above), so this resolves at run time; pyright cannot see it
+        import tokenizer as ST  # pyright: ignore[reportMissingImports]
         vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
         tokens = [None] * len(vocab)
         for t, i in vocab.items():
@@ -151,6 +173,7 @@ def main() -> int:
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
         tok = ST.Tokenizer(tokens, merges, types)
+    has_grammar = False
     if not a.mock_engine:
         vision = None
         env = child_env(cfg)
@@ -163,20 +186,23 @@ def main() -> int:
             while (at := flag_index(cfg["args"], "--vision-mmproj")) is not None:
                 del cfg["args"][at:at + 2]
             del cfg["vision"]
+        sources = image_sources(a)
+        if (a.image_url_host or a.image_dir) and a.vision == "off":
+            fail("--image-url-host and --image-dir need --vision (image input is off)")
         if cfg.get("vision"):
             mode = cfg["vision"].get("mode")
             if mode == "dynamic":
-                vision = EngineVision(cfg["vision"])
+                vision = EngineVision(cfg["vision"], sources)
             else:
                 vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                                env=vision_env(env, mode))
+                                env=vision_env(env, mode), sources=sources)
         print(vision_line(cfg.get("vision"), cfg, vision.ready_s if vision else 0.0), flush=True)
         if lazy:
             print(tagged("model", "unloaded, the first request loads it"), flush=True)
         if cfg.get("log"):                              # follow the engine's log file
             threading.Thread(target=tail_file, args=(logs, cfg["log"], "eng"), daemon=True).start()
         else:
-            ProcessEngine.stderr_sink = lambda line: logs.add("eng", line)
+            ProcessEngine.stderr_sink = lambda line: logs.add("eng", line)  # type: ignore[assignment]
         known_flags = engine_flags_of(cfg["engine_bin"])
         has_grammar = known_flags is not None and "--grammar" in known_flags
         if a.grammar and not has_grammar:
@@ -185,9 +211,9 @@ def main() -> int:
         try:
             engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=lazy)
         except EngineStartError as e:
-            print(f"[server] error: {e}", file=sys.stderr, flush=True)
+            err(f"[server] error: {e}")
             if e.log:
-                print(f"[server] engine log: {e.log}", file=sys.stderr, flush=True)
+                err(f"[server] engine log: {e.log}")
             return 1
         if isinstance(vision, EngineVision):
             vision.attach(engine)
@@ -205,12 +231,12 @@ def main() -> int:
     if any(x == "--api-key" and i + 1 < len(used_argv) and not used_argv[i + 1].strip() or x.strip() == "--api-key="
            for i, x in enumerate(used_argv)):
         # an empty key would silently disable authentication
-        print("[server] error: --api-key is empty (give a key, or leave it out)", file=sys.stderr)
+        err("[server] error: --api-key is empty (give a key, or leave it out)")
         return 2
     try:
         svc.api_key = api_key_of(a.api_key)
     except ValueError as e:
-        print(f"[server] error: {e}: give a key, or leave --api-key out", file=sys.stderr)
+        err(f"[server] error: {e}: give a key, or leave --api-key out")
         return 2
     try:
         svc.cors_origins = origins_of(a.cors_origin, "--cors-origin", wildcard=True)
@@ -227,8 +253,9 @@ def main() -> int:
     svc.idle_unload_s = a.idle_unload or 0
     svc.min_free_vram_mib = a.min_free_vram_mib or 0
     svc.reasoning_budget_tokens = a.reasoning_budget_tokens or 0
-    svc.gpu_indices = gpus_in_play(cfg, engine_args(cfg) if not a.mock_engine else [])   # the cards /metrics reads
-    svc.gpu_index = svc.gpu_indices[0]
+    gpu_indices = gpus_in_play(cfg, engine_args(cfg) if not a.mock_engine else [])   # the cards /metrics reads
+    svc.gpu_indices = gpu_indices  # type: ignore[attr-defined]  (read by getattr in metrics)
+    svc.gpu_index = gpu_indices[0]  # type: ignore[attr-defined]
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
@@ -267,8 +294,9 @@ def main() -> int:
             try:
                 close()
             except KeyboardInterrupt:                   # second Ctrl+C: do not wait for the engine
-                if getattr(engine, "proc", None):
-                    engine.proc.kill()
+                proc = getattr(engine, "proc", None)
+                if proc:
+                    proc.kill()
         print("[server] stopped", flush=True)
     return 0
 

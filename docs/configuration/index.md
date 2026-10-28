@@ -208,6 +208,10 @@ plain decoding would give.
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
 | `vision` | server | `off`, `dynamic`, `cpu`, a GPU number | `off` | Image input; booleans are refused. A GPU number, as `gpu` numbers them: encoder sidecar always on that card (about 2.2 GiB of its expert cache), whatever the engine's cards are and no engine role needed. `dynamic`: inside the engine, borrowing expert-cache slots only while it reads an image. `cpu`: sidecar on the CPU, no VRAM, slow. Latencies: [running](../running.md#vision---vision). A GPU number needs the `basalt-vision` binary next to `bin/basalt`. Needs a model file with a vision projector. |
+| `image-url-host` | server | `HOST` or `HOST:PORT`, repeatable | none | Let a request name an `http(s)` image URL on this host. Off by default: the server then fetches no URL, so a remote client cannot make it reach the network. A host name must resolve to a public address (an IP literal is taken as written); redirects are refused. |
+| `image-dir` | server | directory, repeatable | none | Let a request name a local image file under this directory, as a path or a `file:` URL. Off by default: the server then reads no file a request names. |
+
+An inline `data:` URL is always accepted. Whatever its source, one image is capped at 32 MiB.
 
 Diagnostic flags: `bin/basalt --help`
 

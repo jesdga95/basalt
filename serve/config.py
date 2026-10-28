@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import urllib.parse
 from pathlib import Path
 
 from serve import ROOT
@@ -315,6 +316,18 @@ def vision_setting(text: str) -> str:
         raise argparse.ArgumentTypeError(str(e)) from None
 
 
+def image_host(text: str) -> str:
+    """argparse type: HOST or HOST:PORT an image URL may name."""
+    try:
+        parts = urllib.parse.urlsplit("//" + text.strip())
+        _ = parts.port                                        # a bad port raises here
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected HOST or HOST:PORT, not {text!r}") from None
+    if not parts.hostname or parts.path or parts.query or parts.fragment:
+        raise argparse.ArgumentTypeError(f"expected HOST or HOST:PORT, not {text!r}")
+    return text.strip()
+
+
 def parallel_count(text: str) -> int:
     """argparse type: a whole number of request slots, 1..PARALLEL_MAX."""
     try:
@@ -362,6 +375,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="image input: off (default), dynamic (inside the engine: it borrows expert-cache slots "
                          "on the main GPU while it reads an image, no standing VRAM), cpu (no VRAM, slow) or a "
                          "GPU number, as nvidia-smi numbers them: the encoder sidecar, always on that card")
+    ap.add_argument("--image-url-host", action="append", default=[], metavar="HOST[:PORT]", type=image_host,
+                    help="allow a request to name an http(s) image URL on this host (repeatable; default: image URLs "
+                         "are refused, so a remote client cannot make the server fetch one). A host name must resolve "
+                         "to a public address; an IP literal is taken as written. Redirects are refused")
+    ap.add_argument("--image-dir", action="append", default=[], metavar="DIR",
+                    help="allow a request to name a local image file under this directory, as a path or a file: URL "
+                         "(repeatable; default: local image files are refused)")
     ap.add_argument("--host", default="127.0.0.1",
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other "
                          "devices on your network (give --api-key)")

@@ -180,6 +180,12 @@ Image input is one server option, `--vision off | dynamic | cpu | <GPU number>` 
 `server` section). It is `off` by default. The encoder is Basalt's own and shares its kernels in every mode, so all
 of them give bitwise identical embeddings.
 
+A request names an image as an inline `data:` URL, and by default that is the only form accepted: `http(s)` URLs
+and local file paths are refused, so a client cannot make the server fetch a URL (an internal one, or a cloud
+metadata address) or read a file. `--image-url-host HOST[:PORT]` allows an image URL host (a host name must
+resolve to a public address; redirects are refused) and `--image-dir DIR` allows files under a directory. One
+image is capped at 32 MiB whatever its source.
+
 | mode | where the encoder runs | VRAM cost | fresh-image latency (IQ3_S, 400 W, earlier build) |
 | --- | --- | --- | --- |
 | `off` | no image input | none | |
