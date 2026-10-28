@@ -8092,35 +8092,6 @@ int main(int argc, char** argv) {
             stop_req.store(false);   // a STOP that arrived between requests is stale
             ram_stop.store(false);
             err.clear();
-            // RAM below the guard's floor (another program's peak): shed, then let it come back before the request
-            // starts; a STOP ends the wait, and the request then ends as cancelled
-            if (!batch_on() && basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Ok) {
-                shed_if_low();
-                uint64_t avail = 0, floor = 0;
-                (void) basalt::platform::ram_guard_level(&avail, &floor);
-                basalt::log::info("basalt serve", "RAM low (%llu MiB free < %llu MiB guard): the request waits up to "
-                                  "%llu s", (unsigned long long) (avail >> 20), (unsigned long long) (floor >> 20),
-                                  (unsigned long long) (basalt::platform::kRamAdmitWaitMs / 1000));
-                basalt::core::progress_at("RAM wait");
-                const auto w0 = Clock::now();
-                auto waited = [&] {
-                    return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - w0).count();
-                };
-                while (!stop_req.load() && !stdin_lost.load() &&
-                       basalt::platform::ram_admit_waits(basalt::platform::ram_guard_level(), waited())) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    basalt::core::progress_beat();
-                }
-                const basalt::platform::RamLevel level = basalt::platform::ram_guard_level(&avail, &floor);
-                if (level == basalt::platform::RamLevel::Ok)
-                    basalt::log::info("basalt serve", "RAM back after %.1f s (%llu MiB free): the request starts",
-                                      waited() / 1000.0, (unsigned long long) (avail >> 20));
-                else if (!stop_req.load() && !stdin_lost.load())
-                    basalt::log::warn("basalt serve", "RAM still low after %.1f s (%llu MiB free < %llu MiB guard): the "
-                                      "request starts", waited() / 1000.0, (unsigned long long) (avail >> 20),
-                                      (unsigned long long) (floor >> 20));
-                basalt::core::progress_at("request");
-            }
             if (mtp_on && !mtp.use_main(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }   // (batch windows swap the draft K/V)
             const bool geni = line.rfind("GENI ", 0) == 0;
             if (!geni && line.rfind("GEN ", 0) != 0) {
@@ -8515,6 +8486,39 @@ int main(int argc, char** argv) {
             const auto parked = conversations.best(ids32, req_imgs, want_cvec);
             std::optional<basalt::core::SavedConversation> incoming;
             if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
+            // RAM below the guard's floor (another program's peak): shed (after the conversation this request
+            // continues is taken out of the cache), then let it come back before the request starts; a STOP ends the
+            // wait, and the request then ends as cancelled.  A request that only continues the live conversation by a
+            // few tokens (the server's wrap-up after a thinking budget) is part of a reply already streaming: no wait.
+            if (!batch_on() && basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Ok) {
+                shed_if_low();
+                if (!basalt::platform::ram_continues_live(from_live && !incoming && slot_source < 0, n - resume)) {
+                    uint64_t avail = 0, floor = 0;
+                    (void) basalt::platform::ram_guard_level(&avail, &floor);
+                    basalt::log::info("basalt serve", "RAM low (%llu MiB free < %llu MiB guard): the request waits up "
+                                      "to %llu s", (unsigned long long) (avail >> 20), (unsigned long long) (floor >> 20),
+                                      (unsigned long long) (basalt::platform::kRamAdmitWaitMs / 1000));
+                    basalt::core::progress_at("RAM wait");
+                    const auto w0 = Clock::now();
+                    auto waited = [&] {
+                        return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - w0).count();
+                    };
+                    while (!stop_req.load() && !stdin_lost.load() &&
+                           basalt::platform::ram_admit_waits(basalt::platform::ram_guard_level(), waited())) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        basalt::core::progress_beat();
+                    }
+                    const basalt::platform::RamLevel level = basalt::platform::ram_guard_level(&avail, &floor);
+                    if (level == basalt::platform::RamLevel::Ok)
+                        basalt::log::info("basalt serve", "RAM back after %.1f s (%llu MiB free): the request starts",
+                                          waited() / 1000.0, (unsigned long long) (avail >> 20));
+                    else if (!stop_req.load() && !stdin_lost.load())
+                        basalt::log::warn("basalt serve", "RAM still low after %.1f s (%llu MiB free < %llu MiB guard): "
+                                          "the request starts", waited() / 1000.0, (unsigned long long) (avail >> 20),
+                                          (unsigned long long) (floor >> 20));
+                    basalt::core::progress_at("request");
+                }
+            }
             if (incoming) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.

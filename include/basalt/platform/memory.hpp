@@ -168,6 +168,15 @@ inline constexpr double kStallFullPct = 40.0;
 /// How long a request that arrives below the guard's floor waits for RAM to come back before it starts.
 inline constexpr uint64_t kRamAdmitWaitMs = 30000;
 
+/// Prompt tokens past the live conversation up to which a request only continues it (the server's wrap-up after a
+/// thinking budget) rather than starting a turn of its own.
+inline constexpr int64_t kRamContinueTokens = 256;
+/// Whether a request that reads `fresh` tokens past the live conversation (`from_live`: it continues that
+/// conversation) skips the admission wait: it adds little RAM and is part of a reply already streaming.
+inline bool ram_continues_live(bool from_live, int64_t fresh) {
+    return from_live && fresh >= 0 && fresh <= kRamContinueTokens;
+}
+
 /// The OS's memory-stall shares over the last ten seconds, in percent. `known` is false where the OS keeps none.
 struct MemoryStalls {
     bool known = false;

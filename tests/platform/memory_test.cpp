@@ -466,6 +466,18 @@ int admit_wait_cases() {
     check("low, the wait nearly over", ram_admit_waits(RamLevel::Low, kRamAdmitWaitMs - 1), true);
     check("low, the wait over", ram_admit_waits(RamLevel::Low, kRamAdmitWaitMs), false);
     check("critical, the wait over", ram_admit_waits(RamLevel::Critical, kRamAdmitWaitMs), false);
+    auto cont = [&](const char* what, bool got, bool want) {
+        std::printf("admit wait %-60s %s%s\n", what, got ? "continues, no wait" : "a turn, waits",
+                    got == want ? "" : "   <-- WRONG");
+        fail |= got != want;
+    };
+    cont("wrap-up after a thinking budget (19 tokens past live)", ram_continues_live(true, 19), true);
+    cont("nothing new past live", ram_continues_live(true, 0), true);
+    cont("at the continuation limit", ram_continues_live(true, kRamContinueTokens), true);
+    cont("one past the continuation limit", ram_continues_live(true, kRamContinueTokens + 1), false);
+    cont("a new turn on the live conversation", ram_continues_live(true, 4000), false);
+    cont("few tokens, but not from the live conversation", ram_continues_live(false, 19), false);
+    cont("a shorter prompt than live", ram_continues_live(true, -5), false);
     return fail;
 }
 // The pressure file's avg10 figures
