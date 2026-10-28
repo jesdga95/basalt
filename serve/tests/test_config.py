@@ -315,6 +315,13 @@ class SlotContext(unittest.TestCase):
         self.assertEqual(self.context(["--parallel", "4", "--max-context", "262144"],
                                       {"server": {"slot-full-context": True}}), 262144)
 
+    def test_answer_room_switch(self):
+        """On by default; off by --no-answer-room or the config's "answer-room": false (a switch on by default)."""
+        self.assertTrue(parse([])[0].answer_room)
+        self.assertFalse(parse(["--no-answer-room"])[0].answer_room)
+        self.assertFalse(parse([], {"server": {"answer-room": False}})[0].answer_room)
+        self.assertTrue(parse([], {"server": {"answer-room": True}})[0].answer_room)
+
 
 class EveryOption(unittest.TestCase):
     def sample(self, act):
@@ -337,7 +344,8 @@ class EveryOption(unittest.TestCase):
     def test_every_server_option_by_both_paths(self):
         ap = build_parser()
         for name, act in server_options(ap).items():
-            if name in ("api-key", "engine-bin", "grammar"):   # grammar is on by default: no-grammar differs, see test_grammar
+            # grammar and answer-room are on by default: their no- forms differ (test_grammar, test_answer_room_switch)
+            if name in ("api-key", "engine-bin", "grammar", "answer-room"):
                 continue
             v = "localhost" if name == "host" else self.sample(act)
             if isinstance(act, argparse._AppendAction):

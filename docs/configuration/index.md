@@ -104,7 +104,8 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | `debug` | switch | off | One log line per request and the raw model text after each reply. |
 | `request-lines` | switch | off | Echo the engine's per-request summary on stdout, for a supervisor that sees only that output. |
 | `temperature`, `top-p`, `top-k`, `min-p`, `presence-penalty`, `frequency-penalty`, `repetition-penalty`, `penalty-last-n`, `seed` | number (`top-k`, `penalty-last-n`, `seed`: integer) | the model file's `sampling` value, else the engine's | The sampling default for a request that leaves that field out, over the model file's. Same meaning and allowed values as the [model file's sampling keys](#the-model-files-sampling-defaults). The server applies them to each request; the engine never sees them. |
-| `reasoning-budget-tokens` | integer | `0` (none) | The thinking budget for a request that names none (see [Sampling](#sampling)). At the budget the thinking is closed and the answer starts. It only helps when it sits below the request's `max_tokens`: at or above it the request runs to `max_tokens` in thinking and answers nothing. A request's own field wins, and `0` there turns it off. |
+| `reasoning-budget-tokens` | integer | `0` (none) | The thinking budget for a request that names none (see [Sampling](#sampling)). At the budget the thinking is closed and the answer starts. A request's own field wins, and `0` there disables budgeting. Positive budgets are also limited by `answer-room`. |
+| `answer-room` | switch (`--no-answer-room` or `answer-room: false` turns it off) | on | Reserve wrap-up and answer space when the effective output cap is at least 1024 tokens. Applies to missing budgets and clamps positive budgets; an explicit request budget of `0` opts out. |
 | `tokenizer` | path | `pack/full/tokenizer` in the source tree (a byte tokenizer if absent) | Tokenizer directory. Mock engine only. |
 | `mock-engine`, `script` | switch, string (repeatable) | off, a short greeting | Testing: run a scripted engine instead of the model, for clients and tests (no `model` needed); `script` is its answer, and given more than once, requests get them in turn. |
 | `config` | path | none | The config file. Command line only. |
@@ -249,6 +250,12 @@ Other request fields the API reads: `max_tokens` / `max_completion_tokens` (the 
 and `reasoning_budget_tokens` (a cap on thinking tokens; `0` is none). Anthropic's `thinking.budget_tokens` and
 llama.cpp's `thinking_budget_tokens` are the same budget, and `reasoning_budget_tokens` wins when more than one is
 sent. A request that names none of them takes the server's [`reasoning-budget-tokens`](#server).
+
+With `answer-room` on and an effective output cap of at least 1024 tokens, thinking is limited to the cap minus
+`min(max(512, cap // 4), cap // 2)`. An 8192-token cap allows up to 6144 thinking tokens; the remaining 2048
+include the injected wrap-up and answer. Smaller positive budgets stay unchanged. Context fitting uses the reduced
+cap. Explicit request budgets of `0` disable both the server default and automatic budgeting; smaller output caps
+keep their existing behavior. Reserved space reduces empty answers but does not guarantee a complete answer.
 
 ### The model file's sampling defaults
 

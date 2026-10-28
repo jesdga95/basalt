@@ -34,6 +34,9 @@ VISION_START = "<|vision_start|>"
 REPEAT_STOP_TOKENS = 256
 # closes the thinking at reasoning_budget_tokens
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+# Reserve output tokens for the wrap-up and answer above this cap.
+ANSWER_ROOM_MIN_CAP = 1024
+ANSWER_RESERVE_MIN = 512
 # closes the thinking when the model ends its turn inside it
 REASONING_CLOSE = "\n</think>\n\n"
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often
@@ -106,6 +109,7 @@ class Service:
         self.before_load = None
         self.vram_reserve = None                         # last POST /v1/vram reserve (None: the start's)
         self.reasoning_budget_tokens = 0                 # default thinking budget (0: none)
+        self.answer_room = True                          # reserve output space when thinking
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # see REPEAT_STOP_TOKENS
         self.anthropic_think_unasked = True               # "anthropic_thinking": "on_request" -> False
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
@@ -114,7 +118,7 @@ class Service:
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
 
-    def reasoning_budget(self, req) -> int | None:
+    def reasoning_budget(self, req, *, use_default: bool = True) -> int | None:
         """The request's thinking budget in tokens, or None (0 or less: none); ValueError for a non-integer."""
         req = req if isinstance(req, dict) else {}
         value = req.get("reasoning_budget_tokens")
@@ -124,12 +128,33 @@ class Service:
             thinking = req.get("thinking")
             value = thinking.get("budget_tokens") if isinstance(thinking, dict) else None
         if value is None:
-            value = self.reasoning_budget_tokens
+            value = self.reasoning_budget_tokens if use_default else None
+        if value is None:
+            return None
         if isinstance(value, float) and value.is_integer():
             value = int(value)
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"reasoning_budget_tokens: expected a whole number (0 = none), not {value!r}")
         return value if value > 0 else None
+
+    def answer_budget(self, req, max_new: int, budget: int | None) -> int | None:
+        """Limit thinking to leave answer space; an explicit non-positive request budget opts out."""
+        if not self.answer_room or max_new < ANSWER_ROOM_MIN_CAP:
+            return budget
+        request_budget = self.reasoning_budget(req, use_default=False)
+        # None also means an absent field: distinguish it from an explicit opt-out.
+        req = req if isinstance(req, dict) else {}
+        thinking = req.get("thinking")
+        explicit = any(req.get(k) is not None for k in ("reasoning_budget_tokens", "thinking_budget_tokens")) \
+            or isinstance(thinking, dict) and thinking.get("budget_tokens") is not None
+        if explicit and request_budget is None:
+            return budget
+        room = max_new - min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
+        if budget is None or budget > room:
+            print(f"[server] thinking budget {room} tokens, output cap {max_new} (--no-answer-room disables)",
+                  flush=True)
+            return room
+        return budget
 
     def _vision_down(self) -> bool:
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
@@ -692,7 +717,9 @@ class Service:
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """Yield ("event", Event) as text arrives, ("ping", None) as heartbeat, then ("done", {...}).
         `force`: the opening of the call the reply must make (see prepare)."""
-        budget = self.reasoning_budget(sampling) if thinking else None   # opt-in
+        budget = self.reasoning_budget(sampling) if thinking else None
+        budget_req = sampling
+        budget_ready = False
         if self.sampling_defaults:     # the request's own fields win
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**self.sampling_defaults, **req_values}
@@ -808,6 +835,12 @@ class Service:
                             # a held-back tool argument can leave the stream silent for long: ping after a quiet spell
                             last_out = time.monotonic()
                             for t in gen:
+                                # The engine settles a text prompt's output cap before its first token.
+                                if isinstance(ids, PromptText) and ids.max_new:
+                                    max_new = ids.max_new
+                                if thinking and not budget_ready and (not isinstance(ids, PromptText) or ids.n is not None):
+                                    budget = self.answer_budget(budget_req, max_new, budget)
+                                    budget_ready = True
                                 if t is None:               # heartbeat
                                     if isinstance(ids, PromptText) and ids.n is not None and st.get("prompt_tokens") != ids.n:
                                         with self.status_lock:  # the engine has counted the prompt
