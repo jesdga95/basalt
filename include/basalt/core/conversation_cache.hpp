@@ -353,6 +353,16 @@ public:
     }
     size_t superseded() const { return superseded_; }
 
+    // Drop every parked conversation and the retained K/V buffers, to give their RAM back; returns the bytes freed.
+    size_t clear() {
+        const size_t freed = bytes();
+        entries_.clear();
+        bytes_ = 0;
+        reuse_ = {};
+        reuse_owner_ = nullptr;
+        return freed;
+    }
+
     bool put(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first

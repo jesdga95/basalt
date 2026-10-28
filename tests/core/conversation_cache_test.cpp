@@ -82,6 +82,17 @@ int main() {
         check(cache.retained_bytes() == 0 && cache.size() == 1 && cache.evictions() == 0,
               "pressure drops retained storage before evicting parked conversations");
     }
+    {   // clear gives back everything the cache holds
+        auto one_layer = [] { ConversationKv layer; layer.k.resize(64); std::vector<ConversationKv> v; v.push_back(std::move(layer)); return v; };
+        ConversationCache cache(1 << 20, 4);
+        check(cache.put(image({1, 2, 3})) && cache.put(image({9, 8, 7})), "park two");
+        cache.retain(one_layer(), 16);
+        const size_t held = cache.bytes();
+        check(cache.clear() == held, "clear reports the bytes it held");
+        check(cache.size() == 0 && cache.bytes() == 0 && cache.retained_bytes() == 0, "clear leaves nothing parked or retained");
+        check(cache.best(std::vector<int64_t>{1, 2, 3, 4}, {}, true).tokens == 0, "a cleared conversation no longer matches");
+        check(cache.put(image({1, 2, 3})) && cache.size() == 1, "the cache parks again after a clear");
+    }
     {   // retained K/V belongs to the session it was restored into
         int s0 = 0, s1 = 0;
         auto one_layer = [] { ConversationKv layer; layer.k.resize(64); std::vector<ConversationKv> v; v.push_back(std::move(layer)); return v; };
