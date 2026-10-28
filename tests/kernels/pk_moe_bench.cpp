@@ -4,7 +4,10 @@
 // Synthetic weights in the model's formats (random bytes are valid codes; only the fp16 block scales are set); all
 // routed experts are VRAM-resident.
 //
-//     build/pk_moe_bench [--gu 18] [--dt 20] [--layers 6] [--tlo 1] [--thi 4] [--reps 40] [--corr 0.7] [--nowait]
+//     build/pk_moe_bench [--gu 18] [--dt 20] [--layers 6] [--tlo 1] [--thi 4] [--reps 40] [--corr 0.7] [--nowait] [--glue]
+//
+// --glue: dec_moe_glue alone (gate/up, SwiGLU, down) over the layers: time per layer, GB/s of the routed experts' bytes,
+// and a hash of every layer's expert rows (compare it across builds for a bitwise check).
 //
 // Per layer, reference: hc_fused_read (router, q8_1 rows) -> dec_moe_glue (gate/up, SwiGLU, down) with the shared
 // expert on a side stream -> dec_moe_wait -> dec_moe_combine.  pk: hc_fused_read -> pk_moe_experts with the shared
@@ -106,6 +109,7 @@ int main(int argc, char** argv) {
     int only = -1;
     bool trace = false;
     bool hot = false;
+    bool glue = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto num = [&](int& v) { if (i + 1 < argc) v = std::atoi(argv[++i]); };
@@ -121,6 +125,7 @@ int main(int argc, char** argv) {
         else if (a == "--only") num(only);
         else if (a == "--trace") trace = true;
         else if (a == "--hot") hot = true;   // experts alias a few blobs: weights stay in L2 (compute-only timing)
+        else if (a == "--glue") glue = true;
         else if (a == "--exp" && i + 1 < argc) {
             const std::string kv = argv[++i];
             const size_t eq = kv.find('=');
@@ -276,6 +281,72 @@ int main(int argc, char** argv) {
         K::PdlScope ps(true);
         K::pk_moe_experts(L, a, scratch, cs);
     };
+
+    if (glue) {   // each layer's router ids and q8_1 rows from its hc read, then graphs of dec_moe_glue alone
+        const size_t xqb = (size_t) TM * (N / 32) * 36;
+        std::vector<int32_t*> ids_l(NL);
+        std::vector<void*> xq_l(NL);
+        std::vector<K::DmPlan*> plan_l(NL);
+        for (int l = 0; l < NL; ++l) {
+            ids_l[l] = dalloc<int32_t>((size_t) TM * KT);
+            xq_l[l] = dalloc<uint8_t>(xqb);
+            plan_l[l] = dalloc<K::DmPlan>(1);
+        }
+        std::vector<float> hpart((size_t) cap * N);
+        std::printf("pk_moe_bench --glue: gate/up %d down %d, %d layers, expert blob %.2f MB (down %.2f MB)\n", gu, dt, NL,
+                    L.bytes / 1e6, (L.bytes - L.down_off) / 1e6);
+        for (int T = tlo; T <= thi; ++T) {
+            double distinct = 0;
+            for (int l = 0; l < NL; ++l) {
+                hc(l, T, true);
+                ck(cudaMemcpyAsync(ids_l[l], ids, (size_t) TM * KT * 4, cudaMemcpyDeviceToDevice, cs), "ids");
+                ck(cudaMemcpyAsync(xq_l[l], xq, xqb, cudaMemcpyDeviceToDevice, cs), "xq");
+                ck(cudaStreamSynchronize(cs), "sync");
+                std::vector<int32_t> hid((size_t) T * KT);
+                ck(cudaMemcpy(hid.data(), ids, hid.size() * 4, cudaMemcpyDeviceToHost), "ids");
+                distinct += std::set<int32_t>(hid.begin(), hid.end()).size();
+            }
+            auto g1 = [&](int l) {
+                K::PdlScope ps(true);
+                K::DmGlueArgs ga;
+                ga.ids = ids_l[l]; ga.ptab = lay[l].ptab; ga.n_tok = T; ga.k = KT; ga.n_expert = NE; ga.plan = plan_l[l];
+                ga.xq = xq_l[l];
+                K::dec_moe_glue(L, ga, scratch, parts, T * KT, cs);
+            };
+            unsigned long long h = 1469598103934665603ull;   // FNV-1a over every layer's T * KT rows
+            for (int l = 0; l < NL; ++l) {
+                ck(cudaMemsetAsync(parts, 0, (size_t) cap * N * 4, cs), "memset");
+                g1(l);
+                ck(cudaStreamSynchronize(cs), "sync");
+                ck(cudaMemcpy(hpart.data(), parts, (size_t) T * KT * N * 4, cudaMemcpyDeviceToHost), "copy");
+                const auto* b = (const unsigned char*) hpart.data();
+                for (size_t i = 0; i < (size_t) T * KT * N * 4; ++i) h = (h ^ b[i]) * 1099511628211ull;
+            }
+            cudaGraph_t gg;
+            cudaGraphExec_t ge;
+            ck(cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal), "capture");
+            for (int l = 0; l < NL; ++l) g1(l);
+            ck(cudaStreamEndCapture(cs, &gg), "capture");
+            ck(cudaGraphInstantiate(&ge, gg, 0), "instantiate");
+            std::vector<float> tt;
+            for (int i = 0; i < 8 + reps; ++i) {
+                ck(cudaEventRecord(e0, cs), "record");
+                ck(cudaGraphLaunch(ge, cs), "launch");
+                ck(cudaEventRecord(e1, cs), "record");
+                ck(cudaEventSynchronize(e1), "bench");
+                float ms = 0;
+                ck(cudaEventElapsedTime(&ms, e0, e1), "elapsed");
+                if (i >= 8) tt.push_back(1e3f * ms / NL);
+            }
+            const float us = median(tt);
+            const double mb = distinct / NL * L.bytes / 1e6;
+            std::printf("glue T %d: %.1f distinct experts/layer (%.1f MB), %.2f us/layer = %.0f GB/s, hash %016llx\n", T,
+                        distinct / NL, mb, us, mb * 1e3 / us, h);
+            cudaGraphExecDestroy(ge);
+            cudaGraphDestroy(gg);
+        }
+        return 0;
+    }
 
     int fails = 0;
     std::vector<float> hr((size_t) TM * N), hp((size_t) TM * N);
