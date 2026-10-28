@@ -161,10 +161,10 @@ enum class RamLevel { Ok, Low, Critical };
 /// allocates (its own buffers, a checkpoint) plus room for the OS to compress or drop other programs' idle pages.
 inline constexpr uint64_t kRamHardFloor = 1ull << 30;
 /// The shares of time (percent, averaged over ten seconds) in which some task, or every task, waited on memory, above
-/// which RAM below the guard's floor is critical: the OS then reclaims by stalling programs, not by compressing
-/// idle pages.
-inline constexpr double kStallSomePct = 40.0;
-inline constexpr double kStallFullPct = 10.0;
+/// which RAM below the guard's floor is critical: tasks then wait on memory most of the time (thrashing). One program
+/// reclaiming into compressed swap stays below them, even when it is the only task running and so stalls `full` too.
+inline constexpr double kStallSomePct = 60.0;
+inline constexpr double kStallFullPct = 40.0;
 /// How long a request that arrives below the guard's floor waits for RAM to come back before it starts.
 inline constexpr uint64_t kRamAdmitWaitMs = 30000;
 

@@ -490,11 +490,11 @@ int stop_message_cases() {
     using namespace basalt::platform;
     int fail = 0;
     const uint64_t floor = 3161ull << 20, hard = kRamHardFloor;
-    const MemoryStalls calm{true, 1.0, 0.0}, stalled{true, 55.0, 12.0}, none{};
+    const MemoryStalls calm{true, 1.0, 0.0}, stalled{true, 75.0, 45.0}, none{};
     struct Case { const char* what; double avail; MemoryStalls st; double others, own; const char* has; bool budget; };
     const Case cases[] = {
         {"under the hard floor, other programs", 900.0 / 1024, calm, 2.0, 0.1, "900 MiB free < 1024 MiB hard floor", false},
-        {"stalls, other programs", 2.5, stalled, 3.0, 0.5, "and the system stalls on memory (some 55%, full 12%)", false},
+        {"stalls, other programs", 2.5, stalled, 3.0, 0.5, "and the system stalls on memory (some 75%, full 45%)", false},
         {"no stall reading, the engine grew", 3139.0 / 1024, none, 0.5, 1.5, "RAM low (3139 MiB free < 3161 MiB guard)", true},
         {"other programs' share named", 0.9, calm, 2.0, 0.1, "other programs took 2048 MiB", false},
         {"nothing measured", 0.9, calm, 0.0, 0.0, "request stopped", false},
