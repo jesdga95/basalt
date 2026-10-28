@@ -125,8 +125,12 @@
 namespace {
 
 // Below this much free VRAM a later allocation (a first-used window's buffers, the desktop, another program) can make
-// the driver page GPU memory, and a verify graph spinning on a host flag then never finishes.
+// a driver that pages GPU memory do so, and a verify graph spinning on a host flag then never finishes.  A driver that
+// fails such an allocation instead needs room only for what is allocated after loading (lazily loaded kernels, graphs,
+// a streaming state's residency map).
 constexpr int kVramStallMib = 256;
+constexpr int kVramFloorMib = 128;
+int vram_floor_mib() { return basalt::platform::gpu_memory_pages() ? kVramStallMib : kVramFloorMib; }
 // A round that found at least kSatRatio times --adapt-swaps misses to swap (the pipeline is saturated) lets the next
 // round swap kSatBoost times --adapt-swaps into the main card; the free RAM places are sized for it.  Fewer misses than
 // that are not worth the extra copies.
@@ -1608,9 +1612,9 @@ int main(int argc, char** argv) {
         basalt::log::error("basalt generate", "--prefill-cpu-share must be a number from 0 to 1");
         return 2;
     }
-    if (o.vram_reserve_given && o.vram_reserve_mib < kVramStallMib) {
-        basalt::log::error("basalt", "--vram-reserve-mib %d leaves less VRAM free than the engine needs to keep "
-                             "requests from stalling; the smallest safe value is %d", o.vram_reserve_mib, kVramStallMib);
+    if (o.vram_reserve_given && o.vram_reserve_mib < vram_floor_mib()) {
+        basalt::log::error("basalt", "--vram-reserve-mib %d leaves less VRAM free than the engine needs once "
+                             "everything is loaded; the smallest safe value is %d", o.vram_reserve_mib, vram_floor_mib());
         return 2;
     }
     if (o.expert_cache_remote_placement != "stripe" && o.expert_cache_remote_placement != "layer") {
@@ -6466,7 +6470,7 @@ int main(int argc, char** argv) {
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
             const int64_t free_mib = (int64_t) (free_b >> 20);
-            if (free_mib >= kVramStallMib) {
+            if (free_mib >= vram_floor_mib()) {
                 basalt::log::info("basalt serve", "%lld MiB of VRAM free with everything loaded", (long long) free_mib);
             } else {
                 basalt::log::warn("basalt", "only %lld MiB of VRAM free, requests may stall; close other "
@@ -6734,9 +6738,9 @@ int main(int argc, char** argv) {
             const bool bare = cmd.find_first_not_of(' ', 4) == std::string::npos;
             const long long reserve = bare ? (long long) o.vram_reserve_mib : std::strtoll(cmd.c_str() + 4, &end, 10);
             if (!bare && (end == cmd.c_str() + 4 || reserve < 0)) { e = "expected: VRAM [reserve_mib]"; return false; }
-            if (reserve < kVramStallMib) {
-                e = "VRAM: a reserve below " + std::to_string(kVramStallMib) + " MiB lets requests stall; the smallest "
-                    "safe value is " + std::to_string(kVramStallMib);
+            if (reserve < vram_floor_mib()) {
+                e = "VRAM: a reserve below " + std::to_string(vram_floor_mib()) + " MiB is too small for what is allocated "
+                    "after loading; the smallest safe value is " + std::to_string(vram_floor_mib());
                 return false;
             }
             if (!o.vram_elastic || !xcache.segmented()) {

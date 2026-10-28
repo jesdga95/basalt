@@ -86,6 +86,8 @@ void prefer_oom_victim() {}
 
 bool gpu_peer_access() { return false; }
 
+bool gpu_memory_pages() { return true; }
+
 bool stderr_is_terminal() {
     if (!_isatty(_fileno(stderr))) return false;
     const HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
@@ -137,6 +139,9 @@ void prefer_oom_victim() {
 }
 
 bool gpu_peer_access() { return true; }
+
+// WSL2 reaches the GPU through the Windows driver, which pages
+bool gpu_memory_pages() { return host_os_name() == "WSL2"; }
 
 bool stderr_is_terminal() { return isatty(STDERR_FILENO) != 0; }
 
