@@ -4962,7 +4962,8 @@ int main(int argc, char** argv) {
         constexpr int64_t kLendCapDecoding = 1216;
         constexpr int kRingDecoding = 64;
         // A read of at most this many tokens runs alone even while slots decode: they wait for it (a few seconds at
-        // most) and it lends and reads as on an idle engine.  A longer read goes beside them, within the limits above.
+        // most) and it lends and reads as on an idle engine.  A longer read goes beside them, within the limits above,
+        // and so does the rest of one that gave way to a shorter request (in its chunk).
         constexpr int64_t kReadAlone = 16384;
         // a cache too small to lend the prompt path its buffers would make it allocate them on top - on a card
         // whose cache already filled its reserve, that is the over-subscription the auto sizing avoids - so the
@@ -7081,8 +7082,10 @@ int main(int argc, char** argv) {
             // tokens only up to there - the slot's K/V up to it plus this state continue from it
             std::vector<ConvCheckpoint> checks;
             // a prompt read that gave way to a waiting request (BYIELD): `ids` is the part read so far, and the same
-            // request continues from it (the read goes on with the same chunks; `from0`: it had started at token 0)
+            // request continues from it (the read goes on with the same chunks; `from0`: it had started at token 0;
+            // `chunk`: the chunk of a read beside decoding slots, whose rest is read beside them in it, else 0)
             bool partial = false, partial_from0 = false;
+            int64_t partial_chunk = 0;
             // BSCRIPT (a test drive of the multi-token segments): the tokens this slot's request is known to produce
             // (script[0] is its first token); the windows draft from it, some drafts wrong, and keep what matches
             std::vector<int32_t> script;
@@ -8423,6 +8426,8 @@ int main(int argc, char** argv) {
                 std::vector<ConvCheckpoint> checks;
             } solo_book;
             bool solo_moved = false;   // the solo session gave its cells to this request (hold_slot): it holds nothing after
+            bool own_partial = false, own_partial_from0 = false;   // the slot holds a read that gave way (BYIELD)
+            int64_t own_partial_chunk = 0;
             if (in_slot) {
                 solo_book = {std::move(live), std::move(live_imgs), live_ok, cvec_cached, std::move(checks)};
                 BSlot& sb = bs[(size_t) slot_b];
@@ -8440,6 +8445,9 @@ int main(int argc, char** argv) {
                         err.clear();
                         live_ok = false;
                     }
+                    own_partial = sb.partial;
+                    own_partial_from0 = sb.partial_from0;
+                    own_partial_chunk = sb.partial_chunk;
                 }
                 sb.cached = false;
                 sb.partial = false;
@@ -8483,6 +8491,7 @@ int main(int argc, char** argv) {
             int slot_source = -1;
             int64_t slot_tokens = 0;
             bool resumed_from0 = false;   // a prompt read parked in a slot (BYIELD) that had started at token 0
+            int64_t resumed_chunk = 0;    // its chunk, if it was read beside decoding slots: its first part's plan
             const ConvCheckpoint* slot_ck = nullptr;   // the slot's checkpoint the prompt continues from (else its end)
             // the slot this request reads into: its own conversation is `live` already
             const int own_slot = in_slot ? slot_b : slot0_is_solo ? 0 : -1;
@@ -8517,6 +8526,11 @@ int main(int argc, char** argv) {
             std::optional<basalt::core::SavedConversation> incoming;
             if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
             if (incoming) slot_source = -1;
+            // a read that gave way in this slot, the same request again: on with it as if it had not stopped
+            if (own_partial && from_live && !incoming && slot_source < 0) {
+                resumed_from0 = own_partial_from0;
+                resumed_chunk = own_partial_chunk;
+            }
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
             if (incoming && incoming->stage_images.size() != stages.size()) {
@@ -8642,6 +8656,7 @@ int main(int argc, char** argv) {
                     // checkpoints as if it had not stopped
                     if (slot_ck == nullptr && bs[(size_t) slot_source].partial && admit_slot == slot_source) {
                         resumed_from0 = bs[(size_t) slot_source].partial_from0;
+                        resumed_chunk = bs[(size_t) slot_source].partial_chunk;
                         for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks) checks.push_back(c);
                         bs[(size_t) slot_source].partial = false;
                     }
@@ -8901,7 +8916,7 @@ int main(int argc, char** argv) {
                 const auto t_ln = Clock::now();
                 // the ring depth this read's layout uses; every size computed below (and the layout) follows it, and
                 // the full depth is restored on the way out for the sizing done elsewhere
-                const bool beside = batch_on() && tokens > kReadAlone;
+                const bool beside = batch_on() && (tokens > kReadAlone || resumed_chunk > 0);
                 basalt::prefill::Prefill::set_ring_depth(beside ? kRingDecoding : 1 << 20);
                 struct RingReset { ~RingReset() { basalt::prefill::Prefill::set_ring_depth(1 << 20); } } ring_reset;
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
@@ -8933,9 +8948,11 @@ int main(int argc, char** argv) {
                 }
                 auto [want_full, head_tok] = serve_loans::one_card_chunks(tokens, cap, !beside && stages.empty(),
                                                                        o.prefill_auto_fit);
-                if (chunk > 0) {
-                    want_full = chunk;
-                    head_tok = head;
+                // a chunk the read must have: a split read's, or the one the read this continues had (if it fits)
+                const int64_t fixed_chunk = chunk > 0 ? chunk : (resumed_chunk > 0 && resumed_chunk <= cap) ? resumed_chunk : 0;
+                if (fixed_chunk > 0) {
+                    want_full = fixed_chunk;
+                    head_tok = chunk > 0 ? head : 0;
                 }
                 sp.set_head_chunk(head_tok);
                 const int64_t want = want_full;
@@ -8950,8 +8967,8 @@ int main(int argc, char** argv) {
                     const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
                     if (!p.lent.empty()) {
                         if (want <= p.lent_chunk && p.sp->ring_depth() == ring_now && !ov_copied &&
-                            (chunk <= 0 || want == p.sp->chunk()))
-                            continue;   // its loan covers this (a split read's chunk must be the layout's)
+                            (fixed_chunk <= 0 || want == p.sp->chunk()))
+                            continue;   // its loan covers this (a fixed chunk must be the layout's)
                         // the slots the new loan takes again are not refilled first (their experts would be
                         // overwritten by the new layout): only their table entries go back, and the loop below
                         // lends them again; the new loan's refill brings their experts back after the prompt
@@ -9009,15 +9026,18 @@ int main(int argc, char** argv) {
             // the request ends with `YIELDED <slot> <tokens>` + DONE cancel, and the server sends it again later: it
             // continues from the slot with the same chunks.  Cooperative preemption, with a slot as the park.
             // BYIELD: a read gives way at a chunk boundary after `q` tokens, into slot `ys`, when the rest is read the same
-            // way afterwards (more than a chunk and a short read left), text only, and the slot is not decoding
-            auto can_yield = [&](int64_t q, int64_t b0, int ys) -> bool {
+            // way afterwards (more than a chunk and a short read left; beside decoding slots, `beside`, more than a short
+            // read: the rest is read beside them in the same chunk), text only, and the slot is not decoding
+            auto can_yield = [&](int64_t q, int64_t b0, int ys, bool beside = false) -> bool {
                 return ys >= 0 && ys < (int) bs.size() && !bs[(size_t) ys].active &&
                        n + (admit_slot >= 0 ? admit_max_new : (long long) max_new) + 8 <= slot_cap[(size_t) ys] &&
                        (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
-                       (!in_slot || ys == slot_b) && b0 - q > std::max<int64_t>(std::max<int64_t>(sp.chunk(), 1), o.short_read);
+                       (!in_slot || ys == slot_b) &&
+                       b0 - q > (beside ? o.short_read : std::max<int64_t>(std::max<int64_t>(sp.chunk(), 1), o.short_read));
             };
             // the first `q` tokens of this read go to slot `ys`, which holds them until the request is sent again
-            auto park_read = [&](int64_t q, int ys, std::string& ye) -> bool {
+            // (`chunk`: the chunk of a read beside decoding slots, 0 for any other)
+            auto park_read = [&](int64_t q, int ys, std::string& ye, int64_t chunk = 0) -> bool {
                 std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
                 if (!copy_to_slot(ys, pre, ye)) {
                     bs[(size_t) ys].cached = false;   // half written
@@ -9035,6 +9055,7 @@ int main(int argc, char** argv) {
                 sl.cached = true;
                 sl.partial = true;
                 sl.partial_from0 = read_from == 0 || resumed_from0;
+                sl.partial_chunk = chunk;
                 sl.cvec = cvec_cached;
                 for (const ConvCheckpoint& c : checks)   // the root / periodic checkpoints of this read
                     if ((int64_t) c.ids.size() <= q &&
@@ -9503,7 +9524,7 @@ int main(int argc, char** argv) {
             };
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
                 // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
-                if (o.batch <= 0 || piped || (!stages.empty() && !batch_on()) || b0 - a0 <= kReadAlone) {
+                if (o.batch <= 0 || piped || (!stages.empty() && !batch_on()) || (b0 - a0 <= kReadAlone && resumed_chunk <= 0)) {
                     // no window runs meanwhile, so the CPU pool is free: it takes its share of the streamed experts
                     const bool lend_pool = o.batch > 0 && !multi_gpu && !o.no_pool;
                     if (lend_pool) { sp.set_cpu_pool(&pool); sp.set_cpu_share(o.prefill_cpu_share); }
@@ -9541,7 +9562,7 @@ int main(int argc, char** argv) {
                             // slot can take what was read, or goes on
                             const int ys = yield_req;
                             yield_req = -1;
-                            if (can_yield(p0 + T, b0, ys)) {
+                            if (can_yield(p0 + T, b0, ys, true)) {
                                 yield_q = p0 + T;
                                 yield_slot = ys;
                                 abort_read.store(true);
@@ -9629,7 +9650,7 @@ int main(int argc, char** argv) {
                             rsp->ple_prev[0] = (int32_t) ids[(size_t) yield_q - 2];
                             rsp->ple_prev[1] = (int32_t) ids[(size_t) yield_q - 1];
                         }
-                        if (!park_read(yield_q, yield_slot, ye)) {
+                        if (!park_read(yield_q, yield_slot, ye, sp.chunk())) {
                             e = "BYIELD: parking the prompt read failed: " + ye;
                             return false;
                         }
@@ -9774,8 +9795,8 @@ int main(int argc, char** argv) {
             // A short read into a slot beside decoding slots is not split: each part pays the lend, refill and
             // side-thread costs again, and a checkpoint stalls the windows.  One that runs alone stops at its root,
             // and at its turn boundary only past --prompt-cache-root tokens since the root: a short history is
-            // cheaper to read again than the extra part costs.
-            if (in_slot && batch_on() && n - 1 - read_from <= std::max<int64_t>(sp.chunk(), 1)) {
+            // cheaper to read again than the extra part costs.  The rest of a read that gave way keeps its parts.
+            if (in_slot && batch_on() && resumed_chunk <= 0 && n - 1 - read_from <= std::max<int64_t>(sp.chunk(), 1)) {
                 if (n - 1 - read_from > kReadAlone) {
                     turn_at = -1;
                     root_at = -1;
@@ -9808,7 +9829,7 @@ int main(int argc, char** argv) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
-                const SplitPlan split = win ? SplitPlan{} : split_plan(at, to);
+                const SplitPlan split = win || resumed_chunk > 0 ? SplitPlan{} : split_plan(at, to);
                 const int64_t split_c = split.chunk;
                 if (!win && !lend(to - at, err, split_c, split.head)) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
@@ -9864,6 +9885,7 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
+                resumed_chunk = 0;   // the later parts are planned as the read they continue planned them
                 ov_post = nullptr;
                 if ((to == turn_at || to == root_at) && !ov_post_done && !checkpoint_at(to, nullptr, !in_slot && !batch_on())) {
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
