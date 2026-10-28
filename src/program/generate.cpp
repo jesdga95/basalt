@@ -8508,6 +8508,20 @@ int main(int argc, char** argv) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(100));
                         basalt::core::progress_beat();
                     }
+                    // a STOP during the wait ends the request here, before anything moves for it: the conversation it
+                    // would continue goes back to the cache, the live one stays as it is (a batch slot's request ends
+                    // in its prompt read, which hands the slot back)
+                    if ((stop_req.load() || stdin_lost.load()) && !in_slot && admit_slot < 0) {
+                        if (incoming) (void) conversations.put(std::move(*incoming));
+                        basalt::log::info("basalt serve", "RAM wait: the request was stopped after %.1f s",
+                                          waited() / 1000.0);
+                        basalt::log::info("basalt serve", "prompt %lld tokens = 0 reused + 0 of %lld read in 0 ms "
+                                          "(0.0 tok/s), 0 generated in 0 ms (0.0 tok/s), drafts accepted 0 of 0, %zu "
+                                          "checkpoints (cancelled)", (long long) n, (long long) n, checks.size());
+                        std::printf("DONE 0 %lld 0.0 0.0 cancel 0 0 0 0 0 0 0 0.0 0 0\n", (long long) n);
+                        std::fflush(stdout);
+                        continue;
+                    }
                     const basalt::platform::RamLevel level = basalt::platform::ram_guard_level(&avail, &floor);
                     if (level == basalt::platform::RamLevel::Ok)
                         basalt::log::info("basalt serve", "RAM back after %.1f s (%llu MiB free): the request starts",
