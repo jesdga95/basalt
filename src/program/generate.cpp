@@ -9974,6 +9974,7 @@ int main(int argc, char** argv) {
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
             int64_t dec_windows = 0, dec_T = 0;
             const int64_t decode_hits0 = drive.d.cache_hits;
+            const int64_t swapped0 = xq_swapped, noplace0 = xq_noplace;
             // CS-T: the RAM and file tiers of this request (the mmap source; 0 with the arena)
             const int64_t ram0 = src.ram_reads(), files0 = src.file_reads();
             const uint64_t file_bytes0 = src.file_read_bytes();
@@ -10694,6 +10695,12 @@ int main(int argc, char** argv) {
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look, off);
             }
+            // the adaptive swaps this request queued: the resident RAM line's exchanges count only swaps through the
+            // exchange buffers, not those whose evicted expert takes a free place in the RAM copy
+            if (adapt_fast && !drive.d.usage.empty())
+                basalt::log::info("basalt serve", "adaptive swaps: %lld into the VRAM tier this request, %lld deferred "
+                                     "(no free RAM place)", (long long) (xq_swapped - swapped0),
+                             (long long) (xq_noplace - noplace0));
             // the resident RAM mode, cumulative: experts read from the experts section since the copy was made (what the plain
             // mmap mode reads through the OS file cache, from the SSD when the RAM could not keep it)
             if (src.complement_ready())
