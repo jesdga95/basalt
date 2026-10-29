@@ -769,7 +769,7 @@ bool checkpoint_restore(const ConvCheckpoint& c, basalt::core::SessionState& ss,
     return false;
 }
 
-/// The identity parked conversations on disk are written under (conversation_store.hpp): the engine, the model file
+/// The identity parked conversations on disk are written under (conversation_store.hpp): the model file
 /// (its size and samples of its bytes) and the settings that change a state's bytes - the K/V type, the rope, the draft
 /// layer, the image encoder, control vectors.  A file of another identity is never restored.
 uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeometry& g) {
@@ -778,7 +778,7 @@ uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeomet
     std::snprintf(num, sizeof num, " rope %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g cvec %d %d %d %d", o.rope_scale,
                   o.rope_freq_base, o.rope_freq_scale, o.yarn_orig_ctx, o.yarn_ext_factor, o.yarn_attn_factor,
                   o.yarn_beta_fast, o.yarn_beta_slow, o.cvec_first, o.cvec_last, o.cvec_mode, o.cvec_single);
-    std::string text = std::string("basalt conversation state, engine ") + BASALT_VERSION + " kv " + o.kv + " rope " +
+    std::string text = std::string("basalt conversation state kv ") + o.kv + " rope " +
                        o.rope_scaling + num + " mtp " + o.mtp + " mmproj " + o.vision_mmproj;
     for (const auto& [path, scale] : o.cvec_files) text += " cvec " + path + " " + std::to_string(scale);
     uint64_t h = conversation_store_hash(text.data(), text.size(), 1);

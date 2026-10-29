@@ -169,7 +169,7 @@ turn goes on from there, and a reply sent back as it was is read again. A later 
 tokens, or one of its checkpoints) reads it back cut at that point and goes on from there, after a restart too: the
 wait is the drive reading the K/V cache instead of the prompt being read again. The writes run on a background thread
 with direct I/O; a request that parks a conversation waits only for the copy out of the GPU. A file is bound to the
-model file, the engine version and the settings that change the state (the KV type, the rope, the draft layer, control
+model file, the stored-conversation format and the settings that change the state (the KV type, the rope, the draft layer, control
 vectors); every part of it carries a hash, and a file that does not check out is deleted, never restored. A
 conversation is written again only once it has grown 4096 tokens past its stored copy, and after a second without
 input (no slot decoding) the engine writes each one that has, so a crash or a kill loses at most that much of a

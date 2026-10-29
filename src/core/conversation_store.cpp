@@ -42,7 +42,6 @@ struct ConversationStoreBuffer {
 namespace {
 
 constexpr char kMagic[8] = {'B', 'A', 'S', 'A', 'L', 'T', 'C', 'V'};
-constexpr uint32_t kVersion = 2;
 constexpr uint64_t kAlign = 4096;
 constexpr uint64_t kBlock = 1ull << 20;    // one hash per block
 constexpr uint64_t kStage = 8ull << 20;    // one write
@@ -236,7 +235,7 @@ void hash_srcs(const Srcs& srcs, Aligned& stage, std::vector<uint64_t>& hashes) 
 bool write_container(const std::string& path, Header h, Srcs& srcs, std::vector<uint64_t>* known, Aligned& stage,
                      uint64_t& file_bytes, std::string& error) {
     std::memcpy(h.magic, kMagic, sizeof kMagic);
-    h.version = kVersion;
+    h.version = kConversationFormat;
     h.header_bytes = kAlign;
     h.n_sections = (uint32_t) srcs.size();
     h.table_offset = kAlign;
@@ -363,7 +362,7 @@ bool read_index(int fd, uint64_t file_bytes, Header& h, std::vector<Section>& ta
     std::memcpy(&h, buf.data(), sizeof h);
     Header z = h;
     z.header_hash = 0;
-    if (std::memcmp(h.magic, kMagic, sizeof kMagic) != 0 || h.version != kVersion || h.header_bytes != kAlign ||
+    if (std::memcmp(h.magic, kMagic, sizeof kMagic) != 0 || h.version != kConversationFormat || h.header_bytes != kAlign ||
         conversation_store_hash(&z, sizeof z, 7) != h.header_hash) { error = "not a conversation file"; return false; }
     const bool conv = h.file_kind == kConversationFile;
     if (h.file_bytes != file_bytes || h.n_sections == 0 || h.n_sections > 100000 || h.file_kind > kStateFile ||
