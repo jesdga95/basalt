@@ -495,6 +495,8 @@ void usage() {
                  "  --prefill-cpu-share F  share of the streamed prompt experts the CPU computes, 0 to 1 (default\n"
                  "                       0.6; 0 = the GPU streams them all).  Fixed, so the output is the same\n"
                  "                       from run to run; a weaker CPU may prefer a lower value\n"
+                 "  --prefill-fp8        experimental: the prompt's dense projections in FP8 (E4M3) from chunks of\n"
+                 "                       1024 tokens: long prompts read faster, the numerics change (docs/precision)\n"
                  "  --adapt-swaps N      most experts a round swaps into the main GPU (default 96; 0 = off)\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
                  "  --peer-prefill-rows N  prompt rows per layer the peer computes (default half of chunk x top-k;\n"
@@ -1079,6 +1081,7 @@ int main(int argc, char** argv) {
         else if (a == "--adapt-every") { o.adapt_every = std::atoi(next("--adapt-every")); o.adapt_every_given = true; }
         else if (a == "--adapt-decay") { o.adapt_decay = (float) std::atof(next("--adapt-decay")); o.adapt_decay_set = true; }
         else if (a == "--prefill-cpu-share") o.prefill_cpu_share = std::atof(next("--prefill-cpu-share"));
+        else if (a == "--prefill-fp8") o.prefill_fp8 = true;
         else if (a == "--relaxed-drafting") {   // the value is optional: a number in (0, 1] when one follows
             o.relaxed_drafting = kRelaxedDraftingDefault;
             if (i + 1 < argc) {
@@ -1604,6 +1607,7 @@ int main(int argc, char** argv) {
         basalt::log::error("basalt generate", "invalid sampling or resource parameter");
         return 2;
     }
+    basalt::prefill::Prefill::set_fp8(o.prefill_fp8);
     if (!(o.prefill_cpu_share >= 0.0 && o.prefill_cpu_share <= 1.0)) {
         basalt::log::error("basalt generate", "--prefill-cpu-share must be a number from 0 to 1");
         return 2;
@@ -3008,6 +3012,9 @@ int main(int argc, char** argv) {
             const char* ml = std::getenv("CUDA_MODULE_LOADING");
             constexpr int64_t kLazyKernelsMib = 96;
             if (ml == nullptr || std::strcmp(ml, "EAGER") != 0) late_b += kLazyKernelsMib << 20;
+            // --prefill-fp8: cuBLASLt's handle and its E4M3 kernels load on the prompt path's first FP8 product
+            constexpr int64_t kFp8KernelsMib = 8;
+            if (o.prefill_fp8) late_b += kFp8KernelsMib << 20;
         }
         // the GDN mixer split by key head loads CUDA0's share of the GDN layers after the cache is sized
         if (o.peer_device >= 1) {

@@ -77,6 +77,11 @@ constexpr int RING_MAX = 384;           // the arrays; the ring itself is ring_s
 // The chunk size from which every expert streams: below it only the routed experts are staged.  Staging every
 // non-resident expert costs the same whatever the chunk, so it pays only once most of them are routed anyway.
 int64_t g_stream_all_min = 6144;
+// --prefill-fp8: the dense projections of chunks from kFp8MinTokens on in FP8 (shorter chunks gain little against the
+// conversions); kFp8Kinds says which
+bool g_fp8 = false;
+constexpr int64_t kFp8MinTokens = 1024;
+constexpr int kFp8Kinds = 127;
 inline int64_t stream_all_min() { return g_stream_all_min; }
 // The streamed ring's slots (one whole expert blob each, the same for every pack).  g_ring_depth caps the depth the
 // next layout is laid out with (a prompt read beside decoding slots lends fewer cache slots with a shallower ring).
@@ -469,11 +474,10 @@ struct Prefill::Impl {
     uint32_t* hist = nullptr;                // routed-entry counts per (layer, expert); see route_hist_reset
     int64_t hist_n = 0, hist_tokens = 0;
     bool hist_on = false;
-    // --exp fp8_prompt=MIN: the dense projections of chunks of at least MIN tokens on the FP8 tensor cores (0: off)
+    // the dense projections of chunks of at least this many tokens on the FP8 tensor cores (0: off; set_fp8)
     int64_t fp8_min = 0;
-    // --exp fp8_prompt_kinds=MASK: which of them (1 GDN qkv, 2 GDN z, 4 GDN out, 8 QSA q, 16 QSA k/v, 32 QSA o,
-    // 64 shared expert; default all)
-    int fp8_kinds = 127;
+    // which of them: 1 GDN qkv, 2 GDN z, 4 GDN out, 8 QSA q, 16 QSA k/v, 32 QSA o, 64 shared expert
+    int fp8_kinds = 0;
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
     std::vector<void*> owned;
@@ -862,8 +866,9 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     Impl& m = *impl_;
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
-    m.fp8_min = std::max<int64_t>(0, (int64_t) core::exp_flag("fp8_prompt", 0));
-    m.fp8_kinds = (int) core::exp_flag("fp8_prompt_kinds", 127);
+    // diagnostics: --exp fp8_prompt_min=N (the chunk size from which), fp8_prompt_kinds=MASK (which projections)
+    m.fp8_min = g_fp8 ? std::max<int64_t>(1, (int64_t) core::exp_flag("fp8_prompt_min", (double) kFp8MinTokens)) : 0;
+    m.fp8_kinds = (int) core::exp_flag("fp8_prompt_kinds", (double) kFp8Kinds);
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
     }
@@ -1420,6 +1425,7 @@ double g_pinned_share = 1.0;
 }
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
 void Prefill::set_stream_all_min(int64_t tokens) { g_stream_all_min = tokens; }
+void Prefill::set_fp8(bool on) { g_fp8 = on; }
 void Prefill::set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
 void Prefill::set_cpu_share(double share) { impl_->cpu_share_now = std::max(0.0, std::min(share, 1.0)); }
 void Prefill::set_ring_depth(int slots) { g_ring_depth = std::max(STAGE + 1, std::min(slots, kPrefillRingDeep)); }
