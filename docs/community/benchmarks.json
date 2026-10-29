@@ -583,6 +583,44 @@
       "prefill_64k_tps": 2740.8,
       "decode_tps": 229.6,
       "notes": "Build 471dc4ca04 = upstream 31aacda2 plus one local CLI flag (--no-peer-exclusive) that this preset does not use. Both GPUs overclocked (core +400, mem +5250 offset)."
+    },
+    {
+      "submitter": "jaderinoo",
+      "date": "2026-10-28",
+      "commit": "b9f9b125af",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.7
+        },
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 20.5
+        },
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "2.0 x4",
+          "h2d_gbps": 1.8
+        }
+      ],
+      "ram_gib": 62,
+      "cpu": "Intel Core Ultra 7 265K, 20 cores",
+      "ram_gbps": 70.0,
+      "os": "Linux",
+      "quant": "IQ3_S",
+      "prefill_16k_tps": 2479.3,
+      "prefill_64k_tps": 2471.2,
+      "decode_tps": 195.7,
+      "notes": "Abliterated GSQ-RCO IQ3_S with the official pack's Q8_0 n-gram spliced in. 0 SSD spill. Third GPU is the x4 slot."
     }
   ]
 }
