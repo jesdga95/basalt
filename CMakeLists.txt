@@ -1285,6 +1285,11 @@ if(BUILD_TESTING)
   # needs the AVX-512 VNNI and VBMI instruction sets, which not every host has
   set_property(TEST expert_multi_test APPEND PROPERTY LABELS avx512)
 
+  add_executable(nvfp4_cpu_rows_test tests/kernels/cpu/nvfp4_cpu_rows_test.cpp)
+  target_link_libraries(nvfp4_cpu_rows_test PRIVATE kernels_cpu)
+  basalt_cpu_test(NAME nvfp4_cpu_rows_test COMMAND nvfp4_cpu_rows_test)
+  set_tests_properties(nvfp4_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;avx512")
+
   add_executable(expert_parity tests/kernels/cpu/expert_parity.cpp)
   target_link_libraries(expert_parity PRIVATE kernels_cpu platform)
   # Both tests run on a synthetic expert fixture by default; --file experts.bin (the pack's experts section) checks real blobs.
