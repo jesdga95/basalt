@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -198,8 +199,16 @@ int check_shape(const Shape& s, cudaStream_t st, Gemm& g, cublasHandle_t h) {
         for (int64_t t = 0; t < rows; ++t) std::memcpy(&r[(size_t) t * s.n], &all[(size_t) t * s.ldy], (size_t) s.n * 4);
         return r;
     };
+    // the shape's first call chooses and checks its algorithm: its wall time against the next call's
+    const auto t0 = std::chrono::steady_clock::now();
     run_gemm(g, o, o.x16.p, o.y.as<float>(), T);
     ck(cudaStreamSynchronize(st), "gemm");
+    const auto t1 = std::chrono::steady_clock::now();
+    run_gemm(g, o, o.x16.p, o.y.as<float>(), T);
+    ck(cudaStreamSynchronize(st), "gemm again");
+    const auto t2 = std::chrono::steady_clock::now();
+    const double ms_first = std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                 ms_next = std::chrono::duration<double, std::milli>(t2 - t1).count();
     const std::vector<float> y_new = rows_of(o.y, T);
     run_default(h, o, o.x16.p, o.y.as<float>(), T);
     ck(cudaStreamSynchronize(st), "default");
@@ -250,9 +259,9 @@ int check_shape(const Shape& s, cudaStream_t st, Gemm& g, cublasHandle_t h) {
     // one fp32 K loop per output: the rounding error grows with K
     const bool bad = diff_new != 0 || rms_n > 2e-9 * (double) s.k || worst_n > 4e-9 * (double) s.k;
     std::printf("%-20s %5lld x %5lld | width (%ld rows): %ld differ (cublasGemmEx: %ld) | vs cublasGemmEx max %.1e of max "
-                "|y| | vs double rel RMS %.1e worst %.1e (cublasGemmEx %.1e / %.1e) %s\n",
+                "|y| | vs double rel RMS %.1e worst %.1e (cublasGemmEx %.1e / %.1e) | first call %.2f ms, next %.2f ms %s\n",
                 s.name, (long long) s.n, (long long) s.k, n_rows, diff_new, diff_old, ymax > 0 ? dmax / ymax : 0.0,
-                rms_n, worst_n, rms_o, worst_o, bad ? "FAIL" : "ok");
+                rms_n, worst_n, rms_o, worst_o, ms_first, ms_next, bad ? "FAIL" : "ok");
     return bad ? 1 : 0;
 }
 

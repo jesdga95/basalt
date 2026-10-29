@@ -222,8 +222,8 @@ struct Gemm::Plans {
     }
 
     // Y = X . W^T (T >= 2 rows) with the first candidate that runs every row count of the spread, whose calls of 1, 3,
-    // 7, 37 and 300 rows (those below T) give their rows the bits of the full call, and whose call of the rows from m
-    // on does too; that candidate becomes the plan's.
+    // 7, 37 and 300 rows (those below T) give their rows the bits of the full call, and whose call of rows [m, R) does
+    // too; that candidate becomes the plan's.
     bool settle(Plan& p, cudaDataType_t ty, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N,
                 int64_t K, int64_t ldy, int align, void* ws, size_t ws_bytes, void* stream) {
         int64_t m = 1;   // a later row whose X and Y rows keep the call's alignment
@@ -249,7 +249,7 @@ struct Gemm::Plans {
             for (const int64_t w : {(int64_t) 1, (int64_t) 3, (int64_t) 7, (int64_t) 37, (int64_t) 300})
                 if (ok && w < T) ok = run(p, algo, ty, X, W, Y, w, N, K, ldy, ws, ws_bytes, stream) && same(0, w);
             if (ok && m < R)
-                ok = run(p, algo, ty, X + m * K, W, Y + m * ldy, T - m, N, K, ldy, ws, ws_bytes, stream) && same(m, R);
+                ok = run(p, algo, ty, X + m * K, W, Y + m * ldy, R - m, N, K, ldy, ws, ws_bytes, stream) && same(m, R);
             if (!ok) continue;
             p.algo = algo;
             p.ws = need;
