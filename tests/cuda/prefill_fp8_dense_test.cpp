@@ -543,30 +543,16 @@ int main(int argc, char** argv) {
         Gemm gemm;
         std::string err;
         if (!gemm.init(s, 32ll << 20, err)) throw std::runtime_error(err);
-        fp8::Lt lt;
-        if (!lt.init(err)) throw std::runtime_error(err);
-        Dev ws(kWs);
-        // which scale granularities cuBLASLt offers on this device (a prompt-sized shape)
-        bool offered[3] = {};
-        for (int i = 0; i < 3; ++i) {
-            offered[i] = lt.algos(kScales[i], 4096, 2560, 2560, 2560, kWs, ws.p, ws.p) > 0;
-            std::printf("E4M3 %-13s scales: %s\n", fp8::scale_name(kScales[i]),
-                        offered[i] ? "offered by cuBLASLt" : "NOT offered by cuBLASLt");
-        }
-        if (!gemm.fp8_ready()) {
-            std::printf("prefill_fp8_dense_test: the prompt path's FP8 products are not available here\n");
-            return 1;
-        }
         int64_t kmax = 0, nmax = 0;
         for (const Geo& g : kGeos) {
             kmax = std::max(kmax, g.k);
             nmax = std::max(nmax, g.n);
         }
         if (vram) {
-            // every geometry at a short and a long chunk: FP16 first, then the same shapes in FP8
-            const int64_t ts[2] = {512, 32768};
-            Dev x16((size_t) ts[1] * kmax * 2), y((size_t) ts[1] * nmax * 4), abuf(Gemm::act8_bytes(ts[1], kmax));
-            ck(cudaMemset(x16.p, 0, (size_t) ts[1] * kmax * 2), "x16");
+            // every geometry at a short and a long chunk: FP16 first, then cuBLASLt set up and the same shapes in FP8
+            const int64_t ts[4] = {512, 2048, 8192, 32768};
+            Dev x16((size_t) ts[3] * kmax * 2), y((size_t) ts[3] * nmax * 4), abuf(Gemm::act8_bytes(ts[3], kmax));
+            ck(cudaMemset(x16.p, 0, (size_t) ts[3] * kmax * 2), "x16");
             std::vector<Dev*> ws_;
             std::mt19937 rng(5);
             for (const Geo& g : kGeos) {
@@ -587,6 +573,7 @@ int main(int argc, char** argv) {
                     gemm.native(x16.as<uint16_t>(), kGeos[i].t, ws_[i]->p, y.as<float>(), T, kGeos[i].n, kGeos[i].k);
             ck(cudaStreamSynchronize(s), "fp16");
             const double f0 = free_mib();
+            if (!gemm.fp8_ready()) throw std::runtime_error("no FP8 products here");
             for (int64_t T : ts)
                 for (size_t i = 0; i < std::size(kGeos); ++i) {
                     const Gemm::Rows8 xr = gemm.act8(x16.as<uint16_t>(), T, kGeos[i].k, abuf.p);
@@ -598,6 +585,20 @@ int main(int argc, char** argv) {
             for (Dev* d : ws_) delete d;
             std::printf("VRAM: the FP8 products' first use took %.1f MiB (free %.1f -> %.1f MiB)\n", f0 - f1, f0, f1);
             return 0;
+        }
+        fp8::Lt lt;
+        if (!lt.init(err)) throw std::runtime_error(err);
+        Dev ws(kWs);
+        // which scale granularities cuBLASLt offers on this device (a prompt-sized shape)
+        bool offered[3] = {};
+        for (int i = 0; i < 3; ++i) {
+            offered[i] = lt.algos(kScales[i], 4096, 2560, 2560, 2560, kWs, ws.p, ws.p) > 0;
+            std::printf("E4M3 %-13s scales: %s\n", fp8::scale_name(kScales[i]),
+                        offered[i] ? "offered by cuBLASLt" : "NOT offered by cuBLASLt");
+        }
+        if (!gemm.fp8_ready()) {
+            std::printf("prefill_fp8_dense_test: the prompt path's FP8 products are not available here\n");
+            return 1;
         }
         if (bench) {
             mmq::Context mctx;
