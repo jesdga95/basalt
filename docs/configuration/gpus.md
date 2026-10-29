@@ -86,7 +86,7 @@ smaller chunks of a deep prompt, whose KV leaves the main card fewer slots to le
 routed-only with that card computing its experts' rows of it in a main-card read stays on the main card (the split would
 give that share up); with matched cards, a chunk under 4,096 tokens does. On three or more cards it runs when they all match (memory bandwidth and VRAM
 within 10%); on three or more unlike cards it is off until measured on such a set, and the start line prints what it
-would cost. Off with `--peer-exclusive`, without the RAM copy of the experts, with KV streaming, a
+would cost. Off with `--peer-exclusive`, without the RAM copy of the experts, a
 control vector, experts other than NVFP4 (the price is fitted to those), when RAM or a tier's slots are short, or when a
 tier card keeps under 256 MiB free beside its stage (a read loads its kernels there; `peer-reserve-mib` sets the room).
 Everything that grows with the prompt sits in the lent slots, so a longer prompt that does not fit them is read on the

@@ -789,9 +789,10 @@ void qsa_prompt_state_clear(const QsaState& st, const ModelGeometry& g, void* st
 bool qsa_state_copy_cells(QsaState& dst, const QsaState& src, const ModelGeometry& g, int64_t cell0, int64_t cell1,
                           const DeviceCopy& copy, std::string& err) {
     const QsaShapes s = qsa_shapes(g);
-    if (dst.kv_mode != 0 || src.kv_mode != 0 || dst.kv_int8 != src.kv_int8 || dst.kv_q4 != src.kv_q4 ||
+    if (dst.kv_mode == 2 || src.kv_mode == 2 || (dst.kv_mode == 1 && !dst.host.present()) ||
+        (src.kv_mode == 1 && !src.host.present()) || dst.kv_int8 != src.kv_int8 || dst.kv_q4 != src.kv_q4 ||
         dst.kv_hybrid != src.kv_hybrid) {
-        err = "a QSA state copy needs two whole-in-VRAM states of one format";
+        err = "a QSA state copy needs two states of one format, each whole in VRAM or streamed";
         return false;
     }
     if (cell0 < 0 || cell1 < cell0 || cell1 > dst.max_cells || cell1 > src.max_cells) {
@@ -803,14 +804,22 @@ bool qsa_state_copy_cells(QsaState& dst, const QsaState& src, const ModelGeometr
     const uint64_t pr = (uint64_t) s.n_head_kv * s.page_size;
     const uint64_t code = pr * s.head_dim, scale = pr * (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2;
     const uint64_t q4 = pr * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+    // a streamed state's cells are its host copy, which has the identity layout of a whole pool
+    const bool dh = dst.kv_mode == 1, sh = src.kv_mode == 1;
     struct Arr { void* d; const void* s; uint64_t page; };
     std::vector<Arr> arrs;
     if (src.kv_hybrid) arrs = {{dst.k_q, src.k_q, code}, {dst.k_scale, src.k_scale, scale}, {dst.v_q4, src.v_q4, q4}};
-    else if (src.kv_q4) arrs = {{dst.k_q4, src.k_q4, q4}, {dst.v_q4, src.v_q4, q4}};
+    else if (src.kv_q4)
+        arrs = {{dh ? dst.host.k_q4 : dst.k_q4, sh ? src.host.k_q4 : src.k_q4, q4},
+                {dh ? dst.host.v_q4 : dst.v_q4, sh ? src.host.v_q4 : src.v_q4, q4}};
     else if (src.kv_int8)
-        arrs = {{dst.k_q, src.k_q, code}, {dst.v_q, src.v_q, code}, {dst.k_scale, src.k_scale, scale},
-                {dst.v_scale, src.v_scale, scale}};
-    else arrs = {{dst.k_pool, src.k_pool, code * 2}, {dst.v_pool, src.v_pool, code * 2}};
+        arrs = {{dh ? dst.host.k_q : dst.k_q, sh ? src.host.k_q : src.k_q, code},
+                {dh ? dst.host.v_q : dst.v_q, sh ? src.host.v_q : src.v_q, code},
+                {dh ? dst.host.k_scale : dst.k_scale, sh ? src.host.k_scale : src.k_scale, scale},
+                {dh ? dst.host.v_scale : dst.v_scale, sh ? src.host.v_scale : src.v_scale, scale}};
+    else
+        arrs = {{dh ? dst.host.k_pool : dst.k_pool, sh ? src.host.k_pool : src.k_pool, code * 2},
+                {dh ? dst.host.v_pool : dst.v_pool, sh ? src.host.v_pool : src.v_pool, code * 2}};
     const int64_t p0 = cell0 / s.page_size, p1 = (cell1 + s.page_size - 1) / s.page_size;
     bool ok = true;
     for (const Arr& a : arrs)

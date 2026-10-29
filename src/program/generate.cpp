@@ -4328,7 +4328,6 @@ int main(int argc, char** argv) {
     if (split_want) {
         const char* off = o.peer_exclusive ? "the tier's experts have no RAM copy (--peer-exclusive)"
                         : !src.complement_ready() ? "no RAM copy of the experts"
-                        : o.kv_resident > 0 ? "KV streaming"
                         : !o.cvec_files.empty() ? "a control vector"
                         : !basalt::prefill::Prefill::fp4_experts() ? "priced for NVFP4 experts only" : nullptr;
         if (off == nullptr && main_link_gbps <= 0) main_link_gbps = probe_pcie_h2d_gbps();   // (a set --pcie-frac skips it)
@@ -9432,6 +9431,18 @@ int main(int argc, char** argv) {
                         (given ? ", it came back at " + std::to_string(given_at) : std::string(", it never came back")) +
                         "; " + std::to_string(n_tok) + " tokens in chunks of " + std::to_string(chunk) + ", head " +
                         std::to_string(head) + ")";
+                }
+                // KV streaming: the stages wrote their layers' host copies, so a block resident before may be stale
+                if (given && g.n_qsa_layers() > 0 && rsp->qsa_states[rsp->qsa_primary()].kv_mode == 1) {
+                    const basalt::core::OnDevice on0(0);
+                    const int64_t I = std::max<int64_t>(g.qsa_interval, 1);
+                    for (PromptStage* st : run)
+                        for (int64_t q = st->l0 / I; q < st->l1 / I; ++q)
+                            basalt::kernels::kv_stream_reset(rsp->qsa_states[q].map, nullptr);
+                    if (cudaStreamSynchronize(nullptr) != cudaSuccess && ok) {
+                        ok = false;
+                        e = "prompt split: resetting the streamed K/V's residency";
+                    }
                 }
                 sp.set_keep_last(false);
                 sp.on_stage_chunk = nullptr;
