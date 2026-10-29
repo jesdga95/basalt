@@ -287,3 +287,11 @@ During a batch the command answers `ERR PROBE: ...`.
 
 `PROBE set workers=K share=F` (either key) sets the CPU pool's active worker count and the prompt path's CPU share for the
 requests that follow, and answers `PROBE end workers=<count>`. It is for `basalt-probe`; the settings last until the engine stops.
+
+`PROBE adapt [every=N] [swaps=N] [decay=F] [profile=FILE]` puts the expert tiers back where they were at `READY`, or
+with `profile=` places that saved profile's ranking into the same slots, copying only the slots whose expert differs.
+It zeroes the routing counts, the round counter and the draft policy, drops the session's cached prompts, and sets the
+adaptive tier's settings for the requests that follow, so the next request runs as the first after a load. It answers
+`PROBE end adapt every= swaps= decay= moved= peer_moved= kept= ms=` (slots copied on each card, slots left as they
+were, wall time). It needs the adaptive tier on and one main card (no layer split, at most one peer card, not
+`--peer-exclusive`); a swap count above the start's `--adapt-swaps` finds fewer free RAM places for its rounds.
