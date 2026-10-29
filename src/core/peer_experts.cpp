@@ -458,6 +458,41 @@ bool PeerExperts::give_back_wait(std::vector<std::pair<int32_t, int32_t>>& lent,
     return true;
 }
 
+bool PeerExperts::place(const std::vector<std::pair<int32_t, int32_t>>& want, int64_t& moved, std::string& err) {
+    moved = 0;
+    if (fsrc_ != nullptr) { err = "peer experts: an exclusive tier has no RAM copy to place from"; return false; }
+    if (!asleep_.empty()) { err = "peer experts: the tier is asleep"; return false; }
+    apply_pending(true);
+    std::vector<int32_t> holder((size_t) cache_.slots(), -1);   // slot -> residency index
+    for (size_t i = 0; i < res_.size(); ++i)
+        if (res_[i] >= 0 && res_[i] < (int32_t) holder.size()) holder[(size_t) res_[i]] = (int32_t) i;
+    std::vector<std::pair<int32_t, int32_t>> change;
+    for (const auto& [slot, i] : want)
+        if (slot >= 0 && slot < (int32_t) holder.size() && i >= 0 && (size_t) i < res_.size() && holder[(size_t) slot] != i)
+            change.emplace_back(slot, i);
+    for (const auto& [slot, i] : change) {   // every expert leaving or changing slot stops being resident first
+        if (holder[(size_t) slot] >= 0) res_[(size_t) holder[(size_t) slot]] = kNotResident;
+        if (res_[(size_t) i] >= 0) res_[(size_t) i] = kNotResident;
+    }
+    const auto& lay = basalt::kernels::cpu::expert_layout();
+    On on(device_);
+    std::vector<std::pair<int32_t, int32_t>> done;
+    for (const auto& [slot, i] : change) {
+        const int64_t l = i / n_expert_, e = i % n_expert_;
+        const uint8_t* b = src_->blob(l, e);
+        if (b == nullptr) continue;
+        if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, refill_),
+                "place", err))
+            return false;
+        done.emplace_back(slot, i);
+    }
+    if (!ck(cudaStreamSynchronize(refill_), "place", err)) return false;
+    for (const auto& [slot, i] : done) res_[(size_t) i] = slot;
+    std::fill(hold_.begin(), hold_.end(), 0);
+    moved = (int64_t) done.size();
+    return true;
+}
+
 bool PeerExperts::sleep(std::string& err) {
     if (!asleep_.empty()) return true;
     if (fsrc_ != nullptr) { err = "peer experts: an exclusive tier has no RAM copy to come back from"; return false; }

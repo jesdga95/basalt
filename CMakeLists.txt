@@ -74,23 +74,8 @@ if(WIN32)
   endif()
 endif()
 
-# Warnings live on an INTERFACE target the project's own C++ code links, NOT in add_compile_options: applied
-# globally they would also hit the extracted ggml C and CUDA sources, whose warnings are not this project's to fix.
-# The flags are guarded by COMPILE_LANGUAGE:CXX so nvcc never receives them as inputs, and by the compiler id:
-# MSVC reads -Wall/-Wextra as /Wall and the invalid /Wextra, so it takes its own spellings. The sources are UTF-8,
-# which MSVC only assumes when told (the Windows SDK's headers are not), hence /utf-8 for both languages.
-add_library(warnings INTERFACE)
-target_compile_options(warnings INTERFACE
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/W4>
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/utf-8>
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wall>
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wextra>
-  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/utf-8>)
-if(WERROR)
-  target_compile_options(warnings INTERFACE
-    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/WX>
-    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Werror>)
-endif()
+# The `warnings` and `platform` targets, one file shared with the standalone `tools/vision` configuration.
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/platform.cmake)
 
 # The application manifest, for every program that names a file path in its command line. Windows decodes argv and
 # the CRT's narrow opens in the machine's ANSI code page unless the image says otherwise, so the same pack path
@@ -171,17 +156,7 @@ add_executable(basalt-plan src/plan/plan_main.cpp)
 target_link_libraries(basalt-plan PRIVATE plan)
 
 # ---- platform (host OS boundary) ------------------------------------
-# The file, memory and process calls the engine makes, so the Win32 and POSIX spellings live in one place.
-# Host-only: no CUDA runtime, which is why the header-only `artifact` target, the vision library, the bench and the
-# standalone test programs can all link it.
-add_library(platform STATIC src/platform/file.cpp src/platform/memory.cpp src/platform/direct_file.cpp src/platform/process.cpp
-  src/platform/mapped_file.cpp src/platform/cpu.cpp src/platform/system.cpp src/platform/dynlib.cpp)
-target_include_directories(platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-# dlopen (DynLib) lives in libdl before glibc 2.34
-target_link_libraries(platform PUBLIC warnings ${CMAKE_DL_LIBS})
-if(WIN32)
-  target_link_libraries(platform PUBLIC advapi32)   # the processor name in the registry
-endif()
+# Defined in cmake/platform.cmake, included above with `warnings`.
 
 # ---- core (GPU runtime) ---------------------------------------------
 add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
@@ -428,8 +403,38 @@ add_library(prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefil
 target_include_directories(prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_gpu_include_directories})
 target_link_libraries(prefill PUBLIC engine ${_gpu_blas_target} ${_gpu_runtime_target})
 
-add_executable(basalt src/program/generate.cpp src/program/probe_rates.cpp src/program/serve/loans.cpp
-                       src/program/measure/gpu_modes.cpp src/program/measure/dump_set.cpp)
+add_executable(basalt src/program/generate.cpp src/program/engine_local.cpp src/program/probe_rates.cpp
+                       src/program/serve/batch.cpp
+                       src/program/serve/batch_pipeline.cpp
+                       src/program/serve/commands.cpp
+                       src/program/serve/conversation.cpp
+                       src/program/serve/kv.cpp
+                       src/program/serve/loans.cpp
+                       src/program/serve/loan_moves.cpp
+                       src/program/serve/memory.cpp
+                       src/program/serve/prompt.cpp
+                       src/program/serve/prompt_read.cpp
+                       src/program/serve/prompt_split.cpp
+                       src/program/serve/prompt_windows.cpp
+                       src/program/serve/protocol.cpp
+                       src/program/serve/request.cpp
+                       src/program/serve/request_decode.cpp
+                       src/program/serve/request_finish.cpp
+                       src/program/serve/request_image.cpp
+                       src/program/serve/request_parse.cpp
+                       src/program/serve/request_prefill.cpp
+                       src/program/serve/request_restore.cpp
+                       src/program/serve/runtime.cpp
+                       src/program/serve/slots.cpp
+                       src/program/serve/tier_profile.cpp
+                       src/program/serve/tiers.cpp
+                       src/program/serve/verify.cpp
+                       src/program/serve/vision.cpp
+                       src/program/measure/gpu_modes.cpp src/program/measure/dump_set.cpp
+                       src/program/cli/arguments.cpp src/program/cli/help.cpp src/program/cli/serve.cpp
+                       src/program/cli/options.cpp src/program/cli/control_vectors.cpp
+                       src/program/cli/startup.cpp src/program/cli/gpu.cpp src/program/cli/tokens.cpp
+                       src/program/cli/report.cpp)
 set_target_properties(basalt PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
 target_link_libraries(basalt PRIVATE engine engine_session grammar tokenizer prefill spec ${_gpu_runtime_target})
@@ -980,6 +985,13 @@ target_link_libraries(image_loan_test PRIVATE engine_session warnings)
 basalt_embed_manifest(image_loan_test)
 basalt_cpu_test(NAME image_loan_test COMMAND image_loan_test)
 set_tests_properties(image_loan_test PROPERTIES TIMEOUT 60)
+# a prompt loan's table work: the re-lend split and the routed experts' trades, on a model of the cache (CPU only)
+add_executable(loan_moves_test tests/program/loan_moves_test.cpp src/program/serve/loan_moves.cpp)
+target_include_directories(loan_moves_test PRIVATE src/program/serve)
+target_link_libraries(loan_moves_test PRIVATE warnings)
+basalt_embed_manifest(loan_moves_test)
+basalt_cpu_test(NAME loan_moves_test COMMAND loan_moves_test)
+set_tests_properties(loan_moves_test PROPERTIES TIMEOUT 60)
 add_executable(auto_plan_test tests/program/auto_plan_test.cpp)
 target_link_libraries(auto_plan_test PRIVATE engine_session warnings)
 basalt_embed_manifest(auto_plan_test)

@@ -2,6 +2,7 @@
 // every KV format: a layer range's state from a whole session into a prompt session carved for that range
 // (session_copy_state through StagedCopy), the range's new cells back, and the range into a whole-model checkpoint
 // (conversation_checkpoint_save_layers). Every byte is checked against the source, the rest against what was there.
+// With KV streaming the whole session's cells are its host copy.
 #include "basalt/core/conversation_snapshot.hpp"
 #include "basalt/core/layer.hpp"
 #include "basalt/core/session.hpp"
@@ -33,15 +34,15 @@ std::mt19937_64 g_rng(7);
 void fill(void* d, size_t bytes) {
     std::vector<uint8_t> h(bytes);
     for (uint8_t& b : h) b = (uint8_t) g_rng();
-    cudaMemcpy(d, h.data(), bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d, h.data(), bytes, cudaMemcpyDefault);
 }
 std::vector<uint8_t> get(const void* d, size_t bytes) {
     std::vector<uint8_t> h(bytes);
-    cudaMemcpy(h.data(), d, bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h.data(), d, bytes, cudaMemcpyDefault);
     return h;
 }
 
-// one QSA array: its device bytes and its bytes per KV page (0: not paged)
+// one QSA array: its bytes (a streamed state's cells: its host copy) and its bytes per KV page (0: not paged)
 struct Arr { const void* p; uint64_t page, bytes; };
 
 std::vector<Arr> arrays(const QsaState& st, const ModelGeometry& g) {
@@ -51,11 +52,14 @@ std::vector<Arr> arrays(const QsaState& st, const ModelGeometry& g) {
     const uint64_t pr = (uint64_t) s.n_head_kv * s.page_size, n = (uint64_t) st.n_pages;
     const uint64_t code = pr * s.head_dim, scale = pr * (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2;
     const uint64_t q4 = pr * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+    const bool h = st.kv_mode == 1;
     std::vector<Arr> v;
     if (st.kv_hybrid) v = {{st.k_q, code, 0}, {st.k_scale, scale, 0}, {st.v_q4, q4, 0}};
-    else if (st.kv_q4) v = {{st.k_q4, q4, 0}, {st.v_q4, q4, 0}};
-    else if (st.kv_int8) v = {{st.k_q, code, 0}, {st.v_q, code, 0}, {st.k_scale, scale, 0}, {st.v_scale, scale, 0}};
-    else v = {{st.k_pool, code * 2, 0}, {st.v_pool, code * 2, 0}};
+    else if (st.kv_q4) v = {{h ? st.host.k_q4 : st.k_q4, q4, 0}, {h ? st.host.v_q4 : st.v_q4, q4, 0}};
+    else if (st.kv_int8)
+        v = {{h ? st.host.k_q : st.k_q, code, 0}, {h ? st.host.v_q : st.v_q, code, 0},
+             {h ? st.host.k_scale : st.k_scale, scale, 0}, {h ? st.host.v_scale : st.v_scale, scale, 0}};
+    else v = {{h ? st.host.k_pool : st.k_pool, code * 2, 0}, {h ? st.host.v_pool : st.v_pool, code * 2, 0}};
     for (Arr& a : v) a.bytes = a.page * n;
     const uint64_t row = (uint64_t) g.idx_key_dim * 4;
     v.push_back({st.idx_pooled, row, row * (uint64_t) st.idx_pooled_rows});   // "page": one pooled row
@@ -79,12 +83,13 @@ bool range_is(const std::vector<uint8_t>& got, const std::vector<uint8_t>& want,
     return true;
 }
 
-void run_format(const char* name, bool int8, bool q4, bool hybrid, int dst_dev) {
+void run_format(const char* name, bool int8, bool q4, bool hybrid, int dst_dev, bool streamed = false) {
     qsa_set_kv_int8(int8);
     qsa_set_kv_q4(q4);
     qsa_set_kv_hybrid(hybrid);
     const ModelGeometry g;
-    const int64_t K = 10, cells = 2600, lb = 37, a0 = 1001, c1 = 2302;   // cell bounds mid-page and mid-block
+    // cell bounds mid-page and mid-block; a streamed session needs more cells than it keeps in VRAM
+    const int64_t K = 10, cells = streamed ? qsa_kv_resident_min() + 3000 : 2600, lb = 37, a0 = 1001, c1 = 2302;
     const int64_t I = g.qsa_interval, g0 = lb - lb / I, q0 = lb / I;
     std::string err;
     ConversationStateSizes z;
@@ -95,8 +100,11 @@ void run_format(const char* name, bool int8, bool q4, bool hybrid, int dst_dev) 
     void* sb = nullptr;
     void* pb = nullptr;
     cudaSetDevice(0);
+    qsa_set_kv_resident(streamed ? qsa_kv_resident_min() : 0);
     const uint64_t sbytes = session_bytes(g, cells, K);
     CHECK(cudaMalloc(&sb, sbytes) == cudaSuccess && session_init(g, cells, K, sb, ss) > 0);
+    qsa_set_kv_resident(0);
+    CHECK(ss.qsa_states[ss.qsa_primary()].kv_mode == (streamed ? 1 : 0));
     cudaSetDevice(dst_dev);
     const uint64_t pbytes = prompt_session_bytes(g, cells, lb, g.n_layers);
     CHECK(cudaMalloc(&pb, pbytes) == cudaSuccess);
@@ -198,7 +206,8 @@ void run_format(const char* name, bool int8, bool q4, bool hybrid, int dst_dev) 
     // a range the session does not hold is refused
     CHECK(!conversation_checkpoint_save_layers(w, ps, g, lb - 4, g.n_layers, err));
     CHECK(!session_copy_state(ss, ps, g, lb - 4, g.n_layers, a0, c1, copy_back, err));
-    std::printf("prompt_split_state_test: %s KV, tier card CUDA%d: %s\n", name, dst_dev, g_fail ? "FAILED" : "ok");
+    std::printf("prompt_split_state_test: %s KV%s, tier card CUDA%d: %s\n", name, streamed ? " streamed" : "", dst_dev,
+                g_fail ? "FAILED" : "ok");
     cudaSetDevice(dst_dev);
     cudaStreamDestroy(st);
     cudaFree(pb);
@@ -220,6 +229,9 @@ int main() {
         run_format("int8", true, false, false, dev);
         run_format("q4", false, true, false, dev);
         run_format("hybrid K8V4", false, false, true, dev);
+        run_format("fp16", false, false, false, dev, true);
+        run_format("int8", true, false, false, dev, true);
+        run_format("q4", false, true, false, dev, true);
         if (n < 2) break;
     }
     if (g_fail) { std::printf("prompt_split_state_test: %d failures\n", g_fail); return 1; }

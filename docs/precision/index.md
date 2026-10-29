@@ -182,7 +182,9 @@ the hyper-connection down/up matrices as the pack's BF16 tensors (the main card 
 BF16), and its cuBLAS products may run other kernels; the routed experts and the other products keep the main card's
 arithmetic. A layer gives the same bits on any stage of the same card model: cutting one tier card's layers into two
 stages gives the same tokens and checkpoints. The draft layer builds its K/V on the main card from the last stage's
-rows, read back bit for bit. Parts the price keeps on the main card, parts of one chunk and the quality gate's 256-token
+rows, read back bit for bit. With KV streaming (`kv-resident`) the main card's K/V of the tier layers comes from and
+goes back to its RAM copy byte for byte, so the read is the same: a 65,536-token prompt gives the same 400 greedy
+tokens with and without streaming. Parts the price keeps on the main card, parts of one chunk and the quality gate's 256-token
 prompt halves read as before. Long-context check over two cards, NVIDIA NVFP4 pack, int8 KV, spec 1, 400 W, the first 64
 greedy tokens of a main-card read teacher-forced into the split read, full-vocabulary KLD: 65,535-token prompt mean
 0.0008, median 0.0003, max 0.012, top-1 64 of 64; 122,879-token prompt mean 0.0005, median 0.0003, max 0.003, top-1 64

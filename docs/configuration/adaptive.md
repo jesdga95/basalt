@@ -76,6 +76,18 @@ With a smaller cache (the RTX 5090 alone with `expert-cache 4300`, half its usua
 160 gave cold 130.3, 127.1 and 132.4 (two default runs), 132.3 tok/s: the swap count moves nothing beyond run
 noise there either.
 
+## The probe picks these
+
+[basalt-probe](../probe.md) tries the built-in values, `64 / 256 / 0.7` and `1 / 160` on the machine it runs on, from
+one engine: `PROBE adapt` puts the tiers back where they were after load before each, so every run is a cold start
+followed by a topic switch (prose 1200 tokens, then struct 400). It prints a setting only when it beats the built-in
+values by more than its noise band, and with `--expert-profile-save FILE` it says whether starting from FILE helps.
+Here (400 W + 180 W, and 400 W alone) a reset run scored within noise of a fresh engine's first two requests (two
+cards: built-in 283.9 and 285.8 against fresh 283.6, `1 / 160` 285.2 against 290.5; one card: 224.3 and 225.8 against
+225.9, `1 / 160` 231.2 against 230.6 tok/s), and the
+probe printed no adaptive setting on either set of cards (`1 / 160` +0% and +3% against a 3% band, `64 / 256 / 0.7`
+-29% and -42%), nor the saved profile.
+
 ## Other machines
 
 Not measured: two alike cards (in the expert tier or a layer split), a main card with 16 GB or less (far fewer slots,
@@ -88,4 +100,5 @@ untested guidance:
 - A slower link favours fewer swaps per round over fewer rounds: lower `adapt-swaps` before raising `adapt-every`.
 - With little RAM, `adapt-swaps` sets the free places (four times N experts): lowering it gives that RAM back to the
   experts.
-- Try a change on your own mix with fresh servers and compare the `done` lines' `tg` rates, the first request first.
+- Run `basalt-probe` with your flags; for your own mix, try a change with fresh servers and compare the `done`
+  lines' `tg` rates, the first request first.
