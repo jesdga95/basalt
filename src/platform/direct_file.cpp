@@ -3,12 +3,12 @@
 
 #include "basalt/platform/file.hpp"
 
-#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -59,10 +59,11 @@ struct Pending {
     uint64_t tag;
 };
 
-/// The number of issuing threads, clamped to 1..256. On Linux each thread does one blocking pread, so the thread
-/// count is the queue depth. On Windows a read stays in flight after its issuing thread moves on, so the count
-/// only bounds how fast the submitted queue reaches the drive; the depth itself is what the caller queued.
-int io_threads(int dflt) { return std::clamp(dflt, 1, 256); }
+bool valid_workers(int workers, std::string& err) {
+    if (workers >= 0 && workers <= 256) return true;
+    err = "DirectFile: workers must be 0 (default) or 1..256";
+    return false;
+}
 }  // namespace
 
 #if defined(_WIN32)
@@ -152,8 +153,12 @@ struct DirectFile::Impl {
             DWORD bytes = 0;
             ULONG_PTR key = 0;
             OVERLAPPED* ov = nullptr;
-            if (!GetQueuedCompletionStatus(port, &bytes, &key, &ov, INFINITE)) return;
-            if (ov == nullptr) continue;   // a posted wake or nudge: it carries no request
+            const BOOL ok = GetQueuedCompletionStatus(port, &bytes, &key, &ov, INFINITE);
+            // A cancelled/failed read still supplies its OVERLAPPED and must be reaped before buffers are freed.
+            if (ov == nullptr) {
+                if (!ok) return;
+                continue;
+            }
             std::lock_guard<std::mutex> lk(mu);
             free_reqs.push_back((Req*) ov);
             --inflight;
@@ -192,8 +197,9 @@ DirectFile::~DirectFile() {
     delete impl_;
 }
 
-bool DirectFile::open(const std::string& path, std::string& err) {
+bool DirectFile::open(const std::string& path, std::string& err, int workers) {
     close();
+    if (!valid_workers(workers, err)) return false;
     // NO_BUFFERING: the cache manager never holds these pages, so the table cannot grow into RAM.
     // RANDOM_ACCESS: no read-ahead. OVERLAPPED: many reads in flight, completed through the port below.
     impl_->file = CreateFileW(to_wide_path(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
@@ -202,6 +208,10 @@ bool DirectFile::open(const std::string& path, std::string& err) {
         err = "DirectFile: cannot open " + path + " (error " + std::to_string(GetLastError()) + ")";
         return false;
     }
+    return finish_open(path, err, workers);
+}
+
+bool DirectFile::finish_open(const std::string& path, std::string& err, int workers) {
     LARGE_INTEGER sz;
     if (!GetFileSizeEx(impl_->file, &sz)) {
         err = "DirectFile: cannot size " + path;
@@ -215,8 +225,15 @@ bool DirectFile::open(const std::string& path, std::string& err) {
         close();
         return false;
     }
-    const int n = io_threads(16);
-    for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { impl_->worker(); });
+    const int n = workers == 0 ? 16 : workers;
+    try {
+        impl_->pool.reserve(n);
+        for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { impl_->worker(); });
+    } catch (const std::exception& e) {
+        close();
+        err = "DirectFile: cannot start issuing threads: " + std::string(e.what());
+        return false;
+    }
     return true;
 }
 
@@ -357,16 +374,28 @@ struct DirectFile::Impl {
 DirectFile::DirectFile() : impl_(new Impl) {}
 DirectFile::~DirectFile() { close(); delete impl_; }
 
-bool DirectFile::open(const std::string& path, std::string& err) {
+bool DirectFile::open(const std::string& path, std::string& err, int workers) {
     close();
-    impl_->fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+    if (!valid_workers(workers, err)) return false;
+    impl_->fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
     if (impl_->fd < 0) { err = "DirectFile: cannot open " + path; return false; }
+    return finish_open(path, err, workers);
+}
+
+bool DirectFile::finish_open(const std::string& path, std::string& err, int workers) {
     struct stat st;
     if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
     impl_->size = (uint64_t) st.st_size;
     // one blocking read per thread: a drive serves random pages at its full rate only with a deep queue
-    const int n = io_threads(256);
-    for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { impl_->worker(); });
+    const int n = workers == 0 ? 256 : workers;
+    try {
+        impl_->pool.reserve(n);
+        for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { impl_->worker(); });
+    } catch (const std::exception& e) {
+        close();
+        err = "DirectFile: cannot start issuing threads: " + std::string(e.what());
+        return false;
+    }
     return true;
 }
 
@@ -383,6 +412,7 @@ bool DirectFile::is_open() const { return impl_->fd >= 0; }
 uint64_t DirectFile::size() const { return impl_->size; }
 
 bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t tag, std::string& err) {
+    if (!is_open()) { err = "DirectFile: not open"; return false; }
     if (offset % alignment() || length % alignment() || ((uintptr_t) buffer) % alignment() || length == 0) {
         err = "DirectFile: unaligned request";
         return false;
@@ -402,6 +432,7 @@ void DirectFile::wake() {
 }
 
 int DirectFile::wait(Completion* out, int max, int timeout_ms) {
+    if (max <= 0 || !is_open()) return 0;
     std::unique_lock<std::mutex> lk(impl_->mu);
     if (impl_->done.empty() && timeout_ms != 0) {
         auto ready = [&] { return !impl_->done.empty(); };

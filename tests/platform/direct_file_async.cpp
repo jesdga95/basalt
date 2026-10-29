@@ -1,10 +1,12 @@
 #include "basalt/platform/direct_file.hpp"
+#include "basalt/platform/file.hpp"
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -47,8 +49,6 @@ static std::string temp_path() {
     return base + "/basalt-direct-test-" + std::to_string(owner) + "-" + std::to_string(seq++) + ".bin";
 }
 
-#if defined(_WIN32)
-// ----------------------------------------------------------------------------------- Windows stress tests
 /// A test file of `page_count` alignment-sized pages and an aligned buffer with spare pages for reads that start
 /// past the end of it. Both are released whichever way the test leaves.
 struct Fixture {
@@ -76,6 +76,83 @@ struct Fixture {
     char* at(size_t i) const { return static_cast<char*>(memory) + i * DirectFile::alignment(); }
 };
 
+/// Two opens of one file with a bounded issuing pool: reads stay positional, stay on the open that queued them,
+/// and a close leaves neither an in-flight read nor a completion behind.
+static void test_bounded_opens() {
+    using namespace basalt::platform;
+    const uint32_t page = DirectFile::alignment();
+    constexpr unsigned pages = 12;
+    Fixture fx(pages, 0);
+    {
+        std::ofstream output(fx.name, std::ios::binary | std::ios::trunc);
+        for (unsigned i = 0; i < pages; ++i) {
+            const std::string content(page, (char) ('a' + i));
+            output.write(content.data(), content.size());
+        }
+        check((bool) output, "cannot write the test contents");
+    }
+    DirectFile first, second;
+    std::string error;
+    call_ok(first.open(fx.name, error, 1), error, "open with one worker");
+    call_ok(second.open(fx.name, error, 2), error, "open with two workers");
+    check(first.size() == (uint64_t) pages * page && second.size() == first.size(), "size mismatch");
+    // More outstanding requests than either pool has workers, at descending offsets: an open that shared a file
+    // position shows up as the data of another tag, a pool that serialized as a completion that never comes.
+    for (unsigned i = 0; i < pages; ++i) {
+        DirectFile& f = i % 2 ? second : first;
+        call_ok(f.submit((uint64_t) (pages - 1 - i) * page, fx.at(i), page, i, error), error, "submit");
+    }
+    std::vector<bool> seen(pages, false);
+    for (DirectFile* f : {&first, &second}) {
+        unsigned received = 0;
+        while (received < pages / 2) {
+            Completion batch[3];
+            const int n = f->wait(batch, 3, 5000);
+            check(n > 0, "completion timed out");
+            for (int j = 0; j < n; ++j) {
+                const auto& c = batch[j];
+                check(c.tag < pages && !seen[c.tag], "completion repeated or wrong");
+                check(c.ok && c.bytes == page, "completion failed");
+                check((c.tag % 2 == 0) == (f == &first), "completion reached the wrong open");
+                seen[c.tag] = true;
+                ++received;
+                for (unsigned k = 0; k < page; ++k)
+                    check(fx.at(c.tag)[k] == (char) ('a' + pages - 1 - c.tag), "data mismatch");
+            }
+        }
+    }
+    // The expert source reads the pack through its own handle at the same time; these reads must not move it.
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> plain(open_file_utf8(fx.name, "rb"), &std::fclose);
+    check(plain != nullptr, "cannot open the file for positional reads");
+    check(fseek64(plain.get(), page + 23) == 0, "cannot position the positional reader");
+    call_ok(first.submit(0, fx.at(0), page, 100, error), error, "submit beside a positional reader");
+    Completion c;
+    check(first.wait(&c, 1, 5000) == 1 && c.ok && c.tag == 100 && c.bytes == page && fx.at(0)[0] == 'a',
+          "read beside a positional reader failed");
+    check(std::ftell(plain.get()) == (long) page + 23, "the reads moved the positional reader");
+    plain.reset();
+    call_ok(second.submit(0, fx.at(1), page, 101, error), error, "read after the other handle closed");
+    check(second.wait(&c, 1, 5000) == 1 && c.ok && c.tag == 101 && c.bytes == page && fx.at(1)[0] == 'a',
+          "closing the other handle invalidated this open");
+    for (unsigned i = 0; i < pages; ++i)
+        call_ok(second.submit((uint64_t) i * page, fx.at(i), page, i, error), error, "submit before drain");
+    second.close();
+    std::memset(fx.memory, 0, (size_t) pages * page);
+    call_ok(second.open(fx.name, error, 1), error, "reopen");
+    check(second.wait(&c, 1, 0) == 0, "close left stale completions");
+    call_ok(second.submit((pages - 1) * page, fx.at(0), page, 200, error), error, "reopened submit");
+    check(second.wait(&c, 1, 5000) == 1 && c.ok && c.tag == 200 && c.bytes == page && fx.at(0)[0] == 'l',
+          "reopened read returned incorrect data");
+    second.close();
+    check(!second.submit(0, fx.at(0), page, 0, error), "closed file accepted a read that cannot complete");
+    check(!second.open("basalt-direct-test-no-such-file.bin", error, 1) && !second.is_open(),
+          "open of a missing file accepted");
+    check(!second.open(fx.name, error, -1) && !second.is_open(), "negative worker count accepted");
+    check(!second.open(fx.name, error, 257) && !second.is_open(), "excessive worker count accepted");
+}
+
+#if defined(_WIN32)
+// ----------------------------------------------------------------------------------- Windows stress tests
 /// `close` must not return while a read can still write: a caller that abandons a prefill releases its buffers as
 /// soon as close returns. No read here is ever waited on, so all of them are still queued or in flight when close
 /// runs.
@@ -217,6 +294,7 @@ int main() {
         call_ok(f.submit(0, memory, 4096, 100, error), error, "submit after reopen");
         check(f.wait(&c, 1, 5000) == 1 && c.ok && c.tag == 100, "reopened read failed");
         f.close();
+        test_bounded_opens();
 #if defined(_WIN32)
         test_close_with_reads_in_flight();
         const unsigned maxes[] = {1u, 2u, 3u, 7u, 17u};   // one slot and a batch across the boundary

@@ -560,8 +560,9 @@ public:
     uint64_t places_generation() const override { return places_gen_; }
     bool pcie_layer(int64_t layer) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
-    /// Each blob read from the file with block-aligned unbuffered reads into small pinned staging buffers; a blob that
-    /// cannot be read that way, or a file system without unbuffered reads, takes the mapped copy.
+    /// Overlaps block-aligned unbuffered reads through small pinned stages.  A blob whose read comes back short or
+    /// failed, and a file system without unbuffered reads, take the mapped copy instead, whose pages are given back
+    /// once the sink has them so a full fill does not leave the pack resident.  A sink that fails stops the read.
     bool read_blobs(const std::pair<int32_t, int32_t>* pairs, int64_t n, const BlobSink& sink, std::string& err) override;
 
     /// Blobs touched, for the driver to report.  With `h = 0` this is `48 * k` per token and the number is only
@@ -635,6 +636,7 @@ private:
     std::atomic<int64_t> file_reads_{0};
     int64_t reads_ = 0;
     int fd_ = -1;
+    std::string path_;   ///< the mapped file, which the bulk reads open unbuffered
 };
 
 // ================================ THE RESIDENT ARENA ================================

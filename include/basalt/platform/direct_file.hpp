@@ -27,7 +27,9 @@ public:
     DirectFile(const DirectFile&) = delete;
     DirectFile& operator=(const DirectFile&) = delete;
 
-    bool open(const std::string& path, std::string& err);
+    /// `workers` is 0 for the platform default, or 1..256 issuing threads. An unbuffered open the file system
+    /// refuses (no O_DIRECT / NO_BUFFERING there) fails with `err`, and the caller reads through its own handle.
+    bool open(const std::string& path, std::string& err, int workers = 0);
     void close();
     bool is_open() const;
     uint64_t size() const;
@@ -50,6 +52,7 @@ public:
     static void free_aligned(void* p);
 
 private:
+    bool finish_open(const std::string& path, std::string& err, int workers);
     struct Impl;
     Impl* impl_ = nullptr;
 };
