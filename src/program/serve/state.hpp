@@ -115,14 +115,14 @@ using Clock = std::chrono::steady_clock;
 // ---- --serve's conversation cache.  A chat or an agent sends the whole conversation again with every request, and
 // reading it again would make a long session wait for every turn.  What a sequence leaves behind splits in
 // two, and only one half needs copying:
-//   * POSITIONAL state - the KV cache of the 12 QSA layers and their pooled indexer keys, the draft layer's KV.  A
+//   * positional state - the KV cache of the 12 QSA layers and their pooled indexer keys, the draft layer's KV.  A
 //     cell is written once for its position and read only by later positions (the block scores take `dead` for the
 //     block being filled, never its pooled row), so rewinding to a position just means writing from there again.
-//   * RUNNING state - the 36 GDN recurrences and conv histories, each QSA layer's indexer tail (the unfinished
+//   * running state - the 36 GDN recurrences and conv histories, each QSA layer's indexer tail (the unfinished
 //     block's raw keys) and the PLE's normalized history.  Each describes "everything so far" and cannot be
-//     rewound, so a checkpoint is a copy of exactly these: ~118 MB, the same set the verifier snapshots to roll
+//     rewound, so a checkpoint is a copy of exactly these, the same set the verifier snapshots to roll
 //     back rejected drafts.
-// A checkpoint is only valid while the positional cells below it still hold ITS tokens, so the serve loop keeps
+// A checkpoint is only valid while the positional cells below it still hold its tokens, so the serve loop keeps
 // just the checkpoints that are prefixes of the tokens the session holds now.
 using ImgKey = basalt::core::ConversationImageKey;
 using ConvCheckpoint = basalt::core::ConversationCheckpoint;
@@ -163,11 +163,11 @@ private:
     void* borrow{};
     uint64_t borrow_bytes{};
     int32_t lend_first{};
-    // ---- WHO BORROWS, AND FROM WHOSE CACHE.  One entry per prompt path: CUDA0's (layers [0, split_at[0]), which is
+    // ---- who borrows, and from whose cache.  One entry per prompt path: CUDA0's (layers [0, split_at[0]), which is
     // the whole model without a split) borrowing the tail of CUDA0's cache, then one per stage borrowing the tail
-    // of ITS OWN cache.  A loan is sized by the exact `Prefill::bytes_needed` for the chunk, is laid out by
+    // of its own cache.  A loan is sized by the exact `Prefill::bytes_needed` for the chunk, is laid out by
     // `Prefill::relayout`, and is refilled before any window reads - so outside the prompt the whole cache is
-    // expert cache.  A stage may only lend the rows for ITS OWN layers: `host_res` is one table whose slot values
+    // expert cache.  A stage may only lend the rows for its own layers: `host_res` is one table whose slot values
     // are indices into whichever cache owns the layer, so a loan that marked rows by slot number alone would hand
     // CUDA0 a slot belonging to another stage's cache.
     struct PfPart {
@@ -209,7 +209,6 @@ private:
     basalt::core::VerifyHits vh{};
     // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
     // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
-    // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
     basalt::core::Verifier ver_same{};
     SplitDrive split_drive{};
     SplitDrive split_drive_b{};
@@ -225,7 +224,7 @@ private:
     // points; every one of them is a prefix of `live` (the loop drops the rest), so they form a chain - the radix
     // cache's tree collapsed onto the one branch of history whose cells the session holds.  The chain's root is the
     // deepest point every request so far shared (the end of the system prompt, in practice); the retention policy
-    // pins it and rotates the rest LRU (conv_cache.hpp), so a NEW chat that shares that prefix mounts through it
+    // pins it and rotates the rest LRU (conv_cache.hpp), so a new chat that shares that prefix mounts through it
     // instead of reading it again.
     std::vector<int32_t> live{};
     std::vector<ImgKey> live_imgs{};
@@ -254,7 +253,7 @@ private:
     int64_t pp_reached{};
     Clock::time_point pp_t0{};
     // A layer split's mid-prompt checkpoints: when the last stage reports a chunk, the earlier ones already read
-    // the next, so each stage saves its own part when IT reaches a checkpoint position (the same rule as below:
+    // the next, so each stage saves its own part when it reaches a checkpoint position (the same rule as the main card's:
     // every `prompt_cache_every` tokens from where the request resumed), and the last stage puts them together.
     std::mutex part_mu{};
     std::map<int64_t, std::vector<ConvCheckpoint>> part_at{};   // position -> one part per stage
@@ -275,7 +274,7 @@ private:
     bool peer_landing{};
     std::vector<uint8_t> xlanding{};
     std::vector<std::pair<int32_t, int32_t>> pending_spare{};   // the RAM places the incoming experts free once resident
-    // the VRAM tier follows the conversation (the same rule as the speculative loop below)
+    // the VRAM tier follows the conversation
     // the peer's experts are candidates too, so the ones a workload routes most move to
     // CUDA0 (from their RAM copy, as any other swap) and its coldest go to the CPU
     // routings a peer expert needs above CUDA0's victim before it moves
@@ -357,7 +356,7 @@ private:
         bool cvec = true;              ///< the control vector setting `ids` were read with
         std::vector<ImgKey> imgs;      ///< the pictures in `ids`: a later request reuses them only with the same ones
         // the checkpoint its prompt read took at the last turn boundary (the history before the new turn's header): a
-        // client's next turn renders the history again WITHOUT this reply's thinking, so it matches the slot's
+        // client's next turn renders the history again without this reply's thinking, so it matches the slot's
         // tokens only up to there - the slot's K/V up to it plus this state continue from it
         std::vector<ConvCheckpoint> checks;
         // a prompt read that gave way to a waiting request (BYIELD): `ids` is the part read so far, and the same

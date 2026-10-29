@@ -16,14 +16,9 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
     basalt::core::expert_pool_dispatch(&t->d, x_f, ids, weights, n_embd, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
-    // THE ROUTING TRACE.  Written AFTER the dispatch so the layer index is still this layer's: `d.layers` is
-    // advanced by the adapter as it consumes the blob, and reading it after the call is the same value the
-    // dispatch used.  Record = int32 layer, int32 k, k int32 ids, k float weights.
+    // the routing trace, one record per layer: int32 layer, int32 k, k int32 ids, k float weights
     if (t->routing != nullptr) {
-        // **`d.layers` HAS ALREADY BEEN ADVANCED BY THE TIME THIS RUNS.**  The adapter walks the blob by incrementing `d.layers` as it consumes each layer's
-        // experts, so after the dispatch it holds the NEXT layer's index.  The index is therefore
-        // one past the layer (a trace spanning 1..48 instead of 0..47 is the symptom), and anything keyed on
-        // the layer index, which is exactly what a cache profile is, would be wrong.
+        // the dispatch advanced `d.layers` past this layer, so this layer is one below it
         const int32_t layer_idx = (int32_t) (t->d.layers - 1);
         if (layer_idx < 0 || layer_idx >= 48) {
             basalt::log::warn("basalt generate", "the routing trace saw layer %d, outside 0..47", layer_idx);
@@ -73,10 +68,10 @@ void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t 
     drive_pool_multi(s->base, x_f, ids, n_tok, k, out, layer);
 }
 
-// A peer card as fast as the main one gets a share f (0.45) of the HOT pairs, so both cards compute routed experts
-// every layer.  Of the first 8700 ranks (about the primary's slots), every pair with floor((r+1)f) > floor(rf) moves
-// to just after that point: the primary fills past them, the peer (which takes what the primary does not hold, in
-// order) gets them first.  Returns the pairs moved; `at` and `fill` get the ranks the log names.
+// A peer card as fast as the main one gets a share `f` of the hot pairs, so both cards compute routed experts every
+// layer.  Of the first `at` ranks, every pair with floor((r+1)f) > floor(rf) moves to just after that point: the
+// primary fills past them and the peer, which takes what the primary does not hold, gets them first.  Returns the
+// pairs moved; `at` and `fill` get the ranks the log names.
 size_t peer_hot_share_order(std::vector<std::pair<int32_t, int32_t>>& profile, size_t& at, size_t& fill) {
     const double f = 0.45;
     at = std::min(profile.size(), (size_t) 8700);

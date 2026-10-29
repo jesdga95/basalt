@@ -3,7 +3,7 @@
 
 namespace basalt::program::serve {
 
-// A SHORT PART OF THE PROMPT - the new message of a chat that continues from a checkpoint, the assistant
+// A short part of the prompt - the new message of a chat that continues from a checkpoint, the assistant
 // header - goes through the verify windows, S tokens at a time, as decode reads them.  The batched path has
 // a high fixed cost per run however few tokens it has (it streams every expert the chunk routes to that is
 // not in VRAM over PCIe) and it borrows slots it must refill after; a window costs little per token, with

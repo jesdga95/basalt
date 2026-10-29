@@ -120,10 +120,7 @@ struct Drive {
     basalt::core::ExpertDispatch d;
     double cpu_ms = 0;
     int64_t calls = 0;
-    /// THE ROUTING TRACE.  `drive_pool` is called once per layer from the main loop - the workers live inside
-    /// `expert_pool_dispatch` - so a single FILE* here needs no locking.  `d.layers` is the CURRENT layer on entry (the
-    /// adapter increments it as it walks the blob), which is why the layer index comes from there rather than from a
-    /// counter of our own.
+    /// The routing trace: written once per layer from the calling thread, so it needs no lock.
     std::FILE* routing = nullptr;
 };
 /// Layer split: every verify stage shares one Drive (its counters, usage and failure flags); the GPU plan, the expert

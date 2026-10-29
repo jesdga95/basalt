@@ -212,7 +212,7 @@ int Runtime::capture_windows() {
     // ---- VRAM <reserve_mib>, between requests, only with --vram-elastic.  It shrinks the expert cache until that
     // much VRAM is free for other programs, or grows it back towards its full size when more than that is free.
     // Never on its own: only this command (the server's POST /v1/vram) moves it.  A shrink gives back the cache's
-    // LAST segments: the experts in their slots become CPU misses, as any expert outside the cache is (no output
+    // last segments: the experts in their slots become CPU misses, as any expert outside the cache is (no output
     // changes beyond what a smaller cache decodes; in the resident RAM mode each is first copied to a RAM home),
     // the prompt path's loan moves down to the end of what is left
     // (a smaller chunk when it no longer fits).  A grow maps them again and puts each slot's expert back (or, when

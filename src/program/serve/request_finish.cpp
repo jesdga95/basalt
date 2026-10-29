@@ -229,7 +229,7 @@ Flow Request::complete() {
                              "VRAM tier, %lld blob reads from the file",
                      (double) runtime_.src.resident_bytes() / 1073741824.0, (long long) runtime_.src.exchanges(),
                      (long long) runtime_.src.file_reads());
-    // CS-T: the tiers, cumulative - GPU cache hits (the decode lookups above), RAM copy, files (SSD / OS cache)
+    // the tiers, cumulative - GPU cache hits (the decode lookups above), RAM copy, files (SSD / OS cache)
     if (runtime_.srcp == &runtime_.src)
         basalt::log::info("basalt serve", "expert tiers: GPU %lld hits this request; since the start RAM %lld blobs, files %lld blobs "
                              "%.1f MB read", (long long) req_hits, (long long) runtime_.src.ram_reads(),

@@ -72,7 +72,7 @@ Flow Request::decode() {
     dec_windows = 0;
     dec_T = 0;
     decode_hits0 = runtime_.drive.d.cache_hits;
-    // CS-T: the RAM and file tiers of this request (the mmap source; 0 with the arena)
+    // the RAM and file tiers of this request (the mmap source; 0 with the arena)
     ram0 = runtime_.src.ram_reads();
     files0 = runtime_.src.file_reads();
     file_bytes0 = runtime_.src.file_read_bytes();
@@ -184,7 +184,7 @@ Flow Request::decode() {
         }
         basalt::core::decode_gaps().mark(18);
         if (hist_n > 0) {
-            // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the fed-back
+            // the tails the penalties count over, one per row: the tokens the state has consumed, the fed-back
             // head `x` (it joins `consumed` only after this window commits), then the drafts before that row -
             // what plain decode would have counted there
             basalt::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), window.data(), T,

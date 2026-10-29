@@ -77,7 +77,7 @@ Flow Request::read_prompt() {
                 if (ids[(size_t) i + 1] == runtime_.o.tail_role_token) turn_at = i;
                 break;
             }
-    // A prompt read from token 0 also stops at its FIRST turn boundary: the end of the system prompt (with the
+    // A prompt read from token 0 also stops at its first turn boundary: the end of the system prompt (with the
     // tools), which every new chat of the same client shares.  That checkpoint becomes the chain's root, which
     // the retention policy pins (conv_cache.hpp), so the next new chat reads only what comes after it.  Only
     // for a system prompt of --prompt-cache-root tokens or more: a small one is cheaper to read again than the

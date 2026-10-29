@@ -3,7 +3,7 @@
 
 namespace basalt::program::serve {
 
-// ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
+// ---- where this request starts reading: the live session, or a checkpoint, whose tokens and pictures are
 // exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
 bool Request::starts_with(const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) {
     const int64_t L = (int64_t) pre.size();
@@ -438,7 +438,7 @@ Flow Request::restore() {
         std::vector<std::vector<basalt::core::ConversationKv>> stage_kv;   // every stage's, for its next park
         for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
         runtime_.conversations->retain(std::move(incoming->kv), int64_t(runtime_.live.size()), std::move(stage_kv), runtime_.rsp);
-        incoming.reset(); // Running-state/checkpoint copies are no longer needed.
+        incoming.reset();   // its running state and checkpoints are in the session now
         basalt::log::info("basalt serve", "conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu",
                      (long long) resume, from_live ? "live" : "checkpoint",
                      std::chrono::duration<double, std::milli>(Clock::now() - restore_t0).count(),

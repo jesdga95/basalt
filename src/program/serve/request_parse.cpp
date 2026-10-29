@@ -20,7 +20,7 @@ Flow Request::parse() {
     // only).  Absent keys keep today's behavior: greedy, no penalties.
     req_temperature = 0.0f;
     req_top_p = 1.0f;
-    req_top_k = 20;   // the sampler's own default; the sampled path REQUIRES top_k in 1..64
+    req_top_k = 20;   // the sampler's own default; the sampled path requires top_k in 1..64
     req_seed = 0;
     req_min_p = 0.0f;
     req_penalty_repeat = 1.0f;

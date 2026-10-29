@@ -117,7 +117,7 @@ bool Runtime::park_current(size_t held, int64_t kept) {
         basalt::log::info("basalt serve", "conversation cache: dropped %zu superseded cop%s of this "
                      "conversation; parked=%zu", dropped, dropped == 1 ? "y" : "ies", conversations->size());
     // A layer split parks one image per stage: the first stage's (with the draft layer's K/V, the drafter
-    // runs on CUDA0) and one per later stage (without it).  The checkpoints are MOVED apart into their
+    // runs on CUDA0) and one per later stage (without it).  The checkpoints are moved apart into their
     // stage parts for the capture and put back together whichever way this ends (no running state copied).
     const size_t n_st = stages.size();
     const basalt::core::QsaState* draft0 = mtp_kv;

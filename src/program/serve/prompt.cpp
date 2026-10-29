@@ -14,11 +14,9 @@ uint64_t Runtime::part_bytes(const PfPart& p, int32_t first) {
                                    (uint64_t) basalt::kernels::cpu::expert_layout().max_blob;
 }
 
-// layer split across GPUs: a prompt path per stage, each handing its chunk's rows to the next.
-// THE CHUNK STEPS DOWN INSTEAD OF EXITING.  A split's stage caches are sized after the arena is registered, and
-// the prompt path's own buffers (no loan) are not priced into them: with the whole arena pinned a
-// `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
-// chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
+// A layer split's prompt paths, one per stage, each handing its chunk's rows to the next.  A stage's cache is sized
+// before its prompt path's own buffers are priced, so a chunk that does not fit is tried one size smaller, down to
+// 512 tokens, instead of stopping the start.
 int Runtime::init_prompt_paths() {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
     for (size_t i = 0; i < stages.size(); ++i) {
         GpuStage& st = *stages[i];
@@ -61,7 +59,7 @@ bool Runtime::split_region(PromptStage& st, int64_t cells, int64_t chunk, int64_
 
 // the batched path's slots are lent just before its first run and given back (refilled) before a window
 // reads - so the windows always see the whole expert cache - or once the prompt is read
-// Every participant gives its loan back here: the rows it lent are refilled into the SAME slots from the
+// Every participant gives its loan back here: the rows it lent are refilled into the same slots from the
 // arena, the residency table is restored, and one upload puts it on every device.  A stage refills through
 // its own cache and its own device - a slot refilled into the wrong cache would leave that stage's cache
 // holding an expert it does not own, which is silent and produces plausible tokens.
@@ -183,7 +181,7 @@ bool Request::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t head) 
                 (fixed_chunk <= 0 || want == p.sp->chunk()))
                 continue;   // its loan covers this (a fixed chunk must be the layout's)
             // the slots the new loan takes again are not refilled first (their experts would be
-            // overwritten by the new layout): only their table entries go back, and the loop below
+            // overwritten by the new layout): only their table entries go back, and the loop that follows
             // lends them again; the new loan's refill brings their experts back after the prompt
             if (!ov_copied) {
                 serve_loans::LoanSplit split = serve_loans::split_loan(p.lent, first);
@@ -191,7 +189,7 @@ bool Request::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t head) 
                 again = std::move(split.again);
                 p.lent = std::move(split.back);
             }
-            // ONLY this participant's loan goes back: `refill` would return the other participants'
+            // only this participant's loan goes back: `refill` would return the other participants'
             // loans too, and their buffers are still laid out in their caches - marking those slots
             // resident again would hand the next window a prompt buffer in place of an expert
             if (!refill_one(p, e)) return false;
@@ -207,7 +205,7 @@ bool Request::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t head) 
             if (!p.sp->relayout(want, p.cache->device_slot(first), runtime_.part_bytes(p, first), e)) return false;
             p.first_now = first;
         }
-        for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
+        for (int64_t l = p.lb; l < p.le; ++l)              // this participant's layers only
             for (int64_t ex = 0; ex < runtime_.g.n_expert; ++ex) {
                 const size_t i = (size_t) (l * runtime_.g.n_expert + ex);
                 if (runtime_.host_res[i] >= first) {
@@ -283,13 +281,13 @@ int Runtime::init_prompt() {
 
     // a cache too small to lend the prompt path its buffers would make it allocate them on top - on a card
     // whose cache already filled its reserve, that is the over-subscription the auto sizing avoids - so the
-    // chunk is the largest one EVERY participant can lend (a smaller chunk only reads slower)
+    // chunk is the largest one every participant can lend (a smaller chunk only reads slower)
     if (pf_borrow && d_res != nullptr) {
         pf_parts.push_back({&xcache, &ss, &sp, -1, 0, multi_gpu ? split_at[0] : g.n_layers, -1, -1, 0, {}});
         for (auto& st : stages)
             pf_parts.push_back({&st->cache, &st->ss, &st->sp, st->dev, st->lb, st->le, -1, -1, 0, {}});
         // The two tests plan_lend makes for CUDA0 alone, one participant at a time: a loan must leave the
-        // 128-slot floor.  The percentage cap is an AUTO-chunk rule and only the auto scan applies it - an
+        // 128-slot floor.  The percentage cap is an auto-chunk rule and only the auto scan applies it - an
         // explicit --prefill is the operator's number, and a loan of it only has to fit.  With one participant
         // (no split) this reduces to plan_lend exactly, so the single-GPU loan is unchanged from main.
         auto fits_one = [&](const PfPart& p, int64_t c, bool cap) -> bool {
@@ -344,7 +342,7 @@ int Runtime::init_prompt() {
         }
         if (chunk > 0) {
             if (o.prefill_auto)
-                // the RESOLVED ring: a chunk under stream_all_min() gets the staging slots and those for copies
+                // the resolved ring: a chunk under stream_all_min() gets the staging slots and those for copies
                 // ahead of its routing.  This is what `init` lays out, and what the INFO line reports to the Monitor tab.
                 basalt::log::info("basalt serve", "prompt chunk auto: %lld tokens, a %lld-slot ring",
                              (long long) chunk,
