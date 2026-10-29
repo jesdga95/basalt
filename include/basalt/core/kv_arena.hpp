@@ -29,8 +29,9 @@ public:
     /// Array `i` is a table, not a cache: every byte `map` backs is filled from `bytes` (from the same offset)
     /// instead of zeroed, as far as `bytes` reaches.
     void set_contents(size_t i, std::vector<uint8_t> bytes);
-    /// `map` backs each array in mappings that end on the grid of `cells` cells (0: one mapping per call), so `unmap`
-    /// gives back everything past the first grid line at or above its cut, however few calls backed it.
+    /// `map` splits each array's new backing at the grid lines of `cells` cells (0: one mapping per call), so a mapping
+    /// starts on a grid line or where an earlier `map` stopped; `unmap` gives back every mapping that starts at or above
+    /// its cut, however few calls backed it.
     void set_extent_cells(int64_t cells) { extent_cells_ = std::max<int64_t>(cells, 0); }
     void close();
     bool valid() const { return !arrays_.empty(); }
