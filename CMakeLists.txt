@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
 endif()
-project(basalt VERSION 0.0.1 LANGUAGES C CXX CUDA)
+project(basalt VERSION 0.1.0 LANGUAGES C CXX CUDA)
 add_compile_definitions(BASALT_VERSION="${PROJECT_VERSION}")
 
 set(CMAKE_CXX_STANDARD 20)
@@ -74,23 +74,8 @@ if(WIN32)
   endif()
 endif()
 
-# Warnings live on an INTERFACE target the project's own C++ code links, NOT in add_compile_options: applied
-# globally they would also hit the extracted ggml C and CUDA sources, whose warnings are not this project's to fix.
-# The flags are guarded by COMPILE_LANGUAGE:CXX so nvcc never receives them as inputs, and by the compiler id:
-# MSVC reads -Wall/-Wextra as /Wall and the invalid /Wextra, so it takes its own spellings. The sources are UTF-8,
-# which MSVC only assumes when told (the Windows SDK's headers are not), hence /utf-8 for both languages.
-add_library(warnings INTERFACE)
-target_compile_options(warnings INTERFACE
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/W4>
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/utf-8>
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wall>
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wextra>
-  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/utf-8>)
-if(WERROR)
-  target_compile_options(warnings INTERFACE
-    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/WX>
-    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Werror>)
-endif()
+# The `warnings` and `platform` targets, one file shared with the standalone `tools/vision` configuration.
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/platform.cmake)
 
 # The application manifest, for every program that names a file path in its command line. Windows decodes argv and
 # the CRT's narrow opens in the machine's ANSI code page unless the image says otherwise, so the same pack path
@@ -171,17 +156,7 @@ add_executable(basalt-plan src/plan/plan_main.cpp)
 target_link_libraries(basalt-plan PRIVATE plan)
 
 # ---- platform (host OS boundary) ------------------------------------
-# The file, memory and process calls the engine makes, so the Win32 and POSIX spellings live in one place.
-# Host-only: no CUDA runtime, which is why the header-only `artifact` target, the vision library, the bench and the
-# standalone test programs can all link it.
-add_library(platform STATIC src/platform/file.cpp src/platform/memory.cpp src/platform/direct_file.cpp src/platform/process.cpp
-  src/platform/mapped_file.cpp src/platform/cpu.cpp src/platform/system.cpp src/platform/dynlib.cpp)
-target_include_directories(platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-# dlopen (DynLib) lives in libdl before glibc 2.34
-target_link_libraries(platform PUBLIC warnings ${CMAKE_DL_LIBS})
-if(WIN32)
-  target_link_libraries(platform PUBLIC advapi32)   # the processor name in the registry
-endif()
+# Defined in cmake/platform.cmake, included above with `warnings`.
 
 # ---- core (GPU runtime) ---------------------------------------------
 add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
@@ -307,7 +282,7 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
 add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
   src/core/remote_expert_opt.cu
   src/core/expert_cache.cpp src/core/vmm.cpp src/core/kv_arena.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
-  src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp)
+  src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/conversation_store.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp)
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(engine PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
 if(BUILD_TESTING)
@@ -358,6 +333,11 @@ if(BUILD_TESTING)
   target_link_libraries(conversation_validation_test PRIVATE engine)
   basalt_cpu_test(NAME conversation_validation_test COMMAND conversation_validation_test)
   set_tests_properties(conversation_validation_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
+  # the disk tier: write, match, cut reads (queued and from the file, in a fresh store), corruption, identity, budget
+  add_executable(conversation_store_test tests/core/conversation_store_test.cpp)
+  target_link_libraries(conversation_store_test PRIVATE engine)
+  basalt_cpu_test(NAME conversation_store_test COMMAND conversation_store_test)
+  set_tests_properties(conversation_store_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
   # The transfer-failure paths are reached by GNU ld's --wrap, which symbolizes the three runtime calls. The Windows
   # linker has no equivalent, so that one program is not built here; the same source builds the ordinary snapshot
   # test above, which does port.
@@ -405,6 +385,11 @@ if(BUILD_TESTING)
   basalt_embed_manifest(file_expert_homes_test)
   basalt_gpu_test(NAME file_expert_homes_test COMMAND file_expert_homes_test)
   set_tests_properties(file_expert_homes_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+  add_executable(file_expert_repin_test tests/core/file_expert_repin_test.cpp)
+  target_link_libraries(file_expert_repin_test PRIVATE engine)
+  basalt_embed_manifest(file_expert_repin_test)
+  basalt_gpu_test(NAME file_expert_repin_test COMMAND file_expert_repin_test)
+  set_tests_properties(file_expert_repin_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   add_executable(kv_arena_test tests/core/kv_arena_test.cpp)
   target_link_libraries(kv_arena_test PRIVATE engine)
   basalt_gpu_test(NAME kv_arena_test COMMAND kv_arena_test)
@@ -418,7 +403,38 @@ add_library(prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefil
 target_include_directories(prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_gpu_include_directories})
 target_link_libraries(prefill PUBLIC engine ${_gpu_blas_target} ${_gpu_runtime_target})
 
-add_executable(basalt src/program/generate.cpp src/program/probe_rates.cpp src/program/serve/loans.cpp)
+add_executable(basalt src/program/generate.cpp src/program/engine_local.cpp src/program/probe_rates.cpp
+                       src/program/serve/batch.cpp
+                       src/program/serve/batch_pipeline.cpp
+                       src/program/serve/commands.cpp
+                       src/program/serve/conversation.cpp
+                       src/program/serve/kv.cpp
+                       src/program/serve/loans.cpp
+                       src/program/serve/loan_moves.cpp
+                       src/program/serve/memory.cpp
+                       src/program/serve/prompt.cpp
+                       src/program/serve/prompt_read.cpp
+                       src/program/serve/prompt_split.cpp
+                       src/program/serve/prompt_windows.cpp
+                       src/program/serve/protocol.cpp
+                       src/program/serve/request.cpp
+                       src/program/serve/request_decode.cpp
+                       src/program/serve/request_finish.cpp
+                       src/program/serve/request_image.cpp
+                       src/program/serve/request_parse.cpp
+                       src/program/serve/request_prefill.cpp
+                       src/program/serve/request_restore.cpp
+                       src/program/serve/runtime.cpp
+                       src/program/serve/slots.cpp
+                       src/program/serve/tier_profile.cpp
+                       src/program/serve/tiers.cpp
+                       src/program/serve/verify.cpp
+                       src/program/serve/vision.cpp
+                       src/program/measure/gpu_modes.cpp src/program/measure/dump_set.cpp
+                       src/program/cli/arguments.cpp src/program/cli/help.cpp src/program/cli/serve.cpp
+                       src/program/cli/options.cpp src/program/cli/control_vectors.cpp
+                       src/program/cli/startup.cpp src/program/cli/gpu.cpp src/program/cli/tokens.cpp
+                       src/program/cli/report.cpp)
 set_target_properties(basalt PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
 target_link_libraries(basalt PRIVATE engine engine_session grammar tokenizer prefill spec ${_gpu_runtime_target})
@@ -905,8 +921,8 @@ if(NOT WIN32)
 endif()
 
 # the platform seams below the engine: thread placement and topology, the compiler helpers, large host regions, the
-# piped child, the system questions and the dynamic loader (CPU only, both platforms).
-foreach(_t cpu_test compiler_test region_test process_pipe_test system_test)
+# piped child, the system questions, the dynamic loader and the file writes and directory calls (CPU only, both platforms).
+foreach(_t cpu_test compiler_test region_test process_pipe_test system_test file_write_test)
   add_executable(platform_${_t} tests/platform/${_t}.cpp)
   target_link_libraries(platform_${_t} PRIVATE platform Threads::Threads)
   target_include_directories(platform_${_t} PRIVATE include)
@@ -969,6 +985,13 @@ target_link_libraries(image_loan_test PRIVATE engine_session warnings)
 basalt_embed_manifest(image_loan_test)
 basalt_cpu_test(NAME image_loan_test COMMAND image_loan_test)
 set_tests_properties(image_loan_test PROPERTIES TIMEOUT 60)
+# a prompt loan's table work: the re-lend split and the routed experts' trades, on a model of the cache (CPU only)
+add_executable(loan_moves_test tests/program/loan_moves_test.cpp src/program/serve/loan_moves.cpp)
+target_include_directories(loan_moves_test PRIVATE src/program/serve)
+target_link_libraries(loan_moves_test PRIVATE warnings)
+basalt_embed_manifest(loan_moves_test)
+basalt_cpu_test(NAME loan_moves_test COMMAND loan_moves_test)
+set_tests_properties(loan_moves_test PROPERTIES TIMEOUT 60)
 add_executable(auto_plan_test tests/program/auto_plan_test.cpp)
 target_link_libraries(auto_plan_test PRIVATE engine_session warnings)
 basalt_embed_manifest(auto_plan_test)
@@ -1100,8 +1123,13 @@ target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels
                                          src/kernels/cpu/kq_avx2.cpp
                                          src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/ggml/ggml_cpu_dispatch.cpp
                                          $<TARGET_OBJECTS:ggml_dots_avx2> $<TARGET_OBJECTS:ggml_dots_avx512>)
-set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
-                            "${_isa_avx512_flags}")
+# the i-quant rows also use BMI2 (pdep/pext for the sign masks; cpu_avx512_ok requires it). MSVC compiles the
+# intrinsics without a switch.
+if(MSVC)
+  set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx512_flags}")
+else()
+  set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx512_flags};-mbmi2")
+endif()
 set_source_files_properties(src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS
                             "${_isa_avx512_flags}")
 set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
@@ -1284,6 +1312,11 @@ if(BUILD_TESTING)
   # needs the AVX-512 VNNI and VBMI instruction sets, which not every host has
   set_property(TEST expert_multi_test APPEND PROPERTY LABELS avx512)
 
+  add_executable(nvfp4_cpu_rows_test tests/kernels/cpu/nvfp4_cpu_rows_test.cpp)
+  target_link_libraries(nvfp4_cpu_rows_test PRIVATE kernels_cpu)
+  basalt_cpu_test(NAME nvfp4_cpu_rows_test COMMAND nvfp4_cpu_rows_test)
+  set_tests_properties(nvfp4_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;avx512")
+
   add_executable(expert_parity tests/kernels/cpu/expert_parity.cpp)
   target_link_libraries(expert_parity PRIVATE kernels_cpu platform)
   # Both tests run on a synthetic expert fixture by default; --file experts.bin (the pack's experts section) checks real blobs.
@@ -1304,6 +1337,11 @@ if(BUILD_TESTING)
   add_executable(iq_avx2_test tests/kernels/cpu/iq_avx2_test.cpp)
   target_link_libraries(iq_avx2_test PRIVATE kernels_cpu platform)
   basalt_cpu_test(NAME iq_avx2_test COMMAND iq_avx2_test)
+  # the AVX-512 i-quant rows: frozen output hashes, token-count independence and a double reference
+  add_executable(iq_avx512_test tests/kernels/cpu/iq_avx512_test.cpp)
+  target_link_libraries(iq_avx512_test PRIVATE kernels_cpu platform)
+  basalt_cpu_test(NAME iq_avx512_test COMMAND iq_avx512_test)
+  set_property(TEST iq_avx512_test APPEND PROPERTY LABELS avx512)
 
   # DirectFile has a Linux backend and a Windows backend, and this test covers those two; macOS is not a platform
   # the engine builds for.

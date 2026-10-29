@@ -84,6 +84,14 @@ std::string python_interpreter(const std::string& src_dir) {
 
 void prefer_oom_victim() {}
 
+bool keep_full_speed() {
+    PROCESS_POWER_THROTTLING_STATE s{};
+    s.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    s.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;   // the process sets its execution speed itself
+    s.StateMask = 0;                                            // and it is never lowered
+    return SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &s, sizeof s) != 0;
+}
+
 bool gpu_peer_access() { return false; }
 
 bool stderr_is_terminal() {
@@ -135,6 +143,8 @@ std::string python_interpreter(const std::string& src_dir) {
 void prefer_oom_victim() {
     if (std::FILE* f = std::fopen("/proc/self/oom_score_adj", "w")) { std::fputs("1000", f); std::fclose(f); }
 }
+
+bool keep_full_speed() { return true; }   // the scheduler does not slow a process for its window's state
 
 bool gpu_peer_access() { return true; }
 

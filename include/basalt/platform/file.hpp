@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 namespace basalt::platform {
 
@@ -103,5 +104,46 @@ int open_unbuffered(int fd);
 /// path in the first place. -1 where the platform gives no such descriptor, and the caller opens the file ordinarily
 /// instead.
 int open_unbuffered(const std::string& path);
+
+/// Creates or truncates `path` for writing, binary. A descriptor for `pwrite_all`; -1 on failure.
+int open_write_utf8(const std::string& path);
+
+/// The same with writes that bypass the OS cache: buffer address, offset and count aligned to 4096. -1 where the
+/// platform gives no such descriptor, and the caller writes through `open_write_utf8` instead.
+int open_write_unbuffered(const std::string& path);
+
+/// Writes exactly `n` bytes at `off`, looping over short writes. False when a write fails.
+bool pwrite_all(int fd, const void* src, uint64_t n, uint64_t off);
+
+/// Waits until what was written through `fd` is on the device. False when the OS reports a failure.
+bool sync_fd(int fd);
+
+/// Creates `path` and its missing parents. True when the directory exists afterwards.
+bool make_dirs(const std::string& path);
+
+/// A regular file in a directory: its name (no directory part), size and last write time (seconds on the file
+/// system's clock, `file_time_now` the same clock's present: only differences of two times mean something).
+struct DirFile {
+    std::string name;
+    uint64_t bytes = 0;
+    int64_t mtime = 0;
+};
+/// The regular files directly in `dir`. False when the directory cannot be read.
+bool list_files(const std::string& dir, std::vector<DirFile>& out);
+
+/// Moves `from` to `to`, replacing a file already there, in one step on the same volume.
+bool rename_replace(const std::string& from, const std::string& to);
+
+/// Deletes a file. True when it is gone afterwards.
+bool remove_file(const std::string& path);
+
+/// Sets a file's last write time to now. False when the file cannot be touched.
+bool touch_file(const std::string& path);
+
+/// The present on the clock `list_files` gives write times on, in seconds.
+int64_t file_time_now();
+
+/// Bytes this process may still write on the volume that holds `path`; 0 when the OS does not say.
+uint64_t disk_free_bytes(const std::string& path);
 
 }  // namespace basalt::platform
