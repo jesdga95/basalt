@@ -21,8 +21,8 @@ request finishes, is cancelled or its client leaves. `/metrics` reports `live.sl
 path, used while one request runs alone, has the same length, so a request that fits a slot never outgrows it, and
 one that does not is refused with a 400 naming that length. `/slots`, `/props` and `/v1/models` report the context
 each slot has. `--slot-full-context` (also `"slot-full-context"` in the config's `server` section) gives every slot
-the whole `--max-context` instead, at N times the KV cache; the startup line says so. The slots' KV cache, and one
-solo session of the same length, come out of the expert cache. Each slot keeps two conversation checkpoints, the end
+the whole `--max-context` instead, at N times the KV cache; the startup line says so. The slots' KV cache and one solo
+session of the same length come out of the expert cache. Each slot keeps two conversation checkpoints, the end
 of its system prompt and its last turn (each when at least `--prompt-cache-root` tokens lie before it), and a new
 request reads only what follows the longest start it shares with any slot's checkpoint, decoding or idle: requests that
 share a long system prompt read it once.
@@ -30,15 +30,15 @@ share a long system prompt read it once.
 Every chat, messages and responses request must name the served model in `model`: the alias (or the model's name) that `/v1/models` lists, or the model file's name. An unknown or missing name is a 404 in the API's own error shape, and replies always carry the served name.
 
 With `--max-context` above 32768 the KV cache is elastic (not with `--kv-resident` or `--vram-elastic`; a peer card is
-fine): each session backs its first 32768
-cells at startup (the K/V pools, the indexer's block keys, the RoPE tables and the draft layer's K/V alike), and the
-rest of that VRAM holds the expert cache's last slots until a request needs it. A request backs its prompt plus 16384 cells before the prompt is read (and 16384 more whenever decode runs past that) by taking
-those slots back; their experts become CPU misses read from their RAM copies, which the RAM copy keeps for exactly this.
+fine): each session backs its first 32768 cells at startup (the K/V pools, the indexer's block keys, the RoPE tables
+and the draft layer's K/V alike), and the rest of that VRAM holds the expert cache's last slots until a request needs
+it. A request backs its prompt plus 16384 cells before the prompt is read (and 16384 more whenever decode runs past
+that) by taking those slots back; their experts become CPU misses read from their RAM copies, which the RAM copy keeps for exactly this.
 The next request that needs less gives the cells back and the cache refills the slots from RAM. A short request so
 decodes with the cache a 32k context would have, whatever `--max-context` is. With `--parallel` every slot is elastic
 once its share of the context is above 4096 tokens: it backs 4096 cells at startup and grows by 4096, so idle and short
-slots leave their VRAM to the expert cache. The startup line `elastic KV: ...` says
-how much of the cache is lent this way, and each move is logged (`elastic KV: N cells backed ...`). The cache never goes
+slots leave their VRAM to the expert cache. The startup line `elastic KV: ...` says how much of the cache is lent this
+way, and each move is logged (`elastic KV: N cells backed ...`). The cache never goes
 below the slots a prompt chunk needs: a request whose KV would take it there, even after the other sessions give back
 the cells they do not hold, is refused with that error, and a reply that grows past it ends with it (a `--parallel`
 slot ends as at its length limit); the engine keeps running.
@@ -49,10 +49,10 @@ share of its experts. Its first token so comes about as soon as on an idle engin
 the prompt path runs on its own thread, the slots' decode windows keep running (their kernels take the higher stream
 priority), and the few steps that touch the draft layer or the output run between two windows, so a long prompt does
 not stop the other requests. A much shorter request that arrives meanwhile goes first at the end of the long prompt's
-current chunk; the rest of the long prompt is read after it, beside the slots, in the same chunks. The cache slots its loan and its KV take hold, before they are taken, only experts the
-decoding slots route least: the ones they routed lately trade places with less-routed experts of their layer, so the
-slots keep their experts in VRAM while the prompt is read. A prompt that arrives while no other slot is decoding is read as in the single-stream
-path.
+current chunk; the rest of the long prompt is read after it, beside the slots, in the same chunks. The cache slots its
+loan and its KV take hold, before they are taken, only experts the decoding slots route least: the ones they routed
+lately trade places with less-routed experts of their layer, so the slots keep their experts in VRAM while the prompt
+is read. A prompt that arrives while no other slot is decoding is read as in the single-stream path.
 
 On one card, a batch window's layer with enough CPU misses sends a share of them over PCIe: CUDA0 copies them from
 their RAM copies into VRAM staging and computes them while the CPU pool computes the rest, both reading RAM at once.
@@ -60,12 +60,11 @@ The startup line `batch windows: a layer with N+ CPU misses sends a share of the
 threshold. A request decoding alone runs the single-stream path and is not affected.
 
 At startup the server prints one `[server] kv` line per device with all the session state placed there, for
-example `12.5GiB cuda2 solo=262144 slots=2x262144 draft=0.5GiB`. With elastic KV (the
-default for a server whose `--max-context` is above 32768, or with `--parallel` for slots above 4096 tokens) it reads `0.6/4.4GiB cuda0 elastic`: the memory backed at startup, and what the cache can
-grow to at `--max-context`. Because that memory is
-taken from the expert cache, the engine warns (`warning: the N batch slots' sessions ... take X GiB of CUDA0
-...`) when it leaves the cache short of the expert set, or at under half of what it would hold without the slots, and
-names the remedies: a smaller `--max-context`, no `--slot-full-context`, fewer `--parallel` slots. If a slot's session
+example `12.5GiB cuda2 solo=262144 slots=2x262144 draft=0.5GiB`. With elastic KV (the default for a server whose
+`--max-context` is above 32768, or with `--parallel` for slots above 4096 tokens) it reads `0.6/4.4GiB cuda0 elastic`:
+the memory backed at startup, and what the cache can grow to at `--max-context`. Because that memory is taken from the
+expert cache, the engine warns (`warning: the N batch slots' sessions ... take X GiB of CUDA0 ...`) when it leaves the
+cache short of the expert set, or at under half of what it would hold without the slots, and names the remedies: a smaller `--max-context`, no `--slot-full-context`, fewer `--parallel` slots. If a slot's session
 does not fit at all, the engine says which slot (`warning: --batch N: slot K's session does not fit`) and starts with
 the slots that did fit; if fewer than two fit, `--batch is off` and the server runs one request at a time.
 
@@ -172,14 +171,13 @@ unload) is written to DIR: one file for its tokens and running state, and shared
 cells) and for each checkpoint's state, each named by the tokens it covers and its bytes, so the same conversation
 written again, or another that starts the same way, writes only the blocks and states that are new. A conversation whose
 last checkpoint (the end of its last prompt) is at most 4096 tokens behind is stored as of that checkpoint, with no
-running state of its own: the next turn goes on from there, and a reply sent back as it was is read again. A later
+running state of its own: the next turn goes on from there, and a reply sent back as it was is read
+again. A later
 prompt that starts with a stored conversation (its tokens, or one of its checkpoints) reads it back cut at that point
-and goes on from there, after a restart too: the wait is the drive reading the K/V cache instead of the prompt being
-read again. A file is bound to the model file, the stored-conversation format and the settings that change the state
+and goes on from there, after a restart too: the wait is the drive reading the K/V cache. A file is bound to the model file, the stored-conversation format and the settings that change the state
 (the KV type, the rope, the draft layer, control vectors); every part of it carries a hash, and a file that does not
-check out is deleted, never restored. A conversation is written again only once it has grown 4096 tokens past its stored
-copy, and after a second without input (no slot decoding) the engine writes each one that has, so a crash or a kill
-loses at most that much of a conversation. The budget caps the folder, least recently used conversations first (a shared
+check out is deleted, never restored. After a second without input (no slot decoding) the engine writes each conversation that has grown 4096 tokens past its
+stored copy, so a crash or a kill loses at most that much. The budget caps the folder, least recently used conversations first (a shared
 file goes with the last conversation that uses it), and a write always leaves 4 GiB of the volume free. Writes on the
 drive that holds the model file can slow its next load: a cache directory on another drive avoids that.
 
@@ -208,9 +206,9 @@ Basalt refuses settings that would leave the machine without memory, and never s
   what one prompt chunk reads from the file (up to 3.5 GiB for the lent GPU slots, plus the SSD-held experts of two
   layers). The startup line `RAM floor ...` gives the figures. When every expert has a place, only the margin is kept;
   the copies kept for the lent slots and the adaptive swaps do not count toward that: they take the RAM left over.
-- A server's RAM copy also leaves room for what serving takes after startup: the conversation checkpoints (each the
-  model's whole running state, `--prompt-cache` of them per slot plus one), `--conversation-cache-mib`, one image's
-  buffers and a request's own buffers. The startup line `RAM ... free, guard ...` gives the figures.
+- A server's RAM copy also leaves room for what serving takes after startup: the conversation checkpoints (each the model's
+  whole running state, `--prompt-cache` of them per slot plus one), `--conversation-cache-mib`, one image's buffers and a
+  request's own buffers. The startup line `RAM ... free, guard ...` gives the figures.
 - With the adaptive tier, the RAM copy also holds free places for the experts that leave the GPU, so a topic change can
   swap quickly. The startup line `free places for the adaptive swaps` shows the count (four times `--adapt-swaps` on a server); if RAM is short, fewer are kept
   and a round swaps fewer.
@@ -258,18 +256,16 @@ works, whether or not it runs the engine, and the startup line names it.
 { "server": { "gpu": "0,1", "vision": 1 } }
 ```
 
-A GPU number uses the sidecar, which the main build also produces (`tools/vision` also builds on its own); the
-server looks for it next to `bin/basalt` and only needs the named card to exist: the sm_120 rule is the engine's,
-not the separate sidecar binary's. The card a sidecar is built for is chosen at its configure time
-(`-DCMAKE_CUDA_ARCHITECTURES=<cc>`); pointed at another one it fails at startup with CUDA's own error, and the
-server shows it. Sidecars on non-Blackwell cards are community-tested. `dynamic` needs no sidecar.
+A GPU number uses the sidecar, which the main build also produces (`tools/vision` builds on its own too). The server
+looks for it next to `bin/basalt` and only needs the named card to exist: the sm_120 rule is the engine's, not the
+sidecar's. A sidecar is built for one card at configure time (`-DCMAKE_CUDA_ARCHITECTURES=<cc>`); on another it fails
+at startup with CUDA's own error, which the server shows. Sidecars on non-Blackwell cards are community-tested.
+`dynamic` needs no sidecar.
 
 The image encoder is Basalt's own, written for this model's vision tower (no llama.cpp or ggml): bf16 tensor-core
 products and flash attention with fp32 accumulation on the GPU, AVX-512/AVX2 on the CPU. It replaces llama.cpp's
-mtmd encoder as a drop-in, is faster than it at every image size, and stays closer to an fp32 reference: mtmd's fp16
-attention drifts on large images, ours does not.
-
-One image is capped at 64 megapixels; a header past it is refused before it is decoded.
+mtmd encoder as a drop-in, is faster at every image size, and stays closer to an fp32 reference: mtmd's fp16 attention
+drifts on large images. One image is capped at 64 megapixels; a header past it is refused before it is decoded.
 
 ## `PROBE rates` (engine command)
 
@@ -292,7 +288,8 @@ A step that cannot run prints `n/a` with a reason (no peer, no RAM-resident expe
 During a batch the command answers `ERR PROBE: ...`.
 
 `PROBE set workers=K share=F` (either key) sets the CPU pool's active worker count and the prompt path's CPU share for the
-requests that follow, and answers `PROBE end workers=<count>`. It is for `basalt-probe`; the settings last until the engine stops.
+requests that follow, and answers `PROBE end workers=<count>`. It is for `basalt-probe`; the settings last until
+the engine stops.
 
 `PROBE adapt [every=N] [swaps=N] [decay=F] [profile=FILE]` puts the expert tiers back where they were at `READY`, or
 with `profile=` places that saved profile's ranking into the same slots, copying only the slots whose expert differs.
