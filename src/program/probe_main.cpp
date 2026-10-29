@@ -241,14 +241,16 @@ int main(int argc, char** argv) {
         set_arg(args, "--adapt-swaps", std::to_string(most));
     }
     // the GPUs, chosen here once as the server chooses them: the engine sees only those cards and says nothing again
+    std::string gpu_given = arg_value(args, "--gpu");
     {
         std::string gpu_value;
         std::vector<GpuCard> used;
-        if (!select_gpus(arg_value(args, "--gpu"), "basalt-probe", gpu_value, used, err)) {
+        if (!select_gpus(gpu_given, "basalt-probe", gpu_value, used, err)) {
             basalt::log::error("basalt-probe", "%s", err.c_str());
             return 2;
         }
         set_arg(args, "--gpu", gpu_value);
+        if (gpu_given.empty()) gpu_given = gpu_value;
     }
 
     // fixtures
@@ -413,10 +415,7 @@ int main(int argc, char** argv) {
     in.suggested = suggested;
     in.speeds = speeds;
     in.adapt_line = adapt_line;
-    for (size_t i = 0; i < args.size(); ++i) {
-        if (args[i] == "--model") { ++i; continue; }
-        in.config += (in.config.empty() ? "" : " ") + args[i];
-    }
+    in.config = format_config(args, gpu_given);
     // total wall time from program start, engine launch included
     in.wall_s = std::chrono::duration<double>(Clock::now() - t_start).count();
     std::fputs(format_report(in).c_str(), stdout);

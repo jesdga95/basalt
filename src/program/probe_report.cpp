@@ -137,4 +137,18 @@ std::string format_report(const ReportInput& in) {
     return o;
 }
 
+std::string format_config(const std::vector<std::string>& args, const std::string& gpu_given) {
+    std::string out;
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == "--model") { ++i; continue; }
+        if (!out.empty()) out += " ";
+        out += args[i];
+        if (args[i] == "--gpu" && i + 1 < args.size()) {
+            out += " " + gpu_given;
+            ++i;
+        }
+    }
+    return out;
+}
+
 }  // namespace basalt::program

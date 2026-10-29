@@ -90,6 +90,15 @@ int main() {
     CHECK(format_report(in).find("tok/s (measured)\n  adapt test  1/96/0.85 250 252 tok/s (band 1.0%)\n  suggested:") !=
           std::string::npos);
 
+    // the config line names the cards as given, not as the engine sees them
+    {
+        const std::vector<std::string> a = {"--model", "m.basalt", "--gpu", "0", "--kv", "int8"};
+        CHECK(format_config(a, "1") == "--gpu 1 --kv int8");
+        CHECK(format_config(a, "auto") == "--gpu auto --kv int8");
+        CHECK(format_config({"--gpu", "0,1", "--spec", "8"}, "0,1") == "--gpu 0,1 --spec 8");
+        CHECK(format_config({"--gpu", "0", "--kv", "int8"}, "0") == "--gpu 0 --kv int8");
+    }
+
     if (failures) return 1;
     std::printf("probe_report_test: ok\n");
     return 0;
