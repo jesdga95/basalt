@@ -29,7 +29,7 @@ behind one declaration, and a test in `tests/platform/` that runs on both.
 | memory | `memory.hpp` | RAM probes, page locking, aligned and huge-page allocation |
 | CPU | `cpu.hpp` | topology |
 | processes | `process.hpp` | spawn, wait, terminate, pipes, signals |
-| system | `system.hpp`, `dynlib.hpp` | process memory, disk queries, the NVML loader |
+| system | `system.hpp`, `dynlib.hpp` | process memory, disk queries, full speed in the background, the NVML loader |
 | compiler | `compiler.hpp` | CPUID, bit scan, spin hint, fp16 rounding |
 | Win32 | `win.hpp` | the only inclusion of `windows.h` |
 

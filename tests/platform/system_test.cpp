@@ -9,6 +9,10 @@
 #include <fstream>
 #include <string>
 
+#if defined(_WIN32)
+#include "basalt/platform/win.hpp"
+#endif
+
 namespace {
 int failures = 0;
 void check(bool ok, const std::string& what) {
@@ -41,6 +45,18 @@ int main() {
     const ThreadWaits w = threads_in_disk_wait();
     check(w.waiting <= w.threads, "threads_in_disk_wait counts waiting within all");
     if (!mi.empty()) check(w.threads >= 1, "and lists this process's threads");
+
+    check(keep_full_speed(), "keep_full_speed is accepted");
+    check(keep_full_speed(), "and accepted again");
+#if defined(_WIN32)
+    // older Windows builds accept the state but cannot report it back
+    PROCESS_POWER_THROTTLING_STATE pt{};
+    pt.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    if (GetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof pt) != 0)
+        check((pt.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0 &&
+                  (pt.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) == 0,
+              "and the OS reports execution speed as never lowered");
+#endif
 
     (void) gpu_peer_access();
     const DynLib nvml = DynLib::open_nvml();

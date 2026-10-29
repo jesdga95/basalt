@@ -27,6 +27,12 @@ std::string python_interpreter(const std::string& src_dir);
 /// such knob.
 void prefer_oom_victim();
 
+/// Asks that this process keep running at full speed while its window is in the background or minimized. Windows
+/// otherwise lowers such a process's quality of service, which on a hybrid CPU keeps its threads on the efficiency
+/// cores, where the CPU expert pool's workers wait on each other. False when the OS refused; true where the OS has no
+/// such knob.
+bool keep_full_speed();
+
 /// Whether a process is given direct GPU-to-GPU access between its devices, which a second GPU holding an expert tier
 /// needs. False where the platform withholds it.
 bool gpu_peer_access();
