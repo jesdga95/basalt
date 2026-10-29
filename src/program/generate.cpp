@@ -1936,9 +1936,14 @@ int main(int argc, char** argv) {
         int64_t slots = ((int64_t) free_b - reserve) / blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
-        basalt::log::info("basalt generate", "expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
+        // a reserve raised to hold the late room says what was asked
+        const std::string raised = reserve_b > ((int64_t) o.vram_reserve_mib << 20)
+            ? " (" + std::to_string(o.vram_reserve_mib) + " asked, raised to hold " + std::to_string(late_room >> 20) +
+                  " MiB that loads into it and the " + std::to_string(vram_floor_mib()) + " MiB floor)"
+            : std::string();
+        basalt::log::info("basalt generate", "expert cache auto: %.2f GiB free, %d MiB reserved%s (+%lld MiB for the "
                              "draft head, +%lld MiB for what loads after) -> %d slots",
-                     (double) free_b / 1073741824.0, (int) (reserve_b >> 20), (long long) (mtp_bind >> 20),
+                     (double) free_b / 1073741824.0, (int) (reserve_b >> 20), raised.c_str(), (long long) (mtp_bind >> 20),
                      (long long) (late_b >> 20), o.expert_cache);
         // The batch slots' sessions came out of the same VRAM: say when that leaves the cache short of the expert set
         // (experts then swap in and out per token) or of half of what it would hold without them.
