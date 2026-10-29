@@ -260,7 +260,7 @@ struct Lt::State {
             if (res[i].state == CUBLAS_STATUS_SUCCESS &&
                 cublasLtMatmulAlgoConfigGetAttribute(&res[i].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splits,
                                                      sizeof splits, &got) == CUBLAS_STATUS_SUCCESS &&
-                splits <= 1)
+                (splits == 0 || splits == 1))   // a negative count is a split chosen per launch
                 pick = i;
         }
         if (pick < 0 && n > 0 && res[0].state == CUBLAS_STATUS_SUCCESS) {
