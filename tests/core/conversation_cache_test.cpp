@@ -341,6 +341,12 @@ int main() {
         CheckpointBytes b;
         b.resize(big);
         check(b.data() == first, "a freed large checkpoint buffer is handed out again");
+        {
+            CheckpointBytes c;
+            c.resize(big);
+        }
+        check(CheckpointBytes::allocator_type::release_pooled() >= big, "the kept blocks are freed");
+        check(CheckpointBytes::allocator_type::release_pooled() == 0, "none is kept after that");
         check(b[0] == 9 && b[big - 1] == 4, "a reused buffer is not zeroed");
         CheckpointBytes small(100, 3), copy = small;
         check(copy.size() == 100 && copy[99] == 3, "small buffers still copy and fill");

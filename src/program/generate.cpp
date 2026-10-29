@@ -6578,9 +6578,9 @@ int main(int argc, char** argv) {
         // what a stop's error compares against, to tell the engine's own growth from other programs'
         const uint64_t ready_avail = basalt::platform::available_memory();
         const uint64_t ready_rss = (uint64_t) basalt::platform::process_memory().rss_mib << 20;
-        // once per drop below the guard's floor, on the serve thread between steps: the parked conversations go and
-        // the heap's free pages return to the OS.  The checkpoints stay: a live request's rewind and the deferred
-        // copy in flight use them.
+        // once per drop below the guard's floor, on the serve thread between steps: the parked conversations go, the
+        // checkpoint blocks kept for reuse are freed and the heap's free pages return to the OS.  The checkpoints stay:
+        // a live request's rewind and the deferred copy in flight use them.
         uint64_t shed_drop = 0;
         auto shed_if_low = [&]() {
             if (basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok) return;
@@ -6592,6 +6592,9 @@ int main(int argc, char** argv) {
             if (freed > 0)
                 basalt::log::info("basalt serve", "RAM guard: dropped %zu parked conversations (%zu MiB)", parked,
                                   freed >> 20);
+            if (const size_t pooled = basalt::core::CheckpointBytes::allocator_type::release_pooled(); pooled > 0)
+                basalt::log::info("basalt serve", "RAM guard: freed %zu MiB of checkpoint blocks kept for reuse",
+                                  pooled >> 20);
             const uint64_t before = basalt::platform::available_memory();
             basalt::platform::release_free_heap();
             const uint64_t after = basalt::platform::available_memory();
