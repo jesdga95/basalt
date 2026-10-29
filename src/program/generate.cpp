@@ -6392,9 +6392,10 @@ int main(int argc, char** argv) {
         // what a stop's error compares against, to tell the engine's own growth from other programs'
         const uint64_t ready_avail = basalt::platform::available_memory();
         const uint64_t ready_rss = (uint64_t) basalt::platform::process_memory().rss_mib << 20;
-        // once per drop below the guard's floor, on the serve thread between steps: the parked conversations go, the
-        // checkpoint blocks kept for reuse are freed and the heap's free pages return to the OS.  The checkpoints stay:
-        // a live request's rewind and the deferred copy in flight use them.
+        // once per drop below the guard's floor, on the serve thread between steps: the parked conversations leave RAM
+        // (to the disk tier when it is on and holds no copy of them yet: queued for its writer, whose writes free them;
+        // the others are dropped), the checkpoint blocks kept for reuse are freed and the heap's free pages return to
+        // the OS.  The checkpoints stay: a live request's rewind and the deferred copy in flight use them.
         uint64_t shed_drop = 0;
         auto shed_if_low = [&]() {
             if (basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok) return;
@@ -6403,9 +6404,14 @@ int main(int argc, char** argv) {
             shed_drop = drop;
             const size_t parked = conversations.size();
             const size_t freed = conversations.clear();
+            size_t to_disk = 0;
+            for (auto& sc : conversations.take_spilled())
+                if (disk.enabled() && !disk_has(sc.live.ids, sc.live.imgs, sc.checkpoints, sc.cvec) &&
+                    disk.put(std::move(sc), kDiskQueueCap))
+                    ++to_disk;
             if (freed > 0)
-                basalt::log::info("basalt serve", "RAM guard: dropped %zu parked conversations (%zu MiB)", parked,
-                                  freed >> 20);
+                basalt::log::info("basalt serve", "RAM guard: %zu parked conversations (%zu MiB) leave RAM, %zu of them "
+                                  "to disk", parked, freed >> 20, to_disk);
             if (const size_t pooled = basalt::core::CheckpointBytes::allocator_type::release_pooled(); pooled > 0)
                 basalt::log::info("basalt serve", "RAM guard: freed %zu MiB of checkpoint blocks kept for reuse",
                                   pooled >> 20);

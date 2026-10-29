@@ -370,9 +370,12 @@ public:
     }
     size_t superseded() const { return superseded_; }
 
-    // Drop every parked conversation and the retained K/V buffers, to give their RAM back; returns the bytes freed.
+    // Drop every parked conversation and the retained K/V buffers, to give their RAM back; returns their bytes.  With
+    // spilling on, the conversations wait in take_spilled() for the tier below, as make_room's evictions do.
     size_t clear() {
         const size_t freed = bytes();
+        if (spill_)
+            for (auto& e : entries_) spilled_.push_back(std::move(e));
         entries_.clear();
         bytes_ = 0;
         reuse_ = {};

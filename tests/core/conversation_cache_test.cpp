@@ -92,6 +92,18 @@ int main() {
         check(cache.size() == 0 && cache.bytes() == 0 && cache.retained_bytes() == 0, "clear leaves nothing parked or retained");
         check(cache.best(std::vector<int64_t>{1, 2, 3, 4}, {}, true).tokens == 0, "a cleared conversation no longer matches");
         check(cache.put(image({1, 2, 3})) && cache.size() == 1, "the cache parks again after a clear");
+        check(cache.take_spilled().empty(), "without spilling, a clear hands nothing to the tier below");
+    }
+    {   // with spilling on, a clear hands the parked conversations to the tier below
+        ConversationCache cache(1 << 20, 4);
+        cache.set_spill(true);
+        check(cache.put(image({1, 2, 3})) && cache.put(image({9, 8, 7})), "park two (spilling on)");
+        cache.clear();
+        check(cache.size() == 0 && cache.bytes() == 0, "the cleared cache holds nothing");
+        const auto spilled = cache.take_spilled();
+        check(spilled.size() == 2 && spilled[0].live.ids == std::vector<int32_t>{1, 2, 3} &&
+                  spilled[1].live.ids == std::vector<int32_t>{9, 8, 7},
+              "both wait for the tier below, oldest first");
     }
     {   // retained K/V belongs to the session it was restored into
         int s0 = 0, s1 = 0;
