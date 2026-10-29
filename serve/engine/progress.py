@@ -165,6 +165,15 @@ class LoadBars:
                                  f"{have / 2**30:5.1f}/{plan / 2**30:.1f} GiB{rate}"))
         return out
 
+    def progress(self) -> dict:
+        """The load so far: {"percent": int | None, "gib": {target: GiB}} over the weight targets (copies apart)."""
+        with self.lock:
+            want = self.total or sum(t["plan"] for (tg, c), t in self.targets.items() if not c and tg != self.TABLE)
+            have = {self.key(tg): round((t["done"] + t["last"]) / 2**30, 1)
+                    for (tg, c), t in self.targets.items() if not c and tg != self.TABLE and t["start"] is not None}
+            pct = min(99, int(100 * self.done() / want)) if want > 0 else None
+            return {"percent": pct, "gib": have}
+
     def lines(self) -> list[str]:
         return [text for _, text in self._rows()]
 
@@ -404,8 +413,10 @@ def start_errors(log: str | None, offset: int) -> list[str]:
     return [e for x in lines if (e := engine_error(x.strip())) is not None]
 
 
-def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=20.0, out=None, gpus=None) -> None:
-    """Show load progress and warnings from the engine log, with a heartbeat while idle."""
+def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=20.0, out=None, gpus=None,
+                  on_progress=None) -> None:
+    """Show load progress and warnings from the engine log, with a heartbeat while idle. `on_progress(dict)` gets
+    LoadBars.progress() after each batch of log lines."""
     global _active
     bars = _active = LoadBars(out, gpus)
     t0 = last = time.time()
@@ -438,6 +449,8 @@ def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=2
                     bars.say(f"[server] warning: {w}")
                 elif (r := engine_ram_floor(line)) is not None:
                     bars.say(tagged("ram", f"floor {r}"))
+        if on_progress is not None and chunk.count(b"\n"):
+            on_progress(bars.progress())
         bars.refresh()
         if stop:
             bars.finish()

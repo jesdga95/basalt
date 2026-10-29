@@ -33,6 +33,9 @@
 
 namespace basalt::program::engine_local {
 
+// Spare RAM places for a saturated adaptation round.
+inline constexpr int kSatBoost = 4;
+
 /// One candidate split price: the plan's cost, the prompt chunk and the head chunk it was measured with, and when the
 /// part is not priced (chunk 0) why not.
 struct SplitPricing {
@@ -117,10 +120,7 @@ struct Drive {
     basalt::core::ExpertDispatch d;
     double cpu_ms = 0;
     int64_t calls = 0;
-    /// THE ROUTING TRACE.  `drive_pool` is called once per layer from the main loop - the workers live inside
-    /// `expert_pool_dispatch` - so a single FILE* here needs no locking.  `d.layers` is the CURRENT layer on entry (the
-    /// adapter increments it as it walks the blob), which is why the layer index comes from there rather than from a
-    /// counter of our own.
+    /// The routing trace: written once per layer from the calling thread, so it needs no lock.
     std::FILE* routing = nullptr;
 };
 /// Layer split: every verify stage shares one Drive (its counters, usage and failure flags); the GPU plan, the expert
@@ -189,5 +189,15 @@ struct PromptStage {
     uint8_t* buf = nullptr;               ///< the read's prompt buffers, `buf_bytes` long, below its session
     uint64_t buf_bytes = 0;
 };
+
+void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd, int64_t k,
+                float* out);
+void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
+                      int64_t layer);
+void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
+                      int64_t layer);
+
+// Shares the hottest profile pairs between the main and peer expert tiers.
+size_t peer_hot_share_order(std::vector<std::pair<int32_t, int32_t>>& profile, size_t& at, size_t& fill);
 
 }  // namespace basalt::program::engine_local

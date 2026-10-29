@@ -9,7 +9,7 @@
 // A conversation is one file for its tokens, live state and the K/V past its last whole block, plus shared files: one
 // per block of K/V cells and one per checkpoint state, each named by its token prefix and its bytes.  The same
 // conversation written again a few turns on writes only its new blocks and states; files no conversation refers to
-// are removed.  Every name carries the identity it was written under (the model file, the engine and every setting
+// are removed.  Every name carries the identity it was written under (the model file and every setting
 // that changes the state's bytes).  Reads are fail-closed: header, section table and every 1 MiB block of payload carry
 // hashes, a shared file must match its name, and any mismatch drops the conversation.  The directory keeps to a byte
 // budget, least recently used conversations first.
@@ -28,6 +28,11 @@
 #include <vector>
 
 namespace basalt::core {
+
+/// The stored-conversation format, written in every file header; a file of another format is dropped.  Change it
+/// whenever the stored bytes of a conversation change: the file layouts, the snapshot layout, the K/V or GDN state
+/// layout, a checkpoint state.
+inline constexpr uint32_t kConversationFormat = 2;
 
 struct ConversationStoreBuffer;
 

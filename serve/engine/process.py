@@ -209,6 +209,8 @@ class ProcessEngine:
         if "sleep_lock" not in self.__dict__:            # sleep, wake and close never overlap, across restarts too
             self.sleep_lock = threading.RLock()
         self.ended, self.unloaded = True, True
+        if "loading" not in self.__dict__:               # restart() holds these across its __init__ calls
+            self.loading, self.load_status = False, {}
         self.asleep = False              # its GPU state suspended by the driver (sleep/wake)
         self.restore_s = 0.0             # the driver's part of the last wake
         self.max_context = int(flag_value(args, "--max-context") or 4096)
@@ -235,7 +237,7 @@ class ProcessEngine:
             visible = (env or os.environ).get("CUDA_VISIBLE_DEVICES", "")
             gpus = [int(x) for x in visible.split(",") if x.strip().isdigit()]
             narrator = threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), loading),
-                                        kwargs={"gpus": gpus}, daemon=True)
+                                        kwargs={"gpus": gpus, "on_progress": self._note_load}, daemon=True)
             narrator.start()
             # one follower per log, across restarts
             if REQUEST_LINES and os.path.abspath(log) not in _echoing:
@@ -338,6 +340,9 @@ class ProcessEngine:
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
 
+    def _note_load(self, status: dict) -> None:
+        self.load_status = status
+
     @staticmethod
     def _ready_pump(proc, out: queue.Queue, log=None) -> None:
         """The engine's first lines up to READY, for a read that can time out; None when its output closed first."""
@@ -436,6 +441,7 @@ class ProcessEngine:
         """Start the engine again after it died; a start that exits before READY is retried."""
         info = dict(self.info)
         self.starting = True                     # prepare() answers 503 meanwhile
+        self.loading, self.load_status = True, {}
         try:
             self.close()
             for i in range(tries):
@@ -458,6 +464,7 @@ class ProcessEngine:
                     time.sleep(self.RESTART_RETRY_S)
         finally:
             self.starting = False
+            self.loading = False
             with self.slot_cv:                   # wake the requests that waited through the restart
                 self.slot_cv.notify_all()
         self.info = {**info, **self.info}
