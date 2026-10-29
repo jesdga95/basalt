@@ -120,7 +120,11 @@ grammar form) is not enforced.
 ## Speculative decoding does not change output
 
 Verify guarantees that a token's logits are bit for bit those of plain decode, whatever the window width
-(verify.hpp:3-8). This section tests that end to end.
+(verify.hpp:3-8). This section tests that end to end. The GDN middle of every window of one to eight rows runs as the
+mid chain, so the guarantee holds on every device. Profiled runs (`--profile`), batched windows (`--batch`) and a GDN
+mixer split across two cards run the three separate kernels instead; on a device with fewer than 160 SMs their output
+projection rounds differently from the mid chain, so those runs are exact among themselves but not bitwise equal to a
+plain run there.
 
 The default window is 8 tokens (`--spec 8`; an explicit `--spec N` is used as given). Greedy decoding with the drafter
 stays exact at any window. A sampled request is still drawn from the model's own distribution, but the window length
