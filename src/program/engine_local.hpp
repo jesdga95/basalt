@@ -33,6 +33,9 @@
 
 namespace basalt::program::engine_local {
 
+// Spare RAM places for a saturated adaptation round.
+inline constexpr int kSatBoost = 4;
+
 /// One candidate split price: the plan's cost, the prompt chunk and the head chunk it was measured with, and when the
 /// part is not priced (chunk 0) why not.
 struct SplitPricing {
@@ -189,5 +192,15 @@ struct PromptStage {
     uint8_t* buf = nullptr;               ///< the read's prompt buffers, `buf_bytes` long, below its session
     uint64_t buf_bytes = 0;
 };
+
+void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd, int64_t k,
+                float* out);
+void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
+                      int64_t layer);
+void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
+                      int64_t layer);
+
+// Shares the hottest profile pairs between the main and peer expert tiers.
+size_t peer_hot_share_order(std::vector<std::pair<int32_t, int32_t>>& profile, size_t& at, size_t& fill);
 
 }  // namespace basalt::program::engine_local

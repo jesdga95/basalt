@@ -1,0 +1,204 @@
+// src/program/serve/request.hpp - one request's state and execution phases.
+#pragma once
+
+#include "state.hpp"
+
+namespace basalt::program::serve {
+
+class Request {
+public:
+    explicit Request(Runtime& runtime) : runtime_(runtime) {}
+    Flow execute();
+
+private:
+    Runtime& runtime_;
+    using PfPart = Runtime::PfPart;
+    using BSlot = Runtime::BSlot;
+    using SlotHeld = Runtime::SlotHeld;
+    bool geni{};
+    char* endp{};
+    long long max_new{};
+    float req_temperature{};
+    float req_top_p{};
+    int req_top_k{};
+    unsigned long long req_seed{};
+    float req_min_p{};
+    float req_penalty_repeat{};
+    float req_penalty_freq{};
+    float req_penalty_present{};
+    int req_penalty_last_n{};
+    std::string req_bias_text{};
+    bool req_bias_present{};
+    int64_t req_gprompt{};
+    std::string req_grammar_text{};
+    int req_cvec{};
+    float req_relax{};
+    int req_ppl{};
+    int req_ppl_t{};
+    int req_clip{};
+    std::vector<float> req_bias{};
+    std::string emb_path{};
+    std::vector<int64_t> ids{};
+    std::string pe{};
+    bool ids_ok{};
+    bool from_text{};
+    int64_t n{};
+    std::unique_ptr<basalt::program::grammar::Guard> gguard{};
+    std::vector<float> grammar_bias{};
+    int64_t grammar_resamples{};
+    basalt::program::PplGate* ppl{};
+    bool bad{};
+    std::array<int64_t, 3> remote_before{};
+    std::array<int64_t, 3> launches_before{};
+    std::array<uint64_t, 3> compact_before{};
+    std::array<uint64_t, 3> full_before{};
+    std::array<double, 3> begin_before{};
+    std::array<double, 3> wait_before{};
+    std::vector<int32_t> ids32{};
+    Clock::time_point r0{};
+    bool want_cvec{};
+    int slot_b{};
+    bool in_slot{};
+    bool solo_req{};
+    basalt::core::SessionState* rview{};
+    struct SoloBook {
+        std::vector<int32_t> live;
+        std::vector<ImgKey> live_imgs;
+        bool live_ok = false, cvec = true;
+        std::vector<ConvCheckpoint> checks;
+    };
+    SoloBook solo_book{};
+    bool solo_moved{};
+    bool own_partial{};
+    bool own_partial_from0{};
+    int64_t own_partial_chunk{};
+    int64_t resume{};
+    bool from_live{};
+    int slot_source{};
+    int64_t slot_tokens{};
+    bool resumed_from0{};
+    int64_t resumed_chunk{};
+    const ConvCheckpoint* slot_ck{};
+    int own_slot{};
+    basalt::core::ConversationCache::Match parked{};
+    std::optional<basalt::core::SavedConversation> incoming{};
+    int64_t in_tokens{};
+    bool in_live{};
+    basalt::core::ConversationStore::Match on_disk{};
+    bool from_disk{};
+    int64_t kv_need{};
+    struct KeepRouted {   // only this admission's fits, while slots decode
+                bool& on;
+                ~KeepRouted() { on = false; }
+            };
+    std::optional<KeepRouted> keep_routed;
+    bool kv_ok{};
+    Clock::time_point restore_t0{};
+    int64_t read_from{};
+    bool ov_copied{};
+    static constexpr double decode_share = 0.5;
+    bool batch_fatal{};
+    int64_t il_parts{};
+    double il_ms{};
+    int64_t yielded_at{};
+    int yielded_slot{};
+    struct SplitPlan { int64_t chunk = 0, head = 0; int stages = 0; std::vector<int> cuts; };
+    basalt::kernels::SamplerParams req_sp{};
+    bool relax_on{};
+    bool in_call{};
+    int64_t relaxed_kept{};
+    int hist_n{};
+    bool cancelled{};
+    int64_t turn_at{};
+    int64_t root_at{};
+    int64_t at{};
+    int64_t fold_p0{};
+    double prompt_ms{};
+    int64_t p{};
+    int32_t x{};
+    std::vector<int32_t> drafts{};
+    std::vector<int32_t> window{};
+    std::vector<int32_t> outv{};
+    std::vector<float> dprob{};
+    basalt::core::DraftCumAdapt cum_adapt{};
+    std::vector<int32_t> sbuf{};
+    bool first_window{};
+    int64_t produced_n{};
+    int64_t sfx_windows{};
+    int64_t sfx_drafts{};
+    int64_t sfx_ok{};
+    int64_t draft_offered{};
+    int64_t draft_accepted{};
+    std::vector<int32_t> consumed{};
+    const char* finish{};
+    std::string kv_stop{};
+    basalt::core::Verifier* cv{};
+    basalt::core::Verifier* ov{};
+    struct HeldWindow { bool on = false; int T = 0; std::vector<int32_t> win, out; };
+    HeldWindow held{};
+    std::vector<int32_t> win_b{};
+    int n_chain{};
+    double full_ema{};
+    bool pair_hint{};
+    bool pair_req{};
+    int64_t pair_runs{};
+    int64_t pair_holds{};
+    Clock::time_point d0{};
+    bool dec_timing{};
+    struct DecSnap {
+        double wait, pool, host, plan, actq, jobs, run, peer_wait;
+        int64_t misses, entries, hits, pcie, peer;
+    };
+    DecSnap ds0{};
+    double dt_run{};
+    double dt_commit{};
+    double dt_draft{};
+    int64_t dec_windows{};
+    int64_t dec_T{};
+    int64_t decode_hits0{};
+    int64_t ram0{};
+    int64_t files0{};
+    uint64_t file_bytes0{};
+    int64_t decode_look0{};
+    int64_t offload0{};
+    int adapt_age{};
+    bool applied_early{};
+    JobRunner apply_thr{};
+    JobRunner adapt_thr{};
+    bool copy_live{};
+    bool copy_done{};
+    struct TkStep { int n = 0; int32_t id[4] = {}; float p[4] = {}; };
+    TkStep tk_prev[16]{};
+    bool tk_valid{};
+    double decode_ms{};
+    int64_t req_hits{};
+    int64_t req_look{};
+    int64_t req_offload{};
+    int64_t fresh{};
+    int64_t read_n{};
+    bool ram_out{};
+    char read_txt[64]{};
+
+    bool starts_with(const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs);
+    bool windows_ok(int64_t a, int64_t b);
+    bool read_windows(int64_t a, int64_t b, std::string& e);
+    bool refill_issue(PfPart& p, std::string& e, bool assign = true);
+    bool refill_wait(PfPart& p, std::string& e);
+    bool refill_one(PfPart& p, std::string& e);
+    bool refill(std::string& e);
+    bool lend(int64_t tokens, std::string& e, int64_t chunk = 0, int64_t head = 0);
+    bool can_yield(int64_t q, int64_t b0, int ys, bool beside = false);
+    bool park_read(int64_t q, int ys, std::string& ye, int64_t chunk = 0);
+    SplitPlan split_plan(int64_t a0, int64_t b0, const char* no_split);
+    bool read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool& ran, std::string& e);
+    bool read_part(int64_t a0, int64_t b0, std::string& e);
+    DecSnap dec_snap();
+    Flow parse();
+    Flow prepare_image();
+    Flow restore();
+    Flow read_prompt();
+    Flow decode();
+    Flow complete();
+};
+
+}  // namespace basalt::program::serve
