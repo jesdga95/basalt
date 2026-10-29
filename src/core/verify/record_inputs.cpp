@@ -37,9 +37,10 @@ bool Verifier::WindowRecorder::inputs() {
             return false;
         }
     }
-    // ---- the async commit's remainder (a no-op when none is pending): nothing below reads or writes what it works on until
-    // this node returns - the GDN state, conv history, indexer buffers and PLE history, nor the rows it reads (h_L_,
-    // qkv_L_, gate_L_, beta_L_, idx_raw_L_, tail_snap_, hist_snap_), which the first kernels' launches order after it
+    // ---- the async commit's remainder (a no-op when none is pending): nothing later in the window reads or writes
+    // what it works on until this node returns - the GDN state, conv history, indexer buffers and PLE history, nor the
+    // rows it reads (h_L_, qkv_L_, gate_L_, beta_L_, idx_raw_L_, tail_snap_, hist_snap_), which the first kernels'
+    // launches order after it
     if (v_.finisher_on() && !v_.batch_rec_ && cs == v_.cs_) {
         const GdnCommitLayers fa = v_.commit_gdn_args();
         if (fa.n_layers > 0) gdn_commit_finish(fa, v_.commit_ctl_, cs, v_.fin_blocks_);
@@ -52,7 +53,7 @@ bool Verifier::WindowRecorder::inputs() {
         copy_i32_from_mapped((int32_t*) v_.d_qrows_, (const int32_t*) v_.m_qseg_, (int64_t) (kQsaSegMaxRows + 8) * 4, cs);
         if (ple_on) ple_hist_gather(v_.ple_work_, v_.d_ple_slots_, v_.segb_, HS, T, cs);
     }
-    // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
+    // per-row positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
     pos_k = v_.pos_ + MT * NH;
     pos_i = v_.pos_ + MT * (NH + NKV);
 

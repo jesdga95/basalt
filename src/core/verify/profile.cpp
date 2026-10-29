@@ -254,10 +254,8 @@ void Verifier::collect_profile() {
     cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
     const int64_t L = g.n_layers;
     auto at = [&](int64_t l, int i) { return prof_h_[(size_t) (l * kProfPer + i)]; };
-    // D8: the derived columns below read stamps the hc-read kernels write themselves or the next
-    // layer's first.  A slot no kernel stamped is 0 and its unsigned difference wrapped to ~1e19 ns -
-    // which is why (gap)/head/hc0 printed ~1e14 ms per window.  A missing or out-of-order stamp now
-    // contributes nothing.
+    // the derived columns read stamps the hc-read kernels write themselves or the next layer's first; a slot no kernel
+    // stamped is 0, so a missing or out-of-order stamp contributes nothing instead of an unsigned wrap
     const auto gap = [](unsigned long long to, unsigned long long from) {
         return (from != 0 && to != 0 && to >= from) ? (double) (to - from) : 0.0;
     };

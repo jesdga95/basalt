@@ -344,7 +344,7 @@ bool Verifier::run_end(int32_t* out, std::string& err) {
     gm.mark(1);
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
-    // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
+    // the position it samples, not to how the text was cut into windows, so a seed replays the same text whatever
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
     if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
         ++windows;

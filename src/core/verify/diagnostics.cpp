@@ -154,7 +154,7 @@ std::string Verifier::peer_released() {
 
 void Verifier::diag(std::FILE* f) const {
     auto rd = [](const uint32_t* p) { return p ? *(const volatile uint32_t*) p : 0u; };
-    // outside a verify stage these are the LAST window's numbers (it finished), not the stalled work's
+    // outside a verify stage these are the last window's numbers (it finished), not the stalled work's
     const char* where = progress().where.load();
     const bool current = where != nullptr && std::strncmp(where, "verify window", 13) == 0;
     std::fprintf(f, "  verify window%s (layers %lld-%lld, device %d): %d tokens at position %lld, host at layer step %u; the GPU rang %u; flags: "
