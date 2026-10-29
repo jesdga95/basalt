@@ -423,7 +423,7 @@ int check_geo(const Geo& g, bool outliers, cudaStream_t s, Gemm& gemm, fp8::Lt& 
         }
     }
     const double drel = ymax > 0 ? dmax / ymax : 0, drel16 = ymax > 0 ? dmax16 / ymax : 0;
-    if (qdiff != 0 || drel > 1e-5) ++fail;
+    if (qdiff != 0 || nbits != 0) ++fail;
     std::printf("%-18s %-8s FP16 %.2e / %.2e%s | path %.2e / %.2e (vs FP16 %.2e) | width (401 rows): %ld E4M3 rows "
                 "differ; products: %ld rows differ, max %.1e of max |y| (FP16 path: %ld, %.1e) [%s] %s\n",
                 g.name, outliers ? "outliers" : "plain", ef.rms, ef.worst, line.c_str(), e8.rms, e8.worst,
