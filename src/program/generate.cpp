@@ -10878,17 +10878,6 @@ int main(int argc, char** argv) {
         std::printf("%-24s %.3f ms/token over %lld layers (%.0f positions, %lld dispatches)\n",
                     "  the CPU expert pool", pool_positions > 0.0 ? drive.cpu_ms / pool_positions : 0.0,
                     (long long) g.n_layers, pool_positions, (long long) drive.calls);
-        // AND WHERE INSIDE `run()` IT WENT.  Three phases per layer, reported apart so a pool that is slow at the WORK
-        // can be told from one that is slow at the SYNCHRONISATION - opposite fixes.  Wait-for-park is expected to be
-        // ~0 (the workers re-parked at the end of the previous layer); the question is whether the time is in the
-        // drain or in the re-park barrier.
-        if (pool_positions > 0.0) {
-            double wp = 0, dr = 0, rp = 0;
-            pool.phase_ms(wp, dr, rp);
-            const double per = pool_positions;
-            std::printf("%-24s   wait-park %.3f  drain %.3f  re-park %.3f  ms/token\n",
-                        "  pool phases", wp / per, dr / per, rp / per);
-        }
         std::printf("%-24s %lld blobs read\n", "  expert blobs", (long long) srcp->reads());
         for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
             std::printf("  CUDA%d experts           %lld routed entries computed\n",
