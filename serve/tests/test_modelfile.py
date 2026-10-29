@@ -242,7 +242,7 @@ class Cli(Tmp):
                 mock.patch("sys.stderr", io.StringIO()) as err:
             e = self.run_main(*base, "--vision", "8")   # only a card that is not there fails at startup
         self.assertEqual(getattr(e, "code", None), 2)
-        self.assertIn("vision: GPU 8 is not there", err.getvalue())
+        self.assertIn("vision: GPU 8 is not found by nvidia-smi", err.getvalue())
 
 
 if __name__ == "__main__":

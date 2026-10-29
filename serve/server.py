@@ -117,7 +117,7 @@ def main() -> int:
             card = vision_card(mode)
             if card is not None:                       # a numbered sidecar card: the engine's sm_120 rule is the
                 if gpu_card_name(card) is None:        # engine's; the sidecar is its own build and says whether
-                    fail(f"vision: GPU {card} is not there")   # it runs on the card when it starts
+                    fail(f"vision: GPU {card} is not found by nvidia-smi")   # the sidecar checks the card itself
             for note in plan.get("notes") or []:
                 print(f"[server] {note}", flush=True)
             if plan.get("warning"):
