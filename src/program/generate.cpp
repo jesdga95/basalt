@@ -3003,11 +3003,15 @@ int main(int argc, char** argv) {
         // free VRAM after loading is the reserve itself
         int64_t late_b = o.serve ? (kWindowMib << 20) : 0;
         // the kernels that first run after the cache is sized (the prompt path's, the verify windows') load into the
-        // reserve when modules load lazily
+        // reserve when modules load lazily.  A server loading every kernel up front still loads cuBLAS's GEMM kernels on
+        // their first use and captures its window graphs after the cache, so the same room stays back for those, and
+        // batched serving adds the further slot sessions' solo windows and the batch windows.
         {
             const char* ml = std::getenv("CUDA_MODULE_LOADING");
             constexpr int64_t kLazyKernelsMib = 96;
-            if (ml == nullptr || std::strcmp(ml, "EAGER") != 0) late_b += kLazyKernelsMib << 20;
+            constexpr int64_t kSlotWindowsMib = 24;   // one session's solo windows, or the batch windows
+            if (o.serve || ml == nullptr || std::strcmp(ml, "EAGER") != 0) late_b += kLazyKernelsMib << 20;
+            if (o.serve && o.batch >= 2 && slot0_is_solo) late_b += ((int64_t) o.batch * kSlotWindowsMib) << 20;
         }
         // the GDN mixer split by key head loads CUDA0's share of the GDN layers after the cache is sized
         if (o.peer_device >= 1) {
