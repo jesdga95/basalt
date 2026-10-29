@@ -13,6 +13,7 @@ the model file's sampling defaults. For what a setting does to speed, memory and
 - [Speculative decoding (MTP)](#speculative-decoding-mtp)
 - [Parallel slots](#parallel-slots)
 - [Conversation cache](#conversation-cache)
+- [Model pricing for clients](pricing.md)
 - [Vision](#vision)
 - [Control vectors](#control-vectors)
 - [Sampling](#sampling)
@@ -39,7 +40,8 @@ There are two kinds of setting:
   works too (`--control-vector-layer-range 4 44`). It asks the engine binary which flags it accepts, and stops at
   startup on a flag name it does not know.
 
-A config file is one JSON object with two optional blocks:
+A config file is one JSON object with optional `server`, `engine` and
+[pricing](pricing.md) blocks:
 
 ```json
 {

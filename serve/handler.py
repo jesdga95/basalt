@@ -281,6 +281,8 @@ def make_handler(svc: Service):
                              "meta": {"n_ctx": svc.engine.max_context},
                              "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
                                               "output_modalities": ["text"]}}
+                    if svc.pricing:
+                        model["pricing"] = svc.pricing
                     if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
                         model["status"] = {"value": "unloaded"}   # listed, loads on use
                         loaded = True

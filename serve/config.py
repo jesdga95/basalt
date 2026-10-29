@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from serve import ROOT
@@ -76,11 +77,31 @@ def engine_words(key: str, value) -> list[str]:
     return [flag, *(str(item) for item in items)]
 
 
-def load_config_file(path: str, ap: argparse.ArgumentParser) -> tuple[list[str], list[str]]:
-    """(argv, engine) from a --config JSON file {"server": {...}, "engine": {...}}. `server` options become
-    command-line words so every command-line check applies; `engine` maps flags to values and becomes the words
-    for the engine (true: switch, false: off, a list: several values). Paths are relative to the file; ValueError
-    for anything else."""
+def pricing_from_config(cfg: dict) -> dict:
+    """Validate known rates while preserving their JSON values and extension fields."""
+    block = cfg.get("pricing")
+    if block is None:
+        return {}
+    if not isinstance(block, dict):
+        raise ValueError("pricing: expected an object of rates, or null to omit pricing")
+    for key in ("prompt", "completion", "input_cache_read", "input_cache_write", "request",
+                "cache_read", "cache_write"):
+        if key not in block:
+            continue
+        value = block[key]
+        try:
+            rate = Decimal(str(value)) if isinstance(value, (str, int, float)) and not isinstance(value, bool) else None
+        except InvalidOperation:
+            rate = None
+        if rate is None or not rate.is_finite() or rate < 0:
+            unit = "USD per request" if key == "request" else "USD per token"
+            raise ValueError(f"pricing.{key}: expected a finite, nonnegative number or decimal string ({unit}), "
+                             f"got {value!r}")
+    return dict(block)
+
+
+def read_config_file(path: str) -> dict:
+    """Read and validate the config object before starting the model."""
     try:
         with open(path, encoding="utf-8") as f:
             raw = json.load(f)
@@ -88,9 +109,20 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> tuple[list[str],
         raise ValueError(f"cannot read: {e.strerror or e}") from None
     except json.JSONDecodeError as e:
         raise ValueError(f"not valid JSON: {e}") from None
-    if not isinstance(raw, dict) or set(raw) - {"server", "engine"}:
-        raise ValueError('expected {"server": {...}, "engine": {...}}'
-                         + (f", not the key {sorted(set(raw) - {'server', 'engine'})[0]!r}" if isinstance(raw, dict) else ""))
+    allowed = {"server", "engine", "pricing"}
+    if not isinstance(raw, dict) or set(raw) - allowed:
+        raise ValueError('expected {"server": {...}, "engine": {...}} with optional "pricing"'
+                         + (f", not the key {sorted(set(raw) - allowed)[0]!r}" if isinstance(raw, dict) else ""))
+    pricing_from_config(raw)
+    return raw
+
+
+def load_config_file(path: str, ap: argparse.ArgumentParser, *, raw: dict | None = None) -> tuple[list[str], list[str]]:
+    """(argv, engine) from a --config JSON file {"server": {...}, "engine": {...}}. `server` options become
+    command-line words so every command-line check applies; `engine` maps flags to values and becomes the words
+    for the engine (true: switch, false: off, a list: several values). Paths are relative to the file; ValueError
+    for anything else."""
+    raw = read_config_file(path) if raw is None else raw
     sections = {k: raw.get(k, {}) for k in ("server", "engine")}
     for k, v in sections.items():
         if not isinstance(v, dict):
@@ -146,10 +178,12 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str]):
     command line > config file > defaults; SystemExit(2) for a bad value, ValueError for a bad config or stray word."""
     a_cli, extras = ap.parse_known_args(cli)
     cli_words = split_engine_extras(extras)
-    file_argv, file_words = [], []
+    file_argv, file_words, file_config = [], [], {}
     if a_cli.config:
-        file_argv, file_words = load_config_file(a_cli.config, ap)
+        file_config = read_config_file(a_cli.config)
+        file_argv, file_words = load_config_file(a_cli.config, ap, raw=file_config)
     a = ap.parse_known_args(file_argv + cli)[0]
+    a.pricing = pricing_from_config(file_config)
     a.sampling_launch = {k: getattr(a, k) for k in SAMPLING_KEYS if getattr(a, k) is not None}
     a.sampling_cli = {k for k in a.sampling_launch if getattr(a_cli, k) is not None}
     if a.vision == "":                                     # a bare --vision

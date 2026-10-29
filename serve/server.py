@@ -200,7 +200,7 @@ def main() -> int:
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
-                  grammar_engine=bool(a.mock_engine or has_grammar))
+                  grammar_engine=bool(a.mock_engine or has_grammar), pricing=a.pricing)
     svc.logs = logs
     if any(x == "--api-key" and i + 1 < len(used_argv) and not used_argv[i + 1].strip() or x.strip() == "--api-key="
            for i, x in enumerate(used_argv)):
