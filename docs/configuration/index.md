@@ -135,7 +135,7 @@ A server with `max-context` above 32768 has an elastic KV cache: each session ba
 takes more from the expert cache only when a request needs it. With `parallel`, each slot whose share is above 4096
 tokens does the same from 4096 cells, growing by 4096. It is off with `kv-resident` or `vram-elastic`. A single-stream
 request deeper than 99328 tokens keeps its K/V in pinned RAM instead when the RAM holds it (the host K/V; `"exp":
-"kv_host=0"` turns it off). See [running](../running.md#concurrent-requests---parallel-n).
+"kv_host=0"` turns it off). See [elastic KV](../elastic-kv.md).
 
 ## Expert cache and memory
 
