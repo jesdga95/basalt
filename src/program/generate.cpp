@@ -478,7 +478,9 @@ void usage() {
                  "  --expert-profile-save P  --serve: save what the adaptive tier learned (the experts in\n"
                  "                       VRAM, then the routing counted since the start) as a profile at P, on\n"
                  "                       QUIT and every --expert-profile-save-every MIN minutes (default 10;\n"
-                 "                       0 = on QUIT only) between requests; tools/convert/convert.py --profile reads it\n"
+                 "                       0 = on QUIT only) between requests; a start with P already there\n"
+                 "                       places that profile instead of the model's; tools/convert/convert.py\n"
+                 "                       --profile reads it too\n"
                  "  --expert-cache N|auto  keep N expert blobs resident in VRAM and compute their rows on the\n"
                  "                       GPU.  Default auto on packs with an expert profile.  auto = as many as fit in the VRAM\n"
                  "                       left after the weights, the session and --vram-reserve-mib\n"
@@ -1912,7 +1914,25 @@ int main(int argc, char** argv) {
     std::vector<std::pair<int32_t, int32_t>> profile;
     if (!o.expert_profile.empty()) {
         int64_t pslots = 0;
-        if (!basalt::core::read_expert_profile(srcs.profile, g.n_layers, g.n_expert, profile, pslots, err)) {
+        // --expert-profile-save's file from an earlier run of this model: the start places what that run's adaptive
+        // tier learned instead of the model's profile (the same format; another model's file is refused by its shape)
+        bool learned = false;
+        if (o.serve && !o.expert_profile_save.empty()) {
+            uint64_t bytes = 0;
+            std::string perr;
+            if (basalt::platform::file_size(o.expert_profile_save, bytes) && bytes > 0) {
+                if (basalt::core::read_expert_profile(basalt::core::FileRange(o.expert_profile_save), g.n_layers,
+                                                      g.n_expert, profile, pslots, perr)) {
+                    learned = true;
+                    o.expert_profile = o.expert_profile_save;
+                } else {
+                    basalt::log::warn("basalt generate", "%s not used (%s): the model's profile instead",
+                                      o.expert_profile_save.c_str(), perr.c_str());
+                    profile.clear();
+                }
+            }
+        }
+        if (!learned && !basalt::core::read_expert_profile(srcs.profile, g.n_layers, g.n_expert, profile, pslots, err)) {
             return fatal_start_error(err);
         }
         // An explicit number truncates the ranked list ("what would 2,000 slots give" without rebuilding the file).
