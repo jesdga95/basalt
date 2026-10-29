@@ -93,9 +93,10 @@ bool KvArena::map(int64_t cells, std::string& err) {
     for (Array& a : arrays_) {
         const uint64_t want = need(a, cells);
         for (uint64_t at = a.mapped(); at < want; at = a.mapped()) {
-            // this mapping ends at the first grid line past `at`
+            // this mapping ends at the first grid line past `at`; lines finer than a page are a page apart
             uint64_t end = want;
-            for (int64_t c = extent_cells_; c > 0 && c < max_cells(); c += extent_cells_)
+            const int64_t step = extent_cells_ > 0 ? std::max(extent_cells_, page_cells_) : 0;
+            for (int64_t c = step; c > 0 && c < max_cells(); c += step)
                 if (need(a, c) > at) { end = std::min(end, need(a, c)); break; }
             const unsigned long long h = vmm::map(a.base + at, end - at);
             if (h == 0) {
