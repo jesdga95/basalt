@@ -177,6 +177,21 @@ conversation. The budget caps the folder, least recently used conversations firs
 shared file goes with the last conversation that uses it), and a write always leaves 4 GiB of the volume free. Writes
 on the drive that holds the model file can slow its next load: a cache directory on another drive avoids that.
 
+## Sleep: `--idle-sleep`
+
+`--idle-sleep SECONDS` (a server option, also `"idle-sleep"` in the config's `server` section) puts the model to sleep
+after that long without requests. The engine first gives its expert caches' VRAM back, a peer card's tier included
+(each expert has its RAM copy and the slot it held is remembered; an exclusive peer tier stays), and drops the RAM
+copy's registration with the driver, then the driver moves the rest of its GPU state (weights, KV cache, buffers) to
+host memory and releases the VRAM. The process, its RAM copy of the experts, the conversations it holds and the
+placement the adaptive tier learned all stay. The next request wakes it: the driver puts the GPU state back at the same
+addresses, the engine registers the RAM copy again and the caches refill from the parts already registered, so the
+request runs as it would have before the sleep (when the VRAM left after the restore holds the last few
+slots too). The server
+checks first that the GPU state fits in the free RAM with 8 GiB to spare; otherwise the model stays awake (`[server]
+warning: the model stays awake ...`). Linux only: the driver offers no such suspend elsewhere. `--idle-unload` still
+ends the process, which frees the RAM too; with both, give `idle-unload` the longer time.
+
 ## Memory floors
 
 Basalt refuses settings that would leave the machine without memory, and never shrinks what you asked for:

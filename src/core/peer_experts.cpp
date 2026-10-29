@@ -9,6 +9,7 @@
 #include "basalt/kernels/s2_expert_grouped.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -54,6 +55,7 @@ bool ck(cudaError_t e, const char* what, std::string& err) {
 PeerExperts::~PeerExperts() { close(); }
 
 void PeerExperts::close() {
+    if (wake_thread_.joinable()) wake_thread_.join();
     if (device_ < 0) return;
     {
         On on(device_);
@@ -175,6 +177,8 @@ bool PeerExperts::fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std
     if (pick.empty()) { err = "peer experts: no room or no expert left for the peer"; close(); return false; }
     std::vector<int64_t> sizes;
     for (const auto& pr : pick) sizes.push_back((int64_t) lay.blob_bytes(pr.first));
+    // in segments, so a sleep can give the slots' VRAM back and take it again at the same addresses
+    cache_.set_segment_bytes(512ll << 20);
     const bool opened = lay.native ? cache_.open_sized(sizes, n_layers, n_expert, err)
                                    : cache_.open((int64_t) pick.size(), n_layers, n_expert, (int64_t) lay.max_blob, err);
     if (!opened) { err = "peer experts: " + err; close(); return false; }
@@ -452,6 +456,67 @@ bool PeerExperts::give_back_wait(std::vector<std::pair<int32_t, int32_t>>& lent,
     for (const auto& [i, slot] : lent) res_[(size_t) i] = slot;
     lent.clear();
     return true;
+}
+
+bool PeerExperts::sleep(std::string& err) {
+    if (!asleep_.empty()) return true;
+    if (fsrc_ != nullptr) { err = "peer experts: an exclusive tier has no RAM copy to come back from"; return false; }
+    if (!cache_.segmented()) { err = "peer experts: the tier is one allocation"; return false; }
+    apply_pending(true);
+    if (!lend(0, asleep_, err)) return false;
+    On on(device_);
+    if (cache_.shrink(0, err)) return true;
+    std::string e2;   // the slots kept their bytes: they are the tier again
+    give_back_wait(asleep_, e2);
+    return false;
+}
+
+bool PeerExperts::wake(std::string& err, std::function<bool(const void*, uint64_t)> ready) {
+    if (asleep_.empty()) return true;
+    {
+        On on(device_);
+        if (!cache_.grow(std::numeric_limits<int64_t>::max(), err)) return false;   // every segment, the last one too
+    }
+    if (!ready) return give_back(asleep_, err);
+    // every source and destination looked up here: the thread only copies
+    struct Copy { const uint8_t* src; uint8_t* dst; uint64_t bytes; };
+    std::vector<Copy> copies;
+    const auto& lay = basalt::kernels::cpu::expert_layout();
+    for (const auto& [i, slot] : asleep_) {
+        const int64_t l = i / n_expert_, e = i % n_expert_;
+        const uint8_t* b = src_->blob(l, e);
+        if (b == nullptr) { err = "peer experts: a lent expert has no host copy"; return false; }
+        copies.push_back({b, (uint8_t*) cache_.device_slot(slot), (uint64_t) lay.blob_bytes(l)});
+    }
+    std::sort(copies.begin(), copies.end(),
+              [](const Copy& x, const Copy& y) { return std::less<const uint8_t*>()(x.src, y.src); });
+    wake_failed_ = false;
+    wake_thread_ = std::thread([this, ready, copies = std::move(copies)] {
+        On on(device_);
+        for (const Copy& c : copies)
+            if (!ready(c.src, c.bytes) ||
+                cudaMemcpyAsync(c.dst, c.src, (size_t) c.bytes, cudaMemcpyHostToDevice, refill_) != cudaSuccess) {
+                (void) cudaGetLastError();
+                wake_failed_ = true;
+                return;
+            }
+        if (cudaEventRecord(refill_ev_, refill_) != cudaSuccess) {
+            (void) cudaGetLastError();
+            wake_failed_ = true;
+        }
+    });
+    return true;
+}
+
+bool PeerExperts::wake_wait(std::string& err) {
+    if (wake_thread_.joinable()) {
+        wake_thread_.join();
+        if (wake_failed_) {
+            err = "peer experts: copying the experts back failed";
+            return false;
+        }
+    }
+    return give_back_wait(asleep_, err);
 }
 
 bool PeerExperts::issue_pending(bool wait) {

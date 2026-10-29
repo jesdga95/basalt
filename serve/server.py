@@ -231,6 +231,7 @@ def main() -> int:
         if "*" in svc.cors_origins and not svc.api_key:
             print(tagged("warning", "any web page can use the model (--api-key KEY)"), flush=True)
     svc.idle_unload_s = a.idle_unload or 0
+    svc.idle_sleep_s = a.idle_sleep or 0
     svc.min_free_vram_mib = a.min_free_vram_mib or 0
     svc.reasoning_budget_tokens = a.reasoning_budget_tokens or 0
     svc.answer_room = a.answer_room
@@ -238,6 +239,7 @@ def main() -> int:
     svc.gpu_index = svc.gpu_indices[0]
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
+    svc.start_idle_sleep()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     if getattr(engine, "batch", 0):
         print(tagged("slots", f"par={engine.batch} ctx/slot={engine.max_context}"

@@ -30,7 +30,7 @@ from pathlib import Path
 
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY, engine_key as grammar_key
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
-from serve.engine import lifeline
+from serve.engine import lifeline, suspend
 from serve.engine.flags import flag_value
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStuck
 from serve.engine.slots import AdmissionQueue
@@ -206,7 +206,11 @@ class ProcessEngine:
         self.proc, self.pump, self.log = None, None, None
         if "slot_cv" not in self.__dict__:               # restart() wakes waiters even when the start failed
             self.slot_cv = threading.Condition()
+        if "sleep_lock" not in self.__dict__:            # sleep, wake and close never overlap, across restarts too
+            self.sleep_lock = threading.RLock()
         self.ended, self.unloaded = True, True
+        self.asleep = False              # its GPU state suspended by the driver (sleep/wake)
+        self.restore_s = 0.0             # the driver's part of the last wake
         self.max_context = int(flag_value(args, "--max-context") or 4096)
         self.can_stop = False            # READY <ctx> stop
         self.last = {}
@@ -475,21 +479,62 @@ class ProcessEngine:
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """Resize the expert cache to leave `reserve_mib` free (None: the starting reserve); returns the engine's
         figures. Caller holds the service FIFO. ValueError carries the engine's refusal."""
+        return self._vram_command("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}"), timeout)
+
+    def can_sleep(self) -> bool:
+        return suspend.available()
+
+    def sleep(self, ram_check=None, timeout: float = 120.0) -> dict:
+        """SLEEP: the engine gives its expert cache's VRAM back (its experts stay in RAM), then the driver moves the
+        rest of its GPU state to host memory and releases the VRAM. `ram_check()`, asked once the cache is down, says
+        why the rest would not fit in RAM (None: it fits). Caller holds the service FIFO and the control lines.
+        ValueError: not asleep (the engine is as it was)."""
+        with self.sleep_lock:
+            out = self._vram_command("SLEEP", timeout)
+            why = ram_check() if ram_check is not None else None
+            if why is None:
+                why = suspend.suspend(self.proc.pid)
+            if why is not None:
+                self._vram_command("WAKE", timeout)
+                raise ValueError(why)
+            self.asleep = True
+            return out
+
+    def wake(self, timeout: float = 120.0) -> dict:
+        """The driver puts the GPU state back, then WAKE refills the expert cache from RAM. EngineDied when the GPU
+        state cannot come back (the engine is ended so the next request starts it again)."""
+        with self.sleep_lock:
+            t = time.time()
+            why = suspend.resume(self.proc.pid)
+            self.restore_s = time.time() - t
+            if why is None:
+                self.asleep = False
+                try:
+                    return self._vram_command("WAKE", timeout)
+                except ValueError as e:                 # its caches could not come back: start it again
+                    why = str(e)
+            self.asleep = False
+            self._silent(why)
+            raise EngineDied(why)
+
+    def _vram_command(self, command: str, timeout: float) -> dict:
+        """Send a VRAM, SLEEP or WAKE command and read its VRAM line."""
         if not self.alive():
             raise EngineDied("the engine is not running")
-        self.proc.stdin.write("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}") + "\n")
+        self.proc.stdin.write(command + "\n")
         self.proc.stdin.flush()
+        what = command.split()[0]
         deadline = time.time() + timeout
         while True:
             try:
                 line = self.lines.get(timeout=max(0.1, deadline - time.time()))
             except queue.Empty:
-                raise EngineDied("the engine did not answer the VRAM command") from None
+                raise EngineDied(f"the engine did not answer the {what} command") from None
             if line is None:
                 raise EngineDied("the engine ended")
             line = line.strip()
             if line.startswith("ERR"):
-                raise ValueError(line[4:].strip() or "the engine refused the VRAM command")
+                raise ValueError(line[4:].strip() or f"the engine refused the {what} command")
             if line.startswith("VRAM "):
                 out = {}
                 for kv in line.split()[1:]:
@@ -499,7 +544,7 @@ class ProcessEngine:
                 self.info["vram"] = out
                 return out
             if time.time() > deadline:
-                raise EngineDied("the engine did not answer the VRAM command")
+                raise EngineDied(f"the engine did not answer the {what} command")
 
     ENC_TIMEOUT_S = 300.0
 
@@ -1314,6 +1359,10 @@ class ProcessEngine:
         """End the engine: QUIT, then terminate, then kill, 20 s each; EngineStuck if it still runs."""
         if self.proc is None:
             return
+        with self.sleep_lock:                        # a sleep in progress ends first
+            if self.asleep:                          # its GPU state back first: QUIT runs CUDA calls
+                self.asleep = False
+                suspend.resume(self.proc.pid)
         try:
             if self.proc.poll() is None:
                 try:

@@ -479,10 +479,11 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
 }
 
 void FileExpertSource::close() {
+    repin_join();
     if (complement_arena_ != nullptr) {
         if (complement_pinned_ && !complement_partial_) (void) cudaFreeHost(complement_arena_);
         else {
-            if (complement_partial_) (void) cudaHostUnregister(complement_arena_);
+            if (complement_partial_) unregister_complement();
             if (complement_locked_ > 0)
                 basalt::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
             basalt::platform::free_aligned(complement_arena_);
@@ -529,6 +530,9 @@ void FileExpertSource::close() {
     complement_offsets_.clear();
     ++places_gen_;
     complement_pinned_ = false;
+    unpinned_ = false;
+    pin_units_.clear();
+    pin_state_.reset();
     complement_partial_ = false;
     complement_pin_limit_ = 0;
     complement_lock_off_ = 0;
@@ -1712,6 +1716,101 @@ bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
     // a partial pin (CS-T): only the registered prefix
     return !complement_partial_ ||
            complement_offsets_[index] + layer_blob_bytes_[(size_t) layer] <= complement_pin_limit_;
+}
+
+void FileExpertSource::repin_join() {
+    for (auto& t : pin_threads_) t.join();
+    pin_threads_.clear();
+}
+
+// Each range registered by itself: the whole arena (as loaded), or the ranges of an earlier WAKE.
+void FileExpertSource::unregister_complement() {
+    if (unpinned_ || complement_arena_ == nullptr) return;
+    if (pin_units_.size() >= 2 && pin_state_) {
+        for (size_t i = 0; i + 1 < pin_units_.size(); ++i)
+            if (pin_state_[i].load() == 1) (void) cudaHostUnregister((uint8_t*) complement_arena_ + pin_units_[i]);
+    } else {
+        (void) cudaHostUnregister(complement_arena_);
+    }
+    (void) cudaGetLastError();
+}
+
+bool FileExpertSource::unpin_complement(std::string& err) {
+    if (unpinned_) return true;
+    if (!complement_ready_ || complement_arena_ == nullptr || !complement_partial_ ||
+        complement_pin_limit_ != complement_bytes_ || complement_device_ == nullptr ||
+        complement_device_ != complement_host_) {
+        err = "the RAM copy is not one registered range read at its host addresses";
+        return false;
+    }
+    repin_join();
+    unregister_complement();
+    unpinned_ = true;
+    pin_units_.clear();   // laid out again at the next WAKE (adaptive swaps may have moved blobs since)
+    pin_state_.reset();
+    return true;
+}
+
+void FileExpertSource::repin_start(int threads) {
+    if (!unpinned_ || !pin_threads_.empty()) return;
+    if (pin_units_.empty()) {
+        // the ranges end where a blob starts on a page boundary, about 1 GiB apart (a blob never spans two ranges,
+        // so every copy from one stays a copy from registered memory); the last one ends where the load registered
+        constexpr uint64_t kPage = 4096, kUnit = 1ull << 30, kHuge = 2ull << 20;
+        const uint64_t end = (complement_bytes_ + kHuge - 1) / kHuge * kHuge;
+        std::vector<uint64_t> starts;
+        for (uint64_t off : complement_offsets_)
+            if (off != kNoComplement && off < complement_bytes_ && off % kPage == 0) starts.push_back(off);
+        std::sort(starts.begin(), starts.end());
+        pin_units_.push_back(0);
+        for (uint64_t s : starts)
+            if (s >= pin_units_.back() + kUnit) pin_units_.push_back(s);
+        pin_units_.push_back(end);
+    }
+    const size_t n = pin_units_.size() - 1;
+    pin_state_.reset(new std::atomic<int>[n]);
+    for (size_t i = 0; i < n; ++i) pin_state_[i].store(0);
+    pin_next_.store(0);
+    for (int t = 0; t < std::max(1, threads); ++t)
+        pin_threads_.emplace_back([this, n] {
+            for (;;) {
+                const size_t i = pin_next_.fetch_add(1);
+                if (i >= n) return;
+                const cudaError_t e = cudaHostRegister((uint8_t*) complement_arena_ + pin_units_[i],
+                                                       (size_t) (pin_units_[i + 1] - pin_units_[i]),
+                                                       cudaHostRegisterPortable | cudaHostRegisterMapped);
+                if (e != cudaSuccess) (void) cudaGetLastError();
+                pin_state_[i].store(e == cudaSuccess ? 1 : 2, std::memory_order_release);
+            }
+        });
+}
+
+bool FileExpertSource::repin_wait(const void* p, uint64_t n) const {
+    if (!unpinned_ || !pin_state_ || pin_units_.size() < 2) return true;
+    const uint8_t* base = (const uint8_t*) complement_arena_;
+    const uint8_t* q = (const uint8_t*) p;
+    if (q < base || q >= base + pin_units_.back()) return true;   // not in the copy (a RAM home)
+    const uint64_t lo = (uint64_t) (q - base), hi = std::min<uint64_t>(lo + n, pin_units_.back());
+    size_t i = (size_t) (std::upper_bound(pin_units_.begin(), pin_units_.end(), lo) - pin_units_.begin()) - 1;
+    for (; i + 1 < pin_units_.size() && pin_units_[i] < hi; ++i) {
+        int s;
+        while ((s = pin_state_[i].load(std::memory_order_acquire)) == 0) std::this_thread::yield();
+        if (s != 1) return false;
+    }
+    return true;
+}
+
+bool FileExpertSource::repin_finish(std::string& err) {
+    if (!unpinned_) return true;
+    repin_join();
+    if (!pin_state_) { err = "the RAM copy was not registered again"; return false; }
+    for (size_t i = 0; i + 1 < pin_units_.size(); ++i)
+        if (pin_state_[i].load() != 1) {
+            err = "the driver refused to register the RAM copy again";
+            return false;
+        }
+    unpinned_ = false;
+    return true;
 }
 
 const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) const {

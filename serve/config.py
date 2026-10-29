@@ -394,6 +394,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--lazy", action="store_true", help="start the text-only API unloaded; load on first request")
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
                     help="unload the model after this many seconds without requests; the next request loads it again")
+    ap.add_argument("--idle-sleep", type=float, default=None, metavar="SECONDS",
+                    help="put the model to sleep after this many seconds without requests: its VRAM is freed, its RAM "
+                         "copy, conversations and learned expert placement stay, and the next request wakes it in a few "
+                         "seconds (Linux; the driver suspends the engine's GPU state)")
     for key, text in (
             ("temperature", "0 = greedy; higher is more random"),
             ("top-p", "nucleus cutoff, 0 < value <= 1 (1 = off)"),

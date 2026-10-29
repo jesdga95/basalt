@@ -6507,22 +6507,27 @@ int main(int argc, char** argv) {
                          (double) src.homes_bytes() / 1048576.0);
             return true;
         };
-        auto vram_command = [&](const std::string& cmd, std::string& e) -> bool {
+        // `for_sleep` (SLEEP and WAKE): the cache goes to its smallest size and comes back to the same placement, with no
+        // request between the two, so neither --vram-elastic (any segmented cache does) nor a peer card's tier stands in
+        // the way
+        auto vram_command = [&](const std::string& cmd, std::string& e, bool for_sleep,
+                                std::string* reply = nullptr) -> bool {
             // `VRAM` alone: the reserve the engine started with (--vram-reserve-mib)
             char* end = nullptr;
             const bool bare = cmd.find_first_not_of(' ', 4) == std::string::npos;
             const long long reserve = bare ? (long long) o.vram_reserve_mib : std::strtoll(cmd.c_str() + 4, &end, 10);
             if (!bare && (end == cmd.c_str() + 4 || reserve < 0)) { e = "expected: VRAM [reserve_mib]"; return false; }
-            if (reserve < kVramStallMib) {
+            if (reserve < kVramStallMib && !for_sleep) {
                 e = "VRAM: a reserve below " + std::to_string(kVramStallMib) + " MiB lets requests stall; the smallest "
                     "safe value is " + std::to_string(kVramStallMib);
                 return false;
             }
-            if (!o.vram_elastic || !xcache.segmented()) {
-                e = "VRAM needs an engine started with --vram-elastic (one NVIDIA GPU, --serve)";
+            if ((!o.vram_elastic && !for_sleep) || !xcache.segmented()) {
+                e = for_sleep ? "SLEEP needs a segmented expert cache (an elastic KV cache or --vram-elastic)"
+                              : "VRAM needs an engine started with --vram-elastic (one NVIDIA GPU, --serve)";
                 return false;
             }
-            if (peer.valid()) { e = "VRAM: not with a second GPU as expert tier"; return false; }
+            if (peer.valid() && !for_sleep) { e = "VRAM: not with a second GPU as expert tier"; return false; }
             for (const PfPart& p : pf_parts)
                 if (!p.lent.empty()) { e = "VRAM: a prompt's loan is still out"; return false; }
             if (!ver.wait_commit(e)) return false;
@@ -6565,6 +6570,8 @@ int main(int argc, char** argv) {
                 const int64_t live = xcache.slots();
                 std::string ferr;
                 std::vector<std::pair<int32_t, int32_t>> keep_out;
+                struct Fill { int32_t slot; const uint8_t* b; int64_t bytes; };
+                std::vector<Fill> fills;
                 for (const auto& [i, slot] : vram_evicted) {
                     if (slot >= live) { keep_out.emplace_back(i, slot); continue; }
                     const int64_t layer = i / g.n_expert;
@@ -6581,12 +6588,27 @@ int main(int argc, char** argv) {
                     }
                     if (pick < 0) continue;
                     const uint8_t* b = srcp->blob(layer, pick % g.n_expert);
-                    if (b == nullptr || !xcache.fill_slot_queued(slot, b, ferr,
-                            (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer))) {
+                    if (b == nullptr) {
+                        e = "VRAM: refilling the cache failed: an expert has no RAM copy";
+                        return false;
+                    }
+                    fills.push_back({slot, b, (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer)});
+                    host_res[(size_t) pick] = slot;
+                }
+                // after a SLEEP the RAM copy is registered again in address order (WAKE): the copies follow it
+                const bool repinning = src.complement_unpinned();
+                if (repinning)
+                    std::sort(fills.begin(), fills.end(),
+                              [](const Fill& x, const Fill& y) { return std::less<const uint8_t*>()(x.b, y.b); });
+                for (const Fill& f : fills) {
+                    if (repinning && !src.repin_wait(f.b, (uint64_t) f.bytes)) {
+                        e = "VRAM: the RAM copy could not be registered again";
+                        return false;
+                    }
+                    if (!xcache.fill_slot_queued(f.slot, f.b, ferr, f.bytes)) {
                         e = "VRAM: refilling the cache failed: " + ferr;
                         return false;
                     }
-                    host_res[(size_t) pick] = slot;
                 }
                 vram_evicted.swap(keep_out);
                 if (!xcache.sync_queued(ferr)) { e = "VRAM: " + ferr; return false; }
@@ -6616,11 +6638,14 @@ int main(int argc, char** argv) {
                          (double) xcache.mapped_bytes() / 1073741824.0, (double) xcache.full_bytes() / 1073741824.0,
                          (long long) (free_b >> 20), (long long) o.prefill_chunk,
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), note.c_str());
-            std::printf("VRAM reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld expert_cache_mib=%lld "
-                        "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld ram_homes_mib=%lld\n", reserve,
-                        (long long) xcache.slots(), (long long) xcache.full_slots(),
-                        (long long) (xcache.mapped_bytes() >> 20), (long long) (xcache.full_bytes() >> 20),
-                        (long long) (free_b >> 20), (long long) o.prefill_chunk, (long long) (src.homes_bytes() >> 20));
+            char line[400];
+            std::snprintf(line, sizeof line, "VRAM reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld "
+                          "expert_cache_mib=%lld expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld "
+                          "ram_homes_mib=%lld\n", reserve, (long long) xcache.slots(), (long long) xcache.full_slots(),
+                          (long long) (xcache.mapped_bytes() >> 20), (long long) (xcache.full_bytes() >> 20),
+                          (long long) (free_b >> 20), (long long) o.prefill_chunk, (long long) (src.homes_bytes() >> 20));
+            if (reply != nullptr) *reply = line;
+            else std::fputs(line, stdout);
             return true;
         };
         // ---- the elastic KV (kKvElasticFloor): a session's K/V pools back their cells on demand, out of the expert
@@ -7930,7 +7955,60 @@ int main(int argc, char** argv) {
             if (line.rfind("VRAM", 0) == 0) {   // between requests, not a request
                 std::string verr;
                 if (batch_on()) verr = "VRAM: not while batch slots are decoding";
-                else vram_command(line, verr);
+                else vram_command(line, verr, false);
+                if (!verr.empty()) std::printf("ERR %s\n", verr.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            // SLEEP / WAKE, between requests: the expert cache gives its VRAM back down to its smallest size (every
+            // expert keeps a RAM copy and the slot it held is remembered), so the process can be suspended with little
+            // VRAM left to save; WAKE maps the cache again and puts each expert back in its slot.  Reply: a VRAM line.
+            if (line == "SLEEP" || line == "WAKE") {
+                std::string verr;
+                const bool down = line == "SLEEP";
+                if (batch_on()) {
+                    verr = line + ": not while batch slots are decoding";
+                } else {
+                    // A peer card's tier goes too.  SLEEP then drops the RAM copy's registration with the driver (a process
+                    // checkpoint would map the copy into every context again on restore); WAKE registers it again while
+                    // both caches refill from the ranges already back.  A tier or a registration that cannot come back
+                    // fails WAKE: the server then starts the engine again.
+                    std::string perr, reply, uerr;
+                    const auto tp = Clock::now();
+                    const bool repin = !down && src.complement_unpinned();
+                    std::function<bool(const void*, uint64_t)> ready;
+                    if (repin) {
+                        src.repin_start(4);
+                        ready = [&src](const void* p, uint64_t n) { return src.repin_wait(p, n); };
+                    }
+                    const bool peer_ok = !peer.valid() || (down ? peer.sleep(perr) : peer.wake(perr, ready));
+                    vram_command(down ? "VRAM " + std::to_string(1ll << 30) : std::string("VRAM"), verr, true, &reply);
+                    if (repin) {
+                        if (!src.repin_finish(uerr) && verr.empty()) verr = "WAKE: " + uerr;
+                        basalt::log::info("basalt serve", "WAKE: the RAM copy registered again beside the caches' refill "
+                                          "in %.0f ms", std::chrono::duration<double, std::milli>(Clock::now() - tp).count());
+                    }
+                    if (down && verr.empty() && src.complement_ready()) {
+                        const auto tu = Clock::now();
+                        if (src.unpin_complement(uerr))
+                            basalt::log::info("basalt serve", "SLEEP: the RAM copy's registration dropped in %.0f ms",
+                                              std::chrono::duration<double, std::milli>(Clock::now() - tu).count());
+                        else
+                            basalt::log::info("basalt serve", "SLEEP: the RAM copy stays registered (%s)", uerr.c_str());
+                    }
+                    if (!down && peer.valid() && peer_ok && !peer.wake_wait(perr)) {
+                        if (verr.empty()) verr = "WAKE: the peer card's tier could not come back (" + perr + ")";
+                    } else if (!down && !peer_ok) {
+                        if (verr.empty()) verr = "WAKE: the peer card's tier could not come back (" + perr + ")";
+                    } else if (!peer_ok) {
+                        basalt::log::warn("basalt serve", "SLEEP: the peer tier stays as it is (%s)", perr.c_str());
+                    } else if (peer.valid()) {
+                        basalt::log::info("basalt serve", "%s: the peer tier %s; %.0f ms with the main cache",
+                                          line.c_str(), down ? "gave its VRAM back" : "is back",
+                                          std::chrono::duration<double, std::milli>(Clock::now() - tp).count());
+                    }
+                    if (verr.empty()) std::fputs(reply.c_str(), stdout);
+                }
                 if (!verr.empty()) std::printf("ERR %s\n", verr.c_str());
                 std::fflush(stdout);
                 continue;
