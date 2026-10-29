@@ -43,6 +43,8 @@ int main() {
     if (!mi.empty()) check(w.threads >= 1, "and lists this process's threads");
 
     (void) gpu_peer_access();
+    const std::string os = host_os_name();
+    check(gpu_memory_pages() == (os == "Windows" || os == "WSL2"), "gpu_memory_pages: only the Windows driver pages");
     const DynLib nvml = DynLib::open_nvml();
     if (nvml) {
         check(nvml.sym<void*>("nvmlInit_v2") != nullptr, "the management library, when present, exports nvmlInit_v2");
