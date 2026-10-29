@@ -125,6 +125,10 @@ public:
     /// PEER_PROMOTE: `in` moved to the primary, which gave up `out` (`blob`: its bytes in host memory).  The
     /// slot `in` held takes `out`, resident at `apply_pending`.  Call only between verify windows.
     bool reassign(int64_t layer, int32_t in, int32_t out, const uint8_t* blob, std::string& err);
+    /// Between requests: each (slot, residency index) of `want` holds that expert afterwards, copied from the expert
+    /// source; the slots it does not name keep theirs.  Lands any swap in flight first.  `moved` gets the slots
+    /// rewritten.  Not with an exclusive tier.
+    bool place(const std::vector<std::pair<int32_t, int32_t>>& want, int64_t& moved, std::string& err);
 
     int64_t resident() const { return resident_; }
     /// the last launch writes its rows into the host rows itself (the caller must not touch them)
