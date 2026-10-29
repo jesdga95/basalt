@@ -45,6 +45,24 @@ a value equal to the default is not printed.
   default (ABBA) must then be at least 8% faster, because a live chunk carries about 5% of noise; otherwise nothing is
   printed. The line shows the measured gain, `(prefill +9%)`. The share changes which experts the CPU rounds, so it is fixed per machine, never timing-driven at run time.
 
+### What it covers
+
+The probe suggests a value only where a quick measurement on this machine can pick it and a measured run shows the
+pick matters. The other settings with machine-dependent defaults, and why it leaves them:
+
+| setting | covered | why | seconds added |
+|---|---|---|---|
+| `pool-workers` | yes | the CPU expert time per worker count, from `PROBE rates` | 0 (part of the rates) |
+| `prefill-cpu-share` | yes | timed 8192-token chunks at share 0, 1, the balance and the default | the chunks, a few seconds |
+| `adapt-every`, `adapt-swaps`, `adapt-decay` | no | the defaults were fastest cold on both card sets measured, and the swap counts tried on a small cache split both ways within run noise ([adaptive tier](configuration/adaptive.md)); nothing the probe measures moves the best value, and a cold comparison needs a fresh engine per value | 0 |
+| `peer-adapt-swaps` | no | fewer peer swaps lost on every workload measured; it follows `adapt-swaps` | 0 |
+| `vram-reserve-mib`, `peer-reserve-mib` | no | lower reserves add about 1% more slots, inside run noise; they guard against paging and the start says when one is short | 0 |
+| `spec` | no | fixed at start (no per-request value), and spec 7 against 8 differs by 1-2%, inside one run's noise | 0 |
+| `prefill`, `expert-cache` | no | sized at start from what the cards can hold and lend | 0 |
+| `peer-exclusive`, `resident-budget-gib`, `pool-affinity` | no | picked at start from the RAM and the CPU layout (`[server] auto`) | 0 |
+| `suffix-draft`, `mtp-max-t`, `mtp-window`, `short-read` | no | properties of the model and the workload, not the machine | 0 |
+| `kv`, `max-context` | no | memory and precision choices, not speed | 0 |
+
 The engine's `PROBE set workers=K share=F` sets the pool's active worker count and the share for the requests that
 follow, between requests; the probe uses it and the engine is stopped afterwards.
 

@@ -16,6 +16,7 @@ the model file's sampling defaults. For what a setting does to speed, memory and
 - [Vision](#vision)
 - [Control vectors](#control-vectors)
 - [Sampling](#sampling)
+- [The adaptive tier](adaptive.md)
 - [Example configurations](examples.md)
 
 ## How settings are given
@@ -56,7 +57,7 @@ A config file is one JSON object with two optional blocks:
 - An engine flag in `server`, or a server option in `engine`, stops the server at startup, as does an unknown name.
 - `api-key` cannot be set in a config file; a file that sets it is refused.
 - The built-in defaults pick the fastest settings that need no knowledge of the machine (speculation 8 with a drafter,
-  expert cache auto, prefill auto, resident experts when the RAM holds them, adaptive rounds every window), and keep
+  expert cache auto, prefill auto, resident experts when the RAM holds them, adaptive rounds every window on a server), and keep
   the settings that change output or memory use (4096 context, fp16 KV). A config file sets those. The startup line `[server] engine ...` lists what came from the file or the command line.
 
 In the tables, "default" is what applies when the setting is absent everywhere.
@@ -141,27 +142,23 @@ The model's experts live in VRAM (the expert cache), in RAM, or in the file. The
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
 | `vram-reserve-mib` | engine | integer MiB, at least 256 | 700 (lowered automatically, down to 300, on a card that would otherwise get too few slots; a value you give is kept) | VRAM left free on the main card for graphs, scratch and the head when `expert-cache auto` sizes the cache. Below 256 is refused. Raise it if the machine pages GPU memory or other programs need VRAM. |
-| `resident-experts` | engine | switch | on when the pack has an expert profile and the experts are not split over several cards | Keep the experts the GPU does not hold in page-locked RAM, so none is read from the file again. Leaves a RAM floor free for the OS; when the RAM cannot hold them it falls back to a plain file mapping. `mmap-experts` turns it off. |
+| `resident-experts` | engine | switch | on when the pack has an expert profile | Keep the experts the GPU does not hold in page-locked RAM, so none is read from the file again. Leaves a RAM floor free for the OS; when the RAM cannot hold them it falls back to a plain file mapping. `mmap-experts` turns it off. |
 | `resident-budget-gib` | engine | number GiB | auto when not set | Like `resident-experts` but with at most N GiB of experts in RAM, hottest first. Refused when it would leave less than the RAM floor free; the error names the largest safe value. |
 | `mmap-experts` | engine | switch | off | Opt out of the default resident RAM copy and back to a file mapping. Speed then depends on the OS page cache. |
 | `shared-expert-arena` | engine | file path | off | Back the resident arena with one shared file so several processes use one copy. Put it on `/dev/shm`. |
-| `expert-profile-save` | engine | file path | off | Save what the adaptive tier learned (experts in VRAM and routing counts) to this file on exit and periodically. A start that finds the file places it instead of the model's profile, so the first request runs on what the last run learned. `tools/convert/convert.py --profile` reads it too. |
+| `expert-profile-save` | engine | file path | off | Save what the adaptive tier learned (experts in VRAM and routing counts) to this file on exit and periodically. A start that finds the file places it instead of the model's profile, so the first request runs on what the last run learned: faster when the workload continues, slower when it changes ([adaptive tier](adaptive.md)). Needs the adaptive tier on. `tools/convert/convert.py --profile` reads it too. |
 | `expert-profile-save-every` | engine | minutes | 10 (`0` = on exit only) | How often the profile is saved. |
 | `vram-elastic` | engine | switch | off | Hold the expert cache in segments so `POST /v1/vram` can lend VRAM to other programs between requests. Works with `resident-experts`: a shrink first copies the experts it gives back into RAM, so none is read from the file, and is refused (nothing changed) when the RAM above the floor cannot hold them; a grow frees those copies. |
 | `expert-cache` | engine | `auto`, or an integer count of expert blobs | `auto` (on packs with an expert profile) | Keep this many expert blobs in VRAM and compute their rows on the GPU. `auto` takes as many as fit in the VRAM left after the weights, the session and `vram-reserve-mib`. |
-| `adapt-swaps` | engine | integer | 96 (`0` = off) | Most experts one adaptive round swaps into the main GPU. `0` turns the swaps off. |
-| `peer-adapt-swaps` | engine | integer | the value of `adapt-swaps` | Peer card cache swaps per adaptation step. Only with a peer card. |
+| `adapt-every` | engine | integer windows | 1 on a server, 4 with a layer split (`0` = off) | An adaptive round every N decode windows. [Adaptive tier](adaptive.md). |
+| `adapt-swaps` | engine | integer | 96 (`0` = off) | Most experts one adaptive round swaps into the main GPU; a server round after a large backlog swaps four times as many, and the RAM copy keeps four times N free places for them. [Adaptive tier](adaptive.md). |
+| `peer-adapt-swaps` | engine | integer | the value of `adapt-swaps` | Most experts one round swaps into the peer card. Only with a peer card. |
+| `adapt-decay` | engine | number | 0.85 on a server, 0.7 with a layer split | The factor the routing counts are multiplied by after each round; lower forgets sooner. [Adaptive tier](adaptive.md). |
 
 ### The adaptive tier
 
-The engine counts how often each expert is routed to. Every few decode windows it runs a round: in each layer it swaps
-the most-used experts that are not in VRAM in for the least-used resident ones, when the gain is clear. On one card
-without a peer tier the round ranks every layer together, so a layer that routes to more experts takes slots from the
-layers that route to fewer. The peer card
-takes the next most-used experts the main card does not hold. After each round every count is decayed, so recent routing
-outweighs old. Copies run on a side stream and land a few windows later. Adaptation moves experts between the CPU and
-the GPUs, so output is not bit-identical from run to run; see [precision](../precision/index.md). The round settings are
-engine diagnostic flags; with adaptation off the tiers stay as loaded and `expert-profile-save` has nothing to learn.
+The engine moves the experts the conversation routes to most into VRAM, in rounds beside decode. What the four
+settings above do, what they trade and the measured numbers: [adaptive tier](adaptive.md).
 
 The startup lines `RAM floor ...` and `RAM ... free, guard ...` give the figures behind the memory floors. See the
 [running](../running.md#memory-floors).
@@ -174,6 +171,7 @@ The prompt is read in batched chunks. These settings set the chunk size and how 
 | --- | --- | --- | --- | --- |
 | `prefill` | engine | `auto`, `auto:N` (N = 8192, 16384 or 32768), or a chunk size in tokens | `auto` | Read the prompt in chunks of this many tokens. `auto` takes the largest chunk the expert cache can lend, up to a ceiling; `auto:N` sets that ceiling. |
 | `prefill-cpu-share` | engine | number from 0 to 1 | 0.6 | Share of the streamed prompt experts the CPU computes; `0` has the GPU stream them all. Fixed, so the output is the same from run to run. A weaker CPU may prefer a lower value. |
+| `short-read` | engine | integer tokens | 64 (`0` = off) | A fresh part of a prompt of at most N tokens (a chat message, a short tool result) is read through the decode windows instead of the batched prompt path. |
 | `peer-prefill-rows` | engine | integer rows per layer | half of chunk x top-k | Prompt rows per layer the peer card computes. `0` keeps the prompt path on the main card. |
 
 ## Speculative decoding (MTP)
@@ -184,6 +182,9 @@ plain decoding would give.
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
 | `spec` | engine | integer | 8 with a drafter, else 0 | Verify windows of at most N tokens: the last accepted token plus up to N-1 drafts. `0` or `1` turns speculation off. |
+| `suffix-draft` | engine | integer tokens | 3 (`0` = MTP only) | Prompt lookup: when the text repeats an earlier stretch of the context by at least N tokens, the window may be filled from what followed it there, where the draft policy expects it to pay. |
+| `mtp-max-t` | engine | integer | 0 (= `spec`) | Caps the MTP's own windows; longer ones then come only from prompt lookup. |
+| `mtp-window` | engine | integer cells | 32768 (`0` = all) | The drafter attends to the last N cells. |
 | `relaxed-drafting` | engine (`[P]`) | `true`, or a number in (0, 1] | off | Optional, and it changes output. Under sampling, a draft the model gives probability P or more is kept even when the model's own draw would have been another token. Faster, but no longer the model's exact sampling distribution; lower P is faster and further from exact. Bare `true` or flag alone is 0.5. Greedy requests, `logit_bias`, JSON `response_format`, control tokens and tool calls stay exact. Single-stream only. Numbers: [precision](../precision/features.md#relaxed-drafting). |
 
 ## Parallel slots
