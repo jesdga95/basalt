@@ -40,7 +40,7 @@ template <typename T> std::vector<T> down(const T* d, size_t n) {
 const k::QsaShapes S_ = k::qsa_real_shapes();
 const int IQ = (int) S_.idx_n_head, ID = (int) S_.idx_dim, R = (int) S_.idx_block;
 int g_fail = 0;
-const int64_t MAXB = 16384;   // 65,536 cells
+const int64_t MAXB = 32769;   // 131,076 cells
 
 double time_us(cudaStream_t st, int iters, char* flush, size_t flush_n, const std::function<void()>& call) {
     cudaEvent_t e0, e1;
@@ -84,6 +84,10 @@ int main(int argc, char** argv) {
         {"8 rows, mixed lengths", 8, {16000, 100, 31, 32, 33, 8000, 12500, 1}, {64001, 401, 126, 129, 134, 32002, 50000, 4}},
         {"2 rows, n_bid 0 and 1", 2, {0, 1}, {1, 5}},
         {"5 rows, 63..65 blocks", 5, {63, 64, 65, 95, 96}, {253, 257, 261, 383, 386}},
+        {"5 rows at 131K", 5, {32763, 32764, 32764, 32765, 32766}, {131055, 131057, 131058, 131063, 131066}},
+        {"6 rows at 131K, tails", 6, {32760, 32761, 32762, 32763, 32764, 32765}, {131040, 131045, 131050, 131053, 131059, 131063}},
+        {"7 rows at 131K and short", 7, {32766, 32766, 1000, 32767, 0, 32767, 32768}, {131064, 131065, 4001, 131068, 2, 131071, 131072}},
+        {"8 rows at 131K", 8, {32761, 32762, 32763, 32764, 32765, 32766, 32767, 32768}, {131044, 131049, 131053, 131058, 131061, 131066, 131070, 131072}},
     };
     for (const Case& c : cases) {
         std::vector<float> q((size_t) c.nq * IQ * ID);
@@ -179,6 +183,21 @@ int main(int argc, char** argv) {
                                           [&] { k::qsa_block_scores_seg(tab, d_q, d_steps, nq, MAXB, S_, d_a, st, true); });
                 std::printf("bench segment scores keys %-5s: %7.2f us/call\n", cold ? "cold" : "warm", us);
             }
+            for (int64_t ctx : {40960, 131072}) {   // the same 6 rows on 2 slots at the serving depths
+                for (int i = 0; i < nq; ++i) {
+                    const int64_t n = ctx - 1 - i % 3;
+                    steps[i * k::kStepCount + k::kStepNKv] = (int32_t) n;
+                    steps[i * k::kStepCount + k::kStepNBid] = (int32_t) (n / R);
+                    steps[i * k::kStepCount + k::kStepWidth] = (int) k::qsa_selection_width(n, S_);
+                }
+                up(d_steps, steps);
+                for (int cold = 0; cold < 2; ++cold) {
+                    const double us = time_us(st, iters, cold ? flush : nullptr, flush_n,
+                                              [&] { k::qsa_block_scores_seg(tab, d_q, d_steps, nq, MAXB, S_, d_a, st, true); });
+                    std::printf("bench segment scores 6 rows on 2 slots, %6lld cells, keys %-5s: %7.2f us/call\n",
+                                (long long) ctx, cold ? "cold" : "warm", us);
+                }
+            }
         }
     }
 
@@ -258,6 +277,37 @@ int main(int argc, char** argv) {
         for (int nq : {1, 3}) {
             const double us = time_us(st, iters, nullptr, 0, [&] { k::qsa_block_topk(d_a, d_steps, nq, MAXB, cap, S_, d_ids, st); });
             std::printf("bench top-k nq=%d: %7.2f us/call\n", nq, us);
+        }
+    }
+    {   // microbench at the serving depths: 3 to 8 rows, the keys of 40K and 131K contexts, warm and flushed
+        const int64_t mb = 131072 / R + 1;
+        std::vector<float> kh((size_t) mb * ID);
+        for (auto& x : kh) x = nd(rng);
+        float* d_k = dalloc<float>(kh.size());
+        up(d_k, kh);
+        float* d_s = dalloc<float>((size_t) 8 * mb);
+        std::vector<float> q((size_t) 8 * IQ * ID);
+        for (auto& x : q) x = nd(rng);
+        up(d_q, q);
+        const size_t flush_n = 256u << 20;
+        char* flush = dalloc<char>(flush_n);
+        for (int nq : {3, 4, 5, 6, 7, 8})
+        for (int64_t ctx : {40960, 131072}) {
+            std::vector<int32_t> steps((size_t) nq * k::kStepCount, 0);
+            for (int i = 0; i < nq; ++i) {
+                const int64_t nkv = ctx - nq + i;
+                steps[i * k::kStepCount + k::kStepNKv] = (int32_t) nkv;
+                steps[i * k::kStepCount + k::kStepNBid] = (int32_t) (nkv / R);
+                steps[i * k::kStepCount + k::kStepWidth] = (int) k::qsa_selection_width(nkv, S_);
+            }
+            up(d_steps, steps);
+            const double bytes = (double) (ctx / R) * ID * 4;
+            for (int cold = 0; cold < 2; ++cold) {
+                const double us = time_us(st, iters, cold ? flush : nullptr, flush_n,
+                                          [&] { k::qsa_block_scores(d_k, d_dead, d_q, d_steps, nq, mb, S_, d_s, st, -1, true); });
+                std::printf("bench scores %d rows, %6lld cells, keys %-5s: %7.2f us/call, keys %.1f MB = %.0f GB/s\n", nq,
+                            (long long) ctx, cold ? "cold" : "warm", us, bytes / 1e6, bytes / us / 1e3);
+            }
         }
     }
     std::printf("qsa_scores_parity: %s\n", g_fail ? "FAIL" : "OK");
