@@ -5257,6 +5257,12 @@ int main(int argc, char** argv) {
             const auto m = disk.best(ids.data(), ids.size(), imgs, cvec);
             return m.tokens > 0 && m.tokens + kDiskStaleTokens >= deepest;
         };
+        // A capture of a conversation's state, or a read of one from disk, takes `need` bytes of RAM: only while the RAM
+        // guard reads its level as ok, and with `floor` left free after it (the disk tier's floor sits above the guard's).
+        auto capture_admit = [&](uint64_t need, uint64_t floor) -> bool {
+            return basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok &&
+                   basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), need, floor);
+        };
         if (o.conversation_cache_disk_mib > 0) {
             std::string de;
             const auto t0 = Clock::now();
@@ -5372,9 +5378,8 @@ int main(int argc, char** argv) {
                                                           disk.enabled() ? disk_floor : 0);
                 const size_t retained = reuse.bytes() + stage_retained;
                 const size_t additional = estimate > retained ? estimate - retained : 0;
-                if (!basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(),
-                        additional, floor)) {
-                    basalt::log::info("basalt serve", "conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, or telemetry unavailable)",
+                if (!capture_admit(additional, floor)) {
+                    basalt::log::info("basalt serve", "conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, or telemetry unavailable, or RAM below the guard)",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib);
                     return true;
                 }
@@ -7892,7 +7897,7 @@ int main(int argc, char** argv) {
                     return;
                 }
                 if (at_exit) disk.flush();   // one image in RAM at a time
-                if (!basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), bytes, floor)) {
+                if (!capture_admit(bytes, floor)) {
                     basalt::log::info("basalt serve", "conversation cache: %zu tokens not written to disk (physical RAM "
                                       "admission)", ids.size());
                     return;
@@ -8525,40 +8530,21 @@ int main(int argc, char** argv) {
             std::optional<basalt::core::SavedConversation> incoming;
             int64_t in_tokens = parked.tokens;   // where the incoming image continues: the RAM tier's match or the disk's
             bool in_live = parked.live;
-            // the disk tier, when it holds a longer start than every other source: read back cut at its match
+            // the disk tier, when it holds a longer start than every other source: read back cut at its match, after the
+            // RAM guard's wait below (the read takes RAM)
             const basalt::core::ConversationStore::Match on_disk =
                 disk.enabled() ? disk.best(ids32.data(), ids32.size(), req_imgs, want_cvec)
                                : basalt::core::ConversationStore::Match{};
-            if (on_disk.tokens > std::max({resume, slot_tokens, parked.tokens})) {
-                const uint64_t need = disk.load_bytes(on_disk);
-                const uint64_t floor = std::max<uint64_t>((uint64_t) o.conversation_cache_min_free_mib << 20, disk_floor);
-                const auto t0 = Clock::now();
-                basalt::core::SavedConversation image;
-                std::string de;
-                if (!basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), need, floor)) {
-                    basalt::log::info("basalt serve", "conversation cache: %lld tokens on disk not read (physical RAM "
-                                      "admission; need %llu MiB)", (long long) on_disk.tokens,
-                                      (unsigned long long) (need >> 20));
-                } else if (!disk.load(on_disk, image, de)) {
-                    basalt::log::warn("basalt serve", "conversation cache: reading from disk failed (%s); the file is "
-                                      "dropped", de.c_str());
-                } else {
-                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-                    basalt::log::info("basalt serve", "conversation cache: read %lld tokens from disk in %.1f ms "
-                                      "(%.2f GB of state)", (long long) on_disk.tokens, ms, (double) image.bytes() / 1e9);
-                    incoming.emplace(std::move(image));
-                    in_tokens = on_disk.tokens;
-                    in_live = true;
-                }
-            }
-            if (!incoming && parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
+            const bool from_disk = on_disk.tokens > std::max({resume, slot_tokens, parked.tokens});
+            if (!from_disk && parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
             // RAM below the guard's floor (another program's peak): shed (after the conversation this request
             // continues is taken out of the cache), then let it come back before the request starts; a STOP ends the
             // wait, and the request then ends as cancelled.  A request that only continues the live conversation by a
             // few tokens (the server's wrap-up after a thinking budget) is part of a reply already streaming: no wait.
             if (!batch_on() && basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Ok) {
                 shed_if_low();
-                if (!basalt::platform::ram_continues_live(from_live && !incoming && slot_source < 0, n - resume)) {
+                if (!basalt::platform::ram_continues_live(from_live && !incoming && !from_disk && slot_source < 0,
+                                                           n - resume)) {
                     uint64_t avail = 0, floor = 0;
                     (void) basalt::platform::ram_guard_level(&avail, &floor);
                     basalt::log::info("basalt serve", "RAM low (%llu MiB free < %llu MiB guard): the request waits up "
@@ -8597,6 +8583,36 @@ int main(int argc, char** argv) {
                                           "the request starts", waited() / 1000.0, (unsigned long long) (avail >> 20),
                                           (unsigned long long) (floor >> 20));
                     basalt::core::progress_at("request");
+                }
+            }
+            if (from_disk) {
+                const uint64_t need = disk.load_bytes(on_disk);
+                const uint64_t floor = std::max<uint64_t>((uint64_t) o.conversation_cache_min_free_mib << 20, disk_floor);
+                const auto t0 = Clock::now();
+                basalt::core::SavedConversation image;
+                std::string de;
+                if (!capture_admit(need, floor)) {
+                    basalt::log::info("basalt serve", "conversation cache: %lld tokens on disk not read (physical RAM "
+                                      "admission; need %llu MiB)", (long long) on_disk.tokens,
+                                      (unsigned long long) (need >> 20));
+                } else if (!disk.load(on_disk, image, de)) {
+                    basalt::log::warn("basalt serve", "conversation cache: reading from disk failed (%s); the file is "
+                                      "dropped", de.c_str());
+                } else {
+                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                    basalt::log::info("basalt serve", "conversation cache: read %lld tokens from disk in %.1f ms "
+                                      "(%.2f GB of state)", (long long) on_disk.tokens, ms, (double) image.bytes() / 1e9);
+                    incoming.emplace(std::move(image));
+                    in_tokens = on_disk.tokens;
+                    in_live = true;
+                }
+                if (!incoming) {   // not read: the RAM tier's match, when the shed left one
+                    const auto again = conversations.best(ids32, req_imgs, want_cvec);
+                    if (again.tokens > std::max(resume, slot_tokens)) {
+                        incoming.emplace(conversations.take(again.index));
+                        in_tokens = again.tokens;
+                        in_live = again.live;
+                    }
                 }
             }
             if (incoming) slot_source = -1;
