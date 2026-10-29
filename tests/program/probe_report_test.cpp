@@ -85,6 +85,22 @@ int main() {
     CHECK(rep.find("warm") == std::string::npos && rep.find("PASS") == std::string::npos && rep.find("predicted") == std::string::npos);
     CHECK(rep.find("  suggested: --pool-workers 8 (52 us/expert, best 51 us)\n  config: --gpu 0,1\n") != std::string::npos);
     CHECK(rep.find(kProbeDisclaimer) != std::string::npos);
+    CHECK(rep.find("adapt test") == std::string::npos);   // not run: no line
+    in.adapt_line = "1/96/0.85 250 252 tok/s (band 1.0%)";
+    CHECK(format_report(in).find("tok/s (measured)\n  adapt test  1/96/0.85 250 252 tok/s (band 1.0%)\n  suggested:") !=
+          std::string::npos);
+
+    // the config line names the cards as given, not as the engine sees them
+    {
+        const std::vector<std::string> a = {"--model", "m.basalt", "--gpu", "0", "--kv", "int8"};
+        CHECK(format_config(a, "1") == "--gpu 1 --kv int8");
+        CHECK(format_config(a, "auto") == "--gpu auto --kv int8");
+        CHECK(format_config({"--gpu", "0,1", "--spec", "8"}, "0,1") == "--gpu 0,1 --spec 8");
+        CHECK(format_config({"--gpu", "0", "--kv", "int8"}, "0") == "--gpu 0 --kv int8");
+        // only the user's settings: swaps and context appear when given, and nothing is added when not
+        CHECK(format_config({"--model", "m", "--kv", "int8"}, "") == "--kv int8");
+        CHECK(format_config({"--adapt-swaps", "32", "--max-context", "8192"}, "") == "--adapt-swaps 32 --max-context 8192");
+    }
 
     if (failures) return 1;
     std::printf("probe_report_test: ok\n");
