@@ -59,35 +59,9 @@ public:
             (count > SIZE_MAX / sizeof(Segment) || !add(total, count * sizeof(Segment)))) return SIZE_MAX;
         return total;
     }
-    void resize(size_t n, uint8_t value = 0) {
-        if (n > size_) {
-            const bool growing = size_ != 0;
-            const size_t spare = segments_.empty() ? 0 : segments_.back().capacity() - segments_.back().size();
-            const size_t extend = std::min(n - size_, spare);
-            const size_t extra = n - size_ - extend;
-            segments_.reserve(segments_.size() + extra / segment_bytes + (extra % segment_bytes != 0));
-            if (extend) {
-                segments_.back().resize(segments_.back().size() + extend, value);
-                size_ += extend;
-            }
-            while (size_ < n) {
-                const size_t count = std::min(segment_bytes, n - size_);
-                const size_t previous = segments_.empty() ? 0 : segments_.back().capacity();
-                Segment segment;
-                segment.reserve(segment_capacity(count, previous, growing));
-                segment.resize(count, value);
-                segments_.push_back(std::move(segment));
-                size_ += count;
-            }
-        } else {
-            while (!segments_.empty() && size_ - segments_.back().size() >= n) {
-                size_ -= segments_.back().size();
-                segments_.pop_back();
-            }
-            if (size_ > n) segments_.back().resize(segments_.back().size() - (size_ - n));
-            size_ = n;
-        }
-    }
+    void resize(size_t n, uint8_t value = 0) { grow_or_shrink(n, &value); }
+    /// The same without writing the new bytes: for a caller that overwrites every one of them (a read from a file).
+    void resize_for_overwrite(size_t n) { grow_or_shrink(n, nullptr); }
     void pop_back() { resize(size_ - 1); }
 
     // fn(pointer, count, absolute_offset); false aborts a transfer immediately.
@@ -119,7 +93,47 @@ public:
     }
 
 private:
-    using Segment = std::vector<uint8_t>;
+    // a segment's bytes are written by the caller (a fill value or a copy), never zeroed first by the vector itself
+    template <class T>
+    struct NoInit : std::allocator<T> {
+        template <class U> struct rebind { using other = NoInit<U>; };
+        NoInit() = default;
+        template <class U> NoInit(const NoInit<U>&) noexcept {}
+        template <class U> void construct(U* p) { ::new (static_cast<void*>(p)) U; }
+        template <class U, class... A> void construct(U* p, A&&... a) { ::new (static_cast<void*>(p)) U(std::forward<A>(a)...); }
+    };
+    using Segment = std::vector<uint8_t, NoInit<uint8_t>>;
+    void grow_or_shrink(size_t n, const uint8_t* value) {
+        if (n > size_) {
+            const bool growing = size_ != 0;
+            const size_t spare = segments_.empty() ? 0 : segments_.back().capacity() - segments_.back().size();
+            const size_t extend = std::min(n - size_, spare);
+            const size_t extra = n - size_ - extend;
+            segments_.reserve(segments_.size() + extra / segment_bytes + (extra % segment_bytes != 0));
+            if (extend) {
+                if (value) segments_.back().resize(segments_.back().size() + extend, *value);
+                else segments_.back().resize(segments_.back().size() + extend);
+                size_ += extend;
+            }
+            while (size_ < n) {
+                const size_t count = std::min(segment_bytes, n - size_);
+                const size_t previous = segments_.empty() ? 0 : segments_.back().capacity();
+                Segment segment;
+                segment.reserve(segment_capacity(count, previous, growing));
+                if (value) segment.resize(count, *value);
+                else segment.resize(count);
+                segments_.push_back(std::move(segment));
+                size_ += count;
+            }
+        } else {
+            while (!segments_.empty() && size_ - segments_.back().size() >= n) {
+                size_ -= segments_.back().size();
+                segments_.pop_back();
+            }
+            if (size_ > n) segments_.back().resize(segments_.back().size() - (size_ - n));
+            size_ = n;
+        }
+    }
     // A fresh capture allocates exactly its payload. Later appends reserve
     // geometrically growing segments, bounded by 16 MiB. Small chat turns then
     // extend the final allocation instead of adding one transfer per turn.

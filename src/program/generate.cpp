@@ -7116,12 +7116,11 @@ int main(int argc, char** argv) {
                         return false;
                 }
                 for (int64_t j = 0; j < from.qsa_alloc; ++j) {
-                    basalt::core::ConversationKv img;
-                    basalt::core::ConversationKv& src_img = held ? slot_held.kv[k][(size_t) j] : img;
-                    if (!held && !basalt::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
-                        return false;
-                    if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
-                    if (!basalt::core::conversation_kv_restore(src_img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
+                    // the slot's cells straight into the request's session (a held slot's from its RAM copy)
+                    if (held ? !basalt::core::conversation_kv_restore(slot_held.kv[k][(size_t) j],
+                                                                      to.qsa_states[to.qsa_ord0 + j], g, upto, true, e)
+                             : !basalt::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
+                                                                   to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                         return false;
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }

@@ -325,6 +325,18 @@ int main() {
             check(equal(a,restored),"A/B/A byte-exact K/V and indexer state");
             uint64_t fingerprint = 0;
             check(conversation_kv_verify(a,f.state,f.g,upto,index,fingerprint,err),"verify restored authoritative and resident bytes without rewriting them");
+            {
+                Fixture h(fmt,mode);   // another session of the same layout: A copied into it on the device
+                h.fill(177);
+                cuda_check(cudaDeviceSynchronize());
+                check(conversation_kv_copy(f.state,h.state,f.g,upto,index,err),"copy A into another session");
+                cuda_check(cudaDeviceSynchronize());
+                ConversationKv copied;
+                check(conversation_kv_save(copied,h.state,h.g,upto,index,err),"read back the copy");
+                check(equal(a,copied),"device copy byte-exact K/V and indexer state");
+                uint64_t copied_fp = 0;
+                check(conversation_kv_verify(a,h.state,h.g,upto,index,copied_fp,err),"verify the copy's authoritative and resident bytes");
+            }
             if (mode==1) {
                 std::vector<int32_t> table((size_t)f.state.n_pages);
                 cuda_check(cudaMemcpy(table.data(),f.state.page_table,table.size()*4,cudaMemcpyDeviceToHost));

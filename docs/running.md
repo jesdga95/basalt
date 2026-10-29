@@ -153,6 +153,18 @@ once a second:
 `/metrics` carries the history behind the charts in `history` (`tok_s`, `prefill_tok_s_mean`, `slot_tok_s` one series
 per slot, `gpus` with `util`, `power` and `temp` per card) and the fastest requests in `best`.
 
+evicts, or that the engine still holds when it ends (a stop, an idle unload) is written to DIR: one file for its
+tokens and running state, and shared files for its K/V cache (one per 4096 cells) and for each checkpoint's state,
+each named by the tokens it covers and its bytes, so the same conversation written again, or another that starts the
+same way, writes only the blocks and states that are new. A conversation whose last checkpoint (the end of its last
+prompt) is at most 4096 tokens behind is stored as of that checkpoint, with no running state of its own: the next
+turn goes on from there, and a reply sent back as it was is read again. A later prompt that starts with a stored conversation (its
+tokens, or one of its checkpoints) reads it back cut at that point and goes on from there, after a restart too: the
+wait is the drive reading the K/V cache instead of the prompt being read again. The writes run on a background thread
+with direct I/O; a request that parks a conversation waits only for the copy out of the GPU. A file is bound to the
+model file, the engine version and the settings that change the state (the KV type, the rope, the draft layer, control
+shared file goes with the last conversation that uses it), and a write always leaves 4 GiB of the volume free. Writes
+on the drive that holds the model file can slow its next load: a cache directory on another drive avoids that.
 ## Memory floors
 
 Basalt refuses settings that would leave the machine without memory, and never shrinks what you asked for:
