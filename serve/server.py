@@ -22,11 +22,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable as a script
 from serve import ROOT, service  # noqa: E402
-from serve.config import (build_parser, check_engine_flags, engine_flags_of, engine_line,  # noqa: E402
-                          grammar_words, parse_settings, sampling_defaults_from_config, sampling_line)
+from serve.config import (build_parser, check_engine_flags,  # noqa: E402
+                          engine_flags_of, engine_line, grammar_words, parse_settings, sampling_defaults_from_config,
+                          sampling_line)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
-from serve.engine.flags import flag_index  # noqa: E402
+from serve.engine.flags import flag_index, flag_value  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.engine.process import ProcessEngine  # noqa: E402
 from serve.engine.vision import (EngineVision, Vision, check_gpu, child_env, engine_args, gpu_plan,  # noqa: E402
@@ -182,8 +183,13 @@ def main() -> int:
         if a.grammar and not has_grammar:
             print(tagged("warning", "grammar is on but this engine has no --grammar; requests go without one"), flush=True)
         gwords = grammar_words(known_flags)
+        cdir = flag_value(engine_args(cfg), "--conversation-cache-dir")
+        cmib = flag_value(engine_args(cfg), "--conversation-cache-disk-mib") or "0"
+        if cdir and cmib != "0":
+            print(tagged("disk", f"conversations={cdir} disk-mib={cmib}"), flush=True)
         try:
-            engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=lazy)
+            engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env,
+                                   lazy=lazy)
         except EngineStartError as e:
             print(f"[server] error: {e}", file=sys.stderr, flush=True)
             if e.log:

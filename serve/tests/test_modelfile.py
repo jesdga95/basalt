@@ -61,6 +61,21 @@ class Derivation(Tmp):
         tok = Path(modelfile.model_config(path, str(self.engine_bin))["tokenizer"])
         self.assertEqual(tok, self.dir / "cache" / key / "tokenizer")
 
+    def test_conversation_dir_follows_the_budget(self):
+        path = self.build()
+        key = ModelFile(path).sections["meta"][2].hex()[:16]
+        conv = str(self.dir / "cache" / key / "conversations")
+
+        def args(*words):
+            return modelfile.model_config(path, str(self.engine_bin), engine_words=list(words))["args"]
+        self.assertEqual(args(), ["--model", path])
+        self.assertEqual(args("--conversation-cache-disk-mib", "0"), ["--model", path, "--conversation-cache-disk-mib", "0"])
+        self.assertEqual(args("--conversation-cache-dir", "/x"), ["--model", path, "--conversation-cache-dir", "/x"])
+        self.assertEqual(args("--conversation-cache-disk-mib", "32768"),
+                         ["--model", path, "--conversation-cache-disk-mib", "32768", "--conversation-cache-dir", conv])
+        self.assertEqual(args("--conversation-cache-disk-mib", "5", "--conversation-cache-dir", "/x"),
+                         ["--model", path, "--conversation-cache-disk-mib", "5", "--conversation-cache-dir", "/x"])
+
     def test_tokenizer_extracted_once_and_reused(self):
         path = self.build()
         tok = Path(modelfile.model_config(path, str(self.engine_bin))["tokenizer"])

@@ -313,11 +313,16 @@ public:
         if (bytes() > budget_ - held - incoming) reuse_ = {};
         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
             bytes_ -= entries_.front().bytes();
+            if (spill_) spilled_.push_back(std::move(entries_.front()));
             entries_.pop_front();
             ++evictions_;
         }
         return true;
     }
+
+    /// With spilling on, what make_room evicts waits in take_spilled() for the tier below (the disk) instead of going.
+    void set_spill(bool on) { spill_ = on; }
+    std::vector<SavedConversation> take_spilled() { return std::exchange(spilled_, {}); }
 
     // Drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
     // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
@@ -366,6 +371,8 @@ public:
 private:
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
     std::deque<SavedConversation> entries_; // least recently active first
+    bool spill_ = false;
+    std::vector<SavedConversation> spilled_;
     ConversationKvReuse reuse_;
     const void* reuse_owner_ = nullptr;
 };

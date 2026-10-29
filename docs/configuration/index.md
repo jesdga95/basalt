@@ -203,6 +203,8 @@ plain decoding would give.
 | `conversation-cache-mib` | engine | integer MiB | 0 (off) | RAM budget for parked conversations, so separate chats can come back without re-reading. |
 | `conversation-cache-slots` | engine | integer | 4 | At most this many parked conversations. |
 | `conversation-cache-min-free-mib` | engine | integer MiB | 2560 | Physical RAM floor kept free when parking a conversation. |
+| `conversation-cache-disk-mib` | engine | integer MiB | 0 (off) | Park conversations on disk, at most this much (the least recently used go first), and read them back when a prompt starts with one, after a restart too. Above 0 turns it on; the folder is `conversations` in the model's cache folder. [running](../running.md#conversations-on-disk---conversation-cache-disk-mib) |
+| `conversation-cache-dir` | engine | directory | model cache folder | Another folder for the disk tier. Does nothing while the budget is 0. |
 
 ## Vision
 
