@@ -32,6 +32,7 @@
 namespace basalt::core {
 using namespace verify_detail;
 
+// pre(l, group): up to the ring
 bool Verifier::WindowRecorder::pre(int64_t l) {
     using namespace basalt::kernels;
     const int n = T;
@@ -148,12 +149,12 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
     const bool read_q8 = dec_hc && hc_fused_q8_rows_ok();
     const WeightRef* w_router = v.get("ffn_gate_inp.weight");
     const bool router_multi = w_router != nullptr && NE == 512 && K == 10;
-    // a GDN layer's middle as one persistent kernel (mid_chain.hpp) between the layer's two hc reads: the qkv + z pair,
-    // the recurrence and the output projection, bitwise the kernels it replaces
     // the GDN mixer split by key head: the layer's q8_1 rows and a doorbell for the peer's key heads; in a batch
     // window CUDA0 runs the whole layer and the doorbell only passes
     const bool gs_ring = dm && v_.gs_nk0_ > 0 && !is_qsa_layer(g, l);
     const bool gs_split = gs_ring && !v_.batch_rec_;
+    // a GDN layer's middle as one persistent kernel (mid_chain.hpp) between the layer's two hc reads: the qkv + z pair,
+    // the recurrence and the output projection, bitwise the kernels it replaces
     bool mid_ok = false;
     MidChainArgs ma;
     if (dec_hc && read_q8 && router_multi && !is_qsa_layer(g, l) && !v_.prof_on_ && !v_.batch_rec_ && !gs_split &&

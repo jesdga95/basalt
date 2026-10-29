@@ -55,6 +55,8 @@ inline bool native_of(const WeightRef* w, const std::string& name, std::string& 
     return true;
 }
 
+// The commit graph is two launches, its GDN part from 32 persistent blocks so it trickles beside the draft instead of
+// filling the card
 constexpr int kCommitBlocks = 32;
 extern bool g_commit_async;
 void note_fallback(const char* what, int a, int b);

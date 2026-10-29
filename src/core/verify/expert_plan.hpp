@@ -11,6 +11,8 @@
 
 namespace basalt::core {
 
+// the MoE tail (dec_moe.hpp): planned on CUDA0 from device residency tables, the peer card served from mapped rings
+// by one persistent kernel per window, the CPU pool by the host loop (only its own entries).
 struct DecMoe {
     int64_t rings = 0;                       ///< rings per window (one per layer)
     int32_t* res0 = nullptr;                 ///< CUDA0: [n_layers * n_expert] CUDA0 slot or -1 (host_res mirrored)

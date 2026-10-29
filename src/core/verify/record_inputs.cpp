@@ -98,7 +98,7 @@ bool Verifier::WindowRecorder::inputs() {
     for (int64_t l = v_.lb_; l < v_.le_ && gdn_first < 0; ++l) gdn_first = gdn_idx[(size_t) l];
     lazy = v_.lazy_on() && !v_.batch_rec_ && cs == v_.cs_ && dm;
     lazy_args = lazy ? v_.commit_gdn_lazy_args() : GdnCommitLayers{};
-    lz_open = false;   // a lazy launch not joined yet
+    lz_open = false;
     return true;
 }
 

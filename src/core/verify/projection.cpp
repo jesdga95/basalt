@@ -11,6 +11,7 @@
 
 namespace basalt::core::verify_detail {
 
+// one stderr line per distinct fast-path fallback (what, a, b)
 void note_fallback(const char* what, int a, int b) {
     static std::mutex mu;
     static std::set<std::tuple<std::string, int, int>> seen;

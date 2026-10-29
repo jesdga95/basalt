@@ -34,7 +34,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 bool Verifier::WindowRecorder::run() {
     using namespace basalt::kernels;
     if (!inputs()) return false;
-    // ---------------------------------------------------------------- post(l, group): experts, combine
     fuse_head_gr = (v_.le_ == g.n_layers) && (v_.head_ != nullptr && v_.head_->loaded()) &&
                               !cvec().covers(g.n_layers - 1);
     if (!pre(v_.lb_)) return false;

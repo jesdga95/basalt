@@ -30,7 +30,6 @@
 namespace basalt::core {
 using namespace verify_detail;
 
-// src/core/verify.cpp - see include/basalt/core/verify.hpp.
 Verifier::~Verifier() {
     const Verifier* self = this;
     g_diag_verifier.compare_exchange_strong(self, nullptr);

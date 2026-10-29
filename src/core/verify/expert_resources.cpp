@@ -243,9 +243,6 @@ bool Verifier::dm_init(std::string& err) {
     return true;
 }
 
-// A host-to-device upload in pieces of at most kSmallCopy bytes: a copy that small passes the expert copies queued on
-// the card's copy engine (an adaptive round's), a larger one waits behind all of them.
-
 void Verifier::dm_free() {
     DecMoe* d = dm_;
     if (d == nullptr) return;

@@ -18,8 +18,6 @@ namespace basalt::core {
 using namespace verify_detail;
 
 namespace verify_detail {
-// The commit graph is two launches, its GDN part from 32 persistent blocks so it trickles beside the draft instead of
-// filling the card
 bool g_commit_async = false;   // see Verifier::set_commit_async
 }
 

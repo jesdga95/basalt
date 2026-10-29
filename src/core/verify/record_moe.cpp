@@ -22,6 +22,7 @@
 namespace basalt::core {
 using namespace verify_detail;
 
+// post(l, group): experts, combine
 bool Verifier::WindowRecorder::post(int64_t l) {
     using namespace basalt::kernels;
     const int n = T;

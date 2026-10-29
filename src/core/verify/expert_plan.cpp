@@ -18,6 +18,8 @@
 namespace basalt::core {
 using namespace verify_detail;
 
+// A host-to-device upload in pieces of at most kSmallCopy bytes: a copy that small passes the expert copies queued on
+// the card's copy engine (an adaptive round's), a larger one waits behind all of them.
 constexpr size_t kSmallCopy = 16384;
 static cudaError_t copy_small(void* dst, const void* src, size_t bytes, cudaStream_t s) {
     for (size_t o = 0; o < bytes; o += kSmallCopy) {

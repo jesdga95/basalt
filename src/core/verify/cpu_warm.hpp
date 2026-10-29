@@ -34,9 +34,6 @@ struct CpuWarm {
     std::atomic<uint64_t> sink{0};
 };
 
-// the MoE tail (dec_moe.hpp): planned on CUDA0 from device residency tables, the peer card served from mapped rings
-// by one persistent kernel per window, the CPU pool by the host loop (only its own entries).
-
 namespace verify_detail {
 void warm_job(void* ctx, int w, int W, const std::atomic<bool>& stop);
 bool router_codes(const WeightTable& wt, const ModelGeometry& g, std::vector<int8_t>* q8, std::vector<float>* s8,

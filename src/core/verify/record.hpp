@@ -67,8 +67,7 @@ struct Verifier::WindowRecorder {
     int64_t gdn_first = -1;
     bool lazy = false;
     kernels::GdnCommitLayers lazy_args{};
-    bool lz_open = false;
-    // ---------------------------------------------------------------- pre(l, group): up to the ring
+    bool lz_open = false;   // a lazy launch not joined yet
     bool ring_fork = false;   // the group's ring stream is joined in post
     int mid_ord = 0;   // the mid chain's launches so far in this graph
     bool glue_on = false;   // post's gate/up launch plans the group's VRAM share

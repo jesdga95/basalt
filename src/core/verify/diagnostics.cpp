@@ -50,7 +50,6 @@ std::string released_note(bool drained) {
     return drained ? "; its GPU waits were released and the GPU finished"
                    : "; its GPU waits were released but the GPU did not finish within 5 s";
 }
-// one stderr line per distinct fast-path fallback (what, a, b)
 }
 
 bool Verifier::release_gpu_waits(int timeout_ms) {
