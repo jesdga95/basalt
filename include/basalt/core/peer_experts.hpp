@@ -21,7 +21,9 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -79,6 +81,16 @@ public:
     bool give_back(const std::vector<std::pair<int32_t, int32_t>>& lent, std::string& err);
     /// Waits for `give_back`'s copies and makes the experts resident again; `lent` is cleared.
     bool give_back_wait(std::vector<std::pair<int32_t, int32_t>>& lent, std::string& err);
+    /// Between requests: every expert leaves its slot (the RAM copy keeps it) and the slots' VRAM goes back to the
+    /// driver; `wake` maps it again and copies each expert back into the slot it left.  Not with an exclusive tier (no
+    /// RAM copy to come back from).
+    bool sleep(std::string& err);
+    /// `wake` queues the copies; `wake_wait` waits for them and makes the experts resident again.  With `ready` (the
+    /// RAM copy being registered again) the copies run in source address order on a thread of their own, each once
+    /// `ready(src, bytes)` says its source is registered, while the caller refills the main card's cache.
+    bool wake(std::string& err, std::function<bool(const void*, uint64_t)> ready = nullptr);
+    bool wake_wait(std::string& err);
+    bool asleep() const { return !asleep_.empty(); }
 
     /// Starts the peer's share of one layer: the entries i with kind[i] == 2 (x: n_tok rows of n_embd floats).
     /// multi-GPU: with `out` (pinned, portable host rows) the peer writes its rows straight into
@@ -131,6 +143,9 @@ private:
     std::vector<int32_t> res_;                        ///< [n_layers * n_expert] -> peer slot or -1
     std::vector<std::pair<int32_t, int32_t>> pending_;   ///< (residency index, slot) once the copies land
     FileExpertSource* fsrc_ = nullptr;                ///< set with --peer-exclusive
+    std::vector<std::pair<int32_t, int32_t>> asleep_; ///< (residency index, slot) that `sleep` took out
+    std::thread wake_thread_;                          ///< `wake` with `ready`: its copies
+    bool wake_failed_ = false;
     std::vector<uint8_t> hold_;                       ///< [n_layers * n_expert]: not to be evicted
     /// `off` is the RAM place the victim is copied to, or `kHasPlace` when the victim already has one
     static constexpr uint64_t kHasPlace = ~0ull;
