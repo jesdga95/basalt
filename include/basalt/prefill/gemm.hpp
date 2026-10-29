@@ -6,6 +6,8 @@
 // rounded to BF16, which is also what llama.cpp's batched CUDA path does.  Tensor-core GEMM through cuBLAS.
 #pragma once
 
+#include "basalt/prefill/gemm_fp8.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -51,6 +53,24 @@ public:
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, float beta = 0.0f);
 
+    /// E4M3 rows of a matrix and their scales, as `act8` writes them for `native8`.
+    struct Rows8 {
+        const uint8_t* q = nullptr;
+        const void* scales = nullptr;
+        int64_t rows = 0, cols = 0;
+    };
+    /// Bytes `act8` writes for `rows` rows of `cols` values.
+    static size_t act8_bytes(int64_t rows, int64_t cols);
+    /// Whether the E4M3 products run here: the first call sets cuBLASLt up and takes the first scale granularity it
+    /// offers an algorithm for (per row, else per 32-value block), and says which.
+    bool fp8_ready();
+    /// X [rows, cols] (FP16 bits) as E4M3 rows with power-of-two scales in `buf` (act8_bytes, 256-byte aligned).
+    Rows8 act8(const uint16_t* X, int64_t rows, int64_t cols, void* buf);
+    /// `native` on the FP8 tensor cores: W's rows dequantized to FP16 in the scratch and rounded to E4M3 with
+    /// power-of-two scales (the E4M3 matrix also lives in the scratch), times X from `act8`; FP32 Y.  false: nothing
+    /// was written to Y (no E4M3 path here, the scratch cannot hold W as E4M3, or cuBLASLt has no algorithm).
+    bool native8(const Rows8& X, int ggml_type, const void* W_blocks, float* Y, int64_t N, int64_t ldy = 0);
+
     /// Caller-owned buffers only: the scratch and workspace moved (the prompt path laid its buffers out again).
     void rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes);
 
@@ -64,7 +84,11 @@ private:
     uint16_t* scratch_ = nullptr;
     int64_t scratch_elems_ = 0;
     void* workspace_ = nullptr;
+    size_t ws_bytes_ = 0;
     bool external_ = false;
+    fp8::Lt* lt_ = nullptr;
+    int fp8_state_ = 0;   // 0: not asked yet, 1: ready, -1: unavailable
+    fp8::Scale fp8_scale_ = fp8::Scale::Row;
     void* hipblaslt_state_ = nullptr;
 };
 

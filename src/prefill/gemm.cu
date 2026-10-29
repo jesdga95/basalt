@@ -53,6 +53,7 @@ bool Gemm::prepare_handle(std::string& err) {
 }
 
 Gemm::~Gemm() {
+    delete lt_;
     if (handle_) cublasDestroy((cublasHandle_t) handle_);
     if (!external_) {
         if (scratch_) cudaFree(scratch_);
@@ -77,6 +78,7 @@ bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems,
     external_ = true;
     note(cublasSetStream(h, (cudaStream_t) stream), "cublasSetStream");
     workspace_ = workspace;
+    ws_bytes_ = ws_bytes;
     note(cublasSetWorkspace(h, workspace_, ws_bytes), "cublasSetWorkspace");
     note(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH), "cublasSetMathMode");
     scratch_ = scratch;
@@ -88,6 +90,7 @@ void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, siz
     scratch_ = scratch;
     scratch_elems_ = scratch_elems;
     workspace_ = workspace;
+    ws_bytes_ = ws_bytes;
     cublasSetWorkspace((cublasHandle_t) handle_, workspace_, ws_bytes);
 }
 
@@ -107,6 +110,7 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
         err = std::string("prefill gemm: workspace of 32 MiB: ") + cudaGetErrorString(e);
         return false;
     }
+    ws_bytes_ = ws;
     note(cublasSetWorkspace(h, workspace_, ws), "cublasSetWorkspace");
     note(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH), "cublasSetMathMode");
     if (scratch_elems > 0) {
@@ -191,6 +195,76 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     }
     basalt::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
     f16(X, scratch_, Y, T, N, K, ldy, beta);
+}
+
+namespace {
+size_t align256(size_t v) { return (v + 255) & ~(size_t) 255; }
+}  // namespace
+
+size_t Gemm::act8_bytes(int64_t rows, int64_t cols) {
+    return align256((size_t) rows * (size_t) cols) +
+           align256(std::max(fp8::scale_bytes(fp8::Scale::Row, rows, cols), fp8::scale_bytes(fp8::Scale::Block32, rows, cols)));
+}
+
+bool Gemm::fp8_ready() {
+    if (fp8_state_ != 0) return fp8_state_ > 0;
+    fp8_state_ = -1;
+    std::string err;
+    lt_ = new fp8::Lt;
+    if (!lt_->init(err)) {
+        basalt::log::warn("basalt", "prefill gemm: FP8 products off: %s", err.c_str());
+        return false;
+    }
+    // a prompt-sized shape; the workspace stands in for the scale vectors (the heuristic does not read them)
+    for (fp8::Scale s : {fp8::Scale::Row, fp8::Scale::Block32}) {
+        if (lt_->algos(s, 4096, 2560, 2560, 2560, ws_bytes_, workspace_, workspace_) > 0) {
+            fp8_scale_ = s;
+            fp8_state_ = 1;
+            basalt::log::info("basalt", "prefill gemm: dense products in FP8 (E4M3, %s scales)", fp8::scale_name(s));
+            return true;
+        }
+    }
+    basalt::log::warn("basalt", "prefill gemm: FP8 products off: cuBLASLt offers no E4M3 algorithm with per-row or "
+                                "per-block scales");
+    return false;
+}
+
+Gemm::Rows8 Gemm::act8(const uint16_t* X, int64_t rows, int64_t cols, void* buf) {
+    Rows8 r;
+    uint8_t* q = static_cast<uint8_t*>(buf);
+    void* sc = q + align256((size_t) rows * (size_t) cols);
+    fp8::to_e4m3(X, rows, cols, cols, q, sc, 0, rows, fp8_scale_, nullptr, stream_);
+    r.q = q;
+    r.scales = sc;
+    r.rows = rows;
+    r.cols = cols;
+    return r;
+}
+
+bool Gemm::native8(const Rows8& X, int ggml_type, const void* W_blocks, float* Y, int64_t N, int64_t ldy) {
+    const int64_t T = X.rows, K = X.cols;
+    if (fp8_state_ <= 0 || T <= 0 || N <= 0 || K % 32 != 0) return false;
+    if (ldy <= 0) ldy = N;
+    // the scratch: the E4M3 matrix, its scales, then FP16 row slices on their way to E4M3
+    const size_t total = (size_t) scratch_elems_ * 2, wq = align256((size_t) N * (size_t) K),
+                 ws = align256(fp8::scale_bytes(fp8_scale_, N, K));
+    if (scratch_ == nullptr || wq + ws + (size_t) K * 2 * 16 > total) return false;
+    uint8_t* q = reinterpret_cast<uint8_t*>(scratch_);
+    void* sc = q + wq;
+    uint16_t* stage = reinterpret_cast<uint16_t*>(q + wq + ws);
+    if (lt_->algos(fp8_scale_, T, N, K, ldy, ws_bytes_, sc, X.scales) == 0) return false;
+    const int64_t rows = std::min<int64_t>(N, (int64_t) ((total - wq - ws) / ((size_t) K * 2)));
+    for (int64_t r0 = 0; r0 < N; r0 += rows) {
+        const int64_t n = std::min<int64_t>(rows, N - r0);
+        basalt::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, stage, stream_);
+        fp8::to_e4m3(stage, n, K, K, q + (size_t) r0 * (size_t) K, sc, r0, N, fp8_scale_, nullptr, stream_);
+    }
+    if (!lt_->run(fp8_scale_, q, sc, X.q, X.scales, Y, T, N, K, ldy, workspace_, ws_bytes_, stream_)) {
+        basalt::log::error("basalt", "prefill gemm: cublasLtMatmul (E4M3, %lld x %lld x %lld) failed", (long long) T,
+                           (long long) N, (long long) K);
+        std::exit(1);
+    }
+    return true;
 }
 
 }  // namespace basalt::prefill
