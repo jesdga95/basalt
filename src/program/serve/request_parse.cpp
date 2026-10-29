@@ -27,10 +27,8 @@ Flow Request::parse() {
     req_penalty_freq = 0.0f;
     req_penalty_present = 0.0f;
     req_penalty_last_n = 0;
-       // logit_bias=id:value,...: added to the verifier's logits (see ver.set_logit_bias)
     req_bias_present = false;
     req_gprompt = -1;       // gprompt=N: the first N ids are the prompt, the rest tokens the request has already generated
-       // grammar=<compact ASCII JSON, spaces as \u0020>: the request's grammar (--grammar on)
     req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
     req_relax = runtime_.o.relaxed_drafting;   // relax=P: this request's --relaxed-drafting (0 = exact)
     // ppl=K [ppl_t=T]: quality gate (basalt/program/ppl_gate.hpp) - chunk K of --ppl-base, the rest of

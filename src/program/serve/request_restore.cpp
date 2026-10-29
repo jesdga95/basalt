@@ -3,6 +3,8 @@
 
 namespace basalt::program::serve {
 
+// ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
+// exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
 bool Request::starts_with(const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) {
     const int64_t L = (int64_t) pre.size();
     if (L < 1 || L > n - 1) return false;
@@ -34,8 +36,6 @@ Flow Request::restore() {
     ids32 = std::vector<int32_t>(ids.begin(), ids.end());
     r0 = Clock::now();
     if (!runtime_.drive.d.usage.empty()) runtime_.sp.route_hist_reset();   // counts this request's prompt rows for the usage seed
-    // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
-    // exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
 
     want_cvec = basalt::kernels::cvec().loaded() ? req_cvec != 0 : true;
     // the last request's final commit may still be running on the verifier's stream (set_commit_async):
@@ -511,12 +511,6 @@ Flow Request::restore() {
     std::printf("RESUME %lld\n", (long long) resume);   // before reading: this many prompt tokens are reused
     basalt::core::progress_at("reading the prompt, from token", read_from);
     std::fflush(stdout);
-    // A SHORT PART OF THE PROMPT - the new message of a chat that continues from a checkpoint, the assistant
-    // header - goes through the verify windows, S tokens at a time, as decode reads them.  The batched path has
-    // a high fixed cost per run however few tokens it has (it streams every expert the chunk routes to that is
-    // not in VRAM over PCIe) and it borrows slots it must refill after; a window costs little per token, with
-    // the misses on the CPU.  Each part below is decided on its own, so a long first message is read batched
-    // and its header still goes through the windows.  Picture rows need the batched path.
 
     return Flow::proceed;
 }

@@ -12,6 +12,7 @@ bool Runtime::group_active(int gi) {
     return false;
 }
 
+// one turn: serve every running stage, hand finished groups on, start what can start
 bool Runtime::pump(bool may_start) {
     ++pipe_tick;
     if (bt_windows == 0 && !pipe_inflight()) {

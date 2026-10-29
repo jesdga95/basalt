@@ -70,6 +70,7 @@ bool Runtime::next_line(std::string& out) {
     return true;
 }
 
+// the same, waiting at most `ms`: 1 a line, 0 none came, -1 the input ended
 int Runtime::next_line_within(std::string& out, int ms) {
     std::unique_lock<std::mutex> lk(in_mu);
     if (!in_cv.wait_for(lk, std::chrono::milliseconds(ms), [&] { return !in_lines.empty() || in_eof; }))
@@ -115,12 +116,13 @@ int Runtime::init_protocol() {
         }
     }
 
-       // tokenized prompts waiting for their request line, by sequence
     gent_seq = 0;
     stop_req.store(false);
     stdin_lost.store(false);   // set once at EOF: the peer is gone, so no request keeps running
 
     in_eof = false;
+    // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
+    // away, or pressed Esc): the flag is checked between prompt chunks and between verify windows.
     std::thread([&] {
         // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
         // stdin's lock, which getline holds while it waits for input - an engine ending on an error (every
@@ -230,8 +232,6 @@ int Runtime::init_protocol() {
         in_cv.notify_one();
     }).detach();
 
-    // the same, waiting at most `ms`: 1 a line, 0 none came, -1 the input ended
-
     // a request also stops when the RAM guard judges the RAM critical; `ram_stop` keeps that it did, so the request
     // ends on an error instead of a cancel
     ram_stop.store(false);
@@ -249,7 +249,8 @@ int Runtime::init_protocol() {
             basalt::log::warn("basalt", "only %lld MiB of VRAM free, requests may stall; close other "
                                  "programs that use the GPU", (long long) free_mib);
         }
-    }    return 0;
+    }
+    return 0;
 }
 
 int Runtime::announce() {
@@ -336,7 +337,8 @@ int Runtime::announce() {
                     std::abort();
                 }
             }).detach();
-    }    return 0;
+    }
+    return 0;
 }
 
 }  // namespace basalt::program::serve

@@ -10,6 +10,7 @@ Request::DecSnap Request::dec_snap() {
                    runtime_.drive.d.peer_entries};
 }
 
+// the verify windows: the first holds the last prompt token, with the rest of the last window
 Flow Request::decode() {
     if (runtime_.mtp_on && !runtime_.mtp.use_main(runtime_.err)) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }   // the windows between prompt chunks swapped it
     p = fold_p0;
@@ -28,7 +29,6 @@ Flow Request::decode() {
     window = std::vector<int32_t>((size_t) runtime_.S);
     outv = std::vector<int32_t>((size_t) runtime_.S);
     dprob = std::vector<float>((size_t) std::max(runtime_.S, basalt::core::kMtpChainMax), 0.0f);
-       // this request's draft threshold
     sbuf = std::vector<int32_t>((size_t) runtime_.S, 0);
     if (runtime_.o.suffix_draft > 0) {
         runtime_.sfx->reset();
@@ -41,12 +41,10 @@ Flow Request::decode() {
     sfx_ok = 0;
     draft_offered = 0;
     draft_accepted = 0;
-    // what the session holds once this request is done: the prompt read so far, then every committed token
 
     consumed.reserve((size_t) (n + max_new + runtime_.S));
     for (int64_t i = 0; i < fold_p0; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
     finish = "length";
-       // the elastic KV could not back the next window: the request ends on this error
     // pipelined windows: `cv` runs the next window, `ov` is the other chain; a guess that held leaves the next
     // window's verdict in `held`
     cv = &runtime_.ver;

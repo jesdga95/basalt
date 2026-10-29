@@ -195,7 +195,6 @@ Flow Request::complete() {
         }
     }
     if (runtime_.drive.routing != nullptr) std::fflush(runtime_.drive.routing);   // the routing trace survives a crash and is watchable mid-session
-    // "12288 of 98179" when cancelled mid-read, the rate from what was read
 
     if (cancelled)
         std::snprintf(read_txt, sizeof(read_txt), "%lld of %lld", (long long) read_n, (long long) fresh);

@@ -22,7 +22,8 @@ namespace basalt::program {
 struct Options;
 namespace serve {
 
-// Below this reserve a first-used window or another process may make a request stall.
+// Below this much free VRAM a later allocation (a first-used window's buffers, the desktop, another program) can make
+// the driver page GPU memory, and a verify graph spinning on a host flag then never finishes.
 inline constexpr int kVramStallMib = 256;
 
 // All engine objects belong to startup and outlive run(). Callbacks borrow the same objects.
@@ -101,7 +102,10 @@ struct Context {
     std::function<void()> report_expert_tiers;
 };
 
-// Host RAM reserved beside the resident experts for serving requests and checkpoints.
+// Host RAM a server takes while it serves, beyond what it holds once ready: the conversation checkpoints (the solo
+// session's and those a batch slot keeps, each the whole running state), the parked conversations, one image's
+// host buffers at the largest canvas and a running request's own buffers.  The RAM copy of the experts leaves this
+// free beside the margin, so serving stays above the RAM guard.
 uint64_t serve_growth_bytes(const Options& o, const basalt::core::ModelGeometry& g);
 
 // Serves until QUIT or stdin closes; returns the process exit code.

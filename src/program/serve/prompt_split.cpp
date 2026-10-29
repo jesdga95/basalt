@@ -51,6 +51,11 @@ Request::SplitPlan Request::split_plan(int64_t a0, int64_t b0, const char* no_sp
     return plan;
 }
 
+// [a0, b0) across the cards in chunks of `chunk` tokens: the main card reads layers [0, cuts[0]) of each chunk
+// and hands it on, each stage reads its layers of it and hands it on while the cards before read the next; the
+// main card keeps the last chunk and reads its later layers once the stages' state is back.  Main's loan is
+// made by `lend`.
+// `ran` stays false when it stopped before reading anything (the caller reads the part on the main card)
 bool Request::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool& ran, std::string& e) {
     ran = false;
     const auto t0 = Clock::now();

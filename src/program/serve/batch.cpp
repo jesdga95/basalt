@@ -12,6 +12,8 @@ uint64_t Runtime::row_hash(int t) {
     return h;
 }
 
+// one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
+// so it keeps the conversation it holds
 bool Runtime::batch_step() {
     constexpr int MR = basalt::kernels::kVerifyMaxT;
     const int MB = std::min(MR, ver.max_t());   // the row budget is this verifier capacity; MR only sizes the arrays
@@ -393,8 +395,6 @@ bool Runtime::batch_step() {
 }
 
 int Runtime::init_batch() {
-    // ---- --batch: the slots of the batch windows
-
     bs = std::vector<BSlot>((size_t) std::max(o.batch, 0));
     // the real MTP drafts in the batch windows (a draft K/V per slot); the scripted test drive keeps its own
     batch_spec = mtp_on && mtp.main_store() > 0 && o.batch > 0;
@@ -420,7 +420,6 @@ int Runtime::init_batch() {
     ba_h_l = 0;
     ba_m_l = 0;
     ba_ms = 0;
-           // queues the adaptive copies beside the windows
     ba_job = false;
     // timing of the batch windows since the slots were last all idle (one stderr line then)
     bt_run = 0;
@@ -441,33 +440,7 @@ int Runtime::init_batch() {
 
     // a prompt read on its own thread beside the slots' windows: the tier stays as it is meanwhile
     ov_active = false;
-       // what the overlapped read's thread does right after its last chunk
     ov_post_done = false;
-
-    // the elastic KV's spare cells back to the expert cache: every session keeps what it holds (the solo session
-    // `ss_keep` cells, a decoding slot its next window too), idle ones first; `skip` and slot `skip_slot` are left
-    // alone, and it stops once `enough` (if set) is true
-
-    // ---- ENC <image> <out> [<image> <out> ...] (--vision-mmproj), between requests and between batch windows.  The
-    // images are decoded on the host first; then the encoder borrows the last expert-cache slots (the prompt path's
-    // way: their rows are marked missing for the time), uploads its weights from the pinned copy, encodes each
-    // image on its own stream, and the slots get their experts back from RAM before anything else reads the cache.
-    // One reply line per image: `ENC OK <n> <nx> <ny> <ms>`, or a single `ENC ERR <message>`.
-
-    // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
-
-    // slot b's sessions -> the main ones (the reverse of copy_to_slot): a request that continues the
-    // conversation an idle slot holds reads on from there.  Every stage, the same calls.
-    // `at`: one of the slot's checkpoints - only the K/V up to it is copied and its state restored instead
-    // a slot's conversation held in RAM (`hold_slot`) while its KV cells back the request that continues it, when the
-    // two do not fit side by side; copy_from_slot restores from it
-
-    // hashes of everything slot b's sessions hold for its first `upto` tokens, per part (GDN state, PLE history,
-    // indexer tails, dead rows, block positions, K, V, scales, pooled rows), for comparing a slot's state window by
-    // window against another run of the same request
-
-    // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
-    // so it keeps the conversation it holds
 
     // ---- --batch-groups: the slot groups pipelined through the stages (--batch-groups G > 1 with a layer split)
     n_pipe = (int) stages.size() + 1;
@@ -477,7 +450,8 @@ int Runtime::init_batch() {
     pg = std::vector<PGroup>((size_t) (piped ? o.batch_groups : 0));
     stage_group = std::vector<int>((size_t) n_pipe, -1);
     pipe_tick = 0;
-    rr = 0;    return 0;
+    rr = 0;
+    return 0;
 }
 
 }  // namespace basalt::program::serve

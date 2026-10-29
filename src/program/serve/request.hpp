@@ -27,10 +27,10 @@ private:
     float req_penalty_freq{};
     float req_penalty_present{};
     int req_penalty_last_n{};
-    std::string req_bias_text{};
+    std::string req_bias_text{};   // logit_bias=id:value,...: added to the verifier's logits (see ver.set_logit_bias)
     bool req_bias_present{};
     int64_t req_gprompt{};
-    std::string req_grammar_text{};
+    std::string req_grammar_text{};   // grammar=<compact ASCII JSON, spaces as \u0020>: the request's grammar (--grammar on)
     int req_cvec{};
     float req_relax{};
     int req_ppl{};
@@ -95,14 +95,23 @@ private:
     bool kv_ok{};
     Clock::time_point restore_t0{};
     int64_t read_from{};
+    // `copied`: the copies already ran (and were waited for) on the overlapped read's thread, so only the table is left
     bool ov_copied{};
+    // --batch: a prompt read while slots are decoding goes one prompt chunk at a time (the same chunks as one
+    // run: each run starts where the last ended, at a multiple of the chunk), and between two chunks the slots
+    // decode for a share of the time the chunk took (half), so a long prompt does not stop the others.  The
+    // slots' windows then see the cache without the slots this prompt borrowed (marked missing: those experts
+    // run on the CPU), never a prompt buffer.
     static constexpr double decode_share = 0.5;
     bool batch_fatal{};
     int64_t il_parts{};
     double il_ms{};
     int64_t yielded_at{};
     int yielded_slot{};
+    // ---- the prompt-time layer split: a long part of the prompt is read across the cards when its price there
+    // (split_price) beats the main card's alone; the chunk, its head chunk, the stage count and the cuts, or none
     struct SplitPlan { int64_t chunk = 0, head = 0; int stages = 0; std::vector<int> cuts; };
+    // per-request sampling for the verify window's head (greedy when temperature is absent)
     basalt::kernels::SamplerParams req_sp{};
     bool relax_on{};
     bool in_call{};
@@ -120,7 +129,7 @@ private:
     std::vector<int32_t> window{};
     std::vector<int32_t> outv{};
     std::vector<float> dprob{};
-    basalt::core::DraftCumAdapt cum_adapt{};
+    basalt::core::DraftCumAdapt cum_adapt{};   // this request's draft threshold
     std::vector<int32_t> sbuf{};
     bool first_window{};
     int64_t produced_n{};
@@ -129,9 +138,10 @@ private:
     int64_t sfx_ok{};
     int64_t draft_offered{};
     int64_t draft_accepted{};
+    // what the session holds once this request is done: the prompt read so far, then every committed token
     std::vector<int32_t> consumed{};
     const char* finish{};
-    std::string kv_stop{};
+    std::string kv_stop{};   // the elastic KV could not back the next window: the request ends on this error
     basalt::core::Verifier* cv{};
     basalt::core::Verifier* ov{};
     struct HeldWindow { bool on = false; int T = 0; std::vector<int32_t> win, out; };
@@ -177,6 +187,7 @@ private:
     int64_t fresh{};
     int64_t read_n{};
     bool ram_out{};
+    // "12288 of 98179" when cancelled mid-read, the rate from what was read
     char read_txt[64]{};
 
     bool starts_with(const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs);

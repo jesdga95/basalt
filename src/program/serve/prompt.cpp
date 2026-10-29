@@ -14,6 +14,11 @@ uint64_t Runtime::part_bytes(const PfPart& p, int32_t first) {
                                    (uint64_t) basalt::kernels::cpu::expert_layout().max_blob;
 }
 
+// layer split across GPUs: a prompt path per stage, each handing its chunk's rows to the next.
+// THE CHUNK STEPS DOWN INSTEAD OF EXITING.  A split's stage caches are sized after the arena is registered, and
+// the prompt path's own buffers (no loan) are not priced into them: with the whole arena pinned a
+// `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
+// chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
 int Runtime::init_prompt_paths() {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
     for (size_t i = 0; i < stages.size(); ++i) {
         GpuStage& st = *stages[i];
@@ -39,6 +44,9 @@ int Runtime::init_prompt_paths() {   // 0: ready; 1: failed (err set); 2: failed
     return 0;
 }
 
+// ---- the prompt-time split's stages on the tier cards.  A stage's place, from the end of its tier's slots: the
+// weights, the session (for the whole context here; for its prompt's cells and layers at each read), then the
+// prompt buffers.  The layout is made over live slots and writes nothing until a read lends them.
 bool Runtime::split_region(PromptStage& st, int64_t cells, int64_t chunk, int64_t l0, int64_t l1, uint8_t*& w_at, uint8_t*& s_at, uint8_t*& b_at) {
     const basalt::core::ExpertCache& pc = st.tier->cache();
     uint8_t* base = const_cast<uint8_t*>(pc.device_slot(0));
@@ -51,6 +59,13 @@ bool Runtime::split_region(PromptStage& st, int64_t cells, int64_t chunk, int64_
     return b_at >= base + pc.bytes() / 10;
 }
 
+// the batched path's slots are lent just before its first run and given back (refilled) before a window
+// reads - so the windows always see the whole expert cache - or once the prompt is read
+// Every participant gives its loan back here: the rows it lent are refilled into the SAME slots from the
+// arena, the residency table is restored, and one upload puts it on every device.  A stage refills through
+// its own cache and its own device - a slot refilled into the wrong cache would leave that stage's cache
+// holding an expert it does not own, which is silent and produces plausible tokens.
+// (split in two halves so a layer split can queue every stage's copies before it waits for any)
 bool Request::refill_issue(PfPart& p, std::string& e, bool assign) {
     const basalt::core::OnDevice on(p.dev);
     for (const auto& [i, slot] : p.lent) {   // queued, one wait
@@ -83,6 +98,8 @@ bool Request::refill_one(PfPart& p, std::string& e) {
     return refill_issue(p, e) && refill_wait(p, e);
 }
 
+// with several stages every stage's copies go out first (each card on its own link), then each is waited
+// for - the same copies into the same slots, so the same cache; one stage: refill_one exactly.
 bool Request::refill(std::string& e) {
     const auto t_rf = Clock::now();
     int64_t n_lent = 0, n_parts = 0;
@@ -102,6 +119,10 @@ bool Request::refill(std::string& e) {
     return true;
 }
 
+// lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
+// rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
+// participant's own cache, and marking only that participant's own layers
+// `chunk` > 0: that chunk (a split read's), its first one `head` tokens (0: none)
 bool Request::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t head) {
     if (runtime_.pf_parts.empty()) return true;                     // its own buffers: nothing to lend
     const auto t_ln = Clock::now();
@@ -156,7 +177,7 @@ bool Request::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t head) 
     for (PfPart& p : runtime_.pf_parts) {
         if (p.first < 0) continue;
         const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - runtime_.part_slots(p, want)));
-        std::vector<serve_loans::LentEntry> again;   // entries whose slots the prompt path still holds
+        std::vector<serve_loans::LentEntry> again;   // taken again: their slots hold no expert
         if (!p.lent.empty()) {
             if (want <= p.lent_chunk && p.sp->ring_depth() == ring_now && !ov_copied &&
                 (fixed_chunk <= 0 || want == p.sp->chunk()))
@@ -201,6 +222,13 @@ bool Request::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t head) 
     return true;
 }
 
+// `BYIELD <slot>` (the server: a shorter request is waiting): at the next chunk boundary the part read so
+// far is copied into <slot> (this admission's own, or a free one the server reserved for a solo request),
+// the request ends with `YIELDED <slot> <tokens>` + DONE cancel, and the server sends it again later: it
+// continues from the slot with the same chunks.  Cooperative preemption, with a slot as the park.
+// BYIELD: a read gives way at a chunk boundary after `q` tokens, into slot `ys`, when the rest is read the same
+// way afterwards (more than a chunk and a short read left; beside decoding slots, `beside`, more than a short
+// read: the rest is read beside them in the same chunk), text only, and the slot is not decoding
 bool Request::can_yield(int64_t q, int64_t b0, int ys, bool beside) {
     return ys >= 0 && ys < (int) runtime_.bs.size() && !runtime_.bs[(size_t) ys].active &&
            n + (runtime_.admit_slot >= 0 ? runtime_.admit_max_new : (long long) max_new) + 8 <= runtime_.slot_cap[(size_t) ys] &&
@@ -209,6 +237,8 @@ bool Request::can_yield(int64_t q, int64_t b0, int ys, bool beside) {
            b0 - q > (beside ? runtime_.o.short_read : std::max<int64_t>(std::max<int64_t>(runtime_.sp.chunk(), 1), runtime_.o.short_read));
 }
 
+// the first `q` tokens of this read go to slot `ys`, which holds them until the request is sent again
+// (`chunk`: the chunk of a read beside decoding slots, 0 for any other)
 bool Request::park_read(int64_t q, int ys, std::string& ye, int64_t chunk) {
     std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
     if (!runtime_.copy_to_slot(ys, pre, ye)) {
@@ -250,20 +280,6 @@ int Runtime::init_prompt() {
     borrow = nullptr;
     borrow_bytes = 0;
     lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
-    // ---- WHO BORROWS, AND FROM WHOSE CACHE.  One entry per prompt path: CUDA0's (layers [0, split_at[0]), which is
-    // the whole model without a split) borrowing the tail of CUDA0's cache, then one per stage borrowing the tail
-    // of ITS OWN cache.  A loan is sized by the exact `Prefill::bytes_needed` for the chunk, is laid out by
-    // `Prefill::relayout`, and is refilled before any window reads - so outside the prompt the whole cache is
-    // expert cache.  A stage may only lend the rows for ITS OWN layers: `host_res` is one table whose slot values
-    // are indices into whichever cache owns the layer, so a loan that marked rows by slot number alone would hand
-    // CUDA0 a slot belonging to another stage's cache.
-
-    // A prompt read beside decoding slots lends at most this many cache slots, so their experts stay in the
-    // cache, and its streamed ring is this deep (the loan shrinks with it); otherwise the ring is full depth.
-
-    // A read of at most this many tokens runs alone even while slots decode: they wait for it (a few seconds at
-    // most) and it lends and reads as on an idle engine.  A longer read goes beside them, within the limits above,
-    // and so does the rest of one that gave way to a shorter request (in its chunk).
 
     // a cache too small to lend the prompt path its buffers would make it allocate them on top - on a card
     // whose cache already filled its reserve, that is the over-subscription the auto sizing avoids - so the
@@ -396,11 +412,6 @@ int Runtime::init_prompt() {
     } else {
         basalt::log::info("basalt serve", "the prompt path allocates its own buffers (too few cache slots to borrow)");
     }
-    // layer split across GPUs: a prompt path per stage, each handing its chunk's rows to the next.
-    // THE CHUNK STEPS DOWN INSTEAD OF EXITING.  A split's stage caches are sized after the arena is registered, and
-    // the prompt path's own buffers (no loan) are not priced into them: with the whole arena pinned a
-    // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
-    // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
 
     {
         // First by arithmetic: a prompt path without a loan allocates its buffers, so the chunk must leave headroom
@@ -487,9 +498,6 @@ int Runtime::init_prompt() {
         }
         split_peer_rows = sp.peer_routed_rows_max();
     }
-    // ---- the prompt-time split's stages on the tier cards.  A stage's place, from the end of its tier's slots: the
-    // weights, the session (for the whole context here; for its prompt's cells and layers at each read), then the
-    // prompt buffers.  The layout is made over live slots and writes nothing until a read lends them.
 
     // its buffers' and the hand-off buffers' size; a larger chunk reads on CUDA0
     split_chunk_max = read_cap();
@@ -545,11 +553,11 @@ int Runtime::init_prompt() {
         err.clear();
         split_ready = false;
     }
-       // the routed entries the stages counted in the last split read
     split_hist_tokens = 0;
     if (split_ready && pstages.size() >= 2)
         basalt::log::info("basalt serve", "prompt split: up to %d stages over CUDA0 and %zu tier cards", split_stages,
-                          pstages.size());    return 0;
+                          pstages.size());
+    return 0;
 }
 
 }  // namespace basalt::program::serve

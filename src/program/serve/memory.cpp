@@ -47,6 +47,7 @@ void Runtime::shed_if_low() {
                       (long long) (after >> 20), ((long long) after - (long long) before) / (1ll << 20));
 }
 
+// the prompt path's loan with `live` slots: its chunk as large as fits, and the first slot it covers
 int32_t Runtime::loan_plan(int64_t live, int64_t& chunk) {
     PfPart& p = pf_parts[0];
     auto fits = [&](int64_t c) {
@@ -74,6 +75,9 @@ void Runtime::relend() {   // the prompt path's loan: the end of the slots left,
     p.first_now = -1;   // laid out again at the next loan
 }
 
+// The resident RAM mode holds only the experts no slot holds, so an expert in a slot about to go has no RAM
+// copy: it is copied from its slot into a RAM home first and read from there like the compact copy's.  Refused
+// (nothing copied) when the RAM above the floor cannot take them.  `live`: the slots that stay.
 bool Runtime::home_given_up(int64_t live, std::string& e) {
     if (!src.complement_ready()) return true;
     // the slots the loan will overwrite keep a RAM copy too, so a prompt never costs a file read
@@ -117,6 +121,9 @@ bool Runtime::home_given_up(int64_t live, std::string& e) {
     return true;
 }
 
+// `for_sleep` (SLEEP and WAKE): the cache goes to its smallest size and comes back to the same placement, with no
+// request between the two, so neither --vram-elastic (any segmented cache does) nor a peer card's tier stands in
+// the way
 bool Runtime::vram_command(const std::string& cmd, std::string& e, bool for_sleep, std::string* reply) {
     // `VRAM` alone: the reserve the engine started with (--vram-reserve-mib)
     char* end = nullptr;
@@ -294,7 +301,8 @@ int Runtime::init_memory() {
     if (const uint64_t avail = basalt::platform::available_memory(); avail > 0)
         basalt::log::info("basalt serve", "RAM %.2f GiB free, guard %.2f GiB, %.2f GiB kept for serving",
                      (double) avail / 1073741824.0, (double) guard_floor / 1073741824.0,
-                     (double) serve_growth_bytes(o, g) / 1073741824.0);    return 0;
+                     (double) serve_growth_bytes(o, g) / 1073741824.0);
+    return 0;
 }
 
 }  // namespace basalt::program::serve

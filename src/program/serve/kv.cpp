@@ -3,6 +3,8 @@
 
 namespace basalt::program::serve {
 
+// the expert cache never shrinks below the slots the prompt path's smallest loan needs (a 256-token chunk, and
+// the 128 slots a loan leaves), so the next prompt can always be read
 int64_t Runtime::cache_floor_slots() {
     if (pf_parts.empty() || pf_parts[0].first < 0) return 0;
     const int64_t k = part_slots(pf_parts[0], 256);
@@ -11,6 +13,11 @@ int64_t Runtime::cache_floor_slots() {
     return std::min<int64_t>(f, xcache.full_slots());
 }
 
+// The experts the decoding slots routed lately leave CUDA0's slots from `first` on, which a prompt's loan or the
+// KV is about to take: each trades places with a less-routed expert of its layer below `first` that has a RAM
+// copy (a slot keeps its layer's size; the experts from `first` on come back from RAM).  One blob copy per
+// trade; the table is uploaded by the caller.  `why` names the taker for the log.  `lent_out`: entries whose
+// slots a loan still out holds (the prompt path's buffers, no expert), so their experts are copied from RAM.
 bool Runtime::move_routed_below(int64_t first, const char* why, std::string& e,
                                 const std::vector<serve_loans::LentEntry>* lent_out) {
 
@@ -81,6 +88,9 @@ bool Runtime::kv_drain(std::string& e) {
     return true;
 }
 
+// maps the cache's tail again as far as the free VRAM above the reserve allows, and refills the slots it gets
+// back: each with the expert it held, or (when that one is resident again, or has no RAM copy any more) the
+// layer's most-routed expert that no GPU holds and RAM does
 bool Runtime::cache_regrow(std::string& e) {
     if (!xcache.segmented() || xcache.mapped_bytes() >= xcache.full_bytes()) return true;
     size_t free_b = 0, total_b = 0;
@@ -126,6 +136,9 @@ bool Runtime::cache_regrow(std::string& e) {
     return true;
 }
 
+// `shrink` false: only VRAM that is free now (a prompt read is running beside the windows, its loan in the
+// cache's last slots) - false with `e` empty when that is not enough
+// `min_cells`: when `cells` would take the cache below its floor, as many as leave it, down to these
 bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& e, bool shrink, int64_t min_cells) {
     kv_short = false;
     if (kv_floor <= 0) return true;
@@ -216,6 +229,9 @@ bool Runtime::kv_release(basalt::core::SessionState& s, int64_t cells, std::stri
     return true;
 }
 
+// the elastic KV's spare cells back to the expert cache: every session keeps what it holds (the solo session
+// `ss_keep` cells, a decoding slot its next window too), idle ones first; `skip` and slot `skip_slot` are left
+// alone, and it stops once `enough` (if set) is true
 bool Runtime::kv_give_back(int64_t ss_keep, const basalt::core::SessionState* skip, int skip_slot, const std::function<bool()>& enough, int64_t& given, std::string& e) {
     std::vector<basalt::core::SessionState*> sess;
     std::vector<basalt::program::KvHold> holds;

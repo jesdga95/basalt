@@ -3,6 +3,12 @@
 
 namespace basalt::program::serve {
 
+// A SHORT PART OF THE PROMPT - the new message of a chat that continues from a checkpoint, the assistant
+// header - goes through the verify windows, S tokens at a time, as decode reads them.  The batched path has
+// a high fixed cost per run however few tokens it has (it streams every expert the chunk routes to that is
+// not in VRAM over PCIe) and it borrows slots it must refill after; a window costs little per token, with
+// the misses on the CPU.  Each part below is decided on its own, so a long first message is read batched
+// and its header still goes through the windows.  Picture rows need the batched path.
 bool Request::windows_ok(int64_t a, int64_t b) {
     if ((in_slot && !solo_req) || b - a > runtime_.o.short_read) return false;   // (the verifier is bound to this request's state)
     if (runtime_.sp.embd_rows != nullptr)
@@ -11,6 +17,7 @@ bool Request::windows_ok(int64_t a, int64_t b) {
     return true;
 }
 
+// tokens [a, b) through the windows: commit all of them, then give the draft layer their residuals
 bool Request::read_windows(int64_t a, int64_t b, std::string& e) {
     basalt::core::progress_at("reading the prompt (verify windows), from token", a);   // not "batched"
     // every token is committed and the picks are discarded: no head sampling (see set_head_sampling)

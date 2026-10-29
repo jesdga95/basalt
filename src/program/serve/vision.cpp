@@ -3,6 +3,11 @@
 
 namespace basalt::program::serve {
 
+// ---- ENC <image> <out> [<image> <out> ...] (--vision-mmproj), between requests and between batch windows.  The
+// images are decoded on the host first; then the encoder borrows the last expert-cache slots (the prompt path's
+// way: their rows are marked missing for the time), uploads its weights from the pinned copy, encodes each
+// image on its own stream, and the slots get their experts back from RAM before anything else reads the cache.
+// One reply line per image: `ENC OK <n> <nx> <ny> <ms>`, or a single `ENC ERR <message>`.
 void Runtime::enc_command(const std::string& cmd) {
     auto reply_err = [&](const std::string& m, bool logged = false) {
         if (!logged) basalt::log::warn("basalt serve", "image encoder: refused: %s", m.c_str());

@@ -3,6 +3,8 @@
 
 namespace basalt::program::serve {
 
+// write the learned profile (between requests and at QUIT: a prompt's lent slots are back by then).  A swap
+// still in flight counts as done - its expert is resident once the copy lands.  `why`: for the log.
 void Runtime::save_profile(const char* why) {
     if (heat.empty()) return;
     std::vector<uint8_t> resident(host_res.size(), 0);
@@ -19,6 +21,11 @@ void Runtime::save_profile(const char* why) {
     profile_saved_at = Clock::now();
 }
 
+// PROBE adapt [every=N] [swaps=N] [decay=F] [profile=FILE], between requests (basalt-probe): the expert tiers
+// go back to their placement at READY, or with FILE to its ranking placed rank for rank into the same slots;
+// the routing counts, the round counter and the draft policy start again; the session's cached prompts are
+// dropped; the adaptive tier's settings apply to the requests that follow.  Only slots whose expert differs
+// are copied, in rounds of as many as the RAM copy has free places for.
 bool Runtime::probe_adapt(const std::string& cmd, std::string& e) {
     const auto t0 = Clock::now();
     if (drive.d.usage.empty() || !adapt_fast || host_res.empty() || remote_opt) {

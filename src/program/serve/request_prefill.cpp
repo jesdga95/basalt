@@ -4,64 +4,19 @@
 namespace basalt::program::serve {
 
 Flow Request::read_prompt() {
-
-    // tokens [a, b) through the windows: commit all of them, then give the draft layer their residuals
-
-    // the batched path's slots are lent just before its first run and given back (refilled) before a window
-    // reads - so the windows always see the whole expert cache - or once the prompt is read
-    // Every participant gives its loan back here: the rows it lent are refilled into the SAME slots from the
-    // arena, the residency table is restored, and one upload puts it on every device.  A stage refills through
-    // its own cache and its own device - a slot refilled into the wrong cache would leave that stage's cache
-    // holding an expert it does not own, which is silent and produces plausible tokens.
-    // (split in two halves so a layer split can queue every stage's copies before it waits for any)
-    // `copied`: the copies already ran (and were waited for) on the overlapped read's thread, so only the table is left
     ov_copied = false;
-
-    // with several stages every stage's copies go out first (each card on its own link), then each is waited
-    // for - the same copies into the same slots, so the same cache; one stage: refill_one exactly.
-
-    // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
-    // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
-    // participant's own cache, and marking only that participant's own layers
-    // `chunk` > 0: that chunk (a split read's), its first one `head` tokens (0: none)
-
-    // --batch: a prompt read while slots are decoding goes one prompt chunk at a time (the same chunks as one
-    // run: each run starts where the last ended, at a multiple of the chunk), and between two chunks the slots
-    // decode for a share of the time the chunk took (half), so a long prompt does not stop the others.  The
-    // slots' windows then see the cache without the slots this prompt borrowed (marked missing: those experts
-    // run on the CPU), never a prompt buffer.
 
     batch_fatal = false;
     il_parts = 0;   // the slots' windows run between this prompt's chunks
     il_ms = 0;
     yielded_at = -1;   // BYIELD: the read stopped here and its slot holds it
     yielded_slot = -1;
-    // `BYIELD <slot>` (the server: a shorter request is waiting): at the next chunk boundary the part read so
-    // far is copied into <slot> (this admission's own, or a free one the server reserved for a solo request),
-    // the request ends with `YIELDED <slot> <tokens>` + DONE cancel, and the server sends it again later: it
-    // continues from the slot with the same chunks.  Cooperative preemption, with a slot as the park.
-    // BYIELD: a read gives way at a chunk boundary after `q` tokens, into slot `ys`, when the rest is read the same
-    // way afterwards (more than a chunk and a short read left; beside decoding slots, `beside`, more than a short
-    // read: the rest is read beside them in the same chunk), text only, and the slot is not decoding
-
-    // the first `q` tokens of this read go to slot `ys`, which holds them until the request is sent again
-    // (`chunk`: the chunk of a read beside decoding slots, 0 for any other)
-
-    // ---- the prompt-time layer split: a long part of the prompt is read across the cards when its price there
-    // (split_price) beats the main card's alone; the chunk, its head chunk, the stage count and the cuts, or none
-
-    // [a0, b0) across the cards in chunks of `chunk` tokens: the main card reads layers [0, cuts[0]) of each chunk
-    // and hands it on, each stage reads its layers of it and hands it on while the cards before read the next; the
-    // main card keeps the last chunk and reads its later layers once the stages' state is back.  Main's loan is
-    // made by `lend`.
-    // `ran` stays false when it stopped before reading anything (the caller reads the part on the main card)
 
     runtime_.apply_pending(true);
     if (!runtime_.xq_drain()) {
         std::printf("ERR an adaptive refill failed\n");
         return Flow::error;
     }
-    // per-request sampling for the verify window's head (greedy when temperature is absent)
 
     req_sp.greedy = req_temperature <= 0.0f;
     req_sp.temperature = req_temperature;
@@ -244,7 +199,6 @@ Flow Request::read_prompt() {
     prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
     std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
     std::fflush(stdout);
-    // the verify windows: the first holds the last prompt token, with the rest of the last window
 
     return Flow::proceed;
 }

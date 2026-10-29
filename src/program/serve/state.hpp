@@ -111,14 +111,32 @@ using engine_local::drive_pool_split;
 using engine_local::kSatBoost;
 using engine_local::peer_hot_share_order;
 using Clock = std::chrono::steady_clock;
+
+// ---- --serve's conversation cache.  A chat or an agent sends the whole conversation again with every request, and
+// reading it again would make a long session wait for every turn.  What a sequence leaves behind splits in
+// two, and only one half needs copying:
+//   * POSITIONAL state - the KV cache of the 12 QSA layers and their pooled indexer keys, the draft layer's KV.  A
+//     cell is written once for its position and read only by later positions (the block scores take `dead` for the
+//     block being filled, never its pooled row), so rewinding to a position just means writing from there again.
+//   * RUNNING state - the 36 GDN recurrences and conv histories, each QSA layer's indexer tail (the unfinished
+//     block's raw keys) and the PLE's normalized history.  Each describes "everything so far" and cannot be
+//     rewound, so a checkpoint is a copy of exactly these: ~118 MB, the same set the verifier snapshots to roll
+//     back rejected drafts.
+// A checkpoint is only valid while the positional cells below it still hold ITS tokens, so the serve loop keeps
+// just the checkpoints that are prefixes of the tokens the session holds now.
 using ImgKey = basalt::core::ConversationImageKey;
 using ConvCheckpoint = basalt::core::ConversationCheckpoint;
 using ConvStateSizes = basalt::core::ConversationStateSizes;
 
+// A round that found at least kSatRatio times --adapt-swaps misses to swap (the pipeline is saturated) lets the next
+// round swap kSatBoost times --adapt-swaps into the main card; the free RAM places are sized for it.  Fewer misses than
+// that are not worth the extra copies.
 inline constexpr int kSatRatio = 2;
+/// Pipelined windows: the least chance (the cumulative draft rule's product up to the guess) a window's successor is
+/// launched on, and how far below the window threshold the chain runs on past its window so there are drafts for it.
 inline constexpr float kPairTheta = 0.50f;
 inline constexpr float kPairChainScale = 0.25f;
-inline constexpr double kPairFull = 0.70;
+inline constexpr double kPairFull = 0.70;   ///< the share of windows accepted whole from which the chain runs on
 
 ConvStateSizes conv_state_sizes(const basalt::core::ModelGeometry& g, const basalt::core::SessionState& ss);
 bool checkpoint_save(ConvCheckpoint& c, const basalt::core::SessionState& ss, const basalt::core::ModelGeometry& g);
@@ -145,6 +163,13 @@ private:
     void* borrow{};
     uint64_t borrow_bytes{};
     int32_t lend_first{};
+    // ---- WHO BORROWS, AND FROM WHOSE CACHE.  One entry per prompt path: CUDA0's (layers [0, split_at[0]), which is
+    // the whole model without a split) borrowing the tail of CUDA0's cache, then one per stage borrowing the tail
+    // of ITS OWN cache.  A loan is sized by the exact `Prefill::bytes_needed` for the chunk, is laid out by
+    // `Prefill::relayout`, and is refilled before any window reads - so outside the prompt the whole cache is
+    // expert cache.  A stage may only lend the rows for ITS OWN layers: `host_res` is one table whose slot values
+    // are indices into whichever cache owns the layer, so a loan that marked rows by slot number alone would hand
+    // CUDA0 a slot belonging to another stage's cache.
     struct PfPart {
         basalt::core::ExpertCache* cache = nullptr;
         const basalt::core::SessionState* ses = nullptr;
@@ -157,15 +182,24 @@ private:
         std::vector<std::pair<int32_t, int32_t>> lent;
     };
     std::vector<PfPart> pf_parts{};
+    // A prompt read beside decoding slots lends at most this many cache slots, so their experts stay in the
+    // cache, and its streamed ring is this deep (the loan shrinks with it); otherwise the ring is full depth.
     static constexpr int64_t kLendCapDecoding = 1216;
     static constexpr int kRingDecoding = 64;
+    // A read of at most this many tokens runs alone even while slots decode: they wait for it (a few seconds at
+    // most) and it lends and reads as on an idle engine.  A longer read goes beside them, within the limits above,
+    // and so does the rest of one that gave way to a shorter request (in its chunk).
     static constexpr int64_t kReadAlone = 16384;
     bool any_loan{};
     static constexpr int64_t kStepChunks[] = {6144, 4096, 3072, 2048, 1536, 1024, 512};
     int64_t split_chunk_max{};
     bool split_ready{};
-    std::vector<uint32_t> split_hist{};
+    std::vector<uint32_t> split_hist{};   // the routed entries the stages counted in the last split read
     int64_t split_hist_tokens{};
+    // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last `penalty_last_n`
+    // tokens that row's pick follows, -1 padded in front.  Allocated once at the cap for the widest window; a
+    // request without penalties gets a null buffer and takes the byte-for-byte neutral path (no upload, no buffer
+    // handed to the sampler).
     static constexpr int kPenaltyWindowCap = 4096;
     static constexpr size_t kHistSlots = (size_t) kPenaltyWindowCap* (size_t) basalt::kernels::kVerifyMaxT;
     int32_t* d_hist{};
@@ -173,31 +207,45 @@ private:
     int hist_dev{};
     basalt::core::Verifier ver{};
     basalt::core::VerifyHits vh{};
+    // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
+    // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
+    // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
     basalt::core::Verifier ver_same{};
     SplitDrive split_drive{};
     SplitDrive split_drive_b{};
-    basalt::core::Verifier ver_b{};
+    basalt::core::Verifier ver_b{};   // pipelined windows: the second chain over the same sessions (stage 0)
     void* pair_snap{};
     int n_stages{};
     bool pipe_on{};
     basalt::core::PoolMultiFn win_pool_fn{};
     void* win_pool_user{};
     std::vector<int64_t> cur{};
+    // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens it
+    // has consumed, so a request that starts with exactly them continues without any copy.  `checks` are the saved
+    // points; every one of them is a prefix of `live` (the loop drops the rest), so they form a chain - the radix
+    // cache's tree collapsed onto the one branch of history whose cells the session holds.  The chain's root is the
+    // deepest point every request so far shared (the end of the system prompt, in practice); the retention policy
+    // pins it and rotates the rest LRU (conv_cache.hpp), so a NEW chat that shares that prefix mounts through it
+    // instead of reading it again.
     std::vector<int32_t> live{};
     std::vector<ImgKey> live_imgs{};
     std::vector<ImgKey> req_imgs{};
     bool live_ok{};
     std::vector<ConvCheckpoint> checks{};
     uint64_t check_clock{};
+    // A turn-boundary checkpoint's GDN bytes reach the host after the first token (see the deferral class); this
+    // is declared after `checks` so it is destroyed, and its copy finished, before the checkpoints are.
     basalt::core::ConversationCheckpointDeferral ckd{};
     bool cvec_cached{};
     std::vector<basalt::core::SessionState> rviews{};
     basalt::core::SessionState* rsp{};
     std::optional<basalt::core::ConversationCache> conversations;
+    // the disk tier under it (--conversation-cache-dir): what leaves the session or the RAM cache is written there,
+    // and a prompt that starts with a stored conversation reads it back, after a restart too
     basalt::core::ConversationStore disk{};
-    static constexpr int64_t kDiskMinTokens = 8192;
-    static constexpr int64_t kDiskStaleTokens = 4096;
-    static constexpr uint64_t kDiskQueueCap = 4ull << 30;
+    static constexpr int64_t kDiskMinTokens = 8192;   // shorter ones are cheaper to read again
+    static constexpr int64_t kDiskStaleTokens = 4096;   // a stored copy this close to the chain's end is kept
+    static constexpr uint64_t kDiskQueueCap = 4ull << 30;   // images waiting for the writer, in RAM
     uint64_t disk_floor{};
     int64_t pp_total{};
     int64_t pp_from{};
@@ -205,22 +253,38 @@ private:
     int64_t pp_part_ckpt{};
     int64_t pp_reached{};
     Clock::time_point pp_t0{};
+    // A layer split's mid-prompt checkpoints: when the last stage reports a chunk, the earlier ones already read
+    // the next, so each stage saves its own part when IT reaches a checkpoint position (the same rule as below:
+    // every `prompt_cache_every` tokens from where the request resumed), and the last stage puts them together.
     std::mutex part_mu{};
-    std::map<int64_t, std::vector<ConvCheckpoint>> part_at{};
+    std::map<int64_t, std::vector<ConvCheckpoint>> part_at{};   // position -> one part per stage
     std::vector<int64_t> part_next{};
+    // why the last checkpoint_at failed - a failed device sync is the GPU itself, not the checkpoint, and the error
+    // says so
     std::string ckpt_why{};
     bool all_experts_resident{};
+    // --expert-profile-save: what the adaptive tier learned, kept across restarts (opt-in; off: `heat` stays empty
+    // and nothing below runs).  It needs the adaptive tier's counts and the residency table.
     std::vector<double> heat{};
     Clock::time_point profile_saved_at{};
     cudaStream_t adapt_stream{};
+    // swaps in flight - (residency index, slot) admitted when adapt_ev has completed
     std::vector<std::pair<int32_t, int32_t>> pending{};
-    std::vector<std::array<int32_t, 3>> promoted{};
+    std::vector<std::array<int32_t, 3>> promoted{};   // (layer, in, out) of swaps from the peer
     cudaEvent_t adapt_ev{};
     bool peer_landing{};
     std::vector<uint8_t> xlanding{};
-    std::vector<std::pair<int32_t, int32_t>> pending_spare{};
+    std::vector<std::pair<int32_t, int32_t>> pending_spare{};   // the RAM places the incoming experts free once resident
+    // the VRAM tier follows the conversation (the same rule as the speculative loop below)
+    // the peer's experts are candidates too, so the ones a workload routes most move to
+    // CUDA0 (from their RAM copy, as any other swap) and its coldest go to the CPU
+    // routings a peer expert needs above CUDA0's victim before it moves
     static constexpr float promote_margin = 10.0f;
+    // the round's swaps, best first: the most-routed missing experts against the least-routed resident ones, per
+    // layer, or over all layers (`across`: the incoming expert takes a slot of the outgoing one's layer `lout`)
     struct Swap { float gain; int32_t layer, in, out, lout; };
+    // a layer whose peer experts take more than this share of its 10 routed entries per token promotes them without
+    // the margin (a layer's peer share, not the step's, sets how late the peer is)
     static constexpr float promote_load = 0.0f;
     std::vector<int32_t> prof_rank{};
     bool adapt_fast{};
@@ -231,6 +295,9 @@ private:
     std::vector<XSwap> xq{};
     int xq_stage{};
     bool xq_saturated{};
+    // The landed words (Verifier::landed_words): a round's incoming copies are queued in layer order, each layer's
+    // followed by a 4-byte copy of the round's number into the layer's word.  The copies' sources are a pinned
+    // ring of rounds (every layer's word, then the round's number).
     static constexpr int kXqPinRounds = 4;
     uint32_t xq_no{};
     bool xq_words{};
@@ -238,10 +305,11 @@ private:
     cudaEvent_t p2p_ev{};
     bool xq_unsettled{};
     std::vector<std::pair<int32_t, int32_t>> xq_released{};
+    // GENT: the request text arrives as bytes and the reader thread turns it into ids, from the pack's tokenizer tables
     basalt::program::Tokenizer text_tokenizer{};
     std::string text_tokenizer_note{};
     std::mutex gent_mu{};
-    std::map<uint64_t, std::vector<int32_t>> gent_ids{};
+    std::map<uint64_t, std::vector<int32_t>> gent_ids{};   // tokenized prompts waiting for their request line, by sequence
     uint64_t gent_seq{};
     std::atomic<bool> stop_req{};
     std::atomic<bool> stdin_lost{};
@@ -263,17 +331,18 @@ private:
     int64_t rounds{};
     std::optional<basalt::spec::SuffixDrafter> sfx;
     std::optional<basalt::spec::DraftPolicy> policy;
-    static constexpr int64_t kImagePad = 248056;
+    static constexpr int64_t kImagePad = 248056;   // qwen4exp.ple.image_token_id: the PLE hash reads it for image cells
     bool mrope_identity{};
     std::vector<float> img_rows{};
     std::vector<const float*> row_ptr{};
-    std::vector<std::pair<int32_t, int32_t>> vram_evicted{};
+    std::vector<std::pair<int32_t, int32_t>> vram_evicted{};   // (residency index, slot) the shrinks took
     int64_t chunk_full{};
     int64_t kKvGrowCells{};
-    static constexpr int64_t kKvWindowCells = 2* basalt::kernels::kVerifyMaxT + 64;
+    static constexpr int64_t kKvWindowCells = 2* basalt::kernels::kVerifyMaxT + 64;   // a decoding session's next window
     int64_t kv_moves{};
     bool kv_short{};
-    bool kv_keep_routed{};
+    bool kv_keep_routed{};   // an admission while slots decode: a shrink keeps their routed experts
+    // ---- --batch: the slots of the batch windows
     struct BSlot {
         bool active = false, stop = false;
         int32_t x = 0;                 ///< the token the next window feeds (not yet in the slot's state)
@@ -341,7 +410,7 @@ private:
     int64_t ba_h_l{};
     int64_t ba_m_l{};
     double ba_ms{};
-    JobRunner ba_thr{};
+    JobRunner ba_thr{};   // queues the adaptive copies beside the windows
     bool ba_job{};
     double bt_run{};
     double bt_commit{};
@@ -359,8 +428,10 @@ private:
     int solo_slot{};
     long long admit_max_new{};
     bool ov_active{};
-    std::function<bool ()> ov_post{};
+    std::function<bool ()> ov_post{};   // what the overlapped read's thread does right after its last chunk
     bool ov_post_done{};
+    // a slot's conversation held in RAM (`hold_slot`) while its KV cells back the request that continues it, when the
+    // two do not fit side by side; copy_from_slot restores from it
     struct SlotHeld {
         int b = -1;
         std::vector<basalt::core::ConversationCheckpoint> ck;

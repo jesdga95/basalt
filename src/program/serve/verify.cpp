@@ -27,11 +27,7 @@ int Runtime::init_verify() {
     vh.blob = thits.blob;
     vh.slot_off = xcache.slot_offsets();   // the device plan's pointers
     vh.n_slots = xcache.slots();
-    // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
-    // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
-    // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
 
-       // pipelined windows: the second chain over the same sessions (stage 0)
     pair_snap = nullptr;
 
     n_stages = split_devs.empty() ? 1 : (int) split_at.size() + 1;
@@ -159,7 +155,8 @@ int Runtime::init_verify() {
     }
     // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
     win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
-    win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;    return 0;
+    win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;
+    return 0;
 }
 
 int Runtime::capture_windows() {
@@ -210,7 +207,6 @@ int Runtime::capture_windows() {
     // or more basalt-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
     // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
     // h = p + y, w = p + x, and the text after the image continues at p + max(nx, ny).
-       // qwen4exp.ple.image_token_id: the PLE hash reads it for image cells
     mrope_identity = true;
 
     // ---- VRAM <reserve_mib>, between requests, only with --vram-elastic.  It shrinks the expert cache until that
@@ -222,17 +218,7 @@ int Runtime::capture_windows() {
     // (a smaller chunk when it no longer fits).  A grow maps them again and puts each slot's expert back (or, when
     // the adaptive tier already brought that one back, the most-routed missing expert of the same layer); the
     // adaptive tier carries on from there.
-       // (residency index, slot) the shrinks took
     chunk_full = o.prefill_chunk;              // the loan's chunk with the whole cache
-    // the prompt path's loan with `live` slots: its chunk as large as fits, and the first slot it covers
-
-    // The resident RAM mode holds only the experts no slot holds, so an expert in a slot about to go has no RAM
-    // copy: it is copied from its slot into a RAM home first and read from there like the compact copy's.  Refused
-    // (nothing copied) when the RAM above the floor cannot take them.  `live`: the slots that stay.
-
-    // `for_sleep` (SLEEP and WAKE): the cache goes to its smallest size and comes back to the same placement, with no
-    // request between the two, so neither --vram-elastic (any segmented cache does) nor a peer card's tier stands in
-    // the way
 
     // ---- the elastic KV (kKvElasticFloor): a session's K/V pools back their cells on demand, out of the expert
     // cache's tail.  `kv_fit` backs `cells` of a session before anything writes them: the work in flight lands,
@@ -241,13 +227,11 @@ int Runtime::capture_windows() {
     // tail again, each returned slot refilled from RAM.  Both run between windows, never inside one.
     // a request's room past its prompt, and each later step (batch slots: a smaller step, as their base)
     kKvGrowCells = o.batch > 0 ? 4096 : 16384;
-       // a decoding session's next window
     kv_moves = 0;
-    // the expert cache never shrinks below the slots the prompt path's smallest loan needs (a 256-token chunk, and
-    // the 128 slots a loan leaves), so the next prompt can always be read
 
     kv_short = false;   // the last kv_fit refused: the cells would take the cache below its floor
-    kv_keep_routed = false;    return 0;
+    kv_keep_routed = false;
+    return 0;
 }
 
 }  // namespace basalt::program::serve

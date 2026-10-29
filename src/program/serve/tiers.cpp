@@ -67,6 +67,7 @@ bool resident_spare_swaps(basalt::core::FileExpertSource& src, const std::vector
     return true;
 }
 
+// a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
 void Runtime::res_upload() {
     if (d_res != nullptr)
         res_put(d_res);
@@ -76,6 +77,8 @@ void Runtime::res_upload() {
     }
 }
 
+// the peer tiers take the next most-routed CPU misses: each passes over what the primary (r0) or another tier
+// holds or takes in this round; with one tier r0 is its whole view
 bool Runtime::adapt_peers(const std::vector<int32_t>& r0, std::string& perr) {
     const int swaps_each = o.peer_adapt_swaps >= 0 ? o.peer_adapt_swaps : o.adapt_swaps;
     if (xpeers.empty()) return peer.adapt(drive.d.usage.data(), r0.data(), swaps_each, perr);
@@ -384,6 +387,7 @@ bool Runtime::xq_round() {
     return true;
 }
 
+// `wait`: step (3) waits for the copies even with the landed words (the batch windows, a drain)
 bool Runtime::xq_advance(bool wait) {
     if (xq_stage == 0) return true;
     const auto& lay = basalt::kernels::cpu::expert_layout();
@@ -508,8 +512,6 @@ int Runtime::init_tiers() {
         std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
     if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
         drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
-    // --expert-profile-save: what the adaptive tier learned, kept across restarts (opt-in; off: `heat` stays empty
-    // and nothing below runs).  It needs the adaptive tier's counts and the residency table.
 
     if (!o.expert_profile_save.empty() && !all_experts_resident) {
         if (drive.d.usage.empty() || host_res.empty())
@@ -524,31 +526,13 @@ int Runtime::init_tiers() {
         basalt::log::error("basalt serve", "cannot create the refill stream");
         return 1;
     }
-    // swaps in flight - (residency index, slot) admitted when adapt_ev has completed
 
-       // (layer, in, out) of swaps from the peer
     adapt_ev = nullptr;
     cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
-    // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
 
     // the peer's swaps land a window after their copies are queued, so no window waits for a copy
     peer_landing = false;
     xlanding = std::vector<uint8_t>(xpeers.size(), 0);
-    // the peer tiers take the next most-routed CPU misses: each passes over what the primary (r0) or another tier
-    // holds or takes in this round; with one tier r0 is its whole view
-
-       // the RAM places the incoming experts free once resident
-
-    // the VRAM tier follows the conversation (the same rule as the speculative loop below)
-    // the peer's experts are candidates too, so the ones a workload routes most move to
-    // CUDA0 (from their RAM copy, as any other swap) and its coldest go to the CPU
-    // routings a peer expert needs above CUDA0's victim before it moves
-
-    // the round's swaps, best first: the most-routed missing experts against the least-routed resident ones, per
-    // layer, or over all layers (`across`: the incoming expert takes a slot of the outgoing one's layer `lout`)
-
-    // a layer whose peer experts take more than this share of its 10 routed entries per token promotes them without
-    // the margin (a layer's peer share, not the step's, sets how late the peer is)
 
     // the profile's rank of each pair: of equally routed experts the better-ranked one comes in and the worse-ranked
     // one leaves first
@@ -581,9 +565,6 @@ int Runtime::init_tiers() {
 
     xq_stage = 0;   // 0 idle, 1 evictions copying to RAM, 2 incoming experts copying to their slots
     xq_saturated = false;   // the last round had at least kSatRatio times --adapt-swaps misses to swap
-    // The landed words (Verifier::landed_words): a round's incoming copies are queued in layer order, each layer's
-    // followed by a 4-byte copy of the round's number into the layer's word.  The copies' sources are a pinned
-    // ring of rounds (every layer's word, then the round's number).
 
     xq_no = 0;
     xq_words = false;   // the round in flight writes the landed words
@@ -598,7 +579,8 @@ int Runtime::init_tiers() {
     cudaEventCreateWithFlags(&p2p_ev, cudaEventDisableTiming);
     // a round made resident before its copies were done: the bookkeeping that waits for them (the next round or
     // a drain), and the RAM pages of its experts
-    xq_unsettled = false;    return 0;
+    xq_unsettled = false;
+    return 0;
 }
 
 }  // namespace basalt::program::serve

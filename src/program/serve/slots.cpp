@@ -3,6 +3,8 @@
 
 namespace basalt::program::serve {
 
+// a view of the solo session carrying slot b's state: what the request path and the solo verifier work on for a
+// request that runs in that slot
 void Runtime::make_view(basalt::core::SessionState& v, int b) {
     const basalt::core::SessionState& t = *bslot_ss[0][(size_t) b];
     v = ss;
@@ -19,6 +21,7 @@ void Runtime::make_view(basalt::core::SessionState& v, int b) {
 
 bool Runtime::batch_on() { for (const BSlot& b : bs) if (b.active) return true; return false; }
 
+// the session a request just left behind (its prompt) -> slot b's sessions, on every stage
 bool Runtime::copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& e) {
     const int64_t upto = (int64_t) ids.size();
     for (size_t k = 0; k < bslot_ss.size(); ++k) {
@@ -76,6 +79,9 @@ bool Runtime::hold_slot(int b, const ConvCheckpoint* at, std::string& e) {
     return true;
 }
 
+// slot b's sessions -> the main ones (the reverse of copy_to_slot): a request that continues the
+// conversation an idle slot holds reads on from there.  Every stage, the same calls.
+// `at`: one of the slot's checkpoints - only the K/V up to it is copied and its state restored instead
 bool Runtime::copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) {
     const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
     if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
@@ -113,6 +119,9 @@ bool Runtime::copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) {
     return true;
 }
 
+// hashes of everything slot b's sessions hold for its first `upto` tokens, per part (GDN state, PLE history,
+// indexer tails, dead rows, block positions, K, V, scales, pooled rows), for comparing a slot's state window by
+// window against another run of the same request
 bool Runtime::slot_digest(int b, int64_t upto, uint64_t* part) {
     for (int i = 0; i < 10; ++i) part[i] = 1469598103934665603ull;
     auto mix = [&](int i, const uint8_t* p, size_t n) {

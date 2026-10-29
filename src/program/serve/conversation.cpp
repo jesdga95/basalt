@@ -65,6 +65,7 @@ uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeomet
     return h;
 }
 
+// finishes the in-flight host copy; a failed one drops its checkpoint
 void Runtime::ckd_finish() {
     const void* dst = ckd.pending();
     if (dst == nullptr) return;
@@ -75,6 +76,9 @@ void Runtime::ckd_finish() {
                                 [&](const ConvCheckpoint& k) { return k.gdn.data() == dst; }), checks.end());
 }
 
+// Whether the disk tier needs no new copy of a conversation: it is short, or a stored prefix of it reaches
+// within kDiskStaleTokens of the chain's deepest checkpoint (the point its next turn goes on from; a restore
+// from that copy reads the rest again).  Each turn of a growing conversation is not written again in full.
 bool Runtime::disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const std::vector<ConvCheckpoint>& cks, bool cvec) {
     if ((int64_t) ids.size() < kDiskMinTokens) return true;
     int64_t deepest = 0;
@@ -84,11 +88,17 @@ bool Runtime::disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey
     return m.tokens > 0 && m.tokens + kDiskStaleTokens >= deepest;
 }
 
+// A capture of a conversation's state, or a read of one from disk, takes `need` bytes of RAM: only while the RAM
+// guard reads its level as ok, and with `floor` left free after it (the disk tier's floor sits above the guard's).
 bool Runtime::capture_admit(uint64_t need, uint64_t floor) {
     return basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok &&
            basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), need, floor);
 }
 
+// Save only on a switch/rewind, not on each continuing request. No graph
+// addresses change: all parked images live in ordinary host vectors.
+// `kept`: the tokens of the outgoing conversation the session goes on holding (the request continues from its
+// own chain), 0 when another conversation takes the session
 bool Runtime::park_current(size_t held, int64_t kept) {
     ckd_finish();
     if ((!conversations->enabled() && !disk.enabled()) || !live_ok || live.empty()) return true;
@@ -239,6 +249,8 @@ bool Runtime::gpu_sync_ok() {
     return false;
 }
 
+// a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed.  `parts`: the stages'
+// states saved at L (a split's mid-prompt checkpoint); without, they are read now (everything is at L)
 bool Runtime::checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts, bool defer) {
     ckpt_why.clear();
     ckd_finish();
@@ -284,6 +296,11 @@ bool Runtime::checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts, bool 
     return true;
 }
 
+// The conversations the engine holds go to the disk tier when no stored copy reaches within kDiskStaleTokens of
+// them: the RAM tier's (at exit), the solo session's and every idle slot's, each with its draft layer's K/V.  Between
+// requests (no slot decoding) this bounds what a crash or a kill loses; a slot's draft K/V is copied into the main
+// store for the capture, which every request refills from its own store first, so between requests that runs only
+// when the solo session holds no conversation of its own there.  At most `limit` images; returns those queued.
 size_t Runtime::spill_to_disk(bool at_exit, size_t limit) {
     ckd_finish();   // a turn checkpoint's state may still be on its way to the host
     size_t written = 0;
@@ -348,20 +365,9 @@ size_t Runtime::spill_to_disk(bool at_exit, size_t limit) {
 }
 
 int Runtime::init_conversations() {
-
-    // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens it
-    // has consumed, so a request that starts with exactly them continues without any copy.  `checks` are the saved
-    // points; every one of them is a prefix of `live` (the loop drops the rest), so they form a chain - the radix
-    // cache's tree collapsed onto the one branch of history whose cells the session holds.  The chain's root is the
-    // deepest point every request so far shared (the end of the system prompt, in practice); the retention policy
-    // pins it and rotates the rest LRU (conv_cache.hpp), so a NEW chat that shares that prefix mounts through it
-    // instead of reading it again.
-
     live_ok = false;
 
     check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
-    // A turn-boundary checkpoint's GDN bytes reach the host after the first token (see the deferral class); this
-    // is declared after `checks` so it is destroyed, and its copy finished, before the checkpoints are.
 
     {
         ConvCheckpoint warm;   // one set of pooled blocks, page-faulted now instead of on the first request
@@ -377,7 +383,6 @@ int Runtime::init_conversations() {
                 basalt::log::warn("basalt serve", "deferred checkpoint copy off: %s", ce.c_str());
         }
     }
-    // finishes the in-flight host copy; a failed one drops its checkpoint
 
     cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
     // the session the request path reads, parks and restores: the solo one, or (a --batch request for a slot other
@@ -388,19 +393,8 @@ int Runtime::init_conversations() {
     conversations.emplace(
         o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
         (size_t) o.conversation_cache_slots);
-    // the disk tier under it (--conversation-cache-dir): what leaves the session or the RAM cache is written there,
-    // and a prompt that starts with a stored conversation reads it back, after a restart too
 
-                  // shorter ones are cheaper to read again
-                // a stored copy this close to the chain's end is kept
-            // images waiting for the writer, in RAM
     disk_floor = 0;                              // the RAM a capture or a read leaves free (set below)
-    // Whether the disk tier needs no new copy of a conversation: it is short, or a stored prefix of it reaches
-    // within kDiskStaleTokens of the chain's deepest checkpoint (the point its next turn goes on from; a restore
-    // from that copy reads the rest again).  Each turn of a growing conversation is not written again in full.
-
-    // A capture of a conversation's state, or a read of one from disk, takes `need` bytes of RAM: only while the RAM
-    // guard reads its level as ok, and with `floor` left free after it (the disk tier's floor sits above the guard's).
 
     if (o.conversation_cache_disk_mib > 0) {
         std::string de;
@@ -420,10 +414,6 @@ int Runtime::init_conversations() {
                               std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
         }
     }
-    // Save only on a switch/rewind, not on each continuing request. No graph
-    // addresses change: all parked images live in ordinary host vectors.
-    // `kept`: the tokens of the outgoing conversation the session goes on holding (the request continues from its
-    // own chain), 0 when another conversation takes the session
 
     pp_total = 0;
     pp_from = 0;
@@ -436,17 +426,7 @@ int Runtime::init_conversations() {
     pp_reached = 0;
     pp_t0 = Clock::now();
 
-    // a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed
-    // A layer split's mid-prompt checkpoints: when the last stage reports a chunk, the earlier ones already read
-    // the next, so each stage saves its own part when IT reaches a checkpoint position (the same rule as below:
-    // every `prompt_cache_every` tokens from where the request resumed), and the last stage puts them together.
-
-       // position -> one part per stage
     part_next = std::vector<int64_t>(stages.size() + 1, INT64_MAX);
-    // a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed.  `parts`: the stages'
-    // states saved at L (a split's mid-prompt checkpoint); without, they are read now (everything is at L)
-    // why the last checkpoint_at failed - a failed device sync is the GPU itself, not the checkpoint, and the error
-    // says so
 
     // live progress inside a chunk: PL <estimated position> <prompt tokens> <ms> <tokens/s>, at most twice a second
     sp.on_layer = [&, last_ms = 0.0](int64_t layers_done, int64_t n_layers, int64_t T, int64_t p0) mutable {
@@ -520,7 +500,8 @@ int Runtime::init_conversations() {
         }
     }
     drive.d.plan = ver.plan_sink();
-    drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));    return 0;
+    drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
+    return 0;
 }
 
 }  // namespace basalt::program::serve
