@@ -7,6 +7,12 @@
 // on the same ids on both sides.
 
 #include "engine_local.hpp"
+#include "cli/startup.hpp"
+#include "cli/options.hpp"
+#include "cli/tokens.hpp"
+#include "cli/gpu.hpp"
+#include "cli/report.hpp"
+#include "cli/control_vectors.hpp"
 #include "measure/dump_set.hpp"
 #include "measure/gpu_modes.hpp"
 #include "serve/loans.hpp"
@@ -265,9 +271,9 @@ bool resident_spare_swaps(basalt::core::FileExpertSource& src, const std::vector
     return true;
 }
 
-constexpr float kRelaxedDraftingDefault = 0.5f;   // --relaxed-drafting without a value
 
 using basalt::program::Options;
+namespace cli = basalt::program::cli;
 namespace engine_local = basalt::program::engine_local;
 namespace serve_loans = basalt::program::serve;
 using engine_local::Drive;
@@ -298,263 +304,6 @@ bool for_each_index_name(const basalt::core::FileRange& index, const std::functi
     return true;
 }
 
-/// `basalt serve --config FILE` or `basalt serve MODEL.basalt [--python PY] [server args...]`: runs the Python server
-/// over this binary.  The server gets `--engine-bin` and what was typed; a MODEL.basalt argument stands for `--model MODEL.basalt`.
-/// Only returns on failure.
-int serve_subcommand(int argc, char** argv) {
-    std::string python;
-    std::vector<std::string> extra;
-    bool have_model = false;
-    // the working directory changes below: the paths the server reads must not depend on it
-    auto absolute = [](const std::string& path) {
-        std::string real;
-        if (!basalt::platform::absolute_path(path, real)) {
-            basalt::log::error("basalt serve", "cannot open %s", path.c_str());
-            std::exit(1);
-        }
-        return real;
-    };
-    for (int i = 2; i < argc; ++i) {
-        const std::string a = argv[i];
-        auto value = [&]() -> std::string {
-            if (i + 1 >= argc) { basalt::log::error("basalt serve", "%s needs a value", a.c_str()); std::exit(2); }
-            return argv[++i];
-        };
-        if (a == "--python") python = value();
-        else if (a == "--model") { extra.insert(extra.end(), {a, absolute(value())}); have_model = true; }
-        else if (a == "--config") extra.insert(extra.end(), {a, absolute(value())});
-        // only the first argument can be MODEL.basalt; a later bare word is the value of the option before it
-        else if (i == 2 && !have_model && !a.empty() && a[0] != '-') { extra.insert(extra.end(), {"--model", absolute(a)}); have_model = true; }
-        else extra.push_back(a);
-    }
-    if (extra.empty()) {
-        basalt::log::error("basalt", "usage: basalt serve --config FILE | MODEL.basalt [--python PY] [server args...]");
-        return 2;
-    }
-    const std::string exe = basalt::platform::module_path();
-    if (exe.empty()) { basalt::log::error("basalt serve", "cannot find this binary"); return 1; }
-    const std::string src_dir = BASALT_SOURCE_DIR;
-    if (python.empty()) python = basalt::platform::python_interpreter(src_dir);
-    if (basalt::platform::set_working_dir(src_dir) != 0) {
-        basalt::log::error("basalt serve", "cannot enter the source tree %s", src_dir.c_str());
-        return 1;
-    }
-    std::vector<std::string> args = {python, "-m", "serve.server", "--engine-bin", exe};
-    args.insert(args.end(), extra.begin(), extra.end());
-    // Does not return when it works. Windows has no exec, so this process waits for the server and ends with the
-    // server's exit code. Reaching the line below means the server never started, and errno says why.
-    basalt::platform::exec_replacing(args);
-    basalt::log::error("basalt serve", "cannot run %s: %s", python.c_str(), std::strerror(errno));
-    return 1;
-}
-
-void usage() {
-    basalt::log::raw("basalt serve --config FILE [--python PY] [server args...]\n"
-                 "basalt serve MODEL.basalt [--python PY] [server args...]\n"
-                 "    runs the Python server (serve/) over this binary: the server reads its options and the engine flags\n"
-                 "    from the config file and the command line (the model is the config's or MODEL.basalt, which stands\n"
-                 "    for --model); --python defaults to .venv/bin/python in the source tree, else python3; the other\n"
-                 "    arguments go to the server.  It runs in the source tree; --model and --config paths are made absolute.\n"
-                 "basalt generate --model FILE.basalt --tokens \"1,2,3\" [options]\n"
-                 "\n"
-                 "  --model FILE         the .basalt model file (required): the dense weights, experts, source tensors\n"
-                 "                       (embedding, PLE table, native projections, head), draft layer, expert profile\n"
-                 "                       and 8-bit hyper-connection copies all come from it\n"
-                 "  --dump-hc8 FILE      load as usual, write the 8-bit hyper-connection copies to FILE (the layout in\n"
-                 "                       basalt/core/model_file.hpp; the converter stores it as the `hc8` section), exit\n"
-                 "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
-                 "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
-                 "  --ple-io direct|ram  n-gram table reads. direct (default): unbuffered SSD\n"
-                 "                       reads, the table never enters RAM or the file cache; ram: mmap with the whole table locked in RAM at start\n"
-                 "  --ple-row-cache N    bounded cache of fetched rows, 90 B each (default 1048576; 0 = off)\n"
-                 "  --ple-inflight N     outstanding SSD reads (default 256)\n"
-                 "  --ple-delay-us U     fault injection: each row read completes no earlier than U us\n"
-                 "  --kv fp16|int8       KV storage: int8 codes + fp16 scale per 64 values, half the\n"
-                 "                       VRAM; default fp16\n"
-                 "  --kv q4_0            4-bit K/V after a Hadamard rotation: half of int8's memory,\n"
-                 "                       slightly lower precision\n"
-                 "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"
-                 "                       (vs int8's 1,056); not with --kv-resident\n"
-                 "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
-                 "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
-                 "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
-                 "  --serve              stay resident and take requests on stdin (the server's mode)\n"
-                 "  --exp NAME=VALUE[,...]  diagnostics; concur9_logit_hash=1 prints a hash of each accepted row's\n"
-                 "                       logits on stderr\n"
-                 "  --gpu A,B,..|auto    the GPUs to use, as nvidia-smi numbers them (within CUDA_VISIBLE_DEVICES when\n"
-                 "                       set): exactly these, the first the main card; the engine gives the rest their\n"
-                 "                       roles.  auto = every Blackwell card, the fastest as main.  Default: GPU 0 alone\n"
-                 "  --gpu-plan           print the --gpu choice as one JSON line and exit (no model needed)\n"
-                 "  --mtp-window N       the drafter attends to the last N cells (default 32768; 0 = every cell)\n"
-                 "  --stop-eos           stop when the model emits an end-of-turn token\n"
-                 "  --eos-ids LIST       the end-of-turn token ids for --stop-eos (default 248044,248046); implies it\n"
-                 "  --prompt-cache-root N  --serve: checkpoint a prompt's first turn boundary when it is at least N tokens\n"
-                 "                       long (default 2048, 0 = never)\n"
-                 "  --max-new N          tokens to generate (default 16)\n"
-                 "  --max-context N      KV/state capacity (default 4096)\n"
-                 "  --rope-scaling T     extend the context past the trained one: none, linear\n"
-                 "                       (position interpolation) or yarn - llama.cpp's types and names.\n"
-                 "                       Default: the model file's rope keys, else none. Fixed at startup:\n"
-                 "                       K in the cache is post-RoPE, so one run one scaling\n"
-                 "  --rope-scale F       the extension factor for linear/yarn (default: the model file's\n"
-                 "                       factor, else 1 = off)\n"
-                 "  --rope-freq-base N   the raw ggml knobs: the frequency base (0 = the model's 1e7) and\n"
-                 "  --rope-freq-scale F  the angle shrink (0 = 1/--rope-scale)\n"
-                 "  --yarn-orig-ctx N    the trained context the correction targets (0 = 262144)\n"
-                 "  --yarn-ext-factor F --yarn-attn-factor F --yarn-beta-fast F --yarn-beta-slow F\n"
-                 "                       YaRN's knobs; defaults: -1 (auto: 1 for yarn), 1, 32, 1\n"
-                 "  --greedy             argmax (the default)\n"
-                 "  --seed S             enable sampling with this Philox seed\n"
-                 "  --top-k N --top-p F --temperature F\n"
-                 "  --dump-residual PATH write the final R (hc x n_embd, f32) for head bisection\n"
-
-                 "  --dump-routing PATH  write the routed expert ids and weights per layer per position\n"
-                 "  --no-capture         run the layers directly instead of replaying graphs\n"
-                 "  --vision             --serve takes images too (GENI requests; embeddings from basalt-vision)\n"
-                 "  --vision-mmproj PATH --vision, with the image encoder in this process: ENC requests borrow\n"
-                 "                       expert-cache slots for the encoder and give them back refilled\n"
-                 "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
-                 "                       of RAM each; 0 = read every prompt from the start)\n"
-                 "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
-                 "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
-                 "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking (default 2560)\n"
-                 "  --conversation-cache-disk-mib N  --serve: park conversations on disk, at most N MiB, and read them back\n"
-                 "                       when a prompt starts with one, also after a restart (default 0 = off)\n"
-                 "  --conversation-cache-dir DIR  --serve: the disk tier's folder (required with a budget unless the\n"
-                 "                       server starts the engine, which uses the model cache folder)\n"
-                 "  --vram-elastic       --serve (opt-in): the expert cache in segments (--vram-segment-mib,\n"
-                 "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
-                 "                       give VRAM back to other programs between requests and take it back later\n"
-                 "  --batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8),\n"
-                 "                       each slot with its own session (VRAM like the main one)\n"
-                 "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
-                 "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
-                 "  --tail-role-token ID --serve: a turn of this role right before the last turn is left out of\n"
-                 "                       the conversation checkpoint (a trailing effort turn; default -1 = off)\n"
-                 "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
-                 "                       of the batched prompt path (default 64, 0 = off)\n"
-                 "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
-                 "                       when it pays (default 3; 0 = MTP only)\n"
-                 "  --spec N             speculative decoding: verify windows of at most N tokens (the last accepted\n"
-                 "                       token plus up to N-1 MTP drafts, sized per window by the drafts' joint chance\n"
-                 "                       of acceptance against a threshold adapted per request); 0 or 1 = no\n"
-                 "                       speculation (default 8 when the pack has a drafter, else 0)\n"
-                 "  --relaxed-drafting [P]  sampled requests keep a draft the target gives probability >= P even when\n"
-                 "                       the target's own draw differs: faster, but NOT the exact sampling distribution\n"
-                 "                       (docs/precision/features.md).  P in (0, 1]; lower is faster and further from exact;\n"
-                 "                       the flag alone = 0.5.  Tool calls, control tokens, logit_bias and greedy\n"
-                 "                       requests stay exact.  Default off (exact)\n"
-                 "  --grammar on|off     --serve: enforce a request's \"grammar\" (tool-call, JSON-schema or JSON-object\n"
-                 "                       grammar) on the sampled tokens; the vocabulary comes from the pack.  Default off\n"
-                 "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
-                 "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
-                 "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
-                 "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
-                 "  --cvec-mode add|project  h += s v (default) or h -= s (h.v) v with v unit\n"
-                 "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
-                 "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (default auto); auto = the fewest\n"
-                 "                       equal chunks of at most 16384 tokens (32768 for packs whose expert blobs\n"
-                 "                       exceed 1.5 MiB, such as NVFP4), within\n"
-                 "                       what the expert cache can lend (with --resident-experts the lent slots the\n"
-                 "                       RAM copy backs, else 8192); auto:N (8192, 16384, 32768) sets the ceiling\n"
-                 "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"
-                 "  --dump-mixed PATH    write the post-attention residual (n_embd, f32)\n"
-                 "  --stage-timing       per-stage KERNEL-COUNT shares.  NOT a time profile: an uncaptured\n"
-                 "                       event interval includes host gaps, so run with --gpu-only-full first\n"
-                 "  --graph-only         MEASURE: replay the 48 `pre` graphs only.  OMITS the 48 `post` graphs\n"
-                 "                       and the LM head, so it is NOT the GPU floor\n"
-                 "  --gpu-only-full      MEASURE: replay pre+post for all 48 layers plus the LM head, no pool.\n"
-                 "                       THE TRUE PER-TOKEN GPU FLOOR.  Quote this one, not --graph-only.\n"
-                 "  --stats              print the per-stage breakdown\n"
-                 "  --profile            GPU stage times of the decode windows (serve path)\n"
-                 "  --wait-stats         the host's wait times in the decode loop (serve path)\n"
-                 "  --decode-timing      one line per request: where its decode time went (serve path)\n"
-                 "  --draft-log FILE     one line per decode window for draft-policy study\n"
-                 "  --ppl-base FILE      llama.cpp KL-divergence base for ppl= requests\n"
-                 "  --ppl-out FILE       where ppl= requests write their per-row lines\n"
-                 "  --gpu-stages         capture the layer as three graphs (mixer / ffn+router / post)\n"
-                 "                       and time them from OUTSIDE the capture.  The per-stage table on the\n"
-                 "                       real graph that --stage-timing cannot give.  Prints and exits.\n"
-                 "  --expert-profile-save P  --serve: save what the adaptive tier learned (the experts in\n"
-                 "                       VRAM, then the routing counted since the start) as a profile at P, on\n"
-                 "                       QUIT and every --expert-profile-save-every MIN minutes (default 10;\n"
-                 "                       0 = on QUIT only) between requests; a start with P already there\n"
-                 "                       places that profile instead of the model's; tools/convert/convert.py\n"
-                 "                       --profile reads it too\n"
-                 "  --expert-cache N|auto  keep N expert blobs resident in VRAM and compute their rows on the\n"
-                 "                       GPU.  Default auto on packs with an expert profile.  auto = as many as fit in the VRAM\n"
-                 "                       left after the weights, the session and --vram-reserve-mib\n"
-                 "  --vram-reserve-mib N  VRAM left free on the primary GPU for graphs, scratch and the head when\n"
-                 "                       --expert-cache auto sizes the tier (default 700; at least 256)\n"
-                 "  --peer-exclusive     with --resident-experts: experts on the peer are held only there, not\n"
-                 "                       also in RAM (less RAM).  The peer is filled from the file; swaps move\n"
-                 "                       peer-held experts between the GPUs and RAM through host memory.  Auto when not set\n"
-                 "                       (on only when it keeps every expert off the SSD).\n"
-                 "  --peer-reserve-mib N  VRAM the peer tier leaves free on its card (default 600)\n"
-                 "  --adapt-every N      adaptive expert tier: a round every N decode windows (default 1 for a\n"
-                 "                       server, with or without the peer tier; 4 with the layers split over GPUs\n"
-                 "                       and outside --serve; 0 = the VRAM experts stay as loaded)\n"
-                 "  --adapt-decay F      factor the routing counts are multiplied by after each round (default\n"
-                 "                       0.85 on a server with or without the peer tier, 0.7 with the layers\n"
-                 "                       split over GPUs and outside --serve); lower forgets sooner\n"
-                 "  --prefill-cpu-share F  share of the streamed prompt experts the CPU computes, 0 to 1 (default\n"
-                 "                       0.6; 0 = the GPU streams them all).  Fixed, so the output is the same\n"
-                 "                       from run to run; a weaker CPU may prefer a lower value\n"
-                 "  --adapt-swaps N      most experts a round swaps into the main GPU (default 96; 0 = off). On a\n"
-                 "                       server without a layer split, a round after one that found twice as many\n"
-                 "                       misses swaps four times as many, and the RAM copy keeps 4 N free places\n"
-                 "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
-                 "  --peer-prefill-rows N  prompt rows per layer the peer computes (default half of chunk x top-k;\n"
-                 "                       0 = the prompt path stays on the primary)\n"
-                 "  --pool-workers N     CPU expert pool worker count.  Auto when not set: every physical core\n"
-                 "                       except the one the host loop spins on (on a hybrid CPU, with --pool-affinity\n"
-                 "                       auto: P-cores minus 1 plus half the E-cores; p-cores: P-cores minus 1),\n"
-                 "                       lowered so the workers and the host thread fit a cgroup CPU quota\n"
-                 "                       (container CPU limit).\n"
-                 "  --pool-affinity MODE Which cores size the worker pool (workers are not pinned): all (one\n"
-                 "                       worker per physical core), auto (hybrid CPUs: the P-cores minus the\n"
-                 "                       host's, plus half the E-cores) or p-cores (the P-cores minus the host's).\n"
-                 "                       Auto when not set.\n"
-                 "  --mmap-experts       opt OUT of the default resident RAM copy, back to a file mapping.\n"
-                 "                       The A/B arm: the mmap's rate depends on the OS page cache holding\n"
-                 "                       the experts, so cold and warm runs differ.\n"
-                 "  --shared-expert-arena FILE  back the resident arena with one MAP_SHARED file.\n"
-                 "                       Put this file on /dev/shm, not ordinary SSD storage.\n"
-                 "                       A small header binds an existing backing file to the same model.\n"
-                 "  --resident-cpu-experts  with mmap and a static profile, keep the experts the GPU cache does not\n"
-                 "                       hold resident in ordinary RAM (and the prompt path's lend region as far as\n"
-                 "                       RAM allows); adaptive swaps exchange them, so none is read from the file again.\n"
-                 "  --resident-experts   (the default on packs with an expert profile) the low-RAM resident mode: --mmap-experts --resident-cpu-experts\n"
-                 "                       with the copy page-locked when possible, the RAM floor left free (see the\n"
-                 "                       README's Memory floors), plain mmap if it does not fit.  Same answers as --mmap-experts for the same placement.\n"
-                 "                       When some experts stay in the file, the copy leaves a RAM floor free for\n"
-                 "                       the OS file cache (the RAM margin + the larger of 3.5 GiB + two layers'\n"
-                 "                       experts and 4 GiB).\n"
-                 "  --resident-budget-gib N  the resident mode with at most N GiB of experts in RAM (hottest first;\n"
-                 "                       auto when not set: what fits);\n"
-                 "                       a budget that would leave less than the RAM floor free is refused, naming\n"
-                 "                       the largest safe value.\n");
-}
-
-bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) {
-    out.clear();
-    std::string text(s);
-    for (char& c : text) if (c == ',') c = ' ';
-    std::istringstream input(text);
-    std::string token;
-    while (input >> token) {
-        int32_t id = 0;
-        const auto parsed = std::from_chars(token.data(), token.data() + token.size(), id);
-        if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size() || id < 0) {
-            err = "invalid token id: expected an integer in [0, 2147483647]";
-            out.clear();
-            return false;
-        }
-        out.push_back(id);
-    }
-    if (out.empty()) { err = "token list was empty"; return false; }
-    return true;
-}
 
 
 void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd, int64_t k,
@@ -802,80 +551,6 @@ uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeomet
     return h;
 }
 
-// --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
-// summed; layer 0 has none) and `llama_adapter_cvec::apply` with the projection-mode patch (project: the unit
-// direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports.
-bool load_control_vectors(const Options& o, const basalt::core::ModelGeometry& g, std::string& summary, std::string& err) {
-    const int64_t L = g.n_layers, N = g.n_embd;
-    std::vector<float> data((size_t) (L * N), 0.0f);
-    std::vector<bool> have((size_t) L, false);
-    for (const auto& [path, scale] : o.cvec_files) {
-        try {
-            basalt::GgufFile f(path);
-            const basalt::MetaValue* arch = f.get("general.architecture");
-            if (arch == nullptr || arch->s != "controlvector") {
-                err = path + ": not a control vector GGUF (general.architecture is not 'controlvector')";
-                return false;
-            }
-            const basalt::MetaValue* hint = f.get("controlvector.model_hint");
-            if (hint != nullptr && hint->s != "qwen4exp")
-                basalt::log::warn("basalt generate", "%s was made for '%s', not qwen4exp", path.c_str(), hint->s.c_str());
-            int found = 0;
-            for (const basalt::TensorInfo& t : f.tensors()) {
-                if (t.name.rfind("direction.", 0) != 0) continue;
-                const long l = std::strtol(t.name.c_str() + 10, nullptr, 10);
-                if (l < 1 || l >= L) continue;   // layer 0 has no vector; past the model is ignored, as in llama.cpp
-                if (t.type != 0 || t.elements() != (uint64_t) N) {
-                    err = path + ": " + t.name + " must be " + std::to_string((long long) N) + " f32";
-                    return false;
-                }
-                const float* src = reinterpret_cast<const float*>(f.tensor_data(t));
-                for (int64_t j = 0; j < N; ++j) data[(size_t) (l * N + j)] += scale * src[j];
-                have[(size_t) l] = true;
-                ++found;
-            }
-            if (found == 0) { err = path + ": no direction.<layer> tensors"; return false; }
-        } catch (const std::exception& e) {
-            err = e.what();
-            return false;
-        }
-    }
-    const int first = o.cvec_first <= 0 ? 1 : o.cvec_first;
-    const int last = (o.cvec_last <= 0 || o.cvec_last >= L) ? (int) L - 1 : o.cvec_last;
-    const int single = o.cvec_mode == 0 ? o.cvec_single : -1;
-    if (single >= 0 && (single >= L || !have[(size_t) single])) {
-        err = "--cvec-dir single:" + std::to_string(single) + ": the vector has no direction for that layer";
-        return false;
-    }
-    std::vector<float> dir((size_t) (L * N), 0.0f), s((size_t) L, 0.0f);
-    int steered = 0;
-    for (int64_t l = first; l <= last; ++l) {
-        const int64_t src = single >= 0 ? single : l;
-        if (!have[(size_t) src]) continue;
-        const float* d = data.data() + (size_t) (src * N);
-        if (o.cvec_mode == 0) {
-            double nrm = 0.0;
-            for (int64_t j = 0; j < N; ++j) nrm += (double) d[j] * d[j];
-            nrm = std::sqrt(nrm);
-            if (nrm <= 0.0) continue;
-            s[(size_t) l] = (float) nrm;
-            for (int64_t j = 0; j < N; ++j) dir[(size_t) (l * N + j)] = (float) (d[j] / nrm);
-        } else {
-            s[(size_t) l] = 1.0f;
-            std::copy(d, d + N, dir.begin() + (size_t) (l * N));
-        }
-        ++steered;
-    }
-    if (steered == 0) { err = "the control vector has no direction in layers " + std::to_string(first) + ".." + std::to_string(last); return false; }
-    if (!basalt::kernels::cvec_upload(dir, s, o.cvec_mode, first, last, N, g.hc, err)) return false;
-    summary = std::string(o.cvec_mode == 0 ? "project" : "add") + ":" + std::to_string(first) + "-" + std::to_string(last) +
-              (single >= 0 ? ":single" + std::to_string(single) : "");
-    // the line llama.cpp's patched build prints, so a log shows the same thing
-    basalt::log::info("basalt generate", "control vector mode = %s, dir = %s, layers %d..%d (%d steered)",
-                 o.cvec_mode == 0 ? "project" : "add", single >= 0 ? "single" : "per-layer", first, last, steered);
-    return true;
-}
-
 // The effective host->device bandwidth of the PCIe link: copies from pinned host memory, as the expert arena's
 // reads are.  The native default share (0.55) suits a x16 link; a x8 card in a x8 slot carries about half of that.
 // Returns < 0 when the probe cannot run (then the caller keeps the default).
@@ -988,331 +663,14 @@ double pcie_frac_for_gbps(double gbps, double base) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
-    // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
-    // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
-    std::setvbuf(stdout, nullptr, _IONBF, 0);
-    if (argc >= 2 && std::strcmp(argv[1], "serve") == 0) return serve_subcommand(argc, argv);
-    // if memory runs out the kernel ends this process first, not the rest of the machine
-    basalt::platform::prefer_oom_victim();
-    // the CPU expert pool keeps its speed while the window is in the background
-    if (!basalt::platform::keep_full_speed())
-        basalt::log::warn("basalt", "full-speed scheduling refused: decode slows while the window is in the background");
-    // Kernels load on first use: loading every kernel of the engine and of cuBLAS at context creation holds a few
-    // hundred MiB of device memory for code that never runs.  The expert cache's sizing keeps back room for what loads
-    // later (`kLazyKernelsMib`).  CUDA_MODULE_LOADING=EAGER restores the up-front load; batched serving sets it (below).
-    const bool module_loading_set = std::getenv("CUDA_MODULE_LOADING") != nullptr;
-    if (!module_loading_set) basalt::platform::set_env("CUDA_MODULE_LOADING", "LAZY");
     Options o;
     std::string ppl_base, ppl_out;
-    bool have_tokens = false;
-    for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
-        auto next = [&](const char* what) -> const char* {
-            if (i + 1 >= argc) { basalt::log::error("basalt", "%s needs a value", what); std::exit(2); }
-            return argv[++i];
-        };
-        bool parsed = true;
-        if (a == "--help" || a == "-h") { usage(); return 0; }
-        else if (a == "--model") o.model = next("--model");
-        else if (a == "--dump-hc8") o.dump_hc8 = next("--dump-hc8");
-        else if (a == "--tokens") {
-            if (have_tokens) { basalt::log::error("basalt", "supply one token input only"); return 2; }
-            std::string e;
-            if (!parse_i64_list(next("--tokens"), o.tokens, e)) { basalt::log::error("basalt", "%s", e.c_str()); return 2; }
-            have_tokens = true;
-        }
-        else if (a == "--tokens-file") {
-            if (have_tokens) { basalt::log::error("basalt", "supply one token input only"); return 2; }
-            std::ifstream input(next("--tokens-file"));
-            if (!input) { basalt::log::error("basalt", "cannot open token file"); return 2; }
-            std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-            if (input.bad()) { basalt::log::error("basalt", "cannot read token file"); return 2; }
-            std::string error;
-            if (text.find('\0') != std::string::npos || !parse_i64_list(text.c_str(), o.tokens, error)) {
-                basalt::log::error("basalt", "malformed token file: %s", error.c_str()); return 2;
-            }
-            have_tokens = true;
-        }
-        else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
-        else if (a == "--max-context") o.max_context = std::atoll(next("--max-context"));
-        else if (a == "--rope-scaling") o.rope_scaling = next("--rope-scaling");
-        else if (a == "--rope-scale") o.rope_scale = std::atof(next("--rope-scale"));
-        else if (a == "--rope-freq-base") o.rope_freq_base = std::atof(next("--rope-freq-base"));
-        else if (a == "--rope-freq-scale") o.rope_freq_scale = std::atof(next("--rope-freq-scale"));
-        else if (a == "--yarn-orig-ctx") o.yarn_orig_ctx = std::atof(next("--yarn-orig-ctx"));
-        else if (a == "--yarn-ext-factor") o.yarn_ext_factor = std::atof(next("--yarn-ext-factor"));
-        else if (a == "--yarn-attn-factor") o.yarn_attn_factor = std::atof(next("--yarn-attn-factor"));
-        else if (a == "--yarn-beta-fast") o.yarn_beta_fast = std::atof(next("--yarn-beta-fast"));
-        else if (a == "--yarn-beta-slow") o.yarn_beta_slow = std::atof(next("--yarn-beta-slow"));
-        else if (a == "--greedy") o.greedy = true;
-        else if (a == "--seed") { o.seed = (uint64_t) std::atoll(next("--seed")); o.greedy = false; }
-        else if (a == "--top-k") o.top_k = std::atoi(next("--top-k"));
-        else if (a == "--top-p") o.top_p = (float) std::atof(next("--top-p"));
-        else if (a == "--temperature") o.temperature = (float) std::atof(next("--temperature"));
-        else if (a == "--dump-residual") o.dump_residual = next("--dump-residual");
-        else if (a == "--dump-mixed") o.dump_mixed = next("--dump-mixed");
-        else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
-        else if (a == "--ple-io") o.ple_io = next("--ple-io");
-        else if (a == "--ple-row-cache") o.ple_row_cache = std::atoll(next("--ple-row-cache"));
-        else if (a == "--ple-inflight") o.ple_inflight = std::atoi(next("--ple-inflight"));
-        else if (a == "--ple-delay-us") o.ple_delay_us = std::atof(next("--ple-delay-us"));
-        else if (a == "--kv") o.kv = next("--kv");
-        else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
-        else if (a == "--no-capture") o.no_capture = true;
-        else if (a == "--no-pool") o.no_pool = true;
-        else if (a == "--stage-timing") o.stage_timing = true;
-        else if (a == "--graph-only") o.graph_only = true;
-        else if (a == "--gpu-only-full") o.gpu_only_full = true;
-        else if (a == "--pool-workers") { o.pool_workers = std::atoi(next("--pool-workers")); o.pool_workers_given = true; }
-        else if (a == "--pool-affinity") {
-            const std::string v = next("--pool-affinity");
-            o.pool_affinity_given = true;
-            if (v == "auto") o.pool_affinity = basalt::kernels::cpu::PoolAffinity::Auto;
-            else if (v == "p-cores" || v == "pcores") o.pool_affinity = basalt::kernels::cpu::PoolAffinity::PCores;
-            else if (v == "all") o.pool_affinity = basalt::kernels::cpu::PoolAffinity::All;
-            else {
-                basalt::log::error("basalt generate", "unknown --pool-affinity value '%s' (expected auto, p-cores, or all)", v.c_str());
-                return 2;
-            }
-        }
-        else parsed = false;
-        // The chain continues here in a second statement: the compiler limits how deeply `else if` blocks may nest.
-        if (!parsed) {
-        if (a == "--expert-cache") {
-            const std::string v = next("--expert-cache");
-            o.expert_cache = (v == "auto") ? -1 : std::atoi(v.c_str());
-        }
-        else if (a == "--gpu") o.gpu = next("--gpu");
-        else if (a == "--gpu-plan") o.gpu_plan = true;
-        else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
-        else if (a == "--prefill") {
-            const std::string v = next("--prefill");
-            o.prefill_given = true;
-            o.prefill_auto = v == "auto" || v.rfind("auto:", 0) == 0;
-            // auto:N (N = 16384 or 32768) lets auto take chunks above 8192
-            const long long want_max = v.rfind("auto:", 0) == 0 ? std::atoll(v.c_str() + 5) : 8192;
-            o.prefill_auto_fit = v == "auto";
-            o.prefill_auto_max = o.prefill_auto_fit || want_max >= 32768 ? 32768 : want_max >= 16384 ? 16384 : 8192;
-            o.prefill_chunk = o.prefill_auto ? o.prefill_auto_max : std::atoll(v.c_str());
-        }
-        else if (a == "--vram-elastic") o.vram_elastic = true;
-        else if (a == "--vram-segment-mib") o.vram_segment_mib = std::atoll(next("--vram-segment-mib"));
-        else if (a == "--prefill-until") o.prefill_until = std::atoll(next("--prefill-until"));
-        else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
-        else if (a == "--spec") { o.spec = std::atoi(next("--spec")); o.spec_given = true; }
-        else if (a == "--batch") o.batch = std::atoi(next("--batch"));
-        else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
-        else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
-        else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
-        else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
-        else if (a == "--adapt-every") { o.adapt_every = std::atoi(next("--adapt-every")); o.adapt_every_given = true; }
-        else if (a == "--adapt-decay") { o.adapt_decay = (float) std::atof(next("--adapt-decay")); o.adapt_decay_set = true; }
-        else if (a == "--prefill-cpu-share") o.prefill_cpu_share = std::atof(next("--prefill-cpu-share"));
-        else if (a == "--relaxed-drafting") {   // the value is optional: a number in (0, 1] when one follows
-            o.relaxed_drafting = kRelaxedDraftingDefault;
-            if (i + 1 < argc) {
-                char* e = nullptr;
-                const float v = std::strtof(argv[i + 1], &e);
-                if (e != argv[i + 1] && *e == '\0') {
-                    ++i;
-                    if (!(v > 0.0f && v <= 1.0f)) { basalt::log::error("basalt", "--relaxed-drafting: P must be in (0, 1]"); return 2; }
-                    o.relaxed_drafting = v;
-                }
-            }
-        }
-        else if (a == "--grammar") {
-            const std::string v = next("--grammar");
-            if (v != "on" && v != "off") { basalt::log::error("basalt", "--grammar: on or off"); return 2; }
-            o.grammar = v == "on";
-        }
-        else if (a == "--stop-eos") o.stop_eos = true;
-        else if (a == "--serve") o.serve = true;
-        else if (a == "--vision") o.vision = true;
-        else if (a == "--vision-mmproj") { o.vision_mmproj = next("--vision-mmproj"); o.vision = true; }
-        else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
-        else if (a == "--conversation-cache-dir") o.conversation_cache_dir = next("--conversation-cache-dir");
-        else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
-                 a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-disk-mib") {
-            const std::string value = next(a.c_str());
-            int64_t number = 0;
-            const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
-            const int64_t limit = a == "--conversation-cache-slots" ? INT32_MAX : INT64_MAX / (1024 * 1024);
-            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
-                basalt::log::error("basalt", "%s needs a nonnegative integer within range", a.c_str());
-                return 2;
-            }
-            if (a == "--conversation-cache-mib") o.conversation_cache_mib = number;
-            else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
-            else if (a == "--conversation-cache-disk-mib") o.conversation_cache_disk_mib = number;
-            else o.conversation_cache_slots = (int) number;
-        }
-        else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
-        else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
-        else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
-        else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
-        else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
-        else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
-        else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
-        else if (a == "--control-vector") o.cvec_files.push_back({next("--control-vector"), 1.0f});
-        else if (a == "--control-vector-scaled") {
-            // FILE:SCALE, comma-separated; the LAST colon splits
-            std::stringstream list(next("--control-vector-scaled"));
-            std::string item;
-            while (std::getline(list, item, ',')) {
-                const size_t colon = item.rfind(':');
-                char* end = nullptr;
-                const float sc = colon == std::string::npos ? 0.0f : std::strtof(item.c_str() + colon + 1, &end);
-                if (colon == std::string::npos || colon == 0 || end == item.c_str() + colon + 1 || *end != '\0') {
-                    basalt::log::error("basalt", "--control-vector-scaled: expected FILE:SCALE, got '%s'", item.c_str());
-                    return 2;
-                }
-                o.cvec_files.push_back({item.substr(0, colon), sc});
-            }
-        }
-        else if (a == "--control-vector-layer-range") {
-            o.cvec_first = std::atoi(next("--control-vector-layer-range"));
-            o.cvec_last = std::atoi(next("--control-vector-layer-range"));
-        }
-        else if (a == "--cvec-mode") {
-            const std::string m = next("--cvec-mode");
-            if (m == "project") o.cvec_mode = 0;
-            else if (m == "add") o.cvec_mode = 1;
-            else { basalt::log::error("basalt", "--cvec-mode: add or project, got '%s'", m.c_str()); return 2; }
-        }
-        else if (a == "--cvec-dir") {
-            const std::string d = next("--cvec-dir");
-            if (d == "per-layer") o.cvec_single = -1;
-            else if (d.rfind("single:", 0) == 0) o.cvec_single = std::atoi(d.c_str() + 7);
-            else { basalt::log::error("basalt", "--cvec-dir: per-layer or single:L, got '%s'", d.c_str()); return 2; }
-        }
-        else if (a == "--eos-ids") {
-            std::string e;
-            if (!parse_i64_list(next("--eos-ids"), o.eos_ids, e)) { basalt::log::error("basalt", "--eos-ids: %s", e.c_str()); return 2; }
-            o.stop_eos = true;
-        }
-        else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(next("--adapt-swaps"));
-        else if (a == "--peer-exclusive") { o.peer_exclusive = true; o.peer_exclusive_given = true; }
-        else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib"));
-        else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
-        else if (a == "--peer-prefill-rows") o.peer_prefill_rows = std::atoll(next("--peer-prefill-rows"));
-        else if (a == "--expert-profile-save") o.expert_profile_save = next("--expert-profile-save");
-        else if (a == "--expert-profile-save-every")
-            o.expert_profile_save_min = std::atof(next("--expert-profile-save-every"));
-        else if (a == "--gpu-stages") o.gpu_stages = true;
-        else if (a == "--mmap-experts") o.mmap_experts = true;
-        else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
-        else if (a == "--resident-cpu-experts") o.resident_cpu_experts = o.resident_cpu_explicit = true;
-        else if (a == "--resident-experts") {
-            o.mmap_experts = o.resident_cpu_experts = o.resident_pin = o.resident_soft = true;
-            o.resident_headroom = 0;
-        }
-        else if (a == "--resident-budget-gib") {
-            const double gib = std::atof(next("--resident-budget-gib"));
-            if (!(gib > 0.0)) { basalt::log::error("basalt generate", "--resident-budget-gib needs N > 0"); return 2; }
-            o.resident_budget = (uint64_t) (gib * 1073741824.0);
-            o.resident_budget_given = true;
-            o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
-            o.resident_headroom = 0;
-        }
-        else if (a == "--stats") o.stats = true;
-        else if (a == "--profile") basalt::core::diagnostics().profile = true;
-        else if (a == "--wait-stats") basalt::core::diagnostics().wait_stats = true;
-        else if (a == "--decode-timing") basalt::core::diagnostics().decode_timing = true;
-        else if (a == "--draft-log") basalt::core::diagnostics().draft_log = next("--draft-log");
-        else if (a == "--exp") {
-            const std::string list = next("--exp");   // NAME=VALUE[,NAME=VALUE...]
-            for (size_t at = 0; at < list.size();) {
-                size_t end = list.find(',', at);
-                if (end == std::string::npos) end = list.size();
-                const std::string kv = list.substr(at, end - at);
-                at = end + 1;
-                const size_t eq = kv.find('=');
-                if (eq == std::string::npos || eq == 0) { basalt::log::error("basalt generate", "--exp needs NAME=VALUE"); return 2; }
-                basalt::core::diagnostics().exp[kv.substr(0, eq)] = std::atof(kv.c_str() + eq + 1);
-            }
-        }
-        else if (a == "--ppl-base") ppl_base = next("--ppl-base");
-        else if (a == "--ppl-out") ppl_out = next("--ppl-out");
-        else {
-            // An unknown flag is an ERROR and not a warning: a typo'd `--max-neww` that silently generated 16
-            // tokens would look like a working run.
-            basalt::log::error("basalt", "unknown argument: %s", a.c_str());
-            usage();
-            return 2;
-        }
-        }
-    }
-    // Batched serving reads a prompt on its own thread while verify windows run.  A lazy kernel load on that thread
-    // synchronizes the context and can wait on a window kernel that waits on the load, so batched serving loads every
-    // kernel up front.  An explicit CUDA_MODULE_LOADING wins.
-    if (o.serve && o.batch >= 2 && !module_loading_set) basalt::platform::set_env("CUDA_MODULE_LOADING", "EAGER");
+    if (const auto code = cli::start(argc, argv, o, ppl_base, ppl_out)) return *code;
     // ---- the GPUs: chosen before any CUDA call, which then sees only them, the main card as device 0
     std::vector<basalt::program::GpuCard> chosen_cards;
-    {
-        namespace bp = basalt::program;
-        bp::GpuSpec spec;
-        std::string gerr;
-        if (!bp::parse_gpu_spec(o.gpu, spec, gerr)) {
-            if (o.gpu_plan) {
-                bp::GpuChoice bad;
-                bad.error = gerr;
-                std::printf("%s\n", bp::gpu_plan_json({}, bad).c_str());
-            } else {
-                basalt::log::error("basalt", "%s", gerr.c_str());
-            }
-            return 2;
-        }
-        bool known = false;
-        const std::vector<bp::GpuCard> visible = bp::visible_gpus(known);
-        const bp::GpuChoice choice = bp::choose_gpus(spec, visible, known);
-        if (o.gpu_plan) {
-            std::printf("%s\n", bp::gpu_plan_json(visible, choice).c_str());
-            return choice.error.empty() ? 0 : 2;
-        }
-        if (!choice.error.empty()) { basalt::log::error("basalt", "%s", choice.error.c_str()); return 2; }
-        for (const std::string& s : choice.notes) basalt::log::info("basalt", "%s", s.c_str());
-        if (!choice.warning.empty()) basalt::log::warn("basalt", "%s", choice.warning.c_str());
-        bp::apply_gpus(visible, choice.cards);
-        int seen = 0;
-        if (cudaGetDeviceCount(&seen) != cudaSuccess || seen < (int) choice.cards.size()) {
-            basalt::log::error("basalt", "gpu %s: CUDA sees %d of the %zu GPUs chosen", o.gpu.empty() ? "0" : o.gpu.c_str(),
-                               seen, choice.cards.size());
-            return 2;
-        }
-        bp::RoleInputs ri;
-        for (int i : choice.cards) ri.cards.push_back((size_t) i < visible.size() ? visible[(size_t) i] : bp::GpuCard{});
-        ri.peer_access = basalt::platform::gpu_peer_access();
-        ri.max_expert_tiers = basalt::kernels::kDmMaxX + 1;   // the device-planned tail's peer windows
-        const std::vector<bp::GpuRole> roles = bp::choose_roles(ri);
-        std::string line;
-        for (size_t d = 0; d < roles.size(); ++d) {
-            const bp::GpuCard& c = ri.cards[d];
-            line += std::string(d ? ", " : "") + (c.name.empty() ? "GPU" : c.name) +
-                    (c.smi >= 0 ? " (nvidia-smi " + std::to_string(c.smi) + ")" : "") + " " + bp::gpu_role_name(roles[d]);
-            if (roles[d] == bp::GpuRole::ExpertTier) {
-                o.peer_devices.push_back((int) d);
-                o.peer_gbps.push_back(c.mem_gbps);
-            }
-        }
-        basalt::log::info("basalt", "gpus: %s", line.c_str());
-        if (std::count(roles.begin(), roles.end(), bp::GpuRole::Idle) > 0)
-            basalt::log::warn("basalt", "%s", ri.peer_access
-                ? ("expert tiers max " + std::to_string(ri.max_expert_tiers) + "; later cards idle").c_str()
-                : "no GPU-to-GPU access; cards after the main idle");
-        if (!o.peer_devices.empty()) o.peer_device = o.peer_devices[0];
-        chosen_cards = ri.cards;
-    }
+    if (const auto code = cli::select_gpus(o, chosen_cards, basalt::kernels::kDmMaxX + 1)) return *code;
     // ---- where every loader reads from: the sections of the .basalt file
-    if (o.model.empty()) {
-        basalt::log::error("basalt generate", "--model FILE.basalt is required");
-        usage();
-        return 2;
-    }
-    // a load that exhausts the RAM ends here instead of swapping the machine to a halt; stopped at READY
-    if (o.serve) basalt::platform::start_memory_watchdog(1ull << 30);
-    // the serve protocol's pipes carry bytes, so its newlines are the engine's own
-    if (o.serve) basalt::platform::set_stdio_binary();
+    if (const auto code = cli::prepare_model_process(o)) return *code;
     basalt::core::ModelSources srcs;
     basalt::core::ModelFile model_file;
     {
@@ -1447,36 +805,7 @@ int main(int argc, char** argv) {
     const bool pipe_want = multi_gpu && split_devs.size() == 1 && !o.mtp.empty() && o.serve && o.batch <= 0;
     constexpr int kPairMib0 = 280, kPairMibLater = 160;
     if (pipe_want) o.vram_reserve_mib += kPairMib0;
-    // Built-in defaults for what is given nowhere: the fastest settings that need no knowledge of the machine.
-    // Speculation needs the pack's drafter; prompt chunks are sized from what the expert cache can lend; the experts
-    // the GPU does not hold go to page-locked RAM when they fit (a plain file mapping when not); the adaptive tier
-    // of a server on one card runs a round every window.  An explicit flag always wins.
-    if (!o.spec_given && !o.mtp.empty()) o.spec = 8;
-    if (!o.prefill_given) {
-        o.prefill_auto = o.prefill_auto_fit = true;
-        o.prefill_auto_max = 32768;
-        o.prefill_chunk = o.prefill_auto_max;
-    }
-    if (!o.mmap_experts && !o.resident_cpu_experts && o.shared_expert_arena.empty() && !o.expert_profile.empty() &&
-        o.expert_cache_remote[0] <= 0 && o.expert_cache_remote[1] <= 0 && o.expert_cache_remote[2] <= 0) {
-        o.mmap_experts = o.resident_cpu_experts = o.resident_pin = o.resident_soft = true;
-        o.resident_headroom = 0;
-    }
-    if (!o.adapt_every_given && o.serve && !multi_gpu && !o.remote_expert_opt) o.adapt_every = 1;
-    if (o.mmap_experts && !o.shared_expert_arena.empty()) {
-        basalt::log::error("basalt generate", "--shared-expert-arena backs the resident arena and cannot be used with --mmap-experts");
-        return 2;
-    }
-    if (o.resident_cpu_experts && (!o.mmap_experts || o.expert_profile.empty())) {
-        basalt::log::error("basalt generate", "--resident-cpu-experts requires --mmap-experts and a model with an expert profile");
-        return 2;
-    }
-    const bool remote_caches = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
-                               o.expert_cache_remote[2] > 0;
-    if (o.resident_cpu_experts && remote_caches) {
-        basalt::log::error("basalt generate", "--resident-cpu-experts does not support remote expert caches");
-        return 2;
-    }
+    if (const auto code = cli::resolve_model_options(o, multi_gpu)) return *code;
     if (o.serve) basalt::platform::watch_resident_ram(o.resident_cpu_experts, 0);
     // the helper-GPU expert caches (--expert-cache-remote): CUDA1..3 on one GPU; with a layer
     // split, the visible GPUs no stage runs on, in order
@@ -1509,60 +838,13 @@ int main(int argc, char** argv) {
         basalt::log::info("basalt generate", "layer split across %zu GPUs: CUDA0, then CUDA%s (split %s)",
                      split_devs.size() + 1, devs.c_str(), o.layer_split.c_str());
     }
-    if (o.prefill_auto && o.expert_profile.empty()) {
-        o.prefill_auto = false;       // nothing to lend from: the buffers are reserved for the session, so keep them small
-        o.prefill_chunk = 2048;
-    }
-    if (!have_tokens && o.serve) {   // requests bring their own tokens
-        o.tokens = {248045};
-        o.max_new = 1;
-        have_tokens = true;
-        o.stop_eos = true;
-    }
-    if (!have_tokens) {
-        basalt::log::error("basalt generate", "--tokens is required (this build has no tokenizer; see the "
-                             "header of src/program/generate.cpp)");
-        usage();
-        return 2;
-    }
-
-    if ((o.ple_io != "direct" && o.ple_io != "ram") || o.ple_row_cache < 0 || o.ple_inflight < 1 ||
-        o.ple_inflight > 1024 || !(o.ple_delay_us >= 0)) {
-        basalt::log::error("basalt generate", "invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us");
-        return 2;
-    }
-    if (o.kv == "q4") o.kv = "q4_0";
-    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4") {
-        basalt::log::error("basalt generate", "--kv must be fp16, int8, q4_0 or k8v4");
-        return 2;
-    }
+    if (const auto code = cli::prepare_input_options(o)) return *code;
     basalt::core::qsa_set_kv_int8(o.kv == "int8");
     basalt::core::qsa_set_kv_q4(o.kv == "q4_0");   // 4-bit codes after a Hadamard rotation (kv_q4.hpp)
     basalt::core::qsa_set_kv_hybrid(o.kv == "k8v4");   // K8V4: INT8 K + rotated Q4_0 V, 816 B/cell
-    if (o.kv_resident < 0) {
-        basalt::log::error("basalt generate", "--kv-resident must be >= 0");
-        return 2;
-    }
-    if (o.kv == "k8v4" && o.kv_resident > 0) {
-        basalt::log::error("basalt generate", "--kv k8v4 does not support --kv-resident streaming (yet)");
-        return 2;
-    }
+    if (const auto code = cli::validate_kv_streaming(o)) return *code;
     basalt::core::qsa_set_kv_resident(o.kv_resident);
-    // --serve with --spec 0 or 1: no speculation.  The drafter is not loaded, prompt lookup is off, and every step
-    // is a one-token window through the verify path.
-    const bool no_spec = o.serve && o.spec < 2;
-    if (no_spec) {
-        o.spec = 1;   // one-token windows; the verifier is still sized for 2 or more tokens
-        o.suffix_draft = 0;
-        o.mtp.clear();
-    }
-    // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
-    // up to 2 tokens longer (at most the verifier width); the draft policy (basalt/spec/draft_policy.hpp) takes one only where it pays.
-    // --suffix-draft 0 turns it off.
-    if (o.suffix_draft > 0 && o.spec >= 2 && o.mtp_max_t == 0) {
-        o.mtp_max_t = o.spec;
-        o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
-    }
+    const bool no_spec = cli::normalize_speculation_options(o);
     basalt::core::layer_set_shared_early(true);
     {
         // the source tensors hold the PLE table
@@ -1577,107 +859,8 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    // positions, cells and pooled-block indices are cast to int32 on the device path.
-    if (o.max_context > 2147483647LL - 8) {
-        basalt::log::error("basalt generate", "--max-context must be below 2^31");
-        return 2;
-    }
-    if (o.max_new <= 0 || o.max_context <= 0 || o.max_new > o.max_context ||
-        o.tokens.size() > (size_t) (o.max_context - o.max_new)) {
-        basalt::log::error("basalt generate", "positive --max-new and --max-context must fit the prompt and generation");
-        return 2;
-    }
-    // THE ROPE KNOBS (rope_scaling.hpp).  Anything invalid dies here, at second zero, rather than becoming a
-    // NaN angle inside one of the twelve QSA layers.  Only the RANGES are checked - the config itself is
-    // resolved after the model file has had its say, right before session_init.
-    basalt::kernels::RopeScaling rope_cfg;   // type filled here; the rest at the resolution below
-    {
-        using RST = basalt::kernels::RopeScalingType;
-        // an absent --rope-scaling (the empty default) leaves the type to the model file's rope keys,
-        // resolved below; anything present must be one of the three names
-        if (o.rope_scaling == "none") rope_cfg.type = RST::None;
-        else if (o.rope_scaling == "linear") rope_cfg.type = RST::Linear;
-        else if (o.rope_scaling == "yarn") rope_cfg.type = RST::YaRN;
-        else if (!o.rope_scaling.empty()) {
-            basalt::log::error("basalt generate", "--rope-scaling must be none, linear or yarn (got '%s')",
-                         o.rope_scaling.c_str());
-            return 2;
-        }
-        // every knob FINITE first: `atof("nan")` is NaN, and a NaN passes every range comparison below
-        for (const double v : {o.rope_scale, o.rope_freq_base, o.rope_freq_scale, o.yarn_orig_ctx, o.yarn_ext_factor,
-                               o.yarn_attn_factor, o.yarn_beta_fast, o.yarn_beta_slow})
-            if (!std::isfinite(v)) {
-                basalt::log::error("basalt generate", "a rope scaling knob is not a finite number (%g)", v);
-                return 2;
-            }
-        // 0 is the absent default; an explicit factor must extend, not shrink
-        if (o.rope_scale != 0 && o.rope_scale < 1.0) {
-            basalt::log::error("basalt generate", "--rope-scale %g must be >= 1 (it extends the context, not shrinks it)",
-                         o.rope_scale);
-            return 2;
-        }
-        if (o.rope_freq_base != 0 && o.rope_freq_base <= 1.0) {
-            basalt::log::error("basalt generate", "--rope-freq-base must be a base above 1 (0 = the model's)");
-            return 2;
-        }
-        if (o.rope_freq_scale < 0 || o.yarn_orig_ctx < 0 || o.yarn_ext_factor < -1.0 || o.yarn_attn_factor <= 0 ||
-            o.yarn_beta_fast <= 0 || o.yarn_beta_slow <= 0) {
-            basalt::log::error("basalt generate", "invalid rope scaling knob (see usage: --yarn-ext-factor <0 = auto, "
-                                 "--yarn-orig-ctx 0 = default, the rest positive)");
-            return 2;
-        }
-    }
-    if (!std::isfinite(o.temperature) || o.temperature < 0 || !std::isfinite(o.top_p) ||
-        o.top_p <= 0 || o.top_p > 1 || o.top_k < 0 || o.expert_cache < -1 ||
-        o.pool_workers < 0 || std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
-                                           [](int slots) { return slots < 0; }) ||
-        (o.expert_cache_remote[1] > 0 && o.expert_cache_remote[0] == 0) ||
-        (o.expert_cache_remote[2] > 0 && o.expert_cache_remote[1] == 0)) {
-        basalt::log::error("basalt generate", "invalid sampling or resource parameter");
-        return 2;
-    }
-    if (!(o.prefill_cpu_share >= 0.0 && o.prefill_cpu_share <= 1.0)) {
-        basalt::log::error("basalt generate", "--prefill-cpu-share must be a number from 0 to 1");
-        return 2;
-    }
-    if (o.vram_reserve_given && o.vram_reserve_mib < kVramStallMib) {
-        basalt::log::error("basalt", "--vram-reserve-mib %d leaves less VRAM free than the engine needs to keep "
-                             "requests from stalling; the smallest safe value is %d", o.vram_reserve_mib, kVramStallMib);
-        return 2;
-    }
-    if (o.expert_cache_remote_placement != "stripe" && o.expert_cache_remote_placement != "layer") {
-        basalt::log::error("basalt generate", "--expert-cache-remote-placement must be stripe or layer");
-        return 2;
-    }
-    if (o.remote_expert_opt && !o.serve) {
-        basalt::log::error("basalt generate", "--remote-expert-opt requires --serve");
-        return 2;
-    }
-    if (o.peer_exclusive && (o.peer_device < 1 || !o.resident_cpu_experts || !o.serve)) {
-        basalt::log::error("basalt generate", "--peer-exclusive needs a second GPU (--gpu 0,1), --resident-experts and --serve");
-        return 2;
-    }
-    if (o.peer_exclusive && o.peer_devices.size() > 1) {
-        basalt::log::error("basalt generate", "--peer-exclusive runs with one expert tier card (--gpu 0,1)");
-        return 2;
-    }
-    // the peer tier is the second card's only user: a layer split or a remote expert cache would put a second engine
-    // part (and a second copy of the same experts) on it
-    if (o.peer_device >= 1 && (!o.layer_split.empty() || o.expert_cache_remote[0] > 0)) {
-        basalt::log::error("basalt generate", "--peer-device cannot be combined with %s",
-                     !o.layer_split.empty() ? "--layer-split (use one or the other)"
-                                            : "--expert-cache-device1..3 (the peer tier already caches experts there)");
-        return 2;
-    }
-
-    // The whole-model graph measurements replay every layer through CUDA0's session, which a layer split carves to
-    // CUDA0's own range - the answer would read another stage's state.  Refused here rather than at the call, so
-    // the reason is visible before the model is loaded.
-    if (multi_gpu && (o.gpu_only_full || o.gpu_stages)) {
-        basalt::log::error("basalt generate", "--gpu-only-full and --gpu-stages replay the whole model through one "
-                             "session, which a layer split does not have; run them on one GPU (--gpu 0)");
-        return 2;
-    }
+    basalt::kernels::RopeScaling rope_cfg;
+    if (const auto code = cli::validate_generation_options(o, multi_gpu, kVramStallMib, rope_cfg)) return *code;
 
     // **BEFORE ANYTHING ELSE.**  The CPU expert kernel is AVX-512 (VNNI + VBMI), so on a CPU without those features it
     // does not fail - it executes an illegal instruction at some unpredictable token.  Refusing at second zero is the
@@ -2326,7 +1509,7 @@ int main(int argc, char** argv) {
     std::string cvec_summary = "0";
     if (!o.cvec_files.empty()) {
         std::string ce;
-        if (!load_control_vectors(o, g, cvec_summary, ce)) {
+        if (!cli::load_control_vectors(o, g, cvec_summary, ce)) {
             basalt::log::error("basalt generate", "control vector: %s", ce.c_str());
             return 2;
         }
@@ -3770,23 +2953,7 @@ int main(int argc, char** argv) {
         return true;
     };
 
-    basalt::kernels::SamplerParams sp;
-    sp.greedy = o.greedy;
-    sp.seed = o.seed;
-    sp.top_k = o.top_k;
-    sp.top_p = o.top_p;
-    sp.temperature = o.temperature;
-    // what this run actually samples with (the speculative loop below gets the same parameters); serve samples
-    // per request instead
-    if (!o.serve) {
-        if (sp.greedy || sp.temperature <= 0.0f)
-            basalt::log::info("basalt generate", "sampling greedy");
-        else
-            basalt::log::info("basalt generate", "sampling temperature=%g top_k=%d top_p=%g seed=%llu",
-                         (double) sp.temperature, sp.top_k > 0 && sp.top_k < 64 ? sp.top_k : 64, (double) sp.top_p,
-                         (unsigned long long) sp.seed);
-    }
-
+    const auto sp = cli::sampling_options(o);
 
     // ---- THE LAYER ORACLE: ONE RESIDUAL SNAPSHOT PER LAYER PER POSITION, so the engine can be bisected against
     // `llama-debug`'s `l_last-<il>` node instead of against a single end-to-end perplexity.  The buffer is
@@ -7974,7 +7141,7 @@ int main(int argc, char** argv) {
                 const unsigned long long seed = std::strtoull(e1, &e2, 10);
                 std::vector<int64_t> sids;
                 std::string se;
-                if (b < 0 || b >= (long) bs.size() || e2 == e1 || !parse_i64_list(e2, sids, se)) {
+                if (b < 0 || b >= (long) bs.size() || e2 == e1 || !cli::parse_i64_list(e2, sids, se)) {
                     std::printf("ERR BSCRIPT: bad slot or list\n");
                     std::fflush(stdout);
                     continue;
@@ -8223,7 +7390,7 @@ int main(int argc, char** argv) {
                         pe = "the tokenized prompt is gone";
                     }
                 } else {
-                    ids_ok = parse_i64_list(endp, ids, pe);
+                    ids_ok = cli::parse_i64_list(endp, ids, pe);
                 }
             }
             if (max_new < 1 || endp == nullptr || (geni && emb_path.empty()) || !ids_ok) {
@@ -10975,15 +10142,7 @@ int main(int argc, char** argv) {
                        std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) produced.back()) != o.eos_ids.end();
     if (spec_pos > 0 && (int64_t) produced.size() < o.max_new && !ended) {
         std::vector<int64_t> oracle;
-        if (!o.spec_oracle.empty()) {
-            std::ifstream in(o.spec_oracle);
-            std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-            std::string e;
-            if (!in || !parse_i64_list(text.c_str(), oracle, e)) {
-                basalt::log::error("basalt generate", "cannot read --spec-oracle %s", o.spec_oracle.c_str());
-                return 2;
-            }
-        }
+        if (const auto code = cli::load_spec_oracle(o.spec_oracle, oracle)) return *code;
         if (thits.d_res == nullptr) {
             basalt::log::error("basalt generate", "--spec needs the device residency table (an expert profile, "
                                  "--expert-cache and the token graph)");
@@ -11236,156 +10395,37 @@ int main(int argc, char** argv) {
         if (!ver.wait_commit(err)) {
             return fatal_start_error(err);
         }
-        std::printf("%-24s %lld rounds of %d, drafts accepted %lld of %lld (%.3f), %.2f tokens per round\n",
-                    "speculation", (long long) rounds, o.spec, (long long) drafts_ok, (long long) drafts_total,
-                    drafts_total > 0 ? (double) drafts_ok / (double) drafts_total : 0.0,
-                    rounds > 0 ? (double) (drafts_ok + rounds) / (double) rounds : 0.0);
-        std::printf("%-24s", "window sizes");
-        for (size_t i = 1; i < window_hist.size(); ++i) std::printf(" T%zu:%lld", i, (long long) window_hist[i]);
-        std::printf("  (cumulative draft rule)\n");
-        if (o.suffix_draft > 0)
-            std::printf("%-24s %lld windows, drafts accepted %lld of %lld\n", "suffix drafts", (long long) sfx_windows,
-                        (long long) sfx_ok, (long long) sfx_drafts);
-        std::printf("%-24s", "accepted per round");
-        for (size_t i = 0; i < accepted_hist.size(); ++i) std::printf(" %zu:%lld", i, (long long) accepted_hist[i]);
-        std::printf("\n");
-        if (rounds > 0)
-            std::printf("%-24s wait for rings %.3f  pool %.3f  host %.3f  commit %.3f ms/round; CPU experts %.2f "
-                        "distinct / %.2f routed per layer\n",
-                        "verify window", ver.ms_wait / rounds, ver.ms_pool / rounds, ver.ms_host / rounds,
-                        ver.ms_commit / rounds,
-                        (double) (drive.d.multi_misses - misses0) / (double) (rounds * g.n_layers),
-                        (double) (drive.d.multi_entries - entries0) / (double) (rounds * g.n_layers));
-        if (rounds > 0)
-            std::printf("%-24s gate/up %.3f  quantize %.3f  down %.3f ms/round; %.1f GB/s over the rows phases; "
-                        "CPU pool call %.3f ms/round\n", "pool multi", pool.ms_multi_gu / rounds,
-                        pool.ms_multi_q / rounds, pool.ms_multi_down / rounds,
-                        (double) pool.multi_bytes / 1e6 / std::max(1e-9, pool.ms_multi_gu + pool.ms_multi_down),
-                        (drive.cpu_ms - pool_ms0) / rounds);
-        if (rounds > 0)
-            std::printf("%-24s plan %.3f  activation quantize %.3f  jobs %.3f  run %.3f ms/round\n", "dispatch",
-                        drive.d.ms_plan / rounds, drive.d.ms_actq / rounds, drive.d.ms_jobs / rounds,
-                        drive.d.ms_run / rounds);
-        if (rounds > 0 && !drive.d.usage.empty())
-            std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
-                        (long long) swaps_total, o.adapt_every, ms_adapt / rounds);
-        if (src.complement_ready())
-            std::printf("%-24s %.2f GiB of experts in RAM, %lld exchanged with the VRAM tier, %lld blob reads from "
-                        "the file\n", "resident RAM", (double) src.resident_bytes() / 1073741824.0,
-                        (long long) src.exchanges(), (long long) src.file_reads());
-        if (srcp == &src) {  // CS-T: the RAM and file tiers (the GPU cache's share is the hit rate above)
-            std::printf("%-24s decode: RAM %lld blobs, files %lld blobs, %.1f MB read from the files\n",
-                        "expert tiers", (long long) (src.ram_reads() - ram0), (long long) (src.file_reads() - files0),
-                        (double) (src.file_read_bytes() - fall0) / 1e6);
-        }
-        if (rounds > 0 && drive.d.pcie_num > 0)
-            std::printf("%-24s %.2f distinct experts per layer read over PCIe (share %d/256 of the misses)\n",
-                        "pcie experts", (double) (drive.d.pcie_experts - pcie0) / (double) (rounds * g.n_layers),
-                        drive.d.pcie_num);
-        (void) pool_ms0;
-        if (use_mtp && rounds > 0)
-            std::printf("%-24s %.3f ms/round drafting (%lld rounds), MTP prompt %.1f ms, %.0f MiB of VRAM\n", "mtp",
-                        mtp.ms_draft / (double) mtp.rounds, (long long) mtp.rounds, mtp.ms_prefill,
-                        (double) mtp.vram_bytes() / 1048576.0);
+        cli::print_speculation({
+            .o = o, .g = g, .drive = drive,
+            .pool = pool, .src = src, .srcp = srcp,
+            .ver = ver, .mtp = mtp, .rounds = rounds,
+            .drafts_ok = drafts_ok, .drafts_total = drafts_total, .window_hist = window_hist,
+            .accepted_hist = accepted_hist, .sfx_windows = sfx_windows, .sfx_ok = sfx_ok,
+            .sfx_drafts = sfx_drafts, .misses0 = misses0, .entries0 = entries0,
+            .swaps_total = swaps_total, .ram0 = ram0, .files0 = files0,
+            .pcie0 = pcie0, .fall0 = fall0, .pool_ms0 = pool_ms0,
+            .ms_adapt = ms_adapt, .use_mtp = use_mtp
+        });
     }
 
     if (routing != nullptr) {
         std::fclose(routing);
         drive.routing = nullptr;
-        std::printf("%-24s %s (%lld records of layer, k, ids, weights)\n", "routing dumped",
-                    o.dump_routing.c_str(), (long long) drive.calls);
+        cli::print_routing_dump(o.dump_routing, drive.calls);
     }
     if (o.stage_timing) basalt::core::stage_timing_report(g.n_layers);
 
-    const int64_t decoded = (int64_t) produced.size();
-    std::printf("prompt  :");
-    for (int64_t t : o.tokens) std::printf(" %lld", (long long) t);
-    std::printf("\noutput  :");
-    for (int64_t t : produced) std::printf(" %lld", (long long) t);
-    std::printf("\n");
-    const double decode_ms = decoded > 0 ? total_ms / (double) decoded : 0.0;
-    std::printf("%-24s %lld tokens in %.1f ms  ->  %.2f tok/s\n", "decode", (long long) decoded, total_ms,
-                decode_ms > 0.0 ? 1000.0 / decode_ms : 0.0);
-    if (n_prompt > 1)
-        std::printf("%-24s %lld tokens in %.1f ms  ->  %.2f tok/s  (time to first token %.1f ms)\n", "prefill",
-                    (long long) (n_prompt - 1), prefill_ms,
-                    prefill_ms > 0 ? 1000.0 * (double) (n_prompt - 1) / prefill_ms : 0.0, ttft_ms);
+    const double decode_ms = cli::print_generation(o, produced, n_prompt, total_ms, prefill_ms, ttft_ms);
     if (const int rc = basalt::program::measure::write_host_dumps({&o, &g, &ss}, err); rc != 0) return rc;
 
-    if (o.stats) {
-        std::printf("%-24s %.3f ms/token (WALL CLOCK: embed, layers, head, sample)\n", "  per token", decode_ms);
-        // THE PER-TOKEN HOST TERM, WHICH `--gpu-only-full` CANNOT SEE.  That measurement never enters the token loop,
-        // so it excludes all six of these: non-layer work that is a sizeable part of the token and is not the pool.
-        if (phase_tokens > 0) {
-            const double pt = (double) phase_tokens;
-            std::printf("%-24s PLE %.3f  embed %.3f  LAYERS %.3f  head %.3f  readback %.3f  sample %.3f  "
-                        "(sum %.3f of %.3f ms)\n",
-                        "  token host phases", ms_ple / pt, ms_embed / pt, ms_layers / pt, ms_head / pt,
-                        ms_readback / pt, ms_sample / pt,
-                        (ms_ple + ms_embed + ms_layers + ms_head + ms_readback + ms_sample) / pt, decode_ms);
-        }
-        if (const std::string io = ple_table.io_report(); !io.empty()) std::printf("  %s\n", io.c_str());
-        // **THE DENOMINATOR IS THE POSITIONS THE POOL ACTUALLY RAN ON, NOT THE DECODED TOKENS (A6).**
-        // `drive_pool` is called once per layer per position and PREFILL runs the loop too, so accumulating
-        // `cpu_ms` over prefill and then dividing by `decoded` inflates this figure.  `drive.calls / n_layers`
-        // is the number of positions - the same correction the ring counters below already received, which is
-        // why they print "of 192" rather than "240 of 192".
-        const double pool_positions = g.n_layers > 0 ? (double) drive.calls / (double) g.n_layers : 0.0;
-        std::printf("%-24s %.3f ms/token over %lld layers (%.0f positions, %lld dispatches)\n",
-                    "  the CPU expert pool", pool_positions > 0.0 ? drive.cpu_ms / pool_positions : 0.0,
-                    (long long) g.n_layers, pool_positions, (long long) drive.calls);
-        std::printf("%-24s %lld blobs read\n", "  expert blobs", (long long) srcp->reads());
-        for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
-            std::printf("  CUDA%d experts           %lld routed entries computed\n",
-                        r + 1, (long long) remote_experts[(size_t) r].computed());
-        // ---- **R4's DISPATCH MEASUREMENT: h, ON THE ENGINE'S OWN ROUTING.**  No offline trace, no corpus
-        // question, no k-fold - these are the ids the router actually produced on this run.  Reported as
-        // hits/lookups so it can be read directly as the h the cache would deliver, and alongside `refused`
-        // so a full cache is visible rather than silently capping the rate.
-        if (o.expert_cache > 0) {
-            const int64_t look = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
-            const int64_t hl = drive.d.hit_ready + drive.d.hit_late;
-            std::printf("%-24s %lld of %lld layers the hit work was DONE when the pool returned\n",
-                        "  R4 overlap", (long long) drive.d.hit_ready, (long long) hl);
-            std::printf("%-24s %lld of %lld = %.4f      (%lld admitted, %lld refused, cache %.4f%% full)\n",
-                        "  R4 expert-cache hits", (long long) drive.d.cache_hits, (long long) look,
-                        look > 0 ? (double) drive.d.cache_hits / (double) look : 0.0,
-                        (long long) drive.d.cache_admitted, (long long) drive.d.cache_refused,
-                        100.0 * (double) (drive.d.cache_admitted + drive.d.cache_hits > 0
-                                              ? (double) xcache.resident() / (double) xcache.slots()
-                                              : 0.0));
-        }
-        if (tgraph.captured && tgraph.calls > 0) {
-            const double per = (double) tgraph.calls;
-            std::printf("%-24s wait for rings %.3f  pool %.3f ms/token  (%lld flushes over %lld positions)\n",
-                        "  token graph", tgraph.ms_wait / per, tgraph.ms_pool / per, (long long) tgraph.flushes,
-                        (long long) tgraph.calls);
-        }
-        if (gr.captured && gr.calls_total > 0) {
-            // The counters are CUMULATIVE over every `session_loop` call, and PREFILL runs the loop too - so
-            // the denominator is the number of positions, not the number of generated tokens.  Dividing by
-            // `n_layers * decoded` printed "240 of 192", which is a reporting bug that looks like a ring
-            // firing more often than it should.
-            const int64_t positions = gr.calls_total;
-            std::printf("%-24s %lld of %lld over %lld positions\n", "  rings seen MID-GRAPH",
-                        (long long) gr.rings_mid_graph, (long long) (g.n_layers * positions),
-                        (long long) positions);
-            std::printf("%-24s %.3f ms of a %.3f ms layer\n", "  ring latency",
-                        gr.ms_to_ring / (double) (g.n_layers * positions), decode_ms / (double) g.n_layers);
-            // THE ROUND TRIP, SPLIT AT THE RING.  `ring latency` is the first half and stops when the ring is seen;
-            // this is the second half - the driver calls after it, during which the GPU is IDLE because `post[l]` has
-            // not been launched yet.  `--no-pool` is the arm that isolates it: the gap to the pure-GPU floor is round
-            // trip with no expert work at all.
-            //
-            // Same denominator as the pool line above (the positions the loop actually ran on), so the two can be
-            // added without one of them being inflated by prefill.
-            const double perlap = (double) (g.n_layers * positions);
-            std::printf("%-24s %.3f ms/token over %.0f positions (%.3f ms/layer, after the ring)\n",
-                        "  host after ring", pool_positions > 0.0 ? gr.ms_host / pool_positions : 0.0,
-                        pool_positions, gr.ms_host / perlap);
-        }
-    }
-
+    cli::print_stats({
+        .o = o, .g = g, .drive = drive,
+        .pool = pool, .ple_table = ple_table, .srcp = srcp,
+        .remote_experts = remote_experts, .xcache = xcache, .tgraph = tgraph,
+        .gr = gr, .decode_ms = decode_ms, .phase_tokens = phase_tokens,
+        .ms_ple = ms_ple, .ms_embed = ms_embed, .ms_layers = ms_layers,
+        .ms_head = ms_head, .ms_readback = ms_readback, .ms_sample = ms_sample
+    });
 
     basalt::core::session_graphs_free(gr);
     basalt::core::doorbell_free(db);
