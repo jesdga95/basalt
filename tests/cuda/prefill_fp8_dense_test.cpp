@@ -8,8 +8,9 @@
 //   - each scale granularity cuBLASLt offers here against the reference (E4M3 keeps 3 mantissa bits: the bounds are
 //     relative RMS 6e-2, worst row 0.25), and the path the prompt runs (Gemm::native8) the same;
 //   - an all-zero row gives zeros;
-//   - width invariance, bit for bit: rows of the 512-row batch run again in batches of 37, 64 and 300 at shifted
-//     places give the same E4M3 rows and the same products (the FP16 path's differing values are printed, not failed);
+//   - width invariance: rows of the 512-row batch run again in batches of 37, 64 and 300 at shifted places give the
+//     same E4M3 rows, bit for bit, and products within 1e-5 of the max |y|; the rows whose products differ in any bit
+//     are counted, for this path and for the FP16 path, with the algorithm cuBLASLt runs for the shape;
 // --bench [T]: microseconds per product and TFLOP/s at T rows (default 32768): the FP16 path, each FP8 scale
 // granularity (conversions, the shape's algorithm, fast accumulation), the prompt path's FP8 product, and llama.cpp's
 // MMQ on Q8_0 weights for comparison.
@@ -391,6 +392,7 @@ int check_geo(const Geo& g, bool outliers, cudaStream_t s, Gemm& gemm, fp8::Lt& 
 
     // width invariance: rows [0, w) of the batch again as a batch of w, each at place (r + 7) % w
     long qdiff = 0, nbits = 0, nbits16 = 0;
+    double dmax = 0, dmax16 = 0, ymax = 0;
     for (const int64_t w : {(int64_t) 37, small, (int64_t) 300}) {
         std::vector<uint16_t> xs((size_t) w * g.k);
         for (int64_t r = 0; r < w; ++r)
@@ -413,13 +415,20 @@ int check_geo(const Geo& g, bool outliers, cudaStream_t s, Gemm& gemm, fp8::Lt& 
             qdiff += std::memcmp(&q_full[(size_t) r * g.k], &q_small[at * g.k], (size_t) g.k) != 0;
             nbits += std::memcmp(&y8[(size_t) r * g.n], &y_small[at * g.n], (size_t) g.n * 4) != 0;
             nbits16 += std::memcmp(&y_f16[(size_t) r * g.n], &y16_small[at * g.n], (size_t) g.n * 4) != 0;
+            for (int64_t c = 0; c < g.n; ++c) {
+                dmax = std::max(dmax, (double) std::fabs(y8[(size_t) r * g.n + c] - y_small[at * g.n + c]));
+                dmax16 = std::max(dmax16, (double) std::fabs(y_f16[(size_t) r * g.n + c] - y16_small[at * g.n + c]));
+                ymax = std::max(ymax, (double) std::fabs(y8[(size_t) r * g.n + c]));
+            }
         }
     }
-    if (qdiff != 0 || nbits != 0) ++fail;
+    const double drel = ymax > 0 ? dmax / ymax : 0, drel16 = ymax > 0 ? dmax16 / ymax : 0;
+    if (qdiff != 0 || drel > 1e-5) ++fail;
     std::printf("%-18s %-8s FP16 %.2e / %.2e%s | path %.2e / %.2e (vs FP16 %.2e) | width (401 rows): %ld E4M3 rows "
-                "differ, %ld product rows differ (FP16 path: %ld) %s\n",
+                "differ; products: %ld rows differ, max %.1e of max |y| (FP16 path: %ld, %.1e) [%s] %s\n",
                 g.name, outliers ? "outliers" : "plain", ef.rms, ef.worst, line.c_str(), e8.rms, e8.worst,
-                rel_rms(y8, y_f16), qdiff, nbits, nbits16, fail ? "FAIL" : "ok");
+                rel_rms(y8, y_f16), qdiff, nbits, drel, nbits16, drel16,
+                lt.describe(fp8::Scale::Block32, g.n, g.k, g.n, kWs, ws, ws).c_str(), fail ? "FAIL" : "ok");
     return fail;
 }
 

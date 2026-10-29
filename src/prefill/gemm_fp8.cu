@@ -308,6 +308,26 @@ bool Lt::fits(Scale s, int64_t T, int64_t N, int64_t K, int64_t ldy, size_t ws_b
     return state_->fits(p, T, N, K, ldy, ws_bytes);
 }
 
+std::string Lt::describe(Scale s, int64_t N, int64_t K, int64_t ldy, size_t ws_bytes, const void* w_scales,
+                         const void* x_scales) {
+    if (!state_) return {};
+    const State::Plan& p = state_->plan(s, N, K, ldy, ws_bytes, false, w_scales, x_scales);
+    if (!p.ok) return {};
+    int32_t id = 0, splits = 0;
+    uint32_t tile = 0, red = 0, swz = 0, custom = 0, stages = 0;
+    size_t got = 0;
+    cublasLtMatmulAlgoConfigGetAttribute(&p.algo, CUBLASLT_ALGO_CONFIG_ID, &id, sizeof id, &got);
+    cublasLtMatmulAlgoConfigGetAttribute(&p.algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &tile, sizeof tile, &got);
+    cublasLtMatmulAlgoConfigGetAttribute(&p.algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splits, sizeof splits, &got);
+    cublasLtMatmulAlgoConfigGetAttribute(&p.algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &red, sizeof red, &got);
+    cublasLtMatmulAlgoConfigGetAttribute(&p.algo, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, &swz, sizeof swz, &got);
+    cublasLtMatmulAlgoConfigGetAttribute(&p.algo, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, &custom, sizeof custom, &got);
+    cublasLtMatmulAlgoConfigGetAttribute(&p.algo, CUBLASLT_ALGO_CONFIG_STAGES_ID, &stages, sizeof stages, &got);
+    return "id " + std::to_string(id) + " tile " + std::to_string(tile) + " splits " + std::to_string(splits) +
+           " reduction " + std::to_string(red) + " swizzle " + std::to_string(swz) + " custom " +
+           std::to_string(custom) + " stages " + std::to_string(stages);
+}
+
 bool Lt::run(Scale s, const uint8_t* W, const void* w_scales, const uint8_t* X, const void* x_scales, float* Y,
              int64_t T, int64_t N, int64_t K, int64_t ldy, void* workspace, size_t ws_bytes, void* stream,
              bool fast_accum) {

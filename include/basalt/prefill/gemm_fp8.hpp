@@ -48,6 +48,10 @@ public:
     /// T).  The scale pointers (device memory; a block-scaled heuristic may want them set) are replaced by each run's.
     bool fits(Scale s, int64_t T, int64_t N, int64_t K, int64_t ldy, size_t ws_bytes, const void* w_scales,
               const void* x_scales, bool fast_accum = false);
+    /// The shape's algorithm as cuBLASLt configures it (id, tile, splits, reduction, swizzle, custom option, stages),
+    /// for tests; empty when there is none.
+    std::string describe(Scale s, int64_t N, int64_t K, int64_t ldy, size_t ws_bytes, const void* w_scales,
+                         const void* x_scales);
     /// false: no algorithm for the shape, or the call failed (Y may then be partly written).
     bool run(Scale s, const uint8_t* W, const void* w_scales, const uint8_t* X, const void* x_scales, float* Y,
              int64_t T, int64_t N, int64_t K, int64_t ldy, void* workspace, size_t ws_bytes, void* stream,
