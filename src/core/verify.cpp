@@ -74,23 +74,24 @@ namespace basalt::core {
 // The CPU tier's cache warm-up.  After layer l's doorbell the parked pool workers score layer l + 1's router on layer
 // l's FFN input (the ring's q8_1 rows; the router in 4-bit with one scale per 32 values, a prediction only: half the
 // bytes of an 8-bit copy, so the scoring leaves more of the gap to the read), take every token's top k, rank the
-// predicted experts only the CPU holds by their summed weight, and read the likeliest one into their caches.  The next
-// batch stops the work; the experts are computed as before.
+// predicted experts only the CPU holds by their summed weight, and read the kPicks likeliest into their caches, the
+// likeliest first.  The next batch stops the work; the experts are computed as before.
 struct CpuWarm {
     std::vector<uint8_t> rq;  ///< [n_layers][n_expert][n_embd / 2]: per 32 values, value i in the low nibble of byte i
                               ///< and value i + 16 in its high nibble, each the code plus 8
     std::vector<float> rs;    ///< [n_layers][n_expert][n_embd / 32]
     int n_expert = 0, n_embd = 0, k = 0;
-    size_t bytes = 0, down_off = 0;   ///< a blob's bytes, where its down rows start
     ExpertSource* src = nullptr;
     // the job in flight
     int layer = 0, n_tok = 0;
+    size_t bytes = 0, down_off = 0;                   ///< the layer's blob bytes, where its down rows start
     const uint8_t* xq = nullptr;                      ///< the ring's q8_1 rows, tokens back to back
     const int32_t* res0 = nullptr, *res1 = nullptr;   ///< the layer's CUDA0 / peer residency (res1 may be null)
     std::vector<float> logits;                        ///< [kVerifyMaxT][n_expert]
     alignas(64) std::atomic<int> arrive{0};
     alignas(64) std::atomic<int> ready{0};
-    const uint8_t* blob = nullptr;                    ///< the expert to read, or null
+    static constexpr int kPicks = 3;
+    const uint8_t* blob[kPicks] = {};                 ///< the experts to read, likeliest first; null past the last
     std::atomic<uint64_t> sink{0};
 };
 
@@ -227,7 +228,7 @@ BASALT_TARGET_AVX2_FMA_F16C void warm_logits(CpuWarm& c, int e0, int e1, const s
     }
 }
 
-// every token's top k (softmax weights over them), summed per predicted expert only the CPU holds; the likeliest
+// every token's top k (softmax weights over them), summed per predicted expert only the CPU holds; the kPicks likeliest
 void warm_select(CpuWarm& c) {
     const int NE = c.n_expert, K = std::min(c.k, 16);
     float score[512] = {};
@@ -252,10 +253,15 @@ void warm_select(CpuWarm& c) {
             score[e] += w[j] / sum;
         }
     }
-    int best = -1;
-    for (int e = 0; e < NE; ++e)
-        if (score[e] > 0.0f && (best < 0 || score[e] > score[best])) best = e;
-    c.blob = best >= 0 ? c.src->resident_blob(c.layer, best) : nullptr;
+    // an expert without a RAM copy is passed over, so it does not end the read before the next likeliest
+    for (int r = 0; r < CpuWarm::kPicks;) {
+        int best = -1;
+        for (int e = 0; e < NE; ++e)
+            if (score[e] > 0.0f && (best < 0 || score[e] > score[best])) best = e;
+        if (best < 0) break;
+        score[best] = 0.0f;
+        if (const uint8_t* b = c.src->resident_blob(c.layer, best)) c.blob[r++] = b;
+    }
 }
 
 void warm_job(void* ctx, int w, int W, const std::atomic<bool>& stop) {
@@ -270,21 +276,22 @@ void warm_job(void* ctx, int w, int W, const std::atomic<bool>& stop) {
             _mm_pause();
         }
     }
-    // this worker's share of the blob, one load per line: the gate and up rows first (computed first), then the down
-    // rows, so a read the doorbell cuts short has warmed the start of the computation
-    if (c.blob == nullptr) return;
+    // this worker's share of each blob, one load per line, the likeliest blob first: the gate and up rows first
+    // (computed first), then the down rows, so a read the doorbell cuts short has warmed the start of the computation
     uint64_t x = 0;
-    for (int part = 0; part < 2; ++part) {
-        const size_t r0 = part == 0 ? 0 : c.down_off, r1 = part == 0 ? c.down_off : c.bytes;
-        const size_t per = ((r1 - r0 + (size_t) W - 1) / (size_t) W + 63) & ~(size_t) 63;
-        const size_t b0 = std::min(r1, r0 + per * (size_t) w), b1 = std::min(r1, b0 + per);
-        for (size_t o = b0; o < b1; o += 4096) {
-            if (stop.load(std::memory_order_relaxed)) { part = 2; break; }
-            const uint8_t* p = c.blob + o;
-            const size_t n = std::min<size_t>(4096, b1 - o);
-            for (size_t q = 0; q + 8 <= n; q += 64) x += *(const volatile uint64_t*) (p + q);
+    bool stopped = false;
+    for (int r = 0; r < CpuWarm::kPicks && !stopped && c.blob[r] != nullptr; ++r)
+        for (int part = 0; part < 2 && !stopped; ++part) {
+            const size_t r0 = part == 0 ? 0 : c.down_off, r1 = part == 0 ? c.down_off : c.bytes;
+            const size_t per = ((r1 - r0 + (size_t) W - 1) / (size_t) W + 63) & ~(size_t) 63;
+            const size_t b0 = std::min(r1, r0 + per * (size_t) w), b1 = std::min(r1, b0 + per);
+            for (size_t o = b0; o < b1; o += 4096) {
+                if (stop.load(std::memory_order_relaxed)) { stopped = true; break; }
+                const uint8_t* p = c.blob[r] + o;
+                const size_t n = std::min<size_t>(4096, b1 - o);
+                for (size_t q = 0; q + 8 <= n; q += 64) x += *(const volatile uint64_t*) (p + q);
+            }
         }
-    }
     if (x == 0x9e3779b97f4a7c15ull) c.sink.fetch_add(x, std::memory_order_relaxed);   // keeps the loads
 }
 
@@ -645,10 +652,7 @@ bool Verifier::dm_init(std::string& err) {
         d->pin = nullptr;
     }
     // the warm-ups' predictors, quantized once: every layer's router in int8 for the peer's, in 4-bit for the CPU pool's
-    const bool cpu_warm = warm_pool_ != nullptr && warm_src_ != nullptr && K <= 16 &&
-                          std::all_of(lay.fmt.begin(), lay.fmt.end(), [&](const basalt::kernels::cpu::NativeFmt& f) {
-                              return f.bytes == lay.fmt[0].bytes && f.down_off == lay.fmt[0].down_off;
-                          });
+    const bool cpu_warm = warm_pool_ != nullptr && warm_src_ != nullptr && K <= 16;
     std::vector<int8_t> rq_h;
     std::vector<float> rs_h;
     std::vector<uint8_t> rq4_h;
@@ -734,8 +738,6 @@ bool Verifier::dm_init(std::string& err) {
         w->rq = std::move(rq4_h);
         w->rs = std::move(rs4_h);
         w->n_expert = (int) g.n_expert; w->n_embd = (int) N; w->k = (int) K; w->src = warm_src_;
-        w->bytes = lay.fmt[0].bytes;
-        w->down_off = lay.fmt[0].down_off;
         w->logits.assign((size_t) kVerifyMaxT * g.n_expert, 0.0f);
         d->warm = w;
     }
@@ -789,7 +791,7 @@ bool Verifier::dm_init(std::string& err) {
     }
     basalt::log::info("basalt verify", "the MoE tail planned on the device%s", served.c_str());
     if (d->warm != nullptr)
-        basalt::log::info("basalt verify", "the CPU pool warms its likeliest next-layer expert between doorbells");
+        basalt::log::info("basalt verify", "the CPU pool warms its three likeliest next-layer experts between doorbells");
     return true;
 }
 
@@ -3992,14 +3994,17 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
         if (dm_ != nullptr && dm_->warm != nullptr && l + 1 < le_) {   // the next layer's warm-up
             CpuWarm& w = *dm_->warm;
             warm_pool_->idle_stop();
+            const basalt::kernels::cpu::NativeFmt& f = basalt::kernels::cpu::expert_layout().fmt[(size_t) (l + 1)];
             w.layer = (int) (l + 1);
+            w.bytes = f.bytes;
+            w.down_off = f.down_off;
             w.n_tok = std::min(n, (int) kVerifyMaxT);
             w.xq = dm_->h_xq + (size_t) k * dm_->xq_stride;
             w.res0 = dm_->shadow0.data() + (size_t) (l + 1) * g.n_expert;
             w.res1 = dm_->pdev >= 0 ? dm_->shadow1.data() + (size_t) (l + 1) * g.n_expert : nullptr;
             w.arrive.store(0, std::memory_order_relaxed);
             w.ready.store(0, std::memory_order_relaxed);
-            w.blob = nullptr;
+            for (const uint8_t*& bp : w.blob) bp = nullptr;
             warm_pool_->idle_start(&warm_job, &w);
         }
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
