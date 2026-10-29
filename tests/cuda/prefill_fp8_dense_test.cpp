@@ -12,7 +12,9 @@
 //     and products within 1e-4 of the max |y| (cuBLASLt may pick another algorithm for another width).
 // --bench [T]: microseconds per product and TFLOP/s at T rows (default 32768): the FP16 path, each FP8 scale
 // granularity (conversions, cuBLASLt's pick, the best of the algorithms it offers, fast accumulation), the prompt
-// path's FP8 product, and llama.cpp's MMQ on Q8_0 weights for comparison.  Exit 77 without a device.
+// path's FP8 product, and llama.cpp's MMQ on Q8_0 weights for comparison.
+// --vram: the device memory the prompt path's FP8 products take on first use (cuBLASLt's lazily loaded kernels), after
+// the FP16 products of the same shapes ran.  Exit 77 without a device.
 #include "basalt/kernels/dequant_bf16.hpp"
 #include "basalt/prefill/gemm.hpp"
 #include "basalt/prefill/gemm_fp8.hpp"
@@ -527,9 +529,10 @@ int main(int argc, char** argv) {
             std::printf("no CUDA device - skipped\n");
             return 77;
         }
-        bool bench = false;
+        bool bench = false, vram = false;
         int64_t bench_t = 32768;
         for (int i = 1; i < argc; ++i) {
+            if (!std::strcmp(argv[i], "--vram")) vram = true;
             if (!std::strcmp(argv[i], "--bench")) {
                 bench = true;
                 if (i + 1 < argc && argv[i + 1][0] != '-') bench_t = std::atoll(argv[++i]);
@@ -558,6 +561,43 @@ int main(int argc, char** argv) {
         for (const Geo& g : kGeos) {
             kmax = std::max(kmax, g.k);
             nmax = std::max(nmax, g.n);
+        }
+        if (vram) {
+            // every geometry at a short and a long chunk: FP16 first, then the same shapes in FP8
+            const int64_t ts[2] = {512, 32768};
+            Dev x16((size_t) ts[1] * kmax * 2), y((size_t) ts[1] * nmax * 4), abuf(Gemm::act8_bytes(ts[1], kmax));
+            ck(cudaMemset(x16.p, 0, (size_t) ts[1] * kmax * 2), "x16");
+            std::vector<Dev*> ws_;
+            std::mt19937 rng(5);
+            for (const Geo& g : kGeos) {
+                const size_t wb = ggml_row_size(g.t, g.k) * (size_t) g.n;
+                std::vector<uint8_t> w(wb);
+                fill_matrix(w.data(), g.t, g.n, g.k, rng);
+                ws_.push_back(new Dev(wb));
+                ck(cudaMemcpy(ws_.back()->p, w.data(), wb, cudaMemcpyHostToDevice), "w");
+            }
+            ck(cudaDeviceSynchronize(), "upload");
+            auto free_mib = [] {
+                size_t f = 0, t = 0;
+                ck(cudaMemGetInfo(&f, &t), "cudaMemGetInfo");
+                return (double) f / (1 << 20);
+            };
+            for (int64_t T : ts)
+                for (size_t i = 0; i < std::size(kGeos); ++i)
+                    gemm.native(x16.as<uint16_t>(), kGeos[i].t, ws_[i]->p, y.as<float>(), T, kGeos[i].n, kGeos[i].k);
+            ck(cudaStreamSynchronize(s), "fp16");
+            const double f0 = free_mib();
+            for (int64_t T : ts)
+                for (size_t i = 0; i < std::size(kGeos); ++i) {
+                    const Gemm::Rows8 xr = gemm.act8(x16.as<uint16_t>(), T, kGeos[i].k, abuf.p);
+                    if (!gemm.native8(xr, kGeos[i].t, ws_[i]->p, y.as<float>(), kGeos[i].n))
+                        throw std::runtime_error("native8 did not run");
+                }
+            ck(cudaStreamSynchronize(s), "fp8");
+            const double f1 = free_mib();
+            for (Dev* d : ws_) delete d;
+            std::printf("VRAM: the FP8 products' first use took %.1f MiB (free %.1f -> %.1f MiB)\n", f0 - f1, f0, f1);
+            return 0;
         }
         if (bench) {
             mmq::Context mctx;
