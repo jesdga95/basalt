@@ -12,6 +12,7 @@
 #include <thread>
 #if defined(_WIN32)
 #include "basalt/platform/win.hpp"
+#include <dxgi1_4.h>
 #include <malloc.h>   // _aligned_malloc, _aligned_free
 #else
 #include <fcntl.h>
@@ -558,16 +559,51 @@ void free_region(void* p, uint64_t bytes) {
     VirtualFree(p, 0, MEM_RELEASE);
 }
 
-bool pin_budget(uint64_t& limit, std::string& why) {
-    constexpr uint64_t GiB = 1ull << 30;
-    const uint64_t ram = basalt::platform::total_physical_memory();
-    if (ram == 0) return false;
-    limit = ram / 2 > 8 * GiB ? ram / 2 - 8 * GiB : 0;
-    char buf[192];
-    std::snprintf(buf, sizeof buf, "the GPU's shared-memory budget, RAM/2 - 8 GiB of %.1f GiB RAM",
-                  (double) ram / (double) GiB);
-    why = buf;
-    return true;
+bool pin_budget(uint64_t& limit, std::string& why, const char* luid, uint32_t node_mask, bool shared_mapping) {
+    limit = 0;
+    why.clear();
+    if (!luid || !node_mask) return false;
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**) &factory))) return false;
+    bool found = false;
+    for (UINT i = 0; !found; ++i) {
+        IDXGIAdapter1* adapter = nullptr;
+        if (factory->EnumAdapters1(i, &adapter) != S_OK) break;
+        DXGI_ADAPTER_DESC1 desc{};
+        IDXGIAdapter3* budget_adapter = nullptr;
+        if (SUCCEEDED(adapter->GetDesc1(&desc)) && std::memcmp(&desc.AdapterLuid, luid, 8) == 0 &&
+            SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void**) &budget_adapter))) {
+            for (UINT node = 0; node < 32; ++node) {
+                if (!(node_mask & (uint32_t(1) << node))) continue;
+                DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+                if (FAILED(budget_adapter->QueryVideoMemoryInfo(node, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info))) continue;
+                uint64_t budget = info.Budget;
+                if (shared_mapping) {
+                    // Multiple mapping consumers stay within the OS's reservable working-set allowance.
+                    const uint64_t available = std::min<uint64_t>(info.AvailableForReservation, budget);
+                    budget = available + std::min<uint64_t>(info.CurrentReservation, budget - available);
+                }
+                const uint64_t reserve = pin_reserve(budget);
+                const uint64_t free = budget > info.CurrentUsage ? budget - info.CurrentUsage : 0;
+                const uint64_t allowance = free > reserve ? free - reserve : 0;
+                if (!found || allowance < limit) {
+                    limit = allowance;
+                    char buf[224];
+                    constexpr double GiB = 1073741824.0;
+                    std::snprintf(buf, sizeof buf,
+                                  "DXGI non-local budget %.2f GiB, mapping allowance %.2f GiB, used %.2f GiB, reserve %.2f GiB",
+                                  (double) info.Budget / GiB, (double) budget / GiB,
+                                  (double) info.CurrentUsage / GiB, (double) reserve / GiB);
+                    why = buf;
+                }
+                found = true;
+            }
+            budget_adapter->Release();
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    return found;
 }
 
 #else
@@ -731,8 +767,29 @@ void free_region(void* p, uint64_t bytes) {
     munmap(p, bytes);
 }
 
-bool pin_budget(uint64_t&, std::string&) { return false; }   // no OS-side budget below the driver's own limit
+bool pin_budget(uint64_t& limit, std::string& why, const char*, uint32_t, bool) {
+    limit = 0;
+    why.clear();
+    return false;
+}
 #endif
+
+uint64_t system_page_size() {
+#if defined(_WIN32)
+    return (uint64_t) page_bytes();
+#else
+    const long page = sysconf(_SC_PAGESIZE);
+    return page > 0 ? (uint64_t) page : 0;
+#endif
+}
+
+bool register_host_after_fill() {
+#if defined(_WIN32)
+    return true;
+#else
+    return false;   // untouched pages remain eligible for bounded driver registration
+#endif
+}
 
 void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
                    uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {

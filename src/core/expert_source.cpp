@@ -7,6 +7,7 @@
 
 #include "basalt/core/pinned.hpp"
 #include "basalt/platform/file.hpp"
+#include "basalt/platform/direct_file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/platform/system.hpp"
 #include "basalt/kernels/elementwise.hpp"
@@ -23,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <filesystem>
 #include <sstream>
 #include <limits>
@@ -209,6 +211,29 @@ bool home_region_used(const HomeRegion& r, const std::vector<uint64_t>& offsets)
     for (const uint64_t o : offsets)
         if (o != kNoCacheComplement && o >= r.base && o - r.base < r.bytes) return true;
     return false;
+}
+
+std::vector<uint64_t> complement_pin_slices(std::vector<uint64_t> starts, uint64_t end, uint64_t align,
+                                            uint64_t target_bytes) {
+    std::vector<uint64_t> cuts{0};
+    if (end == 0) return cuts;
+    align = std::max<uint64_t>(align, 1);
+    target_bytes = std::max<uint64_t>(target_bytes, 1);
+    std::sort(starts.begin(), starts.end());
+    for (uint64_t start : starts)
+        if (start < end && start % align == 0 && start - cuts.back() >= target_bytes)
+            cuts.push_back(start);
+    cuts.push_back(end);
+    return cuts;
+}
+
+const uint8_t* complement_pin_alias(const std::vector<uint64_t>& starts,
+                                   const std::vector<const uint8_t*>& devices, uint64_t off) {
+    if (starts.size() != devices.size()) return nullptr;
+    const auto next = std::upper_bound(starts.begin(), starts.end(), off);
+    if (next == starts.begin()) return nullptr;
+    const size_t slice = (size_t) (next - starts.begin() - 1);
+    return devices[slice] ? devices[slice] + (size_t) (off - starts[slice]) : nullptr;
 }
 
 }  // namespace detail
@@ -468,6 +493,7 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
     fd_ = platform::open_fd_utf8(path);
     view_ = std::move(*view_map);
     file_off_ = experts.offset;
+    file_path_ = path;
     base_ = view_.data();
     blobs_ = (int64_t) blob_count;
     n_layers_ = n_layers;
@@ -479,10 +505,15 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
 }
 
 void FileExpertSource::close() {
+    advise_worker_.reset();
     if (complement_arena_ != nullptr) {
         if (complement_pinned_ && !complement_partial_) (void) cudaFreeHost(complement_arena_);
         else {
-            if (complement_partial_) (void) cudaHostUnregister(complement_arena_);
+            if (complement_partial_) {
+                if (complement_slice_at_.empty()) (void) cudaHostUnregister(complement_arena_);
+                else for (uint64_t at : complement_slice_at_)
+                    (void) cudaHostUnregister((uint8_t*) complement_arena_ + (size_t) at);
+            }
             if (complement_locked_ > 0)
                 basalt::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
             basalt::platform::free_aligned(complement_arena_);
@@ -531,6 +562,8 @@ void FileExpertSource::close() {
     complement_pinned_ = false;
     complement_partial_ = false;
     complement_pin_limit_ = 0;
+    complement_slice_at_.clear();
+    complement_slice_dev_.clear();
     complement_lock_off_ = 0;
     complement_ready_ = false;
     complement_locked_ = 0;
@@ -543,6 +576,8 @@ void FileExpertSource::close() {
     platform::close_fd(fd_);
     fd_ = -1;
     base_ = nullptr;
+    file_path_.clear();
+    file_detached_ = false;
     blobs_ = 0;
     n_layers_ = 0;
     n_expert_ = 0;
@@ -563,6 +598,22 @@ bool ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
 
 bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const {
     if (dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
+    if (file_detached_) {
+        uint64_t offset = 0, bytes = 0;
+        if (!blob_range(layer, expert, offset, bytes)) return false;
+        const uint64_t pos = file_off_ + offset;
+        constexpr uint64_t align = 4096;
+        const uint64_t first = pos - pos % align;
+        const uint64_t span = ((pos - first + bytes + align - 1) / align) * align;
+        const int direct = platform::open_unbuffered(file_path_);
+        void* stage = direct >= 0 ? platform::DirectFile::alloc_aligned((size_t) span) : nullptr;
+        const int64_t got = stage != nullptr ? platform::pread(direct, stage, (size_t) span, first) : -1;
+        const bool ok = got >= 0 && (uint64_t) got >= pos - first + bytes;
+        if (ok) std::memcpy(dst, (const uint8_t*) stage + (size_t) (pos - first), (size_t) bytes);
+        platform::DirectFile::free_aligned(stage);
+        platform::close_fd(direct);
+        if (ok) return true;
+    }
     const uint8_t* b = mapped_blob(layer, expert);
     if (b == nullptr) return false;
     std::memcpy(dst, b, (size_t) layer_blob_bytes_[(size_t) layer]);
@@ -708,7 +759,7 @@ bool fill_cache_slots(ExpertSource& src, ExpertCache& cache, int device, const s
 }
 
 bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
-    if (base_ == nullptr || !basalt::platform::read_ahead_enabled()) return false;
+    if (file_detached_ || base_ == nullptr || !basalt::platform::read_ahead_enabled()) return false;
     for (int64_t i = 0; pairs != nullptr && i < n; ++i) {
         const int64_t l = pairs[i].first, e = pairs[i].second;
         if (l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) continue;
@@ -727,7 +778,7 @@ uint64_t FileExpertSource::expert_bytes() const {
 }
 
 bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
-    if (base_ == nullptr || dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
+    if (blobs_ == 0 || dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
         return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
@@ -749,29 +800,64 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
 }
 
 bool FileExpertSource::file_extent(int64_t layer, int64_t expert, int& fd, uint64_t& offset) const {
-    const uint8_t* b = mapped_blob(layer, expert);
-    if (b == nullptr || fd_ < 0) return false;
+    uint64_t relative = 0, bytes = 0;
+    if (!blob_range(layer, expert, relative, bytes)) return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     // a blob held in RAM (the complement, or a staged exchange) is not read from the file
     if (complement_ready_ && (complement_offsets_[index] != kNoComplement || (!override_.empty() && override_[index] != nullptr)))
         return false;
+    if (!file_detached_ && fd_ >= 0) {
+        fd = fd_;
+        offset = file_off_ + relative;
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(file_mu_);
+    if (fd_ < 0) fd_ = platform::open_fd_utf8(file_path_);
+    if (fd_ < 0) return false;
     fd = fd_;
-    offset = file_off_ + (uint64_t) (b - base_);
+    offset = file_off_ + relative;
+    return true;
+}
+
+bool FileExpertSource::blob_range(int64_t layer, int64_t expert, uint64_t& offset, uint64_t& bytes) const {
+    if (blobs_ == 0 || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
+    const size_t i = (size_t) layer;
+    if (i >= layer_offsets_.size() || i >= layer_blob_bytes_.size()) return false;
+    const uint64_t blob_bytes = layer_blob_bytes_[i];
+    if (blob_bytes == 0 || (uint64_t) expert > std::numeric_limits<uint64_t>::max() / blob_bytes) return false;
+    const uint64_t expert_offset = (uint64_t) expert * blob_bytes;
+    const uint64_t layer_offset = layer_offsets_[i];
+    if (layer_offset > mapped_bytes_ || expert_offset > mapped_bytes_ - layer_offset) return false;
+    offset = layer_offset + expert_offset;
+    if (blob_bytes > mapped_bytes_ - offset) return false;
+    bytes = blob_bytes;
     return true;
 }
 
 const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) const {
-    if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
-    const size_t i = (size_t) layer;
-    if (i >= layer_offsets_.size() || i >= layer_blob_bytes_.size()) return nullptr;
-    const uint64_t blob_bytes = layer_blob_bytes_[i];
-    if (blob_bytes == 0 || (uint64_t) expert > std::numeric_limits<uint64_t>::max() / blob_bytes) return nullptr;
-    const uint64_t expert_offset = (uint64_t) expert * blob_bytes;
-    const uint64_t layer_offset = layer_offsets_[i];
-    if (layer_offset > mapped_bytes_ || expert_offset > mapped_bytes_ - layer_offset) return nullptr;
-    const uint64_t offset = layer_offset + expert_offset;
-    if (blob_bytes > mapped_bytes_ - offset) return nullptr;
+    uint64_t offset = 0, bytes = 0;
+    if (!blob_range(layer, expert, offset, bytes)) return nullptr;
+    if (!file_detached_) return base_ != nullptr ? base_ + (size_t) offset : nullptr;
+    std::lock_guard<std::mutex> lock(file_mu_);
+    if (base_ == nullptr) {
+        platform::MapOptions options;
+        options.offset = file_off_;
+        options.bytes = mapped_bytes_;
+        options.shared = true;
+        auto view = platform::MappedFile::open_ro(file_path_, nullptr, options);
+        if (!view) return nullptr;
+        view_ = std::move(*view);
+        base_ = view_.data();
+        basalt::log::info("basalt", "expert file view reopened for layer %lld expert %lld", (long long) layer,
+                         (long long) expert);
+    }
     return base_ + (size_t) offset;
+}
+
+void FileExpertSource::release_mapped_cache() const {
+    if (file_detached_ || base_ == nullptr) return;
+    (void) basalt::platform::drop_mapped_view(base_, mapped_bytes_, 0, mapped_bytes_);
+    basalt::platform::advise_dontneed(fd_, file_off_, mapped_bytes_);
 }
 
 bool FileExpertSource::pin_cache_complement(
@@ -944,6 +1030,8 @@ bool FileExpertSource::pin_cache_complement(
     bool pinned_ok = false;
     uint64_t locked = 0;
     uint64_t partial_pin = 0;   ///< a registered prefix of the arena (all of it once registered after the read)
+    std::vector<uint64_t> slice_at;
+    std::vector<const uint8_t*> slice_dev;
     bool register_after = false;   ///< the arena is registered with the driver after it is filled
     uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
     std::string note;
@@ -953,7 +1041,10 @@ bool FileExpertSource::pin_cache_complement(
         if (arena == nullptr) return;
         if (pinned_ok) (void) cudaFreeHost(arena);
         else {
-            if (partial_pin > 0) (void) cudaHostUnregister(arena);
+            if (partial_pin > 0) {
+                if (slice_at.empty()) (void) cudaHostUnregister(arena);
+                else for (uint64_t at : slice_at) (void) cudaHostUnregister((uint8_t*) arena + (size_t) at);
+            }
             if (locked > 0) basalt::platform::unlock_resident((uint8_t*) arena + lock_off, locked);
             basalt::platform::free_aligned(arena);
         }
@@ -962,35 +1053,117 @@ bool FileExpertSource::pin_cache_complement(
     if (bytes > 0) {
         basalt::log::info("basalt", "FileExpertSource: allocating %.2f GiB %s cache complement",
                      (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
-        if (pin) {
-            // Ordinary memory, aligned and padded to 2 MiB (whole large pages, so the registered range ends on a page
-            // boundary), registered with the driver once it is filled: the reads fault the pages in while the drive
-            // works, instead of the driver zeroing and locking all of it before the first read.
-            const size_t padded = ((size_t) bytes + kArenaAlign - 1) / kArenaAlign * kArenaAlign;
-            arena = basalt::platform::alloc_aligned(padded, kArenaAlign);
-            if (arena != nullptr) {
-                register_after = true;
-            } else {
-                note = "no aligned memory for registration";
-            }
-        }
-        if (arena == nullptr) {
-            arena = basalt::platform::alloc_aligned((size_t) bytes, kArenaAlign);
-            if (arena == nullptr) {
-                err = "FileExpertSource: pageable resident complement allocation failed";
-                return false;
-            }
+        if (basalt::platform::register_host_after_fill()) {
             if (pin) {
-                // CS-T, a RAM budget: its bytes are in profile order, hottest first, so the driver is asked to
-                // register the largest prefix it takes (from the cap down in 2 GiB steps).  Those experts can be
-                // read by the GPU over PCIe (the PCIe share) and copied by DMA; only the rest is locked in the working
-                // set (the registered prefix is page-locked by the driver already - locking it twice made the next
-                // device allocation fail).
-                lock_off = partial_pin;
-                const basalt::platform::LockResult lr =
-                    basalt::platform::lock_resident((uint8_t*) arena + lock_off, bytes - lock_off);
-                locked = lr.locked_bytes;
-                note += (note.empty() ? "" : "; ") + lr.note;
+                // Ordinary memory, aligned and padded to 2 MiB (whole large pages, so the registered range ends on a page
+                // boundary), registered with the driver once it is filled: the reads fault the pages in while the drive
+                // works, instead of the driver zeroing and locking all of it before the first read.
+                const size_t padded = ((size_t) bytes + kArenaAlign - 1) / kArenaAlign * kArenaAlign;
+                arena = basalt::platform::alloc_aligned(padded, kArenaAlign);
+                if (arena != nullptr) {
+                    register_after = true;
+                } else {
+                    note = "no aligned memory for registration";
+                }
+            }
+            if (arena == nullptr) {
+                arena = basalt::platform::alloc_aligned((size_t) bytes, kArenaAlign);
+                if (arena == nullptr) {
+                    err = "FileExpertSource: pageable resident complement allocation failed";
+                    return false;
+                }
+                if (pin) {
+                    // CS-T, a RAM budget: its bytes are in profile order, hottest first, so the driver is asked to
+                    // register the largest prefix it takes (from the cap down in 2 GiB steps).  Those experts can be
+                    // read by the GPU over PCIe (the PCIe share) and copied by DMA; only the rest is locked in the working
+                    // set (the registered prefix is page-locked by the driver already - locking it twice made the next
+                    // device allocation fail).
+                    lock_off = partial_pin;
+                    const basalt::platform::LockResult lr =
+                        basalt::platform::lock_resident((uint8_t*) arena + lock_off, bytes - lock_off);
+                    locked = lr.locked_bytes;
+                    note += (note.empty() ? "" : "; ") + lr.note;
+                }
+            }
+        } else {
+            if (pin) {
+                const cudaError_t allocated = cudaHostAlloc(&arena, (size_t) bytes,
+                                                             cudaHostAllocMapped | cudaHostAllocPortable);
+                if (allocated == cudaSuccess) {
+                    void* alias = nullptr;
+                    const cudaError_t aliased = cudaHostGetDevicePointer(&alias, arena, 0);
+                    if (aliased == cudaSuccess && alias != nullptr) {
+                        device = (const uint8_t*) alias;
+                        pinned_ok = true;
+                        note = "page-locked and mapped";
+                    } else {
+                        note = std::string("no device alias (") + cudaGetErrorString(aliased) + ")";
+                        (void) cudaGetLastError();
+                        (void) cudaFreeHost(arena);
+                        arena = nullptr;
+                    }
+                } else {
+                    // Ordinary allocation may still admit registration when pinned allocation is refused.
+                    note = std::string("page-locking refused (") + cudaGetErrorString(allocated) + ")";
+                    (void) cudaGetLastError();
+                    arena = nullptr;
+                }
+            }
+            if (arena == nullptr) {
+                const uint64_t host_page = basalt::platform::system_page_size();
+                arena = host_page > 0 ? basalt::platform::alloc_aligned((size_t) bytes, kArenaAlign) : nullptr;
+                if (arena == nullptr) {
+                    err = "FileExpertSource: pageable resident complement allocation failed";
+                    return false;
+                }
+                if (pin) {
+                    // Register before touching pages; a refused whole range may still admit a smaller prefix.
+                    constexpr uint64_t step = 2ull << 30;
+                    std::vector<uint64_t> boundaries;
+                    for (size_t i = 0; i < offsets.size(); ++i) {
+                        if (offsets[i] == kNoComplement) continue;
+                        const uint64_t end = offsets[i] + layer_blob_bytes_[i / (size_t) n_expert_];
+                        if (end % (uint64_t) host_page == 0) boundaries.push_back(end);
+                    }
+                    uint64_t spare_end = spare_at;
+                    for (const auto& [blob, count] : spare_sizes)
+                        for (int64_t i = 0; i < count; ++i) {
+                            spare_end += blob;
+                            if (spare_end % (uint64_t) host_page == 0) boundaries.push_back(spare_end);
+                        }
+                    std::sort(boundaries.begin(), boundaries.end());
+                    for (uint64_t target = bytes; target > 0;) {
+                        // A transfer must not straddle registered and pageable memory, even at a page boundary.
+                        const auto boundary = std::upper_bound(boundaries.begin(), boundaries.end(), target);
+                        const uint64_t attempt = target == bytes ? bytes :
+                            (boundary == boundaries.begin() ? 0 : *std::prev(boundary));
+                        if (attempt == 0) break;
+                        const cudaError_t registered = cudaHostRegister(arena, (size_t) attempt,
+                            cudaHostRegisterMapped | cudaHostRegisterPortable);
+                        if (registered == cudaSuccess) {
+                            void* alias = nullptr;
+                            const cudaError_t aliased = cudaHostGetDevicePointer(&alias, arena, 0);
+                            if (aliased == cudaSuccess && alias != nullptr) {
+                                partial_pin = attempt;
+                                device = (const uint8_t*) alias;
+                                char result[128];
+                                std::snprintf(result, sizeof result, "; cudaHostRegister mapped %.2f GiB",
+                                              (double) partial_pin / 1073741824.0);
+                                note += result;
+                                break;
+                            }
+                            (void) cudaHostUnregister(arena);
+                        }
+                        (void) cudaGetLastError();
+                        if (target <= step) break;
+                        target = ((target - 1) / step) * step;
+                    }
+                    lock_off = partial_pin;
+                    const basalt::platform::LockResult lr =
+                        basalt::platform::lock_resident((uint8_t*) arena + lock_off, bytes - lock_off);
+                    locked = lr.locked_bytes;
+                    note += (note.empty() ? "" : "; ") + lr.note;
+                }
             }
         }
         host = (const uint8_t*) arena;
@@ -1139,20 +1312,66 @@ bool FileExpertSource::pin_cache_complement(
     if (direct_fd >= 0) basalt::platform::close_fd(direct_fd);
     const double read_done_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count();
     if (register_after && !failed.load()) {
-        constexpr size_t kHuge = 2ull << 20;
-        const size_t padded = ((size_t) bytes + kHuge - 1) / kHuge * kHuge;
-        const cudaError_t reg = cudaHostRegister(arena, padded, cudaHostRegisterMapped | cudaHostRegisterPortable);
-        void* alias = nullptr;
-        if (reg == cudaSuccess && cudaHostGetDevicePointer(&alias, arena, 0) == cudaSuccess && alias != nullptr) {
-            device = (const uint8_t*) alias;
-            partial_pin = bytes;   // released through the registered-prefix path
-            lock_off = bytes;
-            note = "page-locked and mapped";
-        } else {
-            if (reg == cudaSuccess) (void) cudaHostUnregister(arena);
-            note = std::string("page-locking refused (") + cudaGetErrorString(reg) + ")";
-            (void) cudaGetLastError();
-            const basalt::platform::LockResult lr = basalt::platform::lock_resident(arena, bytes);
+        // A DMA copy cannot straddle registered and pageable bytes, so prefixes end at whole experts and OS pages.
+        const uint64_t page = basalt::platform::system_page_size();
+        std::vector<uint64_t> boundaries, starts;
+        for (size_t i = 0; i < offsets.size(); ++i) {
+            if (offsets[i] == kNoComplement) continue;
+            starts.push_back(offsets[i]);
+            const uint64_t end = offsets[i] + layer_blob_bytes_[i / (size_t) n_expert_];
+            if (end % page == 0) boundaries.push_back(end);
+        }
+        uint64_t spare_end = spare_at;
+        for (const auto& [blob, count] : spare_sizes)
+            for (int64_t i = 0; i < count; ++i) {
+                starts.push_back(spare_end);
+                spare_end += blob;
+                if (spare_end % page == 0) boundaries.push_back(spare_end);
+            }
+        std::sort(boundaries.begin(), boundaries.end());
+        const size_t padded = ((size_t) bytes + kArenaAlign - 1) / kArenaAlign * kArenaAlign;
+        uint64_t limit = padded;
+        uint64_t allowance = 0;
+        std::string why;
+        if (host_pin_budget(allowance, why)) limit = std::min(allowance, (uint64_t) padded);
+        const auto last_boundary = std::upper_bound(boundaries.begin(), boundaries.end(), limit);
+        const uint64_t end = limit >= padded ? padded :
+            (last_boundary == boundaries.begin() ? 0 : *std::prev(last_boundary));
+        const auto cuts = detail::complement_pin_slices(std::move(starts), end, page, 1ull << 30);
+        cudaError_t last = cudaSuccess;
+        for (size_t slice = 0; slice + 1 < cuts.size(); ++slice) {
+            uint8_t* at = (uint8_t*) arena + (size_t) cuts[slice];
+            last = cudaHostRegister(at, (size_t) (cuts[slice + 1] - cuts[slice]),
+                                   cudaHostRegisterMapped | cudaHostRegisterPortable);
+            if (last != cudaSuccess) { (void) cudaGetLastError(); break; }
+            void* alias = nullptr;
+            last = cudaHostGetDevicePointer(&alias, at, 0);
+            if (last != cudaSuccess || alias == nullptr) {
+                if (last == cudaSuccess) last = cudaErrorInvalidValue;
+                (void) cudaGetLastError();
+                (void) cudaHostUnregister(at);
+                (void) cudaGetLastError();
+                break;
+            }
+            slice_at.push_back(cuts[slice]);
+            slice_dev.push_back((const uint8_t*) alias);
+            partial_pin = std::min<uint64_t>(cuts[slice + 1], bytes);
+            device = slice_dev.front();
+        }
+        if (partial_pin > 0) {
+            char result[192];
+            std::snprintf(result, sizeof result, "cudaHostRegister mapped %.2f GiB in %zu slices",
+                          (double) partial_pin / 1073741824.0, slice_at.size());
+            note = result;
+            if (last != cudaSuccess) note += std::string("; next slice refused (") + cudaGetErrorString(last) + ")";
+        } else
+            note = last == cudaSuccess ? "no CUDA registration within the host-memory budget" :
+                std::string("page-locking refused (") + cudaGetErrorString(last) + ")";
+        if (!why.empty()) note += "; registration capped by " + why;
+        lock_off = partial_pin;
+        if (bytes > lock_off) {
+            const basalt::platform::LockResult lr =
+                basalt::platform::lock_resident((uint8_t*) arena + lock_off, bytes - lock_off);
             locked = lr.locked_bytes;
             note += "; " + lr.note;
         }
@@ -1174,6 +1393,8 @@ bool FileExpertSource::pin_cache_complement(
     complement_arena_ = arena;
     complement_host_ = host;
     complement_device_ = device;
+    complement_slice_at_ = std::move(slice_at);
+    complement_slice_dev_ = std::move(slice_dev);
     complement_bytes_ = bytes;
     complement_offsets_ = std::move(offsets);
     ++places_gen_;
@@ -1623,7 +1844,7 @@ int64_t FileExpertSource::commit_exchanges() {
 }
 
 const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
-    if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
+    if (blobs_ == 0 || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     const uint8_t* result = nullptr;
     bool from_files = true;
@@ -1687,9 +1908,24 @@ struct FileExpertSource::AdviseWorker {
     std::thread th;
 };
 
+bool FileExpertSource::detach_file_mapping() {
+    if (!complement_ready_) return false;
+    std::lock_guard<std::mutex> advice_lock(advise_mu_);
+    advise_worker_.reset();
+    std::lock_guard<std::mutex> lock(file_mu_);
+    platform::ram_guard_reclaim_view(nullptr, 0);
+    view_.reset();
+    base_ = nullptr;
+    platform::close_fd(fd_);
+    fd_ = -1;
+    file_detached_ = true;
+    return true;
+}
+
 void FileExpertSource::advise_cpu(int64_t layer, const int32_t* ids, int64_t n) const {
-    if (base_ == nullptr || ids == nullptr || n <= 0 || !basalt::platform::read_ahead_enabled()) return;
-    std::call_once(advise_once_, [this] { advise_worker_.reset(new AdviseWorker(this)); });
+    std::lock_guard<std::mutex> lock(advise_mu_);
+    if (file_detached_ || base_ == nullptr || ids == nullptr || n <= 0 || !basalt::platform::read_ahead_enabled()) return;
+    if (!advise_worker_) advise_worker_.reset(new AdviseWorker(this));
     AdviseWorker& w = *advise_worker_;
     {
         std::lock_guard<std::mutex> g(w.mu);
@@ -1723,7 +1959,9 @@ const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) con
         const int r = detail::home_region_find(homes_, off, layer_blob_bytes_[(size_t) layer]);
         return r >= 0 ? homes_[(size_t) r].device + (size_t) (off - homes_[(size_t) r].base) : nullptr;
     }
-    return off >= complement_bytes_ ? top_device_ + (size_t) (off - complement_bytes_) : complement_device_ + (size_t) off;
+    if (off >= complement_bytes_) return top_device_ + (size_t) (off - complement_bytes_);
+    return complement_slice_at_.empty() ? complement_device_ + (size_t) off :
+        detail::complement_pin_alias(complement_slice_at_, complement_slice_dev_, off);
 }
 
 bool FileExpertSource::pcie_layer(int64_t layer) const {

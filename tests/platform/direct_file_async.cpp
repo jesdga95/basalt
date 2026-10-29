@@ -1,4 +1,5 @@
 #include "basalt/platform/direct_file.hpp"
+#include "basalt/platform/file.hpp"
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -75,6 +76,52 @@ struct Fixture {
     /// a write that belongs to no completion cannot be mistaken for the data a real read must have left.
     char* at(size_t i) const { return static_cast<char*>(memory) + i * DirectFile::alignment(); }
 };
+
+/// The same descriptor serves concurrent positional reads without mixing offsets, including a short final sector.
+static void test_unbuffered_descriptor() {
+    namespace fp = basalt::platform;
+    const size_t page = 4096, pages = 64;
+    Fixture fx((unsigned) pages, 'x');
+    std::string expected(page * pages + 17, 'z');
+    for (size_t i = 0; i < pages; ++i)
+        std::memset(expected.data() + i * page, (int) (i + 1), page);
+    {
+        std::ofstream f(fx.name, std::ios::binary | std::ios::trunc);
+        f.write(expected.data(), (std::streamsize) expected.size());
+        check((bool) f, "write positional fixture");
+    }
+    for (bool by_path : {false, true}) {
+        const int cached = fp::open_fd_utf8(fx.name);
+        check(cached >= 0, "open cached descriptor");
+        const int fd = by_path ? fp::open_unbuffered(fx.name) : fp::open_unbuffered(cached);
+        fp::close_fd(cached);
+        check(fd >= 0, "open unbuffered descriptor");
+        struct Close { int fd; ~Close() { fp::close_fd(fd); } } close{fd};
+        std::atomic<bool> correct{true};
+        std::vector<std::thread> readers;
+        for (size_t w = 0; w < 8; ++w) readers.emplace_back([&, w] {
+            for (int rep = 0; rep < 20; ++rep)
+                for (size_t i = w; i < pages; i += 8) {
+                    char* dst = fx.at(i);
+                    if (fp::pread(fd, dst, page, i * page) != (int64_t) page ||
+                        std::memcmp(dst, expected.data() + i * page, page) != 0) correct.store(false);
+                }
+        });
+        for (auto& r : readers) r.join();
+        check(correct.load(), "concurrent positional read bytes differ");
+        check(fp::pread(fd, fx.at(pages), page, pages * page) == 17, "short final sector");
+        check(std::memcmp(fx.at(pages), expected.data() + pages * page, 17) == 0, "short sector data");
+        check(fp::pread(fd, fx.at(pages + 1), page, (pages + 1) * page) == 0, "read beyond EOF");
+        check(fp::pread(fd, fx.memory, page, 1) == -1, "unaligned direct offset accepted");
+        check(fp::pread(fd, fx.memory, 1, 0) == -1, "unaligned direct size accepted");
+    }
+    const int cached = fp::open_fd_utf8(fx.name);
+    check(cached >= 0, "reopen cached descriptor");
+    char byte = 0;
+    const int64_t got = fp::pread(cached, &byte, 1, page + 1);
+    fp::close_fd(cached);
+    check(got == 1 && byte == expected[page + 1], "reused descriptor kept direct mode");
+}
 
 /// `close` must not return while a read can still write: a caller that abandons a prefill releases its buffers as
 /// soon as close returns. No read here is ever waited on, so all of them are still queued or in flight when close
@@ -218,6 +265,7 @@ int main() {
         check(f.wait(&c, 1, 5000) == 1 && c.ok && c.tag == 100, "reopened read failed");
         f.close();
 #if defined(_WIN32)
+        test_unbuffered_descriptor();
         test_close_with_reads_in_flight();
         const unsigned maxes[] = {1u, 2u, 3u, 7u, 17u};   // one slot and a batch across the boundary
         for (unsigned max : maxes) test_wait_bounds_and_wakes(max);

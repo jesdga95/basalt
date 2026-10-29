@@ -30,6 +30,10 @@ Test setup: one RTX 5090 at a 400 W power limit, an RTX 5060 Ti as the peer expe
 
 ## Decode path precision
 
+Host registration preserves expert bytes and kernel arithmetic. More registered experts can use the existing
+PCIe GPU path instead of CPU execution; these paths round differently. Transport identity checks hold the
+expert tiers and PCIe routing fixed.
+
 Sources are `file:line` under `src/`, `include/basalt/` and `tools/convert/`. Model geometry: n_embd 2560, 4
 hyper-connection streams, 48 layers (36 GDN, 12 QSA), 512 experts, top-10, head_dim 256.
 

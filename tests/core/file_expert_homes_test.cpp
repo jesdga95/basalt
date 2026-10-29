@@ -66,6 +66,7 @@ int run() {
 
     FileExpertSource src;
     require(src.open(FileRange((dir.path / "experts.bin").string()), layers, experts, err), err);
+    require(!src.detach_file_mapping() && src.mapped(), "a source without a resident copy keeps its view");
     ExpertCache cache;
     require(cache.open_sized(std::vector<int64_t>((size_t) (layers * held), (int64_t) blob), layers, experts, err), err);
     for (int64_t l = 0; l < layers; ++l)
@@ -74,6 +75,18 @@ int run() {
             require(slot >= 0 && cache.fill_slot_blocking(slot, src.blob(l, e), err, (int64_t) blob), "cache fill " + err);
         }
     require(src.pin_cache_complement(cache, err, false, {}, -1, 0), err);
+    require(src.detach_file_mapping() && !src.mapped(), "resident source releases its file view");
+    const uint8_t* resident = src.blob(0, 60);
+    require(resident && src.equals_file(0, 60, resident) && !src.mapped(),
+            "resident reads and direct comparisons keep the file unmapped");
+    require(src.equals_file(layers - 1, experts - 1, src.blob(layers - 1, experts - 1)) && !src.mapped(),
+            "the last expert's direct comparison handles the file tail without a view");
+    std::vector<uint8_t> direct((size_t) blob);
+    require(src.copy_blob(0, 0, direct.data()) && !src.mapped(), "a copy miss uses direct I/O without a view");
+    const uint8_t* fallback = src.blob(0, 0);
+    require(fallback && src.mapped() && std::equal(direct.begin(), direct.end(), fallback),
+            "pointer fallback restores a stable file view with the same bytes");
+    require(src.detach_file_mapping() && !src.mapped(), "restored view can be detached again");
     require(src.reserve_exchanges(4, err), err);
 
     // an adaptive swap lands: from here the exchange table stays allocated (the case a plain emptiness guard misses)
@@ -137,6 +150,14 @@ int run() {
     require(src.homes_take({{0, 2}}, err, none), "take after the reserve is lifted: " + err);
     src.homes_abort();
     require(src.homes_bytes() == before && !src.has_resident(0, 2), "an aborted take left a region or a place");
+    const int32_t first = 0;
+    for (int i = 0; i < 2; ++i) {
+        src.close();
+        require(src.open(FileRange((dir.path / "experts.bin").string()), layers, experts, err), err);
+        src.advise_cpu(0, &first, 1);
+    }
+    src.close();
+    require(!src.mapped(), "reopening and closing a source joins its read-ahead worker");
     return 0;
 }
 

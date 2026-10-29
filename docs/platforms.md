@@ -39,9 +39,10 @@ process code page UTF-8 and lifts the path length limit.
 ## Windows limitations
 
 - One GPU. With `gpu` listing more cards, the ones after the main card stay idle and a start-up warning says so.
-- Pinned memory is capped by the driver under WDDM. When the whole arena cannot be registered,
-  the pinned slices are limited to the GPU's shared-memory budget (`RAM/2 - 8 GiB`), and the
-  start-up note says what was capped.
+- Pinned memory is capped by the driver under WDDM. Registration uses the visible adapters'
+  DXGI non-local headroom with a reserve for later allocations. The resident complement is
+  registered in page-aligned whole-expert slices; a driver refusal stops registration, and
+  the unregistered tail stays locked in the working set. Startup reports the registered bytes.
 - Large pages need the "Lock pages in memory" privilege, which is granted to Administrators by
   default; locking the resident expert copy needs "Increase a process working set", which is
   granted to Users, so it works without elevation. The engine enables whichever its token holds.

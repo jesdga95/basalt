@@ -180,7 +180,7 @@ target_include_directories(platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # dlopen (DynLib) lives in libdl before glibc 2.34
 target_link_libraries(platform PUBLIC warnings ${CMAKE_DL_LIBS})
 if(WIN32)
-  target_link_libraries(platform PUBLIC advapi32)   # the processor name in the registry
+  target_link_libraries(platform PUBLIC advapi32 dxgi)
 endif()
 
 # ---- core (GPU runtime) ---------------------------------------------
@@ -324,6 +324,11 @@ if(BUILD_TESTING)
   basalt_embed_manifest(direct_upload_test)
   basalt_gpu_test(NAME direct_upload_test COMMAND direct_upload_test)
   set_tests_properties(direct_upload_test PROPERTIES TIMEOUT 60)
+  add_executable(pinned_arena_test tests/core/pinned_arena_test.cpp)
+  target_link_libraries(pinned_arena_test PRIVATE core)
+  basalt_embed_manifest(pinned_arena_test)
+  basalt_gpu_test(NAME pinned_arena_test COMMAND pinned_arena_test)
+  set_tests_properties(pinned_arena_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 endif()
 # the learned expert profile (--expert-profile-save): its order and file format (CPU only)
 if(BUILD_TESTING)

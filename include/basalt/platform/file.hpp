@@ -65,7 +65,7 @@ std::string temp_dir();
 /// duration of it: a handle opened without overlapped I/O serializes the reads issued through it, so threads sharing
 /// one descriptor would take turns, and a handle the call kept would keep the file open after its descriptor was
 /// closed. When the file cannot be reopened the shared descriptor is used, which still reads correctly, only in
-/// turn.
+/// turn. Unbuffered descriptors instead share an overlapped handle, with an event and absolute offset per read.
 /// A descriptor this process has already closed is not a value to hand here: finding a descriptor's handle is what
 /// Windows does first, and the CRT stops the process for a number it knows is closed. `fd` < 0 says -1 instead.
 /// `dst` has to hold everything `n` asks for: on Windows that is up to the 1 GiB the cap gives, so a caller asking

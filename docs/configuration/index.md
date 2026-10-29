@@ -153,6 +153,9 @@ The model's experts live in VRAM (the expert cache), in RAM, or in the file. The
 
 ### The adaptive tier
 
+When every expert has a RAM or GPU copy, serving releases its expert file view after loading. PLE keeps its
+embedded table; copy fallbacks use a bounded direct-read buffer, and pointer fallbacks restore the view.
+
 The engine counts how often each expert is routed to. Every few decode windows it runs a round: in each layer it swaps
 the most-used experts that are not in VRAM in for the least-used resident ones, when the gain is clear. On one card
 without a peer tier the round ranks every layer together, so a layer that routes to more experts takes slots from the

@@ -476,9 +476,38 @@ void test_host_memory_namespaced() {
 
 }  // namespace
 
+void test_complement_registration_slices() {
+    using basalt::core::detail::complement_pin_slices;
+    using basalt::core::detail::complement_pin_alias;
+    require(complement_pin_slices({}, 0, 16, 32) == std::vector<uint64_t>{0}, "empty registration has a slice");
+    require(complement_pin_slices({0, 16, 32}, 8, 16, 32) == std::vector<uint64_t>({0, 8}),
+            "small registration lost its tail");
+    require(complement_pin_slices({80, 0, 48, 16, 32, 64, 32}, 80, 16, 32) ==
+                std::vector<uint64_t>({0, 32, 64, 80}), "registration cuts are not aligned whole-place starts");
+    require(complement_pin_slices({0, 12, 24, 36, 48, 60, 72}, 72, 16, 32) ==
+                std::vector<uint64_t>({0, 48, 72}), "a registration split a place");
+    require(complement_pin_slices({0, 16, 32, 48, 64, 80}, 48, 16, 32) ==
+                std::vector<uint64_t>({0, 32, 48}), "registration extends beyond its budget end");
+    uint8_t first[32]{}, second[32]{};
+    const std::vector<uint64_t> starts{0, 32};
+    const std::vector<const uint8_t*> devices{first, second};
+    require(complement_pin_alias(starts, devices, 31) == first + 31, "first slice alias shifted");
+    require(complement_pin_alias(starts, devices, 32) == second, "second slice reused the first device base");
+    require(complement_pin_alias(starts, devices, 40) == second + 8, "second slice offset shifted");
+    require(complement_pin_alias({}, {}, 0) == nullptr, "empty registration has an alias");
+    require(complement_pin_alias(starts, {first}, 40) == nullptr, "malformed registration has an alias");
+    std::vector<uint64_t> native_starts;
+    constexpr uint64_t native_blob = 2764816;
+    for (uint64_t i = 0; i < 1024; ++i) native_starts.push_back(i * native_blob);
+    const auto native = complement_pin_slices(native_starts, 1024 * native_blob, 4096, 1ull << 30);
+    require(native.size() == 3 && native[1] == 512 * native_blob,
+            "expert trailer alignment prevented page-aligned registration cuts");
+}
+
 int main() {
     try {
         test_home_regions();
+        test_complement_registration_slices();
         test_complement_plan();
         test_resident_lend_region();
         test_resident_exchange();

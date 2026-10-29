@@ -4140,6 +4140,7 @@ int main(int argc, char** argv) {
     // share-of-pinned figure above (which sizes the prompt path) is left as the mmap mode's for the same reason.
     uint64_t ram_floor_bytes = basalt::platform::ram_margin();   // the RAM the copy leaves free; the serve guard's floor
     if (o.resident_cpu_experts) {
+        src.release_mapped_cache();
         // the RAM copy is sized from the available RAM: without a reading the experts would silently stay in the file
         if (basalt::core::detail::HostMemory hm; !basalt::core::detail::host_available_memory(hm))
             return fatal_start_error(
@@ -6298,6 +6299,8 @@ int main(int argc, char** argv) {
             return 1;
         }
         ple_table.rearm_keepalive();   // a long load must not lapse the SSD keep-alive window before the first request
+        if (srcp == &src && src.complement_ready() && tier_file_bytes == 0 && src.detach_file_mapping())
+            basalt::log::info("basalt generate", "expert file view closed; all live experts have RAM or GPU copies");
         std::printf("INFO file_experts_bytes=%llu\n", (unsigned long long) tier_file_bytes);   // experts only the file holds
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);

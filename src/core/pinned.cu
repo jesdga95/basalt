@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstdio>
@@ -17,6 +18,41 @@
 #include "basalt/log.hpp"
 
 namespace basalt::core {
+
+bool host_pin_budget(uint64_t& limit, std::string& why) {
+    limit = 0;
+    why.clear();
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+    std::vector<cudaDeviceProp> props((size_t) count);
+    for (int d = 0; d < count; ++d) {
+        if (cudaGetDeviceProperties(&props[(size_t) d], d) != cudaSuccess) { (void) cudaGetLastError(); continue; }
+        uint64_t unused = 0;
+        std::string note;
+        const auto& prop = props[(size_t) d];
+        if (!platform::pin_budget(unused, note, prop.luid, prop.luidDeviceNodeMask)) continue;
+        // Create mapping consumers before registering portable pages, without changing the caller's device.
+        const cudaError_t initialized = cudaInitDevice(d, 0, 0);
+        if (initialized != cudaSuccess) {
+            why = "CUDA" + std::to_string(d) + " context initialization refused: " + cudaGetErrorString(initialized);
+            (void) cudaGetLastError();
+            return true;
+        }
+    }
+    bool known = false;
+    for (int d = 0; d < count; ++d) {
+        const auto& prop = props[(size_t) d];
+        uint64_t allowance = 0;
+        std::string note;
+        if (!platform::pin_budget(allowance, note, prop.luid, prop.luidDeviceNodeMask, count > 1)) continue;
+        if (!known || allowance < limit) {
+            limit = allowance;
+            why = "CUDA" + std::to_string(d) + " " + note;
+        }
+        known = true;
+    }
+    return known;
+}
 
 uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed) {
     uint64_t h = seed;
@@ -29,11 +65,7 @@ uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed) {
 
 namespace {
 bool clear_error() { (void) cudaGetLastError(); return true; }
-}  // namespace
 
-
-
-namespace {
 std::vector<uint64_t> uniform_bounds(uint64_t bytes, uint64_t slice) {
     std::vector<uint64_t> b;
     if (slice == 0) return b;
@@ -61,8 +93,15 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
     // that has already been faulted in page by page is far more expensive to register and may fail outright.
     if (base) {
         uint64_t cap = max_pinned_bytes;
-        const std::string cap_why = "by the engine (remote experts)";
-        const bool capped = cap > 0 && cap < bytes && bounds.size() >= 2;
+        std::string cap_why = "the engine registration cap";
+        bool capped = cap > 0 && cap < bytes;
+        uint64_t allowance = 0;
+        std::string budget_note;
+        if (host_pin_budget(allowance, budget_note) && allowance < bytes && (!capped || allowance < cap)) {
+            cap = allowance;
+            cap_why = std::move(budget_note);
+            capped = true;
+        }
         const cudaError_t e = capped ? cudaSuccess :
             cudaHostRegister(base, (size_t) bytes, cudaHostRegisterPortable | cudaHostRegisterMapped);
         if (!capped && e == cudaSuccess) {
@@ -72,24 +111,16 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             // the whole range is refused, so pin it slice by slice from the start.  The rest stays resident through the
             // working-set lock below.  (Slices may differ in size, one per layer.)
             slice_bytes = 1;   // sliced; the uniform constructor records the size
-            bool limited = capped;
-            uint64_t limit = cap;
-            std::string limit_why;
-            // Stop below the shared-memory budget rather than at the driver's refusal, and only when the budget is
-            // actually smaller than the arena: an arena the segment can hold is pinned whole, as before.
-            if (!capped) {
-                uint64_t seg = 0;
-                std::string seg_why;
-                if (basalt::platform::pin_budget(seg, seg_why) && seg < bytes) {
-                    limited = true;
-                    limit = seg;
-                    limit_why = std::move(seg_why);
-                }
-            }
+            const bool limited = capped;
+            const uint64_t limit = capped ? cap : bytes;
+            std::string refusal;
             for (size_t i = 0; i + 1 < bounds.size(); ++i) {
                 const uint64_t off = bounds[i], n = bounds[i + 1] - bounds[i];
                 if (limited && (off > limit || n > limit - off)) break;
-                if (cudaHostRegister((uint8_t*) base + off, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+                const cudaError_t registered = cudaHostRegister((uint8_t*) base + off, (size_t) n,
+                                                               cudaHostRegisterPortable | cudaHostRegisterMapped);
+                if (registered != cudaSuccess) {
+                    refusal = "; slice registration refused: " + std::string(cudaGetErrorString(registered));
                     (void) cudaGetLastError();
                     break;
                 }
@@ -99,12 +130,10 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             }
             char gib[32];
             std::snprintf(gib, sizeof gib, "%.1f", (double) limit / (double) (1ull << 30));
-            note = (capped ? "cudaHostRegister limited to " + std::to_string(cap >> 30) + " GiB " + cap_why + "; " :
-                             "cudaHostRegister of the whole arena FAILED (" + std::string(cudaGetErrorString(e)) + "); " +
-                             (limited ? "slices capped at " + std::string(gib) + " GiB (" + limit_why +
-                                        "); " : std::string())) +
+            note = (capped ? "cudaHostRegister slices capped at " + std::string(gib) + " GiB (" + cap_why + "); " :
+                             "cudaHostRegister of the whole arena FAILED (" + std::string(cudaGetErrorString(e)) + "); ") +
                    std::to_string(registered_slices) + " slices pinned (" + std::to_string(registered_bytes >> 30) +
-                   " GiB); " + note;
+                   " GiB)" + refusal + "; " + note;
             if (registered_bytes < bytes) {
                 const basalt::platform::LockResult lr =
                     basalt::platform::lock_resident((uint8_t*) base + registered_bytes, bytes - registered_bytes);
@@ -112,8 +141,9 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                 note = lr.note + "; " + note;
             }
         } else {
-            note = std::string("cudaHostRegister FAILED (") + cudaGetErrorString(e) +
-                   ") - the arena is NOT pinned, so copies will be slow; " + note;
+            note = (capped ? "no CUDA registration within " + cap_why :
+                            std::string("cudaHostRegister FAILED (") + cudaGetErrorString(e) + ")") +
+                   " - the arena is NOT pinned, so copies will be slow; " + note;
             // **CONSUME THE ERROR, OR IT LIES ABOUT SOMETHING ELSE LATER.**
             //
             // `cudaGetLastError()` returns the last error and CLEARS it; until something reads it, the error
@@ -139,7 +169,7 @@ PinnedArena::~PinnedArena() {
         if (locked_bytes) basalt::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
         if (slice_bytes) {
             for (uint64_t off : slice_starts) cudaHostUnregister((uint8_t*) base + off);
-        } else {
+        } else if (registered_bytes) {
             cudaHostUnregister(base);
         }
         basalt::platform::free_region(mapping_base ? mapping_base : base, mapping_bytes ? mapping_bytes : capacity);

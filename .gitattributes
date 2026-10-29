@@ -2,3 +2,5 @@
 tests/data/native_experts/** -text
 # the table is checked byte for byte (tools/check_benchmarks.py), so it stays LF on every checkout
 docs/community/benchmarks.json text eol=lf
+# Shell checks read this allowlist as line-delimited paths.
+tools/stderr_logging.allow text eol=lf

@@ -13,6 +13,8 @@
 #include <direct.h>   // _wchdir, _wfullpath
 #include <fcntl.h>    // _O_RDONLY, _O_BINARY
 #include <io.h>       // _wopen, _waccess, _close, _fileno, _get_osfhandle
+#include <mutex>
+#include <unordered_set>
 #else
 #include <fcntl.h>    // O_RDONLY, posix_fadvise
 #include <sys/stat.h>  // ::stat
@@ -37,6 +39,19 @@ std::wstring to_wide(const std::string& utf8) {
 }
 
 namespace {
+std::mutex direct_mu;
+std::unordered_set<int> direct_fds;
+
+/// The CRT owns the handle once it has a descriptor. Reads on these handles each use their own event and offset.
+int direct_descriptor(HANDLE h) {
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(h), _O_RDONLY | _O_BINARY);
+    if (fd < 0) { CloseHandle(h); return -1; }
+    std::lock_guard<std::mutex> lock(direct_mu);
+    direct_fds.insert(fd);
+    return fd;
+}
+
 /// The way back, for a path the OS names (its own module path, a resolved path, the temp directory). An empty
 /// result means the name could not be read or is not representable.
 std::string to_utf8(const wchar_t* w) {
@@ -74,7 +89,12 @@ int open_fd_utf8(const std::string& path) {
 }
 
 void close_fd(int fd) {
-    if (fd >= 0) _close(fd);
+    if (fd < 0) return;
+    {
+        std::lock_guard<std::mutex> lock(direct_mu);
+        direct_fds.erase(fd);
+    }
+    _close(fd);
 }
 
 bool absolute_path(const std::string& path, std::string& out) {
@@ -118,31 +138,40 @@ std::string temp_dir() {
 
 int64_t pread(int fd, void* dst, size_t n, uint64_t off) {
     if (fd < 0) return -1;   // asking the CRT for a negative descriptor's handle stops the process here
+    bool direct = false;
+    {
+        std::lock_guard<std::mutex> lock(direct_mu);
+        direct = direct_fds.count(fd) != 0;
+    }
     const HANDLE shared = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
-    const HANDLE h = read_handle(shared);
+    const HANDLE h = direct ? shared : read_handle(shared);
     if (h == INVALID_HANDLE_VALUE) return -1;
     const DWORD want = (DWORD) (n < (size_t) (1ull << 30) ? n : (size_t) (1ull << 30));
     OVERLAPPED ov{};
     ov.Offset = (DWORD) (off & 0xFFFFFFFFull);
     ov.OffsetHigh = (DWORD) (off >> 32);
+    if (direct) {
+        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (ov.hEvent == nullptr) return -1;
+    }
+    struct Close {
+        HANDLE own, event;
+        ~Close() {
+            if (event != nullptr) CloseHandle(event);
+            if (own != INVALID_HANDLE_VALUE) CloseHandle(own);
+        }
+    } close{h != shared ? h : INVALID_HANDLE_VALUE, ov.hEvent};
     DWORD got = 0;
     if (!ReadFile(h, dst, want, &got, &ov)) {
-        // A read that ran into the end of the file reports the bytes it did get as an error, so `got` stands.
-        // ERROR_IO_PENDING means the handle is an overlapped one: this thread has no other read outstanding on it,
-        // so waiting for that request is the whole of what a synchronous read would have done.
         const DWORD e = GetLastError();
         if (e == ERROR_IO_PENDING) {
             got = 0;
-            if (!GetOverlappedResult(h, &ov, &got, TRUE) && GetLastError() != ERROR_HANDLE_EOF) {
-                if (h != shared) CloseHandle(h);
+            if (!GetOverlappedResult(h, &ov, &got, TRUE) && GetLastError() != ERROR_HANDLE_EOF)
                 return -1;
-            }
         } else if (e != ERROR_HANDLE_EOF) {
-            if (h != shared) CloseHandle(h);
             return -1;
         }
     }
-    if (h != shared) CloseHandle(h);   // the read is done: the file is no longer this call's to hold open
     return (int64_t) got;
 }
 
@@ -172,19 +201,16 @@ void advise_dontneed(int fd, uint64_t off, uint64_t bytes) {
 }
 
 int open_unbuffered(int fd) {
-    // No unbuffered descriptor on this platform. A handle that bypasses the cache is opened by path with
-    // FILE_FLAG_NO_BUFFERING, and every read through it has to line up with the volume's sector size; what this call
-    // is given is a descriptor, and a name is not recoverable from it. The caller that gets -1 reads the same bytes
-    // through its mapping, which is the file cache doing the copy the unbuffered read would have saved.
-    (void) fd;
-    return -1;
+    if (fd < 0) return -1;
+    const HANDLE original = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+    return direct_descriptor(ReOpenFile(original, GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED));
 }
 
 int open_unbuffered(const std::string& path) {
-    // The same answer for the path form: those ranges are read through the file cache here, so a caller that gets -1
-    // opens the file ordinarily and the bytes arrive by the cached route.
-    (void) path;
-    return -1;
+    return direct_descriptor(CreateFileW(to_wide(path).c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr));
 }
 
 #else

@@ -18,6 +18,9 @@ namespace basalt::core {
 
 enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
 
+/// Remaining portable registration allowance across the visible devices, when the OS reports their budgets.
+/// A known exhausted allowance returns true with limit=0. Does not divide an allocation by the device count.
+bool host_pin_budget(uint64_t& limit, std::string& why);
 
 struct PinnedArena {
     void* base = nullptr;
@@ -36,7 +39,7 @@ struct PinnedArena {
     explicit PinnedArena(uint64_t bytes, uint64_t slice = 0);
     /// slices of different sizes (one per layer of a native pack), given as their start offsets followed by the end of
     /// the last one.  `slice_starts` holds the registered ones.
-    /// `max_pinned_bytes`: optional cap on CUDA registration. 0 preserves the normal unrestricted path.
+    /// `max_pinned_bytes`: optional cap on CUDA registration. 0 uses the OS budget and driver result.
     /// `shared_file`: use a file-backed MAP_SHARED mapping instead of anonymous memory.
     /// `shared_hash` identifies the model that is allowed to populate that backing.  The file carries a small
     /// header and is refused when its stored hash does not match.  Empty `shared_file` preserves the existing

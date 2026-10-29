@@ -56,10 +56,24 @@ void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const 
 /// Releases what `alloc_region` returned through `mapping_base` and `mapping_bytes`. A null is fine.
 void free_region(void* mapping_base, uint64_t mapping_bytes);
 
-/// The most host memory the GPU may map page-locked before its shared-memory segment is full, when the OS limits it
-/// beneath the driver's own refusal (`why` names where the figure comes from); false when it does not, and the driver's
-/// refusal is the limit.
-bool pin_budget(uint64_t& limit, std::string& why);
+/// Additional host bytes the identified adapter may map within its current non-local budget, leaving room for
+/// later allocations. `luid` is an opaque eight-byte adapter id, `node_mask` selects its nodes. False when the OS
+/// cannot answer; true with limit=0 when no allowance remains. `why` includes the budget, usage and reserve.
+/// `shared_mapping` also bounds the working set by the OS's available plus existing reservation allowance.
+bool pin_budget(uint64_t& limit, std::string& why, const char* luid = nullptr, uint32_t node_mask = 0,
+                bool shared_mapping = false);
+
+/// Space left for later allocations in a host mapping budget.
+inline uint64_t pin_reserve(uint64_t budget) {
+    const uint64_t fraction = budget / 20;
+    return fraction > (1ull << 30) ? fraction : (1ull << 30);
+}
+
+/// The host page size in bytes, or 0 when the OS cannot name it.
+uint64_t system_page_size();
+
+/// Whether resident host memory should be filled before driver registration, allowing page faults to overlap I/O.
+bool register_host_after_fill();
 
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();

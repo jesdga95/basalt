@@ -188,6 +188,20 @@ int read_ahead_cases() {
     }
     spots_intact("view reads back as written, after every hint");
 #if defined(_WIN32)
+    using Query = BOOL (WINAPI*)(HANDLE, PVOID, DWORD);
+    const auto query = reinterpret_cast<Query>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32QueryWorkingSetEx"));
+    PSAPI_WORKING_SET_EX_INFORMATION page{};
+    page.VirtualAddress = (void*) (base + bytes / 2);
+    const volatile uint8_t touched = base[bytes / 2];
+    (void) touched;
+    const bool before = query && query(GetCurrentProcess(), &page, sizeof page) && page.VirtualAttributes.Valid;
+    const bool dropped = drop_mapped_view(base, bytes, bytes / 2 + 1, 1);
+    const bool after = query && query(GetCurrentProcess(), &page, sizeof page) && page.VirtualAttributes.Valid;
+    std::printf("mapped trim: resident before=%d after=%d, mapping retained=%d\n", (int) before, (int) after,
+                (int) dropped);
+    fail |= !before || !dropped || after;
+    spots_intact("view reads back as written, after working-set trim");
+    fail |= drop_mapped_view(base, bytes, bytes - 1, 2);
     UnmapViewOfFile((void*) base);
 #else
     munmap((void*) base, (size_t) bytes);

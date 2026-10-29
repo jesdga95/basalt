@@ -8,10 +8,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 allow=tools/stderr_logging.allow
-pattern='\bstderr\b|std::cerr|std::clog|\bperror\('
+pattern='(^|[^[:alnum:]_])stderr([^[:alnum:]_]|$)|std::cerr|std::clog|(^|[^[:alnum:]_])perror\('
 
 declare -A allowed
 while read -r count path; do
+  path="${path%$'\r'}"
   [[ -z "${count}" || "${count}" == \#* ]] && continue
   allowed["${path}"]="${count}"
 done < "${allow}"
