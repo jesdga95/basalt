@@ -219,27 +219,30 @@ class Cli(Tmp):
     def test_vision_without_sidecar_is_a_startup_error(self):
         path = self.build(vision=True)
         err = io.StringIO()
-        with mock.patch("sys.stderr", err):
+        with mock.patch("serve.server.gpu_card_name", return_value="GeForce RTX 4090"), mock.patch("sys.stderr", err):
             e = self.run_main("--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0", "--vision", "1")
         self.assertEqual(getattr(e, "code", None), 2)
         self.assertIn("basalt-vision", err.getvalue())
 
-    def test_vision_numbered_card_is_checked_at_startup(self):
+    def test_vision_numbered_card_needs_only_to_exist(self):
         path = self.build(vision=True)
         (self.engine_bin.parent / "basalt-vision").write_text("")
         base = ["--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0"]
 
-        def plan(engine_bin, value):                     # a fake --gpu-plan: card 0 Blackwell, card 9 refused
-            if str(value) == "9":
-                raise ValueError("GPU 9 is sm_86, not sm_120")
+        def plan(engine_bin, value):                     # the engine's own choice for --gpu 0
             return {"devices": [0], "cards": [{"smi": 0}], "notes": [], "warning": None}
-        with mock.patch("serve.server.gpu_plan", side_effect=plan), mock.patch("sys.stderr", io.StringIO()) as err:
-            e = self.run_main(*base, "--vision", "9")
-        self.assertEqual(getattr(e, "code", None), 2)
-        self.assertIn("vision: GPU 9 is sm_86, not sm_120", err.getvalue())
-        with mock.patch("serve.server.gpu_plan", side_effect=plan):
-            e = self.run_main(*base, "--vision", "0")   # a visible card gets through to the Server
+        def name(index):                                 # nvidia-smi knows card 9 (an older card), not card 8
+            return None if index == 8 else "GeForce RTX 3070"
+        with mock.patch("serve.server.gpu_plan", side_effect=plan), \
+                mock.patch("serve.server.gpu_card_name", side_effect=name):
+            e = self.run_main(*base, "--vision", "9")   # a non-Blackwell card gets through to the Server
         self.assertIsInstance(e, RuntimeError)
+        with mock.patch("serve.server.gpu_plan", side_effect=plan), \
+                mock.patch("serve.server.gpu_card_name", side_effect=name), \
+                mock.patch("sys.stderr", io.StringIO()) as err:
+            e = self.run_main(*base, "--vision", "8")   # only a card that is not there fails at startup
+        self.assertEqual(getattr(e, "code", None), 2)
+        self.assertIn("vision: GPU 8 is not there", err.getvalue())
 
 
 if __name__ == "__main__":

@@ -48,4 +48,8 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+/// Launches one empty kernel on the current device. False with CUDA's own text when this binary holds no code for
+/// the card it runs on: the way a build made for another compute capability reports itself at startup.
+bool probe_device(std::string& err);
+
 }  // namespace basalt::vision

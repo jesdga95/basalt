@@ -15,6 +15,8 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(CMAKE_BUILD_TYPE Release)
   endif()
   option(BUILD_TESTING "Build the parity programs" OFF)
+  # the root project's `warnings` and `platform` targets, read from the one file both configurations include
+  include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/platform.cmake)
 endif()
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)

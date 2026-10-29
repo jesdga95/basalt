@@ -26,6 +26,22 @@ namespace basalt::vision {
     } while (0)
 
 namespace {
+__global__ void probe_kernel(int*) {}
+}  // namespace
+
+bool probe_device(std::string& err) {
+    probe_kernel<<<1, 1>>>(nullptr);
+    const cudaError_t launched = cudaGetLastError();     // a cubin this card lacks is reported by the launch
+    const cudaError_t e = launched == cudaSuccess ? cudaDeviceSynchronize() : launched;
+    if (e != cudaSuccess) {
+        err = cudaGetErrorString(e);
+        (void) cudaGetLastError();                       // leave the error state clean for whatever tries next
+        return false;
+    }
+    return true;
+}
+
+namespace {
 constexpr int E = 1152, F = 4304, H = 16, D = 72, DP = 80;
 
 constexpr size_t kAlign = 256;
