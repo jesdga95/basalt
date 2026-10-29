@@ -2915,7 +2915,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     const int nr = qsa ? 6 : 3;
                     int r = 0;
                     auto add = [&](const void* p, uint64_t b) {
-                        if (p != nullptr && (b & ~15ull) != 0 && r < kLazyPfRanges) { pf.p[r] = p; pf.n[r++] = b & ~15ull; }
+                        if (p == nullptr || (b & ~15ull) == 0) return;
+                        if (r == kLazyPfRanges) { note_fallback("lazy L2 prefetch list full: a range is left out", kLazyPfRanges, qsa ? 1 : 0); return; }
+                        pf.p[r] = p; pf.n[r++] = b & ~15ull;
                     };
                     for (int i = 0; i < nr; ++i) {
                         const WeightRef* w = nv.get(qsa ? names_qsa[i] : names_gdn[i]);
@@ -2924,6 +2926,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                             add(w->native_data, (uint64_t) iq_row_bytes(w->native_type, w->ne0) * (uint64_t) w->ne1);
                         else
                             add(w->data, w->bytes);
+                    }
+                    // then the FFN read's matrices: its 8-bit copies (codes and scales are one range), the router and
+                    // the shared expert's gate row
+                    for (const char* nm : {"hc_ffn_down.weight", "hc_ffn_inject.weight", "hc_ffn_up.weight"}) {
+                        const WeightRef* w = nv.get(nm);
+                        basalt::kernels::Hc8View hv;
+                        if (w != nullptr && basalt::kernels::hc8_view(w->data, hv)) add(hv.q, hv.bytes);
+                    }
+                    for (const char* nm : {"ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight"}) {
+                        const WeightRef* w = nv.get(nm);
+                        if (w != nullptr) add(w->data, w->bytes);
                     }
                     pf.ids = ids_; pf.n_ids = n * (int) K; pf.n_expert = (int) g.n_expert; pf.ptab = dm_->ptab0 + l * g.n_expert;
                 }
