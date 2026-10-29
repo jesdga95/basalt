@@ -2,6 +2,7 @@
 
 A fake engine script speaking GEN / BGEN / BT / BDONE / BADM / BSTOP runs behind the real ProcessEngine and Service."""
 import json
+import random
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,11 @@ STEP = 0.02
 s0 = "--slot0solo" in args           # slot 0 is the solo session: GEN copies the best slot's conversation over slot 0
 CH = 4096 if s0 else 32
 sstore = {}                           # slot -> the stream its storage holds (s0 only)
+strict = "--checkpoints" in args       # per-slot state; only explicit checkpoint boundaries can rewind
+overcommit = "--overcommit" in args   # EOS can precede the end of a committed speculative window
+cstore, slast = {}, {}
+def cache_line(b):
+    print(f"SCACHE {b} {len(sstore.get(b, []))}" + ''.join(f" {n}" for n in cstore.get(b, [])), flush=True)
 pms = "--pms" in args                 # a run that extends an earlier prompt re-reads next to nothing (0.4 ms), else 500 ms
 seen = []                             # prompts (as id lists) of earlier runs
 keep = "--reuse" in args              # a conversation cache: a prompt reuses the longest start some earlier stream had
@@ -81,12 +87,19 @@ def window():        # one batch window: every active slot one token
             if t == 257 or produced >= max_new or len(got) >= MULTI:
                 break
         print(f"BT {b} " + " ".join(map(str, got)), flush=True)
+        if strict:
+            sstore[b] += [slast[b]] + got[:-1]
+            slast[b] = got[-1]
         if t == 257 or produced >= max_new:
             fin = 'stop' if t == 257 else 'cancel' if b in stopped else 'length'
             stopped.discard(b)
             counts = f" {b + 3} {10 * (b + 1)}" if "--bdone-drafts" in args else ""   # accepted, offered
             if "--draft-counts" in args:      # as the engine: the slot's own windows (not the admission's token)
                 counts = f" {produced - 1} {2 * (produced - 1)}"
+            if strict:
+                if overcommit and fin == "stop":
+                    sstore[b] += [9001, 9002, 9003]
+                cache_line(b)
             print(f"BDONE {b} {produced} {fin} 1.0{counts}", flush=True)
             del active[b]
         else:
@@ -123,6 +136,11 @@ while True:
         if s0:
             src = [sstore.get(slot, [])] if slot is not None else list(sstore.values())
             reused = min(max([lcp([int(x) for x in ids], h) for h in src], default=0), len(ids) - 1)
+        if strict:
+            mine = [int(x) for x in ids]
+            old = sstore.get(slot, [])
+            candidates = [len(old)] + cstore.get(slot, [])
+            reused = max((n for n in candidates if 0 < n < len(mine) and old[:n] == mine[:n]), default=0)
         stop.clear()
         # the prompt read: CH tokens a chunk, a PP line each; a BYIELD <s> gives way at a chunk boundary
         given = None
@@ -157,6 +175,9 @@ while True:
                 print(f"BADM {slot} 0", flush=True)
             continue
         n = 1 if bslot is not None else max_new
+        deferred = strict and bslot is not None and slot > 0
+        if deferred:
+            n = 0
         out = 0
         for t in toks[:n]:
             if stop.is_set():
@@ -169,17 +190,24 @@ while True:
         mine_ids = [int(x) for x in ids]
         pm = (0.4 if any(mine_ids[:len(h)] == h for h in seen) else 500.0) if pms else 5.0
         seen.append(mine_ids)
+        if strict:
+            sstore[slot] = mine_ids[:-1] if deferred else mine_ids + toks[:max(0, out - 1)] if out else []
+            if overcommit and out and fin == "stop":
+                sstore[slot] += [9001, 9002, 9003]
+            cstore[slot] = [len(mine_ids) - 5] if (out or deferred) and len(mine_ids) > 5 else []
+            slast[slot] = mine_ids[-1] if deferred else toks[out - 1] if out else None
+            cache_line(slot)
         print(f"DONE {out} {len(ids)} {pm} {out * STEP * 1000:.1f} {fin} {dc} {reused}", flush=True)
-        if s0:
+        if s0 and not strict:
             sstore[0 if slot is None else slot] = [int(x) for x in ids] + toks[:-1]
         if keep:
             mine = [int(x) for x in ids] + toks[:out]
             held[:] = [h for h in held if mine[:len(h)] != h] + [mine]
         if bslot is not None:
-            cont = fin == "length" and max_new > 1
+            cont = deferred or (fin == "length" and max_new > 1)
             if cont:
-                active[slot] = [toks[1:], max_new, 1]
-            print(f"BADM {slot} {1 if cont else 0}", flush=True)
+                active[slot] = [toks if deferred else toks[1:], max_new, 0 if deferred else 1]
+            print(f"BADM {slot} {2 if deferred else 1 if cont else 0}", flush=True)
         continue
     if line:
         print("ERR unknown " + line[:20], flush=True)
@@ -195,6 +223,8 @@ class PickSlot(unittest.TestCase):
         e.slot_order = list(range(n))
         e.slot_busy = [False] * n
         e.slot_held = [[] for _ in range(n)]
+        e.slot_checkpoints = [[] for _ in range(n)]
+        e.slot_reports = [None for _ in range(n)]
         e.slot_used = [0.0] * n
         return e
 
@@ -212,12 +242,105 @@ class PickSlot(unittest.TestCase):
         e.slot_busy = [False] * 3
         self.assertEqual(e.pick_slot([1, 2, 3]), 1)                 # a held prompt is never the WHOLE prompt
 
+    def test_retry_and_edited_tail_use_confirmed_checkpoints(self):
+        e = self.engine(4)
+        e.slot_held[0] = [10, 11, 12, 90, 91]
+        e.slot_checkpoints[0] = [2, 3]
+        for prompt in ([10, 11, 12], [10, 11, 12, 90, 91], [10, 11, 12, 99]):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(e.pick_slot(prompt), 0)
+                self.assertTrue(e._resumes(0, prompt))
+        e.slot_busy[0] = True
+        self.assertEqual(e.pick_slot([10, 11, 12]), 1)
+
+    def test_uncheckpointed_common_prefix_is_not_a_resume(self):
+        e = self.engine(3)
+        e.slot_held[0] = [10, 11, 12, 90, 91]
+        e.slot_checkpoints[0] = [3]
+        self.assertEqual(e.pick_slot([10, 11, 99]), 1)
+        self.assertFalse(e._resumes(0, [10, 11, 99]))
+        self.assertEqual(e.pick_slot([10, 11, 12]), 1)  # a checkpoint needs one unprocessed prompt token
+
+    def test_full_continuation_precedes_checkpoint_rollback(self):
+        e = self.engine(3)
+        e.slot_held = [[1, 2], [1, 2, 3, 4, 9], []]
+        e.slot_checkpoints[1] = [4]
+        self.assertEqual(e.pick_slot([1, 2, 3, 4, 5]), 0)
+
+    def test_slot_scores_are_computed_once_and_ties_keep_slot_order(self):
+        e = self.engine(4)
+        e.slot_order = [2, 0, 3, 1]
+        e.slot_busy[3] = True
+        e.slot_held = [[1, 2]] * 4
+        with mock.patch.object(e, "_slot_match", wraps=e._slot_match) as score:
+            self.assertEqual(e.pick_slot([1, 2, 3]), 2)
+        self.assertEqual([call.args[0] for call in score.call_args_list], [2, 0, 1])
+
+    def test_longest_first_matches_exhaustive_checkpoint_scoring(self):
+        rng = random.Random(19)
+        for _ in range(200):
+            e = self.engine(4)
+            prompt = [rng.randrange(3) for _ in range(rng.randrange(1, 20))]
+            e.slot_order = rng.sample(range(4), 4)
+            e.slot_busy = [rng.choice([True, False]) for _ in range(4)]
+            e.slot_used = rng.sample(range(4), 4)
+            expected = []
+            for b in range(4):
+                h = prompt[:rng.randrange(len(prompt) + 1)] + [rng.randrange(3) for _ in range(rng.randrange(5))]
+                e.slot_held[b] = h
+                checks = sorted(rng.sample(range(1, len(h) + 1), rng.randrange(len(h) + 1)))
+                e.slot_checkpoints[b] = checks
+                e.slot_reports[b] = rng.choice([None, (len(h), checks), (len(h) + 2, checks)])
+                live = e.slot_reports[b] is None or e.slot_reports[b][0] == len(h)
+                n = max((n for n in checks if n < len(prompt) and prompt[:n] == h[:n]), default=0)
+                rank = (1, n) if n else (0, 0)
+                if h and live and len(h) < len(prompt) and prompt[:len(h)] == h:
+                    rank = (2, len(h))
+                self.assertEqual(e._slot_match(b, prompt), rank)
+                expected.append(rank)
+            free = [b for b in e.slot_order if not e.slot_busy[b]]
+            best = max(free, key=lambda b: expected[b]) if free else None
+            if best is not None and expected[best][0] == 0:
+                best = min(free, key=lambda b: (bool(e.slot_held[b]), e.slot_used[b]))
+            self.assertEqual(e.pick_slot(prompt), best)
+
+    def test_cache_report_normalizes_checkpoint_order(self):
+        reports = [None]
+        ProcessEngine._slot_report("SCACHE 0 9 7 2 4 7", reports)
+        held, checks = ProcessEngine._retained_slot(list(range(9)), reports[0])
+        self.assertEqual((held, checks), (list(range(9)), [2, 4, 7]))
+
+    def test_cache_report_validation_and_zero_output(self):
+        reports = [None, None]
+        ProcessEngine._slot_report("SCACHE 1 3 2 2", reports)
+        self.assertEqual(ProcessEngine._retained_slot([10, 11, 12, 13], reports[1]), ([10, 11, 12], [2]))
+        for frame in ("SCACHE 1", "SCACHE 1 3 -1", "SCACHE 1 3 4", "SCACHE 1 broken"):
+            ProcessEngine._slot_report(frame, reports)
+            self.assertEqual(reports[1], (0, []))
+        self.assertEqual(ProcessEngine._retained_slot([1, 2], (3, [1])), ([1, 2], [1]))
+        e = self.engine(2)
+        e.slot_reports = [(3, [2]), None]
+        e._solo_kept(0, [1, 2, 3, 4], [])
+        self.assertEqual(e.slot_held[0], [1, 2, 3])
+        self.assertTrue(e._resumes(0, [1, 2, 3, 4]))
+
+    def test_speculative_tail_keeps_checkpoints_not_a_live_resume(self):
+        e = self.engine(2)
+        e.slot_reports = [(6, [2, 5]), None]
+        e._keep_slot(0, [10, 11, 12, 13])
+        self.assertEqual(e.slot_held[0], [10, 11, 12, 13])
+        self.assertEqual(e.slot_checkpoints[0], [2])
+        self.assertEqual(e.pick_slot([10, 11, 99]), 0)
+        self.assertEqual(e._slot_match(0, [10, 11, 12, 13, 14]), (1, 2))
+        e.slot_checkpoints[0] = []
+        self.assertFalse(e._resumes(0, [10, 11, 12, 13, 14]))
+
 
 class ParallelService(unittest.TestCase):
     """The real ProcessEngine and Service over HTTP, the fake engine behind them."""
 
     def start(self, slots, fit=None, slot_cache=False, fail=False, ready=None, multi=None, drafts=False, counts=False,
-              nopp=False, reuse=False, slot0_solo=False, solo_any=False, pms=False):
+              nopp=False, reuse=False, slot0_solo=False, solo_any=False, pms=False, checkpoints=False, overcommit=False):
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_engine.py"
         script.write_text(FAKE_BATCH, encoding="utf-8")
@@ -235,6 +358,8 @@ class ParallelService(unittest.TestCase):
         extra += ["--slot0solo"] if slot0_solo else []
         extra += ["--soloany"] if solo_any else []
         extra += ["--pms"] if pms else []
+        extra += ["--checkpoints"] if checkpoints else []
+        extra += ["--overcommit"] if overcommit else []
         with mock.patch.object(subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = ProcessEngine("basalt", extra)
@@ -267,6 +392,68 @@ class ParallelService(unittest.TestCase):
         self.start(4, fit=2)
         self.assertEqual(self.engine.batch, 2)
         self.assertEqual(self.get("/v1/status")["concurrency"]["serving"], 2)
+
+    def test_identical_retries_keep_the_checkpoint_slot(self):
+        self.start(4, slot0_solo=True, solo_any=True, checkpoints=True)
+        text = "identical retry " + "x" * 100
+        for i in range(10):
+            u = self.chat(text)["usage"]
+            self.assertEqual(u["prompt_tokens_details"]["cached_tokens"] > 0, i > 0)
+        slots = [x.split()[1] for x in self.log.read_text().splitlines()]
+        self.assertEqual(set(slots), {"0"})
+
+    def test_eos_inside_committed_window_retains_checkpoint_routing(self):
+        self.start(4, slot0_solo=True, solo_any=True, checkpoints=True, overcommit=True)
+        for i in range(5):
+            u = self.chat("EOS then next turn " + "x" * 100)["usage"]
+            self.assertEqual(u["completion_tokens"], 10)
+            self.assertEqual(u["prompt_tokens_details"]["cached_tokens"] > 0, i > 0)
+        self.assertEqual([x.split()[1] for x in self.log.read_text().splitlines()], ["0"] * 5)
+
+    def test_batch_eos_inside_committed_window_retains_checkpoint_routing(self):
+        self.start(4, slot0_solo=True, checkpoints=True, overcommit=True)
+        self.engine.slot_busy[0] = True
+        for i in range(3):
+            u = self.chat("batch EOS then next turn " + "x" * 100)["usage"]
+            self.assertEqual(u["completion_tokens"], 10)
+            self.assertEqual(u["prompt_tokens_details"]["cached_tokens"] > 0, i > 0)
+        self.assertEqual([x.split()[1] for x in self.log.read_text().splitlines()], ["1"] * 3)
+
+    def test_admission_without_continuation_retains_confirmed_state(self):
+        self.start(4, slot0_solo=True, checkpoints=True)
+        text = "single token retry " + "x" * 100
+        self.chat(text, max_tokens=1)
+        self.assertTrue(any(self.engine.slot_held))
+        u = self.chat(text, max_tokens=1)["usage"]
+        self.assertGreater(u["prompt_tokens_details"]["cached_tokens"], 0)
+
+    def test_shared_system_chats_keep_separate_checkpoint_slots(self):
+        self.start(4, slot0_solo=True, solo_any=True, checkpoints=True)
+        for i, name in enumerate("ABABAAAB"):
+            u = self.chat(f"conversation {name} " + name * 100)["usage"]
+            self.assertEqual(u["prompt_tokens_details"]["cached_tokens"] > 0, i >= 2)
+        slots = [x.split()[1] for x in self.log.read_text().splitlines()]
+        self.assertEqual(slots, list("01010001"))
+
+    def test_deferred_nonzero_admission_keeps_processed_stream(self):
+        self.start(4, slot0_solo=True, checkpoints=True)
+        self.engine.slot_busy[0] = True
+        for i in range(2):
+            u = self.chat("deferred admission " + "x" * 100)["usage"]
+            self.assertEqual(u["completion_tokens"], 10)
+            self.assertEqual(u["prompt_tokens_details"]["cached_tokens"] > 0, i > 0)
+        self.assertEqual([x.split()[1] for x in self.log.read_text().splitlines()], ["1", "1"])
+
+    def test_closed_consumer_drains_confirmed_checkpoint(self):
+        self.start(4, slot0_solo=True, solo_any=True, checkpoints=True)
+        prompt = list(b"cancel then retry " + b"x" * 100)
+        g = self.engine.generate_batched(prompt, 100, {}, threading.Event())
+        self.assertIsInstance(next(g), int)
+        g.close()
+        self.assertFalse(any(self.engine.slot_busy))
+        self.assertTrue(self.engine._resumes(0, prompt))
+        list(self.engine.generate_batched(prompt, 1, {}, threading.Event()))
+        self.assertGreater(self.engine.last["reused"], 0)
 
     def test_engine_turns_batching_off(self):
         self.start(4, fit=0)
