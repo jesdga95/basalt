@@ -5,14 +5,18 @@
 #include "basalt/platform/file.hpp"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <string>
+#include <system_error>
 
 #if defined(_WIN32)
 #include "basalt/platform/win.hpp"
 #include <direct.h>   // _wchdir, _wfullpath
 #include <fcntl.h>    // _O_RDONLY, _O_BINARY
 #include <io.h>       // _wopen, _waccess, _close, _fileno, _get_osfhandle
+#include <sys/stat.h>  // _S_IREAD, _S_IWRITE
 #else
 #include <fcntl.h>    // O_RDONLY, posix_fadvise
 #include <sys/stat.h>  // ::stat
@@ -187,6 +191,49 @@ int open_unbuffered(const std::string& path) {
     return -1;
 }
 
+int open_write_utf8(const std::string& path) {
+    return _wopen(to_wide(path).c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+}
+
+int open_write_unbuffered(const std::string& path) {
+    // As for reads: a caller that gets -1 writes through the file cache.
+    (void) path;
+    return -1;
+}
+
+bool pwrite_all(int fd, const void* src, uint64_t n, uint64_t off) {
+    if (fd < 0) return false;
+    const HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+    if (h == INVALID_HANDLE_VALUE) return false;
+    const uint8_t* p = (const uint8_t*) src;
+    while (n > 0) {
+        const DWORD want = (DWORD) (n < (1ull << 30) ? n : (1ull << 30));
+        OVERLAPPED ov{};
+        ov.Offset = (DWORD) (off & 0xFFFFFFFFull);
+        ov.OffsetHigh = (DWORD) (off >> 32);
+        DWORD put = 0;
+        if (!WriteFile(h, p, want, &put, &ov)) {
+            if (GetLastError() != ERROR_IO_PENDING || !GetOverlappedResult(h, &ov, &put, TRUE)) return false;
+        }
+        if (put == 0) return false;
+        p += put;
+        off += put;
+        n -= put;
+    }
+    return true;
+}
+
+bool sync_fd(int fd) {
+    if (fd < 0) return false;
+    const HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+    return h != INVALID_HANDLE_VALUE && FlushFileBuffers(h) != 0;
+}
+
+namespace {
+std::filesystem::path fs_path(const std::string& utf8) { return std::filesystem::path(to_wide(utf8)); }
+std::string fs_name(const std::filesystem::path& p) { return to_utf8(p.filename().wstring().c_str()); }
+}  // namespace
+
 #else
 // ----------------------------------------------------------------------------------------------- POSIX
 
@@ -268,7 +315,96 @@ int open_unbuffered(const std::string& path) {
     return ::open(path.c_str(), O_RDONLY | O_DIRECT);
 }
 
+int open_write_utf8(const std::string& path) {
+    return ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+}
+
+int open_write_unbuffered(const std::string& path) {
+    // A file system that refuses the flag answers -1, and the caller writes through the cache.
+    return ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_DIRECT, 0644);
+}
+
+bool pwrite_all(int fd, const void* src, uint64_t n, uint64_t off) {
+    const uint8_t* p = (const uint8_t*) src;
+    while (n > 0) {
+        const ssize_t put = ::pwrite(fd, p, (size_t) (n < (1ull << 30) ? n : (1ull << 30)), (off_t) off);
+        if (put <= 0) {
+            if (put < 0 && errno == EINTR) continue;
+            return false;
+        }
+        p += put;
+        off += (uint64_t) put;
+        n -= (uint64_t) put;
+    }
+    return true;
+}
+
+bool sync_fd(int fd) {
+    return ::fdatasync(fd) == 0;
+}
+
+namespace {
+std::filesystem::path fs_path(const std::string& utf8) { return std::filesystem::path(utf8); }
+std::string fs_name(const std::filesystem::path& p) { return p.filename().string(); }
+}  // namespace
+
 #endif
+
+bool make_dirs(const std::string& path) {
+    std::error_code ec;
+    std::filesystem::create_directories(fs_path(path), ec);
+    return std::filesystem::is_directory(fs_path(path), ec);
+}
+
+bool list_files(const std::string& dir, std::vector<DirFile>& out) {
+    out.clear();
+    std::error_code ec;
+    std::filesystem::directory_iterator it(fs_path(dir), ec), end;
+    if (ec) return false;
+    for (; it != end; it.increment(ec)) {
+        if (ec) return false;
+        std::error_code fe;
+        if (!it->is_regular_file(fe) || fe) continue;
+        DirFile f;
+        f.name = fs_name(it->path());
+        f.bytes = (uint64_t) it->file_size(fe);
+        if (fe) continue;
+        const auto t = it->last_write_time(fe);
+        if (fe) continue;
+        f.mtime = (int64_t) std::chrono::duration_cast<std::chrono::seconds>(t.time_since_epoch()).count();
+        out.push_back(std::move(f));
+    }
+    return true;
+}
+
+bool rename_replace(const std::string& from, const std::string& to) {
+    std::error_code ec;
+    std::filesystem::rename(fs_path(from), fs_path(to), ec);
+    return !ec;
+}
+
+bool remove_file(const std::string& path) {
+    std::error_code ec;
+    std::filesystem::remove(fs_path(path), ec);
+    return !std::filesystem::exists(fs_path(path), ec);
+}
+
+bool touch_file(const std::string& path) {
+    std::error_code ec;
+    std::filesystem::last_write_time(fs_path(path), std::filesystem::file_time_type::clock::now(), ec);
+    return !ec;
+}
+
+int64_t file_time_now() {
+    return (int64_t) std::chrono::duration_cast<std::chrono::seconds>(
+               std::filesystem::file_time_type::clock::now().time_since_epoch()).count();
+}
+
+uint64_t disk_free_bytes(const std::string& path) {
+    std::error_code ec;
+    const auto s = std::filesystem::space(fs_path(path), ec);
+    return ec ? 0 : (uint64_t) s.available;
+}
 
 bool pread_all(int fd, void* dst, uint64_t n, uint64_t off) {
     uint8_t* p = (uint8_t*) dst;
