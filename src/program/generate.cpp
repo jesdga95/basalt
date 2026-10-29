@@ -3951,8 +3951,10 @@ int main(int argc, char** argv) {
     // and its last token through the first verify window - the path all three model files share.  Decoding is greedy.
     // The expert-cache slots (from the end of the cache) that hold the prompt path's buffers for a chunk, and the
     // bytes from the first of them to the end.
-    // the share of expert bytes the arena could pin (sizes the prompt path's lend cap)
-    if (srcp != nullptr && o.prefill_chunk > 0) {
+    // the share of expert bytes the arena could pin (sizes the prompt path's lend cap); measured again once the RAM
+    // complement is pinned, since a source pins nothing before that
+    auto measure_pinned_share = [&]() {
+        if (srcp == nullptr || o.prefill_chunk <= 0) return;
         uint64_t pinned = 0, total = 0;
         const auto& lay = basalt::kernels::cpu::expert_layout();
         for (int64_t l = 0; l < g.n_layers; ++l)
@@ -3962,10 +3964,12 @@ int main(int argc, char** argv) {
                 if (srcp->pinned(l, e)) pinned += b;
             }
         basalt::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
-    }
+    };
+    measure_pinned_share();
     // The share of a cache a lent prompt chunk may take: 90% when the copies are DMA from pinned RAM, 85% when host
     // copies are the limit (lending more only streams more through them).
-    const int64_t kAutoLendPct = basalt::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85;
+    auto lend_pct_for_share = [] { return basalt::prefill::Prefill::pinned_share() >= 0.9 ? (int64_t) 90 : (int64_t) 85; };
+    int64_t auto_lend_pct = lend_pct_for_share();
     // The largest chunk --prefill auto may pick: the operator's ceiling (--prefill auto:N) and never past the context,
     // but never below 8192.  A bare `auto` is cut back once the RAM complement is built (below) to what the lend can
     // fund, and again to the fewest-equal-chunks cap when a prompt is read; without the resident RAM mode there is no
@@ -4071,7 +4075,7 @@ int main(int argc, char** argv) {
     if (o.prefill_chunk > 0 && d_res != nullptr && xcache.slots() > 0) {
         int64_t chunk = o.prefill_chunk;
         const int64_t k = serve_loans::plan_lend(chunk, xcache, g, ss, o.prefill_auto, auto_ceiling,
-                                                (int) kAutoLendPct);
+                                                (int) auto_lend_pct);
         if (k > 0) { lend_from = xcache.slots() - k; lend_chunk = chunk; }
     }
     // a layer split: the stages' caches are GPU tiers the RAM copy leaves out, except each one's last slots, which the
@@ -4290,6 +4294,12 @@ int main(int argc, char** argv) {
                          (long long) xcache.resident(),
                          o.adapt_every > 0 && o.adapt_swaps > 0 ? "exchange them with the GPU cache (no file reads)"
                                                                 : "off");
+            measure_pinned_share();   // the loans sized from here on see the pinned complement
+            auto_lend_pct = lend_pct_for_share();
+            if (o.prefill_auto)
+                basalt::log::info("basalt generate", "prompt path lends at most %lld%% of the cache (%.0f%% of the expert "
+                                     "bytes pinned)", (long long) auto_lend_pct,
+                             100.0 * basalt::prefill::Prefill::pinned_share());
         } else if (o.resident_soft) {
             basalt::log::warn("basalt generate", "the resident RAM mode does not fit (%s)", err.c_str());
         } else if (o.resident_budget > 0) {
@@ -4715,7 +4725,7 @@ int main(int argc, char** argv) {
             auto fits_one = [&](const PfPart& p, int64_t c, bool cap) -> bool {
                 const int64_t k = part_slots(p, c);
                 if (k <= 0 || k + 128 > p.cache->slots()) return false;
-                return !(cap && k * 100 > kAutoLendPct * p.cache->slots());
+                return !(cap && k * 100 > auto_lend_pct * p.cache->slots());
             };
             // `only`: CUDA0's cache alone (what one GPU would choose, for the log below); null: every one
             auto fits = [&](int64_t c, bool cap, const PfPart* only = nullptr) -> bool {
@@ -4749,7 +4759,7 @@ int main(int argc, char** argv) {
                         prop.name[0] = 0;
                     }
                     const std::string pct =
-                        o.prefill_auto ? ", and lend at most " + std::to_string(kAutoLendPct) + "%" : "";
+                        o.prefill_auto ? ", and lend at most " + std::to_string(auto_lend_pct) + "%" : "";
                     basalt::log::warn("basalt serve", "prompt chunk %lld tokens, not %lld: CUDA%d (%s) "
                                          "has %lld expert-cache slots, and a %lld-token chunk borrows %lld of them "
                                          "(it must keep 128%s) - prompts read slower than on CUDA0 alone",
@@ -6461,7 +6471,7 @@ int main(int argc, char** argv) {
             PfPart& p = pf_parts[0];
             auto fits = [&](int64_t c) {
                 const int64_t k = part_slots(p, c);
-                return k > 0 && k + 128 <= live && !(o.prefill_auto && k * 100 > kAutoLendPct * live);
+                return k > 0 && k + 128 <= live && !(o.prefill_auto && k * 100 > auto_lend_pct * live);
             };
             // auto: the largest chunk on the start-up's 256-token grid, so a few slots lent away cost a few tokens
             // of chunk, not half of it
@@ -6683,7 +6693,7 @@ int main(int argc, char** argv) {
             if (pf_parts.empty() || pf_parts[0].first < 0) return 0;
             const int64_t k = part_slots(pf_parts[0], 256);
             int64_t f = k + 128;
-            if (o.prefill_auto) f = std::max<int64_t>(f, (k * 100 + kAutoLendPct - 1) / kAutoLendPct);
+            if (o.prefill_auto) f = std::max<int64_t>(f, (k * 100 + auto_lend_pct - 1) / auto_lend_pct);
             return std::min<int64_t>(f, xcache.full_slots());
         };
         bool kv_short = false;   // the last kv_fit refused: the cells would take the cache below its floor
@@ -10744,7 +10754,7 @@ int main(int argc, char** argv) {
         if (!host_res.empty() && d_res != nullptr) {
             int64_t chunk = o.prefill_chunk;
             int64_t k = serve_loans::plan_lend(chunk, xcache, g, ss, o.prefill_auto, auto_ceiling,
-                                               (int) kAutoLendPct);   // auto: the largest that fits; fixed: halved
+                                               (int) auto_lend_pct);   // auto: the largest that fits; fixed: halved
             const int64_t request_sized = serve_loans::request_chunk(n_batched, chunk);
             if (k > 0 && request_sized < chunk) {                     // no bigger than this prompt segment needs
                 chunk = request_sized;
