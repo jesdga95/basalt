@@ -496,15 +496,17 @@ void usage() {
                  "                       (on only when it keeps every expert off the SSD).\n"
                  "  --peer-reserve-mib N  VRAM the peer tier leaves free on its card (default 600)\n"
                  "  --adapt-every N      adaptive expert tier: a round every N decode windows (default 1 for a\n"
-                 "                       server on one GPU, else 4;\n"
-                 "                       0 = the VRAM experts stay as loaded)\n"
+                 "                       server, with or without the peer tier; 4 with the layers split over GPUs\n"
+                 "                       and outside --serve; 0 = the VRAM experts stay as loaded)\n"
                  "  --adapt-decay F      factor the routing counts are multiplied by after each round (default\n"
-                 "                       0.85 on one GPU with or without the peer, 0.7 with the experts split\n"
-                 "                       over several GPUs); lower forgets sooner\n"
+                 "                       0.85 on a server with or without the peer tier, 0.7 with the layers\n"
+                 "                       split over GPUs and outside --serve); lower forgets sooner\n"
                  "  --prefill-cpu-share F  share of the streamed prompt experts the CPU computes, 0 to 1 (default\n"
                  "                       0.6; 0 = the GPU streams them all).  Fixed, so the output is the same\n"
                  "                       from run to run; a weaker CPU may prefer a lower value\n"
-                 "  --adapt-swaps N      most experts a round swaps into the main GPU (default 96; 0 = off)\n"
+                 "  --adapt-swaps N      most experts a round swaps into the main GPU (default 96; 0 = off). On a\n"
+                 "                       server without a layer split, a round after one that found twice as many\n"
+                 "                       misses swaps four times as many, and the RAM copy keeps 4 N free places\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
                  "  --peer-prefill-rows N  prompt rows per layer the peer computes (default half of chunk x top-k;\n"
                  "                       0 = the prompt path stays on the primary)\n"
@@ -773,7 +775,7 @@ bool checkpoint_restore(const ConvCheckpoint& c, basalt::core::SessionState& ss,
     return false;
 }
 
-/// The identity parked conversations on disk are written under (conversation_store.hpp): the engine, the model file
+/// The identity parked conversations on disk are written under (conversation_store.hpp): the model file
 /// (its size and samples of its bytes) and the settings that change a state's bytes - the K/V type, the rope, the draft
 /// layer, the image encoder, control vectors.  A file of another identity is never restored.
 uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeometry& g) {
@@ -782,7 +784,7 @@ uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeomet
     std::snprintf(num, sizeof num, " rope %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g cvec %d %d %d %d", o.rope_scale,
                   o.rope_freq_base, o.rope_freq_scale, o.yarn_orig_ctx, o.yarn_ext_factor, o.yarn_attn_factor,
                   o.yarn_beta_fast, o.yarn_beta_slow, o.cvec_first, o.cvec_last, o.cvec_mode, o.cvec_single);
-    std::string text = std::string("basalt conversation state, engine ") + BASALT_VERSION + " kv " + o.kv + " rope " +
+    std::string text = std::string("basalt conversation state kv ") + o.kv + " rope " +
                        o.rope_scaling + num + " mtp " + o.mtp + " mmproj " + o.vision_mmproj;
     for (const auto& [path, scale] : o.cvec_files) text += " cvec " + path + " " + std::to_string(scale);
     uint64_t h = conversation_store_hash(text.data(), text.size(), 1);
