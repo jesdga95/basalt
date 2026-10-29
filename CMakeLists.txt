@@ -1101,8 +1101,13 @@ target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels
                                          src/kernels/cpu/kq_avx2.cpp
                                          src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/ggml/ggml_cpu_dispatch.cpp
                                          $<TARGET_OBJECTS:ggml_dots_avx2> $<TARGET_OBJECTS:ggml_dots_avx512>)
-set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
-                            "${_isa_avx512_flags}")
+# the i-quant rows also use BMI2 (pdep/pext for the sign masks; cpu_avx512_ok requires it). MSVC compiles the
+# intrinsics without a switch.
+if(MSVC)
+  set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx512_flags}")
+else()
+  set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx512_flags};-mbmi2")
+endif()
 set_source_files_properties(src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS
                             "${_isa_avx512_flags}")
 set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
@@ -1310,6 +1315,11 @@ if(BUILD_TESTING)
   add_executable(iq_avx2_test tests/kernels/cpu/iq_avx2_test.cpp)
   target_link_libraries(iq_avx2_test PRIVATE kernels_cpu platform)
   basalt_cpu_test(NAME iq_avx2_test COMMAND iq_avx2_test)
+  # the AVX-512 i-quant rows: frozen output hashes, token-count independence and a double reference
+  add_executable(iq_avx512_test tests/kernels/cpu/iq_avx512_test.cpp)
+  target_link_libraries(iq_avx512_test PRIVATE kernels_cpu platform)
+  basalt_cpu_test(NAME iq_avx512_test COMMAND iq_avx512_test)
+  set_property(TEST iq_avx512_test APPEND PROPERTY LABELS avx512)
 
   # DirectFile has a Linux backend and a Windows backend, and this test covers those two; macOS is not a platform
   # the engine builds for.

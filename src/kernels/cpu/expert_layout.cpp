@@ -30,7 +30,9 @@ bool cpu_avx512_ok() {
         if ((xcr0 & 0xE6) != 0xE6) return false;          // the OS saves the AVX-512 state
         cpuid(7, 0);
         const unsigned ebx = r[1], ecx = r[2];
-        return ((ebx >> 16) & 1u) && ((ebx >> 30) & 1u) && ((ebx >> 31) & 1u) && ((ecx >> 11) & 1u) && ((ecx >> 1) & 1u);
+        // F, BW, VL, VNNI, VBMI, and BMI2 (the i-quant rows' sign masks)
+        return ((ebx >> 16) & 1u) && ((ebx >> 30) & 1u) && ((ebx >> 31) & 1u) && ((ecx >> 11) & 1u) && ((ecx >> 1) & 1u) &&
+               ((ebx >> 8) & 1u);
     }();
     return ok;
 }
