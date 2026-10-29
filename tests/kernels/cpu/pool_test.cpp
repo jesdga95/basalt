@@ -118,6 +118,16 @@ int main(int argc, char** argv) {
 
     cpu::ExpertPool pool((std::max)(1, (int) cores.size()));
     std::printf("  %-44s %d\n", "workers", pool.workers());
+    // A parked worker yields only when the pool's threads, the host's included, outnumber the physical cores.
+    {
+        const int c = (int) cores.size();
+        cpu::ExpertPool over(c + 1);
+        const bool ok = pool.yields() == (pool.workers() > c) && over.yields();
+        std::printf("  %-44s %s (%d workers: %s, %d workers: %s)\n", "parked workers yield only when oversubscribed",
+                    ok ? "yes" : "*** NO ***", pool.workers(), pool.yields() ? "yield" : "spin", over.workers(),
+                    over.yields() ? "yield" : "spin");
+        if (!ok) ++bad;
+    }
 
     std::vector<cpu::ExpertJob> jobs((size_t) NEXP);
     std::vector<float> got((size_t) NEXP * cpu::H);

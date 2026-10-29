@@ -85,6 +85,8 @@ ExpertPool::ExpertPool(int n_workers, PoolAffinity affinity)
     n_ = n_workers;
     if (n_ < 1) n_ = 1;
     active_.store(n_);
+    // Every worker spins while parked, active or not, and so does the host while it waits.
+    yield_ = n_ > (int) detect_cpu_topology(true, PoolAffinity::All).worker_cores.size();
     scratch_.resize((size_t) n_);
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
@@ -137,8 +139,8 @@ void ExpertPool::worker(int id) {
         // workers against one cache line, would make the workers invalidate each other's caches and the very line the
         // host writes to publish work).  See the note on the atomics in pool.hpp.
         //
-        // After `kSpinBeforeYield` the worker yields its core on every check, and after `kSpinBeforeSleep` with no
-        // work it sleeps.  The clock is read once every 64 checks.
+        // After `kSpinBeforeYield` the worker yields its core on every check (when the pool `yields()`), and after
+        // `kSpinBeforeSleep` with no work it sleeps.  The clock is read once every 64 checks.
         const auto parked_at = std::chrono::steady_clock::now();
         uint32_t spins = 0;
         bool yielding = false;
@@ -148,7 +150,7 @@ void ExpertPool::worker(int id) {
             else _mm_pause();
             if ((++spins & 63u) != 0) continue;
             const auto waited = std::chrono::steady_clock::now() - parked_at;
-            yielding = waited >= kSpinBeforeYield;
+            yielding = yield_ && waited >= kSpinBeforeYield;
             if (waited < spin_before_sleep_) continue;
             std::unique_lock<std::mutex> lk(sleep_mu_);
             wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);

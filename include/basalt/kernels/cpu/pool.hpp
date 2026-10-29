@@ -96,6 +96,8 @@ public:
     int p_threads() const { return topo_.p_threads; }
     int e_cores() const { return topo_.e_cores; }
     PoolAffinity affinity() const { return affinity_; }
+    /// Whether a parked worker yields its core after `kSpinBeforeYield` (see there).
+    bool yields() const { return yield_; }
 
     /// Publish `n` jobs, then block until every one has completed.
     /// `jobs` must outlive the call (it does, and the workers never touch it afterwards).
@@ -142,7 +144,9 @@ public:
     static constexpr std::chrono::milliseconds kSpinBeforeSleep{20};
     /// A parked worker spins this long, then yields its core on every check until the next batch or the sleep: a
     /// short wait keeps the core, a long gap between batches gives it to any runnable thread, such as a worker the OS
-    /// put on this core in the middle of its task.  With nothing else runnable the yield returns at once.
+    /// put on this core in the middle of its task.  Only when the pool's threads (every worker, parked ones included,
+    /// and the host) outnumber the physical cores the process may run on: otherwise each has a core of its own and
+    /// the yield is a system call per check for nothing.
     static constexpr std::chrono::microseconds kSpinBeforeYield{50};
     /// A pool wait that sees no completion for this long is a bug; the engine stops with a message instead of
     /// spinning forever, and the server starts it again.
@@ -204,6 +208,7 @@ private:
     std::mutex sleep_mu_;
     std::condition_variable sleep_cv_;
     std::chrono::microseconds spin_before_sleep_{kSpinBeforeSleep};
+    bool yield_ = false;   // set before the workers start, never changed
     std::vector<std::thread> threads_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
     // idle work (mode 7): one job per worker index
