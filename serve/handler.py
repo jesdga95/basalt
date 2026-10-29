@@ -345,6 +345,9 @@ def make_handler(svc: Service):
                         result = svc.unload()
                         if result == "busy":
                             raise ModelBusy("a request is running or queued")
+                    elif svc.loading:                    # a load in progress: wait for it like any request
+                        svc.load()
+                        result = "loaded"
                     else:
                         if not svc.fifo.acquire(blocking=False):
                             raise ModelBusy("a request is running or queued")
@@ -413,6 +416,11 @@ def make_handler(svc: Service):
             model = parse_qs(urlsplit(self.path).query).get("model", [svc.model])[0]
             if model != svc.model:
                 self._json(404, {"error": {"message": "model not found"}})
+                return
+            try:
+                svc.wait_load()                              # a load in progress is waited for, not refused
+            except (GpuBusy, EngineDied) as e:
+                self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
             if not svc.loaded() and not getattr(svc.engine, "unloaded", False):
                 self._json(503, {"error": {"message": "the engine is not running"}})

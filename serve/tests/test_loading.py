@@ -207,6 +207,42 @@ class Loading(unittest.TestCase):
         self.wait_loading()
         self.finish(t, out)
 
+    def get_status(self, path):
+        try:
+            with urllib.request.urlopen(self.base + path, timeout=15) as r:
+                return r.status, json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode())
+
+    def test_props_and_v1_load_sent_mid_load_wait_for_it(self):
+        self.engine.unloaded = False                     # as a ProcessEngine is while its start runs
+        self.svc.start_load()
+        calls = {"props": lambda: self.get_status("/props"), "v1_load": lambda: self.post("/v1/load", {})}
+        threads = {n: self.in_thread(f) for n, f in calls.items()}
+        self.wait_loading()
+        time.sleep(0.3)
+        for t, _ in threads.values():
+            self.assertTrue(t.is_alive())                # held, not refused
+        self.engine.go.set()
+        for t, _ in threads.values():
+            t.join(10)
+        for n, (_, out) in threads.items():
+            self.assertEqual(out[0][0], 200, n)
+        self.assertEqual(threads["props"][1][0][1]["total_slots"], self.svc.slot_stats()["total"])
+        self.assertEqual(threads["v1_load"][1][0][1]["status"], "loaded")
+
+    def test_props_sent_mid_load_gets_the_failed_loads_503(self):
+        self.engine.fail = "the engine exited before it was ready"
+        self.engine.unloaded = False
+        self.svc.start_load()
+        t, out = self.in_thread(lambda: self.get_status("/props"))
+        self.assertTrue(self.engine.entered.wait(5))
+        time.sleep(0.3)
+        self.engine.go.set()
+        t.join(10)
+        self.assertEqual(out[0][0], 503)
+        self.assertIn("before it was ready", json.dumps(out[0][1]))
+
     def test_ui_shows_the_loading_text(self):
         js = (ROOT / "serve/web/app.js").read_text(encoding="utf-8")
         self.assertIn("Loading weights", js)

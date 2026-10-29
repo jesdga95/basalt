@@ -344,6 +344,11 @@ class Service:
         with self.fifo:
             self.ensure_loaded()
 
+    def wait_load(self):
+        """Hold the caller until a running load or wake ends, on the same fifo as a request; raises the load's error."""
+        if self.loading:
+            self.load()
+
     def _wake(self):
         """Wake a sleeping engine (caller holds fifo); a failed wake ends it and the next start loads it again."""
         t = time.time()
