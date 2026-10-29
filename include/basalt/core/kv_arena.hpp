@@ -6,6 +6,7 @@
 // layout is page-major ([page][kv_head][page_size][...]), so the first `n` pages of every array are a prefix of it.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -28,6 +29,9 @@ public:
     /// Array `i` is a table, not a cache: every byte `map` backs is filled from `bytes` (from the same offset)
     /// instead of zeroed, as far as `bytes` reaches.
     void set_contents(size_t i, std::vector<uint8_t> bytes);
+    /// `map` backs each array in mappings that end on the grid of `cells` cells (0: one mapping per call), so `unmap`
+    /// gives back everything past the first grid line at or above its cut, however few calls backed it.
+    void set_extent_cells(int64_t cells) { extent_cells_ = std::max<int64_t>(cells, 0); }
     void close();
     bool valid() const { return !arrays_.empty(); }
 
@@ -67,6 +71,7 @@ private:
     int64_t pages_ = 0;
     int64_t page_cells_ = 0;
     int64_t cells_ = 0;
+    int64_t extent_cells_ = 0;
     uint64_t gran_ = 0;
 };
 

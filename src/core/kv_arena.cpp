@@ -91,24 +91,29 @@ uint64_t KvArena::grow_bytes(int64_t cells) const {
 bool KvArena::map(int64_t cells, std::string& err) {
     bool any = false;
     for (Array& a : arrays_) {
-        const uint64_t at = a.mapped(), want = need(a, cells);
-        if (want <= at) continue;
-        const unsigned long long h = vmm::map(a.base + at, want - at);
-        if (h == 0) {
-            (void) cudaGetLastError();
-            recount();
-            err = "the driver has no VRAM for the KV pools";
-            return false;
+        const uint64_t want = need(a, cells);
+        for (uint64_t at = a.mapped(); at < want; at = a.mapped()) {
+            // this mapping ends at the first grid line past `at`
+            uint64_t end = want;
+            for (int64_t c = extent_cells_; c > 0 && c < max_cells(); c += extent_cells_)
+                if (need(a, c) > at) { end = std::min(end, need(a, c)); break; }
+            const unsigned long long h = vmm::map(a.base + at, end - at);
+            if (h == 0) {
+                (void) cudaGetLastError();
+                recount();
+                err = "the driver has no VRAM for the KV pools";
+                return false;
+            }
+            a.extents.push_back({at, end - at, h});
+            const uint64_t have = at < a.contents.size() ? std::min<uint64_t>(end - at, a.contents.size() - at) : 0;
+            if (cudaMemset(a.base + at, 0, (size_t) (end - at)) != cudaSuccess ||
+                (have > 0 && cudaMemcpy(a.base + at, a.contents.data() + at, (size_t) have, cudaMemcpyHostToDevice) != cudaSuccess)) {
+                recount();
+                err = std::string("zeroing new KV pages failed: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            any = true;
         }
-        a.extents.push_back({at, want - at, h});
-        const uint64_t have = at < a.contents.size() ? std::min<uint64_t>(want - at, a.contents.size() - at) : 0;
-        if (cudaMemset(a.base + at, 0, (size_t) (want - at)) != cudaSuccess ||
-            (have > 0 && cudaMemcpy(a.base + at, a.contents.data() + at, (size_t) have, cudaMemcpyHostToDevice) != cudaSuccess)) {
-            recount();
-            err = std::string("zeroing new KV pages failed: ") + cudaGetErrorString(cudaGetLastError());
-            return false;
-        }
-        any = true;
     }
     recount();
     // the zeroing is ordered before work on any stream that follows
