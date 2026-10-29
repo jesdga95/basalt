@@ -417,6 +417,139 @@ int exhausted_message_cases() {
     }
     return fail;
 }
+// The serve guard's level: below the floor a request runs on unless RAM is under the hard floor or the OS stalls on it
+int ram_level_cases() {
+    using namespace basalt::platform;
+    int fail = 0;
+    const uint64_t floor = gib(3.09), hard = kRamHardFloor;
+    const MemoryStalls calm{true, 2.0, 0.0}, busy{true, kStallSomePct, 0.0}, stalled{true, 5.0, kStallFullPct},
+                       none{false, 0.0, 0.0};
+    struct Case { const char* what; double avail; MemoryStalls st; RamLevel want; };
+    const Case cases[] = {
+        {"above the floor", 7.13, calm, RamLevel::Ok},
+        {"exactly at the floor", 3.09, calm, RamLevel::Ok},
+        {"unknown reading (0)", 0.0, stalled, RamLevel::Ok},
+        {"the incident's reading, calm", 3139.0 / 1024, calm, RamLevel::Low},
+        {"below the floor, calm", 2.5, calm, RamLevel::Low},
+        {"just above the hard floor, calm", 1.01, calm, RamLevel::Low},
+        {"under the hard floor, calm", 0.99, calm, RamLevel::Critical},
+        {"below the floor, some stalls at the limit", 2.5, busy, RamLevel::Critical},
+        {"below the floor, full stalls at the limit", 2.5, stalled, RamLevel::Critical},
+        {"above the floor, stalls high", 5.0, stalled, RamLevel::Ok},
+        {"below the floor, no stall reading", 2.5, none, RamLevel::Critical},
+        {"above the floor, no stall reading", 5.0, none, RamLevel::Ok},
+    };
+    const char* names[] = {"ok", "low", "critical"};
+    for (const Case& c : cases) {
+        const RamLevel got = ram_level(gib(c.avail), floor, hard, c.st);
+        std::printf("ram level %-60s -> %s%s\n", c.what, names[(int) got], got == c.want ? "" : "   <-- WRONG");
+        fail |= got != c.want;
+    }
+    // a hard floor above the guard's own is capped at it
+    const bool capped = ram_level(gib(1.5), gib(2.0), gib(4.0), calm) == RamLevel::Critical &&
+                        ram_level(gib(2.5), gib(2.0), gib(4.0), calm) == RamLevel::Ok;
+    std::printf("ram level %-60s -> %s\n", "hard floor above the guard's", capped ? "capped" : "not capped   <-- WRONG");
+    fail |= !capped;
+    return fail;
+}
+// How long a request arriving below the floor waits
+// The guard paused (a sleeping engine) judges no reading; unpausing judges a fresh one before it returns.
+int guard_pause_cases() {
+    using namespace basalt::platform;
+    if (available_memory() == 0) {
+        std::printf("guard pause: SKIPPED, no available-RAM reading here\n");
+        return 0;
+    }
+    int fail = 0;
+    auto check = [&](const char* what, bool ok) {
+        std::printf("guard pause %-59s %s\n", what, ok ? "ok" : "   <-- WRONG");
+        fail |= !ok;
+    };
+    start_ram_guard(0);
+    ram_guard_pause(true);
+    ram_guard_pause(false);
+    check("floor 0, unpaused: the level is ok", ram_guard_level() == RamLevel::Ok);
+    ram_guard_pause(true);
+    start_ram_guard(~0ull >> 1);   // every reading below the floor
+    std::this_thread::sleep_for(std::chrono::milliseconds(350));
+    check("paused, readings below the floor: the level stays ok", ram_guard_level() == RamLevel::Ok);
+    const uint64_t drops = ram_guard_drops();
+    ram_guard_pause(false);
+    check("unpaused below the floor: low at once", ram_guard_level() != RamLevel::Ok);
+    check("... counted as one drop", ram_guard_drops() == drops + 1);
+    start_ram_guard(0);
+    ram_guard_pause(true);
+    ram_guard_pause(false);
+    check("floor 0 again: back to ok", ram_guard_level() == RamLevel::Ok);
+    return fail;
+}
+int admit_wait_cases() {
+    using namespace basalt::platform;
+    int fail = 0;
+    auto check = [&](const char* what, bool got, bool want) {
+        std::printf("admit wait %-60s %s%s\n", what, got ? "waits" : "starts", got == want ? "" : "   <-- WRONG");
+        fail |= got != want;
+    };
+    check("RAM ok", ram_admit_waits(RamLevel::Ok, 0), false);
+    check("low, just arrived", ram_admit_waits(RamLevel::Low, 0), true);
+    check("critical, just arrived", ram_admit_waits(RamLevel::Critical, 0), true);
+    check("low, the wait nearly over", ram_admit_waits(RamLevel::Low, kRamAdmitWaitMs - 1), true);
+    check("low, the wait over", ram_admit_waits(RamLevel::Low, kRamAdmitWaitMs), false);
+    check("critical, the wait over", ram_admit_waits(RamLevel::Critical, kRamAdmitWaitMs), false);
+    auto cont = [&](const char* what, bool got, bool want) {
+        std::printf("admit wait %-60s %s%s\n", what, got ? "continues, no wait" : "a turn, waits",
+                    got == want ? "" : "   <-- WRONG");
+        fail |= got != want;
+    };
+    cont("wrap-up after a thinking budget (19 tokens past live)", ram_continues_live(true, 19), true);
+    cont("nothing new past live", ram_continues_live(true, 0), true);
+    cont("at the continuation limit", ram_continues_live(true, kRamContinueTokens), true);
+    cont("one past the continuation limit", ram_continues_live(true, kRamContinueTokens + 1), false);
+    cont("a new turn on the live conversation", ram_continues_live(true, 4000), false);
+    cont("few tokens, but not from the live conversation", ram_continues_live(false, 19), false);
+    cont("a shorter prompt than live", ram_continues_live(true, -5), false);
+    return fail;
+}
+// The pressure file's avg10 figures
+int stall_parse_cases() {
+    using namespace basalt::platform;
+    int fail = 0;
+    const MemoryStalls a = parse_memory_stalls("some avg10=12.34 avg60=1.00 avg300=0.10 total=123\n"
+                                               "full avg10=5.60 avg60=0.50 avg300=0.05 total=45\n");
+    const MemoryStalls b = parse_memory_stalls("some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n");
+    const MemoryStalls c = parse_memory_stalls("");
+    const bool ok_a = a.known && a.some > 12.33 && a.some < 12.35 && a.full > 5.59 && a.full < 5.61;
+    std::printf("stall parse %-58s -> some %.2f full %.2f%s\n", "both lines", a.some, a.full, ok_a ? "" : "   <-- WRONG");
+    std::printf("stall parse %-58s -> %s%s\n", "no full line", b.known ? "known" : "unknown", b.known ? "   <-- WRONG" : "");
+    std::printf("stall parse %-58s -> %s%s\n", "empty", c.known ? "known" : "unknown", c.known ? "   <-- WRONG" : "");
+    fail |= !ok_a || b.known || c.known;
+    const MemoryStalls live = memory_stalls();
+    std::printf("stall reading here: %s (some %.2f, full %.2f)\n", live.known ? "known" : "none", live.some, live.full);
+    return fail;
+}
+// The stop's error: the floor it fell under, and the budget flag only when the engine's own growth took the RAM
+int stop_message_cases() {
+    using namespace basalt::platform;
+    int fail = 0;
+    const uint64_t floor = 3161ull << 20, hard = kRamHardFloor;
+    const MemoryStalls calm{true, 1.0, 0.0}, stalled{true, 75.0, 45.0}, none{};
+    struct Case { const char* what; double avail; MemoryStalls st; double others, own; const char* has; bool budget; };
+    const Case cases[] = {
+        {"under the hard floor, other programs", 900.0 / 1024, calm, 2.0, 0.1, "900 MiB free < 1024 MiB hard floor", false},
+        {"stalls, other programs", 2.5, stalled, 3.0, 0.5, "and the system stalls on memory (some 75%, full 45%)", false},
+        {"no stall reading, the engine grew", 3139.0 / 1024, none, 0.5, 1.5, "RAM low (3139 MiB free < 3161 MiB guard)", true},
+        {"other programs' share named", 0.9, calm, 2.0, 0.1, "other programs took 2048 MiB", false},
+        {"nothing measured", 0.9, calm, 0.0, 0.0, "request stopped", false},
+    };
+    for (const Case& c : cases) {
+        const std::string m = ram_stop_message(gib(c.avail), floor, hard, c.st, gib(c.others), gib(c.own));
+        const bool budget = m.find("--resident-budget-gib") != std::string::npos;
+        const bool ok = m.find(c.has) != std::string::npos && budget == c.budget;
+        std::printf("ram stop %-50s -> %s%s\n", c.what, m.c_str(), ok ? "" : "   <-- WRONG");
+        fail |= !ok;
+    }
+    return fail;
+}
 // The size lock_resident is exercised with: the full 256 MiB where the locked-memory limit allows it, otherwise half
 // of what the limit leaves. Zero means the limit is too low to lock anything meaningful.
 uint64_t lock_test_bytes(bool& reduced) {
@@ -440,7 +573,8 @@ uint64_t lock_test_bytes(bool& reduced) {
 
 int main() {
     int fail_keeps = file_cache_keeps_cases() | ram_floor_cases() | read_ahead_cases() | drop_view_cases() |
-                    guard_reclaim_cases() | reclaim_due_cases() | exhausted_message_cases();
+                    guard_reclaim_cases() | reclaim_due_cases() | exhausted_message_cases() | ram_level_cases() |
+                    admit_wait_cases() | guard_pause_cases() | stall_parse_cases() | stop_message_cases();
     bool reduced = false;
     const uint64_t bytes = lock_test_bytes(reduced);
     if (bytes == 0) {

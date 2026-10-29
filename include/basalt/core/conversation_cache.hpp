@@ -59,6 +59,18 @@ struct PooledAlloc {
     void construct(U* p) noexcept { ::new (static_cast<void*>(p)) U; }   // resize leaves new bytes as they are
     template <class U, class... A>
     void construct(U* p, A&&... a) { ::new (static_cast<void*>(p)) U(std::forward<A>(a)...); }
+    /// Frees the blocks the pool keeps; returns their bytes.
+    static size_t release_pooled() {
+        Pool& p = pool();
+        std::lock_guard<std::mutex> lk(p.mu);
+        size_t n = 0;
+        for (const auto& b : p.blocks) {
+            n += b.second;
+            ::operator delete(b.first);
+        }
+        p.blocks.clear();
+        return n;
+    }
     template <class U>
     bool operator==(const PooledAlloc<U>&) const noexcept { return true; }
     template <class U>
@@ -357,6 +369,19 @@ public:
         return dropped;
     }
     size_t superseded() const { return superseded_; }
+
+    // Drop every parked conversation and the retained K/V buffers, to give their RAM back; returns their bytes.  With
+    // spilling on, the conversations wait in take_spilled() for the tier below, as make_room's evictions do.
+    size_t clear() {
+        const size_t freed = bytes();
+        if (spill_)
+            for (auto& e : entries_) spilled_.push_back(std::move(e));
+        entries_.clear();
+        bytes_ = 0;
+        reuse_ = {};
+        reuse_owner_ = nullptr;
+        return freed;
+    }
 
     bool put(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();
