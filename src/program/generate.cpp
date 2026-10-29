@@ -8077,6 +8077,10 @@ int main(int argc, char** argv) {
                     }
                     if (verr.empty()) std::fputs(reply.c_str(), stdout);
                 }
+                // asleep, the driver holds the engine's GPU state in RAM until the wake: the RAM guard judges no reading
+                // then (no shed, no admission wait from it), and judges a fresh one at the wake
+                if (down && verr.empty()) basalt::platform::ram_guard_pause(true);
+                if (!down) basalt::platform::ram_guard_pause(false);
                 if (!verr.empty()) std::printf("ERR %s\n", verr.c_str());
                 std::fflush(stdout);
                 continue;
@@ -8086,6 +8090,7 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 continue;
             }
+            basalt::platform::ram_guard_pause(false);   // a request without a WAKE first: the guard judges again
             admit_slot = -1;
             solo_slot = -1;
             if (line.rfind("SGEN ", 0) == 0 || line.rfind("SGENI ", 0) == 0) {   // SGEN <slot> <max_new> ...: a GEN in that slot

@@ -453,6 +453,36 @@ int ram_level_cases() {
     return fail;
 }
 // How long a request arriving below the floor waits
+// The guard paused (a sleeping engine) judges no reading; unpausing judges a fresh one before it returns.
+int guard_pause_cases() {
+    using namespace basalt::platform;
+    if (available_memory() == 0) {
+        std::printf("guard pause: SKIPPED, no available-RAM reading here\n");
+        return 0;
+    }
+    int fail = 0;
+    auto check = [&](const char* what, bool ok) {
+        std::printf("guard pause %-59s %s\n", what, ok ? "ok" : "   <-- WRONG");
+        fail |= !ok;
+    };
+    start_ram_guard(0);
+    ram_guard_pause(true);
+    ram_guard_pause(false);
+    check("floor 0, unpaused: the level is ok", ram_guard_level() == RamLevel::Ok);
+    ram_guard_pause(true);
+    start_ram_guard(~0ull >> 1);   // every reading below the floor
+    std::this_thread::sleep_for(std::chrono::milliseconds(350));
+    check("paused, readings below the floor: the level stays ok", ram_guard_level() == RamLevel::Ok);
+    const uint64_t drops = ram_guard_drops();
+    ram_guard_pause(false);
+    check("unpaused below the floor: low at once", ram_guard_level() != RamLevel::Ok);
+    check("... counted as one drop", ram_guard_drops() == drops + 1);
+    start_ram_guard(0);
+    ram_guard_pause(true);
+    ram_guard_pause(false);
+    check("floor 0 again: back to ok", ram_guard_level() == RamLevel::Ok);
+    return fail;
+}
 int admit_wait_cases() {
     using namespace basalt::platform;
     int fail = 0;
@@ -544,7 +574,7 @@ uint64_t lock_test_bytes(bool& reduced) {
 int main() {
     int fail_keeps = file_cache_keeps_cases() | ram_floor_cases() | read_ahead_cases() | drop_view_cases() |
                     guard_reclaim_cases() | reclaim_due_cases() | exhausted_message_cases() | ram_level_cases() |
-                    admit_wait_cases() | stall_parse_cases() | stop_message_cases();
+                    admit_wait_cases() | guard_pause_cases() | stall_parse_cases() | stop_message_cases();
     bool reduced = false;
     const uint64_t bytes = lock_test_bytes(reduced);
     if (bytes == 0) {

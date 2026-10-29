@@ -321,9 +321,39 @@ std::atomic<bool> g_guard_on{false};
 std::atomic<RamLevel> g_guard_level{RamLevel::Ok};
 std::atomic<uint64_t> g_guard_floor{0};
 std::atomic<uint64_t> g_guard_drops{0};
+std::atomic<bool> g_guard_paused{false};
 std::mutex g_guard_mu;   // the reading behind the level
 uint64_t g_guard_avail = 0;
 MemoryStalls g_guard_stalls;
+std::mutex g_judge_mu;   // one judgement at a time: the guard's thread, or an unpause
+RamLevel g_judged = RamLevel::Ok;   // the level the last judgement left (under g_judge_mu)
+
+// Judges the reading `avail` against the floor: sets the level, counts a drop below the floor, logs a change.
+void guard_judge(uint64_t avail) {
+    std::lock_guard<std::mutex> judge(g_judge_mu);
+    const uint64_t floor = g_guard_floor.load();
+    // the stall reading only matters below the floor
+    const MemoryStalls stalls = ram_below_floor(avail, floor) ? memory_stalls() : MemoryStalls{};
+    const RamLevel level = ram_level(avail, floor, kRamHardFloor, stalls);
+    const RamLevel was = g_judged;
+    {
+        std::lock_guard<std::mutex> lock(g_guard_mu);
+        g_guard_avail = avail;
+        g_guard_stalls = stalls;
+    }
+    if (was == RamLevel::Ok && level != RamLevel::Ok) g_guard_drops.fetch_add(1);
+    g_guard_level = level;
+    const unsigned long long mib = (unsigned long long) (avail >> 20);
+    if (was == RamLevel::Ok && level != RamLevel::Ok)
+        basalt::log::warn("basalt", "RAM low: %llu MiB free < %llu MiB guard", mib, (unsigned long long) (floor >> 20));
+    if (level == RamLevel::Critical && was != RamLevel::Critical && stalls.known)
+        basalt::log::warn("basalt", "RAM critical: %llu MiB free, hard floor %llu MiB, memory stalls some "
+                          "%.0f%% full %.0f%%", mib, (unsigned long long) (kRamHardFloor >> 20), stalls.some, stalls.full);
+    if (level == RamLevel::Low && was == RamLevel::Critical)
+        basalt::log::info("basalt", "RAM low, no longer critical: %llu MiB free", mib);
+    if (level == RamLevel::Ok && was != RamLevel::Ok) basalt::log::info("basalt", "RAM back: %llu MiB free", mib);
+    g_judged = level;
+}
 #if defined(_WIN32)
 constexpr uint64_t kReclaimLead = 1ull << 30;       // how far above the floor the guard gives the view back
 constexpr uint64_t kReclaimChunk = 256ull << 20;    // bytes given back per lock hold
@@ -363,16 +393,19 @@ void start_ram_guard(uint64_t floor_bytes) {
     g_guard_floor = floor_bytes;
     if (g_guard_on.exchange(true)) return;
     std::thread([] {
-        RamLevel was = RamLevel::Ok;
 #if defined(_WIN32)
         bool logged_reclaim = false;
         uint64_t avail_after = 0;   // the reading right after the last give-back
         auto last_reclaim = std::chrono::steady_clock::now();
 #endif
         for (;;) {
+            if (g_guard_paused.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
             uint64_t avail = available_memory();
-            const uint64_t floor = g_guard_floor.load();
 #if defined(_WIN32)
+            const uint64_t floor = g_guard_floor.load();
             // A later give-back waits for the view to be read in again, so a long prompt read keeps it in check.
             const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - last_reclaim).count();
@@ -395,29 +428,7 @@ void start_ram_guard(uint64_t floor_bytes) {
                 }
             }
 #endif
-            // the stall reading only matters below the floor
-            const MemoryStalls stalls = ram_below_floor(avail, floor) ? memory_stalls() : MemoryStalls{};
-            const RamLevel level = ram_level(avail, floor, kRamHardFloor, stalls);
-            {
-                std::lock_guard<std::mutex> lock(g_guard_mu);
-                g_guard_avail = avail;
-                g_guard_stalls = stalls;
-            }
-            if (was == RamLevel::Ok && level != RamLevel::Ok) g_guard_drops.fetch_add(1);
-            g_guard_level = level;
-            const unsigned long long mib = (unsigned long long) (avail >> 20);
-            if (was == RamLevel::Ok && level != RamLevel::Ok)
-                basalt::log::warn("basalt", "RAM low: %llu MiB free < %llu MiB guard", mib,
-                                  (unsigned long long) (floor >> 20));
-            if (level == RamLevel::Critical && was != RamLevel::Critical && stalls.known)
-                basalt::log::warn("basalt", "RAM critical: %llu MiB free, hard floor %llu MiB, memory stalls some "
-                                  "%.0f%% full %.0f%%", mib, (unsigned long long) (kRamHardFloor >> 20),
-                                  stalls.some, stalls.full);
-            if (level == RamLevel::Low && was == RamLevel::Critical)
-                basalt::log::info("basalt", "RAM low, no longer critical: %llu MiB free", mib);
-            if (level == RamLevel::Ok && was != RamLevel::Ok)
-                basalt::log::info("basalt", "RAM back: %llu MiB free", mib);
-            was = level;
+            guard_judge(avail);
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }).detach();   // runs for the life of the process
@@ -434,6 +445,14 @@ RamLevel ram_guard_level(uint64_t* avail, uint64_t* floor, MemoryStalls* stalls)
 }
 
 uint64_t ram_guard_drops() { return g_guard_drops.load(); }
+
+void ram_guard_pause(bool paused) {
+    if (paused) {
+        g_guard_paused = true;
+        return;
+    }
+    if (g_guard_paused.exchange(false) && g_guard_on.load()) guard_judge(available_memory());
+}
 
 #if defined(_WIN32)
 namespace {

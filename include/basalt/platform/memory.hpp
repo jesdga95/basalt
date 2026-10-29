@@ -215,6 +215,9 @@ void start_ram_guard(uint64_t floor_bytes);
 RamLevel ram_guard_level(uint64_t* avail = nullptr, uint64_t* floor = nullptr, MemoryStalls* stalls = nullptr);
 /// How many times the reading has gone below the floor since the guard started: the serve loop sheds once per drop.
 uint64_t ram_guard_drops();
+/// Pauses the guard (`paused`): its readings are not judged, and the level stays the last one judged; for a sleeping
+/// engine, whose GPU state the driver holds in RAM until the wake. Unpausing judges a fresh reading before it returns.
+void ram_guard_pause(bool paused);
 /// Hands the heap's free pages back to the OS (best effort).
 void release_free_heap();
 /// A mapped file view the guard gives back (drop_mapped_view) when a reading comes within 1 GiB of its floor, then
