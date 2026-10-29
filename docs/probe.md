@@ -90,7 +90,9 @@ basalt-probe
   suggested: --pool-workers 8 (52 us/expert, best 51 us)
   suggested: --prefill-cpu-share 0.45 (prefill +9%)
   config: --gpu 0,1 --kv int8 ...
+  wall  97.3 s
+
   Measured on this machine. Hand-tuned settings can still beat these.
 ```
 
-(The numbers above only show the layout.) Timing and engine progress go to stderr.
+The `wall` line is the total wall time of the run, engine launch included. (The numbers above only show the layout.) Timing and engine progress go to stderr.

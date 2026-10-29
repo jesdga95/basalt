@@ -132,6 +132,7 @@ std::string format_report(const ReportInput& in) {
     if (!in.adapt_line.empty()) o += "  adapt test  " + in.adapt_line + "\n";
     for (const auto& s : in.suggested) o += "  suggested: " + s + "\n";
     o += "  config: " + in.config + "\n";
+    if (in.wall_s >= 0) o += fmt("  wall  %.1f s\n\n", in.wall_s);
     o += std::string("  ") + kProbeDisclaimer + "\n";
     return o;
 }

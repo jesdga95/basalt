@@ -200,6 +200,7 @@ double measure_share(Engine& eng, const std::vector<std::vector<int64_t>>& fixtu
 }  // namespace
 
 int main(int argc, char** argv) {
+    const auto t_start = Clock::now();
     ProbeOptions o;
     std::string err;
     if (!parse_args(argc, argv, o, err)) {
@@ -416,6 +417,8 @@ int main(int argc, char** argv) {
         if (args[i] == "--model") { ++i; continue; }
         in.config += (in.config.empty() ? "" : " ") + args[i];
     }
+    // total wall time from program start, engine launch included
+    in.wall_s = std::chrono::duration<double>(Clock::now() - t_start).count();
     std::fputs(format_report(in).c_str(), stdout);
     return 0;
 }
