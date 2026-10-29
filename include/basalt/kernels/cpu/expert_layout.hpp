@@ -32,7 +32,7 @@ struct ExpertLayout {
     }
 };
 
-/// Plan v0.3 P6: whether this CPU (and its OS) runs the AVX-512 kernels (F, BW, VL, VNNI, VBMI).  Probed in a
+/// Plan v0.3 P6: whether this CPU (and its OS) runs the AVX-512 kernels (F, BW, VL, VNNI, VBMI, and BMI2).  Probed in a
 /// file compiled without AVX-512, so asking is safe everywhere.
 bool cpu_avx512_ok();
 /// Whether this CPU runs AVX-512F + AVX-512BW + AVX-512VL + AVX-512DQ (e.g. Skylake-X i9-9920X) for iq_avx512.cpp.

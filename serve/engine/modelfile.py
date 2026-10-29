@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 from model_file import ModelFile  # noqa: E402
+from serve.engine.flags import flag_value  # noqa: E402
 
 VISION_EXE = "basalt-vision"
 
@@ -22,6 +23,15 @@ def cache_root() -> Path:
 def cache_dir(mf: ModelFile) -> Path:
     """One cache directory per model, named by the meta section's sha256 prefix."""
     return cache_root() / mf.sections["meta"][2].hex()[:16]
+
+
+def with_conversation_dir(words: list[str], cdir: Path) -> list[str]:
+    """`words` plus the default conversation directory (inside the model cache folder `cdir`) when the disk budget
+    is above zero and no directory is named."""
+    budget = flag_value(words, "--conversation-cache-disk-mib")
+    if budget and budget.isdigit() and int(budget) > 0 and not flag_value(words, "--conversation-cache-dir"):
+        return words + ["--conversation-cache-dir", str(cdir / "conversations")]
+    return words
 
 
 def write_section(mf: ModelFile, name: str, dest: Path) -> None:
@@ -94,10 +104,10 @@ def model_config(path: str, engine_bin: str, vision: bool | str = False,
     mf = ModelFile(path)
     meta = json.loads(mf.read("meta"))
     path = os.path.abspath(path)
-    words = list(engine_words or [])
+    cdir = cache_dir(mf)
+    words = with_conversation_dir(list(engine_words or []), cdir)
     args = ["--model", path]   # settings come from the engine defaults and the server
     args += words
-    cdir = cache_dir(mf)
     cdir.mkdir(parents=True, exist_ok=True)
     cfg = {"engine_bin": os.path.abspath(engine_bin), "args": args, "model_name": meta.get("name") or "basalt",
            "sampling": dict(meta.get("sampling") or {}), "log": str(cdir / "engine.log"),

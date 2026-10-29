@@ -460,6 +460,16 @@ public:
     bool complement_pinned() const { return complement_pinned_; }
     bool complement_ready() const { return complement_ready_; }
     uint64_t locked_bytes() const { return complement_locked_; }
+    /// SLEEP and WAKE: the RAM copy's registration with the driver.  `unpin_complement` drops it, so a process
+    /// checkpoint does not map the whole copy into every context again on restore; false (nothing changed) when the
+    /// copy is not one registered range read at its host addresses.  `repin_start` registers it again at the same
+    /// addresses, about 1 GiB at a time on `threads` threads in address order; `repin_wait(p, n)` waits until
+    /// [p, p + n) is registered (false once a registration was refused); `repin_finish` waits for all of it.
+    bool unpin_complement(std::string& err);
+    bool complement_unpinned() const { return unpinned_; }
+    void repin_start(int threads);
+    bool repin_wait(const void* p, uint64_t n) const;
+    bool repin_finish(std::string& err);
     /// Lend-region slots whose experts the compact copy holds (the last ones of the cache).
     int64_t resident_lent_slots() const { return complement_lent_slots_; }
 
@@ -596,6 +606,13 @@ private:
     const uint8_t* host_at(uint64_t off, uint64_t bytes) const;
     std::vector<uint64_t> complement_offsets_;
     bool complement_pinned_ = false;
+    bool unpinned_ = false;                   ///< SLEEP dropped the copy's registration; WAKE puts it back
+    std::vector<uint64_t> pin_units_;         ///< registered again in these ranges: starts into the arena, then the end
+    std::unique_ptr<std::atomic<int>[]> pin_state_;   ///< per range: 0 waiting, 1 registered, 2 refused
+    std::atomic<size_t> pin_next_{0};
+    std::vector<std::thread> pin_threads_;
+    void repin_join();
+    void unregister_complement();
     bool complement_partial_ = false;         ///< CS-T: only the first complement_pin_limit_ bytes are registered
     uint64_t complement_pin_limit_ = 0;
     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
