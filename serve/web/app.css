@@ -47,6 +47,7 @@ td, th, .v, .num { font-family: var(--font-mono); font-variant-numeric: tabular-
 .state { font: 500 13px/1 var(--font-mono); color: var(--fg-2); white-space: nowrap; }
 .state[data-s="generating"], .state[data-s="reading"] { color: var(--accent); }
 .state[data-s="offline"] { color: var(--err); }
+.state[data-s="loading"] { color: var(--accent); }
 .where { font: 400 13px/1 var(--font-mono); color: var(--fg-3); white-space: nowrap; }
 
 .auth { display: flex; align-items: center; gap: 12px; margin: 0 28px 16px; padding: 12px 20px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; flex: none; }
@@ -232,6 +233,7 @@ tr.live td { color: var(--accent); }
   .sb-ch { flex: none; height: 56px; }
 }
 @media (max-width: 560px) {
+  .detail { display: none; }
   .sl, .sl.dense { --cols: 76px minmax(0, 1fr) 0 96px 0 56px; }
   .sl.dense .rw .p.nm .u { display: none; }
   .rw { column-gap: 10px; padding: 0 16px; }

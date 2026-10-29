@@ -290,7 +290,11 @@ function draw() {
   const live = M.live || {}, eng = M.engine || {}, hist = M.history || {}, reqs = M.requests || [];
   const total = (live.slots || {}).total || 1, slots = M.slots || [];
   const name = (live.state || "idle")[0].toUpperCase() + (live.state || "idle").slice(1);
-  setState(live.state || "idle", live.queued > 0 ? `${name} · ${live.queued} queued` : name);
+  const ld = live.state === "loading" ? live.load || {} : null;
+  const gib = ld ? Object.entries(ld.gib || {}).map(([k, v]) => `${k} ${v.toFixed(1)} GiB`).join(" · ") : "";
+  setState(live.state || "idle", ld ? ld.kind === "wake" ? "Waking up" : `Loading weights${num(ld.percent) ? ` · ${ld.percent}%` : ""}`
+    : live.queued > 0 ? `${name} · ${live.queued} queued` : name);
+  text($("#detail"), gib); $("#detail").hidden = !gib;
   text($("#model"), eng.model || "");
   drawSide(M.hardware || {}, M.hardware_static || {}, hist, eng, reqs[0]);
   drawHero(live, hist, reqs, M.best || {}, slots, total);

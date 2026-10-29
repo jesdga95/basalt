@@ -259,7 +259,7 @@ def make_handler(svc: Service):
             elif path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
-                                 "loaded": svc.loaded(), "service": "basalt"})
+                                 "loaded": svc.loaded(), "loading": svc.loading, "service": "basalt"})
             elif path == "/status":
                 if not self._authorized():                  # it shows the last answer's tail
                     return
@@ -281,7 +281,10 @@ def make_handler(svc: Service):
                              "meta": {"n_ctx": svc.engine.max_context},
                              "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
                                               "output_modalities": ["text"]}}
-                    if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
+                    if svc.loading:
+                        model["status"] = {"value": "loading"}
+                        loaded = True
+                    elif not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
                         model["status"] = {"value": "unloaded"}   # listed, loads on use
                         loaded = True
                     self._json(200, {"object": "list", "data": [model] if loaded else []})

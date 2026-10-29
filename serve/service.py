@@ -68,6 +68,10 @@ DEBUG = False            # --debug: one line per request plus the raw model text
 
 
 class Service:
+    loading = booting = False                      # a load or wake runs; the start-up load runs
+    load_kind = "weights"                               # what the running load is: "weights" or "wake"
+    boot_error = None                                   # the start-up load's failure, for the requests queued behind it
+
     def served_names(self) -> list[str]:
         """The model names a request may use: the one /v1/models lists, and the model file's own name."""
         names = [self.model]
@@ -190,8 +194,47 @@ class Service:
         """Shutdown has begun: a request still in flight no longer restarts the engine."""
         self.stopping.set()
 
+    def load_progress(self) -> dict | None:
+        """The running load: {"kind": "weights" | "wake", and for weights "percent", "gib"} from the engine's log, else None."""
+        if not self.loading:
+            return None
+        return {"kind": self.load_kind, **((getattr(self.engine, "load_status", None) or {}) if self.load_kind == "weights" else {})}
+
+    def start_load(self, on_ready=None) -> None:
+        """Load the model in the background at start. The HTTP server is already up and requests wait on the same
+        fifo as for any load; a failed start is kept for them and ends the server. `on_ready()` runs once loaded."""
+        def run():
+            self.booting = True
+            try:
+                self.load()
+                if on_ready is not None:
+                    on_ready()
+            except (EngineDied, GpuBusy):
+                pass                                    # kept in boot_error by ensure_loaded
+            finally:
+                self.booting = False
+                self.loading = False
+        self.load_kind, self.loading = "weights", True      # from the first poll, not from when the thread gets the fifo
+        threading.Thread(target=run, daemon=True).start()
+
     def ensure_loaded(self):
         """Start the engine if it is not running, after the before_load hook and VRAM check. Caller holds fifo."""
+        if self.boot_error is not None:
+            raise EngineStartError(str(self.boot_error), self.boot_error.log)
+        if self.loaded() and not self._vision_down() and getattr(self.engine, "asleep", False) is not True:
+            return
+        self.load_kind = "wake" if getattr(self.engine, "asleep", False) is True else "weights"
+        self.loading = True
+        try:
+            self._ensure_loaded()
+        except (EngineDied, GpuBusy) as e:
+            if self.booting:                            # the requests queued behind it get this, not a second try
+                self.boot_error = e if isinstance(e, EngineStartError) else EngineStartError(str(e))
+            raise
+        finally:
+            self.loading = False
+
+    def _ensure_loaded(self):
         if self.stopping.is_set():
             raise EngineDied("the server is stopping")
         if getattr(self.engine, "asleep", False) is True:
@@ -221,19 +264,23 @@ class Service:
             return
         if self.stopping.is_set():                      # shutdown began while the hook or the VRAM wait ran
             raise EngineDied("the server is stopping")
-        if getattr(self.engine, "unloaded", False):
+        again = bool(getattr(self.engine, "known_ctx", 0))   # a first load says nothing: the load bars do
+        if not again:
+            pass
+        elif getattr(self.engine, "unloaded", False):
             print("[server] loading the model again", flush=True)
         else:
             code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
             print(f"[server] warning: the engine stopped (exit code {code}), restarting it", flush=True)
         try:
-            self.engine.restart()
+            self.engine.restart(tries=1) if self.booting else self.engine.restart()   # the start-up load tries once
         except EngineStartError as e:                   # a line, not a traceback
             print(f"[server] error: {e}", flush=True)
             if e.log:
                 print(f"[server] engine log: {e.log}", flush=True)
             raise
-        print("[server] engine running again", flush=True)
+        if again:
+            print("[server] engine running again", flush=True)
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # reapply the last reserve
             try:
                 self.engine.vram(self.vram_reserve)
@@ -548,7 +595,9 @@ class Service:
             decoding = any(st.get("first_token") is not None for st, _ in self.live_reqs.values())
             hist = list(self.history)
         busy = bool(s.get("busy"))
-        if busy and s.get("first_token") is None and not decoding:
+        if self.loading:
+            state = "loading"
+        elif busy and s.get("first_token") is None and not decoding:
             state = "reading"
         elif busy:
             state = "generating"
@@ -559,7 +608,7 @@ class Service:
         else:
             state = "idle"
         slots = self.slot_stats()
-        live = {"state": state, "queued": slots["queue_depth"], "slots": slots, "queue": self.slot_table()[1],
+        live = {"state": state, "load": self.load_progress(), "queued": slots["queue_depth"], "slots": slots, "queue": self.slot_table()[1],
                 "prompt_tokens": s.get("prompt_tokens") if busy else None,
                 "generated": s.get("generated") if busy else None,
                 "elapsed_s": round(time.time() - s["started"], 1) if busy and s.get("started") else None,
@@ -604,7 +653,7 @@ class Service:
         images = self.vision is not None
         return {
             "service": "basalt", "model": self.model,
-            "loaded": self.loaded(), "asleep": getattr(self.engine, "asleep", False) is True,
+            "loaded": self.loaded(), "loading": self.loading, "load": self.load_progress(), "asleep": getattr(self.engine, "asleep", False) is True,
             "auto_load": hasattr(self.engine, "restart"),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "grammar",
                                   "constrained_decoding": bool(self.grammar_engine), "stream_buffered": False},
