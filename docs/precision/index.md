@@ -116,7 +116,7 @@ Prefill and decode are different computations that read and write the same KV an
 
 | Item | Prefill | Source |
 |---|---|---|
-| Dense projections | Weights dequantized to fp16, activations rounded to fp16, cuBLAS with fp32 accumulate; BF16 tensors BF16 x BF16 with fp32 compute; no q8_1 | gemm.cu:122-184; prefill.cpp:1078 |
+| Dense projections | Weights dequantized to fp16, activations rounded to fp16, cuBLAS with fp32 accumulate; BF16 tensors BF16 x BF16 with fp32 compute; no q8_1. Each weight shape runs one cuBLASLt algorithm at every chunk width (K in one piece, or a fixed number of parts reduced out of place), chosen from the heuristic's offers without timing and checked on the shape's first call of two or more rows (row 0 in narrower calls, a later row at place 0, the same bits), so a token's products are the same bits in any chunk and at any place in it (`prefill_gemm_width_test`: 20 shapes incl. the BF16 router, hc and indexer products, rows of a 512-row call again in calls of 1, 7, 37, 64 and 300 rows, all equal; cublasGemmEx, which picks per call, differed in up to 409 of 409 rows). Against a double reference over the same operands: rel RMS 7e-8 to 1.1e-5, growing with K as one fp32 loop over K. A shape whose first calls are all one row runs cublasGemmEx until a wider call comes. A last-bit change against cublasGemmEx: 20-chunk gate, IQ3_S, 360 W, PPL 2.3919 to 2.3931, mean KLD 0.02194 to 0.02249, top-1 96.31 to 96.24% (paired per-chunk dKLD +0.0006, 95% CI -0.0013 to +0.0024); 100 chunks with the mid chain change too: PPL 3.3807 to 3.3839, KLD 0.01881 to 0.01873, top-1 95.78 to 95.74% (dKLD -0.0001, CI -0.0006 to +0.0005) | gemm.cu (Plans, pinned); prefill.cpp (native_proj, bf16_proj) |
 | hc matrices | Activations rounded to BF16; down/up use the int8 copy dequantized to BF16; inject uses the BF16 tensor. From 33 tokens the up product and the mix run as one kernel (the FP32 gate rows stay in registers): each gate value is one m16n8k16 chain over k from zero, the chain cuBLAS runs for that product, and the mix keeps gr_mix_r's arithmetic, so the outputs are the same bits as the two steps (`prefill_hc_up_mix_test`) | prefill.cpp (up_mix); kernels.cu (gr_up_mix_kernel); gemm.cu (bf16_w, bf16_rows) |
 | Router | BF16 activation (decode: fp32) | prefill.cpp:1828 |
 | Shared expert | fp16 activation, fp16 SwiGLU | prefill.cpp:1823-1837 |
@@ -159,8 +159,8 @@ PPL is 2.9581 against 2.9547 with the lower cutoff, a paired per-token NLL diffe
 access the cutoff stays at 2,560 (4,096 with `--peer-exclusive`).
 
 **Prompt chunk size.** A bare `--prefill auto` reads a prompt in equal chunks of at most 16384 tokens, or 32768 for packs
-whose expert blobs exceed 1.5 MB (NVFP4). A chunk's GEMM tiles set the rounding of its K/V, so a prompt longer than 16384
-tokens on such a pack is chunked differently and its K/V can differ in the last bits; prompts up to 16384 tokens and the
+whose expert blobs exceed 1.5 MB (NVFP4). The routed experts' MMQ tiles follow the chunk's size (the dense products do not), so a prompt longer
+than 16384 tokens on such a pack is chunked differently and its K/V can differ in the last bits; prompts up to 16384 tokens and the
 256-token prompt half of the quality gate chunk as before, so the gate's numbers do not move. With `--parallel` a
 read that runs alone chunks as the single-stream path does; a read beside decoding slots takes the smaller chunk its
 capped loan allows, so the same prompt's K/V can differ in the last bits between the two. A read beside decoding slots
@@ -168,7 +168,7 @@ that gives way to a shorter request reads its rest later in the same chunks, bes
 
 **Short first chunk.** A prompt above the chunk cap (and at least 32,768 tokens) reads its first 16,384 tokens as one
 chunk and the rest in equal chunks of at most the cap, so the first chunk waits for fewer PLE rows. This moves the chunk
-boundaries (GEMM tiles, so the rounding of the K/V) and nothing else: prompts up to the cap and the quality gate's
+boundaries (the routed experts' MMQ tiles, so the rounding of the K/V) and nothing else: prompts up to the cap and the quality gate's
 256-token prompt half chunk as before (the 20-chunk gate is identical to the previous build: PPL 2.2924, KLD 0.06989,
 top-1 92.86%, 400 W, NVIDIA-checkpoint pack). Long-context check, 65,515-token prompt, the first 64 greedy tokens
 teacher-forced with the previous chunking's tokens, spec 1, int8 KV, 400 W: KLD of the next-token distribution against
