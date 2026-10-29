@@ -51,6 +51,7 @@ struct ReportInput {
     std::vector<FixtureSpeed> speeds;
     std::string config;
     std::vector<std::string> suggested;   ///< values measured to beat the defaults here: a flag and its measured reason
+    std::string adapt_line;      ///< the adaptive-tier settings' sequence rates (format_adapt_line); empty: not run
 };
 
 std::string format_report(const ReportInput& in);

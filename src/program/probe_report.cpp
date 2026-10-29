@@ -129,6 +129,7 @@ std::string format_report(const ReportInput& in) {
         for (const auto& f : in.speeds)
             if (f.name == name) o += fmt(" %s %.0f", name, f.cold);
     o += " tok/s (measured)\n";
+    if (!in.adapt_line.empty()) o += "  adapt test  " + in.adapt_line + "\n";
     for (const auto& s : in.suggested) o += "  suggested: " + s + "\n";
     o += "  config: " + in.config + "\n";
     o += std::string("  ") + kProbeDisclaimer + "\n";

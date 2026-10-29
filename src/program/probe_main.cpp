@@ -2,12 +2,14 @@
 // asks it for the machine's rates (PROBE rates), measures cold decode speed on the three standard fixtures at
 // the engine's context, and prints a short report with the values it suggests. Manual only: it prints and saves
 // nothing.
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -16,6 +18,7 @@
 #include "basalt/platform/system.hpp"
 #include "basalt/program/engine_session.hpp"
 #include "basalt/program/gpu_select.hpp"
+#include "basalt/program/options.hpp"
 #include "basalt/program/probe_derive.hpp"
 #include "basalt/program/probe_report.hpp"
 #include "basalt/log.hpp"
@@ -57,16 +60,17 @@ void usage() {
         "  -- ARGS...            engine flags, as for basalt-bench (--kv, --spec, ...)\n"
         "\n"
         "It runs conv, struct and prose once each (cold: the first request after load counts), %lld tokens each,\n"
-        "greedy. Nothing is saved.\n",
+        "greedy, then the adaptive tier's settings, each from the start placement. Nothing is saved; a\n"
+        "--expert-profile-save file is compared, not written.\n",
         BASALT_BENCH_FIXTURES, kTokens);
 }
 
-struct Options {
+struct ProbeOptions {
     std::string model, engine, fixtures = BASALT_BENCH_FIXTURES, logs;
     std::vector<std::string> passthrough;
 };
 
-bool parse_args(int argc, char** argv, Options& o, std::string& err) {
+bool parse_args(int argc, char** argv, ProbeOptions& o, std::string& err) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> std::string {
@@ -107,6 +111,57 @@ long long peer_experts_from_log(const std::string& log_path) {
     return n;
 }
 
+// The adaptive tier's settings, each run from the tiers' start placement (PROBE adapt) on one sequence: prose, then
+// struct (a cold start, then a topic switch). The first request is as long as a served reply, so the start's ramp
+// weighs in as it does there. Fills `t.tps`; a setting left at 0 is the engine's and is read back.
+constexpr long long kAdaptTokens[2] = {1200, 400};
+constexpr double kAdaptBandFloor = 0.03;   // two passes of the same setting on this sequence spread up to this much
+bool adapt_trial(Engine& eng, const std::vector<std::vector<int64_t>>& fixtures, const std::string& saved, AdaptTrial& t,
+                 std::string& err) {
+    std::string cmd = "PROBE adapt swaps=" + std::to_string(t.swaps);
+    char b[64];
+    if (t.every > 0) cmd += " every=" + std::to_string(t.every);
+    if (t.decay > 0) {
+        std::snprintf(b, sizeof b, " decay=%.4f", t.decay);
+        cmd += b;
+    }
+    if (t.saved) cmd += " profile=" + saved;
+    std::vector<std::string> blk;
+    if (!eng.command(cmd, "PROBE end", blk, err)) return false;
+    std::string ms = "?", moved = "?", peer_moved = "0", kept = "0";
+    std::istringstream is(blk.back());
+    for (std::string kv; is >> kv;) {
+        const size_t eq = kv.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
+        if (k == "every") t.every = std::atoi(v.c_str());
+        else if (k == "decay") t.decay = std::atof(v.c_str());
+        else if (k == "ms") ms = v;
+        else if (k == "moved") moved = v;
+        else if (k == "peer_moved") peer_moved = v;
+        else if (k == "kept") kept = v;
+    }
+    long long gen = 0;
+    double dms = 0, rate[2] = {0, 0};
+    const size_t order[2] = {2, 1};   // prose, struct
+    for (int k = 0; k < 2; ++k) {
+        Done d;
+        if (!eng.request(" temperature=0 top_p=0.95 top_k=20", kAdaptTokens[k], fixtures[order[k]], d) || d.generated <= 0) {
+            err = d.err.empty() ? "no tokens generated" : d.err;
+            return false;
+        }
+        gen += d.generated;
+        dms += d.decode_ms;
+        rate[k] = d.decode_ms > 0 ? (double) d.generated * 1000.0 / d.decode_ms : 0.0;
+    }
+    t.tps = dms > 0 ? (double) gen * 1000.0 / dms : 0.0;
+    if (t.saved) std::snprintf(b, sizeof b, "saved profile");
+    else std::snprintf(b, sizeof b, "%d/%d/%.2f", t.every, t.swaps, t.decay);
+    basalt::log::raw("  adapt %s: %.1f tok/s (prose %.1f, struct %.1f; reset %s ms, %s + %s slots moved, %s kept)\n", b,
+                     t.tps, rate[0], rate[1], ms.c_str(), moved.c_str(), peer_moved.c_str(), kept.c_str());
+    return true;
+}
+
 // The prefill CPU share, measured live: 8k-token chunks (the fixtures cycled, rotated so no chunk shares a prefix with
 // another) timed at share 0 (all GPU) and 1 (all CPU), then at the share that balances the two and at the default,
 // ABBA. Ends the engine's share at the last value set. Returns the balance share, or -1 when it cannot be measured.
@@ -145,7 +200,7 @@ double measure_share(Engine& eng, const std::vector<std::vector<int64_t>>& fixtu
 }  // namespace
 
 int main(int argc, char** argv) {
-    Options o;
+    ProbeOptions o;
     std::string err;
     if (!parse_args(argc, argv, o, err)) {
         basalt::log::error("basalt-probe", "%s", err.c_str());
@@ -162,6 +217,28 @@ int main(int argc, char** argv) {
 
     std::vector<std::string> args = {"--model", fs::absolute(o.model).string()};
     merge_args(args, o.passthrough);
+    // the adaptive tier: a saved profile is compared, never written (the engine starts on the model's own); the RAM
+    // copy's free places are sized at start for the largest swap count tried
+    std::string saved_profile;
+    for (size_t i = 0; i + 1 < args.size(); ++i)
+        if (args[i] == "--expert-profile-save") {
+            saved_profile = args[i + 1];
+            args.erase(args.begin() + (std::ptrdiff_t) i, args.begin() + (std::ptrdiff_t) i + 2);
+            break;
+        }
+    {
+        uint64_t bytes = 0;
+        if (!saved_profile.empty() && !(basalt::platform::file_size(saved_profile, bytes) && bytes > 0)) saved_profile.clear();
+    }
+    const std::string swaps_given = arg_value(args, "--adapt-swaps"), every_given = arg_value(args, "--adapt-every");
+    const int base_swaps = swaps_given.empty() ? basalt::program::Options().adapt_swaps : std::atoi(swaps_given.c_str());
+    bool adapt_on = base_swaps > 0 && (every_given.empty() || std::atoi(every_given.c_str()) > 0);
+    const AdaptTrial kAdaptTried[] = {{64, 256, 0.70, false, 0}, {1, 160, 0, false, 0}};
+    if (adapt_on) {
+        int most = base_swaps;
+        for (const auto& t : kAdaptTried) most = std::max(most, t.swaps);
+        set_arg(args, "--adapt-swaps", std::to_string(most));
+    }
     // the GPUs, chosen here once as the server chooses them: the engine sees only those cards and says nothing again
     {
         std::string gpu_value;
@@ -183,7 +260,7 @@ int main(int argc, char** argv) {
             return 2;
         }
         for (auto& l : lines) ids[i].insert(ids[i].end(), l.begin(), l.end());
-        need = std::max(need, (long long) ids[i].size() + kTokens + 16);
+        need = std::max(need, (long long) ids[i].size() + std::max(kTokens, kAdaptTokens[0]) + 16);
     }
     // the context fits the fixtures unless the engine arguments set one
     if (!has_arg(args, "--max-context")) set_arg(args, "--max-context", std::to_string(need));
@@ -217,6 +294,18 @@ int main(int argc, char** argv) {
         return 1;
     }
     const auto t_ready = Clock::now();
+    // the user's own swap count (the start took the largest tried, for the free places), set while the tiers are as
+    // loaded: nothing moves, so the measurements below and the first request stay cold and the user's
+    if (adapt_on) {
+        std::vector<std::string> blk;
+        if (eng.command("PROBE adapt swaps=" + std::to_string(base_swaps), "PROBE end", blk, err)) {
+            basalt::log::info("basalt-probe", "adaptive tier at the given swap count: %s", blk.back().c_str());
+        } else {
+            basalt::log::warn("basalt-probe", "no adapt test: %s", err.c_str());
+            err.clear();
+            adapt_on = false;
+        }
+    }
 
     // 1. the machine's rates
     std::vector<std::string> block;
@@ -275,6 +364,42 @@ int main(int argc, char** argv) {
             if (star >= 0 && gain > kShareMinGain) suggested.push_back(suggest_share(star, base, gain));
         }
     }
+    // 5. the adaptive tier's settings from the start placement; the first one runs again last for the noise band
+    std::string adapt_line;
+    if (adapt_on) {
+        const auto ta = Clock::now();
+        std::vector<AdaptTrial> trials;
+        AdaptTrial base_t{0, base_swaps, 0, false, 0};
+        std::string aerr;
+        bool ok = adapt_trial(eng, ids, saved_profile, base_t, aerr);
+        if (ok) trials.push_back(base_t);
+        for (AdaptTrial t : kAdaptTried) {
+            if (!ok) break;
+            if (t.decay <= 0) t.decay = base_t.decay;
+            if (t.every == base_t.every && t.swaps == base_t.swaps && std::fabs(t.decay - base_t.decay) < 1e-6) continue;
+            ok = adapt_trial(eng, ids, saved_profile, t, aerr);
+            if (ok) trials.push_back(t);
+        }
+        AdaptTrial again = base_t;
+        if (ok && (ok = adapt_trial(eng, ids, saved_profile, again, aerr))) trials.push_back(again);
+        AdaptTrial saved_t = base_t;
+        saved_t.saved = true;
+        if (ok && !saved_profile.empty() && (ok = adapt_trial(eng, ids, saved_profile, saved_t, aerr))) trials.push_back(saved_t);
+        if (!ok) {
+            basalt::log::warn("basalt-probe", "adapt test: %s", aerr.c_str());
+        } else {
+            const double band = adapt_band(base_t.tps, again.tps, kAdaptBandFloor), base_tps = (base_t.tps + again.tps) / 2.0;
+            const std::string sa = suggest_adapt(base_t, base_tps, band, trials);
+            if (!sa.empty()) suggested.push_back(sa);
+            if (!saved_profile.empty()) {
+                const std::string sp = suggest_saved_profile(saved_profile, base_tps, saved_t.tps, band);
+                if (!sp.empty()) suggested.push_back(sp);
+            }
+            adapt_line = format_adapt_line(trials, band);
+            basalt::log::info("basalt-probe", "adapt test: %zu runs in %.1f s", trials.size(),
+                              std::chrono::duration<double>(Clock::now() - ta).count());
+        }
+    }
     eng.stop();
     basalt::log::info("basalt-probe", "%.1f s after READY", std::chrono::duration<double>(Clock::now() - t_ready).count());
 
@@ -286,6 +411,7 @@ int main(int argc, char** argv) {
     in.engine_context = engine_ctx;
     in.suggested = suggested;
     in.speeds = speeds;
+    in.adapt_line = adapt_line;
     for (size_t i = 0; i < args.size(); ++i) {
         if (args[i] == "--model") { ++i; continue; }
         in.config += (in.config.empty() ? "" : " ") + args[i];

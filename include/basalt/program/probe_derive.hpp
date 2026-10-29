@@ -38,4 +38,25 @@ double share_gain(const std::vector<ShareTrial>& trials, double base, double can
 std::string suggest_workers(const ProbeRates& rates, const WorkerPick& pick);
 std::string suggest_share(double candidate, double base, double gain);
 
+/// One adaptive-tier setting the probe ran from the start placement (PROBE adapt), and its sequence's decode rate.
+struct AdaptTrial {
+    int every = 0, swaps = 0;
+    double decay = 0;
+    bool saved = false;   ///< placed from the saved profile instead of the start's
+    double tps = 0;
+};
+
+/// The probe's noise band from two passes of the same setting: their spread over their mean, at least `floor`.
+double adapt_band(double a, double b, double floor);
+
+/// The suggestion for the adaptive tier: the fastest trial other than `base` (not `saved`) when it beats `base_tps`
+/// by more than `band`, as the flags that differ from `base` and the gain; empty otherwise.
+std::string suggest_adapt(const AdaptTrial& base, double base_tps, double band, const std::vector<AdaptTrial>& trials);
+
+/// The saved profile's line: `saved_tps` against `base_tps`, outside `band` either way; empty inside it.
+std::string suggest_saved_profile(const std::string& file, double base_tps, double saved_tps, double band);
+
+/// "1/96/0.85 251 252 | 64/256/0.70 190 | saved profile 255 tok/s (band 1.0%)", in trial order.
+std::string format_adapt_line(const std::vector<AdaptTrial>& trials, double band);
+
 }  // namespace basalt::program

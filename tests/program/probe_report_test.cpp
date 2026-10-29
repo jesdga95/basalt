@@ -85,6 +85,10 @@ int main() {
     CHECK(rep.find("warm") == std::string::npos && rep.find("PASS") == std::string::npos && rep.find("predicted") == std::string::npos);
     CHECK(rep.find("  suggested: --pool-workers 8 (52 us/expert, best 51 us)\n  config: --gpu 0,1\n") != std::string::npos);
     CHECK(rep.find(kProbeDisclaimer) != std::string::npos);
+    CHECK(rep.find("adapt test") == std::string::npos);   // not run: no line
+    in.adapt_line = "1/96/0.85 250 252 tok/s (band 1.0%)";
+    CHECK(format_report(in).find("tok/s (measured)\n  adapt test  1/96/0.85 250 252 tok/s (band 1.0%)\n  suggested:") !=
+          std::string::npos);
 
     if (failures) return 1;
     std::printf("probe_report_test: ok\n");

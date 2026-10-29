@@ -46,6 +46,26 @@ int main() {
     CHECK(suggest_share(0.5, 0.6, 0.037) == "--prefill-cpu-share 0.50 (prefill +4%)");
     CHECK(suggest_share(0.6, 0.6, 0.1).empty());
 
+    // the adaptive tier: the band from two baseline passes, at least the floor
+    CHECK(std::fabs(adapt_band(250, 255, 0.01) - 5.0 / 252.5) < 1e-9);
+    CHECK(adapt_band(250, 250, 0.01) == 0.01);
+    const AdaptTrial base{1, 96, 0.85, false, 0};
+    std::vector<AdaptTrial> at = {{1, 96, 0.85, false, 250}, {64, 256, 0.70, false, 190}, {1, 160, 0.85, false, 253},
+                                  {1, 96, 0.85, false, 252}};
+    CHECK(suggest_adapt(base, 251, 0.01, at).empty());   // 253 is inside the band
+    at[2].tps = 262;
+    CHECK(suggest_adapt(base, 251, 0.01, at) == "--adapt-swaps 160 (adapt test +4%)");
+    at[1].tps = 280;
+    CHECK(suggest_adapt(base, 251, 0.01, at) == "--adapt-every 64 --adapt-swaps 256 --adapt-decay 0.70 (adapt test +12%)");
+    at.push_back({1, 96, 0.85, true, 300});   // the saved profile is never the adapt pick
+    CHECK(suggest_adapt(base, 251, 0.01, at) == "--adapt-every 64 --adapt-swaps 256 --adapt-decay 0.70 (adapt test +12%)");
+    CHECK(suggest_saved_profile("p.bin", 251, 262, 0.01) == "--expert-profile-save p.bin (adapt test +4%)");
+    CHECK(suggest_saved_profile("p.bin", 251, 240, 0.01) == "no --expert-profile-save (adapt test +5% on the model's profile)");
+    CHECK(suggest_saved_profile("p.bin", 251, 252, 0.01).empty());
+    CHECK(format_adapt_line({{1, 96, 0.85, false, 250}, {64, 256, 0.7, false, 190}, {1, 96, 0.85, false, 252},
+                             {1, 96, 0.85, true, 255}}, 0.01) ==
+          "1/96/0.85 250 252 | 64/256/0.70 190 | saved profile 255 tok/s (band 1.0%)");
+
     std::printf(g_fail ? "probe_derive_test: FAILED\n" : "probe_derive_test: ok\n");
     return g_fail ? 1 : 0;
 }
