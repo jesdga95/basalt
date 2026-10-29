@@ -78,10 +78,11 @@ constexpr int RING_MAX = 384;           // the arrays; the ring itself is ring_s
 // non-resident expert costs the same whatever the chunk, so it pays only once most of them are routed anyway.
 int64_t g_stream_all_min = 6144;
 // --prefill-fp8: the dense projections of chunks from kFp8MinTokens on in FP8 (shorter chunks gain little against the
-// conversions); kFp8Kinds says which
+// conversions).  kFp8Kinds says which: all but the two that write the residual stream (GDN out, QSA o), whose error
+// costs the most quality per millisecond saved
 bool g_fp8 = false;
 constexpr int64_t kFp8MinTokens = 1024;
-constexpr int kFp8Kinds = 127;
+constexpr int kFp8Kinds = 1 | 2 | 8 | 16 | 64;
 inline int64_t stream_all_min() { return g_stream_all_min; }
 // The streamed ring's slots (one whole expert blob each, the same for every pack).  g_ring_depth caps the depth the
 // next layout is laid out with (a prompt read beside decoding slots lends fewer cache slots with a shallower ring).
