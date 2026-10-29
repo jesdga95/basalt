@@ -7,6 +7,8 @@
 // on the same ids on both sides.
 
 #include "engine_local.hpp"
+#include "measure/dump_set.hpp"
+#include "measure/gpu_modes.hpp"
 #include "serve/loans.hpp"
 #include "basalt/program/options.hpp"
 #include "basalt/core/load_progress.hpp"
@@ -70,7 +72,6 @@
 #include "basalt/prefill/gemm.hpp"
 #include "basalt/prefill/prefill.hpp"
 #include "basalt/core/native_dense.hpp"
-#include "basalt/program/logits_selection.hpp"
 #include "basalt/program/conv_cache.hpp"
 #include "basalt/program/ppl_gate.hpp"
 #include "basalt/program/probe_rates.hpp"
@@ -404,11 +405,8 @@ void usage() {
                  "  --greedy             argmax (the default)\n"
                  "  --seed S             enable sampling with this Philox seed\n"
                  "  --top-k N --top-p F --temperature F\n"
-                 "  --dump-logits PATH   write one line of raw logits per position\n"
-                 "  --logits-stride N    store every Nth row plus final input (default 1); N>1 requires --max-new 1\n"
                  "  --dump-residual PATH write the final R (hc x n_embd, f32) for head bisection\n"
-                 "  --dump-layers PATH   write R after EVERY layer, per position: the bisection ladder\n"
-                 "  --dump-halves PATH   write both halves' block_out and inject per layer: the half bisection\n"
+
                  "  --dump-routing PATH  write the routed expert ids and weights per layer per position\n"
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from basalt-vision)\n"
@@ -968,7 +966,6 @@ int main(int argc, char** argv) {
     Options o;
     std::string ppl_base, ppl_out;
     bool have_tokens = false;
-    bool have_logits_stride = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -1013,18 +1010,8 @@ int main(int argc, char** argv) {
         else if (a == "--top-k") o.top_k = std::atoi(next("--top-k"));
         else if (a == "--top-p") o.top_p = (float) std::atof(next("--top-p"));
         else if (a == "--temperature") o.temperature = (float) std::atof(next("--temperature"));
-        else if (a == "--dump-logits") o.dump_logits = next("--dump-logits");
-        else if (a == "--logits-stride") {
-            if (have_logits_stride) { basalt::log::error("basalt", "--logits-stride must be supplied only once"); return 2; }
-            if (!basalt::program::logits_selection::parse_stride(next("--logits-stride"), o.logits_stride)) {
-                basalt::log::error("basalt", "--logits-stride requires a positive decimal int64"); return 2;
-            }
-            have_logits_stride = true;
-        }
         else if (a == "--dump-residual") o.dump_residual = next("--dump-residual");
         else if (a == "--dump-mixed") o.dump_mixed = next("--dump-mixed");
-        else if (a == "--dump-layers") o.dump_layers = next("--dump-layers");
-        else if (a == "--dump-halves") o.dump_halves = next("--dump-halves");
         else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
         else if (a == "--ple-io") o.ple_io = next("--ple-io");
         else if (a == "--ple-row-cache") o.ple_row_cache = std::atoll(next("--ple-row-cache"));
@@ -1543,10 +1530,6 @@ int main(int argc, char** argv) {
             basalt::log::error("basalt generate", "%s: %s", o.model.c_str(), e.what());
             return 2;
         }
-    }
-    if (o.logits_stride > 1 && (o.max_new != 1 || o.dump_logits.empty())) {
-        basalt::log::error("basalt generate", "--logits-stride > 1 requires --max-new 1 and --dump-logits");
-        return 2;
     }
     // positions, cells and pooled-block indices are cast to int32 on the device path.
     if (o.max_context > 2147483647LL - 8) {
@@ -2255,10 +2238,9 @@ int main(int argc, char** argv) {
                      native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0), load_s());
     }
 
-    // The fused hyper-connection read needs the layout where R lags by one pending write; the per-stage and dump
-    // measurements need the unfused layout of R.
-    basalt::core::layer_set_fused_gr(!o.gpu_stages && o.dump_layers.empty() && o.dump_halves.empty() &&
-                                     !o.stage_timing);
+    // The fused hyper-connection read needs the layout where R lags by one pending write; the per-stage measurement
+    // needs the unfused layout of R.
+    basalt::core::layer_set_fused_gr(!o.gpu_stages && !o.stage_timing);
     // The vision path: every rope kernel reads a cell's (t, h, w) from this table (basalt/kernels/mrope.hpp).  It is
     // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.
     int32_t* d_mrope = nullptr;
@@ -2302,30 +2284,6 @@ int main(int argc, char** argv) {
         return 1;
     }
     void* const main_cs = (void*) main_stream;
-
-    // ---- **THE HALF-LEVEL DUMP HAS TO BE ARMED BEFORE `session_capture`, AND THE LADDER MUST NOT BE.**  The
-    // half copies are issued from inside `block_layer_pre`/`block_layer_post`, so they are only ever enqueued
-    // while a graph is being CAPTURED - arming `ss.block.dump` afterwards would produce a file of zeros that
-    // reads exactly like a wrong answer.  The ladder is the opposite: `session_loop` enqueues it per token on
-    // the replay stream, so it must be armed after capture to stay out of the graph.
-    const uint64_t half_stride = (uint64_t) 2 * g.n_embd + (uint64_t) 2 * g.hc +
-                                 (uint64_t) g.n_head * g.head_dim +
-                                 (uint64_t) 5 * g.n_head_kv * g.head_dim + 8;
-    std::FILE* half_dump = nullptr;
-    float* half_stage = nullptr;
-    if (!o.dump_halves.empty()) {
-        half_dump = std::fopen(o.dump_halves.c_str(), "wb");
-        if (half_dump == nullptr) {
-            basalt::log::error("basalt generate", "cannot write %s", o.dump_halves.c_str());
-            return 1;
-        }
-        const size_t n = (size_t) g.n_layers * (size_t) half_stride;
-        if (cudaHostAlloc((void**) &half_stage, n * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
-            basalt::log::error("basalt generate", "cannot pin the half-dump staging buffer");
-            return 1;
-        }
-        ss.block.dump = half_stage;
-    }
 
     basalt::core::Doorbell db;
     if (basalt::core::doorbell_init(g, K, db) == 0) {
@@ -3653,35 +3611,7 @@ int main(int argc, char** argv) {
     // ---- PER-STAGE TIMING.  `--no-capture` only: an event recorded inside a stream capture is silently dropped, so a
     // captured graph cannot carry these events and the numbers would be zeros that read as "every stage is free".
     // Refusing is the fix.
-    if (o.stage_timing) {
-        if (!o.no_capture) {
-            basalt::log::error("basalt generate", "--stage-timing records CUDA events inside the layer path, "
-                                 "and an event record inside a stream capture is silently dropped. Pass "
-                                 "--no-capture as well.");
-            return 2;
-        }
-        if (!basalt::core::stage_timing_enable()) {
-            basalt::log::error("basalt generate", "stage_timing_enable failed");
-            return 1;
-        }
-        basalt::core::stage_timing_name(0, "gr_read (attn)");
-        basalt::core::stage_timing_name(1, "attention block");
-        basalt::core::stage_timing_name(2, "gr_write (attn)");
-        basalt::core::stage_timing_name(3, "gr_read (ffn)");
-        basalt::core::stage_timing_name(4, "moe_route");
-        basalt::core::stage_timing_name(5, "moe_finish");
-        basalt::core::stage_timing_name(6, "gr_write (ffn)");
-        // The GDN block's internals: a single "attention block" number cannot say which of its many small
-        // latency-bound launches costs anything.
-        basalt::core::stage_timing_name(8, "  gdn: quantize x");
-        basalt::core::stage_timing_name(9, "  gdn: qkv gemv");
-        basalt::core::stage_timing_name(10, "  gdn: conv+silu");
-        basalt::core::stage_timing_name(11, "  gdn: l2 norms");
-        basalt::core::stage_timing_name(12, "  gdn: alpha/beta/gate");
-        basalt::core::stage_timing_name(13, "  gdn: gdn_step");
-        basalt::core::stage_timing_name(14, "  gdn: z + out_norm");
-        basalt::core::stage_timing_name(15, "  gdn: out gemv");
-    }
+    if (const int rc = basalt::program::measure::arm_stage_timing(o); rc != 0) return rc;
     std::FILE* routing = nullptr;
     if (!o.dump_routing.empty()) {
         if (o.no_pool) {
@@ -3726,19 +3656,8 @@ int main(int argc, char** argv) {
                      "GPU-only floor is what you want.");
         return 2;
     }
-    // The ladder is written by `session_loop`, and `session_token` does not touch the staging buffer at all - so
-    // accepting the flag there would produce a file of uninitialised memory, which reads as a wrong answer rather
-    // than as a mistake.  `--no-capture` without `--no-pool` is already refused above, so this catches the pair.
-    if (o.no_capture && !o.dump_layers.empty()) {
-        basalt::log::error("basalt generate", "--dump-layers is written by `session_loop`; `--no-capture` runs "
-                     "`session_token` instead, which never fills the staging buffer. Drop one of the two.");
-        return 2;
-    }
-    if (o.no_capture && !o.dump_halves.empty()) {
-        basalt::log::error("basalt generate", "--dump-halves is CAPTURED into the layer graphs, so it needs the "
-                     "captured path; `--no-capture` never records it. Drop one of the two.");
-        return 2;
-    }
+    // The ladder is written by `session_loop`, which this build never runs; nothing fills the staging buffer, so the
+    // two flags that asked for it are gone (see the PR that removed them).
 
     basalt::log::info("basalt generate", "session is up (engine %s)", BASALT_VERSION);
     auto run_head = [&](void* stream) -> bool {
@@ -3801,51 +3720,11 @@ int main(int argc, char** argv) {
                          (unsigned long long) sp.seed);
     }
 
-    std::FILE* dump = nullptr;
-    // The logits header is written WITH THE FIRST ROW, not at open: a header promising rows that were never
-    // written is worse than no file.
-    int32_t hdr[2] = {0, 0};
-    bool hdr_written = false;
-    const int64_t dump_positions = (int64_t) o.tokens.size() - 1 + o.max_new;
-    if (!o.dump_logits.empty()) {
-        if (dump_positions > INT32_MAX || n_vocab > INT32_MAX) {
-            basalt::log::error("basalt generate", "logits dump dimensions exceed int32");
-            return 2;
-        }
-        dump = std::fopen(o.dump_logits.c_str(), "wb");
-        if (dump == nullptr) {
-            basalt::log::error("basalt generate", "cannot write %s", o.dump_logits.c_str());
-            return 1;
-        }
-        // THE COUNT IS `n_prompt - 1 + max_new`, NOT `n_prompt + max_new`.  The loop writes one row per position from
-        // 0, and it stops once `produced` holds `max_new` tokens - and `produced` only starts receiving at position
-        // `n_prompt - 1`.  So a 5-token prompt with `--max-new 6` writes 10 rows.  The header must describe the file
-        // that was written: anything reading the count instead of the size would otherwise get a wrong answer that
-        // looks authoritative.
-        const int32_t n_rows = (int32_t) basalt::program::logits_selection::row_count(dump_positions, o.logits_stride);
-        hdr[0] = n_vocab; hdr[1] = n_rows;
-    }
 
     // ---- THE LAYER ORACLE: ONE RESIDUAL SNAPSHOT PER LAYER PER POSITION, so the engine can be bisected against
     // `llama-debug`'s `l_last-<il>` node instead of against a single end-to-end perplexity.  The buffer is
     // PINNED because `session_loop` enqueues a device-to-host copy into it after every layer and the transfer
     // would otherwise be staged through a pageable bounce buffer on the critical path.
-    std::FILE* layer_dump = nullptr;
-    float* layer_stage = nullptr;
-    const size_t layer_floats = (size_t) (g.n_layers + 1) * (size_t) g.hc * (size_t) g.n_embd;
-    if (!o.dump_layers.empty()) {
-        layer_dump = std::fopen(o.dump_layers.c_str(), "wb");
-        if (layer_dump == nullptr) {
-            basalt::log::error("basalt generate", "cannot write %s", o.dump_layers.c_str());
-            return 1;
-        }
-        if (cudaHostAlloc((void**) &layer_stage, layer_floats * sizeof(float), cudaHostAllocDefault) !=
-            cudaSuccess) {
-            basalt::log::error("basalt generate", "cannot pin the layer-dump staging buffer");
-            return 1;
-        }
-    }
-
     // ---- prefill here is the DECODE PATH ONE TOKEN AT A TIME: the prompt goes through the decode-style graphs.  The
     // batched prompt path is a separate component.
     //
@@ -3862,232 +3741,21 @@ int main(int argc, char** argv) {
     const int64_t n_prompt = (int64_t) o.tokens.size();
     int64_t tok = o.tokens[0];
 
-    // ---- THE PURE-GPU MEASUREMENT.  `session_replay` launches all 48 `pre` graphs back to back on one stream
-    // with NO host work between them - no doorbell poll, no pool, no parts copy - so what it times is the GPU
-    // executing the layer sequence and nothing else.  It had been declared, defined and never called since the
-    // day it was written.
-    //
-    // **THIS IS THE MEASUREMENT THAT SAYS WHETHER THE ENGINE IS HOST-BOUND OR GPU-BOUND**, and the stage table
-    // cannot answer it: those events measure the interval between two marks on a stream, which includes every
-    // gap where the GPU sat idle waiting for the host to enqueue the next kernel.  In `--no-capture` those gaps
-    // are the host's launch latency and they are proportional to the KERNEL COUNT rather than to any work, so
-    // the no-capture stage shares are shares of kernel count - which is why the attention block, with the most
-    // kernels, looks like 55% of the token there.
-    // ---- THE PER-STAGE TABLE ON THE CAPTURED GRAPH.
-    if (o.gpu_stages) {
-        basalt::core::doorbell_reset(db);
-        double mix = 0, ffn = 0, post = 0;
-        if (!basalt::core::session_replay_stages(g, 0, 0, ss, gr, main_cs, mix, ffn, post, err)) {
-            // no per-layer graphs are captured; the serve path times its window's stages
-            basalt::log::error("basalt generate", "%s%s", err.c_str(),
-                         " - there are no per-layer graphs to replay. The decode window's GPU "
-                         "stages are printed per request by the serve path instead: --profile "
-                         "--decode-timing with --serve");
-            return 1;
-        }
-        const int reps = 20;
-        double t_mix = 0, t_ffn = 0, t_post = 0;
-        for (int r = 0; r < reps; ++r) {
-            if (!basalt::core::session_replay_stages(g, 0, 0, ss, gr, main_cs, mix, ffn, post, err)) {
-                return fatal_start_error(err);
-            }
-            t_mix += mix;
-            t_ffn += ffn;
-            t_post += post;
-        }
-        const double tot = t_mix + t_ffn + t_post;
-        std::printf("\nper-stage GPU time on the CAPTURED graph, one token over %lld layers\n",
-                    (long long) g.n_layers);
-        std::printf("  %-22s %9.3f ms/token  %8.3f ms/layer  %6.1f%%\n", "mixer (gr_read+attn+gr_write)",
-                    t_mix / reps, t_mix / reps / (double) g.n_layers, 100.0 * t_mix / tot);
-        std::printf("  %-22s %9.3f ms/token  %8.3f ms/layer  %6.1f%%\n", "ffn front + router",
-                    t_ffn / reps, t_ffn / reps / (double) g.n_layers, 100.0 * t_ffn / tot);
-        std::printf("  %-22s %9.3f ms/token  %8.3f ms/layer  %6.1f%%\n", "post (moe_finish+gr_write)",
-                    t_post / reps, t_post / reps / (double) g.n_layers, 100.0 * t_post / tot);
-        std::printf("  %-22s %9.3f ms/token\n", "sum of the three", tot / reps);
-
-        // ---- AND THE MIXER BY LAYER KIND, because 36 of the 48 layers are GDN and 12 are QSA and a total cannot
-        // separate them.
-        {
-            // ACCUMULATED OVER `reps`, NOT MEASURED ONCE AND THEN DIVIDED: the per-layer replay is timed over all
-            // repetitions, so the per-kind figures add up to the mixer total.
-            std::vector<double> acc((size_t) g.n_layers, 0.0), per;
-            double f2 = 0, p2 = 0;
-            for (int r = 0; r < reps; ++r) {
-                if (!basalt::core::session_replay_stages_per_layer(g, 0, 0, ss, gr, main_cs, per, f2, p2, err)) {
-                    return fatal_start_error(err);
-                }
-                for (int64_t l = 0; l < g.n_layers; ++l) acc[(size_t) l] += per[(size_t) l];
-            }
-            double gdn = 0, qsa = 0, worst = 0;
-            int64_t ng = 0, nq = 0, worst_l = 0;
-            for (int64_t l = 0; l < g.n_layers; ++l) {
-                const double v = acc[(size_t) l] / reps;
-                if (basalt::core::is_qsa_layer(g, l)) { qsa += v; ++nq; }
-                else { gdn += v; ++ng; }
-                if (v > worst) { worst = v; worst_l = l; }
-            }
-            std::printf("\n  the mixer by layer kind, averaged over %d runs\n", reps);
-            std::printf("  %-22s %9.3f ms/token  %8.3f ms/layer  (%lld layers)\n", "GDN layers",
-                        gdn, ng ? gdn / (double) ng : 0.0, (long long) ng);
-            std::printf("  %-22s %9.3f ms/token  %8.3f ms/layer  (%lld layers)\n", "QSA layers",
-                        qsa, nq ? qsa / (double) nq : 0.0, (long long) nq);
-            std::printf("  %-22s layer %lld at %.3f ms\n", "worst mixer layer", (long long) worst_l, worst);
-            std::printf("  %-22s %9.3f ms/token (must equal the mixer above)\n", "GDN + QSA", gdn + qsa);
-        }
-
-        // ================================ THE FIVE STAGES SEPARATELY ================================
-        //
-        // Prefixes 1..5 are replayed per layer with the residual restored between them, and consecutive
-        // differences are the per-stage times.  **THE CHECK IS THAT THE FIVE SUM TO THE THREE-GRAPH TOTAL** -
-        // an independent restatement, and the only reason to believe a table built out of
-        // differences.
-        {
-            std::vector<double> acc5(5, 0.0), per, s5;
-            for (int r = 0; r < reps; ++r) {
-                if (!basalt::core::session_replay_stage_prefixes(g, 0, 0, ss, gr, main_cs, s5, per, err)) {
-                    return fatal_start_error(err);
-                }
-                for (int k = 0; k < 5; ++k) acc5[(size_t) k] += s5[(size_t) k];
-            }
-            static const char* sn[5] = {"0 gr_read (attn)", "1 attention", "2 gr_write (attn)",
-                                        "3 gr_read (ffn)", "4 moe_route (router)"};
-            const char* kind[5] = {"GR", "ATTN", "GR", "GR", "ROUTER"};
-            double tot5 = 0, gr_ms = 0;
-            std::printf("\n  the five stages separately, by differencing prefixes\n");
-            std::printf("  %-24s %-8s %10s %10s %8s\n", "stage", "kind", "ms/token", "ms/layer", "share");
-            for (int k = 0; k < 5; ++k) {
-                const double v = acc5[(size_t) k] / reps;
-                tot5 += v;
-                if (k != 1 && k != 4) gr_ms += v;
-                std::printf("  %-24s %-8s %10.3f %10.4f %7.1f%%\n", sn[k], kind[k], v,
-                            v / (double) g.n_layers, 0.0);
-            }
-            for (int k = 0; k < 5; ++k) {
-                const double v = acc5[(size_t) k] / reps;
-                (void) v;
-            }
-            std::printf("  %-24s %-8s %10.3f\n", "sum of the five", "", tot5);
-            std::printf("  %-24s %-8s %10.3f\n",
-                        "GR passes (0,2,3)", "GR", gr_ms);
-            std::printf("\n  the three-graph total above was %.3f ms/token; the five must account for it.\n",
-                        tot / reps);
-
-            // ================================ THE SAME TABLE, A DIFFERENT WAY ================================
-            //
-            // The differencing table above mixes five graphs per layer, so stage 4's interval carries the launch
-            // of the FULL five-stage graph while stage 3's carries a four-stage one.  This sweep launches ONE
-            // graph type per layer and nothing else, so that bias cannot exist.  **If the two disagree, the
-            // difference IS the bias and this one is right** - and stage 4 is the router, so it is exactly the
-            // number that must not be wrong.
-            {
-                double sweep[6] = {0, 0, 0, 0, 0, 0};
-                for (int k = 1; k <= 5; ++k) {
-                    double acc = 0, one = 0;
-                    for (int r = 0; r < reps; ++r) {
-                        if (!basalt::core::session_replay_stage_sweep(g, 0, 0, ss, gr, main_cs, k, one, err)) {
-                            return fatal_start_error(err);
-                        }
-                        acc += one;
-                    }
-                    sweep[k] = acc / reps;
-                }
-                std::printf("\n  the same five stages, by SWEEPING each prefix back to back (no graph switching)\n");
-                std::printf("  %-24s %10s %10s %12s\n", "stage", "prefix sweep", "difference", "bias");
-                static const char* sn2[5] = {"0 gr_read (attn)", "1 attention", "2 gr_write (attn)",
-                                             "3 gr_read (ffn)", "4 moe_route (router)"};
-                for (int k = 0; k < 5; ++k) {
-                    const double sw = sweep[k + 1] - sweep[k];
-                    const double df = acc5[(size_t) k] / reps;
-                    std::printf("  %-24s %10.3f %10.3f %11.1f%%\n", sn2[k], sw, df,
-                                sw != 0.0 ? 100.0 * (df / sw - 1.0) : 0.0);
-                }
-                std::printf("  %-24s %10.3f   (full pre, 48 layers)\n", "prefix 5 total", sweep[5]);
-            }
-        }
-        std::printf("\n  compare `--gpu-only-full`, which replays the same work as TWO graphs per layer.  The\n");
-        std::printf("  three sum slightly above it because each launch carries the driver's gap.\n");
-        basalt::core::session_graphs_free(gr);
-        basalt::core::doorbell_free(db);
-        cudaFree(d_next);
-        return 0;
-    }
-
-    if (o.graph_only) {
-        basalt::core::doorbell_reset(db);
-        // one warm pass so the first launch does not pay for page mapping
-        if (!basalt::core::session_replay(g, 0, 0, ss, gr, main_cs, err)) {
-            basalt::log::error("basalt generate", "session_replay warm: %s", err.c_str());
-            return 1;
-        }
-        if (cudaDeviceSynchronize() != cudaSuccess) {
-            basalt::log::error("basalt generate", "session_replay warm faulted");
-            return 1;
-        }
-        const int reps = 20;
-        const Clock::time_point t0 = Clock::now();
-        for (int r = 0; r < reps; ++r) {
-            if (!basalt::core::session_replay(g, 0, 0, ss, gr, main_cs, err)) {
-                basalt::log::error("basalt generate", "session_replay: %s", err.c_str());
-                return 1;
-            }
-        }
-        if (cudaDeviceSynchronize() != cudaSuccess) {
-            basalt::log::error("basalt generate", "session_replay faulted: %s", cudaGetErrorString(cudaGetLastError()));
-            return 1;
-        }
-        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count() / (double) reps;
-        std::printf("pre graphs only   %8.2f ms per token over %lld layers  ->  %.2f tok/s of GPU work\n", ms,
-                    (long long) g.n_layers, ms > 0 ? 1000.0 / ms : 0.0);
-        std::printf("                  %8.3f ms per layer\n", ms / (double) g.n_layers);
-        return 0;
-    }
-
-    // ---- THE TRUE PER-TOKEN GPU FLOOR.
-    //
-    // `--graph-only` above launches ONLY `gr.execs[l]`, the `pre` graphs.  It omits the 48 `post` graphs - the shared
-    // expert, the combine and the second `gr_write` - and the LM head.  This flag measures the whole GPU work of a
-    // token: no pool runs, so `parts` keeps whatever the buffer holds and the timing is GPU work alone.
-    if (o.gpu_only_full) {
-        basalt::core::doorbell_reset(db);
-        const int reps = 20;
-        double ms_layers = 0, ms_head = 0;
-        for (int r = -1; r < reps; ++r) {          // r == -1 is the warm pass, not counted
-            const Clock::time_point t0 = Clock::now();
-            if (!basalt::core::session_replay_full(g, 0, 0, ss, gr, main_cs, err)) {
-                basalt::log::error("basalt generate", "session_replay_full: %s", err.c_str());
-                return 1;
-            }
-            // The sync is INSIDE the interval on purpose: it is the wait for the GPU, so t1 - t0 is GPU time.
-            if (cudaStreamSynchronize((cudaStream_t) main_cs) != cudaSuccess) {
-                basalt::log::error("basalt generate", "gpu-only-full layers faulted: %s",
-                             cudaGetErrorString(cudaGetLastError()));
-                return 1;
-            }
-            const Clock::time_point t1 = Clock::now();
-            if (!run_head(main_cs)) {
-                basalt::log::error("basalt generate", "gpu-only-full lm_head: %s", err.c_str());
-                return 1;
-            }
-            if (cudaStreamSynchronize((cudaStream_t) main_cs) != cudaSuccess) {
-                basalt::log::error("basalt generate", "gpu-only-full head faulted: %s",
-                             cudaGetErrorString(cudaGetLastError()));
-                return 1;
-            }
-            const Clock::time_point t2 = Clock::now();
-            if (r < 0) continue;
-            ms_layers += std::chrono::duration<double, std::milli>(t1 - t0).count();
-            ms_head += std::chrono::duration<double, std::milli>(t2 - t1).count();
-        }
-        ms_layers /= (double) reps;
-        ms_head /= (double) reps;
-        const double ms = ms_layers + ms_head;
-        std::printf("GPU floor pre+post+head %7.2f ms per token  ->  %.2f tok/s of GPU work\n", ms,
-                    ms > 0 ? 1000.0 / ms : 0.0);
-        std::printf("                  %8.3f ms layers (%lld x pre+post)\n", ms_layers, (long long) g.n_layers);
-        std::printf("                  %8.3f ms per layer\n", ms_layers / (double) g.n_layers);
-        std::printf("                  %8.3f ms LM head\n", ms_head);
-        return 0;
+    // ---- THE GPU-ONLY MEASUREMENT MODES.  `--gpu-stages`, `--graph-only` and `--gpu-only-full` replay the captured
+    // graphs and print a table instead of decoding; they live in measure/gpu_modes.cpp.
+    {
+        basalt::program::measure::GpuModeContext mc;
+        mc.o = &o;
+        mc.g = &g;
+        mc.ss = &ss;
+        mc.gr = &gr;
+        mc.stream = main_cs;
+        mc.db = &db;
+        mc.d_next = d_next;
+        mc.run_head = run_head;
+        mc.err = &err;
+        const int rc = basalt::program::measure::run_gpu_modes(mc);
+        if (rc != basalt::program::measure::kNotRequested) return rc;
     }
 
     // ---- THE TOKEN PATH ALLOCATES NOTHING.
@@ -4127,7 +3795,7 @@ int main(int argc, char** argv) {
     int32_t* d_hit_count = nullptr;
     basalt::core::TokenHits thits;
     const bool graph_hits = hit_fn != nullptr && !profile.empty() && !o.no_pool;
-    if (graph_hits && !o.no_capture && layer_dump == nullptr && half_dump == nullptr) {
+    if (graph_hits && !o.no_capture) {
         host_res.assign((size_t) (g.n_layers * g.n_expert), basalt::core::kNotResident);
         int64_t resident = 0;
         for (int64_t l = 0; l < g.n_layers; ++l)
@@ -11165,22 +10833,6 @@ int main(int argc, char** argv) {
                         (double) mtp.vram_bytes() / 1048576.0);
     }
 
-    if (dump != nullptr && std::fclose(dump) != 0) {
-        basalt::log::error("basalt generate", "cannot finish logits dump");
-        return 1;
-    }
-    if (layer_dump != nullptr) {
-        std::fclose(layer_dump);
-        cudaFreeHost(layer_stage);
-        std::printf("%-24s %s (%lld layers + the input x %d streams x %lld per position)\n", "layers dumped",
-                    o.dump_layers.c_str(), (long long) g.n_layers, (int) g.hc, (long long) g.n_embd);
-    }
-    if (half_dump != nullptr) {
-        std::fclose(half_dump);
-        cudaFreeHost(half_stage);
-        std::printf("%-24s %s (%lld layers x %llu per position)\n", "halves dumped", o.dump_halves.c_str(),
-                    (long long) g.n_layers, (unsigned long long) half_stride);
-    }
     if (routing != nullptr) {
         std::fclose(routing);
         drive.routing = nullptr;
@@ -11202,51 +10854,7 @@ int main(int argc, char** argv) {
         std::printf("%-24s %lld tokens in %.1f ms  ->  %.2f tok/s  (time to first token %.1f ms)\n", "prefill",
                     (long long) (n_prompt - 1), prefill_ms,
                     prefill_ms > 0 ? 1000.0 * (double) (n_prompt - 1) / prefill_ms : 0.0, ttft_ms);
-    if (!o.dump_mixed.empty()) {
-        std::vector<float> mx((size_t) g.n_embd);
-        if (cudaMemcpy(mx.data(), ss.block.mixed, mx.size() * sizeof(float), cudaMemcpyDeviceToHost) !=
-            cudaSuccess) {
-            basalt::log::error("basalt generate", "reading mixed back failed");
-            return 1;
-        }
-        std::FILE* mf = std::fopen(o.dump_mixed.c_str(), "wb");
-        if (mf == nullptr) {
-            basalt::log::error("basalt generate", "cannot write %s", o.dump_mixed.c_str());
-            return 1;
-        }
-        std::fwrite(mx.data(), sizeof(float), mx.size(), mf);
-        std::fclose(mf);
-        double s2 = 0, mag = 0;
-        for (float v : mx) { s2 += (double) v * (double) v; mag += std::fabs((double) v); }
-        std::printf("%-24s %s (n_embd %lld, rms %.5g, mean|.| %.5g)\n", "mixed dumped", o.dump_mixed.c_str(),
-                    (long long) g.n_embd, std::sqrt(s2 / (double) mx.size()), mag / (double) mx.size());
-    }
-
-    // ---- the residual, for bisecting the head against the layers (see `dump_residual`'s note)
-    if (!o.dump_residual.empty()) {
-        std::vector<float> R((size_t) g.hc * g.n_embd);
-        if (cudaMemcpy(R.data(), ss.R, R.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
-            basalt::log::error("basalt generate", "reading R back failed");
-            return 1;
-        }
-        std::FILE* rf = std::fopen(o.dump_residual.c_str(), "wb");
-        if (rf == nullptr) {
-            basalt::log::error("basalt generate", "cannot write %s", o.dump_residual.c_str());
-            return 1;
-        }
-        const int32_t hdr[2] = {(int32_t) g.hc, (int32_t) g.n_embd};
-        std::fwrite(hdr, sizeof hdr, 1, rf);
-        std::fwrite(R.data(), sizeof(float), R.size(), rf);
-        std::fclose(rf);
-        double mag = 0, mx = 0;
-        int bad = 0;
-        for (float v : R) {
-            if (!std::isfinite(v)) ++bad;
-            else { mag += std::fabs((double) v); mx = std::max(mx, (double) std::fabs((double) v)); }
-        }
-        std::printf("%-24s %s (%d x %lld, nonfinite %d, mean|.| %.4g, max|.| %.4g)\n", "residual dumped",
-                    o.dump_residual.c_str(), (int) g.hc, (long long) g.n_embd, bad, mag / (double) R.size(), mx);
-    }
+    if (const int rc = basalt::program::measure::write_host_dumps({&o, &g, &ss}, err); rc != 0) return rc;
 
     if (o.stats) {
         std::printf("%-24s %.3f ms/token (WALL CLOCK: embed, layers, head, sample)\n", "  per token", decode_ms);
@@ -11333,7 +10941,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (dump != nullptr) std::printf("%-24s %s\n", "logits dumped", o.dump_logits.c_str());
 
     basalt::core::session_graphs_free(gr);
     basalt::core::doorbell_free(db);

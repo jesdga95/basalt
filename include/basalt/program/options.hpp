@@ -22,8 +22,6 @@ struct Options {
     int top_k = 20;
     float top_p = 0.95f;
     float temperature = 1.0f;
-    std::string dump_logits;          // one line of logits per generated position
-    int64_t logits_stride = 1;        // storage selection; all prompt tokens remain conditioned
     /// THE CONTEXT EXTENSION (rope scaling, rope_scaling.hpp).  These knobs resolve to ONE process config,
     /// set once before `session_init` builds the rope table and the graphs capture the kernels.  There is
     /// deliberately no per-request form: K sits in the cache POST-RoPE, so one cache must never mix two
@@ -51,15 +49,6 @@ struct Options {
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the large GEMV does not.
     std::string dump_mixed;
-    /// One residual snapshot per layer per position: `n_layers * hc * n_embd` floats per position, appended in
-    /// position order.  This is the BISECTION LADDER - it is what `llama-debug --tensor-filter l_last` prints
-    /// for the reference, so the first layer whose `sum` diverges is the layer that holds the bug.  It needs the
-    /// captured path (the expert pool only exists there), so it is refused with `--no-capture`.
-    std::string dump_layers;
-    /// `2 * n_embd + 2 * hc` floats per layer per position: the attention half's block output, the MoE half's,
-    /// and the two injection vectors.  It separates `linear_attn_out-<l>` from `ffn_out-<l>`, which the residual
-    /// ladder cannot.  **CAPTURED INTO THE LAYER GRAPHS**, so it must be armed before `session_capture`.
-    std::string dump_halves;
     /// The routing trace: one record per layer per position: `int32 layer, int32 k, k int32 ids, k float weights`.  It is
     /// what a hit-rate curve for a candidate VRAM expert cache is computed from, and it needs no new kernels - the
     /// doorbell already publishes exactly this much to pinned memory.
