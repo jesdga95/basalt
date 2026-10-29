@@ -99,8 +99,8 @@ int main(int argc, char** argv) {
     }
 
     cpu::ExpertPool pool((std::max)(1, workers));
-    std::printf("pool_stress: %d workers + host, %.0f s, %s, parked workers %s\n", pool.workers(), seconds,
-                native ? "run_split_multi_native" : "run and run_split", pool.yields() ? "yield" : "spin");
+    std::printf("pool_stress: %d workers + host, %.0f s, %s\n", pool.workers(), seconds,
+                native ? "run_split_multi_native" : "run and run_split");
     if (native) pool.run_split_multi_native(fmt, mjobs.data(), NJ);
     else pool.run(jobs.data(), NJ);
     const std::vector<float> ref = out, ref2 = out2;
