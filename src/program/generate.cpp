@@ -15,6 +15,7 @@
 #include "cli/control_vectors.hpp"
 #include "measure/dump_set.hpp"
 #include "measure/gpu_modes.hpp"
+#include "serve/loan_moves.hpp"
 #include "serve/loans.hpp"
 #include "basalt/program/options.hpp"
 #include "basalt/core/load_progress.hpp"
@@ -5922,42 +5923,49 @@ int main(int argc, char** argv) {
         // The experts the decoding slots routed lately leave CUDA0's slots from `first` on, which a prompt's loan or the
         // KV is about to take: each trades places with a less-routed expert of its layer below `first` that has a RAM
         // copy (a slot keeps its layer's size; the experts from `first` on come back from RAM).  One blob copy per
-        // trade; the table is uploaded by the caller.  `why` names the taker for the log.
-        auto move_routed_below = [&](int64_t first, const char* why, std::string& e) -> bool {
+        // trade; the table is uploaded by the caller.  `why` names the taker for the log.  `lent_out`: entries whose
+        // slots a loan still out holds (the prompt path's buffers, no expert), so their experts are copied from RAM.
+        auto move_routed_below = [&](int64_t first, const char* why, std::string& e,
+                                     const std::vector<serve_loans::LentEntry>* lent_out = nullptr) -> bool {
             if (drive.d.usage.empty() || srcp != &src || !src.complement_ready() || multi_gpu || first <= 0 ||
                 first >= xcache.slots())
                 return true;
             const auto t0 = Clock::now();
             const auto& lay = basalt::kernels::cpu::expert_layout();
-            int64_t moved = 0, routed = 0;
-            std::vector<int32_t> hot, cold;
+            int64_t moved = 0, routed = 0, from_ram = 0;
+            std::vector<uint8_t> out_of;
+            if (lent_out != nullptr && !lent_out->empty()) {
+                out_of.assign(host_res.size(), 0);
+                for (const auto& [i, slot] : *lent_out) out_of[(size_t) i] = 1;
+            }
+            std::vector<uint8_t> in_ram((size_t) g.n_expert);
+            std::vector<serve_loans::RoutedTrade> trades;
             for (int64_t l = 0; l < g.n_layers; ++l) {
                 const float* u = drive.d.usage.data() + (size_t) (l * g.n_expert);
                 int32_t* r = host_res.data() + (size_t) (l * g.n_expert);
-                hot.clear();
-                cold.clear();
-                for (int32_t ex = 0; ex < (int32_t) g.n_expert; ++ex) {
-                    if (r[ex] >= first) {
-                        if (u[ex] > 0.0f) hot.push_back(ex);
-                    } else if (r[ex] >= 0 && src.has_resident(l, ex)) {
-                        cold.push_back(ex);
+                for (int64_t ex = 0; ex < g.n_expert; ++ex) in_ram[(size_t) ex] = src.has_resident(l, ex) ? 1 : 0;
+                trades.clear();
+                routed += serve_loans::plan_routed_trades(u, r, in_ram.data(),
+                                                          out_of.empty() ? nullptr : out_of.data() + (size_t) (l * g.n_expert),
+                                                          (int32_t) g.n_expert, first, trades);
+                for (const serve_loans::RoutedTrade& t : trades) {
+                    const void* from = xcache.device_slot(t.from);
+                    cudaMemcpyKind kind = cudaMemcpyDeviceToDevice;
+                    if (t.from_ram) {
+                        if ((from = srcp->blob(l, t.hot)) == nullptr) {
+                            e = "moving an expert out of the cache's tail: its RAM copy is gone";
+                            return false;
+                        }
+                        kind = cudaMemcpyHostToDevice;
+                        ++from_ram;
                     }
-                }
-                routed += (int64_t) hot.size();
-                if (hot.empty() || cold.empty()) continue;
-                std::sort(hot.begin(), hot.end(), [&](int32_t a, int32_t b) { return u[a] > u[b]; });
-                std::sort(cold.begin(), cold.end(), [&](int32_t a, int32_t b) {
-                    return u[a] != u[b] ? u[a] < u[b] : r[a] > r[b];   // then the profile's coldest
-                });
-                for (size_t k = 0; k < hot.size() && k < cold.size() && u[hot[k]] > u[cold[k]]; ++k) {
-                    const int32_t sh = r[hot[k]], sc = r[cold[k]];
-                    if (cudaMemcpyAsync(xcache.device_slot(sc), xcache.device_slot(sh), (size_t) lay.blob_bytes(l),
-                                        cudaMemcpyDeviceToDevice, adapt_stream) != cudaSuccess) {
+                    if (cudaMemcpyAsync(xcache.device_slot(t.to), from, (size_t) lay.blob_bytes(l), kind, adapt_stream) !=
+                        cudaSuccess) {
                         e = std::string("moving an expert out of the cache's tail: ") + cudaGetErrorString(cudaGetLastError());
                         return false;
                     }
-                    r[hot[k]] = sc;
-                    r[cold[k]] = sh;
+                    r[t.hot] = t.to;
+                    r[t.cold] = t.from;
                     ++moved;
                 }
             }
@@ -5965,9 +5973,10 @@ int main(int argc, char** argv) {
                 e = std::string("moving experts out of the cache's tail: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
+            const std::string ram_note = from_ram > 0 ? std::to_string(from_ram) + " from RAM, " : std::string();
             basalt::log::info("basalt batch", "%s: %lld of the %lld routed experts in the cache's last %lld slots moved "
-                                 "below them (%.1f ms)", why, (long long) moved, (long long) routed,
-                         (long long) (xcache.slots() - first),
+                                 "below them (%s%.1f ms)", why, (long long) moved, (long long) routed,
+                         (long long) (xcache.slots() - first), ram_note.c_str(),
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
             return true;
         };
@@ -8497,6 +8506,7 @@ int main(int argc, char** argv) {
                 for (PfPart& p : pf_parts) {
                     if (p.first < 0) continue;
                     const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
+                    std::vector<serve_loans::LentEntry> again;   // taken again: their slots hold no expert
                     if (!p.lent.empty()) {
                         if (want <= p.lent_chunk && p.sp->ring_depth() == ring_now && !ov_copied &&
                             (fixed_chunk <= 0 || want == p.sp->chunk()))
@@ -8505,12 +8515,10 @@ int main(int argc, char** argv) {
                         // overwritten by the new layout): only their table entries go back, and the loop below
                         // lends them again; the new loan's refill brings their experts back after the prompt
                         if (!ov_copied) {
-                            std::vector<std::pair<int32_t, int32_t>> back;
-                            for (const auto& [i, slot] : p.lent) {
-                                if (slot >= first) host_res[(size_t) i] = slot;
-                                else back.emplace_back(i, slot);
-                            }
-                            p.lent = std::move(back);
+                            serve_loans::LoanSplit split = serve_loans::split_loan(p.lent, first);
+                            for (const auto& [i, slot] : split.again) host_res[(size_t) i] = slot;
+                            again = std::move(split.again);
+                            p.lent = std::move(split.back);
                         }
                         // ONLY this participant's loan goes back: `refill` would return the other participants'
                         // loans too, and their buffers are still laid out in their caches - marking those slots
@@ -8521,7 +8529,7 @@ int main(int argc, char** argv) {
                     if (beside && &p == &pf_parts[0] && p.lent.empty()) {
                         if (ba_job) { ba_thr.join(); ba_job = false; }   // no adaptive copy lands in a slot it moves
                         if (!xq_drain()) { e = "an adaptive refill failed"; return false; }
-                        if (!move_routed_below(first, "prompt loan", e)) return false;
+                        if (!move_routed_below(first, "prompt loan", e, &again)) return false;
                         any = true;
                     }
                     if (want != p.sp->chunk() || first != p.first_now || p.sp->ring_depth() != ring_now) {
