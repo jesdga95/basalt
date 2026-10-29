@@ -8149,8 +8149,10 @@ int main(int argc, char** argv) {
             float req_relax = o.relaxed_drafting;   // relax=P: this request's --relaxed-drafting (0 = exact)
             // ppl=K [ppl_t=T]: quality gate (basalt/program/ppl_gate.hpp) - chunk K of --ppl-base, the rest of
             // the chunk teacher-forced through verify windows of T tokens, every token committed; ppl_score=0
-            // forces the same tokens through the same windows without scoring or writing rows (a timing mode)
-            int req_ppl = -1, req_ppl_t = 3, req_ppl_score = 1;
+            // forces the same tokens through the same windows without scoring or writing rows (a timing mode);
+            // ppl_force=1 drafts and sizes the windows as decoding does and judges the drafts against the chunk's
+            // tokens, so every drafting rule writes the same text (a timing mode for drafting, rows not scored)
+            int req_ppl = -1, req_ppl_t = 3, req_ppl_score = 1, req_ppl_force = 0;
             int req_clip = 0;   // clip=1 (GENT): max_new is a cap, cut to the room the context leaves after the prompt
             if (endp != nullptr) {   // GENI takes the same keys (image requests were always greedy); its
                                      // embedding file path is the first token without an =
@@ -8182,6 +8184,7 @@ int main(int argc, char** argv) {
                     else if (key == "ppl") req_ppl = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ppl_t") req_ppl_t = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ppl_score") req_ppl_score = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "ppl_force") req_ppl_force = std::atoi(tok.c_str() + eq + 1);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -10000,15 +10003,16 @@ int main(int argc, char** argv) {
                 while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_adapt.th())) ++T;
                 if (first_window) T = (int) (n - fold_p0);
                 const int e0 = first_window ? T - 1 : 0;   // rows before it are prompt tokens: forced, not emitted
+                const bool forced = ppl != nullptr && req_ppl_force != 0;
                 if (ppl != nullptr) {
                     if (p >= ppl->end()) break;
-                    T = (int) std::min<int64_t>(req_ppl_t, ppl->end() - p);
+                    T = (int) std::min<int64_t>(forced ? T : req_ppl_t, ppl->end() - p);
                 }
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
                 bool from_sfx = false;
                 int sfx_match = 0;
-                if (o.suffix_draft > 0 && !first_window && ppl == nullptr && !held.on) {
+                if (o.suffix_draft > 0 && !first_window && (ppl == nullptr || forced) && !held.on) {
                     const int k = sfx.propose(S - 1, sbuf.data());
                     sfx_match = sfx.last_match();
                     if (k > 0 && sbuf[0] == drafts[0]) {
@@ -10016,6 +10020,7 @@ int main(int argc, char** argv) {
                         if (pk.lookup) { T = pk.t; from_sfx = true; }
                     }
                 }
+                if (forced) T = (int) std::min<int64_t>(T, ppl->end() - p);   // a lookup window ends at the base's last token too
                 const bool timed_round = !first_window;
                 const Clock::time_point round0 = Clock::now();
                 if (p + T > o.max_context) break;
@@ -10025,7 +10030,7 @@ int main(int argc, char** argv) {
                     for (int i = 0; i < T; ++i) window[(size_t) i] = held.win[(size_t) i];
                 if (e0 > 0)
                     for (int i = 1; i < T; ++i) window[(size_t) i] = (int32_t) ids[(size_t) (p + i)];
-                if (ppl != nullptr)
+                if (ppl != nullptr && !forced)
                     for (int i = 0; i < T; ++i) window[(size_t) i] = ppl->token(p + i);
                 // the guess: this window is accepted whole and the target's next token is the chain's draft T - 1; the next
                 // window then holds that draft and the ones the chain made after it
@@ -10106,6 +10111,8 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
+                if (forced)   // the chunk's tokens stand in for the target's picks
+                    for (int t = 0; t < T; ++t) outv[(size_t) t] = ppl->token(p + t + 1);
                 int a = 0;
                 if (e0 > 0) {
                     for (int i = 0; i < e0; ++i) outv[(size_t) i] = window[(size_t) i + 1];
@@ -10151,7 +10158,7 @@ int main(int argc, char** argv) {
                         ++grammar_resamples;
                     }
                 }
-                if (ppl != nullptr) {   // every row scored (unless ppl_score=0) and committed
+                if (ppl != nullptr && !forced) {   // every row scored (unless ppl_score=0) and committed
                     a = T - 1;
                     for (int t = 0; t < T; ++t) {
                         if (req_ppl_score != 0) {
