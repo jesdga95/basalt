@@ -227,6 +227,8 @@ int main(int argc, char** argv) {
             args.erase(args.begin() + (std::ptrdiff_t) i, args.begin() + (std::ptrdiff_t) i + 2);
             break;
         }
+    // what the user gave, for the report; the probe adds its own settings below for its measurements
+    const std::vector<std::string> user_args = args;
     {
         uint64_t bytes = 0;
         if (!saved_profile.empty() && !(basalt::platform::file_size(saved_profile, bytes) && bytes > 0)) saved_profile.clear();
@@ -250,7 +252,6 @@ int main(int argc, char** argv) {
             return 2;
         }
         set_arg(args, "--gpu", gpu_value);
-        if (gpu_given.empty()) gpu_given = gpu_value;
     }
 
     // fixtures
@@ -415,7 +416,7 @@ int main(int argc, char** argv) {
     in.suggested = suggested;
     in.speeds = speeds;
     in.adapt_line = adapt_line;
-    in.config = format_config(args, gpu_given);
+    in.config = format_config(user_args, gpu_given);
     // total wall time from program start, engine launch included
     in.wall_s = std::chrono::duration<double>(Clock::now() - t_start).count();
     std::fputs(format_report(in).c_str(), stdout);
