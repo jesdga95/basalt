@@ -293,6 +293,8 @@ int check_geo(const Geo& g, bool outliers, cudaStream_t s, Gemm& gemm, fp8::Lt& 
         xsc(fp8::scale_bytes(fp8::Scale::Block32, T, g.k) + 256), tsw(256), tsx(256), buf(Gemm::act8_bytes(T, g.k));
     ck(cudaMemcpy(w_dev.p, w.data(), wb, cudaMemcpyHostToDevice), "w");
     ck(cudaMemcpy(x16_dev.p, x16.data(), x16.size() * 2, cudaMemcpyHostToDevice), "x16");
+    // a pageable upload can still be landing when cudaMemcpy returns; the work below runs on a non-blocking stream
+    ck(cudaDeviceSynchronize(), "upload");
 
     int fail = 0;
     // the conversion against the CPU encoder, bit for bit (rows of X; W's FP16 rows through the same kernel)
@@ -388,6 +390,7 @@ int check_geo(const Geo& g, bool outliers, cudaStream_t s, Gemm& gemm, fp8::Lt& 
     for (int64_t r = 0; r < small; ++r)
         std::memcpy(&xs[(size_t) ((r + 7) % small) * g.k], &x16[(size_t) r * g.k], (size_t) g.k * 2);
     ck(cudaMemcpy(x16_dev.p, xs.data(), xs.size() * 2, cudaMemcpyHostToDevice), "xs");
+    ck(cudaDeviceSynchronize(), "upload xs");
     const Gemm::Rows8 xsr = gemm.act8(x16_dev.as<uint16_t>(), small, g.k, buf.p);
     if (!gemm.native8(xsr, g.t, w_dev.p, y_dev.as<float>(), g.n)) {
         std::printf("%-18s Gemm::native8 did not run at 64 rows FAIL\n", g.name);
@@ -431,6 +434,7 @@ void bench_geo(const Geo& g, int64_t T, cudaStream_t s, Gemm& gemm, fp8::Lt& lt,
     Dev w_dev(wb), w16((size_t) g.n * g.k * 2), w8((size_t) g.n * g.k),
         wsc(fp8::scale_bytes(fp8::Scale::Block32, g.n, g.k) + 256), tsw(256);
     ck(cudaMemcpy(w_dev.p, w.data(), wb, cudaMemcpyHostToDevice), "w");
+    ck(cudaDeviceSynchronize(), "upload w");
     const int reps = 7;
     const double fl = 2.0 * (double) T * g.n * g.k;
     auto tf = [&](double ms) { return fl / (ms * 1e9); };
@@ -501,6 +505,7 @@ void bench_geo(const Geo& g, int64_t T, cudaStream_t s, Gemm& gemm, fp8::Lt& lt,
         ck(cudaMemcpy(wq_dev.p, wq.data(), qb, cudaMemcpyHostToDevice), "wq");
         const int32_t b[2] = {0, (int32_t) T};
         ck(cudaMemcpy(bounds.p, b, sizeof b, cudaMemcpyHostToDevice), "bounds");
+        ck(cudaDeviceSynchronize(), "upload wq");
         mmq::quantize(x_dev.as<float>(), nullptr, xq.p, GGML_TYPE_Q8_0, g.k, g.k, T, s);
         mmq::Product p;
         p.w = wq_dev.p; p.type = GGML_TYPE_Q8_0; p.w_rows = g.n; p.w_cols = g.k; p.expert_bytes = qb;
