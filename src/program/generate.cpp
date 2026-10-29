@@ -8332,7 +8332,7 @@ int main(int argc, char** argv) {
             // ---- the prompt-time layer split: a long part of the prompt is read across the cards when its price there
             // (split_price) beats the main card's alone; the chunk, its head chunk, the stage count and the cuts, or none
             struct SplitPlan { int64_t chunk = 0, head = 0; int stages = 0; std::vector<int> cuts; };
-            auto split_plan = [&](int64_t a0, int64_t b0) -> SplitPlan {
+            auto split_plan = [&](int64_t a0, int64_t b0, const char* no_split) -> SplitPlan {
                 SplitPlan plan;
                 if (!split_ready) return plan;   // (the start line said why)
                 // every part longer than a chunk that is not read across says why, with its numbers
@@ -8340,14 +8340,14 @@ int main(int argc, char** argv) {
                     basalt::log::info("basalt serve", "prompt split: %lld tokens read on CUDA0 (%s)", (long long) (b0 - a0),
                                       why.c_str());
                 };
-                const char* skip = batch_on() ? "slots are decoding" : !req_imgs.empty() ? "the prompt has images" : nullptr;
+                const char* skip = no_split != nullptr ? no_split : batch_on() ? "slots are decoding" : !req_imgs.empty() ? "the prompt has images" : nullptr;
                 if (skip != nullptr) {
                     if (b0 - a0 > read_cap()) decline(skip);
                     return plan;
                 }
                 const engine_local::SplitPricing pr = split_price(a0, b0, n - 1, split_stages);
                 if (!pr.why.empty()) decline(pr.why);
-                if (pr.chunk <= 0) return plan;
+                if (pr.chunk <= 0) return plan;   // (no reason: the part is one chunk, not longer than one)
                 if (pr.chunk > split_chunk_max) {
                     decline("chunks of " + std::to_string(pr.chunk) + " tokens, above the stages' " +
                             std::to_string(split_chunk_max));
@@ -9105,7 +9105,7 @@ int main(int argc, char** argv) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
-                const SplitPlan split = win || resumed_chunk > 0 ? SplitPlan{} : split_plan(at, to);
+                const SplitPlan split = split_plan(at, to, win ? "a windowed read" : resumed_chunk > 0 ? "a resumed chunked read" : nullptr);
                 const int64_t split_c = split.chunk;
                 if (!win && !lend(to - at, err, split_c, split.head)) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
