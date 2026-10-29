@@ -67,8 +67,9 @@ public:
     /// X [rows, cols] (FP16 bits) as E4M3 rows with power-of-two scales in `buf` (act8_bytes, 256-byte aligned).
     Rows8 act8(const uint16_t* X, int64_t rows, int64_t cols, void* buf);
     /// `native` on the FP8 tensor cores: W's rows dequantized to FP16 in the scratch and rounded to E4M3 with
-    /// power-of-two scales (the E4M3 matrix also lives in the scratch), times X from `act8`; FP32 Y.  false: nothing
-    /// was written to Y (no E4M3 path here, the scratch cannot hold W as E4M3, or cuBLASLt has no algorithm).
+    /// power-of-two scales (the E4M3 matrix also lives in the scratch), times X from `act8`; FP32 Y.  false: the
+    /// caller runs the FP16 product (no E4M3 path here, the scratch cannot hold W as E4M3, cuBLASLt has no algorithm
+    /// for the shape, or the product failed, which also turns the E4M3 path off; Y may then be partly written).
     bool native8(const Rows8& X, int ggml_type, const void* W_blocks, float* Y, int64_t N, int64_t ldy = 0);
 
     /// Caller-owned buffers only: the scratch and workspace moved (the prompt path laid its buffers out again).

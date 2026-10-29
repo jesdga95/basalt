@@ -8,11 +8,11 @@
 //   - each scale granularity cuBLASLt offers here against the reference (E4M3 keeps 3 mantissa bits: the bounds are
 //     relative RMS 6e-2, worst row 0.25), and the path the prompt runs (Gemm::native8) the same;
 //   - an all-zero row gives zeros;
-//   - width invariance: rows run in a batch of 64 at shifted places give the same E4M3 bytes as in the full batch,
-//     and products within 1e-4 of the max |y| (cuBLASLt may pick another algorithm for another width).
+//   - width invariance, bit for bit: rows of the 512-row batch run again in batches of 37, 64 and 300 at shifted
+//     places give the same E4M3 rows and the same products (the FP16 path's differing values are printed, not failed);
 // --bench [T]: microseconds per product and TFLOP/s at T rows (default 32768): the FP16 path, each FP8 scale
-// granularity (conversions, cuBLASLt's pick, the best of the algorithms it offers, fast accumulation), the prompt
-// path's FP8 product, and llama.cpp's MMQ on Q8_0 weights for comparison.
+// granularity (conversions, the shape's algorithm, fast accumulation), the prompt path's FP8 product, and llama.cpp's
+// MMQ on Q8_0 weights for comparison.
 // --vram: the device memory the prompt path's FP8 products take on first use (cuBLASLt's lazily loaded kernels), after
 // the FP16 products of the same shapes ran.  Exit 77 without a device.
 #include "basalt/kernels/dequant_bf16.hpp"
@@ -360,7 +360,8 @@ int check_geo(const Geo& g, bool outliers, cudaStream_t s, Gemm& gemm, fp8::Lt& 
         void* xsp = sm == fp8::Scale::Tensor ? tsx.p : xsc.p;
         weights_e4m3(g, w_dev.p, sm, w16.as<uint16_t>(), w8.as<uint8_t>(), wsc.p, tsw.as<float>(), s);
         acts_e4m3(x16_dev.as<uint16_t>(), T, g.k, sm, x8.as<uint8_t>(), xsc.p, tsx.as<float>(), s);
-        if (!lt.run(sm, w8.as<uint8_t>(), wsp, x8.as<uint8_t>(), xsp, y_dev.as<float>(), T, g.n, g.k, g.n, ws, kWs, s)) {
+        if (!lt.fits(sm, T, g.n, g.k, g.n, kWs, wsp, xsp) ||
+            !lt.run(sm, w8.as<uint8_t>(), wsp, x8.as<uint8_t>(), xsp, y_dev.as<float>(), T, g.n, g.k, g.n, ws, kWs, s)) {
             line += std::string(" | ") + fp8::scale_name(sm) + ": no algorithm at T 512";
             ++fail;
             continue;
@@ -388,42 +389,42 @@ int check_geo(const Geo& g, bool outliers, cudaStream_t s, Gemm& gemm, fp8::Lt& 
     const Err e8 = compare(y8, ref, rows, g.n);
     if (e8.rms > lim_rms || e8.worst > lim_worst || !zero_row(y8)) ++fail;
 
-    std::vector<uint16_t> xs((size_t) small * g.k);
-    for (int64_t r = 0; r < small; ++r)
-        std::memcpy(&xs[(size_t) ((r + 7) % small) * g.k], &x16[(size_t) r * g.k], (size_t) g.k * 2);
-    ck(cudaMemcpy(x16_dev.p, xs.data(), xs.size() * 2, cudaMemcpyHostToDevice), "xs");
-    ck(cudaDeviceSynchronize(), "upload xs");
-    const Gemm::Rows8 xsr = gemm.act8(x16_dev.as<uint16_t>(), small, g.k, buf.p);
-    if (!gemm.native8(xsr, g.t, w_dev.p, y_dev.as<float>(), g.n)) {
-        std::printf("%-18s Gemm::native8 did not run at 64 rows FAIL\n", g.name);
-        return fail + 1;
-    }
-    ck(cudaStreamSynchronize(s), "native8 small");
-    const std::vector<float> y_small = download<float>(y_dev.p, (size_t) small * g.n);
-    const std::vector<uint8_t> q_small = download<uint8_t>(xsr.q, (size_t) small * g.k);
-    long qdiff = 0;
-    for (int64_t r = 0; r < small; ++r)
-        qdiff += std::memcmp(&q_full[(size_t) r * g.k], &q_small[(size_t) ((r + 7) % small) * g.k], (size_t) g.k) != 0;
-    double wmax = 0, rmax = 0;
-    long nbits = 0;
-    for (int64_t r = 0; r < small; ++r)
-        for (int64_t c = 0; c < g.n; ++c) {
-            const float a = y8[(size_t) r * g.n + c], b = y_small[(size_t) ((r + 7) % small) * g.n + c];
-            if (std::memcmp(&a, &b, 4) != 0) ++nbits;
-            wmax = std::max(wmax, (double) std::fabs(a - b));
-            rmax = std::max(rmax, (double) std::fabs(a));
+    // width invariance: rows [0, w) of the batch again as a batch of w, each at place (r + 7) % w
+    long qdiff = 0, nbits = 0, nbits16 = 0;
+    for (const int64_t w : {(int64_t) 37, small, (int64_t) 300}) {
+        std::vector<uint16_t> xs((size_t) w * g.k);
+        for (int64_t r = 0; r < w; ++r)
+            std::memcpy(&xs[(size_t) ((r + 7) % w) * g.k], &x16[(size_t) r * g.k], (size_t) g.k * 2);
+        ck(cudaMemcpy(x16_dev.p, xs.data(), xs.size() * 2, cudaMemcpyHostToDevice), "xs");
+        ck(cudaDeviceSynchronize(), "upload xs");
+        const Gemm::Rows8 xsr = gemm.act8(x16_dev.as<uint16_t>(), w, g.k, buf.p);
+        if (!gemm.native8(xsr, g.t, w_dev.p, y_dev.as<float>(), g.n)) {
+            std::printf("%-18s Gemm::native8 did not run at %lld rows FAIL\n", g.name, (long long) w);
+            return fail + 1;
         }
-    const double wrel = rmax > 0 ? wmax / rmax : 0;
-    if (qdiff != 0 || wrel > 1e-4) ++fail;
-    std::printf("%-18s %-8s FP16 %.2e / %.2e%s | path %.2e / %.2e (vs FP16 %.2e) | width: %ld E4M3 rows differ, %ld "
-                "values differ, max %.2e of the max |y| %s\n",
+        ck(cudaStreamSynchronize(s), "native8 small");
+        const std::vector<float> y_small = download<float>(y_dev.p, (size_t) w * g.n);
+        const std::vector<uint8_t> q_small = download<uint8_t>(xsr.q, (size_t) w * g.k);
+        gemm.native(x16_dev.as<uint16_t>(), g.t, w_dev.p, y_dev.as<float>(), w, g.n, g.k);
+        ck(cudaStreamSynchronize(s), "f16 small");
+        const std::vector<float> y16_small = download<float>(y_dev.p, (size_t) w * g.n);
+        for (int64_t r = 0; r < w; ++r) {
+            const size_t at = (size_t) ((r + 7) % w);
+            qdiff += std::memcmp(&q_full[(size_t) r * g.k], &q_small[at * g.k], (size_t) g.k) != 0;
+            nbits += std::memcmp(&y8[(size_t) r * g.n], &y_small[at * g.n], (size_t) g.n * 4) != 0;
+            nbits16 += std::memcmp(&y_f16[(size_t) r * g.n], &y16_small[at * g.n], (size_t) g.n * 4) != 0;
+        }
+    }
+    if (qdiff != 0 || nbits != 0) ++fail;
+    std::printf("%-18s %-8s FP16 %.2e / %.2e%s | path %.2e / %.2e (vs FP16 %.2e) | width (401 rows): %ld E4M3 rows "
+                "differ, %ld product rows differ (FP16 path: %ld) %s\n",
                 g.name, outliers ? "outliers" : "plain", ef.rms, ef.worst, line.c_str(), e8.rms, e8.worst,
-                rel_rms(y8, y_f16), qdiff, nbits, wrel, fail ? "FAIL" : "ok");
+                rel_rms(y8, y_f16), qdiff, nbits, nbits16, fail ? "FAIL" : "ok");
     return fail;
 }
 
 struct BenchSum {
-    double f16 = 0, path = 0, mm[3] = {}, best[3] = {}, conv[3] = {};
+    double f16 = 0, path = 0, mm[3] = {}, conv[3] = {};
 };
 
 void bench_geo(const Geo& g, int64_t T, cudaStream_t s, Gemm& gemm, fp8::Lt& lt, void* ws, const bool* offered,
@@ -457,35 +458,22 @@ void bench_geo(const Geo& g, int64_t T, cudaStream_t s, Gemm& gemm, fp8::Lt& lt,
         const double t_x = time_ms([&] {
             acts_e4m3(x16_dev.as<uint16_t>(), T, g.k, sm, x8.as<uint8_t>(), xsc.p, tsx.as<float>(), s);
         }, s, reps);
-        const int na = lt.algos(sm, T, g.n, g.k, g.n, kWs, wsp, xsp);
-        if (na == 0) {
+        if (!lt.fits(sm, T, g.n, g.k, g.n, kWs, wsp, xsp)) {
             std::printf("    %-13s no algorithm at T %lld\n", fp8::scale_name(sm), (long long) T);
             continue;
         }
-        auto run = [&](int a, bool fast) {
+        auto run = [&](bool fast) {
             if (!lt.run(sm, w8.as<uint8_t>(), wsp, x8.as<uint8_t>(), xsp, y_dev.as<float>(), T, g.n, g.k, g.n, ws, kWs,
-                        s, fast, a))
+                        s, fast))
                 throw std::runtime_error("cublasLtMatmul failed");
         };
-        const double t0 = time_ms([&] { run(0, false); }, s, reps);
-        double tb = t0;
-        int ib = 0;
-        for (int a = 1; a < na; ++a) {
-            const double t = time_ms([&] { run(a, false); }, s, 3);
-            if (t < tb) { tb = t; ib = a; }
-        }
+        const double t0 = time_ms([&] { run(false); }, s, reps);
         double tfast = -1;
-        if (lt.algos(sm, T, g.n, g.k, g.n, kWs, wsp, xsp, true) > 0) tfast = time_ms([&] {
-            if (!lt.run(sm, w8.as<uint8_t>(), wsp, x8.as<uint8_t>(), xsp, y_dev.as<float>(), T, g.n, g.k, g.n, ws, kWs,
-                        s, true, 0))
-                throw std::runtime_error("cublasLtMatmul (fast accumulation) failed");
-        }, s, reps);
-        std::printf("    %-13s W->E4M3 %6.1f us, X->E4M3 %6.1f us | product %8.1f us %6.1f TFLOP/s (%.2fx FP16) | best of "
-                    "%2d: #%d %8.1f us %6.1f TFLOP/s | fast accumulation %8.1f us\n",
-                    fp8::scale_name(sm), 1e3 * t_w, 1e3 * t_x, 1e3 * t0, tf(t0), t_f16 / t0, na, ib, 1e3 * tb, tf(tb),
-                    1e3 * tfast);
+        if (lt.fits(sm, T, g.n, g.k, g.n, kWs, wsp, xsp, true)) tfast = time_ms([&] { run(true); }, s, reps);
+        std::printf("    %-13s W->E4M3 %6.1f us, X->E4M3 %6.1f us | product %8.1f us %6.1f TFLOP/s (%.2fx FP16) | fast "
+                    "accumulation %8.1f us\n",
+                    fp8::scale_name(sm), 1e3 * t_w, 1e3 * t_x, 1e3 * t0, tf(t0), t_f16 / t0, 1e3 * tfast);
         sum.mm[i] += g.layers * t0;
-        sum.best[i] += g.layers * tb;
         sum.conv[i] += g.layers * (t_w + t_x);
     }
     if (gemm.fp8_ready()) {
@@ -592,7 +580,7 @@ int main(int argc, char** argv) {
         // which scale granularities cuBLASLt offers on this device (a prompt-sized shape)
         bool offered[3] = {};
         for (int i = 0; i < 3; ++i) {
-            offered[i] = lt.algos(kScales[i], 4096, 2560, 2560, 2560, kWs, ws.p, ws.p) > 0;
+            offered[i] = lt.fits(kScales[i], 4096, 2560, 2560, 2560, kWs, ws.p, ws.p);
             std::printf("E4M3 %-13s scales: %s\n", fp8::scale_name(kScales[i]),
                         offered[i] ? "offered by cuBLASLt" : "NOT offered by cuBLASLt");
         }
@@ -621,8 +609,8 @@ int main(int argc, char** argv) {
                         (long long) bench_t, sum.f16, sum.path, sum.path > 0 ? sum.f16 / sum.path : 0.0);
             for (int i = 0; i < 3; ++i)
                 if (offered[i])
-                    std::printf("    %-13s products %.1f ms (best algorithms %.1f ms) + conversions %.1f ms\n",
-                                fp8::scale_name(kScales[i]), sum.mm[i], sum.best[i], sum.conv[i]);
+                    std::printf("    %-13s products %.1f ms + conversions %.1f ms\n", fp8::scale_name(kScales[i]),
+                                sum.mm[i], sum.conv[i]);
             return 0;
         }
         int fails = 0;

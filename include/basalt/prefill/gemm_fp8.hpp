@@ -33,6 +33,8 @@ void to_e4m3(const uint16_t* in, int64_t rows, int64_t cols, int64_t ld, uint8_t
 void tensor_scale(const uint16_t* in, int64_t n, float* out, void* stream);
 
 /// cuBLASLt for Y[T, N] (FP32, row stride ldy) = X[T, K] . W[N, K]^T with X and W as E4M3 rows and their scales.
+/// One algorithm per weight shape, chosen at a long chunk among those that keep K in one piece and run for every T,
+/// so a token's output does not depend on the chunk's size or the token's place in it.
 class Lt {
 public:
     Lt() = default;
@@ -42,14 +44,14 @@ public:
 
     bool init(std::string& err);
     bool ready() const { return state_ != nullptr; }
-    /// The algorithms cuBLASLt offers for the shape (0: the shape or the scale mode is not supported here).  The
-    /// scale pointers (device memory; a block-scaled heuristic may want them set) are replaced by those of each run.
-    int algos(Scale s, int64_t T, int64_t N, int64_t K, int64_t ldy, size_t ws_bytes, const void* w_scales,
+    /// Whether the shape's algorithm runs T rows within `ws_bytes` of workspace (false: no algorithm, or not at this
+    /// T).  The scale pointers (device memory; a block-scaled heuristic may want them set) are replaced by each run's.
+    bool fits(Scale s, int64_t T, int64_t N, int64_t K, int64_t ldy, size_t ws_bytes, const void* w_scales,
               const void* x_scales, bool fast_accum = false);
-    /// `algo`: which of the offered algorithms (the first is cuBLASLt's pick).  false: none offered, or the call failed.
+    /// false: no algorithm for the shape, or the call failed (Y may then be partly written).
     bool run(Scale s, const uint8_t* W, const void* w_scales, const uint8_t* X, const void* x_scales, float* Y,
              int64_t T, int64_t N, int64_t K, int64_t ldy, void* workspace, size_t ws_bytes, void* stream,
-             bool fast_accum = false, int algo = 0);
+             bool fast_accum = false);
 
 private:
     struct State;

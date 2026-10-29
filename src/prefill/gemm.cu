@@ -217,7 +217,7 @@ bool Gemm::fp8_ready() {
     }
     // a prompt-sized shape; the workspace stands in for the scale vectors (the heuristic does not read them)
     for (fp8::Scale s : {fp8::Scale::Row, fp8::Scale::Block32}) {
-        if (lt_->algos(s, 4096, 2560, 2560, 2560, ws_bytes_, workspace_, workspace_) > 0) {
+        if (lt_->fits(s, 4096, 2560, 2560, 2560, ws_bytes_, workspace_, workspace_)) {
             fp8_scale_ = s;
             fp8_state_ = 1;
             basalt::log::info("basalt", "prefill gemm: dense products in FP8 (E4M3, %s scales)", fp8::scale_name(s));
@@ -252,7 +252,7 @@ bool Gemm::native8(const Rows8& X, int ggml_type, const void* W_blocks, float* Y
     uint8_t* q = reinterpret_cast<uint8_t*>(scratch_);
     void* sc = q + wq;
     uint16_t* stage = reinterpret_cast<uint16_t*>(q + wq + ws);
-    if (lt_->algos(fp8_scale_, T, N, K, ldy, ws_bytes_, sc, X.scales) == 0) return false;
+    if (!lt_->fits(fp8_scale_, T, N, K, ldy, ws_bytes_, sc, X.scales)) return false;
     const int64_t rows = std::min<int64_t>(N, (int64_t) ((total - wq - ws) / ((size_t) K * 2)));
     for (int64_t r0 = 0; r0 < N; r0 += rows) {
         const int64_t n = std::min<int64_t>(rows, N - r0);
@@ -260,9 +260,11 @@ bool Gemm::native8(const Rows8& X, int ggml_type, const void* W_blocks, float* Y
         fp8::to_e4m3(stage, n, K, K, q + (size_t) r0 * (size_t) K, sc, r0, N, fp8_scale_, nullptr, stream_);
     }
     if (!lt_->run(fp8_scale_, q, sc, X.q, X.scales, Y, T, N, K, ldy, workspace_, ws_bytes_, stream_)) {
-        basalt::log::error("basalt", "prefill gemm: cublasLtMatmul (E4M3, %lld x %lld x %lld) failed", (long long) T,
-                           (long long) N, (long long) K);
-        std::exit(1);
+        // the caller's FP16 product rewrites all of Y; no further FP8 products
+        basalt::log::warn("basalt", "prefill gemm: cublasLtMatmul (E4M3, %lld x %lld x %lld) failed: FP16 products from here",
+                          (long long) T, (long long) N, (long long) K);
+        fp8_state_ = -1;
+        return false;
     }
     return true;
 }

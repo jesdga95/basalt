@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <map>
 #include <tuple>
-#include <vector>
 
 namespace basalt::prefill::fp8 {
 namespace {
@@ -175,31 +174,53 @@ void tensor_scale(const uint16_t* in, int64_t n, float* out, void* stream) {
 }
 
 // ---- cuBLASLt
+//
+// One algorithm per weight shape (scale mode, N, K, ldy, workspace), chosen once from the heuristic at a long chunk
+// (kRefRows rows) among those that do not split K, and then run for every chunk size: each output element is the same
+// K loop of the same kernel whatever the chunk's size or the token's place in it.  The plans are bounded by the
+// model's weight shapes.
+
+namespace {
+constexpr int64_t kRefRows = 32768;
+
+struct Layouts {
+    cublasLtMatrixLayout_t b = nullptr, c = nullptr;
+    bool ok = false;
+    Layouts(int64_t T, int64_t N, int64_t K, int64_t ldy) {
+        ok = cublasLtMatrixLayoutCreate(&b, CUDA_R_8F_E4M3, (uint64_t) K, (uint64_t) T, K) == CUBLAS_STATUS_SUCCESS &&
+             cublasLtMatrixLayoutCreate(&c, CUDA_R_32F, (uint64_t) N, (uint64_t) T, ldy) == CUBLAS_STATUS_SUCCESS;
+    }
+    ~Layouts() {
+        if (b) cublasLtMatrixLayoutDestroy(b);
+        if (c) cublasLtMatrixLayoutDestroy(c);
+    }
+    Layouts(const Layouts&) = delete;
+    Layouts& operator=(const Layouts&) = delete;
+};
+}  // namespace
 
 struct Lt::State {
     cublasLtHandle_t h = nullptr;
     struct Plan {
         cublasLtMatmulDesc_t op = nullptr;
-        cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
-        std::vector<cublasLtMatmulHeuristicResult_t> algos;
+        cublasLtMatrixLayout_t a = nullptr;
+        cublasLtMatmulAlgo_t algo{};
+        bool ok = false;
     };
-    using Key = std::tuple<int, int64_t, int64_t, int64_t, int64_t, size_t, bool>;
+    using Key = std::tuple<int, int64_t, int64_t, int64_t, size_t, bool>;
     std::map<Key, Plan> plans;
 
     ~State() {
         for (auto& kv : plans) {
-            Plan& p = kv.second;
-            if (p.op) cublasLtMatmulDescDestroy(p.op);
-            for (cublasLtMatrixLayout_t l : {p.a, p.b, p.c})
-                if (l) cublasLtMatrixLayoutDestroy(l);
+            if (kv.second.op) cublasLtMatmulDescDestroy(kv.second.op);
+            if (kv.second.a) cublasLtMatrixLayoutDestroy(kv.second.a);
         }
         if (h) cublasLtDestroy(h);
     }
 
     // The scale pointers go in before the heuristic is asked (block-scaled modes want them); a run sets its own.
-    Plan& plan(Scale s, int64_t T, int64_t N, int64_t K, int64_t ldy, size_t ws, bool fast, const void* ws_ptr,
-               const void* xs_ptr) {
-        const Key key{(int) s, T, N, K, ldy, ws, fast};
+    Plan& plan(Scale s, int64_t N, int64_t K, int64_t ldy, size_t ws, bool fast, const void* ws_ptr, const void* xs_ptr) {
+        const Key key{(int) s, N, K, ldy, ws, fast};
         auto it = plans.find(key);
         if (it != plans.end()) return it->second;
         Plan& p = plans[key];
@@ -210,33 +231,59 @@ struct Lt::State {
                              : s == Scale::Block32 ? CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0
                                                    : CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
         const int8_t fa = fast ? 1 : 0;
-        ok = ok && cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof ta) == CUBLAS_STATUS_SUCCESS;
-        ok = ok && cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof tb) == CUBLAS_STATUS_SUCCESS;
-        ok = ok && cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mode, sizeof mode) ==
-                       CUBLAS_STATUS_SUCCESS;
-        ok = ok && cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mode, sizeof mode) ==
-                       CUBLAS_STATUS_SUCCESS;
-        ok = ok && cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fa, sizeof fa) ==
-                       CUBLAS_STATUS_SUCCESS;
-        ok = ok && cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &ws_ptr, sizeof ws_ptr) ==
-                       CUBLAS_STATUS_SUCCESS;
-        ok = ok && cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &xs_ptr, sizeof xs_ptr) ==
-                       CUBLAS_STATUS_SUCCESS;
+        auto set = [&](cublasLtMatmulDescAttributes_t a, const void* v, size_t n) {
+            ok = ok && cublasLtMatmulDescSetAttribute(p.op, a, v, n) == CUBLAS_STATUS_SUCCESS;
+        };
+        set(CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof ta);
+        set(CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof tb);
+        set(CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mode, sizeof mode);
+        set(CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mode, sizeof mode);
+        set(CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fa, sizeof fa);
+        set(CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &ws_ptr, sizeof ws_ptr);
+        set(CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &xs_ptr, sizeof xs_ptr);
         ok = ok && cublasLtMatrixLayoutCreate(&p.a, CUDA_R_8F_E4M3, (uint64_t) K, (uint64_t) N, K) == CUBLAS_STATUS_SUCCESS;
-        ok = ok && cublasLtMatrixLayoutCreate(&p.b, CUDA_R_8F_E4M3, (uint64_t) K, (uint64_t) T, K) == CUBLAS_STATUS_SUCCESS;
-        ok = ok && cublasLtMatrixLayoutCreate(&p.c, CUDA_R_32F, (uint64_t) N, (uint64_t) T, ldy) == CUBLAS_STATUS_SUCCESS;
-        if (!ok) return p;
+        const Layouts ref(kRefRows, N, K, ldy);
         cublasLtMatmulPreference_t pref = nullptr;
-        if (cublasLtMatmulPreferenceCreate(&pref) != CUBLAS_STATUS_SUCCESS) return p;
+        if (!ok || !ref.ok || cublasLtMatmulPreferenceCreate(&pref) != CUBLAS_STATUS_SUCCESS) return p;
         const uint64_t wsb = ws;
         cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsb, sizeof wsb);
         cublasLtMatmulHeuristicResult_t res[16] = {};
         int n = 0;
-        if (cublasLtMatmulAlgoGetHeuristic(h, p.op, p.a, p.b, p.c, p.c, pref, 16, res, &n) == CUBLAS_STATUS_SUCCESS)
-            for (int i = 0; i < n; ++i)
-                if (res[i].state == CUBLAS_STATUS_SUCCESS) p.algos.push_back(res[i]);
+        if (cublasLtMatmulAlgoGetHeuristic(h, p.op, p.a, ref.b, ref.c, ref.c, pref, 16, res, &n) != CUBLAS_STATUS_SUCCESS)
+            n = 0;
         cublasLtMatmulPreferenceDestroy(pref);
+        // the first offered algorithm that keeps K in one piece; else the first, told not to split
+        int pick = -1;
+        for (int i = 0; i < n && pick < 0; ++i) {
+            int32_t splits = 1;
+            size_t got = 0;
+            if (res[i].state == CUBLAS_STATUS_SUCCESS &&
+                cublasLtMatmulAlgoConfigGetAttribute(&res[i].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splits,
+                                                     sizeof splits, &got) == CUBLAS_STATUS_SUCCESS &&
+                splits <= 1)
+                pick = i;
+        }
+        if (pick < 0 && n > 0 && res[0].state == CUBLAS_STATUS_SUCCESS) {
+            const int32_t one = 1;
+            const uint32_t none = CUBLASLT_REDUCTION_SCHEME_NONE;
+            cublasLtMatmulAlgoConfigSetAttribute(&res[0].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &one, sizeof one);
+            cublasLtMatmulAlgoConfigSetAttribute(&res[0].algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &none, sizeof none);
+            cublasLtMatmulHeuristicResult_t chk{};
+            if (cublasLtMatmulAlgoCheck(h, p.op, p.a, ref.b, ref.c, ref.c, &res[0].algo, &chk) == CUBLAS_STATUS_SUCCESS)
+                pick = 0;
+        }
+        if (pick < 0) return p;
+        p.algo = res[pick].algo;
+        p.ok = true;
         return p;
+    }
+
+    // The plan's algorithm runs this shape within the workspace.
+    bool fits(Plan& p, int64_t T, int64_t N, int64_t K, int64_t ldy, size_t ws) {
+        const Layouts l(T, N, K, ldy);
+        cublasLtMatmulHeuristicResult_t chk{};
+        return p.ok && l.ok && cublasLtMatmulAlgoCheck(h, p.op, p.a, l.b, l.c, l.c, &p.algo, &chk) == CUBLAS_STATUS_SUCCESS &&
+               chk.workspaceSize <= ws;
     }
 };
 
@@ -254,26 +301,28 @@ bool Lt::init(std::string& err) {
     return true;
 }
 
-int Lt::algos(Scale s, int64_t T, int64_t N, int64_t K, int64_t ldy, size_t ws_bytes, const void* w_scales,
-             const void* x_scales, bool fast_accum) {
-    if (!state_) return 0;
-    return (int) state_->plan(s, T, N, K, ldy, ws_bytes, fast_accum, w_scales, x_scales).algos.size();
+bool Lt::fits(Scale s, int64_t T, int64_t N, int64_t K, int64_t ldy, size_t ws_bytes, const void* w_scales,
+              const void* x_scales, bool fast_accum) {
+    if (!state_ || T <= 0) return false;
+    State::Plan& p = state_->plan(s, N, K, ldy, ws_bytes, fast_accum, w_scales, x_scales);
+    return state_->fits(p, T, N, K, ldy, ws_bytes);
 }
 
 bool Lt::run(Scale s, const uint8_t* W, const void* w_scales, const uint8_t* X, const void* x_scales, float* Y,
              int64_t T, int64_t N, int64_t K, int64_t ldy, void* workspace, size_t ws_bytes, void* stream,
-             bool fast_accum, int algo) {
+             bool fast_accum) {
     if (!state_) return false;
-    State::Plan& p = state_->plan(s, T, N, K, ldy, ws_bytes, fast_accum, w_scales, x_scales);
-    if (algo < 0 || algo >= (int) p.algos.size()) return false;
-    if (cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w_scales, sizeof w_scales) !=
+    State::Plan& p = state_->plan(s, N, K, ldy, ws_bytes, fast_accum, w_scales, x_scales);
+    const Layouts l(T, N, K, ldy);
+    if (!p.ok || !l.ok ||
+        cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w_scales, sizeof w_scales) !=
             CUBLAS_STATUS_SUCCESS ||
         cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &x_scales, sizeof x_scales) !=
             CUBLAS_STATUS_SUCCESS)
         return false;
     const float alpha = 1.0f, beta = 0.0f;
-    return cublasLtMatmul(state_->h, p.op, &alpha, W, p.a, X, p.b, &beta, Y, p.c, Y, p.c, &p.algos[(size_t) algo].algo,
-                          workspace, ws_bytes, (cudaStream_t) stream) == CUBLAS_STATUS_SUCCESS;
+    return cublasLtMatmul(state_->h, p.op, &alpha, W, p.a, X, l.b, &beta, Y, l.c, Y, l.c, &p.algo, workspace, ws_bytes,
+                          (cudaStream_t) stream) == CUBLAS_STATUS_SUCCESS;
 }
 
 }  // namespace basalt::prefill::fp8
