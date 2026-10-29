@@ -66,4 +66,53 @@ std::string suggest_share(double candidate, double base, double gain) {
     return fmt("--prefill-cpu-share %.2f (prefill %+.0f%%)", candidate, gain * 100.0);
 }
 
+double adapt_band(double a, double b, double floor) {
+    const double m = (a + b) / 2.0;
+    return std::max(floor, m > 0 ? std::fabs(a - b) / m : 0.0);
+}
+
+namespace {
+bool same_setting(const AdaptTrial& a, const AdaptTrial& b) {
+    return a.every == b.every && a.swaps == b.swaps && std::fabs(a.decay - b.decay) < 1e-6 && a.saved == b.saved;
+}
+}  // namespace
+
+std::string suggest_adapt(const AdaptTrial& base, double base_tps, double band, const std::vector<AdaptTrial>& trials) {
+    const AdaptTrial* best = nullptr;
+    for (const auto& t : trials)
+        if (!t.saved && !same_setting(t, base) && t.tps > 0 && (best == nullptr || t.tps > best->tps)) best = &t;
+    if (best == nullptr || !(base_tps > 0) || best->tps <= base_tps * (1.0 + band)) return "";
+    std::string s;
+    if (best->every != base.every) s += fmt("--adapt-every %d ", best->every);
+    if (best->swaps != base.swaps) s += fmt("--adapt-swaps %d ", best->swaps);
+    if (std::fabs(best->decay - base.decay) > 1e-6) s += fmt("--adapt-decay %.2f ", best->decay);
+    return s + fmt("(adapt test %+.0f%%)", (best->tps / base_tps - 1.0) * 100.0);
+}
+
+std::string suggest_saved_profile(const std::string& file, double base_tps, double saved_tps, double band) {
+    if (!(base_tps > 0) || !(saved_tps > 0)) return "";
+    if (saved_tps > base_tps * (1.0 + band))
+        return fmt("--expert-profile-save %s (adapt test %+.0f%%)", file.c_str(), (saved_tps / base_tps - 1.0) * 100.0);
+    if (base_tps > saved_tps * (1.0 + band))
+        return fmt("no --expert-profile-save (adapt test %+.0f%% on the model's profile)", (base_tps / saved_tps - 1.0) * 100.0);
+    return "";
+}
+
+std::string format_adapt_line(const std::vector<AdaptTrial>& trials, double band) {
+    std::string s;
+    std::vector<bool> done(trials.size(), false);
+    for (size_t i = 0; i < trials.size(); ++i) {
+        if (done[i]) continue;
+        const AdaptTrial& t = trials[i];
+        if (!s.empty()) s += " | ";
+        s += t.saved ? std::string("saved profile") : fmt("%d/%d/%.2f", t.every, t.swaps, t.decay);
+        for (size_t j = i; j < trials.size(); ++j)
+            if (!done[j] && same_setting(trials[j], t)) {
+                s += fmt(" %.0f", trials[j].tps);
+                done[j] = true;
+            }
+    }
+    return s + fmt(" tok/s (band %.1f%%)", band * 100.0);
+}
+
 }  // namespace basalt::program

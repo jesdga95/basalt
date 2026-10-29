@@ -25,6 +25,10 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& state
                               int64_t upto, bool include_index, std::string& error);
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                              int64_t upto, bool include_index, std::string& error);
+// The K/V up to `upto` of `from` into `to` (the same layout) without a host copy: what a save of `from` and a
+// restore of it into `to` leave there.
+bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g, int64_t upto,
+                          bool include_index, std::string& error);
 // Diagnostic read-back after a synchronized restore. Uses 64 KiB of stack
 // workspace, compares authoritative bytes and resident draft-ring pages, and
 // fingerprints the authoritative payload only. Never changes model state.

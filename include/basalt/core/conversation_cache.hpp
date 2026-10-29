@@ -59,6 +59,18 @@ struct PooledAlloc {
     void construct(U* p) noexcept { ::new (static_cast<void*>(p)) U; }   // resize leaves new bytes as they are
     template <class U, class... A>
     void construct(U* p, A&&... a) { ::new (static_cast<void*>(p)) U(std::forward<A>(a)...); }
+    /// Frees the blocks the pool keeps; returns their bytes.
+    static size_t release_pooled() {
+        Pool& p = pool();
+        std::lock_guard<std::mutex> lk(p.mu);
+        size_t n = 0;
+        for (const auto& b : p.blocks) {
+            n += b.second;
+            ::operator delete(b.first);
+        }
+        p.blocks.clear();
+        return n;
+    }
     template <class U>
     bool operator==(const PooledAlloc<U>&) const noexcept { return true; }
     template <class U>
@@ -313,11 +325,16 @@ public:
         if (bytes() > budget_ - held - incoming) reuse_ = {};
         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
             bytes_ -= entries_.front().bytes();
+            if (spill_) spilled_.push_back(std::move(entries_.front()));
             entries_.pop_front();
             ++evictions_;
         }
         return true;
     }
+
+    /// With spilling on, what make_room evicts waits in take_spilled() for the tier below (the disk) instead of going.
+    void set_spill(bool on) { spill_ = on; }
+    std::vector<SavedConversation> take_spilled() { return std::exchange(spilled_, {}); }
 
     // Drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
     // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
@@ -353,6 +370,19 @@ public:
     }
     size_t superseded() const { return superseded_; }
 
+    // Drop every parked conversation and the retained K/V buffers, to give their RAM back; returns their bytes.  With
+    // spilling on, the conversations wait in take_spilled() for the tier below, as make_room's evictions do.
+    size_t clear() {
+        const size_t freed = bytes();
+        if (spill_)
+            for (auto& e : entries_) spilled_.push_back(std::move(e));
+        entries_.clear();
+        bytes_ = 0;
+        reuse_ = {};
+        reuse_owner_ = nullptr;
+        return freed;
+    }
+
     bool put(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
@@ -366,6 +396,8 @@ public:
 private:
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
     std::deque<SavedConversation> entries_; // least recently active first
+    bool spill_ = false;
+    std::vector<SavedConversation> spilled_;
     ConversationKvReuse reuse_;
     const void* reuse_owner_ = nullptr;
 };
