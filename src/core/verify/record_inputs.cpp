@@ -14,29 +14,37 @@
 namespace basalt::core {
 using namespace verify_detail;
 
+// layer 1's PLE projections on their side branch: the host-gated rows' wait, their copy and the two GEMVs; layer 1
+// joins it before its PLE window
+bool Verifier::WindowRecorder::ple_fork() {
+    using namespace basalt::kernels;
+    try {
+        cudaEventRecord(v_.ev_ple_fork_, cs);
+        cudaStreamWaitEvent(v_.ple_s_, v_.ev_ple_fork_, 0);
+        wait_flag_ge(v_.m_flag_ + 8, 1, v_.ple_s_);
+        copy_from_mapped(v_.ple_, v_.m_ple_, (int64_t) T * N, v_.ple_s_);
+        bf16_gemv_fp32_mmvf_multi(v_.ple_, N, ss.ple.w.key_bf16, v_.ple_key_, HC * N, N, HC * N, T, v_.ple_s_);
+        bf16_gemv_fp32_mmvf_multi(v_.ple_, N, ss.ple.w.value_bf16, v_.ple_val_, N, N, N, T, v_.ple_s_);
+        cudaEventRecord(v_.ev_ple_join_, v_.ple_s_);
+    } catch (const std::exception& e) {
+        err = std::string("verify PLE side: ") + e.what();
+        return false;
+    }
+    ple_open = true;
+    return true;
+}
+
 bool Verifier::WindowRecorder::inputs() {
     using namespace basalt::kernels;
     if (v_.prof_on_ && !v_.batch_rec_) gpu_stamp(v_.prof_, (int) (g.n_layers * kProfPer + 2), cs);
-    // layer 1's PLE projections read only the host-gathered rows, so they run beside layer 0 from the window's start;
-    // layer 1 joins them before the PLE window
+    // layer 1's PLE projections read only the host-gated rows: they run on a side branch, forked once no mid chain is
+    // left before layer 1's join (ple_fork), so its spin kernel never holds an SM the mid chain needs
     ple_side = ple_on && !v_.batch_rec_ && dm && v_.lb_ <= 1 && v_.le_ > 1 && !v_.prof_on_ &&
                           v_.ple_s_ != nullptr && v_.ev_ple_fork_ != nullptr && v_.ev_ple_join_ != nullptr &&
                           ss.ple.w.key_bf16 != nullptr && ss.ple.w.value_bf16 != nullptr;
     if (!v_.batch_rec_) v_.ple_side_ = ple_side;
-    if (ple_side) {
-        try {
-            cudaEventRecord(v_.ev_ple_fork_, cs);
-            cudaStreamWaitEvent(v_.ple_s_, v_.ev_ple_fork_, 0);
-            wait_flag_ge(v_.m_flag_ + 8, 1, v_.ple_s_);
-            copy_from_mapped(v_.ple_, v_.m_ple_, (int64_t) T * N, v_.ple_s_);
-            bf16_gemv_fp32_mmvf_multi(v_.ple_, N, ss.ple.w.key_bf16, v_.ple_key_, HC * N, N, HC * N, T, v_.ple_s_);
-            bf16_gemv_fp32_mmvf_multi(v_.ple_, N, ss.ple.w.value_bf16, v_.ple_val_, N, N, N, T, v_.ple_s_);
-            cudaEventRecord(v_.ev_ple_join_, v_.ple_s_);
-        } catch (const std::exception& e) {
-            err = std::string("verify PLE side: ") + e.what();
-            return false;
-        }
-    }
+    ple_open = false;
+    if (ple_side && v_.lb_ == 1 && !ple_fork()) return false;
     // ---- the async commit's remainder (a no-op when none is pending): nothing later in the window reads or writes
     // what it works on until this node returns - the GDN state, conv history, indexer buffers and PLE history, nor the
     // rows it reads (h_L_, qkv_L_, gate_L_, beta_L_, idx_raw_L_, tail_snap_, hist_snap_), which the first kernels'
