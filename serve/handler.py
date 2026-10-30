@@ -15,7 +15,7 @@ from serve.api import responses as responses_api
 from serve.api.responses import error_body as responses_error_body
 from serve import ROOT
 from serve.api.anthropic import anthropic_collect, anthropic_events
-from serve.engine.errors import EngineDied, EngineStarting, EngineStuck, GpuBusy, ModelBusy
+from serve.engine.errors import EngineDied, EngineError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, checked as checked_bias
 from serve.config import checked_sampling
@@ -390,6 +390,11 @@ def make_handler(svc: Service):
                     self._count_tokens(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
+            except EngineError as e:                         # the engine failed: not the request's fault
+                if path == "/v1/responses":
+                    self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
+                else:
+                    self._json(500, {"error": {"type": "server_error", "message": str(e)}})
             except BadBody as e:
                 if path == "/v1/responses":
                     self._json(e.status, responses_error_body(str(e)))
@@ -589,6 +594,8 @@ def make_handler(svc: Service):
                     yield from asm.finish(done)
             try:
                 items = primed(events(), ids)
+            except EngineError:
+                raise
             except ValueError as e:                          # too long for the context: found when the engine counted
                 err = ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None)
                 return self._json(err.status, err.body())
@@ -598,8 +605,11 @@ def make_handler(svc: Service):
                 except EngineDied as e:
                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
                                                                 code="server_error"))
-                except ValueError as e:                      # the engine's ERR line
+                except EngineError as e:                     # the engine failed
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
+                except ValueError as e:                      # the engine refused the request
+                    err = ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None)
+                    return self._json(err.status, err.body())
                 return self._json(200, result)
             self._sse()
             last = time.monotonic()

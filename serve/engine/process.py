@@ -33,7 +33,7 @@ from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY, engine_key as grammar_
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
 from serve.engine import lifeline, suspend
 from serve.engine.flags import flag_value
-from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStuck
+from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck
 from serve.engine.slots import AdmissionQueue
 from serve.prompt import PromptText
 from serve.util.console import tagged
@@ -147,6 +147,16 @@ def _number(v) -> bool:
 # Engine lines for an unrecoverable verifier: the process may stay alive and print DONE, but must take no more requests.
 FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed out at layer ",
                   "ERR verify: an earlier window never finished", "ERR verify batch: an earlier window never finished")
+# Engine ERR texts that are the request's fault (a 400); any other ERR of a request is an engine failure (a 500).
+REQUEST_ERRS = ("prompt (", "bad request:", "sampling ", "logit_bias:", "grammar:", "ppl:",
+                "a token id is outside the vocabulary", "this engine was started without --vision",
+                "the prompt cannot end in an image")
+
+
+def request_err(err: str, shown: str | None = None) -> ValueError:
+    """The exception for a request's ERR text, raised with `shown` when given: ValueError when the request caused it,
+    else EngineError."""
+    return (ValueError if err.startswith(REQUEST_ERRS) else EngineError)(err if shown is None else shown)
 
 
 class ProcessEngine:
@@ -719,7 +729,7 @@ class ProcessEngine:
                     self._yielded = (int(f[1]), int(f[2]))
             elif line.startswith("ERR"):
                 self._ctl_erred = True                   # the engine refused it and is idle: no DONE follows
-                raise ValueError(line[4:].strip())
+                raise request_err(line[4:].strip())
             if line.startswith("DONE") and self._ctl_mode == "solo":
                 self._ctl_result = ("done", None)
                 return
@@ -1326,7 +1336,7 @@ class ProcessEngine:
                 elif line.startswith("ERR"):
                     done = True
                     err = line[4:].strip()
-                    raise ValueError(text.explain(err) if text is not None else err)
+                    raise request_err(err, text.explain(err) if text is not None else None)
         finally:
             if not done:                                  # consumer left early: STOP and drain to DONE
                 if self.can_stop:
