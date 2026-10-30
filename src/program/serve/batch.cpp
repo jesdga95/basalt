@@ -42,6 +42,7 @@ bool Runtime::batch_step() {
                             (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
                 sl.active = false;
                 sl.cached = o.prompt_cache > 0;   // its sessions hold sl.ids
+                sl.idle_busy = busy_now();
                 sl.guard.reset();
                 kv_wait[(size_t) b] = 1;
                 continue;
@@ -296,6 +297,7 @@ bool Runtime::batch_step() {
                         (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
             sl.active = false;
             sl.cached = o.prompt_cache > 0;   // its sessions hold sl.ids for the next turn
+            sl.idle_busy = busy_now();
             sl.guard.reset();
         } else {
             sl.x = outb[r0s[sg] + k - 1];

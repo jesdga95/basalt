@@ -167,7 +167,9 @@ against the base.
 ### Scope
 
 - Identity is bitwise with the expert tiers pinned. With adaptation on, experts move between the CPU pool and the GPU,
-  which round differently: a rounding difference, not a quality difference.
+  which round differently: a rounding difference, not a quality difference. The same holds for the slots the elastic KV
+  takes from the expert cache and gives back. An idle conversation moved to RAM and back keeps its bytes exactly: with
+  the tiers pinned, its next turns write the same tokens and accept the same drafts as when it stays in VRAM.
 - The GPU tiers (VRAM and peer card) share one arithmetic; the CPU tier quantizes with ggml's vec_dot_type (Q8_K per 256
   for i-quant gate/up, against q8_1 per 32 on the GPU; native_expert.cpp:48-49, 76-86). In the quality gate about 0.8% of
   routed experts were computed on the CPU (IQ3_XXS, default placement). The split is fixed per placement, so it is the

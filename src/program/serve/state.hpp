@@ -353,6 +353,8 @@ private:
         // instead of reading its history again (see `slot_source` in the request path).
         std::vector<int32_t> ids;
         bool cached = false;           ///< idle, and its sessions still hold `ids`
+        double idle_busy = 0;          ///< the busy clock (busy_now) when it last became idle holding `ids`
+        double park_noted = -1;        ///< the idle_busy whose stay in VRAM for want of RAM was logged
         bool cvec = true;              ///< the control vector setting `ids` were read with
         std::vector<ImgKey> imgs;      ///< the pictures in `ids`: a later request reuses them only with the same ones
         // the checkpoint its prompt read took at the last turn boundary (the history before the new turn's header): a
@@ -391,6 +393,34 @@ private:
     bool batch_spec{};
     /// the solo conversation's draft K/V waits in slot 0's store while a request in another slot holds the main one
     bool solo_draft_in0{};
+    // ---- idle conversations out of VRAM.  An idle conversation (a cached batch slot's, or the solo session's while
+    // no request works there) keeps its KV in VRAM until the work beside it has run kParkAfterBusy seconds: the
+    // expert-cache slots its cells hold have then cost that work about what moving it out and back costs, both
+    // in proportion to its tokens.  From then on, the VRAM a session is short of comes from it before the expert
+    // cache's slots, and an idle engine moves it out to regrow the cache.  It goes to the RAM tier outside its
+    // budget when RAM admits it, else it stays only on the disk tier when that holds it, else in VRAM; its next
+    // turn reads it back like any parked conversation.  Before a prompt is refused for want of VRAM, any idle
+    // conversation goes.
+    static constexpr double kParkAfterBusy = 15.0;
+    /// the solo session's conversation while a request works in another slot (that request's, moved out of `live`)
+    struct SoloBook {
+        std::vector<int32_t> live;
+        std::vector<ImgKey> live_imgs;
+        bool live_ok = false, cvec = true;
+        std::vector<ConvCheckpoint> checks;
+    };
+    SoloBook* solo_out{};
+    bool solo_busy{};                    ///< a request reads or decodes in the solo session
+    double solo_idle_busy{};             ///< the busy clock when the solo conversation last became idle
+    double solo_park_noted = -1;         ///< as BSlot::park_noted
+    int park_keep = -1;                  ///< the slot whose conversation the request being admitted continues
+    // the busy clock: seconds some request or batch slot ran (dispatch counts them)
+    double busy_s{};
+    Clock::time_point busy_from{};
+    bool busy_on{};
+    double busy_now() const {
+        return busy_s + (busy_on ? std::chrono::duration<double>(Clock::now() - busy_from).count() : 0.0);
+    }
     int S_all{};
     std::optional<basalt::spec::DraftPolicy> bpolicy;
     double bt_draft{};
@@ -499,6 +529,10 @@ private:
     bool batch_on();
     bool try_next_line(std::string& out);
     bool kv_give_back(int64_t ss_keep, const basalt::core::SessionState* skip, int skip_slot, const std::function<bool()>& enough, int64_t& given, std::string& e);
+    std::vector<std::pair<double, int>> idle_list(const basalt::core::SessionState* s, bool any);
+    int64_t park_idle(const basalt::core::SessionState* s, int64_t need, bool any, std::string& e);
+    bool park_one(int b, std::string& e);
+    bool park_idle_engine(std::string& e);
     void enc_command(const std::string& cmd);
     bool copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& e);
     bool hold_slot(int b, const ConvCheckpoint* at, std::string& e);

@@ -61,12 +61,7 @@ private:
     bool in_slot{};
     bool solo_req{};
     basalt::core::SessionState* rview{};
-    struct SoloBook {
-        std::vector<int32_t> live;
-        std::vector<ImgKey> live_imgs;
-        bool live_ok = false, cvec = true;
-        std::vector<ConvCheckpoint> checks;
-    };
+    using SoloBook = Runtime::SoloBook;
     SoloBook solo_book{};
     bool solo_moved{};
     bool own_partial{};
