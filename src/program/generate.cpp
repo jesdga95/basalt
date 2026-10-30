@@ -429,65 +429,31 @@ int main(int argc, char** argv) {
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         basalt::log::warn("basalt serve", "conversation caching is disabled by %s",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
-    // parking with --layer-split saves every stage (SavedConversation::stage_images)
-    // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
-    // the next visible ones); "auto" places the K from each GPU's free VRAM once the weights are in (below).  KV
-    // streaming and images (the server's GPU encoder) run across a split, also with parking and --batch.  Across
-    // GPUs, not supported: control vectors, the helper caches (--expert-cache-remote), and lending cache slots to the
-    // prompt path (each stage's prompt path has its own buffers).
+    // parking with a layer split saves every stage (SavedConversation::stage_images)
+    // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on the next visible GPUs, the K placed from
+    // each GPU's free VRAM once the weights are in (below).  KV streaming and images (the server's GPU encoder) run
+    // across a split, also with parking and --batch.  Across GPUs, not supported: control vectors, the helper caches,
+    // and lending cache slots to the prompt path (each stage's prompt path has its own buffers).
     std::vector<int64_t> split_at;
     std::vector<int> split_devs;
-    bool split_auto = false, split_same = false;
+    bool split_auto = false;
     if (!o.layer_split.empty()) {
         int n_dev = 1;
         if (cudaGetDeviceCount(&n_dev) != cudaSuccess || n_dev < 1) n_dev = 1;
         cudaGetLastError();
-        auto ints = [](const std::string& str, auto& out) -> bool {
-            using V = typename std::decay_t<decltype(out)>::value_type;
-            size_t a = 0;
-            while (a < str.size()) {
-                size_t b = str.find(',', a);
-                if (b == std::string::npos) b = str.size();
-                const std::string t = str.substr(a, b - a);
-                if (t.empty() || t.find_first_not_of("0123456789") != std::string::npos) return false;
-                out.push_back((V) std::atoll(t.c_str()));
-                a = b + 1;
-            }
-            return !out.empty();
-        };
-        split_auto = o.layer_split == "auto";
-        bool ok = o.serve && (split_auto || ints(o.layer_split, split_at));
-        if (ok && !o.split_device.empty()) ok = ints(o.split_device, split_devs);
-        else if (ok)
-            for (int d = 1; d < n_dev && (split_auto || split_devs.size() < split_at.size()); ++d) split_devs.push_back(d);
-        if (ok && !split_auto && split_devs.empty() && split_at.size() == 1) split_devs.push_back(0);   // one GPU
-        split_same = ok && split_devs.size() == 1 && split_devs[0] == 0 && !split_auto;
-        if (split_same && o.conversation_cache_mib > 0 && o.conversation_cache_slots > 0 && o.prompt_cache > 0) {
-            basalt::log::error("basalt serve", "conversation parking does not support a layer split on one GPU "
-                                 "(--split-device 0); disable parking with --conversation-cache-mib 0");
-            return 2;
-        }
-        if (ok && split_auto && split_devs.empty()) {
-            basalt::log::info("basalt generate", "--layer-split auto: one GPU visible, so no split");
+        split_auto = true;
+        for (int d = 1; d < n_dev; ++d) split_devs.push_back(d);
+        if (o.serve && split_devs.empty()) {
+            basalt::log::info("basalt generate", "layer split: one GPU visible, so no split");
             o.layer_split.clear();
             split_auto = false;
-        } else if (ok) {
-            ok = (split_auto || split_at.size() == split_devs.size()) && split_devs.size() < (size_t) SplitDrive::kMax;
-            for (size_t i = 0; ok && i < split_at.size(); ++i) ok = split_at[i] >= 2 && (i == 0 || split_at[i] > split_at[i - 1]);
-            for (size_t i = 0; ok && !split_same && i < split_devs.size(); ++i) {
-                ok = split_devs[i] > 0 && split_devs[i] < n_dev;
-                for (size_t j = 0; ok && j < i; ++j) ok = split_devs[i] != split_devs[j];
-            }
-        }
-        if (!ok) {
-            basalt::log::error("basalt generate", "--layer-split K[,K2..]|auto needs --serve, rising K from 2, and one "
-                                 "distinct GPU per K in --split-device (1..%d; or 0 with one K: the same GPU). K is the "
-                                 "FIRST LAYER of each later GPU, not a count of layers per card: \"24,36,42\" for 4 "
-                                 "GPUs, not \"24,12,6,6\" (got \"%s\")", n_dev - 1, o.layer_split.c_str());
+        } else if (!o.serve || split_devs.size() >= (size_t) SplitDrive::kMax) {
+            basalt::log::error("basalt generate", "the GPU plan picked a layer split, which needs --serve and at most %d "
+                                 "GPUs (%d visible)", (int) SplitDrive::kMax, n_dev);
             return 2;
         }
     }
-    bool multi_gpu = !split_devs.empty() && !split_same;
+    bool multi_gpu = !split_devs.empty();
     // two stages with the drafter and one conversation at a time pipeline their windows: a second chain of verifiers over
     // the same sessions (a window's buffers on each card) and, on the first card, the snapshot a rolled-back guess needs
     const bool pipe_want = multi_gpu && split_devs.size() == 1 && !o.mtp.empty() && o.serve && o.batch <= 0;
@@ -1457,7 +1423,7 @@ int main(int argc, char** argv) {
 
     for (size_t i = 0; i < split_at.size(); ++i)
         if (split_at[i] >= g.n_layers) {
-            basalt::log::error("basalt generate", "--layer-split: layer %lld is past the last (%lld)",
+            basalt::log::error("basalt generate", "layer split: layer %lld is past the last (%lld)",
                          (long long) split_at[i], (long long) (g.n_layers - 1));
             return 2;
         }
@@ -1568,8 +1534,7 @@ int main(int argc, char** argv) {
     bool slot0_is_solo = false;      // slot 0 is the solo session (no separate solo state)
     if (o.batch != 0) {
         const int cap = basalt::kernels::kVerifyMaxT;
-        const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
-                        : split_same ? "it needs each stage of a layer split on its own GPU" : nullptr;
+        const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots" : nullptr;
         if (off != nullptr) {
             basalt::log::warn("basalt generate", "--batch %d is off: %s", o.batch, off);
             o.batch = 0;
@@ -3527,7 +3492,6 @@ int main(int argc, char** argv) {
             .peer_streamed_share = peer_streamed_share,
             .split_at = split_at,
             .split_devs = split_devs,
-            .split_same = split_same,
             .multi_gpu = multi_gpu,
             .pipe_want = pipe_want,
             .no_spec = no_spec,
@@ -3602,10 +3566,8 @@ int main(int argc, char** argv) {
     int64_t spec_pos = 0;   // where the speculative loop starts (0 = not used)
     basalt::prefill::Prefill prefill;
     double prefill_batched_ms = 0;
-    std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
-    std::vector<float> final_r_host(final_r ? (size_t) (g.hc * g.n_embd) : 0);
     std::vector<std::pair<int32_t, int32_t>> lent;     // (residency index, slot) lent to the prompt path
-    const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
+    const int64_t n_batched = n_prompt - 1;
     if (o.prefill_chunk > 0 && n_prompt > 1) {
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;

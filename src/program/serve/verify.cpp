@@ -4,7 +4,7 @@
 namespace basalt::program::serve {
 
 basalt::core::Verifier & Runtime::stage_ver(int st) {
-    return st == 0 ? ver : split_same ? ver_same : stages[(size_t) st - 1]->ver;
+    return st == 0 ? ver : stages[(size_t) st - 1]->ver;
 }
 
 int Runtime::pcie_num_of(double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); }
@@ -60,25 +60,20 @@ int Runtime::init_verify() {
             split_drive.pcie_num[st] = pcie_num_of(o.pcie_frac);
         }
         for (int st = 1; st < n_stages; ++st) {
-            bool ok_s = false;
-            if (split_same) {
-                ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err);
-            } else {
-                GpuStage& gs = *stages[(size_t) st - 1];
-                const basalt::core::OnDevice on(gs.dev);
-                basalt::core::VerifyHits vs;
-                vs.d_res = gs.d_res;
-                vs.h_res = host_res.empty() ? nullptr : host_res.data();
-                vs.cache_base = gs.cache.device_slot(0);
-                vs.blob = thits.blob;
-                vs.slot_off = gs.cache.slot_offsets();
-                vs.n_slots = gs.cache.slots();
-                gs.ver.set_remote_expert_opt(remote_opt.get());
-                ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, std::max({o.spec, o.batch, 2}), err);
-                split_drive.cache_base[st] = gs.cache.device_slot(0);
-                split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
-                split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
-            }
+            GpuStage& gs = *stages[(size_t) st - 1];
+            const basalt::core::OnDevice on(gs.dev);
+            basalt::core::VerifyHits vs;
+            vs.d_res = gs.d_res;
+            vs.h_res = host_res.empty() ? nullptr : host_res.data();
+            vs.cache_base = gs.cache.device_slot(0);
+            vs.blob = thits.blob;
+            vs.slot_off = gs.cache.slot_offsets();
+            vs.n_slots = gs.cache.slots();
+            gs.ver.set_remote_expert_opt(remote_opt.get());
+            const bool ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, std::max({o.spec, o.batch, 2}), err);
+            split_drive.cache_base[st] = gs.cache.device_slot(0);
+            split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
+            split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
             if (!ok_s) {
                 basalt::log::error("basalt serve", "layer split, stage %d: %s", st + 1, err.c_str());
                 return 1;
@@ -124,7 +119,7 @@ int Runtime::init_verify() {
         std::string plan_s = "0-" + std::to_string(split_at[0] - 1) + " (CUDA0)";
         for (int st = 1; st < n_stages; ++st)
             plan_s += ", " + std::to_string(split_at[(size_t) st - 1]) + "-" + std::to_string(split_drive.end[st] - 1) +
-                      " (CUDA" + std::to_string(split_same ? 0 : stages[(size_t) st - 1]->dev) + ")";
+                      " (CUDA" + std::to_string(stages[(size_t) st - 1]->dev) + ")";
         basalt::log::info("basalt serve", "layer split: layers %s, one hand-off per window", plan_s.c_str());
     }
     ver.set_route_tail_skip(o.route_tail_skip);

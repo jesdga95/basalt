@@ -334,10 +334,6 @@ int Runtime::init_prompt() {
                              (long long) chunk, (long long) alone, dev, prop.name,
                              (long long) p.cache->slots(), (long long) alone,
                              (long long) part_slots(p, alone), pct.c_str());
-                // the helper tiers start at CUDA1 without a split (and are enabled in order)
-                basalt::log::info("basalt serve", "  a card this small can serve as a helper expert cache "
-                                     "instead of a split stage: without --layer-split, with %s",
-                             dev == 1 ? "--expert-cache-device1 N" : "--expert-cache-device1..3 N, in order");
             }
         }
         if (chunk > 0) {
