@@ -51,10 +51,9 @@ static std::string cards(const GpuChoice& c) {
     return s;
 }
 
-static std::string roles(const std::vector<GpuCard>& v, const GpuChoice& c, bool peer_access, int tiers) {
+static std::string roles(const std::vector<GpuCard>& v, const GpuChoice& c, int tiers) {
     RoleInputs in;
     for (int i : c.cards) in.cards.push_back(v[(size_t) i]);
-    in.peer_access = peer_access;
     in.max_expert_tiers = tiers;
     std::string s;
     for (GpuRole r : choose_roles(in)) s += (s.empty() ? "" : ",") + std::string(gpu_role_name(r));
@@ -84,8 +83,7 @@ int main() {
         c = pick("0,1", v);
         CHECK_STR(cards(c), "0,1");
         CHECK(c.warning.empty() && c.error.empty());
-        CHECK_STR(roles(v, c, true, 1), "main,expert tier");
-        CHECK_STR(roles(v, c, false, 1), "main,idle");
+        CHECK_STR(roles(v, c, 1), "main,expert tier");
         CHECK_STR(cards(pick("1,0", v)), "1,0");
         CHECK_STR(cards(pick("1", v)), "1");
         CHECK(pick("1", v).warning.empty());
@@ -108,7 +106,7 @@ int main() {
         const GpuChoice c = pick("auto", v);
         CHECK_STR(cards(c), "0,1");
         CHECK(c.notes.empty());
-        CHECK_STR(roles(v, c, true, 1), "main,expert tier");
+        CHECK_STR(roles(v, c, 1), "main,expert tier");
     }
     // Four mixed cards, one of them not Blackwell.
     {
@@ -118,8 +116,8 @@ int main() {
         CHECK_STR(cards(c), "2,0,3");
         CHECK(c.notes.size() == 1);
         if (c.notes.size() == 1) CHECK_STR(c.notes[0], "gpu auto: GPU 1 (RTX 3090) skipped, not sm_120");
-        CHECK_STR(roles(v, c, true, 1), "main,expert tier,idle");
-        CHECK_STR(roles(v, c, true, 3), "main,expert tier,expert tier");
+        CHECK_STR(roles(v, c, 1), "main,expert tier,idle");
+        CHECK_STR(roles(v, c, 3), "main,expert tier,expert tier");
         c = pick("", v);
         CHECK_STR(cards(c), "0");
         CHECK_STR(c.warning, "GPU 2 (RTX 5090), GPU 3 (RTX 5060 Ti) unused; use gpu 0,2,3 or gpu auto");

@@ -222,7 +222,6 @@ std::vector<GpuRole> choose_roles(const RoleInputs& in) {
     std::vector<GpuRole> r(in.cards.size(), GpuRole::Idle);
     if (r.empty()) return r;
     r[0] = GpuRole::Main;
-    if (!in.peer_access) return r;
     int tiers = 0;
     for (size_t i = 1; i < r.size() && tiers < in.max_expert_tiers; ++i, ++tiers) r[i] = GpuRole::ExpertTier;
     return r;

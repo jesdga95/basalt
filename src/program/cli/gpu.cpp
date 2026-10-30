@@ -1,7 +1,6 @@
 #include "gpu.hpp"
 
 #include "basalt/log.hpp"
-#include "basalt/platform/system.hpp"
 #include "basalt/program/options.hpp"
 
 #include <algorithm>
@@ -43,7 +42,6 @@ std::optional<int> select_gpus(Options& o, std::vector<GpuCard>& chosen_cards, i
     }
     bp::RoleInputs ri;
     for (int i : choice.cards) ri.cards.push_back((size_t) i < visible.size() ? visible[(size_t) i] : bp::GpuCard{});
-    ri.peer_access = basalt::platform::gpu_peer_access();
     ri.max_expert_tiers = max_expert_tiers;   // the device-planned tail's peer windows
     const std::vector<bp::GpuRole> roles = bp::choose_roles(ri);
     std::string line;
@@ -58,9 +56,8 @@ std::optional<int> select_gpus(Options& o, std::vector<GpuCard>& chosen_cards, i
     }
     basalt::log::info("basalt", "gpus: %s", line.c_str());
     if (std::count(roles.begin(), roles.end(), bp::GpuRole::Idle) > 0)
-        basalt::log::warn("basalt", "%s", ri.peer_access
-            ? ("expert tiers max " + std::to_string(ri.max_expert_tiers) + "; later cards idle").c_str()
-            : "no GPU-to-GPU access; cards after the main idle");
+        basalt::log::warn("basalt", "%s",
+                          ("expert tiers max " + std::to_string(ri.max_expert_tiers) + "; later cards idle").c_str());
     if (!o.peer_devices.empty()) o.peer_device = o.peer_devices[0];
     chosen_cards = ri.cards;
     return std::nullopt;

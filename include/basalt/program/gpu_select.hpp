@@ -60,12 +60,11 @@ const char* gpu_role_name(GpuRole r);
 /// The inputs of the role decision: the chosen cards, main first, and what this platform and engine can run.
 struct RoleInputs {
     std::vector<GpuCard> cards;
-    bool peer_access = true;        ///< the platform gives a process GPU-to-GPU access (the expert tier needs it)
     int max_expert_tiers = 1;       ///< how many cards the engine can run as expert tiers
 };
 
-/// The role of each card, in order: the cards after the main one are expert tiers, as many as the engine runs, where
-/// the platform allows it, and idle otherwise. The layer split (each card a block of layers) is never picked: it
+/// The role of each card, in order: the cards after the main one are expert tiers, as many as the engine runs, and idle
+/// otherwise. The layer split (each card a block of layers) is never picked: it
 /// measured slower than the expert tier and than the main card alone (docs/configuration/gpus.md).
 std::vector<GpuRole> choose_roles(const RoleInputs& in);
 
