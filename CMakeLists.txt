@@ -472,6 +472,23 @@ target_include_directories(prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${
 target_link_libraries(prefill PUBLIC engine ${_gpu_blas_target} ${_gpu_runtime_target})
 
 add_executable(basalt src/program/generate.cpp src/program/engine_local.cpp src/program/probe_rates.cpp
+                       src/program/generate/helpers.cpp
+                       src/program/generate/configure.cpp
+                       src/program/generate/model.cpp
+                       src/program/generate/layer_plan.cpp
+                       src/program/generate/weights.cpp
+                       src/program/generate/vision.cpp
+                       src/program/generate/sessions.cpp
+                       src/program/generate/sources.cpp
+                       src/program/generate/cache_size.cpp
+                       src/program/generate/cache_fill.cpp
+                       src/program/generate/token_path.cpp
+                       src/program/generate/resident_plan.cpp
+                       src/program/generate/resident_load.cpp
+                       src/program/generate/prompt_split.cpp
+                       src/program/generate/dispatch.cpp
+                       src/program/generate/prefill.cpp
+                       src/program/generate/decode.cpp
                        src/program/serve/batch.cpp
                        src/program/serve/batch_pipeline.cpp
                        src/program/serve/commands.cpp
