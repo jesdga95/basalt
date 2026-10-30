@@ -125,7 +125,7 @@ private:
     std::vector<int32_t> window{};
     std::vector<int32_t> outv{};
     std::vector<float> dprob{};
-    basalt::core::DraftCumAdapt cum_adapt{};   // this request's draft threshold
+    float cum_th{};   // the draft-length rule's threshold
     std::vector<int32_t> sbuf{};
     bool first_window{};
     int64_t produced_n{};

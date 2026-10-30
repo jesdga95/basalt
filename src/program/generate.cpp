@@ -3495,7 +3495,6 @@ int main(int argc, char** argv) {
         tier_file_bytes = b_file;
         const double total = (double) (b_vram + b_peer + b_ram + b_top + b_file);
         if (total <= 0.0) return;
-        basalt::core::draft_cum_cpu_mb() = (float) ((double) (b_ram + b_top) / (double) (g.n_layers * g.n_expert) / 1e6);
         constexpr double kGiB = 1073741824.0;
         auto pct = [&](uint64_t b) { return 100.0 * (double) b / total; };
         // RAM is the loaded copy (the bytes the loader reports); the top-up added after the load is shown beside it
@@ -3842,7 +3841,7 @@ int main(int argc, char** argv) {
         int32_t x = (int32_t) tok;
         std::vector<int32_t> drafts((size_t) o.spec, 0);
         std::vector<float> dprob((size_t) o.spec, 1.0f);
-        basalt::core::DraftCumAdapt cum_adapt;
+        const float cum_th = basalt::core::draft_cum_th();
         std::vector<int64_t> window_hist((size_t) o.spec + 1, 0);
         // the first window is the last prompt token alone (it produces the first generated token and the MTP's
         // first cell)
@@ -3871,7 +3870,7 @@ int main(int argc, char** argv) {
             int T = S_mtp;
             if (use_mtp) {
                 T = 1;
-                while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_adapt.th())) ++T;
+                while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_th)) ++T;
             }
             if (first_window) T = 1;
             bool from_sfx = false;
@@ -3945,8 +3944,7 @@ int main(int argc, char** argv) {
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
-            if (use_mtp && !from_sfx) cum_adapt.observe(dprob.data(), T - 1, a);
-            if (use_mtp) mtp.set_cum_th(cum_adapt.th());
+            if (use_mtp) mtp.set_cum_th(cum_th);
             const bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
                                  mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data());
             if (adapt_thr.joinable()) adapt_thr.join();

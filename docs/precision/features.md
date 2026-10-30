@@ -215,8 +215,7 @@ before the flag. With the flag on, the three greedy streams are identical too.
 draw, the target's final probabilities) for the bench prose and conv prompts (three seeds) and five natural chat
 prompts, at temperature 0.6 and 1.0 (top_p 0.95, top_k 20), on IQ3_S and IQ3_XXS, about 3,500 tokens per cell. The
 replay keeps a draft when the rule would, and averages 1 − p(d) over the relaxed rows per generated token
-(TV/token; 0 for exact). Token gain is the replayed extra tokens per window at the logged window widths; the live
-gain below is larger because the window controller lengthens windows when more drafts are kept.
+(TV/token; 0 for exact). Token gain is the replayed extra tokens per window at the logged window widths.
 
 | Model | Prompts | T | Exact accept | P = 0.5 gain / TV | P = 0.3 gain / TV | P = 0.2 gain / TV |
 |---|---|---|---|---|---|---|
