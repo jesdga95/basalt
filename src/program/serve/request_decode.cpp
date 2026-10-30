@@ -303,7 +303,7 @@ Flow Request::decode() {
                 // top_k, top_p, then temperature over the survivors: the sampler chain without penalties
                 std::vector<int> ord((size_t) runtime_.n_vocab);
                 for (int i = 0; i < runtime_.n_vocab; ++i) ord[(size_t) i] = i;
-                const int K = std::max(1, std::min<int>(req_top_k > 0 ? req_top_k : 20, (int) runtime_.n_vocab));
+                const int K = basalt::kernels::sampler_list_len(req_top_k, (int) runtime_.n_vocab);
                 std::partial_sort(ord.begin(), ord.begin() + K, ord.end(), [&](int x, int y) {
                     return lg[(size_t) x] > lg[(size_t) y] || (lg[(size_t) x] == lg[(size_t) y] && x < y);
                 });

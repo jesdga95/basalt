@@ -139,6 +139,8 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     if (early_sample) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
+        if (sampler_list_len(sp.top_k, (int) n_vocab_) > kSamplerNarrowMax && sampled && !exact_head_rows(T, err))
+            return false;
         sample_tokens_probe(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, probe ? m_q_ : nullptr,
                             probe ? T - 1 : 0, probe ? m_qp_ : nullptr, cs_);
     }
@@ -353,6 +355,8 @@ bool Verifier::run_end(int32_t* out, std::string& err) {
     if (head_sampling_ && (sampled || hist_d_ != nullptr || biased) && !early_sample) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
+        if (sampler_list_len(sp.top_k, (int) n_vocab_) > kSamplerNarrowMax && sampled && !exact_head_rows(T, err))
+            return false;
         sample_tokens_probe(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, probe ? m_q_ : nullptr,
                             probe ? T - 1 : 0, probe ? m_qp_ : nullptr, cs_);
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable

@@ -35,6 +35,14 @@ Flow Request::read_prompt() {
         return Flow::next;
     }
     runtime_.ver.set_sampling(req_sp);
+    // a list longer than the top_k kernels keep is sampled through sorted rows: their buffers before the first window
+    if (!req_sp.greedy &&
+        basalt::kernels::sampler_list_len(req_sp.top_k, (int) runtime_.n_vocab) > basalt::kernels::kSamplerNarrowMax &&
+        (!runtime_.ver.reserve_wide_sampler(runtime_.err) ||
+         (runtime_.pipe_on && !runtime_.ver_b.reserve_wide_sampler(runtime_.err)))) {
+        std::printf("ERR %s\n", runtime_.err.c_str());
+        return Flow::next;
+    }
     // relaxed acceptance: sampled text requests without a logit_bias; never the quality gate
     relax_on = req_relax > 0.0f && !req_sp.greedy && !req_bias_present && ppl == nullptr && gguard == nullptr;
     runtime_.ver.set_draft_probe(relax_on);

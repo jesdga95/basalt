@@ -60,7 +60,9 @@ logits, so log-probabilities stay finite. The block partition does not depend on
 are the same bits at every T.
 
 What it changes: the argmax and the sampler's top-64 list come from exact rows unless the copy's error exceeds the margin;
-the softmax tail outside the rescored rows carries the copy's error (rms about 0.7 logit).
+the softmax tail outside the rescored rows carries the copy's error (rms about 0.7 logit). A request whose sampled list
+is longer than 64 (top_k 0 or above 64) reads every row, so its windows run the plain Q6_K head again over the same
+columns (`Verifier::exact_head_rows`): every logit exact.
 
 Offline, on 3,614 real verify-head inputs dumped from the engine (conv, struct, prose fixtures), all 248,320 rows, exact =
 Q6_K x q8_1 in float:

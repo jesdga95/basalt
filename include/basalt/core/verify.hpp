@@ -162,6 +162,12 @@ public:
         sampling_.logit_bias = logit_bias_host_.empty() ? nullptr : logit_bias_device_;
         if (next_) next_->set_sampling(sp);
     }
+    /// The sampler's buffers for a list longer than its top_k kernels keep (top_k 0, or above 64), on the stream the
+    /// head samples on (the last stage's); false with `err` when the memory cannot be had.
+    bool reserve_wide_sampler(std::string& err);
+    /// A list longer than the top_k kernels keep reads every row's logit: a two-stage head (exact only near the top,
+    /// q6k_vhead) is run again exactly over the window's T columns, the plain kernel's bits.  Other heads: nothing.
+    bool exact_head_rows(int T, std::string& err);
     /// One request's token bias (one float per vocabulary entry, added to the logits before the sampler chain); empty
     /// clears it.  Applies to this verifier's own sampling only: the drafter never sees it.  Call before set_sampling;
     /// copied to the final stage's device only when it changed.

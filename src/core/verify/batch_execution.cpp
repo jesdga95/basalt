@@ -284,7 +284,13 @@ bool Verifier::commit_slots_end(std::string& err) {
 }
 
 bool Verifier::sample_rows(int S, std::string& err) {
-    bool any = false;
+    bool any = false, wide = false;
+    for (int t = 0; t < S; ++t) {
+        const basalt::kernels::SamplerParams& sp = slot_sp_[(size_t) last_rows_[t]];
+        wide = wide || (!sp.greedy && sp.temperature > 0.0f &&
+                        basalt::kernels::sampler_list_len(sp.top_k, (int) n_vocab_) > basalt::kernels::kSamplerNarrowMax);
+    }
+    if (wide && !exact_head_rows(S, err)) return false;
     for (int t = 0; t < S; ++t) {
         basalt::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
         if (sp.greedy || sp.temperature <= 0.0f) continue;
