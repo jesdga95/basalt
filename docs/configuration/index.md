@@ -15,7 +15,7 @@ the model file's sampling defaults. For what a setting does to speed, memory and
 - [Conversation cache](#conversation-cache)
 - [Vision](#vision)
 - [Control vectors](#control-vectors)
-- [Sampling](#sampling)
+- [Sampling and thinking](sampling.md)
 - [The adaptive tier](adaptive.md)
 - [Example configurations](examples.md)
 
@@ -105,8 +105,9 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | `grammar` | switch (`--no-grammar` or `grammar: false` turns it off) | on | Hold every tool call and JSON response format (`json_object`, `json_schema`) to its schema inside the engine, so a malformed call or object cannot be produced (as in llama.cpp's Qwen3-Coder parser, a call's required parameters may come in any order, each once, with up to six required ones permuted and more kept in declared order, followed by the optional ones in any order, which may repeat); the model's JSON is returned as it is generated, with no check after the fact. A request with `strict: true` gets the grammar even when this is off; with it off, any other JSON `response_format` (or Responses `text.format`, or Anthropic `output_config.format`) is refused with HTTP 400. Needs an engine that has `--grammar`; the server turns the engine's grammar support on whenever it has the flag. Works in batch slots: a slot's first pick the grammar refuses is resampled under the mask (the solo rule) and its window ends there. |
 | `debug` | switch | off | One log line per request and the raw model text after each reply. |
 | `request-lines` | switch | off | Echo the engine's per-request summary on stdout, for a supervisor that sees only that output. |
-| `temperature`, `top-p`, `top-k`, `min-p`, `presence-penalty`, `frequency-penalty`, `repetition-penalty`, `penalty-last-n`, `seed` | number (`top-k`, `penalty-last-n`, `seed`: integer) | the model file's `sampling` value, else the engine's | The sampling default for a request that leaves that field out, over the model file's. Same meaning and allowed values as the [model file's sampling keys](#the-model-files-sampling-defaults). The server applies them to each request; the engine never sees them. |
-| `reasoning-budget-tokens` | integer | `0` (none) | The thinking budget for a request that names none (see [Sampling](#sampling)). At the budget the thinking is closed and the answer starts. A request's own field wins, and `0` there disables budgeting. Positive budgets are also limited by `answer-room`. |
+| `temperature`, `top-p`, `top-k`, `min-p`, `presence-penalty`, `frequency-penalty`, `repetition-penalty`, `penalty-last-n`, `seed` | number (`top-k`, `penalty-last-n`, `seed`: integer) | the model file's `sampling` value, else the engine's | The sampling default for a request that leaves that field out, over the model file's. Same meaning and allowed values as the [model file's sampling keys](sampling.md#the-model-files-sampling-defaults). The server applies them to each request; the engine never sees them. |
+| `reasoning-budget-tokens` | integer | `0` (none) | The thinking budget for a request that names none (see [sampling](sampling.md#the-thinking-budget)). At the budget the thinking is closed and the answer starts. A request's own field wins, and `0` there disables budgeting. Positive budgets are also limited by `answer-room`. |
+| `thinking-loop-tokens` | integer | `256` | End the thinking, and let the model answer, when it repeats one token this many times in a row inside the thinking; `0` turns it off. See [Thinking loops](sampling.md#thinking-loops). |
 | `answer-room` | switch (`--no-answer-room` or `answer-room: false` turns it off) | on | Reserve wrap-up and answer space when the effective output cap is at least 1024 tokens. Applies to missing budgets and clamps positive budgets; an explicit request budget of `0` opts out. |
 | `tokenizer` | path | `pack/full/tokenizer` in the source tree (a byte tokenizer if absent) | Tokenizer directory. Mock engine only. |
 | `mock-engine`, `script` | switch, string (repeatable) | off, a short greeting | Testing: run a scripted engine instead of the model, for clients and tests (no `model` needed); `script` is its answer, and given more than once, requests get them in turn. |
@@ -232,55 +233,5 @@ with `cvec` (0 or 1).
 
 ## Sampling
 
-A request carries its own sampling fields. A field the request leaves out takes the launch option of the same name
-(`--temperature`, `--top-p`, ... in the [server options](#server); command line over the config file's `server`
-block), then the model file's `sampling` default (below), then the engine's. Request fields always win. `/props`
-reports the defaults in effect. A value out of range is refused with a 400 naming the field; a value in range reaches
-the sampler as sent.
-
-| Field | Type, values | What it does |
-| --- | --- | --- |
-| `temperature` | number >= 0 | `0` is greedy (argmax); higher is more random. Greedy requests stay exact under every other setting. |
-| `top_p` | number in (0, 1] | Nucleus sampling: keep the smallest set of tokens whose probability adds up to this. `1` is off. |
-| `top_k` | integer >= 0 | Keep only the K likeliest tokens. `0` (or `-1`) is off: every token of the vocabulary. |
-| `min_p` | number in [0, 1] | Sampling cutoff: drop tokens less likely than `min_p` times the likeliest token's probability. `0` is off. It acts on the model's tokens. |
-| `repetition_penalty` | number > 0 | Multiplicative penalty on tokens seen in the window; `1` is off. |
-| `presence_penalty` | number | Flat penalty on any token seen in the window; `0` is off. |
-| `frequency_penalty` | number | Penalty that grows with how often a token was seen; `0` is off. |
-| `penalty_last_n` | integer 0..4096 | The window, in tokens, the three penalties look back over (`0`: none). Applies only when a penalty is set; 64 when omitted. Penalties apply in batch windows too; pipelined batch groups refuse them (400). |
-| `seed` | integer | Fixes the random draw for a reproducible sampled reply. |
-| `relaxed_drafting` | number in [0, 1], or `false` | This request's relaxed-drafting threshold; `false` or `0` forces exact sampling. Needs speculation; see [Speculative decoding](#speculative-decoding-mtp). |
-
-Other request fields the API reads: `max_tokens` / `max_completion_tokens` (the Anthropic `max_tokens`; `0` or
-`-1` means the rest of the context), `stop` / `stop_sequences`, `logit_bias`, `reasoning_effort`, `enable_thinking`
-and `reasoning_budget_tokens` (a cap on thinking tokens; `0` is none). Anthropic's `thinking.budget_tokens` and
-llama.cpp's `thinking_budget_tokens` are the same budget, and `reasoning_budget_tokens` wins when more than one is
-sent. A request that names none of them takes the server's [`reasoning-budget-tokens`](#server).
-
-With `answer-room` on and an effective output cap of at least 1024 tokens, thinking is limited to the cap minus
-`min(max(512, cap // 4), cap // 2)`. An 8192-token cap allows up to 6144 thinking tokens; the remaining 2048
-include the injected wrap-up and answer. Smaller positive budgets stay unchanged. Context fitting uses the reduced
-cap. Explicit request budgets of `0` disable both the server default and automatic budgeting; smaller output caps
-keep their existing behavior. Reserved space reduces empty answers but does not guarantee a complete answer.
-
-### The model file's sampling defaults
-
-The model file's `meta` section carries a `sampling` object. Its keys are the request fields above, with the same
-meaning:
-
-| Key | Allowed values |
-| --- | --- |
-| `temperature` | number >= 0 |
-| `top_p` | 0 < value <= 1 |
-| `top_k` | integer >= 0 (`0` or `-1` = off) |
-| `min_p` | 0 <= value <= 1 |
-| `presence_penalty` | number |
-| `frequency_penalty` | number |
-| `repetition_penalty` | number > 0 (`1` = off) |
-| `penalty_last_n` | integer 0..4096 |
-| `seed` | integer |
-
-A bad value stops the server at startup; an unknown key is named in a warning and ignored. The defaults in effect
-are printed at startup as `[server] sampling ...`, each marked `(cli)` or `(config)` when a launch
-option set it and unmarked when it comes from the model file. A launch option overrides the model file's value for
-that key; the others stay.
+The request fields, the defaults a request inherits, the thinking budget and the loop safeguard are in
+[sampling](sampling.md).

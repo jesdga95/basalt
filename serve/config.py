@@ -343,7 +343,7 @@ def parallel_count(text: str) -> int:
 
 
 def budget_count(text: str) -> int:
-    """argparse type: a thinking budget in tokens, a whole number >= 0 (0: none)."""
+    """argparse type: a token count, a whole number >= 0 (0: none)."""
     try:
         n = int(text)
     except ValueError:
@@ -432,6 +432,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="default thinking budget for requests that leave reasoning_budget_tokens out (0 = none): at "
                          "the budget the thinking is closed and the answer starts, so set it below the request's "
                          "max_tokens")
+    ap.add_argument("--thinking-loop-tokens", type=budget_count, default=256, metavar="N",
+                    help="end the thinking and let the model answer when it repeats one token this many times in a "
+                         "row inside the thinking (0 = never)")
     ap.add_argument("--answer-room", action=argparse.BooleanOptionalAction, default=True,
                     help="reserve wrap-up and answer space when the output cap is at least 1024 tokens; "
                          "an explicit request budget of 0 opts out")

@@ -226,6 +226,7 @@ def main() -> int:
     svc.min_free_vram_mib = a.min_free_vram_mib or 0
     svc.reasoning_budget_tokens = a.reasoning_budget_tokens or 0
     svc.answer_room = a.answer_room
+    svc.thinking_loop_tokens = a.thinking_loop_tokens
     svc.gpu_indices = gpus_in_play(cfg, engine_args(cfg) if not a.mock_engine else [])   # the cards /metrics reads
     svc.gpu_index = svc.gpu_indices[0]
     httpd = serve(svc, host=a.host, port=a.port)

@@ -2848,6 +2848,44 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(b["usage"]["completion_tokens"], 20 + len(extra) + len(ThinkingEngine.ANSWER) + 1)
         self.assertEqual(b["usage"]["prompt_tokens"], len(first))
 
+    def test_a_token_repeated_in_the_thinking_ends_it(self):
+        """256 of one token in a row inside the thinking: the thinking is ended and the model answers."""
+        from serve.service import REASONING_CLOSE
+        self.engine.THOUGHT = "Let me see. " + "0" * 400
+        code, b = self.openai(max_tokens=2000)
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertEqual(msg["reasoning_content"], "Let me see. " + "0" * 256 + REASONING_CLOSE.split("</think>")[0])
+        self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+        first, second = self.engine.prompts
+        extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+        self.assertEqual(second, first + self.tok.encode("Let me see. " + "0" * 256) + extra)
+
+    def test_a_shorter_run_in_the_thinking_and_any_run_in_the_answer_stay(self):
+        self.engine.THOUGHT = "Let me see. " + "0" * 255 + "1" + "0" * 255
+        self.engine.ANSWER = "0" * 600
+        code, b = self.openai(max_tokens=2000)
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertEqual((msg["reasoning_content"], msg["content"]), (self.engine.THOUGHT, "0" * 600))
+        self.assertEqual(len(self.engine.prompts), 1)
+
+    def test_the_loop_safeguard_can_be_turned_off(self):
+        self.svc.thinking_loop_tokens = 0
+        self.engine.THOUGHT = "Let me see. " + "0" * 400
+        code, b = self.openai(max_tokens=2000)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], self.engine.THOUGHT)
+        self.assertEqual(len(self.engine.prompts), 1)
+
+    def test_a_looped_thinking_that_fills_the_cap_is_length(self):
+        """No room left after the end of the thinking: finish_reason stays "length"."""
+        self.engine.THOUGHT = "0" * 400
+        code, b = self.openai(max_tokens=260)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["finish_reason"], "length")
+
     def test_a_turn_ended_while_thinking_is_closed_and_answered(self):
         from serve.service import REASONING_CLOSE
         self.engine.end_in_thought = True
