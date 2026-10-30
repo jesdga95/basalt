@@ -86,6 +86,8 @@ private:
     bool in_live{};
     basalt::core::ConversationStore::Match on_disk{};
     bool from_disk{};
+    std::unique_ptr<basalt::core::ConversationKvRead> disk_kv{};   // the incoming image's K/V, still in its files
+    void drop_incoming();
     int64_t kv_need{};
     struct KeepRouted {   // only this admission's fits, while slots decode
                 bool& on;
