@@ -133,6 +133,8 @@ bool read_file(const FileRange& r, std::vector<uint8_t>& out) {
 
 // spare rows the draft head carries after the base rows, for the head rows of tokens the subset lacks
 constexpr int64_t kDraftCtxRows = 512;
+// of them, the rows a prompt's tokens may take: the rest stay free for the reply's own
+constexpr int64_t kDraftCtxPromptRows = 384;
 
 }  // namespace
 
@@ -1413,7 +1415,20 @@ void MtpDrafter::begin_request(const int64_t* prompt, int64_t n) {
     xlist_.clear();
     xpend_.clear();
     n_xused_ = 0;
-    for (int64_t i = 0; i < n; ++i) ctx_note(prompt[i]);
+    // a prompt with more such tokens than its share of the rows keeps its latest ones, which the reply is likelier
+    // to repeat: counted from the end (marked 2), then noted in prompt order from the first of them
+    const int64_t cap = std::min(n_xcap_, kDraftCtxPromptRows);
+    int64_t from = 0, distinct = 0;
+    for (int64_t i = n - 1; i >= 0; --i) {
+        const int64_t t = prompt[i];
+        if (t < 0 || t >= n_vocab_ || in_sub_[(size_t) t] != 0) continue;
+        if (distinct == cap) { from = i + 1; break; }
+        in_sub_[(size_t) t] = 2;
+        ++distinct;
+    }
+    for (int64_t i = from; i < n; ++i)
+        if (prompt[i] >= 0 && prompt[i] < n_vocab_ && in_sub_[(size_t) prompt[i]] == 2) in_sub_[(size_t) prompt[i]] = 0;
+    for (int64_t i = from; i < n; ++i) ctx_note(prompt[i]);
 }
 
 // The queued tokens' head rows into the next free context rows, ahead of the draft graphs on the same stream.
