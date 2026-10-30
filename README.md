@@ -57,6 +57,7 @@ A model is one file: weights, tokenizer, MTP drafter, expert profile and vision 
 - [basalt-probe](docs/probe.md): measures the machine, the cold decode speed, and suggests values.
 - [The .basalt model file](docs/model-file.md): the layout, and building a pack yourself (including NVFP4).
 - [Platforms](docs/platforms.md): Linux and Windows requirements, the build steps and the Windows limitations.
+- [Changelog](docs/changelog/index.md): what each release changed.
 - [Building and testing](docs/building.md), [Precision and quality](docs/precision/index.md), [Contributing](CONTRIBUTING.md).
 
 ## Credits
