@@ -12,6 +12,7 @@
 
 
 #include <climits>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -53,6 +54,7 @@ bool Gemm::prepare_handle(std::string& err) {
 }
 
 Gemm::~Gemm() {
+    free_plans();
     if (handle_) cublasDestroy((cublasHandle_t) handle_);
     if (!external_) {
         if (scratch_) cudaFree(scratch_);
@@ -77,6 +79,7 @@ bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems,
     external_ = true;
     note(cublasSetStream(h, (cudaStream_t) stream), "cublasSetStream");
     workspace_ = workspace;
+    ws_bytes_ = ws_bytes;
     note(cublasSetWorkspace(h, workspace_, ws_bytes), "cublasSetWorkspace");
     note(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH), "cublasSetMathMode");
     scratch_ = scratch;
@@ -88,6 +91,7 @@ void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, siz
     scratch_ = scratch;
     scratch_elems_ = scratch_elems;
     workspace_ = workspace;
+    ws_bytes_ = ws_bytes;
     cublasSetWorkspace((cublasHandle_t) handle_, workspace_, ws_bytes);
 }
 
@@ -107,6 +111,7 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
         err = std::string("prefill gemm: workspace of 32 MiB: ") + cudaGetErrorString(e);
         return false;
     }
+    ws_bytes_ = ws;
     note(cublasSetWorkspace(h, workspace_, ws), "cublasSetWorkspace");
     note(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH), "cublasSetMathMode");
     if (scratch_elems > 0) {
@@ -124,6 +129,7 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                 float beta) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
+    if (pinned(CUDA_R_16BF, X, W, Y, T, N, K, ldy, beta)) return;
     const float alpha = 1.0f;
     // Column-major view: Y^T[N, T] = W[N, K] (stored K x N col-major, transposed) . X^T[K, T].
     ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
@@ -168,6 +174,7 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
                float beta) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
+    if (pinned(CUDA_R_16F, X, W, Y, T, N, K, ldy, beta)) return;
     const float alpha = 1.0f;
     ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
                     CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,

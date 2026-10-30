@@ -43,7 +43,8 @@ public:
     /// scratch cannot hold the N rows at once.
     const uint16_t* bf16_rows(const uint16_t* W, int64_t N, int64_t K);
 
-    /// Y = X . W^T with both in FP16 (bits).
+    /// Y = X . W^T with both in FP16 (bits).  `bf16` and `f16` run one cuBLASLt algorithm per weight shape whatever T
+    /// is (see gemm.cu), so a row's products do not depend on how many rows share the call or where it sits in them.
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
 
@@ -59,11 +60,19 @@ public:
     void* stream() const { return stream_; }
 
 private:
+    struct Plans;
+    /// Y = X . W^T on the shape's pinned cuBLASLt algorithm (`type`: a cudaDataType_t); false: the shape has none.
+    bool pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                float beta);
+    void free_plans();
+
     void* handle_ = nullptr;
+    Plans* plans_ = nullptr;
     void* stream_ = nullptr;
     uint16_t* scratch_ = nullptr;
     int64_t scratch_elems_ = 0;
     void* workspace_ = nullptr;
+    size_t ws_bytes_ = 0;
     bool external_ = false;
     void* hipblaslt_state_ = nullptr;
 };
