@@ -436,6 +436,6 @@ def build_parser() -> argparse.ArgumentParser:
                     help="end the thinking and let the model answer when it repeats one token this many times in a "
                          "row inside the thinking (0 = never)")
     ap.add_argument("--answer-room", action=argparse.BooleanOptionalAction, default=True,
-                    help="reserve wrap-up and answer space when the output cap is at least 1024 tokens; "
+                    help="reserve space for closing the thinking and the answer when the output cap is at least 1024 tokens; "
                          "an explicit request budget of 0 opts out")
     return ap

@@ -42,12 +42,11 @@ EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief 
                "medium": "Reasoning effort is set to medium. Think as much as the task needs, without unnecessary "
                          "elaboration."}
 VISION_START = "<|vision_start|>"
-# closes the thinking at reasoning_budget_tokens
-REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
-# Reserve output tokens for the wrap-up and answer above this cap.
+# Reserve output tokens for closing the thinking and the answer above this cap.
 ANSWER_ROOM_MIN_CAP = 1024
 ANSWER_RESERVE_MIN = 512
-# closes the thinking when the model ends its turn inside it
+# closes the thinking: the template's own end, written when the model ends its turn inside it, reaches the thinking
+# budget or repeats one token
 REASONING_CLOSE = "\n</think>\n\n"
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often
 KEEPALIVE_S = 10.0          # a stream quiet this long (a held-back tool argument) gets a keep-alive
@@ -1110,8 +1109,7 @@ class Service:
                             print("[server] the model ended while thinking, closing it for an answer", flush=True)
                         elif wrap:
                             budget = None
-                            extra = self.tok.encode((REASONING_CLOSE if looped else REASONING_WRAP_UP) + (force or ""),
-                                                    parse_special=True)
+                            extra = self.tok.encode(REASONING_CLOSE + (force or ""), parse_special=True)
                             force = None
                             if max_new - n - len(extra) < 1:
                                 break                   # no room to answer: "length"

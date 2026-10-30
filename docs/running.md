@@ -220,7 +220,7 @@ Basalt refuses settings that would leave the machine without memory, and never s
   the one the next request continues): with the disk tier on they go to disk (those it holds no copy of yet), otherwise
   they are dropped. The engine also frees the checkpoint blocks it keeps for reuse and returns its free heap to the OS,
   and a request that arrives waits up to 30 s for the RAM to come back before it starts; one that adds at most 256
-  tokens to the live conversation (the server's wrap-up after a thinking budget) does not wait. Below the guard nothing
+  tokens to the live conversation (the server closing the thinking at its budget) does not wait. Below the guard nothing
   new is parked, and the disk tier neither writes a conversation still in a session nor reads one back (its own floor
   sits 1 GiB above the guard's). A running request continues; it stops with an error only when the RAM is critical:
   under 1 GiB free, or below the guard while the kernel's memory pressure (`/proc/pressure/memory`, avg10) shows tasks
