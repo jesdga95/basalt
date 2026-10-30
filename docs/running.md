@@ -174,7 +174,7 @@ last checkpoint (the end of its last prompt) is at most 4096 tokens behind is st
 running state of its own: the next turn goes on from there, and a reply sent back as it was is read
 again. A later
 prompt that starts with a stored conversation (its tokens, or one of its checkpoints) reads it back cut at that point
-and goes on from there, after a restart too: the wait is the drive reading the K/V cache. A file is bound to the model file, the stored-conversation format and the settings that change the state
+and goes on from there, after a restart too: the wait is the drive reading the K/V cache. A conversation whose state does not fit whole in the RAM free above the tier's floor is written from the session a few MiB at a time (the request waits for the write) and read back with its K/V going from the files straight into the session: such a write needs about 10 MiB above the floor, such a read the running states it keeps (about 0.4 GB), at any length. A file is bound to the model file, the stored-conversation format and the settings that change the state
 (the KV type, the rope, the draft layer, control vectors); every part of it carries a hash, and a file that does not
 check out is deleted, never restored. After a second without input (no slot decoding) the engine writes each conversation that has grown 4096 tokens past its
 stored copy, so a crash or a kill loses at most that much. The budget caps the folder, least recently used conversations first (a shared
