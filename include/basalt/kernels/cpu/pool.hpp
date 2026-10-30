@@ -10,20 +10,14 @@
 // wrong and buy nothing.  What is kept is the part that matters: `head`/`done` are single fetch_add counters, one
 // claim per worker, no lock.
 //
-// THE COMPLETION PROTOCOL, because this is where a pool usually goes wrong.  `run()` waits for `done == n` AND for
-// every worker to PARK.  Waiting only for `done` is not enough: a worker can still be inside the drain loop after its
-// last `done` increment, and the host resetting `head` underneath it would let that worker claim a job from the NEXT
-// batch before the next batch has been published.
-//
-// **AND `parked` IS NOT ENOUGH EITHER.**  A worker that went to sleep (after `kSpinBeforeSleep`) is still counted as
-// parked when it wakes, so for a moment after it has seen a new epoch the host believes it is idle.  When most experts
-// are in VRAM the workers sleep in the middle of a request, tiny batches finish before a sleeper is awake, and that
-// moment comes round constantly: a late worker could claim from the NEXT batch while the host was still writing it,
-// run a job twice, or add to `done` after the host had reset it - and `done != n` then never ended, with the GPU
-// waiting on the pool forever.  So every claim carries its batch: `head` is one 64-bit word `epoch | njobs | index`, a
-// claim is a CAS that only succeeds for the epoch the worker woke for, and a late worker's claim simply fails.  A
-// claim that succeeds belongs to the current batch, whose description the host cannot change until that job's `done`
-// has landed.
+// THE COMPLETION PROTOCOL, because this is where a pool usually goes wrong.  `run()` returns once `done == n`; it
+// does not wait for the workers to park again, and the next batch does not wait for them either, because every claim
+// carries its batch: `head` is one 64-bit word `epoch | njobs | index`, a claim is a CAS that only succeeds for the
+// epoch the worker woke for, and a late worker's claim simply fails.  A worker still in the drain loop of a finished
+// batch, or one that wakes late from a sleep, touches nothing of the batch until a claim succeeds, and a claim that
+// succeeds belongs to the current batch, whose description the host cannot change until that job's `done` has
+// landed.  So a batch ends with its last job, not with its slowest worker's return to the park: a worker the OS
+// has descheduled between two claims holds up nobody.
 #pragma once
 
 #include "basalt/kernels/cpu/expert.hpp"
@@ -103,7 +97,7 @@ public:
     int e_cores() const { return topo_.e_cores; }
     PoolAffinity affinity() const { return affinity_; }
 
-    /// Publish `n` jobs, then block until every one has been claimed AND every worker has parked.
+    /// Publish `n` jobs, then block until every one has completed.
     /// `jobs` must outlive the call (it does, and the workers never touch it afterwards).
     void run(ExpertJob* jobs, int n);
 
@@ -125,8 +119,8 @@ public:
     static constexpr int kTasksPerThread = 12;
     /// Work for the parked workers between batches (not the host thread): `fn(ctx, worker, workers, stop)` runs once
     /// per worker index and must return soon after `stop` reads true.  Returns at once.  The next batch, `idle_stop`
-    /// or the destructor raises `stop` and waits for the workers to park, so the work never overlaps a batch; it must
-    /// not write anything a batch reads.
+    /// or the destructor raises `stop`, ends the claims and waits for every claimed job to return, so the work never
+    /// overlaps a batch; it must not write anything a batch reads.
     using IdleFn = void (*)(void* ctx, int worker, int workers, const std::atomic<bool>& stop);
     void idle_start(IdleFn fn, void* ctx);
     void idle_stop();
@@ -139,24 +133,17 @@ public:
     /// contention being measured.
     long long pauses() const { return 0; }
 
-    /// **WHERE `run()` SPENDS ITS TIME, in milliseconds accumulated over its lifetime.**  Three phases per layer - wait
-    /// for every worker to be parked, wait for the drain, wait for them to re-park - reported apart, because a pool
-    /// that is slow at the WORK and one that is slow at the SYNCHRONISATION need opposite fixes: the first is a kernel
-    /// problem and the second is a barrier problem.
-    ///
-    /// Only the host thread touches these, in `run()`, so they need no atomics.
-    void phase_ms(double& wait_park, double& drain, double& repark) const {
-        wait_park = ms_wait_park_;
-        drain = ms_drain_;
-        repark = ms_repark_;
-    }
-
-    /// **A PARKED WORKER SPINS FOR THIS LONG, THEN SLEEPS.**  The park is a `_mm_pause` spin because a layer's batches
-    /// are microseconds apart and a wake-up from the OS costs more than that.  But a spin that never ends keeps every
-    /// worker's core at 100% while the engine waits for a request.  Between requests the workers block on `sleep_cv_`.
+    /// **A PARKED WORKER WAITS THIS LONG, THEN SLEEPS.**  The park spins (then yields, see `kSpinBeforeYield`)
+    /// because a layer's batches are microseconds apart and a wake-up from the OS costs more than that.  But a wait
+    /// that never ends keeps every worker's core at 100% while the engine waits for a request.  Between requests the
+    /// workers block on `sleep_cv_`.
     /// NOT only between requests: with most experts in VRAM many layers have no CPU work, so the workers also sleep
     /// mid-request - which the claim protocol above must survive.
     static constexpr std::chrono::milliseconds kSpinBeforeSleep{20};
+    /// A parked worker spins this long, then yields its core on every check until the next batch or the sleep: a
+    /// short wait keeps the core, a long gap between batches gives it to any runnable thread, such as a worker the OS
+    /// put on this core in the middle of its task.  With nothing else runnable the yield returns at once.
+    static constexpr std::chrono::microseconds kSpinBeforeYield{50};
     /// A pool wait that sees no completion for this long is a bug; the engine stops with a message instead of
     /// spinning forever, and the server starts it again.
     static constexpr std::chrono::seconds kStall{60};
@@ -192,17 +179,13 @@ private:
     /// The host's own scratch .  A separate object rather than a share of `scratch_[i]`,
     /// because a worker may own any index and the two must not be able to collide.
     ExpertScratch host_scratch_;
-    // `run()`'s three phases, accumulated.  Host-thread only; see `phase_ms`.
-    double ms_wait_park_ = 0.0;
-    double ms_drain_ = 0.0;
-    double ms_repark_ = 0.0;
     // ---- EACH ATOMIC GETS ITS OWN CACHE LINE.
     //
-    // `head_`, `done_`, `parked_` and `epoch_` are the four that workers and the host actually contend on; sharing a
-    // cache line they would invalidate each other on every access.  The line the host must WRITE to publish work
-    // (`epoch_`) and READ to confirm the workers are parked (`parked_`) must not be hammered by the very threads
-    // waiting for it, so the parked spin carries no counter (a locked read-modify-write per iteration) and
-    // `alignas(64)` stops the four sharing.
+    // `head_`, `done_`, `parked_` and `epoch_` are the four that workers and the host contend on; sharing a cache
+    // line they would invalidate each other on every access.  The line the host must WRITE to publish work
+    // (`epoch_`) must not be hammered by the very threads waiting for it, so the parked spin carries no counter (a
+    // locked read-modify-write per iteration) and `alignas(64)` stops the four sharing.  `parked_` is read only by
+    // `set_active_workers` and the diagnostics.
     // Diagnostics: each worker's state (kParked, kSleeping, kBetween, or the job it runs) and the host's (kIdle,
     // kWaitParked, kWaitDone, or its job), printed by the serve watchdog through `diag`
     static constexpr int32_t kParked = -1, kSleeping = -2, kBetween = -3, kIdle = -10, kWaitParked = -11,

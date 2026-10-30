@@ -6,6 +6,7 @@
 // int32 sums per 4 bytes (dpbusd equals maddubs + madd at these magnitudes), the same per-lane fp32 products
 // d_y * scale, the same fused accumulation across blocks and the same final reduction, so results are bitwise equal.
 #include "basalt/kernels/cpu/nvfp4_avx512.hpp"
+#include "basalt/platform/compiler.hpp"
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -96,7 +97,16 @@ inline void rows_dot(const block_nvfp4* const* w, int nb, const block_q8_0* cons
     const __m512i zero = _mm512_setzero_si512();
     for (int ib = 0; ib < nb; ++ib) {
         Blk b[R];
-        for (int k = 0; k < R; ++k) b[k] = decode(w[k] + ib);
+        for (int k = 0; k < R; ++k) {
+            if constexpr (platform::kPreferMemberwiseVectorAssignment) {
+                const Blk decoded = decode(w[k] + ib);
+                b[k].aw = decoded.aw;
+                b[k].m = decoded.m;
+                b[k].ws = decoded.ws;
+            } else {
+                b[k] = decode(w[k] + ib);
+            }
+        }
         for (int t = 0; t < NT; ++t) {
             const __m512i a = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i*) y[t][2 * ib].qs)),
                                                  _mm256_loadu_si256((const __m256i*) y[t][2 * ib + 1].qs), 1);
