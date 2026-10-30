@@ -93,6 +93,14 @@ AutoPlan choose_auto(const AutoInputs& in) {
     return p;
 }
 
+bool cut_gives_up_bare(const std::vector<int32_t>& res, int64_t cut, int64_t n_expert,
+                       const std::function<bool(int64_t, int64_t)>& has_copy) {
+    if (n_expert <= 0) return false;
+    for (size_t i = 0; i < res.size(); ++i)
+        if (res[i] >= 0 && res[i] >= cut && !has_copy((int64_t) i / n_expert, (int64_t) i % n_expert)) return true;
+    return false;
+}
+
 std::string auto_flags_line(const AutoPlan& p) {
     std::string out;
     auto add = [&](const std::string& s) { out += out.empty() ? "auto flags: " : ", "; out += s; };

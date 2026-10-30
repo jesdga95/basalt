@@ -61,6 +61,9 @@ struct Context {
     std::function<int(int64_t)> stage_of;
     std::vector<std::pair<int32_t, int32_t>>& profile_all;
     const int64_t& kv_floor;
+    const bool& kv_tail_copies;
+    const int64_t& lend_from;
+    const int64_t& copies_from;
     std::vector<std::vector<engine_local::SlotSession>>& bslot_ss;
     std::vector<int64_t>& slot_cap;
     bool& slot0_is_solo;

@@ -343,6 +343,21 @@ Flow Request::restore() {
         std::printf("ERR %s\n", runtime_.err.c_str());
         return Flow::error;
     }
+    // the tail without RAM copies: the loan follows the cache's end down as the KV grows, so the experts it
+    // reaches below the slots that keep a copy take a home before the prompt is read
+    int64_t loan_chunk = 0;
+    if (!runtime_.kv_tail_copies && runtime_.kv_floor > 0 && !in_slot && runtime_.lend_from > 0 &&
+        !runtime_.pf_parts.empty() && runtime_.pf_parts[0].first >= 0 &&
+        runtime_.loan_plan(runtime_.xcache.slots(), loan_chunk) < runtime_.copies_from) {
+        if (!runtime_.kv_drain(runtime_.err)) {
+            std::printf("ERR %s\n", runtime_.err.c_str());
+            return Flow::error;
+        }
+        std::string he;
+        if (!runtime_.home_given_up(runtime_.xcache.slots(), he))
+            basalt::log::warn("basalt serve", "elastic KV: no RAM homes for the loan's experts without a copy (%s): "
+                              "the prompt reads them from the file", he.c_str());
+    }
     if ((!from_live || incoming || slot_source >= 0) &&
         !runtime_.park_current(incoming ? incoming->bytes() : 0, incoming || slot_source >= 0 ? 0 : resume)) {
         std::printf("ERR %s\n", runtime_.err.c_str());

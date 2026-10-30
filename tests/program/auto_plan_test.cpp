@@ -5,6 +5,7 @@
 
 #include "basalt/platform/memory.hpp"
 #include <string>
+#include <vector>
 
 using namespace basalt::program;
 
@@ -175,6 +176,15 @@ int main() {
         CHECK(choose_auto(in).resident_bytes > before);
         in.ram_available = 10 * G;                  // little RAM: a sane floor, not a negative copy
         CHECK(choose_auto(in).resident_bytes == 0);
+    }
+    {   // a cache cut gives up a bare expert only when one past the cut has no RAM copy
+        const std::vector<int32_t> res = {0, 5, -1, 9, 3, 7};   // 2 layers x 3 experts
+        auto all = [](int64_t, int64_t) { return true; };
+        auto not_l1e0 = [](int64_t l, int64_t e) { return !(l == 1 && e == 0); };   // expert 3, slot 9
+        CHECK(!cut_gives_up_bare(res, 6, 3, all));        // every expert past the cut has a copy: nothing to home
+        CHECK(cut_gives_up_bare(res, 6, 3, not_l1e0));    // slot 9 goes and has none
+        CHECK(!cut_gives_up_bare(res, 10, 3, not_l1e0));  // ... unless the cut keeps it
+        CHECK(!cut_gives_up_bare(res, 0, 0, not_l1e0));   // no geometry
     }
     if (g_fail) { std::printf("auto_plan_test: %d failures\n", g_fail); return 1; }
     std::printf("auto_plan_test: ok\n");

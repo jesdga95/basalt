@@ -2934,10 +2934,23 @@ int main(int argc, char** argv) {
             else stage_lent_bytes += basalt::kernels::cpu::expert_layout().blob_bytes(pr.first);
         }
     }
-    // the elastic KV's tail keeps its experts in RAM too (a slot lent to the KV becomes a CPU miss read from RAM),
-    // below it the prompt path's lend region as before: the RAM decides how far down that goes, as it does today
-    if (kv_tail_slots > 0)
+    // The RAM copies cover the prompt path's lend region: the RAM decides how far down that goes.  The elastic KV
+    // moves that region down as it takes the cache's tail, and the experts it then reaches without a copy take a RAM
+    // home at the request's admission (home_given_up), given back when the cache grows again; so the copies do not
+    // also cover the region's lowest reach.  More than one slot (--batch) keeps them: its slots' prompts lend while
+    // others decode, and homes are taken only between requests.
+    const bool kv_tail_copies = o.batch > 0;
+    if (kv_tail_slots > 0 && kv_tail_copies)
         lend_from = lend_from >= 0 ? std::max<int64_t>(0, lend_from - kv_tail_slots) : xcache.slots() - kv_tail_slots;
+    // a swap takes a free place only for an evicted expert with no RAM copy: the slots below the lend region keep none,
+    // so the places follow their share of the cache
+    auto spare_places = [&](int64_t full) -> int64_t {
+        if (lend_from < 0 || xcache.slots() <= 0) return full;
+        return (full * lend_from + xcache.slots() - 1) / xcache.slots();
+    };
+    // the first slot whose expert the RAM copy really keeps: above lend_from when the RAM held fewer of the region's
+    // copies than planned (set once the complement is pinned)
+    int64_t copies_from = lend_from;
     // ---- the start-up picks for the settings the user left out (peer-exclusive, resident RAM, pool affinity and
     // size): one pure rule over what this machine and pack have, so a given setting is never replaced.  The pool is
     // built here, with the picks.
@@ -2967,7 +2980,7 @@ int main(int argc, char** argv) {
         in.complement_peer_excl = in.complement_full - std::min(in.complement_full, peer_expert_room());
         // the RAM copy also holds the free places the adaptive swaps use (see set_spares)
         const uint64_t blob = basalt::kernels::cpu::expert_layout().max_blob;
-        const uint64_t spares_full = adapt_fast_on ? (uint64_t) o.adapt_swaps * kSatBoost * blob : 0;
+        const uint64_t spares_full = adapt_fast_on ? (uint64_t) spare_places(o.adapt_swaps * kSatBoost) * blob : 0;
         const uint64_t spares_excl =
             adapt_fast_on ? (uint64_t) (o.adapt_swaps * kSatBoost + std::max(o.peer_adapt_swaps, o.adapt_swaps)) * blob : 0;
         // the lent slots' copies and the spares are kept as far as RAM allows: they do not decide whether the complement fits
@@ -3059,7 +3072,7 @@ int main(int argc, char** argv) {
         // --peer-exclusive: peer swaps take places too (an evicted peer expert goes to one)
         if (adapt_fast_on)
             src.set_spares(o.peer_exclusive ? o.adapt_swaps * kSatBoost + std::max(o.peer_adapt_swaps, o.adapt_swaps)
-                                            : o.adapt_swaps * kSatBoost);
+                                            : spare_places(o.adapt_swaps * kSatBoost));
         uint64_t resident_headroom = resident_headroom_base;
         // The experts no GPU tier holds, and the RAM there is for them: when the copy cannot hold them all, the rest
         // are read from the file through the OS file cache, so the copy leaves that cache its floor beside the margin.
@@ -3111,12 +3124,14 @@ int main(int argc, char** argv) {
             else
                 err = whole_err + "; " + err;
         }
+        if (resident_ok && lend_from >= 0 && src.resident_lent_slots() > 0)
+            copies_from = std::max<int64_t>(lend_from, xcache.slots() - src.resident_lent_slots());
         if (resident_ok && o.prefill_auto_fit && lend_from >= 0) {
             // A lent slot whose expert the complement holds is refilled from RAM; the others are read from the file.
             // Allow the backed slots plus a fixed amount of file reading per prompt.  Those reads are evictable page
             // cache that the refill passes through once, so two chunks' worth are funded; the read-time cap
             // (kMaxAutoChunk) bounds the chunk, so the ceiling stops there too.
-            const int64_t allow = std::max<int64_t>(0, src.resident_lent_slots() - kv_tail_slots) +
+            const int64_t allow = std::max<int64_t>(0, src.resident_lent_slots() - (kv_tail_copies ? kv_tail_slots : 0)) +
                                   (int64_t) (2 * basalt::platform::kPromptFileReadBytes / std::max<uint64_t>(1, basalt::kernels::cpu::expert_layout().max_blob));
             auto_ceiling = std::max<int64_t>(8192, engine_local::biggest_chunk(std::min<int64_t>(auto_ceiling, kMaxAutoChunk),
                                                                  [&](int64_t t) { return serve_loans::lend_slots(xcache, g, ss, t) <= allow; }));
@@ -3538,6 +3553,9 @@ int main(int argc, char** argv) {
             .stage_of = stage_of,
             .profile_all = profile_all,
             .kv_floor = kv_floor,
+            .kv_tail_copies = kv_tail_copies,
+            .lend_from = lend_from,
+            .copies_from = copies_from,
             .bslot_ss = bslot_ss,
             .slot_cap = slot_cap,
             .slot0_is_solo = slot0_is_solo,
