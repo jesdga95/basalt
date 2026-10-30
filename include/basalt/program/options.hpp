@@ -132,13 +132,6 @@ struct Options {
     /// `auto:32768` lets it go further, never past the context
     int64_t prefill_auto_max = 8192;
     bool prefill_auto_fit = false;   // a bare `auto`: the ceiling is what the lend can fund (see auto_ceiling)
-    /// Validation: batch only positions [0, P) and run the rest of the prompt through the token path (teacher-forced),
-    /// so the logits of positions >= P - which depend on the batched state - can be scored against the oracle at many
-    /// positions.  0 = the whole prompt but the last position.
-    int64_t prefill_until = 0;
-    /// After every processed position, append the residual after the last layer (hc x n_embd floats, the MTP draft
-    /// head's input) to this file.  Token path only.
-    std::string dump_final_r;
     /// Speculative decoding with a verify window of this many tokens (the last accepted token and spec-1 drafts);
     /// 0 = plain decode.  `spec_oracle` drafts from a token file (the expected continuation, for the exactness test);
     /// `spec_corrupt` N > 0 replaces every Nth draft with a wrong token.

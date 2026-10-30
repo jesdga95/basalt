@@ -103,8 +103,6 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         }
         else if (a == "--vram-elastic") o.vram_elastic = true;
         else if (a == "--vram-segment-mib") o.vram_segment_mib = std::atoll(next("--vram-segment-mib"));
-        else if (a == "--prefill-until") o.prefill_until = std::atoll(next("--prefill-until"));
-        else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
         else if (a == "--spec") { o.spec = std::atoi(next("--spec")); o.spec_given = true; }
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
         else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
