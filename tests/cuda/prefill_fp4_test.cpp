@@ -1,6 +1,6 @@
 // prefill_fp4_test - the prompt path's NVFP4 experts on the FP4 block-scaled tensor cores (moe_fp4.hpp) next to the MMQ
 // path they replace, at the real geometry (gate/up 1280 x 2560, down 2560 x 640) on synthetic NVFP4 experts (sub-block
-// scales over 13 binades, UE4M3 subnormals included; tails {s_gate, s_up, s_down} in 0.004..0.03), in prefill.cpp's
+// scales over 13 binades, UE4M3 subnormals included; tails {s_gate, s_up, s_down} in 0.004..0.03), in expert_fp4.cpp's
 // sequence (16-expert groups, activations to codes, gate/up, SwiGLU, H to codes, down).  Checked against CPU references:
 //   - FP4: the same A4 roundings (token scale amax / (6 * 448), UE4M3 per 16, E2M1 codes) in double: gate/up RMS 1e-5,
 //     down RMS 1e-4; and an output that does not depend on the token's tile or neighbours (bitwise).  The unrounded
@@ -11,7 +11,7 @@
 // The production gate/up reads each row's token from token planes (fp4::quantize_tokens) and leaves the tail-scaled
 // SwiGLU from its epilogue: the planes must hold the bytes quantize() puts in the tiles, H the bits of the plain
 // product followed by mmq::swiglu (and the A4 reference in double to RMS 1e-5).  The group path (`fp4::run_group`, what
-// prefill.cpp runs) with H holding only a run's rows must equal the absolute-row sequence of the plain kernels bitwise,
+// expert_fp4.cpp runs) with H holding only a run's rows must equal the absolute-row sequence of the plain kernels bitwise,
 // and so must every split of a group into runs (a row cap from one expert to none), on two routings with hot experts,
 // with nothing written past the run's rows.  Edge activations: zero sub-blocks
 // next to non-zero ones, tokens scaled by 1e-30 and 1e30, one huge sub-block in a tiny token: finite, zero stays zero,
@@ -224,7 +224,7 @@ struct Bufs {
     float* scales() const { return (float*) (grp_d.as<uint8_t>() + GROUP * mmq::matrix_bytes(GGML_TYPE_NVFP4, N, FF) + TAIL); }
 };
 
-// prefill.cpp's sequence for one layer; `grouped`: one gather launch per group, else one per expert
+// expert_mmq.cpp's sequence for one layer; `grouped`: one gather launch per group, else one per expert
 void run_mmq(mmq::Context& ctx, Bufs& b, const Layer& L, const float* x_dev, const int32_t* src_dev,
              const std::vector<const uint8_t*>& blob, bool grouped, cudaStream_t s) {
     const size_t gub = mmq::matrix_bytes(GGML_TYPE_NVFP4, 1280, N), db = mmq::matrix_bytes(GGML_TYPE_NVFP4, N, FF);
@@ -404,7 +404,7 @@ bool guard_clear(const void* base, size_t from, size_t to) {
     for (uint8_t c : v) if (c != 0xff) return false;
     return true;
 }
-// prefill.cpp's FP4 sequence for one layer: the token planes, then each group in runs of at most `row_cap` rows
+// expert_fp4.cpp's FP4 sequence for one layer: the token planes, then each group in runs of at most `row_cap` rows
 int enqueue_fp4_group(F4& f, F4Run& r, Bufs& b, const Layer& L, const float* x_dev, const int32_t* src_dev,
                       const std::vector<const uint8_t*>& blob, int64_t row_cap, cudaStream_t s) {
     const size_t n = L.order.size();
@@ -634,7 +634,7 @@ std::vector<float> primary_rows(const std::vector<int32_t>& order, const std::ve
     return download(dm, (size_t) rows * N);
 }
 
-// The peer card's sequence (prefill.cpp, no direct access between the cards): its experts `order` (bounds `bh`
+// The peer card's sequence (peer_experts.cpp, no direct access between the cards): its experts `order` (bounds `bh`
 // relative to its block, rows laid out by `src`) in pieces of at most `cap` rows (fp4::cut_pieces), from the `T`
 // tokens' activations rounded once, into buffers of `cap` rows.  `ms`: the compute alone, timed again.
 std::vector<float> peer_rows(const std::vector<int32_t>& order, const std::vector<int32_t>& bh, int64_t rows,
@@ -710,7 +710,7 @@ bool peer_share(int d0, int d1, const PeerShape& sh, const std::vector<const uin
     // the peer's experts: every fourth, and expert 0 (hot when the routing has hot experts)
     std::vector<char> on_peer((size_t) E, 0);
     for (int e = 0; e < E; ++e) on_peer[(size_t) e] = e % 4 == 1 || e == 0;
-    // prefill.cpp's layout with a peer: the primary's experts first, then the peer's block, each in id order
+    // peer_experts.cpp's layout with a peer: the primary's experts first, then the peer's block, each in id order
     std::vector<int32_t> off2((size_t) E, 0), order_l, order_p, bh_l, bh_p;
     int32_t r = 0;
     for (int pass = 0; pass < 2; ++pass)

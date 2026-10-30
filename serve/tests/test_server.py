@@ -643,7 +643,7 @@ class EffortAtTheEnd(unittest.TestCase):
         return self.svc.encode_prompt(messages, None, kw)
 
     def checkpoint(self, ids, tail, resume=0):
-        """Where the engine checkpoints a prompt (the tokens before it), as generate.cpp's serve loop does."""
+        """Where the engine checkpoints a prompt (the tokens before it), as the serve loop (src/program/serve) does."""
         turn_at = next((i for i in range(len(ids) - 1, resume, -1) if ids[i] == self.TURN), -1)
         if turn_at > 0 and tail:
             i = next((i for i in range(turn_at - 1, resume, -1) if ids[i] == self.TURN), None)

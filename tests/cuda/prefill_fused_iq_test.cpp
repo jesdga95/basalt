@@ -3,7 +3,7 @@
 // against
 //   - a double-precision reference: the weights dequantized by ggml's own to_float, times the FP32 activations
 //     (gate/up, SwiGLU, down), and
-//   - the MMQ path in prefill.cpp's sequence (gather_native into 16-expert groups, q8_1 of the slots' activations,
+//   - the MMQ path in expert_mmq.cpp's sequence (gather_native into 16-expert groups, q8_1 of the slots' activations,
 //     gate/up, SwiGLU, q8_1 of H, down).
 // Both round the activations and H to int8 per 32 values, differently, so this is not a bitwise test: the fused
 // path's error against the reference has to be comparable to MMQ's own (at most 1.5x its RMS and 2x its worst row).
@@ -157,7 +157,7 @@ Routing sort_rows(const std::vector<int32_t>& ids, int E) {
     return r;
 }
 
-// MMQ, as prefill.cpp runs a native layer: per group of 16 routed experts a gather, gate/up, SwiGLU (gate rows, then
+// MMQ, as expert_mmq.cpp runs a native layer: per group of 16 routed experts a gather, gate/up, SwiGLU (gate rows, then
 // up rows), q8_1 of H, down.  Returns Dm [rows][N] in sorted-row order.
 struct MmqBufs {
     Dev xq, gu, h, hq, dm, ident, bounds, grp_gu, grp_d;

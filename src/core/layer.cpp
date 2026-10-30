@@ -488,7 +488,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.kv_int8 = g_kv_int8 && !g_kv_q4;
     st.kv_q4 = g_kv_q4;
     // Hybrid K8V4, main layers only (the drafter's state is created with the globals toggled to INT8 -
-    // mtp.cpp). Streamed mode is refused outright; generate.cpp validates it too, this is the backstop.
+    // core/mtp/load.cpp). Streamed mode is refused outright; program/cli/options.cpp validates it too, this is the backstop.
     if (g_kv_hybrid && ring_cells <= 0) {
         if (p.mode == 1) {
             basalt::log::error("basalt", "hybrid K8V4 KV does not support --kv-resident streaming");

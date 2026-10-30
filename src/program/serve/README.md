@@ -1,6 +1,6 @@
 # Persistent serving
 
-`run(Context&)` borrows the loaded engine from `generate.cpp`. `Context` holds
+`run(Context&)` borrows the loaded engine from `src/program/generate/`. `Context` holds
 references and startup callbacks; it does not own the model, sessions or expert
 tiers. The implementation headers in this directory are private to the program.
 

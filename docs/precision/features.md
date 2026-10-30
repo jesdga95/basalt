@@ -151,7 +151,7 @@ deterministic run to run.
 ### Forced-window KLD
 
 The quality gate is teacher-forced: the window tokens are the reference text, forced to width `--t`, and the drafter
-output is not used (`src/program/generate.cpp`, the `ppl != nullptr` branches). Forcing the window widths the drafter
+output is not used (`src/program/serve/request_decode.cpp`, the `ppl != nullptr` branches). Forcing the window widths the drafter
 produces exercises the same verify kernels as real drafting.
 
 IQ3_XXS, 20 chunks of wikitext-2, against the llama.cpp Q8_0 base (base PPL 2.2815), int8 KV, tiers pinned, 400 W:
@@ -196,8 +196,8 @@ slots never overlap windows.
 Lossy flags are listed together in one start warning; the routing ones are in [routing.md](routing.md).
 
 `--relaxed-drafting P` (opt-in; off by default) gives up the guarantee above for sampled requests. In exact mode a draft
-is kept only when it equals the target's own draw at that row (`src/program/generate.cpp`, the acceptance loop after
-`ver.run`). In relaxed mode a draft is also kept when the target gives it probability P or more under the request's
+is kept only when it equals the target's own draw at that row (`src/program/serve/request_decode.cpp`, the acceptance loop after
+the verify window). In relaxed mode a draft is also kept when the target gives it probability P or more under the request's
 final distribution (top_k, top_p, min_p, temperature and penalties applied). The sampler reports that probability next to
 its draw (`sample_tokens_probe`, src/kernels/cuda/sampler.cu:1375); the logits and the draws themselves do not change.
 

@@ -152,7 +152,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         proj(mixed, mixed_h, w_v, Vc, nb, KV, Nn, 0);
         rms_rows(Kc, w_kn, nb * g.n_head_kv, g.head_dim, g.head_dim, EPS, m.cs);
         rope(Kc, nb, g.n_head_kv, g.head_dim, KV, c0, basalt::kernels::rope_scaling(), m.cs);
-        if (st.kv_rot) {   // rotated as the drafter's own decode stores them (mtp.cpp)
+        if (st.kv_rot) {   // rotated as the drafter's own decode stores them (src/core/mtp/forward.cpp)
             basalt::kernels::fwht256_inplace_cuda(Kc, nb * g.n_head_kv, m.cs);
             basalt::kernels::fwht256_inplace_cuda(Vc, nb * g.n_head_kv, m.cs);
         }

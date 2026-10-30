@@ -228,7 +228,7 @@ private:
     std::future<bool> next_run_;
     int hand_buf_ = 0;
 
-    bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
+    bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (src/prefill/layout.hpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;
     std::unique_ptr<Impl> impl_;
