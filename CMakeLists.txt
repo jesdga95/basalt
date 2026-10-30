@@ -48,7 +48,7 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
 endif()
 message(STATUS "basalt: CUDA arch ${CMAKE_CUDA_ARCHITECTURES}")
 set(_gpu_runtime_target CUDA::cudart)
-set(_gpu_blas_target CUDA::cublas)
+set(_gpu_blas_target CUDA::cublas CUDA::cublasLt)
 set(_gpu_include_directories ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 
 # MSVC reports __cplusplus as 199711L unless /Zc:__cplusplus is given. cuda.h applies alignas(TENSOR_MAP_ALIGN) to
@@ -1240,6 +1240,14 @@ if(BUILD_TESTING)
   target_link_libraries(prefill_mmq_kq_test PRIVATE prefill mmq kernels ${_gpu_runtime_target})
   basalt_gpu_test(NAME prefill_mmq_kq_test COMMAND prefill_mmq_kq_test)
   set_tests_properties(prefill_mmq_kq_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+endif()
+if(BUILD_TESTING)
+  # the FP16 / BF16 prompt products: a row's products the same bits at every call width, against cublasGemmEx and a
+  # double-precision reference (--bench [T...]: timings against cublasGemmEx)
+  add_executable(prefill_gemm_width_test tests/cuda/prefill_gemm_width_test.cpp)
+  target_link_libraries(prefill_gemm_width_test PRIVATE prefill kernels ggml_quants ${_gpu_blas_target} ${_gpu_runtime_target})
+  basalt_gpu_test(NAME prefill_gemm_width_test COMMAND prefill_gemm_width_test)
+  set_tests_properties(prefill_gemm_width_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 endif()
 if(BUILD_TESTING)
   # NVFP4 experts through MMQ (tile loader, per-16-scale dot, scale tail in SwiGLU) against CPU references, with a
