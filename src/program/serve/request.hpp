@@ -22,6 +22,7 @@ private:
     float req_top_p{};
     int req_top_k{};
     unsigned long long req_seed{};
+    bool req_seed_given{};
     float req_min_p{};
     float req_penalty_repeat{};
     float req_penalty_freq{};

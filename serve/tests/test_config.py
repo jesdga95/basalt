@@ -247,17 +247,23 @@ class SamplingOptions(unittest.TestCase):
 
     def test_bad_values(self):
         for flag, bad in (("--temperature", "-1"), ("--temperature", "hot"), ("--temperature", "nan"),
-                          ("--top-p", "0"), ("--top-p", "1.5"), ("--min-p", "2"), ("--top-k", "0"),
-                          ("--top-k", "65"), ("--top-k", "2.5"), ("--presence-penalty", "-1"),
-                          ("--repetition-penalty", "0"), ("--penalty-last-n", "-1"), ("--seed", "0")):
+                          ("--top-p", "0"), ("--top-p", "1.5"), ("--min-p", "2"), ("--top-k", "-2"),
+                          ("--top-k", "2.5"), ("--presence-penalty", "inf"), ("--repetition-penalty", "0"),
+                          ("--penalty-last-n", "-1"), ("--penalty-last-n", "4097"), ("--seed", "1.5")):
             with self.assertRaises(SystemExit, msg=(flag, bad)):
                 parse([flag, bad])
         with self.assertRaises(SystemExit):
-            parse([], {"server": {"top_k": 100}})
+            parse([], {"server": {"top_k": -5}})
+
+    def test_values_the_engine_honours(self):
+        a = parse(["--top-k", "0", "--seed", "0", "--presence-penalty", "-0.5", "--penalty-last-n", "4096"])[0]
+        self.assertEqual(a.sampling_launch, {"top_k": 0, "seed": 0, "presence_penalty": -0.5, "penalty_last_n": 4096})
+        self.assertEqual(parse(["--top-k", "1000"])[0].sampling_launch, {"top_k": 1000})
 
     def test_the_model_file_check_is_the_same(self):
-        with self.assertRaisesRegex(SystemExit, "sampling.top_k=100"):
-            sampling_defaults_from_config({"sampling": {"top_k": 100}})
+        with self.assertRaisesRegex(SystemExit, "sampling.top_k=-5"):
+            sampling_defaults_from_config({"sampling": {"top_k": -5}})
+        self.assertEqual(sampling_defaults_from_config({"sampling": {"top_k": 100}}), {"top_k": 100})
 
     def test_startup_line_marks_the_source(self):
         self.assertEqual(sampling_line({"temperature": 0.8, "top_k": 20, "top_p": 0.9}, {"temperature"}, {"top_k"}),

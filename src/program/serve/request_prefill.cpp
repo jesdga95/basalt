@@ -22,10 +22,10 @@ Flow Request::read_prompt() {
     req_sp.temperature = req_temperature;
     req_sp.top_p = req_top_p;
     req_sp.top_k = req_top_k;
-    req_sp.seed = req_seed ? req_seed
-                           : (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count();
-    req_sp.min_p = std::clamp(req_min_p, 0.0f, 1.0f);
-    req_sp.penalty_last_n = std::max(req_penalty_last_n, 0);
+    req_sp.seed = req_seed_given ? req_seed
+                                 : (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count();
+    req_sp.min_p = req_min_p;
+    req_sp.penalty_last_n = req_penalty_last_n;   // 0..kPenaltyWindowCap: request_parse refuses a wider window
     req_sp.penalty_repeat = req_penalty_repeat;
     req_sp.penalty_freq = req_penalty_freq;
     req_sp.penalty_present = req_penalty_present;
@@ -55,7 +55,7 @@ Flow Request::read_prompt() {
     for (int st = 0; st < runtime_.split_drive.n; ++st)
         runtime_.split_drive.pcie_num[st] = (st == 0 || runtime_.split_same)
                                        ? runtime_.drive.d.pcie_num : runtime_.pcie_num_of(runtime_.stages[(size_t) st - 1]->pcie_frac);
-    hist_n = std::min(req_sp.penalty_last_n, runtime_.kPenaltyWindowCap);
+    hist_n = req_sp.penalty_last_n;
     runtime_.ver.set_history(hist_n > 0 ? runtime_.d_hist : nullptr, hist_n);
     if (runtime_.pipe_on) {   // the second chain draws the same way
         if (!runtime_.ver_b.set_logit_bias(req_bias, runtime_.err)) {

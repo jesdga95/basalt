@@ -1067,30 +1067,84 @@ class ClientShapes(unittest.TestCase):
 
 
 class SamplingKeys(unittest.TestCase):
-    """The GEN line's sampling keys: top_k 0 or above 64 becomes 64; a penalty always carries its window."""
+    """The GEN line's sampling keys carry each value as sent; a penalty without a window gets the default one."""
 
     def keys(self, **sampling):
         return ProcessEngine.sampling_keys(sampling).split()
 
-    def test_top_k(self):
-        self.assertIn("top_k=10", self.keys(temperature=0.7, top_k=10))
-        self.assertIn("top_k=64", self.keys(temperature=0.7, top_k=64))
-        self.assertIn("top_k=64", self.keys(temperature=0.7, top_k=0))
-        self.assertIn("top_k=64", self.keys(temperature=0.7, top_k=100))
-        for bad in (-1, True, 2.5, "20"):
-            self.assertFalse([k for k in self.keys(temperature=0.7, top_k=bad) if k.startswith("top_k=")], bad)
+    def test_values_as_sent(self):
+        for top_k in (10, 64, 65, 100, 0, -1, 248320):
+            self.assertIn(f"top_k={top_k}", self.keys(temperature=0.7, top_k=top_k))
+        self.assertIn("top_k=20", self.keys(temperature=0.7, top_k=20.0))     # a whole JSON number
+        self.assertIn("top_p=1.0", self.keys(temperature=0.7, top_p=1))
+        self.assertIn("min_p=0.0", self.keys(temperature=0.7, min_p=0))
+        for seed in (0, 1, -5, 2 ** 63):
+            self.assertIn(f"seed={seed}", self.keys(temperature=0.7, seed=seed))
+        self.assertFalse([k for k in self.keys(temperature=0) if k.startswith("temperature")])   # 0 is greedy
+        self.assertEqual(self.keys(), [])
 
     def test_relaxed_drafting(self):
         self.assertIn("relax=0.3", self.keys(temperature=1.0, relaxed_drafting=0.3))
         self.assertIn("relax=0", self.keys(temperature=1.0, relaxed_drafting=False))
         self.assertIn("relax=0.0", self.keys(temperature=1.0, relaxed_drafting=0))
-        for bad in (True, 1.5, -0.1, "0.3", None):
-            self.assertFalse([k for k in self.keys(temperature=1.0, relaxed_drafting=bad) if k.startswith("relax")], bad)
 
     def test_penalty_window(self):
         self.assertIn("penalty_last_n=64", self.keys(presence_penalty=1.5))
         self.assertIn("penalty_last_n=4096", self.keys(repetition_penalty=1.1, penalty_last_n=4096))
+        self.assertIn("penalty_last_n=0", self.keys(repetition_penalty=1.1, penalty_last_n=0))
         self.assertFalse([k for k in self.keys(temperature=0.7) if k.startswith("penalty")])
+
+
+class SamplingChecked(unittest.TestCase):
+    """A request's sampling value out of range is a 400 naming the field; one in range is never changed."""
+
+    def test_the_rules(self):
+        from serve.config import checked_sampling
+        good = {"temperature": 0, "top_p": 1, "top_k": 0, "min_p": 1, "presence_penalty": -1.5,
+                "frequency_penalty": 2, "repetition_penalty": 1.1, "penalty_last_n": 4096, "seed": 0,
+                "relaxed_drafting": False}
+        checked_sampling(good)
+        checked_sampling({"top_k": -1, "seed": -7, "top_k_unknown": "x", "temperature": None})
+        bad = [("temperature", -0.1), ("temperature", float("nan")), ("temperature", "0.7"), ("top_p", 0),
+               ("top_p", 1.5), ("top_k", -2), ("top_k", 2.5), ("top_k", True), ("min_p", 1.5),
+               ("repetition_penalty", 0), ("presence_penalty", float("inf")), ("penalty_last_n", 4097),
+               ("penalty_last_n", -1), ("seed", 1.5), ("seed", 2 ** 64), ("relaxed_drafting", 1.5),
+               ("relaxed_drafting", True)]
+        for key, value in bad:
+            with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, f"^{key}: expected"):
+                checked_sampling({key: value})
+
+    def test_a_bad_value_is_a_400_before_the_stream(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "ok", max_context=CTX)
+        httpd = serve(Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja")), port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            for path, body in (("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+                               ("/v1/messages", {"messages": [{"role": "user", "content": "hi"}]}),
+                               ("/v1/responses", {"input": "hi"})):
+                for stream in (False, True):
+                    with self.subTest(path=path, stream=stream):
+                        data = {"model": "qwen3.8-flash-next", "max_tokens": 4, "top_k": -3, "stream": stream, **body}
+                        req = urllib.request.Request(base + path, headers={"Content-Type": "application/json"},
+                                                     data=json.dumps(data).encode())
+                        with self.assertRaises(urllib.error.HTTPError) as cm:
+                            urllib.request.urlopen(req, timeout=30)
+                        with cm.exception as e:
+                            self.assertEqual(e.code, 400)
+                            self.assertIn("top_k", e.read().decode())
+            self.assertEqual(engine.requests, [])
+            data = {"model": "qwen3.8-flash-next", "max_tokens": 4, "top_k": 1000, "seed": 0,
+                    "messages": [{"role": "user", "content": "hi"}]}
+            req = urllib.request.Request(base + "/v1/chat/completions", headers={"Content-Type": "application/json"},
+                                         data=json.dumps(data).encode())
+            with urllib.request.urlopen(req, timeout=30) as r:
+                self.assertEqual(r.status, 200)
+            self.assertIn(" top_k=1000", ProcessEngine.sampling_keys(engine.requests[0][1]))
+            self.assertIn(" seed=0", ProcessEngine.sampling_keys(engine.requests[0][1]))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 class GpuChoice(unittest.TestCase):

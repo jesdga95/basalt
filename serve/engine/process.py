@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
 import queue
 import re
@@ -138,6 +139,11 @@ def pump_lines(stream, sink) -> None:
 
 REQUEST_LINES = False    # --request-lines: echo the engine's per-request summary on stdout
 EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
+PENALTY_LAST_N_DEFAULT = 64  # the penalty window of a request that sets a penalty but no penalty_last_n
+
+
+def _number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 # Engine lines for an unrecoverable verifier: the process may stay alive and print DONE, but must take no more requests.
 FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed out at layer ",
                   "ERR verify: an earlier window never finished", "ERR verify batch: an earlier window never finished")
@@ -595,26 +601,28 @@ class ProcessEngine:
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
+        """The GEN line's sampling keys, each value as sent (the handler refused what is out of range,
+        config.checked_sampling); a field left out is not sent.  A temperature of 0 is greedy, as an absent one;
+        penalties that change nothing (repetition 1, frequency and presence 0) are not sent."""
         keys = ""
         t = sampling.get("temperature")
-        if isinstance(t, (int, float)) and float(t) > 0.0:
+        if _number(t) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
         tp = sampling.get("top_p")
-        if isinstance(tp, (int, float)) and float(tp) < 1.0:
+        if _number(tp):
             keys += f" top_p={float(tp)!r}"
         tk = sampling.get("top_k")
-        if isinstance(tk, int) and not isinstance(tk, bool) and tk >= 0:
-            # the sampler keeps at most 64 candidates
-            keys += f" top_k={tk if 1 <= tk <= 64 else 64}"
+        if _number(tk) and tk == int(tk):
+            keys += f" top_k={int(tk)}"
         mp = sampling.get("min_p")
-        if isinstance(mp, (int, float)) and 0.0 < float(mp) <= 1.0:
+        if _number(mp):
             keys += f" min_p={float(mp)!r}"
         rp = sampling.get("repetition_penalty")
-        rp_on = isinstance(rp, (int, float)) and float(rp) != 1.0
+        rp_on = _number(rp) and float(rp) != 1.0
         pf = sampling.get("frequency_penalty")
-        pf_on = isinstance(pf, (int, float)) and float(pf) != 0.0
+        pf_on = _number(pf) and float(pf) != 0.0
         pp = sampling.get("presence_penalty")
-        pp_on = isinstance(pp, (int, float)) and float(pp) != 0.0
+        pp_on = _number(pp) and float(pp) != 0.0
         if rp_on:
             keys += f" penalty_repeat={float(rp)!r}"
         if pf_on:
@@ -622,20 +630,17 @@ class ProcessEngine:
         if pp_on:
             keys += f" penalty_present={float(pp)!r}"
         if rp_on or pf_on or pp_on:
-            # a penalty needs a window; default to the last 64 tokens
+            # the window the penalties count over: the request's, else llama.cpp's default
             pln = sampling.get("penalty_last_n")
-            if isinstance(pln, int) and not isinstance(pln, bool) and pln > 0:
-                keys += f" penalty_last_n={pln}"
-            else:
-                keys += " penalty_last_n=64"
+            keys += f" penalty_last_n={int(pln) if _number(pln) else PENALTY_LAST_N_DEFAULT}"
         seed = sampling.get("seed")
-        if isinstance(seed, int) and seed > 0:
-            keys += f" seed={seed}"
+        if _number(seed) and seed == int(seed):
+            keys += f" seed={int(seed)}"
         # relaxed_drafting: this request's --relaxed-drafting threshold, 0 or false for exact sampling
         rd = sampling.get("relaxed_drafting")
         if rd is False:
             keys += " relax=0"
-        elif isinstance(rd, (int, float)) and not isinstance(rd, bool) and 0.0 <= float(rd) <= 1.0:
+        elif _number(rd):
             keys += f" relax={float(rd)!r}"
         return keys + ProcessEngine.projection_key(sampling) + bias_key(sampling.get(BIAS_KEY)) \
             + grammar_key(sampling.get(GRAMMAR_KEY))
