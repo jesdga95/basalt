@@ -82,6 +82,9 @@ Flow Request::parse() {
     else if (!std::isfinite(req_penalty_freq) || !std::isfinite(req_penalty_present))
         bad = "penalty_freq, penalty_present: numbers";
     else if (!(req_relax >= 0.0f && req_relax <= 1.0f)) bad = "relax: 0..1";
+    if (bad == nullptr && runtime_.o.batch > 0 && runtime_.piped && req_penalty_last_n > 0 &&
+        (req_penalty_repeat != 1.0f || req_penalty_freq != 0.0f || req_penalty_present != 0.0f))
+        bad = "penalties: pipelined batch groups are not supported";
     if (bad != nullptr) {
         std::printf("ERR sampling %s\n", bad);
         return Flow::next;

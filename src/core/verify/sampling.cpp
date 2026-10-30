@@ -83,7 +83,8 @@ bool Verifier::resample_row(int t, int64_t pos0, const std::vector<float>& bias,
     if (last_batch_ && t < last_t_) {
         sp = slot_sp_[(size_t) last_rows_[t]];
         sp.counter = (uint64_t) last_pos_b_[t];
-        sp.penalty_last_n = 0;
+        if (bh_d_ != nullptr && sp.penalty_last_n > 0) { hist = bh_d_ + (size_t) t * (size_t) bh_len_; hist_n = bh_len_; }
+        else sp.penalty_last_n = 0;
     } else {
         sp = sampling_;
         sp.counter = (uint64_t) pos0 + (uint64_t) t;

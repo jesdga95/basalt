@@ -247,7 +247,7 @@ the sampler as sent.
 | `repetition_penalty` | number > 0 | Multiplicative penalty on tokens seen in the window; `1` is off. |
 | `presence_penalty` | number | Flat penalty on any token seen in the window; `0` is off. |
 | `frequency_penalty` | number | Penalty that grows with how often a token was seen; `0` is off. |
-| `penalty_last_n` | integer 0..4096 | The window, in tokens, the three penalties look back over (`0`: none). Applies only when a penalty is set; 64 when omitted. |
+| `penalty_last_n` | integer 0..4096 | The window, in tokens, the three penalties look back over (`0`: none). Applies only when a penalty is set; 64 when omitted. Penalties apply in batch windows too; pipelined batch groups refuse them (400). |
 | `seed` | integer | Fixes the random draw for a reproducible sampled reply. |
 | `relaxed_drafting` | number in [0, 1], or `false` | This request's relaxed-drafting threshold; `false` or `0` forces exact sampling. Needs speculation; see [Speculative decoding](#speculative-decoding-mtp). |
 

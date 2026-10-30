@@ -383,6 +383,7 @@ private:
         std::unique_ptr<basalt::spec::SuffixDrafter> sfx;
         int32_t sbuf[16] = {};
         int sk = 0, smatch = 0;
+        int pen_n = 0;                 ///< the request's penalty window (penalty_last_n; 0: no penalties)
         bool from_sfx = false;
         double acc = 0.6;          ///< drafts accepted per offered, smoothed: who gets the free rows
         int64_t since_draft = 0;   ///< windows since the slot last drafted

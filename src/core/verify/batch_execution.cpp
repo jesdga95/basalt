@@ -293,10 +293,12 @@ bool Verifier::sample_rows(int S, std::string& err) {
     if (wide && !exact_head_rows(S, err)) return false;
     for (int t = 0; t < S; ++t) {
         basalt::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
-        if (sp.greedy || sp.temperature <= 0.0f) continue;
+        const bool pen = bh_d_ != nullptr && sp.penalty_last_n > 0;
+        if ((sp.greedy || sp.temperature <= 0.0f) && !pen) continue;   // the recorded greedy pick stands
         sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
-        sp.penalty_last_n = 0;
-        basalt::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
+        if (!pen) sp.penalty_last_n = 0;
+        basalt::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_,
+                                       pen ? bh_d_ + (size_t) t * (size_t) bh_len_ : nullptr, pen ? bh_len_ : 0, sp,
                                        m_out_ + t, cs_);
         any = true;
     }

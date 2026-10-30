@@ -118,6 +118,7 @@ Flow Request::complete() {
             BSlot& sl = runtime_.bs[(size_t) runtime_.admit_slot];
             sl = BSlot{};
             sl.active = true;
+            sl.pen_n = req_sp.penalty_last_n;
             sl.script = std::move(runtime_.bscript[(size_t) runtime_.admit_slot].first);
             sl.rng.seed(runtime_.bscript[(size_t) runtime_.admit_slot].second);
             runtime_.bscript[(size_t) runtime_.admit_slot].first.clear();

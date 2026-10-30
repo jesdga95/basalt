@@ -305,12 +305,19 @@ public:
     /// -1 = an error (err).  Serves every layer that has rung so far.
     int batch_poll(PoolMultiFn pool, void* user, std::string& err);
     bool batch_busy() const { return b_running_; }
-    /// A slot's sampling (temperature / top_p / top_k / min_p / seed; penalties are not applied in batch windows):
+    /// A slot's sampling (temperature / top_p / top_k / min_p / seed / penalties, the histories by set_batch_history):
     /// its row is drawn again on the last stage with Philox(seed, position), as a solo window draws it.  Greedy by
     /// default.  Set on the first stage, it reaches the last.
     void set_slot_sampling(int slot, const basalt::kernels::SamplerParams& sp) {
         if (slot >= 0 && slot < (int) slot_sp_.size()) slot_sp_[(size_t) slot] = sp;
         if (next_) next_->set_slot_sampling(slot, sp);
+    }
+    /// The next batch window's penalty histories: one row of `len` int32 per window row (penalty_rows), on the last
+    /// stage's device; a row of a slot with a penalty window is drawn with its tail.  Null: the window has no penalties.
+    void set_batch_history(const int32_t* rows, int len) {
+        bh_d_ = rows;
+        bh_len_ = len;
+        if (next_) next_->set_batch_history(rows, len);
     }
     const int32_t* batch_out() const { return b_out_; }
     bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
@@ -433,6 +440,8 @@ private:
     std::map<uint64_t, cudaGraphExec_t> exec_bm_;
     std::map<int, cudaGraphExec_t> commit_bm_;
     int last_rows_[8] = {};                ///< the slot of each row of the last batch window
+    const int32_t* bh_d_ = nullptr;        ///< set_batch_history
+    int bh_len_ = 0;
     int last_nseg_ = 0, last_seg_slot_[8] = {}, last_seg_len_[8] = {};   ///< its segments
     std::chrono::steady_clock::time_point commit_t0_;   ///< commit_slots_begin
     std::vector<int> commit_next_keep_;                 ///< its counts, for the next stage

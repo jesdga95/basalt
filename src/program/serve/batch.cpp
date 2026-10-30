@@ -147,6 +147,24 @@ bool Runtime::batch_step() {
         for (size_t j = 0; j < drafts[sg].size(); ++j) tok[R + 1 + (int) j] = drafts[sg][j];
         R += lens[sg];
     }
+    // the penalty histories, one per row: a slot's row j follows the tokens its state holds, the fed-back token and
+    // the drafts before it, as a solo window's row does (penalty_rows); a slot without penalties never reads its rows
+    int pen_h = 0;
+    for (int sg = 0; sg < S; ++sg) pen_h = std::max(pen_h, bs[(size_t) rows[sg]].pen_n);
+    if (pen_h > 0) {
+        for (int sg = 0; sg < S; ++sg) {
+            const BSlot& sl = bs[(size_t) rows[sg]];
+            basalt::kernels::penalty_rows(sl.ids.data(), (int64_t) sl.ids.size(), tok + r0s[sg], lens[sg], pen_h,
+                                          hist_stage.data() + (size_t) r0s[sg] * (size_t) pen_h);
+        }
+        const basalt::core::OnDevice on_h(hist_dev);
+        if (cudaMemcpy(d_hist, hist_stage.data(), (size_t) R * (size_t) pen_h * sizeof(int32_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+            std::printf("ERR batch: the penalty histories could not be staged\n");
+            return false;
+        }
+    }
+    ver.set_batch_history(pen_h > 0 ? d_hist : nullptr, pen_h);
     const bool was_busy = basalt::core::progress().busy.load();
     basalt::core::progress().busy.store(true);
     drive.d.layers = 0;
