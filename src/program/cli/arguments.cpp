@@ -274,8 +274,10 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         }
         }
     }
-    if (o.route_tail_skip > 0 || o.route_prior > 0.0f) {
+    if (o.route_tail_skip > 0 || o.route_prior > 0.0f || o.relaxed_drafting > 0.0f) {
         basalt::log::warn("basalt", "lossy flags enabled, these flags will affect the accuracy of the served model");
+        if (o.relaxed_drafting > 0.0f)
+            basalt::log::warn("basalt", "--relaxed-drafting %g accepts draft tokens the model would not pick", (double) o.relaxed_drafting);
         if (o.route_prior > 0.0f)
             basalt::log::warn("basalt", "--route-prior %g changes expert routing", (double) o.route_prior);
         if (o.route_tail_skip > 0)
