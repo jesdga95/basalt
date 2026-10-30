@@ -1384,8 +1384,8 @@ uint64_t FileExpertSource::homes_compact() {
         std::memcpy(dst[k], from, (size_t) bytes);
     }
     homes_commit();
-    const uint64_t freed = homes_reclaim();
-    return freed;
+    (void) homes_reclaim();
+    return held - homes_bytes();
 }
 
 bool FileExpertSource::exchange_live() const {
