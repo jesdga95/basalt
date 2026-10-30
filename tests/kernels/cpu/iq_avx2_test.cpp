@@ -8,7 +8,10 @@
 // activations with the model's row geometry, 1 to 8 tokens, plus weights and activations pinned to their extreme codes.
 // The reference dequantizes the weights and the activation and sums in double; its error is reported (the float order of
 // the kernels differs from it by rounding only). On a CPU without AVX-VNNI the base build is checked against the
-// reference alone. `--bench` prints one row range per format on each build.
+// reference alone. Every build's gate/up and dot rows must also hash to the values frozen from the kernels (the decode
+// may change, the bits may not), on a fixture made from the raw generator output only, so it is the same on every
+// standard library, and a token's rows must not depend on how many tokens share the call. `--print` prints the hashes,
+// `--bench` one row range per format on each build.
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
@@ -18,6 +21,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -62,6 +66,91 @@ void dequant_q8_K(const uint8_t* p, float* y, int n) {
     }
 }
 
+// FNV-1a over every output word of every mode, token count and kernel, in the order frozen_rows() computes them
+struct Frozen {
+    int type;
+    uint64_t hash;
+};
+constexpr Frozen kFrozen[] = {
+    {16, 0x5aa6c46c476d9374ull}, {17, 0xe26b83c9c9f6e0beull}, {18, 0x8556519b365713e7ull},
+    {21, 0x055866d379808976ull}, {22, 0x0dcbe782e8793820ull}, {23, 0xdb60269c60d1f256ull},
+};
+
+void fnv(uint64_t& h, const float* p, size_t n) {
+    const auto* b = (const unsigned char*) p;
+    for (size_t i = 0; i < 4 * n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+}
+
+using GuFn = void (*)(int, const uint8_t*, size_t, size_t, int, const void* const*, int, float* const*, int, int);
+using DotFn = void (*)(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int);
+
+// One build's rows against the frozen hashes: mode 0 random codes, 1 every code bit set, 2 random codes with saturating
+// activations, 3 every code bit clear; 1 to MAXT tokens over all FF rows. Returns the number of failures.
+int frozen_rows(const char* build, GuFn gu, DotFn dot, bool print) {
+    int bad = 0;
+    for (const Frozen& fz : kFrozen) {
+        const int type = fz.type;
+        cpu::NativeFmt f;
+        std::string err;
+        if (!cpu::native_fmt(type, 20, H, FF, f, err)) { std::printf("native_fmt(%d): %s\n", type, err.c_str()); return 1; }
+        uint64_t h = 1469598103934665603ull;
+        size_t tok_diff = 0;
+        std::mt19937 rng(11 + (unsigned) type);
+        for (int mode = 0; mode < 4; ++mode) {
+            std::vector<uint8_t> blob(2 * f.up_off);
+            std::mt19937_64 wr(300 + (uint64_t) type * 7 + (uint64_t) mode);
+            for (size_t i = 0; i + 8 <= blob.size(); i += 8) {
+                const uint64_t x = mode == 1 ? ~0ull : mode == 3 ? 0ull : wr();
+                std::memcpy(blob.data() + i, &x, 8);
+            }
+            const size_t bs = ggml_type_size((ggml_type) type);
+            for (size_t b = 0; b + bs <= blob.size(); b += bs) {
+                const uint16_t d = (uint16_t) (0x2800 + (wr() & 0xff));
+                std::memcpy(&blob[b], &d, 2);
+            }
+            std::vector<std::vector<uint8_t>> act(MAXT, std::vector<uint8_t>(cpu::kNativeActBytes));
+            std::vector<float> x(H);
+            for (int t = 0; t < MAXT; ++t) {
+                for (auto& v : x) v = mode == 2 ? ((rng() & 1) ? 1.f : -1.f) : (float) ((int) (rng() % 2001) - 1000) / 400.f;
+                cpu::native_quant_act(f, x.data(), act[(size_t) t].data());
+            }
+            std::vector<std::vector<float>> one_ff(MAXT, std::vector<float>(FF)), one_d(MAXT, std::vector<float>(FF));
+            for (int t = 0; t < MAXT; ++t) {
+                const void* a1[1] = {act[(size_t) t].data()};
+                float* f1[1] = {one_ff[(size_t) t].data()};
+                float* d1[1] = {one_d[(size_t) t].data()};
+                gu(type, blob.data(), f.gu_row, f.up_off, H, a1, 1, f1, 0, FF);
+                dot(type, blob.data(), f.gu_row, H, a1, 1, d1, 0, FF);
+            }
+            for (int nt = 1; nt <= MAXT; ++nt) {
+                const void* ap[MAXT];
+                std::vector<std::vector<float>> ff(nt, std::vector<float>(FF)), dd(nt, std::vector<float>(FF));
+                float *fp[MAXT], *dp[MAXT];
+                for (int t = 0; t < nt; ++t) {
+                    ap[t] = act[(size_t) t].data();
+                    fp[t] = ff[(size_t) t].data();
+                    dp[t] = dd[(size_t) t].data();
+                }
+                gu(type, blob.data(), f.gu_row, f.up_off, H, ap, nt, fp, 0, FF);
+                dot(type, blob.data(), f.gu_row, H, ap, nt, dp, 0, FF);
+                for (int t = 0; t < nt; ++t) {
+                    fnv(h, fp[t], FF);
+                    fnv(h, dp[t], FF);
+                    tok_diff += (size_t) (std::memcmp(fp[t], one_ff[(size_t) t].data(), FF * 4) != 0) +
+                                (size_t) (std::memcmp(dp[t], one_d[(size_t) t].data(), FF * 4) != 0);
+                }
+            }
+        }
+        const bool ok = h == fz.hash;
+        std::printf("  type %2d %s rows: hash %016llx %s, token-count dependence %zu\n", type, build, (unsigned long long) h,
+                    ok ? "(frozen)" : "(DIFFERS from the frozen hash)", tok_diff);
+        if (print) std::printf("    {%d, 0x%016llxull},\n", type, (unsigned long long) h);
+        bad += !ok;
+        bad += tok_diff != 0;
+    }
+    return bad;
+}
+
 double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -69,7 +158,12 @@ double now_ms() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    const bool bench = argc > 1 && std::string(argv[1]) == "--bench";
+    bool print = false, bench = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        print |= a == "--print";
+        bench |= a == "--bench";
+    }
     if (!cpu::cpu_avx2_ok()) {
         std::printf("iq_avx2_test SKIPPED: this CPU lacks AVX2\n");
         return 0;
@@ -79,6 +173,10 @@ int main(int argc, char** argv) {
     int bad = 0, compared = 0;
     std::mt19937 rng(11);
     std::normal_distribution<float> nd(0.f, 1.f);
+
+    // ---- gate/up and plain dot rows against the frozen hashes
+    bad += frozen_rows("base", cpu::iq256_gu_rows_base, cpu::iq256_rows_base, print);
+    if (vnni) bad += frozen_rows("vnni", cpu::iq256_gu_rows_vnni, cpu::iq256_rows_vnni, false);
 
     // ---- gate/up and plain dot rows (Q8_K activations)
     for (int type : {16, 17, 18, 21, 22, 23}) {
