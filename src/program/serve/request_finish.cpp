@@ -193,6 +193,7 @@ Flow Request::complete() {
             runtime_.live_ok = false;
             runtime_.checks.clear();
         }
+        runtime_.solo_draft_back(!solo_moved);
     }
     if (runtime_.drive.routing != nullptr) std::fflush(runtime_.drive.routing);   // the routing trace survives a crash and is watchable mid-session
 

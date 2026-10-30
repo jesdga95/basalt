@@ -58,6 +58,14 @@ Flow Request::restore() {
     own_partial_from0 = false;   // the slot holds a read that gave way (BYIELD)
     own_partial_chunk = 0;
     if (in_slot) {
+        // this request drafts on the main sequence: the solo conversation's draft K/V waits in slot 0's store (the
+        // solo session's) until the request ends, unless that store holds slot 0's own cached conversation
+        if (runtime_.batch_spec && !runtime_.solo_draft_in0 && runtime_.live_ok && !runtime_.live.empty() &&
+            !runtime_.bs[0].cached) {
+            if (runtime_.mtp.copy_store(runtime_.mtp.main_store(), 0, (int64_t) runtime_.live.size(), runtime_.err))
+                runtime_.solo_draft_in0 = true;
+            runtime_.err.clear();
+        }
         solo_book = {std::move(runtime_.live), std::move(runtime_.live_imgs), runtime_.live_ok, runtime_.cvec_cached, std::move(runtime_.checks)};
         BSlot& sb = runtime_.bs[(size_t) slot_b];
         runtime_.live.clear();
@@ -90,6 +98,7 @@ Flow Request::restore() {
         runtime_.sp.set_session((*rview));
         if (runtime_.mtp_on) runtime_.mtp.set_ple_session(&(*rview));
     }
+    if (!in_slot) runtime_.solo_draft_back(true);   // when a request in another slot ended before it gave them back
     // slot 0 is the solo session: what an idle slot 0 holds is the live conversation, in place
     if (runtime_.slot0_is_solo && !in_slot && !runtime_.bs.empty() && runtime_.bs[0].cached && !runtime_.bs[0].active) {
         BSlot& s0 = runtime_.bs[0];
@@ -335,6 +344,7 @@ Flow Request::restore() {
                 runtime_.live_ok = false;
                 runtime_.checks.clear();
             }
+            runtime_.solo_draft_back(!solo_moved);
         }
         runtime_.admit_slot = -1;
         return Flow::next;

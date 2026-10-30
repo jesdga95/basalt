@@ -389,6 +389,8 @@ private:
     };
     std::vector<BSlot> bs{};
     bool batch_spec{};
+    /// the solo conversation's draft K/V waits in slot 0's store while a request in another slot holds the main one
+    bool solo_draft_in0{};
     int S_all{};
     std::optional<basalt::spec::DraftPolicy> bpolicy;
     double bt_draft{};
@@ -500,6 +502,7 @@ private:
     bool copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& e);
     bool hold_slot(int b, const ConvCheckpoint* at, std::string& e);
     bool copy_from_slot(int b, const ConvCheckpoint* at, std::string& e);
+    void solo_draft_back(bool keep);
     bool slot_digest(int b, int64_t upto, uint64_t* part);
     bool batch_step();
     basalt::core::Verifier& stage_verifier(int k);
