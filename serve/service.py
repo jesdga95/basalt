@@ -42,8 +42,6 @@ EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief 
                "medium": "Reasoning effort is set to medium. Think as much as the task needs, without unnecessary "
                          "elaboration."}
 VISION_START = "<|vision_start|>"
-# a reply repeating one token this many times in a row is ended ("length"); Service.repeat_stop_tokens, 0: off
-REPEAT_STOP_TOKENS = 256
 # closes the thinking at reasoning_budget_tokens
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # Reserve output tokens for the wrap-up and answer above this cap.
@@ -128,7 +126,6 @@ class Service:
         self.vram_reserve = None                         # last POST /v1/vram reserve (None: the start's)
         self.reasoning_budget_tokens = 0                 # default thinking budget (0: none)
         self.answer_room = True                          # reserve output space when thinking
-        self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # see REPEAT_STOP_TOKENS
         self.anthropic_think_unasked = True               # "anthropic_thinking": "on_request" -> False
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
@@ -895,8 +892,7 @@ class Service:
             sampling = {**self.sampling_defaults, **req_values}
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
-        run_tok, run_len, repeated = None, 0, False     # current run of one repeated token
-        thinking_n = 0                                  # tokens written while thinking
+        thinking_n = 0                                 # tokens written while thinking
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
 
@@ -1032,11 +1028,6 @@ class Service:
                                 raw_ids.append(t)
                                 seg.append(t)
                                 thinking_n += parser.state == "reasoning"
-                                run_len = run_len + 1 if t == run_tok else 1
-                                run_tok = t
-                                if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
-                                    repeated = True     # degenerate output
-                                    break
                                 piece = detok.push(t)
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
@@ -1135,10 +1126,7 @@ class Service:
                         prompt = prompt + seg + extra
                     if cancel.is_set():
                         finish = "cancel"
-                    elif repeated:
-                        print(f"[server] warning: the reply repeated one token ({self.tok.decode([run_tok])!r}) "
-                              f"{run_len} times, stopped as length (repeat_stop_tokens, 0 = off)", flush=True)
-                except GeneratorExit:                   # client disconnected
+                except GeneratorExit:                  # client disconnected
                     finish = "disconnect"
                     raise
                 finally:

@@ -32,7 +32,7 @@ from types import SimpleNamespace  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 CTX = 4096
-ANSWER = "xy" * 1000                             # alternating bytes: not one repeated token (ended at 256)
+ANSWER = "xy" * 1000
 
 
 class RecordingEngine(MockEngine):
@@ -1419,33 +1419,30 @@ class PcieShare(unittest.TestCase):
         self.assertIn("end=length  hit=60.0%  pcie=20.0%", out.getvalue())
 
 
-class RepeatStop(unittest.TestCase):
-    """One token repeated repeat_stop_tokens times in a row ends the reply as "length"; 0 turns it off."""
+class RepeatedToken(unittest.TestCase):
+    """A reply that repeats one token is served as the model writes it: "length" only at max_tokens."""
 
-    def run_reply(self, script, limit=None):
+    def run_reply(self, script, max_new):
         tok = ByteTokenizer()
         svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
-        if limit is not None:
-            svc.repeat_stop_tokens = limit
-        ids = tok.encode("hi")
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            done = [x for kind, x in svc.run(ids, False, None, 3000, {}, threading.Event()) if kind == "done"][0]
-        return done, out.getvalue()
+        events, done = [], None
+        with contextlib.redirect_stdout(io.StringIO()):
+            for kind, x in svc.run(tok.encode("hi"), False, None, max_new, {}, threading.Event()):
+                if kind == "event":
+                    events.append(x)
+                elif kind == "done":
+                    done = x
+        return done, "".join(ev.text or "" for ev in events if ev.kind == "content")
 
-    def test_a_long_run_is_ended(self):
-        done, log = self.run_reply("ok " + "!" * 1000 + " never")
-        self.assertEqual(done["finish"], "length")
-        self.assertEqual(done["completion_tokens"], 3 + 256)
-        self.assertIn("repeated one token ('!') 256 times", log)
+    def test_a_long_run_ends_where_the_model_ends_it(self):
+        done, text = self.run_reply("ok " + "0" * 1000 + " fine", 3000)
+        self.assertEqual((done["finish"], done["completion_tokens"]), ("stop", 3 + 1000 + 5 + 1))
+        self.assertEqual(text, "ok " + "0" * 1000 + " fine")
 
-    def test_short_runs_and_off(self):
-        done, _ = self.run_reply("=" * 255 + " fine")
-        self.assertEqual(done["finish"], "stop")
-        done, log = self.run_reply("!" * 1000, limit=0)
-        self.assertEqual((done["finish"], done["completion_tokens"]), ("stop", 1001))
-        self.assertNotIn("repeated one token", log)
-        done, _ = self.run_reply("ab" * 400, limit=8)       # alternating tokens are not one run
-        self.assertEqual(done["finish"], "stop")
+    def test_length_is_max_tokens(self):
+        done, text = self.run_reply("0" * 3000, 1000)
+        self.assertEqual((done["finish"], done["completion_tokens"]), ("length", 1000))
+        self.assertEqual(text, "0" * 1000)
 
 
 class DraftHeadHint(unittest.TestCase):
