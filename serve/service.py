@@ -70,6 +70,7 @@ DEBUG = False            # --debug: one line per request plus the raw model text
 class Service:
     loading = booting = False                      # a load or wake runs; the start-up load runs
     load_kind = "weights"                               # what the running load is: "weights" or "wake"
+    on_loaded = None                                    # called after each weights load or wake this service ran
     boot_error = None                                   # the start-up load's failure, for the requests queued behind it
 
     def served_names(self) -> list[str]:
@@ -200,15 +201,13 @@ class Service:
             return None
         return {"kind": self.load_kind, **((getattr(self.engine, "load_status", None) or {}) if self.load_kind == "weights" else {})}
 
-    def start_load(self, on_ready=None) -> None:
+    def start_load(self) -> None:
         """Load the model in the background at start. The HTTP server is already up and requests wait on the same
-        fifo as for any load; a failed start is kept for them and ends the server. `on_ready()` runs once loaded."""
+        fifo as for any load; a failed start is kept for them and ends the server."""
         def run():
             self.booting = True
             try:
                 self.load()
-                if on_ready is not None:
-                    on_ready()
             except (EngineDied, GpuBusy):
                 pass                                    # kept in boot_error by ensure_loaded
             finally:
@@ -227,6 +226,8 @@ class Service:
         self.loading = True
         try:
             self._ensure_loaded()
+            if self.on_loaded is not None:
+                self.on_loaded()
         except (EngineDied, GpuBusy) as e:
             if self.booting:                            # the requests queued behind it get this, not a second try
                 self.boot_error = e if isinstance(e, EngineStartError) else EngineStartError(str(e))

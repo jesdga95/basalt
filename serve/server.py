@@ -231,19 +231,26 @@ def main() -> int:
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
     svc.start_idle_sleep()
+    svc.on_loaded = lambda: announce()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
 
-    def announce():
-        if not a.mock_engine and not lazy:
-            warn_tight_ram(engine.info.get("arena_mib"))
-        if getattr(engine, "batch", 0):
-            print(tagged("slots", f"par={engine.batch} ctx/slot={engine.max_context}"
-                         + (" (slot-full-context)" if a.slot_full_context else "") + ", others queue"), flush=True)
-        tail = f"ctx={engine.max_context} images={'on' if vision else 'off'}" + (" api-key=on" if svc.api_key else "")
-        print(tagged("ready", f"http://{here}:{a.port}/v1  openai+anthropic  {tail}"), flush=True)
+    first_load = [True]
 
-    print(tagged("stats", f"http://{here}:{a.port}/"), flush=True)
-    if a.mock_engine or lazy:
+    def announce():
+        """After every weights load: the slot table once, then the weights line (no URL)."""
+        if first_load[0]:
+            first_load[0] = False
+            if not a.mock_engine:
+                warn_tight_ram(engine.info.get("arena_mib"))
+            if getattr(engine, "batch", 0):
+                print(tagged("slots", f"par={engine.batch} ctx/slot={engine.max_context}"
+                             + (" (slot-full-context)" if a.slot_full_context else "") + ", others queue"), flush=True)
+        print(tagged("weights", f"loaded, ctx={engine.max_context} images={'on' if vision else 'off'}"), flush=True)
+
+    # the one place the addresses and the APIs are printed: the server listens before the model loads
+    print(tagged("ready", f"http://{here}:{a.port}/v1  openai+anthropic  stats http://{here}:{a.port}/"
+                 + (" api-key=on" if svc.api_key else "")), flush=True)
+    if a.mock_engine:
         announce()
     if a.host not in LOOPBACK_NAMES:
         # reachable from other devices: print the addresses
@@ -255,7 +262,7 @@ def main() -> int:
         if exposed_without_key(a.host, svc.api_key):
             print(tagged("warning", "no api key, open to the network (--api-key KEY)"), flush=True)
     if not a.mock_engine and not lazy:
-        svc.start_load(announce)                        # the page and the API are up; requests wait for the load
+        svc.start_load()                                # the page and the API are up; requests wait for the load
     if a.open:
         import webbrowser
         webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")

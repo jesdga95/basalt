@@ -99,11 +99,11 @@ sizes `GiB`/`MiB`, times `s`. Startup prints one block, starting with a legend:
 [server] sampling temp=1.0 top_p=0.95 top_k=20 min_p=0.0 pres=0.0
 [server] vision   mode=dynamic gpu=0 (RTX 5090) load=per-image
 [server] auto     peer-excl=off resident=64.0GB pool-affinity=auto
-[server] stats    http://127.0.0.1:8080/
+[server] ready    http://127.0.0.1:8080/v1  openai+anthropic  stats http://127.0.0.1:8080/
 [server] loaded   68.4GiB 37.5s  cuda0=26.6GiB ram=41.2GiB cuda1=0.6GiB cuda1-copy=14.2GiB
 [server] kv       2.6/16.3GiB cuda0 elastic slots=4
 [server] slots    par=4 ctx/slot=262144 (slot-full-context), others queue
-[server] ready    http://127.0.0.1:8080/v1  openai+anthropic  ctx=262144 images=on
+[server] weights  loaded, ctx=262144 images=on
 ```
 
 `sampling` marks a value set on the command line `(cli)` or in the config file `(config)`; `auto` is the engine's
@@ -142,7 +142,7 @@ Each request ends with one slot-tagged `done` line:
 
 ## The stats page
 
-The server's own address (`[server] stats` above) serves one page that reads `/metrics`, `/slots` and `/api/logs`
+The server's own address (`stats` on the `[server] ready` line above) serves one page that reads `/metrics`, `/slots` and `/api/logs`
 once a second:
 
 - GPUs: every card the engine uses, with VRAM and 60 s charts of load and power (one card adds temperature; three or
