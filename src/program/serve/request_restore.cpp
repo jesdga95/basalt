@@ -400,9 +400,15 @@ Flow Request::restore() {
     }
     restore_t0 = Clock::now();
     if (incoming) {
+        // the draft layer's K/V goes to the main sequence, which then holds it as written
+        if (runtime_.mtp_on && !runtime_.mtp.use_main(runtime_.err)) {
+            std::printf("ERR %s\n", runtime_.err.c_str());
+            return Flow::error;
+        }
         // a snapshot that cannot be restored is dropped and the prompt read from the start
         bool restored = basalt::core::conversation_snapshot_restore(*incoming, *runtime_.rsp,
                 runtime_.g, runtime_.mtp_kv, runtime_.err) == basalt::core::ConversationRestore::restored;
+        if (restored && runtime_.mtp_on) runtime_.mtp.wrote(0, (int64_t) incoming->live.ids.size());
         int failed_stage = -1;
         for (size_t i = 0; restored && i < runtime_.stages.size(); ++i) {   // the later stages' parts
             const basalt::core::OnDevice on(runtime_.stages[i]->dev);
