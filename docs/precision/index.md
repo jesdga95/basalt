@@ -11,6 +11,7 @@ Test setup: one RTX 5090 at a 400 W power limit, an RTX 5060 Ti as the peer expe
 - **MTP does not change output** (unless `--relaxed-drafting` is set: [details](features.md#relaxed-drafting)). With the expert tiers pinned, 275 of 275 greedy prompts produced identical tokens on
   both packs tested, and every full-vocabulary fp32 logit row (62,271 and 60,878) was bit-identical between `--spec 0`
   and `--spec 7`.
+- **Lossy flags are opt-in.** `--relaxed-drafting`, `--route-prior` and `--route-tail-skip` change output; each is off by default and listed in one start warning ([relaxed drafting](features.md#relaxed-drafting), [routing](routing.md)).
 - **KLD matches llama.cpp.** On the same GGUFs against the same base, Basalt and llama.cpp's own `llama-perplexity`
   agree: IQ3_S 0.15264 vs 0.1526, IQ3_XXS 0.2433 vs 0.2428 at 100 chunks, with the exact head. The two-stage
   verify head of a Q6_K head (IQ3_S) adds about 0.0017 ([details](features.md#two-stage-verify-head)).

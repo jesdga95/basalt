@@ -193,6 +193,8 @@ slots never overlap windows.
 
 ## Relaxed drafting
 
+Lossy flags are listed together in one start warning; the routing ones are in [routing.md](routing.md).
+
 `--relaxed-drafting P` (opt-in; off by default) gives up the guarantee above for sampled requests. In exact mode a draft
 is kept only when it equals the target's own draw at that row (`src/program/generate.cpp`, the acceptance loop after
 `ver.run`). In relaxed mode a draft is also kept when the target gives it probability P or more under the request's
