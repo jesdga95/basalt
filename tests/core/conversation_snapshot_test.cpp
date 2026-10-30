@@ -1,6 +1,9 @@
 #include <algorithm>
 #include "basalt/core/conversation_snapshot.hpp"
+#include "basalt/core/conversation_store.hpp"
 #include "basalt/core/kv_arena.hpp"
+#include "basalt/platform/file.hpp"
+#include "basalt/platform/system.hpp"
 #include "basalt/kernels/kv_q4.hpp"
 #include <cuda_runtime.h>
 
@@ -8,6 +11,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <map>
+#include <memory>
+#include <string>
 #include <vector>
 
 using namespace basalt::core;
@@ -106,6 +112,23 @@ bool equal(const ConversationKv& a,const ConversationKv& b) {
     return a.k==b.k && a.v==b.v && a.k_scale==b.k_scale && a.v_scale==b.v_scale && a.pooled==b.pooled;
 }
 
+// every file of a directory, by name; the directory is removed
+std::map<std::string, std::vector<uint8_t>> take_dir(const std::string& dir) {
+    std::map<std::string, std::vector<uint8_t>> out;
+    std::vector<basalt::platform::DirFile> files;
+    if (!basalt::platform::list_files(dir, files)) return out;
+    for (const auto& f : files) {
+        std::vector<uint8_t>& b = out[f.name];
+        b.resize((size_t) f.bytes);
+        std::FILE* fp = basalt::platform::open_file_utf8(dir + "/" + f.name, "rb");
+        if (!fp || std::fread(b.data(), 1, b.size(), fp) != b.size()) b.clear();
+        if (fp) std::fclose(fp);
+        basalt::platform::remove_file(dir + "/" + f.name);
+    }
+    basalt::platform::remove_file(dir);
+    return out;
+}
+
 void full_session(int fmt, int mode, int experts) {
     Fixture main(fmt,mode), draft(fmt==3?kKvInt8:fmt,2);
     auto& g=main.g;
@@ -179,6 +202,49 @@ void full_session(int fmt, int mode, int experts) {
           restored.live.dead==a.live.dead && restored.live.block_pos==a.live.block_pos &&
           equal(restored.kv[0],a.kv[0]) && equal(restored.kv[1],a.kv[1]),"whole-session A/B/A exactness including spare key");
     check(ss.ple_prev[0]==64 && ss.ple_prev[1]==65,"PLE token window reconstructed");
+    {   // the disk tier: written from the session a buffer at a time, the same files as the queued capture; read
+        // back with the K/V left in its files and restored from them, the same state as the whole capture
+        const std::vector<ConversationCheckpoint> none;   // no checkpoint: the live state is stored
+        const ConversationView flat{ids,images,none,true};
+        SavedConversation whole;
+        check(conversation_snapshot_save(whole,flat,ss,g,draft.state,err),"capture A for the disk tier");
+        const std::string base=basalt::platform::temp_dir()+"/basalt-snapshot-disk-"+
+            std::to_string((long long)basalt::platform::process_id())+"-"+std::to_string(fmt)+std::to_string(mode)+
+            std::to_string(experts);
+        {
+            ConversationStore queued,direct;
+            check(queued.open(base+"-q",9,1ull<<30,err) && direct.open(base+"-d",9,1ull<<30,err),"open two stores");
+            SavedConversation copy=whole;
+            check(queued.put(std::move(copy),1ull<<30),"queue the captured image");
+            queued.flush();
+            ConversationSource src;
+            check(conversation_snapshot_source(src,flat,ss,g,&draft.state,err),"the session as a source");
+            check(direct.write(src,err),"write from the session");
+            std::vector<int32_t> p=ids; p.push_back(1);
+            const auto m=direct.best(p.data(),p.size(),images,true);
+            check(m.tokens==(int64_t)ids.size(),"the written conversation matches");
+            SavedConversation part;
+            std::unique_ptr<ConversationKvRead> kv;
+            check(direct.load(m,part,err,&kv) && kv && part.kv.size()==whole.kv.size() && part.kv[0].k.empty(),
+                  "read the state, the K/V left in its files");
+            check(!conversation_snapshot_validate(part,ss,g,nullptr,err,kv.get()),"a draft image's file is refused without a draft");
+            check(conversation_snapshot_restore(b,ss,g,draft.state,err)==ConversationRestore::restored,"restore B over it");
+            check(conversation_snapshot_restore(part,ss,g,&draft.state,err,kv.get())==ConversationRestore::restored,
+                  "restore A with its K/V from the files");
+            SavedConversation back;
+            check(conversation_snapshot_save(back,flat,ss,g,draft.state,err),"capture the restored state");
+            bool same=back.kv.size()==whole.kv.size() && back.live.gdn==whole.live.gdn && back.live.ple==whole.live.ple &&
+                      back.live.tails==whole.live.tails && back.live.dead==whole.live.dead &&
+                      back.live.block_pos==whole.live.block_pos;
+            for (size_t i=0;same && i<back.kv.size();++i) same=equal(back.kv[i],whole.kv[i]);
+            check(same,"the K/V and state restored from the files equal the whole capture, draft included");
+            uint64_t fingerprint=0;
+            check(conversation_kv_verify(whole.kv.back(),draft.state,g,(int64_t)ids.size(),false,fingerprint,err),
+                  "the draft ring's resident pages refilled from the restored pool");
+        }
+        const auto qf=take_dir(base+"-q"),df=take_dir(base+"-d");
+        check(!qf.empty() && qf==df,"the session's write leaves the queued capture's files byte for byte");
+    }
     for (int64_t dirty : {65, 3, 0}) {
         check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore growth fixture base");
         ConversationKvReuse reuse{a.kv,65,dirty};
