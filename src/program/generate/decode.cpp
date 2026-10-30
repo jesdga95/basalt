@@ -353,6 +353,7 @@ int decode(Context& context) {
     cudaFree(d_parts);
     cudaFree(sbuf);
     cudaFree(arena);
-    return 0;}
+    return 0;
+}
 
 }
