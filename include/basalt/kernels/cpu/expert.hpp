@@ -146,9 +146,14 @@ void s2_expert_vnni_multi(const uint8_t* blob, const ActQ* const* a1, int n_toke
 /// per row, `nblocks` blocks each) against `nt` activations: out[t][r].
 void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
                           float* const* out, int r0, int r1);
-/// The same two for CPUs without AVX-512 (src/kernels/cpu/q2_avx2.cpp, compiled for AVX2 only).
+/// The same two for CPUs without AVX-512 (src/kernels/cpu/q2_avx2.cpp, compiled for AVX2 only).  The rows take the
+/// AVX-VNNI build where the CPU has it; `_base` and `_vnni` name the two builds for the tests (every output bit is the same).
 void q2_0_gguf_rows_multi_avx2(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
                                float* const* out, int r0, int r1);
+void q2_0_gguf_rows_multi_avx2_base(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
+                                    float* const* out, int r0, int r1);
+void q2_0_gguf_rows_multi_avx2_vnni(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
+                                    float* const* out, int r0, int r1);
 void act_quant_q8_1_avx2(const float* x, int n, ActQ& a);
 
 void s2_expert_scalar(const uint8_t* blob, const float* x, float* out, bool quant_acts);
