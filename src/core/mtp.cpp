@@ -1000,8 +1000,10 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             native_q8_0_mmvq_stream(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, cs);
         else
             native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
-        if (sub && n_xcap_ > 0)   // rows without a token never win
-            for (int t = 0; t < T; ++t) q5k_head_mask_unmapped(head_logits_ + (size_t) t * nv, dvocab_, (int) nv, cs);
+        if (sub && n_xcap_ > 0)   // a context row without a token never wins (the other rows always have one)
+            for (int t = 0; t < T; ++t)
+                q5k_head_mask_unmapped(head_logits_ + (size_t) t * (size_t) nv + (size_t) xbase_, dvocab_ + xbase_,
+                                       (int) n_xcap_, cs);
         if (diag_ != nullptr && T == 1)   // the step's logits to the host, for the draft-tree study
             cudaMemcpyAsync(diag_ + (size_t) chain_j_ * (size_t) diag_stride_, head_logits_, (size_t) nv * sizeof(float),
                             cudaMemcpyDeviceToHost, cs);
