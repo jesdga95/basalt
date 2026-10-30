@@ -67,6 +67,7 @@ const Case CASES[] = {
     {"kv Q8_0", 8, 2560, 512, 34, {0, -1}},
     {"tail Q8_0", 8, 1024, 1000, 34, {0, -1}},
     {"tail2 Q8_0", 8, 1536, 999, 34, {0, -1}},
+    {"kv IQ3_S", 21, 6144, 512, 110, {0, -1}},
 };
 
 uint16_t sane_half(std::mt19937& rng) {
@@ -139,6 +140,12 @@ bool parity(const Case& c, cudaStream_t s) {
         return false;
     cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
+    // IQ3_S has only the one-tile path; the engine takes it where dense_tc_supported says so, so does the test
+    if (c.type == 21 && !basalt::kernels::dense_tc_supported(c.type, c.n_in, c.n_out, dw)) {
+        std::printf("%-12s %5d x %5d  skipped: shape outside the one-tile path on this device\n", c.name, c.n_in, c.n_out);
+        cudaFree(dw); cudaFree(xq); cudaFree(dx); cudaFree(yref); cudaFree(yt);
+        return true;
+    }
     cudaDeviceSynchronize();   // pageable copies may still be in flight for a non-blocking stream
     basalt::kernels::native_quantize_q8_1(dx, xq, c.n_in, TM, s);
     for (int j = 0; j < TM; ++j)
