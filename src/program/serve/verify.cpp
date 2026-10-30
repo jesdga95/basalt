@@ -226,7 +226,7 @@ int Runtime::capture_windows() {
     // pools map that VRAM, zeroed.  `kv_release` gives a session's cells past `cells` back and the cache maps its
     // tail again, each returned slot refilled from RAM.  Both run between windows, never inside one.
     // a request's room past its prompt, and each later step (batch slots: a smaller step, as their base)
-    kKvGrowCells = o.batch > 0 ? 4096 : 16384;
+    kKvGrowCells = o.batch > 0 ? 4096 : 8192;
     kv_moves = 0;
 
     kv_short = false;   // the last kv_fit refused: the cells would take the cache below its floor
