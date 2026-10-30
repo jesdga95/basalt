@@ -164,7 +164,8 @@ per slot, `gpus` with `util`, `power` and `temp` per card) and the fastest reque
 `--conversation-cache-disk-mib N` (an engine flag, also `"conversation-cache-disk-mib"` in the config's `engine`
 section) parks conversations on disk under the RAM cache, in at most N MiB. It is off at 0, the default. It writes to
 the folder `conversations` inside the model's cache folder (`~/.cache/basalt/<hash>/`, where the engine log is);
-`--conversation-cache-dir DIR` only names another folder, and does nothing on its own. When the tier is on the server
+`--conversation-cache-dir DIR` only names another folder, and does nothing on its own. On Linux the folders the engine
+creates for the tier and the files it writes there are its user's only (0700, 0600); on Windows they take the parent folder's access list. When the tier is on the server
 prints `[disk] conversations=DIR disk-mib=N` at start. A conversation of at least 8192 tokens that leaves its session
 (another one takes its slot), that the RAM cache evicts, or that the engine still holds when it ends (a stop, an idle
 unload) is written to DIR: one file for its tokens and running state, and shared files for its K/V cache (one per 4096
@@ -172,8 +173,7 @@ cells) and for each checkpoint's state, each named by the tokens it covers and i
 written again, or another that starts the same way, writes only the blocks and states that are new. A conversation whose
 last checkpoint (the end of its last prompt) is at most 4096 tokens behind is stored as of that checkpoint, with no
 running state of its own: the next turn goes on from there, and a reply sent back as it was is read
-again. A later
-prompt that starts with a stored conversation (its tokens, or one of its checkpoints) reads it back cut at that point
+again. A later prompt that starts with a stored conversation (its tokens, or one of its checkpoints) reads it back cut at that point
 and goes on from there, after a restart too: the wait is the drive reading the K/V cache. A file is bound to the model file, the stored-conversation format and the settings that change the state
 (the KV type, the rope, the draft layer, control vectors); every part of it carries a hash, and a file that does not
 check out is deleted, never restored. After a second without input (no slot decoding) the engine writes each conversation that has grown 4096 tokens past its
