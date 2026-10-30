@@ -7,6 +7,8 @@
 #include "basalt/platform/system.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cstring>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -106,7 +108,9 @@ void test_native_variable_layout() {
     layout_text << "1 " << GGML_TYPE_IQ2_XS << ' ' << GGML_TYPE_IQ4_NL << ' ' << layer0_bytes << ' '
                 << second_fmt.bytes << '\n';
     create_experts(dir.path, total, {{0, 'a'}, {(uint64_t) first_fmt.bytes, 'b'},
-                                  {layer0_bytes, 'c'}, {layer0_bytes + (uint64_t) second_fmt.bytes, 'd'}});
+                                  {2 * (uint64_t) first_fmt.bytes, 'e'}, {layer0_bytes, 'c'},
+                                  {layer0_bytes + (uint64_t) second_fmt.bytes, 'd'},
+                                  {layer0_bytes + 2 * (uint64_t) second_fmt.bytes, 'f'}, {total - 1, 'z'}});
 
     const bool layout_ok = expert_layout_load_text(layout_text.str(), layers, experts, err);
     require(layout_ok, "could not load synthetic native layout: " + err);
@@ -128,6 +132,34 @@ void test_native_variable_layout() {
                 source.blob(layers, 0) == nullptr && source.blob(0, experts) == nullptr,
             "native bounds check accepted an invalid layer or expert");
     require(source.reads() == 4, "invalid native lookups changed the read count");
+
+    constexpr int count = 8;
+    const std::pair<int32_t, int32_t> pairs[count] = {
+        {1, 2}, {0, 1}, {1, 0}, {0, 0}, {1, 1}, {0, 2}, {0, 1}, {1, 2},
+    };
+    require(!source.read_blobs(pairs, count, [](int64_t, int, const uint8_t*, std::string& error) {
+        error = "consumer failure";
+        return false;
+    }, err) && err == "consumer failure", "bulk read lost the consumer error");
+    std::atomic<int> seen[count]{};
+    err.clear();
+    const bool bulk_ok = source.read_blobs(pairs, count, [&](int64_t i, int worker, const uint8_t* data,
+                                                           std::string& error) {
+        if (i < 0 || i >= count || worker < 0 || worker >= ExpertSource::kBlobReaders) {
+            error = "bulk read returned an invalid request or worker";
+            return false;
+        }
+        const auto [layer, expert] = pairs[i];
+        const uint64_t bytes = layer == 0 ? first_fmt.bytes : second_fmt.bytes;
+        const uint8_t* expected = first + (layer == 0 ? 0 : layer0_bytes) + expert * bytes;
+        if (seen[i].fetch_add(1) != 0 || std::memcmp(data, expected, (size_t) bytes) != 0) {
+            error = "bulk read duplicated a request or returned another expert";
+            return false;
+        }
+        return true;
+    }, err);
+    require(bulk_ok, "bulk read failed after a consumer rejection: " + err);
+    for (const auto& visits : seen) require(visits.load() == 1, "bulk read omitted a request");
 
     check_file_size_rejection(source, dir.path, layers, experts, total);
     create_experts(dir.path, total, {{layer0_bytes, 'c'}});

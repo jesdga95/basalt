@@ -7,6 +7,7 @@
 
 #include "basalt/core/pinned.hpp"
 #include "basalt/platform/file.hpp"
+#include "basalt/platform/direct_file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/platform/system.hpp"
 #include "basalt/kernels/elementwise.hpp"
@@ -462,10 +463,11 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
     std::string map_err;
     auto view_map = platform::MappedFile::open_ro(path, &map_err, mo);
     if (!view_map) { err = "FileExpertSource: " + map_err; return false; }
-    // A plain descriptor for the prompt path's positional reads: the view stays read-only for the compute, while the
-    // staging buffers are filled with reads that do not fault mapping pages in. A failure here is not fatal - the
-    // caller falls back to copying from the view.
+    // A plain descriptor for the prompt path's positional reads: the view stays read-only for the compute.  The
+    // bulk fills open the same path unbuffered themselves (read_blobs).  A failure here is not fatal - the caller
+    // falls back to copying from the view.
     fd_ = platform::open_fd_utf8(path);
+    path_ = path;
     view_ = std::move(*view_map);
     file_off_ = experts.offset;
     base_ = view_.data();
@@ -546,6 +548,7 @@ void FileExpertSource::close() {
     view_.reset();
     platform::close_fd(fd_);
     fd_ = -1;
+    path_.clear();
     base_ = nullptr;
     blobs_ = 0;
     n_layers_ = 0;
@@ -590,90 +593,96 @@ bool ExpertSource::read_blobs(const std::pair<int32_t, int32_t>* pairs, int64_t 
     return true;
 }
 
-bool FileExpertSource::read_blobs(const std::pair<int32_t, int32_t>* pairs, int64_t n, const BlobSink& sink,
-                                  std::string& err) {
-    constexpr uint64_t kAlign = 4096;
-    int dfd = -1;
-    if (n > 0 && !complement_ready_ && base_ != nullptr && fd_ >= 0) dfd = basalt::platform::open_unbuffered(fd_);
+bool FileExpertSource::read_blobs(const std::pair<int32_t, int32_t>* pairs, int64_t n,
+                                 const BlobSink& sink, std::string& err) {
+    // A blob copied out of the mapping leaves its pages in this process, so each one goes back to the OS as soon as
+    // the sink has it: a fill of every expert must not leave the whole pack resident.
+    const BlobSink drop_after = [&](int64_t i, int w, const uint8_t* blob, std::string& e) {
+        if (!sink(i, w, blob, e)) return false;
+        if (blob >= base_ && blob < base_ + mapped_bytes_)
+            (void) basalt::platform::drop_mapped_view(base_, mapped_bytes_, (uint64_t) (blob - base_),
+                                                      layer_blob_bytes_[(size_t) pairs[i].first]);
+        return true;
+    };
+    // With the compact RAM copy ready the experts are not read from the file, so there is nothing to give back.
+    const bool give_back = n > 0 && !complement_ready_ && base_ != nullptr;
+    const BlobSink mapped_sink = give_back ? drop_after : sink;
+    auto mapped_read = [&] { return ExpertSource::read_blobs(pairs, n, mapped_sink, err); };
+    if (complement_ready_ || !base_ || path_.empty() || n <= 0) return mapped_read();
+
     uint64_t max_blob = 0;
-    for (int64_t i = 0; dfd >= 0 && i < n; ++i) {
-        const int64_t l = pairs[i].first;
-        if (l < 0 || l >= n_layers_) { basalt::platform::close_fd(dfd); dfd = -1; break; }
-        max_blob = std::max(max_blob, layer_blob_bytes_[(size_t) l]);
-    }
-    // one staging buffer per reader: the blob's block-aligned span, pinned so the copy to a GPU runs at link speed
-    const int readers = (int) std::max<int64_t>(1, std::min<int64_t>(kBlobReaders, n));
-    const size_t stage_bytes = (size_t) ((max_blob + 2 * kAlign + kAlign - 1) / kAlign * kAlign);
-    std::vector<uint8_t*> stage((size_t) readers, nullptr);
-    struct Free {
-        std::vector<uint8_t*>& v;
-        int& fd;
-        ~Free() {
-            for (uint8_t* p : v) if (p) cudaFreeHost(p);
-            if (fd >= 0) basalt::platform::close_fd(fd);
+    for (int64_t i = 0; i < n; ++i) {
+        const auto [layer, expert] = pairs[i];
+        if (!mapped_blob(layer, expert)) {
+            err = "read_blobs: invalid expert";
+            return false;
         }
-    } cleanup{stage, dfd};
-    for (int w = 0; dfd >= 0 && w < readers; ++w) {
-        void* m = nullptr;
-        if (cudaHostAlloc(&m, stage_bytes, cudaHostAllocPortable) != cudaSuccess) {
+        max_blob = std::max(max_blob, layer_blob_bytes_[(size_t) layer]);
+    }
+    constexpr uint64_t alignment = platform::DirectFile::alignment();
+    if (max_blob > UINT32_MAX - 2 * alignment) return mapped_read();
+    const uint64_t stage_bytes = (max_blob + 2 * (alignment - 1)) & ~(alignment - 1);
+    const int readers = (int) std::min<int64_t>(kBlobReaders, n);
+    struct Stage {
+        uint8_t* data = nullptr;
+        int64_t index = -1;
+        uint32_t prefix = 0, required = 0;
+        ~Stage() { if (data) cudaFreeHost(data); }
+    } stages[kBlobReaders];
+    // The file drains outstanding writes before the staging buffers are released.  A pack on a file system without
+    // unbuffered reads, or one that cannot be reopened, is read through the mapping.
+    platform::DirectFile file;
+    std::string direct_err;
+    if (!file.open(path_, direct_err, readers)) return mapped_read();
+    for (int i = 0; i < readers; ++i) {
+        // Portable: the fill writes the peer card's slots straight from these buffers.
+        if (cudaHostAlloc((void**) &stages[i].data, (size_t) stage_bytes, cudaHostAllocPortable) != cudaSuccess) {
             (void) cudaGetLastError();
-            basalt::platform::close_fd(dfd);
-            dfd = -1;
-            break;
+            file.close();
+            return mapped_read();
         }
-        stage[(size_t) w] = (uint8_t*) m;
-    }
-    if (dfd < 0) {
-        // Without unbuffered reads the blobs come through the mapping, whose pages stay in this process after the copy.
-        // Each is given back once the sink has it, so a fill of every expert does not leave the whole file resident.
-        const bool give_back = n > 0 && !complement_ready_ && base_ != nullptr;
-        if (!give_back) return ExpertSource::read_blobs(pairs, n, sink, err);
-        const BlobSink and_drop = [&](int64_t i, int w, const uint8_t* blob, std::string& e) {
-            if (!sink(i, w, blob, e)) return false;
-            if (blob >= base_ && blob < base_ + mapped_bytes_)
-                (void) basalt::platform::drop_mapped_view(base_, mapped_bytes_, (uint64_t) (blob - base_),
-                                                          layer_blob_bytes_[(size_t) pairs[i].first]);
-            return true;
-        };
-        return ExpertSource::read_blobs(pairs, n, and_drop, err);
     }
 
-    std::atomic<int64_t> next{0};
-    std::atomic<bool> failed{false};
-    std::mutex fail_mu;
-    std::string fail_msg;
-    auto worker = [&](int w) {
-        for (;;) {
-            const int64_t i = next.fetch_add(1);
-            if (i >= n || failed.load()) return;
-            const int64_t l = pairs[i].first, e = pairs[i].second;
-            const uint8_t* mapped = mapped_blob(l, e);
-            std::string msg;
-            if (mapped == nullptr) {
-                msg = "expert blob " + std::to_string(l) + "/" + std::to_string(e) + " is out of range";
-            } else {
-                const uint64_t bytes = layer_blob_bytes_[(size_t) l];
-                const uint64_t pos = file_off_ + (uint64_t) (mapped - base_);
-                const uint64_t a0 = pos - pos % kAlign;
-                const uint64_t a1 = (pos + bytes + kAlign - 1) / kAlign * kAlign;
-                const int64_t got = basalt::platform::pread(dfd, stage[(size_t) w], (size_t) (a1 - a0), a0);
-                const uint8_t* data = got > 0 && (uint64_t) got >= pos + bytes - a0 ? stage[(size_t) w] + (pos - a0)
-                                                                                    : mapped;   // short read: mapped copy
-                if (sink(i, w, data, msg)) continue;
-            }
-            std::lock_guard<std::mutex> lock(fail_mu);
-            if (fail_msg.empty()) fail_msg = msg;
-            failed.store(true);
-            return;
-        }
+    auto submit = [&](int slot, int64_t index) {
+        const auto [layer, expert] = pairs[index];
+        const uint8_t* mapped = mapped_blob(layer, expert);
+        const uint64_t pos = file_off_ + (uint64_t) (mapped - base_);
+        Stage& stage = stages[slot];
+        stage.index = index;
+        stage.prefix = (uint32_t) (pos & (alignment - 1));
+        stage.required = stage.prefix + (uint32_t) layer_blob_bytes_[(size_t) layer];
+        const uint32_t length = (uint32_t) (((uint64_t) stage.required + alignment - 1) & ~(alignment - 1));
+        return file.submit(pos - stage.prefix, stage.data, length, (uint64_t) slot, err);
     };
-    std::vector<std::thread> pool;
-    for (int w = 1; w < readers; ++w) pool.emplace_back(worker, w);
-    worker(0);
-    for (auto& t : pool) t.join();
-    if (failed.load()) {
-        err = fail_msg;
-        return false;
+    int64_t next = 0;
+    for (int slot = 0; slot < readers; ++slot)
+        if (!submit(slot, next++)) return false;
+    int64_t finished = 0;
+    platform::Completion completions[kBlobReaders];
+    while (finished < n) {
+        const int count = file.wait(completions, readers, -1);
+        if (count <= 0) {
+            err = "read_blobs: direct read completion failed";
+            return false;
+        }
+        for (int j = 0; j < count; ++j) {
+            const auto& done = completions[j];
+            if (done.tag == platform::DirectFile::WAKE_TAG) continue;
+            if (done.tag >= (uint64_t) readers || stages[done.tag].index < 0) {
+                err = "read_blobs: invalid direct read completion";
+                return false;
+            }
+            Stage& stage = stages[done.tag];
+            // A read that came back short or failed (a truncated pack, a drive that refused it) hands over this
+            // blob's mapped copy, and the fill carries on with the rest.
+            const uint8_t* data = done.ok && done.bytes >= stage.required
+                                      ? stage.data + stage.prefix
+                                      : mapped_blob(pairs[stage.index].first, pairs[stage.index].second);
+            if (!drop_after(stage.index, (int) done.tag, data, err)) return false;
+            stage.index = -1;
+            ++finished;
+            if (next < n && !submit((int) done.tag, next++)) return false;
+        }
     }
     return true;
 }
