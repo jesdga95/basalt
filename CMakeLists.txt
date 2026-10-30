@@ -281,7 +281,34 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
 # about arithmetic, and this one knows the ORDER the arithmetic happens in.
 add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
   src/core/remote_expert_opt.cu
-  src/core/expert_cache.cpp src/core/vmm.cpp src/core/kv_arena.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
+  src/core/expert_cache.cpp src/core/vmm.cpp src/core/kv_arena.cpp src/core/native_head.cpp src/core/native_dense.cpp
+  src/core/verify/batch_capture.cpp
+  src/core/verify/batch_execution.cpp
+  src/core/verify/batch_sessions.cpp
+  src/core/verify/capture.cpp
+  src/core/verify/commit.cpp
+  src/core/verify/cpu_warm.cpp
+  src/core/verify/diagnostics.cpp
+  src/core/verify/execution.cpp
+  src/core/verify/expert_execution.cpp
+  src/core/verify/expert_plan.cpp
+  src/core/verify/expert_resources.cpp
+  src/core/verify/gdn_split.cpp
+  src/core/verify/hc8.cpp
+  src/core/verify/head_split.cpp
+  src/core/verify/lifecycle.cpp
+  src/core/verify/pipeline.cpp
+  src/core/verify/profile.cpp
+  src/core/verify/projection.cpp
+  src/core/verify/record.cpp
+  src/core/verify/record_gdn.cpp
+  src/core/verify/record_head.cpp
+  src/core/verify/record_inputs.cpp
+  src/core/verify/record_layer.cpp
+  src/core/verify/record_moe.cpp
+  src/core/verify/record_qsa.cpp
+  src/core/verify/sampling.cpp
+  src/core/mtp.cpp
   src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/conversation_store.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp)
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(engine PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})

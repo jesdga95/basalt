@@ -362,6 +362,7 @@ public:
     std::string profile_report();
 
 private:
+    struct WindowRecorder;
     RemoteExpertOpt* remote_opt_ = nullptr;
     bool main_high_ = false;
     PeerExperts* peer_ = nullptr;

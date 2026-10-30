@@ -1016,7 +1016,7 @@ static void opt_in_check(cudaError_t e, const char* who) {
     }
 }
 
-// The live configuration: DEC_DTC2 2 | 4 | 8 | 16 and DEC_PAIR 2 | 4 | 16 (see verify.cpp).
+// The live configuration: DEC_DTC2 2 | 4 | 8 | 16 and DEC_PAIR 2 | 4 | 16 (see src/core/verify/).
 constexpr int g_v2 = 30;
 constexpr int g_pair = 22;
 
@@ -1206,7 +1206,7 @@ void dense_tc_l2_prefetch(const void* w, size_t bytes, void* stream) {
 
 int dense_tc_pair_mask() { return g_pair; }
 
-int dense_tc_mask() { return 29; }   // DEC_DTC 1 | 4 | 8 | 16 (see verify.cpp)
+int dense_tc_mask() { return 29; }   // DEC_DTC 1 | 4 | 8 | 16 (see src/core/verify/)
 
 #endif
 }  // namespace basalt::kernels

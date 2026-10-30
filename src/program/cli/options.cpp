@@ -142,8 +142,8 @@ std::optional<int> validate_generation_options(const Options& o, bool multi_gpu,
         return 2;
     }
     if (o.vram_reserve_given && o.vram_reserve_mib < min_vram_reserve_mib) {
-        basalt::log::error("basalt", "--vram-reserve-mib %d leaves less VRAM free than the engine needs to keep "
-                             "requests from stalling; the smallest safe value is %d", o.vram_reserve_mib, min_vram_reserve_mib);
+        basalt::log::error("basalt", "--vram-reserve-mib %d leaves less VRAM free than the engine needs once "
+                             "everything is loaded; the smallest safe value is %d", o.vram_reserve_mib, min_vram_reserve_mib);
         return 2;
     }
     if (o.expert_cache_remote_placement != "stripe" && o.expert_cache_remote_placement != "layer") {
