@@ -549,6 +549,7 @@ int main(int argc, char** argv) {
     }
     basalt::kernels::RopeScaling rope_cfg;
     if (const auto code = cli::validate_generation_options(o, multi_gpu, vram_floor_mib(), rope_cfg)) return *code;
+    basalt::prefill::Prefill::set_fp8(o.prefill_fp8);
 
     // **BEFORE ANYTHING ELSE.**  The CPU expert kernel is AVX-512 (VNNI + VBMI), so on a CPU without those features it
     // does not fail - it executes an illegal instruction at some unpredictable token.  Refusing at second zero is the
@@ -1897,6 +1898,9 @@ int main(int argc, char** argv) {
             constexpr int64_t kSlotWindowsMib = 24;   // one session's solo windows, or the batch windows
             if (o.serve || ml == nullptr || std::strcmp(ml, "EAGER") != 0) late_room += kLazyKernelsMib << 20;
             if (o.serve && o.batch >= 2 && slot0_is_solo) late_room += ((int64_t) o.batch * kSlotWindowsMib) << 20;
+            // --prefill-fp8: cuBLASLt's handle and its E4M3 kernels load on the prompt path's first FP8 product
+            constexpr int64_t kFp8KernelsMib = 8;
+            if (o.prefill_fp8) late_room += kFp8KernelsMib << 20;
         }
         const int64_t reserve_b = std::max<int64_t>((int64_t) o.vram_reserve_mib << 20,
                                                     late_room + ((int64_t) vram_floor_mib() << 20));
