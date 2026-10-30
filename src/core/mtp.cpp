@@ -510,9 +510,9 @@ std::vector<std::pair<std::string, const void*>> MtpDrafter::hc8_keys() const {
 }
 
 namespace {
-// a Q5_K draft head keeps context rows after its base rows; a Q6_K head (no context rows) reads the main head's rows
-// through its map instead of a copy
-bool draft_ctx_rows(int head_type) { return head_type == 13; }
+// a Q5_K or Q8_0 draft head keeps context rows after its base rows; a Q6_K head (no context rows) reads the main
+// head's rows through its map instead of a copy
+bool draft_ctx_rows(int head_type) { return head_type == 13 || head_type == GGML_Q8_0; }
 bool draft_rows_mapped(int head_type) { return head_type == 14 && !draft_ctx_rows(head_type); }
 }  // namespace
 
