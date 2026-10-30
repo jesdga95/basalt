@@ -687,6 +687,13 @@ target_include_directories(route_tail_skip_parity PRIVATE ${_gpu_include_directo
 target_link_libraries(route_tail_skip_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME route_tail_skip_parity COMMAND route_tail_skip_parity)
 set_tests_properties(route_tail_skip_parity PROPERTIES SKIP_RETURN_CODE 77)
+# the residency-biased router against native_router (lambda 0, bitwise) and a double-precision CPU rule (GPU, synthetic,
+# no model; --bench times it beside the native router)
+add_executable(route_prior_parity tests/kernels/route_prior_parity.cpp)
+target_include_directories(route_prior_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(route_prior_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME route_prior_parity COMMAND route_prior_parity)
+set_tests_properties(route_prior_parity PROPERTIES SKIP_RETURN_CODE 77)
 # the overlapped windows kernels: the list copy of a stage snapshot against a CPU copy, and the flag raised behind a
 # stream writes (GPU, synthetic, no model; --bench)
 add_executable(pair_snapshot_parity tests/kernels/pair_snapshot_parity.cpp)

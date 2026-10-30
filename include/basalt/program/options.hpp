@@ -152,6 +152,10 @@ struct Options {
     /// entry of the window that names it ranks R or lower by router weight (0 = off; the flag alone =
     /// kRouteTailSkipDefault).  The others keep their router weights.  This changes the output: docs/precision/features.md.
     int route_tail_skip = 0;
+    /// --route-prior [LAMBDA]: a decode window picks its top-10 as if every expert a GPU holds had LAMBDA added to its
+    /// router logit; the weights stay the router's own (0 = off; the flag alone = kRoutePriorDefault). This changes
+    /// the output: docs/precision/routing.md.
+    float route_prior = 0.0f;
     /// --grammar on|off: a request's "grammar" key is enforced on the sampled tokens (the vocabulary is read from the
     /// pack at start).  Off: the key is ignored and the decode loop pays one pointer test per window.
     bool grammar = false;

@@ -130,6 +130,8 @@ public:
     /// Opt-in routing changes, each of which changes the output; before init, and only with the device-planned MoE
     /// tail (otherwise init switches them off).  Route tail skip: see `kernels::route_tail_skip` (0 = off).
     void set_route_tail_skip(int rank) { route_tail_skip_ = rank; }
+    /// Residency-biased routing: see `kernels::route_prior_top10` (0 = off).
+    void set_route_prior(float lambda) { route_prior_ = lambda; }
     /// What the routing changes did since the start, one line each; empty when none applied.
     std::vector<std::string> route_report() const;
 
@@ -615,6 +617,7 @@ private:
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block
     GpuPlanSink sink_;
     int route_tail_skip_ = 0;
+    float route_prior_ = 0.0f;
     uint32_t cur_layer_ = 0;
     static void publish_plan(void* ctx);
     void set_plan_slot();

@@ -44,7 +44,9 @@ bool Verifier::dm_init(std::string& err) {
     if (why != nullptr) {
         basalt::log::warn("basalt verify", "the device-planned MoE tail is off: %s", why);
         if (route_tail_skip_ > 0) basalt::log::info("basalt verify", "route-tail-skip is off: it needs the device-planned MoE tail");
+        if (route_prior_ > 0.0f) basalt::log::info("basalt verify", "route-prior is off: it needs the device-planned MoE tail");
         route_tail_skip_ = 0;
+        route_prior_ = 0.0f;
         return true;
     }
     DecMoe* d = new DecMoe;
@@ -86,7 +88,7 @@ bool Verifier::dm_init(std::string& err) {
     if (ok && diagnostics().wait_stats)
         ok = cudaMalloc((void**) &d->wstat, kDmStatWords * 8) == cudaSuccess &&
              cudaMemset(d->wstat, 0, kDmStatWords * 8) == cudaSuccess;
-    if (ok && route_tail_skip_ > 0)
+    if (ok && (route_tail_skip_ > 0 || route_prior_ > 0.0f))
         ok = cudaMalloc((void**) &d->route_counts, 8 * 8) == cudaSuccess && cudaMemset(d->route_counts, 0, 8 * 8) == cudaSuccess;
     if (!ok) { err = "verify: device-planned MoE buffers"; return false; }
     d->rows_words = (size_t) (T * K * N);
@@ -304,6 +306,12 @@ std::vector<std::string> Verifier::route_report() const {
         std::snprintf(b, sizeof b, "route-tail-skip %d: %llu of %llu routed entries no GPU held dropped (%.1f%%); %.1f%% of all %llu entries",
                       route_tail_skip_, c[2], c[1], c[1] > 0 ? 100.0 * (double) c[2] / (double) c[1] : 0.0,
                       100.0 * (double) c[2] / (double) c[0], c[0]);
+        out.push_back(b);
+    }
+    if (route_prior_ > 0.0f && c[3] > 0) {
+        std::snprintf(b, sizeof b, "route-prior %g: %.1f%% of %llu routed entries picked because of the bias; %.1f%% of entries held by no GPU",
+                      (double) route_prior_, 100.0 * (double) c[4] / (double) c[3], c[3],
+                      100.0 * (double) c[5] / (double) c[3]);
         out.push_back(b);
     }
     return out;

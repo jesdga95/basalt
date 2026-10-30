@@ -1618,9 +1618,14 @@ class StartFailureLog(unittest.TestCase):
     def test_route_warnings_reach_the_start_output(self):
         from serve.engine.progress import engine_warning
         self.assertEqual(
-            engine_warning("basalt: warning: route-tail-skip 7: skips low-ranked experts the GPU does not hold; "
-                           "output is less accurate than the model"),
-            "route-tail-skip 7: skips low-ranked experts the GPU does not hold; output is less accurate than the model")
+            engine_warning("basalt: warning: --route-tail-skip 9 drops low-ranked missed experts"),
+            "--route-tail-skip 9 drops low-ranked missed experts")
+
+    def test_route_prior_warning_reaches_the_start_output(self):
+        from serve.engine.progress import engine_warning
+        self.assertEqual(
+            engine_warning("basalt: warning: --route-prior 0.5 changes expert routing"),
+            "--route-prior 0.5 changes expert routing")
 
     def test_marked_lines_of_any_area(self):
         from serve.engine.progress import engine_error, engine_ram_floor, engine_warning, start_errors

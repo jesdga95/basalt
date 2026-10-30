@@ -163,6 +163,10 @@ class Precedence(unittest.TestCase):
         _, _, _, cli_words = parse(["--route-tail-skip", "--resident-experts"])
         self.assertEqual(cli_words, ["--route-tail-skip", "--resident-experts"])
 
+    def test_route_prior_config_words(self):
+        _, _, file_words, _ = parse([], {"engine": {"route-prior": 1.5}})
+        self.assertEqual(file_words, ["--route-prior", "1.5"])
+
     def test_the_command_line_wins_over_the_file(self):
         # the engine reads its words in order and a later flag wins
         _, _, file_words, cli_words = parse(["--kv", "fp16"], {"engine": {"kv": "int8"}})
