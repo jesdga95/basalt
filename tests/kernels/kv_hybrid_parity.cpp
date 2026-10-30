@@ -254,7 +254,7 @@ int main() {
     std::memcpy(Vdq_un.data(), Vdq.data(), Vdq.size() * 4);
     for (int c = 0; c < cells * H; ++c) fwht256_host_reference(Vdq_un.data() + (size_t) c * D);
 
-    // ---- batched form with TWO queries and per-query step arrays (the verify.cpp window's exact call)
+    // ---- batched form with TWO queries and per-query step arrays (the verify window's exact call, record_qsa.cpp)
     {
         const int nq = 2;
         std::vector<float> q2((size_t) nq * QH * D);
