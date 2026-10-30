@@ -184,7 +184,7 @@ plain decoding would give.
 | `spec` | engine | integer | 8 with a drafter, else 0 | Verify windows of at most N tokens: the last accepted token plus up to N-1 drafts. `0` or `1` turns speculation off. |
 | `suffix-draft` | engine | integer tokens | 3 (`0` = MTP only) | Prompt lookup: when the text repeats an earlier stretch of the context by at least N tokens, the window may be filled from what followed it there, where the draft policy expects it to pay. |
 | `mtp-max-t` | engine | integer | 0 (= `spec`) | Caps the MTP's own windows; longer ones then come only from prompt lookup. |
-| `mtp-window` | engine | integer cells | 32768 (`0` = all) | The drafter attends to the last N cells. |
+| `mtp-window` | engine | integer cells | 32768 (`0` = all) | The drafter attends to the last N cells. With `parallel`, each slot's draft K/V keeps only those and the 16384 before them (a turn rolled back), not the slot's whole context, and the rest of that VRAM holds expert slots. |
 | `relaxed-drafting` | engine (`[P]`) | `true`, or a number in (0, 1] | off | Optional, and it changes output. Under sampling, a draft the model gives probability P or more is kept even when the model's own draw would have been another token. Faster, but no longer the model's exact sampling distribution; lower P is faster and further from exact. Bare `true` or flag alone is 0.5. Greedy requests, `logit_bias`, JSON `response_format`, control tokens and tool calls stay exact. Single-stream only. Numbers: [precision](../precision/features.md#relaxed-drafting). |
 
 ## Parallel slots

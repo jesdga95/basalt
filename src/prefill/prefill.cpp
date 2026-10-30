@@ -1239,6 +1239,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         err = std::string("prefill: the draft layer's K/V: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
+    mtp.wrote(cell0 + r0, cell0 + n);
     mtp.ms_prefill += ms_since(t0);
     return true;
 }
