@@ -680,6 +680,13 @@ target_include_directories(dm_table_put_parity PRIVATE ${_gpu_include_directorie
 target_link_libraries(dm_table_put_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME dm_table_put_parity COMMAND dm_table_put_parity)
 set_tests_properties(dm_table_put_parity PROPERTIES SKIP_RETURN_CODE 77)
+# the route tail skip against a plain CPU rule: which entries it drops over random windows, tables and ranks (GPU, synthetic,
+# no model; --bench times the window kernel)
+add_executable(route_tail_skip_parity tests/kernels/route_tail_skip_parity.cpp)
+target_include_directories(route_tail_skip_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(route_tail_skip_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME route_tail_skip_parity COMMAND route_tail_skip_parity)
+set_tests_properties(route_tail_skip_parity PROPERTIES SKIP_RETURN_CODE 77)
 # the overlapped windows kernels: the list copy of a stage snapshot against a CPU copy, and the flag raised behind a
 # stream writes (GPU, synthetic, no model; --bench)
 add_executable(pair_snapshot_parity tests/kernels/pair_snapshot_parity.cpp)

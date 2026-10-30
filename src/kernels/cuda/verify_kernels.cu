@@ -1289,6 +1289,58 @@ __global__ void copy_or_zero_kernel(float4* __restrict__ dst, const volatile flo
 }
 }  // namespace
 
+namespace {
+// One block, one thread per window entry.
+__global__ void __launch_bounds__(kResidentPlanMax) route_tail_skip_kernel(int32_t* __restrict__ ids, float* __restrict__ w,
+                                                                          ResidentTabs held, int n, int k, int R,
+                                                                          int n_expert, unsigned long long* counts) {
+    __shared__ int32_t s_ids[kResidentPlanMax];
+    __shared__ uint8_t s_tail[kResidentPlanMax];   // the entry's weight rank in its token is R or lower
+    const int tid = threadIdx.x;
+    bool miss = false;
+    int32_t e = -1;
+    if (tid < n) {
+        e = ids[tid];
+        s_ids[tid] = e;
+        const float wi = w[tid];
+        const int base = tid - tid % k;
+        int rank = 0;
+        for (int j = 0; j < k; ++j) {
+            const float wj = w[base + j];
+            rank += wj > wi || (wj == wi && base + j < tid);
+        }
+        s_tail[tid] = rank >= R;
+        if (e >= 0 && e < n_expert) {
+            bool in = false;
+            for (int q = 0; q < held.n; ++q) in |= held.t[q][e] >= 0;
+            miss = !in;
+        }
+    }
+    __syncthreads();
+    bool drop = miss;
+    for (int j = 0; drop && j < n; ++j)
+        if (s_ids[j] == e && !s_tail[j]) drop = false;
+    const int n_miss = __syncthreads_count(miss), n_drop = __syncthreads_count(drop);
+    if (drop) {
+        ids[tid] = -1;
+        w[tid] = 0.0f;
+    }
+    if (counts != nullptr && tid == 0) {
+        atomicAdd(&counts[0], (unsigned long long) n);
+        atomicAdd(&counts[1], (unsigned long long) n_miss);
+        atomicAdd(&counts[2], (unsigned long long) n_drop);
+    }
+}
+}  // namespace
+
+void route_tail_skip(int32_t* ids, float* weights, const ResidentTabs& held, int n_entries, int k, int rank, int n_expert,
+                     unsigned long long* counts, void* stream) {
+    if (rank < 1 || rank >= k || n_entries < 1 || n_entries > kResidentPlanMax || k < 1) return;
+    route_tail_skip_kernel<<<1, kResidentPlanMax, 0, (cudaStream_t) stream>>>(ids, weights, held, n_entries, k, rank,
+                                                                              n_expert, counts);
+    check("route_tail_skip");
+}
+
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err) {

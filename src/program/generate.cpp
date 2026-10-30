@@ -3729,6 +3729,7 @@ int main(int argc, char** argv) {
         vh.slot_off = xcache.slot_offsets();   // the device plan's pointers
         vh.n_slots = xcache.slots();
         ver.set_cpu_warm(drive.d.pool, drive.d.src);
+        ver.set_route_tail_skip(o.route_tail_skip);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
             return fatal_start_error(err);
         }

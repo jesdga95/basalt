@@ -1615,6 +1615,13 @@ class StartFailureLog(unittest.TestCase):
         self.assertIsNone(engine_error("basalt error: "))
         self.assertIsNone(engine_error("basalt warning: x"))
 
+    def test_route_warnings_reach_the_start_output(self):
+        from serve.engine.progress import engine_warning
+        self.assertEqual(
+            engine_warning("basalt: warning: route-tail-skip 7: skips low-ranked experts the GPU does not hold; "
+                           "output is less accurate than the model"),
+            "route-tail-skip 7: skips low-ranked experts the GPU does not hold; output is less accurate than the model")
+
     def test_marked_lines_of_any_area(self):
         from serve.engine.progress import engine_error, engine_ram_floor, engine_warning, start_errors
         self.assertEqual(engine_error("basalt generate: error: the weight arena failed"), "the weight arena failed")

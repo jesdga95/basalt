@@ -14,6 +14,7 @@
 namespace basalt::program::cli {
 namespace {
 constexpr float kRelaxedDraftingDefault = 0.5f;
+constexpr int kRouteTailSkipDefault = 7;
 }
 
 std::optional<int> parse_options(int argc, char** argv, Options& o, std::string& ppl_base, std::string& ppl_out) {
@@ -123,6 +124,18 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
                     ++i;
                     if (!(v > 0.0f && v <= 1.0f)) { basalt::log::error("basalt", "--relaxed-drafting: P must be in (0, 1]"); return 2; }
                     o.relaxed_drafting = v;
+                }
+            }
+        }
+        else if (a == "--route-tail-skip") {   // the value is optional: an integer 1..9 when one follows
+            o.route_tail_skip = kRouteTailSkipDefault;
+            if (i + 1 < argc) {
+                char* e = nullptr;
+                const long v = std::strtol(argv[i + 1], &e, 10);
+                if (e != argv[i + 1] && *e == '\0') {
+                    ++i;
+                    if (v < 1 || v > 9) { basalt::log::error("basalt", "--route-tail-skip: R must be 1..9"); return 2; }
+                    o.route_tail_skip = (int) v;
                 }
             }
         }
@@ -248,6 +261,9 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         }
         }
     }
+    if (o.route_tail_skip > 0)
+        basalt::log::warn("basalt", "route-tail-skip %d: skips low-ranked experts the GPU does not hold; output is less accurate than the model",
+                          o.route_tail_skip);
     return std::nullopt;
 }
 

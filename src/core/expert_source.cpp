@@ -2125,7 +2125,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (any_cpu) {
         // a token whose experts all run on a GPU (CUDA0, the peer or a helper) needs no CPU activation
         for (int64_t t = 0; t < n_tok; ++t) {
-            if (std::all_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v >= 0; })) continue;
+            bool cpu = false;   // an id of -1 (dropped by the route tail skip) needs no activation
+            for (int64_t j = t * k; j < (t + 1) * k; ++j) cpu |= kind[j] < 0 && ids[j] >= 0;
+            if (!cpu) continue;
             if (native && basalt::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
                 act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
             else if (native)
@@ -2141,6 +2143,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             const int64_t i = t * k + j;
             const int64_t e = ids[i];
             float* row = out + (size_t) i * H;
+            if (e < 0 && ext) {             // dropped by the route tail skip: no work, no contribution
+                std::memset(row, 0, (size_t) H * sizeof(float));
+                continue;
+            }
             if (e < 0 || e >= d.n_expert) {
                 d.failed = true;
                 d.fail = "a routed expert id is out of range";

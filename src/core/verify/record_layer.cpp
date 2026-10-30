@@ -311,6 +311,15 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         mb.logits = v_.logits_ + t * NE; mb.ids = v_.ids_ + t * K; mb.weights = v_.w_ + t * K;
         if (!moe_route(wt, g, l, K, mb, v_.mixed_ + t * N, cs, err, nullptr)) return false;
     }
+    if (dm && v_.route_tail_skip_ > 0 && n * (int) K <= kDmCap) {   // opt-in: drop the tail experts no GPU holds
+        ResidentTabs held;
+        held.add(v_.dm_->res0 + l * g.n_expert);
+        if (v_.dm_->pdev >= 0) held.add(v_.dm_->res1 + l * g.n_expert);
+        for (const DecMoe::XPeer& x : v_.dm_->xp) held.add(x.res + l * g.n_expert);
+        PdlScope pt(false);
+        route_tail_skip(v_.ids_, v_.w_, held, n * (int) K, (int) K, v_.route_tail_skip_, (int) g.n_expert,
+                        v_.dm_->route_counts, cs);
+    }
     if (dm) {   // the tiers, CUDA0's plan, the q8_1 rows and the rings in one launch
         DmRouteArgs ra;
         ra.ids = v_.ids_; ra.x = xm; ra.n_tok = n; ra.k = (int) K; ra.n_embd = (int) N;

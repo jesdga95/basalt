@@ -127,6 +127,11 @@ public:
     /// the next layer's CPU experts (its router on this layer's FFN input) and read the likeliest into their caches.
     /// Before init; only with the device-planned MoE tail.
     void set_cpu_warm(basalt::kernels::cpu::ExpertPool* pool, ExpertSource* src) { warm_pool_ = pool; warm_src_ = src; }
+    /// Opt-in routing changes, each of which changes the output; before init, and only with the device-planned MoE
+    /// tail (otherwise init switches them off).  Route tail skip: see `kernels::route_tail_skip` (0 = off).
+    void set_route_tail_skip(int rank) { route_tail_skip_ = rank; }
+    /// What the routing changes did since the start, one line each; empty when none applied.
+    std::vector<std::string> route_report() const;
 
     /// The watchdog's view of the window in flight: the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
@@ -609,6 +614,7 @@ private:
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block
     GpuPlanSink sink_;
+    int route_tail_skip_ = 0;
     uint32_t cur_layer_ = 0;
     static void publish_plan(void* ctx);
     void set_plan_slot();
