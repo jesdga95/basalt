@@ -40,7 +40,6 @@ struct Context {
     const bool& peer_streamed_share;
     std::vector<int64_t>& split_at;
     std::vector<int>& split_devs;
-    bool& split_same;
     bool& multi_gpu;
     const bool& pipe_want;
     const bool& no_spec;

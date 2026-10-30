@@ -45,7 +45,7 @@ Flow Request::read_prompt() {
     runtime_.drive.d.pcie_num = std::max(0, std::min(256, (int) (runtime_.o.pcie_frac * 256.0 + 0.5)));
     // a layer split: CUDA0's share; a later GPU keeps its own (its link)
     for (int st = 0; st < runtime_.split_drive.n; ++st)
-        runtime_.split_drive.pcie_num[st] = (st == 0 || runtime_.split_same)
+        runtime_.split_drive.pcie_num[st] = st == 0
                                        ? runtime_.drive.d.pcie_num : runtime_.pcie_num_of(runtime_.stages[(size_t) st - 1]->pcie_frac);
     hist_n = std::min(req_sp.penalty_last_n, runtime_.kPenaltyWindowCap);
     runtime_.ver.set_history(hist_n > 0 ? runtime_.d_hist : nullptr, hist_n);

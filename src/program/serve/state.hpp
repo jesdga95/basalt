@@ -209,7 +209,6 @@ private:
     basalt::core::VerifyHits vh{};
     // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
     // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
-    basalt::core::Verifier ver_same{};
     SplitDrive split_drive{};
     SplitDrive split_drive_b{};
     basalt::core::Verifier ver_b{};   // pipelined windows: the second chain over the same sessions (stage 0)

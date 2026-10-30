@@ -177,12 +177,9 @@ struct Options {
     /// Stop when the model emits an end-of-turn token (<|endoftext|> 248044, <|im_end|> 248046, or --eos-ids).
     bool stop_eos = false;
     std::vector<int64_t> eos_ids = {248044, 248046};
-    /// --serve, multi-GPU layer split: "K" or "K1,K2,.." (the first layer of each later stage) or "auto" (placed
-    /// from each GPU's free VRAM); empty = one GPU
+    /// "auto" when the multi-GPU plan picks a layer split (--serve; the stages placed from each GPU's free VRAM);
+    /// empty = no split
     std::string layer_split;
-    /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
-    /// GPU, sharing everything - the bit-exact A/B of the hand-off)
-    std::string split_device;
     /// --gpu: the cards this run uses (gpu_select.hpp); empty = GPU 0 alone.  --gpu-plan prints the choice and exits.
     std::string gpu;
     bool gpu_plan = false;
