@@ -12,7 +12,7 @@
 
 namespace basalt::kernels {
 
-constexpr int kMidChainMaxT = 4;
+constexpr int kMidChainMaxT = 8;
 
 struct MidChainArgs {
     int T = 0;                       ///< window rows, 1..kMidChainMaxT

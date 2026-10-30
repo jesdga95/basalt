@@ -292,7 +292,7 @@ int main(int argc, char** argv) {
                     if (it == 0) got[T] = g;
                 }
             }
-            // a row's outputs do not depend on the window width: the T = 4 launch against each shorter launch's rows
+            // a row's outputs do not depend on the window width: the widest launch against each shorter launch's rows
             size_t prefix = 0;
             for (int T = 1; T < TM; ++T)
                 for (size_t k = 0; k < outs.size(); ++k) {
@@ -301,7 +301,7 @@ int main(int argc, char** argv) {
                 }
             for (int T = 1; T < TM; ++T)   // the recurrence's q8_1 rows (token-major)
                 for (size_t j = 0; j < (size_t) T * (ZV / 32) * 36; ++j) prefix += got[T][outs.size()][j] != got[TM][outs.size()][j];
-            std::printf("grid %3d types %2d/%2d/%2d %s: T1-T4 x%d vs %s %zu differing bytes, T-prefix %zu\n", gr, w.tq, w.tz, w.to, alias ? "yq in xq" : "yq apart", iters, unf ? "today's kernels" : "the device's grid", tot, prefix);
+            std::printf("grid %3d types %2d/%2d/%2d %s: T1-T%d x%d vs %s %zu differing bytes, T-prefix %zu\n", gr, w.tq, w.tz, w.to, alias ? "yq in xq" : "yq apart", TM, iters, unf ? "today's kernels" : "the device's grid", tot, prefix);
             if (tot) { std::printf("  differing bytes by output:"); for (size_t k = 0; k < ref_names_n(outs.size()); ++k) std::printf(" %s %zu", k < outs.size() ? outs[k].name : "yq", perk[k]); std::printf("\n"); }
             bad += (int) (tot + prefix);
         }
@@ -309,11 +309,10 @@ int main(int argc, char** argv) {
 
     grid = 0;
     // the projections against a double-precision CPU reference (Q6_K, then the Q8_0 triple), from the q8_1 rows the kernels read
-    for (const size_t li : {(size_t) 0, layers.size() - 1}) {
+    for (const size_t li : {(size_t) 0, layers.size() - 1}) for (const int T : {3, TM}) {
         const Layer& w = layers[li];
         const bool q8 = w.tq == 8;
         const int sbb = q8 ? 272 : 210;
-        const int T = 3;
         reset(); run(w, T, true, true, s); CK(cudaStreamSynchronize(s));
         std::vector<uint8_t> xq((size_t) T * (N / 32) * 36);
         CK(cudaMemcpy(xq.data(), b.xq1, 0, cudaMemcpyDeviceToHost));   // (rows are overwritten by the recurrence's output: rebuild below)
@@ -354,7 +353,7 @@ int main(int argc, char** argv) {
             proj(w.ho, 2560, NO_IN, yq, t, y);
             for (int r = 0; r < 2560; ++r) { e_o = std::max(e_o, std::fabs(y[r] - bo[(size_t) t * N + r])); n_o = std::max(n_o, std::fabs(y[r])); }
         }
-        std::printf("CPU double reference (%s, T=3, vs the q8_1 rows the kernel reads): max abs error qkv %.3g (max |y| %.3g), z %.3g (%.3g), out %.3g (%.3g)\n", q8 ? "Q8_0" : "Q6_K", e_q, n_q, e_z, n_z, e_o, n_o);
+        std::printf("CPU double reference (%s, T=%d, vs the q8_1 rows the kernel reads): max abs error qkv %.3g (max |y| %.3g), z %.3g (%.3g), out %.3g (%.3g)\n", q8 ? "Q8_0" : "Q6_K", T, e_q, n_q, e_z, n_z, e_o, n_o);
         if (e_q > 1e-3 * n_q || e_z > 1e-3 * n_z || e_o > 1e-3 * n_o) { std::printf("CPU reference: too far\n"); ++bad; }
     }
 
@@ -362,66 +361,67 @@ int main(int argc, char** argv) {
     // `nl` layers with PDL; the middle is the three kernels, mid_chain, nothing (the two reads alone), the pair alone of
     // each (the risk gate's pair phase)
     for (const int tt : {14, 8}) {
-        const int T = 3;
         const int NCOLD = 48;
         std::vector<Layer> cold;
         for (int i = 0; i < NCOLD; ++i) cold.push_back(make_layer(tt, tt, tt, false));
-        const Layer& hot = tt == 8 ? layers.back() : layers[0];
-        std::printf("%s triple:\n", tt == 8 ? "Q8_0" : "Q6_K");
-        const double bytes = (double) NQ * 10 * sb_bytes(tt) + (double) NZ * 10 * sb_bytes(tt) + 2560.0 * (NO_IN / 256) * sb_bytes(tt);
-        const double state_bytes = (double) S * HV * S * 4 + (double) C * 3 * 4;
-        cudaEvent_t e0, e1;
-        CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
-        enum Mode { kNone, kOld, kMid, kOldPair, kMidPair };
-        const char* names[] = {"the two reads alone", "today's 3 kernels", "mid_chain", "today's pair alone", "mid_chain's pair alone"};
-        auto layer_seq = [&](const Layer& w, Mode m, int idx, cudaStream_t st) {
-            K::PdlScope ps(true, false);
-            K::hc_fused_read(hcargs(0, T), st);
-            if (m == kOld) {
-                K::DecRecArgs ra = w.rec; ra.yq = b.xq1;
-                K::dense_tc_pair(w.tq, w.wq, b.qkv, NQ, w.tz, w.wz, b.z, NZ, b.xq1, N, T, st);
-                K::dec_gdn_rec(ra, T, st);
-                K::dense_tc(w.to, w.wo, b.xq1, b.bo2, NO_IN, 2560, T, st);
-            } else if (m == kOldPair) {
-                K::dense_tc_pair(w.tq, w.wq, b.qkv, NQ, w.tz, w.wz, b.z, NZ, b.xq1, N, T, st);
-            } else if (m == kMid || m == kMidPair) {
-                K::MidChainArgs a = mid_args(w, T, true);
-                a.ord = idx; a.pair_only = m == kMidPair;
-                K::PdlScope pm(true, idx == 0);
-                K::mid_chain(a, st);
+        for (const int T : {3, 5, TM}) {
+            const Layer& hot = tt == 8 ? layers.back() : layers[0];
+            std::printf("%s triple, T=%d:\n", tt == 8 ? "Q8_0" : "Q6_K", T);
+            const double bytes = (double) NQ * 10 * sb_bytes(tt) + (double) NZ * 10 * sb_bytes(tt) + 2560.0 * (NO_IN / 256) * sb_bytes(tt);
+            const double state_bytes = (double) S * HV * S * 4 + (double) C * 3 * 4;
+            cudaEvent_t e0, e1;
+            CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+            enum Mode { kNone, kOld, kMid, kOldPair, kMidPair };
+            const char* names[] = {"the two reads alone", "today's 3 kernels", "mid_chain", "today's pair alone", "mid_chain's pair alone"};
+            auto layer_seq = [&](const Layer& w, Mode m, int idx, cudaStream_t st) {
+                K::PdlScope ps(true, false);
+                K::hc_fused_read(hcargs(0, T), st);
+                if (m == kOld) {
+                    K::DecRecArgs ra = w.rec; ra.yq = b.xq1;
+                    K::dense_tc_pair(w.tq, w.wq, b.qkv, NQ, w.tz, w.wz, b.z, NZ, b.xq1, N, T, st);
+                    K::dec_gdn_rec(ra, T, st);
+                    K::dense_tc(w.to, w.wo, b.xq1, b.bo2, NO_IN, 2560, T, st);
+                } else if (m == kOldPair) {
+                    K::dense_tc_pair(w.tq, w.wq, b.qkv, NQ, w.tz, w.wz, b.z, NZ, b.xq1, N, T, st);
+                } else if (m == kMid || m == kMidPair) {
+                    K::MidChainArgs a = mid_args(w, T, true);
+                    a.ord = idx; a.pair_only = m == kMidPair;
+                    K::PdlScope pm(true, idx == 0);
+                    K::mid_chain(a, st);
+                }
+                K::hc_fused_read(hcargs(1, T), st);
+            };
+            for (int cold_run = 0; cold_run < 2; ++cold_run) {
+                const std::vector<Layer>& set = cold_run ? cold : std::vector<Layer>(NCOLD, hot);
+                double us[5] = {};
+                for (int m = 0; m < 5; ++m) {
+                    reset();
+                    cudaGraph_t g; cudaGraphExec_t ge;
+                    CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal));
+                    for (int i = 0; i < NCOLD; ++i) layer_seq(set[i], (Mode) m, i, s);
+                    CK(cudaStreamEndCapture(s, &g));
+                    CK(cudaGraphInstantiate(&ge, g, 0));
+                    for (int i = 0; i < 3; ++i) CK(cudaGraphLaunch(ge, s));
+                    CK(cudaStreamSynchronize(s));
+                    const int reps = 20;
+                    CK(cudaEventRecord(e0, s));
+                    for (int i = 0; i < reps; ++i) CK(cudaGraphLaunch(ge, s));
+                    CK(cudaEventRecord(e1, s));
+                    CK(cudaEventSynchronize(e1));
+                    float ms = 0;
+                    CK(cudaEventElapsedTime(&ms, e0, e1));
+                    us[m] = 1e3 * ms / reps / NCOLD;
+                    CK(cudaGraphExecDestroy(ge)); CK(cudaGraphDestroy(g));
+                }
+                std::printf("T=%d %s (graph of %d layers, PDL, per layer incl. the two reads):\n", T, cold_run ? "cold" : "hot ", NCOLD);
+                for (int m = 0; m < 5; ++m)
+                    std::printf("  %-24s %7.2f us   increment over the reads %7.2f us%s\n", names[m], us[m], us[m] - us[kNone],
+                                m == 0 ? "" : (m == kOld || m == kMid) ? "" : "");
+                const double inc_old = us[kOld] - us[kNone], inc_mid = us[kMid] - us[kNone];
+                std::printf("  3 kernels %.2f us -> %.1f GB/s of %.1f MB (+%.1f MB state); mid_chain %.2f us -> %.1f GB/s; mid / 3 kernels %.1f%%; pair phase mid / today %.1f%%\n", inc_old,
+                            bytes / inc_old / 1e3, bytes / 1e6, state_bytes / 1e6, inc_mid, bytes / inc_mid / 1e3, 100.0 * inc_mid / inc_old,
+                            100.0 * (us[kMidPair] - us[kNone]) / (us[kOldPair] - us[kNone]));
             }
-            K::hc_fused_read(hcargs(1, T), st);
-        };
-        for (int cold_run = 0; cold_run < 2; ++cold_run) {
-            const std::vector<Layer>& set = cold_run ? cold : std::vector<Layer>(NCOLD, hot);
-            double us[5] = {};
-            for (int m = 0; m < 5; ++m) {
-                reset();
-                cudaGraph_t g; cudaGraphExec_t ge;
-                CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal));
-                for (int i = 0; i < NCOLD; ++i) layer_seq(set[i], (Mode) m, i, s);
-                CK(cudaStreamEndCapture(s, &g));
-                CK(cudaGraphInstantiate(&ge, g, 0));
-                for (int i = 0; i < 3; ++i) CK(cudaGraphLaunch(ge, s));
-                CK(cudaStreamSynchronize(s));
-                const int reps = 20;
-                CK(cudaEventRecord(e0, s));
-                for (int i = 0; i < reps; ++i) CK(cudaGraphLaunch(ge, s));
-                CK(cudaEventRecord(e1, s));
-                CK(cudaEventSynchronize(e1));
-                float ms = 0;
-                CK(cudaEventElapsedTime(&ms, e0, e1));
-                us[m] = 1e3 * ms / reps / NCOLD;
-                CK(cudaGraphExecDestroy(ge)); CK(cudaGraphDestroy(g));
-            }
-            std::printf("T=%d %s (graph of %d layers, PDL, per layer incl. the two reads):\n", T, cold_run ? "cold" : "hot ", NCOLD);
-            for (int m = 0; m < 5; ++m)
-                std::printf("  %-24s %7.2f us   increment over the reads %7.2f us%s\n", names[m], us[m], us[m] - us[kNone],
-                            m == 0 ? "" : (m == kOld || m == kMid) ? "" : "");
-            const double inc_old = us[kOld] - us[kNone], inc_mid = us[kMid] - us[kNone];
-            std::printf("  3 kernels %.2f us -> %.1f GB/s of %.1f MB (+%.1f MB state); mid_chain %.2f us -> %.1f GB/s; mid / 3 kernels %.1f%%; pair phase mid / today %.1f%%\n", inc_old,
-                        bytes / inc_old / 1e3, bytes / 1e6, state_bytes / 1e6, inc_mid, bytes / inc_mid / 1e3, 100.0 * inc_mid / inc_old,
-                        100.0 * (us[kMidPair] - us[kNone]) / (us[kOldPair] - us[kNone]));
         }
     }
     // the phase ledger of mid_chain (cold weights, a graph of distinct layers with PDL, the stamping instances): times in us
