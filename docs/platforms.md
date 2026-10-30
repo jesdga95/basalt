@@ -34,7 +34,8 @@ behind one declaration, and a test in `tests/platform/` that runs on both.
 | Win32 | `win.hpp` | the only inclusion of `windows.h` |
 
 Programs that take paths carry a manifest (`src/platform/basalt.exe.manifest`) that makes the
-process code page UTF-8 and lifts the path length limit.
+process code page UTF-8. A path past the plain Win32 length limit is opened in its `\\?\` form, so it works with the
+system's long-path policy on or off.
 
 ## Windows limitations
 

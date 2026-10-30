@@ -165,23 +165,28 @@ int seam_cases() {
     return failures;
 }
 
-/// A path longer than the 260 the legacy API refuses. `longPathAware` in the manifest is what lets the OS open it;
-/// a CRT that caps its own path handling still refuses, and that is reported rather than assumed.
+/// A path longer than the 260 the legacy API refuses, created and opened through the seams. It has to open with the
+/// system's long-path policy off as well as on: the manifest's `longPathAware` counts only where the policy is on.
 int long_path_case() {
     const std::string base = fixture_dir() + "/deep";
     std::string dir = base;
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    for (int i = 0; i < 8; ++i) {
-        dir += "/\xc3\xa9\xe6\x97\xa5\xd0\x96-dir-" + std::string(20, (char) ('a' + i));
-        std::filesystem::create_directories(dir, ec);
-    }
+    for (int i = 0; i < 8; ++i) dir += "/\xc3\xa9\xe6\x97\xa5\xd0\x96-dir-" + std::string(20, (char) ('a' + i));
+    check(basalt::platform::make_dirs(dir), "a directory past 260 chars is created");
     const std::string file = dir + "/\xc3\xa9-\xe6\x97\xa5.basalt";
     const std::vector<uint8_t> bytes = pattern(1024);
     const bool wrote = write_file(file, bytes);
     std::printf("path_utf8 %-56s %zu chars\n", "path length", file.size());
     check(wrote && read_file(file, bytes), "a path past 260 chars opens");
-    std::filesystem::remove_all(base, ec);
+    // The tree's own paths are long, so the removal walks it through the prefixed form of its root.
+#if defined(_WIN32)
+    const std::wstring abs = std::filesystem::absolute(basalt::platform::to_wide(base)).make_preferred().wstring();
+    const std::filesystem::path root(L"\\\\?\\" + abs);
+#else
+    const std::filesystem::path root(base);
+#endif
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    check(!ec && !std::filesystem::exists(root, ec), "the directory past 260 chars is removed");
     return failures;
 }
 

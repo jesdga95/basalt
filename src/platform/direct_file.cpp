@@ -196,7 +196,7 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     close();
     // NO_BUFFERING: the cache manager never holds these pages, so the table cannot grow into RAM.
     // RANDOM_ACCESS: no read-ahead. OVERLAPPED: many reads in flight, completed through the port below.
-    impl_->file = CreateFileW(to_wide(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+    impl_->file = CreateFileW(to_wide_path(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                               FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
     if (impl_->file == INVALID_HANDLE_VALUE) {
         err = "DirectFile: cannot open " + path + " (error " + std::to_string(GetLastError()) + ")";

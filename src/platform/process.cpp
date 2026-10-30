@@ -120,7 +120,7 @@ bool spawn_piped(const std::vector<std::string>& argv, const std::string& stderr
     (void) SetHandleInformation(rd_out, HANDLE_FLAG_INHERIT, 0);
     // The share mode is what lets the log be read while the run is going on; a share mode of 0 keeps it closed
     // to any other process until the child exits. `sa` (bInheritHandle) is what hands the handle to the child.
-    HANDLE log = CreateFileW(to_wide(stderr_path).c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, &sa,
+    HANDLE log = CreateFileW(to_wide_path(stderr_path).c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, &sa,
                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     const HANDLE std_handles[3] = {rd_in, wr_out, log != INVALID_HANDLE_VALUE ? log : wr_out};
     const HANDLE proc = start(argv, std_handles);
