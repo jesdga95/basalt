@@ -105,6 +105,7 @@ struct Context {
     int& split_stages;
     uint64_t& tier_file_bytes;
     std::function<void()> report_expert_tiers;
+    std::function<void()> price_stream_all;
 };
 
 // Host RAM a server takes while it serves, beyond what it holds once ready: the conversation checkpoints (the solo

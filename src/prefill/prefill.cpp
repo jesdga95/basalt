@@ -1,5 +1,6 @@
 // src/prefill/prefill.cpp - see include/basalt/prefill/prefill.hpp.
 #include "basalt/prefill/prefill.hpp"
+#include "basalt/prefill/stream_all.hpp"
 #include "basalt/core/mtp.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/core/diag.hpp"
@@ -74,9 +75,8 @@ inline int ahead_slots(size_t T) { return (int) std::min<size_t>(kAheadSlots, T 
 // ring_slots()-slot ring (nearly every expert is routed at such a chunk), so the copy engine keeps working through the
 // attention halves instead of waiting for each layer's routing.
 constexpr int RING_MAX = 384;           // the arrays; the ring itself is ring_slots()
-// The chunk size from which every expert streams: below it only the routed experts are staged.  Staging every
-// non-resident expert costs the same whatever the chunk, so it pays only once most of them are routed anyway.
-int64_t g_stream_all_min = 6144;
+// The chunk size from which every expert streams: below it only the routed experts are staged (stream_all.hpp).
+int64_t g_stream_all_min = kStreamAllDefault;
 inline int64_t stream_all_min() { return g_stream_all_min; }
 // The streamed ring's slots (one whole expert blob each, the same for every pack).  g_ring_depth caps the depth the
 // next layout is laid out with (a prompt read beside decoding slots lends fewer cache slots with a shallower ring).
