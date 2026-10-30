@@ -52,6 +52,10 @@ process code page UTF-8 and lifts the path length limit.
   the process.
 - A display-attached GPU is subject to the driver's timeout recovery (TDR). Raise `TdrDelay` under
   `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers` if long kernels are reset.
+- A card that also drives the desktop has free VRAM that moves by a few MiB between starts, so the
+  auto-sized expert cache can land on a different slot count and greedy output can differ from run
+  to run. For reproducible output (`tools/greedy_identity.py`), pin `expert-cache` and raise
+  `vram-reserve-mib`.
 - Quality has not been measured on Windows. No perplexity or KL-divergence run exists for it;
   [precision/builds.md](precision/builds.md) has the compiler-parity checks. There are no
   headline benchmark numbers for Windows.
