@@ -209,6 +209,7 @@ public:
 
 
 private:
+    struct Run;
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
