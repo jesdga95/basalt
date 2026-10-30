@@ -235,7 +235,8 @@ Flow Request::complete() {
                              "%.1f MB read", (long long) req_hits, (long long) runtime_.src.ram_reads(),
                      (long long) runtime_.src.file_reads(), (double) runtime_.src.file_read_bytes() / 1e6);
     if (runtime_.g.n_qsa_layers() > 0 && runtime_.ss.qsa_states[runtime_.ss.qsa_primary()].kv_mode == 1) {
-        // KV streaming, cumulative over the process: blocks the selections named vs blocks read from RAM
+        // KV streaming since the residency map was last reset (a mode switch, a restore, a new conversation):
+        // blocks the selections named vs blocks read from RAM
         // (this device's owned ordinals; a split's other stages hold theirs)
         uint64_t miss = 0, look = 0;
         bool over = false;

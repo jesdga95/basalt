@@ -28,6 +28,10 @@ public:
     /// Array `i` is a table, not a cache: every byte `map` backs is filled from `bytes` (from the same offset)
     /// instead of zeroed, as far as `bytes` reaches.
     void set_contents(size_t i, std::vector<uint8_t> bytes);
+    /// Array `i` backs at most its first `pages` pages whatever `map` asks for (a streamed state's slot pool, while
+    /// the rows that follow the depth keep growing); `pages <= 0` lifts the cap.  A lower cap gives its excess back
+    /// at the next `unmap`.  `cells()` counts a capped array as covering every cell once its cap is backed.
+    void cap(size_t i, int64_t pages);
     void close();
     bool valid() const { return !arrays_.empty(); }
 
@@ -57,6 +61,7 @@ private:
         uint64_t page_bytes = 0;
         uint64_t tail_bytes = 0;
         uint64_t reserved = 0;
+        int64_t cap_pages = 0;          // > 0: backs at most this many pages
         std::vector<uint8_t> contents;
         std::vector<Extent> extents;   // back to back from offset 0
         uint64_t mapped() const { return extents.empty() ? 0 : extents.back().off + extents.back().bytes; }

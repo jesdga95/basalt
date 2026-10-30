@@ -415,6 +415,8 @@ int64_t g_kv_resident = 0;
 uint64_t g_kv_host_bytes = 0;
 // the elastic KV's floor (0: off)
 int64_t g_kv_elastic = 0;
+// the slot pool an elastic state keeps when it streams (cells; 0: elastic states cannot stream)
+int64_t g_kv_host = 0;
 
 /// How one state holds its K/V: `mode` as in QsaState::kv_mode, `slots` VRAM pages of `pages` logical ones.
 struct KvPlan {
@@ -441,6 +443,13 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
 // idx_block cells, so they page with the K/V only when a page holds a whole number of rows.
 bool kv_elastic_state(const QsaShapes& s, const KvPlan& p) {
     return g_kv_elastic > 0 && p.mode == 0 && s.idx_block > 0 && s.page_size % s.idx_block == 0;
+}
+// The slot pages an elastic state can stream with (0: it cannot): whole pages of g_kv_host cells (the server keeps them
+// backed while the state streams), never more than the state's pages; the hybrid K8V4 layout has no streamed form.
+int64_t kv_host_slots(const QsaShapes& s, const KvPlan& p, bool hybrid) {
+    if (g_kv_host <= 0 || hybrid || !kv_elastic_state(s, p)) return 0;
+    const int64_t slots = std::min<int64_t>(p.pages, g_kv_host / s.page_size);
+    return slots * s.page_size >= qsa_kv_resident_min() ? slots : 0;   // one verify window's selections must fit
 }
 uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8) {
     if (hybrid) {   // K8V4: the INT8 K half (codes + scales) plus the Q4_0 V half (kv_q4.hpp's rotation)
@@ -588,6 +597,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.map.page_table = st.page_table;
     st.map.n_blocks = pages;
     st.map.n_slots = p.slots;
+    // a switchable state's residency map is made by its switch to streaming (qsa_state_set_mode)
+    st.host_slots = st.kv_arena != nullptr ? kv_host_slots(s, p, st.kv_hybrid) : 0;
+    st.host_map = nullptr;
     if (p.mode == 1) {
         st.map.slot_block = c.take<int32_t>((uint64_t) p.slots);
         st.map.slot_stamp = c.take<int32_t>((uint64_t) p.slots);
@@ -619,6 +631,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     }
     // KV streaming: the authoritative K/V of every cell, pinned and device-mapped, in the identity layout
     st.host = basalt::kernels::KvHostPools{};
+    st.host_cells = 0;
     if (p.mode != 0) {
         const uint64_t hrows = (uint64_t) pages * s.n_head_kv * s.page_size;
         const uint64_t bytes = (uint64_t) pages * basalt::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
@@ -634,6 +647,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             return 0;
         }
         g_kv_host_bytes += bytes;
+        st.host_cells = pages * s.page_size;
         Cursor hc{d};
         if (st.kv_q4) {
             st.host.k_q4 = hc.take<uint8_t>(hrows * q4_row);
@@ -681,8 +695,148 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
 
 void qsa_set_kv_elastic(int64_t floor_cells) { g_kv_elastic = floor_cells > 0 ? floor_cells : 0; }
 int64_t qsa_kv_elastic() { return g_kv_elastic; }
+void qsa_set_kv_host(int64_t slot_cells) { g_kv_host = slot_cells > 0 ? slot_cells : 0; }
+int64_t qsa_kv_host() { return g_kv_host; }
+
+namespace {
+// The K/V arrays of a state's arena (the rest are the pooled keys and the rope rows)
+size_t kv_arrays(const QsaState& st) { return st.kv_q4 ? 2 : st.kv_int8 ? 4 : 2; }
+
+// A switchable state's residency map, in VRAM only while it streams
+bool host_map_make(QsaState& st) {
+    if (st.host_map != nullptr) return true;
+    const int64_t n = st.host_slots;
+    void* d = nullptr;
+    if (cudaMalloc(&d, (size_t) basalt::kernels::kv_stream_map_bytes(n) + 6 * 16) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    st.host_map = d;
+    Cursor c{(uint8_t*) d};
+    st.map.slot_block = c.take<int32_t>((uint64_t) n);
+    st.map.slot_stamp = c.take<int32_t>((uint64_t) n);
+    st.map.slot_ref = c.take<int32_t>((uint64_t) n);
+    st.map.miss_block = c.take<int32_t>((uint64_t) n);
+    st.map.miss_slot = c.take<int32_t>((uint64_t) n);
+    st.map.ctl = c.take<int32_t>((uint64_t) basalt::kernels::kKvCtlInts);
+    return true;
+}
+
+// Frees it; `stream` is synchronized first (its queued work may still use the map).
+void host_map_free(QsaState& st, void* stream) {
+    if (st.host_map == nullptr) return;
+    (void) cudaStreamSynchronize((cudaStream_t) stream);
+    (void) cudaFree(st.host_map);
+    st.host_map = nullptr;
+    st.map.slot_block = st.map.slot_stamp = st.map.slot_ref = st.map.miss_block = st.map.miss_slot = st.map.ctl = nullptr;
+}
+}  // namespace
+
+uint64_t qsa_kv_host_layer_bytes(const QsaState& st, const ModelGeometry& g, int64_t cells) {
+    const QsaShapes s = qsa_shapes(g);
+    const int64_t pages = (std::max<int64_t>(cells, 0) + s.page_size - 1) / s.page_size;
+    return (uint64_t) pages * basalt::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
+}
+
+basalt::kernels::KvHostPools qsa_kv_host_carve(const QsaState& st, const ModelGeometry& g, void* base, int64_t cells) {
+    // the same sequence as qsa_state_init's host copy
+    const QsaShapes s = qsa_shapes(g);
+    const int64_t pages = (std::max<int64_t>(cells, 0) + s.page_size - 1) / s.page_size;
+    const uint64_t hrows = (uint64_t) pages * s.n_head_kv * s.page_size;
+    const uint64_t q4_row = basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+    basalt::kernels::KvHostPools h;
+    Cursor hc{(uint8_t*) base};
+    if (st.kv_q4) {
+        h.k_q4 = hc.take<uint8_t>(hrows * q4_row);
+        h.v_q4 = hc.take<uint8_t>(hrows * q4_row);
+    } else if (st.kv_int8) {
+        h.k_q = hc.take<int8_t>(hrows * s.head_dim);
+        h.v_q = hc.take<int8_t>(hrows * s.head_dim);
+        h.k_scale = hc.take<uint16_t>(hrows * (s.head_dim / basalt::kernels::KV_Q8_GROUP));
+        h.v_scale = hc.take<uint16_t>(hrows * (s.head_dim / basalt::kernels::KV_Q8_GROUP));
+    } else {
+        h.k_pool = hc.take<uint16_t>(hrows * s.head_dim);
+        h.v_pool = hc.take<uint16_t>(hrows * s.head_dim);
+    }
+    return h;
+}
+
+void qsa_state_kv_cap(QsaState& st, bool capped) {
+    if (st.kv_arena == nullptr || st.host_slots <= 0) return;
+    for (size_t i = 0; i < kv_arrays(st); ++i) st.kv_arena->cap(i, capped ? st.host_slots : 0);
+}
+
+bool qsa_state_set_mode(QsaState& st, const ModelGeometry& g, int mode, const basalt::kernels::KvHostPools& host,
+                        int64_t host_cells, int64_t live_cells, void* stream, std::string& err) {
+    const QsaShapes s = qsa_shapes(g);
+    if (st.kv_arena == nullptr || st.host_slots <= 0 || st.kv_hybrid ||
+        (st.kv_mode != 0 && st.kv_mode != 1) || (mode != 0 && mode != 1)) {
+        err = "KV mode switch: the state cannot stream (not elastic, no residency map, or a hybrid K8V4 layout)";
+        return false;
+    }
+    if (live_cells < 0 || live_cells > st.max_cells) {
+        err = "KV mode switch: invalid live extent";
+        return false;
+    }
+    const int64_t live_pages = (live_cells + s.page_size - 1) / s.page_size;
+    const int fmt = qsa_kv_format(st);
+    // the VRAM K/V in the identity layout (the page table is not read by the copies)
+    const basalt::kernels::QsaAttnPools vram = qsa_attn_pools(st);
+    if (mode == 1) {
+        if (!host.present() || host_cells < live_pages * s.page_size || host_cells > st.n_pages * s.page_size) {
+            err = "KV mode switch: the host copy does not hold the live cells";
+            return false;
+        }
+        if (st.kv_mode == 0) {
+            if (st.kv_arena->cells() < std::min(live_pages * s.page_size, st.kv_arena->max_cells())) {
+                err = "KV mode switch: the live cells are not backed";
+                return false;
+            }
+            if (!host_map_make(st)) {
+                err = "KV mode switch: no VRAM for the residency map";
+                return false;
+            }
+            basalt::kernels::kv_unstage_to_host(vram, host, fmt, 0, live_pages, s, stream);
+            qsa_state_kv_cap(st, true);
+        }
+        st.kv_mode = 1;
+        st.n_slots = st.host_slots;
+        st.map.n_slots = st.host_slots;
+        st.host = host;
+        st.host_cells = host_cells;
+        basalt::kernels::kv_stream_reset(st.map, stream);
+    } else {
+        if (st.kv_mode == 1) {
+            // the arrays must reach the live cells (uncapped and mapped) before the cells come in
+            if (st.kv_arena->cells() < live_pages * s.page_size) {
+                err = "KV mode switch: the live cells are not backed in VRAM (uncap and map them first)";
+                return false;
+            }
+            for (size_t i = 0; i < kv_arrays(st); ++i)
+                if (st.kv_arena->array(i) == nullptr) { err = "KV mode switch: missing K/V array"; return false; }
+            basalt::kernels::kv_stage_from_host(vram, st.host, fmt, live_pages, s, stream);
+        }
+        qsa_state_kv_cap(st, false);
+        st.kv_mode = 0;
+        st.n_slots = st.n_pages;
+        st.map.n_slots = st.n_pages;
+        st.host = basalt::kernels::KvHostPools{};
+        st.host_cells = 0;
+        basalt::kernels::kv_ring_table(st.page_table, st.n_pages, st.n_pages, stream);   // the identity
+        host_map_free(st, stream);
+    }
+    // the launches above stop the engine on their own errors, so one here is the device's: the state is switched
+    // already and the context is lost, and the engine stops as they do
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        basalt::log::error("basalt", "KV mode switch: %s", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return true;
+}
 
 void qsa_state_release(QsaState& st) {
+    host_map_free(st, nullptr);
     delete st.kv_arena;
     st.kv_arena = nullptr;
 }
@@ -690,8 +844,8 @@ void qsa_state_release(QsaState& st) {
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     const QsaShapes s = qsa_shapes(g);
     cudaStream_t cs = (cudaStream_t) stream;
-    // elastic: only the backed pages (the rest has no memory; mapping more zeroes it)
-    const int64_t pages = st.kv_arena != nullptr ? st.kv_arena->cells() / s.page_size : st.n_slots;
+    // elastic: only the backed pages (the rest has no memory; mapping more zeroes it); streamed: the slot pages
+    const int64_t pages = st.kv_arena != nullptr && st.kv_mode == 0 ? st.kv_arena->cells() / s.page_size : st.n_slots;
     const size_t rows = (size_t) pages * s.n_head_kv * s.page_size;
     if (st.kv_hybrid) {
         cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);

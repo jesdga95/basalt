@@ -395,6 +395,7 @@ bool Runtime::batch_step() {
 }
 
 int Runtime::init_batch() {
+    kv_host_init();
     bs = std::vector<BSlot>((size_t) std::max(o.batch, 0));
     // the real MTP drafts in the batch windows (a draft K/V per slot); the scripted test drive keeps its own
     batch_spec = mtp_on && mtp.main_store() > 0 && o.batch > 0;

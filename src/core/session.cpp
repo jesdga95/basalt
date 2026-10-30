@@ -3,6 +3,7 @@
 #include "basalt/kernels/mrope.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/core/kv_arena.hpp"
+#include "basalt/core/kv_host_pool.hpp"
 
 #include "basalt/kernels/qsa.hpp"
 #include "basalt/kernels/elementwise.hpp"
@@ -11,6 +12,7 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/platform/compiler.hpp"
+#include "basalt/log.hpp"
 
 #include <cuda_runtime.h>
 
@@ -182,6 +184,63 @@ bool session_kv_unmap(SessionState& s, int64_t cells, std::string& err) {
     for (KvArena* a : s.kv_extra)
         if (!a->unmap(cells, err)) return false;
     return true;
+}
+
+bool session_kv_can_stream(const SessionState& s) {
+    if (s.qsa_states == nullptr || s.qsa_alloc <= 0) return false;
+    for (int64_t j = 0; j < s.qsa_alloc; ++j) {
+        const QsaState& st = s.qsa_states[s.qsa_ord0 + j];
+        if (st.host_slots <= 0 || st.kv_arena == nullptr) return false;
+    }
+    return true;
+}
+
+int session_kv_mode(const SessionState& s) {
+    if (s.qsa_states == nullptr || s.qsa_alloc <= 0) return -1;
+    const int m = s.qsa_states[s.qsa_ord0].kv_mode;
+    for (int64_t j = 1; j < s.qsa_alloc; ++j)
+        if (s.qsa_states[s.qsa_ord0 + j].kv_mode != m) return -1;
+    return m;
+}
+
+void session_kv_cap(SessionState& s, bool capped) {
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) qsa_state_kv_cap(s.qsa_states[s.qsa_ord0 + j], capped);
+}
+
+bool session_kv_set_mode(SessionState& s, const ModelGeometry& g, int mode, const KvHostPool* pool, int64_t live_cells,
+                         void* stream, std::string& err) {
+    if (!session_kv_can_stream(s)) { err = "KV mode switch: the session cannot stream"; return false; }
+    if (mode == 1 && (pool == nullptr || !pool->valid() || pool->layers() != s.qsa_alloc)) {
+        err = "KV mode switch: no host K/V for the session";
+        return false;
+    }
+    // what each layer was, to put back what a failure leaves half switched
+    struct Was { int mode; basalt::kernels::KvHostPools host; int64_t host_cells; };
+    std::vector<Was> was;
+    for (int64_t j = 0; j < s.qsa_alloc; ++j) {
+        const QsaState& st = s.qsa_states[s.qsa_ord0 + j];
+        was.push_back({st.kv_mode, st.host, st.host_cells});
+    }
+    int64_t done = 0;
+    for (; done < s.qsa_alloc; ++done) {
+        const basalt::kernels::KvHostPools h = mode == 1 ? pool->layer(done) : basalt::kernels::KvHostPools{};
+        if (!qsa_state_set_mode(s.qsa_states[s.qsa_ord0 + done], g, mode, h, mode == 1 ? pool->cells() : 0, live_cells,
+                                stream, err))
+            break;
+    }
+    if (done < s.qsa_alloc) {
+        std::string ignored;
+        for (int64_t j = 0; j < done; ++j)
+            (void) qsa_state_set_mode(s.qsa_states[s.qsa_ord0 + j], g, was[(size_t) j].mode, was[(size_t) j].host,
+                                      was[(size_t) j].host_cells, live_cells, stream, ignored);
+    }
+    // a failed wait is an execution error: the context is lost, whatever the layers point at now
+    const cudaError_t e = cudaStreamSynchronize((cudaStream_t) stream);
+    if (e != cudaSuccess) {
+        basalt::log::error("basalt", "KV mode switch: %s", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return done == s.qsa_alloc;
 }
 
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream) {

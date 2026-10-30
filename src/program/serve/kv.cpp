@@ -1,5 +1,6 @@
 // src/program/serve/kv.cpp - kv operations.
 #include "state.hpp"
+#include "basalt/program/auto_plan.hpp"
 
 namespace basalt::program::serve {
 
@@ -133,7 +134,25 @@ bool Runtime::cache_regrow(std::string& e) {
     if (!xcache.sync_queued(ferr)) { e = "elastic KV: " + ferr; return false; }
     res_upload();
     relend();
+    // the tail without RAM copies: the experts in slots below the loan again give their RAM homes back
+    if (!kv_tail_copies && src.complement_ready() && src.homes_bytes() > 0) {
+        const int64_t loan_from = pf_parts.empty() || pf_parts[0].first < 0 ? INT64_MAX : pf_parts[0].first;
+        size_t released = 0;
+        for (size_t j = 0; j < host_res.size(); ++j)
+            if (host_res[j] >= 0 && host_res[j] < loan_from &&
+                src.home_release((int64_t) j / g.n_expert, (int64_t) j % g.n_expert))
+                ++released;
+        const uint64_t freed = released > 0 ? src.homes_reclaim() + src.homes_compact() : 0;
+        if (released > 0)
+            basalt::log::info("basalt serve", "elastic KV: %zu RAM homes released, %.0f MiB freed, %.0f MiB kept",
+                              released, (double) freed / 1048576.0, (double) src.homes_bytes() / 1048576.0);
+    }
     return true;
+}
+
+// the cells a session never goes below: the floor, and while it streams its slot pool (the capped K/V arrays)
+int64_t Runtime::kv_keep_cells(const basalt::core::SessionState& s) {
+    return basalt::core::session_kv_mode(s) == 1 ? std::max(kv_floor, kKvHostSlotCells) : kv_floor;
 }
 
 // `shrink` false: only VRAM that is free now (a prompt read is running beside the windows, its loan in the
@@ -142,7 +161,7 @@ bool Runtime::cache_regrow(std::string& e) {
 bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& e, bool shrink, int64_t min_cells) {
     kv_short = false;
     if (kv_floor <= 0) return true;
-    cells = std::min<int64_t>(std::max<int64_t>(cells, kv_floor), s.max_cells);
+    cells = std::min<int64_t>(std::max<int64_t>(cells, kv_keep_cells(s)), s.max_cells);
     int64_t add = (int64_t) basalt::core::session_kv_grow_bytes(s, cells);
     if (add <= 0) return true;
     const auto t0 = Clock::now();
@@ -192,6 +211,17 @@ bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& 
         const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
         const int64_t keep = std::max<int64_t>(0, (xcache.mapped_bytes() - (add - room)) / gran * gran);
         if (kv_keep_routed && !move_routed_below(xcache.slots_after_shrink(keep), "elastic KV", e)) return false;
+        // the tail without RAM copies: when an expert it gives up has no RAM copy, the experts past the cut take
+        // their RAM homes first (with the loan's), so the CPU tier reads them from RAM, not from the file; when
+        // every one has a copy, the loan's homes are left to the request's admission (loan_homes)
+        if (!kv_tail_copies && src.complement_ready() &&
+            basalt::program::cut_gives_up_bare(host_res, xcache.slots_after_shrink(keep), g.n_expert,
+                                               [&](int64_t l, int64_t x) { return src.has_resident(l, x); })) {
+            std::string he;
+            if (!home_given_up(xcache.slots_after_shrink(keep), he))
+                basalt::log::warn("basalt serve", "elastic KV: no RAM homes for the experts the tail gives up "
+                                     "without a copy (%s): they are read from the file", he.c_str());
+        }
         if (!xcache.shrink(keep, e)) return false;
         const int64_t live = xcache.slots();
         for (size_t i = 0; i < host_res.size(); ++i)
@@ -213,7 +243,7 @@ bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& 
 
 bool Runtime::kv_release(basalt::core::SessionState& s, int64_t cells, std::string& e) {
     if (kv_floor <= 0) return true;
-    cells = std::min<int64_t>(std::max<int64_t>(cells, kv_floor), s.max_cells);
+    cells = std::min<int64_t>(std::max<int64_t>(cells, kv_keep_cells(s)), s.max_cells);
     if (basalt::core::session_kv_bytes_for(s, basalt::core::session_kv_cells(s)) <=
         basalt::core::session_kv_bytes_for(s, cells)) return true;
     const auto t0 = Clock::now();

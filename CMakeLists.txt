@@ -281,7 +281,7 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
 # about arithmetic, and this one knows the ORDER the arithmetic happens in.
 add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
   src/core/remote_expert_opt.cu
-  src/core/expert_cache.cpp src/core/vmm.cpp src/core/kv_arena.cpp src/core/native_head.cpp src/core/native_dense.cpp
+  src/core/expert_cache.cpp src/core/vmm.cpp src/core/kv_arena.cpp src/core/kv_host_pool.cpp src/core/native_head.cpp src/core/native_dense.cpp
   src/core/verify/batch_capture.cpp
   src/core/verify/batch_execution.cpp
   src/core/verify/batch_sessions.cpp
@@ -360,6 +360,11 @@ if(BUILD_TESTING)
   target_link_libraries(conversation_validation_test PRIVATE engine)
   basalt_cpu_test(NAME conversation_validation_test COMMAND conversation_validation_test)
   set_tests_properties(conversation_validation_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
+  # the per-request host K/V's arithmetic: the switchable state's carve, the host copy's layout, the switch's refusals
+  add_executable(kv_host_layout_test tests/core/kv_host_layout_test.cpp)
+  target_link_libraries(kv_host_layout_test PRIVATE engine)
+  basalt_cpu_test(NAME kv_host_layout_test COMMAND kv_host_layout_test)
+  set_tests_properties(kv_host_layout_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 60)
   # the disk tier: write, match, cut reads (queued and from the file, in a fresh store), corruption, identity, budget
   add_executable(conversation_store_test tests/core/conversation_store_test.cpp)
   target_link_libraries(conversation_store_test PRIVATE engine)
@@ -421,6 +426,11 @@ if(BUILD_TESTING)
   target_link_libraries(kv_arena_test PRIVATE engine)
   basalt_gpu_test(NAME kv_arena_test COMMAND kv_arena_test)
   set_tests_properties(kv_arena_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  # one elastic QSA state switched between whole-in-VRAM and streamed in place, vs a resident state (bitwise)
+  add_executable(kv_mode_switch_test tests/core/kv_mode_switch_test.cpp)
+  target_link_libraries(kv_mode_switch_test PRIVATE engine)
+  basalt_gpu_test(NAME kv_mode_switch_test COMMAND kv_mode_switch_test)
+  set_tests_properties(kv_mode_switch_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 endif()
 
 # `basalt` (generate.cpp): the engine program that composes the components into a token.  The prompt arrives as
@@ -436,6 +446,7 @@ add_executable(basalt src/program/generate.cpp src/program/engine_local.cpp src/
                        src/program/serve/commands.cpp
                        src/program/serve/conversation.cpp
                        src/program/serve/kv.cpp
+                       src/program/serve/kv_host.cpp
                        src/program/serve/loans.cpp
                        src/program/serve/loan_moves.cpp
                        src/program/serve/memory.cpp

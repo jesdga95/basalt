@@ -204,6 +204,7 @@ private:
     bool read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool& ran, std::string& e);
     bool read_part(int64_t a0, int64_t b0, std::string& e);
     DecSnap dec_snap();
+    bool loan_homes();
     Flow parse();
     Flow prepare_image();
     Flow restore();

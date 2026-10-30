@@ -169,6 +169,22 @@ Flow Request::decode() {
             if (!runtime_.pending.empty()) basalt::core::decode_events().tag(1u << 1);
             runtime_.apply_pending(true);
         }
+        // the host K/V: the next window's cells in the pool before it runs (it grows, or the K/V goes back to the
+        // VRAM tail)
+        if (runtime_.kv_pool.valid() && runtime_.rsp == &runtime_.ss && p + T + 64 > runtime_.kv_pool.cells()) {
+            if (adapt_thr.joinable()) adapt_thr.join();
+            if (copy_live) { runtime_.src.commit_exchanges(); copy_live = false; }   // as at the request's end
+            const int r = runtime_.kv_host_more(p, p + T + 64, max_new - produced_n,
+                                                std::min<int64_t>(runtime_.kv_pool.cells(), p + T + 64), runtime_.err);
+            if (r < 0) {
+                std::printf("ERR %s\n", runtime_.err.c_str());
+                return Flow::error;
+            }
+            if (r == 0) {
+                kv_stop = runtime_.err;
+                break;
+            }
+        }
         // the elastic KV: the next window's cells backed before it runs (between windows, rare)
         if (runtime_.kv_floor > 0 && p + T + 64 > basalt::core::session_kv_cells(*runtime_.rsp)) {
             if (adapt_thr.joinable()) adapt_thr.join();

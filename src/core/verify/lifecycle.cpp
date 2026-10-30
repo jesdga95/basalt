@@ -115,6 +115,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
+    bound_kv_ = kv_key(&ss);
     hits_ = hits;
     head_ = head;
     max_t_ = max_t;

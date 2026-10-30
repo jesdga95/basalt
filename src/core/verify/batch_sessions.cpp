@@ -127,17 +127,23 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     return true;
 }
 
+int Verifier::kv_key(const SessionState* s) const {
+    if (s == nullptr || s->qsa_states == nullptr || g_ == nullptr || g_->n_qsa_layers() <= 0) return 0;
+    return s->qsa_states[s->qsa_primary()].kv_mode;
+}
+
 bool Verifier::bind_session(SessionState* s, std::string& err) {
     if (s == nullptr || ss_ == nullptr) { err = "verify: bind_session without a session"; return false; }
-    if (s == ss_) return true;
+    const int key = kv_key(s);
+    if (s == ss_ && key == bound_kv_) return true;
     if (!wait_commit(err)) return false;   // the last commit still works on the old session's state
     SoloGraphs cur;
     std::copy(std::begin(exec_), std::end(exec_), std::begin(cur.exec));
     std::copy(std::begin(exec_nr_), std::end(exec_nr_), std::begin(cur.exec_nr));
     cur.commit = commit_exec_;
-    solo_sets_[ss_] = cur;
+    solo_sets_[{ss_, bound_kv_}] = cur;
     SoloGraphs nx;
-    const auto it = solo_sets_.find(s);
+    const auto it = solo_sets_.find({s, key});
     if (it != solo_sets_.end()) {
         nx = it->second;
         solo_sets_.erase(it);
@@ -146,6 +152,33 @@ bool Verifier::bind_session(SessionState* s, std::string& err) {
     std::copy(std::begin(nx.exec_nr), std::end(nx.exec_nr), std::begin(exec_nr_));
     commit_exec_ = nx.commit;
     ss_ = s;
+    bound_kv_ = key;
+    return true;
+}
+
+bool Verifier::drop_kv_graphs(int mode, std::string& err) {
+    if (!wait_commit(err)) return false;
+    if (cs_ != nullptr && cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = std::string("verify: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    auto drop = [](SoloGraphs& set) {
+        for (auto& e : set.exec) { if (e) cudaGraphExecDestroy(e); e = nullptr; }
+        for (auto& e : set.exec_nr) { if (e) cudaGraphExecDestroy(e); e = nullptr; }
+        if (set.commit) cudaGraphExecDestroy(set.commit);
+        set.commit = nullptr;
+    };
+    for (auto it = solo_sets_.begin(); it != solo_sets_.end();) {
+        if (it->first.second != mode) { ++it; continue; }
+        drop(it->second);
+        it = solo_sets_.erase(it);
+    }
+    if (bound_kv_ == mode) {
+        for (auto& e : exec_) { if (e) cudaGraphExecDestroy(e); e = nullptr; }
+        for (auto& e : exec_nr_) { if (e) cudaGraphExecDestroy(e); e = nullptr; }
+        if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
+        commit_exec_ = nullptr;
+    }
     return true;
 }
 

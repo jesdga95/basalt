@@ -12,6 +12,22 @@ bool Request::starts_with(const std::vector<int32_t>& pre, const std::vector<Img
     return runtime_.imgs_below(runtime_.req_imgs, L) == pre_imgs;
 }
 
+// the tail without RAM copies: the loan follows the cache's end down as the KV grows, so the experts it reaches
+// below the slots that keep a copy take a home before the prompt is read
+bool Request::loan_homes() {
+    int64_t loan_chunk = 0;
+    if (!runtime_.kv_tail_copies && runtime_.kv_floor > 0 && !in_slot && runtime_.lend_from > 0 &&
+        !runtime_.pf_parts.empty() && runtime_.pf_parts[0].first >= 0 &&
+        runtime_.loan_plan(runtime_.xcache.slots(), loan_chunk) < runtime_.copies_from) {
+        if (!runtime_.kv_drain(runtime_.err)) return false;
+        std::string he;
+        if (!runtime_.home_given_up(runtime_.xcache.slots(), he))
+            basalt::log::warn("basalt serve", "elastic KV: no RAM homes for the loan's experts without a copy "
+                              "(%s): the prompt reads them from the file", he.c_str());
+    }
+    return true;
+}
+
 Flow Request::restore() {
     remote_before = {};
     launches_before = {};
@@ -274,6 +290,28 @@ Flow Request::restore() {
     // read) writes it
     // (a restore writes the snapshot's whole live K/V, which can be longer than this prompt)
     kv_need = std::max<int64_t>(n, incoming ? (int64_t) incoming->live.ids.size() : 0);
+    // the host K/V: this request's mode, before anything writes the cells.  The session's cells move with it:
+    // the live conversation's, which its checkpoints (no K/V of their own) are prefixes of
+    {
+        int64_t kv_live = (int64_t) runtime_.live.size();
+        for (const ConvCheckpoint& c : runtime_.checks) kv_live = std::max<int64_t>(kv_live, (int64_t) c.ids.size());
+        runtime_.kv_host_late = false;
+        const int64_t kv_read = n - (incoming ? in_tokens : resume);   // the prompt tokens it reads
+        if (const int adm = in_slot ? 1 : runtime_.kv_host_admit(kv_need, max_new, kv_live, kv_read, runtime_.err);
+            adm <= 0) {
+            if (adm < 0) {
+                std::printf("ERR %s\n", runtime_.err.c_str());
+                return Flow::error;
+            }
+            runtime_.slot_held = SlotHeld{};
+            if (incoming) (void) runtime_.conversations->put(std::move(*incoming));   // the conversation it would continue
+            basalt::log::warn("basalt serve", "prompt of %lld tokens refused: %s", (long long) n, runtime_.err.c_str());
+            std::printf("ERR %s\n", runtime_.err.c_str());
+            std::fflush(stdout);
+            runtime_.admit_slot = -1;
+            return Flow::next;
+        }
+    }
     keep_routed.emplace(runtime_.kv_keep_routed);
     runtime_.kv_keep_routed = runtime_.batch_on();
     kv_ok = runtime_.kv_fit(*runtime_.rsp, kv_need + runtime_.kKvGrowCells, runtime_.err, true, kv_need + runtime_.kKvWindowCells);
@@ -311,8 +349,10 @@ Flow Request::restore() {
         }
     }
     if (!kv_ok && runtime_.kv_short) {
-        // declined: the engine stays up, the solo session and its bookkeeping as they were
+        // declined: the engine stays up, the solo session and its bookkeeping as they were, the conversation it
+        // would continue back in the cache
         runtime_.slot_held = SlotHeld{};
+        if (incoming) (void) runtime_.conversations->put(std::move(*incoming));
         basalt::log::warn("basalt serve", "prompt of %lld tokens refused: %s", (long long) n, runtime_.err.c_str());
         std::printf("ERR %s\n", runtime_.err.c_str());
         std::fflush(stdout);
@@ -340,6 +380,10 @@ Flow Request::restore() {
         return Flow::next;
     }
     if (!kv_ok) {
+        std::printf("ERR %s\n", runtime_.err.c_str());
+        return Flow::error;
+    }
+    if (!loan_homes()) {
         std::printf("ERR %s\n", runtime_.err.c_str());
         return Flow::error;
     }
@@ -457,6 +501,15 @@ Flow Request::restore() {
                      return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
                  }), runtime_.checks.end());
     runtime_.live_ok = false;   // until this request has finished, the session is in between
+    // the host K/V: a shallow request on a streamed session goes back to the VRAM tail with the cells it keeps,
+    // now that the outgoing conversation is parked
+    if (runtime_.kv_host_late) {
+        runtime_.kv_host_late = false;
+        if (runtime_.kv_host_back(kv_need, resume, runtime_.err) < 0 || !loan_homes()) {
+            std::printf("ERR %s\n", runtime_.err.c_str());
+            return Flow::error;
+        }
+    }
     if (resume == 0) {
         basalt::core::session_zero(*runtime_.rsp, runtime_.g, nullptr, runtime_.main_cs);
         cudaStreamSynchronize(runtime_.main_stream);

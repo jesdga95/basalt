@@ -93,6 +93,82 @@ AutoPlan choose_auto(const AutoInputs& in) {
     return p;
 }
 
+KvHostChoice choose_kv_host(const KvHostInputs& in) {
+    KvHostChoice c;
+    if (in.cells <= 0 || in.bytes_per_cell == 0 || in.cells < in.crossover_cells) {
+        c.why = "shallow";
+        return c;
+    }
+    const uint64_t pin = (uint64_t) in.cells * in.bytes_per_cell;
+    if (in.ram_available <= in.ram_kept || pin > in.ram_available - in.ram_kept) {
+        c.why = "no RAM";
+        return c;
+    }
+    c.host = true;
+    c.pin_bytes = pin;
+    c.why = "host";
+    return c;
+}
+
+uint64_t kv_host_keep(uint64_t guard_floor, uint64_t serve_budget, uint64_t serve_held) {
+    return guard_floor + (serve_budget - std::min(serve_budget, serve_held));
+}
+
+int64_t kv_host_cells(int64_t need, int64_t max_new, int64_t slack, int64_t grid, int64_t max_cells) {
+    int64_t c = std::max<int64_t>(need, 0) + std::max<int64_t>(max_new, 0) + std::max<int64_t>(slack, 0);
+    if (grid > 0) c = (c + grid - 1) / grid * grid;
+    return max_cells > 0 ? std::min(c, max_cells) : c;
+}
+
+KvHostPlan plan_kv_host(const KvHostInputs& in, int64_t pool_cells) {
+    KvHostPlan p;
+    const bool deep = in.cells > 0 && in.bytes_per_cell > 0 && in.cells >= in.crossover_cells;
+    if (pool_cells <= 0 && deep && in.fresh_cells > 0 && in.read_cells > in.fresh_cells) {
+        p.why = "fresh";
+        return p;
+    }
+    if (pool_cells > 0 && deep && pool_cells >= in.cells && !in.ram_low) {
+        p.host = true;
+        p.act = KvHostAct::keep;
+        p.cells = pool_cells;
+        p.why = "host";
+        return p;
+    }
+    const KvHostChoice c = choose_kv_host(in);
+    p.why = c.why;
+    if (c.host) {
+        p.host = true;
+        p.act = pool_cells > 0 ? KvHostAct::grow : KvHostAct::take;
+        p.cells = in.cells;
+        p.pin_bytes = c.pin_bytes;
+        return p;
+    }
+    p.act = pool_cells > 0 ? KvHostAct::drop : KvHostAct::none;
+    return p;
+}
+
+bool kv_host_pool_serves(int64_t pool_cells, int64_t at, int64_t window) {
+    return pool_cells > 0 && pool_cells >= std::max<int64_t>(at, 0) + std::max<int64_t>(window, 0);
+}
+
+const char* kv_host_act_name(KvHostAct a) {
+    switch (a) {
+        case KvHostAct::take: return "take";
+        case KvHostAct::keep: return "keep";
+        case KvHostAct::grow: return "grow";
+        case KvHostAct::drop: return "drop";
+        default: return "none";
+    }
+}
+
+bool cut_gives_up_bare(const std::vector<int32_t>& res, int64_t cut, int64_t n_expert,
+                       const std::function<bool(int64_t, int64_t)>& has_copy) {
+    if (n_expert <= 0) return false;
+    for (size_t i = 0; i < res.size(); ++i)
+        if (res[i] >= 0 && res[i] >= cut && !has_copy((int64_t) i / n_expert, (int64_t) i % n_expert)) return true;
+    return false;
+}
+
 std::string auto_flags_line(const AutoPlan& p) {
     std::string out;
     auto add = [&](const std::string& s) { out += out.empty() ? "auto flags: " : ", "; out += s; };

@@ -584,9 +584,11 @@ struct Prefill::Impl {
 };
 
 namespace {
-// the staging pool of a streamed session: every page of one layer (same sequence in init and bytes_needed)
+// the staging pool of a streamed session: every page of one layer (same sequence in init and bytes_needed).  A session
+// that switches modes between requests is laid out again after each switch, so a layout follows the mode it reads in.
 void take_stage(Alloc& o, const core::SessionState& ss, const basalt::kernels::QsaShapes& s,
                 basalt::kernels::KvHostPools& st, bool& ok) {
+    st = basalt::kernels::KvHostPools{};
     const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
     if (q0.kv_mode != 1) return;
     const size_t rows = (size_t) q0.n_pages * s.n_head_kv * s.page_size;
@@ -947,7 +949,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         }
         for (int b = 0; b < 2; ++b) m.ahead_slot[b].assign((size_t) m.g->n_expert, -1);
     }
-    if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
+    // KV streaming: the staging pool's identity page table (a session that switches to streaming later makes it then)
+    if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {
         const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
         std::vector<int32_t> ident((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) ident[(size_t) i] = (int32_t) i;
@@ -1510,6 +1513,26 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const core::OnDevice on_device(m.device);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
+    // a session switched to streaming since init: its layout must carry the staging pool, and the identity table
+    // comes with the first streamed read
+    if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {
+        if (!m.stage.present()) { err = "prefill: a streamed session's staging pool is not laid out"; return false; }
+        if (m.ident_table == nullptr) {
+            const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
+            std::vector<int32_t> ident((size_t) pages);
+            for (int64_t i = 0; i < pages; ++i) ident[(size_t) i] = (int32_t) i;
+            if (cudaMalloc((void**) &m.ident_table, ident.size() * 4) != cudaSuccess) {
+                m.ident_table = nullptr;
+                err = "prefill: the staging pool's page table does not fit in VRAM";
+                return false;
+            }
+            m.owned.push_back(m.ident_table);
+            if (cudaMemcpy(m.ident_table, ident.data(), ident.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = "prefill: the staging pool's page table could not be written";
+                return false;
+            }
+        }
+    }
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
     // set_ring_remote: an expert with no pinned host copy that the other card's cache holds (its blob there), or null

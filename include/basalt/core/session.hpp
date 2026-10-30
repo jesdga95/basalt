@@ -26,6 +26,8 @@
 
 namespace basalt::core {
 
+class KvHostPool;
+
 /// Everything a sequence needs that is NOT a weight: the per-layer state, the block scratch, and the pinned
 /// handoff between the GPU and the CPU expert pool.
 struct SessionState {
@@ -113,6 +115,18 @@ uint64_t session_kv_bytes_for(const SessionState& s, int64_t cells);
 uint64_t session_kv_mapped_bytes(const SessionState& s);
 bool session_kv_map(SessionState& s, int64_t cells, std::string& err);
 bool session_kv_unmap(SessionState& s, int64_t cells, std::string& err);
+/// Per-request host K/V (qsa_set_kv_host, kv_host_pool.hpp).  `session_kv_can_stream`: every QSA layer of `s` can
+/// switch in place.  `session_kv_mode`: the layers' kv_mode (0 or 1; -1 when they differ or `s` has none).
+/// `session_kv_cap` caps or uncaps every layer's K/V arrays (qsa_state_kv_cap).  `session_kv_set_mode` switches every
+/// layer (qsa_state_set_mode) keeping the first `live_cells` cells, streamed from `pool` when `mode` is 1; on `stream`,
+/// which it waits for.  On a refusal the layers already switched are switched back; a device error stops the engine.
+/// No other stream may be working on the session: the engine drains the device first and passes null (the legacy
+/// default stream).
+bool session_kv_can_stream(const SessionState& s);
+int session_kv_mode(const SessionState& s);
+void session_kv_cap(SessionState& s, bool capped);
+bool session_kv_set_mode(SessionState& s, const ModelGeometry& g, int mode, const KvHostPool* pool,
+                         int64_t live_cells, void* stream, std::string& err);
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
 /// from the reference's own `zeros()`.
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream);

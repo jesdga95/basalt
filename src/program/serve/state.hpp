@@ -19,6 +19,7 @@
 #include "basalt/core/conversation_memory.hpp"
 #include "basalt/core/conversation_store.hpp"
 #include "basalt/core/expert_source.hpp"
+#include "basalt/core/kv_host_pool.hpp"
 #include "basalt/core/pinned.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
@@ -137,6 +138,15 @@ inline constexpr int kSatRatio = 2;
 inline constexpr float kPairTheta = 0.50f;
 inline constexpr float kPairChainScale = 0.25f;
 inline constexpr double kPairFull = 0.70;   ///< the share of windows accepted whole from which the chain runs on
+
+// Host RAM a server takes while it serves (serve_growth_bytes), by part.
+struct ServeGrowth {
+    uint64_t checkpoints = 0;     ///< the running checkpoints (the solo session's and the batch slots')
+    uint64_t conversations = 0;   ///< the parked conversations
+    uint64_t other = 0;           ///< a request's buffers, one image's buffers
+    uint64_t total() const { return checkpoints + conversations + other; }
+};
+ServeGrowth serve_growth(const Options& o, const basalt::core::ModelGeometry& g);
 
 ConvStateSizes conv_state_sizes(const basalt::core::ModelGeometry& g, const basalt::core::SessionState& ss);
 bool checkpoint_save(ConvCheckpoint& c, const basalt::core::SessionState& ss, const basalt::core::ModelGeometry& g);
@@ -341,6 +351,21 @@ private:
     int64_t kv_moves{};
     bool kv_short{};
     bool kv_keep_routed{};   // an admission while slots decode: a shrink keeps their routed experts
+    // ---- the per-request host K/V (kv_host_on): a deep request whose K/V fits in RAM streams it from a host pool, so
+    // the VRAM tail stays expert slots; any other keeps it in the elastic tail.  The solo session switches between
+    // requests with its live cells; the pool stays while the session streams (the conversation's next turn resumes
+    // from it).  Set by kv_host_init.
+    bool kv_host_live{};
+    int64_t kv_host_cross{};        // a request that starts decoding below this depth (cells) stays in the VRAM tail
+    int64_t kv_host_ram{};          // a test's stand-in for the RAM free now, MiB; negative: MemAvailable
+    ServeGrowth kv_host_budget{};   // what serving can take, by part (a pin leaves it free less what is held)
+    basalt::core::KvHostPool kv_pool{};
+    int64_t kv_host_out{};          // the output cells a pool is pinned for
+    int64_t kv_host_grow_ram{};     // a test's stand-in for the RAM free at a mid-request grow, MiB
+    // set by kv_host_admit for a shallow request on a streamed session: it goes back to the VRAM tail with the cells
+    // it keeps once the outgoing conversation is parked (kv_host_back)
+    bool kv_host_late{};
+    int64_t kv_host_fresh{};        // a session not streamed yet takes a pool only for a read of at most this many tokens
     // ---- --batch: the slots of the batch windows
     struct BSlot {
         bool active = false, stop = false;
@@ -483,6 +508,7 @@ private:
     void make_view(basalt::core::SessionState& v, int b);
     int32_t loan_plan(int64_t live, int64_t& chunk);
     void relend();
+    void homes_wanted(int64_t live, std::vector<std::pair<int32_t, int32_t>>& give, std::vector<int32_t>& slots);
     bool home_given_up(int64_t live, std::string& e);
     bool vram_command(const std::string& cmd, std::string& e, bool for_sleep, std::string* reply = nullptr);
     int64_t cache_floor_slots();
@@ -492,6 +518,17 @@ private:
     bool cache_regrow(std::string& e);
     bool kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& e, bool shrink = true, int64_t min_cells = -1);
     bool kv_release(basalt::core::SessionState& s, int64_t cells, std::string& e);
+    int64_t kv_keep_cells(const basalt::core::SessionState& s);
+    void kv_host_init();
+    uint64_t kv_host_kept();
+    int64_t kv_host_pin_cells(int64_t at, int64_t new_tokens);
+    uint64_t kv_ram_now();
+    int kv_host_regrow(int64_t cells, int64_t live_c, std::string& pe, std::string& e);
+    int kv_host_to_vram(int64_t at, int64_t live_c, std::string& pe, std::string& e);
+    uint64_t loan_home_bytes();
+    int kv_host_admit(int64_t need, int64_t new_tokens, int64_t live_cells, int64_t read, std::string& e);
+    int kv_host_back(int64_t need, int64_t keep, std::string& e);
+    int kv_host_more(int64_t p, int64_t need, int64_t left, int64_t live_c, std::string& e);
     uint64_t row_hash(int t);
     bool batch_on();
     bool try_next_line(std::string& out);

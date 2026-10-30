@@ -343,6 +343,7 @@ int main() {
         // a large checkpoint buffer returns to the pool and comes back at the same size, with its contents intact
         const size_t big = (size_t(3) << 20) + 5;
         const uint8_t* first = nullptr;
+        const size_t pooled0 = CheckpointBytes::allocator_type::pooled_bytes();
         {
             CheckpointBytes a;
             a.resize(big);
@@ -350,8 +351,10 @@ int main() {
             a[0] = 9;
             a[big - 1] = 4;
         }
+        check(CheckpointBytes::allocator_type::pooled_bytes() == pooled0 + big, "the pool counts the block it keeps");
         CheckpointBytes b;
         b.resize(big);
+        check(CheckpointBytes::allocator_type::pooled_bytes() == pooled0, "a block handed out again leaves the count");
         check(b.data() == first, "a freed large checkpoint buffer is handed out again");
         {
             CheckpointBytes c;

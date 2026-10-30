@@ -3,24 +3,27 @@
 
 namespace basalt::program::serve {
 
-uint64_t serve_growth_bytes(const Options& o, const basalt::core::ModelGeometry& g) {
-    if (!o.serve) return 0;
-    uint64_t bytes = basalt::platform::kRequestHostBytes;
+ServeGrowth serve_growth(const Options& o, const basalt::core::ModelGeometry& g) {
+    ServeGrowth s;
+    if (!o.serve) return s;
+    s.other = basalt::platform::kRequestHostBytes;
     basalt::core::ConversationStateSizes z;
     std::string error;
     if (o.prompt_cache > 0 && basalt::core::conversation_state_sizes(g, z, error)) {
         const uint64_t one = z.gdn + z.ple + (uint64_t) g.n_qsa_layers() * (z.tail + z.dead + z.block_pos);
-        bytes += (uint64_t) (o.prompt_cache + 1) * (uint64_t) std::max(o.batch, 1) * one;
-        bytes += (uint64_t) o.conversation_cache_mib << 20;
+        s.checkpoints = (uint64_t) (o.prompt_cache + 1) * (uint64_t) std::max(o.batch, 1) * one;
+        s.conversations = (uint64_t) o.conversation_cache_mib << 20;
     }
     if (!o.vision_mmproj.empty()) {
         // the canvas (8-bit RGB), its normalized planar floats and the patches
         const basalt::vision::Geometry vg;
         const uint64_t pixels = (uint64_t) vg.max_tokens * (uint64_t) (vg.patch * vg.merge) * (uint64_t) (vg.patch * vg.merge);
-        bytes += pixels * 3 * (1 + 2 * sizeof(float));
+        s.other += pixels * 3 * (1 + 2 * sizeof(float));
     }
-    return bytes;
+    return s;
 }
+
+uint64_t serve_growth_bytes(const Options& o, const basalt::core::ModelGeometry& g) { return serve_growth(o, g).total(); }
 
 void Runtime::shed_if_low() {
     if (basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok) return;
@@ -78,16 +81,14 @@ void Runtime::relend() {   // the prompt path's loan: the end of the slots left,
 // The resident RAM mode holds only the experts no slot holds, so an expert in a slot about to go has no RAM
 // copy: it is copied from its slot into a RAM home first and read from there like the compact copy's.  Refused
 // (nothing copied) when the RAM above the floor cannot take them.  `live`: the slots that stay.
-bool Runtime::home_given_up(int64_t live, std::string& e) {
-    if (!src.complement_ready()) return true;
+// the experts in the slots about to go (`live` slots stay) that have no RAM copy, and their slots
+void Runtime::homes_wanted(int64_t live, std::vector<std::pair<int32_t, int32_t>>& give, std::vector<int32_t>& slots) {
     // the slots the loan will overwrite keep a RAM copy too, so a prompt never costs a file read
     int64_t from = live;
     if (!pf_parts.empty() && pf_parts[0].first >= 0) {
         int64_t c = 0;
         from = std::min<int64_t>(live, loan_plan(live, c));
     }
-    std::vector<std::pair<int32_t, int32_t>> give;
-    std::vector<int32_t> slots;
     for (size_t i = 0; i < host_res.size(); ++i) {
         const int64_t layer = (int64_t) i / g.n_expert, ex = (int64_t) i % g.n_expert;
         if (host_res[i] >= from && !src.has_resident(layer, ex)) {
@@ -95,6 +96,13 @@ bool Runtime::home_given_up(int64_t live, std::string& e) {
             slots.push_back(host_res[i]);
         }
     }
+}
+
+bool Runtime::home_given_up(int64_t live, std::string& e) {
+    if (!src.complement_ready()) return true;
+    std::vector<std::pair<int32_t, int32_t>> give;
+    std::vector<int32_t> slots;
+    homes_wanted(live, give, slots);
     if (give.empty()) return true;
     std::vector<uint8_t*> dst;
     if (!src.homes_take(give, e, dst)) return false;

@@ -46,6 +46,11 @@ void KvArena::set_contents(size_t i, std::vector<uint8_t> bytes) {
     if (i < arrays_.size()) arrays_[i].contents = std::move(bytes);
 }
 
+void KvArena::cap(size_t i, int64_t pages) {
+    if (i < arrays_.size()) arrays_[i].cap_pages = pages > 0 ? std::min(pages, pages_) : 0;
+    recount();
+}
+
 void KvArena::close() {
     if (!arrays_.empty()) cudaDeviceSynchronize();
     for (Array& a : arrays_) {
@@ -58,15 +63,19 @@ void KvArena::close() {
 }
 
 uint64_t KvArena::need(const Array& a, int64_t cells) const {
-    const int64_t pages = std::min<int64_t>(pages_, (std::max<int64_t>(cells, 0) + page_cells_ - 1) / page_cells_);
+    int64_t pages = std::min<int64_t>(pages_, (std::max<int64_t>(cells, 0) + page_cells_ - 1) / page_cells_);
+    if (a.cap_pages > 0) pages = std::min(pages, a.cap_pages);
     if (pages == 0) return 0;
     return std::min(a.reserved, ((uint64_t) pages * a.page_bytes + a.tail_bytes + gran_ - 1) / gran_ * gran_);
 }
 
 void KvArena::recount() {
     int64_t pages = pages_;
-    for (const Array& a : arrays_)
-        pages = std::min<int64_t>(pages, (int64_t) ((a.mapped() > a.tail_bytes ? a.mapped() - a.tail_bytes : 0) / a.page_bytes));
+    for (const Array& a : arrays_) {
+        const int64_t have = (int64_t) ((a.mapped() > a.tail_bytes ? a.mapped() - a.tail_bytes : 0) / a.page_bytes);
+        if (a.cap_pages > 0 && have >= a.cap_pages) continue;   // a capped array backed to its cap covers every cell
+        pages = std::min<int64_t>(pages, have);
+    }
     cells_ = pages * page_cells_;
 }
 

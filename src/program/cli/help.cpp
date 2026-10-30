@@ -36,7 +36,7 @@ void usage() {
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
                  "  --serve              stay resident and take requests on stdin (the server's mode)\n"
                  "  --exp NAME=VALUE[,...]  diagnostics; concur9_logit_hash=1 prints a hash of each accepted row's\n"
-                 "                       logits on stderr\n"
+                 "                       logits on stderr; kv_host=0 keeps every request's K/V in VRAM (--serve)\n"
                  "  --gpu A,B,..|auto    the GPUs to use, as nvidia-smi numbers them (within CUDA_VISIBLE_DEVICES when\n"
                  "                       set): exactly these, the first the main card; the engine gives the rest their\n"
                  "                       roles.  auto = every Blackwell card, the fastest as main.  Default: GPU 0 alone\n"

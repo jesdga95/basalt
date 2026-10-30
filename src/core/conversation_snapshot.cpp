@@ -82,11 +82,17 @@ std::array<void*, 5> pools(const QsaState& st, bool resident = false) {
     return {host ? st.host.k_pool : st.k_pool, host ? st.host.v_pool : st.v_pool, nullptr, nullptr, st.idx_pooled};
 }
 
+// The cells a streamed state's host copy can hold: a switchable state's pool grows to its whole context at a request's
+// admission, which comes after the incoming snapshot is validated; the copy itself is bounded by the pool (`backed`).
+int64_t host_bound(const QsaState& st) {
+    return st.host_slots > 0 ? st.n_pages * basalt::kernels::qsa_real_shapes().page_size : st.host_cells;
+}
+
 bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error) {
     if (upto < 0 || upto > st.max_cells || st.n_pages < 0 || l.cells / l.page_size > st.n_pages ||
         st.kv_mode < 0 || st.kv_mode > 2 || st.n_slots <= 0 ||
         (st.kv_mode == 0 && st.n_slots < st.n_pages) ||
-        l.pooled_rows > st.idx_pooled_rows || (st.kv_mode != 0 && !st.host.present())) {
+        l.pooled_rows > st.idx_pooled_rows || (st.kv_mode != 0 && (!st.host.present() || l.cells > host_bound(st)))) {
         error = "conversation snapshot: invalid K/V extent or missing authoritative host pool";
         return false;
     }
@@ -107,8 +113,14 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
     return true;
 }
 
-// An elastic state backs only a prefix of its cells; a copy past it would fault inside the driver.
+// An elastic state backs only a prefix of its cells, and a streamed one's host pool only its own cells; a copy past
+// either would fault inside the driver.
 bool backed(const QsaState& st, const Layout& l, std::string& error) {
+    if (st.kv_mode != 0 && l.cells > st.host_cells) {
+        error = "conversation snapshot: " + std::to_string((long long) l.cells) + " cells to copy, " +
+                std::to_string((long long) st.host_cells) + " in the host pool";
+        return false;
+    }
     if (!st.kv_arena || st.kv_arena->cells() >= l.cells) return true;
     error = "conversation snapshot: " + std::to_string((long long) l.cells) + " cells to copy, " +
             std::to_string((long long) st.kv_arena->cells()) + " backed";

@@ -59,6 +59,14 @@ struct PooledAlloc {
     void construct(U* p) noexcept { ::new (static_cast<void*>(p)) U; }   // resize leaves new bytes as they are
     template <class U, class... A>
     void construct(U* p, A&&... a) { ::new (static_cast<void*>(p)) U(std::forward<A>(a)...); }
+    /// The bytes of the blocks the pool keeps for the next allocations.
+    static size_t pooled_bytes() {
+        Pool& p = pool();
+        std::lock_guard<std::mutex> lk(p.mu);
+        size_t n = 0;
+        for (const auto& b : p.blocks) n += b.second;
+        return n;
+    }
     /// Frees the blocks the pool keeps; returns their bytes.
     static size_t release_pooled() {
         Pool& p = pool();

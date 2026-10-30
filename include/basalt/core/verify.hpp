@@ -320,6 +320,12 @@ public:
     /// address (its graphs are keyed by it).  Back to init's session: bind_session(&ss).  No copy of any state; a
     /// session's graphs are captured on its first use, or ahead of it by warm_session.
     bool bind_session(SessionState* s, std::string& err);
+    /// The bound session's KV mode changed (session_kv_set_mode): its graphs for that mode are bound, captured on
+    /// first use as with bind_session.  Free when the mode is the one bound.
+    bool sync_kv_mode(std::string& err) { return bind_session(ss_, err); }
+    /// Destroys the solo graphs captured for KV mode `mode` (every session): a streamed session's host K/V moved, and
+    /// the graphs bake its address.
+    bool drop_kv_graphs(int mode, std::string& err);
     /// Captures every solo window width's graph and the commit for session `s` now.
     bool warm_session(SessionState* s, std::string& err);
 
@@ -541,7 +547,10 @@ private:
     struct SoloGraphs {
         cudaGraphExec_t exec[9] = {}, exec_nr[9] = {}, commit = nullptr;
     };
-    std::map<SessionState*, SoloGraphs> solo_sets_;   // the solo graphs of the sessions not bound now
+    // the solo graphs of the (session, KV mode) pairs not bound now: a streamed session's windows resolve its blocks
+    std::map<std::pair<SessionState*, int>, SoloGraphs> solo_sets_;
+    int bound_kv_ = 0;   // the KV mode the bound graphs were captured in
+    int kv_key(const SessionState* s) const;
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T
