@@ -12,6 +12,8 @@
 // one checkpoint's state.  Both are keyed by the token prefix they belong to and by their bytes, so a conversation
 // written again a few turns on, or another one that starts the same way with the same bytes, refers to the files that
 // are there and writes only the new ones.  Block and state files nobody refers to are removed between writes.
+// A conversation stores the state of its root checkpoint (the end of the system prompt) and of its last kTurnStates
+// turn ends; the checkpoints a stride inside a long prompt and older turn ends are not written.
 #include "basalt/core/conversation_store.hpp"
 
 #include "basalt/kernels/qsa.hpp"
@@ -50,6 +52,7 @@ constexpr int kReaders = 8;                // reads in flight
 constexpr uint64_t kSpaceFloor = 4ull << 30;   // a write leaves this much of the volume free
 constexpr int64_t kBlockCells = 4096;      // K/V cells per block file
 constexpr int64_t kOrphanAge = 60;         // seconds: a younger unreferenced file may be another process's write
+constexpr int kTurnStates = 3;             // turn-end states a stored conversation keeps beside its root
 constexpr int64_t kLiveSlack = 4096;       // a live end at most this far past the last checkpoint is stored as of it
 constexpr uint32_t kLive = 0xFFFFFFFFu;
 const char* const kExt = ".bcs";
@@ -339,6 +342,7 @@ struct ConversationStore::Entry {
     std::vector<ConversationImageKey> imgs;   ///< live pictures
     std::vector<int64_t> checks;              ///< checkpoint lengths, in stored order
     std::vector<uint64_t> check_keys;         ///< each checkpoint's state file
+    std::vector<uint8_t> sources;             ///< what took each checkpoint (ConversationCheckpoint::Source)
     std::vector<uint64_t> blocks;             ///< the K/V block files, in cell order
     std::vector<std::string> refs;            ///< the part files counted for it
     std::vector<Section> table;               ///< the file's sections (empty while queued)
@@ -557,6 +561,9 @@ bool ConversationStore::open(const std::string& dir, uint64_t identity, uint64_t
                     if (s.kind == kCheck) {
                         e->checks.push_back(s.meta[0]);
                         e->check_keys.push_back((uint64_t) s.meta[2]);
+                        e->sources.push_back(s.meta[3] == ConversationCheckpoint::kPeriodic ||
+                                                     s.meta[3] == ConversationCheckpoint::kRoot
+                                                 ? (uint8_t) s.meta[3] : (uint8_t) ConversationCheckpoint::kTurnEnd);
                     }
                 }
                 ok = ids && imgs && refs && ids->bytes == (uint64_t) e->head.n_ids * 4 &&
@@ -734,6 +741,7 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
     std::vector<ConversationImageKey> all_imgs, imgs;
     std::vector<int64_t> checks;
     std::vector<uint64_t> check_keys, blocks;
+    std::vector<uint8_t> kinds;
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (m.index >= entries_.size() || m.tokens <= 0) { error = "conversation store: no such entry"; return false; }
@@ -747,6 +755,7 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
         all_imgs = e.imgs;
         checks = e.checks;
         check_keys = e.check_keys;
+        kinds = e.sources;
         blocks = e.blocks;
     }
     ids.assign(all_ids.begin(), all_ids.begin() + std::min<size_t>(all_ids.size(), (size_t) m.tokens));
@@ -782,6 +791,7 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
             ConversationCheckpoint at;
             at.ids = img.live.ids;
             at.imgs = img.live.imgs;
+            at.source = state.source;
             copy_state(state, at);
             img.checkpoints.push_back(std::move(at));
         }
@@ -1009,6 +1019,12 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
     std::vector<Source> sources;
     for (const auto& f : opened) sources.push_back({f.rf->fd, &f.hashes});
     if (!read_parts(sources, parts, read, error, bad, read_bufs_)) return fail(error, bad);
+    auto source_of = [&](int j) {
+        return j >= 0 && (size_t) j < kinds.size() ? (ConversationCheckpoint::Source) kinds[(size_t) j]
+                                                      : ConversationCheckpoint::kTurnEnd;
+    };
+    root.source = source_of(cut.root);
+    at.source = source_of(cut.live);
     if (cut.root >= 0) img.checkpoints.push_back(std::move(root));
     if (cut.live >= 0) {
         at.ids = img.live.ids;
@@ -1030,8 +1046,28 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
 
 // ------------------------------------------------------------------------------------------------ writing
 
+namespace {
+
+// The disk keeps a chat's root and the states of its last kTurnStates turn ends; the other checkpoints (a stride inside
+// a long prompt, older turn ends) live in RAM only, and a cut at one goes back to the nearest stored state before it.
+void keep_stored_checkpoints(std::vector<ConversationCheckpoint>& v) {
+    std::vector<size_t> turns;
+    for (size_t j = 0; j < v.size(); ++j)
+        if (v[j].source == ConversationCheckpoint::kTurnEnd) turns.push_back(j);
+    std::sort(turns.begin(), turns.end(), [&](size_t a, size_t b) { return v[a].ids.size() > v[b].ids.size(); });
+    if (turns.size() > (size_t) kTurnStates) turns.resize((size_t) kTurnStates);
+    std::vector<ConversationCheckpoint> kept;
+    for (size_t j = 0; j < v.size(); ++j)
+        if (v[j].source == ConversationCheckpoint::kRoot || std::find(turns.begin(), turns.end(), j) != turns.end())
+            kept.push_back(std::move(v[j]));
+    v = std::move(kept);
+}
+
+}  // namespace
+
 bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap) {
     if (!open_ || image.live.ids.empty() || !image.stage_images.empty()) return false;
+    keep_stored_checkpoints(image.checkpoints);
     for (const auto& c : image.checkpoints)
         if (c.ids.size() > image.live.ids.size() || !std::equal(c.ids.begin(), c.ids.end(), image.live.ids.begin()) ||
             c.imgs != imgs_below(image.live.imgs, (int64_t) c.ids.size()) || !c.stage_parts.empty())
@@ -1087,7 +1123,10 @@ bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap) {
     e->cvec = job->image.cvec;
     e->ids = job->image.live.ids;
     e->imgs = job->image.live.imgs;
-    for (const auto& c : job->image.checkpoints) e->checks.push_back((int64_t) c.ids.size());
+    for (const auto& c : job->image.checkpoints) {
+        e->checks.push_back((int64_t) c.ids.size());
+        e->sources.push_back((uint8_t) c.source);
+    }
     e->job = job;
     entries_.push_back(std::move(e));
     queue_.push_back(job);
@@ -1347,6 +1386,7 @@ bool ConversationStore::write_job(Job& job, uint64_t& wrote, uint64_t& whole, st
         s.meta[0] = (int64_t) img.checkpoints[j].ids.size();
         s.meta[1] = (int64_t) img.checkpoints[j].imgs.size();
         s.meta[2] = (int64_t) job.check_keys[j];
+        s.meta[3] = (int64_t) img.checkpoints[j].source;
     }
     for (size_t i = 0; i < img.kv.size(); ++i) {
         const ConversationKv& kv = img.kv[i];

@@ -113,6 +113,9 @@ Flow Request::read_prompt() {
     // the last window of the last windowed part carries the last prompt token too: the first generated
     // token is sampled from it, and the draft layer takes its rows like any accepted window
     fold_p0 = n - 1;
+    const auto source_at = [&](int64_t to) {
+        return to == root_at ? ConvCheckpoint::kRoot : ConvCheckpoint::kTurnEnd;
+    };
     for (const int64_t to : {root_at, turn_at, n - 1}) {
         if (to <= at) continue;
         runtime_.err.clear();
@@ -142,7 +145,7 @@ Flow Request::read_prompt() {
         if (win && !ov_window()) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }
         runtime_.ov_post_done = false;
         runtime_.ov_post = [&, to]() -> bool {
-            if ((to == turn_at || to == root_at) && !runtime_.checkpoint_at(to)) return false;
+            if ((to == turn_at || to == root_at) && !runtime_.checkpoint_at(to, nullptr, false, source_at(to))) return false;
             // the lent slots get their experts back here, beside the windows; the table follows on the main thread
             for (PfPart& p : runtime_.pf_parts) {
                 if (p.lent.empty()) continue;
@@ -184,7 +187,7 @@ Flow Request::read_prompt() {
         at = to;
         resumed_chunk = 0;   // the later parts are planned as the read they continue planned them
         runtime_.ov_post = nullptr;
-        if ((to == turn_at || to == root_at) && !runtime_.ov_post_done && !runtime_.checkpoint_at(to, nullptr, !in_slot && !runtime_.batch_on())) {
+        if ((to == turn_at || to == root_at) && !runtime_.ov_post_done && !runtime_.checkpoint_at(to, nullptr, !in_slot && !runtime_.batch_on(), source_at(to))) {
             std::printf("ERR saving a conversation checkpoint failed%s\n", runtime_.ckpt_why.c_str());
             return Flow::error;
         }

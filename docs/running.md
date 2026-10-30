@@ -168,12 +168,12 @@ the folder `conversations` inside the model's cache folder (`~/.cache/basalt/<ha
 prints `[disk] conversations=DIR disk-mib=N` at start. A conversation of at least 8192 tokens that leaves its session
 (another one takes its slot), that the RAM cache evicts, or that the engine still holds when it ends (a stop, an idle
 unload) is written to DIR: one file for its tokens and running state, and shared files for its K/V cache (one per 4096
-cells) and for each checkpoint's state, each named by the tokens it covers and its bytes, so the same conversation
-written again, or another that starts the same way, writes only the blocks and states that are new. A conversation whose
-last checkpoint (the end of its last prompt) is at most 4096 tokens behind is stored as of that checkpoint, with no
-running state of its own: the next turn goes on from there, and a reply sent back as it was is read
-again. A later
-prompt that starts with a stored conversation (its tokens, or one of its checkpoints) reads it back cut at that point
+cells) and for its checkpoint states, each named by the tokens it covers and its bytes, so the same conversation
+written again, or another that starts the same way, writes only the blocks and states that are new. Only the system prompt's
+and the last 3 turn ends' states are written (other checkpoints stay in RAM); a cut at an unstored one goes on from the
+nearest stored state before it. A conversation whose last checkpoint (the end of its last prompt) is at most 4096 tokens
+behind is stored as of that checkpoint, with no running state of its own: the next turn goes on from there, and a reply sent
+back as it was is read again. A later prompt that starts with a stored conversation (its tokens, or one of its checkpoints) reads it back cut at that point
 and goes on from there, after a restart too: the wait is the drive reading the K/V cache. A file is bound to the model file, the stored-conversation format and the settings that change the state
 (the KV type, the rope, the draft layer, control vectors); every part of it carries a hash, and a file that does not
 check out is deleted, never restored. After a second without input (no slot decoding) the engine writes each conversation that has grown 4096 tokens past its

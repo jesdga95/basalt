@@ -95,6 +95,9 @@ struct ConversationImageKey {
 };
 
 struct ConversationCheckpoint {
+    /// What took the checkpoint: the end of a prompt, a fixed stride inside a long one, or the end of the system prompt.
+    enum Source : uint8_t { kTurnEnd = 0, kPeriodic = 1, kRoot = 2 };
+    Source source = kTurnEnd;
     std::vector<int32_t> ids;
     std::vector<ConversationImageKey> imgs;
     CheckpointBytes gdn, ple, tails, dead, block_pos;

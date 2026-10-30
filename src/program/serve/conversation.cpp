@@ -249,15 +249,20 @@ bool Runtime::gpu_sync_ok() {
     return false;
 }
 
-// a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed.  `parts`: the stages'
+// a checkpoint of the state after `cur[0, L)`, taken for `source`; false only when the copy itself failed.  `parts`: the stages'
 // states saved at L (a split's mid-prompt checkpoint); without, they are read now (everything is at L)
-bool Runtime::checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts, bool defer) {
+bool Runtime::checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts, bool defer, ConvCheckpoint::Source source) {
     ckpt_why.clear();
     ckd_finish();
     if (o.prompt_cache <= 0 || L < 1) return true;
     for (ConvCheckpoint& c : checks)
-        if ((int64_t) c.ids.size() == L) { c.used = ++check_clock; return true; }
+        if ((int64_t) c.ids.size() == L) {   // a turn end or the root outranks a stride that landed on it
+            c.used = ++check_clock;
+            if (source > c.source) c.source = source;
+            return true;
+        }
     ConvCheckpoint c;
+    c.source = source;
     c.ids.assign(cur.begin(), cur.begin() + L);
     c.imgs = imgs_below(req_imgs, L);
     if (parts != nullptr) {

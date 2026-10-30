@@ -2,12 +2,14 @@
 // and checkpoints, read back cut at the match (from the write queue and from the files, in a fresh store as after a
 // restart; inside a K/V block, on a block's edge and in the tail), refused when a payload byte of a shared block changed
 // or the identity differs, written again a turn on with only its new state, stored as of its last checkpoint when its
-// live end is a reply past it, and the directory kept to its budget.
+// live end is a reply past it, the directory kept to its budget, and only a chat's root and last three turn-end states
+// written (a cut at a state not written goes back to the nearest one before it, refcounts of a shared root kept).
 #include "basalt/core/conversation_store.hpp"
 #include "basalt/kernels/qsa.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/system.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -124,6 +126,38 @@ void check_cut(const SavedConversation& got, const SavedConversation& src, int64
               same_state(got.checkpoints[1], want));
     }
 }
+
+using Src = ConversationCheckpoint::Source;
+
+// a chat of `ids` with a checkpoint of the given source at each length
+SavedConversation chat(const std::vector<int32_t>& ids, const std::vector<std::pair<size_t, Src>>& checks) {
+    SavedConversation s = image(ids, {});
+    for (const auto& c : checks) {
+        s.checkpoints.push_back(state(ids, c.first));
+        s.checkpoints.back().source = c.second;
+    }
+    return s;
+}
+
+void copy_state_bytes(ConversationCheckpoint& to, const ConversationCheckpoint& from) {
+    to.gdn = from.gdn; to.ple = from.ple; to.tails = from.tails; to.dead = from.dead; to.block_pos = from.block_pos;
+}
+
+// state files in `dir` ("<identity>-s<key>.bcs")
+size_t state_files(const std::string& dir) {
+    std::vector<basalt::platform::DirFile> files;
+    size_t n = 0;
+    if (basalt::platform::list_files(dir, files))
+        for (const auto& f : files) n += f.name.size() > 18 && f.name[17] == 's';
+    return n;
+}
+
+void remove_dir(const std::string& dir) {
+    std::vector<basalt::platform::DirFile> left;
+    if (basalt::platform::list_files(dir, left))
+        for (const auto& f : left) basalt::platform::remove_file(dir + "/" + f.name);
+    basalt::platform::remove_file(dir);
+}
 }  // namespace
 
 int main() {
@@ -131,7 +165,11 @@ int main() {
                             std::to_string((long long) basalt::platform::process_id());
     std::vector<int32_t> ids(10000);
     for (size_t i = 0; i < ids.size(); ++i) ids[i] = (int32_t) (i * 7 + 3);
-    const SavedConversation src = image(ids, {2048, 4096, 5000});   // its live end far past the last checkpoint
+    const SavedConversation src = [&] {   // its live end far past the last checkpoint
+        SavedConversation c = image(ids, {2048, 4096, 5000});
+        c.checkpoints[0].source = ConversationCheckpoint::kRoot;
+        return c;
+    }();
     const uint64_t id = 42;
     {
         ConversationStore st;
@@ -317,6 +355,93 @@ int main() {
         p = ids3;
         p.push_back(0);
         CHECK(st.best(p.data(), p.size(), {}, true).tokens == 10000);   // as of its checkpoint, 300 tokens back
+    }
+    {
+        // only the root and the last three turn ends are written; strides and older turn ends are not
+        const std::string d2 = dir + "-keep";
+        std::vector<int32_t> a(12000);
+        for (size_t i = 0; i < a.size(); ++i) a[i] = (int32_t) (i * 11 + 5);
+        const Src T = ConversationCheckpoint::kTurnEnd, P = ConversationCheckpoint::kPeriodic, R = ConversationCheckpoint::kRoot;
+        const SavedConversation sa = chat(a, {{1000, R}, {3000, P}, {4000, T}, {5000, P}, {6000, T}, {7000, T},
+                                              {8000, T}, {9000, T}, {9500, P}});
+        std::string err;
+        {
+            ConversationStore st;
+            CHECK(st.open(d2, id, 1ull << 30, err));
+            SavedConversation copy = sa;
+            CHECK(st.put(std::move(copy), 1ull << 30));
+            st.flush();
+            CHECK(st.stats().written == 1);
+            CHECK(state_files(d2) == 4);   // root 1000, turn ends 7000, 8000, 9000
+            // a cut at a state that was not written goes back to the nearest one before it
+            std::vector<int32_t> p(a.begin(), a.begin() + 6500);
+            p.push_back(-5);
+            auto m = st.best(p.data(), p.size(), {}, true);
+            CHECK(m.tokens == 1000);
+            SavedConversation got;
+            CHECK(st.load(m, got, err));
+            CHECK(got.live.ids.size() == 1000 && same_state(got.live, sa.checkpoints[0]));
+            CHECK(got.kv.size() == sa.kv.size());
+            for (size_t i = 0; i < got.kv.size(); ++i)
+                CHECK(prefix_of(got.kv[i].k, sa.kv[i].k) && prefix_of(got.kv[i].pooled, sa.kv[i].pooled));
+            // past a stride: the turn end before it, with the root beside
+            p.assign(a.begin(), a.begin() + 9700);
+            p.push_back(-5);
+            m = st.best(p.data(), p.size(), {}, true);
+            CHECK(m.tokens == 9000);
+            SavedConversation g2;
+            CHECK(st.load(m, g2, err));
+            CHECK(same_state(g2.live, sa.checkpoints[7]));
+            CHECK(g2.checkpoints.size() == 2 && g2.checkpoints[0].ids.size() == 1000 &&
+                  g2.checkpoints[0].source == R && same_state(g2.checkpoints[0], sa.checkpoints[0]) &&
+                  g2.checkpoints[1].source == T);
+            // the live end is a reply past the last turn end: stored as of it
+            p = a;
+            p.push_back(-5);
+            CHECK(st.best(p.data(), p.size(), {}, true).tokens == 9000);
+        }
+        {
+            ConversationStore st;   // after a restart the kinds come from the file
+            CHECK(st.open(d2, id, 1ull << 30, err));
+            std::vector<int32_t> p(a.begin(), a.begin() + 8200);
+            p.push_back(-5);
+            auto m = st.best(p.data(), p.size(), {}, true);
+            CHECK(m.tokens == 8000);
+            SavedConversation got;
+            CHECK(st.load(m, got, err));
+            CHECK(same_state(got.live, sa.checkpoints[6]) && got.checkpoints.size() == 2 &&
+                  got.checkpoints[0].source == R && got.checkpoints[1].source == T);
+        }
+        remove_dir(d2);
+        // two chats that share a root: its state file is shared, and stays while either chat is stored
+        const std::string d3 = dir + "-share";
+        std::vector<int32_t> b = a;
+        for (size_t i = 1500; i < b.size(); ++i) b[i] = (int32_t) (i * 13 + 2);
+        SavedConversation sb = chat(b, {{1000, R}, {7000, T}, {8000, T}, {9000, T}});
+        copy_state_bytes(sb.checkpoints[0], sa.checkpoints[0]);
+        {
+            SavedConversation first = sa;
+            ConversationStore probe;
+            CHECK(probe.open(d3, id, 1ull << 30, err));
+            CHECK(probe.put(std::move(first), 1ull << 30));
+            probe.flush();
+        }
+        const uint64_t one = dir_bytes(d3);
+        ConversationStore st;
+        CHECK(st.open(d3, id, one + one / 4, err));
+        CHECK(st.stats().files == 1 && state_files(d3) == 4);
+        CHECK(st.put(SavedConversation(sb), 1ull << 30));
+        st.flush();
+        CHECK(st.stats().files == 1 && st.stats().evicted == 1);   // the first chat went out of the budget
+        CHECK(state_files(d3) == 4);   // its three turn ends are gone; the shared root stays with the second
+        std::vector<int32_t> p(b.begin(), b.begin() + 7500);
+        p.push_back(-5);
+        auto m = st.best(p.data(), p.size(), {}, true);
+        CHECK(m.tokens == 7000);
+        SavedConversation got;
+        CHECK(st.load(m, got, err));
+        CHECK(same_state(got.live, sb.checkpoints[1]) && same_state(got.checkpoints[0], sa.checkpoints[0]));
+        remove_dir(d3);
     }
     std::vector<basalt::platform::DirFile> left;
     if (basalt::platform::list_files(dir, left))
