@@ -64,6 +64,7 @@ private:
     /// Y = X . W^T on the shape's pinned cuBLASLt algorithm (`type`: a cudaDataType_t); false: the shape has none.
     bool pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                 float beta);
+    void free_plans();
 
     void* handle_ = nullptr;
     Plans* plans_ = nullptr;
