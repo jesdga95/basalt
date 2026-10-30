@@ -319,7 +319,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     // window (plus the cells a round writes ahead of its queries) over a host copy, refilled on a resume. The host copy
     // is pinned after the expert arena has pinned what it could: if it does not fit, the K/V stays whole in VRAM.
     int64_t ring = (window > 0 && window < max_cells) ? window + 4 * (int64_t) max_t + 64 : 0;
-    // K8V4 never applies to the drafter: its own attention paths (below, and verify.cpp) handle whole formats
+    // K8V4 never applies to the drafter: its own attention paths (below, and src/core/verify/) handle whole formats
     // only, whatever ring shape it takes (0, a window, or the -1 fully-resident fallback).
     const bool kv_hybrid_was = qsa_kv_hybrid();
     const bool kv_int8_was = qsa_kv_int8();
@@ -1027,7 +1027,7 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
         return false;
     }
     cudaGraphDestroy(graph);
-    // an explicit upload: the first launch's implicit one blocked behind a device-side spin (verify.cpp)
+    // an explicit upload: the first launch's implicit one blocked behind a device-side spin (src/core/verify/)
     cudaGraphUpload(exec, cs);
     cudaStreamSynchronize(cs);
     return true;

@@ -84,7 +84,17 @@ std::string python_interpreter(const std::string& src_dir) {
 
 void prefer_oom_victim() {}
 
+bool keep_full_speed() {
+    PROCESS_POWER_THROTTLING_STATE s{};
+    s.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    s.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;   // the process sets its execution speed itself
+    s.StateMask = 0;                                            // and it is never lowered
+    return SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &s, sizeof s) != 0;
+}
+
 bool gpu_peer_access() { return false; }
+
+bool gpu_memory_pages() { return true; }
 
 bool stderr_is_terminal() {
     if (!_isatty(_fileno(stderr))) return false;
@@ -136,7 +146,12 @@ void prefer_oom_victim() {
     if (std::FILE* f = std::fopen("/proc/self/oom_score_adj", "w")) { std::fputs("1000", f); std::fclose(f); }
 }
 
+bool keep_full_speed() { return true; }   // the scheduler does not slow a process for its window's state
+
 bool gpu_peer_access() { return true; }
+
+// WSL2 reaches the GPU through the Windows driver, which pages
+bool gpu_memory_pages() { return host_os_name() == "WSL2"; }
 
 bool stderr_is_terminal() { return isatty(STDERR_FILENO) != 0; }
 

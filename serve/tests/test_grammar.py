@@ -254,12 +254,14 @@ class EngineStart(unittest.TestCase):
     def engine_args(self, server_block, cli=(), flags=b"\0--grammar\0--kv\0"):
         from unittest import mock
         from serve import server
-        from serve.engine.errors import EngineStartError
         seen = {}
+
+        class Stop(Exception):
+            pass
 
         def fake(binary, args, **kw):
             seen["args"] = list(args)
-            raise EngineStartError("stopped for the test", None)
+            raise Stop
         with tempfile.TemporaryDirectory() as d:
             eng = Path(d) / "eng"
             eng.write_bytes(flags)
@@ -277,7 +279,10 @@ class EngineStart(unittest.TestCase):
                     mock.patch.dict(sys.modules, {"tokenizer": types.SimpleNamespace(Tokenizer=lambda *a: ByteTokenizer())}), \
                     mock.patch.object(server, "ProcessEngine", fake), \
                     mock.patch.object(server, "gpu_plan", return_value=ONE_CARD):
-                server.main()
+                try:
+                    server.main()
+                except Stop:
+                    pass
         return seen["args"]
 
     def test_config_file(self):
