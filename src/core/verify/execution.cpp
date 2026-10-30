@@ -13,6 +13,7 @@
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/kernels/wait_abort.hpp"
 #include "basalt/kernels/dec_moe.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>
@@ -77,6 +78,7 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     last_batch_ = false;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU; restart the engine"; return false; }
+    if (wait_abort_code() != 0) { err = "verify: a device wait timed out in an earlier window; restart the engine"; return false; }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
@@ -302,6 +304,14 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
     return 1;
 }
 
+// The window's results are garbage when one of its bounded device waits timed out (wait_abort.hpp).
+bool Verifier::window_intact(std::string& err) {
+    const unsigned long long code = basalt::kernels::wait_abort_code();
+    if (code == 0) return true;
+    err = "verify: a device wait timed out (" + basalt::kernels::wait_abort_text(code) + "); the window is discarded; restart the engine";
+    return false;
+}
+
 // The window's end: the GPU's finish, the profile, and on the last stage the head's picks.
 bool Verifier::run_end(int32_t* out, std::string& err) {
     using namespace basalt::kernels;
@@ -318,7 +328,8 @@ bool Verifier::run_end(int32_t* out, std::string& err) {
     // with cudaStreamQuery here would cost decode time (a core calling the driver beside the expert workers).
     const cudaError_t se = cudaStreamSynchronize(cs_);
     gm.mark(-1);
-    if (!dm_end(err)) return false;
+    const bool dm_ok = dm_end(err);
+    if (!window_intact(err) || !dm_ok) return false;
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // the table changed under the window
         *(volatile uint32_t*) h_plan_err_ = 0;

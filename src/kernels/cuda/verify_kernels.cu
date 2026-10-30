@@ -3,6 +3,7 @@
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/kernels/wait_abort.hpp"
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/core/draft_cum.hpp"
@@ -375,16 +376,18 @@ __device__ __forceinline__ unsigned long long globaltimer() {
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     return t;
 }
-// Block-wide wait until *p == want (bounded: a commit that never ran traps instead of hanging).
-__device__ __forceinline__ void spin_until_eq(const uint32_t* p, uint32_t want) {
+// Block-wide wait until *p == want, bounded (wait_abort.hpp): a commit that never ran sets the abort word and the
+// wait falls through instead of hanging.
+constexpr unsigned long long kFinisherBoundNs = 2000000000ull;
+__device__ __forceinline__ void spin_until_eq(const uint32_t* p, uint32_t want, unsigned long long* abort, int what) {
     if (threadIdx.x == 0 && threadIdx.y == 0) {
         const unsigned long long t0 = globaltimer();
         while (ld_acquire(p) != want) {
             __nanosleep(64);
-            if (globaltimer() - t0 > 2000000000ull) {
-                printf("basalt: error: commit finisher: block %d waited 2 s for %u (word %u)\n", (int) blockIdx.x, want, ld_acquire(p));
-                __trap();
-            }
+            const unsigned long long el = globaltimer() - t0;
+            if (el > kWaitPollNs &&
+                wait_give_up(abort, el, kFinisherBoundNs, wait_abort_code_of(kWaitCommitFinisher, (unsigned) what, 0u, blockIdx.x)))
+                break;
         }
     }
     __syncthreads();
@@ -472,7 +475,8 @@ __global__ void __launch_bounds__(32 * RG) gdn_commit_layers_dyn_kernel(GdnCommi
 // The first node of a window: when the newest epoch has not been finished by a finisher yet, claims what the commit
 // kernel has not and returns once every item of the epoch is done and its indexer and PLE commits have completed; the
 // epoch is then marked finished.  The host has seen the epoch's begin kernel run before it launches the window.
-__global__ void __launch_bounds__(32 * RG) gdn_commit_finish_kernel(GdnCommitLayers a, int conv_blocks, CommitCtl* ctl) {
+__global__ void __launch_bounds__(32 * RG) gdn_commit_finish_kernel(GdnCommitLayers a, int conv_blocks, CommitCtl* ctl,
+                                                                     unsigned long long* abort) {
     __shared__ uint32_t s_e, s_f;
     if (threadIdx.x == 0 && threadIdx.y == 0) {
         s_e = ld_acquire(ctl->w + (size_t) kCtlWords * 8);
@@ -482,12 +486,12 @@ __global__ void __launch_bounds__(32 * RG) gdn_commit_finish_kernel(GdnCommitLay
     const uint32_t e = s_e;
     if (e == s_f) return;
     const int set = (int) (e & 1u);
-    spin_until_eq(ctl_word(ctl, set, 2), e);
+    spin_until_eq(ctl_word(ctl, set, 2), e, abort, 1);
     const int n = min(__ldcg(a.n_keep), kVerifyMaxT);
     commit_drain(a, n, conv_blocks, ctl_word(ctl, set, 0), ctl_word(ctl, set, 1));
     const int total = (a.h_v * (S / 32) + conv_blocks) * a.n_layers;
-    spin_until_eq(ctl_word(ctl, set, 1), (uint32_t) total);
-    spin_until_eq(ctl_word(ctl, set, 3), e);
+    spin_until_eq(ctl_word(ctl, set, 1), (uint32_t) total, abort, 2);
+    spin_until_eq(ctl_word(ctl, set, 3), e, abort, 3);
     if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
         __threadfence();
         st_release(ctl->w + (size_t) kCtlWords * 9, e);
@@ -1091,7 +1095,7 @@ void gdn_commit_finish(const GdnCommitLayers& a, CommitCtl* ctl, void* stream, i
     if (a.n_layers <= 0) return;
     const int conv_blocks = (a.C + 32 * RG - 1) / (32 * RG);
     gdn_commit_finish_kernel<<<(unsigned) (blocks > 0 ? blocks : 1), dim3(32, RG), 0, (cudaStream_t) stream>>>(
-        a, conv_blocks, ctl);
+        a, conv_blocks, ctl, wait_abort_device_word());
     check("gdn_commit_finish");
 }
 

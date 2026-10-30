@@ -22,6 +22,7 @@
 #include "basalt/kernels/s2_expert_grouped.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/kernels/wait_abort.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>
 #include <cmath>
@@ -111,6 +112,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
     basalt::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     basalt::kernels::hc_fused_init();
+    basalt::kernels::wait_abort_init();
     basalt::kernels::mid_chain_init();
     wt_ = &wt;
     g_ = &g;

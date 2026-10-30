@@ -411,6 +411,7 @@ private:
     bool run_begin(int T, const int32_t* tokens, int64_t pos0, std::string& err, cudaEvent_t after = nullptr);
     bool run_serve(PoolMultiFn pool, void* user, std::string& err);
     bool run_end(int32_t* out, std::string& err);
+    bool window_intact(std::string& err);   // after a window's sync: false when a bounded device wait of it timed out
     /// One step of the host's service of the window's rings: 1 = every ring served, 0 = the GPU has not reached the next
     /// one, -1 = an error.
     int serve_poll(PoolMultiFn pool, void* user, std::string& err);
