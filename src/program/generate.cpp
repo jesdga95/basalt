@@ -128,7 +128,7 @@
 
 namespace {
 
-using basalt::program::serve::kVramStallMib;
+using basalt::program::serve::vram_floor_mib;
 using basalt::program::serve::serve_growth_bytes;
 using basalt::program::engine_local::kSatBoost;
 
@@ -548,7 +548,7 @@ int main(int argc, char** argv) {
         }
     }
     basalt::kernels::RopeScaling rope_cfg;
-    if (const auto code = cli::validate_generation_options(o, multi_gpu, kVramStallMib, rope_cfg)) return *code;
+    if (const auto code = cli::validate_generation_options(o, multi_gpu, vram_floor_mib(), rope_cfg)) return *code;
 
     // **BEFORE ANYTHING ELSE.**  The CPU expert kernel is AVX-512 (VNNI + VBMI), so on a CPU without those features it
     // does not fail - it executes an illegal instruction at some unpredictable token.  Refusing at second zero is the
@@ -1886,12 +1886,20 @@ int main(int argc, char** argv) {
         // free VRAM after loading is the reserve itself
         int64_t late_b = o.serve ? (kWindowMib << 20) : 0;
         // the kernels that first run after the cache is sized (the prompt path's, the verify windows') load into the
-        // reserve when modules load lazily
+        // reserve when modules load lazily.  A server loading every kernel up front still loads cuBLAS's GEMM kernels on
+        // their first use and captures its window graphs after the cache, so the same room stays back for those, and
+        // batched serving adds the further slot sessions' solo windows and the batch windows.  This room loads into the
+        // reserve: the reserve is raised only when it cannot hold the room and still leave the floor free beside it.
+        int64_t late_room = 0;
         {
             const char* ml = std::getenv("CUDA_MODULE_LOADING");
             constexpr int64_t kLazyKernelsMib = 96;
-            if (ml == nullptr || std::strcmp(ml, "EAGER") != 0) late_b += kLazyKernelsMib << 20;
+            constexpr int64_t kSlotWindowsMib = 24;   // one session's solo windows, or the batch windows
+            if (o.serve || ml == nullptr || std::strcmp(ml, "EAGER") != 0) late_room += kLazyKernelsMib << 20;
+            if (o.serve && o.batch >= 2 && slot0_is_solo) late_room += ((int64_t) o.batch * kSlotWindowsMib) << 20;
         }
+        const int64_t reserve_b = std::max<int64_t>((int64_t) o.vram_reserve_mib << 20,
+                                                    late_room + ((int64_t) vram_floor_mib() << 20));
         // the GDN mixer split by key head loads CUDA0's share of the GDN layers after the cache is sized
         if (o.peer_device >= 1) {
             int d0 = 0;
@@ -1904,7 +1912,7 @@ int main(int argc, char** argv) {
             std::string ce;
             if (basalt::core::conversation_state_sizes(g, zc, ce)) late_b += (int64_t) zc.gdn;
         }
-        const int64_t base_b = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + late_b;
+        const int64_t base_b = reserve_b + ((int64_t) prefill_mib << 20) + mtp_bind + late_b;
         // the RAM copy of the experts the cache does not hold is page-locked and mapped, which takes device memory per
         // GiB mapped: a 1 GiB probe gives the rate, applied to the experts that stay out of the cache
         if (o.serve && o.resident_cpu_experts && expert_total_bytes > 0) {
@@ -1923,14 +1931,19 @@ int main(int argc, char** argv) {
             }
             cudaGetLastError();
         }
-        const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + late_b;
+        const int64_t reserve = reserve_b + ((int64_t) prefill_mib << 20) + mtp_bind + late_b;
         const int64_t blob = (int64_t) cache_slot_bytes;
         int64_t slots = ((int64_t) free_b - reserve) / blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
-        basalt::log::info("basalt generate", "expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
+        // a reserve raised to hold the late room says what was asked
+        const std::string raised = reserve_b > ((int64_t) o.vram_reserve_mib << 20)
+            ? " (" + std::to_string(o.vram_reserve_mib) + " asked, raised to hold " + std::to_string(late_room >> 20) +
+                  " MiB that loads into it and the " + std::to_string(vram_floor_mib()) + " MiB floor)"
+            : std::string();
+        basalt::log::info("basalt generate", "expert cache auto: %.2f GiB free, %d MiB reserved%s (+%lld MiB for the "
                              "draft head, +%lld MiB for what loads after) -> %d slots",
-                     (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20),
+                     (double) free_b / 1073741824.0, (int) (reserve_b >> 20), raised.c_str(), (long long) (mtp_bind >> 20),
                      (long long) (late_b >> 20), o.expert_cache);
         // The batch slots' sessions came out of the same VRAM: say when that leaves the cache short of the expert set
         // (experts then swap in and out per token) or of half of what it would hold without them.
@@ -1962,7 +1975,8 @@ int main(int argc, char** argv) {
             const int64_t fit_mib = ((int64_t) free_b - mtp_bind - late_b - min_slots * blob) / (1 << 20) - prefill_mib;
             if (fit_mib >= kSmallReserveMib) {
                 const int r = (int) std::min<int64_t>(fit_mib, o.vram_reserve_mib);
-                int64_t s2 = ((int64_t) free_b - ((((int64_t) r + prefill_mib) << 20) + mtp_bind + late_b)) / blob;
+                const int64_t rb = std::max<int64_t>((int64_t) r << 20, late_room + ((int64_t) vram_floor_mib() << 20));
+                int64_t s2 = ((int64_t) free_b - (rb + ((int64_t) prefill_mib << 20) + mtp_bind + late_b)) / blob;
                 if (!profile.empty()) s2 = std::min<int64_t>(s2, (int64_t) profile.size());
                 basalt::log::warn("basalt generate", "expert cache auto: the %d MiB reserve leaves too few slots on "
                                      "this card (a working cache needs %lld): a %d MiB reserve instead -> %lld slots",
@@ -1975,7 +1989,8 @@ int main(int argc, char** argv) {
             // what is short, and what makes room: the numbers a small card picks from
             const int64_t at_reserve = o.vram_reserve_given ? o.vram_reserve_mib
                                                             : std::min(o.vram_reserve_mib, kSmallReserveMib);
-            const int64_t need_b = (((int64_t) at_reserve + prefill_mib) << 20) + mtp_bind + late_b + min_slots * blob;
+            const int64_t need_b = std::max<int64_t>(at_reserve << 20, late_room + ((int64_t) vram_floor_mib() << 20)) +
+                                   ((int64_t) prefill_mib << 20) + mtp_bind + late_b + min_slots * blob;
             const int64_t short_mib = std::max<int64_t>(1, (need_b - (int64_t) free_b + (1 << 20) - 1) >> 20);
             const int64_t session_mib =
                 (int64_t) (basalt::core::session_bytes(g, o.max_context, K, 0, g.n_layers) >> 20);

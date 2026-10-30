@@ -130,9 +130,9 @@ bool Runtime::vram_command(const std::string& cmd, std::string& e, bool for_slee
     const bool bare = cmd.find_first_not_of(' ', 4) == std::string::npos;
     const long long reserve = bare ? (long long) o.vram_reserve_mib : std::strtoll(cmd.c_str() + 4, &end, 10);
     if (!bare && (end == cmd.c_str() + 4 || reserve < 0)) { e = "expected: VRAM [reserve_mib]"; return false; }
-    if (reserve < kVramStallMib && !for_sleep) {
-        e = "VRAM: a reserve below " + std::to_string(kVramStallMib) + " MiB lets requests stall; the smallest "
-            "safe value is " + std::to_string(kVramStallMib);
+    if (reserve < vram_floor_mib() && !for_sleep) {
+        e = "VRAM: a reserve below " + std::to_string(vram_floor_mib()) + " MiB is too small for what is allocated "
+            "after loading; the smallest safe value is " + std::to_string(vram_floor_mib());
         return false;
     }
     if ((!o.vram_elastic && !for_sleep) || !xcache.segmented()) {

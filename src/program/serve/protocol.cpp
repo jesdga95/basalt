@@ -243,7 +243,7 @@ int Runtime::init_protocol() {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         const int64_t free_mib = (int64_t) (free_b >> 20);
-        if (free_mib >= kVramStallMib) {
+        if (free_mib >= vram_floor_mib()) {
             basalt::log::info("basalt serve", "%lld MiB of VRAM free with everything loaded", (long long) free_mib);
         } else {
             basalt::log::warn("basalt", "only %lld MiB of VRAM free, requests may stall; close other "

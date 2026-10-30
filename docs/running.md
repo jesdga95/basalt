@@ -199,8 +199,9 @@ longer time.
 
 Basalt refuses settings that would leave the machine without memory, and never shrinks what you asked for:
 
-- `--vram-reserve-mib` below 256 is refused at startup: with less VRAM free once everything is loaded, a later
-  allocation can make the driver page GPU memory and requests stall.
+- `--vram-reserve-mib` below 256 is refused at startup on Windows and WSL2: with less VRAM free once everything is
+  loaded, a later allocation can make the driver page GPU memory and requests stall. On Linux, where the driver fails
+  such an allocation instead, the floor is 128.
 - When some experts are read from the SSD (they fit in neither the GPUs nor the RAM copy), the RAM copy leaves a
   floor free for the OS file cache: the RAM margin (2 GiB or 5% of the RAM, the larger) plus the larger of 4 GiB and
   what one prompt chunk reads from the file (up to 3.5 GiB for the lent GPU slots, plus the SSD-held experts of two
