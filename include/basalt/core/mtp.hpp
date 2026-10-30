@@ -34,6 +34,7 @@
 namespace basalt::core {
 
 class NativeHead;
+struct ConversationKv;
 
 /// The longest draft chain (the drafter's `max_t`): a verify window holds at most kVerifyMaxT rows, a chain may run on
 /// past it so a window launched ahead has drafts.
@@ -139,6 +140,10 @@ public:
     bool use_main(std::string& err) { return use_store(n_stores_, err); }
     /// Cells [0, cells) of sequence `from` into sequence `to`.
     bool copy_store(int from, int to, int64_t cells, std::string& err);
+    /// Cells [0, cells) of sequence `id` as a conversation image of the working state's layout (the pages its store
+    /// keeps; the others are the working state's bytes), leaving the working state on the sequence it holds.
+    /// The device is idle.
+    bool save_store(int id, int64_t cells, ConversationKv& out, std::string& err);
     /// `draft` for sequence `id` from the window rows `R_rows` (device, row 0 of the sequence's segment).
     /// Copies a verify window's rows (all slots) out of the buffer the draft graphs also use, so each slot's
     /// `draft_seq` / `defer_rows` reads its own rows intact; null on failure.

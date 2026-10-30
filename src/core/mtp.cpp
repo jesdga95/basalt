@@ -1,5 +1,6 @@
 // src/core/mtp.cpp - see include/basalt/core/mtp.hpp.
 #include "basalt/core/mtp.hpp"
+#include "basalt/core/conversation_snapshot.hpp"
 #include "basalt/core/verify.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/draft_cum.hpp"
@@ -1700,6 +1701,42 @@ bool MtpDrafter::copy_store(int from, int to, int64_t cells, std::string& err) {
     store_hi_[(size_t) to] = std::min<int64_t>({cells, st_.max_cells, store_pages_[(size_t) to] * ps});
     if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: copying the K/V failed"; return false; }
     return true;
+}
+
+bool MtpDrafter::save_store(int id, int64_t cells, ConversationKv& out, std::string& err) {
+    if (n_stores_ == 0) return conversation_kv_save(out, st_, *g_, cells, false, err);
+    if (id < 0 || id > n_stores_) { err = "mtp: no such K/V store"; return false; }
+    const int prev = cur_;
+    if (!pend_tok_[(size_t) id].empty()) {
+        // its deferred rows are computed in the working state; the sequence there comes back whole within its ring
+        note_cells(0, store_hi_[(size_t) prev]);
+        if (!flush(id, err)) return false;
+    }
+    if (!conversation_kv_save(out, st_, *g_, cells, false, err)) return false;
+    if (cur_ != id) {   // the pages the store keeps, over the working state's
+        const OnDevice on_device(device_);
+        KvArr lay[4];
+        const int na = kv_layout(lay);
+        ConversationBuffer* dst[4] = {&out.k, &out.v, &out.k_scale, &out.v_scale};
+        const int64_t ps = shapes_of(*g_).page_size, ring = store_ring_[(size_t) id];
+        const int64_t n1 = std::min<int64_t>(store_pages_[(size_t) id], (cells + ps - 1) / ps);
+        for (int64_t p = std::max<int64_t>(0, n1 - ring); p < n1;) {
+            const int64_t n = std::min(n1 - p, ring - p % ring);
+            for (int i = 0; i < na; ++i) {
+                const uint8_t* src = (const uint8_t*) stores_[(size_t) id][(size_t) i] +
+                                     (uint64_t) (p % ring) * lay[i].page_bytes;
+                const size_t off = (size_t) ((uint64_t) p * lay[i].page_bytes);
+                if (!dst[i]->visit(off, (size_t) ((uint64_t) n * lay[i].page_bytes), [&](uint8_t* q, size_t m, size_t at) {
+                        return cudaMemcpy(q, src + (at - off), m, cudaMemcpyDeviceToHost) == cudaSuccess;
+                    })) {
+                    err = "mtp: saving the K/V failed";
+                    return false;
+                }
+            }
+            p += n;
+        }
+    }
+    return cur_ == prev || use_store(prev, err);
 }
 
 QsaState& MtpDrafter::kv_state_rw() {
