@@ -202,8 +202,20 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
             }
         }
         else if (a == "--control-vector-layer-range") {
-            o.cvec_first = std::atoi(next("--control-vector-layer-range"));
-            o.cvec_last = std::atoi(next("--control-vector-layer-range"));
+            int layer[2] = {};
+            for (int& value : layer) {
+                const std::string text = next("--control-vector-layer-range");
+                int64_t number = 0;
+                const auto result = std::from_chars(text.data(), text.data() + text.size(), number);
+                if (result.ec != std::errc{} || result.ptr != text.data() + text.size() ||
+                    number < 0 || number > INT32_MAX) {
+                    basalt::log::error("basalt", "--control-vector-layer-range needs two nonnegative integers within range");
+                    return 2;
+                }
+                value = (int) number;
+            }
+            o.cvec_first = layer[0];
+            o.cvec_last = layer[1];
         }
         else if (a == "--cvec-mode") {
             const std::string m = next("--cvec-mode");
