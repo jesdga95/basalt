@@ -315,6 +315,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             (head_->type() == 13
                  ? basalt::kernels::q5k_proxy_top1(proxy_, dhead_, xq_, (int) nv, n_tier1_, dvocab_, out_ids_, probs_,
                                                    proxy_scratch_, cs)
+             : head_->type() == GGML_Q8_0
+                 ? basalt::kernels::q80_proxy_top1(proxy_, head_->weights(), xq_, (int) nv, n_tier1_, dvocab_, out_ids_,
+                                                   probs_, proxy_scratch_, cs, true)
                  : basalt::kernels::q6k_proxy_top1(proxy_, rows_mapped_ ? head_->weights() : (const void*) dhead_, xq_,
                                                    (int) nv, n_tier1_, dvocab_, out_ids_, probs_, proxy_scratch_, cs,
                                                    rows_mapped_)))
@@ -323,7 +326,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             q5k_head_top1(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, sub ? dvocab_ : nullptr,
                           out_ids_, probs_, top_scratch_, cs))
             return true;
-        if (rows_mapped_)   // the subset's rows of the main head, one row a step: the bits of the copy's rows
+        if (rows_mapped_ && head_->type() == GGML_Q8_0)   // the subset's rows of the main head: the bits of a copy's rows
+            q80_mmvq_rows(head_->weights(), dvocab_, xq_, head_logits_, (int) N, (int) nv, cs);
+        else if (rows_mapped_)
             native_q6_k_mmvq_rows(head_->weights(), dvocab_, xq_, head_logits_, (int) N, (int) nv, cs);
         else if (head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits
             q5k_head_mmvq(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
