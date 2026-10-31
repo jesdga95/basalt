@@ -20,6 +20,7 @@ using basalt::platform::DirectFile;
 using basalt::platform::Completion;
 
 static void check(bool ok, const char* why) { if (!ok) throw std::runtime_error(why); }
+struct FileCloser { void operator()(std::FILE* f) const { std::fclose(f); } };
 
 /// Reports a call that names its own failure. Handing `error.c_str()` straight to `check` would read the string
 /// before the call that fills it, and that write can move the buffer, so the message is taken after it returned.
@@ -122,7 +123,7 @@ static void test_bounded_opens() {
         }
     }
     // The expert source reads the pack through its own handle at the same time; these reads must not move it.
-    std::unique_ptr<std::FILE, decltype(&std::fclose)> plain(open_file_utf8(fx.name, "rb"), &std::fclose);
+    std::unique_ptr<std::FILE, FileCloser> plain(open_file_utf8(fx.name, "rb"));
     check(plain != nullptr, "cannot open the file for positional reads");
     check(fseek64(plain.get(), page + 23) == 0, "cannot position the positional reader");
     call_ok(first.submit(0, fx.at(0), page, 100, error), error, "submit beside a positional reader");

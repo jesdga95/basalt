@@ -240,11 +240,6 @@ std::vector<float> download(const Dev& d, size_t n) {
     ck(cudaMemcpy(h.data(), d.p, n * 4, cudaMemcpyDeviceToHost), "download");
     return h;
 }
-std::vector<int32_t> download_i(const Dev& d, size_t n) {
-    std::vector<int32_t> h(n);
-    ck(cudaMemcpy(h.data(), d.p, n * 4, cudaMemcpyDeviceToHost), "download");
-    return h;
-}
 
 
 // part 1: the CPU pool and MMQ against the reference

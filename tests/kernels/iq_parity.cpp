@@ -44,12 +44,12 @@ int main(int argc, char** argv) {
             continue;
         }
         int hdr[3];
-        std::fread(hdr, 4, 3, f);
+        if (std::fread(hdr, 4, 3, f) != 3) { std::fprintf(stderr, "short header\n"); std::exit(1); }
         const int type = hdr[0], rows = hdr[1], cols = hdr[2];
         std::vector<uint8_t> raw;
         { uint8_t buf[1 << 16]; size_t n; while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) raw.insert(raw.end(), buf, buf + n); }
         std::vector<float> ref((size_t) rows * cols);
-        std::fread(ref.data(), 4, ref.size(), g);
+        if (std::fread(ref.data(), 4, ref.size(), g) != ref.size()) { std::fprintf(stderr, "short reference\n"); std::exit(1); }
         std::fclose(f);
         std::fclose(g);
         void* dw = nullptr;

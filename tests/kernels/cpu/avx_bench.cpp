@@ -113,7 +113,7 @@ int main(int argc, char** argv) {
     std::vector<std::vector<uint8_t>> a_k(NT), a_0(NT), h_0(NT);
     std::vector<cpu::ActQ> a_1(NT), h_1(NT);
     const void *pk[8], *p0[8], *ph0[8];
-    const cpu::ActQ *p1[8], *ph1[8];
+    const cpu::ActQ* ph1[8];
     for (int t = 0; t < NT; ++t) {
         for (auto& v : xs[t]) v = nd(rng);
         for (auto& v : hs[t]) v = nd(rng);
@@ -125,7 +125,7 @@ int main(int argc, char** argv) {
         tq80->from_float(hs[t].data(), h_0[t].data(), NFF);
         cpu::act_quant_q8_1_avx2(xs[t].data(), NH, a_1[t]);
         cpu::act_quant_q8_1_avx2(hs[t].data(), NFF, h_1[t]);
-        pk[t] = a_k[t].data(); p0[t] = a_0[t].data(); ph0[t] = h_0[t].data(); p1[t] = &a_1[t]; ph1[t] = &h_1[t];
+        pk[t] = a_k[t].data(); p0[t] = a_0[t].data(); ph0[t] = h_0[t].data(); ph1[t] = &h_1[t];
     }
     std::vector<std::vector<float>> ffv(NT, std::vector<float>(NFF)), outv(NT, std::vector<float>(NH));
     // per-thread outputs: each thread writes its own rows, so sharing the arrays is safe

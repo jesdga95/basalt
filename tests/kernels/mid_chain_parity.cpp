@@ -511,7 +511,7 @@ int main(int argc, char** argv) {
         const size_t cnt = (size_t) NL * kMidStampCtas * kMidStampPts;
         CK(cudaMalloc(&sd, cnt * 8));
         // the stamp points (the kernel's enum)
-        const int E_ENTRY = 0, E_WAIT = 1, E_TILE0 = 2, E_PAIR_REL = 9, E_PZ_REL = 11, E_PAIR_END = 13, E_REQ0 = 14, E_REQ1 = 15, E_OFULL = 16, E_RPAIR = 17,
+        const int E_WAIT = 1, E_PAIR_REL = 9, E_PZ_REL = 11, E_PAIR_END = 13, E_REQ0 = 14, E_REQ1 = 15, E_OFULL = 16, E_RPAIR = 17,
                   E_RSTATE = 18, E_RTOK = 19, E_RPZ = 20, E_RREC = 21, E_OREC = 22, E_ODONE = 23;
         std::printf("phase ledger (cold, 48 layers, PDL; us after the first CTA's wait; first/median/last over CTAs, median over layers):\n");
         std::printf("  T  pair-end f/m/l        C_PAIR  C_PZ   C_REC  | rec: pair->state state->tok tok->PZ(slack) | last-out CTA: req0 req1 C_REC-seen ofull  done | k_mid end\n");

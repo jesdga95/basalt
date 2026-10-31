@@ -48,7 +48,7 @@ int run() {
     basalt::kernels::cpu::NativeFmt fmt;
     std::string err;
     require(basalt::kernels::cpu::native_fmt(GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, 2560, 640, fmt, err), err);
-    const uint64_t blob = (uint64_t) fmt.bytes, layer_bytes = blob * experts, total = layer_bytes * layers;
+    const uint64_t blob = (uint64_t) fmt.bytes, layer_bytes = blob * experts;
     std::ostringstream text;
     for (int64_t l = 0; l < layers; ++l)
         text << l << ' ' << GGML_TYPE_IQ3_XXS << ' ' << GGML_TYPE_IQ4_NL << ' ' << (uint64_t) l * layer_bytes << ' '

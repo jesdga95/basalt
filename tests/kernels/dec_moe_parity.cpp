@@ -755,7 +755,7 @@ int main(int argc, char** argv) {
                                                (const uint8_t*) (h_x + (size_t) 5 * MT * H + (size_t) T * H));
                 const std::vector<uint8_t> xqm0(h_xq + 5 * xq_stride, h_xq + 5 * xq_stride + q1.size());
                 const uint32_t w0 = h_words[0], w16 = h_words[16];
-                std::memset(h_rings + 5, 0, sizeof(K::DmRing));
+                h_rings[5] = K::DmRing{};
                 std::memset(h_x + (size_t) 5 * MT * H, 0, (size_t) T * H * 4);
                 std::memset(h_xq + 5 * xq_stride, 0, q1.size());
                 h_words[0] = h_words[16] = 0;
@@ -1002,7 +1002,7 @@ int main(int argc, char** argv) {
                                                    (const uint8_t*) (h_x + (size_t) 5 * MT * H + (size_t) T * H));
                     const size_t nq = (size_t) T * H / 32 * 36;
                     const std::vector<uint8_t> xqm0(h_xq + 5 * xq_stride, h_xq + 5 * xq_stride + nq);
-                    std::memset(h_rings + 5, 0, sizeof(K::DmRing));
+                    h_rings[5] = K::DmRing{};
                     std::memset(h_x + (size_t) 5 * MT * H, 0, (size_t) T * H * 4);
                     std::memset(h_xq + 5 * xq_stride, 0, nq);
                     h_words[0] = h_words[16] = 0;
@@ -1032,7 +1032,7 @@ int main(int argc, char** argv) {
                     {
                         std::memset(h_xq + 5 * xq_stride, 0, nq);
                         std::memset(h_x + (size_t) 5 * MT * H, 0, (size_t) T * H * 4);
-                        std::memset(h_rings + 5, 0, sizeof(K::DmRing));
+                        h_rings[5] = K::DmRing{};
                         h_words[0] = h_words[16] = 0;
                         unsigned int* d_pc = dmal<unsigned int>(3);
                         const unsigned int counts[3] = {81, 1, 1};

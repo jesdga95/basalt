@@ -591,7 +591,7 @@ int main() {
     const basalt::platform::LockResult r = basalt::platform::lock_resident(p, bytes);
     std::printf("lock_resident: ok=%d locked=%llu KiB of %llu KiB (%s)\n", (int) r.ok,
                 (unsigned long long) (r.locked_bytes >> 10), (unsigned long long) (bytes >> 10), r.note.c_str());
-    int fail = !(r.ok && r.locked_bytes == bytes) | fail_keeps;
+    int fail = !(r.ok && r.locked_bytes == bytes) || fail_keeps;
     basalt::platform::unlock_resident(p, bytes);
 #if defined(_WIN32)
     // A successful lock proves nothing on its own: an elevated token locks the region with a soft minimum too. The
