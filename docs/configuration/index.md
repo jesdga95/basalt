@@ -231,13 +231,24 @@ The engine loads the vector; a request controls it with the request field `cvec:
 out uses the server's [`cvec`](#server) option (config `"server": {"cvec": false}`), then the model file's
 `sampling.cvec`, then on when a vector is loaded.
 
+`--control-vector-scaled` takes one or more `FILE:SCALE` entries. For each layer the files' scaled
+`direction.<layer>` tensors are summed; `add` adds that sum, `project` normalizes it to `v` and uses the sum's norm as
+`s` in `h -= s (h.v) v`. With a unit direction, `SCALE 1` removes the component and `2` reflects it.
+`--cvec-dir single:L` uses layer L's direction for every steered layer, in `project` mode only.
+
+Two limits apply. With `--parallel`, all requests in flight must use the same `cvec` state: the engine's enable
+flag is process-wide, so mixing `cvec: true` and `cvec: false` across concurrent slots is not supported. And the disk
+conversation tier keys a control vector by its path and scale, not its contents: replacing a vector file at the same
+path can restore a conversation cached under the old contents; remove the model cache's `conversations` folder after
+changing a vector in place.
+
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
 | `control-vector` | engine | file path | off | A control vector at scale 1. |
-| `control-vector-scaled` | engine | `FILE:SCALE[,...]` | off | Control vectors with their scales. |
-| `control-vector-layer-range` | engine | two layer numbers: `A B` on the command line, `[A, B]` in JSON | 1 to the last layer | The layers it follows, inclusive. |
-| `cvec-mode` | engine | `add`, `project` | `add` | `add`: h += s v. `project`: h -= s (h.v) v with v a unit vector. |
-| `cvec-dir` | engine | `per-layer`, `single:L` | `per-layer` | Each layer's own direction, or layer L's direction everywhere (`project`). |
+| `control-vector-scaled` | engine | `FILE:SCALE[,...]` | off | Control vectors with their scales; per layer the scaled directions are summed. |
+| `control-vector-layer-range` | engine | two layer numbers: `A B` on the command line, `[A, B]` in JSON; `A <= B` | 1 to the last layer | The layers it follows, inclusive. `B` past the last layer is clamped to it; `A` past it is an error. |
+| `cvec-mode` | engine | `add`, `project` | `add` | `add`: h += s v (s = 1). `project`: h -= s (h.v) v with v unit and s the summed direction's norm. |
+| `cvec-dir` | engine | `per-layer`, `single:L` | `per-layer` | Each layer's own direction, or layer L's direction everywhere (`project` only). |
 
 ## Sampling
 
