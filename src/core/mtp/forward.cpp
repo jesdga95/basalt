@@ -63,6 +63,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
     // chain-step kernels that start while the one before them still runs (the paths below all use the fused kernels)
     const bool pdl_ok = kv_par && !st_.kv_rot && qsa_dec_fused_supported(s) &&
                         qsa_dec_attn_supported(qsa_attn_pools(st_), s) && par_ && dec_draft_hcf() && have_pre_;
+    // in every full row the head's blocks start with the final mixer read (they read only weights before they wait)
+    const bool head_pdl = pdl_ok || (full && par_ && dec_draft_hcf());
     std::unique_ptr<PdlScope> psc;
     auto pscope = [&](bool first_plain) {
         psc.reset();
@@ -293,7 +295,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             if (T != 1) { err = "mtp: the one-kernel mixer read runs one row"; return false; }
             HcFusedArgs h = hcf_args(fa, 1, xn_);
             if (hc_fused_q8_rows_ok()) { h.xq = xq_; mixer_q8 = true; }
-            h.next_early = pdl_ok;   // the head's blocks start with the read
+            h.next_early = head_pdl;   // the head's blocks start with the read
             hc_fused_read(h, cs);
             pscope_off();
         } else {
@@ -304,7 +306,10 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                         sample_ + t * N, dummy_inj_, cs);
         }
         if (fold_write) fork_next_hidden();
-        if (mixer_q8) pscope(false);   // the head follows the read
+        if (mixer_q8 && head_pdl) {   // the head follows the read
+            psc.reset();
+            psc.reset(new PdlScope(true, false));
+        }
         if (!mixer_q8) native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dvocab_ != nullptr;
         // the argmax drafts over the base rows only on tier 0
