@@ -23,7 +23,8 @@ the sampler as sent.
 
 Other request fields the API reads: `max_tokens` / `max_completion_tokens` (the Anthropic `max_tokens`; `0` or
 `-1` means the rest of the context), `stop` / `stop_sequences`, `logit_bias`, `reasoning_effort`, `enable_thinking`
-and `reasoning_budget_tokens` (a cap on thinking tokens; `0` is none). Anthropic's `thinking.budget_tokens` and
+and `reasoning_budget_tokens` (a cap on thinking tokens; `0` is none), and `cvec` (`true` or `false`: switches a
+loaded control vector; see [Control vectors](index.md#control-vectors)). Anthropic's `thinking.budget_tokens` and
 llama.cpp's `thinking_budget_tokens` are the same budget, and `reasoning_budget_tokens` wins when more than one is
 sent. A request that names none of them takes the server's [`reasoning-budget-tokens`](index.md#server).
 
@@ -43,8 +44,9 @@ Only the thinking is watched; separators, padding, base64 and digit strings in a
 
 ### The model file's sampling defaults
 
-The model file's `meta` section carries a `sampling` object. Its keys are the request fields above, with the same
-meaning:
+The model file's `meta` section carries a `sampling` object. Its keys are the sampling fields above, with the same
+meaning, plus `cvec` (`true` or `false`, the [control-vector](index.md#control-vectors) state for requests that leave
+it out):
 
 | Key | Allowed values |
 | --- | --- |
