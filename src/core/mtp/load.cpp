@@ -210,6 +210,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
         xn_ = b.take<float>(T * HC * N);
         xq_ = b.take<uint8_t>(basalt::kernels::native_q8_1_bytes((int) (NH * HD), 8));
         xq2_ = b.take<uint8_t>(basalt::kernels::native_q8_1_bytes((int) (NH * HD), 8));
+        xqr_ = b.take<uint8_t>(basalt::kernels::native_q8_1_bytes((int) N, 1));
         qfull_ = b.take<float>(T * NH * 2 * HD); qcur_ = b.take<float>(T * NH * HD);
         kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);

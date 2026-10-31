@@ -76,11 +76,12 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             native_qsa_rms_norm_weighted(data, gamma, data, cols, rows, EPS, cs);
             native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), p, cs);
         };
+        bool kv_side = false;   // K/V on the second stream
         if (reuse_row) {
             // the catch-up already ran this row's input branches, attention hyper-connection and K/V append, with
             // the same per-row arithmetic: its R, injection and mixed rows become row 0
             mtp_take_row(R_, HC * N, inj_, HC, mixed_, N, row_, cs);
-            native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
+            native_quantize_q8_1(mixed_, kv_open_ ? xqr_ : xq_, (int) N, T, cs);
         } else {
             // ---- the two input branches
             const WeightRef* we = wt_->find("token_embd.weight");
@@ -137,8 +138,11 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             }
             // ---- attention: K/V into the layer's own cache, then (full) dense attention over every cell
             if (!q8_done) native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
-            if (kv_par) fork(cs);   // K/V on the second stream, beside Q
-            const cudaStream_t ckv = kv_par ? cs2_ : cs;
+            // K/V on the second stream, beside Q (a round's catch-up: beside the draft row's query, joined before its
+            // attention)
+            kv_side = kv_par || (kv_defer_ && !full && par_ && kv_fused);
+            if (kv_side) fork(cs);
+            const cudaStream_t ckv = kv_side ? cs2_ : cs;
             pscope(true);   // the K/V branch follows the fork
             native_mmvq(GGML_Q8_0, q8("self_attn.k_proj.weight"), xq_, kcur_, (int) N, (int) (NKV * HD), T, ckv);
             native_mmvq(GGML_Q8_0, q8("self_attn.v_proj.weight"), xq_, vcur_, (int) N, (int) (NKV * HD), T, ckv);
@@ -168,10 +172,14 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                                    vcur_ + t * NKV * HD, s, cs, &st_.host);
             }
         }
-        if (!full) return true;
+        if (!full) {
+            kv_open_ = kv_side && !kv_par;
+            return true;
+        }
         pscope(false);   // the query follows the hc read (or its quantize)
         if (T == 1)   // read once a step: streamed past the layer's other weights in L2
-            native_q8_0_mmvq_stream(q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), cs);
+            native_q8_0_mmvq_stream(q8("self_attn.q_proj.weight"), kv_open_ ? xqr_ : xq_, qfull_, (int) N,
+                                    (int) (NH * 2 * HD), cs);
         else
             native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
         if (!st_.kv_rot && qsa_dec_fused_supported(s)) {
@@ -191,7 +199,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         }
         const QsaAttnPools pools = qsa_attn_pools(st_);
         if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
-        if (kv_par) join(cs);
+        if (kv_par || kv_open_) join(cs);
+        kv_open_ = false;
         pscope(true);   // the attention follows the join
         bool aq_done = false;
         if (!st_.kv_rot && qsa_dec_attn_supported(pools, s)) {   // the gate in the merge writes the q8_1 rows
