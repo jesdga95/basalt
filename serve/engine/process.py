@@ -657,8 +657,8 @@ class ProcessEngine:
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
-        """`cvec=0|1` key for the speed-projection control vector (ignored by engines without one)."""
-        on = sampling.get("experimental_speed_projection")
+        """`cvec=0|1` key for the control-vector state (ignored by engines without one)."""
+        on = sampling.get("cvec")
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
     def _send(self, text: str):

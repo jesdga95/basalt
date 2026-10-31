@@ -151,6 +151,8 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str]):
         file_argv, file_words = load_config_file(a_cli.config, ap)
     a = ap.parse_known_args(file_argv + cli)[0]
     a.sampling_launch = {k: getattr(a, k) for k in SAMPLING_KEYS if getattr(a, k) is not None}
+    if a.cvec is not None:                                 # the control-vector default, not a sampling value
+        a.sampling_launch["cvec"] = a.cvec
     a.sampling_cli = {k for k in a.sampling_launch if getattr(a_cli, k) is not None}
     if a.vision == "":                                     # a bare --vision
         ap.error(VISION_USAGE)
@@ -260,9 +262,9 @@ SAMPLING_KEYS = {
 
 
 def checked_sampling(req: dict) -> None:
-    """A request's sampling fields against SAMPLING_KEYS (the model file's rules): ValueError naming the first one out
-    of range, so the request gets a 400 before streaming; a field left out or null takes the defaults.  A value is
-    never changed: what passes reaches the engine as sent."""
+    """A request's sampling fields against SAMPLING_KEYS (the model file's rules), plus the cvec switch: ValueError
+    naming the first one out of range, so the request gets a 400 before streaming; a field left out or null takes the
+    defaults.  A value is never changed: what passes reaches the engine as sent."""
     for key, (_, ok, expected) in SAMPLING_KEYS.items():
         value = req.get(key)
         if value is not None and not ok(value):
@@ -270,11 +272,14 @@ def checked_sampling(req: dict) -> None:
     rd = req.get("relaxed_drafting")
     if rd is not None and rd is not False and not (_num(rd) and 0 <= rd <= 1):
         raise ValueError(f"relaxed_drafting: expected false or a number 0..1, not {rd!r}")
+    cv = req.get("cvec")
+    if cv is not None and not isinstance(cv, bool):
+        raise ValueError(f"cvec: expected true or false, not {cv!r}")
 
 
 def sampling_defaults_from_config(cfg: dict) -> dict:
     """The model file's `sampling` block: defaults for fields a request omits (temperature, top_p, top_k, min_p,
-    presence/repetition/frequency penalties, penalty_last_n, seed). Request fields win; a bad value refuses to
+    presence/repetition/frequency penalties, penalty_last_n, seed, cvec). Request fields win; a bad value refuses to
     start; unknown keys are named and ignored."""
     out = {}
     for key, value in (cfg.get("sampling") or {}).items():
@@ -285,7 +290,7 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
             if not ok(value):
                 raise SystemExit(f"[server] error: sampling.{key}={value!r}: expected {expected}")
             out[key] = convert(value)
-        elif key == "experimental_speed_projection":
+        elif key == "cvec":
             if not isinstance(value, bool):
                 raise SystemExit(f"[server] error: sampling.{key}={value!r}: expected true or "
                                  "false (the default for requests that leave it out, when the engine has the vector)")
@@ -426,6 +431,9 @@ def build_parser() -> argparse.ArgumentParser:
             ("seed", "fix the random draw, an integer")):
         ap.add_argument(f"--{key}", type=sampling_option(key.replace("-", "_")), metavar="N", default=None,
                         help=f"default {key.replace('-', '_')} for requests that leave it out, over the model file's: {text}")
+    ap.add_argument("--cvec", action=argparse.BooleanOptionalAction, default=None,
+                    help="the control-vector state for requests that leave cvec out: --cvec on (the default when a "
+                         "vector is loaded), --no-cvec off; over the model file's sampling.cvec")
     ap.add_argument("--min-free-vram-mib", type=int, default=None,
                     help="load an unloaded model only when this much VRAM is free, else answer 503")
     ap.add_argument("--reasoning-budget-tokens", type=budget_count, default=None, metavar="N",
