@@ -59,6 +59,8 @@ struct KvStreamMap {
 };
 
 inline constexpr int kKvCtlInts = 16;   ///< [0] epoch [1] hand [2] misses [3] overflow; u64 at [4] misses, [6] lookups, [8] calls
+/// The fewest slots a streamed map may have: one step of the resolve's clock sweep (one thread per slot).
+inline constexpr int64_t kKvStreamMinSlots = 1024;
 /// Bytes of the map's arrays besides the page table (which the state already has): 5 per-slot ints + ctl.
 inline uint64_t kv_stream_map_bytes(int64_t n_slots) { return (uint64_t) n_slots * 4 * 5 + kKvCtlInts * 4; }
 
