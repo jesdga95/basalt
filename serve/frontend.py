@@ -646,10 +646,28 @@ class OutputParser:
         self.lead = False
         self.rtail = ""              # last reasoning character sent
         self.schemas = {t.get("name"): t for t in tools or []}
+        aliases = {}
+        for name in self.schemas:
+            if not isinstance(name, str):
+                continue
+            if "." in name:
+                namespace, member = name.rsplit(".", 1)
+                for alias in (f"{namespace}__{member}", f"{namespace}={member}", f"{namespace}_{member}", member):
+                    aliases.setdefault(alias, set()).add(name)
+            if "__" in name:
+                aliases.setdefault(name.replace("__", "_"), set()).add(name)
+        self.aliases = {alias: next(iter(names)) for alias, names in aliases.items()
+                        if len(names) == 1 and alias not in self.schemas}
         # stream_tools: also report a call while it is written ("tool_start", "tool_args" pieces) before "tool_call"
         self.stream_tools = stream_tools
         self.fence, self.line, self.ticks = "", "", 0     # code fence, current line and backticks of the answer so far
         self._reset_scan()
+
+    def _tool_name(self, name: str) -> str | None:
+        """Resolve only an exact declaration or an unambiguous spelling of one."""
+        name = name.strip()
+        name = self.aliases.get(name, name)
+        return name if not self.schemas or name in self.schemas else None
 
     def _track(self, text: str) -> str:
         """Follow the answer text that has gone out: the open code fence (``` or ~~~), the current line, and the
@@ -699,7 +717,9 @@ class OutputParser:
                 b = rest.find(">", a + 10) if a >= 0 else -1
                 if b < 0:
                     return out
-                name = rest[a + 10:b]
+                name = self._tool_name(rest[a + 10:b])
+                if name is None:
+                    return out
                 self.scall = ToolCall(name=name, arguments={})
                 props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
                 self.sdeclared = props
@@ -865,6 +885,23 @@ class OutputParser:
                     out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
                     self.buf = self.buf[i + len(CALL_START):]
                     continue
+                if self.schemas:
+                    body = self.buf[i + len(CALL_START):]
+                    header = body.lstrip()
+                    if not header or "<function=".startswith(header):
+                        return out
+                    if header.startswith("<function="):
+                        gt = header.find(">")
+                        if gt < 0:
+                            return out
+                        if self._tool_name(header[len("<function="):gt]) is None:
+                            end = call_end(body)
+                            if end < 0:
+                                return out
+                            end += i + len(CALL_START) + len(CALL_END)
+                            out.append(Event("content", self._track(self.buf[:end])))
+                            self.buf = self.buf[end:]
+                            continue
                 if i and self.buf[:i].strip():
                     out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
                 self.buf = self.buf[i + len(CALL_START):]
@@ -883,8 +920,9 @@ class OutputParser:
                     return out
                 body = self.buf[:i]
                 self.buf = self.buf[i + len(CALL_END):]
-                name = body.strip()[len("<function="):].split(">", 1)[0]
+                name = self._tool_name(body.strip()[len("<function="):].split(">", 1)[0])
                 call = parse_tool_call(body, self.schemas.get(name))
+                call.name = name
                 if self.scall is not None:
                     call.id = self.scall.id
                 out.append(Event("tool_call", call=call))
