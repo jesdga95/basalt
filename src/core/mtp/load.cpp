@@ -114,9 +114,10 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     // KV streaming: the drafter only reads its last `window` cells, so with streaming on its K/V is a ring of the
     // window (plus the cells a round writes ahead of its queries) over a host copy, refilled on a resume. The host copy
     // is pinned after the expert arena has pinned what it could: if it does not fit, the K/V stays whole in VRAM.
-    int64_t ring = (window > 0 && window < max_cells) ? window + 4 * (int64_t) max_t + 64 : 0;
+    // A window that reaches every cell keeps the K/V whole (-1): the drafter has no resolve to stream it.
+    int64_t ring = (window > 0 && window < max_cells) ? window + 4 * (int64_t) max_t + 64 : -1;
     // K8V4 never applies to the drafter: its own attention paths (below, and src/core/verify/) handle whole formats
-    // only, whatever ring shape it takes (0, a window, or the -1 fully-resident fallback).
+    // only, whatever ring shape it takes (a window, or -1: fully resident).
     const bool kv_hybrid_was = qsa_kv_hybrid();
     const bool kv_int8_was = qsa_kv_int8();
     qsa_set_kv_hybrid(false);
