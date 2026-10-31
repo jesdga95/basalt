@@ -230,6 +230,8 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         qsa_block_scores_seg(seg_tab, v_.qidx_, v_.step_, n, v_.max_blocks_, s, v_.scores_, cs, true);
         qsa_block_topk(v_.scores_, v_.step_, n, v_.max_blocks_, v_.cap_, s, v_.sel_, cs);
         stamp(l, 11);
+        // KV streaming: each streamed slot's selections resident in its own pool (device-side, in the graph)
+        if (v_.batch_stream_) kv_stream_resolve_seg(seg_tab, v_.sel_, v_.step_, v_.cap_, s, cs);
         stamp(l, 12);
         fused_gate = true;
         attn_q8 = true;

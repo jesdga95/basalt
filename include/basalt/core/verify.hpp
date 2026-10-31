@@ -486,6 +486,7 @@ private:
     float** d_ple_slots_ = nullptr;        ///< each slot's PLE history
     float* ple_work_ = nullptr;            ///< each row's PLE history while the window runs
     bool batch_dm_ = false;                ///< a batch window runs the device-planned tail
+    bool batch_stream_ = false;            ///< a slot's QSA K/V is streamed: batch windows resolve before attending
     void* arena_b_ = nullptr;
     int64_t last_pos_b_[8] = {};
     bool capture_batch(int R, int hbase, std::string& err);
