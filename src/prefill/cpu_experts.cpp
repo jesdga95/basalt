@@ -47,13 +47,14 @@ bool Prefill::Run::Chunk::Experts::Group::cpu_download() {
 
 void Prefill::Run::Chunk::Experts::Group::cpu_select() {
     if (cpu_maybe) {
-        // Non-resident experts with a host copy and few rows go to the CPU, fewest rows first, up to
-        // the share at which the CPU and the GPU's streaming end together.
+        // Experts outside the VRAM cache with a host copy and few rows go to the CPU, fewest rows first, up to the
+        // share at which the CPU and the GPU's streaming end together.  "Outside" is the cache's own table, not
+        // the residency of this read: the slots a read lends, and which lent experts keep a RAM copy, follow its
+        // loan (its chunk, the K/V mode's staging), and the CPU rounds an expert differently from the GPU.
         std::vector<std::pair<int32_t, int32_t>> cand;   // (rows, expert)
         for (int32_t e = 0; e < m.g->n_expert; ++e) {
             const int32_t c = m.cnt[(size_t) e];
-            if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) ||
-                (!on_peer.empty() && on_peer[(size_t) e]) ||
+            if (c == 0 || (m.cache && m.cache->slot_of(l, e) >= 0) || (!on_peer.empty() && on_peer[(size_t) e]) ||
                 (m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(l, e)))
                 continue;
             ++n_stream;
