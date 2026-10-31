@@ -214,13 +214,9 @@ void Runtime::rank_swaps(std::vector<Swap>& swaps, bool across) {
 
 bool Runtime::adapt() {
     if (!pending.empty()) return true;   // the previous swaps are still in flight
-    const auto at0 = Clock::now();
-    const int64_t peer_sw0 = peer.valid() ? peer.swaps() : 0;
-    size_t n_ranked = 0, n_kept = 0, n_promoted = 0;
     if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
     std::vector<Swap> swaps;
     rank_swaps(swaps, false);
-    n_ranked = swaps.size();
     if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
     std::vector<int> staged_on;   // the devices whose adapt streams hold copies back (-1: CUDA0)
     const auto copy_back = [&](int32_t layer, int32_t slot, uint8_t* dst) -> bool {
@@ -244,8 +240,6 @@ bool Runtime::adapt() {
         return ok;
     };
     if (!resident_spare_swaps(src, host_res, g.n_expert, swaps, copy_back, wait_copies, pending_spare)) return false;
-    n_kept = swaps.size();
-    const auto at1 = Clock::now();
     bool main_live = false;
     for (const Swap& s : swaps) {
         const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
@@ -303,8 +297,6 @@ void Runtime::xq_settle() {
 
 bool Runtime::xq_round() {
     xq_settle();
-    const auto at0 = Clock::now();
-    const int64_t peer_sw0 = peer.valid() ? peer.swaps() : 0;
     std::vector<Swap> swaps;
     rank_swaps(swaps, xq_across);
     const size_t n_ranked = swaps.size();
@@ -393,7 +385,6 @@ bool Runtime::xq_round() {
 // `wait`: step (3) waits for the copies even with the landed words (the batch windows, a drain)
 bool Runtime::xq_advance(bool wait) {
     if (xq_stage == 0) return true;
-    const auto& lay = basalt::kernels::cpu::expert_layout();
     if (xq_stage == 2) ver.flush_post_launch();
     const bool nowait = xq_stage == 2 && xq_words && !wait;
     if (!nowait) cudaEventSynchronize(adapt_ev);

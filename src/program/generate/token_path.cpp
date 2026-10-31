@@ -107,12 +107,10 @@ int token_path(Context& context) {
         }
         drive.routing = routing;
     }
-    basalt::core::PoolFn pool_fn = o.no_pool ? nullptr : &drive_pool;
     // The hit hook rides the same switch as the pool: with no pool there is no `parts` staging to
     // write into, and a hit path with nowhere to write is a wrong token rather than an error.
     basalt::core::HitFn hit_fn =
         (o.no_pool || o.expert_cache <= 0) ? nullptr : &basalt::core::expert_hit_run;
-    void* pool_user = o.no_pool ? nullptr : (void*) &drive;
 
     // THE LOOP RUNS A CAPTURED PAIR PER LAYER: `pre[l]` ends with the router and the doorbell, then the CPU pool runs,
     // then `post[l]` combines those experts with THAT layer's weights - so layer `l`'s experts meet layer `l`'s
@@ -161,28 +159,6 @@ int token_path(Context& context) {
         basalt::log::error("basalt generate", "the sampler output buffer failed");
         return 1;
     }
-
-    // **`R` IS BOTH THE INPUT AND THE OUTPUT, SO THE NEW TOKEN'S EMBEDDING HAS TO REPLACE THE OLD RESIDUAL.**
-    // At `pos == 0` that is `session_zero`, which is the reference's own initial condition - the embedding
-    // broadcast to all `hc` streams.  After that `session_zero` would also wipe the recurrence, so the
-    // broadcast is done directly.  Getting this wrong is invisible for exactly one token.
-    auto put_input = [&](int64_t tok, int64_t pos) -> bool {
-        if (!basalt::core::embed_row(wt, g, tok, d_emb, main_cs, err)) {
-            basalt::log::error("basalt generate", "%s", err.c_str());
-            return false;
-        }
-        if (pos == 0) {
-            basalt::core::session_zero(ss, g, d_emb, main_cs);
-        } else {
-            for (int64_t c = 0; c < g.hc; ++c)
-                if (cudaMemcpyAsync(ss.R + (size_t) c * g.n_embd, d_emb, (size_t) g.n_embd * 4,
-                                    cudaMemcpyDeviceToDevice, (cudaStream_t) main_cs) != cudaSuccess) {
-                    basalt::log::error("basalt generate", "the residual broadcast failed");
-                    return false;
-                }
-        }
-        return true;
-    };
 
     const auto sp = cli::sampling_options(o);
 

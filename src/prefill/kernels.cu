@@ -17,7 +17,7 @@ namespace basalt::prefill {
 namespace {
 
 constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
-constexpr int S = 128, HK = 16, HV = 48, C = 10240;
+constexpr int HV = 48, C = 10240;
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll

@@ -164,7 +164,6 @@ Flow Request::read_prompt() {
             ov_copied = true;
             return true;
         };
-        const auto tsp = Clock::now();
         runtime_.pp_part_ckpt = (to == turn_at || to == root_at) ? to : -1;
         bool split_ran = true;
         bool sp_ok = win ? (rto <= at || read_windows(at, rto, runtime_.err))

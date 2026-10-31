@@ -203,7 +203,7 @@ bool Verifier::pair_hold_finish_first(Verifier& b, PoolMultiFn pool, void* userb
     return b0->run_serve(pool, userb, err) && b0->run_end(nullptr, err);
 }
 
-bool Verifier::pair_hold_finish(Verifier& b, PoolMultiFn pool, void* userb, int32_t* outb, std::string& err) {
+bool Verifier::pair_hold_finish(Verifier& b, PoolMultiFn pool, void*, int32_t* outb, std::string& err) {
     Verifier* const b0 = &b;
     Verifier* const b1 = b.next_;
     progress_at("pipelined windows: finishing the next window", b0->fl_.T);

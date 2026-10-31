@@ -1017,7 +1017,6 @@ static void opt_in_check(cudaError_t e, const char* who) {
 }
 
 // The live configuration: DEC_DTC2 2 | 4 | 8 | 16 and DEC_PAIR 2 | 4 | 16 (see src/core/verify/).
-constexpr int g_v2 = 30;
 constexpr int g_pair = 22;
 
 template<int TYPE, int S, int MT, int KS>

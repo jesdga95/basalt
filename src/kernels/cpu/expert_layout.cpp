@@ -112,13 +112,11 @@ bool cpu_sse42_ok() {
 
 std::string cpu_name() {
     unsigned r[12] = {};
-    unsigned a = 0, b = 0, c = 0, d = 0;
     {
         unsigned x[4];
         platform::cpuid(0x80000000u, 0, x);
-        a = x[0]; b = x[1]; c = x[2]; d = x[3];
+        if (x[0] < 0x80000004u) return "unknown";
     }
-    if (a < 0x80000004u) return "unknown";
     for (unsigned i = 0; i < 3; ++i) {
         unsigned x[4];
         platform::cpuid(0x80000002u + i, 0, x);
