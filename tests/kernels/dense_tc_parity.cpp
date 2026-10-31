@@ -3,15 +3,21 @@
 //     build/dense_tc_parity [--bench]
 //
 // Random GGUF blocks (fp16 scales rewritten as normal values) and normal activations, one q8_1 quantization shared
-// by both paths, at the model's projection shapes.  Checks:
+// by both paths, at the model's projection shapes and at one shared-memory-bound edge shape.  Checks:
 //   - every column of a T-column dense_tc call is bitwise equal to the same column of the 8-column call (T = 1..8);
 //   - the error against native_mmvq's single-column outputs (the current numerics): max |diff| / max |ref| and the
 //     RMS of the diff over the RMS of ref, per case; it fails above 1e-3 RMS.
-// --bench: native_mmvq and dense_tc timed per T as CUDA graphs over enough weight copies that the L2 holds none
-// (launched as programmatic dependents under PDL=1).
+//   - the same matrix run through dense_tc_pair as two whole-tile row halves (a single projection through the
+//     pair kernel's stages): its T contract, its error against native_mmvq, and whether it is bitwise the
+//     dense_tc output.  Reported, not gated: it says whether changing a layout is a numerics change.
+//   - one column against a double reference built from ggml's own dequantizers and the same q8_1 codes, for
+//     every path that ran: max |d|, max relative error and RMS; it fails above 1e-5 RMS.
+// --bench: native_mmvq, dense_tc and the split form timed per T as CUDA graphs over enough weight copies that the
+// L2 holds none (launched as programmatic dependents under PDL=1).
 #include "basalt/kernels/dense_tc.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/pdl.hpp"
+#include "basalt/ggml/ggml.h"
 
 #include <cuda_runtime.h>
 
@@ -26,6 +32,8 @@
 #include <vector>
 
 namespace {
+
+constexpr int TM = 8;   // the widest window the checks run
 
 struct Case {
     const char* name;
@@ -68,12 +76,18 @@ const Case CASES[] = {
     {"tail Q8_0", 8, 1024, 1000, 34, {0, -1}},
     {"tail2 Q8_0", 8, 1536, 999, 34, {0, -1}},
     {"kv IQ3_S", 21, 6144, 512, 110, {0, -1}},
+    {"q Q5_K", 13, 2560, 12288, 176, {0, 2}},
+    {"q IQ3_S", 21, 2560, 12288, 110, {0, -1}},
+    {"edge Q6_K", 14, 3584, 2560, 210, {208, -1}},   // two tiles fit the pair arena but must not fit the 90 KB bound
 };
 
 uint16_t sane_half(std::mt19937& rng) {
     const uint32_t r = rng();
     return (uint16_t) (((r >> 31) << 15) | ((5u + (r >> 10) % 5u) << 10) | (r & 0x3ffu));
 }
+
+// whole-tile staging rounds the last partial tile's bulk copy up to 16 bytes; weight buffers carry that slack
+constexpr std::size_t WS16 = 16;
 
 bool ck(cudaError_t e, const char* what) {
     if (e == cudaSuccess) return true;
@@ -95,15 +109,26 @@ std::vector<uint8_t> make_weights(const Case& c, std::mt19937& rng) {
     return w;
 }
 
+double h2f(uint16_t h) {
+    const int e = (h >> 10) & 31, m = h & 1023;
+    const double v = e == 0 ? std::ldexp((double) m, -24) : std::ldexp((double) (1024 + m), e - 25);
+    return (h >> 15) ? -v : v;
+}
+
+// the q8_1 column as doubles: the fp16 block scale times the int8 code
+std::vector<double> q8_1_column(const std::vector<uint8_t>& xq, int n_in) {
+    std::vector<double> xd((std::size_t) n_in);
+    for (int k = 0; k < n_in; ++k) {
+        const uint8_t* xb = xq.data() + (std::size_t) (k / 32) * 36;
+        xd[k] = h2f(*(const uint16_t*) xb) * (double) (int8_t) xb[4 + (k % 32)];
+    }
+    return xd;
+}
+
 // float64 reference for Q8_0: sum over blocks of d_w * d_x * (exact integer dot), from the same q8_1 columns
 std::vector<double> cpu_q8_0(const Case& c, const std::vector<uint8_t>& w, const std::vector<uint8_t>& xq, int cols) {
     const int nb = c.n_in / 32;
     const std::size_t qcol = (std::size_t) nb * 36;
-    auto h2f = [](uint16_t h) {
-        const int e = (h >> 10) & 31, m = h & 1023;
-        const double v = e == 0 ? std::ldexp((double) m, -24) : std::ldexp((double) (1024 + m), e - 25);
-        return (h >> 15) ? -v : v;
-    };
     std::vector<double> y((std::size_t) cols * c.n_out);
     for (int j = 0; j < cols; ++j)
         for (int r = 0; r < c.n_out; ++r) {
@@ -123,50 +148,56 @@ std::vector<double> cpu_q8_0(const Case& c, const std::vector<uint8_t>& w, const
     return y;
 }
 
-bool parity(const Case& c, cudaStream_t s) {
-    constexpr int TM = 8;
-    std::mt19937 rng(777u + (unsigned) c.type * 31u + (unsigned) c.n_out);
-    const std::vector<uint8_t> w = make_weights(c, rng);
-    std::vector<float> x((std::size_t) TM * c.n_in);
-    std::normal_distribution<float> nd(0.f, 1.f);
-    for (auto& v : x) v = nd(rng);
-    const std::size_t qcol = basalt::kernels::native_q8_1_bytes(c.n_in, 1);
-    void *dw = nullptr, *xq = nullptr;
-    float *dx = nullptr, *yref = nullptr, *yt = nullptr;
-    const std::size_t ybytes = (std::size_t) TM * c.n_out * 4;
-    if (!ck(cudaMalloc(&dw, w.size()), "malloc") || !ck(cudaMalloc(&xq, qcol * TM), "malloc") ||
-        !ck(cudaMalloc(&dx, x.size() * 4), "malloc") || !ck(cudaMalloc(&yref, ybytes), "malloc") ||
-        !ck(cudaMalloc(&yt, ybytes * (TM + 1)), "malloc"))
-        return false;
-    cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice);
-    cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
-    // IQ3_S has only the one-tile path; the engine takes it where dense_tc_supported says so, so does the test
-    if (c.type == 21 && !basalt::kernels::dense_tc_supported(c.type, c.n_in, c.n_out, dw)) {
-        std::printf("%-12s %5d x %5d  skipped: shape outside the one-tile path on this device\n", c.name, c.n_in, c.n_out);
-        cudaFree(dw); cudaFree(xq); cudaFree(dx); cudaFree(yref); cudaFree(yt);
-        return true;
+// one column against a double reference: ggml's own dequantizers for the weight row, the same q8_1 codes,
+// accumulated in double.  Empty when this build carries no dequantizer for the type.
+std::vector<double> cpu_dequant_dot(const Case& c, const std::vector<uint8_t>& w, const std::vector<uint8_t>& xq) {
+    const struct ggml_type_traits* tt = ggml_get_type_traits((enum ggml_type) c.type);
+    if (tt == nullptr || tt->to_float == nullptr) return {};
+    const int nb = (int) tt->blck_size;
+    const std::vector<double> xd = q8_1_column(xq, c.n_in);
+    const std::size_t rb = ggml_row_size((enum ggml_type) c.type, c.n_in), bs = tt->type_size;
+    std::vector<float> dq(nb);
+    std::vector<double> y((std::size_t) c.n_out);
+    for (int r = 0; r < c.n_out; ++r) {
+        const uint8_t* wr = w.data() + (std::size_t) r * rb;
+        double sum = 0;
+        for (int b = 0; b * nb < c.n_in; ++b) {
+            tt->to_float(wr + (std::size_t) b * bs, dq.data(), nb);
+            const int at = b * nb;
+            for (int k = 0; k < nb; ++k) sum += (double) dq[k] * xd[at + k];
+        }
+        y[r] = sum;
     }
-    cudaDeviceSynchronize();   // pageable copies may still be in flight for a non-blocking stream
-    basalt::kernels::native_quantize_q8_1(dx, xq, c.n_in, TM, s);
-    for (int j = 0; j < TM; ++j)
-        basalt::kernels::native_mmvq(c.type, dw, (const uint8_t*) xq + j * qcol, yref + (std::size_t) j * c.n_out,
-                                     c.n_in, c.n_out, 1, s);
-    cudaMemsetAsync(yt, 0xff, ybytes * (TM + 1), s);
-    for (int T = 1; T <= TM; ++T)
-        basalt::kernels::dense_tc(c.type, dw, xq, yt + (std::size_t) T * TM * c.n_out, c.n_in, c.n_out, T, s);
-    if (!ck(cudaStreamSynchronize(s), "run")) return false;
-    std::vector<float> ref((std::size_t) TM * c.n_out), got((std::size_t) (TM + 1) * TM * c.n_out);
-    cudaMemcpy(ref.data(), yref, ybytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(got.data(), yt, got.size() * 4, cudaMemcpyDeviceToHost);
-    long long bits = 0, nonfinite = 0;
-    const float* g8 = got.data() + (std::size_t) TM * TM * c.n_out;
-    for (int T = 1; T <= TM; ++T)
-        for (int j = 0; j < T; ++j)
-            for (int r = 0; r < c.n_out; ++r) {
-                const float a = got[((std::size_t) T * TM + j) * c.n_out + r], b = g8[(std::size_t) j * c.n_out + r];
-                if (std::memcmp(&a, &b, 4) != 0) ++bits;
-                if (!std::isfinite(a)) ++nonfinite;
-            }
+    return y;
+}
+
+struct Err {
+    double maxabs = 0, maxrel = 0, rms = 0;   // against a double reference
+};
+
+Err err_vs(const float* got, const std::vector<double>& ref) {
+    Err e;
+    double sd = 0, sr = 0;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+        const double d = std::fabs((double) got[i] - ref[i]);
+        e.maxabs = std::max(e.maxabs, d);
+        if (std::fabs(ref[i]) > 1e-12) e.maxrel = std::max(e.maxrel, d / std::fabs(ref[i]));
+        sd += d * d;
+        sr += ref[i] * ref[i];
+    }
+    e.rms = std::sqrt(sd / std::max(sr, 1e-300));
+    return e;
+}
+
+uint64_t hash8(const float* p, std::size_t floats) {
+    uint64_t h = 1469598103934665603ull;   // FNV-1a
+    const uint8_t* b = reinterpret_cast<const uint8_t*>(p);
+    for (std::size_t i = 0; i < floats * 4; ++i) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+
+// a path's [TM][n_out] 8-column block against native_mmvq's single-column outputs
+void vs_native(const std::vector<float>& ref, const float* g8, double& maxrel, double& rms) {
     double maxd = 0, maxr = 0, sd = 0, sr = 0;
     for (std::size_t i = 0; i < ref.size(); ++i) {
         const double d = std::fabs((double) g8[i] - (double) ref[i]);
@@ -175,8 +206,102 @@ bool parity(const Case& c, cudaStream_t s) {
         sd += d * d;
         sr += (double) ref[i] * ref[i];
     }
-    const double rms = std::sqrt(sd / std::max(sr, 1e-300));
-    bool ok = bits == 0 && nonfinite == 0 && rms < 1e-3;
+    maxrel = maxd / std::max(maxr, 1e-30);
+    rms = std::sqrt(sd / std::max(sr, 1e-300));
+}
+
+// every T's columns against the same path's 8-column call
+void t_check(const Case& c, const std::vector<float>& all, long long& bits, long long& nonfinite) {
+    const float* g8 = all.data() + (std::size_t) TM * TM * c.n_out;
+    for (int T = 1; T <= TM; ++T)
+        for (int j = 0; j < T; ++j)
+            for (int r = 0; r < c.n_out; ++r) {
+                const float a = all[((std::size_t) T * TM + j) * c.n_out + r], b = g8[(std::size_t) j * c.n_out + r];
+                if (std::memcmp(&a, &b, 4) != 0) ++bits;
+                if (!std::isfinite(a)) ++nonfinite;
+            }
+}
+
+bool parity(const Case& c, cudaStream_t s) {
+    std::mt19937 rng(777u + (unsigned) c.type * 31u + (unsigned) c.n_out);
+    const std::vector<uint8_t> w = make_weights(c, rng);
+    std::vector<float> x((std::size_t) TM * c.n_in);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (auto& v : x) v = nd(rng);
+    const std::size_t qcol = basalt::kernels::native_q8_1_bytes(c.n_in, 1), wb = w.size();
+    const int row_bytes = (int) (wb / (std::size_t) c.n_out);
+    const int half = (((c.n_out + 15) / 16) / 2) * 16;   // whole tiles on both sides of the split
+    uint8_t* dw = nullptr;
+    void* xq = nullptr;
+    float *dx = nullptr, *yref = nullptr, *yt = nullptr, *y0 = nullptr, *y1 = nullptr;
+    const std::size_t ybytes = (std::size_t) TM * c.n_out * 4;
+    if (!ck(cudaMalloc(&dw, wb + WS16), "malloc") || !ck(cudaMalloc(&xq, qcol * TM), "malloc") ||
+        !ck(cudaMalloc(&dx, x.size() * 4), "malloc") || !ck(cudaMalloc(&yref, ybytes), "malloc") ||
+        !ck(cudaMalloc(&yt, ybytes * (TM + 1)), "malloc") ||
+        !ck(cudaMalloc(&y0, (std::size_t) (TM + 1) * TM * std::max(half, 1) * 4), "malloc y0") ||
+        !ck(cudaMalloc(&y1, (std::size_t) (TM + 1) * TM * std::max(c.n_out - half, 1) * 4), "malloc y1"))
+        return false;
+    cudaMemcpy(dw, w.data(), wb, cudaMemcpyHostToDevice);
+    cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
+    // the same support answers dense_proj makes: one matrix through the dense_tc layouts, and one through the
+    // pair kernel's stages as two row halves
+    const bool single_ok = basalt::kernels::dense_tc_supported(c.type, c.n_in, c.n_out, dw) &&
+                           basalt::kernels::dense_tc_type_on(c.type);
+    const bool split_ok = half > 0 && half < c.n_out && basalt::kernels::dense_tc_pair_supported(c.type, c.type, c.n_in);
+    if (!single_ok && !split_ok) {
+        std::printf("%-12s %5d x %5d  skipped: no dense_tc layout for this shape on this device\n", c.name, c.n_in,
+                    c.n_out);
+        cudaFree(dw); cudaFree(xq); cudaFree(dx); cudaFree(yref); cudaFree(yt); cudaFree(y0); cudaFree(y1);
+        return true;
+    }
+    cudaDeviceSynchronize();   // pageable copies may still be in flight for a non-blocking stream
+    basalt::kernels::native_quantize_q8_1(dx, xq, c.n_in, TM, s);
+    for (int j = 0; j < TM; ++j)
+        basalt::kernels::native_mmvq(c.type, dw, (const uint8_t*) xq + j * qcol, yref + (std::size_t) j * c.n_out,
+                                     c.n_in, c.n_out, 1, s);
+    cudaMemsetAsync(yt, 0xff, ybytes * (TM + 1), s);
+    if (single_ok)
+        for (int T = 1; T <= TM; ++T)
+            basalt::kernels::dense_tc(c.type, dw, xq, yt + (std::size_t) T * TM * c.n_out, c.n_in, c.n_out, T, s);
+    cudaMemsetAsync(y0, 0xff, (std::size_t) (TM + 1) * TM * std::max(half, 1) * 4, s);
+    cudaMemsetAsync(y1, 0xff, (std::size_t) (TM + 1) * TM * std::max(c.n_out - half, 1) * 4, s);
+    if (split_ok)
+        for (int T = 1; T <= TM; ++T)
+            basalt::kernels::dense_tc_pair(c.type, dw, y0 + (std::size_t) T * TM * half, half, c.type,
+                                           dw + (std::size_t) half * row_bytes,
+                                           y1 + (std::size_t) T * TM * (c.n_out - half), c.n_out - half, xq, c.n_in, T,
+                                           s);
+    if (!ck(cudaStreamSynchronize(s), "run")) return false;
+    std::vector<float> ref((std::size_t) TM * c.n_out), got((std::size_t) (TM + 1) * TM * c.n_out),
+        all2((std::size_t) (TM + 1) * TM * c.n_out);
+    std::vector<float> h0((std::size_t) (TM + 1) * TM * std::max(half, 1)),
+        h1((std::size_t) (TM + 1) * TM * std::max(c.n_out - half, 1));
+    cudaMemcpy(ref.data(), yref, ybytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(got.data(), yt, got.size() * 4, cudaMemcpyDeviceToHost);
+    if (split_ok) {
+        cudaMemcpy(h0.data(), y0, h0.size() * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(h1.data(), y1, h1.size() * 4, cudaMemcpyDeviceToHost);
+        for (int T = 1; T <= TM; ++T)
+            for (int j = 0; j < T; ++j)
+                for (int r = 0; r < c.n_out; ++r)
+                    all2[((std::size_t) T * TM + j) * c.n_out + r] =
+                        r < half ? h0[((std::size_t) T * TM + j) * half + r]
+                                 : h1[((std::size_t) T * TM + j) * (c.n_out - half) + (r - half)];
+    }
+    long long bits = 0, nonfinite = 0, bits2 = 0, nonfinite2 = 0;
+    if (single_ok) t_check(c, got, bits, nonfinite);
+    if (split_ok) t_check(c, all2, bits2, nonfinite2);
+    const float* g8 = got.data() + (std::size_t) TM * TM * c.n_out;
+    const float* g82 = all2.data() + (std::size_t) TM * TM * c.n_out;
+    double maxrel = 0, rms = 0, maxrel2 = 0, rms2 = 0;
+    if (single_ok) vs_native(ref, g8, maxrel, rms);
+    if (split_ok) vs_native(ref, g82, maxrel2, rms2);
+    long long cross = 0;
+    if (single_ok && split_ok)
+        for (std::size_t i = 0; i < (std::size_t) TM * c.n_out; ++i)
+            if (std::memcmp(&g8[i], &g82[i], 4) != 0) ++cross;
+    bool ok = (bits == 0 && nonfinite == 0 && rms < 1e-3) || !single_ok;
+    ok = ok && ((!split_ok) || (bits2 == 0 && nonfinite2 == 0 && rms2 < 1e-3));
     if (c.type == 8) {   // against float64, for every T's columns; native_mmvq's own error alongside
         std::vector<uint8_t> xh(qcol * TM);
         cudaMemcpy(xh.data(), xq, xh.size(), cudaMemcpyDeviceToHost);
@@ -199,19 +324,47 @@ bool parity(const Case& c, cudaStream_t s) {
         std::printf("   %s float64: dense_tc rms %.3e  native_mmvq rms %.3e  worst |d| over all T %.3e  %s\n", c.name, rd,
                     rn, tmax, k ? "PASS" : "FAIL");
         ok = ok && k;
+    } else {   // one column against ggml's dequantizers, in double, for every path that ran
+        std::vector<uint8_t> xh(qcol);
+        cudaMemcpy(xh.data(), xq, xh.size(), cudaMemcpyDeviceToHost);
+        const std::vector<double> ex = cpu_dequant_dot(c, w, xh);
+        if (ex.empty()) {
+            std::printf("   %-11s cpu ref: no dequantizer for type %d in this build  FAIL\n", c.name, c.type);
+            ok = false;   // every type in CASES has a bundled dequantizer; a missing one is a build gap
+        } else {
+            const Err e1 = single_ok ? err_vs(g8, ex) : Err{}, e2 = split_ok ? err_vs(g82, ex) : Err{};
+            const bool k = (!single_ok || e1.rms < 1e-5) && (!split_ok || e2.rms < 1e-5);
+            std::printf("   %-11s cpu ref (column 0):", c.name);
+            if (single_ok)
+                std::printf("  dense_tc max|d| %.3e max rel %.3e rms %.3e", e1.maxabs, e1.maxrel, e1.rms);
+            if (split_ok)
+                std::printf("  split max|d| %.3e max rel %.3e rms %.3e", e2.maxabs, e2.maxrel, e2.rms);
+            std::printf("  %s\n", k ? "PASS" : "FAIL");
+            ok = ok && k;
+        }
     }
-    std::printf("%-12s %5d x %5d  T-columns bitwise: %s (%lld diff, %lld nonfinite)  vs native: max|d|/max|ref| "
-                "%.3e  rms %.3e  %s\n",
-                c.name, c.n_in, c.n_out, bits == 0 ? "yes" : "NO", bits, nonfinite, maxd / std::max(maxr, 1e-30), rms,
-                ok ? "PASS" : "FAIL");
-    cudaFree(dw); cudaFree(xq); cudaFree(dx); cudaFree(yref); cudaFree(yt);
+    if (single_ok)
+        std::printf("%-12s %5d x %5d  T-columns bitwise: %s (%lld diff, %lld nonfinite)  vs native: max|d|/max|ref| "
+                    "%.3e  rms %.3e  hash %016llx  %s\n",
+                    c.name, c.n_in, c.n_out, bits == 0 ? "yes" : "NO", bits, nonfinite, maxrel, rms,
+                    (unsigned long long) hash8(g8, (std::size_t) TM * c.n_out),
+                    (bits == 0 && nonfinite == 0 && rms < 1e-3) ? "PASS" : "FAIL");
+    else
+        std::printf("%-12s %5d x %5d  dense_tc: no layout for this shape on this device\n", c.name, c.n_in, c.n_out);
+    if (split_ok)
+        std::printf("   %-11s split %d+%d rows: T-columns bitwise %s (%lld diff, %lld nonfinite)  vs dense_tc "
+                    "bitwise: %s (%lld diff)  vs native: max|d|/max|ref| %.3e  rms %.3e  hash %016llx  %s\n",
+                    c.name, half, c.n_out - half, bits2 == 0 ? "yes" : "NO", bits2, nonfinite2,
+                    single_ok ? (cross == 0 ? "same" : "DIFFERS") : "n/a", cross, maxrel2, rms2,
+                    (unsigned long long) hash8(g82, (std::size_t) TM * c.n_out),
+                    (bits2 == 0 && nonfinite2 == 0 && rms2 < 1e-3) ? "PASS" : "FAIL");
+    cudaFree(dw); cudaFree(xq); cudaFree(dx); cudaFree(yref); cudaFree(yt); cudaFree(y0); cudaFree(y1);
     return ok;
 }
 
 // dense_tc_pair of a qkv and a z case: each output's T columns bitwise equal to the 8-column call, and its error
 // against native_mmvq
 bool pair_parity(const Case& a, const Case& b, cudaStream_t s) {
-    constexpr int TM = 8;
     std::mt19937 rng(4242u + (unsigned) a.type * 7u + (unsigned) b.type);
     const std::vector<uint8_t> wa = make_weights(a, rng), wb = make_weights(b, rng);
     std::vector<float> x((std::size_t) TM * a.n_in);
@@ -220,7 +373,7 @@ bool pair_parity(const Case& a, const Case& b, cudaStream_t s) {
     const std::size_t qcol = basalt::kernels::native_q8_1_bytes(a.n_in, 1);
     void *dwa = nullptr, *dwb = nullptr, *xq = nullptr;
     float *dx = nullptr, *ra = nullptr, *rb = nullptr, *ya = nullptr, *yb = nullptr;
-    cudaMalloc(&dwa, wa.size()); cudaMalloc(&dwb, wb.size()); cudaMalloc(&xq, qcol * TM);
+    cudaMalloc(&dwa, wa.size() + WS16); cudaMalloc(&dwb, wb.size() + WS16); cudaMalloc(&xq, qcol * TM);
     cudaMalloc(&dx, x.size() * 4);
     cudaMalloc(&ra, (std::size_t) TM * a.n_out * 4); cudaMalloc(&rb, (std::size_t) TM * b.n_out * 4);
     cudaMalloc(&ya, (std::size_t) (TM + 1) * TM * a.n_out * 4); cudaMalloc(&yb, (std::size_t) (TM + 1) * TM * b.n_out * 4);
@@ -338,7 +491,7 @@ void bench(cudaStream_t s, const char* pick, bool warm) {
         uint8_t* dw = nullptr;
         void* xq = nullptr;
         float *dx = nullptr, *y = nullptr;
-        cudaMalloc(&dw, wb * NL);
+        cudaMalloc(&dw, wb * NL + WS16);
         for (int l = 0; l < (warm ? 1 : NL); ++l) cudaMemcpy(dw + wb * l, w.data(), wb, cudaMemcpyHostToDevice);
         cudaMalloc(&xq, basalt::kernels::native_q8_1_bytes(c->n_in, 8));
         cudaMalloc(&dx, (std::size_t) 8 * c->n_in * 4);
@@ -349,17 +502,39 @@ void bench(cudaStream_t s, const char* pick, bool warm) {
         cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
         cudaDeviceSynchronize();
         basalt::kernels::native_quantize_q8_1(dx, xq, c->n_in, 8, s);
-        std::printf("%-12s %5d x %5d  %.1f MB  floor %.2f us at 1.79 TB/s\n", c->name, c->n_in, c->n_out, wb / 1e6,
-                    wb / 1.79e6);
-        std::printf("   T   native us   GB/s   dtc us   GB/s   speedup\n");
+        const int row_bytes = (int) (wb / (std::size_t) c->n_out);
+        const int half = (((c->n_out + 15) / 16) / 2) * 16;
+        const bool single_ok = basalt::kernels::dense_tc_supported(c->type, c->n_in, c->n_out, dw) &&
+                               basalt::kernels::dense_tc_type_on(c->type);
+        const bool split_ok = half > 0 && half < c->n_out && (wb % 16) == 0 &&   // every copy needs an aligned start
+                              basalt::kernels::dense_tc_pair_supported(c->type, c->type, c->n_in);
+        std::printf("%-12s %5d x %5d  %.1f MB  floor %.2f us at 1.79 TB/s  dtc %s  split %d+%d %s\n", c->name,
+                    c->n_in, c->n_out, wb / 1e6, wb / 1.79e6, single_ok ? "yes" : "NO", half, c->n_out - half,
+                    split_ok ? "yes" : "NO");
+        std::printf("   T   native us   GB/s");
+        if (single_ok) std::printf("   dtc us   GB/s   native/dtc");
+        if (split_ok) std::printf("   split us   GB/s   native/split");
+        std::printf("\n");
         for (int T = 1; T <= 8; ++T) {
             const double tn = time_graph([&](int l) {
                 basalt::kernels::native_mmvq(c->type, dw + wb * (warm ? 0 : l), xq, y, c->n_in, c->n_out, T, s);
             }, NL, s);
-            const double td = time_graph([&](int l) {
-                basalt::kernels::dense_tc(c->type, dw + wb * (warm ? 0 : l), xq, y, c->n_in, c->n_out, T, s);
-            }, NL, s);
-            std::printf("  %2d  %8.2f %7.0f %8.2f %7.0f   %.2fx\n", T, tn, wb / tn / 1e3, td, wb / td / 1e3, tn / td);
+            std::printf("  %2d  %8.2f %7.0f", T, tn, wb / tn / 1e3);
+            if (single_ok) {
+                const double td = time_graph([&](int l) {
+                    basalt::kernels::dense_tc(c->type, dw + wb * (warm ? 0 : l), xq, y, c->n_in, c->n_out, T, s);
+                }, NL, s);
+                std::printf("   %8.2f %7.0f   %5.2fx", td, wb / td / 1e3, tn / td);
+            }
+            if (split_ok) {
+                const double tp = time_graph([&](int l) {
+                    basalt::kernels::dense_tc_pair(c->type, dw + wb * (warm ? 0 : l), y, half, c->type,
+                                                   dw + wb * (warm ? 0 : l) + (std::size_t) half * row_bytes,
+                                                   y + (std::size_t) 8 * half, c->n_out - half, xq, c->n_in, T, s);
+                }, NL, s);
+                std::printf("   %8.2f %7.0f   %5.2fx", tp, wb / tp / 1e3, tn / tp);
+            }
+            std::printf("\n");
         }
         cudaFree(dw); cudaFree(xq); cudaFree(dx); cudaFree(y);
     }
@@ -380,7 +555,7 @@ void bench_pair(cudaStream_t s, bool warm) {
         uint8_t* dw = nullptr;
         void* xq = nullptr;
         float *dx = nullptr, *y0 = nullptr, *y1 = nullptr;
-        cudaMalloc(&dw, wb * NW);
+        cudaMalloc(&dw, wb * NW + WS16);
         const std::size_t off1 = (wba + 255) & ~(std::size_t) 255;
         for (int l = 0; l < NW; ++l) {
             cudaMemcpy(dw + wb * l, w0.data(), wba, cudaMemcpyHostToDevice);

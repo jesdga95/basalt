@@ -760,10 +760,11 @@ target_include_directories(pair_snapshot_parity PRIVATE ${_gpu_include_directori
 target_link_libraries(pair_snapshot_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME pair_snapshot_parity COMMAND pair_snapshot_parity)
 set_tests_properties(pair_snapshot_parity PROPERTIES SKIP_RETURN_CODE 77)
-# dense_tc (DEC_DTC) against native_mmvq: its columns' T contract bitwise, its error vs the dp4a kernels
+# dense_tc (DEC_DTC) against native_mmvq: its columns' T contract bitwise, its error vs the dp4a kernels, one matrix
+# through dense_tc_pair's stages, and every path's error against a double reference built from ggml's dequantizers
 add_executable(dense_tc_parity tests/kernels/dense_tc_parity.cpp)
 target_include_directories(dense_tc_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(dense_tc_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(dense_tc_parity PRIVATE kernels ggml_quants ${_gpu_runtime_target})
 basalt_gpu_test(NAME dense_tc_parity COMMAND dense_tc_parity)
 set_tests_properties(dense_tc_parity PROPERTIES SKIP_RETURN_CODE 77)
 # the DEC_COMMIT launches against the commit graph's per-layer calls, bitwise (synthetic, GPU; --bench)
