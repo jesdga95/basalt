@@ -143,6 +143,15 @@ class Vision(Tmp):
         self.assertEqual(Path(v["model"]).read_bytes(), b"VOCAB")
         self.assertEqual([p.name for p in Path(v["mmproj"]).parent.iterdir() if ".gguf." in p.name], [])
 
+    def test_sidecar_takes_the_engine_bins_suffix(self):
+        path = self.build(vision=True)
+        exe = self.engine_bin.with_name("basalt.exe")
+        exe.write_text("")
+        side = self.engine_bin.parent / "basalt-vision.exe"
+        side.write_text("")
+        v = modelfile.model_config(path, str(exe), vision="cpu")["vision"]
+        self.assertEqual(v["vision_bin"], str(side.resolve()))
+
     def test_off_by_default(self):
         path = self.build(vision=True)
         (self.engine_bin.parent / "basalt-vision").write_text("")
