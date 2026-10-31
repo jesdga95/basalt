@@ -24,8 +24,9 @@ bool MtpDrafter::prefill_cur(const float* R_rows, const int32_t* next_tokens, in
     note_cells(cell0, cell0 + n);
     const Clock::time_point t0 = Clock::now();
     const int64_t HCN = g_->hc * g_->n_embd;
-    // cells the window can never reach again need no K/V
-    const int64_t first_needed = (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0;
+    // cells the window can never reach again need no K/V; the prompt is the main sequence's, so a batch slot's
+    // catch-up rows (at its own position, which can be far below the prompt's) are never cut
+    const int64_t first_needed = cur_ == n_stores_ && window_ > 0 && prompt_len_ > 0 ? prompt_len_ - window_ - 64 : 0;
     // Every group's token / step / position records are uploaded at once; each group is then device copies and a
     // graph on the one stream, with a single sync at the end.
     const int64_t NHp = g_->n_head, per_row = 1 + 4 + NHp;
