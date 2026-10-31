@@ -1088,6 +1088,12 @@ class SamplingKeys(unittest.TestCase):
         self.assertIn("relax=0", self.keys(temperature=1.0, relaxed_drafting=False))
         self.assertIn("relax=0.0", self.keys(temperature=1.0, relaxed_drafting=0))
 
+    def test_cvec(self):
+        self.assertIn("cvec=1", self.keys(temperature=1.0, cvec=True))
+        self.assertIn("cvec=0", self.keys(temperature=1.0, cvec=False))
+        self.assertFalse([k for k in self.keys(temperature=1.0, cvec=1) if k.startswith("cvec")])
+        self.assertFalse([k for k in self.keys(temperature=1.0) if k.startswith("cvec")])
+
     def test_penalty_window(self):
         self.assertIn("penalty_last_n=64", self.keys(presence_penalty=1.5))
         self.assertIn("penalty_last_n=4096", self.keys(repetition_penalty=1.1, penalty_last_n=4096))
@@ -1096,20 +1102,21 @@ class SamplingKeys(unittest.TestCase):
 
 
 class SamplingChecked(unittest.TestCase):
-    """A request's sampling value out of range is a 400 naming the field; one in range is never changed."""
+    """A request's sampling or control-vector value out of range is a 400 naming the field; one in range is never
+    changed."""
 
     def test_the_rules(self):
         from serve.config import checked_sampling
         good = {"temperature": 0, "top_p": 1, "top_k": 0, "min_p": 1, "presence_penalty": -1.5,
                 "frequency_penalty": 2, "repetition_penalty": 1.1, "penalty_last_n": 4096, "seed": 0,
-                "relaxed_drafting": False}
+                "relaxed_drafting": False, "cvec": True}
         checked_sampling(good)
         checked_sampling({"top_k": -1, "seed": -7, "top_k_unknown": "x", "temperature": None})
         bad = [("temperature", -0.1), ("temperature", float("nan")), ("temperature", "0.7"), ("top_p", 0),
                ("top_p", 1.5), ("top_k", -2), ("top_k", 2.5), ("top_k", True), ("min_p", 1.5),
                ("repetition_penalty", 0), ("presence_penalty", float("inf")), ("penalty_last_n", 4097),
                ("penalty_last_n", -1), ("seed", 1.5), ("seed", 2 ** 64), ("relaxed_drafting", 1.5),
-               ("relaxed_drafting", True)]
+               ("relaxed_drafting", True), ("cvec", 1), ("cvec", "true")]
         for key, value in bad:
             with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, f"^{key}: expected"):
                 checked_sampling({key: value})
@@ -1134,7 +1141,7 @@ class SamplingChecked(unittest.TestCase):
                             self.assertEqual(e.code, 400)
                             self.assertIn("top_k", e.read().decode())
             self.assertEqual(engine.requests, [])
-            data = {"model": "qwen3.8-flash-next", "max_tokens": 4, "top_k": 1000, "seed": 0,
+            data = {"model": "qwen3.8-flash-next", "max_tokens": 4, "top_k": 1000, "seed": 0, "cvec": False,
                     "messages": [{"role": "user", "content": "hi"}]}
             req = urllib.request.Request(base + "/v1/chat/completions", headers={"Content-Type": "application/json"},
                                          data=json.dumps(data).encode())
@@ -1142,6 +1149,7 @@ class SamplingChecked(unittest.TestCase):
                 self.assertEqual(r.status, 200)
             self.assertIn(" top_k=1000", ProcessEngine.sampling_keys(engine.requests[0][1]))
             self.assertIn(" seed=0", ProcessEngine.sampling_keys(engine.requests[0][1]))
+            self.assertIn(" cvec=0", ProcessEngine.sampling_keys(engine.requests[0][1]))
         finally:
             httpd.shutdown()
             httpd.server_close()

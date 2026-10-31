@@ -277,9 +277,26 @@ class SamplingOptions(unittest.TestCase):
             sampling_defaults_from_config({"sampling": {"top_k": -5}})
         self.assertEqual(sampling_defaults_from_config({"sampling": {"top_k": 100}}), {"top_k": 100})
 
+    def test_cvec_default(self):
+        self.assertIsNone(parse([])[0].cvec)
+        a = parse(["--no-cvec"])[0]
+        self.assertEqual(a.sampling_launch, {"cvec": False})
+        self.assertEqual(a.sampling_cli, {"cvec"})
+        a = parse(["--cvec"], {"server": {"cvec": False}})[0]
+        self.assertEqual(a.sampling_launch, {"cvec": True})          # the command line wins
+        a, _, file_words, cli_words = parse([], {"server": {"cvec": False}})
+        self.assertEqual((a.sampling_launch, file_words, cli_words), ({"cvec": False}, [], []))
+        self.assertEqual(sampling_defaults_from_config({"sampling": {"cvec": False}}), {"cvec": False})
+        with self.assertRaisesRegex(ValueError, "cvec: true or false"):
+            parse([], {"server": {"cvec": 0}})
+        with self.assertRaisesRegex(SystemExit, "sampling.cvec=1"):
+            sampling_defaults_from_config({"sampling": {"cvec": 1}})
+
     def test_startup_line_marks_the_source(self):
         self.assertEqual(sampling_line({"temperature": 0.8, "top_k": 20, "top_p": 0.9}, {"temperature"}, {"top_k"}),
                          "[server] sampling temp=0.8(cli) top_k=20(config) top_p=0.9")
+        self.assertEqual(sampling_line({"cvec": False}, set(), {"cvec"}),
+                         "[server] sampling cvec=False(config)")
 
 
 class ThinkingBudget(unittest.TestCase):

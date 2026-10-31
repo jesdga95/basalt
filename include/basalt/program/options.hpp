@@ -249,7 +249,8 @@ struct Options {
     int mtp_max_t = 0;
     /// A control vector on the residual stream (basalt/kernels/cvec.hpp), with llama.cpp's flags: the
     /// `experimental-speed-projection` profile passes `--control-vector-scaled FILE:1.0 --control-vector-layer-range
-    /// 4 44 --cvec-mode project --cvec-dir per-layer`.  None by default; --serve switches a loaded one per request.
+    /// 4 44 --cvec-mode project --cvec-dir per-layer`.  None by default; --serve: a request's `cvec` switches a loaded
+    /// one (on when the request leaves it out and the server or the model file sets no default).
     std::vector<std::pair<std::string, float>> cvec_files;
     int cvec_first = -1, cvec_last = -1;   ///< llama.cpp's defaults: 1 .. the last layer
     int cvec_mode = 1;                     ///< 0 = project, 1 = add (llama.cpp's default)

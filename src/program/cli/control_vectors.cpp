@@ -53,6 +53,11 @@ bool load_control_vectors(const Options& o, const basalt::core::ModelGeometry& g
     }
     const int first = o.cvec_first <= 0 ? 1 : o.cvec_first;
     const int last = (o.cvec_last <= 0 || o.cvec_last >= L) ? (int) L - 1 : o.cvec_last;
+    if (first > last) {
+        err = "--control-vector-layer-range starts past the last layer (" + std::to_string(first) + " > " +
+              std::to_string(last) + ")";
+        return false;
+    }
     const int single = o.cvec_mode == 0 ? o.cvec_single : -1;
     if (single >= 0 && (single >= L || !have[(size_t) single])) {
         err = "--cvec-dir single:" + std::to_string(single) + ": the vector has no direction for that layer";
