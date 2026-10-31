@@ -681,6 +681,37 @@
       "prefill_16k_tps": 5630.7,
       "prefill_64k_tps": 6416.5,
       "decode_tps": 309.3
+    },
+    {
+      "submitter": "azidoazideazide",
+      "date": "2026-10-31",
+      "commit": "c15bbd27d5",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "4.0 x8",
+          "h2d_gbps": 14.5
+        },
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "4.0 x8",
+          "h2d_gbps": 14.5
+        }
+      ],
+      "ram_gib": 126,
+      "cpu": "AMD Ryzen 9 3900X, 12 cores",
+      "ram_gbps": 45.0,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 2249.0,
+      "prefill_64k_tps": 3566.9,
+      "decode_tps": 156.6,
+      "notes": "2x RTX 5060 Ti 16GB PCIe 4.0 x8/x8, no P2P (2nd card = peer tier), Proxmox LXC; +2500 MHz MEM OC (clocks-only, stock voltage); 0 SSD spill; engine fork c15bbd27d5 (upstream 5d28eff + BF16-PLE)"
     }
   ]
 }
