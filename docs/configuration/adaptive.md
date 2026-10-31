@@ -7,7 +7,7 @@ values are the fastest measured here; this page says what each one trades and wh
 ## How a round works
 
 The engine counts how often each expert is routed to. A round ranks the experts that are not in VRAM by their count
-and swaps the most-routed ones in for the least-routed resident ones, when the gain is clear. On a server a round has
+and swaps the most-routed ones in for the least-routed resident ones, when the count clears the resident's by `adapt-margin`. On a server a round has
 three steps, one per decode window: the leaving experts are copied to RAM, the incoming ones are copied into their
 slots on a side stream, and the next window uses them (each layer waits only for its own copies). A new round starts
 only once the last one has landed, so "every window" means one round about every three windows. After each round
@@ -39,6 +39,7 @@ adaptation on is not bit-identical from run to run; see [precision](../precision
 | `adapt-swaps` | `96` (`0` = off) | Most experts one round swaps into the main card. A server round after one that ranked at least twice that many candidates swaps four times as many (a cold start or a topic change). | Bigger rounds catch up faster but move more bytes per round (about 2.6 MiB per NVFP4 expert, each way when the leaving expert has no RAM copy), and the copies share host memory with the CPU experts. The RAM copy keeps four times N free places (384 places, about 1 GiB, at the default), taken from the RAM that holds experts. |
 | `peer-adapt-swaps` | the value of `adapt-swaps` | Most experts one round swaps into the peer card. | As above, on the peer's link; `0` freezes the peer tier, which costs code-like requests most. |
 | `adapt-decay` | `0.85` on a server, with or without the peer tier; `0.7` with a layer split and outside `--serve` | The factor every count is multiplied by after each round. | Lower forgets sooner and follows a topic change faster; higher keeps a long-run placement but adapts late. The decay is per round, so with a larger `adapt-every` the same value remembers far longer in windows. |
+| `adapt-margin` | `1.5` | A missing expert swaps into the main card when its count is at least the least-routed resident's plus this. Must be above 0. The floor below which a missing expert is no candidate (a count of 2; 1.5 when one ranking covers every layer) is a separate rule and stays. The peer card's rounds keep 1.5. | Higher makes fewer, surer swaps; lower follows the routing sooner and moves more bytes. Pairs with a short `adapt-every`: with a round every window the counts are small and noisy, and a higher margin keeps out the swaps that do not pay. |
 | `expert-profile-save` | off | Saves the learned placement (the experts in VRAM, then the counts) on exit and every `expert-profile-save-every` minutes (default 10) between requests. A start that finds the file places it instead of the model's own profile. Needs the adaptive tier on. | A continuing workload starts on what it learned; a different one starts on the wrong experts and must swap them out first. |
 
 The `done` line's `hit=` is the share of the main card's lookups served from its VRAM. Experts the peer card computes
@@ -86,6 +87,11 @@ because that profile had learned the session's last workload (chat), not prose.
 With a smaller cache (the RTX 5090 alone with `expert-cache 4300`, half its usual slots, as on a smaller card), `adapt-swaps` 48, 96 and
 160 gave cold 130.3, 127.1 and 132.4 (two default runs), 132.3 tok/s: the swap count moves nothing beyond run
 noise there either.
+
+`adapt-margin`, on an RTX 5080 at 360 W alone with the IQ3_S pack and `adapt-every 16` as the reference: `adapt-every 1`
+with `adapt-margin 3` cut decode time per token by 1.35% (95% interval 0.36 to 2.34%, 8 paired runs of a 31-request
+session of short prompts) and by 0.80% on prompts of 18K to 28K tokens (4 pairs, interval spans 0); `adapt-every 1` at
+the default margin was 1.07% slower (3 pairs). A round every window pays only with the higher margin.
 
 ## The probe picks these
 
