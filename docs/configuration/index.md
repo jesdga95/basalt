@@ -89,7 +89,7 @@ Command line `--name`; the Where column says which config block takes it.
 | --- | --- | --- | --- | --- |
 | `max-context` | engine | tokens | 8192 | Longest context. Shared by `parallel` slots. The KV cache grows with it. |
 | `kv` | engine | `fp16`, `int8`, `q4_0`, `k8v4` | `fp16` | Flash-Next only. KV storage. `int8` halves VRAM. `q4_0` is 4-bit after rotation; `k8v4` keeps K int8 and V 4-bit (816 bytes per cell against `int8`'s 1,056). Not with `kv-resident`. |
-| `kv-resident` | engine | cells (min 20,480) or `0` | 0 | Flash-Next only. Keep N cells of KV in VRAM and the rest in pinned RAM. |
+| `kv-resident` | engine | cells (min 20,480) or `0` | 0 | Flash-Next only. Keep N cells of KV in VRAM and the rest in pinned RAM. With `parallel` and `kv` `int8`, every slot streams its own K/V this way. |
 | `rope-scaling` | engine | `none`, `linear`, `yarn` | model's, else `none` | Flash-Next only. Extend past the trained length. Fixed for the run. |
 | `rope-scale` | engine | number | model's, else 1 | Flash-Next only. Factor for `linear` and `yarn`. |
 | `rope-freq-base`, `rope-freq-scale` | engine | number | 0 (model's own) | Flash-Next only. Raw RoPE values. Leave at 0 unless you know them. |
@@ -145,7 +145,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `parallel` | entry | 1..8 | 1 | Serve N requests at once. Sets the engine's `batch`. |
+| `parallel` | entry | 1..8 | 1 | Serve N requests at once. Sets the engine's `batch`. With `kv-resident`, each slot keeps only those cells in VRAM. |
 | `slot-full-context` | entry | switch | off | Give every slot the whole `max-context`, at N times the KV. |
 
 ## Conversation cache
