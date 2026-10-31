@@ -463,144 +463,10 @@ __global__ void __launch_bounds__(MT * KS * 128) dense_tc_kernel(const uint8_t* 
 #endif
 }
 
-// Whole tiles: a 16-row tile is contiguous in memory, so it lands in one of two shared-memory slots with one bulk
-// copy (the first two before the grid dependency wait).  Warp w takes half super-block w % 4 of the chunks
-// w / 4, w / 4 + 2, ... in order; a row's eight warp sums are added as
-// ((w0 + w4) + (w1 + w5)) + ((w2 + w6) + (w3 + w7)).
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-// block blk of nblk (256 threads); smem: 128 + 4096 + 2 tiles of 16 rs bytes, 128-byte aligned.  rs: the staged rows'
-// stride - the row's bytes (one bulk copy per tile) or more (one per row, DEC_DTC2 & 32: one_row_stride)
-template<int TYPE>
-__device__ __forceinline__ void dense_tc_tile_block(int blk, int nblk, uint8_t* smem, const uint8_t* __restrict__ w,
-                                                    const uint8_t* __restrict__ x, float* __restrict__ y, int n_in,
-                                                    int n_out, int ncols, int rs) {
-    constexpr int SB = Fmt<TYPE>::SB, CB = 2 * SB;
-    uint64_t* bar = reinterpret_cast<uint64_t*>(smem);
-    float* red = reinterpret_cast<float*>(smem + 128);   // [warp][row][column]
-    uint8_t* slots = smem + 128 + 8 * 16 * kMaxCols * 4;
-    const int tid = threadIdx.x, wp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
-    const int hb = wp & 3, sbi = hb >> 1, n = hb & 1;
-    const int nchunk = n_in / 512, nb32 = n_in / 32;
-    const int row_bytes = (n_in / 256) * SB, tb = 16 * row_bytes, ts = 16 * rs;
-    const int ntiles = (n_out + 15) / 16;
-    const int mine = blk < ntiles ? (ntiles - 1 - blk) / nblk + 1 : 0;
-    // tile i into slot i & 1 by warp 0; the last tile's rows past n_out are not copied (and never stored)
-    auto issue = [&](int i) {
-        const int tile = blk + i * nblk;
-        const int rows = min(16, n_out - tile * 16);
-        const uint32_t sb = (uint32_t) __cvta_generic_to_shared(slots + (size_t) (i & 1) * ts);
-        const uint32_t bb = (uint32_t) __cvta_generic_to_shared(bar + (i & 1));
-        if (rs == row_bytes) {
-            const uint32_t bytes = (uint32_t) ((rows * row_bytes + 15) & ~15);
-            if (lane == 0) {
-                asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bb), "r"(bytes) : "memory");
-                asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-                             ::"r"(sb), "l"(w + (size_t) tile * tb), "r"(bytes), "r"(bb) : "memory");
-            }
-        } else {
-            if (lane == 0)
-                asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bb),
-                             "r"((uint32_t) (rows * row_bytes)) : "memory");
-            __syncwarp();
-            if (lane < rows)
-                asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-                             ::"r"(sb + (uint32_t) (lane * rs)), "l"(w + (size_t) tile * tb + (size_t) lane * row_bytes),
-                             "r"((uint32_t) row_bytes), "r"(bb) : "memory");
-        }
-    };
-    if (wp == 0) {
-        if (lane == 0) {
-            for (int q = 0; q < 2; ++q)
-                asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"((uint32_t) __cvta_generic_to_shared(bar + q)));
-            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-        }
-        __syncwarp();
-            for (int i = 0; i < 2 && i < mine; ++i) issue(i);
-    }
-    __syncthreads();
-    pdl_wait();
-    const uint32_t* tbl = reinterpret_cast<const uint32_t*>(dtc_iq4nl);
-    uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
-    if constexpr (TYPE == 23) { t0 = tbl[0]; t1 = tbl[1]; t2 = tbl[2]; t3 = tbl[3]; }
-    for (int i = 0; i < mine; ++i) {
-        const int row0 = (blk + i * nblk) * 16;
-        {
-            uint32_t done = 0;
-            const uint32_t bb = (uint32_t) __cvta_generic_to_shared(bar + (i & 1)), par = (uint32_t) (i >> 1) & 1u;
-            do {
-                asm volatile("{\n .reg .pred p;\n mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n"
-                             " selp.u32 %0, 1, 0, p;\n}" : "=r"(done) : "r"(bb), "r"(par) : "memory");
-            } while (!done);
-        }
-        const uint8_t* slot = slots + (size_t) (i & 1) * ts;
-        // rows past n_out read the slot's stale bytes: finite or not, they are never stored
-        const uint8_t* rowA = slot + g * rs + sbi * SB;
-        const uint8_t* rowB = slot + (g + 8) * rs + sbi * SB;
-        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (int c = wp >> 2; c < nchunk; c += 2) {
-            XFrag xf;
-#pragma unroll
-            for (int k4 = 0; k4 < 4; ++k4) {
-                const int k = 16 * c + 4 * hb + k4;
-                xf.b0[k4] = xf.b1[k4] = 0;
-                if (g < ncols) {
-                    const uint8_t* xb = x + ((size_t) g * nb32 + k) * kQ81;
-                    xf.b0[k4] = __ldg(reinterpret_cast<const unsigned int*>(xb + 4) + t);
-                    xf.b1[k4] = __ldg(reinterpret_cast<const unsigned int*>(xb + 20) + t);
-                }
-#pragma unroll
-                for (int e = 0; e < 2; ++e) {
-                    const int col = 2 * t + e;
-                    xf.d8[k4][e] = col < ncols ? __low2float(__ldg(reinterpret_cast<const half2*>(
-                                                     x + ((size_t) col * nb32 + k) * kQ81)))
-                                               : 0.0f;
-                }
-            }
-            const uint8_t* const p[2] = {rowA + c * CB, rowB + c * CB};
-            half_sb_terms<TYPE>(acc, p, n, t, xf, t0, t1, t2, t3);
-        }
-        float* rw = red + wp * 16 * kMaxCols;
-        rw[g * kMaxCols + 2 * t] = acc[0];
-        rw[g * kMaxCols + 2 * t + 1] = acc[1];
-        rw[(g + 8) * kMaxCols + 2 * t] = acc[2];
-        rw[(g + 8) * kMaxCols + 2 * t + 1] = acc[3];
-        if (i == mine - 1) pdl_launch_dependents();
-        __syncthreads();   // the slot is read and the warp sums are in
-        if (wp == 0 && i + 2 < mine) {
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            issue(i + 2);
-        }
-        if (tid < 16 * kMaxCols) {
-            const int row = tid / kMaxCols, col = tid % kMaxCols;
-            if (col < ncols && row0 + row < n_out) {
-                const float* rr = red + row * kMaxCols + col;
-                constexpr int WS = 16 * kMaxCols;   // one warp's sums
-                const float v = ((rr[0] + rr[4 * WS]) + (rr[WS] + rr[5 * WS])) +
-                                ((rr[2 * WS] + rr[6 * WS]) + (rr[3 * WS] + rr[7 * WS]));
-                y[(size_t) col * n_out + row0 + row] = v;
-            }
-        }
-        __syncthreads();   // the sums are read
-    }
-}
-#endif
 
-template<int TYPE>
-__global__ void __launch_bounds__(256) dense_tc_tile_kernel(const uint8_t* __restrict__ w,
-                                                           const uint8_t* __restrict__ x, float* __restrict__ y,
-                                                           int n_in, int n_out, int ncols, int rs) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    extern __shared__ __align__(128) uint8_t smem[];
-    dense_tc_tile_block<TYPE>((int) blockIdx.x, (int) gridDim.x, smem, w, x, y, n_in, n_out, ncols, rs);
-#elif defined(__CUDA_ARCH__)
-    __trap();
-#endif
-}
-
-// One tile per block (DEC_DTC2 & 2, where every tile has a block of its own): the 16 rows land by one bulk copy
-// each, issued before the grid dependency wait, and NW warps share its chunks: warp w takes half super-block
-// w % 4 of the chunks w / 4, w / 4 + NW / 4, ...  A row's sums: per half super-block the warp groups in order, then
-// (hb0 + hb1) + (hb2 + hb3).
+// One tile per block: the 16 rows land by one bulk copy each, issued before the grid dependency wait, and NW warps
+// share its chunks: warp w takes half super-block w % 4 of the chunks w / 4, w / 4 + NW / 4, ...  A row's sums: per
+// half super-block the warp groups in order, then (hb0 + hb1) + (hb2 + hb3).
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 // tile blk; smem: one_smem_bytes<TYPE, NW>(n_in) bytes, 128-byte aligned
 template<int TYPE, int NW>
@@ -722,8 +588,11 @@ constexpr int one_smem_bytes(int n_in) {
            (TYPE == 21 ? 2048 : 0);
 }
 
-// Two matrices of one input in one launch (dense_tc_pair): whole 16-row tiles as in dense_tc_tile_block, the first
-// matrix's tiles then the second's, each tile with its own format; a tile's arithmetic is dense_tc_tile_block's.
+// Two matrices of one input in one launch (dense_tc_pair), or one matrix with an empty second: whole 16-row tiles,
+// the first matrix's tiles then the second's, each tile with its own format.  A 16-row tile is contiguous in memory,
+// so it lands in one of two shared-memory slots with one bulk copy (the first two before the grid dependency wait).
+// Warp w takes half super-block w % 4 of the chunks w / 4, w / 4 + 2, ... in order; a row's eight warp sums are added
+// as ((w0 + w4) + (w1 + w5)) + ((w2 + w6) + (w3 + w7)).
 struct PairMat {
     const uint8_t* w;
     float* y;
@@ -849,6 +718,8 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
         const int lt = second ? tile - nt0 : tile;
         const int row_bytes = (n_in / 256) * pair_sb<LQ>(m.type);
         const int rows = min(16, m.n_out - lt * 16);
+        // the last partial tile is copied in whole 16-byte units: up to 15 bytes past the matrix's row end are
+        // read; weight placement pads each tensor to the index alignment, a multiple of 16 enforced at load
         const uint32_t bytes = (uint32_t) ((rows * row_bytes + 15) & ~15);
         const uint32_t sb = (uint32_t) __cvta_generic_to_shared(slots + (size_t) (i & 1) * slot_bytes);
         const uint32_t bb = (uint32_t) __cvta_generic_to_shared(bar + (i & 1));
@@ -1016,8 +887,63 @@ static void opt_in_check(cudaError_t e, const char* who) {
     }
 }
 
-// The live configuration: DEC_DTC2 2 | 4 | 8 | 16 and DEC_PAIR 2 | 4 | 16 (see src/core/verify/).
+// The live configuration of the pair stage: 2 the x fragments in registers across a block's tiles, 4 two warp-sum
+// buffers where one block per SM, 16 the hc read ahead of a GDN qkv+z pair (see src/core/verify/).
 constexpr int g_pair = 22;
+
+// one 16-row tile, in the staged bytes of the largest of the two formats
+inline int pair_tile_bytes(int type, int n_in) { return 16 * (n_in / 256) * sb_bytes_lq(type); }
+
+// the shared memory of a pair launch: two tiles, the warp sums, the IQ3_S codebook
+inline int pair_smem_bytes(int t0, int t1, int n_in) {
+    const int tb = std::max(pair_tile_bytes(t0, n_in), pair_tile_bytes(t1, n_in));
+    return 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * tb;
+}
+
+// m0's tiles then m1's over a persistent grid, both arena slots in flight; m1.n_out == 0 runs one matrix.
+void pair_launch(PairMat m0, PairMat m1, const void* x, int n_in, int ncols, cudaStream_t s) {
+    int smem = pair_smem_bytes(m0.type, m1.type, n_in);
+    if (smem > 99 * 1024) {   // the opt-in limit; both callers gate on it
+        basalt::log::error("basalt", "dense_tc_pair: %d shared-memory bytes exceed the 99 KB opt-in", smem);
+        std::exit(1);
+    }
+    // The type is spelled out because some front ends cannot deduce it from a braced list of these kernel
+    // pointers. The six instantiations in a fixed order.
+    void (*const pair_kernels[])(PairMat, PairMat, const uint8_t*, int, int) = {
+        dense_tc_pair_kernel<false, false, false>, dense_tc_pair_kernel<true, false, false>,
+        dense_tc_pair_kernel<true, true, false>, dense_tc_pair_kernel<false, false, true>,
+        dense_tc_pair_kernel<true, false, true>, dense_tc_pair_kernel<true, true, true>};
+    static std::atomic<bool> attr[64];
+    const int dev = opt_in_device("dense_tc_pair");
+    if (!attr[dev].load(std::memory_order_acquire)) {
+        for (auto k : pair_kernels)
+            opt_in_check(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024),
+                         "dense_tc_pair");
+        attr[dev].store(true, std::memory_order_release);
+    }
+    const bool lq = m0.type == 11 || m0.type == 42 || m0.type == 8 || m1.type == 11 || m1.type == 42 || m1.type == 8;
+    // each warp's x fragments in registers across its tiles, and two warp-sum buffers where the block is alone on its
+    // SM either way
+    const bool xr = (g_pair & 2) && n_in <= 3072;
+    auto kern = lq ? (xr ? dense_tc_pair_kernel<true, false, true> : dense_tc_pair_kernel<false, false, true>)
+                   : (xr ? dense_tc_pair_kernel<true, false, false> : dense_tc_pair_kernel<false, false, false>);
+    int occ = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kern, 256, smem);
+    if (xr && (g_pair & 4) && occ == 1 && smem + 4096 <= 99 * 1024) {
+        kern = lq ? dense_tc_pair_kernel<true, true, true> : dense_tc_pair_kernel<true, true, false>;
+        smem += 4096;
+    }
+    if (occ < 1) occ = 1;
+    const int ntiles = (m0.n_out + 15) / 16 + (m1.n_out + 15) / 16;
+    const int grid = ntiles < occ * sm_count() ? ntiles : occ * sm_count();
+    launch_pdl(kern, dim3((unsigned) grid), dim3(256), (size_t) smem, (cudaStream_t) s, m0, m1,
+               (const uint8_t*) x, n_in, ncols);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        basalt::log::error("basalt", "dense_tc_pair: %s", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
 
 template<int TYPE, int S, int MT, int KS>
 void launch_s(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
@@ -1035,26 +961,6 @@ void launch_s(const void* w, const void* x, float* y, int n_in, int n_out, int n
     const int grid = ntiles < occ * sm_count() ? ntiles : occ * sm_count();
     launch_pdl(dense_tc_kernel<TYPE, S, MT, KS>, dim3((unsigned) grid), dim3(MT * KS * 128), smem, s,
                (const uint8_t*) w, (const uint8_t*) x, y, n_in, n_out, ncols);
-}
-
-template<int TYPE>
-void launch_tile(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
-    const int row_bytes = (n_in / 256) * Fmt<TYPE>::SB;
-    const int rs = row_bytes;
-    const int smem = 128 + 8 * 16 * kMaxCols * 4 + 2 * 16 * rs;
-    static std::atomic<bool> attr[64];
-    const int dev = opt_in_device("dense_tc_tile");
-    if (!attr[dev].load(std::memory_order_acquire)) {
-        opt_in_check(cudaFuncSetAttribute(dense_tc_tile_kernel<TYPE>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024), "dense_tc_tile");
-        attr[dev].store(true, std::memory_order_release);
-    }
-    int occ = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, dense_tc_tile_kernel<TYPE>, 256, smem);
-    if (occ < 1) occ = 1;
-    const int ntiles = (n_out + 15) / 16;
-    const int grid = ntiles < occ * sm_count() ? ntiles : occ * sm_count();
-    launch_pdl(dense_tc_tile_kernel<TYPE>, dim3((unsigned) grid), dim3(256), (size_t) smem, s, (const uint8_t*) w,
-               (const uint8_t*) x, y, n_in, n_out, ncols, rs);
 }
 
 // the one-tile path takes the shape
@@ -1078,28 +984,29 @@ void launch_one(const void* w, const void* x, float* y, int n_in, int n_out, int
 }
 
 // The layout follows the shape alone (never the column count): where every 16-row tile has a block of its own and fits
-// in shared memory, one bulk copy per row, issued before the grid dependency wait; else whole 16-row tiles where two
-// fit in shared memory and the weights are 16-byte aligned; else 16-row tiles in 512-value chunks, and where those
-// leave SMs idle, two warp groups per tile taking alternate 512-value halves of 1024.
+// in shared memory, one bulk copy per row, issued before the grid dependency wait; else whole 16-row tiles, two in
+// flight on a grid of one block per SM, where the weights are 16-byte aligned and two tiles fit in 90 KB;
+// else 16-row tiles in 512-value chunks, and where those leave SMs idle, two warp groups per tile taking alternate
+// 512-value halves of 1024.
 template<int TYPE>
 void launch(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+    static_assert(sb_bytes_lq(TYPE) == Fmt<TYPE>::SB);   // the pair stage stages this type's tiles at its own size
     const bool aligned = ((uintptr_t) w & 15) == 0;
     if (one_ok<TYPE>(w, n_in, n_out)) {
         launch_one<TYPE, 24>(w, x, y, n_in, n_out, ncols, s);
         return;
     }
-    if constexpr (TYPE == 21) {
+    if constexpr (TYPE == 21) {   // IQ3_S has no layout but the one-tile one
         basalt::log::error("basalt", "dense_tc: IQ3_S n_in %d n_out %d needs the one-tile path", n_in, n_out);
         std::exit(1);
-    } else {
-    if (aligned && 2 * 16 * (n_in / 256) * Fmt<TYPE>::SB <= 90 * 1024) {
-        launch_tile<TYPE>(w, x, y, n_in, n_out, ncols, s);
+    }
+    if (aligned && 2 * pair_tile_bytes(TYPE, n_in) <= 90 * 1024) {
+        pair_launch({(const uint8_t*) w, y, TYPE, n_out}, {(const uint8_t*) w, y, TYPE, 0}, x, n_in, ncols, s);
         return;
     }
     const bool few = (n_out + 15) / 16 < sm_count();
     if (n_in % 1024 == 0 && few) launch_s<TYPE, 3, 1, 2>(w, x, y, n_in, n_out, ncols, s);
     else launch_s<TYPE, 3, 1, 1>(w, x, y, n_in, n_out, ncols, s);
-    }
 }
 
 #endif
@@ -1147,8 +1054,7 @@ void dense_tc(int type, const void* w, const void* x, float* y, int n_in, int n_
 bool dense_tc_pair_supported(int t0, int t1, int n_in) noexcept {
     auto ok = [&](int t) { return t == 12 || t == 13 || t == 14 || t == 21 || t == 23 || t == 11 || t == 42 || t == 8; };
     if (!ok(t0) || !ok(t1) || n_in <= 0 || n_in % 512 != 0) return false;
-    const int tb = 16 * (n_in / 256) * std::max(sb_bytes_lq(t0), sb_bytes_lq(t1));
-    return 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * tb <= 99 * 1024;
+    return pair_smem_bytes(t0, t1, n_in) <= 99 * 1024;
 }
 
 void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const void* w1, float* y1, int n_out1,
@@ -1158,44 +1064,8 @@ void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const 
         basalt::log::error("basalt", "dense_tc_pair: types %d/%d n_in %d not supported", t0, t1, n_in);
         std::exit(1);
     }
-    int smem = 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * 16 * (n_in / 256) * std::max(sb_bytes_lq(t0), sb_bytes_lq(t1));
-    static std::atomic<bool> attr[64];
-    const int dev = opt_in_device("dense_tc_pair");
-    if (!attr[dev].load(std::memory_order_acquire)) {
-        // The type is spelled out because some front ends cannot deduce it from a braced list of these kernel
-        // pointers. The six instantiations in a fixed order.
-        void (*const pair_kernels[])(PairMat, PairMat, const uint8_t*, int, int) = {
-            dense_tc_pair_kernel<false, false, false>, dense_tc_pair_kernel<true, false, false>,
-            dense_tc_pair_kernel<true, true, false>, dense_tc_pair_kernel<false, false, true>,
-            dense_tc_pair_kernel<true, false, true>, dense_tc_pair_kernel<true, true, true>};
-        for (auto k : pair_kernels)
-            opt_in_check(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024),
-                         "dense_tc_pair");
-        attr[dev].store(true, std::memory_order_release);
-    }
-    const bool lq = t0 == 11 || t0 == 42 || t0 == 8 || t1 == 11 || t1 == 42 || t1 == 8;
-    // each warp's x fragments in registers across its tiles, and two warp-sum buffers where the block is alone on its
-    // SM either way
-    const bool xr = (g_pair & 2) && n_in <= 3072;
-    auto kern = lq ? (xr ? dense_tc_pair_kernel<true, false, true> : dense_tc_pair_kernel<false, false, true>)
-                   : (xr ? dense_tc_pair_kernel<true, false, false> : dense_tc_pair_kernel<false, false, false>);
-    int occ = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kern, 256, smem);
-    if (xr && (g_pair & 4) && occ == 1 && smem + 4096 <= 99 * 1024) {
-        kern = lq ? dense_tc_pair_kernel<true, true, true> : dense_tc_pair_kernel<true, true, false>;
-        smem += 4096;
-    }
-    if (occ < 1) occ = 1;
-    const int ntiles = (n_out0 + 15) / 16 + (n_out1 + 15) / 16;
-    const int grid = ntiles < occ * sm_count() ? ntiles : occ * sm_count();
-    const PairMat m0{(const uint8_t*) w0, y0, t0, n_out0}, m1{(const uint8_t*) w1, y1, t1, n_out1};
-    launch_pdl(kern, dim3((unsigned) grid), dim3(256), (size_t) smem, (cudaStream_t) stream, m0, m1,
-               (const uint8_t*) x_q8_1, n_in, ncols);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        basalt::log::error("basalt", "dense_tc_pair: %s", cudaGetErrorString(e));
-        std::exit(1);
-    }
+    pair_launch({(const uint8_t*) w0, y0, t0, n_out0}, {(const uint8_t*) w1, y1, t1, n_out1}, x_q8_1, n_in, ncols,
+                (cudaStream_t) stream);
 }
 
 void dense_tc_l2_prefetch(const void* w, size_t bytes, void* stream) {

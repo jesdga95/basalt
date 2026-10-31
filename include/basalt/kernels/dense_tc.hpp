@@ -11,7 +11,8 @@
 //   Q8_0          d * d8 * dot                              (the block's int32 dot is exact)
 // The terms are the native kernels' math with fewer roundings, not their bits.  Every column is summed in one order
 // fixed by the shape (n_in, n_out) alone, so a column's value does not depend on how many columns ride along or where
-// it sits.
+// it sits.  The pair stage rounds a partial last tile's bulk copy up to 16 bytes: up to 15 bytes past the matrix's
+// last row are read, and weight allocations carry that slack.
 //
 // Weights are the GGUF row-major blocks; x_q8_1 holds ncols (1..8) columns of n_in / 32 q8_1 blocks.  n_in must be a
 // multiple of 512, x_q8_1 16-byte aligned.  Needs thread-block clusters.
