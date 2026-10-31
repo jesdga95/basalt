@@ -16,6 +16,7 @@
 #include "basalt/kernels/kv_q8.hpp"
 #include "basalt/kernels/kv_stream.hpp"
 #include "basalt/kernels/qsa.hpp"
+#include "basalt/kernels/qsa_dec_attn.hpp"
 #include "basalt/kernels/qsa_decode_attn.hpp"
 #include "basalt/kernels/qsa_seg.hpp"
 
@@ -267,8 +268,10 @@ bool run(int fmt) {
 // pool that the solo kv_stream_resolve drives over that slot's rows alone. A window is a random set of slots in
 // shuffled order, 1-4 rows each, with unused table entries. After its one segment resolve:
 //   1. the segment attention over the streamed slots is BITWISE what it is over the resident pools;
-//   2. every streamed slot's map is bitwise its twin's: the solo kernel's, so a slot's residency does not depend on
-//      the window's other segments, its width or the slot's place in it;
+//   2. each segment's rows are BITWISE what the solo path gives that slot's rows alone (kv_stream_resolve and
+//      qsa_dec_attn on its twin), so a row does not depend on the window's other segments, its width or the slot's
+//      place in it, and every slot's lookups equal its twin's. (Which pool page a missed block lands in follows the
+//      order the resolve's threads find the misses, so two maps are compared by what they serve, not page by page.)
 //   3. on the CPU: every block a segment selected is resident and its page holds the host copy's bytes, and every
 //      map inverts itself;
 //   4. no overflow, a slot's resolve calls equal the windows it was in, and the pools evict.
@@ -343,8 +346,7 @@ bool run_segments(bool bench) {
     float* out_ref = dalloc<float>(MAXR * NH * D);
     float* out_str = dalloc<float>(MAXR * NH * D);
     std::vector<float> hk(H * D), hv(H * D), hq(MAXR * NH * D), a((size_t) MAXR * NH * D), b2((size_t) MAXR * NH * D);
-    std::vector<int32_t> pt(n_blocks), sb(n_slots), tpt(n_blocks), tsb(n_slots);
-    std::vector<int32_t> mx(n_slots), tmx(n_slots), ctl(k::kKvCtlInts), tctl(k::kKvCtlInts);
+    std::vector<int32_t> pt(n_blocks), sb(n_slots);
     std::vector<std::vector<uint8_t>> dl(4);
     for (int i = 0; i < 4; ++i) dl[i].resize((size_t) n_slots * run_len[i]);
     std::vector<int> windows_in(NS, 0);
@@ -394,6 +396,15 @@ bool run_segments(bool bench) {
         k::kv_stream_resolve(tmaps[g.slot], twin[g.slot].attn(tmaps[g.slot].page_table), host[g.slot].p, fmt,
                              ids + (size_t) g.first * cap, steps + (size_t) g.first * 4, g.len, cap, s, nullptr);
     };
+    auto solo_attn = [&](int j, float* out) {   // segment j's rows through the solo attention, its slot's twin alone
+        const k::QsaSeg& g = segs[(size_t) j];
+        const size_t f = (size_t) g.first;
+        const k::QsaAttnPools pl = g.slot == RESIDENT ? ref[g.slot].attn(ident) : twin[g.slot].attn(tmaps[g.slot].page_table);
+        k::qsa_dec_attn(q + f * NH * D, pl, ids + f * cap, steps + f * 4, cap, s, scratch + f * scr, out + f * NH * D,
+                        g.len, nullptr);
+    };
+    float* out_solo = dalloc<float>(MAXR * NH * D);
+    std::vector<float> c3((size_t) MAXR * NH * D);
 
     int windows = 0, bad = 0;
     int64_t checked_blocks = 0;
@@ -417,32 +428,26 @@ bool run_segments(bool bench) {
         for (int j = 0; j < nseg; ++j) solo(j);
         k::qsa_dec_attn_seg(q, table(d_res), true, ids, steps, cap, s, scratch, out_ref, R, nullptr);
         k::qsa_dec_attn_seg(q, table(d_str), true, ids, steps, cap, s, scratch, out_str, R, nullptr);
+        for (int j = 0; j < nseg; ++j) solo_attn(j, out_solo);
         ck(cudaDeviceSynchronize(), "window");
-        // 1. the attention
+        // 1. the attention against the resident pools'
         ck(cudaMemcpy(a.data(), out_ref, (size_t) R * NH * D * 4, cudaMemcpyDeviceToHost), "a");
         ck(cudaMemcpy(b2.data(), out_str, (size_t) R * NH * D * 4, cudaMemcpyDeviceToHost), "b");
+        ck(cudaMemcpy(c3.data(), out_solo, (size_t) R * NH * D * 4, cudaMemcpyDeviceToHost), "c");
         if (std::memcmp(a.data(), b2.data(), (size_t) R * NH * D * 4) != 0)
             if (bad++ < 5) std::fprintf(stderr, "  segments pos %lld (%d segments, %d rows): streamed attention differs\n",
+                                        (long long) pos, nseg, R);
+        // 2. and against the solo path's, each segment on its own
+        if (std::memcmp(c3.data(), b2.data(), (size_t) R * NH * D * 4) != 0)
+            if (bad++ < 5) std::fprintf(stderr, "  segments pos %lld (%d segments, %d rows): differs from the solo path\n",
                                         (long long) pos, nseg, R);
         for (int j = 0; j < nseg; ++j) {
             const int i = segs[(size_t) j].slot;
             if (i == RESIDENT) continue;
             const k::KvStreamMap& m = maps[i];
-            const k::KvStreamMap& tm = tmaps[i];
-            // 2. the map against the solo kernel's
-            auto same = [&](const int32_t* x, const int32_t* y, int64_t n, std::vector<int32_t>& hx, std::vector<int32_t>& hy) {
-                hx.resize((size_t) n);
-                hy.resize((size_t) n);
-                ck(cudaMemcpy(hx.data(), x, (size_t) n * 4, cudaMemcpyDeviceToHost), "map");
-                ck(cudaMemcpy(hy.data(), y, (size_t) n * 4, cudaMemcpyDeviceToHost), "twin map");
-                return hx == hy;
-            };
-            const bool eq = same(m.page_table, tm.page_table, n_blocks, pt, tpt) & same(m.slot_block, tm.slot_block, n_slots, sb, tsb) &
-                            same(m.slot_stamp, tm.slot_stamp, n_slots, mx, tmx) & same(m.slot_ref, tm.slot_ref, n_slots, mx, tmx) &
-                            same(m.ctl, tm.ctl, k::kKvCtlInts, ctl, tctl);
-            if (!eq && bad++ < 5)
-                std::fprintf(stderr, "  segments pos %lld slot %d: the map differs from the solo resolve's\n", (long long) pos, i);
             // 3. on the CPU: the selected blocks resident with the host copy's bytes, and the map inverts itself
+            ck(cudaMemcpy(pt.data(), m.page_table, n_blocks * 4, cudaMemcpyDeviceToHost), "pt");
+            ck(cudaMemcpy(sb.data(), m.slot_block, n_slots * 4, cudaMemcpyDeviceToHost), "sb");
             const void* pa[4] = {pool[i].p.k_q, pool[i].p.v_q, pool[i].p.k_scale, pool[i].p.v_scale};
             for (int r = 0; r < 4; ++r) ck(cudaMemcpy(dl[r].data(), pa[r], dl[r].size(), cudaMemcpyDeviceToHost), "pool");
             std::set<int32_t> blocks;
@@ -475,19 +480,21 @@ bool run_segments(bool bench) {
         }
         ++windows;
     }
-    // 4. the counters
+    // 4. the counters, and the lookups against the twin's (the same selections walked)
     for (int i = 0; i < NS; ++i) {
         if (i == RESIDENT) continue;
-        const k::KvStreamCounters c = k::kv_stream_counters(maps[i]);
-        std::printf("  segments int8, slot %d: %llu calls in %d windows, %llu block lookups, %llu misses (%.1f%% hit), "
-                    "overflow %d\n", i, (unsigned long long) c.calls, windows_in[i], (unsigned long long) c.lookups,
-                    (unsigned long long) c.misses,
-                    c.lookups ? 100.0 * (double) (c.lookups - c.misses) / (double) c.lookups : 0.0, (int) c.overflow);
-        if (c.overflow || c.calls != (uint64_t) windows_in[i] || c.misses == 0 || c.misses >= c.lookups) ++bad;
+        const k::KvStreamCounters c = k::kv_stream_counters(maps[i]), tc = k::kv_stream_counters(tmaps[i]);
+        std::printf("  segments int8, slot %d: %llu calls in %d windows, %llu block lookups (solo %llu), %llu misses "
+                    "(%.1f%% hit; solo %llu), overflow %d\n", i, (unsigned long long) c.calls, windows_in[i],
+                    (unsigned long long) c.lookups, (unsigned long long) tc.lookups, (unsigned long long) c.misses,
+                    c.lookups ? 100.0 * (double) (c.lookups - c.misses) / (double) c.lookups : 0.0,
+                    (unsigned long long) tc.misses, (int) c.overflow);
+        if (c.overflow || c.calls != (uint64_t) windows_in[i] || c.misses == 0 || c.misses >= c.lookups ||
+            c.lookups != tc.lookups || tc.calls != c.calls)
+            ++bad;
     }
-    std::printf("  segments int8: %d windows, the attention bitwise the resident pools', every map bitwise the solo "
-                "resolve's, %lld selected blocks byte-equal to their host copies; %d failures\n", windows,
-                (long long) checked_blocks, bad);
+    std::printf("  segments int8: %d windows, the attention bitwise the resident pools' and the solo path's, %lld "
+                "selected blocks byte-equal to their host copies; %d failures\n", windows, (long long) checked_blocks, bad);
 
     if (bench && bad == 0) {   // every streamed slot in one window, 4 rows each, at the sequence's end
         cudaEvent_t e0, e1;
