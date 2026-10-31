@@ -149,6 +149,12 @@ public:
     /// keeps; the others are the working state's bytes), leaving the working state on the sequence it holds.
     /// The device is idle.
     bool save_store(int id, int64_t cells, ConversationKv& out, std::string& err);
+    /// Before a conversation snapshot reads `kv_state()` as the main sequence's draft K/V: with KV streaming beside
+    /// stores, the main sequence in the working state and its pages from the ring over the host copy the snapshot
+    /// reads.  A no-op otherwise.
+    bool snapshot_main(std::string& err) {
+        return st_.kv_mode != 2 || n_stores_ == 0 || (use_main(err) && ring_to_host(err));
+    }
     /// `draft` for sequence `id` from the window rows `R_rows` (device, row 0 of the sequence's segment).
     /// Copies a verify window's rows (all slots) out of the buffer the draft graphs also use, so each slot's
     /// `draft_seq` / `defer_rows` reads its own rows intact; null on failure.
