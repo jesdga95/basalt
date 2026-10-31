@@ -33,6 +33,18 @@ void iq256_rows_base(int ggml_type, const uint8_t* w, size_t row_bytes, int n, c
 void iq256_rows_vnni(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                      float* const* out, int r0, int r1);
 
+/// The rows of IQ3_S, IQ3_XXS and IQ2_S in one kernel mode, for the tests: 0 decodes each 32-value half alone, 1 a
+/// 64-value group at a time with its grid rows gathered.  The functions above pick 1 on the cores where gathers are
+/// fast (the AVX-VNNI build only) and 0 elsewhere.  Both modes give the same bits; other formats ignore the mode.
+void iq256_gu_rows_mode_base(int mode, int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
+                             const void* const* act, int nt, float* const* ff, int r0, int r1);
+void iq256_gu_rows_mode_vnni(int mode, int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
+                             const void* const* act, int nt, float* const* ff, int r0, int r1);
+void iq256_rows_mode_base(int mode, int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                          float* const* out, int r0, int r1);
+void iq256_rows_mode_vnni(int mode, int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                          float* const* out, int r0, int r1);
+
 /// out[t][r] = w_r . h[t] for IQ4_NL (type 20) rows against Q8_0 activations (ggml's block_q8_0).
 /// IQ4_NL is a 32-value-block format, so this does not go through iq256_rows (QK_K blocks, Q8_K acts).
 /// Rows of n values where iq4nl256_fits(n) (at most 2048).
