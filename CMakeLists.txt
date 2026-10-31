@@ -657,6 +657,11 @@ basalt_embed_manifest(community_row_test)
 basalt_cpu_test(NAME community_row_test COMMAND community_row_test)
 set_tests_properties(community_row_test PROPERTIES TIMEOUT 60)
 if(Python3_Interpreter_FOUND)
+  basalt_gpu_test(NAME generate_prompt_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/generate_prompt_test.py
+                          --engine $<TARGET_FILE:basalt>
+                          --model ${CMAKE_CURRENT_SOURCE_DIR}/models/Qwen3.8-FN-NVFP4.basalt)
+  set_tests_properties(generate_prompt_test PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
   basalt_cpu_test(NAME community_row_fix_test
                   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/community_row_fix_test.py
                           $<TARGET_FILE:community_row_test> ${CMAKE_CURRENT_SOURCE_DIR})

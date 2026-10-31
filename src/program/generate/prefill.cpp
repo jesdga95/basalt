@@ -27,7 +27,6 @@ int prefill(Context& context) {
     // ---- the prompt's conditioning positions [0, n_prompt - 1) in batched chunks.  The token loop then starts at the
     // last prompt position, whose prediction is the first generated token.
     int64_t pos_start = 0;
-    int64_t spec_pos = 0;   // where the speculative loop starts (0 = not used)
     basalt::prefill::Prefill prefill;
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
@@ -131,10 +130,7 @@ int prefill(Context& context) {
     }
 
     // The last prompt token is the first verify window (T = 1).
-    spec_pos = pos_start;
-
-
-    context.spec_pos = &spec_pos;
+    context.spec_pos = &pos_start;
     return decode(context);
 }
 

@@ -121,6 +121,9 @@ grammar form) is not enforced.
 
 ## Speculative decoding does not change output
 
+The standalone generator starts verification at the last prompt token, including position zero for a one-token
+prompt. The initial window has one row; subsequent windows use the same verifier and draft policy as longer prompts.
+
 Verify guarantees that a token's logits are bit for bit those of plain decode, whatever the window width
 (verify.hpp:3-8). This section tests that end to end.
 
