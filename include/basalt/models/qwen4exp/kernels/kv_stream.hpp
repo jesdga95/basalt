@@ -82,6 +82,11 @@ void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void*
 void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, int fmt, int64_t b0, int64_t b1,
                      int64_t n_slots, const QsaShapes& s, void* stream);
 
+/// The reverse of kv_ring_restore: the ring pages of blocks [b0, b1) (`b % n_slots`, at most n_slots blocks) into
+/// the host copy. Not capturable.
+void kv_ring_save(const QsaAttnPools& slots, const KvHostPools& host, int fmt, int64_t b0, int64_t b1, int64_t n_slots,
+                  const QsaShapes& s, void* stream);
+
 /// Copy the first `n_blocks` blocks of the host copy into a fully resident (identity-layout) pool: the prompt
 /// path's staging of one layer. Not capturable (DMA).
 void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int fmt, int64_t n_blocks,
