@@ -114,9 +114,12 @@ jobs:
         run: python -m pip install -r requirements.txt
 
       - name: Configure
+        env:
+          WERROR: ${{ runner.os == 'Linux' && 'ON' || 'OFF' }}
         run: >
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
+          -DWERROR="$WERROR"
           -DBUILD_TESTING=ON
           -DCMAKE_CUDA_ARCHITECTURES=120
           -DCMAKE_C_COMPILER_LAUNCHER=ccache

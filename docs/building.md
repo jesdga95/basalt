@@ -11,6 +11,10 @@ Clone, requirements and the build commands are in the [README](../README.md). Th
   check and the tokenizer.
 - `tests/`: parity and unit tests.
 
+## Warnings
+
+`-DWERROR=ON` turns warnings in the project's own C++ and CUDA sources into errors (CI sets it on Linux); it is off by default so a newer compiler's new warning cannot break a user build.
+
 ## Tests
 
 The tests are off by default. Configure the README's build with the extra option `-DBUILD_TESTING=ON`, build, then run `ctest --test-dir build`.
