@@ -473,18 +473,28 @@ CALL_END = "</tool_call>"
 
 PARAM_END = "</parameter>"
 FUNC_END = "</function>"
+PARAM_START = "<parameter="
+FUNC_START = "<function="
+_QUOTED_OPEN = re.compile(r"<function=[^<>\s]+>\s*(?:<parameter=|</function>)")
 
 
-def param_end(text: str, final: bool = False) -> int:
-    """Where a parameter value ends: the first `</parameter>` followed by `<parameter=` or `</function>`, so the
-    same text inside a value is kept. -1: none yet; -2: candidate awaiting its follower (`final` accepts it)."""
+def param_end(text: str, final: bool = False, name: str | None = None) -> int:
+    """Find a structural parameter close, keeping quoted calls and a reopened parameter inside its value.
+    -1: none yet; -2: candidate awaiting its follower (`final` accepts it)."""
     at = text.find(PARAM_END)
     while at >= 0:
-        after = text[at + len(PARAM_END):].lstrip()
-        if after.startswith(("<parameter=", FUNC_END)):
-            return at
-        if not after or "<parameter=".startswith(after) or FUNC_END.startswith(after):
-            return at if final else -2
+        if len(_QUOTED_OPEN.findall(text, 0, at)) <= text.count(FUNC_END, 0, at):
+            after = text[at + len(PARAM_END):].lstrip()
+            if after.startswith(PARAM_START):
+                gt = after.find(">")
+                if gt < 0:
+                    return at if final else -2
+                if name is None or after[len(PARAM_START):gt].strip() != name:
+                    return at
+            elif after.startswith(FUNC_END):
+                return at
+            elif not after or PARAM_START.startswith(after) or FUNC_END.startswith(after):
+                return at if final else -2
         at = text.find(PARAM_END, at + 1)
     return -1
 
@@ -508,7 +518,7 @@ def call_end(text: str) -> int:
             gt = text.find(">", pos)
             if gt < 0:
                 return -1
-            end = param_end(text[gt + 1:])
+            end = param_end(text[gt + 1:], name=text[pos:gt].split("=", 1)[1].strip())
             if end < 0:
                 return -1
             pos = gt + 1 + end + len(PARAM_END)
@@ -626,7 +636,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
         pname = rest[:rest.index(">")]
         rest = rest[rest.index(">") + 1:]
-        end = param_end(rest, final=True)
+        end = param_end(rest, final=True, name=pname.strip())
         value = rest[:end] if end >= 0 else rest
         rest = rest[end + len(PARAM_END):] if end >= 0 else ""
         if value.startswith("\n"):
@@ -684,6 +694,7 @@ class OutputParser:
         self.sval_started = False
         self.sdeclared = {}
         self.spname = ""
+        self.svstart = 0
 
     def _scan(self) -> list[Event]:
         """Advance the streaming view of the call body."""
@@ -739,7 +750,9 @@ class OutputParser:
                         self.sp += 1
                         rest = rest[1:]
                     self.sval_started = True
-                end = param_end(rest)
+                    self.svstart = self.sp
+                end = param_end(self.buf[self.svstart:], name=self.spname) if PARAM_END in rest else -1
+                end = end - (self.sp - self.svstart) if end >= 0 else end
                 if end >= 0:
                     value = rest[:end]
                     if value.endswith("\n"):
@@ -757,7 +770,7 @@ class OutputParser:
                     self.sp += safe
                 return out
             elif self.ss == "raw":
-                end = param_end(rest)
+                end = param_end(rest, name=self.spname)
                 if end < 0:
                     return out
                 value = rest[:end]
