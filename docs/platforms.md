@@ -48,6 +48,10 @@ system's long-path policy on or off.
   Without large pages it falls back to 4 KiB pages and says so at start-up.
 - Shared arena files and cgroup quotas do not exist. The engine refuses the first and reports no
   container limit.
+- The n-gram table (`--ple-io direct`) is read through the file cache. NTFS completes the
+  unbuffered reads of a file one at a time while the file is mapped or read through the cache,
+  and the model file is both. Table pages the reads bring in are cached memory, which Windows
+  hands back when a program needs it.
 - `basalt serve` runs the Python server as a child and exits with its status; Linux replaces
   the process.
 - A display-attached GPU is subject to the driver's timeout recovery (TDR). Raise `TdrDelay` under
