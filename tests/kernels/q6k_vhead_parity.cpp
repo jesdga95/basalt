@@ -4,7 +4,9 @@
 //     under fast math);
 //   - the rows near each column's top are exact (the bits of q6k_head_mmvq), every other row is the CPU score of the
 //     copy, and the argmax is the exact one;
-// then a cold microbench of both at the head's shape.
+//   - every column is bitwise the column computed alone, at every width;
+// for two sets of columns: all at a head's spread, and with flat columns (a small spread puts most rows within the
+// margin, as a prompt row folded into a window can); then a cold microbench of both kernels per set.
 //   q6k_vhead_parity [rows] [iters]
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/q6k_head.hpp"
@@ -124,6 +126,7 @@ int main(int argc, char** argv) {
     for (auto& v : hx) v = nd(rng);
     ck(cudaMalloc(&x, hx.size() * 4), "x");
     ck(cudaMemcpy(x, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice), "x up");
+    const std::vector<float> hx0 = hx;
     ck(cudaMalloc(&xq, k::native_q8_1_bytes(kNin, MT)), "xq");
     ck(cudaMalloc(&y0, (size_t) MT * rows * 4), "y0");
     ck(cudaMalloc(&y1, (size_t) MT * rows * 4), "y1");
@@ -178,107 +181,128 @@ int main(int argc, char** argv) {
         if (lv_bad > n_lv / 1000 || sc_bad > n_lv / 32 / 100) fail = 1;
     }
 
-    // the CPU score of the copy for every row and column
-    std::vector<int8_t> hq((size_t) MT * kNin);
-    std::vector<float> hd((size_t) MT * 80);
-    {
-        std::vector<uint8_t> raw(k::native_q8_1_bytes(kNin, MT));
-        ck(cudaMemcpy(raw.data(), xq, raw.size(), cudaMemcpyDeviceToHost), "xq down");
-        for (int b = 0; b < MT * 80; ++b) {
-            __half dh;
-            std::memcpy(&dh, &raw[(size_t) b * 36], 2);
-            hd[(size_t) b] = __half2float(dh);
-            std::memcpy(&hq[(size_t) b * 32], &raw[(size_t) b * 36 + 4], 32);
-        }
-    }
-    std::vector<float> approx((size_t) MT * rows);
-    {
-        std::vector<int> lv(kNin);
-        std::vector<float> sc(80);
-        std::vector<long> sq((size_t) MT * 80, 0);
-        for (int c = 0; c < MT; ++c)
-            for (int i = 0; i < kNin; ++i) sq[(size_t) c * 80 + i / 32] += hq[(size_t) c * kNin + i];
-        for (int r = 0; r < rows; ++r) {
-            for (int g = 0; g < 80; ++g) {
-                sc[(size_t) g] = cp.scale(r, g);
-                for (int l = 0; l < 32; ++l) lv[(size_t) g * 32 + l] = cp.lvl(r, g, l);
-            }
-            for (int c = 0; c < MT; ++c) {
-                double acc = 0;
-                const int8_t* qc = &hq[(size_t) c * kNin];
-                for (int g = 0; g < 80; ++g) {
-                    long p = 0;
-                    for (int l = 0; l < 32; ++l) p += (long) lv[(size_t) g * 32 + l] * qc[g * 32 + l];
-                    acc += (double) sc[(size_t) g] * hd[(size_t) c * 80 + g] * ((double) p - 1.5 * (double) sq[(size_t) c * 80 + g]);
-                }
-                approx[(size_t) c * rows + r] = (float) acc;
-            }
-        }
-    }
-
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0);
     cudaEventCreate(&e1);
     void* flush = nullptr;
     ck(cudaMalloc(&flush, 256u << 20), "flush");
-    std::vector<double> exact_rows(MT + 1, 0);
-    std::vector<float> first;   // column 0 at one column: every width gives the same bits
-    for (int nc = 1; nc <= MT; ++nc) {
-        k::q6k_head_mmvq(w, xq, y0, kNin, rows, nc, s);
-        k::q6k_vhead(proxy, w, xq, y1, kNin, rows, nc, scratch, s);
-        ck(cudaStreamSynchronize(s), "sync");
-        std::vector<float> a((size_t) nc * rows), b((size_t) nc * rows);
-        ck(cudaMemcpy(a.data(), y0, a.size() * 4, cudaMemcpyDeviceToHost), "a");
-        ck(cudaMemcpy(b.data(), y1, b.size() * 4, cudaMemcpyDeviceToHost), "b");
-        if (nc == 1) first = b;
-        const long width_bad = std::memcmp(first.data(), b.data(), (size_t) rows * 4) != 0;
-        long missed = 0, off_cpu = 0, n_exact = 0, argmax_bad = 0;
-        double max_dev = 0;
-        for (int c = 0; c < nc; ++c) {
-            const float* ap = &approx[(size_t) c * rows];
-            std::vector<float> srt(ap, ap + rows);
-            std::nth_element(srt.begin(), srt.begin() + 63, srt.end(), std::greater<float>());
-            const float must = srt[63] - 3.99f;   // the kernel's margin, less the scoring's rounding
-            int am = 0, bm = 0;
-            for (int r = 0; r < rows; ++r) {
-                const size_t i = (size_t) c * rows + r;
-                const bool exact = std::memcmp(&a[i], &b[i], 4) == 0;
-                n_exact += exact;
-                if (ap[r] >= must && !exact) ++missed;
-                if (!exact) {
-                    const double dv = std::fabs((double) b[i] - (double) ap[r]);
-                    max_dev = std::max(max_dev, dv);
-                    off_cpu += dv > 2e-3 * (1.0 + std::fabs((double) ap[r]));
-                }
-                if (a[i] > a[(size_t) c * rows + am]) am = r;
-                if (b[i] > b[(size_t) c * rows + bm]) bm = r;
+    // one set of columns: column c is the random column c times scale[c], quantized
+    auto run_set = [&](const char* set, const float* scale) {
+        for (int c = 0; c < MT; ++c)
+            for (int i = 0; i < kNin; ++i) hx[(size_t) c * kNin + i] = hx0[(size_t) c * kNin + i] * scale[c];
+        ck(cudaMemcpy(x, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice), "x set");
+        k::native_quantize_q8_1(x, xq, kNin, MT, s);
+        ck(cudaStreamSynchronize(s), "quantize");
+        // the CPU score of the copy for every row and column
+        std::vector<int8_t> hq((size_t) MT * kNin);
+        std::vector<float> hd((size_t) MT * 80);
+        {
+            std::vector<uint8_t> raw(k::native_q8_1_bytes(kNin, MT));
+            ck(cudaMemcpy(raw.data(), xq, raw.size(), cudaMemcpyDeviceToHost), "xq down");
+            for (int b = 0; b < MT * 80; ++b) {
+                __half dh;
+                std::memcpy(&dh, &raw[(size_t) b * 36], 2);
+                hd[(size_t) b] = __half2float(dh);
+                std::memcpy(&hq[(size_t) b * 32], &raw[(size_t) b * 36 + 4], 32);
             }
-            argmax_bad += am != bm;
         }
-        exact_rows[nc] = (double) n_exact / nc;
-        // cold time: each launch after a flush of the L2
-        float tot[2] = {0, 0};
-        for (int it = 0; it < iters; ++it)
-            for (int v = 0; v < 2; ++v) {
-                ck(cudaMemsetAsync(flush, it, 256u << 20, s), "flush");
-                cudaEventRecord(e0, s);
-                if (v == 0) k::q6k_head_mmvq(w, xq, y0, kNin, rows, nc, s);
-                else k::q6k_vhead(proxy, w, xq, y1, kNin, rows, nc, scratch, s);
-                cudaEventRecord(e1, s);
-                cudaEventSynchronize(e1);
-                float ms;
-                cudaEventElapsedTime(&ms, e0, e1);
-                tot[v] += ms;
+        std::vector<float> approx((size_t) MT * rows);
+        {
+            std::vector<int> lv(kNin);
+            std::vector<float> sc(80);
+            std::vector<long> sq((size_t) MT * 80, 0);
+            for (int c = 0; c < MT; ++c)
+                for (int i = 0; i < kNin; ++i) sq[(size_t) c * 80 + i / 32] += hq[(size_t) c * kNin + i];
+            for (int r = 0; r < rows; ++r) {
+                for (int g = 0; g < 80; ++g) {
+                    sc[(size_t) g] = cp.scale(r, g);
+                    for (int l = 0; l < 32; ++l) lv[(size_t) g * 32 + l] = cp.lvl(r, g, l);
+                }
+                for (int c = 0; c < MT; ++c) {
+                    double acc = 0;
+                    const int8_t* qc = &hq[(size_t) c * kNin];
+                    for (int g = 0; g < 80; ++g) {
+                        long p = 0;
+                        for (int l = 0; l < 32; ++l) p += (long) lv[(size_t) g * 32 + l] * qc[g * 32 + l];
+                        acc += (double) sc[(size_t) g] * hd[(size_t) c * 80 + g] * ((double) p - 1.5 * (double) sq[(size_t) c * 80 + g]);
+                    }
+                    approx[(size_t) c * rows + r] = (float) acc;
+                }
             }
-        const double u0 = 1e3 * tot[0] / iters, u1 = 1e3 * tot[1] / iters;
-        const bool bad = missed || off_cpu || argmax_bad || width_bad;
-        std::printf("ncols %d: %s (near-top rows not exact %ld, approximate rows off the CPU score %ld, max dev %.2e, "
-                    "argmax differs %ld, column 0 differs from one column %ld; exact rows per column %.0f) | cold: "
-                    "q6k_head %6.1f us | vhead %6.1f us | %.2fx\n",
-                    nc, bad ? "FAIL" : "ok", missed, off_cpu, max_dev, argmax_bad, width_bad, exact_rows[nc], u0, u1,
-                    u0 / u1);
-        if (bad) fail = 1;
-    }
+        }
+
+        std::vector<double> exact_rows(MT + 1, 0);
+        // each column computed alone: a column of any wider call must be these bits
+        const size_t xcol = k::native_q8_1_bytes(kNin, 1);
+        std::vector<float> alone((size_t) MT * rows);
+        for (int c = 0; c < MT; ++c) {
+            k::q6k_vhead(proxy, w, (const char*) xq + (size_t) c * xcol, y1, kNin, rows, 1, scratch, s);
+            ck(cudaMemcpy(&alone[(size_t) c * rows], y1, (size_t) rows * 4, cudaMemcpyDeviceToHost), "alone");
+        }
+        for (int nc = 1; nc <= MT; ++nc) {
+            k::q6k_head_mmvq(w, xq, y0, kNin, rows, nc, s);
+            k::q6k_vhead(proxy, w, xq, y1, kNin, rows, nc, scratch, s);
+            ck(cudaStreamSynchronize(s), "sync");
+            std::vector<float> a((size_t) nc * rows), b((size_t) nc * rows);
+            ck(cudaMemcpy(a.data(), y0, a.size() * 4, cudaMemcpyDeviceToHost), "a");
+            ck(cudaMemcpy(b.data(), y1, b.size() * 4, cudaMemcpyDeviceToHost), "b");
+            long width_bad = 0;   // columns that differ from the column computed alone
+            for (int c = 0; c < nc; ++c)
+                width_bad += std::memcmp(&alone[(size_t) c * rows], &b[(size_t) c * rows], (size_t) rows * 4) != 0;
+            long missed = 0, off_cpu = 0, n_exact = 0, argmax_bad = 0;
+            double max_dev = 0;
+            for (int c = 0; c < nc; ++c) {
+                const float* ap = &approx[(size_t) c * rows];
+                std::vector<float> srt(ap, ap + rows);
+                std::nth_element(srt.begin(), srt.begin() + 63, srt.end(), std::greater<float>());
+                const float must = srt[63] - 3.99f;   // the kernel's margin, less the scoring's rounding
+                int am = 0, bm = 0;
+                for (int r = 0; r < rows; ++r) {
+                    const size_t i = (size_t) c * rows + r;
+                    const bool exact = std::memcmp(&a[i], &b[i], 4) == 0;
+                    n_exact += exact;
+                    if (ap[r] >= must && !exact) ++missed;
+                    if (!exact) {
+                        const double dv = std::fabs((double) b[i] - (double) ap[r]);
+                        max_dev = std::max(max_dev, dv);
+                        off_cpu += dv > 2e-3 * (1.0 + std::fabs((double) ap[r]));
+                    }
+                    if (a[i] > a[(size_t) c * rows + am]) am = r;
+                    if (b[i] > b[(size_t) c * rows + bm]) bm = r;
+                }
+                argmax_bad += am != bm;
+            }
+            exact_rows[nc] = (double) n_exact / nc;
+            // cold time: each launch after a flush of the L2
+            float tot[2] = {0, 0};
+            for (int it = 0; it < iters; ++it)
+                for (int v = 0; v < 2; ++v) {
+                    ck(cudaMemsetAsync(flush, it, 256u << 20, s), "flush");
+                    cudaEventRecord(e0, s);
+                    if (v == 0) k::q6k_head_mmvq(w, xq, y0, kNin, rows, nc, s);
+                    else k::q6k_vhead(proxy, w, xq, y1, kNin, rows, nc, scratch, s);
+                    cudaEventRecord(e1, s);
+                    cudaEventSynchronize(e1);
+                    float ms;
+                    cudaEventElapsedTime(&ms, e0, e1);
+                    tot[v] += ms;
+                }
+            const double u0 = 1e3 * tot[0] / iters, u1 = 1e3 * tot[1] / iters;
+            const bool bad = missed || off_cpu || argmax_bad || width_bad;
+            std::printf("%s ncols %d: %s (near-top rows not exact %ld, approximate rows off the CPU score %ld, max dev "
+                        "%.2e, argmax differs %ld, columns differing from the column alone %ld; exact rows per column %.0f) | "
+                        "cold: q6k_head %6.1f us | vhead %6.1f us | %.2fx\n",
+                        set, nc, bad ? "FAIL" : "ok", missed, off_cpu, max_dev, argmax_bad, width_bad, exact_rows[nc], u0, u1,
+                        u0 / u1);
+            if (bad) fail = 1;
+        }
+    };
+    const float spread[MT] = {1, 1, 1, 1, 1, 1, 1, 1};
+    // flat columns first and among the others: alone, one of them lists more rows than a list of every column's
+    // usual near-top rows holds
+    const float flat[MT] = {0.02f, 1, 0.1f, 1, 0.3f, 1, 0.02f, 1};
+    run_set("spread", spread);
+    run_set("flat", flat);
     std::printf("%s\n", fail ? "q6k_vhead_parity: FAIL" : "q6k_vhead_parity: OK");
     return fail;
 }
