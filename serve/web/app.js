@@ -30,6 +30,15 @@ async function get(path) {
   return r.json();
 }
 
+async function post(path, body) {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
+    body: JSON.stringify(body),
+  });
+  return { status: r.status, body: await r.json().catch(() => ({})) };
+}
+
 /* ---- series and charts ---- */
 // the last HIST samples, padded at the start with null (no line) so the newest sample sits at the right edge
 const tail = a => { const v = (a || []).slice(-HIST).map(x => num(x) ? x : null); while (v.length < HIST) v.unshift(null); return v; };
@@ -299,7 +308,32 @@ function draw() {
   drawSide(M.hardware || {}, M.hardware_static || {}, hist, eng, reqs[0]);
   drawHero(live, hist, reqs, M.best || {}, slots, total);
   drawMain(live, hist, reqs, slots, total);
+  drawCvec(eng);
 }
+
+/* ---- control vector switch ---- */
+let cvecOn = false, cvecBusy = false;
+const cvecBox = $("#cvec-box"), cvecBtn = $("#cvec-btn");
+function drawCvec(eng) {
+  // the engine reports its loaded control vector in /metrics; a bare line has nothing to switch
+  const has = eng && eng.cvec !== undefined && eng.cvec !== 0;
+  cvecBox.hidden = !has;
+  if (!has) return;
+  cvecBtn.setAttribute("aria-pressed", String(cvecOn));
+  cvecBtn.textContent = cvecOn ? "Uncensored: on" : "Uncensored: off";
+}
+cvecBtn.onclick = async () => {
+  if (cvecBusy) return;
+  cvecBusy = true;
+  try {
+    const { body } = await post("v1/cvec", { cvec: !cvecOn });
+    if (body.cvec !== undefined) cvecOn = body.cvec === 1;
+  } finally {
+    cvecBusy = false;
+    drawCvec((M || {}).engine || {});
+  }
+};
+get("v1/cvec").then(r => { cvecOn = r.cvec === 1; if (M) draw(); }).catch(() => {});
 
 /* ---- logs ---- */
 const logEl = $("#log"), MAXLOG = 400;

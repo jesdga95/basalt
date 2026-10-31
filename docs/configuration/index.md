@@ -223,7 +223,9 @@ Diagnostic flags: `bin/basalt --help`
 ## Control vectors
 
 A control vector (a GGUF in llama.cpp's format) is added to the residual stream; with the server, a request switches it
-with `cvec` (0 or 1).
+with `cvec` (0 or 1). POST `/v1/cvec` (`{"cvec": true}` or `false`) switches the state a request that leaves the field
+out gets, from the next request on; GET reads it back, and the monitor shows a switch while the engine reports a
+loaded vector.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
