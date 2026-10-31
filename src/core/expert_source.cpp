@@ -624,10 +624,11 @@ bool FileExpertSource::read_blobs(const std::pair<int32_t, int32_t>* pairs, int6
     const uint64_t stage_bytes = (max_blob + 2 * (alignment - 1)) & ~(alignment - 1);
     const int readers = (int) std::min<int64_t>(kBlobReaders, n);
     struct Stage {
-        uint8_t* data = nullptr;
+        uint8_t* data = nullptr;   ///< the aligned interior the reads land in, which is what `submit` may take
+        uint8_t* block = nullptr;  ///< the pinned block `data` was aligned out of, and what `cudaFreeHost` frees
         int64_t index = -1;
         uint32_t prefix = 0, required = 0;
-        ~Stage() { if (data) cudaFreeHost(data); }
+        ~Stage() { if (block) cudaFreeHost(block); }
     } stages[kBlobReaders];
     // The file drains outstanding writes before the staging buffers are released.  A pack on a file system without
     // unbuffered reads, or one that cannot be reopened, is read through the mapping.
@@ -635,13 +636,21 @@ bool FileExpertSource::read_blobs(const std::pair<int32_t, int32_t>* pairs, int6
     std::string direct_err;
     if (!file.open(path_, direct_err, readers)) return mapped_read();
     for (int i = 0; i < readers; ++i) {
-        // Portable: the fill writes the peer card's slots straight from these buffers.
-        if (cudaHostAlloc((void**) &stages[i].data, (size_t) stage_bytes, cudaHostAllocPortable) != cudaSuccess) {
+        // Portable: the fill writes the peer card's slots straight from these buffers.  Pinned one alignment larger
+        // than the stage: a pinned allocation is not necessarily a multiple of the unbuffered read's alignment, so
+        // the reads go through the aligned interior of the block.
+        void* block = nullptr;
+        if (cudaHostAlloc(&block, (size_t) (stage_bytes + alignment), cudaHostAllocPortable) != cudaSuccess) {
             (void) cudaGetLastError();
             file.close();
             return mapped_read();
         }
+        stages[i].block = (uint8_t*) block;
+        stages[i].data = (uint8_t*) platform::align_for_direct_io(block);
     }
+    // A stage that cannot satisfy the contract reads through the mapping instead of failing the fill.
+    for (int i = 0; i < readers; ++i)
+        if (((uintptr_t) stages[i].data) % alignment != 0) { file.close(); return mapped_read(); }
 
     auto submit = [&](int slot, int64_t index) {
         const auto [layer, expert] = pairs[index];
