@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from model_file import ModelFile  # noqa: E402
 from serve.engine.flags import flag_value  # noqa: E402
 
-VISION_EXE = "basalt-vision"
+VISION_EXE = "basalt-vision.exe" if sys.platform == "win32" else "basalt-vision"
 
 
 def cache_root() -> Path:

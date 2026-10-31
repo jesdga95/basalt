@@ -152,13 +152,13 @@ class Vision(Tmp):
 
     def test_gpu_or_cpu_encoder(self):
         path = self.build(vision=True)
-        (self.engine_bin.parent / "basalt-vision").write_text("")
+        self.vision_bin.write_text("")
         self.assertTrue(modelfile.model_config(path, str(self.engine_bin), vision="1")["vision"]["gpu"])
         self.assertFalse(modelfile.model_config(path, str(self.engine_bin), vision="cpu")["vision"]["gpu"])
 
     def test_modes_name_the_encoder(self):
         path = self.build(vision=True)
-        (self.engine_bin.parent / "basalt-vision").write_text("")
+        self.vision_bin.write_text("")
         for mode, name in (("1", "1"), ("0", "0"), ("cpu", "cpu"), ("dynamic", "dynamic")):
             self.assertEqual(modelfile.model_config(path, str(self.engine_bin), vision=mode)["vision"]["mode"], name)
 
@@ -226,7 +226,7 @@ class Cli(Tmp):
 
     def test_vision_numbered_card_needs_only_to_exist(self):
         path = self.build(vision=True)
-        (self.engine_bin.parent / "basalt-vision").write_text("")
+        self.vision_bin.write_text("")
         base = ["--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0"]
 
         def plan(engine_bin, value):                     # the engine's own choice for --gpu 0
