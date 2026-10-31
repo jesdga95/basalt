@@ -95,7 +95,7 @@ Verifier::~Verifier() {
     if (ev_join_) cudaEventDestroy(ev_join_);
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_, h_pend_,
-                     h_flagA_, h_plan_, h_flagB_, h_q_, h_qp_};
+                     h_flagA_, h_plan_, h_flagB_, h_q_, h_qp_, h_top_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -177,6 +177,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) &&
               mapped(T * 4 + 16, (void**) &h_q_, (void**) &m_q_) &&
               mapped(T * 4 + 16, (void**) &h_qp_, (void**) &m_qp_) &&
+              mapped(T * kTopIds * 4 + 16, (void**) &h_top_, (void**) &m_top_) &&
               mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
               mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
               mapped(T * K * 4, (void**) &h_w_, (void**) &m_w_) &&

@@ -854,6 +854,7 @@ add_executable(sampler_parity tests/kernels/sampler_parity.cpp)
 target_include_directories(sampler_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(sampler_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME sampler_parity COMMAND sampler_parity --selftest)
+basalt_gpu_test(NAME sampler_split_parity COMMAND sampler_parity --split)
 # the decode QSA top-k and the greedy argmax on thread-block clusters vs the one-CTA kernels, bitwise,
 # captured in a graph too (GPU, synthetic, no model; skips without cluster support); --bench: per-call times
 add_executable(decode_cluster_parity tests/kernels/decode_cluster_parity.cpp)

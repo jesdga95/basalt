@@ -75,6 +75,9 @@ public:
     /// A new request: the draft head's extra rows are cleared, and the tokens of the prompt that the
     /// draft subset lacks queue for them.
     void begin_request(const int64_t* prompt, int64_t n);
+    /// The target's candidates at a window's committed rows (`n` ids, -1 skipped): the ones the subset lacks queue for
+    /// context rows, while some stay free for the reply's own picks.
+    void note_candidates(const int32_t* ids, int n);
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
     /// Captures every conditional draft graph (each draft-head tier, each window width) now rather than at its first

@@ -11,6 +11,15 @@ void MtpDrafter::ctx_note(int64_t t) {
     xpend_.push_back((int32_t) t);
 }
 
+void MtpDrafter::note_candidates(const int32_t* ids, int n) {
+    if (n_xcap_ == 0 || ids == nullptr) return;
+    for (int i = 0; i < n; ++i) {
+        if ((int64_t) xlist_.size() + (int64_t) xpend_.size() >= n_xcap_ - kDraftCtxPickRows) return;
+        const int32_t t = ((const volatile int32_t*) ids)[i];
+        if (t >= 0) ctx_note(t);
+    }
+}
+
 void MtpDrafter::begin_request(const int64_t* prompt, int64_t n) {
     if (n_xcap_ == 0) return;
     const OnDevice on_device(device_);

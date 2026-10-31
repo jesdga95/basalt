@@ -459,6 +459,8 @@ Flow Request::decode() {
                 pair_hint = pair_req && full_ema >= kPairFull;
                 runtime_.mtp.set_cum_th(pair_hint ? cum_adapt.th() * kPairChainScale : cum_adapt.th());
                 runtime_.mtp.set_host_th(cum_adapt.th());
+                if (const int32_t* top = cv->top_ids())
+                    runtime_.mtp.note_candidates(top, (a + 1) * basalt::core::Verifier::kTopIds);
                 drafted = runtime_.mtp.draft_from(cv->final_R_all(), T, outv.data(), p, a, drafts.data(), runtime_.err, dprob.data(), &n_chain);
                 runtime_.mtp.set_launch_hook(nullptr);
                 if (drafted && runtime_.pipe_on) {   // the next window's first stage starts after the chain's kernels
