@@ -361,15 +361,20 @@ Flow Request::decode() {
                 basalt::core::decode_gaps().hms[20] += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
             });
         };
+        // the picks this window sends, and the rows it commits: a window that ends the reply (the length or an
+        // end token) keeps no row past the last token sent, so the conversation the session holds is the text
+        // the client saw, which the next turn's prompt starts with
+        int n_emit = 0;
+        bool eos_pre = false;
+        for (int i = e0; i <= a && produced_n + n_emit < max_new && !eos_pre; ++i) {
+            ++n_emit;
+            eos_pre = ppl == nullptr &&
+                      std::find(runtime_.o.eos_ids.begin(), runtime_.o.eos_ids.end(), (int64_t) outv[(size_t) i]) != runtime_.o.eos_ids.end();
+        }
+        const bool ends = ppl == nullptr && n_emit > 0 && (eos_pre || produced_n + n_emit >= max_new);
+        const int keep = ends ? std::min(a, e0 + n_emit) + 1 : a + 1;
         if (chain) {
             // the draft launches first; the commit, the adaptive round and the output go in its shadow
-            int n_emit = 0;
-            bool eos_pre = false;
-            for (int i = e0; i <= a && produced_n + n_emit < max_new && !eos_pre; ++i) {
-                ++n_emit;
-                eos_pre = ppl == nullptr &&
-                          std::find(runtime_.o.eos_ids.begin(), runtime_.o.eos_ids.end(), (int64_t) outv[(size_t) i]) != runtime_.o.eos_ids.end();
-            }
             const bool will_draft = !eos_pre && produced_n + n_emit < max_new;
             float wprob[16];
             const int wprob_n = std::min(runtime_.S_mtp, 16);
@@ -398,11 +403,11 @@ Flow Request::decode() {
                 }
             };
             basalt::core::decode_events().stamp(9);
-            if (!hold && !cv->commit(a + 1, runtime_.err, 2)) {
+            if (!hold && !cv->commit(keep, runtime_.err, 2)) {
                 std::printf("ERR %s\n", runtime_.err.c_str());
                 return Flow::error;
             }
-            for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+            for (int i = 0; i < keep; ++i) consumed.push_back(window[(size_t) i]);
             draft_offered += T - 1 - e0;
             draft_accepted += a - e0;
             first_window = false;
@@ -410,7 +415,7 @@ Flow Request::decode() {
             std::string cerr;
             auto after_launch = [&] {
                 after_ran = true;
-                commit_ok = hold ? true : cv->commit(a + 1, cerr, 1);
+                commit_ok = hold ? true : cv->commit(keep, cerr, 1);
                 if (!hold) adapt_side();
                 for (int i = e0; i <= a && produced_n < max_new && !eos; ++i) {
                     std::printf("T %d\n", (int) outv[(size_t) i]);
@@ -517,13 +522,13 @@ Flow Request::decode() {
             continue;
         }
         spawn_adapt();
-        if (!runtime_.ver.commit(a + 1, runtime_.err)) {
+        if (!runtime_.ver.commit(keep, runtime_.err)) {
             if (adapt_thr.joinable()) adapt_thr.join();
             std::printf("ERR %s\n", runtime_.err.c_str());
             return Flow::error;
         }
-        // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
-        for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+        // the window's first `keep` tokens are in the session now (the last output is not: it is next x)
+        for (int i = 0; i < keep; ++i) consumed.push_back(window[(size_t) i]);
         draft_offered += T - 1 - e0;
         draft_accepted += a - e0;
         first_window = false;
