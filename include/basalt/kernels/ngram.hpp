@@ -98,13 +98,13 @@ int iq4nl_code(int code);
 /// a perfectly plausible embedding of the wrong 160 values.
 void iq4nl_dequant_row(const uint8_t* row, float* out160);
 
-/// How the table's rows are read. `Direct` is the default: unbuffered 4 KiB reads from the SSD,
-/// so the table never occupies RAM or the OS file cache. `Mmap` is the earlier memory-mapped path, kept as the
+/// How the table's rows are read. `Direct` is the default: 4 KiB reads from the SSD (platform::DirectFile),
+/// so the table never occupies the process's memory. `Mmap` is the earlier memory-mapped path, kept as the
 /// A/B arm; it returns the same bytes.
 ///
-/// NEVER KEEP THE SHARD MAPPED WHILE READING IT DIRECT: a live section on the same file serializes the unbuffered
-/// reads (several times slower per token). Direct mode drops its own mapping
-/// after the header parse; nothing else in the process may hold one.
+/// The table is a section of the model file, which the expert source maps and the loaders read. Direct mode drops
+/// its own mapping after the header parse, and its reader opens the file as one mapped elsewhere, so those views do
+/// not serialize its reads (see DirectFile::open).
 enum class PleIo { Direct, Mmap };
 
 struct PleIoOptions {
