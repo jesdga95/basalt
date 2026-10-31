@@ -72,6 +72,8 @@ Flow Request::decode() {
     dec_windows = 0;
     dec_T = 0;
     decode_hits0 = runtime_.drive.d.cache_hits;
+    swapped0 = runtime_.xq_swapped;
+    noplace0 = runtime_.xq_noplace;
     // the RAM and file tiers of this request (the mmap source; 0 with the arena)
     ram0 = runtime_.src.ram_reads();
     files0 = runtime_.src.file_reads();

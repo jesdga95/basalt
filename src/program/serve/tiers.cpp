@@ -374,6 +374,8 @@ bool Runtime::xq_round() {
                                (size_t) swaps[i].layer * g.n_expert + swaps[i].in)) continue;
         if (!plan(swaps[i])) return false;
     }
+    xq_swapped += (int64_t) xq.size();
+    xq_noplace += (int64_t) n_noplace;
     if (!xq.empty()) {
         cudaEventRecord(adapt_ev, adapt_stream);
         xq_stage = 1;
@@ -559,6 +561,8 @@ int Runtime::init_tiers() {
 
     xq_stage = 0;   // 0 idle, 1 evictions copying to RAM, 2 incoming experts copying to their slots
     xq_saturated = false;   // the last round had at least kSatRatio times --adapt-swaps misses to swap
+    xq_swapped = 0;
+    xq_noplace = 0;
 
     xq_no = 0;
     xq_words = false;   // the round in flight writes the landed words
