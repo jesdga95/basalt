@@ -20,8 +20,10 @@ bool qsa_dec_attn_supported(const QsaAttnPools& pools, const QsaShapes& s);
 /// qsa_decode_attn_batch's contract and scratch (qsa_decode_attn_scratch_floats(cap, s) floats per query).
 /// q_full / attn_gated non-null: also attn_gated = attn * sigmoid(gate half of q_full) per head.
 /// xq non-null (with the gated rows): the merge also writes the gated rows' q8_1 blocks (native_quantize_q8_1's).
+/// merge_after non-null: a cudaEvent_t the merge also waits for (the gate half of q_full written on another stream).
 void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                   const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream,
-                  const float* q_full = nullptr, float* attn_gated = nullptr, void* xq = nullptr);
+                  const float* q_full = nullptr, float* attn_gated = nullptr, void* xq = nullptr,
+                  void* merge_after = nullptr);
 
 }  // namespace basalt::kernels

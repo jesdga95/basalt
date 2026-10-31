@@ -65,7 +65,7 @@ The drafter only proposes tokens; verify decides every token, so the drafter's p
 | hc down and inject (hc read) | fp32, no activation quantization; int8 weights converted exactly, fp32 fmaf per group | hc_fused.cu:378-388, 510 |
 | hc up | fp32 input split into an fp16 high and low part (about 22-bit mantissa), fp16 tensor-core mma with fp32 accumulate, per-group fp16 scale applied in fp32 | hc_fused.cu:635-698 |
 | Router | fp32 times BF16 weight, fp32 FMA | hc_fused.cu:762-833; native_bf16.cu:45-125 |
-| GDN qkv, QSA q, GDN ssm_out, QSA o | q8_1: int8 codes with an fp16 scale per 32 values, int8 tensor-core dot (dense_tc) | native_mmvq.cu:147-162; dense_tc.hpp:2-12 |
+| GDN qkv, QSA q, GDN ssm_out, QSA o | q8_1: int8 codes with an fp16 scale per 32 values, int8 tensor-core dot (dense_tc). The QSA query projection of a decode window runs as two launches, its query rows and then its gate rows beside the attention, each 16-row tile with dense_tc's arithmetic: the same bits | native_mmvq.cu:147-162; dense_tc.hpp:2-12; qsa_mid.cu |
 | GDN z, QSA k/v | z through dense_tc together with qkv when eligible; otherwise native_mmvq (dp4a on q8_1) | dense_tc.cu:1148-1154; verify/record_gdn.cpp, verify/record_qsa.cpp |
 | Routed experts gate/up | q8_1 of the fp32 FFN input; dp4a with exact int32 per block | hc_fused.cu:63-77; iq_kernels.cu:202-228 |
 | Routed experts down | fp32 SwiGLU, then q8_1 per 32 | iq_kernels.cu:1909-1920 |
