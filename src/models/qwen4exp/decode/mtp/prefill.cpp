@@ -10,7 +10,21 @@ void MtpDrafter::kv_restore(int64_t upto) {
     // the ring's blocks below `upto`, from the host copy: a checkpoint resume may have left later cells in them
     const basalt::kernels::QsaShapes s = shapes_of(*g_);
     const int64_t b1 = (upto + s.page_size - 1) / s.page_size, b0 = std::max<int64_t>(0, b1 - st_.n_slots);
-    basalt::kernels::kv_ring_restore(qsa_attn_pools(st_), st_.host, qsa_kv_format(st_), b0, b1, st_.n_slots, s, cs_);
+    auto restore = [&](int64_t r0, int64_t r1) {
+        if (r1 > r0) basalt::kernels::kv_ring_restore(qsa_attn_pools(st_), st_.host, qsa_kv_format(st_), r0, r1, st_.n_slots, s, cs_);
+    };
+    if (n_stores_ > 0) {
+        // batch stores: every sequence appends to the one host copy, so it holds the main sequence's cells only where
+        // no other sequence wrote since.  The ring keeps the main sequence's blocks it holds (swapped in from its
+        // store); only those a later block took the page of, or it never held, come from the host copy
+        std::string e;
+        if (!use_main(e)) { basalt::log::error("basalt mtp", "%s", e.c_str()); return; }
+        const int64_t hi = store_hi_[(size_t) cur_], bh = hi > 0 ? (hi - 1) / s.page_size : -1;   // its last block
+        restore(b0, std::min(b1, bh - st_.n_slots + 1));
+        restore(std::max(b0, bh + 1), b1);
+    } else {
+        restore(b0, b1);
+    }
     cudaStreamSynchronize(cs_);
 }
 

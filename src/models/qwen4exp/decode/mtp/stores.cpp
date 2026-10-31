@@ -42,13 +42,16 @@ void MtpDrafter::note_cells(int64_t lo, int64_t hi) {
 
 void MtpDrafter::copy_pages(int to, bool to_work, int from, bool from_work, int64_t a, int64_t b, const KvArr* lay,
                             int na) {
+    // the working state holds every page in place, or with KV streaming its ring (`block % n_slots`), which reaches as
+    // far back as any store (load)
+    const int64_t work_ring = st_.kv_mode == 2 ? st_.n_slots : 0;
     auto at = [&](int id, bool work, int i, int64_t p) {
-        const int64_t ring = work ? 0 : store_ring_[(size_t) id];
+        const int64_t ring = work ? work_ring : store_ring_[(size_t) id];
         return (uint8_t*) (work ? lay[i].p : stores_[(size_t) id][(size_t) i]) +
                (uint64_t) (ring > 0 ? p % ring : p) * lay[i].page_bytes;
     };
     auto run = [&](int id, bool work, int64_t p) {   // pages from p before that side's ring wraps
-        const int64_t ring = work ? 0 : store_ring_[(size_t) id];
+        const int64_t ring = work ? work_ring : store_ring_[(size_t) id];
         return ring > 0 ? ring - p % ring : b - p;
     };
     for (int64_t p = a; p < b;) {
@@ -109,6 +112,9 @@ bool MtpDrafter::save_store(int id, int64_t cells, ConversationKv& out, std::str
         note_cells(0, store_hi_[(size_t) prev]);
         if (!flush(id, err)) return false;
     }
+    // the image comes from the host copy, which a ring shares with every sequence: the one it holds puts its pages
+    // back first (another sequence's come from its store, below)
+    if (cur_ == id && !ring_to_host(err)) return false;
     if (!conversation_kv_save(out, st_, *g_, cells, false, err)) return false;
     if (cur_ != id) {   // the pages the store keeps, over the working state's
         const OnDevice on_device(device_);
@@ -134,6 +140,18 @@ bool MtpDrafter::save_store(int id, int64_t cells, ConversationKv& out, std::str
         }
     }
     return cur_ == prev || use_store(prev, err);
+}
+
+bool MtpDrafter::ring_to_host(std::string& err) {
+    if (st_.kv_mode != 2 || n_stores_ == 0) return true;
+    const OnDevice on_device(device_);
+    const basalt::kernels::QsaShapes s = shapes_of(*g_);
+    const size_t c = (size_t) cur_;
+    const int64_t n1 = std::min<int64_t>(store_pages_[c], (store_hi_[c] + s.page_size - 1) / s.page_size);
+    basalt::kernels::kv_ring_save(qsa_attn_pools(st_), st_.host, qsa_kv_format(st_),
+                                  std::max<int64_t>(0, n1 - store_ring_[c]), n1, st_.n_slots, s, cs_);
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: saving the draft ring failed"; return false; }
+    return true;
 }
 
 QsaState& MtpDrafter::kv_state_rw() {
