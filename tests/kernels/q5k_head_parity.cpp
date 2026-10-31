@@ -347,6 +347,47 @@ int main(int argc, char** argv) {
         std::printf("proxy top1 rows %d: %d of %d picks differ from the exact argmax; probability rel diff max %.2e mean %.2e | cold: two-stage %.1f us, exact %.1f us\n",
                     rr, miss, trials, max_p_rel, sum_p_rel / trials, 1e3 * t_px, 1e3 * t_ex);
         if (miss > trials / 50 || max_p_rel > 1.0) fail = 1;
+        // repeatability with more than 64 rows near the best: a zero input (every row scores 0: the pick is the lowest
+        // listed row, its probability 1 / listed rows) and a narrow one (every row within the margin); each call must give
+        // the same pick and probability bits.  Then the warm time per call of a planted input and of these two.
+        int rep_bad = 0, known_bad = 0;
+        float t_warm[3] = {0, 0, 0};
+        for (int kind = 0; kind < 3; ++kind) {
+            if (kind > 0) {
+                std::vector<float> xh(n_in);
+                for (auto& v : xh) v = kind == 1 ? 0.0f : 0.02f * nd(rng);
+                ck(cudaMemcpy(x1, xh.data(), (size_t) n_in * 4, cudaMemcpyHostToDevice), "x1 up");
+                k::native_quantize_q8_1(x1, xq1, n_in, 1, s);
+                int id0 = 0;
+                float p0 = 0.0f;
+                for (int c = 0; c < 100; ++c) {
+                    k::q5k_proxy_top1(proxy, w2, xq1, rr, cap, d_map_i, d_id, d_p, scratch, s);
+                    int id;
+                    float p;
+                    ck(cudaMemcpy(&id, d_id, 4, cudaMemcpyDeviceToHost), "id");
+                    ck(cudaMemcpy(&p, d_p, 4, cudaMemcpyDeviceToHost), "p");
+                    if (c == 0) { id0 = id; p0 = p; }
+                    else rep_bad += id != id0 || std::memcmp(&p, &p0, 4) != 0;
+                }
+                if (kind == 1) {
+                    int first = -1, listed = 0;
+                    for (int i = 0; i < rr; ++i)
+                        if (map[(size_t) i] >= 0) { listed += 1; if (first < 0) first = i; }
+                    known_bad = id0 != map[(size_t) first] || std::fabs((double) p0 * listed - 1.0) > 1e-6;
+                }
+            }
+            for (int i = 0; i < 5; ++i) k::q5k_proxy_top1(proxy, w2, xq1, rr, cap, d_map_i, d_id, d_p, scratch, s);
+            cudaEventRecord(e0, s);
+            for (int i = 0; i < 100; ++i) k::q5k_proxy_top1(proxy, w2, xq1, rr, cap, d_map_i, d_id, d_p, scratch, s);
+            cudaEventRecord(e1, s);
+            cudaEventSynchronize(e1);
+            cudaEventElapsedTime(&t_warm[kind], e0, e1);
+        }
+        std::printf("proxy top1 repeatability, more than 64 rows near the best: %d of 198 calls differ from the first; zero "
+                    "input %s | warm: planted %.1f us, zero %.1f us, narrow %.1f us\n", rep_bad,
+                    known_bad ? "WRONG pick or probability" : "lowest row, 1 / rows", 10.0f * t_warm[0],
+                    10.0f * t_warm[1], 10.0f * t_warm[2]);
+        if (rep_bad || known_bad) fail = 1;
     }
     std::printf("%s\n", fail ? "q5k_head_parity: FAIL" : "q5k_head_parity: OK (bitwise)");
     return fail;
