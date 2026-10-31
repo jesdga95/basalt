@@ -199,6 +199,9 @@ public:
     /// discarded - a prompt read through windows commits every token - so they cost no sampler launch or sync and
     /// never read a history staged for another position.
     void set_head_sampling(bool on) { head_sampling_ = on; if (next_) next_->set_head_sampling(on); }
+    /// The next window's rows below `t` have their picks discarded (the prompt rows a first window folds in): the
+    /// head leaves those rows' logits approximate, and with head sampling off every row's.  One window only.
+    void set_head_from(int t) { head_from_ = t; if (next_) next_->set_head_from(t); }
     /// On: a sampled window also leaves draft_prob(t), the probability row t's final distribution gives the window's
     /// token t + 1 (t < T - 1), for relaxed acceptance.  The picks are unchanged.  Off by default; set per request.
     void set_draft_probe(bool on) { draft_probe_ = on; if (next_) next_->set_draft_probe(on); }
@@ -503,6 +506,8 @@ private:
     const int32_t* hist_d_ = nullptr;   // penalty-history row (set_history); null = no penalties apply
     int hist_len_ = 0;
     bool head_sampling_ = true;          ///< set_head_sampling
+    int head_from_ = 0;                  ///< set_head_from, for the next window
+    int32_t* h_head_from_ = nullptr; int32_t* m_head_from_ = nullptr;   ///< the window's first row the head scores exactly
     bool draft_probe_ = false;           ///< set_draft_probe
     std::vector<float> logit_bias_host_;
     float* logit_bias_device_ = nullptr;

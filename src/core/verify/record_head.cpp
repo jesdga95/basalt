@@ -103,7 +103,7 @@ bool Verifier::WindowRecorder::head() {
                     q5k_head_mmvq(v_.head_->weights(), v_.xq_, v_.head_logits_, (int) N, (int) v_.n_vocab_, T, cs);
                 else if (v_.head_->type() == 14 && v_.vhead_scratch_ != nullptr && q6k_vhead_supported((int) N, (int) v_.n_vocab_, T))
                     q6k_vhead(v_.head_->vproxy(), v_.head_->weights(), v_.xq_, v_.head_logits_, (int) N, (int) v_.n_vocab_, T,
-                              v_.vhead_scratch_, cs);
+                              v_.vhead_scratch_, cs, v_.batch_rec_ ? nullptr : v_.m_head_from_);
                 else if (v_.head_->type() == 14 && q6k_head_supported((int) N, T))
                     q6k_head_mmvq(v_.head_->weights(), v_.xq_, v_.head_logits_, (int) N, (int) v_.n_vocab_, T, cs);
                 else if (v_.head_->type() == 8 && T >= 4 && q80_head_supported((int) N, T))   // four columns or more: the same bits as one wave

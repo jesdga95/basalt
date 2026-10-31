@@ -46,7 +46,9 @@ void q6k_vproxy_pack(const void* q6k_rows, int64_t n, void* proxy, void* stream)
 /// first use (each call leaves it zeroed).
 size_t q6k_vhead_scratch_bytes();
 bool q6k_vhead_supported(int n_in, int n_out, int ncols);
+/// `col_from` (device-readable, may be null: 0): the columns below it have their picks discarded, so they are left
+/// approximate (no rescoring); at `ncols` or more nothing is scored and `y` is left as it was.
 void q6k_vhead(const void* proxy, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
-               void* scratch, void* stream);
+               void* scratch, void* stream, const int* col_from = nullptr);
 
 }  // namespace basalt::kernels

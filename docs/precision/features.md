@@ -58,7 +58,9 @@ holding the 64th largest block maximum is at or below the column's 64th largest 
 of it is rescored exactly with the plain Q6_K kernel's arithmetic (the same bits). The other rows keep their approximate
 logits, so log-probabilities stay finite. The block partition does not depend on the window width, and every row above
 its column's bound is rescored however many there are (each rescoring block lists its rows in shared memory), so a
-token's logits are the same bits at every T, whatever the window's other columns hold.
+token's logits are the same bits at every T, whatever the window's other columns hold. Rows whose pick is discarded
+(a prompt read through windows, the prompt rows a first window folds in) are not rescored, unless a scored request
+or the logit-hash diagnostic reads them; the rows whose picks are used keep the same bits.
 
 What it changes: the argmax and the sampler's top-64 list come from exact rows unless the copy's error exceeds the margin;
 the softmax tail outside the rescored rows carries the copy's error (rms about 0.7 logit). A request whose sampled list

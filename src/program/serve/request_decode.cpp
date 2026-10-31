@@ -198,6 +198,9 @@ Flow Request::decode() {
         const Clock::time_point tw0 = Clock::now();
         void* const user_c = cv == &runtime_.ver ? runtime_.win_pool_user : (void*) &runtime_.split_drive_b;
         void* const user_o = cv == &runtime_.ver ? (void*) &runtime_.split_drive_b : runtime_.win_pool_user;
+        // the prompt rows the first window folds in send no pick: the head scores them only roughly (exact logits
+        // are kept where something reads them: a scored chunk, the logit-hash diagnostic)
+        if (first_window && e0 > 0 && ppl == nullptr && !runtime_.logit_hash) cv->set_head_from(e0);
         const bool ran = held.on ? true
             : try_pair ? cv->run_pair(*ov, T, window.data(), p, guess, win_b.data(), TB, runtime_.win_pool_fn, user_c, user_o,
                                       outv.data(), runtime_.err)

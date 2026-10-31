@@ -125,6 +125,10 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
         cudaStreamWaitEvent(cs_, wait_ev_, 0);
         wait_ev_ = nullptr;
     }
+    // the head's first exact row for this window (the graph reads it); the request's choice lasts one window
+    *(volatile int32_t*) h_head_from_ = head_sampling_ ? std::clamp(head_from_, 0, T) : T;
+    head_from_ = 0;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
     if (next_ == nullptr) dev.record(DecodeEvents::kVerifyPost, cs_);
     ms_launch += ms_since(tl);
