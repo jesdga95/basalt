@@ -197,13 +197,16 @@ DirectFile::~DirectFile() {
     delete impl_;
 }
 
-bool DirectFile::open(const std::string& path, std::string& err, int workers) {
+bool DirectFile::open(const std::string& path, std::string& err, int workers, bool mapped_elsewhere) {
     close();
     if (!valid_workers(workers, err)) return false;
-    // NO_BUFFERING: the cache manager never holds these pages, so the table cannot grow into RAM.
+    // NO_BUFFERING: the cache manager never holds these pages, so the table cannot grow into RAM. It is left out for
+    // a file mapped elsewhere: while a file has a mapped view or cached reads, NTFS completes its unbuffered reads one
+    // at a time, and its cached reads still run side by side.
     // RANDOM_ACCESS: no read-ahead. OVERLAPPED: many reads in flight, completed through the port below.
+    const DWORD buffering = mapped_elsewhere ? 0 : FILE_FLAG_NO_BUFFERING;
     impl_->file = CreateFileW(to_wide_path(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                              FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
+                              buffering | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
     if (impl_->file == INVALID_HANDLE_VALUE) {
         err = "DirectFile: cannot open " + path + " (error " + std::to_string(GetLastError()) + ")";
         return false;
@@ -374,9 +377,10 @@ struct DirectFile::Impl {
 DirectFile::DirectFile() : impl_(new Impl) {}
 DirectFile::~DirectFile() { close(); delete impl_; }
 
-bool DirectFile::open(const std::string& path, std::string& err, int workers) {
+bool DirectFile::open(const std::string& path, std::string& err, int workers, bool mapped_elsewhere) {
     close();
     if (!valid_workers(workers, err)) return false;
+    (void) mapped_elsewhere;   // a mapping of the file does not hold up O_DIRECT reads of it here
     impl_->fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
     if (impl_->fd < 0) { err = "DirectFile: cannot open " + path; return false; }
     return finish_open(path, err, workers);
