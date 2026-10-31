@@ -246,8 +246,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
         head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
-        if (head_ != nullptr && head_->vproxy() != nullptr)
+        if (head_ != nullptr && head_->vproxy() != nullptr) {
             vhead_scratch_ = b.take<uint8_t>(basalt::kernels::q6k_vhead_scratch_bytes());
+            head_from_d_ = b.take<int32_t>(4);
+        }
         hist_snap_ = b.take<float>(T * HS);
         ple_win_ = b.take<float>(2 * T * HC * N);
         ple_key_ = b.take<float>(T * HC * N); ple_val_ = b.take<float>(T * N);
