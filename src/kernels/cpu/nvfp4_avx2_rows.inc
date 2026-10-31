@@ -31,9 +31,15 @@ constexpr ScaleLut kLut{};
 constexpr int kMaxN = 16384;
 constexpr int kMaxT = 8;
 
-// The tokens' Q8_0 scales as fp32, one 8-lane vector per NVFP4 block: d0 on lanes 0..3, d1 on lanes 4..7.
-__m256* scale_buf() {
-    alignas(32) static thread_local __m256 buf[kMaxT * kMaxN / 64];
+// Pre-unpacked Q8_0 activation pair for one NVFP4 block (64 weights = 2 Q8_0 blocks): sub-blocks (0, 2) in ya,
+// sub-blocks (1, 3) in yb, and Q8_0 scales (d0 on lanes 0..3, d1 on lanes 4..7) in d.
+struct alignas(32) TokBlk {
+    __m256i ya, yb;
+    __m256 d;
+};
+
+TokBlk* tok_buf() {
+    alignas(32) static thread_local TokBlk buf[kMaxT * kMaxN / 64];
     return buf;
 }
 
@@ -79,17 +85,23 @@ inline Blk decode(const block_nvfp4* x) {
 }
 
 template <int NT>
-inline void token_scales(const block_q8_0* const* y, int nb, __m256* dv) {
-    for (int t = 0; t < NT; ++t)
-        for (int ib = 0; ib < nb; ++ib)
-            dv[(size_t) t * nb + ib] = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_set1_ps(h2f(y[t][2 * ib].d))),
-                                                            _mm_set1_ps(h2f(y[t][2 * ib + 1].d)), 1);
+inline void prep_tokens(const block_q8_0* const* y, int nb, TokBlk* tb) {
+    for (int ib = 0; ib < nb; ++ib) {
+        for (int t = 0; t < NT; ++t) {
+            const __m256i y0 = _mm256_loadu_si256((const __m256i*) y[t][2 * ib].qs);
+            const __m256i y1 = _mm256_loadu_si256((const __m256i*) y[t][2 * ib + 1].qs);
+            TokBlk& dst = tb[(size_t) ib * NT + t];
+            dst.ya = _mm256_permute2x128_si256(y0, y1, 0x20);
+            dst.yb = _mm256_permute2x128_si256(y0, y1, 0x31);
+            dst.d = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_set1_ps(h2f(y[t][2 * ib].d))),
+                                         _mm_set1_ps(h2f(y[t][2 * ib + 1].d)), 1);
+        }
+    }
 }
 
 // R rows (each its own block pointer) against NT tokens: res[k][t].
 template <int R, int NT>
-inline void rows_dot(const block_nvfp4* const* w, int nb, const block_q8_0* const* y, const __m256* dv,
-                     float (*res)[kMaxT]) {
+inline void rows_dot(const block_nvfp4* const* w, int nb, const TokBlk* tb, float (*res)[kMaxT]) {
 #if !BASALT_NVFP4_VNNI_INT8
     const __m256i ones = _mm256_set1_epi16(1);
 #endif
@@ -99,12 +111,11 @@ inline void rows_dot(const block_nvfp4* const* w, int nb, const block_q8_0* cons
     for (int ib = 0; ib < nb; ++ib) {
         Blk b[R];
         for (int k = 0; k < R; ++k) b[k] = decode(w[k] + ib);
+        const TokBlk* tk = tb + (size_t) ib * NT;
         for (int t = 0; t < NT; ++t) {
-            const __m256i y0 = _mm256_loadu_si256((const __m256i*) y[t][2 * ib].qs);
-            const __m256i y1 = _mm256_loadu_si256((const __m256i*) y[t][2 * ib + 1].qs);
-            const __m256i ya = _mm256_permute2x128_si256(y0, y1, 0x20);
-            const __m256i yb = _mm256_permute2x128_si256(y0, y1, 0x31);
-            const __m256 d = dv[(size_t) t * nb + ib];
+            const __m256i ya = tk[t].ya;
+            const __m256i yb = tk[t].yb;
+            const __m256 d = tk[t].d;
             for (int k = 0; k < R; ++k) {
 #if BASALT_NVFP4_VNNI_INT8
                 const __m256i pa = _mm256_dpbssd_epi32(_mm256_setzero_si256(), b[k].wa, ya);
@@ -128,13 +139,18 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg,
     const block_q8_0* y[NT];
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_0*) act[t];
     const int nb = n / QK_NVFP4;
-    __m256* dv = scale_buf();
-    token_scales<NT>(y, nb, dv);
+    TokBlk* tb = tok_buf();
+    prep_tokens<NT>(y, nb, tb);
     float res[2][kMaxT];
     for (int r = r0; r < r1; ++r) {
         const block_nvfp4* w[2] = {(const block_nvfp4*) (blob + (size_t) r * gu_row),
                                    (const block_nvfp4*) (blob + up_off + (size_t) r * gu_row)};
-        rows_dot<2, NT>(w, nb, y, dv, res);
+        if constexpr (NT <= 2) {
+            rows_dot<2, NT>(w, nb, tb, res);
+        } else {
+            rows_dot<1, NT>(&w[0], nb, tb, &res[0]);
+            rows_dot<1, NT>(&w[1], nb, tb, &res[1]);
+        }
         for (int t = 0; t < NT; ++t) {
             const float g = res[0][t] * sg, u = res[1][t] * su;
             ff[t][r] = (g / (1.f + std::exp(-g))) * u;
@@ -148,22 +164,24 @@ void down_rows(const uint8_t* w0, size_t row_bytes, int n, float sd, const void*
     const block_q8_0* y[NT];
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_0*) act[t];
     const int nb = n / QK_NVFP4;
-    __m256* dv = scale_buf();
-    token_scales<NT>(y, nb, dv);
+    TokBlk* tb = tok_buf();
+    prep_tokens<NT>(y, nb, tb);
     float res[2][kMaxT];
     int r = r0;
-    for (; r + 2 <= r1; r += 2) {
-        const block_nvfp4* w[2] = {(const block_nvfp4*) (w0 + (size_t) r * row_bytes),
-                                   (const block_nvfp4*) (w0 + (size_t) (r + 1) * row_bytes)};
-        rows_dot<2, NT>(w, nb, y, dv, res);
-        for (int t = 0; t < NT; ++t) {
-            out[t][r] = res[0][t] * sd;
-            out[t][r + 1] = res[1][t] * sd;
+    if constexpr (NT <= 2) {
+        for (; r + 2 <= r1; r += 2) {
+            const block_nvfp4* w[2] = {(const block_nvfp4*) (w0 + (size_t) r * row_bytes),
+                                       (const block_nvfp4*) (w0 + (size_t) (r + 1) * row_bytes)};
+            rows_dot<2, NT>(w, nb, tb, res);
+            for (int t = 0; t < NT; ++t) {
+                out[t][r] = res[0][t] * sd;
+                out[t][r + 1] = res[1][t] * sd;
+            }
         }
     }
-    if (r < r1) {
+    for (; r < r1; ++r) {
         const block_nvfp4* w[1] = {(const block_nvfp4*) (w0 + (size_t) r * row_bytes)};
-        rows_dot<1, NT>(w, nb, y, dv, res);
+        rows_dot<1, NT>(w, nb, tb, res);
         for (int t = 0; t < NT; ++t) out[t][r] = res[0][t] * sd;
     }
 }
@@ -182,10 +200,10 @@ void BASALT_NVFP4_EXPORT(nvfp4_256_gu_rows)(const uint8_t* blob, size_t gu_row, 
             case 2: gu_rows<2>(blob, gu_row, up_off, n, sg, su, a, o, r0, r1); break;
             case 3: gu_rows<3>(blob, gu_row, up_off, n, sg, su, a, o, r0, r1); break;
             case 4: gu_rows<4>(blob, gu_row, up_off, n, sg, su, a, o, r0, r1); break;
-            default: for (int t = 0; t < k; t += 4) {
-                const int m = k - t < 4 ? k - t : 4;
-                BASALT_NVFP4_EXPORT(nvfp4_256_gu_rows)(blob, gu_row, up_off, n, sg, su, a + t, m, o + t, r0, r1);
-            }
+            case 5: gu_rows<5>(blob, gu_row, up_off, n, sg, su, a, o, r0, r1); break;
+            case 6: gu_rows<6>(blob, gu_row, up_off, n, sg, su, a, o, r0, r1); break;
+            case 7: gu_rows<7>(blob, gu_row, up_off, n, sg, su, a, o, r0, r1); break;
+            case 8: gu_rows<8>(blob, gu_row, up_off, n, sg, su, a, o, r0, r1); break;
         }
     }
 }
@@ -201,10 +219,10 @@ void BASALT_NVFP4_EXPORT(nvfp4_256_down_rows)(const uint8_t* w, size_t row_bytes
             case 2: down_rows<2>(w, row_bytes, n, sd, a, o, r0, r1); break;
             case 3: down_rows<3>(w, row_bytes, n, sd, a, o, r0, r1); break;
             case 4: down_rows<4>(w, row_bytes, n, sd, a, o, r0, r1); break;
-            default: for (int t = 0; t < k; t += 4) {
-                const int m = k - t < 4 ? k - t : 4;
-                BASALT_NVFP4_EXPORT(nvfp4_256_down_rows)(w, row_bytes, n, sd, a + t, m, o + t, r0, r1);
-            }
+            case 5: down_rows<5>(w, row_bytes, n, sd, a, o, r0, r1); break;
+            case 6: down_rows<6>(w, row_bytes, n, sd, a, o, r0, r1); break;
+            case 7: down_rows<7>(w, row_bytes, n, sd, a, o, r0, r1); break;
+            case 8: down_rows<8>(w, row_bytes, n, sd, a, o, r0, r1); break;
         }
     }
 }
