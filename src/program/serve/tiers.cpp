@@ -134,7 +134,7 @@ void Runtime::apply_pending(bool wait, bool exchanges) {
     // a promoted expert is CUDA0's now: its peer slot takes the expert CUDA0 gave up (in RAM since the commit)
     for (const auto& p : promoted) {
         std::string perr;
-        if (!peer.reassign(p[0], p[1], p[2], srcp->blob(p[0], p[2]), perr))
+        if (!peer.reassign(p[0], p[1], p[0], p[2], srcp->blob(p[0], p[2]), perr))
             basalt::log::warn("basalt serve", "%s", perr.c_str());
     }
     promoted.clear();
@@ -145,7 +145,9 @@ void Runtime::rank_swaps(std::vector<Swap>& swaps, bool across) {
     if (across) {
         // one ranking over every layer: a layer that routes more experts than its slots hold takes the slots of
         // the least-routed experts of any layer, so the slots follow the request's layers; with every layer's
-        // residents to choose from, a missing expert is a candidate at a lower count
+        // residents to choose from, a missing expert is a candidate at a lower count.  An expert the peer tier
+        // holds ranks lower by the promotion margin, as in the per-layer rounds, and the resident it replaces
+        // takes its peer slot.
         struct Ent { float u; int32_t rank, layer, e; };
         std::vector<Ent> cand, vict;
         for (int64_t l = 0; l < g.n_layers; ++l) {
@@ -154,7 +156,8 @@ void Runtime::rank_swaps(std::vector<Swap>& swaps, bool across) {
             for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                 const int32_t rk = prof_rank[(size_t) (l * g.n_expert + e)];
                 if (r[e] >= 0) vict.push_back({u[e], rk, (int32_t) l, e});
-                else if (u[e] >= 1.5f) cand.push_back({u[e], rk, (int32_t) l, e});
+                else if (u[e] >= 1.5f && !(remote_opt && remote_opt->owns(l, e)))
+                    cand.push_back({peer.valid() && peer.has(l, e) ? u[e] - promote_margin : u[e], rk, (int32_t) l, e});
             }
         }
         if (cand.empty() || vict.empty()) return;
@@ -489,10 +492,10 @@ bool Runtime::xq_advance(bool wait) {
     } else {
         res_upload();
     }
-    for (const XSwap& x : xq) {   // a promoted expert's peer slot takes the one CUDA0 gave up
+    for (const XSwap& x : xq) {   // a promoted expert's peer slot takes the one CUDA0 gave up, from any layer
         if (!x.promo) continue;
         std::string perr;
-        if (!peer.reassign(x.layer, x.in, x.out, srcp->blob(x.layer, x.out), perr))
+        if (!peer.reassign(x.layer, x.in, x.lout, x.out, srcp->blob(x.lout, x.out), perr))
             basalt::log::warn("basalt serve", "%s", perr.c_str());
     }
     xq.clear();
@@ -557,9 +560,9 @@ int Runtime::init_tiers() {
     fast_decay = o.adapt_decay_set ? o.adapt_decay : 0.85f;   // PROBE adapt sets it
 
     peer_excl = o.peer_exclusive && peer.valid() && src.complement_ready();
-    // the rounds rank over all layers when no peer tier holds experts and every layer's blobs are one size (a slot
-    // then takes any layer's expert)
-    xq_across = !peer.valid() && xpeers.empty();
+    // the rounds rank over all layers when at most one peer tier holds experts (not exclusively) and every layer's
+    // blobs are one size (a slot then takes any layer's expert)
+    xq_across = xpeers.empty() && !peer_excl;
     for (int64_t l = 1; xq_across && l < g.n_layers; ++l)
         xq_across = basalt::kernels::cpu::expert_layout().blob_bytes(l) == basalt::kernels::cpu::expert_layout().blob_bytes(0);
 
