@@ -7,7 +7,7 @@
 //   - every column is bitwise the column computed alone, at every width;
 // for two sets of columns: all at a head's spread, and with flat columns (a small spread puts most rows within the
 // margin, as a prompt row folded into a window can); then a cold microbench of both kernels per set.
-//   q6k_vhead_parity [rows] [iters]
+//   q6k_vhead_parity [rows] [iters] [spread|flat]     (iters 0: no microbench, e.g. under compute-sanitizer)
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/q6k_head.hpp"
 
@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace k = basalt::kernels;
@@ -105,6 +106,7 @@ struct Copy {
 int main(int argc, char** argv) {
     const int rows = argc > 1 ? std::atoi(argv[1]) / 16 * 16 : 248320;
     const int iters = argc > 2 ? std::atoi(argv[2]) : 40;
+    const std::string only = argc > 3 ? argv[3] : "";
     const int MT = 8;
     const size_t wbytes = (size_t) rows * kBpr * kBlk;
     std::mt19937 rng(11);
@@ -287,13 +289,13 @@ int main(int argc, char** argv) {
                     cudaEventElapsedTime(&ms, e0, e1);
                     tot[v] += ms;
                 }
-            const double u0 = 1e3 * tot[0] / iters, u1 = 1e3 * tot[1] / iters;
+            const double u0 = iters > 0 ? 1e3 * tot[0] / iters : 0.0, u1 = iters > 0 ? 1e3 * tot[1] / iters : 0.0;
             const bool bad = missed || off_cpu || argmax_bad || width_bad;
             std::printf("%s ncols %d: %s (near-top rows not exact %ld, approximate rows off the CPU score %ld, max dev "
                         "%.2e, argmax differs %ld, columns differing from the column alone %ld; exact rows per column %.0f) | "
                         "cold: q6k_head %6.1f us | vhead %6.1f us | %.2fx\n",
                         set, nc, bad ? "FAIL" : "ok", missed, off_cpu, max_dev, argmax_bad, width_bad, exact_rows[nc], u0, u1,
-                        u0 / u1);
+                        u1 > 0.0 ? u0 / u1 : 0.0);
             if (bad) fail = 1;
         }
     };
@@ -301,8 +303,8 @@ int main(int argc, char** argv) {
     // flat columns first and among the others: alone, one of them lists more rows than a list of every column's
     // usual near-top rows holds
     const float flat[MT] = {0.02f, 1, 0.1f, 1, 0.3f, 1, 0.02f, 1};
-    run_set("spread", spread);
-    run_set("flat", flat);
+    if (only.empty() || only == "spread") run_set("spread", spread);
+    if (only.empty() || only == "flat") run_set("flat", flat);
     std::printf("%s\n", fail ? "q6k_vhead_parity: FAIL" : "q6k_vhead_parity: OK");
     return fail;
 }

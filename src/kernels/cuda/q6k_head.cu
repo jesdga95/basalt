@@ -594,16 +594,20 @@ __global__ void __launch_bounds__(VRESCORE) q6k_vrescore_kernel(const Q6KBlock* 
             if (lane >= o) pre += u;
         }
         const int wtot = __shfl_sync(0xffffffffu, pre, 31);
+        bool full = false;   // the list cannot take another step
         if (wtot > 0) {
             unsigned base = 0;
             if (lane == 31) base = atomicAdd(&count, (unsigned) wtot);
-            base = __shfl_sync(0xffffffffu, base, 31) + (unsigned) (pre - cnt);
+            base = __shfl_sync(0xffffffffu, base, 31);
+            full = base + (unsigned) wtot > (unsigned) (VLIST - 4 * step);
+            base += (unsigned) (pre - cnt);
             for (int b = 0; b < 4; ++b)
                 if (m & (1u << b)) list[base++] = ((uint32_t) col << 18) | (uint32_t) (4 * r4 + b);
         }
-        __syncthreads();
-        const unsigned n = count;
-        if (n > (unsigned) (VLIST - 4 * step) || i0 + gridDim.x * step >= total) {   // full for another step, or the end
+        // one decision per block, taken after every write of the step; the count is read only inside, where
+        // nothing writes it before the reset's barrier
+        if (__syncthreads_or(full) || i0 + gridDim.x * step >= total) {
+            const unsigned n = count;
             for (unsigned c = (unsigned) warp; c < n; c += VRESCORE / 32) {
                 const uint32_t e = list[c];
                 const int row = (int) (e & 0x3ffffu), cc = (int) (e >> 18);
