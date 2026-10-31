@@ -224,6 +224,61 @@ int sampled_reference(const std::vector<float>& l, const std::vector<int>& hist,
     return pick;
 }
 
+// The sampled chain's kept list, host side, as `sampled_reference` builds it: the top_k list in selection order cut
+// by top_p, then by min_p.
+std::vector<int> kept_reference(const std::vector<float>& l, const std::vector<int>& hist,
+                                const basalt::kernels::SamplerParams& p) {
+    auto penal = [&](float logit, int count) {
+        if (count <= 0) return logit;
+        if (logit <= 0.0f) logit *= p.penalty_repeat; else logit /= p.penalty_repeat;
+        logit -= (float) count * p.penalty_freq + (count > 0 ? 1.0f : 0.0f) * p.penalty_present;
+        return logit;
+    };
+    const int nv = (int) l.size();
+    std::vector<int> cnt((size_t) nv, 0);
+    if (p.penalty_last_n > 0) {
+        const int n = (int) hist.size(), from = n > p.penalty_last_n ? n - p.penalty_last_n : 0;
+        for (int i = from; i < n; ++i)
+            if (hist[(size_t) i] >= 0 && hist[(size_t) i] < nv) ++cnt[(size_t) hist[(size_t) i]];
+    }
+    const int KMAX = 64;
+    const int k = std::min(nv, (p.top_k > 0 && p.top_k < KMAX) ? p.top_k : KMAX);
+    std::vector<int> ids;
+    std::vector<float> sel;
+    std::vector<char> taken((size_t) nv, 0);
+    for (int i = 0; i < k; ++i) {
+        int best = -1; float bv = 0;
+        for (int v = 0; v < nv; ++v) {
+            if (taken[(size_t) v]) continue;
+            const float x = penal(l[(size_t) v], cnt[(size_t) v]);
+            if (best < 0 || x > bv) { best = v; bv = x; }
+        }
+        taken[(size_t) best] = 1;
+        ids.push_back(best); sel.push_back(bv);
+    }
+    const int n_sel = (int) sel.size();
+    int n_keep = n_sel;
+    if (p.top_p < 1.0f) {
+        double sum = 0.0;
+        for (int i = 0; i < n_sel; ++i) sum += std::exp((double) sel[(size_t) i] - (double) sel[0]);
+        double cum = 0.0;
+        int cut = n_sel;
+        for (int i = 0; i < n_sel; ++i) {
+            cum += std::exp((double) sel[(size_t) i] - (double) sel[0]) / sum;
+            if (cum >= (double) p.top_p) { cut = i + 1; break; }
+        }
+        if (cut < p.min_keep) cut = p.min_keep < n_sel ? p.min_keep : n_sel;
+        n_keep = cut;
+    }
+    if (p.min_p > 0.0f) {
+        const float thresh = sel[0] + std::log(p.min_p);
+        for (int i = 0; i < n_keep; ++i)
+            if (sel[(size_t) i] < thresh) { n_keep = i; break; }
+    }
+    ids.resize((size_t) n_keep);
+    return ids;
+}
+
 // Survivors after the min_p + top_p cuts, in the sampled chain - the quantity an order or a threshold
 // actually changes, used to assert a fixture can SEE the feature before asserting the kernel matches.
 int sampled_cut(const std::vector<float>& l, const std::vector<int>& hist, const basalt::kernels::SamplerParams& p) {
@@ -727,8 +782,10 @@ void bench_sampled() {
 
 // `--split`: the one-launch splits (sample_tokens_split 1, 2) and the wide path (3, at every length) against the
 // two-launch split (0) on random rows at real and edge geometry: the same picks and the same probe probabilities, bit
-// for bit.  A list longer than 64 takes the wide path in every split.  `bench`: then the per-call time
-// of each at the engine's vocabulary and the default chain (top_k 20, top_p 0.95, temperature 0.6), rows 1..8.
+// for bit.  A list longer than 64 takes the wide path in every split.  On narrow lists the splits 0..2 also hand out
+// the same kept lists (top_ids), which hold the pick and match the host chain on rows without a bias or -inf.
+// `bench`: then the per-call time of each at the engine's vocabulary and the default chain (top_k 20, top_p 0.95,
+// temperature 0.6), rows 1..8, and the engine's split with its kept lists out.
 int split_parity(bool bench) {
     using namespace basalt::kernels;
     int bad = 0;
@@ -739,6 +796,8 @@ int split_parity(bool bench) {
     constexpr int kSplits = 4;
     int* d_o[kSplits] = {};
     float* d_p[kSplits] = {};
+    int* d_top[kSplits] = {};
+    const int NTOP = 8;
     int* d_q = nullptr;
     int* d_h = nullptr;
     float* d_b = nullptr;
@@ -746,6 +805,7 @@ int split_parity(bool bench) {
     for (int v = 0; v < kSplits; ++v) {
         check(cudaMalloc(&d_o[v], max_t * sizeof(int)), "out");
         check(cudaMalloc(&d_p[v], max_t * sizeof(float)), "probs");
+        check(cudaMalloc(&d_top[v], (size_t) max_t * NTOP * sizeof(int)), "kept lists");
     }
     const int vocabs[] = {248320, 262144, 106299, 4097, 4096, 300, 20, 7};
     const int max_nv = 262144;
@@ -753,7 +813,7 @@ int split_parity(bool bench) {
     check(cudaMalloc(&d_h, (size_t) max_t * H * sizeof(int)), "history");
     check(cudaMalloc(&d_b, (size_t) max_nv * sizeof(float)), "bias");
     check(cudaMalloc(&d_l, (size_t) max_t * max_nv * sizeof(float)), "logits");
-    int ncase = 0, nfail = 0;
+    int ncase = 0, nfail = 0, nref = 0, nref_fail = 0;
     for (int nv : vocabs) {
         for (int c = 0; c < 40; ++c) {
             const int T = 1 + c % max_t;
@@ -789,21 +849,26 @@ int split_parity(bool bench) {
             check(cudaMemcpy(d_l, l.data(), l.size() * 4, cudaMemcpyHostToDevice), "logits");
             check(cudaMemcpy(d_h, hist.data(), hist.size() * 4, cudaMemcpyHostToDevice), "history");
             check(cudaMemcpy(d_q, q.data(), q.size() * 4, cudaMemcpyHostToDevice), "query");
-            std::vector<int> o[kSplits];
+            std::vector<int> o[kSplits], top[kSplits];
             std::vector<uint32_t> pb[kSplits];
+            const bool narrow = sampled_k(p.top_k, nv) <= 64;   // the wide path keeps no list
             for (int v = 0; v < kSplits; ++v) {
                 check(cudaMemset(d_p[v], 0xff, max_t * sizeof(float)), "probs fill");
-                sample_tokens_split(v, d_l, T, nv, pen ? d_h : nullptr, pen ? H : 0, p, d_o[v], d_q, T, d_p[v], s);
+                check(cudaMemset(d_top[v], 0x7f, (size_t) max_t * NTOP * sizeof(int)), "kept lists fill");
+                SamplerParams pv = p;
+                if (narrow && v < 3) { pv.top_ids = d_top[v]; pv.n_top = NTOP; }
+                sample_tokens_split(v, d_l, T, nv, pen ? d_h : nullptr, pen ? H : 0, pv, d_o[v], d_q, T, d_p[v], s);
                 check(cudaStreamSynchronize(s), "sync");
                 o[v].resize((size_t) T);
                 pb[v].resize((size_t) T);
+                top[v].resize((size_t) T * NTOP);
                 check(cudaMemcpy(o[v].data(), d_o[v], (size_t) T * 4, cudaMemcpyDeviceToHost), "out");
                 check(cudaMemcpy(pb[v].data(), d_p[v], (size_t) T * 4, cudaMemcpyDeviceToHost), "probs");
+                check(cudaMemcpy(top[v].data(), d_top[v], top[v].size() * 4, cudaMemcpyDeviceToHost), "kept lists");
             }
             ++ncase;
             for (int v = 1; v < kSplits; ++v) {
                 bool same = o[v] == o[0];
-                const bool narrow = sampled_k(p.top_k, nv) <= 64;
                 for (int t = 0; t < T && same; ++t) {
                     if (v < 3 || !narrow) { same = pb[v][(size_t) t] == pb[0][(size_t) t]; continue; }
                     float a, b;   // the wide path's chunked sums: the same probability to a float's last bit or two
@@ -817,10 +882,48 @@ int split_parity(bool bench) {
                                 "two-launch split\n", v, nv, c, T, p.top_k);
                 }
             }
+            if (narrow) {
+                for (int v = 1; v < 3; ++v)
+                    if (top[v] != top[0]) {
+                        ++nfail;
+                        std::printf("  FAIL split %d nv %d case %d T %d: kept lists differ from the two-launch split\n",
+                                    v, nv, c, T);
+                    }
+                // each row's pick is in its kept list, -1 only after the list
+                for (int t = 0; t < T; ++t) {
+                    const int* row_top = top[0].data() + (size_t) t * NTOP;
+                    bool in = false, shape = true;
+                    for (int i = 0; i < NTOP; ++i) {
+                        if (row_top[i] == o[0][(size_t) t]) in = true;
+                        if (i > 0 && row_top[i - 1] < 0 && row_top[i] >= 0) shape = false;
+                        if (row_top[i] < -1 || row_top[i] >= nv) shape = false;
+                    }
+                    if (!shape || (!in && row_top[NTOP - 1] < 0)) {
+                        ++nfail;
+                        std::printf("  FAIL nv %d case %d row %d: the kept list is malformed or misses the pick\n", nv,
+                                    c, t);
+                    }
+                }
+                // and is the host chain's, on rows without a bias or -inf
+                if (!bias && c % 9 != 4 && nv <= 106299)
+                    for (int t = 0; t < T; ++t) {
+                        const std::vector<float> row(l.begin() + (size_t) t * nv, l.begin() + (size_t) (t + 1) * nv);
+                        const std::vector<int> h(hist.begin() + (size_t) t * H, hist.begin() + (size_t) (t + 1) * H);
+                        std::vector<int> want = kept_reference(row, h, p);
+                        want.resize((size_t) NTOP, -1);
+                        ++nref;
+                        if (!std::equal(want.begin(), want.end(), top[0].begin() + (size_t) t * NTOP)) {
+                            ++nref_fail;
+                            std::printf("  FAIL nv %d case %d row %d: the kept list differs from the host chain's\n", nv,
+                                        c, t);
+                        }
+                    }
+            }
         }
     }
-    std::printf("split parity: %d cases x 2 one-launch splits and the wide path, %d mismatches\n", ncase, nfail);
-    bad += nfail;
+    std::printf("split parity: %d cases x 2 one-launch splits and the wide path, %d mismatches; kept lists vs the host "
+                "chain: %d rows, %d mismatches\n", ncase, nfail, nref, nref_fail);
+    bad += nfail + nref_fail;
     if (bench) {
         const int NV = 248320;
         std::normal_distribution<float> g(0.0f, 3.0f);
@@ -852,11 +955,31 @@ int split_parity(bool bench) {
                 std::printf("  bench: split n_vocab %d rows %d top_k 20 top_p 0.95 probe %-16s %7.2f us per call\n", NV, T,
                             names[v], 1000.0 * (double) ms / iters);
             }
+            {   // the engine's split with the kept lists out
+                SamplerParams p;
+                p.top_k = 20; p.top_p = 0.95f; p.temperature = 0.6f; p.seed = 3;
+                p.top_ids = d_top[2]; p.n_top = NTOP;
+                const int iters = 400;
+                for (int w = 0; w < 10; ++w)
+                    sample_tokens_split(2, d_l, T, NV, nullptr, 0, p, d_o[2], d_q, T - 1, d_p[2], s);
+                check(cudaStreamSynchronize(s), "warmup");
+                check(cudaEventRecord(e0, s), "record");
+                for (int it = 0; it < iters; ++it) {
+                    p.counter = (uint64_t) it;
+                    sample_tokens_split(2, d_l, T, NV, nullptr, 0, p, d_o[2], d_q, T - 1, d_p[2], s);
+                }
+                check(cudaEventRecord(e1, s), "record");
+                check(cudaEventSynchronize(e1), "sync");
+                float ms = 0.0f;
+                check(cudaEventElapsedTime(&ms, e0, e1), "elapsed");
+                std::printf("  bench: split n_vocab %d rows %d top_k 20 top_p 0.95 probe %-16s %7.2f us per call\n", NV,
+                            T, "sorted + kept", 1000.0 * (double) ms / iters);
+            }
         }
         cudaEventDestroy(e0);
         cudaEventDestroy(e1);
     }
-    for (int v = 0; v < kSplits; ++v) { cudaFree(d_o[v]); cudaFree(d_p[v]); }
+    for (int v = 0; v < kSplits; ++v) { cudaFree(d_o[v]); cudaFree(d_p[v]); cudaFree(d_top[v]); }
     cudaFree(d_q); cudaFree(d_h); cudaFree(d_b); cudaFree(d_l);
     cudaStreamDestroy(s);
     return bad;

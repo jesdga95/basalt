@@ -413,6 +413,8 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
         for (int i = 0; i < n_keep; ++i)
             if (sel_logit[i] < thresh) { n_keep = i; break; }
     }
+    if (p.top_ids != nullptr)
+        for (int i = lane; i < p.n_top; i += 32) p.top_ids[(size_t) t * p.n_top + i] = i < n_keep ? sel_ids[i] : -1;
     // temperature, then one Philox draw
     float smx = sel_logit[0] * inv_t;
     for (int i = 1; i < n_keep; ++i) smx = fmaxf(smx, sel_logit[i] * inv_t);
@@ -1020,6 +1022,8 @@ __device__ void sampled_tail_pair(TailShared& ts, int k, const SamplerParams& p,
         const int first = below ? __ffs(below) - 1 : k;
         if (first < n_keep) n_keep = first;
     }
+    if (p.top_ids != nullptr && lane < p.n_top)
+        p.top_ids[(size_t) t * p.n_top + lane] = lane < n_keep ? ts.id[lane] : -1;
     tail_pair_sync();                        // warp 1's terms and prefix sums
     const double sum2 = n_keep > 0 ? ts.pre2[n_keep - 1] : 0.0;
     if (lane < n_keep) ts.e2[lane] = ts.e2[lane] / sum2;

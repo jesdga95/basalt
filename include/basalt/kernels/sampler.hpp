@@ -31,6 +31,8 @@ struct SamplerParams {
     uint64_t counter = 0;        // absolute draw index of row 0; advance across decode calls
     bool greedy = false;
     const float* logit_bias = nullptr;   // optional device array [n_vocab] added to the logits first; -inf bans
+    int* top_ids = nullptr;      // optional device array [n_tokens][n_top]: the sampled path's kept list, best first,
+    int n_top = 0;               // -1 after it (0..32 ids per row; the greedy path leaves it unwritten)
 };
 
 // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.

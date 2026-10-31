@@ -136,11 +136,15 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     const bool early_sample = chain_on() && le_ >= g.n_layers && head_sampling_ && (sampled || hist_d_ != nullptr || biased);
     // the draft probe: row t asks for the probability of the window's token t + 1
     const bool probe = draft_probe_ && head_sampling_ && sampled && T > 1 && le_ >= g.n_layers;
+    // the sampled rows' kept lists; the wide path keeps none
+    top_valid_ = head_sampling_ && sampled && le_ >= g.n_layers &&
+                 sampler_list_len(sampling_.top_k, (int) n_vocab_) <= kSamplerNarrowMax;
     if (probe)
         for (int t = 0; t + 1 < T; ++t) h_q_[t] = tokens[t + 1];
     if (early_sample) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
+        if (sampled) { sp.top_ids = m_top_; sp.n_top = kTopIds; }
         if (sampler_list_len(sp.top_k, (int) n_vocab_) > kSamplerNarrowMax && sampled && !exact_head_rows(T, err))
             return false;
         sample_tokens_probe(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, probe ? m_q_ : nullptr,
@@ -366,6 +370,7 @@ bool Verifier::run_end(int32_t* out, std::string& err) {
     if (head_sampling_ && (sampled || hist_d_ != nullptr || biased) && !early_sample) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
+        if (sampled) { sp.top_ids = m_top_; sp.n_top = kTopIds; }
         if (sampler_list_len(sp.top_k, (int) n_vocab_) > kSamplerNarrowMax && sampled && !exact_head_rows(T, err))
             return false;
         sample_tokens_probe(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, probe ? m_q_ : nullptr,

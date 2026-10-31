@@ -70,6 +70,8 @@ using Clock = std::chrono::steady_clock;
 constexpr int64_t kDraftCtxRows = 512;
 // of them, the rows a prompt's tokens may take: the rest stay free for the reply's own
 constexpr int64_t kDraftCtxPromptRows = 384;
+// the rows the target's candidates leave free for the reply's own picks
+constexpr int64_t kDraftCtxPickRows = 64;
 
 double ms_since(Clock::time_point t);
 basalt::kernels::QsaShapes shapes_of(const ModelGeometry& g);

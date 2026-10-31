@@ -204,6 +204,10 @@ public:
     void set_draft_probe(bool on) { draft_probe_ = on; if (next_) next_->set_draft_probe(on); }
     /// Valid after a sampled run() with the probe on.
     float draft_prob(int t) const { return next_ ? next_->draft_prob(t) : ((volatile float*) h_qp_)[t]; }
+    /// After a sampled run(): row t's kept list at [t * kTopIds, (t + 1) * kTopIds), best first, -1 after it.
+    /// nullptr after a window that did not sample.
+    static constexpr int kTopIds = 8;
+    const int32_t* top_ids() const { return next_ ? next_->top_ids() : (top_valid_ ? h_top_ : nullptr); }
 
     /// LAYER SPLIT (multi-GPU): this verifier runs layers [layer_begin, layer_end) of every window.  A stage that
     /// does not start at layer 0 takes its residual from `handoff_in` instead of embedding the tokens; a stage that
@@ -575,6 +579,8 @@ private:
     int32_t* h_out_ = nullptr;   int32_t* m_out_ = nullptr;     // T argmax ids
     int32_t* h_q_ = nullptr;     int32_t* m_q_ = nullptr;       // the probe's tokens: the window's drafts
     float* h_qp_ = nullptr;      float* m_qp_ = nullptr;        // the probe's probabilities
+    int32_t* h_top_ = nullptr;   int32_t* m_top_ = nullptr;     // T * kTopIds: the sampled rows' kept lists
+    bool top_valid_ = false;                                    // the last window wrote them
     float* h_x_ = nullptr;       float* m_x_ = nullptr;         // doorbell payload: T * n_embd
     int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
     float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
