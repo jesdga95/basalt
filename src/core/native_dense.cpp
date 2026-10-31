@@ -12,7 +12,6 @@
 #include <climits>
 #include <cstdlib>
 #include <exception>
-#include <limits>
 #include <memory>
 #include <set>
 
@@ -212,23 +211,10 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             // an ignored tensor must not overlap the native matrix that follows it.
             const uint64_t payload = gguf.file_size() - gguf.data_start();
             for (const auto& tensor : gguf.tensors()) {
-                int block_elements = 0, block_bytes = 0;
-                uint64_t elements = 1;
-                if (tensor.shape.empty() || !basalt::block_geometry(tensor.type, block_elements, block_bytes) ||
-                    tensor.shape[0] % (uint64_t) block_elements != 0) {
-                    err = "native dense: invalid block geometry " + tensor.name; return false;
-                }
-                for (uint64_t dimension : tensor.shape) {
-                    if (!dimension || elements > (std::numeric_limits<uint64_t>::max)() / dimension) {
-                        err = "native dense: invalid tensor extent " + tensor.name; return false;
-                    }
-                    elements *= dimension;
-                }
-                const uint64_t blocks = elements / (uint64_t) block_elements;
-                if (blocks > (std::numeric_limits<uint64_t>::max)() / (uint64_t) block_bytes) {
-                    err = "native dense: tensor byte count overflow " + tensor.name; return false;
-                }
-                const uint64_t bytes = blocks * (uint64_t) block_bytes;
+                // One rule for a tensor's byte count: 0 says the encoding is unknown, the values are not a whole
+                // number of blocks, or the count overflows.
+                const uint64_t bytes = basalt::tensor_payload_bytes(tensor);
+                if (bytes == 0) { err = "native dense: invalid block geometry " + tensor.name; return false; }
                 if (tensor.offset > payload || bytes > payload - tensor.offset) {
                     err = "native dense: truncated payload " + tensor.name; return false;
                 }

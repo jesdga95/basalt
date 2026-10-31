@@ -72,3 +72,24 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-UD-Q4_K_XL.basalt --
 
 The output is about 122 GiB (the 8-bit variant 123 GiB). How NVFP4 is computed on each tier:
 [precision](precision/index.md).
+
+### Without a base pack
+
+`--sections-from` is optional. A checkpoint with no pack to take the drafter and the projector from - the QAD
+checkpoint ([nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local)) is one
+- builds alone:
+
+```sh
+python3 tools/convert/mtp_fetch.py fetch --out mtp-bf16        # the drafter's BF16 tensors, hash-checked
+
+python3 tools/convert/convert.py --checkpoint nvidia-qad --dense-q8-0 --mmproj MMPROJ.gguf --mtp-source mtp-bf16 \
+    --out Qwen3.8-FN-QAD.basalt --name "Qwen3.8-Flash-Next QAD"
+```
+
+The drafter is then built here (Q8_0 dense, Q2_0 experts; its dense part cannot be replaced with `--mtp-dense`
+without a base), the projector from `--mmproj`, with the vocabulary section the sidecar needs written from the
+checkpoint's own tokenizer (`--no-vision` leaves the vision sections out), the expert ranking from `--profile-from`
+routing traces or the plain fill order when there are none, and the 8-bit hyper-connection copies from `--hc8` if you
+have them. What the checkpoint stores its dense weights and its n-gram table as (BF16 or MXFP8, FP8 or NVFP4) is read
+from the checkpoint, not from a flag; `--dense-q8-0` is the matching choice for an MXFP8 checkpoint, since one Q8_0
+block covers exactly one MXFP8 block. [Precision](precision/index.md).

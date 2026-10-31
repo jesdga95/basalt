@@ -53,5 +53,32 @@ class Pack(unittest.TestCase):
                 vision_sections(mm, [shard])
 
 
+class VocabFromKv(unittest.TestCase):
+    """The vocabulary section of a pack built from a checkpoint: the pack's own metadata, read back as GGUF."""
+
+    KV = {"general.architecture": "qwen4exp",
+          "tokenizer.ggml.tokens": ["a", "bb"],
+          "tokenizer.ggml.bos_token_id": 151643,
+          "qwen4exp.ple.nvfp4_scale_2": 3.324236240587197e-05,
+          "qwen4exp.ngram.multipliers": [1469598103934665603, 1099511628211, 2 ** 40],   # past int32
+          "split.count": 3}
+
+    def test_values_survive_the_round_trip(self):
+        from pack_vision import vocab_gguf_bytes
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from gguf_reader import GGUFFile
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "v.gguf")
+            with open(p, "wb") as f:
+                f.write(vocab_gguf_bytes(self.KV))
+            g = GGUFFile(p)
+        self.assertEqual(g.tensors, [])
+        self.assertEqual(g.metadata["tokenizer.ggml.tokens"], ["a", "bb"])
+        self.assertEqual(g.metadata["tokenizer.ggml.bos_token_id"], 151643)
+        self.assertEqual(g.metadata["qwen4exp.ngram.multipliers"], self.KV["qwen4exp.ngram.multipliers"])
+        self.assertAlmostEqual(g.metadata["qwen4exp.ple.nvfp4_scale_2"], 3.324236240587197e-05, places=18)
+        self.assertNotIn("split.count", g.metadata)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -102,8 +102,22 @@ void iq4nl_dequant_row(const uint8_t* row, float* out160) {
     }
 }
 
+void nvfp4_dequant_row(const uint8_t* row, float* out160, float scale_2) {
+    // `dequantize_nvfp4`'s inner loop (basalt/artifact/dequant.hpp) per 16-value group, so one value means one
+    // decode and the two paths cannot drift.  A row is 10 scale-then-8-codes groups, not ggml's block with its
+    // four scales hoisted to the front: the group is what the two share, which `ple_nvfp4_test` pins.
+    for (int g = 0; g < PLE_HEAD_DIM / 16; ++g) {
+        const float sc = basalt::ue4m3_to_fp32_half(row[g * 9]) * scale_2;
+        const uint8_t* q = row + g * 9 + 1;
+        for (int j = 0; j < 8; ++j) {
+            out160[g * 16 + j] = (float) basalt::kvalues_fp4[q[j] & 0x0F] * sc;
+            out160[g * 16 + j + 8] = (float) basalt::kvalues_fp4[q[j] >> 4] * sc;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
-enum class PleFormat { IQ4_NL, Q5_0, Q8_0 };
+enum class PleFormat { IQ4_NL, Q5_0, Q8_0, NVFP4 };
 
 struct PleTable::Impl {
     GgufFile* file = nullptr;
@@ -130,6 +144,7 @@ struct PleTable::Impl {
     uint32_t prefetch_keys[kMaxPrefetch][PLE_N_HEADS] = {};
     uint8_t prefetch_raw[kMaxPrefetch][PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
     uint32_t rb = PLE_ROW_BYTES;      // bytes per row
+    float nvfp4_scale = 1.0f;         // the table's FP32 scale, from the metadata (NVFP4 rows only)
     void decode(const uint8_t* row, float* out160) const {
         switch (fmt) {
         case PleFormat::Q5_0:
@@ -138,6 +153,7 @@ struct PleTable::Impl {
         case PleFormat::Q8_0:
             for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) basalt::dequantize_q8_0(row + (size_t) b * 34, out160 + b * 32);
             break;
+        case PleFormat::NVFP4: nvfp4_dequant_row(row, out160, nvfp4_scale); break;
         default: iq4nl_dequant_row(row, out160); break;
         }
     }
@@ -170,17 +186,33 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    // IQ4_NL, Q5_0 or Q8_0 rows
+    // IQ4_NL, Q5_0, Q8_0 or NVFP4 rows
     if (std::strcmp(t->type_name(), "IQ4_NL") == 0) impl_->fmt = PleFormat::IQ4_NL;
     else if (std::strcmp(t->type_name(), "Q5_0") == 0) impl_->fmt = PleFormat::Q5_0;
     else if (std::strcmp(t->type_name(), "Q8_0") == 0) impl_->fmt = PleFormat::Q8_0;
+    else if (std::strcmp(t->type_name(), "NVFP4") == 0) impl_->fmt = PleFormat::NVFP4;
     else {
-        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL, Q5_0 or Q8_0";
+        err = std::string("per_layer_token_embd.weight is ") + t->type_name()
+              + ", not IQ4_NL, Q5_0, Q8_0 or NVFP4";
         close();
         return false;
     }
     impl_->rb = impl_->fmt == PleFormat::Q8_0 ? PLE_ROW_BYTES_Q8_0
-              : impl_->fmt == PleFormat::Q5_0 ? PLE_ROW_BYTES_Q5_0 : PLE_ROW_BYTES;
+              : impl_->fmt == PleFormat::Q5_0 ? PLE_ROW_BYTES_Q5_0
+              : impl_->fmt == PleFormat::NVFP4 ? PLE_ROW_BYTES_NVFP4 : PLE_ROW_BYTES;
+    if (impl_->fmt == PleFormat::NVFP4) {
+        // The rows carry the checkpoint's own codes and scales; the FP32 scale of the whole table lives in the
+        // metadata.  Without it every row would decode by one constant factor - plausible, and wrong - so a pack
+        // that lost it is refused rather than guessed at.
+        const MetaValue* s = impl_->file->get(PLE_NVFP4_SCALE_KEY);
+        if (s == nullptr || !s->is_num() || !std::isfinite(s->num()) || s->num() <= 0.0) {
+            err = std::string("an NVFP4 PLE table without a positive finite ") + PLE_NVFP4_SCALE_KEY
+                  + " in its metadata";
+            close();
+            return false;
+        }
+        impl_->nvfp4_scale = (float) s->num();
+    }
     // PleReader's row_bytes is a runtime parameter: every format's rows go through the same generic path
     // (ple_reader_test --selftest covers straddling, caching, in-flight tickets, keep-alive).
     impl_->n_rows = t->shape[1];
@@ -296,12 +328,14 @@ void PleTable::close() {
     impl_->n_rows = 0;
     impl_->rb = PLE_ROW_BYTES;
     impl_->fmt = PleFormat::IQ4_NL;
+    impl_->nvfp4_scale = 1.0f;
 }
 
 bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
 bool PleTable::locked() const { return impl_->locked; }
 const char* PleTable::format() const {
-    return impl_->fmt == PleFormat::Q8_0 ? "Q8_0" : impl_->fmt == PleFormat::Q5_0 ? "Q5_0" : "IQ4_NL";
+    return impl_->fmt == PleFormat::Q8_0 ? "Q8_0" : impl_->fmt == PleFormat::Q5_0 ? "Q5_0"
+           : impl_->fmt == PleFormat::NVFP4 ? "NVFP4" : "IQ4_NL";
 }
 PleIo PleTable::mode() const { return impl_->mode; }
 uint64_t PleTable::rows() const { return impl_->n_rows; }

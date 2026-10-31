@@ -78,6 +78,17 @@ def vocab_only_gguf(path: str) -> bytes | None:
     return body + b"\0" * (-len(body) % ALIGNMENT)
 
 
+def vocab_gguf_bytes(kv) -> bytes:
+    """A pack's `gguf_kv` as a vocab-only GGUF (metadata, no tensors, no split keys): what `vision/text_vocab` holds
+    when the model came from a checkpoint, where no source GGUF carries the tokenizer."""
+    from gguf_writer import GGUFWriter
+    w = GGUFWriter()
+    for k, v in kv.items():
+        if not k.startswith("split."):
+            w.add(k, v)
+    return w.blob()
+
+
 def vision_sections(mmproj_path, native_paths):
     out = [("vision/mmproj", None, str(mmproj_path), 0, os.path.getsize(mmproj_path))]
     for p in native_paths:

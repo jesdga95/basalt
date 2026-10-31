@@ -170,6 +170,29 @@ int main() {
               "no key in the skip set: the index is not read");
     }
 
+    std::printf("4. an NVFP4 n-gram table the loader ignores\n");
+    {   // the table's rows are 160 values in 16-value scale groups: whole blocks of NVFP4's 64-value rate, though
+        // a row is not a whole number of them. NativeDense never uploads it, and its span must not stop the matrices.
+        const fs::path pack = tmp.path / "ple";
+        write_pack(pack, false);
+        const std::string shard = (tmp.path / "ple.gguf").string();
+        try {                                   // without a byte count for the table the fixture throws; say so
+            fixture::write(shard, arch_keys(), {{QKV, {NE0, NE1}, 8, 1}, {KEY, {NE0, NE1}, 8, 2},
+                                                {"per_layer_token_embd.weight", {160, 8}, 40, 3}});
+            Loaded l;
+            load(pack, shard, l);
+            check(l.ok, "the dense index loads beside an NVFP4 table " + l.err);
+            check(l.dense.tensor_count() == 2, "the table is not uploaded as a matrix");
+        } catch (const std::exception& e) {
+            check(false, "the [160, 8] NVFP4 table has a byte count: " + std::string(e.what()));
+        }
+        basalt::TensorInfo part;                                  // 160 x 7 values: 17.5 blocks of 64
+        part.name = "per_layer_token_embd.weight";
+        part.shape = {160, 7};
+        part.type = 40;
+        check(basalt::tensor_payload_bytes(part) == 0, "values that are not whole blocks have no byte count");
+    }
+
     std::printf(g_fail ? "native_dense_ple_key_test: %d FAILED\n" : "native_dense_ple_key_test: all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

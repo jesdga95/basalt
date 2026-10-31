@@ -672,6 +672,11 @@ class PleFp8:
         self.rows = sum(r for _, r in shards)
         self.row_bytes = PLE_DIM // 32 * 34
         self.nbytes = self.rows * self.row_bytes
+        self.gguf_type, self.gguf_type_id = "Q8_0", 8
+        self.folded = True       # the checkpoint's scale is applied before Q8_0, so the engine reads no scale
+        self.files = [pathlib.Path(path)]
+        self.conversion = {"name": "per_layer_token_embd.weight", "src_type": "F8_E4M3", "dst_type": "Q8_0",
+                           "method": "fp8 code x per-tensor BF16 scale, Q8_0 blocks of 32 (ggml reference rounding)"}
 
     def jobs(self):
         for off, rows in self.shards:
@@ -682,6 +687,61 @@ class PleFp8:
     def chunks(self, pool, depth: int = 16):
         """The Q8_0 rows in order, made on `pool` with at most `depth` chunks in flight."""
         yield from bounded_imap(pool, _ple_job, self.jobs(), depth)
+
+
+def _ple_nvfp4_job(args):
+    path, off, spath, soff, rows = args
+    codes = np.fromfile(path, dtype=np.uint8, count=rows * (PLE_DIM // 2), offset=off).reshape(rows, PLE_DIM // 2)
+    sc = np.fromfile(spath, dtype=np.uint8, count=rows * (PLE_DIM // 16), offset=soff).reshape(rows, PLE_DIM // 16)
+    if (sc & 0x80).any() or (sc == 0x7F).any():
+        return "a UE4M3 scale with the sign bit set or NaN"
+    # The checkpoint pairs value 2i with 2i+1 in byte i; Basalt's NVFP4 blocks pair value j with j+8, so the
+    # table decodes with the same inner loop as the experts' blocks.
+    nib = np.empty((rows, PLE_DIM // 16, 16), np.uint8)
+    nib[..., 0::2] = codes.reshape(rows, PLE_DIM // 16, 8) & 15
+    nib[..., 1::2] = codes.reshape(rows, PLE_DIM // 16, 8) >> 4
+    out = np.empty((rows, PLE_DIM // 16, 9), np.uint8)
+    out[..., 0] = sc
+    out[..., 1:] = nib[..., :8] | (nib[..., 8:] << 4)
+    return out.reshape(-1).tobytes()
+
+
+class PleNvfp4:
+    """The PLE n-gram table of a checkpoint that stores it as NVFP4 shards (`...ngram_embedding.shard_K.weight`:
+    uint8 [rows, PLE_DIM / 2] E2M1 codes, value 2i in the low nibble of byte i) with `...shard_K.weight_scale`
+    UE4M3 per 16 values and one F32 `...weight_scale_2` for the whole table. A row is 90 bytes: per 16 values one
+    scale byte then 8 code bytes holding value j in the low nibble of byte j and value j + 8 in its high nibble -
+    the pairing an NVFP4 block's codes use, but with each scale kept with its own group instead of a block's
+    hoisted four, so 160 values are 2.5 blocks and a row is not a whole number of them."""
+
+    ROW_BYTES = (PLE_DIM // 16) * 9
+
+    def __init__(self, shards, scale: float, chunk_rows: int = 65536):
+        """`shards`: (codes path, codes offset, scales path, scales offset, rows) in table order."""
+        self.shards, self.scale, self.chunk_rows = shards, scale, chunk_rows
+        self.rows = sum(s[4] for s in shards)
+        self.row_bytes = self.ROW_BYTES
+        self.nbytes = self.rows * self.ROW_BYTES
+        self.gguf_type, self.gguf_type_id = "NVFP4", 40
+        self.folded = False      # the rows are the checkpoint's own codes and scales; the F32 table scale stays outside
+        self.files = sorted({pathlib.Path(s[0]) for s in shards} | {pathlib.Path(s[2]) for s in shards})
+        self.conversion = {"name": "per_layer_token_embd.weight", "src_type": "NVFP4", "dst_type": "NVFP4",
+                           "method": "E2M1 codes and UE4M3 scales per 16 values carried over unchanged, nibbles moved "
+                                     "into Basalt's block order; the F32 table scale stays in the metadata as "
+                                     "qwen4exp.ple.nvfp4_scale_2"}
+
+    def jobs(self):
+        for path, off, spath, soff, rows in self.shards:
+            for r in range(0, rows, self.chunk_rows):
+                n = min(self.chunk_rows, rows - r)
+                yield (path, off + r * (PLE_DIM // 2), spath, soff + r * (PLE_DIM // 16), n)
+
+    def chunks(self, pool, depth: int = 16):
+        """The 90-byte rows in order, made on `pool` with at most `depth` chunks in flight."""
+        for b in bounded_imap(pool, _ple_nvfp4_job, self.jobs(), depth):
+            if isinstance(b, str):
+                raise ConvertError(b)
+            yield b
 
 
 # ------------------------------------------------------------------ Q6_K requantization of the dense projections

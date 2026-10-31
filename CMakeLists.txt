@@ -412,6 +412,13 @@ if(BUILD_TESTING)
   basalt_embed_manifest(native_dense_ple_key_test)
   basalt_gpu_test(NAME native_dense_ple_key_test COMMAND native_dense_ple_key_test)
   set_tests_properties(native_dense_ple_key_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  # an NVFP4 n-gram table read through the table reader: the row stride, the metadata table scale, the gather and
+  # the refusals (CPU, synthetic file, no model)
+  add_executable(ple_nvfp4_test tests/core/ple_nvfp4_test.cpp)
+  target_link_libraries(ple_nvfp4_test PRIVATE engine)
+  basalt_embed_manifest(ple_nvfp4_test)
+  basalt_cpu_test(NAME ple_nvfp4_test COMMAND ple_nvfp4_test)
+  set_tests_properties(ple_nvfp4_test PROPERTIES TIMEOUT 60)
   # per-layer admission on a sized cache starts each layer in its own range
   add_executable(expert_cache_per_layer_test tests/core/expert_cache_per_layer_test.cpp)
   target_link_libraries(expert_cache_per_layer_test PRIVATE engine)
@@ -931,6 +938,9 @@ if(PLE_FIXTURE_DIR)
     --in "${PLE_FIXTURE_DIR}/ple_in.bin" --out "${PLE_FIXTURE_DIR}/ple_out.bin"
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
+# The NVFP4 row decode alone, against a double-precision transcription: the fixture-gated entry above is the only
+# one a build without PLE_FIXTURE_DIR registers, so the decode needs a mode of its own to be tested at all.
+basalt_cpu_test(NAME ple_nvfp4_parity COMMAND ple_parity --nvfp4)
 
 # INT8 KV storage vs a host reference and vs the FP16 path (GPU, synthetic, no model).
 add_executable(kv_q8_parity tests/kernels/kv_q8_parity.cpp)

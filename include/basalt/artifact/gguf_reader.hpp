@@ -460,16 +460,18 @@ private:
     std::map<std::string, MetaValue> meta_;
 };
 
-// Bytes of a tensor's payload from its shape and block geometry; 0 when the type is unknown, a row is not whole
-// blocks, or the count overflows.
+// Bytes of a tensor's payload from its shape and block geometry; 0 when the type is unknown, its values are not a
+// whole number of blocks, or the count overflows.  Blocks are counted over the values, not per row: the n-gram
+// table's rows are 160 values of 16-value scale groups, which are whole blocks of NVFP4's 64-value rate.
 inline uint64_t tensor_payload_bytes(const TensorInfo& t) {
     int be = 0, bb = 0;
-    if (t.shape.empty() || !block_geometry(t.type, be, bb) || t.shape[0] % (uint64_t) be) return 0;
     uint64_t elements = 1;
+    if (t.shape.empty() || !block_geometry(t.type, be, bb)) return 0;
     for (uint64_t d : t.shape) {
         if (d == 0 || elements > (std::numeric_limits<uint64_t>::max)() / d) return 0;
         elements *= d;
     }
+    if (elements % (uint64_t) be) return 0;
     const uint64_t blocks = elements / (uint64_t) be;
     if (blocks > (std::numeric_limits<uint64_t>::max)() / (uint64_t) bb) return 0;
     return blocks * (uint64_t) bb;
