@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include <chrono>
+#include <cinttypes>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -192,7 +193,8 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
         // The format is written when the model file is built and is space-separated with no quoting; a name with a
         // space in it would break the parse, which is why the parser REFUSES rather than taking what it got.
         const int n = std::sscanf(line,
-                                  "%255s %d %d %llu %llu %llu %llu %lld %lld %d %d %d %d %d %llu %llu %llu %d %d",
+                                  "%255s %d %d %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNd64 " %" SCNd64
+                                  " %d %d %d %d %d %" SCNu64 " %" SCNu64 " %" SCNu64 " %d %d",
                                   name, &r.file, &kind, &r.src_off, &r.src_bytes, &r.dst_off, &r.dst_bytes,
                                   &r.ne0, &r.ne1, &r.code_bits, &r.code_bias, &r.group_elems, &r.codebook,
                                   &r.has_offset, &r.codes_bytes, &r.scales_bytes, &r.offset_bytes,
