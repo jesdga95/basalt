@@ -3,6 +3,19 @@
 
 namespace basalt::program::serve {
 
+namespace {
+// stable insertion sort for the few slots a window holds
+template <class Less>
+void sort_small(int* v, int n, Less less) {
+    for (int i = 1; i < n; ++i) {
+        const int x = v[i];
+        int j = i;
+        for (; j > 0 && less(x, v[j - 1]); --j) v[j] = v[j - 1];
+        v[j] = x;
+    }
+}
+}  // namespace
+
 uint64_t Runtime::row_hash(int t) {
     lh_buf.resize((size_t) n_vocab);
     if (!ver.copy_logits(t, lh_buf.data())) return 0;
@@ -98,7 +111,7 @@ bool Runtime::batch_step() {
             // want less: the slots wanting least are served in full, the rest split what is left
             int ord[MR];
             for (int sg = 0; sg < S; ++sg) ord[sg] = sg;
-            std::sort(ord, ord + S, [&](int x1, int x2) { return Tw[x1] < Tw[x2]; });
+            sort_small(ord, S, [&](int x1, int x2) { return Tw[x1] < Tw[x2]; });
             int left_rows = MB;
             for (int i = 0; i < S; ++i) {
                 const int share = std::max(1, (left_rows + (S - i) - 1) / (S - i));
@@ -331,7 +344,7 @@ bool Runtime::batch_step() {
         int cont[MR], nc = 0;
         for (int sg = 0; sg < S; ++sg) if (fin_of[sg] == nullptr) cont[nc++] = sg;
         int nfull = std::min(nc, MR - nc);
-        std::sort(cont, cont + nc, [&](int x1, int x2) {
+        sort_small(cont, nc, [&](int x1, int x2) {
             const BSlot& s1 = bs[(size_t) rows[x1]];
             const BSlot& s2 = bs[(size_t) rows[x2]];
             return s1.acc + 0.05 * (double) s1.since_draft > s2.acc + 0.05 * (double) s2.since_draft;
