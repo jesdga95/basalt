@@ -623,7 +623,7 @@
       "notes": "Abliterated GSQ-RCO IQ3_S with the official pack's Q8_0 n-gram spliced in. 0 SSD spill. Third GPU is the x4 slot."
     },
     {
-      "submitter": "Calogero-Zarbo rig-5090-5070Ti",
+      "submitter": "Calogero-Zarbo",
       "date": "2026-10-30",
       "commit": "6025cbcf30",
       "preset": "community-1",
@@ -653,7 +653,7 @@
       "decode_tps": 438.7
     },
     {
-      "submitter": "Calogero-Zarbo rig-5090-5070Ti",
+      "submitter": "Calogero-Zarbo",
       "date": "2026-10-30",
       "commit": "6025cbcf30",
       "preset": "community-1",
