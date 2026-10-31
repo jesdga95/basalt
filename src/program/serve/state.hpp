@@ -294,6 +294,9 @@ private:
     std::vector<XSwap> xq{};
     int xq_stage{};
     bool xq_saturated{};
+    // since the start: the swaps the rounds queued, and those a round left for a later one (no free RAM place)
+    int64_t xq_swapped{};
+    int64_t xq_noplace{};
     // The landed words (Verifier::landed_words): a round's incoming copies are queued in layer order, each layer's
     // followed by a 4-byte copy of the round's number into the layer's word.  The copies' sources are a pinned
     // ring of rounds (every layer's word, then the round's number).
@@ -441,6 +444,7 @@ private:
     int64_t ba_rounds_l{};
     int64_t ba_h_l{};
     int64_t ba_m_l{};
+    int64_t ba_noplace{};   // the batch rounds' swaps deferred for want of a free RAM place
     double ba_ms{};
     JobRunner ba_thr{};   // queues the adaptive copies beside the windows
     bool ba_job{};
