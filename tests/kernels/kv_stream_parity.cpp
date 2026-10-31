@@ -7,7 +7,8 @@
 //   1. the attention outputs are BITWISE equal (the streamed readers see exactly the resident values);
 //   2. the residency map is consistent after every call (slot_block and page_table invert each other);
 //   3. no call overflowed, and the hit/miss counters add up;
-//   4. a ring (the MTP drafter's layout) restored from the host copy reads the same values as the resident pool.
+//   4. a ring (the MTP drafter's layout) restored from the host copy reads the same values as the resident pool;
+//   5. that ring saved back (kv_ring_save) over a second host copy gives the first's bytes.
 // INT8, FP16 and Q4_0 pools. Then the batch windows' form, kv_stream_resolve_seg (run_segments).
 //
 //     build/kv_stream_parity [--bench]
@@ -111,6 +112,22 @@ const uint8_t* host_of(const void* dev) {   // a mapped host pool's host address
     ck(cudaPointerGetAttributes(&a, dev), "pointer attributes");
     if (a.hostPointer == nullptr) { std::fprintf(stderr, "no host address\n"); std::exit(2); }
     return (const uint8_t*) a.hostPointer;
+}
+
+struct HostArray { const uint8_t* x; const uint8_t* y; size_t len; };   // an array of two host copies, bytes per block
+std::vector<HostArray> host_arrays(const Pools& x, const Pools& y, int fmt, const k::QsaShapes& s) {
+    const size_t rows = (size_t) (s.n_head_kv * s.page_size);
+    if (fmt == k::kKvQ4) {
+        const size_t n = rows * k::kv_q4_bytes_per_head((int) s.head_dim);
+        return {{host_of(x.p.k_q4), host_of(y.p.k_q4), n}, {host_of(x.p.v_q4), host_of(y.p.v_q4), n}};
+    }
+    if (fmt == k::kKvInt8) {
+        const size_t c = rows * (size_t) s.head_dim, sc = rows * (size_t) (s.head_dim / k::KV_Q8_GROUP) * 2;
+        return {{host_of(x.p.k_q), host_of(y.p.k_q), c}, {host_of(x.p.v_q), host_of(y.p.v_q), c},
+                {host_of(x.p.k_scale), host_of(y.p.k_scale), sc}, {host_of(x.p.v_scale), host_of(y.p.v_scale), sc}};
+    }
+    const size_t n = rows * (size_t) s.head_dim * 2;
+    return {{host_of(x.p.k_pool), host_of(y.p.k_pool), n}, {host_of(x.p.v_pool), host_of(y.p.v_pool), n}};
 }
 
 bool run(int fmt) {
@@ -231,6 +248,16 @@ bool run(int fmt) {
         const bool ok = std::memcmp(a.data(), b2.data(), (size_t) NH * D * 4) == 0;
         std::printf("  %s ring restore: %s\n", name, ok ? "identical" : "DIFFERS");
         if (!ok) ++bad;
+        // 5. the ring saved back over a second host copy: blocks [b0, b1) byte-equal to the first's (on the CPU)
+        Pools back;
+        back.alloc(n_blocks, s, fmt, true);
+        k::kv_ring_save(ring.attn(rt), back.p, fmt, b0, b1, R, s, nullptr);
+        ck(cudaDeviceSynchronize(), "ring save");
+        bool same = true;
+        for (const auto& [x, y, len] : host_arrays(host, back, fmt, s))
+            same = same && std::memcmp(x + (size_t) b0 * len, y + (size_t) b0 * len, (size_t) (b1 - b0) * len) == 0;
+        std::printf("  %s ring save: %s\n", name, same ? "identical" : "DIFFERS");
+        if (!same) ++bad;
     }
     return bad == 0;
 }
