@@ -1,14 +1,16 @@
 // tests/kernels/q80_vhead_parity.cpp - the Q8_0 head in bit planes (q80p) and its two-stage verify head.
 //   1. The planes: a head packed and unpacked again holds the same bytes.
 //   2. q80p_mmvq on the planes against native_mmvq on the Q8_0 rows: bitwise at 1..8 columns, each column the bits of
-//      its one-column call; against a CPU reference (double) on sampled rows.
+//      its one-column call; against a CPU reference (double) on sampled rows.  Over a split's two row ranges (the first
+//      rows of the head, a copy of the rest): the same bits as the whole head's rows.
 //   3. q80p_vhead at K = 1, 20, 64: per column the K largest entries (by value, then lower id) are the exact head's ids
 //      in the same order with the same bits, every other entry is at or above its exact logit and below the K-th, the
 //      sampler draws the same tokens and probabilities (greedy, and top_k <= K with top_p, min_p, temperature), and a
 //      column's entries do not depend on the window's width.  K = 0 is the exact head, bitwise.
 //   4. A share of the head on another card (the last fifth of the rows on a copy of their own, screened there against
 //      the first head's published thresholds, its scored entries listed and merged): the same K largest entries and
-//      sampler draws as the exact head; K = 0 is the exact head, bitwise.
+//      sampler draws as the exact head; K = 0 (batch windows, the exact pass) is the exact head, bitwise.  Two splits:
+//      the last fifth, and the share the verify plan sizes for a peer of about a quarter of CUDA0's bandwidth.
 //   5. A cold microbench at the head's shape (L2 flushed before each launch), with the split's two sides timed alone.
 // Random Q8_0 rows (ggml's rounding of Gaussian weights) with 64 rows per column leaned towards it, so each column has
 // a head's spread of near-top logits, and random columns quantized by native_quantize_q8_1.
@@ -183,6 +185,30 @@ int main(int argc, char** argv) {
                     vs_one ? "bitwise" : "DIFFERS");
         if (!vs_native || !vs_one) fail = 1;
     }
+    // a split's two row ranges, each run as a head of its own
+    const int split_rows = (int) ((int64_t) rows * 201984 / 248320) / 256 * 256;
+    for (const int r0 : {rows - rows / 5, split_rows}) {
+        const int r1 = rows - r0;
+        void* wq = nullptr;
+        ck(cudaMalloc(&wq, (size_t) r1 * kRb), "range copy");
+        ck(cudaMemcpyAsync(wq, (const uint8_t*) wp + (size_t) r0 * kRb, (size_t) r1 * kRb, cudaMemcpyDeviceToDevice, s),
+           "range copy up");
+        for (int nc = 1; nc <= kMaxT; ++nc) {
+            k::q80p_mmvq(wp, xq, y1, kNin, r0, nc, s);
+            k::q80p_mmvq(wq, xq, y0, kNin, r1, nc, s);
+            std::vector<float> a((size_t) nc * r0), b((size_t) nc * r1);
+            ck(cudaMemcpyAsync(a.data(), y1, a.size() * 4, cudaMemcpyDeviceToHost, s), "range a");
+            ck(cudaMemcpyAsync(b.data(), y0, b.size() * 4, cudaMemcpyDeviceToHost, s), "range b");
+            ck(cudaStreamSynchronize(s), "range sync");
+            bool ok = true;
+            for (int c = 0; c < nc; ++c)
+                ok = ok && std::memcmp(&a[(size_t) c * r0], &one[(size_t) c * rows], (size_t) r0 * 4) == 0 &&
+                     std::memcmp(&b[(size_t) c * r1], &one[(size_t) c * rows + r0], (size_t) r1 * 4) == 0;
+            std::printf("q80p_mmvq rows %d + %d ncols %d: %s\n", r0, r1, nc, ok ? "bitwise the whole head's" : "DIFFERS");
+            if (!ok) fail = 1;
+        }
+        cudaFree(wq);
+    }
 
     // ---- 3. the two-stage head
     const int keeps[3] = {1, 20, 64};
@@ -278,8 +304,8 @@ int main(int argc, char** argv) {
 
     // ---- 4. a share of the head on another card: the rows past r0 as a head of their own (its own copy, scratch and
     // threshold), its listed entries merged into the first head's column, which screened only the rows before r0
-    {
-        const int r0 = rows - rows / 5, r1 = rows - r0;
+    for (const int r0 : {rows - rows / 5, split_rows}) {
+        const int r1 = rows - r0;
         void *wq = nullptr, *scr1 = nullptr, *list = nullptr, *link = nullptr, *input = nullptr, *xq1 = nullptr;
         int* kd1 = nullptr;
         float* y2 = nullptr;
