@@ -821,6 +821,30 @@
       "prefill_16k_tps": 7696.1,
       "prefill_64k_tps": 11629.7,
       "decode_tps": 497.8
+    },
+    {
+      "submitter": "giveen",
+      "date": "2026-11-01",
+      "commit": "f0bb833c49",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 475,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 48.8
+        }
+      ],
+      "ram_gib": 247,
+      "cpu": "Intel Core Ultra 9 285K, 24 cores",
+      "ram_gbps": 74.7,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 9760.6,
+      "prefill_64k_tps": 10586.1,
+      "decode_tps": 369.2,
+      "notes": "version 2 pack migrated from version 1 with tools/migrations/basalt_v1_to_v2.py; same box and 475 W as the 9c3692e7f5 row (311.8 decode, 9556 16k, 10542 64k), a second run read 371.2"
     }
   ]
 }
