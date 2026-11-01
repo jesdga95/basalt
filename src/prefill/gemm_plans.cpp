@@ -396,7 +396,7 @@ bool Gemm::prepare_shapes(const std::vector<Shape>& declared, std::string& err) 
         err = "prefill gemm: startup memory query failed";
         return false;
     }
-    const uint64_t temp_budget = std::min<uint64_t>(128ull << 20, free_bytes / 4) & ~255ull;
+    const uint64_t temp_budget = std::min<uint64_t>(128ull << 20, free_bytes / 2) & ~255ull;
     if (!plans->h || temp_budget <= kPlanWs + 1536 || !mem.allocate((size_t) temp_budget)) {
         err = "prefill gemm: startup plan workspace";
         return false;
@@ -459,7 +459,8 @@ bool Gemm::prepare_shapes(const std::vector<Shape>& declared, std::string& err) 
             if (p.candidates.empty() ||
                 !plans->settle(p, ty, xp, (const uint16_t*) w, (float*) y, rows, shape.n, shape.k, shape.ldy,
                                a, ws, kPlanWs, nullptr, a == base_align, buffer_rows)) {
-                err = "prefill gemm: no checked startup plan for " + std::to_string(shape.n) + " x " +
+                err = std::string("prefill gemm: no checked startup plan for ") + (shape.bf16 ? "BF16 " : "FP16 ") +
+                      std::to_string(shape.n) + " x " +
                       std::to_string(shape.k) + " stride " + std::to_string(shape.ldy) + " alignment " +
                       std::to_string(a);
                 return false;
@@ -509,7 +510,8 @@ bool Gemm::pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int6
     const Plans::Key key{type, N, K, ldy, align};
     const auto found = plans_->plans.find(key);
     if (plans_->prepared && (found == plans_->plans.end() || !found->second.ok) && T >= 2 && beta == 0.0f) {
-        throw GemmPlanError("prefill gemm: no prepared plan for " + std::to_string(N) + " x " +
+        throw GemmPlanError(std::string("prefill gemm: no prepared plan for ") + (ty == CUDA_R_16BF ? "BF16 " : "FP16 ") +
+                            std::to_string(N) + " x " +
                             std::to_string(K) + " stride " + std::to_string(ldy) + " alignment " +
                             std::to_string(align));
     }
