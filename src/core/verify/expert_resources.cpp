@@ -43,6 +43,10 @@ bool Verifier::dm_init(std::string& err) {
     }
     if (why != nullptr) {
         basalt::log::warn("basalt verify", "the device-planned MoE tail is off: %s", why);
+        if (route_tail_skip_ > 0) basalt::log::info("basalt verify", "route-tail-skip is off: it needs the device-planned MoE tail");
+        if (route_prior_ > 0.0f) basalt::log::info("basalt verify", "route-prior is off: it needs the device-planned MoE tail");
+        route_tail_skip_ = 0;
+        route_prior_ = 0.0f;
         return true;
     }
     DecMoe* d = new DecMoe;
@@ -84,6 +88,8 @@ bool Verifier::dm_init(std::string& err) {
     if (ok && diagnostics().wait_stats)
         ok = cudaMalloc((void**) &d->wstat, kDmStatWords * 8) == cudaSuccess &&
              cudaMemset(d->wstat, 0, kDmStatWords * 8) == cudaSuccess;
+    if (ok && (route_tail_skip_ > 0 || route_prior_ > 0.0f))
+        ok = cudaMalloc((void**) &d->route_counts, 8 * 8) == cudaSuccess && cudaMemset(d->route_counts, 0, 8 * 8) == cudaSuccess;
     if (!ok) { err = "verify: device-planned MoE buffers"; return false; }
     d->rows_words = (size_t) (T * K * N);
     d->tags = d->wstat == nullptr;
@@ -275,7 +281,7 @@ void Verifier::dm_free() {
     for (void* p : {(void*) d->res0, (void*) d->res1, (void*) d->plan, (void*) d->ctr, (void*) d->slot_off, d->vscr,
                     (void*) d->vsync, d->xq_pub, (void*) d->wstat,
                     (void*) d->ptab0, (void*) d->pub, (void*) d->cseen, (void*) d->landed,
-                    (void*) d->stage_src, (void*) d->stage_k})
+                    (void*) d->stage_src, (void*) d->stage_k, (void*) d->route_counts})
         if (p) cudaFree(p);
     if (d->stage_host) cudaFreeHost(d->stage_host);
     if (d->pin) cudaFreeHost(d->pin);
@@ -284,6 +290,31 @@ void Verifier::dm_free() {
         if (h) cudaFreeHost(h);
     delete d;
     dm_ = nullptr;
+}
+
+std::vector<std::string> Verifier::route_report() const {
+    if (dm_ == nullptr || dm_->route_counts == nullptr) return {};
+    const OnDevice on(device_);
+    unsigned long long c[8] = {};
+    if (cudaMemcpy(c, dm_->route_counts, sizeof c, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        cudaGetLastError();
+        return {};
+    }
+    std::vector<std::string> out;
+    char b[240];
+    if (route_tail_skip_ > 0 && c[0] > 0) {
+        std::snprintf(b, sizeof b, "route-tail-skip %d: %llu of %llu routed entries no GPU held dropped (%.1f%%); %.1f%% of all %llu entries",
+                      route_tail_skip_, c[2], c[1], c[1] > 0 ? 100.0 * (double) c[2] / (double) c[1] : 0.0,
+                      100.0 * (double) c[2] / (double) c[0], c[0]);
+        out.push_back(b);
+    }
+    if (route_prior_ > 0.0f && c[3] > 0) {
+        std::snprintf(b, sizeof b, "route-prior %g: %.1f%% of %llu routed entries picked because of the bias; %.1f%% of entries held by no GPU",
+                      (double) route_prior_, 100.0 * (double) c[4] / (double) c[3], c[3],
+                      100.0 * (double) c[5] / (double) c[3]);
+        out.push_back(b);
+    }
+    return out;
 }
 
 }  // namespace basalt::core

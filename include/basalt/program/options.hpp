@@ -148,6 +148,14 @@ struct Options {
     /// own draw differs (0 = exact; the flag alone = kRelaxedDraftingDefault).  This changes the output distribution:
     /// docs/precision/features.md.  Solo decode only; a request's relax=P key overrides it.
     float relaxed_drafting = 0.0f;
+    /// --route-tail-skip [R]: in a decode window an expert no GPU holds is neither copied nor computed when every
+    /// entry of the window that names it ranks R or lower by router weight (0 = off; the flag alone =
+    /// kRouteTailSkipDefault).  The others keep their router weights.  This changes the output: docs/precision/features.md.
+    int route_tail_skip = 0;
+    /// --route-prior [LAMBDA]: a decode window picks its top-10 as if every expert a GPU holds had LAMBDA added to its
+    /// router logit; the weights stay the router's own (0 = off; the flag alone = kRoutePriorDefault). This changes
+    /// the output: docs/precision/routing.md.
+    float route_prior = 0.0f;
     /// --grammar on|off: a request's "grammar" key is enforced on the sampled tokens (the vocabulary is read from the
     /// pack at start).  Off: the key is ignored and the decode loop pays one pointer test per window.
     bool grammar = false;

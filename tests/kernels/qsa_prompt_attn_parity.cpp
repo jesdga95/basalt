@@ -9,7 +9,7 @@
 //   2. the new and old outputs agree to a relative 1e-4 of the output scale (int8 KV: 2e-3);
 //   3. a query's output is bitwise the same when it is computed in a different batch at a different position (nine
 //      sub-batches: off the tile grid, a batch of one, the chunk's tail);
-// then times both over a prompt chunk (the old one in batches of 32, as prefill.cpp calls it).
+// then times both over a prompt chunk (the old one in batches of 32, as src/prefill/qsa.cpp calls it).
 // Usage: qsa_prompt_attn_parity [context=32768] [queries=2048] [reps=5]
 #include "basalt/kernels/qsa.hpp"
 #include "basalt/kernels/qsa_decode_attn.hpp"
