@@ -281,6 +281,9 @@ private:
     static constexpr float promote_margin = 10.0f;
     // the count at which a CPU-tier expert routed about once lately takes a slot the round leaves unused
     static constexpr float once_bar = 1.0f;
+    // at most this many of them a round: more copies cost the CPU tier host memory bandwidth on routing that rarely
+    // comes back (JSON output)
+    static constexpr size_t kOnceSwaps = 16;
     // the round's swaps, best first: the most-routed missing experts against the least-routed resident ones, per
     // layer, or over all layers (`across`: the incoming expert takes a slot of the outgoing one's layer `lout`)
     struct Swap { float gain; int32_t layer, in, out, lout; };

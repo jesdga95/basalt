@@ -344,7 +344,7 @@ bool Runtime::xq_round(std::vector<Swap>* ranked) {
     xq_saturated = n_ranked >= base * (size_t) kSatRatio;
     if (swaps.size() > cap) swaps.resize(cap);
     // a round with base share to spare spends it on experts routed about once lately
-    if (xq_across && swaps.size() < base) rank_once(swaps, base - swaps.size());
+    if (xq_across && swaps.size() < base) rank_once(swaps, std::min(base - swaps.size(), kOnceSwaps));
     xq.clear();
     size_t n_noplace = 0;
     const auto& lay = basalt::kernels::cpu::expert_layout();
