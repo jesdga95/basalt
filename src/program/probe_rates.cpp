@@ -186,7 +186,8 @@ struct Probe {
     template <class... A>
     void line(const char* section, const char* f, A... a) {
         std::fprintf(out, "PROBE %s ", section);
-        std::fprintf(out, f, a...);
+        if constexpr (sizeof...(A) == 0) std::fputs(f, out);
+        else std::fprintf(out, f, a...);
         std::fprintf(out, "\n");
     }
 };
@@ -438,7 +439,7 @@ struct PeerRings {
     void fill(int n) {
         K::DmRing* R = (K::DmRing*) rings.p;
         for (int r = 0; r < kRings; ++r) {
-            std::memset(&R[r], 0, sizeof(K::DmRing));
+            R[r] = K::DmRing{};
             R[r].n_tok = kTok;
             R[r].n_peer = n;
             for (int j = 0; j < n; ++j) {

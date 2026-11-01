@@ -1,7 +1,7 @@
 // prefill_mmq_nvfp4_test - the prompt path's NVFP4 experts through MMQ (moe_mmq.hpp): the NVFP4 tile loader with the
 // per-16-scale int8 dot, the scale tail gathered with each expert and applied in mmq::swiglu, at the real geometry
 // (gate/up 1280 x 2560, down 2560 x 640) on synthetic NVFP4 experts (sub-block scales over 13 binades, UE4M3
-// subnormals included; tails {s_gate, s_up, s_down} in 0.004..0.03), in prefill.cpp's sequence (16-expert groups,
+// subnormals included; tails {s_gate, s_up, s_down} in 0.004..0.03), in expert_mmq.cpp's sequence (16-expert groups,
 // q8_1 of the activations, gate/up, SwiGLU, q8_1 of H, down).  Checked against three CPU references:
 //   - `same`: double-precision math on MMQ's own roundings (x and H rounded to int8 per 32 values the way the
 //     quantizer does).  The gate/up product (before the tail and SwiGLU) isolates the loader and the dot: only fp32
@@ -170,7 +170,7 @@ struct Bufs {
     float* scales() const { return (float*) (grp_d.as<uint8_t>() + GROUP * mmq::matrix_bytes(GGML_TYPE_NVFP4, N, FF) + TAIL); }
 };
 
-// prefill.cpp's sequence for one layer; `grouped`: one gather launch per group, else one per expert
+// expert_mmq.cpp's sequence for one layer; `grouped`: one gather launch per group, else one per expert
 void run_mmq(mmq::Context& ctx, Bufs& b, const Layer& L, const float* x_dev, const int32_t* src_dev,
              const std::vector<const uint8_t*>& blob, bool grouped, cudaStream_t s) {
     const size_t gub = mmq::matrix_bytes(GGML_TYPE_NVFP4, 1280, N), db = mmq::matrix_bytes(GGML_TYPE_NVFP4, N, FF);

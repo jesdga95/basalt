@@ -242,18 +242,34 @@ def _whole(v):
     return _num(v) and v == int(v)
 
 
-# sampling key -> (converter, test, what is expected); the model file and the launch options share it
+# the engine's penalty window holds at most this many tokens (src/program/serve/state.hpp, kPenaltyWindowCap)
+PENALTY_WINDOW_MAX = 4096
+# sampling key -> (converter, test, what is expected); the model file, the launch options and every request share it
 SAMPLING_KEYS = {
     "temperature": (float, lambda v: _num(v) and v >= 0, "a number >= 0 (0 = greedy)"),
     "top_p": (float, lambda v: _num(v) and 0 < v <= 1, "0 < top_p <= 1"),
     "min_p": (float, lambda v: _num(v) and 0 <= v <= 1, "0 <= min_p <= 1"),
-    "top_k": (int, lambda v: _whole(v) and 1 <= v <= 64, "an integer 1..64"),
-    "presence_penalty": (float, lambda v: _num(v) and v >= 0, "a number >= 0"),
-    "frequency_penalty": (float, lambda v: _num(v) and v >= 0, "a number >= 0"),
+    "top_k": (int, lambda v: _whole(v) and v >= -1, "an integer >= 0 (0 or -1 = off: every token)"),
+    "presence_penalty": (float, _num, "a number"),
+    "frequency_penalty": (float, _num, "a number"),
     "repetition_penalty": (float, lambda v: _num(v) and v > 0, "a number > 0 (1 = off)"),
-    "penalty_last_n": (int, lambda v: _whole(v) and v >= 0, "a non-negative integer"),
-    "seed": (int, lambda v: _whole(v) and v > 0, "a positive integer"),
+    "penalty_last_n": (int, lambda v: _whole(v) and 0 <= v <= PENALTY_WINDOW_MAX,
+                       f"an integer 0..{PENALTY_WINDOW_MAX} (the engine's penalty window)"),
+    "seed": (int, lambda v: _whole(v) and -2 ** 63 <= v < 2 ** 64, "an integer"),
 }
+
+
+def checked_sampling(req: dict) -> None:
+    """A request's sampling fields against SAMPLING_KEYS (the model file's rules): ValueError naming the first one out
+    of range, so the request gets a 400 before streaming; a field left out or null takes the defaults.  A value is
+    never changed: what passes reaches the engine as sent."""
+    for key, (_, ok, expected) in SAMPLING_KEYS.items():
+        value = req.get(key)
+        if value is not None and not ok(value):
+            raise ValueError(f"{key}: expected {expected}, not {value!r}")
+    rd = req.get("relaxed_drafting")
+    if rd is not None and rd is not False and not (_num(rd) and 0 <= rd <= 1):
+        raise ValueError(f"relaxed_drafting: expected false or a number 0..1, not {rd!r}")
 
 
 def sampling_defaults_from_config(cfg: dict) -> dict:
@@ -327,7 +343,7 @@ def parallel_count(text: str) -> int:
 
 
 def budget_count(text: str) -> int:
-    """argparse type: a thinking budget in tokens, a whole number >= 0 (0: none)."""
+    """argparse type: a token count, a whole number >= 0 (0: none)."""
     try:
         n = int(text)
     except ValueError:
@@ -401,13 +417,13 @@ def build_parser() -> argparse.ArgumentParser:
     for key, text in (
             ("temperature", "0 = greedy; higher is more random"),
             ("top-p", "nucleus cutoff, 0 < value <= 1 (1 = off)"),
-            ("top-k", "keep the K likeliest tokens, 1..64"),
+            ("top-k", "keep the K likeliest tokens (0 = off: every token)"),
             ("min-p", "drop tokens less likely than this times the likeliest, 0..1 (0 = off)"),
-            ("presence-penalty", "flat penalty on a token seen in the window, >= 0"),
-            ("frequency-penalty", "penalty growing with how often a token was seen, >= 0"),
+            ("presence-penalty", "flat penalty on a token seen in the window"),
+            ("frequency-penalty", "penalty growing with how often a token was seen"),
             ("repetition-penalty", "multiplicative penalty on seen tokens, > 0 (1 = off)"),
-            ("penalty-last-n", "the window the penalties look back over, in tokens"),
-            ("seed", "fix the random draw, a positive integer")):
+            ("penalty-last-n", "the window the penalties look back over, in tokens (at most 4096)"),
+            ("seed", "fix the random draw, an integer")):
         ap.add_argument(f"--{key}", type=sampling_option(key.replace("-", "_")), metavar="N", default=None,
                         help=f"default {key.replace('-', '_')} for requests that leave it out, over the model file's: {text}")
     ap.add_argument("--min-free-vram-mib", type=int, default=None,
@@ -416,7 +432,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="default thinking budget for requests that leave reasoning_budget_tokens out (0 = none): at "
                          "the budget the thinking is closed and the answer starts, so set it below the request's "
                          "max_tokens")
+    ap.add_argument("--thinking-loop-tokens", type=budget_count, default=256, metavar="N",
+                    help="end the thinking and let the model answer when it repeats one token this many times in a "
+                         "row inside the thinking (0 = never)")
     ap.add_argument("--answer-room", action=argparse.BooleanOptionalAction, default=True,
-                    help="reserve wrap-up and answer space when the output cap is at least 1024 tokens; "
+                    help="reserve space for closing the thinking and the answer when the output cap is at least 1024 tokens; "
                          "an explicit request budget of 0 opts out")
     return ap

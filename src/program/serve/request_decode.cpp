@@ -73,6 +73,8 @@ Flow Request::decode() {
     dec_windows = 0;
     dec_T = 0;
     decode_hits0 = runtime_.drive.d.cache_hits;
+    swapped0 = runtime_.xq_swapped;
+    noplace0 = runtime_.xq_noplace;
     // the RAM and file tiers of this request (the mmap source; 0 with the arena)
     ram0 = runtime_.src.ram_reads();
     files0 = runtime_.src.file_reads();
@@ -304,7 +306,7 @@ Flow Request::decode() {
                 // top_k, top_p, then temperature over the survivors: the sampler chain without penalties
                 std::vector<int> ord((size_t) runtime_.n_vocab);
                 for (int i = 0; i < runtime_.n_vocab; ++i) ord[(size_t) i] = i;
-                const int K = std::max(1, std::min<int>(req_top_k > 0 ? req_top_k : 20, (int) runtime_.n_vocab));
+                const int K = basalt::kernels::sampler_list_len(req_top_k, (int) runtime_.n_vocab);
                 std::partial_sort(ord.begin(), ord.begin() + K, ord.end(), [&](int x, int y) {
                     return lg[(size_t) x] > lg[(size_t) y] || (lg[(size_t) x] == lg[(size_t) y] && x < y);
                 });
@@ -459,6 +461,8 @@ Flow Request::decode() {
                 pair_hint = pair_req && full_ema >= kPairFull;
                 runtime_.mtp.set_cum_th(pair_hint ? cum_th * kPairChainScale : cum_th);
                 runtime_.mtp.set_host_th(cum_th);
+                if (const int32_t* top = cv->top_ids())
+                    runtime_.mtp.note_candidates(top, (a + 1) * basalt::core::Verifier::kTopIds);
                 drafted = runtime_.mtp.draft_from(cv->final_R_all(), T, outv.data(), p, a, drafts.data(), runtime_.err, dprob.data(), &n_chain);
                 runtime_.mtp.set_launch_hook(nullptr);
                 if (drafted && runtime_.pipe_on) {   // the next window's first stage starts after the chain's kernels

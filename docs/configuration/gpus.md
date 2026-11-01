@@ -27,8 +27,7 @@ expert tier`:
   2,559 rows when it is slower (a slower card costs a longer chunk more than the experts it saves the main card's link).
   When its memory is faster than the main card's it takes a share of each GDN mixer and of the head (one start line
   each; see [the GDN split](../precision/gdn-split.md)).
-- **Idle.** Where a process gets no GPU-to-GPU access (Windows), the cards after the main one stay idle and a warning
-  says so. The engine runs up to three expert tiers: a fifth card and later ones stay idle.
+- **Idle.** The engine runs up to three expert tiers: a fifth card and later ones stay idle.
 
 Three or more cards are community-tested: the path is checked here on two cards, with two expert tiers sharing the
 second one. Reports from machines with three or four cards are welcome (see [community](../community.md)).

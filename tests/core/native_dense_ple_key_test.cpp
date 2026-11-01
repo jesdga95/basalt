@@ -92,7 +92,7 @@ basalt::core::PackFiles pack_of(const fs::path& dir) {
     return p;
 }
 
-// generate.cpp's order: served_names, keep_unquantized_ple_key, pool_bytes, load, NativeDense::load.
+// the generate driver's order (src/program/generate): served_names, keep_unquantized_ple_key, pool_bytes, load, NativeDense::load.
 void load(const fs::path& pack, const std::string& shard, Loaded& l) {
     const std::vector<std::string> shards{shard};
     if (!NativeDense::served_names(shards, true, l.skip, l.err)) return;

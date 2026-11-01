@@ -42,14 +42,11 @@ EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief 
                "medium": "Reasoning effort is set to medium. Think as much as the task needs, without unnecessary "
                          "elaboration."}
 VISION_START = "<|vision_start|>"
-# a reply repeating one token this many times in a row is ended ("length"); Service.repeat_stop_tokens, 0: off
-REPEAT_STOP_TOKENS = 256
-# closes the thinking at reasoning_budget_tokens
-REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
-# Reserve output tokens for the wrap-up and answer above this cap.
+# Reserve output tokens for closing the thinking and the answer above this cap.
 ANSWER_ROOM_MIN_CAP = 1024
 ANSWER_RESERVE_MIN = 512
-# closes the thinking when the model ends its turn inside it
+# closes the thinking: the template's own end, written when the model ends its turn inside it, reaches the thinking
+# budget or repeats one token
 REASONING_CLOSE = "\n</think>\n\n"
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often
 KEEPALIVE_S = 10.0          # a stream quiet this long (a held-back tool argument) gets a keep-alive
@@ -70,6 +67,7 @@ DEBUG = False            # --debug: one line per request plus the raw model text
 class Service:
     loading = booting = False                      # a load or wake runs; the start-up load runs
     load_kind = "weights"                               # what the running load is: "weights" or "wake"
+    on_loaded = None                                    # called after each weights load or wake this service ran
     boot_error = None                                   # the start-up load's failure, for the requests queued behind it
 
     def served_names(self) -> list[str]:
@@ -127,7 +125,7 @@ class Service:
         self.vram_reserve = None                         # last POST /v1/vram reserve (None: the start's)
         self.reasoning_budget_tokens = 0                 # default thinking budget (0: none)
         self.answer_room = True                          # reserve output space when thinking
-        self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # see REPEAT_STOP_TOKENS
+        self.thinking_loop_tokens = 256                  # one token repeated this often in the thinking ends it (0: off)
         self.anthropic_think_unasked = True               # "anthropic_thinking": "on_request" -> False
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
@@ -200,15 +198,13 @@ class Service:
             return None
         return {"kind": self.load_kind, **((getattr(self.engine, "load_status", None) or {}) if self.load_kind == "weights" else {})}
 
-    def start_load(self, on_ready=None) -> None:
+    def start_load(self) -> None:
         """Load the model in the background at start. The HTTP server is already up and requests wait on the same
-        fifo as for any load; a failed start is kept for them and ends the server. `on_ready()` runs once loaded."""
+        fifo as for any load; a failed start is kept for them and ends the server."""
         def run():
             self.booting = True
             try:
                 self.load()
-                if on_ready is not None:
-                    on_ready()
             except (EngineDied, GpuBusy):
                 pass                                    # kept in boot_error by ensure_loaded
             finally:
@@ -227,6 +223,8 @@ class Service:
         self.loading = True
         try:
             self._ensure_loaded()
+            if self.on_loaded is not None:
+                self.on_loaded()
         except (EngineDied, GpuBusy) as e:
             if self.booting:                            # the requests queued behind it get this, not a second try
                 self.boot_error = e if isinstance(e, EngineStartError) else EngineStartError(str(e))
@@ -894,8 +892,7 @@ class Service:
             sampling = {**self.sampling_defaults, **req_values}
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
-        run_tok, run_len, repeated = None, 0, False     # current run of one repeated token
-        thinking_n = 0                                  # tokens written while thinking
+        thinking_n = 0                                 # tokens written while thinking
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
 
@@ -990,6 +987,7 @@ class Service:
                     last_print = time.time()
                     prompt, thought = ids, 0            # reasoning tokens so far
                     closed_early = False                # the thinking was already closed once
+                    run_id, run_n = None, 0             # the token the thinking is repeating, and how often in a row
                     for ev in opening:
                         yield "event", ev
                     while True:
@@ -998,6 +996,7 @@ class Service:
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
+                        looped = False                  # the wrap is for a repeated token, not the budget
                         ended_thinking = False          # the turn ended inside the thinking
                         opens = False                   # the thinking is over: write the forced call's opening
                         try:
@@ -1030,12 +1029,12 @@ class Service:
                                     break
                                 raw_ids.append(t)
                                 seg.append(t)
+                                if parser.state == "reasoning":
+                                    run_n = run_n + 1 if t == run_id else 1
+                                    run_id = t
+                                else:
+                                    run_n = 0
                                 thinking_n += parser.state == "reasoning"
-                                run_len = run_len + 1 if t == run_tok else 1
-                                run_tok = t
-                                if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
-                                    repeated = True     # degenerate output
-                                    break
                                 piece = detok.push(t)
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
@@ -1056,6 +1055,10 @@ class Service:
                                     yield "ping", None
                                 if stops is not None and stops.hit is not None:
                                     finish = "stop"         # gen.close() below STOPs the engine
+                                    break
+                                if (self.thinking_loop_tokens and run_n >= self.thinking_loop_tokens
+                                        and parser.state == "reasoning" and not parser.buf and not detok.pending()):
+                                    wrap = looped = True
                                     break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
@@ -1106,12 +1109,14 @@ class Service:
                             print("[server] the model ended while thinking, closing it for an answer", flush=True)
                         elif wrap:
                             budget = None
-                            extra = self.tok.encode(REASONING_WRAP_UP + (force or ""), parse_special=True)
+                            extra = self.tok.encode(REASONING_CLOSE + (force or ""), parse_special=True)
                             force = None
                             if max_new - n - len(extra) < 1:
                                 break                   # no room to answer: "length"
-                            print(f"[server] thinking budget reached ({thought} tokens), wrapping up",
-                                  flush=True)
+                            if looped:
+                                print(f"[server] thinking repeated one token {run_n} times, ending it", flush=True)
+                            else:
+                                print(f"[server] thinking budget reached ({thought} tokens), wrapping up", flush=True)
                         else:
                             # the thinking closed itself: the call opens after the blank line the template puts
                             # before a call
@@ -1134,10 +1139,7 @@ class Service:
                         prompt = prompt + seg + extra
                     if cancel.is_set():
                         finish = "cancel"
-                    elif repeated:
-                        print(f"[server] warning: the reply repeated one token ({self.tok.decode([run_tok])!r}) "
-                              f"{run_len} times, stopped as length (repeat_stop_tokens, 0 = off)", flush=True)
-                except GeneratorExit:                   # client disconnected
+                except GeneratorExit:                  # client disconnected
                     finish = "disconnect"
                     raise
                 finally:

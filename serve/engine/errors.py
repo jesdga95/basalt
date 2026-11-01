@@ -27,6 +27,11 @@ class EngineSilent(EngineDied):
     """The engine was silent too long (or ignored a STOP) and the server ended it; the next request restarts it."""
 
 
+class EngineError(ValueError):
+    """The engine failed a request for a reason of its own (a CUDA error, a timed-out device wait): a 500, not the
+    request's fault. A ValueError, so every path that ends a request on the engine's ERR line still does."""
+
+
 class EngineStuck(RuntimeError):
     """The engine survived QUIT, terminate and kill."""
 

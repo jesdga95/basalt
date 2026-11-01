@@ -14,6 +14,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(BUILD_TESTING "Build the tests and parity programs" OFF)
+# Covers the project's own C++ and CUDA sources only; off by default so a newer compiler's new warning cannot break a user build.
 option(WERROR "Treat compiler warnings as errors" OFF)
 if(BUILD_TESTING)
   enable_testing()
@@ -233,6 +234,7 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/dec_gdn_rec.cu
                         src/kernels/cuda/dense_tc.cu
                         src/kernels/cuda/mid_chain.cu
+                        src/kernels/cuda/wait_abort.cu
                         src/kernels/cuda/iq_kernels.cu
                         src/kernels/ngram.cpp
                         src/ngram/ple_reader.cpp)
@@ -281,7 +283,47 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
 # about arithmetic, and this one knows the ORDER the arithmetic happens in.
 add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
   src/core/remote_expert_opt.cu
-  src/core/expert_cache.cpp src/core/vmm.cpp src/core/kv_arena.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
+  src/core/expert_cache.cpp src/core/vmm.cpp src/core/kv_arena.cpp src/core/native_head.cpp src/core/native_dense.cpp
+  src/core/verify/batch_capture.cpp
+  src/core/verify/batch_execution.cpp
+  src/core/verify/batch_sessions.cpp
+  src/core/verify/capture.cpp
+  src/core/verify/commit.cpp
+  src/core/verify/cpu_warm.cpp
+  src/core/verify/diagnostics.cpp
+  src/core/verify/execution.cpp
+  src/core/verify/expert_execution.cpp
+  src/core/verify/expert_plan.cpp
+  src/core/verify/expert_resources.cpp
+  src/core/verify/gdn_split.cpp
+  src/core/verify/hc8.cpp
+  src/core/verify/head_split.cpp
+  src/core/verify/lifecycle.cpp
+  src/core/verify/pipeline.cpp
+  src/core/verify/profile.cpp
+  src/core/verify/projection.cpp
+  src/core/verify/record.cpp
+  src/core/verify/record_gdn.cpp
+  src/core/verify/record_head.cpp
+  src/core/verify/record_inputs.cpp
+  src/core/verify/record_layer.cpp
+  src/core/verify/record_moe.cpp
+  src/core/verify/record_qsa.cpp
+  src/core/verify/sampling.cpp
+  src/core/mtp/helpers.cpp
+  src/core/mtp/lifecycle.cpp
+  src/core/mtp/tensors.cpp
+  src/core/mtp/load.cpp
+  src/core/mtp/head.cpp
+  src/core/mtp/forward.cpp
+  src/core/mtp/graphs.cpp
+  src/core/mtp/branches.cpp
+  src/core/mtp/conditional.cpp
+  src/core/mtp/prefill.cpp
+  src/core/mtp/context.cpp
+  src/core/mtp/draft.cpp
+  src/core/mtp/stores.cpp
+  src/core/mtp/batching.cpp
   src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/conversation_store.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp)
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(engine PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
@@ -399,11 +441,55 @@ endif()
 # `basalt` (generate.cpp): the engine program that composes the components into a token.  The prompt arrives as
 # ids, so a tokenizer is never on one side of a logit comparison.
 # The prompt path: batched prompt processing (tensor-core GEMMs through cuBLAS).
-add_library(prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/gdn_chunked.cu src/prefill/prefill.cpp)
+add_library(prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/gdn_chunked.cu
+  src/prefill/lifecycle.cpp
+  src/prefill/layout.cpp
+  src/prefill/projection.cpp
+  src/prefill/draft_kv.cpp
+  src/prefill/peer.cpp
+  src/prefill/pipeline.cpp
+  src/prefill/statistics.cpp
+  src/prefill/run.cpp
+  src/prefill/inputs.cpp
+  src/prefill/ple.cpp
+  src/prefill/stream.cpp
+  src/prefill/ahead.cpp
+  src/prefill/layer.cpp
+  src/prefill/gdn.cpp
+  src/prefill/qsa.cpp
+  src/prefill/shared_expert.cpp
+  src/prefill/routing.cpp
+  src/prefill/cpu_experts.cpp
+  src/prefill/experts.cpp
+  src/prefill/expert_fused.cpp
+  src/prefill/expert_mmq.cpp
+  src/prefill/expert_fp4.cpp
+  src/prefill/expert_fp16.cpp
+  src/prefill/peer_experts.cpp
+  src/prefill/expert_stream.cpp
+  src/prefill/combine.cpp
+  src/prefill/handoff.cpp)
 target_include_directories(prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_gpu_include_directories})
 target_link_libraries(prefill PUBLIC engine ${_gpu_blas_target} ${_gpu_runtime_target})
 
 add_executable(basalt src/program/generate.cpp src/program/engine_local.cpp src/program/probe_rates.cpp
+                       src/program/generate/helpers.cpp
+                       src/program/generate/configure.cpp
+                       src/program/generate/model.cpp
+                       src/program/generate/layer_plan.cpp
+                       src/program/generate/weights.cpp
+                       src/program/generate/vision.cpp
+                       src/program/generate/sessions.cpp
+                       src/program/generate/sources.cpp
+                       src/program/generate/cache_size.cpp
+                       src/program/generate/cache_fill.cpp
+                       src/program/generate/token_path.cpp
+                       src/program/generate/resident_plan.cpp
+                       src/program/generate/resident_load.cpp
+                       src/program/generate/prompt_split.cpp
+                       src/program/generate/dispatch.cpp
+                       src/program/generate/prefill.cpp
+                       src/program/generate/decode.cpp
                        src/program/serve/batch.cpp
                        src/program/serve/batch_pipeline.cpp
                        src/program/serve/commands.cpp
@@ -572,6 +658,11 @@ basalt_embed_manifest(community_row_test)
 basalt_cpu_test(NAME community_row_test COMMAND community_row_test)
 set_tests_properties(community_row_test PROPERTIES TIMEOUT 60)
 if(Python3_Interpreter_FOUND)
+  basalt_gpu_test(NAME generate_prompt_test
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/generate_prompt_test.py
+                          --engine $<TARGET_FILE:basalt>
+                          --model ${CMAKE_CURRENT_SOURCE_DIR}/models/Qwen3.8-FN-NVFP4.basalt)
+  set_tests_properties(generate_prompt_test PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
   basalt_cpu_test(NAME community_row_fix_test
                   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/community_row_fix_test.py
                           $<TARGET_FILE:community_row_test> ${CMAKE_CURRENT_SOURCE_DIR})
@@ -653,6 +744,20 @@ target_include_directories(dm_table_put_parity PRIVATE ${_gpu_include_directorie
 target_link_libraries(dm_table_put_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME dm_table_put_parity COMMAND dm_table_put_parity)
 set_tests_properties(dm_table_put_parity PROPERTIES SKIP_RETURN_CODE 77)
+# the route tail skip against a plain CPU rule: which entries it drops over random windows, tables and ranks (GPU, synthetic,
+# no model; --bench times the window kernel)
+add_executable(route_tail_skip_parity tests/kernels/route_tail_skip_parity.cpp)
+target_include_directories(route_tail_skip_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(route_tail_skip_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME route_tail_skip_parity COMMAND route_tail_skip_parity)
+set_tests_properties(route_tail_skip_parity PROPERTIES SKIP_RETURN_CODE 77)
+# the residency-biased router against native_router (lambda 0, bitwise) and a double-precision CPU rule (GPU, synthetic,
+# no model; --bench times it beside the native router)
+add_executable(route_prior_parity tests/kernels/route_prior_parity.cpp)
+target_include_directories(route_prior_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(route_prior_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME route_prior_parity COMMAND route_prior_parity)
+set_tests_properties(route_prior_parity PROPERTIES SKIP_RETURN_CODE 77)
 # the overlapped windows kernels: the list copy of a stage snapshot against a CPU copy, and the flag raised behind a
 # stream writes (GPU, synthetic, no model; --bench)
 add_executable(pair_snapshot_parity tests/kernels/pair_snapshot_parity.cpp)
@@ -719,6 +824,15 @@ target_include_directories(mid_chain_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(mid_chain_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME mid_chain_parity COMMAND mid_chain_parity 20)
 set_tests_properties(mid_chain_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# mid_chain with one SM held (mid_chain_parity --hold), built with a short wait bound: below it the launch waits for the
+# release and is bitwise, past it the waits give up through the abort word instead of trapping
+add_executable(mid_chain_hold tests/kernels/mid_chain_parity.cpp src/kernels/cuda/mid_chain.cu)
+target_include_directories(mid_chain_hold PRIVATE ${_gpu_include_directories})
+target_compile_definitions(mid_chain_hold PRIVATE MKB_NS=200000000ull)
+target_link_libraries(mid_chain_hold PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME mid_chain_hold COMMAND mid_chain_hold 1 --hold 50)
+basalt_gpu_test(NAME mid_chain_hold_abort COMMAND mid_chain_hold 1 --hold 600)
+set_tests_properties(mid_chain_hold mid_chain_hold_abort PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 add_executable(gr_parity tests/kernels/gr_parity.cpp)
 target_include_directories(gr_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(gr_parity PRIVATE kernels ${_gpu_runtime_target})
@@ -738,6 +852,7 @@ add_executable(sampler_parity tests/kernels/sampler_parity.cpp)
 target_include_directories(sampler_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(sampler_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME sampler_parity COMMAND sampler_parity --selftest)
+basalt_gpu_test(NAME sampler_split_parity COMMAND sampler_parity --split)
 # the decode QSA top-k and the greedy argmax on thread-block clusters vs the one-CTA kernels, bitwise,
 # captured in a graph too (GPU, synthetic, no model; skips without cluster support); --bench: per-call times
 add_executable(decode_cluster_parity tests/kernels/decode_cluster_parity.cpp)

@@ -22,10 +22,10 @@ Flow Request::read_prompt() {
     req_sp.temperature = req_temperature;
     req_sp.top_p = req_top_p;
     req_sp.top_k = req_top_k;
-    req_sp.seed = req_seed ? req_seed
-                           : (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count();
-    req_sp.min_p = std::clamp(req_min_p, 0.0f, 1.0f);
-    req_sp.penalty_last_n = std::max(req_penalty_last_n, 0);
+    req_sp.seed = req_seed_given ? req_seed
+                                 : (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count();
+    req_sp.min_p = req_min_p;
+    req_sp.penalty_last_n = req_penalty_last_n;   // 0..kPenaltyWindowCap: request_parse refuses a wider window
     req_sp.penalty_repeat = req_penalty_repeat;
     req_sp.penalty_freq = req_penalty_freq;
     req_sp.penalty_present = req_penalty_present;
@@ -35,6 +35,14 @@ Flow Request::read_prompt() {
         return Flow::next;
     }
     runtime_.ver.set_sampling(req_sp);
+    // a list longer than the top_k kernels keep is sampled through sorted rows: their buffers before the first window
+    if (!req_sp.greedy &&
+        basalt::kernels::sampler_list_len(req_sp.top_k, (int) runtime_.n_vocab) > basalt::kernels::kSamplerNarrowMax &&
+        (!runtime_.ver.reserve_wide_sampler(runtime_.err) ||
+         (runtime_.pipe_on && !runtime_.ver_b.reserve_wide_sampler(runtime_.err)))) {
+        std::printf("ERR %s\n", runtime_.err.c_str());
+        return Flow::next;
+    }
     // relaxed acceptance: sampled text requests without a logit_bias; never the quality gate
     relax_on = req_relax > 0.0f && !req_sp.greedy && !req_bias_present && ppl == nullptr && gguard == nullptr;
     runtime_.ver.set_draft_probe(relax_on);
@@ -47,7 +55,7 @@ Flow Request::read_prompt() {
     for (int st = 0; st < runtime_.split_drive.n; ++st)
         runtime_.split_drive.pcie_num[st] = (st == 0 || runtime_.split_same)
                                        ? runtime_.drive.d.pcie_num : runtime_.pcie_num_of(runtime_.stages[(size_t) st - 1]->pcie_frac);
-    hist_n = std::min(req_sp.penalty_last_n, runtime_.kPenaltyWindowCap);
+    hist_n = req_sp.penalty_last_n;
     runtime_.ver.set_history(hist_n > 0 ? runtime_.d_hist : nullptr, hist_n);
     if (runtime_.pipe_on) {   // the second chain draws the same way
         if (!runtime_.ver_b.set_logit_bias(req_bias, runtime_.err)) {
@@ -113,6 +121,9 @@ Flow Request::read_prompt() {
     // the last window of the last windowed part carries the last prompt token too: the first generated
     // token is sampled from it, and the draft layer takes its rows like any accepted window
     fold_p0 = n - 1;
+    const auto source_at = [&](int64_t to) {
+        return to == root_at ? ConvCheckpoint::kRoot : ConvCheckpoint::kTurnEnd;
+    };
     for (const int64_t to : {root_at, turn_at, n - 1}) {
         if (to <= at) continue;
         runtime_.err.clear();
@@ -142,7 +153,7 @@ Flow Request::read_prompt() {
         if (win && !ov_window()) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }
         runtime_.ov_post_done = false;
         runtime_.ov_post = [&, to]() -> bool {
-            if ((to == turn_at || to == root_at) && !runtime_.checkpoint_at(to)) return false;
+            if ((to == turn_at || to == root_at) && !runtime_.checkpoint_at(to, nullptr, false, source_at(to))) return false;
             // the lent slots get their experts back here, beside the windows; the table follows on the main thread
             for (PfPart& p : runtime_.pf_parts) {
                 if (p.lent.empty()) continue;
@@ -153,7 +164,6 @@ Flow Request::read_prompt() {
             ov_copied = true;
             return true;
         };
-        const auto tsp = Clock::now();
         runtime_.pp_part_ckpt = (to == turn_at || to == root_at) ? to : -1;
         bool split_ran = true;
         bool sp_ok = win ? (rto <= at || read_windows(at, rto, runtime_.err))
@@ -184,7 +194,7 @@ Flow Request::read_prompt() {
         at = to;
         resumed_chunk = 0;   // the later parts are planned as the read they continue planned them
         runtime_.ov_post = nullptr;
-        if ((to == turn_at || to == root_at) && !runtime_.ov_post_done && !runtime_.checkpoint_at(to, nullptr, !in_slot && !runtime_.batch_on())) {
+        if ((to == turn_at || to == root_at) && !runtime_.ov_post_done && !runtime_.checkpoint_at(to, nullptr, !in_slot && !runtime_.batch_on(), source_at(to))) {
             std::printf("ERR saving a conversation checkpoint failed%s\n", runtime_.ckpt_why.c_str());
             return Flow::error;
         }
