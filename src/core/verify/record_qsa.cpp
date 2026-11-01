@@ -284,6 +284,7 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     }
     stamp(l, 13);
     if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(v_.attn_, (int64_t) n * NH, cs);   // back: H^-1 = H
+    if (qhalf && !fused_gate) cudaStreamWaitEvent(cs, v_.qev_[1], 0);
     if (fused_gate) {}   // the merge wrote attn32_
     else if (qb) native_qsa_gate_apply(v_.attn_, v_.qfull_, v_.attn32_,
                                   (int) (n * NH), (int) HD, cs);
