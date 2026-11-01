@@ -234,6 +234,41 @@ static void test_text_unions() {
     CHECK(ref && call_ok(ref, head + "notes/x.txt" + tail));
 }
 
+// Parameters sent as a union of objects ({"properties":{},"oneOf":[...]}): the parameters of every variant are allowed,
+// the discriminator takes every variant's value, and only what all the variants require stays required.
+static void test_union_parameters() {
+    std::string err;
+    auto g = Grammar::parse(tool_call_gbnf(R"([{"name":"automation","parameters":{"type":"object","properties":{},
+        "oneOf":[{"$ref":"#/$defs/view"},{"$ref":"#/$defs/write"}],
+        "$defs":{"id":{"type":"string"},
+                 "view":{"type":"object","properties":{"mode":{"type":"string","enum":["view"]},
+                                                       "id":{"$ref":"#/$defs/id"}},
+                         "required":["mode","id"],"additionalProperties":false},
+                 "write":{"oneOf":[{"$ref":"#/$defs/create"},{"$ref":"#/$defs/delete"}]},
+                 "create":{"type":"object","properties":{"mode":{"type":"string","enum":["create"]},
+                                                         "name":{"type":"string"},"every":{"type":"integer"}},
+                           "required":["mode","name"],"additionalProperties":false},
+                 "delete":{"type":"object","properties":{"mode":{"type":"string","enum":["delete"]},
+                                                         "id":{"$ref":"#/$defs/id"}},
+                           "required":["mode","id"],"additionalProperties":false}}}}])",
+                                           ToolGrammarOptions{}, err), err);
+    if (!g) std::printf("union tool grammar error: %s\n", err.c_str());
+    CHECK(g);
+    if (!g) return;
+    const std::string head = "<tool_call>\n<function=automation>\n";
+    const std::string tail = "</function>\n</tool_call>";
+    auto par = [](const std::string& k, const std::string& v) {
+        return "<parameter=" + k + ">\n" + v + "\n</parameter>\n";
+    };
+    CHECK(call_ok(g, head + par("mode", "create") + par("name", "Disk check") + par("every", "8") + tail));
+    CHECK(call_ok(g, head + par("mode", "view") + par("id", "abc") + tail));
+    CHECK(call_ok(g, head + par("mode", "delete") + par("id", "abc") + tail));
+    CHECK(!pre(g, head + par("mode", "explode")));          // the discriminator is the union of the variants' values
+    CHECK(!pre(g, head + tail));                            // every variant requires mode
+    CHECK(!pre(g, head + par("mode", "view") + "<parameter=bogus>"));
+    CHECK(!pre(g, head + par("mode", "create") + par("every", "x")));   // a merged parameter keeps its type
+}
+
 static void test_request() {
     std::string err;
     auto r = grammar_from_request(R"({"kind":"tools","tool_choice":"auto","tools":[{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}}},{"type":"function","function":{"name":"pong","parameters":{"type":"object","properties":{}}}}]})", err);
@@ -301,6 +336,7 @@ int main() {
     test_ref();
     test_tools();
     test_text_unions();
+    test_union_parameters();
     test_control_escapes();
     if (g_fail) { std::printf("grammar_schema_test: %d failures\n", g_fail); return 1; }
     std::printf("grammar_schema_test: ok\n");
