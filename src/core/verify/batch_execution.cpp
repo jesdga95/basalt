@@ -170,7 +170,15 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     (void) cudaStreamQuery(cs_);
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
-    const int64_t steps = le_ - lb_;
+    // The zero-doorbell graph (every expert resident) plans every layer on the device and rings no doorbell;
+    // as in the solo path's ar_on branch it only waits once for the hand-off flag. Publish it and skip the loop.
+    const int64_t steps = ar_on() ? 0 : (le_ - lb_);
+    if (steps == 0) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+        *flag = 1;
+        *(volatile uint32_t*) (h_flag_ + 8) = 1;
+    }
     for (int64_t k = 0; k < steps; ++k) {
         const int64_t l = lb_ + k;
         const uint32_t want = (uint32_t) (k + 1);
@@ -322,6 +330,12 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[S], cs_);   // right behind it: every row is kept
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
+    if (ar_on()) {   // zero-doorbell graph: the one hand-off publish, no per-layer doorbell
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+        *(volatile uint32_t*) h_flag_ = 1;
+        *(volatile uint32_t*) (h_flag_ + 8) = 1;
+    }
     if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
         for (int t = 0; t < S; ++t) {
             SessionState& sx = *slots_[(size_t) rows[t]];
@@ -337,6 +351,8 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
 
 int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     if (!b_running_) return 1;
+    // The zero-doorbell graph rings nothing: skip the per-layer loop and let the stream query below decide.
+    if (ar_on()) b_k_ = b_steps_;
     const OnDevice on_device(device_);
     volatile uint32_t* const seq = h_seq_;
     const int S = last_t_;
