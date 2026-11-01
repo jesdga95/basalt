@@ -140,6 +140,8 @@ struct HomeRegion {
     uint64_t map_bytes = 0;
 };
 /// The region holding the `bytes` at `off`, or -1.
+// Count a prefix whose padded home regions fit in room.
+size_t home_prefix_fit(const std::vector<uint64_t>& bytes, uint64_t room);
 int home_region_find(const std::vector<HomeRegion>& regions, uint64_t off, uint64_t bytes);
 /// Whether any expert's place lies in the region.
 bool home_region_used(const HomeRegion& r, const std::vector<uint64_t>& offsets);
@@ -538,6 +540,7 @@ public:
     uint64_t homes_bytes() const;
     /// RAM above the margin that a take leaves free (the server's guard floor and the engine's later allocations).
     void set_homes_reserve(uint64_t bytes) { homes_reserve_ = bytes; }
+    uint64_t homes_room() const;
     /// Debug: whether `bytes` equal the expert's bytes in the model files.
     bool equals_file(int64_t layer, int64_t expert, const uint8_t* bytes) const;
     /// With the compact copy ready: blobs read from the mapped file since (what the plain mmap mode may read from

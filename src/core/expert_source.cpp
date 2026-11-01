@@ -203,6 +203,34 @@ bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t
     return true;
 }
 
+size_t home_prefix_fit(const std::vector<uint64_t>& sizes, uint64_t room) {
+    constexpr uint64_t region = 96ull << 20;
+    uint64_t finished = 0, current = 0;
+    auto padded = [](uint64_t n, uint64_t& out) {
+        constexpr uint64_t a = 2ull << 20;
+        if (n > std::numeric_limits<uint64_t>::max() - (a - 1)) return false;
+        out = (n + a - 1) / a * a;
+        return true;
+    };
+    size_t count = 0;
+    for (uint64_t size : sizes) {
+        if (size == 0) break;
+        uint64_t done = finished, active = current, rounded = 0;
+        if (active >= region) {
+            if (!padded(active, rounded) || rounded > room - done) break;
+            done += rounded;
+            active = 0;
+        }
+        if (size > std::numeric_limits<uint64_t>::max() - active) break;
+        active += size;
+        if (!padded(active, rounded) || rounded > room - done) break;
+        finished = done;
+        current = active;
+        ++count;
+    }
+    return count;
+}
+
 int home_region_find(const std::vector<HomeRegion>& regions, uint64_t off, uint64_t bytes) {
     for (size_t i = 0; i < regions.size(); ++i) {
         const HomeRegion& r = regions[i];
@@ -1295,6 +1323,11 @@ const uint8_t* FileExpertSource::host_at(uint64_t off, uint64_t bytes) const {
                                                                                  : nullptr;
 }
 
+uint64_t FileExpertSource::homes_room() const {
+    const uint64_t budget = basalt::platform::ram_budget();
+    return budget > homes_reserve_ ? budget - homes_reserve_ : 0;
+}
+
 // Main thread only, between requests, after wait_commit / apply_pending / xq_drain: no pool, keep-alive or read-ahead
 // thread reads blob() or the offsets then.  Regions are appended in the offset space (homes_next_ only grows).
 bool FileExpertSource::homes_take(const std::vector<std::pair<int32_t, int32_t>>& experts, std::string& err,
@@ -1303,20 +1336,17 @@ bool FileExpertSource::homes_take(const std::vector<std::pair<int32_t, int32_t>>
     dst.clear();
     if (!complement_ready_ || !homes_pending_.empty()) { err = "no resident copy to give homes to"; return false; }
     if (!staged_.empty()) { err = "an exchange is in flight"; return false; }
-    uint64_t total = 0;
+    std::vector<uint64_t> sizes;
+    sizes.reserve(experts.size());
     for (const auto& [l, e] : experts) {
         if (l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) { err = "an expert outside the model"; return false; }
-        total += layer_blob_bytes_[(size_t) l];
+        sizes.push_back(layer_blob_bytes_[(size_t) l]);
     }
-    if (total == 0) return true;
-    // the RAM left over also keeps the server's guard floor above the margin (what the guard stops a request at)
-    const uint64_t budget = basalt::platform::ram_budget();
-    if (total > budget || homes_reserve_ > budget - total) {
-        const uint64_t room = budget > homes_reserve_ ? budget - homes_reserve_ : 0;
-        err = "the experts the cache gives back need " + std::to_string((total + (1u << 20) - 1) >> 20) +
-              " MiB of RAM, and " + std::to_string(room >> 20) + " MiB are free above the RAM floor";
+    if (detail::home_prefix_fit(sizes, homes_room()) != sizes.size()) {
+        err = "the experts the cache gives back exceed the RAM above the floor";
         return false;
     }
+    if (sizes.empty()) return true;
     // regions of a bounded size: one that no expert uses any more can then be returned on its own
     constexpr uint64_t kRegionBytes = 96ull << 20;
     if (homes_next_ < homes_start()) homes_next_ = homes_start();

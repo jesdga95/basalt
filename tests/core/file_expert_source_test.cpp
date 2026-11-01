@@ -283,6 +283,17 @@ void test_resident_exchange() {
     require(offsets == before, "exchanging back did not restore the plan");
 }
 
+void test_home_budget() {
+    using basalt::core::detail::home_prefix_fit;
+    constexpr uint64_t M = 1ull << 20;
+    require(home_prefix_fit({97*M, 97*M}, 195*M) == 1, "each region's padding counts");
+    require(home_prefix_fit({97*M, 97*M}, 196*M) == 2, "padded regions fit exactly");
+    require(home_prefix_fit({M, M, M}, 2*M) == 2, "partial group respects padding");
+    require(home_prefix_fit({M}, M) == 0, "no page fault below padded budget");
+    require(home_prefix_fit({UINT64_MAX}, UINT64_MAX) == 0, "rounding overflow rejected");
+    require(home_prefix_fit({}, 0) == 0, "empty home request");
+}
+
 void test_home_regions() {
     using namespace basalt::core::detail;
     // two regions after a 1000-byte complement: [1000, 1300) and [1300, 1400)
@@ -514,6 +525,7 @@ void test_host_memory_namespaced() {
 
 int main() {
     try {
+        test_home_budget();
         test_home_regions();
         test_complement_plan();
         test_resident_lend_region();
