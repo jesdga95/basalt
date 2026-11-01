@@ -80,7 +80,8 @@ std::vector<Gemm::Shape> Gemm::model_shapes(const core::WeightTable& wt, const c
             const uintptr_t byte_offset = (uintptr_t) off * sizeof(float);
             int out_align = 256;
             while (out_align > 1 && byte_offset % (uintptr_t) out_align != 0) out_align >>= 1;
-            result.push_back({bf16, nr, k, ld, std::min(base_align, out_align)});
+            for (int a = std::min(base_align, out_align); a <= 256; a *= 2)
+                result.push_back({bf16, nr, k, ld, a});
         }
     };
     const char* native[] = {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight", "attn_q.weight",
@@ -119,6 +120,10 @@ std::vector<Gemm::Shape> Gemm::model_shapes(const core::WeightTable& wt, const c
     add(true, g.hc_dim(), g.hc_lr, g.hc_dim(), true);
     add(false, g.n_embd, g.n_embd, g.n_embd, true);
     add(false, g.n_head_kv * g.head_dim, g.n_embd, g.n_head_kv * g.head_dim, true);
+    if (const auto* wk = wt.find("blk.1.ple_key.weight"); wk && wk->data && !wk->quantized())
+        add(true, basalt::kernels::NG_HC_DIM, g.n_embd, basalt::kernels::NG_HC_DIM, false, alignment(wk->data));
+    if (const auto* wv = wt.find("blk.1.ple_value.weight"); wv && wv->data)
+        add(true, g.n_embd, g.n_embd, g.n_embd, false, alignment(wv->data));
     add(true, basalt::kernels::NG_HC_DIM, g.n_embd, basalt::kernels::NG_HC_DIM, false);
     add(false, basalt::kernels::NG_HC_DIM, g.n_embd, basalt::kernels::NG_HC_DIM, true);
     add(true, g.n_embd, g.n_embd, g.n_embd, false);
