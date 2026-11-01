@@ -422,6 +422,7 @@ int main(int argc, char** argv) {
             else if (argc != 2) throw std::runtime_error("usage: --prepared [--real-bf16 PATH]");
             std::vector<Gemm::Shape> shapes;
             for (int a : {64, 128, 256}) shapes.push_back({true, 48, 2560, 96, a});
+            shapes.push_back({true, 1, 2560, 1, 256});
             std::string err;
             if (!Gemm::prepare_shapes(shapes, err)) throw std::runtime_error(err);
             cudaStream_t st;
@@ -434,6 +435,8 @@ int main(int argc, char** argv) {
             ckb(cublasSetStream(h, st), "cublasSetStream");
             const Shape s{"ssm_alpha BF16", kBF16, 48, 2560, 96, 1};
             int fails = check_shape(s, st, first, h, 0, true) + check_shape(s, st, second, h, 1, true);
+            const Shape narrow{"shexp gate_inp BF16", kBF16, 1, 2560, 1, 1};
+            fails += check_shape(narrow, st, first, h, 0, false);
             {
                 Dev x(2560 * 2), w(49 * 2560 * 2), y(96 * 4);
                 ck(cudaMemset(x.p, 0, 2560 * 2), "missing-key x");
