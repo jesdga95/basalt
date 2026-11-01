@@ -12,8 +12,13 @@
 
 namespace basalt::kernels {
 
+// The sampled list: top_k as given, 0 (off) or more than the vocabulary the whole vocabulary.  The top_k kernels keep
+// lists up to kSamplerNarrowMax; a longer one takes the wide path (sorted rows), which needs sampler_wide_reserve.
+constexpr int kSamplerNarrowMax = 64;
+inline int sampler_list_len(int top_k, int n_vocab) { return (top_k > 0 && top_k < n_vocab) ? top_k : n_vocab; }
+
 struct SamplerParams {
-    int top_k = 20;              // sampled path: 1..64 as given; 0 (off) or more than 64 keep the widest list, 64
+    int top_k = 20;              // sampled path: as given; 0 (off), or more than the vocabulary, keeps every token
     float top_p = 0.95f;         // 1.0 disables the filter
     float min_p = 0.0f;          // 0 disables; keeps tokens with p >= min_p * p_max (a prefix of the top_k list)
     float temperature = 1.0f;    // <= 0 means greedy
@@ -26,6 +31,8 @@ struct SamplerParams {
     uint64_t counter = 0;        // absolute draw index of row 0; advance across decode calls
     bool greedy = false;
     const float* logit_bias = nullptr;   // optional device array [n_vocab] added to the logits first; -inf bans
+    int* top_ids = nullptr;      // optional device array [n_tokens][n_top]: the sampled path's kept list, best first,
+    int n_top = 0;               // -1 after it (0..32 ids per row; the greedy path leaves it unwritten)
 };
 
 // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.
@@ -50,11 +57,16 @@ void sample_tokens_probe(const float* logits, int n_tokens, int n_vocab, const i
                          const SamplerParams& p, int* out, const int* query, int n_query, float* qprob, void* stream);
 
 // sample_tokens_probe on a chosen implementation of the sampled path's split, for sampler_parity: 0 the two-launch
-// split, 1 the one-launch split with argmax rounds, 2 the one-launch split with bitonic networks (the engine's).  All
-// pick the same token and give the same probabilities, bit for bit.
+// split, 1 the one-launch split with argmax rounds, 2 the one-launch split with bitonic networks (the engine's), 3 the
+// wide path (sorted rows; the engine's for a list longer than 64).  All pick the same token and give the same
+// probabilities, bit for bit.
 void sample_tokens_split(int split, const float* logits, int n_tokens, int n_vocab, const int* history,
                          int history_len, const SamplerParams& p, int* out, const int* query, int n_query, float* qprob,
                          void* stream);
+
+// The wide path's buffers on `stream` (about 16 bytes per vocabulary entry plus the sort's), made now: false when the
+// memory cannot be had.  A request that samples a list longer than 64 entries reserves them before its first window.
+bool sampler_wide_reserve(int n_vocab, void* stream);
 
 // The greedy pick (no penalties) on a thread-block cluster of 8 CTAs per row (needs thread-block clusters): the same token as
 // sample_tokens' one-block argmax.  False (nothing launched) where it

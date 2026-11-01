@@ -197,12 +197,12 @@ private:
                 case 'r': o += '\r'; break;
                 case 't': o += '\t'; break;
                 case 'u': {
-                    uint32_t v;
+                    uint32_t v = 0;
                     if (!hex4(v)) return false;
                     if (v >= 0xD800 && v < 0xDC00 && end - p >= 6 && p[0] == '\\' && p[1] == 'u') {
                         const char* save = p;
                         p += 2;
-                        uint32_t lo;
+                        uint32_t lo = 0;
                         if (!hex4(lo)) return false;
                         if (lo >= 0xDC00 && lo < 0xE000) v = 0x10000 + ((v - 0xD800) << 10) + (lo - 0xDC00);
                         else p = save;
