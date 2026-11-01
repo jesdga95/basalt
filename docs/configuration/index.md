@@ -177,7 +177,7 @@ The prompt is read in batched chunks. These settings set the chunk size and how 
 | --- | --- | --- | --- | --- |
 | `prefill` | engine | `auto`, `auto:N` (N = 8192, 16384 or 32768), or a chunk size in tokens | `auto` | Read the prompt in chunks of this many tokens. `auto` takes the largest chunk the expert cache can lend, up to a ceiling; `auto:N` sets that ceiling. |
 | `prefill-cpu-share` | engine | number from 0 to 1 | 0.6 | Share of the streamed prompt experts the CPU computes; `0` has the GPU stream them all. Fixed, so the output is the same from run to run. A weaker CPU may prefer a lower value. |
-| `prefill-fp8` | engine | switch | off | Experimental. Run most of the prompt's dense projections in FP8 (E4M3) in chunks of 1,024 tokens or more: long prompts read about 15% faster, and the numerics change, so the output after a prompt drifts further from the reference ([precision](../precision/index.md#prefill)). |
+| `prefill-fp8` | engine | switch | off | Experimental. Run most of the prompt's dense projections in FP8 (E4M3) in chunks of 1,024 tokens or more. Numerics change; validate speed and decode-path quality on the target setup before use ([precision](../precision/index.md#prefill)). |
 | `short-read` | engine | integer tokens | 64 (`0` = off) | A fresh part of a prompt of at most N tokens (a chat message, a short tool result) is read through the decode windows instead of the batched prompt path. |
 | `peer-prefill-rows` | engine | integer rows per layer | half of chunk x top-k | Prompt rows per layer the peer card computes. `0` keeps the prompt path on the main card. |
 
