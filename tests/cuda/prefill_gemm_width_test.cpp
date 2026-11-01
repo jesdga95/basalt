@@ -374,7 +374,24 @@ int main(int argc, char** argv) {
             ckb(cublasCreate(&h), "cublasCreate");
             ckb(cublasSetStream(h, st), "cublasSetStream");
             const Shape s{"ssm_alpha BF16", kBF16, 48, 2560, 96, 1};
-            const int fails = check_shape(s, st, first, h) + check_shape(s, st, second, h, 1);
+            int fails = check_shape(s, st, first, h) + check_shape(s, st, second, h, 1);
+            {
+                Dev x(2560 * 2), w(49 * 2560 * 2), y(96 * 4);
+                ck(cudaMemset(x.p, 0, 2560 * 2), "missing-key x");
+                ck(cudaMemset(w.p, 0, 49 * 2560 * 2), "missing-key w");
+                ck(cudaMemset(y.p, 0, 96 * 4), "missing-key y");
+                bool rejected = false;
+                try {
+                    first.bf16(x.as<uint16_t>(), w.as<uint16_t>(), y.as<float>(), 1, 49, 2560, 96);
+                } catch (const basalt::prefill::GemmPlanError&) {
+                    rejected = true;
+                }
+                ck(cudaStreamSynchronize(st), "missing-key synchronize");
+                if (!rejected) {
+                    std::printf("prepared T=1 missing key was not rejected\n");
+                    ++fails;
+                }
+            }
             cublasDestroy(h);
             ck(cudaStreamSynchronize(st), "stream synchronize");
             cudaStreamDestroy(st);

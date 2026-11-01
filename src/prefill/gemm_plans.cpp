@@ -509,7 +509,7 @@ bool Gemm::pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int6
     const int align = std::min(alignment(X), std::min(alignment(W), alignment(Y)));
     const Plans::Key key{type, N, K, ldy, align};
     const auto found = plans_->plans.find(key);
-    if (plans_->prepared && (found == plans_->plans.end() || !found->second.ok) && T >= 2 && beta == 0.0f) {
+    if (plans_->prepared && (found == plans_->plans.end() || !found->second.ok) && beta == 0.0f) {
         throw GemmPlanError(std::string("prefill gemm: no prepared plan for ") + (ty == CUDA_R_16BF ? "BF16 " : "FP16 ") +
                             std::to_string(N) + " x " +
                             std::to_string(K) + " stride " + std::to_string(ldy) + " alignment " +
@@ -522,7 +522,7 @@ bool Gemm::pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int6
         return plans_->settle(p, ty, X, W, Y, T, N, K, ldy, align, workspace_, ws_bytes_, stream_);
     }
     if (p.ws > ws_bytes_ || !plans_->rows(p, ty, T, N, K, ldy)) {
-        if (plans_->prepared && T >= 2 && beta == 0.0f) {
+        if (plans_->prepared && beta == 0.0f) {
             throw GemmPlanError("prefill gemm: prepared plan workspace or layout unavailable");
         }
         return false;
@@ -531,7 +531,7 @@ bool Gemm::pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int6
     if (cublasLtMatmul(plans_->h, p.op, &alpha, W, p.a, X, p.b, &beta, Y, p.c, Y, p.c, &p.algo, workspace_, ws_bytes_,
                        (cudaStream_t) stream_) != CUBLAS_STATUS_SUCCESS) {
         p.ok = false;
-        if (plans_->prepared && T >= 2 && beta == 0.0f) {
+        if (plans_->prepared && beta == 0.0f) {
             throw GemmPlanError("prefill gemm: prepared plan refused");
         }
         basalt::log::warn("basalt", "prefill gemm: cublasLtMatmul refused %s %lld x %lld x %lld: cublasGemmEx for this "
