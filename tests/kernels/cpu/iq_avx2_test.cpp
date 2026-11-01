@@ -1,11 +1,12 @@
-// tests/kernels/cpu/iq_avx2_test.cpp - the AVX2 i-quant rows: the `madd`+`add` build against the AVX-VNNI build, and both
-// against a plain double-precision reference.
+// tests/kernels/cpu/iq_avx2_test.cpp - the AVX2 i-quant and Q2_0 rows: the `madd`+`add` build against the AVX-VNNI build,
+// and both against a plain double-precision reference.
 //
 //     build/iq_avx2_test [--bench]
 //
 // The two builds must agree to the bit (the VNNI instructions are the same arithmetic in one step): gate/up rows of
-// IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS, the plain dot rows, and the IQ4_NL down rows, on random weights and
-// activations with the model's row geometry, 1 to 8 tokens, plus weights and activations pinned to their extreme codes.
+// IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS, the plain dot rows, and the IQ4_NL and Q2_0 down rows, on random
+// weights and activations with the model's row geometry, 1 to 8 tokens, plus weights and activations pinned to their
+// extreme codes.  The Q2_0 down rows must also not depend on the number of tokens in a call or on the row range.
 // The reference dequantizes the weights and the activation and sums in double; its error is reported (the float order of
 // the kernels differs from it by rounding only). On a CPU without AVX-VNNI the base build is checked against the
 // reference alone. `--bench` prints one row range per format on each build.
@@ -243,6 +244,85 @@ int main(int argc, char** argv) {
     }
     std::printf("iq_avx2_test: %d base/vnni comparisons, %d failures\n", compared, bad);
 
+    // ---- Q2_0 down rows (the pool's ActQ activations): 64-value blocks of 18 bytes, value i in byte i/4 bits 2*(i%4)
+    {
+        constexpr int NB = FF / 64;
+        constexpr size_t ROW = (size_t) NB * 18;
+        Stats st;
+        for (int mode = 0; mode < 3; ++mode) {   // random, all codes 3, random codes with activations at +-127
+            std::vector<uint8_t> blob(ROW * (size_t) H);
+            std::mt19937_64 wr(2300 + (uint64_t) mode);
+            for (auto& b : blob) b = mode == 1 ? 0xFF : (uint8_t) wr();
+            for (size_t b = 0; b + 18 <= blob.size(); b += 18) {
+                const uint16_t d = (uint16_t) (0x2800 + (blob[b] & 0xff));
+                std::memcpy(&blob[b], &d, 2);
+            }
+            std::vector<cpu::ActQ> a(MAXT);
+            std::vector<float> h(FF);
+            for (int t = 0; t < MAXT; ++t) {
+                for (auto& v : h) v = mode == 2 ? (rng() & 1 ? 1.f : -1.f) : nd(rng);
+                cpu::act_quant_q8_1_avx2(h.data(), FF, a[(size_t) t]);
+            }
+            const cpu::ActQ* ap[MAXT];
+            for (int t = 0; t < MAXT; ++t) ap[t] = &a[(size_t) t];
+            for (int nt = 1; nt <= MAXT; ++nt) {
+                std::vector<std::vector<float>> ob(nt, std::vector<float>(H)), ov(nt, std::vector<float>(H));
+                float *pb[MAXT], *pv[MAXT];
+                for (int t = 0; t < nt; ++t) { pb[t] = ob[(size_t) t].data(); pv[t] = ov[(size_t) t].data(); }
+                cpu::q2_0_gguf_rows_multi_avx2_base(blob.data(), ROW, NB, ap, nt, pb, 0, H);
+                if (vnni) {
+                    cpu::q2_0_gguf_rows_multi_avx2_vnni(blob.data(), ROW, NB, ap, nt, pv, 0, H);
+                    for (int t = 0; t < nt; ++t) {
+                        ++compared;
+                        if (std::memcmp(pb[t], pv[t], H * 4)) { std::printf("MISMATCH Q2_0 down nt %d mode %d token %d\n", nt, mode, t); ++bad; }
+                    }
+                }
+                for (int v = 0; v < (vnni ? 2 : 1); ++v) {
+                    auto fn = v ? cpu::q2_0_gguf_rows_multi_avx2_vnni : cpu::q2_0_gguf_rows_multi_avx2_base;
+                    float* const* full = v ? pv : pb;
+                    std::vector<float> one(H, 0.f);
+                    for (int t = 0; t < nt; ++t) {
+                        float* op[1] = {one.data()};
+                        fn(blob.data(), ROW, NB, ap + t, 1, op, 0, H);
+                        ++compared;
+                        if (std::memcmp(op[0], full[t], H * 4)) { std::printf("MISMATCH Q2_0 down %s token %d alone vs nt %d\n", v ? "vnni" : "base", t, nt); ++bad; }
+                    }
+                    std::vector<std::vector<float>> part(nt, std::vector<float>(H, 0.f));
+                    float* pp[MAXT];
+                    for (int t = 0; t < nt; ++t) pp[t] = part[(size_t) t].data();
+                    for (int r = 0; r < H;) {
+                        const int r1 = std::min(H, r + 1 + (r * 7 + nt) % 13);
+                        fn(blob.data(), ROW, NB, ap, nt, pp, r, r1);
+                        r = r1;
+                    }
+                    for (int t = 0; t < nt; ++t) {
+                        ++compared;
+                        if (std::memcmp(pp[t], full[t], H * 4)) { std::printf("MISMATCH Q2_0 down %s row ranges nt %d token %d\n", v ? "vnni" : "base", nt, t); ++bad; }
+                    }
+                }
+                for (int r : {0, 5, 1234, H - 1}) {   // (code - 1) * d_w * q * scale, in double
+                    const uint8_t* row = blob.data() + (size_t) r * ROW;
+                    for (int t = 0; t < nt; ++t) {
+                        double want = 0;
+                        for (int b = 0; b < NB; ++b) {
+                            uint16_t dh;
+                            std::memcpy(&dh, row + b * 18, 2);
+                            const double dw = ggml_fp16_to_fp32(dh);
+                            for (int i = 0; i < 64; ++i) {
+                                const int code = (row[b * 18 + 2 + i / 4] >> (2 * (i % 4))) & 3;
+                                want += dw * (code - 1) * (double) a[(size_t) t].q[b * 64 + i] * (double) a[(size_t) t].scale[(b * 64 + i) / 32];
+                            }
+                        }
+                        st.add(pb[t][r], want);
+                    }
+                }
+            }
+        }
+        std::printf("  Q2_0 down rows: vs double reference: max abs %.3g rel %.3g\n", st.max_abs, st.max_rel);
+        if (st.max_rel > 1e-3) { std::printf("REFERENCE ERROR too large for Q2_0 down\n"); ++bad; }
+    }
+    std::printf("iq_avx2_test: %d base/vnni comparisons, %d failures\n", compared, bad);
+
     if (bench) {   // 200 gate/up rows (the pool's task) per call, the arena far larger than the caches
         for (int type : {22, 18, 21}) {
             cpu::NativeFmt f;
@@ -269,6 +349,45 @@ int main(int argc, char** argv) {
                     std::printf("  type %2d nt %d %s: %.2f GB/s (in cache, one thread)\n", type, nt, v ? "vnni" : "base",
                                 (double) reps * 400.0 * (double) f.gu_row / (ms * 1e6));
                 }
+            }
+        }
+    }
+    if (bench) {   // one expert's down rows (2560) per call, one thread, the expert in cache
+        cpu::NativeFmt f;
+        std::string err;
+        cpu::native_fmt(22, 20, H, FF, f, err);
+        std::vector<uint8_t> blob(f.d_row * (size_t) H), q2blob((size_t) FF / 64 * 18 * H);
+        fill(blob, 20, 6, 0);
+        std::mt19937_64 wr(7);
+        for (auto& b : q2blob) b = (uint8_t) wr();
+        for (size_t b = 0; b + 18 <= q2blob.size(); b += 18) { const uint16_t d = 0x2800; std::memcpy(&q2blob[b], &d, 2); }
+        std::vector<uint8_t> hq(cpu::kNativeHBytes);
+        cpu::ActQ a;
+        std::vector<float> h(FF);
+        for (auto& v : h) v = nd(rng);
+        cpu::native_quant_h(f, h.data(), hq.data());
+        cpu::act_quant_q8_1_avx2(h.data(), FF, a);
+        for (int nt : {1, 2, 4}) {
+            const void* hp[MAXT];
+            const cpu::ActQ* ap[MAXT];
+            for (int t = 0; t < nt; ++t) { hp[t] = hq.data(); ap[t] = &a; }
+            std::vector<std::vector<float>> o(nt, std::vector<float>(H));
+            float* op[MAXT];
+            for (int t = 0; t < nt; ++t) op[t] = o[(size_t) t].data();
+            for (int v = 0; v < (vnni ? 2 : 1); ++v) {
+                auto fi = v ? cpu::iq4nl256_down_rows_vnni : cpu::iq4nl256_down_rows_base;
+                auto fq = v ? cpu::q2_0_gguf_rows_multi_avx2_vnni : cpu::q2_0_gguf_rows_multi_avx2_base;
+                const int reps = 200;
+                for (int r = 0; r < 5; ++r) fi(blob.data(), f.d_row, FF, hp, nt, op, 0, H);
+                double t0 = now_ms();
+                for (int r = 0; r < reps; ++r) fi(blob.data(), f.d_row, FF, hp, nt, op, 0, H);
+                const double ui = (now_ms() - t0) * 1e3 / reps;
+                for (int r = 0; r < 5; ++r) fq(q2blob.data(), (size_t) FF / 64 * 18, FF / 64, ap, nt, op, 0, H);
+                t0 = now_ms();
+                for (int r = 0; r < reps; ++r) fq(q2blob.data(), (size_t) FF / 64 * 18, FF / 64, ap, nt, op, 0, H);
+                const double uq = (now_ms() - t0) * 1e3 / reps;
+                std::printf("  down nt %d %s: IQ4_NL %.1f us (%.2f GB/s), Q2_0 %.1f us (%.2f GB/s) per expert (in cache, one thread)\n",
+                            nt, v ? "vnni" : "base", ui, (double) blob.size() / ui / 1e3, uq, (double) q2blob.size() / uq / 1e3);
             }
         }
     }
