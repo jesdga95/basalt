@@ -195,16 +195,19 @@ struct Operands {
 
 // The product as the prompt path runs it (GGUF blocks through Gemm::native, BF16 through Gemm::bf16).
 void run_gemm(Gemm& g, const Operands& o, const void* x, float* y, int64_t rows) {
+    ck(cudaDeviceSynchronize(), "fixture uploads before gemm");
     if (o.bf) g.bf16((const uint16_t*) x, o.w16.as<uint16_t>(), y, rows, o.s.n, o.s.k, o.s.ldy);
     else g.native((const uint16_t*) x, o.s.t, o.wq.p, y, rows, o.s.n, o.s.k, o.s.ldy);
 }
 // The same product with W already in FP16 / BF16 (the benchmark: no dequantization).
 void run_product(Gemm& g, const Operands& o, const void* x, float* y, int64_t rows) {
+    ck(cudaDeviceSynchronize(), "fixture uploads before gemm");
     if (o.bf) g.bf16((const uint16_t*) x, o.w16.as<uint16_t>(), y, rows, o.s.n, o.s.k, o.s.ldy);
     else g.f16((const uint16_t*) x, o.w16.as<uint16_t>(), y, rows, o.s.n, o.s.k, o.s.ldy);
 }
 // The call these products ran on before.
 void run_default(cublasHandle_t h, const Operands& o, const void* x, float* y, int64_t rows) {
+    ck(cudaDeviceSynchronize(), "fixture uploads before default");
     const float alpha = 1.0f, beta = 0.0f;
     const cudaDataType_t ty = o.bf ? CUDA_R_16BF : CUDA_R_16F;
     ckb(cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, (int) o.s.n, (int) rows, (int) o.s.k, &alpha, o.w16.p, ty,
@@ -253,6 +256,7 @@ int check_shape(const Shape& s, cudaStream_t st, Gemm& g, cublasHandle_t h, unsi
         const auto* wptr = (const uint16_t*) ((const char*) shifted_model_w.p + woff);
         if (woff) ck(cudaMemcpy((void*) wptr, o.w_h.data(), o.w_h.size() * 2, cudaMemcpyHostToDevice), "reference w");
         auto run_case = [&](int64_t width) {
+            ck(cudaDeviceSynchronize(), "fixture uploads before case");
             if (woff) g.bf16((const uint16_t*) xptr, wptr, yptr, width, s.n, s.k, s.ldy);
             else run_gemm(g, o, xptr, yptr, width);
         };
@@ -314,6 +318,7 @@ int check_shape(const Shape& s, cudaStream_t st, Gemm& g, cublasHandle_t h, unsi
         for (const size_t off : {size_t(2), size_t(4), size_t(8), size_t(16), size_t(32), size_t(64), size_t(128)}) {
             void* wptr = (char*) shifted_w.p + off;
             ck(cudaMemcpy(wptr, o.w_h.data(), o.w_h.size() * 2, cudaMemcpyHostToDevice), "shifted weight");
+            ck(cudaDeviceSynchronize(), "fixture uploads before shifted weight");
             g.bf16(o.x16.as<uint16_t>(), (const uint16_t*) wptr, ys.as<float>(), 301, s.n, s.k, s.ldy);
             ck(cudaStreamSynchronize(st), "shifted weight gemm");
             const auto got = rows_of(ys, 301);
