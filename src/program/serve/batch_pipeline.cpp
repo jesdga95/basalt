@@ -97,7 +97,7 @@ bool Runtime::pump(bool may_start) {
     }
     if (drive.d.failed) { std::printf("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed"); return false; }
     if (!pipe_inflight() && !batch_on() && bt_windows > 0) {   // all idle: the timing line, as batch_step
-        const double w = (double) bt_windows, wall = std::chrono::duration<double, std::milli>(Clock::now() - bt_start).count();
+        const double wall = std::chrono::duration<double, std::milli>(Clock::now() - bt_start).count();
         basalt::log::raw("basalt batch (pipelined, %d groups of %d): %lld group-steps, %lld rows in %.0f ms = "
                              "%.1f rows/s (admissions included)\n", o.batch_groups, GS, (long long) bt_windows,
                      (long long) bt_rows, wall, 1000.0 * bt_rows / std::max(wall, 1e-9));

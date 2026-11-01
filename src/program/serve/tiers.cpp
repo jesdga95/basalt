@@ -134,7 +134,7 @@ void Runtime::apply_pending(bool wait, bool exchanges) {
     // a promoted expert is CUDA0's now: its peer slot takes the expert CUDA0 gave up (in RAM since the commit)
     for (const auto& p : promoted) {
         std::string perr;
-        if (!peer.reassign(p[0], p[1], p[2], srcp->blob(p[0], p[2]), perr))
+        if (!peer.reassign(p[0], p[1], p[0], p[2], srcp->blob(p[0], p[2]), perr))
             basalt::log::warn("basalt serve", "%s", perr.c_str());
     }
     promoted.clear();
@@ -145,7 +145,9 @@ void Runtime::rank_swaps(std::vector<Swap>& swaps, bool across) {
     if (across) {
         // one ranking over every layer: a layer that routes more experts than its slots hold takes the slots of
         // the least-routed experts of any layer, so the slots follow the request's layers; with every layer's
-        // residents to choose from, a missing expert is a candidate at a lower count
+        // residents to choose from, a missing expert is a candidate at a lower count.  An expert the peer tier
+        // holds ranks lower by the promotion margin, as in the per-layer rounds, and the resident it replaces
+        // takes its peer slot.
         struct Ent { float u; int32_t rank, layer, e; };
         std::vector<Ent> cand, vict;
         for (int64_t l = 0; l < g.n_layers; ++l) {
@@ -154,7 +156,8 @@ void Runtime::rank_swaps(std::vector<Swap>& swaps, bool across) {
             for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                 const int32_t rk = prof_rank[(size_t) (l * g.n_expert + e)];
                 if (r[e] >= 0) vict.push_back({u[e], rk, (int32_t) l, e});
-                else if (u[e] >= 1.5f) cand.push_back({u[e], rk, (int32_t) l, e});
+                else if (u[e] >= 1.5f && !(remote_opt && remote_opt->owns(l, e)))
+                    cand.push_back({peer.valid() && peer.has(l, e) ? u[e] - promote_margin : u[e], rk, (int32_t) l, e});
             }
         }
         if (cand.empty() || vict.empty()) return;
@@ -211,13 +214,9 @@ void Runtime::rank_swaps(std::vector<Swap>& swaps, bool across) {
 
 bool Runtime::adapt() {
     if (!pending.empty()) return true;   // the previous swaps are still in flight
-    const auto at0 = Clock::now();
-    const int64_t peer_sw0 = peer.valid() ? peer.swaps() : 0;
-    size_t n_ranked = 0, n_kept = 0, n_promoted = 0;
     if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
     std::vector<Swap> swaps;
     rank_swaps(swaps, false);
-    n_ranked = swaps.size();
     if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
     std::vector<int> staged_on;   // the devices whose adapt streams hold copies back (-1: CUDA0)
     const auto copy_back = [&](int32_t layer, int32_t slot, uint8_t* dst) -> bool {
@@ -241,8 +240,6 @@ bool Runtime::adapt() {
         return ok;
     };
     if (!resident_spare_swaps(src, host_res, g.n_expert, swaps, copy_back, wait_copies, pending_spare)) return false;
-    n_kept = swaps.size();
-    const auto at1 = Clock::now();
     bool main_live = false;
     for (const Swap& s : swaps) {
         const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
@@ -300,8 +297,6 @@ void Runtime::xq_settle() {
 
 bool Runtime::xq_round() {
     xq_settle();
-    const auto at0 = Clock::now();
-    const int64_t peer_sw0 = peer.valid() ? peer.swaps() : 0;
     std::vector<Swap> swaps;
     rank_swaps(swaps, xq_across);
     const size_t n_ranked = swaps.size();
@@ -379,6 +374,8 @@ bool Runtime::xq_round() {
                                (size_t) swaps[i].layer * g.n_expert + swaps[i].in)) continue;
         if (!plan(swaps[i])) return false;
     }
+    xq_swapped += (int64_t) xq.size();
+    xq_noplace += (int64_t) n_noplace;
     if (!xq.empty()) {
         cudaEventRecord(adapt_ev, adapt_stream);
         xq_stage = 1;
@@ -390,7 +387,6 @@ bool Runtime::xq_round() {
 // `wait`: step (3) waits for the copies even with the landed words (the batch windows, a drain)
 bool Runtime::xq_advance(bool wait) {
     if (xq_stage == 0) return true;
-    const auto& lay = basalt::kernels::cpu::expert_layout();
     if (xq_stage == 2) ver.flush_post_launch();
     const bool nowait = xq_stage == 2 && xq_words && !wait;
     if (!nowait) cudaEventSynchronize(adapt_ev);
@@ -489,10 +485,10 @@ bool Runtime::xq_advance(bool wait) {
     } else {
         res_upload();
     }
-    for (const XSwap& x : xq) {   // a promoted expert's peer slot takes the one CUDA0 gave up
+    for (const XSwap& x : xq) {   // a promoted expert's peer slot takes the one CUDA0 gave up, from any layer
         if (!x.promo) continue;
         std::string perr;
-        if (!peer.reassign(x.layer, x.in, x.out, srcp->blob(x.layer, x.out), perr))
+        if (!peer.reassign(x.layer, x.in, x.lout, x.out, srcp->blob(x.lout, x.out), perr))
             basalt::log::warn("basalt serve", "%s", perr.c_str());
     }
     xq.clear();
@@ -557,14 +553,16 @@ int Runtime::init_tiers() {
     fast_decay = o.adapt_decay_set ? o.adapt_decay : 0.85f;   // PROBE adapt sets it
 
     peer_excl = o.peer_exclusive && peer.valid() && src.complement_ready();
-    // the rounds rank over all layers when no peer tier holds experts and every layer's blobs are one size (a slot
-    // then takes any layer's expert)
-    xq_across = !peer.valid() && xpeers.empty();
+    // the rounds rank over all layers when at most one peer tier holds experts (not exclusively) and every layer's
+    // blobs are one size (a slot then takes any layer's expert)
+    xq_across = xpeers.empty() && !peer_excl;
     for (int64_t l = 1; xq_across && l < g.n_layers; ++l)
         xq_across = basalt::kernels::cpu::expert_layout().blob_bytes(l) == basalt::kernels::cpu::expert_layout().blob_bytes(0);
 
     xq_stage = 0;   // 0 idle, 1 evictions copying to RAM, 2 incoming experts copying to their slots
     xq_saturated = false;   // the last round had at least kSatRatio times --adapt-swaps misses to swap
+    xq_swapped = 0;
+    xq_noplace = 0;
 
     xq_no = 0;
     xq_words = false;   // the round in flight writes the landed words
