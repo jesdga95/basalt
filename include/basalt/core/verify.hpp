@@ -601,6 +601,7 @@ private:
     uint32_t* h_pend_ = nullptr; uint32_t* m_pend_ = nullptr;   // the epoch the commit's begin kernel last started
     uint32_t commit_epoch_ = 0;
     int fin_blocks_ = 0;
+    int mid_max_t_ = 4;
     // Lazy GDN layers (lazy_on): the commit graph and the finisher take only the first GDN layer; the later ones are
     // committed inside the next solo window, on lz_s_ from the previous layer's FFN read (that layer's own items and,
     // until the previous layer's combine has its CPU rows, later ones), joined before the layer's GDN kernels.  The
