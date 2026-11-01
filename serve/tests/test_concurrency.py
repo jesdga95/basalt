@@ -245,7 +245,7 @@ class SlotRows(Slots):
         self.assertEqual(self.get("/slots")[(slot + 1) % 3]["drafts_offered"], None)
 
     def test_waiting_requests_are_listed_oldest_first(self):
-        # Two 80-token waves take about 4.8 seconds, leaving time to inspect the queue and complete.
+        # Keep both request waves inside the HTTP deadline.
         self.start({"go": "word " * 60}, n=2, delay=0.03)
         ts = []
         for i, kind in enumerate(("openai", "anthropic", "openai", "anthropic")):
