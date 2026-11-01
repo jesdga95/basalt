@@ -2175,6 +2175,112 @@ void dec_moe_stage(const DmRouteArgs& a, uint8_t* staging, int64_t stride, int64
     check("dec_moe_stage");
 }
 
+// row_dot_20_sub16<42>'s value with 4 lanes a row instead of 16: lane j (0..3) holds sub-warp lanes j, j + 4, j + 8 and
+// j + 12 (call t, and for t < 4 call t + 16 added after it), adds the pairs of the xor-8 and xor-4 butterfly steps
+// itself and shuffles only the xor-2 and xor-1 steps.  Every call value and every add is the 16-lane form's, in the same
+// tree, so the sums have the same bits.
+template<int NC, bool EXACT_N = false>
+__device__ __forceinline__ void row_dot_20_sub4(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n,
+                                                int j, float (&s)[NC]) {
+    using F = Fmt<42>;
+    using S = Split<42>;
+    typename S::W w[5];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int k = j + 4 * i;
+        w[i] = S::load(row, k / F::ipb, F::step * (k % F::ipb));
+    }
+    {
+        const int k = j + 16;
+        w[4] = S::load(row, k / F::ipb, F::step * (k % F::ipb));
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        if (EXACT_N || c < n) {
+            float p[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int k = j + 4 * i, kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                float a = 0.0f;
+                a += S::apply(w[i], x + off[c] + kbx * (F::qk / 32), iqs);
+                float a16 = 0.0f;
+                if (i == 0) {
+                    const int k2 = j + 16, kbx2 = k2 / F::ipb, iqs2 = F::step * (k2 % F::ipb);
+                    a16 += S::apply(w[4], x + off[c] + kbx2 * (F::qk / 32), iqs2);
+                }
+                p[i] = __fadd_rn(a, a16);
+            }
+            // xor 8: sub-warp lane t pairs with t + 8 (p[0] + p[2], p[1] + p[3]); xor 4: the two pairs
+            float r = __fadd_rn(p[0], p[2]) + __fadd_rn(p[1], p[3]);
+            r += __shfl_xor_sync(0xffffffffu, r, 2);
+            r += __shfl_xor_sync(0xffffffffu, r, 1);
+            s[c] = r;
+        }
+    }
+}
+
+// The glue's Q2_0 down (n_ff == 640): native_down_multi_kernel<42, true> with 64 rows a block at 4 lanes a row
+// (row_dot_20_sub4) instead of 16 rows at 16 lanes, so each block keeps four times the rows' loads in flight behind one
+// plan read and one q8_1 staging; the 16-row blocks are bound by their per-block latency, not by DRAM.  Same bits.
+// No L2 prefetch before the wait: the blocks are resident early, and their prefetch competes with the gate/up launch.
+__device__ __forceinline__ void dm_down_q2_block(const unsigned long long* __restrict__ grp_ptr,
+                                                 const int32_t* __restrict__ grp_start, int ng,
+                                                 const int32_t* __restrict__ ent_dst, const block_q8_1* __restrict__ hq,
+                                                 const NativeExpertLayout& L, float* __restrict__ out, uint32_t* s_hq_buf,
+                                                 int bx, int by, int gy, int tid) {
+    const block_q8_1* s_hq = reinterpret_cast<const block_q8_1*>(s_hq_buf);
+    const int r = bx * 64 + (tid >> 2), j = tid & 3;
+    const bool valid_r = r < (int) L.n_embd;
+    const size_t w_off = L.down_off + (size_t) (valid_r ? r : 0) * L.d_row;
+    for (int g = by; g < ng; g += gy) {
+        const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            const uint32_t* src = reinterpret_cast<const uint32_t*>(hq + (size_t) e * 20);
+            __syncthreads();
+            for (int i = tid; i < n * (20 * 9); i += 256) s_hq_buf[i] = src[i];
+            __syncthreads();
+            if (n == 1) {
+                const int off1[1] = { 0 };
+                float s1[1];
+                row_dot_20_sub4<1, true>(wr, s_hq, off1, 1, j, s1);
+                if (valid_r && j == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s1[0];
+            } else if (n == 2) {
+                const int off2[2] = { 0, 20 };
+                float s2[2];
+                row_dot_20_sub4<2, true>(wr, s_hq, off2, 2, j, s2);
+                if (valid_r && j < 2) out[(size_t) ent_dst[e + j] * L.n_embd + r] = j == 0 ? s2[0] : s2[1];
+            } else {
+                int off[GRP_NC];
+#pragma unroll
+                for (int c = 0; c < GRP_NC; ++c) off[c] = min(c, n - 1) * 20;
+                float sv[GRP_NC];
+                row_dot_20_sub4<GRP_NC>(wr, s_hq, off, n, j, sv);
+#pragma unroll
+                for (int c = 0; c < GRP_NC; ++c)
+                    if (valid_r && c < n && (c & 3) == j) out[(size_t) ent_dst[e + c] * L.n_embd + r] = sv[c];
+            }
+        }
+    }
+}
+
+// at most 64 registers a thread: four blocks an SM
+__global__ void __launch_bounds__(256, 4) dm_down_q2_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                         const int32_t* __restrict__ grp_start,
+                                                         const int32_t* __restrict__ n_groups,
+                                                         const int32_t* __restrict__ ent_dst,
+                                                         const block_q8_1* __restrict__ hq, NativeExpertLayout L,
+                                                         float* __restrict__ out) {
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
+    pdl_wait();
+    pdl_launch_dependents();   // the tail wait may start polling the tiers once every block is past its wait
+    __shared__ uint32_t s_hq_buf[GRP_NC * 20 * 9];
+    dm_down_q2_block(grp_ptr, grp_start, ng, ent_dst, hq, L, out, s_hq_buf, (int) blockIdx.x, (int) blockIdx.y,
+                     (int) gridDim.y, (int) threadIdx.x);
+}
+
 bool dec_moe_glue_ok(const NativeExpertLayout& L) {
     const bool tg = L.gu_type == 16 || L.gu_type == 17 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 ||
                     L.gu_type == 42;
@@ -2226,7 +2332,14 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scr
     launch_dependent(swiglu_q8_1_entries_pdl_kernel, dim3((unsigned) ((nh + 255) / 256)), s, (const float*) gate,
                      (const float*) up, (const int32_t*) P->start, (const int32_t*) P->counts, (int) L.n_ff, hq);
     check("dec_moe_glue/swiglu");
-    const int d_rows = kDown40Type(L.d_type) ? 32 : (L.d_type == 42 ? 16 : 8);
+    if (L.d_type == 42) {   // Q2_0: 64-row blocks (n_ff == 640, dec_moe_glue_ok)
+        launch_dependent(dm_down_q2_kernel, dim3((unsigned) ((L.n_embd + 63) / 64), (unsigned) gy), s,
+                         (const unsigned long long*) P->ptr, (const int32_t*) P->start, (const int32_t*) P->counts,
+                         (const int32_t*) P->dst, (const block_q8_1*) hq, L, out);
+        check("dec_moe_glue/down");
+        return;
+    }
+    const int d_rows = kDown40Type(L.d_type) ? 32 : 8;
     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
     switch (L.d_type) {
 #define DM_DOWN(T) case T: launch_down<T>(gd, s, P->ptr, P->start, P->counts, P->dst, hq, L, out, true); break;
