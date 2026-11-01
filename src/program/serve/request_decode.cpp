@@ -553,7 +553,8 @@ Flow Request::decode() {
             basalt::core::decode_events().stamp(2);
             continue;
         }
-        spawn_adapt(false);
+        if (adapt_early) adapt_go.store(1, std::memory_order_release);
+        else spawn_adapt(false);
         if (!runtime_.ver.commit(a + 1, runtime_.err)) {
             if (adapt_thr.joinable()) adapt_thr.join();
             std::printf("ERR %s\n", runtime_.err.c_str());
