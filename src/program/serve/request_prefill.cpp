@@ -26,14 +26,20 @@ Flow Request::read_prompt() {
         basalt::program::cut_gives_up_bare(
             runtime_.host_res, runtime_.loan_plan(runtime_.xcache.slots(), loan_chunk), runtime_.g.n_expert,
             [&](int64_t l, int64_t x) { return runtime_.src.has_resident(l, x); })) {
-        if (!runtime_.kv_drain(runtime_.err)) {
-            std::printf("ERR %s\n", runtime_.err.c_str());
-            return Flow::error;
+        const bool loan_active = std::any_of(runtime_.pf_parts.begin(), runtime_.pf_parts.end(),
+                                             [](const auto& part) { return !part.lent.empty(); });
+        if (loan_active) {
+            basalt::log::warn("basalt serve", "elastic KV: an active prompt loan leaves unhomed experts on file");
+        } else {
+            if (!runtime_.kv_drain(runtime_.err)) {
+                std::printf("ERR %s\n", runtime_.err.c_str());
+                return Flow::error;
+            }
+            std::string he;
+            if (!runtime_.home_given_up(runtime_.xcache.slots(), he, true))
+                basalt::log::warn("basalt serve", "elastic KV: no RAM homes for the loan's experts without a copy (%s): "
+                                  "the prompt reads them from the file", he.c_str());
         }
-        std::string he;
-        if (!runtime_.home_given_up(runtime_.xcache.slots(), he, true))
-            basalt::log::warn("basalt serve", "elastic KV: no RAM homes for the loan's experts without a copy (%s): "
-                              "the prompt reads them from the file", he.c_str());
     }
 
     req_sp.greedy = req_temperature <= 0.0f;
