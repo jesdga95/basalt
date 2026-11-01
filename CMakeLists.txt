@@ -716,6 +716,9 @@ if(NOT _iq_python STREQUAL "")
   basalt_cpu_test(NAME convert_tests COMMAND ${_iq_python} -m unittest discover -s tools/convert -p "test_*.py"
            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   set_tests_properties(convert_tests PROPERTIES TIMEOUT 300)
+  # the v1 -> v2 file migration on a tiny file
+  basalt_cpu_test(NAME migration_tests COMMAND ${_iq_python} -m unittest discover -s tools/migrations -p "test_*.py"
+           WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 else()
   message(STATUS "basalt tests: no python3 with numpy was found (the configured interpreter and .venv "
                  "were probed) - the iq_parity fixtures and its test and the converter tests are not registered; "
