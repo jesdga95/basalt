@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -123,15 +124,6 @@ std::vector<Gemm::Shape> Gemm::model_shapes(const core::WeightTable& wt, const c
         return key(a) == key(b);
     }), result.end());
     return result;
-}
-
-bool Gemm::prepare_model(const core::WeightTable& wt, const core::ModelGeometry& g, int64_t scratch_elems,
-                         std::string& err) {
-    if (!prepare_handle(err)) return false;
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return true;
-    g_model_shapes[dev] = model_shapes(wt, g, scratch_elems);
-    return true;
 }
 
 bool Gemm::prepare_lt_handle(std::string& err) {
@@ -313,15 +305,85 @@ struct Gemm::Plans {
     }
 };
 
+Gemm::Plans* Gemm::prepared_plans_[16] = {};
+
+bool Gemm::prepare_model(const core::WeightTable& wt, const core::ModelGeometry& g, int64_t scratch_elems,
+                         std::string& err) {
+    if (!prepare_handle(err)) return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return true;
+    g_model_shapes[dev] = model_shapes(wt, g, scratch_elems);
+    std::unique_ptr<Plans> plans(new Plans);
+    plans->h = g_prepared_lt[dev];
+    g_prepared_lt[dev] = nullptr;
+    struct DeviceBuffer {
+        void* p = nullptr;
+        ~DeviceBuffer() { if (p) cudaFree(p); }
+        bool allocate(size_t bytes) { return cudaMalloc(&p, bytes) == cudaSuccess; }
+    } ws;
+    if (!plans->h || !ws.allocate(kPlanWs)) {
+        err = "prefill gemm: startup plan workspace";
+        return false;
+    }
+    constexpr int64_t rows = 301;
+    const auto& shapes = g_model_shapes[dev];
+    for (size_t i = 0; i < shapes.size();) {
+        const Shape& shape = shapes[i];
+        size_t end = i + 1;
+        while (end < shapes.size() && shapes[end].bf16 == shape.bf16 && shapes[end].n == shape.n &&
+               shapes[end].k == shape.k && shapes[end].ldy == shape.ldy) ++end;
+        const uint64_t nw = (uint64_t) shape.n * (uint64_t) shape.k;
+        const uint64_t nx = (uint64_t) rows * (uint64_t) shape.k;
+        const uint64_t ny = (uint64_t) rows * (uint64_t) shape.ldy;
+        if (nw > (256ull << 20) / 2 || nx > (256ull << 20) / 2 || ny > (256ull << 20) / 4) {
+            err = "prefill gemm: startup plan shape exceeds temporary buffer limit";
+            return false;
+        }
+        DeviceBuffer w, x, y;
+        if (!w.allocate((size_t) nw * 2 + 256) || !x.allocate((size_t) nx * 2 + 256) ||
+            !y.allocate((size_t) ny * 4 + 256)) {
+            err = "prefill gemm: startup plan buffers";
+            return false;
+        }
+        std::vector<uint16_t> data((size_t) std::max(nw, nx + 128));
+        const uint16_t base = shape.bf16 ? 0x3e00 : 0x3800;
+        for (size_t j = 0; j < data.size(); ++j)
+            data[j] = (uint16_t) (base | ((j * 73 + j / 17) & 0x7f) | ((j & 1) ? 0x8000 : 0));
+        if (cudaMemcpy(w.p, data.data(), (size_t) nw * 2, cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(x.p, data.data(), (size_t) nx * 2 + 256, cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = "prefill gemm: startup plan input upload";
+            return false;
+        }
+        const auto ty = shape.bf16 ? CUDA_R_16BF : CUDA_R_16F;
+        for (size_t j = i; j < end; ++j) {
+            const int a = shapes[j].align;
+            auto* xp = (const uint16_t*) ((const char*) x.p + (a == 256 ? 0 : a));
+            auto& p = plans->plan(ty, shape.n, shape.k, shape.ldy, a);
+            if (!p.candidates.empty())
+                plans->settle(p, ty, xp, (const uint16_t*) w.p, (float*) y.p, rows, shape.n, shape.k, shape.ldy,
+                              a, ws.p, kPlanWs, nullptr);
+        }
+        i = end;
+    }
+    delete prepared_plans_[dev];
+    prepared_plans_[dev] = plans.release();
+    return true;
+}
+
 bool Gemm::pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta) {
     if (plans_ == nullptr) {
-        plans_ = new Plans;
         int dev = 0;
-        if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 16 && g_prepared_lt[dev]) {
+        if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 16 && prepared_plans_[dev]) {
+            plans_ = prepared_plans_[dev];
+            prepared_plans_[dev] = nullptr;
+        } else {
+            plans_ = new Plans;
+        }
+        if (!plans_->h && dev >= 0 && dev < 16 && g_prepared_lt[dev]) {
             plans_->h = g_prepared_lt[dev];
             g_prepared_lt[dev] = nullptr;
-        } else if (cublasLtCreate(&plans_->h) != CUBLAS_STATUS_SUCCESS) {
+        } else if (!plans_->h && cublasLtCreate(&plans_->h) != CUBLAS_STATUS_SUCCESS) {
             plans_->h = nullptr;
             basalt::log::warn("basalt", "prefill gemm: cublasLtCreate failed: cublasGemmEx, whose rounding follows the "
                                         "chunk size");

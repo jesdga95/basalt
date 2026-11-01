@@ -73,6 +73,7 @@ public:
 
 private:
     struct Plans;
+    static Plans* prepared_plans_[16];
     static bool prepare_lt_handle(std::string& err);
     /// Y = X . W^T on the shape's pinned cuBLASLt algorithm (`type`: a cudaDataType_t); false: the shape has none.
     bool pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
