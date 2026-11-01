@@ -46,9 +46,9 @@ a 128 MiB ceiling including staging allowance and the server's native free-memor
 on a paging driver). Cached graphs and branch buffers are reused for smaller waves; expert placement, chat KV
 precision and context capacity remain unchanged.
 
-The host submits independent tree nodes together; greedy paths proceed in dependent waves. Concurrent callers
-can join pending waves, and identical in-flight rows share one score with separate responses. There is no fixed
-coalescing delay or idle worker. Forced single-token edges need no target score. Prefix checkpoints remain
+The host submits each request's independent tree nodes together; greedy paths proceed in dependent waves.
+Scoring transactions queue in FIFO order and complete independently, including identical requests.
+Forced single-token edges need no target score. Prefix checkpoints remain
 bounded by the existing host cache budget; the branch KV prefix is copied, rather than copy-on-write mapped.
 
 Advanced settings are optional:
@@ -60,8 +60,8 @@ Advanced settings are optional:
 | `jev-max-nodes` | `8192` | `1..65536` | Total compiled divergent nodes across contexts and fields. |
 | `jev-tree-max` | `128` | `1..255` | Largest domain evaluated exhaustively in automatic mode. |
 
-Disconnects and deadlines release that caller; a shared wave continues for its remaining callers. When every
-caller cancels, `STOP` drains the native reply. An engine that fails to stop within ten seconds
+Disconnects and deadlines remove queued transactions or stop their active native work; `STOP` drains the reply.
+Other callers retain their own transactions. An engine that fails to stop within ten seconds
 is ended so the next request starts a synchronized process. The same API key, Host and CORS rules protect these
 routes; replies carry `Cache-Control: no-store`. Each request body is limited to 4 MiB, with separate text and
 domain limits below. No model requests or polling run while Jev is idle.
@@ -88,8 +88,8 @@ The optional `model` must name the served model or an alias. Each result contain
 prompt, cached and computed tokens and scored rows; timings include prefill, scoring and total elapsed time.
 Repeated prefix visits count as input work, rather than generated output tokens. `execution` reports
 `requested_lanes`, `effective_lanes`, the active `kv` format and `dedicated_kv_bytes` (the branch arena plus device
-staging, including indexer/PLE storage; zero on the solo path). `largest_batch`, `scored_windows` and
-`deduplicated_rows` distinguish physical windows from logical scores. `native_scoring_ms` is native scoring wall
+staging, including indexer/PLE storage; zero on the solo path). `largest_batch` and `scored_windows` report physical
+windows; `deduplicated_rows` is zero because callers are scored independently. `native_scoring_ms` is native scoring wall
 time, including branch setup and copies; `total_ms` also includes admission, formatting and tokenization.
 
 - `boolean`: `true` or `false`.

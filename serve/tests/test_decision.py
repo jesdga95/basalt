@@ -16,7 +16,6 @@ from serve.config import build_parser, parse_settings
 from serve.decision import schema, systemone
 from serve.decision.admission import Control, DecisionError, Gate
 from serve.decision.engine import Decisions
-from serve.decision.batches import Batches
 from serve.decision.trie import Trie, summary
 from serve.engine.mock import MockEngine
 from serve.engine.process import ProcessEngine
@@ -160,6 +159,34 @@ class Admission(unittest.TestCase):
         with gate.shared(cancel):
             self.assertFalse(gate.writing)
 
+    def test_transactions_are_fifo_and_cancelled_waiters_leave_the_queue(self):
+        gate = Gate(3)
+        cancels = [threading.Event() for _ in range(3)]
+        order, errors, threads = [], [], []
+        def writer(i):
+            try:
+                with gate.exclusive(Control(cancels[i], 3)):
+                    order.append(i)
+            except DecisionError as error:
+                errors.append((i, error.status))
+        with gate.shared(threading.Event()):
+            for i in range(3):
+                thread = threading.Thread(target=writer, args=(i,))
+                threads.append(thread)
+                thread.start()
+                with gate.cv:
+                    self.assertTrue(gate.cv.wait_for(lambda: len(gate.waiters) == i + 1, 2))
+            cancels[1].set()
+            with gate.cv:
+                self.assertTrue(gate.cv.wait_for(lambda: len(gate.waiters) == 2, 2))
+        for thread in threads:
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(order, [0, 2])
+        self.assertEqual(errors, [(1, 499)])
+        self.assertEqual(gate.waiters, [])
+        self.assertEqual((gate.readers, gate.writers, gate.writing), (0, 0, False))
+
 
 class Scorer(MockEngine):
     """Host oracle only: these deterministic scores never enter the production engine."""
@@ -236,69 +263,6 @@ class Waves(unittest.TestCase):
         self.assertEqual(result[0][1]["reused"], 1)
         self.assertTrue(engine.lines.empty())
 
-    def test_identical_concurrent_rows_fan_out_once_and_worker_exits(self):
-        entered, release = threading.Event(), threading.Event()
-        calls = []
-        def execute(collect, control):
-            entered.set()
-            self.assertTrue(release.wait(2))
-            rows = collect()
-            calls.extend(rows)
-            return [([3.0], {"reused": 0, "prompt_ms": 1, "scored_windows": 1}) for _ in rows]
-        batches = Batches(execute)
-        output, errors = [], []
-        def call(cancel):
-            try:
-                output.extend(batches.submit([([1, 2], [3], [], False)], Control(cancel, 2)))
-            except Exception as exc:
-                errors.append(exc)
-        threads = [threading.Thread(target=call, args=(threading.Event(),)) for _ in range(12)]
-        for thread in threads:
-            thread.start()
-        self.assertTrue(entered.wait(2))
-        with batches.cv:
-            self.assertTrue(batches.cv.wait_for(lambda: len(next(iter(batches.jobs.values())).controls) == 12, 2))
-        release.set()
-        for thread in threads:
-            thread.join(3)
-            self.assertFalse(thread.is_alive())
-        self.assertEqual(errors, [])
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(len(output), 12)
-        self.assertEqual(sum(s["scored_windows"] for _, s in output), 1)
-        with batches.cv:
-            self.assertEqual(batches.jobs, {})
-            self.assertFalse(batches.running)
-
-    def test_cancelled_waiter_does_not_stop_another_waiter(self):
-        entered, release = threading.Event(), threading.Event()
-        cancelled, live = threading.Event(), threading.Event()
-        batches = None
-        def execute(collect, control):
-            entered.set()
-            self.assertTrue(release.wait(2))
-            rows = collect()
-            control.check()
-            return [([7.0], {"scored_windows": 1}) for _ in rows]
-        batches = Batches(execute)
-        results, errors = [], []
-        def call(event):
-            try:
-                results.extend(batches.submit([([1], [2], [], False)], Control(event, 2)))
-            except DecisionError as error:
-                errors.append(error.status)
-        a, b = threading.Thread(target=call, args=(cancelled,)), threading.Thread(target=call, args=(live,))
-        a.start()
-        self.assertTrue(entered.wait(2))
-        b.start()
-        with batches.cv:
-            self.assertTrue(batches.cv.wait_for(lambda: len(next(iter(batches.jobs.values())).controls) == 2, 2))
-        cancelled.set()
-        release.set()
-        a.join(3); b.join(3)
-        self.assertEqual(errors, [499])
-        self.assertEqual(results[0][0], [7.0])
-
 
 class Integration(unittest.TestCase):
     def setUp(self):
@@ -323,33 +287,49 @@ class Integration(unittest.TestCase):
                                             "dedicated_kv_bytes": 0, "kv": "fp16"})
         self.assertEqual(self.engine.info, {"jev": 8, "kv": "fp16"})
 
-    def test_warm_callers_can_join_an_inflight_native_score(self):
-        entered, release = threading.Event(), threading.Event()
+    def test_identical_callers_score_and_complete_independently(self):
+        entered = [threading.Event(), threading.Event()]
+        release = [threading.Event(), threading.Event()]
+        completed = [threading.Event(), threading.Event()]
         original = self.engine.score
+        calls = 0
         def score(*args):
-            entered.set()
-            self.assertTrue(release.wait(2))
+            nonlocal calls
+            i, calls = calls, calls + 1
+            entered[i].set()
+            self.assertTrue(release[i].wait(3))
             return original(*args)
         self.engine.score = score
         output, errors = [], []
-        def run():
+        def run(i):
             try:
                 output.append(self.svc.jev.run(REQUEST, threading.Event()))
+                completed[i].set()
             except Exception as exc:
                 errors.append(exc)
-        a, b = threading.Thread(target=run), threading.Thread(target=run)
-        a.start()
-        self.assertTrue(entered.wait(2))
-        b.start()
-        batches = self.svc.jev.batches
-        with batches.cv:
-            self.assertTrue(batches.cv.wait_for(lambda: len(next(iter(batches.jobs.values())).controls) == 2, 2))
-        release.set()
-        a.join(3); b.join(3)
+        a, b = threading.Thread(target=run, args=(0,)), threading.Thread(target=run, args=(1,))
+        try:
+            a.start()
+            self.assertTrue(entered[0].wait(2))
+            b.start()
+            gate = self.svc.jev.gate
+            with gate.cv:
+                self.assertTrue(gate.cv.wait_for(lambda: len(gate.waiters) == 1, 2))
+            release[0].set()
+            self.assertTrue(entered[1].wait(2))
+            self.assertTrue(completed[0].wait(2))
+            self.assertFalse(completed[1].is_set())
+        finally:
+            for event in release:
+                event.set()
+            for thread in (a, b):
+                if thread.ident is not None:
+                    thread.join(3)
+                    self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
-        self.assertEqual(len(self.engine.calls), 1)
+        self.assertEqual(len(self.engine.calls), 2)
         self.assertEqual(len(output), 2)
-        self.assertEqual(sum(x["timings"]["deduplicated_rows"] for x in output), 1)
+        self.assertTrue(all(x["timings"]["deduplicated_rows"] == 0 for x in output))
 
     def test_systemone_ids_never_enter_prompt(self):
         req = {"state": "new state", "questions": {"private-id": {"type": "choice", "instructions": "Pick", "criteria": {"A": "first", "B": "second"}}}}

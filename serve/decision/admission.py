@@ -33,6 +33,7 @@ class Gate:
         self.readers = self.writers = self.outstanding = 0
         self.writing = False
         self.limit = pending + 1
+        self.waiters = []
 
     @contextlib.contextmanager
     def shared(self, cancel):
@@ -65,14 +66,17 @@ class Gate:
     @contextlib.contextmanager
     def exclusive(self, control):
         with self.cv:
+            ticket = object()
+            self.waiters.append(ticket)
             self.writers += 1
             try:
-                while self.readers or self.writing:
+                while self.readers or self.writing or self.waiters[0] is not ticket:
                     control.check()
                     self.cv.wait(0.1)
                 control.check()
                 self.writing = True
             finally:
+                self.waiters.remove(ticket)
                 self.writers -= 1
                 self.cv.notify_all()
         try:

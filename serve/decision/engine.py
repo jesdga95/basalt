@@ -5,7 +5,6 @@ import contextlib
 import time
 
 from serve.decision.admission import Control, Gate
-from serve.decision.batches import Batches
 from serve.decision import schema, systemone
 from serve.decision.trie import Trie, common_size, probabilities, summary
 from serve.engine.errors import EngineError
@@ -16,7 +15,6 @@ class Decisions:
         self.svc = service
         self.gate = Gate(pending)
         self.timeout, self.max_nodes, self.tree_max = timeout, max_nodes, tree_max
-        self.batches = Batches(self._wave)
 
     @contextlib.contextmanager
     def lease(self, control):
@@ -32,9 +30,8 @@ class Decisions:
                 finally:
                     self.svc.last_request_at = time.time()
 
-    def _wave(self, collect, control):
+    def _score(self, rows, control):
         with self.lease(control):
-            rows = collect()
             if callable(getattr(self.svc.engine, "score_many", None)):
                 return self.svc.engine.score_many(rows, control)
             return [(value, dict(stats, batch_size=1, scored_windows=1, workspace_bytes=0))
@@ -130,12 +127,12 @@ class Decisions:
             # Cache opt-out establishes its fresh prefix before any dependent rows can be reordered.
             scored = []
             if ready[0][3]:
-                scored.extend(self.batches.submit(ready[:1], control))
+                scored.extend(self._score(ready[:1], control))
                 ready_tail = ready[1:]
             else:
                 ready_tail = ready
             if ready_tail:
-                scored.extend(self.batches.submit(ready_tail, control))
+                scored.extend(self._score(ready_tail, control))
             for row, (state, index), (values, stats) in zip(ready, owners, scored):
                 ids = row[0]
                 state["scores"][index] = values
