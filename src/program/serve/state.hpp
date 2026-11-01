@@ -279,6 +279,8 @@ private:
     // CUDA0 (from their RAM copy, as any other swap) and its coldest go to the CPU
     // routings a peer expert needs above CUDA0's victim before it moves
     static constexpr float promote_margin = 10.0f;
+    // the count at which a CPU-tier expert routed about once lately takes a slot the round leaves unused
+    static constexpr float once_bar = 1.0f;
     // the round's swaps, best first: the most-routed missing experts against the least-routed resident ones, per
     // layer, or over all layers (`across`: the incoming expert takes a slot of the outgoing one's layer `lout`)
     struct Swap { float gain; int32_t layer, in, out, lout; };
@@ -508,6 +510,7 @@ private:
     bool adapt_peers(const std::vector<int32_t>& r0, std::string& perr);
     void apply_pending(bool wait, bool exchanges = true);
     void rank_swaps(std::vector<Swap>& swaps, bool across);
+    void rank_once(std::vector<Swap>& swaps, size_t room);
     bool adapt();
     void xq_settle();
     bool xq_round(std::vector<Swap>* ranked = nullptr);
