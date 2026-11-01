@@ -712,6 +712,54 @@
       "prefill_64k_tps": 3566.9,
       "decode_tps": 156.6,
       "notes": "2x RTX 5060 Ti 16GB PCIe 4.0 x8/x8, no P2P (2nd card = peer tier), Proxmox LXC; +2500 MHz MEM OC (clocks-only, stock voltage); 0 SSD spill; engine fork c15bbd27d5 (upstream 5d28eff + BF16-PLE)"
+    },
+    {
+      "submitter": "beastrobin",
+      "date": "2026-11-01",
+      "commit": "9175e7a321",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX PRO 6000 Blackwell Workstation Edition",
+          "vram_gib": 96,
+          "power_w": 600,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 54.4
+        }
+      ],
+      "ram_gib": 253,
+      "cpu": "Intel Core Ultra 9 285K, 24 cores",
+      "ram_gbps": 79.2,
+      "os": "Windows",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 9522.6,
+      "prefill_64k_tps": 11860.5,
+      "decode_tps": 498.3,
+      "notes": "single RTX PRO 6000 Blackwell WS 96 GB at its 600 W default; every expert resident in VRAM, 0 SSD spill; native Windows (WDDM), driver 610.74"
+    },
+    {
+      "submitter": "beastrobin",
+      "date": "2026-11-01",
+      "commit": "9175e7a321",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX PRO 6000 Blackwell Workstation Edition",
+          "vram_gib": 96,
+          "power_w": 300,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 54.5
+        }
+      ],
+      "ram_gib": 253,
+      "cpu": "Intel Core Ultra 9 285K, 24 cores",
+      "ram_gbps": 81.2,
+      "os": "Windows",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 8117.2,
+      "prefill_64k_tps": 8488.7,
+      "decode_tps": 423.1,
+      "notes": "same rig at a 300 W limit (half its default); experts still fully resident, 0 SSD spill; pairs with the 600 W row above"
     }
   ]
 }
