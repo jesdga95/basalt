@@ -201,13 +201,11 @@ void run_gemm(Gemm& g, const Operands& o, const void* x, float* y, int64_t rows)
 }
 // The same product with W already in FP16 / BF16 (the benchmark: no dequantization).
 void run_product(Gemm& g, const Operands& o, const void* x, float* y, int64_t rows) {
-    ck(cudaDeviceSynchronize(), "fixture uploads before gemm");
     if (o.bf) g.bf16((const uint16_t*) x, o.w16.as<uint16_t>(), y, rows, o.s.n, o.s.k, o.s.ldy);
     else g.f16((const uint16_t*) x, o.w16.as<uint16_t>(), y, rows, o.s.n, o.s.k, o.s.ldy);
 }
 // The call these products ran on before.
 void run_default(cublasHandle_t h, const Operands& o, const void* x, float* y, int64_t rows) {
-    ck(cudaDeviceSynchronize(), "fixture uploads before default");
     const float alpha = 1.0f, beta = 0.0f;
     const cudaDataType_t ty = o.bf ? CUDA_R_16BF : CUDA_R_16F;
     ckb(cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, (int) o.s.n, (int) rows, (int) o.s.k, &alpha, o.w16.p, ty,
