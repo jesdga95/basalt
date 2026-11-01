@@ -20,8 +20,9 @@ Flow Request::parse() {
     // only).  Absent keys keep today's behavior: greedy, no penalties.
     req_temperature = 0.0f;
     req_top_p = 1.0f;
-    req_top_k = 20;   // the sampler's own default; the sampled path requires top_k in 1..64
+    req_top_k = 0;    // absent: no top-k limit (the whole vocabulary)
     req_seed = 0;
+    req_seed_given = false;   // absent: a seed from the clock
     req_min_p = 0.0f;
     req_penalty_repeat = 1.0f;
     req_penalty_freq = 0.0f;
@@ -60,13 +61,33 @@ Flow Request::parse() {
             else if (key == "penalty_repeat") req_penalty_repeat = fv;
             else if (key == "penalty_freq") req_penalty_freq = fv;
             else if (key == "penalty_present") req_penalty_present = fv;
-            else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
-            else if (key == "relax") req_relax = std::clamp(fv, 0.0f, 1.0f);
+            else if (key == "seed") { req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10); req_seed_given = true; }
+            else if (key == "relax") req_relax = fv;
             else if (key == "clip") req_clip = std::atoi(tok.c_str() + eq + 1);
             else if (key == "ppl") req_ppl = std::atoi(tok.c_str() + eq + 1);
             else if (key == "ppl_t") req_ppl_t = std::atoi(tok.c_str() + eq + 1);
             // unknown keys are skipped: the ids start at the first token without '='
         }
+    }
+
+    // a sampling value out of range is refused, never changed (the server refuses it first: config.checked_sampling)
+    const char* bad = nullptr;
+    if (!std::isfinite(req_temperature) || req_temperature < 0.0f) bad = "temperature: a number >= 0";
+    else if (!(req_top_p > 0.0f && req_top_p <= 1.0f)) bad = "top_p: 0 < top_p <= 1";
+    else if (req_top_k < -1) bad = "top_k: an integer >= 0 (0 or -1 = off)";
+    else if (!(req_min_p >= 0.0f && req_min_p <= 1.0f)) bad = "min_p: 0 <= min_p <= 1";
+    else if (req_penalty_last_n < 0 || req_penalty_last_n > runtime_.kPenaltyWindowCap)
+        bad = "penalty_last_n: 0 to the engine's penalty window (4096)";
+    else if (!std::isfinite(req_penalty_repeat) || req_penalty_repeat <= 0.0f) bad = "penalty_repeat: a number > 0";
+    else if (!std::isfinite(req_penalty_freq) || !std::isfinite(req_penalty_present))
+        bad = "penalty_freq, penalty_present: numbers";
+    else if (!(req_relax >= 0.0f && req_relax <= 1.0f)) bad = "relax: 0..1";
+    if (bad == nullptr && runtime_.o.batch > 0 && runtime_.piped && req_penalty_last_n > 0 &&
+        (req_penalty_repeat != 1.0f || req_penalty_freq != 0.0f || req_penalty_present != 0.0f))
+        bad = "penalties: pipelined batch groups are not supported";
+    if (bad != nullptr) {
+        std::printf("ERR sampling %s\n", bad);
+        return Flow::next;
     }
 
     if (req_bias_present) {

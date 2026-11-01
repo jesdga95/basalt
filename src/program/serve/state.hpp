@@ -294,6 +294,9 @@ private:
     std::vector<XSwap> xq{};
     int xq_stage{};
     bool xq_saturated{};
+    // since the start: the swaps the rounds queued, and those a round left for a later one (no free RAM place)
+    int64_t xq_swapped{};
+    int64_t xq_noplace{};
     // The landed words (Verifier::landed_words): a round's incoming copies are queued in layer order, each layer's
     // followed by a 4-byte copy of the round's number into the layer's word.  The copies' sources are a pinned
     // ring of rounds (every layer's word, then the round's number).
@@ -353,6 +356,8 @@ private:
         // instead of reading its history again (see `slot_source` in the request path).
         std::vector<int32_t> ids;
         bool cached = false;           ///< idle, and its sessions still hold `ids`
+        double idle_busy = 0;          ///< the busy clock (busy_now) when it last became idle holding `ids`
+        double park_noted = -1;        ///< the idle_busy whose stay in VRAM for want of RAM was logged
         bool cvec = true;              ///< the control vector setting `ids` were read with
         std::vector<ImgKey> imgs;      ///< the pictures in `ids`: a later request reuses them only with the same ones
         // the checkpoint its prompt read took at the last turn boundary (the history before the new turn's header): a
@@ -381,6 +386,7 @@ private:
         std::unique_ptr<basalt::spec::SuffixDrafter> sfx;
         int32_t sbuf[16] = {};
         int sk = 0, smatch = 0;
+        int pen_n = 0;                 ///< the request's penalty window (penalty_last_n; 0: no penalties)
         bool from_sfx = false;
         double acc = 0.6;          ///< drafts accepted per offered, smoothed: who gets the free rows
         int64_t since_draft = 0;   ///< windows since the slot last drafted
@@ -389,6 +395,36 @@ private:
     };
     std::vector<BSlot> bs{};
     bool batch_spec{};
+    /// the solo conversation's draft K/V waits in slot 0's store while a request in another slot holds the main one
+    bool solo_draft_in0{};
+    // ---- idle conversations out of VRAM.  An idle conversation (a cached batch slot's, or the solo session's while
+    // no request works there) keeps its KV in VRAM until the work beside it has run kParkAfterBusy seconds: the
+    // expert-cache slots its cells hold have then cost that work about what moving it out and back costs, both
+    // in proportion to its tokens.  From then on, the VRAM a session is short of comes from it before the expert
+    // cache's slots, and an idle engine moves it out to regrow the cache.  It goes to the RAM tier outside its
+    // budget when RAM admits it, else it stays only on the disk tier when that holds it, else in VRAM; its next
+    // turn reads it back like any parked conversation.  Before a prompt is refused for want of VRAM, any idle
+    // conversation goes.
+    static constexpr double kParkAfterBusy = 15.0;
+    /// the solo session's conversation while a request works in another slot (that request's, moved out of `live`)
+    struct SoloBook {
+        std::vector<int32_t> live;
+        std::vector<ImgKey> live_imgs;
+        bool live_ok = false, cvec = true;
+        std::vector<ConvCheckpoint> checks;
+    };
+    SoloBook* solo_out{};
+    bool solo_busy{};                    ///< a request reads or decodes in the solo session
+    double solo_idle_busy{};             ///< the busy clock when the solo conversation last became idle
+    double solo_park_noted = -1;         ///< as BSlot::park_noted
+    int park_keep = -1;                  ///< the slot whose conversation the request being admitted continues
+    // the busy clock: seconds some request or batch slot ran (dispatch counts them)
+    double busy_s{};
+    Clock::time_point busy_from{};
+    bool busy_on{};
+    double busy_now() const {
+        return busy_s + (busy_on ? std::chrono::duration<double>(Clock::now() - busy_from).count() : 0.0);
+    }
     int S_all{};
     std::optional<basalt::spec::DraftPolicy> bpolicy;
     double bt_draft{};
@@ -408,6 +444,7 @@ private:
     int64_t ba_rounds_l{};
     int64_t ba_h_l{};
     int64_t ba_m_l{};
+    int64_t ba_noplace{};   // the batch rounds' swaps deferred for want of a free RAM place
     double ba_ms{};
     JobRunner ba_thr{};   // queues the adaptive copies beside the windows
     bool ba_job{};
@@ -465,7 +502,8 @@ private:
     bool park_current(size_t held, int64_t kept);
     std::vector<ImgKey> imgs_below(const std::vector<ImgKey>& all, int64_t L);
     bool gpu_sync_ok();
-    bool checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool defer = false);
+    bool checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool defer = false,
+                       ConvCheckpoint::Source source = ConvCheckpoint::kPeriodic);
     void res_upload();
     bool adapt_peers(const std::vector<int32_t>& r0, std::string& perr);
     void apply_pending(bool wait, bool exchanges = true);
@@ -496,10 +534,15 @@ private:
     bool batch_on();
     bool try_next_line(std::string& out);
     bool kv_give_back(int64_t ss_keep, const basalt::core::SessionState* skip, int skip_slot, const std::function<bool()>& enough, int64_t& given, std::string& e);
+    std::vector<std::pair<double, int>> idle_list(const basalt::core::SessionState* s, bool any);
+    int64_t park_idle(const basalt::core::SessionState* s, int64_t need, bool any, std::string& e);
+    bool park_one(int b, std::string& e);
+    bool park_idle_engine(std::string& e);
     void enc_command(const std::string& cmd);
     bool copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& e);
     bool hold_slot(int b, const ConvCheckpoint* at, std::string& e);
     bool copy_from_slot(int b, const ConvCheckpoint* at, std::string& e);
+    void solo_draft_back(bool keep);
     bool slot_digest(int b, int64_t upto, uint64_t* part);
     bool batch_step();
     basalt::core::Verifier& stage_verifier(int k);

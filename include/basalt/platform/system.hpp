@@ -33,9 +33,9 @@ void prefer_oom_victim();
 /// such knob.
 bool keep_full_speed();
 
-/// Whether a process is given direct GPU-to-GPU access between its devices, which a second GPU holding an expert tier
-/// needs. False where the platform withholds it.
-bool gpu_peer_access();
+/// Whether the GPU driver pages device memory out to system memory when a card is full, so that an allocation past
+/// the end succeeds and the work using it stalls, instead of failing the allocation.
+bool gpu_memory_pages();
 
 /// Puts the three standard streams in binary mode where the C runtime defaults them to text, which would turn each
 /// "\n" the serve protocol writes into "\r\n" and fold a "\r\n" in a request to "\n". For a process whose standard

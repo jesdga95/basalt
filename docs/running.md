@@ -33,15 +33,15 @@ With `--max-context` above 8192 the KV cache is elastic (not with `--kv-resident
 fine): each session backs its first 8192 cells at startup (the K/V pools, the indexer's block keys, the RoPE tables
 and the draft layer's K/V alike), and the rest of that VRAM holds the expert cache's last slots until a request needs
 it. A request backs its prompt plus 8192 cells before the prompt is read (and 8192 more whenever decode runs past
-that) by taking those slots back; their experts become CPU misses read from their RAM copies, which the RAM copy keeps for exactly this.
-The next request that needs less gives the cells back and the cache refills the slots from RAM. A short request so
-decodes with the cache an 8k context would have, whatever `--max-context` is. With `--parallel` every slot is elastic
-once its share of the context is above 4096 tokens: it backs 4096 cells at startup and grows by 4096, so idle and short
-slots leave their VRAM to the expert cache. The startup line `elastic KV: ...` says how much of the cache is lent this
-way, and each move is logged (`elastic KV: N cells backed ...`). The cache never goes
-below the slots a prompt chunk needs: a request whose KV would take it there, even after the other sessions give back
-the cells they do not hold, is refused with that error, and a reply that grows past it ends with it (a `--parallel`
-slot ends as at its length limit); the engine keeps running.
+that) by taking those slots back; their experts become CPU misses read from their RAM copies. The next request that
+needs less gives the cells back and the cache refills the slots from RAM, so a short request decodes with the cache a
+8k context would have. With `--parallel` a slot whose share is above 4096 tokens backs 4096 cells at startup and grows
+by 4096. An idle conversation's KV stays until requests beside it have run 15 s, then moves to RAM (outside
+`--conversation-cache-mib`, above the RAM floors; else only to the disk tier holding it) when a request needs VRAM or
+the engine is idle; its next turn reads it back. The startup line and each move say `elastic KV: ...` (a move out:
+`slot N's idle conversation ...`). The cache never goes below the slots a prompt chunk needs: a request whose KV would
+take it there even after the other sessions and idle conversations give back what they can is refused with that error,
+and a reply that grows past it ends with it (a `--parallel` slot ends as at its length limit); the engine keeps running.
 
 While other slots are decoding, a new prompt of up to 16384 tokens is read at once: the slots wait for it (a few
 seconds at most), and it is read as in the single-stream path: the same chunks and streamed ring, the CPU pool's
@@ -61,7 +61,7 @@ threshold. A request decoding alone runs the single-stream path and is not affec
 
 At startup the server prints one `[server] kv` line per device with all the session state placed there, for
 example `12.5GiB cuda2 solo=262144 slots=2x262144 draft=0.5GiB`. With elastic KV (the default for a server whose
-`--max-context` is above 8192, or with `--parallel` for slots above 4096 tokens) it reads `0.6/4.4GiB cuda0 elastic`:
+`--max-context` is above 32768, or with `--parallel` for slots above 4096 tokens) it reads `0.6/4.4GiB cuda0 elastic`:
 the memory backed at startup, and what the cache can grow to at `--max-context`. Because that memory is taken from the
 expert cache, the engine warns (`warning: the N batch slots' sessions ... take X GiB of CUDA0 ...`) when it leaves the
 cache short of the expert set, or at under half of what it would hold without the slots, and names the remedies: a smaller `--max-context`, no `--slot-full-context`, fewer `--parallel` slots. If a slot's session
@@ -99,11 +99,11 @@ sizes `GiB`/`MiB`, times `s`. Startup prints one block, starting with a legend:
 [server] sampling temp=1.0 top_p=0.95 top_k=20 min_p=0.0 pres=0.0
 [server] vision   mode=dynamic gpu=0 (RTX 5090) load=per-image
 [server] auto     peer-excl=off resident=64.0GB pool-affinity=auto
-[server] stats    http://127.0.0.1:8080/
+[server] ready    http://127.0.0.1:8080/v1  openai+anthropic  stats http://127.0.0.1:8080/
 [server] loaded   68.4GiB 37.5s  cuda0=26.6GiB ram=41.2GiB cuda1=0.6GiB cuda1-copy=14.2GiB
 [server] kv       2.6/16.3GiB cuda0 elastic slots=4
 [server] slots    par=4 ctx/slot=262144 (slot-full-context), others queue
-[server] ready    http://127.0.0.1:8080/v1  openai+anthropic  ctx=262144 images=on
+[server] weights  loaded, ctx=262144 images=on
 ```
 
 `sampling` marks a value set on the command line `(cli)` or in the config file `(config)`; `auto` is the engine's
@@ -142,7 +142,7 @@ Each request ends with one slot-tagged `done` line:
 
 ## The stats page
 
-The server's own address (`[server] stats` above) serves one page that reads `/metrics`, `/slots` and `/api/logs`
+The server's own address (`stats` on the `[server] ready` line above) serves one page that reads `/metrics`, `/slots` and `/api/logs`
 once a second:
 
 - GPUs: every card the engine uses, with VRAM and 60 s charts of load and power (one card adds temperature; three or
@@ -168,12 +168,12 @@ the folder `conversations` inside the model's cache folder (`~/.cache/basalt/<ha
 prints `[disk] conversations=DIR disk-mib=N` at start. A conversation of at least 8192 tokens that leaves its session
 (another one takes its slot), that the RAM cache evicts, or that the engine still holds when it ends (a stop, an idle
 unload) is written to DIR: one file for its tokens and running state, and shared files for its K/V cache (one per 4096
-cells) and for each checkpoint's state, each named by the tokens it covers and its bytes, so the same conversation
-written again, or another that starts the same way, writes only the blocks and states that are new. A conversation whose
-last checkpoint (the end of its last prompt) is at most 4096 tokens behind is stored as of that checkpoint, with no
-running state of its own: the next turn goes on from there, and a reply sent back as it was is read
-again. A later
-prompt that starts with a stored conversation (its tokens, or one of its checkpoints) reads it back cut at that point
+cells) and for its checkpoint states, each named by the tokens it covers and its bytes, so the same conversation
+written again, or another that starts the same way, writes only the blocks and states that are new. Only the system prompt's
+and the last 3 turn ends' states are written (other checkpoints stay in RAM); a cut at an unstored one goes on from the
+nearest stored state before it. A conversation whose last checkpoint (the end of its last prompt) is at most 4096 tokens
+behind is stored as of that checkpoint, with no running state of its own: the next turn goes on from there, and a reply sent
+back as it was is read again. A later prompt that starts with a stored conversation (its tokens, or one of its checkpoints) reads it back cut at that point
 and goes on from there, after a restart too: the wait is the drive reading the K/V cache. A file is bound to the model file, the stored-conversation format and the settings that change the state
 (the KV type, the rope, the draft layer, control vectors); every part of it carries a hash, and a file that does not
 check out is deleted, never restored. After a second without input (no slot decoding) the engine writes each conversation that has grown 4096 tokens past its
@@ -199,8 +199,9 @@ longer time.
 
 Basalt refuses settings that would leave the machine without memory, and never shrinks what you asked for:
 
-- `--vram-reserve-mib` below 256 is refused at startup: with less VRAM free once everything is loaded, a later
-  allocation can make the driver page GPU memory and requests stall.
+- `--vram-reserve-mib` below 256 is refused at startup on Windows and WSL2: with less VRAM free once everything is
+  loaded, a later allocation can make the driver page GPU memory and requests stall. On Linux, where the driver fails
+  such an allocation instead, the floor is 128.
 - When some experts are read from the SSD (they fit in neither the GPUs nor the RAM copy), the RAM copy leaves a
   floor free for the OS file cache: the RAM margin (2 GiB or 5% of the RAM, the larger) plus the larger of 4 GiB and
   what one prompt chunk reads from the file (up to 3.5 GiB for the lent GPU slots, plus the SSD-held experts of two
@@ -219,7 +220,7 @@ Basalt refuses settings that would leave the machine without memory, and never s
   the one the next request continues): with the disk tier on they go to disk (those it holds no copy of yet), otherwise
   they are dropped. The engine also frees the checkpoint blocks it keeps for reuse and returns its free heap to the OS,
   and a request that arrives waits up to 30 s for the RAM to come back before it starts; one that adds at most 256
-  tokens to the live conversation (the server's wrap-up after a thinking budget) does not wait. Below the guard nothing
+  tokens to the live conversation (the server closing the thinking at its budget) does not wait. Below the guard nothing
   new is parked, and the disk tier neither writes a conversation still in a session nor reads one back (its own floor
   sits 1 GiB above the guard's). A running request continues; it stops with an error only when the RAM is critical:
   under 1 GiB free, or below the guard while the kernel's memory pressure (`/proc/pressure/memory`, avg10) shows tasks
