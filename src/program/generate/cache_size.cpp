@@ -3,6 +3,9 @@
 namespace basalt::program::generate {
 
 int cache_size(Context& context) {
+    auto& adapters = *context.adapters;
+    auto& pack_files = *context.pack_files;
+    auto& stages = *context.stages;
     auto& o = *context.o;
     auto& peer_streamed_share = *context.peer_streamed_share;
     auto& multi_gpu = *context.multi_gpu;
@@ -37,6 +40,22 @@ int cache_size(Context& context) {
             return 1;
         }
         return 0;
+    }
+    if (!o.adapters.empty()) {
+        if (!adapters.bind_weights(wt, pack_files, 0, err)) return fatal_start_error(err);
+        for (const auto& stp : stages)
+            if (!adapters.bind_weights(stp->wt, pack_files, stp->dev, err)) return fatal_start_error(err);
+        for (const std::string& name : adapters.names()) {
+            if (name == "output.weight" || name == "token_embd.weight") continue;
+            auto bound_in = [&](const basalt::core::WeightTable& t) {
+                const basalt::core::WeightRef* w = t.find(name);
+                return w != nullptr &&
+                       ((w->resident && w->data != nullptr) || (w->native_data != nullptr && w->native_type >= 0));
+            };
+            bool bound = bound_in(wt);
+            for (const auto& stp : stages) bound = bound || bound_in(stp->wt);
+            if (!bound) return fatal_start_error(name + ": adapter replacement is not supported at runtime");
+        }
     }
     // what the peer's prompt buffers take on its card: they are allocated after its tier is filled, so the tier leaves them free
     auto peer_prompt_bytes = [&]() -> uint64_t {

@@ -11,6 +11,50 @@ bool draft_ctx_rows(int head_type) { return head_type == 13 || head_type == GGML
 bool draft_rows_mapped(int head_type) { return head_type == 14 && !draft_ctx_rows(head_type); }
 }  // namespace
 
+bool MtpDrafter::refresh_shared_head(std::string& err) {
+    const OnDevice on_device(device_);
+    auto checked = [&](cudaError_t status, const char* what) {
+        if (status == cudaSuccess) return true;
+        err = std::string("mtp refresh: ") + what + ": " + cudaGetErrorString(status);
+        return false;
+    };
+    int current = -1;
+    if (!checked(cudaGetDevice(&current), "querying device")) return false;
+    if (device_ < 0 || current != device_) { err = "mtp refresh: owning device is not current"; return false; }
+    if (head_ == nullptr || !head_->loaded()) { err = "mtp refresh: the native head is not bound"; return false; }
+    for (cudaStream_t stream : {cs_, cs2_, cs3_})
+        if (stream && !checked(cudaStreamSynchronize(stream), "draining stream")) return false;
+    if (dhead_ == nullptr && proxy_ == nullptr) return true;
+    const int64_t row_bytes = (int64_t) head_->row_bytes();
+    const int64_t leading = xbase_ + n_xused_;
+    try {
+        if (rows_mapped_) {
+            basalt::kernels::q6k_proxy_pack(head_->weights(), 0, n_tier1_, proxy_, n_tier1_, cs_, dvocab_);
+            if (!checked(cudaGetLastError(), "packing mapped head proxy")) return false;
+            return checked(cudaStreamSynchronize(cs_), "finishing mapped head refresh");
+        }
+        // The unmapped gap between the live context rows and tier 2 must not enter the gather.
+        auto gather = [&](int64_t first, int64_t n) {
+            if (n <= 0) return true;
+            basalt::kernels::gather_rows((const uint8_t*) head_->weights(), row_bytes, dvocab_ + first, n,
+                                         dhead_ + first * row_bytes, cs_);
+            return checked(cudaGetLastError(), "gathering head rows");
+        };
+        if (!gather(0, leading) || !gather(n_tier1_, n_dvocab_ - n_tier1_)) return false;
+        if (proxy_ != nullptr && leading > 0) {
+            if (head_->type() == 13)
+                basalt::kernels::q5k_proxy_pack(dhead_, 0, leading, proxy_, n_tier1_, cs_);
+            else
+                basalt::kernels::q6k_proxy_pack(dhead_, 0, leading, proxy_, n_tier1_, cs_);
+            if (!checked(cudaGetLastError(), "packing head proxy")) return false;
+        }
+    } catch (const std::exception& e) {
+        err = std::string("mtp refresh: ") + e.what();
+        return false;
+    }
+    return checked(cudaStreamSynchronize(cs_), "finishing head refresh");
+}
+
 uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int head_type, int64_t n_vocab) const {
     uint64_t bytes = head_logits_ ? 0 : (uint64_t) max_t_ * (uint64_t) n_vocab * sizeof(float);
     if (dhead_ == nullptr && !rows_mapped_) {

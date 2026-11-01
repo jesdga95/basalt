@@ -212,6 +212,7 @@ def make_handler(svc: Service):
             return False
 
         def do_GET(self):
+            svc.reset_request()
             path = self.path.split("?")[0].rstrip("/")
             if path.startswith("/fonts/"):
                 name = path[len("/fonts/"):]
@@ -278,17 +279,20 @@ def make_handler(svc: Service):
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
                     loaded = svc.loaded()
-                    model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
-                             "meta": {"n_ctx": svc.engine.max_context},
-                             "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
-                                              "output_modalities": ["text"]}}
+                    status = "loaded"
                     if svc.loading:
-                        model["status"] = {"value": "loading"}
+                        status = "loading"
                         loaded = True
-                    elif not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
-                        model["status"] = {"value": "unloaded"}   # listed, loads on use
+                    elif not loaded and (len(svc.model_names) > 1 or svc.idle_unload_s or
+                                         getattr(svc.engine, "unloaded", False)):
+                        status = "unloaded"                    # all variants share one process and load on use
                         loaded = True
-                    self._json(200, {"object": "list", "data": [model] if loaded else []})
+                    models = [{"id": name, "object": "model", "status": {"value": status},
+                               "meta": {"n_ctx": svc.engine.max_context},
+                               "architecture": {
+                                   "input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
+                                   "output_modalities": ["text"]}} for name in svc.model_names]
+                    self._json(200, {"object": "list", "data": models if loaded else []})
             elif path == "/props":
                 if self._authorized():
                     self._props()
@@ -303,6 +307,7 @@ def make_handler(svc: Service):
                 self._json(404, {"error": {"message": "not found"}})
 
         def do_POST(self):
+            svc.reset_request()
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # clients post /v1/messages?beta=true
@@ -342,6 +347,7 @@ def make_handler(svc: Service):
                     if req.get("model") not in (None, *svc.served_names()):
                         self._json(404, {"error": {"message": "model not found"}})
                         return
+                    svc.select_model(req.get("model") or svc.model_names[0])
                     if path == "/v1/unload":
                         result = svc.unload()
                         if result == "busy":
@@ -375,11 +381,12 @@ def make_handler(svc: Service):
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 requested = req.get("model")
-                if not (isinstance(requested, str) and requested in svc.served_names()):
+                try:
+                    svc.select_model(requested)
+                except ValueError:
                     self._unknown_model(path, requested)
                     return
                 svc.request_ctx.path = path
-                svc.request_ctx.model = svc.model            # always the served name, never the requested one
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path == "/v1/chat/completions":
@@ -420,7 +427,9 @@ def make_handler(svc: Service):
 
         def _props(self):
             model = parse_qs(urlsplit(self.path).query).get("model", [svc.model])[0]
-            if model != svc.model:
+            try:
+                svc.select_model(model)
+            except ValueError:
                 self._json(404, {"error": {"message": "model not found"}})
                 return
             try:

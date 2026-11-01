@@ -10,6 +10,8 @@
 #include <optional>
 
 namespace basalt::core {
+class NativeEmbed;
+class RuntimeAdapters;
 class ModelFile;
 class MtpDrafter;
 class RemoteExperts;
@@ -36,6 +38,7 @@ struct Context {
     Options& o;
     std::string& ppl_base;
     std::string& ppl_out;
+    basalt::core::RuntimeAdapters& adapters;
     basalt::core::ModelFile& model_file;
     const bool& peer_streamed_share;
     std::vector<int64_t>& split_at;
@@ -74,6 +77,7 @@ struct Context {
     const basalt::core::QsaState* const& mtp_kv;
     const int64_t& n_vocab;
     std::optional<basalt::program::grammar::PackVocab>& grammar_vocab;
+    basalt::core::NativeEmbed& native_embed;
     basalt::core::NativeHead& native_head;
     basalt::core::NativeHead& mtp_head;
     basalt::core::FileExpertSource& src;

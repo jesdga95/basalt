@@ -507,6 +507,26 @@ ConversationStore::~ConversationStore() {
     if (thread_.joinable()) thread_.join();
 }
 
+bool ConversationStore::select_identity(uint64_t identity, std::string& error) {
+    if (!open_) { error = "conversation store: not open"; return false; }
+    if (identity == identity_) return true;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        stop_ = true;
+    }
+    cv_.notify_all();
+    if (thread_.joinable()) thread_.join();
+    open_ = false;
+    stop_ = busy_ = false;
+    entries_.clear();
+    parts_.clear();
+    queue_.clear();
+    queue_bytes_ = clock_ = 0;
+    stats_ = {};
+    read_bufs_.clear();
+    return open(dir_, identity, budget_, error);
+}
+
 bool ConversationStore::open(const std::string& dir, uint64_t identity, uint64_t budget, std::string& error) {
     if (open_) { error = "conversation store: already open"; return false; }
     if (dir.empty() || !basalt::platform::make_dirs(dir)) {

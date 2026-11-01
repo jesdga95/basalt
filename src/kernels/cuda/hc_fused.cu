@@ -1408,6 +1408,31 @@ bool hc8_view(const void* w, Hc8View& v) {
     return true;
 }
 
+bool hc8_refresh(const void* key, const uint16_t* staged_bf16, int rows, int cols) {
+    if (key == nullptr || staged_bf16 == nullptr || rows <= 0 || cols <= 0 || cols % G8 != 0) return false;
+    std::lock_guard<std::mutex> lk(g_hc8_mu);
+    const auto it = g_hc8.find(key);
+    if (it == g_hc8.end()) return false;
+    const Hc8Copy& c = it->second;
+    if (c.rows != rows || c.cols != cols) return false;
+    int dev = 0;
+    cudaPointerAttributes src{}, dst{};
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaPointerGetAttributes(&src, staged_bf16) != cudaSuccess ||
+        cudaPointerGetAttributes(&dst, c.q) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    if (src.type != cudaMemoryTypeDevice || dst.type != cudaMemoryTypeDevice || src.device != dev ||
+        dst.device != dev)
+        return false;
+    if (cudaGetLastError() != cudaSuccess) return false;
+    const int64_t groups = (int64_t) rows * cols / G8;
+    hc8_quant_kernel<<<(unsigned) ((groups + 255) / 256), 256>>>(staged_bf16, groups, cols / G8, c.srow, c.q, c.s,
+                                                             nullptr);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    return cudaDeviceSynchronize() == cudaSuccess;
+}
+
 void hc8_dequant_bf16(const Hc8View& v, int64_t row0, int64_t n, uint16_t* out, void* stream) {
     if (n <= 0) return;
     const int64_t units = n * v.cols / 8;

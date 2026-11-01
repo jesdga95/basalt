@@ -16,6 +16,7 @@ void usage() {
                  "  --model FILE         the .basalt model file (required): the dense weights, experts, source tensors\n"
                  "                       (embedding, PLE table, native projections, head), draft layer, expert profile\n"
                  "                       and 8-bit hyper-connection copies all come from it\n"
+                 "  --adapter FILE...    --serve: runtime adapter group of .basalt adapter files (repeatable)\n"
                  "  --dump-hc8 FILE      load as usual, write the 8-bit hyper-connection copies to FILE (the layout in\n"
                  "                       basalt/core/model_file.hpp; the converter stores it as the `hc8` section), exit\n"
                  "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"

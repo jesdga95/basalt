@@ -109,6 +109,15 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> tuple[list[str],
         if act is None:
             raise ValueError(f'server.{key}: not a server option (engine flags go under "engine")')
         flag = "--" + name
+        if name == "adapter":
+            if (not isinstance(value, list) or not value
+                    or any(not isinstance(group, list) or not group
+                           or any(not isinstance(p, str) or not p.strip() for p in group)
+                           for group in value)):
+                raise ValueError(f"server.{key}: expected a nonempty list of nonempty lists of paths")
+            for group in value:
+                argv += [flag, *(str(here / os.path.expanduser(p)) for p in group)]
+            continue
         if name == "vision":                               # a mode; booleans are refused
             try:
                 mode = vision_mode(value)
@@ -359,6 +368,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--mock-engine", action="store_true",
                     help="run a scripted engine instead of the model, for clients and tests (no --model needed)")
     ap.add_argument("--model", help="the .basalt model file: the engine, tokenizer, sampling and vision come from it")
+    ap.add_argument("--adapter", dest="adapters", action="append", nargs="+", metavar="PATH",
+                    help="serve an ordered adapter composition alongside the base model; repeat for another variant")
     ap.add_argument("--engine-bin", help=argparse.SUPPRESS)      # set by `basalt serve`
     ap.add_argument("--alias", help="the model name the API reports (default: the name stored in the model file)")
     ap.add_argument("--parallel", type=parallel_count, metavar="N",

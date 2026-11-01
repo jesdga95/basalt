@@ -38,7 +38,7 @@ bool checkpoint_restore(const ConvCheckpoint& c, basalt::core::SessionState& ss,
 /// The identity parked conversations on disk are written under (conversation_store.hpp): the model file
 /// (its size and samples of its bytes) and the settings that change a state's bytes - the K/V type, the rope, the draft
 /// layer, the image encoder, control vectors.  A file of another identity is never restored.
-uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeometry& g) {
+uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeometry& g, size_t model) {
     using basalt::core::conversation_store_hash;
     char num[512];
     std::snprintf(num, sizeof num, " rope %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g cvec %d %d %d %d", o.rope_scale,
@@ -51,18 +51,23 @@ uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeomet
     const int64_t geo[] = {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_v_heads, g.n_head_kv,
                            g.head_dim, g.idx_key_dim, g.n_expert, g.n_ff};
     h = conversation_store_hash(geo, sizeof geo, h);
-    uint64_t size = 0;
-    basalt::platform::file_size(o.model, size);
-    h = conversation_store_hash(&size, sizeof size, h);
-    const int fd = basalt::platform::open_fd_utf8(o.model);
     std::vector<uint8_t> buf((size_t) 64 << 10);
-    const uint64_t n = std::min<uint64_t>(buf.size(), size);
-    for (int i = 0; i < 16 && fd >= 0 && n > 0; ++i) {
-        const uint64_t off = (size - n) / 15 * (uint64_t) i;
-        if (!basalt::platform::pread_all(fd, buf.data(), n, off)) break;
-        h = conversation_store_hash(buf.data(), (size_t) n, h);
-    }
-    basalt::platform::close_fd(fd);
+    auto file_identity = [&](const std::string& path) {
+        uint64_t size = 0;
+        basalt::platform::file_size(path, size);
+        h = conversation_store_hash(&size, sizeof size, h);
+        const int fd = basalt::platform::open_fd_utf8(path);
+        const uint64_t n = std::min<uint64_t>(buf.size(), size);
+        for (int i = 0; i < 16 && fd >= 0 && n > 0; ++i) {
+            const uint64_t off = (size - n) / 15 * (uint64_t) i;
+            if (!basalt::platform::pread_all(fd, buf.data(), n, off)) break;
+            h = conversation_store_hash(buf.data(), (size_t) n, h);
+        }
+        basalt::platform::close_fd(fd);
+    };
+    file_identity(o.model);
+    if (model > 0)
+        for (const std::string& path : o.adapters[model - 1]) file_identity(path);
     return h;
 }
 
@@ -566,7 +571,7 @@ int Runtime::init_conversations() {
         if (o.prompt_cache <= 0 || !stages.empty()) {
             basalt::log::warn("basalt serve", "conversation cache on disk off: %s",
                               o.prompt_cache <= 0 ? "--prompt-cache 0" : "a layer split");
-        } else if (!disk.open(o.conversation_cache_dir, conversation_identity(o, g),
+        } else if (!disk.open(o.conversation_cache_dir, conversation_identity(o, g, adapters.current()),
                               (uint64_t) o.conversation_cache_disk_mib << 20, de)) {
             basalt::log::warn("basalt serve", "conversation cache on disk off: %s", de.c_str());
         } else {

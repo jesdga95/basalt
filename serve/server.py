@@ -85,6 +85,8 @@ def main() -> int:
         check_gpu(a.gpu)
     except ValueError:
         fail(f"--gpu {gpu_text(a.gpu)}: expected numbers like 0 or 0,1, or auto")
+    if a.adapters and not a.model:
+        fail("--adapter needs --model")
     if not a.mock_engine and not (a.model and a.engine_bin):
         fail("the server needs --model and the engine binary: run it as basalt serve --config FILE (or --mock-engine)")
     if (file_engine or cli_engine) and not a.model:
@@ -97,6 +99,8 @@ def main() -> int:
             known = engine_flags_of(a.engine_bin)
             check_engine_flags(file_engine, known, f"--config {a.config}")
             check_engine_flags(cli_engine, known, "command line")
+            if a.adapters:
+                check_engine_flags(["--adapter"], known, "adapter")
         except ValueError as e:
             fail(str(e))
         mode = a.vision
@@ -104,7 +108,7 @@ def main() -> int:
         try:
             cfg.update({k: v for k, v in modelfile.model_config(
                 a.model, a.engine_bin, vision=vision_arg,
-                engine_words=file_engine + cli_engine).items()
+                engine_words=file_engine + cli_engine, adapters=a.adapters, alias=a.alias).items()
                 if k not in cfg})
         except (OSError, ValueError, KeyError) as e:
             fail(f"{a.model}: {e}")
@@ -129,7 +133,7 @@ def main() -> int:
             print(engine_line(file_engine, cli_engine,
                                     (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None,
                                     grammar_entry(a.grammar, sys.argv[1:], used_argv)), flush=True)
-    if a.alias:
+    if a.alias and not a.model:
         cfg["model_name"] = a.alias
     try:                                                # fail fast if the port is taken
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
@@ -197,7 +201,7 @@ def main() -> int:
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
-                  grammar_engine=bool(a.mock_engine or has_grammar))
+                  grammar_engine=bool(a.mock_engine or has_grammar), model_names=cfg.get("model_names"))
     svc.logs = logs
     if any(x == "--api-key" and i + 1 < len(used_argv) and not used_argv[i + 1].strip() or x.strip() == "--api-key="
            for i, x in enumerate(used_argv)):

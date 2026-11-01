@@ -161,7 +161,7 @@ target_link_libraries(basalt-plan PRIVATE plan)
 
 # ---- core (GPU runtime) ---------------------------------------------
 add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
-                             src/core/layout.cpp src/core/model_file.cpp)
+                             src/core/layout.cpp src/core/model_file.cpp src/core/model_adapter.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
 # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
@@ -324,7 +324,8 @@ add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/exper
   src/core/mtp/draft.cpp
   src/core/mtp/stores.cpp
   src/core/mtp/batching.cpp
-  src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/conversation_store.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp)
+  src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/conversation_store.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp
+  src/core/runtime_adapters.cpp)
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(engine PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
 if(BUILD_TESTING)
@@ -407,6 +408,23 @@ if(BUILD_TESTING)
   basalt_embed_manifest(model_file_test)
   basalt_cpu_test(NAME model_file_test COMMAND model_file_test)
   set_tests_properties(model_file_test PROPERTIES TIMEOUT 60)
+  add_executable(model_adapter_test tests/core/model_adapter_test.cpp src/core/model_adapter.cpp src/core/model_file.cpp)
+  target_link_libraries(model_adapter_test PRIVATE artifact)
+  basalt_embed_manifest(model_adapter_test)
+  basalt_cpu_test(NAME model_adapter_test COMMAND model_adapter_test)
+  set_tests_properties(model_adapter_test PROPERTIES TIMEOUT 60)
+  add_executable(runtime_adapters_validation_test src/core/runtime_adapters_validation_test.cpp)
+  target_link_libraries(runtime_adapters_validation_test PRIVATE engine)
+  basalt_cpu_test(NAME runtime_adapters_validation_test COMMAND runtime_adapters_validation_test)
+  set_tests_properties(runtime_adapters_validation_test PROPERTIES TIMEOUT 60)
+  add_executable(hc8_refresh_test tests/cuda/hc8_refresh_test.cpp)
+  target_link_libraries(hc8_refresh_test PRIVATE engine)
+  basalt_gpu_test(NAME hc8_refresh_test COMMAND hc8_refresh_test)
+  set_tests_properties(hc8_refresh_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+  add_executable(mtp_head_refresh_test tests/cuda/mtp_head_refresh_test.cpp)
+  target_link_libraries(mtp_head_refresh_test PRIVATE engine)
+  basalt_gpu_test(NAME mtp_head_refresh_test COMMAND mtp_head_refresh_test)
+  set_tests_properties(mtp_head_refresh_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   # a PLE key held unquantized in the dense index stays in the arena; a quantized key row loads as before
   add_executable(native_dense_ple_key_test tests/core/native_dense_ple_key_test.cpp)
   target_link_libraries(native_dense_ple_key_test PRIVATE engine)
@@ -649,6 +667,11 @@ basalt_embed_manifest(iq_parity)
 # BUILD directory (the source tree is not touched).  The CTest fixture makes generation-to-test order
 # explicit even under parallel execution; a fixture-generation failure fails iq_parity with it.
 find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  basalt_cpu_test(NAME model_adapter_python_test COMMAND ${Python3_EXECUTABLE} -m unittest tools.test_model_adapter
+                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  set_tests_properties(model_adapter_python_test PROPERTIES TIMEOUT 60)
+endif()
 
 # appending a community row to docs/community/benchmarks.json: formatting cases, and a byte comparison with
 # tools/check_benchmarks.py --fix (python3)

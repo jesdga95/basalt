@@ -41,6 +41,12 @@ initialization operations allocate buffers and capture graphs in execution order
 Parameterized caches and draft policies are emplaced at their initialization
 point. Request-local references remain borrowed views of the runtime's sessions.
 
+Runtime adapter groups are opened by startup and borrowed through `Context`.
+`model=M` selects a group between drained requests; selection refreshes derived
+weights and drops live, checkpoint, parked-RAM and draft state. Active batch
+slots prevent a switch. The disk cache indexes the selected model's identity,
+including its adapter files, and drains old-model writes before changing identity.
+
 The protocol text and error paths are shared contracts with the Python server and
 benchmark client. A structural change preserves those contracts and is checked
 against a frozen engine with fixed expert placement, including batch slots,

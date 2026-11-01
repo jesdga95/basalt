@@ -443,6 +443,37 @@ int main() {
         CHECK(same_state(got.live, sb.checkpoints[1]) && same_state(got.checkpoints[0], sa.checkpoints[0]));
         remove_dir(d3);
     }
+    {
+        const std::string switched = dir + "-models";
+        {
+            ConversationStore st;
+            std::string err;
+            CHECK(!st.select_identity(id, err));
+            CHECK(st.open(switched, id, 1ull << 30, err));
+            CHECK(st.put(SavedConversation(src), 1ull << 30));
+            // Switching drains pending writes under their original identity.
+            CHECK(st.select_identity(id + 1, err));
+            std::vector<int32_t> p = ids;
+            p.push_back(-5);
+            CHECK(st.best(p.data(), p.size(), {}, true).tokens == 0);
+            SavedConversation adapted = src;
+            adapted.live.gdn[0] ^= 1;
+            CHECK(st.put(SavedConversation(adapted), 1ull << 30));
+            CHECK(st.select_identity(id, err));
+            auto m = st.best(p.data(), p.size(), {}, true);
+            CHECK(m.tokens == (int64_t) ids.size());
+            SavedConversation got;
+            CHECK(st.load(m, got, err));
+            CHECK(same_state(got.live, src.live));
+            CHECK(st.select_identity(id + 1, err));
+            CHECK(st.select_identity(id + 1, err));
+            m = st.best(p.data(), p.size(), {}, true);
+            CHECK(m.tokens == (int64_t) ids.size());
+            CHECK(st.load(m, got, err));
+            CHECK(same_state(got.live, adapted.live));
+        }
+        remove_dir(switched);
+    }
     std::vector<basalt::platform::DirFile> left;
     if (basalt::platform::list_files(dir, left))
         for (const auto& f : left) basalt::platform::remove_file(dir + "/" + f.name);

@@ -45,6 +45,81 @@ Flow Request::restore() {
         std::printf("ERR %s\n", runtime_.err.c_str());
         return Flow::error;
     }
+    if ((size_t) req_model != runtime_.adapters.current()) {
+        if (runtime_.batch_on() || (runtime_.piped && runtime_.pipe_inflight())) {
+            std::printf("ERR adapters: cannot switch models while batch slots are active\n");
+            return Flow::next;
+        }
+        runtime_.ckd_finish();
+        runtime_.apply_pending(true);
+        if (!runtime_.xq_drain()) {
+            std::printf("ERR adapters: an adaptive refill failed\n");
+            return Flow::error;
+        }
+        const size_t old_model = runtime_.adapters.current();
+        const size_t new_model = (size_t) req_model;
+        std::set<std::string> changed;
+        for (const std::string& name : runtime_.adapters.names())
+            if (runtime_.adapters.changed(old_model, new_model, name)) changed.insert(name);
+        if (runtime_.mtp_on && !runtime_.mtp.reset_model_state(runtime_.err)) {
+            std::printf("ERR %s\n", runtime_.err.c_str());
+            return Flow::error;
+        }
+        if (!runtime_.adapters.select(new_model, runtime_.err)) {
+            std::printf("ERR %s\n", runtime_.err.c_str());
+            return Flow::error;
+        }
+        if (changed.count("token_embd.weight")) {
+            const basalt::core::AdapterTensor* src_emb = runtime_.adapters.source(new_model, "token_embd.weight");
+            if (src_emb == nullptr || !runtime_.native_embed.replace(src_emb->data, runtime_.err)) {
+                std::printf("ERR %s\n", runtime_.err.empty() ? "adapters: missing token_embd.weight source" : runtime_.err.c_str());
+                return Flow::error;
+            }
+        }
+        if (changed.count("output.weight")) {
+            const basalt::core::AdapterTensor* src_out = runtime_.adapters.source(new_model, "output.weight");
+            basalt::core::NativeHead& head_ref = runtime_.last_st ? runtime_.last_st->head : runtime_.native_head;
+            const basalt::core::OnDevice on_head(runtime_.last_st ? runtime_.last_st->dev : -1);
+            bool refreshed = src_out != nullptr && head_ref.replace(src_out->data, runtime_.err);
+            if (refreshed && runtime_.multi_gpu && runtime_.mtp_on) {
+                const basalt::core::OnDevice on_mtp(0);
+                refreshed = runtime_.mtp_head.replace(src_out->data, runtime_.err);
+            }
+            if (!refreshed || (runtime_.mtp_on && !runtime_.mtp.refresh_shared_head(runtime_.err))) {
+                std::printf("ERR %s\n", runtime_.err.empty() ? "adapters: missing output.weight source" : runtime_.err.c_str());
+                return Flow::error;
+            }
+        }
+        for (int st = 0; st < runtime_.n_stages; ++st) {
+            if (!runtime_.stage_ver(st).refresh_weights(changed, runtime_.err)) {
+                std::printf("ERR %s\n", runtime_.err.c_str());
+                return Flow::error;
+            }
+        }
+        if (runtime_.disk.enabled() &&
+            !runtime_.disk.select_identity(conversation_identity(runtime_.o, runtime_.g, new_model), runtime_.err)) {
+            std::printf("ERR %s\n", runtime_.err.c_str());
+            return Flow::error;
+        }
+        runtime_.live.clear();
+        runtime_.live_imgs.clear();
+        runtime_.live_ok = false;
+        runtime_.checks.clear();
+        runtime_.conversations->clear();
+        runtime_.conversations->take_spilled();
+        runtime_.solo_draft_in0 = false;
+        for (BSlot& sl : runtime_.bs) {
+            sl.ids.clear();
+            sl.imgs.clear();
+            sl.checks.clear();
+            sl.cached = false;
+            sl.partial = false;
+            sl.partial_from0 = false;
+            sl.n_dr = 0;
+            if (sl.sfx) sl.sfx->reset();
+        }
+        runtime_.sfx->reset();
+    }
     // A request for a slot other than 0 reads its prompt in that slot: the request path works on a view of the
     // solo session that carries the slot's state, with the slot's own conversation bookkeeping swapped in
     // for the request (the solo one is put back after it)

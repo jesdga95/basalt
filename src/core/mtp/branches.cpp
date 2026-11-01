@@ -43,7 +43,7 @@ bool MtpDrafter::step_end(int j) {
 }
 
 int MtpDrafter::diag_top(int j, int k, int32_t* ids, float* probs) const {
-    if (diag_ == nullptr || j < 0 || j >= max_t_) return 0;
+    if (diag_ == nullptr || j < 0 || j >= n_drafted_) return 0;
     const bool sub = dvocab_ != nullptr;
     const int64_t nv = sub ? (tier_ == 0 ? n_tier1_ : n_dvocab_) : n_vocab_;
     const float* l = diag_ + (size_t) j * (size_t) diag_stride_;

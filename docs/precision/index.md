@@ -29,6 +29,17 @@ Test setup: one RTX 5090 at a 400 W power limit, an RTX 5060 Ti as the peer expe
 - **The reference has its own noise.** The reference is a llama.cpp Q8_0 base, which carries about 0.01 to 0.02 KLD of
   its own noise ([details](quality.md#why-q8_0-against-q8_0-is-not-zero)).
 
+## Runtime adapter replacements
+
+[Adapter compositions](../model-file.md#runtime-compositions) retain each tensor's original encoded type.
+Native projections, heads and embeddings upload their encoded blocks unchanged. Converted dense rows use the
+resident tensor's F32, F16 or BF16 form: F16/BF16 widen exactly to F32, and narrowing rounds to nearest-even.
+HC8 copies are regenerated from the new BF16 rows with the existing quantizer, including owned HC8 storage.
+Verifier products, head proxies and the drafter's shared head are refreshed before generation resumes.
+The mapped Q6_K draft subset rebuilds its own 2-bit proxy from the selected head through its row map;
+reading exact rows directly from the shared head does not remove this derived copy.
+All cached recurrent, KV and prefix state is discarded at a model switch.
+
 ## Decode path precision
 
 Sources are `file:line` under `src/`, `include/basalt/` and `tools/convert/`. Model geometry: n_embd 2560, 4

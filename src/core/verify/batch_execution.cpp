@@ -165,68 +165,79 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     if (dm && !dm_begin(err, nullptr)) return false;
     if (dm && !dm_stage_places(err)) return false;
     order_after_commit();
+    if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(R, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
     const int64_t steps = le_ - lb_;
-    for (int64_t k = 0; k < steps; ++k) {
-        const int64_t l = lb_ + k;
-        const uint32_t want = (uint32_t) (k + 1);
-        const Clock::time_point a = Clock::now();
-        auto last_flush = a;
-        uint32_t spins = 0;
-        progress_at("verify batch: waiting for the GPU to reach layer", l);
-        while (*seq < want) {
-            _mm_pause();
-            if ((++spins & 1023u) != 0) continue;
-            const auto now = Clock::now();
-            if (now - last_flush > std::chrono::microseconds(2000)) {
-                last_flush = now;
-                const cudaError_t q = cudaStreamQuery(cs_);
-                if (q != cudaErrorNotReady && *seq < want) {
-                    err = "verify batch: layer " + std::to_string(l) + " never rang (" +
-                          (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
+    if (ar_on()) {
+        *flag = 1;
+        *(volatile uint32_t*) (h_flag_ + 8) = 1;
+    } else {
+        for (int64_t k = 0; k < steps; ++k) {
+            const int64_t l = lb_ + k;
+            const uint32_t want = (uint32_t) (k + 1);
+            const Clock::time_point a = Clock::now();
+            auto last_flush = a;
+            uint32_t spins = 0;
+            progress_at("verify batch: waiting for the GPU to reach layer", l);
+            while (*seq < want) {
+                _mm_pause();
+                if ((++spins & 1023u) != 0) continue;
+                const auto now = Clock::now();
+                if (now - last_flush > std::chrono::microseconds(2000)) {
+                    last_flush = now;
+                    const cudaError_t q = cudaStreamQuery(cs_);
+                    if (q != cudaErrorNotReady && *seq < want) {
+                        err = "verify batch: layer " + std::to_string(l) + " never rang (" +
+                              (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
+                        return false;
+                    }
+                }
+                if (now - a > std::chrono::seconds(20)) {
+                    err = "verify batch: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000));
                     return false;
                 }
             }
-            if (now - a > std::chrono::seconds(20)) {
-                err = "verify batch: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000));
-                return false;
-            }
-        }
-        const Clock::time_point b = Clock::now();
-        cur_layer_ = want - 1;
-        set_plan_slot();
-        progress_at("verify batch: the CPU experts of layer", l);
-        if (dm) {   // the ring's own rows and tiers: the pool computes the CPU's entries only
-            const basalt::kernels::DmRing& Rg = dm_->h_ring[k];
-            sink_.ext_kind = Rg.kind;
-            if (pool != nullptr) pool(user, dm_->h_x + (size_t) k * dm_->x_stride, Rg.ids, R, ss_->k, h_ymiss_, l);
-            sink_.ext_kind = nullptr;
-        } else if (pool != nullptr) pool(user, h_x_, h_ids_, R, ss_->k, h_ymiss_, l);
-        progress_tick();
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
-        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
-            sink_.counts[0] = 0;
-            sink_.counts[1] = 0;
-            sink_.counts[2] = 0;
-            sink_.start[0] = 0;
-            sink_.start2[0] = 0;
+            const Clock::time_point b = Clock::now();
+            cur_layer_ = want - 1;
+            set_plan_slot();
+            progress_at("verify batch: the CPU experts of layer", l);
+            if (dm) {   // the ring's own rows and tiers: the pool computes the CPU's entries only
+                const basalt::kernels::DmRing& Rg = dm_->h_ring[k];
+                sink_.ext_kind = Rg.kind;
+                if (pool != nullptr) pool(user, dm_->h_x + (size_t) k * dm_->x_stride, Rg.ids, R, ss_->k, h_ymiss_, l);
+                sink_.ext_kind = nullptr;
+            } else if (pool != nullptr) pool(user, h_x_, h_ids_, R, ss_->k, h_ymiss_, l);
+            progress_tick();
             std::atomic_thread_fence(std::memory_order_seq_cst);
-            *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            _mm_sfence();
+            if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
+                sink_.counts[0] = 0;
+                sink_.counts[1] = 0;
+                sink_.counts[2] = 0;
+                sink_.start[0] = 0;
+                sink_.start2[0] = 0;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                *(volatile uint32_t*) h_flagA_ = want;
+                raise_flag(h_flagB_, want);
+            }
+            *flag = want;
+            ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
+            ms_pool += ms_since(b);
         }
-        *flag = want;
-        ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
-        ms_pool += ms_since(b);
     }
     const cudaError_t se = cudaStreamSynchronize(cs_);
     const bool dm_ok = !dm || dm_end(err);
     if (!window_intact(err) || !dm_ok) return false;
     if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
+    if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {
+        *(volatile uint32_t*) h_plan_err_ = 0;
+        err = "verify batch: the zero-doorbell plan met an expert that is not in VRAM (the residency table changed during the window)";
+        return false;
+    }
     if (prof_on_) collect_profile();
     ++windows;
     if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_segs(rows, lens, S, tokens, pos, pool, next_user_, out, err);
@@ -318,6 +329,7 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     gs_split_ = false;
     if (!stage_batch(rows, nullptr, S, base, tokens, pos, err)) return false;
     order_after_commit();
+    if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(S, base)], cs_);
     if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[S], cs_);   // right behind it: every row is kept
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
@@ -331,6 +343,11 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     b_running_ = true;
     b_k_ = 0;
     b_steps_ = le_ - lb_;
+    if (ar_on()) {
+        *(volatile uint32_t*) h_flag_ = 1;
+        *(volatile uint32_t*) (h_flag_ + 8) = 1;
+        b_k_ = b_steps_;
+    }
     b_last_ = Clock::now();
     return true;
 }
@@ -386,6 +403,13 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     if (q == cudaErrorNotReady) return 0;
     if (q != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(q); b_running_ = false; return -1; }
     if (prof_on_) collect_profile();
+    if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {
+        const uint32_t code = *(volatile uint32_t*) h_plan_err_;
+        err = "verify batch: an expert was not in the resident pool at layer " + std::to_string((code >> 16) - 1) +
+              " (expert " + std::to_string(code & 0xFFFFu) + ")";
+        b_running_ = false;
+        return -1;
+    }
     if (last_stage()) {
         if (!sample_rows(S, err)) { b_running_ = false; return -1; }
         for (int t = 0; t < S; ++t) b_out_[t] = ((volatile int32_t*) h_out_)[t];

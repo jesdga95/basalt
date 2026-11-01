@@ -107,6 +107,14 @@ public:
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);
 
+    /// With external decode/prefill/peer work drained, reset before overwriting shared model weights.
+    /// Drains this device's streams and invalidates every sequence; callers must discard resumes and restart at zero.
+    /// Both switch hooks select the owning device, finish synchronously, and preserve graph addresses and draft weights.
+    bool reset_model_state(std::string& err);
+    /// After the bound NativeHead is refreshed in place, refill its mapped subset rows and proxies before any work resumes.
+    /// Preserves the vocabulary mapping, including populated context rows; unused rows remain masked.
+    bool refresh_shared_head(std::string& err);
+
     /// Prompt cells [cell0, cell0 + n): residual rows `R_rows` (device, hc*n_embd each) and `next_tokens` (host,
     /// the token at position cell+1).  Runs in batches of up to max_t rows.
     bool prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
@@ -184,6 +192,7 @@ public:
     }
 
 private:
+    friend struct MtpHeadFixture;
     /// reuse_row: the full layer's row 0 from the catch-up's row *row_ (full, T == 1)
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err, bool reuse_row = false);
     void record_hidden(const float* R, int T, uint8_t* xq, cudaStream_t cs);
@@ -307,6 +316,7 @@ private:
     float *h_prob_ = nullptr, *m_prob_ = nullptr;   // each draft's probability under the draft layer
     float* diag_ = nullptr;                         ///< spec_log: the draft head's logits per chain step (pinned)
     int64_t diag_stride_ = 0;
+    int n_drafted_ = 0;                            ///< valid diagnostic/output rows from the last completed draft
     std::vector<int32_t> diag_map_;                 ///< spec_log: the draft head's row -> token id
     // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head.  A Q6_K head
     // reads its rows from the main head through dvocab_ (rows_mapped_); other formats keep a copy in dhead_.

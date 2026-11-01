@@ -115,14 +115,54 @@ void warm_job(void* ctx, int w, int W, const std::atomic<bool>& stop) {
     if (x == 0x9e3779b97f4a7c15ull) c.sink.fetch_add(x, std::memory_order_relaxed);   // keeps the loads
 }
 
-// Every layer's BF16 router [n_expert x n_embd] with one scale per 32 values, read once: as int8 codes for the peer's
-// warm-up (`q8`, `s8`) and as 4-bit codes in CpuWarm's layout for the CPU pool's (`q4`, `s4`); either may be null.  A
-// prediction only.  False when a layer's router is not such a table.
+// One BF16 router in the peer's int8 and CPU warm-up's packed 4-bit layouts; either output may be null.
+bool router_codes_layer(const WeightRef* w, const ModelGeometry& g, std::vector<uint16_t>& src,
+                        int8_t* q8, float* s8, uint8_t* q4, float* s4, std::string& err) {
+    const int64_t N = g.n_embd, NE = g.n_expert, NB = N / 32;
+    if (w == nullptr || w->bytes != (uint64_t) (NE * N * 2)) {
+        err = "the predictor requires a BF16 router";
+        return false;
+    }
+    src.resize((size_t) (NE * N));
+    const cudaError_t status = cudaMemcpy(src.data(), w->data, (size_t) w->bytes, cudaMemcpyDefault);
+    if (status != cudaSuccess) {
+        err = std::string("router download: ") + cudaGetErrorString(status);
+        return false;
+    }
+    for (int64_t r = 0; r < NE; ++r)
+        for (int64_t b = 0; b < NB; ++b) {
+            float v[32], amax = 0.0f;
+            for (int i = 0; i < 32; ++i) {
+                const uint32_t u = (uint32_t) src[(size_t) (r * N + b * 32 + i)] << 16;
+                std::memcpy(&v[i], &u, 4);
+                amax = std::max(amax, std::fabs(v[i]));
+            }
+            const size_t blk = (size_t) (r * NB + b);
+            if (q8 != nullptr) {
+                const float d = amax / 127.0f;
+                s8[blk] = d;
+                for (int i = 0; i < 32; ++i)
+                    q8[blk * 32 + (size_t) i] = (int8_t) (d > 0.0f ? std::lrintf(v[i] / d) : 0);
+            }
+            if (q4 != nullptr) {
+                const float d = amax / 7.0f;
+                s4[blk] = d;
+                uint8_t* out = q4 + blk * 16;
+                for (int i = 0; i < 16; ++i) {
+                    const long c0 = d > 0.0f ? std::lrintf(v[i] / d) : 0, c1 = d > 0.0f ? std::lrintf(v[i + 16] / d) : 0;
+                    out[i] = (uint8_t) ((std::clamp<long>(c0, -7, 7) + 8) | ((std::clamp<long>(c1, -7, 7) + 8) << 4));
+                }
+            }
+        }
+    return true;
+}
+
+// Every layer's router for the CPU and peer warm-up predictors.
 bool router_codes(const WeightTable& wt, const ModelGeometry& g, std::vector<int8_t>* q8, std::vector<float>* s8,
                   std::vector<uint8_t>* q4, std::vector<float>* s4) {
     const int64_t N = g.n_embd, NE = g.n_expert, L = g.n_layers, NB = N / 32;
     if (NE > basalt::kernels::kDmPredExperts || N % 32 != 0) return false;
-    std::vector<uint16_t> src((size_t) (NE * N));
+    std::vector<uint16_t> src;
     if (q8 != nullptr) {
         q8->assign((size_t) (L * NE * N), 0);
         s8->assign((size_t) (L * NE * NB), 0.0f);
@@ -131,38 +171,14 @@ bool router_codes(const WeightTable& wt, const ModelGeometry& g, std::vector<int
         q4->assign((size_t) (L * NE * N / 2), 0);
         s4->assign((size_t) (L * NE * NB), 0.0f);
     }
+    std::string err;
     for (int64_t l = 0; l < L; ++l) {
-        const WeightRef* w = LayerView(wt, l).get("ffn_gate_inp.weight");
-        if (w == nullptr || w->bytes != (uint64_t) (NE * N * 2)) return false;
-        if (cudaMemcpy(src.data(), w->data, (size_t) w->bytes, cudaMemcpyDefault) != cudaSuccess) {
+        if (!router_codes_layer(LayerView(wt, l).get("ffn_gate_inp.weight"), g, src,
+                                q8 ? q8->data() + l * NE * N : nullptr, s8 ? s8->data() + l * NE * NB : nullptr,
+                                q4 ? q4->data() + l * NE * N / 2 : nullptr, s4 ? s4->data() + l * NE * NB : nullptr, err)) {
             cudaGetLastError();
             return false;
         }
-        for (int64_t r = 0; r < NE; ++r)
-            for (int64_t b = 0; b < NB; ++b) {
-                float v[32], amax = 0.0f;
-                for (int i = 0; i < 32; ++i) {
-                    const uint32_t u = (uint32_t) src[(size_t) (r * N + b * 32 + i)] << 16;
-                    std::memcpy(&v[i], &u, 4);
-                    amax = std::max(amax, std::fabs(v[i]));
-                }
-                const size_t blk = (size_t) ((l * NE + r) * NB + b);
-                if (q8 != nullptr) {
-                    const float d = amax / 127.0f;
-                    (*s8)[blk] = d;
-                    for (int i = 0; i < 32; ++i)
-                        (*q8)[blk * 32 + (size_t) i] = (int8_t) (d > 0.0f ? std::lrintf(v[i] / d) : 0);
-                }
-                if (q4 != nullptr) {   // value i in the low nibble of byte i, value i + 16 in its high nibble, code + 8
-                    const float d = amax / 7.0f;
-                    (*s4)[blk] = d;
-                    uint8_t* out = q4->data() + blk * 16;
-                    for (int i = 0; i < 16; ++i) {
-                        const long c0 = d > 0.0f ? std::lrintf(v[i] / d) : 0, c1 = d > 0.0f ? std::lrintf(v[i + 16] / d) : 0;
-                        out[i] = (uint8_t) ((std::clamp<long>(c0, -7, 7) + 8) | ((std::clamp<long>(c1, -7, 7) + 8) << 4));
-                    }
-                }
-            }
     }
     return true;
 }

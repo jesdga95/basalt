@@ -6,6 +6,7 @@
 #include <vector>
 
 namespace basalt::core {
+struct FileRange;
 
 /// Opt-in native output projection. Uploads unchanged GGUF blocks once at startup and owns its
 /// activation scratch. The normal canonical head remains available for numerical A/B comparisons.
@@ -20,6 +21,8 @@ public:
     NativeHead& operator=(const NativeHead&) = delete;
 
     bool load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err);
+    /// After all readers drain: overwrite the existing weight and proxy allocations from an exact-size range.
+    bool replace(const FileRange& source, std::string& err);
     /// The bytes `load` uploads for `output.weight`, from the GGUF headers only.
     static bool plan_bytes(const std::vector<std::string>& shards, uint64_t& out, std::string& err);
     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
@@ -35,12 +38,14 @@ public:
     const void* vproxy() const { return vproxy_; }
 
 private:
+    friend struct MtpHeadFixture;
     void* weights_ = nullptr;
     void* vproxy_ = nullptr;
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;
     int n_in_ = 0, n_out_ = 0;
     int type_ = -1;
+    int device_ = -1;
 };
 
 /// Plan v0.3 P6: `token_embd.weight` in its GGUF form (the IQ model files), in mapped pinned host memory: a row
@@ -55,6 +60,8 @@ public:
     NativeEmbed(const NativeEmbed&) = delete;
     NativeEmbed& operator=(const NativeEmbed&) = delete;
     bool load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err);
+    /// After all readers drain: overwrite the existing table and refresh its hot rows from an exact-size range.
+    bool replace(const FileRange& source, std::string& err);
     /// Rows for device token ids.
     void gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const;
     /// One row for a host token id.
@@ -76,6 +83,7 @@ private:
     size_t row_ = 0;
     int64_t n_embd_ = 0, n_vocab_ = 0;
     int type_ = -1;
+    int device_ = -1;
 };
 void set_native_embed(const NativeEmbed* e);
 const NativeEmbed* native_embed();

@@ -306,6 +306,154 @@ void Verifier::gs_init() {
                       nk0, HK, own_bytes / 1048576.0, HK - nk0, peer_bytes / 1048576.0);
 }
 
+bool Verifier::refresh_weights(const std::set<std::string>& changed, std::string& err) {
+    if (changed.empty() || dm_ == nullptr) return true;
+    const OnDevice on_device(device_);
+    auto checked = [&](cudaError_t status, const std::string& what) {
+        if (status == cudaSuccess) return true;
+        err = "verify: refresh " + what + ": " + cudaGetErrorString(status);
+        return false;
+    };
+    // OnDevice preserves the caller's device; verify the switch before using device-owned buffers.
+    auto current = [&](int dev) {
+        int actual = -1;
+        if (!checked(cudaGetDevice(&actual), "device query")) return false;
+        if (actual == dev) return true;
+        err = "verify: refresh could not select CUDA" + std::to_string(dev);
+        return false;
+    };
+    if (!current(device_)) return false;
+    auto upload = [&](void* dst, const void* src, size_t bytes, int dev, const std::string& name) {
+        const OnDevice on(dev);
+        return current(dev) && checked(cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice), name + " upload") &&
+               checked(cudaStreamSynchronize(nullptr), name + " upload completion");
+    };
+
+    const ModelGeometry& g = *g_;
+    DecMoe& d = *dm_;
+    const bool peer_predict = d.rq != nullptr ||
+                              std::any_of(d.xp.begin(), d.xp.end(), [](const DecMoe::XPeer& x) { return x.rq != nullptr; });
+    if (d.warm != nullptr || peer_predict) {
+        const size_t nq = (size_t) (g.n_expert * g.n_embd), ns = nq / 32;
+        std::vector<uint16_t> src;
+        std::vector<int8_t> q;
+        std::vector<float> sc;
+        bool stopped = false;
+        for (int64_t l = lb_; l < le_; ++l) {
+            const LayerView v(*wt_, l);
+            const std::string name = v.name("ffn_gate_inp.weight");
+            if (changed.count(name) == 0) continue;
+            uint8_t* rq4 = nullptr;
+            float* rs4 = nullptr;
+            if (d.warm != nullptr) {
+                if (!stopped) { warm_pool_->idle_stop(); stopped = true; }
+                rq4 = d.warm->rq.data() + (size_t) l * nq / 2;
+                rs4 = d.warm->rs.data() + (size_t) l * ns;
+            }
+            if (peer_predict) {
+                q.resize(nq);
+                sc.resize(ns);
+            }
+            if (!router_codes_layer(v.get("ffn_gate_inp.weight"), g, src,
+                                    peer_predict ? q.data() : nullptr, peer_predict ? sc.data() : nullptr, rq4, rs4, err)) {
+                err = "verify: refresh " + name + ": " + err;
+                return false;
+            }
+            auto peer_router = [&](int8_t* pq, float* ps, int dev) {
+                if (pq == nullptr) return true;
+                return upload(pq + (size_t) l * nq, q.data(), nq, dev, name) &&
+                       upload(ps + (size_t) l * ns, sc.data(), ns * sizeof(float), dev, name);
+            };
+            if (!peer_router(d.rq, d.rs, d.pdev)) return false;
+            for (const DecMoe::XPeer& x : d.xp)
+                if (!peer_router(x.rq, x.rs, x.dev)) return false;
+        }
+    }
+
+    if (hs_rows_ > 0 && changed.count("output.weight") != 0) {
+        const OnDevice on(hs_dev_);
+        const size_t rb = head_->row_bytes();
+        if (!current(hs_dev_) ||
+            !checked(cudaMemcpyPeer(hs_w_, hs_dev_, (const uint8_t*) head_->weights() + (size_t) hs_rows_ * rb,
+                                    device_, (size_t) (n_vocab_ - hs_rows_) * rb), "output.weight peer rows") ||
+            !checked(cudaStreamSynchronize(nullptr), "output.weight peer completion"))
+            return false;
+    }
+
+    if (gs_nk0_ > 0) {
+        const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, S = (int) g.ssm_state_size;
+        const int64_t N = g.n_embd, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;
+        const GdnHeadSlice sl{HK, HV, S, gs_nk0_, HK - gs_nk0_}, sl0{HK, HV, S, 0, gs_nk0_};
+        constexpr int kBlockCols = 256;
+        const char* suffixes[] = {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight", "ssm_alpha.weight",
+                                  "ssm_beta.weight", "ssm_conv1d.weight", "ssm_norm.weight", "ssm_dt.bias", "ssm_a"};
+        std::vector<GdnRun> qr, qr0, v1, vs, vs0;
+        std::vector<uint8_t> full, part;
+        size_t ordinal = 0;
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            if (is_qsa_layer(g, l)) continue;
+            GsLayer& L = gs_layers_[ordinal++];
+            const LayerView v(*wt_, l);
+            bool affected = false;
+            for (const char* suffix : suffixes) affected |= changed.count(v.name(suffix)) != 0;
+            if (!affected) continue;
+            if (qr.empty()) {
+                qr = gdn_qkv_runs(sl); qr0 = gdn_qkv_runs(sl0);
+                v1 = gdn_vhead_runs(sl, 1); vs = gdn_vhead_runs(sl, S); vs0 = gdn_vhead_runs(sl0, S);
+            }
+            auto down = [&](const char* suffix, size_t bytes, int type) {
+                const WeightRef* w = v.get(suffix);
+                const void* data = w == nullptr ? nullptr : type < 0 ? w->data : w->native_data;
+                if (data == nullptr || (type < 0 ? w->bytes != bytes : w->native_type != type)) {
+                    err = "verify: refresh " + v.name(suffix) + ": the split weight layout changed";
+                    return false;
+                }
+                full.resize(bytes);
+                return checked(cudaMemcpy(full.data(), data, bytes, cudaMemcpyDeviceToHost), v.name(suffix) + " download");
+            };
+            auto rows = [&](const char* suffix, size_t rb, int64_t nr, const std::vector<GdnRun>& runs,
+                            void* dst, int type = -1, const std::vector<GdnRun>* own_runs = nullptr, void* own = nullptr) {
+                const std::string name = v.name(suffix);
+                if (changed.count(name) == 0) return true;
+                if (!down(suffix, rb * (size_t) nr, type)) return false;
+                auto gather = [&](const std::vector<GdnRun>& r, void* to, int dev) {
+                    part.resize(rb * (size_t) gdn_runs_len(r));
+                    gdn_gather_rows(full.data(), rb, r, part.data());
+                    return upload(to, part.data(), part.size(), dev, name);
+                };
+                return gather(runs, dst, gs_dev_) && (own_runs == nullptr || gather(*own_runs, own, device_));
+            };
+            const size_t rq = basalt::kernels::native_mmvq_weight_bytes(L.tq, (int) N, 1);
+            const size_t rz = basalt::kernels::native_mmvq_weight_bytes(L.tz, (int) N, 1);
+            if (!rows("attn_qkv.weight", rq, C, qr, L.wqkv, L.tq, &qr0, L.wqkv0) ||
+                !rows("attn_gate.weight", rz, ZV, vs, L.wz, L.tz, &vs0, L.wz0) ||
+                !rows("ssm_conv1d.weight", (size_t) g.ssm_d_conv * 4, C, qr, L.conv_w) ||
+                !rows("ssm_alpha.weight", (size_t) N * 2, HV, v1, L.wa) ||
+                !rows("ssm_beta.weight", (size_t) N * 2, HV, v1, L.wb) ||
+                !rows("ssm_dt.bias", 4, HV, v1, L.dt) ||
+                !rows("ssm_a", 4, HV, v1, L.ssm_a))
+                return false;
+            const std::string norm = v.name("ssm_norm.weight");
+            if (changed.count(norm) != 0 &&
+                (!down("ssm_norm.weight", (size_t) S * 4, -1) ||
+                 !upload(L.gamma, full.data(), full.size(), gs_dev_, norm)))
+                return false;
+            const std::string out = v.name("ssm_out.weight");
+            if (changed.count(out) != 0) {
+                const size_t rb = basalt::kernels::native_mmvq_weight_bytes(L.to, (int) ZV, 1);
+                if (!down("ssm_out.weight", rb * (size_t) N, L.to)) return false;
+                auto cols = [&](const GdnHeadSlice& h, const std::vector<GdnRun>& runs, void* dst, int dev) {
+                    part.resize(basalt::kernels::native_mmvq_weight_bytes(L.to, (int) h.zv(), (int) N));
+                    gdn_gather_cols(full.data(), N, ZV, kBlockCols, rb / (size_t) (ZV / kBlockCols), runs, part.data());
+                    return upload(dst, part.data(), part.size(), dev, out);
+                };
+                if (!cols(sl, vs, L.wo, gs_dev_) || !cols(sl0, vs0, L.wo0, device_)) return false;
+            }
+        }
+    }
+    return true;
+}
+
 void Verifier::gs_free() {
     if (gs_dev_ >= 0) {
         const OnDevice on(gs_dev_);

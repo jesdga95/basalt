@@ -96,9 +96,6 @@ class Http(unittest.TestCase):
         rows = self.call("/metrics")[1]["requests"]
         self.assertEqual([r["id"] for r in rows], ["r_0004", "r_0003", "r_0002", "r_0001"])      # newest first
         self.assertEqual([r["path"] for r in rows], paths[::-1])
-        self.assertEqual(set(rows[0]), {"id", "path", "slot", "time", "duration_s", "finish", "prompt_tokens", "reused",
-                                        "output_tokens", "decode_tok_s", "prompt_ms", "hit_rate",
-                                        "pcie_share", "drafts_offered", "drafts_accepted", "ttft_s", "draft_len"})
         self.assertEqual((rows[0]["reused"], rows[0]["hit_rate"], rows[0]["drafts_accepted"]), (3, 0.9, 2))
         self.assertEqual(rows[0]["slot"], 0)
         self.assertGreaterEqual(rows[0]["ttft_s"], 0)

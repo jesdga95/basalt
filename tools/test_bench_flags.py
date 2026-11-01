@@ -78,6 +78,38 @@ class BenchFlags(unittest.TestCase):
             r = subprocess.run([str(BENCH), "--model", "m.basalt", "--seed", bad], capture_output=True, text=True)
             self.assertEqual(r.returncode, 2)
 
+    def test_bench_model_rejects_invalid_indices(self):
+        for value in ([], ["-1"], [""], ["1x"], ["1.5"], ["9223372036854775808"]):
+            with self.subTest(value=value):
+                r = subprocess.run([str(BENCH), "--model", "m.basalt", "--bench-model", *value],
+                                   capture_output=True, text=True, timeout=10,
+                                   env={**os.environ, "CUDA_VISIBLE_DEVICES": "-1"})
+                self.assertEqual(r.returncode, 2)
+                self.assertIn("--bench-model", r.stderr)
+                self.assertEqual(r.stdout, "")
+
+    def test_bench_model_must_name_a_configured_group(self):
+        for groups, model in (([], 1), (["--adapter", "a.basalt"], 2),
+                              (["--adapter", "a.basalt", "b.basalt", "--adapter", "c.basalt"], 3)):
+            with self.subTest(groups=groups, model=model):
+                r = subprocess.run([str(BENCH), "--model", "m.basalt", "--bench-model", str(model), *groups],
+                                   capture_output=True, text=True, timeout=10,
+                                   env={**os.environ, "CUDA_VISIBLE_DEVICES": "-1"})
+                self.assertEqual(r.returncode, 2)
+                self.assertIn("--bench-model", r.stderr)
+                self.assertEqual(r.stdout, "")
+
+    def test_community_refuses_bench_model_even_for_the_base(self):
+        for model in ("0", "1"):
+            with self.subTest(model=model):
+                r = subprocess.run([str(BENCH), "--model", "m.basalt", "--community",
+                                    "--submitter", "test", "--bench-model", model],
+                                   capture_output=True, text=True, timeout=10,
+                                   env={**os.environ, "CUDA_VISIBLE_DEVICES": "-1"})
+                self.assertEqual(r.returncode, 2)
+                self.assertIn("--bench-model", r.stderr)
+                self.assertEqual(r.stdout, "")
+
     def test_built_ins_are_minimal(self):
         cmd = self.command()
         self.assertNotIn("--spec", cmd)

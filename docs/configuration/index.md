@@ -92,6 +92,7 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | Setting | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- |
 | `model` | path | none (required) | The `.basalt` model file. The weights, tokenizer, chat template, drafter, vision projector and default sampling all come from it. |
+| `adapter` | path list, repeatable (`[["a.basalt"], ["a.basalt", "b.basalt"]]` in config) | none | Serve ordered [adapter compositions](../model-file.md#runtime-compositions) alongside the base model in one engine process. Each `--adapter PATH...` group adds a model to `/v1/models` named by joining its adapter names with `+`; requests pick a variant by `model`, same-model cohorts run together, and switching drains active slots, replaces changed dense weights, head or embedding in place, and clears prefix caches. |
 | `alias` | string | the name stored in the model file | The model name the API reports. Change it when a client expects a particular name. |
 | `host` | address | `127.0.0.1` | The address to listen on. `127.0.0.1` is this machine only; `0.0.0.0` also serves the network. Never listen beyond `127.0.0.1` without `api-key`. |
 | `port` | integer | `8080` | The TCP port. |

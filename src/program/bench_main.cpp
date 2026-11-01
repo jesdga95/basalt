@@ -6,6 +6,7 @@
 #include <array>
 #include <cctype>
 #include <chrono>
+#include <charconv>
 #include <cmath>
 #include <csignal>
 #include <cstdarg>
@@ -243,6 +244,8 @@ struct Options {
     std::string community_file;          // --community-file: the table the row is added to
     int quality_chunks = 20, quality_t = 3;
     unsigned long long seed = 0;         // --seed N: the sampling seed of every decode request (0: the engine seeds from the clock)
+    long long bench_model = 0;          // --bench-model: 0 = base, then --adapter groups in command-line order
+    bool bench_model_given = false;
 };
 
 void usage(const std::string& engine) {
@@ -286,6 +289,8 @@ void usage(const std::string& engine) {
         "\n"
         "engine\n"
         "  --model FILE       a .basalt model file\n"
+        "  --bench-model N    resident model for every request: 0 = base (default), 1 = first --adapter group,\n"
+        "                     2 = second group, and so on; recorded in markdown and JSON; not with --community\n"
         "  --gpu A,B,..|auto  the GPUs, as for the server and the engine (default: GPU 0 alone). Every\n"
         "                     other --flag is an engine flag, passed on as given (same names as `basalt`; the engine\n"
         "                     rejects a bad one at startup); --print-command shows the command and exits\n"
@@ -351,6 +356,21 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
             usage(engine);
             std::exit(0);
         } else if (a == "--model") o.model = next("--model");
+        else if (a == "--bench-model") {
+            const std::string v = next("--bench-model");
+            const auto parsed = std::from_chars(v.data(), v.data() + v.size(), o.bench_model);
+            if (parsed.ec != std::errc{} || parsed.ptr != v.data() + v.size() || o.bench_model < 0) {
+                err = "--bench-model needs an integer >= 0";
+                return false;
+            }
+            o.bench_model_given = true;
+        }
+        else if (a == "--adapter") {
+            o.passthrough.push_back(a);
+            const int start = i;
+            while (i + 1 < argc && argv[i + 1][0] != '-') o.passthrough.push_back(argv[++i]);
+            if (i == start) { err = "--adapter needs at least one file"; return false; }
+        }
         else if (a == "--engine") o.engine = next("--engine");
         else if (a == "--spec") o.spec = next("--spec");
         else if (a == "--community") o.community = true;
@@ -405,7 +425,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
     }
     if (o.community) {
         const char* bad = o.sel_decode || o.sel_prefill ? "-t / -p" : o.reps != 1 ? "-r" : o.quality ? "--quality"
-                        : !o.spec.empty() ? "--spec" : !o.sets.empty() ? "--set" : !o.engine.empty() ? "--engine"
+                        : o.bench_model_given ? "--bench-model" : !o.spec.empty() ? "--spec" : !o.sets.empty() ? "--set" : !o.engine.empty() ? "--engine"
                         : !o.gpu.empty() ? "--gpu" : !o.power_label.empty() ? "--power-label" : o.seed ? "--seed" : o.no_windows ? "--no-windows"
                         : o.format != "md" ? "-o" : !o.passthrough.empty() ? o.passthrough[0].c_str() : nullptr;
         if (bad != nullptr) {
@@ -727,6 +747,13 @@ int main(int argc, char** argv) {
     if (!o.spec.empty()) set_arg(args, "--spec", o.spec);
     if (o.model.empty()) for (const auto& a : o.passthrough) args.push_back(a);
     else merge_args(args, o.passthrough);
+    const size_t adapter_groups = (size_t) std::count(args.begin(), args.end(), "--adapter");
+    if ((uint64_t) o.bench_model > adapter_groups) {
+        basalt::log::error("basalt-bench", "--bench-model %lld exceeds %zu adapter groups (0 is the base model)",
+                          o.bench_model, adapter_groups);
+        return 2;
+    }
+    const std::string model_keys = " model=" + std::to_string(o.bench_model);
     // the GPUs, chosen here once as the server chooses them: the engine sees only those cards and says nothing again
     if (!o.model.empty()) {
         std::string gpu_value, gerr;
@@ -895,7 +922,7 @@ int main(int argc, char** argv) {
                 Result r;
                 r.name = kDecode[i].name;
                 r.run = run;
-                if (!eng.request(sampling_keys(kDecode[i].temperature, o.seed), kDecode[i].max_new, decode_ids[i], r.d)) {
+                if (!eng.request(model_keys + sampling_keys(kDecode[i].temperature, o.seed), kDecode[i].max_new, decode_ids[i], r.d)) {
                     basalt::log::error("basalt-bench", "%s (run %d): %s", r.name.c_str(), run, r.d.err.c_str());
                     failed = true;
                     break;
@@ -925,7 +952,7 @@ int main(int argc, char** argv) {
                 r.name = "prefill";
                 r.run = run;
                 r.depth = depth;
-                if (!eng.request(" top_p=0.95 top_k=20", depth == kPrefillBase ? kPrefillBaseDecode : 1, ids, r.d)) {
+                if (!eng.request(model_keys + " top_p=0.95 top_k=20", depth == kPrefillBase ? kPrefillBaseDecode : 1, ids, r.d)) {
                     basalt::log::error("basalt-bench", "pp%lld (run %d): %s", depth, run, r.d.err.c_str());
                     failed = true;
                     break;
@@ -1001,7 +1028,7 @@ int main(int argc, char** argv) {
                 for (size_t k = 0; k < chunks.size(); ++k) {
                     std::vector<int64_t> ids(chunks[k].begin(), chunks[k].begin() + first + 1);
                     Done d;
-                    const std::string keys = fmt(" ppl=%zu ppl_t=%d", k, o.quality_t);
+                    const std::string keys = model_keys + fmt(" ppl=%zu ppl_t=%d", k, o.quality_t);
                     if (!eng.request(keys, (long long) n_ctx - 1 - first, ids, d)) {
                         quality.err = fmt("chunk %zu: %s", k, d.err.c_str());
                         ok = false;
@@ -1094,8 +1121,10 @@ int main(int argc, char** argv) {
     };
 
     std::string rep;
+    if (o.format == "md")
+        rep += fmt("basalt-bench  build %s  power limit %s  bench model %lld\n\n",
+                   BASALT_BENCH_GIT, power.c_str(), o.bench_model);
     if (o.format == "md" && do_perf) {
-        rep += fmt("basalt-bench  build %s  power limit %s\n\n", BASALT_BENCH_GIT, power.c_str());
         std::vector<std::array<std::string, 4>> cells;
         cells.push_back({"test", "t/s", "accept %", "draft len"});
         for (const Row& r : rows) {
@@ -1217,6 +1246,7 @@ int main(int argc, char** argv) {
         }
         j.end_arr();
         j.key("model"); j.str(model);
+        j.key("bench_model"); j.integer(o.bench_model);
         j.key("engine_info");
         j.begin_obj();
         for (const auto& kv : info) { j.key(kv.first); j.str(kv.second); }

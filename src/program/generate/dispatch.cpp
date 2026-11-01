@@ -6,6 +6,7 @@ int dispatch(Context& context) {
     auto& o = *context.o;
     auto& ppl_base = *context.ppl_base;
     auto& ppl_out = *context.ppl_out;
+    auto& adapters = *context.adapters;
     auto& model_file = *context.model_file;
     auto& peer_streamed_share = *context.peer_streamed_share;
     auto& split_at = *context.split_at;
@@ -45,6 +46,7 @@ int dispatch(Context& context) {
     auto& mtp_kv = *context.mtp_kv;
     auto& n_vocab = *context.n_vocab;
     auto& grammar_vocab = *context.grammar_vocab;
+    auto& native_embed = *context.native_embed;
     auto& native_head = *context.native_head;
     auto& mtp_head = *context.mtp_head;
     auto& src = *context.src;
@@ -131,6 +133,7 @@ int dispatch(Context& context) {
             .o = o,
             .ppl_base = ppl_base,
             .ppl_out = ppl_out,
+            .adapters = adapters,
             .model_file = model_file,
             .peer_streamed_share = peer_streamed_share,
             .split_at = split_at,
@@ -169,6 +172,7 @@ int dispatch(Context& context) {
             .mtp_kv = mtp_kv,
             .n_vocab = n_vocab,
             .grammar_vocab = grammar_vocab,
+            .native_embed = native_embed,
             .native_head = native_head,
             .mtp_head = mtp_head,
             .src = src,

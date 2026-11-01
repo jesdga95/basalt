@@ -56,6 +56,8 @@ public:
     /// Creates `dir` if needed and indexes the files written under `identity`.  `budget` bytes of files at most (every
     /// identity's files count).  False with `error` when the directory cannot be used.
     bool open(const std::string& dir, uint64_t identity, uint64_t budget, std::string& error);
+    /// Drains writes, then indexes the same directory for another model; call only between requests.
+    bool select_identity(uint64_t identity, std::string& error);
     bool enabled() const { return open_; }
 
     /// The longest stored prefix of `prompt` (live tokens or a checkpoint, with the same pictures and control-vector

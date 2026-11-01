@@ -224,6 +224,10 @@ class ProcessEngine:
             self.slot_cv = threading.Condition()
         if "sleep_lock" not in self.__dict__:            # sleep, wake and close never overlap, across restarts too
             self.sleep_lock = threading.RLock()
+        if "_model_waiters" not in self.__dict__:
+            self._model_waiters = []
+            self._model_active = 0
+            self._model_current = None
         self.ended, self.unloaded = True, True
         if "loading" not in self.__dict__:               # restart() holds these across its __init__ calls
             self.loading, self.load_status = False, {}
@@ -615,6 +619,11 @@ class ProcessEngine:
         config.checked_sampling); a field left out is not sent.  A temperature of 0 is greedy, as an absent one;
         penalties that change nothing (repetition 1, frequency and presence 0) are not sent."""
         keys = ""
+        if "_model_id" in sampling:
+            model_id = sampling["_model_id"]
+            if isinstance(model_id, bool) or not isinstance(model_id, int) or model_id < 0:
+                raise ValueError("_model_id must be a nonnegative integer")
+            keys += f" model={model_id}"
         t = sampling.get("temperature")
         if _number(t) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
@@ -782,7 +791,8 @@ class ProcessEngine:
                         tail.clear()
                 if line.startswith("BDONE "):
                     f = line.split()
-                    self._note_bdone(slot, f)
+                    if busy is self.slot_busy:
+                        self._note_bdone(slot, f)
                     return "done", f
             return "wait", None
 
@@ -798,7 +808,9 @@ class ProcessEngine:
             return fields
 
         def wait():
-            drain(time.monotonic() + 600.0)
+            state, _ = drain(time.monotonic() + 600.0)
+            if state == "wait" and busy is self.slot_busy:
+                self._silent("the engine did not finish a stopped batch slot within 600 s")
             free()
         threading.Thread(target=wait, daemon=True).start()
         return None
@@ -1220,12 +1232,13 @@ class ProcessEngine:
     def queue_depth(self) -> int:
         """Requests waiting for the engine or a free slot."""
         with self.slot_cv:
-            return self.waiting + len(self.admission)
+            return self.waiting + len(self.admission) + len(self._model_waiters)
 
     def pick_slot(self, prompt: list[int]) -> int | None:
         """A free slot for `prompt` (caller holds slot_cv): longest held prefix, else an empty one, then the least
         recently used; None when none is free."""
-        free = [b for b in self.slot_order if not self.slot_busy[b]]
+        order = getattr(self, "slot_order", range(len(self.slot_busy)))
+        free = [b for b in order if not self.slot_busy[b]]
         if not free:
             return None
         def held_prefix(b):
@@ -1236,7 +1249,58 @@ class ProcessEngine:
             return best
         return min(free, key=lambda b: (bool(self.slot_held[b]), self.slot_used[b]))
 
+    def _admit_model(self, model_id: int, cancel):
+        """Admit contiguous same-model cohorts, never passing an earlier different-model waiter."""
+        ticket = (object(), model_id)
+        with self.slot_cv:
+            self._model_waiters.append(ticket)
+        beat = time.monotonic()
+        try:
+            while not cancel.is_set():
+                if not self.alive() and not getattr(self, "starting", False):
+                    raise EngineDied("the engine stopped while this request waited; it was not sent")
+                with self.slot_cv:
+                    earlier = self._model_waiters[:self._model_waiters.index(ticket)]
+                    same = self._model_current == model_id
+                    drained = not self._model_active and not any(getattr(self, "slot_busy", ()))
+                    ready = self.alive() and not getattr(self, "starting", False)
+                    if ready and all(w[1] == model_id for w in earlier) and (same or drained):
+                        if not same:
+                            self.slot_held = [[] for _ in getattr(self, "slot_held", ())]
+                            self.slot_used = [0.0 for _ in getattr(self, "slot_used", ())]
+                            self.slot_drafts.clear()
+                            self._model_current = model_id
+                        self._model_active += 1
+                        return True
+                    self.slot_cv.wait(timeout=0.5)
+                now = time.monotonic()
+                if now - beat >= 10.0:
+                    beat = now
+                    yield None
+            return False
+        finally:
+            with self.slot_cv:
+                self._model_waiters.remove(ticket)
+                self.slot_cv.notify_all()
+
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        """Hold model admission until the generator and its synchronous cleanup finish."""
+        if "_model_id" not in (sampling or {}):
+            yield from self._generate(ids, max_new, sampling, cancel, embeddings)
+            return
+        model_id = sampling["_model_id"]
+        if isinstance(model_id, bool) or not isinstance(model_id, int) or model_id < 0:
+            raise ValueError("_model_id must be a nonnegative integer")
+        if not (yield from self._admit_model(model_id, cancel)):
+            return
+        try:
+            yield from self._generate(ids, max_new, sampling, cancel, embeddings)
+        finally:
+            with self.slot_cv:
+                self._model_active -= 1
+                self.slot_cv.notify_all()
+
+    def _generate(self, ids, max_new, sampling, cancel, embeddings=None):
         """Yield token ids, and None as a 10 s heartbeat while the engine is quiet. An early-leaving consumer or
         `cancel` makes the engine STOP."""
         if not self.alive():

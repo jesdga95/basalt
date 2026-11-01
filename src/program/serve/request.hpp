@@ -36,6 +36,7 @@ private:
     float req_relax{};
     int req_ppl{};
     int req_ppl_t{};
+    int64_t req_model{};
     int req_clip{};
     std::vector<float> req_bias{};
     std::string emb_path{};

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import struct
 
@@ -142,22 +143,60 @@ class ModelWriter:
         self.f.close()
 
 
+def _json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _json_int(text):
+    value = int(text)
+    if abs(value) > (1 << 64) - 1:
+        raise ValueError("JSON integer out of range")
+    return value
+
+
+def _json_constant(text):
+    raise ValueError(f"invalid JSON constant: {text}")
+
+
 class ModelFile:
     def __init__(self, path: str):
         self.path = path
         with open(path, "rb") as f:
             head = f.read(HEADER_BYTES)
+        if len(head) < HEADER_BYTES:
+            raise ValueError(f"{path}: not a .basalt model file (too short)")
         magic, version, n, file_bytes, _ = HEADER.unpack_from(head, 0)
         if magic != MAGIC:
             raise ValueError(f"{path}: not a .basalt model file")
         if version != VERSION:
             raise ValueError(f"{path}: model file version {version}, this build reads {VERSION}")
-        if os.path.getsize(path) < file_bytes:
-            raise ValueError(f"{path}: truncated ({os.path.getsize(path)} of {file_bytes} bytes)")
+        if n > MAX_SECTIONS:
+            raise ValueError(f"{path}: the section table is too long")
+        if file_bytes < HEADER_BYTES:
+            raise ValueError(f"{path}: invalid file size")
+        actual = os.path.getsize(path)
+        if actual < file_bytes:
+            raise ValueError(f"{path}: truncated ({actual} of {file_bytes} bytes)")
         self.sections: dict[str, tuple[int, int, bytes]] = {}
         for i in range(n):
-            name, off, size, digest, _ = ENTRY.unpack_from(head, HEADER.size + i * ENTRY.size)
-            self.sections[name.rstrip(b"\0").decode()] = (off, size, digest)
+            raw_name, off, size, digest, _ = ENTRY.unpack_from(head, HEADER.size + i * ENTRY.size)
+            name = raw_name.split(b"\0", 1)[0].decode()
+            if not name or b"\0" not in raw_name:
+                raise ValueError(f"{path}: invalid section name")
+            if name in self.sections:
+                raise ValueError(f"{path}: duplicate section: {name}")
+            if off % SECTION_ALIGN or off < HEADER_BYTES or off > file_bytes or size > file_bytes - off:
+                raise ValueError(f"{path}: section {name!r} lies outside the file or is misaligned")
+            for prior, (prior_off, prior_size, _) in self.sections.items():
+                if size and prior_size and off < prior_off + prior_size and prior_off < off + size:
+                    raise ValueError(f"{path}: overlapping sections {prior!r} and {name!r}")
+            self.sections[name] = (off, size, digest)
+        self._meta = None
 
     def names(self) -> list[str]:
         return list(self.sections)
@@ -170,7 +209,20 @@ class ModelFile:
         off, size = self.section(name)
         with open(self.path, "rb") as f:
             f.seek(off)
-            return f.read(size)
+            data = f.read(size)
+        if len(data) != size:
+            raise IOError(f"{self.path}: short read in {name}")
+        return data
+
+    def load_meta(self) -> dict:
+        """Parse the metadata once, rejecting duplicate keys and inexact integer magnitudes."""
+        if self._meta is None:
+            meta = json.loads(self.read("meta").decode("utf-8"), object_pairs_hook=_json_object,
+                              parse_int=_json_int, parse_constant=_json_constant)
+            if not isinstance(meta, dict):
+                raise ValueError(f"{self.path}: meta is not a JSON object")
+            self._meta = meta
+        return self._meta
 
     def verify(self, name: str) -> bool:
         off, size, digest = self.sections[name]

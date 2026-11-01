@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 
 namespace basalt::core {
@@ -147,6 +148,7 @@ struct JsonParser {
         while (p < end) {
             const char c = *p++;
             if (c == '"') return true;
+            if ((unsigned char) c < 0x20) return fail("unescaped control character");
             if (c != '\\') { out += c; continue; }
             if (p >= end) break;
             const char e = *p++;
@@ -184,23 +186,37 @@ struct JsonParser {
         const char* digits = p;
         while (p < end && *p >= '0' && *p <= '9') ++p;
         if (p == digits) return fail("bad number");
+        if (p - digits > 1 && *digits == '0') return fail("bad number");
         bool is_float = false;
-        if (p < end && *p == '.') { is_float = true; ++p; while (p < end && *p >= '0' && *p <= '9') ++p; }
+        if (p < end && *p == '.') {
+            is_float = true;
+            const char* fraction = ++p;
+            while (p < end && *p >= '0' && *p <= '9') ++p;
+            if (p == fraction) return fail("bad number");
+        }
         if (p < end && (*p == 'e' || *p == 'E')) {
             is_float = true;
             ++p;
             if (p < end && (*p == '+' || *p == '-')) ++p;
+            const char* exponent = p;
             while (p < end && *p >= '0' && *p <= '9') ++p;
+            if (p == exponent) return fail("bad number");
         }
-        const std::string tok(a, (size_t) (p - a));
-        if (!is_float && (size_t) (p - digits) <= 19) {
+        if (!is_float) {
+            uint64_t magnitude = 0;
+            for (const char* d = digits; d < p; ++d) {
+                const uint64_t digit = (uint64_t) (*d - '0');
+                if (magnitude > (std::numeric_limits<uint64_t>::max() - digit) / 10)
+                    return fail("integer out of range");
+                magnitude = magnitude * 10 + digit;
+            }
             v.type = Json::Type::Int;
             v.neg = neg;
-            v.u = std::strtoull(std::string(digits, (size_t) (p - digits)).c_str(), nullptr, 10);
+            v.u = magnitude;
             return true;
         }
         v.type = Json::Type::Float;
-        v.f = std::strtod(tok.c_str(), nullptr);
+        v.f = std::strtod(std::string(a, (size_t) (p - a)).c_str(), nullptr);
         return true;
     }
     bool value(Json& v, int depth) {
@@ -223,7 +239,8 @@ struct JsonParser {
                 ++p;
                 Json child;
                 if (!value(child, depth + 1)) return false;
-                v.members[std::move(key)] = std::move(child);
+                if (!v.members.try_emplace(std::move(key), std::move(child)).second)
+                    return fail("duplicate object key");
                 ws();
                 if (p < end && *p == ',') { ++p; continue; }
                 if (p < end && *p == '}') { ++p; return true; }
@@ -271,6 +288,7 @@ bool parse_json(const char* text, size_t n, Json& out, std::string& err) {
 bool ModelFile::open(const std::string& path, std::string& err) {
     path_ = path;
     sections_.clear();
+    file_bytes_ = 0;
     meta_ = Json{};
     meta_loaded_ = false;
     uint64_t actual = 0;
@@ -296,6 +314,7 @@ bool ModelFile::open(const std::string& path, std::string& err) {
         return false;
     }
     if (h.n_sections > kMaxSections) { err = path + ": the section table is too long"; return false; }
+    if (h.file_bytes < kHeaderBytes) { err = path + ": invalid file size"; return false; }
     if (actual < h.file_bytes) {
         err = path + ": truncated (" + std::to_string(actual) + " of " + std::to_string(h.file_bytes) + " bytes)";
         return false;
@@ -306,12 +325,27 @@ bool ModelFile::open(const std::string& path, std::string& err) {
         std::memcpy(&e, head.data() + sizeof(FileHeader) + (size_t) i * sizeof(SectionEntry), sizeof e);
         Section s;
         s.name.assign(e.name, strnlen(e.name, sizeof e.name));
+        if (s.name.empty() || s.name.size() == sizeof e.name) {
+            err = path + ": invalid section name";
+            return false;
+        }
         s.offset = e.offset;
         s.bytes = e.bytes;
         if (s.offset % kSectionAlign != 0 || s.offset < kHeaderBytes || s.offset > file_bytes_ ||
             s.bytes > file_bytes_ - s.offset) {
             err = path + ": section '" + s.name + "' lies outside the file or is misaligned";
             return false;
+        }
+        for (const Section& prior : sections_) {
+            if (prior.name == s.name) {
+                err = path + ": duplicate section '" + s.name + "'";
+                return false;
+            }
+            if (prior.bytes != 0 && s.bytes != 0 &&
+                s.offset < prior.offset + prior.bytes && prior.offset < s.offset + s.bytes) {
+                err = path + ": overlapping sections '" + prior.name + "' and '" + s.name + "'";
+                return false;
+            }
         }
         sections_.push_back(std::move(s));
     }
@@ -376,6 +410,11 @@ MetaValue meta_value(const Json& j) {
 }  // namespace
 
 bool ModelFile::register_gguf_view(std::string& err) const {
+    const Json* kind = meta_.get("kind");
+    if (kind != nullptr && (!kind->is_string() || kind->s != "model")) {
+        err = path_ + ": artifact kind is not a model";
+        return false;
+    }
     const Json* kv = meta_.get("gguf_kv");
     const Json* tensors = meta_.get("tensors");
     const Section* gg = find("gguf");

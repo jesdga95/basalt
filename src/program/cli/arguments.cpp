@@ -265,6 +265,15 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         }
         else if (a == "--ppl-base") ppl_base = next("--ppl-base");
         else if (a == "--ppl-out") ppl_out = next("--ppl-out");
+        else if (a == "--adapter") {
+            std::vector<std::string> group;
+            while (i + 1 < argc && argv[i + 1][0] != '-') group.emplace_back(argv[++i]);
+            if (group.empty()) {
+                basalt::log::error("basalt generate", "missing value for --adapter");
+                return 2;
+            }
+            o.adapters.push_back(std::move(group));
+        }
         else {
             // An unknown flag is an ERROR and not a warning: a typo'd `--max-neww` that silently generated 16
             // tokens would look like a working run.
