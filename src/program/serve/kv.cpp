@@ -134,7 +134,7 @@ bool Runtime::cache_regrow(std::string& e) {
     if (!xcache.sync_queued(ferr)) { e = "elastic KV: " + ferr; return false; }
     res_upload();
     relend();
-    // the tail without RAM copies: the experts in slots below the loan again give their RAM homes back
+    // Release homes for slots below the loan once their experts are resident again.
     if (src.complement_ready() && src.homes_bytes() > 0) {
         const int64_t loan_from = pf_parts.empty() || pf_parts[0].first < 0 ? INT64_MAX : pf_parts[0].first;
         size_t released = 0;
@@ -220,9 +220,7 @@ bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& 
         const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
         const int64_t keep = std::max<int64_t>(0, (xcache.mapped_bytes() - (add - room)) / gran * gran);
         if (kv_keep_routed && !move_routed_below(xcache.slots_after_shrink(keep), "elastic KV", e)) return false;
-        // the tail without RAM copies: when an expert it gives up has no RAM copy, the experts past the cut take
-        // their RAM homes first (with the loan's), so the CPU tier reads them from RAM, not from the file; when
-        // every one has a copy, the loan's homes are left to the request's admission (loan_homes)
+        // Home bare victims before shrinking; admission handles bare loan slots.
         if (src.complement_ready() &&
             basalt::program::cut_gives_up_bare(host_res, xcache.slots_after_shrink(keep), g.n_expert,
                                                [&](int64_t l, int64_t x) { return src.has_resident(l, x); })) {

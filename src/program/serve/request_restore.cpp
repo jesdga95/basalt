@@ -1,5 +1,6 @@
 // src/program/serve/request_restore.cpp - request restore operations.
 #include "request.hpp"
+#include "basalt/program/auto_plan.hpp"
 
 namespace basalt::program::serve {
 
