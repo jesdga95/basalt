@@ -85,8 +85,8 @@ public:
     bool put(SavedConversation&& image, uint64_t queue_cap);
 
     /// Writes `src` now, on the caller's thread, a write buffer at a time (no copy of its state in RAM), after a write
-    /// in progress on the writer thread; otherwise as put() and flush() of its image.  False with `error` when it was
-    /// not written.
+    /// in progress on the writer thread. A failed write leaves the existing index and files intact; an index change
+    /// during the write also refuses publication. False with `error` when it was not written.
     bool write(const ConversationSource& src, std::string& error);
     /// The RAM a write() of `tokens` tokens takes beside its source.
     static uint64_t write_bytes(size_t tokens);
@@ -113,7 +113,7 @@ private:
     void writer();
     using CheckRefs = std::vector<const ConversationCheckpoint*>;   ///< the checkpoints a write stores
     std::shared_ptr<Job> job_locked(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs,
-                                    const CheckRefs& checks, bool cvec, uint64_t bytes);
+                                    const CheckRefs& checks, bool cvec, uint64_t bytes, bool keep_file = false);
     bool write_now(Job& job, const ConversationSource& src, const CheckRefs& checks, uint64_t& wrote, uint64_t& whole);
     bool write_job(Job& job, const ConversationSource& src, const CheckRefs& checks, uint64_t& wrote, uint64_t& whole,
                    std::string& error);
@@ -121,7 +121,7 @@ private:
     void drop_read(const std::string& name, const std::string& part, std::string& error);
     void unlink_unread_locked();             ///< removes the dropped files no read holds open any more
     void evict_locked();
-    void drop_locked(size_t index);
+    void drop_locked(size_t index, bool keep_file = false);
     void release_locked(const std::vector<std::string>& refs);
     void gc_locked(int64_t min_age);         ///< removes unused block and state files at least `min_age` s old
 
@@ -137,7 +137,7 @@ private:
     std::vector<std::unique_ptr<Entry>> entries_;
     std::map<std::string, PartFile> parts_;   ///< block and state files of this identity, by name
     std::deque<std::shared_ptr<Job>> queue_;
-    uint64_t queue_bytes_ = 0, clock_ = 0;
+    uint64_t queue_bytes_ = 0, clock_ = 0, revision_ = 0;
     bool stop_ = false, busy_ = false;
     Stats stats_;
     std::vector<std::unique_ptr<ConversationStoreBuffer>> read_bufs_;   ///< the loads' aligned read buffers, kept

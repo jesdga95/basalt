@@ -606,6 +606,69 @@ int main() {
         clear_dir(dir);
     }
     {
+        // A failed direct replacement leaves the prior file and its referenced data readable, including after reopen.
+        const std::string d2 = dir + "-direct-failure";
+        std::vector<int32_t> old_ids(300);
+        for (size_t i = 0; i < old_ids.size(); ++i) old_ids[i] = (int32_t) (i * 3 + 1);
+        const SavedConversation old = chat(old_ids, {{old_ids.size(), ConversationCheckpoint::kTurnEnd}});
+        const SavedConversation same = image(old_ids, {});
+        std::vector<int32_t> longer_ids = old_ids;
+        longer_ids.resize(5000, 19);
+        const SavedConversation longer = chat(longer_ids, {{old_ids.size(), ConversationCheckpoint::kTurnEnd}});
+        std::vector<int32_t> prompt = old_ids;
+        prompt.push_back(-1);
+        std::string err;
+        {
+            ConversationStore d;
+            CHECK(d.open(d2, id, 1ull << 30, err));
+            CHECK(d.write(source(old), err));
+            const auto before = dir_files(d2);
+            for (const SavedConversation* replacement : {&same, &longer}) {
+                int budget = 0;
+                CHECK(!d.write(source(*replacement, &budget), err));
+                CHECK(d.stats().files == 1 && dir_files(d2) == before);
+                const auto match = d.best(prompt.data(), prompt.size(), {}, true);
+                SavedConversation got;
+                CHECK(match.tokens == (int64_t) old_ids.size() && d.load(match, got, err));
+                CHECK(same_state(got.live, old.checkpoints[0]) && same_kv(got.kv, old.kv));
+            }
+            // A newly queued image changes the index during the direct copy; neither entry is discarded.
+            std::vector<int32_t> other_ids(300, 777);
+            SavedConversation other = image(other_ids, {});
+            ConversationSource concurrent = source(same);
+            auto read = concurrent.kv[0].parts[0].read;
+            bool queued = false;
+            concurrent.kv[0].parts[0].read = [&](uint64_t off, uint8_t* dst, uint64_t n) {
+                if (!queued) {
+                    queued = true;
+                    CHECK(d.put(std::move(other), 1ull << 30));
+                }
+                return read(off, dst, n);
+            };
+            CHECK(!d.write(concurrent, err) && queued);
+            d.flush();
+            CHECK(d.stats().files == 2);
+            const auto match = d.best(prompt.data(), prompt.size(), {}, true);
+            SavedConversation got;
+            CHECK(match.tokens == (int64_t) old_ids.size() && d.load(match, got, err));
+            CHECK(same_state(got.live, old.checkpoints[0]) && same_kv(got.kv, old.kv));
+        }
+        {
+            ConversationStore d;
+            CHECK(d.open(d2, id, 1ull << 30, err));
+            const auto match = d.best(prompt.data(), prompt.size(), {}, true);
+            SavedConversation got;
+            CHECK(match.tokens == (int64_t) old_ids.size() && d.load(match, got, err));
+            CHECK(same_state(got.live, old.checkpoints[0]) && same_kv(got.kv, old.kv));
+            CHECK(d.write(source(same), err));
+            const auto updated = d.best(prompt.data(), prompt.size(), {}, true);
+            SavedConversation replacement;
+            CHECK(updated.tokens == (int64_t) old_ids.size() && d.load(updated, replacement, err));
+            CHECK(same_state(replacement.live, same.live) && same_kv(replacement.kv, same.kv));
+        }
+        clear_dir(d2);
+    }
+    {
         // a source that fails partway: nothing indexed, nothing left behind; a K/V read that fails a block hash drops
         // the conversation
         std::vector<int32_t> cids(9001);

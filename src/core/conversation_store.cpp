@@ -1307,7 +1307,8 @@ size_t stored_end(const std::vector<int32_t>& ids, const CheckRefs& checks) {
 std::shared_ptr<ConversationStore::Job> ConversationStore::job_locked(const std::vector<int32_t>& ids,
                                                                       const std::vector<ConversationImageKey>& imgs,
                                                                       const CheckRefs& checks, bool cvec,
-                                                                      uint64_t bytes) {
+                                                                      uint64_t bytes, bool keep_file) {
+    ++revision_;
     auto job = std::make_shared<Job>();
     job->key = key_of(ids, imgs, cvec);
     job->name = conversation_name(identity_, job->key);
@@ -1328,7 +1329,7 @@ std::shared_ptr<ConversationStore::Job> ConversationStore::job_locked(const std:
                                 imgs_below(e.imgs, deepest) == imgs_below(imgs, deepest);
         if (same || superseded) {
             if (!same) ++stats_.dropped;
-            drop_locked(i);   // its block and state files stay until the writer has used them for this one
+            drop_locked(i, keep_file && e.name == job->name);
             continue;
         }
         ++i;
@@ -1409,20 +1410,61 @@ bool ConversationStore::write(const ConversationSource& src, std::string& error)
         ++direct_waiting_;
     }
     std::lock_guard<std::mutex> wl(write_mu_);
-    std::shared_ptr<Job> job;
+    auto job = std::make_shared<Job>();
+    job->key = key_of(*img.ids, *img.imgs, img.cvec);
+    const std::string name = conversation_name(identity_, job->key);
+    job->name = name + ".direct." + std::to_string((long long) basalt::platform::process_id()) +
+                "." + std::to_string((uintptr_t) this);
+    job->bytes = bytes;
+    job->direct = true;
+    uint64_t revision;
     {
         std::lock_guard<std::mutex> lk(mu_);
         --direct_waiting_;
-        job = job_locked(*img.ids, *img.imgs, checks, img.cvec, bytes);
-        job->direct = true;
+        revision = revision_;
     }
     uint64_t wrote = 0, whole = 0;
-    const bool ok = write_now(*job, img, checks, wrote, whole);
+    bool ok = write_now(*job, img, checks, wrote, whole);
+    Header head{};
+    std::vector<Section> table;
+    uint64_t file_bytes = 0;
+    if (ok) {
+        ReadFd rf(dir_ + "/" + job->name);
+        std::vector<uint64_t> hashes;
+        std::string why;
+        ok = rf.fd >= 0 && basalt::platform::file_size(dir_ + "/" + job->name, file_bytes) &&
+             read_index(rf.fd, file_bytes, head, table, hashes, why);
+    }
     std::lock_guard<std::mutex> lk(mu_);
-    finish_locked(job, ok, wrote, whole);
+    if (ok) ok = revision == revision_ && basalt::platform::rename_replace(dir_ + "/" + job->name, dir_ + "/" + name);
+    if (ok) {
+        auto published = job_locked(*img.ids, *img.imgs, checks, img.cvec, bytes, true);
+        published->held = std::move(job->held);
+        published->blocks = std::move(job->blocks);
+        published->check_keys = std::move(job->check_keys);
+        for (auto& e : entries_) if (e->job == published) {
+            unlinked_.erase(std::remove(unlinked_.begin(), unlinked_.end(), name), unlinked_.end());
+            e->head = head;
+            e->table = std::move(table);
+            e->bytes = file_bytes;
+            e->blocks = std::move(published->blocks);
+            e->check_keys = std::move(published->check_keys);
+            e->refs = std::move(published->held);
+            e->job.reset();
+            break;
+        }
+        stats_.written_bytes += wrote;
+        stats_.whole_bytes += whole;
+        ++stats_.written;
+    } else {
+        basalt::platform::remove_file(dir_ + "/" + job->name);
+        release_locked(job->held);
+        stats_.written_bytes += wrote;
+        ++stats_.dropped;
+    }
     if (queue_.empty()) gc_locked(0);
-    evict_locked();
-    cv_.notify_all();   // the writer goes on with the queue
+    if (ok) evict_locked();
+    cv_.notify_all();
     if (!ok) error = "conversation store: not written";
     return ok;
 }
@@ -1434,7 +1476,8 @@ void ConversationStore::release_locked(const std::vector<std::string>& refs) {
     }
 }
 
-void ConversationStore::drop_locked(size_t index) {
+void ConversationStore::drop_locked(size_t index, bool keep_file) {
+    ++revision_;
     Entry& e = *entries_[index];
     if (e.job) {   // queued: it never reaches the disk
         auto it = std::find(queue_.begin(), queue_.end(), e.job);
@@ -1444,8 +1487,10 @@ void ConversationStore::drop_locked(size_t index) {
         }
         // a write in progress finishes into a file nobody indexes: the writer removes it (see writer)
     } else {
-        if (reading_.count(e.name)) unlinked_.push_back(e.name);   // removed once the read has closed it
-        else basalt::platform::remove_file(dir_ + "/" + e.name);
+        if (!keep_file) {
+            if (reading_.count(e.name)) unlinked_.push_back(e.name);
+            else basalt::platform::remove_file(dir_ + "/" + e.name);
+        }
         release_locked(e.refs);
     }
     entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
