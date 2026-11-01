@@ -225,7 +225,7 @@ bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& 
             basalt::program::cut_gives_up_bare(host_res, xcache.slots_after_shrink(keep), g.n_expert,
                                                [&](int64_t l, int64_t x) { return src.has_resident(l, x); })) {
             std::string he;
-            if (!home_given_up(xcache.slots_after_shrink(keep), he))
+            if (!home_given_up(xcache.slots_after_shrink(keep), he, true))
                 basalt::log::warn("basalt serve", "elastic KV: no RAM homes for the experts the tail gives up "
                                      "without a copy (%s): they are read from the file", he.c_str());
         }

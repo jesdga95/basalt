@@ -31,7 +31,7 @@ Flow Request::read_prompt() {
             return Flow::error;
         }
         std::string he;
-        if (!runtime_.home_given_up(runtime_.xcache.slots(), he))
+        if (!runtime_.home_given_up(runtime_.xcache.slots(), he, true))
             basalt::log::warn("basalt serve", "elastic KV: no RAM homes for the loan's experts without a copy (%s): "
                               "the prompt reads them from the file", he.c_str());
     }
