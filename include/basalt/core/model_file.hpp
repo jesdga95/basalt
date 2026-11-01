@@ -9,14 +9,14 @@
 // `meta.tensors`, whose offsets are absolute file offsets, so the loaders that read GGUF tensors in place read them
 // from the .basalt unchanged.
 //
-// The `hc8` section (and `--dump-hc8`) is a table of the 8-bit hyper-connection copies, little-endian:
+// The `hc8` section is a table of the 8-bit hyper-connection copies, little-endian:
 //   Hc8Header                 magic "BASALTH8", version, n_entries
 //   n_entries x Hc8Entry      name (NUL-padded), rows, cols, srow, offset (from the start of the section), bytes
 //   data                      at each entry's offset (a multiple of 256): rows x cols int8 codes, then
 //                             rows x srow f16 scales (a row's cols / 32 scales first, the rest zero), `bytes` in all
 // The names are the weight table's tensor names (e.g. blk.0.hc_attn_down.weight); the draft layer's matrices are
-// prefixed "mtp." and use the drafter's own tensor names.  The codes and scales are the ones the quantizer made, so
-// loading them is bit-identical to quantizing the bf16 matrices.
+// prefixed "mtp." and use the drafter's own tensor names.  tools/convert/hc8.py computes them from the file's bf16
+// matrices, bit for bit as the kernels' quantizer (hc8_adopt) does.
 #include "basalt/core/model_format.hpp"
 
 #include <cstdint>
@@ -114,7 +114,7 @@ private:
 
 /// Where each loader reads from: the sections of the .basalt.
 struct ModelSources {
-    FileRange dense, dense_index, experts, experts_layout, profile, hc8;
+    FileRange dense, dense_index, experts, experts_layout, hc8;
     FileRange mtp_dense, mtp_dense_index, mtp_experts, mtp_draft_vocab;
     /// The file that serves the source GGUF tensors and metadata when they come from a .basalt, else empty.
     std::string model_path;
@@ -148,14 +148,12 @@ struct Hc8Copy {
     const uint16_t* s() const { return (const uint16_t*) (data.data() + (size_t) rows * cols); }
 };
 
-/// The table the engine loads copies from at startup (process-wide; empty = quantize from the bf16 matrices).
+/// The table the engine loads copies from at startup (process-wide).
 void hc8_set_table(std::map<std::string, Hc8Copy> table);
 /// The loaded copy of `name` when its shape is rows x cols, else nullptr.
 const Hc8Copy* hc8_find(const std::string& name, int rows, int cols);
 
-/// Writes the table to `path` (atomically: a ".tmp" beside it, renamed).
-bool hc8_write(const std::string& path, const std::vector<Hc8Copy>& copies, std::string& err);
-/// Reads a table from a range (the whole file for --dump-hc8's output, the `hc8` section of a .basalt).
+/// Reads a table from a range (the `hc8` section of a .basalt).
 bool hc8_read(const FileRange& r, std::map<std::string, Hc8Copy>& out, std::string& err);
 
 }  // namespace basalt::core

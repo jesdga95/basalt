@@ -33,6 +33,8 @@ public:
     /// A Q6_K head's 2-bit copy for the verify window's two-stage head (q6k_vhead); null for other types or when it
     /// did not fit.
     const void* vproxy() const { return vproxy_; }
+    /// A Q8_0 head held as bit planes (q80_vhead.hpp): weights() is in that layout for every reader.
+    bool planes() const { return planes_; }
 
 private:
     void* weights_ = nullptr;
@@ -41,6 +43,7 @@ private:
     uint64_t bytes_ = 0;
     int n_in_ = 0, n_out_ = 0;
     int type_ = -1;
+    bool planes_ = false;
 };
 
 /// Plan v0.3 P6: `token_embd.weight` in its GGUF form (the IQ model files), in mapped pinned host memory: a row

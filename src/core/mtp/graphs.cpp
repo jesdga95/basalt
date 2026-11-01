@@ -64,7 +64,9 @@ bool MtpDrafter::record_round(int T, bool all_rows, std::string& err) {
     }
     if (gstamp_ != nullptr) gpu_stamp(gstamp_, 0, cs_);
     par_ = true;
+    kv_defer_ = true;
     bool ok = record_forward(T, -1, cs_, err);
+    kv_defer_ = false;
     if (ok) {
         chain_j_ = 0;
         pre_next_ = par_;
