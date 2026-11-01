@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import convert  # noqa: E402
 import ggufq  # noqa: E402
+import hc8 as H  # noqa: E402
 import model_sections as S  # noqa: E402
 from gguf_writer import GGUFWriter  # noqa: E402
 from model_file import ModelFile, ModelWriter  # noqa: E402
@@ -48,6 +49,8 @@ class ConvertTest(unittest.TestCase):
         self.conv = rng.standard_normal((2, 4)).astype(np.float32)
         self.ple = rng.standard_normal((2, 6)).astype(np.float32)
         self.q2 = rng.standard_normal((2, 64)).astype(np.float32)
+        self.hc_down = small_ints(rng, (64, 2)) / 4         # GGUF order: ne0 (columns) first
+        self.hc_up = small_ints(rng, (32, 64)) / 8
         self.experts = {}
         g.add_f32("token_embd.weight", self.embd)
         g.add_f32("per_layer_token_embd.weight", self.ple)
@@ -59,12 +62,12 @@ class ConvertTest(unittest.TestCase):
                 self.experts[(l, role)] = a
                 g.add_f32(f"blk.{l}.ffn_{role}_exps.weight", a)
         g.add_f32("blk.0.ple_conv1d.weight", self.conv)
+        g.add_f32("blk.1.hc_attn_down.weight", self.hc_down)
+        g.add_f32("output_hc_up.weight", self.hc_up)
         g.add_q2_0("blk.0.attn_gate.weight", self.q2, [64, 2])
         self.gguf = g.write(t / "m-00001-of-00001.gguf")
         self.tok = {"tokenizer.json": b"{}", "vocab.json": b'{"a":0}', "merges.txt": b"a b\n",
                     "token_type.json": b"[1]", "chat_template.jinja": b"{{ x }}"}
-        self.hc8 = rng.bytes(123)
-        (t / "hc8.bin").write_bytes(self.hc8)
         self.mmproj = rng.bytes(4321)
         (t / "mmproj.gguf").write_bytes(self.mmproj)
         self.vision = None
@@ -86,7 +89,7 @@ class ConvertTest(unittest.TestCase):
     def args(self, **kw):
         t = self.t
         d = dict(gguf=[str(self.gguf)], mmproj=str(t / "mmproj.gguf"), out=str(t / "out.basalt"), mtp_source=None, mtp_dense=None,
-                 draft_vocab=None, profile=None, profile_from=None, hc8=str(t / "hc8.bin"), name="Tiny",
+                 draft_vocab=None, name="Tiny",
                  compat_bf16=False, no_vision=False, force=False, sections_from=None)
         d.update(kw)
         return type("A", (), d)()
@@ -99,12 +102,13 @@ class ConvertTest(unittest.TestCase):
         convert.convert(self.args())
         m = self.model()
         self.assertFalse((self.t / "out.basalt.partial").exists())
-        want = {"hc8", "vision/mmproj", "profile", "dense", "dense.index", "experts", "experts.layout", "gguf", "meta"}
+        want = {"hc8", "vision/mmproj", "dense", "dense.index", "experts", "experts.layout", "gguf", "meta"}
         want |= {"tokenizer/" + k for k in self.tok}
         self.assertEqual(set(m.names()), want)
         for k in m.names():
             self.assertTrue(m.verify(k), k)
-        self.assertEqual(m.read("hc8"), self.hc8)
+        with open(m.path, "rb") as f:
+            self.assertEqual(f.read(12)[8:], struct.pack("<I", 2))
         self.assertEqual(m.read("vision/mmproj"), self.mmproj)
         for k, v in self.tok.items():
             self.assertEqual(m.read("tokenizer/" + k), v)
@@ -170,12 +174,13 @@ class ConvertTest(unittest.TestCase):
             self.assertEqual(gg[o:o + arr.nbytes], arr.astype("<f4").tobytes(), name)
             self.assertEqual(o % 4096, 0)
         self.assertEqual(tens["blk.0.attn_gate.weight"]["type"], "Q2_0")
-        self.assertEqual(meta["hc8"], {"bytes": 123})
         self.assertEqual(meta["vision"]["mmproj"], "vision/mmproj")
         self.assertEqual(meta["sources"][0]["size"], self.gguf.stat().st_size)
-        self.assertEqual(meta["profile"]["n_pairs"], N_LAYERS * N_EXPERT)
-        self.assertNotIn("engine_args", meta)
-        self.assertEqual(meta["sampling"]["top_k"], 20)
+        self.assertEqual(meta["version"], 2)
+        for k in ("profile", "hc8", "sampling", "engine_args"):
+            self.assertNotIn(k, meta)
+        self.assertEqual(meta["converter"], {"tool": "tools/convert/convert.py"})
+        self.assertEqual(meta["gguf_kv"]["general.sampling.top_k"], 20)
         self.assertIsNone(meta["mtp"])
         lic = meta["license"]
         self.assertEqual(lic["name"], "Qwen Community License 1.0")
@@ -183,44 +188,20 @@ class ConvertTest(unittest.TestCase):
         self.assertEqual(lic["quantized_by"], "Someone")
         self.assertEqual(set(lic), {"name", "text", "quantized_by"})
 
-    def test_without_hc8_or_drafter(self):
-        convert.convert(self.args(hc8=None))
-        m = self.model()
-        self.assertNotIn("hc8", m.names())
-        self.assertFalse([n for n in m.names() if n.startswith("mtp/")])
-        self.assertIsNone(json.loads(m.read("meta"))["hc8"])
-
-    # ---------------------------------------------------------------- profile
-    def test_profile_fill_order_and_traces(self):
+    def test_without_drafter(self):
         convert.convert(self.args())
-        blob = self.model().read("profile")
-        info = S.profile_info(blob, N_LAYERS, N_EXPERT)
-        self.assertEqual(info["slots"], 8)
-        pairs = struct.unpack_from("<16H", blob, 20)
-        self.assertEqual(pairs[:4], (0, 0, 1, 0))                    # expert-major fill: (0,0) (1,0) (0,1) ...
-        # three records, each routing its expert and expert 0
-        trace = b"".join(struct.pack("<ii2i2f", l, 2, e, 0, 1.0, 1.0) for l, e in ((1, 3), (0, 2), (1, 3)))
-        (self.t / "trace.bin").write_bytes(trace)
-        convert.convert(self.args(profile_from=[str(self.t / "trace.bin")], force=True))
-        blob = self.model().read("profile")
-        pairs = struct.unpack_from("<16H", blob, 20)
-        self.assertEqual(pairs[:8], (1, 0, 1, 3, 0, 0, 0, 2))   # by count, then by pair
-        table = struct.unpack_from("<8i", blob, 20 + 4 * 8)
-        self.assertEqual(table[1 * N_EXPERT + 3], 1)
+        m = self.model()
+        self.assertFalse([n for n in m.names() if n.startswith("mtp/")])
 
-    def test_profile_file(self):
-        ranked = [(l, e) for e in range(N_EXPERT) for l in range(N_LAYERS)][::-1]
-        (self.t / "p.bin").write_bytes(S.build_profile(ranked, N_LAYERS, N_EXPERT))
-        convert.convert(self.args(profile=str(self.t / "p.bin")))
-        self.assertEqual(self.model().read("profile"), (self.t / "p.bin").read_bytes())
-
-    def test_bad_profile(self):
-        good = S.build_profile([(0, 0)], N_LAYERS, N_EXPERT)
-        for name, blob in (("short", good[:-4]), ("other model", S.build_profile([(0, 0)], N_LAYERS, N_EXPERT + 1))):
-            (self.t / "p.bin").write_bytes(blob)
-            with self.assertRaises(SystemExit, msg=name):
-                convert.convert(self.args(profile=str(self.t / "p.bin")))
-            self.assertFalse((self.t / "out.basalt").exists())
+    def test_hc8_from_the_pack_matrices(self):
+        convert.convert(self.args())
+        t = H.read_table(self.model().read("hc8"))
+        self.assertEqual(list(t), ["blk.1.hc_attn_down.weight", "output_hc_up.weight"])
+        for name, a in (("blk.1.hc_attn_down.weight", self.hc_down), ("output_hc_up.weight", self.hc_up)):
+            rows, cols = a.shape[1], a.shape[0]
+            u16 = (a.view(np.uint32) >> 16).astype(np.uint16).reshape(rows, cols)
+            self.assertEqual(t[name][:2], (rows, cols))
+            self.assertEqual(t[name][3], H.quantize(u16), name)
 
     # ---------------------------------------------------------------- refusals and options
     def test_no_vision_and_overwrite(self):
@@ -319,15 +300,16 @@ class ConvertTest(unittest.TestCase):
         base = ModelFile(str(self.t / "base.basalt"))
         path, _ = self.mixed_gguf(["Q6_K", "Q5_K"])
         convert.convert(self.args(gguf=[str(path)], out=str(self.t / "new.basalt"), sections_from=str(self.t / "base.basalt"),
-                                  mmproj=None, hc8=None, name="Mixed"))
+                                  mmproj=None, name="Mixed"))
         m = ModelFile(str(self.t / "new.basalt"))
         for n in m.names():
             self.assertTrue(m.verify(n), n)
-        for n in ("profile", "hc8", "vision/mmproj"):
-            self.assertEqual(m.read(n), base.read(n), n)
+        self.assertEqual(m.read("vision/mmproj"), base.read("vision/mmproj"))
+        self.assertNotIn("profile", m.names())
+        self.assertEqual(H.read_table(m.read("hc8")), {})        # the mixed GGUF has no hyper-connection matrices
         meta = json.loads(m.read("meta"))
         self.assertEqual(meta["sections_from"]["copied"], [n for n in base.names() if n != "vision/text_vocab"
-                                                           and (n.startswith(("mtp/", "vision/")) or n in ("profile", "hc8"))])
+                                                           and n.startswith(("mtp/", "vision/"))])
         self.assertEqual(m.read("vision/text_vocab"), pack_vision.vocab_only_gguf(str(path)))
         self.assertEqual(meta["vision"], json.loads(base.read("meta"))["vision"])
         self.assertEqual(m.read("experts.layout").decode().splitlines()[1].split()[:3], ["0", "14", "8"])
@@ -335,8 +317,10 @@ class ConvertTest(unittest.TestCase):
     def test_help(self):
         r = subprocess.run([sys.executable, str(Path(convert.__file__)), "--help"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0)
-        for flag in ("--gguf", "--mtp-source", "--mtp-dense", "--mmproj", "--profile-from", "--profile ", "--hc8", "--draft-vocab"):
+        for flag in ("--gguf", "--mtp-source", "--mtp-dense", "--mmproj", "--draft-vocab"):
             self.assertIn(flag, r.stdout)
+        for flag in ("--profile", "--hc8"):
+            self.assertNotIn(flag, r.stdout)
 
     def test_checkpoint_path_takes_mtp_dense_only(self):
         run = lambda *x: subprocess.run([sys.executable, str(Path(convert.__file__)), "--sections-from", str(self.t / "b"),

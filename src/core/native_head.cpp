@@ -5,6 +5,7 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/q6k_head.hpp"
+#include "basalt/kernels/q80_vhead.hpp"
 #include "basalt/platform/memory.hpp"
 
 #include <cuda_runtime.h>
@@ -90,6 +91,15 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         n_in_ = (int) n_in;
         n_out_ = (int) n_out;
         type_ = (int) tensor->type;
+        // a Q8_0 head in bit planes, rewritten in place: the same bytes per row, read by every kernel of this head
+        if (type_ == 8 && basalt::kernels::q80p_supported((int) n_in, 1)) {
+            basalt::kernels::q80p_pack(weights_, n_out, nullptr);
+            if (cudaDeviceSynchronize() != cudaSuccess) {
+                err = "native head: the bit planes failed";
+                return false;
+            }
+            planes_ = true;
+        }
         // the verify head's 2-bit copy, packed once from the uploaded rows (without it the exact head runs)
         if (type_ == 14 && basalt::kernels::q6k_vhead_supported((int) n_in, (int) n_out, 1)) {
             const size_t pb = basalt::kernels::q6k_vproxy_bytes(n_out);
@@ -119,6 +129,9 @@ bool NativeHead::run(const float* mixed, float* logits, void* stream, std::strin
     try {
         if (type_ == 13) {
             basalt::kernels::native_q5_k_f32(weights_, mixed, scratch_, logits, n_in_, n_out_, 1, stream);
+        } else if (planes_) {
+            basalt::kernels::native_quantize_q8_1(mixed, scratch_, n_in_, 1, stream);
+            basalt::kernels::q80p_mmvq(weights_, scratch_, logits, n_in_, n_out_, 1, stream);
         } else {
             basalt::kernels::native_quantize_q8_1(mixed, scratch_, n_in_, 1, stream);
             basalt::kernels::native_mmvq(type_, weights_, scratch_, logits, n_in_, n_out_, 1, stream);
