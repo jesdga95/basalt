@@ -12,6 +12,7 @@ uint64_t serve_growth_bytes(const Options& o, const basalt::core::ModelGeometry&
         const uint64_t one = z.gdn + z.ple + (uint64_t) g.n_qsa_layers() * (z.tail + z.dead + z.block_pos);
         bytes += (uint64_t) (o.prompt_cache + 1) * (uint64_t) std::max(o.batch, 1) * one;
         bytes += (uint64_t) o.conversation_cache_mib << 20;
+        bytes += z.gdn;
     }
     if (!o.vision_mmproj.empty()) {
         // the canvas (8-bit RGB), its normalized planar floats and the patches

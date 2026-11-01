@@ -207,7 +207,7 @@ plain decoding would give.
 
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
-| `prompt-cache` | engine | integer | 6 | Conversation checkpoints kept between requests, about 118 MB of RAM each. `0` reads every prompt from the start. More checkpoints let more chats resume without re-reading. |
+| `prompt-cache` | engine | integer | 6 | Conversation checkpoints kept between requests, about 118 MB of RAM each. A single-GPU server also keeps one page-locked buffer of that size for deferred copies when RAM permits. `0` reads every prompt from the start. More checkpoints let more chats resume without re-reading. |
 | `prompt-cache-every` | engine | integer tokens | 16384 (`0` = off) | Also checkpoint every N freshly read prompt tokens (RAM only: the disk tier does not store them). |
 | `prompt-cache-root` | engine | integer tokens | 2048 (`0` = never) | Checkpoint a prompt's first turn boundary (the end of the system prompt) when it is at least this long. |
 | `turn-token` | engine | token id | 248045 (`<\|im_start\|>`) | The token that opens a chat turn; the last one in a prompt is where the conversation checkpoint goes. |
