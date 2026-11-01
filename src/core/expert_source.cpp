@@ -376,9 +376,7 @@ void free_home(const detail::HomeRegion& r) {
     }
 }
 
-// Page-locked, mapped homes: ordinary memory whose pages several threads fault in, then registered with the driver.
-// The driver's own allocation zeroes and locks the same bytes page by page, several times slower, and the homes are
-// taken while a request waits.  A region the OS or the driver refuses is left without an arena (the caller falls back).
+// Fault home pages in parallel before registration; a refused region falls back to pageable memory.
 void pin_homes(std::vector<detail::HomeRegion>& regions) {
     constexpr uint64_t kHuge = 2ull << 20;
     auto padded = [&](const detail::HomeRegion& r) { return (r.bytes + kHuge - 1) / kHuge * kHuge; };
@@ -387,7 +385,7 @@ void pin_homes(std::vector<detail::HomeRegion>& regions) {
         std::string note;
         r.arena = basalt::platform::alloc_region(padded(r), got, note, "", 0, r.map_base, r.map_bytes);
     }
-    // every page written once, the regions' 2 MiB blocks dealt round-robin to the threads
+    // Distribute page touches across the regions.
     std::vector<std::pair<uint8_t*, uint64_t>> blocks;
     for (const detail::HomeRegion& r : regions)
         if (r.arena != nullptr)
