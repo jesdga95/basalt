@@ -81,7 +81,8 @@ def extract_tokenizer(mf: ModelFile) -> Path:
 
 def vision_config(mf: ModelFile, engine_bin: str, sidecar: bool = True) -> dict:
     """The vision sidecar's config (the projector alone without `sidecar`); ValueError names what is missing."""
-    side = Path(engine_bin).resolve().parent / VISION_EXE
+    engine = Path(engine_bin).resolve()
+    side = engine.parent / (VISION_EXE + engine.suffix)   # with the engine's suffix: basalt-vision.exe on Windows
     if "vision/mmproj" not in mf.sections:
         raise ValueError("this model file has no vision projector (vision/mmproj); drop --vision")
     if sidecar and not side.is_file():
