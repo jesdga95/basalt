@@ -37,6 +37,7 @@
 #include <atomic>
 #include <chrono>
 #include <map>
+#include <memory>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -160,6 +161,16 @@ public:
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     /// Row `t` of the last window's head logits (n_vocab floats) to the host, every one exact. Valid after run().
     bool copy_logits(int t, float* host) const;
+    // ---- Jev: probabilities require exact target rows, including screened heads ----
+    bool copy_score_logits(int t, float* host, std::string& err);
+    struct ScoreBranch {
+        std::vector<int32_t> tokens, candidates;
+        std::vector<float> logits;
+    };
+    bool score_branches(std::vector<ScoreBranch>& branches, int64_t prefix, PoolMultiFn pool, void* user,
+                        uint64_t& workspace_bytes, uint64_t free_floor, std::string& err);
+    bool score_branches_supported() const;
+    // ---- end Jev ----
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
@@ -506,6 +517,17 @@ private:
     float* ple_work_ = nullptr;            ///< each row's PLE history while the window runs
     bool batch_dm_ = false;                ///< a batch window runs the device-planned tail
     void* arena_b_ = nullptr;
+    // ---- Jev: reusable, bounded branch views; recurrence is shared read-only ----
+    uint64_t batch_bytes_ = 0;
+    std::unique_ptr<Verifier> score_workspace_;
+    void* score_arena_ = nullptr;
+    uint64_t score_bytes_ = 0;
+    int64_t score_cells_ = 0;
+    SessionState* score_base_ = nullptr;
+    std::vector<SessionState> score_views_;
+    std::vector<QsaState> score_qsa_;
+    void swap_score_workspace(Verifier& other);
+    // ---- end Jev ----
     int64_t last_pos_b_[8] = {};
     bool capture_batch(int R, int hbase, std::string& err);
     void collect_profile();   // --profile: add the last window's stamps to prof_sum_

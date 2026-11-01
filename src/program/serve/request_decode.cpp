@@ -80,6 +80,9 @@ Flow Request::decode() {
     file_bytes0 = runtime_.src.file_read_bytes();
     decode_look0 = runtime_.drive.d.cache_hits + runtime_.drive.d.cache_admitted + runtime_.drive.d.cache_refused;
     offload0 = runtime_.drive.d.offload_entries;
+    // ---- Jev: one target-head read, no sampled completion or drafter ----
+    if (!score_ids.empty()) return score();
+    // ---- end Jev ----
     static const bool chain = basalt::core::Verifier::chain_on();
     adapt_age = 2;   // loop tops since the last adaptive round
     applied_early = false;

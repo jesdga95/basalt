@@ -88,6 +88,7 @@ class Service:
         self.grammar_engine = grammar_engine          # the engine understands the request key
         self.sampling_defaults = dict(sampling_defaults or {})   # the model file's sampling defaults
         self.fifo = threading.Lock()
+        self.jev = None  # Jev is installed only by the explicit server opt-in.
         self.stopping = threading.Event()               # set at shutdown: nothing starts the engine again
         self.embeddings = threading.local()           # this request's image embeddings file
         self.api_key = ""                              # when set, /v1/* requires it
@@ -882,6 +883,15 @@ class Service:
         return now
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+        # ---- Jev: finish existing chat work before leasing the solo verifier ----
+        if self.jev is None:
+            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force)
+        else:
+            with self.jev.gate.shared(cancel):
+                yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force)
+        # ---- end Jev ----
+
+    def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """Yield ("event", Event) as text arrives, ("ping", None) as heartbeat, then ("done", {...}).
         `force`: the opening of the call the reply must make (see prepare)."""
         budget = self.reasoning_budget(sampling) if thinking else None

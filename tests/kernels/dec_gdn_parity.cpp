@@ -415,7 +415,7 @@ bool parity_seg(cudaStream_t s) {
     constexpr int NL = 2;   // layers per state: the table points at layer 0, the kernels at layer 1
     const int layer = 1;
     const int counts[4] = {1, 2, 5, 8};
-    for (int trial = 0; trial < 3; ++trial)
+    for (int trial = 0; trial < 4; ++trial)
         for (int nseg : counts) {
             std::vector<int> T(nseg), keep(nseg), row0(nseg);
             int R = 0, tmax = 1;
@@ -431,7 +431,7 @@ bool parity_seg(cudaStream_t s) {
             std::vector<float*> sbase(nseg);
             std::vector<std::vector<float>> st0(nseg);
             for (int k = 0; k < nseg; ++k) {
-                st0[k] = randn(NL * SF, 0.1f, rng);
+                st0[k] = trial == 3 && k > 0 ? st0[0] : randn(NL * SF, 0.1f, rng);
                 sbase[k] = upload(st0[k]);
             }
             const std::vector<float> qkv = randn((size_t) R * C, 1.f, rng), z = randn((size_t) R * ZV, 1.f, rng),
@@ -440,7 +440,7 @@ bool parity_seg(cudaStream_t s) {
             std::vector<SegRow> rows(R);
             for (int k = 0; k < nseg; ++k)
                 for (int j = 0; j < T[k]; ++j)
-                    rows[row0[k] + j] = SegRow{sbase[k], row0[k], j, T[k], keep[k], k, 100 + j};
+                    rows[row0[k] + j] = SegRow{sbase[trial == 3 ? 0 : k], row0[k], j, T[k], keep[k], k, 100 + j};
             SegRow* d_rows = upload(rows);
             auto fbuf = [&](size_t n) { float* p; CK(cudaMalloc(&p, n * 4 + 64)); CK(cudaMemset(p, 0xff, n * 4)); return p; };
             // the current kernels, one call per segment
@@ -504,6 +504,21 @@ bool parity_seg(cudaStream_t s) {
                 const std::vector<float> hs = down(h_s + r0 * C, (size_t) T[k] * C), ys = down(y_s + r0 * ZV, (size_t) T[k] * ZV);
                 ec = std::max(ec, max_err(hs.data(), c.h.data(), c.h.size()));
                 ey = std::max(ey, max_err(ys.data(), c.y.data(), c.y.size()));
+            }
+            if (trial == 3) {
+                for (int k = 0; k < nseg; ++k) {
+                    const auto got = down(sbase[k], NL * SF);
+                    d += std::memcmp(got.data(), st0[k].data(), NL * SF * 4) != 0;
+                }
+                std::printf("shared read-only recurrence S=%d R=%d: %s; CPU conv %.2g recurrence %.2g\n",
+                            nseg, R, d == 0 ? "bitwise, state unchanged" : "DIFF", ec, ey);
+                ok = ok && d == 0 && ec < 1e-4 && ey < 1e-3;
+                for (float* p : sbase) CK(cudaFree(p));
+                for (void* p : {(void*) d_qkv, (void*) d_z, (void*) d_x, (void*) d_rows, (void*) h_r, (void*) g_r,
+                                (void*) b_r, (void*) y_r, (void*) h_f1, (void*) g_f1, (void*) b_f1, (void*) y_f1,
+                                yq_r, yq_f, (void*) h_s, (void*) y_s, (void*) h_f, (void*) g_f, (void*) b_f, (void*) y_f})
+                    CK(cudaFree(p));
+                continue;
             }
             // the commit: the current kernel per segment on a copy of the states against the segment kernel
             const int CNL = 2;

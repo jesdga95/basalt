@@ -101,7 +101,7 @@ def relay_auto_flags(line: str) -> bool:
 
 # First words of the stdout lines the server reads (or knowingly ignores); any other line is the engine talking to
 # its log, such as a device-side trap message.
-PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "READY", "T ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR", "BADM ",
+PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "READY", "T ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "JLOGITS", "JWAVE ", "JTIME ", "JFALLBACK", "DONE", "ERR", "BADM ",
                   "BT ", "BDONE ", "YIELDED ", "VRAM ", "ENC ")
 
 
@@ -1364,6 +1364,142 @@ class ProcessEngine:
                         break
                     if not self.can_stop:
                         heard = time.monotonic()
+
+    # ---- Jev: exclusive, zero-output target-head transactions ----
+    def score_many(self, rows, control):
+        from serve.decision.trie import common_size
+        result = [None] * len(rows)
+        pending = sorted(range(len(rows)), key=lambda i: rows[i][0])
+        lanes = min(int(self.info.get("jev_lanes", 1)), 8)
+        window = int(self.info.get("jev_window", 1))
+        while pending:
+            group = [pending.pop(0)]
+            prefix = len(rows[group[0]][0]) - 1
+            for index in pending[:]:
+                if len(group) >= lanes:
+                    break
+                trial = min(prefix, len(rows[index][0]) - 1, common_size(rows[group[0]][0], rows[index][0]))
+                if trial > 0 and sum(len(rows[i][0]) - trial for i in group + [index]) <= window:
+                    group.append(index)
+                    pending.remove(index)
+                    prefix = trial
+            if len(group) == 1:
+                i = group[0]
+                values, stats = self.score(*rows[i], control)
+                result[i] = values, dict(stats, batch_size=1, scored_windows=1, workspace_bytes=0)
+                continue
+            ids = rows[group[0]][0][:prefix] + [rows[group[0]][0][prefix]]
+            branches = [(rows[i][0][prefix:], rows[i][1]) for i in group]
+            points = sorted({prefix} | {p for i in group for p in rows[i][2] if 0 < p <= prefix})
+            values, stats = self.score(ids, rows[group[0]][1], points, any(rows[i][3] for i in group), control,
+                                       _branches=branches)
+            if values is None:
+                middle = len(group) // 2
+                for subset in (group[:middle], group[middle:]):
+                    for i, value in zip(subset, self.score_many([rows[i] for i in subset], control)):
+                        result[i] = value
+                first = result[group[0]][1]
+                first["prompt_ms"] = first.get("prompt_ms", 0) + stats.get("prompt_ms", 0)
+                first["decode_ms"] = first.get("decode_ms", 0) + stats.get("decode_ms", 0)
+                first["reused"] = min(first.get("reused", 0), stats.get("reused", 0))
+                continue
+            for j, i in enumerate(group):
+                st = dict(stats, reused=min(prefix, stats.get("reused", 0)) if j == 0 else prefix,
+                          prompt_ms=stats.get("prompt_ms", 0) if j == 0 else 0,
+                          decode_ms=stats.get("decode_ms", 0) if j == 0 else 0,
+                          batch_size=len(group), scored_windows=int(j == 0))
+                result[i] = values[j], st
+        return result
+
+    def score(self, ids, candidates, frontiers, fresh, control, _branches=None):
+        if not self.alive() or self.info.get("jev", 0) < 1:
+            raise EngineError("this engine has no Jev scoring capability; rebuild basalt with this server")
+        if not ids or len(ids) + 9 > self.max_context:
+            raise ValueError("decision prompt exceeds the context; requests are never truncated")
+        control.check()
+        ctl = getattr(self, "ctl", None) if self.batch else None
+        if ctl:
+            while not ctl.acquire(timeout=0.1):
+                control.check()
+        sent = done = False
+        scores, fallback, wave = [], False, {}
+        native_ms = None
+        stop_at = None
+        try:
+            # A cancelled batch consumer may still be draining its final BDONE.
+            if self.batch:
+                with self.slot_cv:
+                    while any(self.slot_busy):
+                        control.check()
+                        self.slot_cv.wait(0.1)
+            points = sorted({p for p in frontiers if 0 < p < len(ids)})
+            keys = " score=" + ",".join(map(str, candidates))
+            keys += " score_fresh=1" if fresh else ""
+            keys += " score_at=" + ",".join(map(str, points)) if points else ""
+            if _branches:
+                keys += " score_branches=" + "/".join(
+                    ",".join(map(str, tokens)) + ":" + ",".join(map(str, options)) for tokens, options in _branches)
+            self._send(f"GEN 1{keys} " + ",".join(map(str, ids)))
+            sent = True
+            while True:
+                if control.is_set() and stop_at is None:
+                    self._send("STOP")
+                    stop_at = time.monotonic() + 10
+                if stop_at is not None and time.monotonic() >= stop_at:
+                    raise self._silent("Jev did not finish after STOP")
+                try:
+                    line = self.lines.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if line is None:
+                    done = True
+                    raise EngineDied("the engine stopped during decision scoring")
+                if line.startswith("JLOGITS "):
+                    try:
+                        scores.append([float(v) for v in line.split()[1:]])
+                    except ValueError:
+                        raise EngineError("Jev returned malformed target logits") from None
+                elif line.strip() == "JFALLBACK":
+                    fallback = True
+                elif line.startswith("JWAVE "):
+                    try:
+                        count, size = map(int, line.split()[1:])
+                        if not _branches or count != len(_branches) or size < 0:
+                            raise ValueError()
+                        wave = {"workspace_bytes": size}
+                    except ValueError:
+                        raise EngineError("Jev returned malformed wave accounting") from None
+                elif line.startswith("JTIME "):
+                    try:
+                        native_ms = float(line.split()[1])
+                        if not math.isfinite(native_ms) or native_ms < 0:
+                            raise ValueError()
+                    except (ValueError, IndexError):
+                        raise EngineError("Jev returned malformed native timing") from None
+                elif line.startswith("DONE"):
+                    self._parse_done(line)
+                    if native_ms is not None:
+                        self.last["decode_ms"] = native_ms
+                    done = True
+                    control.check()
+                    expected = [options for _, options in _branches] if _branches else [candidates]
+                    if fallback and _branches and not scores:
+                        return None, dict(self.last)
+                    if (len(scores) != len(expected) or _branches and not wave or
+                        any(len(score) != len(options) or not all(math.isfinite(v) for v in score)
+                            for score, options in zip(scores, expected))):
+                        raise EngineError("Jev returned no valid target logits")
+                    return (scores if _branches else scores[0]), dict(self.last, **wave)
+                elif line.startswith("ERR"):
+                    done = True
+                    raise request_err(line[4:].strip())
+        finally:
+            if sent and not done:
+                # Protocol parsing failures cannot leave unread lines for an unrelated request.
+                self._silent("Jev scoring lost protocol synchronization")
+            if ctl:
+                ctl.release()
+    # ---- end Jev ----
 
     def _silent(self, what: str) -> EngineSilent:
         """Kill an engine that lost step with the server so the next request restarts it."""

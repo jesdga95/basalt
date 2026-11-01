@@ -5,6 +5,8 @@
 // microbench line per kernel (one segment call vs one call per segment).
 //   qsa_seg_parity [iters]
 #include "basalt/kernels/native_qsa_indexer.hpp"
+#include "basalt/kernels/native_qsa.hpp"
+#include "basalt/kernels/native_rope.hpp"
 #include "basalt/kernels/qsa.hpp"
 #include "basalt/kernels/qsa_dec_attn.hpp"
 #include "basalt/kernels/qsa_dec_fused.hpp"
@@ -246,7 +248,22 @@ int main(int argc, char** argv) {
     // the solo chain for segment j of layer l (the kernels the verify window runs on one sequence's rows)
     auto solo_kv = [&](const Window& w, int j, int l, bool int8) {
         Slot& x = A[l][w.slot[j]];
-        if (!int8) return;
+        if (!int8) {
+            const int f = w.first[j], n = w.len[j];
+            float* kc = O[0].kcur + (size_t) f * NKV * HD;
+            k::native_qsa_rms_norm_weighted(kc, knorm, kc, HD, n * NKV, 1e-6f, cs);
+            k::native_rope_apply(kc, kc, n * NKV, HD, S_.n_rot, sc, pos_k + f * NKV, cs);
+            ck(cudaMemcpyAsync(x.snap, x.tail, TS * 4, cudaMemcpyDeviceToDevice, cs), "tail snapshot");
+            for (int t = 0; t < n; ++t) {
+                const int r = f + t;
+                k::kv_append_step(x.kp, x.vp, x.table, steps + r * k::kStepCount,
+                                 kc + (size_t) t * NKV * HD, vcur + (size_t) r * NKV * HD, S_, cs, nullptr);
+                const k::QsaIndexerBuffers ib{x.tail, x.dead, x.pooled, x.bpos};
+                k::native_qsa_indexer_append(raw + (size_t) r * ID, steps + r * k::kStepCount + k::kStepPos,
+                                             0, iknorm, 1e-6f, ib, S_, MAX_CELLS, sc, cs);
+            }
+            return;
+        }
         k::QsaDecKvPost a = kv_args(O[0], true, w.first[j]);
         a.k_q = x.kq; a.v_q = x.vq; a.k_scale = x.ks; a.v_scale = x.vs; a.page_table = x.table; a.host = host_of(x);
         a.tail = x.tail; a.dead = x.dead; a.pooled = x.pooled; a.block_pos = x.bpos; a.tail_snap = x.snap;
@@ -270,8 +287,9 @@ int main(int argc, char** argv) {
         return t;
     };
     auto seg_kv = [&](const Window& w, int l, bool int8) {
-        if (!int8) return;
-        k::qsa_dec_kv_post_seg(kv_args(O[1], true, 0), seg_table(w, l), w.R, S_, sc, cs);
+        auto a = kv_args(O[1], true, 0);
+        if (!int8) { a.k_pool = B[l][0].kp; a.v_pool = B[l][0].vp; }
+        k::qsa_dec_kv_post_seg(a, seg_table(w, l), w.R, S_, sc, cs);
     };
     auto seg_rest = [&](const Window& w, int l, bool int8) {
         const k::QsaSegTable t = seg_table(w, l);
@@ -312,6 +330,8 @@ int main(int argc, char** argv) {
                 cmp("block_pos", bad(a.bpos, b.bpos, 1), tot);
                 cmp("pooled", bad(a.pooled, b.pooled, (size_t) MAXB * ID), tot);
                 if (!big) continue;
+                cmp("fp16 k", bad(a.kp, b.kp, ROWS * HD), tot);
+                cmp("fp16 v", bad(a.vp, b.vp, ROWS * HD), tot);
                 cmp("k codes", bad(a.kq, b.kq, ROWS * HD), tot);
                 cmp("v codes", bad(a.vq, b.vq, ROWS * HD), tot);
                 cmp("k scales", bad(a.ks, b.ks, ROWS * HD / 64), tot);
@@ -363,10 +383,33 @@ int main(int argc, char** argv) {
                 cmp("attn", bad(O[0].attn, O[1].attn, (size_t) R * NH * HD), d);
                 cmp("gated", bad(O[0].gated, O[1].gated, (size_t) R * NH * HD), d);
                 cmp("q8_1 rows", bad(O[0].xq, O[1].xq, (size_t) R * q8row), d);
+                if (!int8) {
+                    const auto hc = down(O[0].kcur, (size_t) R * NKV * HD);
+                    const auto hv = down(vcur, (size_t) R * NKV * HD);
+                    size_t wrong = 0;
+                    for (int j = 0; j < w.S; ++j) {
+                        const Slot& x = B[l][w.slot[j]];
+                        const auto table = down(x.table, PAGES);
+                        for (int t = 0; t < w.len[j]; ++t) {
+                            const int pos = pos0[w.slot[j]] + t, row = w.first[j] + t;
+                            if (table[pos / P] < 0) continue;
+                            for (int h = 0; h < NKV; ++h) {
+                                const size_t at = ((size_t) table[pos / P] * NKV * P + h * P + pos % P) * HD;
+                                const auto keys = down(x.kp + at, HD), vals = down(x.vp + at, HD);
+                                for (int c = 0; c < HD; ++c) {
+                                    const size_t src = ((size_t) row * NKV + h) * HD + c;
+                                    wrong += keys[c] != f16(hc[src]);
+                                    wrong += vals[c] != f16(hv[src]);
+                                }
+                            }
+                        }
+                    }
+                    cmp("fp16 CPU append", wrong, d);
+                }
                 if (d) std::printf("  window %d layer %d (S %d, R %d)\n", wi, l, w.S, R);
                 tot += d;
             }
-            if (int8) {
+            {
                 // commit the window's kept rows on a restored tail, then advance
                 for (int j = 0; j < w.S; ++j) commit_solo(w, j);
                 commit_seg(w);
@@ -417,6 +460,10 @@ int main(int argc, char** argv) {
         };
         const double kv_s = time([&] { for (int j = 0; j < nseg; ++j) solo_kv(w, j, 0, true); });
         const double kv_g = time([&] { seg_kv(w, 0, true); });
+        const double fp_s = time([&] { for (int j = 0; j < nseg; ++j) solo_kv(w, j, 0, false); });
+        const double fp_g = time([&] { seg_kv(w, 0, false); });
+        std::printf("S %d FP16 kv_post %.1f -> %.1f us; append %.2f GB/s\n", nseg, fp_s, fp_g,
+                    (double) R * NKV * HD * 4 / (fp_g * 1e3));
         const double sc_s = time([&] {
             for (int j = 0; j < nseg; ++j)
                 k::qsa_block_scores(A[0][j].pooled, A[0][j].dead, O[0].qidx + (size_t) w.first[j] * IQ * ID,

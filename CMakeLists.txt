@@ -290,6 +290,7 @@ add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/exper
   src/core/verify/batch_capture.cpp
   src/core/verify/batch_execution.cpp
   src/core/verify/batch_sessions.cpp
+  src/core/verify/score_branches.cpp
   src/core/verify/capture.cpp
   src/core/verify/commit.cpp
   src/core/verify/cpu_warm.cpp
@@ -507,6 +508,7 @@ add_executable(basalt src/program/generate.cpp src/program/engine_local.cpp src/
                        src/program/serve/prompt_windows.cpp
                        src/program/serve/protocol.cpp
                        src/program/serve/request.cpp
+                       src/program/serve/request_score.cpp
                        src/program/serve/request_decode.cpp
                        src/program/serve/request_finish.cpp
                        src/program/serve/request_image.cpp

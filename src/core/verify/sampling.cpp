@@ -143,4 +143,17 @@ bool Verifier::copy_logits(int t, float* host) const {
                       cudaMemcpyDeviceToHost) == cudaSuccess;
 }
 
+// ---- Jev: reuse exact-head resampling and its existing buffers ----
+bool Verifier::copy_score_logits(int t, float* host, std::string& err) {
+    if (next_ != nullptr) return next_->copy_score_logits(t, host, err);
+    const OnDevice on_device(device_);
+    if (t < 0 || t >= last_t_ || host == nullptr || !exact_head_rows(last_t_, err) ||
+        cudaStreamSynchronize(cs_) != cudaSuccess || !copy_logits(t, host)) {
+        if (err.empty()) err = "verify: exact target logits unavailable";
+        return false;
+    }
+    return true;
+}
+// ---- end Jev ----
+
 }  // namespace basalt::core

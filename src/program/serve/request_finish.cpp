@@ -39,7 +39,8 @@ Flow Request::complete() {
         // (the checkpoints taken while reading it are still good)
         runtime_.live.swap(consumed);
         runtime_.live_imgs = runtime_.imgs_below(runtime_.req_imgs, (int64_t) runtime_.live.size());
-        runtime_.live_ok = runtime_.o.prompt_cache > 0;
+        // Jev retains prefix checkpoints, never a live tail without its drafter state.
+        runtime_.live_ok = runtime_.o.prompt_cache > 0 && score_ids.empty();
     }
     runtime_.ckd_finish();
     req_hits = runtime_.drive.d.cache_hits - decode_hits0;
