@@ -9,11 +9,11 @@
 // A section's bytes are opaque to the container; what each one holds is listed below.  Text sections are UTF-8.
 // tools/model_file.py is the Python side of this layout and must stay byte-compatible with it.
 //
-// Sections (v1):
-//   meta                     JSON: format/version, model name, geometry, the source GGUF metadata the engine reads
-//                            (`gguf_kv`), the type, shape, size and offset in `gguf` of every source tensor (`tensors`), the engine's
-//                            default sampling (`sampling`), provenance (source
-//                            files, sizes, sha256, converter version) and the license / attribution text
+// Sections (version 2; docs/basalt-file-changelog.md lists what each version holds):
+//   meta                     JSON: format/version, model name, the source GGUF metadata the engine and the server read
+//                            (`gguf_kv`, with the sampling defaults as general.sampling.*), the type, shape, size and
+//                            offset in `gguf` of every source tensor (`tensors`), provenance (source files, sizes,
+//                            sha256) and the license / attribution text
 //   tokenizer/<file>         the tokenizer directory's files (tokenizer.json, vocab.json, merges.txt,
 //                            token_type.json, chat_template.jinja)
 //   dense                    the dense weight pool
@@ -25,8 +25,7 @@
 //                            kTensorAlign within the section; meta.tensors[name].offset is relative to the section
 //   mtp/dense, mtp/dense.index, mtp/experts, mtp/draft_vocab
 //                            the drafter (the files of an mtp runtime directory)
-//   profile                  the default expert profile
-//   hc8                      the 8-bit copies of the hyper-connection matrices, as `basalt --dump-hc8` writes them
+//   hc8                      the 8-bit copies of the hyper-connection matrices (model_file.hpp), required
 //   vision/mmproj            the vision projector GGUF, whole
 //   vision/<name>            anything else the vision sidecar reads
 #include <cstdint>
@@ -34,7 +33,7 @@
 namespace basalt::core {
 
 constexpr char kModelMagic[8] = {'B', 'A', 'S', 'A', 'L', 'T', 'M', 'F'};
-constexpr uint32_t kModelVersion = 1;
+constexpr uint32_t kModelVersion = 2;
 constexpr uint64_t kSectionAlign = 2ull << 20;
 constexpr uint64_t kHeaderBytes = 64ull << 10;
 constexpr uint64_t kTensorAlign = 4096;

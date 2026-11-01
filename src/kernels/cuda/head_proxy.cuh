@@ -172,10 +172,64 @@ struct Final {
     int list[kMaxCand];
     float lp[kMaxCand], ex[kMaxCand];
     int cnt;
+    int hist[256];
+    unsigned long long want;
+    int need;
 };
 
+// A candidate's selection key: its approximate score, then the lower row on a tie.  Keys of distinct rows differ.
+__device__ __forceinline__ unsigned long long cand_key(float2 c) {
+    const unsigned u = __float_as_uint(c.x);
+    const unsigned o = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    return ((unsigned long long) o << 32) | (unsigned) (0xffffffffu - (unsigned) __float_as_int(c.y));
+}
+
+// The kMaxCand-th largest key among the nc candidates within kDelta of m (more than kMaxCand of them): a radix
+// select over the key's bytes, most significant first.
+__device__ __forceinline__ unsigned long long kth_key(Final& f, int nc, const float2* __restrict__ cand, float m) {
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float ninf = __int_as_float(0xff800000);
+    if (tid == 0) { f.want = 0ull; f.need = kMaxCand; }
+    unsigned long long mask = 0ull;
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        if (tid < 256) f.hist[tid] = 0;
+        __syncthreads();
+        const unsigned long long want = f.want;
+        for (int i = tid; i < nc; i += 512) {
+            const float2 c = __ldcg(&cand[i]);
+            if (!(c.x > ninf && c.x >= m - kDelta)) continue;
+            const unsigned long long k = cand_key(c);
+            if ((k & mask) == want) atomicAdd(&f.hist[(int) ((k >> shift) & 255u)], 1);
+        }
+        __syncthreads();
+        if (warp == 0) {   // lane l holds bins 255 - 8l .. 248 - 8l; the digit is the bin where the count from the top reaches need
+            int b[8], s = 0;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { b[j] = f.hist[255 - 8 * lane - j]; s += b[j]; }
+            int incl = s;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int v = __shfl_up_sync(0xffffffffu, incl, o);
+                if (lane >= o) incl += v;
+            }
+            const int need = f.need, excl = incl - s;
+            if (excl < need && incl >= need) {
+                int acc = excl, j = 0;
+                while (acc + b[j] < need) acc += b[j++];
+                f.want = want | ((unsigned long long) (255 - 8 * lane - j) << shift);
+                f.need = need - acc;
+            }
+        }
+        mask |= 255ull << shift;
+        __syncthreads();
+    }
+    return f.want;
+}
+
 // After pdl_wait, with f.cnt zeroed by thread 0: the best approximate score, then the rows within kDelta of it into
-// f.list.  Returns the number listed; 0 when every row is masked (the pick is then written here).
+// f.list in ascending row order; when more than kMaxCand qualify, the kMaxCand best by approximate score (the lower row
+// on a tie).  The list depends on the scores alone, never on the order threads arrive in.  Returns the number listed;
+// 0 when every row is masked (the pick is then written here).
 __device__ __forceinline__ int collect(Final& f, int n_tiles, const int32_t* __restrict__ map,
                                        const float2* __restrict__ cand, int* __restrict__ out_id,
                                        float* __restrict__ out_prob) {
@@ -202,7 +256,32 @@ __device__ __forceinline__ int collect(Final& f, int n_tiles, const int32_t* __r
         }
     }
     __syncthreads();
-    return f.cnt < kMaxCand ? f.cnt : kMaxCand;
+    const int total = f.cnt;
+    if (total > kMaxCand) {
+        const unsigned long long kth = kth_key(f, nc, cand, m);
+        if (tid == 0) f.cnt = 0;
+        __syncthreads();
+        for (int i = tid; i < nc; i += 512) {
+            const float2 c = __ldcg(&cand[i]);
+            if (c.x > ninf && c.x >= m - kDelta && cand_key(c) >= kth) {
+                const int p = atomicAdd(&f.cnt, 1);
+                if (p < kMaxCand) { f.list[p] = __float_as_int(c.y); f.lp[p] = c.x; }
+            }
+        }
+        __syncthreads();
+    }
+    const int n = total < kMaxCand ? total : kMaxCand;
+    int row = 0, rank = 0;
+    float lp = 0.0f;
+    if (tid < n) {
+        row = f.list[tid];
+        lp = f.lp[tid];
+        for (int j = 0; j < n; ++j) rank += f.list[j] < row;
+    }
+    __syncthreads();
+    if (tid < n) { f.list[rank] = row; f.lp[rank] = lp; }
+    __syncthreads();
+    return n;
 }
 
 // Warp 0, after f.ex holds the n listed rows' exact scores: the largest exact score (the lowest row on a tie) is the

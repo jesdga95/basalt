@@ -82,7 +82,8 @@ bool hc_fused_q8_rows_ok();
 /// The arrivals a read adds to HcFusedArgs::pub_ctr[0] (its router items').
 unsigned hc_fused_pub_arrivals();
 /// Quantize the bf16 matrix w [rows][cols] (cols a multiple of 32) to an 8-bit copy on the current device, once per
-/// pointer, outside any stream capture.  A row's scales start every (cols / 32 rounded up to 8) f16; the copy and its
+/// pointer, outside any stream capture.  The engine loads the model file's copies (hc8_upload); this quantizer is the
+/// tests' and the reference tools/convert/hc8.py matches bit for bit.  A row's scales start every (cols / 32 rounded up to 8) f16; the copy and its
 /// scales are one allocation (one prefetch range).
 void hc8_prepare(const uint16_t* w, int rows, int cols);
 /// Registers a copy made elsewhere (a hc8 table): `q` [rows][cols] int8 and the f16 scales [rows][srow] (the layout

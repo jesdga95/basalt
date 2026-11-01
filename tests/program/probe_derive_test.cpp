@@ -60,7 +60,7 @@ int main() {
     at.push_back({1, 96, 0.85, true, 300});   // the saved profile is never the adapt pick
     CHECK(suggest_adapt(base, 251, 0.01, at) == "--adapt-every 64 --adapt-swaps 256 --adapt-decay 0.70 (adapt test +12%)");
     CHECK(suggest_saved_profile("p.bin", 251, 262, 0.01) == "--expert-profile-save p.bin (adapt test +4%)");
-    CHECK(suggest_saved_profile("p.bin", 251, 240, 0.01) == "no --expert-profile-save (adapt test +5% on the model's profile)");
+    CHECK(suggest_saved_profile("p.bin", 251, 240, 0.01) == "no --expert-profile-save (adapt test +5% on the engine's profile)");
     CHECK(suggest_saved_profile("p.bin", 251, 252, 0.01).empty());
     CHECK(format_adapt_line({{1, 96, 0.85, false, 250}, {64, 256, 0.7, false, 190}, {1, 96, 0.85, false, 252},
                              {1, 96, 0.85, true, 255}}, 0.01) ==
