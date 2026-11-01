@@ -15,7 +15,7 @@ import pathlib
 import re
 import struct
 import sys
-from collections import defaultdict, deque
+from collections import deque
 
 import numpy as np
 import os
@@ -515,68 +515,6 @@ def draft_vocab_bytes(path, n_vocab: int | None = None) -> bytes:
     if ids.size == 0 or (ids < 0).any() or (n_vocab is not None and (ids >= n_vocab).any()):
         raise ConvertError(f"{path}: an id lies outside the vocabulary" if ids.size else f"{path}: empty")
     return data
-
-
-# ------------------------------------------------------------------ the expert profile
-PROFILE_HEADER = struct.Struct("<5I")
-
-
-def read_trace(path, n_layers: int, n_expert: int) -> dict:
-    """(layer, expert) -> count over `--dump-routing` records (int32 layer, int32 k, k int32 ids, k float32 weights)."""
-    blob = pathlib.Path(path).read_bytes()
-    off, freq = 0, defaultdict(int)
-    while off + 8 <= len(blob):
-        layer, k = struct.unpack_from("<ii", blob, off)
-        off += 8
-        if k < 0 or off + 8 * k > len(blob):
-            raise ConvertError(f"{path}: a truncated routing record")
-        for e in struct.unpack_from("<%di" % k, blob, off):
-            if 0 <= layer < n_layers and 0 <= e < n_expert:
-                freq[(layer, e)] += 1
-        off += 8 * k
-    return freq
-
-
-def rank_pairs(freq: dict, n_layers: int, n_expert: int) -> list:
-    """Routed pairs, most frequent first, then every other pair interleaved across layers (expert-major)."""
-    ranked, seen = [], set()
-    for p, _ in sorted(freq.items(), key=lambda kv: (-kv[1], kv[0])):
-        seen.add(p)
-        ranked.append(p)
-    for e in range(n_expert):
-        for layer in range(n_layers):
-            if (layer, e) not in seen:
-                ranked.append((layer, e))
-    return ranked
-
-
-def build_profile(ranked: list, n_layers: int, n_expert: int) -> bytes:
-    """The profile section: version, n_layers, n_expert, slots, n_ranked (uint32), the pairs (uint16 layer, uint16
-        expert), then the n_layers x n_expert int32 rank table (-1: not ranked)."""
-    table = [[-1] * n_expert for _ in range(n_layers)]
-    for slot, (layer, e) in enumerate(ranked):
-        table[layer][e] = slot
-    out = [PROFILE_HEADER.pack(1, n_layers, n_expert, len(ranked), len(ranked))]
-    out += [struct.pack("<HH", layer, e) for layer, e in ranked]
-    out += [struct.pack("<%di" % n_expert, *row) for row in table]
-    return b"".join(out)
-
-
-def profile_info(blob: bytes, n_layers: int | None = None, n_expert: int | None = None) -> dict:
-    """Checks a profile section and describes it."""
-    if len(blob) < PROFILE_HEADER.size:
-        raise ConvertError("profile: too short to hold a header")
-    ver, nl, ne, slots, n = PROFILE_HEADER.unpack_from(blob, 0)
-    if (n_layers is not None and nl != n_layers) or (n_expert is not None and ne != n_expert):
-        raise ConvertError(f"profile: {nl}x{ne}, but the model is {n_layers}x{n_expert}")
-    want = PROFILE_HEADER.size + 4 * n + 4 * nl * ne
-    if len(blob) != want:
-        raise ConvertError(f"profile: {len(blob)} bytes, expected {want} for {n} pairs of {nl}x{ne}")
-    return {"version": ver, "n_layer": nl, "n_expert": ne, "slots": slots, "n_pairs": n,
-            "layout": "5 x u32 LE (version, n_layer, n_expert, slots, n_pairs); then pairs: n_pairs x (u16 layer, "
-                      "u16 expert) in rank order; then table: n_layer x n_expert x i32 LE, the rank of each "
-                      "(layer, expert) or -1",
-            "pairs_offset": PROFILE_HEADER.size, "table_offset": PROFILE_HEADER.size + 4 * n}
 
 
 # ------------------------------------------------------------------ the n-gram table from a per-tensor FP8 checkpoint

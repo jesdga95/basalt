@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "basalt/kernels/q80_vhead.hpp"
 
 namespace basalt::core {
 
@@ -63,6 +64,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
     // chain-step kernels that start while the one before them still runs (the paths below all use the fused kernels)
     const bool pdl_ok = kv_par && !st_.kv_rot && qsa_dec_fused_supported(s) &&
                         qsa_dec_attn_supported(qsa_attn_pools(st_), s) && par_ && dec_draft_hcf() && have_pre_;
+    // in every full row the head's blocks start with the final mixer read (they read only weights before they wait)
+    const bool head_pdl = pdl_ok || (full && par_ && dec_draft_hcf());
     std::unique_ptr<PdlScope> psc;
     auto pscope = [&](bool first_plain) {
         psc.reset();
@@ -74,11 +77,12 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             native_qsa_rms_norm_weighted(data, gamma, data, cols, rows, EPS, cs);
             native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), p, cs);
         };
+        bool kv_side = false;   // K/V on the second stream
         if (reuse_row) {
             // the catch-up already ran this row's input branches, attention hyper-connection and K/V append, with
             // the same per-row arithmetic: its R, injection and mixed rows become row 0
             mtp_take_row(R_, HC * N, inj_, HC, mixed_, N, row_, cs);
-            native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
+            native_quantize_q8_1(mixed_, kv_open_ ? xqr_ : xq_, (int) N, T, cs);
         } else {
             // ---- the two input branches
             const WeightRef* we = wt_->find("token_embd.weight");
@@ -135,8 +139,11 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             }
             // ---- attention: K/V into the layer's own cache, then (full) dense attention over every cell
             if (!q8_done) native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
-            if (kv_par) fork(cs);   // K/V on the second stream, beside Q
-            const cudaStream_t ckv = kv_par ? cs2_ : cs;
+            // K/V on the second stream, beside Q (a round's catch-up: beside the draft row's query, joined before its
+            // attention)
+            kv_side = kv_par || (kv_defer_ && !full && par_ && kv_fused);
+            if (kv_side) fork(cs);
+            const cudaStream_t ckv = kv_side ? cs2_ : cs;
             pscope(true);   // the K/V branch follows the fork
             native_mmvq(GGML_Q8_0, q8("self_attn.k_proj.weight"), xq_, kcur_, (int) N, (int) (NKV * HD), T, ckv);
             native_mmvq(GGML_Q8_0, q8("self_attn.v_proj.weight"), xq_, vcur_, (int) N, (int) (NKV * HD), T, ckv);
@@ -166,10 +173,14 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                                    vcur_ + t * NKV * HD, s, cs, &st_.host);
             }
         }
-        if (!full) return true;
+        if (!full) {
+            kv_open_ = kv_side && !kv_par;
+            return true;
+        }
         pscope(false);   // the query follows the hc read (or its quantize)
         if (T == 1)   // read once a step: streamed past the layer's other weights in L2
-            native_q8_0_mmvq_stream(q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), cs);
+            native_q8_0_mmvq_stream(q8("self_attn.q_proj.weight"), kv_open_ ? xqr_ : xq_, qfull_, (int) N,
+                                    (int) (NH * 2 * HD), cs);
         else
             native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
         if (!st_.kv_rot && qsa_dec_fused_supported(s)) {
@@ -189,7 +200,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         }
         const QsaAttnPools pools = qsa_attn_pools(st_);
         if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
-        if (kv_par) join(cs);
+        if (kv_par || kv_open_) join(cs);
+        kv_open_ = false;
         pscope(true);   // the attention follows the join
         bool aq_done = false;
         if (!st_.kv_rot && qsa_dec_attn_supported(pools, s)) {   // the gate in the merge writes the q8_1 rows
@@ -293,7 +305,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             if (T != 1) { err = "mtp: the one-kernel mixer read runs one row"; return false; }
             HcFusedArgs h = hcf_args(fa, 1, xn_);
             if (hc_fused_q8_rows_ok()) { h.xq = xq_; mixer_q8 = true; }
-            h.next_early = pdl_ok;   // the head's blocks start with the read
+            h.next_early = head_pdl;   // the head's blocks start with the read
             hc_fused_read(h, cs);
             pscope_off();
         } else {
@@ -304,7 +316,10 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                         sample_ + t * N, dummy_inj_, cs);
         }
         if (fold_write) fork_next_hidden();
-        if (mixer_q8) pscope(false);   // the head follows the read
+        if (mixer_q8 && head_pdl) {   // the head follows the read
+            psc.reset();
+            psc.reset(new PdlScope(true, false));
+        }
         if (!mixer_q8) native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dvocab_ != nullptr;
         // the argmax drafts over the base rows only on tier 0
@@ -315,6 +330,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             (head_->type() == 13
                  ? basalt::kernels::q5k_proxy_top1(proxy_, dhead_, xq_, (int) nv, n_tier1_, dvocab_, out_ids_, probs_,
                                                    proxy_scratch_, cs)
+             : head_->type() == GGML_Q8_0
+                 ? basalt::kernels::q80_proxy_top1(proxy_, head_->weights(), xq_, (int) nv, n_tier1_, dvocab_, out_ids_,
+                                                   probs_, proxy_scratch_, cs, true)
                  : basalt::kernels::q6k_proxy_top1(proxy_, rows_mapped_ ? head_->weights() : (const void*) dhead_, xq_,
                                                    (int) nv, n_tier1_, dvocab_, out_ids_, probs_, proxy_scratch_, cs,
                                                    rows_mapped_)))
@@ -323,12 +341,14 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             q5k_head_top1(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, sub ? dvocab_ : nullptr,
                           out_ids_, probs_, top_scratch_, cs))
             return true;
-        if (rows_mapped_)   // the subset's rows of the main head, one row a step: the bits of the copy's rows
+        if (rows_mapped_ && head_->type() == GGML_Q8_0)   // the subset's rows of the main head: the bits of a copy's rows
+            q80_mmvq_rows(head_->weights(), dvocab_, xq_, head_logits_, (int) N, (int) nv, cs);
+        else if (rows_mapped_)
             native_q6_k_mmvq_rows(head_->weights(), dvocab_, xq_, head_logits_, (int) N, (int) nv, cs);
         else if (head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits
             q5k_head_mmvq(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
-        else if (head_->type() == GGML_Q8_0 && T == 1)   // read once a step: streamed past the layer's other weights
-            native_q8_0_mmvq_stream(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, cs);
+        else if (head_->planes())   // the whole head, in bit planes (a Q8_0 head's rows are always read by the map)
+            q80p_mmvq(head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         else
             native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         if (sub && n_xcap_ > 0)   // a context row without a token never wins (the other rows always have one)
