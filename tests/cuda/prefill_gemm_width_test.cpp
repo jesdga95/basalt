@@ -249,7 +249,7 @@ int check_shape(const Shape& s, cudaStream_t st, Gemm& g, cublasHandle_t h, unsi
         ? std::vector<std::pair<size_t, size_t>>{{0, 0}, {64, 0}, {128, 0}, {0, 64}, {0, 128}}
         : std::vector<std::pair<size_t, size_t>>{{0, 0}};
     Dev shifted_model_w(prepared && o.bf ? o.w_h.size() * 2 + 256 : 256);
-    for (const auto [offset, woff] : cases) {
+    for (const auto& [offset, woff] : cases) {
         void* const xptr = (char*) xs.p + offset;
         auto* const yptr = (float*) ((char*) ys.p + offset);
         const auto* wptr = (const uint16_t*) ((const char*) shifted_model_w.p + woff);
