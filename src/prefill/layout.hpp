@@ -37,7 +37,7 @@ struct Alloc {
     }
 };
 
-constexpr int64_t GEMM_SCRATCH = 32ll << 20;        // FP16 elements for the largest dequantized dense weight
+constexpr int64_t GEMM_SCRATCH = Gemm::kPrefillScratchElems;
 constexpr size_t GEMM_WS = 32u << 20;               // cuBLAS workspace
 
 // Which layers' experts go through MMQ (both weight types covered; the Q2_0 pack always - its blob

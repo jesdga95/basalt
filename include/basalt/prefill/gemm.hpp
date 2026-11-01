@@ -9,11 +9,20 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
+
+namespace basalt::core { class WeightTable; struct ModelGeometry; }
 
 namespace basalt::prefill {
 
 class Gemm {
 public:
+    static constexpr int64_t kPrefillScratchElems = 32ll << 20;
+    struct Shape {
+        bool bf16;
+        int64_t n, k, ldy;
+        int align;
+    };
     Gemm() = default;
     ~Gemm();
     Gemm(const Gemm&) = delete;
@@ -22,6 +31,10 @@ public:
     /// Prepares the current device's cuBLAS and cuBLASLt handles for the first Gemm there. A server calls this
     /// before sizing the expert cache so their device memory is already out of the free figure.
     static bool prepare_handle(std::string& err);
+    static std::vector<Shape> model_shapes(const core::WeightTable& wt, const core::ModelGeometry& g,
+                                           int64_t scratch_elems);
+    static bool prepare_model(const core::WeightTable& wt, const core::ModelGeometry& g, int64_t scratch_elems,
+                              std::string& err);
 
     /// `scratch_elems`: BF16 elements of the dequantization scratch (the largest weight dequantized at once).
     bool init(void* stream, int64_t scratch_elems, std::string& err);

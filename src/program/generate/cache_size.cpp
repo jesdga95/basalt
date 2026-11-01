@@ -74,9 +74,10 @@ int cache_size(Context& context) {
     const uint64_t max_cache_blob = basalt::kernels::cpu::expert_layout().max_blob;
     const uint64_t cache_slot_bytes = profile.empty() ? max_cache_blob : (max_cache_blob + 255) / 256 * 256;
     const bool auto_cache = o.expert_cache < 0;
+    if (o.serve && o.prefill_chunk > 0 &&
+        !basalt::prefill::Gemm::prepare_model(wt, g, basalt::prefill::Gemm::kPrefillScratchElems, err))
+        return fatal_start_error(err);
     if (o.expert_cache < 0) {
-        // the prompt path's cuBLAS handle is made now, so the free figure below already has its device memory out
-        if (o.serve && o.prefill_chunk > 0 && !basalt::prefill::Gemm::prepare_handle(err)) return fatal_start_error(err);
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         // The batched prompt path's chunk buffers are allocated later, so they are reserved here - an over-subscribed

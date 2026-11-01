@@ -1,6 +1,8 @@
 // src/prefill/gemm_plans.cpp - the FP16 / BF16 products' per-shape cuBLASLt algorithms (Gemm::pinned). Host code
 // only, so the standard containers it keeps are compiled by the host compiler alone.
 #include "basalt/prefill/gemm.hpp"
+#include "basalt/core/layout.hpp"
+#include "basalt/kernels/ngram.hpp"
 
 #include <cublasLt.h>
 #include <cuda_runtime.h>
@@ -35,6 +37,7 @@ constexpr int64_t kPlanCheckRows[] = {1, 2, 3, 5, 8, 17, 37, 64, 300, 1000, 4096
 constexpr int kPlanOffers = 32;
 constexpr size_t kPlanWs = 32u << 20;
 cublasLtHandle_t g_prepared_lt[16] = {};
+std::vector<Gemm::Shape> g_model_shapes[16];
 
 int alignment(const void* p) {
     const uintptr_t v = (uintptr_t) p;
@@ -70,6 +73,66 @@ struct Config {
     }
 };
 }  // namespace
+
+std::vector<Gemm::Shape> Gemm::model_shapes(const core::WeightTable& wt, const core::ModelGeometry& g,
+                                            int64_t scratch_elems) {
+    std::vector<Shape> result;
+    auto add = [&](bool bf16, int64_t n, int64_t k, int64_t ld, bool sliced) {
+        if (n <= 0 || k <= 0 || ld < n) return;
+        int64_t rows = n;
+        if (sliced && scratch_elems > 0) rows = std::min(n, scratch_elems / k);
+        if (rows <= 0) return;
+        for (int64_t off = 0; off < n; off += rows) {
+            const int64_t nr = std::min(rows, n - off);
+            for (int a = 2; a <= 256; a *= 2) result.push_back({bf16, nr, k, ld, a});
+        }
+    };
+    const char* native[] = {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight", "attn_q.weight",
+                            "attn_k.weight", "attn_v.weight", "attn_output.weight", "ffn_gate_shexp.weight",
+                            "ffn_up_shexp.weight", "ffn_down_shexp.weight"};
+    const char* bf16[] = {"hc_attn_down.weight", "hc_attn_up.weight", "hc_attn_inject.weight",
+                          "hc_ffn_down.weight", "hc_ffn_up.weight", "hc_ffn_inject.weight",
+                          "indexer.k_proj.weight", "indexer.q_proj.weight", "ffn_gate_inp.weight"};
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        const core::LayerView v(wt, l);
+        for (const char* name : native) if (const auto* w = v.get(name))
+            add(false, w->ne1, w->ne0, w->ne1, true);
+        for (const char* name : bf16) if (const auto* w = v.get(name)) {
+            const int64_t n = std::max<int64_t>(1, w->ne1);
+            add(true, n, w->ne0, n, false);
+            add(true, n, w->ne0, n, true);
+        }
+        for (const char* name : {"ssm_alpha.weight", "ssm_beta.weight"}) if (const auto* w = v.get(name)) {
+            add(true, std::max<int64_t>(1, w->ne1), w->ne0, 2 * g.ssm_v_heads, false);
+            add(true, std::max<int64_t>(1, w->ne1), w->ne0, 2 * g.ssm_v_heads, true);
+        }
+    }
+    add(true, 1, g.n_embd, 1, false);
+    add(false, 2 * g.n_ff, g.n_embd, 2 * g.n_ff, false);
+    add(false, g.n_embd, g.n_ff, g.n_embd, false);
+    add(true, g.hc_lr, g.hc_dim(), g.hc_lr, true);
+    add(true, g.hc_dim(), g.hc_lr, g.hc_dim(), true);
+    add(false, g.n_embd, g.n_embd, g.n_embd, true);
+    add(false, g.n_head_kv * g.head_dim, g.n_embd, g.n_head_kv * g.head_dim, true);
+    add(true, basalt::kernels::NG_HC_DIM, g.n_embd, basalt::kernels::NG_HC_DIM, false);
+    add(false, basalt::kernels::NG_HC_DIM, g.n_embd, basalt::kernels::NG_HC_DIM, true);
+    add(true, g.n_embd, g.n_embd, g.n_embd, false);
+    auto key = [](const Shape& s) { return std::tie(s.bf16, s.n, s.k, s.ldy, s.align); };
+    std::sort(result.begin(), result.end(), [&](const Shape& a, const Shape& b) { return key(a) < key(b); });
+    result.erase(std::unique(result.begin(), result.end(), [&](const Shape& a, const Shape& b) {
+        return key(a) == key(b);
+    }), result.end());
+    return result;
+}
+
+bool Gemm::prepare_model(const core::WeightTable& wt, const core::ModelGeometry& g, int64_t scratch_elems,
+                         std::string& err) {
+    if (!prepare_handle(err)) return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return true;
+    g_model_shapes[dev] = model_shapes(wt, g, scratch_elems);
+    return true;
+}
 
 bool Gemm::prepare_lt_handle(std::string& err) {
     int dev = 0;
