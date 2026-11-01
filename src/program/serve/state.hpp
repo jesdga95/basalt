@@ -279,6 +279,11 @@ private:
     // CUDA0 (from their RAM copy, as any other swap) and its coldest go to the CPU
     // routings a peer expert needs above CUDA0's victim before it moves
     static constexpr float promote_margin = 10.0f;
+    // the count at which a CPU-tier expert routed about once lately takes a slot the round leaves unused
+    static constexpr float once_bar = 1.0f;
+    // at most this many of them a round: more copies cost the CPU tier host memory bandwidth on routing that rarely
+    // comes back (JSON output)
+    static constexpr size_t kOnceSwaps = 16;
     // the round's swaps, best first: the most-routed missing experts against the least-routed resident ones, per
     // layer, or over all layers (`across`: the incoming expert takes a slot of the outgoing one's layer `lout`)
     struct Swap { float gain; int32_t layer, in, out, lout; };
@@ -294,6 +299,9 @@ private:
     std::vector<XSwap> xq{};
     int xq_stage{};
     bool xq_saturated{};
+    // since the start: the swaps the rounds queued, and those a round left for a later one (no free RAM place)
+    int64_t xq_swapped{};
+    int64_t xq_noplace{};
     // The landed words (Verifier::landed_words): a round's incoming copies are queued in layer order, each layer's
     // followed by a 4-byte copy of the round's number into the layer's word.  The copies' sources are a pinned
     // ring of rounds (every layer's word, then the round's number).
@@ -441,6 +449,7 @@ private:
     int64_t ba_rounds_l{};
     int64_t ba_h_l{};
     int64_t ba_m_l{};
+    int64_t ba_noplace{};   // the batch rounds' swaps deferred for want of a free RAM place
     double ba_ms{};
     JobRunner ba_thr{};   // queues the adaptive copies beside the windows
     bool ba_job{};
@@ -504,9 +513,10 @@ private:
     bool adapt_peers(const std::vector<int32_t>& r0, std::string& perr);
     void apply_pending(bool wait, bool exchanges = true);
     void rank_swaps(std::vector<Swap>& swaps, bool across);
+    void rank_once(std::vector<Swap>& swaps, size_t room);
     bool adapt();
     void xq_settle();
-    bool xq_round();
+    bool xq_round(std::vector<Swap>* ranked = nullptr);
     bool xq_advance(bool wait);
     bool xq_drain();
     void save_profile(const char* why);

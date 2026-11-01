@@ -4,8 +4,9 @@ namespace basalt::core {
 
 using namespace mtp_detail;
 
-// The attention projections' weights (fc_embedding, k, v, q, o) into L2 by the prefetch stream, from this point of
-// `from` on, while the chain's latency-bound kernels run; joined back by end_branches.
+// The attention projections' weights (fc_embedding, k, v, o) into L2 by the prefetch stream, from this point of
+// `from` on, while the chain's latency-bound kernels run; joined back by end_branches.  The query projection reads its
+// own weights right after the hc read, beside the K/V append.
 void MtpDrafter::pf_fork(cudaStream_t from) {
     if (!par_) return;
     const ModelGeometry& g = *g_;
@@ -17,7 +18,6 @@ void MtpDrafter::pf_fork(cudaStream_t from) {
     pf(q8("fc_embedding.weight"), q8_bytes(N, N));
     pf(q8("self_attn.k_proj.weight"), q8_bytes(NKV * HD, N));
     pf(q8("self_attn.v_proj.weight"), q8_bytes(NKV * HD, N));
-    pf(q8("self_attn.q_proj.weight"), q8_bytes(NH * 2 * HD, N));
     pf(q8("self_attn.o_proj.weight"), q8_bytes(N, NH * HD));
     pf_open_ = true;
 }
@@ -68,7 +68,8 @@ int MtpDrafter::diag_top(int j, int k, int32_t* ids, float* probs) const {
 }
 
 void MtpDrafter::end_branches() {
-    if (fork_open_) join(cs_);
+    if (fork_open_ || kv_open_) join(cs_);
+    kv_open_ = false;
     prefetch_end(cs_);
     fork_open_ = par_ = pre_next_ = have_pre_ = false;
 }

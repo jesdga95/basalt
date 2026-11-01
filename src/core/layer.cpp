@@ -545,6 +545,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             a->set_contents(n_kv + 1, std::move(rope_cos_host));
             a->set_contents(n_kv + 2, std::move(rope_sin_host));
         }
+        // mapped on the floor's grid: a deep request's pages go back to a shallower one, or to a streamed slot pool
+        a->set_extent_cells(g_kv_elastic);
         if (!a->map(std::min(g_kv_elastic, max_cells), err)) {
             basalt::log::error("basalt", "elastic KV: %s", err.c_str());
             delete a;

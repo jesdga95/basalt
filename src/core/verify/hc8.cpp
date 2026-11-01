@@ -57,9 +57,8 @@ uint64_t Verifier::hc8_plan_bytes(const std::function<bool(const std::string&)>&
     return total;
 }
 
-void Verifier::prepare_hc8(const WeightTable& wt, const ModelGeometry& g) {
-    if (!basalt::kernels::hc8_enabled()) return;
-    size_t from_table = 0;
+bool Verifier::prepare_hc8(const WeightTable& wt, const ModelGeometry& g, std::string& err) {
+    if (!basalt::kernels::hc8_enabled()) return true;
     const std::vector<Hc8Tensor> tensors = hc8_tensors(g);
     const uint64_t total = hc8_plan_bytes([&](const std::string& n) { return wt.find(n) != nullptr; }, g);
     int dev = 0;
@@ -67,46 +66,16 @@ void Verifier::prepare_hc8(const WeightTable& wt, const ModelGeometry& g) {
     LoadProgress progress(LoadProgress::cuda(dev), total);
     for (const Hc8Tensor& t : tensors) {
         const WeightRef* r = wt.find(t.name);
-        if (r == nullptr) continue;
-        const uint16_t* w = (const uint16_t*) r->data;
-        if (w != nullptr && hc8_table_adopt(t.name, w, t.rows, t.cols) != nullptr) {
-            ++from_table;
-        } else {
-            basalt::kernels::hc8_prepare(w, t.rows, t.cols);
+        if (r == nullptr || r->data == nullptr) continue;   // not held on this device
+        if (hc8_table_adopt(t.name, (const uint16_t*) r->data, t.rows, t.cols) == nullptr) {
+            err = "hc8: no 8-bit copy of " + t.name;
+            return false;
         }
         progress.add(hc8_copy_bytes(t));
     }
     progress.finish();
-    (void) from_table;
     basalt::log::info("basalt hc8", "8-bit hyper-connection copies, %.0f MiB of VRAM",
                  (double) basalt::kernels::hc8_bytes() / 1048576.0);
-}
-
-bool hc8_dump(const WeightTable& wt, const ModelGeometry& g, const std::vector<std::pair<std::string, const void*>>& extra,
-              const std::string& path, std::string& err) {
-    std::vector<Hc8Copy> copies;
-    auto add = [&](const std::string& name, const void* key) {
-        basalt::kernels::Hc8View v;
-        if (key == nullptr || !basalt::kernels::hc8_view(key, v)) return;
-        Hc8Copy c;
-        c.name = name;
-        c.rows = (uint32_t) v.rows;
-        c.cols = (uint32_t) v.cols;
-        c.srow = (uint32_t) v.srow;
-        c.data.resize(v.bytes);
-        if (cudaMemcpy(c.data.data(), v.q, v.bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
-            cudaGetLastError();
-            c.data.clear();
-            return;
-        }
-        copies.push_back(std::move(c));
-    };
-    for (const Hc8Tensor& t : hc8_tensors(g))
-        if (const WeightRef* r = wt.find(t.name)) add(t.name, r->data);
-    for (const auto& [name, key] : extra) add(name, key);
-    if (copies.empty()) { err = "hc8: there are no 8-bit copies to write"; return false; }
-    if (!hc8_write(path, copies, err)) return false;
-    basalt::log::info("basalt hc8", "wrote %zu copies to %s", copies.size(), path.c_str());
     return true;
 }
 
