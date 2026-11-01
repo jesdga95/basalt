@@ -82,6 +82,29 @@ int main() {
         check(cache.retained_bytes() == 0 && cache.size() == 1 && cache.evictions() == 0,
               "pressure drops retained storage before evicting parked conversations");
     }
+    {   // clear gives back everything the cache holds
+        auto one_layer = [] { ConversationKv layer; layer.k.resize(64); std::vector<ConversationKv> v; v.push_back(std::move(layer)); return v; };
+        ConversationCache cache(1 << 20, 4);
+        check(cache.put(image({1, 2, 3})) && cache.put(image({9, 8, 7})), "park two");
+        cache.retain(one_layer(), 16);
+        const size_t held = cache.bytes();
+        check(cache.clear() == held, "clear reports the bytes it held");
+        check(cache.size() == 0 && cache.bytes() == 0 && cache.retained_bytes() == 0, "clear leaves nothing parked or retained");
+        check(cache.best(std::vector<int64_t>{1, 2, 3, 4}, {}, true).tokens == 0, "a cleared conversation no longer matches");
+        check(cache.put(image({1, 2, 3})) && cache.size() == 1, "the cache parks again after a clear");
+        check(cache.take_spilled().empty(), "without spilling, a clear hands nothing to the tier below");
+    }
+    {   // with spilling on, a clear hands the parked conversations to the tier below
+        ConversationCache cache(1 << 20, 4);
+        cache.set_spill(true);
+        check(cache.put(image({1, 2, 3})) && cache.put(image({9, 8, 7})), "park two (spilling on)");
+        cache.clear();
+        check(cache.size() == 0 && cache.bytes() == 0, "the cleared cache holds nothing");
+        const auto spilled = cache.take_spilled();
+        check(spilled.size() == 2 && spilled[0].live.ids == std::vector<int32_t>{1, 2, 3} &&
+                  spilled[1].live.ids == std::vector<int32_t>{9, 8, 7},
+              "both wait for the tier below, oldest first");
+    }
     {   // retained K/V belongs to the session it was restored into
         int s0 = 0, s1 = 0;
         auto one_layer = [] { ConversationKv layer; layer.k.resize(64); std::vector<ConversationKv> v; v.push_back(std::move(layer)); return v; };
@@ -225,6 +248,46 @@ int main() {
         check(!disabled.put(image({1,2,3})) && !no_slots.put(image({1,2,3})), "disabled cache stores nothing");
         check(disabled.best(a,{},true).tokens == 0, "disabled cache has no matches");
     }
+    {   // an idle slot's conversation: outside the byte budget, at most `keep` of them, the longest parked leaving
+        ConversationCache off(0, 4);
+        off.put_slot(image({1, 2, 3}), 2);
+        check(off.size() == 1 && off.slot_size() == 1 && off.best(a, {}, true).tokens == 3,
+              "a cache without a budget keeps an idle slot's conversation");
+        off.put_slot(image({9, 8, 7}), 2);
+        off.put_slot(image({5, 6, 7}), 2);
+        check(off.slot_size() == 2 && off.best(a, {}, true).tokens == 0 && off.best(b, {}, true).tokens == 3,
+              "past `keep` the longest parked one leaves");
+        auto taken = off.take(off.best(b, {}, true).index);
+        check(taken.from_slot && off.slot_size() == 1 && off.slot_bytes() == off.bytes(),
+              "taking one gives its bytes back");
+        check(!off.put(std::move(taken)) && off.size() == 1, "a cache without a budget still parks nothing else");
+        check(off.clear() > 0 && off.slot_size() == 0 && off.slot_bytes() == 0 && off.size() == 0,
+              "a clear drops the idle slots' conversations too");
+    }
+    {   // beside a budget: the idle slots' conversations neither count against it nor leave for it
+        const size_t one = image({1, 2, 3}).bytes();
+        ConversationCache cache(one, 1);
+        cache.put_slot(image({9, 8, 7}), 4);
+        check(cache.put(image({1, 2, 3})), "a budgeted park fits beside an idle slot's conversation");
+        check(cache.put(image({5, 6})) && cache.size() == 2 && cache.slot_size() == 1 &&
+                  cache.best(b, {}, true).tokens == 3 && cache.best(a, {}, true).tokens == 0,
+              "the budget's evictions leave the idle slot's conversation");
+        cache.set_spill(true);
+        cache.put_slot(image({4, 4, 4}), 1);
+        const auto spilled = cache.take_spilled();
+        check(spilled.size() == 1 && spilled[0].live.ids == std::vector<int32_t>({9, 8, 7}) &&
+                  cache.slot_size() == 1 && cache.size() == 2,
+              "an idle slot's conversation past `keep` goes to the tier below");
+        SavedConversation turn = image({4, 4, 4, 5, 5});
+        ConversationCheckpoint cp;
+        cp.ids = {4, 4, 4};
+        turn.checkpoints.push_back(cp);
+        SavedConversation older = image({4, 4, 4, 1});
+        older.checkpoints.push_back(cp);
+        cache.put_slot(std::move(older), 4);
+        cache.put_slot(std::move(turn), 4);
+        check(cache.superseded() == 1 && cache.slot_size() == 2, "a later turn of the same conversation supersedes its copy");
+    }
     {
         // layer-split parking: checkpoints moved apart into stage parts and put back, no running state copied
         auto running = [](std::initializer_list<int32_t> ids, uint8_t salt, size_t parts) {
@@ -330,6 +393,12 @@ int main() {
         CheckpointBytes b;
         b.resize(big);
         check(b.data() == first, "a freed large checkpoint buffer is handed out again");
+        {
+            CheckpointBytes c;
+            c.resize(big);
+        }
+        check(CheckpointBytes::allocator_type::release_pooled() >= big, "the kept blocks are freed");
+        check(CheckpointBytes::allocator_type::release_pooled() == 0, "none is kept after that");
         check(b[0] == 9 && b[big - 1] == 4, "a reused buffer is not zeroed");
         CheckpointBytes small(100, 3), copy = small;
         check(copy.size() == 100 && copy[99] == 3, "small buffers still copy and fill");

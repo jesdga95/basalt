@@ -30,7 +30,9 @@ bool cpu_avx512_ok() {
         if ((xcr0 & 0xE6) != 0xE6) return false;          // the OS saves the AVX-512 state
         cpuid(7, 0);
         const unsigned ebx = r[1], ecx = r[2];
-        return ((ebx >> 16) & 1u) && ((ebx >> 30) & 1u) && ((ebx >> 31) & 1u) && ((ecx >> 11) & 1u) && ((ecx >> 1) & 1u);
+        // F, BW, VL, VNNI, VBMI, and BMI2 (the i-quant rows' sign masks)
+        return ((ebx >> 16) & 1u) && ((ebx >> 30) & 1u) && ((ebx >> 31) & 1u) && ((ecx >> 11) & 1u) && ((ecx >> 1) & 1u) &&
+               ((ebx >> 8) & 1u);
     }();
     return ok;
 }
@@ -110,13 +112,11 @@ bool cpu_sse42_ok() {
 
 std::string cpu_name() {
     unsigned r[12] = {};
-    unsigned a = 0, b = 0, c = 0, d = 0;
     {
         unsigned x[4];
         platform::cpuid(0x80000000u, 0, x);
-        a = x[0]; b = x[1]; c = x[2]; d = x[3];
+        if (x[0] < 0x80000004u) return "unknown";
     }
-    if (a < 0x80000004u) return "unknown";
     for (unsigned i = 0; i < 3; ++i) {
         unsigned x[4];
         platform::cpuid(0x80000002u + i, 0, x);

@@ -53,8 +53,8 @@ def parse(cli: list[str], cfg=None):
 
 
 def engine_parser_flags() -> dict:
-    """{flag: takes a value} for every flag the engine's argument parser in generate.cpp accepts."""
-    src = (ROOT / "src/program/generate.cpp").read_text()
+    """{flag: takes a value} for every flag the engine's argument parser accepts."""
+    src = (ROOT / "src/program/cli/arguments.cpp").read_text()
     body = src[src.index('if (a == "--help"'):]
     body = body[:body.index("--gpu-stages")]
     out = {}
@@ -155,6 +155,18 @@ class Precedence(unittest.TestCase):
         self.assertEqual(file_words, ["--spec", "7", "--max-context", "32768", "--kv", "int8"])
         self.assertEqual(cli_words, ["--spec", "5", "--kv", "fp16", "--resident-experts"])
 
+    def test_route_tail_skip_config_words(self):
+        # the optional-value flag: a number is its value, true is the bare flag, false leaves it off
+        for value, words in ((7, ["--route-tail-skip", "7"]), (True, ["--route-tail-skip"]), (False, [])):
+            _, _, file_words, _ = parse([], {"engine": {"route-tail-skip": value}})
+            self.assertEqual(file_words, words)
+        _, _, _, cli_words = parse(["--route-tail-skip", "--resident-experts"])
+        self.assertEqual(cli_words, ["--route-tail-skip", "--resident-experts"])
+
+    def test_route_prior_config_words(self):
+        _, _, file_words, _ = parse([], {"engine": {"route-prior": 1.5}})
+        self.assertEqual(file_words, ["--route-prior", "1.5"])
+
     def test_the_command_line_wins_over_the_file(self):
         # the engine reads its words in order and a later flag wins
         _, _, file_words, cli_words = parse(["--kv", "fp16"], {"engine": {"kv": "int8"}})
@@ -247,17 +259,23 @@ class SamplingOptions(unittest.TestCase):
 
     def test_bad_values(self):
         for flag, bad in (("--temperature", "-1"), ("--temperature", "hot"), ("--temperature", "nan"),
-                          ("--top-p", "0"), ("--top-p", "1.5"), ("--min-p", "2"), ("--top-k", "0"),
-                          ("--top-k", "65"), ("--top-k", "2.5"), ("--presence-penalty", "-1"),
-                          ("--repetition-penalty", "0"), ("--penalty-last-n", "-1"), ("--seed", "0")):
+                          ("--top-p", "0"), ("--top-p", "1.5"), ("--min-p", "2"), ("--top-k", "-2"),
+                          ("--top-k", "2.5"), ("--presence-penalty", "inf"), ("--repetition-penalty", "0"),
+                          ("--penalty-last-n", "-1"), ("--penalty-last-n", "4097"), ("--seed", "1.5")):
             with self.assertRaises(SystemExit, msg=(flag, bad)):
                 parse([flag, bad])
         with self.assertRaises(SystemExit):
-            parse([], {"server": {"top_k": 100}})
+            parse([], {"server": {"top_k": -5}})
+
+    def test_values_the_engine_honours(self):
+        a = parse(["--top-k", "0", "--seed", "0", "--presence-penalty", "-0.5", "--penalty-last-n", "4096"])[0]
+        self.assertEqual(a.sampling_launch, {"top_k": 0, "seed": 0, "presence_penalty": -0.5, "penalty_last_n": 4096})
+        self.assertEqual(parse(["--top-k", "1000"])[0].sampling_launch, {"top_k": 1000})
 
     def test_the_model_file_check_is_the_same(self):
-        with self.assertRaisesRegex(SystemExit, "sampling.top_k=100"):
-            sampling_defaults_from_config({"sampling": {"top_k": 100}})
+        with self.assertRaisesRegex(SystemExit, "sampling.top_k=-5"):
+            sampling_defaults_from_config({"sampling": {"top_k": -5}})
+        self.assertEqual(sampling_defaults_from_config({"sampling": {"top_k": 100}}), {"top_k": 100})
 
     def test_startup_line_marks_the_source(self):
         self.assertEqual(sampling_line({"temperature": 0.8, "top_k": 20, "top_p": 0.9}, {"temperature"}, {"top_k"}),
@@ -315,6 +333,13 @@ class SlotContext(unittest.TestCase):
         self.assertEqual(self.context(["--parallel", "4", "--max-context", "262144"],
                                       {"server": {"slot-full-context": True}}), 262144)
 
+    def test_answer_room_switch(self):
+        """On by default; off by --no-answer-room or the config's "answer-room": false (a switch on by default)."""
+        self.assertTrue(parse([])[0].answer_room)
+        self.assertFalse(parse(["--no-answer-room"])[0].answer_room)
+        self.assertFalse(parse([], {"server": {"answer-room": False}})[0].answer_room)
+        self.assertTrue(parse([], {"server": {"answer-room": True}})[0].answer_room)
+
 
 class EveryOption(unittest.TestCase):
     def sample(self, act):
@@ -337,7 +362,8 @@ class EveryOption(unittest.TestCase):
     def test_every_server_option_by_both_paths(self):
         ap = build_parser()
         for name, act in server_options(ap).items():
-            if name in ("api-key", "engine-bin", "grammar"):   # grammar is on by default: no-grammar differs, see test_grammar
+            # grammar and answer-room are on by default: their no- forms differ (test_grammar, test_answer_room_switch)
+            if name in ("api-key", "engine-bin", "grammar", "answer-room"):
                 continue
             v = "localhost" if name == "host" else self.sample(act)
             if isinstance(act, argparse._AppendAction):

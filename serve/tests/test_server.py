@@ -32,7 +32,7 @@ from types import SimpleNamespace  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 CTX = 4096
-ANSWER = "xy" * 1000                             # alternating bytes: not one repeated token (ended at 256)
+ANSWER = "xy" * 1000
 
 
 class RecordingEngine(MockEngine):
@@ -643,7 +643,7 @@ class EffortAtTheEnd(unittest.TestCase):
         return self.svc.encode_prompt(messages, None, kw)
 
     def checkpoint(self, ids, tail, resume=0):
-        """Where the engine checkpoints a prompt (the tokens before it), as generate.cpp's serve loop does."""
+        """Where the engine checkpoints a prompt (the tokens before it), as the serve loop (src/program/serve) does."""
         turn_at = next((i for i in range(len(ids) - 1, resume, -1) if ids[i] == self.TURN), -1)
         if turn_at > 0 and tail:
             i = next((i for i in range(turn_at - 1, resume, -1) if ids[i] == self.TURN), None)
@@ -1067,30 +1067,84 @@ class ClientShapes(unittest.TestCase):
 
 
 class SamplingKeys(unittest.TestCase):
-    """The GEN line's sampling keys: top_k 0 or above 64 becomes 64; a penalty always carries its window."""
+    """The GEN line's sampling keys carry each value as sent; a penalty without a window gets the default one."""
 
     def keys(self, **sampling):
         return ProcessEngine.sampling_keys(sampling).split()
 
-    def test_top_k(self):
-        self.assertIn("top_k=10", self.keys(temperature=0.7, top_k=10))
-        self.assertIn("top_k=64", self.keys(temperature=0.7, top_k=64))
-        self.assertIn("top_k=64", self.keys(temperature=0.7, top_k=0))
-        self.assertIn("top_k=64", self.keys(temperature=0.7, top_k=100))
-        for bad in (-1, True, 2.5, "20"):
-            self.assertFalse([k for k in self.keys(temperature=0.7, top_k=bad) if k.startswith("top_k=")], bad)
+    def test_values_as_sent(self):
+        for top_k in (10, 64, 65, 100, 0, -1, 248320):
+            self.assertIn(f"top_k={top_k}", self.keys(temperature=0.7, top_k=top_k))
+        self.assertIn("top_k=20", self.keys(temperature=0.7, top_k=20.0))     # a whole JSON number
+        self.assertIn("top_p=1.0", self.keys(temperature=0.7, top_p=1))
+        self.assertIn("min_p=0.0", self.keys(temperature=0.7, min_p=0))
+        for seed in (0, 1, -5, 2 ** 63):
+            self.assertIn(f"seed={seed}", self.keys(temperature=0.7, seed=seed))
+        self.assertFalse([k for k in self.keys(temperature=0) if k.startswith("temperature")])   # 0 is greedy
+        self.assertEqual(self.keys(), [])
 
     def test_relaxed_drafting(self):
         self.assertIn("relax=0.3", self.keys(temperature=1.0, relaxed_drafting=0.3))
         self.assertIn("relax=0", self.keys(temperature=1.0, relaxed_drafting=False))
         self.assertIn("relax=0.0", self.keys(temperature=1.0, relaxed_drafting=0))
-        for bad in (True, 1.5, -0.1, "0.3", None):
-            self.assertFalse([k for k in self.keys(temperature=1.0, relaxed_drafting=bad) if k.startswith("relax")], bad)
 
     def test_penalty_window(self):
         self.assertIn("penalty_last_n=64", self.keys(presence_penalty=1.5))
         self.assertIn("penalty_last_n=4096", self.keys(repetition_penalty=1.1, penalty_last_n=4096))
+        self.assertIn("penalty_last_n=0", self.keys(repetition_penalty=1.1, penalty_last_n=0))
         self.assertFalse([k for k in self.keys(temperature=0.7) if k.startswith("penalty")])
+
+
+class SamplingChecked(unittest.TestCase):
+    """A request's sampling value out of range is a 400 naming the field; one in range is never changed."""
+
+    def test_the_rules(self):
+        from serve.config import checked_sampling
+        good = {"temperature": 0, "top_p": 1, "top_k": 0, "min_p": 1, "presence_penalty": -1.5,
+                "frequency_penalty": 2, "repetition_penalty": 1.1, "penalty_last_n": 4096, "seed": 0,
+                "relaxed_drafting": False}
+        checked_sampling(good)
+        checked_sampling({"top_k": -1, "seed": -7, "top_k_unknown": "x", "temperature": None})
+        bad = [("temperature", -0.1), ("temperature", float("nan")), ("temperature", "0.7"), ("top_p", 0),
+               ("top_p", 1.5), ("top_k", -2), ("top_k", 2.5), ("top_k", True), ("min_p", 1.5),
+               ("repetition_penalty", 0), ("presence_penalty", float("inf")), ("penalty_last_n", 4097),
+               ("penalty_last_n", -1), ("seed", 1.5), ("seed", 2 ** 64), ("relaxed_drafting", 1.5),
+               ("relaxed_drafting", True)]
+        for key, value in bad:
+            with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, f"^{key}: expected"):
+                checked_sampling({key: value})
+
+    def test_a_bad_value_is_a_400_before_the_stream(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "ok", max_context=CTX)
+        httpd = serve(Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja")), port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            for path, body in (("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+                               ("/v1/messages", {"messages": [{"role": "user", "content": "hi"}]}),
+                               ("/v1/responses", {"input": "hi"})):
+                for stream in (False, True):
+                    with self.subTest(path=path, stream=stream):
+                        data = {"model": "qwen3.8-flash-next", "max_tokens": 4, "top_k": -3, "stream": stream, **body}
+                        req = urllib.request.Request(base + path, headers={"Content-Type": "application/json"},
+                                                     data=json.dumps(data).encode())
+                        with self.assertRaises(urllib.error.HTTPError) as cm:
+                            urllib.request.urlopen(req, timeout=30)
+                        with cm.exception as e:
+                            self.assertEqual(e.code, 400)
+                            self.assertIn("top_k", e.read().decode())
+            self.assertEqual(engine.requests, [])
+            data = {"model": "qwen3.8-flash-next", "max_tokens": 4, "top_k": 1000, "seed": 0,
+                    "messages": [{"role": "user", "content": "hi"}]}
+            req = urllib.request.Request(base + "/v1/chat/completions", headers={"Content-Type": "application/json"},
+                                         data=json.dumps(data).encode())
+            with urllib.request.urlopen(req, timeout=30) as r:
+                self.assertEqual(r.status, 200)
+            self.assertIn(" top_k=1000", ProcessEngine.sampling_keys(engine.requests[0][1]))
+            self.assertIn(" seed=0", ProcessEngine.sampling_keys(engine.requests[0][1]))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 class GpuChoice(unittest.TestCase):
@@ -1419,33 +1473,30 @@ class PcieShare(unittest.TestCase):
         self.assertIn("end=length  hit=60.0%  pcie=20.0%", out.getvalue())
 
 
-class RepeatStop(unittest.TestCase):
-    """One token repeated repeat_stop_tokens times in a row ends the reply as "length"; 0 turns it off."""
+class RepeatedToken(unittest.TestCase):
+    """A reply that repeats one token is served as the model writes it: "length" only at max_tokens."""
 
-    def run_reply(self, script, limit=None):
+    def run_reply(self, script, max_new):
         tok = ByteTokenizer()
         svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
-        if limit is not None:
-            svc.repeat_stop_tokens = limit
-        ids = tok.encode("hi")
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            done = [x for kind, x in svc.run(ids, False, None, 3000, {}, threading.Event()) if kind == "done"][0]
-        return done, out.getvalue()
+        events, done = [], None
+        with contextlib.redirect_stdout(io.StringIO()):
+            for kind, x in svc.run(tok.encode("hi"), False, None, max_new, {}, threading.Event()):
+                if kind == "event":
+                    events.append(x)
+                elif kind == "done":
+                    done = x
+        return done, "".join(ev.text or "" for ev in events if ev.kind == "content")
 
-    def test_a_long_run_is_ended(self):
-        done, log = self.run_reply("ok " + "!" * 1000 + " never")
-        self.assertEqual(done["finish"], "length")
-        self.assertEqual(done["completion_tokens"], 3 + 256)
-        self.assertIn("repeated one token ('!') 256 times", log)
+    def test_a_long_run_ends_where_the_model_ends_it(self):
+        done, text = self.run_reply("ok " + "0" * 1000 + " fine", 3000)
+        self.assertEqual((done["finish"], done["completion_tokens"]), ("stop", 3 + 1000 + 5 + 1))
+        self.assertEqual(text, "ok " + "0" * 1000 + " fine")
 
-    def test_short_runs_and_off(self):
-        done, _ = self.run_reply("=" * 255 + " fine")
-        self.assertEqual(done["finish"], "stop")
-        done, log = self.run_reply("!" * 1000, limit=0)
-        self.assertEqual((done["finish"], done["completion_tokens"]), ("stop", 1001))
-        self.assertNotIn("repeated one token", log)
-        done, _ = self.run_reply("ab" * 400, limit=8)       # alternating tokens are not one run
-        self.assertEqual(done["finish"], "stop")
+    def test_length_is_max_tokens(self):
+        done, text = self.run_reply("0" * 3000, 1000)
+        self.assertEqual((done["finish"], done["completion_tokens"]), ("length", 1000))
+        self.assertEqual(text, "0" * 1000)
 
 
 class DraftHeadHint(unittest.TestCase):
@@ -1563,6 +1614,18 @@ class StartFailureLog(unittest.TestCase):
         self.assertEqual(engine_error("basalt error: x y"), "x y")
         self.assertIsNone(engine_error("basalt error: "))
         self.assertIsNone(engine_error("basalt warning: x"))
+
+    def test_route_warnings_reach_the_start_output(self):
+        from serve.engine.progress import engine_warning
+        self.assertEqual(
+            engine_warning("basalt: warning: --route-tail-skip 9 drops low-ranked missed experts"),
+            "--route-tail-skip 9 drops low-ranked missed experts")
+
+    def test_route_prior_warning_reaches_the_start_output(self):
+        from serve.engine.progress import engine_warning
+        self.assertEqual(
+            engine_warning("basalt: warning: --route-prior 0.5 changes expert routing"),
+            "--route-prior 0.5 changes expert routing")
 
     def test_marked_lines_of_any_area(self):
         from serve.engine.progress import engine_error, engine_ram_floor, engine_warning, start_errors
@@ -2783,19 +2846,57 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(b["timings"]["prompt_n"] + b["timings"]["cache_n"], b["usage"]["prompt_tokens"])
 
     def test_the_budget_wraps_up_the_thinking(self):
-        from serve.service import REASONING_WRAP_UP
+        from serve.service import REASONING_CLOSE
         code, b = self.openai(reasoning_budget_tokens=20)
         self.assertEqual(code, 200, b)
         msg = b["choices"][0]["message"]
-        wrap = REASONING_WRAP_UP.split("</think>")[0]
+        wrap = REASONING_CLOSE.split("</think>")[0]
         self.assertEqual(msg["reasoning_content"], ThinkingEngine.THOUGHT[:20] + wrap)
         self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
         self.assertEqual(b["choices"][0]["finish_reason"], "stop")
         first, second = self.engine.prompts
-        extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
+        extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
         self.assertEqual(second, first + self.tok.encode(ThinkingEngine.THOUGHT[:20]) + extra)   # a prefix + more
         self.assertEqual(b["usage"]["completion_tokens"], 20 + len(extra) + len(ThinkingEngine.ANSWER) + 1)
         self.assertEqual(b["usage"]["prompt_tokens"], len(first))
+
+    def test_a_token_repeated_in_the_thinking_ends_it(self):
+        """256 of one token in a row inside the thinking: the thinking is ended and the model answers."""
+        from serve.service import REASONING_CLOSE
+        self.engine.THOUGHT = "Let me see. " + "0" * 400
+        code, b = self.openai(max_tokens=2000)
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertEqual(msg["reasoning_content"], "Let me see. " + "0" * 256 + REASONING_CLOSE.split("</think>")[0])
+        self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+        first, second = self.engine.prompts
+        extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+        self.assertEqual(second, first + self.tok.encode("Let me see. " + "0" * 256) + extra)
+
+    def test_a_shorter_run_in_the_thinking_and_any_run_in_the_answer_stay(self):
+        self.engine.THOUGHT = "Let me see. " + "0" * 255 + "1" + "0" * 255
+        self.engine.ANSWER = "0" * 600
+        code, b = self.openai(max_tokens=2000)
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertEqual((msg["reasoning_content"], msg["content"]), (self.engine.THOUGHT, "0" * 600))
+        self.assertEqual(len(self.engine.prompts), 1)
+
+    def test_the_loop_safeguard_can_be_turned_off(self):
+        self.svc.thinking_loop_tokens = 0
+        self.engine.THOUGHT = "Let me see. " + "0" * 400
+        code, b = self.openai(max_tokens=2000)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], self.engine.THOUGHT)
+        self.assertEqual(len(self.engine.prompts), 1)
+
+    def test_a_looped_thinking_that_fills_the_cap_is_length(self):
+        """No room left after the end of the thinking: finish_reason stays "length"."""
+        self.engine.THOUGHT = "0" * 400
+        code, b = self.openai(max_tokens=260)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["finish_reason"], "length")
 
     def test_a_turn_ended_while_thinking_is_closed_and_answered(self):
         from serve.service import REASONING_CLOSE
@@ -2817,8 +2918,140 @@ class ThinkingBudget(unittest.TestCase):
         msg = b["choices"][0]["message"]
         self.assertEqual((msg["content"], b["choices"][0]["finish_reason"]), ("The ", "stop"))
 
+    def test_answer_room_wraps_up_long_thinking_without_a_budget(self):
+        """From max_tokens 1024 on, thinking with no budget keeps the answer a quarter of the cap: 1024 - 512."""
+        from serve.service import REASONING_CLOSE
+        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4               # 736 reasoning tokens, more than the 512
+        code, b = self.openai(max_tokens=1024)
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertEqual(msg["reasoning_content"], self.engine.THOUGHT[:512] + REASONING_CLOSE.split("</think>")[0])
+        self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+
+    def test_answer_room_cuts_a_budget_at_or_near_max_tokens(self):
+        from serve.service import REASONING_CLOSE
+        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
+        code, b = self.openai(max_tokens=1024, reasoning_budget_tokens=1000)
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertEqual(msg["reasoning_content"], self.engine.THOUGHT[:512] + REASONING_CLOSE.split("</think>")[0])
+        self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
+
+    def test_answer_room_off_and_below_its_cap(self):
+        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
+        self.svc.answer_room = False                                   # --no-answer-room: thinks it all out
+        code, b = self.openai(max_tokens=1024)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], self.engine.THOUGHT)
+        self.svc.answer_room = True                                    # below max_tokens 1024: left as it was
+        self.engine.THOUGHT = ThinkingEngine.THOUGHT
+        code, b = self.openai(max_tokens=400)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
+        self.assertEqual(len(self.engine.prompts), 2)                  # one pass each, no wrap-up
+
+    def test_answer_room_preserves_explicit_opt_outs_and_budget_precedence(self):
+        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
+        self.svc.reasoning_budget_tokens = 20
+        for fields in ({"reasoning_budget_tokens": 0, "thinking_budget_tokens": 10},
+                       {"thinking_budget_tokens": 0, "thinking": {"budget_tokens": 10}},
+                       {"thinking": {"budget_tokens": 0}}):
+            with self.subTest(fields=fields):
+                code, b = self.openai(max_tokens=1024, **fields)
+                self.assertEqual(code, 200, b)
+                self.assertEqual(b["choices"][0]["message"]["reasoning_content"], self.engine.THOUGHT)
+
+    def test_answer_room_keeps_smaller_budgets_and_clamps_server_defaults(self):
+        from serve.service import REASONING_CLOSE
+        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
+        for default, fields, expected in ((0, {"reasoning_budget_tokens": 100}, 100),
+                                          (100, {}, 100), (1000, {}, 512),
+                                          (1000, {"reasoning_budget_tokens": 100}, 100)):
+            with self.subTest(default=default, fields=fields):
+                self.svc.reasoning_budget_tokens = default
+                code, b = self.openai(max_tokens=1024, **fields)
+                self.assertEqual(code, 200, b)
+                self.assertEqual(b["choices"][0]["message"]["reasoning_content"],
+                                 self.engine.THOUGHT[:expected] + REASONING_CLOSE.split("</think>")[0])
+                self.assertEqual(b["choices"][0]["message"]["content"], ThinkingEngine.ANSWER)
+                self.assertLessEqual(b["usage"]["completion_tokens"], 1024)
+
+    def test_answer_room_uses_the_engine_clipped_cap(self):
+        from serve.prompt import PromptText
+        from serve.service import REASONING_CLOSE
+        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
+        self.engine.takes_text = True
+        original = self.engine.generate
+
+        effective_cap = 1024
+
+        def clipped(ids, max_new, sampling, cancel, embeddings=None):
+            if isinstance(ids, PromptText):
+                yield None                              # waiting for the engine's prompt count
+                ids.set_counted(len(ids.ids()), effective_cap)
+                max_new = effective_cap
+                yield None                              # the PT heartbeat
+                ids = ids.ids()
+            yield from original(ids, max_new, sampling, cancel, embeddings)
+
+        self.engine.generate = clipped
+        code, b = self.openai(max_tokens=8192)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"],
+                         self.engine.THOUGHT[:512] + REASONING_CLOSE.split("</think>")[0])
+        self.assertEqual(b["choices"][0]["message"]["content"], ThinkingEngine.ANSWER)
+        self.assertLessEqual(b["usage"]["completion_tokens"], 1024)
+        effective_cap = 400
+        code, b = self.openai(max_tokens=8192)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], self.engine.THOUGHT[:400])
+        self.assertEqual(b["choices"][0]["finish_reason"], "length")
+
+    def test_answer_room_reserves_a_quarter_of_an_8192_token_cap(self):
+        from serve.service import REASONING_CLOSE
+        self.engine.max_context = 16384
+        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 40
+        code, b = self.openai(max_tokens=8192)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"],
+                         self.engine.THOUGHT[:6144] + REASONING_CLOSE.split("</think>")[0])
+        self.assertEqual(b["choices"][0]["message"]["content"], ThinkingEngine.ANSWER)
+        extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+        self.assertEqual(b["usage"]["completion_tokens"], 6144 + len(extra) + len(ThinkingEngine.ANSWER) + 1)
+
+    def test_answer_room_on_both_apis_streaming_and_nonstreaming(self):
+        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
+        for path in ("/v1/messages", "/v1/chat/completions"):
+            for stream in (False, True):
+                with self.subTest(path=path, stream=stream):
+                    code, b = self.post(path, {"model": self.svc.model, "max_tokens": 1024, "stream": stream,
+                                              "messages": [{"role": "user", "content": "2+2?"}]})
+                    self.assertEqual(code, 200, b)
+                    if stream:
+                        events = [json.loads(line[6:]) for line in b.splitlines()
+                                  if line.startswith("data: {")]
+                        if path == "/v1/messages":
+                            answer = "".join(e["delta"].get("text", "") for e in events
+                                             if e["type"] == "content_block_delta")
+                        else:
+                            answer = "".join(e["choices"][0].get("delta", {}).get("content", "")
+                                             for e in events if e.get("choices"))
+                    elif path == "/v1/messages":
+                        answer = "".join(e.get("text", "") for e in b["content"] if e["type"] == "text")
+                    else:
+                        answer = b["choices"][0]["message"]["content"]
+                    self.assertEqual(answer, ThinkingEngine.ANSWER)
+
+    def test_answer_room_does_not_enable_thinking(self):
+        self.engine.THOUGHT = ""
+        code, b = self.openai(max_tokens=1024, reasoning_effort="none")
+        self.assertEqual(code, 200, b)
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.assertEqual(b["choices"][0]["message"]["content"], ThinkingEngine.ANSWER)
+
     def test_anthropic_stream(self):
-        from serve.service import REASONING_WRAP_UP
+        from serve.service import REASONING_CLOSE
         code, raw = self.post("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 400, "stream": True,
                                                "reasoning_budget_tokens": 30,
                                                "messages": [{"role": "user", "content": "2+2?"}]})
@@ -2826,13 +3059,13 @@ class ThinkingBudget(unittest.TestCase):
         evs = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
         thinking = "".join(e["delta"].get("thinking", "") for e in evs if e["type"] == "content_block_delta")
         text = "".join(e["delta"].get("text", "") for e in evs if e["type"] == "content_block_delta")
-        self.assertEqual(thinking, ThinkingEngine.THOUGHT[:30] + REASONING_WRAP_UP.split("</think>")[0])
+        self.assertEqual(thinking, ThinkingEngine.THOUGHT[:30] + REASONING_CLOSE.split("</think>")[0])
         self.assertEqual(text, ThinkingEngine.ANSWER)
         self.assertEqual(evs[-2]["delta"]["stop_reason"], "end_turn")
 
     def test_thinking_budget_tokens_is_the_same_budget(self):
-        from serve.service import REASONING_WRAP_UP
-        wrap = REASONING_WRAP_UP.split("</think>")[0]
+        from serve.service import REASONING_CLOSE
+        wrap = REASONING_CLOSE.split("</think>")[0]
         code, b = self.openai(thinking_budget_tokens=20)
         self.assertEqual(code, 200, b)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT[:20] + wrap)
@@ -2865,8 +3098,8 @@ class ThinkingBudget(unittest.TestCase):
         return "".join(e["delta"].get("thinking", "") for e in evs if e["type"] == "content_block_delta")
 
     def test_anthropics_budget_tokens_is_the_same_budget(self):
-        from serve.service import REASONING_WRAP_UP
-        wrap = REASONING_WRAP_UP.split("</think>")[0]
+        from serve.service import REASONING_CLOSE
+        wrap = REASONING_CLOSE.split("</think>")[0]
         body = {"model": "qwen3.8-flash-next", "max_tokens": 400, "stream": True,
                 "messages": [{"role": "user", "content": "2+2?"}]}
         code, raw = self.post("/v1/messages", {**body, "thinking": {"type": "enabled", "budget_tokens": 30}})
@@ -2884,7 +3117,7 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(len(self.engine.prompts), 1)
 
     def test_no_room_left_to_answer(self):
-        code, b = self.openai(reasoning_budget_tokens=20, max_tokens=40)    # 20 thought + the wrap-up > 40
+        code, b = self.openai(reasoning_budget_tokens=20, max_tokens=22)    # 20 thought + the close > 22
         self.assertEqual(b["choices"][0]["finish_reason"], "length")
         self.assertEqual(len(self.engine.prompts), 1)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT[:20])

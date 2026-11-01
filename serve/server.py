@@ -22,14 +22,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable as a script
 from serve import ROOT, service  # noqa: E402
-from serve.config import (build_parser, check_engine_flags, engine_flags_of, engine_line,  # noqa: E402
-                          grammar_words, parse_settings, sampling_defaults_from_config, sampling_line)
+from serve.config import (build_parser, check_engine_flags,  # noqa: E402
+                          engine_flags_of, engine_line, grammar_words, parse_settings, sampling_defaults_from_config,
+                          sampling_line)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
-from serve.engine.flags import flag_index  # noqa: E402
+from serve.engine.flags import flag_index, flag_value  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.engine.process import ProcessEngine  # noqa: E402
-from serve.engine.vision import (EngineVision, Vision, check_gpu, child_env, engine_args, gpu_plan,  # noqa: E402
+from serve.engine.vision import (EngineVision, Vision, check_gpu, child_env, engine_args, gpu_card_name, gpu_plan,  # noqa: E402
                                  gpu_text, gpus_in_play, vision_card, vision_env, vision_line)
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.handler import Server, serve  # noqa: E402
@@ -114,11 +115,9 @@ def main() -> int:
             except ValueError as e:
                 fail(f"gpu: {e}")
             card = vision_card(mode)
-            if card is not None:                       # a numbered sidecar card, checked like gpu before it starts
-                try:
-                    gpu_plan(a.engine_bin, str(card))
-                except ValueError as e:
-                    fail(f"vision: {e}")
+            if card is not None:                       # a numbered sidecar card: the engine's sm_120 rule is the
+                if gpu_card_name(card) is None:        # engine's; the sidecar is its own build and says whether
+                    fail(f"vision: GPU {card} is not found by nvidia-smi")   # the sidecar checks the card itself
             for note in plan.get("notes") or []:
                 print(f"[server] {note}", flush=True)
             if plan.get("warning"):
@@ -182,16 +181,14 @@ def main() -> int:
         if a.grammar and not has_grammar:
             print(tagged("warning", "grammar is on but this engine has no --grammar; requests go without one"), flush=True)
         gwords = grammar_words(known_flags)
-        try:
-            engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=lazy)
-        except EngineStartError as e:
-            print(f"[server] error: {e}", file=sys.stderr, flush=True)
-            if e.log:
-                print(f"[server] engine log: {e.log}", file=sys.stderr, flush=True)
-            return 1
+        cdir = flag_value(engine_args(cfg), "--conversation-cache-dir")
+        cmib = flag_value(engine_args(cfg), "--conversation-cache-disk-mib") or "0"
+        if cdir and cmib != "0":
+            print(tagged("disk", f"conversations={cdir} disk-mib={cmib}"), flush=True)
+        # always built unloaded: the load itself (below) is the lazy path's, started here instead of by a request
+        engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=True)
         if isinstance(vision, EngineVision):
             vision.attach(engine)
-        warn_tight_ram(engine.info.get("arena_mib"))
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."], batch=a.parallel or 0), None, dict(a.sampling_launch)
@@ -225,19 +222,37 @@ def main() -> int:
         if "*" in svc.cors_origins and not svc.api_key:
             print(tagged("warning", "any web page can use the model (--api-key KEY)"), flush=True)
     svc.idle_unload_s = a.idle_unload or 0
+    svc.idle_sleep_s = a.idle_sleep or 0
     svc.min_free_vram_mib = a.min_free_vram_mib or 0
     svc.reasoning_budget_tokens = a.reasoning_budget_tokens or 0
+    svc.answer_room = a.answer_room
+    svc.thinking_loop_tokens = a.thinking_loop_tokens
     svc.gpu_indices = gpus_in_play(cfg, engine_args(cfg) if not a.mock_engine else [])   # the cards /metrics reads
     svc.gpu_index = svc.gpu_indices[0]
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
+    svc.start_idle_sleep()
+    svc.on_loaded = lambda: announce()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
-    if getattr(engine, "batch", 0):
-        print(tagged("slots", f"par={engine.batch} ctx/slot={engine.max_context}"
-                     + (" (slot-full-context)" if a.slot_full_context else "") + ", others queue"), flush=True)
-    tail = f"ctx={engine.max_context} images={'on' if vision else 'off'}" + (" api-key=on" if svc.api_key else "")
-    print(tagged("ready", f"http://{here}:{a.port}/v1  openai+anthropic  {tail}"), flush=True)
-    print(tagged("stats", f"http://{here}:{a.port}/"), flush=True)
+
+    first_load = [True]
+
+    def announce():
+        """After every weights load: the slot table once, then the weights line (no URL)."""
+        if first_load[0]:
+            first_load[0] = False
+            if not a.mock_engine:
+                warn_tight_ram(engine.info.get("arena_mib"))
+            if getattr(engine, "batch", 0):
+                print(tagged("slots", f"par={engine.batch} ctx/slot={engine.max_context}"
+                             + (" (slot-full-context)" if a.slot_full_context else "") + ", others queue"), flush=True)
+        print(tagged("weights", f"loaded, ctx={engine.max_context} images={'on' if vision else 'off'}"), flush=True)
+
+    # the one place the addresses and the APIs are printed: the server listens before the model loads
+    print(tagged("ready", f"http://{here}:{a.port}/v1  openai+anthropic  stats http://{here}:{a.port}/"
+                 + (" api-key=on" if svc.api_key else "")), flush=True)
+    if a.mock_engine:
+        announce()
     if a.host not in LOOPBACK_NAMES:
         # reachable from other devices: print the addresses
         ips = lan_addresses()
@@ -247,6 +262,8 @@ def main() -> int:
             print(tagged("network", f"port={a.port}"), flush=True)
         if exposed_without_key(a.host, svc.api_key):
             print(tagged("warning", "no api key, open to the network (--api-key KEY)"), flush=True)
+    if not a.mock_engine and not lazy:
+        svc.start_load()                                # the page and the API are up; requests wait for the load
     if a.open:
         import webbrowser
         webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
@@ -257,11 +274,17 @@ def main() -> int:
         signal.signal(signal.SIGTERM, on_sigterm)
     except (ValueError, OSError, AttributeError):         # not the main thread
         pass
+    rc = 0
     try:
         while True:
             time.sleep(1)                               # a timed wait keeps Ctrl+C deliverable
+            if svc.boot_error is not None:              # the start-up load failed: requests waiting on it get the error
+                time.sleep(2)
+                rc = 1
+                raise KeyboardInterrupt
     except KeyboardInterrupt:
-        print("[server] stopping (Ctrl+C again to force)", flush=True)
+        if not rc:
+            print("[server] stopping (Ctrl+C again to force)", flush=True)
         closers = [svc.stop, httpd.shutdown, getattr(engine, "close", None), vision.close if vision else None]
         for close in filter(None, closers):
             try:
@@ -270,7 +293,7 @@ def main() -> int:
                 if getattr(engine, "proc", None):
                     engine.proc.kill()
         print("[server] stopped", flush=True)
-    return 0
+    return rc
 
 
 if __name__ == "__main__":

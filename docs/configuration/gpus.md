@@ -27,8 +27,7 @@ expert tier`:
   2,559 rows when it is slower (a slower card costs a longer chunk more than the experts it saves the main card's link).
   When its memory is faster than the main card's it takes a share of each GDN mixer and of the head (one start line
   each; see [the GDN split](../precision/gdn-split.md)).
-- **Idle.** Where a process gets no GPU-to-GPU access (Windows), the cards after the main one stay idle and a warning
-  says so. The engine runs up to three expert tiers: a fifth card and later ones stay idle.
+- **Idle.** The engine runs up to three expert tiers: a fifth card and later ones stay idle.
 
 Three or more cards are community-tested: the path is checked here on two cards, with two expert tiers sharing the
 second one. Reports from machines with three or four cards are welcome (see [community](../community.md)).
@@ -86,7 +85,7 @@ smaller chunks of a deep prompt, whose KV leaves the main card fewer slots to le
 routed-only with that card computing its experts' rows of it in a main-card read stays on the main card (the split would
 give that share up); with matched cards, a chunk under 4,096 tokens does. On three or more cards it runs when they all match (memory bandwidth and VRAM
 within 10%); on three or more unlike cards it is off until measured on such a set, and the start line prints what it
-would cost. Off with `--peer-exclusive`, without the RAM copy of the experts, with KV streaming, a
+would cost. Off with `--peer-exclusive`, without the RAM copy of the experts, a
 control vector, experts other than NVFP4 (the price is fitted to those), when RAM or a tier's slots are short, or when a
 tier card keeps under 256 MiB free beside its stage (a read loads its kernels there; `peer-reserve-mib` sets the room).
 Everything that grows with the prompt sits in the lent slots, so a longer prompt that does not fit them is read on the

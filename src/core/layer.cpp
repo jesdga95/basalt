@@ -396,7 +396,8 @@ bool moe_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
 // combines `parts` with them, so a caller of this wrapper must have `parts` ready BEFORE the call - which
 // is what `session_token` (the uncaptured path) does and what the captured loop CANNOT, which is why the
 // loop uses the halves separately.
-if (!moe_route(tables, g, layer, k, b, x, stream, err, db)) return false;    return moe_finish(tables, g, layer, k, b, x, parts, out, stream, err);}
+if (!moe_route(tables, g, layer, k, b, x, stream, err, db)) return false;
+    return moe_finish(tables, g, layer, k, b, x, parts, out, stream, err);}
 // ================================ the QSA mixer ================================
 namespace {using basalt::kernels::QsaIndexerBuffers;using basalt::kernels::QsaShapes;
 /// The geometry the QSA kernels want, from the one place that defines it.  `ModelGeometry` carries the widths
@@ -488,7 +489,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.kv_int8 = g_kv_int8 && !g_kv_q4;
     st.kv_q4 = g_kv_q4;
     // Hybrid K8V4, main layers only (the drafter's state is created with the globals toggled to INT8 -
-    // mtp.cpp). Streamed mode is refused outright; generate.cpp validates it too, this is the backstop.
+    // core/mtp/load.cpp). Streamed mode is refused outright; program/cli/options.cpp validates it too, this is the backstop.
     if (g_kv_hybrid && ring_cells <= 0) {
         if (p.mode == 1) {
             basalt::log::error("basalt", "hybrid K8V4 KV does not support --kv-resident streaming");
@@ -544,6 +545,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             a->set_contents(n_kv + 1, std::move(rope_cos_host));
             a->set_contents(n_kv + 2, std::move(rope_sin_host));
         }
+        // mapped on the floor's grid: a deep request's pages go back to a shallower one, or to a streamed slot pool
+        a->set_extent_cells(g_kv_elastic);
         if (!a->map(std::min(g_kv_elastic, max_cells), err)) {
             basalt::log::error("basalt", "elastic KV: %s", err.c_str());
             delete a;
@@ -789,9 +792,10 @@ void qsa_prompt_state_clear(const QsaState& st, const ModelGeometry& g, void* st
 bool qsa_state_copy_cells(QsaState& dst, const QsaState& src, const ModelGeometry& g, int64_t cell0, int64_t cell1,
                           const DeviceCopy& copy, std::string& err) {
     const QsaShapes s = qsa_shapes(g);
-    if (dst.kv_mode != 0 || src.kv_mode != 0 || dst.kv_int8 != src.kv_int8 || dst.kv_q4 != src.kv_q4 ||
+    if (dst.kv_mode == 2 || src.kv_mode == 2 || (dst.kv_mode == 1 && !dst.host.present()) ||
+        (src.kv_mode == 1 && !src.host.present()) || dst.kv_int8 != src.kv_int8 || dst.kv_q4 != src.kv_q4 ||
         dst.kv_hybrid != src.kv_hybrid) {
-        err = "a QSA state copy needs two whole-in-VRAM states of one format";
+        err = "a QSA state copy needs two states of one format, each whole in VRAM or streamed";
         return false;
     }
     if (cell0 < 0 || cell1 < cell0 || cell1 > dst.max_cells || cell1 > src.max_cells) {
@@ -803,14 +807,22 @@ bool qsa_state_copy_cells(QsaState& dst, const QsaState& src, const ModelGeometr
     const uint64_t pr = (uint64_t) s.n_head_kv * s.page_size;
     const uint64_t code = pr * s.head_dim, scale = pr * (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2;
     const uint64_t q4 = pr * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+    // a streamed state's cells are its host copy, which has the identity layout of a whole pool
+    const bool dh = dst.kv_mode == 1, sh = src.kv_mode == 1;
     struct Arr { void* d; const void* s; uint64_t page; };
     std::vector<Arr> arrs;
     if (src.kv_hybrid) arrs = {{dst.k_q, src.k_q, code}, {dst.k_scale, src.k_scale, scale}, {dst.v_q4, src.v_q4, q4}};
-    else if (src.kv_q4) arrs = {{dst.k_q4, src.k_q4, q4}, {dst.v_q4, src.v_q4, q4}};
+    else if (src.kv_q4)
+        arrs = {{dh ? dst.host.k_q4 : dst.k_q4, sh ? src.host.k_q4 : src.k_q4, q4},
+                {dh ? dst.host.v_q4 : dst.v_q4, sh ? src.host.v_q4 : src.v_q4, q4}};
     else if (src.kv_int8)
-        arrs = {{dst.k_q, src.k_q, code}, {dst.v_q, src.v_q, code}, {dst.k_scale, src.k_scale, scale},
-                {dst.v_scale, src.v_scale, scale}};
-    else arrs = {{dst.k_pool, src.k_pool, code * 2}, {dst.v_pool, src.v_pool, code * 2}};
+        arrs = {{dh ? dst.host.k_q : dst.k_q, sh ? src.host.k_q : src.k_q, code},
+                {dh ? dst.host.v_q : dst.v_q, sh ? src.host.v_q : src.v_q, code},
+                {dh ? dst.host.k_scale : dst.k_scale, sh ? src.host.k_scale : src.k_scale, scale},
+                {dh ? dst.host.v_scale : dst.v_scale, sh ? src.host.v_scale : src.v_scale, scale}};
+    else
+        arrs = {{dh ? dst.host.k_pool : dst.k_pool, sh ? src.host.k_pool : src.k_pool, code * 2},
+                {dh ? dst.host.v_pool : dst.v_pool, sh ? src.host.v_pool : src.v_pool, code * 2}};
     const int64_t p0 = cell0 / s.page_size, p1 = (cell1 + s.page_size - 1) / s.page_size;
     bool ok = true;
     for (const Arr& a : arrs)
@@ -997,7 +1009,10 @@ SForm f_k, f_v, f_o, f_q;    if (!sform_of(*w_attnk, f_k, v.name("attn_k.weight"
 // k and v, with the activation THIS layer's tensors ask for.  Both are K-quants in every QSA layer of this
 // artifact, but the dispatch is here for the same reason it is in `gdn_layer`: the pack decides per tensor,
 // and "it happens to be uniform here" is the assumption that was wrong for `attn_q`.
-if (!gemv_quantized(*w_attnk, p_k, f_k, b.x_q8_0, b.x_q8k, b.kcur, g.n_embd, g.n_head_kv * g.head_dim,                        v.name("attn_k.weight"), stream, err, x)) return false;    if (!gemv_quantized(*w_attnv, p_v, f_v, b.x_q8_0, b.x_q8k, b.vcur, g.n_embd, g.n_head_kv * g.head_dim,                        v.name("attn_v.weight"), stream, err, x, w_attnk->native_data && w_attnv->native_data)) return false;    dump_slot(dump, g, layer, b.vcur,                            (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim,                            (uint64_t) g.n_head_kv * g.head_dim, stream);    if (!normalize_rotate(b.kcur, w_kn, (int) g.n_head_kv, (int) g.head_dim)) return false;
+if (!gemv_quantized(*w_attnk, p_k, f_k, b.x_q8_0, b.x_q8k, b.kcur, g.n_embd, g.n_head_kv * g.head_dim,                        v.name("attn_k.weight"), stream, err, x)) return false;
+    if (!gemv_quantized(*w_attnv, p_v, f_v, b.x_q8_0, b.x_q8k, b.vcur, g.n_embd, g.n_head_kv * g.head_dim,                        v.name("attn_v.weight"), stream, err, x, w_attnk->native_data && w_attnv->native_data)) return false;
+    dump_slot(dump, g, layer, b.vcur,                            (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim,                            (uint64_t) g.n_head_kv * g.head_dim, stream);
+    if (!normalize_rotate(b.kcur, w_kn, (int) g.n_head_kv, (int) g.head_dim)) return false;
 // ---- 5. into the cache, and the indexer's append (which pools AND rotates on a block completion).
 // EVERY ENTRY POINT FROM HERE ON IS THE CAPTURABLE ONE: the per-token counts come from `st.step` and every
 // launch is sized from a capacity in `st`/`b`, so this sequence can be captured and replayed.  The
@@ -1055,7 +1070,9 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
                                            b.v_scratch, b.v_scratch, stream);
     }
     else if (st.kv_q4) basalt::kernels::kv_gather_q4_step(st.k_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
-    else if (st.kv_int8) kv_gather_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, b.ids, st.step, cap, s,                                 b.k_scratch, b.v_scratch, stream);    else kv_gather_step(st.k_pool, st.v_pool, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch,                   stream);    qsa_attend_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap, s, b.attn, nullptr, stream);
+    else if (st.kv_int8) kv_gather_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, b.ids, st.step, cap, s,                                 b.k_scratch, b.v_scratch, stream);
+    else kv_gather_step(st.k_pool, st.v_pool, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch,                   stream);
+    qsa_attend_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap, s, b.attn, nullptr, stream);
     }
     if (st.kv_rot || st.kv_hybrid) basalt::kernels::fwht256_inplace_cuda(b.attn, g.n_head, stream);   // the output back: H is self-inverse
     dump_slot(dump, g, layer, b.attn, (uint64_t) 2 * g.n_embd + 2 * g.hc,                            (uint64_t) g.n_head * g.head_dim, stream);    {        const uint64_t vs = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim +                            (uint64_t) 2 * g.n_head_kv * g.head_dim;        dump_slot(dump, g, layer, (const float*) b.v_scratch, vs,                            (uint64_t) g.n_head_kv * g.head_dim / 2, stream);        dump_slot(dump, g, layer, (const float*) b.ids, vs + (uint64_t) g.n_head_kv * g.head_dim / 2, 4, stream);        dump_slot(dump, g, layer, (const float*) st.step,                            vs + (uint64_t) g.n_head_kv * g.head_dim / 2 + 4, 4, stream);    }
@@ -1065,7 +1082,8 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
 try {
     native_qsa_gate_apply(b.attn, b.q_full, b.attn32, (int) g.n_head, (int) g.head_dim, stream);
 } catch (const std::exception& error) { err = v.name("qsa_gate") + ": " + error.what(); return false; }
-    if (!w_attno->native_data) quantize_q8_K(b.attn32, b.attn_q8k, g.n_head * g.head_dim, stream);    if (w_attno->native_data) {
+    if (!w_attno->native_data) quantize_q8_K(b.attn32, b.attn_q8k, g.n_head * g.head_dim, stream);
+    if (w_attno->native_data) {
     if (!gemv_quantized(*w_attno, p_o, f_o, nullptr, b.attn_q8k, out,
         g.n_head * g.head_dim, g.n_embd, v.name("attn_output.weight"), stream, err, b.attn32)) return false;
 } else {
@@ -1394,5 +1412,6 @@ bool block_layer(const WeightTable& tables, const ModelGeometry& g, int64_t laye
 // The two halves back to back.  `parts` must be THIS layer's experts and must be ready before the call -
 // which holds for `session_token`, where the caller supplies them, and does NOT hold for a host loop that
 // has only just seen the router.  That is why the captured path calls the halves separately.
-if (!block_layer_pre(tables, g, layer, pos, pos_base, gb, qst, qb, mb, k, bb, stream, err, db, ple))        return false;    return block_layer_post(tables, g, layer, k, mb, bb, parts, stream, err);}}
+if (!block_layer_pre(tables, g, layer, pos, pos_base, gb, qst, qb, mb, k, bb, stream, err, db, ple))        return false;
+    return block_layer_post(tables, g, layer, k, mb, bb, parts, stream, err);}}
 // namespace basalt::core

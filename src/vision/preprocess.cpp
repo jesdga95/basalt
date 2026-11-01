@@ -15,9 +15,23 @@
 
 namespace basalt::vision {
 
-bool decode_image(const uint8_t* data, size_t len, Image& out, std::string& err) {
+bool decode_image(const uint8_t* data, size_t len, Image& out, std::string& err, int64_t max_pixels) {
+    if (data == nullptr || len == 0) { err = "empty image"; return false; }
+    const int n = (int) std::min<size_t>(len, 0x7fffffff);
     int w = 0, h = 0, c = 0;
-    uint8_t* px = stbi_load_from_memory(data, (int) std::min<size_t>(len, 0x7fffffff), &w, &h, &c, 3);
+    // The header first: a file that claims more pixels than the guard allows is refused before the decode allocates
+    // anything.  stb's own size checks still apply afterwards.
+    if (!stbi_info_from_memory(data, n, &w, &h, &c)) {
+        err = stbi_failure_reason() ? stbi_failure_reason() : "unreadable image";
+        return false;
+    }
+    if ((int64_t) w * (int64_t) h > max_pixels) {
+        const std::string limit = max_pixels >= (1 << 20) ? std::to_string(max_pixels >> 20) + " megapixels"
+                                                          : std::to_string(max_pixels) + " pixels";
+        err = "the image is " + std::to_string(w) + "x" + std::to_string(h) + " pixels; the limit is " + limit;
+        return false;
+    }
+    uint8_t* px = stbi_load_from_memory(data, n, &w, &h, &c, 3);
     if (!px) {
         err = stbi_failure_reason() ? stbi_failure_reason() : "unreadable image";
         return false;

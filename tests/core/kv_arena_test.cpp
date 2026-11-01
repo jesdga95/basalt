@@ -113,6 +113,23 @@ int main() {
         if (!b.map(b.max_cells(), err) || b.cells() != b.max_cells() || !all(b.array(1), (kPages + 2) * kRow, 0))
             return fail("map all with a tail", err);
     }
-    std::puts("kv arena: whole pages backed and zeroed on demand, given back past the cut, addresses fixed");
+    // on a grid, one deep map is given back to the first grid line at or above the cut, the cells below kept
+    {
+        constexpr int64_t kGrid = 128 * kPage;
+        basalt::core::KvArena d;
+        if (!d.open(page_bytes, kPages, kPage, err)) return fail("open grid", err);
+        d.set_extent_cells(kGrid);
+        if (!d.map(kGrid, err) || !d.map(8 * kGrid, err) || d.cells() < 8 * kGrid) return fail("map grid", err);
+        if (cudaMemset(d.array(0), 0x5a, (size_t) (3 * kGrid / kPage * page_bytes[0])) != cudaSuccess) return fail("fill grid");
+        if (!d.unmap(2 * kGrid + 1, err) || d.cells() != 3 * kGrid || d.mapped_bytes() != d.bytes_for(3 * kGrid))
+            return fail("unmap to the grid", err);
+        if (!all(d.array(0), 3 * kGrid / kPage * page_bytes[0], 0x5a)) return fail("kept below the grid line");
+        basalt::core::KvArena one;
+        if (!one.open(page_bytes, kPages, kPage, err) || !one.map(kGrid, err) || !one.map(8 * kGrid, err) ||
+            !one.unmap(2 * kGrid + 1, err) || one.mapped_bytes() != one.bytes_for(8 * kGrid))
+            return fail("one mapping per call stays", err);
+    }
+    std::puts("kv arena: whole pages backed and zeroed on demand, given back past the cut, addresses fixed, mappings "
+              "on a grid");
     return 0;
 }

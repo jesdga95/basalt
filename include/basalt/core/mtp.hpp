@@ -34,6 +34,7 @@
 namespace basalt::core {
 
 class NativeHead;
+struct ConversationKv;
 
 /// The longest draft chain (the drafter's `max_t`): a verify window holds at most kVerifyMaxT rows, a chain may run on
 /// past it so a window launched ahead has drafts.
@@ -74,6 +75,9 @@ public:
     /// A new request: the draft head's extra rows are cleared, and the tokens of the prompt that the
     /// draft subset lacks queue for them.
     void begin_request(const int64_t* prompt, int64_t n);
+    /// The target's candidates at a window's committed rows (`n` ids, -1 skipped): the ones the subset lacks queue for
+    /// context rows, while some stay free for the reply's own picks.
+    void note_candidates(const int32_t* ids, int n);
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
     /// Captures every conditional draft graph (each draft-head tier, each window width) now rather than at its first
@@ -99,7 +103,7 @@ public:
     void kv_restore(int64_t upto);
     /// The VRAM bind() will allocate for a native head of `head_row_bytes` per vocabulary row: the draft logits and
     /// the draft head over rt/draft_vocab.bin's subset.  The expert cache is sized before bind(), so it reserves this.
-    uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const;
+    uint64_t bind_bytes(uint64_t head_row_bytes, int head_type, int64_t n_vocab) const;
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);
 
@@ -131,13 +135,18 @@ public:
     /// `st_` the graphs address holds one sequence at a time, `use_store` swaps another in (the old one's written
     /// cells go to its store).  Store `n` is the main sequence (the prompt path and solo requests), so `use_main`
     /// must precede anything that reads or writes it.  Needs the K/V fully resident.
-    /// `cells[i]` (optional) is slot i's context: its store holds that many cells, the main store the full state.
+    /// `cells[i]` (optional) is slot i's context, the main store's the full state's.  With a draft window a store
+    /// keeps only its sequence's last cells (the window and a turn's roll-back), as a ring.
     void set_stores(int n, std::vector<int64_t> cells = {}) { n_stores_ = n; store_cells_ = std::move(cells); }
     int main_store() const { return n_stores_; }
     bool use_store(int id, std::string& err);
     bool use_main(std::string& err) { return use_store(n_stores_, err); }
     /// Cells [0, cells) of sequence `from` into sequence `to`.
     bool copy_store(int from, int to, int64_t cells, std::string& err);
+    /// Cells [0, cells) of sequence `id` as a conversation image of the working state's layout (the pages its store
+    /// keeps; the others are the working state's bytes), leaving the working state on the sequence it holds.
+    /// The device is idle.
+    bool save_store(int id, int64_t cells, ConversationKv& out, std::string& err);
     /// `draft` for sequence `id` from the window rows `R_rows` (device, row 0 of the sequence's segment).
     /// Copies a verify window's rows (all slots) out of the buffer the draft graphs also use, so each slot's
     /// `draft_seq` / `defer_rows` reads its own rows intact; null on failure.
@@ -160,11 +169,13 @@ public:
     int64_t rounds = 0;
 
     /// the prompt path computes this layer's prompt K/V in batches (Prefill::draft_kv): its tensors, its K/V
-    /// state, the first cell a round can still read, its device, and a wait for its own stream.
+    /// state, the first cell a round can still read, its device, and a wait for its own stream.  The caller
+    /// reports the cells it wrote with `wrote`.
     const float* tensor_f32(const char* name) const { return f32(name); }
     const uint16_t* tensor_bf16(const char* name) const { return bf16(name); }
     const void* tensor_q8(const char* name) const { return q8(name); }
     QsaState& kv_state_rw();
+    void wrote(int64_t lo, int64_t hi) { note_cells(lo, hi); }
     int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
     int device() const { return device_; }
     bool idle(std::string& err) {
@@ -260,7 +271,12 @@ private:
     int n_stores_ = 0, cur_ = 0;
     std::vector<int64_t> store_hi_;
     std::vector<int64_t> store_cells_;   ///< set_stores: the slots' contexts
-    std::vector<int64_t> store_pages_;   ///< pages each store holds (the main store: all of st_'s)
+    std::vector<int64_t> store_pages_;   ///< pages each sequence can reach (the main store: all of st_'s)
+    std::vector<int64_t> store_ring_;    ///< pages each store's buffer keeps: the sequence's last ones, page p at p % ring
+    /// cells below a sequence's end that a turn may roll back to and still find its draft window in the store
+    static constexpr int64_t kStoreRollback = 16384;
+    /// pages [a, b) of one sequence's K/V into another's; `*_work`: that side is the working state (all pages in place)
+    void copy_pages(int to, bool to_work, int from, bool from_work, int64_t a, int64_t b, const KvArr* lay, int na);
     int64_t dirty_lo_ = 0, dirty_hi_ = 0;   // empty when hi <= lo
     static constexpr int kKeepRows = 16;
     float* rkeep_ = nullptr;    ///< a window's rows, kept while the slots draft one after another
@@ -292,8 +308,10 @@ private:
     float* diag_ = nullptr;                         ///< spec_log: the draft head's logits per chain step (pinned)
     int64_t diag_stride_ = 0;
     std::vector<int32_t> diag_map_;                 ///< spec_log: the draft head's row -> token id
-    // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
+    // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head.  A Q6_K head
+    // reads its rows from the main head through dvocab_ (rows_mapped_); other formats keep a copy in dhead_.
     uint8_t* dhead_ = nullptr;
+    bool rows_mapped_ = false;
     int32_t* dvocab_ = nullptr;
     int64_t n_dvocab_ = 0;
     // the subset's leading base rows (n_tier1_) serve the argmax drafts unless the text just held a

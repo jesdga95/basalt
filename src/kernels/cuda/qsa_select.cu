@@ -644,7 +644,8 @@ __device__ __forceinline__ float heads_score(float a0, float a1, float a2, float
 
 // Block scores with the queries in registers (a lane holds its four dims of every head and query), so a CTA stages
 // nothing and needs no barrier, and the next block's key row is loaded before the current one is scored. Per (block,
-// query) the sums are block_scores_kernel's bit for bit. NQ is the register capacity: at least the call's query count.
+// query) the sums are block_scores_kernel's bit for bit. NQ is the register capacity: CTA row y takes the call's queries
+// [y NQ, y NQ + NQ), so a launch of gridDim.y rows scores up to gridDim.y NQ queries.
 template <int NQ>
 __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_rg_kernel(const float* __restrict__ pooled,
                                                                            const float* __restrict__ dead,
@@ -658,6 +659,14 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_rg_kernel(const
         bool all = true;
         for (int q = 0; q < nq; ++q) all = all && steps[q * kStepCount + kStepNKv] <= steps[q * kStepCount + kStepWidth];
         if (all) return;
+    }
+    {   // this CTA row's queries
+        const int q0 = (int) blockIdx.y * NQ;
+        if (q0 >= nq) return;
+        q_idx += (size_t) q0 * IDX_HEADS * IDX_DIM;
+        steps += (size_t) q0 * kStepCount;
+        out += (size_t) q0 * max_blocks;
+        nq = nq - q0 < NQ ? nq - q0 : NQ;
     }
     int64_t top = 0;
     for (int q = 0; q < nq; ++q) {
@@ -1019,9 +1028,12 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         else if (nq <= 4)
             launch_pdl(block_scores_rg_kernel<4>, g, dim3(SCORE_WARPS * 32), 0, (cudaStream_t) stream, pooled, dead, q_idx,
                        steps, (int) nq, max_blocks, scores, skip_identity ? 1 : 0);
-        else
-            launch_pdl(block_scores_rg_kernel<8>, g, dim3(SCORE_WARPS * 32), 0, (cudaStream_t) stream, pooled, dead, q_idx,
-                       steps, (int) nq, max_blocks, scores, skip_identity ? 1 : 0);
+        else {   // rows of four queries side by side, the grid's CTAs split between them; a later row's key reads
+                 // mostly hit L2
+            const unsigned rows = (unsigned) ((nq + 3) / 4);
+            launch_pdl(block_scores_rg_kernel<4>, dim3(g.x / rows > 0 ? g.x / rows : 1u, rows), dim3(SCORE_WARPS * 32), 0,
+                       (cudaStream_t) stream, pooled, dead, q_idx, steps, (int) nq, max_blocks, scores, skip_identity ? 1 : 0);
+        }
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) { basalt::log::error("basalt", "qsa_block_scores rg: %s", cudaGetErrorString(e)); std::exit(1); }
         return;
