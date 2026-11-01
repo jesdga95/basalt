@@ -7,6 +7,7 @@
 //     the worst row within 4e-9 x K (one fp32 loop over K per output).
 // --bench [T...]: microseconds per product (weights already in FP16 / BF16) at each T (default 32768 4096 512 64) for
 // Gemm and for cublasGemmEx, and the sum per chunk over the model's layers.  Exit 77 without a device.
+// --bench-prepared [T...]: benchmark startup-selected plans using preconverted weights.
 // --prepared [--real-bf16 PATH]: test the prepared strided shape with random inputs and optional raw 48 x 2560 BF16 weights.
 // --alignment-2: report whether the device refuses or accepts the two-byte startup alignment.
 // --address-stress: additionally check arbitrary BF16 weight-pointer offsets in the standalone path.
@@ -499,10 +500,11 @@ int main(int argc, char** argv) {
             std::printf("prefill_gemm_width_test prepared: %d failure(s)\n", fails);
             return fails ? 1 : 0;
         }
-        bool bench = false, address_stress = false;
+        bool bench = false, bench_prepared = false, address_stress = false;
         std::vector<int64_t> bench_t;
         for (int i = 1; i < argc; ++i) {
             if (!std::strcmp(argv[i], "--bench")) bench = true;
+            else if (!std::strcmp(argv[i], "--bench-prepared")) bench = bench_prepared = true;
             else if (!std::strcmp(argv[i], "--address-stress")) address_stress = true;
             else if (bench) bench_t.push_back(std::atoll(argv[i]));
         }
@@ -511,6 +513,11 @@ int main(int argc, char** argv) {
         ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "stream");
         Gemm g;
         std::string err;
+        if (bench_prepared) {
+            std::vector<Gemm::Shape> shapes;
+            for (const Shape& s : kShapes) shapes.push_back({s.t == kBF16, s.n, s.k, s.ldy, 256});
+            if (!Gemm::prepare_shapes(shapes, err)) throw std::runtime_error(err);
+        }
         if (!g.init(st, 32ll << 20, err)) throw std::runtime_error(err);
         cublasHandle_t h = nullptr;
         ckb(cublasCreate(&h), "cublasCreate");
@@ -519,6 +526,8 @@ int main(int argc, char** argv) {
         ckb(cublasSetWorkspace(h, ws.p, 32u << 20), "cublasSetWorkspace");
         ckb(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH), "cublasSetMathMode");
         if (bench) {
+            std::printf("GEMM benchmark: %s plans; both paths use preconverted weights (no dequantization)\n",
+                        bench_prepared ? "startup-prepared" : "lazy");
             for (const int64_t T : bench_t) {
                 double sum_new = 0, sum_old = 0;
                 for (const Shape& s : kShapes) {
