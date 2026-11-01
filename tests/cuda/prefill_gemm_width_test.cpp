@@ -397,7 +397,7 @@ int main(int argc, char** argv) {
                     return s.bf16 == bf16 && s.n == n && s.k == k && s.ldy == ld && s.align == align;
                 });
             };
-            if (!has(false, 3, 200, 10, 256) || !has(false, 1, 200, 10, 4) ||
+            if (!has(false, 3, 200, 10, 8) || !has(false, 1, 200, 10, 4) ||
                 !has(true, 48, 2560, 96, 64) || !has(true, 48, 2560, 96, 128) ||
                 !has(true, 10240, 2560, 10240, 128) || !has(true, 10240, 2560, 10240, 256))
                 throw std::runtime_error("model shape catalog missed a split tail or strided projection");

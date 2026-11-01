@@ -39,6 +39,13 @@ int alignment(const void* p) {
     return a;
 }
 
+// Alignments common to every whole-row view of X and Y.
+int row_alignment(int base, int64_t k, int64_t ldy) {
+    int a = base;
+    while (a > 2 && ((k % (a / 2)) != 0 || (ldy % (a / 4)) != 0)) a >>= 1;
+    return a;
+}
+
 // An algorithm's configuration: what identifies it across the heuristic's answers.
 struct Config {
     int32_t id = 0, splits = 0;
@@ -81,7 +88,7 @@ std::vector<Gemm::Shape> Gemm::model_shapes(const core::WeightTable& wt, const c
             int out_align = 256;
             while (out_align > 1 && byte_offset % (uintptr_t) out_align != 0) out_align >>= 1;
             for (int a = std::min(base_align, out_align); a <= 256; a *= 2)
-                result.push_back({bf16, nr, k, ld, a});
+                result.push_back({bf16, nr, k, ld, row_alignment(a, k, ld)});
         }
     };
     const char* native[] = {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight", "attn_q.weight",
@@ -384,6 +391,7 @@ bool Gemm::prepare_shapes(const std::vector<Shape>& declared, std::string& err) 
         }
     }
     auto& catalog = g_model_shapes[dev];
+    for (auto& s : catalog) s.align = row_alignment(s.align, s.k, s.ldy);
     std::sort(catalog.begin(), catalog.end(), [&](const Shape& a, const Shape& b) { return key(a) < key(b); });
     catalog.erase(std::unique(catalog.begin(), catalog.end(), [&](const Shape& a, const Shape& b) {
         return key(a) == key(b);
@@ -511,7 +519,7 @@ bool Gemm::pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int6
     if (plans_->h == nullptr) return false;
     std::lock_guard<std::mutex> lock(plans_->mutex);
     const cudaDataType_t ty = (cudaDataType_t) type;
-    const int align = std::min(alignment(X), std::min(alignment(W), alignment(Y)));
+    const int align = row_alignment(std::min(alignment(X), std::min(alignment(W), alignment(Y))), K, ldy);
     const Plans::Key key{type, N, K, ldy, align};
     const auto found = plans_->plans.find(key);
     if (plans_->prepared && (found == plans_->plans.end() || !found->second.ok) && beta == 0.0f) {
