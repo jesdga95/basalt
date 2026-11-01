@@ -23,7 +23,7 @@ namespace basalt::prefill {
 using namespace detail;
 
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
-                       std::string& err) {
+                       std::string& err) try {
     Impl& m = *impl_;
     // A ring (KV streaming: the drafter's window, page p in slot p % n_slots over a host copy) takes the same appends
     // with its own page table and host copy, as a streamed main layer does; the cells written are those the window can
@@ -170,6 +170,10 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     mtp.wrote(cell0 + r0, cell0 + n);
     mtp.ms_prefill += ms_since(t0);
     return true;
+} catch (const GemmPlanError& e) {
+    if (impl_ && impl_->cs) (void) cudaStreamSynchronize(impl_->cs);
+    err = e.what();
+    return false;
 }
 
 }  // namespace basalt::prefill

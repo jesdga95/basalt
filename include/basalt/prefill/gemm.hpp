@@ -1,28 +1,47 @@
 // include/basalt/prefill/gemm.hpp - the batched projections of prompt processing.
 //
 // Every projection of a chunk of T tokens is Y[T, N] = X[T, K] . W[N, K]^T with W row-major (the GGUF / pack layout)
-// and FP32 outputs.  Weights are BF16 on the device - either already (the pack's BF16 tensors) or dequantized from
-// their native GGUF blocks into a reusable scratch (`dequant_bf16`) right before the product - and activations are
-// rounded to BF16, which is also what llama.cpp's batched CUDA path does.  Tensor-core GEMM through cuBLAS.
+// and FP32 outputs. Native GGUF weights are dequantized to FP16; BF16 weights are used directly or from scratch.
+// Activations have the corresponding 16-bit type, and cuBLAS accumulates in FP32.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <stdexcept>
 #include <string>
+#include <vector>
+
+namespace basalt::core { class WeightTable; struct ModelGeometry; }
 
 namespace basalt::prefill {
 
+class GemmPlanError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 class Gemm {
 public:
+    static constexpr int64_t kPrefillScratchElems = 32ll << 20;
+    struct Shape {
+        bool bf16;
+        int64_t n, k, ldy;
+        int align;
+    };
     Gemm() = default;
     ~Gemm();
     Gemm(const Gemm&) = delete;
     Gemm& operator=(const Gemm&) = delete;
 
-    /// Creates the current device's cuBLAS handle ahead of the first `init_external` there, which then takes it. A
-    /// server calls this before sizing the expert cache so the handle's device memory is already out of the free
-    /// figure the cache is sized from.
+    /// Prepares the current device's cuBLAS and cuBLASLt handles for the first Gemm there. A server calls this
+    /// before sizing the expert cache so their device memory is already out of the free figure.
     static bool prepare_handle(std::string& err);
+    static std::vector<Shape> model_shapes(const core::WeightTable& wt, const core::ModelGeometry& g,
+                                           int64_t scratch_elems);
+    static bool prepare_model(const core::WeightTable& wt, const core::ModelGeometry& g, int64_t scratch_elems,
+                              std::string& err);
+    static bool prepare_shapes(const std::vector<Shape>& shapes, std::string& err);
 
     /// `scratch_elems`: BF16 elements of the dequantization scratch (the largest weight dequantized at once).
     bool init(void* stream, int64_t scratch_elems, std::string& err);
@@ -43,7 +62,8 @@ public:
     /// scratch cannot hold the N rows at once.
     const uint16_t* bf16_rows(const uint16_t* W, int64_t N, int64_t K);
 
-    /// Y = X . W^T with both in FP16 (bits).
+    /// Y = X . W^T with both in FP16 (bits). Prepared zero-beta keys, including T=1, use one algorithm;
+    /// missing keys or refused prepared plans fail. Unprepared calls may fall back; nonzero-beta calls use default cuBLAS.
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
 
@@ -59,11 +79,21 @@ public:
     void* stream() const { return stream_; }
 
 private:
+    struct Plans;
+    static std::shared_ptr<Plans> prepared_plans_[16];
+    static bool prepare_lt_handle(std::string& err);
+    /// Y = X . W^T on the shape's pinned cuBLASLt algorithm (`type`: a cudaDataType_t); false: the shape has none.
+    bool pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                float beta);
+    void free_plans();
+
     void* handle_ = nullptr;
+    std::shared_ptr<Plans> plans_;
     void* stream_ = nullptr;
     uint16_t* scratch_ = nullptr;
     int64_t scratch_elems_ = 0;
     void* workspace_ = nullptr;
+    size_t ws_bytes_ = 0;
     bool external_ = false;
     void* hipblaslt_state_ = nullptr;
 };
