@@ -43,8 +43,10 @@ cublasHandle_t g_prepared[16] = {};
 
 bool Gemm::prepare_handle(std::string& err) {
     int dev = 0;
-    cudaGetDevice(&dev);
-    if (dev < 0 || dev >= 16) return true;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) {
+        err = "prefill gemm: invalid current device";
+        return false;
+    }
     if (g_prepared[dev] != nullptr) return prepare_lt_handle(err);
     if (const cublasStatus_t s = cublasCreate(&g_prepared[dev]); s != CUBLAS_STATUS_SUCCESS) {
         g_prepared[dev] = nullptr;

@@ -74,7 +74,7 @@ int cache_size(Context& context) {
     const uint64_t max_cache_blob = basalt::kernels::cpu::expert_layout().max_blob;
     const uint64_t cache_slot_bytes = profile.empty() ? max_cache_blob : (max_cache_blob + 255) / 256 * 256;
     const bool auto_cache = o.expert_cache < 0;
-    if (o.serve && o.prefill_chunk > 0 &&
+    if (o.prefill_chunk > 0 &&
         !basalt::prefill::Gemm::prepare_model(wt, g, basalt::prefill::Gemm::kPrefillScratchElems, err))
         return fatal_start_error(err);
     if (o.expert_cache < 0) {

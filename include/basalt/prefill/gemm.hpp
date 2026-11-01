@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -35,6 +36,7 @@ public:
                                            int64_t scratch_elems);
     static bool prepare_model(const core::WeightTable& wt, const core::ModelGeometry& g, int64_t scratch_elems,
                               std::string& err);
+    static bool prepare_shapes(const std::vector<Shape>& shapes, std::string& err);
 
     /// `scratch_elems`: BF16 elements of the dequantization scratch (the largest weight dequantized at once).
     bool init(void* stream, int64_t scratch_elems, std::string& err);
@@ -73,7 +75,7 @@ public:
 
 private:
     struct Plans;
-    static Plans* prepared_plans_[16];
+    static std::shared_ptr<Plans> prepared_plans_[16];
     static bool prepare_lt_handle(std::string& err);
     /// Y = X . W^T on the shape's pinned cuBLASLt algorithm (`type`: a cudaDataType_t); false: the shape has none.
     bool pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
@@ -81,7 +83,7 @@ private:
     void free_plans();
 
     void* handle_ = nullptr;
-    Plans* plans_ = nullptr;
+    std::shared_ptr<Plans> plans_;
     void* stream_ = nullptr;
     uint16_t* scratch_ = nullptr;
     int64_t scratch_elems_ = 0;

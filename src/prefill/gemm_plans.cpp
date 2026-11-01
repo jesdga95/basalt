@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -118,7 +119,10 @@ std::vector<Gemm::Shape> Gemm::model_shapes(const core::WeightTable& wt, const c
 
 bool Gemm::prepare_lt_handle(std::string& err) {
     int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return true;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) {
+        err = "prefill gemm: invalid current device";
+        return false;
+    }
     if (g_prepared_lt[dev]) return true;
     const cublasStatus_t s = cublasLtCreate(&g_prepared_lt[dev]);
     if (s != CUBLAS_STATUS_SUCCESS) {
@@ -132,6 +136,7 @@ bool Gemm::prepare_lt_handle(std::string& err) {
 struct Gemm::Plans {
     cublasLtHandle_t h = nullptr;
     bool prepared = false;
+    std::mutex mutex;
     struct Plan {
         cublasLtMatmulDesc_t op = nullptr;
         cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;   // b and c hold `rows` rows
@@ -331,15 +336,35 @@ struct Gemm::Plans {
     }
 };
 
-Gemm::Plans* Gemm::prepared_plans_[16] = {};
+std::shared_ptr<Gemm::Plans> Gemm::prepared_plans_[16];
 
 bool Gemm::prepare_model(const core::WeightTable& wt, const core::ModelGeometry& g, int64_t scratch_elems,
                          std::string& err) {
+    return prepare_shapes(model_shapes(wt, g, scratch_elems), err);
+}
+
+bool Gemm::prepare_shapes(const std::vector<Shape>& declared, std::string& err) {
     if (!prepare_handle(err)) return false;
     int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return true;
-    g_model_shapes[dev] = model_shapes(wt, g, scratch_elems);
-    std::unique_ptr<Plans> plans(new Plans);
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) {
+        err = "prefill gemm: invalid current device";
+        return false;
+    }
+    g_model_shapes[dev] = declared;
+    auto key = [](const Shape& s) { return std::tie(s.bf16, s.n, s.k, s.ldy, s.align); };
+    for (const auto& s : declared) {
+        if (s.n <= 0 || s.k <= 0 || s.ldy < s.n || s.align < 2 || s.align > 256 ||
+            (s.align & (s.align - 1)) != 0) {
+            err = "prefill gemm: invalid startup plan shape";
+            return false;
+        }
+    }
+    auto& catalog = g_model_shapes[dev];
+    std::sort(catalog.begin(), catalog.end(), [&](const Shape& a, const Shape& b) { return key(a) < key(b); });
+    catalog.erase(std::unique(catalog.begin(), catalog.end(), [&](const Shape& a, const Shape& b) {
+        return key(a) == key(b);
+    }), catalog.end());
+    std::shared_ptr<Plans> plans = std::make_shared<Plans>();
     plans->h = g_prepared_lt[dev];
     g_prepared_lt[dev] = nullptr;
     struct DeviceBuffer {
@@ -358,6 +383,12 @@ bool Gemm::prepare_model(const core::WeightTable& wt, const core::ModelGeometry&
         size_t end = i + 1;
         while (end < shapes.size() && shapes[end].bf16 == shape.bf16 && shapes[end].n == shape.n &&
                shapes[end].k == shape.k && shapes[end].ldy == shape.ldy) ++end;
+        if ((uint64_t) shape.k > ((256ull << 20) / 2) / (uint64_t) shape.n ||
+            (uint64_t) shape.k > ((256ull << 20) / 2) / buffer_rows ||
+            (uint64_t) shape.ldy > ((256ull << 20) / 4) / buffer_rows) {
+            err = "prefill gemm: startup plan shape exceeds temporary buffer limit";
+            return false;
+        }
         const uint64_t nw = (uint64_t) shape.n * (uint64_t) shape.k;
         const uint64_t nx = (uint64_t) buffer_rows * (uint64_t) shape.k;
         const uint64_t ny = (uint64_t) buffer_rows * (uint64_t) shape.ldy;
@@ -381,31 +412,40 @@ bool Gemm::prepare_model(const core::WeightTable& wt, const core::ModelGeometry&
             return false;
         }
         const auto ty = shape.bf16 ? CUDA_R_16BF : CUDA_R_16F;
-        for (size_t j = i; j < end; ++j) {
+        for (size_t pos = i; pos < end; ++pos) {
+            const size_t j = pos == i ? end - 1 : pos - 1;
             const int a = shapes[j].align;
             auto* xp = (const uint16_t*) ((const char*) x.p + (a == 256 ? 0 : a));
             auto& p = plans->plan(ty, shape.n, shape.k, shape.ldy, a);
+            auto& base_plan = plans->plan(ty, shape.n, shape.k, shape.ldy, 256);
+            if (a != 256 && base_plan.ok) {
+                const Config base_config(base_plan.algo);
+                const auto same = [&](const cublasLtMatmulAlgo_t& candidate) {
+                    const Config c(candidate);
+                    return !(c < base_config) && !(base_config < c);
+                };
+                const auto found = std::find_if(p.candidates.begin(), p.candidates.end(), same);
+                if (found != p.candidates.end()) std::rotate(p.candidates.begin(), found, found + 1);
+            }
             if (!p.candidates.empty())
                 plans->settle(p, ty, xp, (const uint16_t*) w.p, (float*) y.p, rows, shape.n, shape.k, shape.ldy,
-                              a, ws.p, kPlanWs, nullptr, true);
+                              a, ws.p, kPlanWs, nullptr, a == 256 || !base_plan.ok);
         }
         i = end;
     }
-    delete prepared_plans_[dev];
     plans->prepared = true;
-    prepared_plans_[dev] = plans.release();
+    prepared_plans_[dev] = std::move(plans);
     return true;
 }
 
 bool Gemm::pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta) {
-    if (plans_ == nullptr) {
+    if (!plans_) {
         int dev = 0;
         if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 16 && prepared_plans_[dev]) {
             plans_ = prepared_plans_[dev];
-            prepared_plans_[dev] = nullptr;
         } else {
-            plans_ = new Plans;
+            plans_ = std::make_shared<Plans>();
         }
         if (!plans_->h && dev >= 0 && dev < 16 && g_prepared_lt[dev]) {
             plans_->h = g_prepared_lt[dev];
@@ -417,6 +457,7 @@ bool Gemm::pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int6
         }
     }
     if (plans_->h == nullptr) return false;
+    std::lock_guard<std::mutex> lock(plans_->mutex);
     const cudaDataType_t ty = (cudaDataType_t) type;
     const int align = std::min(alignment(X), std::min(alignment(W), alignment(Y)));
     const Plans::Key key{type, N, K, ldy, align};
@@ -457,8 +498,7 @@ bool Gemm::pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int6
 }
 
 void Gemm::free_plans() {
-    delete plans_;
-    plans_ = nullptr;
+    plans_.reset();
 }
 
 }  // namespace basalt::prefill

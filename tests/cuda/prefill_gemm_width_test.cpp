@@ -324,6 +324,27 @@ int main(int argc, char** argv) {
             std::printf("no CUDA device - skipped\n");
             return 77;
         }
+        if (argc == 2 && !std::strcmp(argv[1], "--prepared")) {
+            std::vector<Gemm::Shape> shapes;
+            for (int a = 2; a <= 256; a *= 2) shapes.push_back({true, 48, 2560, 96, a});
+            std::string err;
+            if (!Gemm::prepare_shapes(shapes, err)) throw std::runtime_error(err);
+            cudaStream_t st;
+            ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "stream");
+            Gemm first, second;
+            if (!first.init(st, Gemm::kPrefillScratchElems, err) ||
+                !second.init(st, Gemm::kPrefillScratchElems, err)) throw std::runtime_error(err);
+            cublasHandle_t h = nullptr;
+            ckb(cublasCreate(&h), "cublasCreate");
+            ckb(cublasSetStream(h, st), "cublasSetStream");
+            const Shape s{"ssm_alpha BF16", kBF16, 48, 2560, 96, 1};
+            const int fails = check_shape(s, st, first, h) + check_shape(s, st, second, h);
+            cublasDestroy(h);
+            ck(cudaStreamSynchronize(st), "stream synchronize");
+            cudaStreamDestroy(st);
+            std::printf("prefill_gemm_width_test prepared: %d failure(s)\n", fails);
+            return fails ? 1 : 0;
+        }
         bool bench = false;
         std::vector<int64_t> bench_t;
         for (int i = 1; i < argc; ++i) {
