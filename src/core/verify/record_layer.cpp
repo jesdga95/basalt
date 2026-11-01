@@ -67,6 +67,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         const bool ple_fork = ple_win && pside != nullptr && v_.ev_fork_ != nullptr && v_.ev_join_ != nullptr;
         if (ple_side) {
             cudaStreamWaitEvent(cs, v_.ev_ple_join_, 0);
+            ple_open = false;
         } else if (ple_batch_kv || ple_win) {
             try {
                 if (ple_fork) {
@@ -220,6 +221,10 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         cudaStreamWaitEvent(cs, v_.lz_join_, 0);
         lz_open = false;
     }
+    if (mid_ok && (ple_open || lz_open)) {   // the mid chain needs every SM: no side branch may run beside it
+        err = "verify layer " + std::to_string(l) + ": the mid chain was recorded beside an open side branch";
+        return false;
+    }
     if (mid_ok) {
         // the first read's dependent: its first pair tiles are already issued by the time the read ends (PDL)
         PdlScope ps(pdl, mid_ord == 0);
@@ -243,6 +248,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         dec_moe_mix_combine(v_.dm_->m_w + 52, (uint32_t) (l - v_.lb_ + 1), v_.gs_m_part_, v_.bo_, n * (int) N, cs);
     else if (gs_ring)
         dec_moe_mix_wait(v_.dm_->m_w + 52, (uint32_t) (l - v_.lb_ + 1), cs);
+    if (ple_side && l == 0 && !ple_fork()) return false;   // after layer 0's middle: no mid chain before layer 1's join
     stamp(l, 16);
     bool routed = false;   // the fused read ran the router too
     const bool sh_fork = !v_.prof_on_ && v_.sh_cs_ != nullptr && v_.ev_fork_ != nullptr &&
@@ -310,6 +316,20 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         MoEBuffers mb = ss.moe;
         mb.logits = v_.logits_ + t * NE; mb.ids = v_.ids_ + t * K; mb.weights = v_.w_ + t * K;
         if (!moe_route(wt, g, l, K, mb, v_.mixed_ + t * N, cs, err, nullptr)) return false;
+    }
+    if (dm && (v_.route_prior_ > 0.0f || v_.route_tail_skip_ > 0) && n * (int) K <= kDmCap) {   // opt-in routing changes
+        ResidentTabs held;
+        held.add(v_.dm_->res0 + l * g.n_expert);
+        if (v_.dm_->pdev >= 0) held.add(v_.dm_->res1 + l * g.n_expert);
+        for (const DecMoe::XPeer& x : v_.dm_->xp) held.add(x.res + l * g.n_expert);
+        PdlScope pt(false);
+        try {
+            if (v_.route_prior_ > 0.0f && NE == 512 && K == 10)   // the selection again, biased toward the held experts
+                route_prior_top10(v_.logits_, held, v_.route_prior_, v_.ids_, v_.w_, n, v_.dm_->route_counts, cs);
+        } catch (const std::exception& e) { err = "verify route-prior: " + std::string(e.what()); return false; }
+        if (v_.route_tail_skip_ > 0)   // then drop the tail experts no GPU holds
+            route_tail_skip(v_.ids_, v_.w_, held, n * (int) K, (int) K, v_.route_tail_skip_, (int) g.n_expert,
+                            v_.dm_->route_counts, cs);
     }
     if (dm) {   // the tiers, CUDA0's plan, the q8_1 rows and the rings in one launch
         DmRouteArgs ra;

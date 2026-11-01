@@ -166,9 +166,9 @@ void ExpertPool::worker(int id) {
         if (id >= active_.load(std::memory_order_acquire)) continue;
         parked_.fetch_sub(1, std::memory_order_acq_rel);   // leaving the park
 
-        // Drain: one claim per iteration, so a slow worker takes fewer experts and a fast one takes more.
-        // Every job is the same size (all experts are 1,382,400 bytes), so there is nothing to schedule.  Only
-        // this epoch's jobs: if the host has already moved on, the claims fail and the worker parks again.
+        // Drain: one claim per iteration, so a slow worker takes fewer experts and a fast one takes more, with no
+        // schedule made ahead.  Only this epoch's jobs: if the host has already moved on, the claims fail and the
+        // worker parks again.
         wstate_[(size_t) id].store(kBetween, std::memory_order_relaxed);
         drain(id, scratch_[(size_t) id], seen);
         wstate_[(size_t) id].store(kParked, std::memory_order_relaxed);

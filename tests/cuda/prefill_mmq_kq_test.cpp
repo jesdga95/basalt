@@ -2,7 +2,7 @@
 // UD-Q4_K_XL pack's layers) on random native expert blobs at the model's geometry (2560 x 640), against
 //   - a double-precision reference: the weights dequantized by ggml's own to_float, times the FP32 activations, and
 //   - the path these formats took before: each expert dequantized to FP16 (iq_dequant_gu_f16 / iq_dequant_f16), FP16
-//     activations, two cuBLAS products and the FP16 SwiGLU, as prefill.cpp runs it.
+//     activations, two cuBLAS products and the FP16 SwiGLU, as expert_mmq.cpp runs it.
 // MMQ rounds the activations and H to int8 per 32 values, so this is not a bitwise test: its error against the
 // reference has to stay within the bounds the i-quant MMQ path meets (relative RMS 2e-2 with plain activations, 3e-2
 // with outliers; worst row 0.1 / 0.15).  Part 1, per pair: 256 tokens over 64 experts, skewed routing (experts with no
@@ -167,7 +167,7 @@ Routing sort_rows(const std::vector<int32_t>& ids, int E) {
     return r;
 }
 
-// MMQ, as prefill.cpp runs a native layer: per group of 16 routed experts a gather, gate/up, SwiGLU (gate rows, then
+// MMQ, as expert_mmq.cpp runs a native layer: per group of 16 routed experts a gather, gate/up, SwiGLU (gate rows, then
 // up rows), q8_1 of H, down.  Dm [rows][N] in sorted-row order.
 struct MmqBufs {
     Dev xq, gu, h, hq, dm, ident, bounds, grp_gu, grp_d;
