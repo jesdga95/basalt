@@ -40,6 +40,22 @@ std::wstring to_wide(const std::string& utf8) {
     return w;
 }
 
+std::wstring to_wide_path(const std::string& utf8) {
+    std::wstring w = to_wide(utf8);
+    // MAX_PATH less the 12 characters a directory keeps for an 8.3 name: the longest path every plain call accepts.
+    if (w.size() < MAX_PATH - 12 || w.rfind(L"\\\\?\\", 0) == 0 || w.rfind(L"\\\\.\\", 0) == 0) return w;
+    // The prefixed form is taken literally: no `/` to `\` conversion and no `.` or `..` resolution, so the full
+    // path is spelled out first.
+    const DWORD n = GetFullPathNameW(w.c_str(), 0, nullptr, nullptr);
+    if (n == 0) return w;
+    std::wstring full((size_t) n, L'\0');
+    const DWORD got = GetFullPathNameW(w.c_str(), n, &full[0], nullptr);
+    if (got == 0 || got >= n) return w;
+    full.resize(got);
+    if (full.rfind(L"\\\\", 0) == 0) return L"\\\\?\\UNC\\" + full.substr(2);   // \\server\share\...
+    return L"\\\\?\\" + full;
+}
+
 namespace {
 /// The way back, for a path the OS names (its own module path, a resolved path, the temp directory). An empty
 /// result means the name could not be read or is not representable.
@@ -70,11 +86,11 @@ HANDLE read_handle(HANDLE cur) {
 }  // namespace
 
 std::FILE* open_file_utf8(const std::string& path, const std::string& mode) {
-    return _wfopen(to_wide(path).c_str(), to_wide(mode).c_str());
+    return _wfopen(to_wide_path(path).c_str(), to_wide(mode).c_str());
 }
 
 int open_fd_utf8(const std::string& path) {
-    return _wopen(to_wide(path).c_str(), _O_RDONLY | _O_BINARY);
+    return _wopen(to_wide_path(path).c_str(), _O_RDONLY | _O_BINARY);
 }
 
 void close_fd(int fd) {
@@ -96,7 +112,7 @@ int set_working_dir(const std::string& path) {
 
 bool path_executable(const std::string& path) {
     // The mode asks only that the file exist: there is no executable bit to test here.
-    return _waccess(to_wide(path).c_str(), 0) == 0;
+    return _waccess(to_wide_path(path).c_str(), 0) == 0;
 }
 
 std::string module_path() {
@@ -152,7 +168,7 @@ int64_t pread(int fd, void* dst, size_t n, uint64_t off) {
 
 bool file_size(const std::string& path, uint64_t& out) {
     WIN32_FILE_ATTRIBUTE_DATA d{};
-    if (!GetFileAttributesExW(to_wide(path).c_str(), GetFileExInfoStandard, &d)) return false;
+    if (!GetFileAttributesExW(to_wide_path(path).c_str(), GetFileExInfoStandard, &d)) return false;
     if (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return false;   // stat's S_ISREG, in the form Windows gives
     ULARGE_INTEGER sz;
     sz.HighPart = d.nFileSizeHigh;
@@ -192,7 +208,7 @@ int open_unbuffered(const std::string& path) {
 }
 
 int open_write_utf8(const std::string& path) {
-    return _wopen(to_wide(path).c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+    return _wopen(to_wide_path(path).c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
 }
 
 int open_write_unbuffered(const std::string& path) {
@@ -230,7 +246,7 @@ bool sync_fd(int fd) {
 }
 
 namespace {
-std::filesystem::path fs_path(const std::string& utf8) { return std::filesystem::path(to_wide(utf8)); }
+std::filesystem::path fs_path(const std::string& utf8) { return std::filesystem::path(to_wide_path(utf8)); }
 std::string fs_name(const std::filesystem::path& p) { return to_utf8(p.filename().wstring().c_str()); }
 }  // namespace
 

@@ -13,6 +13,7 @@
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/kernels/wait_abort.hpp"
 #include "basalt/kernels/dec_moe.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>
@@ -77,6 +78,7 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     last_batch_ = false;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU; restart the engine"; return false; }
+    if (wait_abort_code() != 0) { err = "verify: a device wait timed out in an earlier window; restart the engine"; return false; }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
@@ -134,11 +136,17 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     const bool early_sample = chain_on() && le_ >= g.n_layers && head_sampling_ && (sampled || hist_d_ != nullptr || biased);
     // the draft probe: row t asks for the probability of the window's token t + 1
     const bool probe = draft_probe_ && head_sampling_ && sampled && T > 1 && le_ >= g.n_layers;
+    // the sampled rows' kept lists; the wide path keeps none
+    top_valid_ = head_sampling_ && sampled && le_ >= g.n_layers &&
+                 sampler_list_len(sampling_.top_k, (int) n_vocab_) <= kSamplerNarrowMax;
     if (probe)
         for (int t = 0; t + 1 < T; ++t) h_q_[t] = tokens[t + 1];
     if (early_sample) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
+        if (sampled) { sp.top_ids = m_top_; sp.n_top = kTopIds; }
+        if (sampler_list_len(sp.top_k, (int) n_vocab_) > kSamplerNarrowMax && sampled && !exact_head_rows(T, err))
+            return false;
         sample_tokens_probe(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, probe ? m_q_ : nullptr,
                             probe ? T - 1 : 0, probe ? m_qp_ : nullptr, cs_);
     }
@@ -300,6 +308,14 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
     return 1;
 }
 
+// The window's results are garbage when one of its bounded device waits timed out (wait_abort.hpp).
+bool Verifier::window_intact(std::string& err) {
+    const unsigned long long code = basalt::kernels::wait_abort_code();
+    if (code == 0) return true;
+    err = "verify: a device wait timed out (" + basalt::kernels::wait_abort_text(code) + "); the window is discarded; restart the engine";
+    return false;
+}
+
 // The window's end: the GPU's finish, the profile, and on the last stage the head's picks.
 bool Verifier::run_end(int32_t* out, std::string& err) {
     using namespace basalt::kernels;
@@ -316,7 +332,8 @@ bool Verifier::run_end(int32_t* out, std::string& err) {
     // with cudaStreamQuery here would cost decode time (a core calling the driver beside the expert workers).
     const cudaError_t se = cudaStreamSynchronize(cs_);
     gm.mark(-1);
-    if (!dm_end(err)) return false;
+    const bool dm_ok = dm_end(err);
+    if (!window_intact(err) || !dm_ok) return false;
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // the table changed under the window
         *(volatile uint32_t*) h_plan_err_ = 0;
@@ -353,6 +370,9 @@ bool Verifier::run_end(int32_t* out, std::string& err) {
     if (head_sampling_ && (sampled || hist_d_ != nullptr || biased) && !early_sample) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
+        if (sampled) { sp.top_ids = m_top_; sp.n_top = kTopIds; }
+        if (sampler_list_len(sp.top_k, (int) n_vocab_) > kSamplerNarrowMax && sampled && !exact_head_rows(T, err))
+            return false;
         sample_tokens_probe(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, probe ? m_q_ : nullptr,
                             probe ? T - 1 : 0, probe ? m_qp_ : nullptr, cs_);
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable

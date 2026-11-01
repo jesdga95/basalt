@@ -14,6 +14,7 @@
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/kernels/wait_abort.hpp"
 #include "basalt/kernels/dec_moe.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>
@@ -43,6 +44,7 @@ bool Verifier::stage_batch(const int* slots, const int* lens, int S, int hbase, 
         }
     }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU; restart the engine"; return false; }
+    if (basalt::kernels::wait_abort_code() != 0) { err = "verify: a device wait timed out in an earlier window; restart the engine"; return false; }
     const ModelGeometry& g = *g_;
     for (int s = 0; s < S; ++s)
         if (pos0[s] < 0 || pos0[s] + (lens != nullptr ? lens[s] : 1) > slots_[(size_t) slots[s]]->max_cells) {
@@ -222,7 +224,8 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
         ms_pool += ms_since(b);
     }
     const cudaError_t se = cudaStreamSynchronize(cs_);
-    if (dm && !dm_end(err)) return false;
+    const bool dm_ok = !dm || dm_end(err);
+    if (!window_intact(err) || !dm_ok) return false;
     if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
     if (prof_on_) collect_profile();
     ++windows;
@@ -284,13 +287,21 @@ bool Verifier::commit_slots_end(std::string& err) {
 }
 
 bool Verifier::sample_rows(int S, std::string& err) {
-    bool any = false;
+    bool any = false, wide = false;
+    for (int t = 0; t < S; ++t) {
+        const basalt::kernels::SamplerParams& sp = slot_sp_[(size_t) last_rows_[t]];
+        wide = wide || (!sp.greedy && sp.temperature > 0.0f &&
+                        basalt::kernels::sampler_list_len(sp.top_k, (int) n_vocab_) > basalt::kernels::kSamplerNarrowMax);
+    }
+    if (wide && !exact_head_rows(S, err)) return false;
     for (int t = 0; t < S; ++t) {
         basalt::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
-        if (sp.greedy || sp.temperature <= 0.0f) continue;
+        const bool pen = bh_d_ != nullptr && sp.penalty_last_n > 0;
+        if ((sp.greedy || sp.temperature <= 0.0f) && !pen) continue;   // the recorded greedy pick stands
         sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
-        sp.penalty_last_n = 0;
-        basalt::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
+        if (!pen) sp.penalty_last_n = 0;
+        basalt::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_,
+                                       pen ? bh_d_ + (size_t) t * (size_t) bh_len_ : nullptr, pen ? bh_len_ : 0, sp,
                                        m_out_ + t, cs_);
         any = true;
     }
