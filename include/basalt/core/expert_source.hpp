@@ -136,6 +136,9 @@ struct HomeRegion {
     const uint8_t* device = nullptr;   ///< the mapped device alias when page-locked through the driver
     uint64_t locked = 0;               ///< bytes held in the working set (a malloc'd region)
     bool pinned = false;
+    bool registered = false;           ///< pinned by registering an alloc_region region (else allocated by the driver)
+    void* map_base = nullptr;          ///< what free_region releases for a registered region
+    uint64_t map_bytes = 0;
 };
 /// The region holding the `bytes` at `off`, or -1.
 int home_region_find(const std::vector<HomeRegion>& regions, uint64_t off, uint64_t bytes);
