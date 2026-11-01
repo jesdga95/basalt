@@ -73,7 +73,9 @@ bool Verifier::WindowRecorder::post(int64_t l) {
                 const int nr = qsa ? 6 : 3;
                 int r = 0;
                 auto add = [&](const void* p, uint64_t b) {
-                    if (p != nullptr && (b & ~15ull) != 0 && r < kLazyPfRanges) { pf.p[r] = p; pf.n[r++] = b & ~15ull; }
+                    if (p == nullptr || (b & ~15ull) == 0) return;
+                    if (r == kLazyPfRanges) { note_fallback("lazy L2 prefetch list full: a range is left out", kLazyPfRanges, qsa ? 1 : 0); return; }
+                    pf.p[r] = p; pf.n[r++] = b & ~15ull;
                 };
                 for (int i = 0; i < nr; ++i) {
                     const WeightRef* w = nv.get(qsa ? names_qsa[i] : names_gdn[i]);
