@@ -3,6 +3,7 @@
 #include "basalt/prefill/gemm.hpp"
 #include "basalt/core/layout.hpp"
 #include "basalt/kernels/ngram.hpp"
+#include "basalt/kernels/hc_fused.hpp"
 
 #include <cublasLt.h>
 #include <cuda_runtime.h>
@@ -69,14 +70,17 @@ struct Config {
 std::vector<Gemm::Shape> Gemm::model_shapes(const core::WeightTable& wt, const core::ModelGeometry& g,
                                             int64_t scratch_elems) {
     std::vector<Shape> result;
-    auto add = [&](bool bf16, int64_t n, int64_t k, int64_t ld, bool sliced) {
+    auto add = [&](bool bf16, int64_t n, int64_t k, int64_t ld, bool sliced, int base_align = 256) {
         if (n <= 0 || k <= 0 || ld < n) return;
         int64_t rows = n;
         if (sliced && scratch_elems > 0) rows = std::min(n, scratch_elems / k);
         if (rows <= 0) return;
         for (int64_t off = 0; off < n; off += rows) {
             const int64_t nr = std::min(rows, n - off);
-            for (int a = 2; a <= 256; a *= 2) result.push_back({bf16, nr, k, ld, a});
+            const uintptr_t byte_offset = (uintptr_t) off * sizeof(float);
+            int out_align = 256;
+            while (out_align > 1 && byte_offset % (uintptr_t) out_align != 0) out_align >>= 1;
+            result.push_back({bf16, nr, k, ld, std::min(base_align, out_align)});
         }
     };
     const char* native[] = {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight", "attn_q.weight",
@@ -84,22 +88,31 @@ std::vector<Gemm::Shape> Gemm::model_shapes(const core::WeightTable& wt, const c
                             "ffn_up_shexp.weight", "ffn_down_shexp.weight"};
     const char* bf16[] = {"hc_attn_down.weight", "hc_attn_up.weight", "hc_attn_inject.weight",
                           "hc_ffn_down.weight", "hc_ffn_up.weight", "hc_ffn_inject.weight",
-                          "indexer.k_proj.weight", "indexer.q_proj.weight", "ffn_gate_inp.weight"};
+                          "indexer.k_proj.weight", "indexer.q_proj.weight", "ffn_gate_inp.weight",
+                          "ffn_gate_inp_shexp.weight"};
     for (int64_t l = 0; l < g.n_layers; ++l) {
         const core::LayerView v(wt, l);
-        for (const char* name : native) if (const auto* w = v.get(name))
+        for (const char* name : native) if (const auto* w = v.get(name); w && w->native_data)
             add(false, w->ne1, w->ne0, w->ne1, true);
-        for (const char* name : bf16) if (const auto* w = v.get(name)) {
+        for (const char* name : bf16) if (const auto* w = v.get(name); w && w->data) {
             const int64_t n = std::max<int64_t>(1, w->ne1);
-            add(true, n, w->ne0, n, false);
-            add(true, n, w->ne0, n, true);
+            basalt::kernels::Hc8View view;
+            if (w->data && basalt::kernels::hc8_view(w->data, view) && view.owned)
+                add(true, n, w->ne0, n, true);
+            else
+                add(true, n, w->ne0, n, false, alignment(w->data));
         }
-        for (const char* name : {"ssm_alpha.weight", "ssm_beta.weight"}) if (const auto* w = v.get(name)) {
-            add(true, std::max<int64_t>(1, w->ne1), w->ne0, 2 * g.ssm_v_heads, false);
-            add(true, std::max<int64_t>(1, w->ne1), w->ne0, 2 * g.ssm_v_heads, true);
+        for (const char* name : {"ssm_alpha.weight", "ssm_beta.weight"}) if (const auto* w = v.get(name); w && w->data) {
+            const int out_align = std::strcmp(name, "ssm_beta.weight") == 0
+                ? alignment((const void*) (uintptr_t) (g.ssm_v_heads * 4)) : 256;
+            basalt::kernels::Hc8View view;
+            if (w->data && basalt::kernels::hc8_view(w->data, view) && view.owned)
+                add(true, std::max<int64_t>(1, w->ne1), w->ne0, 2 * g.ssm_v_heads, true, out_align);
+            else
+                add(true, std::max<int64_t>(1, w->ne1), w->ne0, 2 * g.ssm_v_heads, false,
+                    std::min(alignment(w->data), out_align));
         }
     }
-    add(true, 1, g.n_embd, 1, false);
     add(false, 2 * g.n_ff, g.n_embd, 2 * g.n_ff, false);
     add(false, g.n_embd, g.n_ff, g.n_embd, false);
     add(true, g.hc_lr, g.hc_dim(), g.hc_lr, true);
@@ -261,7 +274,8 @@ struct Gemm::Plans {
     // 7, 37 and 300 rows (those below T) give their rows the bits of the full call, and whose call of rows [m, R) does
     // too; that candidate becomes the plan's.
     bool settle(Plan& p, cudaDataType_t ty, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N,
-                int64_t K, int64_t ldy, int align, void* ws, size_t ws_bytes, void* stream, bool tune = false) {
+                int64_t K, int64_t ldy, int align, void* ws, size_t ws_bytes, void* stream, bool tune = false,
+                int64_t timing_rows = 4096) {
         int64_t m = 1;   // a later row whose X and Y rows keep the call's alignment
         while (m < T && (alignment(X + m * K) < align || alignment(Y + m * ldy) < align)) ++m;
         const int64_t R = std::min<int64_t>(T, 301);   // the rows compared
@@ -299,7 +313,7 @@ struct Gemm::Plans {
             Timed entry{algo, need, {}};
             cudaEvent_t start = nullptr, stop = nullptr;
             bool measured = cudaEventCreate(&start) == cudaSuccess && cudaEventCreate(&stop) == cudaSuccess;
-            const int64_t widths[] = {64, 512, 4096};
+            const int64_t widths[] = {64, std::min<int64_t>(512, timing_rows), timing_rows};
             for (int q = 0; measured && q < 3; ++q) {
                 const auto s = (cudaStream_t) stream;
                 float samples[3] = {};
@@ -335,8 +349,7 @@ struct Gemm::Plans {
             return true;
         }
         p.candidates.clear();
-        basalt::log::warn("basalt", "prefill gemm: no fixed cuBLASLt algorithm for %s %lld x %lld: cublasGemmEx, "
-                                    "whose rounding follows the chunk size",
+        basalt::log::warn("basalt", "prefill gemm: no fixed cuBLASLt algorithm for %s %lld x %lld",
                           ty == CUDA_R_16BF ? "BF16" : "FP16", (long long) N, (long long) K);
         return false;
     }
@@ -377,65 +390,92 @@ bool Gemm::prepare_shapes(const std::vector<Shape>& declared, std::string& err) 
         void* p = nullptr;
         ~DeviceBuffer() { if (p) cudaFree(p); }
         bool allocate(size_t bytes) { return cudaMalloc(&p, bytes) == cudaSuccess; }
-    } ws;
-    if (!plans->h || !ws.allocate(kPlanWs)) {
+    } mem;
+    size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+        err = "prefill gemm: startup memory query failed";
+        return false;
+    }
+    const uint64_t temp_budget = std::min<uint64_t>(128ull << 20, free_bytes / 4) & ~255ull;
+    if (!plans->h || temp_budget <= kPlanWs + 1536 || !mem.allocate((size_t) temp_budget)) {
         err = "prefill gemm: startup plan workspace";
         return false;
     }
-    constexpr int64_t rows = 301, buffer_rows = 4096;
+    void* const ws = mem.p;
+    constexpr int64_t rows = 301;
     const auto& shapes = g_model_shapes[dev];
     for (size_t i = 0; i < shapes.size();) {
         const Shape& shape = shapes[i];
         size_t end = i + 1;
         while (end < shapes.size() && shapes[end].bf16 == shape.bf16 && shapes[end].n == shape.n &&
                shapes[end].k == shape.k && shapes[end].ldy == shape.ldy) ++end;
-        if ((uint64_t) shape.k > ((256ull << 20) / 2) / (uint64_t) shape.n ||
-            (uint64_t) shape.k > ((256ull << 20) / 2) / buffer_rows ||
-            (uint64_t) shape.ldy > ((256ull << 20) / 4) / buffer_rows) {
+        const int base_align = shapes[end - 1].align;
+        if ((uint64_t) shape.k > (temp_budget - kPlanWs - 1536) / 2 / (uint64_t) shape.n ||
+            (uint64_t) shape.k > (128ull << 20) || (uint64_t) shape.ldy > (128ull << 20)) {
             err = "prefill gemm: startup plan shape exceeds temporary buffer limit";
             return false;
         }
         const uint64_t nw = (uint64_t) shape.n * (uint64_t) shape.k;
+        const uint64_t fixed_bytes = kPlanWs + nw * 2 + 1536;
+        const uint64_t row_bytes = (uint64_t) shape.k * 2 + (uint64_t) shape.ldy * 4;
+        const int64_t buffer_rows = fixed_bytes < temp_budget
+            ? (int64_t) std::min<uint64_t>(4096, (temp_budget - fixed_bytes) / row_bytes) : 0;
+        if (buffer_rows < rows) {
+            err = "prefill gemm: insufficient temporary memory for startup plan " + std::to_string(shape.n) +
+                  " x " + std::to_string(shape.k);
+            return false;
+        }
         const uint64_t nx = (uint64_t) buffer_rows * (uint64_t) shape.k;
-        const uint64_t ny = (uint64_t) buffer_rows * (uint64_t) shape.ldy;
-        if (nw > (256ull << 20) / 2 || nx > (256ull << 20) / 2 || ny > (256ull << 20) / 4) {
-            err = "prefill gemm: startup plan shape exceeds temporary buffer limit";
-            return false;
-        }
-        DeviceBuffer w, x, y;
-        if (!w.allocate((size_t) nw * 2 + 256) || !x.allocate((size_t) nx * 2 + 256) ||
-            !y.allocate((size_t) ny * 4 + 256)) {
-            err = "prefill gemm: startup plan buffers";
-            return false;
-        }
+        auto round256 = [](uint64_t v) { return (v + 255) & ~255ull; };
+        auto* w = (char*) mem.p + kPlanWs;
+        auto* x = w + round256(nw * 2 + 256);
+        auto* y = x + round256(nx * 2 + 256);
         std::vector<uint16_t> data((size_t) std::max(nw, nx + 128));
         const uint16_t base = shape.bf16 ? 0x3e00 : 0x3800;
         for (size_t j = 0; j < data.size(); ++j)
             data[j] = (uint16_t) (base | ((j * 73 + j / 17) & 0x7f) | ((j & 1) ? 0x8000 : 0));
-        if (cudaMemcpy(w.p, data.data(), (size_t) nw * 2, cudaMemcpyHostToDevice) != cudaSuccess ||
-            cudaMemcpy(x.p, data.data(), (size_t) nx * 2 + 256, cudaMemcpyHostToDevice) != cudaSuccess) {
+        if (cudaMemcpy(w, data.data(), (size_t) nw * 2, cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(x, data.data(), (size_t) nx * 2 + 256, cudaMemcpyHostToDevice) != cudaSuccess) {
             err = "prefill gemm: startup plan input upload";
             return false;
         }
         const auto ty = shape.bf16 ? CUDA_R_16BF : CUDA_R_16F;
+        std::vector<float> reference((size_t) rows * shape.n), current(reference.size());
         for (size_t pos = i; pos < end; ++pos) {
             const size_t j = pos == i ? end - 1 : pos - 1;
             const int a = shapes[j].align;
-            auto* xp = (const uint16_t*) ((const char*) x.p + (a == 256 ? 0 : a));
-            auto& p = plans->plan(ty, shape.n, shape.k, shape.ldy, a);
-            auto& base_plan = plans->plan(ty, shape.n, shape.k, shape.ldy, 256);
-            if (a != 256 && base_plan.ok) {
-                const Config base_config(base_plan.algo);
-                const auto same = [&](const cublasLtMatmulAlgo_t& candidate) {
-                    const Config c(candidate);
-                    return !(c < base_config) && !(base_config < c);
-                };
-                const auto found = std::find_if(p.candidates.begin(), p.candidates.end(), same);
-                if (found != p.candidates.end()) std::rotate(p.candidates.begin(), found, found + 1);
+            auto* xp = (const uint16_t*) (x + (a == 256 ? 0 : a));
+            const size_t input_bytes = (size_t) (a == base_align ? nx : (uint64_t) rows * shape.k) * 2;
+            if (cudaMemcpy((void*) xp, data.data(), input_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = "prefill gemm: startup plan alignment input upload";
+                return false;
             }
-            if (!p.candidates.empty())
-                plans->settle(p, ty, xp, (const uint16_t*) w.p, (float*) y.p, rows, shape.n, shape.k, shape.ldy,
-                              a, ws.p, kPlanWs, nullptr, a == 256 || !base_plan.ok);
+            auto& p = plans->plan(ty, shape.n, shape.k, shape.ldy, a);
+            auto& base_plan = plans->plan(ty, shape.n, shape.k, shape.ldy, base_align);
+            if (a != base_align && base_plan.ok) {
+                p.candidates.assign(1, base_plan.algo);
+                p.next = 0;
+            }
+            if (p.candidates.empty() ||
+                !plans->settle(p, ty, xp, (const uint16_t*) w, (float*) y, rows, shape.n, shape.k, shape.ldy,
+                               a, ws, kPlanWs, nullptr, a == base_align, buffer_rows)) {
+                err = "prefill gemm: no checked startup plan for " + std::to_string(shape.n) + " x " +
+                      std::to_string(shape.k) + " stride " + std::to_string(shape.ldy) + " alignment " +
+                      std::to_string(a);
+                return false;
+            }
+            if (!plans->run(p, p.algo, ty, xp, (const uint16_t*) w, (float*) y, rows, shape.n, shape.k,
+                            shape.ldy, ws, kPlanWs, nullptr) ||
+                cudaMemcpy2D(current.data(), (size_t) shape.n * 4, y, (size_t) shape.ldy * 4,
+                             (size_t) shape.n * 4, (size_t) rows, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                err = "prefill gemm: startup plan alignment comparison failed";
+                return false;
+            }
+            if (pos == i) reference = current;
+            else if (std::memcmp(reference.data(), current.data(), current.size() * sizeof(float)) != 0) {
+                err = "prefill gemm: startup plan output differs across alignments";
+                return false;
+            }
         }
         i = end;
     }
@@ -469,10 +509,9 @@ bool Gemm::pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int6
     const Plans::Key key{type, N, K, ldy, align};
     const auto found = plans_->plans.find(key);
     if (plans_->prepared && (found == plans_->plans.end() || !found->second.ok) && T >= 2 && beta == 0.0f) {
-        basalt::log::error("basalt", "prefill gemm: no prepared plan for %s %lld x %lld stride %lld alignment %d",
-                           ty == CUDA_R_16BF ? "BF16" : "FP16", (long long) N, (long long) K,
-                           (long long) ldy, align);
-        std::exit(1);
+        throw GemmPlanError("prefill gemm: no prepared plan for " + std::to_string(N) + " x " +
+                            std::to_string(K) + " stride " + std::to_string(ldy) + " alignment " +
+                            std::to_string(align));
     }
     Plans::Plan& p = plans_->plan(ty, N, K, ldy, align);
     if (!p.ok) {
@@ -482,8 +521,7 @@ bool Gemm::pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int6
     }
     if (p.ws > ws_bytes_ || !plans_->rows(p, ty, T, N, K, ldy)) {
         if (plans_->prepared && T >= 2 && beta == 0.0f) {
-            basalt::log::error("basalt", "prefill gemm: prepared plan workspace or layout unavailable");
-            std::exit(1);
+            throw GemmPlanError("prefill gemm: prepared plan workspace or layout unavailable");
         }
         return false;
     }
@@ -492,8 +530,7 @@ bool Gemm::pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int6
                        (cudaStream_t) stream_) != CUBLAS_STATUS_SUCCESS) {
         p.ok = false;
         if (plans_->prepared && T >= 2 && beta == 0.0f) {
-            basalt::log::error("basalt", "prefill gemm: prepared plan refused");
-            std::exit(1);
+            throw GemmPlanError("prefill gemm: prepared plan refused");
         }
         basalt::log::warn("basalt", "prefill gemm: cublasLtMatmul refused %s %lld x %lld x %lld: cublasGemmEx for this "
                                     "shape from here",

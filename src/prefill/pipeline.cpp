@@ -1,6 +1,7 @@
 #include "state.hpp"
 #include "layout.hpp"
 #include "basalt/prefill/prefill.hpp"
+#include "basalt/prefill/gemm.hpp"
 #include "basalt/core/mtp.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include <string>
@@ -52,7 +53,13 @@ bool Prefill::drain_pipeline(std::string& err) {
 }
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
-    const bool body_ok = run_impl(tokens, n, pos0, err);
+    bool body_ok = false;
+    try {
+        body_ok = run_impl(tokens, n, pos0, err);
+    } catch (const GemmPlanError& e) {
+        if (impl_->cs) (void) cudaStreamSynchronize(impl_->cs);
+        err = e.what();
+    }
     // the tokens the warm-up reads belong to this request: wait for it once the run that reads them is over
     impl_->warm.pending = false;
     if (impl_->warm.fut.valid() && (!body_ok || pos0 + n >= impl_->warm.to)) impl_->warm.fut.wait();

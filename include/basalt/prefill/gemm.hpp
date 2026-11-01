@@ -9,12 +9,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace basalt::core { class WeightTable; struct ModelGeometry; }
 
 namespace basalt::prefill {
+
+class GemmPlanError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 class Gemm {
 public:

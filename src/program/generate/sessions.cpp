@@ -73,10 +73,10 @@ int sessions(Context& context) {
                          err.c_str());
             return 1;
         }
+        basalt::core::Verifier::prepare_hc8(st.wt, g);   // this stage's fused hyper-connection reads need its device's copies
         if (o.prefill_chunk > 0 &&
             !basalt::prefill::Gemm::prepare_model(st.wt, g, basalt::prefill::Gemm::kPrefillScratchElems, err))
             return fatal_start_error(err);
-        basalt::core::Verifier::prepare_hc8(st.wt, g);   // this stage's fused hyper-connection reads need its device's copies
         // THE SESSION AND THE HEAD WAIT FOR THE SPLIT SEARCH.  `session_bytes` prices a stage's session by its LAYER
         // RANGE (the carve), so the sessions are allocated after the search below has set `st.lb`/`st.le`; the last
         // stage's head follows.
