@@ -10,7 +10,7 @@
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/q5k_head.hpp"
 #include "basalt/kernels/q6k_head.hpp"
-#include "basalt/kernels/q80_head.hpp"
+#include "basalt/kernels/q80_vhead.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include <algorithm>
 #include <exception>
@@ -74,8 +74,8 @@ bool Verifier::WindowRecorder::head() {
                         q5k_head_mmvq(w, x, y, (int) N, n, T, s);
                     else if (v_.head_->type() == 14 && q6k_head_supported((int) N, T))
                         q6k_head_mmvq(w, x, y, (int) N, n, T, s);
-                    else if (v_.head_->type() == 8 && T >= 4 && q80_head_supported((int) N, T))
-                        q80_head_mmvq(w, x, y, (int) N, n, T, s);
+                    else if (v_.head_->planes())
+                        q80p_mmvq(w, x, y, (int) N, n, T, s);
                     else
                         native_mmvq(v_.head_->type(), w, x, y, (int) N, n, T, s);
                 };
@@ -106,8 +106,11 @@ bool Verifier::WindowRecorder::head() {
                               v_.vhead_scratch_, cs);
                 else if (v_.head_->type() == 14 && q6k_head_supported((int) N, T))
                     q6k_head_mmvq(v_.head_->weights(), v_.xq_, v_.head_logits_, (int) N, (int) v_.n_vocab_, T, cs);
-                else if (v_.head_->type() == 8 && T >= 4 && q80_head_supported((int) N, T))   // four columns or more: the same bits as one wave
-                    q80_head_mmvq(v_.head_->weights(), v_.xq_, v_.head_logits_, (int) N, (int) v_.n_vocab_, T, cs);
+                else if (v_.head_->planes() && v_.head_keep_d_ != nullptr)   // the exact list's rows, the rest bounded
+                    q80p_vhead(v_.head_->weights(), v_.xq_, v_.head_logits_, (int) N, (int) v_.n_vocab_, T,
+                               v_.head_keep_d_, v_.vhead_scratch_, cs);
+                else if (v_.head_->planes())
+                    q80p_mmvq(v_.head_->weights(), v_.xq_, v_.head_logits_, (int) N, (int) v_.n_vocab_, T, cs);
                 else
                     native_mmvq(v_.head_->type(), v_.head_->weights(), v_.xq_, v_.head_logits_, (int) N, (int) v_.n_vocab_, T, cs);
             } catch (const std::exception& e) {

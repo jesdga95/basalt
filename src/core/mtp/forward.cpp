@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "basalt/kernels/q80_vhead.hpp"
 
 namespace basalt::core {
 
@@ -346,8 +347,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             native_q6_k_mmvq_rows(head_->weights(), dvocab_, xq_, head_logits_, (int) N, (int) nv, cs);
         else if (head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits
             q5k_head_mmvq(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
-        else if (head_->type() == GGML_Q8_0 && T == 1)   // read once a step: streamed past the layer's other weights
-            native_q8_0_mmvq_stream(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, cs);
+        else if (head_->planes())   // the whole head, in bit planes (a Q8_0 head's rows are always read by the map)
+            q80p_mmvq(head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         else
             native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         if (sub && n_xcap_ > 0)   // a context row without a token never wins (the other rows always have one)

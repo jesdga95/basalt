@@ -1,4 +1,5 @@
-// tests/kernels/q80_proxy_parity.cpp - the Q8_0 draft head read through a row map, and its two-stage argmax.
+// tests/kernels/q80_proxy_parity.cpp - the Q8_0 draft head read through a row map, and its two-stage argmax.  The
+// q80_* kernels read the head's bit planes (q80_vhead.hpp): the rows and the gathered copy are packed for them.
 //   1. q80_mmvq_rows over a subset of a head's rows (shuffled, with rows that hold no token) against native_mmvq and
 //      native_q8_0_mmvq_stream on the same rows gathered into a copy, bitwise, and against a CPU reference (double).
 //   2. The 2-bit copy packed through the row map against the copy packed from the gathered rows, bitwise.
@@ -10,6 +11,7 @@
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/q5k_head.hpp"
 #include "basalt/kernels/q80_proxy.hpp"
+#include "basalt/kernels/q80_vhead.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
 
@@ -94,6 +96,13 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     k::gather_rows((const uint8_t*) w, (int64_t) rb, d_gmap, nsub, (uint8_t*) wg, s);
+    void *wp = nullptr, *wgp = nullptr;   // the head and the copy in planes
+    ck(cudaMalloc(&wp, hw.size()), "wp");
+    ck(cudaMalloc(&wgp, (size_t) nsub * rb), "wgp");
+    ck(cudaMemcpyAsync(wp, w, hw.size(), cudaMemcpyDeviceToDevice, s), "wp copy");
+    ck(cudaMemcpyAsync(wgp, wg, (size_t) nsub * rb, cudaMemcpyDeviceToDevice, s), "wgp copy");
+    k::q80p_pack(wp, rows, s);
+    k::q80p_pack(wgp, nsub, s);
     float* x = nullptr;
     void* xq = nullptr;
     float *y0 = nullptr, *y1 = nullptr, *y2 = nullptr;
@@ -119,7 +128,7 @@ int main(int argc, char** argv) {
             k::native_quantize_q8_1(x, xq, n_in, 1, s);
             k::native_mmvq(8, wg, xq, y0, n_in, nsub, 1, s);
             k::native_q8_0_mmvq_stream(wg, xq, y1, n_in, nsub, s);
-            k::q80_mmvq_rows(w, d_map, xq, y2, n_in, nsub, s);
+            k::q80_mmvq_rows(wp, d_map, xq, y2, n_in, nsub, s);
             ck(cudaStreamSynchronize(s), "sync");
             ck(cudaMemcpy(a.data(), y0, a.size() * 4, cudaMemcpyDeviceToHost), "a");
             ck(cudaMemcpy(b.data(), y1, b.size() * 4, cudaMemcpyDeviceToHost), "b");
@@ -158,8 +167,8 @@ int main(int argc, char** argv) {
         ck(cudaMemcpy(d_hmap, hmap.data(), hmap.size() * 4, cudaMemcpyHostToDevice), "hmap up");
         ck(cudaMemset(pa, 0, pbytes), "pa0");
         ck(cudaMemset(pb, 0, pbytes), "pb0");
-        k::q80_proxy_pack(wg, 0, nsub, pa, nsub, s);
-        k::q80_proxy_pack(w, 0, nsub, pb, nsub, s, d_hmap);
+        k::q80_proxy_pack(wgp, 0, nsub, pa, nsub, s);
+        k::q80_proxy_pack(wp, 0, nsub, pb, nsub, s, d_hmap);
         ck(cudaStreamSynchronize(s), "pack");
         std::vector<uint8_t> ha(pbytes), hb(pbytes);
         ck(cudaMemcpy(ha.data(), pa, pbytes, cudaMemcpyDeviceToHost), "pa");
@@ -167,12 +176,12 @@ int main(int argc, char** argv) {
         const bool eq = std::memcmp(ha.data(), hb.data(), pbytes) == 0;
         // through the map with holes, in two parts (as context rows fill later) and at once: the same bytes
         ck(cudaMemset(pb, 0, pbytes), "pb0");
-        k::q80_proxy_pack(w, 0, nbase, pb, nsub, s, d_map);
-        k::q80_proxy_pack(w, nbase, nctx, pb, nsub, s, d_map);
+        k::q80_proxy_pack(wp, 0, nbase, pb, nsub, s, d_map);
+        k::q80_proxy_pack(wp, nbase, nctx, pb, nsub, s, d_map);
         void* pc = nullptr;
         ck(cudaMalloc(&pc, pbytes), "pc");
         ck(cudaMemset(pc, 0, pbytes), "pc0");
-        k::q80_proxy_pack(w, 0, nsub, pc, nsub, s, d_map);
+        k::q80_proxy_pack(wp, 0, nsub, pc, nsub, s, d_map);
         ck(cudaStreamSynchronize(s), "pack2");
         std::vector<uint8_t> hc(pbytes);
         ck(cudaMemcpy(hb.data(), pb, pbytes, cudaMemcpyDeviceToHost), "pb2");
@@ -203,7 +212,7 @@ int main(int argc, char** argv) {
         const double sd = std::sqrt(m2 / nsub - (m1 / nsub) * (m1 / nsub));
         const float xs = (float) (3.0 / sd);
         ck(cudaMemset(pb, 0, pbytes), "pb0");
-        k::q80_proxy_pack(w, 0, nsub, pb, nsub, s, d_map);
+        k::q80_proxy_pack(wp, 0, nsub, pb, nsub, s, d_map);
         std::vector<float> a((size_t) nsub);
         int miss_map = 0, miss_copy = 0, miss_cpu = 0, ties = 0;
         double max_rel = 0, sum_rel = 0, sum_bias = 0;
@@ -222,9 +231,9 @@ int main(int argc, char** argv) {
             }
             ck(cudaMemcpy(x, hxf.data(), hxf.size() * 4, cudaMemcpyHostToDevice), "x up");
             k::native_quantize_q8_1(x, xq, n_in, 1, s);
-            k::q80_mmvq_rows(w, d_map, xq, y0, n_in, nsub, s);
-            if (!k::q80_proxy_top1(pb, w, xq, nsub, nsub, d_map, d_id, d_p, scratch, s, true) ||
-                !k::q80_proxy_top1(pa, wg, xq, nsub, nsub, d_map, d_id + 1, d_p + 1, scratch, s)) {
+            k::q80_mmvq_rows(wp, d_map, xq, y0, n_in, nsub, s);
+            if (!k::q80_proxy_top1(pb, wp, xq, nsub, nsub, d_map, d_id, d_p, scratch, s, true) ||
+                !k::q80_proxy_top1(pa, wgp, xq, nsub, nsub, d_map, d_id + 1, d_p + 1, scratch, s)) {
                 std::printf("proxy refused\n");
                 fail = 1;
                 break;
@@ -286,12 +295,12 @@ int main(int argc, char** argv) {
             for (int v = 0; v < 3; ++v) {
                 ck(cudaMemsetAsync(flush, it, 512u << 20, s), "flush");
                 cudaEventRecord(e0, s);
-                if (v == 0) k::q80_proxy_top1(pb, w, xq, nsub, nsub, d_map, d_id, d_p, scratch, s, true);
+                if (v == 0) k::q80_proxy_top1(pb, wp, xq, nsub, nsub, d_map, d_id, d_p, scratch, s, true);
                 else if (v == 1) {
                     k::native_q8_0_mmvq_stream(wg, xq, y1, n_in, nsub, s);
                     k::q5k_head_mask_unmapped(y1 + nbase, d_map + nbase, nctx, s);
                     k::sample_greedy_top_prob(y1, 1, nsub, d_map, r_id, r_p, s);
-                } else k::q80_mmvq_rows(w, d_map, xq, y2, n_in, nsub, s);
+                } else k::q80_mmvq_rows(wp, d_map, xq, y2, n_in, nsub, s);
                 cudaEventRecord(e1, s);
                 cudaEventSynchronize(e1);
                 float ms;

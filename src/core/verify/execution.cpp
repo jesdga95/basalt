@@ -129,6 +129,7 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
         cudaStreamWaitEvent(cs_, wait_ev_, 0);
         wait_ev_ = nullptr;
     }
+    set_head_keep(head_keep());
     const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
     if (next_ == nullptr) dev.record(DecodeEvents::kVerifyPost, cs_);
     ms_launch += ms_since(tl);

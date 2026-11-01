@@ -158,7 +158,7 @@ public:
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
-    /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
+    /// Row `t` of the last window's head logits (n_vocab floats) to the host, every one exact. Valid after run().
     bool copy_logits(int t, float* host) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
@@ -173,7 +173,8 @@ public:
     /// head samples on (the last stage's); false with `err` when the memory cannot be had.
     bool reserve_wide_sampler(std::string& err);
     /// A list longer than the top_k kernels keep reads every row's logit: a two-stage head (exact only near the top,
-    /// q6k_vhead) is run again exactly over the window's T columns, the plain kernel's bits.  Other heads: nothing.
+    /// q6k_vhead, or a Q8_0 head's screened window, q80p_vhead) is run again exactly over the window's T columns, the
+    /// plain kernel's bits.  Other heads, or a window whose head was exact: nothing.
     bool exact_head_rows(int T, std::string& err);
     /// One request's token bias (one float per vocabulary entry, added to the logits before the sampler chain); empty
     /// clears it.  Applies to this verifier's own sampling only: the drafter never sees it.  Call before set_sampling;
@@ -418,6 +419,14 @@ private:
     bool run_begin(int T, const int32_t* tokens, int64_t pos0, std::string& err, cudaEvent_t after = nullptr);
     bool run_serve(PoolMultiFn pool, void* user, std::string& err);
     bool run_end(int32_t* out, std::string& err);
+    /// A Q8_0 head in bit planes runs two-stage in the window (q80p_vhead) with the exact list this long: the top_k of
+    /// a sampled request (64 at most), 1 for a greedy pick; 0 (every row exact) for a request whose sampling reads more
+    /// than that list: a longer list, a logit bias, non-neutral penalties.
+    int head_keep() const;
+    /// The list length for the next launched window (stream-ordered, written only when it changes).
+    void set_head_keep(int keep);
+    /// After a two-stage window: the head again over its columns, every row exact (the plain kernel's bits).
+    bool head_exact_again() const;
     bool window_intact(std::string& err);   // after a window's sync: false when a bounded device wait of it timed out
     /// One step of the host's service of the window's rings: 1 = every ring served, 0 = the GPU has not reached the next
     /// one, -1 = an error.
@@ -696,7 +705,10 @@ private:
     bool gs_live_ = false, gs_split_ = false;
     SessionState* gs_ss_ = nullptr;
     float *gs_h_full_ = nullptr, *gs_h_slice_ = nullptr;   // pinned staging for gs_move: CUDA0's whole layers, the slice
-    uint8_t* vhead_scratch_ = nullptr;   // the two-stage head's histogram and row list (q6k_vhead)
+    uint8_t* vhead_scratch_ = nullptr;   // the two-stage head's histogram and row list (q6k_vhead, q80p_vhead)
+    int32_t* head_keep_d_ = nullptr;     // q80p_vhead's list length, read by the captured head (null: no such head)
+    int head_keep_set_ = 0;              // the value last written to head_keep_d_ (the arena starts it at 0)
+    mutable bool head_screened_ = false;   // the last window's head was two-stage: only its top rows are exact
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
     float* ple_win_ = nullptr;   // 2 * T * NG_HC_DIM
