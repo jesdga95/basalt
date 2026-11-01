@@ -77,11 +77,12 @@ void Runtime::ckd_finish() {
                                 [&](const ConvCheckpoint& k) { return k.gdn.data() == dst; }), checks.end());
 }
 
-// Whether the disk tier needs no new copy of a conversation: it is short, or a stored prefix of it reaches
-// within kDiskStaleTokens of the chain's deepest checkpoint (the point its next turn goes on from; a restore
+// Whether the disk tier needs no new copy of a conversation: it is short (below the disk's minimum, or below
+// --conversation-cache-min-tokens when that is higher), or a stored prefix of it reaches within
+// kDiskStaleTokens of the chain's deepest checkpoint (the point its next turn goes on from; a restore
 // from that copy reads the rest again).  Each turn of a growing conversation is not written again in full.
 bool Runtime::disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const std::vector<ConvCheckpoint>& cks, bool cvec) {
-    if ((int64_t) ids.size() < kDiskMinTokens) return true;
+    if ((int64_t) ids.size() < std::max<int64_t>(kDiskMinTokens, o.conversation_cache_min_tokens)) return true;
     int64_t deepest = 0;
     for (const ConvCheckpoint& c : cks) deepest = std::max<int64_t>(deepest, (int64_t) c.ids.size());
     if (deepest <= 0) deepest = (int64_t) ids.size();
@@ -103,6 +104,12 @@ bool Runtime::capture_admit(uint64_t need, uint64_t floor) {
 bool Runtime::park_current(size_t held, int64_t kept) {
     ckd_finish();
     if ((!conversations->enabled() && !disk.enabled()) || !live_ok || live.empty()) return true;
+    // below the token minimum: store nothing, evict nothing
+    if (o.conversation_cache_min_tokens > 0 && (int64_t) live.size() < o.conversation_cache_min_tokens) {
+        basalt::log::info("basalt serve", "conversation cache: %zu tokens below the minimum %d, not parked",
+                          live.size(), o.conversation_cache_min_tokens);
+        return true;
+    }
     // the disk tier takes the image when there is no RAM tier or it cannot make room, unless the conversation is
     // short or stored already, or the request goes on from the chain's deepest checkpoint (the same
     // conversation's next turn: all it drops is the last reply)
@@ -467,10 +474,13 @@ bool Runtime::park_one(int b, std::string& e) {
     // (the file cache when experts are read from the file)
     const uint64_t floor = std::max({(uint64_t) o.conversation_cache_min_free_mib << 20,
                                      disk.enabled() ? disk_floor : 0, ram_floor_bytes});
-    bool to_ram = capture_admit(est > moved ? est - moved : 0, floor);
-    const bool on_disk = !to_ram && disk.enabled() && (int64_t) ids.size() >= kDiskMinTokens &&
+    // below the token minimum: cells go back, the conversation is kept in neither tier
+    const bool keep = o.conversation_cache_min_tokens <= 0 ||
+                      (int64_t) ids.size() >= o.conversation_cache_min_tokens;
+    bool to_ram = keep && capture_admit(est > moved ? est - moved : 0, floor);
+    const bool on_disk = keep && !to_ram && disk.enabled() && (int64_t) ids.size() >= kDiskMinTokens &&
                          disk_has(ids, imgs, cks, cvec);
-    if (!to_ram && !on_disk) {   // said once per idle stretch
+    if (!to_ram && !on_disk && keep) {   // said once per idle stretch
         double& noted = b >= 0 ? bs[(size_t) b].park_noted : solo_park_noted;
         const double since = b >= 0 ? bs[(size_t) b].idle_busy : solo_idle_busy;
         if (noted != since)
@@ -520,7 +530,8 @@ bool Runtime::park_one(int b, std::string& e) {
     ++kv_moves;
     char where[64];
     if (to_ram) std::snprintf(where, sizeof where, "to RAM (%.0f MiB)", (double) bytes / 1048576.0);
-    else std::snprintf(where, sizeof where, "kept on disk only");
+    else if (on_disk) std::snprintf(where, sizeof where, "kept on disk only");
+    else std::snprintf(where, sizeof where, "dropped, below the %d token minimum", o.conversation_cache_min_tokens);
     basalt::log::info("basalt serve", "%s's idle conversation, %lld tokens, %s in %.0f ms: %lld KV cells back",
                       who.c_str(), (long long) tokens, where,
                       std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),

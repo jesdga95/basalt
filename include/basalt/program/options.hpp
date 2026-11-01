@@ -13,7 +13,6 @@ namespace basalt::program {
 
 struct Options {
     std::string model;                ///< --model: the .basalt file every loader reads from
-    std::string dump_hc8;             ///< --dump-hc8: write the 8-bit hyper-connection copies here, then exit
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;
     int64_t max_context = 4096;
@@ -102,11 +101,12 @@ struct Options {
     /// the prompt path's rows per layer the peer computes: -1 = half of chunk x top-k, 0 = the prompt path stays on
     /// the primary
     int64_t peer_prefill_rows = -1;
-    /// Names the model's expert profile when it carries one (the file and `#profile`); empty means none.  A profile
-    /// decides residency by routing frequency instead of by first use.
+    /// The engine's expert profile for the model (data/profiles/<key>.prof, cli::profile_key), or the
+    /// --expert-profile-save file a start places from; empty means none.  A profile decides residency by routing
+    /// frequency instead of by first use.
     std::string expert_profile;
     /// --serve (opt-in): where to save what the adaptive tier learned, as a profile (the resident experts first,
-    /// then the routing counted since the start; tools/convert/convert.py reads it as `--profile`); on QUIT and every
+    /// then the routing counted since the start; the format of data/profiles); on QUIT and every
     /// `expert_profile_save_min` minutes between requests.  Empty (the default): nothing is counted or written.
     std::string expert_profile_save;
     double expert_profile_save_min = 10.0;
@@ -218,6 +218,7 @@ struct Options {
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
+    int conversation_cache_min_tokens = 0;   ///< --serve: park only conversations of at least N tokens (0 = park every one)
     /// --serve: the folder of the disk tier (the server names one inside the model cache folder): a conversation
     /// that leaves the session or the RAM cache, and every one the process holds when it ends, is written there and
     /// read back when a prompt starts with it, after a restart too (conversation_store.hpp)

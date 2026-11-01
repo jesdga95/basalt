@@ -73,7 +73,11 @@ int sessions(Context& context) {
                          err.c_str());
             return 1;
         }
-        basalt::core::Verifier::prepare_hc8(st.wt, g);   // this stage's fused hyper-connection reads need its device's copies
+        // this stage's fused hyper-connection reads need its device's copies
+        if (!basalt::core::Verifier::prepare_hc8(st.wt, g, err)) {
+            basalt::log::error("basalt generate", "layer split, CUDA%d: %s", st.dev, err.c_str());
+            return 1;
+        }
         if (o.prefill_chunk > 0 &&
             !basalt::prefill::Gemm::prepare_model(st.wt, g, basalt::prefill::Gemm::kPrefillScratchElems, err))
             return fatal_start_error(err);
