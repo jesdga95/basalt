@@ -442,7 +442,7 @@ Flow Request::decode() {
                 std::printf("ERR %s\n", runtime_.err.c_str());
                 return Flow::error;
             }
-            for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+            for (int i = 0; i < keep; ++i) consumed.push_back(window[(size_t) i]);
             draft_offered += T - 1 - e0;
             draft_accepted += a - e0;
             first_window = false;
@@ -551,8 +551,8 @@ Flow Request::decode() {
             if (eos) { finish = "stop"; break; }
             runtime_.shed_if_low();
             if (runtime_.halted()) { finish = "cancel"; break; }
-            x = outv[(size_t) a];
-            p += a + 1;
+            x = outv[(size_t) (ends ? e0 + n_emit - 1 : a)];
+            p += keep;
             basalt::core::decode_events().stamp(2);
             continue;
         }
@@ -562,8 +562,8 @@ Flow Request::decode() {
             std::printf("ERR %s\n", runtime_.err.c_str());
             return Flow::error;
         }
-        // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
-        for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+        // The committed window rows are in the session; the last output is the next x.
+        for (int i = 0; i < keep; ++i) consumed.push_back(window[(size_t) i]);
         draft_offered += T - 1 - e0;
         draft_accepted += a - e0;
         first_window = false;
@@ -607,8 +607,8 @@ Flow Request::decode() {
         if (eos) { finish = "stop"; break; }
         runtime_.shed_if_low();
         if (runtime_.halted()) { finish = "cancel"; break; }
-        x = outv[(size_t) a];
-        p += a + 1;
+        x = outv[(size_t) (ends ? e0 + n_emit - 1 : a)];
+        p += keep;
     }
     if (gguard != nullptr)
         basalt::log::info("basalt grammar", "%lld windows checked, %lld masked resamples, %.3f ms in grammar code (%.2f us/window)",
