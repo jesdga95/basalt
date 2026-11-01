@@ -49,7 +49,7 @@ struct Pools {
         data[2].resize(format == 1 ? 96 * g.n_head_kv * (g.head_dim / 64) * 2 : 0, 0xa5); data[3] = data[2];
         data[4].resize(26 * g.idx_key_dim * 4, 0xa5);
         data[5].resize(3 * g.idx_key_dim * 4, 0xa5);
-        data[6].resize(g.idx_key_dim * 4, 0xa5); data[7].resize(4, 0xa5);
+        data[6].resize(g.idx_key_dim * 4, 0xa5); data[7].assign(4, 0xa5);
         if (format == 2) { st.k_q4 = data[0].data(); st.v_q4 = data[1].data(); }
         else if (format == 1) {
             st.k_q = (int8_t*) data[0].data(); st.v_q = (int8_t*) data[1].data();
@@ -207,7 +207,7 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     SavedConversation full,incremental;
     check(conversation_snapshot_save(full,view,ss,g,draft.st,error), "full capture through host transfer backend");
     const size_t full_copies = copied_bytes;
-    ConversationKvReuse reuse{full.kv,9,9};
+    ConversationKvReuse reuse{full.kv,9,9,{}};
     size_t peak = 0, reused = 0;
     check(conversation_snapshot_capture_bytes(reuse,view,ss,g,draft.st,peak,error), "incremental capture admission without transfers");
     copied_bytes = 0;
@@ -220,12 +220,12 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
         check(incremental.kv[i].k==full.kv[i].k && incremental.kv[i].v==full.kv[i].v &&
               incremental.kv[i].k_scale==full.kv[i].k_scale && incremental.kv[i].v_scale==full.kv[i].v_scale &&
               incremental.kv[i].pooled==full.kv[i].pooled, "incremental and full capture agree across every payload");
-    reuse = {full.kv,9,9};
+    reuse = {full.kv,9,9,{}};
     reuse.kv.back().k.pop_back();
     copy_calls = sync_calls = 0;
     check(!conversation_snapshot_capture_bytes(reuse,view,ss,g,draft.st,peak,error), "malformed retained draft rejected before admission");
     check(!copy_calls && !sync_calls, "invalid retained storage performs no CUDA calls");
-    reuse = {full.kv,9,9};
+    reuse = {full.kv,9,9,{}};
     fail_copy = copy_calls + 1;
     SavedConversation unpublished;
     check(!conversation_snapshot_save(unpublished,view,ss,g,draft.st,error,std::move(reuse)), "incremental capture copy failure is reported");

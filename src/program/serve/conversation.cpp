@@ -1,5 +1,6 @@
 // src/program/serve/conversation.cpp - conversation operations for the persistent engine.
 #include "state.hpp"
+#include "basalt/core/kv_arena.hpp"
 
 namespace basalt::program::serve {
 
@@ -289,15 +290,20 @@ bool Runtime::gpu_sync_ok() {
     return false;
 }
 
-// a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed.  `parts`: the stages'
+// a checkpoint of the state after `cur[0, L)`, taken for `source`; false only when the copy itself failed.  `parts`: the stages'
 // states saved at L (a split's mid-prompt checkpoint); without, they are read now (everything is at L)
-bool Runtime::checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts, bool defer) {
+bool Runtime::checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts, bool defer, ConvCheckpoint::Source source) {
     ckpt_why.clear();
     ckd_finish();
     if (o.prompt_cache <= 0 || L < 1) return true;
     for (ConvCheckpoint& c : checks)
-        if ((int64_t) c.ids.size() == L) { c.used = ++check_clock; return true; }
+        if ((int64_t) c.ids.size() == L) {   // a turn end or the root outranks a stride that landed on it
+            c.used = ++check_clock;
+            if (source > c.source) c.source = source;
+            return true;
+        }
     ConvCheckpoint c;
+    c.source = source;
     c.ids.assign(cur.begin(), cur.begin() + L);
     c.imgs = imgs_below(req_imgs, L);
     if (parts != nullptr) {
@@ -413,6 +419,164 @@ size_t Runtime::spill_to_disk(bool at_exit, size_t limit) {
     }
     if (at_exit) disk.flush();
     return written;
+}
+
+namespace {
+// the VRAM a session's own QSA layers' K/V maps (the drafter's arena aside)
+uint64_t qsa_kv_mapped(const basalt::core::SessionState& u) {
+    uint64_t b = 0;
+    for (int64_t j = 0; u.qsa_states != nullptr && j < u.qsa_alloc; ++j)
+        if (const basalt::core::KvArena* a = u.qsa_states[u.qsa_ord0 + j].kv_arena) b += a->mapped_bytes();
+    return b;
+}
+}  // namespace
+
+// The idle conversations whose KV may leave VRAM, the longest idle first (the busy clock when each went idle, and
+// its batch slot, -1 for the solo session's): those whose time is up (kParkAfterBusy), or with `any` every one.
+// Idle: a cached batch slot other than `park_keep`, or the solo session's conversation while no request works
+// there, holding cells beyond the base; not session `s` (null: none is excluded).
+std::vector<std::pair<double, int>> Runtime::idle_list(const basalt::core::SessionState* s, bool any) {
+    std::vector<std::pair<double, int>> idle;
+    if (kv_floor <= 0 || bs.empty()) return idle;
+    const double now = busy_now();
+    auto holds = [&](const basalt::core::SessionState& u, double since) {
+        return (s == nullptr || u.qsa_states != s->qsa_states) && (any || now - since >= kParkAfterBusy) &&
+               basalt::core::session_kv_cells(u) > kv_floor;
+    };
+    for (int b = 0; b < (int) bs.size(); ++b) {
+        const BSlot& sl = bs[(size_t) b];
+        if (sl.cached && !sl.active && !sl.partial && b != park_keep && holds(*bslot_ss[0][(size_t) b], sl.idle_busy))
+            idle.emplace_back(sl.idle_busy, b);
+    }
+    const bool solo = solo_out != nullptr ? solo_out->live_ok && !solo_out->live.empty()
+                                          : !solo_busy && live_ok && !live.empty();
+    if (solo && !(slot0_is_solo && (bs[0].cached || bs[0].active || park_keep == 0)) && holds(ss, solo_idle_busy))
+        idle.emplace_back(solo_idle_busy, -1);
+    std::sort(idle.begin(), idle.end());
+    return idle;
+}
+
+// The VRAM session `s` is `need` bytes short of comes first from the KV idle conversations hold (idle_list), each
+// moved out whole by park_one.  Returns the bytes given back, -1 when cells could not be given back.  The device is
+// idle.
+int64_t Runtime::park_idle(const basalt::core::SessionState* s, int64_t need, bool any, std::string& e) {
+    int64_t given = 0;
+    for (const auto& idle : idle_list(s, any)) {
+        if (given >= need) break;
+        const int b = idle.second;
+        const basalt::core::SessionState& u = b >= 0 ? *bslot_ss[0][(size_t) b] : ss;
+        const uint64_t had = qsa_kv_mapped(u);
+        if (!park_one(b, e)) {
+            if (!e.empty()) return -1;
+            continue;
+        }
+        given += (int64_t) (had - qsa_kv_mapped(u));
+    }
+    return given;
+}
+
+// An idle engine (no request, no slot decoding): one idle conversation whose time is up leaves VRAM and the expert
+// cache maps what it held, while the cache is below its full size.  False when none went (`e` set on a failure).
+bool Runtime::park_idle_engine(std::string& e) {
+    if (!xcache.segmented() || xcache.mapped_bytes() >= xcache.full_bytes() || idle_list(nullptr, false).empty())
+        return false;
+    if (!kv_drain(e)) return false;
+    const int64_t before = xcache.slots();
+    if (park_idle(nullptr, 1, false, e) <= 0 || !cache_regrow(e)) return false;
+    basalt::log::info("basalt serve", "idle: the expert cache %lld -> %lld slots", (long long) before,
+                      (long long) xcache.slots());
+    return true;
+}
+
+// Idle conversation `b` (a batch slot; -1: the solo session's) out of VRAM, its K/V cells beyond the base back to the
+// driver: into the RAM tier when the RAM a capture must leave admits it, else nothing is copied when the disk tier
+// holds it.  False when it stays in VRAM (`e` empty) or its cells could not be given back (`e` set).
+bool Runtime::park_one(int b, std::string& e) {
+    const auto t0 = Clock::now();
+    basalt::core::SessionState& u = b >= 0 ? *bslot_ss[0][(size_t) b] : ss;
+    std::vector<int32_t>& ids = b >= 0 ? bs[(size_t) b].ids : solo_out != nullptr ? solo_out->live : live;
+    std::vector<ImgKey>& imgs = b >= 0 ? bs[(size_t) b].imgs : solo_out != nullptr ? solo_out->live_imgs : live_imgs;
+    std::vector<ConvCheckpoint>& cks = b >= 0 ? bs[(size_t) b].checks : solo_out != nullptr ? solo_out->checks : checks;
+    const bool cvec = b >= 0 ? bs[(size_t) b].cvec : solo_out != nullptr ? solo_out->cvec : cvec_cached;
+    const std::string who = b >= 0 ? "slot " + std::to_string(b) : std::string("the solo session");
+    basalt::core::SessionState* cap = &u;   // a slot's state is captured through its view of the solo session
+    if (&u != &ss) {
+        make_view(rviews[(size_t) b], b);
+        cap = &rviews[(size_t) b];
+    }
+    const int store = b >= 0 ? b : solo_draft_in0 ? 0 : mtp.main_store();
+    std::string se;
+    const basalt::core::ConversationView view{ids, imgs, cks, cvec};
+    size_t est = 0;
+    if (!basalt::core::conversation_snapshot_bytes(view, *cap, g, mtp_kv, est, se)) {
+        basalt::log::warn("basalt serve", "%s's idle conversation stays in VRAM (%s)", who.c_str(), se.c_str());
+        return false;
+    }
+    size_t moved = 0;   // its checkpoints are in RAM already: they move into the image
+    for (const ConvCheckpoint& c : cks) moved += c.bytes();
+    // the RAM a capture leaves free: the conversation cache's, the disk tier's, and the floor the expert copy left
+    // (the file cache when experts are read from the file)
+    const uint64_t floor = std::max({(uint64_t) o.conversation_cache_min_free_mib << 20,
+                                     disk.enabled() ? disk_floor : 0, ram_floor_bytes});
+    bool to_ram = capture_admit(est > moved ? est - moved : 0, floor);
+    const bool on_disk = !to_ram && disk.enabled() && (int64_t) ids.size() >= kDiskMinTokens &&
+                         disk_has(ids, imgs, cks, cvec);
+    if (!to_ram && !on_disk) {   // said once per idle stretch
+        double& noted = b >= 0 ? bs[(size_t) b].park_noted : solo_park_noted;
+        const double since = b >= 0 ? bs[(size_t) b].idle_busy : solo_idle_busy;
+        if (noted != since)
+            basalt::log::info("basalt serve", "%s's idle conversation stays in VRAM: %zu MiB do not fit in RAM above "
+                              "the %llu MiB floor", who.c_str(), (est - std::min(est, moved)) >> 20,
+                              (unsigned long long) (floor >> 20));
+        noted = since;
+        return false;
+    }
+    size_t bytes = 0;
+    if (to_ram) {
+        try {
+            basalt::core::SavedConversation image;
+            const std::vector<ConvCheckpoint> none;
+            const basalt::core::ConversationView bare{ids, imgs, none, cvec};
+            if (!basalt::core::conversation_snapshot_save(image, bare, *cap, g,
+                    static_cast<const basalt::core::QsaState*>(nullptr), se) ||
+                (mtp_kv != nullptr && !mtp.save_store(store, (int64_t) ids.size(), image.kv.emplace_back(), se))) {
+                basalt::log::warn("basalt serve", "%s's idle conversation stays in VRAM (%s)", who.c_str(), se.c_str());
+                return false;
+            }
+            if (!basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), 0, floor)) {
+                basalt::log::info("basalt serve", "%s's idle conversation stays in VRAM: RAM below the %llu MiB floor "
+                                  "after its capture", who.c_str(), (unsigned long long) (floor >> 20));
+                return false;
+            }
+            image.checkpoints = std::move(cks);
+            bytes = image.bytes();
+            conversations->put_slot(std::move(image), bs.size());
+            for (auto& sc : conversations->take_spilled())
+                if (!disk_has(sc.live.ids, sc.live.imgs, sc.checkpoints, sc.cvec)) disk.put(std::move(sc), kDiskQueueCap);
+        } catch (const std::bad_alloc&) {
+            basalt::log::warn("basalt serve", "%s's idle conversation stays in VRAM: allocation failed", who.c_str());
+            return false;
+        }
+    }
+    const int64_t tokens = (int64_t) ids.size(), had = basalt::core::session_kv_cells(u);
+    if (b >= 0) bs[(size_t) b].cached = false;
+    else if (solo_out != nullptr) solo_out->live_ok = false;
+    else live_ok = false;
+    ids.clear();
+    imgs.clear();
+    cks.clear();
+    for (int64_t j = 0; j < u.qsa_alloc; ++j)
+        if (basalt::core::KvArena* a = u.qsa_states[u.qsa_ord0 + j].kv_arena)
+            if (!a->unmap(kv_floor, e)) { e = "elastic KV: " + e; return false; }
+    ++kv_moves;
+    char where[64];
+    if (to_ram) std::snprintf(where, sizeof where, "to RAM (%.0f MiB)", (double) bytes / 1048576.0);
+    else std::snprintf(where, sizeof where, "kept on disk only");
+    basalt::log::info("basalt serve", "%s's idle conversation, %lld tokens, %s in %.0f ms: %lld KV cells back",
+                      who.c_str(), (long long) tokens, where,
+                      std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                      (long long) (had - basalt::core::session_kv_cells(u)));
+    return true;
 }
 
 int Runtime::init_conversations() {

@@ -111,10 +111,12 @@ private:
     class KvFileRead;
     class KvQueuedRead;
     void writer();
+    using CheckRefs = std::vector<const ConversationCheckpoint*>;   ///< the checkpoints a write stores
     std::shared_ptr<Job> job_locked(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs,
-                                    const std::vector<ConversationCheckpoint>& checks, bool cvec, uint64_t bytes);
-    bool write_now(Job& job, const ConversationSource& src, uint64_t& wrote, uint64_t& whole);
-    bool write_job(Job& job, const ConversationSource& src, uint64_t& wrote, uint64_t& whole, std::string& error);
+                                    const CheckRefs& checks, bool cvec, uint64_t bytes);
+    bool write_now(Job& job, const ConversationSource& src, const CheckRefs& checks, uint64_t& wrote, uint64_t& whole);
+    bool write_job(Job& job, const ConversationSource& src, const CheckRefs& checks, uint64_t& wrote, uint64_t& whole,
+                   std::string& error);
     void finish_locked(const std::shared_ptr<Job>& job, bool ok, uint64_t wrote, uint64_t whole);
     void drop_read(const std::string& name, const std::string& part, std::string& error);
     void unlink_unread_locked();             ///< removes the dropped files no read holds open any more
