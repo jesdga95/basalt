@@ -102,7 +102,10 @@ bool WeightTable::pool_bytes(const PackFiles& pack, uint64_t& out, std::string& 
         if (line[0] == '#') {
             unsigned long long p = 0;
             int a = 0, tensors = 0;
-            if (std::sscanf(line, "# align %d pool %llu tensors %d", &a, &p, &tensors) == 3) { pool = p; align = a; }
+            if (std::sscanf(line, "# align %d pool %llu tensors %d", &a, &p, &tensors) == 3) {
+                if (a % 16) { err = "# align must be a multiple of 16"; return false; }
+                pool = p; align = a;
+            }
             continue;
         }
         if (skip == nullptr) continue;
@@ -132,7 +135,10 @@ bool WeightTable::pool_bytes_by_layer(const PackFiles& pack, int64_t n_layers, s
         if (line[0] == '#') {
             unsigned long long p = 0;
             int a = 0, tensors = 0;
-            if (std::sscanf(line, "# align %d pool %llu tensors %d", &a, &p, &tensors) == 3) align = a;
+            if (std::sscanf(line, "# align %d pool %llu tensors %d", &a, &p, &tensors) == 3) {
+                if (a % 16) { err = "# align must be a multiple of 16"; return false; }
+                align = a;
+            }
             continue;
         }
         char name[256] = {0};
@@ -184,7 +190,11 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
         if (line[0] == '#') {
             unsigned long long p = 0;
             int a = 0, t = 0;
-            if (std::sscanf(line, "# align %d pool %llu tensors %d", &a, &p, &t) == 3) { pool = p; align = a; }
+            // the dense index places tensors at its alignment; the whole-tile kernels need a multiple of 16
+            if (std::sscanf(line, "# align %d pool %llu tensors %d", &a, &p, &t) == 3) {
+                if (a % 16) { err = "# align must be a multiple of 16"; return false; }
+                pool = p; align = a;
+            }
             continue;
         }
         IndexRow r;
