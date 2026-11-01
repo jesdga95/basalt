@@ -34,6 +34,7 @@ constexpr int64_t kPlanRows[] = {64, 256, 512, 1024, 2048, 4096, 16384, 32768}; 
 constexpr int64_t kPlanCheckRows[] = {1, 2, 3, 5, 8, 17, 37, 64, 300, 1000, 4096, 16384, 32768};
 constexpr int kPlanOffers = 32;
 constexpr size_t kPlanWs = 32u << 20;
+cublasLtHandle_t g_prepared_lt[16] = {};
 
 int alignment(const void* p) {
     const uintptr_t v = (uintptr_t) p;
@@ -69,6 +70,19 @@ struct Config {
     }
 };
 }  // namespace
+
+bool Gemm::prepare_lt_handle(std::string& err) {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return true;
+    if (g_prepared_lt[dev]) return true;
+    const cublasStatus_t s = cublasLtCreate(&g_prepared_lt[dev]);
+    if (s != CUBLAS_STATUS_SUCCESS) {
+        g_prepared_lt[dev] = nullptr;
+        err = "prefill gemm: cublasLtCreate: cuBLAS status " + std::to_string((int) s);
+        return false;
+    }
+    return true;
+}
 
 struct Gemm::Plans {
     cublasLtHandle_t h = nullptr;
@@ -240,7 +254,11 @@ bool Gemm::pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int6
                   int64_t ldy, float beta) {
     if (plans_ == nullptr) {
         plans_ = new Plans;
-        if (cublasLtCreate(&plans_->h) != CUBLAS_STATUS_SUCCESS) {
+        int dev = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 16 && g_prepared_lt[dev]) {
+            plans_->h = g_prepared_lt[dev];
+            g_prepared_lt[dev] = nullptr;
+        } else if (cublasLtCreate(&plans_->h) != CUBLAS_STATUS_SUCCESS) {
             plans_->h = nullptr;
             basalt::log::warn("basalt", "prefill gemm: cublasLtCreate failed: cublasGemmEx, whose rounding follows the "
                                         "chunk size");
