@@ -60,7 +60,9 @@ logits, so log-probabilities stay finite. The block partition does not depend on
 are the same bits at every T.
 
 What it changes: the argmax and the sampler's top-64 list come from exact rows unless the copy's error exceeds the margin;
-the softmax tail outside the rescored rows carries the copy's error (rms about 0.7 logit).
+the softmax tail outside the rescored rows carries the copy's error (rms about 0.7 logit). A request whose sampled list
+is longer than 64 (top_k 0 or above 64) reads every row, so its windows run the plain Q6_K head again over the same
+columns (`Verifier::exact_head_rows`): every logit exact.
 
 Offline, on 3,614 real verify-head inputs dumped from the engine (conv, struct, prose fixtures), all 248,320 rows, exact =
 Q6_K x q8_1 in float:
@@ -74,7 +76,7 @@ Q6_K x q8_1 in float:
 Margins 6 and 8 rescore 5,569-18,649 and 27,962-78,806 rows per column. Neither a least-squares scale for the copy nor a
 per-column correction of the tail's bias lowers the KLD (the tail's mass is unbiased; the cost is its noise).
 
-Quality gate (IQ3_S, 100 chunks, against the Q8_0 base, tiers pinned to `--expert-cache 9000 --peer-slots 7562`, 400 W;
+Quality gate (IQ3_S, 100 chunks, against the Q8_0 base, tiers pinned (expert cache 9000 slots, peer 7562), 400 W;
 the gate leaves the PCIe share dynamic, so two runs of one build differ):
 
 | Head | Run | PPL | KLD mean | KLD median | KLD p99 | Same top-1 |
@@ -119,6 +121,9 @@ grammar form) is not enforced.
 
 ## Speculative decoding does not change output
 
+The standalone generator starts verification at the last prompt token, including position zero for a one-token
+prompt. The initial window has one row; subsequent windows use the same verifier and draft policy as longer prompts.
+
 Verify guarantees that a token's logits are bit for bit those of plain decode, whatever the window width
 (verify.hpp:3-8). This section tests that end to end.
 
@@ -133,7 +138,7 @@ configuration, same prompt order. A logit-hash diagnostic prints an FNV-1a hash 
 of every accepted row. Token ids and the hash at each generated position are compared between `--spec 0` and
 `--spec 7`.
 
-Expert tiers are pinned (`--adapt-swaps 0 --peer-adapt-swaps 0`, with `--expert-cache` and `--peer-slots`
+Expert tiers are pinned (`--adapt-swaps 0 --peer-adapt-swaps 0`, with the expert cache and the peer tier
 fixed to the sizes auto-sizing picks), so the same experts sit on the same device in both runs.
 
 | Pack | Prompts | Identical tokens | Logit rows compared | Bit-identical rows | First divergence | Accepted drafts | Decode tok/s, spec 0 → spec 7 |
@@ -149,7 +154,7 @@ deterministic run to run.
 ### Forced-window KLD
 
 The quality gate is teacher-forced: the window tokens are the reference text, forced to width `--t`, and the drafter
-output is not used (`src/program/generate.cpp`, the `ppl != nullptr` branches). Forcing the window widths the drafter
+output is not used (`src/program/serve/request_decode.cpp`, the `ppl != nullptr` branches). Forcing the window widths the drafter
 produces exercises the same verify kernels as real drafting.
 
 IQ3_XXS, 20 chunks of wikitext-2, against the llama.cpp Q8_0 base (base PPL 2.2815), int8 KV, tiers pinned, 400 W:
@@ -167,18 +172,35 @@ against the base.
 ### Scope
 
 - Identity is bitwise with the expert tiers pinned. With adaptation on, experts move between the CPU pool and the GPU,
-  which round differently: a rounding difference, not a quality difference.
+  which round differently: a rounding difference, not a quality difference. The same holds for the slots the elastic KV
+  takes from the expert cache and gives back. An idle conversation moved to RAM and back keeps its bytes exactly: with
+  the tiers pinned, its next turns write the same tokens and accept the same drafts as when it stays in VRAM.
 - The GPU tiers (VRAM and peer card) share one arithmetic; the CPU tier quantizes with ggml's vec_dot_type (Q8_K per 256
   for i-quant gate/up, against q8_1 per 32 on the GPU; native_expert.cpp:48-49, 76-86). In the quality gate about 0.8% of
   routed experts were computed on the CPU (IQ3_XXS, default placement). The split is fixed per placement, so it is the
   same for spec 0 and spec 7.
 - Prompts are 19 to 395 tokens with 256 new tokens: this tests the decode path, not long context.
 
+### Overlapped windows on a layer split
+
+A two-card layer split can start window K+1 on the first card while the second card still verifies window K (see
+[GPUs](../configuration/gpus.md)). The first card commits K as if every row were kept, from a snapshot of the state that
+commit changes (recurrent state, conv history, the indexer's pooled rows and block position, the PLE history), and runs
+K+1 from the guess that K is accepted whole and that its last pick is the drafter's next token. When the guess fails the
+snapshot is put back and K+1 is run again as without the overlap; when it holds, the second card runs K+1 behind K's
+commit. Every row is computed by the same kernels on the same inputs, so greedy output is that of the plain split: the
+two builds write the same 400 tokens for conv, struct and prose and for 3-5K-token prompts when their expert caches are
+pinned (an expert on the CPU tier and the same expert on a GPU differ at 8e-8, which flips a near-tie token between
+unpinned runs). Scored (`ppl=`) requests, requests with a repetition penalty or a grammar, relaxed drafting and batch
+slots never overlap windows.
+
 ## Relaxed drafting
 
+Lossy flags are listed together in one start warning; the routing ones are in [routing.md](routing.md).
+
 `--relaxed-drafting P` (opt-in; off by default) gives up the guarantee above for sampled requests. In exact mode a draft
-is kept only when it equals the target's own draw at that row (`src/program/generate.cpp`, the acceptance loop after
-`ver.run`). In relaxed mode a draft is also kept when the target gives it probability P or more under the request's
+is kept only when it equals the target's own draw at that row (`src/program/serve/request_decode.cpp`, the acceptance loop after
+the verify window). In relaxed mode a draft is also kept when the target gives it probability P or more under the request's
 final distribution (top_k, top_p, min_p, temperature and penalties applied). The sampler reports that probability next to
 its draw (`sample_tokens_probe`, src/kernels/cuda/sampler.cu:1375); the logits and the draws themselves do not change.
 

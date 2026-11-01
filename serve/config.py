@@ -11,6 +11,7 @@ from pathlib import Path
 from serve import ROOT
 from serve.engine.flags import flag_index
 from serve.engine.vision import VISION_MODES, VISION_USAGE, vision_mode
+from serve.util.console import tagged
 
 
 MIN_SLOT_CONTEXT = 256          # the least context a slot is given when --max-context is shared
@@ -118,7 +119,7 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> tuple[list[str],
         if act.nargs == 0:                                 # a switch
             if not isinstance(value, bool):
                 raise ValueError(f"server.{key}: true or false")
-            argv += [flag] if value else (["--no-grammar"] if name == "grammar" else [])
+            argv += [flag] if value else ([f"--no-{name}"] if isinstance(act, argparse.BooleanOptionalAction) else [])
             continue
         items = value if isinstance(value, list) else [value]
         if isinstance(value, list) and not isinstance(act, argparse._AppendAction):
@@ -199,25 +200,38 @@ def engine_groups(words: list[str]) -> list[list[str]]:
     return groups
 
 
+ENGINE_NAMES = {"max-context": "ctx", "pool-workers": "pool"}      # flag -> the console's name
+UNIT_SUFFIXES = {"-mib": "MiB", "-gib": "GiB"}
+
+
+def engine_item(group: list[str]) -> str:
+    """One engine flag with its values as `name=value`; a switch is its bare name."""
+    name, values = group[0][2:], group[1:]
+    for suffix, unit in UNIT_SUFFIXES.items():
+        if name.endswith(suffix) and len(values) == 1:
+            return f"{name[:-len(suffix)]}={values[0]}{unit}"
+    name = ENGINE_NAMES.get(name, name)
+    return f"{name}={','.join(values)}" if values else name
+
+
 def engine_line(file_words: list[str], cli_words: list[str],
                 shared: tuple[int, int] | None = None, grammar: tuple[bool, str] | None = None) -> str:
-    """The startup line listing the engine words from --config and the command line, each flag with its values and
-    origin; with none it says the default flags are used. `shared` is (total, slots) when --max-context
-    was divided among the slots. `grammar` is (on, origin) with origin "config" or "cli", None when left at its default (no entry)."""
+    """The startup line listing the engine words from --config and the command line as key=value items, each origin's
+    items followed by `(from config)` or `(from cli)`; with none it says `defaults`. `shared` is (total, slots)
+    when --max-context was divided among the slots. `grammar` is (on, origin) with origin "config" or "cli", None when
+    left at its default (no entry)."""
     groups = [(g, "config") for g in engine_groups(file_words)] + [(g, "cli") for g in engine_groups(cli_words)]
     last_ctx = max((i for i, (g, _) in enumerate(groups) if g[0] == "--max-context"), default=None)
-    def one(i, g, src):
-        note = f"{src}: {shared[0]} / {shared[1]} slots" if shared and i == last_ctx else src
-        return f"{' '.join(g)} ({note})"
-    shown = ", ".join(one(i, g, src) for i, (g, src) in enumerate(groups))
+    items: dict[str, list[str]] = {"config": [], "cli": []}
+    for i, (g, src) in enumerate(groups):
+        item = engine_item(g)
+        if shared and i == last_ctx:
+            item += f" ({shared[0]}/{shared[1]} slots)"
+        items[src].append(item)
     if grammar is not None:
-        on, origin = grammar
-        entry = f"grammar {'on' if on else 'off'} ({origin})"
-        shown = f"{shown}, {entry}" if shown else entry
-        base = "using default flags, " + entry if not groups else shown
-    else:
-        base = shown or "using default flags"
-    return f"[server] engine: {base}"
+        items[grammar[1]].append(f"grammar={'on' if grammar[0] else 'off'}")
+    shown = "  ".join(f"{' '.join(v)} (from {src})" for src, v in items.items() if v)
+    return tagged("engine", shown or "defaults")
 
 
 def _num(v):
@@ -228,18 +242,34 @@ def _whole(v):
     return _num(v) and v == int(v)
 
 
-# sampling key -> (converter, test, what is expected); the model file and the launch options share it
+# the engine's penalty window holds at most this many tokens (src/program/serve/state.hpp, kPenaltyWindowCap)
+PENALTY_WINDOW_MAX = 4096
+# sampling key -> (converter, test, what is expected); the model file, the launch options and every request share it
 SAMPLING_KEYS = {
     "temperature": (float, lambda v: _num(v) and v >= 0, "a number >= 0 (0 = greedy)"),
     "top_p": (float, lambda v: _num(v) and 0 < v <= 1, "0 < top_p <= 1"),
     "min_p": (float, lambda v: _num(v) and 0 <= v <= 1, "0 <= min_p <= 1"),
-    "top_k": (int, lambda v: _whole(v) and 1 <= v <= 64, "an integer 1..64"),
-    "presence_penalty": (float, lambda v: _num(v) and v >= 0, "a number >= 0"),
-    "frequency_penalty": (float, lambda v: _num(v) and v >= 0, "a number >= 0"),
+    "top_k": (int, lambda v: _whole(v) and v >= -1, "an integer >= 0 (0 or -1 = off: every token)"),
+    "presence_penalty": (float, _num, "a number"),
+    "frequency_penalty": (float, _num, "a number"),
     "repetition_penalty": (float, lambda v: _num(v) and v > 0, "a number > 0 (1 = off)"),
-    "penalty_last_n": (int, lambda v: _whole(v) and v >= 0, "a non-negative integer"),
-    "seed": (int, lambda v: _whole(v) and v > 0, "a positive integer"),
+    "penalty_last_n": (int, lambda v: _whole(v) and 0 <= v <= PENALTY_WINDOW_MAX,
+                       f"an integer 0..{PENALTY_WINDOW_MAX} (the engine's penalty window)"),
+    "seed": (int, lambda v: _whole(v) and -2 ** 63 <= v < 2 ** 64, "an integer"),
 }
+
+
+def checked_sampling(req: dict) -> None:
+    """A request's sampling fields against SAMPLING_KEYS (the model file's rules): ValueError naming the first one out
+    of range, so the request gets a 400 before streaming; a field left out or null takes the defaults.  A value is
+    never changed: what passes reaches the engine as sent."""
+    for key, (_, ok, expected) in SAMPLING_KEYS.items():
+        value = req.get(key)
+        if value is not None and not ok(value):
+            raise ValueError(f"{key}: expected {expected}, not {value!r}")
+    rd = req.get("relaxed_drafting")
+    if rd is not None and rd is not False and not (_num(rd) and 0 <= rd <= 1):
+        raise ValueError(f"relaxed_drafting: expected false or a number 0..1, not {rd!r}")
 
 
 def sampling_defaults_from_config(cfg: dict) -> dict:
@@ -280,13 +310,17 @@ def sampling_option(key: str):
     return parse
 
 
+SAMPLING_NAMES = {"temperature": "temp", "presence_penalty": "pres", "frequency_penalty": "freq",
+                  "repetition_penalty": "rep"}      # the console's short names
+
+
 def sampling_line(effective: dict, cli: set[str], config: set[str]) -> str:
     """The startup line for the effective sampling defaults, each marked with where it came from: the keys in
     `cli` were typed on the command line, those in `config` come from the config file; the rest are the model
     file's."""
-    mark = lambda k: " (command line)" if k in cli else " (config)" if k in config else ""
-    shown = ", ".join(f"{k}={v}{mark(k)}" for k, v in effective.items())
-    return f"[server] sampling defaults: {shown}"
+    mark = lambda k: "(cli)" if k in cli else "(config)" if k in config else ""
+    shown = " ".join(f"{SAMPLING_NAMES.get(k, k)}={v}{mark(k)}" for k, v in effective.items())
+    return tagged("sampling", shown)
 
 
 def vision_setting(text: str) -> str:
@@ -309,7 +343,7 @@ def parallel_count(text: str) -> int:
 
 
 def budget_count(text: str) -> int:
-    """argparse type: a thinking budget in tokens, a whole number >= 0 (0: none)."""
+    """argparse type: a token count, a whole number >= 0 (0: none)."""
     try:
         n = int(text)
     except ValueError:
@@ -376,16 +410,20 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--lazy", action="store_true", help="start the text-only API unloaded; load on first request")
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
                     help="unload the model after this many seconds without requests; the next request loads it again")
+    ap.add_argument("--idle-sleep", type=float, default=None, metavar="SECONDS",
+                    help="put the model to sleep after this many seconds without requests: its VRAM is freed, its RAM "
+                         "copy, conversations and learned expert placement stay, and the next request wakes it in a few "
+                         "seconds (Linux; the driver suspends the engine's GPU state)")
     for key, text in (
             ("temperature", "0 = greedy; higher is more random"),
             ("top-p", "nucleus cutoff, 0 < value <= 1 (1 = off)"),
-            ("top-k", "keep the K likeliest tokens, 1..64"),
+            ("top-k", "keep the K likeliest tokens (0 = off: every token)"),
             ("min-p", "drop tokens less likely than this times the likeliest, 0..1 (0 = off)"),
-            ("presence-penalty", "flat penalty on a token seen in the window, >= 0"),
-            ("frequency-penalty", "penalty growing with how often a token was seen, >= 0"),
+            ("presence-penalty", "flat penalty on a token seen in the window"),
+            ("frequency-penalty", "penalty growing with how often a token was seen"),
             ("repetition-penalty", "multiplicative penalty on seen tokens, > 0 (1 = off)"),
-            ("penalty-last-n", "the window the penalties look back over, in tokens"),
-            ("seed", "fix the random draw, a positive integer")):
+            ("penalty-last-n", "the window the penalties look back over, in tokens (at most 4096)"),
+            ("seed", "fix the random draw, an integer")):
         ap.add_argument(f"--{key}", type=sampling_option(key.replace("-", "_")), metavar="N", default=None,
                         help=f"default {key.replace('-', '_')} for requests that leave it out, over the model file's: {text}")
     ap.add_argument("--min-free-vram-mib", type=int, default=None,
@@ -394,4 +432,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="default thinking budget for requests that leave reasoning_budget_tokens out (0 = none): at "
                          "the budget the thinking is closed and the answer starts, so set it below the request's "
                          "max_tokens")
+    ap.add_argument("--thinking-loop-tokens", type=budget_count, default=256, metavar="N",
+                    help="end the thinking and let the model answer when it repeats one token this many times in a "
+                         "row inside the thinking (0 = never)")
+    ap.add_argument("--answer-room", action=argparse.BooleanOptionalAction, default=True,
+                    help="reserve space for closing the thinking and the answer when the output cap is at least 1024 tokens; "
+                         "an explicit request budget of 0 opts out")
     return ap

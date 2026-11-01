@@ -113,7 +113,7 @@ __global__ void dm_combine_kernel(const float* __restrict__ parts, const float* 
     auto row = [&](int j) -> float {
         const int64_t off = (tk * k + j) * n_embd + col;
         const int kd = s_kind[j];
-        if (kd == 0) return __fadd_rn(0.0f, parts[off]);
+        if ((unsigned) kd <= 1u) return __fadd_rn(0.0f, parts[off]);   // CUDA0's own and its staged share
         return __ldcv(kd >= 2 ? peer_rows + off : cpu_rows + off);
     };
     float sum = row(0) * weights[0];
@@ -177,7 +177,7 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
 #pragma unroll
     for (int j = 0; j < KM; ++j) {
         if (j >= k) break;
-        if (s_kind[j] == 0)
+        if ((unsigned) s_kind[j] <= 1u)   // CUDA0's own and its staged share
             v[j] = make_float4(__fadd_rn(0.0f, v[j].x), __fadd_rn(0.0f, v[j].y), __fadd_rn(0.0f, v[j].z),
                                __fadd_rn(0.0f, v[j].w));
         else if (TAG && s_kind[j] >= 2)
@@ -186,18 +186,20 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
     if (shared && sh_gate)   // the shared expert's gate, as its own kernel applied it
         h = make_float4(sh_mul(h.x, gt), sh_mul(h.y, gt), sh_mul(h.z, gt), sh_mul(h.w, gt));
     if constexpr (DEP) pdl_wait();
+    bool pmark = false;
     if constexpr (WAITC) {
         // as the wait kernel: every row after the pool's word when the layer has CPU entries (the peers' rows are not
         // polled while the pool reads its experts).  cpu_seen only ever steps through a window's rings in order, so
         // holding this ring means this ring's word was seen.
         const bool cpu = plan->counts[3] > 0;
+        pmark = !cpu && plan->counts[2] > 0;   // only the peers' rows to wait for
         if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
             if (cpu) {
                 st_release_gpu(cpu_seen, ring | 0x80000000u);   // waiting for the pool
                 while (*cpu_done < ring) __nanosleep(64);
                 __threadfence_system();
             }
-            st_release_gpu(cpu_seen, ring);
+            st_release_gpu(cpu_seen, pmark ? ring | 0x40000000u : ring);   // (pmark: waiting for the peers' rows)
         }
         if (cpu)
             while (ld_acquire_gpu(cpu_seen) != ring) __nanosleep(32);
@@ -207,7 +209,7 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
     for (int j = 0; j < KM; ++j) {
         if (j >= k) break;
         const int kd = s_kind[j];
-        if (kd != 0 && !(TAG && kd >= 2)) v[j] = __ldcv(mapped_row(j, kd));
+        if ((unsigned) kd > 1u && !(TAG && kd >= 2)) v[j] = __ldcv(mapped_row(j, kd));
     }
     if constexpr (TAG) {
         // a peer row still holding the tag word is read again until none is; a released window (tag_done past ring)
@@ -239,6 +241,7 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
             }
             __stcs(src, make_float4(__uint_as_float(tag), __uint_as_float(tag), __uint_as_float(tag), __uint_as_float(tag)));
         }
+        if (pmark && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) st_release_gpu(cpu_seen, ring);   // its rows are in
     }
     float sx = v[0].x * w[0], sy = v[0].y * w[0], sz = v[0].z * w[0], sw = v[0].w * w[0];
 #pragma unroll

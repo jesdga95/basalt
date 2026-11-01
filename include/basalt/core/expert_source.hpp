@@ -187,6 +187,9 @@ public:
 
     /// The DEVICE address of a pinned, mapped blob (the GPU can read it over PCIe), or null.
     virtual const uint8_t* device_alias(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
+    /// Changes whenever an expert's RAM place (so its `device_alias`) may have changed: a swap's exchange, a spare
+    /// place landing or freed, a RAM home, the top-up.  The places move only between verify windows.
+    virtual uint64_t places_generation() const { return 0; }
     /// A file-backed source: start reading this expert's pages now (it will be needed by the CPU); no-op elsewhere.
     virtual void prefetch(int64_t layer, int64_t expert) { (void) layer; (void) expert; }
     /// A file-backed source: queue the read of these experts' file pages now (a helper thread issues it, the caller
@@ -457,6 +460,16 @@ public:
     bool complement_pinned() const { return complement_pinned_; }
     bool complement_ready() const { return complement_ready_; }
     uint64_t locked_bytes() const { return complement_locked_; }
+    /// SLEEP and WAKE: the RAM copy's registration with the driver.  `unpin_complement` drops it, so a process
+    /// checkpoint does not map the whole copy into every context again on restore; false (nothing changed) when the
+    /// copy is not one registered range read at its host addresses.  `repin_start` registers it again at the same
+    /// addresses, about 1 GiB at a time on `threads` threads in address order; `repin_wait(p, n)` waits until
+    /// [p, p + n) is registered (false once a registration was refused); `repin_finish` waits for all of it.
+    bool unpin_complement(std::string& err);
+    bool complement_unpinned() const { return unpinned_; }
+    void repin_start(int threads);
+    bool repin_wait(const void* p, uint64_t n) const;
+    bool repin_finish(std::string& err);
     /// Lend-region slots whose experts the compact copy holds (the last ones of the cache).
     int64_t resident_lent_slots() const { return complement_lent_slots_; }
 
@@ -544,10 +557,12 @@ public:
     bool pinned(int64_t layer, int64_t expert) const override;
     bool file_extent(int64_t layer, int64_t expert, int& fd, uint64_t& offset) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
+    uint64_t places_generation() const override { return places_gen_; }
     bool pcie_layer(int64_t layer) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
-    /// Each blob read from the file with block-aligned unbuffered reads into small pinned staging buffers; a blob that
-    /// cannot be read that way, or a file system without unbuffered reads, takes the mapped copy.
+    /// Overlaps block-aligned unbuffered reads through small pinned stages.  A blob whose read comes back short or
+    /// failed, and a file system without unbuffered reads, take the mapped copy instead, whose pages are given back
+    /// once the sink has them so a full fill does not leave the pack resident.  A sink that fails stops the read.
     bool read_blobs(const std::pair<int32_t, int32_t>* pairs, int64_t n, const BlobSink& sink, std::string& err) override;
 
     /// Blobs touched, for the driver to report.  With `h = 0` this is `48 * k` per token and the number is only
@@ -592,6 +607,13 @@ private:
     const uint8_t* host_at(uint64_t off, uint64_t bytes) const;
     std::vector<uint64_t> complement_offsets_;
     bool complement_pinned_ = false;
+    bool unpinned_ = false;                   ///< SLEEP dropped the copy's registration; WAKE puts it back
+    std::vector<uint64_t> pin_units_;         ///< registered again in these ranges: starts into the arena, then the end
+    std::unique_ptr<std::atomic<int>[]> pin_state_;   ///< per range: 0 waiting, 1 registered, 2 refused
+    std::atomic<size_t> pin_next_{0};
+    std::vector<std::thread> pin_threads_;
+    void repin_join();
+    void unregister_complement();
     bool complement_partial_ = false;         ///< CS-T: only the first complement_pin_limit_ bytes are registered
     uint64_t complement_pin_limit_ = 0;
     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
@@ -608,11 +630,13 @@ private:
     int64_t xstage_cap_ = 0;
     uint64_t xstage_blob_ = 0;
     int64_t exchanges_ = 0;
+    uint64_t places_gen_ = 0;   ///< places_generation
     int64_t spares_want_ = 0;
     std::vector<std::pair<uint64_t, uint64_t>> spare_free_;   // (offset, bytes) of free places
     std::atomic<int64_t> file_reads_{0};
     int64_t reads_ = 0;
     int fd_ = -1;
+    std::string path_;   ///< the mapped file, which the bulk reads open unbuffered
 };
 
 // ================================ THE RESIDENT ARENA ================================

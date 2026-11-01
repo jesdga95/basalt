@@ -292,9 +292,10 @@ void usage(const std::string& engine) {
         "  --engine BIN       engine binary (default: the one built with this program)\n"
         "  --set \"F V ...\"    FLAG VALUE pairs that replace or add engine arguments (repeatable)\n"
         "  --spec N           speculation window for the engine (--spec N, e.g. 7; also --spec after --); without it\n"
-        "                     the run has no speculation (--spec 0): a clean baseline\n"
+        "                     the engine default (speculation with the pack drafter, window 8); --spec 0 is a\n"
+        "                     plain-decode baseline\n"
         "  -- ARGS...         the same engine arguments, after --: replacing and adding flags\n"
-        "  built in (only what the measurement needs, each replaced by giving the flag): --spec 0, --max-context sized\n"
+        "  built in (only what the measurement needs, each replaced by giving the flag): --max-context sized\n"
         "  to the fixtures\n"
         "\n"
         "output\n"
@@ -405,7 +406,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
     if (o.community) {
         const char* bad = o.sel_decode || o.sel_prefill ? "-t / -p" : o.reps != 1 ? "-r" : o.quality ? "--quality"
                         : !o.spec.empty() ? "--spec" : !o.sets.empty() ? "--set" : !o.engine.empty() ? "--engine"
-                        : !o.power_label.empty() ? "--power-label" : o.seed ? "--seed" : o.no_windows ? "--no-windows"
+                        : !o.gpu.empty() ? "--gpu" : !o.power_label.empty() ? "--power-label" : o.seed ? "--seed" : o.no_windows ? "--no-windows"
                         : o.format != "md" ? "-o" : !o.passthrough.empty() ? o.passthrough[0].c_str() : nullptr;
         if (bad != nullptr) {
             err = std::string("--community runs the fixed preset: ") + bad + " would make the row incomparable";
@@ -726,12 +727,12 @@ int main(int argc, char** argv) {
     if (!o.spec.empty()) set_arg(args, "--spec", o.spec);
     if (o.model.empty()) for (const auto& a : o.passthrough) args.push_back(a);
     else merge_args(args, o.passthrough);
-    if (!o.community && !has_arg(args, "--spec")) set_arg(args, "--spec", "0");
     // the GPUs, chosen here once as the server chooses them: the engine sees only those cards and says nothing again
     if (!o.model.empty()) {
         std::string gpu_value, gerr;
         std::vector<basalt::program::GpuCard> used;
-        const std::string want = has_arg(args, "--gpu") ? arg_value(args, "--gpu") : o.gpu;
+        // a community run uses every visible card; CUDA_VISIBLE_DEVICES picks them
+        const std::string want = o.community ? "auto" : has_arg(args, "--gpu") ? arg_value(args, "--gpu") : o.gpu;
         if (!basalt::program::select_gpus(want, "basalt-bench", gpu_value, used, gerr)) {
             basalt::log::error("basalt-bench", "%s", gerr.c_str());
             return 2;
@@ -1140,8 +1141,7 @@ int main(int argc, char** argv) {
         }
         std::string gpu_err;
         std::vector<std::pair<std::string, Nvml::Snap>> cards;
-        std::istringstream ids(info.count("gpus") ? info["gpus"] : "");
-        for (std::string id; std::getline(ids, id, ',');) {
+        for (const std::string& id : basalt::program::split_gpu_ids(info.count("gpus") ? info["gpus"] : "")) {
             Nvml::Snap g;
             if (!nvml.snap_bus(id, g) || g.name.empty() || g.vram_gib <= 0 || g.power_enforced_w <= 0) {
                 gpu_err = "NVML could not read the GPU at " + id;

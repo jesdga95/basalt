@@ -7,7 +7,7 @@
 // subtraction inside the INTEGER domain, which is what makes it bit-exact.
 //
 // Naive on purpose: one thread per block, no vectors, no shared memory, no unrolling.  Phase 3 changes this
-// file and the parity test in src/kernels/dequant_s2_parity.cpp is what says whether a change is still right.
+// file and the parity test in tests/kernels/dequant_s2_parity.cpp is what says whether a change is still right.
 #include "basalt/kernels/dequant_s2.hpp"
 
 #include <cuda_runtime.h>

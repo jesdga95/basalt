@@ -21,7 +21,9 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -69,6 +71,26 @@ public:
     /// DEC_MOE: the residency table ([n_layers * n_expert] slot or -1) and a slot's device address.
     const std::vector<int32_t>& residency() const { return res_; }
     const uint8_t* slot_address(int32_t slot) { return cache_.device_slot(slot); }
+    /// The tier's slots: a prompt-time stage on this card reads its experts there and lends the last ones.
+    const ExpertCache& cache() const { return cache_; }
+
+    /// A prompt-time stage on this card takes slots `first` and up for one prompt: their experts stop being resident,
+    /// and `lent` gets each one's residency index and slot.  No swap may be in flight (apply_pending first).
+    bool lend(int32_t first, std::vector<std::pair<int32_t, int32_t>>& lent, std::string& err);
+    /// Queues the copies that put the lent slots' experts back, from the expert source, on the refill stream.
+    bool give_back(const std::vector<std::pair<int32_t, int32_t>>& lent, std::string& err);
+    /// Waits for `give_back`'s copies and makes the experts resident again; `lent` is cleared.
+    bool give_back_wait(std::vector<std::pair<int32_t, int32_t>>& lent, std::string& err);
+    /// Between requests: every expert leaves its slot (the RAM copy keeps it) and the slots' VRAM goes back to the
+    /// driver; `wake` maps it again and copies each expert back into the slot it left.  Not with an exclusive tier (no
+    /// RAM copy to come back from).
+    bool sleep(std::string& err);
+    /// `wake` queues the copies; `wake_wait` waits for them and makes the experts resident again.  With `ready` (the
+    /// RAM copy being registered again) the copies run in source address order on a thread of their own, each once
+    /// `ready(src, bytes)` says its source is registered, while the caller refills the main card's cache.
+    bool wake(std::string& err, std::function<bool(const void*, uint64_t)> ready = nullptr);
+    bool wake_wait(std::string& err);
+    bool asleep() const { return !asleep_.empty(); }
 
     /// Starts the peer's share of one layer: the entries i with kind[i] == 2 (x: n_tok rows of n_embd floats).
     /// multi-GPU: with `out` (pinned, portable host rows) the peer writes its rows straight into
@@ -100,9 +122,14 @@ public:
     void hold(int64_t layer, int64_t expert) { hold_[(size_t) (layer * n_expert_ + expert)] = 1; }
     /// Copies (layer, expert)'s bytes from the peer's slot into `dst` on device 0 (queued on `stream`).
     bool copy_to(int64_t layer, int64_t expert, uint8_t* dst, cudaStream_t stream, std::string& err);
-    /// PEER_PROMOTE: `in` moved to the primary, which gave up `out` (`blob`: its bytes in host memory).  The
-    /// slot `in` held takes `out`, resident at `apply_pending`.  Call only between verify windows.
-    bool reassign(int64_t layer, int32_t in, int32_t out, const uint8_t* blob, std::string& err);
+    /// PEER_PROMOTE: `in` of `layer` moved to the primary, which gave up `out` of `lout` (`blob`: its bytes in host
+    /// memory, a blob of the same size).  The slot `in` held takes `out`, resident at `apply_pending`.  Call only
+    /// between verify windows.
+    bool reassign(int64_t layer, int32_t in, int64_t lout, int32_t out, const uint8_t* blob, std::string& err);
+    /// Between requests: each (slot, residency index) of `want` holds that expert afterwards, copied from the expert
+    /// source; the slots it does not name keep theirs.  Lands any swap in flight first.  `moved` gets the slots
+    /// rewritten.  Not with an exclusive tier.
+    bool place(const std::vector<std::pair<int32_t, int32_t>>& want, int64_t& moved, std::string& err);
 
     int64_t resident() const { return resident_; }
     /// the last launch writes its rows into the host rows itself (the caller must not touch them)
@@ -121,6 +148,9 @@ private:
     std::vector<int32_t> res_;                        ///< [n_layers * n_expert] -> peer slot or -1
     std::vector<std::pair<int32_t, int32_t>> pending_;   ///< (residency index, slot) once the copies land
     FileExpertSource* fsrc_ = nullptr;                ///< set with --peer-exclusive
+    std::vector<std::pair<int32_t, int32_t>> asleep_; ///< (residency index, slot) that `sleep` took out
+    std::thread wake_thread_;                          ///< `wake` with `ready`: its copies
+    bool wake_failed_ = false;
     std::vector<uint8_t> hold_;                       ///< [n_layers * n_expert]: not to be evicted
     /// `off` is the RAM place the victim is copied to, or `kHasPlace` when the victim already has one
     static constexpr uint64_t kHasPlace = ~0ull;

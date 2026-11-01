@@ -113,5 +113,8 @@ void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_r
 /// Plan v0.3 P3: copy `n` int32 from mapped pinned host memory into device memory with a kernel (the QSA
 /// per-token step and positions), instead of a host-to-device memcpy node in the middle of a layer.
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream);
+/// Three such copies in one launch (sizes n0, n1, n2; a size may be 0).
+void copy_i32x3_from_mapped(int32_t* d0, const int32_t* s0, int64_t n0, int32_t* d1, const int32_t* s1, int64_t n1,
+                            int32_t* d2, const int32_t* s2, int64_t n2, void* stream);
 
 }  // namespace basalt::kernels

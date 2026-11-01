@@ -2,6 +2,7 @@
 
     BASALT_BIN=bin/basalt BASALT_BENCH_BIN=bin/basalt-bench python3 -m unittest tools.test_bench_flags
 """
+import json
 import os
 import re
 import subprocess
@@ -44,7 +45,7 @@ class BenchFlags(unittest.TestCase):
         # Every flag the help lists is one the engine parser accepts; an empty or cut-short list would make the
         # per-flag test vacuous.
         flags = engine_flags()
-        parsed = set(re.findall(r'a == "(--[a-z0-9-]+)"', (ROOT / "src/program/generate.cpp").read_text()))
+        parsed = set(re.findall(r'a == "(--[a-z0-9-]+)"', (ROOT / "src/program/cli/arguments.cpp").read_text()))
         self.assertTrue(parsed)
         self.assertEqual(sorted(set(flags) - parsed), [])
         for known in ("--spec", "--kv", "--max-context", "--gpu"):
@@ -79,9 +80,13 @@ class BenchFlags(unittest.TestCase):
 
     def test_built_ins_are_minimal(self):
         cmd = self.command()
-        self.assertEqual(cmd[cmd.index("--spec") + 1], "0")
+        self.assertNotIn("--spec", cmd)
         self.assertNotIn("--kv", cmd)
         self.assertNotIn("--resident-experts", cmd)
+
+    def test_spec_zero_is_passed_when_given(self):
+        cmd = self.command("--spec", "0")
+        self.assertEqual(cmd[cmd.index("--spec") + 1], "0")
 
     def test_community_keeps_the_engine_defaults(self):
         cmd = self.command_community()
@@ -102,6 +107,15 @@ class BenchFlags(unittest.TestCase):
                                    capture_output=True, text=True)
                 self.assertEqual(r.returncode, 2)
                 self.assertIn("incomparable", r.stderr)
+
+    def test_community_uses_every_visible_card_and_refuses_gpu(self):
+        cmd = self.command_community()
+        plan = subprocess.run([str(ENGINE), "--gpu-plan", "--gpu", "auto"], capture_output=True, text=True)
+        self.assertEqual(plan.returncode, 0, plan.stderr)
+        self.assertEqual(cmd[cmd.index("--gpu") + 1], json.loads(plan.stdout)["devices"])   # every visible card
+        r = subprocess.run([str(BENCH), "--model", "m.basalt", "--community", "--gpu", "0"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("incomparable", r.stderr)
 
     def test_help_lists_the_engine_flags(self):
         r = subprocess.run([str(BENCH), "--help", "--engine", str(ENGINE)], capture_output=True, text=True)

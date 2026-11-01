@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 using namespace basalt::program;
 
@@ -33,7 +34,7 @@ CommunityRow plain_row() {
 // quotes, a backslash, a control character, 0x7f and non-ASCII text
 CommunityRow odd_row() {
     CommunityRow r = plain_row();
-    r.submitter = "\xC3\x9Cn\xC3\xAF \"q\" \\ \xE2\x98\x83 \xE6\x97\xA5\xE6\x9C\xAC";
+    r.submitter = "\xC3\x9Cn\xC3\xAF\"q\"\\\xE2\x98\x83\xE6\x97\xA5\xE6\x9C\xAC";
     r.gpus = {{"Card \"X\"\tTi", 24, 300, "", 0}};   // no link figures: the optional keys are left out
     r.cpu.clear(); r.ram_gbps = 0;
     r.notes = "line\nbreak \xE2\x82\xAC \x01\x7f";
@@ -64,6 +65,19 @@ int main(int argc, char** argv) {
         if (!f || std::fwrite(out.data(), 1, out.size(), f) != out.size()) return 1;
         std::fclose(f);
         return 0;
+    }
+
+    {
+        const std::vector<int> none;
+        auto str = [](const std::vector<int>& v) { std::string t; for (int d : v) t += (t.empty() ? "" : ",") + std::to_string(d); return t; };
+        check(str(engine_gpu_order(-1, none, none)) == "0", "one card");
+        check(str(engine_gpu_order(1, {1}, none)) == "0,1", "two cards, one tier");
+        check(str(engine_gpu_order(1, {1, 2, 3}, none)) == "0,1,2,3", "four cards, three tiers", str(engine_gpu_order(1, {1, 2, 3}, none)));
+        check(str(engine_gpu_order(-1, none, {1, 2})) == "0,1,2", "layer split stages");
+        check(str(engine_gpu_order(1, {1, 1, 2}, {2, 3})) == "0,1,2,3", "repeats listed once, in order");
+        const auto ids = split_gpu_ids("0000:01:00.0,0000:02:00.0,0000:03:00.0,0000:04:00.0");
+        check(ids.size() == 4 && ids[0] == "0000:01:00.0" && ids[3] == "0000:04:00.0", "a four-card gpus= field gives four ids");
+        check(split_gpu_ids("").empty() && split_gpu_ids("a,,b,").size() == 2, "empty fields are dropped");
     }
 
     const std::string one =

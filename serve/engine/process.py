@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
 import queue
 import re
@@ -30,11 +31,12 @@ from pathlib import Path
 
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY, engine_key as grammar_key
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
-from serve.engine import lifeline
+from serve.engine import lifeline, suspend
 from serve.engine.flags import flag_value
-from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStuck
+from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck
 from serve.engine.slots import AdmissionQueue
 from serve.prompt import PromptText
+from serve.util.console import tagged
 from serve.engine.progress import narrate_start, server_line, start_errors, start_failure_hint, start_last_line
 
 
@@ -82,13 +84,18 @@ def engine_line(line: str) -> str:
 
 
 AUTO_FLAGS = "auto flags: "
+AUTO_NAMES = {"peer-exclusive": "peer-excl", "pool-workers": "pool"}   # the console's short names
 
 
 def relay_auto_flags(line: str) -> bool:
     """Print the engine's auto-picked flags as a server line; False when the line is not that line."""
     if not line.startswith(AUTO_FLAGS):
         return False
-    server_line("[server] " + line.rstrip("\n"))
+    pairs = []
+    for item in line.rstrip("\n")[len(AUTO_FLAGS):].split(", "):
+        name, _, value = item.partition(" ")
+        pairs.append(f"{AUTO_NAMES.get(name, name)}={value.replace(' ', '')}" if value else name)
+    server_line(tagged("auto", " ".join(pairs)))
     return True
 
 
@@ -132,9 +139,24 @@ def pump_lines(stream, sink) -> None:
 
 REQUEST_LINES = False    # --request-lines: echo the engine's per-request summary on stdout
 EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
+PENALTY_LAST_N_DEFAULT = 64  # the penalty window of a request that sets a penalty but no penalty_last_n
+
+
+def _number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 # Engine lines for an unrecoverable verifier: the process may stay alive and print DONE, but must take no more requests.
 FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed out at layer ",
                   "ERR verify: an earlier window never finished", "ERR verify batch: an earlier window never finished")
+# Engine ERR texts that are the request's fault (a 400); any other ERR of a request is an engine failure (a 500).
+REQUEST_ERRS = ("prompt (", "bad request:", "sampling ", "logit_bias:", "grammar:", "ppl:",
+                "a token id is outside the vocabulary", "this engine was started without --vision",
+                "the prompt cannot end in an image")
+
+
+def request_err(err: str, shown: str | None = None) -> ValueError:
+    """The exception for a request's ERR text, raised with `shown` when given: ValueError when the request caused it,
+    else EngineError."""
+    return (ValueError if err.startswith(REQUEST_ERRS) else EngineError)(err if shown is None else shown)
 
 
 class ProcessEngine:
@@ -165,6 +187,20 @@ class ProcessEngine:
             tl = self.__dict__.setdefault("_tl", threading.local())
             tl.last = value
 
+    # Windows of the request in progress on this thread: (windows, tokens in them), counted from the batch slot's
+    # `BT` lines.
+    def window_stats(self) -> tuple[int, int]:
+        tl = self.__dict__.setdefault("_wtl", threading.local())
+        return getattr(tl, "windows", 0), getattr(tl, "tokens", 0)
+
+    def _count_window(self, tokens: int) -> None:
+        tl = self.__dict__.setdefault("_wtl", threading.local())
+        tl.windows, tl.tokens = getattr(tl, "windows", 0) + 1, getattr(tl, "tokens", 0) + tokens
+
+    def _reset_windows(self) -> None:
+        tl = self.__dict__.setdefault("_wtl", threading.local())
+        tl.windows = tl.tokens = 0
+
     # `read_ms`: prompt-read time of the request in progress, summed over its engine runs (per thread with batch slots).
     @property
     def read_ms(self) -> float:
@@ -186,7 +222,13 @@ class ProcessEngine:
         self.proc, self.pump, self.log = None, None, None
         if "slot_cv" not in self.__dict__:               # restart() wakes waiters even when the start failed
             self.slot_cv = threading.Condition()
+        if "sleep_lock" not in self.__dict__:            # sleep, wake and close never overlap, across restarts too
+            self.sleep_lock = threading.RLock()
         self.ended, self.unloaded = True, True
+        if "loading" not in self.__dict__:               # restart() holds these across its __init__ calls
+            self.loading, self.load_status = False, {}
+        self.asleep = False              # its GPU state suspended by the driver (sleep/wake)
+        self.restore_s = 0.0             # the driver's part of the last wake
         self.max_context = int(flag_value(args, "--max-context") or 4096)
         self.can_stop = False            # READY <ctx> stop
         self.last = {}
@@ -211,7 +253,7 @@ class ProcessEngine:
             visible = (env or os.environ).get("CUDA_VISIBLE_DEVICES", "")
             gpus = [int(x) for x in visible.split(",") if x.strip().isdigit()]
             narrator = threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), loading),
-                                        kwargs={"gpus": gpus}, daemon=True)
+                                        kwargs={"gpus": gpus, "on_progress": self._note_load}, daemon=True)
             narrator.start()
             # one follower per log, across restarts
             if REQUEST_LINES and os.path.abspath(log) not in _echoing:
@@ -314,6 +356,9 @@ class ProcessEngine:
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
 
+    def _note_load(self, status: dict) -> None:
+        self.load_status = status
+
     @staticmethod
     def _ready_pump(proc, out: queue.Queue, log=None) -> None:
         """The engine's first lines up to READY, for a read that can time out; None when its output closed first."""
@@ -412,6 +457,7 @@ class ProcessEngine:
         """Start the engine again after it died; a start that exits before READY is retried."""
         info = dict(self.info)
         self.starting = True                     # prepare() answers 503 meanwhile
+        self.loading, self.load_status = True, {}
         try:
             self.close()
             for i in range(tries):
@@ -434,6 +480,7 @@ class ProcessEngine:
                     time.sleep(self.RESTART_RETRY_S)
         finally:
             self.starting = False
+            self.loading = False
             with self.slot_cv:                   # wake the requests that waited through the restart
                 self.slot_cv.notify_all()
         self.info = {**info, **self.info}
@@ -455,21 +502,62 @@ class ProcessEngine:
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """Resize the expert cache to leave `reserve_mib` free (None: the starting reserve); returns the engine's
         figures. Caller holds the service FIFO. ValueError carries the engine's refusal."""
+        return self._vram_command("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}"), timeout)
+
+    def can_sleep(self) -> bool:
+        return suspend.available()
+
+    def sleep(self, ram_check=None, timeout: float = 120.0) -> dict:
+        """SLEEP: the engine gives its expert cache's VRAM back (its experts stay in RAM), then the driver moves the
+        rest of its GPU state to host memory and releases the VRAM. `ram_check()`, asked once the cache is down, says
+        why the rest would not fit in RAM (None: it fits). Caller holds the service FIFO and the control lines.
+        ValueError: not asleep (the engine is as it was)."""
+        with self.sleep_lock:
+            out = self._vram_command("SLEEP", timeout)
+            why = ram_check() if ram_check is not None else None
+            if why is None:
+                why = suspend.suspend(self.proc.pid)
+            if why is not None:
+                self._vram_command("WAKE", timeout)
+                raise ValueError(why)
+            self.asleep = True
+            return out
+
+    def wake(self, timeout: float = 120.0) -> dict:
+        """The driver puts the GPU state back, then WAKE refills the expert cache from RAM. EngineDied when the GPU
+        state cannot come back (the engine is ended so the next request starts it again)."""
+        with self.sleep_lock:
+            t = time.time()
+            why = suspend.resume(self.proc.pid)
+            self.restore_s = time.time() - t
+            if why is None:
+                self.asleep = False
+                try:
+                    return self._vram_command("WAKE", timeout)
+                except ValueError as e:                 # its caches could not come back: start it again
+                    why = str(e)
+            self.asleep = False
+            self._silent(why)
+            raise EngineDied(why)
+
+    def _vram_command(self, command: str, timeout: float) -> dict:
+        """Send a VRAM, SLEEP or WAKE command and read its VRAM line."""
         if not self.alive():
             raise EngineDied("the engine is not running")
-        self.proc.stdin.write("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}") + "\n")
+        self.proc.stdin.write(command + "\n")
         self.proc.stdin.flush()
+        what = command.split()[0]
         deadline = time.time() + timeout
         while True:
             try:
                 line = self.lines.get(timeout=max(0.1, deadline - time.time()))
             except queue.Empty:
-                raise EngineDied("the engine did not answer the VRAM command") from None
+                raise EngineDied(f"the engine did not answer the {what} command") from None
             if line is None:
                 raise EngineDied("the engine ended")
             line = line.strip()
             if line.startswith("ERR"):
-                raise ValueError(line[4:].strip() or "the engine refused the VRAM command")
+                raise ValueError(line[4:].strip() or f"the engine refused the {what} command")
             if line.startswith("VRAM "):
                 out = {}
                 for kv in line.split()[1:]:
@@ -479,7 +567,7 @@ class ProcessEngine:
                 self.info["vram"] = out
                 return out
             if time.time() > deadline:
-                raise EngineDied("the engine did not answer the VRAM command")
+                raise EngineDied(f"the engine did not answer the {what} command")
 
     ENC_TIMEOUT_S = 300.0
 
@@ -523,26 +611,28 @@ class ProcessEngine:
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
+        """The GEN line's sampling keys, each value as sent (the handler refused what is out of range,
+        config.checked_sampling); a field left out is not sent.  A temperature of 0 is greedy, as an absent one;
+        penalties that change nothing (repetition 1, frequency and presence 0) are not sent."""
         keys = ""
         t = sampling.get("temperature")
-        if isinstance(t, (int, float)) and float(t) > 0.0:
+        if _number(t) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
         tp = sampling.get("top_p")
-        if isinstance(tp, (int, float)) and float(tp) < 1.0:
+        if _number(tp):
             keys += f" top_p={float(tp)!r}"
         tk = sampling.get("top_k")
-        if isinstance(tk, int) and not isinstance(tk, bool) and tk >= 0:
-            # the sampler keeps at most 64 candidates
-            keys += f" top_k={tk if 1 <= tk <= 64 else 64}"
+        if _number(tk) and tk == int(tk):
+            keys += f" top_k={int(tk)}"
         mp = sampling.get("min_p")
-        if isinstance(mp, (int, float)) and 0.0 < float(mp) <= 1.0:
+        if _number(mp):
             keys += f" min_p={float(mp)!r}"
         rp = sampling.get("repetition_penalty")
-        rp_on = isinstance(rp, (int, float)) and float(rp) != 1.0
+        rp_on = _number(rp) and float(rp) != 1.0
         pf = sampling.get("frequency_penalty")
-        pf_on = isinstance(pf, (int, float)) and float(pf) != 0.0
+        pf_on = _number(pf) and float(pf) != 0.0
         pp = sampling.get("presence_penalty")
-        pp_on = isinstance(pp, (int, float)) and float(pp) != 0.0
+        pp_on = _number(pp) and float(pp) != 0.0
         if rp_on:
             keys += f" penalty_repeat={float(rp)!r}"
         if pf_on:
@@ -550,20 +640,17 @@ class ProcessEngine:
         if pp_on:
             keys += f" penalty_present={float(pp)!r}"
         if rp_on or pf_on or pp_on:
-            # a penalty needs a window; default to the last 64 tokens
+            # the window the penalties count over: the request's, else llama.cpp's default
             pln = sampling.get("penalty_last_n")
-            if isinstance(pln, int) and not isinstance(pln, bool) and pln > 0:
-                keys += f" penalty_last_n={pln}"
-            else:
-                keys += " penalty_last_n=64"
+            keys += f" penalty_last_n={int(pln) if _number(pln) else PENALTY_LAST_N_DEFAULT}"
         seed = sampling.get("seed")
-        if isinstance(seed, int) and seed > 0:
-            keys += f" seed={seed}"
+        if _number(seed) and seed == int(seed):
+            keys += f" seed={int(seed)}"
         # relaxed_drafting: this request's --relaxed-drafting threshold, 0 or false for exact sampling
         rd = sampling.get("relaxed_drafting")
         if rd is False:
             keys += " relax=0"
-        elif isinstance(rd, (int, float)) and not isinstance(rd, bool) and 0.0 <= float(rd) <= 1.0:
+        elif _number(rd):
             keys += f" relax={float(rd)!r}"
         return keys + ProcessEngine.projection_key(sampling) + bias_key(sampling.get(BIAS_KEY)) \
             + grammar_key(sampling.get(GRAMMAR_KEY))
@@ -642,7 +729,7 @@ class ProcessEngine:
                     self._yielded = (int(f[1]), int(f[2]))
             elif line.startswith("ERR"):
                 self._ctl_erred = True                   # the engine refused it and is idle: no DONE follows
-                raise ValueError(line[4:].strip())
+                raise request_err(line[4:].strip())
             if line.startswith("DONE") and self._ctl_mode == "solo":
                 self._ctl_result = ("done", None)
                 return
@@ -845,6 +932,7 @@ class ProcessEngine:
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress = None
+        self._reset_windows()
         keys = self.sampling_keys(sampling or {})
         out: list[int] = []
         pending: list[int] = []
@@ -1037,6 +1125,7 @@ class ProcessEngine:
                         phase = "none"
                         raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
                     if line.startswith("BT "):
+                        self._count_window(len(line.split()) - 2)
                         for t in (int(x) for x in line.split()[2:]):    # a window's tokens for this slot, in order
                             out.append(t)
                             if cancel.is_set():
@@ -1247,7 +1336,7 @@ class ProcessEngine:
                 elif line.startswith("ERR"):
                     done = True
                     err = line[4:].strip()
-                    raise ValueError(text.explain(err) if text is not None else err)
+                    raise request_err(err, text.explain(err) if text is not None else None)
         finally:
             if not done:                                  # consumer left early: STOP and drain to DONE
                 if self.can_stop:
@@ -1292,6 +1381,10 @@ class ProcessEngine:
         """End the engine: QUIT, then terminate, then kill, 20 s each; EngineStuck if it still runs."""
         if self.proc is None:
             return
+        with self.sleep_lock:                        # a sleep in progress ends first
+            if self.asleep:                          # its GPU state back first: QUIT runs CUDA calls
+                self.asleep = False
+                suspend.resume(self.proc.pid)
         try:
             if self.proc.poll() is None:
                 try:

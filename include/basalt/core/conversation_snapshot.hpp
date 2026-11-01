@@ -27,6 +27,10 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& state
                               int64_t upto, bool include_index, std::string& error);
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                              int64_t upto, bool include_index, std::string& error);
+// The K/V up to `upto` of `from` into `to` (the same layout) without a host copy: what a save of `from` and a
+// restore of it into `to` leave there.
+bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g, int64_t upto,
+                          bool include_index, std::string& error);
 // Diagnostic read-back after a synchronized restore. Uses 64 KiB of stack
 // workspace, compares authoritative bytes and resident draft-ring pages, and
 // fingerprints the authoritative payload only. Never changes model state.
@@ -47,6 +51,10 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& checkpoint, 
                                       const ModelGeometry& g, std::string& error);
 bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const SessionState& session,
                                   const ModelGeometry& g, std::string& error);
+/// Overwrites the running state of layers [layer_lo, layer_hi) in a whole-model checkpoint with `part`'s, a session
+/// that holds those layers (another card's share of a prompt read).  The caller has synchronized `part`'s device.
+bool conversation_checkpoint_save_layers(ConversationCheckpoint& checkpoint, const SessionState& part,
+                                         const ModelGeometry& g, int64_t layer_lo, int64_t layer_hi, std::string& error);
 /// Saves a checkpoint's GDN recurrences off the caller's critical path: the device state is copied into a spare
 /// device buffer at device bandwidth, and a helper thread moves it to the checkpoint's host bytes while the caller
 /// carries on (through a page-locked bounce buffer when the RAM budget allows one).  The checkpoint's `gdn` bytes are

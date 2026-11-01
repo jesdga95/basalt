@@ -16,6 +16,8 @@
 
 #include <cstdint>
 
+#include "basalt/kernels/resident_tabs.hpp"
+
 namespace basalt::kernels {
 
 inline constexpr int kVerifyMaxT = 8;
@@ -57,9 +59,9 @@ void gdn_commit_finish(const GdnCommitLayers& a, CommitCtl* ctl, void* stream, i
 /// The newest epoch's commit of the layers in `a` (as gdn_commit_layers), its items claimed in order from the epoch's
 /// lazy counter: every item of the first `must_layers` not claimed yet, then further ones while *stop != stop_value
 /// (device word; null: none).  A launch after the epoch's earlier ones finds their items done.
-/// `pf` (or null): what the launch also reads into L2 for the next layer while the layer it runs beside waits for the
-/// CPU pool: once *stop holds stop_value with its top bit (the combine waits) and while it still does, if the layer has
-/// entries off CUDA0 at all (ids against ptab, that layer's CUDA0 blob table).
+/// `pf` (or null): what the launch also reads into L2 for the next layer while the layer it runs beside waits for a
+/// tier: once *stop holds stop_value with bit 31 (the combine waits for the CPU pool) or bit 30 (for the peers' rows)
+/// and while it still does, if the layer has entries off CUDA0 at all (ids against ptab, that layer's CUDA0 blob table).
 constexpr int kLazyPfRanges = 8;
 struct GdnLazyPf {
     const void* p[kLazyPfRanges] = {};   ///< byte ranges (16-byte multiples) in the order they are used; empty ones last
@@ -121,8 +123,30 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+/// Sets *flag = value (a mapped host flag) behind everything queued on the stream, written out to the system first: the
+/// other end of a wait_flag_ge on another device.
+void signal_flag(uint32_t* flag, uint32_t value, void* stream);
+/// Up to kWordCopyMax disjoint device word ranges copied by one launch (the pipelined pair's state snapshot).
+constexpr int kWordCopyMax = 32;
+struct WordCopy {
+    const int32_t* src = nullptr;
+    int32_t* dst = nullptr;
+    int n = 0;
+};
+struct WordCopyList {
+    WordCopy e[kWordCopyMax];
+    int n = 0;
+};
+void word_copy_list(const WordCopyList& l, void* stream);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
+
+// ---- route tail skip (opt-in, changes the output)
+/// An entry whose expert no GPU holds and that every entry naming that expert ranks `rank` or lower by router weight in
+/// its token (0-based, of k) gets id -1 and weight 0; the other weights are kept. n_entries <= 128.
+/// counts (device, optional): [0] entries, [1] entries no GPU holds, [2] entries dropped (added to).
+void route_tail_skip(int32_t* ids, float* weights, const ResidentTabs& held, int n_entries, int k, int rank, int n_expert,
+                     unsigned long long* counts, void* stream);
 
 // ---- a layer whose routed experts are all in VRAM needs nothing from the host
 /// One group's plan, built on the device when every routed expert of its n*k entries is resident: the host pool's
@@ -158,7 +182,7 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
 /// ptr[k] = base + k * blob_bytes for k < *n (the staged copies `fetch_blobs` made).
 void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream);
 
-// ---- the MTP draft layer (src/core/mtp.cpp)
+// ---- the MTP draft layer (src/core/mtp/)
 /// R[t][c][:] = h[t][c][:] + e[t][:]  (the embedding branch added to every stream).
 void add_streams_broadcast(const float* h, const float* e, float* R, int64_t n_embd, int hc, int n_tok, void* stream);
 /// Every routed expert is resident (slot = expert id): slot[i] = ids[i], dst[i] = i, *count = n.

@@ -1,10 +1,12 @@
 """GET /metrics and GET /api/logs - what the stats page reads - and the telemetry behind /metrics' hardware."""
+import collections
 import ctypes
 import json
 import os
 import stat
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -17,7 +19,7 @@ from serve.util.logbuf import LogBuffer
 from serve.engine.mock import MockEngine
 from serve.engine.process import ProcessEngine
 from serve.handler import serve
-from serve.service import REQUESTS_SHOWN, Service
+from serve.service import RATE_SAMPLES, REQUESTS_SHOWN, Service
 from serve.util.text import ByteTokenizer
 from serve.engine.vision import gpus_in_play
 from serve.util.telemetry import GPU_KEYS, Telemetry
@@ -73,10 +75,11 @@ class Http(unittest.TestCase):
     def test_the_contract(self):
         code, m = self.call("/metrics")
         self.assertEqual(code, 200)
-        self.assertEqual(set(m), {"engine", "live", "requests", "hardware", "hardware_static", "history"})
+        self.assertEqual(set(m), {"engine", "live", "requests", "best", "hardware", "hardware_static", "history"})
+        self.assertEqual(m["best"], {})
         self.assertEqual((m["engine"]["model"], m["engine"]["max_context"]), (self.svc.model, 16384))
         self.assertEqual((m["engine"]["version"], m["engine"]["kv"], m["engine"]["expert_slots"]), ("1.2.3", "fp8", 100))
-        self.assertEqual(set(m["live"]), {"state", "queued", "slots", "queue", "prompt_tokens", "generated", "elapsed_s",
+        self.assertEqual(set(m["live"]), {"state", "load", "queued", "slots", "queue", "prompt_tokens", "generated", "elapsed_s",
                                           "tok_s", "prefill_tok_s_mean"})
         self.assertEqual(m["live"]["queue"], [])
         self.assertEqual((m["live"]["state"], m["live"]["queued"]), ("idle", 0))
@@ -84,7 +87,7 @@ class Http(unittest.TestCase):
         self.assertEqual(set(m["hardware"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb"})
         self.assertIsInstance(m["hardware"]["gpus"], list)
         self.assertEqual(set(m["hardware_static"]), {"gpus", "cpu_name", "cores", "threads", "driver", "cuda"})
-        self.assertEqual(set(m["history"]), {"tok_s", "prefill_tok_s_mean"})
+        self.assertEqual(set(m["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
 
     def test_requests_have_an_id_and_the_path(self):
         paths = ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/chat/completions"]
@@ -93,10 +96,13 @@ class Http(unittest.TestCase):
         rows = self.call("/metrics")[1]["requests"]
         self.assertEqual([r["id"] for r in rows], ["r_0004", "r_0003", "r_0002", "r_0001"])      # newest first
         self.assertEqual([r["path"] for r in rows], paths[::-1])
-        self.assertEqual(set(rows[0]), {"id", "path", "time", "duration_s", "finish", "prompt_tokens", "reused",
+        self.assertEqual(set(rows[0]), {"id", "path", "slot", "time", "duration_s", "finish", "prompt_tokens", "reused",
                                         "output_tokens", "decode_tok_s", "prompt_ms", "hit_rate",
-                                        "pcie_share", "drafts_offered", "drafts_accepted"})
+                                        "pcie_share", "drafts_offered", "drafts_accepted", "ttft_s", "draft_len"})
         self.assertEqual((rows[0]["reused"], rows[0]["hit_rate"], rows[0]["drafts_accepted"]), (3, 0.9, 2))
+        self.assertEqual(rows[0]["slot"], 0)
+        self.assertGreaterEqual(rows[0]["ttft_s"], 0)
+        self.assertIsNone(rows[0]["draft_len"])                     # the mock engine reports no windows
         self.assertEqual(rows[0]["finish"], "stop")
 
     def test_only_the_newest_are_listed(self):
@@ -105,6 +111,41 @@ class Http(unittest.TestCase):
         rows = self.call("/metrics")[1]["requests"]
         self.assertEqual(len(rows), 12)
         self.assertEqual(rows[0]["id"], f"r_{REQUESTS_SHOWN + 3:04d}")
+
+    def test_best_keeps_the_fastest_big_enough_request(self):
+        rows = [{"id": "r_0001", "time": 1.0, "output_tokens": 300, "decode_tok_s": 100.0, "prompt_tokens": 9000,
+                 "reused": 1000, "prompt_ms": 2000.0},
+                {"id": "r_0002", "time": 2.0, "output_tokens": 100, "decode_tok_s": 500.0, "prompt_tokens": 5000,
+                 "reused": 2000, "prompt_ms": 100.0},                      # too short for either
+                {"id": "r_0003", "time": 3.0, "output_tokens": 256, "decode_tok_s": 120.0, "prompt_tokens": 100,
+                 "reused": None, "prompt_ms": 10.0}]
+        for r in rows:
+            self.svc._note_best(r)
+        best = self.call("/metrics")[1]["best"]
+        self.assertEqual(best["decode"], {"tok_s": 120.0, "id": "r_0003", "time": 3.0, "output_tokens": 256})
+        self.assertEqual(best["prefill"], {"tok_s": 4000.0, "id": "r_0001", "time": 1.0, "read_tokens": 8000})
+
+    def test_a_request_waiting_for_the_single_stream_is_queued(self):
+        self.engine.delay = 0.05
+        body = {"model": "qwen3.8-flash-next", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}
+        ts = [threading.Thread(target=self.call, args=(p, body)) for p in ("/v1/chat/completions", "/v1/messages")]
+        ts[0].start()
+        end = time.time() + 5
+        while self.call("/metrics")[1]["live"]["state"] == "idle":
+            self.assertLess(time.time(), end)
+            time.sleep(0.01)
+        ts[1].start()
+        while not self.call("/metrics")[1]["live"]["queue"]:
+            self.assertLess(time.time(), end)
+            time.sleep(0.01)
+        q = self.call("/metrics")[1]["live"]["queue"]
+        self.assertEqual(len(q), 1)
+        self.assertEqual((q[0]["api"], q[0]["model"]), ("anthropic", "qwen3.8-flash-next"))
+        self.assertGreater(q[0]["prompt_tokens"], 0)
+        for t in ts:
+            t.join(20)
+        self.assertEqual(self.call("/metrics")[1]["live"]["queue"], [])
+        self.assertEqual(self.svc.waiting, {})
 
     def test_the_removed_endpoints_are_gone(self):
         for path in ("/api/requests", "/api-monitor", "/settings", "/config", "/mcp"):
@@ -195,19 +236,31 @@ class PerGpu(unittest.TestCase):
         self.assertEqual(snap["static"]["gpus"], [{"index": 0, "name": "Card 0"}, {"index": 1, "name": "Card 1"}])
         self.assertEqual((snap["static"]["driver"], snap["static"]["cuda"]), ("610.57.04", "13.3"))
         self.assertEqual(set(snap["static"]), {"gpus", "cpu_name", "cores", "threads", "driver", "cuda"})
-        self.assertEqual(set(snap["history"]), {"tok_s", "prefill_tok_s_mean"})
+        self.assertEqual(set(snap["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
         self.assertEqual(set(snap["now"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb"})
 
-    def test_history_keeps_only_the_two_speeds(self):
-        tel = Telemetry(extra=lambda: {"tok_s": 12.3456, "prefill_tok_s_mean": None, "tok_s_mean": 9},
-                        gpu_indices=[0], gpu_factory=FakeGpu)
+    def test_history_keeps_the_speeds_slots_and_cards(self):
+        tel = Telemetry(extra=lambda: {"tok_s": 12.3456, "prefill_tok_s_mean": None, "tok_s_mean": 9,
+                                       "slot_tok_s": [1.234, 0.0]},
+                        gpu_indices=[0, 1], gpu_factory=FakeGpu)
         for _ in range(70):
-            s = tel.sample()
-            for k in telemetry.SERIES:
-                tel.hist[k].append(s.get(k))
+            tel.record(tel.sample())
         snap = tel.snapshot()
-        self.assertEqual(set(snap["history"]), {"tok_s", "prefill_tok_s_mean"})
+        self.assertEqual(set(snap["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
         self.assertEqual(len(snap["history"]["tok_s"]), 60)
+        self.assertEqual(snap["history"]["tok_s"][-1], 12.35)
+        self.assertEqual(snap["history"]["slot_tok_s"], [[1.23] * 60, [0.0] * 60])     # one series per slot
+        self.assertEqual([g["index"] for g in snap["history"]["gpus"]], [0, 1])
+        g1 = snap["history"]["gpus"][1]
+        self.assertEqual(set(g1), {"index", *telemetry.GPU_SERIES})
+        self.assertEqual((len(g1["util"]), g1["util"][-1], g1["power"][-1], g1["temp"][-1]), (60, 11, 51.5, 41))
+        self.assertNotIn("slot_tok_s", snap["now"])
+
+    def test_a_slot_series_starts_when_the_slot_appears(self):
+        tel = Telemetry(gpu_indices=[0], gpu_factory=FakeGpu)
+        for rates in ([5.0], [5.0], [6.0, 2.0]):
+            tel.record({"gpus": [], "slot_tok_s": rates})
+        self.assertEqual(tel.snapshot()["history"]["slot_tok_s"], [[5.0, 5.0, 6.0], [None, None, 2.0]])
 
     def test_what_cannot_be_read_is_none_and_nothing_raises(self):
         tel = self.telemetry([0, 1, 2], {1: FakeGpu(1, ok=False), 2: FakeGpu(2, fail=True)})
@@ -279,6 +332,24 @@ class GpusInPlay(unittest.TestCase):
         self.assertEqual(gpus_in_play({}), [0])
         self.assertEqual(gpus_in_play({"gpu": 2}), [2])
         self.assertEqual(gpus_in_play({"gpu": "auto"}), [0])
+
+
+
+class LiveRate(unittest.TestCase):
+    """The live tok/s is the rate over the last RATE_WINDOW_S, also at the speeds MTP reaches."""
+
+    def test_window_at_high_speed(self):
+        # 8 s at 300 tok/s, then 2 s at 150: the window reads ~150, not the 270 mean since the first token
+        now = time.time()
+        rate, n = collections.deque(maxlen=RATE_SAMPLES), 0
+        for i in range(2400):
+            n += 1
+            rate.append((now - 10 + i / 300, n))
+        for i in range(300):
+            n += 1
+            rate.append((now - 2 + (i + 1) / 150, n))
+        s = {"busy": True, "first_token": now - 10, "generated": n}
+        self.assertAlmostEqual(Service._rate_of(s, list(rate)), 150, delta=10)
 
 
 if __name__ == "__main__":

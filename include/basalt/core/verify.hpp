@@ -127,6 +127,13 @@ public:
     /// the next layer's CPU experts (its router on this layer's FFN input) and read the likeliest into their caches.
     /// Before init; only with the device-planned MoE tail.
     void set_cpu_warm(basalt::kernels::cpu::ExpertPool* pool, ExpertSource* src) { warm_pool_ = pool; warm_src_ = src; }
+    /// Opt-in routing changes, each of which changes the output; before init, and only with the device-planned MoE
+    /// tail (otherwise init switches them off).  Route tail skip: see `kernels::route_tail_skip` (0 = off).
+    void set_route_tail_skip(int rank) { route_tail_skip_ = rank; }
+    /// Residency-biased routing: see `kernels::route_prior_top10` (0 = off).
+    void set_route_prior(float lambda) { route_prior_ = lambda; }
+    /// What the routing changes did since the start, one line each; empty when none applied.
+    std::vector<std::string> route_report() const;
 
     /// The watchdog's view of the window in flight: the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
@@ -162,6 +169,12 @@ public:
         sampling_.logit_bias = logit_bias_host_.empty() ? nullptr : logit_bias_device_;
         if (next_) next_->set_sampling(sp);
     }
+    /// The sampler's buffers for a list longer than its top_k kernels keep (top_k 0, or above 64), on the stream the
+    /// head samples on (the last stage's); false with `err` when the memory cannot be had.
+    bool reserve_wide_sampler(std::string& err);
+    /// A list longer than the top_k kernels keep reads every row's logit: a two-stage head (exact only near the top,
+    /// q6k_vhead) is run again exactly over the window's T columns, the plain kernel's bits.  Other heads: nothing.
+    bool exact_head_rows(int T, std::string& err);
     /// One request's token bias (one float per vocabulary entry, added to the logits before the sampler chain); empty
     /// clears it.  Applies to this verifier's own sampling only: the drafter never sees it.  Call before set_sampling;
     /// copied to the final stage's device only when it changed.
@@ -191,6 +204,10 @@ public:
     void set_draft_probe(bool on) { draft_probe_ = on; if (next_) next_->set_draft_probe(on); }
     /// Valid after a sampled run() with the probe on.
     float draft_prob(int t) const { return next_ ? next_->draft_prob(t) : ((volatile float*) h_qp_)[t]; }
+    /// After a sampled run(): row t's kept list at [t * kTopIds, (t + 1) * kTopIds), best first, -1 after it.
+    /// nullptr after a window that did not sample.
+    static constexpr int kTopIds = 8;
+    const int32_t* top_ids() const { return next_ ? next_->top_ids() : (top_valid_ ? h_top_ : nullptr); }
 
     /// LAYER SPLIT (multi-GPU): this verifier runs layers [layer_begin, layer_end) of every window.  A stage that
     /// does not start at layer 0 takes its residual from `handoff_in` instead of embedding the tokens; a stage that
@@ -299,12 +316,19 @@ public:
     /// -1 = an error (err).  Serves every layer that has rung so far.
     int batch_poll(PoolMultiFn pool, void* user, std::string& err);
     bool batch_busy() const { return b_running_; }
-    /// A slot's sampling (temperature / top_p / top_k / min_p / seed; penalties are not applied in batch windows):
+    /// A slot's sampling (temperature / top_p / top_k / min_p / seed / penalties, the histories by set_batch_history):
     /// its row is drawn again on the last stage with Philox(seed, position), as a solo window draws it.  Greedy by
     /// default.  Set on the first stage, it reaches the last.
     void set_slot_sampling(int slot, const basalt::kernels::SamplerParams& sp) {
         if (slot >= 0 && slot < (int) slot_sp_.size()) slot_sp_[(size_t) slot] = sp;
         if (next_) next_->set_slot_sampling(slot, sp);
+    }
+    /// The next batch window's penalty histories: one row of `len` int32 per window row (penalty_rows), on the last
+    /// stage's device; a row of a slot with a penalty window is drawn with its tail.  Null: the window has no penalties.
+    void set_batch_history(const int32_t* rows, int len) {
+        bh_d_ = rows;
+        bh_len_ = len;
+        if (next_) next_->set_batch_history(rows, len);
     }
     const int32_t* batch_out() const { return b_out_; }
     bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
@@ -323,6 +347,30 @@ public:
     /// Captures every solo window width's graph and the commit for session `s` now.
     bool warm_session(SessionState* s, std::string& err);
 
+    // ---- PIPELINED WINDOWS (a layer split of two stages with two chains of verifiers over the same sessions, A and B).
+    // Window A runs; once its stage 0 is done, stage 0 commits A as if every row were kept (the state it reaches when the
+    // guess below holds) and starts window B, whose first token is the guess for A's next token, while stage 1 still runs
+    // A.  A held (every row accepted, and A's last pick is B's first token): stage 1 commits A and runs B (`pair_hold`).
+    // A missed: B's stage 0 drains and stage 0's state is put back as before that commit (`pair_miss`); the caller then
+    // commits A with its real count as for any window.  The head of each chain calls these.
+    /// Before init, on a chain's first stage: the verifier keeps a snapshot of its state in `snap` (`pair_snapshot_bytes`).
+    void set_pipelined(void* snap) { pair_snap_ = snap; }
+    /// The next window's graph on this verifier waits for `e` (then it forgets it): work on the same card it must not
+    /// overlap, such as the drafter's chain.
+    void set_wait_event(cudaEvent_t e) { wait_ev_ = e; }
+    static uint64_t pair_snapshot_bytes(const ModelGeometry& g, const SessionState& ss, int64_t lb, int64_t le);
+    /// `guess` runs once this window's stage 0 has served its last ring: it writes the next window's tokens to `tokb` and
+    /// returns their count, or 0 for no guess (then this is `run`).  `tb` gets that count.
+    bool run_pair(Verifier& b, int ta, const int32_t* toka, int64_t pa, const std::function<int(int32_t*)>& guess,
+                  int32_t* tokb, int& tb, PoolMultiFn pool, void* usera, void* userb, int32_t* outa, std::string& err);
+    bool pair_hold_commit(int ta, std::string& err);
+    bool pair_hold_begin(Verifier& b, int ta, int64_t pa, int tb, const int32_t* tokb, std::string& err);
+    /// The next window's first stage, served to its end (the card is then free for the drafter), and its last stage.
+    bool pair_hold_finish_first(Verifier& b, PoolMultiFn pool, void* userb, std::string& err);
+    bool pair_hold_finish(Verifier& b, PoolMultiFn pool, void* userb, int32_t* outb, std::string& err);
+    bool pair_miss(Verifier& b, PoolMultiFn pool, void* userb, std::string& err);
+
+    Verifier* next_stage() const { return next_; }
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
@@ -338,6 +386,7 @@ public:
     std::string profile_report();
 
 private:
+    struct WindowRecorder;
     RemoteExpertOpt* remote_opt_ = nullptr;
     bool main_high_ = false;
     PeerExperts* peer_ = nullptr;
@@ -357,10 +406,40 @@ private:
     bool gs_move(bool to_peer, std::string& err);
     bool dm_sync(std::string& err);        ///< the residency tables to the devices, before a window
     bool dm_begin(std::string& err, DecodeGaps* gm);   ///< the tail's window start (tables, flags, the peer window)
+    bool dm_stage_places(std::string& err);            ///< the staged share's RAM addresses, read again when they moved
     bool dm_end(std::string& err);         ///< the peer window's end
     void dm_free();
     std::string peer_released();           ///< after a release: whether the peer window ended (see dm_note)
     bool capture(int T, std::string& err);
+    // run(), in three parts: the launch, the host's serving of the rings, the finish
+    bool run_begin(int T, const int32_t* tokens, int64_t pos0, std::string& err, cudaEvent_t after = nullptr);
+    bool run_serve(PoolMultiFn pool, void* user, std::string& err);
+    bool run_end(int32_t* out, std::string& err);
+    bool window_intact(std::string& err);   // after a window's sync: false when a bounded device wait of it timed out
+    /// One step of the host's service of the window's rings: 1 = every ring served, 0 = the GPU has not reached the next
+    /// one, -1 = an error.
+    int serve_poll(PoolMultiFn pool, void* user, std::string& err);
+    struct WindowFlight {
+        int T = 0;
+        int64_t pos0 = 0;
+        bool do_ple = false, ple_early = false, sampled = false, biased = false, early_sample = false, probe = false;
+        std::vector<uint32_t> ple_rows;
+        int64_t k = 0;                      ///< the next ring to serve
+        bool waiting = false;               ///< the wait for ring k has started
+        uint32_t spins = 0;
+        std::chrono::steady_clock::time_point wait_t0, last_flush;
+    } fl_;
+    // the pair's snapshot and optimistic commit
+    void* pair_snap_ = nullptr;
+    cudaEvent_t wait_ev_ = nullptr;
+    cudaEvent_t ev_opt_ = nullptr;         ///< recorded behind an optimistic commit
+    int64_t snap_pos0_ = 0;
+    int32_t snap_ple_[2] = {-1, -1};
+    bool pl_save(std::string& err);
+    bool pl_qsa_copy(bool save, std::string& err);
+    static constexpr int kPairRows = 4;     ///< indexer pooled rows a commit of one window can complete
+    bool pl_restore(std::string& err);
+    bool pl_commit_opt(int n_keep, std::string& err);
     bool pdl_rec_ = false;   // record_window may use programmatic dependent launch
     bool pdl_off_ = false;                 ///< ... a window failed to capture with it: the later ones go without
     // batch windows (see init_slots)
@@ -373,6 +452,8 @@ private:
     std::map<uint64_t, cudaGraphExec_t> exec_bm_;
     std::map<int, cudaGraphExec_t> commit_bm_;
     int last_rows_[8] = {};                ///< the slot of each row of the last batch window
+    const int32_t* bh_d_ = nullptr;        ///< set_batch_history
+    int bh_len_ = 0;
     int last_nseg_ = 0, last_seg_slot_[8] = {}, last_seg_len_[8] = {};   ///< its segments
     std::chrono::steady_clock::time_point commit_t0_;   ///< commit_slots_begin
     std::vector<int> commit_next_keep_;                 ///< its counts, for the next stage
@@ -498,6 +579,8 @@ private:
     int32_t* h_out_ = nullptr;   int32_t* m_out_ = nullptr;     // T argmax ids
     int32_t* h_q_ = nullptr;     int32_t* m_q_ = nullptr;       // the probe's tokens: the window's drafts
     float* h_qp_ = nullptr;      float* m_qp_ = nullptr;        // the probe's probabilities
+    int32_t* h_top_ = nullptr;   int32_t* m_top_ = nullptr;     // T * kTopIds: the sampled rows' kept lists
+    bool top_valid_ = false;                                    // the last window wrote them
     float* h_x_ = nullptr;       float* m_x_ = nullptr;         // doorbell payload: T * n_embd
     int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
     float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
@@ -522,7 +605,7 @@ private:
     // committed inside the next solo window, on lz_s_ from the previous layer's FFN read (that layer's own items and,
     // until the previous layer's combine has its CPU rows, later ones), joined before the layer's GDN kernels.  The
     // same launches (and one before each QSA layer) read the next layer's projection weights into L2 while the
-    // previous layer's combine waits for the CPU pool.
+    // previous layer's combine waits for the CPU pool or the peer's rows.
     cudaStream_t lz_s_ = nullptr;
     cudaEvent_t lz_fork_ = nullptr, lz_join_ = nullptr;
     bool lz_pending_ = false;                       ///< a commit whose lazy layers no window has applied yet
@@ -540,6 +623,8 @@ private:
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block
     GpuPlanSink sink_;
+    int route_tail_skip_ = 0;
+    float route_prior_ = 0.0f;
     uint32_t cur_layer_ = 0;
     static void publish_plan(void* ctx);
     void set_plan_slot();

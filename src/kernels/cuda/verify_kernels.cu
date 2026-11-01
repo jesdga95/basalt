@@ -3,6 +3,7 @@
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/kernels/wait_abort.hpp"
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/core/draft_cum.hpp"
@@ -375,16 +376,18 @@ __device__ __forceinline__ unsigned long long globaltimer() {
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     return t;
 }
-// Block-wide wait until *p == want (bounded: a commit that never ran traps instead of hanging).
-__device__ __forceinline__ void spin_until_eq(const uint32_t* p, uint32_t want) {
+// Block-wide wait until *p == want, bounded (wait_abort.hpp): a commit that never ran sets the abort word and the
+// wait falls through instead of hanging.
+constexpr unsigned long long kFinisherBoundNs = 2000000000ull;
+__device__ __forceinline__ void spin_until_eq(const uint32_t* p, uint32_t want, unsigned long long* abort, int what) {
     if (threadIdx.x == 0 && threadIdx.y == 0) {
         const unsigned long long t0 = globaltimer();
         while (ld_acquire(p) != want) {
             __nanosleep(64);
-            if (globaltimer() - t0 > 2000000000ull) {
-                printf("basalt: error: commit finisher: block %d waited 2 s for %u (word %u)\n", (int) blockIdx.x, want, ld_acquire(p));
-                __trap();
-            }
+            const unsigned long long el = globaltimer() - t0;
+            if (el > kWaitPollNs &&
+                wait_give_up(abort, el, kFinisherBoundNs, wait_abort_code_of(kWaitCommitFinisher, (unsigned) what, 0u, blockIdx.x)))
+                break;
         }
     }
     __syncthreads();
@@ -472,7 +475,8 @@ __global__ void __launch_bounds__(32 * RG) gdn_commit_layers_dyn_kernel(GdnCommi
 // The first node of a window: when the newest epoch has not been finished by a finisher yet, claims what the commit
 // kernel has not and returns once every item of the epoch is done and its indexer and PLE commits have completed; the
 // epoch is then marked finished.  The host has seen the epoch's begin kernel run before it launches the window.
-__global__ void __launch_bounds__(32 * RG) gdn_commit_finish_kernel(GdnCommitLayers a, int conv_blocks, CommitCtl* ctl) {
+__global__ void __launch_bounds__(32 * RG) gdn_commit_finish_kernel(GdnCommitLayers a, int conv_blocks, CommitCtl* ctl,
+                                                                     unsigned long long* abort) {
     __shared__ uint32_t s_e, s_f;
     if (threadIdx.x == 0 && threadIdx.y == 0) {
         s_e = ld_acquire(ctl->w + (size_t) kCtlWords * 8);
@@ -482,12 +486,12 @@ __global__ void __launch_bounds__(32 * RG) gdn_commit_finish_kernel(GdnCommitLay
     const uint32_t e = s_e;
     if (e == s_f) return;
     const int set = (int) (e & 1u);
-    spin_until_eq(ctl_word(ctl, set, 2), e);
+    spin_until_eq(ctl_word(ctl, set, 2), e, abort, 1);
     const int n = min(__ldcg(a.n_keep), kVerifyMaxT);
     commit_drain(a, n, conv_blocks, ctl_word(ctl, set, 0), ctl_word(ctl, set, 1));
     const int total = (a.h_v * (S / 32) + conv_blocks) * a.n_layers;
-    spin_until_eq(ctl_word(ctl, set, 1), (uint32_t) total);
-    spin_until_eq(ctl_word(ctl, set, 3), e);
+    spin_until_eq(ctl_word(ctl, set, 1), (uint32_t) total, abort, 2);
+    spin_until_eq(ctl_word(ctl, set, 3), e, abort, 3);
     if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
         __threadfence();
         st_release(ctl->w + (size_t) kCtlWords * 9, e);
@@ -548,10 +552,11 @@ __global__ void __launch_bounds__(32 * RG) gdn_commit_lazy_kernel(GdnCommitLayer
     }
     __syncthreads();
     if (s_i == 0 || !lead) return;
-    const uint32_t waiting = stop_value | 0x80000000u;
+    // the combine marks its wait: the ring with bit 31 (the CPU pool) or bit 30 (only the peers' rows)
+    auto tier_wait = [&](uint32_t w) { return w == (stop_value | 0x80000000u) || w == (stop_value | 0x40000000u); };
     uint32_t v;
-    while ((v = ld_acquire(stop)) != waiting && v != stop_value) __nanosleep(256);
-    if (v != waiting) return;
+    while (!tier_wait(v = ld_acquire(stop)) && v != stop_value) __nanosleep(256);
+    if (!tier_wait(v)) return;
     // step k of every block covers [k * blocks + b, +1) * step of the ranges laid end to end; after its requests a block
     // reads the step's last word (it lands once that part is in L2), then looks at the stop word again
     uint64_t total_b = 0;
@@ -576,7 +581,7 @@ __global__ void __launch_bounds__(32 * RG) gdn_commit_lazy_kernel(GdnCommitLayer
             const uint4 w = __ldcg((const uint4*) last);
             acc ^= w.x ^ w.y ^ w.z ^ w.w;
         }
-        if (ld_acquire(stop) != waiting) break;
+        if (!tier_wait(ld_acquire(stop))) break;
     }
     if (acc == 0x9e3779b9u) ctl->w[(size_t) kCtlWords * 10 + 1] = acc;   // keeps the reads (never in practice)
 }
@@ -898,7 +903,7 @@ void mtp_take_row(float* R, int64_t R_stride, float* inj, int64_t inj_stride, fl
 
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12040
 namespace {
-struct CondHandles { unsigned long long h[8]; };
+struct CondHandles { unsigned long long h[16]; };
 __global__ void mtp_draft_cond_kernel(CondHandles hs, int n, const float* __restrict__ probs,
                                       const int32_t* __restrict__ row, const int32_t* __restrict__ th_bits,
                                       const float* hist, int j) {
@@ -915,7 +920,7 @@ __global__ void mtp_draft_cond_kernel(CondHandles hs, int n, const float* __rest
 
 bool mtp_draft_cond(const unsigned long long* h, int n, const float* probs, const int32_t* row,
                     const int32_t* th_bits, void* stream, const float* hist, int j) {
-    if (n < 1 || n > 8) { basalt::log::error("basalt", "mtp_draft_cond: n out of range"); std::exit(1); }
+    if (n < 1 || n > 16) { basalt::log::error("basalt", "mtp_draft_cond: n out of range"); std::exit(1); }
     CondHandles hs{};
     for (int k = 0; k < n; ++k) hs.h[k] = h[k];
     mtp_draft_cond_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(hs, n, probs, row, th_bits, hist, j);
@@ -967,7 +972,7 @@ void mtp_stage(const MtpStageSeg* segs, int n_segs, float* f_dst, const float* f
 }
 
 namespace {
-struct StepEndCond { unsigned long long h[8]; };
+struct StepEndCond { unsigned long long h[16]; };
 __global__ void mtp_step_end_kernel(const int32_t* __restrict__ ids, const int32_t* __restrict__ row_dev,
                                     int32_t* __restrict__ tok_dst, int32_t* out, int j, const float* probs, float* out_p,
                                     StepEndCond hs, int n, const int32_t* __restrict__ th_bits,
@@ -998,7 +1003,7 @@ bool mtp_step_end(const int32_t* ids, const int32_t* row_dev, int32_t* tok_dst, 
 #if !(defined(CUDART_VERSION) && CUDART_VERSION >= 12040)
     if (n > 0) return false;
 #endif
-    if (n > 8) { basalt::log::error("basalt", "mtp_step_end: n out of range"); std::exit(1); }
+    if (n > 16) { basalt::log::error("basalt", "mtp_step_end: n out of range"); std::exit(1); }
     StepEndCond hs{};
     for (int k = 0; k < n; ++k) hs.h[k] = h[k];
     mtp_step_end_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids, row_dev, tok_dst, out, j, probs, out_p, hs, n, th_bits,
@@ -1090,7 +1095,7 @@ void gdn_commit_finish(const GdnCommitLayers& a, CommitCtl* ctl, void* stream, i
     if (a.n_layers <= 0) return;
     const int conv_blocks = (a.C + 32 * RG - 1) / (32 * RG);
     gdn_commit_finish_kernel<<<(unsigned) (blocks > 0 ? blocks : 1), dim3(32, RG), 0, (cudaStream_t) stream>>>(
-        a, conv_blocks, ctl);
+        a, conv_blocks, ctl, wait_abort_device_word());
     check("gdn_commit_finish");
 }
 
@@ -1288,6 +1293,58 @@ __global__ void copy_or_zero_kernel(float4* __restrict__ dst, const volatile flo
 }
 }  // namespace
 
+namespace {
+// One block, one thread per window entry.
+__global__ void __launch_bounds__(kResidentPlanMax) route_tail_skip_kernel(int32_t* __restrict__ ids, float* __restrict__ w,
+                                                                          ResidentTabs held, int n, int k, int R,
+                                                                          int n_expert, unsigned long long* counts) {
+    __shared__ int32_t s_ids[kResidentPlanMax];
+    __shared__ uint8_t s_tail[kResidentPlanMax];   // the entry's weight rank in its token is R or lower
+    const int tid = threadIdx.x;
+    bool miss = false;
+    int32_t e = -1;
+    if (tid < n) {
+        e = ids[tid];
+        s_ids[tid] = e;
+        const float wi = w[tid];
+        const int base = tid - tid % k;
+        int rank = 0;
+        for (int j = 0; j < k; ++j) {
+            const float wj = w[base + j];
+            rank += wj > wi || (wj == wi && base + j < tid);
+        }
+        s_tail[tid] = rank >= R;
+        if (e >= 0 && e < n_expert) {
+            bool in = false;
+            for (int q = 0; q < held.n; ++q) in |= held.t[q][e] >= 0;
+            miss = !in;
+        }
+    }
+    __syncthreads();
+    bool drop = miss;
+    for (int j = 0; drop && j < n; ++j)
+        if (s_ids[j] == e && !s_tail[j]) drop = false;
+    const int n_miss = __syncthreads_count(miss), n_drop = __syncthreads_count(drop);
+    if (drop) {
+        ids[tid] = -1;
+        w[tid] = 0.0f;
+    }
+    if (counts != nullptr && tid == 0) {
+        atomicAdd(&counts[0], (unsigned long long) n);
+        atomicAdd(&counts[1], (unsigned long long) n_miss);
+        atomicAdd(&counts[2], (unsigned long long) n_drop);
+    }
+}
+}  // namespace
+
+void route_tail_skip(int32_t* ids, float* weights, const ResidentTabs& held, int n_entries, int k, int rank, int n_expert,
+                     unsigned long long* counts, void* stream) {
+    if (rank < 1 || rank >= k || n_entries < 1 || n_entries > kResidentPlanMax || k < 1) return;
+    route_tail_skip_kernel<<<1, kResidentPlanMax, 0, (cudaStream_t) stream>>>(ids, weights, held, n_entries, k, rank,
+                                                                              n_expert, counts);
+    check("route_tail_skip");
+}
+
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err) {
@@ -1318,6 +1375,32 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
     check("wait_flag_ge");
+}
+
+namespace {
+__global__ void signal_flag_kernel(volatile uint32_t* flag, uint32_t value) {
+    __threadfence_system();
+    *flag = value;
+    __threadfence_system();
+}
+}  // namespace
+
+namespace {
+__global__ void word_copy_list_kernel(WordCopyList l) {
+    const WordCopy e = l.e[blockIdx.x];
+    for (int i = threadIdx.x; i < e.n; i += blockDim.x) e.dst[i] = e.src[i];
+}
+}  // namespace
+
+void word_copy_list(const WordCopyList& l, void* stream) {
+    if (l.n <= 0) return;
+    word_copy_list_kernel<<<l.n, 128, 0, (cudaStream_t) stream>>>(l);
+    check("word_copy_list");
+}
+
+void signal_flag(uint32_t* flag, uint32_t value, void* stream) {
+    signal_flag_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    check("signal_flag");
 }
 
 void embedding_gather_dev(const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,

@@ -15,6 +15,7 @@ from pathlib import Path
 
 from serve.engine import lifeline
 from serve.engine.process import frame_pipes
+from serve.util.console import tagged
 
 # Reads of the encoder's pipe have a timeout: a read that never returns would hold the request turn for good.
 # Generous: a cold model load or a slow encode is not a hang. A silent encoder is killed and the next request
@@ -22,6 +23,7 @@ from serve.engine.process import frame_pipes
 VISION_READY_S = 300.0
 VISION_ENCODE_S = 300.0
 VISION_CACHE_BYTES = 1 << 30                    # room for about 64 images
+IMAGE_MAX_PIXELS = 64 << 20                     # matches the decoder's kMaxImagePixels
 
 
 class Vision:
@@ -121,7 +123,8 @@ class Vision:
     @staticmethod
     def normalize(data: bytes) -> bytes:
         """Formats the decoder reads pass through; others are converted to PNG. A JPEG with an EXIF Orientation
-        other than 1 is turned upright first (needs Pillow)."""
+        other than 1 is turned upright first (needs Pillow). An image past IMAGE_MAX_PIXELS is refused before its
+        pixels are loaded; the decoder enforces the same budget for the formats it reads itself."""
         jpeg = data[:3] == b"\xff\xd8\xff"
         if (jpeg and not Vision._exif_rotated(data)) or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"BM" or \
                 data[:6] in (b"GIF87a", b"GIF89a"):
@@ -134,9 +137,17 @@ class Vision:
                              "GIF work without it") from None
         try:
             im = Image.open(io.BytesIO(data))
+            width, height = im.size
+            if width * height > IMAGE_MAX_PIXELS:
+                raise ValueError(f"the image is {width}x{height} pixels; the limit is "
+                                 f"{IMAGE_MAX_PIXELS >> 20} megapixels")
             im.load()
             from PIL import ImageOps
             im = ImageOps.exif_transpose(im)             # the camera's orientation tag, applied
+        except ValueError:
+            raise                                        # the pixel budget's own message
+        except Image.DecompressionBombError:
+            raise ValueError(f"the image is larger than {IMAGE_MAX_PIXELS >> 20} megapixels") from None
         except Exception as e:
             raise ValueError(f"the image could not be read ({e})") from None
         if im.mode in ("RGBA", "LA", "P") and "transparency" in im.info or im.mode in ("RGBA", "LA"):
@@ -404,18 +415,18 @@ def gpu_card_name(index: int) -> str | None:
 def vision_line(vision: dict | None, cfg: dict, ready_s: float = 0.0, name=gpu_card_name) -> str:
     """The startup line about the encoder: off, or where it runs and its ready time."""
     if not vision:
-        return "[server] vision mode: off"
-    took = f"ready in {ready_s:.1f} s"
+        return tagged("vision", "mode=off")
+    took = f"ready={ready_s:.1f}s"
     mode = vision.get("mode") or "cpu"
     listed = gpu_list(cfg)
     main = listed[0] if listed else 0
 
     def card(i):
         n = name(i)
-        return f"GPU {i}{f' ({n})' if n else ''}"
+        return f"gpu={i}{f' ({n})' if n else ''}"
     gpu = vision_card(mode)
     if gpu is not None:
-        return f"[server] vision mode: {card(gpu)}, {took}"
+        return tagged("vision", f"mode=gpu {card(gpu)} {took}")
     if mode == "dynamic":
-        return f"[server] vision mode: dynamic, {card(main)}, loads per image"
-    return f"[server] vision mode: cpu, {max(1, (os.cpu_count() or 2) // 2)} threads, {took}"
+        return tagged("vision", f"mode=dynamic {card(main)} load=per-image")
+    return tagged("vision", f"mode=cpu threads={max(1, (os.cpu_count() or 2) // 2)} {took}")

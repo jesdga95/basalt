@@ -254,12 +254,14 @@ class EngineStart(unittest.TestCase):
     def engine_args(self, server_block, cli=(), flags=b"\0--grammar\0--kv\0"):
         from unittest import mock
         from serve import server
-        from serve.engine.errors import EngineStartError
         seen = {}
+
+        class Stop(Exception):
+            pass
 
         def fake(binary, args, **kw):
             seen["args"] = list(args)
-            raise EngineStartError("stopped for the test", None)
+            raise Stop
         with tempfile.TemporaryDirectory() as d:
             eng = Path(d) / "eng"
             eng.write_bytes(flags)
@@ -277,7 +279,10 @@ class EngineStart(unittest.TestCase):
                     mock.patch.dict(sys.modules, {"tokenizer": types.SimpleNamespace(Tokenizer=lambda *a: ByteTokenizer())}), \
                     mock.patch.object(server, "ProcessEngine", fake), \
                     mock.patch.object(server, "gpu_plan", return_value=ONE_CARD):
-                server.main()
+                try:
+                    server.main()
+                except Stop:
+                    pass
         return seen["args"]
 
     def test_config_file(self):
@@ -290,13 +295,13 @@ class EngineStart(unittest.TestCase):
         out = io.StringIO()
         with redirect_stdout(out):
             self.engine_args(block, cli)
-        return next(x for x in out.getvalue().splitlines() if x.startswith("[server] engine:"))
+        return next(x for x in out.getvalue().splitlines() if x.startswith("[server] engine "))
 
     def test_startup_line(self):
-        self.assertEqual(self.line({}), "[server] engine: using default flags")
-        self.assertEqual(self.line({"grammar": True}), "[server] engine: using default flags, grammar on (config)")
-        self.assertEqual(self.line({"grammar": True}, ["--no-grammar"]), "[server] engine: using default flags, grammar off (cli)")
-        self.assertEqual(self.line({}, ["--grammar"]), "[server] engine: using default flags, grammar on (cli)")
+        self.assertEqual(self.line({}), "[server] engine   defaults")
+        self.assertEqual(self.line({"grammar": True}), "[server] engine   grammar=on (from config)")
+        self.assertEqual(self.line({"grammar": True}, ["--no-grammar"]), "[server] engine   grammar=off (from cli)")
+        self.assertEqual(self.line({}, ["--grammar"]), "[server] engine   grammar=on (from cli)")
 
     def test_command_line(self):
         self.assertEqual(self.engine_args({}, ["--grammar"]), ["--serve", "--gpu", "0", "--grammar", "on"])

@@ -759,7 +759,7 @@ class ParallelService(unittest.TestCase):
         self.assertGreaterEqual(t["prompt_ms"], 500.0)
         self.assertLess(t["prompt_ms"], 502.0)
         self.assertLess(t["prompt_per_second"], t["prompt_n"] * 2.0)         # n tokens in ~0.5 s
-        self.assertIn(" in 0.5 s,", done_line(t["prompt_n"], 1, "stop", False, t, 0.5, 1.0))
+        self.assertIn(" 0.5s", done_line(0, t["prompt_n"], 1, "stop", False, t, 0.5, 1.0))
         self.assertEqual(got[1]["prompt_ms"], 500.0)                          # the other request read its own once
 
     def test_old_bdone_without_counts_keeps_drafts_unknown(self):

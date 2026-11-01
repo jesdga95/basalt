@@ -349,6 +349,26 @@ void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* str
     check_launch("copy_i32_from_mapped");
 }
 
+// a thread per value, so the reads over the link overlap instead of following each other
+__global__ void copy_i32x3_from_mapped_kernel(int32_t* __restrict__ d0, const volatile int32_t* s0, int n0,
+                                              int32_t* __restrict__ d1, const volatile int32_t* s1, int n1,
+                                              int32_t* __restrict__ d2, const volatile int32_t* s2, int n2) {
+    const int i = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n0) d0[i] = s0[i];
+    else if (i < n0 + n1) d1[i - n0] = s1[i - n0];
+    else if (i < n0 + n1 + n2) d2[i - n0 - n1] = s2[i - n0 - n1];
+}
+
+void copy_i32x3_from_mapped(int32_t* d0, const int32_t* s0, int64_t n0, int32_t* d1, const int32_t* s1, int64_t n1,
+                            int32_t* d2, const int32_t* s2, int64_t n2, void* stream) {
+    const int64_t n = n0 + n1 + n2;
+    if (n <= 0) return;
+    copy_i32x3_from_mapped_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(
+        d0, (const volatile int32_t*) s0, (int) n0, d1, (const volatile int32_t*) s1, (int) n1, d2,
+        (const volatile int32_t*) s2, (int) n2);
+    check_launch("copy_i32x3_from_mapped");
+}
+
 void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, float eps, void* stream) {
     if (rows <= 0 || cols <= 0) return;
     // 4 warps per block, so a row count that is not a multiple of 4 wastes at most 3 warps rather than
