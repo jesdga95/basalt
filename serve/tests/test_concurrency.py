@@ -18,6 +18,29 @@ from serve.util.text import ByteTokenizer
 TEMPLATE = Path(__file__).resolve().parents[1] / "chat_template.jinja"
 
 
+class CheckedThread(threading.Thread):
+    """Propagate worker errors and unfinished work to the test thread."""
+
+    def __init__(self, job, index, results):
+        super().__init__(daemon=True)
+        self.job, self.index, self.results = job, index, results
+        self.error = None
+
+    def run(self):
+        try:
+            self.results[self.index] = self.job()
+        except BaseException as exc:
+            self.error = exc
+
+    def join(self, timeout=None):
+        super().join(timeout)
+        if self.is_alive():
+            raise TimeoutError(f"request worker {self.index} did not finish within {timeout}s")
+        if self.error is not None:
+            error, self.error = self.error, None
+            raise error
+
+
 class Slots(unittest.TestCase):
     """A server over MockEngine(batch=N); each script is chosen by the first word of the user's message."""
     N = 2
@@ -38,7 +61,7 @@ class Slots(unittest.TestCase):
     def post(self, path, body, headers=None):
         req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json", **(headers or {})})
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=15) as r:
             return json.loads(r.read())
 
     def get(self, path):
@@ -52,11 +75,10 @@ class Slots(unittest.TestCase):
 
     def run_all(self, jobs):
         res = [None] * len(jobs)
-        def go(i, f):
-            res[i] = f()
-        ts = [threading.Thread(target=go, args=(i, f)) for i, f in enumerate(jobs)]
+        ts = [CheckedThread(f, i, res) for i, f in enumerate(jobs)]
         for t in ts:
             t.start()
+            self.addCleanup(t.join, 20)
         return ts, res
 
     def wait_for(self, cond, what, timeout=5.0):
@@ -64,6 +86,27 @@ class Slots(unittest.TestCase):
         while not cond():
             self.assertLess(time.time(), end, what)
             time.sleep(0.01)
+
+
+class WorkerReliability(unittest.TestCase):
+    def test_worker_exception_reaches_join(self):
+        def fail():
+            raise ValueError("worker failed")
+        worker = CheckedThread(fail, 0, [None])
+        worker.start()
+        with self.assertRaisesRegex(ValueError, "worker failed"):
+            worker.join(5)
+
+    def test_unfinished_worker_fails_join(self):
+        gate = threading.Event()
+        worker = CheckedThread(gate.wait, 0, [None])
+        worker.start()
+        try:
+            with self.assertRaisesRegex(TimeoutError, "did not finish"):
+                worker.join(0.01)
+        finally:
+            gate.set()
+            worker.join(5)
 
 
 class Concurrent(Slots):
@@ -180,7 +223,7 @@ class SlotRows(Slots):
             t.join(20)
 
     def test_a_slot_reads_before_it_decodes(self):
-        self.start({"go": "word " * 5}, delay=0.4)
+        self.start({"go": "word " * 5}, delay=0.2)
         ts, _ = self.run_all([lambda: self.chat("go slowly")])
         reading = self.busy_rows(1, "one slot busy")[0]
         self.assertEqual((reading["state"], reading["generated"]), ("prefill", 0))
@@ -202,11 +245,12 @@ class SlotRows(Slots):
         self.assertEqual(self.get("/slots")[(slot + 1) % 3]["drafts_offered"], None)
 
     def test_waiting_requests_are_listed_oldest_first(self):
-        self.start({"go": "word " * 60}, n=2, delay=0.05)
+        # Two 80-token waves take about 4.8 seconds, leaving time to inspect the queue and complete.
+        self.start({"go": "word " * 60}, n=2, delay=0.03)
         ts = []
         for i, kind in enumerate(("openai", "anthropic", "openai", "anthropic")):
-            job = (lambda i=i: self.chat(f"go {i}", model="qwen3.8-flash-next")) if kind == "openai" else \
-                  (lambda i=i: self.post("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 200,
+            job = (lambda i=i: self.chat(f"go {i}", model="qwen3.8-flash-next", max_tokens=80)) if kind == "openai" else \
+                  (lambda i=i: self.post("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 80,
                                                           "messages": [{"role": "user", "content": f"go {i}"}]}))
             t, _ = self.run_all([job])
             ts += t
