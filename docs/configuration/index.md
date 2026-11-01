@@ -108,6 +108,7 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | `debug` | switch | off | One log line per request and the raw model text after each reply. |
 | `request-lines` | switch | off | Echo the engine's per-request summary on stdout, for a supervisor that sees only that output. |
 | `temperature`, `top-p`, `top-k`, `min-p`, `presence-penalty`, `frequency-penalty`, `repetition-penalty`, `penalty-last-n`, `seed` | number (`top-k`, `penalty-last-n`, `seed`: integer) | the model file's `sampling` value, else the engine's | The sampling default for a request that leaves that field out, over the model file's. Same meaning and allowed values as the [model file's sampling keys](sampling.md#the-model-files-sampling-defaults). The server applies them to each request; the engine never sees them. |
+| `cvec` | switch (`--cvec` / `--no-cvec`) | the model file's `sampling.cvec`, else on when a control vector is loaded | The control-vector state for a request that leaves `cvec` out. Only matters with a loaded control vector; see [Control vectors](#control-vectors). |
 | `reasoning-budget-tokens` | integer | `0` (none) | The thinking budget for a request that names none (see [sampling](sampling.md#the-thinking-budget)). At the budget the thinking is closed and the answer starts. A request's own field wins, and `0` there disables budgeting. Positive budgets are also limited by `answer-room`. |
 | `thinking-loop-tokens` | integer | `256` | End the thinking, and let the model answer, when it repeats one token this many times in a row inside the thinking; `0` turns it off. See [Thinking loops](sampling.md#thinking-loops). |
 | `answer-room` | switch (`--no-answer-room` or `answer-room: false` turns it off) | on | Reserve space for closing the thinking and for the answer when the effective output cap is at least 1024 tokens. Applies to missing budgets and clamps positive budgets; an explicit request budget of `0` opts out. |
@@ -228,16 +229,32 @@ Diagnostic flags: [diagnostics](diagnostics.md)
 
 ## Control vectors
 
-A control vector (a GGUF in llama.cpp's format) is added to the residual stream; with the server, a request switches it
-with `cvec` (0 or 1).
+A control vector (a GGUF in llama.cpp's format) is added to the residual stream. On the command line a flag with
+several values takes them as separate words (`--control-vector-layer-range 4 44`); in a `--config` file the same flag
+takes a list (`"control-vector-layer-range": [4, 44]`).
+
+The engine loads the vector; a request controls it with the request field `cvec: true|false`. A request that leaves it
+out uses the server's [`cvec`](#server) option (config `"server": {"cvec": false}`), then the model file's
+`sampling.cvec`, then on when a vector is loaded.
+
+`--control-vector-scaled` takes one or more `FILE:SCALE` entries. For each layer the files' scaled
+`direction.<layer>` tensors are summed; `add` adds that sum, `project` normalizes it to `v` and uses the sum's norm as
+`s` in `h -= s (h.v) v`. With a unit direction, `SCALE 1` removes the component and `2` reflects it.
+`--cvec-dir single:L` uses layer L's direction for every steered layer, in `project` mode only.
+
+Two limits apply. With `--parallel`, all requests in flight must use the same `cvec` state: the engine's enable
+flag is process-wide, so mixing `cvec: true` and `cvec: false` across concurrent slots is not supported. And the disk
+conversation tier keys a control vector by its path and scale, not its contents: replacing a vector file at the same
+path can restore a conversation cached under the old contents; remove the model cache's `conversations` folder after
+changing a vector in place.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
 | `control-vector` | engine | file path | off | A control vector at scale 1. |
-| `control-vector-scaled` | engine | `FILE:SCALE[,...]` | off | Control vectors with their scales. |
-| `control-vector-layer-range` | engine | two layer numbers, `A B` | 1 to the last layer | The layers it follows, inclusive. |
-| `cvec-mode` | engine | `add`, `project` | `add` | `add`: h += s v. `project`: h -= s (h.v) v with v a unit vector. |
-| `cvec-dir` | engine | `per-layer`, `single:L` | `per-layer` | Each layer's own direction, or layer L's direction everywhere (`project`). |
+| `control-vector-scaled` | engine | `FILE:SCALE[,...]` | off | Control vectors with their scales; per layer the scaled directions are summed. |
+| `control-vector-layer-range` | engine | two layer numbers: `A B` on the command line, `[A, B]` in JSON; `A <= B` | 1 to the last layer | The layers it follows, inclusive. `B` past the last layer is clamped to it; `A` past it is an error. |
+| `cvec-mode` | engine | `add`, `project` | `add` | `add`: h += s v (s = 1). `project`: h -= s (h.v) v with v unit and s the summed direction's norm. |
+| `cvec-dir` | engine | `per-layer`, `single:L` | `per-layer` | Each layer's own direction, or layer L's direction everywhere (`project` only). |
 
 ## Sampling
 

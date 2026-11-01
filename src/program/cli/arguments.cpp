@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstdlib>
 #include <sstream>
 
@@ -194,16 +195,33 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
                 const size_t colon = item.rfind(':');
                 char* end = nullptr;
                 const float sc = colon == std::string::npos ? 0.0f : std::strtof(item.c_str() + colon + 1, &end);
-                if (colon == std::string::npos || colon == 0 || end == item.c_str() + colon + 1 || *end != '\0') {
-                    basalt::log::error("basalt", "--control-vector-scaled: expected FILE:SCALE, got '%s'", item.c_str());
+                if (colon == std::string::npos || colon == 0 || end == item.c_str() + colon + 1 || *end != '\0' ||
+                    !std::isfinite(sc)) {
+                    basalt::log::error("basalt", "--control-vector-scaled: expected FILE:SCALE with a finite scale, got '%s'", item.c_str());
                     return 2;
                 }
                 o.cvec_files.push_back({item.substr(0, colon), sc});
             }
         }
         else if (a == "--control-vector-layer-range") {
-            o.cvec_first = std::atoi(next("--control-vector-layer-range"));
-            o.cvec_last = std::atoi(next("--control-vector-layer-range"));
+            int layer[2] = {};
+            for (int& value : layer) {
+                const std::string text = next("--control-vector-layer-range");
+                int64_t number = 0;
+                const auto result = std::from_chars(text.data(), text.data() + text.size(), number);
+                if (result.ec != std::errc{} || result.ptr != text.data() + text.size() ||
+                    number < 0 || number > INT32_MAX) {
+                    basalt::log::error("basalt", "--control-vector-layer-range needs two nonnegative integers within range");
+                    return 2;
+                }
+                value = (int) number;
+            }
+            if (layer[0] > layer[1]) {
+                basalt::log::error("basalt", "--control-vector-layer-range: the first layer must not be after the last");
+                return 2;
+            }
+            o.cvec_first = layer[0];
+            o.cvec_last = layer[1];
         }
         else if (a == "--cvec-mode") {
             const std::string m = next("--cvec-mode");
@@ -214,7 +232,17 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         else if (a == "--cvec-dir") {
             const std::string d = next("--cvec-dir");
             if (d == "per-layer") o.cvec_single = -1;
-            else if (d.rfind("single:", 0) == 0) o.cvec_single = std::atoi(d.c_str() + 7);
+            else if (d.rfind("single:", 0) == 0) {
+                const std::string text = d.substr(7);
+                int64_t number = 0;
+                const auto result = std::from_chars(text.data(), text.data() + text.size(), number);
+                if (result.ec != std::errc{} || result.ptr != text.data() + text.size() ||
+                    number < 1 || number > INT32_MAX) {
+                    basalt::log::error("basalt", "--cvec-dir single:L needs a positive integer within range");
+                    return 2;
+                }
+                o.cvec_single = (int) number;
+            }
             else { basalt::log::error("basalt", "--cvec-dir: per-layer or single:L, got '%s'", d.c_str()); return 2; }
         }
         else if (a == "--eos-ids") {

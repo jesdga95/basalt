@@ -145,6 +145,14 @@ if(BUILD_TESTING)
   add_executable(logit_bias_test tests/core/logit_bias_test.cpp)
   target_include_directories(logit_bias_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   basalt_cpu_test(NAME logit_bias_test COMMAND logit_bias_test)
+  # the engine's command line: the control-vector layer range takes two numbers, not the next flag (host only)
+  add_executable(cli_arguments_test tests/program/cli_arguments_test.cpp
+                 src/program/cli/arguments.cpp src/program/cli/help.cpp src/program/cli/tokens.cpp)
+  target_include_directories(cli_arguments_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                              ${CMAKE_CURRENT_SOURCE_DIR}/src/program/cli)
+  basalt_embed_manifest(cli_arguments_test)
+  basalt_cpu_test(NAME cli_arguments_test COMMAND cli_arguments_test)
+  set_tests_properties(cli_arguments_test PROPERTIES TIMEOUT 60)
 endif()
 
 # ---- plan ----------------------------------------------------------
