@@ -19,9 +19,8 @@ public:
     Gemm(const Gemm&) = delete;
     Gemm& operator=(const Gemm&) = delete;
 
-    /// Creates the current device's cuBLAS handle ahead of the first `init_external` there, which then takes it. A
-    /// server calls this before sizing the expert cache so the handle's device memory is already out of the free
-    /// figure the cache is sized from.
+    /// Prepares the current device's cuBLAS and cuBLASLt handles for the first Gemm there. A server calls this
+    /// before sizing the expert cache so their device memory is already out of the free figure.
     static bool prepare_handle(std::string& err);
 
     /// `scratch_elems`: BF16 elements of the dequantization scratch (the largest weight dequantized at once).
