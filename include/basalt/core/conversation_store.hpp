@@ -29,6 +29,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -118,7 +119,7 @@ private:
     bool write_job(Job& job, const ConversationSource& src, const CheckRefs& checks, uint64_t& wrote, uint64_t& whole,
                    std::string& error);
     void finish_locked(const std::shared_ptr<Job>& job, bool ok, uint64_t wrote, uint64_t whole);
-    void drop_read(const std::string& name, const std::string& part, std::string& error);
+    void drop_read(const std::string& name, uint64_t generation, const std::string& part, std::string& error);
     void unlink_unread_locked();             ///< removes the dropped files no read holds open any more
     void evict_locked();
     void drop_locked(size_t index, bool keep_file = false);
@@ -129,6 +130,7 @@ private:
     uint64_t identity_ = 0, budget_ = 0;
     bool open_ = false;
     mutable std::mutex mu_;
+    mutable std::shared_mutex publish_mu_;    ///< readers open a consistent set before publication
     std::mutex write_mu_;                     ///< held while a conversation's files are written
     int direct_waiting_ = 0;                  ///< write() calls waiting for write_mu_: the writer lets them go first
     std::map<std::string, int> reading_;      ///< files a ConversationKvRead holds open: not removed until it closes them
@@ -137,7 +139,7 @@ private:
     std::vector<std::unique_ptr<Entry>> entries_;
     std::map<std::string, PartFile> parts_;   ///< block and state files of this identity, by name
     std::deque<std::shared_ptr<Job>> queue_;
-    uint64_t queue_bytes_ = 0, clock_ = 0, revision_ = 0;
+    uint64_t queue_bytes_ = 0, clock_ = 0, revision_ = 0, generation_ = 0;
     bool stop_ = false, busy_ = false;
     Stats stats_;
     std::vector<std::unique_ptr<ConversationStoreBuffer>> read_bufs_;   ///< the loads' aligned read buffers, kept

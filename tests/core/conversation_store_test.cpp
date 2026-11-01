@@ -13,6 +13,8 @@
 #include "basalt/platform/system.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <filesystem>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -660,11 +662,52 @@ int main() {
             SavedConversation got;
             CHECK(match.tokens == (int64_t) old_ids.size() && d.load(match, got, err));
             CHECK(same_state(got.live, old.checkpoints[0]) && same_kv(got.kv, old.kv));
-            CHECK(d.write(source(same), err));
+            std::unique_ptr<ConversationKvRead> held;
+            SavedConversation shape;
+            CHECK(d.load(match, shape, err, &held) && held);
+            const bool replaced_with_open_read = d.write(source(same), err);
+            if (replaced_with_open_read) {
+                CHECK(!held->read([](size_t, int, uint64_t, const uint8_t*, uint64_t) { return false; }, err));
+                held.reset();
+            } else {
+                held.reset();
+                CHECK(d.write(source(same), err));
+            }
             const auto updated = d.best(prompt.data(), prompt.size(), {}, true);
             SavedConversation replacement;
             CHECK(updated.tokens == (int64_t) old_ids.size() && d.load(updated, replacement, err));
             CHECK(same_state(replacement.live, same.live) && same_kv(replacement.kv, same.kv));
+        }
+        clear_dir(d2);
+    }
+    {
+        // Old staged files from a dead process are reclaimed, but live and unrelated files are left alone.
+        const std::string d2 = dir + "-stages";
+        CHECK(basalt::platform::make_dirs(d2));
+        const std::string base = "000000000000002a-0000000000000001.bcs.direct.";
+        const std::string dead = base + "9223372036854775807.123";
+        const std::string live = base + std::to_string((long long) basalt::platform::process_id()) + ".123";
+        const std::string other = "000000000000002b-0000000000000001.bcs.direct.9223372036854775807.123";
+        const std::string malformed = base + "bad.123.tmp";
+        for (const auto& name : {dead, dead + ".9223372036854775807.tmp", live, other, malformed}) {
+            std::FILE* f = basalt::platform::open_file_utf8(d2 + "/" + name, "wb");
+            CHECK(f != nullptr);
+            if (f) std::fclose(f);
+            std::error_code ec;
+            std::filesystem::last_write_time(std::filesystem::u8path(d2 + "/" + name),
+                std::filesystem::file_time_type::clock::now() - std::chrono::hours(2), ec);
+            CHECK(!ec);
+        }
+        {
+            ConversationStore d;
+            std::string err;
+            CHECK(d.open(d2, id, 1ull << 30, err));
+            uint64_t bytes = 0;
+            CHECK(!basalt::platform::file_size(d2 + "/" + dead, bytes));
+            CHECK(!basalt::platform::file_size(d2 + "/" + dead + ".9223372036854775807.tmp", bytes));
+            CHECK(basalt::platform::file_size(d2 + "/" + live, bytes));
+            CHECK(basalt::platform::file_size(d2 + "/" + other, bytes));
+            CHECK(basalt::platform::file_size(d2 + "/" + malformed, bytes));
         }
         clear_dir(d2);
     }

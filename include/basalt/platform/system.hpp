@@ -15,6 +15,9 @@ namespace basalt::platform {
 /// This process's id.
 int64_t process_id();
 
+/// False only when the process id is known not to be running.
+bool process_alive(int64_t pid);
+
 /// The kind of system the program runs on, for a benchmark row: "Linux", "Windows", or "WSL2" for Linux inside the
 /// Windows subsystem.
 std::string host_os_name();

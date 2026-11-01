@@ -24,6 +24,8 @@ void check(bool ok, const std::string& what) {
 int main() {
     using namespace basalt::platform;
     check(process_id() > 0, "process_id is positive");
+    check(process_alive(process_id()), "current process is alive");
+    check(!process_alive(-1), "negative process id is invalid");
     (void) stderr_is_terminal();   // either answer is valid; the call must not fail
 
     const std::string mi = meminfo_path();

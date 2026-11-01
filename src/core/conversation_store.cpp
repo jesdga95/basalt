@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -382,7 +383,7 @@ struct ConversationStore::Job {
 
 struct ConversationStore::Entry {
     std::string name;                         ///< file name in the directory
-    uint64_t key = 0, bytes = 0, used = 0;
+    uint64_t key = 0, bytes = 0, used = 0, generation = 0;
     bool mine = true;                         ///< written under this identity (others count for the budget only)
     bool cvec = true;
     std::vector<int32_t> ids;                 ///< live tokens
@@ -547,6 +548,29 @@ NameKind name_kind(const std::string& name, const std::string& prefix) {
     return NameKind::kOther;
 }
 
+// Only this identity's direct-write names are eligible for staged-file cleanup.
+bool direct_owner(const std::string& name, const std::string& prefix, int64_t& pid) {
+    const size_t base = prefix.size();
+    const size_t dot = base + 16;
+    if (name.rfind(prefix, 0) != 0 || name.size() <= dot + 12 || name.compare(dot, 12, ".bcs.direct.") != 0)
+        return false;
+    for (size_t i = base; i < dot; ++i)
+        if (!((name[i] >= '0' && name[i] <= '9') || (name[i] >= 'a' && name[i] <= 'f'))) return false;
+    const size_t p0 = dot + 12, p1 = name.find('.', p0);
+    if (p1 == std::string::npos || p1 == p0) return false;
+    const auto parsed = std::from_chars(name.data() + p0, name.data() + p1, pid);
+    if (parsed.ec != std::errc{} || parsed.ptr != name.data() + p1 || pid <= 0) return false;
+    const size_t a0 = p1 + 1, a1 = name.find('.', a0);
+    const size_t end = a1 == std::string::npos ? name.size() : a1;
+    if (end == a0) return false;
+    for (size_t i = a0; i < end; ++i) if (name[i] < '0' || name[i] > '9') return false;
+    if (a1 != std::string::npos) {
+        const std::string suffix = "." + std::to_string((long long) pid) + ".tmp";
+        if (name.substr(a1) != suffix) return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------ open and index
@@ -581,6 +605,12 @@ bool ConversationStore::open(const std::string& dir, uint64_t identity, uint64_t
     const std::string prefix = hex16(identity_) + "-";
     for (const auto& f : files) {
         const std::string path = dir_ + "/" + f.name;
+        if (f.name.find(".bcs.direct.") != std::string::npos) {
+            int64_t pid = 0;
+            if (direct_owner(f.name, prefix, pid) && now - f.mtime >= 3600 && !basalt::platform::process_alive(pid))
+                basalt::platform::remove_file(path);
+            continue;
+        }
         if (f.name.size() > 4 && f.name.compare(f.name.size() - 4, 4, ".tmp") == 0) {
             // a write cut short an hour ago or more (a newer one may be another process's write in progress)
             if (now - f.mtime >= 3600) basalt::platform::remove_file(path);
@@ -598,6 +628,7 @@ bool ConversationStore::open(const std::string& dir, uint64_t identity, uint64_t
         e->name = f.name;
         e->bytes = f.bytes;
         e->used = ++clock_;
+        e->generation = ++generation_;
         e->mine = nk == NameKind::kConversation;
         if (e->mine) {
             std::string why;
@@ -815,9 +846,9 @@ using KvSizes = std::vector<std::array<uint64_t, 5>>;
 // The K/V of a read left in its files: the files stay open (and the parts point into their tables) until it is read.
 class ConversationStore::KvFileRead final : public ConversationKvRead {
 public:
-    KvFileRead(ConversationStore& store, std::string name, std::vector<Opened>&& opened, std::vector<Part>&& parts,
+    KvFileRead(ConversationStore& store, std::string name, uint64_t generation, std::vector<Opened>&& opened, std::vector<Part>&& parts,
                KvSizes&& sizes)
-        : store_(store), name_(std::move(name)), opened_(std::move(opened)), parts_(std::move(parts)),
+        : store_(store), name_(std::move(name)), generation_(generation), opened_(std::move(opened)), parts_(std::move(parts)),
           sizes_(std::move(sizes)) {
         std::lock_guard<std::mutex> lk(store_.mu_);
         for (const auto& f : opened_) ++store_.reading_[f.name];
@@ -843,7 +874,7 @@ public:
         release();
         if (!ok) {
             error = "conversation store: " + name_ + ": " + why;
-            store_.drop_read(name_, bad != SIZE_MAX && bad > 0 && bad < opened_.size() ? opened_[bad].name : "", error);
+            store_.drop_read(name_, generation_, bad != SIZE_MAX && bad > 0 && bad < opened_.size() ? opened_[bad].name : "", error);
             return false;
         }
         for (const auto& f : opened_) basalt::platform::touch_file(store_.dir_ + "/" + f.name);
@@ -868,6 +899,7 @@ private:
 
     ConversationStore& store_;
     std::string name_;
+    uint64_t generation_;
     std::vector<Opened> opened_;
     std::vector<Part> parts_;
     KvSizes sizes_;
@@ -903,8 +935,12 @@ private:
     KvSizes sizes_;
 };
 
-void ConversationStore::drop_read(const std::string& name, const std::string& part, std::string& error) {
+void ConversationStore::drop_read(const std::string& name, uint64_t generation, const std::string& part, std::string& error) {
     std::lock_guard<std::mutex> lk(mu_);
+    const auto current = std::find_if(entries_.begin(), entries_.end(), [&](const auto& e) {
+        return e->name == name && e->generation == generation && !e->job;
+    });
+    if (current == entries_.end()) return;
     if (!part.empty()) {
         // a block or state file that does not check out goes; every conversation that refers to it fails its read
         basalt::platform::remove_file(dir_ + "/" + part);
@@ -918,8 +954,10 @@ void ConversationStore::drop_read(const std::string& name, const std::string& pa
 
 bool ConversationStore::load(const Match& m, SavedConversation& out, std::string& error,
                              std::unique_ptr<ConversationKvRead>* kv_read) {
+    std::shared_lock<std::shared_mutex> publication(publish_mu_);
     std::shared_ptr<Job> job;
     std::string name;
+    uint64_t generation = 0;
     Header head{};
     std::vector<Section> table;
     std::vector<int32_t> all_ids, ids;
@@ -934,6 +972,7 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
         e.used = ++clock_;
         job = e.job;
         name = e.name;
+        generation = e.generation;
         head = e.head;
         table = e.table;
         all_ids = e.ids;
@@ -1017,7 +1056,7 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
     auto fail = [&](const std::string& why, size_t bad) {
         for (auto& f : opened) f.rf->close();
         error = "conversation store: " + name + ": " + why;
-        drop_read(name, bad != SIZE_MAX && bad > 0 && bad < opened.size() ? opened[bad].name : "", error);
+        drop_read(name, generation, bad != SIZE_MAX && bad > 0 && bad < opened.size() ? opened[bad].name : "", error);
         return false;
     };
     auto open_file = [&](const std::string& fname, uint32_t kind, uint64_t key) -> bool {
@@ -1224,7 +1263,7 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
     }
     out = std::move(img);
     if (kv_read) {   // the K/V files stay open for the restore's read
-        *kv_read = std::make_unique<KvFileRead>(*this, name, std::move(opened), std::move(kv_parts), std::move(sizes));
+        *kv_read = std::make_unique<KvFileRead>(*this, name, generation, std::move(opened), std::move(kv_parts), std::move(sizes));
     } else {
         for (auto& f : opened) {
             f.rf->close();
@@ -1339,6 +1378,7 @@ std::shared_ptr<ConversationStore::Job> ConversationStore::job_locked(const std:
     e->key = job->key;
     e->bytes = bytes;
     e->used = ++clock_;
+    e->generation = ++generation_;
     e->cvec = cvec;
     e->ids = ids;
     e->imgs = imgs;
@@ -1435,6 +1475,7 @@ bool ConversationStore::write(const ConversationSource& src, std::string& error)
         ok = rf.fd >= 0 && basalt::platform::file_size(dir_ + "/" + job->name, file_bytes) &&
              read_index(rf.fd, file_bytes, head, table, hashes, why);
     }
+    std::unique_lock<std::shared_mutex> publication(publish_mu_);
     std::lock_guard<std::mutex> lk(mu_);
     if (ok) ok = revision == revision_ && basalt::platform::rename_replace(dir_ + "/" + job->name, dir_ + "/" + name);
     if (ok) {
