@@ -84,7 +84,7 @@ The per-layer n-gram (PLE) table stays on disk and its rows are read as needed.
 | `ppl=K` | request key | chunk index | Score chunk K of `--ppl-base`, the rest of the chunk teacher-forced through verify windows. |
 | `ppl_t=T` | request key | tokens, 3 | The window width of a `ppl=` request. |
 | `ppl_score` | request key | `0`, `1`; `1` | On a `ppl=` request, `0` teacher-forces the same tokens through the same windows without scoring or writing rows, for timing. |
-| `ppl_force` | request key | `0`, `1`; `0` | On a `ppl=` request, `1` uses decode's drafting and window sizes, judging drafts against the chunk's stored tokens without scoring rows, for content-fixed drafting timing. |
+| `ppl_force` | request key | `0`, `1`; `0` | On a `ppl=` request, `1` uses decode's drafting and window sizes, judging drafts against the chunk's stored tokens without scoring rows, for content-fixed drafting timing. Relaxed drafting and grammar enforcement are disabled for this replay; acceptance counts exact draft matches to the stored tokens. |
 
 The request keys go on a `GEN` line of the engine's stdin protocol, before the token ids.
 

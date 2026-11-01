@@ -246,7 +246,7 @@ Flow Request::decode() {
                 else if (outv[(size_t) i] == runtime_.o.relax_call_close) in_call = false;
         } else
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
-        if (gguard != nullptr && gguard->on()) {
+        if (!forced && gguard != nullptr && gguard->on()) {
             // the first sampled token the grammar refuses is drawn again under the grammar's mask, and the window ends there
             const int miss = gguard->scan(outv.data(), a + 1);
             if (miss >= 0) {
