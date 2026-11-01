@@ -77,8 +77,8 @@ threshold and CUDA0's, scores the rows that reach it with the same kernel, and l
 (row, fp32 bits); CUDA0 writes the list into its columns, whose peer rows are -inf otherwise. Either threshold is at or
 below the K-th largest logit of its card's rows, so at or below the column's K-th largest: every row of the column's K
 largest is scored on its card and kept or listed with the exact kernel's bits (the same code on both cards). The K
-largest entries of a column, their order and their values are the exact head's. With K = 0 CUDA0's exact pass takes
-every row. A card that waits past its limit for the other marks the window, which is discarded with an error.
+largest entries of a column, their order and their values are the exact head's. With K = 0, and in every batch
+window, CUDA0's exact pass takes every row. A card that waits past its limit for the other marks the window, which is discarded with an error.
 
 With the tiers pinned the split writes the same greedy tokens (the three bench prompts, 1,200 tokens, both cards) and
 the same seeded prose text as the head on CUDA0 alone (q80_vhead_parity's split section: the same top-K lists and

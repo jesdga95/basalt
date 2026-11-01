@@ -93,7 +93,7 @@ bool Verifier::WindowRecorder::head() {
                     q80p_vhead_merge(v_.head_logits_, (int) v_.n_vocab_, r0, T, r1, v_.head_keep_d_, v_.hs_list_,
                                      v_.hs_link_, cs);
                     if (!ok) { err = "verify: the split head's fork failed"; return false; }
-                } else if (v_.hs_rows_ > 0) {   // the peer's rows while CUDA0 does its own; its logits land beside CUDA0's
+                } else if (v_.hs_rows_ > 0 && !v_.hs_two_) {   // the exact head split: the peer's rows while CUDA0 does its own
                     const int r0 = v_.hs_rows_, r1 = (int) v_.n_vocab_ - r0;
                     const size_t xb = native_q8_1_bytes((int) N, T);
                     bool ok = cudaMemcpyAsync(v_.hs_hxq_, v_.xq_, xb, cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
@@ -120,7 +120,9 @@ bool Verifier::WindowRecorder::head() {
                               v_.vhead_scratch_, cs);
                 else if (v_.head_->type() == 14 && q6k_head_supported((int) N, T))
                     q6k_head_mmvq(v_.head_->weights(), v_.xq_, v_.head_logits_, (int) N, (int) v_.n_vocab_, T, cs);
-                else if (v_.head_->planes() && v_.head_keep_d_ != nullptr)   // the exact list's rows, the rest bounded
+                // the exact list's rows, the rest bounded; a batch window's list length is 0, so with the two-stage
+                // split too every row is scored here on CUDA0
+                else if (v_.head_->planes() && v_.head_keep_d_ != nullptr)
                     q80p_vhead(v_.head_->weights(), v_.xq_, v_.head_logits_, (int) N, (int) v_.n_vocab_, T,
                                v_.head_keep_d_, v_.vhead_scratch_, cs);
                 else if (v_.head_->planes())
