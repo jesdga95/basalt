@@ -302,11 +302,17 @@ struct Gemm::Plans {
             const int64_t widths[] = {64, 512, 4096};
             for (int q = 0; measured && q < 3; ++q) {
                 const auto s = (cudaStream_t) stream;
-                measured = run(p, algo, ty, X, W, Y, widths[q], N, K, ldy, ws, ws_bytes, stream) &&
-                           cudaEventRecord(start, s) == cudaSuccess &&
-                           run(p, algo, ty, X, W, Y, widths[q], N, K, ldy, ws, ws_bytes, stream) &&
-                           cudaEventRecord(stop, s) == cudaSuccess && cudaEventSynchronize(stop) == cudaSuccess &&
-                           cudaEventElapsedTime(&entry.ms[q], start, stop) == cudaSuccess && entry.ms[q] > 0;
+                float samples[3] = {};
+                measured = run(p, algo, ty, X, W, Y, widths[q], N, K, ldy, ws, ws_bytes, stream);
+                for (int rep = 0; measured && rep < 3; ++rep)
+                    measured = cudaEventRecord(start, s) == cudaSuccess &&
+                               run(p, algo, ty, X, W, Y, widths[q], N, K, ldy, ws, ws_bytes, stream) &&
+                               cudaEventRecord(stop, s) == cudaSuccess && cudaEventSynchronize(stop) == cudaSuccess &&
+                               cudaEventElapsedTime(&samples[rep], start, stop) == cudaSuccess && samples[rep] > 0;
+                if (measured) {
+                    std::sort(samples, samples + 3);
+                    entry.ms[q] = samples[1];
+                }
             }
             if (start) cudaEventDestroy(start);
             if (stop) cudaEventDestroy(stop);

@@ -57,8 +57,8 @@ public:
     /// scratch cannot hold the N rows at once.
     const uint16_t* bf16_rows(const uint16_t* W, int64_t N, int64_t K);
 
-    /// Y = X . W^T with both in FP16 (bits).  `bf16` and `f16` run one cuBLASLt algorithm per weight shape whatever T
-    /// is (see gemm.cu), so a row's products do not depend on how many rows share the call or where it sits in them.
+    /// Y = X . W^T with both in FP16 (bits). Prepared `bf16` and `f16` shapes use one algorithm across widths;
+    /// one-row and nonzero-beta calls may fall back to cuBLAS if no plan is available.
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
 
