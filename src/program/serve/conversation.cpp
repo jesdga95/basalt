@@ -200,6 +200,7 @@ bool Runtime::park_current(size_t held, int64_t kept) {
         }
         basalt::core::SavedConversation image;
         size_t reused_bytes = 0;
+        if (draft0 != nullptr && !mtp.snapshot_main(err)) return false;   // a streamed draft ring's own window
         if (!basalt::core::conversation_snapshot_save(image, view, *rsp, g, draft0, err,
                 std::move(reuse), &reused_bytes)) return false;
         for (size_t k = 0; k < n_st; ++k) {   // the later stages
@@ -335,7 +336,8 @@ size_t Runtime::spill_to_disk(bool at_exit, size_t limit) {
         try {
             const auto t0 = Clock::now();
             basalt::core::SavedConversation image;
-            if (!basalt::core::conversation_snapshot_save(image, view, s, g, mtp_kv, se)) {
+            if ((mtp_kv != nullptr && !mtp.snapshot_main(se)) ||   // a streamed draft ring's own window
+                !basalt::core::conversation_snapshot_save(image, view, s, g, mtp_kv, se)) {
                 basalt::log::warn("basalt serve", "conversation cache: not written to disk (%s)", se.c_str());
                 return;
             }

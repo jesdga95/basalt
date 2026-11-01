@@ -106,9 +106,18 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     // KV streaming: the drafter only reads its last `window` cells, so with streaming on its K/V is a ring of the
     // window (plus the cells a round writes ahead of its queries) over a host copy, refilled on a resume. The host copy
     // is pinned after the expert arena has pinned what it could: if it does not fit, the K/V stays whole in VRAM.
-    int64_t ring = (window > 0 && window < max_cells) ? window + 4 * (int64_t) max_t + 64 : 0;
+    // A window that reaches every cell keeps the K/V whole (-1): the drafter has no resolve to stream it.
+    const bool windowed = window > 0 && window < max_cells;
+    int64_t ring = windowed ? window + 4 * (int64_t) max_t + 64 : -1;
+    // with a store per batch slot (below) a store keeps the last pages of its sequence, the window and the cells a turn
+    // may roll back, as a ring (page p at p % ring); a streamed ring then reaches as far back, so every page a store
+    // keeps has its place in it when the sequence is swapped in
+    const int64_t store_ring = windowed ? (window + kStoreRollback + 4 * (int64_t) max_t + 64 + s.page_size - 1) /
+                                              s.page_size + 1
+                                        : 0;
+    if (windowed && n_stores_ > 0) ring = store_ring * s.page_size;
     // K8V4 never applies to the drafter: its own attention paths (below, and src/core/verify/) handle whole formats
-    // only, whatever ring shape it takes (0, a window, or the -1 fully-resident fallback).
+    // only, whatever ring shape it takes (a window, or -1: fully resident).
     const bool kv_hybrid_was = qsa_kv_hybrid();
     const bool kv_int8_was = qsa_kv_int8();
     qsa_set_kv_hybrid(false);
@@ -142,8 +151,8 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     if (n_stores_ > 0) {   // one K/V per slot beside the working one (batch windows)
         KvArr lay[4];
         const int na = kv_layout(lay);
-        if (st_.kv_mode != 0 || na == 0) {
-            basalt::log::warn("basalt mtp", "batch windows need the draft layer's K/V fully resident; no drafts there");
+        if ((st_.kv_mode != 0 && st_.kv_mode != 2) || na == 0) {
+            basalt::log::warn("basalt mtp", "batch windows need the draft layer's K/V whole or a ring; no drafts there");
             n_stores_ = cur_ = 0;
         } else {
             stores_.assign((size_t) n_stores_ + 1, std::array<void*, 4>{});
@@ -152,11 +161,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
             const int64_t ps0 = shapes_of(g).page_size;
             for (size_t id = 0; id < store_cells_.size() && (int) id < n_stores_; ++id)
                 store_pages_[id] = std::min<int64_t>(st_.n_pages, (store_cells_[id] + ps0 - 1) / ps0);
-            // the drafter reads only its last `window` cells: a store keeps the last pages of its sequence, the window
-            // and the cells a turn may roll back, as a ring (page p at p % ring)
-            const int64_t ring_pages = (window > 0 && window < max_cells)
-                                           ? (window + kStoreRollback + 4 * (int64_t) max_t + 64 + ps0 - 1) / ps0 + 1
-                                           : st_.n_pages;
+            const int64_t ring_pages = store_ring > 0 ? store_ring : st_.n_pages;
             store_ring_.assign((size_t) n_stores_ + 1, 0);
             for (size_t id = 0; id < stores_.size(); ++id) store_ring_[id] = std::min(store_pages_[id], ring_pages);
             for (size_t id = 0; id < stores_.size(); ++id)

@@ -96,7 +96,8 @@ public:
     /// The draft layer's K/V state (read-only: the serve state check hashes it)
     const QsaState& kv_state() const { return st_; }
     /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
-    /// `upto` (a conversation-cache resume). No-op unless the drafter's K/V is a ring.
+    /// `upto` (a conversation-cache resume). No-op unless the drafter's K/V is a ring.  With batch stores it is the
+    /// main sequence's, and only the blocks the ring does not hold for it come from the host copy.
     void kv_restore(int64_t upto);
     /// The VRAM bind() will allocate for a native head of `head_row_bytes` per vocabulary row: the draft logits and
     /// the draft head over rt/draft_vocab.bin's subset.  The expert cache is sized before bind(), so it reserves this.
@@ -131,7 +132,8 @@ public:
     /// BATCH WINDOWS: one draft K/V per sequence.  `n` stores for the slots (set before `load`); the working state
     /// `st_` the graphs address holds one sequence at a time, `use_store` swaps another in (the old one's written
     /// cells go to its store).  Store `n` is the main sequence (the prompt path and solo requests), so `use_main`
-    /// must precede anything that reads or writes it.  Needs the K/V fully resident.
+    /// must precede anything that reads or writes it.  The working K/V is whole in VRAM or, with KV streaming, a ring
+    /// as long as a store's over a host copy that every sequence's appends share.
     /// `cells[i]` (optional) is slot i's context, the main store's the full state's.  With a draft window a store
     /// keeps only its sequence's last cells (the window and a turn's roll-back), as a ring.
     void set_stores(int n, std::vector<int64_t> cells = {}) { n_stores_ = n; store_cells_ = std::move(cells); }
@@ -144,6 +146,12 @@ public:
     /// keeps; the others are the working state's bytes), leaving the working state on the sequence it holds.
     /// The device is idle.
     bool save_store(int id, int64_t cells, ConversationKv& out, std::string& err);
+    /// Before a conversation snapshot reads `kv_state()` as the main sequence's draft K/V: with KV streaming beside
+    /// stores, the main sequence in the working state and its pages from the ring over the host copy the snapshot
+    /// reads.  A no-op otherwise.
+    bool snapshot_main(std::string& err) {
+        return st_.kv_mode != 2 || n_stores_ == 0 || (use_main(err) && ring_to_host(err));
+    }
     /// `draft` for sequence `id` from the window rows `R_rows` (device, row 0 of the sequence's segment).
     /// Copies a verify window's rows (all slots) out of the buffer the draft graphs also use, so each slot's
     /// `draft_seq` / `defer_rows` reads its own rows intact; null on failure.
@@ -276,8 +284,13 @@ private:
     std::vector<int64_t> store_ring_;    ///< pages each store's buffer keeps: the sequence's last ones, page p at p % ring
     /// cells below a sequence's end that a turn may roll back to and still find its draft window in the store
     static constexpr int64_t kStoreRollback = 16384;
-    /// pages [a, b) of one sequence's K/V into another's; `*_work`: that side is the working state (all pages in place)
+    /// pages [a, b) of one sequence's K/V into another's; `*_work`: that side is the working state (all pages in place,
+    /// or its ring)
     void copy_pages(int to, bool to_work, int from, bool from_work, int64_t a, int64_t b, const KvArr* lay, int na);
+    /// KV streaming beside stores: the ring's pages of the sequence it holds, as far as its store keeps them, over the
+    /// host copy (which every sequence appends to), so a conversation image read from that copy has the sequence's
+    /// own window.  Waits for the drafter's stream; a no-op without a ring or stores.
+    bool ring_to_host(std::string& err);
     int64_t dirty_lo_ = 0, dirty_hi_ = 0;   // empty when hi <= lo
     static constexpr int kKeepRows = 16;
     float* rkeep_ = nullptr;    ///< a window's rows, kept while the slots draft one after another

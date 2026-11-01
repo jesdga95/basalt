@@ -2,6 +2,7 @@
 #include "basalt/kernels/kv_stream.hpp"
 #include "basalt/kernels/kv_q4.hpp"
 #include "basalt/kernels/kv_q8.hpp"
+#include "basalt/kernels/qsa_seg.hpp"
 
 #include <cuda_runtime.h>
 
@@ -31,6 +32,19 @@ struct Runs {
     int n;
 };
 
+// The INT8 pools' runs: codes, then the fp16 scales (host and device callers).
+__host__ __device__ Runs runs_int8(const QsaAttnPools& slots, const KvHostPools& host, const QsaShapes& s) {
+    const int rows = (int) (s.n_head_kv * s.page_size);
+    const int codes = rows * (int) s.head_dim, scales = rows * (int) (s.head_dim / KV_Q8_GROUP) * 2;
+    Runs r{};
+    r.src[0] = (const uint8_t*) host.k_q;     r.dst[0] = (uint8_t*) slots.k_q;     r.len[0] = codes;
+    r.src[1] = (const uint8_t*) host.v_q;     r.dst[1] = (uint8_t*) slots.v_q;     r.len[1] = codes;
+    r.src[2] = (const uint8_t*) host.k_scale; r.dst[2] = (uint8_t*) slots.k_scale; r.len[2] = scales;
+    r.src[3] = (const uint8_t*) host.v_scale; r.dst[3] = (uint8_t*) slots.v_scale; r.len[3] = scales;
+    r.n = 4;
+    return r;
+}
+
 Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const QsaShapes& s) {
     const int rows = (int) (s.n_head_kv * s.page_size);
     Runs r{};
@@ -40,12 +54,7 @@ Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const 
         r.src[1] = (const uint8_t*) host.v_q4; r.dst[1] = (uint8_t*) slots.v_q4; r.len[1] = bytes;
         r.n = 2;
     } else if (fmt == kKvInt8) {
-        const int codes = rows * (int) s.head_dim, scales = rows * (int) (s.head_dim / KV_Q8_GROUP) * 2;
-        r.src[0] = (const uint8_t*) host.k_q;     r.dst[0] = (uint8_t*) slots.k_q;     r.len[0] = codes;
-        r.src[1] = (const uint8_t*) host.v_q;     r.dst[1] = (uint8_t*) slots.v_q;     r.len[1] = codes;
-        r.src[2] = (const uint8_t*) host.k_scale; r.dst[2] = (uint8_t*) slots.k_scale; r.len[2] = scales;
-        r.src[3] = (const uint8_t*) host.v_scale; r.dst[3] = (uint8_t*) slots.v_scale; r.len[3] = scales;
-        r.n = 4;
+        r = runs_int8(slots, host, s);
     } else {
         const int bytes = rows * (int) s.head_dim * 2;
         r.src[0] = (const uint8_t*) host.k_pool; r.dst[0] = (uint8_t*) slots.k_pool; r.len[0] = bytes;
@@ -80,8 +89,9 @@ __device__ int block_scan(int v, int* warp_sums, int& total) {
     return excl;
 }
 
-__global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_t* __restrict__ ids,
-                                                     const int32_t* __restrict__ steps, int n_q, int cap, int page_size) {
+// One map's resolve by the whole block (RT threads): resolve_kernel's body, and each block's of resolve_seg_kernel.
+__device__ void resolve_block(const KvStreamMap& m, const int32_t* __restrict__ ids, const int32_t* __restrict__ steps,
+                              int n_q, int cap, int page_size) {
     __shared__ int s_nmiss, s_lookups, s_cut;
     __shared__ int warp_sums[32];
     const int epoch = m.ctl[0] + 1;
@@ -158,10 +168,16 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
     }
 }
 
-// One block per missed block (grid-stride): copy its runs from the host copy into its slot, 16 B per thread.
-__global__ void copy_kernel(KvStreamMap m, Runs r) {
+__global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_t* __restrict__ ids,
+                                                     const int32_t* __restrict__ steps, int n_q, int cap, int page_size) {
+    resolve_block(m, ids, steps, n_q, cap, page_size);
+}
+
+// Blocks blk, blk + nblk, ... of a copy: each copies one missed block's runs from the host copy into its slot, 16 B
+// per thread.
+__device__ void copy_misses(const KvStreamMap& m, const Runs& r, int blk, int nblk) {
     const int need = m.ctl[2];
-    for (int k = blockIdx.x; k < need; k += gridDim.x) {
+    for (int k = blk; k < need; k += nblk) {
         const long long b = m.miss_block[k], sl = m.miss_slot[k];
         for (int a = 0; a < r.n; ++a) {
             const uint4* src = reinterpret_cast<const uint4*>(r.src[a] + b * r.len[a]);
@@ -169,6 +185,29 @@ __global__ void copy_kernel(KvStreamMap m, Runs r) {
             for (int i = threadIdx.x; i < r.len[a] / 16; i += blockDim.x) dst[i] = src[i];
         }
     }
+}
+
+__global__ void copy_kernel(KvStreamMap m, Runs r) { copy_misses(m, r, blockIdx.x, gridDim.x); }
+
+// Block j: segment j's rows resolve into its slot's map.  A segment without a slot or rows, or a resident slot (null
+// map), does nothing.  The segments name distinct slots, so no two blocks touch one map.
+__global__ void __launch_bounds__(RT) resolve_seg_kernel(QsaSegTable t, const int32_t* __restrict__ ids,
+                                                         const int32_t* __restrict__ steps, int cap, int page_size) {
+    const QsaSeg sg = t.segs[blockIdx.x];
+    if (sg.slot < 0 || sg.len <= 0) return;
+    const KvStreamMap m = t.slots[sg.slot].map;
+    if (m.ctl == nullptr) return;
+    resolve_block(m, ids + (long long) sg.first * cap, steps + (long long) sg.first * kStepCount, sg.len, cap,
+                  page_size);
+}
+
+// Grid (copy blocks, segments): segment blockIdx.y's misses into its slot's pool.
+__global__ void copy_seg_kernel(QsaSegTable t, QsaShapes s) {
+    const QsaSeg sg = t.segs[blockIdx.y];
+    if (sg.slot < 0 || sg.len <= 0) return;
+    const QsaSegSlot& sl = t.slots[sg.slot];
+    if (sl.map.ctl == nullptr) return;
+    copy_misses(sl.map, runs_int8(sl.pools(), sl.host, s), blockIdx.x, gridDim.x);
 }
 
 __global__ void reset_kernel(KvStreamMap m) {
@@ -213,7 +252,7 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
     // one sweep step looks at RT consecutive slots `(hand + thread) % n_slots`; with fewer slots than RT two
     // threads see the same slot and may both take it for two different misses.  The engine never streams with fewer
     // than qsa_kv_resident_min() / page_size = 5,120 slots, so this is a guard, not a limit.
-    if (m.n_slots < RT) {
+    if (m.n_slots < kKvStreamMinSlots) {
         basalt::log::error("basalt", "kv_stream: %lld slots is fewer than the resolve block (%d): the clock sweep would take a "
                              "slot twice", (long long) m.n_slots, RT);
         std::exit(1);
@@ -222,6 +261,21 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
     check("resolve");
     copy_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s));
     check("copy");
+}
+
+void kv_stream_resolve_seg(const QsaSegTable& t, const int32_t* ids, const int32_t* steps, int64_t cap,
+                           const QsaShapes& s, void* stream) {
+    static_assert(kKvStreamMinSlots == RT, "a streamed slot's pool holds at least one sweep step");
+    if (t.n_seg <= 0) return;
+    if (s.n_head_kv * s.page_size * (s.head_dim / KV_Q8_GROUP) * 2 % 16 != 0) {
+        basalt::log::error("basalt", "kv_stream: a block's scale run must be a multiple of 16 bytes");
+        std::exit(1);
+    }
+    // the slots' pool sizes live in the device table: the caller holds every streamed slot to kKvStreamMinSlots
+    resolve_seg_kernel<<<t.n_seg, RT, 0, (cudaStream_t) stream>>>(t, ids, steps, (int) cap, (int) s.page_size);
+    check("resolve seg");
+    copy_seg_kernel<<<dim3(96, (unsigned) t.n_seg), 128, 0, (cudaStream_t) stream>>>(t, s);
+    check("copy seg");
 }
 
 void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void* stream) {
@@ -238,6 +292,19 @@ void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, int fmt
             if (cudaMemcpyAsync(r.dst[a] + sl * r.len[a], r.src[a] + b * r.len[a], (size_t) (run * r.len[a]),
                                 cudaMemcpyDefault, (cudaStream_t) stream) != cudaSuccess)
                 check("ring restore");
+        b += run;
+    }
+}
+
+void kv_ring_save(const QsaAttnPools& slots, const KvHostPools& host, int fmt, int64_t b0, int64_t b1, int64_t n_slots,
+                  const QsaShapes& s, void* stream) {
+    const Runs r = runs_of(slots, host, fmt, s);   // src: the host copy, dst: the ring
+    for (int64_t b = b0; b < b1;) {
+        const int64_t sl = b % n_slots, run = std::min<int64_t>(b1 - b, n_slots - sl);   // up to the ring's end
+        for (int a = 0; a < r.n; ++a)
+            if (cudaMemcpyAsync((void*) (r.src[a] + b * r.len[a]), r.dst[a] + sl * r.len[a], (size_t) (run * r.len[a]),
+                                cudaMemcpyDefault, (cudaStream_t) stream) != cudaSuccess)
+                check("ring save");
         b += run;
     }
 }
