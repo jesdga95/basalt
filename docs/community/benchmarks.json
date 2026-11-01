@@ -791,6 +791,36 @@
       "prefill_64k_tps": 12741.9,
       "decode_tps": 553.6,
       "notes": "2x RTX 5090 at a 400 W limit each, PCIe 5.0 x8/x8, 90 GiB DDR5 dual-channel; resident experts, 0 SSD spill"
+    },
+    {
+      "submitter": "SolettaSolaris",
+      "date": "2026-10-31",
+      "commit": "9175e7a321",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 575,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.4
+        },
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.4
+        }
+      ],
+      "ram_gib": 504,
+      "cpu": "AMD EPYC 7702, 64 cores",
+      "ram_gbps": 147.8,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 7696.1,
+      "prefill_64k_tps": 11629.7,
+      "decode_tps": 497.8
     }
   ]
 }
