@@ -694,7 +694,9 @@ int main() {
             CHECK(f != nullptr);
             if (f) { std::fputc(1, f); std::fclose(f); }
             std::error_code ec;
-            std::filesystem::last_write_time(std::filesystem::u8path(d2 + "/" + name),
+            const std::string utf8_path = d2 + "/" + name;
+            const std::filesystem::path path(std::u8string(utf8_path.begin(), utf8_path.end()));
+            std::filesystem::last_write_time(path,
                 std::filesystem::file_time_type::clock::now() - std::chrono::hours(2), ec);
             CHECK(!ec);
         }
