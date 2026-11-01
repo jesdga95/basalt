@@ -241,6 +241,9 @@ public:
     /// The peer bytes the head split by vocabulary loads after the peer's expert tier is filled, for a head of
     /// `row_bytes` per row and native `type`, windows of up to max_t tokens; 0 when the split is not taken.
     static int64_t hs_peer_bytes(size_t row_bytes, int type, int64_t n_vocab, int64_t n_embd, int max_t, int dev0, int dev1);
+    /// The head is split for its two-stage screen (a Q8_0 head, a peer slower than CUDA0): the peer's bytes are taken
+    /// before its expert tier is filled.
+    static bool hs_two_stage(int type, int64_t n_vocab, int64_t n_embd, int max_t, int dev0, int dev1);
     /// The bytes prepare_hc8 will place when `has` names the tensors the model holds (0 with the copies off).
     static uint64_t hc8_plan_bytes(const std::function<bool(const std::string&)>& has, const ModelGeometry& g);
 
@@ -402,6 +405,9 @@ private:
     // the head split by vocabulary with the peer card, when the peer streams its rows faster than CUDA0 does
     void hs_init();
     void hs_free();
+    /// The peer's share of this window's head (T columns), queued behind its persistent window: a no-op without the
+    /// two-stage split or for an exact head.
+    bool hs_launch(int T, std::string& err);
     // the GDN mixer split by key head with the peer card, when the peer streams the mixer's bytes faster than CUDA0
     void gs_init();
     void gs_free();
@@ -678,6 +684,19 @@ private:
     cudaStream_t hs_s_ = nullptr;    // peer
     cudaEvent_t hs_in_ = nullptr;    // CUDA0: the input is staged
     cudaEvent_t hs_out_ = nullptr;   // peer: its logits are staged
+    // the two-stage head's split (hs_two_): the peer screens its rows on its copy against CUDA0's published thresholds
+    // and lists its scored entries; CUDA0 screens the rest and writes the list into its columns.  The cards meet in
+    // host memory (the link, the input and the list blocks), the peer's part queued behind its persistent window.
+    bool hs_two_ = false;
+    uint32_t hs_seq_ = 0;             // the last window number written to the link
+    int* hs_k_ = nullptr;             // peer: the list length fetched with the input
+    void* hs_scr_ = nullptr;          // peer: its two-stage scratch
+    void* hs_link_ = nullptr;         // pinned, both cards: the window number and each card's words
+    void* hs_input_ = nullptr;        // pinned, both cards: CUDA0's q8_1 columns and list length
+    void* hs_list_ = nullptr;         // pinned, both cards: the peer's listed entries
+    cudaStream_t hs_cs_ = nullptr;    // CUDA0: posts the input beside the head
+    cudaEvent_t hs_fork_ = nullptr;   // CUDA0: the head's input is quantized
+    cudaEvent_t hs_post_ = nullptr;   // CUDA0: the input is posted
     // GDN mixer split by key head: CUDA0 owns key heads [0, gs_nk0_), the peer the rest; gs_nk0_ 0 means no split
     struct GsLayer {   // peer: one GDN layer's weights for its heads (gdn_head_split.hpp layout)
         void *wqkv = nullptr, *wz = nullptr, *wo = nullptr;

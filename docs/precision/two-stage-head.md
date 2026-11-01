@@ -42,7 +42,7 @@ the window's width.
 | `logit_bias` | exact pass | a bias can lift any row into the list |
 | Grammar | two-stage; a refused row is drawn again after the exact pass over the window | the mask can leave only rows outside the list |
 | Scored requests (`ppl=`, the quality gate), the logit hash, the top-k log | the rows are read through `Verifier::copy_logits`, which runs the exact pass first | every row exact |
-| Batch slots; the head split by vocabulary | exact pass | the slots sample with their own parameters; both cards run the exact kernel |
+| Batch slots; the head split by vocabulary with a peer card faster than CUDA0 | exact pass | the slots sample with their own parameters; both cards run the exact kernel |
 
 Rows scored exactly per column on real verify-head inputs (256 inputs dumped from the bench fixtures on the IQ3_S pack,
 against the NVFP4 pack's head, all rows): K = 1: 2 on average (at most 21); K = 20: 301 (p99 1,254, at most 1,460);
@@ -66,6 +66,24 @@ prompts, 1,200 tokens), seeded sampled replies the same text (temperature 0.6 an
 top_k 1, 5, 20 at temperature 1.0, 64, 100 and 0, min_p alone, three penalty settings and neutral ones, two logit
 biases, a json_object grammar sampled and greedy, relaxed drafting); the quality gate's 5,100 rows (20 chunks) are byte
 identical (PPL 2.30097, KLD 0.0750037).
+
+### Split with a slower peer card
+
+With a peer card whose memory is slower than CUDA0's, the window's two-stage head is split by vocabulary: CUDA0
+screens rows [0, r0), the peer the rest on its own copy of them, r0 sized so that both finish together (201,984 and
+46,336 rows with a 5090 and a 5060 Ti). The cards meet in pinned host memory: CUDA0 posts the window's q8_1 columns
+and K and publishes each column's threshold as its screen finds it; the peer screens against the higher of its own
+threshold and CUDA0's, scores the rows that reach it with the same kernel, and lists every scored entry at or above it
+(row, fp32 bits); CUDA0 writes the list into its columns, whose peer rows are -inf otherwise. Either threshold is at or
+below the K-th largest logit of its card's rows, so at or below the column's K-th largest: every row of the column's K
+largest is scored on its card and kept or listed with the exact kernel's bits (the same code on both cards). The K
+largest entries of a column, their order and their values are the exact head's. With K = 0 CUDA0's exact pass takes
+every row. A card that waits past its limit for the other marks the window, which is discarded with an error.
+
+With the tiers pinned the split writes the same greedy tokens (the three bench prompts, 1,200 tokens, both cards) and
+the same seeded prose text as the head on CUDA0 alone (q80_vhead_parity's split section: the same top-K lists and
+draws at K = 1, 20, 64 and 0 on either card). In the engine (5090 at 400 W, 5060 Ti at 180 W, bench prose seed 101,
+the same text in both builds) a window costs 50-80 µs less at every width (6.65 vs 6.71 ms at three tokens).
 
 ## Q6_K head: approximate tail
 

@@ -52,7 +52,7 @@ int Verifier::head_keep() const {
 
 void Verifier::set_head_keep(int keep) {
     // the window records the two-stage head only where it ends the model, without the head split
-    const bool on = head_keep_d_ != nullptr && le_ >= g_->n_layers && hs_rows_ == 0;
+    const bool on = head_keep_d_ != nullptr && le_ >= g_->n_layers && (hs_rows_ == 0 || hs_two_);
     head_screened_ = on && keep > 0;
     if (!on || keep == head_keep_set_) return;
     cudaMemsetAsync(head_keep_d_, keep, 1, cs_);   // the low byte: the value is 0..64, the rest of the word is 0

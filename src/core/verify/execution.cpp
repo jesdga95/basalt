@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "basalt/kernels/q80_vhead.hpp"
 #include "expert_plan.hpp"
 #include "diagnostics.hpp"
 #include "basalt/core/load_progress.hpp"
@@ -130,6 +131,7 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
         wait_ev_ = nullptr;
     }
     set_head_keep(head_keep());
+    if (!hs_launch(T, err)) return false;
     const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
     if (next_ == nullptr) dev.record(DecodeEvents::kVerifyPost, cs_);
     ms_launch += ms_since(tl);
@@ -339,6 +341,10 @@ bool Verifier::run_end(int32_t* out, std::string& err) {
     gm.mark(-1);
     const bool dm_ok = dm_end(err);
     if (!window_intact(err) || !dm_ok) return false;
+    if (hs_two_ && head_screened_ && basalt::kernels::q80p_vhead_link_failed(hs_link_)) {
+        err = "verify: the peer's share of the head did not answer; the window is discarded; restart the engine";
+        return false;
+    }
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // the table changed under the window
         *(volatile uint32_t*) h_plan_err_ = 0;
