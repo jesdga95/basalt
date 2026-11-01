@@ -8,6 +8,8 @@
 // --bench [T...]: microseconds per product (weights already in FP16 / BF16) at each T (default 32768 4096 512 64) for
 // Gemm and for cublasGemmEx, and the sum per chunk over the model's layers.  Exit 77 without a device.
 // --prepared [--real-bf16 PATH]: test the prepared strided shape with random inputs and optional raw 48 x 2560 BF16 weights.
+// --alignment-2: report whether the device refuses or accepts the two-byte startup alignment.
+// --address-stress: additionally check arbitrary BF16 weight-pointer offsets in the standalone path.
 #include "basalt/kernels/dequant_bf16.hpp"
 #include "basalt/prefill/gemm.hpp"
 #include "basalt/core/layout.hpp"
@@ -28,15 +30,16 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace basalt::core {
 struct WeightTableFixture {
-    static void put(WeightTable& wt, const std::string& name, int64_t n, int64_t k) {
+    static void put(WeightTable& wt, const std::string& name, int64_t n, int64_t k, uintptr_t address = 256) {
         WeightRef r;
         r.ne0 = k;
         r.ne1 = n;
-        r.data = (const void*) (uintptr_t) 256;
+        r.data = (const void*) address;
         r.native_data = r.data;
         wt.table_[name] = r;
     }
@@ -211,7 +214,8 @@ void run_default(cublasHandle_t h, const Operands& o, const void* x, float* y, i
 }
 
 // returns the failures
-int check_shape(const Shape& s, cudaStream_t st, Gemm& g, cublasHandle_t h, unsigned seed = 0) {
+int check_shape(const Shape& s, cudaStream_t st, Gemm& g, cublasHandle_t h, unsigned seed = 0,
+                bool prepared = false, bool address_stress = false) {
     const int64_t T = 512;
     std::mt19937 rng(11 + (unsigned) s.t * 131 + (unsigned) s.n * 7 + (unsigned) s.k + seed);
     Operands o(s, T, rng);
@@ -237,36 +241,75 @@ int check_shape(const Shape& s, cudaStream_t st, Gemm& g, cublasHandle_t h, unsi
     ck(cudaStreamSynchronize(st), "default");
     const std::vector<float> y_old = rows_of(o.y, T);
 
-    // width: rows [0, w) again as a call of w rows, row r at (r + 7) % w
-    long diff_new = 0, diff_old = 0, n_rows = 0;
-    int width_index = 0;
-    for (const int64_t w : {(int64_t) 1, (int64_t) 2, (int64_t) 3, (int64_t) 4, (int64_t) 5, (int64_t) 6,
-                            (int64_t) 7, (int64_t) 8, (int64_t) 9, (int64_t) 17, (int64_t) 37, (int64_t) 64,
-                            (int64_t) 127, (int64_t) 255, (int64_t) 300, (int64_t) 301, (int64_t) 511}) {
-        const size_t xoff[] = {0, 2, 4, 8, 16, 32, 64, 128};
-        const size_t xo = xoff[width_index++ % 8];
-        const size_t yo = xo == 2 ? 0 : xo;
-        void* const xptr = (char*) xs.p + xo;
-        auto* const yptr = (float*) ((char*) ys.p + yo);
-        std::vector<uint16_t> xw((size_t) w * s.k);
-        for (int64_t r = 0; r < w; ++r)
-            std::memcpy(&xw[(size_t) ((r + 7) % w) * s.k], &o.x_h[(size_t) r * s.k], (size_t) s.k * 2);
-        ck(cudaMemcpy(xptr, xw.data(), xw.size() * 2, cudaMemcpyHostToDevice), "xw");
-        ck(cudaDeviceSynchronize(), "upload xw");
-        run_gemm(g, o, xptr, yptr, w);
-        ck(cudaStreamSynchronize(st), "gemm w");
-        const std::vector<float> yn = rows_of(ys, w, yo);
-        run_default(h, o, xptr, yptr, w);
-        ck(cudaStreamSynchronize(st), "default w");
-        const std::vector<float> old_rows = rows_of(ys, w, yo);
-        for (int64_t r = 0; r < w; ++r) {
-            const size_t at = (size_t) ((r + 7) % w);
-            diff_new += std::memcmp(&y_new[(size_t) r * s.n], &yn[at * s.n], (size_t) s.n * 4) != 0;
-            diff_old += std::memcmp(&y_old[(size_t) r * s.n], &old_rows[at * s.n], (size_t) s.n * 4) != 0;
-            ++n_rows;
+    // Compare each width to a reference with the same base alignment and weight pointer.
+    long diff_new = 0, diff_old = 0, n_rows = 0, row_diff = 0, class_diff = 0, address_diff = 0;
+    const std::vector<std::pair<size_t, size_t>> cases = prepared
+        ? std::vector<std::pair<size_t, size_t>>{{0, 0}, {64, 0}, {128, 0}, {0, 64}, {0, 128}}
+        : std::vector<std::pair<size_t, size_t>>{{0, 0}};
+    Dev shifted_model_w(prepared && o.bf ? o.w_h.size() * 2 + 256 : 256);
+    for (const auto [offset, woff] : cases) {
+        void* const xptr = (char*) xs.p + offset;
+        auto* const yptr = (float*) ((char*) ys.p + offset);
+        const auto* wptr = (const uint16_t*) ((const char*) shifted_model_w.p + woff);
+        if (woff) ck(cudaMemcpy((void*) wptr, o.w_h.data(), o.w_h.size() * 2, cudaMemcpyHostToDevice), "reference w");
+        auto run_case = [&](int64_t width) {
+            if (woff) g.bf16((const uint16_t*) xptr, wptr, yptr, width, s.n, s.k, s.ldy);
+            else run_gemm(g, o, xptr, yptr, width);
+        };
+        ck(cudaMemcpy(xptr, o.x_h.data(), (size_t) T * s.k * 2, cudaMemcpyHostToDevice), "reference x");
+        run_case(T);
+        ck(cudaStreamSynchronize(st), "aligned reference");
+        const auto reference = rows_of(ys, T, offset);
+        if (prepared && (offset != 0 || woff != 0))
+            for (int64_t r = 0; r < T; ++r)
+                class_diff += std::memcmp(&y_new[(size_t) r * s.n], &reference[(size_t) r * s.n],
+                                          (size_t) s.n * 4) != 0;
+        run_default(h, o, xptr, yptr, T);
+        ck(cudaStreamSynchronize(st), "aligned default reference");
+        const auto old_reference = rows_of(ys, T, offset);
+        for (const int64_t w : {(int64_t) 1, (int64_t) 2, (int64_t) 3, (int64_t) 4, (int64_t) 5,
+                                (int64_t) 6, (int64_t) 7, (int64_t) 8, (int64_t) 9, (int64_t) 17,
+                                (int64_t) 37, (int64_t) 64, (int64_t) 127, (int64_t) 255,
+                                (int64_t) 300, (int64_t) 301, (int64_t) 511}) {
+            std::vector<uint16_t> xw((size_t) w * s.k);
+            for (int64_t r = 0; r < w; ++r)
+                std::memcpy(&xw[(size_t) ((r + 7) % w) * s.k], &o.x_h[(size_t) r * s.k], (size_t) s.k * 2);
+            ck(cudaMemcpy(xptr, xw.data(), xw.size() * 2, cudaMemcpyHostToDevice), "xw");
+            run_case(w);
+            ck(cudaStreamSynchronize(st), "gemm w");
+            const auto got = rows_of(ys, w, offset);
+            run_default(h, o, xptr, yptr, w);
+            ck(cudaStreamSynchronize(st), "default w");
+            const auto old = rows_of(ys, w, offset);
+            long width_diff = 0;
+            for (int64_t r = 0; r < w; ++r) {
+                const size_t at = (size_t) ((r + 7) % w);
+                width_diff += std::memcmp(&reference[(size_t) r * s.n], &got[at * s.n], (size_t) s.n * 4) != 0;
+                diff_old += std::memcmp(&old_reference[(size_t) r * s.n], &old[at * s.n], (size_t) s.n * 4) != 0;
+                ++n_rows;
+            }
+            if (width_diff) std::printf("  input/output offset %zu weight offset %zu width %lld: %ld rows differ\n",
+                                        offset, woff, (long long) w, width_diff);
+            diff_new += width_diff;
         }
     }
-    if (o.bf) {
+    // A subrange advances both pointers by complete rows, keeping the original weights.
+    for (const int64_t start : {(int64_t) 1, (int64_t) 2, (int64_t) 7}) {
+        const auto* xp = o.x16.as<uint16_t>() + start * s.k;
+        auto* yp = o.y.as<float>() + start * s.ldy;
+        run_gemm(g, o, xp, yp, 37);  // settle this alignment before testing width one
+        ck(cudaStreamSynchronize(st), "row-offset warmup");
+        for (const int64_t width : {(int64_t) 1, (int64_t) 2, (int64_t) 7, (int64_t) 37}) {
+            run_gemm(g, o, xp, yp, width);
+            ck(cudaStreamSynchronize(st), "row-offset gemm");
+            const auto got = rows_of(o.y, start + width);
+            for (int64_t r = 0; r < width; ++r)
+                row_diff += std::memcmp(&y_new[(size_t) (start + r) * s.n],
+                                        &got[(size_t) (start + r) * s.n], (size_t) s.n * 4) != 0;
+        }
+    }
+    // Arbitrary weight-address invariance is a separate stress mode.
+    if (address_stress && o.bf) {
         Dev shifted_w(o.w_h.size() * 2 + 256);
         for (const size_t off : {size_t(2), size_t(4), size_t(8), size_t(16), size_t(32), size_t(64), size_t(128)}) {
             void* wptr = (char*) shifted_w.p + off;
@@ -274,10 +317,8 @@ int check_shape(const Shape& s, cudaStream_t st, Gemm& g, cublasHandle_t h, unsi
             g.bf16(o.x16.as<uint16_t>(), (const uint16_t*) wptr, ys.as<float>(), 301, s.n, s.k, s.ldy);
             ck(cudaStreamSynchronize(st), "shifted weight gemm");
             const auto got = rows_of(ys, 301);
-            for (int64_t r = 0; r < 301; ++r) {
-                diff_new += std::memcmp(&y_new[(size_t) r * s.n], &got[(size_t) r * s.n], (size_t) s.n * 4) != 0;
-                ++n_rows;
-            }
+            for (int64_t r = 0; r < 301; ++r)
+                address_diff += std::memcmp(&y_new[(size_t) r * s.n], &got[(size_t) r * s.n], (size_t) s.n * 4) != 0;
         }
     }
 
@@ -302,11 +343,14 @@ int check_shape(const Shape& s, cudaStream_t st, Gemm& g, cublasHandle_t h, unsi
     }
     const double rms_n = r2 > 0 ? std::sqrt(e2n / r2) : 0, rms_o = r2 > 0 ? std::sqrt(e2o / r2) : 0;
     // one fp32 K loop per output: the rounding error grows with K
-    const bool bad = diff_new != 0 || rms_n > 2e-9 * (double) s.k || worst_n > 4e-9 * (double) s.k;
+    const bool bad = diff_new != 0 || row_diff != 0 || class_diff != 0 || address_diff != 0 ||
+                     rms_n > 2e-9 * (double) s.k || worst_n > 4e-9 * (double) s.k;
     std::printf("%-20s %5lld x %5lld | width (%ld rows): %ld differ (cublasGemmEx: %ld) | vs cublasGemmEx max %.1e of max "
                 "|y| | vs double rel RMS %.1e worst %.1e (cublasGemmEx %.1e / %.1e) | first call %.2f ms, next %.2f ms %s\n",
                 s.name, (long long) s.n, (long long) s.k, n_rows, diff_new, diff_old, ymax > 0 ? dmax / ymax : 0.0,
                 rms_n, worst_n, rms_o, worst_o, ms_first, ms_next, bad ? "FAIL" : "ok");
+    std::printf("  row-offset differences %ld; catalog-class differences %ld; arbitrary-address differences %ld%s\n", row_diff, class_diff, address_diff,
+                address_stress ? " (tested)" : " (not tested)");
     return bad ? 1 : 0;
 }
 
@@ -343,6 +387,7 @@ int main(int argc, char** argv) {
             basalt::core::WeightTableFixture::put(wt, "blk.0.attn_qkv.weight", 10, 200);
             basalt::core::WeightTableFixture::put(wt, "blk.0.ssm_alpha.weight", 48, 2560);
             basalt::core::WeightTableFixture::put(wt, "blk.0.ssm_beta.weight", 48, 2560);
+            basalt::core::WeightTableFixture::put(wt, "blk.1.ple_key.weight", 10240, 2560, 128);
             const auto shapes = Gemm::model_shapes(wt, geom, 600);
             auto has = [&](bool bf16, int64_t n, int64_t k, int64_t ld, int align) {
                 return std::any_of(shapes.begin(), shapes.end(), [&](const Gemm::Shape& s) {
@@ -350,7 +395,8 @@ int main(int argc, char** argv) {
                 });
             };
             if (!has(false, 3, 200, 10, 256) || !has(false, 1, 200, 10, 4) ||
-                !has(true, 48, 2560, 96, 64))
+                !has(true, 48, 2560, 96, 64) || !has(true, 48, 2560, 96, 128) ||
+                !has(true, 10240, 2560, 10240, 128) || !has(true, 10240, 2560, 10240, 256))
                 throw std::runtime_error("model shape catalog missed a split tail or strided projection");
         }
         int n_dev = 0;
@@ -358,11 +404,21 @@ int main(int argc, char** argv) {
             std::printf("no CUDA device - skipped\n");
             return 77;
         }
+        if (argc == 2 && !std::strcmp(argv[1], "--alignment-2")) {
+            std::vector<Gemm::Shape> shapes{{true, 48, 2560, 96, 2}, {true, 48, 2560, 96, 256}};
+            std::string err;
+            if (!Gemm::prepare_shapes(shapes, err)) {
+                std::printf("alignment-2 preparation refused: %s\n", err.c_str());
+                return err.find("alignment 2") != std::string::npos ? 0 : 1;
+            }
+            std::printf("alignment-2 preparation accepted; arbitrary-address parity not tested\n");
+            return 77;
+        }
         if (argc >= 2 && !std::strcmp(argv[1], "--prepared")) {
             if (argc == 4 && !std::strcmp(argv[2], "--real-bf16")) real_bf16_path = argv[3];
             else if (argc != 2) throw std::runtime_error("usage: --prepared [--real-bf16 PATH]");
             std::vector<Gemm::Shape> shapes;
-            for (int a = 2; a <= 256; a *= 2) shapes.push_back({true, 48, 2560, 96, a});
+            for (int a : {64, 128, 256}) shapes.push_back({true, 48, 2560, 96, a});
             std::string err;
             if (!Gemm::prepare_shapes(shapes, err)) throw std::runtime_error(err);
             cudaStream_t st;
@@ -374,7 +430,7 @@ int main(int argc, char** argv) {
             ckb(cublasCreate(&h), "cublasCreate");
             ckb(cublasSetStream(h, st), "cublasSetStream");
             const Shape s{"ssm_alpha BF16", kBF16, 48, 2560, 96, 1};
-            int fails = check_shape(s, st, first, h) + check_shape(s, st, second, h, 1);
+            int fails = check_shape(s, st, first, h, 0, true) + check_shape(s, st, second, h, 1, true);
             {
                 Dev x(2560 * 2), w(49 * 2560 * 2), y(96 * 4);
                 ck(cudaMemset(x.p, 0, 2560 * 2), "missing-key x");
@@ -398,10 +454,11 @@ int main(int argc, char** argv) {
             std::printf("prefill_gemm_width_test prepared: %d failure(s)\n", fails);
             return fails ? 1 : 0;
         }
-        bool bench = false;
+        bool bench = false, address_stress = false;
         std::vector<int64_t> bench_t;
         for (int i = 1; i < argc; ++i) {
             if (!std::strcmp(argv[i], "--bench")) bench = true;
+            else if (!std::strcmp(argv[i], "--address-stress")) address_stress = true;
             else if (bench) bench_t.push_back(std::atoll(argv[i]));
         }
         if (bench && bench_t.empty()) bench_t = {32768, 4096, 512, 64};
@@ -438,7 +495,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         int fails = 0;
-        for (const Shape& s : kShapes) fails += check_shape(s, st, g, h);
+        for (const Shape& s : kShapes) fails += check_shape(s, st, g, h, 0, false, address_stress);
         cublasDestroy(h);
         std::printf("prefill_gemm_width_test: %d failure(s)\n", fails);
         return fails ? 1 : 0;
