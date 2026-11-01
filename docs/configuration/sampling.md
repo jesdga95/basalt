@@ -43,20 +43,19 @@ Only the thinking is watched; separators, padding, base64 and digit strings in a
 
 ### The model file's sampling defaults
 
-The model file's `meta` section carries a `sampling` object. Its keys are the request fields above, with the same
-meaning:
+The model's GGUF metadata (the `gguf_kv` of the model file's `meta`) carries llama.cpp's `general.sampling.*` keys.
+The server takes them as the defaults of these request fields:
 
-| Key | Allowed values |
-| --- | --- |
-| `temperature` | number >= 0 |
-| `top_p` | 0 < value <= 1 |
-| `top_k` | integer >= 0 (`0` or `-1` = off) |
-| `min_p` | 0 <= value <= 1 |
-| `presence_penalty` | number |
-| `frequency_penalty` | number |
-| `repetition_penalty` | number > 0 (`1` = off) |
-| `penalty_last_n` | integer 0..4096 |
-| `seed` | integer |
+| Key | Request field | Allowed values |
+| --- | --- | --- |
+| `general.sampling.temp` | `temperature` | number >= 0 |
+| `general.sampling.top_p` | `top_p` | 0 < value <= 1 |
+| `general.sampling.top_k` | `top_k` | integer >= 0 (`0` or `-1` = off) |
+| `general.sampling.min_p` | `min_p` | 0 <= value <= 1 |
+| `general.sampling.penalty_repeat` | `repetition_penalty` | number > 0 (`1` = off) |
+| `general.sampling.penalty_last_n` | `penalty_last_n` | integer 0..4096 |
+
+A float key is read as the shortest decimal with the same float32 value (0.95, not 0.949999988).
 
 A bad value stops the server at startup; an unknown key is named in a warning and ignored. The defaults in effect
 are printed at startup as `[server] sampling ...`, each marked `(cli)` or `(config)` when a launch
