@@ -291,8 +291,9 @@ bool ModelFile::open(const std::string& path, std::string& err) {
         return false;
     }
     if (h.version != kModelVersion) {
-        err = path + ": model file version " + std::to_string(h.version) + ", this build reads " +
-              std::to_string(kModelVersion);
+        err = path + ": .basalt version " + std::to_string(h.version) + ", this build reads version " +
+              std::to_string(kModelVersion) +
+              (h.version < kModelVersion ? "; upgrade it with tools/migrations/basalt_v1_to_v2.py" : "");
         return false;
     }
     if (h.n_sections > kMaxSections) { err = path + ": the section table is too long"; return false; }
@@ -417,7 +418,6 @@ void model_sources(const ModelFile& m, ModelSources& s) {
     s.dense_index = m.range("dense.index");
     s.experts = m.range("experts");
     s.experts_layout = m.range("experts.layout");
-    s.profile = m.range("profile");
     s.hc8 = m.range("hc8");
     s.mtp_dense = m.range("mtp/dense");
     s.mtp_dense_index = m.range("mtp/dense.index");
@@ -441,55 +441,6 @@ const Hc8Copy* hc8_find(const std::string& name, int rows, int cols) {
     const auto it = hc8_table().find(name);
     if (it == hc8_table().end() || (int) it->second.rows != rows || (int) it->second.cols != cols) return nullptr;
     return &it->second;
-}
-
-bool hc8_write(const std::string& path, const std::vector<Hc8Copy>& copies, std::string& err) {
-    std::vector<Hc8Entry> entries(copies.size());
-    uint64_t at = (sizeof(Hc8Header) + copies.size() * sizeof(Hc8Entry) + 255) & ~255ull;
-    for (size_t i = 0; i < copies.size(); ++i) {
-        const Hc8Copy& c = copies[i];
-        if (c.name.size() >= sizeof entries[i].name) { err = "hc8: name too long: " + c.name; return false; }
-        const uint64_t want = (uint64_t) c.rows * c.cols + (uint64_t) c.rows * c.srow * 2;
-        if (c.data.size() != want) { err = "hc8: wrong size for " + c.name; return false; }
-        std::memset(&entries[i], 0, sizeof entries[i]);
-        std::memcpy(entries[i].name, c.name.data(), c.name.size());
-        entries[i].rows = c.rows;
-        entries[i].cols = c.cols;
-        entries[i].srow = c.srow;
-        entries[i].offset = at;
-        entries[i].bytes = want;
-        at = (at + want + 255) & ~255ull;
-    }
-    Hc8Header h{};
-    std::memcpy(h.magic, "BASALTH8", 8);
-    h.version = 1;
-    h.n_entries = (uint32_t) copies.size();
-    const std::string tmp = path + ".tmp";
-    std::FILE* f = platform::open_file_utf8(tmp, "wb");
-    if (f == nullptr) { err = "hc8: cannot create " + tmp; return false; }
-    bool ok = std::fwrite(&h, sizeof h, 1, f) == 1 &&
-              (entries.empty() || std::fwrite(entries.data(), sizeof(Hc8Entry), entries.size(), f) == entries.size());
-    uint64_t pos = sizeof h + entries.size() * sizeof(Hc8Entry);
-    static const uint8_t zeros[256] = {};
-    auto pad_to = [&](uint64_t to) {
-        while (ok && pos < to) {
-            const size_t n = (size_t) std::min<uint64_t>(sizeof zeros, to - pos);
-            ok = std::fwrite(zeros, 1, n, f) == n;
-            pos += n;
-        }
-    };
-    for (size_t i = 0; ok && i < copies.size(); ++i) {
-        pad_to(entries[i].offset);
-        ok = ok && std::fwrite(copies[i].data.data(), 1, copies[i].data.size(), f) == copies[i].data.size();
-        pos += copies[i].data.size();
-    }
-    ok = (std::fclose(f) == 0) && ok;
-    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
-        std::remove(tmp.c_str());
-        err = "hc8: could not write " + path;
-        return false;
-    }
-    return true;
 }
 
 bool hc8_read(const FileRange& r, std::map<std::string, Hc8Copy>& out, std::string& err) {

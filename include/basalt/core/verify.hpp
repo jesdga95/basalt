@@ -225,9 +225,10 @@ public:
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
-    /// The 8-bit copies of every layer's hyper-connection matrices (and the head's) on the current device; called
-    /// before the expert cache takes the free memory.
-    static void prepare_hc8(const WeightTable& wt, const ModelGeometry& g);
+    /// The 8-bit copies of every layer's hyper-connection matrices (and the head's) on the current device, from the
+    /// model file's table; called before the expert cache takes the free memory.  False with `err` when a matrix this
+    /// device holds has no copy in the table or no VRAM for it.
+    static bool prepare_hc8(const WeightTable& wt, const ModelGeometry& g, std::string& err);
     /// The CUDA0 bytes the GDN mixer split by key head loads after the expert cache is sized (CUDA0's packed rows and
     /// columns of its key heads), for CUDA0 on dev0 and the peer on dev1; 0 when the split is not taken.
     static int64_t gs_cuda0_bytes(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1);
@@ -737,12 +738,8 @@ private:
 
 /// The loaded hc8 table (model_file.hpp) has a copy of `name` of this shape.
 bool hc8_table_has(const std::string& name, int rows, int cols);
-/// Registers the table's copy of `name` on the current device, keyed by the bf16 matrix `w` (hc8_prepare's form) or,
-/// with w == nullptr, by the copy itself (hc8_adopt's form; the key is returned).  nullptr: no such copy, or no VRAM.
+/// Registers the table's copy of `name` on the current device, keyed by the bf16 matrix `w` or, with w == nullptr, by
+/// the copy itself (the key is returned).  nullptr: no such copy, or no VRAM.
 const void* hc8_table_adopt(const std::string& name, const uint16_t* w, int rows, int cols);
-/// --dump-hc8: writes the 8-bit copies of the weight table's hyper-connection matrices, and `extra` (name, key) pairs
-/// (the drafter's), to `path` in the layout model_file.hpp describes.
-bool hc8_dump(const WeightTable& wt, const ModelGeometry& g, const std::vector<std::pair<std::string, const void*>>& extra,
-              const std::string& path, std::string& err);
 
 }  // namespace basalt::core

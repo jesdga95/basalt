@@ -67,9 +67,6 @@ public:
     /// The bytes `load` places on the device (the dense weights and the experts; the K/V and buffers are working
     /// memory), from the section sizes and the dense index.
     static bool plan_bytes(const MtpFiles& files, const ModelGeometry& g, uint64_t& out, std::string& err);
-    /// The draft layer's hyper-connection matrices that have 8-bit copies, as ("mtp." + tensor name, key) for
-    /// hc8_dump.  After `load`.
-    std::vector<std::pair<std::string, const void*>> hc8_keys() const;
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// A new request: the draft head's extra rows are cleared, and the tokens of the prompt that the

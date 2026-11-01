@@ -1,6 +1,7 @@
 #include "options.hpp"
 #include "help.hpp"
 
+#include "basalt/core/model_file.hpp"
 #include "basalt/kernels/rope_scaling.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/log.hpp"
@@ -10,6 +11,17 @@
 #include <cmath>
 
 namespace basalt::program::cli {
+
+std::string profile_key(const basalt::core::Json& meta) {
+    using T = basalt::core::Json::Type;
+    const basalt::core::Json* kv = meta.get("gguf_kv");
+    const basalt::core::Json* arch = kv ? kv->get("general.architecture") : nullptr;
+    if (arch == nullptr || !arch->is_string() || arch->s.empty()) return {};
+    const basalt::core::Json* nl = kv->get(arch->s + ".block_count");
+    const basalt::core::Json* ne = kv->get(arch->s + ".expert_count");
+    if (nl == nullptr || ne == nullptr || nl->type != T::Int || ne->type != T::Int || nl->neg || ne->neg) return {};
+    return arch->s + "-" + std::to_string(nl->u64()) + "x" + std::to_string(ne->u64());
+}
 
 std::optional<int> resolve_model_options(Options& o, bool multi_gpu) {
     // Built-in defaults for what is given nowhere: the fastest settings that need no knowledge of the machine.

@@ -1,11 +1,17 @@
 #pragma once
 
 #include <optional>
+#include <string>
 
+namespace basalt::core { struct Json; }
 namespace basalt::program { struct Options; }
 namespace basalt::kernels { struct RopeScaling; struct SamplerParams; }
 
 namespace basalt::program::cli {
+
+// The name of the engine's expert profile for a model (data/profiles/<key>.prof): "<architecture>-<block_count>x
+// <expert_count>" from meta.gguf_kv; empty when the metadata does not say.
+std::string profile_key(const basalt::core::Json& meta);
 
 // Resolve defaults after the model's sections and GPU roles are known.
 std::optional<int> resolve_model_options(Options& o, bool multi_gpu);

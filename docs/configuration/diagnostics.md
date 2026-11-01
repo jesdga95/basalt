@@ -24,7 +24,6 @@ The binary column says who takes the flag:
 | `--stop-eos` | CLI | switch, off | Stop at an end-of-turn token. `--serve` always stops there. |
 | `--eos-ids` | engine | id list, `248044,248046` | The end-of-turn tokens; implies `--stop-eos`. The server expects the default. |
 | `--gpu-plan` | engine | switch | Print the `--gpu` choice as one JSON line and exit; needs no model. The server calls it. |
-| `--dump-hc8` | engine | path | Load, write the 8-bit hyper-connection copies (the converter's `hc8` section) to the file, exit. |
 
 ## Dumps
 

@@ -5,7 +5,6 @@ namespace basalt::program::generate {
 int model(Context& context) {
     auto& o = *context.o;
     auto& chosen_cards = *context.chosen_cards;
-    auto& srcs = *context.srcs;
     auto& pack_files = *context.pack_files;
     auto& no_spec = *context.no_spec;
     auto& rope_cfg = *context.rope_cfg;
@@ -159,13 +158,14 @@ int model(Context& context) {
                     learned = true;
                     o.expert_profile = o.expert_profile_save;
                 } else {
-                    basalt::log::warn("basalt generate", "%s not used (%s): the model's profile instead",
+                    basalt::log::warn("basalt generate", "%s not used (%s): the engine's profile instead",
                                       o.expert_profile_save.c_str(), perr.c_str());
                     profile.clear();
                 }
             }
         }
-        if (!learned && !basalt::core::read_expert_profile(srcs.profile, g.n_layers, g.n_expert, profile, pslots, err)) {
+        if (!learned && !basalt::core::read_expert_profile(basalt::core::FileRange(o.expert_profile), g.n_layers,
+                                                           g.n_expert, profile, pslots, err)) {
             return fatal_start_error(err);
         }
         // An explicit number truncates the ranked list ("what would 2,000 slots give" without rebuilding the file).
