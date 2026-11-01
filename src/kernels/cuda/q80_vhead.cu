@@ -10,6 +10,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -40,7 +41,30 @@ struct VScratch {   // the screen's last block clears the histogram and the coun
     unsigned hist[8][VHIST];
     float thr[8];
     unsigned done;
+    unsigned lcnt[8], ldone;   // q80p_vhead_list's counts and arrivals, cleared by its last block
+    unsigned fail;             // the share's input did not come (q80p_vhead_fetch), read by q80p_vhead_list
 };
+
+// The split's link (host memory both cards map, q80p_vhead_link_words words): the window's number (written by the
+// host), then each card's words, a 64-byte line each, carrying the number of the window they belong to.
+constexpr int kLinkSeq = 0;             // the host: this window
+constexpr int kLinkIn = 16;             // CUDA0: the window whose input is in the input block
+constexpr int kLinkPub = 32;            // CUDA0: the window whose thresholds follow (words 33..40)
+constexpr int kLinkDone = 48;           // the peer: the window whose list is in the list block (bit 31: it gave up)
+constexpr int kLinkErr = 56;            // CUDA0: the window whose share did not answer
+constexpr int kLinkWords = 64;
+constexpr unsigned kLinkFail = 0x80000000u;
+constexpr unsigned long long kPubWaitNs = 2000000ull;     // a share waits this long for CUDA0's thresholds
+constexpr unsigned long long kLinkWaitNs = 200000000ull;  // either card waits this long for the other's input or list
+__device__ __forceinline__ unsigned long long dm_now_ns() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+// q80p_vhead_list's host block: the columns' counts, then per column n_out (row, logit bits) pairs
+constexpr int kListHead = 16;   // words before the pairs
+__host__ __device__ inline size_t list_bytes(int n_out) { return (size_t) kListHead * 4 + (size_t) 8 * n_out * 8; }
 
 __device__ __forceinline__ float warp_sum(float x) {
 #pragma unroll
@@ -186,13 +210,14 @@ __device__ __forceinline__ void load_xe(const Q81Block* __restrict__ x, int ncol
 template <int NC>
 __global__ void __launch_bounds__(WPB * WARP) q80p_rows_kernel(const uint8_t* __restrict__ w,
                                                                const Q81Block* __restrict__ x, float* __restrict__ y,
-                                                               int n_out, int per_block, const int* __restrict__ k,
+                                                               int n_out, int n_scr, int per_block,
+                                                               const int* __restrict__ k,
                                                                const VScratch* __restrict__ vs) {
     extern __shared__ __align__(16) int4 xe[];
     __shared__ uint32_t list[kListCap];
     __shared__ int cnt;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int r0 = blockIdx.x * per_block, r1 = min(n_out, r0 + per_block);
+    const int r0 = blockIdx.x * per_block, r1 = min(n_scr, r0 + per_block);   // the listed rows: the screened ones
     const int keep = k != nullptr ? __ldg(k) : 0;   // set before the launch
     q80p::Quarter cur[kNch];
     if (keep == 0) {
@@ -268,15 +293,20 @@ __device__ __forceinline__ void screen_load(const uint8_t* __restrict__ row, int
     }
 }
 
-// Every row's upper bound into y; each block adds its per-column maximum lower bound to the histogram, and the last
-// block turns the histogram into the columns' thresholds: the lower edge of the bin holding the K-th largest block
-// maximum, at or below the K-th largest lower bound and so at or below the K-th largest exact logit.  Blocks hold
-// disjoint rows, so their maxima are K distinct rows' bounds.
+// Every screened row's upper bound into y (rows [0, n_scr); the entries of the rows past it -inf); each block adds its
+// per-column maximum lower bound to the histogram, and the last block turns the histogram into the columns'
+// thresholds: the lower edge of the bin holding the K-th largest block maximum, at or below the K-th largest lower bound
+// and so at or below the K-th largest exact logit.  Blocks hold disjoint rows, so their maxima are K distinct rows'
+// bounds.
+// With `pub` (the split's link), the last block also publishes the thresholds there for the window; with `sub` (the
+// link, on the share's card), it raises each threshold to the one published for this window, when that comes within
+// kPubWaitNs.
 template <int NC>
 __global__ void __launch_bounds__(WPB * WARP) q80p_screen_kernel(const uint8_t* __restrict__ w,
                                                                  const Q81Block* __restrict__ x, float* __restrict__ y,
-                                                                 int n_out, const int* __restrict__ k,
-                                                                 VScratch* __restrict__ vs) {
+                                                                 int n_out, int n_scr, const int* __restrict__ k,
+                                                                 VScratch* __restrict__ vs, unsigned* pub,
+                                                                 const unsigned* sub) {
     __shared__ __align__(16) int4 sy[NC][2][kBlocks];   // a column's codes per block, in two halves
     __shared__ __align__(16) float4 sc[NC][kBlocks];    // {4 d, -31.625 sum q, 1.5 d sum |q|, 0}
     __shared__ float wmax[WPB][NC];
@@ -286,9 +316,14 @@ __global__ void __launch_bounds__(WPB * WARP) q80p_screen_kernel(const uint8_t* 
     const int keep = __ldg(k);   // set before the launch
     const int row0 = blockIdx.x * WPB + warp, stride = gridDim.x * WPB;
     ScreenRow cur;
-    if (keep != 0 && row0 < n_out) screen_load(w + (size_t) row0 * kRowBytes, lane, cur);   // weights: before the wait
+    if (keep != 0 && row0 < n_scr) screen_load(w + (size_t) row0 * kRowBytes, lane, cur);   // weights: before the wait
     pdl_wait();
     if (keep == 0) return;   // the exact pass takes every row
+    if (n_scr < n_out) {     // another card's rows: below every entry of the merged column
+        const int nr = n_out - n_scr;
+        for (int i = blockIdx.x * blockDim.x + tid; i < NC * nr; i += gridDim.x * blockDim.x)
+            y[(size_t) (i / nr) * n_out + n_scr + i % nr] = __int_as_float(0xff800000);
+    }
     if (tid < NC) bad[tid] = 0;
     __syncthreads();
     for (int i = tid; i < NC * kBlocks; i += blockDim.x) {
@@ -314,10 +349,10 @@ __global__ void __launch_bounds__(WPB * WARP) q80p_screen_kernel(const uint8_t* 
     float lmax[NC];
 #pragma unroll
     for (int j = 0; j < NC; ++j) lmax[j] = __int_as_float(0xff800000);
-    for (int row = row0; row < n_out; row += stride) {
+    for (int row = row0; row < n_scr; row += stride) {
         const int nrow = row + stride;
         ScreenRow nxt;
-        if (nrow < n_out) screen_load(w + (size_t) nrow * kRowBytes, lane, nxt);
+        if (nrow < n_scr) screen_load(w + (size_t) nrow * kRowBytes, lane, nxt);
         constexpr int P = NC <= 1 ? 1 : NC <= 2 ? 2 : NC <= 4 ? 4 : 8;   // the columns, padded to a power of two
         float v[2 * P];   // c of each column, then its half-width
 #pragma unroll
@@ -418,6 +453,176 @@ __global__ void __launch_bounds__(WPB * WARP) q80p_screen_kernel(const uint8_t* 
         for (int i = lane; i < VHIST; i += 32) vs->hist[c][i] = 0u;
     }
     if (tid == 0) vs->done = 0u;
+    if (pub != nullptr) {   // CUDA0: the thresholds, then the window they belong to
+        __syncthreads();
+        if (tid == 0) {
+            __threadfence();
+            volatile unsigned* l = pub;
+            for (int c = 0; c < NC; ++c) l[kLinkPub + 1 + c] = __float_as_uint(__ldcg(&vs->thr[c]));
+            __threadfence_system();
+            l[kLinkPub] = l[kLinkSeq];
+            __threadfence_system();
+        }
+    }
+    if (sub != nullptr && tid == 0) {   // the share: CUDA0's thresholds of this window, when they come in time
+        __threadfence();
+        const volatile unsigned* l = sub;
+        const unsigned want = l[kLinkSeq];
+        unsigned long long t0 = 0;
+        for (unsigned i = 0;; ++i) {
+            if (l[kLinkPub] == want) {
+                __threadfence_system();
+                const uint4* p = reinterpret_cast<const uint4*>(sub + kLinkPub);   // words 32..43
+                const uint4 a = __ldcv(p), b = __ldcv(p + 1), c3 = __ldcv(p + 2);
+                const unsigned t[8] = {a.y, a.z, a.w, b.x, b.y, b.z, b.w, c3.x};
+                for (int c = 0; c < NC; ++c) vs->thr[c] = fmaxf(__ldcg(&vs->thr[c]), __uint_as_float(t[c]));
+                break;
+            }
+            if ((i & 63u) == 0u) {
+                const unsigned long long t = dm_now_ns();
+                if (t0 == 0) t0 = t;
+                else if (t - t0 > kPubWaitNs) break;   // its own thresholds: complete, only wider
+            }
+            __nanosleep(64);
+        }
+    }
+}
+
+// ---- a share on another card
+
+// the input block: the q8_1 columns, then the list length at the next 16-byte boundary
+__host__ __device__ inline size_t input_k_offset(int n_in, int ncols) {
+    return ((size_t) ncols * (n_in / 32) * sizeof(Q81Block) + 15) / 16 * 16;
+}
+
+// CUDA0: the head's input and its list length into the input block, then the window they belong to.
+__global__ void __launch_bounds__(256) q80p_post_kernel(const uint4* __restrict__ x, int n16, const int* __restrict__ k,
+                                                        uint4* in, int ko, unsigned* link) {
+    for (int i = threadIdx.x; i < n16; i += blockDim.x) in[i] = __ldg(x + i);
+    if (threadIdx.x == 0) *(volatile int*) ((uint8_t*) in + ko) = __ldg(k);
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        volatile unsigned* l = link;
+        l[kLinkIn] = l[kLinkSeq];
+        __threadfence_system();
+    }
+}
+
+// The share: this window's input from the input block into x and k (its own memory), once CUDA0 posted it; an input
+// that does not come in kLinkWaitNs leaves the share's list empty and marked (k 0, fail).
+__global__ void __launch_bounds__(256) q80p_fetch_kernel(const uint4* in, int n16, int ko, const unsigned* link,
+                                                         uint4* __restrict__ x, int* __restrict__ k,
+                                                         VScratch* __restrict__ vs) {
+    __shared__ int ok;
+    if (threadIdx.x == 0) {
+        const volatile unsigned* l = link;
+        const unsigned want = l[kLinkSeq];
+        unsigned long long t0 = 0;
+        bool got = false;
+        for (unsigned i = 0;; ++i) {
+            if (l[kLinkIn] == want) { got = true; break; }
+            if ((i & 63u) == 0u) {
+                const unsigned long long t = dm_now_ns();
+                if (t0 == 0) t0 = t;
+                else if (t - t0 > kLinkWaitNs) break;
+            }
+            __nanosleep(32);
+        }
+        __threadfence_system();
+        ok = got;
+        if (!got) { *k = 0; vs->fail = 1u; }
+    }
+    __syncthreads();
+    if (!ok) return;
+    for (int i = threadIdx.x; i < n16; i += blockDim.x) x[i] = __ldcv(in + i);
+    if (threadIdx.x == 0) *k = *(const volatile int*) ((const uint8_t*) in + ko);
+}
+
+// Every entry at or above its column's threshold (after the exact pass: the scored rows whose logit reaches it), as
+// (row, logit bits) into the host block; the last block writes the counts and the thresholds and clears its counters.
+template <int NC>
+__global__ void __launch_bounds__(256) q80p_list_kernel(const float* __restrict__ y, int n_out, const int* __restrict__ k,
+                                                        VScratch* __restrict__ vs, unsigned* __restrict__ list,
+                                                        unsigned* link) {
+    __shared__ float thr[NC];
+    __shared__ bool last;
+    const int keep = __ldg(k);
+    if (threadIdx.x < NC) thr[threadIdx.x] = __ldcg(&vs->thr[threadIdx.x]);
+    __syncthreads();
+    if (keep != 0) {
+        uint2* pairs = reinterpret_cast<uint2*>(list + kListHead);
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < NC * n_out; i += gridDim.x * blockDim.x) {
+            const int j = i / n_out;
+            const float v = __ldcg(y + i);
+            if (!(v < thr[j])) {   // NaN: listed, as the exact pass scores it
+                const unsigned p = atomicAdd(&vs->lcnt[j], 1u);
+                pairs[(size_t) j * n_out + p] = make_uint2((unsigned) (i - j * n_out), __float_as_uint(v));
+            }
+        }
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(&vs->ldone, 1u) == gridDim.x - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    if (threadIdx.x < 8) {
+        const unsigned c = keep != 0 && threadIdx.x < NC ? __ldcg(&vs->lcnt[threadIdx.x]) : 0u;
+        *(volatile unsigned*) (list + threadIdx.x) = c;
+        *(volatile unsigned*) (list + 8 + threadIdx.x) = threadIdx.x < NC ? __float_as_uint(thr[threadIdx.x]) : 0u;
+        vs->lcnt[threadIdx.x] = 0u;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {   // the list is complete: the window it belongs to
+        vs->ldone = 0u;
+        volatile unsigned* l = link;
+        l[kLinkDone] = l[kLinkSeq] | (vs->fail != 0u ? kLinkFail : 0u);
+        vs->fail = 0u;
+        __threadfence_system();
+    }
+}
+
+// The share's listed entries (exact logits) into y at row first + row, once its list of this window is in: a warp a
+// column, each lane reading its first pair with the count, so a short list costs one round trip over the link.  A list
+// that does not come in kLinkWaitNs (or comes without its input) marks the window in the link's error word.
+__global__ void __launch_bounds__(256) q80p_merge_kernel(float* __restrict__ y, int n_out, int first, int ncols,
+                                                         int list_rows, const int* __restrict__ k, const unsigned* list,
+                                                         unsigned* link) {
+    __shared__ int ok;
+    const int j = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (__ldg(k) == 0) return;
+    if (threadIdx.x == 0) {
+        volatile unsigned* l = link;
+        const unsigned want = l[kLinkSeq];
+        unsigned long long t0 = 0;
+        unsigned d = 0;
+        for (unsigned i = 0;; ++i) {
+            d = l[kLinkDone];
+            if ((d & ~kLinkFail) == want) break;
+            if ((i & 63u) == 0u) {
+                const unsigned long long t = dm_now_ns();
+                if (t0 == 0) t0 = t;
+                else if (t - t0 > kLinkWaitNs) { d = kLinkFail; break; }
+            }
+            __nanosleep(32);
+        }
+        ok = (d & kLinkFail) == 0u;
+        if (!ok) l[kLinkErr] = want;
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (!ok || j >= ncols) return;
+    const uint2* pairs = reinterpret_cast<const uint2*>(list + kListHead) + (size_t) j * list_rows;
+    const unsigned n0 = lane == 0 ? __ldcv(list + j) : 0u;
+    const uint2 e0 = lane < list_rows ? __ldcv(pairs + lane) : make_uint2(0u, 0u);
+    const unsigned n = __shfl_sync(0xffffffffu, n0, 0);
+    if ((unsigned) lane < n) y[(size_t) j * n_out + first + (int) e0.x] = __uint_as_float(e0.y);
+    for (unsigned i = 32 + lane; i < n; i += 32) {
+        const uint2 e = __ldcv(pairs + i);
+        y[(size_t) j * n_out + first + (int) e.x] = __uint_as_float(e.y);
+    }
 }
 
 // ---- launches
@@ -447,17 +652,26 @@ void grids(int& screen, int& rows) {
 }
 
 template <int NC>
-void launch(const void* w, const void* x, float* y, int n_out, const int* k, VScratch* vs, cudaStream_t s) {
+void launch(const void* w, const void* x, float* y, int n_out, int n_scr, const int* k, VScratch* vs, cudaStream_t s,
+            unsigned* pub, const unsigned* sub) {
     int screen = 0, grid = 0;
     grids<NC>(screen, grid);
     if (k != nullptr)
         launch_pdl(q80p_screen_kernel<NC>, dim3((unsigned) screen), dim3(WPB * WARP), 0, s, (const uint8_t*) w,
-                   (const Q81Block*) x, y, n_out, k, vs);
+                   (const Q81Block*) x, y, n_out, n_scr, k, vs, pub, sub);
     if ((long long) grid * kListCap < n_out) grid = (n_out + kListCap - 1) / kListCap;
     const int per_block = (n_out + grid - 1) / grid;
     grid = (n_out + per_block - 1) / per_block;
     launch_pdl(q80p_rows_kernel<NC>, dim3((unsigned) grid), dim3(WPB * WARP), (size_t) NC * kBlocks * 4 * sizeof(int4), s,
-               (const uint8_t*) w, (const Q81Block*) x, y, n_out, per_block, k, (const VScratch*) vs);
+               (const uint8_t*) w, (const Q81Block*) x, y, n_out, n_scr, per_block, k, (const VScratch*) vs);
+}
+
+template <int NC>
+void launch_list(const float* y, int n_out, const int* k, VScratch* vs, unsigned* list, unsigned* link, cudaStream_t s) {
+    int sms = 0, dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    q80p_list_kernel<NC><<<(unsigned) std::max(sms, 1), 256, 0, s>>>(y, n_out, k, vs, list, link);
 }
 
 void check(const char* what) {
@@ -469,22 +683,23 @@ void check(const char* what) {
 }
 
 void dispatch(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, const int* k, void* scratch,
-              void* stream, const char* who) {
-    if (!q80p_supported(n_in, ncols) || n_out <= 0 || !w || !x || !y || (k != nullptr && scratch == nullptr)) {
+              void* stream, const char* who, int n_scr, unsigned* pub = nullptr, const unsigned* sub = nullptr) {
+    if (!q80p_supported(n_in, ncols) || n_out <= 0 || !w || !x || !y || (k != nullptr && scratch == nullptr) ||
+        n_scr <= 0 || n_scr > n_out) {
         basalt::log::error("basalt", "%s: unsupported shape (n_in %d, n_out %d, ncols %d)", who, n_in, n_out, ncols);
         std::exit(1);
     }
     const auto s = (cudaStream_t) stream;
     VScratch* vs = (VScratch*) scratch;
     switch (ncols) {
-        case 1: launch<1>(w, x, y, n_out, k, vs, s); break;
-        case 2: launch<2>(w, x, y, n_out, k, vs, s); break;
-        case 3: launch<3>(w, x, y, n_out, k, vs, s); break;
-        case 4: launch<4>(w, x, y, n_out, k, vs, s); break;
-        case 5: launch<5>(w, x, y, n_out, k, vs, s); break;
-        case 6: launch<6>(w, x, y, n_out, k, vs, s); break;
-        case 7: launch<7>(w, x, y, n_out, k, vs, s); break;
-        default: launch<8>(w, x, y, n_out, k, vs, s); break;
+        case 1: launch<1>(w, x, y, n_out, n_scr, k, vs, s, pub, sub); break;
+        case 2: launch<2>(w, x, y, n_out, n_scr, k, vs, s, pub, sub); break;
+        case 3: launch<3>(w, x, y, n_out, n_scr, k, vs, s, pub, sub); break;
+        case 4: launch<4>(w, x, y, n_out, n_scr, k, vs, s, pub, sub); break;
+        case 5: launch<5>(w, x, y, n_out, n_scr, k, vs, s, pub, sub); break;
+        case 6: launch<6>(w, x, y, n_out, n_scr, k, vs, s, pub, sub); break;
+        case 7: launch<7>(w, x, y, n_out, n_scr, k, vs, s, pub, sub); break;
+        default: launch<8>(w, x, y, n_out, n_scr, k, vs, s, pub, sub); break;
     }
     check(who);
 }
@@ -506,18 +721,106 @@ void q80p_unpack(void* rows, int64_t n, void* stream) {
 }
 
 void q80p_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
-    dispatch(weights, x_q8_1, y, n_in, n_out, ncols, nullptr, nullptr, stream, "q80p_mmvq");
+    dispatch(weights, x_q8_1, y, n_in, n_out, ncols, nullptr, nullptr, stream, "q80p_mmvq", n_out);
 }
 
 size_t q80p_vhead_scratch_bytes() { return sizeof(VScratch); }
 
 void q80p_vhead(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, const int* k,
-                void* scratch, void* stream) {
+                void* scratch, void* stream, int n_screen, unsigned* link_pub, const unsigned* link_sub) {
     if (k == nullptr) {
         basalt::log::error("basalt", "q80p_vhead: no list length");
         std::exit(1);
     }
-    dispatch(weights, x_q8_1, y, n_in, n_out, ncols, k, scratch, stream, "q80p_vhead");
+    dispatch(weights, x_q8_1, y, n_in, n_out, ncols, k, scratch, stream, "q80p_vhead", n_screen < 0 ? n_out : n_screen,
+             link_pub, link_sub);
+}
+
+size_t q80p_vhead_list_bytes(int ncols, int n_out) { return ncols >= 1 && ncols <= 8 ? list_bytes(n_out) : 0; }
+size_t q80p_vhead_link_bytes() { return (size_t) kLinkWords * 4; }
+size_t q80p_vhead_input_bytes(int n_in, int ncols) { return input_k_offset(n_in, ncols) + 16; }
+
+void q80p_vhead_post(const void* x_q8_1, int n_in, int ncols, const int* k, void* input, void* link, void* stream) {
+    if (!q80p_supported(n_in, ncols) || !x_q8_1 || !k || !input || !link) {
+        basalt::log::error("basalt", "q80p_vhead_post: unsupported shape (n_in %d, ncols %d)", n_in, ncols);
+        std::exit(1);
+    }
+    const int n16 = (int) ((size_t) ncols * (n_in / 32) * sizeof(Q81Block) / 16);
+    q80p_post_kernel<<<1, 256, 0, (cudaStream_t) stream>>>((const uint4*) x_q8_1, n16, k, (uint4*) input,
+                                                          (int) input_k_offset(n_in, ncols), (unsigned*) link);
+    check("q80p_vhead_post");
+}
+
+void q80p_vhead_fetch(const void* input, const void* link, void* x_q8_1, int* k, int n_in, int ncols, void* scratch,
+                      void* stream) {
+    if (!q80p_supported(n_in, ncols) || !input || !link || !x_q8_1 || !k || !scratch) {
+        basalt::log::error("basalt", "q80p_vhead_fetch: unsupported shape (n_in %d, ncols %d)", n_in, ncols);
+        std::exit(1);
+    }
+    const int n16 = (int) ((size_t) ncols * (n_in / 32) * sizeof(Q81Block) / 16);
+    q80p_fetch_kernel<<<1, 256, 0, (cudaStream_t) stream>>>((const uint4*) input, n16, (int) input_k_offset(n_in, ncols),
+                                                           (const unsigned*) link, (uint4*) x_q8_1, k,
+                                                           (VScratch*) scratch);
+    check("q80p_vhead_fetch");
+}
+
+template <int NC>
+static void prepare_cols() {
+    int screen = 0, rows = 0;
+    grids<NC>(screen, rows);
+    cudaFuncAttributes fa;
+    cudaFuncGetAttributes(&fa, q80p_screen_kernel<NC>);
+    cudaFuncGetAttributes(&fa, q80p_rows_kernel<NC>);
+    cudaFuncGetAttributes(&fa, q80p_list_kernel<NC>);
+}
+
+void q80p_vhead_prepare() {
+    prepare_cols<1>(); prepare_cols<2>(); prepare_cols<3>(); prepare_cols<4>();
+    prepare_cols<5>(); prepare_cols<6>(); prepare_cols<7>(); prepare_cols<8>();
+    cudaFuncAttributes fa;
+    cudaFuncGetAttributes(&fa, q80p_post_kernel);
+    cudaFuncGetAttributes(&fa, q80p_fetch_kernel);
+    cudaFuncGetAttributes(&fa, q80p_merge_kernel);
+    check("q80p_vhead_prepare");
+}
+
+bool q80p_vhead_link_failed(const void* link) {
+    const volatile unsigned* l = (const volatile unsigned*) link;
+    return l[kLinkErr] != 0u && l[kLinkErr] == l[kLinkSeq];
+}
+
+void q80p_vhead_list(const float* y, int n_out, int ncols, const int* k, void* scratch, void* list, void* link,
+                     void* stream) {
+    if (ncols < 1 || ncols > 8 || n_out <= 0 || !y || !k || !scratch || !list || !link) {
+        basalt::log::error("basalt", "q80p_vhead_list: unsupported shape (n_out %d, ncols %d)", n_out, ncols);
+        std::exit(1);
+    }
+    const auto s = (cudaStream_t) stream;
+    VScratch* vs = (VScratch*) scratch;
+    unsigned* l = (unsigned*) list;
+    switch (ncols) {
+        case 1: launch_list<1>(y, n_out, k, vs, l, (unsigned*) link, s); break;
+        case 2: launch_list<2>(y, n_out, k, vs, l, (unsigned*) link, s); break;
+        case 3: launch_list<3>(y, n_out, k, vs, l, (unsigned*) link, s); break;
+        case 4: launch_list<4>(y, n_out, k, vs, l, (unsigned*) link, s); break;
+        case 5: launch_list<5>(y, n_out, k, vs, l, (unsigned*) link, s); break;
+        case 6: launch_list<6>(y, n_out, k, vs, l, (unsigned*) link, s); break;
+        case 7: launch_list<7>(y, n_out, k, vs, l, (unsigned*) link, s); break;
+        default: launch_list<8>(y, n_out, k, vs, l, (unsigned*) link, s); break;
+    }
+    check("q80p_vhead_list");
+}
+
+void q80p_vhead_merge(float* y, int n_out, int first, int ncols, int list_rows, const int* k, const void* list,
+                      void* link, void* stream) {
+    if (ncols < 1 || ncols > 8 || first < 0 || first + list_rows > n_out || !y || !k || !list || !link) {
+        basalt::log::error("basalt", "q80p_vhead_merge: unsupported shape (n_out %d, first %d, rows %d, ncols %d)", n_out,
+                           first, list_rows, ncols);
+        std::exit(1);
+    }
+    q80p_merge_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(y, n_out, first, ncols, list_rows, k, (const unsigned*) list,
+                                                         (unsigned*) link);
+    check("q80p_vhead_merge");
 }
 
 }  // namespace basalt::kernels
