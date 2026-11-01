@@ -36,11 +36,12 @@ struct TempDir {
 struct Sec { std::string name; std::string data; };
 
 /// Writes a model file with the given sections, each at a multiple of kSectionAlign.
-std::string write_model(const fs::path& path, const std::vector<Sec>& secs, bool truncate = false) {
+std::string write_model(const fs::path& path, const std::vector<Sec>& secs, bool truncate = false,
+                        uint32_t version = kModelVersion) {
     std::vector<char> file((size_t) kHeaderBytes, 0);
     FileHeader h{};
     std::memcpy(h.magic, kModelMagic, 8);
-    h.version = kModelVersion;
+    h.version = version;
     h.n_sections = (uint32_t) secs.size();
     for (size_t i = 0; i < secs.size(); ++i) {
         const uint64_t off = (file.size() + kSectionAlign - 1) / kSectionAlign * kSectionAlign;
@@ -58,6 +59,26 @@ std::string write_model(const fs::path& path, const std::vector<Sec>& secs, bool
     std::ofstream(path, std::ios::binary).write(file.data(), (std::streamsize) file.size());
     return path.string();
 }
+
+/// An hc8 section holding one copy (the layout model_file.hpp describes).
+std::string hc8_section(const Hc8Copy& c) {
+    Hc8Header h{};
+    std::memcpy(h.magic, "BASALTH8", 8);
+    h.version = 1;
+    h.n_entries = 1;
+    Hc8Entry e{};
+    std::memcpy(e.name, c.name.data(), c.name.size());
+    e.rows = c.rows;
+    e.cols = c.cols;
+    e.srow = c.srow;
+    e.offset = 256;
+    e.bytes = c.data.size();
+    std::string out(256, '\0');
+    std::memcpy(out.data(), &h, sizeof h);
+    std::memcpy(out.data() + sizeof h, &e, sizeof e);
+    out.append(c.data.begin(), c.data.end());
+    return out;
+}
 }  // namespace
 
 int main() {
@@ -70,21 +91,14 @@ int main() {
         R"({"format":"basalt","gguf_kv":{"general.architecture":"qwen4exp","qwen4exp.expert_count":512,)"
         R"("qwen4exp.rope.freq_base":10000000.0,"tok":["a","b","c"],"neg":-3,"name":"hé"},)"
         R"("tensors":{"a.weight":{"type":"F32","type_id":0,"shape":[25],"bytes":100,"offset":0},)"
-        R"("b.weight":{"type":"F32","type_id":0,"shape":[5,2],"bytes":40,"offset":4096}},)"
-        R"("sampling":{"temperature":1.0}})";
+        R"("b.weight":{"type":"F32","type_id":0,"shape":[5,2],"bytes":40,"offset":4096}}})";
     basalt::core::Hc8Copy c;
     c.name = "blk.0.hc_attn_down.weight";
     c.rows = 3; c.cols = 64; c.srow = 8;
     c.data.resize(3 * 64 + 3 * 8 * 2);
     for (size_t i = 0; i < c.data.size(); ++i) c.data[i] = (uint8_t) (i * 7);
     std::string err;
-    const std::string hc8 = (d.path / "copies.hc8").string();
-    check(hc8_write(hc8, {c}, err), "hc8_write");
-    std::string hc8_bytes;
-    {
-        std::ifstream f(hc8, std::ios::binary);
-        hc8_bytes.assign(std::istreambuf_iterator<char>(f), {});
-    }
+    const std::string hc8_bytes = hc8_section(c);
     const std::string layout =
         "# experts v5: layer gu_type d_type offset blob_bytes (n_expert 2, total 0)\n";
 
@@ -105,6 +119,10 @@ int main() {
         check(!bad.open(trunc, e2) && e2.find("truncated") != std::string::npos, "a truncated file is refused: " + e2);
         std::ofstream(d.path / "n.basalt") << std::string(70000, 'x');
         check(!bad.open((d.path / "n.basalt").string(), e2), "a file without the magic is refused");
+        const std::string v1 = write_model(d.path / "v1.basalt", {{"meta", meta}}, false, 1);
+        check(!bad.open(v1, e2) && e2.find("version 1") != std::string::npos &&
+                  e2.find("tools/migrations/basalt_v1_to_v2.py") != std::string::npos,
+              "a version 1 file is refused with the migration's name: " + e2);
     }
 
     std::printf("2. meta and the GGUF view\n");
@@ -142,7 +160,6 @@ int main() {
         check(hc8_read(m.range("hc8"), back, err) && back.count(c.name) && back[c.name].data == c.data &&
                   back[c.name].rows == 3 && back[c.name].srow == 8,
               "the hc8 section reads back byte for byte: " + err);
-        check(hc8_read(FileRange(hc8), back, err) && back.size() == 1, "and so does the file");
         hc8_set_table(back);
         check(hc8_find(c.name, 3, 64) != nullptr && hc8_find(c.name, 3, 32) == nullptr && hc8_find("x", 3, 64) == nullptr,
               "hc8_find matches name and shape");

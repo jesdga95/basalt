@@ -212,6 +212,41 @@ void Runtime::rank_swaps(std::vector<Swap>& swaps, bool across) {
     std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
 }
 
+// Up to `room` more swaps over every layer: CPU-tier experts routed about once lately (a count from once_bar up to the
+// main ranking's floor), each against a resident expert at least once_bar below it that no swap of the round takes
+void Runtime::rank_once(std::vector<Swap>& swaps, size_t room) {
+    struct Ent { float u; int32_t rank, layer, e; };
+    std::vector<Ent> cand, vict;
+    std::vector<uint8_t> taken(host_res.size(), 0);
+    for (const Swap& s : swaps) taken[(size_t) s.lout * g.n_expert + s.out] = 1;
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        const float* u = drive.d.usage.data() + l * g.n_expert;
+        const int32_t* r = host_res.data() + l * g.n_expert;
+        for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+            const size_t i = (size_t) (l * g.n_expert + e);
+            if (r[e] >= 0) {
+                if (!taken[i] && u[e] < 1.5f - once_bar) vict.push_back({u[e], prof_rank[i], (int32_t) l, e});
+            } else if (u[e] >= once_bar && u[e] < 1.5f && !(peer.valid() && peer.has(l, e)) &&
+                       !(remote_opt && remote_opt->owns(l, e))) {
+                cand.push_back({u[e], prof_rank[i], (int32_t) l, e});
+            }
+        }
+    }
+    const size_t nc = std::min(room, std::min(cand.size(), vict.size()));
+    if (nc == 0) return;
+    auto key = [](const Ent& x) { return std::make_tuple(x.rank, x.layer, x.e); };
+    std::sort(cand.begin(), cand.end(), [&](const Ent& a, const Ent& b) {
+        return a.u != b.u ? a.u > b.u : key(a) < key(b);
+    });
+    std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(), [&](const Ent& a, const Ent& b) {
+        return a.u != b.u ? a.u < b.u : key(a) > key(b);
+    });
+    for (size_t i = 0; i < nc; ++i) {
+        if (cand[i].u < vict[i].u + once_bar) break;
+        swaps.push_back({cand[i].u - vict[i].u, cand[i].layer, cand[i].e, vict[i].e, vict[i].layer});
+    }
+}
+
 bool Runtime::adapt() {
     if (!pending.empty()) return true;   // the previous swaps are still in flight
     if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
@@ -295,10 +330,12 @@ void Runtime::xq_settle() {
     xq_unsettled = false;
 }
 
-bool Runtime::xq_round() {
+// `ranked`: the round's ranking already made (rank_swaps reads nothing xq_settle changes)
+bool Runtime::xq_round(std::vector<Swap>* ranked) {
     xq_settle();
     std::vector<Swap> swaps;
-    rank_swaps(swaps, xq_across);
+    if (ranked != nullptr) swaps.swap(*ranked);
+    else rank_swaps(swaps, xq_across);
     const size_t n_ranked = swaps.size();
     // the base share goes first, then the peer takes its own from the rest, then a saturated pipeline's extra
     // swaps take what the peer left: a large round never takes the peer's candidates
@@ -306,6 +343,8 @@ bool Runtime::xq_round() {
     const size_t cap = xq_saturated ? base * (size_t) kSatBoost : base;
     xq_saturated = n_ranked >= base * (size_t) kSatRatio;
     if (swaps.size() > cap) swaps.resize(cap);
+    // a round with base share to spare spends it on experts routed about once lately
+    if (xq_across && swaps.size() < base) rank_once(swaps, std::min(base - swaps.size(), kOnceSwaps));
     xq.clear();
     size_t n_noplace = 0;
     const auto& lay = basalt::kernels::cpu::expert_layout();
