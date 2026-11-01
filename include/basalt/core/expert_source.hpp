@@ -110,9 +110,8 @@ const uint8_t* cache_complement_blob_or_fallback(
 int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint64_t base_bytes, uint64_t budget,
                                   int64_t lend_from);
 
-/// The resident RAM mode's room after `base_bytes`: the adaptive swaps' free places (`spare_bytes`) are placed first,
-/// since without them no swap can run, and the lent slots then fill what is left (choose_resident_keep_from).
-/// `spares_fit` says whether the places fit; when they do not, the slots get the whole budget.
+/// Select lent copies first, then admit adaptive swap places if the remaining budget holds all of them.
+/// `spares_fit` says whether the requested places fit.
 int64_t choose_resident_room(const std::vector<uint64_t>& slot_bytes, uint64_t base_bytes, uint64_t budget,
                              int64_t lend_from, uint64_t spare_bytes, bool& spares_fit);
 
