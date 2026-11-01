@@ -1,11 +1,12 @@
-// tests/kernels/cpu/iq_avx2_test.cpp - the AVX2 i-quant rows: the `madd`+`add` build against the AVX-VNNI build, and both
-// against a plain double-precision reference.
+// tests/kernels/cpu/iq_avx2_test.cpp - the AVX2 i-quant rows: the `madd`+`add` build against the AVX-VNNI build,
+// and both against a plain double-precision reference.
 //
 //     build/iq_avx2_test [--bench]
 //
 // The two builds must agree to the bit (the VNNI instructions are the same arithmetic in one step): gate/up rows of
-// IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS, the plain dot rows, and the IQ4_NL down rows, on random weights and
-// activations with the model's row geometry, 1 to 8 tokens, plus weights and activations pinned to their extreme codes.
+// IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS, the plain dot rows, and the IQ4_NL down rows, on random
+// weights and activations with the model's row geometry, 1 to 8 tokens, plus weights and activations pinned to their
+// extreme codes.  The down rows must also not depend on the number of tokens in a call or on the row range.
 // The reference dequantizes the weights and the activation and sums in double; its error is reported (the float order of
 // the kernels differs from it by rounding only). On a CPU without AVX-VNNI the base build is checked against the
 // reference alone. `--bench` prints one row range per format on each build.
@@ -172,6 +173,31 @@ int main(int argc, char** argv) {
                         if (std::memcmp(pb[t], pv[t], H * 4)) { std::printf("MISMATCH IQ4_NL down nt %d mode %d token %d\n", nt, mode, t); ++bad; }
                     }
                 }
+                // width invariance: each token alone gives the bits it gets in the group; row ranges of any length
+                // and start give the bits of the full range
+                for (int v = 0; v < (vnni ? 2 : 1); ++v) {
+                    auto fn = v ? cpu::iq4nl256_down_rows_vnni : cpu::iq4nl256_down_rows_base;
+                    float* const* full = v ? pv : pb;
+                    std::vector<float> one(H, 0.f);
+                    for (int t = 0; t < nt; ++t) {
+                        float* op[1] = {one.data()};
+                        fn(blob.data(), f.d_row, FF, hp + t, 1, op, 0, H);
+                        ++compared;
+                        if (std::memcmp(op[0], full[t], H * 4)) { std::printf("MISMATCH IQ4_NL down %s token %d alone vs nt %d\n", v ? "vnni" : "base", t, nt); ++bad; }
+                    }
+                    std::vector<std::vector<float>> part(nt, std::vector<float>(H, 0.f));
+                    float* pp[MAXT];
+                    for (int t = 0; t < nt; ++t) pp[t] = part[(size_t) t].data();
+                    for (int r = 0; r < H;) {   // ranges of 1..13 rows: every pass width and remainder
+                        const int r1 = std::min(H, r + 1 + (r * 7 + nt) % 13);
+                        fn(blob.data(), f.d_row, FF, hp, nt, pp, r, r1);
+                        r = r1;
+                    }
+                    for (int t = 0; t < nt; ++t) {
+                        ++compared;
+                        if (std::memcmp(pp[t], full[t], H * 4)) { std::printf("MISMATCH IQ4_NL down %s row ranges nt %d token %d\n", v ? "vnni" : "base", nt, t); ++bad; }
+                    }
+                }
                 std::vector<float> wrow(FF);
                 for (int r : {0, 5, 1234, H - 1}) {
                     tr->to_float(blob.data() + (size_t) r * f.d_row, wrow.data(), FF);
@@ -186,8 +212,9 @@ int main(int argc, char** argv) {
         std::printf("  IQ4_NL down rows: vs double reference: max abs %.3g rel %.3g\n", st.max_abs, st.max_rel);
         if (st.max_rel > 1e-3) { std::printf("REFERENCE ERROR too large for IQ4_NL down\n"); ++bad; }
     }
-    // ---- IQ4_NL down rows, the extreme grid: weight nibbles and activation codes pinned to their largest magnitudes, so the
-    // four-wise sums the VNNI build takes in one step are the ones a saturating pair sum would clip first
+    // ---- IQ4_NL down rows, the extreme grid: weight nibbles and activation codes pinned to their largest magnitudes (the
+    // Q8_0 quantizer writes -127..127), so the four-wise sums the VNNI build takes in one step are the ones a saturating
+    // pair sum would clip first
     if (vnni) {
         cpu::NativeFmt f;
         std::string err;
@@ -201,7 +228,7 @@ int main(int argc, char** argv) {
                 for (size_t b = 0; b + 18 <= blob.size(); b += 18)
                     for (int i = 2; i < 18; ++i) blob[b + (size_t) i] = pat;
             }
-            for (int amode = 0; amode < 5; ++amode) {    // random, all 127, all -128, all -127, random 127 / -128
+            for (int amode = 0; amode < 4; ++amode) {    // random, all 127, all -127, random 127 / -127
                 std::vector<std::vector<uint8_t>> hq(MAXT, std::vector<uint8_t>(cpu::kNativeHBytes, 0));
                 for (int t = 0; t < MAXT; ++t)
                     for (int b = 0; b < FF / 32; ++b) {   // block_q8_0: fp16 scale, 32 int8 codes
@@ -213,9 +240,8 @@ int main(int argc, char** argv) {
                             switch (amode) {
                                 case 0: q = (int8_t) ((int) (rng() % 255) - 127); break;
                                 case 1: q = 127; break;
-                                case 2: q = -128; break;
-                                case 3: q = -127; break;
-                                default: q = (rng() & 1) ? 127 : -128; break;
+                                case 2: q = -127; break;
+                                default: q = (rng() & 1) ? 127 : -127; break;
                             }
                             blk[2 + i] = (uint8_t) q;
                         }
@@ -269,6 +295,34 @@ int main(int argc, char** argv) {
                     std::printf("  type %2d nt %d %s: %.2f GB/s (in cache, one thread)\n", type, nt, v ? "vnni" : "base",
                                 (double) reps * 400.0 * (double) f.gu_row / (ms * 1e6));
                 }
+            }
+        }
+    }
+    if (bench) {   // one expert's down rows (2560) per call, one thread, the expert in cache
+        cpu::NativeFmt f;
+        std::string err;
+        cpu::native_fmt(22, 20, H, FF, f, err);
+        std::vector<uint8_t> blob(f.d_row * (size_t) H);
+        fill(blob, 20, 6, 0);
+        std::vector<uint8_t> hq(cpu::kNativeHBytes);
+        std::vector<float> h(FF);
+        for (auto& v : h) v = nd(rng);
+        cpu::native_quant_h(f, h.data(), hq.data());
+        for (int nt : {1, 2, 4}) {
+            const void* hp[MAXT];
+            for (int t = 0; t < nt; ++t) hp[t] = hq.data();
+            std::vector<std::vector<float>> o(nt, std::vector<float>(H));
+            float* op[MAXT];
+            for (int t = 0; t < nt; ++t) op[t] = o[(size_t) t].data();
+            for (int v = 0; v < (vnni ? 2 : 1); ++v) {
+                auto fi = v ? cpu::iq4nl256_down_rows_vnni : cpu::iq4nl256_down_rows_base;
+                const int reps = 200;
+                for (int r = 0; r < 5; ++r) fi(blob.data(), f.d_row, FF, hp, nt, op, 0, H);
+                double t0 = now_ms();
+                for (int r = 0; r < reps; ++r) fi(blob.data(), f.d_row, FF, hp, nt, op, 0, H);
+                const double ui = (now_ms() - t0) * 1e3 / reps;
+                std::printf("  down nt %d %s: IQ4_NL %.1f us (%.2f GB/s) per expert (in cache, one thread)\n",
+                            nt, v ? "vnni" : "base", ui, (double) blob.size() / ui / 1e3);
             }
         }
     }

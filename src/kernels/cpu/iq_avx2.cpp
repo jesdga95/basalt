@@ -89,6 +89,8 @@ void iq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
     else iq256_rows_base(type, w, row_bytes, n, act, nt, out, r0, r1);
 }
 
+bool iq4nl256_fits(int n) noexcept { return n > 0 && n % QK4_NL == 0 && n / QK4_NL <= iq4nl_max_blocks; }
+
 void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt, float* const* out,
                         int r0, int r1) {
     static const bool vnni = cpu_avxvnni_ok();
