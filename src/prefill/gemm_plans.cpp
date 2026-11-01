@@ -500,6 +500,7 @@ bool Gemm::prepare_shapes(const std::vector<Shape>& declared, std::string& err) 
 
 bool Gemm::pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta) {
+    if (beta != 0.0f) return false;
     if (!plans_) {
         int dev = 0;
         if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 16 && prepared_plans_[dev]) {

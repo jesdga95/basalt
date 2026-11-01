@@ -63,7 +63,7 @@ public:
     const uint16_t* bf16_rows(const uint16_t* W, int64_t N, int64_t K);
 
     /// Y = X . W^T with both in FP16 (bits). Prepared zero-beta keys, including T=1, use one algorithm;
-    /// missing keys or refused prepared plans fail. Unprepared and nonzero-beta calls may fall back to cuBLAS.
+    /// missing keys or refused prepared plans fail. Unprepared calls may fall back; nonzero-beta calls use default cuBLAS.
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
 

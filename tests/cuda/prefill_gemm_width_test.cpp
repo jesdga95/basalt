@@ -433,6 +433,45 @@ int main(int argc, char** argv) {
             cublasHandle_t h = nullptr;
             ckb(cublasCreate(&h), "cublasCreate");
             ckb(cublasSetStream(h, st), "cublasSetStream");
+            // Nonzero beta must use the default product without changing the prepared plan.
+            {
+                constexpr int64_t N = 48, K = 2560, LD = 96;
+                std::vector<uint16_t> xh((size_t) K, f2bf(0.5f));
+                std::vector<uint16_t> wh((size_t) N * K, f2bf(0.015625f));
+                std::vector<float> initial((size_t) LD, 0.25f);
+                Dev x(K * 2), w(N * K * 2), y(LD * 4), expected(LD * 4);
+                ck(cudaMemcpy(x.p, xh.data(), xh.size() * 2, cudaMemcpyHostToDevice), "beta x");
+                ck(cudaMemcpy(w.p, wh.data(), wh.size() * 2, cudaMemcpyHostToDevice), "beta w");
+                ck(cudaMemcpy(y.p, initial.data(), initial.size() * 4, cudaMemcpyHostToDevice), "beta y");
+                ck(cudaMemcpy(expected.p, initial.data(), initial.size() * 4, cudaMemcpyHostToDevice), "beta expected y");
+                ck(cudaDeviceSynchronize(), "beta uploads");
+                first.bf16(x.as<uint16_t>(), w.as<uint16_t>(), y.as<float>(), 1, N, K, LD, 1.0f);
+                const float alpha = 1.0f, beta = 1.0f;
+                ckb(cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, N, 1, K, &alpha, w.p, CUDA_R_16BF, K,
+                                 x.p, CUDA_R_16BF, K, &beta, expected.p, CUDA_R_32F, LD,
+                                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), "beta default");
+                ck(cudaStreamSynchronize(st), "beta products");
+                const auto actual = download<float>(y.p, LD), ref = download<float>(expected.p, LD);
+                for (int i = 0; i < N; ++i) {
+                    const double cpu = (double) K * 0.5 * 0.015625 + 0.25;
+                    if (std::memcmp(&actual[i], &ref[i], sizeof(float)) != 0 ||
+                        std::fabs((double) actual[i] - cpu) > 1e-5)
+                        throw std::runtime_error("nonzero-beta result differs from default or CPU reference");
+                }
+                first.bf16(x.as<uint16_t>(), w.as<uint16_t>(), y.as<float>(), 1, N, K, LD);
+                ck(cudaStreamSynchronize(st), "zero-beta after beta");
+                const auto zero1 = download<float>(y.p, LD);
+                first.bf16(x.as<uint16_t>(), w.as<uint16_t>(), y.as<float>(), 1, N, K, LD);
+                ck(cudaStreamSynchronize(st), "repeat zero-beta after beta");
+                const auto zero2 = download<float>(y.p, LD);
+                for (int i = 0; i < N; ++i) {
+                    const double cpu = (double) K * 0.5 * 0.015625;
+                    if (std::memcmp(&zero1[i], &zero2[i], sizeof(float)) != 0 ||
+                        std::fabs((double) zero1[i] - cpu) > 1e-5)
+                        throw std::runtime_error("zero-beta plan after beta is not repeatable or disagrees with CPU");
+                }
+                std::printf("prepared beta fallback and subsequent T=1 plan: ok\n");
+            }
             const Shape s{"ssm_alpha BF16", kBF16, 48, 2560, 96, 1};
             int fails = check_shape(s, st, first, h, 0, true) + check_shape(s, st, second, h, 1, true);
             const Shape narrow{"shexp gate_inp BF16", kBF16, 1, 2560, 1, 1};
