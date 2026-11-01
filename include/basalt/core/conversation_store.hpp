@@ -61,7 +61,8 @@ public:
     ConversationStore& operator=(const ConversationStore&) = delete;
 
     /// Creates `dir` if needed and indexes the files written under `identity`.  `budget` bytes of files at most (every
-    /// identity's files count).  False with `error` when the directory cannot be used.
+    /// identity's files count). Unowned direct-write files are counted but not removed; they can exceed the budget.
+    /// False with `error` when the directory cannot be used.
     bool open(const std::string& dir, uint64_t identity, uint64_t budget, std::string& error);
     bool enabled() const { return open_; }
 
@@ -121,6 +122,7 @@ private:
     void finish_locked(const std::shared_ptr<Job>& job, bool ok, uint64_t wrote, uint64_t whole);
     void drop_read(const std::string& name, uint64_t generation, const std::string& part, std::string& error);
     void unlink_unread_locked();             ///< removes the dropped files no read holds open any more
+    uint64_t stage_bytes_locked() const;
     void evict_locked();
     void drop_locked(size_t index, bool keep_file = false);
     void release_locked(const std::vector<std::string>& refs);
@@ -137,6 +139,7 @@ private:
     std::vector<std::string> unlinked_;       ///< conversation files dropped while open for a read
     std::condition_variable cv_, idle_;
     std::vector<std::unique_ptr<Entry>> entries_;
+    std::vector<std::string> stages_;         ///< unowned direct-write files, counted but never evicted
     std::map<std::string, PartFile> parts_;   ///< block and state files of this identity, by name
     std::deque<std::shared_ptr<Job>> queue_;
     uint64_t queue_bytes_ = 0, clock_ = 0, revision_ = 0, generation_ = 0;

@@ -10,7 +10,6 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <limits>
 #include <string>
 
 #if defined(_WIN32)
@@ -19,8 +18,6 @@
 #include <io.h>      // _fileno, _setmode
 #else
 #include <sys/stat.h>
-#include <signal.h>
-#include <cerrno>
 #include <sys/sysmacros.h>
 #include <unistd.h>
 #endif
@@ -78,16 +75,6 @@ std::optional<std::string> capture_output(const std::vector<std::string>& argv, 
 
 int64_t process_id() { return (int64_t) GetCurrentProcessId(); }
 
-bool process_alive(int64_t pid) {
-    if (pid <= 0 || (uint64_t) pid > (uint64_t) std::numeric_limits<DWORD>::max()) return false;
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD) pid);
-    if (!h) return GetLastError() != ERROR_INVALID_PARAMETER;
-    DWORD code = 0;
-    const bool alive = !GetExitCodeProcess(h, &code) || code == STILL_ACTIVE;
-    CloseHandle(h);
-    return alive;
-}
-
 std::string host_os_name() { return "Windows"; }
 
 std::string python_interpreter(const std::string& src_dir) {
@@ -139,11 +126,6 @@ ThreadWaits threads_in_disk_wait() {
 // --------------------------------------------------------------------------------------------- Linux
 
 int64_t process_id() { return (int64_t) getpid(); }
-
-bool process_alive(int64_t pid) {
-    if (pid <= 0 || (uint64_t) pid > (uint64_t) std::numeric_limits<pid_t>::max()) return false;
-    return kill((pid_t) pid, 0) == 0 || errno != ESRCH;
-}
 
 std::string host_os_name() {
     std::ifstream in("/proc/sys/kernel/osrelease");

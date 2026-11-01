@@ -548,8 +548,8 @@ NameKind name_kind(const std::string& name, const std::string& prefix) {
     return NameKind::kOther;
 }
 
-// Only this identity's direct-write names are eligible for staged-file cleanup.
-bool direct_owner(const std::string& name, const std::string& prefix, int64_t& pid) {
+// Recognize direct-write files without treating them as removable cache entries.
+bool direct_stage(const std::string& name, const std::string& prefix, int64_t& pid) {
     const size_t base = prefix.size();
     const size_t dot = base + 16;
     if (name.rfind(prefix, 0) != 0 || name.size() <= dot + 12 || name.compare(dot, 12, ".bcs.direct.") != 0)
@@ -607,8 +607,10 @@ bool ConversationStore::open(const std::string& dir, uint64_t identity, uint64_t
         const std::string path = dir_ + "/" + f.name;
         if (f.name.find(".bcs.direct.") != std::string::npos) {
             int64_t pid = 0;
-            if (direct_owner(f.name, prefix, pid) && now - f.mtime >= 3600 && !basalt::platform::process_alive(pid))
-                basalt::platform::remove_file(path);
+            bool identity = f.name.size() >= 17 && f.name[16] == '-';
+            for (size_t i = 0; identity && i < 16; ++i)
+                identity = (f.name[i] >= '0' && f.name[i] <= '9') || (f.name[i] >= 'a' && f.name[i] <= 'f');
+            if (identity && direct_stage(f.name, f.name.substr(0, 17), pid)) stages_.push_back(f.name);
             continue;
         }
         if (f.name.size() > 4 && f.name.compare(f.name.size() - 4, 4, ".tmp") == 0) {
@@ -1498,7 +1500,7 @@ bool ConversationStore::write(const ConversationSource& src, std::string& error)
         stats_.whole_bytes += whole;
         ++stats_.written;
     } else {
-        basalt::platform::remove_file(dir_ + "/" + job->name);
+        if (!basalt::platform::remove_file(dir_ + "/" + job->name)) stages_.push_back(job->name);
         release_locked(job->held);
         stats_.written_bytes += wrote;
         ++stats_.dropped;
@@ -1559,9 +1561,18 @@ void ConversationStore::gc_locked(int64_t min_age) {
     }
 }
 
+uint64_t ConversationStore::stage_bytes_locked() const {
+    uint64_t bytes = 0;
+    for (const auto& name : stages_) {
+        uint64_t n = 0;
+        if (basalt::platform::file_size(dir_ + "/" + name, n)) bytes += n;
+    }
+    return bytes;
+}
+
 void ConversationStore::evict_locked() {
     auto total = [&]() {
-        uint64_t t = 0;
+        uint64_t t = stage_bytes_locked();
         for (const auto& e : entries_) t += e->bytes;
         for (const auto& [n, p] : parts_) t += p.bytes;
         return t;
@@ -1854,7 +1865,7 @@ ConversationStore::Stats ConversationStore::stats() const {
     std::lock_guard<std::mutex> lk(mu_);
     Stats s = stats_;
     s.files = 0;
-    s.bytes = 0;
+    s.bytes = stage_bytes_locked();
     for (const auto& e : entries_)
         if (e->mine) { ++s.files; s.bytes += e->bytes; }
     for (const auto& [n, p] : parts_) s.bytes += p.bytes;

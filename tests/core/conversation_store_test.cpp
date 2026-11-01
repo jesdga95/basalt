@@ -681,7 +681,7 @@ int main() {
         clear_dir(d2);
     }
     {
-        // Old staged files from a dead process are reclaimed, but live and unrelated files are left alone.
+        // Staged files are never removed without ownership proof and still count toward the disk budget.
         const std::string d2 = dir + "-stages";
         CHECK(basalt::platform::make_dirs(d2));
         const std::string base = "000000000000002a-0000000000000001.bcs.direct.";
@@ -692,7 +692,7 @@ int main() {
         for (const auto& name : {dead, dead + ".9223372036854775807.tmp", live, other, malformed}) {
             std::FILE* f = basalt::platform::open_file_utf8(d2 + "/" + name, "wb");
             CHECK(f != nullptr);
-            if (f) std::fclose(f);
+            if (f) { std::fputc(1, f); std::fclose(f); }
             std::error_code ec;
             std::filesystem::last_write_time(std::filesystem::u8path(d2 + "/" + name),
                 std::filesystem::file_time_type::clock::now() - std::chrono::hours(2), ec);
@@ -701,13 +701,16 @@ int main() {
         {
             ConversationStore d;
             std::string err;
-            CHECK(d.open(d2, id, 1ull << 30, err));
+            CHECK(d.open(d2, id, 1, err));
             uint64_t bytes = 0;
-            CHECK(!basalt::platform::file_size(d2 + "/" + dead, bytes));
-            CHECK(!basalt::platform::file_size(d2 + "/" + dead + ".9223372036854775807.tmp", bytes));
+            CHECK(d.stats().bytes == 4);
+            CHECK(basalt::platform::file_size(d2 + "/" + dead, bytes));
+            CHECK(basalt::platform::file_size(d2 + "/" + dead + ".9223372036854775807.tmp", bytes));
             CHECK(basalt::platform::file_size(d2 + "/" + live, bytes));
             CHECK(basalt::platform::file_size(d2 + "/" + other, bytes));
             CHECK(basalt::platform::file_size(d2 + "/" + malformed, bytes));
+            CHECK(basalt::platform::remove_file(d2 + "/" + dead));
+            CHECK(d.stats().bytes == 3);
         }
         clear_dir(d2);
     }
