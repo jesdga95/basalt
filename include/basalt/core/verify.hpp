@@ -265,6 +265,9 @@ public:
     void set_post_launch(std::function<void()> f) { post_launch_ = std::move(f); }
     /// runs it now if no window has since (a request ending)
     void flush_post_launch() { if (post_launch_) { auto f = std::move(post_launch_); post_launch_ = nullptr; f(); } }
+    /// `f` runs on the calling thread of the next `run`, once the host has served the last layer's ring (every routed
+    /// entry of the window has been counted) and before the window's end is awaited.
+    void set_served_hook(std::function<void()> f) { served_hook_ = std::move(f); }
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //
@@ -589,6 +592,7 @@ private:
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
     std::function<void()> post_launch_;
+    std::function<void()> served_hook_;
     cudaEvent_t fence_ev_ = nullptr;      // dm_fence
     bool landed_glue_ = true;             // every device-planned layer captured so far ran dec_moe_glue
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit

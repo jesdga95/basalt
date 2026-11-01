@@ -58,6 +58,8 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
 // predecessor's graph raises), then the host serves each stage's rings in turn.
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
+    const std::function<void()> served = std::move(served_hook_);
+    served_hook_ = nullptr;
     for (Verifier* v = this; v != nullptr; v = v->next_)
         if (v->lb_ > 0 && v->h_flag_ != nullptr) *(volatile uint32_t*) (v->h_flag_ + 12) = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -65,7 +67,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         if (!v->run_begin(T, tokens, pos0, err)) return false;
     void* u = user;
     for (Verifier* v = this; v != nullptr; v = v->next_) {
-        if (!v->run_serve(pool, u, err) || !v->run_end(v->next_ == nullptr ? out : nullptr, err)) return false;
+        if (!v->run_serve(pool, u, err)) return false;
+        if (v->next_ == nullptr && served) served();
+        if (!v->run_end(v->next_ == nullptr ? out : nullptr, err)) return false;
         u = v->next_user_;
     }
     return true;

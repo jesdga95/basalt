@@ -295,10 +295,12 @@ void Runtime::xq_settle() {
     xq_unsettled = false;
 }
 
-bool Runtime::xq_round() {
+// `ranked`: the round's ranking already made (rank_swaps reads nothing xq_settle changes)
+bool Runtime::xq_round(std::vector<Swap>* ranked) {
     xq_settle();
     std::vector<Swap> swaps;
-    rank_swaps(swaps, xq_across);
+    if (ranked != nullptr) swaps.swap(*ranked);
+    else rank_swaps(swaps, xq_across);
     const size_t n_ranked = swaps.size();
     // the base share goes first, then the peer takes its own from the rest, then a saturated pipeline's extra
     // swaps take what the peer left: a large round never takes the peer's candidates

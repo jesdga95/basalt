@@ -510,7 +510,7 @@ private:
     void rank_swaps(std::vector<Swap>& swaps, bool across);
     bool adapt();
     void xq_settle();
-    bool xq_round();
+    bool xq_round(std::vector<Swap>* ranked = nullptr);
     bool xq_advance(bool wait);
     bool xq_drain();
     void save_profile(const char* why);
