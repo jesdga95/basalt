@@ -99,7 +99,6 @@ bool Request::refill_one(PfPart& p, std::string& e) {
 // with several stages every stage's copies go out first (each card on its own link), then each is waited
 // for - the same copies into the same slots, so the same cache; one stage: refill_one exactly.
 bool Request::refill(std::string& e) {
-    const auto t_rf = Clock::now();
     int64_t n_lent = 0, n_parts = 0;
     for (PfPart& p : runtime_.pf_parts)
         if (!p.lent.empty()) { n_lent += (int64_t) p.lent.size(); ++n_parts; }
@@ -123,7 +122,6 @@ bool Request::refill(std::string& e) {
 // `chunk` > 0: that chunk (a split read's), its first one `head` tokens (0: none)
 bool Request::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t head) {
     if (runtime_.pf_parts.empty()) return true;                     // its own buffers: nothing to lend
-    const auto t_ln = Clock::now();
     // the ring depth this read's layout uses; every size computed below (and the layout) follows it, and
     // the full depth is restored on the way out for the sizing done elsewhere
     const bool beside = runtime_.batch_on() && (tokens > runtime_.kReadAlone || resumed_chunk > 0);

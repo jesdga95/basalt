@@ -14,6 +14,8 @@
 namespace basalt::program::cli {
 namespace {
 constexpr float kRelaxedDraftingDefault = 0.5f;
+constexpr int kRouteTailSkipDefault = 9;
+constexpr float kRoutePriorDefault = 0.5f;
 }
 
 std::optional<int> parse_options(int argc, char** argv, Options& o, std::string& ppl_base, std::string& ppl_out) {
@@ -123,6 +125,30 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
                     ++i;
                     if (!(v > 0.0f && v <= 1.0f)) { basalt::log::error("basalt", "--relaxed-drafting: P must be in (0, 1]"); return 2; }
                     o.relaxed_drafting = v;
+                }
+            }
+        }
+        else if (a == "--route-tail-skip") {   // the value is optional: an integer 1..9 when one follows
+            o.route_tail_skip = kRouteTailSkipDefault;
+            if (i + 1 < argc) {
+                char* e = nullptr;
+                const long v = std::strtol(argv[i + 1], &e, 10);
+                if (e != argv[i + 1] && *e == '\0') {
+                    ++i;
+                    if (v < 1 || v > 9) { basalt::log::error("basalt", "--route-tail-skip: R must be 1..9"); return 2; }
+                    o.route_tail_skip = (int) v;
+                }
+            }
+        }
+        else if (a == "--route-prior") {   // the value is optional: a number in (0, 16] when one follows
+            o.route_prior = kRoutePriorDefault;
+            if (i + 1 < argc) {
+                char* e = nullptr;
+                const float v = std::strtof(argv[i + 1], &e);
+                if (e != argv[i + 1] && *e == '\0') {
+                    ++i;
+                    if (!(v > 0.0f && v <= 16.0f)) { basalt::log::error("basalt", "--route-prior: LAMBDA must be in (0, 16]"); return 2; }
+                    o.route_prior = v;
                 }
             }
         }
@@ -247,6 +273,15 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
             return 2;
         }
         }
+    }
+    if (o.route_tail_skip > 0 || o.route_prior > 0.0f || o.relaxed_drafting > 0.0f) {
+        basalt::log::warn("basalt", "lossy flags enabled, these flags will affect the accuracy of the served model");
+        if (o.relaxed_drafting > 0.0f)
+            basalt::log::warn("basalt", "--relaxed-drafting %g accepts draft tokens the model would not pick", (double) o.relaxed_drafting);
+        if (o.route_prior > 0.0f)
+            basalt::log::warn("basalt", "--route-prior %g changes expert routing", (double) o.route_prior);
+        if (o.route_tail_skip > 0)
+            basalt::log::warn("basalt", "--route-tail-skip %d drops low-ranked missed experts", o.route_tail_skip);
     }
     return std::nullopt;
 }

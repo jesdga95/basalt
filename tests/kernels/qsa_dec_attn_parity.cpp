@@ -216,7 +216,7 @@ int main(int argc, char** argv) {
         const auto hkq = down(p.kq, (size_t) rows * D), hvq = down(p.vq, (size_t) rows * D);
         const auto hks = down(p.ks, (size_t) rows * D / 64), hvs = down(p.vs, (size_t) rows * D / 64);
         const auto hq = down(q, (size_t) NH * D);
-        auto h2f = [](uint16_t b) { __half h; std::memcpy(&h, &b, 2); return (double) __half2float(h); };
+        auto h2f = [](uint16_t b) { return (double) __half2float(__ushort_as_half(b)); };
         const int cap = 32768;
         const size_t sf = k::qsa_decode_attn_scratch_floats(cap, s);
         float* scr = dalloc<float>(sf);

@@ -1,7 +1,7 @@
 // tests/program/conv_cache_test.cpp - the conversation cache's retention policy: the shared root survives,
 // the leaves rotate by least recent use.
 //
-// The scenarios, in the serve loop's terms (generate.cpp): checkpoints are a prefix chain - stamps[0] is
+// The scenarios, in the serve loop's terms (src/program/serve): checkpoints are a prefix chain - stamps[0] is
 // the root, the deepest point every request so far has shared (the end of the system prompt, in practice).
 // A stamp advances on creation, when a new checkpoint lands on an existing length, and when a request
 // mounts through the checkpoint.

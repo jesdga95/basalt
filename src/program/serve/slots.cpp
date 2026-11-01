@@ -119,6 +119,16 @@ bool Runtime::copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) {
     return true;
 }
 
+// the solo conversation's draft K/V from slot 0's store back into the main sequence once a request in another slot
+// has drafted there; `keep` false: the solo session gave its cells to that request, nothing comes back
+void Runtime::solo_draft_back(bool keep) {
+    if (!solo_draft_in0) return;
+    solo_draft_in0 = false;
+    std::string e;
+    if (keep && live_ok && !live.empty() && !mtp.copy_store(0, mtp.main_store(), (int64_t) live.size(), e))
+        basalt::log::warn("basalt serve", "the solo conversation's draft K/V: %s", e.c_str());
+}
+
 // hashes of everything slot b's sessions hold for its first `upto` tokens, per part (GDN state, PLE history,
 // indexer tails, dead rows, block positions, K, V, scales, pooled rows), for comparing a slot's state window by
 // window against another run of the same request
