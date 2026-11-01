@@ -1,9 +1,8 @@
 // include/basalt/prefill/gemm.hpp - the batched projections of prompt processing.
 //
 // Every projection of a chunk of T tokens is Y[T, N] = X[T, K] . W[N, K]^T with W row-major (the GGUF / pack layout)
-// and FP32 outputs.  Weights are BF16 on the device - either already (the pack's BF16 tensors) or dequantized from
-// their native GGUF blocks into a reusable scratch (`dequant_bf16`) right before the product - and activations are
-// rounded to BF16, which is also what llama.cpp's batched CUDA path does.  Tensor-core GEMM through cuBLAS.
+// and FP32 outputs. Native GGUF weights are dequantized to FP16; BF16 weights are used directly or from scratch.
+// Activations have the corresponding 16-bit type, and cuBLAS accumulates in FP32.
 #pragma once
 
 #include <cstddef>
@@ -63,8 +62,8 @@ public:
     /// scratch cannot hold the N rows at once.
     const uint16_t* bf16_rows(const uint16_t* W, int64_t N, int64_t K);
 
-    /// Y = X . W^T with both in FP16 (bits). Prepared zero-beta shapes use one algorithm across widths;
-    /// unprepared one-row calls and nonzero-beta calls may fall back to cuBLAS.
+    /// Y = X . W^T with both in FP16 (bits). Prepared zero-beta keys, including T=1, use one algorithm;
+    /// missing keys or refused prepared plans fail. Unprepared and nonzero-beta calls may fall back to cuBLAS.
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
 

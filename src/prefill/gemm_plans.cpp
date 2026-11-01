@@ -22,7 +22,7 @@
 
 namespace basalt::prefill {
 
-// A shape keeps one fixed-order algorithm across row counts. Startup checks representative rows and times the
+// A shape keeps one algorithm configuration across row counts. Startup checks representative rows and times the
 // accepted candidates; a shape without a prepared plan is checked on its first eligible call.
 namespace {
 constexpr int64_t kPlanRows[] = {64, 256, 512, 1024, 2048, 4096, 16384, 32768};   // the heuristic's offers
@@ -235,7 +235,7 @@ struct Gemm::Plans {
              {CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
               CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES})
             cublasLtMatmulPreferenceSetAttribute(pref, a, &al, sizeof al);
-        // every fixed-order algorithm offered at any of the sizes, with the sum of its ranks from 256 rows up (an
+        // eligible fixed-split algorithms offered at any of the sizes, with the sum of their ranks from 256 rows up (an
         // absent offer counts as the last rank)
         struct Offer {
             cublasLtMatmulAlgo_t algo;
