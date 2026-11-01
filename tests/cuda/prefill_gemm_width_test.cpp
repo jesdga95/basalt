@@ -9,6 +9,7 @@
 // Gemm and for cublasGemmEx, and the sum per chunk over the model's layers.  Exit 77 without a device.
 #include "basalt/kernels/dequant_bf16.hpp"
 #include "basalt/prefill/gemm.hpp"
+#include "basalt/core/layout.hpp"
 
 #include "basalt/ggml/ggml.h"
 
@@ -26,6 +27,17 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+namespace basalt::core {
+struct WeightTableFixture {
+    static void put(WeightTable& wt, const std::string& name, int64_t n, int64_t k) {
+        WeightRef r;
+        r.ne0 = k;
+        r.ne1 = n;
+        wt.table_[name] = r;
+    }
+};
+}
 
 namespace {
 using basalt::prefill::Gemm;
@@ -291,6 +303,22 @@ template <typename F> double time_us(F&& f, cudaStream_t st, int reps) {
 
 int main(int argc, char** argv) {
     try {
+        {
+            basalt::core::WeightTable wt;
+            basalt::core::ModelGeometry geom;
+            geom.n_layers = 1;
+            basalt::core::WeightTableFixture::put(wt, "blk.0.attn_qkv.weight", 10, 200);
+            basalt::core::WeightTableFixture::put(wt, "blk.0.ssm_alpha.weight", 48, 2560);
+            const auto shapes = Gemm::model_shapes(wt, geom, 600);
+            auto has = [&](bool bf16, int64_t n, int64_t k, int64_t ld, int align) {
+                return std::any_of(shapes.begin(), shapes.end(), [&](const Gemm::Shape& s) {
+                    return s.bf16 == bf16 && s.n == n && s.k == k && s.ldy == ld && s.align == align;
+                });
+            };
+            if (!has(false, 3, 200, 10, 256) || !has(false, 1, 200, 10, 2) ||
+                !has(true, 48, 2560, 96, 64))
+                throw std::runtime_error("model shape catalog missed a split tail or strided projection");
+        }
         int n_dev = 0;
         if (cudaGetDeviceCount(&n_dev) != cudaSuccess || n_dev == 0) {
             std::printf("no CUDA device - skipped\n");
