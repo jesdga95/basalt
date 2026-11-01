@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <tuple>
@@ -19,19 +20,8 @@
 
 namespace basalt::prefill {
 
-// ---- FP16 / BF16 products on one cuBLASLt algorithm per weight shape
-//
-// cublasGemmEx picks a kernel, a tile and a split of K per call, and the call's row count T is part of the shape, so a
-// token's products would depend on the chunk that carries it.  Each shape (input type, N, K, ldy, the operands'
-// alignment) instead takes one algorithm, chosen once and accepted only if it runs every row count of a spread: K in
-// one piece, or in a fixed number of parts summed by a separate reduction.  The candidates come from the heuristic's
-// offers at a range of chunk sizes, never from a timing: first the no-split 64x64-tile kernel (algorithm 21, 32x6
-// stages) when it is offered, as its tile keeps short chunks busy and long ones efficient, then the others by the sum
-// of their ranks across the range.  The configuration does not say everything a kernel does with the row count, so
-// the shape's first call of two or more rows checks a candidate on its own rows: row 0 again in narrower calls, and a
-// later row again at place 0, must give the same bits, else the next candidate runs.  Each output element is
-// then the same arithmetic in the same order at every T.  A shape without such an algorithm, or whose algorithm a
-// call refuses, runs cublasGemmEx from then on.
+// A shape keeps one fixed-order algorithm across row counts. Startup checks representative rows and times the
+// accepted candidates; a shape without a prepared plan is checked on its first eligible call.
 namespace {
 constexpr int64_t kPlanRows[] = {64, 256, 512, 1024, 2048, 4096, 16384, 32768};   // the heuristic's offers
 constexpr int64_t kPlanCheckRows[] = {1, 2, 3, 5, 8, 17, 37, 64, 300, 1000, 4096, 16384, 32768};
@@ -141,6 +131,7 @@ bool Gemm::prepare_lt_handle(std::string& err) {
 
 struct Gemm::Plans {
     cublasLtHandle_t h = nullptr;
+    bool prepared = false;
     struct Plan {
         cublasLtMatmulDesc_t op = nullptr;
         cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;   // b and c hold `rows` rows
@@ -265,7 +256,7 @@ struct Gemm::Plans {
     // 7, 37 and 300 rows (those below T) give their rows the bits of the full call, and whose call of rows [m, R) does
     // too; that candidate becomes the plan's.
     bool settle(Plan& p, cudaDataType_t ty, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N,
-                int64_t K, int64_t ldy, int align, void* ws, size_t ws_bytes, void* stream) {
+                int64_t K, int64_t ldy, int align, void* ws, size_t ws_bytes, void* stream, bool tune = false) {
         int64_t m = 1;   // a later row whose X and Y rows keep the call's alignment
         while (m < T && (alignment(X + m * K) < align || alignment(Y + m * ldy) < align)) ++m;
         const int64_t R = std::min<int64_t>(T, 301);   // the rows compared
@@ -280,6 +271,8 @@ struct Gemm::Plans {
             return rows_back(r0, r1, part.data()) &&
                    std::memcmp(part.data(), full.data() + r0 * N, (size_t) (r1 - r0) * N * 4) == 0;
         };
+        struct Timed { cublasLtMatmulAlgo_t algo; size_t ws; float ms[3]; };
+        std::vector<Timed> timed;
         for (; p.next < p.candidates.size(); ++p.next) {
             cublasLtMatmulAlgo_t& algo = p.candidates[p.next];
             size_t need = 0;
@@ -291,11 +284,44 @@ struct Gemm::Plans {
             if (ok && m < R)
                 ok = run(p, algo, ty, X + m * K, W, Y + m * ldy, R - m, N, K, ldy, ws, ws_bytes, stream) && same(m, R);
             if (!ok) continue;
-            p.algo = algo;
-            p.ws = need;
+            if (!tune) {
+                p.algo = algo;
+                p.ws = need;
+                p.ok = true;
+                p.candidates.clear();
+                return true;
+            }
+            Timed entry{algo, need, {}};
+            cudaEvent_t start = nullptr, stop = nullptr;
+            bool measured = cudaEventCreate(&start) == cudaSuccess && cudaEventCreate(&stop) == cudaSuccess;
+            const int64_t widths[] = {64, 512, 4096};
+            for (int q = 0; measured && q < 3; ++q) {
+                const auto s = (cudaStream_t) stream;
+                measured = run(p, algo, ty, X, W, Y, widths[q], N, K, ldy, ws, ws_bytes, stream) &&
+                           cudaEventRecord(start, s) == cudaSuccess &&
+                           run(p, algo, ty, X, W, Y, widths[q], N, K, ldy, ws, ws_bytes, stream) &&
+                           cudaEventRecord(stop, s) == cudaSuccess && cudaEventSynchronize(stop) == cudaSuccess &&
+                           cudaEventElapsedTime(&entry.ms[q], start, stop) == cudaSuccess && entry.ms[q] > 0;
+            }
+            if (start) cudaEventDestroy(start);
+            if (stop) cudaEventDestroy(stop);
+            if (measured) timed.push_back(entry);
+            if (timed.size() == 8) break;
+        }
+        if (!timed.empty()) {
+            float best[3] = {timed[0].ms[0], timed[0].ms[1], timed[0].ms[2]};
+            for (const auto& e : timed) for (int q = 0; q < 3; ++q) best[q] = std::min(best[q], e.ms[q]);
+            size_t selected = 0;
+            auto score = [&](const Timed& e) {
+                return e.ms[0] / best[0] + e.ms[1] / best[1] + e.ms[2] / best[2];
+            };
+            for (size_t q = 1; q < timed.size(); ++q)
+                if (score(timed[q]) < score(timed[selected])) selected = q;
+            p.algo = timed[selected].algo;
+            p.ws = timed[selected].ws;
             p.ok = true;
             p.candidates.clear();
-            return true;   // Y holds the full product: the reruns wrote the same bits
+            return true;
         }
         p.candidates.clear();
         basalt::log::warn("basalt", "prefill gemm: no fixed cuBLASLt algorithm for %s %lld x %lld: cublasGemmEx, "
@@ -325,7 +351,7 @@ bool Gemm::prepare_model(const core::WeightTable& wt, const core::ModelGeometry&
         err = "prefill gemm: startup plan workspace";
         return false;
     }
-    constexpr int64_t rows = 301;
+    constexpr int64_t rows = 301, buffer_rows = 4096;
     const auto& shapes = g_model_shapes[dev];
     for (size_t i = 0; i < shapes.size();) {
         const Shape& shape = shapes[i];
@@ -333,8 +359,8 @@ bool Gemm::prepare_model(const core::WeightTable& wt, const core::ModelGeometry&
         while (end < shapes.size() && shapes[end].bf16 == shape.bf16 && shapes[end].n == shape.n &&
                shapes[end].k == shape.k && shapes[end].ldy == shape.ldy) ++end;
         const uint64_t nw = (uint64_t) shape.n * (uint64_t) shape.k;
-        const uint64_t nx = (uint64_t) rows * (uint64_t) shape.k;
-        const uint64_t ny = (uint64_t) rows * (uint64_t) shape.ldy;
+        const uint64_t nx = (uint64_t) buffer_rows * (uint64_t) shape.k;
+        const uint64_t ny = (uint64_t) buffer_rows * (uint64_t) shape.ldy;
         if (nw > (256ull << 20) / 2 || nx > (256ull << 20) / 2 || ny > (256ull << 20) / 4) {
             err = "prefill gemm: startup plan shape exceeds temporary buffer limit";
             return false;
@@ -361,11 +387,12 @@ bool Gemm::prepare_model(const core::WeightTable& wt, const core::ModelGeometry&
             auto& p = plans->plan(ty, shape.n, shape.k, shape.ldy, a);
             if (!p.candidates.empty())
                 plans->settle(p, ty, xp, (const uint16_t*) w.p, (float*) y.p, rows, shape.n, shape.k, shape.ldy,
-                              a, ws.p, kPlanWs, nullptr);
+                              a, ws.p, kPlanWs, nullptr, true);
         }
         i = end;
     }
     delete prepared_plans_[dev];
+    plans->prepared = true;
     prepared_plans_[dev] = plans.release();
     return true;
 }
@@ -392,17 +419,35 @@ bool Gemm::pinned(int type, const uint16_t* X, const uint16_t* W, float* Y, int6
     if (plans_->h == nullptr) return false;
     const cudaDataType_t ty = (cudaDataType_t) type;
     const int align = std::min(alignment(X), std::min(alignment(W), alignment(Y)));
+    const Plans::Key key{type, N, K, ldy, align};
+    const auto found = plans_->plans.find(key);
+    if (plans_->prepared && (found == plans_->plans.end() || !found->second.ok) && T >= 2 && beta == 0.0f) {
+        basalt::log::error("basalt", "prefill gemm: no prepared plan for %s %lld x %lld stride %lld alignment %d",
+                           ty == CUDA_R_16BF ? "BF16" : "FP16", (long long) N, (long long) K,
+                           (long long) ldy, align);
+        std::exit(1);
+    }
     Plans::Plan& p = plans_->plan(ty, N, K, ldy, align);
     if (!p.ok) {
         // the candidates are checked on a call of two or more rows that overwrites Y; until then cublasGemmEx
         if (p.candidates.empty() || T < 2 || beta != 0.0f) return false;
         return plans_->settle(p, ty, X, W, Y, T, N, K, ldy, align, workspace_, ws_bytes_, stream_);
     }
-    if (p.ws > ws_bytes_ || !plans_->rows(p, ty, T, N, K, ldy)) return false;
+    if (p.ws > ws_bytes_ || !plans_->rows(p, ty, T, N, K, ldy)) {
+        if (plans_->prepared && T >= 2 && beta == 0.0f) {
+            basalt::log::error("basalt", "prefill gemm: prepared plan workspace or layout unavailable");
+            std::exit(1);
+        }
+        return false;
+    }
     const float alpha = 1.0f;
     if (cublasLtMatmul(plans_->h, p.op, &alpha, W, p.a, X, p.b, &beta, Y, p.c, Y, p.c, &p.algo, workspace_, ws_bytes_,
                        (cudaStream_t) stream_) != CUBLAS_STATUS_SUCCESS) {
         p.ok = false;
+        if (plans_->prepared && T >= 2 && beta == 0.0f) {
+            basalt::log::error("basalt", "prefill gemm: prepared plan refused");
+            std::exit(1);
+        }
         basalt::log::warn("basalt", "prefill gemm: cublasLtMatmul refused %s %lld x %lld x %lld: cublasGemmEx for this "
                                     "shape from here",
                           ty == CUDA_R_16BF ? "BF16" : "FP16", (long long) T, (long long) N, (long long) K);
