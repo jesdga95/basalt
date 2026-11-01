@@ -64,7 +64,7 @@ pick matters. The other settings with machine-dependent defaults, and why it lea
 | `pool-workers` | yes | the CPU expert time per worker count, from `PROBE rates` | 0 (part of the rates) |
 | `prefill-cpu-share` | yes | timed 8192-token chunks at share 0, 1, the balance and the default | the chunks, a few seconds |
 | `adapt-every`, `adapt-swaps`, `adapt-decay` | yes | each setting from the start placement in the loaded engine (`PROBE adapt`), no restart; a reset scores within noise of a fresh engine's first requests ([adaptive tier](configuration/adaptive.md)) | 35 (two cards) to 46 (one card): 5 runs of 7 to 9 s, each reset under 1 s |
-| `expert-profile-save` | yes | the saved file against the model's profile, same setting, same sequence | one of those runs |
+| `expert-profile-save` | yes | the saved file against the engine's profile, same setting, same sequence | one of those runs |
 | `peer-adapt-swaps` | no | fewer peer swaps lost on every workload measured; it follows `adapt-swaps` | 0 |
 | `vram-reserve-mib`, `peer-reserve-mib` | no | lower reserves add about 1% more slots, inside run noise; they guard against paging and the start says when one is short | 0 |
 | `spec` | no | fixed at start (no per-request value), and spec 7 against 8 differs by 1-2%, inside one run's noise | 0 |

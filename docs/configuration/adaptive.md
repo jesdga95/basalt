@@ -22,6 +22,11 @@ prose, four seeds) ranking every layer together cut the window cost by 1.9% at t
 a request's first 50 windows. A promotion that kept its peer copy cost the GPUs one expert each: after a long JSON
 reply a fifth of the peer's slots held such copies, and in the standard bench order on one server (conv, struct,
 prose; four seeds) prose ran 269 tok/s and struct 562, against 284 and 573 with the slot handed over.
+A round that ranks fewer swaps than `adapt-swaps` spends up to 16 of the rest on CPU-tier experts routed about once
+lately (a count from 1 up to the ranking's floor), each against a resident expert at least one routing below it: prose touches
+many experts a few times each, and those stay on the CPU under the main ranking. On two cards (400 W + 180 W, cold
+prose, two seeds) it cut the window cost at the same window widths by about 3% after the first 150 windows; without
+the limit of 16 a JSON reply ran 1.2% slower.
 
 Moving an expert changes which tier computes its rows (the CPU rounds differently from the GPU), so output with
 adaptation on is not bit-identical from run to run; see [precision](../precision/index.md).

@@ -225,7 +225,8 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/qsa_dec_fused.cu
                         src/kernels/cuda/q5k_head.cu
                         src/kernels/cuda/q6k_head.cu
-                        src/kernels/cuda/q80_head.cu
+                        src/kernels/cuda/q80_proxy.cu
+                        src/kernels/cuda/q80_vhead.cu
                         src/kernels/cuda/qsa_prompt_attn.cu
                         src/kernels/cuda/fused_gdn.cu
                         src/kernels/cuda/dequant_bf16.cu
@@ -234,6 +235,7 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/dec_gdn_rec.cu
                         src/kernels/cuda/dense_tc.cu
                         src/kernels/cuda/mid_chain.cu
+                        src/kernels/cuda/qsa_mid.cu
                         src/kernels/cuda/wait_abort.cu
                         src/kernels/cuda/iq_kernels.cu
                         src/kernels/ngram.cpp
@@ -273,7 +275,8 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
     src/kernels/cuda/qsa_dec_fused.cu
     src/kernels/cuda/q5k_head.cu
     src/kernels/cuda/q6k_head.cu
-    src/kernels/cuda/q80_head.cu
+    src/kernels/cuda/q80_proxy.cu
+    src/kernels/cuda/q80_vhead.cu
     PROPERTIES COMPILE_OPTIONS "--use_fast_math")
 
 # ---- engine -----------------------------------------------------
@@ -525,7 +528,7 @@ set_target_properties(basalt PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
 target_link_libraries(basalt PRIVATE engine engine_session grammar tokenizer prefill spec ${_gpu_runtime_target})
 basalt_embed_manifest(basalt)
-# `basalt serve` runs the Python server from the source tree
+# `basalt serve` runs the Python server from the source tree; the engine reads its expert profiles from data/profiles
 target_compile_definitions(basalt PRIVATE BASALT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # The standard benchmark: a host-only program that drives the engine over its stdin/stdout protocol.
@@ -713,6 +716,9 @@ if(NOT _iq_python STREQUAL "")
   basalt_cpu_test(NAME convert_tests COMMAND ${_iq_python} -m unittest discover -s tools/convert -p "test_*.py"
            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   set_tests_properties(convert_tests PROPERTIES TIMEOUT 300)
+  # the v1 -> v2 file migration on a tiny file
+  basalt_cpu_test(NAME migration_tests COMMAND ${_iq_python} -m unittest discover -s tools/migrations -p "test_*.py"
+           WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 else()
   message(STATUS "basalt tests: no python3 with numpy was found (the configured interpreter and .venv "
                  "were probed) - the iq_parity fixtures and its test and the converter tests are not registered; "
@@ -833,6 +839,11 @@ target_link_libraries(mid_chain_hold PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME mid_chain_hold COMMAND mid_chain_hold 1 --hold 50)
 basalt_gpu_test(NAME mid_chain_hold_abort COMMAND mid_chain_hold 1 --hold 600)
 set_tests_properties(mid_chain_hold mid_chain_hold_abort PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+add_executable(qsa_mid_parity tests/kernels/qsa_mid_parity.cpp)
+target_include_directories(qsa_mid_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(qsa_mid_parity PRIVATE kernels ggml_quants ${_gpu_runtime_target})
+basalt_gpu_test(NAME qsa_mid_parity COMMAND qsa_mid_parity)
+set_tests_properties(qsa_mid_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 add_executable(gr_parity tests/kernels/gr_parity.cpp)
 target_include_directories(gr_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(gr_parity PRIVATE kernels ${_gpu_runtime_target})
@@ -965,10 +976,14 @@ add_executable(q5k_head_parity tests/kernels/q5k_head_parity.cpp)
 target_include_directories(q5k_head_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(q5k_head_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME q5k_head_parity COMMAND q5k_head_parity 20000 5)
-add_executable(q80_head_parity tests/kernels/q80_head_parity.cpp)
-target_include_directories(q80_head_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(q80_head_parity PRIVATE kernels ${_gpu_runtime_target})
-basalt_gpu_test(NAME q80_head_parity COMMAND q80_head_parity 20000 5)
+add_executable(q80_proxy_parity tests/kernels/q80_proxy_parity.cpp)
+target_include_directories(q80_proxy_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(q80_proxy_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME q80_proxy_parity COMMAND q80_proxy_parity 100000 200)
+add_executable(q80_vhead_parity tests/kernels/q80_vhead_parity.cpp)
+target_include_directories(q80_vhead_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(q80_vhead_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME q80_vhead_parity COMMAND q80_vhead_parity 20000 3)
 add_executable(q6k_head_parity tests/kernels/q6k_head_parity.cpp)
 target_include_directories(q6k_head_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(q6k_head_parity PRIVATE kernels ${_gpu_runtime_target})
