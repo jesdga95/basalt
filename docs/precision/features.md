@@ -49,6 +49,18 @@ about 10% of the KLD and 0.4 points of top-1. On long prompts (12 chunks of 4,09
 PPL goes from 2.9547 to 2.9816; paired NLL +0.0091 (95% CI +0.0049 to +0.0132). Q6_K dense runs through dense_tc and
 dense_tc_pair; the same arithmetic applies as for any Q6_K dense tensor (q8_1 activations, int8 tensor-core dot).
 
+## BF16 PLE tables
+
+`--checkpoint` and BF16 GGUF preserve n-gram shards byte for byte in `per_layer_token_embd.weight` (GGML type 30), without a flag. FP8 checkpoint tables still become Q8_0.
+Without runtime quantization, direct, mapped and RAM-locked reads widen BF16 exactly to fp32, with no FP16 intermediate. IQ4_NL, Q5_0 and Q8_0 retain their decoding.
+BF16 adds 44.704 GiB on disk, not in VRAM; the bounded row cache uses the stored row size. Direct reads do not load the whole table; RAM mode requires it.
+
+`--ple-io ram --ple-ram-quant q8_0` locks the final Q8_0 RAM first, then packs in the background or on demand with the same CPU reference encoder; default `none` preserves BF16.
+The source is unchanged. Widening Q8_0 cannot recover lost bits: rebuild from BF16 sources. Dimensions, storage costs and runtime behavior: [CPU PLE quantization](../model-file.md#cpu-ple-quantization-in-ram).
+
+Storage parity: all 128 shards of a full BF16 table match source SHA-256 hashes. Native reader tests check exact fp32 bits across direct/mapped, cached, prefetched and batched reads, including values outside FP16's range.
+Existing Q8_0-PLE inference matches the previous build over 900 greedy tokens with fixed expert tiers. BF16 changes inputs relative to Q8_0; its Q8_0-reference PPL/KLD gate is not measured here.
+
 ## Two-stage verify head
 
 A Q6_K output head (the IQ3_S pack's) runs in two stages in the verify window (`q6k_vhead`, q6k_head.cu). Every one of the

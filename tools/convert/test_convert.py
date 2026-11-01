@@ -183,6 +183,42 @@ class ConvertTest(unittest.TestCase):
         self.assertEqual(lic["quantized_by"], "Someone")
         self.assertEqual(set(lic), {"name", "text", "quantized_by"})
 
+    def test_ple_formats_survive_gguf_and_pack_copy(self):
+        from unittest.mock import patch
+        import gguf_writer
+
+        source = S.SourceModel([self.gguf])
+        for type_name, type_id, row_bytes in (("BF16", 30, 320), ("IQ4_NL", 20, 90),
+                                               ("Q5_0", 6, 110), ("Q8_0", 8, 170)):
+            with self.subTest(type_name=type_name):
+                g = GGUFWriter()
+                for key, value in source.files[0].metadata.items():
+                    g.add(key, value)
+                for name, (_, info, _) in source.where.items():
+                    if name not in ("per_layer_token_embd.weight", "blk.0.attn_q.weight"):
+                        g.add_raw(name, info.shape, info.type_name, source.bytes(name).tobytes())
+                if type_name == "BF16":
+                    raw = np.resize(np.array([0x0001, 0x8000, 0x4780, 0xFF7F, 0x3F81], dtype="<u2"),
+                                    3 * 160).tobytes()
+                else:
+                    block_bytes = row_bytes // 5
+                    raw = b"".join(struct.pack("<H", 0x3C00) + bytes([i]) * (block_bytes - 2) for i in range(15))
+                g.add_raw("per_layer_token_embd.weight", [160, 3], type_name, raw)
+                g.add_raw("blk.0.attn_q.weight", [256, 1], "Q8_0", S.q8_0(np.ones(256, dtype=np.float32)))
+                path = self.t / f"{type_name}.gguf"
+                with patch.dict(gguf_writer.TYPE_IDS, {type_name: type_id}):
+                    g.write(path)
+                out = self.t / f"{type_name}.basalt"
+                convert.convert(self.args(gguf=[str(path)], out=str(out)))
+                copied = self.t / f"{type_name}-q6k.basalt"
+                convert.requant_dense(self.args(out=str(copied), requant_dense_q6k=str(out), checkpoint=None, workers=2))
+                for packed in (out, copied):
+                    pack = ModelFile(str(packed))
+                    info = json.loads(pack.read("meta"))["tensors"]["per_layer_token_embd.weight"]
+                    self.assertEqual((info["type"], info["type_id"], info["shape"], info["bytes"]),
+                                     (type_name, type_id, [160, 3], 3 * row_bytes))
+                    self.assertEqual(pack.read("gguf")[info["offset"]:info["offset"] + info["bytes"]], raw)
+
     def test_without_hc8_or_drafter(self):
         convert.convert(self.args(hc8=None))
         m = self.model()

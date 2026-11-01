@@ -5,8 +5,8 @@
 //   * `ngram_rows` - the HOST hash.  Sixteen row indices per token from the last three token ids, computed
 //     with 64-bit multiply/xor and no tensor op at all.  The source computes it on the host
 //     because "ggml has no int64 and no xor".
-//   * `PleTable`  - the row gather.  `per_layer_token_embd.weight` is IQ4_NL and is NOT IN THE DENSE POOL: it is
-//     51.2e9 elements (28.8 GB) and is read straight from the source GGUF section of the model file.
+//   * `PleTable` - the row gather. `per_layer_token_embd.weight` is BF16, IQ4_NL, Q5_0 or Q8_0 and is NOT IN
+//     THE DENSE POOL: it is read straight from the source GGUF section of the model file.
 //
 // THE HASH IS THE ONE PLACE IN THIS MODEL WHERE A WRONG BIT IS SILENTLY PLAUSIBLE.  Every one of its
 // properties has a rival reading that produces a valid index in range:
@@ -40,13 +40,14 @@ inline constexpr int NG_HIST = (PLE_CONV_KERNEL - 1) * NGRAM_SIZE;       // 9
 inline constexpr int32_t TOKEN_NULL = -1;       // LLAMA_TOKEN_NULL
 inline constexpr float NG_RMS_EPS = 1e-6f;
 
-// The table: [160, 320001536] IQ4_NL.  ne0 = 160 is the FAST axis, so one row is 160 contiguous elements =
-// 5 blocks of 32 at 18 bytes = 90 bytes.  The head-slowest flatten then makes 16 rows exactly n_embd = 2560.
+// The table: [160, 320001536]. ne0 = 160 is the FAST axis, so each row holds 160 contiguous values.
+// The head-slowest flatten makes 16 rows exactly n_embd = 2560.
 inline constexpr uint64_t PLE_TABLE_ROWS = 320001536ull;
 inline constexpr int PLE_ROW_BYTES = (PLE_HEAD_DIM / 32) * 18;           // 90: an IQ4_NL row
 inline constexpr int PLE_ROW_BYTES_Q5_0 = (PLE_HEAD_DIM / 32) * 22;       // 110: a Q5_0 row
 inline constexpr int PLE_ROW_BYTES_Q8_0 = (PLE_HEAD_DIM / 32) * 34;       // 170: a Q8_0 row
-inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_Q8_0;
+inline constexpr int PLE_ROW_BYTES_BF16 = PLE_HEAD_DIM * 2;             // 320: a BF16 row
+inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_BF16;
 
 /// The artifact's own hash constants, transcribed from the GGUF metadata:
 ///
@@ -110,11 +111,15 @@ enum class PleIo { Direct, Mmap };
 struct PleIoOptions {
     PleIo mode = PleIo::Direct;
     uint32_t max_inflight = 256;     ///< outstanding SSD reads (decode needs 16; a prompt chunk saturates the SSD at 256)
-    uint64_t cache_rows = 1u << 20;  ///< bounded row cache: 1,048,576 rows x 90 B ~ 95 MB; 0 disables
+    uint64_t cache_rows = 1u << 20;  ///< bounded row cache: capacity in rows; storage uses the table's row size
     /// Mmap mode only (`--ple-io ram`): lock the whole mapped table in RAM at open, so no SSD read ever sits on
     /// the prompt or token path. Needs RAM for the full table. Locked through the platform helper (`mlock` on
     /// Linux, the working-set minimum plus `VirtualLock` on Windows); `locked()` reports the outcome.
     bool lock = false;
+    /// Locked Mmap mode only: allocate resident Q8_0 RAM, then pack BF16 in the background/on demand.
+    bool quantize_q8_0 = false;
+    /// Background CPU workers, resolved by the caller from its existing worker policy.
+    int quant_workers = 1;
     /// Direct mode: keep the SSD awake while rows are asked for - one page of the table
     /// after this long without a read (0 = off), until `keepalive_window_s` after the last request for rows
     /// (see PleReader::set_keepalive).
@@ -173,15 +178,17 @@ public:
     /// True when `PleIoOptions::lock` was asked for and the whole table was locked (false: pages only pre-touched).
     bool locked() const;
     uint64_t rows() const;
-    /// "IQ4_NL" or "Q5_0".
+    /// "BF16", "IQ4_NL", "Q5_0" or "Q8_0".
     const char* format() const;
 
     /// 16 row indices -> 2560 floats.  The gathered rows are flattened HEAD-SLOWEST: row h's 160 values
     /// occupy `out[h*160, (h+1)*160)`, which is what `ggml_get_rows` does and what makes the result a plain
     /// n_embd-wide vector for the block that consumes it.
+    /// Owned Q8_0 conversion failures throw std::runtime_error; bool gather APIs report them through err.
     void gather(const uint32_t* rows16, float* out2560) const;
 
     /// One row -> 160 floats, for diagnostics and for the parity test's oracle comparison.
+    /// Owned Q8_0 conversion failures throw std::runtime_error; out-of-range rows still produce zeros.
     void read_row(uint32_t row, float* out160) const;
 
     /// Bytes actually touched since `open`, for the "how often is it not ready" measurement.

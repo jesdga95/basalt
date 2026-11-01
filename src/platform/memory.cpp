@@ -572,6 +572,40 @@ bool drop_mapped_view(const void* base, uint64_t view_bytes, uint64_t off, uint6
 
 // ---------------------------------------------------------------------------------------------------- host regions
 
+namespace {
+bool region_budget_allows(uint64_t bytes, uint64_t reserve, std::string& note) {
+    if (bytes > UINT64_MAX - reserve) {
+        note = "region size plus reserve overflows";
+        return false;
+    }
+    const uint64_t need = bytes + reserve;
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) {
+        if (need > ms.ullAvailPhys) {
+            note = "region plus reserve needs " + std::to_string(need) + " B of RAM; only " +
+                   std::to_string(ms.ullAvailPhys) + " B available";
+            return false;
+        }
+        if (need > ms.ullAvailPageFile) {
+            note = "region plus reserve needs " + std::to_string(need) + " B of commit; only " +
+                   std::to_string(ms.ullAvailPageFile) + " B available";
+            return false;
+        }
+    }
+#else
+    const uint64_t avail = available_memory();
+    if (avail > 0 && need > avail) {
+        note = "region plus reserve needs " + std::to_string(need) + " B of RAM; only " +
+               std::to_string(avail) + " B available";
+        return false;
+    }
+#endif
+    return true;
+}
+}  // namespace
+
 #if defined(_WIN32)
 namespace {
 // A size in GiB, for the notes that have to say how big something was.
@@ -596,37 +630,49 @@ std::string commit_headroom_note() {
 
 
 static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
-                              uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {
+                              uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes,
+                              const uint64_t* reserve = nullptr) {
     mapping_base = nullptr;
     mapping_bytes = 0;
     if (!shared_file.empty()) {
         note = "shared arena files are not available on Windows";
         return nullptr;
     }
+    if (reserve != nullptr && !region_budget_allows(bytes, *reserve, note)) return nullptr;
     // MEM_LARGE_PAGES needs SeLockMemoryPrivilege, and the account having it assigned is not enough: the process
     // enables it in its own token first. An account without the assignment fails here and falls through to the
     // ordinary allocation below, which is the expected outcome rather than an error.
     enable_privilege(L"SeLockMemoryPrivilege");
     const SIZE_T large = GetLargePageMinimum();
-    if (large > 0) {
+    if (large > 0 && bytes <= SIZE_MAX - (large - 1)) {
         // The requested size must be an exact multiple of the large-page minimum; the slack is under one page.
         const SIZE_T lbytes = (SIZE_T) (((SIZE_T) bytes + large - 1) / large * large);
-        void* p = VirtualAlloc(nullptr, lbytes, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+        void* p = nullptr;
+        // Large-page rounding is real RAM too; if only the exact-size normal allocation fits, fall back.
+        const bool large_fits = reserve == nullptr || region_budget_allows(lbytes, *reserve, note);
+        if (large_fits) p = VirtualAlloc(nullptr, lbytes, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
         if (p != nullptr) {
             got = RegionBacking::LargePages;
+            mapping_base = p;
+            mapping_bytes = lbytes;
             note = "large pages (" + std::to_string((unsigned long long) large) + " B)";
             return p;
         }
         // ERROR_NO_SYSTEM_RESOURCES is the page pool declining, ERROR_PRIVILEGE_NOT_HELD is the token and
         // ERROR_INVALID_PARAMETER a size that is not a multiple of the minimum. They need different fixes, so the
         // note carries the number.
-        note = "large pages refused for " + std::to_string((unsigned long long) lbytes) +
-               " B (GetLargePageMinimum=" + std::to_string((unsigned long long) large) + ", VirtualAlloc error " +
-               std::to_string((unsigned long long) GetLastError()) + "); using 4 KB pages";
+        if (large_fits) {
+            note = "large pages refused for " + std::to_string((unsigned long long) lbytes) +
+                   " B (GetLargePageMinimum=" + std::to_string((unsigned long long) large) + ", VirtualAlloc error " +
+                   std::to_string((unsigned long long) GetLastError()) + "); using 4 KB pages";
+        } else {
+            note += "; large-page rounding exceeds budget; using 4 KB pages";
+        }
     } else {
-        note = "this system has no large-page minimum; using 4 KB pages";
+        note = "large-page size unavailable or rounding overflows; using 4 KB pages";
     }
     {
+        if (reserve != nullptr && !region_budget_allows(bytes, *reserve, note)) return nullptr;
         // Reserve first, then commit in chunks.  A single MEM_COMMIT over the whole arena only ever says that the
         // allocation failed, and whether it can succeed depends on RAM plus page file together, which is not known
         // before the commit reaches that far.  Committing a chunk at a time makes the failure name the size it
@@ -697,7 +743,8 @@ static_assert(sizeof(SharedArenaHeader) <= kSharedArenaHeaderBytes);
 }  // namespace
 
 static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
-                              uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {
+                              uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes,
+                              const uint64_t* reserve = nullptr) {
     mapping_base = nullptr;
     mapping_bytes = 0;
     if (!shared_file.empty()) {
@@ -787,12 +834,15 @@ static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& n
         note = "MAP_SHARED file " + shared_file + " (model hash checked)";
         return (uint8_t*) map + kSharedArenaHeaderBytes;
     }
+    if (reserve != nullptr && !region_budget_allows(0, *reserve, note)) return nullptr;
 
     {
         void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
         if (p != MAP_FAILED) {
             got = RegionBacking::LargePages;
+            mapping_base = p;
+            mapping_bytes = (bytes + (2ull << 20) - 1) & ~((2ull << 20) - 1);
             note = "hugetlb 2 MB pages";
             return p;
         }
@@ -809,6 +859,7 @@ static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& n
         note = "MAP_HUGETLB unavailable (needed " + std::to_string(need) + " 2 MiB pages, vm.nr_hugepages=" +
                (have_pool ? std::to_string(pool) : std::string("?")) + "); using 4 KB pages";
     }
+    if (reserve != nullptr && !region_budget_allows(bytes, *reserve, note)) return nullptr;
     // No hugetlb mapping: a 2 MiB-aligned anonymous mapping with MADV_HUGEPAGE, so transparent huge pages back
     // it where THP is "madvise" (the common distro default). The CPU expert pool streams whole experts out of
     // this arena; with 4 KB pages every 3 MB expert costs ~750 TLB misses.
@@ -846,6 +897,40 @@ void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const 
     if (p != nullptr && mapping_base == nullptr) {   // not a file mapping: the region is what gets released
         mapping_base = p;
         mapping_bytes = bytes;
+    }
+    return p;
+}
+
+void* alloc_region_budgeted(uint64_t bytes, uint64_t reserve_bytes, RegionBacking& got, std::string& note,
+                            void*& mapping_base, uint64_t& mapping_bytes) {
+    mapping_base = nullptr;
+    mapping_bytes = 0;
+    got = RegionBacking::NormalPages;
+    // Include the allocator's alignment padding in the representability check, before any OS operation.
+    constexpr uint64_t padding = 2ull << 20;
+    if (bytes == 0 || bytes > SIZE_MAX - padding || bytes > UINT64_MAX - reserve_bytes) {
+        note = "invalid region size or region plus reserve overflows";
+        return nullptr;
+    }
+    if (!region_budget_allows(0, reserve_bytes, note)) return nullptr;
+#if defined(_WIN32)
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    const uint64_t page = si.dwPageSize;
+#else
+    const long ps = sysconf(_SC_PAGE_SIZE);
+    if (ps <= 0) { note = "cannot determine region page size"; return nullptr; }
+    const uint64_t page = (uint64_t) ps;
+#endif
+    const uint64_t rounded = (bytes + page - 1) / page * page;
+    if (rounded > UINT64_MAX - reserve_bytes) {
+        note = "page-rounded region plus reserve overflows";
+        return nullptr;
+    }
+    void* p = alloc_region_raw(rounded, got, note, "", 0, mapping_base, mapping_bytes, &reserve_bytes);
+    if (p != nullptr && mapping_base == nullptr) {
+        mapping_base = p;
+        mapping_bytes = rounded;
     }
     return p;
 }

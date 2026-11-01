@@ -28,8 +28,9 @@ From an NVFP4 checkpoint (--sections-from with --checkpoint)
                      their E2M1 codes and UE4M3 scales, moved into Basalt's blocks with the FP32 tail {s_gate, s_up,
                      s_down, 0} from weight_scale_2; the projections are quantized once from BF16 to Q6_K (Q8_0 where
                      rows are not whole 256-value blocks, and for the output head and token embedding); the other
-                     tensors keep BF16 or become F32/F16 as the engine reads them; the n-gram table is FP8 code x scale
-                     as Q8_0. The GGUF metadata and the tokenizer come from the checkpoint's files.
+                     tensors keep BF16 or become F32/F16 as the engine reads them; the n-gram table stays BF16
+                     for BF16 shards, or becomes Q8_0 for FP8 codes times their scale. The GGUF metadata and
+                     the tokenizer come from the checkpoint's files.
   --dense-q8-0       Q8_0 projections instead of Q6_K (the 8-bit dense variant)
   The drafter, profile and vision sections come from BASE byte for byte; BASE's vocabulary must be the checkpoint's.
 
@@ -367,7 +368,7 @@ def warn_unofficial():
 
 def from_checkpoint(a) -> None:
     """The language model straight from an NVFP4 safetensors checkpoint (routed experts moved into Basalt's layout,
-    every other tensor converted once from BF16, the n-gram table from FP8, metadata and tokenizer from the
+    every other tensor converted once from BF16, the n-gram table from BF16 or FP8, metadata and tokenizer from the
     checkpoint's files); drafter, profile and vision are copied from BASE byte for byte."""
     import multiprocessing
     import checkpoint as C
@@ -384,8 +385,7 @@ def from_checkpoint(a) -> None:
         ck = C.Checkpoint(a.checkpoint)
         experts = C.CheckpointExperts(ck)
         dense_src = C.CheckpointDense(ck, q6k)
-        ple_path = C.ple_table(ck)
-        ple = S.PleFp8(str(ple_path))
+        ple = C.ple_table(ck)
         kv = C.model_kv(ck, S.PLE_DIM, 18 if q6k else 7, a.name)
         dense = S.Dense(dense_src, False)
     except S.ConvertError as e:
@@ -449,9 +449,9 @@ def from_checkpoint(a) -> None:
                     die(f"section {name}: the copy's SHA-256 differs from {src}'s")
             tens = {n: {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.ne],
                         "bytes": t.expected_bytes(), "offset": tensor_offsets[n]} for n, t in dense_src.tensors.items()}
-            tens["per_layer_token_embd.weight"] = {"type": "Q8_0", "type_id": 8, "shape": [S.PLE_DIM, ple.rows],
+            tens["per_layer_token_embd.weight"] = {"type": ple.type_name, "type_id": ple.type_id, "shape": [S.PLE_DIM, ple.rows],
                                                   "bytes": ple.nbytes, "offset": tensor_offsets["per_layer_token_embd.weight"]}
-            ck_files = sorted(set(ck.shards) | {ple_path})
+            ck_files = sorted(set(ck.shards) | set(ple.sources))
             meta = {
                 "format": "basalt", "version": 1, "name": a.name or base_meta.get("name"),
                 "converter": {"tool": "tools/convert/convert.py", "git": git_rev()},
@@ -459,10 +459,7 @@ def from_checkpoint(a) -> None:
                              "fingerprint_sha256_first_last_64mib_and_size": fingerprint(p)} for p in ck_files],
                 "gguf_kv": kv,
                 "tensors": tens,
-                "conversions": {"compat_bf16": False, "tensors": [{
-                    "name": "per_layer_token_embd.weight", "src_type": "F8_E4M3", "dst_type": "Q8_0",
-                    "method": "fp8 code x per-tensor BF16 scale, Q8_0 blocks of 32 (ggml reference rounding)",
-                    "scale": ple.scale}]},
+                "conversions": {"compat_bf16": False, "tensors": [ple.conversion] if ple.conversion is not None else []},
                 "sampling": SAMPLING, "license": model_license(kv),
             }
             for k in ("profile", "hc8", "mtp", "vision"):

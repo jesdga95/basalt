@@ -382,5 +382,159 @@ class TokenizerKvTest(unittest.TestCase):
                 C.tokenizer_kv(C.Checkpoint(d))
 
 
+class PleBf16Test(unittest.TestCase):
+    """The BF16 n-gram table keeps its source bits across files and streamed chunks."""
+
+    P = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding."
+
+    def build(self, d, keys):
+        rng = np.random.default_rng(7)
+        rows = sum(n for _, n in keys)
+        u = rng.integers(0, 0x7F80, size=(rows, 160), dtype=np.uint16).astype("<u2")
+        # Include signed zero, subnormals and finite values outside FP16's range.
+        u[:, :8] = [0x0000, 0x8000, 0x0001, 0x8001, 0x4780, 0xC780, 0x7F7F, 0xFF7F]
+        at, shards = 0, {}
+        for i, (key, n) in enumerate(keys):
+            raw = u[at:at + n].tobytes()
+            write_safetensors(d / f"ple-{i}.safetensors",
+                              {self.P + f"padding_{i}": ("I64", (1,), bytes(8)),
+                               self.P + key: ("BF16", (n, 160), raw)})
+            shards[int(key.split("_")[1].split(".")[0])] = raw
+            at += n
+        return b"".join(shards[k] for k in sorted(shards))
+
+    def ck(self, d):
+        (d / "config.json").write_text(json.dumps({"text_config": {}}))
+        (d / "model-00001-of-00001.safetensors").write_bytes(struct.pack("<Q", 2) + b"{}")
+        return C.Checkpoint(d)
+
+    def test_shards_over_files_preserve_bf16_bytes(self):
+        import multiprocessing
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            want = self.build(d, [("shard_2.weight", 3), ("shard_0.weight", 5), ("shard_1.weight", 4)])
+            ck = self.ck(d)
+            for chunk_rows in (2, 4):
+                with self.subTest(chunk_rows=chunk_rows):
+                    ple = C.ple_table(ck)
+                    ple.chunk_rows = chunk_rows
+                    self.assertEqual(ple.rows, 12)
+                    self.assertEqual(ple.nbytes, 12 * 320)
+                    with multiprocessing.get_context("spawn").Pool(2) as pool:
+                        got = b"".join(ple.chunks(pool, depth=2))
+                    self.assertEqual(got, want)
+
+    def test_shard_gap_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            self.build(d, [("shard_0.weight", 5), ("shard_2.weight", 3)])
+            with self.assertRaises(S.ConvertError):
+                C.ple_table(self.ck(d))
+
+    def test_non_bf16_shard_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            self.build(d, [("shard_0.weight", 5)])
+            write_safetensors(d / "ple-0.safetensors",
+                              {self.P + "shard_0.weight": ("F16", (5, 160), bytes(5 * 320))})
+            with self.assertRaises(S.ConvertError):
+                C.ple_table(self.ck(d))
+
+    def test_shard_extent_cannot_include_the_following_tensor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            write_safetensors(d / "ple.safetensors", {
+                self.P + "shard_0.weight": ("BF16", (1, 160), b"\x80\x3f"),
+                self.P + "following.weight": ("BF16", (160,), bytes(320)),
+            })
+            ck = self.ck(d)
+            with self.assertRaises(S.ConvertError):
+                C.ple_table(ck)
+
+    def test_truncated_shard_fails_during_streaming(self):
+        from multiprocessing.dummy import Pool
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            self.build(d, [("shard_0.weight", 1)])
+            ple = C.ple_table(self.ck(d))
+            path = d / "ple-0.safetensors"
+            with path.open("r+b") as f:
+                f.truncate(path.stat().st_size - 1)
+            with Pool(1) as pool, self.assertRaises(S.ConvertError):
+                list(ple.chunks(pool))
+
+
+class CheckpointPackPleTest(unittest.TestCase):
+    def test_stored_table_format_matches_source(self):
+        from types import SimpleNamespace
+        import convert
+        from model_file import ModelFile, ModelWriter
+
+        for source_type, type_id, row_bytes in (("BF16", 30, 320), ("F8_E4M3", 8, 170)):
+            with self.subTest(source_type=source_type), tempfile.TemporaryDirectory() as tmp:
+                d = Path(tmp)
+                cfg = {"text_config": {**CompleteSetTest.CFG["text_config"],
+                       "model_type": "qwen4_exp_text", "num_hidden_layers": 1, "layer_types": ["full_attention"],
+                       "num_experts": 1, "hidden_size": 64, "moe_intermediate_size": 64,
+                       "num_experts_per_tok": 1, "max_position_embeddings": 128, "head_dim": 32,
+                       "num_attention_heads": 2, "num_key_value_heads": 1, "rope_theta": 10000,
+                       "rms_norm_eps": 1e-6, "shared_expert_intermediate_size": 64,
+                       "linear_conv_kernel_dim": 4, "full_attention_interval": 1, "partial_rotary_factor": 1,
+                       "hc_count": 1, "hc_lowrank": 1, "indexer_budget": 1, "indexer_compress_ratio": 1,
+                       "ngram_size": 2, "heads_per_ngram": 1, "ple_conv_kernel_size": 4,
+                       "eos_token_id": 1, "vocab_size": 4}, "image_token_id": 2}
+                tensors = {k.replace("layers.1.", "layers.0."): v
+                           for k, v in CompleteSetTest.tensors().items() if "layers.0." not in k}
+                tensors.update(expert_tensors(0, 0, h=64))
+                pe = "model.language_model.layers.0.ple.ple_embedding."
+                for name, values in (("layer_multipliers", [1]), ("ngram_heads_offsets", [0]),
+                                     ("ngram_heads_vocab_sizes", [8])):
+                    tensors[pe + name] = ("I64", (len(values),), np.array(values, dtype="<i8").tobytes())
+                small_checkpoint(d, tensors, cfg)
+                tokens = ["a", "b", "c", "d"]
+                (d / "tokenizer.json").write_text(json.dumps({
+                    "model": {"type": "BPE", "vocab": dict(zip(tokens, range(4))), "merges": []},
+                    "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+                        {"type": "Split", "pattern": {"Regex": C.QWEN35_HF_SPLIT}}]}}))
+                (d / "tokenizer_config.json").write_text("{}")
+                stem = pe + "ngram_embedding."
+                rng = np.random.default_rng(19)
+                table, want = {}, []
+                if source_type == "F8_E4M3":
+                    table[stem + "weight_scale"] = ("BF16", (1,), struct.pack("<H", 0x3C00))
+                for shard, rows in ((1, 3), (0, 5)):
+                    if source_type == "BF16":
+                        values = rng.integers(0, 0x7F80, size=(rows, 160), dtype=np.uint16).astype("<u2")
+                        values[:, :4] = [0x0001, 0x8000, 0x4780, 0xFF7F]
+                        stored = values.tobytes()
+                    else:
+                        values = rng.integers(0, 0x70, size=(rows, 160), dtype=np.uint8)
+                        stored = S.fp8_rows_to_q8_0(values, 2.0 ** -7)
+                    table[stem + f"shard_{shard}.weight"] = (source_type, values.shape, values.tobytes())
+                    want.insert(0, stored)
+                write_safetensors(d / "ple.safetensors", table)
+                base = d / "base.basalt"
+                w = ModelWriter(str(base))
+                w.add_bytes("meta", json.dumps({"gguf_kv": {"tokenizer.ggml.tokens": tokens}}).encode())
+                w.add_bytes("experts.layout", C.CheckpointExperts(C.Checkpoint(d)).layout_text())
+                w.close()
+                out = d / "out.basalt"
+                convert.from_checkpoint(SimpleNamespace(
+                    out=str(out), sections_from=str(base), checkpoint=str(d), force=False,
+                    dense_q8_0=True, name="Tiny", workers=2, mtp_dense=None))
+                pack = ModelFile(str(out))
+                meta = json.loads(pack.read("meta"))
+                info = meta["tensors"]["per_layer_token_embd.weight"]
+                self.assertEqual((info["type"], info["type_id"], info["shape"], info["bytes"]),
+                                 ("BF16" if source_type == "BF16" else "Q8_0", type_id, [160, 8], row_bytes * 8))
+                self.assertEqual(info["offset"] % 4096, 0)
+                self.assertEqual(pack.read("gguf")[info["offset"]:info["offset"] + info["bytes"]], b"".join(want))
+                conversions = meta["conversions"]["tensors"]
+                if source_type == "BF16":
+                    self.assertEqual(conversions, [])
+                else:
+                    self.assertEqual([(c["src_type"], c["dst_type"]) for c in conversions], [("F8_E4M3", "Q8_0")])
+
+
 if __name__ == "__main__":
     unittest.main()

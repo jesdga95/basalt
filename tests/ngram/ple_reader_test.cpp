@@ -417,6 +417,152 @@ int warm_rows_check(const std::string& dir) {
     return g_fail ? 1 : 0;
 }
 
+uint16_t bf16_row_bits(uint32_t row, int col) {
+    static constexpr uint16_t edge[] = {
+        0x0000, 0x8000, 0x0001, 0x8001, 0x007f, 0x807f, 0x0080, 0x8080,
+        0x3f80, 0xbf80, 0x4780, 0xc780, 0x7f7f, 0xff7f, 0x3f81, 0xbf81};
+    if (col < 16) return edge[(col + row) % 16];
+    uint16_t bits = (uint16_t) ((row * k::PLE_HEAD_DIM + (uint32_t) col) * 4051u);
+    if ((bits & 0x7f80u) == 0x7f80u) bits ^= 0x0080u;
+    return bits;
+}
+
+bool check_bf16_rows(const uint32_t* rows, size_t n, uint32_t total, const float* got, const char* what) {
+    for (size_t r = 0; r < n; ++r)
+        for (int i = 0; i < k::PLE_HEAD_DIM; ++i) {
+            const uint32_t want = rows[r] < total ? (uint32_t) bf16_row_bits(rows[r], i) << 16 : 0;
+            uint32_t bits;
+            std::memcpy(&bits, got + r * k::PLE_HEAD_DIM + i, sizeof bits);
+            if (bits != want || !std::isfinite(got[r * k::PLE_HEAD_DIM + i])) {
+                CHECK(false, "%s: row %u column %d: bits %08x != %08x", what, rows[r], i, bits, want);
+                return false;
+            }
+        }
+    return true;
+}
+
+// Real head geometry with exact BF16 bit patterns, including finite values beyond FP16's range.
+int bf16_table_check(const std::string& dir) {
+    constexpr uint32_t N = 257;
+    constexpr size_t T = 16;
+    const std::string path = dir + "/ple_bf16_selftest.gguf";
+    std::vector<uint8_t> b;
+    put<uint32_t>(b, 0x46554747u);
+    put<uint32_t>(b, 3);
+    put<uint64_t>(b, 1);
+    put<uint64_t>(b, 0);
+    const std::string name = "per_layer_token_embd.weight";
+    put<uint64_t>(b, name.size());
+    b.insert(b.end(), name.begin(), name.end());
+    put<uint32_t>(b, 2);
+    const size_t shape_at = b.size();
+    put<uint64_t>(b, k::PLE_HEAD_DIM);
+    put<uint64_t>(b, N);
+    put<uint32_t>(b, 30);
+    put<uint64_t>(b, 0);
+    b.resize((b.size() + 31) / 32 * 32);
+    const size_t data_at = b.size();
+    for (uint32_t r = 0; r < N; ++r)
+        for (int i = 0; i < k::PLE_HEAD_DIM; ++i) {
+            const uint16_t bits = bf16_row_bits(r, i);
+            put<uint8_t>(b, (uint8_t) bits);
+            put<uint8_t>(b, (uint8_t) (bits >> 8));
+        }
+    auto save = [&] {
+        std::ofstream f(path, std::ios::binary);
+        f.write((const char*) b.data(), (std::streamsize) b.size());
+        CHECK((bool) f, "writing BF16 fixture");
+    };
+    save();
+    std::vector<uint32_t> rows(T * k::PLE_N_HEADS);
+    for (size_t i = 0; i < rows.size(); ++i) rows[i] = (uint32_t) (i * 37 % N);
+    rows[1] = N - 1;
+    for (uint32_t r = 0; r < N; ++r) {
+        const size_t at = data_at + r * k::PLE_ROW_BYTES_BF16;
+        if (at / 4096 != (at + k::PLE_ROW_BYTES_BF16 - 1) / 4096) { rows[2] = r; break; }
+    }
+    rows[3] = N;
+    rows[4] = rows[2];
+    std::vector<float> got(T * k::NG_N_EMBD), single(T * k::NG_N_EMBD);
+    std::string err;
+    for (int mode = 0; mode < 4; ++mode) {
+        k::PleIoOptions io;
+        io.mode = mode < 2 ? k::PleIo::Direct : k::PleIo::Mmap;
+        io.cache_rows = mode == 1 ? 4096 : 0;
+        io.max_inflight = 1;   // straddled rows must survive reuse of the sole page slot
+        io.lock = mode == 3;
+        k::PleTable table;
+        const bool opened = table.open(path, err, io);
+        CHECK(opened, "BF16 open mode %d: %s", mode, err.c_str());
+        if (!opened) continue;
+        CHECK(std::strcmp(table.format(), "BF16") == 0 && table.rows() == N, "BF16 table format/shape");
+        CHECK(table.warm_rows(rows.data(), T, err), "BF16 warm: %s", err.c_str());
+        CHECK(table.gather_rows(rows.data(), T, got.data(), err), "BF16 warmed gather: %s", err.c_str());
+        check_bf16_rows(rows.data(), rows.size(), N, got.data(), "warmed gather");
+        for (size_t t = 0; t < T; ++t) {
+            CHECK(table.issue(rows.data() + t * k::PLE_N_HEADS), "BF16 issue");
+            CHECK(table.collect(single.data() + t * k::NG_N_EMBD, err), "BF16 collect: %s", err.c_str());
+        }
+        CHECK(table.gather_batch(rows.data(), T, got.data(), err), "BF16 batch: %s", err.c_str());
+        check_bf16_rows(rows.data(), rows.size(), N, got.data(), "batch");
+        CHECK(std::memcmp(got.data(), single.data(), got.size() * sizeof(float)) == 0, "BF16 batch/single differ");
+        for (size_t t = 0; t < T; ++t) table.prefetch_rows(rows.data() + t * k::PLE_N_HEADS);
+        CHECK(table.gather_batch(rows.data(), T, got.data(), err), "BF16 prefetched batch: %s", err.c_str());
+        check_bf16_rows(rows.data(), rows.size(), N, got.data(), "prefetched batch");
+        table.prefetch_rows(rows.data());
+        table.wait_prefetches();
+        table.gather(rows.data(), got.data());
+        check_bf16_rows(rows.data(), k::PLE_N_HEADS, N, got.data(), "gather");
+        for (uint32_t r = 0; r <= N; ++r) {
+            table.read_row(r, got.data());
+            if (!check_bf16_rows(&r, 1, N, got.data(), "read_row")) break;
+        }
+    }
+    // Cache hits, including a split row, require no disk reads and retain the original stored bits.
+    {
+        ng::PleReader reader;
+        const bool opened = reader.open(path, data_at, N, 1, 4096, err, k::PLE_ROW_BYTES_BF16);
+        CHECK(opened, "BF16 raw reader: %s", err.c_str());
+        if (opened) {
+            std::vector<uint8_t> raw(k::PLE_N_HEADS * k::PLE_ROW_BYTES_BF16);
+            CHECK(reader.collect(reader.issue(rows.data(), k::PLE_N_HEADS, raw.data()), err),
+                  "BF16 cache warm: %s", err.c_str());
+            const auto before = reader.snapshot();
+            CHECK(reader.collect(reader.issue(rows.data(), k::PLE_N_HEADS, raw.data()), err),
+                  "BF16 cache read: %s", err.c_str());
+            const auto after = reader.snapshot();
+            CHECK(after.reads == before.reads && after.cache_hits - before.cache_hits == k::PLE_N_HEADS - 1,
+                  "BF16 warmed rows missed cache");
+            for (int h = 0; h < k::PLE_N_HEADS; ++h)
+                for (int i = 0; i < k::PLE_HEAD_DIM; ++i) {
+                    const size_t at = h * k::PLE_ROW_BYTES_BF16 + 2 * i;
+                    const uint16_t bits = (uint16_t) (raw[at] | (raw[at + 1] << 8));
+                    CHECK(bits == (rows[h] < N ? bf16_row_bits(rows[h], i) : 0), "BF16 cached source bits");
+                }
+        }
+    }
+    // The format's 320-byte row extent and 160-value fast axis are validated before reads.
+    b.pop_back();
+    save();
+    for (const auto mode : {k::PleIo::Direct, k::PleIo::Mmap}) {
+        k::PleIoOptions io;
+        io.mode = mode;
+        k::PleTable table;
+        CHECK(!table.open(path, err, io), "truncated BF16 table accepted");
+    }
+    b.push_back(0);
+    const uint64_t wrong_dim = k::PLE_HEAD_DIM - 1;
+    std::memcpy(b.data() + shape_at, &wrong_dim, sizeof wrong_dim);
+    save();
+    {
+        k::PleTable table;
+        CHECK(!table.open(path, err), "wrong BF16 head width accepted");
+    }
+    std::filesystem::remove(path);
+    std::printf("BF16 PLE table: %s\n", g_fail ? "FAILED" : "OK");
+    return g_fail ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -448,7 +594,8 @@ int main(int argc, char** argv) {
         const int r170 = selftest(dir, k::PLE_ROW_BYTES_Q8_0);
         const int q8 = q8_decode_check();
         const int warm = warm_rows_check(dir);
-        return r90 != 0 ? r90 : r110 != 0 ? r110 : r170 != 0 ? r170 : q8 != 0 ? q8 : warm;
+        const int bf16 = bf16_table_check(dir);
+        return r90 != 0 ? r90 : r110 != 0 ? r110 : r170 != 0 ? r170 : q8 != 0 ? q8 : warm != 0 ? warm : bf16;
     }
     if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, stress_secs);
     std::fprintf(stderr, "nothing to do\n");

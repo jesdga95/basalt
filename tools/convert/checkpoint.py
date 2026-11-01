@@ -598,10 +598,13 @@ def model_kv(ck: Checkpoint, ple_dim: int, file_type: int, name: str | None) -> 
     kv.update(tokenizer_kv(ck))
     return kv
 
-
-def ple_table(ck: Checkpoint) -> pathlib.Path:
-    """The checkpoint file that holds the FP8 n-gram table."""
+def ple_table(ck: Checkpoint):
+    """The checkpoint's n-gram table as a builder: FP8 shards beside one per-tensor scale (the NVIDIA
+    layout), or the BF16 shards as stored."""
     hits = sorted({ck.t[k][0] for k in ck.t if k.endswith("ngram_embedding.weight_scale")})
-    if len(hits) != 1:
-        raise S.ConvertError(f"{ck.dir}: {len(hits)} files hold an ngram_embedding.weight_scale")
-    return hits[0]
+    if len(hits) == 1:
+        return S.PleFp8(str(hits[0]))
+    files = sorted({ck.t[k][0] for k in ck.t if re.search(r"ngram_embedding\.shard_\d+\.weight$", k)})
+    if files:
+        return S.PleBf16(files)
+    raise S.ConvertError("the checkpoint has no n-gram table (no ngram_embedding.weight_scale, no shards)")
