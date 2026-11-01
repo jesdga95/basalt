@@ -42,6 +42,8 @@ bool cpu_avx512bw_ok();
 bool cpu_avx2_ok();
 /// Whether this CPU (and its OS) also has the 256-bit AVX-VNNI instructions (`vpdpwssd`, `vpdpbusd`).
 bool cpu_avxvnni_ok();
+/// Whether this CPU (and its OS) also has the 256-bit AVX-VNNI-INT8 instructions (`vpdpbssd`).
+bool cpu_avxvnni_int8_ok();
 /// Whether this CPU (and its OS) runs AVX (Sandy Bridge and newer): the AVX1 router dot (kq_avx1.cpp).
 bool cpu_avx1_ok();
 /// SSE4.2 + POPCNT.
