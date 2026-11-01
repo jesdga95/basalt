@@ -326,7 +326,8 @@ bool PleReader::open(const std::string& path, uint64_t table_offset, uint64_t n_
     close();
     if (max_inflight == 0 || max_inflight > 1024) { err = "PleReader: max_inflight must be 1..1024"; return false; }
     if (row_bytes == 0 || row_bytes > PAGE) { err = "PleReader: row_bytes must be 1..4096"; return false; }
-    if (!impl_->file.open(path, err)) return false;
+    // the table is a section of the model file, which the expert source maps and the loaders read
+    if (!impl_->file.open(path, err, 0, /*mapped_elsewhere=*/true)) return false;
     impl_->row_bytes = row_bytes;
     if (table_offset + n_rows * (uint64_t) row_bytes > impl_->file.size()) {
         err = "PleReader: the table extends past the end of " + path;

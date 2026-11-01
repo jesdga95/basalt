@@ -19,6 +19,7 @@
 #include "basalt/kernels/qsa.hpp"
 #include "basalt/kernels/qsa_decode_attn.hpp"
 #include "basalt/kernels/q6k_head.hpp"
+#include "basalt/kernels/q80_vhead.hpp"
 #include "basalt/kernels/s2_expert_grouped.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
@@ -249,6 +250,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (head_ != nullptr && head_->vproxy() != nullptr) {
             vhead_scratch_ = b.take<uint8_t>(basalt::kernels::q6k_vhead_scratch_bytes());
             head_from_d_ = b.take<int32_t>(4);
+        }
+        if (head_ != nullptr && head_->planes()) {
+            vhead_scratch_ = b.take<uint8_t>(basalt::kernels::q80p_vhead_scratch_bytes());
+            head_keep_d_ = b.take<int32_t>(1);
         }
         hist_snap_ = b.take<float>(T * HS);
         ple_win_ = b.take<float>(2 * T * HC * N);

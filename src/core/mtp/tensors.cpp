@@ -55,13 +55,4 @@ bool MtpDrafter::plan_bytes(const MtpFiles& files, const ModelGeometry& g, uint6
     return true;
 }
 
-std::vector<std::pair<std::string, const void*>> MtpDrafter::hc8_keys() const {
-    std::vector<std::pair<std::string, const void*>> out;
-    for (const Tensor& t : tensors_)
-        if (t.kind == "bf16" && t.name.find("hyper_connection") != std::string::npos)
-            out.emplace_back("mtp." + t.name, t.dev ? t.dev : (const void*) (dense_ + t.off));
-    return out;
-}
-
-
 }

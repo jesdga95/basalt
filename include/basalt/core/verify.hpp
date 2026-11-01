@@ -158,7 +158,7 @@ public:
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
-    /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
+    /// Row `t` of the last window's head logits (n_vocab floats) to the host, every one exact. Valid after run().
     bool copy_logits(int t, float* host) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
@@ -173,7 +173,8 @@ public:
     /// head samples on (the last stage's); false with `err` when the memory cannot be had.
     bool reserve_wide_sampler(std::string& err);
     /// A list longer than the top_k kernels keep reads every row's logit: a two-stage head (exact only near the top,
-    /// q6k_vhead) is run again exactly over the window's T columns, the plain kernel's bits.  Other heads: nothing.
+    /// q6k_vhead, or a Q8_0 head's screened window, q80p_vhead) is run again exactly over the window's T columns, the
+    /// plain kernel's bits.  Other heads, or a window whose head was exact: nothing.
     bool exact_head_rows(int T, std::string& err);
     /// One request's token bias (one float per vocabulary entry, added to the logits before the sampler chain); empty
     /// clears it.  Applies to this verifier's own sampling only: the drafter never sees it.  Call before set_sampling;
@@ -199,8 +200,7 @@ public:
     /// discarded - a prompt read through windows commits every token - so they cost no sampler launch or sync and
     /// never read a history staged for another position.
     void set_head_sampling(bool on) { head_sampling_ = on; if (next_) next_->set_head_sampling(on); }
-    /// The next window's rows below `t` have their picks discarded (the prompt rows a first window folds in): the
-    /// head leaves those rows' logits approximate, and with head sampling off every row's.  One window only.
+    /// Skip exact head scoring below this row for the next window.
     void set_head_from(int t) { head_from_ = t; if (next_) next_->set_head_from(t); }
     /// On: a sampled window also leaves draft_prob(t), the probability row t's final distribution gives the window's
     /// token t + 1 (t < T - 1), for relaxed acceptance.  The picks are unchanged.  Off by default; set per request.
@@ -227,9 +227,10 @@ public:
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
-    /// The 8-bit copies of every layer's hyper-connection matrices (and the head's) on the current device; called
-    /// before the expert cache takes the free memory.
-    static void prepare_hc8(const WeightTable& wt, const ModelGeometry& g);
+    /// The 8-bit copies of every layer's hyper-connection matrices (and the head's) on the current device, from the
+    /// model file's table; called before the expert cache takes the free memory.  False with `err` when a matrix this
+    /// device holds has no copy in the table or no VRAM for it.
+    static bool prepare_hc8(const WeightTable& wt, const ModelGeometry& g, std::string& err);
     /// The CUDA0 bytes the GDN mixer split by key head loads after the expert cache is sized (CUDA0's packed rows and
     /// columns of its key heads), for CUDA0 on dev0 and the peer on dev1; 0 when the split is not taken.
     static int64_t gs_cuda0_bytes(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1);
@@ -243,6 +244,9 @@ public:
     /// The peer bytes the head split by vocabulary loads after the peer's expert tier is filled, for a head of
     /// `row_bytes` per row and native `type`, windows of up to max_t tokens; 0 when the split is not taken.
     static int64_t hs_peer_bytes(size_t row_bytes, int type, int64_t n_vocab, int64_t n_embd, int max_t, int dev0, int dev1);
+    /// The head is split for its two-stage screen (a Q8_0 head, a peer slower than CUDA0): the peer's bytes are taken
+    /// before its expert tier is filled.
+    static bool hs_two_stage(int type, int64_t n_vocab, int64_t n_embd, int max_t, int dev0, int dev1);
     /// The bytes prepare_hc8 will place when `has` names the tensors the model holds (0 with the copies off).
     static uint64_t hc8_plan_bytes(const std::function<bool(const std::string&)>& has, const ModelGeometry& g);
 
@@ -268,6 +272,9 @@ public:
     void set_post_launch(std::function<void()> f) { post_launch_ = std::move(f); }
     /// runs it now if no window has since (a request ending)
     void flush_post_launch() { if (post_launch_) { auto f = std::move(post_launch_); post_launch_ = nullptr; f(); } }
+    /// `f` runs on the calling thread of the next `run`, once the host has served the last layer's ring (every routed
+    /// entry of the window has been counted) and before the window's end is awaited.
+    void set_served_hook(std::function<void()> f) { served_hook_ = std::move(f); }
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //
@@ -401,6 +408,9 @@ private:
     // the head split by vocabulary with the peer card, when the peer streams its rows faster than CUDA0 does
     void hs_init();
     void hs_free();
+    /// The peer's share of this window's head (T columns), queued behind its persistent window: a no-op without the
+    /// two-stage split or for an exact head.
+    bool hs_launch(int T, std::string& err);
     // the GDN mixer split by key head with the peer card, when the peer streams the mixer's bytes faster than CUDA0
     void gs_init();
     void gs_free();
@@ -418,6 +428,14 @@ private:
     bool run_begin(int T, const int32_t* tokens, int64_t pos0, std::string& err, cudaEvent_t after = nullptr);
     bool run_serve(PoolMultiFn pool, void* user, std::string& err);
     bool run_end(int32_t* out, std::string& err);
+    /// A Q8_0 head in bit planes runs two-stage in the window (q80p_vhead) with the exact list this long: the top_k of
+    /// a sampled request (64 at most), 1 for a greedy pick; 0 (every row exact) for a request whose sampling reads more
+    /// than that list: a longer list, a logit bias, non-neutral penalties.
+    int head_keep() const;
+    /// The list length for the next launched window (stream-ordered, written only when it changes).
+    void set_head_keep(int keep);
+    /// After a two-stage window: the head again over its columns, every row exact (the plain kernel's bits).
+    bool head_exact_again() const;
     bool window_intact(std::string& err);   // after a window's sync: false when a bounded device wait of it timed out
     /// One step of the host's service of the window's rings: 1 = every ring served, 0 = the GPU has not reached the next
     /// one, -1 = an error.
@@ -505,9 +523,9 @@ private:
     }();   ///< greedy by default; per-request via set_sampling
     const int32_t* hist_d_ = nullptr;   // penalty-history row (set_history); null = no penalties apply
     int hist_len_ = 0;
+    int head_from_ = 0;
+    int32_t* h_head_from_ = nullptr; int32_t* m_head_from_ = nullptr;
     bool head_sampling_ = true;          ///< set_head_sampling
-    int head_from_ = 0;                  ///< set_head_from, for the next window
-    int32_t* h_head_from_ = nullptr; int32_t* m_head_from_ = nullptr;   ///< the window's first row the head scores exactly
     bool draft_probe_ = false;           ///< set_draft_probe
     std::vector<float> logit_bias_host_;
     float* logit_bias_device_ = nullptr;
@@ -594,6 +612,7 @@ private:
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
     std::function<void()> post_launch_;
+    std::function<void()> served_hook_;
     cudaEvent_t fence_ev_ = nullptr;      // dm_fence
     bool landed_glue_ = true;             // every device-planned layer captured so far ran dec_moe_glue
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
@@ -670,6 +689,19 @@ private:
     cudaStream_t hs_s_ = nullptr;    // peer
     cudaEvent_t hs_in_ = nullptr;    // CUDA0: the input is staged
     cudaEvent_t hs_out_ = nullptr;   // peer: its logits are staged
+    // the two-stage head's split (hs_two_): the peer screens its rows on its copy against CUDA0's published thresholds
+    // and lists its scored entries; CUDA0 screens the rest and writes the list into its columns.  The cards meet in
+    // host memory (the link, the input and the list blocks), the peer's part queued behind its persistent window.
+    bool hs_two_ = false;
+    uint32_t hs_seq_ = 0;             // the last window number written to the link
+    int* hs_k_ = nullptr;             // peer: the list length fetched with the input
+    void* hs_scr_ = nullptr;          // peer: its two-stage scratch
+    void* hs_link_ = nullptr;         // pinned, both cards: the window number and each card's words
+    void* hs_input_ = nullptr;        // pinned, both cards: CUDA0's q8_1 columns and list length
+    void* hs_list_ = nullptr;         // pinned, both cards: the peer's listed entries
+    cudaStream_t hs_cs_ = nullptr;    // CUDA0: posts the input beside the head
+    cudaEvent_t hs_fork_ = nullptr;   // CUDA0: the head's input is quantized
+    cudaEvent_t hs_post_ = nullptr;   // CUDA0: the input is posted
     // GDN mixer split by key head: CUDA0 owns key heads [0, gs_nk0_), the peer the rest; gs_nk0_ 0 means no split
     struct GsLayer {   // peer: one GDN layer's weights for its heads (gdn_head_split.hpp layout)
         void *wqkv = nullptr, *wz = nullptr, *wo = nullptr;
@@ -697,8 +729,11 @@ private:
     bool gs_live_ = false, gs_split_ = false;
     SessionState* gs_ss_ = nullptr;
     float *gs_h_full_ = nullptr, *gs_h_slice_ = nullptr;   // pinned staging for gs_move: CUDA0's whole layers, the slice
-    uint8_t* vhead_scratch_ = nullptr;   // the two-stage head's histogram and thresholds (q6k_vhead)
-    int32_t* head_from_d_ = nullptr;     // the window's first exact head row, copied from m_head_from_ (q6k_vhead's col_from)
+    uint8_t* vhead_scratch_ = nullptr;   // the two-stage head's histogram and row list (q6k_vhead, q80p_vhead)
+    int32_t* head_from_d_ = nullptr;
+    int32_t* head_keep_d_ = nullptr;     // q80p_vhead's list length, read by the captured head (null: no such head)
+    int head_keep_set_ = 0;              // the value last written to head_keep_d_ (the arena starts it at 0)
+    mutable bool head_screened_ = false;   // the last window's head was two-stage: only its top rows are exact
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
     float* ple_win_ = nullptr;   // 2 * T * NG_HC_DIM
@@ -708,12 +743,8 @@ private:
 
 /// The loaded hc8 table (model_file.hpp) has a copy of `name` of this shape.
 bool hc8_table_has(const std::string& name, int rows, int cols);
-/// Registers the table's copy of `name` on the current device, keyed by the bf16 matrix `w` (hc8_prepare's form) or,
-/// with w == nullptr, by the copy itself (hc8_adopt's form; the key is returned).  nullptr: no such copy, or no VRAM.
+/// Registers the table's copy of `name` on the current device, keyed by the bf16 matrix `w` or, with w == nullptr, by
+/// the copy itself (the key is returned).  nullptr: no such copy, or no VRAM.
 const void* hc8_table_adopt(const std::string& name, const uint16_t* w, int rows, int cols);
-/// --dump-hc8: writes the 8-bit copies of the weight table's hyper-connection matrices, and `extra` (name, key) pairs
-/// (the drafter's), to `path` in the layout model_file.hpp describes.
-bool hc8_dump(const WeightTable& wt, const ModelGeometry& g, const std::vector<std::pair<std::string, const void*>>& extra,
-              const std::string& path, std::string& err);
 
 }  // namespace basalt::core

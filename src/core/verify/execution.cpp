@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "basalt/kernels/q80_vhead.hpp"
 #include "expert_plan.hpp"
 #include "diagnostics.hpp"
 #include "basalt/core/load_progress.hpp"
@@ -58,6 +59,8 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
 // predecessor's graph raises), then the host serves each stage's rings in turn.
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
+    const std::function<void()> served = std::move(served_hook_);
+    served_hook_ = nullptr;
     for (Verifier* v = this; v != nullptr; v = v->next_)
         if (v->lb_ > 0 && v->h_flag_ != nullptr) *(volatile uint32_t*) (v->h_flag_ + 12) = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -65,7 +68,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         if (!v->run_begin(T, tokens, pos0, err)) return false;
     void* u = user;
     for (Verifier* v = this; v != nullptr; v = v->next_) {
-        if (!v->run_serve(pool, u, err) || !v->run_end(v->next_ == nullptr ? out : nullptr, err)) return false;
+        if (!v->run_serve(pool, u, err)) return false;
+        if (v->next_ == nullptr && served) served();
+        if (!v->run_end(v->next_ == nullptr ? out : nullptr, err)) return false;
         u = v->next_user_;
     }
     return true;
@@ -125,10 +130,11 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
         cudaStreamWaitEvent(cs_, wait_ev_, 0);
         wait_ev_ = nullptr;
     }
-    // the head's first exact row for this window (the graph reads it); the request's choice lasts one window
     *(volatile int32_t*) h_head_from_ = head_sampling_ ? std::clamp(head_from_, 0, T) : T;
     head_from_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    set_head_keep(head_keep());
+    if (!hs_launch(T, err)) return false;
     const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
     if (next_ == nullptr) dev.record(DecodeEvents::kVerifyPost, cs_);
     ms_launch += ms_since(tl);
@@ -338,6 +344,10 @@ bool Verifier::run_end(int32_t* out, std::string& err) {
     gm.mark(-1);
     const bool dm_ok = dm_end(err);
     if (!window_intact(err) || !dm_ok) return false;
+    if (hs_two_ && head_screened_ && basalt::kernels::q80p_vhead_link_failed(hs_link_)) {
+        err = "verify: the peer's share of the head did not answer; the window is discarded; restart the engine";
+        return false;
+    }
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // the table changed under the window
         *(volatile uint32_t*) h_plan_err_ = 0;
