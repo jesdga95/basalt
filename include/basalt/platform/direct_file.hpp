@@ -61,6 +61,14 @@ private:
     Impl* impl_ = nullptr;
 };
 
+/// `p` rounded up to `DirectFile::alignment()`, for a buffer from an allocator that promises no alignment of that
+/// size - a pinned buffer from the CUDA runtime is carved out of an arena and is only as aligned as that arena.
+/// The caller frees the block by its base and reads through this pointer, so the block is `bytes + alignment()` big.
+inline void* align_for_direct_io(void* p) {
+    const uintptr_t a = (uintptr_t) p, mask = (uintptr_t) (DirectFile::alignment() - 1);
+    return (void*) ((a + mask) & ~mask);
+}
+
 /// Monotonic time in microseconds, for latency accounting.
 double now_us();
 

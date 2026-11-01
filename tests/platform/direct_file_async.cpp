@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -327,6 +328,39 @@ static void test_wait_bounds_and_wakes(unsigned max) {
 }
 #endif
 
+/// A pinned buffer is not necessarily aligned, and an unbuffered read refuses an unaligned one outright. This
+/// checks the rounding a caller uses to read from such a block, and that the rounded pointer is accepted while the
+/// unaligned base is refused.
+static void test_align_for_direct_io() {
+    std::string error;
+    const std::string name = temp_path();
+    { std::ofstream out(name, std::ios::binary); out << std::string(2 * (size_t) DirectFile::alignment(), 'q'); }
+    DirectFile f;
+    call_ok(f.open(name, error), error, "open");
+    const size_t block = 3 * (size_t) DirectFile::alignment();
+    char* raw = (char*) malloc(block + (size_t) DirectFile::alignment());
+    check(raw != nullptr, "malloc of the stand-in pinned block failed");
+    for (unsigned skew = 0; skew < DirectFile::alignment(); skew += 511) {
+        char* base = raw + skew;
+        void* aligned = basalt::platform::align_for_direct_io(base);
+        check((uintptr_t) aligned % DirectFile::alignment() == 0, "align_for_direct_io left an unaligned pointer");
+        check((char*) aligned >= base && (char*) aligned - base < (long) DirectFile::alignment(),
+              "align_for_direct_io ran away from the block it was given");
+        std::memset(aligned, 0, DirectFile::alignment());
+        if (base != aligned)
+            check(!f.submit(0, base, DirectFile::alignment(), 1, error) && !error.empty(),
+                  "an unaligned buffer was accepted, so the guard below proves nothing");
+        error.clear();
+        call_ok(f.submit(0, aligned, DirectFile::alignment(), 7, error), error, "submit at the aligned buffer");
+        Completion c;
+        check(f.wait(&c, 1, 5000) == 1 && c.ok && c.tag == 7, "the aligned read did not complete");
+        check(static_cast<char*>(aligned)[0] == 'q', "the aligned read returned the wrong bytes");
+    }
+    free(raw);
+    f.close();
+    std::remove(name.c_str());
+}
+
 int main() {
     const std::string name = temp_path();
     void* memory = DirectFile::alloc_aligned(4096 * 18);
@@ -369,6 +403,7 @@ int main() {
         f.close();
         test_bounded_opens();
         test_mapped_elsewhere();
+        test_align_for_direct_io();
 #if defined(_WIN32)
         test_close_with_reads_in_flight();
         const unsigned maxes[] = {1u, 2u, 3u, 7u, 17u};   // one slot and a batch across the boundary
