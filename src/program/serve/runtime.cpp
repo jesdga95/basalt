@@ -43,6 +43,8 @@ int Runtime::shutdown() {
                           (double) st.whole_bytes / 1073741824.0, st.restored, (double) st.read_bytes / 1073741824.0,
                           st.evicted, st.dropped);
     }
+    for (int st = 0; st < std::max(n_stages, 1); ++st)
+        for (const std::string& r : stage_ver(st).route_report()) basalt::log::info("basalt serve", "%s", r.c_str());
     save_profile("exit");   // QUIT, or the server closed stdin
     return 0;
 }

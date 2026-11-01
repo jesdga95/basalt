@@ -22,6 +22,7 @@ private:
     float req_top_p{};
     int req_top_k{};
     unsigned long long req_seed{};
+    bool req_seed_given{};
     float req_min_p{};
     float req_penalty_repeat{};
     float req_penalty_freq{};
@@ -63,12 +64,7 @@ private:
     bool in_slot{};
     bool solo_req{};
     basalt::core::SessionState* rview{};
-    struct SoloBook {
-        std::vector<int32_t> live;
-        std::vector<ImgKey> live_imgs;
-        bool live_ok = false, cvec = true;
-        std::vector<ConvCheckpoint> checks;
-    };
+    using SoloBook = Runtime::SoloBook;
     SoloBook solo_book{};
     bool solo_moved{};
     bool own_partial{};
@@ -168,6 +164,8 @@ private:
     int64_t dec_windows{};
     int64_t dec_T{};
     int64_t decode_hits0{};
+    int64_t swapped0{};
+    int64_t noplace0{};
     int64_t ram0{};
     int64_t files0{};
     uint64_t file_bytes0{};
