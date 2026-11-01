@@ -10,7 +10,7 @@
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/q5k_head.hpp"
 #include "basalt/kernels/q6k_head.hpp"
-#include "basalt/kernels/q80_head.hpp"
+#include "basalt/kernels/q80_vhead.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include <algorithm>
 #include <exception>
@@ -74,12 +74,26 @@ bool Verifier::WindowRecorder::head() {
                         q5k_head_mmvq(w, x, y, (int) N, n, T, s);
                     else if (v_.head_->type() == 14 && q6k_head_supported((int) N, T))
                         q6k_head_mmvq(w, x, y, (int) N, n, T, s);
-                    else if (v_.head_->type() == 8 && T >= 4 && q80_head_supported((int) N, T))
-                        q80_head_mmvq(w, x, y, (int) N, n, T, s);
+                    else if (v_.head_->planes())
+                        q80p_mmvq(w, x, y, (int) N, n, T, s);
                     else
                         native_mmvq(v_.head_->type(), w, x, y, (int) N, n, T, s);
                 };
-                if (v_.hs_rows_ > 0) {   // the peer's rows while CUDA0 does its own; its logits land beside CUDA0's
+                if (v_.hs_two_ && !v_.batch_rec_ && q80p_supported((int) N, T)) {
+                    // the peer's share (hs_launch) screens its rows against CUDA0's thresholds and lists its scored
+                    // entries; CUDA0 posts the input beside its own screen, then writes the list into its columns
+                    const int r0 = v_.hs_rows_, r1 = (int) v_.n_vocab_ - r0;
+                    bool ok = cudaEventRecord(v_.hs_fork_, cs) == cudaSuccess &&
+                              cudaStreamWaitEvent(v_.hs_cs_, v_.hs_fork_, 0) == cudaSuccess;
+                    if (ok) q80p_vhead_post(v_.xq_, (int) N, T, v_.head_keep_d_, v_.hs_input_, v_.hs_link_, v_.hs_cs_);
+                    ok = ok && cudaEventRecord(v_.hs_post_, v_.hs_cs_) == cudaSuccess;
+                    q80p_vhead(v_.head_->weights(), v_.xq_, v_.head_logits_, (int) N, (int) v_.n_vocab_, T,
+                               v_.head_keep_d_, v_.vhead_scratch_, cs, r0, (unsigned*) v_.hs_link_);
+                    ok = ok && cudaStreamWaitEvent(cs, v_.hs_post_, 0) == cudaSuccess;
+                    q80p_vhead_merge(v_.head_logits_, (int) v_.n_vocab_, r0, T, r1, v_.head_keep_d_, v_.hs_list_,
+                                     v_.hs_link_, cs);
+                    if (!ok) { err = "verify: the split head's fork failed"; return false; }
+                } else if (v_.hs_rows_ > 0 && !v_.hs_two_) {   // the exact head split: the peer's rows while CUDA0 does its own
                     const int r0 = v_.hs_rows_, r1 = (int) v_.n_vocab_ - r0;
                     const size_t xb = native_q8_1_bytes((int) N, T);
                     bool ok = cudaMemcpyAsync(v_.hs_hxq_, v_.xq_, xb, cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
@@ -106,8 +120,13 @@ bool Verifier::WindowRecorder::head() {
                               v_.vhead_scratch_, cs);
                 else if (v_.head_->type() == 14 && q6k_head_supported((int) N, T))
                     q6k_head_mmvq(v_.head_->weights(), v_.xq_, v_.head_logits_, (int) N, (int) v_.n_vocab_, T, cs);
-                else if (v_.head_->type() == 8 && T >= 4 && q80_head_supported((int) N, T))   // four columns or more: the same bits as one wave
-                    q80_head_mmvq(v_.head_->weights(), v_.xq_, v_.head_logits_, (int) N, (int) v_.n_vocab_, T, cs);
+                // the exact list's rows, the rest bounded; a batch window's list length is 0, so with the two-stage
+                // split too every row is scored here on CUDA0
+                else if (v_.head_->planes() && v_.head_keep_d_ != nullptr)
+                    q80p_vhead(v_.head_->weights(), v_.xq_, v_.head_logits_, (int) N, (int) v_.n_vocab_, T,
+                               v_.head_keep_d_, v_.vhead_scratch_, cs);
+                else if (v_.head_->planes())
+                    q80p_mmvq(v_.head_->weights(), v_.xq_, v_.head_logits_, (int) N, (int) v_.n_vocab_, T, cs);
                 else
                     native_mmvq(v_.head_->type(), v_.head_->weights(), v_.xq_, v_.head_logits_, (int) N, (int) v_.n_vocab_, T, cs);
             } catch (const std::exception& e) {

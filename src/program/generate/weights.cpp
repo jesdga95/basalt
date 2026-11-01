@@ -89,56 +89,25 @@ int weights(Context& context) {
                          "skipped: served from the source tensors)",
                  (unsigned long long) (pool_bytes >> 20), o.model.c_str(), load_s(), skip.size());
     if (!hc8_names.empty()) {
-        // the copies the model file holds are registered as they are; the rest are quantized from their bf16 matrices,
-        // staged for the purpose and dropped
-        std::set<std::string> staged_names;
-        size_t n_done = 0;
+        // the matrices held only as 8-bit copies are registered from the model file's table
         for (const std::string& n : hc8_names) {
             const basalt::core::WeightRef* r0 = wt.find(n);
             const void* q = r0 ? basalt::core::hc8_table_adopt(n, nullptr, (int) r0->ne1, (int) r0->ne0) : nullptr;
-            if (q == nullptr) { staged_names.insert(n); continue; }
-            if (!wt.rebind(n, q)) {
-                basalt::log::error("basalt generate", "hc8: no 8-bit copy of %s", n.c_str());
-                return 1;
-            }
-            ++n_done;
-        }
-        uint64_t stage_bytes = 0;
-        if (!staged_names.empty()) {
-        std::set<std::string> others;
-        for (const auto& kv : wt.all())
-            if (!staged_names.count(kv.first)) others.insert(kv.first);
-        void* stage = nullptr;
-        basalt::core::WeightTable staged;
-        if (!basalt::core::WeightTable::pool_bytes(pack_files, stage_bytes, err, &others) ||
-            cudaMalloc(&stage, stage_bytes) != cudaSuccess || !staged.load(pack_files, stage, stage_bytes, err, &others, false)) {
-            basalt::log::error("basalt generate", "hc8: staging the hyper-connection matrices failed%s%s",
-                         err.empty() ? "" : ": ", err.c_str());
-            return 1;
-        }
-        for (const std::string& n : staged_names) {
-            const basalt::core::WeightRef* r = staged.find(n);
-            const void* q = r && r->data && r->kind == basalt::core::WeightKind::Bf16InF32
-                                ? basalt::kernels::hc8_adopt((const uint16_t*) r->data, (int) r->ne1, (int) r->ne0)
-                                : nullptr;
             if (q == nullptr || !wt.rebind(n, q)) {
                 basalt::log::error("basalt generate", "hc8: no 8-bit copy of %s", n.c_str());
                 return 1;
             }
-            ++n_done;
-        }
-        cudaFree(stage);
         }
         for (const auto& kv : wt.all())   // the injections stay bf16 in the arena, with copies beside them
-            if (kv.first.ends_with("_inject.weight") && kv.first.find(".hc_") != std::string::npos && kv.second.data) {
-                if (basalt::core::hc8_table_adopt(kv.first, (const uint16_t*) kv.second.data, (int) kv.second.ne1,
-                                                  (int) kv.second.ne0) == nullptr)
-                    basalt::kernels::hc8_prepare((const uint16_t*) kv.second.data, (int) kv.second.ne1, (int) kv.second.ne0);
+            if (kv.first.ends_with("_inject.weight") && kv.first.find(".hc_") != std::string::npos && kv.second.data &&
+                basalt::core::hc8_table_adopt(kv.first, (const uint16_t*) kv.second.data, (int) kv.second.ne1,
+                                              (int) kv.second.ne0) == nullptr) {
+                basalt::log::error("basalt generate", "hc8: no 8-bit copy of %s", kv.first.c_str());
+                return 1;
             }
-        basalt::log::info("basalt hc8", "%zu hyper-connection matrices held only as 8-bit copies (%.0f MiB of bf16 "
-                             "left out of VRAM, %.0f MiB of copies) in %.1f s",
-                     n_done, (double) stage_bytes / 1048576.0, (double) basalt::kernels::hc8_bytes() / 1048576.0,
-                     load_s());
+        basalt::log::info("basalt hc8", "%zu hyper-connection matrices held only as 8-bit copies (%.0f MiB of copies) "
+                             "in %.1f s",
+                     hc8_names.size(), (double) basalt::kernels::hc8_bytes() / 1048576.0, load_s());
     }
 
     basalt::core::NativeDense native_dense;
