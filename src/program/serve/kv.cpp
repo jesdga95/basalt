@@ -150,8 +150,21 @@ bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& 
     const int64_t before = xcache.slots();
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
-    const int64_t room = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
+    int64_t room = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
     if (!shrink && add > room) { e.clear(); return false; }
+    // the KV of idle conversations whose time is up goes before the expert cache's slots, any idle one's before
+    // a refusal
+    int64_t parked = 0;
+    auto park = [&](bool any) {
+        const int64_t got = add > room ? park_idle(&s, add - room, any, e) : 0;
+        if (got > 0) {
+            parked += got;
+            cudaMemGetInfo(&free_b, &total_b);
+            room = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
+        }
+        return got >= 0;
+    };
+    if (!park(false)) return false;
     if (add > room && xcache.segmented()) {
         const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
         auto keep_for = [&](int64_t a) {
@@ -162,6 +175,7 @@ bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& 
             const int64_t a = (int64_t) basalt::core::session_kv_grow_bytes(s, c);
             return a <= room || xcache.slots_after_shrink(keep_for(a)) >= floor;
         };
+        if (!leaves_floor(cells) && !park(true)) return false;
         if (!leaves_floor(cells)) {
             // the most cells on the 256-cell grid that leave it, down to `min_cells`
             int64_t best = -1;
@@ -203,6 +217,7 @@ bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& 
         relend();
     }
     if (!basalt::core::session_kv_map(s, cells, e)) { e = "elastic KV: " + e; return false; }
+    if (parked > 0 && !cache_regrow(e)) return false;   // the rest of what they held is the cache's again
     ++kv_moves;
     basalt::log::info("basalt serve", "elastic KV: %lld cells backed (+%.0f MiB), the expert cache %lld -> %lld "
                          "slots, in %.1f ms", (long long) basalt::core::session_kv_cells(s),

@@ -39,7 +39,7 @@ namespace basalt::kernels::cpu {
 /// One expert evaluation.  `act` is SHARED and read-only across the whole batch - that sharing is the point
 /// of `s2_expert_vnni_q` and it is what saves 480 redundant activation conversions per token.
 struct ExpertJob {
-    const uint8_t* blob = nullptr;   ///< one 1,382,400-byte expert
+    const uint8_t* blob = nullptr;   ///< one expert's blob in the pack's layout
     const ActQ* act = nullptr;       ///< the layer's quantized activation, shared
     float* out = nullptr;            ///< H floats, written by exactly one worker
     float weight = 1.0f;             ///< the router weight; applied by the HOST, not here

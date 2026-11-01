@@ -122,9 +122,10 @@ public:
     void hold(int64_t layer, int64_t expert) { hold_[(size_t) (layer * n_expert_ + expert)] = 1; }
     /// Copies (layer, expert)'s bytes from the peer's slot into `dst` on device 0 (queued on `stream`).
     bool copy_to(int64_t layer, int64_t expert, uint8_t* dst, cudaStream_t stream, std::string& err);
-    /// PEER_PROMOTE: `in` moved to the primary, which gave up `out` (`blob`: its bytes in host memory).  The
-    /// slot `in` held takes `out`, resident at `apply_pending`.  Call only between verify windows.
-    bool reassign(int64_t layer, int32_t in, int32_t out, const uint8_t* blob, std::string& err);
+    /// PEER_PROMOTE: `in` of `layer` moved to the primary, which gave up `out` of `lout` (`blob`: its bytes in host
+    /// memory, a blob of the same size).  The slot `in` held takes `out`, resident at `apply_pending`.  Call only
+    /// between verify windows.
+    bool reassign(int64_t layer, int32_t in, int64_t lout, int32_t out, const uint8_t* blob, std::string& err);
     /// Between requests: each (slot, residency index) of `want` holds that expert afterwards, copied from the expert
     /// source; the slots it does not name keep theirs.  Lands any swap in flight first.  `moved` gets the slots
     /// rewritten.  Not with an exclusive tier.

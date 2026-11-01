@@ -5,7 +5,8 @@
 // is the first read's q8_1 rows and mixed output, its result the output projection's `bo`, which the second read adds.
 // One CTA per SM (a device with fewer than 170 SMs runs fewer, each taking more tiles and heads); the phases hand over through counters in global memory.  The kernel needs every CTA resident, so it
 // must be launched with the stream drained of kernels that wait on later work (it is a programmatic dependent of the
-// first read and the second read is its dependent).
+// first read and the second read is its dependent).  A hand-off wait that passes its bound sets the abort word and
+// falls through (wait_abort.hpp).
 #pragma once
 
 #include "basalt/kernels/dec_gdn.hpp"

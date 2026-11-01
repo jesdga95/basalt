@@ -95,6 +95,9 @@ struct ConversationImageKey {
 };
 
 struct ConversationCheckpoint {
+    /// What took the checkpoint: the end of a prompt, a fixed stride inside a long one, or the end of the system prompt.
+    enum Source : uint8_t { kTurnEnd = 0, kPeriodic = 1, kRoot = 2 };
+    Source source = kTurnEnd;
     std::vector<int32_t> ids;
     std::vector<ConversationImageKey> imgs;
     CheckpointBytes gdn, ple, tails, dead, block_pos;
@@ -202,6 +205,8 @@ struct SavedConversation {
     std::vector<ConversationCheckpoint> checkpoints;
     std::vector<ConversationKv> kv; // main layers followed by the draft layer
     bool cvec = true;
+    /// an idle batch slot's conversation moved out of VRAM (ConversationCache::put_slot): outside the byte budget
+    bool from_slot = false;
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
 
@@ -259,6 +264,9 @@ public:
     bool enabled() const { return budget_ != 0 && slots_ != 0; }
     size_t bytes() const { return bytes_ + reuse_.bytes(); }
     size_t size() const { return entries_.size(); }
+    /// the idle slots' conversations among them (put_slot) and their bytes
+    size_t slot_size() const { return slot_count_; }
+    size_t slot_bytes() const { return slot_bytes_; }
     size_t evictions() const { return evictions_; }
 
     // Retain only the restored K/V buffers, not duplicate running checkpoints.
@@ -271,7 +279,7 @@ public:
         reuse_owner_ = owner;
         ConversationKvReuse candidate{std::move(kv), tokens, tokens, {}};
         for (auto& k : stage_kv) candidate.stages.push_back(ConversationKvReuse{std::move(k), tokens, tokens, {}});
-        if (enabled() && candidate.bytes() <= budget_ - bytes_) reuse_ = std::move(candidate);
+        if (enabled() && candidate.bytes() <= budget_ - (bytes_ - slot_bytes_)) reuse_ = std::move(candidate);
     }
     void limit_reuse(int64_t first_dirty) {
         reuse_.unchanged_tokens = std::min(reuse_.unchanged_tokens, first_dirty);
@@ -290,7 +298,7 @@ public:
     size_t retained_bytes() const { return reuse_.bytes(); }
     bool can_fit(size_t incoming, size_t held = 0) const {
         return enabled() && held <= budget_ && incoming <= budget_ - held &&
-               entries_.size() < slots_ && bytes() <= budget_ - held - incoming;
+               entries_.size() - slot_count_ < slots_ && budgeted_bytes() <= budget_ - held - incoming;
     }
 
     template<class Token>
@@ -313,23 +321,33 @@ public:
 
     SavedConversation take(size_t index) {
         SavedConversation out = std::move(entries_.at(index));
-        bytes_ -= out.bytes();
         entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
+        forget(out);
         return out;
     }
 
     // Reserve before allocating a snapshot. held is an incoming image removed
     // with take() but still alive during the exchange; count it against RAM too.
+    // The idle slots' conversations are outside the budget: they stay.
     bool make_room(size_t incoming, size_t held = 0) {
         if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
-        if (bytes() > budget_ - held - incoming) reuse_ = {};
-        while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
-            bytes_ -= entries_.front().bytes();
-            if (spill_) spilled_.push_back(std::move(entries_.front()));
-            entries_.pop_front();
-            ++evictions_;
-        }
+        if (budgeted_bytes() > budget_ - held - incoming) reuse_ = {};
+        while (entries_.size() - slot_count_ >= slots_ || bytes_ - slot_bytes_ > budget_ - held - incoming)
+            if (!evict_oldest(false)) break;
         return true;
+    }
+
+    /// An idle batch slot's conversation, out of VRAM: kept whatever the byte budget (the caller has admitted its
+    /// RAM), at most `keep` of them; the longest parked leaves first (to the tier below when spilling).
+    void put_slot(SavedConversation&& image, size_t keep) {
+        drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
+        while (slot_count_ > 0 && slot_count_ >= keep && evict_oldest(true)) {}
+        image.from_slot = true;
+        const size_t n = image.bytes();
+        entries_.push_back(std::move(image));
+        bytes_ += n;
+        slot_bytes_ += n;
+        ++slot_count_;
     }
 
     /// With spilling on, what make_room evicts waits in take_spilled() for the tier below (the disk) instead of going.
@@ -358,8 +376,9 @@ public:
             for (const auto& c : e.checkpoints)
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
             if (e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest)) {
-                bytes_ -= e.bytes();
+                SavedConversation gone = std::move(entries_[i]);
                 entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
+                forget(gone);
                 ++dropped;
                 continue;
             }
@@ -378,6 +397,8 @@ public:
             for (auto& e : entries_) spilled_.push_back(std::move(e));
         entries_.clear();
         bytes_ = 0;
+        slot_bytes_ = 0;
+        slot_count_ = 0;
         reuse_ = {};
         reuse_owner_ = nullptr;
         return freed;
@@ -388,13 +409,35 @@ public:
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
         if (!make_room(n, held)) return false;
+        image.from_slot = false;
         entries_.push_back(std::move(image));
         bytes_ += n;
         return true;
     }
 
 private:
+    size_t budgeted_bytes() const { return bytes_ - slot_bytes_ + reuse_.bytes(); }
+    // the bookkeeping of an entry that has left `entries_`
+    void forget(const SavedConversation& e) {
+        const size_t n = e.bytes();
+        bytes_ -= n;
+        if (e.from_slot) { slot_bytes_ -= n; --slot_count_; }
+    }
+    // the oldest entry of one kind (an idle slot's or a budgeted one) leaves; false when there is none
+    bool evict_oldest(bool from_slot) {
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            if (entries_[i].from_slot != from_slot) continue;
+            SavedConversation gone = std::move(entries_[i]);
+            entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
+            forget(gone);
+            if (spill_) spilled_.push_back(std::move(gone));
+            ++evictions_;
+            return true;
+        }
+        return false;
+    }
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
+    size_t slot_bytes_ = 0, slot_count_ = 0;
     std::deque<SavedConversation> entries_; // least recently active first
     bool spill_ = false;
     std::vector<SavedConversation> spilled_;

@@ -58,7 +58,6 @@ int main() {
               "and the OS reports execution speed as never lowered");
 #endif
 
-    (void) gpu_peer_access();
     const std::string os = host_os_name();
     check(gpu_memory_pages() == (os == "Windows" || os == "WSL2"), "gpu_memory_pages: only the Windows driver pages");
     const DynLib nvml = DynLib::open_nvml();

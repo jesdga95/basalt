@@ -20,7 +20,8 @@
 
 using namespace basalt::kernels;
 // the wait helpers of the bound header: this translation unit keeps its own copies
-#define mkb_hang mid_mkb_hang
+#define mkb_word mid_mkb_word
+#define mkb_give_up mid_mkb_give_up
 #define mkb_mwait mid_mkb_mwait
 #define mkb_now mid_mkb_now
 #define mkb_try mid_mkb_try
@@ -580,9 +581,12 @@ void mid_chain_init() {
         return;
     }
     d.ctas = sms < kMidCtas ? sms : kMidCtas;
+    wait_abort_init();
+    unsigned long long* const word = wait_abort_device_word();
     bool ok = cudaMalloc((void**) &d.cnt, (2 * NCTR + 1) * 4) == cudaSuccess &&
               cudaMemset(d.cnt, 0, (2 * NCTR + 1) * 4) == cudaSuccess &&
-              cudaMalloc((void**) &d.abv, (size_t) R_HV * 2 * XT * 4) == cudaSuccess;
+              cudaMalloc((void**) &d.abv, (size_t) R_HV * 2 * XT * 4) == cudaSuccess &&
+              cudaMemcpyToSymbol(mkb_word, &word, sizeof word) == cudaSuccess;
     for (const int t : {1, 2, 3, 4, XT}) {
         if (!ok) break;
         ok = cudaFuncSetAttribute((const void*) mid_pick(t, 0, 0, 0), cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX) == cudaSuccess;

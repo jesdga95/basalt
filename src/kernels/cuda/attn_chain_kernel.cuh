@@ -72,7 +72,11 @@ __device__ __forceinline__ void barn(int id, int n) { asm volatile("bar.sync %0,
 // out of the layer loop (and spilled: a local-memory reload after an acquire is an L2 round trip)
 __device__ __forceinline__ void pfence() { asm volatile("fence.proxy.async.shared::cta;" ::: "memory"); }
 __device__ __forceinline__ void spin_ge(const unsigned* c, unsigned target) {
-    if (ldacq(c) < target) { const unsigned t0_ = mkb_now(); while (ldacq(c) < target) if (mkb_now() - t0_ > MKB_NS) mkb_hang(2, __LINE__); }
+    if (ldacq(c) < target) {
+        const unsigned long long t0_ = mkb_now();
+        while (ldacq(c) < target)
+            if (mkb_now() - t0_ > basalt::kernels::kWaitPollNs && mkb_give_up(t0_, 2, __LINE__)) return;
+    }
 }
 __device__ __forceinline__ void hop_copy(const unsigned* ctr, unsigned target, void* dst, const void* src, unsigned bytes, uint64_t* bar) {
     spin_ge(ctr, target);

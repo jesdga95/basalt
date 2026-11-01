@@ -54,7 +54,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
         err = "verify: the batch QSA table staging failed";
         return false;
     }
-    std::memset(h_qseg_, 0, (size_t) (basalt::kernels::kQsaSegMaxRows + 8) * sizeof(QsaSeg));
+    std::fill_n(h_qseg_, basalt::kernels::kQsaSegMaxRows + 8, QsaSeg{});
     // the QSA chain's segment kernels need resident, unrotated INT8 K/V in every slot
     if (!(qsa_dec_fused_supported(s))) {
         err = "verify: batch windows need the native QSA kernels";

@@ -7,12 +7,19 @@
 // L2 holds), next to the three kernels, in a graph with PDL.  The replaced kernels are checked against CPU references by
 // dense_tc_parity and dec_gdn_parity.
 //
-//     build/mid_chain_parity [iters]
+//     build/mid_chain_parity [iters] [--hold <ms>]
+//
+// --hold: one launch with one SM held by another stream's kernel for <ms> (as a host-gated spin kernel beside it would
+// hold it; the decode graph keeps every side branch away from the mid chain).  The kernel needs every CTA resident, so
+// it ends only after the release.  Held for less than the wait bound (MKB_NS) it has the bits of a free launch; held
+// longer, its waits give up at the bound and set the abort word (wait_abort.hpp) instead of trapping, the resident CTAs
+// leave, the last one runs on an SM they free, the launch ends cleanly, and the next launch is bitwise again.  The mid_chain_hold build has a short bound for this.
 #include "basalt/kernels/dec_gdn.hpp"
 #include "basalt/kernels/dense_tc.hpp"
 #include "basalt/kernels/hc_fused.hpp"
 #include "basalt/kernels/mid_chain.hpp"
 #include "basalt/kernels/pdl.hpp"
+#include "basalt/kernels/wait_abort.hpp"
 
 #include <cuda_runtime.h>
 
@@ -22,12 +29,17 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <random>
 #include <string>
 #include <vector>
 
 namespace K = basalt::kernels;
+
+#ifndef MKB_NS
+#define MKB_NS 2000000000ull   // the kernel's wait bound (attn_chain_bound.cuh)
+#endif
 
 namespace {
 constexpr int N = 2560, HC = 4, D = N * HC, LR = 320, NE = 512, KT = 10, S = 128, HV = 48, HK = 16;
@@ -115,6 +127,9 @@ struct Bufs {
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     const int iters = argc > 1 ? std::atoi(argv[1]) : 20;
+    int hold_ms = -1;
+    for (int i = 1; i + 1 < argc; ++i)
+        if (std::strcmp(argv[i], "--hold") == 0) hold_ms = std::atoi(argv[i + 1]);
     K::hc_fused_init();
     K::mid_chain_init();
     if (!K::hc_fused_supported()) { std::printf("mid_chain_parity: no fused hc read on this device\n"); return 77; }
@@ -242,6 +257,66 @@ int main(int argc, char** argv) {
     const bool big = sms >= 160;   // the output projection has its one-tile kernel
     int bad = 0;
     auto ref_names_n = [](size_t n) { return n + 1; };
+
+    if (hold_ms >= 0) {
+        const Layer w = make_layer(14, 14, 14, false);
+        const int T = 2;
+        auto differing = [](const std::vector<std::vector<uint8_t>>& a, const std::vector<std::vector<uint8_t>>& b2) {
+            size_t d = 0;
+            for (size_t k = 0; k < a.size(); ++k) for (size_t j = 0; j < a[k].size(); ++j) d += a[k][j] != b2[k][j];
+            return d;
+        };
+        reset(); run(w, T, true, true, s); CK(cudaStreamSynchronize(s));
+        const auto ref = snap(T, true);
+        int *h_go = nullptr, *h_started = nullptr, *d_go = nullptr, *d_started = nullptr;
+        CK(cudaHostAlloc((void**) &h_go, 64, cudaHostAllocMapped));
+        CK(cudaHostAlloc((void**) &h_started, 64, cudaHostAllocMapped));
+        CK(cudaHostGetDevicePointer((void**) &d_go, h_go, 0));
+        CK(cudaHostGetDevicePointer((void**) &d_started, h_started, 0));
+        cudaStream_t sb;
+        CK(cudaStreamCreateWithFlags(&sb, cudaStreamNonBlocking));
+        *(volatile int*) h_go = 0;
+        *(volatile int*) h_started = 0;
+        reset();
+        K::hc_test_hold_sms(1, d_go, d_started, sb);
+        auto t0 = std::chrono::steady_clock::now();
+        auto ms_since = [&] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); };
+        while (*(volatile int*) h_started < 1 && ms_since() < 2000) {}
+        if (*(volatile int*) h_started < 1) { std::printf("mid_chain_parity: the SM holder never started\n"); *(volatile int*) h_go = 1; return 1; }
+        t0 = std::chrono::steady_clock::now();
+        run(w, T, true, true, s);
+        bool early = false;
+        while (ms_since() < hold_ms)
+            if (cudaStreamQuery(s) == cudaSuccess) { early = true; break; }
+        *(volatile int*) h_go = 1;
+        const cudaError_t e = cudaStreamSynchronize(s);
+        const double ended = ms_since();
+        CK(cudaStreamSynchronize(sb));
+        const unsigned long long code = K::wait_abort_code();
+        const bool expect_abort = (unsigned long long) hold_ms * 1000000ull > (unsigned long long) MKB_NS;
+        std::printf("hold 1 of %d SMs for %d ms (wait bound %.0f ms): k_mid %s, ended %.1f ms after its launch (%s), abort word %s\n",
+                    sms, hold_ms, MKB_NS / 1e6, early ? "ended with the SM held" : "stuck until the release", ended,
+                    cudaGetErrorString(e), code != 0 ? K::wait_abort_text(code).c_str() : "clear");
+        // past the bound the resident CTAs give up and leave, and the last one runs on an SM they free
+        bad += early && (!expect_abort || ended * 1e6 < (double) MKB_NS) ? 1 : 0;
+        bad += e != cudaSuccess ? 1 : 0;
+        if (!expect_abort) {
+            const size_t d = e == cudaSuccess ? differing(ref, snap(T, true)) : 0;
+            std::printf("  held below the bound: %zu bytes differ from the free launch\n", d);
+            bad += (int) d + (code != 0 ? 1 : 0);
+        } else {
+            bad += (code >> 56 & 0x7fu) == K::kWaitMidChain ? 0 : 1;
+            K::wait_abort_clear();
+            reset(); run(w, T, true, true, s);
+            const cudaError_t e2 = cudaStreamSynchronize(s);
+            const size_t d = e2 == cudaSuccess ? differing(ref, snap(T, true)) : 0;
+            std::printf("  held past the bound: the next launch %s, %zu bytes differ from the free launch, abort word %s\n",
+                        cudaGetErrorString(e2), d, K::wait_abort_code() != 0 ? "set" : "clear");
+            bad += (int) d + (e2 != cudaSuccess ? 1 : 0) + (K::wait_abort_code() != 0 ? 1 : 0);
+        }
+        std::printf(bad == 0 ? "mid_chain_parity --hold: as expected\n" : "mid_chain_parity --hold: %d unexpected\n", bad);
+        return bad != 0;
+    }
 
     // the pair ring alternates its tiles between two groups: its slot count is even for every type triple
     for (int q : {8, 12, 13, 14, 21, 23}) for (int z : {8, 12, 13, 14, 21, 23}) for (int o : {8, 12, 13, 14, 21, 23}) {
@@ -436,7 +511,7 @@ int main(int argc, char** argv) {
         const size_t cnt = (size_t) NL * kMidStampCtas * kMidStampPts;
         CK(cudaMalloc(&sd, cnt * 8));
         // the stamp points (the kernel's enum)
-        const int E_ENTRY = 0, E_WAIT = 1, E_TILE0 = 2, E_PAIR_REL = 9, E_PZ_REL = 11, E_PAIR_END = 13, E_REQ0 = 14, E_REQ1 = 15, E_OFULL = 16, E_RPAIR = 17,
+        const int E_WAIT = 1, E_PAIR_REL = 9, E_PZ_REL = 11, E_PAIR_END = 13, E_REQ0 = 14, E_REQ1 = 15, E_OFULL = 16, E_RPAIR = 17,
                   E_RSTATE = 18, E_RTOK = 19, E_RPZ = 20, E_RREC = 21, E_OREC = 22, E_ODONE = 23;
         std::printf("phase ledger (cold, 48 layers, PDL; us after the first CTA's wait; first/median/last over CTAs, median over layers):\n");
         std::printf("  T  pair-end f/m/l        C_PAIR  C_PZ   C_REC  | rec: pair->state state->tok tok->PZ(slack) | last-out CTA: req0 req1 C_REC-seen ofull  done | k_mid end\n");

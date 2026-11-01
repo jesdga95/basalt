@@ -15,9 +15,10 @@ from serve.api import responses as responses_api
 from serve.api.responses import error_body as responses_error_body
 from serve import ROOT
 from serve.api.anthropic import anthropic_collect, anthropic_events
-from serve.engine.errors import EngineDied, EngineStarting, EngineStuck, GpuBusy, ModelBusy
+from serve.engine.errors import EngineDied, EngineError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, checked as checked_bias
+from serve.config import checked_sampling
 from serve.frontend import anthropic_to_messages, forced_call, openai_to_messages
 from serve.api.openai import openai_chunks, openai_collect
 from serve.api.responses import ResponsesError
@@ -389,6 +390,11 @@ def make_handler(svc: Service):
                     self._count_tokens(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
+            except EngineError as e:                         # the engine failed: not the request's fault
+                if path == "/v1/responses":
+                    self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
+                else:
+                    self._json(500, {"error": {"type": "server_error", "message": str(e)}})
             except BadBody as e:
                 if path == "/v1/responses":
                     self._json(e.status, responses_error_body(str(e)))
@@ -528,6 +534,7 @@ def make_handler(svc: Service):
                 raise ValueError("structured response_format with tools is not supported")
             svc.require_grammar(req.get("response_format"))
             svc.load()
+            checked_sampling(req)                             # a sampling value out of range is a 400 likewise
             req[BIAS_KEY] = checked_bias(req, svc.engine)     # a bad logit_bias is a 400 before streaming
             req[GRAMMAR_KEY] = svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"),
                                                req.get("response_format"))
@@ -587,6 +594,8 @@ def make_handler(svc: Service):
                     yield from asm.finish(done)
             try:
                 items = primed(events(), ids)
+            except EngineError:
+                raise
             except ValueError as e:                          # too long for the context: found when the engine counted
                 err = ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None)
                 return self._json(err.status, err.body())
@@ -596,8 +605,11 @@ def make_handler(svc: Service):
                 except EngineDied as e:
                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
                                                                 code="server_error"))
-                except ValueError as e:                      # the engine's ERR line
+                except EngineError as e:                     # the engine failed
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
+                except ValueError as e:                      # the engine refused the request
+                    err = ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None)
+                    return self._json(err.status, err.body())
                 return self._json(200, result)
             self._sse()
             last = time.monotonic()
@@ -666,6 +678,10 @@ def make_handler(svc: Service):
             except ValueError as e:
                 raise ResponsesError(str(e), "reasoning_budget_tokens") from None
             try:
+                checked_sampling(req)
+            except ValueError as e:
+                raise ResponsesError(str(e), str(e).split(":")[0]) from None
+            try:
                 stop_strings(req)
             except ValueError as e:
                 raise ResponsesError(str(e), "stop") from None
@@ -704,6 +720,7 @@ def make_handler(svc: Service):
                 raise ValueError(str(e).replace("response_format json_schema and json_object", "output_config.format json_schema")) from None
             req[GRAMMAR_KEY] = svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"), response_format)
             svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
+            checked_sampling(req)                             # likewise a sampling value out of range
             stop_strings(req)                                 # likewise a bad stop
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
