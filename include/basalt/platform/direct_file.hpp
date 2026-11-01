@@ -1,9 +1,10 @@
 // include/basalt/platform/direct_file.hpp - unbuffered asynchronous file reads.
 //
-// The n-gram table (26.8 GiB) stays on the SSD and must never occupy RAM, including the OS file cache. A memory
-// map cannot promise that; an unbuffered read can. Linux reads it with O_DIRECT preads issued from a thread
-// pool (submit only queues), so many reads are in flight. Windows reads the same file with FILE_FLAG_NO_BUFFERING
-// overlapped reads completed through an I/O completion port; the queue of reads is the same either way.
+// The n-gram table (26.8 GiB) stays on the SSD and out of the process's memory. A memory map cannot promise that;
+// a positional read can. Linux reads it with O_DIRECT preads issued from a thread pool (submit only queues), so
+// many reads are in flight and the OS file cache never holds it. Windows reads the same file with overlapped reads
+// completed through an I/O completion port, with FILE_FLAG_NO_BUFFERING unless `open` is told the file is mapped
+// elsewhere; the queue of reads is the same either way.
 //
 // Contract of every read: offset, length and buffer address are multiples of `alignment()` (4096 here).
 // Reads past end of file return the bytes that exist; `Completion::bytes` says how many.
@@ -29,7 +30,10 @@ public:
 
     /// `workers` is 0 for the platform default, or 1..256 issuing threads. An unbuffered open the file system
     /// refuses (no O_DIRECT / NO_BUFFERING there) fails with `err`, and the caller reads through its own handle.
-    bool open(const std::string& path, std::string& err, int workers = 0);
+    /// `mapped_elsewhere`: the process also maps the file or reads it through the file cache. Windows then reads it
+    /// through the file cache too, because NTFS runs the unbuffered reads of a file that has a mapped view or cached
+    /// reads one at a time; Linux reads around the cache either way. The alignment contract does not change.
+    bool open(const std::string& path, std::string& err, int workers = 0, bool mapped_elsewhere = false);
     void close();
     bool is_open() const;
     uint64_t size() const;
