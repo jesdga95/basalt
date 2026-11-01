@@ -61,7 +61,7 @@ threshold. A request decoding alone runs the single-stream path and is not affec
 
 At startup the server prints one `[server] kv` line per device with all the session state placed there, for
 example `12.5GiB cuda2 solo=262144 slots=2x262144 draft=0.5GiB`. With elastic KV (the default for a server whose
-`--max-context` is above 32768, or with `--parallel` for slots above 4096 tokens) it reads `0.6/4.4GiB cuda0 elastic`:
+`--max-context` is above 8192, or with `--parallel` for slots above 4096 tokens) it reads `0.6/4.4GiB cuda0 elastic`:
 the memory backed at startup, and what the cache can grow to at `--max-context`. Because that memory is taken from the
 expert cache, the engine warns (`warning: the N batch slots' sessions ... take X GiB of CUDA0 ...`) when it leaves the
 cache short of the expert set, or at under half of what it would hold without the slots, and names the remedies: a smaller `--max-context`, no `--slot-full-context`, fewer `--parallel` slots. If a slot's session
