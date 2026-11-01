@@ -618,8 +618,9 @@ int Runtime::init_conversations() {
         std::vector<int32_t> nxt((size_t) T);
         for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
         // batched through the prompt path when it can (one GPU: a layer split's drafter is on the last stage)
-        const bool batched = mtp_on && !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
-        if (!e.empty() || (mtp_on && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
+        const bool draft = mtp_on && !jev_scoring;
+        const bool batched = draft && !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
+        if (!e.empty() || (draft && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
         // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
         const int64_t done = p0 + T;
         pp_reached = done;
@@ -629,7 +630,7 @@ int Runtime::init_conversations() {
         basalt::core::progress_at("reading the prompt (batched), done up to token", done);
         basalt::core::progress_beat();
         std::fflush(stdout);
-        if (o.prompt_cache_every > 0 && done >= pp_next_check) {
+        if (!jev_scoring && o.prompt_cache_every > 0 && done >= pp_next_check) {
             if (done == pp_part_ckpt && !multi_gpu) {
                 pp_next_check = done + o.prompt_cache_every;
                 return true;

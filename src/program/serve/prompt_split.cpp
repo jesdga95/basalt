@@ -206,7 +206,7 @@ bool Request::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool& ra
     // came in (the card before writes it again two chunks later, and not at all for the last); after its last
     // chunk, every stage's state to the main session and the slots' experts back, while the main card reads
     // its own last chunk
-    const int64_t first_cell = runtime_.mtp_on ? std::max<int64_t>(0, runtime_.mtp.first_needed()) : INT64_MAX;
+    const int64_t first_cell = runtime_.mtp_on && !runtime_.jev_scoring ? std::max<int64_t>(0, runtime_.mtp.first_needed()) : INT64_MAX;
     bool given = false;
     int64_t given_at = -1;   // the cell the stages' state came back up to
     double ms_copy = 0;
@@ -397,7 +397,7 @@ bool Request::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool& ra
     // layers [lb, n_layers) here
     const auto td = Clock::now();
     for (const Relay& rl : relays) {
-        if (!ok || !runtime_.mtp_on) break;
+        if (!ok || !runtime_.mtp_on || runtime_.jev_scoring) break;
         std::vector<int32_t> nxt((size_t) rl.n);
         for (int64_t t = 0; t < rl.n; ++t) nxt[(size_t) t] = (int32_t) runtime_.cur[(size_t) (rl.cell0 + t + 1)];
         const bool batched = runtime_.sp.draft_kv(runtime_.mtp, rl.rows, nxt.data(), rl.n, rl.cell0, e);

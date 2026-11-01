@@ -130,7 +130,7 @@ Flow Request::read_prompt() {
     std::span<const int64_t> stops(standard_stops);
     std::vector<int64_t> score_stops;
     if (!score_ids.empty()) {
-        score_stops.assign(std::begin(standard_stops), std::end(standard_stops));
+        score_stops.push_back(n - 1);
         score_stops.insert(score_stops.end(), score_frontiers.begin(), score_frontiers.end());
         std::sort(score_stops.begin(), score_stops.end());
         score_stops.erase(std::unique(score_stops.begin(), score_stops.end()), score_stops.end());

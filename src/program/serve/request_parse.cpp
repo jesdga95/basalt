@@ -169,11 +169,11 @@ Flow Request::parse() {
         req_relax = 0;
         req_temperature = 0;
         req_penalty_last_n = 0;
-        size_t rows = 0, longest = 0;
-        for (const auto& b : score_branches) { rows += b.tokens.size(); longest = std::max(longest, b.tokens.size()); }
+        size_t longest = 0;
+        for (const auto& b : score_branches) longest = std::max(longest, b.tokens.size());
         if (!score_branches.empty() && (score_branches.size() < 2 || score_branches.size() > (size_t) runtime_.o.jev ||
-            rows > (size_t) runtime_.ver.max_t() || n - 1 + (int64_t) longest + 9 > runtime_.o.max_context)) {
-            std::printf("ERR bad request: Jev branch wave exceeds its lane, window or context budget\n"); return Flow::next;
+            score_branches.size() > (size_t) runtime_.ver.max_t() || n - 1 + (int64_t) longest + 9 > runtime_.o.max_context)) {
+            std::printf("ERR bad request: Jev branch wave exceeds its lane or context budget\n"); return Flow::next;
         }
     } else if (score_fresh || !score_frontiers.empty() || !score_branches.empty()) {
         std::printf("ERR bad request: Jev checkpoint keys require candidates\n");

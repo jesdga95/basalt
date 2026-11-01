@@ -62,7 +62,7 @@ int Runtime::init_verify() {
         for (int st = 1; st < n_stages; ++st) {
             bool ok_s = false;
             if (split_same) {
-                ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err);
+                ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, o.jev, 2}), err);
             } else {
                 GpuStage& gs = *stages[(size_t) st - 1];
                 const basalt::core::OnDevice on(gs.dev);
@@ -74,7 +74,7 @@ int Runtime::init_verify() {
                 vs.slot_off = gs.cache.slot_offsets();
                 vs.n_slots = gs.cache.slots();
                 gs.ver.set_remote_expert_opt(remote_opt.get());
-                ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, std::max({o.spec, o.batch, 2}), err);
+                ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, std::max({o.spec, o.batch, o.jev, 2}), err);
                 split_drive.cache_base[st] = gs.cache.device_slot(0);
                 split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
                 split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
@@ -113,7 +113,7 @@ int Runtime::init_verify() {
             vs.slot_off = gs.cache.slot_offsets();
             vs.n_slots = gs.cache.slots();
             gs.ver_b.set_remote_expert_opt(remote_opt.get());
-            if (!gs.ver_b.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, std::max({o.spec, o.batch, 2}), err)) {
+            if (!gs.ver_b.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, std::max({o.spec, o.batch, o.jev, 2}), err)) {
                 basalt::log::error("basalt serve", "pipelined windows, stage 2: %s", err.c_str());
                 return 1;
             }
@@ -135,12 +135,12 @@ int Runtime::init_verify() {
     for (const auto& xpe : xpeers)
         if (xpe->valid()) ver.add_peer(xpe.get());
     ver.set_cpu_warm(drive.d.pool, drive.d.src);
-    if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err) ||
+    if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, o.jev, 2}), err) ||
         (mtp_on && !mtp.bind(wt, multi_gpu ? &mtp_head : &native_head, ver.final_R_all(), err))) {
         basalt::log::error("basalt serve", "%s", err.c_str());
         return 1;
     }
-    if (pipe_on && !ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err)) {
+    if (pipe_on && !ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, o.jev, 2}), err)) {
         basalt::log::error("basalt serve", "pipelined windows: %s", err.c_str());
         return 1;
     }

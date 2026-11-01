@@ -166,10 +166,13 @@ public:
     struct ScoreBranch {
         std::vector<int32_t> tokens, candidates;
         std::vector<float> logits;
+        int windows = 0;
     };
     bool score_branches(std::vector<ScoreBranch>& branches, int64_t prefix, PoolMultiFn pool, void* user,
-                        uint64_t& workspace_bytes, uint64_t free_floor, std::string& err);
+                        uint64_t& workspace_bytes, uint64_t free_floor, std::string& err,
+                        const std::function<bool()>& cancelled = {});
     bool score_branches_supported() const;
+    void release_score_workspace();
     // ---- end Jev ----
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
@@ -488,7 +491,7 @@ private:
     std::chrono::steady_clock::time_point commit_t0_;   ///< commit_slots_begin
     std::vector<int> commit_next_keep_;                 ///< its counts, for the next stage
     uint64_t bkey(int S, int hbase) const {
-        return batch_key(S, hbase) | (ar_off_ ? (1ull << 63) : 0ull);
+        return batch_key(S, hbase) | (ar_off_ ? (1ull << 63) : 0ull) | (score_prefill_ ? (1ull << 62) : 0ull);
     }
     static uint64_t batch_key(int S, int hbase) { return (uint64_t) hbase << 40 | (uint64_t) S << 32; }
     /// Instantiates a finished batch capture as the executable of a new key.
@@ -517,12 +520,14 @@ private:
     float* ple_work_ = nullptr;            ///< each row's PLE history while the window runs
     bool batch_dm_ = false;                ///< a batch window runs the device-planned tail
     void* arena_b_ = nullptr;
-    // ---- Jev: reusable, bounded branch views; recurrence is shared read-only ----
+    // ---- Jev: demand-sized branch views; private recurrence only for continuing windows ----
     uint64_t batch_bytes_ = 0;
     std::unique_ptr<Verifier> score_workspace_;
     void* score_arena_ = nullptr;
     uint64_t score_bytes_ = 0;
     int64_t score_cells_ = 0;
+    bool score_recurrent_ = false;
+    bool score_prefill_ = false;
     SessionState* score_base_ = nullptr;
     std::vector<SessionState> score_views_;
     std::vector<QsaState> score_qsa_;

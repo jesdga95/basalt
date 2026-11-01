@@ -5,6 +5,7 @@ import contextlib
 import time
 
 from serve.decision.admission import Control, Gate
+from serve.decision.batches import Batches
 from serve.decision import schema, systemone
 from serve.decision.trie import Trie, common_size, probabilities, summary
 from serve.engine.errors import EngineError
@@ -15,6 +16,7 @@ class Decisions:
         self.svc = service
         self.gate = Gate(pending)
         self.timeout, self.max_nodes, self.tree_max = timeout, max_nodes, tree_max
+        self.batches = Batches(self)
 
     @contextlib.contextmanager
     def lease(self, control):
@@ -31,11 +33,7 @@ class Decisions:
                     self.svc.last_request_at = time.time()
 
     def _score(self, rows, control):
-        with self.lease(control):
-            if callable(getattr(self.svc.engine, "score_many", None)):
-                return self.svc.engine.score_many(rows, control)
-            return [(value, dict(stats, batch_size=1, scored_windows=1, workspace_bytes=0))
-                    for value, stats in (self.svc.engine.score(*row, control) for row in rows)]
+        return self.batches.score(rows, control)
 
     def run(self, body, cancel, system_one=False):
         started = time.monotonic()

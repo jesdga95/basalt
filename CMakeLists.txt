@@ -369,6 +369,10 @@ if(BUILD_TESTING)
   add_executable(conversation_cache_test tests/core/conversation_cache_test.cpp)
   target_include_directories(conversation_cache_test PRIVATE include)
   basalt_cpu_test(NAME conversation_cache_test COMMAND conversation_cache_test)
+
+  add_executable(decision_windows_test tests/core/decision_windows_test.cpp)
+  target_include_directories(decision_windows_test PRIVATE include)
+  basalt_cpu_test(NAME decision_windows_test COMMAND decision_windows_test)
   # conversation_memory.cpp asks the platform layer for the free RAM, so the probe comes along; it needs the system
   # allocator and the OS memory query, and nothing from the GPU runtime.
   add_executable(conversation_memory_test tests/core/conversation_memory_test.cpp src/core/conversation_memory.cpp)

@@ -16,7 +16,7 @@ Flow Request::score() {
         uint64_t bytes = 0;
         const bool ok = runtime_.ver.score_branches(score_branches, n - 1, runtime_.win_pool_fn,
                                                    runtime_.win_pool_user, bytes, (uint64_t) vram_floor_mib() << 20,
-                                                   runtime_.err);
+                                                   runtime_.err, [&] { return runtime_.halted(); });
         const double native_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
         if ((!ok && !runtime_.err.empty()) || runtime_.drive.d.failed) {
             std::printf("ERR Jev branch verify: %s\n", runtime_.err.c_str()); return Flow::error;
@@ -26,6 +26,7 @@ Flow Request::score() {
         else if (!ok) std::printf("JFALLBACK\n");
         else {
             std::printf("JWAVE %zu %llu\n", score_branches.size(), (unsigned long long) bytes);
+            std::printf("JWINDOWS %d\n", score_branches.front().windows);
             for (const auto& b : score_branches) {
                 if (std::any_of(b.logits.begin(), b.logits.end(), [](float v) { return !std::isfinite(v); })) {
                     std::printf("ERR Jev: nonfinite branch logits\n"); return Flow::error;

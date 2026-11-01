@@ -23,31 +23,35 @@ The engine requires a version 2 `.basalt` pack. An existing version 1 pack can b
 | Weights | Uses the loaded `.basalt` pack and its tokenizer/template. Experts, dense tensors, PLE/n-gram table, MTP and vision weights keep their stored formats. |
 | KV | Keeps the selected `kv` format, including `fp16`, and the existing context and memory policies. |
 | Experts and prefill | Keeps expert placement, resident experts, auto-sizing, prefill and adaptive-tier settings. Decision work can warm the same expert cache as chat. |
-| MTP | Keeps `spec` and the drafter. Prompt processing fills draft state normally; scoring reads the target head without drafting output. A scoring tail is never reused as a completed chat tail. |
+| MTP | Keeps chat `spec` and the drafter. Decisions prepare target state only. A draft-valid prefix bounds which checkpoints a subsequent chat may reuse; chat-only cache entries and parked conversations keep their ordinary draft state. |
 | Prompt cache | Shared prefixes use existing checkpoints, including recurrent state, indexer tails and PLE history. Their count remains bounded by `prompt-cache`; `0` works by recomputing prefixes. More checkpoints improve reuse at the existing RAM cost. |
 | Conversation cache | Follows the existing RAM/disk policy; chat conversations can be parked or evicted as with other requests. Enabling Jev reserves no extra conversation pool. |
 | Sampling and grammar | Chat settings remain unchanged. Decision rows use allowed-token probabilities, independently of chat temperature, top-k, penalties, relaxed drafting and output grammar. |
 | Vision | Chat vision stays configured as before. Decision inputs are text/state JSON; these routes do not encode images. |
 
 `jev` is a numeric decision lane limit, `0..8`, separate from `parallel`. `1` uses the solo target scorer with
-zero dedicated GPU KV storage. Higher values allow independent suffixes to run together in one native batch
-window. Native `INFO` reports the supported lanes and row capacity; responses report the actual largest wave.
-No second model is loaded and the verifier scratch width stays at its existing capacity, usually set by `spec`.
+zero dedicated GPU KV storage. Higher values allow independent suffixes to advance together through native batch
+windows. Native `INFO` reports the supported lanes and row capacity; responses report the actual largest wave.
+The verifier row capacity is the maximum of `spec`, chat batch width, `jev`, and two. This sizes target scratch
+without changing the chat speculation length, chat slots or context division. No second model is loaded.
 
-Compatible rows fork from their longest shared prefix. Each suffix consumes its own token rows; their sum must
-fit the existing window. Resident unrotated FP16 and INT8 KV support these waves. Other KV layouts, layer-split
-stages and long suffixes use exact solo scoring. A wave that exceeds workspace is split into smaller waves,
+Compatible rows fork from their longest shared prefix. Each suffix consumes its own token rows, advancing across
+as many bounded windows as needed. Resident unrotated FP16 and INT8 KV support these waves. Other KV layouts and
+layer-split stages use exact solo scoring. A wave that exceeds workspace is split into smaller waves,
 down to solo scoring when necessary. Peer expert tiers remain available.
 
-The shared GDN recurrence is read-only: branch windows are discarded rather than committed. Only writable QSA
-KV/indexer state and PLE history are copied, sized to the current prompt instead of the configured chat context.
-This avoids a full recurrent-state allocation per lane. The reusable branch arena is allocated on demand, with
-a 128 MiB ceiling including staging allowance and the server's native free-memory floor (128 MiB, or 256 MiB
-on a paging driver). Cached graphs and branch buffers are reused for smaller waves; expert placement, chat KV
-precision and context capacity remain unchanged.
+Short waves share read-only GDN recurrence and copy only writable QSA KV/indexer state and PLE history. Continuing
+waves also copy FP32 recurrence per lane, so each sequence can commit intermediate windows independently. For
+the model's default geometry this recurrence is about 112 MiB per lane, in addition to prompt-sized KV/PLE.
+The arena is allocated on demand against actual available memory and the server's native free-memory floor,
+rather than a fixed arena ceiling. Allocations include a staging allowance and recheck free memory afterward.
+Buffers and graphs are reused between decisions and released before chat work. Expert placement, chat KV
+precision and context capacity remain unchanged; limited free memory can reduce effective decision width.
 
-The host submits each request's independent tree nodes together; greedy paths proceed in dependent waves.
-Scoring transactions queue in FIFO order and complete independently, including identical requests.
+The host submits independent tree nodes together; greedy paths proceed in dependent waves. Requests already
+queued at an engine boundary may share a sequence batch, with no collection timer or identical-request fan-out.
+Each caller completes when its own rows finish, rather than waiting for unrelated groups. Cache-opt-out rows
+establish their fresh prefix in a separate transaction.
 Forced single-token edges need no target score. Prefix checkpoints remain
 bounded by the existing host cache budget; the branch KV prefix is copied, rather than copy-on-write mapped.
 
@@ -60,8 +64,8 @@ Advanced settings are optional:
 | `jev-max-nodes` | `8192` | `1..65536` | Total compiled divergent nodes across contexts and fields. |
 | `jev-tree-max` | `128` | `1..255` | Largest domain evaluated exhaustively in automatic mode. |
 
-Disconnects and deadlines remove queued transactions or stop their active native work; `STOP` drains the reply.
-Other callers retain their own transactions. An engine that fails to stop within ten seconds
+Disconnects and deadlines remove queued callers; shared work stops when no unfinished caller still needs it.
+Native continuing waves check `STOP` between windows and drain the reply. An engine that fails to stop within ten seconds
 is ended so the next request starts a synchronized process. The same API key, Host and CORS rules protect these
 routes; replies carry `Cache-Control: no-store`. Each request body is limited to 4 MiB, with separate text and
 domain limits below. No model requests or polling run while Jev is idle.
@@ -138,7 +142,11 @@ Oversized prompts receive HTTP 400 rather than truncation.
 model input. A single question's rubric precedes the changing state for prefix reuse; multiple questions share
 the state and carry isolated rubrics.
 
-The response has `model`, `answers` and input/output usage; output tokens are zero:
+The response has `model`, `answers`, input/output usage, `execution` and `timings`; output tokens are zero.
+Execution reports actual width and workspace, while timings separate target prefill and native scoring.
+Shared physical-group costs are accounted once, on the group's first row; caller elapsed time includes waiting.
+
+Answer shapes:
 
 - `noul`: `noul` is always `P(true)`, including when false is more likely. Optional criteria keys are `true`/`false`.
 - `choice`: `choice`, a probability map and confidence `(N * P(winner) - 1) / (N - 1)`; a singleton has confidence 1.

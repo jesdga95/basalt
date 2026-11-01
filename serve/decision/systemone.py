@@ -81,4 +81,5 @@ def format_response(result, fields, questions, model):
             answer["choice"] = f.values[winner]
         answers[f.name] = answer
     return {"model": model, "answers": answers,
-            "usage": {"input_tokens": result["usage"]["prompt_tokens"], "output_tokens": 0}}
+            "usage": {"input_tokens": result["usage"]["prompt_tokens"], "output_tokens": 0},
+            **{key: result[key] for key in ("execution", "timings") if key in result}}

@@ -314,7 +314,7 @@ int Runtime::announce() {
     if (text_tokenizer_note.empty()) std::printf("INFO text_prompt=1\n");
     // ---- Jev: capability negotiation, separate from the unchanged READY contract ----
     if (o.jev > 0) {
-        std::printf("INFO jev=%d jev_lanes=%d jev_window=%d\n", o.jev,
+        std::printf("INFO jev=%d jev_lanes=%d jev_window=%d jev_sequence=1\n", o.jev,
                     ver.score_branches_supported() ? std::min(o.jev, ver.max_t()) : 1, ver.max_t());
     }
     // ---- end Jev ----

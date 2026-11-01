@@ -230,6 +230,10 @@ private:
     std::vector<ImgKey> live_imgs{};
     std::vector<ImgKey> req_imgs{};
     bool live_ok{};
+    // ---- Jev: target-only checkpoints can extend beyond the untouched draft cache ----
+    bool jev_scoring{};
+    int64_t jev_draft_prefix = -1;
+    // ---- end Jev ----
     std::vector<ConvCheckpoint> checks{};
     uint64_t check_clock{};
     // A turn-boundary checkpoint's GDN bytes reach the host after the first token (see the deferral class); this

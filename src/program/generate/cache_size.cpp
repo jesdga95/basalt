@@ -48,7 +48,7 @@ int cache_size(Context& context) {
             (void) cudaSetDevice(d0);
         }
         (void) cudaGetLastError();
-        const int max_t = std::max({o.spec, o.batch, 2});
+        const int max_t = std::max({o.spec, o.batch, o.jev, 2});
         const int64_t hs = native_head.loaded()
             ? basalt::core::Verifier::hs_peer_bytes(native_head.row_bytes(), native_head.type(), n_vocab, g.n_embd, max_t,
                                                     d0, o.peer_device) : 0;

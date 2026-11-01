@@ -1366,12 +1366,17 @@ class ProcessEngine:
                         heard = time.monotonic()
 
     # ---- Jev: exclusive, zero-output target-head transactions ----
-    def score_many(self, rows, control):
+    def score_many(self, rows, control, completed=None):
         from serve.decision.trie import common_size
         result = [None] * len(rows)
         pending = sorted(range(len(rows)), key=lambda i: rows[i][0])
         lanes = min(int(self.info.get("jev_lanes", 1)), 8)
         window = int(self.info.get("jev_window", 1))
+        sequences = self.info.get("jev_sequence", 0)
+        def publish(indices):
+            if completed:
+                for i in indices:
+                    completed(i, result[i])
         while pending:
             group = [pending.pop(0)]
             prefix = len(rows[group[0]][0]) - 1
@@ -1379,7 +1384,7 @@ class ProcessEngine:
                 if len(group) >= lanes:
                     break
                 trial = min(prefix, len(rows[index][0]) - 1, common_size(rows[group[0]][0], rows[index][0]))
-                if trial > 0 and sum(len(rows[i][0]) - trial for i in group + [index]) <= window:
+                if trial >= 0 and (sequences or trial > 0 and sum(len(rows[i][0]) - trial for i in group + [index]) <= window):
                     group.append(index)
                     pending.remove(index)
                     prefix = trial
@@ -1387,6 +1392,7 @@ class ProcessEngine:
                 i = group[0]
                 values, stats = self.score(*rows[i], control)
                 result[i] = values, dict(stats, batch_size=1, scored_windows=1, workspace_bytes=0)
+                publish(group)
                 continue
             ids = rows[group[0]][0][:prefix] + [rows[group[0]][0][prefix]]
             branches = [(rows[i][0][prefix:], rows[i][1]) for i in group]
@@ -1396,19 +1402,24 @@ class ProcessEngine:
             if values is None:
                 middle = len(group) // 2
                 for subset in (group[:middle], group[middle:]):
-                    for i, value in zip(subset, self.score_many([rows[i] for i in subset], control)):
+                    def retried(j, value):
+                        i = subset[j]
                         result[i] = value
-                first = result[group[0]][1]
-                first["prompt_ms"] = first.get("prompt_ms", 0) + stats.get("prompt_ms", 0)
-                first["decode_ms"] = first.get("decode_ms", 0) + stats.get("decode_ms", 0)
-                first["reused"] = min(first.get("reused", 0), stats.get("reused", 0))
+                        if i == group[0]:
+                            first = value[1]
+                            first["prompt_ms"] = first.get("prompt_ms", 0) + stats.get("prompt_ms", 0)
+                            first["decode_ms"] = first.get("decode_ms", 0) + stats.get("decode_ms", 0)
+                            first["reused"] = min(first.get("reused", 0), stats.get("reused", 0))
+                        publish([i])
+                    self.score_many([rows[i] for i in subset], control, completed=retried)
                 continue
             for j, i in enumerate(group):
                 st = dict(stats, reused=min(prefix, stats.get("reused", 0)) if j == 0 else prefix,
                           prompt_ms=stats.get("prompt_ms", 0) if j == 0 else 0,
                           decode_ms=stats.get("decode_ms", 0) if j == 0 else 0,
-                          batch_size=len(group), scored_windows=int(j == 0))
+                          batch_size=len(group), scored_windows=stats.get("scored_windows", 1) if j == 0 else 0)
                 result[i] = values[j], st
+            publish(group)
         return result
 
     def score(self, ids, candidates, frontiers, fresh, control, _branches=None):
@@ -1476,6 +1487,14 @@ class ProcessEngine:
                             raise ValueError()
                     except (ValueError, IndexError):
                         raise EngineError("Jev returned malformed native timing") from None
+                elif line.startswith("JWINDOWS "):
+                    try:
+                        count = int(line.split()[1])
+                        if not _branches or count < 1:
+                            raise ValueError()
+                        wave["scored_windows"] = count
+                    except (ValueError, IndexError):
+                        raise EngineError("Jev returned malformed window accounting") from None
                 elif line.startswith("DONE"):
                     self._parse_done(line)
                     if native_ms is not None:

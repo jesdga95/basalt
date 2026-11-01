@@ -16,6 +16,7 @@ from serve.config import build_parser, parse_settings
 from serve.decision import schema, systemone
 from serve.decision.admission import Control, DecisionError, Gate
 from serve.decision.engine import Decisions
+from serve.decision.batches import BatchControl, Job
 from serve.decision.trie import Trie, summary
 from serve.engine.mock import MockEngine
 from serve.engine.process import ProcessEngine
@@ -263,6 +264,41 @@ class Waves(unittest.TestCase):
         self.assertEqual(result[0][1]["reused"], 1)
         self.assertTrue(engine.lines.empty())
 
+    def test_long_distinct_contexts_use_sequence_batches(self):
+        engine = self.wire(["JWAVE 2 500000000", "JWINDOWS 100", "JLOGITS 3", "JLOGITS 4",
+                            "JTIME 10", "DONE 0 2 1 0 length 0 0 1"], window=2)
+        engine.info["jev_sequence"] = 1
+        rows = [([1, 2] + [i] * 100, [7], [2], False) for i in (3, 4)]
+        result = engine.score_many(rows, Control(threading.Event(), 2))
+        self.assertEqual([v[0] for v, _ in result], [3, 4])
+        self.assertEqual([s["batch_size"] for _, s in result], [2, 2])
+        self.assertEqual(sum(s["scored_windows"] for _, s in result), 100)
+        sent = "".join(c.args[0] for c in engine.proc.stdin.write.call_args_list)
+        self.assertEqual(sent.count("GEN 1"), 1)
+
+    def test_physical_groups_publish_before_unrelated_scoring(self):
+        engine = self.wire([], window=2)
+        engine.info.update(jev_lanes=2, jev_sequence=1)
+        published = []
+        def score(ids, options, points, fresh, control, _branches=None):
+            if _branches and _branches[0][0][-1] == 5:
+                self.assertEqual(published, [0, 1])
+            return [[float(t[-1])] for t, _ in _branches], {"reused": 1}
+        engine.score = score
+        rows = [([1, i], [7], [], False) for i in range(3, 7)]
+        result = engine.score_many(rows, Control(threading.Event(), 2), completed=lambda i, _: published.append(i))
+        self.assertEqual(published, [0, 1, 2, 3])
+        self.assertEqual([v[0] for v, _ in result], [3, 4, 5, 6])
+
+    def test_completed_callers_do_not_prevent_cancel_of_remaining_work(self):
+        controls = [Control(threading.Event(), 2) for _ in range(2)]
+        jobs = [Job([None], control) for control in controls]
+        batch = BatchControl(jobs)
+        self.assertFalse(batch.is_set())
+        jobs[0].done.set()
+        controls[1].cancel.set()
+        self.assertTrue(batch.is_set())
+
 
 class Integration(unittest.TestCase):
     def setUp(self):
@@ -312,9 +348,14 @@ class Integration(unittest.TestCase):
             a.start()
             self.assertTrue(entered[0].wait(2))
             b.start()
-            gate = self.svc.jev.gate
-            with gate.cv:
-                self.assertTrue(gate.cv.wait_for(lambda: len(gate.waiters) == 1, 2))
+            batches = self.svc.jev.batches
+            for _ in range(100):
+                with batches.lock:
+                    if batches.pending:
+                        break
+                threading.Event().wait(0.01)
+            with batches.lock:
+                self.assertEqual(len(batches.pending), 1)
             release[0].set()
             self.assertTrue(entered[1].wait(2))
             self.assertTrue(completed[0].wait(2))
@@ -330,6 +371,54 @@ class Integration(unittest.TestCase):
         self.assertEqual(len(self.engine.calls), 2)
         self.assertEqual(len(output), 2)
         self.assertTrue(all(x["timings"]["deduplicated_rows"] == 0 for x in output))
+
+    def test_waiting_requests_batch_without_a_completion_barrier(self):
+        entered, release = threading.Event(), threading.Event()
+        done = [threading.Event() for _ in range(3)]
+        values, errors, sizes = [None] * 3, [], []
+        def score_many(rows, control, completed=None):
+            sizes.append(len(rows))
+            for i, row in enumerate(rows):
+                if i == 2:
+                    entered.set()
+                    self.assertTrue(release.wait(3))
+                completed(i, ([row[0][-1]], {"reused": 0}))
+        self.engine.score_many = score_many
+        def run(i):
+            try:
+                values[i] = self.svc.jev._score([([1, i], [7], [], False)], Control(threading.Event(), 3))
+                done[i].set()
+            except Exception as error:
+                errors.append(error)
+        threads = [threading.Thread(target=run, args=(i,)) for i in range(3)]
+        try:
+            with self.svc.jev.gate.shared(threading.Event()):
+                threads[0].start()
+                gate = self.svc.jev.gate
+                with gate.cv:
+                    self.assertTrue(gate.cv.wait_for(lambda: len(gate.waiters) == 1, 2))
+                for thread in threads[1:]:
+                    thread.start()
+                for _ in range(100):
+                    with self.svc.jev.batches.lock:
+                        if len(self.svc.jev.batches.pending) == 2:
+                            break
+                    threading.Event().wait(0.01)
+                with self.svc.jev.batches.lock:
+                    self.assertEqual(len(self.svc.jev.batches.pending), 2)
+            self.assertTrue(entered.wait(2))
+            self.assertTrue(done[0].wait(2))
+            self.assertTrue(done[1].wait(2))
+            self.assertFalse(done[2].is_set())
+        finally:
+            release.set()
+            for thread in threads:
+                if thread.ident is not None:
+                    thread.join(3)
+                    self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(sizes, [3])
+        self.assertEqual([row[0][0][0] for row in values], [0, 1, 2])
 
     def test_systemone_ids_never_enter_prompt(self):
         req = {"state": "new state", "questions": {"private-id": {"type": "choice", "instructions": "Pick", "criteria": {"A": "first", "B": "second"}}}}

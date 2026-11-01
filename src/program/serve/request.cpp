@@ -6,9 +6,20 @@ namespace basalt::program::serve {
 Flow Request::execute() {
     struct Scope {   // what tells the idle conversations' parking where this request works, until it ends
         Runtime& r;
-        ~Scope() { r.solo_out = nullptr; r.solo_busy = false; r.park_keep = -1; }
+        ~Scope() { r.solo_out = nullptr; r.solo_busy = false; r.park_keep = -1; r.jev_scoring = false; }
     } scope{runtime_};
     if (const Flow flow = parse(); flow != Flow::proceed) return flow;
+    // ---- Jev: discard only checkpoints whose draft state was never prepared ----
+    runtime_.jev_scoring = !score_ids.empty();
+    if (!runtime_.jev_scoring) runtime_.ver.release_score_workspace();
+    if (!runtime_.jev_scoring && runtime_.jev_draft_prefix >= 0) {
+        runtime_.ckd_finish();
+        std::erase_if(runtime_.checks, [&](const ConvCheckpoint& c) {
+            return (int64_t) c.ids.size() > runtime_.jev_draft_prefix;
+        });
+        runtime_.jev_draft_prefix = -1;
+    }
+    // ---- end Jev ----
     if (const Flow flow = prepare_image(); flow != Flow::proceed) return flow;
     if (const Flow flow = restore(); flow != Flow::proceed) return flow;
     if (const Flow flow = read_prompt(); flow != Flow::proceed) return flow;

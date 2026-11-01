@@ -1,5 +1,6 @@
 // src/program/serve/request_restore.cpp - request restore operations.
 #include "request.hpp"
+#include "basalt/core/decision_schedule.hpp"
 
 namespace basalt::program::serve {
 
@@ -406,6 +407,7 @@ Flow Request::restore() {
     }
     runtime_.park_keep = -1;
     restore_t0 = Clock::now();
+    const bool draft_replaced = incoming.has_value() || slot_source >= 0;
     if (incoming) {
         // the draft layer's K/V goes to the main sequence, which then holds it as written
         if (runtime_.mtp_on && !runtime_.mtp.use_main(runtime_.err)) {
@@ -507,11 +509,17 @@ Flow Request::restore() {
     }
     // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
     // host copies and slots are always current (every writer writes both), so they need nothing
-    if (runtime_.mtp_on) {
+    // ---- Jev: keep a draft-valid watermark while target-only checkpoints advance ----
+    if (runtime_.jev_scoring && runtime_.mtp_on) {
+        runtime_.jev_draft_prefix = basalt::core::decision_draft_prefix(runtime_.jev_draft_prefix, resume,
+                                                                      draft_replaced);
+    }
+    if (runtime_.mtp_on && !runtime_.jev_scoring) {
         if (resume > 0) runtime_.mtp.kv_restore(resume);
         runtime_.mtp.set_prompt_len(n);
         runtime_.mtp.begin_request(ids.data(), (int64_t) ids.size());
     }
+    // ---- end Jev ----
     read_from = resume;
     runtime_.conversations->drop_reuse_unless(runtime_.rsp);   // another session may have overwritten the cells since
     runtime_.conversations->limit_reuse(read_from);
