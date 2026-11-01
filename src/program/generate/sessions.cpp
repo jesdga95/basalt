@@ -72,7 +72,11 @@ int sessions(Context& context) {
                          err.c_str());
             return 1;
         }
-        basalt::core::Verifier::prepare_hc8(st.wt, g);   // this stage's fused hyper-connection reads need its device's copies
+        // this stage's fused hyper-connection reads need its device's copies
+        if (!basalt::core::Verifier::prepare_hc8(st.wt, g, err)) {
+            basalt::log::error("basalt generate", "layer split, CUDA%d: %s", st.dev, err.c_str());
+            return 1;
+        }
         // THE SESSION AND THE HEAD WAIT FOR THE SPLIT SEARCH.  `session_bytes` prices a stage's session by its LAYER
         // RANGE (the carve), so the sessions are allocated after the search below has set `st.lb`/`st.le`; the last
         // stage's head follows.
