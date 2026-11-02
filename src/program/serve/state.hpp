@@ -527,7 +527,7 @@ private:
     void make_view(basalt::core::SessionState& v, int b);
     int32_t loan_plan(int64_t live, int64_t& chunk);
     void relend();
-    bool home_given_up(int64_t live, std::string& e);
+    bool home_given_up(int64_t live, std::string& e, bool partial = false);
     bool vram_command(const std::string& cmd, std::string& e, bool for_sleep, std::string* reply = nullptr);
     int64_t cache_floor_slots();
     bool move_routed_below(int64_t first, const char* why, std::string& e,

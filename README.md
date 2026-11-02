@@ -55,6 +55,7 @@ profile ships with the engine ([data/profiles](data/profiles)).
 
 - [Configuration](docs/configuration/index.md): every setting.
 - [Running](docs/running.md): parallel requests, prompt chunks, memory floors, image input.
+- [Elastic KV](docs/elastic-kv.md): how the KV cache takes VRAM from the expert cache and gives it back.
 - [basalt-probe](docs/probe.md): measures the machine, the cold decode speed, and suggests values.
 - [The .basalt model file](docs/model-file.md): the layout, and building a pack yourself (including NVFP4).
 - [Platforms](docs/platforms.md): Linux and Windows requirements, the build steps and the Windows limitations.

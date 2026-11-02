@@ -278,10 +278,14 @@ void test_resident_lend_region() {
     require(choose_resident_keep_from(slots, 10, 100, -1) == 4, "no lend region kept slots in RAM");
     require(choose_resident_keep_from(slots, 10, 100, 9) == 4, "an out-of-range lend region kept slots in RAM");
     bool fit = false;
-    require(choose_resident_room(slots, 10, 19, 1, 4, fit) == 3 && fit,
-            "the swaps' free places must be placed before the lent slots");
+    require(choose_resident_room(slots, 10, 19, 1, 4, fit) == 2 && !fit,
+            "partial copies precede spare places");
     require(choose_resident_room(slots, 10, 15, 1, 6, fit) == 3 && !fit,
-            "free places that do not fit must leave the whole budget to the lent slots");
+            "copies fit when places do not");
+    require(choose_resident_room(slots, 10, 26, 1, 4, fit) == 1 && fit,
+            "full tail and places fit");
+    require(choose_resident_room(slots, 10, 22, 1, 4, fit) == 1 && !fit,
+            "full positive-start tail precedes places");
     require(choose_resident_room(slots, 10, 100, 1, 0, fit) == 1 && !fit, "no free places asked for");
     require(choose_resident_keep_from({}, 0, 0, 0) == 0, "an empty cache");
 }
@@ -349,6 +353,17 @@ void test_resident_exchange() {
     // and back: the copy is again what the plan makes for the original placement
     require(exchange_cache_complement(offsets, 5, 3), "the reverse exchange was refused");
     require(offsets == before, "exchanging back did not restore the plan");
+}
+
+void test_home_budget() {
+    using basalt::core::detail::home_prefix_fit;
+    constexpr uint64_t M = 1ull << 20;
+    require(home_prefix_fit({97*M, 97*M}, 195*M) == 1, "each region's padding counts");
+    require(home_prefix_fit({97*M, 97*M}, 196*M) == 2, "padded regions fit exactly");
+    require(home_prefix_fit({M, M, M}, 2*M) == 2, "partial group respects padding");
+    require(home_prefix_fit({M}, M) == 0, "no page fault below padded budget");
+    require(home_prefix_fit({UINT64_MAX}, UINT64_MAX) == 0, "rounding overflow rejected");
+    require(home_prefix_fit({}, 0) == 0, "empty home request");
 }
 
 void test_home_regions() {
@@ -582,6 +597,7 @@ void test_host_memory_namespaced() {
 
 int main() {
     try {
+        test_home_budget();
         test_home_regions();
         test_complement_plan();
         test_resident_lend_region();

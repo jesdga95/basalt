@@ -137,6 +137,38 @@ int run() {
     require(src.homes_take({{0, 2}}, err, none), "take after the reserve is lifted: " + err);
     src.homes_abort();
     require(src.homes_bytes() == before && !src.has_resident(0, 2), "an aborted take left a region or a place");
+
+    // a page-locked copy's homes are page-locked and mapped too: the GPU reads an expert's bytes through its alias
+    FileExpertSource ps;
+    require(ps.open(FileRange((dir.path / "experts.bin").string()), layers, experts, err), err);
+    ExpertCache pc;
+    require(pc.open_sized(std::vector<int64_t>((size_t) (layers * held), (int64_t) blob), layers, experts, err), err);
+    for (int64_t l = 0; l < layers; ++l)
+        for (int64_t e = 0; e < held; ++e) {
+            const int32_t slot = pc.admit(l, e);
+            require(slot >= 0 && pc.fill_slot_blocking(slot, ps.blob(l, e), err, (int64_t) blob), "cache fill " + err);
+        }
+    require(ps.pin_cache_complement(pc, err, true, {}, -1, 0), err);
+    if (ps.pinned_bytes() == 0) {
+        std::puts("file_expert_homes_test: page-locked homes skipped (the copy was not page-locked here)");
+        return 0;
+    }
+    std::vector<std::pair<int32_t, int32_t>> pgive;
+    for (int32_t l = 0; l < layers; ++l)
+        for (int32_t e = 0; e < held; ++e) pgive.emplace_back(l, e);
+    require(ps.homes_take(pgive, err, dst), "page-locked homes_take: " + err);
+    for (size_t k = 0; k < pgive.size(); ++k) std::copy(ps.blob(pgive[k].first, pgive[k].second),
+                                                       ps.blob(pgive[k].first, pgive[k].second) + blob, dst[k]);
+    ps.homes_commit();
+    for (const auto& [l, e] : {std::pair<int32_t, int32_t>{0, 0}, {1, 3}, {1, (int32_t) held - 1}}) {
+        require(ps.pinned(l, e) && ps.device_alias(l, e) != nullptr, "a page-locked home has no device alias");
+        std::vector<uint8_t> back((size_t) blob);
+        require(cudaMemcpy(back.data(), ps.device_alias(l, e), (size_t) blob, cudaMemcpyDeviceToHost) == cudaSuccess,
+                "reading a home through its alias");
+        require(ps.equals_file(l, e, back.data()), "a home's alias reads other bytes than the file's");
+    }
+    for (const auto& [l, e] : pgive) require(ps.home_release(l, e), "page-locked home_release");
+    require(ps.homes_reclaim() > 0 && ps.homes_bytes() == 0, "page-locked homes were not all returned");
     return 0;
 }
 

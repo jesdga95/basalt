@@ -186,8 +186,13 @@ int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint6
 
 int64_t choose_resident_room(const std::vector<uint64_t>& slot_bytes, uint64_t base_bytes, uint64_t budget,
                              int64_t lend_from, uint64_t spare_bytes, bool& spares_fit) {
-    spares_fit = spare_bytes > 0 && base_bytes <= budget && spare_bytes <= budget - base_bytes;
-    return choose_resident_keep_from(slot_bytes, base_bytes, spares_fit ? budget - spare_bytes : budget, lend_from);
+    const int64_t keep = choose_resident_keep_from(slot_bytes, base_bytes, budget, lend_from);
+    spares_fit = false;
+    if (keep < 0) return keep;
+    uint64_t used = base_bytes;
+    for (size_t i = (size_t) keep; i < slot_bytes.size(); ++i) used += slot_bytes[i];
+    spares_fit = spare_bytes > 0 && spare_bytes <= budget - used;
+    return keep;
 }
 
 bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t out) {
@@ -196,6 +201,34 @@ bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t
     offsets[out] = offsets[in];
     offsets[in] = kNoCacheComplement;
     return true;
+}
+
+size_t home_prefix_fit(const std::vector<uint64_t>& sizes, uint64_t room) {
+    constexpr uint64_t region = 96ull << 20;
+    uint64_t finished = 0, current = 0;
+    auto padded = [](uint64_t n, uint64_t& out) {
+        constexpr uint64_t a = 2ull << 20;
+        if (n > std::numeric_limits<uint64_t>::max() - (a - 1)) return false;
+        out = (n + a - 1) / a * a;
+        return true;
+    };
+    size_t count = 0;
+    for (uint64_t size : sizes) {
+        if (size == 0) break;
+        uint64_t done = finished, active = current, rounded = 0;
+        if (active >= region) {
+            if (!padded(active, rounded) || rounded > room - done) break;
+            done += rounded;
+            active = 0;
+        }
+        if (size > std::numeric_limits<uint64_t>::max() - active) break;
+        active += size;
+        if (!padded(active, rounded) || rounded > room - done) break;
+        finished = done;
+        current = active;
+        ++count;
+    }
+    return count;
 }
 
 int home_region_find(const std::vector<HomeRegion>& regions, uint64_t off, uint64_t bytes) {
@@ -363,6 +396,63 @@ bool available_memory_bytes(uint64_t& bytes) {
     return bytes > 0;
 }
 
+void free_home(const detail::HomeRegion& r) {
+    if (r.arena == nullptr) return;
+    if (r.registered) {
+        (void) cudaHostUnregister(r.arena);
+        basalt::platform::free_region(r.map_base, r.map_bytes);
+    } else if (r.pinned) {
+        (void) cudaFreeHost(r.arena);
+    } else {
+        if (r.locked > 0) basalt::platform::unlock_resident(r.arena, r.locked);
+        std::free(r.arena);
+    }
+}
+
+// Page-locked, mapped homes: ordinary memory whose pages several threads fault in, then registered with the driver.
+// The driver's own allocation zeroes and locks the same bytes page by page, several times slower, and the homes are
+// taken while a request waits.  A region the OS or the driver refuses is left without an arena (the caller falls back).
+void pin_homes(std::vector<detail::HomeRegion>& regions) {
+    constexpr uint64_t kHuge = 2ull << 20;
+    auto padded = [&](const detail::HomeRegion& r) { return (r.bytes + kHuge - 1) / kHuge * kHuge; };
+    for (detail::HomeRegion& r : regions) {
+        basalt::platform::RegionBacking got;
+        std::string note;
+        r.arena = basalt::platform::alloc_region(padded(r), got, note, "", 0, r.map_base, r.map_bytes);
+    }
+    // every page written once, the regions' 2 MiB blocks dealt round-robin to the threads
+    std::vector<std::pair<uint8_t*, uint64_t>> blocks;
+    for (const detail::HomeRegion& r : regions)
+        if (r.arena != nullptr)
+            for (uint64_t at = 0; at < padded(r); at += kHuge) blocks.emplace_back((uint8_t*) r.arena + at, kHuge);
+    const unsigned hw = std::thread::hardware_concurrency();
+    const size_t threads = std::min<size_t>(blocks.size(), std::max(1u, std::min(8u, hw)));
+    auto touch = [&](size_t t) {
+        for (size_t b = t; b < blocks.size(); b += threads)
+            for (uint64_t at = 0; at < blocks[b].second; at += 4096) blocks[b].first[at] = 0;
+    };
+    std::vector<std::thread> pool;
+    for (size_t t = 1; t < threads; ++t) pool.emplace_back(touch, t);
+    if (threads > 0) touch(0);
+    for (auto& th : pool) th.join();
+    for (detail::HomeRegion& r : regions) {
+        if (r.arena == nullptr) continue;
+        void* alias = nullptr;
+        const cudaError_t reg = cudaHostRegister(r.arena, (size_t) padded(r), cudaHostRegisterMapped | cudaHostRegisterPortable);
+        if (reg == cudaSuccess && cudaHostGetDevicePointer(&alias, r.arena, 0) == cudaSuccess && alias != nullptr) {
+            r.device = (const uint8_t*) alias;
+            r.pinned = r.registered = true;
+            continue;
+        }
+        if (reg == cudaSuccess) (void) cudaHostUnregister(r.arena);
+        basalt::platform::free_region(r.map_base, r.map_bytes);
+        r.arena = nullptr;
+        r.map_base = nullptr;
+        r.map_bytes = 0;
+    }
+    (void) cudaGetLastError();
+}
+
 }  // namespace
 
 // ================================ THE FILE-BACKED SOURCE ================================
@@ -498,13 +588,7 @@ void FileExpertSource::close() {
             std::free(top_arena_);
         }
     }
-    for (const detail::HomeRegion& r : homes_) {
-        if (r.pinned) (void) cudaFreeHost(r.arena);
-        else {
-            if (r.locked > 0) basalt::platform::unlock_resident(r.arena, r.locked);
-            std::free(r.arena);
-        }
-    }
+    for (const detail::HomeRegion& r : homes_) free_home(r);
     homes_.clear();
     homes_pending_.clear();
     homes_next_ = 0;
@@ -936,6 +1020,7 @@ bool FileExpertSource::pin_cache_complement(
     if (lend) {
         bool spares_fit = false;
         keep_from = detail::choose_resident_room(slot_bytes, bytes, budget, lend_from_slot, spare_bytes, spares_fit);
+        if (!spares_fit) { spare_sizes.clear(); spare_bytes = 0; }
         if (keep_from < 0) keep_from = n_slots;
         if (keep_from < n_slots) {
             std::vector<std::pair<int32_t, int32_t>> core;
@@ -948,7 +1033,7 @@ bool FileExpertSource::pin_cache_complement(
     }
 
     const uint64_t spare_at = bytes;
-    if (bytes == 0 || bytes + spare_bytes > budget) spare_sizes.clear();   // no room: swaps use exchange buffers
+    if (bytes == 0 || bytes > budget || spare_bytes > budget - bytes) spare_sizes.clear();   // no room: swaps use exchange buffers
     else bytes += spare_bytes;
 
     // The experts the GPU cache was filled from sit in the file cache and the mapping; give them back first, so the
@@ -1245,6 +1330,11 @@ const uint8_t* FileExpertSource::host_at(uint64_t off, uint64_t bytes) const {
                                                                                  : nullptr;
 }
 
+uint64_t FileExpertSource::homes_room() const {
+    const uint64_t budget = basalt::platform::ram_budget();
+    return budget > homes_reserve_ ? budget - homes_reserve_ : 0;
+}
+
 // Main thread only, between requests, after wait_commit / apply_pending / xq_drain: no pool, keep-alive or read-ahead
 // thread reads blob() or the offsets then.  Regions are appended in the offset space (homes_next_ only grows).
 bool FileExpertSource::homes_take(const std::vector<std::pair<int32_t, int32_t>>& experts, std::string& err,
@@ -1253,67 +1343,57 @@ bool FileExpertSource::homes_take(const std::vector<std::pair<int32_t, int32_t>>
     dst.clear();
     if (!complement_ready_ || !homes_pending_.empty()) { err = "no resident copy to give homes to"; return false; }
     if (!staged_.empty()) { err = "an exchange is in flight"; return false; }
-    uint64_t total = 0;
+    std::vector<uint64_t> sizes;
+    sizes.reserve(experts.size());
     for (const auto& [l, e] : experts) {
         if (l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) { err = "an expert outside the model"; return false; }
-        total += layer_blob_bytes_[(size_t) l];
+        sizes.push_back(layer_blob_bytes_[(size_t) l]);
     }
-    if (total == 0) return true;
-    // the RAM left over also keeps the server's guard floor above the margin (what the guard stops a request at)
-    const uint64_t budget = basalt::platform::ram_budget();
-    if (total > budget || homes_reserve_ > budget - total) {
-        const uint64_t room = budget > homes_reserve_ ? budget - homes_reserve_ : 0;
-        err = "the experts the cache gives back need " + std::to_string((total + (1u << 20) - 1) >> 20) +
-              " MiB of RAM, and " + std::to_string(room >> 20) + " MiB are free above the RAM floor";
+    if (detail::home_prefix_fit(sizes, homes_room()) != sizes.size()) {
+        err = "the experts the cache gives back exceed the RAM above the floor";
         return false;
     }
+    if (sizes.empty()) return true;
     // regions of a bounded size: one that no expert uses any more can then be returned on its own
     constexpr uint64_t kRegionBytes = 96ull << 20;
     if (homes_next_ < homes_start()) homes_next_ = homes_start();
-    size_t k = 0;
-    while (k < experts.size()) {
+    struct Cut { size_t first, count; };
+    std::vector<Cut> cuts;
+    std::vector<detail::HomeRegion> made;
+    for (size_t k = 0; k < experts.size();) {
         uint64_t bytes = 0;
         size_t n = 0;
         while (k + n < experts.size() && (n == 0 || bytes < kRegionBytes))
             bytes += layer_blob_bytes_[(size_t) experts[k + n++].first];
-        detail::HomeRegion r;
-        r.bytes = bytes;
-        if (complement_pinned_ || top_pinned_) {
-            void* arena = nullptr;
-            if (cudaHostAlloc(&arena, (size_t) bytes, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) {
-                void* alias = nullptr;
-                if (cudaHostGetDevicePointer(&alias, arena, 0) == cudaSuccess && alias != nullptr) {
-                    r.arena = arena;
-                    r.device = (const uint8_t*) alias;
-                    r.pinned = true;
-                } else {
-                    (void) cudaFreeHost(arena);
-                }
-            }
-            (void) cudaGetLastError();
-        }
+        cuts.push_back({k, n});
+        made.emplace_back().bytes = bytes;
+        k += n;
+    }
+    if (complement_pinned_ || top_pinned_) pin_homes(made);
+    for (size_t i = 0; i < made.size(); ++i) {
+        detail::HomeRegion& r = made[i];
         if (r.arena == nullptr) {
-            r.arena = std::malloc((size_t) bytes);
+            r.arena = std::malloc((size_t) r.bytes);
             if (r.arena == nullptr) {
+                for (size_t j = i + 1; j < made.size(); ++j) free_home(made[j]);
                 err = "the RAM for the experts the cache gives back could not be allocated";
                 dst.clear();
                 homes_abort();
                 return false;
             }
             if (complement_locked_ > 0 || top_locked_ > 0)
-                r.locked = basalt::platform::lock_resident(r.arena, bytes).locked_bytes;
+                r.locked = basalt::platform::lock_resident(r.arena, r.bytes).locked_bytes;
         }
         r.base = homes_next_;
-        homes_next_ += bytes;
+        homes_next_ += r.bytes;
         homes_.push_back(r);
         uint64_t at = 0;
-        for (size_t m = 0; m < n; ++m) {
-            const auto& [l, e] = experts[k + m];
+        for (size_t m = 0; m < cuts[i].count; ++m) {
+            const auto& [l, e] = experts[cuts[i].first + m];
             homes_pending_.emplace_back((size_t) l * (size_t) n_expert_ + (size_t) e, r.base + at);
             dst.push_back((uint8_t*) r.arena + (size_t) at);
             at += layer_blob_bytes_[(size_t) l];
         }
-        k += n;
     }
     return true;
 }
@@ -1354,11 +1434,7 @@ uint64_t FileExpertSource::homes_reclaim() {
                                              return f.first >= r.base && f.first - r.base < r.bytes;
                                          }),
                           spare_free_.end());
-        if (r.pinned) (void) cudaFreeHost(r.arena);
-        else {
-            if (r.locked > 0) basalt::platform::unlock_resident(r.arena, r.locked);
-            std::free(r.arena);
-        }
+        free_home(r);
         freed += r.bytes;
         homes_.erase(homes_.begin() + (ptrdiff_t) k);
     }
