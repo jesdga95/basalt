@@ -351,15 +351,13 @@ void test_resident_exchange() {
     require(offsets == before, "exchanging back did not restore the plan");
 }
 
-void test_home_budget() {
+void test_home_prefix() {
     using basalt::core::detail::home_prefix_fit;
-    constexpr uint64_t M = 1ull << 20;
-    require(home_prefix_fit({97*M, 97*M}, 195*M) == 1, "each region's padding counts");
-    require(home_prefix_fit({97*M, 97*M}, 196*M) == 2, "padded regions fit exactly");
-    require(home_prefix_fit({M, M, M}, 2*M) == 2, "partial group respects padding");
-    require(home_prefix_fit({M}, M) == 0, "no page fault below padded budget");
-    require(home_prefix_fit({UINT64_MAX}, UINT64_MAX) == 0, "rounding overflow rejected");
-    require(home_prefix_fit({}, 0) == 0, "empty home request");
+    require(home_prefix_fit({3, 3, 3}, 9) == 3, "experts that fit exactly were not all counted");
+    require(home_prefix_fit({3, 3, 3}, 8) == 2, "an expert past the room was counted");
+    require(home_prefix_fit({5, 1}, 4) == 0, "a later smaller expert jumped the order");
+    require(home_prefix_fit({UINT64_MAX, 1}, UINT64_MAX) == 1, "the room's top end");
+    require(home_prefix_fit({}, 0) == 0, "no experts");
 }
 
 void test_home_regions() {
@@ -593,7 +591,7 @@ void test_host_memory_namespaced() {
 
 int main() {
     try {
-        test_home_budget();
+        test_home_prefix();
         test_home_regions();
         test_complement_plan();
         test_resident_lend_region();
