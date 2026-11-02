@@ -149,6 +149,7 @@ bool Engine::request(const std::string& keys, long long max_new, const std::vect
             d.accepted = std::atoll(f[6].c_str());
             d.offered = std::atoll(f[7].c_str());
             if (f.size() > 8) d.reused = std::atoll(f[8].c_str());
+            if (f.size() > 10) { d.hits = std::atoll(f[9].c_str()); d.lookups = std::atoll(f[10].c_str()); }
             if (f.size() > 14) d.read_n = std::atoll(f[14].c_str());
             d.ok = true;
             return true;
