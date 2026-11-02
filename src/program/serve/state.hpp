@@ -13,6 +13,7 @@
 #include "basalt/core/device.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/draft_cum.hpp"
+#include "basalt/core/decision_schedule.hpp"
 #include "basalt/core/remote_expert_opt.hpp"
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/conversation_snapshot.hpp"
@@ -230,6 +231,12 @@ private:
     std::vector<ImgKey> live_imgs{};
     std::vector<ImgKey> req_imgs{};
     bool live_ok{};
+    // ---- Jev: target-only checkpoints can extend beyond the untouched draft cache ----
+    bool jev_scoring{};
+    int64_t jev_draft_prefix = -1;
+    basalt::core::DecisionCacheDeadline jev_cache{};
+    bool expire_jev(std::string& e, bool force = false);
+    // ---- end Jev ----
     std::vector<ConvCheckpoint> checks{};
     uint64_t check_clock{};
     // A turn-boundary checkpoint's GDN bytes reach the host after the first token (see the deferral class); this
@@ -519,6 +526,7 @@ private:
     bool xq_round(std::vector<Swap>* ranked = nullptr);
     bool xq_advance(bool wait);
     bool xq_drain();
+    bool adaptive_window(std::string& e);
     void save_profile(const char* why);
     bool next_line(std::string& out);
     int next_line_within(std::string& out, int ms);

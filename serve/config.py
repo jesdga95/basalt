@@ -362,6 +362,14 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--model", help="the .basalt model file: the engine, tokenizer, sampling and vision come from it")
     ap.add_argument("--engine-bin", help=argparse.SUPPRESS)      # set by `basalt serve`
     ap.add_argument("--alias", help="the model name the API reports (default: the name stored in the model file)")
+    # ---- Jev: server-owned options, independent of chat slot counts ----
+    ap.add_argument("--jev", type=int, default=0, metavar="N",
+                    help="decision lane limit, 0..8 (default 0: off), independent of chat slots")
+    ap.add_argument("--jev-max-pending", type=int, default=16, metavar="N", help="waiting decisions, 0..256")
+    ap.add_argument("--jev-timeout", type=int, default=300, metavar="SECONDS", help="decision deadline, 1..3600 seconds")
+    ap.add_argument("--jev-max-nodes", type=int, default=8192, metavar="N", help="decision trie budget, 1..65536 nodes")
+    ap.add_argument("--jev-tree-max", type=int, default=128, metavar="N", help="auto-mode exhaustive domain limit, 1..255")
+    # ---- end Jev ----
     ap.add_argument("--parallel", type=parallel_count, metavar="N",
                     help=f"requests served at once, 1..{PARALLEL_MAX} (default 1: one at a time); more requests wait "
                          "their turn. --max-context is shared: each slot holds that divided by N (so 4 slots of 262144 "

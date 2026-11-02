@@ -30,6 +30,12 @@ private:
     int req_penalty_last_n{};
     std::string req_bias_text{};   // logit_bias=id:value,...: added to the verifier's logits (see ver.set_logit_bias)
     bool req_bias_present{};
+    // ---- Jev: candidate logits, checkpoints and exact-root refresh ----
+    std::vector<int64_t> score_ids{}, score_frontiers{};
+    std::vector<basalt::core::Verifier::ScoreBranch> score_branches{};
+    bool score_fresh{};
+    Flow score();
+    // ---- end Jev ----
     int64_t req_gprompt{};
     std::string req_grammar_text{};   // grammar=<compact ASCII JSON, spaces as \u0020>: the request's grammar (--grammar on)
     int req_cvec{};

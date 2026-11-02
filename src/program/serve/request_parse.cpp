@@ -50,6 +50,36 @@ Flow Request::parse() {
             const std::string key = tok.substr(0, eq);
             const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
             if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
+            // ---- Jev: private protocol keys; never sampling parameters ----
+            else if (key == "score" || key == "score_at") {
+                auto& dst = key == "score" ? score_ids : score_frontiers;
+                if (!runtime_.o.jev || !cli::parse_i64_list(tok.c_str() + eq + 1, dst, pe)) {
+                    std::printf("ERR bad request: Jev is disabled or its token list is invalid\n");
+                    return Flow::next;
+                }
+            }
+            else if (key == "score_fresh") score_fresh = tok.substr(eq + 1) == "1";
+            else if (key == "score_branches") {
+                std::istringstream parts(tok.substr(eq + 1));
+                for (std::string part; std::getline(parts, part, '/');) {
+                    const size_t colon = part.find(':');
+                    std::vector<int64_t> tokens, candidates;
+                    if (!runtime_.o.jev || colon == std::string::npos ||
+                        !cli::parse_i64_list(part.substr(0, colon).c_str(), tokens, pe) ||
+                        !cli::parse_i64_list(part.substr(colon + 1).c_str(), candidates, pe) ||
+                        tokens.empty() || candidates.empty() || candidates.size() > 255 || score_branches.size() >= 8) {
+                        std::printf("ERR bad request: invalid Jev branch\n"); return Flow::next;
+                    }
+                    basalt::core::Verifier::ScoreBranch b;
+                    b.tokens.assign(tokens.begin(), tokens.end()); b.candidates.assign(candidates.begin(), candidates.end());
+                    if (std::any_of(tokens.begin(), tokens.end(), [&](int64_t t) { return t < 0 || t >= runtime_.n_vocab; }) ||
+                        std::any_of(candidates.begin(), candidates.end(), [&](int64_t t) { return t < 0 || t >= runtime_.n_vocab; })) {
+                        std::printf("ERR bad request: Jev branch token outside vocabulary\n"); return Flow::next;
+                    }
+                    score_branches.push_back(std::move(b));
+                }
+            }
+            // ---- end Jev ----
             else if (key == "grammar") req_grammar_text = tok.substr(eq + 1);
             else if (key == "gprompt") req_gprompt = std::atoll(tok.c_str() + eq + 1);
             else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
@@ -126,6 +156,30 @@ Flow Request::parse() {
         return Flow::next;
     }
     n = (int64_t) ids.size();
+    // ---- Jev: validate before the request can overwrite session state ----
+    if (!score_ids.empty()) {
+        if (geni || runtime_.batch_on() || runtime_.admit_slot >= 0 || runtime_.solo_slot >= 0 || score_ids.size() > 255 ||
+            req_bias_present || !req_grammar_text.empty() || req_ppl >= 0 ||
+            std::any_of(score_ids.begin(), score_ids.end(), [&](int64_t t) { return t < 0 || t >= runtime_.n_vocab; }) ||
+            score_frontiers.size() > 32 || std::any_of(score_frontiers.begin(), score_frontiers.end(),
+                [&](int64_t t) { return t < 1 || t >= n; })) {
+            std::printf("ERR bad request: invalid Jev candidates or checkpoint frontiers\n");
+            return Flow::next;
+        }
+        req_relax = 0;
+        req_temperature = 0;
+        req_penalty_last_n = 0;
+        size_t longest = 0;
+        for (const auto& b : score_branches) longest = std::max(longest, b.tokens.size());
+        if (!score_branches.empty() && (score_branches.size() < 2 || score_branches.size() > (size_t) runtime_.o.jev ||
+            score_branches.size() > (size_t) runtime_.ver.max_t() || n - 1 + (int64_t) longest + 9 > runtime_.o.max_context)) {
+            std::printf("ERR bad request: Jev branch wave exceeds its lane or context budget\n"); return Flow::next;
+        }
+    } else if (score_fresh || !score_frontiers.empty() || !score_branches.empty()) {
+        std::printf("ERR bad request: Jev checkpoint keys require candidates\n");
+        return Flow::next;
+    }
+    // ---- end Jev ----
 
     if (!req_grammar_text.empty() && runtime_.grammar_vocab) {
         std::string gerr;

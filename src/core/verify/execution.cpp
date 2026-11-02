@@ -130,9 +130,9 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
         cudaStreamWaitEvent(cs_, wait_ev_, 0);
         wait_ev_ = nullptr;
     }
-    set_head_keep(head_keep());
-    if (!hs_launch(T, err)) return false;
-    const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
+    set_head_keep(score_prefill_ ? 0 : head_keep());
+    if (!score_prefill_ && !hs_launch(T, err)) return false;
+    const cudaError_t le = cudaGraphLaunch(window_graph(T), cs_);
     if (next_ == nullptr) dev.record(DecodeEvents::kVerifyPost, cs_);
     ms_launch += ms_since(tl);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
@@ -392,7 +392,8 @@ bool Verifier::run_end(int32_t* out, std::string& err) {
         }
     }
     gm.mark(2);
-    for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    if (!score_prefill_)
+        for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     gm.mark(3);
     ++windows;
     progress_at("decode");

@@ -8,6 +8,8 @@ Test setup: one RTX 5090 at a 400 W power limit, an RTX 5060 Ti as the peer expe
 
 ## Summary
 
+[Jev target scores](decisions.md) describes finite-decision head reads and checkpoint ownership.
+
 - **MTP does not change output** (unless `--relaxed-drafting` is set: [details](features.md#relaxed-drafting)). With the expert tiers pinned, 275 of 275 greedy prompts produced identical tokens on
   both packs tested, and every full-vocabulary fp32 logit row (62,271 and 60,878) was bit-identical between `--spec 0`
   and `--spec 7`.

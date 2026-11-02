@@ -47,6 +47,11 @@ Verifier::~Verifier() {
     if (ring_hi_) cudaStreamSynchronize(ring_hi_);
     for (cudaStream_t q : qs_)
         if (q) cudaStreamSynchronize(q);
+    // ---- Jev: captured branch graphs release before their mutable caches ----
+    release_score_prefix_graphs();
+    score_workspace_.reset();
+    if (score_arena_) cudaFree(score_arena_);
+    // ---- end Jev ----
     dm_free();
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);

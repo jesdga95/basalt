@@ -27,6 +27,7 @@ from serve.security import host_allowed, host_names_for, key_matches, origin_all
 from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, Service, _debug_req
 from serve.api.structured import anthropic_format, check_format
 from serve.util.text import stop_strings
+from serve.decision.admission import DecisionError
 
 
 BODY_MAX = 256 << 20                        # the most a JSON request body may hold (read into memory)
@@ -111,7 +112,7 @@ def make_handler(svc: Service):
 
         def _body(self) -> bytes:
             """The request body, chunked or by Content-Length, at most BODY_MAX bytes."""
-            limit = BODY_MAX
+            limit = (4 << 20) if self.path.split("?")[0].rstrip("/") in ("/decision", "/v1/decision", "/v1/systemone") else BODY_MAX
             if self._chunked():
                 return self._read_chunked(limit)
             try:
@@ -167,7 +168,7 @@ def make_handler(svc: Service):
 
         def _cors(self):
             """CORS headers, only for /v1/* and a listed origin."""
-            if not svc.cors_origins or not self.path.split("?")[0].startswith("/v1/"):
+            if not svc.cors_origins or not (self.path.split("?")[0].startswith("/v1/") or self.path.split("?")[0].rstrip("/") == "/decision"):
                 return
             origin = (self.headers.get("Origin") or "").rstrip("/")
             if "*" in svc.cors_origins:
@@ -196,6 +197,8 @@ def make_handler(svc: Service):
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
+            if self.path.split("?")[0].rstrip("/") in ("/decision", "/v1/decision", "/v1/systemone"):
+                self.send_header("Cache-Control", "no-store")
             self._cors()
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -306,7 +309,7 @@ def make_handler(svc: Service):
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # clients post /v1/messages?beta=true
-            if path.startswith("/v1/") and self._foreign_page():
+            if (path.startswith("/v1/") or path == "/decision") and self._foreign_page():
                 return
             if path in ("/unload", "/load") and not self._control_body():
                 return
@@ -332,6 +335,19 @@ def make_handler(svc: Service):
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
+                # ---- Jev: preserve auth, body, disconnect and error boundaries ----
+                if path in ("/decision", "/v1/decision", "/v1/systemone"):
+                    if svc.jev is None:
+                        self._json(404, {"error": {"message": "not found"}})
+                        return
+                    if req.get("model", svc.model) not in svc.served_names():
+                        self._unknown_model(path, req.get("model"))
+                        return
+                    cancel = threading.Event()
+                    self._watch_client(cancel)
+                    self._json(200, svc.jev.run(req, cancel, path == "/v1/systemone"))
+                    return
+                # ---- end Jev ----
                 if path.startswith("/v1/responses/"):        # nothing is stored
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
@@ -390,6 +406,8 @@ def make_handler(svc: Service):
                     self._count_tokens(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
+            except DecisionError as e:
+                self._json(e.status, {"error": {"type": "server_overloaded" if e.status == 429 else "decision_error", "message": str(e)}})
             except EngineError as e:                         # the engine failed: not the request's fault
                 if path == "/v1/responses":
                     self._json(500, responses_error_body(str(e), "server_error", code="server_error"))

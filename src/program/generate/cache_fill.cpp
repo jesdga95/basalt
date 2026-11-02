@@ -42,7 +42,7 @@ int cache_fill(Context& context) {
         if (gs == 0) return 0;
         const int64_t hs = native_head.loaded()
             ? basalt::core::Verifier::hs_peer_bytes(native_head.row_bytes(), native_head.type(), n_vocab, g.n_embd,
-                                                    std::max({o.spec, o.batch, 2}), dev0, o.peer_device) : 0;
+                                                    std::max({o.spec, o.batch, o.jev, 2}), dev0, o.peer_device) : 0;
         return hs + gs;
     };
     auto peer_expert_room = [&]() -> uint64_t {

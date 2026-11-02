@@ -1,5 +1,6 @@
 // src/program/serve/request_prefill.cpp - request read_prompt operations.
 #include "request.hpp"
+#include <span>
 
 namespace basalt::program::serve {
 
@@ -124,12 +125,29 @@ Flow Request::read_prompt() {
     const auto source_at = [&](int64_t to) {
         return to == root_at ? ConvCheckpoint::kRoot : ConvCheckpoint::kTurnEnd;
     };
-    for (const int64_t to : {root_at, turn_at, n - 1}) {
+    // ---- Jev: stop at exact shared-token frontiers, inside the existing checkpoint budget ----
+    const int64_t standard_stops[]{root_at, turn_at, n - 1};
+    std::span<const int64_t> stops(standard_stops);
+    std::vector<int64_t> score_stops;
+    if (!score_ids.empty()) {
+        score_stops.push_back(n - 1);
+        score_stops.insert(score_stops.end(), score_frontiers.begin(), score_frontiers.end());
+        std::sort(score_stops.begin(), score_stops.end());
+        score_stops.erase(std::unique(score_stops.begin(), score_stops.end()), score_stops.end());
+        stops = score_stops;
+    }
+    // ---- end Jev ----
+    for (const int64_t to : stops) {
         if (to <= at) continue;
         runtime_.err.clear();
         const bool win = windows_ok(at, to);
+        // ---- Jev: expert exchanges finish before the prompt path borrows their slots ----
+        if (!score_ids.empty() && !win && !runtime_.xq_drain()) {
+            std::printf("ERR an adaptive refill failed\n"); return Flow::error;
+        }
+        // ---- end Jev ----
         int64_t rto = to;
-        if (win && to == n - 1 && to != turn_at && to != root_at && ppl == nullptr && gguard == nullptr) {
+        if (win && to == n - 1 && to != turn_at && to != root_at && ppl == nullptr && gguard == nullptr && score_ids.empty()) {
             const int64_t p0 = at + (int64_t) runtime_.S * ((to - at) / runtime_.S);
             if (!runtime_.mtp_on || n - p0 <= runtime_.S_mtp) { rto = p0; fold_p0 = p0; }
         }
@@ -153,7 +171,7 @@ Flow Request::read_prompt() {
         if (win && !ov_window()) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }
         runtime_.ov_post_done = false;
         runtime_.ov_post = [&, to]() -> bool {
-            if ((to == turn_at || to == root_at) && !runtime_.checkpoint_at(to, nullptr, false, source_at(to))) return false;
+            if ((to == turn_at || to == root_at || !score_ids.empty()) && !runtime_.checkpoint_at(to, nullptr, false, source_at(to))) return false;
             // the lent slots get their experts back here, beside the windows; the table follows on the main thread
             for (PfPart& p : runtime_.pf_parts) {
                 if (p.lent.empty()) continue;
@@ -194,7 +212,7 @@ Flow Request::read_prompt() {
         at = to;
         resumed_chunk = 0;   // the later parts are planned as the read they continue planned them
         runtime_.ov_post = nullptr;
-        if ((to == turn_at || to == root_at) && !runtime_.ov_post_done && !runtime_.checkpoint_at(to, nullptr, !in_slot && !runtime_.batch_on(), source_at(to))) {
+        if ((to == turn_at || to == root_at || !score_ids.empty()) && !runtime_.ov_post_done && !runtime_.checkpoint_at(to, nullptr, !in_slot && !runtime_.batch_on(), source_at(to))) {
             std::printf("ERR saving a conversation checkpoint failed%s\n", runtime_.ckpt_why.c_str());
             return Flow::error;
         }

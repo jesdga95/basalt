@@ -290,6 +290,7 @@ add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/exper
   src/core/verify/batch_capture.cpp
   src/core/verify/batch_execution.cpp
   src/core/verify/batch_sessions.cpp
+  src/core/verify/score_branches.cpp
   src/core/verify/capture.cpp
   src/core/verify/commit.cpp
   src/core/verify/cpu_warm.cpp
@@ -368,6 +369,10 @@ if(BUILD_TESTING)
   add_executable(conversation_cache_test tests/core/conversation_cache_test.cpp)
   target_include_directories(conversation_cache_test PRIVATE include)
   basalt_cpu_test(NAME conversation_cache_test COMMAND conversation_cache_test)
+
+  add_executable(decision_windows_test tests/core/decision_windows_test.cpp)
+  target_include_directories(decision_windows_test PRIVATE include)
+  basalt_cpu_test(NAME decision_windows_test COMMAND decision_windows_test)
   # conversation_memory.cpp asks the platform layer for the free RAM, so the probe comes along; it needs the system
   # allocator and the OS memory query, and nothing from the GPU runtime.
   add_executable(conversation_memory_test tests/core/conversation_memory_test.cpp src/core/conversation_memory.cpp)
@@ -507,6 +512,7 @@ add_executable(basalt src/program/generate.cpp src/program/engine_local.cpp src/
                        src/program/serve/prompt_windows.cpp
                        src/program/serve/protocol.cpp
                        src/program/serve/request.cpp
+                       src/program/serve/request_score.cpp
                        src/program/serve/request_decode.cpp
                        src/program/serve/request_finish.cpp
                        src/program/serve/request_image.cpp

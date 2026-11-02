@@ -2,11 +2,11 @@
 // the T rows of a window in one launch each, with the arithmetic of the separate kernels bit for bit:
 //
 //   qsa_dec_kv_post   K: RMS norm + RoPE (native_qsa_rms_norm_weighted, native_rope_apply); K and V of every row into
-//                     the INT8 cache and its host copy (kv_append_q8_step); the indexer tail snapshot, then the rows'
+//                     the INT8/FP16 cache and its host copy; the indexer tail snapshot, then the rows'
 //                     indexer keys in order (native_qsa_indexer_append)
 //   qsa_dec_q_post    the query heads out of q_full with norm + RoPE, the indexer query heads with norm + RoPE
 //
-// INT8 K/V without rotation only (qsa_dec_kv_post_supported).
+// INT8 or FP16 K/V without rotation (qsa_dec_fused_supported).
 #pragma once
 
 #include "basalt/kernels/kv_stream.hpp"
@@ -36,6 +36,9 @@ struct QsaDecKvPost {
     int max_cells = 0;
     float eps = 1e-6f;
     int part = 0;                       ///< 0: K/V rows and indexer; 1: K/V rows only; 2: indexer only
+    // ---- Jev: resident FP16 segment appends use the existing conversion ----
+    uint16_t *k_pool = nullptr, *v_pool = nullptr;
+    // ---- end Jev ----
 };
 
 struct QsaDecQPost {

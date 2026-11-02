@@ -35,18 +35,23 @@ Flow Runtime::dispatch() {
         // waits
         bool got = false, parking = true;
         std::string pe;
-        while (!got && (disk.enabled() || parking)) {
-            const int r = next_line_within(line, 1000);
+        while (!got && (disk.enabled() || parking || jev_cache.armed)) {
+            const int wait = disk.enabled() || parking ? 1000 : jev_cache.remaining_ms();
+            const int r = next_line_within(line, wait);
             if (r < 0) return Flow::quit;
             got = r == 1;
             while (!got && !(got = try_next_line(line)) && disk.enabled() && spill_to_disk(false, 1) > 0) {}
             if (got) break;
+            if (!expire_jev(pe)) { std::printf("ERR %s\n", pe.c_str()); return Flow::error; }
             parking = parking && park_idle_engine(pe);
             if (!pe.empty()) { std::printf("ERR %s\n", pe.c_str()); return Flow::error; }
-            if (!parking) break;
+            if (!parking && !jev_cache.armed) break;
         }
         if (!got && !next_line(line)) return Flow::quit;
     }
+    // ---- Jev: commands arriving at the deadline release state before using the engine ----
+    if (!expire_jev(err, line == "SLEEP")) { std::printf("ERR %s\n", err.c_str()); return Flow::error; }
+    // ---- end Jev ----
     // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
     // request's prompt and first token as a GEN 1, then continues it in that slot
     if (line.rfind("BSTOP ", 0) == 0) {

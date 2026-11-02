@@ -55,7 +55,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
         return false;
     }
     std::fill_n(h_qseg_, basalt::kernels::kQsaSegMaxRows + 8, QsaSeg{});
-    // the QSA chain's segment kernels need resident, unrotated INT8 K/V in every slot
+    // the QSA chain's segment kernels need resident, unrotated K/V of one format
     if (!(qsa_dec_fused_supported(s))) {
         err = "verify: batch windows need the native QSA kernels";
         return false;
@@ -66,8 +66,8 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
         for (int64_t m = 0; m < l; ++m) qi += is_qsa_layer(*g_, m) ? 1 : 0;
         for (SessionState* x : slots) {
             const QsaState& st = x->qsa_states[qi];
-            if (st.kv_mode != 0 || !st.kv_int8 || st.kv_rot || st.kv_hybrid || st.kv_q4) {
-                err = "verify: batch windows need resident INT8 K/V without rotation (--kv int8)";
+            if (st.kv_mode != 0 || st.kv_int8 != ss_->qsa_states[qi].kv_int8 || st.kv_rot || st.kv_hybrid || st.kv_q4) {
+                err = "verify: batch windows need resident FP16 or INT8 K/V of one format without rotation";
                 return false;
             }
         }
@@ -84,6 +84,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
         return false;
     }
     arena_b_ = d;
+    batch_bytes_ = b5 + (uint64_t) std::max<int64_t>(nQ, 1) * S * sizeof(QsaSegSlot);
     commitb_ = (int32_t*) d;
     tail_snap_b_ = (float*) ((uint8_t*) d + a);
     segb_ = (basalt::kernels::SegRow*) ((uint8_t*) d + b);
@@ -131,6 +132,9 @@ bool Verifier::bind_session(SessionState* s, std::string& err) {
     if (s == nullptr || ss_ == nullptr) { err = "verify: bind_session without a session"; return false; }
     if (s == ss_) return true;
     if (!wait_commit(err)) return false;   // the last commit still works on the old session's state
+    // ---- Jev: prefix graphs bind the session they captured ----
+    release_score_prefix_graphs();
+    // ---- end Jev ----
     SoloGraphs cur;
     std::copy(std::begin(exec_), std::end(exec_), std::begin(cur.exec));
     std::copy(std::begin(exec_nr_), std::end(exec_nr_), std::begin(cur.exec_nr));

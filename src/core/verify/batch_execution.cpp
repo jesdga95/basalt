@@ -231,8 +231,10 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     if (prof_on_) collect_profile();
     ++windows;
     if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_segs(rows, lens, S, tokens, pos, pool, next_user_, out, err);
-    if (!sample_rows(R, err)) return false;
-    for (int t = 0; t < R; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    if (!score_prefill_) {
+        if (!sample_rows(R, err)) return false;
+        for (int t = 0; t < R; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    }
     progress_at("decode");
     progress_beat();
     return true;

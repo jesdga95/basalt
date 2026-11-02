@@ -12,6 +12,7 @@ the model file's sampling defaults. For what a setting does to speed, memory and
 - [Prompt processing](#prompt-processing)
 - [Speculative decoding (MTP)](#speculative-decoding-mtp)
 - [Parallel slots](#parallel-slots)
+- [Jev decisions](decisions.md)
 - [Conversation cache](#conversation-cache)
 - [Vision](#vision)
 - [Control vectors](#control-vectors)
@@ -114,6 +115,8 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | `tokenizer` | path | `pack/full/tokenizer` in the source tree (a byte tokenizer if absent) | Tokenizer directory. Mock engine only. |
 | `mock-engine`, `script` | switch, string (repeatable) | off, a short greeting | Testing: run a scripted engine instead of the model, for clients and tests (no `model` needed); `script` is its answer, and given more than once, requests get them in turn. |
 | `config` | path | none | The config file. Command line only. |
+| `jev` | integer `0..8` | `0` (off) | Decision lane limit on the resident model, independent of chat slots. `1` enables the solo scorer. [Settings and API](decisions.md). |
+| `jev-max-pending`, `jev-timeout`, `jev-max-nodes`, `jev-tree-max` | integer | `16`, `300`, `8192`, `128` | Decision queue, deadline, compiled trie budget and automatic exhaustive-domain limit. [Ranges](decisions.md#runtime-and-settings). |
 
 ## Model and GPUs
 
