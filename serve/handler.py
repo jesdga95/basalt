@@ -530,8 +530,7 @@ def make_handler(svc: Service):
         def _openai(self, req):
             messages, tools, kw = openai_to_messages(req)
             tools, force = forced_call(req.get("tool_choice"), tools)   # a bad choice is a 400 before streaming
-            if check_format(req.get("response_format")) and tools:
-                raise ValueError("structured response_format with tools is not supported")
+            check_format(req.get("response_format"))
             svc.require_grammar(req.get("response_format"))
             svc.load()
             checked_sampling(req)                             # a sampling value out of range is a 400 likewise
@@ -657,12 +656,9 @@ def make_handler(svc: Service):
                 raise ResponsesError(str(e), "tool_choice") from None
             kw = responses_api.template_kwargs(req)
             try:
-                structured = check_format(responses_api.text_format(req))
+                check_format(responses_api.text_format(req))
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
-            if structured and tools:
-                raise ResponsesError("a JSON text.format with tools is not supported", "text.format",
-                                     "unsupported_parameter")
             try:
                 svc.require_grammar(responses_api.text_format(req))
             except ValueError as e:
@@ -712,8 +708,6 @@ def make_handler(svc: Service):
             tools, force = forced_call(req.get("tool_choice"), tools)   # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             response_format = anthropic_format(req)            # structured outputs
-            if response_format and tools:
-                raise ValueError("a JSON output format with tools is not supported")
             try:
                 svc.require_grammar(response_format)
             except ValueError as e:
