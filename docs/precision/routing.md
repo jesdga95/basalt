@@ -49,6 +49,6 @@ builds. The flag code is unchanged; the starting expert placement (a learned pro
 experts outside VRAM, so there is less for the flags to steer or skip (NVFP4: 1.4% of routed experts on the CPU tier
 in these runs).
 
-For scale, the exact IQ3_XXS pack scores KLD 0.2404 / top-1 84.03% and Q2_0 0.4329 / 78.24% on this gate. The speed
+For scale, every exact pack on this gate is on the [Hugging Face card](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt#quality). The speed
 comes from fewer misses, so it grows with the share of experts outside VRAM (IQ3_S, mostly held, gets slower), and
 so does the error. The bare defaults (0.5 / 9) are not measured here.
