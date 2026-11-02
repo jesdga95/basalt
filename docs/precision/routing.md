@@ -44,11 +44,10 @@ only, since the gate does not sample.
 | Q8_0 | 1.5 / 7 | 4.141 | 0.3736 | 4.06 | 80.28% | 219.3 |
 | Q8_0 | 16 / 1 | 8.873 | 1.2338 | 9.12 | 62.26% | 274.9 |
 
-The quality columns are from a later build than the decode column. Against the earlier Q8_0 reference, an earlier build
-read KLD 0.2440 (IQ3_S 1.5 / 7), 0.3484 and 0.8228 (NVFP4) and 1.6156 (Q8_0 16 / 1); the same flags on the later build
-against that reference read 0.2296 for NVFP4 1.5 / 7, so the drop is the build, not the reference. The flag code is
-unchanged; the starting expert placement (a learned profile in `data/profiles`) leaves fewer experts outside VRAM, so
-there is less for the flags to steer or skip (NVFP4: 1.4% of routed experts on the CPU tier in these runs).
+The quality columns are from a later build than the decode column, and read lower than the same flags did on earlier
+builds. The flag code is unchanged; the starting expert placement (a learned profile in `data/profiles`) leaves fewer
+experts outside VRAM, so there is less for the flags to steer or skip (NVFP4: 1.4% of routed experts on the CPU tier
+in these runs).
 
 For scale, the exact IQ3_XXS pack scores KLD 0.2404 / top-1 84.03% and Q2_0 0.4329 / 78.24% on this gate. The speed
 comes from fewer misses, so it grows with the share of experts outside VRAM (IQ3_S, mostly held, gets slower), and

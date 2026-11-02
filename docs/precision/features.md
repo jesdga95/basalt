@@ -45,7 +45,7 @@ Quality, against the BF16 reference through the decode path ([quality.md](qualit
 | Q6_K (NVFP4-DQ6_K) | 3.3037 | 0.0624 | 0.728 | 91.65% |
 
 The paired per-chunk KLD difference is +0.0059 (95% CI +0.0043 to +0.0074, [isolated-costs.md](isolated-costs.md)), so
-the loss is outside the run-to-run noise: about 10% of the KLD and half a point of top-1. On long prompts (12 chunks of 4,096 tokens, no Q8_0 reference, so PPL only)
+the loss is outside the run-to-run noise: about 10% of the KLD and half a point of top-1. On long prompts (12 chunks of 4,096 tokens, no reference base, so PPL only)
 PPL goes from 2.9547 to 2.9816; paired NLL +0.0091 (95% CI +0.0049 to +0.0132). Q6_K dense runs through dense_tc and
 dense_tc_pair; the same arithmetic applies as for any Q6_K dense tensor (q8_1 activations, int8 tensor-core dot).
 
@@ -121,17 +121,16 @@ The quality gate is teacher-forced: the window tokens are the reference text, fo
 output is not used (`src/program/serve/request_decode.cpp`, the `ppl != nullptr` branches). Forcing the window widths the drafter
 produces exercises the same verify kernels as real drafting.
 
-IQ3_XXS, 20 chunks of wikitext-2, against the llama.cpp Q8_0 base (base PPL 2.2815), int8 KV, tiers pinned, 400 W:
+IQ3_S, 20 chunks of wikitext-2, against the BF16 base (base PPL 2.2883), int8 KV, tiers pinned, 400 W + 180 W:
 
 | Forced window T | PPL | KLD mean | KLD median | KLD p99 | Same top-1 | rows.tsv md5 |
 |---|---|---|---|---|---|---|
-| 1 | 2.5330 | 0.27827 | 0.02674 | 3.5108 | 86.80% | 179c7f42f1e6d89459bf27f780e99b35 |
-| 3 | 2.5330 | 0.27827 | 0.02674 | 3.5108 | 86.80% | 179c7f42f1e6d89459bf27f780e99b35 |
-| 7 | 2.5330 | 0.27827 | 0.02674 | 3.5108 | 86.80% | 179c7f42f1e6d89459bf27f780e99b35 |
+| 1 | 2.3893 | 0.17480 | 0.01585 | 2.3380 | 88.92% | 60db649beeb84321e53ee96868e72f30 |
+| 3 | 2.3893 | 0.17480 | 0.01585 | 2.3380 | 88.92% | 60db649beeb84321e53ee96868e72f30 |
+| 7 | 2.3893 | 0.17480 | 0.01585 | 2.3380 | 88.92% | 60db649beeb84321e53ee96868e72f30 |
 
-All 5,100 per-row lines (NLL and KLD) are byte identical across T=1, 3 and 7 (`ppl_gate.py --diff`: max |dKLD|
-0.000000). Window width does not change the logits, so KLD with MTP on equals KLD with MTP off; the 0.278 is the quant
-against the base.
+All 5,100 per-row lines (NLL and KLD) are byte identical across T=1, 3 and 7. Window width does not change the logits,
+so KLD with MTP on equals KLD with MTP off; the 0.175 is the quant against the base.
 
 ### Scope
 
@@ -255,8 +254,8 @@ temperature 0.6 and +6 to 10% at 1.0. 0.3 doubles both the gain and the cost; 0.
 ## Prefill CPU share
 
 The CPU pool and the GPU round a streamed prompt expert differently (see the CPU-share paragraph in [index.md](index.md)), so
-`--prefill-cpu-share` can move numbers. NVFP4 pack, quality gate 20 chunks against the Q8_0 reference, T 3, int8 KV,
-`--spec 0`, 400 W, share 0 (all GPU) against 1 (all CPU): PPL 2.3046 / 2.3142 (standard error 0.06 each), KLD 0.07766 /
-0.07717, top-1 92.86% / 92.82%. The two ends differ by 0.0095 PPL, 0.0005 KLD and 0.04 points of top-1, inside the
-run-to-run size of this gate, so any share between them is bounded by that. `basalt-probe` may print a different share
+`--prefill-cpu-share` can move numbers. NVFP4 pack (DQ6_K), quality gate 20 chunks against the BF16 reference, T 3,
+int8 KV, `--spec 0`, 400 W + 180 W, share 0 (all GPU) against 1 (all CPU): PPL 2.3046 / 2.3068, KLD 0.07337 / 0.07085,
+top-1 93.04% / 93.12%. The paired KLD difference is +0.0025 [-0.0005, +0.0055], inside the noise of this gate, so any
+share between them is bounded by that. `basalt-probe` may print a different share
 as a suggestion ([probe](../probe.md)); it never changes it on its own.
