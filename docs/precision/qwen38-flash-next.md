@@ -15,7 +15,9 @@ build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 
 - **Closer to BF16 than llama.cpp.** Same Q8_0 weights, against the BF16 reference: llama.cpp scores KLD 0.0325, top-1 93.98%;
   the Basalt Q8_0 pack scores KLD 0.0200, top-1 95.34%.
 - **Quantized once.** GGUF packs keep their blocks. The NVIDIA NVFP4 pack keeps NVIDIA's expert codes and scales bit for bit and
-  quantizes each dense tensor once from BF16.
+  quantizes each dense tensor once from BF16. A checkpoint that stores its dense weights as MXFP8 is dequantized exactly
+  first (an E4M3 value times a power of two is a BF16 number), so the pack still holds one rounding; its expert scales
+  may arrive in Model Optimizer's base-plus-offset (CSF) form and are decoded to the same UE4M3 bytes first.
 - **Only one rounding costs measurable quality by default:** the Q6_K dense projections, about 0.006 KLD and 0.3 to 0.6 points of
   top-1 against NVIDIA's precision. Everything else costs about 0.001 or less.
 
@@ -27,6 +29,7 @@ build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 
 | Routed experts (NVFP4) | NVIDIA's E2M1 codes and UE4M3 scales, 4.5 bits/weight; FP32 tail `{s_gate, s_up, s_down}` | q8_1 activations, exact int32 per 16-value sub-block, fp32 scales; tails applied in fp32 |
 | Dense projections (attention, GDN qkv/z/out, QSA) | Q8_0 (or Q6_K in the NVFP4 pack; Q4_K/Q5_K/Q6_K in others) | q8_1 activations, int8 tensor-core dot, exact int32 per 32 block |
 | Router, GDN alpha/beta, indexer, PLE key/value | BF16 as stored | fp32 activations and sums |
+| N-gram (PLE) table | The source's type: IQ4_NL blocks as shipped, FP8 E4M3 re-blocked to Q8_0 (one more rounding), or a checkpoint's NVFP4 codes and UE4M3 scales bit for bit (90-byte rows, `qwen4exp.ple.nvfp4_scale_2` in the metadata) | rows decoded to fp32, one row per token |
 | Hyper-connections | int8 copy, one fp16 scale per 32 inputs (`hc8`); the hc read takes fp32 activations | fp32 sums; the up product uses fp16 hi/lo mma |
 | Token embedding | GGUF type; one row dequantized to fp32 per token | fp32 |
 | Output head | Q8_0 (NVFP4 pack) or Q6_K (IQ3_S pack) | two-stage in verify, see [head](#two-stage-verify-head) |

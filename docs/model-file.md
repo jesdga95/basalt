@@ -124,3 +124,22 @@ ggml's NVFP4 blocks, the layout the dense products read with TMA (NInfer's and I
 - The matrix's FP32 scale is a separate F32 [1] tensor `<name>.scale`; a value is `e2m1 * ue4m3 * scale`.
 
 [nvfp4_planes.hpp](../include/basalt/kernels/nvfp4_planes.hpp) is the engine's copy of this layout.
+
+### What else a checkpoint may store its weights as
+
+A checkpoint is read in whatever form it stores each weight in, with no flag for it and no requantization:
+
+- **Expert scales** as Model Optimizer's CSF stream (`weight_scale.nvfp4_csf_fixed` with its
+  `weight_scale.nvfp4_csf_exceptions` words) instead of plain `weight_scale`. Both arrive as the same UE4M3 bytes;
+  a single checkpoint can mix the two forms across its projections.
+- **Dense weights** as MXFP8 (E4M3 values with one UE8M0 scale per 32 values) instead of BF16. That dequantizes
+  exactly, so the pack still holds one rounding. `--dense-q8-0` is the matching choice for an MXFP8 checkpoint,
+  since one Q8_0 block covers exactly one MXFP8 block.
+- **The n-gram table** as NVFP4 shards instead of FP8. Its codes and UE4M3 scales come over bit for bit as 90-byte
+  rows (one UE4M3 scale byte then 8 code bytes per 16 values) instead of the 170 bytes an 8-bit copy of the same
+  rows takes, and the table's one F32 `weight_scale_2` is written to the metadata as
+  `qwen4exp.ple.nvfp4_scale_2`, which is what the engine multiplies the rows by - a pack that lost it is refused at
+  open rather than guessed at.
+
+`meta.checkpoint` records the source, how many expert scale sets came from the CSF form and how many dense tensors
+came from MXFP8.

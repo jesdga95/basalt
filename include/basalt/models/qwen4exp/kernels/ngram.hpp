@@ -47,9 +47,11 @@ inline constexpr int PLE_ROW_BYTES = (PLE_HEAD_DIM / 32) * 18;           // 90: 
 inline constexpr int PLE_ROW_BYTES_Q5_0 = (PLE_HEAD_DIM / 32) * 22;       // 110: a Q5_0 row
 inline constexpr int PLE_ROW_BYTES_Q8_0 = (PLE_HEAD_DIM / 32) * 34;       // 170: a Q8_0 row
 inline constexpr int PLE_ROW_BYTES_BF16 = PLE_HEAD_DIM * 2;                // 320: a BF16 row
-inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_BF16;
-
-/// The artifact's own hash constants, transcribed from the GGUF metadata:
+// An NVFP4 row: 10 groups of one UE4M3 scale byte plus the 8 code bytes of those 16 values.  The same 90 bytes as
+// an IQ4_NL row by coincidence, and a different layout, so the format decides both.
+inline constexpr int PLE_ROW_BYTES_NVFP4 = (PLE_HEAD_DIM / 16) * 9;        // 90: an NVFP4 row
+inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_BF16;               // the widest row any format uses
+inline constexpr const char* PLE_NVFP4_SCALE_KEY = "qwen4exp.ple.nvfp4_scale_2";   // the table's FP32 scalect's own hash constants, transcribed from the GGUF metadata:
 ///
 ///     layer_multipliers = [23703573157769, 20109073645365, 8052911324071]
 ///     head_vocab_sizes  = [20000003, 20000023, ...]          16 entries, NOT an arithmetic sequence
@@ -98,6 +100,15 @@ int iq4nl_code(int code);
 /// so byte j carries elements j and j+16 - NOT 2j and 2j+1, which is the natural reading and which produces
 /// a perfectly plausible embedding of the wrong 160 values.
 void iq4nl_dequant_row(const uint8_t* row, float* out160);
+
+/// One 90-byte NVFP4 row -> 160 floats: per 16 values one UE4M3 scale byte, then 8 code bytes with value j in the
+/// low nibble of byte j and value j + 8 in its high one - the arrangement of an NVFP4 expert block, so both decode
+/// with `kvalues_fp4` x `ue4m3_to_fp32_half`.  `scale_2` is the table's FP32 scale, read from the metadata
+/// (`PLE_NVFP4_SCALE_KEY`) and applied as the experts apply their tensor scale.
+///
+/// THE NIBBLE ORDER IS THE TRAP AGAIN: the checkpoint pairs value 2i with 2i+1 in byte i, so a reader using that
+/// order decodes a plausible 160-vector of the wrong values (the converter moves the nibbles when it writes them).
+void nvfp4_dequant_row(const uint8_t* row, float* out160, float scale_2);
 
 /// How the table's rows are read. `Direct` is the default: 4 KiB reads from the SSD (platform::DirectFile),
 /// so the table never occupies the process's memory. `Mmap` is the earlier memory-mapped path, kept as the
@@ -174,7 +185,7 @@ public:
     /// True when `PleIoOptions::lock` was asked for and the whole table was locked (false: pages only pre-touched).
     bool locked() const;
     uint64_t rows() const;
-    /// "IQ4_NL" or "Q5_0".
+    /// "IQ4_NL", "Q5_0", "Q8_0" or "NVFP4".
     const char* format() const;
 
     /// 16 row indices -> 2560 floats.  The gathered rows are flattened HEAD-SLOWEST: row h's 160 values

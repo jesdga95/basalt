@@ -24,14 +24,17 @@ Inputs
                      With --sections-from and --checkpoint it replaces the mtp/dense copied from BASE (same size required)
   --draft-vocab FILE the token subset the draft head may propose (int32 ids; needs --mtp-source)
 
-From an NVFP4 checkpoint (--sections-from with --checkpoint)
-  --checkpoint DIR   NVIDIA Model Optimizer's NVFP4 safetensors (config.json, the model-NNNNN-of-NNNNN shards, the FP8
-                     n-gram table file, tokenizer files, generation_config.json, README.md). The routed experts keep
-                     their E2M1 codes and UE4M3 scales, moved into Basalt's blocks with the FP32 tail {s_gate, s_up,
-                     s_down, 0} from weight_scale_2; the projections are quantized once from BF16 to Q6_K (Q8_0 where
-                     rows are not whole 256-value blocks, and for the output head and token embedding); the other
-                     tensors keep BF16 or become F32/F16 as the engine reads them; the n-gram table is FP8 code x scale
-                     as Q8_0. The GGUF metadata and the tokenizer come from the checkpoint's files.
+From a quantized checkpoint (--sections-from with --checkpoint)
+  --checkpoint DIR   NVIDIA Model Optimizer's safetensors (config.json, the model-NNNNN-of-NNNNN shards, in the
+                     directory or in tensors/, the n-gram table, tokenizer files, generation_config.json, README.md).
+                     The routed experts keep their E2M1 codes and UE4M3 scales, read plain (`weight_scale`) or from
+                     Model Optimizer's CSF scale stream (`weight_scale.nvfp4_csf_fixed` with its exceptions), moved
+                     into Basalt's blocks with the FP32 tail {s_gate, s_up, s_down, 0} from weight_scale_2; the
+                     projections are quantized once from BF16, or from MXFP8 (E4M3 x UE8M0, which is exact), to Q6_K
+                     (Q8_0 where rows are not whole 256-value blocks, and for the output head and token embedding);
+                     the other tensors keep BF16 or become F32/F16 as the engine reads them; the n-gram table is FP8
+                     code x scale as Q8_0, or carried over as NVFP4 rows when the checkpoint stores it that way. The
+                     GGUF metadata and the tokenizer come from the checkpoint's files.
   --dense-q8-0       Q8_0 projections instead of Q6_K (the 8-bit dense variant)
   The drafter and vision sections come from BASE byte for byte; BASE's vocabulary must be the checkpoint's.
 
@@ -538,9 +541,9 @@ def warn_unofficial():
 
 
 def from_checkpoint(a) -> None:
-    """The language model straight from an NVFP4 safetensors checkpoint (routed experts moved into Basalt's layout,
-    every other tensor converted once from BF16, the n-gram table from FP8, metadata and tokenizer from the
-    checkpoint's files); drafter and vision are copied from BASE byte for byte."""
+    """The language model straight from a quantized safetensors checkpoint (routed experts moved into Basalt's
+    layout, every other tensor converted once, the n-gram table in the form the checkpoint keeps it, metadata and
+    tokenizer from the checkpoint's files); drafter and vision are copied from BASE byte for byte."""
     import multiprocessing
     import checkpoint as C
     out, src = Path(a.out), Path(a.sections_from)
@@ -564,9 +567,10 @@ def from_checkpoint(a) -> None:
         ck = C.Checkpoint(a.checkpoint)
         experts = C.CheckpointExperts(ck)
         dense_src = C.CheckpointDense(ck, q6k)
-        ple_path = C.ple_table(ck)
-        ple = S.PleFp8(str(ple_path))
+        ple = C.ple_table(ck)
         kv = C.model_kv(ck, S.PLE_DIM, 18 if q6k else 7, a.name)
+        if not ple.folded:      # an NVFP4 table keeps its scales; the engine needs the table's F32 one with them
+            kv["qwen4exp.ple.nvfp4_scale_2"] = C.f32(ple.scale)
         dense = S.Dense(dense_src, False)
     except S.ConvertError as e:
         die(str(e))
@@ -592,7 +596,7 @@ def from_checkpoint(a) -> None:
                 job.file(f"tokenizer/{p.name}", p)
             job.chunks("dense", dense.chunks())
             job.bytes("dense.index", dense.index_text())
-            job.chunks("experts", experts.chunks(pool))
+            job.chunks("experts", experts.chunks(pool, depth=2 * a.workers))
             job.bytes("experts.layout", experts.layout_text())
             t = time.time()
             parts = []
@@ -630,9 +634,10 @@ def from_checkpoint(a) -> None:
                     die(f"section {name}: the copy's SHA-256 differs from {src}'s")
             tens = {n: {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.ne],
                         "bytes": t.expected_bytes(), "offset": tensor_offsets[n]} for n, t in dense_src.tensors.items()}
-            tens["per_layer_token_embd.weight"] = {"type": "Q8_0", "type_id": 8, "shape": [S.PLE_DIM, ple.rows],
-                                                  "bytes": ple.nbytes, "offset": tensor_offsets["per_layer_token_embd.weight"]}
-            ck_files = sorted(set(ck.shards) | {ple_path})
+            tens["per_layer_token_embd.weight"] = {"type": ple.gguf_type, "type_id": ple.gguf_type_id,
+                                                  "shape": [S.PLE_DIM, ple.rows], "bytes": ple.nbytes,
+                                                  "offset": tensor_offsets["per_layer_token_embd.weight"]}
+            ck_files = sorted(set(ck.shards) | set(ple.files))
             meta = {
                 "format": "basalt", "version": 2, "name": a.name or base_meta.get("name"),
                 "converter": {"tool": "tools/convert/convert.py"},
@@ -640,25 +645,32 @@ def from_checkpoint(a) -> None:
                              "fingerprint_sha256_first_last_64mib_and_size": fingerprint(p)} for p in ck_files],
                 "gguf_kv": kv,
                 "tensors": tens,
-                "conversions": {"compat_bf16": False, "tensors": [{
-                    "name": "per_layer_token_embd.weight", "src_type": "F8_E4M3", "dst_type": "Q8_0",
-                    "method": "fp8 code x per-tensor BF16 scale, Q8_0 blocks of 32 (ggml reference rounding)",
-                    "scale": ple.scale}]},
+                "conversions": {"compat_bf16": False, "tensors": [{**ple.conversion, "scale": ple.scale}]},
                 "license": model_license(kv),
             }
             for k in ("mtp", "vision"):
                 meta[k] = base_meta.get(k)
             if tuned_sha:
                 meta["mtp"] = {**meta["mtp"], "dense": {"tuning": "self_distilled", "sha256": tuned_sha}}
+            n_mxfp8 = sum(1 for t in dense_src.tensors.values() if t.scale)
             used = sorted({t.how for t in dense_src.tensors.values()})
             meta["checkpoint"] = {
                 "dir": Path(a.checkpoint).name, "config_sha256": hashlib.sha256((ck.dir / "config.json").read_bytes()).hexdigest(),
-                "experts": {"format": "nvfp4", "source": "weight (E2M1 pairs), weight_scale (UE4M3 per 16), "
-                            "weight_scale_2 (FP32); input_scale unused", "repack": "codes and scales unchanged, "
+                "experts": {"format": "nvfp4",
+                            "source": "weight (E2M1 pairs), weight_scale.nvfp4_csf_fixed and "
+                                      ".nvfp4_csf_exceptions (UE4M3 per 16 values, decoded to bytes), "
+                                      "weight_scale_2 (FP32); input_scale unused" if experts.csf else
+                                      "weight (E2M1 pairs), weight_scale (UE4M3 per 16), weight_scale_2 (FP32); "
+                                      "input_scale unused",
+                            "csf_decoded": experts.csf,
+                            "repack": "codes and scales unchanged, "
                             "nibbles moved into 64-value blocks", "tail": "fp32 {s_gate, s_up, s_down, 0} per expert"},
                 "dense": {"projections": "Q6_K where rows are whole 256-value blocks, else Q8_0" if q6k else "Q8_0",
                           "q6_k_method": "least-squares 16-value group scales, 8-bit group scales, fp16 super-scale",
-                          "q8_0_method": "ggml reference rounding", "from": "BF16, quantized once",
+                          "q8_0_method": "ggml reference rounding",
+                          "from": "BF16, quantized once" if not n_mxfp8 else "BF16, or MXFP8 dequantized exactly, "
+                                  "quantized once",
+                          "mxfp8_dequantized": n_mxfp8,
                           "transforms": {k: C.METHODS[k] for k in used}},
                 "sections_from": {"path": src.name, "size": src.stat().st_size,
                                   "fingerprint_sha256_first_last_64mib_and_size": fingerprint(src),
@@ -780,7 +792,8 @@ def main():
     ap.add_argument("--requant-dense-q6k", metavar="PACK.basalt",
                     help="copy PACK with its Q8_0 dense projections requantized to Q6_K")
     ap.add_argument("--checkpoint", metavar="DIR",
-                    help="an NVFP4 safetensors checkpoint: with --sections-from, the language model is read from it; "
+                    help="a quantized safetensors checkpoint (NVFP4 experts, BF16 or MXFP8 projections): with "
+                         "--sections-from the language model is read from it and the other sections from that pack; "
                          "with --requant-dense-q6k, the BF16 projections")
     ap.add_argument("--dense-q8-0", action="store_true",
                     help="with --checkpoint and --sections-from: Q8_0 projections instead of Q6_K")

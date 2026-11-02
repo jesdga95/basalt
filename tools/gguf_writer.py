@@ -85,6 +85,8 @@ class GGUFWriter:
         if type_name is None:
             if isinstance(value, list) and value:
                 elem = {bool: "bool", int: "i32", float: "f32", str: "string"}.get(type(value[0]))
+                if elem == "i32" and any(v < -(1 << 31) or v > (1 << 31) - 1 for v in value):
+                    elem = "i64"        # 64-bit values (the n-gram multipliers are) do not fit an int32 array
                 if elem is None:
                     raise TypeError(f"unsupported array element {type(value[0])} for {key}")
                 type_name = "array:" + elem
@@ -139,8 +141,8 @@ class GGUFWriter:
                "f32": "<f", "bool": "<?", "u64": "<Q", "i64": "<q", "f64": "<d"}[type_name]
         return struct.pack(fmt, v)
 
-    def write(self, path) -> pathlib.Path:
-        path = pathlib.Path(path)
+    def blob(self) -> bytes:
+        """The whole file: header, metadata, tensor directory, then the tensor data aligned to `alignment`."""
         body = bytearray()
         body += struct.pack("<I", GGUF_MAGIC)
         body += struct.pack("<I", 3)                       # GGUF v3
@@ -169,7 +171,11 @@ class GGUFWriter:
             pad = (-len(t.data)) % self.alignment
             body += b"\0" * pad
 
-        path.write_bytes(bytes(body))
+        return bytes(body)
+
+    def write(self, path) -> pathlib.Path:
+        path = pathlib.Path(path)
+        path.write_bytes(self.blob())
         return path
 
 
