@@ -131,6 +131,10 @@ class GrammarOff(Fixture, unittest.TestCase):
         self.assertEqual(g["kind"], "tools")
         self.assertEqual(g["tools"][0]["function"]["name"], "get_weather")
 
+    def test_strict_json_format_with_plain_tools(self):
+        g = self.chat(tools=[TOOL], response_format=self.json_schema(strict=True))
+        self.assertEqual(g, {"kind": "json_schema", "schema": SCHEMA, "tools": [TOOL]})
+
     def test_responses_strict_schema(self):
         g = self.sent("/v1/responses", {"model": "qwen3.8-flash-next", "input": "hi", "text": {"format": {"type": "json_schema", "name": "s",
                                                                             "schema": SCHEMA, "strict": True}}})
@@ -195,11 +199,40 @@ class GrammarOn(Fixture, unittest.TestCase):
     def test_anthropic_bad_format(self):
         for body in ({"output_config": {"format": {"type": "json_schema"}}},
                      {"output_config": {"format": {"type": "text"}}},
-                     {"output_format": {"type": "json_schema", "schema": {"type": "string"}}},
-                     {"output_config": {"format": {"type": "json_schema", "schema": SCHEMA}}, "tools": [
-                         {"name": "t", "input_schema": {"type": "object"}}]}):
+                     {"output_format": {"type": "json_schema", "schema": {"type": "string"}}}):
             code, err = self.refused("/v1/messages", self.anthropic(**body))
             self.assertEqual((code, err["type"]), (400, "invalid_request_error"))
+
+
+    def test_json_format_with_tools(self):
+        want = {"kind": "json_schema", "schema": SCHEMA, "tools": [TOOL]}
+        self.assertEqual(self.chat(tools=[TOOL], response_format=self.json_schema()), want)
+        self.assertEqual(self.chat(tools=[TOOL], tool_choice="auto", response_format={"type": "json_object"}),
+                         {"kind": "json_object", "tools": [TOOL]})
+        self.assertEqual(self.sent("/v1/responses", {"model": "qwen3.8-flash-next", "input": "hi", "tools": [
+            {"type": "function", **FN}], "text": {"format": {"type": "json_schema", "name": "s", "schema": SCHEMA,
+                                                             "strict": True}}}), want)
+        self.assertEqual(self.sent("/v1/messages", self.anthropic(
+            tools=[{"name": "get_weather", "description": "weather", "input_schema": FN["parameters"]}],
+            tool_choice={"type": "auto"}, output_config={"format": {"type": "json_schema", "schema": SCHEMA}})), want)
+
+    def test_json_format_with_a_forced_call_is_the_call(self):
+        g = self.chat(tools=[TOOL], tool_choice="required", response_format=self.json_schema())
+        self.assertEqual(g, {"kind": "tools", "tools": [TOOL], "tool_choice": "required"})
+
+    def test_json_format_with_tool_choice_none_is_the_format(self):
+        g = self.chat(tools=[TOOL], tool_choice="none", response_format=self.json_schema())
+        self.assertEqual(g, {"kind": "json_schema", "schema": SCHEMA})
+
+    def test_responses_json_answer_with_tools(self):
+        req = urllib.request.Request(self.base + "/v1/responses", data=json.dumps(
+            {"model": "qwen3.8-flash-next", "input": "hi", "tools": [{"type": "function", **FN}],
+             "text": {"format": {"type": "json_schema", "name": "s", "schema": SCHEMA, "strict": True}}}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            out = json.loads(r.read())["output"]
+        self.assertEqual([o["type"] for o in out if o["type"] != "reasoning"], ["message"])
+        self.assertEqual(json.loads(out[-1]["content"][0]["text"]), {"a": 1})
 
 
 class EngineWithoutTheFlag(unittest.TestCase):

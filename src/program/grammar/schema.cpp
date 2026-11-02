@@ -251,7 +251,19 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
         fns.push_back(c.add_rule(fn_id, literal("<function=" + nm->s + ">\n") + " " + body + literal("</function>")));
     }
     c.add_rule("call", literal("<tool_call>\n") + " (" + join(fns, " | ") + ") " + literal("\n</tool_call>"));
-    c.add_rule("root", opt.multiple_calls ? "call ([ \\t\\n]* call)*" : "call");
+    std::string root = opt.multiple_calls ? "call ([ \\t\\n]* call)*" : "call";
+    if (!opt.answer_schema.empty()) {
+        JsonValue answer;
+        if (!read_json(opt.answer_schema, answer, err)) return "";
+        try {
+            SchemaDocument d = build_schema_document(answer);
+            root = "(" + root + ") | " + c.add_schema("answer", *d.root);
+        } catch (const std::exception& e) {
+            err = std::string("schema: ") + e.what();
+            return "";
+        }
+    }
+    c.add_rule("root", root);
     try {
         c.check_errors();
     } catch (const std::exception& e) {
@@ -271,15 +283,27 @@ RequestGrammar grammar_from_request(const std::string& grammar_json, std::string
         return out;
     }
     std::string gbnf;
-    if (kind->s == "json_object") {
-        gbnf = json_schema_to_gbnf(R"({"type":"object"})", err);
-    } else if (kind->s == "json_schema") {
-        const JsonValue* sch = req.get("schema");
-        if (!sch) {
-            err = "grammar: json_schema needs a schema";
-            return out;
+    if (kind->s == "json_object" || kind->s == "json_schema") {
+        std::string schema = R"({"type":"object"})";
+        if (kind->s == "json_schema") {
+            const JsonValue* sch = req.get("schema");
+            if (!sch) {
+                err = "grammar: json_schema needs a schema";
+                return out;
+            }
+            schema = sch->dump();
         }
-        gbnf = json_schema_to_gbnf(sch->dump(), err);
+        if (const JsonValue* tools = req.get("tools")) {   // tool calls or the JSON answer, from the first answer token
+            if (!tools->is(Type::Array)) {
+                err = "grammar: tools needs an array";
+                return out;
+            }
+            ToolGrammarOptions opt;
+            opt.answer_schema = schema;
+            gbnf = tool_call_gbnf(tools->dump(), opt, err);
+        } else {
+            gbnf = json_schema_to_gbnf(schema, err);
+        }
     } else if (kind->s == "tools") {
         const JsonValue* tools = req.get("tools");
         if (!tools || !tools->is(Type::Array)) {
