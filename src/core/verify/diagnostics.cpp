@@ -85,6 +85,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
         if (s == nullptr) continue;
         while (cudaStreamQuery(s) == cudaErrorNotReady) {
             if (ms_since(t0) > timeout_ms) {
+                gpu_left_running().store(true);
                 return false;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
