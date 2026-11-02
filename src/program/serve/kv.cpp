@@ -158,7 +158,7 @@ bool Runtime::peer_take(const std::vector<int32_t>& off, std::string& e) {
         if (pres[(size_t) i] < 0) in[pool_of((size_t) i)].push_back(i);
     for (size_t i = 0; i < pres.size(); ++i)
         if (pres[i] >= 0 && !in[pool_of(i)].empty()) on[pool_of(i)].push_back((int32_t) i);
-    std::vector<std::pair<int32_t, int32_t>> want;   // (peer slot, the expert it takes)
+    std::vector<std::array<int32_t, 3>> due;   // (peer slot, its expert, the expert it takes)
     for (int64_t p = 0; p < pools; ++p) {
         std::vector<int32_t>& a = in[(size_t) p];
         std::vector<int32_t>& b = on[(size_t) p];
@@ -167,13 +167,61 @@ bool Runtime::peer_take(const std::vector<int32_t>& off, std::string& e) {
         std::sort(a.begin(), a.end(), [&](int32_t x, int32_t y) { return better(x, y) || (!better(y, x) && x < y); });
         std::partial_sort(b.begin(), b.begin() + (ptrdiff_t) n, b.end(),
                           [&](int32_t x, int32_t y) { return better(y, x) || (!better(x, y) && x > y); });
-        for (size_t k = 0; k < n && better(a[k], b[k]); ++k) want.emplace_back(pres[(size_t) b[k]], a[k]);
+        for (size_t k = 0; k < n && better(a[k], b[k]); ++k) due.push_back({pres[(size_t) b[k]], b[k], a[k]});
     }
-    if (want.empty()) return true;
+    if (due.empty()) return true;
+    if (peer_defer) {   // the prompt read that follows lends the peer's coldest slots and refills them: no copy here
+        peer_due.insert(peer_due.end(), due.begin(), due.end());
+        peer_due_off += (int64_t) off.size();
+        return true;
+    }
+    std::vector<std::pair<int32_t, int32_t>> want;
+    for (const auto& d : due) want.emplace_back(d[0], d[2]);
     int64_t moved = 0;
     if (!peer.place(want, moved, e)) { e = "elastic KV: " + e; return false; }
     basalt::log::info("basalt serve", "elastic KV: the peer took %lld of the %zu experts the KV moved off CUDA0 (%.1f ms)",
                       (long long) moved, off.size(), std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+    return true;
+}
+
+// The prompt split lent the peer's slots `lent` (expert, slot): a due handoff into one of them gives the slot its new
+// expert, so the loan's refill copies that one instead of the old
+void Runtime::peer_due_lent(std::vector<std::pair<int32_t, int32_t>>& lent) {
+    if (peer_due.empty()) return;
+    std::vector<int32_t> at((size_t) peer.cache().slots(), -1);   // slot -> its entry in `lent`
+    for (size_t j = 0; j < lent.size(); ++j)
+        if (lent[j].second >= 0 && lent[j].second < (int32_t) at.size()) at[(size_t) lent[j].second] = (int32_t) j;
+    size_t kept = 0;
+    for (const auto& d : peer_due) {
+        const int32_t j = d[0] >= 0 && d[0] < (int32_t) at.size() ? at[(size_t) d[0]] : -1;
+        if (j >= 0 && lent[(size_t) j].first == d[1] && host_res[(size_t) d[2]] < 0) {
+            lent[(size_t) j].first = d[2];
+            ++peer_due_lent_n;
+        } else {
+            peer_due[kept++] = d;
+        }
+    }
+    peer_due.resize(kept);
+}
+
+// before the first window: the due handoffs no loan took are copied now
+bool Runtime::peer_due_apply(std::string& e) {
+    peer_defer = false;
+    if (peer_due.empty() && peer_due_lent_n == 0) return true;
+    const auto t0 = Clock::now();
+    std::vector<std::pair<int32_t, int32_t>> want;
+    const std::vector<int32_t>& pres = peer.residency();
+    for (const auto& d : peer_due)
+        if (pres[(size_t) d[1]] == d[0] && pres[(size_t) d[2]] < 0 && host_res[(size_t) d[2]] < 0) want.emplace_back(d[0], d[2]);
+    peer_due.clear();
+    int64_t moved = 0;
+    if (!want.empty() && !peer.place(want, moved, e)) { e = "elastic KV: " + e; return false; }
+    basalt::log::info("basalt serve", "elastic KV: the peer took %lld of the %lld experts the KV moved off CUDA0 (%lld "
+                      "with the prompt's loan, the rest in %.1f ms)", (long long) (moved + peer_due_lent_n), (long long) peer_due_off,
+                      (long long) peer_due_lent_n,
+                      std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+    peer_due_lent_n = 0;
+    peer_due_off = 0;
     return true;
 }
 

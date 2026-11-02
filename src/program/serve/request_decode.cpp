@@ -13,6 +13,7 @@ Request::DecSnap Request::dec_snap() {
 // the verify windows: the first holds the last prompt token, with the rest of the last window
 Flow Request::decode() {
     if (runtime_.mtp_on && !runtime_.mtp.use_main(runtime_.err)) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }   // the windows between prompt chunks swapped it
+    if (!runtime_.peer_due_apply(runtime_.err)) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }
     p = fold_p0;
     x = (int32_t) ids[(size_t) fold_p0];
     {   // a request decoded here starts its adaptation from the experts its own prompt routed to
