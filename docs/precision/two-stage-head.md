@@ -92,8 +92,8 @@ A Q6_K output head (the IQ3_S pack's) runs in two stages in the verify window (`
 q8_1 codes the exact kernel reads. Each block of rows adds its per-column maximum to a histogram; the lower edge of the bin
 holding the 64th largest block maximum is at or below the column's 64th largest approximate logit, and every row within 4
 of it is rescored exactly with the plain Q6_K kernel's arithmetic (the same bits). The other rows keep their approximate
-logits, so log-probabilities stay finite. The block partition does not depend on the window width, so a token's logits
-are the same bits at every T.
+logits, so log-probabilities stay finite. The block partition does not depend on window width, and every row above its
+column's bound is rescored however many qualify, so a token's logits have the same bits at every T.
 
 What it changes: the argmax and the sampler's top-64 list come from exact rows unless the copy's error exceeds the margin;
 the softmax tail outside the rescored rows carries the copy's error (rms about 0.7 logit). A request whose sampled list
