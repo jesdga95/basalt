@@ -95,6 +95,11 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
 void ple_block_projected(const float* projected_key, const float* projected_value, const float* hidden,
                          const float* hist_rows, const PleWeights& w, PleOut& out, void* scratch, void* stream);
 
+/// The key projections of T (1..8) contiguous embedding rows, emb [T][n_embd] -> key [T][hc_dim], each row bitwise
+/// its projection inside `ple_block`: the BF16 key's multi-row MMVF, or a native key's T-column Q8_1 quantization and
+/// MMVQ in the exact multi-column layout. `q8_1` holds native_q8_1_bytes(n_embd, T) (unused for a BF16 key).
+void ple_key_rows(const float* emb, int T, const PleWeights& w, float* key, void* q8_1, void* stream);
+
 /// Advance the row-fastest normalized history by one token: hist[r,c] = old_hist[r+1,c], then append
 /// normalized[c] at row NG_HIST-1. One thread owns each channel, making the in-place shift well-defined.
 /// hist and normalized must be nonnull, disjoint device regions of NG_HIST*NG_HC_DIM and NG_HC_DIM floats.
