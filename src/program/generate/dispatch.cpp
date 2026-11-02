@@ -64,6 +64,9 @@ int dispatch(Context& context) {
     auto& auto_lend_pct = *context.auto_lend_pct;
     auto& auto_ceiling = *context.auto_ceiling;
     auto& prompt_file_bytes = *context.prompt_file_bytes;
+    auto& stream_all_priced = *context.stream_all_priced;
+    auto& prompt_peer = context.prompt_peer;
+    auto& set_stream_all_min = context.set_stream_all_min;
     auto& pool = *context.pool;
     auto& ram_floor_bytes = *context.ram_floor_bytes;
     auto& pstages = *context.pstages;
@@ -126,6 +129,39 @@ int dispatch(Context& context) {
                      pct(b_file), (double) b_file / kGiB, levers.c_str());
     };
     if (!o.serve) report_expert_tiers();
+    // the serve path's one-card stream-all price (see set_stream_all_min), before the loan and init, which size by it
+    auto price_stream_all = [&]() {
+        if (multi_gpu || prompt_peer() || main_link_gbps <= 0.0) return;
+        const bool ram_ok = srcp == &src && src.complement_ready();
+        const bool arena_ok = srcp == &arena_src && arena_src.mapped();
+        uint64_t nonres = 0, pinned = 0;   // the bytes a streamed chunk copies, and those from pinned RAM
+        const char* off = nullptr;
+        for (int64_t l = 0; l < g.n_layers && off == nullptr; ++l)
+            for (int64_t e = 0; e < g.n_expert; ++e) {
+                const size_t i = (size_t) (l * g.n_expert + e);
+                if (i < host_res.size() && host_res[i] >= 0) continue;
+                if (!arena_ok && !(ram_ok && src.has_resident(l, e))) {
+                    off = peer.valid() && peer.has(l, e) ? "peer-only experts" : "experts only in the file";
+                    break;
+                }
+                const uint64_t b = basalt::kernels::cpu::expert_layout().blob_bytes(l);
+                nonres += b;
+                if (srcp->pinned(l, e)) pinned += b;
+            }
+        if (off == nullptr && (double) pinned < 0.9 * (double) nonres) off = "streamed experts outside pinned RAM";
+        if (off == nullptr && nonres > 0) {
+            stream_all_priced = basalt::prefill::stream_all_min_for(nonres, main_link_gbps);
+            set_stream_all_min();
+            basalt::log::info("basalt serve", "prompt path: every expert streams from %lld-token chunks (%.1f GiB "
+                                 "non-resident, %.0f%% pinned, link %.1f GB/s)", (long long) stream_all_priced,
+                         (double) nonres / 1073741824.0, 100.0 * (double) pinned / (double) nonres, main_link_gbps);
+        } else {
+            basalt::log::info("basalt serve", "prompt path: every expert streams from %lld-token chunks (%s; %.0f%% of "
+                                 "%.1f GiB pinned)", (long long) basalt::prefill::kStreamAllDefault,
+                         off != nullptr ? off : "every expert resident",
+                         nonres > 0 ? 100.0 * (double) pinned / (double) nonres : 0.0, (double) nonres / 1073741824.0);
+        }
+    };
     if (o.serve) {
         basalt::program::serve::Context context{
             .o = o,
@@ -200,6 +236,7 @@ int dispatch(Context& context) {
             .split_stages = split_stages,
             .tier_file_bytes = tier_file_bytes,
             .report_expert_tiers = report_expert_tiers,
+            .price_stream_all = price_stream_all,
         };
         return basalt::program::serve::run(context);
     }

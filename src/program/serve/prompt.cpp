@@ -272,6 +272,7 @@ int Runtime::init_prompt() {
                              "--expert-cache; the graphed hit path additionally needs an expert profile)");
         return 2;
     }
+    price_stream_all();   // before the loan and init, which size by it
 
     borrow = nullptr;
     borrow_bytes = 0;

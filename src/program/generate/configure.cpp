@@ -72,13 +72,21 @@ int run(int argc, char** argv) {
         split_alike = split_alike && basalt::program::cards_alike(chosen_cards[0], chosen_cards[i]);
     const int split_cap = o.peer_devices.size() <= 1 ? 2 : split_alike ? (int) o.peer_devices.size() + 1 : 1;
     basalt::core::set_peer_portable(o.peer_device >= 1 || !o.layer_split.empty());   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
-    // Chunks below this take the routed-only path with the peer card computing its experts' rows; from it on
-    // every expert streams through the ring.  The routed-only path costs ~0.3 ms per token, streaming ~0.12 ms
-    // plus the time to move the experts the primary lacks over its link; with --peer-exclusive that includes the
-    // peer-only experts, staged through the host, so streaming loses until later.
+    // Chunks below this take the routed-only path; from it on every expert streams through the ring.  With a prompt
+    // peer the peer card computes its experts' rows on the routed path, and streaming also moves the experts the
+    // primary lacks over its link; with --peer-exclusive that includes the peer-only experts, staged through the host,
+    // so streaming loses until later.  On one card the serve path prices the size from the non-resident experts' bytes
+    // and the probed link (stream_all.hpp) once the tiers are placed: a fixed function of the placement and the link,
+    // never of a read's timing, since the two paths round differently.  Only a placement like the one the price was
+    // measured on is priced (every non-resident expert copied from pinned RAM); any other keeps the default, as does
+    // the one-shot path.
+    int64_t stream_all_priced = 0;   // the one-card price, once known
+    auto prompt_peer = [&]() { return o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0 && peer_streamed_share; };
     auto set_stream_all_min = [&]() {
-        if (o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0 && peer_streamed_share)
+        if (prompt_peer())
             basalt::prefill::Prefill::set_stream_all_min(o.peer_exclusive ? 4096 : 2560);
+        else if (stream_all_priced > 0)
+            basalt::prefill::Prefill::set_stream_all_min(stream_all_priced);
     };
     set_stream_all_min();
     if (o.serve && o.conversation_cache_disk_mib > 0 && o.conversation_cache_dir.empty()) {
@@ -324,6 +332,8 @@ int run(int argc, char** argv) {
     context.split_want = &split_want;
     context.split_cap = &split_cap;
     context.set_stream_all_min = set_stream_all_min;
+    context.stream_all_priced = &stream_all_priced;
+    context.prompt_peer = prompt_peer;
     context.split_at = &split_at;
     context.split_devs = &split_devs;
     context.split_auto = &split_auto;

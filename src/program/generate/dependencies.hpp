@@ -68,6 +68,7 @@
 #include "basalt/core/mtp.hpp"
 #include "basalt/prefill/gemm.hpp"
 #include "basalt/prefill/prefill.hpp"
+#include "basalt/prefill/stream_all.hpp"
 #include "basalt/core/native_dense.hpp"
 #include "basalt/program/conv_cache.hpp"
 #include "basalt/program/ppl_gate.hpp"

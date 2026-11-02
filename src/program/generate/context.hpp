@@ -19,6 +19,8 @@ struct Context {
     bool* split_want = nullptr;
     const int* split_cap = nullptr;
     std::function<void ()> set_stream_all_min;
+    int64_t* stream_all_priced = nullptr;
+    std::function<bool()> prompt_peer;
     std::vector<int64_t>* split_at = nullptr;
     std::vector<int>* split_devs = nullptr;
     bool* split_auto = nullptr;
