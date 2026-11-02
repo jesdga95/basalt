@@ -77,8 +77,9 @@ void Runtime::relend() {   // the prompt path's loan: the end of the slots left,
 
 // The resident RAM mode holds only the experts no slot holds, so an expert in a slot about to go has no RAM
 // copy: it is copied from its slot into a RAM home first and read from there like the compact copy's.  Refused
-// (nothing copied) when the RAM above the floor cannot take them, or with `partial` as many as it can take, the
-// slots that go before the loan's (false: the others are read from the file).  `live`: the slots that stay.
+// (nothing copied) when the RAM above the floor cannot take them, or with `partial` as many as leave the serving
+// budget free too, the slots that go before the loan's (false: the others are read from the file).  `live`: the
+// slots that stay.
 bool Runtime::home_given_up(int64_t live, std::string& e, bool partial) {
     if (!src.complement_ready()) return true;
     // the slots the loan will overwrite keep a RAM copy too, so a prompt never costs a file read
@@ -106,7 +107,9 @@ bool Runtime::home_given_up(int64_t live, std::string& e, bool partial) {
         sizes.reserve(wanted);
         for (const auto& entry : give)
             sizes.push_back(basalt::kernels::cpu::expert_layout().blob_bytes(entry.first));
-        const size_t fit = basalt::core::detail::home_prefix_fit(sizes, src.homes_room());
+        // a request's own growth (the serving budget) stays free beside the guard's floor
+        const uint64_t room = src.homes_room(), serving = serve_growth_bytes(o, g);
+        const size_t fit = basalt::core::detail::home_prefix_fit(sizes, room > serving ? room - serving : 0);
         give.resize(fit);
         slots.resize(fit);
         if (fit == 0) { e = "the RAM above the floor holds none of their " + std::to_string(wanted); return false; }

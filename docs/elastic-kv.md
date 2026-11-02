@@ -17,6 +17,6 @@ and a reply that grows past it ends with it (a `--parallel` slot ends as at its 
 The RAM plan keeps the lent slots' RAM copies, the KV's whole reach included, as far as RAM holds them after the
 experts no slot holds. When RAM is short at startup the lowest lent slots go without a copy; before a KV growth or a
 prompt's loan takes such a slot, its expert is copied into a RAM home (`VRAM: N experts moved from the cache to RAM`),
-as many as fit above the RAM floor, the slots the KV takes first. The others are read from the model file while their
-slots are lent (`elastic KV: RAM homes for ...: the others are read from the file`). A home is freed when the cache
-grows back and its expert is in a slot again (`elastic KV: N RAM homes released`).
+as many as leave the RAM floor and the serving budget free, the slots the KV takes first. The others are read from the
+model file while their slots are lent (`elastic KV: RAM homes for ...: the others are read from the file`). A home is
+freed when the cache grows back and its expert is in a slot again (`elastic KV: N RAM homes released`).
