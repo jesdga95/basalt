@@ -9,6 +9,10 @@ bool Runtime::expire_jev(std::string& e, bool force) {
     ckd_finish();
     ver.release_score_workspace();
     std::vector<ConvCheckpoint>().swap(checks);
+    {
+        std::lock_guard<std::mutex> lk(part_mu);
+        part_at.clear();
+    }
     std::vector<int32_t>().swap(live);
     std::vector<int64_t>().swap(cur);
     std::vector<ImgKey>().swap(live_imgs);
@@ -16,6 +20,8 @@ bool Runtime::expire_jev(std::string& e, bool force) {
     jev_draft_prefix = -1;
     conversations->limit_reuse(0);
     if (!kv_release(ss, 0, e)) return false;
+    basalt::core::CheckpointBytes::allocator_type::release_pooled();
+    basalt::platform::release_free_heap();
     jev_cache.clear();
     basalt::log::info("basalt jev", "temporary state released");
     return true;

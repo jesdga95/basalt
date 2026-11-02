@@ -49,7 +49,7 @@ Buffers and graphs are reused between decisions and released before chat work. E
 precision and context capacity remain unchanged; limited free memory can reduce effective decision width.
 
 After 60 seconds without decision work, the native event loop releases Jev's branch buffers, graphs and prefix
-checkpoints. Its excess elastic KV backing returns to the ordinary engine baseline; fixed session allocations
+checkpoints, reclaiming unused pooled checkpoint blocks too. Its excess elastic KV backing returns to the ordinary engine baseline; fixed session allocations
 remain part of the loaded model. Chat work and model sleep release this temporary state immediately. Parked
 conversations and other chat slots keep their caches. Cleanup waits on a deadline, with no Jev polling thread.
 
