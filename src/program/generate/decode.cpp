@@ -188,7 +188,7 @@ int decode(Context& context) {
         int32_t x = (int32_t) tok;
         std::vector<int32_t> drafts((size_t) o.spec, 0);
         std::vector<float> dprob((size_t) o.spec, 1.0f);
-        basalt::core::DraftCumAdapt cum_adapt;
+        const float cum_th = basalt::core::draft_cum_th();
         std::vector<int64_t> window_hist((size_t) o.spec + 1, 0);
         // the first window is the last prompt token alone (it produces the first generated token and the MTP's
         // first cell)
@@ -217,7 +217,7 @@ int decode(Context& context) {
             int T = S_mtp;
             if (use_mtp) {
                 T = 1;
-                while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_adapt.th())) ++T;
+                while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_th)) ++T;
             }
             if (first_window) T = 1;
             bool from_sfx = false;
@@ -291,8 +291,7 @@ int decode(Context& context) {
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
-            if (use_mtp && !from_sfx) cum_adapt.observe(dprob.data(), T - 1, a);
-            if (use_mtp) mtp.set_cum_th(cum_adapt.th());
+            if (use_mtp) mtp.set_cum_th(cum_th);
             const bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
                                  mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data());
             if (adapt_thr.joinable()) adapt_thr.join();

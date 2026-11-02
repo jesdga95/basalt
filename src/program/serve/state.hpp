@@ -382,12 +382,10 @@ private:
         // scanned, the first refused one is resampled under the mask, and the segment ends there
         std::unique_ptr<basalt::program::grammar::Guard> guard;
         // the MTP drafter's side of the slot (the draft K/V is the drafter's store of the same index): the drafts and
-        // their probabilities for the slot's next window, the request's draft-length rule state, its prompt-lookup
-        // history and last proposal
+        // their probabilities for the slot's next window, its prompt-lookup history and last proposal
         int32_t dr[16] = {};
         float dprob[16] = {};
         int n_dr = 0;
-        basalt::core::DraftCumAdapt cum;
         std::unique_ptr<basalt::spec::SuffixDrafter> sfx;
         int32_t sbuf[16] = {};
         int sk = 0, smatch = 0;
@@ -432,6 +430,7 @@ private:
     }
     int S_all{};
     std::optional<basalt::spec::DraftPolicy> bpolicy;
+    float cum_th{};   // the draft-length rule's threshold
     double bt_draft{};
     double bt_draft_last{};
     int64_t bt_slotwin{};

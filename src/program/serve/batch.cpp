@@ -83,7 +83,7 @@ bool Runtime::batch_step() {
         for (int sg = 0; sg < S; ++sg) {
             BSlot& sl = bs[(size_t) rows[sg]];
             int T = 1;
-            while (T < S_mtp && T - 1 < sl.n_dr && basalt::core::draft_keep(sl.dprob, T - 1, sl.cum.th())) ++T;
+            while (T < S_mtp && T - 1 < sl.n_dr && basalt::core::draft_keep(sl.dprob, T - 1, cum_th)) ++T;
             sl.from_sfx = false;
             sl.sk = 0;
             if (sl.sfx && sl.n_dr > 0) {
@@ -301,9 +301,8 @@ bool Runtime::batch_step() {
         }
         std::printf("\n");
         sl.produced += k;
-        if (real) {   // the window's verdict on its drafts: the draft-length rule, the lookup history, the policy
+        if (real) {   // the window's verdict on its drafts: the lookup history, the policy
             const int a = k - 1, Tw = lens[sg];
-            if (Tw > 1 && !sl.from_sfx) sl.cum.observe(sl.dprob, Tw - 1, a);
             if (Tw > 1) sl.acc = 0.8 * sl.acc + 0.2 * ((double) a / (double) (Tw - 1));
             sl.drafts_offered += Tw - 1;
             sl.drafts_accepted += a;
@@ -363,7 +362,7 @@ bool Runtime::batch_step() {
             mtp.set_ple_session(bslot_ss[0][(size_t) b].get());
             sl.n_dr = 0;
             if (ci < nfull) {
-                mtp.set_cum_th(sl.cum.th());
+                mtp.set_cum_th(cum_th);
                 int nd = 0;
                 if (!mtp.draft_seq(b, Rw + (size_t) r0s[sg] * HCN, Tw, outb + r0s[sg], p0s[sg], a, sl.dr, err, sl.dprob,
                                    &nd)) {
@@ -437,6 +436,7 @@ int Runtime::init_batch() {
     batch_spec = mtp_on && mtp.main_store() > 0 && o.batch > 0;
     S_all = S;
     bpolicy.emplace(S);   // the lookup-or-MTP choice, costs per row
+    cum_th = basalt::core::draft_cum_th();   // the draft-length rule's threshold
     bt_draft = 0;
     bt_draft_last = 0;
     bt_slotwin = 0;

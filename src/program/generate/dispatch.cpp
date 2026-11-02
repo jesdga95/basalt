@@ -103,7 +103,6 @@ int dispatch(Context& context) {
         tier_file_bytes = b_file;
         const double total = (double) (b_vram + b_peer + b_ram + b_top + b_file);
         if (total <= 0.0) return;
-        basalt::core::draft_cum_cpu_mb() = (float) ((double) (b_ram + b_top) / (double) (g.n_layers * g.n_expert) / 1e6);
         constexpr double kGiB = 1073741824.0;
         auto pct = [&](uint64_t b) { return 100.0 * (double) b / total; };
         // RAM is the loaded copy (the bytes the loader reports); the top-up added after the load is shown beside it

@@ -29,6 +29,7 @@ Flow Request::decode() {
     window = std::vector<int32_t>((size_t) runtime_.S);
     outv = std::vector<int32_t>((size_t) runtime_.S);
     dprob = std::vector<float>((size_t) std::max(runtime_.S, basalt::core::kMtpChainMax), 0.0f);
+    cum_th = basalt::core::draft_cum_th();   // the draft-length rule's threshold
     sbuf = std::vector<int32_t>((size_t) runtime_.S, 0);
     if (runtime_.o.suffix_draft > 0) {
         runtime_.sfx->reset();
@@ -105,7 +106,7 @@ Flow Request::decode() {
         int T = 1;
         if (held.on) T = held.T;
         else
-        while (T < runtime_.S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_adapt.th())) ++T;
+        while (T < runtime_.S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_th)) ++T;
         if (first_window) T = (int) (n - fold_p0);
         const int e0 = first_window ? T - 1 : 0;   // rows before it are prompt tokens: forced, not emitted
         if (ppl != nullptr) {
@@ -144,7 +145,7 @@ Flow Request::decode() {
             n_chain = runtime_.mtp.draft_more(n_chain, drafts.data(), dprob.data());   // made beside this window's stage 0
             if (n_chain <= T || !basalt::core::draft_keep(dprob.data(), T - 1, kPairTheta)) return 0;
             int tb = 1;
-            while (tb < runtime_.S_mtp && T - 1 + tb < n_chain && basalt::core::draft_keep(dprob.data() + T, tb - 1, cum_adapt.th()))
+            while (tb < runtime_.S_mtp && T - 1 + tb < n_chain && basalt::core::draft_keep(dprob.data() + T, tb - 1, cum_th))
                 ++tb;
             if (tb < 2) return 0;
             wb[0] = drafts[(size_t) T - 1];
@@ -462,8 +463,7 @@ Flow Request::decode() {
             ++runtime_.rounds;
             const Clock::time_point tw2 = Clock::now();
             basalt::core::decode_gaps().mark(5);
-            if (!from_sfx && e0 == 0) cum_adapt.observe(dprob.data(), T - 1, a);
-            runtime_.mtp.set_cum_th(cum_adapt.th());
+            runtime_.mtp.set_cum_th(cum_th);
             bool drafted = true;
             if (hold) {
                 // the tokens go out; the next window's last stage runs behind this window's commit while its first
@@ -494,8 +494,8 @@ Flow Request::decode() {
             } else if (will_draft && runtime_.mtp_on) {
                 runtime_.mtp.set_launch_hook(after_launch);
                 pair_hint = pair_req && full_ema >= kPairFull;
-                runtime_.mtp.set_cum_th(pair_hint ? cum_adapt.th() * kPairChainScale : cum_adapt.th());
-                runtime_.mtp.set_host_th(cum_adapt.th());
+                runtime_.mtp.set_cum_th(pair_hint ? cum_th * kPairChainScale : cum_th);
+                runtime_.mtp.set_host_th(cum_th);
                 if (const int32_t* top = cv->top_ids())
                     runtime_.mtp.note_candidates(top, (a + 1) * basalt::core::Verifier::kTopIds);
                 drafted = runtime_.mtp.draft_from(cv->final_R_all(), T, outv.data(), p, a, drafts.data(), runtime_.err, dprob.data(), &n_chain);
@@ -577,8 +577,7 @@ Flow Request::decode() {
         ++runtime_.rounds;
         const Clock::time_point tw2 = Clock::now();
         basalt::core::decode_gaps().mark(5);
-        if (!from_sfx && e0 == 0) cum_adapt.observe(dprob.data(), T - 1, a);
-        runtime_.mtp.set_cum_th(cum_adapt.th());
+        runtime_.mtp.set_cum_th(cum_th);
         const bool drafted = eos || produced_n >= max_new || !runtime_.mtp_on ||
                              runtime_.mtp.draft(T, outv.data(), p, a, drafts.data(), runtime_.err, dprob.data());
         {
