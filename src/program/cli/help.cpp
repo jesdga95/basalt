@@ -136,6 +136,8 @@ void usage() {
                  "  --wait-stats         the host's wait times in the decode loop (serve path)\n"
                  "  --decode-timing      one line per request: where its decode time went (serve path)\n"
                  "  --draft-log FILE     one line per decode window for draft-policy study\n"
+                 "  --force-zero-doorbell  TEST: every decode window on the zero-doorbell graph; the routed\n"
+                 "                       experts not in VRAM drop out, so the output is wrong (serve path)\n"
                  "  --ppl-base FILE      llama.cpp KL-divergence base for ppl= requests\n"
                  "  --ppl-out FILE       where ppl= requests write their per-row lines\n"
                  "  --gpu-stages         capture the layer as three graphs (mixer / ffn+router / post)\n"

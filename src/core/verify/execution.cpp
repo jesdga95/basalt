@@ -346,7 +346,7 @@ bool Verifier::run_end(int32_t* out, std::string& err) {
         return false;
     }
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
-    if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // the table changed under the window
+    if (ar_on() && !ar_forced_ && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // the table changed under the window
         *(volatile uint32_t*) h_plan_err_ = 0;
         err = "verify: the zero-doorbell plan met an expert that is not in VRAM (the residency table changed during the window)";
         return false;

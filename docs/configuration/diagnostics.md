@@ -58,6 +58,12 @@ All CLI, all off.
 | `--spec-oracle` | CLI | path | With `--spec N` on a pack without a drafter: draft from a token file (the expected continuation), the exactness test of the verify path. Prompt lookup windows still take precedence. |
 | `--spec-corrupt` | CLI | integer, 0 | Replace every Nth draft with a wrong token, to test rejection. |
 
+## Scheduling tests
+
+| Flag | Binary | What it does |
+| --- | --- | --- |
+| `--force-zero-doorbell` | serve | Run every decode window, solo and batch, on the zero-doorbell graph a fully resident pack uses, whatever the residency. The routed experts not in VRAM drop out, so the output is wrong: it tests the windows' scheduling on a card that cannot hold every expert. |
+
 ## The n-gram table reads
 
 The per-layer n-gram (PLE) table stays on disk and its rows are read as needed.

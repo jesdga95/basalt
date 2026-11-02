@@ -11,6 +11,7 @@ struct Diag {
     bool wait_stats = false;   ///< --wait-stats: the MoE tail's wait counters, one report per 200 windows
     bool decode_timing = false;   ///< --decode-timing: the per-request decode timing line
     std::string draft_log;     ///< --draft-log FILE: one line per verify window (width, accepted, ms)
+    bool zero_doorbell = false;   ///< --force-zero-doorbell: every window on the zero-doorbell graph (a scheduling test)
     std::map<std::string, double> exp;   ///< --exp NAME=V: short-lived experiment gates, removed when they resolve
 };
 

@@ -352,7 +352,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                     }
                 }
             }
-            all_resident_ = all_ok;
+            ar_forced_ = diagnostics().zero_doorbell;
+            all_resident_ = all_ok || ar_forced_;
         }
     }
     device_plan_ = false;
