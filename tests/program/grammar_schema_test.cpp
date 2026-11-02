@@ -255,6 +255,23 @@ static void test_request() {
     GrammarState o(jo.grammar, jo.triggers);
     CHECK(jo.grammar && o.accept("{\"x\":[1,{\"y\":null}]}") && o.accepting() && !o.allows("[1]"));
     CHECK(!grammar_from_request(R"({"kind":"nope"})", err).grammar && !err.empty());
+    // a JSON format with tools: from the first answer token, tool calls or the JSON value
+    err.clear();
+    auto both = grammar_from_request(R"({"kind":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false},"tools":[{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}}}]})", err);
+    CHECK(both.grammar && err.empty() && !both.triggers.lazy());
+    GrammarState b1(both.grammar, both.triggers);
+    CHECK(b1.active() && b1.accept("{\"title\":\"Fix the build\"}") && b1.accepting());
+    GrammarState b2(both.grammar, both.triggers);
+    CHECK(b2.accept("<tool_call>\n<function=ping>\n<parameter=n>\n5\n</parameter>\n</function>\n</tool_call>") && b2.accepting());
+    GrammarState b3(both.grammar, both.triggers);
+    CHECK(!b3.allows("Sure: {") && !b3.allows("{\"name\":") && !b3.allows("<tool_call>\n<function=pong>"));
+    GrammarState b4(both.grammar, both.triggers);
+    CHECK(!b4.allows("<tool_call>\n<function=ping>\n<parameter=n>\n5\n</parameter>\n</function>\n</tool_call>{"));
+    err.clear();
+    auto obj = grammar_from_request(R"({"kind":"json_object","tools":[{"type":"function","function":{"name":"ping"}}]})", err);
+    GrammarState o2(obj.grammar, obj.triggers);
+    CHECK(obj.grammar && err.empty() && o2.accept("{\"x\":1}") && o2.accepting() && !o2.allows("[1]"));
+    CHECK(!grammar_from_request(R"({"kind":"json_object","tools":{}})", err).grammar && !err.empty());
 }
 
 // A pattern or an enum string can decode (a "\u0000" JSON escape) to raw control bytes. They must reach the

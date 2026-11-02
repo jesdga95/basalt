@@ -26,6 +26,7 @@ std::string json_schema_to_gbnf(const std::string& schema_json, std::string& err
 struct ToolGrammarOptions {
     size_t max_permute = 6;          ///< required parameters are permuted up to this many; more keep the declared order
     bool multiple_calls = true;      ///< more than one <tool_call> block
+    std::string answer_schema;       ///< a JSON schema: the root also takes one JSON value of it instead of calls
 };
 
 /// `tools_json` is an array of {name, parameters:{properties, required}} (or the OpenAI {type:"function",
@@ -45,7 +46,8 @@ struct RequestGrammar {
 ///   {"kind":"tools","tools":[<OpenAI tool objects>],"tool_choice":<as received>}   lazy, trigger "<tool_call>"
 ///   {"kind":"json_schema","schema":{...}}                                          from the first answer token
 ///   {"kind":"json_object"}                                                         any JSON object
-/// tool_choice "none" gives a null grammar; a named choice keeps only that tool. A null grammar with empty `err` is
+/// A json_schema or json_object request may carry "tools" too: from the first answer token, either tool calls or the
+/// JSON value. tool_choice "none" gives a null grammar; a named choice keeps only that tool. A null grammar with empty `err` is
 /// not an error; an unusable request sets `err`.
 RequestGrammar grammar_from_request(const std::string& grammar_json, std::string& err);
 
