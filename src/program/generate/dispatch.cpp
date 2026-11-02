@@ -10,7 +10,6 @@ int dispatch(Context& context) {
     auto& peer_streamed_share = *context.peer_streamed_share;
     auto& split_at = *context.split_at;
     auto& split_devs = *context.split_devs;
-    auto& split_same = *context.split_same;
     auto& multi_gpu = *context.multi_gpu;
     auto& pipe_want = *context.pipe_want;
     auto& no_spec = *context.no_spec;
@@ -135,7 +134,6 @@ int dispatch(Context& context) {
             .peer_streamed_share = peer_streamed_share,
             .split_at = split_at,
             .split_devs = split_devs,
-            .split_same = split_same,
             .multi_gpu = multi_gpu,
             .pipe_want = pipe_want,
             .no_spec = no_spec,

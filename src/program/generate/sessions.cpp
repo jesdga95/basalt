@@ -9,7 +9,6 @@ int sessions(Context& context) {
     auto& pack_files = *context.pack_files;
     auto& split_at = *context.split_at;
     auto& split_devs = *context.split_devs;
-    auto& split_same = *context.split_same;
     auto& multi_gpu = *context.multi_gpu;
     auto& pipe_want = *context.pipe_want;
     auto& remote_dev = *context.remote_dev;
@@ -121,7 +120,7 @@ int sessions(Context& context) {
 
     for (size_t i = 0; i < split_at.size(); ++i)
         if (split_at[i] >= g.n_layers) {
-            basalt::log::error("basalt generate", "--layer-split: layer %lld is past the last (%lld)",
+            basalt::log::error("basalt generate", "layer split: layer %lld is past the last (%lld)",
                          (long long) split_at[i], (long long) (g.n_layers - 1));
             return 2;
         }
@@ -232,8 +231,7 @@ int sessions(Context& context) {
     bool slot0_is_solo = false;      // slot 0 is the solo session (no separate solo state)
     if (o.batch != 0) {
         const int cap = basalt::kernels::kVerifyMaxT;
-        const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
-                        : split_same ? "it needs each stage of a layer split on its own GPU" : nullptr;
+        const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots" : nullptr;
         if (off != nullptr) {
             basalt::log::warn("basalt generate", "--batch %d is off: %s", o.batch, off);
             o.batch = 0;
