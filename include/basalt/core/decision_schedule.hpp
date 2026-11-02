@@ -2,10 +2,27 @@
 #pragma once
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <span>
 
 namespace basalt::core {
+
+struct DecisionCacheDeadline {
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point until{};
+    bool armed = false;
+
+    void touch(Clock::time_point now = Clock::now()) {
+        until = now + std::chrono::seconds(60);
+        armed = true;
+    }
+    void clear() { armed = false; }
+    int remaining_ms(Clock::time_point now = Clock::now()) const {
+        return !armed || now >= until ? 0 : (int) std::chrono::ceil<std::chrono::milliseconds>(until - now).count();
+    }
+    bool expired(Clock::time_point now = Clock::now()) const { return armed && now >= until; }
+};
 
 struct DecisionWindow {
     std::array<int, 8> slots{}, lengths{};

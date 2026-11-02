@@ -13,6 +13,7 @@
 #include "basalt/core/device.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/draft_cum.hpp"
+#include "basalt/core/decision_schedule.hpp"
 #include "basalt/core/remote_expert_opt.hpp"
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/conversation_snapshot.hpp"
@@ -233,6 +234,8 @@ private:
     // ---- Jev: target-only checkpoints can extend beyond the untouched draft cache ----
     bool jev_scoring{};
     int64_t jev_draft_prefix = -1;
+    basalt::core::DecisionCacheDeadline jev_cache{};
+    bool expire_jev(std::string& e, bool force = false);
     // ---- end Jev ----
     std::vector<ConvCheckpoint> checks{};
     uint64_t check_clock{};

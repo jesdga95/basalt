@@ -40,4 +40,18 @@ int main() {
     assert(decision_draft_prefix(100, 60, false) == 60);
     assert(decision_draft_prefix(100, 0, false) == 0);
     assert(decision_draft_prefix(0, 200, true) == 200);
+    DecisionCacheDeadline idle;
+    const auto t0 = DecisionCacheDeadline::Clock::time_point{};
+    assert(!idle.expired(t0) && idle.remaining_ms(t0) == 0);
+    idle.touch(t0);
+    assert(idle.remaining_ms(t0) == 60000);
+    assert(!idle.expired(t0 + std::chrono::milliseconds(59999)));
+    assert(idle.remaining_ms(t0 + std::chrono::microseconds(59999999)) == 1);
+    assert(idle.expired(t0 + std::chrono::seconds(60)));
+    idle.touch(t0 + std::chrono::seconds(50));
+    assert(!idle.expired(t0 + std::chrono::seconds(60)));
+    assert(idle.expired(t0 + std::chrono::seconds(110)));
+    idle.clear();
+    assert(!idle.expired(t0 + std::chrono::seconds(120)));
+    assert(idle.remaining_ms(t0 + std::chrono::seconds(120)) == 0);
 }

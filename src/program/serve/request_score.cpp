@@ -3,6 +3,24 @@
 
 namespace basalt::program::serve {
 
+bool Runtime::expire_jev(std::string& e, bool force) {
+    if (!jev_cache.armed || (!force && !jev_cache.expired())) return true;
+    if (batch_on() || (piped && pipe_inflight()) || solo_busy) return true;
+    ckd_finish();
+    ver.release_score_workspace();
+    std::vector<ConvCheckpoint>().swap(checks);
+    std::vector<int32_t>().swap(live);
+    std::vector<int64_t>().swap(cur);
+    std::vector<ImgKey>().swap(live_imgs);
+    live_ok = false;
+    jev_draft_prefix = -1;
+    conversations->limit_reuse(0);
+    if (!kv_release(ss, 0, e)) return false;
+    jev_cache.clear();
+    basalt::log::info("basalt jev", "temporary state released");
+    return true;
+}
+
 Flow Request::score() {
     if (cancelled || runtime_.halted()) {
         cancelled = true;
