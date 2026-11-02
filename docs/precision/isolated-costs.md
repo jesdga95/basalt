@@ -64,7 +64,8 @@ activation switches need 294.6, BF16 dense with fp32 activations through the thr
 
 The Q8_0-dense pack is the production-kernel way to get the all-off quality: 7% slower on prose and 3% on struct
 than the default in the same session (ABBA numbers:
-[6-bit dense projections](features.md#6-bit-dense-projections-nvidia-nvfp4-pack)).
+[6-bit dense projections](features.md#6-bit-dense-projections-nvidia-nvfp4-pack)). Both NVFP4 packs are on Hugging Face:
+`Qwen3.8-FN-NVFP4-DQ6_K.basalt` (the default above) and `Qwen3.8-FN-NVFP4-DQ8.basalt` (`D` names the dense format).
 
 ## Lossless and measurable
 
