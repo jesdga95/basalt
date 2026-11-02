@@ -230,7 +230,7 @@ class Waves(unittest.TestCase):
         engine = self.wire(["JFALLBACK", "DONE 0 3 1.0 0 length 0 0 1",
                             "JLOGITS 1 2", "DONE 0 3 0 1 length 0 0 2",
                             "JLOGITS 3 4", "DONE 0 3 0 1 length 0 0 2"])
-        rows = [([1, 2, 3], [4, 5], [], False), ([1, 2, 4], [4, 5], [], False)]
+        rows = [((1, 2, 3), [4, 5], [], False), ((1, 2, 4), [4, 5], [], False)]
         values = engine.score_many(rows, Control(threading.Event(), 2))
         self.assertEqual([v for v, _ in values], [[1, 2], [3, 4]])
         self.assertTrue(all(s["batch_size"] == 1 for _, s in values))
@@ -268,7 +268,7 @@ class Waves(unittest.TestCase):
         engine = self.wire(["JWAVE 2 500000000", "JWINDOWS 100", "JLOGITS 3", "JLOGITS 4",
                             "JTIME 10", "DONE 0 2 1 0 length 0 0 1"], window=2)
         engine.info["jev_sequence"] = 1
-        rows = [([1, 2] + [i] * 100, [7], [2], False) for i in (3, 4)]
+        rows = [((1, 2) + (i,) * 100, [7], [2], False) for i in (3, 4)]
         result = engine.score_many(rows, Control(threading.Event(), 2))
         self.assertEqual([v[0] for v, _ in result], [3, 4])
         self.assertEqual([s["batch_size"] for _, s in result], [2, 2])
@@ -322,6 +322,29 @@ class Integration(unittest.TestCase):
         self.assertEqual(out["execution"], {"requested_lanes": 8, "effective_lanes": 1,
                                             "dedicated_kv_bytes": 0, "kv": "fp16"})
         self.assertEqual(self.engine.info, {"jev": 8, "kv": "fp16"})
+
+    def test_trie_tuples_reach_native_sequence_planner(self):
+        self.engine.info = {"jev": 2, "jev_lanes": 2, "jev_window": 7, "jev_sequence": 1}
+        self.engine.score_many = ProcessEngine.score_many.__get__(self.engine)
+        waves, original = [], self.engine.score
+        def score(ids, options, points, fresh, control, _branches=None):
+            if not _branches:
+                return original(ids, options, points, fresh, control)
+            control.check()
+            self.assertIsInstance(ids, tuple)
+            self.assertTrue(all(isinstance(tokens, tuple) for tokens, _ in _branches))
+            waves.append(_branches)
+            return [[float(-i) for i in range(len(choices))] for _, choices in _branches], {"reused": 0}
+        self.engine.score = score
+        requests = [(False, {**REQUEST, "contexts": ["charged twice", "refund please"]}),
+                    (True, {"state": "charged twice", "questions": {
+                        name: {"type": "noul", "instructions": text}
+                        for name, text in (("urgent", "Needs action?"), ("billing", "Is this billing?"))}})]
+        for system_one, body in requests:
+            with self.subTest(system_one=system_one):
+                out = self.svc.jev.run(body, threading.Event(), system_one)
+                self.assertEqual(out["timings"]["largest_batch"], 2)
+        self.assertGreaterEqual(len(waves), 2)
 
     def test_identical_callers_score_and_complete_independently(self):
         entered = [threading.Event(), threading.Event()]

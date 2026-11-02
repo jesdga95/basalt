@@ -1394,7 +1394,7 @@ class ProcessEngine:
                 result[i] = values, dict(stats, batch_size=1, scored_windows=1, workspace_bytes=0)
                 publish(group)
                 continue
-            ids = rows[group[0]][0][:prefix] + [rows[group[0]][0][prefix]]
+            ids = rows[group[0]][0][:prefix + 1]
             branches = [(rows[i][0][prefix:], rows[i][1]) for i in group]
             points = sorted({prefix} | {p for i in group for p in rows[i][2] if 0 < p <= prefix})
             values, stats = self.score(ids, rows[group[0]][1], points, any(rows[i][3] for i in group), control,
