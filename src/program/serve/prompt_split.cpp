@@ -113,6 +113,7 @@ bool Request::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool& ra
             give_back_all();
             return false;
         }
+        if (st.tier_at == 0) runtime_.peer_due_lent(st.lent);
         st.buf = base + (pc.slot_offsets() ? (size_t) pc.slot_offsets()[first]
                                            : (size_t) first * basalt::kernels::cpu::expert_layout().max_blob);
         st.buf_bytes = (uint64_t) (s_at - st.buf);
