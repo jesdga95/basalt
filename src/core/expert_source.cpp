@@ -1172,7 +1172,53 @@ bool FileExpertSource::pin_cache_complement(
             if (reg == cudaSuccess) (void) cudaHostUnregister(arena);
             note = std::string("page-locking refused (") + cudaGetErrorString(reg) + ")";
             (void) cudaGetLastError();
-            const basalt::platform::LockResult lr = basalt::platform::lock_resident(arena, bytes);
+            // the driver may cap page-locked memory below the arena: a prefix one step under the largest it takes
+            // (in 2 GiB steps down) is registered and mapped, leaving the step for the buffers the engine pins later,
+            // and only the rest is locked in the working set.  The prefix ends on a whole large page at an expert's
+            // start within the experts' region, since a copy from a range only partly registered is refused.
+            constexpr size_t kPrefixStep = 2ull << 30;
+            auto blob_edge = [&](size_t pre) {
+                pre = std::min<size_t>(pre, (size_t) spare_at) / kArenaAlign * kArenaAlign;
+                for (bool moved = true; moved && pre > 0;) {
+                    moved = false;
+                    for (size_t i = 0; i < offsets.size(); ++i) {
+                        const uint64_t off = offsets[i];
+                        if (off == kNoComplement || off >= pre) continue;
+                        if (off + layer_blob_bytes_[i / (size_t) n_expert_] > pre) {
+                            pre = (size_t) off / kArenaAlign * kArenaAlign;
+                            moved = true;
+                        }
+                    }
+                }
+                return pre;
+            };
+            bool fits = false;
+            for (size_t pre = padded > kPrefixStep ? padded - kPrefixStep : 0; pre >= kPrefixStep; pre -= kPrefixStep) {
+                if (cudaHostRegister(arena, fits ? blob_edge(pre) : pre, cudaHostRegisterMapped | cudaHostRegisterPortable) !=
+                    cudaSuccess) {
+                    (void) cudaGetLastError();
+                    continue;
+                }
+                if (!fits) {
+                    (void) cudaHostUnregister(arena);
+                    fits = true;
+                    continue;
+                }
+                if (cudaHostGetDevicePointer(&alias, arena, 0) != cudaSuccess || alias == nullptr) {
+                    (void) cudaHostUnregister(arena);
+                    (void) cudaGetLastError();
+                    break;
+                }
+                device = (const uint8_t*) alias;
+                partial_pin = blob_edge(pre);
+                lock_off = partial_pin;
+                char part[96];
+                std::snprintf(part, sizeof part, "; the first %.1f GiB page-locked and mapped", (double) partial_pin / 1073741824.0);
+                note += part;
+                break;
+            }
+            const basalt::platform::LockResult lr =
+                basalt::platform::lock_resident((uint8_t*) arena + lock_off, bytes - lock_off);
             locked = lr.locked_bytes;
             note += "; " + lr.note;
         }
