@@ -239,3 +239,9 @@ tr.live td { color: var(--accent); }
   .rw { column-gap: 10px; padding: 0 16px; }
   .rw .cx, .rw .spark, .rw .sk { display: none; }
 }
+
+.sb-cvec { margin-top: 16px; }
+.cvec-btn { width: 100%; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line);
+            background: none; color: var(--fg); font: inherit; font-size: 12.5px; cursor: pointer; }
+.cvec-btn[aria-pressed="true"] { border-color: var(--basalt-500); color: var(--basalt-500);
+            background: rgba(255, 122, 61, .07); }

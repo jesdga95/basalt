@@ -87,6 +87,7 @@ class Service:
         self.grammar = grammar                        # the `grammar` option: every tool or JSON request gets one
         self.grammar_engine = grammar_engine          # the engine understands the request key
         self.sampling_defaults = dict(sampling_defaults or {})   # the model file's sampling defaults
+        self.cvec_on = bool(self.sampling_defaults.get("experimental_speed_projection", False))
         self.fifo = threading.Lock()
         self.stopping = threading.Event()               # set at shutdown: nothing starts the engine again
         self.embeddings = threading.local()           # this request's image embeddings file
@@ -284,6 +285,24 @@ class Service:
                 self.engine.vram(self.vram_reserve)
             except (ValueError, EngineDied) as e:
                 print(f"[server] warning: VRAM reserve of {self.vram_reserve} MiB not applied ({e})", flush=True)
+
+    def apply_defaults(self, sampling: dict | None) -> dict:
+        """The request's own fields over the server defaults; a request that leaves out the projection
+        control vector gets the live state of `cvec_on`."""
+        out = dict(sampling or {})
+        for k, v in self.sampling_defaults.items():
+            if out.get(k) is None:
+                out[k] = v
+        if not isinstance((sampling or {}).get("experimental_speed_projection"), bool):
+            out["experimental_speed_projection"] = self.cvec_on   # the live switch, over any start-up default
+        return out
+
+    def cvec(self, on: bool) -> dict:
+        """POST /v1/cvec: the projection control vector for requests that leave the field out, from the
+        next request on."""
+        self.cvec_on = bool(on)
+        print(f"[server] cvec: projection {'on' if self.cvec_on else 'off'} from the next request", flush=True)
+        return {"cvec": int(self.cvec_on)}
 
     vram_wait_s = 300.0                                  # POST /v1/vram wait for a running request
 
@@ -887,9 +906,7 @@ class Service:
         budget = self.reasoning_budget(sampling) if thinking else None
         budget_req = sampling
         budget_ready = False
-        if self.sampling_defaults:     # the request's own fields win
-            req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
-            sampling = {**self.sampling_defaults, **req_values}
+        sampling = self.apply_defaults(sampling)
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         thinking_n = 0                                 # tokens written while thinking
