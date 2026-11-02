@@ -512,7 +512,6 @@ private:
     bool capture_commit_batch(int R, std::string& err);
     bool stage_batch(const int* slots, const int* lens, int S, int hbase, const int32_t* tokens, const int64_t* pos0,
                      std::string& err);
-    bool batch_seg_ple_ = true;            ///< the window's PLE runs the window kernels (segments of several rows)
     basalt::kernels::SamplerParams sampling_ = [] {
         basalt::kernels::SamplerParams s;
         s.greedy = true;
@@ -733,6 +732,7 @@ private:
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
     float* ple_win_ = nullptr;   // 2 * T * NG_HC_DIM
     float *ple_key_ = nullptr, *ple_val_ = nullptr;   // the PLE key / value projections: T * HC * N, T * N
+    void* ple_q8_ = nullptr;     // a native PLE key's q8_1 rows: native_q8_1_bytes(N, T)
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
 };
 
