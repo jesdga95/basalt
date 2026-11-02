@@ -251,8 +251,6 @@ public:
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.  `parts`: 1 launches
     /// the commit graph, 2 advances `ss.ple_prev` (3: both, in that order).
     bool commit(int n_keep, std::string& err, int parts = 3);
-    /// The decode loop's host work off the GPU's critical path (see run() and the serve loop)
-    static bool chain_on();
     /// the residency tables uploaded now (between windows) rather than at the next run()
     bool dm_presync(std::string& err) { return dm_ == nullptr || dm_sync(err); }
     /// Work queued on `s` after this call starts only once the window stream has run everything queued on it so far (the

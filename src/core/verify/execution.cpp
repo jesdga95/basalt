@@ -140,7 +140,7 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     // a sampled or penalized request's head sampling queued behind the window now, not after a sync
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     const bool biased = sampling_.logit_bias != nullptr;
-    const bool early_sample = chain_on() && le_ >= g.n_layers && head_sampling_ && (sampled || hist_d_ != nullptr || biased);
+    const bool early_sample = le_ >= g.n_layers && head_sampling_ && (sampled || hist_d_ != nullptr || biased);
     // the draft probe: row t asks for the probability of the window's token t + 1
     const bool probe = draft_probe_ && head_sampling_ && sampled && T > 1 && le_ >= g.n_layers;
     // the sampled rows' kept lists; the wide path keeps none

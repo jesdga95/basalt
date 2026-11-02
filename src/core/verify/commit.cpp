@@ -156,8 +156,6 @@ bool Verifier::capture_commit(std::string& err) {
 
 void Verifier::set_commit_async(bool on) { g_commit_async = on; }
 
-bool Verifier::chain_on() { return true; }
-
 bool Verifier::commit(int n_keep, std::string& err, int parts) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
