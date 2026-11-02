@@ -187,21 +187,61 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
 
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                               int64_t upto, bool index, std::string& error) {
+    return conversation_kv_validate(image, {image.k.size(), image.v.size(), image.k_scale.size(), image.v_scale.size(),
+                                            image.pooled.size()}, st, g, upto, index, error);
+}
+
+bool conversation_kv_validate(const ConversationKv& image, const std::array<uint64_t, 5>& payload, const QsaState& st,
+                              const ModelGeometry& g, int64_t upto, bool index, std::string& error) {
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error)) return false;
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
-    const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     if (image.format != l.format || image.cells != l.cells || image.heads != g.n_head_kv ||
         image.head_dim != g.head_dim || image.page_size != l.page_size || image.pooled_rows != l.pooled_rows ||
         image.idx_dim != g.idx_key_dim) {
         error = "conversation snapshot: incompatible K/V geometry";
         return false;
     }
-    for (size_t i = 0; i < src.size(); ++i)
-        if (src[i]->size() != sizes[i]) { error = "conversation snapshot: invalid K/V payload size"; return false; }
+    for (size_t i = 0; i < sizes.size(); ++i)
+        if (payload[i] != sizes[i]) { error = "conversation snapshot: invalid K/V payload size"; return false; }
     const auto dst = pools(st);
-    for (size_t i = 0; i < src.size(); ++i)
+    for (size_t i = 0; i < sizes.size(); ++i)
+        if (sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
+    return true;
+}
+
+bool conversation_kv_source(ConversationKvSource& out, const QsaState& st, const ModelGeometry& g, int64_t upto,
+                            bool index, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error) || !backed(st, l, error)) return false;
+    out.format = l.format;
+    out.cells = l.cells;
+    out.heads = g.n_head_kv;
+    out.head_dim = g.head_dim;
+    out.page_size = l.page_size;
+    out.pooled_rows = l.pooled_rows;
+    out.idx_dim = g.idx_key_dim;
+    const auto src = pools(st);
+    const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        if (sizes[i] && !src[i]) { error = "conversation snapshot: missing state buffer"; return false; }
+        const uint8_t* p = static_cast<const uint8_t*>(src[i]);
+        out.parts[i].size = sizes[i];
+        out.parts[i].read = [p](uint64_t o, uint8_t* d, uint64_t n) {
+            return cudaMemcpy(d, p + o, n, cudaMemcpyDefault) == cudaSuccess;
+        };
+    }
+    return true;
+}
+
+bool conversation_kv_targets(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
+                             std::array<void*, 5>& dst, std::array<uint64_t, 5>& sizes, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error) || !backed(st, l, error)) return false;
+    dst = pools(st);
+    sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    for (size_t i = 0; i < sizes.size(); ++i)
         if (sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
     return true;
 }
@@ -237,6 +277,10 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
             })) return false;
+    return settle_resident(st, g, upto, error);
+}
+
+bool conversation_kv_settle(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
     return settle_resident(st, g, upto, error);
 }
 

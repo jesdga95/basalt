@@ -12,6 +12,12 @@ bool Request::starts_with(const std::vector<int32_t>& pre, const std::vector<Img
     return runtime_.imgs_below(runtime_.req_imgs, L) == pre_imgs;
 }
 
+// The incoming image goes, with its K/V still in its files when it has one.
+void Request::drop_incoming() {
+    incoming.reset();
+    disk_kv.reset();
+}
+
 Flow Request::restore() {
     remote_before = {};
     launches_before = {};
@@ -222,22 +228,37 @@ Flow Request::restore() {
         }
     }
     if (from_disk) {
-        const uint64_t need = runtime_.disk.load_bytes(on_disk);
+        uint64_t need = runtime_.disk.load_bytes(on_disk);
         const uint64_t floor = std::max<uint64_t>((uint64_t) runtime_.o.conversation_cache_min_free_mib << 20, runtime_.disk_floor);
         const auto t0 = Clock::now();
         basalt::core::SavedConversation image;
         std::string de;
-        if (!runtime_.capture_admit(need, floor)) {
+        // refused whole by the RAM admission: the K/V stays in its files until the restore reads it into the session
+        const bool whole = runtime_.disk_stream < 2 && runtime_.capture_admit(need, floor);
+        const bool direct = !whole && runtime_.disk_stream > 0 && runtime_.stages.empty();
+        if (direct) need = runtime_.disk.load_bytes(on_disk, false);
+        if (!whole && (!direct || !runtime_.capture_admit(need, floor))) {
             basalt::log::info("basalt serve", "conversation cache: %lld tokens on disk not read (physical RAM "
                               "admission; need %llu MiB)", (long long) on_disk.tokens,
                               (unsigned long long) (need >> 20));
-        } else if (!runtime_.disk.load(on_disk, image, de)) {
+        } else if (!runtime_.disk.load(on_disk, image, de, direct ? &disk_kv : nullptr)) {
+            disk_kv.reset();
             basalt::log::warn("basalt serve", "conversation cache: reading from disk failed (%s); the file is "
                               "dropped", de.c_str());
         } else {
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-            basalt::log::info("basalt serve", "conversation cache: read %lld tokens from disk in %.1f ms "
-                              "(%.2f GB of state)", (long long) on_disk.tokens, ms, (double) image.bytes() / 1e9);
+            if (direct) {
+                uint64_t kv_bytes = 0;
+                for (size_t i = 0; i < disk_kv->layers(); ++i)
+                    for (int b = 0; b < 5; ++b) kv_bytes += disk_kv->bytes(i, b);
+                basalt::log::info("basalt serve", "conversation cache: read %lld tokens from disk in %.1f ms "
+                                  "(%.2f GB of running state; %.2f GB of K/V go from the files into the session at "
+                                  "the restore)", (long long) on_disk.tokens, ms, (double) image.bytes() / 1e9,
+                                  (double) kv_bytes / 1e9);
+            } else {
+                basalt::log::info("basalt serve", "conversation cache: read %lld tokens from disk in %.1f ms "
+                                  "(%.2f GB of state)", (long long) on_disk.tokens, ms, (double) image.bytes() / 1e9);
+            }
             incoming.emplace(std::move(image));
             in_tokens = on_disk.tokens;
             in_live = true;
@@ -261,7 +282,7 @@ Flow Request::restore() {
     // state. Invalid entries can safely fall back to its existing prefix.
     if (incoming && incoming->stage_images.size() != runtime_.stages.size()) {
         basalt::log::info("basalt serve", "conversation cache: discard snapshot (stage count)");
-        incoming.reset();
+        drop_incoming();
     }
     if (incoming) for (size_t i = 0; i < runtime_.stages.size(); ++i) {
         const basalt::core::OnDevice on(runtime_.stages[i]->dev);
@@ -269,15 +290,15 @@ Flow Request::restore() {
                 nullptr, runtime_.err)) {
             basalt::log::warn("basalt serve", "conversation cache: discard invalid stage snapshot (%s)",
                          runtime_.err.c_str());
-            incoming.reset();
+            drop_incoming();
             runtime_.err.clear();
             break;
         }
     }
     if (incoming && !basalt::core::conversation_snapshot_validate(*incoming, *runtime_.rsp, runtime_.g,
-            runtime_.mtp_kv, runtime_.err)) {
+            runtime_.mtp_kv, runtime_.err, disk_kv.get())) {
         basalt::log::warn("basalt serve", "conversation cache: discard invalid snapshot (%s)", runtime_.err.c_str());
-        incoming.reset();
+        drop_incoming();
         runtime_.err.clear();
     }
     // Preserve the outgoing branch before any checkpoint rewind, reset,
@@ -414,7 +435,7 @@ Flow Request::restore() {
         }
         // a snapshot that cannot be restored is dropped and the prompt read from the start
         bool restored = basalt::core::conversation_snapshot_restore(*incoming, *runtime_.rsp,
-                runtime_.g, runtime_.mtp_kv, runtime_.err) == basalt::core::ConversationRestore::restored;
+                runtime_.g, runtime_.mtp_kv, runtime_.err, disk_kv.get()) == basalt::core::ConversationRestore::restored;
         if (restored && runtime_.mtp_on) runtime_.mtp.wrote(0, (int64_t) incoming->live.ids.size());
         int failed_stage = -1;
         for (size_t i = 0; restored && i < runtime_.stages.size(); ++i) {   // the later stages' parts
@@ -436,7 +457,7 @@ Flow Request::restore() {
             (void) cudaGetLastError();
             if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR restore sync\n"); return Flow::error; }
             runtime_.err.clear();
-            incoming.reset();
+            drop_incoming();
             runtime_.live.clear();
             runtime_.live_imgs.clear();
             runtime_.checks.clear();
@@ -460,8 +481,10 @@ Flow Request::restore() {
         from_live = in_live;
         std::vector<std::vector<basalt::core::ConversationKv>> stage_kv;   // every stage's, for its next park
         for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
-        runtime_.conversations->retain(std::move(incoming->kv), int64_t(runtime_.live.size()), std::move(stage_kv), runtime_.rsp);
-        incoming.reset();   // its running state and checkpoints are in the session now
+        // (K/V read from its files into the session: nothing in RAM to retain)
+        runtime_.conversations->retain(disk_kv ? std::vector<basalt::core::ConversationKv>{} : std::move(incoming->kv),
+                                       int64_t(runtime_.live.size()), std::move(stage_kv), runtime_.rsp);
+        drop_incoming();   // its running state and checkpoints are in the session now
         basalt::log::info("basalt serve", "conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu",
                      (long long) resume, from_live ? "live" : "checkpoint",
                      std::chrono::duration<double, std::milli>(Clock::now() - restore_t0).count(),

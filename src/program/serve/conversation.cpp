@@ -93,8 +93,26 @@ bool Runtime::disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey
 // A capture of a conversation's state, or a read of one from disk, takes `need` bytes of RAM: only while the RAM
 // guard reads its level as ok, and with `floor` left free after it (the disk tier's floor sits above the guard's).
 bool Runtime::capture_admit(uint64_t need, uint64_t floor) {
+    auto avail = basalt::core::conversation_available_memory();
+    if (avail && ram_seen_cap > 0) avail = std::min(*avail, floor + ram_seen_cap);
     return basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok &&
-           basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), need, floor);
+           basalt::core::conversation_memory_admit(avail, need, floor);
+}
+
+// Writes a conversation to the disk tier from the session itself, a write buffer at a time, with its draft layer's
+// K/V: no copy of its state in RAM.  The session's state stays as it is until this returns.  `bytes`: its state.
+bool Runtime::disk_write_direct(const basalt::core::ConversationView& view, const basalt::core::SessionState& s,
+                                size_t& bytes, double& ms) {
+    const auto t0 = Clock::now();
+    basalt::core::ConversationSource src;
+    std::string se;
+    if (!basalt::core::conversation_snapshot_source(src, view, s, g, mtp_kv, se) || !disk.write(src, se)) {
+        basalt::log::warn("basalt serve", "conversation cache: not written to disk (%s)", se.c_str());
+        return false;
+    }
+    bytes = (size_t) src.bytes();
+    ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    return true;
 }
 
 // Save only on a switch/rewind, not on each continuing request. No graph
@@ -189,18 +207,40 @@ bool Runtime::park_current(size_t held, int64_t kept) {
     // a capped figure would under-evict and overfill the budget.
     const bool ram_room = !to_disk && conversations->make_room(estimate, held);
     if (!to_disk && !ram_room && disk_wants) to_disk = true;   // larger than the RAM tier: the disk tier takes it
-    if (to_disk ? disk.queued_bytes() + estimate > kDiskQueueCap : !ram_room) {
+    const uint64_t floor = std::max<uint64_t>((uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024,
+                                              disk.enabled() ? disk_floor : 0);
+    const size_t retained = reuse.bytes() + stage_retained;
+    const size_t additional = estimate > retained ? estimate - retained : 0;
+    // what the RAM admission or the write queue refuses whole, the disk tier writes from the session itself
+    const bool whole_ok = capture_admit(additional, floor);
+    const bool queue_ok = !to_disk || disk.queued_bytes() + estimate <= kDiskQueueCap;
+    if (disk_wants && n_st == 0 && disk_stream > 0 &&
+        (to_disk ? disk_stream == 2 || !whole_ok || !queue_ok : !whole_ok)) {
+        reuse = {};   // its RAM goes before the write
+        const size_t need = basalt::core::ConversationStore::write_bytes(live.size());
+        if (!capture_admit(need, floor)) {
+            basalt::log::info("basalt serve", "conversation cache: skip parking (physical RAM admission; need %zu MiB "
+                              "to write from the session)", need >> 20);
+            return true;
+        }
+        size_t bytes = 0;
+        double ms = 0;
+        const bool stored = disk_write_direct(view, *rsp, bytes, ms);
+        basalt::log::info("basalt serve", "conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=0 (to disk, written from the session)",
+                          stored ? "parked" : "skipped", live.size(), ms, conversations->size(), conversations->bytes(),
+                          conversations->evictions(), bytes);
+        for (auto& sc : conversations->take_spilled())
+            if (!disk_has(sc.live.ids, sc.live.imgs, sc.checkpoints, sc.cvec)) disk.put(std::move(sc), kDiskQueueCap);
+        return true;
+    }
+    if (to_disk ? !queue_ok : !ram_room) {
         basalt::log::info("basalt serve", "conversation cache: skip parking (snapshot %zu MiB exceeds available budget)",
                      estimate >> 20);
         return true;
     }
     const auto t0 = Clock::now();
     try {
-        const uint64_t floor = std::max<uint64_t>((uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024,
-                                                  disk.enabled() ? disk_floor : 0);
-        const size_t retained = reuse.bytes() + stage_retained;
-        const size_t additional = estimate > retained ? estimate - retained : 0;
-        if (!capture_admit(additional, floor)) {
+        if (!whole_ok) {
             basalt::log::info("basalt serve", "conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, or telemetry unavailable, or RAM below the guard)",
                          additional >> 20, (long long) o.conversation_cache_min_free_mib);
             return true;
@@ -334,9 +374,20 @@ size_t Runtime::spill_to_disk(bool at_exit, size_t limit) {
             return;
         }
         if (at_exit) disk.flush();   // one image in RAM at a time
-        if (!capture_admit(bytes, floor)) {
-            basalt::log::info("basalt serve", "conversation cache: %zu tokens not written to disk (physical RAM "
-                              "admission)", ids.size());
+        if (disk_stream == 2 || !capture_admit(bytes, floor)) {
+            // refused whole: written from the session itself
+            if (disk_stream == 0 || !capture_admit(basalt::core::ConversationStore::write_bytes(ids.size()), floor)) {
+                basalt::log::info("basalt serve", "conversation cache: %zu tokens not written to disk (physical RAM "
+                                  "admission)", ids.size());
+                return;
+            }
+            size_t wrote = 0;
+            double ms = 0;
+            if (!disk_write_direct(view, s, wrote, ms)) return;
+            ++written;
+            if (!at_exit)
+                basalt::log::info("basalt serve", "conversation cache: %zu tokens to disk between requests "
+                                  "(written from the session in %.0f ms, %.2f GB)", ids.size(), ms, (double) wrote / 1e9);
             return;
         }
         try {
@@ -570,6 +621,8 @@ int Runtime::init_conversations() {
         (size_t) o.conversation_cache_slots);
 
     disk_floor = 0;                              // the RAM a capture or a read leaves free (set below)
+    disk_stream = (int) basalt::core::exp_flag("disk_stream", 1);
+    ram_seen_cap = (uint64_t) std::max(0.0, basalt::core::exp_flag("conv_ram_mib", 0)) << 20;
 
     if (o.conversation_cache_disk_mib > 0) {
         std::string de;
