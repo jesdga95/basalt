@@ -101,10 +101,7 @@ bool Verifier::dm_init(std::string& err) {
         d->pin = nullptr;
     }
     // the warm-ups' predictors, quantized once: every layer's router in int8 for the peer's, in 4-bit for the CPU pool's
-    const bool cpu_warm = warm_pool_ != nullptr && warm_src_ != nullptr && K <= 16 &&
-                          std::all_of(lay.fmt.begin(), lay.fmt.end(), [&](const basalt::kernels::cpu::NativeFmt& f) {
-                              return f.bytes == lay.fmt[0].bytes && f.down_off == lay.fmt[0].down_off;
-                          });
+    const bool cpu_warm = warm_pool_ != nullptr && warm_src_ != nullptr && K <= 16;
     std::vector<int8_t> rq_h;
     std::vector<float> rs_h;
     std::vector<uint8_t> rq4_h;
@@ -190,8 +187,6 @@ bool Verifier::dm_init(std::string& err) {
         w->rq = std::move(rq4_h);
         w->rs = std::move(rs4_h);
         w->n_expert = (int) g.n_expert; w->n_embd = (int) N; w->k = (int) K; w->src = warm_src_;
-        w->bytes = lay.fmt[0].bytes;
-        w->down_off = lay.fmt[0].down_off;
         w->logits.assign((size_t) kVerifyMaxT * g.n_expert, 0.0f);
         d->warm = w;
     }
@@ -245,7 +240,7 @@ bool Verifier::dm_init(std::string& err) {
     }
     basalt::log::info("basalt verify", "the MoE tail planned on the device%s", served.c_str());
     if (d->warm != nullptr)
-        basalt::log::info("basalt verify", "the CPU pool warms its likeliest next-layer expert between doorbells");
+        basalt::log::info("basalt verify", "the CPU pool warms its three likeliest next-layer experts between doorbells");
     return true;
 }
 
