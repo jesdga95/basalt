@@ -32,7 +32,7 @@ Test setup: one RTX 5090 at a 400 W power limit, an RTX 5060 Ti as the peer expe
 - **Quality is scored through decode.** Prefill is a different computation (fp16/BF16 GEMMs, int8 MMQ, and FP4 tensor cores for NVFP4 experts); the quality gate scores
   the decode path.
 - **The reference is full precision.** Quality is measured against a llama.cpp BF16 base of the original model
-  ([every pack](quality.md#the-bf16-reference)).
+  ([method](quality.md#the-bf16-reference), [every pack](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt#quality)).
 
 ## Decode path precision
 
