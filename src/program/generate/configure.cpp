@@ -1,5 +1,6 @@
 #include "context.hpp"
 #include "run.hpp"
+#include "basalt/program/split_cuts.hpp"
 
 namespace basalt::program::generate {
 
@@ -109,16 +110,10 @@ int run(int argc, char** argv) {
         cudaGetLastError();
         auto ints = [](const std::string& str, auto& out) -> bool {
             using V = typename std::decay_t<decltype(out)>::value_type;
-            size_t a = 0;
-            while (a < str.size()) {
-                size_t b = str.find(',', a);
-                if (b == std::string::npos) b = str.size();
-                const std::string t = str.substr(a, b - a);
-                if (t.empty() || t.find_first_not_of("0123456789") != std::string::npos) return false;
-                out.push_back((V) std::atoll(t.c_str()));
-                a = b + 1;
-            }
-            return !out.empty();
+            std::vector<int64_t> v;
+            if (!parse_split_cuts(str, v)) return false;
+            for (const int64_t x : v) out.push_back((V) x);
+            return true;
         };
         split_auto = o.layer_split == "auto";
         bool ok = o.serve && (split_auto || ints(o.layer_split, split_at));
@@ -138,7 +133,7 @@ int run(int argc, char** argv) {
             split_auto = false;
         } else if (ok) {
             ok = (split_auto || split_at.size() == split_devs.size()) && split_devs.size() < (size_t) SplitDrive::kMax;
-            for (size_t i = 0; ok && i < split_at.size(); ++i) ok = split_at[i] >= 2 && (i == 0 || split_at[i] > split_at[i - 1]);
+            ok = ok && split_cuts_ordered(split_at);
             for (size_t i = 0; ok && !split_same && i < split_devs.size(); ++i) {
                 ok = split_devs[i] > 0 && split_devs[i] < n_dev;
                 for (size_t j = 0; ok && j < i; ++j) ok = split_devs[i] != split_devs[j];
