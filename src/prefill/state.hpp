@@ -31,6 +31,10 @@ struct Prefill::Impl {
     uint32_t* hist = nullptr;                // routed-entry counts per (layer, expert); see route_hist_reset
     int64_t hist_n = 0, hist_tokens = 0;
     bool hist_on = false;
+    // the dense projections of chunks of at least this many tokens on the FP8 tensor cores (0: off; set_fp8)
+    int64_t fp8_min = 0;
+    // which of them: 1 GDN qkv, 2 GDN z, 4 GDN out, 8 QSA q, 16 QSA k/v, 32 QSA o, 64 shared expert
+    int fp8_kinds = 0;
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
     std::vector<void*> owned;

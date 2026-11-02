@@ -208,6 +208,7 @@ int run(int argc, char** argv) {
     }
     basalt::kernels::RopeScaling rope_cfg;
     if (const auto code = cli::validate_generation_options(o, multi_gpu, vram_floor_mib(), rope_cfg)) return *code;
+    basalt::prefill::Prefill::set_fp8(o.prefill_fp8);
 
     // **BEFORE ANYTHING ELSE.**  The CPU expert kernel is AVX-512 (VNNI + VBMI), so on a CPU without those features it
     // does not fail - it executes an illegal instruction at some unpredictable token.  Refusing at second zero is the

@@ -120,6 +120,7 @@ Prefill and decode are different computations that read and write the same KV an
 | Item | Prefill | Source |
 |---|---|---|
 | Dense projections | Weights dequantized to fp16, activations rounded to fp16, cuBLAS with fp32 accumulate; BF16 tensors BF16 x BF16 with fp32 compute; no q8_1 | gemm.cu:122-184; prefill/projection.cpp:29-40 |
+| Dense projections in FP8 (`--prefill-fp8`, experimental, off) | Selected prompt products use E4M3 weights and activations with FP32 accumulation; their errors carry into subsequent decode. Numerics change from the FP16 path. The prior measurements on the original branch do not validate this merge; rerun prompt-path parity and decode-path quality against Q8_0 | prefill/gemm_fp8.cu; prefill/projection.cpp; prefill_fp8_dense_test |
 | hc matrices | Activations rounded to BF16; down/up use the int8 copy dequantized to BF16; inject uses the BF16 tensor. From 33 tokens the up product and the mix run as one kernel (the FP32 gate rows stay in registers): each gate value is one m16n8k16 chain over k from zero, the chain cuBLAS runs for that product, and the mix keeps gr_mix_r's arithmetic, so the outputs are the same bits as the two steps (`prefill_hc_up_mix_test`) | prefill/projection.cpp:16-22 (up_mix); kernels.cu (gr_up_mix_kernel); gemm.cu (bf16_w, bf16_rows) |
 | Router | BF16 activation (decode: fp32) | prefill/routing.cpp:26 |
 | Shared expert | fp16 activation, fp16 SwiGLU | prefill/shared_expert.cpp:10-20 |

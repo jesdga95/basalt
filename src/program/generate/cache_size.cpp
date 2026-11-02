@@ -95,6 +95,7 @@ int cache_size(Context& context) {
             constexpr int64_t kSlotWindowsMib = 24;   // one session's solo windows, or the batch windows
             if (o.serve || ml == nullptr || std::strcmp(ml, "EAGER") != 0) late_room += kLazyKernelsMib << 20;
             if (o.serve && o.batch >= 2 && slot0_is_solo) late_room += ((int64_t) o.batch * kSlotWindowsMib) << 20;
+            if (o.prefill_fp8) late_room += 8ll << 20;
         }
         const int64_t reserve_b = std::max<int64_t>((int64_t) o.vram_reserve_mib << 20,
                                                     late_room + ((int64_t) vram_floor_mib() << 20));

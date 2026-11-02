@@ -2,6 +2,7 @@
 #include "layout.hpp"
 #include "basalt/prefill/prefill.hpp"
 #include "basalt/core/mtp.hpp"
+#include "basalt/core/diag.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/layout.hpp"
 #include "basalt/kernels/ngram.hpp"
@@ -60,6 +61,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     Impl& m = *impl_;
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
+    m.fp8_min = g_fp8 ? std::max<int64_t>(1, (int64_t) core::exp_flag("fp8_prompt_min", (double) kFp8MinTokens)) : 0;
+    m.fp8_kinds = (int) core::exp_flag("fp8_prompt_kinds", (double) kFp8Kinds);
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
     }

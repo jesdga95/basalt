@@ -29,6 +29,9 @@ constexpr int RING_MAX = 384;           // the arrays; the ring itself is ring_s
 // The chunk size from which every expert streams: below it only the routed experts are staged.  Staging every
 // non-resident expert costs the same whatever the chunk, so it pays only once most of them are routed anyway.
 extern int64_t g_stream_all_min;
+extern bool g_fp8;
+constexpr int64_t kFp8MinTokens = 1024;
+constexpr int kFp8Kinds = 1 | 2 | 8 | 16 | 64;
 inline int64_t stream_all_min() { return g_stream_all_min; }
 // The streamed ring's slots (one whole expert blob each, the same for every pack).  g_ring_depth caps the depth the
 // next layout is laid out with (a prompt read beside decoding slots lends fewer cache slots with a shallower ring).
@@ -53,7 +56,7 @@ void up_mix(Gemm& gm, const uint16_t* w_up, const uint16_t* lo16, float* gated, 
             const float* w_norm, float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream);
 const core::WeightRef* need(const core::LayerView& v, const char* suffix, std::string& err);
 bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
-                 std::string& err, int64_t ldy = 0);
+                 std::string& err, int64_t ldy = 0, const Gemm::Rows8* x8 = nullptr);
 bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
                std::string& err, int64_t ld = 0);
 extern double g_pinned_share;

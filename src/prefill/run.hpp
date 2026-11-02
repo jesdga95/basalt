@@ -157,6 +157,18 @@ struct Prefill::Run::Chunk {
                             ? (m.ring - STAGE) / 2 : 0;
     int64_t guess_for = -1;   // the layer whose routing this layer's half guessed
     bool normed = false;   // the previous half's write already normed R for this half (grs, xn16)
+    // The FP8 products' activation rows go to buffers that are dead while the product runs: bo until the half's
+    // last product writes it, y (the recurrence's FP32 scratch) and attn (read by gate_attn) once their FP16 rows
+    // exist.
+    const bool f8 = m.fp8_min > 0 && T >= m.fp8_min && m.gemm.fp8_ready();
+    const size_t cap_bo = (size_t) m.T * N * 4, cap_zv = (size_t) m.T * ZV * 4;
+    Gemm::Rows8 x8, y8;
+    const Gemm::Rows8* act8(int kinds, const uint16_t* x, int64_t cols, void* buf, size_t cap, Gemm::Rows8& r) {
+        if (!f8 || (m.fp8_kinds & kinds) == 0 || Gemm::act8_bytes(T, cols) > cap) return nullptr;
+        r = m.gemm.act8(x, T, cols, buf);
+        return &r;
+    }
+    const Gemm::Rows8* kind8(int kind, const Gemm::Rows8* x) const { return (m.fp8_kinds & kind) ? x : nullptr; }
 };
 
 }  // namespace basalt::prefill

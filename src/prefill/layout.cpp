@@ -31,6 +31,7 @@ using namespace detail;
 
 namespace detail {
 int64_t g_stream_all_min = 6144;
+bool g_fp8 = false;
 int g_ring_depth = kPrefillRingDeep;
 double g_pinned_share = 1.0;
 // Whether the fused experts' buffers apply: a streamed chunk of a pack the fused kernels cover.
@@ -358,6 +359,7 @@ int64_t Prefill::chunk() const { return impl_->T; }
 
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
 void Prefill::set_stream_all_min(int64_t tokens) { g_stream_all_min = tokens; }
+void Prefill::set_fp8(bool on) { g_fp8 = on; }
 void Prefill::set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
 void Prefill::set_cpu_share(double share) { impl_->cpu_share_now = std::max(0.0, std::min(share, 1.0)); }
 void Prefill::set_ring_depth(int slots) { g_ring_depth = std::max(STAGE + 1, std::min(slots, kPrefillRingDeep)); }

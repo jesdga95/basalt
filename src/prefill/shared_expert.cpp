@@ -10,10 +10,12 @@ using namespace detail;
 bool Prefill::Run::Chunk::shared_expert(const core::LayerView& v, const core::WeightRef* wgi, const core::WeightRef* wsg,
                                               const core::WeightRef* wsu, const core::WeightRef* wsd) {
     // the shared expert and its scalar gate
-    if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
-    if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+    const Gemm::Rows8* xa = act8(64, m.mixed_h, N, m.bo, cap_bo, x8);
+    if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err, 0, xa)) return false;
+    if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err, 0, xa)) return false;
     swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
-    if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
+    const Gemm::Rows8* ha = act8(64, m.sh_h, 640, m.bo, cap_bo, y8);   // after gate/up read x8 (one stream)
+    if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err, 0, ha)) return false;
     if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
     m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
     return true;
