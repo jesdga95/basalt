@@ -1,4 +1,5 @@
 // src/program/serve/request_decode.cpp - request decode operations.
+#include "reply_rows.hpp"
 #include "request.hpp"
 
 namespace basalt::program::serve {
@@ -397,19 +398,13 @@ Flow Request::decode() {
         }
         tk_valid = false;
         const Clock::time_point tw1 = Clock::now();
-        // Keep only rows through the reply's last emitted token when this window ends the reply.
-        int n_emit = 0;
-        bool eos_pre = false;
-        for (int i = e0; i <= a && produced_n + n_emit < max_new && !eos_pre; ++i) {
-            ++n_emit;
-            eos_pre = ppl == nullptr &&
-                      std::find(runtime_.o.eos_ids.begin(), runtime_.o.eos_ids.end(), (int64_t) outv[(size_t) i]) != runtime_.o.eos_ids.end();
-        }
-        const bool ends = ppl == nullptr && n_emit > 0 && (eos_pre || produced_n + n_emit >= max_new);
-        const int keep = ends ? std::min(a, e0 + n_emit) + 1 : a + 1;
+        // the picks this window sends and the rows it keeps: a window that ends the reply keeps no row past its
+        // last pick, and that pick is the next token, as at any window's end
+        const ReplyRows rr = reply_rows(outv.data(), e0, a, produced_n, max_new, runtime_.o.eos_ids, ppl != nullptr);
+        const int keep = rr.keep;
         if (chain) {
             // the draft launches first; the commit, the adaptive round and the output go in its shadow
-            const bool will_draft = !eos_pre && produced_n + n_emit < max_new;
+            const bool will_draft = !rr.ends && produced_n + rr.emit < max_new;
             float wprob[16];
             const int wprob_n = std::min(runtime_.S_mtp, 16);
             if (draft_log != nullptr)
@@ -551,7 +546,7 @@ Flow Request::decode() {
             if (eos) { finish = "stop"; break; }
             runtime_.shed_if_low();
             if (runtime_.halted()) { finish = "cancel"; break; }
-            x = outv[(size_t) (ends ? e0 + n_emit - 1 : a)];
+            x = outv[(size_t) keep - 1];
             p += keep;
             basalt::core::decode_events().stamp(2);
             continue;
@@ -607,7 +602,7 @@ Flow Request::decode() {
         if (eos) { finish = "stop"; break; }
         runtime_.shed_if_low();
         if (runtime_.halted()) { finish = "cancel"; break; }
-        x = outv[(size_t) (ends ? e0 + n_emit - 1 : a)];
+        x = outv[(size_t) keep - 1];
         p += keep;
     }
     if (gguard != nullptr)
