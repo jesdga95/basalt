@@ -624,10 +624,11 @@ bool FileExpertSource::read_blobs(const std::pair<int32_t, int32_t>* pairs, int6
     const uint64_t stage_bytes = (max_blob + 2 * (alignment - 1)) & ~(alignment - 1);
     const int readers = (int) std::min<int64_t>(kBlobReaders, n);
     struct Stage {
-        uint8_t* data = nullptr;
+        uint8_t* alloc = nullptr;   // what cudaHostAlloc returned
+        uint8_t* data = nullptr;    // `alloc` rounded up to the read alignment
         int64_t index = -1;
         uint32_t prefix = 0, required = 0;
-        ~Stage() { if (data) cudaFreeHost(data); }
+        ~Stage() { if (alloc) cudaFreeHost(alloc); }
     } stages[kBlobReaders];
     // The file drains outstanding writes before the staging buffers are released.  A pack on a file system without
     // unbuffered reads, or one that cannot be reopened, is read through the mapping.
@@ -635,12 +636,18 @@ bool FileExpertSource::read_blobs(const std::pair<int32_t, int32_t>* pairs, int6
     std::string direct_err;
     if (!file.open(path_, direct_err, readers)) return mapped_read();
     for (int i = 0; i < readers; ++i) {
-        // Portable: the fill writes the peer card's slots straight from these buffers.
-        if (cudaHostAlloc((void**) &stages[i].data, (size_t) stage_bytes, cudaHostAllocPortable) != cudaSuccess) {
+        // Portable: the fill writes the peer card's slots straight from these buffers.  A small pinned allocation
+        // can be carved from a shared block at less than the read alignment, so each buffer has one alignment of
+        // slack and starts at the next aligned address inside it.
+        if (cudaHostAlloc((void**) &stages[i].alloc, (size_t) (stage_bytes + alignment), cudaHostAllocPortable) !=
+            cudaSuccess) {
+            stages[i].alloc = nullptr;
             (void) cudaGetLastError();
             file.close();
             return mapped_read();
         }
+        const uintptr_t at = (uintptr_t) stages[i].alloc;
+        stages[i].data = stages[i].alloc + (((at + alignment - 1) & ~(uintptr_t) (alignment - 1)) - at);
     }
 
     auto submit = [&](int slot, int64_t index) {
