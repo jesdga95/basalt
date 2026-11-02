@@ -977,6 +977,7 @@ class ProcessEngine:
                             alone = False
                         else:
                             self.slot_busy[solo_slot] = True
+                            self.claim_slot(solo_slot, session)
                             reserved = solo_slot
                 if alone and left > 1:
                     if solo_slot is not None:
@@ -1007,6 +1008,7 @@ class ProcessEngine:
                                         reserved = self.pick_slot(prompt, session)
                                         if reserved is not None:
                                             self.slot_busy[reserved] = True
+                                            self.claim_slot(reserved, session)
                                 if reserved is not None:    # (a solo run in a slot parks its read in that slot)
                                     self._send(f"BYIELD {reserved}")
                                     yield_sent = True
@@ -1043,6 +1045,7 @@ class ProcessEngine:
                                     slot = self.pick_slot(prompt, session)
                                     if slot is not None and self.admission.may_go(ticket, self._resumes(slot, prompt)):
                                         self.slot_busy[slot] = True
+                                        self.claim_slot(slot, session)
                                         break
                                     slot = None
                                     if holding:
@@ -1230,33 +1233,36 @@ class ProcessEngine:
         """A free slot for `prompt` (caller holds slot_cv): this session's own slot first (a conversation stays
         where its K/V sits), then the longest held prefix, else an empty one, then the least recently used; None
         when none is free.  A slot owned by another session is taken only when no unowned one is free: the owner
-        lost its conversation either way, and the least recently used goes first."""
+        lost its conversation either way, and the least recently used goes first.  Read-only: `claim_slot` records
+        the choice."""
         free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
-        if not hasattr(self, "slot_owner"):   # a hand-built engine (tests) skipped the init that declares these
-            self.slot_owner: dict[int, str] = {}
-            self.session_slot: dict[str, int] = {}
         own = self.session_slot.get(session) if session is not None else None
         if own is not None and own in free:
-            slot = own
-        else:
-            def held_prefix(b):
-                h = self.slot_held[b]
-                return len(h) if h and len(h) < len(prompt) and prompt[:len(h)] == h else 0
-            pool = [b for b in free if b not in self.slot_owner.values()] or free
-            best = max(pool, key=held_prefix)
-            slot = best if held_prefix(best) > 0 else min(pool, key=lambda b: (bool(self.slot_held[b]), self.slot_used[b]))
-        if session is not None:
-            for s, o in list(self.session_slot.items()):    # anyone else owning this slot loses it
-                if o == slot:
-                    del self.session_slot[s]
-            old = self.session_slot.get(session)           # the session's previous slot, replaced
-            if old is not None and old != slot and self.slot_owner.get(old) == session:
-                del self.slot_owner[old]
-            self.slot_owner[slot] = session
-            self.session_slot[session] = slot
-        return slot
+            return own
+
+        def held_prefix(b):
+            h = self.slot_held[b]
+            return len(h) if h and len(h) < len(prompt) and prompt[:len(h)] == h else 0
+        pool = [b for b in free if b not in self.slot_owner] or free   # slot_owner is keyed by slot
+        best = max(pool, key=held_prefix)
+        return best if held_prefix(best) > 0 else min(pool, key=lambda b: (bool(self.slot_held[b]), self.slot_used[b]))
+
+    def claim_slot(self, slot: int, session: str | None) -> None:
+        """Bind `slot` to `session` (caller holds slot_cv), dropping whoever held it and the session's own previous
+        slot: two owners of one slot, or one session in two slots, would both be lies the next turn acts on."""
+        if session is None:
+            return
+        for s, o in list(self.session_slot.items()):    # anyone else owning this slot loses it
+            if o == slot:
+                del self.session_slot[s]
+                self.slot_owner.pop(slot, None)
+        old = self.session_slot.get(session)           # the session's previous slot, replaced
+        if old is not None and old != slot and self.slot_owner.get(old) == session:
+            del self.slot_owner[old]
+        self.slot_owner[slot] = session
+        self.session_slot[session] = slot
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         """Yield token ids, and None as a 10 s heartbeat while the engine is quiet. An early-leaving consumer or
