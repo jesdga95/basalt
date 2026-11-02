@@ -159,7 +159,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
     bool mid_ok = false;
     MidChainArgs ma;
     if (dec_hc && read_q8 && router_multi && !is_qsa_layer(g, l) && !v_.prof_on_ && !v_.batch_rec_ && !gs_split &&
-        n <= kMidChainMaxT && N == 2560 && dec_gdnf_mode() != 0 && (dense_tc_mask() & 4)) {
+        n <= v_.mid_max_t_ && N == 2560 && dec_gdnf_mode() != 0 && (dense_tc_mask() & 4)) {
         const WeightRef *wqkv = v.get("attn_qkv.weight"), *wg = v.get("attn_gate.weight"),
                         *wout = v.get("ssm_out.weight"), *wa = v.get("ssm_alpha.weight"),
                         *wb = v.get("ssm_beta.weight"), *wc = v.get("ssm_conv1d.weight"),

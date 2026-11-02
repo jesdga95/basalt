@@ -1,5 +1,8 @@
 namespace mkc {
-constexpr int CT = 512, XT = 4, SMEM_MAX = 101376;
+// XT: a window's rows; RXT: the recurrence's q/k/v rows staged at a time (a wider window stages its second half after
+// the first half's tokens)
+constexpr int CT = 512, XT = kMidChainMaxT, RXT = 4, SMEM_MAX = 101376;
+static_assert(XT <= 2 * RXT, "the recurrence stages at most two halves");
 // ---- pair
 // the projections' types are per layer: Q8_0 8, Q4_K 12, Q5_K 13, Q6_K 14, IQ3_S 21, IQ4_XS 23 (sb_bytes: a
 // 256-value super-block's bytes; Q8_0 is eight 34-byte blocks)
@@ -8,9 +11,12 @@ constexpr int P_SLOTS = 4, OFF_PRED = 87040;   // the ring: up to 4 slots of the
 // ---- rec
 constexpr int R_HV = 48, R_HK = 16, R_C = 2 * R_HK * S + R_HV * S, R_ZV = R_HV * S, R_CTA0 = 122;   // [0, 64 KB): the head's state tile
 // ---- out
-// out: the tile [0, 16 * row stride), red (4 columns) after it, x staged after red where it fits below OFF_PERM
+// out: the tile [0, 16 * row stride), red after it, x staged after red where it fits below OFF_PERM
 constexpr int O_Q8_SMEM_CH = 9;   // Q8_0 out: 512-value chunks of a row kept in smem (of 12)
-constexpr int O_NIN = 6144, O_NOUT = 2560, O_NLW = 24, O_RC = 4, O_REDB = O_NLW * 16 * O_RC * 4;
+// red holds rc columns per row: 4 for windows of up to RXT rows, else 8
+constexpr int O_NIN = 6144, O_NOUT = 2560, O_NLW = 24;
+__host__ __device__ constexpr int o_rc(int rows) { return rows <= RXT ? 4 : 8; }
+__host__ __device__ constexpr int o_redb(int rc) { return O_NLW * 16 * rc * 4; }
 // ---- permanent tail: barriers + the IQ3_S grid
 constexpr int OFF_PERM = SMEM_MAX - 4096;
 // the per-layer geometry of the typed phases (host-computed)
@@ -21,7 +27,7 @@ struct Geo {
     int orb, ors, ored, ox;   // out: row bytes in smem, row stride, red offset, staged x offset
     int orow;           // out: a row's bytes in the weights (orb, or more when the row's tail is read from L2)
 };
-__host__ __device__ constexpr Geo make_geo(int tq, int tz, int to) {
+__host__ __device__ constexpr Geo make_geo(int tq, int tz, int to, int rc) {
     Geo g{};
     g.tq = tq; g.tz = tz; g.to = to;
     g.tbq = 16 * (P_NIN / 256) * sb_bytes(tq); g.tbz = 16 * (P_NIN / 256) * sb_bytes(tz);
@@ -34,7 +40,7 @@ __host__ __device__ constexpr Geo make_geo(int tq, int tz, int to) {
     // Q8_0 rows (6528 bytes) do not fit 16 to a tile: the first O_Q8_SMEM_CH chunks go to smem, the rest is prefetched to
     // L2 and read from there
     g.orb = to == 8 ? O_Q8_SMEM_CH * 2 * sb_bytes(8) : g.orow; g.ors = one_row_stride(g.orb);
-    g.ored = (16 * g.ors + 127) & ~127; g.ox = g.ored + O_REDB;
+    g.ored = (16 * g.ors + 127) & ~127; g.ox = g.ored + o_redb(rc);
     return g;
 }
 // f(integral_constant<TYPE>) for a projection type
@@ -91,9 +97,9 @@ __device__ __forceinline__ void pf_l2(const void* p, size_t n) {   // n multiple
 enum { PB_WD = 0, PB_WU = 1, PB_A = 2, PB_SLOT = 3, PB_REC = 7, PB_OX = 8, PB_OW = 9 };   // bits of the parity register
 #define MW(bar, bit) do { mwait(bar, (PH >> (bit)) & 1u); PH ^= 1u << (bit); } while (0)
 enum { C_H1DN, C_H1UP, C_PAIR, C_REC, C_OUT, C_H2DN, C_H2UP, C_RT, C_END, C_REL, C_PZ, NCTR = 16 };
-struct RecS {   // rec_rank's RecSmem for T <= XT, the alpha/beta rows shared by the 4 ranks
-    float qn[XT][S], kn[XT][S];
-    float v[4][XT][32], oc[4][XT][32];
+struct RecS {   // rec_rank's RecSmem with q/k/v for RXT tokens at a time, the alpha/beta rows shared by the 4 ranks
+    float qn[RXT][S], kn[RXT][S];
+    float v[4][RXT][32], oc[4][XT][32];
     float red_kv[4][RG][32], red_o[4][RG][32];
     float part[4][2][XT][RG];
     float g[4][XT], b[4][XT];
@@ -103,6 +109,7 @@ struct RecS {   // rec_rank's RecSmem for T <= XT, the alpha/beta rows shared by
 constexpr int OFF_REC = (OFF_PERM - (int) sizeof(RecS)) & ~127;
 static_assert(OFF_REC >= 16 * 5040, "rec above the largest out tile (Q6_K)");
 static_assert(OFF_REC >= 16 * one_row_stride(O_Q8_SMEM_CH * 2 * 272), "rec above the Q8_0 out tile");
+static_assert(make_geo(14, 14, 14, 8).ox <= OFF_PERM && make_geo(8, 8, 8, 8).ox <= OFF_PERM, "8-column red below the tail");
 
 extern __shared__ __align__(128) char sm_dyn[];
 // weight copies: L2 evict-first policy (read once per layer; keeps the kernel's code and the activations in L2)
@@ -170,7 +177,8 @@ __device__ __forceinline__ float ab_one_g(const DecRecArgs& a, int head, bool is
 }
 #endif
 // dec_gdn_rec's conv_silu with its contraction spelled out (fma(v0, w0, v1*w1), then + v2*w2, + x*w3)
-__device__ __forceinline__ float conv_silu_x(const float (&hist)[3], const float (&w)[4], const float (&xv)[XT], int t) {
+template <int N>
+__device__ __forceinline__ float conv_silu_x(const float (&hist)[3], const float (&w)[4], const float (&xv)[N], int t) {
     float win[3];
 #pragma unroll
     for (int j = 0; j < 3; ++j) { const int src = t + j; win[j] = src < 3 ? hist[src] : xv[src - 3]; }
