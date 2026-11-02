@@ -23,6 +23,11 @@ screened heads. The shared prefix stays unchanged; private recurrence remains FP
 Intermediate windows skip vocabulary projection and sampling under a distinct graph-cache key. Their target
 layers and state commits retain native arithmetic; terminal windows and ordinary chat retain their heads.
 
+Decision windows share the chat batch scheduler's adaptive expert-tier maintenance. Exchanges advance only
+between windows, with their copy worker joined before serial-verifier or prefill-loan transitions. The existing
+adaptation switches and cadence apply. As in chat, moving an expert between CPU and GPU can change rounding;
+pinning the tiers disables that source of variation. Model weights and KV formats stay unchanged.
+
 The segmented QSA K/V post kernel also accepts FP16 pools, using the existing FP32-to-FP16 conversion and page
 addressing from `kv_append_step`. Norm, RoPE, indexer and attention arithmetic retain their native order. INT8
 appends keep their existing path; solo FP16 recording is unchanged. The QSA segment fixture compares FP16 post

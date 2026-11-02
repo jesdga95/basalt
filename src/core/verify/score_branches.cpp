@@ -43,7 +43,8 @@ void Verifier::swap_score_workspace(Verifier& o) {
 
 bool Verifier::score_branches(std::vector<ScoreBranch>& branches, int64_t prefix, PoolMultiFn pool, void* user,
                               uint64_t& workspace_bytes, uint64_t free_floor, std::string& err,
-                              const std::function<bool()>& cancelled) {
+                              const std::function<bool()>& cancelled,
+                              const std::function<bool(std::string&)>& before_window) {
     const OnDevice on_device(device_);
     workspace_bytes = 0;
     if (!score_branches_supported() || !wait_commit(err)) return false;
@@ -146,6 +147,7 @@ bool Verifier::score_branches(std::vector<ScoreBranch>& branches, int64_t prefix
         const auto plan = decision_window(std::span<const int>(remaining, S), max_t_);
         const int active = plan.size, used = plan.rows;
         if (!active) break;
+        if (before_window && !before_window(err)) return false;
         const auto& rows = plan.slots;
         const auto& lens = plan.lengths;
         std::vector<int32_t> tokens;

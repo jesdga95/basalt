@@ -141,6 +141,11 @@ Flow Request::read_prompt() {
         if (to <= at) continue;
         runtime_.err.clear();
         const bool win = windows_ok(at, to);
+        // ---- Jev: expert exchanges finish before the prompt path borrows their slots ----
+        if (!score_ids.empty() && !win && !runtime_.xq_drain()) {
+            std::printf("ERR an adaptive refill failed\n"); return Flow::error;
+        }
+        // ---- end Jev ----
         int64_t rto = to;
         if (win && to == n - 1 && to != turn_at && to != root_at && ppl == nullptr && gguard == nullptr && score_ids.empty()) {
             const int64_t p0 = at + (int64_t) runtime_.S * ((to - at) / runtime_.S);

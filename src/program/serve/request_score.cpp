@@ -34,7 +34,8 @@ Flow Request::score() {
         uint64_t bytes = 0;
         const bool ok = runtime_.ver.score_branches(score_branches, n - 1, runtime_.win_pool_fn,
                                                    runtime_.win_pool_user, bytes, (uint64_t) vram_floor_mib() << 20,
-                                                   runtime_.err, [&] { return runtime_.halted(); });
+                                                   runtime_.err, [&] { return runtime_.halted(); },
+                                                   [&](std::string& e) { return runtime_.adaptive_window(e); });
         const double native_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
         if ((!ok && !runtime_.err.empty()) || runtime_.drive.d.failed) {
             std::printf("ERR Jev branch verify: %s\n", runtime_.err.c_str()); return Flow::error;
@@ -57,6 +58,11 @@ Flow Request::score() {
         std::printf("JTIME %.6f\n", native_ms);
         return Flow::proceed;
     }
+    if (!runtime_.adaptive_window(runtime_.err)) {
+        std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error;
+    }
+    // The serial verifier also consumes deferred launches; its copy worker must finish first.
+    if (runtime_.ba_job) { runtime_.ba_thr.join(); runtime_.ba_job = false; }
     if (!runtime_.ver.run(1, &token, n - 1, runtime_.win_pool_fn, runtime_.win_pool_user, &ignored, runtime_.err) ||
         runtime_.drive.d.failed) {
         std::printf("ERR Jev verify: %s\n", runtime_.err.c_str());

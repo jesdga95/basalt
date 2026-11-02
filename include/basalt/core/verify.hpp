@@ -170,7 +170,8 @@ public:
     };
     bool score_branches(std::vector<ScoreBranch>& branches, int64_t prefix, PoolMultiFn pool, void* user,
                         uint64_t& workspace_bytes, uint64_t free_floor, std::string& err,
-                        const std::function<bool()>& cancelled = {});
+                        const std::function<bool()>& cancelled = {},
+                        const std::function<bool(std::string&)>& before_window = {});
     bool score_branches_supported() const;
     void release_score_workspace();
     // ---- end Jev ----

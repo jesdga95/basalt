@@ -38,6 +38,12 @@ bool Request::read_windows(int64_t a, int64_t b, std::string& e) {
         runtime_.drive.d.layers = 0;
         runtime_.drive.d.experts = 0;
         runtime_.drive.d.failed = false;
+        // ---- Jev: prefix rows participate in the same adaptive tier as scoring rows ----
+        if (runtime_.jev_scoring) {
+            if (!runtime_.adaptive_window(e)) return false;
+            if (runtime_.ba_job) { runtime_.ba_thr.join(); runtime_.ba_job = false; }
+        }
+        // ---- end Jev ----
         if (!runtime_.ver.run(T, win.data(), q, runtime_.win_pool_fn, runtime_.win_pool_user, outw.data(), e) || runtime_.drive.d.failed) {
             if (runtime_.drive.d.failed && runtime_.drive.d.fail) e = runtime_.drive.d.fail;
             return false;

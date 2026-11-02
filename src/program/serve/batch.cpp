@@ -183,48 +183,7 @@ bool Runtime::batch_step() {
     drive.d.layers = 0;
     drive.d.experts = 0;
     drive.d.failed = false;
-    if (!ov_active) apply_pending(false);
-    if (batch_adapt && !ov_active) {
-        // the tier follows what all the slots' rows route: a round every --adapt-every windows.  Its steps
-        // are taken once their copies are done; the copies out of the RAM tier (which may read the experts
-        // file) are queued from a worker thread beside the windows, so no window waits for one.
-        const Clock::time_point ta = Clock::now();
-        bool ok = true, acted = false;
-        ++ba_win;
-        if (ba_job && ba_thr.finished()) { ba_thr.join(); ba_job = false; }
-        if (!ba_job) {
-            if (xq_stage != 0) {
-                if (cudaEventQuery(adapt_ev) == cudaSuccess) {
-                    const int was = xq_stage;
-                    ok = xq_advance(true);
-                    if (ok && was == 1 && xq_stage == 2) {
-                        ba_thr.run([&] { ver.flush_post_launch(); });
-                        ba_job = true;
-                    }
-                    acted = true;
-                }
-            } else if (ba_win % o.adapt_every == 0) {
-                const int64_t np0 = xq_noplace;
-                ok = xq_round();
-                ba_swaps += (int64_t) xq.size();
-                ba_noplace += xq_noplace - np0;
-                ++ba_rounds;
-                acted = true;
-            }
-        }
-        std::string perr;
-        if (ok && acted && !ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
-        if (!ok) { std::printf("ERR an adaptive refill failed\n"); return false; }
-        ba_ms += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
-        if (ba_win % 2000 == 0 && ba_win > 0) {   // the swap rate and the hit rate over the last 2000 windows
-            const int64_t h = drive.d.cache_hits, m = drive.d.multi_misses;
-            basalt::log::info("basalt batch adapt", "window %lld: %lld swaps in %lld rounds, VRAM hits %.2f and CPU "
-                                 "experts %.2f per layer-window", (long long) ba_win, (long long) (ba_swaps - ba_swaps_l),
-                         (long long) (ba_rounds - ba_rounds_l), (double) (h - ba_h_l) / (2000.0 * g.n_layers),
-                         (double) (m - ba_m_l) / (2000.0 * g.n_layers));
-            ba_swaps_l = ba_swaps; ba_rounds_l = ba_rounds; ba_h_l = h; ba_m_l = m;
-        }
-    }
+    if (!adaptive_window(err)) { std::printf("ERR %s\n", err.c_str()); return false; }
     if (bt_windows == 0) {
         bt_start = Clock::now();
         bt_wait0 = ver.ms_wait; bt_pool0 = ver.ms_pool;

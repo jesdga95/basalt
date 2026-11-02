@@ -536,11 +536,56 @@ bool Runtime::xq_advance(bool wait) {
 }
 
 bool Runtime::xq_drain() {
+    if (ba_job) { ba_thr.join(); ba_job = false; }
     while (xq_stage != 0)
         if (!xq_advance(true)) return false;
     xq_settle();
     return true;
 }
+
+// ---- Jev: chat and decision windows share the same nonblocking tier maintenance ----
+bool Runtime::adaptive_window(std::string& e) {
+    if (!ov_active) apply_pending(false);
+    if (!batch_adapt || ov_active) return true;
+    const Clock::time_point ta = Clock::now();
+    bool ok = true, acted = false;
+    ++ba_win;
+    if (ba_job && ba_thr.finished()) { ba_thr.join(); ba_job = false; }
+    if (!ba_job) {
+        if (xq_stage != 0) {
+            if (cudaEventQuery(adapt_ev) == cudaSuccess) {
+                const int was = xq_stage;
+                ok = xq_advance(true);
+                if (ok && was == 1 && xq_stage == 2) {
+                    ba_thr.run([this] { ver.flush_post_launch(); });
+                    ba_job = true;
+                }
+                acted = true;
+            }
+        } else if (ba_win % o.adapt_every == 0) {
+            const int64_t np0 = xq_noplace;
+            ok = xq_round();
+            ba_swaps += (int64_t) xq.size();
+            ba_noplace += xq_noplace - np0;
+            ++ba_rounds;
+            acted = true;
+        }
+    }
+    std::string perr;
+    if (ok && acted && !ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
+    if (!ok) { e = "an adaptive refill failed"; return false; }
+    ba_ms += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
+    if (ba_win % 2000 == 0) {
+        const int64_t h = drive.d.cache_hits, m = drive.d.multi_misses;
+        basalt::log::info("basalt batch adapt", "window %lld: %lld swaps in %lld rounds, VRAM hits %.2f and CPU "
+                         "experts %.2f per layer-window", (long long) ba_win, (long long) (ba_swaps - ba_swaps_l),
+                         (long long) (ba_rounds - ba_rounds_l), (double) (h - ba_h_l) / (2000.0 * g.n_layers),
+                         (double) (m - ba_m_l) / (2000.0 * g.n_layers));
+        ba_swaps_l = ba_swaps; ba_rounds_l = ba_rounds; ba_h_l = h; ba_m_l = m;
+    }
+    return true;
+}
+// ---- end Jev ----
 
 int Runtime::init_tiers() {
     all_experts_resident = !host_res.empty() &&

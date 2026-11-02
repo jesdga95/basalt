@@ -22,7 +22,7 @@ The engine requires a version 2 `.basalt` pack. An existing version 1 pack can b
 | Multiple chat sessions | Existing chat parallelism remains. A decision wave waits for active chats, then leases the verifier exclusively. Native chat and decision work exclude each other at lease boundaries. |
 | Weights | Uses the loaded `.basalt` pack and its tokenizer/template. Experts, dense tensors, PLE/n-gram table, MTP and vision weights keep their stored formats. |
 | KV | Keeps the selected `kv` format, including `fp16`, and the existing context and memory policies. |
-| Experts and prefill | Keeps expert placement, resident experts, auto-sizing, prefill and adaptive-tier settings. Decision work can warm the same expert cache as chat. |
+| Experts and prefill | Uses the shared expert placement, resident experts, auto-sizing and prefill policy. Solo/prefix and segmented decision windows advance the same adaptive-tier maintenance as chat batch windows, honoring the existing adaptive settings. |
 | MTP | Keeps chat `spec` and the drafter. Decisions prepare target state only. A draft-valid prefix bounds which checkpoints a subsequent chat may reuse; chat-only cache entries and parked conversations keep their ordinary draft state. |
 | Prompt cache | Shared prefixes use existing checkpoints, including recurrent state, indexer tails and PLE history. Their count remains bounded by `prompt-cache`; `0` works by recomputing prefixes. More checkpoints improve reuse at the existing RAM cost. |
 | Conversation cache | Follows the existing RAM/disk policy; chat conversations can be parked or evicted as with other requests. Enabling Jev reserves no extra conversation pool. |

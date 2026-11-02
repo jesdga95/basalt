@@ -526,6 +526,7 @@ private:
     bool xq_round(std::vector<Swap>* ranked = nullptr);
     bool xq_advance(bool wait);
     bool xq_drain();
+    bool adaptive_window(std::string& e);
     void save_profile(const char* why);
     bool next_line(std::string& out);
     int next_line_within(std::string& out, int ms);
