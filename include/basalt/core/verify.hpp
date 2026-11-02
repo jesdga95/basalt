@@ -163,6 +163,8 @@ public:
     bool copy_logits(int t, float* host) const;
     // ---- Jev: probabilities require exact target rows, including screened heads ----
     bool copy_score_logits(int t, float* host, std::string& err);
+    bool run_score_prefix(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user,
+                          int32_t* out, std::string& err);
     struct ScoreBranch {
         std::vector<int32_t> tokens, candidates;
         std::vector<float> logits;
@@ -529,6 +531,12 @@ private:
     int64_t score_cells_ = 0;
     bool score_recurrent_ = false;
     bool score_prefill_ = false;
+    cudaGraphExec_t score_exec_[2][9] = {};
+    void release_score_prefix_graphs();
+    void release_score_branches();
+    cudaGraphExec_t& window_graph(int T) {
+        return score_prefill_ ? score_exec_[ar_off_ ? 1 : 0][T] : ar_off_ ? exec_nr_[T] : exec_[T];
+    }
     SessionState* score_base_ = nullptr;
     std::vector<SessionState> score_views_;
     std::vector<QsaState> score_qsa_;

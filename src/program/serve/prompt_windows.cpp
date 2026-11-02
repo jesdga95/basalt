@@ -44,7 +44,10 @@ bool Request::read_windows(int64_t a, int64_t b, std::string& e) {
             if (runtime_.ba_job) { runtime_.ba_thr.join(); runtime_.ba_job = false; }
         }
         // ---- end Jev ----
-        if (!runtime_.ver.run(T, win.data(), q, runtime_.win_pool_fn, runtime_.win_pool_user, outw.data(), e) || runtime_.drive.d.failed) {
+        const bool ok = runtime_.jev_scoring
+            ? runtime_.ver.run_score_prefix(T, win.data(), q, runtime_.win_pool_fn, runtime_.win_pool_user, outw.data(), e)
+            : runtime_.ver.run(T, win.data(), q, runtime_.win_pool_fn, runtime_.win_pool_user, outw.data(), e);
+        if (!ok || runtime_.drive.d.failed) {
             if (runtime_.drive.d.failed && runtime_.drive.d.fail) e = runtime_.drive.d.fail;
             return false;
         }

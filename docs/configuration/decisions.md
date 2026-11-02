@@ -55,6 +55,8 @@ conversations and other chat slots keep their caches. Cleanup waits on a deadlin
 
 The host submits independent tree nodes together; greedy paths proceed in dependent waves. Requests already
 queued at an engine boundary may share a sequence batch, with no collection timer or identical-request fan-out.
+Short prefix reads and intermediate branch windows advance target state without computing discarded vocabulary
+outputs. Final decisions still use the exact output head.
 Each caller completes when its own rows finish, rather than waiting for unrelated groups. Cache-opt-out rows
 establish their fresh prefix in a separate transaction.
 Forced single-token edges need no target score. Prefix checkpoints remain

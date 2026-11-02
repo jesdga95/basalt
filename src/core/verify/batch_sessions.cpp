@@ -132,6 +132,9 @@ bool Verifier::bind_session(SessionState* s, std::string& err) {
     if (s == nullptr || ss_ == nullptr) { err = "verify: bind_session without a session"; return false; }
     if (s == ss_) return true;
     if (!wait_commit(err)) return false;   // the last commit still works on the old session's state
+    // ---- Jev: prefix graphs bind the session they captured ----
+    release_score_prefix_graphs();
+    // ---- end Jev ----
     SoloGraphs cur;
     std::copy(std::begin(exec_), std::end(exec_), std::begin(cur.exec));
     std::copy(std::begin(exec_nr_), std::end(exec_nr_), std::begin(cur.exec_nr));

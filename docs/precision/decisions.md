@@ -22,6 +22,9 @@ before its scratch row can be reused. Exact-head replay covers terminal windows 
 screened heads. The shared prefix stays unchanged; private recurrence remains FP32.
 Intermediate windows skip vocabulary projection and sampling under a distinct graph-cache key. Their target
 layers and state commits retain native arithmetic; terminal windows and ordinary chat retain their heads.
+Short Jev prefix reads also skip the output head, using separate solo graphs for resident and doorbell execution.
+They commit target state normally; no output token is consumed. A session rebind releases these graphs, and the
+same idle/chat cleanup releases them with the branch workspace. Layer-split prefix reads retain upstream execution.
 
 Decision windows share the chat batch scheduler's adaptive expert-tier maintenance. Exchanges advance only
 between windows, with their copy worker joined before serial-verifier or prefill-loan transitions. The existing

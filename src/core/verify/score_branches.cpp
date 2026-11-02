@@ -8,6 +8,26 @@
 
 namespace basalt::core {
 
+bool Verifier::run_score_prefix(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user,
+                                int32_t* out, std::string& err) {
+    if (next_) return run(T, tokens, pos0, pool, user, out, err);
+    struct Restore {
+        Verifier& v;
+        bool sampling;
+        ~Restore() { v.score_prefill_ = false; v.head_sampling_ = sampling; }
+    } restore{*this, head_sampling_};
+    score_prefill_ = true;
+    head_sampling_ = false;
+    return run(T, tokens, pos0, pool, user, out, err);
+}
+
+void Verifier::release_score_prefix_graphs() {
+    const OnDevice on_device(device_);
+    for (auto& variant : score_exec_)
+        for (auto& graph : variant)
+            if (graph) { cudaGraphExecDestroy(graph); graph = nullptr; }
+}
+
 bool Verifier::score_branches_supported() const {
     if (!ss_ || next_ || lb_ != 0 || le_ != g_->n_layers || b_running_) return false;
     for (int64_t q = 0; q < g_->n_qsa_layers(); ++q) {
@@ -18,6 +38,11 @@ bool Verifier::score_branches_supported() const {
 }
 
 void Verifier::release_score_workspace() {
+    release_score_prefix_graphs();
+    release_score_branches();
+}
+
+void Verifier::release_score_branches() {
     if (!score_workspace_ && !score_arena_) return;
     const OnDevice on_device(device_);
     score_workspace_.reset();
@@ -71,7 +96,7 @@ bool Verifier::score_branches(std::vector<ScoreBranch>& branches, int64_t prefix
     constexpr uint64_t margin = 8ull << 20;
     if (!score_workspace_ || score_base_ != ss_ || score_cells_ < cells ||
         (int) score_views_.size() < S || recurrent != score_recurrent_) {
-        release_score_workspace();
+        release_score_branches();
         size_t free = 0, total = 0;
         if (cudaMemGetInfo(&free, &total) != cudaSuccess || free < bytes + margin + free_floor) return false;
         if (cudaMalloc(&score_arena_, bytes) != cudaSuccess) { cudaGetLastError(); return false; }
@@ -96,12 +121,12 @@ bool Verifier::score_branches(std::vector<ScoreBranch>& branches, int64_t prefix
         swap_score_workspace(*score_workspace_);
         if (!ok) {
             const auto failure = cudaGetLastError();
-            release_score_workspace();
+            release_score_branches();
             if (failure == cudaErrorMemoryAllocation) err.clear();
             return false;
         }
         if (cudaMemGetInfo(&free, &total) != cudaSuccess || free < free_floor) {
-            release_score_workspace(); return false;
+            release_score_branches(); return false;
         }
     }
     const auto copy = [&](void* dst, const void* src, uint64_t n) {
