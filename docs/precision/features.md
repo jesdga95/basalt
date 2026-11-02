@@ -36,16 +36,16 @@ arm), development measurement; mean over 6:
 
 Draft acceptance is unchanged within the run-to-run spread, so the gain is window time.
 
-Quality, against the Q8_0 reference through the decode path, 100 chunks, 400 W (three runs of the Q8_0-dense pack on three builds, KLD spread
-0.0009; two of them are in the quality table in [quality.md](quality.md)):
+Quality, against the BF16 reference through the decode path ([quality.md](quality.md#the-bf16-reference)), 100 chunks,
+400 W + 180 W, one build:
 
 | dense format | PPL | KLD mean | KLD p99 | same top-1 |
 |---|---:|---:|---:|---:|
-| Q8_0 | 3.287-3.294 | 0.0612-0.0621 | 0.692-0.699 | 91.80-91.87% |
-| Q6_K | 3.3081 | 0.0680 | 0.775 | 91.46% |
+| Q8_0 (NVFP4-DQ8) | 3.2970 | 0.0561 | 0.641 | 92.25% |
+| Q6_K (NVFP4-DQ6_K) | 3.3037 | 0.0624 | 0.728 | 91.65% |
 
-The paired per-chunk KLD difference is +0.0063 (95% CI +0.0048 to +0.0077), so the loss is outside the run-to-run noise:
-about 10% of the KLD and 0.4 points of top-1. On long prompts (12 chunks of 4,096 tokens, no Q8_0 reference, so PPL only)
+The paired per-chunk KLD difference is +0.0059 (95% CI +0.0043 to +0.0074, [isolated-costs.md](isolated-costs.md)), so
+the loss is outside the run-to-run noise: about 10% of the KLD and half a point of top-1. On long prompts (12 chunks of 4,096 tokens, no Q8_0 reference, so PPL only)
 PPL goes from 2.9547 to 2.9816; paired NLL +0.0091 (95% CI +0.0049 to +0.0132). Q6_K dense runs through dense_tc and
 dense_tc_pair; the same arithmetic applies as for any Q6_K dense tensor (q8_1 activations, int8 tensor-core dot).
 

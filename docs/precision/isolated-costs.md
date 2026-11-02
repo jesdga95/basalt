@@ -8,7 +8,8 @@ experts as published, BF16 dense weights, and fp32 activations and sums.
 ## Method
 
 - **Gate:** `tools/ppl_gate.py` (`basalt-bench --quality`), 100 chunks of wikitext-2, the 256-token prompt half read
-  by the prompt path and rows 256 to 510 scored through decode at T 3 against the llama.cpp Q8_0 base. RTX 5090 at
+  by the prompt path and rows 256 to 510 scored through decode at T 3 against the llama.cpp BF16 base of the original
+  model ([quality.md](quality.md#the-bf16-reference)). RTX 5090 at
   400 W with an RTX 5060 Ti at 180 W as the expert tier, `--kv int8 --resident-experts --expert-cache 7000`, tiers
   pinned. The default is the official pack (Q6_K dense) with these flags.
 - **Paired difference:** per chunk, the arm's mean KLD (and same-top-1 rate) minus the default's on the same rows;
@@ -34,18 +35,23 @@ square root everywhere, and fp32 indexer keys. The routed experts stay NVIDIA's 
 
 | arm | PPL | KLD mean | KLD p99 | same top-1 | paired dKLD [95% CI] | paired top-1, points [95% CI] |
 |---|---:|---:|---:|---:|---|---|
-| default (Q6_K dense, int8 KV) | 3.2975 | 0.06858 | 0.818 | 91.44% | | |
-| all off | 3.2866 | 0.06241 | 0.735 | 91.95% | -0.0062 [-0.0081, -0.0043] | +0.51 [+0.23, +0.80] |
-| all off, expert activations too ¹ | 3.2850 | 0.06211 | 0.728 | 91.77% | -0.0058 [-0.0072, -0.0044] | +0.27 [+0.02, +0.53] |
-| Q8_0-dense pack, nothing else changed | 3.2863 | 0.06229 | 0.712 | 91.77% | -0.0063 [-0.0082, -0.0044] | +0.33 [+0.06, +0.61] |
+| default (Q6_K dense, int8 KV) | 3.2975 | 0.06213 | 0.711 | 91.59% | | |
+| all off | 3.2866 | 0.05308 | 0.631 | 92.55% | -0.0091 [-0.0110, -0.0072] | +0.95 [+0.68, +1.22] |
+| all off, expert activations too ¹ | 3.2850 | 0.05382 | 0.633 | 92.30% | -0.0078 [-0.0093, -0.0064] | +0.43 [+0.15, +0.70] |
+| Q8_0-dense pack, nothing else changed | 3.2863 | 0.05629 | 0.669 | 92.14% | -0.0059 [-0.0074, -0.0043] | +0.55 [+0.28, +0.82] |
 
 ¹ One card with a 256-slot expert cache, so the CPU tier computes 98.8% of the expert rows, with each activation held
 as an int8 value plus an int8 residual (two dot products per row, error at most 1.6e-5 of the 32-value block's largest
 value); paired against the default flags at the same placement.
 
-Removing every reducible rounding lowers the KLD by about 0.006 (9%) and raises top-1 agreement by about half a point.
-The Q6_K dense projections account for all of it: the Q8_0-dense pack alone gets the same KLD, and every other item
-below is within noise.
+Removing every reducible rounding lowers the KLD by about 0.009 (15%) and raises top-1 agreement by about one point.
+The Q6_K dense projections are most of it: the Q8_0-dense pack alone lowers the KLD by 0.0059. All off against the
+Q8_0-dense pack is a further -0.0032 [-0.0047, -0.0018] and +0.40 [+0.18, +0.63] points of top-1, the remaining
+roundings together (BF16 against Q8_0 dense and the items below, each within noise on its own).
+
+Against the earlier llama.cpp Q8_0 base the same arms read KLD 0.0686 (default), 0.0624 (all off) and 0.0623 (Q8_0
+dense): that base carries its own rounding, which hid the last 0.003. PPL is the pack's own and does not depend on the
+base.
 
 Speed, one cold run per row (`bench.sh` fixtures through `basalt-bench`, the default serving flags, 400 W + 180 W, or
 the 5090 alone at 400 W). The all-off decode uses throwaway kernels (a warp-per-row fp32 matrix-vector product and the
@@ -70,12 +76,16 @@ than the default in the same session (ABBA numbers:
 ## Lossless and measurable
 
 Paired against the default unless a control is named; a negative dKLD means switching the rounding off lowers the KLD
-by that much. Items that change no output bit are listed with how that is known.
+by that much. Items that change no output bit are listed with how that is known. The Q6_K-against-Q8_0 row is against
+the BF16 base; the other rows were measured against the earlier llama.cpp Q8_0 base. A paired difference between two
+Basalt arms moves little with the base (the Q6_K-against-Q8_0 row moved from -0.0063 to -0.0059), except where the
+base's own rounding sits close to the arm's: the BF16-against-Q8_0-dense difference, within noise there, is part of
+the -0.0032 above.
 
 | item | switch | paired dKLD [95% CI] | top-1, points | verdict |
 |---|---|---|---|---|
 | Q6_K dense projections (vs BF16) | BF16-dense pack | -0.0069 [-0.0086, -0.0053] | +0.57 | measurable |
-| Q6_K dense projections (vs Q8_0) | Q8_0-dense pack | -0.0063 [-0.0082, -0.0044] | +0.33 | measurable |
+| Q6_K dense projections (vs Q8_0) | Q8_0-dense pack | -0.0059 [-0.0074, -0.0043] | +0.55 | measurable |
 | Q8_0 dense (vs BF16) | BF16-dense against Q8_0-dense | -0.0007 [-0.0022, +0.0009] | +0.24 | lossless |
 | int8 hyper-connection copy (hc8), decode | BF16 matrices, fp32 sums | +0.0002 [-0.0012, +0.0015] | +0.02 | lossless |
 | hc8 in decode and the prompt path | no 8-bit copy at all | +0.0006 [-0.0007, +0.0018] | -0.08 | lossless |
@@ -136,9 +146,9 @@ no fp32 KV; fp16 has three more mantissa bits than the BF16 the checkpoint compu
 
 ## Reading the result
 
-- **Dense projections:** the only default rounding that costs more than 0.001 KLD. Q6_K costs 0.0063 to 0.0069 KLD
-  and 0.3 to 0.6 points of top-1 against Q8_0 or BF16; BF16 dense is within noise of Q8_0 dense. The Q8_0-dense pack
-  recovers the whole loss at the cost in the speed table.
+- **Dense projections:** the only default rounding that costs more than 0.001 KLD on its own. Q6_K costs 0.0059 KLD
+  and 0.55 points of top-1 against Q8_0 dense (BF16 base). The Q8_0-dense pack recovers it at the cost in the speed
+  table; every other rounding together, BF16 dense included, is a further 0.003.
 - **hc8:** within noise in decode and in the prompt path.
 - **8-bit activations:** within noise for the dense projections, the shared expert and the NVFP4 experts (W4A8 against a
   two-term int8 split). The head's int8 input costs 0.0001, resolved only because its paired differences are very
