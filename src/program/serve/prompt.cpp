@@ -124,7 +124,10 @@ bool Request::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t head) 
     if (runtime_.pf_parts.empty()) return true;                     // its own buffers: nothing to lend
     // the ring depth this read's layout uses; every size computed below (and the layout) follows it, and
     // the full depth is restored on the way out for the sizing done elsewhere
-    const bool beside = runtime_.batch_on() && (tokens > runtime_.kReadAlone || resumed_chunk > 0);
+    // on a layer split the read is exclusive (read_part below), so the windows cannot lose the lent slots while it
+    // runs and the loan may size as on an idle engine; beside stays for the single-GPU overlap path, where a resumed
+    // read (it gave way and continues) parks its rest in the decode-sized loan even when the rest is short
+    const bool beside = runtime_.batch_on() && runtime_.stages.empty() && (tokens > runtime_.kReadAlone || resumed_chunk > 0);
     basalt::prefill::Prefill::set_ring_depth(beside ? runtime_.kRingDecoding : 1 << 20);
     struct RingReset { ~RingReset() { basalt::prefill::Prefill::set_ring_depth(1 << 20); } } ring_reset;
     // what this segment needs, capped by the configured chunk: a request lends only what its own
@@ -141,8 +144,9 @@ bool Request::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t head) 
     // engine may refill lent slots from the file, so a larger chunk is worth it.  The chunk shrinks to the
     // loan, but not below the smallest chunk the prompt path runs.
     int64_t loan_lim = std::numeric_limits<int64_t>::max();
-    if (runtime_.batch_on()) {
-        if (beside) loan_lim = runtime_.kLendCapDecoding;
+    if (beside) {   // windows decode beside this read: their hot slots are not lent, and a lent one is refilled from
+                    // RAM, never the file, before they decode again
+        loan_lim = runtime_.kLendCapDecoding;
         // the RAM-backed slots are the cache's last ones: those still live after the KV took its share
         if (runtime_.src.complement_ready())
             loan_lim = std::min<int64_t>(loan_lim, std::max<int64_t>(0, runtime_.src.resident_lent_slots() -
