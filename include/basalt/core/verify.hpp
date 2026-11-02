@@ -532,6 +532,7 @@ private:
     /// the stage is in VRAM.  A prompt loan, a VRAM shrink or an adaptive swap marks some -1: the windows then run the
     /// doorbell graph (exec_nr_ / the batch key's top bit).  refresh_ar() reads the host table before each window.
     bool ar_off_ = false;
+    bool ar_forced_ = false;   ///< --force-zero-doorbell: all_resident_ whatever the residency table says
     bool ar_on() const { return all_resident_ && !ar_off_; }
     void refresh_ar();
     uint32_t* h_plan_err_ = nullptr; uint32_t* m_plan_err_ = nullptr;   // set by resident_plan on a -1 (zero-doorbell graph)
