@@ -60,6 +60,28 @@ std::optional<int> select_gpus(Options& o, std::vector<GpuCard>& chosen_cards, i
                           ("expert tiers max " + std::to_string(ri.max_expert_tiers) + "; later cards idle").c_str());
     if (!o.peer_devices.empty()) o.peer_device = o.peer_devices[0];
     chosen_cards = ri.cards;
+    // The split hands a window's activations from one card to the next, and a tier card reads its experts d2d: both
+    // want peer access, which every pair must opt into once per process.  A pair the driver refuses is left alone and
+    // the copy goes the long way.
+    if (chosen_cards.size() > 1) {
+        int pairs = 0, tried = 0;
+        for (int a = 0; a < (int) chosen_cards.size(); ++a)
+            for (int b = 0; b < (int) chosen_cards.size(); ++b) {
+                if (a == b) continue;
+                int prev = 0;
+                cudaGetDevice(&prev);
+                if (cudaSetDevice(a) != cudaSuccess) { (void) cudaGetLastError(); continue; }
+                int can = 0;
+                if (cudaDeviceCanAccessPeer(&can, a, b) == cudaSuccess && can) {
+                    ++tried;
+                    const cudaError_t e = cudaDeviceEnablePeerAccess(b, 0);
+                    if (e == cudaSuccess || e == cudaErrorPeerAccessAlreadyEnabled) ++pairs;
+                    (void) cudaGetLastError();
+                } else (void) cudaGetLastError();
+                (void) cudaSetDevice(prev);
+            }
+        basalt::log::info("basalt", "peer access: %d of %d ordered pairs enabled", pairs, tried);
+    }
     return std::nullopt;
 }
 
