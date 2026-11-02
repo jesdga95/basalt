@@ -512,6 +512,12 @@ void BASALT_IQ_EXPORT(iq256_rows)(int type, const uint8_t* w, size_t row_bytes, 
 
 void BASALT_IQ_EXPORT(iq4nl256_down_rows)(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt, float* const* out,
                         int r0, int r1) {
+    // the tokens' block scales are held on the stack: rows of at most iq4nl_max_blocks blocks (iq4nl256_fits)
+    if (n % QK4_NL != 0 || n / QK4_NL > iq4nl_max_blocks) {
+        basalt::log::error("basalt", "iq4nl256_down_rows: rows of %d values; at most %d, in blocks of %d", n,
+                           iq4nl_max_blocks * QK4_NL, QK4_NL);
+        std::exit(1);
+    }
     const block_q8_0* y[8];
     for (int t = 0; t < nt; ++t) y[t] = (const block_q8_0*) hq[t];
     switch (nt) {
