@@ -1,7 +1,7 @@
 # Precision and quality
 
 This page shows what precision Basalt computes in, that speculative decoding (MTP) does not change its output, and how
-its quality compares with llama.cpp on the same GGUFs against the same Q8_0 reference.
+its quality compares with llama.cpp on the same GGUFs against the same reference: the original model in BF16.
 
 Test setup: one RTX 5090 at a 400 W power limit, an RTX 5060 Ti as the peer expert tier, 128 GB of system RAM
 (121 GiB visible to the OS). Each section names the build it measured.
@@ -31,8 +31,9 @@ Test setup: one RTX 5090 at a 400 W power limit, an RTX 5060 Ti as the peer expe
   (q8_1) into the quantized matmuls. GDN state is fp32. KV is fp16 by default, with int8, q4_0 and k8v4 options.
 - **Quality is scored through decode.** Prefill is a different computation (fp16/BF16 GEMMs, int8 MMQ, and FP4 tensor cores for NVFP4 experts); the quality gate scores
   the decode path.
-- **The reference has its own noise.** The reference is a llama.cpp Q8_0 base, which carries about 0.01 to 0.02 KLD of
-  its own noise ([details](quality.md#why-q8_0-against-q8_0-is-not-zero)).
+- **The reference is full precision.** Quality is measured against a llama.cpp BF16 base of the original model
+  ([every pack](quality.md#the-bf16-reference)). Sections that name base PPL 3.2861 used the earlier llama.cpp Q8_0
+  base, which carries about 0.01 KLD of its own rounding ([details](quality.md#why-q8_0-against-q8_0-is-not-zero)).
 
 ## Decode path precision
 
