@@ -136,6 +136,47 @@ bool Runtime::cache_regrow(std::string& e) {
     return true;
 }
 
+// The experts the KV just took CUDA0's slots from take the peer's slots of less-routed experts (by the routing counts,
+// then the profile's rank), so the next most-routed experts stay on a GPU while the KV holds CUDA0's tail.  Between
+// windows: the copies come from the RAM copy and land before it returns.
+bool Runtime::peer_take(const std::vector<int32_t>& off, std::string& e) {
+    if (off.empty() || !peer.valid() || peer.exclusive() || peer.asleep() || !xpeers.empty()) return true;
+    const auto t0 = Clock::now();
+    auto used = [&](int32_t i) { return drive.d.usage.empty() ? 0.0f : drive.d.usage[(size_t) i]; };
+    auto rank = [&](int32_t i) { return prof_rank.empty() ? 0 : prof_rank[(size_t) i]; };
+    auto better = [&](int32_t a, int32_t b) {
+        const float ua = used(a), ub = used(b);
+        return ua != ub ? ua > ub : rank(a) < rank(b);
+    };
+    peer.apply_pending(true);
+    const std::vector<int32_t>& pres = peer.residency();
+    // one pool when every layer's blobs are one size (a slot takes any layer's expert), else one per layer
+    const int64_t pools = xq_across ? 1 : g.n_layers;
+    auto pool_of = [&](size_t i) { return xq_across ? (size_t) 0 : i / (size_t) g.n_expert; };
+    std::vector<std::vector<int32_t>> in((size_t) pools), on((size_t) pools);
+    for (const int32_t i : off)
+        if (pres[(size_t) i] < 0) in[pool_of((size_t) i)].push_back(i);
+    for (size_t i = 0; i < pres.size(); ++i)
+        if (pres[i] >= 0 && !in[pool_of(i)].empty()) on[pool_of(i)].push_back((int32_t) i);
+    std::vector<std::pair<int32_t, int32_t>> want;   // (peer slot, the expert it takes)
+    for (int64_t p = 0; p < pools; ++p) {
+        std::vector<int32_t>& a = in[(size_t) p];
+        std::vector<int32_t>& b = on[(size_t) p];
+        const size_t n = std::min(a.size(), b.size());
+        if (n == 0) continue;
+        std::sort(a.begin(), a.end(), [&](int32_t x, int32_t y) { return better(x, y) || (!better(y, x) && x < y); });
+        std::partial_sort(b.begin(), b.begin() + (ptrdiff_t) n, b.end(),
+                          [&](int32_t x, int32_t y) { return better(y, x) || (!better(x, y) && x > y); });
+        for (size_t k = 0; k < n && better(a[k], b[k]); ++k) want.emplace_back(pres[(size_t) b[k]], a[k]);
+    }
+    if (want.empty()) return true;
+    int64_t moved = 0;
+    if (!peer.place(want, moved, e)) { e = "elastic KV: " + e; return false; }
+    basalt::log::info("basalt serve", "elastic KV: the peer took %lld of the %zu experts the KV moved off CUDA0 (%.1f ms)",
+                      (long long) moved, off.size(), std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+    return true;
+}
+
 // `shrink` false: only VRAM that is free now (a prompt read is running beside the windows, its loan in the
 // cache's last slots) - false with `e` empty when that is not enough
 // `min_cells`: when `cells` would take the cache below its floor, as many as leave it, down to these
@@ -146,6 +187,7 @@ bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& 
     int64_t add = (int64_t) basalt::core::session_kv_grow_bytes(s, cells);
     if (add <= 0) return true;
     const auto t0 = Clock::now();
+    const int64_t had = basalt::core::session_kv_cells(s);
     if (shrink && !kv_drain(e)) return false;
     const int64_t before = xcache.slots();
     size_t free_b = 0, total_b = 0;
@@ -208,13 +250,18 @@ bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& 
         if (kv_keep_routed && !move_routed_below(xcache.slots_after_shrink(keep), "elastic KV", e)) return false;
         if (!xcache.shrink(keep, e)) return false;
         const int64_t live = xcache.slots();
+        std::vector<int32_t> off;
         for (size_t i = 0; i < host_res.size(); ++i)
             if (host_res[i] >= live) {
                 vram_evicted.emplace_back((int32_t) i, host_res[i]);
                 host_res[i] = basalt::core::kNotResident;
+                off.push_back((int32_t) i);
             }
         res_upload();
         relend();
+        // a long prompt's cells take a block of CUDA0's cache: its experts go to the peer; a short request's few
+        // are left to the adaptive rounds
+        if (cells - had >= kPeerTakeCells && !peer_take(off, e)) return false;
     }
     if (!basalt::core::session_kv_map(s, cells, e)) { e = "elastic KV: " + e; return false; }
     if (parked > 0 && !cache_regrow(e)) return false;   // the rest of what they held is the cache's again

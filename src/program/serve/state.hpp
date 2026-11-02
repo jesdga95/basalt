@@ -346,6 +346,7 @@ private:
     int64_t chunk_full{};
     int64_t kKvGrowCells{};
     static constexpr int64_t kKvWindowCells = 2* basalt::kernels::kVerifyMaxT + 64;   // a decoding session's next window
+    static constexpr int64_t kPeerTakeCells = 32768;   // a fit backing this many new cells hands its experts to the peer
     int64_t kv_moves{};
     bool kv_short{};
     bool kv_keep_routed{};   // an admission while slots decode: a shrink keeps their routed experts
@@ -534,6 +535,7 @@ private:
                            const std::vector<serve_loans::LentEntry>* lent_out = nullptr);
     bool kv_drain(std::string& e);
     bool cache_regrow(std::string& e);
+    bool peer_take(const std::vector<int32_t>& off, std::string& e);
     bool kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& e, bool shrink = true, int64_t min_cells = -1);
     bool kv_release(basalt::core::SessionState& s, int64_t cells, std::string& e);
     uint64_t row_hash(int t);
