@@ -134,7 +134,7 @@ bool Runtime::cache_regrow(std::string& e) {
     if (!xcache.sync_queued(ferr)) { e = "elastic KV: " + ferr; return false; }
     res_upload();
     relend();
-    // Release homes for slots below the loan once their experts are resident again.
+    // the experts back in slots below the loan give their RAM homes back
     if (src.complement_ready() && src.homes_bytes() > 0) {
         const int64_t loan_from = pf_parts.empty() || pf_parts[0].first < 0 ? INT64_MAX : pf_parts[0].first;
         size_t released = 0;
@@ -220,14 +220,14 @@ bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& 
         const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
         const int64_t keep = std::max<int64_t>(0, (xcache.mapped_bytes() - (add - room)) / gran * gran);
         if (kv_keep_routed && !move_routed_below(xcache.slots_after_shrink(keep), "elastic KV", e)) return false;
-        // Home bare victims before shrinking; admission handles bare loan slots.
+        // the experts past the cut and in the loan that RAM holds no copy of take RAM homes first
         if (src.complement_ready() &&
             basalt::program::cut_gives_up_bare(host_res, xcache.slots_after_shrink(keep), g.n_expert,
                                                [&](int64_t l, int64_t x) { return src.has_resident(l, x); })) {
             std::string he;
             if (!home_given_up(xcache.slots_after_shrink(keep), he, true))
-                basalt::log::warn("basalt serve", "elastic KV: no RAM homes for the experts the tail gives up "
-                                     "without a copy (%s): they are read from the file", he.c_str());
+                basalt::log::warn("basalt serve", "elastic KV: RAM homes for the experts the cache gives up without "
+                                  "a RAM copy: %s; the others are read from the file", he.c_str());
         }
         if (!xcache.shrink(keep, e)) return false;
         const int64_t live = xcache.slots();

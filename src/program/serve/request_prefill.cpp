@@ -19,7 +19,8 @@ Flow Request::read_prompt() {
         return Flow::error;
     }
 
-    // Home only loan victims without a resident copy, after outstanding work has drained.
+    // the loan's experts that RAM holds no copy of (the RAM plan kept the lent copies only as far as RAM allowed)
+    // take RAM homes before the read, once the work in flight has drained
     int64_t loan_chunk = 0;
     if (runtime_.kv_floor > 0 && runtime_.src.complement_ready() &&
         !runtime_.pf_parts.empty() && runtime_.pf_parts[0].first >= 0 &&
@@ -29,7 +30,8 @@ Flow Request::read_prompt() {
         const bool loan_active = std::any_of(runtime_.pf_parts.begin(), runtime_.pf_parts.end(),
                                              [](const auto& part) { return !part.lent.empty(); });
         if (loan_active) {
-            basalt::log::warn("basalt serve", "elastic KV: an active prompt loan leaves unhomed experts on file");
+            basalt::log::warn("basalt serve", "elastic KV: a prompt loan is out: the loan's experts without a RAM "
+                              "copy are read from the file");
         } else {
             if (!runtime_.kv_drain(runtime_.err)) {
                 std::printf("ERR %s\n", runtime_.err.c_str());
@@ -37,8 +39,8 @@ Flow Request::read_prompt() {
             }
             std::string he;
             if (!runtime_.home_given_up(runtime_.xcache.slots(), he, true))
-                basalt::log::warn("basalt serve", "elastic KV: no RAM homes for the loan's experts without a copy (%s): "
-                                  "the prompt reads them from the file", he.c_str());
+                basalt::log::warn("basalt serve", "elastic KV: RAM homes for the loan's experts without a RAM copy: "
+                                  "%s; the prompt reads the others from the file", he.c_str());
         }
     }
 
