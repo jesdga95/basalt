@@ -53,10 +53,6 @@ bool Verifier::stage_batch(const int* slots, const int* lens, int S, int hbase, 
         }
     refresh_ar();
     if (!capture_batch(R, hbase, err) || !capture_commit_batch(R, err)) return false;
-    if (R > S && !batch_seg_ple_) {
-        err = "verify: batch segments of several rows need the PLE window kernels";
-        return false;
-    }
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
     const int64_t CB = 2 + max_t_;

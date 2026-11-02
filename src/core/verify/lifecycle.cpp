@@ -255,6 +255,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         hist_snap_ = b.take<float>(T * HS);
         ple_win_ = b.take<float>(2 * T * HC * N);
         ple_key_ = b.take<float>(T * HC * N); ple_val_ = b.take<float>(T * N);
+        ple_q8_ = b.take<uint8_t>(basalt::kernels::native_q8_1_bytes((int) N, (int) T));
     };
     Bump count;
     carve(count);

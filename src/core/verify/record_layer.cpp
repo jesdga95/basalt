@@ -55,20 +55,14 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
             if (v_.ar_on() || dm) wait_flag_ge(v_.m_flag_, 1, cs);
             copy_from_mapped(v_.ple_, v_.m_ple_, (int64_t) T * N, cs);
         }
-        float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
-        const bool ple_batch_kv = n > 1 && ss.ple.w.key_bf16 != nullptr &&
-                                  ss.ple.w.value_bf16 != nullptr;
-        // the rows' write, post-ops, history advance and snapshots in two launches, the value
-        // projection on the side stream beside the key's
-        // (one row too: there the multi-row GEMVs are ple_block's own)
-        const bool ple_win = ple_batch_kv || (n == 1 && ss.ple.w.key_bf16 != nullptr && ss.ple.w.value_bf16 != nullptr);
-        if (v_.batch_rec_) v_.batch_seg_ple_ = ple_win;
+        // the rows' write, post-ops, history advance and snapshots in two launches, the value projection on the side
+        // stream beside the key's
         cudaStream_t pside = v_.sh_hi_ != nullptr ? v_.sh_hi_ : v_.sh_cs_;
-        const bool ple_fork = ple_win && pside != nullptr && v_.ev_fork_ != nullptr && v_.ev_join_ != nullptr;
+        const bool ple_fork = pside != nullptr && v_.ev_fork_ != nullptr && v_.ev_join_ != nullptr;
         if (ple_side) {
             cudaStreamWaitEvent(cs, v_.ev_ple_join_, 0);
             ple_open = false;
-        } else if (ple_batch_kv || ple_win) {
+        } else {
             try {
                 if (ple_fork) {
                     cudaEventRecord(v_.ev_fork_, cs);
@@ -77,8 +71,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
                                               v_.z_, N, N, N, n, pside);
                     cudaEventRecord(v_.ev_join_, pside);
                 }
-                bf16_gemv_fp32_mmvf_multi(v_.ple_, N, ss.ple.w.key_bf16,
-                                          v_.xn_, HC * N, N, HC * N, n, cs);
+                ple_key_rows(v_.ple_, n, ss.ple.w, v_.xn_, v_.ple_q8_, cs);
                 if (ple_fork) cudaStreamWaitEvent(cs, v_.ev_join_, 0);
                 else bf16_gemv_fp32_mmvf_multi(v_.ple_, N, ss.ple.w.value_bf16,
                                                v_.z_, N, N, N, n, cs);
@@ -87,39 +80,17 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
                 return false;
             }
         }
-        if (ple_win) {
-            PleWindowArgs pa;
-            pa.R = Rt(0); pa.block_out = v_.bo_; pa.inject = v_.inj2_;
-            pa.key = ple_side ? v_.ple_key_ : v_.xn_;
-            pa.value = ple_side ? v_.ple_val_ : v_.z_;
-            pa.history = v_.batch_rec_ ? v_.ple_work_ : ss.ple.hist; pa.segs = v_.batch_rec_ ? v_.segb_ : nullptr;
-            pa.hist_snap = v_.hist_snap_; pa.scratch = v_.ple_win_; pa.T = n;
-            try {
-                native_ple_window(pa, ss.ple.w, cs);
-            } catch (const std::exception& e) {
-                err = std::string("verify PLE window: ") + e.what();
-                return false;
-            }
-        }
-        for (int t = 0; t < T && !ple_win; ++t) {
-            gr_write(Rt(t), v_.bo_ + t * N, v_.inj2_ + t * HC, gs, Rt(t), cs);
-            PleOut po;
-            po.normalized = normalized;
-            po.result = Rt(t);
-            float* hist = v_.batch_rec_ ? v_.ple_work_ + (size_t) t * HS : ss.ple.hist;   // the row's own history
-            try {
-                if (ple_batch_kv) {
-                    ple_block_projected(v_.xn_ + (size_t) t * HC * N, v_.z_ + (size_t) t * N, Rt(t), hist,
-                                        ss.ple.w, po, ss.ple.scratch, cs);
-                } else {
-                    ple_block(v_.ple_ + t * N, Rt(t), hist, ss.ple.w, po, ss.ple.scratch, cs);
-                }
-                ple_history_advance(hist, normalized, cs);
-            } catch (const std::exception& e) {
-                err = std::string("verify PLE: ") + e.what();
-                return false;
-            }
-            copy_from_mapped(v_.hist_snap_ + (size_t) t * HS, hist, HS, cs);
+        PleWindowArgs pa;
+        pa.R = Rt(0); pa.block_out = v_.bo_; pa.inject = v_.inj2_;
+        pa.key = ple_side ? v_.ple_key_ : v_.xn_;
+        pa.value = ple_side ? v_.ple_val_ : v_.z_;
+        pa.history = v_.batch_rec_ ? v_.ple_work_ : ss.ple.hist; pa.segs = v_.batch_rec_ ? v_.segb_ : nullptr;
+        pa.hist_snap = v_.hist_snap_; pa.scratch = v_.ple_win_; pa.T = n;
+        try {
+            native_ple_window(pa, ss.ple.w, cs);
+        } catch (const std::exception& e) {
+            err = std::string("verify PLE window: ") + e.what();
+            return false;
         }
         pending = false;
     }
