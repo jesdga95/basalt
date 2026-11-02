@@ -47,11 +47,10 @@ value); paired against the default flags at the same placement.
 Removing every reducible rounding lowers the KLD by about 0.009 (15%) and raises top-1 agreement by about one point.
 The Q6_K dense projections are most of it: the Q8_0-dense pack alone lowers the KLD by 0.0059. All off against the
 Q8_0-dense pack is a further -0.0032 [-0.0047, -0.0018] and +0.40 [+0.18, +0.63] points of top-1, the remaining
-roundings together (BF16 against Q8_0 dense and the items below, each within noise on its own).
+roundings together (BF16 against Q8_0 dense, -0.0014, and the items below).
 
-Against the earlier llama.cpp Q8_0 base the same arms read KLD 0.0686 (default), 0.0624 (all off) and 0.0623 (Q8_0
-dense): that base carries its own rounding, which hid the last 0.003. PPL is the pack's own and does not depend on the
-base.
+Against the earlier llama.cpp Q8_0 base all off and the Q8_0-dense pack read the same (0.0624 against 0.0623): that
+base carries its own rounding, which hid the last 0.003.
 
 Speed, one cold run per row (`bench.sh` fixtures through `basalt-bench`, the default serving flags, 400 W + 180 W, or
 the 5090 alone at 400 W). The all-off decode uses throwaway kernels (a warp-per-row fp32 matrix-vector product and the
@@ -76,32 +75,28 @@ than the default in the same session (ABBA numbers:
 ## Lossless and measurable
 
 Paired against the default unless a control is named; a negative dKLD means switching the rounding off lowers the KLD
-by that much. Items that change no output bit are listed with how that is known. The Q6_K-against-Q8_0 row is against
-the BF16 base; the other rows were measured against the earlier llama.cpp Q8_0 base. A paired difference between two
-Basalt arms moves little with the base (the Q6_K-against-Q8_0 row moved from -0.0063 to -0.0059), except where the
-base's own rounding sits close to the arm's: the BF16-against-Q8_0-dense difference, within noise there, is part of
-the -0.0032 above.
+by that much. Items that change no output bit are listed with how that is known.
 
 | item | switch | paired dKLD [95% CI] | top-1, points | verdict |
 |---|---|---|---|---|
-| Q6_K dense projections (vs BF16) | BF16-dense pack | -0.0069 [-0.0086, -0.0053] | +0.57 | measurable |
+| Q6_K dense projections (vs BF16) | BF16-dense pack | -0.0072 [-0.0086, -0.0058] | +0.82 | measurable |
 | Q6_K dense projections (vs Q8_0) | Q8_0-dense pack | -0.0059 [-0.0074, -0.0043] | +0.55 | measurable |
-| Q8_0 dense (vs BF16) | BF16-dense against Q8_0-dense | -0.0007 [-0.0022, +0.0009] | +0.24 | lossless |
-| int8 hyper-connection copy (hc8), decode | BF16 matrices, fp32 sums | +0.0002 [-0.0012, +0.0015] | +0.02 | lossless |
-| hc8 in decode and the prompt path | no 8-bit copy at all | +0.0006 [-0.0007, +0.0018] | -0.08 | lossless |
-| int8 activations into GDN and QSA projections | fp32 activations (control: fused kernels off) | -0.0003 [-0.0012, +0.0007] | -0.22 | lossless |
-| int8 activations into the shared expert | fp32 activations (same control) | +0.0005 [-0.0005, +0.0015] | -0.20 | lossless |
-| int8 activations into the head | fp32 activations (same control) | -0.00009 [-0.00013, -0.00006] | 0.00 | measurable (0.1% of the KLD) |
-| int8 activations into all three | fp32 activations (same control) | -0.0010 [-0.0018, -0.0001] | -0.18 | measurable, at the edge of noise |
-| int8 activations into the routed experts (W4A8) | two-term split (control: same placement) | +0.0004 [-0.0008, +0.0017] | -0.08 | lossless |
-| fast math in 18 kernel files, `__expf`, `__fdividef`, `rsqrtf`, approximate `ex2`/`rcp` | exact-math build (control: fp32 indexer keys build) | +0.0002 [-0.0010, +0.0014] | -0.07 | lossless |
-| int8 KV (sample config) against fp16 KV | `--kv fp16` | +0.0004 [-0.0009, +0.0017] | +0.13 | lossless |
-| k8v4 KV | `--kv k8v4` | +0.0052 [+0.0033, +0.0071] | -0.37 | measurable |
-| q4_0 KV | `--kv q4_0` | +0.0096 [+0.0075, +0.0117] | -0.65 | measurable |
-| prompt path (fp16 GEMMs, BF16 hc and router inputs, fp16 shared expert, MMQ experts, fp16-MMA attention, chunked GDN on BF16/TF32 tensor cores) | prompt half teacher-forced through decode | +0.0006 [-0.0006, +0.0019] | -0.01 | lossless |
-| CPU tier against GPU tiers (Q8_0 vs q8_1 activations, kernel order) | 98.8% of expert rows on the CPU, one card | -0.0007 [-0.0020, +0.0006] | +0.06 | lossless |
-| dense_tc against native_mmvq reduction order | dense_tc off | +0.0008 [-0.0001, +0.0018] | -0.09 | lossless |
-| fused against unfused kernels (hc read int8 rows, GDN recurrence, mid chain, attention int8 output, split query projection, glue gate/up) | the activation switches' control | +0.0003 [-0.0006, +0.0012] | +0.11 | lossless (not bitwise: 0.3% of rows equal) |
+| Q8_0 dense (vs BF16) | BF16-dense against Q8_0-dense | -0.0014 [-0.0025, -0.0003] | +0.27 | measurable |
+| int8 hyper-connection copy (hc8), decode | BF16 matrices, fp32 sums | -0.0002 [-0.0014, +0.0011] | +0.02 | lossless |
+| hc8 in decode and the prompt path | no 8-bit copy at all | -0.0014 [-0.0027, -0.0001] | +0.15 | measurable, at the edge of noise |
+| int8 activations into GDN and QSA projections | fp32 activations (control: fused kernels off) | -0.0004 [-0.0014, +0.0006] | -0.04 | lossless |
+| int8 activations into the shared expert | fp32 activations (same control) | +0.0005 [-0.0004, +0.0014] | -0.02 | lossless |
+| int8 activations into the head | fp32 activations (same control) | -0.00009 [-0.00012, -0.00005] | 0.00 | measurable (0.1% of the KLD) |
+| int8 activations into all three | fp32 activations (same control) | -0.0010 [-0.0019, -0.0002] | +0.15 | measurable, at the edge of noise |
+| int8 activations into the routed experts (W4A8) | two-term split (control: same placement) | +0.0002 [-0.0008, +0.0012] | -0.15 | lossless |
+| fast math in 18 kernel files, `__expf`, `__fdividef`, `rsqrtf`, approximate `ex2`/`rcp` | exact-math build (control: fp32 indexer keys build) | -0.0003 [-0.0012, +0.0006] | +0.11 | lossless |
+| int8 KV (sample config) against fp16 KV | `--kv fp16` | +0.0000 [-0.0010, +0.0010] | +0.15 | lossless |
+| k8v4 KV | `--kv k8v4` | +0.0056 [+0.0038, +0.0073] | -0.20 | measurable |
+| q4_0 KV | `--kv q4_0` | +0.0093 [+0.0074, +0.0112] | -0.38 | measurable |
+| prompt path (fp16 GEMMs, BF16 hc and router inputs, fp16 shared expert, MMQ experts, fp16-MMA attention, chunked GDN on BF16/TF32 tensor cores) | prompt half teacher-forced through decode | -0.0000 [-0.0010, +0.0009] | +0.13 | lossless |
+| CPU tier against GPU tiers (Q8_0 vs q8_1 activations, kernel order) | 98.8% of expert rows on the CPU, one card | -0.0005 [-0.0015, +0.0005] | +0.28 | lossless |
+| dense_tc against native_mmvq reduction order | dense_tc off | +0.0003 [-0.0004, +0.0010] | +0.14 | lossless |
+| fused against unfused kernels (hc read int8 rows, GDN recurrence, mid chain, attention int8 output, split query projection, glue gate/up) | the activation switches' control | +0.0000 [-0.0008, +0.0008] | +0.10 | lossless (not bitwise: 0.3% of rows equal) |
 | verify window width | T 1 against T 3, 20 chunks | 0 | 0 | lossless: 5,100 of 5,100 rows bitwise equal |
 | fp16-rounded indexer keys | fp32 keys | 0 | 0 | no effect below 2,048 tokens: 25,500 of 25,500 rows bitwise equal |
 | two-stage Q8_0 head (screen on six bits) | none needed | | | lossless by proof: every consumer reads the exact head ([two-stage head](two-stage-head.md#q8_0-head-bit-planes-exact)); the gate scores the exact pass |
@@ -146,12 +141,12 @@ no fp32 KV; fp16 has three more mantissa bits than the BF16 the checkpoint compu
 
 ## Reading the result
 
-- **Dense projections:** the only default rounding that costs more than 0.001 KLD on its own. Q6_K costs 0.0059 KLD
-  and 0.55 points of top-1 against Q8_0 dense (BF16 base). The Q8_0-dense pack recovers it at the cost in the speed
-  table; every other rounding together, BF16 dense included, is a further 0.003.
-- **hc8:** within noise in decode and in the prompt path.
+- **Dense projections:** the largest default rounding. Q6_K costs 0.0059 KLD and 0.55 points of top-1 against Q8_0
+  dense, 0.0072 and 0.82 against BF16; Q8_0 against BF16 dense is 0.0014. The Q8_0-dense pack recovers most of it at
+  the cost in the speed table; every other rounding together, BF16 dense included, is a further 0.003.
+- **hc8:** within noise in decode; with the prompt path too, 0.0014 at the edge of the interval.
 - **8-bit activations:** within noise for the dense projections, the shared expert and the NVFP4 experts (W4A8 against a
   two-term int8 split). The head's int8 input costs 0.0001, resolved only because its paired differences are very
   consistent; all three dense consumers together cost 0.0010, at the edge of the interval.
-- **KV:** int8 is within noise of fp16 at this length; k8v4 and q4_0 cost 0.005 and 0.010.
+- **KV:** int8 is within noise of fp16 at this length; k8v4 and q4_0 cost 0.006 and 0.009.
 - **Fast math and approximate intrinsics, reduction order, the prompt path, CPU against GPU tiers:** within noise.

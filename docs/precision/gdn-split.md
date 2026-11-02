@@ -23,9 +23,10 @@ NVFP4 pack, 400 W main card and 180 W peer). Every change below applies only whe
   code matches. The parity test counts one step like a one-step value flip and fails on a larger step: 60 of 60 cases pass
   in both card orders, with that tie as the only scale difference.
 
-Quality gate, swapped card order (400 W peer card, 180 W main card), NVFP4 pack, 20 chunks, T 3, int8 KV, `--spec 0`,
-base build / split: PPL 2.3016 / 2.3071, KLD 0.07656 / 0.07640, top-1 92.71% / 92.73%. The paired per-row KLD difference is
--0.00016 +- 0.0012 and 143 of 5,100 rows change their argmax: reduction-order noise, no shift.
+Quality gate against the BF16 reference, swapped card order (400 W peer card, 180 W main card), NVFP4 pack, 20 chunks,
+T 3, int8 KV, `--spec 0`, whole mixer / split: PPL 2.3129 / 2.2999, KLD 0.07294 / 0.07262, top-1 92.94% / 92.96%. The
+paired per-row KLD difference is -0.00032 +- 0.0014 and 145 of 5,100 rows change their argmax: reduction-order noise
+(and the placement the split changes on the peer), no shift.
 
 Long-context check, same card order, greedy through the serve path (spec 7, int8 KV, a fresh engine per build), the first
 100,000 and 65,000 tokens of a 200K document as a bare prompt, 128 tokens. The text splits early: at token 8 (100K) and

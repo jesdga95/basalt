@@ -65,24 +65,25 @@ python3 -c "import sys; sys.path.insert(0,'tools'); from model_file import Model
 
 ## Reproduce
 
-Build llama.cpp, then the Q8_0 base from the Q8_0 GGUF (100 chunks):
+Build llama.cpp, then the BF16 base from unsloth's BF16 GGUF (100 chunks; the model does not fit RAM and VRAM, so the
+experts stream from disk, and a large batch reads them once per 16 chunks):
 
 ```sh
-llama-perplexity -m MODEL-Q8_0-00001-of-0000N.gguf -f wikitext-2-raw/wiki.test.raw \
-    --kl-divergence-base flashnext-q8-base.kld -c 512 -b 2048 -ngl 99 --n-cpu-moe 99 -t 16
+llama-perplexity -m Qwen3.8-Flash-Next-BF16-00001-of-00008.gguf -f wikitext-2-raw/wiki.test.raw \
+    --kl-divergence-base flashnext-bf16-base.kld -c 512 -b 8192 -ub 8192 --chunks 100 -ngl 99 --n-cpu-moe 99 -t 16
 ```
 
 llama.cpp's numbers for a pack:
 
 ```sh
-llama-perplexity -m PACK.gguf -f wikitext-2-raw/wiki.test.raw --kl-divergence-base flashnext-q8-base.kld \
-    --kl-divergence -c 512 -b 2048 -ngl 99 --n-cpu-moe 99 -t 16
+llama-perplexity -m PACK.gguf -f wikitext-2-raw/wiki.test.raw --kl-divergence-base flashnext-bf16-base.kld \
+    --kl-divergence -c 512 -b 8192 -ub 8192 --chunks 100 -ngl 99 --n-cpu-moe 99 -t 16
 ```
 
 Basalt's numbers, and the forced-window identity check (run with `--t` 1, 3 and 7, then diff the rows):
 
 ```sh
-python3 tools/ppl_gate.py --model PACK.basalt --engine-bin bin/basalt --base flashnext-q8-base.kld \
+python3 tools/ppl_gate.py --model PACK.basalt --engine-bin bin/basalt --base flashnext-bf16-base.kld \
     --chunks 20 --t {1|3|7} --out DIR --expert-cache N --kv int8 --resident-experts \
     --peer-exclusive --prefill auto
 python3 tools/ppl_gate.py --diff DIR1/rows.tsv DIR7/rows.tsv

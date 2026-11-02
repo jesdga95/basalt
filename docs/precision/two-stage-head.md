@@ -65,7 +65,7 @@ prompts, 1,200 tokens), seeded sampled replies the same text (temperature 0.6 an
 1,200 tokens), and one request per consumer in the table above the same tokens (18 requests of 400 tokens: greedy,
 top_k 1, 5, 20 at temperature 1.0, 64, 100 and 0, min_p alone, three penalty settings and neutral ones, two logit
 biases, a json_object grammar sampled and greedy, relaxed drafting); the quality gate's 5,100 rows (20 chunks) are byte
-identical (PPL 2.30097, KLD 0.0750037).
+identical.
 
 ### Split with a slower peer card
 
@@ -112,16 +112,14 @@ Q6_K x q8_1 in float:
 Margins 6 and 8 rescore 5,569-18,649 and 27,962-78,806 rows per column. Neither a least-squares scale for the copy nor a
 per-column correction of the tail's bias lowers the KLD (the tail's mass is unbiased; the cost is its noise).
 
-Quality gate (IQ3_S, 100 chunks, against the Q8_0 base, tiers pinned (expert cache 9000 slots, peer 7562), 400 W;
-the gate leaves the PCIe share dynamic, so two runs of one build differ):
+Quality gate (IQ3_S, 100 chunks, against the BF16 base, tiers pinned, 400 W + 180 W; the exact arm keeps the 2-bit
+copy packed, so both arms place the same experts):
 
-| Head | Run | PPL | KLD mean | KLD median | KLD p99 | Same top-1 |
-|---|---|---|---|---|---|---|
-| exact Q6_K | 1 | 3.3778 | 0.15355 | 0.03400 | 1.7316 | 87.36% |
-| exact Q6_K | 2 | 3.3728 | 0.15288 | 0.03397 | 1.7082 | 87.18% |
-| two-stage | 1 | 3.3852 | 0.15507 | 0.03484 | 1.7681 | 87.24% |
-| two-stage | 2 | 3.3827 | 0.15472 | 0.03497 | 1.7381 | 87.40% |
+| Head | PPL | KLD mean | KLD p99 | Same top-1 |
+|---|---|---|---|---|
+| exact Q6_K | 3.3719 | 0.14744 | 1.6589 | 87.58% |
+| two-stage | 3.3804 | 0.14960 | 1.6658 | 87.58% |
 
-The two-stage head raises KLD by about 0.0017 (1.1%) and PPL by 0.2%, more than the 0.0007 between two runs of one build:
-the gate scores the whole softmax, including the approximate tail. Same top-1 is unchanged. Greedy decoding with the tiers
+The two-stage head raises KLD by 0.0022 [0.0018, 0.0025] (1.5%) and PPL by 0.25%: the gate scores the whole softmax,
+including the approximate tail. No row's argmax changes (25,500 rows). Greedy decoding with the tiers
 pinned (`tools/greedy_identity.py`, the three bench prompts, 900 tokens) is token-identical to the exact head.
