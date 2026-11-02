@@ -11,7 +11,7 @@
 namespace basalt::kernels {
 
 /// who timed out (the code's bits 56..62)
-constexpr unsigned kWaitMidChain = 1, kWaitCommitFinisher = 2;
+constexpr unsigned kWaitMidChain = 1, kWaitCommitFinisher = 2, kWaitHostRelease = 3;
 /// a bounded wait reads the word only once it has waited this long
 constexpr unsigned long long kWaitPollNs = 1000000ull;
 
@@ -24,6 +24,8 @@ unsigned long long* wait_abort_device_word();
 unsigned long long wait_abort_code();
 /// "<who>: kind K, line L, block B" for a code.
 std::string wait_abort_text(unsigned long long code);
+/// Set the word (unless a wait already did): every bounded wait falls through once it has waited kWaitPollNs.
+void wait_abort_release();
 /// Tests only: clear the word.
 void wait_abort_clear();
 
