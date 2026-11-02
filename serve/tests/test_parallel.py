@@ -196,6 +196,8 @@ class PickSlot(unittest.TestCase):
         e.slot_busy = [False] * n
         e.slot_held = [[] for _ in range(n)]
         e.slot_used = [0.0] * n
+        e.slot_owner = {}
+        e.session_slot = {}
         return e
 
     def test_the_slot_that_holds_the_conversation(self):
@@ -782,6 +784,56 @@ class ParallelService(unittest.TestCase):
             self.chat("long " * 1100)
         self.assertEqual(cm.exception.code, 400)
         self.assertIn("(1024)", cm.exception.read().decode())
+
+
+class SessionAffinity(PickSlot):
+    """A session header keeps a conversation in its own slot, so the next turn continues the K/V already there."""
+
+    def test_a_repeated_session_takes_its_own_slot(self):
+        e = self.engine(3)
+        e.slot_held = [[1, 2, 3, 4], [9, 9], [1, 2]]
+        e.slot_used = [0.0, 1.0, 2.0]
+        # the longest held prefix would be slot 0; the session owns slot 1 and that wins
+        self.assertEqual(e.pick_slot([1, 2, 3, 4, 5], session="s1"), 0)
+        e.claim_slot(1, "s1")
+        self.assertEqual(e.pick_slot([1, 2, 3, 4, 5], session="s1"), 1)
+        self.assertEqual(e.session_slot, {"s1": 1})
+        self.assertEqual(e.slot_owner, {1: "s1"})
+
+    def test_another_sessions_slot_is_taken_only_when_no_unowned_one_is_free(self):
+        e = self.engine(3)
+        e.claim_slot(0, "s1")
+        e.claim_slot(1, "s2")
+        # slot 2 is unowned, so a third session gets it rather than evicting anyone
+        self.assertEqual(e.pick_slot([7], session="s3"), 2)
+        # with no unowned slot free, a session takes another's - the least recently used of them
+        e.slot_busy = [True, True, True]
+        self.assertIsNone(e.pick_slot([7], session="s3"))
+        e.slot_busy = [False, False, True]
+        e.slot_used = [5.0, 1.0, 0.0]
+        self.assertEqual(e.pick_slot([7], session="s3"), 1)   # slot 1 is the least recently used of {0, 1}
+        e.claim_slot(1, "s3")
+        # s2 lost its slot and s3 owns it now; one slot, one owner
+        self.assertNotIn("s2", e.session_slot)
+        self.assertEqual(e.slot_owner, {0: "s1", 1: "s3"})
+
+    def test_claiming_frees_the_sessions_previous_slot(self):
+        e = self.engine(3)
+        e.claim_slot(0, "s1")
+        e.claim_slot(2, "s1")            # the same session moved
+        self.assertEqual(e.session_slot, {"s1": 2})
+        self.assertEqual(e.slot_owner, {2: "s1"})   # slot 0 is free of the stale claim
+
+    def test_no_session_behaves_exactly_as_before(self):
+        e = self.engine(3)
+        e.slot_held = [[1, 2, 3], [], [1, 2, 3, 4, 5]]
+        e.slot_used = [5.0, 0.0, 9.0]
+        before = [e.pick_slot(p) for p in ([1, 2, 3, 4, 5, 6], [1, 2, 3, 9], [7, 8], [1, 2, 3])]
+        e.claim_slot(0, None)            # a claim with no session is a no-op
+        self.assertEqual(e.slot_owner, {})
+        self.assertEqual(e.session_slot, {})
+        after = [e.pick_slot(p, None) for p in ([1, 2, 3, 4, 5, 6], [1, 2, 3, 9], [7, 8], [1, 2, 3])]
+        self.assertEqual(before, after)
 
 
 if __name__ == "__main__":
