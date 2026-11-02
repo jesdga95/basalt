@@ -186,13 +186,8 @@ int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint6
 
 int64_t choose_resident_room(const std::vector<uint64_t>& slot_bytes, uint64_t base_bytes, uint64_t budget,
                              int64_t lend_from, uint64_t spare_bytes, bool& spares_fit) {
-    const int64_t keep = choose_resident_keep_from(slot_bytes, base_bytes, budget, lend_from);
-    spares_fit = false;
-    if (keep < 0) return keep;
-    uint64_t used = base_bytes;
-    for (size_t i = (size_t) keep; i < slot_bytes.size(); ++i) used += slot_bytes[i];
-    spares_fit = spare_bytes > 0 && spare_bytes <= budget - used;
-    return keep;
+    spares_fit = spare_bytes > 0 && base_bytes <= budget && spare_bytes <= budget - base_bytes;
+    return choose_resident_keep_from(slot_bytes, base_bytes, spares_fit ? budget - spare_bytes : budget, lend_from);
 }
 
 bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t out) {
@@ -1020,7 +1015,6 @@ bool FileExpertSource::pin_cache_complement(
     if (lend) {
         bool spares_fit = false;
         keep_from = detail::choose_resident_room(slot_bytes, bytes, budget, lend_from_slot, spare_bytes, spares_fit);
-        if (!spares_fit) { spare_sizes.clear(); spare_bytes = 0; }
         if (keep_from < 0) keep_from = n_slots;
         if (keep_from < n_slots) {
             std::vector<std::pair<int32_t, int32_t>> core;
@@ -1033,7 +1027,7 @@ bool FileExpertSource::pin_cache_complement(
     }
 
     const uint64_t spare_at = bytes;
-    if (bytes == 0 || bytes > budget || spare_bytes > budget - bytes) spare_sizes.clear();   // no room: swaps use exchange buffers
+    if (bytes == 0 || bytes + spare_bytes > budget) spare_sizes.clear();   // no room: swaps use exchange buffers
     else bytes += spare_bytes;
 
     // The experts the GPU cache was filled from sit in the file cache and the mapping; give them back first, so the
