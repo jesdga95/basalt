@@ -23,6 +23,10 @@ Test setup: one RTX 5090 at a 400 W power limit, an RTX 5060 Ti as the peer expe
   verify: the rows near the top are the exact Q6_K logits, the far tail keeps the copy's approximate logits
   ([details](two-stage-head.md#q6_k-head-approximate-tail)). A Q8_0 head is screened on the top six bits of its own
   codes with a proven bound: every consumer reads the exact head's values ([details](two-stage-head.md#q8_0-head-bit-planes-exact)).
+- **Each rounding measured on its own.** Against the NVIDIA checkpoint's precision, only the Q6_K dense projections
+  cost measurable KLD in the default configuration (about 0.006, and 0.3 to 0.6 points of top-1); every other default
+  rounding (hc8, 8-bit activations into the dense projections, the shared expert and the NVFP4 experts, int8 KV, fast
+  math, the prompt path) stays within 0.001 ([details](isolated-costs.md)).
 - **fp32 where it matters.** Activations are fp32 in the residual stream, norms, router, softmax and logits, and int8
   (q8_1) into the quantized matmuls. GDN state is fp32. KV is fp16 by default, with int8, q4_0 and k8v4 options.
 - **Quality is scored through decode.** Prefill is a different computation (fp16/BF16 GEMMs, int8 MMQ, and FP4 tensor cores for NVFP4 experts); the quality gate scores
