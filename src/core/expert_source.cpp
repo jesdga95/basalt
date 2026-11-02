@@ -376,10 +376,13 @@ void free_home(const detail::HomeRegion& r) {
     }
 }
 
+// A page-locked home is mapped, faulted and registered in whole 2 MiB pages: the RAM it holds.
+constexpr uint64_t kHomePage = 2ull << 20;
+uint64_t home_mapped_bytes(uint64_t bytes) { return (bytes + kHomePage - 1) / kHomePage * kHomePage; }
+
 // Fault home pages in parallel before registration; a refused region falls back to pageable memory.
 void pin_homes(std::vector<detail::HomeRegion>& regions) {
-    constexpr uint64_t kHuge = 2ull << 20;
-    auto padded = [&](const detail::HomeRegion& r) { return (r.bytes + kHuge - 1) / kHuge * kHuge; };
+    auto padded = [&](const detail::HomeRegion& r) { return home_mapped_bytes(r.bytes); };
     for (detail::HomeRegion& r : regions) {
         basalt::platform::RegionBacking got;
         std::string note;
@@ -389,7 +392,7 @@ void pin_homes(std::vector<detail::HomeRegion>& regions) {
     std::vector<std::pair<uint8_t*, uint64_t>> blocks;
     for (const detail::HomeRegion& r : regions)
         if (r.arena != nullptr)
-            for (uint64_t at = 0; at < padded(r); at += kHuge) blocks.emplace_back((uint8_t*) r.arena + at, kHuge);
+            for (uint64_t at = 0; at < padded(r); at += kHomePage) blocks.emplace_back((uint8_t*) r.arena + at, kHomePage);
     const unsigned hw = std::thread::hardware_concurrency();
     const size_t threads = std::min<size_t>(blocks.size(), std::max(1u, std::min(8u, hw)));
     auto touch = [&](size_t t) {
@@ -1301,17 +1304,8 @@ bool FileExpertSource::homes_take(const std::vector<std::pair<int32_t, int32_t>>
         total += layer_blob_bytes_[(size_t) l];
     }
     if (total == 0) return true;
-    // the RAM left over also keeps the server's guard floor above the margin (what the guard stops a request at)
-    const uint64_t budget = basalt::platform::ram_budget();
-    if (total > budget || homes_reserve_ > budget - total) {
-        const uint64_t room = budget > homes_reserve_ ? budget - homes_reserve_ : 0;
-        err = "the experts the cache gives back need " + std::to_string((total + (1u << 20) - 1) >> 20) +
-              " MiB of RAM, and " + std::to_string(room >> 20) + " MiB are free above the RAM floor";
-        return false;
-    }
     // regions of a bounded size: one that no expert uses any more can then be returned on its own
     constexpr uint64_t kRegionBytes = 96ull << 20;
-    if (homes_next_ < homes_start()) homes_next_ = homes_start();
     struct Cut { size_t first, count; };
     std::vector<Cut> cuts;
     std::vector<detail::HomeRegion> made;
@@ -1324,7 +1318,20 @@ bool FileExpertSource::homes_take(const std::vector<std::pair<int32_t, int32_t>>
         made.emplace_back().bytes = bytes;
         k += n;
     }
-    if (complement_pinned_ || top_pinned_) pin_homes(made);
+    // the RAM the regions will hold (page-locked ones in whole pages) also keeps the server's guard floor above the
+    // margin (what the guard stops a request at)
+    const bool pin = complement_pinned_ || top_pinned_;
+    uint64_t need = 0;
+    for (const detail::HomeRegion& r : made) need += pin ? home_mapped_bytes(r.bytes) : r.bytes;
+    const uint64_t budget = basalt::platform::ram_budget();
+    if (need > budget || homes_reserve_ > budget - need) {
+        const uint64_t room = budget > homes_reserve_ ? budget - homes_reserve_ : 0;
+        err = "the experts the cache gives back need " + std::to_string((need + (1u << 20) - 1) >> 20) +
+              " MiB of RAM, and " + std::to_string(room >> 20) + " MiB are free above the RAM floor";
+        return false;
+    }
+    if (homes_next_ < homes_start()) homes_next_ = homes_start();
+    if (pin) pin_homes(made);
     for (size_t i = 0; i < made.size(); ++i) {
         detail::HomeRegion& r = made[i];
         if (r.arena == nullptr) {
