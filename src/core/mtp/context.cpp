@@ -50,12 +50,17 @@ void MtpDrafter::begin_request(const int64_t* prompt, int64_t n) {
 void MtpDrafter::ctx_flush(cudaStream_t cs) {
     if (xpend_.empty()) return;
     const int64_t n = (int64_t) xpend_.size();
-    const int64_t row_bytes = (int64_t) head_->row_bytes();
     const int64_t at = xbase_ + n_xused_;
     cudaMemcpyAsync(dxids_, xpend_.data(), (size_t) n * 4, cudaMemcpyHostToDevice, cs);
-    basalt::kernels::gather_rows((const uint8_t*) head_->weights(), row_bytes, dxids_, n, dhead_ + at * row_bytes, cs);
-    if (proxy_ != nullptr) basalt::kernels::q5k_proxy_pack(dhead_, at, n, proxy_, n_tier1_, cs);
-    cudaMemcpyAsync(dvocab_ + at, dxids_, (size_t) n * 4, cudaMemcpyDeviceToDevice, cs);
+    if (rows_mapped_) {   // a Q8_0 head: the rows are read through the map, so the ids and their 2-bit rows only
+        cudaMemcpyAsync(dvocab_ + at, dxids_, (size_t) n * 4, cudaMemcpyDeviceToDevice, cs);
+        if (proxy_ != nullptr) basalt::kernels::q80_proxy_pack(head_->weights(), at, n, proxy_, n_tier1_, cs, dvocab_);
+    } else {
+        const int64_t row_bytes = (int64_t) head_->row_bytes();
+        basalt::kernels::gather_rows((const uint8_t*) head_->weights(), row_bytes, dxids_, n, dhead_ + at * row_bytes, cs);
+        if (proxy_ != nullptr) basalt::kernels::q5k_proxy_pack(dhead_, at, n, proxy_, n_tier1_, cs);
+        cudaMemcpyAsync(dvocab_ + at, dxids_, (size_t) n * 4, cudaMemcpyDeviceToDevice, cs);
+    }
     if (!diag_map_.empty()) std::copy(xpend_.begin(), xpend_.end(), diag_map_.begin() + at);
     xlist_.insert(xlist_.end(), xpend_.begin(), xpend_.end());
     n_xused_ += n;

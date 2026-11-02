@@ -22,21 +22,25 @@ int run(int argc, char** argv) {
             return fatal_start_error("--model: " + merr);
         }
         basalt::core::model_sources(model_file, srcs);
-        if (srcs.dense.empty() || srcs.dense_index.empty() || srcs.experts.empty() || srcs.experts_layout.empty()) {
-            return fatal_start_error(o.model + " lacks the dense, dense.index, experts or experts.layout section");
+        if (srcs.dense.empty() || srcs.dense_index.empty() || srcs.experts.empty() || srcs.experts_layout.empty() ||
+            srcs.hc8.empty()) {
+            return fatal_start_error(o.model + " lacks the dense, dense.index, experts, experts.layout or hc8 section");
         }
         // the source tensors (embedding, PLE table, native projections, head) are served through the GGUF view of the file
         o.native_shards = {o.model};
         if (!srcs.mtp_dense.empty() && !srcs.mtp_dense_index.empty() && !srcs.mtp_experts.empty()) o.mtp = o.model;
-        if (!srcs.profile.empty()) o.expert_profile = o.model + "#profile";
-        // the 8-bit hyper-connection copies, unless this run is making them
-        if (!srcs.hc8.empty() && o.dump_hc8.empty()) {
-            std::map<std::string, basalt::core::Hc8Copy> table;
-            if (!basalt::core::hc8_read(srcs.hc8, table, merr)) {
-                return fatal_start_error(o.model + ": " + merr);
-            }
-            basalt::core::hc8_set_table(std::move(table));
+        // the engine's expert profile for this model, when it has one
+        const std::string key = cli::profile_key(model_file.meta());
+        const std::string prof = std::string(BASALT_SOURCE_DIR) + "/data/profiles/" + key + ".prof";
+        uint64_t prof_bytes = 0;
+        if (!key.empty() && basalt::platform::file_size(prof, prof_bytes) && prof_bytes > 0) o.expert_profile = prof;
+        else basalt::log::info("basalt generate", "no expert profile for %s", key.empty() ? "this model" : key.c_str());
+        // the 8-bit hyper-connection copies
+        std::map<std::string, basalt::core::Hc8Copy> table;
+        if (!basalt::core::hc8_read(srcs.hc8, table, merr)) {
+            return fatal_start_error(o.model + ": " + merr);
         }
+        basalt::core::hc8_set_table(std::move(table));
     }
     const basalt::core::PackFiles pack_files = basalt::core::PackFiles::from(srcs);
     const basalt::core::ExpertFiles expert_files = basalt::core::ExpertFiles::from(srcs);

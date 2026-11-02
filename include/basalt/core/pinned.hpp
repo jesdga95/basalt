@@ -125,7 +125,7 @@ uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed = 14695981039346656
 //     miss fraction (1 - h) x E / measured bandwidth = milliseconds per token
 //
 // So `h` (the VRAM hit rate) is only worth anything if a per-expert transfer can actually
-// reach the bus's bandwidth.  A 1,382,400-byte copy is SMALL, and if small copies run at a fraction of large
+// reach the bus's bandwidth.  One expert's copy is SMALL, and if small copies run at a fraction of large
 // ones then the architecture's central constant is wrong and no kernel optimisation can fix it.  That is what
 // this measures: the same total bytes at several granularities, so the difference is visible.
 struct StreamStats {

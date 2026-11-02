@@ -4,7 +4,10 @@
 
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/ggml/ggml.h"
+#include "basalt/platform/direct_file.hpp"
 #include "basalt/platform/system.hpp"
+
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <atomic>
@@ -34,9 +37,9 @@ void require(bool ok, const std::string& message) {
 struct TempDirectory {
     fs::path path;
 
-    TempDirectory() {
+    explicit TempDirectory(const fs::path& base = fs::temp_directory_path()) {
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-        path = fs::temp_directory_path() / ("basalt-file-source-test-" + std::to_string(stamp));
+        path = base / ("basalt-file-source-test-" + std::to_string(stamp));
         fs::create_directories(path);
     }
 
@@ -169,6 +172,75 @@ void test_native_variable_layout() {
     const uint8_t* reopened = source.blob(1, 0);
     require(reopened && source.reads() == 1 && reopened[0] == 'c', "reopened native source kept stale state");
     source.close();
+}
+
+// Unbuffered bulk reads of blobs whose sizes and offsets are not multiples of the read alignment, with staging
+// buffers small enough to be carved from a shared pinned block that an odd-sized pinned allocation already uses.
+void test_direct_read_unaligned_geometry() {
+    using namespace basalt::core;
+    using namespace basalt::kernels::cpu;
+    constexpr int64_t layers = 2;
+    constexpr int64_t experts = 3;
+    constexpr int64_t embedding = 2560;
+    constexpr int64_t feed_forward = 640;
+    constexpr uint64_t section = 2ull << 20;
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+        (void) cudaGetLastError();
+        std::cout << "file_expert_source_test: no CUDA device, unaligned direct reads not run\n";
+        return;
+    }
+    // the working directory, since a temporary file system may refuse unbuffered reads
+    TempDirectory dir(fs::current_path());
+    NativeFmt first_fmt, second_fmt;
+    std::string err;
+    require(native_fmt(GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ4_NL, embedding, feed_forward, first_fmt, err), err);
+    require(native_fmt(GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_NL, embedding, feed_forward, second_fmt, err), err);
+    constexpr uint64_t align = basalt::platform::DirectFile::alignment();
+    require(first_fmt.bytes % align != 0 && second_fmt.bytes % align != 0,
+            "the synthetic blobs do not exercise unaligned sizes");
+    const uint64_t layer0_bytes = (uint64_t) first_fmt.bytes * experts;
+    const uint64_t total = layer0_bytes + (uint64_t) second_fmt.bytes * experts;
+    std::vector<uint8_t> bytes((size_t) (section + total));
+    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = (uint8_t) ((i * 2654435761u) >> 13);
+    const fs::path file = dir.path / "experts.bin";
+    {
+        std::ofstream out(file, std::ios::binary | std::ios::trunc);
+        out.write((const char*) bytes.data(), (std::streamsize) bytes.size());
+        require((bool) out, "could not write the synthetic experts file");
+    }
+    std::ostringstream layout_text;
+    layout_text << "0 " << GGML_TYPE_IQ2_XXS << ' ' << GGML_TYPE_IQ4_NL << " 0 " << first_fmt.bytes << '\n';
+    layout_text << "1 " << GGML_TYPE_IQ2_XS << ' ' << GGML_TYPE_IQ4_NL << ' ' << layer0_bytes << ' '
+                << second_fmt.bytes << '\n';
+    require(expert_layout_load_text(layout_text.str(), layers, experts, err), err);
+    {
+        basalt::platform::DirectFile probe;
+        std::string probe_err;
+        if (!probe.open(file.string(), probe_err, 1))
+            std::cout << "file_expert_source_test: no unbuffered reads here, the mapped path is checked\n";
+    }
+    void* odd = nullptr;
+    require(cudaHostAlloc(&odd, 1000, cudaHostAllocPortable) == cudaSuccess, "cannot allocate pinned memory");
+    FileExpertSource source;
+    require(source.open(FileRange(file.string(), section, total), layers, experts, err), err);
+    const std::pair<int32_t, int32_t> pairs[] = {{1, 2}, {0, 1}, {1, 0}, {0, 0}, {1, 1}, {0, 2}};
+    constexpr int64_t count = (int64_t) (sizeof pairs / sizeof pairs[0]);
+    std::atomic<int> seen[count]{};
+    const bool ok = source.read_blobs(pairs, count, [&](int64_t i, int, const uint8_t* data, std::string& error) {
+        const auto [layer, expert] = pairs[i];
+        const uint64_t blob = layer == 0 ? first_fmt.bytes : second_fmt.bytes;
+        const uint64_t at = section + (layer == 0 ? 0 : layer0_bytes) + (uint64_t) expert * blob;
+        if (seen[i].fetch_add(1) != 0 || std::memcmp(data, bytes.data() + at, (size_t) blob) != 0) {
+            error = "an unaligned direct read returned the wrong bytes";
+            return false;
+        }
+        return true;
+    }, err);
+    source.close();
+    cudaFreeHost(odd);
+    require(ok, "bulk read of unaligned blobs failed: " + err);
+    for (const auto& visits : seen) require(visits.load() == 1, "bulk read of unaligned blobs omitted a request");
 }
 
 void test_complement_plan() {
@@ -520,6 +592,7 @@ int main() {
         test_host_memory();
         test_host_memory_namespaced();
         test_native_variable_layout();
+        test_direct_read_unaligned_geometry();
         std::cout << "file_expert_source_test: PASS\n";
         return 0;
     } catch (const std::exception& error) {

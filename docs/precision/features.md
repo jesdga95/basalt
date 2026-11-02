@@ -51,44 +51,8 @@ dense_tc_pair; the same arithmetic applies as for any Q6_K dense tensor (q8_1 ac
 
 ## Two-stage verify head
 
-A Q6_K output head (the IQ3_S pack's) runs in two stages in the verify window (`q6k_vhead`, q6k_head.cu). Every one of the
-248,320 rows is scored from a 2-bit copy (the draft head's fit, head_proxy.cuh) on int8 tensor cores against the same
-q8_1 codes the exact kernel reads. Each block of rows adds its per-column maximum to a histogram; the lower edge of the bin
-holding the 64th largest block maximum is at or below the column's 64th largest approximate logit, and every row within 4
-of it is rescored exactly with the plain Q6_K kernel's arithmetic (the same bits). The other rows keep their approximate
-logits, so log-probabilities stay finite. The block partition does not depend on the window width, so a token's logits
-are the same bits at every T.
-
-What it changes: the argmax and the sampler's top-64 list come from exact rows unless the copy's error exceeds the margin;
-the softmax tail outside the rescored rows carries the copy's error (rms about 0.7 logit). A request whose sampled list
-is longer than 64 (top_k 0 or above 64) reads every row, so its windows run the plain Q6_K head again over the same
-columns (`Verifier::exact_head_rows`): every logit exact.
-
-Offline, on 3,614 real verify-head inputs dumped from the engine (conv, struct, prose fixtures), all 248,320 rows, exact =
-Q6_K x q8_1 in float:
-
-| Fixture | Inputs | Top-64 recall, margin 4 | Margin 6 | Margin 8 | Rows rescored per column, margin 4 (mean / p99) | Greedy pick unchanged | KLD exact -> two-stage (mean) |
-|---|---|---|---|---|---|---|---|
-| conv | 1,232 | 99.971% | 100% | 100% | 1,333 / 6,286 | 100% | 4.7e-4 |
-| prose | 1,124 | 99.979% | 100% | 100% | 1,098 / 2,988 | 100% | 5.1e-4 |
-| struct | 1,258 | 99.968% | 100% | 100% | 1,981 / 12,790 | 100% | 2.5e-5 |
-
-Margins 6 and 8 rescore 5,569-18,649 and 27,962-78,806 rows per column. Neither a least-squares scale for the copy nor a
-per-column correction of the tail's bias lowers the KLD (the tail's mass is unbiased; the cost is its noise).
-
-Quality gate (IQ3_S, 100 chunks, against the Q8_0 base, tiers pinned (expert cache 9000 slots, peer 7562), 400 W;
-the gate leaves the PCIe share dynamic, so two runs of one build differ):
-
-| Head | Run | PPL | KLD mean | KLD median | KLD p99 | Same top-1 |
-|---|---|---|---|---|---|---|
-| exact Q6_K | 1 | 3.3778 | 0.15355 | 0.03400 | 1.7316 | 87.36% |
-| exact Q6_K | 2 | 3.3728 | 0.15288 | 0.03397 | 1.7082 | 87.18% |
-| two-stage | 1 | 3.3852 | 0.15507 | 0.03484 | 1.7681 | 87.24% |
-| two-stage | 2 | 3.3827 | 0.15472 | 0.03497 | 1.7381 | 87.40% |
-
-The two-stage head raises KLD by about 0.0017 (1.1%) and PPL by 0.2%, more than the 0.0007 between two runs of one build:
-the gate scores the whole softmax, including the approximate tail. Same top-1 is unchanged. Greedy decoding with the tiers
-pinned (`tools/greedy_identity.py`, the three bench prompts, 900 tokens) is token-identical to the exact head.
+A Q8_0 head runs in two stages in the verify window with a proven bound (every consumer reads the exact head's values),
+a Q6_K head through a 2-bit copy with an approximate softmax tail: [two-stage-head.md](two-stage-head.md).
 
 ## Request logit bias
 
@@ -120,6 +84,9 @@ array sizes and formats are enforced); what llama.cpp does not express (`uniqueI
 grammar form) is not enforced.
 
 ## Speculative decoding does not change output
+
+The standalone generator starts verification at the last prompt token, including position zero for a one-token
+prompt. The initial window has one row; subsequent windows use the same verifier and draft policy as longer prompts.
 
 Verify guarantees that a token's logits are bit for bit those of plain decode, whatever the window width
 (verify.hpp:3-8). This section tests that end to end.
@@ -188,7 +155,7 @@ snapshot is put back and K+1 is run again as without the overlap; when it holds,
 commit. Every row is computed by the same kernels on the same inputs, so greedy output is that of the plain split: the
 two builds write the same 400 tokens for conv, struct and prose and for 3-5K-token prompts when their expert caches are
 pinned (an expert on the CPU tier and the same expert on a GPU differ at 8e-8, which flips a near-tie token between
-unpinned runs). Scored (`--ppl`) requests, requests with a repetition penalty or a grammar, relaxed drafting and batch
+unpinned runs). Scored (`ppl=`) requests, requests with a repetition penalty or a grammar, relaxed drafting and batch
 slots never overlap windows.
 
 ## Relaxed drafting

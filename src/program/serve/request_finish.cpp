@@ -228,6 +228,12 @@ Flow Request::complete() {
                      100.0 * (double) req_hits / (double) req_look,
                      (long long) req_hits, (long long) req_look, off);
     }
+    // the adaptive swaps this request queued: the resident RAM line's exchanges count only swaps through the
+    // exchange buffers, not those whose evicted expert takes a free place in the RAM copy
+    if (runtime_.adapt_fast && !runtime_.drive.d.usage.empty())
+        basalt::log::info("basalt serve", "adaptive swaps: %lld into the VRAM tier this request, %lld deferred "
+                          "(no free RAM place)", (long long) (runtime_.xq_swapped - swapped0),
+                          (long long) (runtime_.xq_noplace - noplace0));
     // the resident RAM mode, cumulative: experts read from the experts section since the copy was made (what the plain
     // mmap mode reads through the OS file cache, from the SSD when the RAM could not keep it)
     if (runtime_.src.complement_ready())

@@ -204,8 +204,10 @@ bool Runtime::batch_step() {
                     acted = true;
                 }
             } else if (ba_win % o.adapt_every == 0) {
+                const int64_t np0 = xq_noplace;
                 ok = xq_round();
                 ba_swaps += (int64_t) xq.size();
+                ba_noplace += xq_noplace - np0;
                 ++ba_rounds;
                 acted = true;
             }
@@ -404,11 +406,13 @@ bool Runtime::batch_step() {
                      (drive.d.multi_misses - bt_miss0) / (w * L), (drive.d.cache_hits - bt_hits0) / (w * L),
                      (drive.d.pcie_experts - bt_pcie0) / (w * L), 1000.0 * bt_rows / std::max(wall, 1e-9), wall);
         if (batch_adapt) {
-            basalt::log::info("basalt batch adapt", "%lld rounds, %lld swaps queued (%.1f per round), %.3f ms/window of host "
-                                 "time, peer swaps total %lld", (long long) ba_rounds, (long long) ba_swaps,
-                         ba_rounds > 0 ? (double) ba_swaps / (double) ba_rounds : 0.0, ba_ms / w,
+            basalt::log::info("basalt batch adapt", "%lld rounds, %lld swaps queued (%.1f per round), %lld deferred "
+                                 "(no free RAM place), %.3f ms/window of host time, peer swaps total %lld",
+                         (long long) ba_rounds, (long long) ba_swaps,
+                         ba_rounds > 0 ? (double) ba_swaps / (double) ba_rounds : 0.0,
+                         (long long) ba_noplace, ba_ms / w,
                          (long long) (peer.valid() ? peer.swaps() : 0));
-            ba_swaps = ba_rounds = ba_swaps_l = ba_rounds_l = 0;
+            ba_swaps = ba_rounds = ba_swaps_l = ba_rounds_l = ba_noplace = 0;
             ba_ms = 0;
         }
         if (bt_slotwin > 0)
@@ -452,6 +456,7 @@ int Runtime::init_batch() {
     ba_rounds_l = 0;
     ba_h_l = 0;
     ba_m_l = 0;
+    ba_noplace = 0;
     ba_ms = 0;
     ba_job = false;
     // timing of the batch windows since the slots were last all idle (one stderr line then)

@@ -162,6 +162,8 @@ private:
     int64_t dec_windows{};
     int64_t dec_T{};
     int64_t decode_hits0{};
+    int64_t swapped0{};
+    int64_t noplace0{};
     int64_t ram0{};
     int64_t files0{};
     uint64_t file_bytes0{};

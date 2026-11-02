@@ -33,6 +33,7 @@
 #include "basalt/kernels/qsa_dec_fused.hpp"
 #include "basalt/kernels/q5k_head.hpp"
 #include "basalt/kernels/q6k_head.hpp"
+#include "basalt/kernels/q80_proxy.hpp"
 #include "basalt/kernels/quantize_act.hpp"
 #include "basalt/kernels/rope.hpp"
 #include "basalt/kernels/router_top10.hpp"

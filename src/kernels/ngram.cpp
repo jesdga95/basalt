@@ -112,7 +112,7 @@ struct PleTable::Impl {
     PleFormat fmt = PleFormat::IQ4_NL;
     mutable std::atomic<uint64_t> bytes_read{0};
     // Direct mode: the mapping above is released after the header parse and every row comes
-    // from an unbuffered SSD read into `raw`.
+    // from an SSD read into `raw` (see PleReader).
     PleIo mode = PleIo::Mmap;
     basalt::ngram::PleReader reader;
     // `ring_mu` guards the single-token slot (ticket, pending, rows) and the prefetch ring (n_prefetch,

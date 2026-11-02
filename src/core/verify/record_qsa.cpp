@@ -15,6 +15,7 @@
 #include "basalt/kernels/qsa_decode_attn.hpp"
 #include "basalt/kernels/qsa_dec_attn.hpp"
 #include "basalt/kernels/qsa_dec_fused.hpp"
+#include "basalt/kernels/qsa_mid.hpp"
 #include "basalt/kernels/qsa_select.hpp"
 
 namespace basalt::core {
@@ -76,6 +77,10 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     // K, V and the indexer key/query each on a branch of their own, beside the query (one row: the
     // multi-row GEMV is the one-row one)
     const bool qsaf_wide = fused_pre && (qb || n == 1) && v_.qs_[0] != nullptr;
+    // the query projection's query rows first; its gate rows, which only the merge reads, beside the selection and the
+    // attention chunks
+    const bool qhalf = qsaf_wide && !v_.batch_rec_ && N == 2560 &&
+                       qsa_qproj_half_supported(wq->native_type, wq->native_data, (int) N, (int) (NH * 2 * HD));
     // the indexer appends gate the scores, the K/V appends the attention chunks: each on its own branch,
     // joined after the query post, which runs beside them
     if (qsaf_wide) {
@@ -122,12 +127,25 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         cudaEventRecord(v_.qev_[4], v_.qs_[1]);
         {
             PdlScope pq(pdl);   // after the q8_1 kernel
-            dense_proj(8, wq->native_type, wq->native_data, v_.xq_, v_.qfull_, (int) N,
-                       (int) (NH * 2 * HD), n, cs);
+            if (qhalf)
+                qsa_qproj_half(wq->native_type, wq->native_data, v_.xq_, v_.qfull_, (int) N, (int) (NH * 2 * HD), n, 0,
+                               0, cs);
+            else
+                dense_proj(8, wq->native_type, wq->native_data, v_.xq_, v_.qfull_, (int) N, (int) (NH * 2 * HD), n, cs);
         }
         cudaStreamWaitEvent(cs, v_.qev_[4], 0);
         for (int i = 7; i <= 9; ++i) stamp(l, i);
         qsa_dec_q_post(q_post_args(), n, s, rope_scaling(), cs);
+        if (qhalf) {   // the gate rows on the indexer key's branch, its appends done; the merge waits for them
+            cudaEventRecord(v_.qev_[0], cs);
+            cudaStreamWaitEvent(v_.qs_[2], v_.qev_[0], 0);
+            {
+                PdlScope pg(false);
+                qsa_qproj_half(wq->native_type, wq->native_data, v_.xq_, v_.qfull_, (int) N, (int) (NH * 2 * HD), n, 1,
+                               0, v_.qs_[2]);
+            }
+            cudaEventRecord(v_.qev_[1], v_.qs_[2]);
+        }
         cudaStreamWaitEvent(cs, v_.qev_[3], 0);
         cudaStreamWaitEvent(cs, v_.qev_[2], 0);
     } else {
@@ -259,7 +277,7 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     if (fused_gate)
         qsa_dec_attn(v_.qcur_, pools, v_.sel_, v_.step_, v_.cap_, s,
                      v_.attn_scratch_, v_.attn_, n, cs,
-                     v_.qfull_, v_.attn32_, attn_q8 ? v_.xq_ : nullptr);
+                     v_.qfull_, v_.attn32_, attn_q8 ? v_.xq_ : nullptr, qhalf ? (void*) v_.qev_[1] : nullptr);
     else
     qsa_decode_attn_batch(v_.qcur_, pools, v_.sel_, v_.step_, v_.cap_,
                           s, v_.attn_scratch_, v_.attn_, n, cs);

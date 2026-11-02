@@ -5,10 +5,11 @@ namespace basalt::core {
 using namespace mtp_detail;
 
 namespace {
-// a Q5_K or Q8_0 draft head keeps context rows after its base rows; a Q6_K head (no context rows) reads the main
-// head's rows through its map instead of a copy
+// a Q5_K or Q8_0 draft head keeps context rows after its base rows; a Q6_K or Q8_0 head reads the main head's rows
+// through its map instead of a copy; the leading rows of these three are screened through a 2-bit copy
 bool draft_ctx_rows(int head_type) { return head_type == 13 || head_type == GGML_Q8_0; }
-bool draft_rows_mapped(int head_type) { return head_type == 14 && !draft_ctx_rows(head_type); }
+bool draft_rows_mapped(int head_type) { return head_type == 14 || head_type == GGML_Q8_0; }
+bool draft_proxy(int head_type) { return head_type == 13 || head_type == 14 || head_type == GGML_Q8_0; }
 }  // namespace
 
 uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int head_type, int64_t n_vocab) const {
@@ -118,7 +119,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 // the map, the copy unless mapped, the context rows' ids and the leading rows' 2-bit copy
                 uint64_t need = map.size() * 4 + (uint64_t) n_xcap_ * 4;
                 if (!mapped) need += (uint64_t) (n_dvocab_ * row_bytes);
-                if (head->type() == 13 || head->type() == 14)
+                if (draft_proxy(head->type()))
                     need += basalt::kernels::q5k_proxy_bytes(n_base + n_xcap_) +
                             basalt::kernels::q5k_proxy_scratch_bytes(n_base + n_xcap_);
                 draft_head_hint(n_dvocab_, need);
@@ -145,12 +146,14 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             }
             if (exp_flag("spec_log", 0) != 0) diag_map_ = map;
             n_tier1_ = n_base + n_xcap_;
-            if (head->type() == 13 || head->type() == 14) {   // the 2-bit copy of the leading rows: a fraction of the bytes
+            if (draft_proxy(head->type())) {   // the 2-bit copy of the leading rows: a fraction of the bytes
                 const size_t pb = basalt::kernels::q5k_proxy_bytes(n_tier1_);
                 const size_t sb = basalt::kernels::q5k_proxy_scratch_bytes(n_tier1_);
                 if (cudaMalloc((void**) &proxy_, pb) == cudaSuccess && cudaMalloc(&proxy_scratch_, sb) == cudaSuccess) {
                     cudaMemset(proxy_, 0, pb);
                     if (head->type() == 13) basalt::kernels::q5k_proxy_pack(dhead_, 0, n_tier1_, proxy_, n_tier1_, nullptr);
+                    else if (head->type() == GGML_Q8_0)   // the context rows (id -1 for now) are packed as they fill
+                        basalt::kernels::q80_proxy_pack(head->weights(), 0, n_tier1_, proxy_, n_tier1_, nullptr, dvocab_);
                     else if (mapped)
                         basalt::kernels::q6k_proxy_pack(head->weights(), 0, n_tier1_, proxy_, n_tier1_, nullptr, dvocab_);
                     else basalt::kernels::q6k_proxy_pack(dhead_, 0, n_tier1_, proxy_, n_tier1_, nullptr);

@@ -165,6 +165,7 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     if (dm && !dm_begin(err, nullptr)) return false;
     if (dm && !dm_stage_places(err)) return false;
     order_after_commit();
+    set_head_keep(0);   // the slots sample with their own parameters: every row exact
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(R, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
@@ -318,6 +319,7 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     gs_split_ = false;
     if (!stage_batch(rows, nullptr, S, base, tokens, pos, err)) return false;
     order_after_commit();
+    set_head_keep(0);   // the slots sample with their own parameters: every row exact
     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(S, base)], cs_);
     if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[S], cs_);   // right behind it: every row is kept
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }

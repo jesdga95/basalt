@@ -27,16 +27,9 @@ int cache_size(Context& context) {
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
     // sees the memory this process actually has left rather than the card's idle figure - and refuses with both
     // numbers if the slots do not fit, instead of handing back a cache smaller than it was asked for.
-    basalt::core::Verifier::prepare_hc8(wt, g); // before the cache sizes itself
-    if (!o.dump_hc8.empty()) {
-        // --dump-hc8: the copies, as a .basalt's `hc8` section holds them; nothing else of the startup is kept
-        cudaDeviceSynchronize();
-        const auto extra = o.mtp.empty() ? std::vector<std::pair<std::string, const void*>>{} : mtp.hc8_keys();
-        if (!basalt::core::hc8_dump(wt, g, extra, o.dump_hc8, err)) {
-            basalt::log::error("basalt generate", "--dump-hc8: %s", err.c_str());
-            return 1;
-        }
-        return 0;
+    if (!basalt::core::Verifier::prepare_hc8(wt, g, err)) {   // before the cache sizes itself
+        basalt::log::error("basalt generate", "%s", err.c_str());
+        return 1;
     }
     // what the peer's prompt buffers take on its card: they are allocated after its tier is filled, so the tier leaves them free
     auto peer_prompt_bytes = [&]() -> uint64_t {

@@ -67,9 +67,6 @@ public:
     /// The bytes `load` places on the device (the dense weights and the experts; the K/V and buffers are working
     /// memory), from the section sizes and the dense index.
     static bool plan_bytes(const MtpFiles& files, const ModelGeometry& g, uint64_t& out, std::string& err);
-    /// The draft layer's hyper-connection matrices that have 8-bit copies, as ("mtp." + tensor name, key) for
-    /// hc8_dump.  After `load`.
-    std::vector<std::pair<std::string, const void*>> hc8_keys() const;
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// A new request: the draft head's extra rows are cleared, and the tokens of the prompt that the
@@ -241,6 +238,10 @@ private:
     void prefetch_end(cudaStream_t cs);
     void fork(cudaStream_t cs) { cudaEventRecord(ev_fork_, cs); cudaStreamWaitEvent(cs2_, ev_fork_, 0); }
     void join(cudaStream_t cs) { cudaEventRecord(ev_join_, cs2_); cudaStreamWaitEvent(cs, ev_join_, 0); }
+    /// the round: the catch-up's K/V append runs on the second stream while the draft row's query projection runs (its
+    /// q8_1 row in xqr_); joined before the draft row's attention
+    bool kv_defer_ = false, kv_open_ = false;
+    uint8_t* xqr_ = nullptr;
     cudaGraphExec_t prefill_exec_[9] = {};
     cudaGraphExec_t prefill_dev_exec_[9] = {};
     int32_t* pf_dev_ = nullptr;   ///< a prompt's rows' token / step / position records, uploaded at once

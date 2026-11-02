@@ -48,17 +48,9 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
             for (Tensor& t : tensors_) {
                 if (t.off + t.bytes > blob.size()) { err = "mtp: the dense index names bytes past the dense section: " + t.name; return false; }
                 const bool hc = is_hc8_matrix(t);
-                if (hc) {
-                    // the 8-bit copy from the model file's table when it has one, else quantized from the bf16 matrix
+                if (hc) {   // the 8-bit copy from the model file's table
                     t.dev = hc8_table_adopt("mtp." + t.name, nullptr, (int) t.rows, (int) t.cols);
-                    if (t.dev == nullptr) {
-                        void* tmp = nullptr;
-                        if (cudaMalloc(&tmp, t.bytes) != cudaSuccess) { err = "mtp: no VRAM to stage " + t.name; return false; }
-                        cudaMemcpy(tmp, blob.data() + t.off, t.bytes, cudaMemcpyHostToDevice);
-                        t.dev = basalt::kernels::hc8_adopt((const uint16_t*) tmp, (int) t.rows, (int) t.cols);
-                        cudaFree(tmp);
-                    }
-                    if (t.dev == nullptr) { err = "mtp: no VRAM for the 8-bit copy of " + t.name; return false; }
+                    if (t.dev == nullptr) { err = "mtp: no 8-bit copy of " + t.name; return false; }
                     staged += t.bytes;
                     continue;
                 }
@@ -210,6 +202,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
         xn_ = b.take<float>(T * HC * N);
         xq_ = b.take<uint8_t>(basalt::kernels::native_q8_1_bytes((int) (NH * HD), 8));
         xq2_ = b.take<uint8_t>(basalt::kernels::native_q8_1_bytes((int) (NH * HD), 8));
+        xqr_ = b.take<uint8_t>(basalt::kernels::native_q8_1_bytes((int) N, 1));
         qfull_ = b.take<float>(T * NH * 2 * HD); qcur_ = b.take<float>(T * NH * HD);
         kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
@@ -274,15 +267,16 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
             const int LR = (int) g.hc_lr, D = (int) (g.hc * g.n_embd), HCn = (int) g.hc;
             for (const char* p : {"attn_hyper_connection.", "mlp_hyper_connection.", "hyper_connection_mixer."}) {
                 const std::string s(p);
-                // (a copy read from the model file's table is registered the same way)
+                // the copies of the matrices the blob still holds in bf16, from the model file's table
                 auto prepare = [&](const std::string& n, int rows, int cols) {
                     const uint16_t* w = bf16(n.c_str());
-                    if (w != nullptr && hc8_table_adopt("mtp." + n, w, rows, cols) != nullptr) return;
-                    basalt::kernels::hc8_prepare(w, rows, cols);
+                    if (w == nullptr || hc8_table_adopt("mtp." + n, w, rows, cols) != nullptr) return true;
+                    err = "mtp: no 8-bit copy of " + n;
+                    return false;
                 };
-                prepare(s + "input_mix_weight_down.weight", LR, D);
-                prepare(s + "input_mix_weight_up.weight", D, LR);
-                prepare(s + "block_inject_weight.weight", HCn, D);
+                if (!prepare(s + "input_mix_weight_down.weight", LR, D) || !prepare(s + "input_mix_weight_up.weight", D, LR) ||
+                    !prepare(s + "block_inject_weight.weight", HCn, D))
+                    return false;
             }
         }
     }

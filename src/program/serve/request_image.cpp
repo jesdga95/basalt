@@ -50,6 +50,10 @@ Flow Request::prepare_image() {
                 imgs.push_back({hdr[1], hdr[2], hdr[3], off});
             }
             if (f) std::fclose(f);
+            // the table holds one entry per cell: a longer prompt is refused before any is written
+            if (ve.empty() && (n > cells || n > runtime_.o.max_context))
+                ve = "prompt (" + std::to_string((long long) n) + " tokens) exceeds the context (" +
+                     std::to_string((long long) runtime_.o.max_context) + ")";
             int64_t p = 0, i = 0;
             size_t k = 0;
             while (ve.empty() && i < n) {

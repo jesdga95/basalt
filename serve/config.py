@@ -273,7 +273,8 @@ def checked_sampling(req: dict) -> None:
 
 
 def sampling_defaults_from_config(cfg: dict) -> dict:
-    """The model file's `sampling` block: defaults for fields a request omits (temperature, top_p, top_k, min_p,
+    """The model file's sampling defaults (its GGUF metadata's general.sampling.* keys, serve/engine/modelfile.py):
+    defaults for fields a request omits (temperature, top_p, top_k, min_p,
     presence/repetition/frequency penalties, penalty_last_n, seed). Request fields win; a bad value refuses to
     start; unknown keys are named and ignored."""
     out = {}

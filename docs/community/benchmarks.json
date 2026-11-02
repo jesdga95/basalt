@@ -681,6 +681,146 @@
       "prefill_16k_tps": 5630.7,
       "prefill_64k_tps": 6416.5,
       "decode_tps": 309.3
+    },
+    {
+      "submitter": "azidoazideazide",
+      "date": "2026-10-31",
+      "commit": "c15bbd27d5",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "4.0 x8",
+          "h2d_gbps": 14.5
+        },
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "4.0 x8",
+          "h2d_gbps": 14.5
+        }
+      ],
+      "ram_gib": 126,
+      "cpu": "AMD Ryzen 9 3900X, 12 cores",
+      "ram_gbps": 45.0,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 2249.0,
+      "prefill_64k_tps": 3566.9,
+      "decode_tps": 156.6,
+      "notes": "2x RTX 5060 Ti 16GB PCIe 4.0 x8/x8, no P2P (2nd card = peer tier), Proxmox LXC; +2500 MHz MEM OC (clocks-only, stock voltage); 0 SSD spill; engine fork c15bbd27d5 (upstream 5d28eff + BF16-PLE)"
+    },
+    {
+      "submitter": "beastrobin",
+      "date": "2026-11-01",
+      "commit": "9175e7a321",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX PRO 6000 Blackwell Workstation Edition",
+          "vram_gib": 96,
+          "power_w": 600,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 54.4
+        }
+      ],
+      "ram_gib": 253,
+      "cpu": "Intel Core Ultra 9 285K, 24 cores",
+      "ram_gbps": 79.2,
+      "os": "Windows",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 9522.6,
+      "prefill_64k_tps": 11860.5,
+      "decode_tps": 498.3,
+      "notes": "single RTX PRO 6000 Blackwell WS 96 GB at its 600 W default; every expert resident in VRAM, 0 SSD spill; native Windows (WDDM), driver 610.74"
+    },
+    {
+      "submitter": "beastrobin",
+      "date": "2026-11-01",
+      "commit": "9175e7a321",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX PRO 6000 Blackwell Workstation Edition",
+          "vram_gib": 96,
+          "power_w": 300,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 54.5
+        }
+      ],
+      "ram_gib": 253,
+      "cpu": "Intel Core Ultra 9 285K, 24 cores",
+      "ram_gbps": 81.2,
+      "os": "Windows",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 8117.2,
+      "prefill_64k_tps": 8488.7,
+      "decode_tps": 423.1,
+      "notes": "same rig at a 300 W limit (half its default); experts still fully resident, 0 SSD spill; pairs with the 600 W row above"
+    },
+    {
+      "submitter": "BobbyL2k",
+      "date": "2026-11-01",
+      "commit": "9175e7a321",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 400,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.9
+        },
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 400,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.9
+        }
+      ],
+      "ram_gib": 90,
+      "cpu": "AMD Ryzen 9 9900X, 12 cores",
+      "ram_gbps": 75.7,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 8233.0,
+      "prefill_64k_tps": 12741.9,
+      "decode_tps": 553.6,
+      "notes": "2x RTX 5090 at a 400 W limit each, PCIe 5.0 x8/x8, 90 GiB DDR5 dual-channel; resident experts, 0 SSD spill"
+    },
+    {
+      "submitter": "SolettaSolaris",
+      "date": "2026-10-31",
+      "commit": "9175e7a321",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 575,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.4
+        },
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.4
+        }
+      ],
+      "ram_gib": 504,
+      "cpu": "AMD EPYC 7702, 64 cores",
+      "ram_gbps": 147.8,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 7696.1,
+      "prefill_64k_tps": 11629.7,
+      "decode_tps": 497.8
     }
   ]
 }
