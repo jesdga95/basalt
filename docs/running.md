@@ -29,13 +29,13 @@ share a long system prompt read it once.
 
 Every chat, messages and responses request must name the served model in `model`: the alias (or the model's name) that `/v1/models` lists, or the model file's name. An unknown or missing name is a 404 in the API's own error shape, and replies always carry the served name.
 
-With `--max-context` above 32768 the KV cache is elastic (not with `--kv-resident` or `--vram-elastic`; a peer card is
-fine): each session backs its first 32768 cells at startup (the K/V pools, the indexer's block keys, the RoPE tables
+With `--max-context` above 8192 the KV cache is elastic (not with `--kv-resident` or `--vram-elastic`; a peer card is
+fine): each session backs its first 8192 cells at startup (the K/V pools, the indexer's block keys, the RoPE tables
 and the draft layer's K/V alike), and the rest of that VRAM holds the expert cache's last slots until a request needs
-it. A request backs its prompt plus 16384 cells before the prompt is read (and 16384 more whenever decode runs past
+it. A request backs its prompt plus 8192 cells before the prompt is read (and 8192 more whenever decode runs past
 that) by taking those slots back; their experts become CPU misses read from their RAM copies. The next request that
 needs less gives the cells back and the cache refills the slots from RAM, so a short request decodes with the cache a
-32k context would have. With `--parallel` a slot whose share is above 4096 tokens backs 4096 cells at startup and grows
+8k context would have. With `--parallel` a slot whose share is above 4096 tokens backs 4096 cells at startup and grows
 by 4096. An idle conversation's KV stays until requests beside it have run 15 s, then moves to RAM (outside
 `--conversation-cache-mib`, above the RAM floors; else only to the disk tier holding it) when a request needs VRAM or
 the engine is idle; its next turn reads it back. The startup line and each move say `elastic KV: ...` (a move out:
@@ -61,7 +61,7 @@ threshold. A request decoding alone runs the single-stream path and is not affec
 
 At startup the server prints one `[server] kv` line per device with all the session state placed there, for
 example `12.5GiB cuda2 solo=262144 slots=2x262144 draft=0.5GiB`. With elastic KV (the default for a server whose
-`--max-context` is above 32768, or with `--parallel` for slots above 4096 tokens) it reads `0.6/4.4GiB cuda0 elastic`:
+`--max-context` is above 8192, or with `--parallel` for slots above 4096 tokens) it reads `0.6/4.4GiB cuda0 elastic`:
 the memory backed at startup, and what the cache can grow to at `--max-context`. Because that memory is taken from the
 expert cache, the engine warns (`warning: the N batch slots' sessions ... take X GiB of CUDA0 ...`) when it leaves the
 cache short of the expert set, or at under half of what it would hold without the slots, and names the remedies: a smaller `--max-context`, no `--slot-full-context`, fewer `--parallel` slots. If a slot's session

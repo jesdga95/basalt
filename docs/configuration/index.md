@@ -134,8 +134,8 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | `rope-freq-base`, `rope-freq-scale` | engine | number | 0 (the model's own) | Raw frequency base and angle shrink. Leave at 0 unless you know the values you want. |
 | `yarn-orig-ctx`, `yarn-ext-factor`, `yarn-attn-factor`, `yarn-beta-fast`, `yarn-beta-slow` | engine | number | 0 (262144), auto, 1, 32, 1 | YaRN's own parameters, as in llama.cpp. |
 
-A server with `max-context` above 32768 has an elastic KV cache: each session backs its first 32768 cells at startup and
-takes more from the expert cache only when a request needs it. With `parallel`, each slot whose share is above 4096
+A server with `max-context` above 8192 has an elastic KV cache: each session backs its first 8192 cells at startup and
+takes 8192 cells past what a request needs from the expert cache only when needed. With `parallel`, each slot whose share is above 4096
 tokens does the same from 4096 cells, growing by 4096, and an idle conversation's KV moves to RAM once requests beside
 it have run 15 s. It is off with `kv-resident` or `vram-elastic`. See [running](../running.md#concurrent-requests---parallel-n).
 
