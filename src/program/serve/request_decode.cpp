@@ -397,15 +397,18 @@ Flow Request::decode() {
         }
         tk_valid = false;
         const Clock::time_point tw1 = Clock::now();
+        // Keep only rows through the reply's last emitted token when this window ends the reply.
+        int n_emit = 0;
+        bool eos_pre = false;
+        for (int i = e0; i <= a && produced_n + n_emit < max_new && !eos_pre; ++i) {
+            ++n_emit;
+            eos_pre = ppl == nullptr &&
+                      std::find(runtime_.o.eos_ids.begin(), runtime_.o.eos_ids.end(), (int64_t) outv[(size_t) i]) != runtime_.o.eos_ids.end();
+        }
+        const bool ends = ppl == nullptr && n_emit > 0 && (eos_pre || produced_n + n_emit >= max_new);
+        const int keep = ends ? std::min(a, e0 + n_emit) + 1 : a + 1;
         if (chain) {
             // the draft launches first; the commit, the adaptive round and the output go in its shadow
-            int n_emit = 0;
-            bool eos_pre = false;
-            for (int i = e0; i <= a && produced_n + n_emit < max_new && !eos_pre; ++i) {
-                ++n_emit;
-                eos_pre = ppl == nullptr &&
-                          std::find(runtime_.o.eos_ids.begin(), runtime_.o.eos_ids.end(), (int64_t) outv[(size_t) i]) != runtime_.o.eos_ids.end();
-            }
             const bool will_draft = !eos_pre && produced_n + n_emit < max_new;
             float wprob[16];
             const int wprob_n = std::min(runtime_.S_mtp, 16);
@@ -435,11 +438,11 @@ Flow Request::decode() {
                 }
             };
             basalt::core::decode_events().stamp(9);
-            if (!hold && !cv->commit(a + 1, runtime_.err, 2)) {
+            if (!hold && !cv->commit(keep, runtime_.err, 2)) {
                 std::printf("ERR %s\n", runtime_.err.c_str());
                 return Flow::error;
             }
-            for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+            for (int i = 0; i < keep; ++i) consumed.push_back(window[(size_t) i]);
             draft_offered += T - 1 - e0;
             draft_accepted += a - e0;
             first_window = false;
@@ -447,7 +450,7 @@ Flow Request::decode() {
             std::string cerr;
             auto after_launch = [&] {
                 after_ran = true;
-                commit_ok = hold ? true : cv->commit(a + 1, cerr, 1);
+                commit_ok = hold ? true : cv->commit(keep, cerr, 1);
                 if (!hold) adapt_side();
                 for (int i = e0; i <= a && produced_n < max_new && !eos; ++i) {
                     std::printf("T %d\n", (int) outv[(size_t) i]);
@@ -548,19 +551,19 @@ Flow Request::decode() {
             if (eos) { finish = "stop"; break; }
             runtime_.shed_if_low();
             if (runtime_.halted()) { finish = "cancel"; break; }
-            x = outv[(size_t) a];
-            p += a + 1;
+            x = outv[(size_t) (ends ? e0 + n_emit - 1 : a)];
+            p += keep;
             basalt::core::decode_events().stamp(2);
             continue;
         }
         spawn_adapt(false);
-        if (!runtime_.ver.commit(a + 1, runtime_.err)) {
+        if (!runtime_.ver.commit(keep, runtime_.err)) {
             if (adapt_thr.joinable()) adapt_thr.join();
             std::printf("ERR %s\n", runtime_.err.c_str());
             return Flow::error;
         }
-        // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
-        for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+        // The committed window rows are in the session; the last output is the next x.
+        for (int i = 0; i < keep; ++i) consumed.push_back(window[(size_t) i]);
         draft_offered += T - 1 - e0;
         draft_accepted += a - e0;
         first_window = false;
@@ -604,8 +607,8 @@ Flow Request::decode() {
         if (eos) { finish = "stop"; break; }
         runtime_.shed_if_low();
         if (runtime_.halted()) { finish = "cancel"; break; }
-        x = outv[(size_t) a];
-        p += a + 1;
+        x = outv[(size_t) (ends ? e0 + n_emit - 1 : a)];
+        p += keep;
     }
     if (gguard != nullptr)
         basalt::log::info("basalt grammar", "%lld windows checked, %lld masked resamples, %.3f ms in grammar code (%.2f us/window)",
