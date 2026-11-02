@@ -108,15 +108,16 @@ Flow Request::decode() {
         while (T < runtime_.S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_adapt.th())) ++T;
         if (first_window) T = (int) (n - fold_p0);
         const int e0 = first_window ? T - 1 : 0;   // rows before it are prompt tokens: forced, not emitted
+        const bool forced = ppl != nullptr && req_ppl_force != 0;
         if (ppl != nullptr) {
             if (p >= ppl->end()) break;
-            T = (int) std::min<int64_t>(req_ppl_t, ppl->end() - p);
+            T = (int) std::min<int64_t>(forced ? T : req_ppl_t, ppl->end() - p);
         }
         // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
         // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
         bool from_sfx = false;
         int sfx_match = 0;
-        if (runtime_.o.suffix_draft > 0 && !first_window && ppl == nullptr && !held.on) {
+        if (runtime_.o.suffix_draft > 0 && !first_window && (ppl == nullptr || forced) && !held.on) {
             const int k = runtime_.sfx->propose(runtime_.S - 1, sbuf.data());
             sfx_match = runtime_.sfx->last_match();
             if (k > 0 && sbuf[0] == drafts[0]) {
@@ -124,6 +125,7 @@ Flow Request::decode() {
                 if (pk.lookup) { T = pk.t; from_sfx = true; }
             }
         }
+        if (forced) T = (int) std::min<int64_t>(T, ppl->end() - p);   // a lookup window ends at the base's last token too
         const bool timed_round = !first_window;
         const Clock::time_point round0 = Clock::now();
         if (p + T > runtime_.o.max_context) break;
@@ -133,7 +135,7 @@ Flow Request::decode() {
             for (int i = 0; i < T; ++i) window[(size_t) i] = held.win[(size_t) i];
         if (e0 > 0)
             for (int i = 1; i < T; ++i) window[(size_t) i] = (int32_t) ids[(size_t) (p + i)];
-        if (ppl != nullptr)
+        if (ppl != nullptr && !forced)
             for (int i = 0; i < T; ++i) window[(size_t) i] = ppl->token(p + i);
         // the guess: this window is accepted whole and the target's next token is the chain's draft T - 1; the next
         // window then holds that draft and the ones the chain made after it
@@ -282,6 +284,8 @@ Flow Request::decode() {
             std::printf("ERR %s\n", runtime_.drive.d.failed && runtime_.drive.d.fail ? runtime_.drive.d.fail : runtime_.err.c_str());
             return Flow::error;
         }
+        if (forced)   // the chunk's tokens stand in for the target's picks
+            for (int t = 0; t < T; ++t) outv[(size_t) t] = ppl->token(p + t + 1);
         int a = 0;
         if (e0 > 0) {
             for (int i = 0; i < e0; ++i) outv[(size_t) i] = window[(size_t) i + 1];
@@ -310,7 +314,7 @@ Flow Request::decode() {
                 else if (outv[(size_t) i] == runtime_.o.relax_call_close) in_call = false;
         } else
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
-        if (gguard != nullptr && gguard->on()) {
+        if (!forced && gguard != nullptr && gguard->on()) {
             // the first sampled token the grammar refuses is drawn again under the grammar's mask, and the window ends there
             const int miss = gguard->scan(outv.data(), a + 1);
             if (miss >= 0) {
@@ -327,13 +331,15 @@ Flow Request::decode() {
                 ++grammar_resamples;
             }
         }
-        if (ppl != nullptr) {   // every row scored and committed
+        if (ppl != nullptr && !forced) {   // every row scored (unless ppl_score=0) and committed
             a = T - 1;
             for (int t = 0; t < T; ++t) {
-                std::vector<float> lg((size_t) runtime_.n_vocab);
-                if (!cv->copy_logits(t, lg.data()) || !ppl->score(p + t, std::move(lg), runtime_.err)) {
-                    std::printf("ERR ppl: %s\n", runtime_.err.empty() ? "the head logits copy failed" : runtime_.err.c_str());
-                    return Flow::error;
+                if (req_ppl_score != 0) {
+                    std::vector<float> lg((size_t) runtime_.n_vocab);
+                    if (!cv->copy_logits(t, lg.data()) || !ppl->score(p + t, std::move(lg), runtime_.err)) {
+                        std::printf("ERR ppl: %s\n", runtime_.err.empty() ? "the head logits copy failed" : runtime_.err.c_str());
+                        return Flow::error;
+                    }
                 }
                 outv[(size_t) t] = ppl->token(p + t + 1);   // as if every draft were accepted: x, the MTP
             }
