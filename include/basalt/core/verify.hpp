@@ -435,6 +435,8 @@ private:
     /// After a two-stage window: the head again over its columns, every row exact (the plain kernel's bits).
     bool head_exact_again() const;
     bool window_intact(std::string& err);   // after a window's sync: false when a bounded device wait of it timed out
+    void ar_handoff();                      // the zero-doorbell window's one hand-off (its rows are staged)
+    bool ar_plan_intact(std::string& err);  // after a zero-doorbell window: false when its plan met an expert out of VRAM
     /// One step of the host's service of the window's rings: 1 = every ring served, 0 = the GPU has not reached the next
     /// one, -1 = an error.
     int serve_poll(PoolMultiFn pool, void* user, std::string& err);

@@ -160,7 +160,6 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     (void) cudaStreamQuery(cs_);
     if (post_launch_) { auto f = std::move(post_launch_); post_launch_ = nullptr; f(); }
     gm.mark(15);
-    volatile uint32_t* const flag = h_flag_;
     fl_.T = T;
     fl_.pos0 = pos0;
     fl_.k = 0;
@@ -174,15 +173,9 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
         if (do_ple) {
             const Clock::time_point tp = Clock::now();
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            _mm_sfence();
-            *flag = 1;
-            *(volatile uint32_t*) (h_flag_ + 8) = 1;
             ms_host += ms_since(tp);
-        } else {
-            *flag = 1;
-            *(volatile uint32_t*) (h_flag_ + 8) = 1;
         }
+        ar_handoff();
     } else {
     // the side branch of layer 1's PLE projections waits for the rows alone
     const bool ple_early = ple_side_ && do_ple;
@@ -323,6 +316,22 @@ bool Verifier::window_intact(std::string& err) {
     return false;
 }
 
+// The zero-doorbell graph plans every layer on the device and never rings h_seq_: the host raises the hand-off once,
+// after the window's PLE rows are in h_ple_, and then only waits for the window's end.
+void Verifier::ar_handoff() {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+    *(volatile uint32_t*) h_flag_ = 1;
+    *(volatile uint32_t*) (h_flag_ + 8) = 1;
+}
+
+bool Verifier::ar_plan_intact(std::string& err) {
+    if (!ar_on() || ar_forced_ || h_plan_err_ == nullptr || *(volatile uint32_t*) h_plan_err_ == 0) return true;
+    *(volatile uint32_t*) h_plan_err_ = 0;   // the table changed under the window
+    err = "verify: the zero-doorbell plan met an expert that is not in VRAM (the residency table changed during the window)";
+    return false;
+}
+
 // The window's end: the GPU's finish, the profile, and on the last stage the head's picks.
 bool Verifier::run_end(int32_t* out, std::string& err) {
     using namespace basalt::kernels;
@@ -346,11 +355,7 @@ bool Verifier::run_end(int32_t* out, std::string& err) {
         return false;
     }
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
-    if (ar_on() && !ar_forced_ && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // the table changed under the window
-        *(volatile uint32_t*) h_plan_err_ = 0;
-        err = "verify: the zero-doorbell plan met an expert that is not in VRAM (the residency table changed during the window)";
-        return false;
-    }
+    if (!ar_plan_intact(err)) return false;
     constexpr int64_t wstat_every = 200;   // windows per report
     if (dm_ != nullptr && dm_->wstat != nullptr && (dm_->wstat_t += T, ++dm_->wstat_windows == wstat_every)) {
         // --wait-stats: the last wstat_every windows' counters
