@@ -200,6 +200,8 @@ public:
     /// discarded - a prompt read through windows commits every token - so they cost no sampler launch or sync and
     /// never read a history staged for another position.
     void set_head_sampling(bool on) { head_sampling_ = on; if (next_) next_->set_head_sampling(on); }
+    /// Skip exact head scoring below this row for the next window.
+    void set_head_from(int t) { head_from_ = t; if (next_) next_->set_head_from(t); }
     /// On: a sampled window also leaves draft_prob(t), the probability row t's final distribution gives the window's
     /// token t + 1 (t < T - 1), for relaxed acceptance.  The picks are unchanged.  Off by default; set per request.
     void set_draft_probe(bool on) { draft_probe_ = on; if (next_) next_->set_draft_probe(on); }
@@ -521,6 +523,8 @@ private:
     }();   ///< greedy by default; per-request via set_sampling
     const int32_t* hist_d_ = nullptr;   // penalty-history row (set_history); null = no penalties apply
     int hist_len_ = 0;
+    int head_from_ = 0;
+    int32_t* h_head_from_ = nullptr; int32_t* m_head_from_ = nullptr;
     bool head_sampling_ = true;          ///< set_head_sampling
     bool draft_probe_ = false;           ///< set_draft_probe
     std::vector<float> logit_bias_host_;
@@ -726,6 +730,7 @@ private:
     SessionState* gs_ss_ = nullptr;
     float *gs_h_full_ = nullptr, *gs_h_slice_ = nullptr;   // pinned staging for gs_move: CUDA0's whole layers, the slice
     uint8_t* vhead_scratch_ = nullptr;   // the two-stage head's histogram and row list (q6k_vhead, q80p_vhead)
+    int32_t* head_from_d_ = nullptr;
     int32_t* head_keep_d_ = nullptr;     // q80p_vhead's list length, read by the captured head (null: no such head)
     int head_keep_set_ = 0;              // the value last written to head_keep_d_ (the arena starts it at 0)
     mutable bool head_screened_ = false;   // the last window's head was two-stage: only its top rows are exact

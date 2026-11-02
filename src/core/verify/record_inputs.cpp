@@ -56,6 +56,9 @@ bool Verifier::WindowRecorder::inputs() {
     // ---- the window's inputs, from mapped staging
     copy_i32x3_from_mapped(v_.tok_, v_.m_tok_, T, v_.step_, v_.m_step_, (int64_t) T * kStepCount, v_.pos_, v_.m_pos_,
                            (int64_t) MT * (NH + NKV + IQ), cs);
+    // the head's first exact row, read once here: every block of the head's kernels reads it, and a read of the mapped
+    // word crosses the link
+    if (!v_.batch_rec_ && v_.head_from_d_ != nullptr) copy_i32_from_mapped(v_.head_from_d_, v_.m_head_from_, 1, cs);
     if (v_.batch_rec_) {   // the segment tables: which slot each row is
         copy_i32_from_mapped((int32_t*) v_.segb_, (const int32_t*) v_.m_segb_, (int64_t) T * 8, cs);
         copy_i32_from_mapped((int32_t*) v_.d_qrows_, (const int32_t*) v_.m_qseg_, (int64_t) (kQsaSegMaxRows + 8) * 4, cs);

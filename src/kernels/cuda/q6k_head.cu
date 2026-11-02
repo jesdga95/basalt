@@ -351,17 +351,18 @@ __global__ void __launch_bounds__(512) q6k_proxy_final_kernel(const Q6KBlock* __
 constexpr int VQ = 20;               // group quads per row
 constexpr int VHIST = 1024;          // bins per column of the block-maximum histogram
 constexpr float VBIN = 8.0f;         // bins per logit unit, centred on zero
-constexpr int VCAP = 65536;          // rows rescored per call at most
+constexpr int VRESCORE = 512;        // threads of a rescoring block
+constexpr int VLIST = 8 * VRESCORE;  // its list: two scan steps of 4 rows per thread
 constexpr float VDELTA = 4.0f;       // rescored: within this of the column's 64th best (approximate) logit
 constexpr int VKEEP = 64;            // the sampler's widest list
 
 __host__ __device__ inline size_t vtiles(int64_t n) { return (size_t) (n / 16); }
 __host__ __device__ inline size_t vlevels_bytes(int64_t n) { return vtiles(n) * VQ * 32 * 16; }
 
-struct VScratch {   // each kernel's last block leaves its part zeroed for the next call
+struct VScratch {   // the scoring kernel's last block leaves its part zeroed for the next call
     unsigned hist[8][VHIST];
     float thr[8];
-    unsigned count, done_score, done_rescore;
+    unsigned done_score;
 };
 
 __device__ __forceinline__ void mma_s8(int (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
@@ -408,7 +409,8 @@ __global__ void q6k_vproxy_pack_kernel(const Q6KBlock* __restrict__ q6, int64_t 
 template <int NC>
 __global__ void __launch_bounds__(128) q6k_vscore_kernel(const uint4* __restrict__ wq, const uint4* __restrict__ sc,
                                                          const Q81Block* __restrict__ x, float* __restrict__ y,
-                                                         int n_out, VScratch* __restrict__ vs) {
+                                                         int n_out, VScratch* __restrict__ vs,
+                                                         const int* __restrict__ col_from) {
     __shared__ float4 xf[80][4];   // per group and column pair: the two scales, then -1.5 x scale x sum of q
     __shared__ float red[4][16][9];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
@@ -423,6 +425,8 @@ __global__ void __launch_bounds__(128) q6k_vscore_kernel(const uint4* __restrict
         }
     }
     pdl_wait();
+    // no column's pick is used: every block leaves at once (no histogram entry, so the scratch stays clear)
+    if (col_from != nullptr && *(volatile const int*) col_from >= NC) return;
     for (int i = tid; i < 80 * 8; i += 128) {
         const int grp = i >> 3, col = i & 7;
         float dd = 0.0f, xs = 0.0f;
@@ -548,17 +552,37 @@ __global__ void __launch_bounds__(128) q6k_vscore_kernel(const uint4* __restrict
     if (tid == 0) vs->done_score = 0u;
 }
 
-// The (row, column) pairs at or above the column's threshold, listed.
-__global__ void __launch_bounds__(256) q6k_vselect_kernel(const float* __restrict__ y, int n_out, int ncols,
-                                                          VScratch* __restrict__ vs, uint32_t* __restrict__ list) {
+// The rows at or above their column's threshold, rescored exactly (q6k_rows' bits).  Each block scans its slots of 4
+// rows and lists its rows in shared memory; whenever another scan step could overflow the list, and at the end, the
+// block's warps rescore the list, a warp per (row, column).  Every listed row is rescored whatever the count, so a
+// column's rows are the same bits at every window width.
+__global__ void __launch_bounds__(VRESCORE) q6k_vrescore_kernel(const Q6KBlock* __restrict__ w,
+                                                           const Q81Block* __restrict__ x, float* __restrict__ y,
+                                                           int n_out, int ncols, const VScratch* __restrict__ vs,
+                                                           const int* __restrict__ col_from) {
+    extern __shared__ __align__(16) int2 xv[];   // the columns' q8_1 values, then the block's list
+    uint32_t* list = reinterpret_cast<uint32_t*>(xv + (size_t) ncols * XBLK * 8);
     __shared__ float thr[8];
-    const int tid = threadIdx.x, lane = tid & 31;
+    __shared__ unsigned count;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     pdl_wait();
+    // the columns below `cf` keep their approximate logits: their picks are discarded
+    const int cf = col_from != nullptr ? max(0, *(volatile const int*) col_from) : 0;
+    if (cf >= ncols) return;
+    for (int i = tid; i < ncols * XBLK * 8; i += blockDim.x) {
+        const int b = i / 8, pos = i % 8;
+        const Q81Block* blk = x + b;
+        const unsigned dsb = __ldg(reinterpret_cast<const unsigned*>(&blk->ds));
+        xv[i] = make_int2(__ldg(reinterpret_cast<const int*>(blk->qs) + pos),
+                          __float_as_int(__low2float(*reinterpret_cast<const half2*>(&dsb))));
+    }
     if (tid < ncols) thr[tid] = __ldcg(&vs->thr[tid]);
+    if (tid == 0) count = 0u;
     __syncthreads();
     const int n4 = n_out / 4;
     const int total = ncols * n4;
-    for (int i0 = blockIdx.x * blockDim.x; i0 < total; i0 += gridDim.x * blockDim.x) {
+    constexpr int step = VRESCORE;
+    for (int i0 = cf * n4 + blockIdx.x * step; i0 < total; i0 += gridDim.x * step) {
         const int i = i0 + tid;
         unsigned m = 0u;
         int col = 0, r4 = 0;
@@ -573,54 +597,38 @@ __global__ void __launch_bounds__(256) q6k_vselect_kernel(const float* __restric
         int pre = cnt;
 #pragma unroll
         for (int o = 1; o < 32; o <<= 1) {
-            const int v = __shfl_up_sync(0xffffffffu, pre, o);
-            if (lane >= o) pre += v;
+            const int u = __shfl_up_sync(0xffffffffu, pre, o);
+            if (lane >= o) pre += u;
         }
         const int wtot = __shfl_sync(0xffffffffu, pre, 31);
-        if (wtot == 0) continue;
-        unsigned base = 0;
-        if (lane == 31) base = atomicAdd(&vs->count, (unsigned) wtot);
-        base = __shfl_sync(0xffffffffu, base, 31) + (unsigned) (pre - cnt);
-        for (int b = 0; b < 4; ++b)
-            if (m & (1u << b)) {
-                if (base < (unsigned) VCAP) list[base] = ((uint32_t) col << 18) | (uint32_t) (4 * r4 + b);
-                ++base;
+        bool full = false;   // the list cannot take another step
+        if (wtot > 0) {
+            unsigned base = 0;
+            if (lane == 31) base = atomicAdd(&count, (unsigned) wtot);
+            base = __shfl_sync(0xffffffffu, base, 31);
+            full = base + (unsigned) wtot > (unsigned) (VLIST - 4 * step);
+            base += (unsigned) (pre - cnt);
+            for (int b = 0; b < 4; ++b)
+                if (m & (1u << b)) list[base++] = ((uint32_t) col << 18) | (uint32_t) (4 * r4 + b);
+        }
+        // one decision per block, taken after every write of the step; the count is read only inside, where
+        // nothing writes it before the reset's barrier
+        if (__syncthreads_or(full) || i0 + gridDim.x * step >= total) {
+            const unsigned n = count;
+            for (unsigned c = (unsigned) warp; c < n; c += VRESCORE / 32) {
+                const uint32_t e = list[c];
+                const int row = (int) (e & 0x3ffffu), cc = (int) (e >> 18);
+                const float v = q6k_row_one(w + (size_t) row * BPR, xv + (size_t) cc * XBLK * 8, lane);
+                if (lane == 0) y[(size_t) cc * n_out + row] = v;
             }
+            __syncthreads();
+            if (tid == 0) count = 0u;
+            __syncthreads();
+        }
     }
 }
 
-// The listed rows' exact logits (q6k_rows' bits), a warp per (row, column); the last block clears the count.
-__global__ void __launch_bounds__(512) q6k_vrescore_kernel(const Q6KBlock* __restrict__ w,
-                                                           const Q81Block* __restrict__ x, float* __restrict__ y,
-                                                           int n_out, int ncols, VScratch* __restrict__ vs,
-                                                           const uint32_t* __restrict__ list) {
-    extern __shared__ __align__(16) int2 xv[];
-    __shared__ bool last;
-    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    pdl_wait();
-    for (int i = tid; i < ncols * XBLK * 8; i += blockDim.x) {
-        const int b = i / 8, pos = i % 8;
-        const Q81Block* blk = x + b;
-        const unsigned dsb = __ldg(reinterpret_cast<const unsigned*>(&blk->ds));
-        xv[i] = make_int2(__ldg(reinterpret_cast<const int*>(blk->qs) + pos),
-                          __float_as_int(__low2float(*reinterpret_cast<const half2*>(&dsb))));
-    }
-    __syncthreads();
-    const unsigned n = min(__ldcg(&vs->count), (unsigned) VCAP);
-    for (unsigned c = blockIdx.x * 16 + warp; c < n; c += gridDim.x * 16) {
-        const uint32_t e = __ldcg(list + c);
-        const int row = (int) (e & 0x3ffffu), col = (int) (e >> 18);
-        const float v = q6k_row_one(w + (size_t) row * BPR, xv + (size_t) col * XBLK * 8, lane);
-        if (lane == 0) y[(size_t) col * n_out + row] = v;
-    }
-    __syncthreads();
-    if (tid == 0) {
-        __threadfence();
-        last = atomicAdd(&vs->done_rescore, 1u) == gridDim.x - 1;
-    }
-    __syncthreads();
-    if (last && tid == 0) { vs->count = 0u; vs->done_rescore = 0u; }
-}
+size_t vrescore_smem(int ncols) { return (size_t) ncols * XBLK * 8 * sizeof(int2) + VLIST * sizeof(uint32_t); }
 
 // One grid size for every column count: the blocks' rows, so their maxima and the thresholds, and with them which rows
 // are exact, do not depend on the window's width.
@@ -639,11 +647,12 @@ int vscore_grid(int n_out) {
 }
 
 template <int NC>
-void vscore_launch(const void* proxy, const void* x, float* y, int n_out, VScratch* vs, cudaStream_t s) {
+void vscore_launch(const void* proxy, const void* x, float* y, int n_out, VScratch* vs, const int* col_from,
+                   cudaStream_t s) {
     const unsigned grid = (unsigned) vscore_grid(n_out);
     const uint4* wq = (const uint4*) proxy;
     const uint4* sc = (const uint4*) ((const char*) proxy + vlevels_bytes(n_out));
-    launch_pdl(q6k_vscore_kernel<NC>, dim3(grid), dim3(128), 0, s, wq, sc, (const Q81Block*) x, y, n_out, vs);
+    launch_pdl(q6k_vscore_kernel<NC>, dim3(grid), dim3(128), 0, s, wq, sc, (const Q81Block*) x, y, n_out, vs, col_from);
 }
 
 }  // namespace
@@ -757,30 +766,29 @@ void q6k_vproxy_pack(const void* q6k_rows, int64_t n, void* proxy, void* stream)
     }
 }
 
-size_t q6k_vhead_scratch_bytes() { return sizeof(VScratch) + (size_t) VCAP * sizeof(uint32_t); }
+size_t q6k_vhead_scratch_bytes() { return sizeof(VScratch); }
 
 bool q6k_vhead_supported(int n_in, int n_out, int ncols) {
     return n_in == BPR * QK && n_out > 0 && n_out % 16 == 0 && n_out <= (1 << 18) && ncols >= 1 && ncols <= 8;
 }
 
 void q6k_vhead(const void* proxy, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
-               void* scratch, void* stream) {
+               void* scratch, void* stream, const int* col_from) {
     if (!q6k_vhead_supported(n_in, n_out, ncols) || !proxy || !weights || !x_q8_1 || !y || !scratch) {
         basalt::log::error("basalt", "q6k_vhead: unsupported shape (n_in %d, n_out %d, ncols %d)", n_in, n_out, ncols);
         std::exit(1);
     }
     const auto s = (cudaStream_t) stream;
     VScratch* vs = (VScratch*) scratch;
-    uint32_t* list = (uint32_t*) ((char*) scratch + sizeof(VScratch));
     switch (ncols) {
-        case 1: vscore_launch<1>(proxy, x_q8_1, y, n_out, vs, s); break;
-        case 2: vscore_launch<2>(proxy, x_q8_1, y, n_out, vs, s); break;
-        case 3: vscore_launch<3>(proxy, x_q8_1, y, n_out, vs, s); break;
-        case 4: vscore_launch<4>(proxy, x_q8_1, y, n_out, vs, s); break;
-        case 5: vscore_launch<5>(proxy, x_q8_1, y, n_out, vs, s); break;
-        case 6: vscore_launch<6>(proxy, x_q8_1, y, n_out, vs, s); break;
-        case 7: vscore_launch<7>(proxy, x_q8_1, y, n_out, vs, s); break;
-        default: vscore_launch<8>(proxy, x_q8_1, y, n_out, vs, s); break;
+        case 1: vscore_launch<1>(proxy, x_q8_1, y, n_out, vs, col_from, s); break;
+        case 2: vscore_launch<2>(proxy, x_q8_1, y, n_out, vs, col_from, s); break;
+        case 3: vscore_launch<3>(proxy, x_q8_1, y, n_out, vs, col_from, s); break;
+        case 4: vscore_launch<4>(proxy, x_q8_1, y, n_out, vs, col_from, s); break;
+        case 5: vscore_launch<5>(proxy, x_q8_1, y, n_out, vs, col_from, s); break;
+        case 6: vscore_launch<6>(proxy, x_q8_1, y, n_out, vs, col_from, s); break;
+        case 7: vscore_launch<7>(proxy, x_q8_1, y, n_out, vs, col_from, s); break;
+        default: vscore_launch<8>(proxy, x_q8_1, y, n_out, vs, col_from, s); break;
     }
     static int sms[64] = {};
     static std::atomic<bool> ready[64];
@@ -790,16 +798,14 @@ void q6k_vhead(const void* proxy, const void* weights, const void* x_q8_1, float
         if (!ready[dev].load(std::memory_order_relaxed)) {
             cudaDeviceGetAttribute(&sms[dev], cudaDevAttrMultiProcessorCount, dev);
             opt_in_check(cudaFuncSetAttribute(q6k_vrescore_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                              8 * XBLK * 8 * (int) sizeof(int2)),
+                                              (int) vrescore_smem(8)),
                          "q6k_vhead");
             if (sms[dev] <= 0) sms[dev] = 1;
             ready[dev].store(true, std::memory_order_release);
         }
     }
-    launch_pdl(q6k_vselect_kernel, dim3((unsigned) sms[dev] * 2), dim3(256), 0, s, (const float*) y, n_out, ncols, vs,
-               list);
-    launch_pdl(q6k_vrescore_kernel, dim3((unsigned) sms[dev]), dim3(512), (size_t) ncols * XBLK * 8 * sizeof(int2), s,
-               (const Q6KBlock*) weights, (const Q81Block*) x_q8_1, y, n_out, ncols, vs, (const uint32_t*) list);
+    launch_pdl(q6k_vrescore_kernel, dim3((unsigned) sms[dev]), dim3(VRESCORE), vrescore_smem(ncols), s,
+               (const Q6KBlock*) weights, (const Q81Block*) x_q8_1, y, n_out, ncols, (const VScratch*) vs, col_from);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         basalt::log::error("basalt", "q6k_vhead: %s", cudaGetErrorString(e));
