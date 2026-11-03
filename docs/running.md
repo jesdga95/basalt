@@ -226,7 +226,7 @@ Basalt refuses settings that would leave the machine without memory, and never s
   sits 1 GiB above the guard's). A running request continues; it stops with an error only when the RAM is critical:
   under 1 GiB free, or below the guard while the kernel's memory pressure (`/proc/pressure/memory`, avg10) shows tasks
   stalled most of the time (some >= 60% or full >= 40%). Without a pressure reading (Windows, or a kernel without PSI)
-  below the guard is critical. The error (`RAM low (... free < ... guard) ...: request stopped` or `RAM critical (...
+  RAM that stays below the guard for 10 s is critical; a shorter dip is not. The error (`RAM low (... free < ... guard) ...: request stopped` or `RAM critical (...
   free < ... hard floor): request stopped`, also returned to the client) names `--resident-budget-gib` only when the
   engine's own growth took the RAM, otherwise how much other programs took. While the model sleeps the guard judges no
   reading (the driver holds the GPU state in RAM until the wake); the wake takes a fresh one. Windows does not count the

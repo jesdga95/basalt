@@ -417,6 +417,60 @@ int exhausted_message_cases() {
     }
     return fail;
 }
+// Without a stall reading: samples every 100 ms through BelowFloorClock into ram_level
+int ram_level_sustained_cases() {
+    using namespace basalt::platform;
+    int fail = 0;
+    const uint64_t floor = gib(3.09), hard = kRamHardFloor;
+    const MemoryStalls none{false, 0.0, 0.0}, calm{true, 2.0, 0.0}, busy{true, kStallSomePct, 0.0};
+    auto check = [&](const char* what, bool ok) {
+        std::printf("ram level %-60s -> %s\n", what, ok ? "ok" : "   <-- WRONG");
+        fail |= !ok;
+    };
+    // a run of `ms` of readings at `gib_avail`, then the level of the last sample
+    auto run = [&](BelowFloorClock& clk, int64_t& t, double gib_avail, int64_t ms, const MemoryStalls& st) {
+        RamLevel lv = RamLevel::Ok;
+        for (int64_t end = t + ms; t <= end; t += 100)
+            lv = ram_level(gib(gib_avail), floor, hard, st, clk.update(t, ram_below_floor(gib(gib_avail), floor)));
+        return lv;
+    };
+    {
+        BelowFloorClock clk;
+        int64_t t = 0;
+        check("a 3 s dip below the guard stays low", run(clk, t, 3.05, 3000, none) == RamLevel::Low);
+        check("back above the guard: ok", run(clk, t, 5.0, 100, none) == RamLevel::Ok);
+        check("a 9.9 s dip after it restarts the run, still low", run(clk, t, 3.05, 9900, none) == RamLevel::Low);
+    }
+    {
+        BelowFloorClock clk;
+        int64_t t = 0;
+        check("below for 9 s: low", run(clk, t, 3.05, 9000, none) == RamLevel::Low);
+        check("below for 10 s: critical", run(clk, t, 3.05, 1000, none) == RamLevel::Critical);
+        check("RAM back: ok", run(clk, t, 4.0, 100, none) == RamLevel::Ok);
+        check("a new dip is low again", run(clk, t, 3.05, 500, none) == RamLevel::Low);
+    }
+    {
+        BelowFloorClock clk;
+        int64_t t = 0;
+        check("swinging around the guard every 2 s never goes critical", [&] {
+            for (int i = 0; i < 20; i++)
+                if (run(clk, t, i % 2 ? 3.2 : 3.05, 2000, none) == RamLevel::Critical) return false;
+            return true;
+        }());
+    }
+    {
+        BelowFloorClock clk;
+        int64_t t = 0;
+        check("under the hard floor: critical at the first sample", run(clk, t, 0.9, 0, none) == RamLevel::Critical);
+    }
+    {
+        BelowFloorClock clk;
+        int64_t t = 0;
+        check("stall reading calm: low however long below", run(clk, t, 3.05, 30000, calm) == RamLevel::Low);
+        check("stall reading busy: critical at once", run(clk, t, 3.05, 0, busy) == RamLevel::Critical);
+    }
+    return fail;
+}
 // The serve guard's level: below the floor a request runs on unless RAM is under the hard floor or the OS stalls on it
 int ram_level_cases() {
     using namespace basalt::platform;
@@ -436,20 +490,21 @@ int ram_level_cases() {
         {"below the floor, some stalls at the limit", 2.5, busy, RamLevel::Critical},
         {"below the floor, full stalls at the limit", 2.5, stalled, RamLevel::Critical},
         {"above the floor, stalls high", 5.0, stalled, RamLevel::Ok},
-        {"below the floor, no stall reading", 2.5, none, RamLevel::Critical},
+        {"below the floor, no stall reading, brief", 2.5, none, RamLevel::Low},
         {"above the floor, no stall reading", 5.0, none, RamLevel::Ok},
     };
     const char* names[] = {"ok", "low", "critical"};
     for (const Case& c : cases) {
-        const RamLevel got = ram_level(gib(c.avail), floor, hard, c.st);
+        const RamLevel got = ram_level(gib(c.avail), floor, hard, c.st, 0);
         std::printf("ram level %-60s -> %s%s\n", c.what, names[(int) got], got == c.want ? "" : "   <-- WRONG");
         fail |= got != c.want;
     }
     // a hard floor above the guard's own is capped at it
-    const bool capped = ram_level(gib(1.5), gib(2.0), gib(4.0), calm) == RamLevel::Critical &&
-                        ram_level(gib(2.5), gib(2.0), gib(4.0), calm) == RamLevel::Ok;
+    const bool capped = ram_level(gib(1.5), gib(2.0), gib(4.0), calm, 0) == RamLevel::Critical &&
+                        ram_level(gib(2.5), gib(2.0), gib(4.0), calm, 0) == RamLevel::Ok;
     std::printf("ram level %-60s -> %s\n", "hard floor above the guard's", capped ? "capped" : "not capped   <-- WRONG");
     fail |= !capped;
+    fail |= ram_level_sustained_cases();
     return fail;
 }
 // How long a request arriving below the floor waits
