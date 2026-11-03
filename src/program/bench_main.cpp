@@ -1262,6 +1262,9 @@ int main(int argc, char** argv) {
                 j.key("tokens_per_pass"); j.num(r.d.generated > r.d.accepted ? (double) r.d.generated / (double) (r.d.generated - r.d.accepted) : 0.0);
                 j.key("mean_draft_len"); j.num(r.d.offered > 0 ? (double) r.d.offered / window_count(r) : 0.0);
                 j.key("finish"); j.str(r.d.finish);
+                j.key("hit_pct"); j.num(r.d.lookups > 0 ? 100.0 * (double) r.d.hits / (double) r.d.lookups : 0.0);
+                j.key("hits"); j.integer(r.d.hits);
+                j.key("lookups"); j.integer(r.d.lookups);
                 if (r.name == "struct") { j.key("checksum_ok"); j.boolean(!r.checksum_bad); }
                 if (r.win.present) {
                     j.key("windows"); j.integer(r.win.windows);

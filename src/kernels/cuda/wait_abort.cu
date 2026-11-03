@@ -58,9 +58,16 @@ std::string wait_abort_text(unsigned long long code) {
     const unsigned who = (unsigned) (code >> 56) & 0x7fu;
     char buf[128];
     std::snprintf(buf, sizeof buf, "%s: kind %u, line %u, block %u",
-                  who == kWaitMidChain ? "mid chain" : who == kWaitCommitFinisher ? "commit finisher" : "device wait",
+                  who == kWaitMidChain ? "mid chain" : who == kWaitCommitFinisher ? "commit finisher"
+                  : who == kWaitHostRelease ? "released by the host" : "device wait",
                   (unsigned) (code >> 48) & 0xffu, (unsigned) (code >> 32) & 0xffffu, (unsigned) code);
     return buf;
+}
+
+void wait_abort_release() {
+    if (g_abort_host == nullptr) return;
+    volatile unsigned long long* const w = g_abort_host;
+    if (*w == 0) *w = (1ull << 63) | ((unsigned long long) kWaitHostRelease << 56);   // a wait's own code stays
 }
 
 void wait_abort_clear() {

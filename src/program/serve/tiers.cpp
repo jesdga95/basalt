@@ -477,7 +477,7 @@ bool Runtime::xq_advance(bool wait) {
             pw = w;
         }
         if (deferred) {   // the RAM copies are queued once the next window is launched, and run beside it
-            ver.set_post_launch([&, pw] {
+            auto copies = [&, pw] {
                 const auto& lay2 = basalt::kernels::cpu::expert_layout();
                 std::vector<uint32_t> ord;   // layer order: a layer's word goes up right after its own copies
                 for (uint32_t i = 0; i < (uint32_t) xq.size(); ++i)
@@ -497,7 +497,13 @@ bool Runtime::xq_advance(bool wait) {
                                      cudaGetErrorString(cudaGetLastError()));
                 }
                 cudaEventRecord(adapt_ev, adapt_stream);
-            });
+            };
+            // a copy from pageable RAM holds the calling thread until the copy runs, and a window launched ahead of it
+            // waits for that thread to serve its rings: such a round's copies are queued here, before the window
+            if (std::all_of(xq.begin(), xq.end(), [&](const XSwap& x) { return x.p2p || srcp->pinned(x.layer, x.in); }))
+                ver.set_post_launch(std::move(copies));
+            else
+                copies();
         } else {
             cudaEventRecord(adapt_ev, adapt_stream);
         }
