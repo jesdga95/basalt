@@ -88,8 +88,13 @@ grammar form) is not enforced.
 The standalone generator starts verification at the last prompt token, including position zero for a one-token
 prompt. The initial window has one row; subsequent windows use the same verifier and draft policy as longer prompts.
 
-Verify guarantees that a token's logits are bit for bit those of plain decode, whatever the window width
-(verify.hpp:3-8). This section tests that end to end.
+In ordinary single-stream decode, verify gives a token the same logits as plain decode, whatever the window width
+(verify.hpp:3-8). This section tests that end to end. The GDN middle of windows of one to four rows runs as the
+mid chain. Windows of five to eight rows do too below 160 SMs; at 160 SMs or more they keep the three separate
+kernels, whose output projection already has the mid chain's reduction order. The width guarantee holds on every device for this path. Profiled runs (`--profile`), batched windows (`--batch`) and a GDN
+mixer split across two cards run the three separate kernels instead; on a device with fewer than 160 SMs their output
+projection rounds differently from the mid chain, so those runs are exact among themselves but not bitwise equal to a
+plain run there.
 
 The default window is 8 tokens (`--spec 8`; an explicit `--spec N` is used as given). Greedy decoding with the drafter
 stays exact at any window. A sampled request is still drawn from the model's own distribution, but the window length
