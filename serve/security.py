@@ -2,10 +2,20 @@
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import socket
 
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
+
+
+# proxies announce themselves with these; ordinary clients send none of them
+FORWARDING_HEADERS = frozenset((
+    "forwarded", "via", "x-real-ip", "x-client-ip", "client-ip", "true-client-ip", "x-cluster-client-ip",
+    "cf-connecting-ip", "fastly-client-ip", "x-originating-ip", "x-remote-ip", "x-remote-addr", "x-host",
+    "x-proxyuser-ip", "wl-proxy-client-ip", "proxy-connection"))
+FORWARDING_PREFIXES = ("x-forwarded-", "x-original-", "x-envoy-", "x-amzn-", "x-azure-", "x-appengine-", "cf-",
+                       "tailscale-")
 
 
 def exposed_without_key(host: str, api_key: str) -> bool:
@@ -70,8 +80,7 @@ def host_name(value) -> str:
     return v if v and all(c.isalnum() or c in "-._" for c in v) else ""
 
 
-def _is_ip(name: str) -> bool:
-    import ipaddress
+def is_ip(name: str) -> bool:
     try:
         ipaddress.ip_address(name)
         return True
@@ -130,7 +139,7 @@ def host_allowed(host, names, any_host=False) -> bool:
     if any_host or not (host or "").strip():
         return True
     name = host_name(host)
-    return bool(name) and (_is_ip(name) or name == "localhost" or name.endswith(".localhost")
+    return bool(name) and (is_ip(name) or name == "localhost" or name.endswith(".localhost")
                            or _name_in(name, names))
 
 
@@ -150,6 +159,52 @@ def origin_allowed(origin: str, host, names, origins=()) -> bool:
         return True
     name = host_name(rest)
     return bool(name) and (name in LOOPBACK_NAMES or name.endswith(".localhost") or _name_in(name, names))
+
+
+def peer_of(client_address) -> str:
+    """The socket peer's address as text; "" when there is none."""
+    try:
+        return str(client_address[0])
+    except (TypeError, IndexError, KeyError):
+        return ""
+
+
+def loopback_peer(address) -> bool:
+    """127.0.0.0/8, ::1 or an IPv4-mapped ::ffff:127.x; anything else, this machine's LAN address too, is not."""
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return (getattr(ip, "ipv4_mapped", None) or ip).is_loopback
+
+
+def _loopback_host(host) -> bool:
+    """A Host value only a client of this machine sends. Any other name fails, which also covers a rebinding page."""
+    name = host_name(host)
+    return name == "localhost" or loopback_peer(name) or name in ("0.0.0.0", "::")
+
+
+def remote_reason(client_address, headers) -> str:
+    """"" when a request is provably from this machine, else why not. Only the socket peer can make a request local;
+    headers can only make it remote: a proxy's forwarding headers, a Host that is not a loopback name, any Origin or a
+    Fetch Metadata value other than `none`, which a desktop app's main process sends. No web page counts as local, the
+    server's own neither. Unparsable headers count too: the parser drops whatever follows a malformed line, which can
+    hide a proxy's own."""
+    if not peer_of(client_address):
+        return "no-peer"
+    if not loopback_peer(peer_of(client_address)):
+        return "peer"
+    if headers is None or headers.defects or headers.get_payload():
+        return "headers"
+    names = [k.lower().replace("_", "-") for k in headers.keys()]
+    if any(n in FORWARDING_HEADERS or n.startswith(FORWARDING_PREFIXES) for n in names):
+        return "forwarded"
+    hosts = headers.get_all("Host") or []
+    if len(hosts) != 1 or not _loopback_host(hosts[0]):
+        return "host"
+    if headers.get_all("Origin") or any(v.strip().lower() != "none" for v in headers.get_all("Sec-Fetch-Site") or []):
+        return "origin"
+    return ""
 
 
 def origins_of(value, key: str, wildcard: bool) -> list[str]:

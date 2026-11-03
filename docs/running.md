@@ -219,6 +219,8 @@ Image input is one server option, `--vision off | dynamic | cpu | <GPU number>` 
 `server` section). It is `off` by default. The encoder is Basalt's own and shares its kernels in every mode, so all
 of them give bitwise identical embeddings.
 
+What a request may name as an image depends on where it comes from: [image sources](configuration/image-sources.md).
+
 | mode | where the encoder runs | VRAM cost | fresh-image latency (IQ3_S, 400 W, earlier build) |
 | --- | --- | --- | --- |
 | `off` | no image input | none | |

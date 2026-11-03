@@ -8,6 +8,7 @@ import socket
 import sys
 import threading
 import time
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -23,7 +24,7 @@ from serve.frontend import anthropic_to_messages, forced_call, openai_to_message
 from serve.api.openai import openai_chunks, openai_collect
 from serve.api.responses import ResponsesError
 from serve.prompt import primed
-from serve.security import host_allowed, host_names_for, key_matches, origin_allowed
+from serve.security import host_allowed, host_names_for, key_matches, origin_allowed, peer_of, remote_reason
 from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, Service, _debug_req
 from serve.api.structured import anthropic_format, check_format
 from serve.util.text import stop_strings
@@ -143,6 +144,11 @@ def make_handler(svc: Service):
                 self._json(415, {"error": {"message": "send application/json"}})
                 return True
             return False
+
+        def _image_access(self):
+            """What this request may name as an image, from its own connection."""
+            why = "remote-only" if svc.image_sources.remote_only else remote_reason(self.client_address, self.headers)
+            return replace(svc.image_sources, local=not why, why=why, peer=peer_of(self.client_address))
 
         def _watch_client(self, cancel: threading.Event) -> None:
             """Cancel the request when its client hangs up, polling every 0.5 s: a readable socket with nothing to
@@ -540,7 +546,8 @@ def make_handler(svc: Service):
             max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             stop_strings(req)                                 # likewise a bad stop
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force,
+                                                 image_access=self._image_access())
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)
@@ -683,7 +690,8 @@ def make_handler(svc: Service):
                 raise ResponsesError(str(e), "stop") from None
             svc.load()
             try:
-                ids, thinking, max_new = svc.prepare(messages, tools, kw, req.get("max_output_tokens") or 0, force=force)
+                ids, thinking, max_new = svc.prepare(messages, tools, kw, req.get("max_output_tokens") or 0, force=force,
+                                                     image_access=self._image_access())
             except ResponsesError:
                 raise
             except ValueError as e:                          # too long for the context, or an image without vision
@@ -716,7 +724,8 @@ def make_handler(svc: Service):
             svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             checked_sampling(req)                             # likewise a sampling value out of range
             stop_strings(req)                                 # likewise a bad stop
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force,
+                                                 image_access=self._image_access())
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)

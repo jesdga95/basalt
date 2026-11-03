@@ -92,7 +92,7 @@ def _has_image(content) -> bool:
 def _image_source(part: dict) -> str:
     """An image part's source as a data: URL, http(s) URL or local path (OpenAI, Responses and Anthropic shapes)."""
     if part.get("type") == "image":
-        src = part.get("source") or {}
+        src = part.get("source") if isinstance(part.get("source"), dict) else {}
         if src.get("type") == "base64":
             return f"data:{src.get('media_type', 'image/png')};base64,{src.get('data', '')}"
         return src.get("url") or src.get("path") or ""

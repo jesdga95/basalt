@@ -52,7 +52,7 @@ A config file is one JSON object with two optional blocks:
 ```
 
 - Keys are the flag names without the dashes (`_` works for `-`). Values are strings or numbers; a switch is `true`, and
-  `false` leaves it off. A repeatable option (`allowed-host`, `cors-origin`) takes a list.
+  `false` leaves it off. A repeatable option (`allowed-host`, `cors-origin`, `image-url-host`, `image-dir`) takes a list.
 - `model` and `tokenizer` paths are relative to the config file.
 - **Precedence:** command line > config file > built-in defaults. The engine receives the config file's flags, then
   the command line's, and a flag given twice takes its last value.
@@ -224,7 +224,10 @@ plain decoding would give.
 
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
-| `vision` | server | `off`, `dynamic`, `cpu`, a GPU number | `off` | Image input; booleans are refused. A GPU number, as `gpu` numbers them: encoder sidecar always on that card (about 2.2 GiB of its expert cache), whatever the engine's cards are and no engine role needed. `dynamic`: inside the engine, borrowing expert-cache slots only while it reads an image. `cpu`: sidecar on the CPU, no VRAM, slow. Latencies: [running](../running.md#vision---vision). A GPU number needs the `basalt-vision` binary next to `bin/basalt`. Needs a model file with a vision projector. One image is capped at 64 megapixels before it is decoded. |
+| `vision` | server | `off`, `dynamic`, `cpu`, a GPU number | `off` | Image input; booleans are refused. A GPU number, as `gpu` numbers them: encoder sidecar always on that card (about 2.2 GiB of its expert cache), whatever the engine's cards are and no engine role needed. `dynamic`: inside the engine, borrowing expert-cache slots only while it reads an image. `cpu`: sidecar on the CPU, no VRAM, slow. Latencies: [running](../running.md#vision---vision). A GPU number needs the `basalt-vision` binary next to `bin/basalt`. Needs a model file with a vision projector. One image is capped at 32 MiB and 64 megapixels before it is decoded. |
+| `image-url-host` | server | `HOST` or `HOST:PORT`, repeatable | none | Let requests from other machines name `http(s)` image URLs on exactly this host. Requests from this machine need no flag. [image sources](image-sources.md) |
+| `image-dir` | server | directory, repeatable | none | Let requests from other machines name image files under this directory. Requests from this machine need no flag. [image sources](image-sources.md) |
+| `image-remote-only` | server | switch | off | Treat requests from this machine as remote too. Set it when anything on this machine forwards other people's requests to the server. [image sources](image-sources.md) |
 
 Diagnostic flags: [diagnostics](diagnostics.md)
 
