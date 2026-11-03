@@ -821,6 +821,103 @@
       "prefill_16k_tps": 7696.1,
       "prefill_64k_tps": 11629.7,
       "decode_tps": 497.8
+    },
+    {
+      "submitter": "Hazelhof",
+      "date": "2026-10-26",
+      "commit": "31aacda2d4",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 26.8
+        },
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 26.8
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "Intel Core Ultra 7 270K Plus, 24 cores",
+      "ram_gbps": 88.8,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 5031.8,
+      "prefill_64k_tps": 5580.6,
+      "decode_tps": 286.1
+    },
+    {
+      "submitter": "Hazelhof",
+      "date": "2026-10-26",
+      "commit": "31aacda2d4",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 26.7
+        },
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 26.7
+        },
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 26.7
+        },
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 26.7
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "Intel Core Ultra 7 270K Plus, 24 cores",
+      "ram_gbps": 86.9,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 5045.4,
+      "prefill_64k_tps": 5581.2,
+      "decode_tps": 343.0
+    },
+    {
+      "submitter": "Cosmin-Local-Ai",
+      "date": "2026-10-26",
+      "commit": "b2fe96bf30",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.9
+        }
+      ],
+      "ram_gib": 60,
+      "cpu": "AMD Ryzen 9 9950X3D, 16 cores",
+      "ram_gbps": 71.1,
+      "os": "Linux",
+      "quant": "IQ3_S",
+      "prefill_16k_tps": 4876.9,
+      "prefill_64k_tps": 4961.0,
+      "decode_tps": 186.8
     }
   ]
 }

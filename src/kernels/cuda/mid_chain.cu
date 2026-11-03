@@ -39,6 +39,7 @@ namespace mkc {   // mkmid
 // the kernel's argument record
 struct MP {
     Geo geo;
+    int T;                               // window rows (the instance's TM when TM <= RXT)
     const uint8_t* xq;                   // the first read's q8_1 rows
     const uint8_t *wq, *wz, *wo;
     DecRecArgs rec;
@@ -87,9 +88,11 @@ __device__ __forceinline__ void stamp_at(const MP& p, int b, int pt) {
     p.stamps[((size_t) p.lay * kMidStampCtas + b) * kMidStampPts + pt] = t;
 }
 
-template <int T, int FQ, int FZ, int FO, bool ST>
+// TM: the window's rows, or (TM > RXT) their bound, the rows then read from p.T
+template <int TM, int FQ, int FZ, int FO, bool ST>
 __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    const int T = TM <= RXT ? TM : p.T;
 #define STP(cond, pt) do { if constexpr (ST) { if (cond) stamp_at(p, b, pt); } } while (0)
     extern __shared__ __align__(128) char sm_dyn[];
     char* sm = sm_dyn;
@@ -239,9 +242,9 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
             const float v = __uint_as_float(ldca32(p.abv + head * 2 * XT + lane));
             ((lane & 1) ? RS_.b[rank] : RS_.g[rank])[lane >> 1] = v;
         }
-        float xq[XT], xk[XT], xv[XT], zz[XT];
+        float xq[TM], xk[TM], xv[TM], zz[TM];
 #pragma unroll
-        for (int t = 0; t < XT; ++t) {
+        for (int t = 0; t < TM; ++t) {
             xq[t] = t < T ? a.qkv[(size_t) t * Cc + cq] : 0.0f;
             xk[t] = t < T ? a.qkv[(size_t) t * Cc + ck] : 0.0f;
             xv[t] = t < T && rg == 1 ? a.qkv[(size_t) t * Cc + cv] : 0.0f;
@@ -249,9 +252,9 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
         }
         // the state tile: after the hop and the qkv loads (an in-flight 64 KB copy delays this SM's loads and polls)
         if (tid == 0) { pfence(); mbar_expect_tx(&P.rbar, S * S * 4); tma_2d(sm, reinterpret_cast<const CUtensorMap*>(&p.stm), head * S, 0, &P.rbar); }
-        float yq[XT], yk[XT];
+        float yq[TM], yk[TM], yv[TM];   // yv: rank's value columns (rg 1), held for the second half's staging
 #pragma unroll
-        for (int t = 0; t < XT; ++t) {
+        for (int t = 0; t < TM; ++t) {
             if (t >= T) break;
             yq[t] = conv_silu_x(hq, wq, xq, t);
             yk[t] = conv_silu_x(hk, wk, xk, t);
@@ -259,21 +262,21 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
             for (int o = 16; o > 0; o >>= 1) { sq += __shfl_xor_sync(0xffffffffu, sq, o); sk += __shfl_xor_sync(0xffffffffu, sk, o); }
             if (lane == 0) { RS_.part[rank][0][t][rg] = sq; RS_.part[rank][1][t][rg] = sk; }
             if (rg == 1) {
-                const float yv = conv_silu_x(hv, wv, xv, t);
-                RS_.v[rank][t][lane] = yv;
-                a.h[(size_t) t * Cc + cv] = yv;
+                yv[t] = conv_silu_x(hv, wv, xv, t);
+                if (t < RXT) RS_.v[rank][t][lane] = yv[t];
+                a.h[(size_t) t * Cc + cv] = yv[t];
             }
         }
         barn(bid, 128);
         const bool write_qk = rank == 0 && head < a.h_k;
 #pragma unroll
-        for (int t = 0; t < XT; ++t) {
+        for (int t = 0; t < TM; ++t) {
             if (t >= T) break;
             const float ssq = RS_.part[rank][0][t][0] + RS_.part[rank][0][t][1] + RS_.part[rank][0][t][2] + RS_.part[rank][0][t][3];
             const float ssk = RS_.part[rank][1][t][0] + RS_.part[rank][1][t][1] + RS_.part[rank][1][t][2] + RS_.part[rank][1][t][3];
             yq[t] *= rsqrtf(ssq + a.eps);
             yk[t] *= rsqrtf(ssk + a.eps);
-            if (rank == 0) { RS_.qn[t][ltid] = yq[t]; RS_.kn[t][ltid] = yk[t]; }
+            if (rank == 0 && t < RXT) { RS_.qn[t][ltid] = yq[t]; RS_.kn[t][ltid] = yk[t]; }
             if (write_qk) { a.h[(size_t) t * Cc + cq] = yq[t]; a.h[(size_t) t * Cc + ck] = yk[t]; }
         }
         if (ltid < T) {
@@ -292,19 +295,30 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
         if (out_role && hi == n_heads - 1 && tid == 32) out_req(b);
         float wsum_t = 0.0f;
         for (int t = 0; t < T; ++t) {
+            if (TM > RXT && t == RXT) {   // the second half's q/k/v into the staging rows, once every rank has read the first's
+                cbar();
+#pragma unroll
+                for (int u = RXT; u < TM; ++u) {
+                    if (u >= T) break;
+                    if (rank == 0) { RS_.qn[u - RXT][ltid] = yq[u]; RS_.kn[u - RXT][ltid] = yk[u]; }
+                    if (rg == 1) RS_.v[rank][u - RXT][lane] = yv[u];
+                }
+                cbar();
+            }
+            const int ts = TM > RXT && t >= RXT ? t - RXT : t;   // the token's staging row
             const float gg = __expf(RS_.g[rank][t]);
             float kv = 0.0f;
 #pragma unroll
-            for (int r = 0; r < RPG; ++r) kv = fmaf(sreg[r], RS_.kn[t][rg * RPG + r], kv);
+            for (int r = 0; r < RPG; ++r) kv = fmaf(sreg[r], RS_.kn[ts][rg * RPG + r], kv);
             RS_.red_kv[rank][rg][lane] = kv;
             barn(bid, 128);
             const float kv_col = RS_.red_kv[rank][0][lane] + RS_.red_kv[rank][1][lane] + RS_.red_kv[rank][2][lane] + RS_.red_kv[rank][3][lane];
-            const float delta = (RS_.v[rank][t][lane] - gg * kv_col) * RS_.b[rank][t];
+            const float delta = (RS_.v[rank][ts][lane] - gg * kv_col) * RS_.b[rank][t];
             float o = 0.0f;
 #pragma unroll
             for (int r = 0; r < RPG; ++r) {
-                sreg[r] = fmaf(gg, sreg[r], RS_.kn[t][rg * RPG + r] * delta);
-                o = fmaf(sreg[r], RS_.qn[t][rg * RPG + r], o);
+                sreg[r] = fmaf(gg, sreg[r], RS_.kn[ts][rg * RPG + r] * delta);
+                o = fmaf(sreg[r], RS_.qn[ts][rg * RPG + r], o);
             }
             RS_.red_o[rank][rg][lane] = o;
             barn(bid, 128);
@@ -323,10 +337,10 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
         STP(tid == 0, ST_R_PZ);
         if (rg == 0)
 #pragma unroll
-            for (int t = 0; t < XT; ++t) zz[t] = t < T ? a.z[(size_t) t * value_dim + head * S + col] : 0.0f;
+            for (int t = 0; t < TM; ++t) zz[t] = t < T ? a.z[(size_t) t * value_dim + head * S + col] : 0.0f;
         if (rg == 0) {
 #pragma unroll
-            for (int t = 0; t < XT; ++t) {
+            for (int t = 0; t < TM; ++t) {
                 if (t >= T) break;
                 const float ss = RS_.wsum[t][0] + RS_.wsum[t][1] + RS_.wsum[t][2] + RS_.wsum[t][3];
                 norm_q8(a, t, head, a.h_v, rank, lane, RS_.oc[rank][t][lane], ss, gam, zz[t]);
@@ -339,11 +353,11 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
     if (out_role) {
         const int g = lane >> 2, t = lane & 3, nb32 = O_NIN / 32;
         const int ors = P.geo.ors, osb = sb_bytes(P.geo.to);
-        constexpr bool oxs_fixed = FO != 0 && make_geo(23, 23, FO).ox + T * (O_NIN / 32) * kQ81 <= OFF_PERM;
-        const bool oxs = FO != 0 ? oxs_fixed : P.geo.ox + T * nb32 * kQ81 <= OFF_PERM;   // x staged in smem (else read from L2 through L1)
+        constexpr int RC = o_rc(TM);
+        constexpr bool oxs_fixed = FO != 0 && TM <= RXT && make_geo(23, 23, FO, RC).ox + TM * (O_NIN / 32) * kQ81 <= OFF_PERM;
+        const bool oxs = FO != 0 && TM <= RXT ? oxs_fixed : P.geo.ox + T * nb32 * kQ81 <= OFF_PERM;   // x staged in smem (else read from L2 through L1)
         const uint8_t* xsm = oxs ? reinterpret_cast<const uint8_t*>(sm + P.geo.ox) : P.lyq;
         float* red = reinterpret_cast<float*>(sm + P.geo.ored);
-        constexpr int RC = O_RC;
         if (oxs) {
             if (tid == 0) hop_copy(&c[C_REC], R_HV, sm + P.geo.ox, P.lyq, (unsigned) (T * nb32 * kQ81), &P.oxbar);
             MW(&P.oxbar, PB_OX);
@@ -542,12 +556,14 @@ MFn mid_pick_st(int q, int z, int o) {
     if (q == 14 && z == 14 && o == 14) return k_mid<T, 14, 14, 14, true>;
     return k_mid<T, 0, 0, 0, true>;
 }
+// a window of more than RXT rows: one instance per type triple, the rows at run time
 MFn mid_pick(int T, int q, int z, int o, bool st = false) {
     switch (T) {
         case 1: return st ? mid_pick_st<1>(q, z, o) : mid_pick_t<1>(q, z, o);
         case 2: return st ? mid_pick_st<2>(q, z, o) : mid_pick_t<2>(q, z, o);
         case 3: return st ? mid_pick_st<3>(q, z, o) : mid_pick_t<3>(q, z, o);
-        default: return st ? mid_pick_st<4>(q, z, o) : mid_pick_t<4>(q, z, o);
+        case 4: return st ? mid_pick_st<4>(q, z, o) : mid_pick_t<4>(q, z, o);
+        default: return st ? mid_pick_st<XT>(q, z, o) : mid_pick_t<XT>(q, z, o);
     }
 }
 }  // namespace
@@ -571,7 +587,8 @@ void mid_chain_init() {
               cudaMemset(d.cnt, 0, (2 * NCTR + 1) * 4) == cudaSuccess &&
               cudaMalloc((void**) &d.abv, (size_t) R_HV * 2 * XT * 4) == cudaSuccess &&
               cudaMemcpyToSymbol(mkb_word, &word, sizeof word) == cudaSuccess;
-    for (int t = 1; ok && t <= kMidChainMaxT; ++t) {
+    for (const int t : {1, 2, 3, 4, XT}) {
+        if (!ok) break;
         ok = cudaFuncSetAttribute((const void*) mid_pick(t, 0, 0, 0), cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX) == cudaSuccess;
         if (ok) ok = cudaFuncSetAttribute((const void*) mid_pick(t, 0, 0, 0, true), cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX) == cudaSuccess;
         if (ok) ok = cudaFuncSetAttribute((const void*) mid_pick(t, 14, 14, 14, true), cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX) == cudaSuccess;
@@ -587,7 +604,7 @@ void mid_chain_init() {
     }
 }
 
-int mid_chain_ring_slots(int type_q, int type_z, int type_o) { return make_geo(type_q, type_z, type_o).ns; }
+int mid_chain_ring_slots(int type_q, int type_z, int type_o) { return make_geo(type_q, type_z, type_o, 4).ns; }
 
 bool mid_chain_supported(const MidChainArgs& a) {
     const MidDev& d = mid_dev();
@@ -605,7 +622,8 @@ void mid_chain(const MidChainArgs& a, void* stream) {
         std::exit(1);
     }
     MP p{};
-    p.geo = make_geo(a.type_q, a.type_z, a.type_o);
+    p.geo = make_geo(a.type_q, a.type_z, a.type_o, o_rc(a.T));
+    p.T = a.T;
     p.xq = static_cast<const uint8_t*>(a.xq);
     p.wq = static_cast<const uint8_t*>(a.wq);
     p.wz = static_cast<const uint8_t*>(a.wz);

@@ -33,10 +33,10 @@ With `--max-context` above 8192 the KV cache is elastic (not with `--kv-resident
 fine): each session backs its first 8192 cells at startup (the K/V pools, the indexer's block keys, the RoPE tables
 and the draft layer's K/V alike), and the rest of that VRAM holds the expert cache's last slots until a request needs
 it. A request backs its prompt plus 8192 cells before the prompt is read (and 8192 more whenever decode runs past
-that) by taking those slots back; their experts become CPU misses read from their RAM copies. The next request that
-needs less gives the cells back and the cache refills the slots from RAM, so a short request decodes with the cache a
-8k context would have. With `--parallel` a slot whose share is above 4096 tokens backs 4096 cells at startup and grows
-by 4096. An idle conversation's KV stays until requests beside it have run 15 s, then moves to RAM (outside
+that) by taking those slots back; their experts become CPU misses (a long prompt's go to a peer card). The next request
+that needs less gives the cells back and the cache refills the slots from RAM, so a short request decodes with the cache
+an 8k context would have. With `--parallel` a slot whose share is above 4096 tokens backs 4096 cells at startup and
+grows by 4096. An idle conversation's KV stays until requests beside it have run 15 s, then moves to RAM (outside
 `--conversation-cache-mib`, above the RAM floors; else only to the disk tier holding it) when a request needs VRAM or
 the engine is idle; its next turn reads it back. The startup line and each move say `elastic KV: ...` (a move out:
 `slot N's idle conversation ...`). The cache never goes below the slots a prompt chunk needs: a request whose KV would
@@ -164,7 +164,8 @@ per slot, `gpus` with `util`, `power` and `temp` per card) and the fastest reque
 `--conversation-cache-disk-mib N` (an engine flag, also `"conversation-cache-disk-mib"` in the config's `engine`
 section) parks conversations on disk under the RAM cache, in at most N MiB. It is off at 0, the default. It writes to
 the folder `conversations` inside the model's cache folder (`~/.cache/basalt/<hash>/`, where the engine log is);
-`--conversation-cache-dir DIR` only names another folder, and does nothing on its own. When the tier is on the server
+`--conversation-cache-dir DIR` only names another folder, and does nothing on its own. On Linux the folders the engine
+creates for the tier and the files it writes there are its user's only (0700, 0600); on Windows they take the parent folder's access list. When the tier is on the server
 prints `[disk] conversations=DIR disk-mib=N` at start. A conversation of at least 8192 tokens that leaves its session
 (another one takes its slot), that the RAM cache evicts, or that the engine still holds when it ends (a stop, an idle
 unload) is written to DIR: one file for its tokens and running state, and shared files for its K/V cache (one per 4096

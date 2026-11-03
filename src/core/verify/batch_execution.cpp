@@ -53,10 +53,6 @@ bool Verifier::stage_batch(const int* slots, const int* lens, int S, int hbase, 
         }
     refresh_ar();
     if (!capture_batch(R, hbase, err) || !capture_commit_batch(R, err)) return false;
-    if (R > S && !batch_seg_ple_) {
-        err = "verify: batch segments of several rows need the PLE window kernels";
-        return false;
-    }
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
     const int64_t CB = 2 + max_t_;
@@ -166,12 +162,14 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     if (dm && !dm_stage_places(err)) return false;
     order_after_commit();
     set_head_keep(0);   // the slots sample with their own parameters: every row exact
+    if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(R, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
-    const int64_t steps = le_ - lb_;
+    const int64_t steps = ar_on() ? 0 : le_ - lb_;   // the zero-doorbell graph rings no layer
+    if (ar_on()) ar_handoff();
     for (int64_t k = 0; k < steps; ++k) {
         const int64_t l = lb_ + k;
         const uint32_t want = (uint32_t) (k + 1);
@@ -224,10 +222,12 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
+    progress_at("verify batch: waiting for the GPU to finish the window", R);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     const bool dm_ok = !dm || dm_end(err);
     if (!window_intact(err) || !dm_ok) return false;
     if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
+    if (!ar_plan_intact(err)) return false;
     if (prof_on_) collect_profile();
     ++windows;
     if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_segs(rows, lens, S, tokens, pos, pool, next_user_, out, err);
@@ -320,10 +320,12 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     if (!stage_batch(rows, nullptr, S, base, tokens, pos, err)) return false;
     order_after_commit();
     set_head_keep(0);   // the slots sample with their own parameters: every row exact
+    if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(S, base)], cs_);
     if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[S], cs_);   // right behind it: every row is kept
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
+    if (ar_on()) ar_handoff();
     if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
         for (int t = 0; t < S; ++t) {
             SessionState& sx = *slots_[(size_t) rows[t]];
@@ -332,7 +334,7 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
         }
     b_running_ = true;
     b_k_ = 0;
-    b_steps_ = le_ - lb_;
+    b_steps_ = ar_on() ? 0 : le_ - lb_;   // the zero-doorbell graph rings no layer
     b_last_ = Clock::now();
     return true;
 }
@@ -385,8 +387,16 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         ++b_k_;
     }
     const cudaError_t q = cudaStreamQuery(cs_);
-    if (q == cudaErrorNotReady) return 0;
+    if (q == cudaErrorNotReady) {
+        if (Clock::now() - b_last_ > std::chrono::seconds(20)) {
+            err = "verify batch: timed out at the window's end" + released_note(release_gpu_waits(5000));
+            b_running_ = false;
+            return -1;
+        }
+        return 0;
+    }
     if (q != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(q); b_running_ = false; return -1; }
+    if (!window_intact(err) || !ar_plan_intact(err)) { b_running_ = false; return -1; }
     if (prof_on_) collect_profile();
     if (last_stage()) {
         if (!sample_rows(S, err)) { b_running_ = false; return -1; }

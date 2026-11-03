@@ -245,19 +245,18 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const block_iq2_s * bxi = (const block_iq2_s *) x + kbx0 + i*stride;
 
         const int       qs_packed = get_int_b2(bxi->qs, kqsx);
-        const uint8_t * qs        = (const uint8_t *) &qs_packed;
 
         const int qh = bxi->qh[kqsx];
 
         const int       signs_packed_32 = get_int_b2(bxi->qs, QK_K/32 + kqsx);
-        const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
 
 #pragma unroll
         for (int l = 0; l < QR2_S; ++l) {
-            const int * grid_pos = (const int *)(iq2s_grid + (qs[l] | ((qh << (8-2*l)) & 0x300)));
+            const int * grid_pos = (const int *)(iq2s_grid + (packed_byte(qs_packed, l) | ((qh << (8-2*l)) & 0x300)));
 
-            const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
-            const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
+            const uint32_t sgn = packed_byte(signs_packed_32, l);
+            const int signs0 = __vcmpne4(((sgn & 0x03) << 7) | ((sgn & 0x0C) << 21), 0x00000000);
+            const int signs1 = __vcmpne4(((sgn & 0x30) << 3) | ((sgn & 0xC0) << 17), 0x00000000);
 
             const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
             const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
@@ -347,21 +346,20 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const block_iq3_s * bxi = (const block_iq3_s *) x + kbx0 + i*stride;
 
         const int2      qs_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
-        const uint8_t * qs        = (const uint8_t *) &qs_packed;
 
         const int qh = bxi->qh[kqsx];
 
         const int       signs_packed_32 = get_int_b2(bxi->signs, kqsx);
-        const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
 
 #pragma unroll
         for (int l = 0; l < QR3_S; ++l) {
             const int2 grid_pos = make_int2(
-                iq3s_grid[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
-                iq3s_grid[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
+                iq3s_grid[packed_byte(qs_packed, 2*l+0) | ((qh << (8 - 2*l)) & 0x100)],
+                iq3s_grid[packed_byte(qs_packed, 2*l+1) | ((qh << (7 - 2*l)) & 0x100)]);
 
-            const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
-            const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
+            const uint32_t sgn = packed_byte(signs_packed_32, l);
+            const int signs0 = __vcmpne4(((sgn & 0x03) << 7) | ((sgn & 0x0C) << 21), 0x00000000);
+            const int signs1 = __vcmpne4(((sgn & 0x30) << 3) | ((sgn & 0xC0) << 17), 0x00000000);
 
             const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
             const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
