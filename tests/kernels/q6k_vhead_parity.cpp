@@ -5,6 +5,8 @@
 //   - the rows near each column's top are exact (the bits of q6k_head_mmvq), every other row is the CPU score of the
 //     copy, and the argmax is the exact one;
 //   - every column is bitwise the column computed alone, at every width;
+//   - with the first k columns marked discarded (`col_from`), the others keep the full call's bits and the first k
+//     their approximate scores; with every column discarded nothing is written, and the next call is exact again;
 // for two sets of columns: all at a head's spread, and with flat columns (a small spread puts most rows within the
 // margin, as a prompt row folded into a window can); then a cold microbench of both kernels per set.
 //   q6k_vhead_parity [rows] [iters] [spread|flat]     (iters 0: no microbench, e.g. under compute-sanitizer)
@@ -188,6 +190,8 @@ int main(int argc, char** argv) {
     cudaEventCreate(&e1);
     void* flush = nullptr;
     ck(cudaMalloc(&flush, 256u << 20), "flush");
+    int* d_cf = nullptr;   // the kernel's col_from
+    ck(cudaMalloc(&d_cf, sizeof(int)), "col_from");
     // one set of columns: column c is the random column c times scale[c], quantized
     auto run_set = [&](const char* set, const float* scale) {
         for (int c = 0; c < MT; ++c)
@@ -275,6 +279,32 @@ int main(int argc, char** argv) {
                 argmax_bad += am != bm;
             }
             exact_rows[nc] = (double) n_exact / nc;
+            long skip_bad = 0;   // the discarded-columns contract, at two widths
+            if (nc == 4 || nc == 8) {
+                const int kk = nc / 2, all = nc;
+                ck(cudaMemcpy(d_cf, &kk, sizeof(int), cudaMemcpyHostToDevice), "col_from k");
+                k::q6k_vhead(proxy, w, xq, y1, kNin, rows, nc, scratch, s, d_cf);
+                ck(cudaStreamSynchronize(s), "skip k");
+                std::vector<float> c((size_t) nc * rows);
+                ck(cudaMemcpy(c.data(), y1, c.size() * 4, cudaMemcpyDeviceToHost), "c");
+                skip_bad += std::memcmp(&c[(size_t) kk * rows], &b[(size_t) kk * rows], (size_t) (nc - kk) * rows * 4) != 0;
+                for (int col = 0; col < kk; ++col)
+                    for (int r = 0; r < rows; ++r) {
+                        const double ap = approx[(size_t) col * rows + r];
+                        skip_bad += std::fabs((double) c[(size_t) col * rows + r] - ap) > 2e-3 * (1.0 + std::fabs(ap));
+                    }
+                ck(cudaMemcpy(d_cf, &all, sizeof(int), cudaMemcpyHostToDevice), "col_from all");
+                ck(cudaMemset(y1, 0xff, (size_t) nc * rows * 4), "sentinel");
+                k::q6k_vhead(proxy, w, xq, y1, kNin, rows, nc, scratch, s, d_cf);
+                ck(cudaStreamSynchronize(s), "skip all");
+                std::vector<uint32_t> u((size_t) nc * rows);
+                ck(cudaMemcpy(u.data(), y1, u.size() * 4, cudaMemcpyDeviceToHost), "u");
+                for (uint32_t v : u) skip_bad += v != 0xffffffffu;
+                k::q6k_vhead(proxy, w, xq, y1, kNin, rows, nc, scratch, s);
+                ck(cudaStreamSynchronize(s), "after skip");
+                ck(cudaMemcpy(c.data(), y1, c.size() * 4, cudaMemcpyDeviceToHost), "c2");
+                skip_bad += std::memcmp(c.data(), b.data(), c.size() * 4) != 0;
+            }
             // cold time: each launch after a flush of the L2
             float tot[2] = {0, 0};
             for (int it = 0; it < iters; ++it)
@@ -290,11 +320,12 @@ int main(int argc, char** argv) {
                     tot[v] += ms;
                 }
             const double u0 = iters > 0 ? 1e3 * tot[0] / iters : 0.0, u1 = iters > 0 ? 1e3 * tot[1] / iters : 0.0;
-            const bool bad = missed || off_cpu || argmax_bad || width_bad;
+            const bool bad = missed || off_cpu || argmax_bad || width_bad || skip_bad;
             std::printf("%s ncols %d: %s (near-top rows not exact %ld, approximate rows off the CPU score %ld, max dev "
-                        "%.2e, argmax differs %ld, columns differing from the column alone %ld; exact rows per column %.0f) | "
+                        "%.2e, argmax differs %ld, columns differing from the column alone %ld, discarded-columns errors %ld; exact "
+                        "rows per column %.0f) | "
                         "cold: q6k_head %6.1f us | vhead %6.1f us | %.2fx\n",
-                        set, nc, bad ? "FAIL" : "ok", missed, off_cpu, max_dev, argmax_bad, width_bad, exact_rows[nc], u0, u1,
+                        set, nc, bad ? "FAIL" : "ok", missed, off_cpu, max_dev, argmax_bad, width_bad, skip_bad, exact_rows[nc], u0, u1,
                         u1 > 0.0 ? u0 / u1 : 0.0);
             if (bad) fail = 1;
         }

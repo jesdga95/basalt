@@ -409,7 +409,8 @@ __global__ void q6k_vproxy_pack_kernel(const Q6KBlock* __restrict__ q6, int64_t 
 template <int NC>
 __global__ void __launch_bounds__(128) q6k_vscore_kernel(const uint4* __restrict__ wq, const uint4* __restrict__ sc,
                                                          const Q81Block* __restrict__ x, float* __restrict__ y,
-                                                         int n_out, VScratch* __restrict__ vs) {
+                                                         int n_out, VScratch* __restrict__ vs,
+                                                         const int* __restrict__ col_from) {
     __shared__ float4 xf[80][4];   // per group and column pair: the two scales, then -1.5 x scale x sum of q
     __shared__ float red[4][16][9];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
@@ -424,6 +425,8 @@ __global__ void __launch_bounds__(128) q6k_vscore_kernel(const uint4* __restrict
         }
     }
     pdl_wait();
+    // no column's pick is used: every block leaves at once (no histogram entry, so the scratch stays clear)
+    if (col_from != nullptr && *(volatile const int*) col_from >= NC) return;
     for (int i = tid; i < 80 * 8; i += 128) {
         const int grp = i >> 3, col = i & 7;
         float dd = 0.0f, xs = 0.0f;
@@ -555,13 +558,17 @@ __global__ void __launch_bounds__(128) q6k_vscore_kernel(const uint4* __restrict
 // column's rows are the same bits at every window width.
 __global__ void __launch_bounds__(VRESCORE) q6k_vrescore_kernel(const Q6KBlock* __restrict__ w,
                                                            const Q81Block* __restrict__ x, float* __restrict__ y,
-                                                           int n_out, int ncols, const VScratch* __restrict__ vs) {
+                                                           int n_out, int ncols, const VScratch* __restrict__ vs,
+                                                           const int* __restrict__ col_from) {
     extern __shared__ __align__(16) int2 xv[];   // the columns' q8_1 values, then the block's list
     uint32_t* list = reinterpret_cast<uint32_t*>(xv + (size_t) ncols * XBLK * 8);
     __shared__ float thr[8];
     __shared__ unsigned count;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     pdl_wait();
+    // the columns below `cf` keep their approximate logits: their picks are discarded
+    const int cf = col_from != nullptr ? max(0, *(volatile const int*) col_from) : 0;
+    if (cf >= ncols) return;
     for (int i = tid; i < ncols * XBLK * 8; i += blockDim.x) {
         const int b = i / 8, pos = i % 8;
         const Q81Block* blk = x + b;
@@ -575,7 +582,7 @@ __global__ void __launch_bounds__(VRESCORE) q6k_vrescore_kernel(const Q6KBlock* 
     const int n4 = n_out / 4;
     const int total = ncols * n4;
     constexpr int step = VRESCORE;
-    for (int i0 = blockIdx.x * step; i0 < total; i0 += gridDim.x * step) {
+    for (int i0 = cf * n4 + blockIdx.x * step; i0 < total; i0 += gridDim.x * step) {
         const int i = i0 + tid;
         unsigned m = 0u;
         int col = 0, r4 = 0;
@@ -640,11 +647,12 @@ int vscore_grid(int n_out) {
 }
 
 template <int NC>
-void vscore_launch(const void* proxy, const void* x, float* y, int n_out, VScratch* vs, cudaStream_t s) {
+void vscore_launch(const void* proxy, const void* x, float* y, int n_out, VScratch* vs, const int* col_from,
+                   cudaStream_t s) {
     const unsigned grid = (unsigned) vscore_grid(n_out);
     const uint4* wq = (const uint4*) proxy;
     const uint4* sc = (const uint4*) ((const char*) proxy + vlevels_bytes(n_out));
-    launch_pdl(q6k_vscore_kernel<NC>, dim3(grid), dim3(128), 0, s, wq, sc, (const Q81Block*) x, y, n_out, vs);
+    launch_pdl(q6k_vscore_kernel<NC>, dim3(grid), dim3(128), 0, s, wq, sc, (const Q81Block*) x, y, n_out, vs, col_from);
 }
 
 }  // namespace
@@ -765,7 +773,7 @@ bool q6k_vhead_supported(int n_in, int n_out, int ncols) {
 }
 
 void q6k_vhead(const void* proxy, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
-               void* scratch, void* stream) {
+               void* scratch, void* stream, const int* col_from) {
     if (!q6k_vhead_supported(n_in, n_out, ncols) || !proxy || !weights || !x_q8_1 || !y || !scratch) {
         basalt::log::error("basalt", "q6k_vhead: unsupported shape (n_in %d, n_out %d, ncols %d)", n_in, n_out, ncols);
         std::exit(1);
@@ -773,14 +781,14 @@ void q6k_vhead(const void* proxy, const void* weights, const void* x_q8_1, float
     const auto s = (cudaStream_t) stream;
     VScratch* vs = (VScratch*) scratch;
     switch (ncols) {
-        case 1: vscore_launch<1>(proxy, x_q8_1, y, n_out, vs, s); break;
-        case 2: vscore_launch<2>(proxy, x_q8_1, y, n_out, vs, s); break;
-        case 3: vscore_launch<3>(proxy, x_q8_1, y, n_out, vs, s); break;
-        case 4: vscore_launch<4>(proxy, x_q8_1, y, n_out, vs, s); break;
-        case 5: vscore_launch<5>(proxy, x_q8_1, y, n_out, vs, s); break;
-        case 6: vscore_launch<6>(proxy, x_q8_1, y, n_out, vs, s); break;
-        case 7: vscore_launch<7>(proxy, x_q8_1, y, n_out, vs, s); break;
-        default: vscore_launch<8>(proxy, x_q8_1, y, n_out, vs, s); break;
+        case 1: vscore_launch<1>(proxy, x_q8_1, y, n_out, vs, col_from, s); break;
+        case 2: vscore_launch<2>(proxy, x_q8_1, y, n_out, vs, col_from, s); break;
+        case 3: vscore_launch<3>(proxy, x_q8_1, y, n_out, vs, col_from, s); break;
+        case 4: vscore_launch<4>(proxy, x_q8_1, y, n_out, vs, col_from, s); break;
+        case 5: vscore_launch<5>(proxy, x_q8_1, y, n_out, vs, col_from, s); break;
+        case 6: vscore_launch<6>(proxy, x_q8_1, y, n_out, vs, col_from, s); break;
+        case 7: vscore_launch<7>(proxy, x_q8_1, y, n_out, vs, col_from, s); break;
+        default: vscore_launch<8>(proxy, x_q8_1, y, n_out, vs, col_from, s); break;
     }
     static int sms[64] = {};
     static std::atomic<bool> ready[64];
@@ -797,7 +805,7 @@ void q6k_vhead(const void* proxy, const void* weights, const void* x_q8_1, float
         }
     }
     launch_pdl(q6k_vrescore_kernel, dim3((unsigned) sms[dev]), dim3(VRESCORE), vrescore_smem(ncols), s,
-               (const Q6KBlock*) weights, (const Q81Block*) x_q8_1, y, n_out, ncols, (const VScratch*) vs);
+               (const Q6KBlock*) weights, (const Q81Block*) x_q8_1, y, n_out, ncols, (const VScratch*) vs, col_from);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         basalt::log::error("basalt", "q6k_vhead: %s", cudaGetErrorString(e));
