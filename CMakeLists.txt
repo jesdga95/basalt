@@ -1289,7 +1289,10 @@ if(BASALT_ARM64)
   target_include_directories(ggml_dots_neon PRIVATE include src/kernels/cpu/ggml)
   target_compile_options(ggml_dots_neon PRIVATE ${_isa_neon_dot_flags})
   set_target_properties(ggml_dots_neon PROPERTIES C_STANDARD 11 C_EXTENSIONS ON POSITION_INDEPENDENT_CODE ON)
-  target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp $<TARGET_OBJECTS:ggml_dots_neon>)
+  target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/nvfp4_neon.cpp
+                                     $<TARGET_OBJECTS:ggml_dots_neon>)
+  # the multi-token NVFP4 rows, bitwise equal per token to the NEON dot above
+  set_source_files_properties(src/kernels/cpu/nvfp4_neon.cpp PROPERTIES COMPILE_OPTIONS "${_isa_neon_dot_flags}")
 else()
   # The CPU dot products are built for AVX2 and for AVX-512, each with its own name for the table lookup;
   # ggml_cpu_dispatch.cpp picks one at run time (cpu_avx512_ok / cpu_avx2_ok).

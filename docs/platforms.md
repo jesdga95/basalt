@@ -39,7 +39,7 @@ behind one declaration, and a test in `tests/platform/` that runs on both.
 | Win32 | `win.hpp` | the only inclusion of `windows.h` |
 
 The CPU kernels are per architecture, chosen by CMake (`cmake/target_arch.cmake`): AVX2 / AVX-512 on x86-64,
-NEON with the dot product on Arm64 (`expert_neon.cpp`, `router_q4_neon.cpp`, `ggml/ggml_cpu_dots_neon.c`,
+NEON with the dot product on Arm64 (`expert_neon.cpp`, `nvfp4_neon.cpp`, `router_q4_neon.cpp`, `ggml/ggml_cpu_dots_neon.c`,
 `src/vision/gemm_cpu_neon.cpp`). Shared code calls an x86 kernel only inside `if constexpr (platform::kX86)`.
 
 Programs that take paths carry a manifest (`src/platform/basalt.exe.manifest`) that makes the

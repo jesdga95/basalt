@@ -67,10 +67,11 @@ python3 -c "import sys; sys.path.insert(0,'tools'); from model_file import Model
 
 The Windows on Arm build (MSVC 19.51, on an RTX Spark's N1X) replaces the AVX2 / AVX-512 CPU kernels with NEON ones
 that use the dot product: the Q2_0 expert kernel (`expert_neon.cpp`), the ggml dot products
-(`ggml/ggml_cpu_dots_neon.c`, llama.cpp's Arm kernels with Basalt's NVFP4 scale), the router warm-up dot and the vision
-encoder's CPU GEMM. They sum in their own order, so the CPU tier's rows differ from the x86 builds' within the same
-tolerances. The GPU kernels are the same source, built for compute capability 12.1. The programs above on the same
-expert section, and `native_expert_parity` on the NVFP4 pack's layer 0:
+(`ggml/ggml_cpu_dots_neon.c`, llama.cpp's Arm kernels with Basalt's NVFP4 scale), the NVFP4 expert rows for several
+tokens at once (`nvfp4_neon.cpp`), the router warm-up dot and the vision encoder's CPU GEMM. They sum in their own
+order, so the CPU tier's rows differ from the x86 builds' within the same tolerances. The GPU kernels are the same
+source, built for compute capability 12.1. The programs above on the same expert section, and `native_expert_parity`
+on the NVFP4 pack's layer 0:
 
 | check | MSVC 19.51 (Windows on Arm64) |
 | --- | --- |
@@ -82,13 +83,15 @@ expert section, and `native_expert_parity` on the NVFP4 pack's layer 0:
 | `pool_test` | 0 failures |
 | pool output vs the serial run | 0 of 25600 differ, worst \|d\| 0.000e+00 |
 | NVFP4 NEON dot vs plain C (`--experts PACK.basalt 0`) | 3200 rows, rel 2.16e-07 |
+| NVFP4 multi-token rows vs the NEON dot, 1 to 9 tokens | 90 token-rowsets, 0 differ in any bit |
 | NVFP4 CPU expert vs the GPU's, layer 0 | rel 7.24e-08 |
 | Q6_K NEON dot vs a double reference (`--cpu-synthetic q6_K/q8_0`) | worst error / sum\|terms\| 1.26e-08 |
 
-The figures sit where the x86 builds' do. The native rows take the per-token NEON dot for any number of tokens, so a
-token rounds the same alone as in a window. The build reproduces its own tokens: `conv`, 256 tokens,
-`--expert-cache 21000`, identical in two runs. No x86 build's tokens have been compared with it, and no PPL/KLD run
-exists for Arm64.
+The figures sit where the x86 builds' do. The NVFP4 rows take `nvfp4_neon.cpp` for any number of tokens, bitwise
+equal per token to the NEON dot, so a token rounds the same alone as in a window, and the kernel left the tokens of
+`prose` and `conv` (512 tokens, `--expert-cache 23500 --mmap-experts`) unchanged. The build reproduces its own tokens:
+`conv`, 256 tokens, `--expert-cache 21000`, identical in two runs. No x86 build's tokens have been compared with it,
+and no PPL/KLD run exists for Arm64.
 
 ## Reproduce
 

@@ -446,25 +446,26 @@ int gpu_nvfp4(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, const s
               const std::vector<float>& G, const std::vector<float>& U, const std::vector<float>& D, const float* sc,
               const std::vector<float>& ref, const std::vector<float>& got_c, cudaStream_t s);
 
-// NVFP4 multi-token AVX-512 kernel against the single-token ggml dot this CPU would otherwise run (gate/up with s_gate,
-// s_up and SwiGLU, down with s_down): bitwise equal for every token count 1..9 (9 crosses the 8-token pass) and for
-// a row range that splits a down row pair; then a single-thread microbench, ggml dot vs the kernel, 1/2/4/8 tokens.
+// NVFP4 multi-token kernels (AVX-512 and AVX2 on x86-64, NEON on Arm64) against the single-token ggml dot this CPU
+// would otherwise run (gate/up with s_gate, s_up and SwiGLU, down with s_down): bitwise equal for every token count
+// 1..9 (9 crosses the 8-token pass, and NEON's 4-token passes) and for a row range that splits a down row pair; then a
+// single-thread microbench, ggml dot vs the kernel, 1/2/4/8 tokens.
 int check_nvfp4_multi(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, bool avx2) {
-    if constexpr (!basalt::platform::kX86) {
-        (void) f;
-        (void) blob;
-        (void) seed;
-        std::printf("          nvfp4 multi-token %s: an x86-64 kernel\n", avx2 ? "avx2" : "avx512");
-        return 0;
-    } else {
-        const char* isa = avx2 ? "avx2" : "avx512";
+    const char* isa = basalt::platform::kX86 ? (avx2 ? "avx2" : "avx512") : "neon";
+    ggml_vec_dot_t dot = nullptr;
+    if constexpr (basalt::platform::kX86) {
         if (!avx2 && !cpu::cpu_avx512_ok()) { std::printf("          nvfp4 multi-token avx512: no AVX-512 on this CPU\n"); return 0; }
         if (avx2 && !cpu::cpu_avx2_ok()) { std::printf("          nvfp4 multi-token avx2: no AVX2 on this CPU\n"); return 0; }
+        dot = (avx2 ? ggml_get_type_traits_cpu_avx2(GGML_TYPE_NVFP4)
+                    : ggml_get_type_traits_cpu_avx512(GGML_TYPE_NVFP4))->vec_dot;
+    } else {
+        if (avx2) return 0;   // the one Arm64 kernel is checked on the first call
+        dot = ggml_get_type_traits_cpu(GGML_TYPE_NVFP4)->vec_dot;
+    }
+    {
         constexpr int MT = 9;
         float sc[4];
         std::memcpy(sc, blob.data() + f.bytes - f.tail, sizeof sc);
-        const ggml_vec_dot_t dot = (avx2 ? ggml_get_type_traits_cpu_avx2(GGML_TYPE_NVFP4)
-                                          : ggml_get_type_traits_cpu_avx512(GGML_TYPE_NVFP4))->vec_dot;
         std::mt19937 rng(23 + seed);
         std::normal_distribution<float> nd(0.f, 1.f);
         std::vector<std::vector<uint8_t>> act(MT, std::vector<uint8_t>(f.act_bytes)), hq(MT, std::vector<uint8_t>(f.h_bytes));
@@ -475,12 +476,22 @@ int check_nvfp4_multi(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob,
         const void* const* hp_ = hp;
         // the kernel under test: the AVX2 one is called directly, so an AVX-512 CPU checks it too
         auto new_gu = [&](int nt, float* const* ff, int r0, int r1) {
-            if (avx2) cpu::nvfp4_256_gu_rows(blob.data(), f.gu_row, f.up_off, (int) H, sc[0], sc[1], a_, nt, ff, r0, r1);
-            else cpu::native_gu_rows(f, blob.data(), a_, nt, ff, r0, r1);
+            if constexpr (basalt::platform::kX86) {
+                if (avx2) {
+                    cpu::nvfp4_256_gu_rows(blob.data(), f.gu_row, f.up_off, (int) H, sc[0], sc[1], a_, nt, ff, r0, r1);
+                    return;
+                }
+            }
+            cpu::native_gu_rows(f, blob.data(), a_, nt, ff, r0, r1);
         };
         auto new_down = [&](int nt, float* const* out, int r0, int r1) {
-            if (avx2) cpu::nvfp4_256_down_rows(blob.data() + f.down_off, f.d_row, (int) FF, sc[2], hp_, nt, out, r0, r1);
-            else cpu::native_down_rows(f, blob.data(), hp_, nt, out, r0, r1);
+            if constexpr (basalt::platform::kX86) {
+                if (avx2) {
+                    cpu::nvfp4_256_down_rows(blob.data() + f.down_off, f.d_row, (int) FF, sc[2], hp_, nt, out, r0, r1);
+                    return;
+                }
+            }
+            cpu::native_down_rows(f, blob.data(), hp_, nt, out, r0, r1);
         };
         for (int t = 0; t < MT; ++t) {
             for (auto& v : x) v = nd(rng) * (t == 4 ? 30.f : 1.f);
