@@ -121,11 +121,13 @@ int run() {
 
     // the exchange table is allocated and stays so: compaction still runs and frees the sparse regions
     const uint64_t freed = src.homes_compact();
-    require(freed == homed && src.homes_bytes() == keep.size() * blob, "compaction after an adaptive swap kept more than the survivors");
+    require(freed > 0 && freed + src.homes_bytes() == homed, "compaction did not report the net bytes freed");
+    require(src.homes_bytes() == keep.size() * blob, "compaction after an adaptive swap kept more than the survivors");
     for (const auto& [l, e] : keep)
         require(src.has_resident(l, e) && src.equals_file(l, e, src.blob(l, e)), "a survivor lost its bytes");
     for (size_t k = 0; k < give.size(); ++k)
         if (k % 20 != 0) require(!src.has_resident(give[k].first, give[k].second), "a released expert still has a place");
+    require(src.homes_compact() == 0, "dense homes reported a second saving");
 
     // the RAM reserve counts against the budget
     src.set_homes_reserve(~0ull >> 1);

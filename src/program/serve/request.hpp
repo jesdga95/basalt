@@ -88,6 +88,7 @@ private:
                 ~KeepRouted() { on = false; }
             };
     std::optional<KeepRouted> keep_routed;
+    std::optional<KeepRouted> defer_peer;
     bool kv_ok{};
     Clock::time_point restore_t0{};
     int64_t read_from{};
