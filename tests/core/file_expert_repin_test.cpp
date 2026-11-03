@@ -1,7 +1,7 @@
 // The resident expert copy's registration around a sleep: dropped (`unpin_complement`), registered again at the same
 // addresses (`repin_start` / `repin_wait` / `repin_finish`), twice, with the device alias still the host address and
 // the bytes unchanged; then a copy out of it into the GPU cache and back.  A synthetic expert file and a small GPU
-// expert cache; needs a CUDA device (exits 77 without one).
+// expert cache; needs a CUDA device (exits 77 without one, or when the device reads the copy at addresses of its own).
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/expert_source.hpp"
 #include "basalt/ggml/ggml.h"
@@ -88,6 +88,13 @@ int run() {
     }
     // the experts the copy holds, and what they read now
     std::vector<std::pair<int64_t, int64_t>> probe = {{0, held}, {0, experts - 1}, {1, held + 7}, {1, experts - 1}};
+    // a device that reads registered host memory at addresses of its own is never handed the copy back at the same
+    // addresses: unpin_complement refuses, and the copy stays registered
+    if (src.device_alias(probe[0].first, probe[0].second) != src.blob(probe[0].first, probe[0].second)) {
+        require(!src.unpin_complement(err), "a copy the device reads at other addresses stays registered");
+        std::puts("the device reads the copy at addresses of its own: the copy stays registered, skipped");
+        return 77;
+    }
     std::vector<std::vector<uint8_t>> bytes;
     for (const auto& [l, e] : probe) {
         require(src.has_resident(l, e) && registered(src.blob(l, e)), "a resident expert is registered after the load");
