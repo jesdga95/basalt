@@ -1,4 +1,5 @@
 // src/program/serve/request_decode.cpp - request decode operations.
+#include "reply_rows.hpp"
 #include "request.hpp"
 
 namespace basalt::program::serve {
@@ -397,15 +398,12 @@ Flow Request::decode() {
         }
         tk_valid = false;
         const Clock::time_point tw1 = Clock::now();
+        // the picks this window sends and the rows it keeps: a window that ends the reply keeps no row past its
+        // last pick, and that pick is the next token, as at any window's end
+        const ReplyRows rr = reply_rows(outv.data(), e0, a, produced_n, max_new, runtime_.o.eos_ids, ppl != nullptr);
+        const int keep = rr.keep;
         // the draft launches first; the commit, the adaptive round and the output go in its shadow
-        int n_emit = 0;
-        bool eos_pre = false;
-        for (int i = e0; i <= a && produced_n + n_emit < max_new && !eos_pre; ++i) {
-            ++n_emit;
-            eos_pre = ppl == nullptr &&
-                      std::find(runtime_.o.eos_ids.begin(), runtime_.o.eos_ids.end(), (int64_t) outv[(size_t) i]) != runtime_.o.eos_ids.end();
-        }
-        const bool will_draft = !eos_pre && produced_n + n_emit < max_new;
+        const bool will_draft = !rr.ends && produced_n + rr.emit < max_new;
         float wprob[16];
         const int wprob_n = std::min(runtime_.S_mtp, 16);
         if (draft_log != nullptr)
@@ -434,11 +432,11 @@ Flow Request::decode() {
             }
         };
         basalt::core::decode_events().stamp(9);
-        if (!hold && !cv->commit(a + 1, runtime_.err, 2)) {
+        if (!hold && !cv->commit(keep, runtime_.err, 2)) {
             std::printf("ERR %s\n", runtime_.err.c_str());
             return Flow::error;
         }
-        for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+        for (int i = 0; i < keep; ++i) consumed.push_back(window[(size_t) i]);
         draft_offered += T - 1 - e0;
         draft_accepted += a - e0;
         first_window = false;
@@ -446,7 +444,7 @@ Flow Request::decode() {
         std::string cerr;
         auto after_launch = [&] {
             after_ran = true;
-            commit_ok = hold ? true : cv->commit(a + 1, cerr, 1);
+            commit_ok = hold ? true : cv->commit(keep, cerr, 1);
             if (!hold) adapt_side();
             for (int i = e0; i <= a && produced_n < max_new && !eos; ++i) {
                 std::printf("T %d\n", (int) outv[(size_t) i]);
@@ -547,8 +545,8 @@ Flow Request::decode() {
         if (eos) { finish = "stop"; break; }
         runtime_.shed_if_low();
         if (runtime_.halted()) { finish = "cancel"; break; }
-        x = outv[(size_t) a];
-        p += a + 1;
+        x = outv[(size_t) keep - 1];
+        p += keep;
         basalt::core::decode_events().stamp(2);
     }
     if (gguard != nullptr)
