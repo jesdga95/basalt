@@ -319,6 +319,7 @@ void reference_part(const Pair& p, cudaStream_t s) {
     ck(cudaMemcpy(fb.ids.p, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice), "ids");
     ck(cudaMemset(fb.dm.p, 0xff, (size_t) rows * N * 4), "sentinel");   // an unwritten row is NaN
     ck(cudaDeviceSynchronize(), "uploads");
+    fused::native_v2_override(0);   // the fused arm is the native kernels; v2 is forced on below
     run_fused(p, geo, fb, x_dev.as<float>(), T, E, {0, 1, 20, E}, blob, s);
     ck(cudaStreamSynchronize(s), "sync");
     const std::vector<float> y_mmq = download(mb.dm, (size_t) rows * N), y_f = download(fb.dm, (size_t) rows * N);
@@ -395,7 +396,7 @@ void reference_part(const Pair& p, cudaStream_t s) {
             for (int k = 0; k < K; ++k)
                 for (int o = 0; o < N; ++o)
                     z2 = std::max(z2, (double) std::fabs(y_2[(size_t) slot2[(size_t) (ZERO * K + k)] * N + o]));
-            fused::native_v2_override(-1);
+            fused::native_v2_override(0);
             if (z2 != 0)
                 throw std::runtime_error(std::string(p.name) + ": v2: the all-zero token's outputs are not zero");
             if (e2.rms > 1.5 * em.rms || e2.worst > 2.0 * em.worst)
@@ -403,8 +404,9 @@ void reference_part(const Pair& p, cudaStream_t s) {
             if (e21.rms > 0.1 * ef.rms)
                 throw std::runtime_error(std::string(p.name) + ": v2 and the fused kernels disagree");
         }
-        fused::native_v2_override(-1);
+        fused::native_v2_override(0);
     }
+    fused::native_v2_override(-1);
 }
 
 // part 2: one layer at a real chunk, timed
@@ -455,6 +457,7 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     };
     auto mmq_run = [&] { run_mmq(p, geo, ctx, mb, r, x_dev.as<float>(), src_dev.as<int32_t>(), blob, rows, s); };
     auto fused_run = [&] { run_fused(p, geo, fb, x_dev.as<float>(), T, E, {0, E}, blob, s); };
+    fused::native_v2_override(0);   // the fused arm is the native kernels; v2 is forced on below
     const bool all_routed = std::count(r.cnt.begin(), r.cnt.end(), 0) == 0;
     auto direct_run = [&] {
         run_mmq(p, geo, ctx, mb, r, x_dev.as<float>(), src_dev.as<int32_t>(), blob, rows, s, true, stride);
@@ -575,12 +578,13 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
                                     [&](size_t i) { return (int64_t) slot[i]; }, (size_t) rows);
             std::printf("  v2: median %.3f ms, min %.3f (fused back to back %.3f: %.2fx); v2 vs fused rel RMS %.3e "
                         "worst row %.3e\n", t2[4], t2[0], tf2[4], tf2[4] / t2[4], e21.rms, e21.worst);
-            fused::native_v2_override(-1);
+            fused::native_v2_override(0);
             if (e21.rms > 0.01)
                 throw std::runtime_error(std::string(p.name) + ": v2 and the fused kernels disagree (timing)");
         }
-        fused::native_v2_override(-1);
+        fused::native_v2_override(0);
     }
+    fused::native_v2_override(-1);
     cudaEventDestroy(a);
     cudaEventDestroy(b);
     if (efm.rms > 0.05) throw std::runtime_error(std::string(p.name) + ": the paths disagree at the real shape");
