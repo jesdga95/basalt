@@ -164,6 +164,8 @@ V* upload(const std::vector<V>& h) {
     V* d = nullptr;
     CK(cudaMalloc(&d, h.size() * sizeof(V) + 64));
     CK(cudaMemcpy(d, h.data(), h.size() * sizeof(V), cudaMemcpyHostToDevice));
+    // a copy from pageable memory may return before its DMA lands, and the non-blocking streams do not wait for it
+    CK(cudaDeviceSynchronize());
     return d;
 }
 template<typename V>
