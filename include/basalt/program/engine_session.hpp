@@ -16,6 +16,7 @@ struct Done {
     bool ok = false;
     std::string err;
     long long generated = 0, prompt = 0, accepted = 0, offered = 0, reused = 0, read_n = -1;
+    long long hits = 0, lookups = 0;            ///< the VRAM tier's lookups and how many of them it served
     double prompt_ms = 0, decode_ms = 0, wall_s = 0, first_token_s = -1;
     std::string finish;
 };
