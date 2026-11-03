@@ -10,6 +10,8 @@ Clone, requirements and the build commands are in the [README](../README.md). Th
 - `tools/`: the .basalt reader and writer (`model_file.py`), the PPL/KLD quality gate (`ppl_gate.py`), the greedy-identity
   check and the tokenizer.
 - `tests/`: parity and unit tests.
+- `data/`: files the engine reads at run time, among them the expert profiles (`data/profiles`, which experts start in
+  VRAM). A custom install or container image ships `data/` with the binaries, `serve/` and `tools/`.
 
 ## Warnings
 
