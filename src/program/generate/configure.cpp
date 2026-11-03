@@ -34,7 +34,15 @@ int run(int argc, char** argv) {
         const std::string prof = std::string(BASALT_SOURCE_DIR) + "/data/profiles/" + key + ".prof";
         uint64_t prof_bytes = 0;
         if (!key.empty() && basalt::platform::file_size(prof, prof_bytes) && prof_bytes > 0) o.expert_profile = prof;
-        else basalt::log::info("basalt generate", "no expert profile for %s", key.empty() ? "this model" : key.c_str());
+        else {
+            basalt::log::info("basalt generate", "no expert profile for %s", key.empty() ? "this model" : key.c_str());
+            if (o.resident_cpu_experts) {
+                basalt::log::error("basalt generate", "expert profile not found: %s; ship data/profiles with the engine "
+                                   "(or pass --mmap-experts without --resident-experts)",
+                                   key.empty() ? "the model names no architecture or layer and expert counts" : prof.c_str());
+                return 2;
+            }
+        }
         // the 8-bit hyper-connection copies
         std::map<std::string, basalt::core::Hc8Copy> table;
         if (!basalt::core::hc8_read(srcs.hc8, table, merr)) {
