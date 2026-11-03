@@ -572,7 +572,11 @@ __global__ void __launch_bounds__(32 * RG) gdn_commit_lazy_kernel(GdnCommitLayer
             const uint64_t take = min(min(o1 - o, pf.n[r] - ro), (uint64_t) 32768);
             const char* src = (const char*) pf.p[r] + ro;
             if (take >= 16) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+                for (uint64_t q = 0; q < (take & ~15ull); q += 128) asm volatile("prefetch.global.L2 [%0];" ::"l"(src + q));
+#else
                 asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src), "r"((unsigned) (take & ~15ull)) : "memory");
+#endif
                 last = src + (take & ~15ull) - 16;
             }
             o += take;

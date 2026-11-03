@@ -185,50 +185,64 @@ static_assert(alignof(CUtensorMap) >= 64, "CUtensorMap lost its alignas: the bui
 static_assert(offsetof(HcLaunch, tm) % 64 == 0, "the TMA descriptors must sit on the map boundary");
 
 // ---------------------------------------------------------------- primitives
+// The transaction barriers, bulk and tensor copies and the async-proxy fence need compute capability 9.0.  Below it
+// these helpers trap (hc_fused_supported() is false there, so no launch reaches them); the L2 prefetch is a hint and
+// is left out.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+#define HC_SM90_ONLY(...) __trap()
+#else
+#define HC_SM90_ONLY(...) __VA_ARGS__
+#endif
 __device__ __forceinline__ unsigned smem_u32(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
 __device__ __forceinline__ void mbar_init(uint64_t* bar, unsigned count) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_u32(bar)), "r"(count) : "memory");
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    HC_SM90_ONLY(asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_u32(bar)), "r"(count) : "memory"));
+    HC_SM90_ONLY(asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory"));
 }
 __device__ __forceinline__ void mbar_expect_tx(uint64_t* bar, unsigned bytes) {
-    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(bar)), "r"(bytes) : "memory");
+    HC_SM90_ONLY(asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(bar)), "r"(bytes) : "memory"));
 }
 __device__ __forceinline__ void mbar_wait(uint64_t* bar, unsigned ph) {
     unsigned done = 0;
     while (!done) {
-        asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
-                     : "=r"(done) : "r"(smem_u32(bar)), "r"(ph) : "memory");
+        HC_SM90_ONLY(asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
+                                  : "=r"(done) : "r"(smem_u32(bar)), "r"(ph) : "memory"));
     }
 }
 __device__ __forceinline__ void mbar_arrive(uint64_t* bar) {
-    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(bar)) : "memory");
+    HC_SM90_ONLY(asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(bar)) : "memory"));
 }
 __device__ __forceinline__ void bulk_g2s(void* dst, const void* src, unsigned bytes, uint64_t* bar) {
-    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-                 ::"r"(smem_u32(dst)), "l"(src), "r"(bytes), "r"(smem_u32(bar)) : "memory");
+    HC_SM90_ONLY(asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                              ::"r"(smem_u32(dst)), "l"(src), "r"(bytes), "r"(smem_u32(bar)) : "memory"));
 }
 // A 2D tensor copy (box of the map) at element coordinates (x, y) into shared memory, completing on bar.
 __device__ __forceinline__ void tma_2d(void* dst, const CUtensorMap* map, int x, int y, uint64_t* bar) {
-    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
-                 ::"r"(smem_u32(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(x), "r"(y), "r"(smem_u32(bar))
-                 : "memory");
+    HC_SM90_ONLY(asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+                              ::"r"(smem_u32(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(x), "r"(y), "r"(smem_u32(bar))
+                              : "memory"));
 }
 __device__ __forceinline__ void tma_3d(void* dst, const CUtensorMap* map, int x, int y, int z, uint64_t* bar) {
-    asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4}], [%5];"
-                 ::"r"(smem_u32(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(x), "r"(y), "r"(z), "r"(smem_u32(bar))
-                 : "memory");
+    HC_SM90_ONLY(asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4}], [%5];"
+                              ::"r"(smem_u32(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(x), "r"(y), "r"(z), "r"(smem_u32(bar))
+                              : "memory"));
 }
 __device__ __forceinline__ void tma_4d(void* dst, const CUtensorMap* map, int x, int y, int z, int w, uint64_t* bar) {
-    asm volatile("cp.async.bulk.tensor.4d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4, %5}], [%6];"
-                 ::"r"(smem_u32(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(x), "r"(y), "r"(z), "r"(w), "r"(smem_u32(bar))
-                 : "memory");
+    HC_SM90_ONLY(asm volatile("cp.async.bulk.tensor.4d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4, %5}], [%6];"
+                              ::"r"(smem_u32(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(x), "r"(y), "r"(z), "r"(w), "r"(smem_u32(bar))
+                              : "memory"));
 }
+__device__ __forceinline__ void fence_proxy_async() { HC_SM90_ONLY(asm volatile("fence.proxy.async;" ::: "memory")); }
 __device__ __forceinline__ void prefetch_l2(const void* p, size_t bytes) {   // 16-byte aligned, multiple of 16
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
     const char* c = (const char*) p;
     for (size_t o = 0; o < bytes; o += 65536) {
         const unsigned sz = (unsigned) (bytes - o < 65536 ? bytes - o : 65536);
         asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(c + o), "r"(sz) : "memory");
     }
+#else
+    (void) p;
+    (void) bytes;
+#endif
 }
 // DBG: the bench's phase times (a separate instantiation of the kernel); otherwise no code at all
 template <bool DBG>
@@ -1039,7 +1053,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
                 while (ld_acquire(&sy->down.v) < (unsigned) CN_ND) {}
                 stamp<DBG>(dbg, b, 11, 0);
                 if (lst) {
-                    asm volatile("fence.proxy.async;" ::: "memory");
+                    fence_proxy_async();
                     mbar_expect_tx(&lbar, lst_p + lst_s);
                     bulk_g2s(lsm, L.cnp, lst_p, &lbar);
                     bulk_g2s(lsm + T * CN_HS * CN_ROWS, L.cns, lst_s, &lbar);

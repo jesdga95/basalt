@@ -92,6 +92,10 @@ uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_ba
                        const basalt::kernels::QsaShapes& s);
 uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused);
 bool fused_layout(size_t T, bool src);
+/// The FP4 block-scaled tensor cores (mma kind::mxf4nvf4, fp4/moe_fp4.cu, built for 12.0a only) exist on compute
+/// capability 12.x.  On another card (Ada, 8.9) an NVFP4 pack's prompt experts take the MMQ path (int8 tiles from the
+/// pack's NVFP4 blocks, mmq_nvfp4.cu) for every chunk size, and the buffers are sized for it.  The current device.
+bool fp4_tensor_cores();
 bool fp4_pack();
 size_t fp4_x_bytes(size_t rows, int64_t ne);
 size_t fp4_h_bytes(size_t rows);

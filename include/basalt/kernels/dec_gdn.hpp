@@ -5,7 +5,7 @@
 //
 // Every value is the one the per-stage kernels produce (gdn_conv_l2_multi, gdn_ab_multi, gdn_step_norm_multi,
 // native_quantize_q8_1): the same operations on the same values in the same order, so a token's outputs do not
-// depend on T or its column.  Needs thread-block clusters.
+// depend on T or its column.  Needs thread-block clusters (compute capability 9.0 and up).
 #pragma once
 
 #include <cstddef>
@@ -63,7 +63,8 @@ void dec_gdn_rec_norm(const DecRecArgs& a, int n_tok, void* stream);
 
 /// The verify window's GDN block around native q8_1 + qkv/z/out projections, as run: dec_gdn_rec_split beside the z
 /// projection (z forked after the q8_1, beside qkv too), then dec_gdn_rec_norm.  Mode 1 is dec_gdn_rec after z, 2 forks
-/// z after qkv.
-inline constexpr int dec_gdnf_mode() { return 3; }
+/// z after qkv.  The fused recurrence runs on thread-block clusters, so a card below compute capability 9.0 (Ada) gets
+/// mode 0: the callers then take the per-stage kernels (gdn_conv_l2_multi, gdn_ab_multi, gdn_step_norm_multi).
+int dec_gdnf_mode();
 
 }  // namespace basalt::kernels

@@ -308,13 +308,21 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: commit stream create failed";
         return false;
     }
+    // Below compute capability 9.0 the lazy commit stays off (no lz_s_, so lazy_on() is false): its read-ahead blocks
+    // wait on the stop word beside the MoE tail, whose grids fill the card and wait across blocks, and the window
+    // deadlocks; its commit alone, or a read-ahead that does not wait, competes with the MoE tail and costs more than it
+    // saves.
+    bool lazy_dev = true;
     {
-        int sms = 0;
+        int sms = 0, major = 0;
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device_ >= 0 ? device_ : 0);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_ >= 0 ? device_ : 0);
         fin_blocks_ = sms;
+        lazy_dev = major >= 9;
+        if (!lazy_dev) basalt::log::info("basalt verify", "lazy GDN commit off: compute capability %d.x", major);
     }
     if (!basalt::kernels::gdn_commit_lazy_none(commit_ctl_) ||
-        cudaStreamCreateWithPriority(&lz_s_, cudaStreamNonBlocking, cs_prio) != cudaSuccess ||
+        (lazy_dev && cudaStreamCreateWithPriority(&lz_s_, cudaStreamNonBlocking, cs_prio) != cudaSuccess) ||
         cudaEventCreateWithFlags(&lz_fork_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&lz_join_, cudaEventDisableTiming) != cudaSuccess) {
         err = "verify: lazy commit stream create failed";

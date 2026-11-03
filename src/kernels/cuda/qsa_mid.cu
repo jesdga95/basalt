@@ -180,6 +180,13 @@ void launch_half(const void* w, const void* x, float* y, int n_in, int n_out, in
 
 bool qsa_qproj_half_supported(int type, const void* w, int n_in, int n_out) {
     if (!(dense_tc_mask() & 8) || !dense_tc_supported(type, n_in, n_out, w) || !dense_tc_type_on(type)) return false;
+    int dev = 0, major = 0;   // the whole-tile layout runs on bulk copies (compute capability 9.0)
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (major < 9) return false;
     const int sb = sb_of(type);
     if (sb == 0 || n_in % 512 != 0 || n_out % 512 != 0 || ((uintptr_t) w & 15) != 0) return false;
     // dense_tc's whole-tile layout for this shape: more tiles than SMs (not the one-tile path), two tiles in 90 KB; and

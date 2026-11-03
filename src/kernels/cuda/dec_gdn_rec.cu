@@ -19,11 +19,20 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include "basalt/log.hpp"
 
 namespace cg = cooperative_groups;
+
+// Thread-block clusters (distributed shared memory, barrier.cluster) exist from compute capability 9.0.  Below it - the
+// 8.9 build, or any device pass for a compute capability under 9.0 - the cluster kernels trap and rec_block keeps only its
+// SPLIT form (no cluster), which the peer mixer item and dec_gdn_rec_split run; the callers take the unfused recurrence
+// (dec_gdnf_mode() == 0) on such a card.  BASALT_ARCH_BELOW_SM90 is CMake's: a build with no architecture of 9.0 or up.
+#if defined(BASALT_ARCH_BELOW_SM90) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900)
+#define REC_NO_CLUSTER 1
+#endif
 
 namespace basalt::kernels {
 namespace {
@@ -166,9 +175,14 @@ __device__ __forceinline__ void rec_sync() {
 
 // One block of a head's cluster.  `head` = the launch's value head (head_map), `rank` = its column group.  SPLIT: no cluster and no z; the
 // head's raw output goes to a.o for dec_gdn_rec_norm.
+#ifdef REC_NO_CLUSTER
+using RecCluster = void;   // no cluster_group below compute capability 9.0: only SPLIT blocks run, with nullptr
+#else
+using RecCluster = cg::cluster_group;
+#endif
 template<int MAXT, bool SPLIT, bool SUB = false>
 __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, int rank, RecSmem& sm,
-                                          cg::cluster_group* cluster) {
+                                          RecCluster* cluster) {
     const int rg = threadIdx.x / 32, lane = threadIdx.x % 32, tid = threadIdx.x;
     stamp(a, 0);
     const int col = rank * 32 + lane;
@@ -200,9 +214,11 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     asm volatile("cp.async.commit_group;" ::: "memory");
     const float dt = a.dt[gh], sa = a.ssm_a[gh], gam = a.gamma[col];
     stamp(a, 1);
-    if (a.early_trigger) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");   // the out projection may stage its weights
+    if (a.early_trigger) pdl_launch_dependents();   // the out projection may stage its weights (griddepcontrol, 9.0+)
     // this block has started: the barrier the ranks wait on before writing into each other's shared memory
+#ifndef REC_NO_CLUSTER
     if (!SPLIT) asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+#endif
     // alpha and beta read only the hc output and constants, both complete before this kernel can launch (its
     // predecessor passed its own wait on the hc read), so they are computed while the projections still run
     asm volatile("cp.async.wait_all;" ::: "memory");
@@ -314,6 +330,9 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     if (SPLIT) return;
     // every rank's sums of squares, pushed into every rank's shared memory (once every rank has started) before one
     // cluster barrier
+#ifdef REC_NO_CLUSTER
+    __trap();   // unreachable: a non-SPLIT block is never launched below compute capability 9.0
+#else
     asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
     if (rg == 0) {
         const int t = lane / 4, r = lane % 4;
@@ -321,6 +340,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
         if (t < T) *cluster->map_shared_rank(&sm.wsum[t][rank], r) = v;
     }
     cluster->sync();
+#endif
     stamp(a, 7);
 
     // ---- the gated RMS norm and the q8_1 of the output: one warp, one q8_1 block per token
@@ -336,11 +356,21 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     stamp(a, 9);
 }
 
+#ifdef REC_NO_CLUSTER
+#define REC_CLUSTER_DIMS   // no cluster attribute below compute capability 9.0; the kernel traps if it is ever launched
+#else
+#define REC_CLUSTER_DIMS __cluster_dims__(4, 1, 1)
+#endif
+
 template<int MAXT>
-__global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_kernel(const DecRecArgs a, int T) {
+__global__ void REC_CLUSTER_DIMS __launch_bounds__(S) rec_kernel(const DecRecArgs a, int T) {
+#ifdef REC_NO_CLUSTER
+    __trap();
+#else
     __shared__ RecSmem sm;
     cg::cluster_group cl = cg::this_cluster();
     rec_block<MAXT, false>(a, T, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
+#endif
 }
 
 template<int MAXT>
@@ -352,8 +382,11 @@ __global__ void __launch_bounds__(S) rec_split_kernel(const DecRecArgs a, int T)
 // rec_kernel over a segmented window: cluster row y is a window row, of which only a segment's first works, on the
 // segment's rows and state
 template<int MAXT>
-__global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(const DecRecArgs a0, const SegRow* rows,
-                                                                              size_t state_off) {
+__global__ void REC_CLUSTER_DIMS __launch_bounds__(S) rec_seg_kernel(const DecRecArgs a0, const SegRow* rows,
+                                                                     size_t state_off) {
+#ifdef REC_NO_CLUSTER
+    __trap();
+#else
     const SegRow r = rows[blockIdx.y];
     if (r.j != 0) return;
     __shared__ RecSmem sm;
@@ -366,6 +399,7 @@ __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(co
     if (a.y) a.y += r0 * vd;
     a.yq = static_cast<char*>(a.yq) + r0 * (vd / 32) * sizeof(Q81);
     rec_block<MAXT, false>(a, r.n, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
+#endif
 }
 
 // one warp per (token, value head): the head's four 32-value sums of squares in rank order, then norm_q8 per rank
@@ -441,6 +475,23 @@ void dec_gdn_rec_split(const DecRecArgs& a, int n_tok, void* stream) {
     else launch_pdl(rec_split_kernel<kDecMaxT>, grid, block, 0, s, a, n_tok);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { basalt::log::error("basalt", "dec_gdn_rec_split: %s", cudaGetErrorString(e)); std::exit(1); }
+}
+
+int dec_gdnf_mode() {
+    static std::atomic<signed char> known[64];   // per device: 0 unknown, else 1 + the mode
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return 0; }
+    signed char k = known[dev].load(std::memory_order_acquire);
+    if (k == 0) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return 0;
+        }
+        k = (signed char) (1 + (major >= 9 ? 3 : 0));
+        known[dev].store(k, std::memory_order_release);
+    }
+    return k - 1;
 }
 
 void dec_gdn_rec_norm(const DecRecArgs& a, int n_tok, void* stream) {

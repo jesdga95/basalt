@@ -59,7 +59,9 @@ __host__ __device__ constexpr int one_row_stride(int row_bytes) {
 __device__ __align__(4) int8_t dtc_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
                                                 1,    13,   25,  38,  53,  69,  89,  113};
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+// The int8 mma and the row decoders need compute capability 8.0; the persistent kernel below runs on them and cp.async
+// alone, the tile, one-tile and pair kernels also on bulk copies and mbarriers (9.0).
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void mma_k32(int (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                         uint32_t b1) {
     asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
@@ -351,7 +353,7 @@ __device__ __forceinline__ void half_sb_terms(float (&acc)[4], const uint8_t* co
 }
 #endif
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 // block blk of nblk; smem: smem_bytes<TYPE, S, MT, KS>() bytes, 128-byte aligned
 template<int TYPE, int S, int MT, int KS>
 __device__ __forceinline__ void dense_tc_block(int blk, int nblk, uint8_t* smem, const uint8_t* __restrict__ w,
@@ -455,7 +457,7 @@ template<int TYPE, int S, int MT, int KS>
 __global__ void __launch_bounds__(MT * KS * 128) dense_tc_kernel(const uint8_t* __restrict__ w,
                                                                  const uint8_t* __restrict__ x, float* __restrict__ y,
                                                                  int n_in, int n_out, int ncols) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     extern __shared__ __align__(128) uint8_t smem[];
     dense_tc_block<TYPE, S, MT, KS>((int) blockIdx.x, (int) gridDim.x, smem, w, x, y, n_in, n_out, ncols);
 #elif defined(__CUDA_ARCH__)
@@ -1016,6 +1018,25 @@ static void opt_in_check(cudaError_t e, const char* who) {
     }
 }
 
+// Bulk copies and transaction barriers (compute capability 9.0): the one-tile, tile and pair kernels.  Below it only
+// the persistent cp.async kernel runs.
+static bool tc_bulk_ok() noexcept {
+    static std::atomic<signed char> known[64];   // per device: 0 unknown, 1 yes, -1 no
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return false; }
+    signed char k = known[dev].load(std::memory_order_acquire);
+    if (k == 0) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        k = major >= 9 ? 1 : -1;
+        known[dev].store(k, std::memory_order_release);
+    }
+    return k > 0;
+}
+
 // The live configuration: DEC_DTC2 2 | 4 | 8 | 16 and DEC_PAIR 2 | 4 | 16 (see src/core/verify/).
 constexpr int g_pair = 22;
 
@@ -1080,11 +1101,13 @@ void launch_one(const void* w, const void* x, float* y, int n_in, int n_out, int
 // The layout follows the shape alone (never the column count): where every 16-row tile has a block of its own and fits
 // in shared memory, one bulk copy per row, issued before the grid dependency wait; else whole 16-row tiles where two
 // fit in shared memory and the weights are 16-byte aligned; else 16-row tiles in 512-value chunks, and where those
-// leave SMs idle, two warp groups per tile taking alternate 512-value halves of 1024.
+// leave SMs idle, two warp groups per tile taking alternate 512-value halves of 1024.  Without bulk copies, only the
+// last.
 template<int TYPE>
 void launch(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+    const bool bulk = tc_bulk_ok();
     const bool aligned = ((uintptr_t) w & 15) == 0;
-    if (one_ok<TYPE>(w, n_in, n_out)) {
+    if (bulk && one_ok<TYPE>(w, n_in, n_out)) {
         launch_one<TYPE, 24>(w, x, y, n_in, n_out, ncols, s);
         return;
     }
@@ -1092,7 +1115,7 @@ void launch(const void* w, const void* x, float* y, int n_in, int n_out, int nco
         basalt::log::error("basalt", "dense_tc: IQ3_S n_in %d n_out %d needs the one-tile path", n_in, n_out);
         std::exit(1);
     } else {
-    if (aligned && 2 * 16 * (n_in / 256) * Fmt<TYPE>::SB <= 90 * 1024) {
+    if (bulk && aligned && 2 * 16 * (n_in / 256) * Fmt<TYPE>::SB <= 90 * 1024) {
         launch_tile<TYPE>(w, x, y, n_in, n_out, ncols, s);
         return;
     }
@@ -1111,7 +1134,7 @@ bool dense_tc_supported(int t, int n_in) noexcept {
 }
 
 bool dense_tc_supported(int t, int n_in, int n_out, const void* w) noexcept {
-    if (t == 21) return n_in > 0 && n_in % 512 == 0 && n_out > 0 && one_ok<21>(w, n_in, n_out);
+    if (t == 21) return tc_bulk_ok() && n_in > 0 && n_in % 512 == 0 && n_out > 0 && one_ok<21>(w, n_in, n_out);
     return dense_tc_supported(t, n_in);
 }
 
@@ -1146,7 +1169,7 @@ void dense_tc(int type, const void* w, const void* x, float* y, int n_in, int n_
 
 bool dense_tc_pair_supported(int t0, int t1, int n_in) noexcept {
     auto ok = [&](int t) { return t == 12 || t == 13 || t == 14 || t == 21 || t == 23 || t == 11 || t == 42 || t == 8; };
-    if (!ok(t0) || !ok(t1) || n_in <= 0 || n_in % 512 != 0) return false;
+    if (!tc_bulk_ok() || !ok(t0) || !ok(t1) || n_in <= 0 || n_in % 512 != 0) return false;
     const int tb = 16 * (n_in / 256) * std::max(sb_bytes_lq(t0), sb_bytes_lq(t1));
     return 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * tb <= 99 * 1024;
 }
@@ -1203,7 +1226,7 @@ void dense_tc_l2_prefetch(const void* w, size_t bytes, void* stream) {
     launch_pdl(dense_tc_l2_kernel, dim3(16), dim3(32), 0, (cudaStream_t) stream, (const uint8_t*) w, bytes);
 }
 
-int dense_tc_pair_mask() { return g_pair; }
+int dense_tc_pair_mask() { return tc_bulk_ok() ? g_pair : 0; }
 
 int dense_tc_mask() { return 29; }   // DEC_DTC 1 | 4 | 8 | 16 (see src/core/verify/)
 

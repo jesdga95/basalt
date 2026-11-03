@@ -20,7 +20,9 @@
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/prefill/kernels.hpp"
 #include "basalt/log.hpp"
+#include <cuda_runtime.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <string>
@@ -150,10 +152,26 @@ bool fused_layout(size_t T, bool src) {
 struct MoeBufs { size_t gu, h, xq, hq; };
 // An NVFP4 pack's prompt experts run on the FP4 tensor cores: the activation planes, token scales and tile tables sit
 // in Xq (the layer's rows) and Hq (one group's H, a group of up to MMQ_GROUP experts).
+bool fp4_tensor_cores() {
+    static std::atomic<signed char> known[64];   // per device: 0 unknown, 1 yes, -1 no
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return false; }
+    signed char k = known[dev].load(std::memory_order_acquire);
+    if (k == 0) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        k = major >= 12 ? 1 : -1;
+        known[dev].store(k, std::memory_order_release);
+    }
+    return k > 0;
+}
 bool fp4_pack() {
     static const bool any = [] {
         const auto& lay = basalt::kernels::cpu::expert_layout();
-        if (!lay.native) return false;
+        if (!lay.native || !fp4_tensor_cores()) return false;
         for (const auto& f : lay.fmt)
             if (f.gu_type == GGML_TYPE_NVFP4 && f.d_type == GGML_TYPE_NVFP4 && f.tail != 0) return true;
         return false;
@@ -173,7 +191,8 @@ bool fp4_every_layer() {
     static const bool all = [] {
         const auto& lay = basalt::kernels::cpu::expert_layout();
         const MmqPlan& mp = mmq_plan();
-        if (!lay.native || lay.fmt.empty() || !mp.any || mp.layer.size() < lay.fmt.size()) return false;
+        if (!lay.native || lay.fmt.empty() || !mp.any || mp.layer.size() < lay.fmt.size() || !fp4_tensor_cores())
+            return false;
         for (size_t l = 0; l < lay.fmt.size(); ++l)
             if (!mp.layer[l] || lay.fmt[l].gu_type != GGML_TYPE_NVFP4 || lay.fmt[l].d_type != GGML_TYPE_NVFP4 ||
                 lay.fmt[l].tail == 0)

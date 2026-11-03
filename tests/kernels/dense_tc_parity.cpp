@@ -418,13 +418,6 @@ void bench_pair(cudaStream_t s, bool warm) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    int dev = 0, major = 0;
-    cudaGetDevice(&dev);
-    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-    if (major < 9) {
-        std::printf("dense_tc needs thread-block clusters; skipped\n");
-        return 77;
-    }
     cudaStream_t s;
     cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
     bool only_bench = false, run_bench = false, pair_only = false, bench_pair_on = false, warm = false;
@@ -450,10 +443,19 @@ int main(int argc, char** argv) {
                 if (c.type != 21 || c.n_in % 2048 == 0) ok = parity(c, s) && ok;
         const int pairs[][2] = {{0, 6}, {1, 5}, {2, 4}, {3, 6}, {0, 5}, {16, 17}, {3, 17}, {20, 21}, {16, 21}, {1, 17},
                                 {20, 17}, {25, 26}, {25, 4}, {0, 26}};
-        for (const auto& pr : pairs) ok = pair_parity(CASES[pr[0]], CASES[pr[1]], s) && ok;
+        for (const auto& pr : pairs) {
+            const Case &a = CASES[pr[0]], &b = CASES[pr[1]];
+            if (!basalt::kernels::dense_tc_pair_supported(a.type, b.type, a.n_in)) {   // no bulk copies on this device
+                std::printf("pair %-10s + %-10s skipped: dense_tc_pair not supported on this device\n", a.name, b.name);
+                continue;
+            }
+            ok = pair_parity(a, b, s) && ok;
+        }
     }
     if (run_bench) {
-        if (bench_pair_on) bench_pair(s, warm);
+        if (bench_pair_on && !basalt::kernels::dense_tc_pair_supported(CASES[0].type, CASES[6].type, CASES[0].n_in))
+            std::printf("pair bench skipped: dense_tc_pair not supported on this device\n");
+        else if (bench_pair_on) bench_pair(s, warm);
         else bench(s, pick, warm);
     }
     std::printf("%s\n", ok ? "PASS" : "FAIL");
