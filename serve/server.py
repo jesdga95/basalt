@@ -27,6 +27,7 @@ from serve.config import (build_parser, check_engine_flags,  # noqa: E402
                           sampling_line)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
+from serve.engine.image_source import image_sources_of  # noqa: E402
 from serve.engine.flags import flag_index, flag_value  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.engine.process import ProcessEngine  # noqa: E402
@@ -148,6 +149,12 @@ def main() -> int:
             print(engine_line(file_engine, cli_engine,
                                     (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None,
                                     grammar_entry(a.grammar, sys.argv[1:], used_argv)), flush=True)
+    if (a.image_url_host or a.image_dir) and a.vision == "off" and not a.mock_engine:
+        fail("--image-url-host and --image-dir need --vision (image input is off)")
+    try:
+        image_sources = image_sources_of(a.image_url_host, a.image_dir, a.image_remote_only)
+    except ValueError as e:
+        fail(str(e))
     if a.alias:
         cfg["model_name"] = a.alias
     try:                                                # fail fast if the port is taken
@@ -218,6 +225,11 @@ def main() -> int:
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
                   grammar_engine=bool(a.mock_engine or has_grammar))
     svc.logs = logs
+    svc.image_sources = image_sources
+    if image_sources.url_hosts or image_sources.dirs or image_sources.remote_only:
+        print(tagged("images", f"from other machines{' and this one' if image_sources.remote_only else ''}: "
+                               f"url-hosts={','.join(a.image_url_host) or '-'} "
+                               f"dirs={','.join(image_sources.dirs) or '-'}"), flush=True)
     if any(x == "--api-key" and i + 1 < len(used_argv) and not used_argv[i + 1].strip() or x.strip() == "--api-key="
            for i, x in enumerate(used_argv)):
         # an empty key would silently disable authentication
