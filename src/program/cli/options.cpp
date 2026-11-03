@@ -44,8 +44,8 @@ std::optional<int> resolve_model_options(Options& o, bool multi_gpu) {
         basalt::log::error("basalt generate", "--shared-expert-arena backs the resident arena and cannot be used with --mmap-experts");
         return 2;
     }
-    if (o.resident_cpu_experts && (!o.mmap_experts || o.expert_profile.empty())) {
-        basalt::log::error("basalt generate", "--resident-cpu-experts requires --mmap-experts and a model with an expert profile");
+    if (o.resident_cpu_experts && !o.mmap_experts) {
+        basalt::log::error("basalt generate", "--resident-cpu-experts requires --mmap-experts");
         return 2;
     }
     const bool remote_caches = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
