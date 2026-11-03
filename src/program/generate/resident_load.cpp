@@ -130,7 +130,7 @@ int resident_load(Context& context) {
                                                                 : "off");
             measure_pinned_share();   // the loans sized from here on see the pinned complement
             auto_lend_pct = lend_pct_for_share();
-            if (o.prefill_auto)
+            if (o.prefill_auto && !*context.own_prompt_buffers)
                 basalt::log::info("basalt generate", "prompt path lends at most %lld%% of the cache (%.0f%% of the expert "
                                      "bytes pinned)", (long long) auto_lend_pct,
                              100.0 * basalt::prefill::Prefill::pinned_share());

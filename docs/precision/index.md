@@ -156,7 +156,7 @@ runs them on MMQ, or on the FP4 tensor cores for NVFP4 experts from 1,024 tokens
 or more streams every non-resident expert through the ring and runs the fused kernels (NVFP4 has none: it stays on the FP4 tensor cores, or MMQ below 1,024 tokens, so the cutoff there only changes which experts are staged). Staging everything costs the same
 whatever the chunk, so it only pays once most experts are hit anyway. In a chunk below the cutoff the FP4 experts run in groups of 16, as in the streamed walk,
 bitwise equal to one at a time (`prefill_fp4_test` checks every split of a group into runs); its 32 staging slots come
-out of the prompt's loan like its other buffers, so the experts the GPU holds during the read, and with them the CPU's
+out of the prompt's loan like its other buffers (or out of buffers of its own, on a card with room for them), so the experts the GPU holds during the read, and with them the CPU's
 share, follow the ring's size as they follow any tier layout. Each layer of such a chunk also runs the next layer's router on its own FFN rows, and the
 experts that guess gives more than 8 rows are copied ahead into slots of their own while the layer ends: that changes
 where an expert's bytes are read from, never what is computed. Chunks of 1,024
@@ -173,7 +173,9 @@ whose expert blobs exceed 1.5 MB (NVFP4). A chunk's GEMM tiles set the rounding 
 tokens on such a pack is chunked differently and its K/V can differ in the last bits; prompts up to 16384 tokens and the
 256-token prompt half of the quality gate chunk as before, so the gate's numbers do not move. With `--parallel` a
 read that runs alone chunks as the single-stream path does; a read beside decoding slots takes the smaller chunk its
-capped loan allows, so the same prompt's K/V can differ in the last bits between the two. A read beside decoding slots
+capped loan allows (the full chunk on a card that keeps its own prompt buffers, as it lends nothing), so the same
+prompt's K/V can differ in the last bits between the two. A card that keeps its own buffers otherwise chunks as a loan
+does (greedy output identical to the loan's on 22-, 16,672- and 66,688-token prompts). A read beside decoding slots
 that gives way to a shorter request reads its rest later in the same chunks, beside the slots, with no CPU share.
 
 **Short first chunk.** A prompt above the chunk cap (and at least 32,768 tokens) reads its first 16,384 tokens as one

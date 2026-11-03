@@ -22,6 +22,7 @@ int dispatch(Context& context) {
     auto& peer_hot_share = *context.peer_hot_share;
     auto& profile_loaded = *context.profile_loaded;
     auto& pf_borrow = *context.pf_borrow;
+    auto& own_prompt_buffers = *context.own_prompt_buffers;
     auto& wt = *context.wt;
     auto& d_mrope = *context.d_mrope;
     auto& mrope_host = *context.mrope_host;
@@ -144,6 +145,7 @@ int dispatch(Context& context) {
             .peer_hot_share = peer_hot_share,
             .profile_loaded = profile_loaded,
             .pf_borrow = pf_borrow,
+            .own_prompt_buffers = own_prompt_buffers,
             .wt = wt,
             .d_mrope = d_mrope,
             .mrope_host = mrope_host,

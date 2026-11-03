@@ -38,7 +38,8 @@ int Runtime::init_prompt_paths() {   // 0: ready; 1: failed (err set); 2: failed
     }
     if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
     if (!multi_gpu && o.batch <= 0 && !o.no_pool) { sp.set_cpu_pool(&pool); sp.set_cpu_share(o.prefill_cpu_share); }   // the pool is idle while a prompt is read
-    if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
+    if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err,
+                 borrow != nullptr ? borrow : own_region.get(), borrow != nullptr ? borrow_bytes : own_region_bytes))
         return err.find("do not fit") != std::string::npos ? 2 : 1;
     return 0;
 }
@@ -172,7 +173,14 @@ bool Request::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t head) 
     bool any = false;
     const int ring_now = (int) basalt::prefill::Prefill::ring_slots_for(want);
     for (PfPart& p : runtime_.pf_parts) {
-        if (p.first < 0) continue;
+        if (p.first < 0) {
+            // CUDA0's buffers of its own: laid out for this read's chunk as a loan is, nothing lent
+            if (&p == &runtime_.pf_parts[0] && runtime_.own_region &&
+                (want != p.sp->chunk() || p.sp->ring_depth() != ring_now) &&
+                !p.sp->relayout(want, runtime_.own_region.get(), runtime_.own_region_bytes, e))
+                return false;
+            continue;
+        }
         const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - runtime_.part_slots(p, want)));
         std::vector<serve_loans::LentEntry> again;   // taken again: their slots hold no expert
         if (!p.lent.empty()) {
@@ -353,7 +361,8 @@ int Runtime::init_prompt() {
             // a split stage whose card still has room for the chunk's buffers (its cache already holds every
             // expert of its layers, so auto stopped short of its VRAM) keeps them as its own instead of borrowing
             // cache slots: nothing of it is lent, streamed during the prompt or refilled after it.  Room = the
-            // buffers + the headroom for what is made after this.  Layer splits only - one GPU keeps its loan.
+            // buffers + the headroom for what is made after this.  One GPU decided this before its RAM copy was
+            // planned (own_prompt_buffers), with the elastic KV's growth counted too.
             if (pf_parts.size() > 1) {
                 for (PfPart& p : pf_parts) {
                     const basalt::core::OnDevice on(p.dev);
@@ -367,6 +376,21 @@ int Runtime::init_prompt() {
                         p.first = -1;
                         p.first_now = -1;
                     }
+                }
+            } else if (own_prompt_buffers) {
+                // one region laid out as a loan is, so each read takes its own chunk as with a loan
+                const uint64_t need = basalt::prefill::Prefill::bytes_needed(g, ss, chunk);
+                void* region = nullptr;
+                if (cudaMalloc(&region, need) == cudaSuccess) {
+                    own_region.reset(region);
+                    own_region_bytes = need;
+                    pf_parts[0].first = -1;
+                    pf_parts[0].first_now = -1;
+                } else {
+                    (void) cudaGetLastError();
+                    basalt::log::warn("basalt serve", "prompt buffers of its own: %.2f GiB not allocated, the prompt "
+                                         "path borrows cache slots (refilled from the file)",
+                                      (double) need / 1073741824.0);
                 }
             }
             lend_first = pf_parts[0].first;
@@ -402,7 +426,8 @@ int Runtime::init_prompt() {
                          (long long) pf_parts[i].cache->slots(),
                          (double) part_bytes(pf_parts[i], pf_parts[i].first) / 1073741824.0);
     } else {
-        basalt::log::info("basalt serve", "the prompt path allocates its own buffers (too few cache slots to borrow)");
+        basalt::log::info("basalt serve", "the prompt path allocates its own buffers (%s)",
+                          own_region ? "VRAM free beside the expert cache" : "too few cache slots to borrow");
     }
 
     {
@@ -412,7 +437,8 @@ int Runtime::init_prompt() {
         const int64_t kHeadroom = 512ll << 20;
         auto own_fits = [&](int64_t c, int& dev_out, int64_t& need_out, int64_t& free_out) -> bool {
             for (size_t i = 0; i <= stages.size(); ++i) {
-                const bool loan = i == 0 ? borrow != nullptr : (i < pf_parts.size() && pf_parts[i].first >= 0);
+                const bool loan = i == 0 ? borrow != nullptr || own_region
+                                         : (i < pf_parts.size() && pf_parts[i].first >= 0);
                 if (loan) continue;
                 const int dev = i == 0 ? -1 : stages[i - 1]->dev;
                 const basalt::core::OnDevice on(dev);

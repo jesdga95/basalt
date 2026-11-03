@@ -104,11 +104,12 @@ reports both. Everything above applies, and:
   Windows' RAM. A larger carve-out keeps more experts on the GPU; the start line
   `expert cache: the integrated GPU's dedicated memory` gives the figure. Where NVML reports no carve-out, the cache
   is sized from the RAM available, less the host's late memory and the file cache's floor.
-- The carve-out is RAM Windows no longer has. With every expert on the GPU, a server still keeps page-locked copies of
-  the experts in the cache slots its prompt path borrows, in the RAM left over beside the margin
-  ([memory floors](running.md#memory-floors)), and on Windows a request stops once the RAM available falls below the
-  guard. An explicit `resident-budget-gib` keeps no such copies: the borrowed slots are refilled from the file after a
-  prompt, so a long prompt takes longer and Windows keeps that RAM.
+- The carve-out is RAM Windows no longer has. A carve-out that holds every expert with room to spare keeps the prompt
+  path's buffers beside them ([`prefill`](configuration/index.md)), so nothing is copied to RAM. With less room the
+  prompt path borrows the cache's last slots, and a server keeps page-locked copies of their experts in the RAM left
+  over beside the margin ([memory floors](running.md#memory-floors)); on Windows a request stops once the RAM
+  available falls below the guard. An explicit `resident-budget-gib` keeps no such copies: the borrowed slots are
+  refilled from the file after a prompt, so a long prompt takes longer and Windows keeps that RAM.
 - `nvidia-smi` lists the NPU as a second device with no CUDA compute capability: `gpu auto` skips it, and an unset
   `gpu` does not count it.
 - The GPU reads page-locked host memory at addresses of its own, so the resident RAM copy is never unpinned.
