@@ -23,18 +23,36 @@ int main() {
     using namespace basalt::platform;
     unsigned r[4] = {};
     cpuid(0, 0, r);
-    char vendor[13] = {};
-    std::memcpy(vendor, &r[1], 4);
-    std::memcpy(vendor + 4, &r[3], 4);
-    std::memcpy(vendor + 8, &r[2], 4);
-    std::printf("compiler: cpuid vendor %s, highest leaf %u\n", vendor, r[0]);
-    check(r[0] >= 1 && vendor[0] != 0, "cpuid leaf 0 names a vendor");
-    cpuid(1, 0, r);
-    if (((r[2] >> 27) & 1u) != 0) check((xgetbv0() & 0x1) != 0, "XCR0 reports x87 state when OSXSAVE is set");
+    if (kX86) {
+        char vendor[13] = {};
+        std::memcpy(vendor, &r[1], 4);
+        std::memcpy(vendor + 4, &r[3], 4);
+        std::memcpy(vendor + 8, &r[2], 4);
+        std::printf("compiler: cpuid vendor %s, highest leaf %u\n", vendor, r[0]);
+        check(r[0] >= 1 && vendor[0] != 0, "cpuid leaf 0 names a vendor");
+        cpuid(1, 0, r);
+        if (((r[2] >> 27) & 1u) != 0) check((xgetbv0() & 0x1) != 0, "XCR0 reports x87 state when OSXSAVE is set");
+    } else {
+        check((r[0] | r[1] | r[2] | r[3]) == 0 && xgetbv0() == 0, "the x86 probes answer zero off x86");
+        check(!cpu_has_avx512_bf16(), "no AVX-512 off x86");
+    }
+    check(kX86 != kArm64, "one architecture");
 
     check(ctz32(1) == 0 && ctz32(0x80000000u) == 31 && ctz32(0x00f0u) == 4 && ctz32(0xffffffffu) == 0, "ctz32");
     for (int i = 0; i < 4; ++i) cpu_relax();
     check(true, "cpu_relax returns");
+    {
+        // the fences and the prefetch change no value: a store before the fence is what a load after it reads
+        volatile uint32_t word = 0;
+        word = 7;
+        store_fence();
+        const uint32_t seen = word;
+        load_fence();
+        static const char line[128] = {1};
+        prefetch(line);
+        prefetch(line + 64, false);
+        check(seen == 7 && line[0] == 1, "store_fence, load_fence and prefetch return");
+    }
 
     check(f16_round(1.0f) == 1.0f && f16_round(-2.5f) == -2.5f && f16_round(0.0f) == 0.0f, "f16_round exact values");
     check(f16_round(0.1f) == 0.0999755859375f, "f16_round rounds 0.1 to the nearest half");

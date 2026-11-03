@@ -35,8 +35,11 @@ public:
     bool attach(void* arena, size_t bytes, int max_tokens, std::string& err);
     void detach();
 
-    /// As CpuEncoder::encode; the taps copy to the host and are for parity runs only.
+    /// As CpuEncoder::encode (a picture's 768-wide rows or a video group's 1536-wide ones); the taps copy to the host
+    /// and are for parity runs only.
     bool encode(const std::vector<float>& patches, Size canvas, std::vector<float>& out, const TapFn& tap = {});
+    /// As CpuEncoder::encode_padded (the class-token tower): the picture's bytes go to the device, which cuts the patch rows.
+    bool encode_padded(const Image& img, std::vector<float>& out, const TapFn& tap = {});
 
     /// Device bytes held by the weights and the work buffers.
     size_t device_bytes() const;
@@ -51,5 +54,9 @@ private:
 /// Launches one empty kernel on the current device. False with CUDA's own text when this binary holds no code for
 /// the card it runs on: the way a build made for another compute capability reports itself at startup.
 bool probe_device(std::string& err);
+
+/// The CUDA driver context current on this thread (a CUcontext: the device's primary one, made current here if it is
+/// not yet), for a library that works on the same device in this process (FFmpeg's NVDEC); null when there is none.
+void* current_context();
 
 }  // namespace basalt::vision

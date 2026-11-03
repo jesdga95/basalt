@@ -46,10 +46,11 @@ int serve_subcommand(int argc, char** argv) {
     }
     const std::string exe = basalt::platform::module_path();
     if (exe.empty()) { basalt::log::error("basalt serve", "cannot find this binary"); return 1; }
-    const std::string src_dir = BASALT_SOURCE_DIR;
+    const std::string src_dir = basalt::platform::install_root();
+    if (src_dir.empty()) { basalt::log::error("basalt serve", "cannot find the directory above this binary"); return 1; }
     if (python.empty()) python = basalt::platform::python_interpreter(src_dir);
     if (basalt::platform::set_working_dir(src_dir) != 0) {
-        basalt::log::error("basalt serve", "cannot enter the source tree %s", src_dir.c_str());
+        basalt::log::error("basalt serve", "cannot enter %s", src_dir.c_str());
         return 1;
     }
     std::vector<std::string> args = {python, "-m", "serve.server", "--engine-bin", exe};

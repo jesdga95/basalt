@@ -64,7 +64,7 @@ class ClaudeCodeBillingStamp(unittest.TestCase):
 
     def test_two_turns_share_the_whole_system_prompt(self):
         tok = ByteTokenizer()
-        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
         tools = [{"name": "Bash", "description": "Run a command.", "input_schema": {
             "type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}]
         turn1 = [{"role": "user", "content": "fix the bug"}]

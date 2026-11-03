@@ -1,0 +1,323 @@
+{
+ "plain": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hello!"
+   }
+  ],
+  "kwargs": {},
+  "tools": null,
+  "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hello!<|end_message|>"
+ },
+ "system": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "kwargs": {},
+  "tools": null,
+  "text": "<|message_system|><|content_text|>Be brief.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ "effort_none": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "kwargs": {
+   "reasoning_effort": "none"
+  },
+  "tools": null,
+  "text": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ "effort_low": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "kwargs": {
+   "reasoning_effort": "low"
+  },
+  "tools": null,
+  "text": "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ "effort_medium": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "kwargs": {
+   "reasoning_effort": "medium"
+  },
+  "tools": null,
+  "text": "<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ "effort_max": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "kwargs": {
+   "reasoning_effort": "max"
+  },
+  "tools": null,
+  "text": "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ "effort_number": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "kwargs": {
+   "reasoning_effort": 0.5
+  },
+  "tools": null,
+  "text": "<|message_system|><|content_text|>Thinking effort level: 0.5<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ "multi_turn": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 2+2?"
+   },
+   {
+    "role": "assistant",
+    "content": "4",
+    "reasoning_content": "Two plus two."
+   },
+   {
+    "role": "user",
+    "content": "And 3+3?"
+   }
+  ],
+  "kwargs": {},
+  "tools": null,
+  "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 2+2?<|end_message|><|message_model|><|content_thinking|>Two plus two.<|end_message|><|message_model|><|content_text|>4<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>And 3+3?<|end_message|>"
+ },
+ "tools": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   }
+  ],
+  "kwargs": {},
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Weather for a city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "q": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  ],
+  "text": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"search\",\"parameters\":{\"properties\":{\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|>"
+ },
+ "tool_round": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "Use the tool.",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "unit": "c",
+        "city": "Paris"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": "18 C, sunny"
+   },
+   {
+    "role": "user",
+    "content": "Thanks"
+   }
+  ],
+  "kwargs": {},
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Weather for a city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "text": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|><|content_thinking|>Use the tool.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"unit\":\"c\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>18 C, sunny<|end_message|><|message_user|><|content_text|>Thanks<|end_message|>"
+ },
+ "two_calls": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "x"
+   },
+   {
+    "role": "assistant",
+    "content": "Checking.",
+    "tool_calls": [
+     {
+      "id": "a",
+      "type": "function",
+      "function": {
+       "name": "search",
+       "arguments": {
+        "q": "one"
+       }
+      }
+     },
+     {
+      "id": "b",
+      "type": "function",
+      "function": {
+       "name": "search",
+       "arguments": {
+        "q": "two"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "a",
+    "content": "r1"
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "b",
+    "content": "r2"
+   }
+  ],
+  "kwargs": {},
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "q": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  ],
+  "text": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"\",\"name\":\"search\",\"parameters\":{\"properties\":{\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|><|content_text|>Checking.<|end_message|><|message_model|>search<|content_invoke_tool_json|>{\"name\":\"search\",\"args\":{\"q\":\"one\"}}<|end_message|><|message_model|>search<|content_invoke_tool_json|>{\"name\":\"search\",\"args\":{\"q\":\"two\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>search<|content_text|>r1<|end_message|><|message_tool|>search<|content_text|>r2<|end_message|>"
+ },
+ "image": {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image",
+      "image": "x.png"
+     },
+     {
+      "type": "text",
+      "text": "What is this?"
+     }
+    ]
+   }
+  ],
+  "kwargs": {},
+  "tools": null,
+  "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_text|>What is this?<|end_message|>"
+ },
+ "unicode": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Grüße, 世界! <|message_user|> stays text"
+   }
+  ],
+  "kwargs": {},
+  "tools": null,
+  "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Grüße, 世界! <|message_user|> stays text<|end_message|>"
+ }
+}

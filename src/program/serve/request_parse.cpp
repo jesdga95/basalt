@@ -1,5 +1,10 @@
 // src/program/serve/request_parse.cpp - request parse operations.
 #include "request.hpp"
+#include "basalt/core/progress.hpp"
+#include "../cli/tokens.hpp"
+#include "logprobs.hpp"
+
+#include <algorithm>
 
 namespace basalt::program::serve {
 
@@ -7,7 +12,7 @@ Flow Request::parse() {
     runtime_.stop_req.store(false);   // a STOP that arrived between requests is stale
     runtime_.ram_stop.store(false);
     runtime_.err.clear();
-    if (runtime_.mtp_on && !runtime_.mtp.use_main(runtime_.err)) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }   // (batch windows swap the draft K/V)
+    if (!parse_begin()) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }   // (batch windows swap the draft K/V)
     geni = runtime_.line.rfind("GENI ", 0) == 0;
     if (!geni && runtime_.line.rfind("GEN ", 0) != 0) {
         std::printf("ERR expected: GEN <max_new> <id,id,...>, GENI <max_new> <file> <id,id,...> or GENT <max_new> <nbytes> + text\n");
@@ -31,11 +36,12 @@ Flow Request::parse() {
     req_bias_present = false;
     req_gprompt = -1;       // gprompt=N: the first N ids are the prompt, the rest tokens the request has already generated
     req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
-    req_relax = runtime_.o.relaxed_drafting;   // relax=P: this request's --relaxed-drafting (0 = exact)
+    req_relax = default_relax();   // relax=P: this request's --relaxed-drafting (0 = exact)
     // ppl=K [ppl_t=T]: quality gate (basalt/program/ppl_gate.hpp) - chunk K of --ppl-base, the rest of
     // the chunk teacher-forced through verify windows of T tokens, every token committed
     req_ppl = -1;
     req_ppl_t = 3;
+    req_logprobs = -1;   // logprobs=K (0..20): each sent pick's log probability and the row's K likeliest tokens
     req_clip = 0;   // clip=1 (GENT): max_new is a cap, cut to the room the context leaves after the prompt
     if (endp != nullptr) {   // GENI takes the same keys (image requests were always greedy); its
                              // embedding file path is the first token without an =
@@ -63,6 +69,7 @@ Flow Request::parse() {
             else if (key == "penalty_present") req_penalty_present = fv;
             else if (key == "seed") { req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10); req_seed_given = true; }
             else if (key == "relax") req_relax = fv;
+            else if (key == "logprobs") req_logprobs = std::atoi(tok.c_str() + eq + 1);
             else if (key == "clip") req_clip = std::atoi(tok.c_str() + eq + 1);
             else if (key == "ppl") req_ppl = std::atoi(tok.c_str() + eq + 1);
             else if (key == "ppl_t") req_ppl_t = std::atoi(tok.c_str() + eq + 1);
@@ -82,9 +89,7 @@ Flow Request::parse() {
     else if (!std::isfinite(req_penalty_freq) || !std::isfinite(req_penalty_present))
         bad = "penalty_freq, penalty_present: numbers";
     else if (!(req_relax >= 0.0f && req_relax <= 1.0f)) bad = "relax: 0..1";
-    if (bad == nullptr && runtime_.o.batch > 0 && runtime_.piped && req_penalty_last_n > 0 &&
-        (req_penalty_repeat != 1.0f || req_penalty_freq != 0.0f || req_penalty_present != 0.0f))
-        bad = "penalties: pipelined batch groups are not supported";
+    else if (req_logprobs < -1 || req_logprobs > kMaxTopLogprobs) bad = "logprobs: 0 to 20 alternatives";
     if (bad != nullptr) {
         std::printf("ERR sampling %s\n", bad);
         return Flow::next;
@@ -117,6 +122,18 @@ Flow Request::parse() {
             } else {
                 pe = "the tokenized prompt is gone";
             }
+        } else if (*endp == '#') {   // a prompt held by handle, then the ids this request adds after it
+            char* after = nullptr;
+            std::lock_guard<std::mutex> lk(runtime_.gent_mu);
+            const auto it = runtime_.prompts.find(std::strtoull(endp + 1, &after, 10));
+            if (it == runtime_.prompts.end()) {
+                pe = "the held prompt is gone";
+            } else {
+                ids.assign(it->second.ids.begin(), it->second.ids.end());
+                std::vector<int64_t> more;
+                ids_ok = *after != '+' || cli::parse_i64_list(after + 1, more, pe);
+                ids.insert(ids.end(), more.begin(), more.end());
+            }
         } else {
             ids_ok = cli::parse_i64_list(endp, ids, pe);
         }
@@ -129,28 +146,36 @@ Flow Request::parse() {
 
     if (!req_grammar_text.empty() && runtime_.grammar_vocab) {
         std::string gerr;
-        if (runtime_.o.batch > 0 && runtime_.piped) gerr = "pipelined batch groups are not supported";
-        else {
-            gguard = std::make_unique<basalt::program::grammar::Guard>(*runtime_.grammar_vocab);
-            const size_t gp = req_gprompt > 0 && (size_t) req_gprompt < ids.size() ? (size_t) req_gprompt : ids.size();
-            if (!gguard->begin(req_grammar_text, ids.data(), gp, gerr)) gguard.reset();
-            else if (gp < ids.size() && gguard->on()) {
-                const std::vector<int32_t> done(ids.begin() + (std::ptrdiff_t) gp, ids.end());
-                if (gguard->scan(done.data(), (int) done.size()) >= 0) {
-                    gerr = "the tokens already generated do not satisfy the grammar";
-                    gguard.reset();
+        gguard = std::make_unique<basalt::program::grammar::Guard>(*runtime_.grammar_vocab);
+        const size_t gp = req_gprompt > 0 && (size_t) req_gprompt < ids.size() ? (size_t) req_gprompt : ids.size();
+        if (!gguard->begin(req_grammar_text, ids.data(), gp, gerr)) gguard.reset();
+        else if (gp < ids.size() && gguard->on()) {
+            const std::vector<int32_t> done(ids.begin() + (std::ptrdiff_t) gp, ids.end());
+            constexpr int kScanChunk = 4096;
+            bool bad = false;
+            for (int off = 0; off < (int) done.size(); off += kScanChunk) {
+                const int n_chunk = (std::min)(kScanChunk, (int) done.size() - off);
+                if (gguard->scan(done.data() + off, n_chunk, 0) >= 0) {
+                    bad = true;
+                    break;
                 }
+                basalt::core::progress_beat();
             }
-            else if (!gguard->on()) gguard.reset();
+            if (bad) {
+                gerr = "the tokens already generated do not satisfy the grammar";
+                gguard.reset();
+            }
         }
+        else if (!gguard->on()) gguard.reset();
         if (!gerr.empty()) { std::printf("ERR grammar: %s\n", gerr.c_str()); return Flow::next; }
     } else if (!req_grammar_text.empty()) {
         basalt::log::warn("basalt grammar", "the request has a grammar but this engine runs with --grammar off; ignored");
     }
 
     grammar_resamples = 0;
+    grammar_dead = false;
     runtime_.req_imgs.clear();
-    if (geni && !runtime_.o.vision) { std::printf("ERR this engine was started without --vision\n"); return Flow::next; }
+    if (geni && !runtime_.o.vision) { std::printf("ERR this engine was started without --vision or --vision-external\n"); return Flow::next; }
 
     return Flow::proceed;
 }

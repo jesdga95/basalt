@@ -9,7 +9,7 @@ from serve.api.responses import request_tools
 from serve.frontend import ChatTemplate, OutputParser, anthropic_to_messages, openai_to_messages
 
 ROOT = Path(__file__).resolve().parents[2]
-TEMPLATE = ChatTemplate(ROOT / "serve/chat_template.jinja")
+TEMPLATE = ChatTemplate.from_file(ROOT / "serve/chat_template.jinja")
 NAMES = ["read", "write", "edit", "bash", "grep", "glob", "fetch", "todo", "task", "ctx7"]
 
 
@@ -30,7 +30,7 @@ def rs(names):
 
 
 def prompt_oa(names):
-    req = {"model": "qwen3.8-flash-next", "messages": [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"}], "tools": oa(names)}
+    req = {"model": "basalt", "messages": [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"}], "tools": oa(names)}
     messages, tools, kw = openai_to_messages(req)
     return TEMPLATE.render(messages, tools, **kw)
 
@@ -66,7 +66,7 @@ class ToolOrder(unittest.TestCase):
     def test_anthropic_and_responses(self):
         def an_names(ns):
             return [t["name"] for t in anthropic_to_messages(
-                {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": "x"}], "tools": an(ns)})[1]]
+                {"model": "basalt", "messages": [{"role": "user", "content": "x"}], "tools": an(ns)})[1]]
         self.assertEqual(an_names(NAMES), NAMES)
         self.assertEqual(an_names(NAMES[::-1]), NAMES)
         frontend._TOOL_ORDERS.clear()

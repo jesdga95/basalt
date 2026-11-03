@@ -1,0 +1,23 @@
+{
+  "submitter": "drakiss79",
+  "date": "2026-10-24",
+  "commit": "588a4776ed",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5090",
+      "vram_gib": 32,
+      "power_w": 500
+    }
+  ],
+  "ram_gib": 62,
+  "cpu": "Intel Core Ultra 9 285K, 24 cores",
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "int8",
+  "prefill_16k_tps": 9288.7,
+  "prefill_64k_tps": 10095.3,
+  "decode_tps": 305.4,
+  "notes": "RTX 5090 at a 500 W limit (below the card's 575 W default), 62 GiB DDR5; 63.3 GiB of experts fit beside the VRAM cache with no SSD spill at 62 GiB RAM"
+}

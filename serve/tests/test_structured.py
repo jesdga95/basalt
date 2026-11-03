@@ -51,7 +51,7 @@ class Structured(unittest.TestCase):
     def setUp(self):
         self.tok = ByteTokenizer()
         self.engine = MockEngine(self.tok, json.dumps(STORY), max_context=16384)
-        self.svc = Service(self.engine, self.tok, ChatTemplate(Path(__file__).resolve().parents[1] / "chat_template.jinja"),
+        self.svc = Service(self.engine, self.tok, ChatTemplate.from_file(Path(__file__).resolve().parents[1] / "chat_template.jinja"),
                            grammar=True)
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
@@ -63,7 +63,7 @@ class Structured(unittest.TestCase):
     def chat(self, script=None, **kwargs):
         if script is not None:
             self.engine = self.svc.engine = MockEngine(self.tok, script, max_context=16384)
-        req = {"model": "qwen3.8-flash-next", "messages": [{"role": "system", "content": "Write a film plan."},
+        req = {"model": "basalt", "messages": [{"role": "system", "content": "Write a film plan."},
                             {"role": "user", "content": "Photobooth. 15 seconds."}],
                "response_format": FORMAT, "reasoning_effort": "none", **kwargs}
         return self.request("/v1/chat/completions", req)
@@ -113,7 +113,7 @@ class Structured(unittest.TestCase):
         fmt = {"type": "json_schema", "json_schema": {"name": "local", "schema": schema}}
         self.assertEqual(self.chat('{"answer":4}', response_format=fmt)[0], 200)
 
-    def test_malformed_formats_and_tools_are_rejected_before_loading(self):
+    def test_malformed_formats_are_rejected_before_loading(self):
         formats = ([], {"type": "unsupported"},
                    {"type": "json_schema", "json_schema": {"schema": {"type": "object"}}},
                    {"type": "json_schema", "json_schema": {"name": "x", "strict": "true", "schema": {"type": "object"}}})
@@ -121,7 +121,6 @@ class Structured(unittest.TestCase):
             for fmt in formats:
                 with self.subTest(fmt=fmt):
                     self.assertEqual(self.chat(response_format=fmt)[0], 400)
-            self.assertEqual(self.chat(tools=[{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}])[0], 400)
             self.assertEqual(self.request("/v1/chat/completions", [])[0], 400)
             load.assert_not_called()
 

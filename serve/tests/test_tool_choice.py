@@ -17,7 +17,7 @@ from serve.service import REASONING_CLOSE, Service  # noqa: E402
 from serve.util.text import ByteTokenizer  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
-TEMPLATE = ChatTemplate(ROOT / "serve/chat_template.jinja")
+TEMPLATE = ChatTemplate.from_file(ROOT / "serve/chat_template.jinja")
 ARGS = "<parameter=q>\n2+2\n</parameter>\n</function>\n</tool_call>"
 
 
@@ -30,7 +30,7 @@ class CallingEngine(MockEngine):
         super().__init__(tok, "x", max_context=32768)
         self.prompts = []
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         self.prompts.append(list(ids))
         prompt = self.tok.decode(ids)
         if prompt.endswith("<function="):
@@ -39,8 +39,10 @@ class CallingEngine(MockEngine):
             text = ARGS
         elif prompt.endswith("</think>\n\n"):
             text = self.ANSWER
-        else:
-            text = self.THOUGHT + "</think>\n\n" + self.ANSWER
+        else:   # a pass that continues an earlier one (a thinking budget stops the first) picks up where it ends
+            full = self.THOUGHT + "</think>\n\n" + self.ANSWER
+            said = prompt.split("<think>\n")[-1] if "<think>\n" in prompt else ""
+            text = full[len(said):] if said and full.startswith(said) else full
         for t in (self.tok.encode(text) + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
             if cancel.is_set():
                 return
@@ -124,7 +126,7 @@ class OpenAI(Base):
     NO_THINKING = {"chat_template_kwargs": {"enable_thinking": False}}
 
     def chat(self, **extra):
-        return self.post("/v1/chat/completions", {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": "2+2?"}],
+        return self.post("/v1/chat/completions", {"model": "basalt", "messages": [{"role": "user", "content": "2+2?"}],
                                                   "max_tokens": 400, "tools": FN, **extra})
 
     def call_of(self, code, b, stream):
@@ -187,7 +189,11 @@ class OpenAI(Base):
                 code, b = self.chat(**extra)
                 self.assertEqual(code, 200, b)
                 self.assertEqual(b["choices"][0]["message"]["content"], CallingEngine.ANSWER)
-                self.assertEqual(len(self.engine.prompts), 1)
+                # one reply: a later pass (the thinking budget stops the first) only extends what the model wrote
+                first = self.engine.prompts[0]
+                for later in self.engine.prompts[1:]:
+                    self.assertEqual(later[:len(first)], first)
+                    self.assertNotIn("<tool_call>", self.tok.decode(later[len(first):]))
                 self.assertEqual(self.offered(), extra.get("tool_choice") != "none")
 
     def test_flat_shape_names_a_function(self):
@@ -215,7 +221,7 @@ class Anthropic(Base):
     THINKING = {"thinking": {"type": "enabled", "budget_tokens": 1024}}
 
     def msg(self, **extra):
-        return self.post("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 400, "tools": AN,
+        return self.post("/v1/messages", {"model": "basalt", "max_tokens": 400, "tools": AN,
                                           "messages": [{"role": "user", "content": "2+2?"}], **extra})
 
     def blocks(self, code, b, stream):
@@ -276,7 +282,7 @@ class Anthropic(Base):
 
 class Responses(Base):
     def resp(self, **extra):
-        return self.post("/v1/responses", {"model": "qwen3.8-flash-next", "input": "2+2?", "max_output_tokens": 400, "tools": RS,
+        return self.post("/v1/responses", {"model": "basalt", "input": "2+2?", "max_output_tokens": 400, "tools": RS,
                                            **extra})
 
     def calls(self, code, b):

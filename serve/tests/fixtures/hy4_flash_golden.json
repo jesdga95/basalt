@@ -1,0 +1,928 @@
+{
+ "generated_by": "transformers render_jinja_template (transformers 5.23.0), jinja2 3.1.6",
+ "cases": [
+  {
+   "name": "user",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "tools": null,
+   "kwargs": {},
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Hello<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hello<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "system_user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are brief."
+    },
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "tools": null,
+   "kwargs": {},
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜>You are brief.<｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Hello<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>You are brief.<｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hello<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "no_think",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "no_think"
+   },
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Hello<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:no_think<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hello<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>"
+  },
+  {
+   "name": "max",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be careful."
+    },
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "max"
+   },
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜>Be careful.<｜reasoning_mode:opensource｜>reasoning_effort:max<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Hello<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>Be careful.<｜reasoning_mode:6124c78e｜>reasoning_effort:max<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hello<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "high_explicit",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "high"
+   },
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Hello<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hello<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "low",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "low"
+   },
+   "official": {
+    "error": "TemplateError: reasoning_effort error : low, should be no_think/high/max"
+   },
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:low<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hello<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "no_generation_prompt",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "add_generation_prompt": false
+   },
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Hello<｜hy_end:opensource｜>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hello<｜hy_end:6124c78e｜>"
+  },
+  {
+   "name": "multi_turn",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    },
+    {
+     "role": "user",
+     "content": "2+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4",
+     "reasoning_content": "add them"
+    },
+    {
+     "role": "user",
+     "content": "and 3+3?"
+    }
+   ],
+   "tools": null,
+   "kwargs": {},
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜>s<｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>2+2?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>4<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>and 3+3?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>s<｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>2+2?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>4<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>and 3+3?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "multi_turn_no_think",
+   "messages": [
+    {
+     "role": "user",
+     "content": "2+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4",
+     "reasoning_content": "add them"
+    },
+    {
+     "role": "user",
+     "content": "and 3+3?"
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "no_think"
+   },
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>2+2?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>4<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>and 3+3?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:no_think<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>2+2?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>4<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>and 3+3?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>"
+  },
+  {
+   "name": "history_preserved",
+   "messages": [
+    {
+     "role": "user",
+     "content": "2+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4",
+     "reasoning_content": "add them"
+    },
+    {
+     "role": "user",
+     "content": "and 3+3?"
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "preserved_thinking": true
+   },
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>2+2?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>add them</think:opensource>4<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>and 3+3?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>2+2?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>add them</think:6124c78e>4<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>and 3+3?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "last_assistant_open",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Say hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hi",
+     "reasoning_content": "greet"
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "add_generation_prompt": false
+   },
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Say hi<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>greet</think:opensource>Hi<｜hy_end:opensource｜>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Say hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>greet</think:6124c78e>Hi<｜hy_end:6124c78e｜>"
+  },
+  {
+   "name": "last_assistant_raw",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Say hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hi th"
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "add_generation_prompt": false,
+    "raw_last_assistant": true
+   },
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Say hi<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜>Hi th",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Say hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜>Hi th"
+  },
+  {
+   "name": "reasoning_field",
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "assistant",
+     "content": "b",
+     "reasoning": "plain reasoning"
+    },
+    {
+     "role": "user",
+     "content": "c"
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "preserved_thinking": true
+   },
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>a<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>plain reasoning</think:opensource>b<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>c<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>a<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>plain reasoning</think:6124c78e>b<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>c<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "late_system",
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "assistant",
+     "content": "b"
+    },
+    {
+     "role": "system",
+     "content": "late rule"
+    },
+    {
+     "role": "user",
+     "content": "c"
+    }
+   ],
+   "tools": null,
+   "kwargs": {},
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>a<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>b<｜hy_end:opensource｜><｜hy_start:opensource｜>system<｜hy_middle:opensource｜>late rule<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>c<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>a<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>b<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>late rule<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>c<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "tools",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Get the weather for a city — café über.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    },
+    {
+     "name": "calc",
+     "description": "Add numbers.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "xs": {
+        "type": "array",
+        "items": {
+         "type": "number"
+        }
+       }
+      }
+     }
+    }
+   ],
+   "kwargs": {},
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city — café über.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n{\"name\": \"calc\", \"description\": \"Add numbers.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"xs\": {\"type\": \"array\", \"items\": {\"type\": \"number\"}}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Weather in Paris?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city — café über.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n{\"name\": \"calc\", \"description\": \"Add numbers.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"xs\": {\"type\": \"array\", \"items\": {\"type\": \"number\"}}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "tools_wrapped",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city — café über.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "kwargs": {},
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city — café über.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Weather in Paris?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city — café über.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "tools_system",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Use tools wisely."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Get the weather for a city — café über.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   ],
+   "kwargs": {},
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city — café über.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource>\n\nUse tools wisely.<｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Weather in Paris?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city — café über.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e>\n\nUse tools wisely.<｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "tools_no_think",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Get the weather for a city — café über.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   ],
+   "kwargs": {
+    "reasoning_effort": "no_think"
+   },
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city — café über.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Weather in Paris?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city — café über.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:no_think<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>"
+  },
+  {
+   "name": "tool_round_trip",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris and 1+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "Checking.",
+     "reasoning_content": "need two tools",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 2
+        }
+       }
+      },
+      {
+       "id": "c2",
+       "function": {
+        "name": "calc",
+        "arguments": {
+         "xs": [
+          1,
+          2
+         ]
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 21 °C",
+     "tool_call_id": "c1"
+    },
+    {
+     "role": "tool",
+     "content": "3",
+     "tool_call_id": "c2"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Get the weather for a city — café über.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    },
+    {
+     "name": "calc",
+     "description": "Add numbers.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "xs": {
+        "type": "array",
+        "items": {
+         "type": "number"
+        }
+       }
+      }
+     }
+    }
+   ],
+   "kwargs": {},
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city — café über.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n{\"name\": \"calc\", \"description\": \"Add numbers.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"xs\": {\"type\": \"array\", \"items\": {\"type\": \"number\"}}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Weather in Paris and 1+2?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>need two tools</think:opensource>Checking.<tool_calls:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Paris</arg_value:opensource><arg_key:opensource>days</arg_key:opensource><arg_value:opensource>2</arg_value:opensource></tool_call:opensource><tool_call:opensource>calc<arg_key:opensource>xs</arg_key:opensource><arg_value:opensource>[1, 2]</arg_value:opensource></tool_call:opensource></tool_calls:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>tool<｜hy_middle:opensource｜><tool_response:opensource>Sunny, 21 °C</tool_response:opensource><tool_response:opensource>3</tool_response:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city — café über.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n{\"name\": \"calc\", \"description\": \"Add numbers.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"xs\": {\"type\": \"array\", \"items\": {\"type\": \"number\"}}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Weather in Paris and 1+2?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>need two tools</think:6124c78e>Checking.<tool_calls:6124c78e><tool_call:6124c78e>get_weather<arg_key:6124c78e>city</arg_key:6124c78e><arg_value:6124c78e>Paris</arg_value:6124c78e><arg_key:6124c78e>days</arg_key:6124c78e><arg_value:6124c78e>2</arg_value:6124c78e></tool_call:6124c78e><tool_call:6124c78e>calc<arg_key:6124c78e>xs</arg_key:6124c78e><arg_value:6124c78e>[1, 2]</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>Sunny, 21 °C</tool_response:6124c78e><tool_response:6124c78e>3</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "tool_results_reordered",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "a",
+       "function": {
+        "name": "calc",
+        "arguments": {
+         "xs": [
+          1
+         ]
+        }
+       }
+      },
+      {
+       "id": "b",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Zürich"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "second",
+     "tool_call_id": "b"
+    },
+    {
+     "role": "tool",
+     "content": "first",
+     "tool_call_id": "a"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Get the weather for a city — café über.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    },
+    {
+     "name": "calc",
+     "description": "Add numbers.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "xs": {
+        "type": "array",
+        "items": {
+         "type": "number"
+        }
+       }
+      }
+     }
+    }
+   ],
+   "kwargs": {},
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city — café über.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n{\"name\": \"calc\", \"description\": \"Add numbers.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"xs\": {\"type\": \"array\", \"items\": {\"type\": \"number\"}}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>go<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource><tool_calls:opensource><tool_call:opensource>calc<arg_key:opensource>xs</arg_key:opensource><arg_value:opensource>[1]</arg_value:opensource></tool_call:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Zürich</arg_value:opensource></tool_call:opensource></tool_calls:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>tool<｜hy_middle:opensource｜><tool_response:opensource>first</tool_response:opensource><tool_response:opensource>second</tool_response:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city — café über.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n{\"name\": \"calc\", \"description\": \"Add numbers.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"xs\": {\"type\": \"array\", \"items\": {\"type\": \"number\"}}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>go<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>calc<arg_key:6124c78e>xs</arg_key:6124c78e><arg_value:6124c78e>[1]</arg_value:6124c78e></tool_call:6124c78e><tool_call:6124c78e>get_weather<arg_key:6124c78e>city</arg_key:6124c78e><arg_value:6124c78e>Zürich</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>first</tool_response:6124c78e><tool_response:6124c78e>second</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "tool_result_no_ids",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "function": {
+        "name": "calc",
+        "arguments": {
+         "xs": [
+          1
+         ]
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "1"
+    },
+    {
+     "role": "assistant",
+     "content": "One."
+    },
+    {
+     "role": "user",
+     "content": "thanks"
+    }
+   ],
+   "tools": [
+    {
+     "name": "calc",
+     "description": "Add numbers.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "xs": {
+        "type": "array",
+        "items": {
+         "type": "number"
+        }
+       }
+      }
+     }
+    }
+   ],
+   "kwargs": {},
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"calc\", \"description\": \"Add numbers.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"xs\": {\"type\": \"array\", \"items\": {\"type\": \"number\"}}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>go<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource><tool_calls:opensource><tool_call:opensource>calc<arg_key:opensource>xs</arg_key:opensource><arg_value:opensource>[1]</arg_value:opensource></tool_call:opensource></tool_calls:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>tool<｜hy_middle:opensource｜><tool_response:opensource>1</tool_response:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>One.<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>thanks<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"calc\", \"description\": \"Add numbers.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"xs\": {\"type\": \"array\", \"items\": {\"type\": \"number\"}}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>go<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>calc<arg_key:6124c78e>xs</arg_key:6124c78e><arg_value:6124c78e>[1]</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>1</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>One.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>thanks<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "tool_result_parts",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "a",
+       "function": {
+        "name": "calc",
+        "arguments": {
+         "xs": [
+          4
+         ]
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": [
+      {
+       "type": "text",
+       "text": "line one"
+      },
+      {
+       "type": "text",
+       "text": " two"
+      }
+     ],
+     "tool_call_id": "a"
+    }
+   ],
+   "tools": [
+    {
+     "name": "calc",
+     "description": "Add numbers.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "xs": {
+        "type": "array",
+        "items": {
+         "type": "number"
+        }
+       }
+      }
+     }
+    }
+   ],
+   "kwargs": {},
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"calc\", \"description\": \"Add numbers.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"xs\": {\"type\": \"array\", \"items\": {\"type\": \"number\"}}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>go<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource><tool_calls:opensource><tool_call:opensource>calc<arg_key:opensource>xs</arg_key:opensource><arg_value:opensource>[4]</arg_value:opensource></tool_call:opensource></tool_calls:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>tool<｜hy_middle:opensource｜><tool_response:opensource>line one two</tool_response:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"calc\", \"description\": \"Add numbers.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"xs\": {\"type\": \"array\", \"items\": {\"type\": \"number\"}}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>go<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>calc<arg_key:6124c78e>xs</arg_key:6124c78e><arg_value:6124c78e>[4]</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>line one two</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "string_args",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "a",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": "3",
+         "note": "say \"hi\"\nnow"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "ok",
+     "tool_call_id": "a"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Get the weather for a city — café über.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   ],
+   "kwargs": {},
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city — café über.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>go<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource><tool_calls:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Paris</arg_value:opensource><arg_key:opensource>days</arg_key:opensource><arg_value:opensource>3</arg_value:opensource><arg_key:opensource>note</arg_key:opensource><arg_value:opensource>say \"hi\"\nnow</arg_value:opensource></tool_call:opensource></tool_calls:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>tool<｜hy_middle:opensource｜><tool_response:opensource>ok</tool_response:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city — café über.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>go<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>get_weather<arg_key:6124c78e>city</arg_key:6124c78e><arg_value:6124c78e>Paris</arg_value:6124c78e><arg_key:6124c78e>days</arg_key:6124c78e><arg_value:6124c78e>3</arg_value:6124c78e><arg_key:6124c78e>note</arg_key:6124c78e><arg_value:6124c78e>say \"hi\"\nnow</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>ok</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "tool_history_not_preserved",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "r",
+     "tool_calls": [
+      {
+       "id": "a",
+       "function": {
+        "name": "calc",
+        "arguments": {
+         "xs": [
+          1
+         ]
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "1",
+     "tool_call_id": "a"
+    },
+    {
+     "role": "assistant",
+     "content": "One.",
+     "reasoning_content": "r2"
+    },
+    {
+     "role": "user",
+     "content": "again"
+    }
+   ],
+   "tools": null,
+   "kwargs": {},
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>go<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource><tool_calls:opensource><tool_call:opensource>calc<arg_key:opensource>xs</arg_key:opensource><arg_value:opensource>[1]</arg_value:opensource></tool_call:opensource></tool_calls:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>tool<｜hy_middle:opensource｜><tool_response:opensource>1</tool_response:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>One.<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>again<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>go<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>calc<arg_key:6124c78e>xs</arg_key:6124c78e><arg_value:6124c78e>[1]</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>1</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>One.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>again<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "image",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "What is this?"
+      },
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "data:image/png;base64,AAAA"
+       }
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "kwargs": {},
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>What is this?<｜hy_image▁start:opensource｜><｜hy_image▁pad:opensource｜><｜hy_image▁end:opensource｜><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is this?<｜hy_image▁start:6124c78e｜><｜hy_image▁pad:6124c78e｜><｜hy_image▁end:6124c78e｜><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "two_images_ids",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "data:image/png;base64,AAAA"
+       }
+      },
+      {
+       "type": "text",
+       "text": "vs"
+      },
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "data:image/png;base64,AAAA"
+       }
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "add_vision_id": true
+   },
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Picture 1: <｜hy_image▁start:opensource｜><｜hy_image▁pad:opensource｜><｜hy_image▁end:opensource｜>vsPicture 2: <｜hy_image▁start:opensource｜><｜hy_image▁pad:opensource｜><｜hy_image▁end:opensource｜><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Picture 1: <｜hy_image▁start:6124c78e｜><｜hy_image▁pad:6124c78e｜><｜hy_image▁end:6124c78e｜>vsPicture 2: <｜hy_image▁start:6124c78e｜><｜hy_image▁pad:6124c78e｜><｜hy_image▁end:6124c78e｜><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "image_system_refused",
+   "messages": [
+    {
+     "role": "system",
+     "content": [
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "data:image/png;base64,AAAA"
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "kwargs": {},
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜hy_image▁start:opensource｜><｜hy_image▁pad:opensource｜><｜hy_image▁end:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>x<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜hy_image▁start:6124c78e｜><｜hy_image▁pad:6124c78e｜><｜hy_image▁end:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>x<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "bad_effort",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "medium"
+   },
+   "official": {
+    "error": "TemplateError: reasoning_effort error : medium, should be no_think/high/max"
+   },
+   "pack": {
+    "error": "TemplateError: reasoning_effort error : medium, should be no_think/low/high/max"
+   }
+  },
+  {
+   "name": "unicode_content",
+   "messages": [
+    {
+     "role": "user",
+     "content": "你好 <b>&</b> {{x}} {%y%}"
+    }
+   ],
+   "tools": null,
+   "kwargs": {},
+   "official": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>你好 <b>&</b> {{x}} {%y%}<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+   "pack": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>你好 <b>&</b> {{x}} {%y%}<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  }
+ ]
+}

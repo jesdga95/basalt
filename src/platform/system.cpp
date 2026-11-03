@@ -16,6 +16,7 @@
 #include "basalt/platform/win.hpp"
 #include <fcntl.h>   // _O_BINARY
 #include <io.h>      // _fileno, _setmode
+#include <psapi.h>   // K32GetProcessMemoryInfo
 #else
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -77,8 +78,8 @@ int64_t process_id() { return (int64_t) GetCurrentProcessId(); }
 
 std::string host_os_name() { return "Windows"; }
 
-std::string python_interpreter(const std::string& src_dir) {
-    const std::string venv = src_dir + "/.venv/Scripts/python.exe";
+std::string python_interpreter(const std::string& root) {
+    const std::string venv = root + "/.venv/Scripts/python.exe";
     return path_executable(venv) ? venv : "python";
 }
 
@@ -112,7 +113,20 @@ std::string meminfo_path() { return std::string(); }
 std::string self_cgroup_path() { return std::string(); }
 std::string cgroup_root() { return std::string(); }
 
-ProcessMemory process_memory() { return ProcessMemory{}; }   // the stall report names the Linux readings only
+ProcessMemory process_memory() {
+    ProcessMemory m;
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) m.avail_mib = ms.ullAvailPhys >> 20;
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof pmc;
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof pmc)) {
+        m.faults = pmc.PageFaultCount;
+        m.rss_mib = pmc.WorkingSetSize >> 20;
+        m.commit_mib = pmc.PrivateUsage > pmc.WorkingSetSize ? (pmc.PrivateUsage - pmc.WorkingSetSize) >> 20 : 0;
+    }
+    return m;
+}
 
 int disk_rotational(const std::string&, std::string&) {
     return -1;   // sysfs names the queue on Linux; unknown means the caller does not warn
@@ -135,8 +149,8 @@ std::string host_os_name() {
     return rel.find("microsoft") != std::string::npos || rel.find("wsl") != std::string::npos ? "WSL2" : "Linux";
 }
 
-std::string python_interpreter(const std::string& src_dir) {
-    const std::string venv = src_dir + "/.venv/bin/python";
+std::string python_interpreter(const std::string& root) {
+    const std::string venv = root + "/.venv/bin/python";
     return path_executable(venv) ? venv : "python3";
 }
 

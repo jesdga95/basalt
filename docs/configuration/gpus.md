@@ -1,111 +1,159 @@
 # GPUs
 
-One setting picks the cards: `gpu`. It means the same in the server (`"gpu"` in the config's `server` section, or
-`--gpu`), in `basalt` itself, in `basalt-bench` and in `basalt-probe`.
+Three settings say how a run uses its cards. The engine never picks a mode or a cut for you: `gpu-mode` decides, `gpu-share` sets
+the proportions, and a mode the model cannot run, or a card that would hold nothing, is refused with the reason before the load.
 
-| Value | Cards used | Main card |
+They mean the same in the server (`"gpu"`, `"gpu-mode"` and `"gpu-share"` in a model entry, or `--gpu`, `--gpu-mode`, `--gpu-share`),
+in `basalt` itself, in `basalt-bench` and in `basalt-probe`.
+
+| Setting | Values | Default |
 | --- | --- | --- |
-| not set | GPU 0 alone; one warning at start names the other visible cards | GPU 0 |
-| `"0,1"`, `"1,0"`, ... | exactly these, in this order | the first one listed |
-| `"auto"` | every visible Blackwell (sm_120) card; any other card is skipped with one line naming it | the one with the most memory bandwidth, then the most VRAM |
+| `gpu` | a number (`0`), a list (`0,1`, `1,0,2`) or `all` | GPU 0 alone; one warning at start names the other visible cards (only when `gpu` is unset) |
+| `gpu-mode` | `peer`, `split`, `tensor` | none; required when `gpu` names two or more cards, an error with one |
+| `gpu-share` | one positive number per card, in the order of `gpu` (`3,1`) | by the mode ([shares](#shares)); an error with one card |
 
-Cards are numbered as `nvidia-smi` numbers them. When `CUDA_VISIBLE_DEVICES` is set, the numbers count within its list
-(`CUDA_VISIBLE_DEVICES=1,0` makes `gpu 0` the card `nvidia-smi` calls 1), and its numbers are read as `nvidia-smi`'s
-too. A number past the visible cards, a card listed twice or a card that is not Blackwell stops the start with an error.
+- Cards are numbered as `nvidia-smi` numbers them. The first card listed is the main card; `all` is every visible card in order, so
+  GPU 0 is the main card. When `CUDA_VISIBLE_DEVICES` is set, the numbers count within its list.
+- **On this fork** the main card is Blackwell (sm_120) **or** Ada (sm_89): the port builds every kernel for 8.9, so an Ada card is a
+  main card, a peer and a split card alike ([an Ada card](#an-ada-sm_89-card)). Upstream keeps the main card sm_120 and admits sm_89
+  only as a peer, and only in a `-DPEER_ADA=ON` build ([older peer card](#an-older-peer-card)).
+- A number past the visible cards or a card listed twice stops the start with an error, as does a card the build holds no code for.
+- **Idle cards:** with `gpu` unset and more cards visible, every model warns once at start (`GPU 1 (RTX 5060 Ti) unused; to use
+  more cards set gpu (0,1 or all) and gpu-mode`), in the CLI, the server and the bench. It is a warning, not an error. Naming a
+  card (`gpu 0`) is a choice and prints nothing.
+- **Old values:** `gpu: auto`, a `gpu` list without a `gpu-mode`, and the flags the old multi-card logic had are errors, with the
+  valid forms in the message ([upgrading](../changelog/0.5.7.md#upgrading)).
 
-The main card holds the dense weights, the KV cache, the drafter and its own expert cache. The engine decides what the
-other cards do and prints one line at start, for example `gpus: RTX 5090 (nvidia-smi 0) main, RTX 5060 Ti (nvidia-smi 1)
-expert tier`:
+```
+gpus: peer; RTX 5090 (nvidia-smi 0) main, share 0.80; RTX 5060 Ti (nvidia-smi 1) peer, share 0.20 (bandwidth)
+```
 
-- **Expert tier.** Each card after the main one holds experts the main card does not, computes their rows in every
-  decode window and follows the conversation like the main card's cache does. The experts are dealt out hottest first,
-  each to the tier with the least work so far for its memory bandwidth, until every tier is full. On two cards a second
-  card at least as fast as the main one also takes a share of the hottest experts, so both compute routed experts in
-  every layer; a slower second card takes the experts after the main card's. Every tier computes its experts with the
-  main card's kernels, so where an expert sits does not change its rows. The second card also
-  computes its experts' share of each prompt chunk: of any chunk when it is as fast as the main card, of chunks up to
-  2,559 rows when it is slower (a slower card costs a longer chunk more than the experts it saves the main card's link).
-  When its memory is faster than the main card's it takes a share of each GDN mixer and of the head (one start line
-  each; see [the GDN split](../precision/gdn-split.md)).
-- **Idle.** The engine runs up to three expert tiers: a fifth card and later ones stay idle.
+The start prints this line before the load and each card's part after it. `--gpu-plan` prints the choice as JSON, with the mode and
+the shares, and checks the model's modes without loading it.
 
-Three or more cards are community-tested: the path is checked here on two cards, with two expert tiers sharing the
-second one. Reports from machines with three or four cards are welcome (see [community](../community.md)).
+## Modes
 
-## What several cards do together
+- **peer:** the main card runs every layer and decodes; the other cards help. What they do depends on the model: hold and compute
+  experts of a mixture of experts, read the last layers of a long prompt, or both.
+- **split:** the layers are divided between the cards in order; each card holds its layers' weights and their KV cache and
+  recurrent state, and a window or prompt chunk crosses from one card to the next. The cut follows the shares.
+- **tensor:** every layer sharded across the cards. The name is reserved; no model runs it yet.
 
-With two or more cards the engine prices three mechanisms at start, as milliseconds per decode window, from the cards'
-memory bandwidth, their VRAM and the model's size, and prints one line, for example
-`multi-gpu: 2 cards unlike; ms per window: expert tier 7.9, layer split 13.5, tensor parallel 9.0
-(not built); picked expert tier`. The line appears for every multi-card setting, alike cards or not. With one card (unset, or one number)
-there is no choice: nothing is priced and no other card is used or even visible to the process.
+| Model | peer | split | tensor |
+| --- | --- | --- | --- |
+| [Qwen3.8-Flash-Next](../models/qwen38-flash-next.md#cards) | up to 4 cards: experts and prompt layers | up to 8 cards | refused |
+| [DeepSeek-V4.1-Flash](../models/deepseek41.md#cards) | up to 5 cards: experts, a block of layers each | refused | refused |
+| [Hy4-flash](../models/hy4-flash.md#cards) | up to 4 cards: experts, a block of layers each | refused | refused |
+| [Qwen3.8-27B](../models/qwen38-27b.md#cards) | 2 cards: the last layers of long prompts | 2 cards | refused |
+| [Inkling 2 Mini](../models/inkling2.md#two-cards) | 2 cards: the experts that spill from the main card | 2 cards | refused |
 
-- **Expert tier**: the main card runs every layer and the other cards hold and compute experts (above).
-- **Layer split**: each card runs a block of layers, one after another. The cut is searched at start, before any weight
-  is placed, and every card holds only the dense weights of its own layers, so its VRAM goes to experts as in the tier.
-  Every card plans its layers' experts on its own device, as a single card does, and the window is handed to the next
-  card once, which costs a fixed part of a window. The drafter stays on the first card and reads the last card's rows
-  of each window; the last card holds the head. The experts no card holds are read from one pinned RAM copy that all
-  stages share (the resident RAM mode, as in the tier), and each card's adaptive swaps stay within its own layers.
-- **Layer split of alike cards, overlapped windows**: with two cards, a server and the drafter, one conversation at a
-  time, the split also overlaps consecutive windows. Once the first card has served window K and the drafter's chain
-  holds a draft past it, the first card commits K as if every row were kept and starts window K+1 from the guess that K
-  is accepted whole, while the second card still verifies K. A guess that holds sends K+1 on to the second card at once;
-  one that fails puts the first card's state back and runs the window again, so the text is the same either way. The
-  price of the split does not count the overlap. The engine log prints `pipelined windows: N launched, M held` per
-  request.
-- **Tensor parallel**: every layer is split across the cards. It is priced and not built: the dense part is a third of
-  a window's bytes, so splitting it saves about 2 ms between two cards and the exchanges between the cards (host-staged,
-  about 5.4 us per 10 KiB) cost about as much; the expert tier already shares the experts.
+A mode a model refuses is an error that names the modes it runs, for example `gpu-mode split: Hy4-flash does not run it; it runs
+peer`. More cards than a mode takes is refused with the most it takes. One mode per run.
 
-Only cards that match (memory bandwidth and VRAM within 10%) may pick a mechanism other than the expert tier, and only
-when it prices at least 5% below it. Unlike cards always use the expert tier. The prices are estimates fitted to
-measured windows (a 5090 with a 5060 Ti: tier 7.9 ms, plain layer split 13.4-13.7 ms measured at the cuts
-tried; two 5080s: 147 tok/s reported against 141 priced), good for the choice and not for forecasting a rate.
+## Shares
 
-## Long prompts across the cards
+Shares are normalized to sum to 1 and stay fixed for the run. What a share divides depends on the mode:
 
-In the expert tier, a long fresh part of a prompt can be read as a pipeline over the main card and the tier cards while
-no other conversation decodes (with `--parallel`, while every other slot is idle). The main card reads the first layers
-of each chunk and hands the chunk on; each tier card reads the next block of layers of it while the cards before it read
-the next chunks, the last one ending at the last layer. The main card reads the last chunk's later layers itself once
-the tier cards have given their layers' state back and got their experts back. A tier card's weights, prompt state and
-buffers go into its tier's last slots for the read (its weights from a pinned RAM copy made at start), so outside a
-prompt the tiers hold what they held before and decode does not change. The engine prices each part on the main card
-alone and over every number of stages and every set of cuts, from each card's memory bandwidth, the probed link rates
-(each card's alone and all the cards' at once, which a shared switch or the RAM can hold below their sum) and the
-experts each card holds, and reads it across the cards only when that is at least 5% cheaper. Tier cards join in
-order of memory bandwidth, the fastest reading the last layers. At start each card gets the layers the stage counts
-worth it for a prompt of the context's length (up to 131,072 tokens) give it, plus a few. The start and request lines
-begin with `prompt split:` and print the prices; a part longer than one chunk that stays on the main card says why
-(`prompt split: N tokens read on CUDA0 (...)`). The chunks are the main card's own, so a part of one chunk (up to
-32,768 tokens) stays on the main card. The draft layer's rows of the prompt's last cells come back from the last card in
-the hand-off buffers (the last two chunks handed on where they came in, earlier ones past the chunk in both), so the
-smaller chunks of a deep prompt, whose KV leaves the main card fewer slots to lend, still split. With a slower tier card, a chunk short enough to be read
-routed-only with that card computing its experts' rows of it in a main-card read stays on the main card (the split would
-give that share up); with matched cards, a chunk under 4,096 tokens does. On three or more cards it runs when they all match (memory bandwidth and VRAM
-within 10%); on three or more unlike cards it is off until measured on such a set, and the start line prints what it
-would cost. Off with `--peer-exclusive`, without the RAM copy of the experts, a
-control vector, experts other than NVFP4 (the price is fitted to those), when RAM or a tier's slots are short, or when a
-tier card keeps under 256 MiB free beside its stage (a read loads its kernels there; `peer-reserve-mib` sets the room).
-Everything that grows with the prompt sits in the lent slots, so a longer prompt that does not fit them is read on the
-main card. A
-prompt that arrives while other slots decode is read on the main card beside them, as before. A much shorter request
-that arrives during a read across the cards gets its turn at the end of the main card's current chunk: the main card
-reads that chunk's later layers itself and the rest of the prompt is read later, as with a main-card read.
+| Mode, part | What the share divides | Default without `gpu-share` |
+| --- | --- | --- |
+| split | each card's bytes: its layers' weights plus their KV and state at the context and slots; the cut is the layer nearest the shares | free VRAM at start |
+| peer, experts | the experts the main card does not hold, dealt hottest first to the peers; the main card fills first | free VRAM of the peers |
+| peer, prompt layers | the layers of a long prompt's chunk: the main card reads the first part, each card the next by share | memory bandwidth |
+| peer, the main card's hot share | only with `gpu-share`: Flash-Next interleaves the hottest experts between the main card and a peer by share | off: the main card keeps the hottest |
+
+A part that does not fit its card is refused with the numbers (what it needs, what is free); lower that card's `gpu-share`,
+`max-context` or `parallel`. A peer that would hold nothing (the main card holds every expert, or its room is gone) is refused too,
+with `use gpu 0`.
+
+## Peer mode
+
+- **Experts (Flash-Next, DeepSeek, Hy4-flash, Inkling).** Each peer holds experts the main card does not and computes their rows in
+  every decode window, following the conversation like the main card's cache. The rows are the main card's kernels' rows, so where an
+  expert sits does not change them. Flash-Next and Inkling deal the experts one by one, hottest first; DeepSeek and Hy4-flash give each
+  peer a contiguous block of layers, sized to its room.
+- **Prompt rows.** A peer also computes its experts' share of each prompt chunk: any chunk on a peer as fast as the main card, chunks
+  up to 2,559 rows on a slower one (a slower card costs a longer chunk more than the experts it saves the main card's link).
+- **Prompt layers (Flash-Next, Qwen3.8-27B).** A long fresh part of a prompt is read as a pipeline over the cards while no other
+  conversation decodes: the main card reads the first layers of a chunk and hands it on, a peer reads the next layers while the cards
+  before it read the next chunks, and the main card reads the last chunk whole. Decode never uses the stage.
+  - Flash-Next's cuts come from the shares over layers 2 to the last. A part shorter than a chunk, a chunk under 4,096 tokens, a
+    chunk short enough to be read routed-only on a slower peer, and a prompt that arrives while other slots decode stay on the main
+    card.
+  - A peer's weights, prompt state and buffers go into its tier's last slots for the read, so outside a prompt decode does not change.
+  - A loaded control vector is copied to every stage card.
+- **Per-operation splits (Flash-Next).** A peer whose memory is faster than the main card's takes a share of each GDN mixer and of the
+  head ([the GDN split](../precision/qwen38-flash-next.md#gdn-split-across-two-cards)).
+- **Tuning:** `peer-reserve-mib` (default 600) is the VRAM a peer keeps free beside its experts and prompt buffers; `peer-exclusive`
+  keeps the peer's experts out of RAM when RAM is short; `gpu 0` keeps everything on the main card.
+
+Measured, from the ledger's rows:
+
+- **Flash-Next:** no speed loss against the earlier peer path (64K prefill 9,823 against 9,835 tok/s, conversation decode within
+  noise). A normal peer run scores BF16 KLD 0.06174 against 0.06221 on one card and top-1 91.84% against 91.80%.
+- **Qwen3.8-27B:** a 64K prefill reads 17% faster than on one card (7,410 against 6,336 tok/s); decode stays on the main card.
+- **Inkling 2 Mini:** a peer helps only when experts spill beyond what the main card's elastic copies cover. At default settings one
+  card is fastest up to 1M tokens, and a peer is refused when the main card holds every expert
+  ([Inkling](../models/inkling2.md#two-cards)).
+- **Rounding:** a peer's prompt reads differ from one card's at summation-order rounding, about 0.01 KLD on `--diag-gpu-check`, the
+  same as any reordering of the experts' sum. `--diag-main-card-bits` makes Flash-Next's other cards compute the main card's bits,
+  and the prompt stages are then bitwise ([diagnostics](diagnostics.md)).
+
+## Split mode
+
+Each card runs a block of layers, one after another, with the window handed to the next card once. The cut is made at start by the
+shares, before any weight is placed; every card holds only the dense weights of its own layers, and its leftover VRAM goes to that
+model's experts or caches.
+
+- **Flash-Next:** the experts no card holds are read from one pinned RAM copy that all stages share, and each card's adaptive swaps stay
+  within its own layers. With two cards, a server and the drafter, one conversation at a time, the split overlaps consecutive windows:
+  the first card starts window K+1 on the guess that K is accepted whole while the second card verifies K; a guess that fails puts the
+  first card's state back and runs the window again, so the text is the same either way (`pipelined windows: N launched, M held` per
+  request).
+- **Qwen3.8-27B:** the output is the main card's alone to the bit ([27B](../models/qwen38-27b.md#cards)).
+- **Inkling 2 Mini:** a split holds every expert of its layers on its card; it is about 25% slower than one card at the contexts where
+  one card holds or copies back its experts ([Inkling](../models/inkling2.md#two-cards)).
+- A split costs a fixed part of a window per crossing: use it for a model or context that does not fit one card, and a peer where it
+  does.
 
 ## Two 16 GB cards
 
-`gpu "0,1"` with two cards of 16 GB (two RTX 5080s, say) runs the expert tier: each card holds experts in what its VRAM has
-left, and the second card also reads its experts' share of each prompt. The engine sizes the second card's tier to leave
-room for the buffers of that share (about 200 MiB, the size is computed, not a setting) and `peer-reserve-mib` more
-(default 600 MiB; at least 128) for everything else the card needs after its experts are in. If the start prints
-`prefill peer: the peer's buffers do not fit`, raise `peer-reserve-mib` (the card shows a display or another program using
-its VRAM) and the second card's experts shrink by the same amount. The start line `peer GPU 1: N experts` says how many
-it holds.
+`gpu "0,1"` with `gpu-mode "peer"` on two cards of 16 GB (two RTX 5080s, say) has each card hold experts in what its VRAM has left. The
+engine sizes the second card to leave room for its prompt buffers (about 200 MiB, computed) and `peer-reserve-mib` more (default
+600 MiB, at least 128). If the start prints `prefill peer: the peer's buffers do not fit`, raise `peer-reserve-mib` (a display or
+another program may be using the card) and its experts shrink by the same amount. `peer GPU 1: N experts` says how many it holds.
 
-## The engine log
+## An Ada (sm_89) card
 
-The server writes the engine's output, the `basalt ...` lines the engine prints at start and while it runs, to
-`~/.cache/basalt/<id>/engine.log`, one folder per model file (`<id>` is 16 hex digits taken from the model file).
-`[server] engine log: PATH` names it when the engine stops. The `[server]` lines are the server's own and go to its terminal.
+On this fork every path also runs on sm_89 (Ada): an Ada card can be the only card, the main card or a second card. The
+build must hold its code: `-DCMAKE_CUDA_ARCHITECTURES=89` for Ada cards alone, `"120;89"` beside a Blackwell card
+(`-DPEER_ADA=ON` adds 89 to the list). The engine refuses at start a card its build holds no code for. On 8.9 the kernels
+that need thread-block clusters, bulk async copies or FP4 tensor cores are compiled out and their callers take plain
+kernels ([Ada port notes](../../ADA_PORT_NOTES.md)). On a Blackwell + Ada pair:
+
+- Flash-Next: both cards read NVFP4 prompts through MMQ (its FP4 prompt kernels run only when every card is 12.x), so
+  the buffers, chunk plan and row rounding are the same on both. Its decode does not use FP4 tensor cores.
+- DeepSeek takes an Ada second card; its peer-tier kernels are built for 8.9 as well.
+- Hy4-flash takes an Ada main or second card: its kernels build for 8.9 as they are. No Hy4-flash pack has been run here.
+- Inkling 2 Mini runs on an Ada card alone (both packs run here). Its layer split may put an Ada card on either side:
+  each card picks its own prompt kernels (FP4 experts only on 12.x, the Q8_0 projections and MXFP8 experts in their 8.9
+  forms). Not run with two cards here.
+- Flash-Next's layer split, overlapped windows and tensor parallel need matched cards; an unlike pair uses the expert
+  tier.
+- Not run here: no Blackwell card was available, so a mixed pair has been checked only with an Ada card alone running the
+  `"120;89"` binary.
+
+## An older peer card
+
+One older architecture can be built for the peer's kernels: sm_89 (Ada), beside an sm_120 main card, with the `-DPEER_ADA=ON` build
+flag (off by default to keep build times down). Without it, or for any other pre-Blackwell card, the card is refused at the start.
+What such a peer does:
+
+- It holds experts and computes their rows in every decode window with the standard-CUDA kernels (Q8_1/Q2_0 and the GGUF i-quant
+  rows, dp4a arithmetic). It reads its experts' share of a prompt chunk under the slower-card rule (chunks up to 2,559 rows).
+- It does not run the main card's work: the dense weights, the KV cache, the drafter, TMA and the FP4 tensor-core expert kernels stay
+  on the Blackwell card, so an NVFP4 pack's FP4 experts are main-card only.
+- Only Flash-Next's peer kernels are built for it; the other models refuse an sm_89 card. Split and tensor need sm_120 cards
+  (`gpu-mode split: GPU 1 (RTX 4060 Ti) is sm_89; split and tensor run on sm_120 cards`).
+
+Three or more cards are community-tested: the path is checked on two cards. Reports from machines with three or four cards are
+welcome ([community](../community.md)).

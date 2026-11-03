@@ -1,15 +1,16 @@
 // tests/program/loan_moves_test.cpp - a prompt loan's table work: the re-lend split and the routed experts' trades.
 // The lend sequence runs on a model of the cache (each slot holds an expert's bytes or a loan's buffers) through the
 // same helpers the engine calls: no trade reads a slot of a loan still out, and every table entry names a slot that
-// holds its expert.
+// holds its expert, also after a move that gives up partway.
 #include "loan_moves.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <utility>
 #include <vector>
 
-using namespace basalt::program::serve;
+using namespace basalt::models::qwen4exp::serve;
 
 static int g_fail = 0;
 #define CHECK(c)                                                                         \
@@ -85,6 +86,7 @@ Outcome relend(Cache c, int64_t first1, int64_t first2, bool mask) {
         out[(size_t) i] = 1;
         lent_slot[(size_t) s] = 1;
     }
+    std::vector<IssuedTrade> issued;
     for (int32_t l = 0; l < c.layers; ++l) {
         const size_t at = (size_t) l * (size_t) c.n;
         std::vector<RoutedTrade> tr;
@@ -101,15 +103,59 @@ Outcome relend(Cache c, int64_t first1, int64_t first2, bool mask) {
                 o.reads_lent_slot = true;
             }
             c.bytes[(size_t) t.to] = t.from_ram ? hot : c.bytes[(size_t) t.from];
-            c.slot[(size_t) hot] = t.to;
-            c.slot[(size_t) cold] = t.from;
+            issued.push_back({l, t});
             ++o.trades;
         }
     }
+    settle_trades(c.slot.data(), c.n, issued, true, -1);   // every copy landed
     const std::vector<LentEntry> lent2 = lend_from(c, first2);
     o.table_ok = table_true(c);
     refill(c, lent2);
     o.refill_ok = table_true(c);
+    return o;
+}
+
+constexpr int32_t kTorn = -3;   // a slot a copy was landing in when the move gave up: neither expert's bytes
+
+struct GiveUp {
+    bool table_ok = true;   // after settle_trades, every entry names a slot that holds its expert
+    bool rest_kept = true;  // and only the issued trades' cold experts changed (to a miss)
+    bool old_ok = true;     // the same truth test after the old per-copy writes (hot to `to`, cold to `from`)
+    int64_t trades = 0, issued = 0;
+};
+
+// A move before the KV takes the slots from `first` on that gives up after `issue` of its trades, the tail still
+// live (a copy that would not start, a RAM copy gone, or a failed stream sync with every trade issued).  Each issued
+// copy landed, never ran, or was torn.
+GiveUp give_up(Cache c, int64_t first, int64_t issue) {
+    GiveUp o;
+    std::vector<IssuedTrade> issued;
+    for (int32_t l = 0; l < c.layers; ++l) {
+        const size_t at = (size_t) l * (size_t) c.n;
+        std::vector<RoutedTrade> tr;
+        plan_routed_trades(c.use.data() + at, c.slot.data() + at, c.in_ram.data() + at, nullptr, c.n, first, tr);
+        for (const RoutedTrade& t : tr) {
+            ++o.trades;
+            if ((int64_t) issued.size() >= issue) continue;
+            issued.push_back({l, t});
+            const int64_t fate = below(3);
+            if (fate == 0) c.bytes[(size_t) t.to] = (int32_t) at + t.hot;   // landed
+            else if (fate == 2) c.bytes[(size_t) t.to] = kTorn;            // torn; 1: never ran
+        }
+    }
+    o.issued = (int64_t) issued.size();
+    Cache old = c;
+    for (const IssuedTrade& x : issued) {
+        const size_t at = (size_t) x.layer * (size_t) c.n;
+        old.slot[at + (size_t) x.t.hot] = x.t.to;
+        old.slot[at + (size_t) x.t.cold] = x.t.from;
+    }
+    o.old_ok = table_true(old);
+    std::vector<int32_t> want = c.slot;
+    for (const IssuedTrade& x : issued) want[(size_t) x.layer * (size_t) c.n + (size_t) x.t.cold] = -1;
+    settle_trades(c.slot.data(), c.n, issued, false, -1);
+    o.table_ok = table_true(c);
+    o.rest_kept = c.slot == want;
     return o;
 }
 
@@ -224,6 +270,41 @@ int main() {
         CHECK(old_bad > 50);    // and the old trades broke the table in many
         std::printf("loan_moves_test: %lld random re-lends, %lld moved experts from RAM, %lld broke without the mask\n",
                     (long long) cases, (long long) with_ram, (long long) old_bad);
+    }
+    // settling: landed trades swap the two entries; a move given up turns only the cold ones into misses
+    {
+        int32_t table[2 * 4] = {0, 1, 9, 8, 2, 3, 7, 6};   // layer 0 then layer 1, slots 0-9 (the tail from 6)
+        const std::vector<IssuedTrade> issued = {{0, {2, 0, 9, 0, false}}, {1, {2, 1, 7, 3, false}}};
+        int32_t landed[8], lost[8];
+        std::copy(table, table + 8, landed);
+        std::copy(table, table + 8, lost);
+        settle_trades(landed, 4, issued, true, -1);
+        settle_trades(lost, 4, issued, false, -1);
+        const int32_t want_landed[8] = {9, 1, 0, 8, 2, 7, 3, 6}, want_lost[8] = {-1, 1, 9, 8, 2, -1, 7, 6};
+        CHECK(std::equal(landed, landed + 8, want_landed));
+        CHECK(std::equal(lost, lost + 8, want_lost));
+    }
+    // a move that gives up partway with the tail still live, random tables: every entry still names a slot holding its
+    // expert and nothing else changed; the old per-copy writes left false entries in every case with an issued trade
+    {
+        int64_t cases = 0, gave_up = 0, old_bad = 0;
+        const int32_t geo[3][3] = {{1, 16, 12}, {3, 32, 70}, {4, 64, 200}};
+        for (uint64_t seed = 1; seed <= 400; ++seed) {
+            g_rng = 1000003 * seed;
+            const int32_t* gm = geo[seed % 3];
+            const Cache c = random_cache(gm[0], gm[1], gm[2]);
+            const int64_t first = 1 + below(gm[2] - 1);
+            const GiveUp o = give_up(c, first, below(12));
+            CHECK(o.table_ok);
+            CHECK(o.rest_kept);
+            CHECK(o.issued == 0 || !o.old_ok);
+            ++cases;
+            gave_up += o.issued > 0;
+            old_bad += o.issued > 0 && !o.old_ok;
+        }
+        CHECK(gave_up > 100);   // most cases had trades issued before the failure
+        std::printf("loan_moves_test: %lld moves given up partway, %lld with issued trades, %lld false entries the old "
+                    "way\n", (long long) cases, (long long) gave_up, (long long) old_bad);
     }
     if (g_fail == 0) std::printf("loan_moves_test: all passed\n");
     return g_fail == 0 ? 0 : 1;

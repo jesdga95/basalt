@@ -3,13 +3,13 @@
 // (session_copy_state through StagedCopy), the range's new cells back, and the range into a whole-model checkpoint
 // (conversation_checkpoint_save_layers). Every byte is checked against the source, the rest against what was there.
 // With KV streaming the whole session's cells are its host copy.
-#include "basalt/core/conversation_snapshot.hpp"
-#include "basalt/core/layer.hpp"
-#include "basalt/core/session.hpp"
+#include "basalt/models/qwen4exp/decode/conversation_snapshot.hpp"
+#include "basalt/models/qwen4exp/decode/layer.hpp"
+#include "basalt/models/qwen4exp/decode/session.hpp"
 #include "basalt/core/staged_copy.hpp"
-#include "basalt/kernels/kv_q4.hpp"
-#include "basalt/kernels/kv_q8.hpp"
-#include "basalt/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q8.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
 
 #include <cuda_runtime.h>
 
@@ -182,25 +182,25 @@ void run_format(const char* name, bool int8, bool q4, bool hybrid, int dst_dev, 
     fill_state(ss, g, gdn_row);   // the whole session moves on; the checkpoint keeps the range's state from `ps`
     ConversationCheckpoint w = c;
     CHECK(conversation_checkpoint_save_layers(w, ps, g, lb, g.n_layers, err));
-    std::vector<uint8_t> want(c.gdn.begin(), c.gdn.end());
+    std::vector<uint8_t> want(c.state_a.begin(), c.state_a.end());
     {
         const std::vector<uint8_t> p = get(ps.gdn_state, ps.gdn_alloc * gdn_row);
         std::copy(p.begin(), p.end(), want.begin() + (std::ptrdiff_t) (g0 * gdn_row));
     }
-    CHECK(std::vector<uint8_t>(w.gdn.begin(), w.gdn.end()) == want);
-    CHECK(std::vector<uint8_t>(w.ple.begin(), w.ple.end()) == std::vector<uint8_t>(c.ple.begin(), c.ple.end()));
+    CHECK(std::vector<uint8_t>(w.state_a.begin(), w.state_a.end()) == want);
+    CHECK(std::vector<uint8_t>(w.state_b.begin(), w.state_b.end()) == std::vector<uint8_t>(c.state_b.begin(), c.state_b.end()));
     for (int64_t q = 0; q < g.n_qsa_layers(); ++q) {
         auto slice = [q](const CheckpointBytes& b, uint64_t each) {
             return std::vector<uint8_t>(b.begin() + (std::ptrdiff_t) (q * each), b.begin() + (std::ptrdiff_t) ((q + 1) * each));
         };
         if (q < q0) {
-            CHECK(slice(w.tails, z.tail) == slice(c.tails, z.tail) && slice(w.dead, z.dead) == slice(c.dead, z.dead) &&
-                  slice(w.block_pos, z.block_pos) == slice(c.block_pos, z.block_pos));
+            CHECK(slice(w.state_c, z.tail) == slice(c.state_c, z.tail) && slice(w.state_d, z.dead) == slice(c.state_d, z.dead) &&
+                  slice(w.state_e, z.block_pos) == slice(c.state_e, z.block_pos));
         } else {   // (arrays() ends with the tail, the spare key and the block position)
             const std::vector<Arr> a = arrays(ps.qsa_states[q], g);
             const size_t n = a.size();
-            CHECK(slice(w.tails, z.tail) == get(a[n - 3].p, z.tail) && slice(w.dead, z.dead) == get(a[n - 2].p, z.dead) &&
-                  slice(w.block_pos, z.block_pos) == get(a[n - 1].p, z.block_pos));
+            CHECK(slice(w.state_c, z.tail) == get(a[n - 3].p, z.tail) && slice(w.state_d, z.dead) == get(a[n - 2].p, z.dead) &&
+                  slice(w.state_e, z.block_pos) == get(a[n - 1].p, z.block_pos));
         }
     }
     // a range the session does not hold is refused

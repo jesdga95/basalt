@@ -8,6 +8,8 @@
 #include "gguf_fixture.hpp"
 
 #include "basalt/artifact/gguf_split.hpp"
+#include "basalt/model/adapter.hpp"
+#include "../model/meta_adapters.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -90,7 +92,7 @@ int real_model(const std::string& any) {
                         m.shard(i).tensors().size(), (unsigned long long) m.shard(i).data_start());
             tensors += m.shard(i).tensors().size();
         }
-        const std::string arch = basalt::check_architecture(m.meta());
+        const std::string arch = basalt::model::check_architecture(m.meta());
         std::printf("  %zu tensors; architecture check on the metadata shard: %s\n", tensors,
                     arch.empty() ? "ok" : arch.c_str());
         int bad = arch.empty() ? 0 : 1;
@@ -113,6 +115,7 @@ int real_model(const std::string& any) {
 }
 
 int main(int argc, char** argv) {
+    basalt::test::register_meta_adapters();
     if (argc == 3 && std::string(argv[1]) == "--real") return real_model(argv[2]);
     std::printf("gguf_split_test\n");
     {
@@ -140,7 +143,7 @@ int main(int argc, char** argv) {
             check(gate && up && down && s_gate == 2 && s_up == 2 && s_down == 1,
                   "layer 11 per role: gate/up in shard 3, down in shard 2");
             check(m.find("blk.99.ffn_gate_exps.weight") == nullptr, "an absent tensor is nullptr");
-            check(basalt::check_architecture(m.meta()).find("block_count") != std::string::npos,
+            check(basalt::model::check_architecture(m.meta()).find("block_count") != std::string::npos,
                   "the architecture guard reads the metadata shard (and wants its keys)");
         } catch (const std::exception& e) {
             err = e.what();

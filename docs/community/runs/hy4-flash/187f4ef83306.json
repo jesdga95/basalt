@@ -1,0 +1,34 @@
+{
+  "submitter": "neuromaniacmd",
+  "date": "2026-11-24",
+  "commit": "400b411c58",
+  "preset": "community-1",
+  "model": "Hy4-flash",
+  "gpus": [
+    {
+      "name": "RTX PRO 5000 Blackwell",
+      "vram_gib": 48,
+      "power_w": 250,
+      "pcie": "4.0 x16"
+    }
+  ],
+  "ram_gib": 252,
+  "cpu": "AMD EPYC 7443, 24 cores",
+  "ram_gbps": 113.0,
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "fp16",
+  "prefill_16k_tps": 2280.2,
+  "prefill_64k_tps": 2290.3,
+  "decode_tps": 144.6,
+  "decode_conv_tps": 96.2,
+  "decode_struct_tps": 174.8,
+  "decode_prose_tps": 88.4,
+  "accept_conv_pct": 70.4,
+  "accept_struct_pct": 99.9,
+  "accept_prose_pct": 56.6,
+  "draft_len_conv": 1.6,
+  "draft_len_struct": 4.9,
+  "draft_len_prose": 1.3,
+  "engine_args": "--gpu 0 --max-context 56544"
+}

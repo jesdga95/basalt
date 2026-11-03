@@ -1,0 +1,35 @@
+{
+  "submitter": "mesquitafmr",
+  "date": "2026-11-19",
+  "commit": "d3b7574296",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5070 Ti",
+      "vram_gib": 16,
+      "power_w": 300,
+      "pcie": "5.0 x8"
+    }
+  ],
+  "ram_gib": 62,
+  "cpu": "AMD Ryzen 7 9800X3D, 8 cores",
+  "ram_gbps": 61.4,
+  "os": "Windows",
+  "quant": "IQ3_XXS",
+  "kv": "int8",
+  "prefill_16k_tps": 4064.2,
+  "prefill_64k_tps": 4335.9,
+  "decode_tps": 166.5,
+  "decode_conv_tps": 117.4,
+  "decode_struct_tps": 188.8,
+  "decode_prose_tps": 125.5,
+  "accept_conv_pct": 71.0,
+  "accept_struct_pct": 97.3,
+  "accept_prose_pct": 68.2,
+  "draft_len_conv": 2.3,
+  "draft_len_struct": 7.0,
+  "draft_len_prose": 2.0,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+  "notes": "Self-converted pack (tools/convert, from the ISTA-DASLab GSQ-RCO IQ3_XXS GGUF) with the tuned MTP layer from convert/mtp/rt/dense.bin."
+}

@@ -36,16 +36,6 @@
 
 namespace basalt::kernels::cpu {
 
-/// One expert evaluation.  `act` is SHARED and read-only across the whole batch - that sharing is the point
-/// of `s2_expert_vnni_q` and it is what saves 480 redundant activation conversions per token.
-struct ExpertJob {
-    const uint8_t* blob = nullptr;   ///< one expert's blob in the pack's layout
-    const ActQ* act = nullptr;       ///< the layer's quantized activation, shared
-    float* out = nullptr;            ///< H floats, written by exactly one worker
-    float weight = 1.0f;             ///< the router weight; applied by the HOST, not here
-    int slot = -1;                   ///< the job's index, for diagnostics
-};
-
 /// One expert for the `nt` tokens of a verify window that were routed to it.  Every token's output is bitwise the
 /// single-token job's.
 struct ExpertJobMulti {
@@ -71,9 +61,19 @@ using platform::detect_cpu_topology;
 /// `skip_first` drops the first core, which is reserved for the host loop.
 std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAffinity::All);
 
+/// The pool's worker count when the operator gave none: every physical core the affinity allows, except that a hybrid CPU
+/// (`Auto` or `P-cores`) takes its P-cores less the host thread and then half its E-cores, and a cgroup CPU quota caps the
+/// workers and the host thread together.  A pure function of the machine's counts, so a model sizes its pool without the
+/// program layer.
+int auto_pool_workers(int worker_cores, int p_cores, int e_cores, bool hybrid, double cpu_quota, PoolAffinity affinity);
+/// The start-up worker count: `given` when positive (--pool-workers), else auto_pool_workers over this machine's topology
+/// and cgroup quota, with the auto affinity unless the operator gave p-cores or all.  It holds whatever the quant and the
+/// cards, so no model decides it.
+int start_pool_workers(int given, bool affinity_given, PoolAffinity affinity);
+
 class ExpertPool {
 public:
-    /// `n_workers` is the worker count (at least 1); the caller sizes it (see program/auto_plan).  Workers are not pinned (the OS places them) and each owns one `ExpertScratch`, so nothing in the token path allocates.
+    /// `n_workers` is the worker count (at least 1); the caller sizes it (see auto_pool_workers).  Workers are not pinned (the OS places them) and each owns one `ExpertScratch`, so nothing in the token path allocates.
     ///
     /// The host thread joins the drain: `run()` claims jobs itself instead of spinning on `done_`, so the pool uses
     /// every core.
@@ -97,26 +97,19 @@ public:
     int e_cores() const { return topo_.e_cores; }
     PoolAffinity affinity() const { return affinity_; }
 
-    /// Publish `n` jobs, then block until every one has completed.
-    /// `jobs` must outlive the call (it does, and the workers never touch it afterwards).
-    void run(ExpertJob* jobs, int n);
-
-    /// The same outputs as `run`, bitwise, with every expert split by rows across all threads (gate/up rows, then the
-    /// intermediate's quantization, then down rows).  With fewer experts than threads - the case once the VRAM tier
-    /// takes half of them - `run` leaves cores idle and each expert streams at one core's bandwidth; this streams every
-    /// expert at all of them.  At most `kMaxSplit` experts.
-    void run_split(ExpertJob* jobs, int n);
-    static constexpr int kMaxSplit = 16;
-    /// `run_split` for multi-token jobs (at most `kMaxSplitMulti`); the rows of each expert are read once for all of
-    /// its tokens.
-    void run_split_multi(ExpertJobMulti* jobs, int n);
-    /// the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
+    /// A native pack's layer (ggml-cpu arithmetic, `nact` activations): every expert split by rows across all threads.
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
+    /// run_split_multi_native in two halves: start publishes the layer's batch, which the workers take while the caller
+    /// does other work; finish joins them and returns once every part is done. A layer of more than kMaxSplitMulti
+    /// experts runs whole in start. `jobs` and their buffers stay untouched until finish returns.
+    void start_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
+    void finish_split_multi_native();
     static constexpr int kMaxSplitMulti = 96;
     /// Row-range tasks per thread in each phase of the multi-token paths.  The cores differ in speed, so a thread
     /// that finishes early claims another: the more and smaller the tasks, the shorter the wait for the slowest one
     /// at the end of a phase, until the claim traffic and the short streams cost more than the tail they remove.
     static constexpr int kTasksPerThread = 12;
+    static constexpr int kTasksPerThreadAvx2 = 8;   // the native multi-token path on AVX2
     /// Work for the parked workers between batches (not the host thread): `fn(ctx, worker, workers, stop)` runs once
     /// per worker index and must return soon after `stop` reads true.  Returns at once.  The next batch, `idle_stop`
     /// or the destructor raises `stop`, ends the claims and waits for every claimed job to return, so the work never
@@ -124,7 +117,7 @@ public:
     using IdleFn = void (*)(void* ctx, int worker, int workers, const std::atomic<bool>& stop);
     void idle_start(IdleFn fn, void* ctx);
     void idle_stop();
-    /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
+    /// The native batches' time shared out by bytes, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
 
@@ -133,29 +126,33 @@ public:
     /// contention being measured.
     long long pauses() const { return 0; }
 
-    /// **A PARKED WORKER WAITS THIS LONG, THEN SLEEPS.**  The park spins (then yields, see `kSpinBeforeYield`)
-    /// because a layer's batches are microseconds apart and a wake-up from the OS costs more than that.  But a wait
-    /// that never ends keeps every worker's core at 100% while the engine waits for a request.  Between requests the
-    /// workers block on `sleep_cv_`.
+    /// **A PARKED WORKER WAITS THIS LONG, THEN SLEEPS.**  The park spins (see `kYieldEvery`) because a layer's
+    /// batches are microseconds apart and a wake-up from the OS costs more than that.  But a wait that never ends
+    /// keeps every worker's core at 100% while the engine waits for a request.  Between requests the workers block on
+    /// `sleep_cv_`.
     /// NOT only between requests: with most experts in VRAM many layers have no CPU work, so the workers also sleep
     /// mid-request - which the claim protocol above must survive.
     static constexpr std::chrono::milliseconds kSpinBeforeSleep{20};
-    /// A parked worker spins this long, then yields its core on every check until the next batch or the sleep: a
-    /// short wait keeps the core, a long gap between batches gives it to any runnable thread, such as a worker the OS
-    /// put on this core in the middle of its task.  With nothing else runnable the yield returns at once.
-    static constexpr std::chrono::microseconds kSpinBeforeYield{50};
+    /// A parked worker pauses, and yields its core once every this long until the next batch or the sleep: a thread
+    /// the OS queued behind it (a worker taken off this core in the middle of its task when the threads outnumber the
+    /// cores, or another program's) waits at most this long.  With nothing else runnable the yield returns at once.
+    /// Between the yields the spin makes no system call: one per check would draw power the cores still working lack.
+    static constexpr std::chrono::microseconds kYieldEvery{50};
     /// A pool wait that sees no completion for this long is a bug; the engine stops with a message instead of
     /// spinning forever, and the server starts it again.
     static constexpr std::chrono::seconds kStall{60};
 
 private:
     void worker(int id);
-    void drain(int id, ExpertScratch& scratch, uint32_t epoch);
+    void drain(int id, uint32_t epoch);
     void run_phase(int mode, int n_tasks);
     /// Rows [r0, r1) of expert `e` of the native batch: gate/up with SwiGLU into the split buffer, the intermediate's
     /// quantization, and the down projection into the job's outputs.
     void native_gu_range(int e, int r0, int r1);
     void native_quantize(int e);
+    /// A down part that finds its expert's intermediate not yet quantized: prefetch its `bytes` of down rows at `p`
+    /// while the gate/up parts finish, stopping early once they have.
+    void prefetch_until_ready(int e, const uint8_t* p, size_t bytes) const;
     void native_down_range(int e, int r0, int r1);
     /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
     int claim(uint32_t epoch);
@@ -174,11 +171,6 @@ private:
     int n_ = 0;
     /// Workers with id < active_ take work; written only while every worker is parked, before the next publish.
     std::atomic<int> active_{0};
-    ExpertJob* jobs_ = nullptr;
-    int njobs_ = 0;
-    /// The host's own scratch .  A separate object rather than a share of `scratch_[i]`,
-    /// because a worker may own any index and the two must not be able to collide.
-    ExpertScratch host_scratch_;
     // ---- EACH ATOMIC GETS ITS OWN CACHE LINE.
     //
     // `head_`, `done_`, `parked_` and `epoch_` are the four that workers and the host contend on; sharing a cache
@@ -205,26 +197,16 @@ private:
     std::condition_variable sleep_cv_;
     std::chrono::microseconds spin_before_sleep_{kSpinBeforeSleep};
     std::vector<std::thread> threads_;
-    std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
     // idle work (mode 7): one job per worker index
     IdleFn idle_fn_ = nullptr;
     void* idle_ctx_ = nullptr;
     bool idle_live_ = false;
     alignas(64) std::atomic<bool> idle_halt_{false};
-    // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
-    int mode_ = 0;
-    int parts_a_ = 1, parts_b_ = 1;
-    struct SplitBuf {
-        alignas(64) float ff[FF];
-        ActQ a2;
-    };
-    std::vector<SplitBuf> split_;
-    // run_split_multi state: mode 3 = gate/up row parts, 4 = down row parts (mode 8, the native path, is below)
+    int njobs_ = 0;
+    int mode_ = 0;   // 7 idle work, 8 the native batch
     ExpertJobMulti* mjobs_ = nullptr;
-    int64_t mrows_ = 0;   // rows of the current multi phase across all its experts (n * FF, then n * H)
-    int mtasks_ = 1;   // equal row ranges the phase is cut into
     struct SplitBufMulti {
-        alignas(64) float ff[MAXT][FF];
+        alignas(64) float ff[MAXT][kNativeMaxFF];
         ActQ a2[MAXT];
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // native down activations
     };
@@ -236,7 +218,18 @@ private:
         std::atomic<int> ready{0};
     };
     std::unique_ptr<FusedExpert[]> fused_;
-    int fused_n_ = 0, fused_gu_parts_ = 1, fused_d_parts_ = 1;
+    int fused_n_ = 0, fused_gu_parts_ = 1, fused_d_parts_ = 1, fused_tail_ = 1;
+    /// The first row of `part` of `parts` over `rows` rows (`part == parts` gives `rows`): equal parts, then
+    /// `fused_tail_` quarter-size ones.
+    int part_row(int part, int parts, int rows) const;
+    /// Sets up one batch of at most kMaxSplitMulti experts: its parts per expert; the tasks it makes and the gate/up
+    /// share of its bytes.
+    int split_multi_batch(const NativeFmt& f, ExpertJobMulti* jobs, int n, double& gu_share);
+    // a started batch: its epoch, tasks (0: none), experts, gate/up share and start
+    uint32_t pend_epoch_ = 0;
+    int pend_tasks_ = 0, pend_n_ = 0;
+    double pend_gu_share_ = 0;
+    std::chrono::steady_clock::time_point pend_t0_{};
     std::vector<SplitBufMulti> split_multi_;
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;

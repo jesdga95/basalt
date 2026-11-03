@@ -27,6 +27,62 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ================================================================================
+Project Maya (https://github.com/mw00/project-maya), v1.1.17, through Strata (src/dsv41)
+The DeepSeek-V4.1 cache roundings and their packed rows, in src/models/deepseek41/kernels/cache_rows.cuh
+================================================================================
+
+MIT License
+
+Copyright (c) 2026 Peasant Smith and the Project Maya contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+Adamant (https://github.com/nixcat-dev/adamant)
+================================================================================
+
+src/models/qwen4exp/kernels/hc_fused_ada.cu and tests/models/qwen4exp/kernels/hc_fused_ada_parity.cpp derive from its
+hc_fused.cu and hc_fused_parity.cpp.
+
+MIT License
+
+Copyright (c) 2026 Jesús Gulfo
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
 ggml and llama.cpp (https://github.com/ggml-org/ggml, https://github.com/ggml-org/llama.cpp)
 Extracted from llama.cpp commit 3cf03257f219afbe7334045ff7c6a06ac68c627d into
   include/basalt/ggml/, src/kernels/cpu/ggml/ and src/prefill/mmq/;
@@ -119,11 +175,34 @@ Infernix (https://github.com/Wallawalla47/Infernix), Apache License 2.0
 By Ian Ranson and the Infernix contributors.
 ================================================================================
 
-The grouped NVFP4 expert GEMM in src/prefill/fp4/moe_fp4.cu adapts code from Infernix.
+The grouped NVFP4 expert GEMM in src/prefill/moe_fp4.cu adapts code from Infernix.
+The dense W4A4 product in src/prefill/fp4_dense.cu adapts Infernix's TMA NVFP4 GEMM (src/ops/linear/nvfp4/nvfp4_a4_tma.cuh,
+nvfp4_schedule.cuh; src/ops/common/mbarrier.cuh, mma.cuh): the mbarrier full/empty tensor-load pipeline, the producer warpgroup
+beside eight consumer warps, the 128 x 256 x 128 block-scaled MMA tile and the tiled activation-scale layout.
+
+The FP8 E4M3 prompt-chunk product in src/prefill/fp8_gemm.cu adapts Infernix's fp8_a8_tma_mma_kernel
+(src/ops/linear/fp8/fp8_a8_tma_mma.cuh, fp8_a8_mma_common.cuh, src/ops/common/mbarrier.cuh, mma.cuh): the TMA and
+mbarrier producer/consumer pipeline, the 128x256x128 tile with its warp layout and ping-ponged fragments, the
+block-scaled mma used as the full-rate e4m3 product, and the segmented outputs.
 
 The int8 prompt-attention kernel adapts ideas and code from Infernix (src/ops/qsa/qsa_prompt.cu): the
 per-warp 16-cell tiles with one merge, the k-step query ordering, and the exact int8 widening to FP16.
-The chunked gated delta rule in src/prefill/gdn_chunked.cu adapts the Infernix chunked formulation.
+The chunked gated delta rule in src/kernels/cuda/gdn_prompt.cu adapts the Infernix chunked formulation.
+The GDN a/b projection with fused gating in src/kernels/cuda/dense_ops.cu (gdn_gating_proj) adapts Infernix's
+bf16_gdn_gating_proj_gemm_mma (src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_gemm_mma.cuh, bf16_gdn_gating_proj_kernels.cu):
+the a and b rows of one head held together so the gates apply in the epilogue, BF16 mma with a split K reduced before the gates.
+The int8-cache prompt attention in src/kernels/cuda/gqa_attn.cu adapts Infernix's fast int8 prompt kernel
+(src/ops/softmax_attention/dense/causal_cache/int8/fast_tiled_mma.cuh, fast_tiled_plan.h, ../fast_prompt_common.cuh):
+warps owning 16 query rows of one head for the whole sweep, raw int8 K/V tiles with V decoded in registers, the FP16
+partial guard, longest-first issue, and the block-shape and key-split plan with its merge.
+The decode-window products in src/kernels/cuda/window_gemm*.cu adapt the launch protocol of Infernix's decode products
+(src/core/pdl.cuh, src/ops/linear/nvfp4/nvfp4_a16_gemv.cuh): weights staged before the programmatic-launch wait,
+dependents started once the weights are read, and the slice-ordered split-K reduction; Basalt fixes the split by the
+matrix shape so a row's bits do not depend on the window.
+The FP8 decode-window product in src/kernels/cuda/window_gemm_sliced.cuh adapts the layout of Infernix's
+fp8_a16_sliced_k_mma (src/ops/linear/fp8/fp8_a16_sliced_k_mma.cuh, fp8_schedule.cuh): a 16-row block over the whole K,
+its warps on fixed K slices, the activations staged in shared memory beside the weights, and the slices reduced in the
+block in a fixed order.
 
 Licensed under the Apache License, Version 2.0, reproduced below.
 
@@ -328,3 +407,60 @@ Licensed under the Apache License, Version 2.0, reproduced below.
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+
+================================================================================
+ninfer (https://github.com/Neroued/ninfer), Apache License 2.0
+By Neroued and the ninfer contributors.
+================================================================================
+
+The video input adapts ideas from ninfer, not its code: the decode guards (encoded bytes, source
+length, source frames, decoded pixels) and their limits, the frame count from the container,
+then the length, then a counting pass, and per-group timestamps with image positions per group
+(src/vision/video.cpp, serve/). Licensed under the Apache License, Version 2.0, reproduced above.
+
+The dense stack and the Qwen3.8-27B model (src/dense/, src/models/qwen35/, src/kernels/cuda/dense_ops.cu,
+src/kernels/cuda/gqa_attn.cu) follow ninfer's Qwen3.5 dense execution (commit 13ebb92f6f) as the reference
+design, not its code: the DFlash 2 block drafter's flow (target-layer feature taps, the projected context K/V
+window, the non-causal draft block, top-k candidates and the candidate-path selection that picks the
+proposed tokens), the gated attention and the GDN output gate. Licensed under the Apache License, Version 2.0,
+reproduced above.
+
+================================================================================
+DeepSeek-V4.1 chat encoding (https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), in
+serve/models/deepseek41_encoding.py
+================================================================================
+
+MIT License
+
+Copyright (c) 2023 DeepSeek
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+FFmpeg (https://ffmpeg.org), declarations in include/basalt/vision/ffmpeg_abi.hpp
+================================================================================
+
+Basalt neither ships nor links FFmpeg. When video input is used, it loads the
+FFmpeg shared libraries installed on the machine at run time. The declarations
+in include/basalt/vision/ffmpeg_abi.hpp (function signatures, constants and
+structure field offsets) are derived from FFmpeg's public headers, releases 6.0
+to 8.0. FFmpeg is Copyright (c) the FFmpeg developers and is licensed under the
+GNU Lesser General Public License version 2.1 or later
+(https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html); some optional parts
+of an FFmpeg build are under the GPL.

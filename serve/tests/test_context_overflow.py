@@ -21,7 +21,7 @@ class ContextOverflow(unittest.TestCase):
     def setUpClass(cls):
         tok = ByteTokenizer()
         cls.engine = MockEngine(tok, "ok", max_context=CTX)
-        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.svc = Service(cls.engine, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
         cls.httpd = serve(cls.svc, port=0)
         cls.port = cls.httpd.server_address[1]
 
@@ -34,7 +34,7 @@ class ContextOverflow(unittest.TestCase):
         self.svc.fit_max_tokens = False
 
     def post(self, path, key, prompt_tokens, max_tokens=None, stream=False):
-        body = {"model": "qwen3.8-flash-next", "input": "hi"} if path == "/v1/responses" else {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": "hi"}]}
+        body = {"model": "basalt", "input": "hi"} if path == "/v1/responses" else {"model": "basalt", "messages": [{"role": "user", "content": "hi"}]}
         body["stream"] = stream
         if max_tokens is not None:
             body[key] = max_tokens

@@ -8,6 +8,9 @@
 
     m = ModelFile(path)                               # version 2 only; versions=(1,) for the migration's input
     m.names(); m.section("meta") -> (offset, bytes); m.read("meta") -> bytes; m.verify("dense") -> bool
+
+    append_section(path, "name", "/path/source", new_meta, undo_dir)   # no other section moves or changes
+    undo_append(path, undo_dir)
 """
 from __future__ import annotations
 
@@ -141,6 +144,97 @@ class ModelWriter:
         for name, off, n, digest in self.entries:
             self.f.write(ENTRY.pack(name.encode(), off, n, digest, b"\0" * 16))
         self.f.close()
+
+
+def _sync(f) -> None:
+    f.flush()
+    os.fsync(f.fileno())
+
+
+def _write_zeros(f, n: int) -> None:
+    while n > 0:
+        k = min(COPY_CHUNK, n)
+        f.write(b"\0" * k)
+        n -= k
+
+
+def append_section(path: str, name: str, src: str, new_meta: bytes, undo_dir: str) -> None:
+    """Adds a section to a file without moving or changing any other: the section and `new_meta` go past the file's end,
+    then one write replaces the header and table, then the old meta's bytes, now a gap, are zeroed. Until that one write the
+    file reads as it did. `undo_dir` (new) keeps what undo_append restores."""
+    m = ModelFile(path)
+    if name in m.sections or len(name.encode()) >= 64:
+        raise ValueError(f"{path}: cannot add a section named {name}")
+    with open(path, "r+b") as f:
+        head = f.read(HEADER_BYTES)
+        magic, version, n, file_bytes, reserved = HEADER.unpack_from(head, 0)
+        if n + 1 > MAX_SECTIONS:
+            raise ValueError(f"{path}: the section table is full")
+        if os.path.getsize(path) != file_bytes:
+            raise ValueError(f"{path}: {os.path.getsize(path)} bytes, its table says {file_bytes}")
+        if not m.verify("meta"):
+            raise ValueError(f"{path}: its meta section does not match its hash")
+        old_off, old_size = m.section("meta")
+        os.makedirs(undo_dir)
+        with open(os.path.join(undo_dir, "header.bin"), "wb") as u:
+            u.write(head)
+            _sync(u)
+        with open(os.path.join(undo_dir, "meta.bin"), "wb") as u:
+            u.write(m.read("meta"))
+            _sync(u)
+
+        off = _align(file_bytes)
+        f.seek(file_bytes)
+        _write_zeros(f, off - file_bytes)
+        h = hashlib.sha256()
+        size = 0
+        with open(src, "rb") as s:
+            while b := s.read(COPY_CHUNK):
+                h.update(b)
+                f.write(b)
+                size += len(b)
+        meta_off = _align(off + size)
+        _write_zeros(f, meta_off - (off + size))
+        f.write(new_meta)
+        end = meta_off + len(new_meta)
+        _sync(f)
+
+        table = [(k, v[0], v[1], v[2]) for k, v in m.sections.items() if k != "meta"]
+        table += [(name, off, size, h.digest()), ("meta", meta_off, len(new_meta), hashlib.sha256(new_meta).digest())]
+        new_head = HEADER.pack(magic, version, len(table), end, reserved)
+        new_head += b"".join(ENTRY.pack(k.encode(), o, b, d, b"\0" * 16) for k, o, b, d in table)
+        f.seek(0)
+        f.write(new_head + b"\0" * (HEADER_BYTES - len(new_head)))
+        _sync(f)
+
+        f.seek(old_off)
+        _write_zeros(f, old_size)
+        _sync(f)
+
+
+def undo_append(path: str, undo_dir: str) -> None:
+    """Restores the file append_section changed, bit for bit."""
+    with open(os.path.join(undo_dir, "header.bin"), "rb") as u:
+        head = u.read()
+    with open(os.path.join(undo_dir, "meta.bin"), "rb") as u:
+        old_meta = u.read()
+    _, _, n, file_bytes, _ = HEADER.unpack_from(head, 0)
+    old_off = None
+    for i in range(n):
+        name, off, _, _, _ = ENTRY.unpack_from(head, HEADER.size + i * ENTRY.size)
+        if name.rstrip(b"\0") == b"meta":
+            old_off = off
+    if old_off is None or len(head) != HEADER_BYTES:
+        raise ValueError(f"{undo_dir}: not what append_section kept")
+    with open(path, "r+b") as f:
+        f.seek(old_off)
+        f.write(old_meta)
+        _sync(f)
+        f.seek(0)
+        f.write(head)
+        _sync(f)
+        f.truncate(file_bytes)
+        _sync(f)
 
 
 class ModelFile:

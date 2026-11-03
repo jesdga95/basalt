@@ -4,6 +4,7 @@
 // ggml/src/ggml-cuda/vecdotq.cuh.  Copyright (c) 2023-2026 The ggml authors.  MIT licence: see THIRD_PARTY_LICENSES.
 #pragma once
 
+#include "basalt/kernels/packed_byte.hpp"
 #include "mmq_common.cuh"
 
 #include <cstdint>
@@ -13,6 +14,17 @@ static __device__ __forceinline__ int get_int_b2(const void * x, const int & i32
 
     int x32  = x16[2*i32 + 0] <<  0;
     x32     |= x16[2*i32 + 1] << 16;
+
+    return x32;
+}
+
+static __device__ __forceinline__ int get_int_b1(const void * x, const int & i32) {
+    const uint8_t * x8 = (const uint8_t *) x; // no alignment assumption (MXFP4's 17-byte blocks)
+
+    int x32  = x8[4*i32 + 0] <<  0;
+    x32     |= x8[4*i32 + 1] <<  8;
+    x32     |= x8[4*i32 + 2] << 16;
+    x32     |= x8[4*i32 + 3] << 24;
 
     return x32;
 }

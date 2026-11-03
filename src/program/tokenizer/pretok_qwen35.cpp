@@ -5,6 +5,7 @@
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
 // by hand, without backtracking. Here the code points are decoded once, with their flags, and the pieces come back as
 // byte offsets into the UTF-8 text.
+#include "basalt/program/qwen_forms.hpp"
 #include "unicode_flags.hpp"
 
 namespace basalt::program::tokenizer {
@@ -12,27 +13,6 @@ namespace basalt::program::tokenizer {
 namespace {
 
 constexpr uint32_t kOutOfRange = 0xFFFFFFFFu;
-
-// A stray or truncated byte stands for U+FFFD and consumes one byte.
-uint32_t decode_cp(const uint8_t* s, size_t n, size_t i, size_t& len) {
-    const uint8_t c = s[i];
-    len = 1;
-    if (c < 0x80) return c;
-    int extra = 0;
-    uint32_t v = 0, lo = 0x80;
-    if ((c & 0xE0) == 0xC0) { extra = 1; v = c & 0x1F; }
-    else if ((c & 0xF0) == 0xE0) { extra = 2; v = c & 0x0F; lo = 0x800; }
-    else if ((c & 0xF8) == 0xF0) { extra = 3; v = c & 0x07; lo = 0x10000; }
-    else return 0xFFFD;
-    if (i + (size_t) extra >= n) return 0xFFFD;
-    for (int k = 1; k <= extra; ++k) {
-        if ((s[i + (size_t) k] & 0xC0) != 0x80) return 0xFFFD;
-        v = (v << 6) | (s[i + (size_t) k] & 0x3F);
-    }
-    if (v < lo || v > 0x10FFFF) return 0xFFFD;
-    len = (size_t) extra + 1;
-    return v;
-}
 
 }  // namespace
 

@@ -987,13 +987,124 @@ int split_parity(bool bench) {
 
 }  // namespace
 
+// ---- drawn drafts (speculative sampling): rows that carry a draft drawn from a proposal q keep it by min(1, p / q), else
+// draw the residual.  Over many draws each row's token must follow the row's own distribution p (what plain sampling
+// gives, read back through qprob), and the draft must be the token as often as sum min(p, q).  q is unlike p on purpose:
+// flatter over the top, and with mass on ids p does not keep (outside top_k) and a zero on one p keeps.
+int drawn_parity() {
+    int bad = 0;
+    const int vocab = 248320, rows = 15, Q = 16;
+    std::mt19937 rng(1234);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> one((size_t) vocab);
+    for (int v = 0; v < vocab; ++v) one[(size_t) v] = 0.5f * nd(rng);
+    const int top[6] = {101, 2002, 30003, 77, 123456, 248000};
+    const float boost[6] = {6.0f, 5.6f, 5.2f, 4.9f, 4.4f, 4.0f};
+    for (int i = 0; i < 6; ++i) one[(size_t) top[i]] = boost[i];
+    std::vector<float> l((size_t) rows * vocab);
+    for (int t = 0; t < rows; ++t) std::copy(one.begin(), one.end(), l.begin() + (size_t) t * vocab);
+    float* dl = nullptr;
+    check(cudaMalloc(&dl, l.size() * sizeof(float)), "drawn logits");
+    check(cudaMemcpy(dl, l.data(), l.size() * sizeof(float), cudaMemcpyHostToDevice), "drawn logits upload");
+    // q: the six boosted ids flattened, a zero on top[3], and mass on ids outside the kept list
+    std::vector<int> qid = {101, 2002, 30003, 77, 123456, 248000, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
+    std::vector<float> qp = {0.22f, 0.2f, 0.16f, 0.0f, 0.14f, 0.12f, 0.03f, 0.02f, 0.02f, 0.02f, 0.02f, 0.01f, 0.01f, 0.01f, 0.01f, 0.01f};
+    double qs = 0;
+    for (float x : qp) qs += x;
+    for (float& x : qp) x = (float) (x / qs);
+    std::vector<int> hq((size_t) rows * Q);
+    std::vector<float> hp((size_t) rows * Q);
+    for (int t = 0; t < rows; ++t)
+        for (int j = 0; j < Q; ++j) { hq[(size_t) t * Q + j] = qid[(size_t) j]; hp[(size_t) t * Q + j] = qp[(size_t) j]; }
+    int *dq = nullptr, *dd = nullptr, *dout = nullptr, *dquery = nullptr;
+    float *dqp = nullptr, *dprob = nullptr;
+    check(cudaMalloc(&dq, hq.size() * sizeof(int)), "q ids");
+    check(cudaMalloc(&dqp, hp.size() * sizeof(float)), "q p");
+    check(cudaMalloc(&dd, rows * sizeof(int)), "drafts");
+    check(cudaMalloc(&dout, rows * sizeof(int)), "out");
+    check(cudaMalloc(&dquery, rows * sizeof(int)), "query");
+    check(cudaMalloc(&dprob, rows * sizeof(float)), "prob");
+    check(cudaMemcpy(dq, hq.data(), hq.size() * sizeof(int), cudaMemcpyHostToDevice), "q ids upload");
+    check(cudaMemcpy(dqp, hp.data(), hp.size() * sizeof(float), cudaMemcpyHostToDevice), "q p upload");
+    std::discrete_distribution<int> qdraw(qp.begin(), qp.end());
+    int* dtop = nullptr;
+    check(cudaMalloc(&dtop, (size_t) rows * 32 * sizeof(int)), "kept lists");
+    for (const int top_k : {20, 32}) for (const int split : {0, 1, 2}) {
+        basalt::kernels::SamplerParams p;
+        p.top_k = top_k; p.top_p = 0.95f; p.temperature = 0.9f; p.seed = 99;
+        // the ids that can come out: the kept list (top_ids) and q's; p of each queried through qprob (rows ask for
+        // different ids)
+        p.top_ids = dtop; p.n_top = 32;
+        basalt::kernels::sample_tokens_split(split, dl, rows, vocab, nullptr, 0, p, dout, nullptr, 0, nullptr, nullptr);
+        std::vector<int> kept_list(32);
+        check(cudaMemcpy(kept_list.data(), dtop, 32 * sizeof(int), cudaMemcpyDeviceToHost), "kept list read");
+        p.top_ids = nullptr; p.n_top = 0;
+        std::vector<int> ids = qid;
+        for (int v : kept_list)
+            if (v >= 0 && std::find(ids.begin(), ids.end(), v) == ids.end()) ids.push_back(v);
+        std::vector<double> pw(ids.size(), 0.0);
+        for (size_t i0 = 0; i0 < ids.size(); i0 += rows) {
+            std::vector<int> qq((size_t) rows, ids[0]);
+            for (int t = 0; t < rows && i0 + t < ids.size(); ++t) qq[(size_t) t] = ids[i0 + t];
+            std::vector<float> pr((size_t) rows);
+            check(cudaMemcpy(dquery, qq.data(), rows * sizeof(int), cudaMemcpyHostToDevice), "query upload");
+            basalt::kernels::sample_tokens_split(split, dl, rows, vocab, nullptr, 0, p, dout, dquery, rows, dprob, nullptr);
+            check(cudaMemcpy(pr.data(), dprob, rows * sizeof(float), cudaMemcpyDeviceToHost), "prob read");
+            for (int t = 0; t < rows && i0 + t < ids.size(); ++t) pw[i0 + t] = pr[(size_t) t];
+        }
+        double pin = 0, keep_want = 0;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            pin += pw[i];
+            if (i < qp.size()) keep_want += std::min(pw[i], (double) qp[i]);
+        }
+        if (pin < 0.999) { std::printf("drawn: the test's ids hold only %.4f of p\n", pin); ++bad; continue; }
+        // many windows: drafts drawn from q on the host, the rows drawn with the window's counter
+        p.q_ids = dq; p.q_p = dqp; p.q_n = Q; p.drafts = dd; p.n_drawn = rows;
+        const int calls = 12000;
+        std::vector<double> hist(ids.size(), 0.0);
+        double kept = 0, other = 0, n = 0;
+        std::vector<int> dr((size_t) rows), out((size_t) rows);
+        for (int c = 0; c < calls; ++c) {
+            for (int t = 0; t < rows; ++t) dr[(size_t) t] = qid[(size_t) qdraw(rng)];
+            check(cudaMemcpy(dd, dr.data(), rows * sizeof(int), cudaMemcpyHostToDevice), "drafts upload");
+            p.counter = (uint64_t) c * rows;
+            basalt::kernels::sample_tokens_split(split, dl, rows, vocab, nullptr, 0, p, dout, nullptr, 0, nullptr, nullptr);
+            check(cudaMemcpy(out.data(), dout, rows * sizeof(int), cudaMemcpyDeviceToHost), "out read");
+            for (int t = 0; t < rows; ++t) {
+                n += 1;
+                kept += out[(size_t) t] == dr[(size_t) t];
+                const auto it = std::find(ids.begin(), ids.end(), out[(size_t) t]);
+                if (it == ids.end()) other += 1;
+                else hist[(size_t) (it - ids.begin())] += 1;
+            }
+        }
+        double tv = other / n;
+        for (size_t i = 0; i < ids.size(); ++i) tv += std::fabs(hist[i] / n - pw[i]);
+        tv *= 0.5;
+        const double keep = kept / n;
+        // 180,000 draws: the TV of an exact sampler over these few ids is about 0.003
+        const bool ok = tv < 0.008 && std::fabs(keep - keep_want) < 0.006 && other == 0;
+        std::printf("drawn: top_k %d split %d  TV %.4f  kept %.4f (sum min(p,q) %.4f)%s\n", top_k, split, tv, keep,
+                    keep_want, ok ? "" : "  FAIL");
+        bad += ok ? 0 : 1;
+    }
+    cudaFree(dl); cudaFree(dq); cudaFree(dqp); cudaFree(dd); cudaFree(dout); cudaFree(dquery); cudaFree(dprob); cudaFree(dtop);
+    return bad;
+}
+
 int main(int argc, char** argv) {
-    bool selftest = false, bench = false, split = false;
+    bool selftest = false, bench = false, split = false, drawn = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") selftest = true;
         else if (std::string(argv[i]) == "--bench") bench = true;
         else if (std::string(argv[i]) == "--split") split = true;
-        else { std::fprintf(stderr, "usage: sampler_parity [--selftest] [--bench] [--split [--bench]]\n"); return 2; }
+        else if (std::string(argv[i]) == "--drawn") drawn = true;
+        else { std::fprintf(stderr, "usage: sampler_parity [--selftest] [--bench] [--split [--bench]] [--drawn]\n"); return 2; }
+    }
+    if (drawn) {
+        const int bad = drawn_parity();
+        std::printf(bad ? "DRAWN PARITY FAIL (%d)\n" : "DRAWN PARITY OK\n", bad);
+        return bad ? 1 : 0;
     }
     if (split) {
         const int bad = split_parity(bench);

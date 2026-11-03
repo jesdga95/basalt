@@ -1,0 +1,35 @@
+{
+  "submitter": "DaHoodie",
+  "date": "2026-11-23",
+  "commit": "f7b04c01c3",
+  "preset": "community-1",
+  "model": "Inkling-2-Mini",
+  "gpus": [
+    {
+      "name": "RTX PRO 4500 Blackwell",
+      "vram_gib": 32,
+      "power_w": 200,
+      "pcie": "4.0 x16",
+      "h2d_gbps": 28.3
+    }
+  ],
+  "ram_gib": 499,
+  "cpu": "AMD Ryzen Threadripper PRO 5975WX, 31 cores",
+  "ram_gbps": 115.2,
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "fp16",
+  "prefill_16k_tps": 9311.5,
+  "prefill_64k_tps": 7519.1,
+  "decode_tps": 304.6,
+  "decode_conv_tps": 210.4,
+  "decode_struct_tps": 377.6,
+  "decode_prose_tps": 162.7,
+  "accept_conv_pct": 62.0,
+  "accept_struct_pct": 96.1,
+  "accept_prose_pct": 42.6,
+  "draft_len_conv": 2.1,
+  "draft_len_struct": 5.6,
+  "draft_len_prose": 1.4,
+  "engine_args": "--gpu 0 --max-context 63233"
+}

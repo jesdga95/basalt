@@ -5,25 +5,84 @@ import json
 import time
 import uuid
 
+from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, logprobs_part
 from serve.frontend import Event
 from serve.service import Service
 
 
-def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None):
-    cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
+def checked_return_progress(req: dict) -> bool:
+    """llama.cpp's `return_progress`: true sends `prompt_progress` with the chunks of the prompt read; ValueError
+    (a 400 before streaming) for anything but a boolean."""
+    value = req.get("return_progress")
+    if value is not None and not isinstance(value, bool):
+        raise ValueError(f"return_progress: expected a boolean, not {value!r}")
+    return bool(value) and bool(req.get("stream"))
+
+
+def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, session=None, live=None):
+    cid, created = live.id if live else "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
     model = svc.model
 
+    want_lp = req.get(LOGPROBS_KEY) is not None
+    # tokens' logprobs not yet sent with a chunk: the answer's (OpenAI's `content`), and Basalt's own
+    # `reasoning_content` and `tool_calls` (per call index), each riding the next chunk
+    lps: list[dict] = []
+    lps_reasoning: list[dict] = []
+    lps_tools: dict[int, list[dict]] = {}
+
     def chunk(delta, finish=None):
+        choice = {"index": 0, "delta": delta, "finish_reason": finish}
+        if want_lp and (lps or lps_reasoning or lps_tools or delta.get("content") or finish):
+            choice["logprobs"] = logprobs_part(lps, lps_reasoning, lps_tools)
+            lps.clear()
+            lps_reasoning.clear()
+            lps_tools.clear()
         return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
-                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+                "choices": [choice]}
+
+    progress = checked_return_progress(req)
+    sent = None                                    # the last prompt_progress sent
+
+    def progress_chunk(final=False):
+        """llama.cpp's way: a chunk with an empty assistant delta that carries `prompt_progress`; None when it says
+        nothing new.  `final`: the read is over, so processed is the whole prompt."""
+        nonlocal sent
+        p = svc.prompt_progress(None if ids is None else len(ids))
+        if p is None or (final and p["processed"] == p["total"] and sent == p):
+            return None
+        if final:
+            p = {**p, "processed": p["total"]}
+        if p == sent:
+            return None
+        sent = p
+        c = chunk({"role": "assistant", "content": None})
+        c["prompt_progress"] = p
+        return c
 
     yield chunk({"role": "assistant", "content": ""})
+    reading = progress                             # the prompt is still being read
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
+    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, session=session, live=live):
+        if reading and kind != "ping":
+            reading = False                        # the first answer: the read is over
+            c = progress_chunk(final=True)
+            if c is not None:
+                yield c
         if kind == "ping":
+            c = progress_chunk() if reading else None
+            if c is not None:
+                yield c
             yield None
+        elif kind == "logprobs":
+            channel, entry, index = x
+            if channel == "content":
+                lps.append(entry)
+            elif channel == "reasoning":
+                lps_reasoning.append(entry)
+            else:
+                lps_tools.setdefault(index, []).append(entry)
         elif kind == "event":
             ev: Event = x
             if ev.kind == "reasoning" and ev.text:
@@ -46,6 +105,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                 calls += 1
         else:
             # a call whose final tool_call never came was cut off: not "tool_calls"
+            if lps or lps_reasoning or lps_tools:  # tokens whose text a stop string or the end held back
+                yield chunk({})
             whole = calls and streamed.keys() <= finished
             finish = "tool_calls" if whole and x["finish"] == "stop" else {"cancel": "stop"}.get(x["finish"], x["finish"])
             last = chunk({}, finish)
@@ -68,9 +129,17 @@ def _is_json(text: str) -> bool:
 
 def openai_collect(chunks) -> dict:
     content, reasoning, by_index, last = [], [], {}, None
+    lps = None                                     # the tokens' logprobs, when the request asked
+    lps_reasoning, lps_tools = [], {}
     for c in chunks:
         if c is None:                              # a heartbeat
             continue
+        if "logprobs" in c["choices"][0]:
+            part = c["choices"][0]["logprobs"]
+            lps = (lps or []) + part["content"]
+            lps_reasoning += part.get("reasoning_content") or []
+            for t in part.get("tool_calls") or []:
+                lps_tools.setdefault(t["index"], []).extend(t["content"])
         d = c["choices"][0]["delta"]
         content.append(d.get("content") or "")
         reasoning.append(d.get("reasoning_content") or "")
@@ -91,7 +160,8 @@ def openai_collect(chunks) -> dict:
     if calls:
         msg["tool_calls"] = calls
     out = {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
-           "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"]}],
+           "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"],
+                        **({"logprobs": logprobs_part(lps, lps_reasoning, lps_tools)} if lps is not None else {})}],
            "usage": last["usage"]}
     if last.get("timings"):
         out["timings"] = last["timings"]

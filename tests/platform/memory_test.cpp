@@ -59,54 +59,30 @@ int file_cache_keeps_cases() {
     }
     return fail;
 }
-// The RAM floor, the largest safe copy and the serve guard's decision, on injected MemAvailable readings
-int ram_floor_cases() {
+// The reserve and the serve guard's decision, on injected MemAvailable readings
+int ram_reserve_cases() {
     using namespace basalt::platform;
     int fail = 0;
     auto check = [&](const char* what, double got, double want) {
         const bool ok = got > want - 0.01 && got < want + 0.01;
-        std::printf("ram floor %-62s %8.2f GiB%s\n", what, got, ok ? "" : "   <-- WRONG");
+        std::printf("ram reserve %-60s %8.2f GiB%s\n", what, got, ok ? "" : "   <-- WRONG");
         fail |= !ok;
     };
     const double G = 1073741824.0;
-    const uint64_t margin = gib(2.0);
-    const uint64_t layer_q4 = 512ull * 3170304;   // every expert of a layer of a 4-bit pack (1.51 GiB)
-    const uint64_t layer_q2 = 512ull * 1382400;   // the same of the 2-bit pack (0.66 GiB)
-    const uint64_t prompt = kPromptFileReadBytes;
-    const uint64_t all_q4 = gib(15), all_q2 = gib(1);   // the experts no GPU tier holds
-    check("nothing read from the file: the margin alone", ram_floor(margin, 0, all_q4, layer_q4, prompt) / G, 2.0);
-    check("4-bit pack, every expert read from the file: margin + 3.5 + 2 layers",
-          ram_floor(margin, all_q4, all_q4, layer_q4, prompt) / G, 2.0 + 3.5 + 2.0 * (double) layer_q4 / G);
-    check("2-bit pack, every expert read from the file: margin + 3.5 + 2 layers",
-          ram_floor(margin, all_q2, all_q2, layer_q2, prompt) / G, 2.0 + 3.5 + 2.0 * (double) layer_q2 / G);
-    check("small layers: the 4 GiB file cache minimum applies", file_cache_floor(1, 1, gib(0.1), prompt) / G, 4.0);
-    check("one byte from the file is enough to need the cache", file_cache_floor(1, 1, layer_q4, prompt) / G,
-          3.5 + 2.0 * (double) layer_q4 / G);
-    // a fifth of the experts on the file: the two layers' read-ahead is a fifth of two whole layers
-    check("a fifth on the file: two layers' file-held share",
-          file_cache_floor(all_q4 / 5, all_q4, layer_q4, prompt) / G, 3.5 + 2.0 * 0.2 * (double) layer_q4 / G + 0.0);
-    check("a sixteenth on the file: the 4 GiB minimum", file_cache_floor(all_q4 / 16, all_q4, layer_q4, prompt) / G, 4.0);
-    check("no lent slot left to the file: the layers alone, at the minimum",
-          file_cache_floor(all_q4 / 2, all_q4, layer_q4, 0) / G, 4.0);
-    // a 30 GiB machine with 27 GiB available and 2 GiB taken by the server later
-    const uint64_t fl = ram_floor(margin, all_q4, all_q4, layer_q4, prompt);
-    check("largest safe copy, 27 available, 2 late", max_safe_copy(gib(27), gib(2), fl) / G, 27.0 - 2.0 - fl / G);
-    check("largest safe copy when the floor exceeds the RAM", max_safe_copy(gib(8), gib(2), fl) / G, 0.0);
-    const uint64_t guard = ram_guard_floor(margin, all_q4, prompt);
-    check("serve guard, experts read from the file: margin + 3.5", guard / G, 5.5);
-    check("serve guard, only part of a chunk read from the file", ram_guard_floor(margin, all_q4, gib(1)) / G, 3.0);
-    check("serve guard, nothing read from the file: the margin", ram_guard_floor(margin, 0, prompt) / G, 2.0);
+    check("the default reserve", ram_reserve() / G, 2.0);
+    set_ram_reserve(gib(3));
+    check("--ram-reserve-mib 3072", ram_reserve() / G, 3.0);
+    set_ram_reserve(kDefaultRamReserveBytes);
+    const uint64_t reserve = ram_reserve();
     struct Case { const char* what; double avail; bool low; };
     const Case cases[] = {
-        {"well above the floor", 20.0, false},
-        {"at the load floor (sized as asked)", fl / G, false},
-        {"exactly at the guard line", guard / G, false},
-        {"just below the guard line", guard / G - 0.01, true},
-        {"the freeze's reading (2.5 GB)", 2.33, true},
+        {"well above the reserve", 20.0, false},
+        {"exactly at the reserve", 2.0, false},
+        {"just below the reserve", 1.99, true},
         {"unknown (0)", 0.0, false},
     };
     for (const Case& c : cases) {
-        const bool got = ram_below_floor(gib(c.avail), guard);
+        const bool got = ram_below_floor(gib(c.avail), reserve);
         std::printf("ram guard %-62s -> %s%s\n", c.what, got ? "stop" : "run", got == c.low ? "" : "   <-- WRONG");
         fail |= got != c.low;
     }
@@ -417,6 +393,60 @@ int exhausted_message_cases() {
     }
     return fail;
 }
+// Without a stall reading: samples every 100 ms through BelowFloorClock into ram_level
+int ram_level_sustained_cases() {
+    using namespace basalt::platform;
+    int fail = 0;
+    const uint64_t floor = gib(3.09), hard = kRamHardFloor;
+    const MemoryStalls none{false, 0.0, 0.0}, calm{true, 2.0, 0.0}, busy{true, kStallSomePct, 0.0};
+    auto check = [&](const char* what, bool ok) {
+        std::printf("ram level %-60s -> %s\n", what, ok ? "ok" : "   <-- WRONG");
+        fail |= !ok;
+    };
+    // a run of `ms` of readings at `gib_avail`, then the level of the last sample
+    auto run = [&](BelowFloorClock& clk, int64_t& t, double gib_avail, int64_t ms, const MemoryStalls& st) {
+        RamLevel lv = RamLevel::Ok;
+        for (int64_t end = t + ms; t <= end; t += 100)
+            lv = ram_level(gib(gib_avail), floor, hard, st, clk.update(t, ram_below_floor(gib(gib_avail), floor)));
+        return lv;
+    };
+    {
+        BelowFloorClock clk;
+        int64_t t = 0;
+        check("a 3 s dip below the guard stays low", run(clk, t, 3.05, 3000, none) == RamLevel::Low);
+        check("back above the guard: ok", run(clk, t, 5.0, 100, none) == RamLevel::Ok);
+        check("a 9.9 s dip after it restarts the run, still low", run(clk, t, 3.05, 9900, none) == RamLevel::Low);
+    }
+    {
+        BelowFloorClock clk;
+        int64_t t = 0;
+        check("below for 9 s: low", run(clk, t, 3.05, 9000, none) == RamLevel::Low);
+        check("below for 10 s: critical", run(clk, t, 3.05, 1000, none) == RamLevel::Critical);
+        check("RAM back: ok", run(clk, t, 4.0, 100, none) == RamLevel::Ok);
+        check("a new dip is low again", run(clk, t, 3.05, 500, none) == RamLevel::Low);
+    }
+    {
+        BelowFloorClock clk;
+        int64_t t = 0;
+        check("swinging around the guard every 2 s never goes critical", [&] {
+            for (int i = 0; i < 20; i++)
+                if (run(clk, t, i % 2 ? 3.2 : 3.05, 2000, none) == RamLevel::Critical) return false;
+            return true;
+        }());
+    }
+    {
+        BelowFloorClock clk;
+        int64_t t = 0;
+        check("under the hard floor: critical at the first sample", run(clk, t, 0.9, 0, none) == RamLevel::Critical);
+    }
+    {
+        BelowFloorClock clk;
+        int64_t t = 0;
+        check("stall reading calm: low however long below", run(clk, t, 3.05, 30000, calm) == RamLevel::Low);
+        check("stall reading busy: critical at once", run(clk, t, 3.05, 0, busy) == RamLevel::Critical);
+    }
+    return fail;
+}
 // The serve guard's level: below the floor a request runs on unless RAM is under the hard floor or the OS stalls on it
 int ram_level_cases() {
     using namespace basalt::platform;
@@ -436,20 +466,21 @@ int ram_level_cases() {
         {"below the floor, some stalls at the limit", 2.5, busy, RamLevel::Critical},
         {"below the floor, full stalls at the limit", 2.5, stalled, RamLevel::Critical},
         {"above the floor, stalls high", 5.0, stalled, RamLevel::Ok},
-        {"below the floor, no stall reading", 2.5, none, RamLevel::Critical},
+        {"below the floor, no stall reading, brief", 2.5, none, RamLevel::Low},
         {"above the floor, no stall reading", 5.0, none, RamLevel::Ok},
     };
     const char* names[] = {"ok", "low", "critical"};
     for (const Case& c : cases) {
-        const RamLevel got = ram_level(gib(c.avail), floor, hard, c.st);
+        const RamLevel got = ram_level(gib(c.avail), floor, hard, c.st, 0);
         std::printf("ram level %-60s -> %s%s\n", c.what, names[(int) got], got == c.want ? "" : "   <-- WRONG");
         fail |= got != c.want;
     }
     // a hard floor above the guard's own is capped at it
-    const bool capped = ram_level(gib(1.5), gib(2.0), gib(4.0), calm) == RamLevel::Critical &&
-                        ram_level(gib(2.5), gib(2.0), gib(4.0), calm) == RamLevel::Ok;
+    const bool capped = ram_level(gib(1.5), gib(2.0), gib(4.0), calm, 0) == RamLevel::Critical &&
+                        ram_level(gib(2.5), gib(2.0), gib(4.0), calm, 0) == RamLevel::Ok;
     std::printf("ram level %-60s -> %s\n", "hard floor above the guard's", capped ? "capped" : "not capped   <-- WRONG");
     fail |= !capped;
+    fail |= ram_level_sustained_cases();
     return fail;
 }
 // How long a request arriving below the floor waits
@@ -572,7 +603,7 @@ uint64_t lock_test_bytes(bool& reduced) {
 }  // namespace
 
 int main() {
-    int fail_keeps = file_cache_keeps_cases() | ram_floor_cases() | read_ahead_cases() | drop_view_cases() |
+    int fail_keeps = file_cache_keeps_cases() | ram_reserve_cases() | read_ahead_cases() | drop_view_cases() |
                     guard_reclaim_cases() | reclaim_due_cases() | exhausted_message_cases() | ram_level_cases() |
                     admit_wait_cases() | guard_pause_cases() | stall_parse_cases() | stop_message_cases();
     bool reduced = false;

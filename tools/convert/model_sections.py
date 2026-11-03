@@ -3,7 +3,6 @@
   dense / dense.index       float tensors in the form the engine reads, and the table of every non-expert tensor
   experts / experts.layout  per layer, n_expert blobs of [gate | up | down] rows, and where each layer starts
   mtp/dense, mtp/dense.index, mtp/experts  the draft layer from the BF16 `mtp.*` tensors (tools/convert/mtp_fetch.py)
-  profile                   the expert ranking from routing traces or an existing profile
 
 Sections are produced as byte-chunk iterators for ModelWriter.add_chunks. Needs numpy.
 """
@@ -11,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import pathlib
 import re
 import struct
@@ -22,7 +22,9 @@ import os
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE))
 import ggufq  # noqa: E402
+from arch import for_architecture  # noqa: E402
 from gguf_reader import GGUFFile  # noqa: E402
 
 
@@ -34,37 +36,12 @@ FLOAT = {"BF16", "F32", "F16"}
 ROLES = ("gate", "up", "down")
 ALIGN = 64                      # between the tensors of `dense`
 EXPERT_RE = re.compile(r"^blk\.\d+\.ffn_(gate|up|down|gate_up)_exps\.(weight|scale|input_scale)$")
-# the PLE table comes from the `gguf` section, never the dense pool
-NOT_IN_DENSE = {"per_layer_token_embd.weight"}
-
-# float form the engine reads each dense tensor in (name without `blk.N.`); other forms are converted and recorded
-# in meta.conversions:
-#   F32 -> BF16 when exactly BF16 (low 16 bits zero)              exact, by default
-#   other F32, F16 or quantized -> BF16                           rounds (nearest-even): only with --compat-bf16
-#   F32 -> F16 (ple_conv1d)                                       index kind 3, narrowed by the loader
-#   F16 / BF16 -> F32                                             exact widening
-# tensors not listed are written as stored (floats) or served from the `gguf` section (quantized)
-FORM = {
-    "ffn_gate_inp.weight": "BF16", "ffn_gate_inp_shexp.weight": "BF16",
-    "hc_attn_down.weight": "BF16", "hc_attn_up.weight": "BF16", "hc_attn_inject.weight": "BF16",
-    "hc_ffn_down.weight": "BF16", "hc_ffn_up.weight": "BF16", "hc_ffn_inject.weight": "BF16",
-    "output_hc_down.weight": "BF16", "output_hc_up.weight": "BF16",
-    "indexer.k_proj.weight": "BF16", "indexer.q_proj.weight": "BF16",
-    "ssm_alpha.weight": "BF16", "ssm_beta.weight": "BF16",
-    "ple_key.weight": "BF16", "ple_value.weight": "BF16", "ple_conv1d.weight": "F16",
-    "attn_q_norm.weight": "F32", "attn_k_norm.weight": "F32", "hc_attn_norm.weight": "F32",
-    "hc_ffn_norm.weight": "F32", "output_hc_norm.weight": "F32", "indexer.q_norm.weight": "F32",
-    "indexer.k_norm.weight": "F32", "ple_norm_conv.weight": "F32", "ple_norm_key.weight": "F32",
-    "ple_norm_query.weight": "F32", "ssm_a": "F32", "ssm_conv1d.weight": "F32", "ssm_dt.bias": "F32",
-    "ssm_norm.weight": "F32",
-}
-# PLE key encodings the engine reads natively; other quantized keys need --compat-bf16
-NATIVE_PLE_KEY = {"Q2_0", "Q8_0"}
 KIND = {"BF16": "4", "F16": "5", "F32": "2"}
+QWEN = for_architecture("qwen4exp")
 
 
-def form_of(name: str):
-    return FORM.get(re.sub(r"^blk\.\d+\.", "", name))
+def form_of(name: str, arch=QWEN):
+    return arch.form_of(name)
 
 
 # ------------------------------------------------------------------ the source model
@@ -108,17 +85,21 @@ def check_split(files) -> None:
 class SourceModel:
     """All shards of one model: name -> (GGUFFile, TensorInfo, shard path), in file order."""
 
-    def __init__(self, paths):
+    def __init__(self, paths, described=frozenset()):
+        """`described`: tensors whose shard may stop after its header; their names land in `short`."""
         self.paths = [pathlib.Path(p) for p in paths]
         self.files = [GGUFFile(p) for p in self.paths]
         self.sizes = [p.stat().st_size for p in self.paths]
         check_split(self.files)
         self._maps: dict[pathlib.Path, np.ndarray] = {}
         self.where: dict[str, tuple] = {}
+        self.short: set[str] = set()
         for p, g, size in zip(self.paths, self.files, self.sizes):
             for t in g.tensors:
                 n = t.expected_bytes()
-                if n is None or g.data_start + t.offset + n > size:
+                if n is not None and g.data_start + t.offset + n > size and t.name in described:
+                    self.short.add(t.name)
+                elif n is None or g.data_start + t.offset + n > size:
                     raise ConvertError(f"{p.name}: unsupported or truncated tensor {t.name}")
                 if t.name in self.where:
                     raise ConvertError(f"{p.name}: duplicate tensor {t.name}")
@@ -172,10 +153,10 @@ def f16_values(values: np.ndarray, name: str) -> np.ndarray:
     return h
 
 
-def convert_tensor(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool):
+def convert_tensor(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool, arch=QWEN):
     """The dense form of one tensor: (index kind, stored bytes, destination bytes, record or None), or an error string.
         `record` describes a conversion for meta.conversions."""
-    form = form_of(name)
+    form = arch.form_of(name)
     if form is None or form == type_name:
         return KIND[type_name], raw.tobytes(), raw.nbytes, None
     values = _dequantize(raw, type_name)
@@ -223,8 +204,10 @@ class Dense:
     """The `dense` section: `plan` validates every tensor first, `chunks` streams the pool and fills `rows` and `records`,
         `index_text` is the `dense.index`."""
 
-    def __init__(self, model: SourceModel, compat_bf16: bool = False):
+    def __init__(self, model: SourceModel, compat_bf16: bool = False, arch=QWEN, only=None):
+        """`only`: a predicate on tensor names; the tensors it rejects are not in this pool."""
         self.model = model
+        self.arch = arch
         self.compat_bf16 = compat_bf16
         self.todo = []
         self.rows: list[list[str]] = []
@@ -232,14 +215,12 @@ class Dense:
         self.pool_bytes = 0
         problems = []
         for name, (g, t, p) in model.where.items():
-            if is_expert(name) or name in NOT_IN_DENSE:
+            if is_expert(name) or name in arch.not_in_dense or (only is not None and not only(name)):
                 continue
-            if len(t.shape) > 2:
-                raise ConvertError(f"tensor {name} has {len(t.shape)} dimensions; the index holds two")
-            form = form_of(name)
+            form = arch.form_of(name)
             # quantized tensors are served from the source unless the pool needs them dequantized (--compat-bf16)
-            native = t.type_name not in FLOAT and (
-                form is None or (name == "blk.1.ple_key.weight" and t.type_name in NATIVE_PLE_KEY))
+            native = t.type_name not in FLOAT and arch.native(name, t.type_name)
+            # a row gives the first dimension and the rest flattened; meta.tensors has a served tensor's own shape
             if t.type_name not in FLOAT and not native and not compat_bf16:
                 problems.append(f"{name} is {t.type_name}, but the engine requires {form}; use --compat-bf16")
             self.todo.append((name, t, p, native))
@@ -251,13 +232,13 @@ class Dense:
         at = 0
         for name, t, p, native in self.todo:
             ne0 = int(t.shape[0])
-            ne1 = int(t.shape[1]) if len(t.shape) > 1 else 0
+            ne1 = math.prod(int(d) for d in t.shape[1:]) if len(t.shape) > 1 else 0
             if native:
                 self.rows.append([name, "0", "0", "0", "0", "0", "0", str(ne0), str(ne1), "8", "0", "32"] + ["0"] * 7)
                 continue
             raw = self.model.bytes(name)
             try:
-                got = convert_tensor(name, t.type_name, raw, self.compat_bf16)
+                got = convert_tensor(name, t.type_name, raw, self.compat_bf16, self.arch)
             except ValueError as e:
                 got = str(e)
             if isinstance(got, str):
@@ -289,20 +270,25 @@ class Dense:
 class Experts:
     """The `experts` section and its `experts.layout`; each role is resolved by name in the shard that holds it."""
 
-    def __init__(self, model: SourceModel):
+    def __init__(self, model: SourceModel, layers=None):
+        """`layers`: the layer ids that hold routed experts (default 0 .. the last layer with expert tensors); the
+            layout lists exactly these, by layer id."""
         T = {n: w[1] for n, w in model.where.items()}
         exps = [n for n in T if n.startswith("blk.") and n.endswith("_exps.weight")]
         if not exps:
             raise ConvertError("the model has no expert tensors (blk.N.ffn_{gate,up,down}_exps.weight)")
         self.model = model
-        self.n_layers = 1 + max(int(n.split(".")[1]) for n in exps)
+        self.layers = list(layers) if layers is not None else list(range(1 + max(int(n.split(".")[1]) for n in exps)))
+        if not self.layers:
+            raise ConvertError("no layer holds routed experts")
+        self.n_layers = len(self.layers)
         # router rows = experts kept (a pruned model has fewer)
-        self.n_expert = int(T["blk.0.ffn_gate_inp.weight"].shape[1])
-        if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != self.n_expert for l in range(self.n_layers)):
+        self.n_expert = int(T["blk.%d.ffn_gate_inp.weight" % self.layers[0]].shape[1])
+        if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != self.n_expert for l in self.layers):
             raise ConvertError("the routers disagree on the expert count; a per-layer pruned model cannot be converted")
         self.layout = []
         offset = 0
-        for l in range(self.n_layers):
+        for l in self.layers:
             names = ["blk.%d.ffn_%s_exps.weight" % (l, r) for r in ROLES]
             if any(n not in T for n in names):
                 raise ConvertError("layer %d: missing %s" % (l, ", ".join(n for n in names if n not in T)))
@@ -310,22 +296,28 @@ class Experts:
             if any(t.expected_bytes() is None or len(t.shape) != 3 or int(t.shape[2]) != self.n_expert for t in ts):
                 raise ConvertError("layer %d: an expert tensor is not [*, *, %d] of whole blocks" % (l, self.n_expert))
             per = [t.expected_bytes() // self.n_expert for t in ts]
-            if per[0] != per[1] or ts[0].type_name != ts[1].type_name:
-                raise ConvertError("layer %d: gate and up differ in type" % l)
             blob = sum(per)
-            self.layout.append((l, ts[0].type_id, ts[2].type_id, offset, blob, names))
+            self.layout.append((l, ts[0].type_id, ts[2].type_id, offset, blob, names, ts[1].type_id))
             offset += blob * self.n_expert
         self.total = offset
 
     def layout_text(self) -> bytes:
-        head = ("# experts v5: layer gu_type d_type offset blob_bytes (n_expert %d, total %d)\n"
+        """v5; v7 (a sixth column, the up rows' type) only when a layer's gate and up differ in type, so every other
+            model stays readable by engines from before v7."""
+        mixed = any(gt != ut for _, gt, _, _, _, _, ut in self.layout)
+        if not mixed:
+            head = ("# experts v5: layer gu_type d_type offset blob_bytes (n_expert %d, total %d)\n"
+                    % (self.n_expert, self.total))
+            return (head + "".join("%d %d %d %d %d\n" % (l, gt, dt, off, blob)
+                                   for l, gt, dt, off, blob, _, _ in self.layout)).encode("utf-8")
+        head = ("# experts v7: layer gu_type d_type offset blob_bytes up_type (n_expert %d, total %d)\n"
                 % (self.n_expert, self.total))
-        return (head + "".join("%d %d %d %d %d\n" % (l, gt, dt, off, blob)
-                               for l, gt, dt, off, blob, _ in self.layout)).encode("utf-8")
+        return (head + "".join("%d %d %d %d %d %d\n" % (l, gt, dt, off, blob, ut)
+                               for l, gt, dt, off, blob, _, ut in self.layout)).encode("utf-8")
 
     def chunks(self, group: int = 32):
         """The blobs layer by layer, `group` experts at a time: each expert is [gate | up | down] of its slices."""
-        for l, gt, dt, off, blob, names in self.layout:
+        for l, gt, dt, off, blob, names, _ in self.layout:
             arrays = [self.model.bytes(n).reshape(self.n_expert, -1) for n in names]
             for s in range(0, self.n_expert, group):
                 yield np.concatenate([a[s:s + group] for a in arrays], axis=1).tobytes()
@@ -582,40 +574,61 @@ def bounded_imap(pool, fn, jobs, depth: int):
 
 class PleFp8:
     """The PLE n-gram table of a checkpoint that stores it as FP8 shards (`...ngram_embedding.shard_K.weight`) with one
-    BF16 `...ngram_embedding.weight_scale`, as Q8_0 rows: values are code x scale, re-blocked per 32 values."""
+    BF16 `...ngram_embedding.weight_scale`, as Q8_0 rows: values are code x scale, re-blocked per 32 values.  A release
+    that consolidates its weight files spreads the shards over several of them; they are gathered by their index."""
 
-    def __init__(self, path, chunk_rows: int = 65536):
-        self.path, self.chunk_rows = path, chunk_rows
-        head, base = read_safetensors_header(path)
-        scales = [k for k in head if k.endswith("ngram_embedding.weight_scale")]
-        if len(scales) != 1:
-            raise ConvertError(f"{path}: {len(scales)} ngram_embedding.weight_scale tensors")
-        stem = scales[0][:-len("weight_scale")]
-        sc = head[scales[0]]
-        if sc["dtype"] != "BF16" or sc["shape"] != [1]:
-            raise ConvertError(f"{path}: the PLE scale is not one BF16 value")
-        with open(path, "rb") as f:
-            f.seek(base + sc["data_offsets"][0])
-            u = np.frombuffer(f.read(2), dtype="<u2").astype(np.uint32) << 16
-        self.scale = float(u.view(np.float32)[0])
-        shards = []
-        while f"{stem}shard_{len(shards)}.weight" in head:
-            t = head[f"{stem}shard_{len(shards)}.weight"]
-            if t["dtype"] != "F8_E4M3" or len(t["shape"]) != 2 or t["shape"][1] != PLE_DIM:
-                raise ConvertError(f"{path}: shard {len(shards)} is not FP8 rows of {PLE_DIM}")
-            shards.append((base + t["data_offsets"][0], t["shape"][0]))
-        if not shards:
-            raise ConvertError(f"{path}: no PLE shards")
-        self.shards = shards
-        self.rows = sum(r for _, r in shards)
+    def __init__(self, paths, chunk_rows: int = 65536):
+        if isinstance(paths, (str, pathlib.Path)):
+            paths = [paths]
+        self.paths, self.chunk_rows = [pathlib.Path(p) for p in paths], chunk_rows
+        stem, scale, found = None, None, {}
+        for path in self.paths:
+            head, base = read_safetensors_header(path)
+            scales = [k for k in head if k.endswith("ngram_embedding.weight_scale")]
+            for k in scales:
+                if scale is not None:
+                    raise ConvertError(f"{path}: a second ngram_embedding.weight_scale")
+                sc = head[k]
+                if sc["dtype"] != "BF16" or sc["shape"] != [1]:
+                    raise ConvertError(f"{path}: the PLE scale is not one BF16 value")
+                with open(path, "rb") as f:
+                    f.seek(base + sc["data_offsets"][0])
+                    u = np.frombuffer(f.read(2), dtype="<u2").astype(np.uint32) << 16
+                scale = float(u.view(np.float32)[0])
+                stem = k[:-len("weight_scale")]
+            if stem is None:      # a file with shards but the scale in another file: its own prefix
+                heads = [k for k in head if "ngram_embedding.shard_" in k]
+                stem = heads[0][:heads[0].index("shard_")] if heads else None
+            for k, t in head.items():
+                if stem is None or not k.startswith(stem + "shard_") or not k.endswith(".weight"):
+                    continue
+                i = int(k[len(stem) + len("shard_"):-len(".weight")])
+                if i in found:
+                    raise ConvertError(f"{path}: PLE shard {i} is in two files")
+                if t["dtype"] != "F8_E4M3" or len(t["shape"]) != 2 or t["shape"][1] != PLE_DIM:
+                    raise ConvertError(f"{path}: shard {i} is not FP8 rows of {PLE_DIM}")
+                found[i] = (path, base + t["data_offsets"][0], t["shape"][0])
+        if scale is None:
+            raise ConvertError("no ngram_embedding.weight_scale in " + ", ".join(str(p) for p in self.paths))
+        if not found:
+            raise ConvertError("no PLE shards in " + ", ".join(str(p) for p in self.paths))
+        missing = sorted(set(range(max(found) + 1)) - set(found))
+        if missing:
+            raise ConvertError(f"the PLE table lacks shards {missing[:8]} of {max(found) + 1}")
+        self.scale = scale
+        self.shards = [found[i] for i in range(max(found) + 1)]
+        self.rows = sum(r for _, _, r in self.shards)
         self.row_bytes = PLE_DIM // 32 * 34
         self.nbytes = self.rows * self.row_bytes
+        self.conversion = {"src_type": "F8_E4M3", "dst_type": "Q8_0",
+                           "method": "fp8 code x per-tensor BF16 scale, Q8_0 blocks of 32 (ggml reference rounding)",
+                           "scale": self.scale}
 
     def jobs(self):
-        for off, rows in self.shards:
+        for path, off, rows in self.shards:
             for r in range(0, rows, self.chunk_rows):
                 n = min(self.chunk_rows, rows - r)
-                yield (self.path, off + r * PLE_DIM, n, self.scale)
+                yield (str(path), off + r * PLE_DIM, n, self.scale)
 
     def chunks(self, pool, depth: int = 16):
         """The Q8_0 rows in order, made on `pool` with at most `depth` chunks in flight."""
@@ -629,16 +642,33 @@ Q6K_BLOCK, Q6K_BYTES = 256, 210
 def q6_k(x: np.ndarray) -> bytes:
     """Q6_K blocks of 256 over a float32 array (length a multiple of 256): per 16-value group the least-squares
     scale from the signed-max starting grid, 8-bit group scales against one fp16 super-scale, values re-rounded
-    against the scales as stored. The layout is ggml block_q6_K."""
+    against the scales as stored. The layout is ggml block_q6_K.
+
+    Every per-group term is built by 16 explicit elementwise steps instead of a reduction over the last axis: a bulk
+    reduction can return wrong sums for these shapes, which shows up as whole 16-value groups turning to zero. The
+    elementwise form is exact and costs nothing at this width."""
     nb = x.size // Q6K_BLOCK
     x = np.ascontiguousarray(x, dtype=np.float32).reshape(nb, 16, 16)
     with np.errstate(divide="ignore", invalid="ignore"):
-        mx = np.take_along_axis(x, np.abs(x).argmax(-1)[..., None], -1)[..., 0]
+        # the signed value of the largest magnitude in each group (the first of equals, as argmax takes)
+        mx = x[:, :, 0].copy()
+        for k in range(1, 16):
+            v = x[:, :, k]
+            mx = np.where(np.abs(v) > np.abs(mx), v, mx)
         start = np.where(mx != 0, -32.0 / np.where(mx == 0, 1, mx), 0.0)
         l = np.clip(np.rint(x * start[..., None]), -32, 31)
-        den, num = (l * l).sum(-1), (x * l).sum(-1)
+        x64 = x.astype(np.float64)
+        l64 = l.astype(np.float64)
+        den = np.zeros((nb, 16))
+        num = np.zeros((nb, 16))
+        for k in range(16):
+            c, v = l64[:, :, k], x64[:, :, k]
+            den += c * c
+            num += v * c
         scale = np.where(den > 0, num / np.where(den == 0, 1, den), 0.0)
-        smax = np.take_along_axis(scale, np.abs(scale).argmax(-1)[..., None], -1)[..., 0]
+        smax = scale[:, 0].copy()
+        for g in range(1, 16):
+            smax = np.where(np.abs(scale[:, g]) > np.abs(smax), scale[:, g], smax)
         d = smax / 127.0
         d16 = d.astype(np.float16)
         sc = np.clip(np.rint(scale / np.where(d == 0, 1, d)[..., None]), -128, 127)

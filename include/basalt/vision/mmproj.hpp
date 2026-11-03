@@ -4,6 +4,7 @@
 // is checked, and a file that does not match is refused with the reason.
 #pragma once
 
+#include "basalt/core/model_file.hpp"
 #include "basalt/platform/mapped_file.hpp"
 
 #include <cstdint>
@@ -24,6 +25,7 @@ struct TensorRef {
 
 struct Hparams {
     int image_size = 0, patch = 0, embd = 0, ffn = 0, layers = 0, heads = 0, merge = 0, proj = 0;
+    int min_pixels = 0;   ///< smallest input area in pixels, when the file states one
     float eps = 0.f;
     float mean[3] = {0, 0, 0}, std[3] = {1, 1, 1};
 };
@@ -35,13 +37,17 @@ public:
     Mmproj(const Mmproj&) = delete;
     Mmproj& operator=(const Mmproj&) = delete;
 
-    /// Reads `path` (mapped when the file system refuses unbuffered reads), parses the header and checks it is the expected projector.  False with `err` otherwise.
-    bool open(const std::string& path, std::string& err);
+    /// Reads the projector GGUF at `range` in place (a whole file, or the `vision/mmproj` section of a .basalt; mapped
+    /// when the file system refuses unbuffered reads), parses the header and checks it is the `projector` type.  False
+    /// with `err` otherwise.
+    bool open(const core::FileRange& range, std::string& err, const char* projector = "qwen3vl_merger");
 
     /// Drops the file's bytes: tensor pointers are invalid afterwards, hp() stays.  For callers that copied the weights.
     void release();
 
     const Hparams& hp() const { return hp_; }
+    /// The `projector` the file was opened as (the name its model asked for).
+    const std::string& projector() const { return projector_; }
     /// A tensor by name; null when absent.
     const TensorRef* find(const std::string& name) const;
     /// A required tensor of the given type and element count (ne product); null with `err` set otherwise.
@@ -53,6 +59,7 @@ private:
     bool mapped_ = false;   ///< `map_` is a file mapping (else allocated memory the file was read into)
     size_t size_ = 0;
     Hparams hp_;
+    std::string projector_;
     std::map<std::string, TensorRef> tensors_;
 };
 

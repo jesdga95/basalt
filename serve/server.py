@@ -1,8 +1,8 @@
-"""OpenAI, Anthropic and Responses endpoints over an engine that maps token ids to tokens.
+"""OpenAI, Anthropic and Responses endpoints over engines that map token ids to tokens, one model loaded at a time.
 
     basalt serve --model FILE.basalt [--alias NAME] [--host H] [--port P] [--gpu 0,1] [--api-key KEY] ...
     python -m serve.server --model FILE.basalt --engine-bin bin/basalt ...
-    python -m serve.server --config config.json
+    python -m serve.server --config config.json          (each entry of its "models" is one model)
     python -m serve.server --mock-engine --port 8080
 
 The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel)` -> token ids. ProcessEngine keeps
@@ -12,6 +12,7 @@ context are rejected with a 400, never truncated.
 from __future__ import annotations
 
 import json
+import os
 import signal
 import sys
 import threading
@@ -23,23 +24,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable as a script
 from serve import ROOT, service  # noqa: E402
 from serve.config import (build_parser, check_engine_flags,  # noqa: E402
-                          engine_flags_of, engine_line, grammar_words, parse_settings, sampling_defaults_from_config,
-                          sampling_line)
+                          engine_flags_of, grammar_words, model_line, model_settings, sampling_defaults_from_config,
+                          sampling_items, shared_line, slot_share, slots_text, start_items, with_spec)
 from serve.engine import process as engine_process  # noqa: E402
+from serve.engine import suspend  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
-from serve.engine.flags import flag_index, flag_value  # noqa: E402
+from serve.engine.image_source import image_sources_of  # noqa: E402
+from serve.engine.flags import flag_value  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.engine.process import ProcessEngine  # noqa: E402
-from serve.engine.vision import (EngineVision, Vision, check_gpu, child_env, engine_args, gpu_card_name, gpu_plan,  # noqa: E402
-                                 gpu_text, gpus_in_play, vision_card, vision_env, vision_line)
-from serve.frontend import ChatTemplate  # noqa: E402
+from serve.engine.vision import (EngineVision, Vision, check_gpu, child_env, engine_args, flag_refused, gpu_card_name,  # noqa: E402
+                                 gpu_text, gpus_in_play, model_plan, vision_card, vision_env, vision_item)
+from serve.models import dialect_for  # noqa: E402
 from serve.handler import Server, serve  # noqa: E402
-from serve.security import (LOOPBACK_NAMES, allowed_hosts_of, api_key_of, exposed_without_key,  # noqa: E402
-                            lan_addresses, origins_of)
-from serve.service import Service  # noqa: E402
+from serve.security import (LOOPBACK_NAMES, allowed_hosts_of, api_key_from_file, api_key_of,  # noqa: E402
+                            exposed_without_key, lan_addresses, origins_of)
+from serve.router import Router  # noqa: E402
+from serve.service import Service, meminfo_mib  # noqa: E402
+from serve.engine.progress import load_progress                             # noqa: E402
 from serve.util.logbuf import ColorStream, LogBuffer, TeeStream, tail_file  # noqa: E402
+from serve.util.loglevel import ERR, WARN, LevelReader                     # noqa: E402
 from serve.util.console import LEGEND, tagged  # noqa: E402
 from serve.util.text import ByteTokenizer  # noqa: E402
+
+
+SWAP_START_TRIES = 2      # a swap's load: a second try for VRAM still being released, not a third for clients to wait on
 
 
 def fail(msg: str) -> None:
@@ -69,141 +78,358 @@ def grammar_entry(on: bool, cli: list[str], used: list[str]) -> tuple[bool, str]
     return (on, origin) if origin else None
 
 
-def main() -> int:
-    ap = build_parser()
-    try:
-        a, used_argv, file_engine, cli_engine = parse_settings(ap, sys.argv[1:])
-    except ValueError as e:
-        fail(f"--config: {e}")
-    service.DEBUG, engine_process.REQUEST_LINES = a.debug, a.request_lines
-    logs = LogBuffer()                                  # this process's and the engine's output
-    sys.stdout, sys.stderr = (TeeStream(ColorStream.wrap(sys.stdout), logs, "srv"),
-                              TeeStream(ColorStream.wrap(sys.stderr), logs, "srv"))
-    print(tagged("legend", LEGEND), flush=True)          # first line, so the key precedes every value
+def open_when_ready(svc, url, now=False, opener=None):
+    """Open the page once, after the first weights load; at once when no load is under way (mock, lazy)."""
+    if opener is None:
+        import webbrowser
+        opener = webbrowser.open
+    if now:
+        opener(url)
+        return
+    done, previous = [], svc.on_loaded
+
+    def loaded():
+        if previous is not None:
+            previous()
+        if not done:
+            done.append(1)
+            opener(url)
+    svc.on_loaded = loaded
+
+
+def model_file_problems(settings) -> list[str]:
+    """One plain line for each configured model whose file is missing, a directory or unreadable (the same paths the
+    engine is given: relative ones are already resolved against the config file)."""
+    out = []
+    for i, (m, *_rest) in enumerate(settings):
+        if not m.model or not m.engine_bin or (m.mock_engine and m.config):
+            continue
+        if m.config:
+            who = f"model '{m.alias}'" if m.alias else f"models[{i}]"
+            where = f' (the "model" key in {Path(m.config).name})'
+        else:
+            who, where = "model", " (--model)"
+        if os.path.isdir(m.model):
+            why = f"{m.model} is a directory, not a model file"
+        elif not os.path.exists(m.model):
+            why = f"file not found: {m.model}"
+        else:
+            try:
+                with open(m.model, "rb"):
+                    continue
+            except OSError as e:
+                why = f"can't read {m.model}: {e.strerror or e}"
+        out.append(f"{who}: {why}{where}")
+    return out
+
+
+def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: list[str], known) -> dict:
+    """What one configured model's file and flags imply, by the engine's own rules and without loading anything; fail()
+    for what stops the start."""
     cfg = {}                                            # what the model file implies
+    lines = cfg["start_lines"] = []                     # printed with the model's other lines once all are checked
     try:
-        check_gpu(a.gpu)
-    except ValueError:
-        fail(f"--gpu {gpu_text(a.gpu)}: expected numbers like 0 or 0,1, or auto")
+        check_gpu(a.gpu, a.gpu_mode, a.gpu_share)
+    except ValueError as e:
+        fail(str(e))
     if not a.mock_engine and not (a.model and a.engine_bin):
         fail("the server needs --model and the engine binary: run it as basalt serve --config FILE (or --mock-engine)")
     if (file_engine or cli_engine) and not a.model:
         fail("engine flags need --model")
-    if a.model:
+    pack = bool(a.model) and not (a.mock_engine and a.config)   # the scripted engine of a config file reads no model files
+    if pack:
         if not a.engine_bin:
             fail("--model needs --engine-bin BINARY")
         from serve.engine import modelfile
         try:
-            known = engine_flags_of(a.engine_bin)
             check_engine_flags(file_engine, known, f"--config {a.config}")
             check_engine_flags(cli_engine, known, "command line")
         except ValueError as e:
             fail(str(e))
         mode = a.vision
-        vision_arg = False if a.mock_engine or mode == "off" else mode
+        spec = modelfile.ModelSpec(a.model, alias=a.alias, gpu=a.gpu,
+                                   vision=False if a.mock_engine or mode == "off" else mode,
+                                   engine_words=tuple(file_engine + cli_engine))
         try:
-            cfg.update({k: v for k, v in modelfile.model_config(
-                a.model, a.engine_bin, vision=vision_arg,
-                engine_words=file_engine + cli_engine).items()
-                if k not in cfg})
+            cfg.update(modelfile.model_config(spec, a.engine_bin))
         except (OSError, ValueError, KeyError) as e:
             fail(f"{a.model}: {e}")
         if not a.mock_engine:
-            # the engine's own choice, printed once here; the engine then sees only these cards, main first
+            # the engine's own choice and its own flag rules, printed once here; the engine then sees only these cards,
+            # main first
             try:
-                plan = gpu_plan(a.engine_bin, a.gpu)
+                plan = model_plan(a.engine_bin, a.model, spec.gpu, list(spec.engine_words), a.gpu_mode, a.gpu_share)
             except ValueError as e:
-                fail(f"gpu: {e}")
+                fail(f"{a.model}: {e}")
             card = vision_card(mode)
             if card is not None:                       # a numbered sidecar card: the engine's sm_120 rule is the
                 if gpu_card_name(card) is None:        # engine's; the sidecar is its own build and says whether
                     fail(f"vision: GPU {card} is not found by nvidia-smi")   # the sidecar checks the card itself
             for note in plan.get("notes") or []:
-                print(f"[server] {note}", flush=True)
+                lines.append(f"[server] {note}")
             if plan.get("warning"):
-                print(f"[server] warning: {plan['warning']}", flush=True)
+                lines.append(f"[server] warning: {plan['warning']}")
             cfg["gpu"] = plan["devices"]
+            cfg["spec"] = plan.get("spec")
+            if getattr(a, "split_default", False) and plan.get("max_context"):
+                # the engine's default context, shared by the slots
+                a.shared_context = int(plan["max_context"])
+                part = ["--max-context", str(slot_share(a.shared_context, a.parallel))]
+                cfg["args"] += part
+                cli_engine += part
             cfg["gpu_smi"] = [c.get("smi", -1) for c in plan.get("cards") or []]
             cfg["args"] += ["--gpu", ",".join(str(i) for i in range(len(plan.get("cards") or [])))]
-        if not a.mock_engine:
-            print(engine_line(file_engine, cli_engine,
-                                    (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None,
-                                    grammar_entry(a.grammar, sys.argv[1:], used_argv)), flush=True)
-    if a.alias:
+            for flag, value in (("--gpu-mode", gpu_text(a.gpu_mode)), ("--gpu-share", gpu_text(a.gpu_share))):
+                if value:                                  # the engine checks them again on the cards it was given
+                    cfg["args"] += [flag, value]
+    for flag in a.skipped:
+        lines.append(tagged("engine", f"{flag[2:]} from the top level: this model has no such flag, skipped"))
+    cfg["items"] = start_items(file_engine, cli_engine,
+                               (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None,
+                               grammar_entry(a.grammar, sys.argv[1:], used_argv), a.debug) if pack and not a.mock_engine else []
+    cfg["items"] = with_spec(cfg["items"], cfg.get("spec"))
+    if a.alias and not pack:
         cfg["model_name"] = a.alias
-    try:                                                # fail fast if the port is taken
-        Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
-    except OSError:
-        fail(f"port {a.port} is in use (--port N)")
-    if cfg.get("tokenizer"):
-        a.tokenizer = cfg["tokenizer"]
+    if not cfg.get("model_name") and a.model:
+        cfg["model_name"] = Path(a.model).name
+    return cfg
+
+
+def drop_sidecar_vision(cfg: dict) -> None:
+    """Only a sidecar encoder holds VRAM before the first request; `dynamic` encodes inside the engine, which the
+    request loads first anyway."""
+    if not cfg.get("vision") or cfg["vision"].get("mode") == "dynamic":
+        return
+    print(tagged("warning", "lazy loading drops a sidecar image encoder, vision off; --vision dynamic stays on"), flush=True)
+    del cfg["vision"]
+
+
+def engine_echo(engine):
+    """The tail callback that repeats the engine log's warnings and errors (and the indented lines of an error's
+    report) in the server window once the engine is ready; what it wrote while loading is the load bars' business."""
+    level = LevelReader()
+    in_err_block = False
+
+    def echo_engine_line(text: str, end_pos: int) -> None:
+        nonlocal in_err_block
+        lvl = level.read(text)
+        if lvl == ERR:
+            in_err_block = True
+            echo = True
+        elif in_err_block and text.startswith(("  ", "\t")) and text.strip():
+            echo = True
+        else:
+            in_err_block = False
+            echo = lvl == WARN
+        if echo and getattr(engine, "known_ctx", 0) > 0 and not engine.loading and end_pos > getattr(engine, "log_ready_pos", 0):
+            out = getattr(sys.stdout, "_stream", sys.stdout)
+            out.write(text.rstrip() + "\n")
+            out.flush()
+
+    return echo_engine_line
+
+
+def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
+    """The Service of one checked model, unloaded. With several models a numbered vision sidecar waits for its model's
+    turn too."""
+    from serve.engine import modelfile
+    files = cfg.get("tokenizer")
+    if files is None:                                   # the mock engine: a directory, or the byte tokenizer without one
+        tdir = Path(a.tokenizer)
+        files = {n: (tdir / n).read_bytes() for n in modelfile.TOKENIZER_SECTIONS if (tdir / n).exists()}
+    if not a.mock_engine and "vocab.json" not in files:
+        fail(f"tokenizer missing: {a.tokenizer}/vocab.json")
     tok = ByteTokenizer()
-    tpath = Path(a.tokenizer)
-    if not a.mock_engine and not (tpath / "vocab.json").exists():
-        fail(f"tokenizer missing: {tpath / 'vocab.json'}")
-    if (tpath / "vocab.json").exists():
+    if "vocab.json" in files:
         import tokenizer as ST
-        vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
+        vocab = json.loads(files["vocab.json"].decode("utf-8"))
         tokens = [None] * len(vocab)
         for t, i in vocab.items():
             tokens[i] = t
-        merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
-        types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+        merges = files["merges.txt"].decode("utf-8").split("\n")
+        types = json.loads(files["token_type.json"])
+        pre = json.loads(files["tokenizer.json"].decode("utf-8")).get("pre", "qwen35") if "tokenizer.json" in files else "qwen35"
+        tok = ST.Tokenizer(tokens, merges, types, pre=pre)
+    has_grammar = False
     if not a.mock_engine:
         vision = None
         env = child_env(cfg)
         sampling_defaults = {**sampling_defaults_from_config(cfg), **a.sampling_launch}
-        if sampling_defaults:
-            print(sampling_line(sampling_defaults, a.sampling_cli, set(a.sampling_launch) - a.sampling_cli), flush=True)
-        lazy = a.lazy
-        if lazy and cfg.get("vision"):
-            print(tagged("warning", "lazy loading is text-only, vision off"), flush=True)
-            while (at := flag_index(cfg["args"], "--vision-mmproj")) is not None:
-                del cfg["args"][at:at + 2]
-            del cfg["vision"]
+        if a.lazy and not multi:
+            drop_sidecar_vision(cfg)
+        shown = [x for x in cfg["items"] if x not in cfg.get("shared_items", ())]
+        shown += sampling_items(sampling_defaults) + [x for x in [vision_item(cfg.get("vision"), cfg)] if x]
+        print(model_line(cfg["model_name"], cfg.get("name_width", 0), shown), flush=True)
+        for line in cfg["start_lines"]:
+            print(line, flush=True)
         if cfg.get("vision"):
             mode = cfg["vision"].get("mode")
             if mode == "dynamic":
                 vision = EngineVision(cfg["vision"])
             else:
                 vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                                env=vision_env(env, mode))
-        print(vision_line(cfg.get("vision"), cfg, vision.ready_s if vision else 0.0), flush=True)
-        if lazy:
+                                env=vision_env(env, mode), start=not multi)
+        if a.lazy and not multi:
             print(tagged("model", "unloaded, the first request loads it"), flush=True)
-        if cfg.get("log"):                              # follow the engine's log file
-            threading.Thread(target=tail_file, args=(logs, cfg["log"], "eng"), daemon=True).start()
-        else:
-            ProcessEngine.stderr_sink = lambda line: logs.add("eng", line)
-        known_flags = engine_flags_of(cfg["engine_bin"])
-        has_grammar = known_flags is not None and "--grammar" in known_flags
+        has_grammar = known is not None and "--grammar" in known
         if a.grammar and not has_grammar:
             print(tagged("warning", "grammar is on but this engine has no --grammar; requests go without one"), flush=True)
-        gwords = grammar_words(known_flags)
+        gwords = grammar_words(known)
         cdir = flag_value(engine_args(cfg), "--conversation-cache-dir")
         cmib = flag_value(engine_args(cfg), "--conversation-cache-disk-mib") or "0"
-        if cdir and cmib != "0":
+        if cdir and cmib != "0" and a.debug:
             print(tagged("disk", f"conversations={cdir} disk-mib={cmib}"), flush=True)
-        # always built unloaded: the load itself (below) is the lazy path's, started here instead of by a request
+        # always built unloaded: the load itself is the lazy path's, started by the caller instead of by a request
         engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=True)
+        if cfg.get("log"):                              # follow the engine's log file
+            print(f"[server] engine log: {cfg['log']}", flush=True)
+            echo_engine_line = engine_echo(engine)
+            threading.Thread(target=tail_file, args=(logs, cfg["log"], "eng"),
+                             kwargs={"on_line": echo_engine_line,
+                                     "skip": lambda line: load_progress(line) is not None}, daemon=True).start()
+        else:
+            ProcessEngine.stderr_sink = lambda line: logs.add("eng", line)
         if isinstance(vision, EngineVision):
             vision.attach(engine)
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."], batch=a.parallel or 0), None, dict(a.sampling_launch)
     # the model's exported template, else the bundled one
-    tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
-                  model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
+    dialect = dialect_for(cfg.get("arch"))
+    template = files["chat_template.jinja"].decode("utf-8") if "chat_template.jinja" in files else \
+        (ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8")
+    svc = Service(engine, tok, dialect.template(template),
+                  model_name=cfg.get("model_name", "basalt"), vision=vision,
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
-                  grammar_engine=bool(a.mock_engine or has_grammar))
+                  grammar_engine=bool(a.mock_engine or has_grammar), dialect=dialect, video_max_tokens=a.video_max_tokens)
     svc.logs = logs
+    svc.idle_unload_s = a.idle_unload or 0
+    svc.idle_sleep_s = a.idle_sleep or 0
+    svc.min_free_vram_mib = a.min_free_vram_mib or 0
+    svc.reasoning_budget_tokens = a.reasoning_budget_tokens or 0
+    svc.answer_room = a.answer_room
+    svc.reasoning_effort = a.reasoning_effort
+    svc.thinking_loop_tokens = a.thinking_loop_tokens
+    svc.gpu_indices = gpus_in_play(cfg, engine_args(cfg) if not a.mock_engine else [])   # the cards /metrics reads
+    svc.gpu_index = svc.gpu_indices[0]
+    if multi:
+        svc.start_tries = SWAP_START_TRIES
+    return svc
+
+
+def check_models(services: list[Service]) -> None:
+    """Refuse model names that answer for two entries, and one conversation folder shared by two: each model's chats keep
+    their own budget."""
+    seen: dict[str, Service] = {}
+    folders: dict[str, str] = {}
+    for svc in services:
+        for name in svc.served_names():
+            if seen.setdefault(name, svc) is not svc:
+                fail(f"--config: {name!r} names two models: give each its own alias")
+        args = getattr(svc.engine, "spawn", (None, []))[1]
+        where = flag_value(args, "--conversation-cache-dir")
+        if where and (flag_value(args, "--conversation-cache-disk-mib") or "0") != "0" and \
+                folders.setdefault(where, svc.model) != svc.model:
+            fail(f"--config: {svc.model} and {folders[where]} share the conversation folder {where}: give each its own")
+
+
+RAM_FLOOR_BEAT_MIB = 1024    # kept free above the engines' own RAM reserve while models are parked
+RAM_RESERVE_DEFAULT_MIB = 2048
+
+
+def model_cache_plan(a, services: list[Service]) -> tuple[int, int]:
+    """The model cache's budget and RAM floor in MiB, from the options and the models' own `ram-reserve-mib`; (0, 0) when
+    off. The floor is the highest reserve of any model and a margin, so the cache ends a parked model before the
+    engines' own RAM guard acts. A setting that cannot work stops the start."""
+    if a.model_cache_mib < 0:
+        fail(f"--model-cache-mib {a.model_cache_mib} must be 0 (off) or more")
+    if not a.model_cache_mib:
+        return 0, 0
+    if len(services) < 2:
+        fail("--model-cache-mib parks a model when the router switches to another: it needs two or more models in --config")
+    if a.mock_engine:
+        fail("--model-cache-mib needs the engine, not --mock-engine")
+    if not suspend.available():
+        fail("--model-cache-mib needs the driver's process suspend, which is Linux only: it parks a model as an engine "
+             "asleep in RAM (idle-sleep uses the same)")
+    reserve = max(int(flag_value(getattr(s.engine, "spawn", (None, []))[1], "--ram-reserve-mib") or RAM_RESERVE_DEFAULT_MIB)
+                  for s in services)
+    floor, total = reserve + RAM_FLOOR_BEAT_MIB, meminfo_mib("MemTotal")
+    if total is not None and a.model_cache_mib > total - floor:
+        fail(f"--model-cache-mib {a.model_cache_mib} is more than this machine can park: {total} MiB of RAM, "
+             f"{floor} MiB of it kept free (ram-reserve-mib {reserve})")
+    print(tagged("parking", f"up to {a.model_cache_mib} MiB of switched-away models, least recently used out first; "
+                            f"ends one when RAM available drops under {floor} MiB"), flush=True)
+    return a.model_cache_mib, floor
+
+
+def main() -> int:
+    ap = build_parser()
+    engine_bin = ap.parse_known_args(sys.argv[1:])[0].engine_bin
+    try:
+        settings = model_settings(ap, sys.argv[1:], (lambda path, group: flag_refused(engine_bin, path, group))
+                                  if engine_bin else None)
+    except ValueError as e:
+        fail(f"--config: {e}")
+    a = settings[0][0]                                  # the options every model shares read the same in each
+    multi = len(settings) > 1
+    service.DEBUG, engine_process.REQUEST_LINES = a.debug, a.request_lines
+    logs = LogBuffer()                                  # this process's and the engine's output
+    sys.stdout, sys.stderr = (TeeStream(ColorStream.wrap(sys.stdout), logs, "srv"),
+                              TeeStream(ColorStream.wrap(sys.stderr), logs, "srv"))
+    print(tagged("legend", LEGEND), flush=True)          # first line, so the key precedes every value
+    problems = model_file_problems(settings)
+    for line in problems:
+        print(f"[server] error: {line}", file=sys.stderr)
+    if problems:
+        return 2
+    known = engine_flags_of(a.engine_bin) if a.engine_bin else None
+    cfgs = [check_model(m, file_engine, cli_engine, used_argv, known)
+            for m, used_argv, file_engine, cli_engine in settings]
+    if (a.image_url_host or a.image_dir) and not a.mock_engine and all(m[0].vision == "off" for m in settings):
+        fail("--image-url-host and --image-dir need --vision (image input is off)")
+    try:
+        image_sources = image_sources_of(a.image_url_host, a.image_dir, a.image_remote_only)
+    except ValueError as e:
+        fail(str(e))
+    try:                                                # fail fast if the port is taken
+        Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
+    except OSError:
+        fail(f"port {a.port} is in use (--port N)")
+    width = max(len(c.get("model_name") or "") for c in cfgs) + 1
+    shared = [x for x in cfgs[0].get("items", []) if all(x in c.get("items", []) for c in cfgs[1:])] if multi else []
+    line, shared_sleep = shared_line(shared, [m[0].idle_sleep for m in settings])
+    if line:
+        print(tagged("engine", line), flush=True)
+    for c in cfgs:
+        c["shared_items"], c["name_width"] = shared, width
+    services = [build_model(m[0], cfg, logs, multi, known) for m, cfg in zip(settings, cfgs)]
+    check_models(services)
+    router = Router(services, *model_cache_plan(a, services))
+    svc = router.front
+    svc.image_sources = image_sources
+    if image_sources.url_hosts or image_sources.dirs or image_sources.remote_only:
+        print(tagged("images", f"from other machines{' and this one' if image_sources.remote_only else ''}: "
+                               f"url-hosts={','.join(a.image_url_host) or '-'} "
+                               f"dirs={','.join(image_sources.dirs) or '-'}"), flush=True)
+    used_argv = settings[0][1]
     if any(x == "--api-key" and i + 1 < len(used_argv) and not used_argv[i + 1].strip() or x.strip() == "--api-key="
            for i, x in enumerate(used_argv)):
         # an empty key would silently disable authentication
         print("[server] error: --api-key is empty (give a key, or leave it out)", file=sys.stderr)
         return 2
+    if a.max_payload_mib < 1:
+        fail(f"--max-payload-mib {a.max_payload_mib} must be at least 1")
+    svc.max_payload = a.max_payload_mib << 20
+    if a.api_key_file:
+        if a.api_key:
+            print("[server] error: give --api-key or --api-key-file, not both", file=sys.stderr)
+            return 2
+        try:
+            a.api_key = api_key_from_file(a.api_key_file)
+        except ValueError as e:
+            print(f"[server] error: {e}", file=sys.stderr)
+            return 2
     try:
         svc.api_key = api_key_of(a.api_key)
     except ValueError as e:
@@ -221,38 +447,70 @@ def main() -> int:
         print(tagged("cors", ",".join(svc.cors_origins)), flush=True)
         if "*" in svc.cors_origins and not svc.api_key:
             print(tagged("warning", "any web page can use the model (--api-key KEY)"), flush=True)
-    svc.idle_unload_s = a.idle_unload or 0
-    svc.idle_sleep_s = a.idle_sleep or 0
-    svc.min_free_vram_mib = a.min_free_vram_mib or 0
-    svc.reasoning_budget_tokens = a.reasoning_budget_tokens or 0
-    svc.answer_room = a.answer_room
-    svc.thinking_loop_tokens = a.thinking_loop_tokens
-    svc.gpu_indices = gpus_in_play(cfg, engine_args(cfg) if not a.mock_engine else [])   # the cards /metrics reads
-    svc.gpu_index = svc.gpu_indices[0]
-    httpd = serve(svc, host=a.host, port=a.port)
-    svc.start_idle_unload()
-    svc.start_idle_sleep()
-    svc.on_loaded = lambda: announce()
+    from serve.totals import totals_path_of, totals_path_for_model, totals_reset_file
+    pricing_cli = getattr(a, "pricing_cli", set())
+    for s in services:
+        s.cost_input_per_million = a.cost_in
+        s.cost_output_per_million = a.cost_out
+        s.cost_cache_write_per_million = a.cost_cache_write
+        s.cost_cache_hit_per_million = a.cost_cache_hit
+    totals_owner: dict[str, str] = {}
+    for s in services:
+        tp = totals_path_of(a.totals_file, a.config)
+        if tp and multi:
+            tp = totals_path_for_model(tp, s.model)
+            if tp in totals_owner:
+                raise SystemExit(f"error: models {totals_owner[tp]!r} and {s.model!r} would share the totals file {tp}; "
+                                 "rename one of them")
+            totals_owner[tp] = s.model
+        if tp:
+            if a.totals_reset:
+                prev = totals_reset_file(tp)
+                if prev:
+                    print(tagged("totals", f"reset {s.model}, previous saved to {prev}"), flush=True)
+            s.totals_path = tp
+            s.load_totals(pricing_cli)
+    httpd = serve(router, host=a.host, port=a.port)
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
 
-    first_load = [True]
+    def announcer(s: Service, m):
+        first_load, said_video = [True], [False]
 
-    def announce():
-        """After every weights load: the slot table once, then the weights line (no URL)."""
-        if first_load[0]:
-            first_load[0] = False
-            if not a.mock_engine:
-                warn_tight_ram(engine.info.get("arena_mib"))
-            if getattr(engine, "batch", 0):
-                print(tagged("slots", f"par={engine.batch} ctx/slot={engine.max_context}"
-                             + (" (slot-full-context)" if a.slot_full_context else "") + ", others queue"), flush=True)
-        print(tagged("weights", f"loaded, ctx={engine.max_context} images={'on' if vision else 'off'}"), flush=True)
+        def announce():
+            """After every weights load: the slot table once, then the weights line (no URL)."""
+            engine = s.engine
+            if first_load[0]:
+                first_load[0] = False
+                if not a.mock_engine:
+                    warn_tight_ram(engine.info.get("arena_mib"))
+                if getattr(engine, "batch", 0):
+                    shared = None if m.slot_full_context else getattr(m, "shared_context", None)
+                    print(tagged("slots", slots_text(engine.batch, engine.max_context, shared) + ", others queue"),
+                          flush=True)
+            print(tagged("weights", f"loaded{f' {s.model}' if multi else ''}, ctx={engine.max_context} "
+                                    f"images={'on' if s.vision else 'off'}"), flush=True)
+            # with image input on, whether video works too: the encoder's own word (FFmpeg found or not), once
+            video = s.vision.video_state() if s.vision is not None and hasattr(s.vision, "video_state") else None
+            if video and not said_video[0]:
+                said_video[0] = True
+                state, _, why = video.partition(" ")
+                print(tagged("video", f"{state}, {why}" if s.dialect.video_pad else "off, this model reads no video"),
+                      flush=True)
+        return announce
+
+    if router.cache is not None:
+        router.start_guard()
+    for s, m in zip(services, (x[0] for x in settings)):
+        s.start_idle_unload()
+        s.start_idle_sleep(announce=not shared_sleep, name=s.model if multi else None)
+        s.on_loaded = announcer(s, m)
 
     # the one place the addresses and the APIs are printed: the server listens before the model loads
     print(tagged("ready", f"http://{here}:{a.port}/v1  openai+anthropic  stats http://{here}:{a.port}/"
                  + (" api-key=on" if svc.api_key else "")), flush=True)
     if a.mock_engine:
-        announce()
+        for s in services:
+            s.on_loaded()
     if a.host not in LOOPBACK_NAMES:
         # reachable from other devices: print the addresses
         ips = lan_addresses()
@@ -262,13 +520,17 @@ def main() -> int:
             print(tagged("network", f"port={a.port}"), flush=True)
         if exposed_without_key(a.host, svc.api_key):
             print(tagged("warning", "no api key, open to the network (--api-key KEY)"), flush=True)
-    if not a.mock_engine and not lazy:
-        svc.start_load()                                # the page and the API are up; requests wait for the load
+    if not a.mock_engine and not a.lazy:
+        if multi:
+            router.preload(svc)                         # the first entry; a failed load leaves the others servable
+        else:
+            svc.start_load()                            # the page and the API are up; requests wait for the load
     if a.open:
-        import webbrowser
-        webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
+        open_when_ready(svc, f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/",
+                        now=bool(a.mock_engine or a.lazy))
     # SIGTERM takes Ctrl+C's path (QUIT to the engine) so a container stop does not orphan it
     def on_sigterm(signum, frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)   # one stop: a later TERM must not cut the engine's QUIT short
         raise KeyboardInterrupt
     try:
         signal.signal(signal.SIGTERM, on_sigterm)
@@ -285,13 +547,16 @@ def main() -> int:
     except KeyboardInterrupt:
         if not rc:
             print("[server] stopping (Ctrl+C again to force)", flush=True)
-        closers = [svc.stop, httpd.shutdown, getattr(engine, "close", None), vision.close if vision else None]
+        closers = [router.stop, httpd.shutdown]
+        for s in services:
+            closers += [getattr(s.engine, "close", None), s.vision.close if s.vision else None]
         for close in filter(None, closers):
             try:
                 close()
             except KeyboardInterrupt:                   # second Ctrl+C: do not wait for the engine
-                if getattr(engine, "proc", None):
-                    engine.proc.kill()
+                for s in services:
+                    if getattr(s.engine, "proc", None):
+                        s.engine.proc.kill()
         print("[server] stopped", flush=True)
     return rc
 

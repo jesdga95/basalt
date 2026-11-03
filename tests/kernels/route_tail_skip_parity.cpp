@@ -2,16 +2,16 @@
 //
 //     build/route_tail_skip_parity [--bench]
 //
-// Random windows of 1..kVerifyMaxT tokens x 10 routed experts (the model's geometry: 512 experts, distinct within a
-// token, shared between tokens), random residency on 1..4 tables, ranks 1..9, weights sorted as the router leaves them
-// and shuffled. An entry must be dropped (id -1, weight 0) exactly when no table holds its expert and every entry
+// Random windows of 1..8 tokens at each MoE model's geometry (512 experts top 10, 384 top 6, 512 top 16: distinct within
+// a token, shared between tokens), random residency on 1..4 tables, ranks 1..k-1, weights sorted as the router leaves
+// them and shuffled. An entry must be dropped (id -1, weight 0) exactly when no table holds its expert and every entry
 // naming it ranks R or lower by weight in its token; every other id and weight must be untouched, and the counters
 // must match the reference.
 //
 // --bench: one launch of the window kernel at the largest window, timed over many launches.
 #include <cstddef>
 
-#include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/kernels/route_lossy.hpp"
 
 #include <cuda_runtime.h>
 
@@ -28,13 +28,17 @@
 using namespace basalt::kernels;
 
 namespace {
-constexpr int kExperts = 512, kTop = 10;
+constexpr int kMaxExperts = 512, kMaxT = 8;
+struct Geometry {
+    int experts, top;
+};
+constexpr Geometry kGeometries[] = {{512, 10}, {384, 6}, {512, 16}};
 
 // the entry's rank by weight in its token: heavier entries first, equal weights in position order
-int weight_rank(const std::vector<float>& w, int i) {
-    const int base = i - i % kTop;
+int weight_rank(const std::vector<float>& w, int i, int top) {
+    const int base = i - i % top;
     int r = 0;
-    for (int j = 0; j < kTop; ++j) r += w[base + j] > w[i] || (w[base + j] == w[i] && base + j < i);
+    for (int j = 0; j < top; ++j) r += w[base + j] > w[i] || (w[base + j] == w[i] && base + j < i);
     return r;
 }
 }  // namespace
@@ -51,16 +55,17 @@ int main(int argc, char** argv) {
     int32_t *d_ids = nullptr, *d_tab[ResidentTabs::kMax] = {};
     float* d_w = nullptr;
     unsigned long long* d_cnt = nullptr;
-    cudaMalloc(&d_ids, kVerifyMaxT * kTop * 4);
-    cudaMalloc(&d_w, kVerifyMaxT * kTop * 4);
+    cudaMalloc(&d_ids, kRouteTailSkipMax * 4);
+    cudaMalloc(&d_w, kRouteTailSkipMax * 4);
     cudaMalloc(&d_cnt, 3 * 8);
-    for (auto& t : d_tab) cudaMalloc(&t, kExperts * 4);
+    for (auto& t : d_tab) cudaMalloc(&t, kMaxExperts * 4);
     cudaMemset(d_cnt, 0, 3 * 8);
     long bad = 0, dropped = 0, total = 0, missed = 0;
-    for (int it = 0; it < 4000; ++it) {
-        const int nt = 1 + (int) (rng() % kVerifyMaxT), n = nt * kTop, R = 1 + (int) (rng() % 9);
+    for (int it = 0; it < 6000; ++it) {
+        const int kExperts = kGeometries[it % 3].experts, kTop = kGeometries[it % 3].top;
+        const int nt = 1 + (int) (rng() % kMaxT), n = nt * kTop, R = 1 + (int) (rng() % (kTop - 1));
         const int ntab = 1 + (int) (rng() % ResidentTabs::kMax);
-        const int pool = 12 + (int) (rng() % 60);   // a small pool of experts so the tokens share them
+        const int pool = kTop + 2 + (int) (rng() % 60);   // a small pool of experts so the tokens share them
         std::vector<std::vector<int32_t>> tab(ntab, std::vector<int32_t>(kExperts));
         for (auto& t : tab)
             for (int e = 0; e < kExperts; ++e) t[e] = rng() % (3 + ntab) == 0 ? e : -1;
@@ -88,7 +93,7 @@ int main(int argc, char** argv) {
             if (held) continue;
             ++want_miss;
             bool keep = false;
-            for (int j = 0; j < n && !keep; ++j) keep = ids[j] == e && weight_rank(w, j) < R;
+            for (int j = 0; j < n && !keep; ++j) keep = ids[j] == e && weight_rank(w, j, kTop) < R;
             if (!keep) { want[i] = -1; wantw[i] = 0.0f; ++want_drop; }
         }
         ResidentTabs held;
@@ -117,26 +122,27 @@ int main(int argc, char** argv) {
     if (bench) {
         ResidentTabs held;
         for (auto* t : d_tab) held.add(t);
-        std::vector<int32_t> ids(kVerifyMaxT * kTop);
-        std::vector<float> w(kVerifyMaxT * kTop, 0.1f);
-        for (size_t i = 0; i < ids.size(); ++i) ids[i] = (int32_t) (rng() % kExperts);
+        constexpr int kTop = 16;
+        std::vector<int32_t> ids(kMaxT * kTop);
+        std::vector<float> w(kMaxT * kTop, 0.1f);
+        for (size_t i = 0; i < ids.size(); ++i) ids[i] = (int32_t) (rng() % kMaxExperts);
         cudaMemcpy(d_ids, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(d_w, w.data(), w.size() * 4, cudaMemcpyHostToDevice);
         cudaStream_t s;
         cudaStreamCreate(&s);
         constexpr int kRuns = 2000;
-        for (int i = 0; i < 100; ++i) route_tail_skip(d_ids, d_w, held, kVerifyMaxT * kTop, kTop, 7, kExperts, d_cnt, s);
+        for (int i = 0; i < 100; ++i) route_tail_skip(d_ids, d_w, held, kMaxT * kTop, kTop, 7, kMaxExperts, d_cnt, s);
         cudaStreamSynchronize(s);
         cudaEvent_t a, b;
         cudaEventCreate(&a);
         cudaEventCreate(&b);
         cudaEventRecord(a, s);
-        for (int i = 0; i < kRuns; ++i) route_tail_skip(d_ids, d_w, held, kVerifyMaxT * kTop, kTop, 7, kExperts, d_cnt, s);
+        for (int i = 0; i < kRuns; ++i) route_tail_skip(d_ids, d_w, held, kMaxT * kTop, kTop, 7, kMaxExperts, d_cnt, s);
         cudaEventRecord(b, s);
         cudaEventSynchronize(b);
         float ms = 0;
         cudaEventElapsedTime(&ms, a, b);
-        std::printf("route_tail_skip_parity: bench %d-token window, 4 tables: %.2f us per launch\n", kVerifyMaxT, 1000.0 * ms / kRuns);
+        std::printf("route_tail_skip_parity: bench %d-token window, top 16, 4 tables: %.2f us per launch\n", kMaxT, 1000.0 * ms / kRuns);
     }
     return bad == 0 && dropped > 0 ? 0 : 1;
 }

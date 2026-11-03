@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <map>
+#include <set>
 #include <mutex>
 #include <new>
 #include <type_traits>
@@ -18,14 +20,25 @@
 
 namespace basalt::core {
 
+/// Page-locks a block of host memory (and releases it); supplied by the code that owns the GPU runtime, so this header
+/// stays free of it.  `pin` returns false when the block cannot be locked: it is then used as ordinary memory.
+struct HostPin {
+    bool (*pin)(void* p, size_t bytes);
+    void (*unpin)(void* p);
+};
+
 /// Byte storage for a checkpoint's running state.  Large blocks go back to a small shared pool instead of the OS and
 /// are handed out again without being zeroed: a fresh block of this size costs more in page faults and zero-fill
-/// than the device copy into it, and a checkpoint is saved on the request path.
+/// than the device copy into it, and a checkpoint is saved on the request path.  A server reserves the blocks its
+/// checkpoints take at their most before its RAM tier is sized, and the pool keeps that many through a RAM shed.
+/// Reserved blocks are page-locked when a `HostPin` is given, so the copies between them and the device run at link
+/// speed and can be asynchronous; they are handed out first.
 template <class T>
 struct PooledAlloc {
     using value_type = T;
     static constexpr size_t kMinBytes = size_t(1) << 20;   // smaller blocks are not worth pooling
-    static constexpr size_t kMaxBlocks = 4;                // blocks kept; the rest are freed
+    static constexpr size_t kMaxBlocks = 4;                // blocks kept beyond the reserved ones; the rest are freed
+    static constexpr size_t kAlign = 4096;                 // large blocks start on a page: a lock covers only them
     PooledAlloc() = default;
     template <class U>
     PooledAlloc(const PooledAlloc<U>&) noexcept {}
@@ -34,42 +47,90 @@ struct PooledAlloc {
         if (bytes >= kMinBytes) {
             Pool& p = pool();
             std::lock_guard<std::mutex> lk(p.mu);
-            for (size_t i = 0; i < p.blocks.size(); ++i)
-                if (p.blocks[i].second == bytes) {
-                    T* r = static_cast<T*>(p.blocks[i].first);
-                    p.blocks.erase(p.blocks.begin() + (std::ptrdiff_t) i);
-                    return r;
-                }
+            size_t at = p.blocks.size();   // a locked block of this size first, else any
+            for (size_t i = 0; i < p.blocks.size(); ++i) {
+                if (p.blocks[i].bytes != bytes) continue;
+                if (p.locked.count(p.blocks[i].ptr) > 0) { at = i; break; }
+                if (at == p.blocks.size()) at = i;
+            }
+            if (at < p.blocks.size()) {
+                T* r = static_cast<T*>(p.blocks[at].ptr);
+                p.blocks.erase(p.blocks.begin() + (std::ptrdiff_t) at);
+                return r;
+            }
+            return static_cast<T*>(::operator new(bytes, std::align_val_t(kAlign)));
         }
         return static_cast<T*>(::operator new(bytes));
     }
     void deallocate(T* ptr, size_t n) noexcept {
         const size_t bytes = n * sizeof(T);
-        if (bytes >= kMinBytes) {
-            Pool& p = pool();
-            std::lock_guard<std::mutex> lk(p.mu);
-            if (p.blocks.size() < kMaxBlocks) {
-                p.blocks.emplace_back(ptr, bytes);
-                return;
-            }
+        if (bytes < kMinBytes) {
+            ::operator delete(ptr);
+            return;
         }
-        ::operator delete(ptr);
+        Pool& p = pool();
+        std::lock_guard<std::mutex> lk(p.mu);
+        size_t kept = 0;   // the blocks kept beyond the reserved ones
+        for (const Block& b : p.blocks) kept += p.reserved.count(b.ptr) == 0;
+        if (p.reserved.count(ptr) > 0 || kept < kMaxBlocks) {
+            p.blocks.push_back({ptr, bytes});
+            return;
+        }
+        drop(p, ptr);
     }
     template <class U>
     void construct(U* p) noexcept { ::new (static_cast<void*>(p)) U; }   // resize leaves new bytes as they are
     template <class U, class... A>
     void construct(U* p, A&&... a) { ::new (static_cast<void*>(p)) U(std::forward<A>(a)...); }
-    /// Frees the blocks the pool keeps; returns their bytes.
+    /// Allocates `count` blocks of `bytes` now, their pages written, for checkpoints to take.  False when they cannot
+    /// be allocated (none is kept then).  With `pin`, each block is page-locked before its pages are written; one the
+    /// driver refuses stays ordinary memory.
+    static bool reserve(size_t bytes, size_t count, const HostPin* pin = nullptr) {
+        if (bytes < kMinBytes || count == 0) return true;
+        std::vector<std::pair<void*, bool>> got;
+        for (size_t i = 0; i < count; ++i) {
+            void* b = ::operator new(bytes, std::align_val_t(kAlign), std::nothrow);
+            if (b == nullptr) {
+                for (auto& x : got) {
+                    if (x.second) pin->unpin(x.first);
+                    ::operator delete(x.first, std::align_val_t(kAlign));
+                }
+                return false;
+            }
+            const bool locked = pin != nullptr && pin->pin(b, bytes);
+            std::memset(b, 0, bytes);
+            got.emplace_back(b, locked);
+        }
+        Pool& p = pool();
+        std::lock_guard<std::mutex> lk(p.mu);
+        for (auto& x : got) {
+            p.blocks.push_back({x.first, bytes});
+            p.reserved.insert(x.first);
+            if (x.second) {
+                p.locked.emplace(x.first, std::make_pair(pin, bytes));
+                p.locked_total += bytes;
+            }
+        }
+        return true;
+    }
+    /// Frees the blocks the pool keeps beyond the reserved ones; returns their bytes.
     static size_t release_pooled() {
         Pool& p = pool();
         std::lock_guard<std::mutex> lk(p.mu);
         size_t n = 0;
-        for (const auto& b : p.blocks) {
-            n += b.second;
-            ::operator delete(b.first);
+        for (size_t i = p.blocks.size(); i-- > 0;) {
+            if (p.reserved.count(p.blocks[i].ptr) > 0) continue;
+            n += p.blocks[i].bytes;
+            drop(p, p.blocks[i].ptr);
+            p.blocks.erase(p.blocks.begin() + (std::ptrdiff_t) i);
         }
-        p.blocks.clear();
         return n;
+    }
+    /// The bytes of the blocks page-locked now, in the pool or held by checkpoints.
+    static size_t locked_bytes() {
+        Pool& p = pool();
+        std::lock_guard<std::mutex> lk(p.mu);
+        return p.locked_total;
     }
     template <class U>
     bool operator==(const PooledAlloc<U>&) const noexcept { return true; }
@@ -77,10 +138,25 @@ struct PooledAlloc {
     bool operator!=(const PooledAlloc<U>&) const noexcept { return false; }
 
 private:
+    struct Block {
+        void* ptr;
+        size_t bytes;
+    };
     struct Pool {
         std::mutex mu;
-        std::vector<std::pair<void*, size_t>> blocks;
+        std::vector<Block> blocks;
+        std::map<void*, std::pair<const HostPin*, size_t>> locked;   // every page-locked block, in the pool or out
+        size_t locked_total = 0;
+        std::set<void*> reserved;   // the blocks reserved for checkpoints: always kept, never freed
     };
+    static void drop(Pool& p, void* ptr) {
+        if (auto it = p.locked.find(ptr); it != p.locked.end()) {
+            it->second.first->unpin(ptr);
+            p.locked_total -= it->second.second;
+            p.locked.erase(it);
+        }
+        ::operator delete(ptr, std::align_val_t(kAlign));
+    }
     static Pool& pool() {
         static Pool* p = new Pool;   // never destroyed: checkpoints may outlive static destruction
         return *p;
@@ -100,7 +176,8 @@ struct ConversationCheckpoint {
     Source source = kTurnEnd;
     std::vector<int32_t> ids;
     std::vector<ConversationImageKey> imgs;
-    CheckpointBytes gdn, ple, tails, dead, block_pos;
+    /// The model's running state, its parts as the model names them.
+    CheckpointBytes state_a, state_b, state_c, state_d, state_e;
     uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
     // Ordinary layer-split checkpoints retain each device's running state.
     // Whole-session parking is currently single-GPU and rejects these parts.
@@ -108,7 +185,7 @@ struct ConversationCheckpoint {
 
     size_t bytes() const {
         size_t n = ids.capacity() * sizeof(int32_t) + imgs.capacity() * sizeof(ConversationImageKey) +
-               gdn.capacity() + ple.capacity() + tails.capacity() + dead.capacity() + block_pos.capacity() +
+               state_a.capacity() + state_b.capacity() + state_c.capacity() + state_d.capacity() + state_e.capacity() +
                stage_parts.capacity() * sizeof(ConversationCheckpoint);
         for (const auto& part : stage_parts) n += part.bytes();
         return n;

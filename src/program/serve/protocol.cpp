@@ -1,5 +1,9 @@
 // src/program/serve/protocol.cpp - protocol operations for the persistent engine.
+#include "basalt/core/gpu_mem_info.hpp"
+#include "basalt/protocol.hpp"
 #include "state.hpp"
+#include "basalt_git.h"
+#include "basalt/platform/cpu.hpp"
 
 namespace basalt::program::serve {
 
@@ -61,6 +65,12 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
     }
 }
 
+void Runtime::report_conversations(long long restored, double restored_ms) {
+    if (!conversations) return;
+    basalt::protocol::emit_text(basalt::protocol::conversation_line(conversations->size(), conversations->bytes(),
+                                                                    conversations->evictions(), restored, restored_ms));
+}
+
 bool Runtime::next_line(std::string& out) {
     std::unique_lock<std::mutex> lk(in_mu);
     in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
@@ -98,7 +108,7 @@ bool Runtime::try_next_line(std::string& out) {
 
 int Runtime::init_protocol() {
 
-    text_tokenizer_note = "this pack has no qwen35 tokenizer tables";
+    text_tokenizer_note = "this pack has no tokenizer tables this engine can read";
     {
         std::vector<uint8_t> vj, mj, tj, cj;
         std::string terr;
@@ -106,7 +116,9 @@ int Runtime::init_protocol() {
             basalt::core::read_range(model_file.range("tokenizer/merges.txt"), mj, terr) &&
             basalt::core::read_range(model_file.range("tokenizer/token_type.json"), tj, terr) &&
             basalt::core::read_range(model_file.range("tokenizer/tokenizer.json"), cj, terr) &&
-            std::string_view((const char*) cj.data(), cj.size()).find("\"pre\": \"qwen35\"") != std::string_view::npos) {
+            std::string_view((const char*) cj.data(), cj.size()).find("\"pre\": \"" + std::string(pre_.name) + "\"") != std::string_view::npos) {
+            text_tokenizer.set_pretokenize(pre_.split);
+            text_tokenizer.set_ignore_merges(pre_.ignore_merges);
             if (text_tokenizer.load(std::string_view((const char*) vj.data(), vj.size()),
                                     std::string_view((const char*) mj.data(), mj.size()),
                                     std::string_view((const char*) tj.data(), tj.size()), terr))
@@ -123,12 +135,20 @@ int Runtime::init_protocol() {
     in_eof = false;
     // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
     // away, or pressed Esc): the flag is checked between prompt chunks and between verify windows.
-    std::thread([&] {
+    reader_stop_.store(false);
+    reader_ = std::thread([&] {
         // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
         // stdin's lock, which getline holds while it waits for input - an engine ending on an error (every
         // std::exit) would hang in exit(), and the server would wait for it forever
         std::string l, buf;
         char chunk[4096];
+        // the next bytes of stdin, waited for in slices so that the runtime's end stops this thread before its state
+        // goes; -2 when it has
+        auto read_some = [&]() -> std::ptrdiff_t {
+            while (!basalt::platform::pipe_wait_readable(0, 100))
+                if (reader_stop_.load()) return -2;
+            return (std::ptrdiff_t) basalt::platform::pipe_read(0, chunk, sizeof chunk);
+        };
         auto getline_fd = [&](std::string& out) -> bool {
             for (;;) {
                 const size_t nlpos = buf.find('\n');
@@ -137,7 +157,8 @@ int Runtime::init_protocol() {
                     buf.erase(0, nlpos + 1);
                     return true;
                 }
-                const std::ptrdiff_t n = (std::ptrdiff_t) basalt::platform::pipe_read(0, chunk, sizeof chunk);
+                const std::ptrdiff_t n = read_some();
+                if (n == -2) return false;
                 if (n < 0 && errno == EINTR) continue;
                 if (n <= 0) {
                     if (buf.empty()) return false;
@@ -151,7 +172,7 @@ int Runtime::init_protocol() {
         // exactly n raw bytes: what the line reader already holds, then the pipe
         auto read_exact = [&](size_t n, std::string& out) -> bool {
             while (buf.size() < n) {
-                const std::ptrdiff_t got = (std::ptrdiff_t) basalt::platform::pipe_read(0, chunk, sizeof chunk);
+                const std::ptrdiff_t got = read_some();
                 if (got < 0 && errno == EINTR) continue;
                 if (got <= 0) return false;
                 buf.append(chunk, (size_t) got);
@@ -160,6 +181,8 @@ int Runtime::init_protocol() {
             buf.erase(0, n);
             return true;
         };
+        // PROMPT <nbytes> [plain=a:b,...] + nbytes of text: the same, held by handle and answered at once "PROMPT
+        // <handle> <n>" (or "PROMPT ERR <why>"); the main loop never sees it.  PROMPTI [img] <ids> likewise.
         // GENT/SGENT/BGENT <...> <max_new> [k=v ...] <nbytes> [plain=a:b,...] + nbytes of UTF-8: tokenize here and hand
         // the main loop the matching GEN/SGEN/BGEN line, with "@<seq>" where the ids would be.  False: the input ends
         // inside the payload.
@@ -169,8 +192,8 @@ int Runtime::init_protocol() {
                 std::istringstream is(head_line);
                 for (std::string w; is >> w;) tk.push_back(w);
             }
-            const size_t lead = tk[0] == "GENT" ? 2 : 3;   // the command, [the slot,] max_new
-            std::string head = tk[0].substr(0, tk[0].size() - 1);
+            const size_t lead = tk[0] == "PROMPT" ? 1 : tk[0] == "GENT" ? 2 : 3;   // the command, [the slot,] max_new
+            std::string head = tk[0] == "PROMPT" ? tk[0] : tk[0].substr(0, tk[0].size() - 1);
             long long nbytes = -1;
             std::string plain_text;
             for (size_t i = 1; i < tk.size(); ++i) {
@@ -200,6 +223,14 @@ int Runtime::init_protocol() {
             std::vector<int32_t> tids;
             std::string terr;
             if (!text_tokenizer.encode(payload, true, spans, tids, terr)) { line_out = "ERR_GENT tokenizer: " + terr; return true; }
+            if (tk[0] == "PROMPT") {
+                const size_t n = tids.size();
+                const uint64_t handle = hold_prompt({std::move(tids), false});
+                std::printf("PROMPT %llu %zu\n", (unsigned long long) handle, n);
+                std::fflush(stdout);
+                line_out.clear();
+                return true;
+            }
             std::lock_guard<std::mutex> lk(gent_mu);
             const uint64_t seq = ++gent_seq;
             gent_ids[seq] = std::move(tids);
@@ -210,9 +241,24 @@ int Runtime::init_protocol() {
         while (getline_fd(l)) {
             if (!l.empty() && l.back() == '\r') l.pop_back();
             if (l == "STOP") { stop_req.store(true); continue; }
-            if (l.rfind("GENT ", 0) == 0 || l.rfind("SGENT ", 0) == 0 || l.rfind("BGENT ", 0) == 0) {
+            if (l.rfind("PROMPTI", 0) == 0) {
+                take_prompt_ids(l);
+                continue;
+            }
+            if (l.rfind("GENT ", 0) == 0 || l.rfind("SGENT ", 0) == 0 || l.rfind("BGENT ", 0) == 0 ||
+                l.rfind("PROMPT ", 0) == 0) {
+                const bool prompt = l.rfind("PROMPT ", 0) == 0;
                 std::string rewritten;
                 const bool framed = take_text(l, rewritten);
+                if (prompt && !rewritten.empty()) {   // refused: said at once, like the answer
+                    std::printf("PROMPT ERR %s\n", rewritten.rfind("ERR_GENT ", 0) == 0 ? rewritten.c_str() + 9 : rewritten.c_str());
+                    std::fflush(stdout);
+                    rewritten.clear();
+                }
+                if (prompt) {
+                    if (!framed) break;
+                    continue;
+                }
                 l = rewritten;
                 if (!framed) {   // the input ended inside the payload: report it
                     std::lock_guard<std::mutex> lk(in_mu);
@@ -230,18 +276,18 @@ int Runtime::init_protocol() {
         std::lock_guard<std::mutex> lk(in_mu);
         in_eof = true;
         in_cv.notify_one();
-    }).detach();
+    });
 
     // a request also stops when the RAM guard judges the RAM critical; `ram_stop` keeps that it did, so the request
     // ends on an error instead of a cancel
     ram_stop.store(false);
 
-    sp.should_stop = [&] { return halted(); };
+    after_input_start();
     {
         // what is left once everything is allocated: a GPU filled to the brim may not fail but page, and a page-in
         // while the verify graph spins on a host flag stalls the request for good
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         const int64_t free_mib = (int64_t) (free_b >> 20);
         if (free_mib >= vram_floor_mib()) {
             basalt::log::info("basalt serve", "%lld MiB of VRAM free with everything loaded", (long long) free_mib);
@@ -254,64 +300,33 @@ int Runtime::init_protocol() {
 }
 
 int Runtime::announce() {
-    // what the server's Monitor tab shows (the server skips unknown lines until READY)
+    print_info();
     {
-        size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
-        // "Experts in VRAM" is every tier, not one card's.  The tiers are disjoint by construction
-        // (remote_experts.cpp skips any pair a stage already claimed), so they add.
-        const int64_t slots_primary = (int64_t) xcache.slots();
-        const int64_t mib_primary = (int64_t) (xcache.bytes() >> 20);
-        int64_t slots_all = slots_primary, mib_all = mib_primary;
-        for (const auto& st : stages) {
-            slots_all += (int64_t) st->cache.slots();
-            mib_all += (int64_t) (st->cache.bytes() >> 20);
-        }
-        for (int r = 0; r < 3; ++r)
-            if (o.expert_cache_remote[(size_t) r] > 0) {
-                slots_all += remote_experts[(size_t) r].resident();
-                mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
-            }
-        // the pack's quantization label (the last word of its name, without the publisher's prefixes) and the PCI
-        // bus ids of the cards this engine computes on, primary first: what a benchmark row records
-        std::string quant_label, gpu_ids;
-        {
-            const basalt::core::Json* nm = model_file.meta().get("name");
-            std::string nmv = nm != nullptr && nm->is_string() ? nm->s : std::string();
-            quant_label = nmv.substr(nmv.rfind(' ') == std::string::npos ? 0 : nmv.rfind(' ') + 1);
-            for (const char* pre : {"NVIDIA-", "UD-"})
-                if (quant_label.rfind(pre, 0) == 0) quant_label.erase(0, std::strlen(pre));
-            if (quant_label.empty()) quant_label = "unknown";
-            for (int d : basalt::program::engine_gpu_order(o.peer_device, o.peer_devices,
-                                                           multi_gpu ? split_devs : std::vector<int>())) {
-                char bus[32] = {};
-                if (cudaDeviceGetPCIBusId(bus, sizeof bus, d) == cudaSuccess)
-                    gpu_ids += (gpu_ids.empty() ? "" : ",") + std::string(bus);
-            }
-        }
-        std::printf("INFO logit_bias=%lld context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
-                    "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
-                    "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
-                    "conversation_cache_mib=%lld conversation_cache_slots=%d "
-                    "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%d tail_role_token=%lld vram_elastic=%d%s quant=%s gpus=%s engine=" BASALT_VERSION "\n",
-                    (long long) n_vocab, (long long) o.max_context, o.kv.c_str(),
-                    (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
-                                     ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
-                    (long long) slots_all, (long long) mib_all,
-                    (long long) slots_primary, (long long) mib_primary,
-                    o.spec, o.mtp_max_t,
-                    o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
-                    (long long) ((o.mmap_experts ? src.resident_bytes() : basalt::kernels::cpu::expert_layout().total) >> 20),
-                    pool.workers(), o.pcie_frac,
-                    (long long) o.conversation_cache_mib, o.conversation_cache_slots,
-                    (long long) o.conversation_cache_min_free_mib, o.conversation_cache_min_tokens, (long long) o.tail_role_token, o.vram_elastic && xcache.segmented() ? 1 : 0,
-                    o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
-                                   " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                   " slot0_solo=" + std::to_string(slot0_is_solo ? 1 : 0) +
-                                   " solo_any_slot=" + std::to_string(slot0_is_solo ? 1 : 0)).c_str() : "",
-                    quant_label.c_str(), gpu_ids.c_str());
+        std::string ends;
+        for (const int64_t id : o.eos_ids) ends += (ends.empty() ? "" : ",") + std::to_string((long long) id);
+        std::printf("INFO eos_ids=%s\n", ends.c_str());
     }
     if (text_tokenizer_note.empty()) std::printf("INFO text_prompt=1\n");
+    {   // the build's commit, and the processors that share each L3 cache (the console's load per CCD)
+        std::string l3;
+        for (const std::vector<int>& g : basalt::platform::cpu_l3_groups()) {
+            std::string part;
+            for (size_t i = 0; i < g.size(); ++i) {
+                size_t j = i;
+                while (j + 1 < g.size() && g[j + 1] == g[j] + 1) ++j;
+                part += (part.empty() ? "" : ",") + std::to_string(g[i]) + (j > i ? "-" + std::to_string(g[j]) : "");
+                i = j;
+            }
+            l3 += (l3.empty() ? "" : ";") + part;
+        }
+        std::printf("INFO commit=%s%s%s%s\n", BASALT_BENCH_GIT, BASALT_BENCH_DIRTY ? "-dirty" : "",
+                    l3.empty() ? "" : " cpu_l3=", l3.c_str());
+    }
+    if (!o.lossy.empty()) {   // the flags that change the output, for a client that labels what it measures
+        std::string flags;
+        for (const auto& f : o.lossy) flags += (flags.empty() ? "" : ",") + f.flag;
+        std::printf("INFO lossy=%s\n", flags.c_str());
+    }
     // a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on a flag nobody
     // will raise - end the engine with where it was, so the server starts it again instead of the GPU spinning
     // forever.  Before it does, it reports what every part was doing (stall_report), so one occurrence says where

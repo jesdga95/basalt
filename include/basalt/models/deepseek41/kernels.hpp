@@ -1,0 +1,73 @@
+// include/basalt/models/deepseek41/kernels.hpp - the DeepSeek-V4.1 decode kernels: router, row norms, Engram.
+//
+// All activations are fp32 and device pointers; a call takes T tokens (any T >= 1) and the result for a token does
+// not depend on T or on the token's place in the window. `stream` may be null (the call then synchronises).
+//
+// Hyper-connection streams are laid out [T][4][n_embd] (stream-major per token). The mixing coefficients of one
+// token are 24 floats: pre[4], post[4], comb[16] with comb[src*4 + dst].
+#pragma once
+
+#include "basalt/kernels/mhc.hpp"
+#include "basalt/kernels/router.hpp"
+#include "basalt/kernels/row_norm.hpp"
+
+#include <cstdint>
+#include <vector>
+
+namespace basalt::models::deepseek41 {
+
+// The hyper-connection kernels are shared (basalt/kernels/mhc.hpp).
+using kernels::HcArgs;
+using kernels::hc_mixes;
+using kernels::hc_mixes_workspace_floats;
+using kernels::hc_post;
+using kernels::hc_pre;
+using kernels::kHcCoef;
+using kernels::kHcMult;
+using kernels::kHcSplits;
+
+// ---- router ---------------------------------------------------------------------------------------------------
+
+// The router is shared (basalt/kernels/router.hpp); DeepSeek's gate is the default, sqrt-softplus, and its k is at most 8.
+using kernels::RouterArgs;
+using kernels::router;
+
+// ---- row norms ------------------------------------------------------------------------------------------------
+
+// The row norms are shared (basalt/kernels/row_norm.hpp).
+using kernels::hc_pre_rms_norm;
+using kernels::rms_norm_rows;
+
+// ---- Engram ---------------------------------------------------------------------------------------------------
+
+struct EngramArgs {
+    int n_embd = 5120;
+    float rms_eps = 1e-20f;
+};
+
+/// The post-op on the projected rows. kv[T][(4+1)*n_embd] is wkv . rows (key copies 0..3, then the value);
+/// gate_w[4][n_embd] is the per-copy gate weight (row c at c*n_embd). In place on x[T][4][n_embd]:
+///   dot_c = sum_d rms(x_c)[d] * rms(key_c)[d] * gate_w[c][d] / sqrt(n_embd)
+///   gate_c = sigmoid(copysign(sqrt(max(|dot_c|, 1e-6)), dot_c));  x_c += gate_c * value
+/// `keep` ([T], 1 for text tokens, 0 for embedding tokens) may be null.
+void engram_apply(const float* kv, const float* gate_w, const float* keep, int n_tokens, const EngramArgs& a,
+                  float* x, void* stream);
+
+/// Hash constants of the Engram row lookup (the pack's meta.engram and the GGUF's token map).
+struct EngramHashParams {
+    int n_gram = 4;                       ///< longest n-gram
+    int n_head = 8;                       ///< hash heads per n
+    int pad_token_id = 2;
+    std::vector<int32_t> token_map;       ///< token id -> compressed id (negative: dead)
+    std::vector<uint64_t> mult;           ///< [engram layer][n_gram]
+    std::vector<uint64_t> primes;         ///< [engram layer][n_cols]
+    std::vector<uint64_t> offsets;        ///< [engram layer][n_cols]
+    int n_cols() const { return (n_gram - 1) * n_head; }
+};
+
+/// Table row ids for engram layer slot `e` (host). tokens[n] sit at positions pos0..pos0+n-1; `prev` holds the
+/// n_gram-1 tokens before tokens[0], oldest first (null when pos0 == 0). out is [n][n_cols].
+void engram_hash(const EngramHashParams& p, int e, const int32_t* tokens, int n, int64_t pos0, const int32_t* prev,
+                 int32_t* out);
+
+}  // namespace basalt::models::deepseek41

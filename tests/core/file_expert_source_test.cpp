@@ -1,10 +1,12 @@
 #include "basalt/core/expert_source.hpp"
+#include "basalt/core/ram_load.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/platform/direct_file.hpp"
+#include "basalt/platform/memory.hpp"
 #include "basalt/platform/system.hpp"
 
 #include <cuda_runtime.h>
@@ -115,7 +117,7 @@ void test_native_variable_layout() {
                                   {layer0_bytes + (uint64_t) second_fmt.bytes, 'd'},
                                   {layer0_bytes + 2 * (uint64_t) second_fmt.bytes, 'f'}, {total - 1, 'z'}});
 
-    const bool layout_ok = expert_layout_load_text(layout_text.str(), layers, experts, err);
+    const bool layout_ok = expert_layout_load_text(layout_text.str(), layers, experts, err, 2560, 640);
     require(layout_ok, "could not load synthetic native layout: " + err);
     FileExpertSource source;
     bool opened = source.open(FileRange((dir.path / "experts.bin").string()), layers, experts, err);
@@ -136,34 +138,6 @@ void test_native_variable_layout() {
             "native bounds check accepted an invalid layer or expert");
     require(source.reads() == 4, "invalid native lookups changed the read count");
 
-    constexpr int count = 8;
-    const std::pair<int32_t, int32_t> pairs[count] = {
-        {1, 2}, {0, 1}, {1, 0}, {0, 0}, {1, 1}, {0, 2}, {0, 1}, {1, 2},
-    };
-    require(!source.read_blobs(pairs, count, [](int64_t, int, const uint8_t*, std::string& error) {
-        error = "consumer failure";
-        return false;
-    }, err) && err == "consumer failure", "bulk read lost the consumer error");
-    std::atomic<int> seen[count]{};
-    err.clear();
-    const bool bulk_ok = source.read_blobs(pairs, count, [&](int64_t i, int worker, const uint8_t* data,
-                                                           std::string& error) {
-        if (i < 0 || i >= count || worker < 0 || worker >= ExpertSource::kBlobReaders) {
-            error = "bulk read returned an invalid request or worker";
-            return false;
-        }
-        const auto [layer, expert] = pairs[i];
-        const uint64_t bytes = layer == 0 ? first_fmt.bytes : second_fmt.bytes;
-        const uint8_t* expected = first + (layer == 0 ? 0 : layer0_bytes) + expert * bytes;
-        if (seen[i].fetch_add(1) != 0 || std::memcmp(data, expected, (size_t) bytes) != 0) {
-            error = "bulk read duplicated a request or returned another expert";
-            return false;
-        }
-        return true;
-    }, err);
-    require(bulk_ok, "bulk read failed after a consumer rejection: " + err);
-    for (const auto& visits : seen) require(visits.load() == 1, "bulk read omitted a request");
-
     check_file_size_rejection(source, dir.path, layers, experts, total);
     create_experts(dir.path, total, {{layer0_bytes, 'c'}});
     err.clear();
@@ -172,75 +146,6 @@ void test_native_variable_layout() {
     const uint8_t* reopened = source.blob(1, 0);
     require(reopened && source.reads() == 1 && reopened[0] == 'c', "reopened native source kept stale state");
     source.close();
-}
-
-// Unbuffered bulk reads of blobs whose sizes and offsets are not multiples of the read alignment, with staging
-// buffers small enough to be carved from a shared pinned block that an odd-sized pinned allocation already uses.
-void test_direct_read_unaligned_geometry() {
-    using namespace basalt::core;
-    using namespace basalt::kernels::cpu;
-    constexpr int64_t layers = 2;
-    constexpr int64_t experts = 3;
-    constexpr int64_t embedding = 2560;
-    constexpr int64_t feed_forward = 640;
-    constexpr uint64_t section = 2ull << 20;
-    int devices = 0;
-    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
-        (void) cudaGetLastError();
-        std::cout << "file_expert_source_test: no CUDA device, unaligned direct reads not run\n";
-        return;
-    }
-    // the working directory, since a temporary file system may refuse unbuffered reads
-    TempDirectory dir(fs::current_path());
-    NativeFmt first_fmt, second_fmt;
-    std::string err;
-    require(native_fmt(GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ4_NL, embedding, feed_forward, first_fmt, err), err);
-    require(native_fmt(GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_NL, embedding, feed_forward, second_fmt, err), err);
-    constexpr uint64_t align = basalt::platform::DirectFile::alignment();
-    require(first_fmt.bytes % align != 0 && second_fmt.bytes % align != 0,
-            "the synthetic blobs do not exercise unaligned sizes");
-    const uint64_t layer0_bytes = (uint64_t) first_fmt.bytes * experts;
-    const uint64_t total = layer0_bytes + (uint64_t) second_fmt.bytes * experts;
-    std::vector<uint8_t> bytes((size_t) (section + total));
-    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = (uint8_t) ((i * 2654435761u) >> 13);
-    const fs::path file = dir.path / "experts.bin";
-    {
-        std::ofstream out(file, std::ios::binary | std::ios::trunc);
-        out.write((const char*) bytes.data(), (std::streamsize) bytes.size());
-        require((bool) out, "could not write the synthetic experts file");
-    }
-    std::ostringstream layout_text;
-    layout_text << "0 " << GGML_TYPE_IQ2_XXS << ' ' << GGML_TYPE_IQ4_NL << " 0 " << first_fmt.bytes << '\n';
-    layout_text << "1 " << GGML_TYPE_IQ2_XS << ' ' << GGML_TYPE_IQ4_NL << ' ' << layer0_bytes << ' '
-                << second_fmt.bytes << '\n';
-    require(expert_layout_load_text(layout_text.str(), layers, experts, err), err);
-    {
-        basalt::platform::DirectFile probe;
-        std::string probe_err;
-        if (!probe.open(file.string(), probe_err, 1))
-            std::cout << "file_expert_source_test: no unbuffered reads here, the mapped path is checked\n";
-    }
-    void* odd = nullptr;
-    require(cudaHostAlloc(&odd, 1000, cudaHostAllocPortable) == cudaSuccess, "cannot allocate pinned memory");
-    FileExpertSource source;
-    require(source.open(FileRange(file.string(), section, total), layers, experts, err), err);
-    const std::pair<int32_t, int32_t> pairs[] = {{1, 2}, {0, 1}, {1, 0}, {0, 0}, {1, 1}, {0, 2}};
-    constexpr int64_t count = (int64_t) (sizeof pairs / sizeof pairs[0]);
-    std::atomic<int> seen[count]{};
-    const bool ok = source.read_blobs(pairs, count, [&](int64_t i, int, const uint8_t* data, std::string& error) {
-        const auto [layer, expert] = pairs[i];
-        const uint64_t blob = layer == 0 ? first_fmt.bytes : second_fmt.bytes;
-        const uint64_t at = section + (layer == 0 ? 0 : layer0_bytes) + (uint64_t) expert * blob;
-        if (seen[i].fetch_add(1) != 0 || std::memcmp(data, bytes.data() + at, (size_t) blob) != 0) {
-            error = "an unaligned direct read returned the wrong bytes";
-            return false;
-        }
-        return true;
-    }, err);
-    source.close();
-    cudaFreeHost(odd);
-    require(ok, "bulk read of unaligned blobs failed: " + err);
-    for (const auto& visits : seen) require(visits.load() == 1, "bulk read of unaligned blobs omitted a request");
 }
 
 void test_complement_plan() {
@@ -284,40 +189,100 @@ void test_resident_lend_region() {
             "free places that do not fit must leave the whole budget to the lent slots");
     require(choose_resident_room(slots, 10, 100, 1, 0, fit) == 1 && !fit, "no free places asked for");
     require(choose_resident_keep_from({}, 0, 0, 0) == 0, "an empty cache");
+    // a RAM budget keeps the lend region only when it holds the whole complement
+    require(budget_lend_room(0, 10) == 0, "no budget");
+    require(budget_lend_room(9, 10) == 0, "a budget short of the complement kept the lend region");
+    require(budget_lend_room(10, 10) == 10, "a budget of exactly the complement must keep the lend region");
+    require(budget_lend_room(68, 39) == 68, "a budget above the complement must give the lend region its rest");
+    require(budget_lend_room(17, 10) - 10 == 7, "the lend region's room is what the budget has after the complement");
+    // the caller asks with the complement plus the adaptive swaps' free places (#342, #366): a budget that holds the
+    // experts but not the places keeps no lend region, so the places stay; one that holds both keeps it
+    constexpr uint64_t experts = 3779, places = 75;   // 37.79 GiB and 749 MiB, in 10 MiB
+    require(budget_lend_room(3700, experts + places) == 0, "a budget short of the experts kept the lend region");
+    require(budget_lend_room(3800, experts + places) == 0, "a budget between the experts and the places kept the lend region");
+    require(budget_lend_room(experts + places - 1, experts + places) == 0, "a budget one short of the places kept it");
+    require(budget_lend_room(experts + places, experts + places) == experts + places, "a budget holding both must keep it");
+    require(budget_lend_room(3900, experts + places) == 3900, "a budget above both must give the lend region its rest");
 }
 
-void test_resident_room() {
-    using namespace basalt::core::detail;
+// A 62 GiB machine with swap, one card, a third of the experts left in the file (issue #285): the tier leaves the OS
+// file cache its floor beside the reserve, so the experts read from the file and the rest of the system keep their RAM.
+void test_file_cache_keep() {
+    using basalt::core::FileCache;
+    using basalt::core::file_cache_floor;
+    using basalt::core::file_cache_keep;
+    using basalt::core::kMinFileCacheBytes;
+    using basalt::core::ram_tier_room;
+    constexpr uint64_t kGiB = 1ull << 30;
+    const FileCache flash{(uint64_t) (1.6 * kGiB), 3584ull << 20};   // a layer's experts, one prompt chunk's reads
+    const uint64_t avail = 55 * kGiB, reserve = 2 * kGiB, want = 67 * kGiB;
+    const uint64_t keep = file_cache_keep(avail, reserve, true, want, flash);
+    const uint64_t room = ram_tier_room(avail, reserve + keep, true);
+    require(room < want, "a third of the experts stay in the file");
+    require(keep >= kMinFileCacheBytes && keep >= flash.prompt_file_bytes, "the file cache keeps a prompt chunk's reads");
+    require(file_cache_floor(want - room, want, flash) <= keep, "the floor for what is left in the file is kept");
+    require(keep < 6 * kGiB, "the floor is a prompt chunk and two layers' file share, not more");
+    // all of it fits: nothing is read from the file, nothing is kept
+    require(file_cache_keep(avail, reserve, true, 40 * kGiB, flash) == 0, "a tier that holds every expert keeps no cache");
+    require(file_cache_floor(0, want, flash) == 0, "no file reads, no floor");
+    // small layers and no prompt reads: the minimum
+    require(file_cache_keep(avail, reserve, false, want, FileCache{kGiB / 4, 0}) == kMinFileCacheBytes,
+            "the file cache keeps at least its minimum");
+    // everything in the file (no RAM above the reserve): the whole largest layer twice and a chunk
+    require(file_cache_floor(want, want, FileCache{4 * kGiB, kGiB}) == 9 * kGiB + 2, "two whole layers and a chunk");
+}
+
+void test_plan_reserve() {
+    using basalt::core::kPostPlanHostBytes;
+    using basalt::core::plan_reserve;
+    using basalt::core::ram_tier_room;
+    constexpr uint64_t kGiB = 1ull << 30;
+    require(plan_reserve(2 * kGiB) == 2 * kGiB + kPostPlanHostBytes, "the plan leaves the reserve and the late allowance");
+    require(plan_reserve(0) == 0, "a guard that is off leaves nothing");
+    // a tier sized against plan_reserve() still has the guard's line free after the engine takes its late memory, where one
+    // sized against the reserve alone ends on it (#339)
+    const uint64_t avail = 55 * kGiB, reserve = 2 * kGiB;
+    const uint64_t on_line = avail - ram_tier_room(avail, reserve, false);
+    const uint64_t with_allowance = avail - ram_tier_room(avail, plan_reserve(reserve), false);
+    require(on_line == reserve, "sized by the reserve alone, the tier leaves exactly the guard's line");
+    require(with_allowance - kPostPlanHostBytes >= reserve, "with the allowance, the late memory does not reach the guard");
+    require(ram_tier_room(kPostPlanHostBytes, plan_reserve(reserve), true) == 0, "RAM below the plan's reserve leaves no room");
+}
+
+void test_ram_tier_room() {
+    using basalt::core::ram_tier_room;
+    using basalt::core::pin_tracking_bytes;
     constexpr uint64_t kGiB = 1ull << 30;
     constexpr uint64_t kBlob = 17407795;   // one expert, bytes
-    // The gate and the keep-what-fits budget share resident_room(); the budget packs whole experts into it, so what it
+    // The gate and the keep-what-fits budget share ram_tier_room(); the budget packs whole experts into it, so what it
     // keeps always passes the gate, and the copy loses the shortfall plus less than one expert.
-    auto kept = [&](uint64_t physical, uint64_t headroom, uint64_t complement) {
-        const uint64_t room = resident_room(physical, headroom);
-        const uint64_t budget = std::min(room, complement);
+    auto kept = [&](uint64_t physical, uint64_t reserve, uint64_t complement) {
+        const uint64_t budget = std::min(ram_tier_room(physical, reserve, true), complement);
         return budget / kBlob * kBlob;
     };
-    const uint64_t physical = 78 * kGiB + kGiB / 6, headroom = 15 * kGiB;
-    const uint64_t room = resident_room(physical, headroom);
-    require(room == physical - headroom - physical / 256, "the room is the available RAM less the headroom and overhead");
-    require(resident_room(10 * kGiB, 15 * kGiB) == 0, "a headroom above the RAM leaves no room");
+    const uint64_t physical = 78 * kGiB + kGiB / 6, reserve = 2 * kGiB;
+    const uint64_t room = ram_tier_room(physical, reserve, true);
+    require(room + pin_tracking_bytes(room) <= physical - reserve, "a pinned copy and its tracking fit above the reserve");
+    require(physical - reserve - (room + pin_tracking_bytes(room)) < 64, "a pinned copy leaves no more than rounding");
+    require(ram_tier_room(physical, reserve, false) == physical - reserve, "a pageable copy takes all above the reserve");
+    require(ram_tier_room(10 * kGiB, 15 * kGiB, true) == 0, "a reserve above the RAM leaves no room");
     // the whole complement fits
     const uint64_t whole = 60 * kGiB;
-    require(whole <= room && kept(physical, headroom, whole) > whole - kBlob, "a complement that fits was cut");
-    // a small shortfall (about 1.8 GiB): the hottest experts that fit are kept, and the gate accepts them
-    const uint64_t small = 64 * kGiB + 700 * (1ull << 20);
-    uint64_t k = kept(physical, headroom, small);
-    require(small > room && k > 0 && k <= room, "a small shortfall must keep what fits");
+    require(whole <= room && kept(physical, reserve, whole) > whole - kBlob, "a complement that fits was cut");
+    // a small shortfall: the hottest experts that fit are kept, and the gate accepts them
+    const uint64_t small = room + 700 * (1ull << 20);
+    uint64_t k = kept(physical, reserve, small);
+    require(k > 0 && k <= room, "a small shortfall must keep what fits");
     require(small - k < (small - room) + kBlob, "a small shortfall lost more than the shortfall");
     // a big shortfall keeps the room, not nothing
-    const uint64_t big = 120 * kGiB;
-    k = kept(physical, headroom, big);
+    k = kept(physical, reserve, 120 * kGiB);
     require(k <= room && room - k < kBlob, "a big shortfall must keep the whole room");
-    // across readings: the kept bytes never exceed the gate's room
+    // across readings: the kept bytes and their tracking never pass the reserve
     for (uint64_t gb = 20; gb <= 120; ++gb)
-        for (uint64_t h = 4; h <= 16; h += 3)
-            require(kept(gb * kGiB + 12345, h * kGiB, 200 * kGiB) <= resident_room(gb * kGiB + 12345, h * kGiB),
-                    "kept bytes failed the gate");
+        for (uint64_t r = 0; r <= 16; r += 3) {
+            const uint64_t avail = gb * kGiB + 12345, kb = kept(avail, r * kGiB, 200 * kGiB);
+            require(kb + pin_tracking_bytes(kb) <= avail - std::min(avail, r * kGiB), "kept bytes went into the reserve");
+        }
 }
 
 void test_resident_exchange() {
@@ -377,7 +342,7 @@ void test_home_regions() {
 }
 
 void test_cgroup_memory_budget() {
-    using namespace basalt::core::detail;
+    using namespace basalt::platform;
     constexpr uint64_t GiB = 1ull << 30;
     uint64_t bytes = 0;
 
@@ -414,7 +379,7 @@ void test_cgroup_memory_budget() {
 // memory.stat text -> available bytes, with no /sys read.  A container's own reads sit on the active list, so the
 // file total (active + inactive) is what counts as reclaimable.
 void test_cgroup_memory_stat_text() {
-    using namespace basalt::core::detail;
+    using namespace basalt::platform;
     constexpr uint64_t GiB = 1ull << 30;
     auto gib = [](uint64_t n) { return std::to_string(n * GiB); };
     CgroupMemoryStat stat;
@@ -445,6 +410,16 @@ void test_cgroup_memory_stat_text() {
             "small text rejected");
     require(cgroup_available_bytes(64000, stat, bytes) && bytes == 64000 - 680, "margin exceeded half the reclaimable");
 
+    // shared memory (pinned host buffers) is in `file` but never reclaimed
+    require(parse_cgroup_memory_stat("file " + gib(40) + "\nshmem " + gib(30) + "\ninactive_file " + gib(2) +
+                                         "\nfile_dirty 0\nfile_writeback 0\n", current, stat) && stat.shmem == 30 * GiB,
+            "memory.stat with shmem was rejected");
+    require(cgroup_available_bytes(limit, stat, bytes), "shmem: available refused");
+    require(bytes == (limit - (current - 10 * GiB)) - limit / 64, "shared memory counted reclaimable");
+    require(parse_cgroup_memory_stat("file " + gib(4) + "\nshmem " + gib(6) + "\ninactive_file " + gib(1) +
+                                         "\nfile_dirty 0\nfile_writeback 0\n", current, stat) &&
+                cgroup_available_bytes(limit, stat, bytes) && bytes == (limit - (current - 1 * GiB)) - 1 * GiB / 2,
+            "shmem above file: the inactive list alone");
     // malformed text fails closed
     require(!parse_cgroup_memory_stat("inactive_file 1\nfile_dirty 0\n", current, stat), "missing writeback accepted");
     require(!parse_cgroup_memory_stat("file 1\nfile 2\ninactive_file 1\nfile_dirty 0\nfile_writeback 0\n", current, stat),
@@ -455,7 +430,7 @@ void test_cgroup_memory_stat_text() {
 // The host RAM probe with fake /proc and cgroup trees: v2 (a limit, "max", a missing or malformed limit), v1
 // (a limit, unlimited), and no cgroup line at all.
 void test_host_memory() {
-    using namespace basalt::core::detail;
+    using namespace basalt::platform;
     constexpr uint64_t GiB = 1ull << 30;
     HostMemory m;
     TempDirectory t;
@@ -513,13 +488,18 @@ void test_host_memory() {
     // the system's own files (empty paths): some RAM, and no container limit where the OS keeps no accounting file
     require(host_available_memory(m) && m.available > 0, "this machine's RAM");
     if (basalt::platform::meminfo_path().empty()) require(m.cgroup_limit == ~0ull, "no cgroup limit without cgroup files");
+    // available_memory() is that same reading (in a memory-limited cgroup, the room under the limit, not MemAvailable);
+    // the two reads are moments apart, so they agree within a GiB
+    const uint64_t avail = available_memory();
+    require(host_available_memory(m) && avail > 0 && avail <= m.available + GiB && m.available <= avail + GiB,
+            "available_memory() is not the host reading");
 }
 
 // A container whose own cgroup namespace shows its group as the mount's root, while /proc/self/cgroup names the
 // group by its host path (not visible here): the limit is read at the root.  The hybrid layout (v1 controllers plus a
 // unified line) reads the v1 memory controller.
 void test_host_memory_namespaced() {
-    using namespace basalt::core::detail;
+    using namespace basalt::platform;
     constexpr uint64_t GiB = 1ull << 30;
     const std::string id = "/docker/4f3c2a";
     struct Tree {
@@ -586,14 +566,15 @@ int main() {
         test_complement_plan();
         test_resident_lend_region();
         test_resident_exchange();
-        test_resident_room();
+        test_plan_reserve();
+        test_ram_tier_room();
+        test_file_cache_keep();
         test_cgroup_memory_budget();
         test_cgroup_memory_stat_text();
         test_host_memory();
         test_host_memory_namespaced();
         test_native_variable_layout();
-        test_direct_read_unaligned_geometry();
-        std::cout << "file_expert_source_test: PASS\n";
+            std::cout << "file_expert_source_test: PASS\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "file_expert_source_test: " << error.what() << '\n';

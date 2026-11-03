@@ -1,0 +1,35 @@
+{
+  "submitter": "void-mckenzie",
+  "date": "2026-11-23",
+  "commit": "1e205ae87c",
+  "preset": "community-1",
+  "model": "DeepSeek-V4.1-Flash",
+  "gpus": [
+    {
+      "name": "RTX 5090",
+      "vram_gib": 32,
+      "power_w": 450,
+      "pcie": "5.0 x16",
+      "h2d_gbps": 54.5
+    }
+  ],
+  "ram_gib": 188,
+  "cpu": "AMD Ryzen 9 7950X3D, 16 cores",
+  "ram_gbps": 54.4,
+  "os": "Linux",
+  "quant": "IQ2_XXS",
+  "kv": "fp8+fp4",
+  "prefill_16k_tps": 2545.4,
+  "prefill_64k_tps": 3183.4,
+  "decode_tps": 89.0,
+  "decode_conv_tps": 63.3,
+  "decode_struct_tps": 98.7,
+  "decode_prose_tps": 65.0,
+  "accept_conv_pct": 75.8,
+  "accept_struct_pct": 99.9,
+  "accept_prose_pct": 70.4,
+  "draft_len_conv": 1.2,
+  "draft_len_struct": 4.7,
+  "draft_len_prose": 0.7,
+  "engine_args": "--gpu 0 --max-context 61709 --kv fp8"
+}

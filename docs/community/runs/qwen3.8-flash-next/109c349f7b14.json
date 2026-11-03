@@ -1,0 +1,35 @@
+{
+  "submitter": "TiddlyWiddly",
+  "date": "2026-11-16",
+  "commit": "99dc78cb51",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX PRO 5000 72GB Blackwell",
+      "vram_gib": 72,
+      "power_w": 300,
+      "pcie": "4.0 x16"
+    }
+  ],
+  "ram_gib": 378,
+  "cpu": "AMD EPYC 7302, 16 cores",
+  "ram_gbps": 56.4,
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "int8",
+  "prefill_16k_tps": 7200.7,
+  "prefill_64k_tps": 8112.0,
+  "decode_tps": 403.9,
+  "decode_conv_tps": 277.1,
+  "decode_struct_tps": 487.5,
+  "decode_prose_tps": 253.2,
+  "accept_conv_pct": 70.1,
+  "accept_struct_pct": 98.3,
+  "accept_prose_pct": 64.3,
+  "draft_len_conv": 2.6,
+  "draft_len_struct": 6.9,
+  "draft_len_prose": 2.2,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+  "notes": "OrcaRouter-abliterated NVFP4-DQ8 pack; single RTX Pro 5000 72GB; Docker benchmark."
+}

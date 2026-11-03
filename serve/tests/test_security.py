@@ -7,6 +7,7 @@ import io
 import json
 import socket
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -15,8 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.handler import serve  # noqa: E402
-from serve.security import (allowed_hosts_of, api_key_of, host_allowed, host_name, host_names_for,  # noqa: E402
-                            key_matches, origin_allowed)
+from serve.security import (allowed_hosts_of, api_key_from_file, api_key_of, host_allowed, host_name,  # noqa: E402
+                            host_names_for, key_matches, origin_allowed)
 from serve.service import Service  # noqa: E402
 from serve.util.text import ByteTokenizer  # noqa: E402
 
@@ -100,7 +101,7 @@ class OverHttp(unittest.TestCase):
     def setUp(self):
         tok = ByteTokenizer()
         self.svc = Service(MockEngine(tok, "</think>\n\nok", max_context=4096), tok,
-                           ChatTemplate(ROOT / "serve/chat_template.jinja"))
+                           ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
         self.httpd = None
 
     def start(self, **attrs):
@@ -132,7 +133,7 @@ class OverHttp(unittest.TestCase):
             c.close()
 
     def chat_body(self):
-        return {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 64}
+        return {"model": "basalt", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 64}
 
     # --- Host
     def test_rebinding_name_is_refused_everywhere(self):
@@ -292,6 +293,17 @@ class ApiKeyForms(unittest.TestCase):
             with self.assertRaises(ValueError):
                 api_key_of(blank)
 
+    def test_a_key_file_gives_its_first_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "key.txt"
+            path.write_text("s3cret\nnotes\n", encoding="utf-8")
+            self.assertEqual(api_key_of(api_key_from_file(str(path))), "s3cret")
+            path.write_text("\ns3cret\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "no key in its first line"):
+                api_key_from_file(str(path))
+            with self.assertRaisesRegex(ValueError, "--api-key-file"):
+                api_key_from_file(str(path) + ".missing")
+
     def test_a_key_outside_ascii_matches_as_utf8_and_as_latin1(self):
         def as_read(key, enc):                                    # what http.server hands the handler
             return key.encode(enc).decode("latin-1")
@@ -305,7 +317,7 @@ class ApiKeyForms(unittest.TestCase):
 
     def test_a_utf8_key_over_http(self):
         tok = ByteTokenizer()
-        svc = Service(MockEngine(tok, "ok", max_context=4096), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc = Service(MockEngine(tok, "ok", max_context=4096), tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
         svc.api_key = "ключ"
         httpd = serve(svc, port=0)
         port = httpd.server_address[1]

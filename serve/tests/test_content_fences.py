@@ -76,7 +76,7 @@ class OverHttp(unittest.TestCase):
 
     def ask(self, script, max_tokens=800):
         tok = ByteTokenizer()
-        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         msgs = [{"role": "user", "content": "save my notes"}]
@@ -93,7 +93,7 @@ class OverHttp(unittest.TestCase):
         try:
             for api, (path, body) in reqs.items():
                 for stream in (False, True):
-                    req = urllib.request.Request(base + path, data=json.dumps(dict(body, model="qwen3.8-flash-next", stream=stream)).encode(),
+                    req = urllib.request.Request(base + path, data=json.dumps(dict(body, model="basalt", stream=stream)).encode(),
                                                  headers={"Content-Type": "application/json",
                                                           "anthropic-version": "2023-06-01"})
                     with urllib.request.urlopen(req, timeout=30) as r:

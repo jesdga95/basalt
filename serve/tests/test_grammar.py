@@ -34,7 +34,7 @@ class Fixture:
     def setUpClass(cls):
         tok = ByteTokenizer()
         cls.engine = MockEngine(tok, "</think>\n\n{\"a\": 1}", max_context=4096)
-        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), grammar=cls.grammar)
+        cls.svc = Service(cls.engine, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"), grammar=cls.grammar)
         cls.httpd = serve(cls.svc, port=0)
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
 
@@ -60,7 +60,7 @@ class Fixture:
         return cm.exception.code, json.loads(cm.exception.read())["error"]
 
     def chat(self, **extra):
-        return self.sent("/v1/chat/completions", {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": "hi"}], **extra})
+        return self.sent("/v1/chat/completions", {"model": "basalt", "messages": [{"role": "user", "content": "hi"}], **extra})
 
     def json_schema(self, **spec):
         return {"type": "json_schema", "json_schema": {"name": "s", "schema": SCHEMA, **spec}}
@@ -78,20 +78,20 @@ class GrammarOff(Fixture, unittest.TestCase):
     def test_chat_json_format_is_refused(self):
         msgs = [{"role": "user", "content": "hi"}]
         for fmt in (self.json_schema(), {"type": "json_object"}):
-            code, err = self.refused("/v1/chat/completions", {"model": "qwen3.8-flash-next", "messages": msgs, "response_format": fmt})
+            code, err = self.refused("/v1/chat/completions", {"model": "basalt", "messages": msgs, "response_format": fmt})
             self.assertEqual(code, 400)
             self.assertEqual(err["type"], "invalid_request_error")
             self.assertIn("need grammar enabled", err["message"])
 
     def test_responses_json_format_is_refused(self):
         for fmt in ({"type": "json_schema", "name": "s", "schema": SCHEMA}, {"type": "json_object"}):
-            code, err = self.refused("/v1/responses", {"model": "qwen3.8-flash-next", "input": "hi", "text": {"format": fmt}})
+            code, err = self.refused("/v1/responses", {"model": "basalt", "input": "hi", "text": {"format": fmt}})
             self.assertEqual(code, 400)
             self.assertEqual(err["param"], "text.format")
             self.assertIn("text.format json_schema and json_object (structured output) need grammar enabled", err["message"])
 
     def test_anthropic_json_format_is_refused(self):
-        code, err = self.refused("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
+        code, err = self.refused("/v1/messages", {"model": "basalt", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
                                                   "output_config": {"format": {"type": "json_schema", "schema": SCHEMA}}})
         self.assertEqual(code, 400)
         self.assertEqual(err["type"], "invalid_request_error")
@@ -99,12 +99,12 @@ class GrammarOff(Fixture, unittest.TestCase):
         self.assertIn("need grammar enabled", err["message"])
 
     def test_anthropic_output_format_is_refused(self):
-        code, _ = self.refused("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
+        code, _ = self.refused("/v1/messages", {"model": "basalt", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
                                                 "output_format": {"type": "json_schema", "schema": SCHEMA}})
         self.assertEqual(code, 400)
 
     def test_responses_text_format_is_allowed(self):
-        self.assertIsNone(self.sent("/v1/responses", {"model": "qwen3.8-flash-next", "input": "hi", "text": {"format": {"type": "text"}}}))
+        self.assertIsNone(self.sent("/v1/responses", {"model": "basalt", "input": "hi", "text": {"format": {"type": "text"}}}))
 
     def test_strict_json_schema(self):
         self.assertEqual(self.chat(response_format=self.json_schema(strict=True)),
@@ -115,24 +115,28 @@ class GrammarOff(Fixture, unittest.TestCase):
         self.assertEqual(g, {"kind": "tools", "tools": [STRICT_TOOL], "tool_choice": "required"})
 
     def test_anthropic_strict_tool(self):
-        g = self.sent("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
+        g = self.sent("/v1/messages", {"model": "basalt", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
                                        "tools": [{"name": "get_weather", "strict": True,
                                                   "input_schema": FN["parameters"]}]})
         self.assertEqual(g["kind"], "tools")
         self.assertEqual(g["tools"][0]["function"]["name"], "get_weather")
 
     def test_anthropic_tools_without_strict(self):
-        self.assertIsNone(self.sent("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
+        self.assertIsNone(self.sent("/v1/messages", {"model": "basalt", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
                                                      "tools": [{"name": "t", "input_schema": {"type": "object"}}]}))
 
     def test_responses_strict_tool(self):
-        g = self.sent("/v1/responses", {"model": "qwen3.8-flash-next", "input": "hi", "tools": [{"type": "function", "name": "get_weather", "strict": True,
+        g = self.sent("/v1/responses", {"model": "basalt", "input": "hi", "tools": [{"type": "function", "name": "get_weather", "strict": True,
                                                                    "parameters": FN["parameters"]}]})
         self.assertEqual(g["kind"], "tools")
         self.assertEqual(g["tools"][0]["function"]["name"], "get_weather")
 
+    def test_strict_json_format_with_plain_tools(self):
+        g = self.chat(tools=[TOOL], response_format=self.json_schema(strict=True))
+        self.assertEqual(g, {"kind": "json_schema", "schema": SCHEMA, "tools": [TOOL]})
+
     def test_responses_strict_schema(self):
-        g = self.sent("/v1/responses", {"model": "qwen3.8-flash-next", "input": "hi", "text": {"format": {"type": "json_schema", "name": "s",
+        g = self.sent("/v1/responses", {"model": "basalt", "input": "hi", "text": {"format": {"type": "json_schema", "name": "s",
                                                                             "schema": SCHEMA, "strict": True}}})
         self.assertEqual(g, {"kind": "json_schema", "schema": SCHEMA})
 
@@ -158,24 +162,24 @@ class GrammarOn(Fixture, unittest.TestCase):
         self.assertIsNone(self.chat(response_format={"type": "text"}))
 
     def test_anthropic_tools(self):
-        g = self.sent("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
+        g = self.sent("/v1/messages", {"model": "basalt", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
                                        "tools": [{"name": "get_weather", "description": "weather",
                                                   "input_schema": FN["parameters"]}], "tool_choice": {"type": "any"}})
         self.assertEqual(g, {"kind": "tools", "tools": [TOOL], "tool_choice": {"type": "any"}})
 
     def test_responses_tools(self):
-        g = self.sent("/v1/responses", {"model": "qwen3.8-flash-next", "input": "hi", "tools": [{"type": "function", "name": "get_weather",
+        g = self.sent("/v1/responses", {"model": "basalt", "input": "hi", "tools": [{"type": "function", "name": "get_weather",
                                                                    "description": "weather",
                                                                    "parameters": FN["parameters"]}]})
         self.assertEqual(g["kind"], "tools")
         self.assertEqual(g["tools"], [TOOL])
 
     def test_responses_json_object(self):
-        self.assertEqual(self.sent("/v1/responses", {"model": "qwen3.8-flash-next", "input": "hi", "text": {"format": {"type": "json_object"}}}),
+        self.assertEqual(self.sent("/v1/responses", {"model": "basalt", "input": "hi", "text": {"format": {"type": "json_object"}}}),
                          {"kind": "json_object"})
 
     def anthropic(self, **extra):
-        return {"model": "qwen3.8-flash-next", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}], **extra}
+        return {"model": "basalt", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}], **extra}
 
     def test_anthropic_json_schema(self):
         want = {"kind": "json_schema", "schema": SCHEMA}
@@ -195,17 +199,122 @@ class GrammarOn(Fixture, unittest.TestCase):
     def test_anthropic_bad_format(self):
         for body in ({"output_config": {"format": {"type": "json_schema"}}},
                      {"output_config": {"format": {"type": "text"}}},
-                     {"output_format": {"type": "json_schema", "schema": {"type": "string"}}},
-                     {"output_config": {"format": {"type": "json_schema", "schema": SCHEMA}}, "tools": [
-                         {"name": "t", "input_schema": {"type": "object"}}]}):
+                     {"output_format": {"type": "json_schema", "schema": {"type": "string"}}}):
             code, err = self.refused("/v1/messages", self.anthropic(**body))
             self.assertEqual((code, err["type"]), (400, "invalid_request_error"))
+
+
+    def test_json_format_with_tools(self):
+        want = {"kind": "json_schema", "schema": SCHEMA, "tools": [TOOL]}
+        self.assertEqual(self.chat(tools=[TOOL], response_format=self.json_schema()), want)
+        self.assertEqual(self.chat(tools=[TOOL], tool_choice="auto", response_format={"type": "json_object"}),
+                         {"kind": "json_object", "tools": [TOOL]})
+        self.assertEqual(self.sent("/v1/responses", {"model": "basalt", "input": "hi", "tools": [
+            {"type": "function", **FN}], "text": {"format": {"type": "json_schema", "name": "s", "schema": SCHEMA,
+                                                             "strict": True}}}), want)
+        self.assertEqual(self.sent("/v1/messages", self.anthropic(
+            tools=[{"name": "get_weather", "description": "weather", "input_schema": FN["parameters"]}],
+            tool_choice={"type": "auto"}, output_config={"format": {"type": "json_schema", "schema": SCHEMA}})), want)
+
+    def test_json_format_with_a_forced_call_is_the_call(self):
+        g = self.chat(tools=[TOOL], tool_choice="required", response_format=self.json_schema())
+        self.assertEqual(g, {"kind": "tools", "tools": [TOOL], "tool_choice": "required"})
+
+    def test_json_format_with_tool_choice_none_is_the_format(self):
+        g = self.chat(tools=[TOOL], tool_choice="none", response_format=self.json_schema())
+        self.assertEqual(g, {"kind": "json_schema", "schema": SCHEMA})
+
+    def test_responses_json_answer_with_tools(self):
+        req = urllib.request.Request(self.base + "/v1/responses", data=json.dumps(
+            {"model": "basalt", "input": "hi", "tools": [{"type": "function", **FN}],
+             "text": {"format": {"type": "json_schema", "name": "s", "schema": SCHEMA, "strict": True}}}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            out = json.loads(r.read())["output"]
+        self.assertEqual([o["type"] for o in out if o["type"] != "reasoning"], ["message"])
+        self.assertEqual(json.loads(out[-1]["content"][0]["text"]), {"a": 1})
+
+    def test_responses_namespaced_tool_choice_flattens_for_grammar(self):
+        g = self.sent("/v1/responses", {
+            "model": "basalt",
+            "input": "hi",
+            "tools": [{"type": "namespace", "name": "crm", "description": "CRM", "tools": [
+                {"type": "function", "name": "get_user", "description": "get user",
+                 "parameters": {"type": "object", "properties": {"id": {"type": "string"}}}}
+            ]}],
+            "tool_choice": {"type": "function", "namespace": "crm", "name": "get_user"},
+        })
+        self.assertEqual(g["kind"], "tools")
+        self.assertEqual(g["tools"][0]["function"]["name"], "crm.get_user")
+        self.assertEqual(g["tool_choice"], {"type": "function", "function": {"name": "crm.get_user"}})
+
+    def test_gprompt_set_for_forced_tool_without_thinking_and_after_thinking(self):
+        import threading
+        tok = ByteTokenizer()
+        tpl = ChatTemplate.from_file(ROOT / "serve/chat_template.jinja")
+        # 1) enable_thinking=False with forced tool choice: pass 1 sets _gprompt before the forced opening
+        eng1 = MockEngine(tok, '<parameter=city>\nNYC\n</parameter>\n</function>\n</tool_call>', max_context=4096)
+        svc1 = Service(eng1, tok, tpl, grammar=True)
+        msgs = [{"role": "user", "content": "hi"}]
+        ids, thinking, max_new = svc1.prepare(msgs, [TOOL], {"enable_thinking": False}, 64,
+                                              force=svc1.dialect.forced_opening("get_weather"))
+        g = svc1.grammar_for([TOOL], {"type": "function", "function": {"name": "get_weather"}}, [TOOL], None)
+        list(svc1.run(ids, thinking, [TOOL], max_new, {"_grammar": g}, threading.Event(),
+                      force=svc1.dialect.forced_opening("get_weather")))
+        req_ids, req_samp = eng1.requests[0]
+        gp = req_samp.get("_gprompt")
+        self.assertIsNotNone(gp)
+        self.assertEqual(tok.decode(req_ids[gp:]), svc1.dialect.forced_opening("get_weather"))
+
+        # 2) thinking closes itself then pass 2 opens forced call: pass 2 sets _gprompt right before forced opening
+        eos = tok.encode("<|im_end|>", parse_special=True)[0]
+        replies = iter(["hmm</think>", '<parameter=city>\nNYC\n</parameter>\n</function>\n</tool_call>'])
+
+        class TwoPass(MockEngine):
+            def generate(self, prompt_ids, max_new, sampling, cancel, **kw):
+                self.requests.append((list(prompt_ids), dict(sampling)))
+                text = next(replies)
+                for tid in self.tok.encode(text, parse_special=True):
+                    yield tid
+                yield eos
+
+        eng2 = TwoPass(tok, "", max_context=4096)
+        svc2 = Service(eng2, tok, tpl, grammar=True)
+        ids2, thinking2, max_new2 = svc2.prepare(msgs, [TOOL], {"enable_thinking": True}, 128,
+                                                 force=svc2.dialect.forced_opening("get_weather"))
+        list(svc2.run(ids2, thinking2, [TOOL], max_new2, {"_grammar": g}, threading.Event(),
+                      force=svc2.dialect.forced_opening("get_weather")))
+        self.assertEqual(len(eng2.requests), 2)
+        self.assertNotIn("_gprompt", eng2.requests[0][1])
+        p2_ids, p2_samp = eng2.requests[1]
+        gp2 = p2_samp.get("_gprompt")
+        self.assertIsNotNone(gp2)
+        self.assertIn("<tool_call>", tok.decode(p2_ids[gp2:]))
+
+        # 3) plain thinking-budget wrap-up for json_object (no force): pass 2 must NOT set _gprompt (avoids feeding \n\n)
+        replies3 = iter(["abcde", '{"a": 1}'])
+
+        class WrapPass(MockEngine):
+            def generate(self, prompt_ids, max_new, sampling, cancel, **kw):
+                self.requests.append((list(prompt_ids), dict(sampling)))
+                text = next(replies3)
+                for tid in self.tok.encode(text, parse_special=True):
+                    yield tid
+                yield eos
+
+        eng3 = WrapPass(tok, "", max_context=4096)
+        svc3 = Service(eng3, tok, tpl, grammar=True)
+        ids3, thinking3, max_new3 = svc3.prepare(msgs, None, {"enable_thinking": True}, 128)
+        list(svc3.run(ids3, thinking3, None, max_new3,
+                      {"_grammar": {"kind": "json_object"}, "reasoning_max_tokens": 5}, threading.Event()))
+        self.assertEqual(len(eng3.requests), 2)
+        self.assertNotIn("_gprompt", eng3.requests[1][1])
 
 
 class EngineWithoutTheFlag(unittest.TestCase):
     def test_no_key_sent(self):
         tok = ByteTokenizer()
-        svc = Service(MockEngine(tok, "ok"), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), grammar=True,
+        svc = Service(MockEngine(tok, "ok"), tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"), grammar=True,
                       grammar_engine=False)
         self.assertIsNone(svc.grammar_for([TOOL], None, [STRICT_TOOL], None))
 
@@ -220,6 +329,11 @@ class Wire(unittest.TestCase):
     def test_no_spec_no_key(self):
         self.assertEqual(engine_key(None), "")
         self.assertNotIn("grammar", ProcessEngine.sampling_keys({"_grammar": None}))
+        self.assertNotIn("gprompt", ProcessEngine.sampling_keys({"_gprompt": 42}))
+
+    def test_gprompt_wire_key(self):
+        keys = ProcessEngine.sampling_keys({"_grammar": {"kind": "json_object"}, "_gprompt": 42})
+        self.assertIn(" gprompt=42", keys)
 
     def test_engine_words(self):
         self.assertEqual(grammar_words({"--kv"}), [])           # an engine without the flag
@@ -227,7 +341,7 @@ class Wire(unittest.TestCase):
         self.assertEqual(grammar_words({"--grammar"}), ["--grammar", "on"])
 
     def test_off_forms(self):
-        from serve.config import load_config_file, parse_settings
+        from serve.config import model_settings, parse_settings
         ap = build_parser()
         self.assertTrue(parse_settings(ap, ["--grammar"])[0].grammar)
         self.assertFalse(parse_settings(ap, ["--no-grammar"])[0].grammar)
@@ -235,8 +349,8 @@ class Wire(unittest.TestCase):
             for value, cli, want in ((True, [], True), (False, [], False), (True, ["--no-grammar"], False),
                                      (False, ["--grammar"], True)):
                 p = Path(d) / "c.json"
-                p.write_text(json.dumps({"server": {"grammar": value}}))
-                self.assertEqual(parse_settings(build_parser(), ["--config", str(p)] + cli)[0].grammar, want)
+                p.write_text(json.dumps({"models": [{"model": "m.basalt", "grammar": value}]}))
+                self.assertEqual(model_settings(build_parser(), ["--config", str(p)] + cli)[0][0].grammar, want)
 
 
 def free_port():
@@ -266,19 +380,20 @@ class EngineStart(unittest.TestCase):
             eng = Path(d) / "eng"
             eng.write_bytes(flags)
             conf = Path(d) / "c.json"
-            conf.write_text(json.dumps({"server": {"model": "m.basalt", **server_block}}))
+            conf.write_text(json.dumps({"models": [{"model": "m.basalt", **server_block}]}))
+            (Path(d) / "m.basalt").write_bytes(b"")              # the launch check wants the file to exist
             argv = ["x", "--config", str(conf), "--engine-bin", str(eng), "--port", str(free_port()), *cli]
             tokdir = Path(d) / "tok"
             tokdir.mkdir()
             (tokdir / "vocab.json").write_text("{}")
             (tokdir / "merges.txt").write_text("")
             (tokdir / "token_type.json").write_text("[]")
-            cfg = {"engine_bin": str(eng), "args": ["--serve"], "log": None, "tokenizer": str(tokdir)}
+            cfg = {"engine_bin": str(eng), "args": ["--serve"], "log": None, "tokenizer": {n: (tokdir / n).read_bytes() for n in ("vocab.json", "merges.txt", "token_type.json")}}
             with mock.patch.object(sys, "argv", argv), \
                     mock.patch("serve.engine.modelfile.model_config", return_value=cfg), \
-                    mock.patch.dict(sys.modules, {"tokenizer": types.SimpleNamespace(Tokenizer=lambda *a: ByteTokenizer())}), \
+                    mock.patch.dict(sys.modules, {"tokenizer": types.SimpleNamespace(Tokenizer=lambda *a, **k: ByteTokenizer())}), \
                     mock.patch.object(server, "ProcessEngine", fake), \
-                    mock.patch.object(server, "gpu_plan", return_value=ONE_CARD):
+                    mock.patch.object(server, "model_plan", return_value=ONE_CARD):
                 try:
                     server.main()
                 except Stop:
@@ -295,13 +410,13 @@ class EngineStart(unittest.TestCase):
         out = io.StringIO()
         with redirect_stdout(out):
             self.engine_args(block, cli)
-        return next(x for x in out.getvalue().splitlines() if x.startswith("[server] engine "))
+        return next(x for x in out.getvalue().splitlines() if x.startswith("[server] m.basalt"))
 
     def test_startup_line(self):
-        self.assertEqual(self.line({}), "[server] engine   defaults")
-        self.assertEqual(self.line({"grammar": True}), "[server] engine   grammar=on (from config)")
-        self.assertEqual(self.line({"grammar": True}, ["--no-grammar"]), "[server] engine   grammar=off (from cli)")
-        self.assertEqual(self.line({}, ["--grammar"]), "[server] engine   grammar=on (from cli)")
+        self.assertEqual(self.line({}), "[server] m.basalt")
+        self.assertEqual(self.line({"grammar": True}), "[server] m.basalt  grammar=on")
+        self.assertEqual(self.line({"grammar": True}, ["--no-grammar"]), "[server] m.basalt  grammar=off")
+        self.assertEqual(self.line({}, ["--grammar"]), "[server] m.basalt  grammar=on")
 
     def test_command_line(self):
         self.assertEqual(self.engine_args({}, ["--grammar"]), ["--serve", "--gpu", "0", "--grammar", "on"])

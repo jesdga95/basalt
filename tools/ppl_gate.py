@@ -3,13 +3,14 @@
 
 The base is `llama-perplexity --kl-divergence-base`'s file (wikitext-2, 512-token chunks, second half scored). The
 engine runs as `--serve` with the model plus --ppl-base and --ppl-out; per chunk it reads the first half as a prompt
-and teacher-forces the rest through verify windows of T tokens (see the engine's ppl_gate.hpp). Flags this tool does
-not know are passed to the engine as they are; it sets only what the measurement needs (--spec 5,
-no adaptive swaps, the first two visible GPUs when there are two: --gpu 0,1), and an engine flag given here replaces
-that value.
+and teacher-forces the rest through verify windows of T tokens (see the engine's ppl_gate.hpp). It sets --spec 5 and,
+when the visibility mask (CUDA_VISIBLE_DEVICES, else the cards the machine has) allows two GPUs, --gpu 0,1. A mask
+naming one card means one GPU, so neither that nor a mode is added. `--architecture qwen4exp` also disables adaptive
+swaps so placement stays fixed. Flags passed after the tool's options replace these defaults.
 
-  python3 tools/ppl_gate.py --model FILE.basalt --base base.kld --out DIR [--engine-bin BIN] [--chunks 20] [--t 3]
-                            [--gpu 0 ...]
+  python3 tools/ppl_gate.py --model FILE.basalt --architecture qwen4exp|inkling2|other \
+                             --base base.kld --out DIR [--engine-bin BIN] [--chunks 20] [--t 3]
+                             [--gpu 0 ...]
   python3 tools/ppl_gate.py --report DIR/rows.tsv          # summary of a finished run
   python3 tools/ppl_gate.py --diff A/rows.tsv B/rows.tsv   # row by row: identical rows, largest NLL/KLD change
 """
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import struct
 import subprocess
 import sys
@@ -80,6 +82,14 @@ def diff(pa: str, pb: str) -> str:
 
 
 def gpu_count() -> int:
+    # `nvidia-smi --list-gpus` names every card in the machine, not the ones this process may use, so the visibility
+    # mask decides first: a box whose second card drives the displays (`CUDA_VISIBLE_DEVICES=0`) has one GPU here, and
+    # naming that card in --gpu with a mode from the default below would hand the engine a mode with a single card.
+    mask = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if mask is not None:
+        if mask.strip() in ("", "-1", "none", "None"):
+            return 0
+        return len([p for p in mask.split(",") if p.strip() != ""])
     try:
         out = subprocess.run(["nvidia-smi", "--list-gpus"], capture_output=True, text=True, timeout=10).stdout
     except (OSError, subprocess.SubprocessError):
@@ -108,10 +118,13 @@ def set_args(args: list[str], extra: list[str]) -> list[str]:
 def run(a) -> int:
     n_ctx, n_vocab, n_chunk, chunks = read_base(a.base)
     first = n_ctx // 2
-    args = ["--model", str(Path(a.model).resolve()), "--spec", "5",
-            "--adapt-swaps", "0", "--peer-adapt-swaps", "0", "--max-context", "4096"]
+    model_path = Path(a.model)
+    args = ["--model", str(model_path.resolve()), "--spec", "5"]
+    if a.architecture == "qwen4exp":
+        args += ["--adapt-swaps", "0", "--peer-adapt-swaps", "0"]
+    args += ["--max-context", "4096"]
     if gpu_count() > 1:
-        args += ["--gpu", "0,1"]
+        args += ["--gpu", "0,1", "--gpu-mode", "peer"]   # a model that only splits: add --gpu-mode split
     args = set_args(args, a.engine_args + ["--ppl-base", str(Path(a.base).resolve())])
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -181,6 +194,8 @@ def run(a) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--model", help="the .basalt file")
+    ap.add_argument("--architecture", choices=("qwen4exp", "inkling2", "other"),
+                    help="model architecture; selects architecture-specific measurement controls")
     ap.add_argument("--engine-bin", default=str(ENGINE_BIN) if ENGINE_BIN.is_file() else None,
                     help="the engine binary (default: bin/basalt in the repo)")
     ap.add_argument("--base")
@@ -198,6 +213,8 @@ def main() -> int:
     if a.report:
         print(summary(a.report))
         return 0
+    if not a.architecture:
+        ap.error("--architecture is required when running the gate")
     if not (a.model and a.base and a.out):
         ap.error("--model, --base and --out are required")
     if not a.engine_bin:

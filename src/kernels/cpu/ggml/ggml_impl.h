@@ -98,3 +98,27 @@ static inline ggml_fp16_t ggml_compute_fp32_to_fp16(float f) {
 
 #define GGML_FP16_TO_FP32(x) GGML_COMPUTE_FP16_TO_FP32(x)
 #define GGML_FP32_TO_FP16(x) GGML_COMPUTE_FP32_TO_FP16(x)
+
+// Equal to ggml_e8m0_to_fp32/2  (ggml-impl.h, verbatim)
+// Useful with MXFP4 quantization since the E2M1 values are doubled
+static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
+    uint32_t bits;
+
+    // For x < 2: use precomputed denormal patterns
+    if (x < 2) {
+        // 0x00200000 = 2^(-128), 0x00400000 = 2^(-127)
+        bits = 0x00200000 << x;
+    }
+    // For x >= 2: normalized exponent adjustment
+    else {
+        // 0.5 * 2^(x-127) = 2^(x-128) = normalized with exponent (x-1)
+        bits = (uint32_t)(x - 1) << 23;
+    }
+    // Note: NaNs are not handled here
+
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
+#define GGML_E8M0_TO_FP32_HALF(x) ggml_e8m0_to_fp32_half(x)

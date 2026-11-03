@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <stdexcept>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -15,7 +17,7 @@
 
 namespace basalt::vision {
 
-bool decode_image(const uint8_t* data, size_t len, Image& out, std::string& err, int64_t max_pixels) {
+bool decode_image(const uint8_t* data, size_t len, Image& out, std::string& err, int64_t max_pixels, std::vector<uint8_t>* alpha) {
     if (data == nullptr || len == 0) { err = "empty image"; return false; }
     const int n = (int) std::min<size_t>(len, 0x7fffffff);
     int w = 0, h = 0, c = 0;
@@ -31,14 +33,28 @@ bool decode_image(const uint8_t* data, size_t len, Image& out, std::string& err,
         err = "the image is " + std::to_string(w) + "x" + std::to_string(h) + " pixels; the limit is " + limit;
         return false;
     }
-    uint8_t* px = stbi_load_from_memory(data, n, &w, &h, &c, 3);
+    if (alpha) alpha->clear();
+    const bool keep = alpha && (c == 2 || c == 4);   // grey or colour with an alpha channel (or a transparent colour)
+    uint8_t* px = stbi_load_from_memory(data, n, &w, &h, &c, keep ? 4 : 3);
     if (!px) {
         err = stbi_failure_reason() ? stbi_failure_reason() : "unreadable image";
         return false;
     }
     out.w = w;
     out.h = h;
-    out.rgb.assign(px, px + (size_t) w * h * 3);
+    if (keep) {
+        const size_t np = (size_t) w * h;
+        out.rgb.resize(np * 3);
+        alpha->resize(np);
+        for (size_t i = 0; i < np; ++i) {
+            out.rgb[i * 3] = px[i * 4];
+            out.rgb[i * 3 + 1] = px[i * 4 + 1];
+            out.rgb[i * 3 + 2] = px[i * 4 + 2];
+            (*alpha)[i] = px[i * 4 + 3];
+        }
+    } else {
+        out.rgb.assign(px, px + (size_t) w * h * 3);
+    }
     stbi_image_free(px);
     return true;
 }
@@ -47,18 +63,20 @@ Size fit_size(int w, int h, const Geometry& g) {
     if (w <= 0 || h <= 0) return {0, 0};
     const int f = g.patch * g.merge;
     const int64_t min_px = (int64_t) g.min_tokens * f * f, max_px = (int64_t) g.max_tokens * f * f;
-    auto round_f = [f](float x) { return (int) std::round(x / (float) f) * f; };
-    auto ceil_f = [f](float x) { return (int) std::ceil(x / (float) f) * f; };
-    auto floor_f = [f](float x) { return (int) std::floor(x / (float) f) * f; };
-    int wb = std::max(f, round_f((float) w)), hb = std::max(f, round_f((float) h));
+    // the reference smart_resize's arithmetic: doubles, and Python round() (nearbyint rounds half to even in the
+    // default rounding mode)
+    auto round_f = [f](double x) { return (int) std::nearbyint(x / (double) f) * f; };
+    auto ceil_f = [f](double x) { return (int) std::ceil(x / (double) f) * f; };
+    auto floor_f = [f](double x) { return (int) std::floor(x / (double) f) * f; };
+    int wb = round_f((double) w), hb = round_f((double) h);
     if ((int64_t) hb * wb > max_px) {
-        const float beta = std::sqrt((float) h * (float) w / (float) max_px);
-        hb = std::max(f, floor_f((float) h / beta));
-        wb = std::max(f, floor_f((float) w / beta));
+        const double beta = std::sqrt((double) h * (double) w / (double) max_px);
+        hb = std::max(f, floor_f((double) h / beta));
+        wb = std::max(f, floor_f((double) w / beta));
     } else if ((int64_t) hb * wb < min_px) {
-        const float beta = std::sqrt((float) min_px / ((float) h * (float) w));
-        hb = ceil_f((float) h * beta);
-        wb = ceil_f((float) w * beta);
+        const double beta = std::sqrt((double) min_px / ((double) h * (double) w));
+        hb = ceil_f((double) h * beta);
+        wb = ceil_f((double) w * beta);
     }
     return {wb, hb};
 }
@@ -176,26 +194,10 @@ Image resize_bicubic(const Image& s, int ow, int oh) {
 
 }  // namespace
 
+Image resize_bicubic_to(const Image& src, int w, int h) { return resize_bicubic(src, w, h); }
+
 Image to_canvas(const Image& src, Size target) {
-    if (src.w == target.w && src.h == target.h) return src;
-    const float sw = (float) target.w / src.w, sh = (float) target.h / src.h;
-    const float scale = std::min(sw, sh);
-    const int nw = std::min((int) std::ceil(src.w * scale), target.w);
-    const int nh = std::min((int) std::ceil(src.h * scale), target.h);
-    const Image r = resize_bicubic(src, nw, nh);
-    Image out;
-    out.w = target.w;
-    out.h = target.h;
-    out.rgb.assign((size_t) target.w * target.h * 3, 0);
-    const int ox = (target.w - nw) / 2, oy = (target.h - nh) / 2;
-    for (int y = 0; y < nh; ++y) {
-        if (y + oy < 0 || y + oy >= target.h) continue;
-        for (int x = 0; x < nw; ++x) {
-            if (x + ox < 0 || x + ox >= target.w) continue;
-            std::copy_n(&r.rgb[((size_t) y * nw + x) * 3], 3, &out.rgb[((size_t) (y + oy) * target.w + x + ox) * 3]);
-        }
-    }
-    return out;
+    return resize_bicubic(src, target.w, target.h);
 }
 
 void normalize_planar(const Image& c, std::vector<float>& out) {
@@ -219,6 +221,43 @@ void patchify(const std::vector<float>& planar, Size canvas, const Geometry& g, 
                         for (int ky = 0; ky < P; ++ky)
                             std::copy_n(&planar[c * plane + (size_t) ((yb + dy) * P + ky) * canvas.w + (xb + dx) * P], P,
                                         d + ((size_t) c * P + ky) * P);
+                }
+}
+
+Size padded_canvas(int w, int h, const Geometry& g) {
+    const int f = g.patch * g.merge;
+    return {(w + f - 1) / f * f, (h + f - 1) / f * f};
+}
+
+void patchify_padded(const Image& img, const Geometry& g, const float mean[3], const float std[3], std::vector<float>& out) {
+    const Size canvas = padded_canvas(img.w, img.h, g);
+    const int P = g.patch, gx = canvas.w / P, gy = canvas.h / P, m = g.merge;
+    const size_t row = (size_t) 3 * P * P;
+    // round to nearest even bf16, as the device's __float2bfloat16_rn (no NaN reaches here)
+    const auto bf16 = [](float f) {
+        uint32_t u;
+        std::memcpy(&u, &f, 4);
+        u = (u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u;
+        std::memcpy(&f, &u, 4);
+        return f;
+    };
+    float cm[3], cs[3];
+    for (int c = 0; c < 3; ++c) { cm[c] = bf16(kClipMean[c]); cs[c] = bf16(kClipStd[c]); }
+    out.resize((size_t) gx * gy * row);
+    size_t n = 0;
+    for (int yb = 0; yb < gy; yb += m)
+        for (int xb = 0; xb < gx; xb += m)
+            for (int dy = 0; dy < m; ++dy)
+                for (int dx = 0; dx < m; ++dx, ++n) {
+                    float* d = &out[n * row];
+                    for (int c = 0; c < 3; ++c)
+                        for (int ky = 0; ky < P; ++ky)
+                            for (int kx = 0; kx < P; ++kx) {
+                                const int X = (xb + dx) * P + kx, Y = (yb + dy) * P + ky;
+                                const float v = X < img.w && Y < img.h ? (float) img.rgb[((size_t) Y * img.w + X) * 3 + c] : -1.0f;
+                                const float x = bf16((v / 255.0f - kClipMean[c]) / kClipStd[c]);
+                                d[((size_t) c * P + ky) * P + kx] = bf16((x * cs[c] + cm[c] - mean[c]) / std[c]);
+                            }
                 }
 }
 

@@ -1,0 +1,26 @@
+{
+  "submitter": "polygizer",
+  "date": "2026-11-06",
+  "commit": "1b3f69641c",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5090",
+      "vram_gib": 32,
+      "power_w": 575,
+      "pcie": "5.0 x16",
+      "h2d_gbps": 57.9
+    }
+  ],
+  "ram_gib": 125,
+  "cpu": "AMD Ryzen 7 9700X, 8 cores",
+  "ram_gbps": 64.7,
+  "os": "Windows",
+  "quant": "IQ3_S",
+  "kv": "int8",
+  "prefill_16k_tps": 8561.9,
+  "prefill_64k_tps": 9661.4,
+  "decode_tps": 486.7,
+  "notes": "single RTX 5090 at the stock 575 W default limit (no OC), weights SHA256-verified, 0 SSD spill; same build as our 489 W rows: decode 431.1 -> 486.7 (+12.9 %), prefill 16K 7,910.8 -> 8,561.9"
+}

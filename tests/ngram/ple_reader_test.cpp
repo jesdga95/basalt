@@ -8,7 +8,7 @@
 // dedup slot mixed up shows as a mismatch rather than as plausible data.
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/core/model_file.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/ngram/ple_reader.hpp"
 #include "basalt/platform/direct_file.hpp"
 
@@ -79,9 +79,9 @@ bool check_rows(ng::PleReader& rd, const std::vector<uint32_t>& rows, uint32_t n
     return true;
 }
 
-// row_bytes: ng::ROW_BYTES (90, IQ4_NL) is the production default; 110 (Q5_0) and 170 (Q8_0) are
-// run too, through the exact same generic row_bytes path -- nothing here is IQ4_NL-specific, so a second row
-// size is the correctness evidence for the generic path.
+// row_bytes: ng::ROW_BYTES (90, IQ4_NL) is the production default; 110 (Q5_0), 170 (Q8_0), 320 (BF16) and 176 (a Q5_K
+// deepseek41 Engram row) are run too, through the exact same generic row_bytes path -- nothing here is IQ4_NL-specific,
+// so a second row size is the correctness evidence for the generic path.
 int selftest(const std::string& dir, uint32_t rb) {
     const uint32_t N = 500000;                          // 45 MB: large enough for thousands of distinct pages
     const std::string path = dir + "/ple_reader_selftest_" + std::to_string(rb) + ".bin";
@@ -353,6 +353,34 @@ template <class T> void put(std::vector<uint8_t>& b, T v) {
     std::memcpy(b.data() + n, &v, sizeof(T));
 }
 
+// A BF16 PLE row (PLE_HEAD_DIM 16-bit values) decoded the way PleTable does - the bits shifted into an
+// f32 - against a reference that reads the sign, exponent and mantissa fields and builds the value.
+// BF16 is the high half of f32, so every pattern must match exactly, infinities and NaNs included.
+int bf16_decode_check() {
+    std::mt19937 rng(29);
+    int bad = 0;
+    for (int t = 0; t < 2000; ++t) {
+        uint16_t row[k::PLE_HEAD_DIM];
+        for (auto& v : row) v = (uint16_t) rng();
+        for (int i = 0; i < k::PLE_HEAD_DIM; ++i) {
+            const uint32_t w = (uint32_t) row[i] << 16;
+            float got;
+            std::memcpy(&got, &w, 4);
+            const int e = (row[i] >> 7) & 255, m = row[i] & 127;
+            const float sign = (row[i] & 0x8000) ? -1.0f : 1.0f;
+            if (e == 255) {                       // no mantissa is an infinity, any mantissa is a NaN
+                if (m == 0 ? !std::isinf(got) : !std::isnan(got)) ++bad;
+                continue;
+            }
+            const float want = sign * (e == 0 ? std::ldexp((float) m, -133)
+                                              : std::ldexp((float) (m + 128), e - 134));
+            if (got != want) ++bad;
+        }
+    }
+    std::printf("BF16 PLE row decode: %s\n", bad ? "FAILED" : "OK");
+    return bad ? 1 : 0;
+}
+
 // PleTable::warm_rows on a synthetic one-tensor GGUF (Q8_0 rows): rows read ahead come back byte-identical to the
 // mapped table's, are served from the row cache (a read held back by injected delay is not waited for), and in
 // Mmap mode the call does nothing.
@@ -441,14 +469,18 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F] [--stress SECS]\n"); return 2; }
     }
     if (self) {
-        // ng::ROW_BYTES (90, IQ4_NL, production default), 110 (Q5_0) and 170 (Q8_0) rows through the
-        // same generic row_bytes path -- see the comment on selftest().
+        // ng::ROW_BYTES (90, IQ4_NL, production default), 110 (Q5_0), 170 (Q8_0), 320 (BF16) and 176 (a Q5_K
+        // deepseek41 Engram row) through the same generic row_bytes path -- see the comment on selftest().
         const int r90 = selftest(dir, ng::ROW_BYTES);
         const int r110 = selftest(dir, k::PLE_ROW_BYTES_Q5_0);
         const int r170 = selftest(dir, k::PLE_ROW_BYTES_Q8_0);
+        const int r320 = selftest(dir, k::PLE_ROW_BYTES_BF16);
+        const int r176 = selftest(dir, 176);
         const int q8 = q8_decode_check();
+        const int bf16 = bf16_decode_check();
         const int warm = warm_rows_check(dir);
-        return r90 != 0 ? r90 : r110 != 0 ? r110 : r170 != 0 ? r170 : q8 != 0 ? q8 : warm;
+        return r90 != 0 ? r90 : r110 != 0 ? r110 : r170 != 0 ? r170 : r320 != 0 ? r320 : r176 != 0 ? r176
+               : q8 != 0 ? q8 : bf16 != 0 ? bf16 : warm;
     }
     if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, stress_secs);
     std::fprintf(stderr, "nothing to do\n");

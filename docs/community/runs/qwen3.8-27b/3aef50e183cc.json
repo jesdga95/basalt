@@ -1,0 +1,35 @@
+{
+  "submitter": "liangqi",
+  "date": "2026-11-18",
+  "commit": "d3b7574296",
+  "preset": "community-1",
+  "model": "Qwen3.8-27B",
+  "gpus": [
+    {
+      "name": "RTX 5090",
+      "vram_gib": 32,
+      "power_w": 500,
+      "pcie": "5.0 x16"
+    }
+  ],
+  "ram_gib": 61,
+  "cpu": "Intel Core Ultra 9 285K, 24 cores",
+  "ram_gbps": 36.8,
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "int8",
+  "prefill_16k_tps": 14744.5,
+  "prefill_64k_tps": 10639.5,
+  "decode_tps": 514.6,
+  "decode_conv_tps": 300.3,
+  "decode_struct_tps": 794.7,
+  "decode_prose_tps": 212.1,
+  "accept_conv_pct": 50.4,
+  "accept_struct_pct": 86.6,
+  "accept_prose_pct": 34.0,
+  "draft_len_conv": 6.1,
+  "draft_len_struct": 13.9,
+  "draft_len_prose": 5.3,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+  "notes": "single RTX 5090 at a 500 W limit (default 575 W), 61 GiB DDR5, weights on NVMe; vLLM lane paused for the run"
+}

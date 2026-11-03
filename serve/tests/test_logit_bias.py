@@ -68,7 +68,7 @@ class Http(unittest.TestCase):
     def setUp(self):
         tok = ByteTokenizer()
         self.engine = MockEngine(tok, "ok", max_context=4096)
-        self.httpd = serve(Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja")), port=0)
+        self.httpd = serve(Service(self.engine, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja")), port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 
     def tearDown(self):
@@ -76,7 +76,7 @@ class Http(unittest.TestCase):
         self.httpd.server_close()
 
     def post(self, path, **extra):
-        body = {"model": "qwen3.8-flash-next", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}], **extra}
+        body = {"model": "basalt", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}], **extra}
         req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         try:

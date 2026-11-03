@@ -1,0 +1,22 @@
+{
+  "submitter": "foolio",
+  "date": "2026-10-23",
+  "commit": "702c08f783",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX PRO 4000 Blackwell",
+      "vram_gib": 24,
+      "power_w": 145
+    }
+  ],
+  "ram_gib": 123,
+  "os": "Linux",
+  "quant": "UD-Q4_K_XL",
+  "kv": "int8",
+  "prefill_16k_tps": 2865.9,
+  "prefill_64k_tps": 3156.2,
+  "decode_tps": 104.3,
+  "notes": "converted from Unsloth UD-Q4_K_XL GGUF via --compat-bf16 --sections-from; weights on SATA SSD"
+}

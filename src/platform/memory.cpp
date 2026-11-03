@@ -6,12 +6,16 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 #if defined(_WIN32)
 #include "basalt/platform/win.hpp"
+#include <dxgi1_4.h>
 #include <malloc.h>   // _aligned_malloc, _aligned_free, _heapmin
 #else
 #include <fcntl.h>
@@ -24,6 +28,7 @@
 #include <cerrno>
 #include <cstring>
 #include "basalt/log.hpp"
+#include "basalt/platform/system.hpp"
 
 namespace basalt::platform {
 
@@ -150,19 +155,14 @@ void memory_status(uint64_t& avail, uint64_t& total) {
     avail = (uint64_t) ms.ullAvailPhys;
     total = (uint64_t) ms.ullTotalPhys;
 }
-}  // namespace
 
-uint64_t available_memory() {
+// The OS's own reading, before a container limit lowers it (available_memory).
+uint64_t os_available_memory() {
     uint64_t avail = 0, total = 0;
     memory_status(avail, total);
     return avail;
 }
-
-uint64_t ram_margin() {
-    uint64_t avail = 0, total = 0;
-    memory_status(avail, total);
-    return std::max<uint64_t>(2ull << 30, total / 20);
-}
+}  // namespace
 #else
 namespace {
 // One "<key>: <n> kB" line of /proc/meminfo in bytes (0 when absent).
@@ -174,31 +174,219 @@ uint64_t meminfo_bytes(const char* key) {
         if (line.compare(0, k.size(), k) == 0) return std::strtoull(line.c_str() + k.size(), nullptr, 10) * 1024;
     return 0;
 }
+
+// The OS's own reading, before a container limit lowers it (available_memory).
+uint64_t os_available_memory() { return meminfo_bytes("MemAvailable"); }
+}  // namespace
+#endif
+
+namespace {
+
+bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current,
+                             CgroupMemoryStat& stat) {
+    std::ifstream input(path / "memory.stat");
+    if (!input) return false;
+    std::ostringstream text;
+    text << input.rdbuf();
+    return text.good() && parse_cgroup_memory_stat(text.str(), current, stat);
+}
+
+// cgroup v1's memory.stat: the group's hierarchical counters (total_*), the same allowance as v2's.  False when the
+// file or total_inactive_file is missing (the usage is then taken as it is).
+bool read_cgroup_v1_memory_stat(const std::filesystem::path& path, uint64_t usage, CgroupMemoryStat& stat) {
+    std::ifstream input(path / "memory.stat");
+    if (!input) return false;
+    bool inactive_file = false;
+    std::string key;
+    uint64_t value = 0, active_file = 0;
+    while (input >> key >> value) {
+        if (key == "total_inactive_file") { stat.inactive_file = value; inactive_file = true; }
+        else if (key == "total_active_file") active_file = value;
+        else if (key == "total_dirty") stat.file_dirty = value;
+        else if (key == "total_writeback") stat.file_writeback = value;
+    }
+    if (!inactive_file) return false;
+    stat.file = stat.inactive_file + active_file;
+    stat.current = usage;
+    stat.valid = true;
+    return true;
+}
+
 }  // namespace
 
-uint64_t available_memory() { return meminfo_bytes("MemAvailable"); }
+bool parse_cgroup_memory_stat(const std::string& text, uint64_t current, CgroupMemoryStat& stat) {
+    stat = CgroupMemoryStat{};
+    bool inactive_file = false, file_dirty = false, file_writeback = false, file = false, shmem = false;
+    std::istringstream input(text);
+    std::string line;
+    while (std::getline(input, line)) {
+        std::istringstream fields(line);
+        std::string key;
+        uint64_t value = 0;
+        if (!(fields >> key >> value)) return false;
+        fields >> std::ws;
+        if (!fields.eof()) return false;
 
-uint64_t ram_margin() {
-    return std::max<uint64_t>(2ull << 30, meminfo_bytes("MemTotal") / 20);
+        auto take = [&](bool& seen, uint64_t& out) {
+            if (seen) return false;
+            seen = true;
+            out = value;
+            return true;
+        };
+        if (key == "file") { if (!take(file, stat.file)) return false; }
+        else if (key == "shmem") { if (!take(shmem, stat.shmem)) return false; }
+        else if (key == "inactive_file") { if (!take(inactive_file, stat.inactive_file)) return false; }
+        else if (key == "file_dirty") { if (!take(file_dirty, stat.file_dirty)) return false; }
+        else if (key == "file_writeback") { if (!take(file_writeback, stat.file_writeback)) return false; }
+    }
+    if (!inactive_file || !file_dirty || !file_writeback) return false;
+    stat.current = current;
+    stat.valid = true;
+    return true;
 }
-#endif
 
-uint64_t commit_headroom() {
-#if defined(_WIN32)
-    MEMORYSTATUSEX ms{};
-    ms.dwLength = sizeof ms;
-    return GlobalMemoryStatusEx(&ms) ? (uint64_t) ms.ullAvailPageFile : 0;
-#else
-    return available_memory();
-#endif
+bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64_t& bytes) {
+    bytes = 0;
+    if (!stat.valid) return false;
+
+    // Clean file pages are reclaimable.  The page cache is the active and inactive lists together (`file`; the
+    // inactive list alone when the file total is not reported), because the container's own reads move pages to
+    // the active list.  The counters can race memory.current, so bound them to charged usage first.
+    // `file` counts shared memory too (pinned host buffers, tmpfs), which reclaim never frees: it is left out.
+    const uint64_t page_cache = stat.file > stat.shmem ? stat.file - stat.shmem : 0;
+    uint64_t reclaimable = std::min(std::max(page_cache, stat.inactive_file), stat.current);
+    reclaimable = stat.file_dirty >= reclaimable ? 0 : reclaimable - stat.file_dirty;
+    reclaimable = stat.file_writeback >= reclaimable ? 0 : reclaimable - stat.file_writeback;
+    // Keep a margin: part of the cache is mapped or locked and does not come back on demand.
+    reclaimable -= std::min(reclaimable / 2, limit / 64);
+
+    // Reclaiming clean file pages reduces usage; saturating subtraction also handles a transient over-limit read.
+    const uint64_t usage_after_reclaim = stat.current - reclaimable;
+    bytes = usage_after_reclaim < limit ? limit - usage_after_reclaim : 0;
+    return true;
 }
+
+bool host_available_memory(HostMemory& m, const std::string& meminfo_arg, const std::string& self_cgroup_arg,
+                           const std::string& cgroup_root_arg) {
+    m = HostMemory{};
+    const std::string meminfo = meminfo_arg.empty() ? basalt::platform::meminfo_path() : meminfo_arg;
+    const std::string self_cgroup = self_cgroup_arg.empty() ? basalt::platform::self_cgroup_path() : self_cgroup_arg;
+    const std::string cgroup_root = cgroup_root_arg.empty() ? basalt::platform::cgroup_root() : cgroup_root_arg;
+    if (meminfo.empty()) {
+        // No memory accounting files and no cgroup hierarchy here: the OS reading is the whole answer, and there is
+        // no container limit tighter than it.
+        const uint64_t avail = os_available_memory();
+        if (avail == 0) return false;
+        m.available = avail;
+        m.cgroup_limit = ~0ull;
+        return true;
+    }
+    // MemAvailable includes reclaimable page cache, unlike _SC_AVPHYS_PAGES.
+    std::ifstream info(meminfo);
+    std::string line;
+    uint64_t bytes = 0;
+    while (std::getline(info, line)) {
+        std::istringstream fields(line);
+        std::string key, unit;
+        uint64_t value = 0;
+        if (fields >> key >> value >> unit && key == "MemAvailable:" && unit == "kB" &&
+            value <= std::numeric_limits<uint64_t>::max() / 1024) bytes = value * 1024;
+    }
+    if (bytes == 0) return false;
+    // The tightest cgroup limit of this process's group and its ancestors.  A group whose path is not visible here
+    // (a container's own cgroup namespace shows its group as the mount's root) is read at that root; a group without
+    // a readable limit has none of its own.  No cgroup file or line: MemAvailable alone.
+    // This is a point-in-time guard, not a reservation against concurrent allocations.
+    const std::filesystem::path root(cgroup_root);
+    bool v2 = false;
+    std::string v2_path, v1_path;   // the unified group; the v1 memory controller's group
+    if (std::ifstream groups(self_cgroup); groups) {
+        while (std::getline(groups, line)) {
+            if (line.rfind("0::/", 0) == 0) {
+                v2 = true;
+                v2_path = line.substr(4);
+                continue;
+            }
+            // v1: "N:controller[,controller]:/path"
+            const size_t c1 = line.find(':'), c2 = c1 == std::string::npos ? c1 : line.find(':', c1 + 1);
+            if (c2 == std::string::npos) continue;
+            std::istringstream ctl(line.substr(c1 + 1, c2 - c1 - 1));
+            for (std::string c; std::getline(ctl, c, ',');)
+                if (c == "memory") v1_path = line.substr(c2 + 1);
+        }
+    }
+    // the group's directory under `top`, or `top` itself when the group is not visible there
+    auto visible_group = [](const std::filesystem::path& top, const std::string& rel) {
+        const std::string sub = rel.substr(rel.rfind('/', 0) == 0 ? 1 : 0);
+        if (sub.empty()) return top;
+        auto path = (top / sub).lexically_normal();
+        if (path.string().rfind(top.string(), 0) != 0 || !std::filesystem::is_directory(path)) return top;
+        return path;
+    };
+    if (!v1_path.empty()) {
+        // cgroup v1 (also the hybrid layout, where the unified line carries no memory controller): the memory
+        // controller's memory.limit_in_bytes - memory.usage_in_bytes, with the clean inactive file cache counted as
+        // free as for v2.  An unlimited group says a number near 2^63 (rounded to its page size).
+        const std::filesystem::path mroot = root / "memory";
+        for (auto path = visible_group(mroot, v1_path); path.string().rfind(mroot.string(), 0) == 0;
+             path = path.parent_path()) {
+            std::ifstream limit_file(path / "memory.limit_in_bytes"), usage_file(path / "memory.usage_in_bytes");
+            uint64_t cap = 0, usage = 0;
+            if (limit_file >> cap && usage_file >> usage && cap < (1ull << 62)) {
+                uint64_t room = usage < cap ? cap - usage : 0;
+                CgroupMemoryStat stat;
+                if (read_cgroup_v1_memory_stat(path, usage, stat) && !cgroup_available_bytes(cap, stat, room)) return false;
+                bytes = std::min(bytes, room);
+                m.cgroup_limit = std::min(m.cgroup_limit, cap);
+            }
+            if (path == mroot) break;
+        }
+    } else if (v2) {
+        for (auto path = visible_group(root, v2_path); path.string().rfind(root.string(), 0) == 0;
+             path = path.parent_path()) {
+            std::ifstream limit_file(path / "memory.max"), current_file(path / "memory.current");
+            std::string limit;
+            uint64_t current = 0;
+            // the host's root group, and a group whose parent does not enable the memory controller, have no limit
+            if (limit_file >> limit && current_file >> current && limit != "max") {
+                try {
+                    size_t consumed = 0;
+                    const uint64_t cap = std::stoull(limit, &consumed);
+                    if (consumed != limit.size()) return false;
+                    CgroupMemoryStat stat;
+                    if (!read_cgroup_memory_stat(path, current, stat)) return false;
+                    uint64_t cgroup_available = 0;
+                    if (!cgroup_available_bytes(cap, stat, cgroup_available)) return false;
+                    bytes = std::min(bytes, cgroup_available);
+                    m.cgroup_limit = std::min(m.cgroup_limit, cap);
+                } catch (...) { return false; }
+            }
+            if (path == root) break;
+        }
+    }
+    m.available = bytes;
+    return true;
+}
+
+uint64_t available_memory() {
+    HostMemory m;
+    return host_available_memory(m) ? m.available : os_available_memory();
+}
+
+namespace {
+std::atomic<uint64_t> g_ram_reserve{kDefaultRamReserveBytes};
+}  // namespace
+
+uint64_t ram_reserve() { return g_ram_reserve.load(); }
+
+void set_ram_reserve(uint64_t bytes) { g_ram_reserve = bytes; }
 
 uint64_t ram_budget(bool* known) {
     const uint64_t avail = available_memory();
     if (known) *known = avail > 0;
     if (avail == 0) return UINT64_MAX;
-    const uint64_t margin = ram_margin();
-    return avail > margin ? avail - margin : 0;
+    const uint64_t reserve = ram_reserve();
+    return avail > reserve ? avail - reserve : 0;
 }
 
 namespace {
@@ -208,21 +396,21 @@ std::atomic<bool> g_resident_mode{false};
 std::atomic<uint64_t> g_resident_copy{0};
 }  // namespace
 
-std::string ram_exhausted_message(uint64_t avail, bool resident, uint64_t copy_bytes, uint64_t margin) {
+std::string ram_exhausted_message(uint64_t avail, bool resident, uint64_t copy_bytes, uint64_t reserve) {
     const unsigned long long mib = (unsigned long long) (avail >> 20);
     char buf[384];
     if (!resident) {
-        std::snprintf(buf, sizeof buf, "basalt error: RAM ran out loading (%llu MiB free); use "
+        std::snprintf(buf, sizeof buf, "RAM ran out loading (%llu MiB free); use "
                                        "--resident-experts or --mmap-experts", mib);
     } else if (copy_bytes < (1ull << 30)) {
         // a budget of 1 GiB or more would not shrink a copy this small, so it is not offered
-        std::snprintf(buf, sizeof buf, "basalt error: RAM ran out loading (%llu MiB free); the resident copy is only "
+        std::snprintf(buf, sizeof buf, "RAM ran out loading (%llu MiB free); the resident copy is only "
                                        "%llu MiB, so something else is holding the memory (other programs, or file "
                                        "pages read while loading)", mib, (unsigned long long) (copy_bytes >> 20));
     } else {
-        // the copy shrunk by what the margin is short of leaves the margin free again
-        const uint64_t keep = copy_bytes - std::min(copy_bytes, margin > avail ? margin - avail : 0);
-        std::snprintf(buf, sizeof buf, "basalt error: RAM ran out loading (%llu MiB free); use --resident-budget-gib %llu",
+        // the copy shrunk by what the reserve is short of leaves the reserve free again
+        const uint64_t keep = copy_bytes - std::min(copy_bytes, reserve > avail ? reserve - avail : 0);
+        std::snprintf(buf, sizeof buf, "RAM ran out loading (%llu MiB free); use --resident-budget-gib %llu",
                       mib, (unsigned long long) std::max<uint64_t>(1, keep >> 30));
     }
     return buf;
@@ -241,7 +429,7 @@ void start_memory_watchdog(uint64_t floor_bytes) {
             const uint64_t avail = available_memory();
             if (avail > 0 && avail < floor_bytes) {
                 basalt::log::error("basalt", "%s", ram_exhausted_message(avail, g_resident_mode.load(), g_resident_copy.load(),
-                                                                   ram_margin()).c_str());
+                                                                   ram_reserve()).c_str());
                 _exit(1);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -327,6 +515,7 @@ uint64_t g_guard_avail = 0;
 MemoryStalls g_guard_stalls;
 std::mutex g_judge_mu;   // one judgement at a time: the guard's thread, or an unpause
 RamLevel g_judged = RamLevel::Ok;   // the level the last judgement left (under g_judge_mu)
+BelowFloorClock g_below;            // how long the reading has been below the floor (under g_judge_mu)
 
 // Judges the reading `avail` against the floor: sets the level, counts a drop below the floor, logs a change.
 void guard_judge(uint64_t avail) {
@@ -334,7 +523,10 @@ void guard_judge(uint64_t avail) {
     const uint64_t floor = g_guard_floor.load();
     // the stall reading only matters below the floor
     const MemoryStalls stalls = ram_below_floor(avail, floor) ? memory_stalls() : MemoryStalls{};
-    const RamLevel level = ram_level(avail, floor, kRamHardFloor, stalls);
+    const uint64_t below_ms = g_below.update(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(),
+        ram_below_floor(avail, floor));
+    const RamLevel level = ram_level(avail, floor, kRamHardFloor, stalls, below_ms);
     const RamLevel was = g_judged;
     {
         std::lock_guard<std::mutex> lock(g_guard_mu);
@@ -349,6 +541,9 @@ void guard_judge(uint64_t avail) {
     if (level == RamLevel::Critical && was != RamLevel::Critical && stalls.known)
         basalt::log::warn("basalt", "RAM critical: %llu MiB free, hard floor %llu MiB, memory stalls some "
                           "%.0f%% full %.0f%%", mib, (unsigned long long) (kRamHardFloor >> 20), stalls.some, stalls.full);
+    if (level == RamLevel::Critical && was != RamLevel::Critical && !stalls.known && avail >= kRamHardFloor)
+        basalt::log::warn("basalt", "RAM critical: %llu MiB free, below the %llu MiB guard for %llu s", mib,
+                          (unsigned long long) (floor >> 20), (unsigned long long) (below_ms / 1000));
     if (level == RamLevel::Low && was == RamLevel::Critical)
         basalt::log::info("basalt", "RAM low, no longer critical: %llu MiB free", mib);
     if (level == RamLevel::Ok && was != RamLevel::Ok) basalt::log::info("basalt", "RAM back: %llu MiB free", mib);
@@ -451,12 +646,18 @@ void ram_guard_pause(bool paused) {
         g_guard_paused = true;
         return;
     }
+    if (g_guard_paused.load()) {
+        std::lock_guard<std::mutex> judge(g_judge_mu);
+        g_below = BelowFloorClock{};   // a sleep is not time spent below the floor
+    }
     if (g_guard_paused.exchange(false) && g_guard_on.load()) guard_judge(available_memory());
 }
 
 #if defined(_WIN32)
 namespace {
 constexpr uint64_t kPrefetchStep = 128ull << 10;
+// Windows of one prefetch ask: bounded so a batch holds at most this much memory ahead of the access.
+constexpr size_t kMaxPrefetchEntries = 512;
 
 /// The page size, so a prefetch window starts on a page boundary.
 uintptr_t page_bytes() {
@@ -472,19 +673,36 @@ uintptr_t page_bytes() {
 bool read_ahead_enabled() { return true; }
 
 void advise_willneed(const void* p, uint64_t bytes) {
-    if (p == nullptr || bytes == 0 || !read_ahead_enabled()) return;
-    // A view of a file mapping takes its pages one fault at a time as they are touched, so asking for the range
-    // ahead of the access replaces those faults with large background reads.  The hint is best effort: a range the
-    // system will not serve is skipped without an error, and pages already in memory cost nothing.  The range is
-    // asked for in bounded windows, which keeps the reads in flight - and the memory they hold - bounded instead of
-    // asking for a whole layer at once.
-    const uintptr_t pg = page_bytes(), end = (uintptr_t) p + bytes;
-    for (uintptr_t a = (uintptr_t) p & ~(pg - 1); a < end; a += kPrefetchStep) {
-        WIN32_MEMORY_RANGE_ENTRY entry{};
-        entry.VirtualAddress = (PVOID) a;
-        entry.NumberOfBytes = (SIZE_T) std::min<uintptr_t>(kPrefetchStep, end - a);
-        (void) PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+    if (p == nullptr || bytes == 0) return;
+    advise_willneed(&p, &bytes, 1);
+}
+
+void advise_willneed(const void* const* addrs, const uint64_t* sizes, size_t n) {
+    if (addrs == nullptr || sizes == nullptr || n == 0 || !read_ahead_enabled()) return;
+    // A view of a file mapping takes its pages one fault at a time as they are touched, so asking for the ranges
+    // ahead of the access replaces those faults with large background reads. The entries of one PrefetchVirtualMemory
+    // call are read side by side; a call per window would serialize them, so the windows of every range gather into
+    // one ask, flushed in bounded batches to keep the reads in flight - and the memory they hold - bounded.
+    const uintptr_t pg = page_bytes();
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
+    for (size_t i = 0; i < n; ++i) {
+        const uint8_t* p = (const uint8_t*) addrs[i];
+        const uint64_t bytes = sizes[i];
+        if (p == nullptr || bytes == 0) continue;
+        const uintptr_t end = (uintptr_t) p + bytes;
+        for (uintptr_t a = (uintptr_t) p & ~(pg - 1); a < end; a += kPrefetchStep) {
+            WIN32_MEMORY_RANGE_ENTRY entry{};
+            entry.VirtualAddress = (PVOID) a;
+            entry.NumberOfBytes = (SIZE_T) std::min<uintptr_t>(kPrefetchStep, end - a);
+            entries.push_back(entry);
+            if (entries.size() >= kMaxPrefetchEntries) {
+                (void) PrefetchVirtualMemory(GetCurrentProcess(), (ULONG) entries.size(), entries.data(), 0);
+                entries.clear();
+            }
+        }
     }
+    if (!entries.empty())
+        (void) PrefetchVirtualMemory(GetCurrentProcess(), (ULONG) entries.size(), entries.data(), 0);
 }
 
 void advise_willneed(int fd, uint64_t offset, uint64_t bytes) {
@@ -508,6 +726,11 @@ void advise_willneed(const void* p, uint64_t bytes) {
     const uintptr_t pg = ps > 0 ? (uintptr_t) ps : 4096, end = (uintptr_t) p + bytes;
     for (uintptr_t a = (uintptr_t) p & ~(pg - 1); a < end; a += kAdviseStep)
         (void) madvise((void*) a, (size_t) std::min<uintptr_t>(kAdviseStep, end - a), MADV_WILLNEED);
+}
+
+void advise_willneed(const void* const* addrs, const uint64_t* sizes, size_t n) {
+    if (addrs == nullptr || sizes == nullptr || n == 0 || !read_ahead_enabled()) return;
+    for (size_t i = 0; i < n; ++i) advise_willneed(addrs[i], sizes[i]);
 }
 
 void advise_willneed(int fd, uint64_t offset, uint64_t bytes) {
@@ -664,16 +887,51 @@ void free_region(void* p, uint64_t bytes) {
     VirtualFree(p, 0, MEM_RELEASE);
 }
 
-bool pin_budget(uint64_t& limit, std::string& why) {
-    constexpr uint64_t GiB = 1ull << 30;
-    const uint64_t ram = basalt::platform::total_physical_memory();
-    if (ram == 0) return false;
-    limit = ram / 2 > 8 * GiB ? ram / 2 - 8 * GiB : 0;
-    char buf[192];
-    std::snprintf(buf, sizeof buf, "the GPU's shared-memory budget, RAM/2 - 8 GiB of %.1f GiB RAM",
-                  (double) ram / (double) GiB);
-    why = buf;
-    return true;
+bool pin_budget(uint64_t& limit, std::string& why, const char* luid, uint32_t node_mask, bool shared_mapping) {
+    limit = 0;
+    why.clear();
+    if (!luid || !node_mask) return false;
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**) &factory))) return false;
+    bool found = false;
+    for (UINT i = 0; !found; ++i) {
+        IDXGIAdapter1* adapter = nullptr;
+        if (factory->EnumAdapters1(i, &adapter) != S_OK) break;
+        DXGI_ADAPTER_DESC1 desc{};
+        IDXGIAdapter3* budget_adapter = nullptr;
+        if (SUCCEEDED(adapter->GetDesc1(&desc)) && std::memcmp(&desc.AdapterLuid, luid, 8) == 0 &&
+            SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void**) &budget_adapter))) {
+            for (UINT node = 0; node < 32; ++node) {
+                if (!(node_mask & (uint32_t(1) << node))) continue;
+                DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+                if (FAILED(budget_adapter->QueryVideoMemoryInfo(node, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info))) continue;
+                uint64_t budget = info.Budget;
+                if (shared_mapping) {
+                    // Multiple mapping consumers stay within the OS's reservable working-set allowance.
+                    const uint64_t available = std::min<uint64_t>(info.AvailableForReservation, budget);
+                    budget = available + std::min<uint64_t>(info.CurrentReservation, budget - available);
+                }
+                const uint64_t reserve = pin_reserve(budget);
+                const uint64_t free = budget > info.CurrentUsage ? budget - info.CurrentUsage : 0;
+                const uint64_t allowance = free > reserve ? free - reserve : 0;
+                if (!found || allowance < limit) {
+                    limit = allowance;
+                    char buf[224];
+                    constexpr double GiB = 1073741824.0;
+                    std::snprintf(buf, sizeof buf,
+                                  "DXGI non-local budget %.2f GiB, mapping allowance %.2f GiB, used %.2f GiB, reserve %.2f GiB",
+                                  (double) info.Budget / GiB, (double) budget / GiB,
+                                  (double) info.CurrentUsage / GiB, (double) reserve / GiB);
+                    why = buf;
+                }
+                found = true;
+            }
+            budget_adapter->Release();
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    return found;
 }
 
 #else
@@ -837,7 +1095,7 @@ void free_region(void* p, uint64_t bytes) {
     munmap(p, bytes);
 }
 
-bool pin_budget(uint64_t&, std::string&) { return false; }   // no OS-side budget below the driver's own limit
+bool pin_budget(uint64_t&, std::string&, const char*, uint32_t, bool) { return false; }   // no OS-side budget below the driver's own limit
 #endif
 
 void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
@@ -850,5 +1108,14 @@ void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const 
     return p;
 }
 
+
+uint64_t system_page_size() {
+#if defined(_WIN32)
+    return (uint64_t) page_bytes();
+#else
+    const long page = sysconf(_SC_PAGESIZE);
+    return page > 0 ? (uint64_t) page : 0;
+#endif
+}
 
 }  // namespace basalt::platform

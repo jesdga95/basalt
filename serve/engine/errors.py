@@ -1,6 +1,24 @@
 """Errors raised for a request by the engine process and the server."""
 from __future__ import annotations
 
+# The ERR codes the engine gives a machine-readable form: `ERR <code> key=N ...: <message>`
+ERR_CODES = ("context_overflow", "context_no_room")
+
+
+def split_err(text: str) -> tuple[str | None, dict[str, int], str]:
+    """(code, fields, message) of an ERR text (the line without `ERR `): the code and integer fields of a coded error,
+    else (None, {}, text)."""
+    head, sep, message = text.partition(": ")
+    words = head.split()
+    if sep and len(words) > 1 and words[0] in ERR_CODES:
+        fields = {}
+        for w in words[1:]:
+            k, _, v = w.partition("=")
+            if not v.lstrip("-").isdigit():
+                return None, {}, text
+            fields[k] = int(v)
+        return words[0], fields, message
+    return None, {}, text
 
 
 class EngineDied(RuntimeError):
@@ -32,8 +50,16 @@ class EngineError(ValueError):
     request's fault. A ValueError, so every path that ends a request on the engine's ERR line still does."""
 
 
+class ClientGone(Exception):
+    """The client left while its request waited for its model's turn."""
+
+
 class EngineStuck(RuntimeError):
     """The engine survived QUIT, terminate and kill."""
+
+
+class WakeBlocked(RuntimeError):
+    """A sleeping engine cannot wake yet: the VRAM its state needs is not free. The engine is untouched and stays asleep."""
 
 
 class GpuBusy(RuntimeError):

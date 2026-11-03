@@ -1,0 +1,35 @@
+{
+  "submitter": "obiscr",
+  "date": "2026-11-20",
+  "commit": "71be0a452b",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5090",
+      "vram_gib": 32,
+      "power_w": 510,
+      "pcie": "5.0 x16",
+      "h2d_gbps": 57.8
+    }
+  ],
+  "ram_gib": 93,
+  "cpu": "AMD Ryzen 9 9950X3D, 16 cores",
+  "ram_gbps": 61.8,
+  "os": "Windows",
+  "quant": "IQ3_S",
+  "kv": "int8",
+  "prefill_16k_tps": 8534.7,
+  "prefill_64k_tps": 9464.4,
+  "decode_tps": 511.0,
+  "decode_conv_tps": 342.2,
+  "decode_struct_tps": 631.1,
+  "decode_prose_tps": 292.6,
+  "accept_conv_pct": 71.3,
+  "accept_struct_pct": 93.6,
+  "accept_prose_pct": 61.5,
+  "draft_len_conv": 2.4,
+  "draft_len_struct": 6.8,
+  "draft_len_prose": 1.8,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8"
+}

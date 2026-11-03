@@ -1,10 +1,9 @@
 // include/basalt/kernels/rope_scaling.hpp - rope scaling: extending the context past the trained one.
 //
-// WHAT IT IS.  The artifact's RoPE is trained over `orig_ctx` positions (the artifact ships no
-// `rope.scaling` keys, so this is a pure runtime feature).  Scaling re-uses positions past that by
-// rescaling the rotation angles.  Three types, the llama.cpp set:
+// WHAT IT IS.  A model's RoPE is trained over `orig_ctx` positions.  Scaling re-uses positions past
+// that by rescaling the rotation angles.  Three types, the llama.cpp set:
 //
-//   none    freq_scale 1, no correction                      - today's behaviour, exactly
+//   none    freq_scale 1, no correction                      - the trained rotation, exactly
 //   linear  Position Interpolation: angles shrunk by 1/factor - every position fits again, all
 //           frequencies compressed uniformly
 //   yarn    YaRN: high-frequency pairs keep their trained angles (extrapolate), low-frequency
@@ -12,28 +11,18 @@
 //           `mscale` that keeps the attention temperature where training put it
 //
 // THE MATH IS GGML'S, TRANSCRIBED, NOT RE-DERIVED.  llama.cpp (commit
-// 3cf03257f219afbe7334045ff7c6a06ac68c627d) is the
-// numerical contract (the same standing `native_rope.cu` declares): ramp, correction dims, the
+// 3cf03257f219afbe7334045ff7c6a06ac68c627d) is the numerical contract: ramp, correction dims, the
 // interpolation mix and the mscale formula below are line-for-line that source, with the MIT
 // attribution at each helper.  The one deliberate deviation is bookkeeping: ggml's device kernel
-// speaks in even dim indices (`i0`) and halves them inside the ramp, while every the engine rope kernel
+// speaks in even dim indices (`i0`) and halves them inside the ramp, while every engine rope kernel
 // speaks in PAIR indices - so `rope_yarn_ramp` here takes the pair index and compares it against
-// `corr_dims` directly.  Same numbers, one less division per call site.
+// `corr_dims` directly.  Same numbers, one less division per call site.  Under interleaved M-RoPE a
+// pair keeps its frequency index whichever position stream (t, h, w) it rotates by, so the ramp runs
+// over the same pair index there too (as ggml's rope_multi and transformers' Qwen3.5 rotary do).
 //
-// HOW IT REACHES THE ROPE.  Two forms, one config:
-//
-//   - the TABLE path (the default decode path, the indexer's pooled key) never changes its kernels:
-//     scaling is baked into the cos/sin contents by `build_rope_table`, which the parity test checks
-//     bit-exactly against a float64 reference;
-//   - the ANALYTIC paths (the native rope, the native indexer, prefill) get the resolved constants
-//     as kernel arguments.
-//
-// **PROCESS CONSTANTS, SET ONCE BEFORE CAPTURE.**  A CUDA graph bakes kernel ARGUMENTS at capture
-// time, so the scaling must be fixed before `session_init` captures the layers - which is exactly
-// the constraint the per-token values already respect by living in device memory (`st.pos_dev`).
-// `rope_scaling_set()` is called once from the engine's startup, after CLI and GGUF defaults meet,
-// before any graph exists.  There is deliberately no way to change it mid-process: the K already in
-// the cache is stored POST-RoPE, so a mid-run change would mix two scalings in one cache.
+// FIXED FOR A RUN.  The K in a cache is stored POST-RoPE, so one cache must never mix two scalings:
+// a model resolves its scaling once at start (basalt/model/rope_flags.hpp) and every rotation of
+// the run reads that one configuration.
 #pragma once
 
 #include <cmath>
@@ -59,14 +48,14 @@ struct RopeKernelArgs {
     float attn_factor = 1.0f;
 };
 
-/// The one rope configuration, as the CLI flag family and the (future) GGUF rope keys resolve to.
+/// The one rope configuration, as the CLI flag family and the model file's rope keys resolve to.
 ///
 /// Default-constructed this is EXACTLY today's engine: freq_scale 1, mscale 1, no correction.  That
 /// identity is a regression gate, not a coincidence - the parity test compares the default's table
 /// against the pre-scaling builder bit for bit.
 struct RopeScaling {
     RopeScalingType type = RopeScalingType::None;
-    double freq_base = 1e7;    ///< `rope.freq_base` (the value pinned by `qsa_freq_base()`)
+    double freq_base = 1e7;    ///< `rope.freq_base`: the model's own unless `--rope-freq-base` says otherwise
     double factor = 1.0;       ///< `--rope-scale`: how far past the trained context the run goes
     double freq_scale_in = 0;  ///< `--rope-freq-scale`: the raw ggml knob; 0 = 1/factor
     double orig_ctx = 262144;  ///< `--yarn-orig-ctx`: the context the model was trained over
@@ -184,11 +173,5 @@ inline const char* rope_scaling_invalid(const RopeScaling& s) {
     return nullptr;
 }
 
-/// The process's one rope configuration.  Set it ONCE at startup, after the CLI and the model file
-/// have agreed on the values and BEFORE `session_init` (which builds the rope table and captures the
-/// graphs); read it at table build time and when launching the analytic kernels.  Plain storage, no
-/// atomics: one writer on the startup thread, every reader after it.
-void rope_scaling_set(const RopeScaling& scaling);
-const RopeScaling& rope_scaling();
 
 }  // namespace basalt::kernels

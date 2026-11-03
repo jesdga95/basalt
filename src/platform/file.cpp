@@ -17,6 +17,8 @@
 #include <fcntl.h>    // _O_RDONLY, _O_BINARY
 #include <io.h>       // _wopen, _waccess, _close, _fileno, _get_osfhandle
 #include <sys/stat.h>  // _S_IREAD, _S_IWRITE
+#include <mutex>
+#include <unordered_set>
 #else
 #include <fcntl.h>    // O_RDONLY, posix_fadvise
 #include <sys/stat.h>  // ::stat
@@ -56,9 +58,6 @@ std::wstring to_wide_path(const std::string& utf8) {
     return L"\\\\?\\" + full;
 }
 
-namespace {
-/// The way back, for a path the OS names (its own module path, a resolved path, the temp directory). An empty
-/// result means the name could not be read or is not representable.
 std::string to_utf8(const wchar_t* w) {
     const int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
     if (n <= 0) return std::string();
@@ -66,6 +65,20 @@ std::string to_utf8(const wchar_t* w) {
     WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], n, nullptr, nullptr);
     s.pop_back();
     return s;
+}
+
+namespace {
+std::mutex direct_mu;
+std::unordered_set<int> direct_fds;
+
+/// The CRT owns the handle once it has a descriptor. Reads on these handles each use their own event and offset.
+int direct_descriptor(HANDLE h) {
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(h), _O_RDONLY | _O_BINARY);
+    if (fd < 0) { CloseHandle(h); return -1; }
+    std::lock_guard<std::mutex> lock(direct_mu);
+    direct_fds.insert(fd);
+    return fd;
 }
 
 /// This thread's handle for reading `fd`, valid until the read that asked for it is done. A handle opened without
@@ -94,7 +107,12 @@ int open_fd_utf8(const std::string& path) {
 }
 
 void close_fd(int fd) {
-    if (fd >= 0) _close(fd);
+    if (fd < 0) return;
+    {
+        std::lock_guard<std::mutex> lock(direct_mu);
+        direct_fds.erase(fd);
+    }
+    _close(fd);
 }
 
 bool absolute_path(const std::string& path, std::string& out) {
@@ -138,31 +156,40 @@ std::string temp_dir() {
 
 int64_t pread(int fd, void* dst, size_t n, uint64_t off) {
     if (fd < 0) return -1;   // asking the CRT for a negative descriptor's handle stops the process here
+    bool direct = false;
+    {
+        std::lock_guard<std::mutex> lock(direct_mu);
+        direct = direct_fds.count(fd) != 0;
+    }
     const HANDLE shared = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
-    const HANDLE h = read_handle(shared);
+    const HANDLE h = direct ? shared : read_handle(shared);
     if (h == INVALID_HANDLE_VALUE) return -1;
     const DWORD want = (DWORD) (n < (size_t) (1ull << 30) ? n : (size_t) (1ull << 30));
     OVERLAPPED ov{};
     ov.Offset = (DWORD) (off & 0xFFFFFFFFull);
     ov.OffsetHigh = (DWORD) (off >> 32);
+    if (direct) {
+        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (ov.hEvent == nullptr) return -1;
+    }
+    struct Close {
+        HANDLE own, event;
+        ~Close() {
+            if (event != nullptr) CloseHandle(event);
+            if (own != INVALID_HANDLE_VALUE) CloseHandle(own);
+        }
+    } close{h != shared ? h : INVALID_HANDLE_VALUE, ov.hEvent};
     DWORD got = 0;
     if (!ReadFile(h, dst, want, &got, &ov)) {
-        // A read that ran into the end of the file reports the bytes it did get as an error, so `got` stands.
-        // ERROR_IO_PENDING means the handle is an overlapped one: this thread has no other read outstanding on it,
-        // so waiting for that request is the whole of what a synchronous read would have done.
         const DWORD e = GetLastError();
         if (e == ERROR_IO_PENDING) {
             got = 0;
-            if (!GetOverlappedResult(h, &ov, &got, TRUE) && GetLastError() != ERROR_HANDLE_EOF) {
-                if (h != shared) CloseHandle(h);
+            if (!GetOverlappedResult(h, &ov, &got, TRUE) && GetLastError() != ERROR_HANDLE_EOF)
                 return -1;
-            }
         } else if (e != ERROR_HANDLE_EOF) {
-            if (h != shared) CloseHandle(h);
             return -1;
         }
     }
-    if (h != shared) CloseHandle(h);   // the read is done: the file is no longer this call's to hold open
     return (int64_t) got;
 }
 
@@ -192,19 +219,16 @@ void advise_dontneed(int fd, uint64_t off, uint64_t bytes) {
 }
 
 int open_unbuffered(int fd) {
-    // No unbuffered descriptor on this platform. A handle that bypasses the cache is opened by path with
-    // FILE_FLAG_NO_BUFFERING, and every read through it has to line up with the volume's sector size; what this call
-    // is given is a descriptor, and a name is not recoverable from it. The caller that gets -1 reads the same bytes
-    // through its mapping, which is the file cache doing the copy the unbuffered read would have saved.
-    (void) fd;
-    return -1;
+    if (fd < 0) return -1;
+    const HANDLE original = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+    return direct_descriptor(ReOpenFile(original, GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED));
 }
 
 int open_unbuffered(const std::string& path) {
-    // The same answer for the path form: those ranges are read through the file cache here, so a caller that gets -1
-    // opens the file ordinarily and the bytes arrive by the cached route.
-    (void) path;
-    return -1;
+    return direct_descriptor(CreateFileW(to_wide_path(path).c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr));
 }
 
 int open_write_utf8(const std::string& path) {
@@ -249,6 +273,13 @@ namespace {
 std::filesystem::path fs_path(const std::string& utf8) { return std::filesystem::path(to_wide_path(utf8)); }
 std::string fs_name(const std::filesystem::path& p) { return to_utf8(p.filename().wstring().c_str()); }
 }  // namespace
+
+bool make_dirs(const std::string& path) {
+    // the new directories take the parent's inherited access list
+    std::error_code ec;
+    std::filesystem::create_directories(fs_path(path), ec);
+    return std::filesystem::is_directory(fs_path(path), ec);
+}
 
 #else
 // ----------------------------------------------------------------------------------------------- POSIX
@@ -332,12 +363,12 @@ int open_unbuffered(const std::string& path) {
 }
 
 int open_write_utf8(const std::string& path) {
-    return ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    return ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
 }
 
 int open_write_unbuffered(const std::string& path) {
     // A file system that refuses the flag answers -1, and the caller writes through the cache.
-    return ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_DIRECT, 0644);
+    return ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_DIRECT, 0600);
 }
 
 bool pwrite_all(int fd, const void* src, uint64_t n, uint64_t off) {
@@ -364,13 +395,19 @@ std::filesystem::path fs_path(const std::string& utf8) { return std::filesystem:
 std::string fs_name(const std::filesystem::path& p) { return p.filename().string(); }
 }  // namespace
 
-#endif
-
 bool make_dirs(const std::string& path) {
+    // each missing directory is made owner-only; existing ones keep their mode
     std::error_code ec;
-    std::filesystem::create_directories(fs_path(path), ec);
+    std::filesystem::path cur;
+    for (const auto& part : fs_path(path)) {
+        cur /= part;
+        if (std::filesystem::is_directory(cur, ec)) continue;
+        if (::mkdir(cur.c_str(), 0700) != 0 && errno != EEXIST) return false;
+    }
     return std::filesystem::is_directory(fs_path(path), ec);
 }
+
+#endif
 
 bool list_files(const std::string& dir, std::vector<DirFile>& out) {
     out.clear();
@@ -438,6 +475,16 @@ bool pread_all(int fd, void* dst, uint64_t n, uint64_t off) {
         n -= (uint64_t) got;
     }
     return true;
+}
+
+std::string install_root() {
+    std::string dir = module_path();
+    for (int up = 0; up < 2; ++up) {   // the executable's name, then its directory
+        const size_t cut = dir.find_last_of("/\\");
+        if (cut == std::string::npos || cut == 0) return std::string();
+        dir.resize(cut);
+    }
+    return dir;
 }
 
 }  // namespace basalt::platform

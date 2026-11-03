@@ -13,6 +13,8 @@
 // repeatable: the construction of llama.cpp's Qwen3-Coder parser.
 #pragma once
 
+#include "basalt/program/grammar/tool_form.hpp"
+
 #include <memory>
 #include <string>
 
@@ -25,27 +27,28 @@ std::string json_schema_to_gbnf(const std::string& schema_json, std::string& err
 
 struct ToolGrammarOptions {
     size_t max_permute = 6;          ///< required parameters are permuted up to this many; more keep the declared order
-    bool multiple_calls = true;      ///< more than one <tool_call> block
+    bool multiple_calls = true;      ///< more than one call
+    std::string answer_schema;       ///< a JSON schema: the root also takes one JSON value of it instead of calls
 };
 
 /// `tools_json` is an array of {name, parameters:{properties, required}} (or the OpenAI {type:"function",
 /// function:{...}} wrapper). Empty with `err` set on bad input or an empty list.
 std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptions& opt, std::string& err);
 
-/// The text that starts a tool call: the lazy trigger for tool_call_gbnf.
-inline const char* tool_call_trigger() { return "<tool_call>"; }
-
 /// What the engine needs for one request: the parsed grammar and when it starts.
 struct RequestGrammar {
     std::shared_ptr<const Grammar> grammar;   ///< null: nothing to enforce
     Triggers triggers;                        ///< empty: enforce from the first answer token
+    bool think = true;                        ///< "think": false, the request's thinking is off (a reply of blocks)
 };
 
 /// Builds the grammar from the request's "grammar" JSON object:
 ///   {"kind":"tools","tools":[<OpenAI tool objects>],"tool_choice":<as received>}   lazy, trigger "<tool_call>"
 ///   {"kind":"json_schema","schema":{...}}                                          from the first answer token
 ///   {"kind":"json_object"}                                                         any JSON object
-/// tool_choice "none" gives a null grammar; a named choice keeps only that tool. A null grammar with empty `err` is
+/// Any of them may say "think": false (the request's thinking is off).
+/// A json_schema or json_object request may carry "tools" too: from the first answer token, either tool calls or the
+/// JSON value. tool_choice "none" gives a null grammar; a named choice keeps only that tool. A null grammar with empty `err` is
 /// not an error; an unusable request sets `err`.
 RequestGrammar grammar_from_request(const std::string& grammar_json, std::string& err);
 

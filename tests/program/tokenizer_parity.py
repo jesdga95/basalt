@@ -26,7 +26,8 @@ def load_reference(tdir: pathlib.Path):
         tokens[i] = k
     merges = (tdir / "merges.txt").read_text(encoding="utf-8").split("\n")
     types = json.loads((tdir / "token_type.json").read_text())
-    return ST.Tokenizer(tokens, merges, types)
+    pre = json.loads((tdir / "tokenizer.json").read_text(encoding="utf-8")).get("pre", "qwen35")
+    return ST.Tokenizer(tokens, merges, types, pre=pre)
 
 
 def corpus(tk, big):

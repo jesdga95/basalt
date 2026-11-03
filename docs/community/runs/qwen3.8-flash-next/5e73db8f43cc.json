@@ -1,0 +1,43 @@
+{
+  "submitter": "void-mckenzie",
+  "date": "2026-11-19",
+  "commit": "caa7c7a08b",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5090",
+      "vram_gib": 32,
+      "power_w": 450,
+      "pcie": "5.0 x16",
+      "h2d_gbps": 48.4
+    },
+    {
+      "name": "RTX 5060 Ti",
+      "vram_gib": 16,
+      "power_w": 180,
+      "pcie": "4.0 x4",
+      "h2d_gbps": 6.5
+    }
+  ],
+  "ram_gib": 93,
+  "cpu": "AMD Ryzen 9 7950X3D, 16 cores",
+  "ram_gbps": 54.0,
+  "os": "Linux",
+  "quant": "Q4_K_XL-Q8PLE",
+  "kv": "int8",
+  "prefill_16k_tps": 7637.6,
+  "prefill_64k_tps": 8274.7,
+  "decode_tps": 334.0,
+  "decode_conv_tps": 214.3,
+  "decode_struct_tps": 406.1,
+  "decode_prose_tps": 205.6,
+  "accept_conv_pct": 69.2,
+  "accept_struct_pct": 97.3,
+  "accept_prose_pct": 64.8,
+  "draft_len_conv": 2.1,
+  "draft_len_struct": 7.0,
+  "draft_len_prose": 1.9,
+  "engine_args": "--gpu 0,1 --max-context 66661 --kv int8",
+  "notes": "Self-built pack: unsloth UD-Q4_K_XL everywhere but the Engram rows, which are Q8, per unsloth's guidance; default (untuned) drafter, vision mmproj. 5060 Ti peer on a PCIe 4.0 x4 slot."
+}

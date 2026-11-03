@@ -89,5 +89,41 @@ class StreamedCall(unittest.TestCase):
         self.check("count", "null", None)
 
 
+UNION = {"name": "automation", "parameters": {"type": "object", "properties": {},
+    "oneOf": [{"$ref": "#/$defs/view"}, {"$ref": "#/$defs/write"}],
+    "$defs": {
+        "id": {"type": "string"},
+        "view": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["view"]},
+                                                 "id": {"$ref": "#/$defs/id"}}},
+        "write": {"oneOf": [{"$ref": "#/$defs/create"}]},
+        "create": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["create"]},
+                                                   "name": {"type": "string"}, "every": {"type": "integer"}}},
+    }}}
+
+
+class UnionParameters(unittest.TestCase):
+    """Parameters sent as a oneOf union are typed by the variant that declares them."""
+
+    def test_each_variant_types_its_parameters(self):
+        body = ("<function=automation>\n<parameter=mode>\ncreate\n</parameter>\n"
+                "<parameter=name>\n123\n</parameter>\n<parameter=every>\n8\n</parameter>\n</function>")
+        self.assertEqual(parse_tool_call(body, UNION).arguments, {"mode": "create", "name": "123", "every": 8})
+        body = ("<function=automation>\n<parameter=mode>\nview\n</parameter>\n"
+                "<parameter=id>\n42\n</parameter>\n</function>")
+        self.assertEqual(parse_tool_call(body, UNION).arguments, {"mode": "view", "id": "42"})
+
+    def test_streamed(self):
+        text = ("<tool_call>\n<function=automation>\n<parameter=name>\n123\n</parameter>\n"
+                "<parameter=every>\n8\n</parameter>\n</function>\n</tool_call>")
+        for step in (1, 7, len(text)):
+            p = OutputParser(thinking=False, tools=[UNION], stream_tools=True)
+            events = []
+            for i in range(0, len(text), step):
+                events += p.feed(text[i:i + step])
+            events += p.finish()
+            streamed = "".join(e.text for e in events if e.kind == "tool_args")
+            self.assertEqual(json.loads(streamed), {"name": "123", "every": 8}, step)
+
+
 if __name__ == "__main__":
     unittest.main()

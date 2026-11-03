@@ -25,6 +25,7 @@
 // the same arithmetic over the sorted list.
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/core/diag.hpp"
+#include "philox.cuh"
 
 #include <cub/device/device_radix_sort.cuh>
 #include <cuda_runtime.h>
@@ -40,33 +41,6 @@
 
 namespace basalt::kernels {
 namespace {
-
-// Philox 4x32-10, a counter-based generator.  Counter-based matters because it makes the stream a function of
-// (seed, position) rather than of how many draws came before - so a batch can be sampled in any order and a run is
-// reproducible.
-__device__ __forceinline__ uint32_t philox4x32_round(uint32_t& c0, uint32_t& c1, uint32_t& c2, uint32_t& c3,
-                                                     uint32_t k0, uint32_t k1) {
-    const uint32_t hi0 = __umulhi(0x9E3779B9u, c0);
-    const uint32_t hi1 = __umulhi(0xBB67AE85u, c2);
-    const uint32_t lo0 = 0x9E3779B9u * c0;
-    const uint32_t lo1 = 0xBB67AE85u * c2;
-    const uint32_t n0 = hi1 ^ c1 ^ k0;
-    const uint32_t n1 = lo1;
-    const uint32_t n2 = hi0 ^ c3 ^ k1;
-    const uint32_t n3 = lo0;
-    c0 = n0; c1 = n1; c2 = n2; c3 = n3;
-    return 0;
-}
-
-__device__ __forceinline__ float philox_uniform(uint64_t seed, uint64_t counter) {
-    uint32_t c0 = (uint32_t) counter, c1 = (uint32_t) (counter >> 32);
-    uint32_t c2 = (uint32_t) seed, c3 = (uint32_t) (seed >> 32);
-    for (int i = 0; i < 10; ++i) {
-        philox4x32_round(c0, c1, c2, c3, (uint32_t) i, 0u);
-    }
-    // 24 bits of mantissa, so the value is uniform in [0,1) with no rounding to 1.0
-    return (float) (c0 >> 8) * (1.0f / 16777216.0f);
-}
 
 // `count_in_history` and the penalty application, transcribed from `llama_sampler_penalties_apply`.
 // The repeat penalty MULTIPLIES for non-positive logits and DIVIDES for positive ones - dividing
@@ -367,6 +341,42 @@ __device__ __forceinline__ void warp_first(float& bv, int& bi) {
     }
 }
 
+/// Row t's token under a drawn draft (one thread, after the row's final distribution: prob(i) for ids[0 .. n), n > 0):
+/// the draft kept with probability min(1, p(d) / q(d)) on the keep stream, else the residual max(p - q, 0) drawn with the
+/// row's own uniform.  `pick`, the plain draw, stands when the residual has no mass left (only by rounding: an empty
+/// residual means p <= q everywhere, which keeps the draft).
+template <class Prob>
+__device__ int drawn_pick(const int* ids, Prob prob, int n, const SamplerParams& p, int t, int pick) {
+    const int d = p.drafts[t];
+    const int* qi = p.q_ids + (size_t) t * p.q_n;
+    const float* qp = p.q_p + (size_t) t * p.q_n;
+    const auto q_of = [&](int v) {
+        for (int j = 0; j < p.q_n; ++j)
+            if (qi[j] == v) return (double) qp[j];
+        return 0.0;
+    };
+    double pd = 0.0;
+    for (int i = 0; i < n; ++i)
+        if (ids[i] == d) { pd = prob(i); break; }
+    const double qd = q_of(d);
+    const float keep = philox_uniform(p.seed, p.counter + (uint64_t) t, kPhiloxKeep);
+    if (qd > 0.0 && (pd >= qd || (double) keep * qd < pd)) return d;
+    double mass = 0.0;
+    for (int i = 0; i < n; ++i) mass += fmax(prob(i) - q_of(ids[i]), 0.0);
+    if (!(mass > 0.0)) return pick;
+    const double thr = (double) philox_uniform(p.seed, p.counter + (uint64_t) t) * mass;
+    double cum = 0.0;
+    int last = -1;
+    for (int i = 0; i < n; ++i) {
+        const double r = fmax(prob(i) - q_of(ids[i]), 0.0);
+        if (r <= 0.0) continue;
+        cum += r;
+        last = i;
+        if (thr < cum) return ids[i];
+    }
+    return last >= 0 ? ids[last] : pick;
+}
+
 /// /// **THE TAIL ON ONE WARP.**  `sel_ids` / `sel_logit` (shared, `k` entries) are the top_k list in selection order;
 /// /// the 32 lanes of one warp call this and lane 0 writes `out[t]`.  The tail's doubles run on one warp (FP64 issues
 /// /// at a small fraction of FP32): the lanes share the `exp`s (one per entry, into `ex`) and then the quotients, and
@@ -435,6 +445,11 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
         for (int i = 0; i < n_keep; ++i) {
             cum += ex[i];
             if ((double) u < cum) { pick = sel_ids[i]; pi = i; break; }
+        }
+        if (t < p.n_drawn && n_keep > 0) {
+            pick = drawn_pick(sel_ids, [&](int i) { return ex[i]; }, n_keep, p, t, pick);
+            for (int i = 0; i < n_keep; ++i)
+                if (sel_ids[i] == pick) { pi = i; break; }
         }
         out[t] = pick;
         if constexpr (kProb) *prob_out = n_keep > 0 ? (float) ex[pi] : 1.0f;
@@ -1036,7 +1051,8 @@ __device__ void sampled_tail_pair(TailShared& ts, int k, const SamplerParams& p,
             if (!found && (double) u < cum) { pi = i; found = true; }
             return found;
         });
-        out[t] = ts.id[pi];
+        out[t] = t < p.n_drawn && n_keep > 0 ? drawn_pick(ts.id, [&](int i) { return ts.e2[i]; }, n_keep, p, t, ts.id[pi])
+                                              : ts.id[pi];
         if (qprob != nullptr && t < nq) {
             const int q = query[t];
             float pq = 0.0f;
@@ -1234,7 +1250,9 @@ int2* split_scratch(void* stream, size_t entries, unsigned** done) {
 // per entry.  The same chain at every launch, so a seed replays its draws; sampler_parity's mirror runs the same order.
 constexpr int kWideBlockSpan = 4096;   // logits per block of the key pass (its penalty bitmap: 512 bytes)
 constexpr int kWideKeyThreads = 256;
-constexpr int kWideChunks = 1024;      // chunks of a list's sums: 32 blocks of 32 threads, one chunk each
+constexpr int kWideChunks = 1024;      // chunks of a list's sums, each summed in order by one thread
+constexpr int kWideTermChunks = 8;     // chunks one block of the terms pass takes: all its threads compute their terms
+constexpr int kWideTermThreads = 256;
 constexpr int kWideRows = 8;           // rows of one pass (their buffers); more rows take several passes
 
 // a row's scan state between the wide path's launches
@@ -1303,29 +1321,33 @@ __device__ __forceinline__ int wide_kept(const WideRow& r, int k, int min_keep) 
     return cut < r.below ? cut : r.below;
 }
 
-/// One pass's terms and chunk sums: grid (32, rows) x 32 threads, thread c the chunk c of the pass's length (pass 1:
-/// the list, k; pass 2: the kept prefix).  Pass 1 holds exp(x - x0), pass 2 exp(x / T - x0 / T); pass 2's block 0
-/// records the kept prefix.
-__global__ void __launch_bounds__(32)
+/// One pass's terms and chunk sums: grid (kWideChunks / kWideTermChunks, rows) x kWideTermThreads, block b the chunks
+/// b * kWideTermChunks.. of the pass's length (pass 1: the list, k; pass 2: the kept prefix).  The block's threads compute
+/// the terms of those chunks' entries together; then one thread per chunk sums its terms in order.  Pass 1 holds
+/// exp(x - x0), pass 2 exp(x / T - x0 / T); pass 2's block 0 records the kept prefix.
+__global__ void __launch_bounds__(kWideTermThreads)
 sampler_wide_terms_kernel(const unsigned* __restrict__ keys, int n_vocab, int k, const SamplerParams p, int pass,
                           double* __restrict__ e, double* __restrict__ part, WideRow* __restrict__ st) {
-    const int t = blockIdx.y, c = (int) (blockIdx.x * 32 + threadIdx.x);
+    const int t = blockIdx.y, c0 = (int) blockIdx.x * kWideTermChunks;
     const unsigned* kr = keys + (size_t) t * n_vocab;
     double* er = e + (size_t) t * n_vocab;
     const float x0 = wide_value(kr[0]);
     const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
     const float smx = x0 * inv_t;            // the list is sorted: its first product is the largest
     const int n = pass == 1 ? k : wide_kept(st[t], k, p.min_keep);
-    if (pass == 2 && c == 0) st[t].n_keep = n;
+    if (pass == 2 && c0 == 0 && threadIdx.x == 0) st[t].n_keep = n;
     const int C = (n + kWideChunks - 1) / kWideChunks;
-    const int lo = min(n, c * C), hi = min(n, lo + C);
-    double s = 0.0;
-    for (int i = lo; i < hi; ++i) {
+    const int lo = min(n, c0 * C), hi = min(n, (c0 + kWideTermChunks) * C);
+    for (int i = lo + (int) threadIdx.x; i < hi; i += kWideTermThreads) {
         const float x = wide_value(kr[i]);
-        const double v = pass == 1 ? exp((double) x - (double) x0) : exp((double) (x * inv_t) - (double) smx);
-        er[i] = v;
-        s += v;
+        er[i] = pass == 1 ? exp((double) x - (double) x0) : exp((double) (x * inv_t) - (double) smx);
     }
+    __syncthreads();
+    if (threadIdx.x >= kWideTermChunks) return;
+    const int c = c0 + (int) threadIdx.x;
+    const int clo = min(n, c * C), chi = min(n, clo + C);
+    double s = 0.0;
+    for (int i = clo; i < chi; ++i) s += er[i];
     part[(size_t) t * kWideChunks + c] = s;
 }
 
@@ -1425,8 +1447,9 @@ __global__ void sampler_wide_out_kernel(const unsigned* __restrict__ keys, const
 
 // The wide path's buffers, one set per (device, stream) as `split_scratch`, for kWideRows rows of the vocabulary:
 // the keys and ids in, which the passes then reuse as their terms (8 bytes an entry), the sorted keys and ids, the
-// chunk sums and prefixes, the rows' scan state and the sort's own storage.  Grown (a grown-out set is retired, as the
-// split's), never shrunk; false when the memory cannot be had.
+// chunk sums and prefixes, the rows' scan state and the sorts' own storage, one per row: the rows' sorts run on streams
+// of their own (`side`, forked at `fork` and joined at `join`), since one row's sort leaves most of the card idle.
+// Grown (a grown-out set is retired, as the split's), never shrunk; false when the memory cannot be had.
 struct WideBuffers {
     unsigned* keys_in;
     int* ids_in;
@@ -1436,8 +1459,11 @@ struct WideBuffers {
     double* part;
     double* pre;
     WideRow* rows;
-    void* temp;
-    size_t temp_bytes;
+    char* temp;             // kWideRows sorts' storage, `temp_stride` bytes apart
+    size_t temp_bytes, temp_stride;
+    cudaStream_t side[kWideRows - 1];   // rows 1.. sort there, row 0 on the caller's stream
+    cudaEvent_t fork;
+    cudaEvent_t join[kWideRows - 1];
 };
 
 bool wide_buffers(void* stream, int n_vocab, WideBuffers& out) {
@@ -1447,6 +1473,9 @@ bool wide_buffers(void* stream, int n_vocab, WideBuffers& out) {
         int n_vocab;
         void* base;
         size_t temp_bytes;
+        cudaStream_t side[kWideRows - 1];
+        cudaEvent_t fork;
+        cudaEvent_t join[kWideRows - 1];
     };
     static std::mutex mu;
     static std::vector<Slot> slots;
@@ -1461,7 +1490,17 @@ bool wide_buffers(void* stream, int n_vocab, WideBuffers& out) {
     for (Slot& s : slots)
         if (s.device == device && s.stream == stream) slot = &s;
     if (slot == nullptr) {
-        slots.push_back({device, stream, 0, nullptr, 0});
+        if (stream_capturing(stream)) return false;
+        Slot ns{device, stream, 0, nullptr, 0, {}, nullptr, {}};
+        bool ok = cudaEventCreateWithFlags(&ns.fork, cudaEventDisableTiming) == cudaSuccess;
+        for (int i = 0; ok && i < kWideRows - 1; ++i)
+            ok = cudaStreamCreateWithFlags(&ns.side[i], cudaStreamNonBlocking) == cudaSuccess &&
+                 cudaEventCreateWithFlags(&ns.join[i], cudaEventDisableTiming) == cudaSuccess;
+        if (!ok) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        slots.push_back(ns);
         slot = &slots.back();
     }
     const size_t chunks = (size_t) kWideRows * kWideChunks * sizeof(double);
@@ -1475,8 +1514,9 @@ bool wide_buffers(void* stream, int n_vocab, WideBuffers& out) {
             return false;
         }
         const size_t row = (size_t) kWideRows * n_vocab * 4;
+        temp = (temp + 255) / 256 * 256;
         void* base = nullptr;
-        if (stream_capturing(stream) || cudaMalloc(&base, 4 * row + 2 * chunks + state + temp) != cudaSuccess) {
+        if (stream_capturing(stream) || cudaMalloc(&base, 4 * row + 2 * chunks + state + temp * kWideRows) != cudaSuccess) {
             (void) cudaGetLastError();
             return false;
         }
@@ -1497,6 +1537,12 @@ bool wide_buffers(void* stream, int n_vocab, WideBuffers& out) {
     out.rows = (WideRow*) (b + 4 * have + 2 * chunks);
     out.temp = b + 4 * have + 2 * chunks + state;
     out.temp_bytes = slot->temp_bytes;
+    out.temp_stride = slot->temp_bytes;
+    for (int i = 0; i < kWideRows - 1; ++i) {
+        out.side[i] = slot->side[i];
+        out.join[i] = slot->join[i];
+    }
+    out.fork = slot->fork;
     return true;
 }
 
@@ -1517,25 +1563,39 @@ void sample_wide(const float* logits, int n_tokens, int n_vocab, const int* hist
         sampler_wide_keys_kernel<<<dim3((unsigned) nb, (unsigned) R), kWideKeyThreads, 0, cs>>>(
             logits + (size_t) t0 * n_vocab, n_vocab, hist ? history + (size_t) t0 * history_len : nullptr, history_len,
             pr, k, w.keys_in, w.ids_in, w.rows);
+        // each row's sort on a stream of its own, joined before the terms
+        if (R > 1 && cudaEventRecord(w.fork, cs) != cudaSuccess) {
+            basalt::log::error("basalt", "sample_tokens sort: cannot fork the rows' sorts");
+            std::exit(1);
+        }
         for (int t = 0; t < R; ++t) {
             size_t temp = w.temp_bytes;
             const size_t o = (size_t) t * n_vocab;
-            const cudaError_t se = cub::DeviceRadixSort::SortPairs(w.temp, temp, w.keys_in + o, w.keys + o, w.ids_in + o,
-                                                                   w.ids + o, n_vocab, 0, 32, cs);
+            const cudaStream_t ss = t == 0 ? cs : w.side[t - 1];
+            cudaError_t se = t == 0 ? cudaSuccess : cudaStreamWaitEvent(ss, w.fork, 0);
+            if (se == cudaSuccess)
+                se = cub::DeviceRadixSort::SortPairs(w.temp + (size_t) t * w.temp_stride, temp, w.keys_in + o, w.keys + o,
+                                                     w.ids_in + o, w.ids + o, n_vocab, 0, 32, ss);
+            if (se == cudaSuccess && t > 0) se = cudaEventRecord(w.join[t - 1], ss);
             if (se != cudaSuccess) {
                 basalt::log::error("basalt", "sample_tokens sort: %s", cudaGetErrorString(se));
                 std::exit(1);
             }
         }
-        const dim3 grid(kWideChunks / 32, (unsigned) R);
+        for (int t = 1; t < R; ++t)
+            if (cudaStreamWaitEvent(cs, w.join[t - 1], 0) != cudaSuccess) {
+                basalt::log::error("basalt", "sample_tokens sort: cannot join the rows' sorts");
+                std::exit(1);
+            }
+        const dim3 grid(kWideChunks / 32, (unsigned) R), tgrid(kWideChunks / kWideTermChunks, (unsigned) R);
         if (p.top_p < 1.0f) {
-            sampler_wide_terms_kernel<<<grid, 32, 0, cs>>>(w.keys, n_vocab, k, pr, 1, w.terms, w.part, w.rows);
+            sampler_wide_terms_kernel<<<tgrid, kWideTermThreads, 0, cs>>>(w.keys, n_vocab, k, pr, 1, w.terms, w.part, w.rows);
             sampler_wide_scan_kernel<<<(unsigned) R, kWideChunks, 0, cs>>>(w.part, w.pre, 1, w.rows);
         }
         if (p.top_p < 1.0f || p.min_p > 0.0f)
             sampler_wide_search_kernel<<<grid, 32, 0, cs>>>(w.keys, w.ids, n_vocab, k, pr, 1, w.terms, w.pre, nullptr, 0,
                                                             w.rows);
-        sampler_wide_terms_kernel<<<grid, 32, 0, cs>>>(w.keys, n_vocab, k, pr, 2, w.terms, w.part, w.rows);
+        sampler_wide_terms_kernel<<<tgrid, kWideTermThreads, 0, cs>>>(w.keys, n_vocab, k, pr, 2, w.terms, w.part, w.rows);
         sampler_wide_scan_kernel<<<(unsigned) R, kWideChunks, 0, cs>>>(w.part, w.pre, 2, w.rows);
         // the query rows of this pass (row t0 + t asks for query[t0 + t])
         const int nq = n_query - t0 > 0 ? n_query - t0 : 0;
@@ -1687,6 +1747,10 @@ void sample_tokens_impl(int split, const float* logits, int n_tokens, int n_voca
             // sized for 16 rows and 64 entries at least, so a verify window or a wider top_k does not regrow it
             scratch = split_scratch(stream, (size_t) (n_tokens > 16 ? n_tokens : 16) * n_blocks * kSelMax, &done);
         const dim3 grid((unsigned) n_blocks, (unsigned) n_tokens);
+        if ((k > kSelMax || split == 3) && p.n_drawn > 0) {
+            basalt::log::error("basalt", "sample_tokens: drawn drafts on the wide path (a list of %d)", k);
+            std::exit(1);
+        }
         if (k > kSelMax || split == 3) {
             sample_wide(logits, n_tokens, n_vocab, history, history_len, p, k, out, query, n_query, qprob, stream);
         } else if (scratch == nullptr) {

@@ -151,6 +151,7 @@ private:
     };
     bool feed(const std::string_view& bytes, std::vector<uint32_t>& stacks, Utf8& u) const;
     bool advance(std::vector<uint32_t>& stacks, Utf8& u, std::string_view bytes, int32_t token_id) const;
+    std::vector<uint32_t> root_stacks() const;
     bool fire(size_t from, bool by_token, int32_t token_id, std::string_view bytes);
     void walk(const Vocab& v, uint32_t node, const std::vector<uint32_t>& stacks, const Utf8& u,
               std::vector<uint8_t>& out) const;

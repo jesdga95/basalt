@@ -41,9 +41,34 @@ bool device_summary(int ordinal, std::string& name, std::string& detail);
 // The device's PCI bus id as the runtime spells it ("0000:01:00.0"); false when it cannot say.
 bool device_pci_bus_id(int ordinal, std::string& id);
 
+// Fixed facts of the device for splitting work between cards: its PCIe link's byte rate in one direction (the generation
+// the card and the system reach, the width it runs at, the per-lane rate of that generation) and its SM count times its
+// highest SM clock. Read from the driver, never timed, so a placement prices the same on every start; 0 when unknown.
+struct DeviceRates {
+    double link_bytes = 0;    // bytes per second
+    double sm_hz = 0;         // SMs x clock (cycles per second summed over SMs)
+};
+DeviceRates device_rates(int ordinal);
+
+// The free and total memory of `ordinal`'s card (negative: the current one). On failure `why` names the call, the error
+// and the card: "cudaMemGetInfo: out of memory (code 2), device 0 of 2".
+bool device_memory(int ordinal, uint64_t& free_bytes, uint64_t& total_bytes, std::string& why);
+
+// Whether the runtime still serves every card in `ordinals`: a free-memory query and a 1 MiB allocation on each. A
+// process that has page-locked more host memory than the driver backs can lose both on every card while the cards
+// have room; `why` is the first failure, as `device_memory` words it.
+bool devices_allocate(const std::vector<int>& ordinals, std::string& why);
+
 // Pinned host-to-device copy speed of the device in GB/s: the best of several 256 MiB copies. 0 when the copy could not
 // be set up or timed. Uses the device briefly and frees everything before it returns.
 double device_h2d_gbps(int ordinal);
+
+// The SM count a kernel divides its work by where the division changes its bits (a layout or a split picked by the SM
+// count): the planning card's.  A model whose stages run on several cards plans by its main card (plan_sms_device), so a
+// stage on a smaller card computes what the main card would; unset, ordinal's (negative: the current card's).  A grid
+// whose blocks must all be resident at once still sizes itself by the card it runs on.
+void plan_sms_device(int ordinal);
+int plan_sms(int ordinal = -1);
 
 // Throws when there is no CUDA device.  The engine targets one architecture and must say so rather than
 // run slowly on something else: `CMakeLists.txt` refuses to COMPILE for another architecture, and

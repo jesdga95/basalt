@@ -1,0 +1,36 @@
+{
+  "submitter": "wrongdoug",
+  "date": "2026-11-23",
+  "commit": "86074b538b",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5090",
+      "vram_gib": 32,
+      "power_w": 500,
+      "pcie": "4.0 x8",
+      "h2d_gbps": 14.0
+    }
+  ],
+  "ram_gib": 94,
+  "cpu": "13th Gen Intel Core i9-13900HK, 14 cores",
+  "ram_gbps": 71.4,
+  "os": "Linux",
+  "quant": "IQ3_XXS",
+  "kv": "int8",
+  "prefill_16k_tps": 6262.6,
+  "prefill_64k_tps": 7814.4,
+  "decode_tps": 479.4,
+  "decode_conv_tps": 326.2,
+  "decode_struct_tps": 597.8,
+  "decode_prose_tps": 258.8,
+  "accept_conv_pct": 69.3,
+  "accept_struct_pct": 94.0,
+  "accept_prose_pct": 64.4,
+  "draft_len_conv": 2.7,
+  "draft_len_struct": 6.8,
+  "draft_len_prose": 2.0,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+  "notes": "Single RTX 5090 at 500 W (below 575 W default), 94 GiB DDR5, 24.6 GiB VRAM + 22.2 GiB RAM experts, 0 SSD spill; container with 68 GiB mem limit / 0 swap"
+}

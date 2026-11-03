@@ -61,10 +61,14 @@ struct DraftCumAdapt {
     /// One verified window of the MTP chain: `n` drafts were offered with probabilities probs[0..n), `acc` accepted.
     void observe(const float* probs, int n, int acc) {
         if (n <= 0) return;
-        constexpr double kDecay = 0.97, kRlo = 0.9, kRhi = 1.1;
-        const float kLo = 0.25f * draft_cum_scale();
         double c = 1.0, e = 0.0;
         for (int j = 0; j < n; ++j) { c *= (double) draft_cum_acc(probs[j]); e += c; }
+        observe_expected(e, acc);
+    }
+    /// A window in which `e` drafts were expected accepted and `acc` were.
+    void observe_expected(double e, int acc) {
+        constexpr double kDecay = 0.97, kRlo = 0.9, kRhi = 1.1;
+        const float kLo = 0.25f * draft_cum_scale();
         obs = obs * kDecay + (double) acc;
         exp = exp * kDecay + e;
         if (exp < 0.5) return;

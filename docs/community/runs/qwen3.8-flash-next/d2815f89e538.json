@@ -1,0 +1,36 @@
+{
+  "submitter": "pro4000-rig",
+  "date": "2026-11-21",
+  "commit": "a388da2431",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX PRO 4000 Blackwell",
+      "vram_gib": 24,
+      "power_w": 145,
+      "pcie": "5.0 x16",
+      "h2d_gbps": 57.7
+    }
+  ],
+  "ram_gib": 125,
+  "cpu": "AMD Ryzen Threadripper 7970X s, 32 cores",
+  "ram_gbps": 130.7,
+  "os": "Linux",
+  "quant": "NVFP4-DQ8",
+  "kv": "int8",
+  "prefill_16k_tps": 4290.3,
+  "prefill_64k_tps": 4325.6,
+  "decode_tps": 215.0,
+  "decode_conv_tps": 145.4,
+  "decode_struct_tps": 262.3,
+  "decode_prose_tps": 128.8,
+  "accept_conv_pct": 71.6,
+  "accept_struct_pct": 98.8,
+  "accept_prose_pct": 68.3,
+  "draft_len_conv": 2.4,
+  "draft_len_struct": 6.9,
+  "draft_len_prose": 1.8,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+  "notes": "official HF pack (Qwen3.8-FN-NVFP4-DQ8), single RTX PRO 4000 Blackwell, Threadripper 7970X, weights on NVMe"
+}

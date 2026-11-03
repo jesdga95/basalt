@@ -87,6 +87,9 @@ typedef half2 ggml_half2;
 #define QI8_1 (QK8_1 / (4 * QR8_1))
 #define QR8_1 1
 
+#define QI2_K (QK_K / (4*QR2_K))
+#define QR2_K 4
+
 #define QI3_K (QK_K / (4*QR3_K))
 #define QR3_K 4
 
@@ -141,6 +144,17 @@ typedef struct {
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
 
+// MXFP4: 32 values with one E8M0 scale (the byte is the fp32 exponent: d = 2^(e - 127), halved against the
+// doubled kvalues_mxfp4); byte j of qs holds value j (low nibble) and value j + 16 (high nibble).
+#define QI_MXFP4 (QK_MXFP4 / (4 * QR_MXFP4))
+#define QR_MXFP4 2
+#define QK_MXFP4 32
+typedef struct {
+    uint8_t e; // E8M0
+    uint8_t qs[QK_MXFP4/2];
+} block_mxfp4;
+static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
+
 // NVFP4: 64 values in four 16-value sub-blocks, each with a UE4M3 scale. Sub-block s keeps its E2M1 codes in
 // qs[8 s .. 8 s + 7]: byte j holds value j (low nibble) and value j + 8 (high nibble). The FP32 scale per
 // expert matrix is not part of the block; it multiplies the projection's output.
@@ -151,6 +165,16 @@ typedef struct {
     uint8_t qs[QK_NVFP4 / 2];             // E2M1 codes, 4 bits each
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == QK_NVFP4 / QK_NVFP4_SUB + QK_NVFP4 / 2, "wrong nvfp4 block size/padding");
+
+// MXFP8: 128 values in four 32-value sub-blocks, each with a UE8M0 scale (2^(d - 127), 0 for NaN 0xFF).
+// Sub-block s keeps its 32 OCP FP8 E4M3 codes contiguously in qs[32 * s .. 32 * s + 31].
+#define QK_MXFP8 128
+#define QK_MXFP8_SUB 32
+typedef struct {
+    uint8_t d[QK_MXFP8 / QK_MXFP8_SUB];   // UE8M0 sub-block scales (4 bytes)
+    uint8_t qs[QK_MXFP8];                 // E4M3 codes (128 bytes)
+} block_mxfp8;
+static_assert(sizeof(block_mxfp8) == QK_MXFP8 / QK_MXFP8_SUB + QK_MXFP8, "wrong mxfp8 block size/padding");
 
 #define QK4_0 32
 typedef struct {
@@ -204,6 +228,23 @@ static_assert(sizeof(block_q8_1) == 2*sizeof(ggml_half) + QK8_1, "wrong q8_1 blo
 //
 // Super-block quantization structures
 //
+
+// 2-bit quantization
+// weight is represented as x = a * q + b
+// 16 blocks of 16 elements each
+// Effectively 2.625 bits per weight
+typedef struct {
+    uint8_t scales[QK_K/16]; // scales and mins, quantized with 4 bits
+    uint8_t qs[QK_K/4];      // quants
+    GGML_EXTENSION union {
+        struct {
+            ggml_half d;    // super-block scale for quantized scales
+            ggml_half dmin; // super-block scale for quantized mins
+        } GGML_COMMON_AGGR_S;
+        ggml_half2 dm;
+    } GGML_COMMON_AGGR_U;
+} block_q2_K;
+static_assert(sizeof(block_q2_K) == 2*sizeof(ggml_half) + QK_K/16 + QK_K/4, "wrong q2_K block size/padding");
 
 // 3-bit quantization
 // weight is represented as x = a * q
@@ -1009,6 +1050,7 @@ GGML_TABLE_END()
 GGML_TABLE_BEGIN(int8_t, kvalues_fp4, 16)
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 GGML_TABLE_END()
+#define kvalues_mxfp4 kvalues_fp4
 #define NGRID_IQ1S 2048
 #define IQ1S_DELTA 0.125f
 #define IQ1M_DELTA 0.125f

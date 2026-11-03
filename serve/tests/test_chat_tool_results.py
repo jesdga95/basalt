@@ -12,7 +12,7 @@ from serve.service import Service
 from serve.util.text import ByteTokenizer
 
 
-TEMPLATE = ChatTemplate(Path(__file__).resolve().parents[1] / "chat_template.jinja")
+TEMPLATE = ChatTemplate.from_file(Path(__file__).resolve().parents[1] / "chat_template.jinja")
 
 
 def history():

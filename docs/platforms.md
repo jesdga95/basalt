@@ -1,75 +1,98 @@
 # Platforms
 
-Basalt runs natively on Linux x64 and Windows x64, on NVIDIA Blackwell (sm_120). Linux is where
-the engine is tested and benchmarked. CI builds both and runs the CPU tests on each. The GPU
-tests and the quality gate run on a machine with a card.
+Linux x64 and Windows x64 with NVIDIA Blackwell (sm_120), and Linux Arm64 with the integrated Blackwell GPU (sm_121) of the DGX
+Spark, described in [arm64](arm64.md). Linux x64 is where the engine is tested and benchmarked. CI builds all three and runs the
+CPU tests on each. The GPU tests and the quality gate need a card.
 
-## Requirements
+This fork also runs every path on sm_89 (Ada), as the only card, the main card or a second card, in a build that holds
+sm_89 code ([GPUs](configuration/gpus.md#an-ada-sm_89-card), [Ada port notes](../ADA_PORT_NOTES.md)); every other
+architecture is refused. Upstream is narrower: its main card is always sm_120, and sm_89 (Ada) appears only as a
+Flash-Next expert-tier peer in a `-DPEER_ADA=ON` build ([GPUs](configuration/gpus.md#an-older-peer-card)).
 
-| | Linux | Windows |
-| --- | --- | --- |
-| OS | x86-64, AVX2 (AVX-512 used when present) | Windows 10 1903 or later, x64 |
-| Compiler | C++20 (GCC or Clang) | Visual Studio 2022 (MSVC 19.44) |
-| CUDA | 13 | 13 |
-| Build | CMake 3.24+ | CMake 3.24+ and Ninja |
-| Python | 3.10+ | 3.10+ |
-| GPU | NVIDIA Blackwell (sm_120); optional second GPU as a peer expert tier (`gpu 0,1`) | NVIDIA Blackwell (sm_120); optional second GPU as a peer expert tier (`gpu 0,1`) |
+| | Linux | Windows | Linux Arm64 |
+| --- | --- | --- | --- |
+| OS | x86-64, AVX2 (AVX-512 used when present) | Windows 10 1903+ x64 | Armv8.2 with the dot product, an integrated sm_121 GPU |
+| Compiler, build | GCC 13+, CMake 3.24+ | MSVC 19.44 (VS 2022), CMake 3.24+, Ninja | GCC 13+, CMake 3.24+ |
+| CUDA, Python | 13, 3.10+ | 13, 3.10+ | 13, 3.10+ |
+
+## Release archives
+
+Each release carries `basalt-vX.Y.Z-linux-x64.tar.gz`, `basalt-vX.Y.Z-linux-arm64.tar.gz` (the DGX Spark's, built for 12.1) and
+`basalt-vX.Y.Z-windows-x64.zip`: `bin/` (`basalt`, `basalt-bench`,
+`basalt-probe`, `basalt-vision`), `serve/`, `tools/` (what the server imports), `data/`, `docs/`, `requirements.txt` and the licences.
+They hold no CUDA libraries and no Python environment. Needs:
+
+- An NVIDIA driver of the R580 branch or newer. The archives are built with CUDA 13.0.2, whose Linux minimum is 580.95.05; NVIDIA
+  publishes no Windows minimum since 13.0, so use a current driver there.
+  On Linux an older 615 build made every reply loop endlessly and 615.71.09 fixed it (#514): if output loops or looks garbled,
+  update the driver before anything else.
+- The CUDA 13 runtime libraries (cudart, cuBLAS) on the library path (`PATH` on Windows).
+- Python 3.10+ with the requirements in a `.venv` at the archive's top directory, which `bin/basalt serve` uses when it is there:
+
+```sh
+cd basalt-vX.Y.Z-linux-x64                   # tar xzf the archive first; on Windows unzip it
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+```
+
+On Windows: `py -3 -m venv .venv` then `.venv\Scripts\pip install -r requirements.txt`. Then follow the README's quick start from the
+model download on: `bin/basalt serve --config basalt_config.json`. `bin/basalt-bench` starts the `basalt` beside it and
+reads the archive's `data/bench`.
+
+## Container image
+
+`Dockerfile` builds the engine, the server and the server's venv into one image on a CUDA 13 base: the release archive's tree,
+with the venv already installed. Building it needs no GPU.
+
+```sh
+docker build -t basalt .
+docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all \
+    -v "$PWD/appdata/basalt:/data" -v "$PWD/models:/models" -p 8080:8080 basalt
+```
+
+`/data` holds `basalt_config.json` (v2; `tools/migrations/config_v1_to_v2.py` converts an older file) and takes the server's
+folder per model under `~/.cache/basalt`, where `HOME` points: its engine log and, when the conversation disk tier is on, that
+tier. A pack is read where it lies, so the packs go on `/models` and the config names them by their mount path
+(`/models/<pack>.basalt`); paths in the config are relative to the config file. The entrypoint is
+`basalt serve --config /data/basalt_config.json --host 0.0.0.0` and arguments after the image name follow it (`--api-key KEY`).
+The served port is `server.port` (8080) and the mapped host port has to match it; `--gpu` names the cards the container sees.
+
+The container path is untested: no `basalt-bench` run and no PPL/KLD quality run has been measured inside the image, so the
+benchmark numbers describe native runs.
 
 ## Platform code
 
-OS-specific code lives in `src/platform/` (declared in `include/basalt/platform/`) and in CMake
-`WIN32` blocks. Engine code outside them names no OS or compiler.
-`tools/check_platform_boundary.sh` enforces this. Every seam has a Linux body and a Windows body
-behind one declaration, and a test in `tests/platform/` that runs on both.
+OS code lives only in `src/platform/` and `include/basalt/platform/`, and CMake `if(WIN32)` blocks. Anywhere else there is no `_WIN32`,
+`_MSC_VER`, `__linux__`, `<windows.h>`, `<sys/mman.h>`, `<unistd.h>` or raw OS call (mmap, madvise, pread, pthread/affinity,
+fork/exec/pipe, dlopen, /proc or /sys reads). `tools/check_platform_boundary.sh` enforces it. Each seam has a Linux and a Windows body,
+the Linux body being the code you would have written anyway, and a test in `tests/platform/` that runs on both. Paths are UTF-8 and go
+through the platform file calls.
 
-| seam | header | wraps |
-| --- | --- | --- |
-| file I/O | `file.hpp` | UTF-8 paths, open, positional reads, unbuffered descriptors |
-| file views | `mapped_file.hpp` | mapped files, prefetch and release hints, locking |
-| memory | `memory.hpp` | RAM probes, page locking, aligned and huge-page allocation |
-| CPU | `cpu.hpp` | topology |
-| processes | `process.hpp` | spawn, wait, terminate, pipes, signals |
-| system | `system.hpp`, `dynlib.hpp` | process memory, disk queries, full speed in the background, the NVML loader |
-| compiler | `compiler.hpp` | CPUID, bit scan, spin hint, fp16 rounding |
-| Win32 | `win.hpp` | the only inclusion of `windows.h` |
+## FFmpeg for video
 
-Programs that take paths carry a manifest (`src/platform/basalt.exe.manifest`) that makes the
-process code page UTF-8. A path past the plain Win32 length limit is opened in its `\\?\` form, so it works with the
-system's long-path policy on or off.
+Video input loads FFmpeg's shared libraries at run time (libavformat, libavcodec, libavutil and libswscale of release 6, 7, 8 or 9; nothing
+is linked or shipped). Linux: the distribution's runtime packages (`libavformat62` and its siblings on Ubuntu 26.04, `libavformat60`
+on 24.04), found by the system loader. Windows: a shared FFmpeg build (`avformat-62.dll` for 8, `avformat-63.dll` for 9, and the rest, from gyan.dev or BtbN) beside
+`basalt.exe` or in a `PATH` directory; the current directory is never searched. Without them video is off and the server says why.
+GPU decoding needs an FFmpeg build with NVDEC (the distribution packages and the gyan.dev and BtbN builds have it); without it
+frames decode on the CPU.
 
 ## Windows limitations
 
-- Pinned memory is capped by the driver under WDDM. When the whole arena cannot be registered,
-  the pinned slices are limited to the GPU's shared-memory budget (`RAM/2 - 8 GiB`), and the
-  start-up note says what was capped.
-- Large pages need the "Lock pages in memory" privilege, which is granted to Administrators by
-  default; locking the resident expert copy needs "Increase a process working set", which is
-  granted to Users, so it works without elevation. The engine enables whichever its token holds.
-  Without large pages it falls back to 4 KiB pages and says so at start-up.
-- Shared arena files and cgroup quotas do not exist. The engine refuses the first and reports no
-  container limit.
-- The n-gram table (`--ple-io direct`) is read through the file cache. NTFS completes the
-  unbuffered reads of a file one at a time while the file is mapped or read through the cache,
-  and the model file is both. Table pages the reads bring in are cached memory, which Windows
-  hands back when a program needs it.
-- `basalt serve` runs the Python server as a child and exits with its status; Linux replaces
-  the process.
-- A display-attached GPU is subject to the driver's timeout recovery (TDR). Raise `TdrDelay` under
-  `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers` if long kernels are reset.
-- A card that also drives the desktop has free VRAM that moves by a few MiB between starts, so the
-  auto-sized expert cache can land on a different slot count and greedy output can differ from run
-  to run. For reproducible output (`tools/greedy_identity.py`), pin `expert-cache` and raise
-  `vram-reserve-mib`.
-- Quality has not been measured on Windows. No perplexity or KL-divergence run exists for it;
-  [precision/builds.md](precision/builds.md) has the compiler-parity checks. There are no
-  headline benchmark numbers for Windows.
-
-Windows is supported with the help of the community. Report Windows problems as issues labelled
-`windows`.
+- Portable host registrations stay within the visible adapters' DXGI non-local allowances, leaving driver headroom.
+  Whole-expert slices retain their own device aliases; the unregistered tail is locked in the working set.
+  Qwen and DeepSeek's resident RAM tiers share CUDA host VMM when supported, with ordinary registration as the fallback.
+  Allocation-backed pins stay in RAM across SLEEP/WAKE; the expert caches can still return their VRAM.
+- Large pages need "Lock pages in memory" (Administrators). Without it the engine uses 4 KiB pages and says so at start.
+- No shared arena files and no cgroup limits. `--ple-io direct` reads through the file cache.
+- `basalt serve` runs the Python server as a child.
+- A display-attached GPU can hit the driver's timeout (TDR). Raise `TdrDelay` under `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`.
+- A card that drives the desktop has VRAM that moves between starts, so greedy output can differ run to run. Pin `expert-cache` and raise
+  `vram-reserve-mib` for reproducible output.
+- Quality is not measured on Windows, and there are no headline benchmark numbers for it. Report Windows problems as issues labelled `windows`.
 
 ## Building on Windows
 
-Run from a Developer command prompt (or call `vcvarsall.bat x64` first), so `cl.exe` is on `PATH`:
+From a Developer command prompt (or after `vcvarsall.bat x64`):
 
 ```bat
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
@@ -77,9 +100,22 @@ cmake --build build -j
 ctest --test-dir build -L cpu -j 8 --output-on-failure
 ```
 
-If tests fail to create fixtures, point `TEMP` and `TMP` at a directory inside the build tree.
-`cpu_quota_test` and `pool_affinity_test` exercise Linux-only surfaces and are not built.
+The executables land in `bin/` whatever the generator is (a Visual Studio generator would otherwise put them in `bin/Release`, away from `data/`).
 
-CUDA 13.2 and later ship CCCL headers that `#error` under cl.exe's traditional preprocessor (C1189); the
-CMakeLists hands `/Zc:preprocessor` to nvcc's host compiler, verified on CUDA 13.4 and MSVC 19.44.
-Anything compiling these headers outside this CMakeLists needs the same flag.
+`-DBASALT_MODELS=qwen4exp`, `deepseek41`, `qwen35` or `hy4flash` builds one model ([building](building.md#building-only-some-models)); the option works the same here.
+
+If tests fail to create fixtures, point `TEMP` and `TMP` into the build tree. CUDA 13.2+ headers need `/Zc:preprocessor`; the CMakeLists
+passes it to nvcc's host compiler.
+
+## Numerics across the two builds
+
+The CPU expert kernel is compiled by MSVC on Windows and GCC on Linux. On one commit, `expert_parity` and `pool_test` give 0 failures
+on both, and the pool output matches the serial run bit for bit.
+
+Greedy tokens differ across the builds: with tiers pinned and adaptive swaps off, `struct` matches over 300 tokens, `conv` diverges at
+token 23 and `prose` at token 44. One build matches itself run to run, so the difference is the host compiler's CPU code (78% of expert
+rows). The Windows build's quality ([quality](precision/quality.md)): `basalt-bench --quality 100 -- --kv int8` against a base built
+under MSVC (same llama.cpp commit and BF16 GGUF; PPL 3.2771, 3.2759 on the scored rows, against the reference's 3.2749 and
+3.2733), `Qwen3.8-FN-NVFP4` (122.6 GiB), RTX 4090 at 450 W: PPL 3.3119, KLD 0.0619, same top-1 91.79%. The card's
+NVFP4-DQ6_K (122.0 GiB), RTX 5090 at 400 W + RTX 5060 Ti at 180 W: 3.304, 0.0624, 91.65%. GPU, base and pack file differ
+as well as the compiler, so this does not isolate the compiler.

@@ -1,21 +1,23 @@
 name: ci
 
-# Pull requests run the same jobs as main. Fork pull requests get a read-only token and no secrets (none are used).
+# Pull requests run the same jobs as main. Changes that only touch docs/ or Markdown files skip CI (community.yml checks the community rows). A pull
+# request that changes no native code (only the Python server, Python tools, requirements or Markdown) runs lint alone: the builds need a
+# C++/CUDA/CMake file, a test, a tool a CPU test runs, or the CI files themselves. Fork pull requests get a read-only token and no secrets (none are used).
 # No GPU is available: the engine is compiled for sm_120 and only the `cpu`-labelled tests run.
 on:
   pull_request:
     paths-ignore:
-      - "docs/community/**"
-      - "site/**"
+      - "docs/**"
+      - "**.md"
       - "tools/check_benchmarks.py"
-      - ".github/workflows/pages.yml"
+      - ".github/workflows/community.yml"
   push:
     branches: [main]
     paths-ignore:
-      - "docs/community/**"
-      - "site/**"
+      - "docs/**"
+      - "**.md"
       - "tools/check_benchmarks.py"
-      - ".github/workflows/pages.yml"
+      - ".github/workflows/community.yml"
   workflow_dispatch:
   schedule:
     - cron: "17 5 * * *"   # keeps the compiler caches from expiring
@@ -31,6 +33,36 @@ env:
   CUDA_VERSION: "13.0.2"
 
 jobs:
+  # native=true when the builds must run: always outside pull requests, else when a changed file is not one of the Python-only paths below
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      native: ${{ steps.files.outputs.native }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: files
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != pull_request ]; then echo native=true >> "$GITHUB_OUTPUT"; exit 0; fi
+          native=false
+          while IFS= read -r f; do
+            case "$f" in
+              tools/tokenizer.py|tools/check_benchmarks.py|tools/iq_fixture.py) native=true ;;   # CPU tests run these
+              serve/*|tools/*.py|tools/convert/*|tools/migrations/*|requirements*.txt|*.md|docs/*) ;;
+              .github/workflows/review.yml|.github/workflows/community*.yml) ;;
+              *) native=true ;;
+            esac
+          done < <(git diff --name-only "$BASE...$HEAD")
+          echo "native=$native" | tee -a "$GITHUB_OUTPUT"
+
   lint:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -42,6 +74,8 @@ jobs:
         run: tools/check_platform_boundary.sh
       - name: Engine log lines
         run: tools/check_stderr_logging.sh
+      - name: Build structure
+        run: tools/check_cu_includes.sh
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
@@ -52,18 +86,19 @@ jobs:
       - name: Server tests
         run: python -m pytest serve/tests -q
       - name: Tool tests
-        run: python -m pytest tools/test_bench_flags.py tools/test_serve_launcher.py tools/test_tokenizer.py -q
+        run: python -m pytest tools/test_bench_flags.py tools/test_bench_fixtures.py tools/test_serve_launcher.py tools/test_tokenizer.py tools/test_community_gate.py tools/test_community_sync.py tools/test_llm_review.py -q
       - name: Converter tests
         run: python -m unittest discover -s tools/convert -p "test_*.py"
       - name: Migration tests
         run: python -m unittest discover -s tools/migrations -p "test_*.py"
 
   build-test:
-    needs: lint
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2022]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2022]   # the Arm64 build is the DGX Spark's (12.1, NEON)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
     defaults:
@@ -74,37 +109,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: CUDA toolkit (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-          sudo dpkg -i cuda-keyring_1.1-1_all.deb
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ninja-build \
-            cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-cccl-13-0 cuda-nvrtc-dev-13-0 libcublas-dev-13-0
-          echo /usr/local/cuda-13.0/bin >> "$GITHUB_PATH"
-          echo CUDA_PATH=/usr/local/cuda-13.0 >> "$GITHUB_ENV"
-
-      - name: CUDA toolkit (Windows)
-        if: runner.os == 'Windows'
-        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+      - uses: ./.github/actions/toolchain
         with:
-          cuda: ${{ env.CUDA_VERSION }}
-          method: network
-          sub-packages: '["nvcc", "cudart", "crt", "nvvm", "cublas_dev", "nvrtc_dev", "visual_studio_integration"]'
-          use-github-cache: true
-
-      - name: MSVC environment
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
-        with:
-          arch: x64
-
-      - uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
-        with:
-          key: ${{ matrix.os }}-${{ hashFiles('CMakeLists.txt') }}
-          restore-keys: ${{ matrix.os }}-
-          max-size: 1G
+          cuda-version: ${{ env.CUDA_VERSION }}
+          cache-key: ${{ matrix.os }}
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
@@ -123,7 +131,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
           -DWERROR="$WERROR"
           -DBUILD_TESTING=ON
-          -DCMAKE_CUDA_ARCHITECTURES=120
+          -DCMAKE_CUDA_ARCHITECTURES=${{ runner.arch == 'ARM64' && '121' || '120' }}
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
@@ -149,6 +157,7 @@ jobs:
           fi
 
       - name: AVX-512 stays inside the dispatched kernels
+        if: runner.arch == 'X64'
         run: python tools/check_isa_isolation.py build
 
       - name: CPU tests
@@ -164,3 +173,49 @@ jobs:
           name: test-logs-${{ matrix.os }}
           path: build/Testing/Temporary/
           if-no-files-found: ignore
+
+  # A build of one model compiles and tests none of the others (-DBASALT_MODELS).
+  build-single-model:
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [qwen4exp, deepseek41, qwen35, hy4flash, inkling2]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/toolchain
+        with:
+          cuda-version: ${{ env.CUDA_VERSION }}
+          # its own cache under another prefix: a one-model build holds a subset of the objects, and a full build restores by the ubuntu-24.04- prefix
+          cache-key: single-${{ matrix.model }}-ubuntu-24.04
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DWERROR=ON
+          -DBUILD_TESTING=ON
+          -DBASALT_MODELS=${{ matrix.model }}
+          -DCMAKE_CUDA_ARCHITECTURES=120
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)" -- -k 0
+
+      - name: CPU tests
+        run: |
+          mkdir -p build/tmp
+          export TEMP="$PWD/build/tmp" TMP="$PWD/build/tmp" TMPDIR="$PWD/build/tmp"
+          ctest --test-dir build -L cpu -LE avx512 -j 4 --output-on-failure --timeout 300

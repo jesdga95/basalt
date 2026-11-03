@@ -1,0 +1,26 @@
+{
+  "submitter": "gugglegum",
+  "date": "2026-11-16",
+  "commit": "1bc0ba79e3",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5060 Ti",
+      "vram_gib": 16,
+      "power_w": 180,
+      "pcie": "3.0 x8",
+      "h2d_gbps": 6.8
+    }
+  ],
+  "ram_gib": 126,
+  "cpu": "Intel Core i7-10700, 8 cores",
+  "ram_gbps": 42.8,
+  "os": "Linux",
+  "quant": "IQ4_XS",
+  "kv": "int8",
+  "prefill_16k_tps": 1579.7,
+  "prefill_64k_tps": 1692.4,
+  "decode_tps": 59.2,
+  "notes": "Core i7-10700, ASUS Z490-F, 128 GB DDR4, single RTX 5060 Ti on PCIe 3.0 x8. Basalt v0.3.0; no expert SSD spill."
+}

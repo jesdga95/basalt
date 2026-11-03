@@ -1,9 +1,13 @@
 // src/core/device.cu - the CUDA side of the runtime core.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/core/device.hpp"
+#include "basalt/build_archs.hpp"
+#include "basalt/platform/dynlib.hpp"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 
@@ -27,6 +31,32 @@ __global__ void poison_kernel(float* p, uint64_t n_floats) {
 
 
 }  // namespace
+
+namespace {
+std::atomic<int> g_plan_device{-1};   // plan_sms_device
+std::atomic<int> g_plan_sms[64];      // per ordinal, 0 until read
+}  // namespace
+
+void plan_sms_device(int ordinal) { g_plan_device.store(ordinal, std::memory_order_relaxed); }
+
+int plan_sms(int ordinal) {
+    int dev = g_plan_device.load(std::memory_order_relaxed);
+    if (dev < 0) dev = ordinal;
+    if (dev < 0 && cudaGetDevice(&dev) != cudaSuccess) {
+        cudaGetLastError();
+        dev = 0;
+    }
+    if (dev < 0 || dev >= 64) dev = 0;
+    int v = g_plan_sms[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        if (cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || v <= 0) {
+            cudaGetLastError();
+            v = 1;
+        }
+        g_plan_sms[dev].store(v, std::memory_order_relaxed);
+    }
+    return v;
+}
 
 int device_count() {
     int count = 0;
@@ -58,6 +88,92 @@ bool device_pci_bus_id(int ordinal, std::string& id) {
         return false;
     }
     id = buf;
+    return true;
+}
+
+DeviceRates device_rates(int ordinal) {
+    DeviceRates r;
+    std::string bus;
+    int sms = 0;
+    if (!device_pci_bus_id(ordinal, bus) || cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, ordinal) != cudaSuccess) {
+        cudaGetLastError();
+        return r;
+    }
+    const platform::DynLib lib = platform::DynLib::open_nvml();
+    if (!lib) return r;
+    const auto init = lib.sym<int (*)()>("nvmlInit_v2");
+    const auto shut = lib.sym<int (*)()>("nvmlShutdown");
+    const auto by_bus = lib.sym<int (*)(const char*, void**)>("nvmlDeviceGetHandleByPciBusId_v2");
+    const auto gen = lib.sym<int (*)(void*, unsigned*)>("nvmlDeviceGetMaxPcieLinkGeneration");
+    const auto width = lib.sym<int (*)(void*, unsigned*)>("nvmlDeviceGetCurrPcieLinkWidth");
+    const auto clk = lib.sym<int (*)(void*, int, unsigned*)>("nvmlDeviceGetMaxClockInfo");
+    if (!init || !by_bus || init() != 0) return r;
+    void* h = nullptr;
+    unsigned g = 0, w = 0, mhz = 0;
+    if (by_bus(bus.c_str(), &h) == 0) {
+        // per lane and direction, after line encoding: 8b/10b to generation 2, 128b/130b from generation 3 on
+        static constexpr double kLaneBytes[] = {0, 0.25e9, 0.5e9, 0.985e9, 1.969e9, 3.938e9, 7.877e9};
+        if (gen && width && gen(h, &g) == 0 && width(h, &w) == 0 && g >= 1 && g <= 6) r.link_bytes = kLaneBytes[g] * w;
+        if (clk && clk(h, 1 /* NVML_CLOCK_SM */, &mhz) == 0) r.sm_hz = (double) sms * mhz * 1e6;
+    }
+    if (shut) shut();
+    return r;
+}
+
+namespace {
+
+std::string device_fault(const char* call, cudaError_t e, int ordinal) {
+    return std::string(call) + ": " + cudaGetErrorString(e) + " (code " + std::to_string((int) e) + "), device " +
+           std::to_string(ordinal) + " of " + std::to_string(device_count());
+}
+
+}  // namespace
+
+bool device_memory(int ordinal, uint64_t& free_bytes, uint64_t& total_bytes, std::string& why) {
+    int prev = 0;
+    cudaError_t e = cudaGetDevice(&prev);
+    const int at = ordinal < 0 ? prev : ordinal;
+    const char* call = "cudaGetDevice";
+    if (e == cudaSuccess && ordinal >= 0 && ordinal != prev) {
+        call = "cudaSetDevice";
+        e = cudaSetDevice(ordinal);
+    }
+    size_t f = 0, t = 0;
+    if (e == cudaSuccess) {
+        call = "cudaMemGetInfo";
+        e = basalt::core::gpu_mem_info(&f, &t);
+        if (ordinal >= 0 && ordinal != prev) cudaSetDevice(prev);
+    }
+    if (e != cudaSuccess) {
+        why = device_fault(call, e, at);
+        cudaGetLastError();
+        return false;
+    }
+    free_bytes = f;
+    total_bytes = t;
+    return true;
+}
+
+bool devices_allocate(const std::vector<int>& ordinals, std::string& why) {
+    for (int ordinal : ordinals) {
+        uint64_t f = 0, t = 0;
+        if (!device_memory(ordinal, f, t, why)) return false;
+        int prev = 0;
+        cudaGetDevice(&prev);
+        const int d = ordinal < 0 ? prev : ordinal;
+        void* p = nullptr;
+        cudaError_t e = d == prev ? cudaSuccess : cudaSetDevice(d);
+        if (e == cudaSuccess) {
+            e = cudaMalloc(&p, 1ull << 20);
+            if (e == cudaSuccess) cudaFree(p);
+            if (d != prev) cudaSetDevice(prev);
+        }
+        if (e != cudaSuccess) {
+            why = device_fault("cudaMalloc of 1 MiB", e, d);
+            cudaGetLastError();
+            return false;
+        }
+    }
     return true;
 }
 
@@ -139,7 +255,7 @@ DeviceInfo device_info(int ordinal) {
     d.multi_processor_count = p.multiProcessorCount;
 
     size_t free_b = 0, total_b = 0;
-    check(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+    check(basalt::core::gpu_mem_info(&free_b, &total_b), "cudaMemGetInfo");
     d.free_bytes = free_b;
     d.total_bytes = total_b;
 
@@ -152,6 +268,14 @@ DeviceInfo device_info(int ordinal) {
     if (!cc_ok) {
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) + "." +
                             std::to_string(d.cc_minor) + "; basalt needs an NVIDIA GPU of compute capability 12.0 or 8.9",
+                        -1);
+    }
+    // and only for the architectures it was built for (build_archs.hpp): another one would run lower PTX with the
+    // code its paths need compiled out
+    if (!basalt::build_has_arch(d.cc_major, d.cc_minor)) {
+        throw CudaError("device " + d.name + " is sm_" + std::to_string(d.cc_major) + std::to_string(d.cc_minor) +
+                            " and this build has device code for " + basalt::build_archs() +
+                            " only; build with -DCMAKE_CUDA_ARCHITECTURES=\"120;89\" for Blackwell and Ada cards together",
                         -1);
     }
     return d;

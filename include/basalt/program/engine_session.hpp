@@ -16,6 +16,7 @@ struct Done {
     bool ok = false;
     std::string err;
     long long generated = 0, prompt = 0, accepted = 0, offered = 0, reused = 0, read_n = -1;
+    long long hits = 0, lookups = 0;            ///< the VRAM tier's lookups and how many of them it served
     double prompt_ms = 0, decode_ms = 0, wall_s = 0, first_token_s = -1;
     std::string finish;
 };
@@ -54,6 +55,27 @@ private:
     size_t rpos_ = 0;
 };
 
+/// Asks the engine about `args` without starting it (--gpu-plan): its exit code and answer line, -1 when it cannot run.
+/// A flag this model does not take is a nonzero code. stderr goes to `log_path`.
+int engine_plan(const std::string& engine_bin, const std::vector<std::string>& args, const std::string& log_path,
+                std::string& answer);
+/// A string field of the plan's answer; empty without it.
+std::string plan_field(const std::string& plan_answer, const std::string& name);
+/// `dir`/<arch> when the model has its own fixtures there, else `dir`.
+std::string fixtures_for(const std::string& dir, const std::string& plan_answer);
+/// Why fixtures whose largest token id is `max_id` cannot run on a model of `n_vocab` tokens (the engine's INFO
+/// logit_bias): they were made with another tokenizer. Empty when they fit, or when the vocabulary is unknown (0).
+std::string fixture_vocab_refusal(int64_t max_id, int64_t n_vocab, const std::string& dir);
+/// The engine a benchmark program starts without --engine: the `basalt` executable beside the program (`self`, its
+/// own path) when there is one, else `built`, where the build wrote it.
+std::string default_engine(const std::string& self, const std::string& built);
+/// The fixtures folder without --fixtures: `root`/data/bench (`root` the install's top) when there is one, else `built`.
+std::string default_fixtures(const std::string& root, const std::string& built);
+/// Why --community refuses the engine flags `extra` (FLAG [VALUE] words from the command line): the lossy ones by
+/// name when the engine's --gpu-plan answer for them (`plan_answer`) lists any, else the first word as a change to
+/// the preset.
+std::string community_refusal(const std::vector<std::string>& extra, const std::string& plan_answer);
+
 std::vector<std::string> split(const std::string& s, char sep);
 bool all_digits(const std::string& s);
 /// "16384", "32k" to tokens: k is 1024, except a number that rounds in thousands to a power of two is that power
@@ -64,7 +86,8 @@ bool parse_depth(const std::string& s, long long& tokens);
 void set_arg(std::vector<std::string>& args, const std::string& flag, const std::string& value);
 bool has_arg(const std::vector<std::string>& args, const std::string& flag);
 std::string arg_value(const std::vector<std::string>& args, const std::string& flag);
-/// FLAG [VALUE] words added to `args`: a flag already there takes the new value, else both are appended.
+/// FLAG [VALUE] words added to `args`: a flag already there takes the new value, else both are appended; a flag whose
+/// every value the engine keeps (`--exp`, `--control-vector`, `--image`, ...) is appended each time.
 void merge_args(std::vector<std::string>& args, const std::vector<std::string>& add);
 
 /// The engine's own error lines from its log, else the last few lines.

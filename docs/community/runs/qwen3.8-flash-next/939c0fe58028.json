@@ -1,0 +1,36 @@
+{
+  "submitter": "zlosim",
+  "date": "2026-11-24",
+  "commit": "400b411c58",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX PRO 1000 Blackwell Generation Laptop GPU",
+      "vram_gib": 8,
+      "power_w": 35,
+      "pcie": "5.0 x8",
+      "h2d_gbps": 26.1
+    }
+  ],
+  "ram_gib": 94,
+  "cpu": "Intel Core Ultra 7 265H, 16 cores",
+  "ram_gbps": 66.5,
+  "os": "Linux",
+  "quant": "GSQ-RCO-IQ3_S",
+  "kv": "int8",
+  "prefill_16k_tps": 557.6,
+  "prefill_64k_tps": 369.7,
+  "decode_tps": 40.4,
+  "decode_conv_tps": 32.3,
+  "decode_struct_tps": 43.4,
+  "decode_prose_tps": 31.9,
+  "accept_conv_pct": 75.7,
+  "accept_struct_pct": 95.1,
+  "accept_prose_pct": 67.5,
+  "draft_len_conv": 2.3,
+  "draft_len_struct": 6.8,
+  "draft_len_prose": 1.6,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+  "notes": "Self-converted pack, tuned MTP drafter. AC + performance profile; power-saver (PL1 15 W) halves decode. --kv-resident 20480 keeps prefill ~500 t/s to 128k. Keep ~10% RAM free (earlyoom)"
+}

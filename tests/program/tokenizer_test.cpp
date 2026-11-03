@@ -10,8 +10,25 @@
 #include <string>
 
 #include "basalt/program/tokenizer.hpp"
+#include "unicode_flags.hpp"
+
+// The Qwen pre-tokenizer is shared (the tokenizer library); the others belong to the models this build contains.
+#ifdef BASALT_MODEL_DEEPSEEK41
+#include "models/deepseek41/adapter.hpp"
+#endif
+namespace basalt::program::tokenizer { void pretok_qwen35(const char* text, size_t size, std::vector<size_t>& ends); }
 
 using basalt::program::Tokenizer;
+
+namespace {
+using PreTok = void (*)(const char*, size_t, std::vector<size_t>&);
+#ifdef BASALT_MODEL_DEEPSEEK41
+constexpr PreTok kJoyai = basalt::models::deepseek41::pretok_joyai;
+#else
+constexpr PreTok kJoyai = nullptr;
+#endif
+constexpr PreTok kQwen35 = basalt::program::tokenizer::pretok_qwen35;
+}  // namespace
 
 namespace {
 
@@ -61,11 +78,21 @@ void synthetic() {
     merges = "b c\na b\nab c\na a\naa a";   // ranks: bc 0, ab 1, abc 2, aa 3, aaa 4
     Tokenizer t;
     std::string err;
+    t.set_pretokenize(kQwen35);
     CHECK(t.load(vocab, merges, types, err));
     std::vector<int32_t> ids;
     CHECK(t.encode("abc", false, {}, ids, err));
     // lowest rank first: b+c (0) beats a+b (1), so a, bc
     CHECK((ids == std::vector<int32_t>{'a', 258}));
+    // the winning merge is the last pair of a 2-byte and of a 3-byte piece
+    CHECK(t.encode("ab", false, {}, ids, err));
+    CHECK((ids == std::vector<int32_t>{256}));
+    CHECK(t.encode("bc", false, {}, ids, err));
+    CHECK((ids == std::vector<int32_t>{258}));
+    CHECK(t.encode("aab", false, {}, ids, err));
+    CHECK((ids == std::vector<int32_t>{'a', 256}));
+    CHECK(t.encode("xbc", false, {}, ids, err));
+    CHECK((ids == std::vector<int32_t>{'x', 258}));
     CHECK(t.encode("aaa", false, {}, ids, err));
     CHECK((ids == std::vector<int32_t>{260}));
     CHECK(t.encode("aaaa", false, {}, ids, err));
@@ -86,6 +113,17 @@ void synthetic() {
     // the same piece twice: the memo returns the same ids
     CHECK(t.encode("abcabc abcabc", false, {}, ids, err));
     CHECK(t.encode("abcabc abcabc", false, {}, ids, err));
+    // ignore_merges: a piece that is an entry is that token (abc, which the merges build as a, bc); others still merge
+    Tokenizer whole;
+    whole.set_pretokenize(kQwen35);
+    whole.set_ignore_merges(true);
+    CHECK(whole.load(vocab, merges, types, err));
+    CHECK(whole.encode("abc", false, {}, ids, err));
+    CHECK((ids == std::vector<int32_t>{257}));
+    CHECK(whole.encode("abcx", false, {}, ids, err));
+    CHECK((ids == std::vector<int32_t>{'a', 258, 'x'}));
+    CHECK(whole.encode("x<|ctl|>y", true, {}, ids, err));
+    CHECK((ids == std::vector<int32_t>{'x', 261, 'y'}));
     std::string bad;
     CHECK(!t.load("{\"a\":1", "", "[]", bad));
 }
@@ -94,6 +132,13 @@ int parity(const std::string& dir, const std::string& golden) {
     Tokenizer t;
     std::string err;
     const auto t0 = std::chrono::steady_clock::now();
+    // the rule the pack names
+    const PreTok pre = read_all(dir + "/tokenizer.json").find("\"pre\": \"joyai-llm\"") != std::string::npos ? kJoyai : kQwen35;
+    if (pre == nullptr) {
+        std::fprintf(stderr, "the pre-tokenizer of this pack belongs to a model this build left out\n");
+        return 1;
+    }
+    t.set_pretokenize(pre);
     if (!t.load(read_all(dir + "/vocab.json"), read_all(dir + "/merges.txt"), read_all(dir + "/token_type.json"), err)) {
         std::fprintf(stderr, "load: %s\n", err.c_str());
         return 1;

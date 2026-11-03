@@ -59,72 +59,76 @@ void free_region(void* mapping_base, uint64_t mapping_bytes);
 /// The most host memory the GPU may map page-locked before its shared-memory segment is full, when the OS limits it
 /// beneath the driver's own refusal (`why` names where the figure comes from); false when it does not, and the driver's
 /// refusal is the limit.
-bool pin_budget(uint64_t& limit, std::string& why);
+bool pin_budget(uint64_t& limit, std::string& why, const char* luid = nullptr,
+                uint32_t node_mask = 0, bool shared_mapping = false);
+
+// Portable registrations consume each WDDM adapter's non-local budget. Host VMM instead backs the CPU tier
+// without registering the same pages on every adapter; other platforms keep their existing allocation path.
+#if defined(_WIN32)
+inline constexpr bool kBoundHostRegistration = true;
+inline constexpr bool kPreferHostVmm = true;
+#else
+inline constexpr bool kBoundHostRegistration = false;
+inline constexpr bool kPreferHostVmm = false;
+#endif
+uint64_t system_page_size();
+inline uint64_t pin_reserve(uint64_t budget) { return budget / 20 > (1ull << 30) ? budget / 20 : (1ull << 30); }
 
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
 
-/// The RAM the OS can hand out without paging, in bytes (0 when unknown).
+/// Required cgroup-v2 usage counters for the conservative cache-reclaim allowance.
+struct CgroupMemoryStat {
+    uint64_t current = 0;
+    uint64_t inactive_file = 0;
+    uint64_t file_dirty = 0;
+    uint64_t file_writeback = 0;
+    bool valid = false;
+    uint64_t file = 0;  // page cache, active + inactive; 0 when memory.stat does not report it
+    uint64_t shmem = 0; // the part of `file` that is shared memory (pinned host buffers among it): never reclaimed
+};
+
+/// Parse a cgroup-v2 memory.stat text (inactive_file, file_dirty, file_writeback required; file and shmem optional).
+/// False on a malformed or incomplete text.
+bool parse_cgroup_memory_stat(const std::string& text, uint64_t current, CgroupMemoryStat& stat);
+
+/// Calculate additional bytes under a finite cgroup limit after reclaiming clean file cache.
+/// Returns false when the required memory.stat counters were unavailable.
+bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64_t& bytes);
+
+/// the RAM this process can get.  `available`: MemAvailable, lowered to the room under the tightest cgroup limit;
+/// `cgroup_limit`: that tightest limit itself (v2 memory.max of the group and its ancestors, or v1
+/// memory.limit_in_bytes), ~0 when there is none - what a container can never exceed.
+struct HostMemory {
+    uint64_t available = 0;
+    uint64_t cgroup_limit = ~uint64_t{0};
+};
+
+/// This reads `meminfo`, `self_cgroup` and the cgroup tree under `cgroup_root` (the parameters are for tests; an
+/// empty one is the system's own file, see platform::meminfo_path - and on a system with none, the OS's available-RAM
+/// reading is the whole answer and no container limit is tighter than it).  A v1 memory controller line wins over the unified line (the hybrid layout): v1 reads
+/// `<root>/memory/<path>` (memory.limit_in_bytes - memory.usage_in_bytes, clean inactive file cache counted as free),
+/// v2 reads `<root>/<path>` (memory.max, memory.current, memory.stat).  A group not visible here is read at the mount's
+/// root (a container's own namespace); groups without a readable limit add none; no cgroup file or line is MemAvailable
+/// alone.  False when MemAvailable is missing or a visible v2 limit or its memory.stat is malformed.
+bool host_available_memory(HostMemory& m, const std::string& meminfo = "", const std::string& self_cgroup = "",
+                           const std::string& cgroup_root = "");
+
+/// The RAM this process can get without paging, in bytes (0 when unknown): host_available_memory of the system's own
+/// files, so a container's memory limit lowers it as it does the RAM tiers' plan; the OS reading where that fails.
 uint64_t available_memory();
 
-/// What the OS could still commit, in bytes. A page-locked or fully reserved region is charged against RAM and the
-/// page file together, so on Windows this is the free part of that pair - the reading a refused allocation names.
-/// Linux keeps no separate charge, so there it is the available-RAM reading (0 when unknown).
-uint64_t commit_headroom();
-
-/// The RAM left alone by anything that locks or fills memory: the larger of 2 GiB and 5% of the machine's RAM.
-uint64_t ram_margin();
-
-/// Host RAM the engine takes after the resident expert copy is sized and before it serves: the GPU libraries' own
-/// host memory, the prompt path's and the verifier's staging.  A resident copy leaves this much beside the margin.
-inline constexpr uint64_t kLateHostBytes = 2ull << 30;
-
-/// Host RAM one running request allocates beside its checkpoints and images: token lists, the reply, the server
-/// process's own buffers.
-inline constexpr uint64_t kRequestHostBytes = 256ull << 20;
+/// The RAM left free for the rest of the system (--ram-reserve-mib): the expert tiers leave it, and while serving the
+/// RAM guard holds that line.  0: nothing is kept and the guard is off.
+uint64_t ram_reserve();
+void set_ram_reserve(uint64_t bytes);
+inline constexpr uint64_t kDefaultRamReserveBytes = 2ull << 30;
 
 /// The expert bytes one prompt chunk may read from the expert file for the slots it borrows from the GPU cache (the
 /// chunk is sized to stay within it).
 inline constexpr uint64_t kPromptFileReadBytes = 3584ull << 20;
 
-/// The least RAM kept for the OS file cache while any expert is read from the file.
-inline constexpr uint64_t kMinFileCacheBytes = 4ull << 30;
-
-/// The RAM the OS file cache needs beside ram_margin() while `file_bytes` of the `complement_bytes` experts no GPU
-/// tier holds are read from the file through it (0: nothing is read from the file).  A prompt chunk reads
-/// `prompt_file_bytes` for the lent slots whose experts the RAM copy does not keep (at most kPromptFileReadBytes),
-/// plus the file-held experts of the layer it computes and of the next one it reads ahead: two layers' file-held
-/// share (`largest_layer_bytes`, every expert of the largest layer, scaled by file_bytes / complement_bytes).
-/// Pages evicted before that pass is over are read again, and the reclaim then runs at drive speed.
-inline uint64_t file_cache_floor(uint64_t file_bytes, uint64_t complement_bytes, uint64_t largest_layer_bytes,
-                                 uint64_t prompt_file_bytes) {
-    if (file_bytes == 0) return 0;
-    const double share = complement_bytes > file_bytes ? (double) file_bytes / (double) complement_bytes : 1.0;
-    const uint64_t layer_file = (uint64_t) ((double) largest_layer_bytes * share) + 1;
-    const uint64_t pass = prompt_file_bytes + 2 * layer_file;
-    return pass > kMinFileCacheBytes ? pass : kMinFileCacheBytes;
-}
-
-/// The RAM left free once the experts are placed: `margin` (ram_margin()) plus the file cache's floor.
-inline uint64_t ram_floor(uint64_t margin, uint64_t file_bytes, uint64_t complement_bytes, uint64_t largest_layer_bytes,
-                          uint64_t prompt_file_bytes) {
-    return margin + file_cache_floor(file_bytes, complement_bytes, largest_layer_bytes, prompt_file_bytes);
-}
-
-/// The serve guard's floor (see ram_level): the margin plus one prompt chunk's file reads when experts are read from
-/// the file (the margin alone when none are).  Below ram_floor() by the two layers' read-ahead, so the engine's own
-/// growth after the load (conversation cache, an image's buffers) does not reach it on a machine still sized as asked.
-inline uint64_t ram_guard_floor(uint64_t margin, uint64_t file_bytes, uint64_t prompt_file_bytes) {
-    return margin + (file_bytes > 0 ? prompt_file_bytes : 0);
-}
-
-/// The largest RAM copy that leaves `floor` free, with `avail` bytes available and `late` bytes still to be taken by
-/// the engine after the copy.
-inline uint64_t max_safe_copy(uint64_t avail, uint64_t late, uint64_t floor) {
-    return avail > late + floor ? avail - late - floor : 0;
-}
-
-/// The RAM a page-locked or fully resident allocation may take now: available_memory() less ram_margin().  `known`
+/// The RAM a page-locked or fully resident allocation may take now: available_memory() less ram_reserve().  `known`
 /// is false when the OS gives no reading (nothing is refused then).
 uint64_t ram_budget(bool* known = nullptr);
 
@@ -135,8 +139,8 @@ void start_memory_watchdog(uint64_t floor_bytes);
 /// its error names the copy's cap instead of the resident mode.
 void watch_resident_ram(bool resident, uint64_t copy_bytes);
 /// The line the watchdog prints when RAM runs out: `avail` bytes free, `resident` for the resident-copy mode with a
-/// copy of `copy_bytes`, `margin` the free RAM to keep. A budget flag is named only when it could shrink the copy.
-std::string ram_exhausted_message(uint64_t avail, bool resident, uint64_t copy_bytes, uint64_t margin);
+/// copy of `copy_bytes`, `reserve` the free RAM to keep. A budget flag is named only when it could shrink the copy.
+std::string ram_exhausted_message(uint64_t avail, bool resident, uint64_t copy_bytes, uint64_t reserve);
 void stop_memory_watchdog();
 
 /// Whether an available-RAM reading of `avail` is below `floor` (a reading of 0, unknown, is not).
@@ -188,11 +192,32 @@ MemoryStalls memory_stalls();
 /// The `some` and `full` lines' avg10 of a pressure file's text; `known` false when either is missing.
 MemoryStalls parse_memory_stalls(const std::string& text);
 
+/// How long the reading must stay below the guard's floor, where the OS gives no stall reading, before that counts as
+/// critical: the span the stall shares are averaged over, so a brief dip is judged as it is where the OS shows stalls.
+inline constexpr uint64_t kRamSustainedMs = 10000;
+
+/// How long the reading has been continuously below the floor, from the guard's samples (`now_ms` on any steady clock).
+struct BelowFloorClock {
+    int64_t since_ms = -1;   ///< when the current run below the floor began; -1 when not below
+    /// Feeds one sample (`below`: the reading is under the floor) and returns the ms the run has lasted (0 when not below).
+    uint64_t update(int64_t now_ms, bool below) {
+        if (!below) {
+            since_ms = -1;
+            return 0;
+        }
+        if (since_ms < 0) since_ms = now_ms;
+        return now_ms > since_ms ? (uint64_t) (now_ms - since_ms) : 0;
+    }
+};
+
 /// The guard's level for an available-RAM reading `avail` (0 = unknown) against `floor`, the hard floor `hard` and
-/// the stall reading. Without a stall reading, below the floor is critical at once.
-inline RamLevel ram_level(uint64_t avail, uint64_t floor, uint64_t hard, const MemoryStalls& stalls) {
+/// the stall reading. Without a stall reading, below the floor is critical once the reading has stayed there for
+/// `below_ms` >= kRamSustainedMs; a shorter dip is low. Under the hard floor it is critical at once.
+inline RamLevel ram_level(uint64_t avail, uint64_t floor, uint64_t hard, const MemoryStalls& stalls,
+                          uint64_t below_ms) {
     if (!ram_below_floor(avail, floor)) return RamLevel::Ok;
-    if (avail < (hard < floor ? hard : floor) || !stalls.known) return RamLevel::Critical;
+    if (avail < (hard < floor ? hard : floor)) return RamLevel::Critical;
+    if (!stalls.known) return below_ms >= kRamSustainedMs ? RamLevel::Critical : RamLevel::Low;
     return stalls.some >= kStallSomePct || stalls.full >= kStallFullPct ? RamLevel::Critical : RamLevel::Low;
 }
 
@@ -244,6 +269,10 @@ bool read_ahead_enabled();
 /// hint the pages still arrive - one fault at a time, where they are touched.  The range is asked for in 128 KiB
 /// windows, which keeps the reads in flight bounded.  Only a mapped view is reached this way.
 void advise_willneed(const void* p, uint64_t bytes);
+/// The same for several mapped ranges at once. The entries of one prefetch ask are read side by side, while a
+/// separate ask per range serializes them; batching the ranges keeps the storage queue full. A hint, never an
+/// error, and only a mapped view is reached this way.
+void advise_willneed(const void* const* addrs, const uint64_t* sizes, size_t n);
 /// The same for [offset, offset + bytes) of an open descriptor.  Linux asks its page cache.  Windows asks nothing:
 /// the cache manager takes no range hint for a handle, and a read through a descriptor is a cached read unless the
 /// caller opted out of that cache - which already reads ahead around a sequential reader.  Bytes reached only

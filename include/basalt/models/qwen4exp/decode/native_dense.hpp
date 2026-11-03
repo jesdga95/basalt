@@ -1,0 +1,60 @@
+#pragma once
+
+#include <cstdint>
+#include <set>
+#include <string>
+#include <vector>
+
+namespace basalt::core {
+class LoadPlan;
+class WeightTable;
+struct PackFiles;
+
+// Experimental GDN/QSA/shared-expert projection overrides. Upload unchanged native GGUF
+// blocks once, then attach them to the matching canonical WeightRef. Unsupported
+// types retain their canonical paths. Owns one Q8_1 scratch vector shared by all
+// these projections, so use one ordered session stream and keep this object
+// alive until all graphs that reference it have been destroyed and synchronized.
+class NativeDense {
+public:
+    NativeDense() = default;
+    ~NativeDense();
+    NativeDense(const NativeDense&) = delete;
+    NativeDense& operator=(const NativeDense&) = delete;
+    /// With layer_hi >= 0, only the `blk.<l>.` matrices with layer_lo <= l < layer_hi are uploaded (a layer
+    /// split's stage holds its own layers' projections, not the whole model's); the others keep data == nullptr.
+    /// `slab_at`: the device block (`slab_cap` bytes, `slab_bytes` long at least) the matrices go in instead of one this
+    /// object allocates and owns.  With `into` the reads are queued there for the caller's pass.
+    bool load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
+              bool include_ple_key = false, int64_t layer_lo = 0, int64_t layer_hi = -1, void* slab_at = nullptr,
+              uint64_t slab_cap = 0, LoadPlan* into = nullptr);
+    /// The bytes of the block the matrices of `plan_bytes`' total take (their alignment included).
+    static uint64_t slab_bytes(uint64_t plan_total);
+    /// Plan v0.3 P1: the canonical tensor names `load` would serve natively from these shards (eligible name,
+    /// supported type, 2-D), read from the GGUF headers only - so the canonical arena can skip them.
+    static bool served_names(const std::vector<std::string>& shards, bool include_ple_key,
+                             std::set<std::string>& out, std::string& err);
+    /// The bytes `load` with the same arguments will write to the device, from the GGUF headers only.
+    static bool plan_bytes(const std::vector<std::string>& shards, bool include_ple_key, int64_t layer_lo,
+                           int64_t layer_hi, uint64_t& out, std::string& err);
+    /// The bytes `plan_bytes` counts, by block: `per_layer[l]` for the `blk.<l>.` matrices, `shared` for the PLE key (a
+    /// stage always holds it).
+    static bool plan_bytes_by_layer(const std::vector<std::string>& shards, bool include_ple_key, int64_t n_layers,
+                                    std::vector<uint64_t>& per_layer, uint64_t& shared, std::string& err);
+    /// Layer split: load only blocks [lb, le) (every other `blk.N.` projection belongs to another GPU's stage; the
+    /// PLE tensors are loaded everywhere).  Process-wide, read by the next `load`; (-1, -1) = all layers.
+    static void set_layer_range(int lb, int le);
+    /// A model whose dense index holds `blk.1.ple_key.weight` unquantized serves the PLE from that row, so the key is
+    /// taken out of `skip` and `load` does not upload the source tensor over it.  A quantized row leaves `skip`
+    /// unchanged.
+    static bool keep_unquantized_ple_key(const PackFiles& pack, std::set<std::string>& skip, std::string& err);
+    uint64_t weight_bytes() const { return bytes_; }
+    size_t tensor_count() const { return weights_.size(); }
+
+private:
+    std::vector<void*> weights_;   // each matrix
+    std::vector<void*> allocs_;    // the device allocations holding them
+    void* scratch_ = nullptr;
+    uint64_t bytes_ = 0;
+};
+} // namespace basalt::core

@@ -1,8 +1,11 @@
 """Tests for convert.py and model_sections.py on a tiny synthetic model, drafter and side files.
 
     python3 -m unittest discover -s tools/convert -p 'test_convert.py'"""
+import contextlib
 import hashlib
+import io
 import json
+import re
 import struct
 import subprocess
 import sys
@@ -96,6 +99,13 @@ class ConvertTest(unittest.TestCase):
 
     def model(self):
         return ModelFile(str(self.t / "out.basalt"))
+
+    def planned(self, **kw):
+        """Section name -> size, from the listing a --dry-run prints."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            convert.convert(self.args(dry_run=True, **kw))
+        return {m.group(1): int(m.group(3)) for m in re.finditer(r"^ {9}(\S+) +(\d+) +(\d+)$", out.getvalue(), re.M)}
 
     # ---------------------------------------------------------------- sections
     def test_sections(self):
@@ -203,6 +213,13 @@ class ConvertTest(unittest.TestCase):
             self.assertEqual(t[name][:2], (rows, cols))
             self.assertEqual(t[name][3], H.quantize(u16), name)
 
+    def test_a_dry_run_plans_the_sections_a_build_writes(self):
+        planned = self.planned()
+        self.assertFalse((self.t / "out.basalt").exists() or (self.t / "out.basalt.partial").exists())
+        convert.convert(self.args())
+        m = self.model()
+        self.assertEqual(planned, {k: m.sections[k][1] for k in m.names()})
+
     # ---------------------------------------------------------------- refusals and options
     def test_no_vision_and_overwrite(self):
         convert.convert(self.args(no_vision=True))
@@ -278,20 +295,34 @@ class ConvertTest(unittest.TestCase):
             off += blob * N_EXPERT
         self.assertEqual(off, len(out))
 
-    def test_gate_up_type_mismatch_is_refused(self):
+    def test_gate_up_of_two_types_write_a_v7_layout(self):
         g = GGUFWriter()
         rng = np.random.default_rng(1)
         g.add("general.architecture", "qwen")
-        g.add("qwen.block_count", 1, "u32")
+        g.add("qwen.block_count", 2, "u32")
         g.add("tokenizer.ggml.tokens", TOKENS)
-        g.add_f32("blk.0.ffn_gate_inp.weight", self.router)
-        g.add_raw("blk.0.ffn_gate_exps.weight", [256, 2, N_EXPERT], "Q5_K", rng.bytes(176 * 2 * N_EXPERT))
-        g.add_raw("blk.0.ffn_up_exps.weight", [256, 2, N_EXPERT], "Q6_K", rng.bytes(210 * 2 * N_EXPERT))
-        g.add_raw("blk.0.ffn_down_exps.weight", [32, 2, N_EXPERT], "Q8_0", rng.bytes(34 * 2 * N_EXPERT))
-        bad = g.write(self.t / "bad-00001-of-00001.gguf")
-        with self.assertRaises(SystemExit) as c:
-            convert.convert(self.args(gguf=[str(bad)]))
-        self.assertIn("gate and up differ in type", str(c.exception))
+        g.add_f32("token_embd.weight", self.embd)
+        g.add_f32("per_layer_token_embd.weight", self.ple)
+        raw = {}
+        for l, (gt, ut) in enumerate((("Q5_K", "Q5_K"), ("Q5_K", "Q6_K"))):
+            g.add_f32(f"blk.{l}.ffn_gate_inp.weight", self.router)
+            for role, t, cols, nb in (("gate", gt, 256, 176), ("up", ut, 256, 176 if ut == "Q5_K" else 210),
+                                      ("down", "Q8_0", 32, 34)):
+                raw[(l, role)] = rng.bytes(nb * 2 * N_EXPERT)
+                g.add_raw(f"blk.{l}.ffn_{role}_exps.weight", [cols, 2, N_EXPERT], t, raw[(l, role)])
+        path = g.write(self.t / "mix-00001-of-00001.gguf")
+        convert.convert(self.args(gguf=[str(path)]))
+        m = self.model()
+        b0, b1 = 2 * (176 + 176 + 34), 2 * (176 + 210 + 34)
+        lines = m.read("experts.layout").decode().splitlines()
+        self.assertEqual(lines[0], f"# experts v7: layer gu_type d_type offset blob_bytes up_type "
+                                   f"(n_expert {N_EXPERT}, total {(b0 + b1) * N_EXPERT})")
+        self.assertEqual(lines[1:], [f"0 13 8 0 {b0} 13", f"1 13 8 {b0 * N_EXPERT} {b1} 14"])
+        out = m.read("experts")
+        e = 1
+        want = b"".join(raw[(1, r)][e * (len(raw[(1, r)]) // N_EXPERT):(e + 1) * (len(raw[(1, r)]) // N_EXPERT)]
+                        for r in ("gate", "up", "down"))
+        self.assertEqual(out[b0 * N_EXPERT + e * b1:b0 * N_EXPERT + (e + 1) * b1], want)
 
     def test_sections_from_with_gguf(self):
         import pack_vision
@@ -332,6 +363,9 @@ class ConvertTest(unittest.TestCase):
         r = run("--mtp-source", str(self.t))
         self.assertEqual(r.returncode, 2)
         self.assertIn("--mtp-dense", r.stderr)
+        r = run("--dry-run")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("takes only", r.stderr)
 
 
 class DrafterTest(unittest.TestCase):
@@ -423,6 +457,8 @@ class DrafterTest(unittest.TestCase):
                              {"mtp/dense", "mtp/dense.index", "mtp/experts", "mtp/draft_vocab"})
             self.assertEqual(len(m.read("mtp/experts")), self.NE * 3 * (self.H * self.FF * 18 // 64))
             self.assertEqual(m.read("mtp/draft_vocab"), (t.t / "dv.bin").read_bytes())
+            self.assertEqual(t.planned(mtp_source=str(self.src), draft_vocab=str(t.t / "dv.bin"), force=True),
+                             {k: m.sections[k][1] for k in m.names()})
             (t.t / "dv.bin").write_bytes(np.array([0, 6], dtype="<i4").tobytes())      # 6 is outside the 6 tokens
             with self.assertRaises(SystemExit):
                 convert.convert(t.args(mtp_source=str(self.src), draft_vocab=str(t.t / "dv.bin"), force=True))
@@ -493,19 +529,44 @@ class PleFp8Test(unittest.TestCase):
             data += raw
             at += len(raw)
         hb = json.dumps(head).encode()
+        want = b"".join(S.fp8_rows_to_q8_0(a, float(np.array([0x3C23 << 16], np.uint32).view(np.float32)[0]))
+                        for a in shards)
+
+        def write(path, entries):
+            head, data, at = {}, b"", 0
+            for k, arr, dt in entries:
+                raw = arr.tobytes()
+                head[k] = {"dtype": dt, "shape": list(arr.shape) if arr.ndim > 1 else [1],
+                           "data_offsets": [at, at + len(raw)]}
+                data += raw
+                at += len(raw)
+            hb = json.dumps(head).encode()
+            path.write_bytes(struct.pack("<Q", len(hb)) + hb + data)
+
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "t.safetensors"
             path.write_bytes(struct.pack("<Q", len(hb)) + hb + data)
             ple = S.PleFp8(str(path), chunk_rows=4)
             self.assertEqual(ple.rows, 8)
-            self.assertAlmostEqual(ple.scale, float((np.uint32(0x3C23) << 16).view(np.float32)), places=9)
+            self.assertAlmostEqual(ple.scale, float(np.array([0x3C23 << 16], np.uint32).view(np.float32)[0]), places=9)
             got = b"".join(S._ple_job(j) for j in ple.jobs())
             self.assertEqual(len(got), ple.nbytes)
-            want = b"".join(S.fp8_rows_to_q8_0(a, ple.scale) for a in shards)
             self.assertEqual(got, want)
             import multiprocessing
             with multiprocessing.Pool(2) as pool:
                 self.assertEqual(b"".join(ple.chunks(pool, depth=2)), want)
+
+            # a consolidated release spreads the shards over several files; the scale sits in one of them
+            a, b = Path(tmp) / "a.safetensors", Path(tmp) / "b.safetensors"
+            write(a, [(stem + "shard_1.weight", shards[1], "F8_E4M3")])
+            write(b, [(stem + "weight_scale", scale_bf16, "BF16"), (stem + "shard_0.weight", shards[0], "F8_E4M3")])
+            split = S.PleFp8([str(a), str(b)], chunk_rows=4)
+            self.assertEqual(split.rows, 8)
+            self.assertEqual(b"".join(S._ple_job(j) for j in split.jobs()), want)
+            # a missing shard is refused, not silently dropped
+            write(a, [(stem + "shard_2.weight", shards[1], "F8_E4M3")])
+            with self.assertRaises(S.ConvertError):
+                S.PleFp8([str(a), str(b)])
 
 
 class BoundedImapTest(unittest.TestCase):
@@ -556,6 +617,17 @@ class Q6KRequantTest(unittest.TestCase):
         deq = self.dequant(S.q6_k(vals)).reshape(x.shape)
         self.assertLess(np.sqrt(((deq - x) ** 2).mean()), 0.025 * x.std())
 
+    def test_large_input_quantizes_each_block_once(self):
+        """A matrix of many blocks must quantize each block the same as it does alone: a per-group term that goes
+        wrong only at scale zeroes whole 16-value groups, which both checks below catch."""
+        rng = np.random.default_rng(6)
+        x = (rng.standard_normal((512, 512)) * 0.03).astype(np.float32)       # 1024 blocks
+        blob = S.q6_k(x)
+        self.assertEqual(blob[:len(S.q6_k(x[:8]))], S.q6_k(x[:8]))
+        deq = self.dequant(blob).reshape(x.shape)
+        self.assertLess(np.sqrt(((deq - x) ** 2).mean()), 0.02 * x.std())
+        self.assertLess((deq == 0).mean(), 0.06)
+
     def test_gdn_head_order(self):
         src = S.gdn_block_source()
         self.assertEqual(sorted(src), list(range(48)))
@@ -596,6 +668,153 @@ class Q6KRequantTest(unittest.TestCase):
             self.assertEqual(g[tb["offset"]:tb["offset"] + tb["bytes"]], qb)
             deq = self.dequant(g[ta["offset"]:ta["offset"] + ta["bytes"]]).reshape(a.shape)
             self.assertLess(np.sqrt(((deq - a) ** 2).mean()), 0.03 * a.std())
+
+    def test_pack_rewrite_preserves_own_section_tensors(self):
+        rng = np.random.default_rng(7)
+        a = (rng.standard_normal((6, 512)) * 0.03).astype(np.float32)
+        qa = S.q8_0(a)
+        engram_blob = bytes(range(200))
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            w = ModelWriter(str(t / "base.basalt"))
+            w.add_bytes("dense", b"d" * 100)
+            offs = w.add_parts("gguf", [qa], 32)
+            w.add_bytes("engram", engram_blob)
+            tens = {
+                "blk.0.attn_qkv.weight": {"type": "Q8_0", "type_id": 8, "shape": [512, 6], "bytes": len(qa), "offset": offs[0]},
+                "blk.0.engram.weight": {"section": "engram", "type": "Q8_0", "type_id": 8, "shape": [64, 2],
+                                        "bytes": len(engram_blob), "offset": 0},
+            }
+            w.add_bytes("meta", json.dumps({"tensors": tens}).encode())
+            w.close()
+            out = t / "out.basalt"
+            args = type("A", (), {"out": str(out), "requant_dense_q6k": str(t / "base.basalt"), "checkpoint": None,
+                                  "workers": 2, "force": False})
+            convert.requant_dense(args)
+            m = ModelFile(str(out))
+            meta = json.loads(m.read("meta"))
+            self.assertEqual(m.read("engram"), engram_blob)
+            self.assertEqual(meta["tensors"]["blk.0.engram.weight"], tens["blk.0.engram.weight"])
+            ta = meta["tensors"]["blk.0.attn_qkv.weight"]
+            self.assertEqual((ta["type"], ta["type_id"], ta["bytes"]), ("Q6_K", 14, 6 * 2 * S.Q6K_BYTES))
+            # gguf must hold only the gguf tensor (not a spurious copy of engram)
+            self.assertEqual(len(m.read("gguf")), ta["offset"] + ta["bytes"])
+
+    def test_verify_pack_kind3_dense_file_offset(self):
+        import verify_pack
+        rng = np.random.default_rng(9)
+        t1 = rng.standard_normal((16, 32)).astype(np.float32)       # 2048 B stored F32 -> 1024 B F16 runtime (kind 3)
+        t2 = rng.standard_normal((16, 32)).astype(np.float32)       # 2048 B stored F32 -> 2048 B F32 runtime (kind 2)
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            gw = GGUFWriter()
+            gw.add("general.architecture", "qwen4exp")
+            gw.add_f32("blk.0.ssm_a", t1)
+            gw.add_f32("blk.0.attn_norm.weight", t2)
+            gguf_path = gw.write(t / "src.gguf")
+
+            src = S.SourceModel([gguf_path])
+            # Custom arch: ssm_a wants F16 (stored as kind "3", F32->F16 narrowing), attn_norm wants F32 (kind "2")
+            class Kind3Arch:
+                not_in_dense = frozenset()
+                @staticmethod
+                def form_of(name):
+                    return "F16" if name == "blk.0.ssm_a" else "F32"
+                @staticmethod
+                def native(name, tname):
+                    return False
+
+            dense = S.Dense(src, arch=Kind3Arch())
+            blob = b"".join(dense.chunks())
+            idx = dense.index_text()
+            # Sanity: r[3] (file offset = 2048) != r[5] (pool offset = 1024) for the second tensor!
+            rows = verify_pack.parse_index(idx)
+            self.assertNotEqual(int(rows["blk.0.attn_norm.weight"][3]), int(rows["blk.0.attn_norm.weight"][5]))
+
+            pack = t / "pack.basalt"
+            w = ModelWriter(str(pack))
+            w.add_bytes("dense", blob)
+            w.add_bytes("dense.index", idx)
+            w.add_bytes("tokenizer/vocab.json", b"{}")
+            w.add_bytes("tokenizer/merges.txt", b"")
+            w.add_bytes("tokenizer/token_type.json", b"[]")
+            w.add_bytes("tokenizer/tokenizer.json", b"{}")
+            w.add_bytes("tokenizer/chat_template.jinja", b"tpl")
+            w.add_bytes("meta", json.dumps({
+                "tensors": {},
+                "gguf_kv": {"tokenizer.ggml.tokens": [], "tokenizer.chat_template": "tpl"},
+                "license": {"text": "Apache-2.0"},
+            }).encode())
+            w.close()
+            del dense, src
+            import gc
+            gc.collect()
+            self.assertTrue(verify_pack.verify(pack, gguf_path, workers=1))
+            gc.collect()
+
+
+class Qwen4ExpDefaultNameTest(unittest.TestCase):
+    """Qwen4Exp.default_name takes the pack name and its quant from the GGUF file name (both the plain and the
+    --sections-from path); an unrecognised name carries no quant rather than a guessed one."""
+
+    def setUp(self):
+        self.arch = convert.A.for_architecture("qwen4exp")
+
+    def name(self, gguf, sections_from=False):
+        return self.arch.default_name(gguf, {}, sections_from)
+
+    def test_shard_quant_names_both_paths(self):
+        gguf = "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
+        self.assertEqual(self.name(gguf), "Qwen3.8-Flash-Next UD-Q4_K_XL")
+        self.assertEqual(self.name(gguf, sections_from=True), "Qwen3.8-Flash-Next UD-Q4_K_XL")
+
+    def test_iq3_shard_plain_name_matches_the_sections_from_name(self):
+        gguf = "Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf"
+        self.assertEqual(self.name(gguf), "Qwen3.8-Flash-Next UD-IQ3_XXS")
+        self.assertEqual(self.name(gguf, sections_from=True), "Qwen3.8-Flash-Next UD-IQ3_XXS")
+
+    def test_single_file_quant(self):
+        self.assertEqual(self.name("Qwen3.8-Flash-Next-Q8_0.gguf"), "Qwen3.8-Flash-Next Q8_0")
+
+    def test_sections_from_single_file_quant(self):
+        self.assertEqual(self.name("Qwen3.8-Flash-Next-Q8_0.gguf", sections_from=True), "Qwen3.8-Flash-Next Q8_0")
+
+    def test_dot_separated_tag(self):
+        self.assertEqual(self.name("Qwen3.8-Flash-Next.Q4_K_M.gguf"), "Qwen3.8-Flash-Next Q4_K_M")
+
+    def test_lowercase_name_keeps_the_tag_case(self):
+        self.assertEqual(self.name("qwen3.8-flash-next-q4_k_m.gguf"), "Qwen3.8-Flash-Next q4_k_m")
+
+    def test_uppercase_extension_and_shard(self):
+        self.assertEqual(self.name("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.GGUF"), "Qwen3.8-Flash-Next UD-Q4_K_XL")
+
+    def test_shard_suffix_of_any_digit_count(self):
+        self.assertEqual(self.name("Qwen3.8-Flash-Next-UD-Q4_K_XL-1-of-4.gguf"), "Qwen3.8-Flash-Next UD-Q4_K_XL")
+
+    def test_shard_suffix_uppercase_of(self):
+        self.assertEqual(self.name("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-OF-00004.gguf"), "Qwen3.8-Flash-Next UD-Q4_K_XL")
+
+    def test_unrelated_name_has_no_quant(self):
+        self.assertEqual(self.name("model.gguf"), "Qwen3.8-Flash-Next")
+        self.assertEqual(self.name("model.gguf", sections_from=True), "Qwen3.8-Flash-Next")
+
+    def test_only_the_file_name_is_used(self):
+        gguf = "/models/unsloth/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
+        self.assertEqual(self.name(gguf), "Qwen3.8-Flash-Next UD-Q4_K_XL")
+
+
+class GgufStemTest(unittest.TestCase):
+    """arch.gguf_stem: the file name alone, a trailing `.gguf` (any case) and a shard suffix (any case) of any digit
+    count stripped."""
+
+    def test_stems(self):
+        self.assertEqual(convert.A.gguf_stem("/models/unsloth/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.GGUF"),
+                         "Qwen3.8-Flash-Next-UD-Q4_K_XL")
+        self.assertEqual(convert.A.gguf_stem("Qwen3.8-Flash-Next-UD-Q4_K_XL-1-of-4.gguf"), "Qwen3.8-Flash-Next-UD-Q4_K_XL")
+        self.assertEqual(convert.A.gguf_stem("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-OF-00004.gguf"),
+                         "Qwen3.8-Flash-Next-UD-Q4_K_XL")
+        self.assertEqual(convert.A.gguf_stem("model.gguf"), "model")
+        self.assertEqual(convert.A.gguf_stem("model"), "model")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,32 @@
+{
+  "submitter": "Calogero-Zarbo",
+  "date": "2026-10-30",
+  "commit": "6025cbcf30",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5090",
+      "vram_gib": 32,
+      "power_w": 600,
+      "pcie": "5.0 x8",
+      "h2d_gbps": 28.8
+    },
+    {
+      "name": "RTX 5070 Ti",
+      "vram_gib": 16,
+      "power_w": 300,
+      "pcie": "5.0 x4",
+      "h2d_gbps": 14.5
+    }
+  ],
+  "ram_gib": 92,
+  "cpu": "AMD Ryzen 9 9950X3D, 16 cores",
+  "ram_gbps": 63.8,
+  "os": "Linux",
+  "quant": "Q4_K_XL",
+  "kv": "int8",
+  "prefill_16k_tps": 5630.7,
+  "prefill_64k_tps": 6416.5,
+  "decode_tps": 309.3
+}

@@ -305,6 +305,49 @@ inline void dequantize_nvfp4(const uint8_t* block, float* out) {
     }
 }
 
+// ---- MXFP4: 32 elements from a 17-byte block { uint8 e (E8M0); uint8 qs[16] }, transcribed from
+// dequantize_row_mxfp4 and ggml_e8m0_to_fp32_half (ggml): d = 2^(e - 128) (half the scale, the e2m1 values being
+// doubled), low nibble element j, high nibble j + 16.
+inline float e8m0_to_fp32_half(uint8_t x) {
+    const uint32_t bits = x < 2 ? 0x00200000u << x : (uint32_t)(x - 1) << 23;
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
+inline float ue8m0_to_fp32(uint8_t x) {
+    if (x == 0xFFu) return 0.0f;
+    const uint32_t bits = x == 0u ? 0x00400000u : ((uint32_t) x << 23);
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
+inline float e4m3_to_fp32(uint8_t b) {
+    const int e = (b >> 3) & 0xF, m = b & 0x7;
+    if (e == 15 && m == 7) return 0.0f;
+    const float v = e == 0 ? std::ldexp((float) m, -9) : std::ldexp(1.0f + (float) m * 0.125f, e - 7);
+    return (b & 0x80) ? -v : v;
+}
+
+inline void dequantize_mxfp8(const uint8_t* block, float* out) {
+    const uint8_t* d = block;
+    const uint8_t* qs = block + 4;
+    for (int s = 0; s < 4; ++s) {
+        const float sc = ue8m0_to_fp32(d[s]);
+        for (int j = 0; j < 32; ++j) out[32 * s + j] = e4m3_to_fp32(qs[32 * s + j]) * sc;
+    }
+}
+
+inline void dequantize_mxfp4(const uint8_t* block, float* out) {
+    const float d = e8m0_to_fp32_half(block[0]);
+    const uint8_t* qs = block + 1;
+    for (int j = 0; j < 16; ++j) {
+        out[j] = (float)kvalues_fp4[qs[j] & 0x0F] * d;
+        out[j + 16] = (float)kvalues_fp4[qs[j] >> 4] * d;
+    }
+}
+
 // ---- element types
 inline void dequantize_f32(const uint8_t* p, float* out, int n) {
     std::memcpy(out, p, (size_t)n * 4);

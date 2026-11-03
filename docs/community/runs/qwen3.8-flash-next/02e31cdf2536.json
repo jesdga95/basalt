@@ -1,0 +1,36 @@
+{
+  "submitter": "countzerox",
+  "date": "2026-11-23",
+  "commit": "351039841a",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5070 Ti",
+      "vram_gib": 16,
+      "power_w": 320,
+      "pcie": "5.0 x16",
+      "h2d_gbps": 57.9
+    }
+  ],
+  "ram_gib": 94,
+  "cpu": "AMD Ryzen 9 9950X3D, 16 cores",
+  "ram_gbps": 73.2,
+  "os": "Windows",
+  "quant": "NVFP4",
+  "kv": "int8",
+  "prefill_16k_tps": 4852.6,
+  "prefill_64k_tps": 5041.5,
+  "decode_tps": 124.7,
+  "decode_conv_tps": 96.8,
+  "decode_struct_tps": 138.1,
+  "decode_prose_tps": 95.4,
+  "accept_conv_pct": 77.3,
+  "accept_struct_pct": 98.8,
+  "accept_prose_pct": 69.6,
+  "draft_len_conv": 2.6,
+  "draft_len_struct": 6.9,
+  "draft_len_prose": 1.8,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+  "notes": "Windows 11; NVFP4-DQ8 pack (Q8_0 dense); 2x48 GB DDR5-6600 CL32; expert RAM page-locked, no SSD spill."
+}

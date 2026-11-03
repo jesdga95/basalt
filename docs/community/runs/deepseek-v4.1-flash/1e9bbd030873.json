@@ -1,0 +1,35 @@
+{
+  "submitter": "peterw",
+  "date": "2026-11-21",
+  "commit": "ff0b978d2e",
+  "preset": "community-1",
+  "model": "DeepSeek-V4.1-Flash",
+  "gpus": [
+    {
+      "name": "RTX PRO 6000 Blackwell Workstation Edition",
+      "vram_gib": 96,
+      "power_w": 300,
+      "pcie": "4.0 x16",
+      "h2d_gbps": 28.8
+    }
+  ],
+  "ram_gib": 252,
+  "cpu": "AMD Ryzen Threadripper 3970X, 32 cores",
+  "ram_gbps": 72.0,
+  "os": "Linux",
+  "quant": "IQ2_XXS",
+  "kv": "fp8+fp4",
+  "prefill_16k_tps": 1630.8,
+  "prefill_64k_tps": 2245.9,
+  "decode_tps": 157.7,
+  "decode_conv_tps": 91.3,
+  "decode_struct_tps": 188.8,
+  "decode_prose_tps": 95.6,
+  "accept_conv_pct": 67.4,
+  "accept_struct_pct": 99.8,
+  "accept_prose_pct": 58.5,
+  "draft_len_conv": 1.4,
+  "draft_len_struct": 4.8,
+  "draft_len_prose": 1.1,
+  "engine_args": "--gpu 0 --max-context 61709 --kv fp8"
+}

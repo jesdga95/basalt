@@ -46,6 +46,10 @@ struct Fixture {
 };
 const Fixture kFixtures[] = {{"conv", "conv.ids"}, {"struct", "struct.ids"}, {"prose", "prose.ids"}};
 
+// Without --engine / --fixtures: the install's own (an unpacked release has them beside this program), else the build's.
+std::string engine_default() { return default_engine(basalt::platform::module_path(), BASALT_BENCH_ENGINE); }
+std::string fixtures_default() { return default_fixtures(basalt::platform::install_root(), BASALT_BENCH_FIXTURES); }
+
 void usage() {
     std::printf(
         "basalt-probe - measures this machine and prints its rates, decode speeds and suggested values\n"
@@ -53,20 +57,23 @@ void usage() {
         "usage: basalt-probe --model FILE.basalt [-- ENGINE ARGS...]\n"
         "\n"
         "  --model FILE          a .basalt model file\n"
-        "  --engine BIN          engine binary (default: the one built with this program)\n"
-        "  --fixtures DIR        fixture ids (default %s)\n"
+        "  --engine BIN          engine binary (default: basalt beside this program, else the build's)\n"
+        "  --fixtures DIR        fixture ids (default %s, or the model's own folder in it)\n"
         "  --logs DIR            keep the engine log there\n"
-        "  --gpu A,B,..|auto     the GPUs, as for the server and the engine (default: GPU 0 alone)\n"
+        "  --gpu A,B,..|all      the GPUs, as for the server and the engine (default: GPU 0 alone)\n"
+        "  --gpu-mode MODE       what two or more GPUs do together (peer, split or tensor), --gpu-share A,B,.. their shares\n"
         "  -- ARGS...            engine flags, as for basalt-bench (--kv, --spec, ...)\n"
         "\n"
         "It runs conv, struct and prose once each (cold: the first request after load counts), %lld tokens each,\n"
         "greedy, then the adaptive tier's settings, each from the start placement. Nothing is saved; a\n"
         "--expert-profile-save file is compared, not written.\n",
-        BASALT_BENCH_FIXTURES, kTokens);
+        fixtures_default().c_str(), kTokens);
 }
 
+constexpr int kDefaultSwaps = 96;   // the engine's --adapt-swaps default
+
 struct ProbeOptions {
-    std::string model, engine, fixtures = BASALT_BENCH_FIXTURES, logs;
+    std::string model, engine, fixtures, logs;
     std::vector<std::string> passthrough;
 };
 
@@ -86,7 +93,7 @@ bool parse_args(int argc, char** argv, ProbeOptions& o, std::string& err) {
         else if (a == "--engine") o.engine = next("--engine");
         else if (a == "--fixtures") o.fixtures = next("--fixtures");
         else if (a == "--logs") o.logs = next("--logs");
-        else if (a == "--gpu") o.passthrough.insert(o.passthrough.end(), {a, next("--gpu")});
+        else if (a == "--gpu" || a == "--gpu-mode" || a == "--gpu-share") o.passthrough.insert(o.passthrough.end(), {a, next(a.c_str())});
         else err = "unknown argument " + a + " (engine flags go after --; see --help)";
         if (!err.empty()) return false;
     }
@@ -210,13 +217,29 @@ int main(int argc, char** argv) {
     basalt::platform::ignore_broken_pipe();
     basalt::platform::install_child_stop_signals();
 
-    std::string engine_bin = o.engine.empty() ? std::string(BASALT_BENCH_ENGINE) : o.engine;
+    const std::string engine_bin = o.engine.empty() ? engine_default() : o.engine;
     if (engine_bin.empty() || !fs::exists(engine_bin)) {
         basalt::log::error("basalt-probe", "the engine binary %s does not exist (--engine BIN)", engine_bin.c_str());
         return 2;
     }
 
     std::vector<std::string> args = {"--model", fs::absolute(o.model).string()};
+    // what this model takes, asked of the engine; only its own tests and suggestions run
+    const std::string plan_log = basalt::platform::temp_dir() + "/basalt-probe-plan-" + std::to_string((long long) basalt::platform::process_id());
+    const auto model_takes = [&](const char* flag, const char* value) {
+        std::string answer;
+        return engine_plan(engine_bin, {args[0], args[1], "--gpu", "0", flag, value}, plan_log, answer) == 0;
+    };
+    const bool adapt_flags = model_takes("--adapt-swaps", "96"), share_flag = model_takes("--prefill-cpu-share", "0.6");
+    if (o.fixtures.empty()) {
+        std::string answer;
+        (void) engine_plan(engine_bin, {args[0], args[1], "--gpu", "0"}, plan_log, answer);
+        o.fixtures = fixtures_for(fixtures_default(), answer);
+    }
+    {
+        std::error_code rm_ec;
+        fs::remove(plan_log, rm_ec);
+    }
     merge_args(args, o.passthrough);
     // the adaptive tier: a saved profile is compared, never written (the engine starts on the model's own); the RAM
     // copy's free places are sized at start for the largest swap count tried
@@ -234,9 +257,9 @@ int main(int argc, char** argv) {
         if (!saved_profile.empty() && !(basalt::platform::file_size(saved_profile, bytes) && bytes > 0)) saved_profile.clear();
     }
     const std::string swaps_given = arg_value(args, "--adapt-swaps"), every_given = arg_value(args, "--adapt-every");
-    const int base_swaps = swaps_given.empty() ? basalt::program::Options().adapt_swaps : std::atoi(swaps_given.c_str());
-    bool adapt_on = base_swaps > 0 && (every_given.empty() || std::atoi(every_given.c_str()) > 0);
-    const AdaptTrial kAdaptTried[] = {{64, 256, 0.70, false, 0}, {1, 160, 0, false, 0}};
+    const int base_swaps = swaps_given.empty() ? kDefaultSwaps : std::atoi(swaps_given.c_str());
+    bool adapt_on = adapt_flags && base_swaps > 0 && (every_given.empty() || std::atoi(every_given.c_str()) > 0);
+    const AdaptTrial kAdaptTried[] = {{64, 256, 0.70, false, 0}, {1, 160, 0, false, 0}, {0, 12, 0, false, 0}};
     if (adapt_on) {
         int most = base_swaps;
         for (const auto& t : kAdaptTried) most = std::max(most, t.swaps);
@@ -247,7 +270,7 @@ int main(int argc, char** argv) {
     {
         std::string gpu_value;
         std::vector<GpuCard> used;
-        if (!select_gpus(gpu_given, "basalt-probe", gpu_value, used, err)) {
+        if (!select_gpus(gpu_given, arg_value(args, "--gpu-mode"), arg_value(args, "--gpu-share"), "basalt-probe", gpu_value, used, err)) {
             basalt::log::error("basalt-probe", "%s", err.c_str());
             return 2;
         }
@@ -256,7 +279,7 @@ int main(int argc, char** argv) {
 
     // fixtures
     std::vector<std::vector<int64_t>> ids(3);
-    long long need = 4096;
+    long long need = basalt::program::kDefaultContext;
     for (size_t i = 0; i < 3; ++i) {
         std::vector<std::vector<int64_t>> lines;
         if (!read_id_lines((fs::path(o.fixtures) / kFixtures[i].file).string(), lines, err) || lines.empty()) {
@@ -360,7 +383,7 @@ int main(int argc, char** argv) {
         }
         const std::string given = arg_value(args, "--prefill-cpu-share");
         const double base = given.empty() ? 0.6 : std::atof(given.c_str());
-        if (rates.pool_workers > 0 && engine_ctx >= kChunk + 16) {
+        if (share_flag && rates.pool_workers > 0 && engine_ctx >= kChunk + 16) {
             std::vector<ShareTrial> trials;
             const double star = measure_share(eng, ids, base, trials);
             const double gain = share_gain(trials, base, star);

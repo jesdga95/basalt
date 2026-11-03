@@ -16,6 +16,7 @@ from serve.engine.mock import MockEngine
 from serve.engine.process import ProcessEngine
 from serve.frontend import ChatTemplate
 from serve.handler import serve
+from serve.server import open_when_ready
 from serve.service import Service
 from serve.util.text import ByteTokenizer
 
@@ -32,7 +33,7 @@ class GatedEngine(ProcessEngine):
         self.asleep, self.unloaded, self.progress, self.restore_s = False, not loaded, None, 0.0
         self.up = loaded
         self.go, self.entered, self.fail = threading.Event(), threading.Event(), None
-        self.load_status = {"percent": 42, "gib": {"cuda0": 12.3, "ram": 4.0}}
+        self.load_status = {"percent": 42, "gib": 12.3}
         self.restarts = 0
 
     def alive(self):
@@ -50,7 +51,7 @@ class GatedEngine(ProcessEngine):
     def unload(self):
         self.up, self.unloaded = False, True
 
-    def wake(self, timeout=120.0):
+    def wake(self, timeout=120.0, vram_check=None):
         self.entered.set()
         self.go.wait(10)
         self.asleep = False
@@ -64,7 +65,7 @@ class Loading(unittest.TestCase):
     def setUp(self):
         tok = ByteTokenizer()
         self.engine = GatedEngine(tok)
-        self.svc = Service(self.engine, tok, ChatTemplate(TEMPLATE))
+        self.svc = Service(self.engine, tok, ChatTemplate.from_file(TEMPLATE))
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 
@@ -105,7 +106,7 @@ class Loading(unittest.TestCase):
         self.assertTrue(status["loading"])
         if kind == "weights":
             self.assertEqual(live["load"]["percent"], 42)
-            self.assertEqual(live["load"]["gib"], {"cuda0": 12.3, "ram": 4.0})
+            self.assertEqual(live["load"]["gib"], 12.3)
             self.assertEqual(status["load"]["percent"], 42)
         else:
             self.assertNotIn("percent", live["load"])
@@ -132,6 +133,36 @@ class Loading(unittest.TestCase):
         self.assertTrue(t.is_alive())                    # held, not answered
         self.finish(t, out)
         self.assertTrue(ready.wait(5))
+
+    def test_open_waits_for_the_load_and_fires_once(self):
+        opened, ready = [], threading.Event()
+        self.svc.on_loaded = ready.set
+        open_when_ready(self.svc, "http://x/", opener=opened.append)
+        self.svc.start_load()
+        self.assertTrue(self.engine.entered.wait(5))
+        self.assertEqual(opened, [])                     # still loading
+        self.engine.go.set()
+        self.assertTrue(ready.wait(5))
+        self.svc.on_loaded()                             # a later load or wake does not open it again
+        self.assertEqual(opened, ["http://x/"])
+
+    def test_open_does_not_fire_when_the_load_fails(self):
+        opened = []
+        open_when_ready(self.svc, "http://x/", opener=opened.append)
+        self.engine.fail = "no model"
+        self.svc.start_load()
+        self.assertTrue(self.engine.entered.wait(5))
+        self.engine.go.set()
+        deadline = time.time() + 5
+        while self.svc.boot_error is None and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertIsNotNone(self.svc.boot_error)
+        self.assertEqual(opened, [])
+
+    def test_open_is_immediate_without_a_start_up_load(self):
+        opened = []
+        open_when_ready(self.svc, "http://x/", now=True, opener=opened.append)
+        self.assertEqual(opened, ["http://x/"])
 
     def test_start_up_load_streams_after_the_wait(self):
         self.svc.start_load()
@@ -253,7 +284,7 @@ class Loading(unittest.TestCase):
 
     def test_ui_shows_the_loading_text(self):
         js = (ROOT / "serve/web/app.js").read_text(encoding="utf-8")
-        self.assertIn("Loading weights", js)
+        self.assertIn("\"Loading\"", js)
         self.assertIn("Waking up", js)
         self.assertIsNone(re.search(r"—", js))      # no em dashes in UI text
         self.assertIn('data-s="loading"', (ROOT / "serve/web/app.css").read_text(encoding="utf-8").replace(

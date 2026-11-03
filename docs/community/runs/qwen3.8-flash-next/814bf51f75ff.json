@@ -1,0 +1,22 @@
+{
+  "submitter": "lindworm-hermes2026",
+  "date": "2026-10-22",
+  "commit": "57909606c2",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5080",
+      "vram_gib": 16,
+      "power_w": 360
+    }
+  ],
+  "ram_gib": 88,
+  "os": "WSL2",
+  "quant": "IQ3_S",
+  "kv": "int8",
+  "prefill_16k_tps": 3179.8,
+  "prefill_64k_tps": 4351.7,
+  "decode_tps": 137.9,
+  "notes": "single RTX 5080 16GB, WSL2/Docker; 46.8 GiB experts, VRAM 18% + RAM copy, no SSD spill; engine 57909606c2 clean tree"
+}

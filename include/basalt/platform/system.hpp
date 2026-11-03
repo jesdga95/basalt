@@ -19,9 +19,9 @@ int64_t process_id();
 /// Windows subsystem.
 std::string host_os_name();
 
-/// The Python the server runs under: the virtual environment in `src_dir` when it has one, else the interpreter name
+/// The Python the server runs under: the virtual environment in `root` (`install_root()`) when it has one, else the interpreter name
 /// the platform puts on PATH.
-std::string python_interpreter(const std::string& src_dir);
+std::string python_interpreter(const std::string& root);
 
 /// Asks that this process be the one ended first if the machine runs out of memory. No effect where the OS has no
 /// such knob.
@@ -55,7 +55,7 @@ std::string cgroup_root();
 
 /// This process's own memory use, for the stall report. Every field is 0 where the OS gives no reading.
 struct ProcessMemory {
-    unsigned long long faults = 0;       ///< hard page faults
+    unsigned long long faults = 0;       ///< page faults (hard ones on Linux, all of them on Windows)
     unsigned long long rss_mib = 0;      ///< resident set
     unsigned long long avail_mib = 0;    ///< RAM the system can hand out
     unsigned long long commit_mib = 0;   ///< what is swapped out

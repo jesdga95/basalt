@@ -1,0 +1,35 @@
+{
+  "submitter": "miloaissatu",
+  "date": "2026-11-22",
+  "commit": "a089ecaf79",
+  "preset": "community-1",
+  "model": "Inkling-2-Mini",
+  "gpus": [
+    {
+      "name": "RTX 5080",
+      "vram_gib": 16,
+      "power_w": 396,
+      "pcie": "4.0 x16",
+      "h2d_gbps": 28.4
+    }
+  ],
+  "ram_gib": 63,
+  "cpu": "AMD Ryzen 9 5900X, 12 cores",
+  "ram_gbps": 50.7,
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "fp16",
+  "prefill_16k_tps": 4210.7,
+  "prefill_64k_tps": 3782.5,
+  "decode_tps": 45.5,
+  "decode_conv_tps": 45.0,
+  "decode_struct_tps": 45.0,
+  "decode_prose_tps": 50.7,
+  "accept_conv_pct": 67.7,
+  "accept_struct_pct": 96.1,
+  "accept_prose_pct": 54.7,
+  "draft_len_conv": 1.1,
+  "draft_len_struct": 5.1,
+  "draft_len_prose": 1.1,
+  "engine_args": "--gpu 0 --max-context 63233"
+}

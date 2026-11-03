@@ -34,4 +34,35 @@ std::vector<std::pair<int, int64_t>> kv_giveback_order(const std::vector<KvHold>
     return out;
 }
 
+int64_t kv_cache_spare_granules(int64_t mapped, int64_t gran, int64_t floor,
+                                const std::function<int64_t(int64_t)>& slots_after) {
+    if (gran <= 0 || mapped <= 0) return 0;
+    // what a shrink keeps falls with every granule given, so the slots it leaves do too
+    int64_t lo = 0, hi = mapped / gran;
+    while (lo < hi) {
+        const int64_t mid = lo + (hi - lo + 1) / 2;
+        if (slots_after(mapped - mid * gran) >= floor) lo = mid;
+        else hi = mid - 1;
+    }
+    return lo;
+}
+
+int64_t kv_ceiling_cells(const std::vector<int64_t>& backed, const std::vector<int64_t>& max_cells, int64_t spare,
+                         const std::function<int64_t(size_t, int64_t)>& grow) {
+    int64_t total = 0;
+    for (size_t i = 0; i < backed.size() && i < max_cells.size(); ++i) {
+        if (backed[i] < 0) { total += max_cells[i]; continue; }
+        int64_t best = std::min(backed[i], max_cells[i]);
+        for (int64_t lo = best / 256 + 1, hi = (max_cells[i] + 255) / 256; lo <= hi;) {
+            const int64_t mid = lo + (hi - lo) / 2;
+            const int64_t c = std::min<int64_t>(mid * 256, max_cells[i]);
+            if (grow(i, c) <= spare) { best = c; lo = mid + 1; }
+            else hi = mid - 1;
+        }
+        spare -= grow(i, best);
+        total += best;
+    }
+    return total;
+}
+
 }  // namespace basalt::program

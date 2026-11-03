@@ -1,0 +1,42 @@
+{
+  "submitter": "tselle",
+  "date": "2026-11-23",
+  "commit": "8667cc8abd",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5060 Ti",
+      "vram_gib": 16,
+      "power_w": 180,
+      "pcie": "5.0 x8",
+      "h2d_gbps": 28.8
+    },
+    {
+      "name": "RTX 5060 Ti",
+      "vram_gib": 16,
+      "power_w": 180,
+      "pcie": "5.0 x8",
+      "h2d_gbps": 28.8
+    }
+  ],
+  "ram_gib": 59,
+  "cpu": "AMD Ryzen 5 9600X, 6 cores",
+  "ram_gbps": 56.7,
+  "os": "Linux",
+  "quant": "NVFP4",
+  "kv": "int8",
+  "prefill_16k_tps": 2752.9,
+  "prefill_64k_tps": 2775.7,
+  "decode_tps": 178.6,
+  "decode_conv_tps": 108.6,
+  "decode_struct_tps": 221.7,
+  "decode_prose_tps": 103.4,
+  "accept_conv_pct": 69.0,
+  "accept_struct_pct": 98.5,
+  "accept_prose_pct": 66.5,
+  "draft_len_conv": 2.1,
+  "draft_len_struct": 6.9,
+  "draft_len_prose": 1.7,
+  "engine_args": "--gpu 0,1 --max-context 66661 --kv int8"
+}

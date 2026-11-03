@@ -1,0 +1,34 @@
+{
+  "submitter": "lukyjay",
+  "date": "2026-11-24",
+  "commit": "400b411c58",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5060 Ti",
+      "vram_gib": 16,
+      "power_w": 180,
+      "pcie": "5.0 x8"
+    }
+  ],
+  "ram_gib": 125,
+  "cpu": "Intel Core Ultra 5 225, 10 cores",
+  "ram_gbps": 69.2,
+  "os": "Linux",
+  "quant": "Q5_K_XL",
+  "kv": "int8",
+  "prefill_16k_tps": 1990.8,
+  "prefill_64k_tps": 2052.6,
+  "decode_tps": 56.8,
+  "decode_conv_tps": 44.4,
+  "decode_struct_tps": 62.1,
+  "decode_prose_tps": 44.5,
+  "accept_conv_pct": 77.6,
+  "accept_struct_pct": 98.4,
+  "accept_prose_pct": 74.0,
+  "draft_len_conv": 1.9,
+  "draft_len_struct": 6.8,
+  "draft_len_prose": 1.4,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8"
+}

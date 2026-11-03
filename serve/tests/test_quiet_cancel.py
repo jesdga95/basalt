@@ -49,11 +49,18 @@ threading.Thread(target=reader, daemon=True).start()
 if batch:
     print(f'INFO batch_slots={batch}', flush=True)
 print('READY 4096 stop', flush=True)
-count = 0
+count = held = 0
 while True:
     line = commands.get()
     if line == 'QUIT':
         break
+    if line.startswith('PROMPTI'):             # a held prompt: answered at once, then matched against the idle slots
+        held += 1
+        print(f'PROMPT {held} {len(line.split()[-1].split(","))}', flush=True)
+        continue
+    if line.startswith('PMATCH '):
+        print('PMATCH ' + line.split()[1] + ' ' + ' '.join(['0:0'] * batch), flush=True)
+        continue
     if not line.startswith(('GEN ', 'BGEN ')):
         continue
     count += 1
@@ -83,18 +90,18 @@ class QuietPromptCancel(unittest.TestCase):
             with mock.patch.object(process.subprocess, 'Popen', lambda cmd, **kw:
                                    real_popen([sys.executable, str(script), *cmd[1:]], **kw)):
                 engine = ProcessEngine('basalt', ['--batch', str(batch), '--events', str(events)])
-            service = Service(engine, ByteTokenizer(), ChatTemplate(ROOT / 'serve/chat_template.jinja'))
+            service = Service(engine, ByteTokenizer(), ChatTemplate.from_file(ROOT / 'serve/chat_template.jinja'))
             http = serve(service, port=0)
             port = http.server_address[1]
             sock = None
             reply, errors = [], []
             follower = None
             try:
-                body = {'model': 'qwen3.8-flash-next', 'stream': stream, 'max_tokens': max_new,
+                body = {'model': 'basalt', 'stream': stream, 'max_tokens': max_new,
                         'messages': [{'role': 'user', 'content': 'a long prompt'}],
                         'reasoning_effort': 'none'}
                 if api == 'responses':
-                    body = {'model': 'qwen3.8-flash-next', 'stream': stream, 'max_output_tokens': max_new,
+                    body = {'model': 'basalt', 'stream': stream, 'max_output_tokens': max_new,
                             'input': 'a long prompt', 'reasoning': {'effort': 'none'}}
                 data = json.dumps(body).encode()
                 path = {'openai': '/v1/chat/completions', 'anthropic': '/v1/messages',
@@ -116,7 +123,7 @@ class QuietPromptCancel(unittest.TestCase):
                 sock = None
 
                 def follow():
-                    data = json.dumps({'model': 'qwen3.8-flash-next', 'messages': [{'role': 'user', 'content': 'hi'}],
+                    data = json.dumps({'model': 'basalt', 'messages': [{'role': 'user', 'content': 'hi'}],
                                        'max_tokens': 1, 'reasoning_effort': 'none'}).encode()
                     req = urllib.request.Request(f'http://127.0.0.1:{port}/v1/chat/completions', data=data,
                                                  headers={'Content-Type': 'application/json'})

@@ -1,0 +1,147 @@
+// DeepSeek-V4.1-Flash adapter: registers the architecture, validates and describes the file from its
+// `deepseek41.*` metadata, and loads the pack into a DsModel.
+#include "models/deepseek41/adapter.hpp"
+
+#include "basalt/log.hpp"
+#include "basalt/program/options.hpp"
+
+#include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/core/diag.hpp"
+#include "basalt/core/model_file.hpp"
+#include "basalt/log.hpp"
+#include "basalt/model/flags.hpp"
+#include "basalt/model/route_flags.hpp"
+#include "models/deepseek41/context_policy.hpp"
+#include "models/deepseek41/dspark.hpp"
+#include "models/deepseek41/meta.hpp"
+#include "models/deepseek41/model.hpp"
+
+#include <cuda_runtime.h>
+
+#include <cstdint>
+#include <cstdlib>
+#include <vector>
+
+namespace basalt::models::deepseek41 {
+namespace {
+
+constexpr float kRoutePriorBare = 0.1f;   // --route-prior alone: on the biased score, which runs about 0.5 to 3
+
+class Adapter final : public model::ModelAdapter {
+public:
+    const char* arch() const override { return "deepseek41"; }
+
+    std::string validate(const GgufFile& g) const override { return validate_meta(g); }
+
+    model::ModelDesc describe(const GgufFile& g) const override { return describe_meta(g); }
+
+    // the routing order of the experts and the drafter's ranking of each stage's experts
+    std::vector<std::string> shipped_profiles(const std::string& key) const override {
+        if (key != "deepseek41-40x384") return {};
+        return {key + ".prof", key + "-dspark.prof"};
+    }
+
+    std::unique_ptr<model::LoadedModel> make_model() const override { return std::make_unique<DsModel>(); }
+
+    std::vector<model::SideTableSpec> side_tables(const model::ModelDesc&) const override {
+        // the Engram table; its row geometry comes from the pack's meta.engram
+        return {{model::SideTableSpec::Kind::Engram, "per_layer_token_embd.weight", 256, 0}};
+    }
+
+    model::TokenizerSpec tokenizer_spec() const override { return {"tokenizer.ggml.tokens", "deepseek"}; }
+
+    // <｜DSML｜ calls>, <｜DSML｜ invoke name="N">, <｜DSML｜ parameter name="P" string="true|false">
+    program::grammar::ToolForm tool_form() const override {
+        const std::string dsml = "\xef\xbd\x9c" "DSML\xef\xbd\x9c";
+        program::grammar::ToolForm f;
+        f.call_open = "<" + dsml + " calls>\n";
+        f.call_close = "\n</" + dsml + " calls>";
+        f.fn_open = "<" + dsml + " invoke name=\"";
+        f.fn_mid = "\">\n";
+        f.fn_close = "</" + dsml + " invoke>";
+        f.param_open = "<" + dsml + " parameter name=\"";
+        f.param_mid_text = "\" string=\"true\">";
+        f.param_mid_value = "\" string=\"false\">";
+        f.param_close = "</" + dsml + " parameter>\n";
+        f.text_end = "</" + dsml + " parameter>";
+        f.calls_share_block = true;
+        f.trigger = "<" + dsml + " calls>";
+        return f;
+    }
+
+    PreTokenizer pretokenizer() const override { return {"joyai-llm", pretok_joyai}; }
+
+    /// Peer: the second cards hold experts, each a contiguous block of layers.
+    program::GpuModes gpu_modes() const override { return {kMaxSecondCards + 1, 0, 0}; }
+
+    const char* model_name() const override { return "DeepSeek-V4.1-Flash"; }
+    const char* community_kv() const override { return "fp8"; }
+
+    bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
+        if (model::parse_route_flag(a, args, o.route, code)) {}
+        else if (a == "--no-prompt-skip") o.no_prompt_skip = true;
+        else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
+        else if (a == "--spec-oracle") o.spec_oracle = args.next("--spec-oracle");
+        else if (a == "--kv") o.kv = args.next("--kv");
+        else if (a == "--draft-experts") o.draft_experts = std::atoi(args.next("--draft-experts"));
+        else if (a == "--diag-drafter-gpu") o.drafter_device = std::atoi(args.next("--diag-drafter-gpu"));
+        else if (a == "--diag-teacher") o.diag_teacher = true;
+        else if (a == "--diag-tier-frozen") o.diag_tier_frozen = true;
+        else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
+        else return false;
+        return true;
+    }
+
+    // A context the pack refuses is refused with the flags, before anything loads; the memory check needs the card.
+    std::optional<int> finish_flags(program::CommonOptions& o) const override {
+        CacheFormat fmt = CacheFormat::Fp8;
+        if (o.kv.empty()) o.kv = "fp8";
+        if (!ctxp::cache_format(o.kv, fmt)) {
+            basalt::log::error("basalt deepseek41", "--kv %s: DeepSeek's caches are fp8 (the default: FP8 window rows, FP4 "
+                               "compressed rows and index keys) or fp16", o.kv.c_str());
+            return 2;
+        }
+        if (o.draft_experts < 0 || o.draft_experts > 128 || o.draft_experts % 32 != 0) {
+            basalt::log::error("basalt deepseek41", "--draft-experts %d: 32, 64, 96 or 128, or 0 for all", o.draft_experts);
+            return 2;
+        }
+        core::ModelFile file;
+        std::string err;
+        const bool opened = !o.model.empty() && file.open(o.model, err);
+        const bool drafter = opened && file.find("dspark/gguf") != nullptr;
+        // the pack's drafter offers a whole block (the window policy takes the rows that pay) unless --spec caps it;
+        // a token file drafts in its place
+        if (!o.spec_given) {
+            o.spec = drafter ? kDsparkBlock + 1 : 0;
+            if (opened && !drafter) basalt::log::info("basalt deepseek41", "no dspark/gguf section: plain decode");
+        }
+        if (o.spec >= 2 && o.spec_oracle.empty() && !drafter) {
+            basalt::log::warn("basalt deepseek41", "--spec %d off: the pack has no dspark/gguf section", o.spec);
+            o.spec = 0;
+        }
+        const bool meta = opened && file.load_meta(err);
+        const core::Json* kv = meta ? file.meta().get("gguf_kv") : nullptr;
+        const core::Json* geo = meta ? file.meta().get("geometry") : nullptr;
+        const core::Json* used = geo ? geo->get("expert_used_count") : nullptr;
+        if (const std::optional<int> c = model::finish_route_flags(o, used ? (int) used->num() : 0, kRoutePriorBare, "basalt deepseek41"))
+            return c;
+        if (!meta) return std::nullopt;
+        const core::Json* native = kv ? kv->get("deepseek41.context_length") : nullptr;
+        const ctxp::Plan p = ctxp::plan_context(o.max_context, native ? (int64_t) native->u64() : 0, UINT64_MAX, {}, fmt);
+        if (p.error.empty()) return std::nullopt;
+        basalt::log::error("basalt deepseek41", "%s", p.error.c_str());
+        return 2;
+    }
+
+    // The disk tier's records count positional cells; this model's caches keep compressed rows.
+    model::TokenNames token_names() const override {
+        return {{"<\xef\xbd\x9c" "end\xe2\x96\x81of\xe2\x96\x81sentence\xef\xbd\x9c>"}, "<\xef\xbd\x9cUser\xef\xbd\x9c>",
+                "<\xef\xbd\x9c" "deepseek_image\xef\xbd\x9c>", "", ""};   // its User token opens no reply
+    }
+};
+
+}  // namespace
+
+std::unique_ptr<model::ModelAdapter> make_adapter() { return std::make_unique<Adapter>(); }
+
+}  // namespace basalt::models::deepseek41

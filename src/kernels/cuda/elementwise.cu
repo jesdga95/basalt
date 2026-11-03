@@ -1,6 +1,7 @@
 // src/kernels/cuda/elementwise.cu - the glue kernels.  See the header for why each exists.
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/dp4a.hpp"
+#include "basalt/kernels/doorbell.cuh"
 
 #include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/kernels/f16_bits.hpp"
@@ -196,6 +197,47 @@ void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream) 
     check_launch("doorbell_wait");
 }
 
+__global__ void doorbell_abort_wait_kernel(const uint32_t* flag, const uint32_t* seq, const uint32_t* abort) {
+    doorbell_spin(flag, *seq, abort, 1);
+}
+
+void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, const uint32_t* d_abort, void* stream) {
+    if (d_flag == nullptr || d_seq == nullptr) return;
+    doorbell_abort_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(d_flag, d_seq, d_abort);
+    check_launch("doorbell_wait");
+}
+
+__global__ void wait_word_kernel(const volatile uint32_t* word, uint32_t value) {
+    while (*word != value) spin_pause();
+    __threadfence_system();
+}
+
+void wait_word(const uint32_t* word, uint32_t value, void* stream) {
+    wait_word_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(word, value);
+    check_launch("wait_word");
+}
+
+__global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
+    while (*flag < value) spin_pause();
+    __threadfence_system();
+}
+
+void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
+    wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    check_launch("wait_flag_ge");
+}
+
+__global__ void signal_flag_kernel(volatile uint32_t* flag, uint32_t value) {
+    __threadfence_system();
+    *flag = value;
+    __threadfence_system();
+}
+
+void signal_flag(uint32_t* flag, uint32_t value, void* stream) {
+    signal_flag_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    check_launch("signal_flag");
+}
+
 __global__ void copy_from_mapped_kernel(float4* __restrict__ dst, const volatile float4* src, int64_t n4) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x) {
         const float4 v = const_cast<const float4*>(src)[i];
@@ -226,20 +268,23 @@ __global__ void copy_rows_from_mapped_kernel(float4* __restrict__ dst, const vol
 }
 namespace {
 __global__ void scatter_rows_kernel(const float4* __restrict__ src, float4* dst, const int32_t* __restrict__ rows,
-                                    int64_t w4) {
+                                    int64_t w4, const int32_t* __restrict__ count) {
     const int64_t r = blockIdx.x;
+    if (count && r >= *count) return;
     const float4* s = src + r * w4;
     float4* d = dst + (int64_t) rows[r] * w4;
     for (int64_t i = threadIdx.x; i < w4; i += blockDim.x) d[i] = s[i];
 }
 }  // namespace
-void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t n, int64_t width, void* stream) {
+void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t n, int64_t width, void* stream,
+                      const int32_t* count) {
     if (n <= 0) return;
     if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
         basalt::log::error("basalt", "scatter_rows_f32: width must be a multiple of 4 and both pointers 16-byte aligned");
         std::exit(1);
     }
-    scatter_rows_kernel<<<(unsigned) n, 128, 0, (cudaStream_t) stream>>>((const float4*) src, (float4*) dst, rows, width / 4);
+    scatter_rows_kernel<<<(unsigned) n, 128, 0, (cudaStream_t) stream>>>((const float4*) src, (float4*) dst, rows, width / 4,
+                                                                         count);
 }
 void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t width, const int32_t* hit_rows,
                            const int32_t* count, void* stream) {
@@ -313,14 +358,6 @@ __global__ void doorbell_publish_value_kernel(const float* __restrict__ x, const
         *(volatile uint32_t*) seq = value;
         __threadfence_system();
     }
-}
-
-void doorbell_publish_value(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k,
-                            float* x_out, int32_t* ids_out, float* weights_out, uint32_t* d_seq, uint32_t value,
-                            void* stream) {
-    if (k > 1024) { basalt::log::error("basalt", "doorbell_publish: k too large"); std::exit(1); }
-    doorbell_publish_value_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, ids, weights, (int) n, (int) k, x_out,
-                                                                          ids_out, weights_out, d_seq, value);
 }
 
 void doorbell_publish(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k, float* x_out,

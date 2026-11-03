@@ -5,15 +5,18 @@
 // places the rows at the image's pad tokens and gives them their 2-D M-RoPE positions (see --serve GENI in
 // src/program/serve/commands.cpp).
 //
-//   basalt-vision --mmproj <mmproj.gguf> [--model <text vocab .gguf>] [--gpu] [--threads N] [--max-tokens N]
-//                 [--flash-attn on|off|auto]
+//   basalt-vision --model <model.basalt> [--gpu] [--threads N] [--max-tokens N]
 //
-// Resident: prints "READY <n_embd>", then per stdin line
+// The projector is read in place from the model file's `vision/mmproj` section; nothing is copied out.
+//
+// Resident: prints "VIDEO on|off ..." (whether it reads video, video.hpp) and "READY <n_embd>", then per stdin line
 //   ENC <image path> <output path>   ->  "OK <n_tokens> <nx> <ny> <ms>"  or  "ERR <message>"
+//   ENCV <video> <output> [fps=F] [max_frames=N] [max_tokens=N]
+//                                    ->  "OK <groups> <nx> <ny> <ms> <time,time,...>"  or  "ERR <message>"
 //   QUIT
 // The output file is  int32 {0x31455653 'SVE1', n_tokens, nx, ny, n_embd}  then float32 [n_tokens][n_embd],
-// row i at grid position (x = i % nx, y = i / nx).  --model and --flash-attn are accepted for the callers that
-// pass them and have no effect.
+// row i at grid position (x = i % nx, y = i / nx); a video's file is one such record per group, in time order, and
+// its reply gives each group's time in seconds.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -29,9 +32,12 @@
 #ifdef BASALT_VISION_CUDA
 #include "basalt/vision/encoder_cuda.hpp"
 #endif
+#include "basalt/core/model_file.hpp"
 #include "basalt/vision/encoder_cpu.hpp"
+#include "basalt/vision/ffmpeg_api.hpp"
 #include "basalt/vision/mmproj.hpp"
 #include "basalt/vision/preprocess.hpp"
+#include "basalt/vision/video.hpp"
 
 namespace {
 
@@ -50,15 +56,16 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
 }
 
 const char* const kUsage =
-    "usage: basalt-vision --mmproj <mmproj.gguf> [--model <model.gguf>] [--gpu] [--threads N] [--max-tokens N] "
-    "[--flash-attn on|off|auto]\n"
-    "  reads \"ENC <image> <output>\" lines on stdin and writes each image's embeddings to <output>;\n"
+    "usage: basalt-vision --model <model.basalt> [--gpu] [--threads N] [--max-tokens N]\n"
+    "  reads the projector in place from the model file's vision/mmproj section;\n"
+    "  reads \"ENC <image> <output>\" lines on stdin and writes each image's embeddings to <output>,\n"
+    "  and \"ENCV <video> <output> [fps=F] [max_frames=N] [max_tokens=N]\" lines, one record per group;\n"
     "  --gpu runs the encoder on the GPU, else on the CPU\n";
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string mmproj;
+    std::string model;
     bool gpu = false;
     int threads = 0, max_tokens = 0;
     for (int i = 1; i < argc; ++i) {
@@ -71,14 +78,13 @@ int main(int argc, char** argv) {
             std::printf("%s", kUsage);
             return 0;
         }
-        if (a == "--mmproj") mmproj = next();
-        else if (a == "--model" || a == "--flash-attn") next();
+        if (a == "--model") model = next();
         else if (a == "--gpu") gpu = true;
         else if (a == "--threads") threads = std::atoi(next().c_str());
         else if (a == "--max-tokens") max_tokens = std::atoi(next().c_str());
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
-    if (mmproj.empty()) {
+    if (model.empty()) {
         std::fprintf(stderr, "%s", kUsage);
         return 2;
     }
@@ -95,7 +101,14 @@ int main(int argc, char** argv) {
     const auto load_t0 = std::chrono::steady_clock::now();
     std::string err;
     Mmproj mp;
-    if (!mp.open(mmproj, err)) { std::printf("ERR cannot load the vision encoder %s: %s\n", mmproj.c_str(), err.c_str()); std::fflush(stdout); return 1; }
+    basalt::core::ModelFile file;
+    if (!file.open(model, err) || file.range("vision/mmproj").empty()) {
+        if (err.empty()) err = model + " has no vision/mmproj section";
+        std::printf("ERR cannot load the vision encoder: %s\n", err.c_str());
+        std::fflush(stdout);
+        return 1;
+    }
+    if (!mp.open(file.range("vision/mmproj"), err)) { std::printf("ERR cannot load the vision encoder %s: %s\n", model.c_str(), err.c_str()); std::fflush(stdout); return 1; }
     Geometry geo;
     if (max_tokens > 0) geo.max_tokens = std::max(max_tokens, geo.min_tokens);
     if (threads <= 0) threads = (int) std::max(1u, std::thread::hardware_concurrency() / 2);
@@ -141,6 +154,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "basalt-vision: on the CPU, %d threads, no warm-up\n", threads);
     }
     const int n_embd = mp.hp().proj;
+    std::printf("%s\n", video_line().c_str());
     std::printf("READY %d\n", n_embd);
     std::fflush(stdout);
 
@@ -148,13 +162,49 @@ int main(int argc, char** argv) {
     while (std::getline(std::cin, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
         if (line == "QUIT") break;
+        if (line.rfind("ENCV ", 0) == 0) {
+            const auto t0 = std::chrono::steady_clock::now();
+            std::string vid_path, out_path;
+            VideoOptions vo;
+            vo.group_tokens = geo.max_tokens;
+            vo.gpu = gpu ? 0 : -1;   // NVDEC on the encoder's own card, in its context
+#ifdef BASALT_VISION_CUDA
+            if (gpu) vo.cuda_context = current_context();
+#endif
+            Video v;
+            if (!parse_encv(line, vid_path, out_path, vo, err) || !read_video(vid_path, vo, v, err)) {
+                std::printf("ERR %s\n", err.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            std::vector<float> patches, out;
+            patchify_video(v.frames, (int) v.indices.size(), v.canvas, geo, patches);
+            const int nx = v.canvas.w / 32, ny = v.canvas.h / 32, n = nx * ny;
+            const size_t per = (size_t) n * 4 * 1536;
+            FILE* o = std::fopen(out_path.c_str(), "wb");
+            bool ok = o != nullptr;
+            for (int gi = 0; ok && gi < v.groups(); ++gi) {
+                const std::vector<float> group(patches.begin() + gi * per, patches.begin() + (gi + 1) * per);
+                const int32_t hdr[5] = {0x31455653, n, nx, ny, n_embd};
+                ok = encode(group, v.canvas, out) && std::fwrite(hdr, sizeof hdr, 1, o) == 1 &&
+                     std::fwrite(out.data(), sizeof(float) * (size_t) n_embd, (size_t) n, o) == (size_t) n;
+            }
+            if (o) std::fclose(o);
+            if (!ok) { std::printf("ERR the video could not be encoded to %s\n", out_path.c_str()); std::fflush(stdout); continue; }
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            std::printf("OK %d %d %d %.0f %s\n", v.groups(), nx, ny, ms, times_text(group_times(v.indices, v.fps)).c_str());
+            std::fflush(stdout);
+            continue;
+        }
         std::string img_path, out_path;
         if (!parse_enc(line, img_path, out_path)) { std::printf("ERR expected: ENC <image> <output>\n"); std::fflush(stdout); continue; }
         const auto t0 = std::chrono::steady_clock::now();
         std::ifstream f(img_path, std::ios::binary);
         const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        const bool read_ok = static_cast<bool>(f);
+        f.close();   // the caller removes the input once it has the reply
         Image img;
-        if (!f || bytes.empty() || !decode_image(bytes.data(), bytes.size(), img, err)) {
+        if (!read_ok || bytes.empty() || !decode_image(bytes.data(), bytes.size(), img, err)) {
             std::printf("ERR cannot read the image %s\n", img_path.c_str());
             std::fflush(stdout);
             continue;

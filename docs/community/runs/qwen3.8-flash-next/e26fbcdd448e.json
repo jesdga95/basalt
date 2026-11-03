@@ -1,0 +1,25 @@
+{
+  "submitter": "jesdga95",
+  "date": "2026-10-25",
+  "commit": "a57fade43e",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5060 Ti",
+      "vram_gib": 16,
+      "power_w": 180,
+      "pcie": "5.0 x8",
+      "h2d_gbps": 28.8
+    }
+  ],
+  "ram_gib": 121,
+  "cpu": "AMD Ryzen 9 9950X, 16 cores",
+  "ram_gbps": 58.3,
+  "os": "Linux",
+  "quant": "IQ3_S",
+  "kv": "int8",
+  "prefill_16k_tps": 2427.2,
+  "prefill_64k_tps": 2430.0,
+  "decode_tps": 137.0
+}

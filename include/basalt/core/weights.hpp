@@ -34,6 +34,8 @@
 
 namespace basalt::core {
 
+class LoadPlan;
+
 /// What the loader had to DO for a tensor, decided when the model file is built and written into the index
 /// rather than inferred here.  The four cases are distinguishable in the manifest only by combining
 /// `source_type` with `values_fp16`, and getting that combination wrong yields a plausible tensor.
@@ -99,8 +101,7 @@ struct LoadReport {
     uint64_t arena_bytes = 0;
     size_t re_rounded = 0;        ///< tensors written as 16 bits out of a 32-bit container
     uint64_t bytes_saved = 0;     ///< what those conversions saved against the file
-    double read_ms = 0.0;
-    double upload_ms = 0.0;
+    double read_ms = 0.0;   ///< the whole read, conversion and copy
 };
 
 /// The ranges the dense index's rows refer to: the index and the byte ranges of its files, by the index's file id
@@ -136,9 +137,10 @@ public:
     /// because the failure mode otherwise is a device write past the end of the arena.
     /// With `skip`, the named tensors are not read: their rows keep their metadata with `data == nullptr` and
     /// `resident == false`, and the other tensors are packed into the compacted arena `pool_bytes` sized.
-    /// `report_progress == false` keeps a temporary load out of the startup progress lines.
+    /// `report_progress == false` keeps a temporary load out of the startup progress lines.  With `into` the reads are
+    /// queued there for the caller's pass instead (the rows are set; the bytes land when the pass runs).
     bool load(const PackFiles& pack, void* arena_base, uint64_t arena_bytes, std::string& err,
-              const std::set<std::string>* skip = nullptr, bool report_progress = true);
+              const std::set<std::string>* skip = nullptr, bool report_progress = true, LoadPlan* into = nullptr);
 
     const WeightRef* find(const std::string& name) const;
     /// Point a row at another device form that stands for the tensor (an 8-bit copy keyed by its own address,

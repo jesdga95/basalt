@@ -1,6 +1,9 @@
 // The host side of the MMQ kernels: error reporting, the properties of each device and the cache of scratch buffers
-// that the stream-k fixup of a launch takes from.
+// that the stream-k fixup of a launch takes from, and the explicit load of a kernel.
 #include "mmq_common.cuh"
+#include "basalt/core/device.hpp"
+
+#include <cuda.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +22,24 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+void ggml_cuda_func_load(const void * symbol) {
+    using Load = CUresult (CUDAAPI *)(CUfunction);
+    static const Load load = [] {
+        void * p = nullptr;
+        cudaDriverEntryPointQueryResult q{};
+        if (cudaGetDriverEntryPointByVersion("cuFuncLoad", &p, 12040, cudaEnableDefault, &q) != cudaSuccess ||
+            q != cudaDriverEntryPointSuccess) {
+            (void) cudaGetLastError();
+            p = nullptr;
+        }
+        return (Load) p;
+    }();
+    cudaFunction_t f = nullptr;
+    CUDA_CHECK(cudaGetFuncBySymbol(&f, symbol));
+    if (load == nullptr || load((CUfunction) f) != CUDA_SUCCESS)
+        GGML_ABORT("cannot load a kernel (cuFuncLoad)");
+}
+
 const ggml_cuda_device_info & ggml_cuda_info() {
     static ggml_cuda_device_info info = [] {
         ggml_cuda_device_info in = {};
@@ -35,7 +56,7 @@ const ggml_cuda_device_info & ggml_cuda_info() {
             };
             auto & d = in.devices[id];
             d.smpbo = (size_t) attr(cudaDevAttrMaxSharedMemoryPerBlockOptin);
-            d.nsm = attr(cudaDevAttrMultiProcessorCount);
+            d.nsm = basalt::core::plan_sms(id);   // the stream-k split: the planning card's, so a stage computes its bits
             d.warp_size = attr(cudaDevAttrWarpSize);
         }
         return in;

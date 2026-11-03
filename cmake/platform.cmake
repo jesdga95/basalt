@@ -34,6 +34,20 @@ add_library(platform STATIC
 target_include_directories(platform PUBLIC ${BASALT_CMAKE_ROOT}/include)
 # dlopen (DynLib) lives in libdl before glibc 2.34
 target_link_libraries(platform PUBLIC warnings ${CMAKE_DL_LIBS})
+
 if(WIN32)
-  target_link_libraries(platform PUBLIC advapi32)   # the processor name in the registry
+  target_link_libraries(platform PUBLIC advapi32 dxgi)   # processor name and adapter memory budgets
 endif()
+
+# The .basalt reader (host-only like `platform`): the engine's `core` and the vision programs, which open a section in
+# place, link the one copy.
+add_library(model_file STATIC ${BASALT_CMAKE_ROOT}/src/core/model_file.cpp)
+target_include_directories(model_file PUBLIC ${BASALT_CMAKE_ROOT}/include)
+target_link_libraries(model_file PUBLIC platform warnings)
+
+# The executables a release ships go to <source>/bin for every generator. A plain RUNTIME_OUTPUT_DIRECTORY gets a
+# per-configuration subdirectory (bin/Release) from the multi-config generators (Visual Studio, Ninja Multi-Config),
+# and the engine finds data/ and its sibling programs relative to bin/; the generator expression stops that.
+function(basalt_ship_to_bin target)
+  set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<1:${BASALT_CMAKE_ROOT}/bin>")
+endfunction()

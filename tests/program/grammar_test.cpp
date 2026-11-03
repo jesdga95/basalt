@@ -1,5 +1,6 @@
 // tests/program/grammar_test.cpp - GBNF parse, accept/reject, UTF-8 across tokens, clone/rewind, lazy triggers, and
 // the vocabulary mask against a token-by-token check. Ends with a timing line for allows() and fill_mask().
+#include "tool_form_fixture.hpp"
 #include "basalt/program/grammar/grammar.hpp"
 #include "basalt/program/grammar/schema.hpp"
 
@@ -312,6 +313,41 @@ static void test_patterns() {
     GrammarState c(r, rt);
     CHECK(!c.accept("g", 1) && !c.active());      // the trigger fires, the grammar wants token 5: refused, unchanged
     CHECK(c.accept("g", 5) && c.active() && c.accept("x") && c.accepting());
+    // bounded pattern after a long inactive prefix (past tail trim) still matches across token boundaries,
+    // preserves capture-group offsets and replayed token ids, and rolls back cleanly on failed fire
+    auto mg = parse("root ::= \"<|message_model|>\" [a-z]+ \"<|end|>\"");
+    Triggers mt;
+    mt.patterns = {"<\\|message_model\\|>[^<]"};
+    GrammarState ms(mg, mt);
+    for (int i = 0; i < 2000; ++i) CHECK(ms.accept("hello world ", 10) && !ms.active());
+    CHECK(ms.accept("<|message_model|>", 20) && !ms.active());
+    CHECK(!ms.accept("1", 21) && !ms.active());   // fires on "<|message_model|>1", grammar rejects '1', rolls back
+    CHECK(ms.accept("ab", 22) && ms.active());    // previous header piece survived rollback and matches now
+    CHECK(ms.accept("c<|end|>", 23) && !ms.active() && ms.accepting());
+    // capture group inside a bounded pattern after tail trim (lo > 0)
+    Triggers cap;
+    cap.patterns = {"pre_(<c>)"};
+    GrammarState cs(g, cap);
+    for (int i = 0; i < 400; ++i) CHECK(cs.accept("padding ", 1) && !cs.active());
+    CHECK(cs.accept("pre_<", 2) && !cs.active());
+    CHECK(cs.accept("c>xy", 3) && cs.active());
+    CHECK(cs.accept("</c>", 4) && !cs.active());
+    // token reference inside a bounded multi-token trigger after tail trim
+    auto rg = parse("root ::= <[5]> <[6]> \"z\"");
+    Triggers rgt;
+    rgt.patterns = {"ab"};
+    GrammarState rs(rg, rgt);
+    for (int i = 0; i < 400; ++i) CHECK(rs.accept("----", 1) && !rs.active());
+    CHECK(rs.accept("a", 5) && !rs.active());
+    CHECK(!rs.accept("b", 9) && !rs.active());    // wrong id for 'b': rolls back keeping token 5's 'a'
+    CHECK(rs.accept("b", 6) && rs.active() && rs.accept("z", 7) && !rs.active());
+    // word-boundary pattern stays unbounded (falls back to full scan)
+    auto cg = parse("root ::= \"call\" [a-z]+ \"!\"");
+    Triggers wb;
+    wb.patterns = {"\\bcall"};
+    GrammarState ws(cg, wb);
+    CHECK(ws.accept("xcall", 1) && !ws.active());
+    CHECK(ws.accept(" callq", 2) && ws.active() && ws.accept("!", 3) && !ws.active());
 }
 
 // A byte sequence split across tokens: a prefix is fine while some completion can match.
@@ -337,6 +373,13 @@ static void test_partial_utf8() {
     t.fill_mask(voc, mask);
     CHECK(mask[0xE2] && mask[257] && mask['a'] && !mask[0xA9] && !mask[0xFF]);
     CHECK(t.accept("\xE2\x82") && t.accept("\xAC") && t.accept("\xF0\x9F") && t.accept("\x98\x80") && t.accepting());
+    // the same stacks with a character half read give another mask, and the cached one for the whole state is not served
+    GrammarState w(any);
+    w.fill_mask(voc, mask);
+    CHECK(mask['a'] && mask[0xE2] && !mask[0xA9]);
+    CHECK(w.accept("\xE2"));
+    w.fill_mask(voc, mask);
+    CHECK(mask[0xA9] && !mask['a'] && !mask[0xE2]);
     // a continuation byte after a finished character, or a bad lead, is refused
     GrammarState u(any);
     CHECK(!u.accept("\x80") && !u.accept("\xC0\x80") && !u.accept("\xFF"));
@@ -446,6 +489,7 @@ static void bench() {
 }
 
 int main() {
+    set_test_tool_form();
     test_parse();
     test_basic();
     test_json();

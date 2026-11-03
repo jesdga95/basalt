@@ -6,6 +6,7 @@
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
 #include "basalt/ggml/ggml_common.h"
+#include "basalt/log.hpp"
 #include "basalt/platform/compiler.hpp"
 
 #include <immintrin.h>
@@ -17,6 +18,7 @@
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
 #define BASALT_IQ_VNNI 0
+#define BASALT_IQ_BMI2 0
 #define BASALT_IQ_EXPORT(name) name##_base
 #include "iq_avx2_rows.inc"
 
@@ -88,6 +90,8 @@ void iq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
     if (vnni) iq256_rows_vnni(type, w, row_bytes, n, act, nt, out, r0, r1);
     else iq256_rows_base(type, w, row_bytes, n, act, nt, out, r0, r1);
 }
+
+bool iq4nl256_fits(int n) noexcept { return n > 0 && n % QK4_NL == 0 && n / QK4_NL <= iq4nl_max_blocks; }
 
 void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt, float* const* out,
                         int r0, int r1) {

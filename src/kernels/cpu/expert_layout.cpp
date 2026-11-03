@@ -1,5 +1,7 @@
 // src/kernels/cpu/expert_layout.cpp - the per-layer expert table.  See the header.
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/cpu/neon.hpp"
+#include "basalt/platform/cpu.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -37,23 +39,6 @@ bool cpu_avx512_ok() {
     return ok;
 }
 
-bool cpu_avx512bw_ok() {
-    static const bool ok = [] {
-        unsigned r[4] = {0, 0, 0, 0};
-        auto cpuid = [&](unsigned leaf, unsigned sub) { platform::cpuid(leaf, sub, r); };
-        cpuid(0, 0);
-        if (r[0] < 7) return false;
-        cpuid(1, 0);
-        if (!((r[2] >> 27) & 1u)) return false;             // OSXSAVE
-        const unsigned long long xcr0 = platform::xgetbv0();
-        if ((xcr0 & 0xE6) != 0xE6) return false;          // the OS saves the AVX-512 state
-        cpuid(7, 0);
-        const unsigned ebx = r[1];
-        return ((ebx >> 16) & 1u) && ((ebx >> 17) & 1u) && ((ebx >> 30) & 1u) && ((ebx >> 31) & 1u);
-    }();
-    return ok;
-}
-
 bool cpu_avx2_ok() {
     static const bool ok = [] {
         if (cpu_isa_cap() < 2) return false;
@@ -81,8 +66,23 @@ bool cpu_avxvnni_ok() {
         if (r[0] < 7) return false;
         platform::cpuid(7, 0, r);
         if (r[0] < 1) return false;                        // leaf 7 has no sub-leaf 1
+        if (!((r[1] >> 8) & 1u)) return false;             // BMI2 (the i-quant rows' grid indices)
         platform::cpuid(7, 1, r);
         return ((r[0] >> 4) & 1u) != 0;                    // AVX-VNNI
+    }();
+    return ok;
+}
+
+bool cpu_avxvnni_int8_ok() {
+    static const bool ok = [] {
+        if (!cpu_avx2_ok()) return false;
+        unsigned r[4] = {0, 0, 0, 0};
+        platform::cpuid(0, 0, r);
+        if (r[0] < 7) return false;
+        platform::cpuid(7, 0, r);
+        if (r[0] < 1) return false;                        // leaf 7 has no sub-leaf 1
+        platform::cpuid(7, 1, r);
+        return ((r[3] >> 4) & 1u) != 0;                    // AVX-VNNI-INT8
     }();
     return ok;
 }
@@ -101,16 +101,16 @@ bool cpu_avx1_ok() {
     return ok;
 }
 
-bool cpu_sse42_ok() {
-    static const bool ok = [] {
-        unsigned r[4] = {0, 0, 0, 0};
-        platform::cpuid(1, 0, r);
-        return ((r[2] >> 20) & 1u) && ((r[2] >> 23) & 1u);   // SSE4.2, POPCNT
-    }();
+bool cpu_neon_ok() {
+    static const bool ok = platform::kArm64 && platform::cpu_has_arm_dotprod();
     return ok;
 }
 
 std::string cpu_name() {
+    if constexpr (platform::kArm64) {   // no CPUID: the OS's name for the processor
+        const std::string name = platform::cpu_info().name;
+        return name.empty() ? std::string("Arm64") : name;
+    }
     unsigned r[12] = {};
     {
         unsigned x[4];
@@ -131,17 +131,26 @@ std::string cpu_name() {
 
 void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
                  int r0, int r1) {
+    if constexpr (platform::kArm64) {
+        q2_0_gguf_rows_multi_neon(w, row_bytes, nblocks, a, nt, out, r0, r1);
+        return;
+    }
     if (cpu_avx512_ok()) q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);
     else q2_0_gguf_rows_multi_avx2(w, row_bytes, nblocks, a, nt, out, r0, r1);
 }
 
 void act_quant_any(const float* x, int n, ActQ& a) {
+    if constexpr (platform::kArm64) {
+        act_quant_q8_1_neon(x, n, a);
+        return;
+    }
     if (cpu_avx512_ok()) act_quant_q8_1(x, n, a);
     else act_quant_q8_1_avx2(x, n, a);
 }
 
 
-bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err) {
+bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err,
+                             int64_t n_embd, int64_t n_ff, float swiglu_limit) {
     ExpertLayout L;
     L.n_layers = n_layers;
     L.n_expert = n_expert;
@@ -179,14 +188,15 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
             continue;
         }
         std::istringstream ss(line);
-        long long l = -1, gt = -1, dt = -1;
+        long long l = -1, gt = -1, dt = -1, ut = -1;
         unsigned long long off = 0, blob = 0;
-        if (!(ss >> l >> gt >> dt >> off >> blob) || l < 0 || l >= n_layers) {
+        // v7 adds the up rows' type as a sixth column
+        if (!(ss >> l >> gt >> dt >> off >> blob) || l < 0 || l >= n_layers || (L.version >= 7 && !(ss >> ut))) {
             err = "expert layout: a malformed line: " + line;
             return false;
         }
         NativeFmt f;
-        if (!native_fmt((int) gt, (int) dt, H, FF, f, err)) return false;
+        if (!native_fmt((int) gt, (int) dt, n_embd, n_ff, f, err, swiglu_limit, (int) ut)) return false;
         if (f.bytes != blob) {
             err = "expert layout: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);

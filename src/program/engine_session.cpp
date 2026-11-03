@@ -2,6 +2,8 @@
 #include "basalt/log.hpp"
 #include "basalt/program/engine_session.hpp"
 
+#include <filesystem>
+
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/system.hpp"
 #include "basalt/program/load_summary.hpp"
@@ -149,6 +151,7 @@ bool Engine::request(const std::string& keys, long long max_new, const std::vect
             d.accepted = std::atoll(f[6].c_str());
             d.offered = std::atoll(f[7].c_str());
             if (f.size() > 8) d.reused = std::atoll(f[8].c_str());
+            if (f.size() > 10) { d.hits = std::atoll(f[9].c_str()); d.lookups = std::atoll(f[10].c_str()); }
             if (f.size() > 14) d.read_n = std::atoll(f[14].c_str());
             d.ok = true;
             return true;
@@ -206,6 +209,75 @@ bool Engine::read_line(std::string& line) {
         if (n <= 0) return false;
         buf_.append(tmp, (size_t) n);
     }
+}
+
+int engine_plan(const std::string& engine_bin, const std::vector<std::string>& args, const std::string& log_path,
+                std::string& answer) {
+    std::vector<std::string> argv = {engine_bin};
+    argv.insert(argv.end(), args.begin(), args.end());
+    argv.push_back("--gpu-plan");
+    basalt::platform::PipedChild child;
+    std::string err;
+    if (!basalt::platform::spawn_piped(argv, log_path, child, err)) return -1;
+    basalt::platform::close_fd(child.in_fd);
+    char buf[4096];
+    answer.clear();
+    for (int64_t n; (n = basalt::platform::pipe_read(child.out_fd, buf, sizeof buf)) > 0;) answer.append(buf, (size_t) n);
+    basalt::platform::close_fd(child.out_fd);
+    const int code = basalt::platform::child_wait(child.child, 20000);
+    if (code < 0) basalt::platform::child_terminate(child.child);
+    basalt::platform::child_close(child.child);
+    return code;
+}
+
+std::string plan_field(const std::string& plan_answer, const std::string& name) {
+    const std::string key = "\"" + name + "\":\"";
+    const size_t at = plan_answer.find(key);
+    if (at == std::string::npos) return {};
+    const size_t b = at + key.size(), e = plan_answer.find('"', b);
+    return e == std::string::npos ? std::string() : plan_answer.substr(b, e - b);
+}
+
+std::string fixtures_for(const std::string& dir, const std::string& plan_answer) {
+    const std::string arch = plan_field(plan_answer, "arch");
+    if (arch.empty()) return dir;
+    std::error_code ec;
+    const std::filesystem::path own = std::filesystem::path(dir) / arch;
+    return std::filesystem::is_directory(own, ec) ? own.string() : dir;
+}
+
+std::string fixture_vocab_refusal(int64_t max_id, int64_t n_vocab, const std::string& dir) {
+    if (n_vocab <= 0 || max_id < n_vocab) return {};
+    return "the fixtures in " + dir + " hold token id " + std::to_string((long long) max_id) + ", past this model's vocabulary of " +
+           std::to_string((long long) n_vocab) + " tokens: they were made with another tokenizer (a model's own go in " +
+           "data/bench/<arch>, or give --fixtures)";
+}
+
+std::string default_engine(const std::string& self, const std::string& built) {
+    if (!self.empty()) {
+        const std::filesystem::path p(self);
+        const std::string beside = (p.parent_path() / ("basalt" + p.extension().string())).string();
+        if (basalt::platform::path_executable(beside)) return beside;
+    }
+    return built;
+}
+
+std::string default_fixtures(const std::string& root, const std::string& built) {
+    std::error_code ec;
+    if (!root.empty() && std::filesystem::is_directory(std::filesystem::path(root) / "data" / "bench", ec))
+        return (std::filesystem::path(root) / "data" / "bench").string();
+    return built;
+}
+
+std::string community_refusal(const std::vector<std::string>& extra, const std::string& plan_answer) {
+    const std::vector<std::string> lossy = split(plan_field(plan_answer, "lossy"), ',');
+    if (!lossy.empty()) {
+        std::string list;
+        for (const auto& f : lossy) list += (list.empty() ? "" : ", ") + f;
+        return "--community runs the model as it is: " + list + (lossy.size() == 1 ? " is a lossy flag" : " are lossy flags");
+    }
+    return "--community runs the fixed preset: " + (extra.empty() ? std::string("an engine flag") : extra[0]) +
+           " would make the row incomparable";
 }
 
 void Engine::reap() {
@@ -272,13 +344,18 @@ std::string arg_value(const std::vector<std::string>& args, const std::string& f
     return "";
 }
 
-// FLAG [VALUE] words added to `args`: a flag already there takes the new value, else both are appended.  A word
-// that does not begin with "--" after a flag is its value.
+// FLAG [VALUE] words added to `args`: a flag already there takes the new value, else both are appended; a flag whose
+// every value the engine keeps (each `--exp` adds its settings) is appended each time.  A word that does not begin
+// with "--" after a flag is its value.
 void merge_args(std::vector<std::string>& args, const std::vector<std::string>& add) {
+    static const std::vector<std::string> kept = {"--exp", "--control-vector", "--control-vector-scaled", "--image",
+                                                  "--image-at"};
     for (size_t i = 0; i < add.size(); ++i) {
         const bool value = i + 1 < add.size() && add[i + 1].rfind("--", 0) != 0;
         if (add[i].rfind("--", 0) != 0) { args.push_back(add[i]); continue; }
-        if (value) { set_arg(args, add[i], add[i + 1]); ++i; }
+        const bool every = std::find(kept.begin(), kept.end(), add[i]) != kept.end();
+        if (value && every) { args.push_back(add[i]); args.push_back(add[i + 1]); ++i; }
+        else if (value) { set_arg(args, add[i], add[i + 1]); ++i; }
         else if (!has_arg(args, add[i])) args.push_back(add[i]);
     }
 }

@@ -1,0 +1,35 @@
+{
+  "submitter": "beastrobin",
+  "date": "2026-11-20",
+  "commit": "ad274aa8dc",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX PRO 6000 Blackwell Workstation Edition",
+      "vram_gib": 96,
+      "power_w": 300,
+      "pcie": "5.0 x16"
+    }
+  ],
+  "ram_gib": 253,
+  "cpu": "Intel Core Ultra 9 285K, 24 cores",
+  "ram_gbps": 80.5,
+  "os": "Windows",
+  "quant": "NVFP4-DQ8",
+  "kv": "int8",
+  "prefill_16k_tps": 6747.6,
+  "prefill_64k_tps": 8124.0,
+  "decode_tps": 430.6,
+  "decode_conv_tps": 301.7,
+  "decode_struct_tps": 510.2,
+  "decode_prose_tps": 276.2,
+  "accept_conv_pct": 67.6,
+  "accept_struct_pct": 98.1,
+  "accept_prose_pct": 64.8,
+  "draft_len_conv": 2.6,
+  "draft_len_struct": 6.9,
+  "draft_len_prose": 2.1,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8",
+  "notes": "v0.5.0 release binary, one visible card (sibling PRO 6000 hidden), 300 W. Replaces the v0.3.1-tag run of 2026-11-09 on this pack: decode 441.4, prefill 16K 7567.6, 64K 8374.7"
+}
