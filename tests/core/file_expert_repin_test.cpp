@@ -1,7 +1,7 @@
 // The resident expert copy's registration around a sleep: dropped (`unpin_complement`), registered again at the same
-// addresses (`repin_start` / `repin_wait` / `repin_finish`), twice, with the device alias still the host address and
-// the bytes unchanged; then a copy out of it into the GPU cache and back.  A synthetic expert file and a small GPU
-// expert cache; needs a CUDA device (exits 77 without one).
+// addresses (`repin_start` / `repin_wait` / `repin_finish`), twice, with the device alias still mapping the
+// same bytes and the bytes unchanged; then a copy out of it into the GPU cache and back.  A synthetic expert file and a
+// small GPU expert cache; needs a CUDA device (exits 77 without one).
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/expert_source.hpp"
 #include "basalt/ggml/ggml.h"
@@ -42,6 +42,15 @@ struct TempDirectory {
         fs::remove_all(path, ignored);
     }
 };
+
+// the alias is a device address (cudaHostGetDevicePointer), not the host pointer: on a driver that does not map registered
+// host memory at its own address the two differ, so the check is that the alias reads back the host bytes
+void require_alias_maps(const void* alias, const uint8_t* host, size_t bytes, const char* what) {
+    require(alias != nullptr, std::string(what) + ": no device alias");
+    std::vector<uint8_t> via(bytes);
+    require(cudaMemcpy(via.data(), alias, bytes, cudaMemcpyDeviceToHost) == cudaSuccess, std::string(what) + ": copy through the alias");
+    require(std::memcmp(via.data(), host, bytes) == 0, std::string(what) + ": the alias maps the host bytes");
+}
 
 bool registered(const void* p) {
     cudaPointerAttributes a{};
@@ -89,24 +98,40 @@ int run() {
     // the experts the copy holds, and what they read now
     std::vector<std::pair<int64_t, int64_t>> probe = {{0, held}, {0, experts - 1}, {1, held + 7}, {1, experts - 1}};
     std::vector<std::vector<uint8_t>> bytes;
+    std::vector<const void*> alias;
+    bool host_alias = true;   // the driver maps the registered copy at its host address: the sleep needs that
     for (const auto& [l, e] : probe) {
         require(src.has_resident(l, e) && registered(src.blob(l, e)), "a resident expert is registered after the load");
-        require(src.device_alias(l, e) == src.blob(l, e), "the device alias is the host address");
+        require_alias_maps(src.device_alias(l, e), src.blob(l, e), (size_t) blob, "the device alias after the load");
         bytes.emplace_back(src.blob(l, e), src.blob(l, e) + blob);
+        alias.push_back(src.device_alias(l, e));
+        host_alias = host_alias && src.device_alias(l, e) == src.blob(l, e);
     }
-    for (int cycle = 0; cycle < 2; ++cycle) {
-        require(src.unpin_complement(err), "unpin: " + err);
+    if (!host_alias) {
+        // the sleep is refused where the device alias is not the host address (one registered range read at its host
+        // addresses); the copy stays registered and the read path below still runs
+        const bool refused = src.unpin_complement(err);
+        require(!refused, "the sleep is accepted although the device alias is not the host address");
+        std::printf("file_expert_repin_test: this driver does not map the registered copy at its host address, the sleep is "
+                    "refused: %s; the repin cycles are skipped\n",
+                    err.c_str());
+    }
+    for (int cycle = 0; host_alias && cycle < 2; ++cycle) {
+        const bool unpinned = src.unpin_complement(err);
+        require(unpinned, "unpin: " + err);
         require(src.complement_unpinned(), "unpinned");
         for (const auto& [l, e] : probe) require(!registered(src.blob(l, e)), "the copy is no longer registered");
         src.repin_start(2);
         for (const auto& [l, e] : probe)
             require(src.repin_wait(src.blob(l, e), blob) && registered(src.blob(l, e)), "a range waited for is registered");
-        require(src.repin_finish(err), "repin: " + err);
+        const bool repinned = src.repin_finish(err);
+        require(repinned, "repin: " + err);
         require(!src.complement_unpinned(), "registered again");
         for (size_t k = 0; k < probe.size(); ++k) {
             const auto& [l, e] = probe[k];
-            require(registered(src.blob(l, e)) && src.device_alias(l, e) == src.blob(l, e), "the same addresses again");
+            require(registered(src.blob(l, e)) && src.device_alias(l, e) == alias[k], "the same addresses again");
             require(std::memcmp(src.blob(l, e), bytes[k].data(), (size_t) blob) == 0, "the bytes stay");
+            require_alias_maps(src.device_alias(l, e), bytes[k].data(), (size_t) blob, "the device alias after a repin");
         }
     }
     // a copy out of the registered copy into a slot and back
@@ -117,8 +142,15 @@ int run() {
             "copy back");
     require(back == bytes[0], "the slot holds the expert's bytes");
     // a sleep left in place at the end: closing frees an unregistered copy
-    require(src.unpin_complement(err), "unpin at the end: " + err);
+    if (host_alias) {
+        const bool unpinned = src.unpin_complement(err);
+        require(unpinned, "unpin at the end: " + err);
+    }
     src.close();
+    if (!host_alias) {
+        std::puts("file_expert_repin_test: skipped: this driver cannot sleep the resident copy, there is no repin to test");
+        return 77;
+    }
     return 0;
 }
 
