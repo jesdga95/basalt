@@ -1,0 +1,7 @@
+.git
+build
+*.basalt
+models
+.venv
+__pycache__
+*.pyc
