@@ -1,5 +1,6 @@
 #include "context.hpp"
 #include "run.hpp"
+#include "basalt/program/split_cuts.hpp"
 
 namespace basalt::program::generate {
 
@@ -62,10 +63,16 @@ int run(int argc, char** argv) {
         mm.peer_overhead = 5ull << 28;
         const basalt::program::MgPlan mp = basalt::program::plan_multi_gpu(chosen_cards, mm);
         basalt::log::info("basalt", "%s", mp.line.c_str());
-        if (mp.pick == basalt::program::Mechanism::LayerSplit && o.peer_device >= 1) {
-            o.layer_split = "auto";
+        // --layer-split-forced (or an explicit --layer-split): the price model picks the expert tier on this box,
+        // but the split keeps every expert where it is computed (pipeline parallel), which is what the prompt path
+        // needs.
+        if ((mp.pick == basalt::program::Mechanism::LayerSplit || o.split_forced) && o.peer_device >= 1) {
+            if (o.layer_split.empty()) o.layer_split = "auto";   // an explicit --layer-split cut stands
             o.peer_devices.clear();
             o.peer_device = -1;
+            if (o.split_forced && mp.pick != basalt::program::Mechanism::LayerSplit)
+                basalt::log::info("basalt", "layer split forced on (the price model picked %s)",
+                                  basalt::program::mechanism_name(mp.pick));
         }
     }
     // the peer card takes expert rows of a long prompt chunk only when it is as fast as the main one: a slower card costs the
@@ -111,16 +118,10 @@ int run(int argc, char** argv) {
         cudaGetLastError();
         auto ints = [](const std::string& str, auto& out) -> bool {
             using V = typename std::decay_t<decltype(out)>::value_type;
-            size_t a = 0;
-            while (a < str.size()) {
-                size_t b = str.find(',', a);
-                if (b == std::string::npos) b = str.size();
-                const std::string t = str.substr(a, b - a);
-                if (t.empty() || t.find_first_not_of("0123456789") != std::string::npos) return false;
-                out.push_back((V) std::atoll(t.c_str()));
-                a = b + 1;
-            }
-            return !out.empty();
+            std::vector<int64_t> v;
+            if (!parse_split_cuts(str, v)) return false;
+            for (const int64_t x : v) out.push_back((V) x);
+            return true;
         };
         split_auto = o.layer_split == "auto";
         bool ok = o.serve && (split_auto || ints(o.layer_split, split_at));
@@ -140,7 +141,7 @@ int run(int argc, char** argv) {
             split_auto = false;
         } else if (ok) {
             ok = (split_auto || split_at.size() == split_devs.size()) && split_devs.size() < (size_t) SplitDrive::kMax;
-            for (size_t i = 0; ok && i < split_at.size(); ++i) ok = split_at[i] >= 2 && (i == 0 || split_at[i] > split_at[i - 1]);
+            ok = ok && split_cuts_ordered(split_at);
             for (size_t i = 0; ok && !split_same && i < split_devs.size(); ++i) {
                 ok = split_devs[i] > 0 && split_devs[i] < n_dev;
                 for (size_t j = 0; ok && j < i; ++j) ok = split_devs[i] != split_devs[j];
