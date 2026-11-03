@@ -1,7 +1,6 @@
 // basalt/program/options.hpp - the `basalt generate` flag set, resolved into one struct.
 #pragma once
 
-#include <array>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -82,9 +81,6 @@ struct Options {
     /// Slots of VRAM-resident experts.  **0 = off, and off is the default.**  Switching the cache on moves work off the
     /// CPU pool (`src/kernels/cuda/s2_expert_grouped.cu`, wired via `expert_hit_run`).
     int expert_cache = 0;
-    std::array<int, 3> expert_cache_remote{}; ///< CUDA1..3 slots; CUDA0 keeps dense/state/MTP
-    std::array<bool, 3> expert_cache_remote_auto{};
-    bool remote_expert_opt = false; ///< optional optimization of the existing remote-expert decode path
     /// Multi-GPU: a second expert tier on CUDA device `peer_device` (-1 = off), `peer_reserve_mib` left free
     /// there, `peer_slots` caps its size (0 = as many as fit), `peer_adapt_swaps` per adaptive round
     /// (-1 = adapt_swaps).

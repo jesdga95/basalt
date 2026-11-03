@@ -59,9 +59,7 @@ int sources(Context& context) {
         basalt::log::info("basalt generate", "experts via mmap (--mmap-experts)");
         srcp = &src;
     } else {
-        const uint64_t pin_limit = 0;   // the whole arena is pinned
-        if (!arena_src.open(expert_files, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
-                            o.shared_expert_arena)) {
+        if (!arena_src.open(expert_files, g.n_layers, g.n_expert, /*threads=*/6, err, o.shared_expert_arena)) {
             return fatal_start_error(err);
         }
         if (!arena_src.ram_warning().empty())   // said before the load's numbers, which it explains

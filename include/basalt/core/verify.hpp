@@ -47,7 +47,6 @@ namespace basalt::kernels { struct DmMixLayer; }
 namespace basalt::core {
 
 class NativeHead;
-class RemoteExpertOpt;
 class PeerExperts;
 struct DecMoe;
 
@@ -114,7 +113,6 @@ public:
     ~Verifier();
     Verifier(const Verifier&) = delete;
     Verifier& operator=(const Verifier&) = delete;
-    void set_remote_expert_opt(RemoteExpertOpt* opt) { remote_opt_ = opt; } // before init/capture
     /// Before init: the window's main stream outranks other streams' kernels (a prompt read running beside the windows).
     void set_main_priority(bool high) { main_high_ = high; }
     /// The peer expert tier the window drives itself (persistent kernel, mapped rings) instead of the pool launching it
@@ -395,7 +393,6 @@ public:
 
 private:
     struct WindowRecorder;
-    RemoteExpertOpt* remote_opt_ = nullptr;
     bool main_high_ = false;
     PeerExperts* peer_ = nullptr;
     std::vector<PeerExperts*> xpeers_;
@@ -606,7 +603,6 @@ private:
     bool top_valid_ = false;                                    // the last window wrote them
     float* h_x_ = nullptr;       float* m_x_ = nullptr;         // doorbell payload: T * n_embd
     int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
-    float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
     uint32_t* h_seq_ = nullptr;  uint32_t* m_seq_ = nullptr;
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
@@ -663,7 +659,7 @@ private:
     uint8_t* xq_ = nullptr;                                   // T columns of q8_1
     uint8_t* sh_xq_ = nullptr;                                // T columns of q8_1 for shared expert branch
     float *qkv_L_ = nullptr, *h_L_ = nullptr, *gate_L_ = nullptr, *beta_L_ = nullptr;   // per GDN layer
-    float *z_ = nullptr, *y_ = nullptr, *y_dummy_ = nullptr;
+    float *z_ = nullptr, *y_ = nullptr;
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *idx_raw_L_ = nullptr;
     float *qidx_ = nullptr, *scores_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr, *attn_scratch_ = nullptr;
     float* tail_snap_ = nullptr;                              // per QSA layer
