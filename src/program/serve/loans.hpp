@@ -37,4 +37,13 @@ std::vector<int64_t> chunk_list(int64_t tokens, int64_t chunk, int64_t head);
 int64_t plan_lend(int64_t& chunk, const basalt::core::ExpertCache& xc, const basalt::core::ModelGeometry& g,
                   const basalt::core::SessionState& ss, bool prefill_auto, int64_t auto_ceiling, int auto_lend_pct);
 
+/// What a card keeps free beside prompt buffers of its own: the verify windows, the draft head and the GEMM
+/// workspaces made after the buffers are planned.
+inline constexpr uint64_t kOwnBuffersHeadroom = 3ull << 29;
+
+/// Whether a card with `free_bytes` free holds a chunk's prompt buffers of its own, `also` more (the elastic KV's
+/// growth) and the headroom, so it need not lend them its expert cache's slots.
+bool own_buffers_fit(uint64_t free_bytes, const basalt::core::ModelGeometry& g, const basalt::core::SessionState& ss,
+                     int64_t chunk, uint64_t also);
+
 }  // namespace basalt::program::serve

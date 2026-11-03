@@ -353,18 +353,17 @@ int Runtime::init_prompt() {
             // a split stage whose card still has room for the chunk's buffers (its cache already holds every
             // expert of its layers, so auto stopped short of its VRAM) keeps them as its own instead of borrowing
             // cache slots: nothing of it is lent, streamed during the prompt or refilled after it.  Room = the
-            // buffers + 1.5 GiB (the verify windows, the draft head, cuBLAS workspaces made after this).  Layer
-            // splits only - one GPU keeps its loan.
+            // buffers + the headroom for what is made after this.  Layer splits only - one GPU keeps its loan.
             if (pf_parts.size() > 1) {
                 for (PfPart& p : pf_parts) {
                     const basalt::core::OnDevice on(p.dev);
                     size_t fb = 0, tb = 0;
                     if (basalt::core::device_mem_info(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); continue; }
-                    const uint64_t need = basalt::prefill::Prefill::bytes_needed(g, *p.ses, chunk);
-                    if ((uint64_t) fb >= need + (3ull << 29)) {
+                    if (serve_loans::own_buffers_fit(fb, g, *p.ses, chunk, 0)) {
                         basalt::log::info("basalt serve", "  CUDA%d keeps its own prompt buffers (%.2f GiB of "
                                              "%.2f GiB free): no loan", p.dev < 0 ? 0 : p.dev,
-                                     (double) need / 1073741824.0, (double) fb / 1073741824.0);
+                                     (double) basalt::prefill::Prefill::bytes_needed(g, *p.ses, chunk) / 1073741824.0,
+                                     (double) fb / 1073741824.0);
                         p.first = -1;
                         p.first_now = -1;
                     }
