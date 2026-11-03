@@ -299,6 +299,9 @@ def make_handler(svc: Service):
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())
+            elif path == "/v1/cvec":
+                if self._authorized():
+                    self._json(200, {"cvec": int(svc.cvec_on)})
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
@@ -373,6 +376,14 @@ def make_handler(svc: Service):
                         self._json(200, svc.vram(r))
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                    return
+                if path == "/v1/cvec":                       # flip the projection control vector default
+                    if not self._own_page("the control vector default can be changed"):
+                        return
+                    on = req.get("cvec")
+                    if not isinstance(on, bool):
+                        raise ValueError("cvec: true or false")
+                    self._json(200, svc.cvec(on))
                     return
                 requested = req.get("model")
                 if not (isinstance(requested, str) and requested in svc.served_names()):
