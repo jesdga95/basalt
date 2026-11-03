@@ -639,6 +639,70 @@ def _decode_param(value: str, schema) -> object:
         return value
 
 
+def _deref(root: dict, schema):
+    """Follows local $ref links ("#/a/b") to the schema they name; None if one does not resolve."""
+    for _ in range(32):
+        ref = schema.get("$ref") if isinstance(schema, dict) else None
+        if not isinstance(ref, str):
+            return schema
+        if not ref.startswith("#/"):
+            return None
+        cur = root
+        for part in ref[2:].split("/"):
+            if isinstance(cur, dict):
+                cur = cur.get(part)
+            elif isinstance(cur, list) and part.isdigit() and int(part) < len(cur):
+                cur = cur[int(part)]
+            else:
+                return None
+        schema = cur
+    return schema
+
+
+def _union_variants(root: dict, schema, out: list, depth: int = 0) -> None:
+    """The object variants of a oneOf/anyOf union, nested unions flattened."""
+    schema = _deref(root, schema)
+    if not isinstance(schema, dict) or depth > 8:
+        return
+    unions = [schema[k] for k in ("oneOf", "anyOf") if isinstance(schema.get(k), list)]
+    for alts in unions:
+        for alt in alts:
+            _union_variants(root, alt, out, depth + 1)
+    if not unions and isinstance(schema.get("properties"), dict):
+        out.append(schema)
+
+
+def _tool_properties(tool: dict | None) -> dict:
+    """A tool's parameter schemas by name. Parameters sent as a union ({"properties": {}, "oneOf": [...]}) take the
+    properties of every variant, string enums united, as the tool-call grammar does."""
+    params = (tool or {}).get("parameters") or {}
+    props = params.get("properties") if isinstance(params, dict) else None
+    if props or not isinstance(params, dict):
+        return props or {}
+    variants = []
+    for k in ("oneOf", "anyOf"):
+        for alt in params.get(k) if isinstance(params.get(k), list) else []:
+            _union_variants(params, alt, variants)
+    merged = {}
+    for v in variants:
+        for name, prop in v["properties"].items():
+            value = _deref(params, prop)
+            value = value if value is not None else {}
+            cur = merged.get(name)
+            if cur is None:
+                merged[name] = value
+            elif cur == value:
+                continue
+            elif all(isinstance(s, dict) and isinstance(s.get("enum"), list)
+                     and all(isinstance(e, str) for e in s["enum"]) for s in (cur, value)):
+                merged[name] = dict(cur, enum=cur["enum"] + [e for e in value["enum"] if e not in cur["enum"]])
+            elif isinstance(cur, dict) and list(cur) == ["anyOf"]:
+                merged[name] = {"anyOf": cur["anyOf"] + ([value] if value not in cur["anyOf"] else [])}
+            else:
+                merged[name] = {"anyOf": [cur, value]}
+    return merged
+
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """`<function=NAME>...</function>` -> ToolCall. Values are JSON-decoded when the schema says non-string
     (without a schema: when they parse as JSON objects, arrays, numbers or booleans)."""
@@ -647,7 +711,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
         raise ValueError("malformed tool call: " + body[:80])
     name = body[len("<function="):body.index(">")]
     rest = body[body.index(">") + 1:]
-    props = ((schema or {}).get("parameters") or {}).get("properties") or {}
+    props = _tool_properties(schema)
     args = {}
     while "<parameter=" in rest:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
@@ -728,8 +792,7 @@ class OutputParser:
                     return out
                 name = rest[a + 10:b]
                 self.scall = ToolCall(name=name, arguments={})
-                props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
-                self.sdeclared = props
+                self.sdeclared = _tool_properties(self.schemas.get(name))
                 out.append(Event("tool_start", call=self.scall))
                 args("{")
                 self.sp += b + 1

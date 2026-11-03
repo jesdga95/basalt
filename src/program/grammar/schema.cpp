@@ -3,6 +3,7 @@
 #include "basalt/program/grammar/schema.hpp"
 
 #include <algorithm>
+#include <map>
 #include <set>
 #include <stdexcept>
 
@@ -146,6 +147,107 @@ std::string add_free_text(SchemaConverter& c, const std::string& tag) {
     return "free-text-0";
 }
 
+// The object variants of a oneOf/anyOf union, nested unions flattened.
+void collect_variants(const JsonValue* root, const JsonValue* s, std::vector<const JsonValue*>& out, int depth) {
+    s = deref(root, s);
+    if (!s || !s->is(Type::Object) || depth > 8) return;
+    bool is_union = false;
+    for (const char* k : {"oneOf", "anyOf"}) {
+        if (const JsonValue* u = s->get(k); u && u->is(Type::Array)) {
+            is_union = true;
+            for (const JsonValue& alt : u->items) collect_variants(root, &alt, out, depth + 1);
+        }
+    }
+    const JsonValue* p = s->get("properties");
+    if (!is_union && p && p->is(Type::Object)) out.push_back(s);
+}
+
+bool string_enum(const JsonValue& s) {
+    const JsonValue* e = s.is(Type::Object) ? s.get("enum") : nullptr;
+    return e && e->is(Type::Array) &&
+           std::all_of(e->items.begin(), e->items.end(), [](const JsonValue& v) { return v.is(Type::String); });
+}
+
+JsonValue json_string(const std::string& text) {
+    JsonValue v;
+    v.type = Type::String;
+    v.s = text;
+    return v;
+}
+
+// Two schemas for one property name in different variants: string enums are united, anything else becomes an anyOf.
+JsonValue merge_property(const JsonValue& cur, const JsonValue& add) {
+    if (cur.dump() == add.dump()) return cur;
+    if (string_enum(cur) && string_enum(add)) {
+        JsonValue merged = cur;
+        JsonValue en = *cur.get("enum");
+        for (const JsonValue& e : add.get("enum")->items) {
+            auto same = [&](const JsonValue& x) { return x.s == e.s; };
+            if (std::none_of(en.items.begin(), en.items.end(), same)) en.items.push_back(e);
+        }
+        merged.set("enum", en);
+        return merged;
+    }
+    JsonValue alts;
+    alts.type = Type::Array;
+    const JsonValue* any = cur.get("anyOf");
+    if (any && any->is(Type::Array) && cur.members.size() == 1) alts = *any;
+    else alts.items.push_back(cur);
+    auto same = [&](const JsonValue& x) { return x.dump() == add.dump(); };
+    if (std::none_of(alts.items.begin(), alts.items.end(), same)) alts.items.push_back(add);
+    JsonValue merged;
+    merged.type = Type::Object;
+    merged.set("anyOf", alts);
+    return merged;
+}
+
+// Parameters sent as a union of objects ({"properties": {}, "oneOf": [...]}, as zod-generated tools do) become one
+// object: every property of every variant, and required only what every variant requires (the client still checks
+// the variant). False when the parameters are not such a union.
+bool flatten_union(const JsonValue* params, JsonValue& out) {
+    if (!params || !params->is(Type::Object)) return false;
+    if (const JsonValue* p = params->get("properties"); p && p->is(Type::Object) && !p->members.empty()) return false;
+    std::vector<const JsonValue*> variants;
+    for (const char* k : {"oneOf", "anyOf"}) {
+        if (const JsonValue* u = params->get(k); u && u->is(Type::Array))
+            for (const JsonValue& alt : u->items) collect_variants(params, &alt, variants, 0);
+    }
+    if (variants.empty()) return false;
+
+    JsonValue props;
+    props.type = Type::Object;
+    std::map<std::string, size_t> required_by;   // property -> number of variants that require it
+    for (const JsonValue* v : variants) {
+        for (const auto& m : v->get("properties")->members) {
+            const JsonValue* r = deref(params, &m.second);
+            JsonValue value;
+            if (r) value = *r;
+            else value.type = Type::Object;
+            const JsonValue* cur = props.get(m.first);
+            props.set(m.first, cur ? merge_property(*cur, value) : value);
+        }
+        if (const JsonValue* req = v->get("required"); req && req->is(Type::Array)) {
+            for (const JsonValue& n : req->items)
+                if (n.is(Type::String)) ++required_by[n.s];
+        }
+    }
+
+    JsonValue required;
+    required.type = Type::Array;
+    for (const auto& m : props.members) {
+        auto it = required_by.find(m.first);
+        if (it != required_by.end() && it->second == variants.size()) required.items.push_back(json_string(m.first));
+    }
+    out = JsonValue();
+    out.type = Type::Object;
+    out.set("type", json_string("object"));
+    out.set("properties", props);
+    out.set("required", required);
+    for (const char* k : {"$defs", "definitions"})
+        if (const JsonValue* d = params->get(k)) out.set(k, *d);
+    return true;
+}
+
 }  // namespace
 
 std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptions& opt, std::string& err) {
@@ -168,6 +270,8 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
         }
         const JsonValue* params = tool->get("parameters");
         if (!params) params = tool->get("input_schema");
+        JsonValue flat;
+        if (flatten_union(params, flat)) params = &flat;
         const JsonValue* props = params && params->is(Type::Object) ? params->get("properties") : nullptr;
         std::set<std::string> required;
         if (const JsonValue* r = params && params->is(Type::Object) ? params->get("required") : nullptr) {
