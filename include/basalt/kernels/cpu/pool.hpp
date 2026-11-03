@@ -128,7 +128,7 @@ public:
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
 
-    /// Total `_mm_pause` iterations spent waiting are not counted - see the note on the
+    /// Total spin-hint iterations spent waiting are not counted - see the note on the
     /// atomics below.  Counting needs a LOCKED read-modify-write in the park loop, which would add to the
     /// contention being measured.
     long long pauses() const { return 0; }
