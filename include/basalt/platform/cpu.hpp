@@ -38,4 +38,8 @@ struct CpuInfo {
 };
 CpuInfo cpu_info();
 
+/// Whether this CPU, as the OS reports it, runs the Armv8.2 dot product instructions (SDOT and UDOT) the Arm64 CPU
+/// kernels are built on. False on x86-64.
+bool cpu_has_arm_dotprod();
+
 }  // namespace basalt::platform
