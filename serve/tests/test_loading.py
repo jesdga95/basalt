@@ -16,6 +16,7 @@ from serve.engine.mock import MockEngine
 from serve.engine.process import ProcessEngine
 from serve.frontend import ChatTemplate
 from serve.handler import serve
+from serve.server import open_when_ready
 from serve.service import Service
 from serve.util.text import ByteTokenizer
 
@@ -132,6 +133,36 @@ class Loading(unittest.TestCase):
         self.assertTrue(t.is_alive())                    # held, not answered
         self.finish(t, out)
         self.assertTrue(ready.wait(5))
+
+    def test_open_waits_for_the_load_and_fires_once(self):
+        opened, ready = [], threading.Event()
+        self.svc.on_loaded = ready.set
+        open_when_ready(self.svc, "http://x/", opener=opened.append)
+        self.svc.start_load()
+        self.assertTrue(self.engine.entered.wait(5))
+        self.assertEqual(opened, [])                     # still loading
+        self.engine.go.set()
+        self.assertTrue(ready.wait(5))
+        self.svc.on_loaded()                             # a later load or wake does not open it again
+        self.assertEqual(opened, ["http://x/"])
+
+    def test_open_does_not_fire_when_the_load_fails(self):
+        opened = []
+        open_when_ready(self.svc, "http://x/", opener=opened.append)
+        self.engine.fail = "no model"
+        self.svc.start_load()
+        self.assertTrue(self.engine.entered.wait(5))
+        self.engine.go.set()
+        deadline = time.time() + 5
+        while self.svc.boot_error is None and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertIsNotNone(self.svc.boot_error)
+        self.assertEqual(opened, [])
+
+    def test_open_is_immediate_without_a_start_up_load(self):
+        opened = []
+        open_when_ready(self.svc, "http://x/", now=True, opener=opened.append)
+        self.assertEqual(opened, ["http://x/"])
 
     def test_start_up_load_streams_after_the_wait(self):
         self.svc.start_load()

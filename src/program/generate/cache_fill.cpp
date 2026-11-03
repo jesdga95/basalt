@@ -280,8 +280,7 @@ int cache_fill(Context& context) {
         }
         std::array<std::vector<std::pair<int32_t, int32_t>>, 3> by_device;
         if (multi_remote) {
-            // Either stripe experts for parallel GPU work, or give each layer one
-            // secondary GPU to reduce switches and transfers over shared USB4.
+            // Stripe experts across the cards for parallel GPU work.
             std::vector<uint8_t> assigned((size_t) g.n_layers * (size_t) g.n_expert, 0);
             const int devices = 1 + (o.expert_cache_remote[1] > 0) + (o.expert_cache_remote[2] > 0);
             int next = 0;
@@ -291,27 +290,19 @@ int cache_fill(Context& context) {
                 const size_t index = (size_t) pair.first * (size_t) g.n_expert + (size_t) pair.second;
                 if (assigned[index]) continue;
                 int target = -1;
-                if (o.expert_cache_remote_placement == "layer") {
-                    target = pair.first % devices;
-                    // Other layers' owners may still have room: keep scanning ranks.
-                    if (by_device[(size_t) target].size() >=
-                        (size_t) o.expert_cache_remote[(size_t) target]) continue;
-                } else {
-                    for (int i = 0; i < devices; ++i) {
-                        const int r = (next + i) % devices;
-                        if (by_device[(size_t) r].size() < (size_t) o.expert_cache_remote[(size_t) r]) {
-                            target = r;
-                            break;
-                        }
+                for (int i = 0; i < devices; ++i) {
+                    const int r = (next + i) % devices;
+                    if (by_device[(size_t) r].size() < (size_t) o.expert_cache_remote[(size_t) r]) {
+                        target = r;
+                        break;
                     }
-                    if (target < 0) break;
                 }
+                if (target < 0) break;
                 assigned[index] = 1;
                 by_device[(size_t) target].push_back(pair);
                 next = (target + 1) % devices;
             }
-            basalt::log::info("basalt generate", "remote ranks %s across %d CUDA devices",
-                         o.expert_cache_remote_placement == "layer" ? "grouped by layer" : "striped", devices);
+            basalt::log::info("basalt generate", "remote ranks striped across %d CUDA devices", devices);
         } else {
             by_device[0] = std::move(ranked);
         }

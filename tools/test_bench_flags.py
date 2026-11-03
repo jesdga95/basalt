@@ -108,6 +108,14 @@ class BenchFlags(unittest.TestCase):
                 self.assertEqual(r.returncode, 2)
                 self.assertIn("incomparable", r.stderr)
 
+    def test_community_refuses_a_submitter_the_table_checker_rejects(self):
+        for name in ("two words", "x" * 41, "tab\tname"):
+            with self.subTest(name=name):
+                r = subprocess.run([str(BENCH), "--model", "m.basalt", "--community", "--submitter", name],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2)
+                self.assertIn("--submitter", r.stderr)
+
     def test_community_uses_every_visible_card_and_refuses_gpu(self):
         cmd = self.command_community()
         plan = subprocess.run([str(ENGINE), "--gpu-plan", "--gpu", "auto"], capture_output=True, text=True)

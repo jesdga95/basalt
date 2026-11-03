@@ -419,6 +419,12 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
             err = "--community needs --submitter NAME, the name shown in the table";
             return false;
         }
+        if (o.submitter.size() > 40) { err = "--submitter must be at most 40 characters"; return false; }
+        for (unsigned char c : o.submitter)
+            if (c < 0x20 || c == 0x7f || std::isspace(c)) {
+                err = "--submitter must be one name with no spaces or control characters";
+                return false;
+            }
     }
     if (!o.community_file.empty() && !o.community) { err = "--community-file needs --community"; return false; }
     if (o.reps < 1) { err = "-r needs N >= 1"; return false; }

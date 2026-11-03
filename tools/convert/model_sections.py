@@ -3,7 +3,6 @@
   dense / dense.index       float tensors in the form the engine reads, and the table of every non-expert tensor
   experts / experts.layout  per layer, n_expert blobs of [gate | up | down] rows, and where each layer starts
   mtp/dense, mtp/dense.index, mtp/experts  the draft layer from the BF16 `mtp.*` tensors (tools/convert/mtp_fetch.py)
-  profile                   the expert ranking from routing traces or an existing profile
 
 Sections are produced as byte-chunk iterators for ModelWriter.add_chunks. Needs numpy.
 """
