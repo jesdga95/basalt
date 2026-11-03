@@ -23,14 +23,14 @@ git clone https://github.com/jesdga95/basalt && cd basalt
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j                  # bin/basalt, bin/basalt-bench, bin/basalt-probe, bin/basalt-vision
 pip install -r requirements.txt
-hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-NVFP4.basalt --local-dir models
+hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-NVFP4-DQ6_K.basalt --local-dir models
 ```
 
 Put your settings in `basalt_config.json`, with `model` pointing at the downloaded file:
 
 ```json
 {
-  "server": { "model": "models/Qwen3.8-FN-NVFP4.basalt", "gpu": "0,1", "port": 8080 },
+  "server": { "model": "models/Qwen3.8-FN-NVFP4-DQ6_K.basalt", "gpu": "0,1", "port": 8080 },
   "engine": { "expert-cache": "auto", "prefill": "auto", "kv": "int8", "resident-experts": true }
 }
 ```
@@ -47,7 +47,9 @@ The server listens on 127.0.0.1 by default.
 
 Ready-to-run packs, with the quality of each measured against Q8_0, are on
 [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt):
-`Qwen3.8-FN-NVFP4`, `-UD-Q4_K_XL`, `-UD-Q5_K_XL`, `-UD-Q6_K_XL`, `-Q8_0`, `-GSQ-RCO-IQ3_S`, `-GSQ-RCO-IQ3_XXS` and `-GSQ-RCO-Q2_0` (each `.basalt`).
+`Qwen3.8-FN-NVFP4-DQ6_K`, `-NVFP4-DQ8`, `-UD-Q4_K_XL`, `-UD-Q5_K_XL`, `-UD-Q6_K_XL`, `-Q8_0`, `-GSQ-RCO-IQ3_S`, `-GSQ-RCO-IQ3_XXS` and `-GSQ-RCO-Q2_0` (each `.basalt`).
+The two NVFP4 packs share NVIDIA's NVFP4 experts; `D` names the dense projections' format: DQ6_K is the default and
+faster, DQ8 is about 7% slower on prose with a lower KLD ([precision](docs/precision/isolated-costs.md)).
 A model is one file: weights, tokenizer, MTP drafter, 8-bit hyper-connection copies and vision projector. The expert
 profile ships with the engine ([data/profiles](data/profiles)).
 

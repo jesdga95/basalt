@@ -250,6 +250,13 @@ std::filesystem::path fs_path(const std::string& utf8) { return std::filesystem:
 std::string fs_name(const std::filesystem::path& p) { return to_utf8(p.filename().wstring().c_str()); }
 }  // namespace
 
+bool make_dirs(const std::string& path) {
+    // the new directories take the parent's inherited access list
+    std::error_code ec;
+    std::filesystem::create_directories(fs_path(path), ec);
+    return std::filesystem::is_directory(fs_path(path), ec);
+}
+
 #else
 // ----------------------------------------------------------------------------------------------- POSIX
 
@@ -332,12 +339,12 @@ int open_unbuffered(const std::string& path) {
 }
 
 int open_write_utf8(const std::string& path) {
-    return ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    return ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
 }
 
 int open_write_unbuffered(const std::string& path) {
     // A file system that refuses the flag answers -1, and the caller writes through the cache.
-    return ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_DIRECT, 0644);
+    return ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_DIRECT, 0600);
 }
 
 bool pwrite_all(int fd, const void* src, uint64_t n, uint64_t off) {
@@ -364,13 +371,19 @@ std::filesystem::path fs_path(const std::string& utf8) { return std::filesystem:
 std::string fs_name(const std::filesystem::path& p) { return p.filename().string(); }
 }  // namespace
 
-#endif
-
 bool make_dirs(const std::string& path) {
+    // each missing directory is made owner-only; existing ones keep their mode
     std::error_code ec;
-    std::filesystem::create_directories(fs_path(path), ec);
+    std::filesystem::path cur;
+    for (const auto& part : fs_path(path)) {
+        cur /= part;
+        if (std::filesystem::is_directory(cur, ec)) continue;
+        if (::mkdir(cur.c_str(), 0700) != 0 && errno != EEXIST) return false;
+    }
     return std::filesystem::is_directory(fs_path(path), ec);
 }
+
+#endif
 
 bool list_files(const std::string& dir, std::vector<DirFile>& out) {
     out.clear();

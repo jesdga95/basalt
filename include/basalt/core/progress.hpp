@@ -39,6 +39,9 @@ inline std::atomic<DiagFn>& release_gpu_fn() { static std::atomic<DiagFn> f{null
 inline void release_gpu_waits(std::FILE* f) {
     if (auto fn = release_gpu_fn().load()) fn(f);
 }
+/// Set when a release's GPU did not finish: the CUDA teardown of an ending engine would wait for that work forever,
+/// so an engine ending on an error leaves without it.
+inline std::atomic<bool>& gpu_left_running() { static std::atomic<bool> f{false}; return f; }
 
 inline Progress& progress() {
     static Progress p;

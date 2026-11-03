@@ -9,6 +9,7 @@
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/kernels/dec_moe.hpp"
+#include "basalt/kernels/wait_abort.hpp"
 #include "basalt/log.hpp"
 #include <atomic>
 #include <chrono>
@@ -63,6 +64,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
         *(volatile uint32_t*) (h_flag_ + 8) = UINT32_MAX;
         *(volatile uint32_t*) (h_flag_ + 12) = UINT32_MAX;   // the hand-off a later stage's graph waits for
     }
+    basalt::kernels::wait_abort_release();   // the bounded device waits (mid chain, commit finisher) fall through
     if (dm_ != nullptr) {   // the peer window stops at its next ring; CUDA0's waits on it pass
         *(volatile uint32_t*) (dm_->h_w + 0) = UINT32_MAX;
         *(volatile uint32_t*) (dm_->h_w + 16) = UINT32_MAX;
@@ -83,6 +85,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
         if (s == nullptr) continue;
         while (cudaStreamQuery(s) == cudaErrorNotReady) {
             if (ms_since(t0) > timeout_ms) {
+                gpu_left_running().store(true);
                 return false;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
