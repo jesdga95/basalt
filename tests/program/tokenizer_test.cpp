@@ -66,6 +66,15 @@ void synthetic() {
     CHECK(t.encode("abc", false, {}, ids, err));
     // lowest rank first: b+c (0) beats a+b (1), so a, bc
     CHECK((ids == std::vector<int32_t>{'a', 258}));
+    // the winning merge is the last pair of a 2-byte and of a 3-byte piece
+    CHECK(t.encode("ab", false, {}, ids, err));
+    CHECK((ids == std::vector<int32_t>{256}));
+    CHECK(t.encode("bc", false, {}, ids, err));
+    CHECK((ids == std::vector<int32_t>{258}));
+    CHECK(t.encode("aab", false, {}, ids, err));
+    CHECK((ids == std::vector<int32_t>{'a', 256}));
+    CHECK(t.encode("xbc", false, {}, ids, err));
+    CHECK((ids == std::vector<int32_t>{'x', 258}));
     CHECK(t.encode("aaa", false, {}, ids, err));
     CHECK((ids == std::vector<int32_t>{260}));
     CHECK(t.encode("aaaa", false, {}, ids, err));
