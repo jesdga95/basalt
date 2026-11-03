@@ -2,8 +2,6 @@
 
 The precision tables are in [index.md](index.md).
 
-## How quality is measured
-
 `basalt-bench --quality` (`tools/ppl_gate.py`) scores wikitext-2 (`wiki.test.raw`) in 512-token chunks. The first half
 of each chunk is prefilled and the second half (rows 256 to 510) is scored through the decode path, against a llama.cpp
 base file written by `llama-perplexity --kl-divergence-base`, read in llama.cpp's own `.kld` format. The base is the
@@ -14,7 +12,7 @@ fp32 log-softmax of the head logits; the base is decoded as scale*u16+min, and t
 skipped (a tiny underestimate). The prompt half is checked equal to the base tokens, the window tokens are the base
 tokens, and KLD is flat across positions, so the two are aligned.
 
-### The BF16 reference
+## The BF16 reference
 
 The base is unsloth's BF16 GGUF of Qwen3.8-Flash-Next through `llama-perplexity` (commit 436f6f89e), 100 chunks of 512,
 `-b 8192 -ub 8192`, dense layers on the GPU and the experts read from disk: PPL 3.2749 (3.2733 on the scored rows),
