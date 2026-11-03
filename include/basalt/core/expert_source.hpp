@@ -530,7 +530,7 @@ public:
     void homes_abort();
     bool home_release(int64_t layer, int64_t expert);
     uint64_t homes_reclaim();
-    /// Moves the experts still in homes into fresh regions and frees the old ones (bytes freed; 0 when it would
+    /// Moves the experts still in homes into fresh regions and frees the old ones (net bytes freed; 0 when it would
     /// free less than a region or the RAM cannot take the copy).  Only with no exchange in flight.
     uint64_t homes_compact();
     uint64_t homes_bytes() const;
