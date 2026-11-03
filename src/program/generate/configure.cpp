@@ -29,18 +29,24 @@ int run(int argc, char** argv) {
         // the source tensors (embedding, PLE table, native projections, head) are served through the GGUF view of the file
         o.native_shards = {o.model};
         if (!srcs.mtp_dense.empty() && !srcs.mtp_dense_index.empty() && !srcs.mtp_experts.empty()) o.mtp = o.model;
-        // the engine's expert profile for this model, when it has one
-        const std::string key = cli::profile_key(model_file.meta());
-        const std::string prof = std::string(BASALT_SOURCE_DIR) + "/data/profiles/" + key + ".prof";
+        // the expert profile: the one --expert-profile names, else the engine's for this model when it has one
         uint64_t prof_bytes = 0;
-        if (!key.empty() && basalt::platform::file_size(prof, prof_bytes) && prof_bytes > 0) o.expert_profile = prof;
-        else {
-            basalt::log::info("basalt generate", "no expert profile for %s", key.empty() ? "this model" : key.c_str());
-            if (o.resident_cpu_experts) {
-                basalt::log::error("basalt generate", "expert profile not found: %s; ship data/profiles with the engine "
-                                   "(or pass --mmap-experts without --resident-experts)",
-                                   key.empty() ? "the model names no architecture or layer and expert counts" : prof.c_str());
-                return 2;
+        if (!o.expert_profile.empty()) {
+            if (!basalt::platform::file_size(o.expert_profile, prof_bytes) || prof_bytes == 0) {
+                return fatal_start_error("--expert-profile " + o.expert_profile + ": no such file, or it is empty");
+            }
+        } else {
+            const std::string key = cli::profile_key(model_file.meta());
+            const std::string prof = std::string(BASALT_SOURCE_DIR) + "/data/profiles/" + key + ".prof";
+            if (!key.empty() && basalt::platform::file_size(prof, prof_bytes) && prof_bytes > 0) o.expert_profile = prof;
+            else {
+                basalt::log::info("basalt generate", "no expert profile for %s", key.empty() ? "this model" : key.c_str());
+                if (o.resident_cpu_experts) {
+                    basalt::log::error("basalt generate", "expert profile not found: %s; ship data/profiles with the engine "
+                                       "(or pass --mmap-experts without --resident-experts)",
+                                       key.empty() ? "the model names no architecture or layer and expert counts" : prof.c_str());
+                    return 2;
+                }
             }
         }
         // the 8-bit hyper-connection copies
