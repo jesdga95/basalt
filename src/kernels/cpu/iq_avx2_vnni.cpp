@@ -6,6 +6,7 @@
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
 #include "basalt/ggml/ggml_common.h"
+#include "basalt/log.hpp"
 #include "basalt/platform/compiler.hpp"
 
 #include <immintrin.h>
