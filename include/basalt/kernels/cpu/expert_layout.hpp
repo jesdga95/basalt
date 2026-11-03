@@ -48,11 +48,18 @@ bool cpu_avxvnni_int8_ok();
 bool cpu_avx1_ok();
 /// SSE4.2 + POPCNT.
 bool cpu_sse42_ok();
-/// The cap on the probes above (3 = no cap, 2 = AVX2, 1 = AVX, 0 = SSE4.2); always 3.
+/// Whether this CPU runs the Arm64 kernels: NEON with the Armv8.2 dot product. False on x86-64.
+bool cpu_neon_dot_ok();
+/// Whether this CPU runs the floor every CPU expert kernel of this build needs (cpu_avx2_ok on x86-64,
+/// cpu_neon_dot_ok on Arm64), and that floor's name for a refusal.
+bool cpu_kernels_ok();
+const char* cpu_kernels_floor();
+/// The cap on the x86 probes above (3 = no cap, 2 = AVX2, 1 = AVX, 0 = SSE4.2); always 3.
 int cpu_isa_cap();
-/// Whether a layer of this ggml type runs on the engine's own Q2_0 kernels (AVX2 / AVX-512).
-inline bool q2_native_kernels(int type) { return type == 42 && cpu_avx2_ok(); }
-/// The CPU's brand string (CPUID 0x80000002..4), for messages; "unknown" when it has none.
+/// Whether a layer of this ggml type runs on the engine's own Q2_0 kernels (AVX2 / AVX-512, or NEON).
+inline bool q2_native_kernels(int type) { return type == 42 && cpu_kernels_ok(); }
+/// The CPU's brand string (CPUID 0x80000002..4), for messages; where CPUID has none (any Arm CPU), the name the OS
+/// gives; "unknown" when neither does.
 std::string cpu_name();
 /// Q2_0 GGUF rows / activation quantizer on the kernels this CPU has.
 void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,

@@ -6,6 +6,7 @@
 #include <cstring>
 #include <string>
 #include "basalt/platform/compiler.hpp"
+#include "basalt/platform/cpu.hpp"
 #include <sstream>
 
 namespace basalt::kernels::cpu {
@@ -125,12 +126,26 @@ bool cpu_sse42_ok() {
     return ok;
 }
 
+bool cpu_neon_dot_ok() {
+    static const bool ok = !platform::kX86 && platform::cpu_has_arm_dotprod();
+    return ok;
+}
+
+bool cpu_kernels_ok() { return platform::kX86 ? cpu_avx2_ok() : cpu_neon_dot_ok(); }
+
+const char* cpu_kernels_floor() {
+    return platform::kX86 ? "AVX2 with FMA and F16C" : "NEON with the Armv8.2 dot product";
+}
+
 std::string cpu_name() {
     unsigned r[12] = {};
     {
         unsigned x[4];
         platform::cpuid(0x80000000u, 0, x);
-        if (x[0] < 0x80000004u) return "unknown";
+        if (x[0] < 0x80000004u) {
+            const std::string os_name = platform::cpu_info().name;
+            return os_name.empty() ? std::string("unknown") : os_name;
+        }
     }
     for (unsigned i = 0; i < 3; ++i) {
         unsigned x[4];
@@ -146,13 +161,21 @@ std::string cpu_name() {
 
 void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
                  int r0, int r1) {
-    if (cpu_avx512_ok()) q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);
-    else q2_0_gguf_rows_multi_avx2(w, row_bytes, nblocks, a, nt, out, r0, r1);
+    if constexpr (platform::kX86) {
+        if (cpu_avx512_ok()) q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);
+        else q2_0_gguf_rows_multi_avx2(w, row_bytes, nblocks, a, nt, out, r0, r1);
+    } else {
+        q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);
+    }
 }
 
 void act_quant_any(const float* x, int n, ActQ& a) {
-    if (cpu_avx512_ok()) act_quant_q8_1(x, n, a);
-    else act_quant_q8_1_avx2(x, n, a);
+    if constexpr (platform::kX86) {
+        if (cpu_avx512_ok()) act_quant_q8_1(x, n, a);
+        else act_quant_q8_1_avx2(x, n, a);
+    } else {
+        act_quant_q8_1(x, n, a);
+    }
 }
 
 

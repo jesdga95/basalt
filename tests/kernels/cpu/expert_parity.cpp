@@ -17,6 +17,7 @@
 // finite, non-zero scales, and the blob at a DIFFERENT layer must be different data - which is what a wrong
 // stride would break.
 #include "basalt/kernels/cpu/expert.hpp"
+#include "basalt/platform/compiler.hpp"
 #include "basalt/platform/file.hpp"
 
 #include <cmath>
@@ -106,11 +107,13 @@ int main(int argc, char** argv) {
     int bad = 0;
 
     // ---- the CPU must be able to run the kernel, and the report must say WHICH feature is missing
+    // (the kernel this build runs: AVX-512 VNNI on x86-64, NEON with the dot product on Arm64)
+    const char* const isa = basalt::platform::kX86 ? "AVX512 F/BW/VL/VNNI/VBMI" : "NEON with the dot product";
+    const std::string kernel = basalt::platform::kX86 ? "VNNI" : "NEON";
     const cpu::CpuFeatures feat = cpu::cpu_features();
-    std::printf("  %-44s %s\n", "AVX512 F/BW/VL/VNNI/VBMI",
-                feat.usable() ? "all present" : feat.reason());
+    std::printf("  %-44s %s\n", isa, feat.usable() ? "all present" : feat.reason());
     if (!feat.usable()) {
-        std::printf("      the VNNI path cannot run here; only the scalar oracle can be exercised.\n");
+        std::printf("      the %s path cannot run here; only the scalar oracle can be exercised.\n", kernel.c_str());
         std::printf("      the kernel check is SKIPPED, not passed.\n");
         std::printf("\nexpert_parity: 0 failures, 1 SKIPPED\n");
         return 0;
@@ -180,13 +183,13 @@ int main(int argc, char** argv) {
     }
 
     // ---- 1. the kernel, against an oracle fed the SAME activations
-    std::printf("  %-44s rel %.3e   (tolerance <= 3e-3, mean |ref| %.4f)\n", "VNNI vs scalar (INT8 acts)",
+    std::printf("  %-44s rel %.3e   (tolerance <= 3e-3, mean |ref| %.4f)\n", (kernel + " vs scalar (INT8 acts)").c_str(),
                 rel_kernel, mag);
     if (!(rel_kernel <= 3e-3)) { std::printf("    *** over the 3e-3 tolerance ***\n"); ++bad; }
 
     // ---- 2. the activation contract's own cost, reported rather than asserted
     std::printf("  %-44s rel %.3e   (the cost of the contract, REPORTED)\n",
-                "VNNI vs scalar (FP32 acts)", rel_contract);
+                (kernel + " vs scalar (FP32 acts)").c_str(), rel_contract);
 
     std::printf("\nexpert_parity: %d failures (layer %lld expert %lld of %s)\n", bad, layer, expert,
                 path ? path : "the synthetic fixture");
