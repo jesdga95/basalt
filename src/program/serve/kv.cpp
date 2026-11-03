@@ -136,6 +136,95 @@ bool Runtime::cache_regrow(std::string& e) {
     return true;
 }
 
+// The experts the KV just took CUDA0's slots from take the peer's slots of less-routed experts (by the routing counts,
+// then the profile's rank), so the next most-routed experts stay on a GPU while the KV holds CUDA0's tail.  Between
+// windows: the copies come from the RAM copy and land before it returns.
+bool Runtime::peer_take(const std::vector<int32_t>& off, std::string& e) {
+    if (off.empty() || !peer.valid() || peer.exclusive() || peer.asleep() || !xpeers.empty()) return true;
+    const auto t0 = Clock::now();
+    auto used = [&](int32_t i) { return drive.d.usage.empty() ? 0.0f : drive.d.usage[(size_t) i]; };
+    auto rank = [&](int32_t i) { return prof_rank.empty() ? 0 : prof_rank[(size_t) i]; };
+    auto better = [&](int32_t a, int32_t b) {
+        const float ua = used(a), ub = used(b);
+        return ua != ub ? ua > ub : rank(a) < rank(b);
+    };
+    peer.apply_pending(true);
+    const std::vector<int32_t>& pres = peer.residency();
+    // one pool when every layer's blobs are one size (a slot takes any layer's expert), else one per layer
+    const int64_t pools = xq_across ? 1 : g.n_layers;
+    auto pool_of = [&](size_t i) { return xq_across ? (size_t) 0 : i / (size_t) g.n_expert; };
+    std::vector<std::vector<int32_t>> in((size_t) pools), on((size_t) pools);
+    for (const int32_t i : off)
+        if (pres[(size_t) i] < 0) in[pool_of((size_t) i)].push_back(i);
+    for (size_t i = 0; i < pres.size(); ++i)
+        if (pres[i] >= 0 && !in[pool_of(i)].empty()) on[pool_of(i)].push_back((int32_t) i);
+    std::vector<std::array<int32_t, 3>> due;   // (peer slot, its expert, the expert it takes)
+    for (int64_t p = 0; p < pools; ++p) {
+        std::vector<int32_t>& a = in[(size_t) p];
+        std::vector<int32_t>& b = on[(size_t) p];
+        const size_t n = std::min(a.size(), b.size());
+        if (n == 0) continue;
+        std::sort(a.begin(), a.end(), [&](int32_t x, int32_t y) { return better(x, y) || (!better(y, x) && x < y); });
+        std::partial_sort(b.begin(), b.begin() + (ptrdiff_t) n, b.end(),
+                          [&](int32_t x, int32_t y) { return better(y, x) || (!better(x, y) && x > y); });
+        for (size_t k = 0; k < n && better(a[k], b[k]); ++k) due.push_back({pres[(size_t) b[k]], b[k], a[k]});
+    }
+    if (due.empty()) return true;
+    if (peer_defer) {   // the prompt read that follows lends the peer's coldest slots and refills them: no copy here
+        peer_due.insert(peer_due.end(), due.begin(), due.end());
+        peer_due_off += (int64_t) off.size();
+        return true;
+    }
+    std::vector<std::pair<int32_t, int32_t>> want;
+    for (const auto& d : due) want.emplace_back(d[0], d[2]);
+    int64_t moved = 0;
+    if (!peer.place(want, moved, e)) { e = "elastic KV: " + e; return false; }
+    basalt::log::info("basalt serve", "elastic KV: the peer took %lld of the %zu experts the KV moved off CUDA0 (%.1f ms)",
+                      (long long) moved, off.size(), std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+    return true;
+}
+
+// The prompt split lent the peer's slots `lent` (expert, slot): a due handoff into one of them gives the slot its new
+// expert, so the loan's refill copies that one instead of the old
+void Runtime::peer_due_lent(std::vector<std::pair<int32_t, int32_t>>& lent) {
+    if (peer_due.empty()) return;
+    std::vector<int32_t> at((size_t) peer.cache().slots(), -1);   // slot -> its entry in `lent`
+    for (size_t j = 0; j < lent.size(); ++j)
+        if (lent[j].second >= 0 && lent[j].second < (int32_t) at.size()) at[(size_t) lent[j].second] = (int32_t) j;
+    size_t kept = 0;
+    for (const auto& d : peer_due) {
+        const int32_t j = d[0] >= 0 && d[0] < (int32_t) at.size() ? at[(size_t) d[0]] : -1;
+        if (j >= 0 && lent[(size_t) j].first == d[1] && host_res[(size_t) d[2]] < 0) {
+            lent[(size_t) j].first = d[2];
+            ++peer_due_lent_n;
+        } else {
+            peer_due[kept++] = d;
+        }
+    }
+    peer_due.resize(kept);
+}
+
+// before the first window: the due handoffs no loan took are copied now
+bool Runtime::peer_due_apply(std::string& e) {
+    peer_defer = false;
+    if (peer_due.empty() && peer_due_lent_n == 0) return true;
+    const auto t0 = Clock::now();
+    std::vector<std::pair<int32_t, int32_t>> want;
+    const std::vector<int32_t>& pres = peer.residency();
+    for (const auto& d : peer_due)
+        if (pres[(size_t) d[1]] == d[0] && pres[(size_t) d[2]] < 0 && host_res[(size_t) d[2]] < 0) want.emplace_back(d[0], d[2]);
+    peer_due.clear();
+    int64_t moved = 0;
+    if (!want.empty() && !peer.place(want, moved, e)) { e = "elastic KV: " + e; return false; }
+    basalt::log::info("basalt serve", "elastic KV: the peer took %lld of the %lld experts the KV moved off CUDA0 (%lld "
+                      "with the prompt's loan, the rest in %.1f ms)", (long long) (moved + peer_due_lent_n), (long long) peer_due_off,
+                      (long long) peer_due_lent_n,
+                      std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+    peer_due_lent_n = 0;
+    peer_due_off = 0;
+    return true;
+}
+
 // `shrink` false: only VRAM that is free now (a prompt read is running beside the windows, its loan in the
 // cache's last slots) - false with `e` empty when that is not enough
 // `min_cells`: when `cells` would take the cache below its floor, as many as leave it, down to these
@@ -146,6 +235,7 @@ bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& 
     int64_t add = (int64_t) basalt::core::session_kv_grow_bytes(s, cells);
     if (add <= 0) return true;
     const auto t0 = Clock::now();
+    const int64_t had = basalt::core::session_kv_cells(s);
     if (shrink && !kv_drain(e)) return false;
     const int64_t before = xcache.slots();
     size_t free_b = 0, total_b = 0;
@@ -208,13 +298,18 @@ bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& 
         if (kv_keep_routed && !move_routed_below(xcache.slots_after_shrink(keep), "elastic KV", e)) return false;
         if (!xcache.shrink(keep, e)) return false;
         const int64_t live = xcache.slots();
+        std::vector<int32_t> off;
         for (size_t i = 0; i < host_res.size(); ++i)
             if (host_res[i] >= live) {
                 vram_evicted.emplace_back((int32_t) i, host_res[i]);
                 host_res[i] = basalt::core::kNotResident;
+                off.push_back((int32_t) i);
             }
         res_upload();
         relend();
+        // a long prompt's cells take a block of CUDA0's cache: its experts go to the peer; a short request's few
+        // are left to the adaptive rounds
+        if (cells - had >= kPeerTakeCells && !peer_take(off, e)) return false;
     }
     if (!basalt::core::session_kv_map(s, cells, e)) { e = "elastic KV: " + e; return false; }
     if (parked > 0 && !cache_regrow(e)) return false;   // the rest of what they held is the cache's again

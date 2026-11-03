@@ -200,4 +200,18 @@ void ple_block_projected(const float* projected_key, const float* projected_valu
     native_ple_postops(projected_key, hidden, projected_value, hist_rows, w, buffers, stream);
 }
 
+void ple_key_rows(const float* emb, int T, const PleWeights& w, float* key, void* q8_1, void* stream) {
+    if (!emb || !key || !stream || T < 1 || T > 8) throw std::invalid_argument("ple_key_rows: null input or rows outside 1..8");
+    if (w.key_bf16 != nullptr) {
+        bf16_gemv_fp32_mmvf_multi(emb, NG_N_EMBD, w.key_bf16, key, NG_HC_DIM, NG_N_EMBD, NG_HC_DIM, T, stream);
+        return;
+    }
+    if (!w.key_native_data || !q8_1 || !native_mmvq_multi_exact() ||
+        (w.key_native_type != 42 && w.key_native_type != 18 && w.key_native_type != 23 && w.key_native_type != 8))
+        throw std::invalid_argument("ple_key_rows: the key needs BF16 or a Q2_0, IQ3_XXS, IQ4_XS or Q8_0 native key, "
+                                    "q8_1 scratch and the exact multi-column layout");
+    native_quantize_q8_1(emb, q8_1, NG_N_EMBD, T, stream);
+    native_mmvq(w.key_native_type, w.key_native_data, q8_1, key, NG_N_EMBD, NG_HC_DIM, T, stream);
+}
+
 }  // namespace basalt::kernels

@@ -17,6 +17,12 @@ static __device__ __forceinline__ int get_int_b2(const void * x, const int & i32
     return x32;
 }
 
+// Byte `index` of a packed word by shift: the reads below take bytes out of register values, not through a pointer.
+static __device__ __forceinline__ uint32_t packed_byte(uint32_t word, int index) { return (word >> (8 * index)) & 0xffu; }
+static __device__ __forceinline__ uint32_t packed_byte(int2 words, int index) {
+    return packed_byte(index < 4 ? (uint32_t) words.x : (uint32_t) words.y, index & 3);
+}
+
 static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32) {
     return ((const int *) x)[i32]; // assume at least 4 byte alignment
 }
