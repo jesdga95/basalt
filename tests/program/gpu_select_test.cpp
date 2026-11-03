@@ -115,13 +115,13 @@ int main() {
         GpuChoice c = pick("auto", v);
         CHECK_STR(cards(c), "2,0,3");
         CHECK(c.notes.size() == 1);
-        if (c.notes.size() == 1) CHECK_STR(c.notes[0], "gpu auto: GPU 1 (RTX 3090) skipped, not sm_120");
+        if (c.notes.size() == 1) CHECK_STR(c.notes[0], "gpu auto: GPU 1 (RTX 3090) skipped, not sm_120 or sm_89");
         CHECK_STR(roles(v, c, 1), "main,expert tier,idle");
         CHECK_STR(roles(v, c, 3), "main,expert tier,expert tier");
         c = pick("", v);
         CHECK_STR(cards(c), "0");
         CHECK_STR(c.warning, "GPU 2 (RTX 5090), GPU 3 (RTX 5060 Ti) unused; use gpu 0,2,3 or gpu auto");
-        CHECK_STR(pick("1", v).error, "gpu: GPU 1 (RTX 3090) is sm_86, not sm_120");
+        CHECK_STR(pick("1", v).error, "gpu: GPU 1 (RTX 3090) is sm_86, not sm_120 or sm_89");
         CHECK_STR(cards(pick("3,2,0", v)), "3,2,0");
     }
     // A laptop's own card beside a desktop card in an enclosure: the desktop card's bandwidth makes it main; the
@@ -137,7 +137,7 @@ int main() {
     }
     // A first card Basalt cannot run: unset is an error that points at gpu N and auto.
     {
-        const std::vector<GpuCard> v = {card(0, "RTX 4090", 8, 9, 1008, 24), card(1, "RTX 5090", 12, 0, 1792, 32)};
+        const std::vector<GpuCard> v = {card(0, "RTX 3090", 8, 6, 936, 24), card(1, "RTX 5090", 12, 0, 1792, 32)};
         CHECK(!pick("", v).error.empty());
         CHECK_STR(cards(pick("auto", v)), "1");
         CHECK(pick("auto", v).notes.size() == 1);

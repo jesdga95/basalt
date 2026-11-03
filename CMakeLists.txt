@@ -37,13 +37,23 @@ endfunction()
 # the CUDA language gives the .cu compile rules but not the imported targets, so `CUDA::cudart` is brought in
 # explicitly for the host-side programs that call the runtime themselves
 find_package(CUDAToolkit REQUIRED)
-# One architecture only: the kernels use its instructions and nothing else is tested.
+# Two architectures: 120 (the full engine) and 89 (Ada, e.g. -DCMAKE_CUDA_ARCHITECTURES=89), where the kernels that
+# need thread-block clusters, bulk async copies or FP4 tensor cores are compiled out and their callers take the
+# plain kernels instead.
+set(_basalt_has_sm90 FALSE)
 foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX REPLACE "[-a].*$" "" _base "${_a}")     # 120-real / 120a are still 120
-  if(NOT _base STREQUAL "120")
-    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': basalt builds for compute capability 12.0 only")
+  if(NOT (_base STREQUAL "120" OR _base STREQUAL "89"))
+    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': basalt builds for compute capability 12.0 and 8.9 only")
+  endif()
+  if(_base STREQUAL "120")
+    set(_basalt_has_sm90 TRUE)
   endif()
 endforeach()
+if(NOT _basalt_has_sm90)
+  # Nothing in the build has thread-block clusters (dec_gdn_rec.cu drops __cluster_dims__ in every compile pass).
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CUDA>:BASALT_ARCH_BELOW_SM90=1>)
+endif()
 if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
   message(FATAL_ERROR "CUDA ${CMAKE_CUDA_COMPILER_VERSION}: basalt needs CUDA 13.0 or newer")
 endif()

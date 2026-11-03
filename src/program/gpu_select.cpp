@@ -133,7 +133,9 @@ bool parse_gpu_spec(const std::string& text, GpuSpec& out, std::string& err) {
     return true;
 }
 
-bool gpu_supported(const GpuCard& c) { return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0); }
+bool gpu_supported(const GpuCard& c) {
+    return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0) || (c.cc_major == 8 && c.cc_minor == 9);
+}
 
 std::string gpu_label(const std::vector<GpuCard>& visible, int index) {
     std::string s = "GPU " + std::to_string(index);
@@ -147,7 +149,7 @@ GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, 
     const int n = (int) visible.size();
     auto unsupported = [&](int i) {
         return "gpu: " + gpu_label(visible, i) + " is sm_" + std::to_string(visible[(size_t) i].cc_major) +
-               std::to_string(visible[(size_t) i].cc_minor) + ", not sm_120";
+               std::to_string(visible[(size_t) i].cc_minor) + ", not sm_120 or sm_89";
     };
     if (spec.kind == GpuSpec::Kind::Auto) {
         if (!known) {
@@ -157,10 +159,10 @@ GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, 
         std::vector<int> ok;
         for (int i = 0; i < n; ++i) {
             if (gpu_supported(visible[(size_t) i])) ok.push_back(i);
-            else c.notes.push_back("gpu auto: " + gpu_label(visible, i) + " skipped, not sm_120");
+            else c.notes.push_back("gpu auto: " + gpu_label(visible, i) + " skipped, not sm_120 or sm_89");
         }
         if (ok.empty()) {
-            c.error = n == 0 ? "gpu auto: no GPU is visible" : "gpu auto: no sm_120 GPU visible";
+            c.error = n == 0 ? "gpu auto: no GPU is visible" : "gpu auto: no sm_120 or sm_89 GPU visible";
             return c;
         }
         // the main card: the most memory bandwidth, then the most VRAM, then the lowest number
