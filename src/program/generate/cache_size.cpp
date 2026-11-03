@@ -245,13 +245,11 @@ int cache_size(Context& context) {
         }
         o.expert_cache = (int) sized_slots.size();
     }
-    // --vram-elastic: the cache in physical segments (the VRAM command resizes it between requests).  One GPU, no
-    // helper caches, serve mode: anything else keeps the one cudaMalloc, said once.
+    // --vram-elastic: the cache in physical segments (the VRAM command resizes it between requests).  One GPU, serve
+    // mode: anything else keeps the one cudaMalloc, said once.
     if (o.vram_elastic) {
         const char* why = !o.serve ? "it works between requests of --serve"
                         : multi_gpu ? "a layer split has a cache per GPU"
-                        : std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
-                                      [](int n) { return n > 0; }) ? "the helper caches on other GPUs"
                         : o.vram_segment_mib < 64 ? "--vram-segment-mib is below 64" : nullptr;
         if (why != nullptr) {
             basalt::log::warn("basalt generate", "--vram-elastic is off: %s", why);

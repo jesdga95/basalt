@@ -12,7 +12,7 @@ using namespace verify_detail;
 // Whether the zero-doorbell graph is right for the next window: only while every expert of [lb_, le_) is in VRAM
 // now (the host table is the one the device copy was uploaded from).
 void Verifier::refresh_ar() {
-    if (!all_resident_ || hits_.h_res == nullptr || g_ == nullptr) return;
+    if (!all_resident_ || ar_forced_ || hits_.h_res == nullptr || g_ == nullptr) return;
     const int64_t ne = g_->n_expert;
     const int32_t* r = hits_.h_res + lb_ * ne;
     const int64_t n = (le_ < 0 ? g_->n_layers : le_) * ne - lb_ * ne;

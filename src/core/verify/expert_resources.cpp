@@ -3,7 +3,6 @@
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/verify.hpp"
 #include "basalt/core/diag.hpp"
-#include "basalt/core/remote_expert_opt.hpp"
 #include "basalt/core/native_head.hpp"
 #include "basalt/core/gdn_head_split.hpp"
 #include "basalt/core/on_device.hpp"
@@ -33,7 +32,6 @@ bool Verifier::dm_init(std::string& err) {
     const auto& lay = basalt::kernels::cpu::expert_layout();
     const char* why = nullptr;
     if (!lay.native) why = "the experts are not a native pack";
-    else if (remote_opt_ != nullptr) why = "--remote-expert-opt";
     else if (all_resident_) why = "every expert is resident";
     else if (hits_.h_res == nullptr) why = "no host residency table";
     else if ((int64_t) max_t_ * ss_->k > kDmCap) why = "the window is too large";

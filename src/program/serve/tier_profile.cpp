@@ -28,7 +28,7 @@ void Runtime::save_profile(const char* why) {
 // are copied, in rounds of as many as the RAM copy has free places for.
 bool Runtime::probe_adapt(const std::string& cmd, std::string& e) {
     const auto t0 = Clock::now();
-    if (drive.d.usage.empty() || !adapt_fast || host_res.empty() || remote_opt) {
+    if (drive.d.usage.empty() || !adapt_fast || host_res.empty()) {
         e = "PROBE adapt: needs the adaptive tier on the main card (--adapt-every and --adapt-swaps above 0, "
             "no layer split)";
         return false;

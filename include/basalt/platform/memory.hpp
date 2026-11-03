@@ -188,11 +188,32 @@ MemoryStalls memory_stalls();
 /// The `some` and `full` lines' avg10 of a pressure file's text; `known` false when either is missing.
 MemoryStalls parse_memory_stalls(const std::string& text);
 
+/// How long the reading must stay below the guard's floor, where the OS gives no stall reading, before that counts as
+/// critical: the span the stall shares are averaged over, so a brief dip is judged as it is where the OS shows stalls.
+inline constexpr uint64_t kRamSustainedMs = 10000;
+
+/// How long the reading has been continuously below the floor, from the guard's samples (`now_ms` on any steady clock).
+struct BelowFloorClock {
+    int64_t since_ms = -1;   ///< when the current run below the floor began; -1 when not below
+    /// Feeds one sample (`below`: the reading is under the floor) and returns the ms the run has lasted (0 when not below).
+    uint64_t update(int64_t now_ms, bool below) {
+        if (!below) {
+            since_ms = -1;
+            return 0;
+        }
+        if (since_ms < 0) since_ms = now_ms;
+        return now_ms > since_ms ? (uint64_t) (now_ms - since_ms) : 0;
+    }
+};
+
 /// The guard's level for an available-RAM reading `avail` (0 = unknown) against `floor`, the hard floor `hard` and
-/// the stall reading. Without a stall reading, below the floor is critical at once.
-inline RamLevel ram_level(uint64_t avail, uint64_t floor, uint64_t hard, const MemoryStalls& stalls) {
+/// the stall reading. Without a stall reading, below the floor is critical once the reading has stayed there for
+/// `below_ms` >= kRamSustainedMs; a shorter dip is low. Under the hard floor it is critical at once.
+inline RamLevel ram_level(uint64_t avail, uint64_t floor, uint64_t hard, const MemoryStalls& stalls,
+                          uint64_t below_ms) {
     if (!ram_below_floor(avail, floor)) return RamLevel::Ok;
-    if (avail < (hard < floor ? hard : floor) || !stalls.known) return RamLevel::Critical;
+    if (avail < (hard < floor ? hard : floor)) return RamLevel::Critical;
+    if (!stalls.known) return below_ms >= kRamSustainedMs ? RamLevel::Critical : RamLevel::Low;
     return stalls.some >= kStallSomePct || stalls.full >= kStallFullPct ? RamLevel::Critical : RamLevel::Low;
 }
 

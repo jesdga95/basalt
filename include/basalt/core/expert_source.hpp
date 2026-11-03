@@ -45,7 +45,6 @@ struct ExpertLayout;
 namespace basalt::core {
 
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
-class RemoteExperts;
 struct LoadStats;
 
 namespace detail {
@@ -261,8 +260,6 @@ struct GpuPlanSink {
 struct ExpertDispatch {
     basalt::kernels::cpu::ExpertPool* pool = nullptr;
     ExpertSource* src = nullptr;
-    RemoteExperts* remote[3] = {}; ///< optional CUDA1..3 tiers for otherwise CPU-served rows
-    int remote_count = 0;
     int64_t n_expert = basalt::kernels::cpu::NE;
 
     /// Counters, for the driver to report rather than for control flow.
@@ -530,7 +527,7 @@ public:
     void homes_abort();
     bool home_release(int64_t layer, int64_t expert);
     uint64_t homes_reclaim();
-    /// Moves the experts still in homes into fresh regions and frees the old ones (bytes freed; 0 when it would
+    /// Moves the experts still in homes into fresh regions and frees the old ones (net bytes freed; 0 when it would
     /// free less than a region or the RAM cannot take the copy).  Only with no exchange in flight.
     uint64_t homes_compact();
     uint64_t homes_bytes() const;
@@ -658,7 +655,7 @@ public:
     /// Allocates and loads the model's `experts` section.  Prints nothing; the caller reports `note()` and the load
     /// rate, because those are the two numbers that say whether the arena is the one that was asked for.
     bool open(const ExpertFiles& files, int64_t n_layers, int64_t n_expert, int threads, std::string& err,
-              uint64_t max_pinned_bytes = 0, const std::string& shared_arena_file = {});
+              const std::string& shared_arena_file = {});
     void close();
 
     bool mapped() const { return base_ != nullptr; }

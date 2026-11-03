@@ -100,8 +100,8 @@ Verifier::~Verifier() {
     if (ev_fork_) cudaEventDestroy(ev_fork_);
     if (ev_join_) cudaEventDestroy(ev_join_);
     if (arena_) cudaFree(arena_);
-    void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_, h_pend_,
-                     h_flagA_, h_plan_, h_flagB_, h_q_, h_qp_, h_top_};
+    void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_seq_, h_flag_, h_ymiss_, h_pend_,
+                     h_flagA_, h_plan_, h_flagB_, h_q_, h_qp_, h_top_, h_head_from_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -186,12 +186,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(T * kTopIds * 4 + 16, (void**) &h_top_, (void**) &m_top_) &&
               mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
               mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
-              mapped(T * K * 4, (void**) &h_w_, (void**) &m_w_) &&
               mapped(64, (void**) &h_seq_, (void**) &m_seq_) &&
               mapped(64, (void**) &h_flag_, (void**) &m_flag_) &&
               mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
+              mapped(64, (void**) &h_head_from_, (void**) &m_head_from_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
@@ -229,7 +229,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sh_xq_ = b.take<uint8_t>(basalt::kernels::native_q8_1_bytes(max_in, (int) T));
         qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
         gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
-        z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV); y_dummy_ = b.take<float>(T * ZV);
+        z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV);
         qfull_ = b.take<float>(T * NH * 2 * HD); qcur_ = b.take<float>(T * NH * HD);
         kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
         idx_raw_L_ = b.take<float>(nQ * T * ID); qidx_ = b.take<float>(T * IQ * ID);
@@ -251,8 +251,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
         head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
-        if (head_ != nullptr && head_->vproxy() != nullptr)
+        if (head_ != nullptr && head_->vproxy() != nullptr) {
             vhead_scratch_ = b.take<uint8_t>(basalt::kernels::q6k_vhead_scratch_bytes());
+            head_from_d_ = b.take<int32_t>(4);
+        }
         if (head_ != nullptr && head_->planes()) {
             vhead_scratch_ = b.take<uint8_t>(basalt::kernels::q80p_vhead_scratch_bytes());
             head_keep_d_ = b.take<int32_t>(1);
@@ -260,6 +262,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         hist_snap_ = b.take<float>(T * HS);
         ple_win_ = b.take<float>(2 * T * HC * N);
         ple_key_ = b.take<float>(T * HC * N); ple_val_ = b.take<float>(T * N);
+        ple_q8_ = b.take<uint8_t>(basalt::kernels::native_q8_1_bytes((int) N, (int) T));
     };
     Bump count;
     carve(count);
@@ -317,6 +320,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         int sms = 0;
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device_ >= 0 ? device_ : 0);
         fin_blocks_ = sms;
+        mid_max_t_ = sms < 160 ? basalt::kernels::kMidChainMaxT : 4;
     }
     if (!basalt::kernels::gdn_commit_lazy_none(commit_ctl_) ||
         cudaStreamCreateWithPriority(&lz_s_, cudaStreamNonBlocking, cs_prio) != cudaSuccess ||
@@ -356,7 +360,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                     }
                 }
             }
-            all_resident_ = all_ok;
+            ar_forced_ = diagnostics().zero_doorbell;
+            all_resident_ = all_ok || ar_forced_;
         }
     }
     device_plan_ = false;

@@ -6,6 +6,7 @@
 // THIRD_PARTY_LICENSES).  The block structs and codebook grids are basalt/ggml/ggml_common.h.
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/dp4a.hpp"
+#include "basalt/kernels/packed_byte.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/core/diag.hpp"
@@ -88,12 +89,11 @@ __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(const void* __restrict__ v
                                                       const int& kbx, const int& iqs) {
     const block_iq2_xxs* bq2 = (const block_iq2_xxs*) vbq + kbx;
     const int q2 = get_int_b2(bq2->qs, iqs);
-    const uint8_t* aux8 = (const uint8_t*) &q2;
     const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
     int sumi = 0;
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
-        const uint2 grid_pos = ((const uint2*) iq2xxs_grid)[aux8[k0 / 2]];
+        const uint2 grid_pos = ((const uint2*) iq2xxs_grid)[packed_byte(q2, k0 / 2)];
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
@@ -145,18 +145,17 @@ __device__ __forceinline__ float vec_dot_iq2_s_q8_1(const void* __restrict__ vbq
                                                     const int& kbx, const int& iqs) {
     const block_iq2_s* bq2 = (const block_iq2_s*) vbq + kbx;
     const int qs_packed = get_int_b2(bq2->qs, iqs / 2);
-    const uint8_t* qs = (const uint8_t*) &qs_packed;
     const int qh = bq2->qh[iqs / 2];
     const int signs_packed_32 = get_int_b2(bq2->qs, QK_K / 32 + iqs / 2);
-    const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
     const int ls0 = bq2->scales[iqs / 2] & 0x0F;
     const int ls1 = bq2->scales[iqs / 2] >> 4;
     int sumi0 = 0, sumi1 = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int* grid_pos = (const int*) (iq2s_grid + (qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)));
-        const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
+        const int* grid_pos = (const int*) (iq2s_grid + (packed_byte(qs_packed, l0 / 2) | ((qh << (8 - l0)) & 0x300)));
+        const uint32_t sgn = packed_byte(signs_packed_32, l0 / 2);
+        const int signs0 = __vcmpne4(((sgn & 0x03) << 7) | ((sgn & 0x0C) << 21), 0x00000000);
+        const int signs1 = __vcmpne4(((sgn & 0x30) << 3) | ((sgn & 0xC0) << 17), 0x00000000);
         const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
@@ -178,12 +177,11 @@ __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(const void* __restrict__ v
                                                       const int& kbx, const int& iqs) {
     const block_iq3_xxs* bq3 = (const block_iq3_xxs*) vbq + kbx;
     const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs + 1));
-    const uint8_t* q3 = (const uint8_t*) &q3_packed;
     const uint32_t aux32 = get_int_b2(bq3->qs, QK_K / 16 + iqs / 2);
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+        const int2 grid_pos = make_int2(iq3xxs_grid[packed_byte(q3_packed, l0 + 0)], iq3xxs_grid[packed_byte(q3_packed, l0 + 1)]);
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
@@ -204,17 +202,16 @@ __device__ __forceinline__ float vec_dot_iq3_s_q8_1(const void* __restrict__ vbq
                                                     const int& kbx, const int& iqs) {
     const block_iq3_s* bq3 = (const block_iq3_s*) vbq + kbx;
     const int2 qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
-    const uint8_t* qs = (const uint8_t*) &qs_packed;
     const int qh = bq3->qh[iqs / 2];
     const int signs_packed_32 = get_int_b2(bq3->signs, iqs / 2);
-    const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int2 grid_pos = make_int2(iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
-                                        iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
-        const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
+        const int2 grid_pos = make_int2(iq3s_grid[packed_byte(qs_packed, l0 + 0) | ((qh << (8 - l0)) & 0x100)],
+                                        iq3s_grid[packed_byte(qs_packed, l0 + 1) | ((qh << (7 - l0)) & 0x100)]);
+        const uint32_t sgn = packed_byte(signs_packed_32, l0 / 2);
+        const int signs0 = __vcmpne4(((sgn & 0x03) << 7) | ((sgn & 0x0C) << 21), 0x00000000);
+        const int signs1 = __vcmpne4(((sgn & 0x30) << 3) | ((sgn & 0xC0) << 17), 0x00000000);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
@@ -231,13 +228,12 @@ __device__ __forceinline__ float vec_dot_iq1_m_q8_1(const void* __restrict__ vbq
                                                     const int& kbx, const int& iqs) {
     const block_iq1_m* bq1 = (const block_iq1_m*) vbq + kbx;
     const int qs_packed = get_int_b4(bq1->qs, iqs);
-    const uint8_t* qs = (const uint8_t*) &qs_packed;
     int sumi[2] = {0, 0};
     float sumf[2] = {0.0f, 0.0f};
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int qhl = bq1->qh[2 * iqs + l0 / 4] >> (4 * ((l0 / 2) % 2));
-        const int grid = iq1s_grid_gpu[qs[l0 / 2] | ((qhl & 0x07) << 8)];
+        const int grid = iq1s_grid_gpu[packed_byte(qs_packed, l0 / 2) | ((qhl & 0x07) << 8)];
         const int grid0 = (grid >> 0) & 0x0F0F0F0F;
         const int grid1 = (grid >> 4) & 0x0F0F0F0F;
         const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
@@ -304,7 +300,7 @@ __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(const void* __restrict__ vb
 constexpr int VDR_Q4_K = 2, VDR_Q5_K = 2, VDR_Q5_1 = 2, VDR_Q5_0 = 2, VDR_Q8_0 = 2;
 
 __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(const int* __restrict__ v, const int* __restrict__ u,
-                                                             const uint8_t* __restrict__ sc, const uint8_t* __restrict__ m,
+                                                             const uint32_t scm,
                                                              const half2& dm4, const float* __restrict__ d8) {
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
@@ -314,15 +310,15 @@ __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(const int* __restri
         const int v1i = (v[1] >> (4 * i)) & 0x0F0F0F0F;
         const int dot1 = ggml_cuda_dp4a(v1i, u[2 * i + 1], ggml_cuda_dp4a(v0i, u[2 * i + 0], 0));
         const int dot2 = ggml_cuda_dp4a(0x01010101, u[2 * i + 1], ggml_cuda_dp4a(0x01010101, u[2 * i + 0], 0));
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);   // the min times the sum of the QUANTIZED activations
+        sumf_d += d8[i] * (dot1 * (int) packed_byte(scm, i));
+        sumf_m += d8[i] * (dot2 * (int) packed_byte(scm, 2 + i));   // the min times the sum of the QUANTIZED activations
     }
     const float2 dm4f = __half22float2(dm4);
     return dm4f.x * sumf_d - dm4f.y * sumf_m;
 }
 __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(const int* __restrict__ vl, const int* __restrict__ vh,
-                                                             const int* __restrict__ u, const uint8_t* __restrict__ sc,
-                                                             const uint8_t* __restrict__ m, const half2& dm5,
+                                                             const int* __restrict__ u, const uint32_t scm,
+                                                             const half2& dm5,
                                                              const float* __restrict__ d8) {
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
@@ -336,8 +332,8 @@ __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(const int* __restri
         const int v1i = vl1i | vh1i;
         const int dot1 = ggml_cuda_dp4a(v0i, u[2 * i + 0], ggml_cuda_dp4a(v1i, u[2 * i + 1], 0));
         const int dot2 = ggml_cuda_dp4a(0x01010101, u[2 * i + 0], ggml_cuda_dp4a(0x01010101, u[2 * i + 1], 0));
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);
+        sumf_d += d8[i] * (dot1 * (int) packed_byte(scm, i));
+        sumf_m += d8[i] * (dot2 * (int) packed_byte(scm, 2 + i));
     }
     const float2 dm5f = __half22float2(dm5);
     return dm5f.x * sumf_d - dm5f.y * sumf_m;
@@ -366,8 +362,7 @@ __device__ __forceinline__ float vec_dot_q4_K_q8_1(const void* __restrict__ vbq,
     v[1] = q4[4];
     uint16_t aux[2];
     k_scale_min(bq4_K->scales, bq8_offset, aux);
-    const uint8_t* sc = (const uint8_t*) aux;
-    const uint8_t* m = sc + 2;
+    const uint32_t scm = pack_scale_min(aux);
 #pragma unroll
     for (int i = 0; i < QR4_K; ++i) {
         const block_q8_1* bq8i = bq8_1 + bq8_offset + i;
@@ -376,7 +371,7 @@ __device__ __forceinline__ float vec_dot_q4_K_q8_1(const void* __restrict__ vbq,
         u[2 * i + 0] = q8[0];
         u[2 * i + 1] = q8[4];
     }
-    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
+    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, scm, bq4_K->dm, d8);
 }
 __device__ __forceinline__ float vec_dot_q5_K_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
                                                    const int& kbx, const int& iqs) {
@@ -394,8 +389,7 @@ __device__ __forceinline__ float vec_dot_q5_K_q8_1(const void* __restrict__ vbq,
     vh[1] = qh[4] >> bq8_offset;
     uint16_t aux[2];
     k_scale_min(bq5_K->scales, bq8_offset, aux);
-    const uint8_t* sc = (const uint8_t*) aux;
-    const uint8_t* m = sc + 2;
+    const uint32_t scm = pack_scale_min(aux);
 #pragma unroll
     for (int i = 0; i < QR5_K; ++i) {
         const block_q8_1* bq8i = bq8_1 + bq8_offset + i;
@@ -404,7 +398,7 @@ __device__ __forceinline__ float vec_dot_q5_K_q8_1(const void* __restrict__ vbq,
         u[2 * i + 0] = q8[0];
         u[2 * i + 1] = q8[4];
     }
-    return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
+    return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, scm, bq5_K->dm, d8);
 }
 // Q5_1: llama.cpp's integer chain, but the min term multiplies the sum of the QUANTIZED activations (dp4a with
 // 0x01010101, times d8) instead of the q8_1 block's `ds.y`, which our quantizer (like llama.cpp's) fills with the sum
@@ -649,15 +643,14 @@ template<> struct Split<16> {   // IQ2_XXS
     __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
         const block_iq2_xxs* bq2 = (const block_iq2_xxs*) vbq + kbx;
         const int q2 = get_int_b2(bq2->qs, iqs);
-        const uint8_t* aux8 = (const uint8_t*) &q2;
-        const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
+            const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
         const uint2* grid_lut;
         if constexpr (STAGE_GRID) grid_lut = (const uint2*) s_grid;
         else grid_lut = (const uint2*) iq2xxs_grid;
         W r;
 #pragma unroll
         for (int k0 = 0; k0 < 8; k0 += 2) {
-            const uint2 grid_pos = grid_lut[aux8[k0 / 2]];
+            const uint2 grid_pos = grid_lut[packed_byte(q2, k0 / 2)];
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
             r.g[k0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
@@ -723,10 +716,8 @@ template<> struct Split<22> : SplitLs2 {   // IQ2_S
     __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
         const block_iq2_s* bq2 = (const block_iq2_s*) vbq + kbx;
         const int qs_packed = get_int_b2(bq2->qs, iqs / 2);
-        const uint8_t* qs = (const uint8_t*) &qs_packed;
         const int qh = bq2->qh[iqs / 2];
         const int signs_packed_32 = get_int_b2(bq2->qs, QK_K / 32 + iqs / 2);
-        const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
         const uint64_t* grid_lut;
         if constexpr (STAGE_GRID) grid_lut = (const uint64_t*) s_grid;
         else grid_lut = iq2s_grid;
@@ -735,9 +726,10 @@ template<> struct Split<22> : SplitLs2 {   // IQ2_S
         r.ls1 = bq2->scales[iqs / 2] >> 4;
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
-            const int* grid_pos = (const int*) (grid_lut + (qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)));
-            const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
-            const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
+            const int* grid_pos = (const int*) (grid_lut + (packed_byte(qs_packed, l0 / 2) | ((qh << (8 - l0)) & 0x300)));
+            const uint32_t sgn = packed_byte(signs_packed_32, l0 / 2);
+            const int signs0 = __vcmpne4(((sgn & 0x03) << 7) | ((sgn & 0x0C) << 21), 0x00000000);
+            const int signs1 = __vcmpne4(((sgn & 0x30) << 3) | ((sgn & 0xC0) << 17), 0x00000000);
             r.g[l0 + 0] = __vsub4(grid_pos[0] ^ signs0, signs0);
             r.g[l0 + 1] = __vsub4(grid_pos[1] ^ signs1, signs1);
         }
@@ -752,7 +744,6 @@ template<> struct Split<18> {   // IQ3_XXS
     __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
         const block_iq3_xxs* bq3 = (const block_iq3_xxs*) vbq + kbx;
         const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs + 1));
-        const uint8_t* q3 = (const uint8_t*) &q3_packed;
         const uint32_t aux32 = get_int_b2(bq3->qs, QK_K / 16 + iqs / 2);
         const uint32_t* grid_lut;
         if constexpr (STAGE_GRID) grid_lut = s_grid;
@@ -760,7 +751,7 @@ template<> struct Split<18> {   // IQ3_XXS
         W r;
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
-            const int2 grid_pos = make_int2(grid_lut[q3[l0 + 0]], grid_lut[q3[l0 + 1]]);
+            const int2 grid_pos = make_int2(grid_lut[packed_byte(q3_packed, l0 + 0)], grid_lut[packed_byte(q3_packed, l0 + 1)]);
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
             r.g[l0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
@@ -787,17 +778,16 @@ template<> struct Split<21> {   // IQ3_S
     __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
         const block_iq3_s* bq3 = (const block_iq3_s*) vbq + kbx;
         const int2 qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
-        const uint8_t* qs = (const uint8_t*) &qs_packed;
         const int qh = bq3->qh[iqs / 2];
         const int signs_packed_32 = get_int_b2(bq3->signs, iqs / 2);
-        const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
         W r;
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
-            const int2 grid_pos = make_int2(iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
-                                            iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
-            const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
-            const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
+            const int2 grid_pos = make_int2(iq3s_grid[packed_byte(qs_packed, l0 + 0) | ((qh << (8 - l0)) & 0x100)],
+                                            iq3s_grid[packed_byte(qs_packed, l0 + 1) | ((qh << (7 - l0)) & 0x100)]);
+            const uint32_t sgn = packed_byte(signs_packed_32, l0 / 2);
+            const int signs0 = __vcmpne4(((sgn & 0x03) << 7) | ((sgn & 0x0C) << 21), 0x00000000);
+            const int signs1 = __vcmpne4(((sgn & 0x30) << 3) | ((sgn & 0xC0) << 17), 0x00000000);
             r.g[l0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
             r.g[l0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
         }
@@ -821,7 +811,6 @@ template<> struct Split<29> {   // IQ1_M
     __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
         const block_iq1_m* bq1 = (const block_iq1_m*) vbq + kbx;
         const int qs_packed = get_int_b4(bq1->qs, iqs);
-        const uint8_t* qs = (const uint8_t*) &qs_packed;
         const uint32_t* grid_lut;
         if constexpr (STAGE_GRID) grid_lut = s_grid;
         else grid_lut = iq1s_grid_gpu;
@@ -829,7 +818,7 @@ template<> struct Split<29> {   // IQ1_M
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
             const int qhl = bq1->qh[2 * iqs + l0 / 4] >> (4 * ((l0 / 2) % 2));
-            const int grid = grid_lut[qs[l0 / 2] | ((qhl & 0x07) << 8)];
+            const int grid = grid_lut[packed_byte(qs_packed, l0 / 2) | ((qhl & 0x07) << 8)];
             r.g[l0 + 0] = (grid >> 0) & 0x0F0F0F0F;
             r.g[l0 + 1] = (grid >> 4) & 0x0F0F0F0F;
             r.delta[l0 / 2] = -1.0f + IQ1M_DELTA - (qhl & 0x08) * (2.0f * IQ1M_DELTA / 0x08);
@@ -976,8 +965,7 @@ template<> struct Split<12> {   // Q4_K
             u[2 * i + 0] = q8[0];
             u[2 * i + 1] = q8[4];
         }
-        const uint8_t* sc = (const uint8_t*) r.aux;
-        return vec_dot_q4_K_q8_1_impl_vmmq(r.v, u, sc, sc + 2, r.dm, d8);
+        return vec_dot_q4_K_q8_1_impl_vmmq(r.v, u, pack_scale_min(r.aux), r.dm, d8);
     }
 };
 template<> inline constexpr bool kSplit<13> = true;
@@ -1010,8 +998,7 @@ template<> struct Split<13> {   // Q5_K
             u[2 * i + 0] = q8[0];
             u[2 * i + 1] = q8[4];
         }
-        const uint8_t* sc = (const uint8_t*) r.aux;
-        return vec_dot_q5_K_q8_1_impl_vmmq(r.vl, r.vh, u, sc, sc + 2, r.dm, d8);
+        return vec_dot_q5_K_q8_1_impl_vmmq(r.vl, r.vh, u, pack_scale_min(r.aux), r.dm, d8);
     }
 };
 template<> inline constexpr bool kSplit<14> = true;
@@ -2268,11 +2255,10 @@ __device__ void dq_iq1_m(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const float d = (float) scale.f16 * (2 * ((sc[ib16 / 4] >> 3 * (ib16 % 4)) & 0x7) + 1);
     const float delta = x[ibs].qh[2 * ib + il / 2] & (0x08 << 4 * (il % 2)) ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA;
     uint32_t grid32[2];
-    const int8_t* q = (const int8_t*) grid32;
     grid32[0] = iq1s_grid_gpu[x[ibs].qs[4 * ib + il] | (((x[ibs].qh[2 * ib + il / 2] >> 4 * (il % 2)) & 7) << 8)];
     grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
     grid32[0] &= 0x0f0f0f0f;
-    for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>(d * (q[j] + delta));
+    for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>(d * (packed_s8(grid32[j >> 2], j & 3) + delta));
 }
 template<typename dst_t>
 __device__ void dq_iq4_nl(const void* vx, int64_t ibs, dst_t* yy, int tid) {

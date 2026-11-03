@@ -81,8 +81,23 @@ bool cpu_avxvnni_ok() {
         if (r[0] < 7) return false;
         platform::cpuid(7, 0, r);
         if (r[0] < 1) return false;                        // leaf 7 has no sub-leaf 1
+        if (!((r[1] >> 8) & 1u)) return false;             // BMI2 (the i-quant rows' grid indices)
         platform::cpuid(7, 1, r);
         return ((r[0] >> 4) & 1u) != 0;                    // AVX-VNNI
+    }();
+    return ok;
+}
+
+bool cpu_avxvnni_int8_ok() {
+    static const bool ok = [] {
+        if (!cpu_avx2_ok()) return false;
+        unsigned r[4] = {0, 0, 0, 0};
+        platform::cpuid(0, 0, r);
+        if (r[0] < 7) return false;
+        platform::cpuid(7, 0, r);
+        if (r[0] < 1) return false;                        // leaf 7 has no sub-leaf 1
+        platform::cpuid(7, 1, r);
+        return ((r[3] >> 4) & 1u) != 0;                    // AVX-VNNI-INT8
     }();
     return ok;
 }

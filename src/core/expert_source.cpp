@@ -1,7 +1,6 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "basalt/core/expert_source.hpp"
 #include "basalt/core/load_progress.hpp"
-#include "basalt/core/remote_experts.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
@@ -1391,8 +1390,8 @@ uint64_t FileExpertSource::homes_compact() {
         std::memcpy(dst[k], from, (size_t) bytes);
     }
     homes_commit();
-    const uint64_t freed = homes_reclaim();
-    return freed;
+    (void) homes_reclaim();
+    return held - homes_bytes();
 }
 
 bool FileExpertSource::exchange_live() const {
@@ -1907,22 +1906,6 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     const bool use_hits = graph_hits || (d.hits_ready() && d.decided);
     int64_t njobs = 0;
 
-    if (d.remote_count > 0) {
-        int32_t kind[32];
-        if (k > 32) {
-            d.failed = true; d.fail = "remote experts: routing width exceeds 32"; return;
-        }
-        for (int64_t i = 0; i < k; ++i)
-            kind[i] = use_hits && ids[i] >= 0 && ids[i] < d.n_expert && (graph_hits
-                ? d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] >= 0
-                : d.is_hit[(size_t) i] != 0) ? 0 : -1;
-        static thread_local std::string remote_error;
-        for (int r = 0; r < d.remote_count; ++r)
-            if (!d.remote[r]->begin(d.layers, x_f, ids, 1, k, kind, d.host_res, remote_error)) {
-                d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
-            }
-    }
-
     for (int64_t i = 0; i < k; ++i) {
         const int64_t e = ids[i];
         if (e < 0 || e >= d.n_expert) {
@@ -1955,13 +1938,6 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
         }
         if (graph_hits) ++d.cache_refused;   // token graph: a miss (nothing is admitted during a token)
 
-        bool remote_owns = false;
-        for (int r = 0; r < d.remote_count; ++r) remote_owns |= d.remote[r]->owns(i);
-        if (remote_owns) {
-            std::memset(out + (size_t) i * (size_t) n_embd, 0, (size_t) n_embd * sizeof(float));
-            continue;
-        }
-
         // `njobs` indexes the JOB ARRAY and `i` indexes the OUTPUT - they are the same only when nothing is a
         // hit, and using one for the other is how a hit's row would get two experts summed into it.
         ExpertJob& j = d.jobs[(size_t) njobs++];
@@ -1974,13 +1950,6 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 
     // rows of every expert across all threads (bitwise the same as `run`).
     d.pool->run_split(d.jobs.data(), (int) njobs);
-    if (d.remote_count > 0) {
-        static thread_local std::string remote_error;
-        for (int r = 0; r < d.remote_count; ++r)
-            if (!d.remote[r]->finish(out, remote_error)) {
-                d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
-            }
-    }
     ++d.layers;
     d.experts += k;
 }
@@ -2123,15 +2092,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             return;
         }
     }
-    if (d.remote_count > 0) {
-        static thread_local std::string remote_error;
-        for (int r = 0; r < d.remote_count; ++r) {
-            if (!d.remote[r]->begin(d.layers, x_f, ids, n_tok, k, kind, d.host_res, remote_error)) {
-                d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
-            }
-            for (int64_t i = 0; i < n; ++i) if (d.remote[r]->owns(i)) kind[i] = 2;
-        }
-    }
     // the GPU's copy_rows_from_mapped zeroes the rows it computed itself
     const bool gpu_zeroes_hits = (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap);
     bool any_cpu = false;
@@ -2139,7 +2099,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (kind[i] < 0) { any_cpu = true; break; }
     const auto c1 = std::chrono::steady_clock::now();
     if (any_cpu) {
-        // a token whose experts all run on a GPU (CUDA0, the peer or a helper) needs no CPU activation
+        // a token whose experts all run on a GPU (CUDA0 or the peer) needs no CPU activation
         for (int64_t t = 0; t < n_tok; ++t) {
             bool cpu = false;   // an id of -1 (dropped by the route tail skip) needs no activation
             for (int64_t j = t * k; j < (t + 1) * k; ++j) cpu |= kind[j] < 0 && ids[j] >= 0;
@@ -2170,7 +2130,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 d.fail_expert = e;
                 return;
             }
-            if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below
+            if (kind[i] >= 0) {             // CUDA0, PCIe, or a peer result staged into this row below
                 if (kind[i] == 0) ++d.cache_hits;
                 else ++d.offload_entries;   // PCIe or another GPU
                 if (kind[i] == 2 && d.peer != nullptr) ++d.peer_entries;
@@ -2210,13 +2170,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (njobs > 0) {
         if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
         else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
-    }
-    if (d.remote_count > 0) {
-        static thread_local std::string remote_error;
-        for (int r = 0; r < d.remote_count; ++r)
-            if (!d.remote[r]->finish(out, remote_error)) {
-                d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
-            }
     }
     if (d.peer != nullptr && !ext) {         // multi-GPU: the second GPU's rows, into the same mapped rows
         std::string perr;
@@ -2403,7 +2356,7 @@ bool shared_arena_range_hash(const ExpertFiles& files, const basalt::kernels::cp
 ArenaExpertSource::~ArenaExpertSource() { close(); }
 
 bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int64_t n_expert, int threads,
-                             std::string& err, uint64_t max_pinned_bytes,
+                             std::string& err,
                              const std::string& shared_arena_file) {
     close();
     const std::string& path = files_in.experts.path;
@@ -2478,8 +2431,8 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
         lbytes.push_back(lay.blob_bytes(l) * (uint64_t) n_expert);
     }
     bounds.push_back(want);
-    PinnedArena* a = new PinnedArena(want + (uint64_t) blob, bounds, max_pinned_bytes,
-                                     shared_arena_file, arena_hash);
+    PinnedArena* a = new PinnedArena(want + (uint64_t) blob, bounds, shared_arena_file,
+                                     arena_hash);
     if (!a->valid()) {
         const std::string why = a->note;
         delete a;

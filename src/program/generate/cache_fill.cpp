@@ -6,7 +6,6 @@ int cache_fill(Context& context) {
     auto& o = *context.o;
     auto& split_at = *context.split_at;
     auto& multi_gpu = *context.multi_gpu;
-    auto& remote_dev = *context.remote_dev;
     auto& err = *context.err;
     auto& g = *context.g;
     auto& profile = *context.profile;
@@ -246,99 +245,9 @@ int cache_fill(Context& context) {
             if (stp->cache.slot_of(pr.first, pr.second) >= 0)
                 cache_fill_bytes += basalt::kernels::cpu::expert_layout().blob_bytes(pr.first);
 
-    std::array<basalt::core::RemoteExperts, 3> remote_experts;
-    std::unique_ptr<basalt::core::RemoteExpertOpt> remote_opt;
-    if (o.remote_expert_opt && o.expert_cache_remote[0] > 0) remote_opt = std::make_unique<basalt::core::RemoteExpertOpt>();
-    const bool multi_remote = o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
-    if (o.expert_cache_remote[0] > 0) {
-        if (o.expert_cache <= 0 || profile.empty() || o.no_pool) {
-            basalt::log::error("basalt generate", "remote experts need an expert profile, "
-                                 "a CUDA0 expert cache and the expert pool");
-            return 2;
-        }
-        std::vector<std::pair<int32_t, int32_t>> ranked = profile;
-        if (!stages.empty()) {   // a layer split: CUDA0's share of the profile, then the later stages' pairs no cache holds
-            for (auto& st : stages)
-                for (const auto& pr : st->profile)
-                    if (st->cache.slot_of(pr.first, pr.second) < 0) ranked.push_back(pr);
-        }
-        if (multi_remote || std::any_of(o.expert_cache_remote_auto.begin(), o.expert_cache_remote_auto.end(),
-                                        [](bool automatic) { return automatic; })) {
-            // The shipped frequency profile names only 8000 of 24576 experts. Once exhausted,
-            // fill remaining VRAM from unranked pairs in expert-then-layer order: this spreads
-            // the tail across all layers instead of concentrating it on layer zero.
-            std::vector<uint8_t> seen((size_t) g.n_layers * (size_t) g.n_expert, 0);
-            for (const auto& pair : ranked)
-                if (pair.first >= 0 && pair.first < g.n_layers && pair.second >= 0 && pair.second < g.n_expert)
-                    seen[(size_t) pair.first * (size_t) g.n_expert + (size_t) pair.second] = 1;
-            for (int64_t e = 0; e < g.n_expert; ++e)
-                for (int64_t l = 0; l < g.n_layers; ++l)
-                    if (!seen[(size_t) l * (size_t) g.n_expert + (size_t) e])
-                        ranked.emplace_back((int32_t) l, (int32_t) e);
-            basalt::log::info("basalt generate", "remote ranking: %zu profiled pairs, "
-                                 "%zu other pairs to fill CUDA1..3", profile.size(), ranked.size() - profile.size());
-        }
-        std::array<std::vector<std::pair<int32_t, int32_t>>, 3> by_device;
-        if (multi_remote) {
-            // Either stripe experts for parallel GPU work, or give each layer one
-            // secondary GPU to reduce switches and transfers over shared USB4.
-            std::vector<uint8_t> assigned((size_t) g.n_layers * (size_t) g.n_expert, 0);
-            const int devices = 1 + (o.expert_cache_remote[1] > 0) + (o.expert_cache_remote[2] > 0);
-            int next = 0;
-            for (const auto& pair : ranked) {
-                if (pair.first < 0 || pair.first >= g.n_layers || pair.second < 0 || pair.second >= g.n_expert ||
-                    xcache.slot_of(pair.first, pair.second) >= 0) continue;
-                const size_t index = (size_t) pair.first * (size_t) g.n_expert + (size_t) pair.second;
-                if (assigned[index]) continue;
-                int target = -1;
-                if (o.expert_cache_remote_placement == "layer") {
-                    target = pair.first % devices;
-                    // Other layers' owners may still have room: keep scanning ranks.
-                    if (by_device[(size_t) target].size() >=
-                        (size_t) o.expert_cache_remote[(size_t) target]) continue;
-                } else {
-                    for (int i = 0; i < devices; ++i) {
-                        const int r = (next + i) % devices;
-                        if (by_device[(size_t) r].size() < (size_t) o.expert_cache_remote[(size_t) r]) {
-                            target = r;
-                            break;
-                        }
-                    }
-                    if (target < 0) break;
-                }
-                assigned[index] = 1;
-                by_device[(size_t) target].push_back(pair);
-                next = (target + 1) % devices;
-            }
-            basalt::log::info("basalt generate", "remote ranks %s across %d CUDA devices",
-                         o.expert_cache_remote_placement == "layer" ? "grouped by layer" : "striped", devices);
-        } else {
-            by_device[0] = std::move(ranked);
-        }
-        std::vector<uint8_t> claimed((size_t) g.n_layers * (size_t) g.n_expert, 0);
-        for (auto& st : stages)   // a layer split: what a stage's cache holds is no helper's
-            for (const auto& pr : st->profile)
-                if (st->cache.slot_of(pr.first, pr.second) >= 0)
-                    claimed[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second] = 1;
-        for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
-            if (remote_opt) remote_opt->attach(remote_experts[(size_t) r]);
-            if (!remote_experts[(size_t) r].open(remote_dev[r], o.expert_cache_remote[(size_t) r],
-                     g.n_layers, g.n_expert, by_device[(size_t) r], xcache, *srcp, claimed, err,
-                     o.expert_cache_remote_auto[(size_t) r])) {
-                return fatal_start_error(err);
-            }
-            basalt::log::info("basalt generate", "CUDA%d: %lld additional experts, %.2f GiB; "
-                                 "results return through pinned host rows", remote_dev[r],
-                         (long long) remote_experts[(size_t) r].resident(), remote_experts[(size_t) r].gib());
-        }
-    }
-
-
     context.cache_fill_bytes = &cache_fill_bytes;
     context.peer_split_bytes = peer_split_bytes;
     context.peer_expert_room = peer_expert_room;
-    context.remote_experts = &remote_experts;
-    context.remote_opt = &remote_opt;
     return token_path(context);
 }
 

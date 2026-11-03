@@ -1,7 +1,6 @@
 #include "common.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/verify.hpp"
-#include "basalt/core/remote_expert_opt.hpp"
 #include "basalt/core/gdn_head_split.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/core/peer_experts.hpp"

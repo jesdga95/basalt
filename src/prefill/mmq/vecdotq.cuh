@@ -4,6 +4,7 @@
 // ggml/src/ggml-cuda/vecdotq.cuh.  Copyright (c) 2023-2026 The ggml authors.  MIT licence: see THIRD_PARTY_LICENSES.
 #pragma once
 
+#include "basalt/kernels/packed_byte.hpp"
 #include "mmq_common.cuh"
 
 #include <cstdint>

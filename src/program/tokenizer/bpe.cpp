@@ -237,8 +237,10 @@ bool Tokenizer::merge_piece(const uint8_t* p, size_t n, std::vector<int32_t>& ou
             if (best_rank == kNone) break;
             uint32_t r;
             sym_[best] = find_merge(sym_[best], sym_[best + 1], r);
-            std::memmove(&sym_[best + 1], &sym_[best + 2], (count - best - 2) * sizeof(int32_t));
-            std::memmove(&rank_[best], &rank_[best + 1], (count - best - 1) * sizeof(uint32_t));
+            int32_t* sym = sym_.data();
+            uint32_t* rank = rank_.data();
+            if (best + 2 < count) std::memmove(sym + best + 1, sym + best + 2, (count - best - 2) * sizeof(int32_t));
+            std::memmove(rank + best, rank + best + 1, (count - best - 1) * sizeof(uint32_t));
             --count;
             if (best + 1 < count) rank_[best] = find_merge(sym_[best], sym_[best + 1], r) >= 0 ? r : kNone;
             else rank_[best] = kNone;

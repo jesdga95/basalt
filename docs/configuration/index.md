@@ -30,7 +30,7 @@ bin/basalt serve MODEL.basalt [--python PY] [options]
 
 `basalt serve` runs the Python server (`serve/`) over the engine binary. `MODEL.basalt` as the first argument stands for
 `--model MODEL.basalt`; `--python` picks the interpreter (default: `.venv/bin/python` in the source tree, else
-`python3`). Everything else goes to the server.
+`python3`; on Windows `.venv/Scripts/python.exe`, else `python`). Everything else goes to the server.
 
 There are two kinds of setting:
 
@@ -81,7 +81,7 @@ wins and is never changed.
 The engine prints one line naming only the picked settings, in the order above, and the server relays it once per start:
 
 ```
-[server] auto     peer-excl=off resident=51.2GB pool-affinity=all pool=15
+[server] auto     peer-excl=off resident=51.2GB pool-affinity=auto pool=15
 ```
 
 When every setting is given, no line is printed.
@@ -105,11 +105,11 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | `idle-unload` | seconds | off | Unload the model after this long without requests; the next request loads it again. Frees VRAM for other programs. |
 | `idle-sleep` | seconds | off | Put the model to sleep after this long without requests: its VRAM is freed, the process keeps its RAM copy, conversations and learned expert placement, and the next request wakes it in seconds. Linux only (the driver suspends the engine's GPU state); it stays awake when that state would not fit in the free RAM. [running](../running.md#sleep---idle-sleep) |
 | `min-free-vram-mib` | integer | off | Load an unloaded model only when this much VRAM is free, otherwise answer 503. Pairs with `lazy` and `idle-unload`. |
-| `grammar` | switch (`--no-grammar` or `grammar: false` turns it off) | on | Hold every tool call and JSON response format (`json_object`, `json_schema`) to its schema inside the engine, so a malformed call or object cannot be produced (as in llama.cpp's Qwen3-Coder parser, a call's required parameters may come in any order, each once, with up to six required ones permuted and more kept in declared order, followed by the optional ones in any order, which may repeat); the model's JSON is returned as it is generated, with no check after the fact. A request with `strict: true` gets the grammar even when this is off; with it off, any other JSON `response_format` (or Responses `text.format`, or Anthropic `output_config.format`) is refused with HTTP 400. Needs an engine that has `--grammar`; the server turns the engine's grammar support on whenever it has the flag. Works in batch slots: a slot's first pick the grammar refuses is resampled under the mask (the solo rule) and its window ends there. |
+| `grammar` | switch (`--no-grammar` or `grammar: false` turns it off) | on | Hold every tool call and JSON response format (`json_object`, `json_schema`) to its schema inside the engine, so a malformed call or object cannot be produced (as in llama.cpp's Qwen3-Coder parser, a call's required parameters may come in any order, each once, with up to six required ones permuted and more kept in declared order, followed by the optional ones in any order, which may repeat); the model's JSON is returned as it is generated, with no check after the fact. A JSON format sent together with tools (`tool_choice` auto) holds the answer to tool calls or the JSON value; a forced call holds it to the call. A request with `strict: true` gets the grammar even when this is off; with it off, any other JSON `response_format` (or Responses `text.format`, or Anthropic `output_config.format`) is refused with HTTP 400. Needs an engine that has `--grammar`; the server turns the engine's grammar support on whenever it has the flag. Works in batch slots: a slot's first pick the grammar refuses is resampled under the mask (the solo rule) and its window ends there. |
 | `debug` | switch | off | One log line per request and the raw model text after each reply. |
 | `request-lines` | switch | off | Echo the engine's per-request summary on stdout, for a supervisor that sees only that output. |
 | `temperature`, `top-p`, `top-k`, `min-p`, `presence-penalty`, `frequency-penalty`, `repetition-penalty`, `penalty-last-n`, `seed` | number (`top-k`, `penalty-last-n`, `seed`: integer) | the model file's `sampling` value, else the engine's | The sampling default for a request that leaves that field out, over the model file's. Same meaning and allowed values as the [model file's sampling keys](sampling.md#the-model-files-sampling-defaults). The server applies them to each request; the engine never sees them. |
-| `reasoning-budget-tokens` | integer | `0` (none) | The thinking budget for a request that names none (see [sampling](sampling.md#the-thinking-budget)). At the budget the thinking is closed and the answer starts. A request's own field wins, and `0` there disables budgeting. Positive budgets are also limited by `answer-room`. |
+| `reasoning-budget-tokens` | integer | `0` (none) | The thinking budget for a request that names none (see [sampling](sampling.md)). At the budget the thinking is closed and the answer starts. A request's own field wins, and `0` there disables budgeting. Positive budgets are also limited by `answer-room`. |
 | `thinking-loop-tokens` | integer | `256` | End the thinking, and let the model answer, when it repeats one token this many times in a row inside the thinking; `0` turns it off. See [Thinking loops](sampling.md#thinking-loops). |
 | `answer-room` | switch (`--no-answer-room` or `answer-room: false` turns it off) | on | Reserve space for closing the thinking and for the answer when the effective output cap is at least 1024 tokens. Applies to missing budgets and clamps positive budgets; an explicit request budget of `0` opts out. |
 | `tokenizer` | path | `pack/full/tokenizer` in the source tree (a byte tokenizer if absent) | Tokenizer directory. Mock engine only. |
@@ -140,7 +140,7 @@ Server options. Command line `--name`, config `server` block `"name"`.
 A server with `max-context` above 32768 has an elastic KV cache: each session backs its first 32768 cells at startup and
 takes more from the expert cache only when a request needs it. With `parallel`, each slot whose share is above 4096
 tokens does the same from 4096 cells, growing by 4096, and an idle conversation's KV moves to RAM once requests beside
-it have run 15 s. It is off with `kv-resident` or `vram-elastic`. See [running](../running.md#concurrent-requests---parallel-n).
+it have run 15 s. It is off with `kv-resident`, `vram-elastic` or a layer split. See [running](../running.md#concurrent-requests---parallel-n).
 
 ## Expert cache and memory
 
@@ -153,7 +153,8 @@ The model's experts live in VRAM (the expert cache), in RAM, or in the file. The
 | `resident-budget-gib` | engine | number GiB | auto when not set | Like `resident-experts` but with at most N GiB of experts in RAM, hottest first. Refused when it would leave less than the RAM floor free; the error names the largest safe value. |
 | `mmap-experts` | engine | switch | off | Opt out of the default resident RAM copy and back to a file mapping. Speed then depends on the OS page cache. |
 | `shared-expert-arena` | engine | file path | off | Back the resident arena with one shared file so several processes use one copy. Put it on `/dev/shm`. |
-| `expert-profile-save` | engine | file path | off | Save what the adaptive tier learned (experts in VRAM and routing counts) to this file on exit and periodically. A start that finds the file places it instead of the engine's profile, so the first request runs on what the last run learned: faster when the workload continues, slower when it changes ([adaptive tier](adaptive.md)). Needs the adaptive tier on. `tools/convert/convert.py --profile` reads it too. |
+| `expert-profile` | engine | file path | the engine's (`data/profiles/<model>.prof` in the source tree it was built from) | The expert profile a start places, in the format of `data/profiles`: which experts go to VRAM first. Set it to keep a binary's placement independent of its build folder, or to try another profile. A missing or empty file stops the start. |
+| `expert-profile-save` | engine | file path | off | Save what the adaptive tier learned (experts in VRAM and routing counts) to this file on exit and periodically. A start that finds the file places it instead of the engine's profile, so the first request runs on what the last run learned: faster when the workload continues, slower when it changes ([adaptive tier](adaptive.md)). Needs the adaptive tier on. |
 | `expert-profile-save-every` | engine | minutes | 10 (`0` = on exit only) | How often the profile is saved. |
 | `resident-cpu-experts` | engine | switch | off (implied by `resident-experts`) | With `mmap-experts` and an expert profile: keep the experts the GPU does not hold in ordinary RAM, so none is read from the file again. `resident-experts` is this with the copy page-locked when possible and the file mapping as a fallback when it does not fit. |
 | `vram-elastic` | engine | switch | off | Hold the expert cache in segments so `POST /v1/vram` can lend VRAM to other programs between requests. Works with `resident-experts`: a shrink first copies the experts it gives back into RAM, so none is read from the file, and is refused (nothing changed) when the RAM above the floor cannot hold them; a grow frees those copies. |
@@ -191,7 +192,7 @@ plain decoding would give.
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
 | `spec` | engine | integer | 8 with a drafter, else 0 | Verify windows of at most N tokens: the last accepted token plus up to N-1 drafts. `0` or `1` turns speculation off. |
-| `suffix-draft` | engine | integer tokens | 3 (`0` = MTP only) | Prompt lookup: when the text repeats an earlier stretch of the context by at least N tokens, the window may be filled from what followed it there, where the draft policy expects it to pay. |
+| `suffix-draft` | engine | integer tokens | 3 (`0` = MTP only) | Prompt lookup: when the text repeats an earlier stretch of the context by at least N tokens, the window may be filled from what followed it there, where the draft policy expects it to pay; such a window may be up to 2 tokens longer than `spec`, at most 8. |
 | `mtp-max-t` | engine | integer | 0 (= `spec`) | Caps the MTP's own windows; longer ones then come only from prompt lookup. |
 | `mtp-window` | engine | integer cells | 32768 (`0` = all) | The drafter attends to the last N cells. With `parallel`, each slot's draft K/V keeps only those and the 16384 before them (a turn rolled back), not the slot's whole context, and the rest of that VRAM holds expert slots. |
 | `relaxed-drafting` | engine (`[P]`) | `true`, or a number in (0, 1] | off | Optional, and it changes output. Under sampling, a draft the model gives probability P or more is kept even when the model's own draw would have been another token. Faster, but no longer the model's exact sampling distribution; lower P is faster and further from exact. Bare `true` or flag alone is 0.5. Greedy requests, `logit_bias`, JSON `response_format`, control tokens and tool calls stay exact. Single-stream only. Numbers: [precision](../precision/features.md#relaxed-drafting). |
@@ -233,7 +234,7 @@ Diagnostic flags: [diagnostics](diagnostics.md)
 ## Control vectors
 
 A control vector (a GGUF in llama.cpp's format) is added to the residual stream; with the server, a request switches it
-with `cvec` (0 or 1).
+with `experimental_speed_projection` (`true` or `false`).
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
