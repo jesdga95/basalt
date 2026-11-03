@@ -6,14 +6,23 @@ Unreadable values are None and never stop the server.
 from __future__ import annotations
 
 import collections
+import contextlib
 import ctypes
+import importlib
 import os
 import platform
 import sys
 import threading
 import time
+from typing import Any, cast
 
 HISTORY = 60
+
+
+def _call(obj, name: str):
+    """`obj.name()` where the object has one, else None: an older driver may not answer at all."""
+    fn = getattr(obj, name, None) if obj is not None else None
+    return fn() if callable(fn) else None
 
 
 # ------------------------------------------------------------------------------------------------ NVML
@@ -25,8 +34,9 @@ class _Nvml:
         _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
 
     def __init__(self, index=0):
-        self.lib = self.dev = None
-        names = ["libnvidia-ml.so.1", "libnvidia-ml.so"]
+        self.lib: Any = None                   # a loaded libnvidia-ml, whose functions are named at call time
+        self.dev: Any = None
+        names = ["libnvidia-ml.so.1", "libnvidia-ml.so", "nvml.dll"]   # Linux's soname, then Windows' DLL
         for n in names:
             try:
                 self.lib = ctypes.CDLL(n)
@@ -52,6 +62,10 @@ class _Nvml:
     def ok(self):
         return self.lib is not None and self.dev is not None
 
+    def _fn(self, name: str):
+        """The NVML function `name`, or None when this driver does not have it."""
+        return getattr(self.lib, name, None) if self.lib is not None else None
+
     def _uint(self, fn, *args):
         v = ctypes.c_uint()
         try:
@@ -60,18 +74,24 @@ class _Nvml:
             return None
 
     def name(self):
+        fn = self._fn("nvmlDeviceGetName")
+        if fn is None:
+            return None
         buf = ctypes.create_string_buffer(96)
         try:
-            if self.lib.nvmlDeviceGetName(self.dev, buf, ctypes.c_uint(96)) == 0:
+            if fn(self.dev, buf, ctypes.c_uint(96)) == 0:
                 return buf.value.decode(errors="replace")
         except (AttributeError, OSError):
             pass
         return None
 
     def driver_version(self):
+        fn = self._fn("nvmlSystemGetDriverVersion")
+        if fn is None:
+            return None
         buf = ctypes.create_string_buffer(96)
         try:
-            if self.lib.nvmlSystemGetDriverVersion(buf, ctypes.c_uint(96)) == 0:
+            if fn(buf, ctypes.c_uint(96)) == 0:
                 return buf.value.decode(errors="replace")
         except (AttributeError, OSError):
             pass
@@ -91,14 +111,16 @@ class _Nvml:
     def read(self):
         out = {}
         u = self.Util()
+        usage = self._fn("nvmlDeviceGetUtilizationRates")
         try:
-            if self.lib.nvmlDeviceGetUtilizationRates(self.dev, ctypes.byref(u)) == 0:
+            if usage is not None and usage(self.dev, ctypes.byref(u)) == 0:
                 out["util"] = u.gpu
         except (AttributeError, OSError):
             pass
         m = self.Mem()
+        info = self._fn("nvmlDeviceGetMemoryInfo")
         try:
-            if self.lib.nvmlDeviceGetMemoryInfo(self.dev, ctypes.byref(m)) == 0:
+            if info is not None and info(self.dev, ctypes.byref(m)) == 0:
                 out["mem_used"], out["mem_total"] = m.used, m.total
         except (AttributeError, OSError):
             pass
@@ -124,10 +146,21 @@ def gpu_reader(index=0):
 
 # ------------------------------------------------------------------------------------------------ CPU / RAM
 def _cpu_name():
-    if os.path.exists("/proc/cpuinfo"):
-        for line in open("/proc/cpuinfo", encoding="utf-8", errors="replace"):
-            if line.startswith("model name"):
-                return line.split(":", 1)[1].strip()
+    """The CPU's name: /proc/cpuinfo on Linux, the registry on Windows, else whatever platform reports."""
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    try:
+        winreg = cast(Any, importlib.import_module("winreg"))   # present on Windows only
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
+            return str(winreg.QueryValueEx(k, "ProcessorNameString")[0]).strip()
+    except (ImportError, OSError):
+        pass
     return platform.processor() or None
 
 
@@ -139,8 +172,9 @@ class _CpuRamFallback:
 
     def _times(self):
         try:
-            f = [int(x) for x in open("/proc/stat").readline().split()[1:]]
-            return f[3] + f[4], sum(f)
+            with open("/proc/stat", encoding="utf-8") as f:
+                fields = [int(x) for x in f.readline().split()[1:]]
+            return fields[3] + fields[4], sum(fields)
         except (OSError, ValueError):
             return None
 
@@ -154,7 +188,8 @@ class _CpuRamFallback:
     @staticmethod
     def ram():
         try:
-            info = dict(line.split(":", 1) for line in open("/proc/meminfo"))
+            with open("/proc/meminfo", encoding="utf-8") as f:
+                info = dict(line.split(":", 1) for line in f)
             total = int(info["MemTotal"].split()[0]) * 1024
             avail = int(info["MemAvailable"].split()[0]) * 1024
             return total - avail, total
@@ -166,7 +201,7 @@ class _CpuRamFallback:
 GPU_KEYS = ("util", "mem_used", "mem_total", "temp", "power", "power_limit", "pcie_gen", "pcie_gen_max", "pcie_width",
             "pcie_rx_mb", "pcie_tx_mb")
 SERIES = ("tok_s", "prefill_tok_s_mean")      # series kept as history
-GPU_SERIES = ("util", "power", "temp")         # per-card series kept as history
+GPU_SERIES = ("util", "power", "temp", "mem_used")   # per-card series kept as history
 
 
 def _r2(v):
@@ -180,7 +215,8 @@ class Telemetry:
         driver_version(), cuda_version()."""
         self.extra = extra
         self.lock = threading.Lock()
-        self.now: dict = {"gpus": [], "cpu": None, "ram_used": None, "ram_total": None, "disk_read_mb": None}
+        self.now: dict = {"gpus": [], "cpu": None, "ram_used": None, "ram_total": None,
+                          "disk_read_mb": None, "disk_write_mb": None}
         self.hist = {k: collections.deque(maxlen=HISTORY) for k in SERIES}
         self.slot_hist = collections.deque(maxlen=HISTORY)     # per sample: each slot's tok/s
         self.gpus = [(i, g) for i, g in ((i, gpu_factory(i)) for i in dict.fromkeys(gpu_indices or [0])) if g.ok()]
@@ -189,7 +225,7 @@ class Telemetry:
             import psutil  # noqa: F401
             self.ps = sys.modules["psutil"]
         except ImportError:
-            self.ps = None
+            self.ps: Any = None                    # the psutil module when it is installed; a test may substitute a fake
         self.fallback = _CpuRamFallback()
         first = self.gpus[0][1] if self.gpus else None
         self.static = {
@@ -197,28 +233,30 @@ class Telemetry:
             "cpu_name": _cpu_name(),
             "cores": (self.ps.cpu_count(logical=False) if self.ps else None) or None,
             "threads": os.cpu_count(),
-            "driver": first.driver_version() if hasattr(first, "driver_version") else None,
-            "cuda": first.cuda_version() if hasattr(first, "cuda_version") else None,
+            "driver": _call(first, "driver_version"),
+            "cuda": _call(first, "cuda_version"),
         }
         self._disk_prev = None
         threading.Thread(target=self._loop, daemon=True).start()
 
     def _disk(self):
-        """Disk read MB/s since the last call; None without psutil or on the first call."""
+        """(read, write) MiB/s since the last call; None without psutil or on the first call."""
         if not self.ps:
-            return None
+            return None, None
         try:
             c = self.ps.disk_io_counters()
         except (OSError, RuntimeError):
-            return None
+            return None, None
         t = time.time()
-        prev, self._disk_prev = self._disk_prev, (t, c.read_bytes)
+        prev, self._disk_prev = self._disk_prev, (t, c.read_bytes, c.write_bytes)
         if prev is None or t <= prev[0]:
-            return None
-        return (c.read_bytes - prev[1]) / (t - prev[0]) / 2**20
+            return None, None
+        span = t - prev[0]                           # seconds; the bytes below are what moved in them
+        mib = 2 ** 20
+        return (c.read_bytes - prev[1]) / span / mib, (c.write_bytes - prev[2]) / span / mib
 
     def sample(self):
-        s = {"gpus": []}
+        s: dict = {"gpus": []}
         for i, g in self.gpus:
             try:
                 r = g.read()
@@ -236,12 +274,10 @@ class Telemetry:
         else:
             s["cpu"] = self.fallback.cpu()
             s["ram_used"], s["ram_total"] = self.fallback.ram()
-        s["disk_read_mb"] = self._disk()
+        s["disk_read_mb"], s["disk_write_mb"] = self._disk()
         if self.extra:
-            try:
+            with contextlib.suppress(Exception):     # telemetry must never take the server down
                 s.update(self.extra())
-            except Exception:  # noqa: BLE001
-                pass
         return s
 
     def record(self, s: dict) -> None:

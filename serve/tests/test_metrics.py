@@ -13,6 +13,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from unittest import mock
+
 from serve.util import telemetry
 from serve.frontend import ChatTemplate
 from serve.util.logbuf import LogBuffer
@@ -75,16 +77,17 @@ class Http(unittest.TestCase):
     def test_the_contract(self):
         code, m = self.call("/metrics")
         self.assertEqual(code, 200)
-        self.assertEqual(set(m), {"engine", "live", "requests", "best", "hardware", "hardware_static", "history"})
+        self.assertEqual(set(m), {"engine", "live", "requests", "best", "totals", "conversation", "hardware",
+                                  "hardware_static", "history"})
         self.assertEqual(m["best"], {})
         self.assertEqual((m["engine"]["model"], m["engine"]["max_context"]), (self.svc.model, 16384))
         self.assertEqual((m["engine"]["version"], m["engine"]["kv"], m["engine"]["expert_slots"]), ("1.2.3", "fp8", 100))
         self.assertEqual(set(m["live"]), {"state", "load", "queued", "slots", "queue", "prompt_tokens", "generated", "elapsed_s",
-                                          "tok_s", "prefill_tok_s_mean"})
+                                          "tok_s", "phase", "prefill_tok_s_mean"})
         self.assertEqual(m["live"]["queue"], [])
         self.assertEqual((m["live"]["state"], m["live"]["queued"]), ("idle", 0))
         self.assertEqual(m["requests"], [])
-        self.assertEqual(set(m["hardware"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb"})
+        self.assertEqual(set(m["hardware"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb", "disk_write_mb"})
         self.assertIsInstance(m["hardware"]["gpus"], list)
         self.assertEqual(set(m["hardware_static"]), {"gpus", "cpu_name", "cores", "threads", "driver", "cuda"})
         self.assertEqual(set(m["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
@@ -210,6 +213,41 @@ class FakeGpu:
                 "pcie_width": 16, "pcie_rx_mb": 1.5, "pcie_tx_mb": 0.5, "unlisted": 1}
 
 
+class DiskRates(unittest.TestCase):
+    """A disk rate is the bytes that moved over the seconds between two readings, in MiB/s."""
+
+    class Ps:
+        def __init__(self, read: int, write: int):
+            self.read_bytes, self.write_bytes = read, write
+
+        def disk_io_counters(self):
+            return self
+
+    def reading(self, first, second, seconds):
+        """The rate between a reading of `first` at t=100 and one of `second` `seconds` later."""
+        tel = Telemetry.__new__(Telemetry)               # no sampler thread for a unit test
+        tel.ps, tel._disk_prev = self.Ps(*first), (100.0, *first)
+        tel.ps = self.Ps(*second)
+        with mock.patch.object(telemetry.time, "time", return_value=100.0 + seconds):
+            return tel._disk()
+
+    def test_rates_are_mebibytes_per_second(self):
+        mib = 2 ** 20
+        self.assertEqual(self.reading((0, 0), (8 * mib, 3 * mib), 2.0), (4.0, 1.5))
+        # 25.4 GiB read in 3.5 s is a page-cache miss on a fast disk, not a million
+        self.assertEqual(self.reading((0, 0), (26 * 1024 * mib, 0), 3.5), (26 * 1024 / 3.5, 0.0))
+
+    def test_a_first_reading_has_no_rate(self):
+        tel = Telemetry.__new__(Telemetry)
+        tel.ps, tel._disk_prev = self.Ps(5, 5), None
+        self.assertEqual(tel._disk(), (None, None))
+
+    def test_without_psutil_there_is_no_rate(self):
+        tel = Telemetry.__new__(Telemetry)
+        tel.ps, tel._disk_prev = None, None
+        self.assertEqual(tel._disk(), (None, None))
+
+
 class PerGpu(unittest.TestCase):
     def telemetry(self, indices, factories=None):
         factories = factories or {}
@@ -237,7 +275,7 @@ class PerGpu(unittest.TestCase):
         self.assertEqual((snap["static"]["driver"], snap["static"]["cuda"]), ("610.57.04", "13.3"))
         self.assertEqual(set(snap["static"]), {"gpus", "cpu_name", "cores", "threads", "driver", "cuda"})
         self.assertEqual(set(snap["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
-        self.assertEqual(set(snap["now"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb"})
+        self.assertEqual(set(snap["now"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb", "disk_write_mb"})
 
     def test_history_keeps_the_speeds_slots_and_cards(self):
         tel = Telemetry(extra=lambda: {"tok_s": 12.3456, "prefill_tok_s_mean": None, "tok_s_mean": 9,
