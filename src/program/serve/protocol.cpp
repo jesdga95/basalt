@@ -258,8 +258,7 @@ int Runtime::announce() {
     {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        // "Experts in VRAM" is every tier, not one card's.  The tiers are disjoint by construction
-        // (remote_experts.cpp skips any pair a stage already claimed), so they add.
+        // "Experts in VRAM" is every stage's cache, not one card's.  The caches hold disjoint pairs, so they add.
         const int64_t slots_primary = (int64_t) xcache.slots();
         const int64_t mib_primary = (int64_t) (xcache.bytes() >> 20);
         int64_t slots_all = slots_primary, mib_all = mib_primary;
@@ -267,11 +266,6 @@ int Runtime::announce() {
             slots_all += (int64_t) st->cache.slots();
             mib_all += (int64_t) (st->cache.bytes() >> 20);
         }
-        for (int r = 0; r < 3; ++r)
-            if (o.expert_cache_remote[(size_t) r] > 0) {
-                slots_all += remote_experts[(size_t) r].resident();
-                mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
-            }
         // the pack's quantization label (the last word of its name, without the publisher's prefixes) and the PCI
         // bus ids of the cards this engine computes on, primary first: what a benchmark row records
         std::string quant_label, gpu_ids;

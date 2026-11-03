@@ -51,8 +51,6 @@ int dispatch(Context& context) {
     auto& arena_src = *context.arena_src;
     auto& srcp = *context.srcp;
     auto& xcache = *context.xcache;
-    auto& remote_experts = *context.remote_experts;
-    auto& remote_opt = *context.remote_opt;
     auto& peer = *context.peer;
     auto& xpeers = *context.xpeers;
     auto& drive = *context.drive;
@@ -90,7 +88,6 @@ int dispatch(Context& context) {
                 const size_t i = (size_t) (l * g.n_expert + e);
                 bool on_gpu = (i < host_res.size() && host_res[i] >= 0);
                 for (const auto& st : stages) on_gpu = on_gpu || st->cache.slot_of(l, e) >= 0;
-                for (const auto& r : remote_experts) on_gpu = on_gpu || (r.resident() > 0 && r.owns((int64_t) i));
                 bool on_peer = peer.valid() && peer.has(l, e);
                 for (const auto& xpe : xpeers) on_peer = on_peer || (xpe->valid() && xpe->has(l, e));
                 if (on_gpu) b_vram += blob;
@@ -174,8 +171,6 @@ int dispatch(Context& context) {
             .src = src,
             .srcp = srcp,
             .xcache = xcache,
-            .remote_experts = remote_experts,
-            .remote_opt = remote_opt,
             .peer = peer,
             .xpeers = xpeers,
             .drive = drive,

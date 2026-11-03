@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -21,7 +20,6 @@ namespace basalt::kernels {
 class PleTable;
 namespace cpu { class ExpertPool; }
 }
-namespace basalt::core { class RemoteExperts; }
 
 namespace basalt::program::cli {
 
@@ -32,7 +30,6 @@ struct StatsReport {
     const basalt::kernels::cpu::ExpertPool& pool;
     const basalt::kernels::PleTable& ple_table;
     const basalt::core::ExpertSource* srcp;
-    const std::array<basalt::core::RemoteExperts, 3>& remote_experts;
     const basalt::core::ExpertCache& xcache;
     const basalt::core::TokenGraph& tgraph;
     const basalt::core::SessionGraphs& gr;

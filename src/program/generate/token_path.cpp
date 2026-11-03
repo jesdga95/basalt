@@ -20,8 +20,6 @@ int token_path(Context& context) {
     auto& d_logits = *context.d_logits;
     auto& srcp = *context.srcp;
     auto& xcache = *context.xcache;
-    auto& remote_experts = *context.remote_experts;
-    auto& remote_opt = *context.remote_opt;
 
     // ---- Multi-GPU: the second GPU's expert tier (filled after the RAM complement below, from it), and the further
     // cards' tiers beside it
@@ -32,10 +30,7 @@ int token_path(Context& context) {
         return 1;
     }
 
-    if (remote_opt && !remote_opt->init(err)) { basalt::log::error("basalt generate", "%s", err.c_str()); return 1; }
     Drive drive;
-    for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
-        drive.d.remote[drive.d.remote_count++] = &remote_experts[(size_t) r];
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);

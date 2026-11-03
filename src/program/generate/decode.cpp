@@ -20,7 +20,6 @@ int decode(Context& context) {
     auto& src = *context.src;
     auto& srcp = *context.srcp;
     auto& xcache = *context.xcache;
-    auto& remote_experts = *context.remote_experts;
     auto& drive = *context.drive;
     auto& routing = *context.routing;
     auto& gr = *context.gr;
@@ -339,7 +338,7 @@ int decode(Context& context) {
     cli::print_stats({
         .o = o, .g = g, .drive = drive,
         .pool = pool, .ple_table = ple_table, .srcp = srcp,
-        .remote_experts = remote_experts, .xcache = xcache, .tgraph = tgraph,
+        .xcache = xcache, .tgraph = tgraph,
         .gr = gr, .decode_ms = decode_ms, .phase_tokens = phase_tokens,
         .ms_ple = ms_ple, .ms_embed = ms_embed, .ms_layers = ms_layers,
         .ms_head = ms_head, .ms_readback = ms_readback, .ms_sample = ms_sample

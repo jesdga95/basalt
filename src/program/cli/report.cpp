@@ -3,7 +3,6 @@
 #include "../engine_local.hpp"
 #include "basalt/core/expert_source.hpp"
 #include "basalt/core/mtp.hpp"
-#include "basalt/core/remote_experts.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/program/options.hpp"
 
@@ -18,7 +17,7 @@ void print_routing_dump(const std::string& path, int64_t records) {
 }
 
 void print_stats(const StatsReport& report) {
-    const auto& [o, g, drive, pool, ple_table, srcp, remote_experts, xcache, tgraph, gr, decode_ms,
+    const auto& [o, g, drive, pool, ple_table, srcp, xcache, tgraph, gr, decode_ms,
                  phase_tokens, ms_ple, ms_embed, ms_layers, ms_head, ms_readback, ms_sample] = report;
     if (o.stats) {
         std::printf("%-24s %.3f ms/token (WALL CLOCK: embed, layers, head, sample)\n", "  per token", decode_ms);
@@ -43,9 +42,6 @@ void print_stats(const StatsReport& report) {
                     "  the CPU expert pool", pool_positions > 0.0 ? drive.cpu_ms / pool_positions : 0.0,
                     (long long) g.n_layers, pool_positions, (long long) drive.calls);
         std::printf("%-24s %lld blobs read\n", "  expert blobs", (long long) srcp->reads());
-        for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
-            std::printf("  CUDA%d experts           %lld routed entries computed\n",
-                        r + 1, (long long) remote_experts[(size_t) r].computed());
         // ---- **R4's DISPATCH MEASUREMENT: h, ON THE ENGINE'S OWN ROUTING.**  No offline trace, no corpus
         // question, no k-fold - these are the ids the router actually produced on this run.  Reported as
         // hits/lookups so it can be read directly as the h the cache would deliver, and alongside `refused`

@@ -264,16 +264,6 @@ Flow Request::complete() {
     if (sfx_windows > 0)
         basalt::log::info("basalt serve", "suffix drafts: %lld windows, %lld of %lld drafts accepted",
                      (long long) sfx_windows, (long long) sfx_ok, (long long) sfx_drafts);
-    for (int r = 0; r < 3; ++r) if (runtime_.o.expert_cache_remote[(size_t) r] > 0)
-        basalt::log::info("basalt serve", "CUDA%d: %lld expert entries, %lld active layer launches, %.1f MiB returned "
-                             "(%.1f MiB with full rows) in this request; host %.0f ms staging+launching, %.0f ms "
-                             "waiting for it in this request", r + 1,
-                     (long long) (runtime_.remote_experts[(size_t) r].computed() - remote_before[(size_t) r]),
-                     (long long) (runtime_.remote_experts[(size_t) r].launched_layers() - launches_before[(size_t) r]),
-                     (double) (runtime_.remote_experts[(size_t) r].returned_bytes() - compact_before[(size_t) r]) / 1048576.0,
-                     (double) (runtime_.remote_experts[(size_t) r].full_row_bytes() - full_before[(size_t) r]) / 1048576.0,
-                     runtime_.remote_experts[(size_t) r].ms_begin() - begin_before[(size_t) r],
-                     runtime_.remote_experts[(size_t) r].ms_wait() - wait_before[(size_t) r]);
 
     return Flow::next;
 }

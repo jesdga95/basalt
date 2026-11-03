@@ -2,7 +2,6 @@
 #include "expert_plan.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/verify.hpp"
-#include "basalt/core/remote_expert_opt.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/dec_gdn.hpp"

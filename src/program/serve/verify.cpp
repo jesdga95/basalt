@@ -73,7 +73,6 @@ int Runtime::init_verify() {
                 vs.blob = thits.blob;
                 vs.slot_off = gs.cache.slot_offsets();
                 vs.n_slots = gs.cache.slots();
-                gs.ver.set_remote_expert_opt(remote_opt.get());
                 ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, std::max({o.spec, o.batch, 2}), err);
                 split_drive.cache_base[st] = gs.cache.device_slot(0);
                 split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
@@ -112,7 +111,6 @@ int Runtime::init_verify() {
             vs.blob = thits.blob;
             vs.slot_off = gs.cache.slot_offsets();
             vs.n_slots = gs.cache.slots();
-            gs.ver_b.set_remote_expert_opt(remote_opt.get());
             if (!gs.ver_b.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, std::max({o.spec, o.batch, 2}), err)) {
                 basalt::log::error("basalt serve", "pipelined windows, stage 2: %s", err.c_str());
                 return 1;
@@ -129,7 +127,6 @@ int Runtime::init_verify() {
     }
     ver.set_route_tail_skip(o.route_tail_skip);
     ver.set_route_prior(o.route_prior);
-    ver.set_remote_expert_opt(remote_opt.get());
     ver.set_main_priority(o.batch > 0);   // beside a prompt read the slots' windows must win the SMs
     if (peer.valid()) ver.set_peer(&peer);   // the window drives the peer tier itself
     for (const auto& xpe : xpeers)

@@ -2,6 +2,32 @@
 
 namespace basalt::program::generate {
 
+namespace {
+// Creates the stage device's context before the host arena registers pinned memory; spin scheduling and mapped host
+// memory must be set before the context exists.
+bool stage_preflight(int device, std::string& err) {
+    const auto fail = [&](const char* what, cudaError_t e) {
+        err = "CUDA" + std::to_string(device) + ": " + what + ": " + cudaGetErrorString(e);
+        return false;
+    };
+    int count = 0;
+    if (const cudaError_t e = cudaGetDeviceCount(&count); e != cudaSuccess) return fail("cudaGetDeviceCount", e);
+    if (device < 1 || device >= count) {
+        err = "CUDA" + std::to_string(device) + ": CUDA device is not visible";
+        return false;
+    }
+    cudaInitDevice(device, cudaDeviceScheduleSpin | cudaDeviceMapHost, 0);
+    cudaGetLastError();
+    int previous = -1;
+    if (const cudaError_t e = cudaGetDevice(&previous); e != cudaSuccess) return fail("cudaGetDevice", e);
+    if (const cudaError_t e = cudaSetDevice(device); e != cudaSuccess) return fail("cudaSetDevice", e);
+    size_t free_bytes = 0, total_bytes = 0;
+    const cudaError_t e = cudaMemGetInfo(&free_bytes, &total_bytes);
+    cudaSetDevice(previous);
+    return e == cudaSuccess ? true : fail("preflight free memory", e);
+}
+} // namespace
+
 int sessions(Context& context) {
     auto& o = *context.o;
     auto& srcs = *context.srcs;
@@ -12,7 +38,6 @@ int sessions(Context& context) {
     auto& split_same = *context.split_same;
     auto& multi_gpu = *context.multi_gpu;
     auto& pipe_want = *context.pipe_want;
-    auto& remote_dev = *context.remote_dev;
     auto& err = *context.err;
     auto& g = *context.g;
     auto& K = *context.K;
@@ -36,10 +61,7 @@ int sessions(Context& context) {
         stages.push_back(std::make_unique<GpuStage>());
         GpuStage& st = *stages.back();
         st.dev = split_devs[i];
-        double free_gib = 0;
-        if (!basalt::core::RemoteExperts::preflight(st.dev, free_gib, err)) {
-            return fatal_start_error(err);
-        }
+        if (!stage_preflight(st.dev, err)) return fatal_start_error(err);
         const basalt::core::OnDevice on(st.dev);
         std::set<std::string> skip_s = skip_base;
         uint64_t pool_s = pool_bytes;
@@ -403,16 +425,6 @@ int sessions(Context& context) {
         (void) cudaGetLastError();
         basalt::log::error("basalt generate", "the logits buffer failed%s", vram_free_note().c_str());
         return 1;
-    }
-    // Create the additional contexts after MTP has secured CUDA0 memory, but
-    // before the host arena maps its expert pages into their address spaces.
-    for (int r = 1; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
-        double free_gib = 0;
-        if (!basalt::core::RemoteExperts::preflight(remote_dev[r], free_gib, err)) {
-            return fatal_start_error(err);
-        }
-        basalt::log::info("basalt generate", "CUDA%d context ready, %.2f GiB free before expert arena registration",
-                     remote_dev[r], free_gib);
     }
 
 
