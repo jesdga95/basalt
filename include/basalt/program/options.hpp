@@ -101,8 +101,8 @@ struct Options {
     /// the prompt path's rows per layer the peer computes: -1 = half of chunk x top-k, 0 = the prompt path stays on
     /// the primary
     int64_t peer_prefill_rows = -1;
-    /// The engine's expert profile for the model (data/profiles/<key>.prof, cli::profile_key), or the
-    /// --expert-profile-save file a start places from; empty means none.  A profile decides residency by routing
+    /// The engine's expert profile for the model (--expert-profile, else data/profiles/<key>.prof, cli::profile_key),
+    /// or the --expert-profile-save file a start places from; empty means none.  A profile decides residency by routing
     /// frequency instead of by first use.
     std::string expert_profile;
     /// --serve (opt-in): where to save what the adaptive tier learned, as a profile (the resident experts first,
