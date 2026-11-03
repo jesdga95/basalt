@@ -123,21 +123,31 @@ Each request ends with one slot-tagged `done` line:
 ## The stats page
 
 The server's own address (`stats` on the `[server] ready` line above) serves one page that reads `/metrics`, `/slots` and `/api/logs`
-once a second:
+once a second. Its header names the build (`v0.2.0 · NVFP4 · 262k`), and hovering the model name shows the model file.
 
+- Model state: Idle, Reading, Generating and Error with the current one lit (Unloaded, Loading and Asleep only while a
+  `--lazy`, `--idle-unload` or `--idle-sleep` server is in one), and what it is doing now (tokens generated against the ask,
+  prompt tokens being read, or the loading percentage) on a bar.
+- Context: a donut of the fullest slot's window, then the experts in VRAM, system RAM and GPU temperature.
 - GPUs: every card the engine uses, with VRAM and 60 s charts of load and power (one card adds temperature; three or
-  more cards are a table with a chart of their mean load and total power). System: CPU, RAM, disk reads, driver and
-  CUDA. Experts: where the last request's routed lookups were served (VRAM, peer card, CPU).
+  more cards are a table with a chart of their mean load and total power). System: CPU, RAM, disk reads and writes,
+  driver and CUDA. Experts: where the last request's routed lookups were served (VRAM, peer card, CPU).
 - Speed: decode and prefill rates with 60 s charts (one line per slot with `--parallel`), the last prompt and its prefix
   cache hit, and the fastest whole request since the server started (at least 256 output tokens for decode, 4096
   newly read prompt tokens for prefill).
 - Slots (with `--parallel`): each busy slot's rate, output against its limit, context, time to first token, prefix
-  hit and tokens per window; Accept is the slot's last finished request. Requests: the newest finished requests.
-  Queue: the requests waiting for a slot or for the single stream.
-- Logs: the console lines.
+  hit and tokens per window; Accept is the slot's last finished request. Requests: the newest finished requests with
+  prompt and cached tokens, output, time to first token, rate, expert-cache hit, PCIe share and duration, then what has
+  been served since the server started. A row opens that request's own timings (click, Enter or Space; Esc closes),
+  whose Copy JSON button copies the whole record. Queue: the requests waiting for a slot or for the single stream.
+  Columns the card is too narrow for are dropped rather than clipped, so the table never scrolls sideways.
+- Conversation cache: the budget and how much of it is parked, how much of the last prompt came from the cache, and the
+  mean reuse over the recent requests.
+- Logs: the console lines, filtered by level, with a run of identical lines collapsed into one and counted.
 
 `/metrics` carries the history behind the charts in `history` (`tok_s`, `prefill_tok_s_mean`, `slot_tok_s` one series
-per slot, `gpus` with `util`, `power` and `temp` per card) and the fastest requests in `best`.
+per slot, `gpus` with `util`, `power`, `temp` and `mem_used` per card), the fastest requests in `best`, and the session's
+`totals` (`requests`, `prompt`, `reused`, `written` and the milliseconds behind them).
 
 ## Conversations on disk: `--conversation-cache-disk-mib`
 
