@@ -558,8 +558,12 @@ add_library(tokenizer STATIC src/program/tokenizer/bpe.cpp src/program/tokenizer
             src/program/tokenizer/unicode_flags.cpp)
 target_include_directories(tokenizer PUBLIC include PRIVATE src/program/tokenizer)
 target_link_libraries(tokenizer PRIVATE warnings)
-add_executable(tokenizer_test tests/program/tokenizer_test.cpp)
-target_link_libraries(tokenizer_test PRIVATE tokenizer warnings)
+# built from the tokenizer sources with the standard library range checks on, so an out-of-range index aborts the test
+add_executable(tokenizer_test tests/program/tokenizer_test.cpp src/program/tokenizer/bpe.cpp
+               src/program/tokenizer/pretok_qwen35.cpp src/program/tokenizer/unicode_flags.cpp)
+target_include_directories(tokenizer_test PRIVATE include src/program/tokenizer)
+target_compile_definitions(tokenizer_test PRIVATE _GLIBCXX_ASSERTIONS)
+target_link_libraries(tokenizer_test PRIVATE warnings)
 basalt_embed_manifest(tokenizer_test)
 add_executable(tokenizer_bench tests/program/tokenizer_bench.cpp)
 target_link_libraries(tokenizer_bench PRIVATE tokenizer warnings)
