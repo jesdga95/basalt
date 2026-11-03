@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Basalt is a local inference engine for the Qwen3.8-Flash-Next mixture-of-experts model, built for NVIDIA Blackwell (sm_120) on Linux and Windows x64. It runs on an NVIDIA Blackwell GPU, optionally with a second GPU as a peer expert tier, and system RAM holding the rest. It is a fork of Strata (MIT): the C++/CUDA engine is in `src/` and `include/`, and the Python server with an OpenAI- and Anthropic-compatible API is in `serve/`.
+Basalt is a local inference engine for the Qwen3.8-Flash-Next mixture-of-experts model, built for NVIDIA Blackwell (sm_120) on Linux and Windows x64, and for the RTX Spark's integrated Blackwell GPU (sm_121) on Windows on Arm64. It runs on an NVIDIA Blackwell GPU, optionally with a second GPU as a peer expert tier, and system RAM holding the rest. It is a fork of Strata (MIT): the C++/CUDA engine is in `src/` and `include/`, and the Python server with an OpenAI- and Anthropic-compatible API is in `serve/`.
 
 ## Working rules
 
@@ -13,7 +13,7 @@ Basalt is a local inference engine for the Qwen3.8-Flash-Next mixture-of-experts
 - **Don't push or publish anywhere** (GitHub, HF, any remote) without the maintainer's approval.
 - **Don't write tools nobody asked for.**
 - **No shims for removed things.** A removed or renamed flag, option, field or code path is simply gone: no alias, no fallback, no "was retired" message or list. The normal unknown-flag error covers it.
-- **Linux and Windows are both supported; Linux is where we test, and CI compiles and CPU-tests Windows.** Changes must not remove the platform seams (`src/platform/`, CMake `if(WIN32)`); see `CONTRIBUTING.md` and `docs/platforms.md`.
+- **Linux and Windows are both supported; Linux is where we test, and CI compiles and CPU-tests Windows.** Changes must not remove the platform seams (`src/platform/`, CMake `if(WIN32)`) or the per-architecture CPU kernels (`cmake/target_arch.cmake`, `platform::kX86`); see `CONTRIBUTING.md` and `docs/platforms.md`.
 - **Headline benchmark numbers come from the maintainer's own runs.** Agent benches are development A/Bs only. Label every number with its GPU power limit.
 - **Quality gate:** PPL/KLD against the BF16 reference (`docs/precision/quality.md#the-bf16-reference`), through the decode path (`basalt-bench --quality`). Byte identity with old output is not required, but say whenever numerics change. Bitwise-neutral refactors need only the greedy-identity check.
 - **Keep `docs/precision/` current.** Any engine change that can alter precision (weight formats, activation or accumulation types, KV/state formats, reduction order, decode or MTP paths) updates the page that covers it in the same change, with fresh numbers where it quotes them.

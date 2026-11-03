@@ -1,7 +1,8 @@
 <p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png"><img src="assets/basalt-lockup-light.png" alt="Basalt" width="480"></picture></p>
 
 Basalt is a local inference engine for the **Qwen3.8-Flash-Next** mixture-of-experts model.
-It runs on Linux and Windows with an NVIDIA Blackwell GPU (sm_120); see [platforms](docs/platforms.md) for limitations.
+It runs on Linux and Windows with an NVIDIA Blackwell GPU (sm_120), and on Windows on Arm with the RTX Spark's
+integrated Blackwell GPU (sm_121); see [platforms](docs/platforms.md) for limitations.
 
 Experts that do not fit in VRAM live in system RAM, and optionally on a second GPU used as a peer expert tier.
 A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compatible API.
@@ -13,6 +14,7 @@ A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compa
 ## Requirements
 
 - Linux x86-64 with AVX2 (AVX-512 is used when present), and an NVIDIA Blackwell GPU (compute capability 12.0) with CUDA 13.
+  Windows x64, and Windows on Arm64 with an RTX Spark (compute capability 12.1): see [platforms](docs/platforms.md).
 - CMake 3.24 or newer, a C++20 compiler, and Python 3.10 or newer.
 - Enough system RAM to hold the experts that do not fit in VRAM.
 

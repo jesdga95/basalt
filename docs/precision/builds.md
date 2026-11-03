@@ -1,6 +1,7 @@
 # Precision across builds
 
-Compiler parity between the Linux and Windows builds, and how to reproduce the numbers in this folder.
+Compiler parity between the Linux and Windows builds, the Arm64 build's kernels, and how to reproduce the numbers in
+this folder.
 
 ## Compiler parity
 
@@ -61,6 +62,33 @@ python3 -c "import sys; sys.path.insert(0,'tools'); from model_file import Model
 ./expert_parity --file experts.bin
 ./pool_test --file experts.bin
 ```
+
+## The Arm64 build
+
+The Windows on Arm build (MSVC 19.51, on an RTX Spark's N1X) replaces the AVX2 / AVX-512 CPU kernels with NEON ones
+that use the dot product: the Q2_0 expert kernel (`expert_neon.cpp`), the ggml dot products
+(`ggml/ggml_cpu_dots_neon.c`, llama.cpp's Arm kernels with Basalt's NVFP4 scale), the router warm-up dot and the vision
+encoder's CPU GEMM. They sum in their own order, so the CPU tier's rows differ from the x86 builds' within the same
+tolerances. The GPU kernels are the same source, built for compute capability 12.1. The programs above on the same
+expert section, and `native_expert_parity` on the NVFP4 pack's layer 0:
+
+| check | MSVC 19.51 (Windows on Arm64) |
+| --- | --- |
+| `expert_parity` | 0 failures |
+| blob decodes to live scales | 40/40 non-zero, \|s\| in [0.0179, 0.03564] |
+| the next expert is different data | 96.9% of bytes differ |
+| NEON vs scalar, INT8 activations | rel 9.330e-07 |
+| NEON vs scalar, FP32 activations | rel 1.209e-02 |
+| `pool_test` | 0 failures |
+| pool output vs the serial run | 0 of 25600 differ, worst \|d\| 0.000e+00 |
+| NVFP4 NEON dot vs plain C (`--experts PACK.basalt 0`) | 3200 rows, rel 2.16e-07 |
+| NVFP4 CPU expert vs the GPU's, layer 0 | rel 7.24e-08 |
+| Q6_K NEON dot vs a double reference (`--cpu-synthetic q6_K/q8_0`) | worst error / sum\|terms\| 1.26e-08 |
+
+The figures sit where the x86 builds' do. The native rows take the per-token NEON dot for any number of tokens, so a
+token rounds the same alone as in a window. The build reproduces its own tokens: `conv`, 256 tokens,
+`--expert-cache 21000`, identical in two runs. No x86 build's tokens have been compared with it, and no PPL/KLD run
+exists for Arm64.
 
 ## Reproduce
 
