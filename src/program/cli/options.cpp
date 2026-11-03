@@ -158,10 +158,6 @@ std::optional<int> validate_generation_options(const Options& o, bool multi_gpu,
                              "everything is loaded; the smallest safe value is %d", o.vram_reserve_mib, min_vram_reserve_mib);
         return 2;
     }
-    if (o.expert_cache_remote_placement != "stripe" && o.expert_cache_remote_placement != "layer") {
-        basalt::log::error("basalt generate", "--expert-cache-remote-placement must be stripe or layer");
-        return 2;
-    }
     if (o.remote_expert_opt && !o.serve) {
         basalt::log::error("basalt generate", "--remote-expert-opt requires --serve");
         return 2;

@@ -69,6 +69,25 @@ def grammar_entry(on: bool, cli: list[str], used: list[str]) -> tuple[bool, str]
     return (on, origin) if origin else None
 
 
+def open_when_ready(svc, url, now=False, opener=None):
+    """Open the page once, after the first weights load; at once when no load is under way (mock, lazy)."""
+    if opener is None:
+        import webbrowser
+        opener = webbrowser.open
+    if now:
+        opener(url)
+        return
+    done, previous = [], svc.on_loaded
+
+    def loaded():
+        if previous is not None:
+            previous()
+        if not done:
+            done.append(1)
+            opener(url)
+    svc.on_loaded = loaded
+
+
 def main() -> int:
     ap = build_parser()
     try:
@@ -265,8 +284,8 @@ def main() -> int:
     if not a.mock_engine and not lazy:
         svc.start_load()                                # the page and the API are up; requests wait for the load
     if a.open:
-        import webbrowser
-        webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
+        open_when_ready(svc, f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/",
+                        now=bool(a.mock_engine or lazy))
     # SIGTERM takes Ctrl+C's path (QUIT to the engine) so a container stop does not orphan it
     def on_sigterm(signum, frame):
         raise KeyboardInterrupt
