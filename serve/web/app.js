@@ -9,7 +9,10 @@ const gib = n => num(n) ? (n / 1024 ** 3).toFixed(1) : "-";
 const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ESC[c]);
 const drawn = new WeakMap();
-const html = (el, h) => { if (drawn.get(el) !== h) { el.innerHTML = h; drawn.set(el, h); } };   // skip unchanged redraws
+// Every interpolated value in a view string goes through esc(); the helper parses it as a fragment rather than
+// handing markup to innerHTML.
+const fragment = h => document.createRange().createContextualFragment(h);
+const html = (el, h) => { if (drawn.get(el) !== h) { el.replaceChildren(fragment(h)); drawn.set(el, h); } };   // skip unchanged redraws
 const text = (el, v) => { if (el.textContent !== v) el.textContent = v; };
 const HIST = 60;
 const kt = n => n >= 100000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);   // 41.2k, 262k
@@ -79,6 +82,46 @@ const ticks = (max, labels) => [[4, max], [50, max / 2]].filter(t => !labels.som
 /* ---- top bar ---- */
 function setState(s, label) { $("#state").dataset.s = s; text($("#state"), label); }
 
+/* ---- model state strip ---- */
+// The states this server sits in. The ones only a --lazy, --idle-unload or --idle-sleep server reaches are named
+// while it is in one of them, so the strip carries no chip that nothing ever lights.
+const STATES = [["idle", "Idle"], ["reading", "Reading"], ["generating", "Generating"], ["error", "Error"]];
+const OCCASIONAL = [["unloaded", "Unloaded"], ["loading", "Loading"], ["asleep", "Asleep"]];
+function drawState(live, slots, eng) {
+  const cur = live.state || "idle";
+  const shown = STATES.concat(OCCASIONAL.filter(([k]) => k === cur));
+  html($("#states"), shown.map(([k, l]) => `<span class="chip" data-on="${k === cur}">${l}</span>`).join(""));
+  const s = slots[0] || {}, gen = num(live.generated) ? live.generated : null;
+  const max = num(s.max_tokens) ? s.max_tokens : null;
+  let line = "Nothing is running", sub = "", frac = 0;
+  if (cur === "generating") {
+    const ph = String(live.phase || "");
+    const lead = ph === "thinking" ? "Thinking" : ph === "answering" ? "Answering"
+      : ph.startsWith("writing a tool call") ? ph[0].toUpperCase() + ph.slice(1) : (gen ? "Thinking" : "Generating");
+    line = `${lead} · ${fmt(gen || 0)} tokens${num(live.tok_s) ? ` · ${fmt(live.tok_s, 1)} tok/s` : ""}`;
+    sub = max ? `of ${fmt(max)} asked` : "";
+    frac = max ? (gen || 0) / max : 0;
+  } else if (cur === "reading") {
+    line = num(live.prompt_tokens) ? `Reading ${fmt(live.prompt_tokens)} prompt tokens` : "Reading the prompt";
+    sub = num(live.elapsed_s) ? `${fmt(live.elapsed_s, 1)} s` : "";
+  } else if (cur === "loading") {
+    const ld = live.load || {};
+    line = ld.kind === "wake" ? "Waking up" : "Loading weights";
+    sub = num(ld.percent) ? `${ld.percent}%` : "";
+    frac = num(ld.percent) ? ld.percent / 100 : 0;
+  } else if (cur === "unloaded") {
+    line = "Unloaded: the next request loads it";
+  } else if (cur === "asleep") {
+    line = "Asleep: the next request wakes it";
+  } else if (cur === "idle") {
+    line = "Idle";
+    sub = num(eng.max_context) ? `${kt(eng.max_context)} token window` : "";
+  }
+  text($("#activity"), line);
+  text($("#activity-sub"), live.queued > 0 ? `${fmt(live.queued)} queued` : sub);
+  html($("#activity-bar"), `<i style="width:${(clamp(frac, 0, 1) * 100).toFixed(1)}%"></i>`);
+}
+
 /* ---- sidebar ---- */
 const sbRow = (k, v, u, st) => `<div class="sb-row"><span class="k">${k}</span>${st ? `<span class="st">${st}</span>` : ""}<span class="num">${v}${u ? `<span class="u">${u}</span>` : ""}</span></div>`;
 const bar = f => `<div class="bar4"><i style="width:${(clamp(f || 0, 0, 1) * 100).toFixed(1)}%"></i></div>`;
@@ -96,11 +139,19 @@ function sbTemp(h, now) {
   return `<div class="sb-met grow">${sbRow("Temp", r0(now), "°C", s ? `Min ${Math.round(s.min)} · Max ${Math.round(s.max)} °C` : "")}${sbChart(h, lo, hi, false)}</div>`;
 }
 const link = g => num(g.pcie_gen_max ?? g.pcie_gen) ? `Gen${g.pcie_gen_max ?? g.pcie_gen}${num(g.pcie_width) ? ` x${g.pcie_width}` : ""}` : "";
-const vramRow = g => `<div class="sb-met">${sbRow("VRAM", num(g.mem_used) ? `${gib(g.mem_used)} / ${gib(g.mem_total)}` : "-", "GiB")}${bar(num(g.mem_total) ? g.mem_used / g.mem_total : 0)}</div>`;
-function sbGpu(g, h, name, alone) {
+const vramRow = (g, h) => {
+  const total = num(g.mem_total) ? g.mem_total / 2 ** 20 : 0;
+  const series = tail((h || {}).mem_used).map(v => v == null ? null : v / 2 ** 20);
+  const seen = series.filter(num).length;
+  return `<div class="sb-met">${sbRow("VRAM", num(g.mem_used) ? `${gib(g.mem_used)} / ${gib(g.mem_total)}` : "-", "GiB")}`
+    + (seen > 1 && total ? `<div class="sb-vram">${sbChart(series, 0, total, false, true)}</div>`
+      : bar(total ? g.mem_used / total : 0)) + `</div>`;
+};
+function sbGpu(g, h, name, alone, bus) {
   const right = alone ? `<span class="num">${esc(link(g))}</span>`
     : `<span class="num">${num(g.temp) ? `<b>${Math.round(g.temp)}</b><span class="u">°C</span>` : ""}${num(g.temp) && link(g) ? " · " : ""}${esc(link(g))}</span>`;
-  return `<div class="sb-gpu"><div class="sb-gt"><span>${esc(name)}</span>${right}</div>${vramRow(g)}`
+  return `<div class="sb-gpu"><div class="sb-gt"${bus ? ` title="PCI bus ${esc(bus)}"` : ""}><span>${esc(name)}</span>${right}</div>`
+    + (bus ? `<div class="sb-bus">${esc(bus)}</div>` : "") + `${vramRow(g, h)}`
     + sbLoad(tail(h.util), g.util) + sbPower(tail(h.power), g.power, g.power_limit) + (alone ? sbTemp(tail(h.temp), g.temp) : "") + `</div>`;
 }
 function sbTable(G, H, names) {
@@ -126,16 +177,20 @@ function drawSide(hw, st, hist, eng, r) {
   gid = 0;
   const G = hw.gpus || [], H = Object.fromEntries((hist.gpus || []).map(x => [x.index, x]));
   const named = Object.fromEntries((st.gpus || []).map(g => [g.index, shortGpu(g.name)]));
+  // the engine names its cards by PCI bus id, primary first, in the order the sampler reads them
+  const buses = String(eng.gpus || "").split(",").map(x => x.trim()).filter(Boolean);
+  const busOf = g => buses[G.findIndex(x => x.index === g.index)] || "";
   const title = g => `GPU ${g.index} · ${named[g.index] || "GPU"}`;
   html($("#gpus"), !G.length ? `<div class="sb-none">No GPU readings.</div>`
-    : G.length >= 3 ? sbTable(G, G.map(g => H[g.index] || {}), title)
-    : G.map(g => sbGpu(g, H[g.index] || {}, G.length === 1 ? named[g.index] || title(g) : title(g), G.length === 1)).join(""));
+    : G.length >= 3 ? sbTable(G, G.map(g => H[g.index] || {}), g => `${title(g)}${busOf(g) ? ` · ${busOf(g)}` : ""}`)
+    : G.map(g => sbGpu(g, H[g.index] || {}, G.length === 1 ? named[g.index] || title(g) : title(g), G.length === 1, busOf(g))).join(""));
 
   const cpu = shortCpu(st.cpu_name);
   text($("#cpu-name"), cpu); $("#cpu-name").title = st.cpu_name || "";
   html($("#sys"), sbRow("CPU", num(hw.cpu) ? `${Math.round(hw.cpu)}%` : "-")
     + `<div class="sb-met">${sbRow("RAM", num(hw.ram_total) ? `${gib(hw.ram_used)} / ${gib(hw.ram_total)}` : "-", "GiB")}${bar(num(hw.ram_total) ? hw.ram_used / hw.ram_total : 0)}</div>`
-    + sbRow("Disk read", num(hw.disk_read_mb) ? hw.disk_read_mb.toFixed(1) : "-", "MB/s")
+    + sbRow("Disk read", num(hw.disk_read_mb) ? hw.disk_read_mb.toFixed(1) : "-", "MiB/s")
+    + sbRow("Disk write", num(hw.disk_write_mb) ? hw.disk_write_mb.toFixed(1) : "-", "MiB/s")
     + (st.driver ? `<div class="sb-foot">Driver ${esc(st.driver)}${st.cuda ? ` · CUDA ${esc(st.cuda)}` : ""}</div>` : ""));
 
   // the tier split of the last request's routed lookups; the peer tier shows only when the engine reports it
@@ -143,8 +198,60 @@ function drawSide(hw, st, hist, eng, r) {
   const tiers = [["VRAM", "var(--fg)", hit == null ? null : hit * (1 - (peer || 0))]];
   if (peer != null) tiers.push(["Peer", "var(--fg-3)", peer]);
   tiers.push(["CPU", "var(--basalt-500)", hit == null ? null : (1 - hit) * (1 - (peer || 0))]);
-  html($("#experts"), `<div class="sb-stack" aria-hidden="true">${tiers.map(t => `<i style="width:${((t[2] || 0) * 100).toFixed(1)}%;background:${t[1]}"></i>`).join("")}</div>`
+  // what the cache is, then where the last request's lookups came from: the capacity is said once, the split once
+  const cap = num(eng.expert_slots)
+    ? `${fmt(eng.expert_slots)} slots${num(eng.expert_cache_mib) ? ` · ${(eng.expert_cache_mib / 1024).toFixed(1)} GiB` : ""}` : "";
+  const primaryMib = num(eng.expert_cache_primary_mib) ? eng.expert_cache_primary_mib : null;
+  const shared = primaryMib != null && num(eng.expert_cache_mib) && Math.abs(primaryMib - eng.expert_cache_mib) > 64;
+  html($("#experts"), (cap ? `<div class="sb-row sb-cap"><span class="k">In VRAM</span><span class="num">${cap}</span></div>`
+      + (shared ? `<div class="sb-cap2">${(primaryMib / 1024).toFixed(1)} GiB on the primary, the rest on the peer</div>` : "") : "")
+    + `<div class="sb-stack" aria-hidden="true">${tiers.map(t => `<i style="width:${((t[2] || 0) * 100).toFixed(1)}%;background:${t[1]}"></i>`).join("")}</div>`
     + `<div class="sb-leg">${tiers.map(t => `<div style="--c:${t[1]}"><span>${t[0]}</span><b>${t[2] == null ? "-" : `${(t[2] * 100).toFixed(1)}%`}</b></div>`).join("")}</div>`);
+}
+
+/* ---- context fill, conversation cache, session totals ---- */
+function donut(frac, label, sub) {
+  const C = 2 * Math.PI * 34, on = clamp(frac, 0, 1) * C;
+  return `<div class="donut"><svg viewBox="0 0 84 84" aria-hidden="true"><circle cx="42" cy="42" r="34" fill="none" stroke="var(--raised)" stroke-width="8"/>`
+    + `<circle cx="42" cy="42" r="34" fill="none" stroke="var(--accent)" stroke-width="8" stroke-linecap="round" `
+    + `stroke-dasharray="${on.toFixed(1)} ${(C - on).toFixed(1)}" transform="rotate(-90 42 42)"/></svg>`
+    + `<div><div class="dv">${label}</div><div class="dk">${sub}</div></div></div>`;
+}
+function drawContext(slots, eng) {
+  const held = slots.filter(s => num(s.ctx_used));
+  const s = held.length ? held.reduce((a, b) => (b.ctx_used > a.ctx_used ? b : a)) : null;
+  const used = s ? s.ctx_used : 0, n = num(eng.max_context) ? eng.max_context : (s ? s.n_ctx : 0);
+  const frac = n ? used / n : 0;
+  text($("#ctx-sub"), s ? `Slot ${s.id + 1}` : "Widest slot");
+  html($("#ctx"), donut(frac, n ? `${Math.round(frac * 100)}%` : "-", `${kt(used)} / ${kt(n)}`));
+}
+function drawConv(eng, conv, reqs) {
+  const slots = num(eng.conversation_cache_slots) ? eng.conversation_cache_slots : null;
+  const mib = num(eng.conversation_cache_mib) ? eng.conversation_cache_mib : null;
+  text($("#conv-sub"), slots ? `${fmt(slots)} slots · ${(mib / 1024).toFixed(0)} GiB` : "");
+  const parked = num(conv.parked) ? conv.parked : null, bytes = num(conv.bytes) ? conv.bytes : null;
+  const evicted = num(conv.evictions) ? conv.evictions : null, restored = num(conv.restored) ? conv.restored : null;
+  const budget = mib ? mib * 2 ** 20 : 0;
+  const rows = reqs.filter(r => num(r.prompt_tokens) && r.prompt_tokens > 0).slice(0, 30);
+  const last = rows[0], share = r => num(r.reused) ? r.reused / r.prompt_tokens : null;
+  const hit = last ? share(last) : null;
+  const seen = rows.map(share).filter(num);
+  const mean = seen.length ? seen.reduce((t, x) => t + x, 0) / seen.length : null;
+  const series = rows.slice().reverse().map(share);
+  html($("#conv"), (parked != null ? `<div class="sb-met">${sbRow("Parked conversations", `${fmt(parked)}${slots ? `<span class="u"> / ${fmt(slots)}</span>` : ""}`)}${bar(slots ? parked / slots : 0)}</div>` : "")
+    + (bytes != null ? `<div class="sb-met">${sbRow("Their memory", budget ? `${gib(bytes)} / ${gib(budget)}` : gib(bytes), "GiB")}${bar(budget ? bytes / budget : 0)}</div>` : "")
+    + (evicted || restored ? `<div class="cv-note">${evicted ? `${fmt(evicted)} evicted` : ""}${evicted && restored ? " · " : ""}${restored ? `${fmt(restored)} tokens restored by the last request` : ""}</div>` : "")
+    + `<div class="sb-met">${sbRow("Reused by the last request", last ? `${fmt(last.reused || 0)} / ${fmt(last.prompt_tokens)}` : "-", hit != null ? `${Math.round(hit * 100)}%` : "")}${bar(hit || 0)}</div>`
+    + (seen.length > 1 ? `<div class="sb-met">${sbRow("Mean reuse", `${Math.round(mean * 100)}`, `% of ${seen.length} requests`)}${bar(mean)}` : "")
+    + spark(series.map(v => v == null ? null : v * 100), 100));
+}
+function drawTotals(t) {
+  if (!t || !num(t.requests)) { html($("#totals"), "No requests finished since the server started."); return; }
+  const pr = t.prompt_ms ? t.prompt / (t.prompt_ms / 1000) : null;
+  const wr = t.decode_ms ? t.written / (t.decode_ms / 1000) : null;
+  html($("#totals"), `Since ${clock(t.since * 1000)} · <b>${fmt(t.requests)}</b> requests · <b>${fmt(t.prompt)}</b> prompt tokens read`
+    + `${pr ? ` at <b>${fmt(pr)}</b> tok/s` : ""} (<b>${fmt(t.reused)}</b> reused) · <b>${fmt(t.written)}</b> written`
+    + `${wr ? ` at <b>${fmt(wr)}</b> tok/s` : ""}`);
 }
 
 /* ---- Speed ---- */
@@ -209,7 +316,7 @@ function drawHero(live, hist, reqs, best, slots, total) {
 }
 $("#chips").addEventListener("click", e => {
   const b = e.target.closest(".ck"); if (!b) return;
-  off.has(b.dataset.k) ? off.delete(b.dataset.k) : off.add(b.dataset.k);
+  if (off.has(b.dataset.k)) off.delete(b.dataset.k); else off.add(b.dataset.k);
   draw();
 });
 
@@ -217,8 +324,35 @@ $("#chips").addEventListener("click", e => {
 let tab = sessionStorage.getItem("basalt.tab") || "slots";
 $("#tabs").addEventListener("click", e => {
   const b = e.target.closest("button[data-t]"); if (!b) return;
-  tab = b.dataset.t; try { sessionStorage.setItem("basalt.tab", tab); } catch (err) { /* private mode */ }
+  tab = b.dataset.t; try { sessionStorage.setItem("basalt.tab", tab); } catch { /* private mode */ }
   draw();
+});
+// a request row opens its own timings; Enter and Space do it from the keyboard, Esc closes it
+$("#pane").addEventListener("click", e => {
+  const copy = e.target.closest("button.copy");
+  if (copy) {
+    const rec = ((M && M.requests) || []).find(r => r.id === selected.id);
+    if (rec && navigator.clipboard) {
+      navigator.clipboard.writeText(JSON.stringify(rec, null, 2)).then(() => {
+        copy.textContent = "Copied";
+        setTimeout(() => { copy.textContent = "Copy JSON"; }, 1200);
+      }).catch(() => {});
+    }
+    return;
+  }
+  const tr = e.target.closest("tr.req"); if (!tr || !tr.dataset.k) return;
+  selected.id = selected.id === tr.dataset.k ? null : tr.dataset.k;
+  draw();
+});
+$("#pane").addEventListener("keydown", e => {
+  const tr = e.target.closest("tr.req");
+  if (tr && tr.dataset.k && (e.key === "Enter" || e.key === " ")) {
+    e.preventDefault();
+    selected.id = selected.id === tr.dataset.k ? null : tr.dataset.k;
+    draw();
+    return;
+  }
+  if (e.key === "Escape" && selected.id) { selected.id = null; draw(); }
 });
 const accept = s => s.drafts_offered > 20 ? Math.round(s.drafts_accepted / s.drafts_offered * 100) : null;
 const prefixHit = s => num(s.reused) && s.prompt_tokens > 0 ? Math.round(s.reused / s.prompt_tokens * 100) : null;
@@ -244,20 +378,43 @@ function slotRows(rows, series) {
   });
   return h + `</div>`;
 }
+const selected = { id: null };       // the request whose timings the strip under the table shows
+const detailOf = r => {
+  const x = r.raw || {};
+  const cells = [["Prompt read", num(x.prompt_ms) ? `${x.prompt_ms.toFixed(0)} ms` : "-"],
+    ["Decode", num(x.decode_ms) ? `${x.decode_ms.toFixed(0)} ms` : "-"],
+    ["From cache", num(x.reused) && x.prompt_tokens ? `${Math.round(x.reused / x.prompt_tokens * 100)}% of the prompt` : "-"],
+    ["Drafts", num(x.drafts_accepted) ? `${fmt(x.drafts_accepted)} of ${fmt(x.drafts_offered)} accepted` : "-"],
+    ["Tokens per window", num(x.draft_len) ? x.draft_len.toFixed(1) : "-"],
+    ["Finish", x.finish || "-"]];
+  return `<div class="dl">${cells.map(([k, v]) => `<span>${k}<b>${esc(v)}</b></span>`).join("")}</div>`
+    + `<button type="button" class="copy">Copy JSON</button>`;
+};
 function requestsPane(live, reqs, multi) {
   const rows = [];
   if (!multi && (live.state === "reading" || live.state === "generating"))
-    rows.push({ t: Date.now() / 1000 - (live.elapsed_s || 0), id: "Running", path: "", out: live.generated, tps: live.tok_s, dur: live.elapsed_s, live: true });
-  reqs.forEach(r => rows.push({ t: r.time, id: r.id, slot: r.slot, path: r.path, out: r.output_tokens, tps: r.decode_tok_s, dur: r.duration_s, finish: r.finish }));
+    rows.push({ t: Date.now() / 1000 - (live.elapsed_s || 0), id: "Running", path: "", prompt: live.prompt_tokens,
+      out: live.generated, tps: live.tok_s, dur: live.elapsed_s, live: true });
+  reqs.forEach(r => rows.push({ t: r.time, id: r.id, slot: r.slot, path: r.path, prompt: r.prompt_tokens, cached: r.reused,
+    out: r.output_tokens, ttft: r.ttft_s, tps: r.decode_tok_s, hit: r.hit_rate, pcie: r.pcie_share, dur: r.duration_s, finish: r.finish, raw: r }));
   if (!rows.length) return `<div class="empty">No requests yet.</div>`;
   const ep = p => String(p || "-").replace("/v1/", "").replace("chat/completions", "chat");
-  return `<table><thead><tr><th>Time</th><th>ID</th>${multi ? "<th>Slot</th>" : ""}<th>Endpoint</th><th class="r">Output</th><th class="r">Rate</th><th class="r">Duration</th></tr></thead><tbody>`
+  const pct = v => num(v) ? `${Math.round(v * 100)}%` : "-";
+  const sel = rows.find(r => r.id === selected.id);
+  return (sel ? `<div class="reqdet">${detailOf(sel)}</div>` : "")
+    + `<table><thead><tr><th>Time</th><th>ID</th>${multi ? "<th>Slot</th>" : ""}<th class="col-ep">Endpoint</th>`
+    + `<th class="r">Prompt</th><th class="r col-cache">Cached</th><th class="r">Output</th><th class="r">TTFT</th>`
+    + `<th class="r">Rate</th><th class="r col-hit">Hit</th><th class="r col-pcie">PCIe</th><th class="r">Duration</th></tr></thead><tbody>`
     + rows.map(r => {
       // a request that did not simply stop is marked on its id, with the reason
       const odd = r.finish && r.finish !== "stop" ? (r.finish === "error" ? "err" : "warn") : "";
-      return `<tr${r.live ? ` class="live"` : ""}><td>${clock(r.t * 1000)}</td><td class="${odd}">${esc(r.id)}${odd ? ` · ${esc(r.finish)}` : ""}</td>`
+      const open = selected.id === r.id;
+      return `<tr class="req${r.live ? " live" : ""}${open ? " on" : ""}" data-k="${esc(r.id)}" tabindex="0" aria-expanded="${open}"><td>${clock(r.t * 1000)}</td><td class="${odd}">${esc(r.id)}${odd ? ` · ${esc(r.finish)}` : ""}</td>`
         + (multi ? `<td class="dim">${num(r.slot) ? `s${r.slot + 1}` : "-"}</td>` : "")
-        + `<td>${r.live ? "-" : esc(ep(r.path))}</td><td class="r">${num(r.out) ? fmt(r.out) : "-"}</td><td class="r">${num(r.tps) ? r.tps.toFixed(1) : "-"}</td>`
+        + `<td class="col-ep">${r.live ? "-" : esc(ep(r.path))}</td>`
+        + `<td class="r">${num(r.prompt) ? fmt(r.prompt) : "-"}</td><td class="r col-cache">${num(r.cached) ? fmt(r.cached) : "-"}</td>`
+        + `<td class="r">${num(r.out) ? fmt(r.out) : "-"}</td><td class="r">${num(r.ttft) ? `${r.ttft.toFixed(2)} s` : "-"}</td>`
+        + `<td class="r">${num(r.tps) ? r.tps.toFixed(1) : "-"}</td><td class="r col-hit">${pct(r.hit)}</td><td class="r col-pcie">${pct(r.pcie)}</td>`
         + `<td class="r">${num(r.dur) ? `${r.dur.toFixed(1)} s` : "-"}</td></tr>`;
     }).join("") + `</tbody></table>`;
 }
@@ -296,54 +453,100 @@ function draw() {
     : live.queued > 0 ? `${name} · ${live.queued} queued` : name);
   text($("#detail"), gib); $("#detail").hidden = !gib;
   text($("#model"), eng.model || "");
-  drawSide(M.hardware || {}, M.hardware_static || {}, hist, eng, reqs[0]);
+  // what build this is, in the header: the version, the pack's quantization and the window
+  text($("#ident"), [eng.version ? `v${eng.version}` : null, eng.quant, num(eng.max_context) ? kt(eng.max_context) : null]
+    .filter(Boolean).join(" · "));
+  $("#model").title = eng.path || "";
+  drawSide(M.hardware || {}, M.hardware_static || {}, hist, eng, reqs[0]);  drawState(live, slots, eng);
+  drawContext(slots, eng);
+  drawConv(eng, M.conversation || {}, reqs);
+  drawTotals(M.totals);
   drawHero(live, hist, reqs, M.best || {}, slots, total);
   drawMain(live, hist, reqs, slots, total);
+  // a tab kept in the background still says what the server is doing
+  document.title = live.state === "generating" && num(live.tok_s) ? `basalt · ${fmt(live.tok_s, 1)} tok/s`
+    : live.state && live.state !== "idle" ? `basalt · ${live.state}` : "basalt";
 }
 
 /* ---- logs ---- */
 const logEl = $("#log"), MAXLOG = 400;
-let logCount = 0, follow = true;
+let logCount = 0, follow = true, logLines = [];
+let logFilter = sessionStorage.getItem("basalt.logf") || "all";
+const keepLine = e => logFilter === "all" || (logFilter === "warn" ? e.lvl !== "info" : e.lvl === "err");
 function lineEl(e) {
   const d = document.createElement("div");
   if (e.lvl !== "info") d.className = e.lvl;
   const t = document.createElement("i"); t.textContent = clock(e.t * 1000);
   d.append(t, `  ${e.src === "srv" ? "[server] " : ""}${e.msg}`);
+  if (e.n > 1) { const b = document.createElement("b"); b.className = "ln"; b.textContent = ` ×${e.n}`; d.append(b); }
   return d;
 }
+// Redraws from the kept lines, so a filter change and a repeat collapse both work without the server's help.
+function renderLog() {
+  const runs = [];
+  for (const e of logLines) {
+    if (!keepLine(e)) continue;
+    const last = runs[runs.length - 1];
+    if (last && last.src === e.src && last.msg === e.msg && last.lvl === e.lvl) { last.n++; continue; }
+    runs.push({ ...e, n: 1 });
+  }
+  if (!runs.length) { clearLog(logLines.length ? "Nothing at this level." : "No log lines yet.", false); return; }
+  const at = logEl.scrollTop;
+  logEl.replaceChildren(...runs.slice(-MAXLOG).map(lineEl));
+  logEl.scrollTop = follow ? logEl.scrollHeight : at;
+}
 function append(lines) {
-  logEl.querySelector(".empty")?.remove();
-  logEl.append(...lines.map(lineEl));
-  while (logEl.childElementCount > MAXLOG) logEl.firstChild.remove();
+  logLines.push(...lines);
+  if (logLines.length > MAXLOG * 2) logLines = logLines.slice(-MAXLOG);
   logCount += lines.length; text($("#log-count"), `${fmt(logCount)} lines`);
-  if (follow) logEl.scrollTop = logEl.scrollHeight;
+  renderLog();
 }
 logEl.addEventListener("scroll", () => { follow = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 12; });
-function clearLog(note) {
-  logCount = 0; text($("#log-count"), "");
+function clearLog(note, reset = true) {
+  if (reset) { logCount = 0; text($("#log-count"), ""); logLines = []; }
   const d = document.createElement("div"); d.className = "empty"; d.textContent = note; logEl.replaceChildren(d);
 }
+const paintFilter = () => { for (const x of $("#log-filter").children) x.setAttribute("aria-pressed", String(x.dataset.f === logFilter)); };
+$("#log-filter").addEventListener("click", e => {
+  const b = e.target.closest("button[data-f]"); if (!b) return;
+  logFilter = b.dataset.f;
+  try { sessionStorage.setItem("basalt.logf", logFilter); } catch { /* private mode */ }
+  paintFilter(); follow = true; renderLog();
+});
+paintFilter();
 
 /* ---- polling ---- */
+// A locked server leaves the dashboard showing its last reading: inert keeps that stale page out of the tab order
+// and the accessibility tree, and the key field takes the focus.
+function setLocked(on) {
+  const dash = $("main");
+  if (!dash) return;
+  dash.inert = on;
+  dash.classList.toggle("frozen", on);
+  if (on && document.activeElement !== $("#key")) $("#key").focus();
+}
 let lastLog = 0;
 async function pollMetrics() {
+  if (document.hidden) { setTimeout(pollMetrics, 1000); return; }   // a background tab reads nothing
   try {
     const m = await get("metrics");
     m.slots = await get("slots").catch(() => []);
-    M = m; $("#auth").hidden = true; draw();
+    M = m; $("#auth").hidden = true; setLocked(false); draw();
   } catch (e) {
     $("#auth").hidden = !e.locked; M = null;
+    setLocked(!!e.locked);
     setState("offline", e.locked ? "Locked" : "Offline");
   }
   setTimeout(pollMetrics, 1000);
 }
 async function pollLog() {
+  if (document.hidden) { setTimeout(pollLog, 1000); return; }
   try {
     const r = await get(`api/logs?after=${lastLog}`);
     if (r.last < lastLog) { lastLog = 0; clearLog("The server restarted."); }
     else if (r.lines.length) { lastLog = r.last; append(r.lines); }
     else if (!logCount && !logEl.firstChild) clearLog("No log lines yet.");
-  } catch (e) { /* the metrics poll reports the connection */ }
+  } catch { /* the metrics poll reports the connection */ }
   setTimeout(pollLog, 1000);
 }
 $("#auth").onsubmit = e => {
