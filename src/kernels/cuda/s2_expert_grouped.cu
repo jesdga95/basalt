@@ -15,6 +15,7 @@
 // the same reason.  `moe_hit_parity` is the check.
 #include "basalt/kernels/s2_expert_grouped.hpp"
 #include "basalt/kernels/dp4a.hpp"
+#include "basalt/kernels/packed_byte.hpp"
 
 #include "basalt/kernels/quantize_act.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
@@ -646,12 +647,11 @@ constexpr int D_ROWS = 64;                       // down rows per block: 8 per w
 // One activation chunk's contribution, `row_dot_s2_q8`'s inner body with the 32 int8 of the chunk already in
 // aligned words: same dp4a sequence, same float expression, so the result is bitwise the per-entry kernel's.
 __device__ __forceinline__ float chunk_dot(uint2 cb, const int* xw, float dw, float dx) {
-    const uint8_t* cbytes = (const uint8_t*) &cb;
     int s = 0, hx = 0;
     const int ones = 0x01010101;
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-        const unsigned cbyte = cbytes[j];
+        const unsigned cbyte = packed_byte(cb, j);
         const int cw = (int) ((cbyte & 3u) | (((cbyte >> 2) & 3u) << 8) | (((cbyte >> 4) & 3u) << 16) |
                               (((cbyte >> 6) & 3u) << 24));
         s = DP4A(cw, xw[j], s);

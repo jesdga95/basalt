@@ -4,6 +4,7 @@
 // The ggml authors): dequantize_row_q2_0/q4_0/q5_0/q8_0/q3_K/q4_K/q5_K/q6_K/iq4_nl/iq4_xs.
 #include "basalt/kernels/dequant_bf16.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/packed_byte.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -104,12 +105,11 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
         aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
         aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
         aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-        const int8_t* scales = reinterpret_cast<const int8_t*>(aux);
         const int shift = 2 * jj;
         const uint8_t m = (uint8_t) (1u << (n * 4 + jj));
         for (int t = 0; t < 32; ++t) {
             const int is = n * 8 + jj * 2 + (t >= 16 ? 1 : 0);
-            const float dl = d_all * (float) (scales[is] - 32);
+            const float dl = d_all * (float) (packed_s8(aux[is >> 2], is & 3) - 32);
             put(out, t, dl * (float) ((int) ((q[t] >> shift) & 3) - ((hm[t] & m) ? 0 : 4)));
         }
     } else if constexpr (TYPE == 12) {                             // Q4_K: d dmin scales[12] qs[128]

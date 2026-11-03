@@ -1,6 +1,7 @@
 // src/kernels/cuda/qsa_decode_attn.cu - see include/basalt/kernels/qsa_decode_attn.hpp.
 #include "basalt/kernels/qsa_decode_attn.hpp"
 #include "basalt/kernels/kv_q8.hpp"
+#include "basalt/kernels/packed_byte.hpp"
 #include "basalt/kernels/kv_q4.hpp"
 
 #include <cuda_fp16.h>
@@ -49,9 +50,8 @@ __device__ __forceinline__ void load8_q8(const QsaAttnPools& p, bool value, long
     const uint16_t sbits = (value ? p.v_scale : p.k_scale)[row * (HD / KV_Q8_GROUP) + d0 / KV_Q8_GROUP];
     const float sc = __half2float(__ushort_as_half(sbits));
     const uint2 raw = *reinterpret_cast<const uint2*>(codes);
-    const int8_t* c = reinterpret_cast<const int8_t*>(&raw);
 #pragma unroll
-    for (int j = 0; j < 8; ++j) out[j] = (float) c[j] * sc;
+    for (int j = 0; j < 8; ++j) out[j] = (float) packed_s8(j < 4 ? raw.x : raw.y, j & 3) * sc;
 }
 __device__ __forceinline__ void load8_q4(const QsaAttnPools& p, bool value, long long row, int d0, float* out) {
     constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);

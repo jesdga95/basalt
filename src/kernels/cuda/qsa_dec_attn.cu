@@ -2,6 +2,7 @@
 #include "basalt/kernels/qsa_dec_attn.hpp"
 #include "basalt/kernels/qsa_seg.hpp"
 #include "basalt/kernels/kv_q8.hpp"
+#include "basalt/kernels/packed_byte.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "smem_opt_in.cuh"
@@ -130,9 +131,8 @@ __device__ __forceinline__ void k8_from(const ChunkSmem<KV_MODE>& sm, int c, int
     } else {
         const float sc = __half2float(__ushort_as_half(sm.ks[c][d0 / KV_Q8_GROUP]));
         const uint2 raw = *reinterpret_cast<const uint2*>(&sm.k[c][d0]);
-        const int8_t* cc = reinterpret_cast<const int8_t*>(&raw);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) out[j] = (float) cc[j] * sc;
+        for (int j = 0; j < 8; ++j) out[j] = (float) packed_s8(j < 4 ? raw.x : raw.y, j & 3) * sc;
     }
 }
 template <int KV_MODE>
