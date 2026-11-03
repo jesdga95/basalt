@@ -11,6 +11,7 @@ context are rejected with a 400, never truncated.
 """
 from __future__ import annotations
 
+import importlib
 import json
 import signal
 import sys
@@ -18,6 +19,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from typing import NoReturn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable as a script
@@ -43,7 +45,7 @@ from serve.util.console import LEGEND, tagged  # noqa: E402
 from serve.util.text import ByteTokenizer  # noqa: E402
 
 
-def fail(msg: str) -> None:
+def fail(msg: str) -> NoReturn:
     """Print a startup error and exit with status 2."""
     print(f"[server] error: {msg}", file=sys.stderr)
     raise SystemExit(2)
@@ -101,6 +103,7 @@ def main() -> int:
                               TeeStream(ColorStream.wrap(sys.stderr), logs, "srv"))
     print(tagged("legend", LEGEND), flush=True)          # first line, so the key precedes every value
     cfg = {}                                            # what the model file implies
+    lazy, has_grammar = False, False                     # both belong to the real engine; a mock has neither
     try:
         check_gpu(a.gpu)
     except ValueError:
@@ -168,7 +171,7 @@ def main() -> int:
     if not a.mock_engine and not (tpath / "vocab.json").exists():
         fail(f"tokenizer missing: {tpath / 'vocab.json'}")
     if (tpath / "vocab.json").exists():
-        import tokenizer as ST
+        ST = importlib.import_module("tokenizer")       # beside the model file, on the path the engine runs with
         vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
         tokens = [None] * len(vocab)
         for t, i in vocab.items():
@@ -230,6 +233,7 @@ def main() -> int:
         print(tagged("images", f"from other machines{' and this one' if image_sources.remote_only else ''}: "
                                f"url-hosts={','.join(a.image_url_host) or '-'} "
                                f"dirs={','.join(image_sources.dirs) or '-'}"), flush=True)
+    logs.on_line = svc.note_engine_line                  # the conversation cache logs its own figures
     if any(x == "--api-key" and i + 1 < len(used_argv) and not used_argv[i + 1].strip() or x.strip() == "--api-key="
            for i, x in enumerate(used_argv)):
         # an empty key would silently disable authentication
@@ -321,8 +325,9 @@ def main() -> int:
             try:
                 close()
             except KeyboardInterrupt:                   # second Ctrl+C: do not wait for the engine
-                if getattr(engine, "proc", None):
-                    engine.proc.kill()
+                proc = getattr(engine, "proc", None)
+                if proc is not None:
+                    proc.kill()
         print("[server] stopped", flush=True)
     return rc
 

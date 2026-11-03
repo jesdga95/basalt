@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import os
 import re
 import threading
 import time
+from collections.abc import Callable
 
 from serve.util.loglevel import ERR, WARN, LevelReader
 
@@ -23,6 +25,7 @@ class LogBuffer:
         self.lines: collections.deque = collections.deque(maxlen=capacity)
         self.last = 0
         self.readers: dict[str, LevelReader] = {}      # per source: a traceback spans lines
+        self.on_line: Callable[[str], None] | None = None   # another consumer of every line
 
     def add(self, src: str, text: str) -> None:
         """Add each non-empty line of `text` (ANSI codes removed, long lines cut) from source `src`. A line's level is
@@ -37,6 +40,9 @@ class LogBuffer:
                 self.last += 1
                 self.lines.append({"id": self.last, "t": now, "src": src, "lvl": lvl,
                                    "msg": msg.removeprefix(SERVER_PREFIX)})
+            if self.on_line is not None:                # outside the lock: a consumer keeps its own
+                with contextlib.suppress(Exception):    # a log consumer must never break logging
+                    self.on_line(msg)
 
     def since(self, after_id: int = 0, limit: int = 500) -> tuple[list[dict], int]:
         """Return (the newest `limit` lines above `after_id`, oldest first; the newest id)."""

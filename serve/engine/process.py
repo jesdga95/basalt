@@ -27,7 +27,9 @@ import re
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, TypeGuard
 
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY, engine_key as grammar_key
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
@@ -142,7 +144,7 @@ EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default -
 PENALTY_LAST_N_DEFAULT = 64  # the penalty window of a request that sets a penalty but no penalty_last_n
 
 
-def _number(v) -> bool:
+def _number(v: object) -> TypeGuard[int | float]:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 # Engine lines for an unrecoverable verifier: the process may stay alive and print DONE, but must take no more requests.
 FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed out at layer ",
@@ -168,7 +170,7 @@ class ProcessEngine:
     slot_drafts = {}                     # batch slot -> (accepted, offered, time) of its last BDONE, counts None when absent
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
     takes_text = True                    # generate() accepts a PromptText (sent as GENT when the engine can tokenize)
-    stderr_sink = None                   # callable(line): engine stderr when there is no log file
+    stderr_sink: Callable[[str], None] | None = None     # callable(line): engine stderr when there is no log file
 
     # `last`: figures of the last DONE line; per thread with batch slots, since requests run concurrently.
     @property
@@ -219,7 +221,9 @@ class ProcessEngine:
         self.spawn = (engine_bin, list(args), cwd, log, env)   # to start it again
         self.model_path = flag_value(args, "--model") or ""
         self.log_path = log
-        self.proc, self.pump, self.log = None, None, None
+        self.proc: Any = None                    # the engine process, re-created by every (re)start
+        self.pump: Any = None                    # its stdout reader
+        self.log: Any = None                     # a log file, subprocess.DEVNULL, or None
         if "slot_cv" not in self.__dict__:               # restart() wakes waiters even when the start failed
             self.slot_cv = threading.Condition()
         if "sleep_lock" not in self.__dict__:            # sleep, wake and close never overlap, across restarts too
@@ -249,6 +253,7 @@ class ProcessEngine:
         loading = threading.Event()                     # set once READY: stops the narrator
         log_start = os.path.getsize(log) if log else 0  # where this start's log lines begin
         self.log_start = log_start
+        narrator = None                                 # the reader of this start's log, when one is written
         if log:
             visible = (env or os.environ).get("CUDA_VISIBLE_DEVICES", "")
             gpus = [int(x) for x in visible.split(",") if x.strip().isdigit()]
@@ -267,7 +272,7 @@ class ProcessEngine:
                                        text=True, encoding="utf-8", bufsize=1, env=env)
         except OSError as e:                            # missing or not executable: nothing started, so this is a start error
             loading.set()                               # the narrator stops and the log handle goes back
-            if log:
+            if hasattr(self.log, "close"):
                 self.log.close()
             raise EngineStartError(f"the engine could not be started: {e}", log) from e
         frame_pipes(self.proc, sink is not None)
@@ -301,7 +306,7 @@ class ProcessEngine:
                 self.can_stop = "stop" in f[2:]
                 break
         loading.set()
-        if log:
+        if narrator is not None:
             narrator.join(2)                            # its lines precede what follows READY
         if self.max_context <= 0:
             if timed_out:                               # still loading, or hung: end it so the turn is not held
@@ -412,11 +417,15 @@ class ProcessEngine:
 
     def death_note(self) -> str:
         """Why the engine most likely ended, from the end of its log: its own watchdog, else RAM."""
-        if getattr(self, "silent_note", None):          # the server ended it
-            return self.silent_note
+        note = getattr(self, "silent_note", None)       # the server ended it
+        if note:
+            return str(note)
         tail = ""
         try:
-            with open(self.log_path, "rb") as f:
+            path = self.log_path
+            if not path:
+                raise OSError("the engine keeps no log file")
+            with open(path, "rb") as f:
                 f.seek(0, 2)
                 f.seek(max(0, f.tell() - 4096))
                 tail = f.read().decode("utf-8", "replace")
@@ -628,18 +637,18 @@ class ProcessEngine:
         if _number(mp):
             keys += f" min_p={float(mp)!r}"
         rp = sampling.get("repetition_penalty")
-        rp_on = _number(rp) and float(rp) != 1.0
+        rp_v = float(rp) if _number(rp) and float(rp) != 1.0 else None
         pf = sampling.get("frequency_penalty")
-        pf_on = _number(pf) and float(pf) != 0.0
+        pf_v = float(pf) if _number(pf) and float(pf) != 0.0 else None
         pp = sampling.get("presence_penalty")
-        pp_on = _number(pp) and float(pp) != 0.0
-        if rp_on:
-            keys += f" penalty_repeat={float(rp)!r}"
-        if pf_on:
-            keys += f" penalty_freq={float(pf)!r}"
-        if pp_on:
-            keys += f" penalty_present={float(pp)!r}"
-        if rp_on or pf_on or pp_on:
+        pp_v = float(pp) if _number(pp) and float(pp) != 0.0 else None
+        if rp_v is not None:
+            keys += f" penalty_repeat={rp_v!r}"
+        if pf_v is not None:
+            keys += f" penalty_freq={pf_v!r}"
+        if pp_v is not None:
+            keys += f" penalty_present={pp_v!r}"
+        if rp_v is not None or pf_v is not None or pp_v is not None:
             # the window the penalties count over: the request's, else llama.cpp's default
             pln = sampling.get("penalty_last_n")
             keys += f" penalty_last_n={int(pln) if _number(pln) else PENALTY_LAST_N_DEFAULT}"
@@ -1261,7 +1270,8 @@ class ProcessEngine:
                 self.proc.stdin.write(f"GENT {int(max_new)}{self.sampling_keys(sampling or {})}{clip} "
                                       f"{len(body.encode('utf-8'))}{plain}\n{body}")
             else:
-                self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
+                tokens = ids if isinstance(ids, list) else ids.ids()
+                self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in tokens)}\n")
             self.proc.stdin.flush()
         except OSError:                                  # the pipe is gone: the engine died
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None

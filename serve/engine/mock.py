@@ -31,6 +31,7 @@ class MockEngine:
                                                                                  else script)]
         self.script, self.turns = self.scripts[0], 0
         self.last_prompt: list[int] = []
+        self.info: dict = {}                            # no arena, no cards: the fields the real engine reports
 
     def queue_depth(self) -> int:
         with self.cv:
