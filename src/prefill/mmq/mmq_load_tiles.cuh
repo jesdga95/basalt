@@ -297,12 +297,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const block_iq3_xxs * bxi = (const block_iq3_xxs *) x + kbx0 + i*stride;
 
         const int2 q3_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
-        const uint8_t * q3 = (const uint8_t *) &q3_packed;
         const uint32_t aux32 = get_int_b2(bxi->qs, QK_K/16 + kqsx);
 
 #pragma unroll
         for (int l = 0; l < QR3_XXS; ++l) {
-            const int2 grid_pos = make_int2(iq3xxs_grid[q3[2*l+0]], iq3xxs_grid[q3[2*l+1]]);
+            const int2 grid_pos = make_int2(iq3xxs_grid[packed_byte(q3_packed, 2*l+0)], iq3xxs_grid[packed_byte(q3_packed, 2*l+1)]);
             const uint32_t signs = unpack_ksigns(aux32 >> (7*l));
 
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
