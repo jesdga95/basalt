@@ -289,6 +289,10 @@ Flow Request::restore() {
     runtime_.park_keep = slot_source;   // the conversation this request continues stays where it is
     keep_routed.emplace(runtime_.kv_keep_routed);
     runtime_.kv_keep_routed = runtime_.batch_on();
+    runtime_.peer_due.clear();
+    runtime_.peer_due_off = runtime_.peer_due_lent_n = 0;
+    defer_peer.emplace(runtime_.peer_defer);
+    runtime_.peer_defer = !in_slot;
     kv_ok = runtime_.kv_fit(*runtime_.rsp, kv_need + runtime_.kKvGrowCells, runtime_.err, true, kv_need + runtime_.kKvWindowCells);
     if (!kv_ok && runtime_.kv_short) {   // the other sessions' spare cells first
         int64_t given = 0;

@@ -500,23 +500,40 @@ CALL_END = "</tool_call>"
 
 PARAM_END = "</parameter>"
 FUNC_END = "</function>"
+PARAM_START = "<parameter="
+FUNC_START = "<function="
+_QUOTED_OPEN = re.compile(r"<function=[^<>\s]+>\s*(?:<parameter=|</function>)")
 
 
-def param_end(text: str, final: bool = False) -> int:
-    """Where a parameter value ends: the first `</parameter>` followed by `<parameter=` or `</function>`, so the
-    same text inside a value is kept. -1: none yet; -2: candidate awaiting its follower (`final` accepts it)."""
+def param_end(text: str, final: bool = False, name: str | None = None) -> int:
+    """Find a structural parameter close, keeping quoted calls and a reopened parameter inside its value.
+    -1: none yet; -2: candidate awaiting more output. `final` falls back to the plain structural close."""
     at = text.find(PARAM_END)
+    fallback = -1
     while at >= 0:
         after = text[at + len(PARAM_END):].lstrip()
-        if after.startswith(("<parameter=", FUNC_END)):
-            return at
-        if not after or "<parameter=".startswith(after) or FUNC_END.startswith(after):
-            return at if final else -2
+        candidate = -1
+        if after.startswith(PARAM_START):
+            gt = after.find(">")
+            if gt < 0:
+                candidate = at if final else -2
+            elif name is None or after[len(PARAM_START):gt].strip() != name:
+                candidate = at
+        elif after.startswith(FUNC_END):
+            candidate = at
+        elif not after or PARAM_START.startswith(after) or FUNC_END.startswith(after):
+            candidate = at if final else -2
+        if candidate != -1:
+            if len(_QUOTED_OPEN.findall(text, 0, at)) <= text.count(FUNC_END, 0, at):
+                return candidate
+            if fallback < 0:
+                fallback = at
         at = text.find(PARAM_END, at + 1)
-    return -1
+    # An unclosed quoted function must not hide the enclosing call at end of output.
+    return fallback if final else (-2 if fallback >= 0 else -1)
 
 
-def call_end(text: str) -> int:
+def call_end(text: str, final: bool = False) -> int:
     """Where a call body ends: the `</tool_call>` after its own `</function>` (found via param_end); -1: incomplete.
     A body not in the call format ends at the first `</tool_call>`."""
     s = text.lstrip()
@@ -535,7 +552,7 @@ def call_end(text: str) -> int:
             gt = text.find(">", pos)
             if gt < 0:
                 return -1
-            end = param_end(text[gt + 1:])
+            end = param_end(text[gt + 1:], final=final, name=text[pos:gt].split("=", 1)[1].strip())
             if end < 0:
                 return -1
             pos = gt + 1 + end + len(PARAM_END)
@@ -639,6 +656,70 @@ def _decode_param(value: str, schema) -> object:
         return value
 
 
+def _deref(root: dict, schema):
+    """Follows local $ref links ("#/a/b") to the schema they name; None if one does not resolve."""
+    for _ in range(32):
+        ref = schema.get("$ref") if isinstance(schema, dict) else None
+        if not isinstance(ref, str):
+            return schema
+        if not ref.startswith("#/"):
+            return None
+        cur = root
+        for part in ref[2:].split("/"):
+            if isinstance(cur, dict):
+                cur = cur.get(part)
+            elif isinstance(cur, list) and part.isdigit() and int(part) < len(cur):
+                cur = cur[int(part)]
+            else:
+                return None
+        schema = cur
+    return schema
+
+
+def _union_variants(root: dict, schema, out: list, depth: int = 0) -> None:
+    """The object variants of a oneOf/anyOf union, nested unions flattened."""
+    schema = _deref(root, schema)
+    if not isinstance(schema, dict) or depth > 8:
+        return
+    unions = [schema[k] for k in ("oneOf", "anyOf") if isinstance(schema.get(k), list)]
+    for alts in unions:
+        for alt in alts:
+            _union_variants(root, alt, out, depth + 1)
+    if not unions and isinstance(schema.get("properties"), dict):
+        out.append(schema)
+
+
+def _tool_properties(tool: dict | None) -> dict:
+    """A tool's parameter schemas by name. Parameters sent as a union ({"properties": {}, "oneOf": [...]}) take the
+    properties of every variant, string enums united, as the tool-call grammar does."""
+    params = (tool or {}).get("parameters") or {}
+    props = params.get("properties") if isinstance(params, dict) else None
+    if props or not isinstance(params, dict):
+        return props or {}
+    variants = []
+    for k in ("oneOf", "anyOf"):
+        for alt in params.get(k) if isinstance(params.get(k), list) else []:
+            _union_variants(params, alt, variants)
+    merged = {}
+    for v in variants:
+        for name, prop in v["properties"].items():
+            value = _deref(params, prop)
+            value = value if value is not None else {}
+            cur = merged.get(name)
+            if cur is None:
+                merged[name] = value
+            elif cur == value:
+                continue
+            elif all(isinstance(s, dict) and isinstance(s.get("enum"), list)
+                     and all(isinstance(e, str) for e in s["enum"]) for s in (cur, value)):
+                merged[name] = dict(cur, enum=cur["enum"] + [e for e in value["enum"] if e not in cur["enum"]])
+            elif isinstance(cur, dict) and list(cur) == ["anyOf"]:
+                merged[name] = {"anyOf": cur["anyOf"] + ([value] if value not in cur["anyOf"] else [])}
+            else:
+                merged[name] = {"anyOf": [cur, value]}
+    return merged
+
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """`<function=NAME>...</function>` -> ToolCall. Values are JSON-decoded when the schema says non-string
     (without a schema: when they parse as JSON objects, arrays, numbers or booleans)."""
@@ -647,13 +728,13 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
         raise ValueError("malformed tool call: " + body[:80])
     name = body[len("<function="):body.index(">")]
     rest = body[body.index(">") + 1:]
-    props = ((schema or {}).get("parameters") or {}).get("properties") or {}
+    props = _tool_properties(schema)
     args = {}
     while "<parameter=" in rest:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
         pname = rest[:rest.index(">")]
         rest = rest[rest.index(">") + 1:]
-        end = param_end(rest, final=True)
+        end = param_end(rest, final=True, name=pname.strip())
         value = rest[:end] if end >= 0 else rest
         rest = rest[end + len(PARAM_END):] if end >= 0 else ""
         if value.startswith("\n"):
@@ -711,8 +792,9 @@ class OutputParser:
         self.sval_started = False
         self.sdeclared = {}
         self.spname = ""
+        self.svstart = 0
 
-    def _scan(self) -> list[Event]:
+    def _scan(self, final: bool = False) -> list[Event]:
         """Advance the streaming view of the call body."""
         out = []
 
@@ -728,8 +810,7 @@ class OutputParser:
                     return out
                 name = rest[a + 10:b]
                 self.scall = ToolCall(name=name, arguments={})
-                props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
-                self.sdeclared = props
+                self.sdeclared = _tool_properties(self.schemas.get(name))
                 out.append(Event("tool_start", call=self.scall))
                 args("{")
                 self.sp += b + 1
@@ -766,7 +847,9 @@ class OutputParser:
                         self.sp += 1
                         rest = rest[1:]
                     self.sval_started = True
-                end = param_end(rest)
+                    self.svstart = self.sp
+                end = param_end(self.buf[self.svstart:], final=final, name=self.spname) if PARAM_END in rest else -1
+                end = end - (self.sp - self.svstart) if end >= 0 else end
                 if end >= 0:
                     value = rest[:end]
                     if value.endswith("\n"):
@@ -784,7 +867,7 @@ class OutputParser:
                     self.sp += safe
                 return out
             elif self.ss == "raw":
-                end = param_end(rest)
+                end = param_end(rest, final=final, name=self.spname)
                 if end < 0:
                     return out
                 value = rest[:end]
@@ -839,7 +922,7 @@ class OutputParser:
                     best = max(best, n)
         return best
 
-    def feed(self, delta: str) -> list[Event]:
+    def feed(self, delta: str, *, final: bool = False) -> list[Event]:
         self.buf += delta
         out: list[Event] = []
         while True:
@@ -897,15 +980,15 @@ class OutputParser:
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
             else:
-                i = call_end(self.buf)
+                i = call_end(self.buf, final=final)
                 if self.stream_tools:
                     if i >= 0:
                         whole, self.buf = self.buf, self.buf[:i]     # scan only the body
-                        out += self._scan()
+                        out += self._scan(final=final)
                         out += self._close_scan()
                         self.buf = whole
                     else:
-                        out += self._scan()
+                        out += self._scan(final=final)
                 if i < 0:
                     return out
                 body = self.buf[:i]
@@ -921,9 +1004,8 @@ class OutputParser:
     def finish(self) -> list[Event]:
         """End of generation: flush what is held (an unterminated call becomes content; an announced one is left
         unfinished with no "tool_call")."""
-        out = []
+        out = self.feed("", final=True)
         if self.state == "call" and self.stream_tools and self.scall is not None:
-            out += self._scan()                 # ended inside an announced call
             if self.ss == "done":               # only </tool_call> is missing
                 out.append(Event("tool_call", call=self.scall))
             self.buf = ""
