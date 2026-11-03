@@ -138,8 +138,8 @@ blobs at the model's geometry, up to 8 rows per expert, against a double-precisi
 expert outputs, MMQ / CPU: 1.0e-2 / 1.2e-2 with plain activations (all four format pairs), 1.4e-2 to 1.6e-2 / 3.1e-2 to
 3.4e-2 when 0.5% of the activations are 12 times larger (the CPU's Q8_K block is 256 values wide, MMQ's 32). A row's output
 does not depend on how many tokens share its expert's job (bitwise, every pair). Quality gate, IQ3_S, 100 chunks, against the
-BF16 base, 400 W + 180 W, the 256-token prompt half through this path: KLD 0.14972 against 0.15003 with every prompt
-expert on the GPU (`--prefill-cpu-share 0`), paired difference +0.0003 [-0.0010, +0.0016]. The share is a fixed 0.6 of the routed experts outside the cache by default (`--prefill-cpu-share`), not a timing-driven
+BF16 base, 400 W + 180 W, the 256-token prompt half through this path: KLD 0.14920 against 0.15003 with every prompt
+expert on the GPU (`--prefill-cpu-share 0`), paired difference -0.0008 [-0.0021, +0.0004]. The share is a fixed 0.6 of the routed experts outside the cache by default (`--prefill-cpu-share`), not a timing-driven
 value; the cache enters only through its table, not through which slots a read lends or which lent experts keep a RAM
 copy (both follow the read's chunk and the K/V mode), so which experts the CPU computes depends only on the routing and
 the tiers, and prefill is reproducible bit for bit between runs and between K/V modes (six identical greedy outputs on
