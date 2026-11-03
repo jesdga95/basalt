@@ -96,7 +96,7 @@ Verifier::~Verifier() {
     if (ev_join_) cudaEventDestroy(ev_join_);
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_, h_pend_,
-                     h_flagA_, h_plan_, h_flagB_, h_q_, h_qp_, h_top_};
+                     h_flagA_, h_plan_, h_flagB_, h_q_, h_qp_, h_top_, h_head_from_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -187,6 +187,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
+              mapped(64, (void**) &h_head_from_, (void**) &m_head_from_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
@@ -246,8 +247,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
         head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
-        if (head_ != nullptr && head_->vproxy() != nullptr)
+        if (head_ != nullptr && head_->vproxy() != nullptr) {
             vhead_scratch_ = b.take<uint8_t>(basalt::kernels::q6k_vhead_scratch_bytes());
+            head_from_d_ = b.take<int32_t>(4);
+        }
         if (head_ != nullptr && head_->planes()) {
             vhead_scratch_ = b.take<uint8_t>(basalt::kernels::q80p_vhead_scratch_bytes());
             head_keep_d_ = b.take<int32_t>(1);
