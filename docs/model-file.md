@@ -10,7 +10,7 @@ The layout diagram is in the [README](../README.md#models).
 - **Layout:** a 64 KiB header (magic `BASALTMF`, version 2, a table of up to 511 named sections, each with its offset,
   size and SHA-256), then the sections, each aligned to 2 MiB so it can be memory-mapped or read with `O_DIRECT`.
 - **Sections:** `meta` (JSON: the source GGUF metadata with its `general.sampling.*` defaults, every tensor's type,
-  shape and offset, provenance and license), `tokenizer/*`, `dense`, `experts` and `experts.layout` (the routed
+  shape and offset, provenance and license), `tokenizer/*`, `dense` and `dense.index`, `experts` and `experts.layout` (the routed
   experts, laid out per layer), `gguf` (every non-expert source tensor), `mtp/*` (the drafter), `hc8` (the int8 copies
   of the hyper-connection matrices the decode reads, computed by the converter so a start reads them as they are) and
   `vision/*`. The authoritative description is [include/basalt/core/model_format.hpp](../include/basalt/core/model_format.hpp).
@@ -65,7 +65,7 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-UD-Q4_K_XL.basalt --
 
 `--mtp-dense FILE` replaces the dense part of the drafter copied from the base with a tuned layer. The file is the raw
 bytes of the `mtp/dense` section of an official IQ3_S, IQ3_XXS or Q2_0 pack (for example
-`ModelFile(path).read("mtp/dense")` from `tools/convert/model_file.py`); its size must match the base's section, and the
+`ModelFile(path).read("mtp/dense")` from `tools/model_file.py`); its size must match the base's section, and the
 converter records its SHA-256 in `meta.mtp.dense` with the tuning `self_distilled`. Add it to either command:
 
 ```sh
