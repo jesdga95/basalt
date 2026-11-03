@@ -112,6 +112,9 @@ reports both. Everything above applies, and:
 - `nvidia-smi` lists the NPU as a second device with no CUDA compute capability: `gpu auto` skips it, and an unset
   `gpu` does not count it.
 - The GPU reads page-locked host memory at addresses of its own, so the resident RAM copy is never unpinned.
+- In Modern Standby (the screen off or the session locked, on a laptop that sleeps that way) the driver can move the
+  GPU's memory to RAM and the pagefile, and a running engine stalls until the machine wakes. Keep it awake while it
+  serves: no sleep and no screen timeout while plugged in.
 - The CPU tier runs the NEON kernels, whose rows differ from the x86 ones by summation order
   ([precision/builds.md](precision/builds.md#the-arm64-build)). Quality has not been measured on Arm64.
 
