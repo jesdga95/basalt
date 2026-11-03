@@ -14,14 +14,6 @@
 #include <cpuid.h>
 #endif
 
-// Marks a function that uses AVX2, FMA and F16C intrinsics in a translation unit built without those flags. MSVC
-// accepts the intrinsics in any function and needs no marking.
-#if defined(_MSC_VER)
-#define BASALT_TARGET_AVX2_FMA_F16C
-#else
-#define BASALT_TARGET_AVX2_FMA_F16C __attribute__((target("avx2,fma,f16c")))
-#endif
-
 namespace basalt::platform {
 
 // MSVC can retain temporary stack copies for vector aggregate assignments even after inlining.

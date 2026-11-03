@@ -7,51 +7,23 @@
 #include "basalt/core/progress.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
 #include "basalt/kernels/dec_moe.hpp"
+#include "basalt/kernels/cpu/router_q4.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstring>
 #include <vector>
-#include <immintrin.h>
 
 namespace basalt::core::verify_detail {
 
 // layer `c.layer`'s router rows [e0, e1) on the job's tokens
-BASALT_TARGET_AVX2_FMA_F16C void warm_logits(CpuWarm& c, int e0, int e1, const std::atomic<bool>& stop) {
-    const int NB = c.n_embd / 32, pt = c.n_tok;
-    const uint8_t* R = c.rq.data() + (size_t) c.layer * c.n_expert * (c.n_embd / 2);
-    const float* S = c.rs.data() + (size_t) c.layer * c.n_expert * NB;
-    const __m128i lo4 = _mm_set1_epi8(0x0f), off = _mm_set1_epi8(8);
-    for (int e = e0; e < e1; ++e) {
-        if (stop.load(std::memory_order_relaxed)) return;
-        __m256 acc[basalt::kernels::kVerifyMaxT];
-        for (int t = 0; t < pt; ++t) acc[t] = _mm256_setzero_ps();
-        const uint8_t* row = R + (size_t) e * (c.n_embd / 2);
-        for (int b = 0; b < NB; ++b) {
-            const __m128i q = _mm_loadu_si128((const __m128i*) (row + b * 16));
-            const __m128i ql = _mm_sub_epi8(_mm_and_si128(q, lo4), off);
-            const __m128i qh = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(q, 4), lo4), off);
-            const __m256i wl = _mm256_cvtepi8_epi16(ql);
-            const __m256i wh = _mm256_cvtepi8_epi16(qh);
-            const float sw = S[(size_t) e * NB + b];
-            for (int t = 0; t < pt; ++t) {
-                const uint8_t* blk = c.xq + ((size_t) t * NB + b) * 36;   // block_q8_1: half d, half s, 32 x int8
-                uint16_t dh;
-                std::memcpy(&dh, blk, 2);
-                const __m256i x = _mm256_loadu_si256((const __m256i*) (blk + 4));
-                const __m256i p = _mm256_add_epi32(_mm256_madd_epi16(wl, _mm256_cvtepi8_epi16(_mm256_castsi256_si128(x))),
-                                                   _mm256_madd_epi16(wh, _mm256_cvtepi8_epi16(_mm256_extracti128_si256(x, 1))));
-                acc[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(sw * _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(dh)))), acc[t]);
-            }
-        }
-        for (int t = 0; t < pt; ++t) {
-            __m128 v = _mm_add_ps(_mm256_castps256_ps128(acc[t]), _mm256_extractf128_ps(acc[t], 1));
-            v = _mm_add_ps(v, _mm_movehl_ps(v, v));
-            v = _mm_add_ss(v, _mm_shuffle_ps(v, v, 1));
-            c.logits[(size_t) t * c.n_expert + e] = _mm_cvtss_f32(v);
-        }
-    }
+void warm_logits(CpuWarm& c, int e0, int e1, const std::atomic<bool>& stop) {
+    static_assert(basalt::kernels::kVerifyMaxT <= basalt::kernels::cpu::kRouterQ4MaxT, "a job's tokens fit one call");
+    const size_t nb = (size_t) (c.n_embd / 32);
+    basalt::kernels::cpu::router_q4_logits(c.rq.data() + (size_t) c.layer * c.n_expert * (c.n_embd / 2),
+                                           c.rs.data() + (size_t) c.layer * c.n_expert * nb, c.n_embd, c.n_expert, e0, e1,
+                                           c.xq, c.n_tok, c.logits.data(), stop);
 }
 
 // every token's top k (softmax weights over them), summed per predicted expert only the CPU holds; the likeliest
@@ -94,7 +66,7 @@ void warm_job(void* ctx, int w, int W, const std::atomic<bool>& stop) {
     } else {
         while (c.ready.load(std::memory_order_acquire) == 0) {
             if (stop.load(std::memory_order_relaxed)) return;
-            _mm_pause();
+            basalt::platform::cpu_relax();
         }
     }
     // this worker's share of the blob, one load per line: the gate and up rows first (computed first), then the down
