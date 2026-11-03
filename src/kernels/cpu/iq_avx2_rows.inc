@@ -1,7 +1,9 @@
 // src/kernels/cpu/iq_avx2_rows.inc - the i-quant expert rows in 256-bit lanes, several tokens at once.
 //
 // Included by iq_avx2.cpp (BASALT_IQ_VNNI 0: `madd` and `add`) and iq_avx2_vnni.cpp (BASALT_IQ_VNNI 1: the AVX-VNNI
-// instruction that does both), which name the exported functions through BASALT_IQ_EXPORT.
+// instruction that does both), which name the exported functions through BASALT_IQ_EXPORT.  BASALT_IQ_BMI2 1 builds the
+// IQ3_S and IQ2_S grid indices with `pdep`; the build without it keeps the scalar index arithmetic, since `pdep` is
+// slow on some AVX2 CPUs.
 // The AVX-512 kernels' (iq_avx512.cpp) multi-token scheme on the CPUs without AVX-512: each 32-value chunk is decoded once - grid lookups, one sign vector,
 // one scale vector - and every token of the verify window applies them with a load, a `sign`, a `maddubs`,
 // a `madd` and an `add`.  ggml-cpu's own AVX2 dot products for these formats are single-token: every token
@@ -23,12 +25,12 @@ inline uint64_t u64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); retur
 // the index of the lowest set bit of a nonzero mask: the compiler's own scan
 inline int lowest_bit(unsigned m) { return platform::ctz32(m); }
 
-// 32 sign bits -> 32 bytes of -1 (bit set) / +1: ggml's bit_selector pattern, shared by all tokens.
+// 32 sign bits -> 32 bytes of -1 (bit set) / +1: ggml's bit_selector pattern, shared by all tokens.  The mask is
+// broadcast to every dword, so one in-lane shuffle spreads bytes 0-1 over the low lane and 2-3 over the high one.
 inline __m256i sgn_vec(uint32_t m) {
-    const __m128i bm = _mm_set1_epi32((int) m);
-    const __m128i lo = _mm_shuffle_epi8(bm, _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1));
-    const __m128i hi = _mm_shuffle_epi8(bm, _mm_setr_epi8(2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3));
-    const __m256i bits = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+    const __m256i bits = _mm256_shuffle_epi8(_mm256_set1_epi32((int) m),
+                                             _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+                                                              2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3));
     const __m256i sel = _mm256_setr_epi8(1, 2, 4, 8, 16, 32, 64, (char) 0x80,
                                          1, 2, 4, 8, 16, 32, 64, (char) 0x80,
                                          1, 2, 4, 8, 16, 32, 64, (char) 0x80,
@@ -148,15 +150,18 @@ template <> struct Fmt32<22> {   // IQ2_S: d, qs[64] (32 grid bytes, 32 sign byt
     static constexpr int bytes = 82;
     static constexpr float K = 0.125f;
     static inline void decode(const uint8_t* b, int j, int half, __m256i& g, __m256i& sgn, __m256i& sc) {
-        const uint8_t* qs = b + 2 + 8 * j;
+        const uint8_t* qs = b + 2 + 8 * j + 4 * half;
         const uint8_t h = b[66 + 2 * j + half];
-        const int o = 4 * half;
-        g = _mm256_set_epi64x((long long) iq2s_grid[qs[o + 3] | ((h << 2) & 0x300)],
-                              (long long) iq2s_grid[qs[o + 2] | ((h << 4) & 0x300)],
-                              (long long) iq2s_grid[qs[o + 1] | ((h << 6) & 0x300)],
-                              (long long) iq2s_grid[qs[o] | ((h << 8) & 0x300)]);
-        const uint64_t m = u64(b + 2 + 32 + 8 * j);
-        sgn = sgn_vec(half ? (uint32_t) (m >> 32) : (uint32_t) m);
+#if BASALT_IQ_BMI2
+        // the four 10-bit indices as 16-bit fields of one register: qs[k] | (bits 2k, 2k+1 of qh) << 8
+        const uint64_t a = _pdep_u64(u32(qs), 0x00FF00FF00FF00FFull) | _pdep_u64(h, 0x0300030003000300ull);
+#define G2(k) (long long) iq2s_grid[(uint16_t) (a >> (16 * (k)))]
+#else
+#define G2(k) (long long) iq2s_grid[qs[k] | ((h << (8 - 2 * (k))) & 0x300)]
+#endif
+        g = _mm256_set_epi64x(G2(3), G2(2), G2(1), G2(0));
+#undef G2
+        sgn = sgn_vec(u32(b + 2 + 32 + 8 * j + 4 * half));
         const uint8_t sb = b[74 + 2 * j + half];
         sc = sc16(2 * (sb & 15) + 1, 2 * (sb >> 4) + 1);
     }
@@ -182,11 +187,18 @@ template <> struct Fmt32<21> {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4
     static inline void decode(const uint8_t* b, int j, int half, __m256i& g, __m256i& sgn, __m256i& sc) {
         const uint8_t* q = b + 2 + 16 * j + 8 * half;
         const uint32_t h = b[66 + 2 * j + half];
-#define G3(k) (int) iq3s_grid[q[k] | (((h >> k) & 1u) << 8)]
+#if BASALT_IQ_BMI2
+        // the eight 9-bit indices as 16-bit fields of two registers: q[k] | (bit k of qh) << 8
+        const uint64_t q8 = u64(q);
+        const uint64_t lo = _pdep_u64(q8, 0x00FF00FF00FF00FFull) | _pdep_u64(h, 0x0100010001000100ull);
+        const uint64_t hi = _pdep_u64(q8 >> 32, 0x00FF00FF00FF00FFull) | _pdep_u64(h >> 4, 0x0100010001000100ull);
+#define G3(k) (int) iq3s_grid[(uint16_t) (((k) < 4 ? lo : hi) >> (16 * ((k) & 3)))]
+#else
+#define G3(k) (int) iq3s_grid[q[k] | ((h << (8 - (k))) & 0x100)]
+#endif
         g = _mm256_set_epi32(G3(7), G3(6), G3(5), G3(4), G3(3), G3(2), G3(1), G3(0));
 #undef G3
-        const uint64_t m = u64(b + 74 + 8 * j);
-        sgn = sgn_vec(half ? (uint32_t) (m >> 32) : (uint32_t) m);
+        sgn = sgn_vec(u32(b + 74 + 8 * j + 4 * half));
         const uint8_t s = b[106 + j];
         sc = sc32(half ? 2 * (s >> 4) + 1 : 2 * (s & 15) + 1);
     }

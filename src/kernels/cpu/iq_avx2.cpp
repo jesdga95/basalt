@@ -17,6 +17,7 @@
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
 #define BASALT_IQ_VNNI 0
+#define BASALT_IQ_BMI2 0
 #define BASALT_IQ_EXPORT(name) name##_base
 #include "iq_avx2_rows.inc"
 
