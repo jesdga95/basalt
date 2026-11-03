@@ -1,9 +1,16 @@
 # basalt: a local inference engine for one NVIDIA GPU.
 cmake_minimum_required(VERSION 3.24)
+# Blackwell's compute capability on the target: 12.0 for the discrete cards on x86-64, 12.1 for the integrated GPU
+# on Arm64, settled once the target is known (below).
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
+  set(_basalt_default_arch ON)
 endif()
 project(basalt VERSION 0.2.1 LANGUAGES C CXX CUDA)
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/target_arch.cmake)
+if(_basalt_default_arch AND BASALT_ARM64)
+  set(CMAKE_CUDA_ARCHITECTURES 121 CACHE STRING "CUDA architectures" FORCE)
+endif()
 add_compile_definitions(BASALT_VERSION="${PROJECT_VERSION}")
 
 set(CMAKE_CXX_STANDARD 20)
@@ -37,17 +44,22 @@ endfunction()
 # the CUDA language gives the .cu compile rules but not the imported targets, so `CUDA::cudart` is brought in
 # explicitly for the host-side programs that call the runtime themselves
 find_package(CUDAToolkit REQUIRED)
-# One architecture only: the kernels use its instructions and nothing else is tested.
+# One architecture only: the kernels use its instructions and nothing else is tested. Blackwell 12.0 or 12.1; the
+# engine refuses a card of any other compute capability at start (BASALT_CUDA_CC).
+set(_basalt_cc "")
 foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX REPLACE "[-a].*$" "" _base "${_a}")     # 120-real / 120a are still 120
-  if(NOT _base STREQUAL "120")
-    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': basalt builds for compute capability 12.0 only")
+  if(NOT _base MATCHES "^12[01]$" OR (_basalt_cc AND NOT _base STREQUAL _basalt_cc))
+    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': basalt builds for one compute "
+                        "capability, 12.0 or 12.1")
   endif()
+  set(_basalt_cc "${_base}")
 endforeach()
 if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
   message(FATAL_ERROR "CUDA ${CMAKE_CUDA_COMPILER_VERSION}: basalt needs CUDA 13.0 or newer")
 endif()
 message(STATUS "basalt: CUDA arch ${CMAKE_CUDA_ARCHITECTURES}")
+add_compile_definitions(BASALT_CUDA_CC=${_basalt_cc})
 set(_gpu_runtime_target CUDA::cudart)
 set(_gpu_blas_target CUDA::cublas)
 set(_gpu_include_directories ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -1329,7 +1341,7 @@ target_link_libraries(mmq PUBLIC ggml_quants ${_gpu_runtime_target})
 target_link_libraries(prefill PUBLIC mmq)
 # the FP4 block-scaled tensor-core experts (need the a-variant of the architecture)
 add_library(fp4 STATIC src/prefill/fp4/moe_fp4.cu)
-set_target_properties(fp4 PROPERTIES CUDA_ARCHITECTURES 120a-real)
+set_target_properties(fp4 PROPERTIES CUDA_ARCHITECTURES ${_basalt_cc}a-real)
 target_include_directories(fp4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(fp4 PUBLIC mmq ${_gpu_runtime_target})
 target_link_libraries(prefill PUBLIC fp4)

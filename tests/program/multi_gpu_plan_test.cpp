@@ -3,6 +3,7 @@
 #include "basalt/program/gpu_select.hpp"
 #include "basalt/program/multi_gpu_plan.hpp"
 
+#include "basalt/core/cuda_arch.hpp"
 #include "basalt/platform/process.hpp"
 
 #include <algorithm>
@@ -25,7 +26,8 @@ static GpuCard card(int smi, const char* name, double gbps, uint64_t gib) {
     c.token = std::to_string(smi);
     c.smi = smi;
     c.name = name;
-    c.cc_major = 12;
+    c.cc_major = basalt::core::kCudaCcMajor;   // a card this build runs on
+    c.cc_minor = basalt::core::kCudaCcMinor;
     c.mem_gbps = gbps;
     c.vram = gib * GiB;
     return c;

@@ -1,6 +1,7 @@
 // src/program/gpu_select.cpp - see gpu_select.hpp.
 #include "basalt/program/gpu_select.hpp"
 
+#include "basalt/core/cuda_arch.hpp"
 #include "basalt/log.hpp"
 #include "basalt/platform/dynlib.hpp"
 #include "basalt/platform/process.hpp"
@@ -93,7 +94,11 @@ NvmlCards read_nvml() {
                 char u[96] = {0};
                 if (uuid && uuid(h, u, sizeof u) == 0) id = u;
                 int ma = 0, mi = 0;
-                if (cc && cc(h, &ma, &mi) == 0) { c.cc_major = ma; c.cc_minor = mi; }
+                if (cc) {
+                    const int rc = cc(h, &ma, &mi);
+                    if (rc == 0) { c.cc_major = ma; c.cc_minor = mi; }
+                    else if (rc == 3 /* NVML_ERROR_NOT_SUPPORTED */) c.compute = false;
+                }
                 MemInfo m{};
                 if (mem && mem(h, &m) == 0) c.vram = m.total;
                 unsigned width = 0, mhz = 0;
@@ -133,7 +138,10 @@ bool parse_gpu_spec(const std::string& text, GpuSpec& out, std::string& err) {
     return true;
 }
 
-bool gpu_supported(const GpuCard& c) { return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0); }
+bool gpu_supported(const GpuCard& c) {
+    return c.compute && (c.cc_major == 0 || (c.cc_major == basalt::core::kCudaCcMajor &&
+                                             c.cc_minor == basalt::core::kCudaCcMinor));
+}
 
 std::string gpu_label(const std::vector<GpuCard>& visible, int index) {
     std::string s = "GPU " + std::to_string(index);
@@ -145,9 +153,12 @@ std::string gpu_label(const std::vector<GpuCard>& visible, int index) {
 GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, bool known) {
     GpuChoice c;
     const int n = (int) visible.size();
+    const std::string sm = basalt::core::cuda_sm_text();
     auto unsupported = [&](int i) {
-        return "gpu: " + gpu_label(visible, i) + " is sm_" + std::to_string(visible[(size_t) i].cc_major) +
-               std::to_string(visible[(size_t) i].cc_minor) + ", not sm_120";
+        const GpuCard& g = visible[(size_t) i];
+        return "gpu: " + gpu_label(visible, i) +
+               (g.compute ? " is sm_" + std::to_string(g.cc_major) + std::to_string(g.cc_minor) + ", not " + sm
+                          : std::string(" is not a CUDA GPU"));
     };
     if (spec.kind == GpuSpec::Kind::Auto) {
         if (!known) {
@@ -157,10 +168,11 @@ GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, 
         std::vector<int> ok;
         for (int i = 0; i < n; ++i) {
             if (gpu_supported(visible[(size_t) i])) ok.push_back(i);
-            else c.notes.push_back("gpu auto: " + gpu_label(visible, i) + " skipped, not sm_120");
+            else c.notes.push_back("gpu auto: " + gpu_label(visible, i) + " skipped, not " +
+                                   (visible[(size_t) i].compute ? sm : std::string("a CUDA GPU")));
         }
         if (ok.empty()) {
-            c.error = n == 0 ? "gpu auto: no GPU is visible" : "gpu auto: no sm_120 GPU visible";
+            c.error = n == 0 ? "gpu auto: no GPU is visible" : "gpu auto: no " + sm + " GPU visible";
             return c;
         }
         // the main card: the most memory bandwidth, then the most VRAM, then the lowest number
