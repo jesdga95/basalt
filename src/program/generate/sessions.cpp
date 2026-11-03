@@ -1,4 +1,5 @@
 #include "context.hpp"
+#include "basalt/core/device_memory.hpp"
 
 namespace basalt::program::generate {
 
@@ -82,7 +83,7 @@ int sessions(Context& context) {
             !st.wt.load(pack_files, arena_s, pool_s, err, skip_s.empty() ? nullptr : &skip_s)) {
             cudaGetLastError();
             size_t free_b = 0, total_b = 0;   // what that card had free
-            cudaMemGetInfo(&free_b, &total_b);
+            basalt::core::device_mem_info(&free_b, &total_b);
             basalt::log::error("basalt generate", "layer split, CUDA%d weights: %s (%llu MiB needed, %llu MiB of %llu "
                                  "MiB free on that card)", st.dev,
                          err.empty() ? "the weight arena does not fit" : err.c_str(),
@@ -135,7 +136,7 @@ int sessions(Context& context) {
                                  "%.2f", st.dev, bw, bursts.c_str(), st.pcie_frac);
         }
         size_t fb = 0, tb = 0;
-        cudaMemGetInfo(&fb, &tb);
+        basalt::core::device_mem_info(&fb, &tb);
         basalt::log::info("basalt generate", "layer split: CUDA%d holds its weights; %.2f GiB free (its session "
                              "follows the split search)", st.dev, (double) fb / 1073741824.0);
     }
@@ -238,7 +239,7 @@ int sessions(Context& context) {
             return 1;
         }
         size_t fb = 0, tb = 0;
-        cudaMemGetInfo(&fb, &tb);
+        basalt::core::device_mem_info(&fb, &tb);
         basalt::log::info("basalt generate", "layer split: CUDA%d holds its weights, session [%lld, %lld)%s; "
                              "%.2f GiB free", st.dev, (long long) st.lb, (long long) st.le,
                      last ? " and the head" : "", (double) fb / 1073741824.0);
@@ -295,7 +296,7 @@ int sessions(Context& context) {
                     cudaGetLastError();
                     if (buf != nullptr) cudaFree(buf);
                     size_t fb = 0, tb = 0;
-                    cudaMemGetInfo(&fb, &tb);
+                    basalt::core::device_mem_info(&fb, &tb);
                     basalt::log::warn("basalt generate", "--batch %d: slot %d's session does not fit on CUDA%d "
                                          "(%.2f GiB, %.2f GiB free); %d slot%s", o.batch, b, dev,
                                  (double) bytes / 1073741824.0, (double) fb / 1073741824.0, b, b == 1 ? "" : "s");
@@ -310,7 +311,7 @@ int sessions(Context& context) {
             }
             cudaDeviceSynchronize();
             size_t fb = 0, tb = 0;
-            cudaMemGetInfo(&fb, &tb);
+            basalt::core::device_mem_info(&fb, &tb);
             basalt::log::info("basalt generate", "--batch: %d slot sessions on CUDA%d (%.2f GiB in all); %.2f GiB free",
                          (int) bslot_ss[k].size(), dev, (double) total / 1073741824.0, (double) fb / 1073741824.0);
         }

@@ -1,4 +1,5 @@
 #include "context.hpp"
+#include "basalt/core/device_memory.hpp"
 
 namespace basalt::program::generate {
 
@@ -52,7 +53,7 @@ int layer_plan(Context& context) {
     auto stage_room = [&](int dev, bool later, int64_t extra_mib) -> int64_t {
         const basalt::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
-        if (const cudaError_t e = cudaMemGetInfo(&fb, &tb); e != cudaSuccess)
+        if (const cudaError_t e = basalt::core::device_mem_info(&fb, &tb); e != cudaSuccess)
             basalt::log::warn("basalt generate", "layer split: CUDA%d free memory: %s", dev < 0 ? 0 : dev,
                          cudaGetErrorString(e));
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + split_pf_mib + (later ? kWindowMib + (pipe_want ? kPairMibLater : 0) : 0) +

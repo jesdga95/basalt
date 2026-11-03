@@ -1,4 +1,5 @@
 #include "context.hpp"
+#include "basalt/core/device_memory.hpp"
 
 namespace basalt::program::generate {
 
@@ -108,7 +109,7 @@ int resident_plan(Context& context) {
             size_t fb = 0, tb = 0;
             {
                 const basalt::core::OnDevice on(dev);
-                cudaMemGetInfo(&fb, &tb);
+                basalt::core::device_mem_info(&fb, &tb);
             }
             const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
                                      (dev == o.peer_device ? (uint64_t) peer_split_bytes(d0) + peer_prompt_bytes() : 0);

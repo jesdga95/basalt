@@ -1,5 +1,6 @@
 // src/program/serve/memory.cpp - memory operations for the persistent engine.
 #include "state.hpp"
+#include "basalt/core/device_memory.hpp"
 
 namespace basalt::program::serve {
 
@@ -152,7 +153,7 @@ bool Runtime::vram_command(const std::string& cmd, std::string& e, bool for_slee
     }
     const auto t0 = Clock::now();
     size_t free_b = 0, total_b = 0;
-    cudaMemGetInfo(&free_b, &total_b);
+    basalt::core::device_mem_info(&free_b, &total_b);
     const int64_t want_free = (int64_t) reserve << 20, mapped = xcache.mapped_bytes();
     const int64_t before = xcache.slots();
     // what stays at least: the prompt path's smallest loan (256 tokens) and the 128 slots it must leave
@@ -244,7 +245,7 @@ bool Runtime::vram_command(const std::string& cmd, std::string& e, bool for_slee
         }
     }
     relend();
-    cudaMemGetInfo(&free_b, &total_b);
+    basalt::core::device_mem_info(&free_b, &total_b);
     basalt::log::info("basalt serve", "VRAM %lld MiB kept free: the expert cache %lld -> %lld of %lld slots "
                          "(%.2f of %.2f GiB), %lld MiB free now, prompt chunk %lld, in %.0f ms%s",
                  reserve, (long long) before, (long long) xcache.slots(), (long long) xcache.full_slots(),

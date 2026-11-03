@@ -1,5 +1,6 @@
 // src/core/peer_experts.cpp - see include/basalt/core/peer_experts.hpp.
 #include "basalt/core/load_progress.hpp"
+#include "basalt/core/device_memory.hpp"
 #include "basalt/core/peer_experts.hpp"
 
 #include "basalt/kernels/cpu/expert_layout.hpp"
@@ -111,7 +112,7 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     // the pairs the primary does not hold, in rank order, as many as fit
     On on(device);
     size_t free_b = 0, total_b = 0;
-    if (!ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo", err)) { close(); return false; }
+    if (!ck(basalt::core::device_mem_info(&free_b, &total_b), "cudaMemGetInfo", err)) { close(); return false; }
     const uint64_t reserve = (uint64_t) std::max(reserve_mib, 128) << 20;
     const uint64_t budget = free_b > reserve ? free_b - reserve : 0;
     std::vector<std::pair<int32_t, int32_t>> pick;

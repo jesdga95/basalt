@@ -4,6 +4,7 @@
 // loop and its idle read, and dec_moe_parity's host-rung peer rings.  The peer rings run on a small synthetic expert
 // set on the peer card, so no tier's residency or cache is read or written.
 #include "basalt/program/probe_rates.hpp"
+#include "basalt/core/device_memory.hpp"
 
 #include "basalt/core/on_device.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
@@ -201,7 +202,7 @@ void step_facts(Probe& P) {
         size_t fr = 0, tot = 0;
         {
             core::OnDevice od(d);
-            cudaMemGetInfo(&fr, &tot);
+            basalt::core::device_mem_info(&fr, &tot);
         }
         int mclk = 0, bus = 0;
         cudaDeviceGetAttribute(&mclk, cudaDevAttrMemoryClockRate, d);

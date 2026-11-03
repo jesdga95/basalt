@@ -1,5 +1,6 @@
 // src/program/serve/verify.cpp - verify operations for the persistent engine.
 #include "state.hpp"
+#include "basalt/core/device_memory.hpp"
 
 namespace basalt::program::serve {
 
@@ -175,7 +176,7 @@ int Runtime::capture_windows() {
     if (o.serve && slot0_is_solo && o.batch > 1) {
         const auto tw = Clock::now();
         size_t free0 = 0, total0 = 0;
-        cudaMemGetInfo(&free0, &total0);
+        basalt::core::device_mem_info(&free0, &total0);
         for (int b = 1; b < o.batch; ++b) {
             make_view(rviews[(size_t) b], b);
             if (!ver.warm_session(&rviews[(size_t) b], err)) {
@@ -184,7 +185,7 @@ int Runtime::capture_windows() {
             }
         }
         size_t free1 = 0;
-        cudaMemGetInfo(&free1, &total0);
+        basalt::core::device_mem_info(&free1, &total0);
         basalt::log::info("basalt serve", "solo windows of %d more slot sessions captured in %.0f ms (%.1f MiB of VRAM)",
                      o.batch - 1, std::chrono::duration<double, std::milli>(Clock::now() - tw).count(),
                      (double) ((int64_t) free0 - (int64_t) free1) / 1048576.0);

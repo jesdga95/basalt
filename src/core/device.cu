@@ -1,5 +1,6 @@
 // src/core/device.cu - the CUDA side of the runtime core.
 #include "basalt/core/device.hpp"
+#include "basalt/core/device_memory.hpp"
 
 #include <cuda_runtime.h>
 
@@ -139,7 +140,7 @@ DeviceInfo device_info(int ordinal) {
     d.multi_processor_count = p.multiProcessorCount;
 
     size_t free_b = 0, total_b = 0;
-    check(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+    check(basalt::core::device_mem_info(&free_b, &total_b), "cudaMemGetInfo");
     d.free_bytes = free_b;
     d.total_bytes = total_b;
 

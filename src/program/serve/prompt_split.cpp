@@ -1,5 +1,6 @@
 // src/program/serve/prompt_split.cpp - request prompt_split operations.
 #include "request.hpp"
+#include "basalt/core/device_memory.hpp"
 
 namespace basalt::program::serve {
 
@@ -452,7 +453,7 @@ bool Request::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool& ra
         size_t pfree = 0, ptotal = 0;
         {
             const basalt::core::OnDevice on(st.dev);
-            if (cudaMemGetInfo(&pfree, &ptotal) != cudaSuccess) (void) cudaGetLastError();
+            if (basalt::core::device_mem_info(&pfree, &ptotal) != cudaSuccess) (void) cudaGetLastError();
         }
         char b[256];
         std::snprintf(b, sizeof b, "%s%lld on CUDA%d, layers %lld-%lld", k ? ", " : "",

@@ -1,4 +1,5 @@
 #include "context.hpp"
+#include "basalt/core/device_memory.hpp"
 
 namespace basalt::program::generate {
 
@@ -42,9 +43,9 @@ int cache_size(Context& context) {
         int d0 = 0, count = 0;
         size_t f0 = 0, t0 = 0, f1 = 0, t1 = 0;
         cudaGetDevice(&d0);
-        cudaMemGetInfo(&f0, &t0);
+        basalt::core::device_mem_info(&f0, &t0);
         if (cudaGetDeviceCount(&count) == cudaSuccess && o.peer_device < count && cudaSetDevice(o.peer_device) == cudaSuccess) {
-            cudaMemGetInfo(&f1, &t1);
+            basalt::core::device_mem_info(&f1, &t1);
             (void) cudaSetDevice(d0);
         }
         (void) cudaGetLastError();
@@ -67,11 +68,35 @@ int cache_size(Context& context) {
     const uint64_t max_cache_blob = basalt::kernels::cpu::expert_layout().max_blob;
     const uint64_t cache_slot_bytes = profile.empty() ? max_cache_blob : (max_cache_blob + 255) / 256 * 256;
     const bool auto_cache = o.expert_cache < 0;
+    // A GPU whose memory is the host's RAM shares it with what the host still takes once the experts are placed: the
+    // engine's late host memory and, while experts are left to the file, the file cache's floor for them
+    // (device_mem_info already leaves the margin).  No RAM copy is planned beside it: the RAM left over caches the file.
+    const bool host_ram = basalt::core::device_memory_is_host_ram();
+    auto host_ram_room = [&](size_t free_b) -> size_t {
+        if (!host_ram) return free_b;
+        const uint64_t late = basalt::platform::kLateHostBytes + (o.serve ? serve_growth_bytes(o, g) : 0);
+        const uint64_t room = free_b > late ? free_b - late : 0;
+        if (room >= expert_total_bytes) return (size_t) room;   // every expert fits: none is read from the file
+        uint64_t largest = 0;
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            largest = std::max<uint64_t>(largest, (uint64_t) g.n_expert * basalt::kernels::cpu::expert_layout().blob_bytes(l));
+        const uint64_t file = basalt::platform::file_cache_floor(expert_total_bytes, expert_total_bytes, largest,
+                                                                 basalt::platform::kPromptFileReadBytes);
+        const uint64_t left = room > file ? room - file : 0;
+        basalt::log::info("basalt generate", "expert cache: the GPU's memory is the RAM, %.2f GiB of it for the cache "
+                             "(%.2f GiB kept for the host's late memory, %.2f GiB for the file cache)",
+                          (double) left / 1073741824.0, (double) late / 1073741824.0, (double) file / 1073741824.0);
+        return (size_t) left;
+    };
     if (o.expert_cache < 0) {
         // the prompt path's cuBLAS handle is made now, so the free figure below already has its device memory out
         if (o.serve && o.prefill_chunk > 0 && !basalt::prefill::Gemm::prepare_handle(err)) return fatal_start_error(err);
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::device_mem_info(&free_b, &total_b);
+        if (!host_ram && basalt::core::device_integrated())
+            basalt::log::info("basalt generate", "expert cache: the integrated GPU's dedicated memory, %.2f GiB free of "
+                                 "%.2f GiB", (double) free_b / 1073741824.0, (double) total_b / 1073741824.0);
+        free_b = host_ram_room(free_b);
         // The batched prompt path's chunk buffers are allocated later, so they are reserved here - an over-subscribed
         // allocation can page to system memory and crawl.  With borrowing - the default with a profile - the prompt
         // path lends cache slots instead (`pf_borrow`, hoisted above so both cache-size branches read the same one).
@@ -113,14 +138,14 @@ int cache_size(Context& context) {
         const int64_t base_b = reserve_b + ((int64_t) prefill_mib << 20) + mtp_bind + late_b;
         // the RAM copy of the experts the cache does not hold is page-locked and mapped, which takes device memory per
         // GiB mapped: a 1 GiB probe gives the rate, applied to the experts that stay out of the cache
-        if (o.serve && o.resident_cpu_experts && expert_total_bytes > 0) {
+        if (o.serve && o.resident_cpu_experts && expert_total_bytes > 0 && !host_ram) {
             void* probe = nullptr;
             const size_t pb = (size_t) 1 << 30;
             cudaDeviceSynchronize();
             size_t f0 = 0, f1 = 0, t0 = 0;
-            cudaMemGetInfo(&f0, &t0);
+            basalt::core::device_mem_info(&f0, &t0);
             if (cudaHostAlloc(&probe, pb, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) {
-                cudaMemGetInfo(&f1, &t0);
+                basalt::core::device_mem_info(&f1, &t0);
                 cudaFreeHost(probe);
                 const double per_gib = f0 > f1 ? (double) (f0 - f1) : 0.0;
                 const double outside = std::max(0.0, (double) expert_total_bytes -
@@ -213,7 +238,7 @@ int cache_size(Context& context) {
         // fails with "device buffers ... do not fit" (with borrowing - the default with a profile - the path lends
         // slots instead and `prefill_mib` is 0, so only the reserve is checked)
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::device_mem_info(&free_b, &total_b);
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
         const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) cache_slot_bytes, 0);
@@ -231,7 +256,7 @@ int cache_size(Context& context) {
     std::vector<int64_t> sized_slots;
     if (o.expert_cache > 0 && !profile.empty()) {
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::device_mem_info(&free_b, &total_b);
         const auto& lay = basalt::kernels::cpu::expert_layout();
         const uint64_t budget = (uint64_t) o.expert_cache * cache_slot_bytes;   // what the uniform sizing granted
         uint64_t used = 0;
@@ -324,7 +349,7 @@ int cache_size(Context& context) {
             cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
             cudaDeviceSynchronize();
             size_t free_b = 0, total_b = 0;
-            cudaMemGetInfo(&free_b, &total_b);
+            basalt::core::device_mem_info(&free_b, &total_b);
             const int64_t want = (int64_t) o.vram_reserve_mib << 20;
             if ((int64_t) free_b >= want - (64ll << 20)) break;
             // short by (want - free); a figure of 0 only says "at least": the first two such reads give back 1 GiB
