@@ -115,8 +115,11 @@ last-bit changes.
 ## Quality
 
 GSQ-RCO IQ2_XXS, 5090 only, against llama.cpp b11870 on the same GGUF, llama's tokens fed one decode step at a time on
-three prompts: Basalt's greedy choice differs at 8 of 688 generated positions, each one a near-tie (at most 0.33 of
-log-probability between the two tokens at llama's logits). There is no Basalt PPL/KLD run on this pack yet.
+three prompts: Basalt's greedy choice differs at 5 to 8 of 688 generated positions, depending on which tier each expert
+sits in during the run, with 1.0 at most of log-probability between the two tokens at llama's logits. KL against llama's logits on 512 positions of real text: mean
+0.0025, median 0.0007, top-1 agreement 98.2%, position 1 left out: llama's own row at position 1 moves by KL 4.2 between
+a 2-token and a 512-token batch, and Basalt is within 0.07 of its 2-token row. There is no PPL/KLD run against the
+native model on this pack yet.
 
 Quality is the quant's, not the engine's. The IQ1_S pack scores, against the native model's logits (teacher: the
 native FP4 checkpoint through the reference code; Lucebox's 8 x 1,024 held-out tokens, KL over the teacher's top-256 ids,
