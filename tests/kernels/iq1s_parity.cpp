@@ -1,4 +1,4 @@
-// src/kernels/iq1s_parity.cpp - IQ1_S (and the IQ2_XXS / IQ1_S expert pairs of a limited-SwiGLU MoE) on the GPU and
+// tests/kernels/iq1s_parity.cpp - IQ1_S (and the IQ2_XXS / IQ1_S expert pairs of a limited-SwiGLU MoE) on the GPU and
 // CPU expert paths, at the real expert geometry (hidden 5120, FF 2304), against a CPU double reference.
 //
 //     build/iq1s_parity            the checks (a ctest; needs the GPU)
