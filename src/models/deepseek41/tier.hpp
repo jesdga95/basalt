@@ -8,6 +8,7 @@
 #pragma once
 
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/core/ram_load.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
@@ -152,6 +153,7 @@ private:
     uint64_t tick_ = 0;
     uint64_t one_each_ = 0, reserve_ = 0;
 
+    std::vector<core::RamPin> ram_pins_;    ///< [layer] what each span's pin got
     std::vector<uint8_t*> ram_;             ///< [layer] cover_ + 1 pinned expert slots (the last starts as the spare)
     policy::Homes homes_;
     std::vector<int32_t> rank_;             ///< [layer * n_expert + rank] expert; empty: the file's order
