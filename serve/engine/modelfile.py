@@ -150,7 +150,7 @@ def model_config(path: str, engine_bin: str, vision: bool | str = False,
            "sampling": sampling_defaults(meta),
            "arch": (meta.get("gguf_kv") or {}).get("general.architecture"), "log": str(cdir / "engine.log"),
            "tokenizer": str(extract_tokenizer(mf))}
-    if vision == "dynamic" and cfg["arch"] == "deepseek41":
+    if vision and cfg["arch"] == "deepseek41":   # its encoder always lives in the engine
         v, extra = deepseek_vision_config(mf, Path(cfg["tokenizer"]), words)
         args += extra
         v.update(mode="dynamic", gpu=True)

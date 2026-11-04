@@ -71,7 +71,7 @@ class EngineSide(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.src = (ROOT / "src/program/generate.cpp").read_text()
+        cls.src = (ROOT / "src/program/generate/adapter.cpp").read_text() + (ROOT / "src/program/cli/arguments.cpp").read_text()
 
     def test_the_flag_is_tracked_and_handed_to_the_model(self):
         self.assertIn("o.max_context_set = true;", self.src)
@@ -123,7 +123,7 @@ class LongRequests(unittest.TestCase):
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
         try:
             with mock.patch.object(self.svc, "encode_prompt", return_value=[ord("x")] * prompt_tokens):
-                c.request("POST", "/v1/chat/completions", json.dumps({"messages": [{"role": "user", "content": "hi"}],
+                c.request("POST", "/v1/chat/completions", json.dumps({"model": self.svc.model, "messages": [{"role": "user", "content": "hi"}],
                                                                      "max_tokens": 8}),
                           {"Content-Type": "application/json"})
                 r = c.getresponse()
