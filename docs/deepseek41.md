@@ -4,9 +4,9 @@ A `deepseek41` pack runs through the same command, `basalt serve PACK`; the serv
 the pack and picks the chat format, tool-call syntax and thinking switch to match.
 
 - **First start:** the engine sizes a VRAM expert tier from the free memory, then loads as many experts as fit into a
-  pinned RAM tier; the rest are read from the pack by the CPU. The load runs once per start and the startup lines
+  pinned RAM tier, the most routed first; the rest are read from the pack by the CPU. The load runs once per start and the startup lines
   `basalt deepseek41: VRAM expert tier ...` and `basalt deepseek41: RAM expert tier ...` give the sizes. Which experts are resident
-  can change the last bits of the output ([precision](precision/deepseek41.md)).
+  can change the rounding of the output ([precision](precision/deepseek41.md)).
 - **Context:** `--max-context N` (or `"max-context"` in the config's `engine` section) sets it, as for every model, up
   to the model's own maximum (1,048,576 tokens, from the pack). Without it the engine takes that maximum, lowered
   until the compressed caches of a full context take at most a quarter of the free VRAM, and prints the result
