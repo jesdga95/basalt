@@ -41,7 +41,7 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, program::Options& o
     else if (a == "--no-capture") o.no_capture = true;
     else if (a == "--no-pool") o.no_pool = true;
     else if (a == "--stage-timing") o.stage_timing = true;
-    else if (a == "--graph-only") o.graph_only = true;
+    else if (a == "--graph-only") { o.graph_only = true; o.generates = false; }
     else if (a == "--gpu-only-full") o.gpu_only_full = true;
     else if (a == "--prefill") {
         const std::string v = args.next("--prefill");
