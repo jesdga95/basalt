@@ -419,7 +419,7 @@ public:
         ExpertTier::Reserve r;
         // the caches grow into the reserve beside the tier, then into the spare arena the tier gives back
         r.copies = kTierReserve;
-        r.homes = m_.context_bytes() + prefillp::workspace_bytes(d, prefillp::kMaxChunk) + prefillp::ahead_bytes(d) +
+        r.homes = m_.context_bytes() + prefillp::workspace_bytes(d, prefillp::kHomeChunk) + prefillp::ahead_bytes(d) +
                   prefillp::kMargin + kModuleRoom + (m_.pack().vision.bytes ? kVisionRoom : 0);
         r.beside_homes = prefillp::workspace_bytes(d, prefillp::kShortChunk) + prefillp::kMargin + kModuleRoom;
         if (!t->open(r, h_x_, h_rows_, err)) return false;

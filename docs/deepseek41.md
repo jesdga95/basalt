@@ -21,7 +21,7 @@ the pack and picks the chat format, tool-call syntax and thinking switch to matc
   refused; a prompt that fills the context leaves the tier smaller for the rest of that run. The rotary extension (YaRN) is part of the model: the `--rope-*` and
   `--yarn-*` flags are refused for it.
 - **Long prompts:** each prompt takes the tier's loan back, maps the caches it needs and sizes its workspaces to the
-  memory left: 8192 tokens per chunk, halved down to 256. A read of 4,096 tokens or more gives the main card's copies
+  memory left: 16,384 tokens per chunk, halved down to 256. A read of 4,096 tokens or more gives the main card's copies
   back for its duration and streams the experts from the main card's homes, RAM, the second card (through the host) and
   the pack; the copies reopen after it, from the routing order on two cards, empty on one, where the first tokens after
   it decode slower. On two cards a prompt of up to 640 tokens reads beside the copies and keeps them. After a long

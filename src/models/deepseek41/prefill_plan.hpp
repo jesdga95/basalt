@@ -10,7 +10,8 @@
 
 namespace basalt::models::deepseek41::prefillp {
 
-constexpr int kMaxChunk = 8192;
+constexpr int kMaxChunk = 16384;
+constexpr int kHomeChunk = 8192;                   // the chunk a prompt keeps at the full context beside a tier's homes
 constexpr int kMinChunk = 256;
 constexpr uint64_t kMargin = 1ull << 30;           // left free after the workspaces (kernel modules load lazily)
 constexpr int64_t kKeepPositions = 32768;          // a new sequence keeps the caches of this many positions

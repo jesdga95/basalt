@@ -13,7 +13,7 @@ namespace basalt::models::deepseek41 {
 class DsModel;
 
 /// The most prompt tokens one batch call takes.
-constexpr int kMaxChunk = 8192;
+constexpr int kMaxChunk = 16384;
 
 /// The per-layer caches the decode path and the batch path share (owned by the decode ops).
 struct AttnCaches {
