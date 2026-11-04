@@ -4,6 +4,7 @@
 
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/layout.hpp"
+#include "unicode_flags.hpp"
 #include "basalt/program/options.hpp"
 
 namespace basalt::models::qwen4exp {
@@ -67,6 +68,8 @@ public:
     }
 
     model::TokenizerSpec tokenizer_spec() const override { return {"tokenizer.ggml.tokens", "qwen"}; }
+
+    PreTokenizer pretokenizer() const override { return {"qwen35", program::tokenizer::pretok_qwen35}; }
 
     model::TokenNames token_names() const override {
         return {{"<|endoftext|>", "<|im_end|>"}, "<|im_start|>", "<|image_pad|>"};

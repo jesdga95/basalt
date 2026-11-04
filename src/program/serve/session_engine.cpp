@@ -70,7 +70,6 @@ public:
         std::printf("INFO logit_bias=%lld context=%lld spec=0 mtp_max=0 lookup=0%s engine=" BASALT_VERSION "\n",
                     (long long) n_vocab, (long long) o.max_context, slots.c_str());
     }
-    bool pack_tokenizer_supported(std::string_view) const override { return false; }
     bool windows_in_flight() override { return false; }
     bool next_batch_window() override;
     bool drain_windows() override { return true; }
@@ -452,9 +451,11 @@ void SessionRuntime::enc_command(const std::string& cmd) {
 
 }  // namespace
 
-int run_session(CommonOptions& o, basalt::core::ModelFile& file, basalt::model::LoadedModel& model) {
+int run_session(CommonOptions& o, basalt::core::ModelFile& file, const basalt::model::ModelAdapter& adapter,
+                basalt::model::LoadedModel& model) {
     std::string err;
     SessionRuntime runtime(o, file, err, model);
+    runtime.pre_ = adapter.pretokenizer();
     return runtime.execute();
 }
 

@@ -106,7 +106,8 @@ int Runtime::init_protocol() {
             basalt::core::read_range(model_file.range("tokenizer/merges.txt"), mj, terr) &&
             basalt::core::read_range(model_file.range("tokenizer/token_type.json"), tj, terr) &&
             basalt::core::read_range(model_file.range("tokenizer/tokenizer.json"), cj, terr) &&
-            pack_tokenizer_supported(std::string_view((const char*) cj.data(), cj.size()))) {
+            std::string_view((const char*) cj.data(), cj.size()).find("\"pre\": \"" + std::string(pre_.name) + "\"") != std::string_view::npos) {
+            text_tokenizer.set_pretokenize(pre_.split);
             if (text_tokenizer.load(std::string_view((const char*) vj.data(), vj.size()),
                                     std::string_view((const char*) mj.data(), mj.size()),
                                     std::string_view((const char*) tj.data(), tj.size()), terr))
