@@ -27,8 +27,9 @@ const core::WeightRef* need(const core::LayerView& v, const char* suffix, std::s
     return r;
 }
 bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
-                 std::string& err, int64_t ldy) {
+                 std::string& err, int64_t ldy, const Gemm::Rows8* x8) {
     if (!w->native_data) { err = "prefill: " + name + " has no native GGUF blocks (the model pack must carry them)"; return false; }
+    if (x8 != nullptr && x8->cols == w->ne0 && gm.native8(*x8, w->native_type, w->native_data, Y, w->ne1, ldy)) return true;
     gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy);
     return true;
 }

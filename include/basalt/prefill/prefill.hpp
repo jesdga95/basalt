@@ -90,6 +90,10 @@ public:
     /// computes the rows of its own); before init, which sizes the buffers by it.  Default 1024.
     static void set_stream_all_min(int64_t tokens);
 
+    /// The dense projections of chunks of 1024 tokens or more on the FP8 tensor cores (Gemm::native8), for the prompt
+    /// paths set up from now on.
+    static void set_fp8(bool on);
+
     /// The streamed ring's depth for the layouts made from now on (`relayout`, `bytes_needed`, `ring_slots_for`); at
     /// most the one `init` laid out.  A shallower ring takes fewer of the lent cache slots.
     static void set_ring_depth(int slots);

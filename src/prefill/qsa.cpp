@@ -29,9 +29,10 @@ bool Prefill::Run::Chunk::qsa(const core::LayerView& v) {
                           *wiqn = need(v, "indexer.q_norm.weight", err),
                           *wikn = need(v, "indexer.k_norm.weight", err);
     if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
-    if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
-    if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
-    if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+    const Gemm::Rows8* xa = act8(8 | 16, m.mixed_h, N, m.bo, cap_bo, x8);
+    if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err, 0, kind8(16, xa))) return false;
+    if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err, 0, kind8(16, xa))) return false;
+    if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err, 0, kind8(8, xa))) return false;
     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err)) return false;
     if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err)) return false;
     rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
@@ -112,7 +113,8 @@ bool Prefill::Run::Chunk::qsa(const core::LayerView& v) {
         }
     if (st.kv_rot || st.kv_hybrid) basalt::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
-    if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
+    const Gemm::Rows8* ya = act8(32, m.attn_h, ZV, m.attn, cap_zv, y8);
+    if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err, 0, ya)) return false;
     ++qsa_index;
     return true;
 }
