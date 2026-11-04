@@ -262,6 +262,11 @@ class Seam(unittest.TestCase):
     def test_stop_text_is_the_end_of_sentence(self):
         self.assertEqual(DeepSeek41.stop_texts, (EOS,))
 
+    def test_tool_result_images_render_in_the_encoder_format(self):
+        text = DeepseekTemplate().render([{"role": "user", "content": "go"}, {"role": "tool", "content": [
+            {"type": "text", "text": "seen"}, {"type": "image", "source": "x.png"}]}], enable_thinking=False)
+        self.assertIn(f"<tool_result>seen\n\n{enc.IMAGE_PLACEHOLDER}</tool_result>", text)
+
     def test_image_block_renders_the_pad_text_once(self):
         d = DeepSeek41()
         text = DeepseekTemplate().render([{"role": "user", "content": [{"type": "image", "source": "x.png"},

@@ -46,9 +46,6 @@ class DeepseekTemplate:
                 msgs[0]["tools"] = wrapped
             else:
                 msgs.insert(0, {"role": "system", "content": "", "tools": wrapped})
-        for m in msgs:
-            if m.get("role") == "tool" and not isinstance(m.get("content"), str):
-                m["content"] = frontend._text_of(m.get("content"))
         mode = "thinking" if enable_thinking is not False else "chat"
         effort = EFFORTS.get(reasoning_effort, reasoning_effort)
         text = enc.encode_messages(msgs, thinking_mode=mode, reasoning_effort=effort)
