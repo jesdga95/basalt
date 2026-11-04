@@ -10,7 +10,9 @@
 
 namespace basalt::program {
 
-struct Options {
+/// The flags every model takes.
+struct CommonOptions {
+    virtual ~CommonOptions() = default;
     std::string model;                ///< --model: the .basalt file every loader reads from
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;
@@ -20,6 +22,95 @@ struct Options {
     int top_k = 20;
     float top_p = 0.95f;
     float temperature = 1.0f;
+    /// The files the source tensors are read from: the model file, which serves them as a GGUF.
+    std::vector<std::string> native_shards;
+    int pool_workers = 0;         ///< >0 = the user's worker count; otherwise the start-up pick
+    /// The pool's core layout; the start-up pick unless given
+    basalt::kernels::cpu::PoolAffinity pool_affinity = basalt::kernels::cpu::PoolAffinity::Auto;
+    /// CS-T `--resident-budget-gib N`: the resident mode with a RAM budget - the N GiB of experts the GPU cache does
+    /// not hold that the expert profile ranks hottest are copied into RAM, the rest are read from the files in place
+    /// (the GGUF shards when the model file has no experts section).  0 = the whole complement (--resident-experts).
+    uint64_t resident_budget = 0;
+    /// Slots of VRAM-resident experts.  **0 = off, and off is the default.**  Switching the cache on moves work off the
+    /// CPU pool (`src/models/qwen4exp/kernels/s2_expert_grouped.cu`, wired via `expert_hit_run`).
+    int expert_cache = 0;
+    /// Multi-GPU: a second expert tier on CUDA device `peer_device` (-1 = off), `peer_reserve_mib` left free
+    /// there, `peer_slots` caps its size (0 = as many as fit), `peer_adapt_swaps` per adaptive round
+    /// (-1 = adapt_swaps).
+    int peer_device = -1;
+    /// every expert tier's device, the first one peer_device, and each card's memory bandwidth (GB/s, 0 unknown)
+    std::vector<int> peer_devices;
+    std::vector<double> peer_gbps;
+    int peer_reserve_mib = 600;
+    /// The engine's expert profile for the model (--expert-profile, else data/profiles/<key>.prof, cli::profile_key),
+    /// or the --expert-profile-save file a start places from; empty means none.  A profile decides residency by routing
+    /// frequency instead of by first use.
+    std::string expert_profile;
+    /// `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session and the KV state, minus
+    /// this reserve for the graphs, the hit scratch and the head.
+    int vram_reserve_mib = 700;
+    bool vram_reserve_given = false;   // --vram-reserve-mib on the command line (no smaller automatic reserve)
+    /// --grammar on|off: a request's "grammar" key is enforced on the sampled tokens (the vocabulary is read from the
+    /// pack at start).  Off: the key is ignored and the decode loop pays one pointer test per window.
+    bool grammar = false;
+    /// --serve runs up to this many sequences at once, one token each per batch window (0 = off).  A request
+    /// sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual path, then
+    /// continues in slot <slot> of the batch windows (`BT <slot> <id> [<id> ...]` lines, then `BDONE <slot> ...`).
+    int batch = 0;
+    bool resident_budget_given = false;  // --resident-budget-gib on the command line
+    bool pool_affinity_given = false;    // --pool-affinity on the command line
+    bool pool_workers_given = false;     // --pool-workers on the command line
+    /// Stop when the model emits an end-of-turn token (<|endoftext|> 248044, <|im_end|> 248046, or --eos-ids).
+    bool stop_eos = false;
+    std::vector<int64_t> eos_ids = {248044, 248046};
+    /// --gpu: the cards this run uses (gpu_select.hpp); empty = GPU 0 alone.  --gpu-plan prints the choice and exits.
+    std::string gpu;
+    bool gpu_plan = false;
+    std::string diag_dump;                 ///< --diag-dump DIR: a model's per-layer tensors, off by default
+    int diag_tier_ram = -1, diag_tier_vram = -1;   ///< --diag-tier-ram / --diag-tier-vram: fixed expert-tier sizes
+    bool diag_serial_prompt = false;       ///< --diag-serial-prompt: an adapter model reads its prompt one decode step at a time
+    std::string diag_logits;               ///< --diag-logits FILE: an adapter model writes the logits of each decoded row
+    std::vector<std::string> images;       ///< --image FILE ... with --image-at N: the picture's block goes before token N
+    std::vector<int64_t> image_at;
+    int64_t image_pad_id = -1;             ///< --image-pad-id: the prompt token that stands for a picture's rows (--serve)
+    bool max_context_set = false;          ///< --max-context was given (a model with its own default picks one otherwise)
+    /// Stay resident and take requests on stdin (see the --serve block in main).
+    bool serve = false;
+    /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
+    bool vision = false;
+    /// --vision-mmproj PATH: the image encoder runs in this process on the model's GPU (implies --vision).  Its weights
+    /// stay in pinned host memory; each ENC command borrows expert-cache slots, encodes in them and refills them.
+    std::string vision_mmproj;
+    /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole prompt
+    /// again).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and the PLE history (~118 MB of host
+    /// RAM); the KV cache itself is positional and stays where it is.
+    int prompt_cache = 6;
+    int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
+    int conversation_cache_slots = 4;
+    int64_t conversation_cache_min_free_mib = 2560;
+    int conversation_cache_min_tokens = 0;   ///< --serve: park only conversations of at least N tokens (0 = park every one)
+    /// --serve: the folder of the disk tier (the server names one inside the model cache folder): a conversation
+    /// that leaves the session or the RAM cache, and every one the process holds when it ends, is written there and
+    /// read back when a prompt starts with it, after a restart too (conversation_store.hpp)
+    std::string conversation_cache_dir;
+    int64_t conversation_cache_disk_mib = 0;   ///< byte budget of the disk tier, least recently used first; above 0 turns it on
+    /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
+    int64_t prompt_cache_every = 16384;
+    /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
+    /// prompt, which every chat of the same client shares - when that is at least N tokens (0 = never)
+    int64_t prompt_cache_root = 2048;
+    /// --serve: the token that opens a chat turn (<|im_start|>).  The last one in a prompt is where the chat's
+    /// history ends and the new assistant turn begins, which is the checkpoint the next request can reuse.
+    int64_t turn_token = 248045;
+    /// --serve (opt-in): the role token of a short turn the server puts right before the new assistant turn (the
+    /// "system" of a trailing reasoning-effort turn).  When the turn before the last <|im_start|> opens with it,
+    /// the checkpoint goes in front of that turn instead, so it holds the conversation and not the effort text.
+    /// -1 = off (the checkpoint at the last <|im_start|>).
+    int64_t tail_role_token = -1;
+};
+
+/// The flags of this model on top of the common ones.
+struct Options : CommonOptions {
     /// THE CONTEXT EXTENSION (rope scaling, rope_scaling.hpp).  These knobs resolve to ONE process config,
     /// set once before `session_init` builds the rope table and the graphs capture the kernels.  There is
     /// deliberately no per-request form: K sits in the cache POST-RoPE, so one cache must never mix two
@@ -34,8 +125,6 @@ struct Options {
     double yarn_attn_factor = 1.0;      ///< --yarn-attn-factor F
     double yarn_beta_fast = 32.0;       ///< --yarn-beta-fast F
     double yarn_beta_slow = 1.0;        ///< --yarn-beta-slow F
-    /// The files the source tensors are read from: the model file, which serves them as a GGUF.
-    std::vector<std::string> native_shards;
     /// How the n-gram table is read.  Direct (default) = unbuffered SSD reads, table never in RAM.
     std::string ple_io = "direct";
     int64_t ple_row_cache = 1 << 20;   ///< bounded row cache (rows of 90 B); 0 disables
@@ -61,9 +150,6 @@ struct Options {
     /// stage events include every gap where the GPU waited for the host.
     bool graph_only = false;
     bool gpu_only_full = false;   ///< pre + post + head, the true per-token GPU floor
-    int pool_workers = 0;         ///< >0 = the user's worker count; otherwise the start-up pick
-    /// The pool's core layout; the start-up pick unless given
-    basalt::kernels::cpu::PoolAffinity pool_affinity = basalt::kernels::cpu::PoolAffinity::Auto;
     bool mmap_experts = false;    ///< opt OUT of the resident arena, back to a file mapping
     std::string shared_expert_arena; ///< optional file backing for the resident arena shared by processes
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
@@ -74,21 +160,6 @@ struct Options {
     uint64_t resident_headroom = 8ull << 30;
     bool resident_soft = false;
     bool resident_cpu_explicit = false;   // --resident-cpu-experts given by itself (not only implied)
-    /// CS-T `--resident-budget-gib N`: the resident mode with a RAM budget - the N GiB of experts the GPU cache does
-    /// not hold that the expert profile ranks hottest are copied into RAM, the rest are read from the files in place
-    /// (the GGUF shards when the model file has no experts section).  0 = the whole complement (--resident-experts).
-    uint64_t resident_budget = 0;
-    /// Slots of VRAM-resident experts.  **0 = off, and off is the default.**  Switching the cache on moves work off the
-    /// CPU pool (`src/models/qwen4exp/kernels/s2_expert_grouped.cu`, wired via `expert_hit_run`).
-    int expert_cache = 0;
-    /// Multi-GPU: a second expert tier on CUDA device `peer_device` (-1 = off), `peer_reserve_mib` left free
-    /// there, `peer_slots` caps its size (0 = as many as fit), `peer_adapt_swaps` per adaptive round
-    /// (-1 = adapt_swaps).
-    int peer_device = -1;
-    /// every expert tier's device, the first one peer_device, and each card's memory bandwidth (GB/s, 0 unknown)
-    std::vector<int> peer_devices;
-    std::vector<double> peer_gbps;
-    int peer_reserve_mib = 600;
     int64_t peer_slots = 0;
     int peer_adapt_swaps = -1;
     /// The peer's experts are held only on the peer, not also in the RAM complement (needs --resident-experts).
@@ -96,10 +167,6 @@ struct Options {
     /// the prompt path's rows per layer the peer computes: -1 = half of chunk x top-k, 0 = the prompt path stays on
     /// the primary
     int64_t peer_prefill_rows = -1;
-    /// The engine's expert profile for the model (--expert-profile, else data/profiles/<key>.prof, cli::profile_key),
-    /// or the --expert-profile-save file a start places from; empty means none.  A profile decides residency by routing
-    /// frequency instead of by first use.
-    std::string expert_profile;
     /// --serve (opt-in): where to save what the adaptive tier learned, as a profile (the resident experts first,
     /// then the routing counted since the start; the format of data/profiles); on QUIT and every
     /// `expert_profile_save_min` minutes between requests.  Empty (the default): nothing is counted or written.
@@ -109,10 +176,6 @@ struct Options {
     /// valid way to get a per-stage table on the real graph.  Prints and exits; it is a measurement, not a run.
     bool gpu_stages = false;
     bool stats = false;
-    /// `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session and the KV state, minus
-    /// this reserve for the graphs, the hit scratch and the head.
-    int vram_reserve_mib = 700;
-    bool vram_reserve_given = false;   // --vram-reserve-mib on the command line (no smaller automatic reserve)
     /// Opt-in: the expert cache in physical segments (CUDA virtual memory management), so the serve loop's
     /// `VRAM <reserve_mib>` command can give part of it back to other programs and take it again.  Off: one cudaMalloc.
     bool vram_elastic = false;
@@ -151,17 +214,10 @@ struct Options {
     /// router logit; the weights stay the router's own (0 = off; the flag alone = kRoutePriorDefault). This changes
     /// the output: docs/precision/routing.md.
     float route_prior = 0.0f;
-    /// --grammar on|off: a request's "grammar" key is enforced on the sampled tokens (the vocabulary is read from the
-    /// pack at start).  Off: the key is ignored and the decode loop pays one pointer test per window.
-    bool grammar = false;
     /// Never relaxed: the added tokens (control and tool tags, ids from relax_special_from on) and every token
     /// between the tool-call tags, so tool calls are sampled exactly.
     int64_t relax_special_from = 248044;
     int64_t relax_call_open = 248058, relax_call_close = 248059;
-    /// --serve runs up to this many sequences at once, one token each per batch window (0 = off).  A request
-    /// sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual path, then
-    /// continues in slot <slot> of the batch windows (`BT <slot> <id> [<id> ...]` lines, then `BDONE <slot> ...`).
-    int batch = 0;
     /// The --batch slots in this many groups pipelined through the stages of a layer split (stage k
     /// runs one group while stage k+1 runs another).  1 = every slot in one window, stage after stage.
     int batch_groups = 1;
@@ -178,68 +234,18 @@ struct Options {
     int adapt_every = 4;
     bool adapt_every_given = false;   // --adapt-every on the command line
     bool peer_exclusive_given = false;   // --peer-exclusive on the command line
-    bool resident_budget_given = false;  // --resident-budget-gib on the command line
-    bool pool_affinity_given = false;    // --pool-affinity on the command line
-    bool pool_workers_given = false;     // --pool-workers on the command line
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
     bool adapt_decay_set = false;
     double prefill_cpu_share = 0.6;   ///< the share of the streamed prompt experts the CPU computes (--prefill-cpu-share)
-    /// Stop when the model emits an end-of-turn token (<|endoftext|> 248044, <|im_end|> 248046, or --eos-ids).
-    bool stop_eos = false;
-    std::vector<int64_t> eos_ids = {248044, 248046};
     /// --serve, multi-GPU layer split: "K" or "K1,K2,.." (the first layer of each later stage) or "auto" (placed
     /// from each GPU's free VRAM); empty = one GPU
     std::string layer_split;
     /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
     /// GPU, sharing everything - the bit-exact A/B of the hand-off)
     std::string split_device;
-    /// --gpu: the cards this run uses (gpu_select.hpp); empty = GPU 0 alone.  --gpu-plan prints the choice and exits.
-    std::string gpu;
-    bool gpu_plan = false;
-    std::string diag_dump;                 ///< --diag-dump DIR: a model's per-layer tensors, off by default
-    int diag_tier_ram = -1, diag_tier_vram = -1;   ///< --diag-tier-ram / --diag-tier-vram: fixed expert-tier sizes
-    bool diag_serial_prompt = false;       ///< --diag-serial-prompt: an adapter model reads its prompt one decode step at a time
-    std::string diag_logits;               ///< --diag-logits FILE: an adapter model writes the logits of each decoded row
-    std::vector<std::string> images;       ///< --image FILE ... with --image-at N: the picture's block goes before token N
-    std::vector<int64_t> image_at;
-    int64_t image_pad_id = -1;             ///< --image-pad-id: the prompt token that stands for a picture's rows (--serve)
-    bool max_context_set = false;          ///< --max-context was given (a model with its own default picks one otherwise)
-    /// Stay resident and take requests on stdin (see the --serve block in main).
-    bool serve = false;
-    /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
-    bool vision = false;
-    /// --vision-mmproj PATH: the image encoder runs in this process on the model's GPU (implies --vision).  Its weights
-    /// stay in pinned host memory; each ENC command borrows expert-cache slots, encodes in them and refills them.
-    std::string vision_mmproj;
     /// The most experts one adaptive round swaps into the main card's tier; a saturated pipeline (see `kSatBoost`) may
     /// swap `kSatBoost` times as many.
     int adapt_swaps = 96;
-    /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole prompt
-    /// again).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and the PLE history (~118 MB of host
-    /// RAM); the KV cache itself is positional and stays where it is.
-    int prompt_cache = 6;
-    int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
-    int conversation_cache_slots = 4;
-    int64_t conversation_cache_min_free_mib = 2560;
-    int conversation_cache_min_tokens = 0;   ///< --serve: park only conversations of at least N tokens (0 = park every one)
-    /// --serve: the folder of the disk tier (the server names one inside the model cache folder): a conversation
-    /// that leaves the session or the RAM cache, and every one the process holds when it ends, is written there and
-    /// read back when a prompt starts with it, after a restart too (conversation_store.hpp)
-    std::string conversation_cache_dir;
-    int64_t conversation_cache_disk_mib = 0;   ///< byte budget of the disk tier, least recently used first; above 0 turns it on
-    /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
-    int64_t prompt_cache_every = 16384;
-    /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
-    /// prompt, which every chat of the same client shares - when that is at least N tokens (0 = never)
-    int64_t prompt_cache_root = 2048;
-    /// --serve: the token that opens a chat turn (<|im_start|>).  The last one in a prompt is where the chat's
-    /// history ends and the new assistant turn begins, which is the checkpoint the next request can reuse.
-    int64_t turn_token = 248045;
-    /// --serve (opt-in): the role token of a short turn the server puts right before the new assistant turn (the
-    /// "system" of a trailing reasoning-effort turn).  When the turn before the last <|im_start|> opens with it,
-    /// the checkpoint goes in front of that turn instead, so it holds the conversation and not the effort text.
-    /// -1 = off (the checkpoint at the last <|im_start|>).
-    int64_t tail_role_token = -1;
     /// --serve: a text part of the prompt of at most N tokens (a chat message, the assistant header, a short tool
     /// result) goes through the verify windows, S tokens at a time, instead of the batched prompt path (0 = always
     /// the batched path)
@@ -258,6 +264,7 @@ struct Options {
     int cvec_first = -1, cvec_last = -1;   ///< llama.cpp's defaults: 1 .. the last layer
     int cvec_mode = 1;                     ///< 0 = project, 1 = add (llama.cpp's default)
     int cvec_single = -1;                  ///< --cvec-dir single:L (project mode): layer L's direction everywhere
+    std::string ppl_base, ppl_out;    ///< --ppl-base, --ppl-out
 };
 
 }  // namespace basalt::program

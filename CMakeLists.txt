@@ -131,7 +131,7 @@ add_library(model STATIC src/model/registry.cpp)
 target_include_directories(model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(model PUBLIC artifact warnings)
 
-add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp)
+add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwen4exp/flags.cpp)
 target_include_directories(model_qwen4exp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(model_qwen4exp PUBLIC model)
 
