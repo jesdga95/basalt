@@ -72,7 +72,7 @@ The per-layer n-gram (PLE) table stays on disk and its rows are read as needed.
 | --- | --- | --- | --- |
 | `--ple-io` | engine | `direct`, `ram`; `direct` | `direct`: unbuffered reads, the table never enters RAM or the file cache. `ram`: map the file with the whole table locked in RAM at start. |
 | `--ple-row-cache` | engine | rows, 1048576 | A bounded cache of fetched rows, 90 B each; `0` turns it off. |
-| `--ple-inflight` | engine | integer, 256 | Outstanding reads. |
+| `--ple-inflight` | engine | 1..1024, 256 | Outstanding reads. |
 | `--ple-delay-us` | engine | microseconds, 0 | Fault injection: each row read completes no earlier than this. |
 
 ## Quality gate
