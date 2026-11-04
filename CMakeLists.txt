@@ -123,8 +123,42 @@ add_library(artifact INTERFACE)
 target_include_directories(artifact INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(artifact INTERFACE platform warnings)
 
+# ---- model adapters ---------------------------------------------------
+# `model` is the registry and the adapter interface (shared code may use it). Each model is its own library under
+# src/models/<arch>/; `models` is the composition root that registers them. tools/check_model_layering.sh keeps
+# shared code from including src/models and models from including each other.
+add_library(model STATIC src/model/registry.cpp)
+target_include_directories(model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(model PUBLIC artifact warnings)
+
+add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp)
+target_include_directories(model_qwen4exp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(model_qwen4exp PUBLIC model)
+
+add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models/deepseek41/pack.cpp
+  src/models/deepseek41/model.cpp src/models/deepseek41/session.cpp src/models/deepseek41/layer_ops.cpp
+  src/models/deepseek41/fixture_ops.cpp src/models/deepseek41/elastic.cpp src/models/deepseek41/ops_kernels.cpp src/models/deepseek41/tier.cpp src/models/deepseek41/ops.cu
+  src/models/deepseek41/prefill.cpp src/models/deepseek41/prefill_ffn.cpp src/models/deepseek41/prefill_ffn.cu src/models/deepseek41/attn_batch.cpp src/models/deepseek41/attn_dense.cu
+  src/models/deepseek41/dspark.cpp src/models/deepseek41/dspark_kernels.cu)
+target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
+target_link_libraries(model_deepseek41 PUBLIC model deepseek41_kernels deepseek41_attn deepseek41_vision engine mmq kernels core ${_gpu_runtime_target})
+
+add_library(models STATIC src/models/builtin.cpp)
+target_link_libraries(models PUBLIC model_qwen4exp model_deepseek41)
+
+# DeepSeek-V4.1 kernels and their tests (own file)
+include(src/models/deepseek41/kernels/kernels.cmake)
+if(BUILD_TESTING)
+  # the DSpark drafter's kernels against CPU references (GPU)
+  add_executable(ds41_dspark_parity src/models/deepseek41/dspark_parity.cpp)
+  target_include_directories(ds41_dspark_parity PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(ds41_dspark_parity PRIVATE model_deepseek41 ${_gpu_runtime_target})
+  basalt_gpu_test(NAME ds41_dspark_parity COMMAND ds41_dspark_parity)
+endif()
+include(src/models/deepseek41/vision/vision.cmake)
+
 add_executable(basalt-gguf src/artifact/gguf_reader.cpp)
-target_link_libraries(basalt-gguf PRIVATE artifact)
+target_link_libraries(basalt-gguf PRIVATE artifact models)
 basalt_embed_manifest(basalt-gguf)
 
 add_executable(basalt-dequant src/artifact/dequant.cpp)
@@ -140,9 +174,32 @@ if(BUILD_TESTING)
   basalt_cpu_test(NAME gguf_reader_test COMMAND gguf_reader_test)
   # a split model's shards and their joint view: missing shard, split keys, duplicates, truncation (synthetic)
   add_executable(gguf_split_test tests/core/gguf_split_test.cpp)
-  target_link_libraries(gguf_split_test PRIVATE artifact)
+  target_link_libraries(gguf_split_test PRIVATE artifact models)
   basalt_embed_manifest(gguf_split_test)
   basalt_cpu_test(NAME gguf_split_test COMMAND gguf_split_test)
+  # the adapter registry: lookup by architecture, geometry from metadata, the DeepSeek skeleton (synthetic)
+  add_executable(adapter_registry_test tests/model/adapter_registry_test.cpp)
+  target_link_libraries(adapter_registry_test PRIVATE models)
+  basalt_embed_manifest(adapter_registry_test)
+  basalt_cpu_test(NAME adapter_registry_test COMMAND adapter_registry_test)
+  # the DeepSeek expert tiers' admission and placement rules on synthetic id streams (no GPU)
+  add_executable(tier_policy_test src/models/deepseek41/tier_policy_test.cpp)
+  target_include_directories(tier_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  basalt_embed_manifest(tier_policy_test)
+  basalt_cpu_test(NAME tier_policy_test COMMAND tier_policy_test)
+  # the DeepSeek context: the default, the refusals and the cache sizes (no GPU)
+  add_executable(context_policy_test src/models/deepseek41/context_policy_test.cpp)
+  target_include_directories(context_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  basalt_embed_manifest(context_policy_test)
+  basalt_cpu_test(NAME context_policy_test COMMAND context_policy_test)
+  # the DeepSeek prompt chunk choice and the cache give-back rule (no GPU)
+  add_executable(prefill_plan_test src/models/deepseek41/prefill_plan_test.cpp)
+  target_include_directories(prefill_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  basalt_embed_manifest(prefill_plan_test)
+  basalt_cpu_test(NAME prefill_plan_test COMMAND prefill_plan_test)
+  # shared code must not include a model; models must not include each other
+  add_test(NAME model_layering COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_model_layering.sh)
+  set_property(TEST model_layering APPEND PROPERTY LABELS cpu)
   # the logit_bias protocol key: what parses and what is refused (host only)
   add_executable(logit_bias_test tests/core/logit_bias_test.cpp)
   target_include_directories(logit_bias_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -330,7 +387,7 @@ add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/exper
   src/core/mtp/batching.cpp
   src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/conversation_store.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp)
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(engine PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
+target_link_libraries(engine PUBLIC core model kernels kernels_cpu ${_gpu_runtime_target})
 if(BUILD_TESTING)
   add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)
   target_link_libraries(file_expert_source_test PRIVATE engine)
@@ -413,7 +470,7 @@ if(BUILD_TESTING)
   set_tests_properties(model_file_test PROPERTIES TIMEOUT 60)
   # a PLE key held unquantized in the dense index stays in the arena; a quantized key row loads as before
   add_executable(native_dense_ple_key_test tests/core/native_dense_ple_key_test.cpp)
-  target_link_libraries(native_dense_ple_key_test PRIVATE engine)
+  target_link_libraries(native_dense_ple_key_test PRIVATE engine models)
   basalt_embed_manifest(native_dense_ple_key_test)
   basalt_gpu_test(NAME native_dense_ple_key_test COMMAND native_dense_ple_key_test)
   set_tests_properties(native_dense_ple_key_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
@@ -477,6 +534,7 @@ target_include_directories(prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${
 target_link_libraries(prefill PUBLIC engine ${_gpu_blas_target} ${_gpu_runtime_target})
 
 add_executable(basalt src/program/generate.cpp src/program/engine_local.cpp src/program/probe_rates.cpp
+                       src/program/generate/adapter.cpp
                        src/program/generate/helpers.cpp
                        src/program/generate/configure.cpp
                        src/program/generate/model.cpp
@@ -527,7 +585,7 @@ add_executable(basalt src/program/generate.cpp src/program/engine_local.cpp src/
                        src/program/cli/report.cpp)
 set_target_properties(basalt PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
-target_link_libraries(basalt PRIVATE engine engine_session grammar tokenizer prefill spec ${_gpu_runtime_target})
+target_link_libraries(basalt PRIVATE engine engine_session grammar tokenizer prefill spec models ${_gpu_runtime_target})
 basalt_embed_manifest(basalt)
 # `basalt serve` runs the Python server from the source tree; the engine reads its expert profiles from data/profiles
 target_compile_definitions(basalt PRIVATE BASALT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -1223,6 +1281,10 @@ if(BUILD_TESTING)
   add_executable(conv_cache_test tests/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
   basalt_cpu_test(NAME conv_cache_test COMMAND conv_cache_test)
+  # which part of a held DeepSeek sequence the next prompt keeps (header-only, CPU)
+  add_executable(prefix_reuse_test src/program/prefix_reuse_test.cpp)
+  target_include_directories(prefix_reuse_test PRIVATE include)
+  basalt_cpu_test(NAME prefix_reuse_test COMMAND prefix_reuse_test)
   # the f32 -> bf16 rounding against ggml's, NaN included, over every f32 bit pattern (header-only, CPU)
   add_executable(bf16_bits_test tests/kernels/bf16_bits_test.cpp)
   target_include_directories(bf16_bits_test PRIVATE include)
@@ -1309,7 +1371,7 @@ if(BUILD_TESTING)
 endif()
 # MMQ (ggml-cuda) for the prompt path's experts: the kernel, one instance per format the packs use, and the
 # activation quantizer; mmq_host.cu holds its few host symbols
-set(_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 q5_1 q4_k q5_k q6_k nvfp4)
+set(_mmq_types q2_0 iq1_s iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 q5_1 q4_k q5_k q6_k nvfp4)
 # the Q2_0 pack's prompt experts on the engine's own int8 kernels (moe_fused.cu)
 add_library(mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
             src/prefill/mmq/mmq_host.cu src/prefill/mmq/quantize.cu)
@@ -1360,6 +1422,10 @@ if(BUILD_TESTING)
     set_tests_properties(prefill_layout_${_mode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   endforeach()
   # MMQ for the K-quant experts against the FP16 dequant + cuBLAS path and a double-precision reference (--bench: timings)
+  add_executable(prefill_mmq_iq1s_test tests/cuda/prefill_mmq_iq1s_test.cpp)
+  target_link_libraries(prefill_mmq_iq1s_test PRIVATE prefill mmq kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME prefill_mmq_iq1s_test COMMAND prefill_mmq_iq1s_test)
+  set_tests_properties(prefill_mmq_iq1s_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
   add_executable(prefill_mmq_kq_test tests/cuda/prefill_mmq_kq_test.cpp)
   target_link_libraries(prefill_mmq_kq_test PRIVATE prefill mmq kernels ${_gpu_runtime_target})
   basalt_gpu_test(NAME prefill_mmq_kq_test COMMAND prefill_mmq_kq_test)
@@ -1398,6 +1464,17 @@ target_link_libraries(native_expert_parity PRIVATE kernels kernels_cpu artifact 
 add_executable(native_expert_bench tests/kernels/native_expert_bench.cpp)
 target_include_directories(native_expert_bench PRIVATE ${_gpu_include_directories})
 target_link_libraries(native_expert_bench PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})
+# IQ1_S and the limited-SwiGLU expert pairs at the DeepSeek geometry, GPU and CPU tiers against a double reference
+add_executable(iq1s_parity src/kernels/iq1s_parity.cpp)
+target_include_directories(iq1s_parity PRIVATE ${_gpu_include_directories})
+target_compile_definitions(iq1s_parity PRIVATE BASALT_IQ1S_GPU)
+target_link_libraries(iq1s_parity PRIVATE kernels kernels_cpu ${_gpu_runtime_target})
+basalt_gpu_test(NAME iq1s_parity COMMAND iq1s_parity)
+set_tests_properties(iq1s_parity PROPERTIES TIMEOUT 300)
+basalt_cpu_test(NAME iq1s_parity_cpu COMMAND iq1s_parity --cpu)
+add_executable(iq1s_fixture_parity src/kernels/iq1s_fixture_parity.cpp)   # real DeepSeek weights vs llama.cpp tensors (manual: needs the GGUF and fixtures)
+target_include_directories(iq1s_fixture_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(iq1s_fixture_parity PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})
 # DEC_MOE's kernels on real GGUF experts, bitwise vs the path they replace (--bench: timings)
 add_executable(dec_moe_parity tests/kernels/dec_moe_parity.cpp)
 target_include_directories(dec_moe_parity PRIVATE ${_gpu_include_directories})

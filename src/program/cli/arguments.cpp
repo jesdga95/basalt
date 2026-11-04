@@ -41,7 +41,16 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
             have_tokens = true;
         }
         else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
-        else if (a == "--max-context") o.max_context = std::atoll(next("--max-context"));
+        else if (a == "--max-context") { o.max_context = std::atoll(next("--max-context")); o.max_context_set = true; }
+        else if (a == "--diag-fixture") o.diag_fixture = next("--diag-fixture");
+        else if (a == "--diag-dump") o.diag_dump = next("--diag-dump");
+        else if (a == "--diag-mmproj") o.diag_mmproj = next("--diag-mmproj");
+        else if (a == "--diag-tier-ram") o.diag_tier_ram = std::atoi(next("--diag-tier-ram"));
+        else if (a == "--diag-tier-vram") o.diag_tier_vram = std::atoi(next("--diag-tier-vram"));
+        else if (a == "--diag-dspark") o.diag_dspark = next("--diag-dspark");
+        else if (a == "--image") o.images.push_back(next("--image"));
+        else if (a == "--image-at") o.image_at.push_back(std::atoll(next("--image-at")));
+        else if (a == "--image-pad-id") o.image_pad_id = std::atoll(next("--image-pad-id"));
         else if (a == "--rope-scaling") o.rope_scaling = next("--rope-scaling");
         else if (a == "--rope-scale") o.rope_scale = std::atof(next("--rope-scale"));
         else if (a == "--rope-freq-base") o.rope_freq_base = std::atof(next("--rope-freq-base"));
