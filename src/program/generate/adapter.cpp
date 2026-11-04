@@ -243,6 +243,7 @@ std::optional<int> run_adapter_model(basalt::program::CommonOptions& o, basalt::
         lreq.peer_devices = o.peer_devices;
         lreq.max_context = o.max_context;
         lreq.max_context_set = true;
+        lreq.sessions = std::max(o.batch, 1);
         lreq.expert_profile = o.expert_profile;
         if (lreq.expert_profile.empty()) {   // the engine's own for this model, when it ships one
             const std::string key = cli::profile_key(model_file.meta());

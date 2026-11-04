@@ -30,6 +30,8 @@ inline void dense_f32(const DevTensor& w, const float* x, void* scratch_q8_1, fl
     kernels::native_mmvq(w.type, w.ptr, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
+class ExpertTier;
+
 class DsModel final : public model::LoadedModel {
 public:
     ~DsModel() override;
@@ -60,6 +62,15 @@ public:
     int diag_tier_ram() const { return diag_tier_ram_; }
     int diag_tier_vram() const { return diag_tier_vram_; }
     void set_diag_tier(int ram, int vram) { diag_tier_ram_ = ram; diag_tier_vram_ = vram; }
+    /// The expert tier and the pinned rows it shares with a second card: one per model, whatever the sessions.
+    struct SharedTier {
+        std::shared_ptr<ExpertTier> tier;
+        float* h_x = nullptr;
+        float* h_rows = nullptr;
+    };
+    SharedTier& shared_tier() const { return shared_tier_; }
+    /// The sessions that will hold a context each.
+    int sessions() const { return tiers_.sessions > 0 ? tiers_.sessions : 1; }
     /// What the flags ask of the expert tiers.
     const model::LoadRequest& tiers() const { return tiers_; }
     void set_tiers(const model::LoadRequest& req) { tiers_ = req; }
@@ -82,6 +93,7 @@ private:
     int diag_tier_ram_ = -1, diag_tier_vram_ = -1;
     int peer_device_ = -1;
     model::LoadRequest tiers_;
+    mutable SharedTier shared_tier_;
     int64_t ctx_ = 0;
     static int64_t ctxp_default();
     int embd_fd_ = -1;
