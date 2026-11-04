@@ -24,6 +24,7 @@ struct TensorRef {
 
 struct Hparams {
     int image_size = 0, patch = 0, embd = 0, ffn = 0, layers = 0, heads = 0, merge = 0, proj = 0;
+    int min_pixels = 0;   ///< smallest input area in pixels, when the file states one
     float eps = 0.f;
     float mean[3] = {0, 0, 0}, std[3] = {1, 1, 1};
 };
@@ -35,8 +36,12 @@ public:
     Mmproj(const Mmproj&) = delete;
     Mmproj& operator=(const Mmproj&) = delete;
 
-    /// Reads `path` (mapped when the file system refuses unbuffered reads), parses the header and checks it is the expected projector.  False with `err` otherwise.
-    bool open(const std::string& path, std::string& err);
+    /// Reads `path` (mapped when the file system refuses unbuffered reads), parses the header and checks it is the `projector` type.  False with `err` otherwise.
+    bool open(const std::string& path, std::string& err, const char* projector = "qwen3vl_merger");
+
+    /// The same for the `bytes` bytes at `offset` of `path` (a projector stored as a section of a larger file).
+    bool open_range(const std::string& path, uint64_t offset, uint64_t bytes, std::string& err,
+                    const char* projector = "qwen3vl_merger");
 
     /// Drops the file's bytes: tensor pointers are invalid afterwards, hp() stays.  For callers that copied the weights.
     void release();
@@ -52,6 +57,7 @@ private:
     platform::MappedFile mapping_;   ///< the file's view, when `map_` is one
     bool mapped_ = false;   ///< `map_` is a file mapping (else allocated memory the file was read into)
     size_t size_ = 0;
+    size_t view_off_ = 0;   ///< where the projector starts inside the mapping
     Hparams hp_;
     std::map<std::string, TensorRef> tensors_;
 };
