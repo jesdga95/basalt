@@ -12,13 +12,21 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <algorithm>
 #include <thread>
+#include <vector>
 
 namespace basalt::models::deepseek41 {
 namespace {
 
 constexpr uint64_t kRamHeadroom = 20ull << 30;   // host memory left to the system beside the RAM tier
 constexpr size_t kMaxPending = 128;              // promotions in flight
+
+// The usual routing order of this model's experts: the RAM and VRAM tiers start from the head of it.
+constexpr int kRankLayers = 40, kRankExperts = 384;
+constexpr uint16_t kExpertRank[kRankLayers][kRankExperts] =
+#include "models/deepseek41/expert_rank.inc"
+;
 
 }  // namespace
 
@@ -109,6 +117,7 @@ bool ExpertTier::open(uint64_t reserve_bytes, std::string& err) {
     uint64_t ram = 0;
     if (core::detail::host_available_memory(hm) && hm.available > kRamHeadroom) ram = hm.available - kRamHeadroom;
     if (!load_ram(ram, err)) return false;
+    seed_vram();
     basalt::log::info("basalt deepseek41", "VRAM expert tier %.2f GiB, %lld of %d experts per layer (%.0f%%); CPU pool %d workers",
                  cache_.gib(), (long long) per_layer_, n_expert_, 100.0 * (double) per_layer_ / n_expert_, pool_->workers());
     return true;
@@ -126,8 +135,12 @@ bool ExpertTier::load_ram(uint64_t bytes, std::string& err) {
     last_miss_.assign((size_t) n_layers_ * n_expert_, 0);
     if (cover_ <= 0) return true;
     const bool swaps = cover_ < n_expert_;   // one more slot per layer takes the experts swapped in
-    for (int l = 0; l < n_layers_; ++l)
-        for (int e = 0; e < cover_; ++e) ram_idx_[(size_t) l * n_expert_ + e] = e;
+    for (int l = 0; l < n_layers_; ++l) {
+        std::vector<int> held((size_t) cover_);
+        for (int r = 0; r < cover_; ++r) held[(size_t) r] = ranked(l, r);
+        std::sort(held.begin(), held.end());
+        for (int r = 0; r < cover_; ++r) ram_idx_[(size_t) l * n_expert_ + held[(size_t) r]] = r;
+    }
     if (swaps)
         for (int l = 0; l < n_layers_; ++l) spare_[(size_t) l] = cover_;
     const auto t0 = std::chrono::steady_clock::now();
@@ -147,10 +160,11 @@ bool ExpertTier::load_ram(uint64_t bytes, std::string& err) {
                 failed = true;
                 return;
             }
-            constexpr uint64_t kChunk = 32ull << 20;
-            for (uint64_t o = 0; o < span; o += kChunk) {
-                const uint64_t n = std::min(kChunk, span - o);
-                if (!platform::pread_all(m_.experts_fd(), p + o, n, m_.pack().experts_range.offset + el.offset + o)) {
+            for (int e = 0; e < n_expert_; ++e) {
+                const int32_t r = ram_idx_[(size_t) l * n_expert_ + e];
+                if (r < 0) continue;
+                if (!platform::pread_all(m_.experts_fd(), p + (uint64_t) r * el.blob_bytes, el.blob_bytes,
+                                         m_.pack().experts_range.offset + el.offset + (uint64_t) e * el.blob_bytes)) {
                     std::lock_guard<std::mutex> g(mu);
                     err = "deepseek41: short read loading the RAM expert tier";
                     failed = true;
@@ -170,6 +184,31 @@ bool ExpertTier::load_ram(uint64_t bytes, std::string& err) {
     basalt::log::info("basalt deepseek41", "RAM expert tier %.1f GiB (%d of %d experts per layer) loaded in %.1f s",
                  (double) per_layer * cover_ / 1073741824.0, cover_, n_expert_, s);
     return true;
+}
+
+int ExpertTier::ranked(int layer, int r) const {
+    return n_layers_ == kRankLayers && n_expert_ == kRankExperts ? kExpertRank[layer][r] : r;
+}
+
+// The VRAM slots start with the RAM tier's most routed experts.
+void ExpertTier::seed_vram() {
+    for (int l = 0; l < n_layers_; ++l) {
+        for (int64_t r = 0, placed = 0; r < n_expert_ && placed < per_layer_; ++r) {
+            const int e = ranked(l, (int) r);
+            if (!pinned(l, e)) continue;
+            ++tick_;
+            if (claim(l, e, blob_of(l, e), copy_stream_) < 0) {
+                cudaStreamSynchronize(copy_stream_);
+                drain();
+                ++tick_;
+                if (claim(l, e, blob_of(l, e), copy_stream_) < 0) return;
+            }
+            ++placed;
+        }
+    }
+    cudaStreamSynchronize(copy_stream_);
+    drain();
+    promoted_ = 0;
 }
 
 const uint8_t* ExpertTier::blob_of(int layer, int e) const {

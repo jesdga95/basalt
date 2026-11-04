@@ -98,6 +98,8 @@ private:
         int layer, expert, victim;
     };
     bool load_ram(uint64_t bytes, std::string& err);
+    int ranked(int layer, int r) const;
+    void seed_vram();
     bool pinned(int layer, int e) const { return ram_idx_[(size_t) layer * n_expert_ + e] >= 0; }
     const uint8_t* blob_of(int layer, int e) const;
     const uint8_t* slot_ptr(int32_t slot) const;

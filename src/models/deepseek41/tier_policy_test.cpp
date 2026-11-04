@@ -1,6 +1,7 @@
 // src/models/deepseek41/tier_policy_test.cpp - the tier admission and placement rules on synthetic id streams.
 #include "models/deepseek41/tier_policy.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <vector>
 
@@ -90,6 +91,19 @@ int main() {
             }
         ++seen[(size_t) spare];
         CHECK(pinned == cover);
+        for (int s : seen) CHECK(s == 1);
+    }
+
+    // the routing order holds every expert of a layer once
+    static const uint16_t rank[40][384] =
+#include "models/deepseek41/expert_rank.inc"
+    ;
+    for (const auto& row : rank) {
+        std::vector<int> seen(384, 0);
+        for (uint16_t e : row) {
+            CHECK(e < 384);
+            if (e < 384) ++seen[e];
+        }
         for (int s : seen) CHECK(s == 1);
     }
 
