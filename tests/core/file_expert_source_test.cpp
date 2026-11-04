@@ -115,7 +115,7 @@ void test_native_variable_layout() {
                                   {layer0_bytes + (uint64_t) second_fmt.bytes, 'd'},
                                   {layer0_bytes + 2 * (uint64_t) second_fmt.bytes, 'f'}, {total - 1, 'z'}});
 
-    const bool layout_ok = expert_layout_load_text(layout_text.str(), layers, experts, err);
+    const bool layout_ok = expert_layout_load_text(layout_text.str(), layers, experts, err, 2560, 640);
     require(layout_ok, "could not load synthetic native layout: " + err);
     FileExpertSource source;
     bool opened = source.open(FileRange((dir.path / "experts.bin").string()), layers, experts, err);
@@ -213,7 +213,7 @@ void test_direct_read_unaligned_geometry() {
     layout_text << "0 " << GGML_TYPE_IQ2_XXS << ' ' << GGML_TYPE_IQ4_NL << " 0 " << first_fmt.bytes << '\n';
     layout_text << "1 " << GGML_TYPE_IQ2_XS << ' ' << GGML_TYPE_IQ4_NL << ' ' << layer0_bytes << ' '
                 << second_fmt.bytes << '\n';
-    require(expert_layout_load_text(layout_text.str(), layers, experts, err), err);
+    require(expert_layout_load_text(layout_text.str(), layers, experts, err, 2560, 640), err);
     {
         basalt::platform::DirectFile probe;
         std::string probe_err;

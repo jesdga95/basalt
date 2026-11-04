@@ -9,6 +9,7 @@
 #include "basalt/models/qwen4exp/decode/layout.hpp"
 #include "basalt/models/qwen4exp/decode/session.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/models/qwen4exp/kernels/cpu_geometry.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 
@@ -40,7 +41,7 @@ bool load_layout(const std::string& mode, int64_t layers, std::string& err) {
         t << l << ' ' << gt << ' ' << dt << ' ' << off << ' ' << f.bytes << '\n';
         off += f.bytes * 512;
     }
-    return cpu::expert_layout_load_text(t.str(), layers, 512, err);
+    return cpu::expert_layout_load_text(t.str(), layers, 512, err, 2560, 640);
 }
 }  // namespace
 

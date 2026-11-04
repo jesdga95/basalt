@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/models/qwen4exp/decode/expert_dispatch.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/models/qwen4exp/decode/native_dense.hpp"

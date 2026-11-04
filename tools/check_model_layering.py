@@ -83,7 +83,7 @@ WIDTH_OK = {
     "src/kernels/cuda/gu2.cuh": "a shared kernel's instance for this width; other widths take the other path",
     "src/prefill/moe_mmq.cu": "the Q2_0 blob layout of that format's instance",
     "include/basalt/prefill/moe_mmq.hpp": "the Q2_0 blob layout of that format's instance",
-    "include/basalt/kernels/cpu/expert.hpp": "pending: the Q2_0 CPU kernels move to the model",
+    "include/basalt/kernels/cpu/expert.hpp": "the capacity of the Q8_1 activation block, not a model width",
     "src/kernels/cpu/kq_avx2.cpp": "a loop bound in a comment",
 }
 hits = []

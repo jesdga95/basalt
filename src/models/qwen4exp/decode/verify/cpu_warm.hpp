@@ -4,6 +4,7 @@
 #include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
+#include "basalt/models/qwen4exp/kernels/cpu_geometry.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include <atomic>
 #include <vector>

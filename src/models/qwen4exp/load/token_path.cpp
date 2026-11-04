@@ -33,7 +33,6 @@ int token_path(Context& context) {
     Drive drive;
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
-    drive.d.jobs.resize((size_t) K);
     // ---- THE HIT PATH.  Every one of these is required for `hits_ready()`, which is all-or-nothing on
     // purpose: a half-configured hit path would compute some experts twice and others not at all, and a token
     // built on that is wrong rather than refused.

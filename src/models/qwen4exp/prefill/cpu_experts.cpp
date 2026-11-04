@@ -3,6 +3,7 @@
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/models/qwen4exp/kernels/cpu_geometry.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/models/qwen4exp/prefill/moe_fp4.hpp"
 #include "basalt/core/peer_experts.hpp"

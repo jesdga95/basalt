@@ -225,7 +225,7 @@ int run_engine(program::Options& o, std::vector<program::GpuCard>& chosen_cards)
         std::vector<uint8_t> text;
         bool layout_ok = basalt::core::read_range(srcs.experts_layout, text, err) &&
                          basalt::kernels::cpu::expert_layout_load_text(std::string(text.begin(), text.end()), g0.n_layers,
-                                                                       g0.n_expert, err);
+                                                                       g0.n_expert, err, g0.n_embd, g0.n_ff);
         if (!layout_ok) {
             return fatal_start_error(err);
         }

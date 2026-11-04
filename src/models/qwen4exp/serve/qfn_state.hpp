@@ -35,6 +35,7 @@
 #include "basalt/core/weights.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
+#include "basalt/models/qwen4exp/kernels/cpu_geometry.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/program/image_loan.hpp"
