@@ -140,7 +140,7 @@ def main() -> int:
                     fail(f"vision: GPU {card} is not found by nvidia-smi")   # the sidecar checks the card itself
             for note in plan.get("notes") or []:
                 print(f"[server] {note}", flush=True)
-            if plan.get("warning"):
+            if plan.get("warning") and cfg.get("arch") != "deepseek41":   # that model runs on its main card alone
                 print(f"[server] warning: {plan['warning']}", flush=True)
             cfg["gpu"] = plan["devices"]
             cfg["gpu_smi"] = [c.get("smi", -1) for c in plan.get("cards") or []]

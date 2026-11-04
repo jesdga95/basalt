@@ -44,7 +44,8 @@ struct AdapterTimes {
 /// read, the reused positions counted as read and left out of the speed.
 bool adapter_prompt(basalt::model::ModelSession& sess, const std::vector<int32_t>& toks,
                     const std::vector<AdapterImage>& images, int32_t& next, int64_t& pos, AdapterTimes& tm,
-                    std::string& err, float* logits = nullptr, size_t reuse = 0, bool report = false) {
+                    std::string& err, float* logits = nullptr, size_t reuse = 0, bool report = false,
+                    bool* checkpointed = nullptr) {
     const auto t0 = Clock::now();
     pos = (int64_t) reuse;
     int64_t total = (int64_t) toks.size();
@@ -112,6 +113,8 @@ bool adapter_prompt(basalt::model::ModelSession& sess, const std::vector<int32_t
             if (r.ok()) report_at(pos);
         }
     }
+    // the state before the last prompt token: a next turn renders the same text up to here, whatever this reply thinks
+    if (r.ok() && checkpointed != nullptr && images.empty() && n_pre > 0) *checkpointed = sess.checkpoint(pos).ok();
     if (r.ok()) {
         basalt::model::DecodeRequest dr;
         dr.tokens = toks.data() + n_pre;
@@ -258,6 +261,7 @@ int adapter_serve(basalt::model::LoadedModel& loaded, int64_t max_context, int64
     std::fflush(stdout);
     std::string line;
     std::vector<int32_t> held;   // the tokens whose state the session holds, position by position (no pictures)
+    std::vector<int32_t> turn;   // the tokens of the session's checkpoint: the last prompt, without its final token
     while (next_line(line)) {
         std::istringstream in(line);
         std::string cmd;
@@ -354,7 +358,12 @@ int adapter_serve(basalt::model::LoadedModel& loaded, int64_t max_context, int64
         long long made = 0;
         std::mt19937_64 rng(seed ? seed : std::random_device{}());
         std::vector<float> logits;
-        const size_t reuse = blocks.empty() ? basalt::program::prefix_reuse::reusable(held, toks) : 0;
+        size_t reuse = blocks.empty() ? basalt::program::prefix_reuse::reusable(held, toks) : 0;
+        if (reuse == 0 && blocks.empty() && basalt::program::prefix_reuse::reusable(turn, toks) > 0 &&
+            sess->rewind_to_checkpoint().ok()) {
+            reuse = turn.size();
+            held = turn;
+        }
         if (!held.empty() && reuse == 0) {
             size_t same = 0;
             while (same < held.size() && same < toks.size() && held[same] == toks[same]) ++same;
@@ -367,12 +376,15 @@ int adapter_serve(basalt::model::LoadedModel& loaded, int64_t max_context, int64
         auto t_dec = Clock::now();
         const bool sample = temperature > 0.f;
         if (sample) logits.resize((size_t) loaded.desc().n_vocab);
-        if (!adapter_prompt(*sess, toks, blocks, next, pos, tm, err, sample ? logits.data() : nullptr, reuse, true)) {
+        bool checkpointed = false;
+        turn.clear();
+        if (!adapter_prompt(*sess, toks, blocks, next, pos, tm, err, sample ? logits.data() : nullptr, reuse, true, &checkpointed)) {
             std::printf("ERR %s\n", err.c_str());
             std::fflush(stdout);
             continue;
         }
         if (blocks.empty()) held = toks;
+        if (checkpointed) turn.assign(toks.begin(), toks.end() - 1);
         t_dec = Clock::now();
         basalt::model::DecodeRequest dr;
         int32_t cur = 0;
