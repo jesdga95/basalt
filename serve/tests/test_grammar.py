@@ -309,7 +309,7 @@ class EngineStart(unittest.TestCase):
             cfg = {"engine_bin": str(eng), "args": ["--serve"], "log": None, "tokenizer": str(tokdir)}
             with mock.patch.object(sys, "argv", argv), \
                     mock.patch("serve.engine.modelfile.model_config", return_value=cfg), \
-                    mock.patch.dict(sys.modules, {"tokenizer": types.SimpleNamespace(Tokenizer=lambda *a: ByteTokenizer())}), \
+                    mock.patch.dict(sys.modules, {"tokenizer": types.SimpleNamespace(Tokenizer=lambda *a, **k: ByteTokenizer())}), \
                     mock.patch.object(server, "ProcessEngine", fake), \
                     mock.patch.object(server, "gpu_plan", return_value=ONE_CARD):
                 try:
