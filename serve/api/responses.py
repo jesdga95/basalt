@@ -20,7 +20,7 @@ import json
 import time
 import uuid
 
-from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs, stable_tool_order
+from serve.frontend import IMAGE_PARTS, Event, _late_system_to_user, _parts_of, effort_kwargs, stable_tool_order
 
 ENCRYPTED_PREFIX = "basalt.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -67,8 +67,9 @@ def _content(content, param):
             parts.append({"type": "text", "text": part.get("text") or ""})
         elif kind == "refusal":
             parts.append({"type": "text", "text": part.get("refusal") or ""})
-        elif kind in ("input_image", "image_url"):
+        elif kind in IMAGE_PARTS:
             if not part.get("image_url"):
+                print("[server] error: an image part has no image_url", flush=True)
                 raise ResponsesError("only images given as image_url (a data: or http(s) URL) are supported; "
                                      "this server keeps no files", f"{param}[{j}]", "unsupported_parameter")
             parts.append({"type": "input_image", "image_url": part["image_url"]})
@@ -111,8 +112,10 @@ def _arguments(raw, param) -> dict:
 
 def _tool_output(item, param):
     out = item.get("output")
-    if isinstance(out, dict):                        # some clients send a JSON result as an object
-        return json.dumps(out, ensure_ascii=False)
+    if isinstance(out, dict):
+        if out.get("type") in IMAGE_PARTS:
+            return _content([out], param + ".output")
+        return json.dumps(out, ensure_ascii=False)   # some clients send a JSON result as an object
     return out if isinstance(out, str) else _content(out, param + ".output")
 
 
@@ -153,8 +156,7 @@ def input_messages(req: dict) -> list[dict]:
                 raise ResponsesError(f"unknown message role {role!r}", param + ".role")
             content = _content(item.get("content"), param + ".content")
             if role == "assistant":
-                turn(content if isinstance(content, str) else "".join(
-                    p.get("text", "") for p in content if p.get("type") == "text"))
+                turn(content)
             else:
                 open_turn = None
                 thinking.clear()
