@@ -263,7 +263,7 @@ class ProcessEngine:
         try:
             self.proc = lifeline.popen([engine_bin, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE if sink else self.log,
-                                       text=True, encoding="utf-8", bufsize=1, env=env)
+                                       text=True, encoding="utf-8", errors="replace", bufsize=1, env=env)
         except OSError as e:                            # missing or not executable: nothing started, so this is a start error
             loading.set()                               # the narrator stops and the log handle goes back
             if log:
