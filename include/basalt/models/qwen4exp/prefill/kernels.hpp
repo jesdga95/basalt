@@ -1,4 +1,4 @@
-// include/basalt/prefill/kernels.hpp - the element-wise and stateful kernels of a prompt chunk.
+// include/basalt/models/qwen4exp/prefill/kernels.hpp - the element-wise and stateful kernels of a prompt chunk.
 //
 // T tokens at a time, all row-major with the token as the slow index.  The arithmetic mirrors the per-token native
 // kernels (the decode path), batched; where a step is a recurrence in time (the GDN conv and state, the PLE conv)
@@ -53,7 +53,7 @@ void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate
 void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, void* stream);
 /// The bytes of scratch gdn_recurrence needs for T tokens.
 uint64_t gdn_work_bytes(int64_t T);
-/// The recurrence over the chunk in 16-token chunks (src/prefill/gdn_chunked.cu): q/k L2-normalized (eps) and
+/// The recurrence over the chunk in 16-token chunks (src/models/qwen4exp/prefill/gdn_chunked.cu): q/k L2-normalized (eps) and
 /// rounded to BF16, the state [key][value head][value] kept in FP32; y16[t] = rmsnorm(o) * gamma * sigmoid(z) in FP16
 /// (what the out projection reads); y is FP32 scratch, work gdn_work_bytes(T) bytes.
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,

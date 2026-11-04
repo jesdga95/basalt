@@ -2,7 +2,7 @@
 // model's geometry (512 experts, 10 per token) for chunk widths from one token to a full prompt chunk, with ids outside
 // [0, n_expert) mixed in (skipped).  Counts are integers, so the match is exact, and a layer's counts accumulate across
 // chunks.  Prints the kernel's time and the id bytes read per second.  Exit 77 without a CUDA device.
-#include "basalt/prefill/kernels.hpp"
+#include "basalt/models/qwen4exp/prefill/kernels.hpp"
 
 #include <cuda_runtime.h>
 

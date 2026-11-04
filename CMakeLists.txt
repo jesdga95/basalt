@@ -494,7 +494,7 @@ endif()
 # `basalt` (generate.cpp): the engine program that composes the components into a token.  The prompt arrives as
 # ids, so a tokenizer is never on one side of a logit comparison.
 # The prompt path: batched prompt processing (tensor-core GEMMs through cuBLAS).
-add_library(prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/gdn_chunked.cu
+add_library(prefill STATIC src/models/qwen4exp/prefill/gemm.cu src/models/qwen4exp/prefill/kernels.cu src/models/qwen4exp/prefill/gdn_chunked.cu
   src/models/qwen4exp/prefill/lifecycle.cpp
   src/models/qwen4exp/prefill/layout.cpp
   src/models/qwen4exp/prefill/projection.cpp
@@ -1365,7 +1365,7 @@ endif()
 # activation quantizer; mmq_host.cu holds its few host symbols
 set(_mmq_types q2_0 iq1_s iq1_m iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 q5_1 q4_k q5_k q6_k nvfp4)
 # the Q2_0 pack's prompt experts on the engine's own int8 kernels (moe_fused.cu)
-add_library(mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
+add_library(mmq STATIC src/prefill/moe_mmq.cu src/models/qwen4exp/prefill/moe_fused.cu src/models/qwen4exp/prefill/moe_fused_iq.cu
             src/prefill/mmq/mmq_host.cu src/prefill/mmq/quantize.cu)
 # q8_0: the drafter's matrices
 foreach(_t IN LISTS _mmq_types)
@@ -1380,7 +1380,7 @@ endif()
 target_link_libraries(mmq PUBLIC ggml_quants ${_gpu_runtime_target})
 target_link_libraries(prefill PUBLIC mmq)
 # the FP4 block-scaled tensor-core experts (need the a-variant of the architecture)
-add_library(fp4 STATIC src/prefill/fp4/moe_fp4.cu)
+add_library(fp4 STATIC src/models/qwen4exp/prefill/fp4/moe_fp4.cu)
 set_target_properties(fp4 PROPERTIES CUDA_ARCHITECTURES 120a-real)
 target_include_directories(fp4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(fp4 PUBLIC mmq ${_gpu_runtime_target})

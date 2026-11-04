@@ -1,4 +1,4 @@
-// src/prefill/moe_fused.cu - see include/basalt/prefill/moe_fused.hpp (the Q2_0 prompt experts on
+// src/models/qwen4exp/prefill/moe_fused.cu - see include/basalt/models/qwen4exp/prefill/moe_fused.hpp (the Q2_0 prompt experts on
 // the engine's own int8 tensor-core kernels, with the grouping on the GPU).
 //
 // The arithmetic.  A Q2_0 block is 64 weights w = d_w * (q - 1), q in 0..3, four codes per byte, weight j of a block
@@ -17,7 +17,7 @@
 // bytes - (word >> 2t) & 0x03030303 holds weights t, t+4, t+8, t+12 of a 16-weight word.  So the kernels use that order
 // for the k of a half-block: mma k index 16h + 4t + j stands for weight (and activation) 16h + t + 4j.  The
 // activations are stored in it (perm32), and a lane's two B registers (h = 0 and 1) are adjacent: one 8-byte load.
-#include "basalt/prefill/moe_fused.hpp"
+#include "basalt/models/qwen4exp/prefill/moe_fused.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

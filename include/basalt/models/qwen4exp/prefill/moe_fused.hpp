@@ -1,4 +1,4 @@
-// include/basalt/prefill/moe_fused.hpp - the routed experts of a Q2_0 model in the prompt path on
+// include/basalt/models/qwen4exp/prefill/moe_fused.hpp - the routed experts of a Q2_0 model in the prompt path on
 // own int8 tensor-core kernels (devices with int8 MMA; others use MMQ).
 //
 // The MMQ path (moe_mmq.hpp) per MoE layer: a host sync to group the (token, k) pairs by expert, a gather of each

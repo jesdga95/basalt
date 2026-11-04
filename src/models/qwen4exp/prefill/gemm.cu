@@ -1,4 +1,4 @@
-// src/prefill/gemm.cu - see include/basalt/prefill/gemm.hpp.
+// src/models/qwen4exp/prefill/gemm.cu - see include/basalt/prefill/gemm.hpp.
 #include "basalt/prefill/gemm.hpp"
 #include "basalt/kernels/dequant_bf16.hpp"
 #include "basalt/kernels/hc_fused.hpp"

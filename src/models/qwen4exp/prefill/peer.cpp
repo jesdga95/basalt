@@ -6,7 +6,7 @@
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/core/native_head.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
-#include "basalt/prefill/moe_fp4.hpp"
+#include "basalt/models/qwen4exp/prefill/moe_fp4.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/log.hpp"
