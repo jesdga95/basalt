@@ -1,13 +1,18 @@
 // src/program/generate/adapter.cpp - models served by their adapter session: the CLI path and the --serve line protocol.
-#include "context.hpp"
 #include "run.hpp"
+#include "session_model.hpp"
 #include "../serve/session_engine.hpp"
 
+#include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/platform/process.hpp"
-#include "basalt/program/prefix_reuse.hpp"
+#include "basalt/program/options.hpp"
+#include "../cli/options.hpp"
+#include <cuda_runtime.h>
+#include <chrono>
+#include <cstdio>
 
 #include <atomic>
 #include <cerrno>
@@ -24,6 +29,14 @@
 namespace basalt::program::generate {
 
 namespace {
+
+using Clock = std::chrono::steady_clock;
+namespace cli = basalt::program::cli;
+
+int fatal_start_error(const std::string& text) {
+    basalt::log::error("basalt", "%s", text.c_str());
+    return 1;
+}
 
 bool g_diag_serial_prompt = false;   // --diag-serial-prompt
 std::FILE* g_diag_logits = nullptr;  // --diag-logits FILE: each decoded row's logits (the serial prompt and the last prompt token)
@@ -220,14 +233,17 @@ int adapter_generate(basalt::model::LoadedModel& loaded, const std::vector<int64
     return 0;
 }
 
-std::optional<int> run_adapter_model(basalt::program::CommonOptions& o, basalt::core::ModelFile& model_file) {
+int run_session_model(basalt::program::CommonOptions& o, const basalt::model::ModelAdapter& model_adapter) {
+    const basalt::model::ModelAdapter* adapter = &model_adapter;
+    basalt::core::ModelFile model_file;
+    {
+        std::string merr;
+        if (!model_file.open(o.model, merr) || !model_file.load_meta(merr) || !model_file.register_gguf_view(merr))
+            return fatal_start_error("--model: " + merr);
+    }
+    o.native_shards = {o.model};
     g_diag_serial_prompt = o.diag_serial_prompt;
     if (!o.diag_logits.empty()) g_diag_logits = std::fopen(o.diag_logits.c_str(), "wb");
-    const basalt::core::Json* kv = model_file.meta().get("gguf_kv");
-    const basalt::core::Json* arch = kv ? kv->get("general.architecture") : nullptr;
-    const std::string name = arch && arch->is_string() ? arch->s : std::string();
-    const basalt::model::ModelAdapter* adapter = basalt::model::find_adapter(name);
-    if (adapter == nullptr) return fatal_start_error("--model: no model adapter for architecture '" + name + "'");
     try {
         const basalt::GgufFile model_gguf(o.native_shards.front());
         std::string err = adapter->validate(model_gguf);
@@ -259,7 +275,6 @@ std::optional<int> run_adapter_model(basalt::program::CommonOptions& o, basalt::
         lreq.peer_reserve_mib = o.peer_reserve_mib;
         lreq.vram_reserve_mib = o.vram_reserve_given ? o.vram_reserve_mib : 0;
         const basalt::model::Result r = adapter->load(lreq, loaded);
-        if (r.status == basalt::model::Status::UseEnginePath) return std::nullopt;
         if (!r.ok() || !loaded) return fatal_start_error(r.message);
         std::vector<int64_t> stop;
         if (o.stop_eos) stop = o.eos_ids;
