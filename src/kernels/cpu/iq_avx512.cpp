@@ -6,6 +6,7 @@
 // `maddubs` and a `madd`.  The arithmetic is ggml's (ggml-cpu/quants.c, the `_generic` references): integer sums
 // per block, times d_x * d_y * the format's constant - only the order of the float additions differs.
 //
+// IQ1_S (19) has a single-token kernel, bitwise ggml's dot.
 // Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22).  IQ1_M stays on ggml-cpu (no shipped
 // model has IQ1_M expert rows: the 'Coder IQ1_M' pack's gate/up are IQ2_S / IQ3_XXS / IQ3_S).
 //
@@ -149,6 +150,69 @@ template <> struct Fmt<21> {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4]
         sc = scales4(sa, sa, sb, sb);
     }
 };
+
+
+// ---- IQ1_S (19), one token: ggml's AVX2 dot with the 64-value steps widened to 512 bits.  The integer sums are
+// exact and folded to ggml's eight int32 lanes, and the float accumulation keeps ggml's order, so the result
+// is bit for bit ggml's single-token dot.
+inline float hsum8(__m256 x) {
+    __m128 r = _mm256_extractf128_ps(x, 1);
+    r = _mm_add_ps(r, _mm256_castps256_ps128(x));
+    r = _mm_add_ps(r, _mm_movehl_ps(r, r));
+    r = _mm_add_ss(r, _mm_movehdup_ps(r));
+    return _mm_cvtss_f32(r);
+}
+
+inline float iq1s_row_dot(const uint8_t* row, int nb, const block_q8_K* y) {
+    // lane i of the 32 grid indices of a block takes its high bits from qh word i/4, shifted by 3 * (i % 4)
+    const __m512i rep = _mm512_set_epi16(7, 7, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1,
+                                         0, 0, 0, 0);
+    const __m512i sh = _mm512_set1_epi64(0x0009000600030000LL);
+    const __m512i c0 = _mm512_set_epi16(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    const __m512i ones = _mm512_set1_epi16(1);
+    __m256 accum = _mm256_setzero_ps();
+    float accum1 = 0;
+    const __m512i zero = _mm512_setzero_si512();
+    for (int i = 0; i < nb; ++i) {
+        const uint8_t* blk = row + (size_t) i * sizeof(block_iq1_s);
+        _mm_prefetch((const char*) blk + prefetch_ahead, _MM_HINT_T0);
+        const __m128i qh = _mm_loadu_si128((const __m128i*) (blk + 34));
+        const __m512i hv = _mm512_permutexvar_epi16(rep, _mm512_castsi128_si512(qh));
+        const __m512i hi = _mm512_slli_epi16(_mm512_and_si512(_mm512_srlv_epi16(hv, sh), _mm512_set1_epi16(7)), 8);
+        const __m512i idx16 = _mm512_or_si512(_mm512_cvtepu8_epi16(_mm256_loadu_si256((const __m256i*) (blk + 2))), hi);
+        // per group scale 2 * ((qh >> 12) & 7) + 1 (int16 lanes 0..7) and the sign of the delta term
+        const __m128i ls = _mm_add_epi16(_mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh, 12), _mm_set1_epi16(7)), 1), _mm_set1_epi16(1));
+        const __m128i sg = _mm_srai_epi16(qh, 15);
+        const __m128i lss = _mm_sub_epi16(_mm_xor_si128(ls, sg), sg);
+        const __m512i ls512 = _mm512_castsi128_si512(ls);
+        __m512i acc = zero;
+        alignas(64) uint16_t ix[32];
+        _mm512_store_si512((void*) ix, idx16);
+        for (int j = 0; j < 4; ++j) {
+            const uint16_t* q = ix + 8 * j;
+            const __m512i g = _mm512_set_epi64((long long) iq1s_grid[q[7]], (long long) iq1s_grid[q[6]], (long long) iq1s_grid[q[5]],
+                                               (long long) iq1s_grid[q[4]], (long long) iq1s_grid[q[3]], (long long) iq1s_grid[q[2]],
+                                               (long long) iq1s_grid[q[1]], (long long) iq1s_grid[q[0]]);
+            const __m512i yv = _mm512_loadu_si512((const void*) (y[i].qs + 64 * j));
+            const __m512i ys = _mm512_mask_sub_epi8(yv, _mm512_movepi8_mask(g), zero, yv);
+            const __m512i dot = _mm512_maddubs_epi16(_mm512_abs_epi8(g), ys);
+            const __m512i lsj = _mm512_permutexvar_epi16(_mm512_add_epi16(c0, _mm512_set1_epi16((short) (2 * j))), ls512);
+            // (the permute index: lanes 0-15 -> word 2j, lanes 16-31 -> word 2j + 1)
+            acc = _mm512_add_epi32(acc, _mm512_madd_epi16(dot, lsj));
+        }
+        const __m256i sumi = _mm256_add_epi32(_mm512_castsi512_si256(acc), _mm512_extracti64x4_epi64(acc, 1));
+        // the delta term: sum over the 8 groups of bsums pair * sign * scale (exact integers)
+        const __m256i pairs = _mm256_madd_epi16(_mm256_loadu_si256((const __m256i*) y[i].bsums), _mm512_castsi512_si256(ones));
+        __m256i t = _mm256_mullo_epi32(pairs, _mm256_cvtepi16_epi32(lss));
+        __m128i t4 = _mm_add_epi32(_mm256_castsi256_si128(t), _mm256_extracti128_si256(t, 1));
+        t4 = _mm_add_epi32(t4, _mm_unpackhi_epi64(t4, t4));
+        const int sumi1 = _mm_cvtsi128_si32(_mm_add_epi32(t4, _mm_shuffle_epi32(t4, 1)));
+        const float d = y[i].d * h2f(u16(blk));
+        accum = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), accum);
+        accum1 += d * sumi1;
+    }
+    return hsum8(accum) + IQ1S_DELTA * accum1;
+}
 
 template <int TY, int NT>
 inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
@@ -302,6 +366,37 @@ void iq512_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
         case 22: dot_rows_nt<22>(nt, w, row_bytes, n, act, out, r0, r1); break;
         default: break;
     }
+}
+
+bool iq1s_512_fits(int n) noexcept { return n > 0 && n % QK_K == 0; }
+
+void iq1s_512_gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg, float su, bool scaled,
+                      float limit, const void* const* act, int nt, float* const* ff, int r0, int r1) {
+    const int nb = n / QK_K;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* gr = blob + (size_t) r * gu_row;
+        const uint8_t* ur = blob + up_off + (size_t) r * gu_row;
+        for (int t = 0; t < nt; ++t) {
+            const block_q8_K* y = (const block_q8_K*) act[t];
+            float g = iq1s_row_dot(gr, nb, y), u = iq1s_row_dot(ur, nb, y);
+            if (scaled) {
+                g *= sg;
+                u *= su;
+            }
+            if (limit > 0.f) {
+                g = std::fmin(g, limit);
+                u = std::fmax(std::fmin(u, limit), -limit);
+            }
+            ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+        }
+    }
+}
+
+void iq1s_512_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
+                   int r0, int r1) {
+    const int nb = n / QK_K;
+    for (int r = r0; r < r1; ++r)
+        for (int t = 0; t < nt; ++t) out[t][r] = iq1s_row_dot(w + (size_t) r * row_bytes, nb, (const block_q8_K*) act[t]);
 }
 
 }  // namespace basalt::kernels::cpu
