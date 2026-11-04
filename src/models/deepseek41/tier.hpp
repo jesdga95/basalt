@@ -14,6 +14,7 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
@@ -100,6 +101,7 @@ private:
     bool load_ram(uint64_t bytes, std::string& err);
     int ranked(int layer, int r) const;
     void seed_vram();
+    void preread();
     bool pinned(int layer, int e) const { return ram_idx_[(size_t) layer * n_expert_ + e] >= 0; }
     const uint8_t* blob_of(int layer, int e) const;
     const uint8_t* slot_ptr(int32_t slot) const;
@@ -140,6 +142,8 @@ private:
     std::vector<std::pair<int, int>> want_; ///< file-backed experts that missed twice, in lookup order
     std::vector<Swap> flight_;              ///< swaps started at the previous begin_token
     std::thread worker_;
+    std::thread preread_;
+    std::atomic<bool> preread_quit_{false};
     std::mutex mu_;
     std::condition_variable cv_;
     std::vector<Swap> jobs_;
