@@ -280,7 +280,7 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     start; unknown keys are named and ignored."""
     out = {}
     for key, value in (cfg.get("sampling") or {}).items():
-        if value is None:
+        if value is None or (key == "top_k" and value == 0):   # 0: no top-k cut
             continue
         if key in SAMPLING_KEYS:
             convert, ok, expected = SAMPLING_KEYS[key]
