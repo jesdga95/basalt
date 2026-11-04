@@ -37,4 +37,6 @@ the pack and picks the chat format, tool-call syntax and thinking switch to matc
   so an expert gives the same bits on either card, while the CPU pool computes the misses; the rows come back through
   mapped host memory. Without it the first card runs alone and a warning names the other. One second card is used.
 - **Images:** `--vision dynamic` encodes inside the engine from the pack's `vision/mmproj` section, which exists when the
-  pack was built with `--mmproj` ([model file](model-file.md#deepseek-v41-pack)). The sidecar modes do not apply.
+  pack was built with `--mmproj` ([model file](model-file.md#deepseek-v41-pack)). The sidecar modes do not apply. It holds no
+  memory at rest: for the pictures of a request the encoder takes the memory of the extra copies, of all copies on one
+  card when that is short, and gives it back before the prompt reads.
