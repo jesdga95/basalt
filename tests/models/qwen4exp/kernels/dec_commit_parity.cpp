@@ -21,7 +21,7 @@
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/models/qwen4exp/kernels/rope_scaling.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/kernels/wait_abort.hpp"
 
 #include <cuda_runtime.h>

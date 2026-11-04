@@ -4,7 +4,7 @@
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/models/qwen4exp/decode/layout.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/models/qwen4exp/prefill/gemm.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/log.hpp"

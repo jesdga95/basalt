@@ -6,7 +6,7 @@
 #include "basalt/models/qwen4exp/decode/layout.hpp"     // ModelGeometry
 #include "basalt/models/qwen4exp/decode/session.hpp"    // SessionState
 #include "basalt/log.hpp"
-#include "basalt/program/options.hpp"
+#include "basalt/models/qwen4exp/options.hpp"
 
 #include <cmath>
 #include <cstdio>

@@ -4,7 +4,7 @@
 #include "basalt/models/qwen4exp/decode/layout.hpp"
 #include "basalt/models/qwen4exp/kernels/cvec.hpp"
 #include "basalt/log.hpp"
-#include "basalt/program/options.hpp"
+#include "basalt/models/qwen4exp/options.hpp"
 
 #include <algorithm>
 #include <cmath>

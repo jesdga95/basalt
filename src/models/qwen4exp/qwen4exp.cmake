@@ -2,6 +2,8 @@
 
 # The model's CUDA kernels: GDN, gated residual, QSA, heads, router, shared expert, verify, KV, control vectors.
 add_library(model_qwen4exp_kernels STATIC
+  src/models/qwen4exp/kernels/ngram.cpp
+  src/models/qwen4exp/kernels/dec_gdn_rec.cu
   src/models/qwen4exp/kernels/dec_moe.cu
   src/models/qwen4exp/kernels/s2_gemv.cu
   src/models/qwen4exp/kernels/s_gemv.cu
@@ -52,6 +54,7 @@ target_link_libraries(model_qwen4exp_kernels PUBLIC kernels)
 add_library(model_qwen4exp_engine STATIC src/models/qwen4exp/decode/layer.cpp src/models/qwen4exp/decode/expert_dispatch.cpp
   src/models/qwen4exp/decode/session.cpp
   src/models/qwen4exp/decode/kv_arena.cpp
+  src/models/qwen4exp/decode/layout.cpp
   src/models/qwen4exp/decode/native_head.cpp
   src/models/qwen4exp/decode/native_dense.cpp
   src/models/qwen4exp/decode/verify/batch_capture.cpp

@@ -8,7 +8,7 @@
 #include "basalt/platform/compiler.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/pdl.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/core/progress.hpp"

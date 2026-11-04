@@ -7,7 +7,7 @@
 #include "basalt/models/qwen4exp/kernels/native_gr_postops.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/qwen4exp/kernels/native_ple_postops.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/models/qwen4exp/kernels/ple.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"

@@ -9,7 +9,6 @@
 #include "basalt/model/adapter.hpp"
 #include "basalt/platform/process.hpp"
 #include "basalt/program/options.hpp"
-#include "../../models/qwen4exp/cli/options.hpp"
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstdio>
@@ -32,6 +31,18 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 namespace cli = basalt::program::cli;
+
+// The name of the engine's expert profile for a model (data/profiles/<key>.prof).
+std::string profile_key(const basalt::core::Json& meta) {
+    using T = basalt::core::Json::Type;
+    const basalt::core::Json* kv = meta.get("gguf_kv");
+    const basalt::core::Json* arch = kv ? kv->get("general.architecture") : nullptr;
+    if (arch == nullptr || !arch->is_string() || arch->s.empty()) return {};
+    const basalt::core::Json* nl = kv->get(arch->s + ".block_count");
+    const basalt::core::Json* ne = kv->get(arch->s + ".expert_count");
+    if (nl == nullptr || ne == nullptr || nl->type != T::Int || ne->type != T::Int || nl->neg || ne->neg) return {};
+    return arch->s + "-" + std::to_string(nl->u64()) + "x" + std::to_string(ne->u64());
+}
 
 int fatal_start_error(const std::string& text) {
     basalt::log::error("basalt", "%s", text.c_str());
@@ -160,7 +171,7 @@ bool adapter_prompt(basalt::model::ModelSession& sess, const std::vector<int32_t
 
 }  // namespace
 
-// DeepSeek (adapter session) CLI path: greedy decode of a pre-tokenized prompt, one `T <id>` line per token.
+// The CLI path of a session model: greedy decode of a pre-tokenized prompt, one `T <id>` line per token.
 // Each --image's embedding block goes before the prompt token at its --image-at index.
 int adapter_generate(basalt::model::LoadedModel& loaded, const std::vector<int64_t>& prompt, int64_t max_new,
                             const std::vector<int64_t>& stop_ids, const std::vector<std::string>& images,
@@ -262,7 +273,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.sessions = std::max(o.batch, 1);
         lreq.expert_profile = o.expert_profile;
         if (lreq.expert_profile.empty()) {   // the engine's own for this model, when it ships one
-            const std::string key = cli::profile_key(model_file.meta());
+            const std::string key = profile_key(model_file.meta());
             const std::string prof = std::string(BASALT_SOURCE_DIR) + "/data/profiles/" + key + ".prof";
             uint64_t bytes = 0;
             if (!key.empty() && basalt::platform::file_size(prof, bytes) && bytes > 0) lreq.expert_profile = prof;

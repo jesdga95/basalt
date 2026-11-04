@@ -63,7 +63,7 @@ void act_quant_any(const float* x, int n, ActQ& a);
 const ExpertLayout& expert_layout();
 /// Loads the layout from its text (the model's `experts.layout` section: "# experts vN: ..." then one line per layer,
 /// `layer gu_type d_type offset blob_bytes`; further columns are ignored).  A newer version is refused.
-/// `n_embd` / `n_ff` / `swiglu_limit`: the model's expert geometry (Flash-Next's by default).
+/// `n_embd` / `n_ff` / `swiglu_limit`: the model's expert geometry.
 bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err,
                              int64_t n_embd = H, int64_t n_ff = FF, float swiglu_limit = 0.f);
 /// The newest layout version this engine reads.

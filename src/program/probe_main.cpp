@@ -65,6 +65,8 @@ void usage() {
         BASALT_BENCH_FIXTURES, kTokens);
 }
 
+constexpr int kDefaultSwaps = 96;   // the engine's --adapt-swaps default
+
 struct ProbeOptions {
     std::string model, engine, fixtures = BASALT_BENCH_FIXTURES, logs;
     std::vector<std::string> passthrough;
@@ -234,7 +236,7 @@ int main(int argc, char** argv) {
         if (!saved_profile.empty() && !(basalt::platform::file_size(saved_profile, bytes) && bytes > 0)) saved_profile.clear();
     }
     const std::string swaps_given = arg_value(args, "--adapt-swaps"), every_given = arg_value(args, "--adapt-every");
-    const int base_swaps = swaps_given.empty() ? basalt::program::Options().adapt_swaps : std::atoi(swaps_given.c_str());
+    const int base_swaps = swaps_given.empty() ? kDefaultSwaps : std::atoi(swaps_given.c_str());
     bool adapt_on = base_swaps > 0 && (every_given.empty() || std::atoi(every_given.c_str()) > 0);
     const AdaptTrial kAdaptTried[] = {{64, 256, 0.70, false, 0}, {1, 160, 0, false, 0}};
     if (adapt_on) {

@@ -1,7 +1,7 @@
-// src/kernels/ngram.cpp - the PLE n-gram hash and the IQ4_NL table read.
+// src/models/qwen4exp/kernels/ngram.cpp - the PLE n-gram hash and the IQ4_NL table read.
 //
-// See include/basalt/kernels/ngram.hpp for the semantics, the rival readings, and the note on MADV_RANDOM.
-#include "basalt/kernels/ngram.hpp"
+// See include/basalt/models/qwen4exp/kernels/ngram.hpp for the semantics, the rival readings, and the note on MADV_RANDOM.
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/artifact/dequant.hpp"

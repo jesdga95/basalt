@@ -14,7 +14,7 @@
 #include "basalt/models/qwen4exp/kernels/ple.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/f16_bits.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/kernels/quantize_act.hpp"
 #include "basalt/models/qwen4exp/kernels/s2_gemv_q8.hpp"
 #include "basalt/kernels/native_mmvq.hpp"

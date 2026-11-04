@@ -49,7 +49,7 @@ struct NativeExpertLayout {
     size_t bytes = 0;                   // the whole blob (NVFP4: with its 16-byte FP32 scale tail)
     float swiglu_limit = 0.0f;          // > 0: native_expert_grouped limits the SwiGLU (gate capped, up clamped to +-limit)
 };
-/// `swiglu_limit` (DeepSeek's experts) rides in the layout, so every caller of `native_expert_grouped` (the VRAM cache,
+/// `swiglu_limit` rides in the layout, so every caller of `native_expert_grouped` (the VRAM cache,
 /// the peer card, the remote tier) applies it without a signature change.
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, float swiglu_limit = 0.0f);
 /// Whether `native_expert_grouped` has kernels for this gate/up and down type pair at these dimensions, and the
@@ -70,7 +70,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups = 0);
 /// native_expert_grouped with the SwiGLU limited: gate capped above at `swiglu_limit`, up clamped to
-/// [-swiglu_limit, swiglu_limit] before the product (DeepSeek's experts).  Everything else is the same launches.
+/// [-swiglu_limit, swiglu_limit] before the product.  Everything else is the same launches.
 void native_expert_grouped_clamped(const NativeExpertLayout& L, float swiglu_limit, const unsigned long long* grp_ptr,
                                    const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
                                    const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,

@@ -6,7 +6,7 @@
 #include "basalt/models/qwen4exp/decode/layout.hpp"
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "unicode_flags.hpp"
-#include "basalt/program/options.hpp"
+#include "basalt/models/qwen4exp/options.hpp"
 
 namespace basalt::models::qwen4exp {
 namespace {

@@ -7,7 +7,7 @@
 #include "basalt/models/qwen4exp/decode/layer.hpp"      // Doorbell, stage_timing_*, is_qsa_layer
 #include "basalt/models/qwen4exp/decode/session.hpp"    // session_replay*, session_graphs_free
 #include "basalt/log.hpp"
-#include "basalt/program/options.hpp"
+#include "basalt/models/qwen4exp/options.hpp"
 
 #include <chrono>
 #include <cstdio>

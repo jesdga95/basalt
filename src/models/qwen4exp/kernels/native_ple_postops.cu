@@ -21,7 +21,7 @@
 #include "basalt/models/qwen4exp/kernels/native_ple_postops.hpp"
 #include "basalt/models/qwen4exp/kernels/native_gr_norm.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cmath>

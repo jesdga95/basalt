@@ -3,7 +3,7 @@
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/core/on_device.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/models/qwen4exp/prefill/moe_fp4.hpp"

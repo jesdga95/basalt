@@ -4,7 +4,7 @@
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/models/qwen4exp/decode/layout.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"

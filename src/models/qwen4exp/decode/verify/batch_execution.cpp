@@ -9,7 +9,7 @@
 #include "basalt/models/qwen4exp/kernels/dec_gdn.hpp"
 #include "basalt/models/qwen4exp/kernels/native_ple_postops.hpp"
 #include "basalt/kernels/pdl.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/core/progress.hpp"

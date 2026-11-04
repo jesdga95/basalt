@@ -4,7 +4,7 @@
 //   ple_win_parity [iters]
 #include "basalt/models/qwen4exp/kernels/native_gr_postops.hpp"
 #include "basalt/models/qwen4exp/kernels/native_ple_postops.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/models/qwen4exp/kernels/ple.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 

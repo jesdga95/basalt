@@ -6,7 +6,7 @@
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/models/qwen4exp/kernels/dec_gdn.hpp"
 #include "basalt/models/qwen4exp/kernels/native_ple_postops.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_dec_fused.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
