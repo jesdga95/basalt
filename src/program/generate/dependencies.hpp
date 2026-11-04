@@ -1,5 +1,6 @@
 #pragma once
 
+#include "basalt/models/builtin.hpp"
 #include "../engine_local.hpp"
 #include "../serve/runtime.hpp"
 #include "../cli/startup.hpp"
