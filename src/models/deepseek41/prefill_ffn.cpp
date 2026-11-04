@@ -14,7 +14,6 @@
 #include "models/deepseek41/model.hpp"
 #include "models/deepseek41/layer_ops.hpp"
 #include "models/deepseek41/ops.hpp"
-#include "models/deepseek41/peer_tier.hpp"
 #include "models/deepseek41/prefill_plan.hpp"
 #include "models/deepseek41/tier.hpp"
 
@@ -163,7 +162,7 @@ public:
                 } else if (src.pinned) {
                     cudaMemcpyAsync(dst, src.pinned, L.bytes, cudaMemcpyHostToDevice, copy_);
                 } else if (src.peer) {
-                    tier_->peer()->read(src.peer, B.host + slot_ * (size_t) q, L.bytes);
+                    tier_->peer()->read_slot(src.peer, B.host + slot_ * (size_t) q, L.bytes);
                     from_peer = true;
                 } else {
                     from_file.push_back(q);
@@ -517,7 +516,7 @@ private:
             for (size_t i = 0; i < list.size(); ++i) {
                 const ExpertTier::Source src = tier_->locate(l, list[i]);
                 if (src.peer) {
-                    tier_->peer()->read(src.peer, base + i * slot_, el.blob_bytes);
+                    tier_->peer()->read_slot(src.peer, base + i * slot_, el.blob_bytes);
                     any_peer = true;
                 } else {
                     files.push_back(i);

@@ -6,7 +6,7 @@
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
-#include "models/deepseek41/peer_tier.hpp"
+#include "basalt/core/peer_experts.hpp"
 
 #include <cuda_runtime.h>
 
@@ -20,7 +20,6 @@
 #include <string>
 #include <vector>
 
-namespace ds = basalt::models::deepseek41;
 namespace kg = basalt::kernels;
 
 namespace {
@@ -127,14 +126,14 @@ void one_pair(int gu, int d, bool bench, const float* h_x, float* h_rows, cudaSt
     ck(cudaMemcpy(main_rows.data(), dout, main_rows.size() * sizeof(float), cudaMemcpyDeviceToHost), "rows");
 
     // the second card: shares of every size, landing in rows other than their order
-    ds::PeerTier peer;
+    basalt::core::PeerExperts peer;
     std::string err;
-    if (!peer.open(1, 1, NB, H, FF, h_x, h_rows, err)) {
+    if (!peer.open_plain(1, 1, NB, H, FF, h_rows, err)) {
         std::printf("FAIL: open: %s\n", err.c_str());
         ++g_fail;
         return;
     }
-    if (!peer.slots(std::vector<int64_t>(NB, (int64_t) L.bytes), err)) {
+    if (!peer.open_slots(std::vector<int64_t>(NB, (int64_t) L.bytes), err)) {
         std::printf("FAIL: slots: %s\n", err.c_str());
         ++g_fail;
         return;
@@ -144,41 +143,38 @@ void one_pair(int gu, int d, bool bench, const float* h_x, float* h_rows, cudaSt
     for (int b = 0; b < NB; ++b) {
         peer.admit(0, b, b);
         std::memcpy(stage, blob[(size_t) b].data(), L.bytes);
-        check(peer.fill(b, stage, L.bytes), "fill");
+        check(peer.fill_slot(b, stage, L.bytes), "fill");
     }
+    kg::NativeExpertLayout Lp = L;
+    Lp.swiglu_limit = kLimit;
     bool same = true;
     for (int n = 1; n <= 6; ++n) {
-        ds::PeerTier::Share sh;
+        int32_t ids[8] = {}, kind[8] = {};
         for (int i = 0; i < n; ++i) {
-            sh.blob[i] = peer.blob(0, (i * 3) % NB);
-            sh.row[i] = n - 1 - i;
-            ++sh.n;
+            ids[n - 1 - i] = (i * 3) % NB;   // landing in rows other than their order
+            kind[n - 1 - i] = 2;
         }
         std::memset(h_rows, 0, (size_t) n * H * sizeof(float));
-        if (!peer.launch(L, kLimit, sh, err) || !peer.finish(err)) {
+        if (!peer.launch_plain(0, Lp, h_x, ids, n, kind, err) || !peer.finish(nullptr, err)) {
             std::printf("FAIL: share: %s\n", err.c_str());
             ++g_fail;
             return;
         }
         for (int i = 0; i < n; ++i)
-            same = same && !std::memcmp(h_rows + (size_t) sh.row[i] * H, main_rows.data() + (size_t) ((i * 3) % NB) * H, H * sizeof(float));
+            same = same && !std::memcmp(h_rows + (size_t) (n - 1 - i) * H, main_rows.data() + (size_t) ((i * 3) % NB) * H, (size_t) H * sizeof(float));
     }
     check(same, "the second card's rows differ from the main card's");
     std::printf("%-7s/%-7s second card vs main card, shares of 1..6: %s\n", nm(gu), nm(d), same ? "bitwise same" : "DIFFER");
 
     if (bench) {
         for (int n : {1, 2, 3, 4, 6}) {
-            ds::PeerTier::Share sh;
-            for (int i = 0; i < n; ++i) {
-                sh.blob[i] = peer.blob(0, i);
-                sh.row[i] = i;
-                ++sh.n;
-            }
+            int32_t ids[8] = {}, kind[8] = {};
+            for (int i = 0; i < n; ++i) { ids[i] = i; kind[i] = 2; }
             std::vector<double> us;
             for (int it = 0; it < 201; ++it) {
                 const auto t0 = std::chrono::steady_clock::now();
-                peer.launch(L, kLimit, sh, err);
-                peer.finish(err);
+                peer.launch_plain(0, Lp, h_x, ids, n, kind, err);
+                peer.finish(nullptr, err);
                 if (it > 0) us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
             }
             std::sort(us.begin(), us.end());

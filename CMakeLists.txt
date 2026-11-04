@@ -137,7 +137,7 @@ target_link_libraries(model_qwen4exp PUBLIC model tokenizer)
 
 add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models/deepseek41/tokenizer/pretok_joyai.cpp src/models/deepseek41/pack.cpp
   src/models/deepseek41/model.cpp src/models/deepseek41/session.cpp src/models/deepseek41/layer_ops.cpp
-  src/models/deepseek41/elastic.cpp src/models/deepseek41/ops_kernels.cpp src/models/deepseek41/tier.cpp src/models/deepseek41/peer_tier.cpp src/models/deepseek41/ops.cu
+  src/models/deepseek41/elastic.cpp src/models/deepseek41/ops_kernels.cpp src/models/deepseek41/tier.cpp src/models/deepseek41/ops.cu
   src/models/deepseek41/prefill.cpp src/models/deepseek41/prefill_ffn.cpp src/models/deepseek41/prefill_ffn.cu src/models/deepseek41/attn_batch.cpp src/models/deepseek41/attn_dense.cu)
 target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
 target_link_libraries(model_deepseek41 PUBLIC model tokenizer deepseek41_kernels deepseek41_attn deepseek41_vision model_qwen4exp_engine mmq kernels core ${_gpu_runtime_target})
@@ -1342,7 +1342,7 @@ add_executable(iq1s_parity tests/kernels/iq1s_parity.cpp)
 target_include_directories(iq1s_parity PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(iq1s_parity PRIVATE BASALT_IQ1S_GPU)
 target_link_libraries(iq1s_parity PRIVATE kernels kernels_cpu ${_gpu_runtime_target})
-add_executable(ds41_peer_parity tests/kernels/ds41_peer_parity.cpp src/models/deepseek41/peer_tier.cpp)
+add_executable(ds41_peer_parity tests/kernels/ds41_peer_parity.cpp)
 target_include_directories(ds41_peer_parity PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ds41_peer_parity PRIVATE model_qwen4exp_engine kernels kernels_cpu core ${_gpu_runtime_target})
 basalt_gpu_test(NAME ds41_peer_parity COMMAND ds41_peer_parity)

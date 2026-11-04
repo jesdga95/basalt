@@ -17,6 +17,7 @@
 
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/expert_source.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -51,6 +52,21 @@ public:
     /// `fill` sizes the slots for exactly `pick` and copies those experts in.
     bool prepare(int device, ExpertSource& src, int64_t n_layers, int64_t n_expert, std::string& err);
     bool fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std::string& err, bool exclusive = false);
+    /// A tier whose owner keeps the experts' places and fills the slots itself: no expert source, no adaptation.
+    /// `rows`: the pinned, portable, mapped host rows a share lands in.
+    bool open_plain(int device, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, float* rows, std::string& err);
+    /// The device bytes free for expert slots.
+    uint64_t room() const;
+    /// Slots of the given sizes; `admit` says which expert each holds and `fill_slot` copies it in (any thread).
+    bool open_slots(const std::vector<int64_t>& slot_bytes, std::string& err);
+    void admit(int64_t layer, int64_t expert, int32_t slot) { res_[(size_t) (layer * n_expert_ + expert)] = slot; }
+    bool fill_slot(int32_t slot, const uint8_t* src, uint64_t bytes);
+    /// Queues a copy of a blob of this card into pinned, portable host memory; `read_wait` waits for those queued.
+    void read_slot(const uint8_t* blob, uint8_t* dst, uint64_t bytes);
+    bool read_wait(std::string& err);
+    /// One token's share over the pinned activation `x`, in the layout given; the rows land in open_plain's rows.
+    bool launch_plain(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t k,
+                      const int32_t* kind, std::string& err);
     /// A slot's bytes for an expert of `layer`.
     static uint64_t slot_bytes(int64_t layer);
     void close();
@@ -168,6 +184,10 @@ private:
     std::vector<int32_t> row_of_;                     ///< compact row -> original entry
     int64_t launched_rows_ = 0;
     bool launched_direct_ = false;
+    int64_t n_embd_ = 0;                              ///< activation width of the launched shares
+    float* rows_map_ = nullptr;                       ///< open_plain's rows as this card addresses them
+    bool launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
+                       int64_t k, const int32_t* kind, std::string& err, float* out);
 };
 
 }  // namespace basalt::core

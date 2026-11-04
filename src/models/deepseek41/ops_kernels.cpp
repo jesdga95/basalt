@@ -11,7 +11,6 @@
 #include "models/deepseek41/model.hpp"
 #include "models/deepseek41/prefill_plan.hpp"
 #include "models/deepseek41/ops.hpp"
-#include "models/deepseek41/peer_tier.hpp"
 #include "models/deepseek41/tier.hpp"
 
 #include <cuda_runtime.h>
@@ -498,16 +497,13 @@ public:
         tier_->fetch(il, lk, st);
 
         // the second card's share first: its rows are the last of the two cards' to land
-        PeerTier* peer = tier_->peer();
+        core::PeerExperts* peer = tier_->peer();
         if (peer) {
-            PeerTier::Share sh;
-            for (int k = 0; k < K; ++k) {
-                if (!lk.peer[k]) continue;
-                sh.blob[sh.n] = lk.peer[k];
-                sh.row[sh.n] = k;
-                ++sh.n;
-            }
-            if (!peer->launch(L, g_.clamp_exp[(size_t) il], sh, err)) return false;
+            int32_t kind[ExpertTier::kMaxK] = {};
+            for (int k = 0; k < K; ++k) kind[k] = lk.peer[k] ? 2 : 0;
+            kernels::NativeExpertLayout limited = L;
+            limited.swiglu_limit = g_.clamp_exp[(size_t) il];
+            if (!peer->launch_plain(il, limited, h_x_, lk.experts, K, kind, err)) return false;
         }
 
         // the GPU's share: the experts the VRAM tier holds, one group each, writing the row of their router index
@@ -535,7 +531,7 @@ public:
             if (!tier_->run_cpu(il, h_x_, lk, h_rows_, err)) return false;
             tier_->promote(il, lk);
         }
-        if (peer && !peer->finish(err)) return false;
+        if (peer && !peer->finish(nullptr, err)) return false;
         RowPtrs rp{};
         for (int k = 0; k < K; ++k)
             rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * g_.n_embd : d_rows_ + (size_t) k * g_.n_embd;

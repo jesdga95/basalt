@@ -8,6 +8,7 @@
 #pragma once
 
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/platform/mapped_file.hpp"
@@ -27,7 +28,6 @@
 namespace basalt::models::deepseek41 {
 
 class DsModel;
-class PeerTier;
 
 class ExpertTier {
 public:
@@ -98,7 +98,7 @@ public:
         const uint8_t* pinned = nullptr;
     };
     Source locate(int layer, int e) const;
-    PeerTier* peer() const { return peer_.get(); }
+    core::PeerExperts* peer() const { return peer_.get(); }
     /// The main card holds homes: they stay through a prompt, and a short prompt keeps the copies beside them.
     bool has_homes() const { return homes_.main > 0; }
 
@@ -173,7 +173,7 @@ private:
     uint64_t token_ = 0;
     int64_t swapped_ = 0;
     platform::MappedFile file_;             ///< the experts section
-    std::unique_ptr<PeerTier> peer_;
+    std::unique_ptr<core::PeerExperts> peer_;
     std::vector<kernels::cpu::NativeFmt> fmt_;   ///< [layer]
     std::unique_ptr<kernels::cpu::ExpertPool> pool_;
     uint8_t* act_ = nullptr;                ///< the quantized activation the CPU jobs share

@@ -9,7 +9,6 @@
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "models/deepseek41/model.hpp"
-#include "models/deepseek41/peer_tier.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -92,9 +91,9 @@ bool ExpertTier::open(const Reserve& reserve, const float* h_x, float* h_rows, s
 
     int peer_slots = 0;
     if (m_.peer_device() >= 0) {
-        peer_ = std::make_unique<PeerTier>();
+        peer_ = std::make_unique<core::PeerExperts>();
         std::string pe;
-        if (peer_->open(m_.peer_device(), n_layers_, n_expert_, g.n_embd, g.n_ff_exp, h_x, h_rows, pe)) {
+        if (peer_->open_plain(m_.peer_device(), n_layers_, n_expert_, g.n_embd, g.n_ff_exp, h_rows, pe)) {
             peer_slots = slots_in(peer_->room(), (uint64_t) m_.tiers().peer_reserve_mib << 20);
         } else {
             basalt::log::warn("basalt deepseek41", "second card not used: %s", pe.c_str());
@@ -205,7 +204,7 @@ bool ExpertTier::load_ram(std::string& err) {
         std::vector<int64_t> sizes;
         for (int l = 0; l < n_layers_; ++l)
             for (int s = 0; s < homes_.peer; ++s) sizes.push_back((int64_t) m_.pack().experts[(size_t) l].blob_bytes);
-        if (!peer_->slots(sizes, err)) return false;
+        if (!peer_->open_slots(sizes, err)) return false;
     }
     for (int l = 0; l < n_layers_; ++l) {
         std::vector<int> held;
@@ -299,7 +298,7 @@ bool ExpertTier::load_ram(std::string& err) {
                 }
                 if (ok && home >= 0)
                     ok = res_[idx] >= 0 ? cudaMemcpy(cache_.device_slot(home), got, el.blob_bytes, cudaMemcpyHostToDevice) == cudaSuccess
-                                        : peer_->fill(home, got, el.blob_bytes);
+                                        : peer_->fill_slot(home, got, el.blob_bytes);
                 if (ok && home >= 0) (res_[idx] >= 0 ? main_load : peer_load)->add(el.blob_bytes);
                 if (!ok) {
                     std::lock_guard<std::mutex> g(mu);
@@ -505,7 +504,7 @@ bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::s
             lk.dev[i] = slot_ptr(s);
             lk.host[i] = nullptr;
             ++hits_;
-        } else if (peer_ && (lk.peer[i] = peer_->blob(layer, e))) {
+        } else if (peer_ && (lk.peer[i] = peer_->slot_ptr(layer, e))) {
             lk.dev[i] = nullptr;
             lk.host[i] = nullptr;
             ++peer_hits_;
@@ -533,7 +532,7 @@ ExpertTier::Source ExpertTier::locate(int layer, int e) const {
         r.dev = slot_ptr(s);
         return r;
     }
-    if (peer_) r.peer = peer_->blob(layer, e);
+    if (peer_) r.peer = peer_->slot_ptr(layer, e);
     if (!r.peer && pinned(layer, e)) r.pinned = blob_of(layer, e);
     return r;
 }
