@@ -5,6 +5,7 @@
 // minimum plus VirtualLock on Windows.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -39,6 +40,18 @@ void free_aligned(void* p);
 /// view. False when the OS refused or the range leaves the view. Windows takes the pages out of the process's working
 /// set (they then wait on the standby list as available memory) and does not report a refusal: it is a hint there.
 bool drop_mapped_view(const void* base, uint64_t view_bytes, uint64_t off, uint64_t bytes);
+
+/// The page alignment required by the virtual-memory range operations below.
+uint64_t vm_page_size();
+/// Reserves `bytes` of inaccessible address space without taking physical RAM. Page multiples only; null on refusal.
+void* vm_reserve(uint64_t bytes);
+/// Makes a page-aligned subrange readable and writable, asking for transparent huge pages where available.
+bool vm_commit(void* p, uint64_t bytes);
+/// Discards a committed subrange's contents and makes it inaccessible, keeping its address space reserved.
+/// The caller must unregister any device mapping first.
+bool vm_decommit(void* p, uint64_t bytes);
+/// Releases an entire reservation from vm_reserve. A null is fine.
+void vm_release(void* p, uint64_t bytes);
 
 /// What backs a host region from `alloc_region`.
 enum class RegionBacking { LargePages, NormalPages };

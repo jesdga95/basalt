@@ -127,6 +127,9 @@ int session_kv_mode(const SessionState& s);
 void session_kv_cap(SessionState& s, bool capped);
 bool session_kv_set_mode(SessionState& s, const ModelGeometry& g, int mode, const KvHostPool* pool,
                          int64_t live_cells, void* stream, std::string& err);
+/// Publishes an in-place host pool's committed extent without changing its pointers, residency map or mode.
+/// The device is drained and every streamed layer already points into that pool.
+void session_kv_host_cells(SessionState& s, int64_t cells);
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
 /// from the reference's own `zeros()`.
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream);

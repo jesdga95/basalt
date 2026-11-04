@@ -297,6 +297,38 @@ int main() {
         in.fresh_cells = 0;                         // no limit
         CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
     }
+    {   // registered growth fits at the delta boundary; replacement still needs the whole pin
+        KvHostInputs in;
+        in.cells = 163840;
+        in.crossover_cells = 99328;
+        in.bytes_per_cell = 12672;
+        in.ram_kept = 4 * G;
+        in.growth_bytes = 16384ull * 12672;
+        in.ram_available = in.ram_kept + in.growth_bytes;
+        CHECK(plan_kv_host(in, 147456).act == KvHostAct::drop);
+        in.grow_in_place = true;
+        auto p = plan_kv_host(in, 147456);
+        CHECK(p.host && p.act == KvHostAct::grow && p.pin_bytes == in.growth_bytes);
+        CHECK(choose_kv_host(in).pin_bytes == in.growth_bytes);
+        --in.ram_available;
+        CHECK(plan_kv_host(in, 147456).act == KvHostAct::drop);
+        in.ram_available = in.ram_kept - 1;
+        CHECK(!choose_kv_host(in).host);
+        in.growth_bytes = 0;                       // the next cells already fit the pinned host page
+        in.ram_available = in.ram_kept + 1;
+        CHECK(plan_kv_host(in, 147456).pin_bytes == 0);
+        CHECK(plan_kv_host(in, 147456).act == KvHostAct::grow);
+        in.ram_available = in.ram_kept;
+        CHECK(!choose_kv_host(in).host);
+        in.ram_low = true;
+        CHECK(plan_kv_host(in, 180224).act == KvHostAct::drop);
+        in.ram_low = false;
+        CHECK(plan_kv_host(in, 180224).act == KvHostAct::keep);
+        in.grow_in_place = false;                  // a first take always charges the whole pool
+        in.ram_available = in.ram_kept + (uint64_t) in.cells * in.bytes_per_cell;
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
+        CHECK(plan_kv_host(in, 147456).pin_bytes == (uint64_t) in.cells * in.bytes_per_cell);
+    }
     {   // a pool that cannot grow still serves a request when it holds the prompt and the next decode window
         CHECK(kv_host_pool_serves(131072, 120000, 2112));
         CHECK(kv_host_pool_serves(131072, 128960, 2112));

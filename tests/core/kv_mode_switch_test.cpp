@@ -31,6 +31,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace k = basalt::kernels;
@@ -112,6 +113,7 @@ int run(int fmt, int64_t floor) {
     }
     c::SessionState ss;   // a one-layer session over the state, for the host pool
     ss.qsa_states = &st;
+    ss.max_cells = max_cells;
     ss.qsa_ord0 = 0;
     ss.qsa_alloc = 1;
     c::qsa_state_zero(ref, g, nullptr);
@@ -170,13 +172,28 @@ int run(int fmt, int64_t floor) {
                         deep_early ? "ran (wrong)" : rerr.c_str());
             if (!valid || deep_early || rerr.find("host pool") == std::string::npos) ++bad;
         }
-        if (pos == grow_at) {   // 1 -> 1: a larger pool, the cells moved over in host memory
-            if (!pool2.reserve(ss, g, N + 64, err) || !pool2.copy_from(pool, pos, err) ||
-                !c::session_kv_set_mode(ss, g, 1, &pool2, pos, nullptr, err)) {
-                std::fprintf(stderr, "%s: pool move at %lld: %s\n", name, (long long) pos, err.c_str());
-                return 1;
+        if (pos == grow_at) {
+            ck(cudaDeviceSynchronize(), "drain before growth");
+            if (pool.grows_in_place()) {
+                const auto* const map = st.host_map;
+                const auto before = k::kv_stream_counters(st.map);
+                if (!pool.grow(N + 64, err)) {
+                    std::fprintf(stderr, "%s: registered growth: %s\n", name, err.c_str());
+                    return 1;
+                }
+                c::session_kv_host_cells(ss, pool.cells());
+                const auto after = k::kv_stream_counters(st.map);
+                if (st.host_map != map || before.calls != after.calls || before.misses != after.misses ||
+                    before.lookups != after.lookups || before.overflow != after.overflow || st.host_cells != pool.cells()) ++bad;
+                pool2 = std::move(pool);
+            } else {
+                if (!pool2.reserve(ss, g, N + 64, err) || !pool2.copy_from(pool, pos, err) ||
+                    !c::session_kv_set_mode(ss, g, 1, &pool2, pos, nullptr, err)) {
+                    std::fprintf(stderr, "%s: pool move at %lld: %s\n", name, (long long) pos, err.c_str());
+                    return 1;
+                }
+                pool.release();
             }
-            pool.release();
             // the pool now holds the deep snapshot (its cells past `pos` are rewritten as the run goes on)
             if (!c::conversation_kv_restore(deep, st, g, deep_upto, true, err)) {
                 std::fprintf(stderr, "  %s: deep snapshot restore after the pool grew: %s\n", name, err.c_str());

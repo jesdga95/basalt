@@ -76,6 +76,8 @@ struct KvHostInputs {
     int64_t cells = 0;                    ///< the cells the request can hold: prompt + new tokens + slack
     int64_t crossover_cells = 0;          ///< below this many cells the VRAM tail is the faster place
     uint64_t bytes_per_cell = 0;          ///< host K/V bytes per cell over every QSA layer
+    bool grow_in_place = false;           ///< an existing pool can extend without a replacement
+    uint64_t growth_bytes = 0;            ///< additional page-rounded pin bytes when grow_in_place
     uint64_t ram_available = 0;           ///< bytes free now
     uint64_t ram_kept = 0;                ///< bytes that stay free beside the pin (kv_host_keep)
     bool ram_low = false;                 ///< the RAM guard is below its floor: a pool held is given back, not kept
@@ -106,7 +108,7 @@ enum class KvHostAct {
     none,   ///< stays in the VRAM tail, no host K/V held
     take,   ///< pins a pool and moves the session's cells into it
     keep,   ///< the pool held covers the request: streamed as it is
-    grow,   ///< a larger pool; the cells move over, the old one is freed
+    grow,   ///< a larger extent, registered in place or copied into a replacement
     drop,   ///< back to the VRAM tail; the cells move back, the pool is freed
 };
 
@@ -119,7 +121,8 @@ struct KvHostPlan {
 };
 
 /// `pool_cells`: the cells of the pool the session holds now (0: none, the session is in the VRAM tail).  A pool that
-/// covers a deep request is kept (it is pinned already) unless `ram_low`; a larger one must fit beside it.
+/// covers a deep request is kept (it is pinned already) unless `ram_low`; growth charges `growth_bytes` in place,
+/// otherwise the whole replacement must fit beside the old pool.
 KvHostPlan plan_kv_host(const KvHostInputs& in, int64_t pool_cells);
 /// Whether a pool of `pool_cells` can still serve a request that starts decoding at `at` cells: its prompt and the
 /// next decode window (`window` cells); the output past it grows the pool between windows or stops the request.

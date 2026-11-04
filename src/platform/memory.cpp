@@ -548,6 +548,65 @@ void free_aligned(void* p) {
 #endif
 }
 
+uint64_t vm_page_size() {
+#if defined(_WIN32)
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    return si.dwPageSize;
+#else
+    const long page = sysconf(_SC_PAGESIZE);
+    return page > 0 ? (uint64_t) page : 0;
+#endif
+}
+
+namespace {
+bool vm_aligned(const void* p, uint64_t bytes) {
+    const uint64_t page = vm_page_size();
+    return page > 0 && bytes > 0 && bytes % page == 0 && (uintptr_t) p % page == 0 && bytes <= SIZE_MAX;
+}
+}  // namespace
+
+void* vm_reserve(uint64_t bytes) {
+    if (!vm_aligned(nullptr, bytes)) return nullptr;
+#if defined(_WIN32)
+    return VirtualAlloc(nullptr, (SIZE_T) bytes, MEM_RESERVE, PAGE_NOACCESS);
+#else
+    void* p = mmap(nullptr, (size_t) bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    return p == MAP_FAILED ? nullptr : p;
+#endif
+}
+
+bool vm_commit(void* p, uint64_t bytes) {
+    if (p == nullptr || !vm_aligned(p, bytes)) return false;
+#if defined(_WIN32)
+    return VirtualAlloc(p, (SIZE_T) bytes, MEM_COMMIT, PAGE_READWRITE) == p;
+#else
+    if (mprotect(p, (size_t) bytes, PROT_READ | PROT_WRITE) != 0) return false;
+    (void) madvise(p, (size_t) bytes, MADV_HUGEPAGE);
+    return true;
+#endif
+}
+
+bool vm_decommit(void* p, uint64_t bytes) {
+    if (p == nullptr || !vm_aligned(p, bytes)) return false;
+#if defined(_WIN32)
+    return VirtualFree(p, (SIZE_T) bytes, MEM_DECOMMIT) != 0;
+#else
+    if (mprotect(p, (size_t) bytes, PROT_NONE) != 0) return false;
+    return madvise(p, (size_t) bytes, MADV_DONTNEED) == 0;
+#endif
+}
+
+void vm_release(void* p, uint64_t bytes) {
+    if (p == nullptr) return;
+#if defined(_WIN32)
+    (void) bytes;
+    (void) VirtualFree(p, 0, MEM_RELEASE);
+#else
+    (void) munmap(p, (size_t) bytes);
+#endif
+}
+
 bool drop_mapped_view(const void* base, uint64_t view_bytes, uint64_t off, uint64_t bytes) {
     if (base == nullptr || bytes == 0) return true;
 #if defined(_WIN32)

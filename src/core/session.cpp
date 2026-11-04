@@ -243,6 +243,13 @@ bool session_kv_set_mode(SessionState& s, const ModelGeometry& g, int mode, cons
     return done == s.qsa_alloc;
 }
 
+void session_kv_host_cells(SessionState& s, int64_t cells) {
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) {
+        QsaState& st = s.qsa_states[s.qsa_ord0 + j];
+        if (st.kv_mode == 1) st.host_cells = cells;
+    }
+}
+
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream) {
     cudaStream_t cs = (cudaStream_t) stream;
     // the residual: `hc` copies of the one vector a caller hands in.  A real sequence's first token is the

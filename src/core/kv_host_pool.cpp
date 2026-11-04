@@ -1,6 +1,8 @@
 // src/core/kv_host_pool.cpp - a request's K/V in pinned host RAM.  Read the header first.
 #include "basalt/core/kv_host_pool.hpp"
 #include "basalt/core/session.hpp"
+#include "basalt/platform/memory.hpp"
+#include "basalt/log.hpp"
 #include "basalt/kernels/kv_q4.hpp"
 #include "basalt/kernels/kv_q8.hpp"
 
@@ -8,6 +10,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
+#include <numeric>
 #include <utility>
 
 namespace basalt::core {
@@ -33,6 +37,32 @@ std::vector<uint64_t> page_runs(const QsaState& st, const ModelGeometry& g) {
     return {rows * g.head_dim * 2, rows * g.head_dim * 2};
 }
 
+uint64_t align_up(uint64_t n, uint64_t a) { return (n + a - 1) / a * a; }
+
+void unregister_range(void* p) {
+    const cudaError_t e = cudaHostUnregister(p);
+    if (e != cudaSuccess) {
+        basalt::log::error("basalt", "host K/V: cannot unregister RAM: %s", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
+
+bool register_identity(void* base, uint64_t bytes, uint64_t& registered, std::string& err) {
+    if (cudaHostRegister(base, (size_t) bytes, cudaHostRegisterMapped | cudaHostRegisterPortable) != cudaSuccess) {
+        (void) cudaGetLastError();
+        err = "host K/V: cannot register the RAM";
+        return false;
+    }
+    registered = bytes;
+    void* device = nullptr;
+    if (cudaHostGetDevicePointer(&device, base, 0) != cudaSuccess || device != base) {
+        (void) cudaGetLastError();
+        err = "host K/V: the registered RAM has a different device address";
+        return false;
+    }
+    return true;
+}
+
 int64_t page_cells() { return basalt::kernels::qsa_real_shapes().page_size; }
 }  // namespace
 
@@ -46,7 +76,11 @@ KvHostPool& KvHostPool::operator=(KvHostPool&& o) noexcept {
     host_ = std::exchange(o.host_, nullptr);
     dev_ = std::exchange(o.dev_, nullptr);
     bytes_ = std::exchange(o.bytes_, 0);
-    layer_bytes_ = std::exchange(o.layer_bytes_, 0);
+    reserved_bytes_ = std::exchange(o.reserved_bytes_, 0);
+    page_bytes_ = std::exchange(o.page_bytes_, 0);
+    max_cells_ = std::exchange(o.max_cells_, 0);
+    registrations_ = std::move(o.registrations_);
+    o.registrations_.clear();
     cells_ = std::exchange(o.cells_, 0);
     layers_ = std::move(o.layers_);
     run_bytes_ = std::move(o.run_bytes_);
@@ -68,6 +102,11 @@ bool KvHostPool::reserve(const SessionState& s, const ModelGeometry& g, int64_t 
     }
     const int64_t ps = page_cells();
     const int64_t c = (cells + ps - 1) / ps * ps;
+    if (s.max_cells > 0 && c <= (int64_t) align_up((uint64_t) s.max_cells, (uint64_t) ps) &&
+        reserve_registered(s, g, c, err)) return true;
+    // A refused reservation or non-identity device alias uses the allocated pool.
+    release();
+    err.clear();
     const QsaState& q0 = s.qsa_states[s.qsa_ord0];
     const uint64_t per = (qsa_kv_host_layer_bytes(q0, g, c) + 255) & ~255ull;
     const uint64_t total = per * (uint64_t) s.qsa_alloc;
@@ -87,12 +126,103 @@ bool KvHostPool::reserve(const SessionState& s, const ModelGeometry& g, int64_t 
     host_ = (uint8_t*) h;
     dev_ = (uint8_t*) d;
     bytes_ = total;
-    layer_bytes_ = per;
     cells_ = c;
     run_bytes_ = page_runs(q0, g);
     layers_.clear();
     for (int64_t j = 0; j < s.qsa_alloc; ++j)
         layers_.push_back(qsa_kv_host_carve(s.qsa_states[s.qsa_ord0 + j], g, dev_ + (uint64_t) j * per, c));
+    return true;
+}
+
+bool KvHostPool::reserve_registered(const SessionState& s, const ModelGeometry& g, int64_t cells,
+                                    std::string& err) {
+    int device = 0, identity = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&identity, cudaDevAttrCanUseHostPointerForRegisteredMem, device) != cudaSuccess ||
+        !identity) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    page_bytes_ = basalt::platform::vm_page_size();
+    if (page_bytes_ == 0) return false;
+    const QsaState& q0 = s.qsa_states[s.qsa_ord0];
+    run_bytes_ = page_runs(q0, g);
+    // Widen the carve so every array starts at a host-page boundary, including a partial context page.
+    uint64_t quantum = 1;
+    for (uint64_t run : run_bytes_)
+        quantum = std::lcm(quantum, page_bytes_ / std::gcd(page_bytes_, run));
+    const uint64_t pages = align_up(((uint64_t) s.max_cells + page_cells() - 1) / page_cells(), quantum);
+    const int64_t carve_cells = (int64_t) pages * page_cells();
+    const uint64_t per = align_up(qsa_kv_host_layer_bytes(q0, g, carve_cells), page_bytes_);
+    reserved_bytes_ = per * (uint64_t) s.qsa_alloc;
+    host_ = (uint8_t*) basalt::platform::vm_reserve(reserved_bytes_);
+    if (host_ == nullptr) { reserved_bytes_ = 0; return false; }
+    dev_ = host_;
+    max_cells_ = (int64_t) align_up((uint64_t) s.max_cells, (uint64_t) page_cells());
+    for (int64_t j = 0; j < s.qsa_alloc; ++j) {
+        const QsaState& st = s.qsa_states[s.qsa_ord0 + j];
+        if (page_runs(st, g) != run_bytes_) { err = "host K/V: different layer formats"; return false; }
+        layers_.push_back(qsa_kv_host_carve(st, g, host_ + (uint64_t) j * per, carve_cells));
+        for (uint8_t* base : arrays_of(layers_.back())) registrations_.push_back({base, 0});
+    }
+    return grow(cells, err);
+}
+
+uint64_t KvHostPool::growth_bytes(int64_t cells) const {
+    if (!grows_in_place() || cells <= cells_ || cells > max_cells_) return 0;
+    const uint64_t pages = ((uint64_t) cells + page_cells() - 1) / page_cells();
+    const uint64_t old_pages = (uint64_t) cells_ / page_cells();
+    uint64_t bytes = 0;
+    for (uint64_t run : run_bytes_)
+        bytes += align_up(pages * run, page_bytes_) - align_up(old_pages * run, page_bytes_);
+    return bytes * layers_.size();
+}
+
+bool KvHostPool::grow(int64_t cells, std::string& err) {
+    if (!grows_in_place() || cells <= 0 || cells > max_cells_) {
+        err = "host K/V: no registered capacity for the cells";
+        return false;
+    }
+    const int64_t c = (cells + page_cells() - 1) / page_cells() * page_cells();
+    if (c <= cells_) return true;
+    const uint64_t pages = (uint64_t) c / page_cells();
+    struct Change { size_t index; uint64_t old_bytes; uint64_t new_bytes; };
+    std::vector<Change> changed;
+    changed.reserve(registrations_.size());
+    bool ok = true;
+    for (size_t i = 0; i < registrations_.size(); ++i) {
+        auto& r = registrations_[i];
+        const uint64_t wanted = align_up(pages * run_bytes_[i % run_bytes_.size()], page_bytes_);
+        if (wanted == r.bytes) continue;
+        if (!basalt::platform::vm_commit(r.base + r.bytes, wanted - r.bytes)) {
+            err = "host K/V: cannot commit the new RAM";
+            ok = false;
+            break;
+        }
+        changed.push_back({i, r.bytes, wanted});
+        // Keep one registration per array so whole-array DMA never crosses registration boundaries.
+        if (r.bytes != 0) unregister_range(r.base);
+        r.bytes = 0;
+        if (!register_identity(r.base, wanted, r.bytes, err)) { ok = false; break; }
+    }
+    if (!ok) {
+        for (auto it = changed.rbegin(); it != changed.rend(); ++it) {
+            auto& r = registrations_[it->index];
+            if (r.bytes != 0) unregister_range(r.base);
+            r.bytes = 0;
+            if (it->old_bytes != 0) {
+                std::string restore_error;
+                if (!register_identity(r.base, it->old_bytes, r.bytes, restore_error)) {
+                    basalt::log::error("basalt", "host K/V: cannot restore registered RAM: %s", restore_error.c_str());
+                    std::exit(1);
+                }
+            }
+            (void) basalt::platform::vm_decommit(r.base + it->old_bytes, it->new_bytes - it->old_bytes);
+        }
+        return false;
+    }
+    bytes_ += growth_bytes(c);
+    cells_ = c;
     return true;
 }
 
@@ -116,11 +246,19 @@ bool KvHostPool::copy_from(const KvHostPool& from, int64_t cells, std::string& e
 }
 
 void KvHostPool::release() {
-    if (host_ != nullptr) cudaFreeHost(host_);
+    if (grows_in_place()) {
+        for (auto r = registrations_.rbegin(); r != registrations_.rend(); ++r)
+            if (r->bytes != 0) unregister_range(r->base);
+        basalt::platform::vm_release(host_, reserved_bytes_);
+    } else if (host_ != nullptr) {
+        (void) cudaFreeHost(host_);
+    }
     host_ = dev_ = nullptr;
-    bytes_ = layer_bytes_ = 0;
-    cells_ = 0;
+    bytes_ = reserved_bytes_ = page_bytes_ = 0;
+    cells_ = max_cells_ = 0;
+    registrations_.clear();
     layers_.clear();
+    run_bytes_.clear();
 }
 
 }  // namespace basalt::core

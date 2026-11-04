@@ -16,7 +16,8 @@
 namespace basalt::program::serve {
 
 /// How many of `xc`'s slots `need` bytes take, measured from the end (sized slots) or in whole blobs.
-int64_t cache_slots_for(const basalt::core::ExpertCache& xc, uint64_t need);
+/// `live` chooses the planned end of the cache, including slots that are currently unmapped.
+int64_t cache_slots_for(const basalt::core::ExpertCache& xc, uint64_t need, int64_t live = -1);
 
 /// The slots a prompt chunk of `cells` tokens needs from `xc`'s tail.
 int64_t lend_slots(const basalt::core::ExpertCache& xc, const basalt::core::ModelGeometry& g,

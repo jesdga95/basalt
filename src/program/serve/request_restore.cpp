@@ -277,6 +277,9 @@ Flow Request::restore() {
         for (const ConvCheckpoint& c : runtime_.checks) kv_live = std::max<int64_t>(kv_live, (int64_t) c.ids.size());
         runtime_.kv_host_late = false;
         const int64_t kv_read = n - (incoming ? in_tokens : resume);   // the prompt tokens it reads
+        // the loan its homes are sized for: the read's own chunk (a resumed read keeps its chunk); a full chunk for
+        // a slot's read or pictures (their own loans)
+        runtime_.loan_tokens = in_slot || !runtime_.req_imgs.empty() ? 0 : std::max<int64_t>(kv_read, resumed_chunk);
         if (const int adm = in_slot ? 1 : runtime_.kv_host_admit(kv_need, max_new, kv_live, kv_read, runtime_.err);
             adm <= 0) {
             if (adm < 0) {

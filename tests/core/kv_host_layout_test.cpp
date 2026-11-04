@@ -79,6 +79,32 @@ int main() {
     const uint64_t per = (c::qsa_kv_host_layer_bytes(layers[0], g, 131072) + 255) & ~255ull;
     CHECK(c::KvHostPool::bytes_for(ss, g, 131072) == 12 * per);
     CHECK(c::KvHostPool::bytes_for(ss, g, 131072) > 131072ull * 12 * 1056);   // 1,056 B per cell and layer, plus slack
+    // At the context carve, each smaller prefix ends before the following array.
+    for (const c::QsaState* fmt : {&st, &q4, &f16}) {
+        const auto max = c::qsa_kv_host_carve(*fmt, g, base, ctx);
+        const uint64_t rows = 131072ull * g.n_head_kv;
+        if (max.k_q != nullptr) {
+            CHECK((uint8_t*) max.k_q + rows * g.head_dim <= (uint8_t*) max.v_q);
+            CHECK((uint8_t*) max.k_scale + rows * (g.head_dim / 64) * 2 <= (uint8_t*) max.v_scale);
+            CHECK((uintptr_t) max.k_scale % 4096 == 0 && (uintptr_t) max.v_scale % 4096 == 0);
+        } else if (max.k_q4 != nullptr) {
+            CHECK(max.k_q4 + rows * k::kv_q4_bytes_per_head((int) g.head_dim) <= max.v_q4);
+        } else {
+            CHECK(max.k_pool + rows * g.head_dim <= max.v_pool);
+        }
+    }
+    // Publishing capacity changes only streamed layers' bounds, including an allocated ordinal offset.
+    ss.qsa_ord0 = 2;
+    ss.qsa_alloc = 3;
+    layers[2].kv_mode = layers[3].kv_mode = 1;
+    layers[2].host = h;
+    layers[2].map.page_table = reinterpret_cast<int32_t*>(base);
+    c::session_kv_host_cells(ss, 163840);
+    CHECK(layers[2].host_cells == 163840 && layers[3].host_cells == 163840 && layers[4].host_cells == 0);
+    CHECK(layers[1].host_cells == 0 && layers[2].host.k_q == h.k_q && layers[2].map.page_table == (int32_t*) base);
+    layers[2].kv_mode = layers[3].kv_mode = 0;
+    ss.qsa_ord0 = 0;
+    ss.qsa_alloc = 12;
     // the switch refuses, before any device work, a state that cannot stream and a mode-1 switch without a host copy
     std::string err;
     CHECK(!c::session_kv_can_stream(ss));

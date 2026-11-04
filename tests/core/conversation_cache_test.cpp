@@ -402,6 +402,7 @@ int main() {
         }
         check(CheckpointBytes::allocator_type::release_pooled() >= big, "the kept blocks are freed");
         check(CheckpointBytes::allocator_type::release_pooled() == 0, "none is kept after that");
+        check(CheckpointBytes::allocator_type::pooled_bytes() == 0, "none is kept after that");
         check(b[0] == 9 && b[big - 1] == 4, "a reused buffer is not zeroed");
         CheckpointBytes small(100, 3), copy = small;
         check(copy.size() == 100 && copy[99] == 3, "small buffers still copy and fill");

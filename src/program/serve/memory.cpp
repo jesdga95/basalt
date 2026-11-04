@@ -53,8 +53,12 @@ void Runtime::shed_if_low() {
 // the prompt path's loan with `live` slots: its chunk as large as fits, and the first slot it covers
 int32_t Runtime::loan_plan(int64_t live, int64_t& chunk) {
     PfPart& p = pf_parts[0];
+    // measured from the end of `live` slots, which may be fewer than the cache holds now (a shrink being planned)
+    auto slots_for = [&](int64_t c) {
+        return serve_loans::cache_slots_for(*p.cache, basalt::prefill::Prefill::bytes_needed(g, *p.ses, c), live);
+    };
     auto fits = [&](int64_t c) {
-        const int64_t k = part_slots(p, c);
+        const int64_t k = slots_for(c);
         return k > 0 && k + 128 <= live && !(o.prefill_auto && k * 100 > auto_lend_pct * live);
     };
     // auto: the largest chunk on the start-up's 256-token grid, so a few slots lent away cost a few tokens
@@ -66,7 +70,7 @@ int32_t Runtime::loan_plan(int64_t live, int64_t& chunk) {
     }
     while (c > 256 && !fits(c)) c = std::max<int64_t>(256, c / 2 / 256 * 256);
     chunk = c;
-    return (int32_t) std::max<int64_t>(0, live - part_slots(p, c));
+    return (int32_t) std::max<int64_t>(0, live - slots_for(c));
 }
 
 void Runtime::relend() {   // the prompt path's loan: the end of the slots left, its chunk as large as fits
@@ -78,6 +82,29 @@ void Runtime::relend() {   // the prompt path's loan: the end of the slots left,
     p.first_now = -1;   // laid out again at the next loan
 }
 
+// The first slot the admitted request's loan reaches with `live` slots: its read's chunk (`loan_tokens`, rounded
+// up as the prompt path rounds it) laid out from the end, never below the full chunk's loan (Request::lend).
+int64_t Runtime::homes_from(int64_t live) {
+    if (pf_parts.empty() || pf_parts[0].first < 0) return live;
+    int64_t c = 0;
+    const int64_t full = loan_plan(live, c);
+    if (loan_tokens <= 0) return std::min<int64_t>(live, full);
+    const PfPart& p = pf_parts[0];
+    const int64_t want = serve_loans::request_chunk(loan_tokens, c);
+    const int64_t k = serve_loans::cache_slots_for(*p.cache, basalt::prefill::Prefill::bytes_needed(g, *p.ses, want),
+                                                   live);
+    return std::min<int64_t>(live, std::max<int64_t>(full, live - k));
+}
+
+// the part of what serving takes (serve_growth) the engine holds now, each counted up to its own share: the running
+// checkpoints and the blocks their pool keeps for the next ones, the parked conversations
+uint64_t Runtime::serve_held() {
+    uint64_t ck = basalt::core::CheckpointBytes::allocator_type::pooled_bytes();
+    for (const ConvCheckpoint& c : checks) ck += c.bytes();
+    return std::min<uint64_t>(ck, serve_budget.checkpoints) +
+           std::min<uint64_t>(conversations->bytes(), serve_budget.conversations);
+}
+
 // The resident RAM mode holds only the experts no slot holds, so an expert in a slot about to go has no RAM
 // copy: it is copied from its slot into a RAM home first and read from there like the compact copy's.  Refused
 // (nothing copied) when the RAM above the floor cannot take them, or with `partial` as many as leave the serving
@@ -85,27 +112,32 @@ void Runtime::relend() {   // the prompt path's loan: the end of the slots left,
 // slots that stay.
 bool Runtime::home_given_up(int64_t live, std::string& e, bool partial) {
     if (!src.complement_ready()) return true;
-    // the slots the loan will overwrite keep a RAM copy too, so a prompt never costs a file read
-    int64_t from = live;
-    if (!pf_parts.empty() && pf_parts[0].first >= 0) {
-        int64_t c = 0;
-        from = std::min<int64_t>(live, loan_plan(live, c));
-    }
+    // the slots the request's loan will overwrite keep a RAM copy too, so its prompt never costs a file read
+    const int64_t from = homes_from(live);
     std::vector<std::pair<int32_t, int32_t>> give;
     std::vector<int32_t> slots;
-    // the slots that go first, then the loan's
-    for (int pass = 0; pass < 2; ++pass) {
-        for (size_t i = 0; i < host_res.size(); ++i) {
-            const int64_t layer = (int64_t) i / g.n_expert, ex = (int64_t) i % g.n_expert;
-            const int32_t slot = host_res[i];
-            if (slot < from || (pass == 0 ? slot < live : slot >= live) || src.has_resident(layer, ex)) continue;
+    for (size_t i = 0; i < host_res.size(); ++i) {
+        const int64_t layer = (int64_t) i / g.n_expert, ex = (int64_t) i % g.n_expert;
+        if (host_res[i] >= from && !src.has_resident(layer, ex)) {
             give.emplace_back((int32_t) layer, (int32_t) ex);
-            slots.push_back(slot);
+            slots.push_back(host_res[i]);
         }
     }
     if (give.empty()) return true;
     const size_t wanted = give.size();
     if (partial) {
+        // the highest slots first: the slots that go come before the loan's, and a short read lends the last ones
+        std::vector<size_t> order(wanted);
+        for (size_t k = 0; k < wanted; ++k) order[k] = k;
+        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return slots[a] > slots[b]; });
+        std::vector<std::pair<int32_t, int32_t>> ranked;
+        std::vector<int32_t> ranked_slots;
+        for (const size_t k : order) {
+            ranked.push_back(give[k]);
+            ranked_slots.push_back(slots[k]);
+        }
+        give = std::move(ranked);
+        slots = std::move(ranked_slots);
         std::vector<uint64_t> sizes;
         sizes.reserve(wanted);
         for (const auto& entry : give)
@@ -288,12 +320,13 @@ bool Runtime::vram_command(const std::string& cmd, std::string& e, bool for_slee
 }
 
 int Runtime::init_memory() {
+    serve_budget = serve_growth(o, g);
     // the load's own buffers are gone: RAM still free keeps the next-hottest experts the first sizing left out
     if (srcp == &src && src.complement_ready() && o.resident_budget == 0) {
         int64_t n_top = 0;
-        // what the engine still takes once serving (see serve_growth_bytes) and the file cache's floor while
-        // experts are read from the SSD (none when every expert has a tier)
-        const uint64_t later = serve_growth_bytes(o, g) +
+        // what the engine still takes once serving (its budget less the part it holds now) and the file cache's floor
+        // while experts are read from the SSD (none when every expert has a tier)
+        const uint64_t later = serve_budget.total() - std::min(serve_budget.total(), serve_held()) +
                                (ram_floor_bytes - std::min(ram_floor_bytes, basalt::platform::ram_margin()));
         const uint64_t add = src.top_up(stages.empty() ? profile : profile_all, [&](int32_t l, int32_t e) {
             return host_res[(size_t) l * g.n_expert + (size_t) e] >= 0 || (peer.valid() && peer.has(l, e));

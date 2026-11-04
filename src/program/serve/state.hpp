@@ -334,6 +334,7 @@ private:
     bool in_eof{};
     std::atomic<bool> ram_stop{};
     uint64_t guard_floor{};
+    ServeGrowth serve_budget{};   // what serving takes (serve_growth), by part
     uint64_t ready_avail{};
     uint64_t ready_rss{};
     uint64_t shed_drop{};
@@ -365,14 +366,15 @@ private:
     bool kv_host_live{};
     int64_t kv_host_cross{};        // a request that starts decoding below this depth (cells) stays in the VRAM tail
     int64_t kv_host_ram{};          // a test's stand-in for the RAM free now, MiB; negative: MemAvailable
-    ServeGrowth kv_host_budget{};   // what serving can take, by part (a pin leaves it free less what is held)
     basalt::core::KvHostPool kv_pool{};
     int64_t kv_host_out{};          // the output cells a pool is pinned for
-    int64_t kv_host_grow_ram{};     // a test's stand-in for the RAM free at a mid-request grow, MiB
+    int64_t kv_host_grow_ram{};     // a test's stand-in for the RAM free at admission or mid-request growth, MiB
     // set by kv_host_admit for a shallow request on a streamed session: it goes back to the VRAM tail with the cells
     // it keeps once the outgoing conversation is parked (kv_host_back)
     bool kv_host_late{};
     int64_t kv_host_fresh{};        // a session not streamed yet takes a pool only for a read of at most this many tokens
+    // the prompt tokens the admitted request reads (0: a full chunk): the loan its RAM homes are sized for
+    int64_t loan_tokens{};
     // a solo request's fits before its prompt read leave their handoffs to the peer to that read: (peer slot, its
     // expert, the expert it takes), done by the split's loan of the slot or else before the first window
     bool peer_defer{};
@@ -556,6 +558,7 @@ private:
     void make_view(basalt::core::SessionState& v, int b);
     int32_t loan_plan(int64_t live, int64_t& chunk);
     void relend();
+    uint64_t serve_held();
     bool home_given_up(int64_t live, std::string& e, bool partial = false);
     bool vram_command(const std::string& cmd, std::string& e, bool for_sleep, std::string* reply = nullptr);
     int64_t cache_floor_slots();
@@ -575,6 +578,7 @@ private:
     uint64_t kv_ram_now();
     int kv_host_regrow(int64_t cells, int64_t live_c, std::string& pe, std::string& e);
     int kv_host_to_vram(int64_t at, int64_t live_c, std::string& pe, std::string& e);
+    int64_t homes_from(int64_t live);
     int kv_host_admit(int64_t need, int64_t new_tokens, int64_t live_cells, int64_t read, std::string& e);
     int kv_host_back(int64_t need, int64_t keep, std::string& e);
     int kv_host_more(int64_t p, int64_t need, int64_t left, int64_t live_c, std::string& e);

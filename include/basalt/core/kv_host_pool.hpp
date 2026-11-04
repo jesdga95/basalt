@@ -1,10 +1,9 @@
 // include/basalt/core/kv_host_pool.hpp - a request's K/V in pinned host RAM.
 //
 // A session whose QSA states can stream (qsa_set_kv_host) keeps its authoritative K/V here while a request runs
-// streamed: one pinned, device-mapped allocation for every QSA layer of the session, each layer laid out as
-// qsa_state_init lays a host copy out, for the request's cells rather than the whole context.  It is taken at a
-// request's admission and kept while the session stays streamed (the next request of the conversation resumes from
-// it); a deeper request takes a larger one and the cells move over in host memory.
+// streamed. Each array reserves the context's address space and pins only its used prefix, so growth preserves
+// addresses. If registered host pointers cannot be used by the device, a pool uses one mapped allocation and grows
+// by copying into a replacement.
 #pragma once
 
 #include "basalt/core/layer.hpp"
@@ -32,6 +31,13 @@ public:
     /// Pins a pool of `cells` cells (whole pages) for `s`'s QSA layers; what this pool held before is released first.
     /// False with `err`, holding nothing, when the driver cannot pin it.
     bool reserve(const SessionState& s, const ModelGeometry& g, int64_t cells, std::string& err);
+    /// Re-registers longer array prefixes at their existing addresses, without moving bytes.
+    /// On refusal the old registrations and extent are restored; a failed restoration stops the engine.
+    /// The device must be drained before growth. False also for an allocated pool, which needs replacement.
+    bool grow(int64_t cells, std::string& err);
+    bool grows_in_place() const { return reserved_bytes_ != 0; }
+    /// Additional page-rounded RAM a registered growth pins (zero when already covered).
+    uint64_t growth_bytes(int64_t cells) const;
     /// Copies the first `cells` cells of every layer of `from` (same session) into this pool, in host memory.
     bool copy_from(const KvHostPool& from, int64_t cells, std::string& err);
     /// Frees the pinned RAM; the device must be done with it (no state points at it any more).
@@ -48,7 +54,12 @@ private:
     uint8_t* host_ = nullptr;   // the host address of the allocation
     uint8_t* dev_ = nullptr;    // its device alias
     uint64_t bytes_ = 0;
-    uint64_t layer_bytes_ = 0;
+    uint64_t reserved_bytes_ = 0;
+    uint64_t page_bytes_ = 0;
+    int64_t max_cells_ = 0;
+    struct Registration { uint8_t* base; uint64_t bytes; };
+    std::vector<Registration> registrations_;
+    bool reserve_registered(const SessionState& s, const ModelGeometry& g, int64_t cells, std::string& err);
     int64_t cells_ = 0;
     std::vector<basalt::kernels::KvHostPools> layers_;
     std::vector<uint64_t> run_bytes_;   // per array of a layer: bytes per page

@@ -99,8 +99,8 @@ KvHostChoice choose_kv_host(const KvHostInputs& in) {
         c.why = "shallow";
         return c;
     }
-    const uint64_t pin = (uint64_t) in.cells * in.bytes_per_cell;
-    if (in.ram_available <= in.ram_kept || pin > in.ram_available - in.ram_kept) {
+    const uint64_t pin = in.grow_in_place ? in.growth_bytes : (uint64_t) in.cells * in.bytes_per_cell;
+    if (in.ram_low || in.ram_available <= in.ram_kept || pin > in.ram_available - in.ram_kept) {
         c.why = "no RAM";
         return c;
     }
