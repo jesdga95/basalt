@@ -114,26 +114,35 @@ prompts; on the third it can diverge after a few tokens (see [Quality](#quality)
 ## Quality
 
 GSQ-RCO IQ2_XXS, 5090 only, against llama.cpp b11870 on the same GGUF, llama's tokens fed one decode step at a time on
-three prompts: Basalt's greedy choice differs at 4 to 8 of 688 generated positions, depending on which tier each expert
-sits in during the run. KL against llama's logits on 512 positions of real text: mean 0.0025, median 0.0007, top-1
-agreement 98.2%, position 1 left out: llama's own row at position 1 moves by KL 4.2 between a 2-token and a 512-token
-batch, and Basalt is within 0.07 of its 2-token row. There is no PPL/KLD run against the native model on this pack yet.
+three prompts: Basalt's greedy choice differs from llama's at 8 of 688 generated positions at the default tier state
+(5, 2 and 1 on the three prompts), 10 with the RAM tier one expert larger and 11 with a VRAM tier of 6 experts per layer.
+The count moves with which tier each expert sits in. KL against llama's logits on 512 positions of real text: mean
+0.0025, median 0.0007, top-1 agreement 98.0%, position 1 left out: llama's own row at position 1 moves by KL 4.2
+between a 2-token and a 512-token batch, and Basalt is within 0.04 of its 2-token row. There is no PPL/KLD run against
+the native model on this pack yet.
 
-Neither engine has one answer to compare. On the same tokens (mean KL over the generated positions of the first prompt):
+Neither engine has one answer to compare. On the same tokens of the first prompt (319 generated positions; each row
+names the two runs compared, KL over the full vocabulary):
 
 | Pair | Mean KL | Top-1 differs at |
 |---|---|---|
-| Basalt vs llama, batched | 0.0025 to 0.0030 | 4 to 8 of 319 |
-| Basalt, RAM tier one expert larger | 0.0020 | 5 of 319 |
-| Basalt, VRAM tier of 6 experts per layer | 0.0022 | 5 of 319 |
-| llama serial vs llama batched | top-5 log-probabilities move by 0.32 (median), 2.08 (max) | 4 of 319 |
+| Basalt default tier vs llama batched | 0.0032 | 9 of 319 |
+| Basalt RAM tier 305 vs llama batched | 0.0032 | 10 of 319 |
+| Basalt VRAM tier of 6 vs llama batched | 0.0031 | 10 of 319 |
+| Basalt default tier vs Basalt RAM tier 305 | 0.0016 | 3 of 319 |
+| Basalt default tier vs Basalt VRAM tier of 6 | 0.0020 | 3 of 319 |
+| llama serial vs llama batched | top-5 log-probabilities move by 0.32 (median of per-row maxima), 2.08 (max) | 4 of 319 |
 
-The largest gap between the two engines' tokens shows it. Log-probability of the first token minus the second, same row:
-llama serial +1.01, llama batched +0.39, Basalt +0.18, -0.64 and -0.59 at three tier settings. The mechanism: with input
-and routing bit-equal, placement alone changes a layer's routed output by 0.9% (median; 1.9% at most), since q8_1 and
-Q8_K round the activations differently. That is enough to move a top-6 choice in a later layer, and a changed choice moves
-the layer's output by about 10%. Reruns at one tier setting are bitwise equal, and asking for logits does not change the
-tokens.
+Over all three prompts the default tier differs from the RAM tier 305 run at 4 of 688 positions (mean KL 0.0019) and
+from the VRAM-6 run at 7 of 688 (0.0021).
+
+The largest gap between the two engines' tokens shows it. Log-probability of the first token minus the second, same row
+(first prompt, generated position 124): llama serial +1.01, llama batched +0.39, Basalt -0.58 at the default tier, -0.21
+at RAM tier 305 and -0.48 at VRAM 6, so Basalt takes the second token at all three. The mechanism: with input and
+routing bit-equal, placement alone changes a layer's routed output by 0.9% (median; 1.9% at most), since q8_1 and Q8_K
+round the activations differently. That is enough to move a top-6 choice in a later layer, and in the one position
+traced a changed choice moved the layer's output by about 10%; that is a single observation, not a spread. Reruns at
+one tier setting are bitwise equal, and asking for logits does not change the tokens.
 
 Quality is the quant's, not the engine's. The IQ1_S pack scores, against the native model's logits (teacher: the
 native FP4 checkpoint through the reference code; Lucebox's 8 x 1,024 held-out tokens, KL over the teacher's top-256 ids,
