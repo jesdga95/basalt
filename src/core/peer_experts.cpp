@@ -1,4 +1,4 @@
-// src/models/qwen4exp/decode/peer_experts.cpp - see include/basalt/core/peer_experts.hpp.
+// src/core/peer_experts.cpp - see include/basalt/core/peer_experts.hpp.
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/peer_experts.hpp"
 

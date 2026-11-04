@@ -377,7 +377,7 @@ add_library(engine STATIC src/models/qwen4exp/decode/layer.cpp src/models/qwen4e
   src/models/qwen4exp/decode/mtp/draft.cpp
   src/models/qwen4exp/decode/mtp/stores.cpp
   src/models/qwen4exp/decode/mtp/batching.cpp
-  src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/conversation_store.cpp src/models/qwen4exp/decode/peer_experts.cpp src/core/staged_copy.cpp)
+  src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/conversation_store.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp)
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(engine PUBLIC core model kernels kernels_cpu ${_gpu_runtime_target})
 if(BUILD_TESTING)
