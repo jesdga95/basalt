@@ -364,6 +364,7 @@ class Service:
         print(f"[server] model awake in {time.time() - t:.1f} s (driver restore {self.engine.restore_s:.1f} s)",
               flush=True)
 
+    sleep_refused_at = None                              # the request an idle sleep was last refused after
     SLEEP_RAM_MARGIN_MIB = 8192                          # RAM left free once the GPU state is in host memory
 
     def sleep(self, idle_for: float | None = None) -> str:
@@ -389,10 +390,15 @@ class Service:
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
+            # an idle sleep the engine refused is tried again after the next request, not on every round
+            if idle_for is not None and self.sleep_refused_at == (self.last_request_at or self.started_at):
+                return "unsupported"
             t = time.time()
             try:
                 self.engine.sleep(ram_check=self._sleep_fits)
             except ValueError as e:
+                if idle_for is not None:
+                    self.sleep_refused_at = self.last_request_at or self.started_at
                 print(f"[server] warning: the model stays awake ({e})", flush=True)
                 return "no ram" if "RAM" in str(e) else "unsupported"
             print(f"[server] model asleep{f' after {idle_for:.0f} s idle' if idle_for else ''} in {time.time() - t:.1f} s: "
