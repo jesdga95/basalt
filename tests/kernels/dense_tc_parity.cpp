@@ -9,7 +9,7 @@
 //     RMS of the diff over the RMS of ref, per case; it fails above 1e-3 RMS.
 // --bench: native_mmvq and dense_tc timed per T as CUDA graphs over enough weight copies that the L2 holds none
 // (launched as programmatic dependents under PDL=1).
-#include "basalt/kernels/dense_tc.hpp"
+#include "basalt/models/qwen4exp/kernels/dense_tc.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/pdl.hpp"
 

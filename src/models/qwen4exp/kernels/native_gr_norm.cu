@@ -22,7 +22,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "basalt/kernels/native_gr_norm.hpp"
+#include "basalt/models/qwen4exp/kernels/native_gr_norm.hpp"
 
 #include <cuda_runtime.h>
 #include <cmath>
