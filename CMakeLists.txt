@@ -140,7 +140,7 @@ add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models
   src/models/deepseek41/elastic.cpp src/models/deepseek41/ops_kernels.cpp src/models/deepseek41/tier.cpp src/models/deepseek41/peer_tier.cpp src/models/deepseek41/ops.cu
   src/models/deepseek41/prefill.cpp src/models/deepseek41/prefill_ffn.cpp src/models/deepseek41/prefill_ffn.cu src/models/deepseek41/attn_batch.cpp src/models/deepseek41/attn_dense.cu)
 target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
-target_link_libraries(model_deepseek41 PUBLIC model deepseek41_kernels deepseek41_attn deepseek41_vision engine mmq kernels core ${_gpu_runtime_target})
+target_link_libraries(model_deepseek41 PUBLIC model deepseek41_kernels deepseek41_attn deepseek41_vision model_qwen4exp_engine mmq kernels core ${_gpu_runtime_target})
 
 add_library(models STATIC src/models/builtin.cpp)
 target_link_libraries(models PUBLIC model_qwen4exp model_deepseek41)
@@ -227,77 +227,36 @@ target_link_libraries(basalt-load PRIVATE core kernels)
 
 add_executable(basalt-concurrent src/core/concurrent_main.cpp)
 target_include_directories(basalt-concurrent PRIVATE ${_gpu_include_directories})
-target_link_libraries(basalt-concurrent PRIVATE core kernels ${_gpu_runtime_target})
+target_link_libraries(basalt-concurrent PRIVATE core model_qwen4exp_kernels ${_gpu_runtime_target})
 
 add_executable(basalt-overlap src/core/overlap_main.cpp)
 # a .cpp that calls cudaMemcpyAsync itself needs the toolkit headers and cudart explicitly
 target_include_directories(basalt-overlap PRIVATE ${_gpu_include_directories})
-target_link_libraries(basalt-overlap PRIVATE core kernels ${_gpu_runtime_target})
+target_link_libraries(basalt-overlap PRIVATE core model_qwen4exp_kernels ${_gpu_runtime_target})
 
 # ---- kernels ----
 # Naive first, each with a parity test against a reference that was itself validated against ggml.  The
 # kernels link `artifact` for the scalar dequantizers, because using the VALIDATED scalar path as the
 # reference is the whole point - a kernel checked against another copy of itself proves nothing.
-add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/models/qwen4exp/kernels/s2_gemv.cu
-                        src/models/qwen4exp/kernels/s_gemv.cu
-                        src/models/qwen4exp/kernels/router_top10.cu
+add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu
                         src/kernels/cuda/quantize_act.cu
-                        src/models/qwen4exp/kernels/rope.cu
                         src/kernels/cuda/sampler.cu
-                        src/models/qwen4exp/kernels/s2_gemv_q8.cu
-  src/models/qwen4exp/kernels/s2_expert_grouped.cu
-                        src/models/qwen4exp/kernels/shared_expert.cu
-                        src/models/qwen4exp/kernels/gr.cu
-                        src/models/qwen4exp/kernels/gdn.cu
-                        src/models/qwen4exp/kernels/qsa.cu
                         src/kernels/cuda/elementwise.cu
                         src/kernels/cuda/bf16_gemv.cu
                         src/kernels/cuda/native_mmvq.cu
                         src/kernels/cuda/native_bf16.cu
-                        src/models/qwen4exp/kernels/native_gr_norm.cu
-                        src/models/qwen4exp/kernels/native_moe.cu
-                        src/models/qwen4exp/kernels/native_gdn.cu
-                        src/models/qwen4exp/kernels/native_gr_postops.cu
-                        src/models/qwen4exp/kernels/native_router.cu
-                        src/models/qwen4exp/kernels/native_gdn_preprocess.cu
-                        src/models/qwen4exp/kernels/native_qsa.cu
-                        src/models/qwen4exp/kernels/native_rope.cu
-                        src/models/qwen4exp/kernels/native_ple_postops.cu
-                        src/models/qwen4exp/kernels/native_qsa_indexer.cu
-                        src/models/qwen4exp/kernels/native_qsa_score.cu
-                        src/models/qwen4exp/kernels/ple.cu
-                        src/models/qwen4exp/kernels/kv_q8.cu
-                        src/models/qwen4exp/kernels/kv_stream.cu
-                        src/models/qwen4exp/kernels/kv_q4.cu
-                        src/models/qwen4exp/kernels/fused_gr.cu
-                        src/models/qwen4exp/kernels/cvec.cu
-                        src/models/qwen4exp/kernels/qsa_decode_attn.cu
-                        src/models/qwen4exp/kernels/qsa_dec_attn.cu
-                        src/models/qwen4exp/kernels/qsa_dec_fused.cu
-                        src/models/qwen4exp/kernels/q5k_head.cu
-                        src/models/qwen4exp/kernels/q6k_head.cu
-                        src/models/qwen4exp/kernels/q80_proxy.cu
-                        src/models/qwen4exp/kernels/q80_vhead.cu
-                        src/models/qwen4exp/kernels/qsa_prompt_attn.cu
-                        src/models/qwen4exp/kernels/fused_gdn.cu
                         src/kernels/cuda/dequant_bf16.cu
-                        src/models/qwen4exp/kernels/qsa_select.cu
-                        src/models/qwen4exp/kernels/verify_kernels.cu
                         src/kernels/cuda/dec_gdn_rec.cu
-                        src/models/qwen4exp/kernels/dense_tc.cu
-                        src/models/qwen4exp/kernels/mid_chain.cu
-                        src/models/qwen4exp/kernels/qsa_mid.cu
                         src/kernels/cuda/wait_abort.cu
                         src/kernels/cuda/iq_kernels.cu
                         src/kernels/ngram.cpp
                         src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
-target_sources(kernels PRIVATE src/models/qwen4exp/kernels/hc_fused.cu src/models/qwen4exp/kernels/hc8_gr.cu)
 # the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
 if(BUILD_TESTING)
   add_executable(qsa_prompt_attn_parity tests/models/qwen4exp/kernels/qsa_prompt_attn_parity.cpp)
   target_include_directories(qsa_prompt_attn_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-  target_link_libraries(qsa_prompt_attn_parity PRIVATE kernels CUDA::cudart)
+  target_link_libraries(qsa_prompt_attn_parity PRIVATE model_qwen4exp_kernels CUDA::cudart)
   basalt_gpu_test(NAME qsa_prompt_attn_parity COMMAND qsa_prompt_attn_parity 32768 2048 1)
   set_tests_properties(qsa_prompt_attn_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 endif()
@@ -306,7 +265,7 @@ endif()
 if(BUILD_TESTING)
   add_executable(qsa_topk_active_parity tests/models/qwen4exp/kernels/qsa_topk_active_parity.cpp)
   target_include_directories(qsa_topk_active_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-  target_link_libraries(qsa_topk_active_parity PRIVATE kernels CUDA::cudart)
+  target_link_libraries(qsa_topk_active_parity PRIVATE model_qwen4exp_kernels CUDA::cudart)
   basalt_gpu_test(NAME qsa_topk_active_parity COMMAND qsa_topk_active_parity)
   set_tests_properties(qsa_topk_active_parity PROPERTIES SKIP_RETURN_CODE 77)
 endif()
@@ -335,54 +294,14 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
 # already links `core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
 # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
 # about arithmetic, and this one knows the ORDER the arithmetic happens in.
-add_library(engine STATIC src/models/qwen4exp/decode/layer.cpp src/models/qwen4exp/decode/session.cpp src/core/expert_source.cpp
-  src/core/expert_cache.cpp src/core/vmm.cpp src/core/kv_arena.cpp src/core/native_head.cpp src/core/native_dense.cpp
-  src/models/qwen4exp/decode/verify/batch_capture.cpp
-  src/models/qwen4exp/decode/verify/batch_execution.cpp
-  src/models/qwen4exp/decode/verify/batch_sessions.cpp
-  src/models/qwen4exp/decode/verify/capture.cpp
-  src/models/qwen4exp/decode/verify/commit.cpp
-  src/models/qwen4exp/decode/verify/cpu_warm.cpp
-  src/models/qwen4exp/decode/verify/diagnostics.cpp
-  src/models/qwen4exp/decode/verify/execution.cpp
-  src/models/qwen4exp/decode/verify/expert_execution.cpp
-  src/models/qwen4exp/decode/verify/expert_plan.cpp
-  src/models/qwen4exp/decode/verify/expert_resources.cpp
-  src/models/qwen4exp/decode/verify/gdn_split.cpp
-  src/models/qwen4exp/decode/verify/hc8.cpp
-  src/models/qwen4exp/decode/verify/head_split.cpp
-  src/models/qwen4exp/decode/verify/lifecycle.cpp
-  src/models/qwen4exp/decode/verify/pipeline.cpp
-  src/models/qwen4exp/decode/verify/profile.cpp
-  src/models/qwen4exp/decode/verify/projection.cpp
-  src/models/qwen4exp/decode/verify/record.cpp
-  src/models/qwen4exp/decode/verify/record_gdn.cpp
-  src/models/qwen4exp/decode/verify/record_head.cpp
-  src/models/qwen4exp/decode/verify/record_inputs.cpp
-  src/models/qwen4exp/decode/verify/record_layer.cpp
-  src/models/qwen4exp/decode/verify/record_moe.cpp
-  src/models/qwen4exp/decode/verify/record_qsa.cpp
-  src/models/qwen4exp/decode/verify/sampling.cpp
-  src/models/qwen4exp/decode/mtp/helpers.cpp
-  src/models/qwen4exp/decode/mtp/lifecycle.cpp
-  src/models/qwen4exp/decode/mtp/tensors.cpp
-  src/models/qwen4exp/decode/mtp/load.cpp
-  src/models/qwen4exp/decode/mtp/head.cpp
-  src/models/qwen4exp/decode/mtp/forward.cpp
-  src/models/qwen4exp/decode/mtp/graphs.cpp
-  src/models/qwen4exp/decode/mtp/branches.cpp
-  src/models/qwen4exp/decode/mtp/conditional.cpp
-  src/models/qwen4exp/decode/mtp/prefill.cpp
-  src/models/qwen4exp/decode/mtp/context.cpp
-  src/models/qwen4exp/decode/mtp/draft.cpp
-  src/models/qwen4exp/decode/mtp/stores.cpp
-  src/models/qwen4exp/decode/mtp/batching.cpp
-  src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/conversation_store.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp)
-target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(engine PUBLIC core model kernels kernels_cpu ${_gpu_runtime_target})
+# ---- tiers: the storage and transfer tier shared by the models (VRAM slots, RAM and file source, peer card) ----
+add_library(tiers STATIC src/core/expert_source.cpp src/core/expert_cache.cpp src/core/vmm.cpp src/core/peer_experts.cpp)
+target_include_directories(tiers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(tiers PUBLIC core kernels_cpu model_qwen4exp_kernels ${_gpu_runtime_target})
+include(src/models/qwen4exp/qwen4exp.cmake)
 if(BUILD_TESTING)
   add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)
-  target_link_libraries(file_expert_source_test PRIVATE engine)
+  target_link_libraries(file_expert_source_test PRIVATE model_qwen4exp_engine)
   basalt_embed_manifest(file_expert_source_test)
   basalt_cpu_test(NAME file_expert_source_test COMMAND file_expert_source_test)
   set_tests_properties(file_expert_source_test PROPERTIES TIMEOUT 60)
@@ -398,7 +317,7 @@ endif()
 # the learned expert profile (--expert-profile-save): its order and file format (CPU only)
 if(BUILD_TESTING)
   add_executable(expert_profile_save_test tests/core/expert_profile_save_test.cpp)
-  target_link_libraries(expert_profile_save_test PRIVATE engine)
+  target_link_libraries(expert_profile_save_test PRIVATE model_qwen4exp_engine)
   basalt_embed_manifest(expert_profile_save_test)
   basalt_cpu_test(NAME expert_profile_save_test COMMAND expert_profile_save_test)
   set_tests_properties(expert_profile_save_test PROPERTIES TIMEOUT 60)
@@ -410,7 +329,7 @@ if(BUILD_TESTING)
   basalt_cpu_test(NAME layout_check_test COMMAND layout_check_test)
   # the expert layout text: real models' layouts and the refusals
   add_executable(expert_layout_test tests/core/expert_layout_test.cpp)
-  target_link_libraries(expert_layout_test PRIVATE engine)
+  target_link_libraries(expert_layout_test PRIVATE model_qwen4exp_engine)
   basalt_cpu_test(NAME expert_layout_test COMMAND expert_layout_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/native_experts)
   set_tests_properties(expert_layout_test PROPERTIES TIMEOUT 60)
   # the conversation cache: retention bookkeeping (header-only), the memory budget, the snapshot's validation (host
@@ -425,12 +344,12 @@ if(BUILD_TESTING)
   target_link_libraries(conversation_memory_test PRIVATE platform)
   basalt_cpu_test(NAME conversation_memory_test COMMAND conversation_memory_test)
   add_executable(conversation_validation_test tests/core/conversation_validation_test.cpp)
-  target_link_libraries(conversation_validation_test PRIVATE engine)
+  target_link_libraries(conversation_validation_test PRIVATE model_qwen4exp_engine)
   basalt_cpu_test(NAME conversation_validation_test COMMAND conversation_validation_test)
   set_tests_properties(conversation_validation_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
   # the disk tier: write, match, cut reads (queued and from the file, in a fresh store), corruption, identity, budget
   add_executable(conversation_store_test tests/core/conversation_store_test.cpp)
-  target_link_libraries(conversation_store_test PRIVATE engine)
+  target_link_libraries(conversation_store_test PRIVATE model_qwen4exp_engine)
   basalt_cpu_test(NAME conversation_store_test COMMAND conversation_store_test)
   set_tests_properties(conversation_store_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
   # The transfer-failure paths are reached by GNU ld's --wrap, which symbolizes the three runtime calls. The Windows
@@ -441,52 +360,52 @@ if(BUILD_TESTING)
     target_compile_definitions(conversation_transfer_test PRIVATE CONVERSATION_TEST_TRANSFERS)
     target_link_options(conversation_transfer_test PRIVATE
       -Wl,--wrap=cudaMemcpy -Wl,--wrap=cudaDeviceSynchronize -Wl,--wrap=cudaGetLastError)
-    target_link_libraries(conversation_transfer_test PRIVATE engine)
+    target_link_libraries(conversation_transfer_test PRIVATE model_qwen4exp_engine)
     basalt_cpu_test(NAME conversation_transfer_test COMMAND conversation_transfer_test)
     set_tests_properties(conversation_transfer_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
   endif()
   add_executable(conversation_snapshot_test tests/core/conversation_snapshot_test.cpp)
-  target_link_libraries(conversation_snapshot_test PRIVATE engine)
+  target_link_libraries(conversation_snapshot_test PRIVATE model_qwen4exp_engine)
   basalt_gpu_test(NAME conversation_snapshot_test COMMAND conversation_snapshot_test)
   set_tests_properties(conversation_snapshot_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   # the prompt-time layer split's state moves (a layer range into a prompt session, back, into a checkpoint)
   add_executable(prompt_split_state_test tests/core/prompt_split_state_test.cpp)
-  target_link_libraries(prompt_split_state_test PRIVATE engine)
+  target_link_libraries(prompt_split_state_test PRIVATE model_qwen4exp_engine)
   basalt_gpu_test(NAME prompt_split_state_test COMMAND prompt_split_state_test)
   set_tests_properties(prompt_split_state_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   # the .basalt reader: table, meta JSON, the GGUF view of the source tensors, the layout text, the hc8 table
   add_executable(model_file_test tests/core/model_file_test.cpp)
-  target_link_libraries(model_file_test PRIVATE engine)
+  target_link_libraries(model_file_test PRIVATE model_qwen4exp_engine)
   basalt_embed_manifest(model_file_test)
   basalt_cpu_test(NAME model_file_test COMMAND model_file_test)
   set_tests_properties(model_file_test PROPERTIES TIMEOUT 60)
   # a PLE key held unquantized in the dense index stays in the arena; a quantized key row loads as before
   add_executable(native_dense_ple_key_test tests/core/native_dense_ple_key_test.cpp)
-  target_link_libraries(native_dense_ple_key_test PRIVATE engine models)
+  target_link_libraries(native_dense_ple_key_test PRIVATE model_qwen4exp_engine models)
   basalt_embed_manifest(native_dense_ple_key_test)
   basalt_gpu_test(NAME native_dense_ple_key_test COMMAND native_dense_ple_key_test)
   set_tests_properties(native_dense_ple_key_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   # per-layer admission on a sized cache starts each layer in its own range
   add_executable(expert_cache_per_layer_test tests/core/expert_cache_per_layer_test.cpp)
-  target_link_libraries(expert_cache_per_layer_test PRIVATE engine)
+  target_link_libraries(expert_cache_per_layer_test PRIVATE model_qwen4exp_engine)
   basalt_gpu_test(NAME expert_cache_per_layer_test COMMAND expert_cache_per_layer_test)
   set_tests_properties(expert_cache_per_layer_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   add_executable(expert_cache_segmented_test tests/core/expert_cache_segmented_test.cpp)
-  target_link_libraries(expert_cache_segmented_test PRIVATE engine)
+  target_link_libraries(expert_cache_segmented_test PRIVATE model_qwen4exp_engine)
   basalt_gpu_test(NAME expert_cache_segmented_test COMMAND expert_cache_segmented_test)
   set_tests_properties(expert_cache_segmented_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   add_executable(file_expert_homes_test tests/core/file_expert_homes_test.cpp)
-  target_link_libraries(file_expert_homes_test PRIVATE engine)
+  target_link_libraries(file_expert_homes_test PRIVATE model_qwen4exp_engine)
   basalt_embed_manifest(file_expert_homes_test)
   basalt_gpu_test(NAME file_expert_homes_test COMMAND file_expert_homes_test)
   set_tests_properties(file_expert_homes_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   add_executable(file_expert_repin_test tests/core/file_expert_repin_test.cpp)
-  target_link_libraries(file_expert_repin_test PRIVATE engine)
+  target_link_libraries(file_expert_repin_test PRIVATE model_qwen4exp_engine)
   basalt_embed_manifest(file_expert_repin_test)
   basalt_gpu_test(NAME file_expert_repin_test COMMAND file_expert_repin_test)
   set_tests_properties(file_expert_repin_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   add_executable(kv_arena_test tests/core/kv_arena_test.cpp)
-  target_link_libraries(kv_arena_test PRIVATE engine)
+  target_link_libraries(kv_arena_test PRIVATE model_qwen4exp_engine)
   basalt_gpu_test(NAME kv_arena_test COMMAND kv_arena_test)
   set_tests_properties(kv_arena_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 endif()
@@ -494,36 +413,6 @@ endif()
 # `basalt` (generate.cpp): the engine program that composes the components into a token.  The prompt arrives as
 # ids, so a tokenizer is never on one side of a logit comparison.
 # The prompt path: batched prompt processing (tensor-core GEMMs through cuBLAS).
-add_library(prefill STATIC src/models/qwen4exp/prefill/gemm.cu src/models/qwen4exp/prefill/kernels.cu src/models/qwen4exp/prefill/gdn_chunked.cu
-  src/models/qwen4exp/prefill/lifecycle.cpp
-  src/models/qwen4exp/prefill/layout.cpp
-  src/models/qwen4exp/prefill/projection.cpp
-  src/models/qwen4exp/prefill/draft_kv.cpp
-  src/models/qwen4exp/prefill/peer.cpp
-  src/models/qwen4exp/prefill/pipeline.cpp
-  src/models/qwen4exp/prefill/statistics.cpp
-  src/models/qwen4exp/prefill/run.cpp
-  src/models/qwen4exp/prefill/inputs.cpp
-  src/models/qwen4exp/prefill/ple.cpp
-  src/models/qwen4exp/prefill/stream.cpp
-  src/models/qwen4exp/prefill/ahead.cpp
-  src/models/qwen4exp/prefill/layer.cpp
-  src/models/qwen4exp/prefill/gdn.cpp
-  src/models/qwen4exp/prefill/qsa.cpp
-  src/models/qwen4exp/prefill/shared_expert.cpp
-  src/models/qwen4exp/prefill/routing.cpp
-  src/models/qwen4exp/prefill/cpu_experts.cpp
-  src/models/qwen4exp/prefill/experts.cpp
-  src/models/qwen4exp/prefill/expert_fused.cpp
-  src/models/qwen4exp/prefill/expert_mmq.cpp
-  src/models/qwen4exp/prefill/expert_fp4.cpp
-  src/models/qwen4exp/prefill/expert_fp16.cpp
-  src/models/qwen4exp/prefill/peer_experts.cpp
-  src/models/qwen4exp/prefill/expert_stream.cpp
-  src/models/qwen4exp/prefill/combine.cpp
-  src/models/qwen4exp/prefill/handoff.cpp)
-target_include_directories(prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_gpu_include_directories})
-target_link_libraries(prefill PUBLIC engine ${_gpu_blas_target} ${_gpu_runtime_target})
 
 add_executable(basalt src/program/generate.cpp src/program/engine_local.cpp src/program/probe_rates.cpp
                        src/program/generate/adapter.cpp
@@ -577,7 +466,7 @@ add_executable(basalt src/program/generate.cpp src/program/engine_local.cpp src/
                        src/program/cli/report.cpp)
 set_target_properties(basalt PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
-target_link_libraries(basalt PRIVATE engine engine_session grammar tokenizer prefill spec models ${_gpu_runtime_target})
+target_link_libraries(basalt PRIVATE model_qwen4exp_engine engine_session grammar tokenizer model_qwen4exp_prefill spec models ${_gpu_runtime_target})
 basalt_embed_manifest(basalt)
 # `basalt serve` runs the Python server from the source tree; the engine reads its expert profiles from data/profiles
 target_compile_definitions(basalt PRIVATE BASALT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -695,7 +584,7 @@ basalt_gpu_test(NAME dequant_s2_parity COMMAND dequant_s2_parity --selftest)
 
 add_executable(s2_gemv_parity tests/models/qwen4exp/kernels/s2_gemv_parity.cpp)
 target_include_directories(s2_gemv_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(s2_gemv_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(s2_gemv_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME s2_gemv_parity COMMAND s2_gemv_parity --selftest)
 
 add_executable(iq_parity tests/kernels/iq_parity.cpp)
@@ -788,54 +677,54 @@ basalt_gpu_test(NAME mmvq_multi_parity COMMAND mmvq_multi_parity)
 # the decode GDN block against the per-stage verify kernels, bitwise (synthetic, GPU, no model; --bench)
 add_executable(dec_gdn_parity tests/models/qwen4exp/kernels/dec_gdn_parity.cpp)
 target_include_directories(dec_gdn_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(dec_gdn_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(dec_gdn_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME dec_gdn_parity COMMAND dec_gdn_parity)
 set_tests_properties(dec_gdn_parity PROPERTIES SKIP_RETURN_CODE 77)
 # a GDN layer split by key-head group across two cards against the whole layer and a CPU reference (synthetic, GPU,
 # no model; --bench)
 add_executable(gdn_head_split_parity tests/models/qwen4exp/kernels/gdn_head_split_parity.cpp)
 target_include_directories(gdn_head_split_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(gdn_head_split_parity PRIVATE kernels artifact ${_gpu_runtime_target})
+target_link_libraries(gdn_head_split_parity PRIVATE model_qwen4exp_kernels artifact ${_gpu_runtime_target})
 basalt_gpu_test(NAME gdn_head_split_parity COMMAND gdn_head_split_parity)
 set_tests_properties(gdn_head_split_parity PROPERTIES SKIP_RETURN_CODE 77)
 # the peer table update by kernel and the counter zeroing against the span copy and memset they replace, bitwise
 # (GPU, synthetic, no model; --bench times each behind a burst of expert copies on another stream)
 add_executable(dm_table_put_parity tests/models/qwen4exp/kernels/dm_table_put_parity.cpp)
 target_include_directories(dm_table_put_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(dm_table_put_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(dm_table_put_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME dm_table_put_parity COMMAND dm_table_put_parity)
 set_tests_properties(dm_table_put_parity PROPERTIES SKIP_RETURN_CODE 77)
 # the route tail skip against a plain CPU rule: which entries it drops over random windows, tables and ranks (GPU, synthetic,
 # no model; --bench times the window kernel)
 add_executable(route_tail_skip_parity tests/models/qwen4exp/kernels/route_tail_skip_parity.cpp)
 target_include_directories(route_tail_skip_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(route_tail_skip_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(route_tail_skip_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME route_tail_skip_parity COMMAND route_tail_skip_parity)
 set_tests_properties(route_tail_skip_parity PROPERTIES SKIP_RETURN_CODE 77)
 # the residency-biased router against native_router (lambda 0, bitwise) and a double-precision CPU rule (GPU, synthetic,
 # no model; --bench times it beside the native router)
 add_executable(route_prior_parity tests/models/qwen4exp/kernels/route_prior_parity.cpp)
 target_include_directories(route_prior_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(route_prior_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(route_prior_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME route_prior_parity COMMAND route_prior_parity)
 set_tests_properties(route_prior_parity PROPERTIES SKIP_RETURN_CODE 77)
 # the overlapped windows kernels: the list copy of a stage snapshot against a CPU copy, and the flag raised behind a
 # stream writes (GPU, synthetic, no model; --bench)
 add_executable(pair_snapshot_parity tests/models/qwen4exp/kernels/pair_snapshot_parity.cpp)
 target_include_directories(pair_snapshot_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(pair_snapshot_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(pair_snapshot_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME pair_snapshot_parity COMMAND pair_snapshot_parity)
 set_tests_properties(pair_snapshot_parity PROPERTIES SKIP_RETURN_CODE 77)
 # dense_tc (DEC_DTC) against native_mmvq: its columns' T contract bitwise, its error vs the dp4a kernels
 add_executable(dense_tc_parity tests/models/qwen4exp/kernels/dense_tc_parity.cpp)
 target_include_directories(dense_tc_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(dense_tc_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(dense_tc_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME dense_tc_parity COMMAND dense_tc_parity)
 set_tests_properties(dense_tc_parity PROPERTIES SKIP_RETURN_CODE 77)
 # the DEC_COMMIT launches against the commit graph's per-layer calls, bitwise (synthetic, GPU; --bench)
 add_executable(dec_commit_parity tests/models/qwen4exp/kernels/dec_commit_parity.cpp)
 target_include_directories(dec_commit_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(dec_commit_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(dec_commit_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME dec_commit_parity COMMAND dec_commit_parity)
 basalt_gpu_test(NAME dec_commit_finisher COMMAND dec_commit_parity --finisher)
 basalt_gpu_test(NAME dec_commit_lazy COMMAND dec_commit_parity --lazy)
@@ -848,41 +737,41 @@ basalt_gpu_test(NAME iq_multi_parity COMMAND iq_multi_parity)
 # the prompt path's chunked DeltaNet recurrence against the token-serial kernel before it and a double-precision
 # CPU reference, output and state (GPU, synthetic, no model; --bench adds timings)
 add_executable(gdn_chunk_parity tests/models/qwen4exp/prefill/gdn_chunk_parity.cu)
-target_link_libraries(gdn_chunk_parity PRIVATE prefill ${_gpu_runtime_target})
+target_link_libraries(gdn_chunk_parity PRIVATE model_qwen4exp_prefill ${_gpu_runtime_target})
 target_include_directories(gdn_chunk_parity PRIVATE ${CMAKE_SOURCE_DIR}/include)
 basalt_gpu_test(NAME gdn_chunk_parity COMMAND gdn_chunk_parity)
 # the hyper-connection reads and prompt-path products on matrices held only as 8-bit copies
 # against the bf16 ones (GPU, synthetic, no model; --bench adds timings)
 add_executable(hc8_parity tests/models/qwen4exp/kernels/hc8_parity.cpp)
 target_include_directories(hc8_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(hc8_parity PRIVATE prefill kernels ${_gpu_runtime_target})
+target_link_libraries(hc8_parity PRIVATE model_qwen4exp_prefill model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME hc8_parity COMMAND hc8_parity)
 # native_expert_grouped's group stride and fused SwiGLU + q8_1, bitwise vs the launches before them (GPU, synthetic,
 # no model; --bench adds v1/new timings of a window's 48 calls in a graph)
 add_executable(native_grouped_parity tests/models/qwen4exp/kernels/native_grouped_parity.cpp)
 target_include_directories(native_grouped_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(native_grouped_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(native_grouped_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME native_grouped_parity COMMAND native_grouped_parity)
 # dec_moe_glue (plan built inside, gate/up pair kernel, SwiGLU, down) bitwise vs native_expert_grouped, every covered pair
 basalt_gpu_test(NAME native_grouped_parity_glue COMMAND native_grouped_parity --glue)
 set_tests_properties(native_grouped_parity_glue PROPERTIES TIMEOUT 300)
 add_executable(shared_expert_parity tests/models/qwen4exp/kernels/shared_expert_parity.cpp)
 target_include_directories(shared_expert_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(shared_expert_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(shared_expert_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME shared_expert_parity COMMAND shared_expert_parity --selftest)
 
 # the MoE half of a decode layer: the engine's launch sequence against the persistent experts kernel (GPU, synthetic)
 add_executable(pk_moe_bench tests/models/qwen4exp/kernels/pk_moe_bench.cpp)
 target_include_directories(pk_moe_bench PRIVATE ${_gpu_include_directories})
-target_link_libraries(pk_moe_bench PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(pk_moe_bench PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 
 add_executable(hc_fused_parity tests/models/qwen4exp/kernels/hc_fused_parity.cpp)
 target_include_directories(hc_fused_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(hc_fused_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(hc_fused_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME hc_fused_parity COMMAND hc_fused_parity 20 1 8 --check-only --stress 200)
 add_executable(mid_chain_parity tests/models/qwen4exp/kernels/mid_chain_parity.cpp)
 target_include_directories(mid_chain_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(mid_chain_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(mid_chain_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME mid_chain_parity COMMAND mid_chain_parity 20)
 set_tests_properties(mid_chain_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 # mid_chain with one SM held (mid_chain_parity --hold), built with a short wait bound: below it the launch waits for the
@@ -890,28 +779,28 @@ set_tests_properties(mid_chain_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600
 add_executable(mid_chain_hold tests/models/qwen4exp/kernels/mid_chain_parity.cpp src/models/qwen4exp/kernels/mid_chain.cu)
 target_include_directories(mid_chain_hold PRIVATE ${_gpu_include_directories})
 target_compile_definitions(mid_chain_hold PRIVATE MKB_NS=200000000ull)
-target_link_libraries(mid_chain_hold PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(mid_chain_hold PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME mid_chain_hold COMMAND mid_chain_hold 1 --hold 50)
 basalt_gpu_test(NAME mid_chain_hold_abort COMMAND mid_chain_hold 1 --hold 600)
 set_tests_properties(mid_chain_hold mid_chain_hold_abort PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 add_executable(qsa_mid_parity tests/models/qwen4exp/kernels/qsa_mid_parity.cpp)
 target_include_directories(qsa_mid_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(qsa_mid_parity PRIVATE kernels ggml_quants ${_gpu_runtime_target})
+target_link_libraries(qsa_mid_parity PRIVATE model_qwen4exp_kernels ggml_quants ${_gpu_runtime_target})
 basalt_gpu_test(NAME qsa_mid_parity COMMAND qsa_mid_parity)
 set_tests_properties(qsa_mid_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 add_executable(gr_parity tests/models/qwen4exp/kernels/gr_parity.cpp)
 target_include_directories(gr_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(gr_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(gr_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME gr_parity COMMAND gr_parity --selftest)
 
 add_executable(gdn_parity tests/models/qwen4exp/kernels/gdn_parity.cpp)
 target_include_directories(gdn_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(gdn_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(gdn_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME gdn_parity COMMAND gdn_parity --selftest)
 
 add_executable(s2_gemv_q8_parity tests/models/qwen4exp/kernels/s2_gemv_q8_parity.cpp)
 target_include_directories(s2_gemv_q8_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(s2_gemv_q8_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(s2_gemv_q8_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME s2_gemv_q8_parity COMMAND s2_gemv_q8_parity --selftest)
 
 add_executable(sampler_parity tests/kernels/sampler_parity.cpp)
@@ -923,12 +812,12 @@ basalt_gpu_test(NAME sampler_split_parity COMMAND sampler_parity --split)
 # captured in a graph too (GPU, synthetic, no model; skips without cluster support); --bench: per-call times
 add_executable(decode_cluster_parity tests/models/qwen4exp/kernels/decode_cluster_parity.cpp)
 target_include_directories(decode_cluster_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(decode_cluster_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(decode_cluster_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME decode_cluster_parity COMMAND decode_cluster_parity --selftest)
 
 add_executable(rope_parity tests/models/qwen4exp/kernels/rope_parity.cpp)
 target_include_directories(rope_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(rope_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(rope_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME rope_parity COMMAND rope_parity --selftest)
 
 add_executable(quantize_act_parity tests/kernels/quantize_act_parity.cpp)
@@ -939,17 +828,17 @@ basalt_gpu_test(NAME quantize_act_parity COMMAND quantize_act_parity --selftest)
 # the verify window's routing in one multi-column BF16 projection + one top-k, bitwise the per-token calls
 add_executable(route_window_parity tests/models/qwen4exp/kernels/route_window_parity.cpp)
 target_include_directories(route_window_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(route_window_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(route_window_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME route_window_parity COMMAND route_window_parity)
 
 add_executable(router_top10_parity tests/models/qwen4exp/kernels/router_top10_parity.cpp)
 target_include_directories(router_top10_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(router_top10_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(router_top10_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME router_top10_parity COMMAND router_top10_parity --selftest)
 
 add_executable(s_gemv_parity tests/models/qwen4exp/kernels/s_gemv_parity.cpp)
 target_include_directories(s_gemv_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(s_gemv_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(s_gemv_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME s_gemv_parity COMMAND s_gemv_parity --selftest)
 
 add_executable(elementwise_parity tests/kernels/elementwise_parity.cpp)
@@ -964,26 +853,26 @@ basalt_gpu_test(NAME bf16_gemv_parity COMMAND bf16_gemv_parity --selftest)
 
 add_executable(s_gemv_q8k_parity tests/models/qwen4exp/kernels/s_gemv_q8k_parity.cpp)
 target_include_directories(s_gemv_q8k_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(s_gemv_q8k_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(s_gemv_q8k_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME s_gemv_q8k_parity COMMAND s_gemv_q8k_parity --selftest)
 
 add_executable(qsa_parity tests/models/qwen4exp/kernels/qsa_parity.cpp)
 target_include_directories(qsa_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(qsa_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(qsa_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME qsa_parity COMMAND qsa_parity --selftest)
 
 # the QSA top-k the engine dispatches against the original kernel: identical ids on both sides of the register
 # kernel's reach, with tied and with equal scores (synthetic, no model)
 add_executable(qsa_scores_parity tests/models/qwen4exp/kernels/qsa_scores_parity.cpp)
 target_include_directories(qsa_scores_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(qsa_scores_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(qsa_scores_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME qsa_scores_parity COMMAND qsa_scores_parity 20)
 add_executable(dequant_f16_parity tests/kernels/dequant_f16_parity.cpp)
 target_include_directories(dequant_f16_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(dequant_f16_parity PRIVATE kernels artifact ${_gpu_runtime_target})
 add_executable(qsa_topk_parity tests/models/qwen4exp/kernels/qsa_topk_parity.cpp)
 target_include_directories(qsa_topk_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(qsa_topk_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(qsa_topk_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME qsa_topk_parity COMMAND qsa_topk_parity --selftest)
 
 # ---- the PLE n-gram hash, the IQ4_NL table read, and the PLE block ----
@@ -996,7 +885,7 @@ basalt_gpu_test(NAME qsa_topk_parity COMMAND qsa_topk_parity --selftest)
 # re-learning.
 add_executable(ple_parity tests/models/qwen4exp/kernels/ple_parity.cpp)
 target_include_directories(ple_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(ple_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(ple_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 set(PLE_FIXTURE_DIR "" CACHE PATH "Directory containing the ple_in.bin and ple_out.bin parity fixtures")
 if(PLE_FIXTURE_DIR)
   basalt_gpu_test(NAME ple_parity COMMAND ple_parity --selftest
@@ -1007,77 +896,77 @@ endif()
 # INT8 KV storage vs a host reference and vs the FP16 path (GPU, synthetic, no model).
 add_executable(kv_q8_parity tests/models/qwen4exp/kernels/kv_q8_parity.cpp)
 target_include_directories(kv_q8_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(kv_q8_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(kv_q8_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME kv_q8_parity COMMAND kv_q8_parity)
 
 # Decode attention for a few queries vs qsa_decode_attn_batch + the gate, bitwise (GPU, synthetic, no model).
 add_executable(qsa_dec_attn_parity tests/models/qwen4exp/kernels/qsa_dec_attn_parity.cpp)
 target_include_directories(qsa_dec_attn_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(qsa_dec_attn_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(qsa_dec_attn_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME qsa_dec_attn_parity COMMAND qsa_dec_attn_parity 20)
 add_executable(qsa_dec_fused_parity tests/models/qwen4exp/kernels/qsa_dec_fused_parity.cpp)
 target_include_directories(qsa_dec_fused_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(qsa_dec_fused_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(qsa_dec_fused_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME qsa_dec_fused_parity COMMAND qsa_dec_fused_parity 20)
 add_executable(qsa_seg_parity tests/models/qwen4exp/kernels/qsa_seg_parity.cpp)
 target_include_directories(qsa_seg_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(qsa_seg_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(qsa_seg_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME qsa_seg_parity COMMAND qsa_seg_parity 20)
 add_executable(ple_win_parity tests/models/qwen4exp/kernels/ple_win_parity.cpp)
 target_include_directories(ple_win_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(ple_win_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(ple_win_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME ple_win_parity COMMAND ple_win_parity 20)
 add_executable(ple_key_rows_parity tests/models/qwen4exp/kernels/ple_key_rows_parity.cpp)
 target_include_directories(ple_key_rows_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(ple_key_rows_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(ple_key_rows_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME ple_key_rows_parity COMMAND ple_key_rows_parity 20)
 add_executable(q5k_head_parity tests/models/qwen4exp/kernels/q5k_head_parity.cpp)
 target_include_directories(q5k_head_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(q5k_head_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(q5k_head_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME q5k_head_parity COMMAND q5k_head_parity 20000 5)
 add_executable(q80_proxy_parity tests/models/qwen4exp/kernels/q80_proxy_parity.cpp)
 target_include_directories(q80_proxy_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(q80_proxy_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(q80_proxy_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME q80_proxy_parity COMMAND q80_proxy_parity 100000 200)
 add_executable(q80_vhead_parity tests/models/qwen4exp/kernels/q80_vhead_parity.cpp)
 target_include_directories(q80_vhead_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(q80_vhead_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(q80_vhead_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME q80_vhead_parity COMMAND q80_vhead_parity 20000 3)
 add_executable(q6k_head_parity tests/models/qwen4exp/kernels/q6k_head_parity.cpp)
 target_include_directories(q6k_head_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(q6k_head_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(q6k_head_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME q6k_head_parity COMMAND q6k_head_parity 20000 5)
 add_executable(q6k_vhead_parity tests/models/qwen4exp/kernels/q6k_vhead_parity.cpp)
 target_include_directories(q6k_vhead_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(q6k_vhead_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(q6k_vhead_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME q6k_vhead_parity COMMAND q6k_vhead_parity 65536 5)
 
 # KV streaming: streamed vs resident attention, bitwise (GPU, synthetic, no model).
 add_executable(kv_stream_parity tests/models/qwen4exp/kernels/kv_stream_parity.cpp)
 target_include_directories(kv_stream_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(kv_stream_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(kv_stream_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME kv_stream_parity COMMAND kv_stream_parity)
 
 # the hybrid K8V4 KV (INT8 K + rotated Q4_0 V) vs host references (GPU, synthetic, no model).
 add_executable(kv_hybrid_parity tests/models/qwen4exp/kernels/kv_hybrid_parity.cpp)
 target_include_directories(kv_hybrid_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(kv_hybrid_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(kv_hybrid_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME kv_hybrid_parity COMMAND kv_hybrid_parity)
 # Q4_0 KV with Walsh-Hadamard rotation vs a host reference (GPU, synthetic, no model).
 add_executable(kv_q4_parity tests/models/qwen4exp/kernels/kv_q4_parity.cpp)
 target_include_directories(kv_q4_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(kv_q4_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(kv_q4_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME kv_q4_parity COMMAND kv_q4_parity)
 add_executable(cvec_parity tests/models/qwen4exp/kernels/cvec_parity.cpp)
 target_include_directories(cvec_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(cvec_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(cvec_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME cvec_parity COMMAND cvec_parity)
 
 # The rewritten per-hit and grouped expert kernels vs the previous ones, bitwise (GPU, synthetic, no model).
 # `--bench` adds previous/new timings on engine-like shapes.
 add_executable(s2_expert_grouped_parity tests/models/qwen4exp/kernels/s2_expert_grouped_parity.cpp)
 target_include_directories(s2_expert_grouped_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(s2_expert_grouped_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(s2_expert_grouped_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME s2_expert_grouped_parity COMMAND s2_expert_grouped_parity --selftest)
 
 # working-set lock of a host region (CPU only).
@@ -1378,13 +1267,13 @@ if(MSVC)
   target_compile_options(mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
 endif()
 target_link_libraries(mmq PUBLIC ggml_quants ${_gpu_runtime_target})
-target_link_libraries(prefill PUBLIC mmq)
+target_link_libraries(model_qwen4exp_prefill PUBLIC mmq)
 # the FP4 block-scaled tensor-core experts (need the a-variant of the architecture)
 add_library(fp4 STATIC src/models/qwen4exp/prefill/fp4/moe_fp4.cu)
 set_target_properties(fp4 PROPERTIES CUDA_ARCHITECTURES 120a-real)
 target_include_directories(fp4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(fp4 PUBLIC mmq ${_gpu_runtime_target})
-target_link_libraries(prefill PUBLIC fp4)
+target_link_libraries(model_qwen4exp_prefill PUBLIC fp4)
 if(BUILD_TESTING)
   # the fused int8 experts against a double-precision reference and the MMQ path (exit 77 without int8 tensor cores)
   add_executable(prefill_fused_moe_test tests/models/qwen4exp/prefill/prefill_fused_moe_test.cpp)
@@ -1403,23 +1292,23 @@ if(BUILD_TESTING)
   set_tests_properties(prefill_cpu_share_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
   # the prompt path's routed-entry histogram against a host count
   add_executable(prefill_route_count_test tests/models/qwen4exp/prefill/prefill_route_count_test.cpp)
-  target_link_libraries(prefill_route_count_test PRIVATE prefill ${_gpu_runtime_target})
+  target_link_libraries(prefill_route_count_test PRIVATE model_qwen4exp_prefill ${_gpu_runtime_target})
   basalt_gpu_test(NAME prefill_route_count_test COMMAND prefill_route_count_test)
   set_tests_properties(prefill_route_count_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   # the prompt path's buffer layout against its sizing (no device memory), once per expert layout
   add_executable(prefill_layout_test tests/models/qwen4exp/prefill/prefill_layout_test.cpp)
-  target_link_libraries(prefill_layout_test PRIVATE prefill ${_gpu_runtime_target})
+  target_link_libraries(prefill_layout_test PRIVATE model_qwen4exp_prefill ${_gpu_runtime_target})
   foreach(_mode nvfp4 mixed kquant q2)
     basalt_gpu_test(NAME prefill_layout_${_mode} COMMAND prefill_layout_test ${_mode})
     set_tests_properties(prefill_layout_${_mode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   endforeach()
   # MMQ for the K-quant experts against the FP16 dequant + cuBLAS path and a double-precision reference (--bench: timings)
   add_executable(prefill_mmq_iq1s_test tests/cuda/prefill_mmq_iq1s_test.cpp)
-  target_link_libraries(prefill_mmq_iq1s_test PRIVATE prefill mmq kernels ${_gpu_runtime_target})
+  target_link_libraries(prefill_mmq_iq1s_test PRIVATE model_qwen4exp_prefill mmq kernels ${_gpu_runtime_target})
   basalt_gpu_test(NAME prefill_mmq_iq1s_test COMMAND prefill_mmq_iq1s_test)
   set_tests_properties(prefill_mmq_iq1s_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
   add_executable(prefill_mmq_kq_test tests/models/qwen4exp/prefill/prefill_mmq_kq_test.cpp)
-  target_link_libraries(prefill_mmq_kq_test PRIVATE prefill mmq kernels ${_gpu_runtime_target})
+  target_link_libraries(prefill_mmq_kq_test PRIVATE model_qwen4exp_prefill mmq model_qwen4exp_kernels ${_gpu_runtime_target})
   basalt_gpu_test(NAME prefill_mmq_kq_test COMMAND prefill_mmq_kq_test)
   set_tests_properties(prefill_mmq_kq_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 endif()
@@ -1442,7 +1331,7 @@ endif()
 if(BUILD_TESTING)
   # the hc up product fused with the mix against cuBLAS + gr_mix_r (bitwise) and a double-precision reference
   add_executable(prefill_hc_up_mix_test tests/models/qwen4exp/prefill/prefill_hc_up_mix_test.cpp)
-  target_link_libraries(prefill_hc_up_mix_test PRIVATE prefill kernels ${_gpu_runtime_target})
+  target_link_libraries(prefill_hc_up_mix_test PRIVATE model_qwen4exp_prefill model_qwen4exp_kernels ${_gpu_runtime_target})
   basalt_gpu_test(NAME prefill_hc_up_mix_test COMMAND prefill_hc_up_mix_test --no-bench)
   set_tests_properties(prefill_hc_up_mix_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   add_executable(prefill_fp4_test tests/models/qwen4exp/prefill/prefill_fp4_test.cpp)
@@ -1463,7 +1352,7 @@ target_compile_definitions(iq1s_parity PRIVATE BASALT_IQ1S_GPU)
 target_link_libraries(iq1s_parity PRIVATE kernels kernels_cpu ${_gpu_runtime_target})
 add_executable(ds41_peer_parity tests/kernels/ds41_peer_parity.cpp src/models/deepseek41/peer_tier.cpp)
 target_include_directories(ds41_peer_parity PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(ds41_peer_parity PRIVATE engine kernels kernels_cpu core ${_gpu_runtime_target})
+target_link_libraries(ds41_peer_parity PRIVATE model_qwen4exp_engine kernels kernels_cpu core ${_gpu_runtime_target})
 basalt_gpu_test(NAME ds41_peer_parity COMMAND ds41_peer_parity)
 basalt_gpu_test(NAME iq1s_parity COMMAND iq1s_parity)
 set_tests_properties(iq1s_parity PROPERTIES TIMEOUT 300)
@@ -1471,7 +1360,7 @@ basalt_cpu_test(NAME iq1s_parity_cpu COMMAND iq1s_parity --cpu)
 # DEC_MOE's kernels on real GGUF experts, bitwise vs the path they replace (--bench: timings)
 add_executable(dec_moe_parity tests/models/qwen4exp/kernels/dec_moe_parity.cpp)
 target_include_directories(dec_moe_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(dec_moe_parity PRIVATE kernels artifact ${_gpu_runtime_target})
+target_link_libraries(dec_moe_parity PRIVATE model_qwen4exp_kernels artifact ${_gpu_runtime_target})
 basalt_gpu_test(NAME dec_moe_parity_nvfp4 COMMAND dec_moe_parity --nvfp4)   # synthetic experts: no GGUF needed
 basalt_gpu_test(NAME dec_moe_parity_kq COMMAND dec_moe_parity --kq)   # synthetic K-quant experts at the real geometry (Q5_K and Q6_K gate/up, Q8_0 down)
 if(BUILD_TESTING)
