@@ -9,7 +9,7 @@
 #include "basalt/kernels/qsa.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
 #include "basalt/kernels/dec_moe.hpp"
-#include "basalt/kernels/fused_gr.hpp"
+#include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
 #include <string>
 #include <vector>
 

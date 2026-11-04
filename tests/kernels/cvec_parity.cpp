@@ -6,7 +6,7 @@
 //   4. a layer without a direction is untouched.
 
 #include "basalt/kernels/cvec.hpp"
-#include "basalt/kernels/fused_gr.hpp"
+#include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
 
 #include <cuda_runtime.h>
 

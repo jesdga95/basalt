@@ -11,7 +11,7 @@
 //   3. --bench: the read's time (weights cold in L2) and the products' time against the bf16 ones.
 //
 //     build/hc8_parity [--bench]
-#include "basalt/kernels/fused_gr.hpp"
+#include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
 #include "basalt/kernels/gr.hpp"
 #include "basalt/kernels/hc_fused.hpp"
 #include "basalt/prefill/gemm.hpp"

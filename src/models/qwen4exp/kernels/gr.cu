@@ -1,4 +1,4 @@
-// src/kernels/cuda/gr.cu - the gated residual / hyper-connection, `gr_read` and `gr_write`.
+// src/models/qwen4exp/kernels/gr.cu - the gated residual / hyper-connection, `gr_read` and `gr_write`.
 //
 // See include/basalt/kernels/gr.hpp for the semantics and for why the weights are bf16.
 //
@@ -12,9 +12,9 @@
 // with no permutation at all.
 #include "basalt/kernels/gr.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
-#include "basalt/kernels/fused_gr.hpp"
-#include "basalt/kernels/native_gr_norm.hpp"
-#include "basalt/kernels/native_gr_postops.hpp"
+#include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
+#include "basalt/models/qwen4exp/kernels/native_gr_norm.hpp"
+#include "basalt/models/qwen4exp/kernels/native_gr_postops.hpp"
 
 #include <cuda_runtime.h>
 

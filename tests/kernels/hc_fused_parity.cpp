@@ -11,7 +11,7 @@
 // --tol prints every case's differences against the plain kernels, not only the failing ones.
 #include "basalt/core/diag.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
-#include "basalt/kernels/fused_gr.hpp"
+#include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
 #include "basalt/kernels/hc_fused.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/native_router.hpp"

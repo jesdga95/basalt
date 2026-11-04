@@ -1,4 +1,4 @@
-// src/kernels/cuda/dense_tc.cu - see include/basalt/kernels/dense_tc.hpp.
+// src/models/qwen4exp/kernels/dense_tc.cu - see include/basalt/models/qwen4exp/kernels/dense_tc.hpp.
 //
 // A tile is 16 MT rows; its 512-value chunks (two super-blocks of each row) are one ring slot each.  Warp w of a
 // tile takes m-tile (w / 4) % MT (16 rows) and half super-block w % 4 of every chunk (4 blocks of 32 values, whose
@@ -11,7 +11,7 @@
 // Persistent: block b takes tiles b, b + G, ...; their chunks stream through one ring of S slots (16-byte cp.async
 // per thread, issued S - 1 chunks ahead across tile boundaries, the first ones before the grid dependency wait:
 // weights are constant).  The q8_1 columns are read through L1.
-#include "basalt/kernels/dense_tc.hpp"
+#include "basalt/models/qwen4exp/kernels/dense_tc.hpp"
 #include "basalt/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>

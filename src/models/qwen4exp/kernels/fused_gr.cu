@@ -1,9 +1,9 @@
-// src/kernels/cuda/fused_gr.cu - see include/basalt/kernels/fused_gr.hpp.
-#include "basalt/kernels/fused_gr.hpp"
+// src/models/qwen4exp/kernels/fused_gr.cu - see include/basalt/models/qwen4exp/kernels/fused_gr.hpp.
+#include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
 #include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
-#include "smem_opt_in.cuh"
+#include "../../../kernels/cuda/smem_opt_in.cuh"
 
 #include <cuda_runtime.h>
 

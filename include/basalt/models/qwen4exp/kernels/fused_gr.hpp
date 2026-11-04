@@ -1,4 +1,4 @@
-// include/basalt/kernels/fused_gr.hpp - the hyper-connection read in TWO kernels, with the
+// include/basalt/models/qwen4exp/kernels/fused_gr.hpp - the hyper-connection read in TWO kernels, with the
 // previous half's write folded in.
 //
 // The native path spends six kernels per `gr_read` (norm, down MMVF, silu, up MMVF, gate+mean, inject MMVF) and

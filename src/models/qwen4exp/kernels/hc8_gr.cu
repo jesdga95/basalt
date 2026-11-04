@@ -1,4 +1,4 @@
-// src/kernels/cuda/hc8_gr.cu - the hyper-connection read on the matrices' 8-bit copies (int8, one f16 scale per 32
+// src/models/qwen4exp/kernels/hc8_gr.cu - the hyper-connection read on the matrices' 8-bit copies (int8, one f16 scale per 32
 // values of a row; hc_fused.hpp) for every caller that does not run hc_fused_read: fused_gr_read, fused_gr_read_multi
 // and gr_read hand such matrices here.  Three kernels:
 //
@@ -7,7 +7,7 @@
 //   up   : mixed[d] = mean_c xn[c,d] * sigmoid(q_up[c*n_embd + d] . lo)
 //
 // Every token's values come from the same operations in the same order whatever the token count.
-#include "basalt/kernels/fused_gr.hpp"
+#include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
 #include "basalt/kernels/hc_fused.hpp"
 
 #include <cuda_fp16.h>

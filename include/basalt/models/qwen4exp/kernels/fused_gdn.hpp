@@ -1,4 +1,4 @@
-// include/basalt/kernels/fused_gdn.hpp - the gated delta-net step and its output norm in ONE kernel.
+// include/basalt/models/qwen4exp/kernels/fused_gdn.hpp - the gated delta-net step and its output norm in ONE kernel.
 //
 // The native step (after llama.cpp's gated_delta_net.cu) gives each warp one (head, column) and strides its 32
 // lanes over the 128 ROWS of the state, which is stored `[row][head][col]`: every lane's load is 24.5 KB from its

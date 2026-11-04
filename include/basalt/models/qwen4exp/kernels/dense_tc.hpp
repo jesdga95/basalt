@@ -1,4 +1,4 @@
-// include/basalt/kernels/dense_tc.hpp - dense projections of a verify window on int8 tensor cores.
+// include/basalt/models/qwen4exp/kernels/dense_tc.hpp - dense projections of a verify window on int8 tensor cores.
 //
 // y[c][r] = sum over the row's 32-value blocks of the format's float term on the block's exact integer dot with
 // column c's q8_1 codes (mma.sync, 16 rows x 8 columns per tile).  Terms per block:

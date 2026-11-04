@@ -1,10 +1,10 @@
-// src/kernels/cuda/qsa_mid.cu - see include/basalt/kernels/qsa_mid.hpp.
+// src/models/qwen4exp/kernels/qsa_mid.cu - see include/basalt/kernels/qsa_mid.hpp.
 //
 // Its own translation unit: dense_tc.cu's device code without its host side.  Built WITHOUT fast math, like it.
 #define FZ_DEV_ONLY
 #include "dense_tc.cu"
 #include "basalt/kernels/qsa_mid.hpp"
-#include "smem_opt_in.cuh"
+#include "../../../kernels/cuda/smem_opt_in.cuh"
 
 #include <atomic>
 #include <cstdint>

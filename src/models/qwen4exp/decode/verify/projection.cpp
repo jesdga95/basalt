@@ -1,6 +1,6 @@
 #include "common.hpp"
 #include "basalt/core/verify.hpp"
-#include "basalt/kernels/dense_tc.hpp"
+#include "basalt/models/qwen4exp/kernels/dense_tc.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include <cmath>

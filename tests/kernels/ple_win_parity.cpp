@@ -2,7 +2,7 @@
 // ple_block_projected, ple_history_advance, the history copy), bitwise, for windows of 1..7 rows; then both forms
 // captured as graphs and timed at T = 1..4.
 //   ple_win_parity [iters]
-#include "basalt/kernels/native_gr_postops.hpp"
+#include "basalt/models/qwen4exp/kernels/native_gr_postops.hpp"
 #include "basalt/kernels/native_ple_postops.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/kernels/ple.hpp"
