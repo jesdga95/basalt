@@ -7,7 +7,7 @@
 #include "basalt/core/native_head.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
 #include "basalt/core/peer_experts.hpp"
-#include "basalt/prefill/kernels.hpp"
+#include "basalt/models/qwen4exp/prefill/kernels.hpp"
 #include <algorithm>
 #include <future>
 

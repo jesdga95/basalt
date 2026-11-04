@@ -7,7 +7,7 @@
 #include "basalt/kernels/verify_kernels.hpp"
 #include "basalt/prefill/gemm.hpp"
 #include "basalt/core/peer_experts.hpp"
-#include "basalt/prefill/kernels.hpp"
+#include "basalt/models/qwen4exp/prefill/kernels.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>
 #include <exception>

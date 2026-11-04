@@ -4,7 +4,7 @@
 #include "basalt/core/progress.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
-#include "basalt/prefill/moe_fp4.hpp"
+#include "basalt/models/qwen4exp/prefill/moe_fp4.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>

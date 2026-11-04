@@ -1,9 +1,9 @@
-// src/prefill/fp4/moe_fp4.cu - see include/basalt/prefill/moe_fp4.hpp.
+// src/models/qwen4exp/prefill/fp4/moe_fp4.cu - see include/basalt/models/qwen4exp/prefill/moe_fp4.hpp.
 // The block-scaled MMA wrapper and the tile structure (64-token tiles x 128 weight rows, eight warps, activation
 // fragments through ldmatrix, scale registers per 64-wide K step) follow Infernix's grouped NVFP4 GEMM
 // (src/ops/offloaded_sparse_moe/cuda/wide_expert.cuh, src/ops/common/mma.cuh).
 // Adapted from Infernix (Ian Ranson and contributors), Apache-2.0: see THIRD_PARTY_LICENSES.
-#include "basalt/prefill/moe_fp4.hpp"
+#include "basalt/models/qwen4exp/prefill/moe_fp4.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>

@@ -1,12 +1,12 @@
-// src/prefill/gdn_chunked.cu - the prompt path's gated delta rule (gdn_recurrence in
-// include/basalt/prefill/kernels.hpp), in chunks of 16 tokens on the tensor cores.
+// src/models/qwen4exp/prefill/gdn_chunked.cu - the prompt path's gated delta rule (gdn_recurrence in
+// include/basalt/models/qwen4exp/prefill/kernels.hpp), in chunks of 16 tokens on the tensor cores.
 // Per chunk and value head, gdn_prepare_kernel builds the L2-normalized BF16 q/k packet, the within-chunk solve
 // (I + L)^-1 diag(beta), the decayed q.k products and the cumulative decays; gdn_chunk_kernel then carries the FP32
 // state across the chunks: prediction K S and history Q S (TF32 / BF16 MMA), the residual through the solve, the
 // output, and S = decay S + K^T diag(suffix) Delta.
 // Adapted from Infernix (Ian Ranson and contributors), src/ops/linear_attention/gated_delta_net/chunked/,
 // Apache-2.0: see THIRD_PARTY_LICENSES.
-#include "basalt/prefill/kernels.hpp"
+#include "basalt/models/qwen4exp/prefill/kernels.hpp"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>

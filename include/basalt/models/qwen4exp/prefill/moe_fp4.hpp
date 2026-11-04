@@ -1,4 +1,4 @@
-// include/basalt/prefill/moe_fp4.hpp - the prompt path's NVFP4 experts on the FP4 block-scaled tensor cores.
+// include/basalt/models/qwen4exp/prefill/moe_fp4.hpp - the prompt path's NVFP4 experts on the FP4 block-scaled tensor cores.
 // Weights stay in the pack's NVFP4 blocks (read in place from each expert's blob); activations are rounded to FP4
 // codes with a UE4M3 scale per 16 values and one FP32 scale per token (W4A4).  A layer's input is rounded once per
 // token (token planes: the gate/up product reads each row's token); H is laid out per 64-token tile of one expert

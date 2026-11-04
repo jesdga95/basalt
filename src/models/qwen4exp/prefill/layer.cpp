@@ -4,7 +4,7 @@
 #include "basalt/core/progress.hpp"
 #include "basalt/core/layout.hpp"
 #include "basalt/kernels/cvec.hpp"
-#include "basalt/prefill/kernels.hpp"
+#include "basalt/models/qwen4exp/prefill/kernels.hpp"
 #include <algorithm>
 #include <string>
 

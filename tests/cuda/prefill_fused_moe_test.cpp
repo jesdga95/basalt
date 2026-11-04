@@ -9,7 +9,7 @@
 // tiles - an all-zero token, per-expert blobs at unrelated addresses, three launches of different expert ranges.
 // Part 2 (timing): one layer at a real chunk (2048 tokens, 512 experts, top 10) on both paths, with their agreement.
 // Exit 77 without a CUDA device with int8 tensor cores.
-#include "basalt/prefill/moe_fused.hpp"
+#include "basalt/models/qwen4exp/prefill/moe_fused.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 
 #include "basalt/ggml/ggml.h"

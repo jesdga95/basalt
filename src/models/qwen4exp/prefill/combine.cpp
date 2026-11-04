@@ -2,7 +2,7 @@
 #include "basalt/prefill/prefill.hpp"
 #include "basalt/core/mtp.hpp"
 #include "basalt/core/peer_experts.hpp"
-#include "basalt/prefill/kernels.hpp"
+#include "basalt/models/qwen4exp/prefill/kernels.hpp"
 
 namespace basalt::prefill {
 using namespace detail;
