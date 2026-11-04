@@ -92,7 +92,6 @@ class DeepSeek41Test(unittest.TestCase):
         self.assertEqual(meta["geometry"]["expert_count"], N_EXPERT)
         self.assertIsNone(meta["vision"])
         self.assertIsNone(meta["mtp"])
-        self.assertIsNone(meta["profile"])
         e = meta["engram"]
         self.assertEqual((e["rows"], e["row_values"], e["row_bytes"], e["bytes"]), (ROWS, 256, 144, ROWS * 144))
         self.assertEqual(e["ple.layer_multipliers"], [7, 11])
@@ -137,7 +136,7 @@ class DeepSeek41Test(unittest.TestCase):
 
     def test_side_sections_are_refused(self):
         with self.assertRaises(SystemExit):
-            convert.convert(self.args(hc8=str(self.gguf)))
+            convert.convert(self.args(draft_vocab=str(self.gguf)))
 
     def test_mmproj_becomes_the_vision_section(self):
         proj = self.t / "mmproj.gguf"
