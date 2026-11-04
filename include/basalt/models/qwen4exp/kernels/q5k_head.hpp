@@ -1,4 +1,4 @@
-// include/basalt/kernels/q5k_head.hpp - the Q5_K x q8_1 GEMV of a wide head (the output projection, the draft head)
+// include/basalt/models/qwen4exp/kernels/q5k_head.hpp - the Q5_K x q8_1 GEMV of a wide head (the output projection, the draft head)
 // for 1..8 columns, bitwise equal to native_mmvq (type 13, the exact layout): one warp per row holds what four warps
 // did, and a block reads the columns' activations once into shared memory for all its rows instead of once per row.
 #pragma once

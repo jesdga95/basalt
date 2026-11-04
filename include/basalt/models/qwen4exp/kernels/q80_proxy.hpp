@@ -1,4 +1,4 @@
-// include/basalt/kernels/q80_proxy.hpp - the two-stage draft head for a Q8_0 head (n_in 2560): the 2-bit copy of
+// include/basalt/models/qwen4exp/kernels/q80_proxy.hpp - the two-stage draft head for a Q8_0 head (n_in 2560): the 2-bit copy of
 // q5k_head.hpp packed from Q8_0 rows, the rows near the best approximate score rescored exactly, and the Q8_0 rows of
 // a subset read from the whole head through a row map.  The rows are the head's bit planes (q80_vhead.hpp), 2720
 // bytes each; every value is the Q8_0 row's.

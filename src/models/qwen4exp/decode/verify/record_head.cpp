@@ -8,7 +8,7 @@
 #include "basalt/kernels/hc_fused.hpp"
 #include "basalt/kernels/cvec.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
-#include "basalt/kernels/q5k_head.hpp"
+#include "basalt/models/qwen4exp/kernels/q5k_head.hpp"
 #include "basalt/kernels/q6k_head.hpp"
 #include "basalt/kernels/q80_vhead.hpp"
 #include "basalt/kernels/sampler.hpp"
