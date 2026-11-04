@@ -39,6 +39,15 @@ A take reads the free RAM again right before it pins and pins only when that rea
 keep and the RAM guard. The keep counts what serving can still take: its budget less the checkpoints, the blocks
 their pool keeps for the next ones and the parked conversations it holds now.
 
+A session nearing the crossover (`kv_host_lead`) prefaults its first pool: the registered layout is reserved and its
+first pin's pages are committed and written with zeros on a background thread that makes no device call, under the
+same keep as the take. The take waits for the writer and registers that layout in place. The bytes a pool holds when
+it is first read are unchanged (new pages are zero either way); only when the OS backs them moves. Admission and the
+take count the prefaulted bytes as free, since the pin reuses them; the RAM guard's shed, a shallower request, a deep
+request refused for RAM and RAM homes that would not fit release them. `kv_host_pool_stub_test` covers the layout
+reuse, a refused pin's fallback and a release while writing; `kv_host_grow_test` runs its checks over a prefaulted
+pool too, and `--pin-bench POWER_W` times the first pin of a 131072-cell pool from fresh and prefaulted pages.
+
 The RAM homes a prompt's loan takes (experts without a RAM copy in the slots it lends) follow the admitted request's
 own loan: its read's chunk laid out from the cache's end, never below the full chunk's loan (`homes_from`). When the
 RAM cannot hold them all, the highest slots get homes first and the rest are read from the file. None of this changes

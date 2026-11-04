@@ -9,12 +9,28 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <numeric>
+#include <system_error>
+#include <thread>
 #include <utility>
 
 namespace basalt::core {
+
+struct KvHostPool::Ahead {
+    std::thread writer;
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> written{0};
+    double ms = 0;                      // the writer's own time, set before it returns
+    std::vector<std::pair<uint8_t*, uint64_t>> committed;   // per registration, in its order
+    const QsaState* first = nullptr;    // the layers it was laid out for
+    int64_t layers = 0;
+    int64_t max_cells = 0;
+};
+
 namespace {
 // the arrays of one layer's host copy, in carve order
 std::vector<uint8_t*> arrays_of(const basalt::kernels::KvHostPools& h) {
@@ -64,7 +80,23 @@ bool register_identity(void* base, uint64_t bytes, uint64_t& registered, std::st
 }
 
 int64_t page_cells() { return basalt::kernels::qsa_real_shapes().page_size; }
+
+// A write backs each page (a read would map the shared zero page). The pages are new, so a zero keeps their bytes.
+void write_pages(std::atomic<bool>* stop, std::atomic<uint64_t>* written, double* ms,
+                 std::vector<std::pair<uint8_t*, uint64_t>> ranges, uint64_t page) {
+    const auto t0 = std::chrono::steady_clock::now();
+    constexpr uint64_t kStep = 2ull << 20;   // the stop flag is read between steps
+    for (const auto& [base, bytes] : ranges)
+        for (uint64_t off = 0; off < bytes && !stop->load(std::memory_order_relaxed); off += kStep) {
+            const uint64_t end = std::min(bytes, off + kStep);
+            for (uint64_t at = off; at < end; at += page) ((volatile uint8_t*) base)[at] = 0;
+            written->fetch_add(end - off, std::memory_order_relaxed);
+        }
+    *ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
 }  // namespace
+
+KvHostPool::KvHostPool() = default;
 
 KvHostPool::~KvHostPool() { release(); }
 
@@ -81,6 +113,7 @@ KvHostPool& KvHostPool::operator=(KvHostPool&& o) noexcept {
     max_cells_ = std::exchange(o.max_cells_, 0);
     registrations_ = std::move(o.registrations_);
     o.registrations_.clear();
+    ahead_ = std::move(o.ahead_);
     cells_ = std::exchange(o.cells_, 0);
     layers_ = std::move(o.layers_);
     run_bytes_ = std::move(o.run_bytes_);
@@ -95,15 +128,33 @@ uint64_t KvHostPool::bytes_for(const SessionState& s, const ModelGeometry& g, in
 }
 
 bool KvHostPool::reserve(const SessionState& s, const ModelGeometry& g, int64_t cells, std::string& err) {
-    release();
+    const bool laid_out = ahead_ != nullptr && s.qsa_states != nullptr && ahead_->first == s.qsa_states + s.qsa_ord0 &&
+                          ahead_->layers == s.qsa_alloc && ahead_->max_cells == s.max_cells;
+    std::vector<std::pair<uint8_t*, uint64_t>> committed;
+    if (laid_out) {
+        (void) prefault_wait();
+        committed = std::move(ahead_->committed);
+        ahead_.reset();
+    } else {
+        release();
+    }
     if (s.qsa_states == nullptr || s.qsa_alloc <= 0 || cells <= 0) {
+        release();
         err = "host K/V: no QSA layers or no cells";
         return false;
     }
     const int64_t ps = page_cells();
     const int64_t c = (cells + ps - 1) / ps * ps;
     if (s.max_cells > 0 && c <= (int64_t) align_up((uint64_t) s.max_cells, (uint64_t) ps) &&
-        reserve_registered(s, g, c, err)) return true;
+        (laid_out ? grow(c, err) : reserve_registered(s, g, c, err))) {
+        // prefaulted pages past the registered prefixes go back
+        for (size_t i = 0; i < committed.size() && i < registrations_.size(); ++i) {
+            const Registration& r = registrations_[i];
+            if (committed[i].second > r.bytes)
+                (void) basalt::platform::vm_decommit(r.base + r.bytes, committed[i].second - r.bytes);
+        }
+        return true;
+    }
     // A refused reservation or non-identity device alias uses the allocated pool.
     release();
     err.clear();
@@ -136,6 +187,59 @@ bool KvHostPool::reserve(const SessionState& s, const ModelGeometry& g, int64_t 
 
 bool KvHostPool::reserve_registered(const SessionState& s, const ModelGeometry& g, int64_t cells,
                                     std::string& err) {
+    return lay_out(s, g, err) && grow(cells, err);
+}
+
+bool KvHostPool::prefault(const SessionState& s, const ModelGeometry& g, int64_t cells, std::string& err) {
+    release();
+    if (s.qsa_states == nullptr || s.qsa_alloc <= 0 || cells <= 0 || s.max_cells <= 0) {
+        err = "host K/V: no QSA layers or no cells";
+        return false;
+    }
+    if (!lay_out(s, g, err)) {
+        release();
+        if (err.empty()) err = "host K/V: registered pools are unavailable";
+        return false;
+    }
+    const uint64_t pages = (uint64_t) ((std::min(cells, max_cells_) + page_cells() - 1) / page_cells());
+    std::vector<std::pair<uint8_t*, uint64_t>> ranges;
+    for (size_t i = 0; i < registrations_.size(); ++i) {
+        const uint64_t bytes = align_up(pages * run_bytes_[i % run_bytes_.size()], page_bytes_);
+        if (!basalt::platform::vm_commit(registrations_[i].base, bytes)) {
+            release();
+            err = "host K/V: cannot commit the RAM";
+            return false;
+        }
+        ranges.emplace_back(registrations_[i].base, bytes);
+    }
+    ahead_ = std::make_unique<Ahead>();
+    ahead_->first = s.qsa_states + s.qsa_ord0;
+    ahead_->layers = s.qsa_alloc;
+    ahead_->max_cells = s.max_cells;
+    ahead_->committed = ranges;
+    try {
+        ahead_->writer = std::thread(write_pages, &ahead_->stop, &ahead_->written, &ahead_->ms, std::move(ranges),
+                                     page_bytes_);
+    } catch (const std::system_error&) {
+        ahead_.reset();
+        release();
+        err = "host K/V: cannot start the prefault";
+        return false;
+    }
+    return true;
+}
+
+uint64_t KvHostPool::prefaulted_bytes() const {
+    return ahead_ != nullptr ? ahead_->written.load(std::memory_order_relaxed) : 0;
+}
+
+double KvHostPool::prefault_wait() {
+    if (ahead_ == nullptr) return 0;
+    if (ahead_->writer.joinable()) ahead_->writer.join();
+    return ahead_->ms;
+}
+
+bool KvHostPool::lay_out(const SessionState& s, const ModelGeometry& g, std::string& err) {
     int device = 0, identity = 0;
     if (cudaGetDevice(&device) != cudaSuccess ||
         cudaDeviceGetAttribute(&identity, cudaDevAttrCanUseHostPointerForRegisteredMem, device) != cudaSuccess ||
@@ -165,7 +269,7 @@ bool KvHostPool::reserve_registered(const SessionState& s, const ModelGeometry& 
         layers_.push_back(qsa_kv_host_carve(st, g, host_ + (uint64_t) j * per, carve_cells));
         for (uint8_t* base : arrays_of(layers_.back())) registrations_.push_back({base, 0});
     }
-    return grow(cells, err);
+    return true;
 }
 
 uint64_t KvHostPool::growth_bytes(int64_t cells) const {
@@ -246,6 +350,11 @@ bool KvHostPool::copy_from(const KvHostPool& from, int64_t cells, std::string& e
 }
 
 void KvHostPool::release() {
+    if (ahead_ != nullptr) {
+        ahead_->stop.store(true, std::memory_order_relaxed);
+        (void) prefault_wait();
+        ahead_.reset();
+    }
     if (grows_in_place()) {
         for (auto r = registrations_.rbegin(); r != registrations_.rend(); ++r)
             if (r->bytes != 0) unregister_range(r->base);

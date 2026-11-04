@@ -27,6 +27,7 @@ uint64_t serve_growth_bytes(const Options& o, const basalt::core::ModelGeometry&
 
 void Runtime::shed_if_low() {
     if (basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok) return;
+    kv_ahead_drop("RAM guard");
     const uint64_t drop = basalt::platform::ram_guard_drops();
     if (drop == shed_drop) return;
     shed_drop = drop;
@@ -125,6 +126,12 @@ bool Runtime::home_given_up(int64_t live, std::string& e, bool partial) {
     }
     if (give.empty()) return true;
     const size_t wanted = give.size();
+    // a prefaulted host K/V pool gives its RAM to the homes when they need it
+    if (kv_ahead.prefaulting()) {
+        uint64_t need = 0;
+        for (const auto& entry : give) need += basalt::kernels::cpu::expert_layout().blob_bytes(entry.first);
+        if (need + serve_growth_bytes(o, g) > src.homes_room()) kv_ahead_drop("RAM homes");
+    }
     if (partial) {
         // the highest slots first: the slots that go come before the loan's, and a short read lends the last ones
         std::vector<size_t> order(wanted);

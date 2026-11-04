@@ -33,6 +33,8 @@ void Runtime::kv_host_init() {
     // a session not streamed yet takes a pool only for a request that reads at most this many prompt tokens: a long
     // streamed read costs more than its decode wins back, and the conversation's next turn (a short read) streams
     kv_host_fresh = (int64_t) basalt::core::exp_flag("kv_host_fresh", 32768);
+    // a session not streamed yet prefaults its first pool from this many cells below kv_host_cross (0: at the take)
+    kv_host_lead = std::max<int64_t>(0, (int64_t) basalt::core::exp_flag("kv_host_lead", 8192));
 }
 
 // a pin leaves the guard's floor free and what serving can still take: its budget less the part it holds now
@@ -45,8 +47,47 @@ int64_t Runtime::kv_host_pin_cells(int64_t at, int64_t new_tokens) {
                                           std::min<int64_t>(4096, kv_host_out), 16384, ss.max_cells);
 }
 
+// the RAM free now, counting what the prefaulted pool holds (its take reuses it)
+uint64_t Runtime::kv_ram_free() {
+    const uint64_t ahead = kv_ahead.prefaulted_bytes();   // first: a reading after it is not higher
+    return basalt::platform::available_memory() + ahead;
+}
+
 uint64_t Runtime::kv_ram_now() {
-    return kv_host_ram >= 0 ? (uint64_t) kv_host_ram << 20 : basalt::platform::available_memory();
+    return kv_host_ram >= 0 ? (uint64_t) kv_host_ram << 20 : kv_ram_free();
+}
+
+// a session nearing the crossover prefaults its first pool when the take's keep admits it now; one farther from it,
+// or already streamed, holds none
+void Runtime::kv_host_ahead(int64_t need) {
+    if (kv_pool.valid() || kv_host_lead <= 0 || need < kv_host_cross - kv_host_lead) {
+        kv_ahead_drop("shallow");
+        return;
+    }
+    if (kv_ahead.prefaulting()) return;
+    basalt::program::KvHostInputs in;
+    in.cells = kv_host_pin_cells(kv_host_cross, kv_host_out);
+    in.crossover_cells = kv_host_cross;
+    in.bytes_per_cell = (basalt::core::KvHostPool::bytes_for(ss, g, in.cells) + (uint64_t) in.cells - 1) /
+                        (uint64_t) std::max<int64_t>(in.cells, 1);
+    in.ram_available = kv_ram_now();
+    in.ram_kept = kv_host_kept();
+    in.ram_low = basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Ok;
+    if (!basalt::program::choose_kv_host(in).host) return;
+    std::string pe;
+    if (!kv_ahead.prefault(ss, g, in.cells, pe)) return;
+    basalt::log::info("basalt serve", "host K/V: prefaulting a %lld-cell pool at %lld cells, %.2f GiB, %.2f GiB free, "
+                      "%.2f GiB kept free", (long long) in.cells, (long long) need,
+                      (double) ((uint64_t) in.cells * in.bytes_per_cell) / 1073741824.0,
+                      (double) in.ram_available / 1073741824.0, (double) in.ram_kept / 1073741824.0);
+}
+
+void Runtime::kv_ahead_drop(const char* why) {
+    if (!kv_ahead.prefaulting()) return;
+    const uint64_t bytes = kv_ahead.prefaulted_bytes();
+    kv_ahead.release();
+    basalt::log::info("basalt serve", "host K/V: the prefaulted pool released (%s), %.2f GiB", why,
+                      (double) bytes / 1073741824.0);
 }
 
 // A larger host extent, registered in place or copied into a replacement: 1 done, 0 refused (`pe`, the old pool
@@ -93,6 +134,7 @@ int Runtime::kv_host_admit(int64_t need, int64_t new_tokens, int64_t live_cells,
     // shallow (the depth it starts decoding at): the VRAM tail (a streamed session moves there after the park)
     if (need < kv_host_cross) {
         kv_host_late = kv_pool.valid();
+        kv_host_ahead(need);
         return 1;
     }
     const int64_t cells = kv_host_pin_cells(at, new_tokens);
@@ -131,11 +173,13 @@ int Runtime::kv_host_admit(int64_t need, int64_t new_tokens, int64_t live_cells,
             basalt::log::info("basalt serve", "host K/V: kept in VRAM (a %lld-token prompt read), %lld cells; a "
                               "later turn that reads at most %lld streams", (long long) in.read_cells,
                               (long long) cells, (long long) in.fresh_cells);
-        if (std::strcmp(plan.why, "no RAM") == 0)
+        if (std::strcmp(plan.why, "no RAM") == 0) {
+            kv_ahead_drop("no RAM");
             basalt::log::info("basalt serve", "host K/V: kept in VRAM (no RAM), %lld cells need %.2f GiB pinned, "
                               "%.2f GiB free, %.2f GiB kept free", (long long) cells,
                               (double) ((uint64_t) cells * in.bytes_per_cell) / 1073741824.0,
                               (double) in.ram_available / 1073741824.0, (double) in.ram_kept / 1073741824.0);
+        }
         return 1;
     case basalt::program::KvHostAct::keep:
         return 1;
@@ -158,18 +202,33 @@ int Runtime::kv_host_admit(int64_t need, int64_t new_tokens, int64_t live_cells,
         }
         lap(1);
         // the RAM read again just before the pin: the drain and the slot pool may have taken some
-        pin_free = std::min(in.ram_available, basalt::platform::available_memory());
+        pin_free = std::min(in.ram_available, kv_ram_free());
         basalt::program::KvHostInputs pin = in;
         pin.ram_available = pin_free;
         pin.ram_kept = kv_host_kept();
         pin.ram_low = basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Ok;
         if (!basalt::program::choose_kv_host(pin).host) {
+            kv_ahead_drop("no RAM");
             said("kept in VRAM", "no RAM");
             return 1;
         }
         const uint64_t cache_homes0 = src.homes_bytes();
+        // a prefaulted pool is registered in place: the pin finds its pages in RAM
+        const bool ahead = kv_ahead.prefaulting();
+        double ahead_ms = 0, ahead_wait = 0;
+        uint64_t ahead_bytes = 0;
+        if (ahead) {
+            const auto w0 = Clock::now();
+            ahead_ms = kv_ahead.prefault_wait();
+            ahead_wait = std::chrono::duration<double, std::milli>(Clock::now() - w0).count();
+            ahead_bytes = kv_ahead.prefaulted_bytes();
+            kv_pool = std::move(kv_ahead);
+        }
         bool moved = kv_pool.reserve(ss, g, plan.cells, pe);
         lap(2);
+        if (ahead)
+            basalt::log::info("basalt serve", "host K/V: the take pins a prefaulted pool, %.2f GiB written in %.1f ms, "
+                              "%.1f ms of it waited", (double) ahead_bytes / 1073741824.0, ahead_ms, ahead_wait);
         moved = moved && basalt::core::session_kv_set_mode(ss, g, 1, &kv_pool, live_c, nullptr, pe);
         if (!moved) {
             kv_pool.release();

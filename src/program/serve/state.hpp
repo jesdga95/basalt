@@ -367,6 +367,10 @@ private:
     int64_t kv_host_cross{};        // a request that starts decoding below this depth (cells) stays in the VRAM tail
     int64_t kv_host_ram{};          // a test's stand-in for the RAM free now, MiB; negative: MemAvailable
     basalt::core::KvHostPool kv_pool{};
+    // a session not streamed yet within kv_host_lead cells of kv_host_cross prefaults its first pool here (pages
+    // written in the background, none registered); its take registers those pages in kv_pool
+    basalt::core::KvHostPool kv_ahead{};
+    int64_t kv_host_lead{};
     int64_t kv_host_out{};          // the output cells a pool is pinned for
     int64_t kv_host_grow_ram{};     // a test's stand-in for the RAM free at admission or mid-request growth, MiB
     // set by kv_host_admit for a shallow request on a streamed session: it goes back to the VRAM tail with the cells
@@ -576,6 +580,9 @@ private:
     uint64_t kv_host_kept();
     int64_t kv_host_pin_cells(int64_t at, int64_t new_tokens);
     uint64_t kv_ram_now();
+    uint64_t kv_ram_free();
+    void kv_host_ahead(int64_t need);
+    void kv_ahead_drop(const char* why);
     int kv_host_regrow(int64_t cells, int64_t live_c, std::string& pe, std::string& e);
     int kv_host_to_vram(int64_t at, int64_t live_c, std::string& pe, std::string& e);
     int64_t homes_from(int64_t live);

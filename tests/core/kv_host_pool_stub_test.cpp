@@ -171,6 +171,42 @@ void run(bool int8, bool q4) {
     pool.release();
     alias_on = 0;
     CHECK(allocated == 0);
+    // A prefault writes the layout's pages and registers nothing; the take registers that layout in place.
+    c::KvHostPool ahead;
+    CHECK(ahead.prefault(ss, g, 1001, err) && ahead.prefaulting() && !ahead.valid() && pins.empty());
+    (void) ahead.prefault_wait();
+    const uint64_t written = ahead.prefaulted_bytes();
+    const auto laid = c::arrays_of(ahead.layer(0));
+    c::KvHostPool taken(std::move(ahead));
+    CHECK(!ahead.prefaulting() && taken.prefaulting());
+    CHECK(taken.reserve(ss, g, 1001, err) && taken.valid() && !taken.prefaulting() && taken.cells() == 1004);
+    CHECK(taken.grows_in_place() && c::arrays_of(taken.layer(0)) == laid && written == taken.bytes());
+    pinned = 0;
+    for (const auto& pin : pins) pinned += pin.n;
+    CHECK(pinned == taken.bytes() && pins.size() == (size_t) taken.layers() * laid.size());
+    taken.release();
+    CHECK(pins.empty());
+    // A prefault of other layers is laid out again; a refused pin falls back; a release stops the writer.
+    CHECK(ahead.prefault(ss, g, 1001, err));
+    c::SessionState other = ss;
+    other.qsa_alloc = 2;
+    CHECK(ahead.reserve(other, g, 1001, err) && ahead.valid() && ahead.layers() == 2 && !ahead.prefaulting());
+    ahead.release();
+    CHECK(ahead.prefault(ss, g, 1001, err));
+    fail_on = attempts + 1;
+    CHECK(ahead.reserve(ss, g, 1001, err) && !ahead.grows_in_place() && pins.empty() && allocated == 1);
+    fail_on = 0;
+    ahead.release();
+    CHECK(ahead.prefault(ss, g, 16387, err));
+    CHECK(ahead.reserve(ss, g, 1001, err) && ahead.cells() == 1004 && ahead.grow(12000, err) && ahead.cells() == 12000);
+    ahead.release();
+    CHECK(ahead.prefault(ss, g, 16387, err));
+    ahead.release();
+    CHECK(!ahead.prefaulting() && !ahead.valid() && pins.empty());
+    identity = 0;
+    CHECK(!ahead.prefault(ss, g, 1001, err) && !ahead.prefaulting());
+    identity = 1;
+    CHECK(allocated == 0);
 }
 
 int main(int argc, char** argv) {

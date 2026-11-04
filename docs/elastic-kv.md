@@ -33,7 +33,11 @@ request goes back to the VRAM tail too, and so does a streamed session when a re
 guard's floor (the pin is freed). A pin, and each larger one, is taken only when it leaves the RAM guard's floor free
 plus what serving can still take (its budget less what it holds now: the checkpoints and the freed blocks kept for
 the next ones, and the parked conversations) and the RAM copies
-the prompt path's loan then needs; otherwise the request keeps its K/V in VRAM (`host K/V: kept in VRAM ...`). It is
+the prompt path's loan then needs; otherwise the request keeps its K/V in VRAM (`host K/V: kept in VRAM ...`). A
+session within 8192 cells below the crossover (`"exp": "kv_host_lead=N"`, `0` pins at the take) prefaults its first
+pool in the background when that rule admits it then, so the take does not wait for the OS to back the pin
+(`host K/V: prefaulting ...`); the RAM guard, a shallower request, a deep one refused for RAM and RAM homes that need
+the room give it back. It is
 on by default with one GPU, the experts' RAM copy, a prompt path that lends cache slots and a KV other than `k8v4`; not
 with `--parallel`, a layer split, `--kv-resident` or `--vram-elastic`, where the K/V stays in VRAM.
 `"exp": "kv_host=0"` in the config's `engine` section turns it off. A streamed request decodes as from the VRAM tail

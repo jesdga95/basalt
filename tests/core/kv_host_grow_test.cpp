@@ -4,6 +4,7 @@
 #include "basalt/kernels/kv_q4.hpp"
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,7 +37,7 @@ std::vector<Span> spans(const k::KvHostPools& h, const c::ModelGeometry& g, int6
     return {{(uint8_t*) h.k_pool, codes * 2}, {(uint8_t*) h.v_pool, codes * 2}};
 }
 
-int run(int fmt) {
+int run(int fmt, bool ahead) {
     const c::ModelGeometry g{};
     c::QsaState layers[12];
     for (auto& st : layers) { st.kv_int8 = fmt == k::kKvInt8; st.kv_q4 = fmt == k::kKvQ4; }
@@ -46,6 +47,11 @@ int run(int fmt) {
     ss.max_cells = 33797;
     std::string err;
     c::KvHostPool pool;
+    // a prefaulted pool is registered in place by the reserve
+    if (ahead && !pool.prefault(ss, g, 8192, err)) {
+        std::puts("registered identity mappings unavailable: skipped");
+        return 77;
+    }
     if (!pool.reserve(ss, g, 8192, err)) { std::printf("reserve: %s\n", err.c_str()); return 1; }
     if (!pool.grows_in_place()) { std::puts("registered identity mappings unavailable: skipped"); return 77; }
     std::mt19937 rng(86);
@@ -103,8 +109,9 @@ int run(int fmt) {
                 bad += readback != reference;
             }
         }
-        std::printf("format %d: %lld -> %lld cells, %llu extra bytes, %d failures\n", fmt,
-                    (long long) old_cells, (long long) pool.cells(), (unsigned long long) delta, bad);
+        std::printf("format %d%s: %lld -> %lld cells, %llu extra bytes, %d failures\n", fmt,
+                    ahead ? " (prefaulted)" : "", (long long) old_cells, (long long) pool.cells(),
+                    (unsigned long long) delta, bad);
     }
     ck(cudaGraphExecDestroy(executable), "destroy executable");
     ck(cudaGraphDestroy(graph), "destroy graph");
@@ -116,15 +123,49 @@ int run(int fmt) {
 
 #include "kv_host_read_bench.hpp"
 
+// The first pin of a 131072-cell INT8 pool over 12 layers: fresh pages, and pages prefaulted before the pin.
+int pin_bench(double power_w) {
+    if (power_w <= 0) { std::puts("--pin-bench requires the measured GPU power limit in watts"); return 1; }
+    const c::ModelGeometry g{};
+    c::QsaState layers[12];
+    for (auto& st : layers) st.kv_int8 = true;
+    c::SessionState ss;
+    ss.qsa_states = layers;
+    ss.qsa_alloc = 12;
+    ss.max_cells = 262144;
+    const int64_t cells = 131072;
+    std::string err;
+    using Ms = std::chrono::duration<double, std::milli>;
+    for (int arm : {0, 1, 1, 0, 0, 1}) {
+        c::KvHostPool pool;
+        double ahead_ms = 0;
+        if (arm == 1) {
+            if (!pool.prefault(ss, g, cells, err)) { std::printf("prefault: %s\n", err.c_str()); return 77; }
+            ahead_ms = pool.prefault_wait();
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!pool.reserve(ss, g, cells, err) || !pool.grows_in_place()) {
+            std::printf("reserve: %s\n", err.c_str());
+            return 77;
+        }
+        const double pin_ms = Ms(std::chrono::steady_clock::now() - t0).count();
+        std::printf("pin bench: %s, %.2f GiB, pin %.1f ms, prefault %.1f ms, power limit %.0f W\n",
+                    arm ? "prefaulted" : "fresh", (double) pool.bytes() / 1073741824.0, pin_ms, ahead_ms, power_w);
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) return 77;
     if (argc == 3 && std::string(argv[1]) == "--bench") return host_read_bench(std::atof(argv[2]));
-    if (argc != 1) { std::puts("usage: kv_host_grow_test [--bench POWER_W]"); return 1; }
-    for (int fmt : {k::kKvInt8, k::kKvQ4, k::kKvF16}) {
-        const int result = run(fmt);
-        if (result) return result;
-    }
+    if (argc == 3 && std::string(argv[1]) == "--pin-bench") return pin_bench(std::atof(argv[2]));
+    if (argc != 1) { std::puts("usage: kv_host_grow_test [--bench POWER_W | --pin-bench POWER_W]"); return 1; }
+    for (bool ahead : {false, true})
+        for (int fmt : {k::kKvInt8, k::kKvQ4, k::kKvF16}) {
+            const int result = run(fmt, ahead);
+            if (result) return result;
+        }
     std::puts("kv_host_grow_test: PASS");
     return 0;
 }
