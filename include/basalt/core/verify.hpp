@@ -79,6 +79,9 @@ struct DecodeGaps {
         if (i >= 0) hms[i] += std::chrono::duration<double, std::milli>(n - hlast).count();
         hlast = n;
     }
+    /// What hms[i] holds ("" for an unused index).  Indices 28 to 30 are GPU spans that only --profile collects.
+    static const char* name(int i);
+    static constexpr int kHostPhases = 21;   ///< hms[0, kHostPhases) are host phases
 };
 DecodeGaps& decode_gaps();
 

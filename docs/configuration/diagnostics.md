@@ -49,7 +49,7 @@ All CLI, all off.
 | `--gpu-stages` | CLI | Capture each layer as three graphs (mixer, FFN and router, post), time them from outside the capture, print and exit. Not with a layer split. |
 | `--profile` | serve | GPU stage times of the decode windows, per request. Turns programmatic dependent launch off, so not for A/B timing. |
 | `--wait-stats` | serve | The host's wait times in the decode loop, one report per 200 windows. |
-| `--decode-timing` | serve | One line per request: where its decode time went. |
+| `--decode-timing` | serve | Per request: where its decode time went, and the decode loop's host phases outside verify with the bytes the adaptive swaps copied. |
 | `--draft-log` | serve | Path. One line per verify window (width, accepted, time), for studying the draft policy. |
 
 ## Speculation tests

@@ -413,6 +413,10 @@ bool Runtime::xq_round(std::vector<Swap>* ranked) {
     }
     xq_swapped += (int64_t) xq.size();
     xq_noplace += (int64_t) n_noplace;
+    for (const XSwap& x : xq) {
+        xq_in_bytes += (uint64_t) lay.blob_bytes(x.layer);
+        if (x.xchg) xq_out_bytes += (uint64_t) lay.blob_bytes(x.lout);
+    }
     if (!xq.empty()) {
         cudaEventRecord(adapt_ev, adapt_stream);
         xq_stage = 1;
@@ -606,6 +610,7 @@ int Runtime::init_tiers() {
     xq_saturated = false;   // the last round had at least kSatRatio times --adapt-swaps misses to swap
     xq_swapped = 0;
     xq_noplace = 0;
+    xq_in_bytes = xq_out_bytes = 0;
 
     xq_no = 0;
     xq_words = false;   // the round in flight writes the landed words

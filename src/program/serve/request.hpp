@@ -146,6 +146,8 @@ private:
     int64_t pair_holds{};
     Clock::time_point d0{};
     bool dec_timing{};
+    double hms0[32]{};   // --decode-timing: the decode loop's host phases at the decode's start
+    uint64_t swap_in0{}, swap_out0{};
     struct DecSnap {
         double wait, pool, host, plan, actq, jobs, run, peer_wait;
         int64_t misses, entries, hits, pcie, peer;
