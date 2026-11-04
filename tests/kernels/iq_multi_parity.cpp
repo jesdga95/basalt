@@ -459,7 +459,7 @@ void bench(cudaStream_t s, std::mt19937& rng) {
     // the verify window's shape: 2560 x 640 experts, 16 groups of m entries each
     // (GB/s: the 16 experts' bytes once per call, at the new kernel's time)
     for (auto [gu, dt] : {std::pair<int, int>{16, 42}, {17, 42}, {18, 42}, {21, 42}, {22, 42}, {29, 42}, {40, 40},
-                          {12, 7}, {12, 8}, {13, 8}, {8, 8}}) {   // NVFP4 with its own down format; the Q4_K_XL and Q8_0 pairs
+                          {12, 7}, {12, 8}, {13, 8}, {8, 8}, {21, 8}, {23, 8}}) {   // NVFP4, Q4_K_XL, Q8_0, i-quant pairs
         std::printf("%-8s/%-5s grouped, 16 groups of m entries:", name_of(gu), name_of(dt));
         std::string gbs;
         for (int m : {1, 2, 3, 4, 8}) {
@@ -556,7 +556,8 @@ int main(int argc, char** argv) {
         for (int dt : {20, 42}) check_grouped(gu, dt, 2560, 640, s, rng);   // the model's shape
         check_grouped(gu, 23, 1024, 512, s, rng);                           // IQ4_XS down needs n_ff % 256 == 0
     }
-    for (auto [gu, dt] : {std::pair<int, int>{12, 7}, {12, 8}, {13, 8}, {13, 7}, {8, 8}}) {   // the Q4_K_XL and Q8_0 pairs
+    for (auto [gu, dt] : {std::pair<int, int>{12, 7}, {12, 8}, {13, 8}, {13, 7}, {8, 8},
+                          {21, 8}, {23, 8}}) {   // the Q4_K_XL and Q8_0 pairs, i-quant gate/up with Q8_0 down
         check_grouped(gu, dt, 2560, 640, s, rng);
         check_grouped(gu, dt, 1024, 512, s, rng);
     }

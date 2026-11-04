@@ -1290,7 +1290,7 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
     X(16, 20) X(17, 20) X(18, 20) X(21, 20) X(22, 20) X(23, 20) X(29, 20) X(42, 20) \
     X(16, 42) X(17, 42) X(18, 42) X(21, 42) X(22, 42) X(23, 42) X(29, 42) X(42, 42) \
     X(16, 6) X(17, 6) X(18, 6) X(21, 6) X(22, 6) X(23, 6) X(29, 6) X(42, 6) \
-    X(40, 40) X(12, 7) X(12, 8) X(13, 8) X(14, 8) X(8, 8)
+    X(40, 40) X(12, 7) X(12, 8) X(13, 8) X(14, 8) X(8, 8) X(21, 8) X(23, 8)   // IQ3_S / IQ4_XS gate/up, Q8_0 down
 
 template<bool Q2 = false>
 __device__ void dm_experts_any(DmShared& sm, const block_q8_1* xq, const NativeExpertLayout& L, float* gate, float* up,
