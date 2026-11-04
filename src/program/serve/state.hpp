@@ -156,6 +156,7 @@ public:
         : o(options), model_file(file), err(error), n_vocab(vocab), grammar_vocab(vocab_tables) {}
     virtual ~Runtime() = default;
     Flow dispatch();
+    static constexpr int kPenaltyWindowCap = 4096;
     // ---- what a model answers: one call per batch window at most, the rest per command or per request
     virtual bool windows_in_flight() = 0;
     virtual bool next_batch_window() = 0;
@@ -172,6 +173,8 @@ public:
     virtual bool copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) = 0;
     virtual void ckd_finish() {}
     virtual void shed_if_low() = 0;
+    virtual bool pipelined() const { return false; }   // batch groups pipelined through layer split stages
+    virtual int64_t slot_context(int slot) const = 0;
     virtual bool slot0_solo() const = 0;   // slot 0 of the batch windows is the solo session
     virtual void enc_command(const std::string& cmd) = 0;
     virtual size_t spill_to_disk(bool at_exit, size_t limit) = 0;
@@ -346,6 +349,8 @@ public:
     void between_requests(const std::string& line) override;
     Flow run_request() override;
     bool slot0_solo() const override { return slot0_is_solo; }
+    bool pipelined() const override { return piped; }
+    int64_t slot_context(int slot) const override { return slot_cap[(size_t) slot]; }
 
 private:
     friend class QfnRequest;
@@ -396,7 +401,6 @@ private:
     // tokens that row's pick follows, -1 padded in front.  Allocated once at the cap for the widest window; a
     // request without penalties gets a null buffer and takes the byte-for-byte neutral path (no upload, no buffer
     // handed to the sampler).
-    static constexpr int kPenaltyWindowCap = 4096;
     static constexpr size_t kHistSlots = (size_t) kPenaltyWindowCap* (size_t) basalt::kernels::kVerifyMaxT;
     int32_t* d_hist{};
     std::vector<int32_t> hist_stage{};
