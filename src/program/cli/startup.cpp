@@ -94,6 +94,11 @@ std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& 
     if (const auto code = parse_options(argc, argv, o, adapter)) return *code;
     if (adapter != nullptr) {
         pack_tokens(*adapter, o);
+        // nothing would end a reply
+        if (o.eos_ids.empty() && o.generates && !o.gpu_plan && (o.serve || (o.max_new > 0 && o.stop_eos))) {
+            basalt::log::error("basalt", "this pack names no end-of-text token: give --eos-ids");
+            return 2;
+        }
         basalt::program::grammar::set_tool_form(adapter->tool_form());
     }
     // Batched serving reads a prompt on its own thread while verify windows run.  A lazy kernel load on that thread

@@ -78,6 +78,7 @@ struct CommonOptions {
     bool max_context_set = false;          ///< --max-context was given (a model with its own default picks one otherwise)
     /// Stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
+    bool generates = true;             ///< false: this run produces no tokens (a model flag says so)
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
     /// --vision-mmproj PATH: the image encoder runs in this process on the model's GPU (implies --vision).  Its weights
