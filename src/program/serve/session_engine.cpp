@@ -35,7 +35,7 @@ public:
             bs.resize((size_t) o.batch);
             slot_sampling_.resize((size_t) o.batch);
         }
-        conversations.emplace((size_t) 0, (size_t) 0);
+        conversations.emplace((size_t) o.conversation_cache_mib << 20, (size_t) o.conversation_cache_slots);
         if (o.grammar) {   // the token texts the grammar walks, read from the pack's tokenizer files
             std::vector<uint8_t> vj, tj;
             std::string gerr;
@@ -94,8 +94,31 @@ public:
     void enc_command(const std::string& cmd) override;
     size_t spill_to_disk(bool, size_t) override { return 0; }
     bool park_idle_engine(std::string&) override { return false; }
-    bool capture_admit(uint64_t, uint64_t) override { return false; }
-    bool park_current(size_t, int64_t) override { return true; }
+    bool capture_admit(uint64_t need, uint64_t floor) override {
+        return basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok &&
+               basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), need, floor);
+    }
+    // The outgoing conversation leaves the session as one block: its running state, then its positional state.
+    bool park_current(size_t, int64_t kept) override {
+        if (!conversations->enabled() || !live_ok || live.empty() || kept > 0) return true;
+        if (o.conversation_cache_min_tokens > 0 && (int64_t) live.size() < o.conversation_cache_min_tokens) return true;
+        const int64_t positions = (int64_t) live.size();
+        const size_t running = session().running_bytes(), cells = session().cells_bytes(positions);
+        if (!capture_admit(running + cells, (uint64_t) o.conversation_cache_min_free_mib << 20)) {
+            basalt::log::info("basalt serve", "conversation cache: %zu tokens not parked (physical RAM admission)", live.size());
+            return true;
+        }
+        basalt::core::SavedConversation image;
+        image.live.ids = live;
+        image.live.imgs = live_imgs;
+        image.live.gdn.resize(running + cells);
+        if (const basalt::model::Result r = session().save_running(image.live.gdn.data(), positions); !r.ok()) { err = r.message; return false; }
+        if (const basalt::model::Result r = session().save_cells(image.live.gdn.data() + running, positions); !r.ok()) { err = r.message; return false; }
+        image.checkpoints = checks;
+        image.cvec = cvec_cached;
+        (void) conversations->put(std::move(image));
+        return true;
+    }
     bool copy_from_slot(int, const ConvCheckpoint*, std::string& e) override { e = "this model's slots copy no cells"; return false; }
     // slot 0 is the solo session, the only way a request reaches this with its state elsewhere
     bool copy_to_slot(int b, const std::vector<int32_t>&, std::string& e) override {
@@ -246,6 +269,24 @@ private:
     }
     Flow read_to(int64_t to) override;
     Flow slot_bind() override { rt_.set_active(slot_b); return Flow::proceed; }
+    Flow restore_image() override {
+        const int64_t positions = (int64_t) incoming->live.ids.size();
+        const size_t running = rt_.session().running_bytes();
+        basalt::model::Result r = rt_.session().restore_cells(incoming->live.gdn.data() + running, positions);
+        if (r.ok()) r = rt_.session().restore_running(incoming->live.gdn.data(), positions);
+        if (r.ok()) r = rt_.session().set_history(incoming->live.ids.data(), positions);
+        if (!r.ok()) {
+            basalt::log::warn("basalt serve", "conversation cache: restoring a parked conversation failed (%s); reading the prompt from the start", r.message.c_str());
+            incoming.reset();
+            runtime_.live.clear();
+            runtime_.live_imgs.clear();
+            runtime_.checks.clear();
+            resume = 0;
+            from_live = false;
+        }
+        return Flow::proceed;
+    }
+    void adopt_checkpoints() override { runtime_.checks = std::move(incoming->checkpoints); }
     bool slot_leave() override { rt_.set_active(0); return true; }
     void slot_set_sampling(int slot) override { rt_.set_slot_sampling(slot, req_sp); }
     Flow prompt_end() override {
