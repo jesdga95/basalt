@@ -504,6 +504,9 @@ target_include_directories(grammar PUBLIC include)
 target_link_libraries(grammar PRIVATE warnings)
 
 # the C++ byte-level BPE tokenizer the engine runs on request text (CPU only)
+# the pre-tokenizers read request text: range checks on, as the rest of the tokenizer
+set_source_files_properties(src/models/qwen4exp/tokenizer/pretok_qwen35.cpp src/models/deepseek41/tokenizer/pretok_joyai.cpp
+                            PROPERTIES COMPILE_DEFINITIONS _GLIBCXX_ASSERTIONS)
 add_library(tokenizer STATIC src/program/tokenizer/bpe.cpp
             src/program/tokenizer/unicode_flags.cpp)
 target_include_directories(tokenizer PUBLIC include PRIVATE src/program/tokenizer)
