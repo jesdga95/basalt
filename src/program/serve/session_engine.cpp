@@ -67,11 +67,17 @@ public:
         std::fflush(stdout);
     }
     void probe_command(const std::string&, std::string& e) override { e = "PROBE: this model has no probe"; }
-    bool vram_command(const std::string& cmd, std::string& e, bool, std::string*) override {
-        e = cmd + ": this model cannot give VRAM back";
-        return false;
+    // VRAM <mib>: what the session can give back goes; VRAM alone: it is taken again.  One reply line.
+    bool vram_command(const std::string& cmd, std::string& e, bool, std::string* reply) override {
+        char* end = nullptr;
+        const long long reserve = cmd.size() > 4 ? std::strtoll(cmd.c_str() + 4, &end, 10) : -1;
+        if (cmd.size() > 4 && (end == cmd.c_str() + 4 || reserve < 0)) { e = "expected: VRAM [reserve_mib]"; return false; }
+        return set_memory(reserve >= 0, reserve, e, reply);
     }
-    void sleep_command(bool down, std::string& e) override { e = std::string(down ? "SLEEP" : "WAKE") + ": this model cannot give VRAM back"; }
+    void sleep_command(bool down, std::string& e) override {
+        std::string reply;
+        if (set_memory(down, -1, e, &reply)) std::fputs(reply.c_str(), stdout);
+    }
     void between_requests(const std::string&) override {}
     Flow run_request() override;
     void enc_command(const std::string& cmd) override;
@@ -120,6 +126,22 @@ public:
     const basalt::model::ModelDesc& desc() const { return model_.desc(); }
 
 private:
+    bool set_memory(bool low, long long reserve, std::string& e, std::string* reply) {
+        int64_t slots = 0;
+        if (const basalt::model::Result r = session_->set_low_memory(low, slots); !r.ok()) {
+            e = r.message;
+            return false;
+        }
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        char line[160];
+        std::snprintf(line, sizeof line, "VRAM reserve_mib=%lld expert_slots=%lld vram_free_mib=%lld\n", reserve,
+                      (long long) slots, (long long) (free_b >> 20));
+        if (reply != nullptr) *reply = line;
+        else std::fputs(line, stdout);
+        return true;
+    }
+
     std::optional<basalt::program::grammar::PackVocab> vocab_;
     basalt::model::LoadedModel& model_;
     std::unique_ptr<basalt::model::ModelSession> session_;

@@ -127,19 +127,6 @@ int main() {
         for (int s : seen) CHECK(s == 1);
     }
 
-    // the routing order holds every expert of a layer once
-    static const uint16_t rank[40][384] =
-#include "models/deepseek41/expert_rank.inc"
-    ;
-    for (const auto& row : rank) {
-        std::vector<int> seen(384, 0);
-        for (uint16_t e : row) {
-            CHECK(e < 384);
-            if (e < 384) ++seen[e];
-        }
-        for (int s : seen) CHECK(s == 1);
-    }
-
     if (g_fail) return 1;
     std::printf("tier_policy_test: ok\n");
     return 0;

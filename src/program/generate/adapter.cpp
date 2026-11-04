@@ -243,6 +243,20 @@ std::optional<int> run_adapter_model(basalt::program::CommonOptions& o, basalt::
         lreq.peer_devices = o.peer_devices;
         lreq.max_context = o.max_context;
         lreq.max_context_set = true;
+        lreq.expert_profile = o.expert_profile;
+        if (lreq.expert_profile.empty()) {   // the engine's own for this model, when it ships one
+            const std::string key = cli::profile_key(model_file.meta());
+            const std::string prof = std::string(BASALT_SOURCE_DIR) + "/data/profiles/" + key + ".prof";
+            uint64_t bytes = 0;
+            if (!key.empty() && basalt::platform::file_size(prof, bytes) && bytes > 0) lreq.expert_profile = prof;
+        }
+        lreq.expert_cache = o.expert_cache;
+        lreq.resident_budget = o.resident_budget;
+        lreq.pool_workers = o.pool_workers;
+        lreq.pool_affinity = o.pool_affinity;
+        lreq.pool_affinity_given = o.pool_affinity_given;
+        lreq.peer_reserve_mib = o.peer_reserve_mib;
+        lreq.vram_reserve_mib = o.vram_reserve_given ? o.vram_reserve_mib : 0;
         const basalt::model::Result r = adapter->load(lreq, loaded);
         if (r.status == basalt::model::Status::UseEnginePath) return std::nullopt;
         if (!r.ok() || !loaded) return fatal_start_error(r.message);
