@@ -63,7 +63,7 @@ class Structured(unittest.TestCase):
     def chat(self, script=None, **kwargs):
         if script is not None:
             self.engine = self.svc.engine = MockEngine(self.tok, script, max_context=16384)
-        req = {"model": "qwen3.8-flash-next", "messages": [{"role": "system", "content": "Write a film plan."},
+        req = {"model": "basalt", "messages": [{"role": "system", "content": "Write a film plan."},
                             {"role": "user", "content": "Photobooth. 15 seconds."}],
                "response_format": FORMAT, "reasoning_effort": "none", **kwargs}
         return self.request("/v1/chat/completions", req)

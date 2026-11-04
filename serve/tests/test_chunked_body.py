@@ -58,7 +58,7 @@ class ChunkedBody(unittest.TestCase):
     def chat(self, extra: bytes, body: bytes, path: bytes = b"/v1/chat/completions"):
         return self.send(path + b" HTTP/1.1" + CRLF + b"Content-Type: application/json" + CRLF + extra, body)
 
-    REQ = json.dumps({"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 20}).encode()
+    REQ = json.dumps({"model": "basalt", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 20}).encode()
 
     def test_a_chunked_chat_request_is_read(self):
         status, body = self.chat(b"Transfer-Encoding: chunked" + CRLF, chunked(self.REQ))
@@ -76,7 +76,7 @@ class ChunkedBody(unittest.TestCase):
 
     def test_every_body_route_reads_chunked(self):
         for path in (b"/v1/messages", b"/v1/messages/count_tokens", b"/v1/responses"):
-            body = json.dumps({"model": "qwen3.8-flash-next", "max_tokens": 8, "input": "hi",
+            body = json.dumps({"model": "basalt", "max_tokens": 8, "input": "hi",
                                "messages": [{"role": "user", "content": "hi"}]}).encode()
             with self.subTest(path=path):
                 status, got = self.chat(b"Transfer-Encoding: chunked" + CRLF, chunked(body), path)

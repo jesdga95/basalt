@@ -140,7 +140,7 @@ def main() -> int:
                     fail(f"vision: GPU {card} is not found by nvidia-smi")   # the sidecar checks the card itself
             for note in plan.get("notes") or []:
                 print(f"[server] {note}", flush=True)
-            if plan.get("warning") and cfg.get("arch") != "deepseek41":   # that model runs on its main card alone
+            if plan.get("warning"):
                 print(f"[server] warning: {plan['warning']}", flush=True)
             cfg["gpu"] = plan["devices"]
             cfg["gpu_smi"] = [c.get("smi", -1) for c in plan.get("cards") or []]
@@ -224,7 +224,7 @@ def main() -> int:
     dialect = dialect_for(cfg.get("arch"))
     tpl = tpath / "chat_template.jinja"
     svc = Service(engine, tok, dialect.template(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
-                  model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
+                  model_name=cfg.get("model_name", "basalt"), vision=vision,
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
                   grammar_engine=bool(a.mock_engine or has_grammar), dialect=dialect)
     svc.logs = logs

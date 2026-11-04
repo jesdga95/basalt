@@ -76,7 +76,7 @@ class Http(unittest.TestCase):
         self.httpd.server_close()
 
     def post(self, path, **extra):
-        body = {"model": "qwen3.8-flash-next", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}], **extra}
+        body = {"model": "basalt", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}], **extra}
         req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         try:

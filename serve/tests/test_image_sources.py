@@ -36,7 +36,7 @@ from serve.util.text import ByteTokenizer  # noqa: E402
 ROOT = Path(__file__).resolve().parents[2]
 PNG = b"\x89PNG\r\n\x1a\n" + b"pixels"
 DATA = "data:image/png;base64," + base64.b64encode(PNG).decode()
-MODEL = "qwen3.8-flash-next"
+MODEL = "basalt"
 LOCAL = ImageSources(local=True, why="")
 POLICY = "refused by server policy"
 posix_only = unittest.skipUnless(os.name == "posix", "POSIX paths and special files")

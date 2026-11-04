@@ -124,7 +124,7 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(self.request("/v1/models")[1]["data"][0]["status"]["value"], "unloaded")
         self.assertTrue(self.request("/props")[1]["models_autoload"])
         self.assertEqual(self.engine.starts, 0)
-        chat = {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 32, "reasoning_effort": "none"}
+        chat = {"model": "basalt", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 32, "reasoning_effort": "none"}
         for _ in range(2):
             code, answer = self.request("/v1/chat/completions", chat)
             self.assertEqual(code, 200)
@@ -141,7 +141,7 @@ class Lifecycle(unittest.TestCase):
             log = Path(d) / "engine.log"
             engine = ProcessEngine(str(Path(d) / "no-such-engine"), [], log=str(log), lazy=True)
             self.svc.engine = engine
-            chat = {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 32, "reasoning_effort": "none"}
+            chat = {"model": "basalt", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 32, "reasoning_effort": "none"}
             with mock.patch("serve.engine.process.narrate_start", lambda *a, **k: None):
                 for stream in (False, True):
                     with self.subTest(stream=stream):
@@ -169,7 +169,7 @@ class Lifecycle(unittest.TestCase):
         def died():
             raise EngineDied("the engine ended while it started")
         self.engine.restart = died
-        code, body = self.request("/v1/chat/completions", {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": "Hello"}]})
+        code, body = self.request("/v1/chat/completions", {"model": "basalt", "messages": [{"role": "user", "content": "Hello"}]})
         self.assertEqual(code, 503)
         self.assertIn("the next request restarts it", body["error"]["message"])
 

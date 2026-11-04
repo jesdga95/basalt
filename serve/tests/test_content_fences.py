@@ -93,7 +93,7 @@ class OverHttp(unittest.TestCase):
         try:
             for api, (path, body) in reqs.items():
                 for stream in (False, True):
-                    req = urllib.request.Request(base + path, data=json.dumps(dict(body, model="qwen3.8-flash-next", stream=stream)).encode(),
+                    req = urllib.request.Request(base + path, data=json.dumps(dict(body, model="basalt", stream=stream)).encode(),
                                                  headers={"Content-Type": "application/json",
                                                           "anthropic-version": "2023-06-01"})
                     with urllib.request.urlopen(req, timeout=30) as r:

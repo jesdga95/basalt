@@ -253,7 +253,7 @@ class ParallelService(unittest.TestCase):
             self.tmp.cleanup()
 
     def chat(self, text, max_tokens=64):
-        body = {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": text}], "max_tokens": max_tokens, "reasoning_effort": "none"}
+        body = {"model": "basalt", "messages": [{"role": "user", "content": text}], "max_tokens": max_tokens, "reasoning_effort": "none"}
         req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=60) as r:
@@ -531,7 +531,7 @@ class ParallelService(unittest.TestCase):
     def test_stop_strings_in_a_batch_slot(self):
         """A stop string cuts the answer in --batch mode too, and the slot is freed for the next request."""
         self.start(2)
-        body = {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": "hi LONGREPLY"}], "max_tokens": 64, "reasoning_effort": "none",
+        body = {"model": "basalt", "messages": [{"role": "user", "content": "hi LONGREPLY"}], "max_tokens": 64, "reasoning_effort": "none",
                 "stop": ["la la"]}
         req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
@@ -578,7 +578,7 @@ class ParallelService(unittest.TestCase):
         out = [None] * len(texts)
 
         def go(i):
-            body = {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": texts[i]}], "max_tokens": max_tokens,
+            body = {"model": "basalt", "messages": [{"role": "user", "content": texts[i]}], "max_tokens": max_tokens,
                     "reasoning_effort": "none", "stream": True, "stream_options": {"include_usage": True}}
             req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
                                          headers={"Content-Type": "application/json"})
@@ -603,7 +603,7 @@ class ParallelService(unittest.TestCase):
         out = [None] * len(texts)
 
         def go(i):
-            body = {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": texts[i]}], "max_tokens": max_tokens,
+            body = {"model": "basalt", "messages": [{"role": "user", "content": texts[i]}], "max_tokens": max_tokens,
                     "reasoning_effort": "none", "stream": True, "stream_options": {"include_usage": True}}
             req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
                                          headers={"Content-Type": "application/json"})
@@ -654,7 +654,7 @@ class ParallelService(unittest.TestCase):
     def convo(self, msgs, text):
         """One more turn of the conversation `msgs`: its usage; the reply is added to `msgs`."""
         msgs.append({"role": "user", "content": text})
-        body = {"model": "qwen3.8-flash-next", "messages": msgs, "max_tokens": 16, "reasoning_effort": "none"}
+        body = {"model": "basalt", "messages": msgs, "max_tokens": 16, "reasoning_effort": "none"}
         req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=120) as r:

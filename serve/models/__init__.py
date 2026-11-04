@@ -1,6 +1,6 @@
 """Per-model chat dialects: how a model's prompt is rendered, its output parsed and its turn ended.
 
-The server picks one from the model file's architecture; an unknown or missing architecture gets the Qwen dialect.
+The server picks one from the model file's architecture; a file of an unknown architecture is refused.
 """
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ class Dialect:
     nothink_lead = ""                       # text between a no-thinking prompt and a forced call's opening
     image_pad = "<|image_pad|>"             # the prompt token that stands for one row of an image's embeddings
     image_start = "<|vision_start|>"        # the token an image's pad run follows ("" : every pad is an image row)
+    in_engine_vision = False                # the image encoder always lives in the engine (only --vision dynamic)
+    effort_turn = ""                        # a trailing turn that states the reasoning effort ("{}" for its text)
 
     def template(self, path):
         """The prompt renderer: an object with `render(messages, tools=, add_generation_prompt=, **kwargs)` and
@@ -35,8 +37,11 @@ class Dialect:
 
 
 def dialect_for(arch: str | None) -> Dialect:
+    """The dialect of a model file's architecture; None (no file: the mock engine) is the plain chat-template one."""
     if arch == "deepseek41":
         from serve.models.deepseek41 import DeepSeek41
         return DeepSeek41()
-    from serve.models.qwen4exp import Qwen4Exp
-    return Qwen4Exp()
+    if arch in ("qwen4exp", None):
+        from serve.models.qwen4exp import Qwen4Exp
+        return Qwen4Exp()
+    raise ValueError(f"no dialect for architecture {arch!r}")

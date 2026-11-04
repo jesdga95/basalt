@@ -255,6 +255,11 @@ int Runtime::init_protocol() {
 
 int Runtime::announce() {
     print_info();
+    {
+        std::string ends;
+        for (const int64_t id : o.eos_ids) ends += (ends.empty() ? "" : ",") + std::to_string((long long) id);
+        std::printf("INFO eos_ids=%s\n", ends.c_str());
+    }
     if (text_tokenizer_note.empty()) std::printf("INFO text_prompt=1\n");
     // a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on a flag nobody
     // will raise - end the engine with where it was, so the server starts it again instead of the GPU spinning

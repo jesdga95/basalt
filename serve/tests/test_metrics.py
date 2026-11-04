@@ -66,9 +66,9 @@ class Http(unittest.TestCase):
                 return e.code, json.loads(e.read())
 
     def ask(self, path):
-        body = {"model": "qwen3.8-flash-next", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}
+        body = {"model": "basalt", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}
         if path == "/v1/responses":
-            body = {"model": "qwen3.8-flash-next", "input": "hi"}
+            body = {"model": "basalt", "input": "hi"}
         self.assertEqual(self.call(path, body)[0], 200)
 
     # --- /metrics
@@ -127,7 +127,7 @@ class Http(unittest.TestCase):
 
     def test_a_request_waiting_for_the_single_stream_is_queued(self):
         self.engine.delay = 0.05
-        body = {"model": "qwen3.8-flash-next", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}
+        body = {"model": "basalt", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}
         ts = [threading.Thread(target=self.call, args=(p, body)) for p in ("/v1/chat/completions", "/v1/messages")]
         ts[0].start()
         end = time.time() + 5
@@ -140,7 +140,7 @@ class Http(unittest.TestCase):
             time.sleep(0.01)
         q = self.call("/metrics")[1]["live"]["queue"]
         self.assertEqual(len(q), 1)
-        self.assertEqual((q[0]["api"], q[0]["model"]), ("anthropic", "qwen3.8-flash-next"))
+        self.assertEqual((q[0]["api"], q[0]["model"]), ("anthropic", "basalt"))
         self.assertGreater(q[0]["prompt_tokens"], 0)
         for t in ts:
             t.join(20)
