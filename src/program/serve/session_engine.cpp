@@ -3,6 +3,9 @@
 
 #include "decode_loop.hpp"
 #include "basalt/program/conv_cache.hpp"
+#include "basalt/program/probe_rates.hpp"
+
+#include <sstream>
 
 namespace basalt::program::serve {
 
@@ -59,6 +62,7 @@ public:
                 basalt::log::error("basalt serve", "%s", r.message.c_str());
                 return 1;
             }
+        if (const std::string words = sessions_[0]->info_words(); !words.empty()) std::printf("INFO %s\n", words.c_str());
         std::printf("READY %lld stop\n", (long long) o.max_context);
         std::fflush(stdout);
         return 0;
@@ -77,7 +81,23 @@ public:
         std::printf("ERR BSCRIPT: this model's slots draft nothing\n");
         std::fflush(stdout);
     }
-    void probe_command(const std::string&, std::string& e) override { e = "PROBE: this model has no probe"; }
+    void probe_command(const std::string& line, std::string& e) override {
+        basalt::program::ProbeEnv env;
+        if (const basalt::model::Result r = session().probe_env(env); !r.ok()) { e = "PROBE: " + r.message; return; }
+        if (line.rfind("PROBE set ", 0) == 0) {   // PROBE set workers=K: a live value for the next requests
+            std::istringstream kvs(line.substr(10));
+            for (std::string kv; kvs >> kv;) {
+                const int v = kv.rfind("workers=", 0) == 0 ? std::atoi(kv.c_str() + 8) : -1;
+                if (v >= 1) env.pool->set_active_workers(v);
+                else e = "PROBE: bad setting " + kv;
+            }
+            if (e.empty()) std::printf("PROBE end workers=%d\n", env.pool->active_workers());
+        } else if (line == "PROBE rates") {
+            basalt::program::probe_rates(env, stdout, e);
+        } else {
+            e = "PROBE: expected PROBE rates or PROBE set";
+        }
+    }
     // VRAM <mib>: what the session can give back goes; VRAM alone: it is taken again.  One reply line.
     bool vram_command(const std::string& cmd, std::string& e, bool, std::string* reply) override {
         char* end = nullptr;

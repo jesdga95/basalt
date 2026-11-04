@@ -9,6 +9,7 @@
 
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/ram_load.hpp"
+#include "basalt/program/probe_rates.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
@@ -107,6 +108,8 @@ public:
     int64_t slots() const { return (int64_t) n_layers_ * (per_layer_ + ext_per_layer_); }
 
     void report(const char* tag) const;
+    /// What `PROBE rates` measures: this tier's pool, RAM blobs, formats and second card.
+    void probe_env(program::ProbeEnv& env);
 
 private:
     struct Pending {

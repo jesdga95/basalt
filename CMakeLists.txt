@@ -134,7 +134,7 @@ target_link_libraries(model PUBLIC artifact warnings)
 add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwen4exp/flags.cpp
   src/models/qwen4exp/tokenizer/pretok_qwen35.cpp
   src/models/qwen4exp/load/engine_local.cpp
-  src/models/qwen4exp/serve/probe_rates.cpp
+  src/models/qwen4exp/serve/probe_peer.cpp
   src/models/qwen4exp/load/helpers.cpp
   src/models/qwen4exp/load/model.cpp
   src/models/qwen4exp/load/layer_plan.cpp
@@ -453,6 +453,7 @@ endif()
 # The prompt path: batched prompt processing (tensor-core GEMMs through cuBLAS).
 
 add_library(serve_shared STATIC src/program/serve/commands.cpp
+            src/program/probe_rates.cpp
             src/program/serve/protocol.cpp
             src/program/serve/runtime.cpp
             src/program/serve/request.cpp
