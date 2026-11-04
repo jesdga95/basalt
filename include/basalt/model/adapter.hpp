@@ -173,6 +173,12 @@ public:
     virtual std::vector<SideTableSpec> side_tables(const ModelDesc&) const { return {}; }
     virtual TokenizerSpec tokenizer_spec() const = 0;
     virtual TokenNames token_names() const = 0;
+    /// The pre-tokenizer's name in the pack's tokenizer.json and its rule.
+    struct PreTokenizer {
+        const char* name = "";
+        void (*split)(const char* text, size_t size, std::vector<size_t>& ends) = nullptr;
+    };
+    virtual PreTokenizer pretokenizer() const = 0;
     virtual program::grammar::ToolForm tool_form() const = 0;
     /// The options object of this model: the common flags and its own.
     virtual std::unique_ptr<program::CommonOptions> make_options() const;

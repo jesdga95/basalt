@@ -23,6 +23,10 @@ public:
 
     /// `vocab_json` is {"token text": id}, `merges_txt` one "left right" pair per line, best rank first, `types_json`
     /// one type per id (3 control, 4 user-defined). False with `err` on a malformed table.
+    /// The rule that splits text into pieces: byte offsets of the pieces' ends. Set before encode().
+    using PreTokenize = void (*)(const char* text, size_t size, std::vector<size_t>& ends);
+    void set_pretokenize(PreTokenize fn) { pretokenize_ = fn; }
+
     bool load(std::string_view vocab_json, std::string_view merges_txt, std::string_view types_json, std::string& err);
     bool loaded() const { return !raw_.empty(); }
     size_t vocab_size() const { return raw_.size(); }
@@ -76,6 +80,7 @@ private:
     std::string memo_keys_;
     std::vector<int32_t> memo_ids_;
 
+    PreTokenize pretokenize_ = nullptr;
     // scratch for the pre-tokenizer and the merger, kept between calls
     std::vector<size_t> ends_;
     std::vector<int32_t> sym_;
