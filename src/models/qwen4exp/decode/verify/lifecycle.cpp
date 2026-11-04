@@ -15,7 +15,7 @@
 #include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/pdl.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_decode_attn.hpp"
 #include "basalt/models/qwen4exp/kernels/q6k_head.hpp"

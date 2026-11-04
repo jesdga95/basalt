@@ -3,8 +3,8 @@
 #include "../load/engine_local.hpp"
 #include "basalt/core/expert_source.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
-#include "basalt/kernels/ngram.hpp"
-#include "basalt/program/options.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/options.hpp"
 
 #include <algorithm>
 #include <cstdio>

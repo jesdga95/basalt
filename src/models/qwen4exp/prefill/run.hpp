@@ -7,7 +7,7 @@
 #include "basalt/core/progress.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/models/qwen4exp/decode/layout.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/models/qwen4exp/decode/layer.hpp"

@@ -1,4 +1,4 @@
-// include/basalt/kernels/ngram.hpp - the PLE n-gram hash and the per-layer token table.
+// include/basalt/models/qwen4exp/kernels/ngram.hpp - the PLE n-gram hash and the per-layer token table.
 //
 // Two halves that share nothing but the row indices they exchange:
 //

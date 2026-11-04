@@ -35,7 +35,7 @@
 
 #include "basalt/models/qwen4exp/kernels/gr.hpp"
 #include "basalt/models/qwen4exp/kernels/kv_stream.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/models/qwen4exp/kernels/ple.hpp"
 
 #include <cstdio>

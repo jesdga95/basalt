@@ -1,10 +1,10 @@
-// src/core/device_main.cpp - `basalt-device`: report the GPU, the plan, and exercise the arena.
+// src/models/qwen4exp/plan/device_main.cpp - `basalt-device`: report the GPU, the plan, and exercise the arena.
 //
 // This prints the memory plan against the actual cudaMemGetInfo, on its own so it can run
 // without the model.  It is also the run-time half of the architecture policy: CMake refuses to COMPILE for another
 // architecture, and this refuses to RUN on one.
 #include "basalt/core/device.hpp"
-#include "basalt/plan/plan.hpp"
+#include "basalt/models/qwen4exp/plan/plan.hpp"
 
 #include <cstdio>
 #include <cstring>

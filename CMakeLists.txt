@@ -132,6 +132,7 @@ target_include_directories(model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(model PUBLIC artifact warnings)
 
 add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwen4exp/flags.cpp
+  src/models/qwen4exp/tokenizer/pretok_qwen35.cpp
   src/models/qwen4exp/load/engine_local.cpp
   src/models/qwen4exp/serve/probe_rates.cpp
   src/models/qwen4exp/load/helpers.cpp
@@ -260,14 +261,14 @@ target_link_libraries(basalt-plan PRIVATE plan)
 
 # ---- core (GPU runtime) ---------------------------------------------
 add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
-                             src/models/qwen4exp/decode/layout.cpp src/core/model_file.cpp)
+                             src/core/model_file.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
 # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
 # linker error ("unresolved external symbol cudaGraphInstantiate") names the function rather than the cause.
-target_link_libraries(core PUBLIC plan artifact platform warnings ${_gpu_runtime_target})
+target_link_libraries(core PUBLIC artifact platform warnings ${_gpu_runtime_target})
 
-add_executable(basalt-device src/core/device_main.cpp)
+add_executable(basalt-device src/models/qwen4exp/plan/device_main.cpp)
 target_link_libraries(basalt-device PRIVATE core)
 
 add_executable(basalt-load src/core/load_main.cpp)
@@ -285,10 +286,8 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu
                         src/kernels/cuda/native_mmvq.cu
                         src/kernels/cuda/native_bf16.cu
                         src/kernels/cuda/dequant_bf16.cu
-                        src/models/qwen4exp/kernels/dec_gdn_rec.cu
                         src/kernels/cuda/wait_abort.cu
                         src/kernels/cuda/iq_kernels.cu
-                        src/kernels/ngram.cpp
                         src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
 # the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
@@ -505,7 +504,7 @@ target_include_directories(grammar PUBLIC include)
 target_link_libraries(grammar PRIVATE warnings)
 
 # the C++ byte-level BPE tokenizer the engine runs on request text (CPU only)
-add_library(tokenizer STATIC src/program/tokenizer/bpe.cpp src/models/qwen4exp/tokenizer/pretok_qwen35.cpp
+add_library(tokenizer STATIC src/program/tokenizer/bpe.cpp
             src/program/tokenizer/unicode_flags.cpp)
 target_include_directories(tokenizer PUBLIC include PRIVATE src/program/tokenizer)
 target_link_libraries(tokenizer PRIVATE warnings)
@@ -517,7 +516,7 @@ target_include_directories(tokenizer_test PRIVATE include src src/program/tokeni
 target_compile_definitions(tokenizer_test PRIVATE _GLIBCXX_ASSERTIONS)
 target_link_libraries(tokenizer_test PRIVATE warnings)
 basalt_embed_manifest(tokenizer_test)
-add_executable(tokenizer_bench tests/program/tokenizer_bench.cpp)
+add_executable(tokenizer_bench tests/program/tokenizer_bench.cpp src/models/qwen4exp/tokenizer/pretok_qwen35.cpp)
 target_link_libraries(tokenizer_bench PRIVATE tokenizer warnings)
 basalt_embed_manifest(tokenizer_bench)
 basalt_cpu_test(NAME tokenizer_test COMMAND tokenizer_test)
@@ -1263,7 +1262,7 @@ endif()
 # activation quantizer; mmq_host.cu holds its few host symbols
 set(_mmq_types q2_0 iq1_s iq1_m iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 q5_1 q4_k q5_k q6_k nvfp4)
 # the Q2_0 pack's prompt experts on the engine's own int8 kernels (moe_fused.cu)
-add_library(mmq STATIC src/prefill/moe_mmq.cu src/models/qwen4exp/prefill/moe_fused.cu src/models/qwen4exp/prefill/moe_fused_iq.cu
+add_library(mmq STATIC src/prefill/moe_mmq.cu
             src/prefill/mmq/mmq_host.cu src/prefill/mmq/quantize.cu)
 # q8_0: the drafter's matrices
 foreach(_t IN LISTS _mmq_types)
@@ -1278,20 +1277,26 @@ endif()
 target_link_libraries(mmq PUBLIC ggml_quants ${_gpu_runtime_target})
 target_link_libraries(model_qwen4exp_prefill PUBLIC mmq)
 # the FP4 block-scaled tensor-core experts (need the a-variant of the architecture)
-add_library(fp4 STATIC src/models/qwen4exp/prefill/fp4/moe_fp4.cu)
-set_target_properties(fp4 PROPERTIES CUDA_ARCHITECTURES 120a-real)
-target_include_directories(fp4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(fp4 PUBLIC mmq ${_gpu_runtime_target})
-target_link_libraries(model_qwen4exp_prefill PUBLIC fp4)
+# the fused prompt experts: on the MMQ device code, with its flags
+add_library(model_qwen4exp_moe_fused STATIC src/models/qwen4exp/prefill/moe_fused.cu src/models/qwen4exp/prefill/moe_fused_iq.cu)
+target_include_directories(model_qwen4exp_moe_fused PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(model_qwen4exp_moe_fused PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
+target_link_libraries(model_qwen4exp_moe_fused PUBLIC mmq ${_gpu_runtime_target})
+target_link_libraries(model_qwen4exp_prefill PUBLIC model_qwen4exp_moe_fused)
+add_library(model_qwen4exp_fp4 STATIC src/models/qwen4exp/prefill/fp4/moe_fp4.cu)
+set_target_properties(model_qwen4exp_fp4 PROPERTIES CUDA_ARCHITECTURES 120a-real)
+target_include_directories(model_qwen4exp_fp4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(model_qwen4exp_fp4 PUBLIC mmq ${_gpu_runtime_target})
+target_link_libraries(model_qwen4exp_prefill PUBLIC model_qwen4exp_fp4)
 if(BUILD_TESTING)
   # the fused int8 experts against a double-precision reference and the MMQ path (exit 77 without int8 tensor cores)
   add_executable(prefill_fused_moe_test tests/models/qwen4exp/prefill/prefill_fused_moe_test.cpp)
-  target_link_libraries(prefill_fused_moe_test PRIVATE mmq ${_gpu_runtime_target})
+  target_link_libraries(prefill_fused_moe_test PRIVATE model_qwen4exp_moe_fused ${_gpu_runtime_target})
   basalt_gpu_test(NAME prefill_fused_moe_test COMMAND prefill_fused_moe_test)
   set_tests_properties(prefill_fused_moe_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   # the same for the native packs' formats (IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_XS, down Q2_0 IQ4_NL)
   add_executable(prefill_fused_iq_test tests/models/qwen4exp/prefill/prefill_fused_iq_test.cpp)
-  target_link_libraries(prefill_fused_iq_test PRIVATE mmq ${_gpu_runtime_target})
+  target_link_libraries(prefill_fused_iq_test PRIVATE model_qwen4exp_moe_fused ${_gpu_runtime_target})
   basalt_gpu_test(NAME prefill_fused_iq_test COMMAND prefill_fused_iq_test)
   set_tests_properties(prefill_fused_iq_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
   # a small chunk's experts on the CPU pool against MMQ and a double-precision reference
@@ -1344,7 +1349,7 @@ if(BUILD_TESTING)
   basalt_gpu_test(NAME prefill_hc_up_mix_test COMMAND prefill_hc_up_mix_test --no-bench)
   set_tests_properties(prefill_hc_up_mix_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   add_executable(prefill_fp4_test tests/models/qwen4exp/prefill/prefill_fp4_test.cpp)
-  target_link_libraries(prefill_fp4_test PRIVATE fp4 mmq ${_gpu_runtime_target})
+  target_link_libraries(prefill_fp4_test PRIVATE model_qwen4exp_fp4 mmq ${_gpu_runtime_target})
   basalt_gpu_test(NAME prefill_fp4_test COMMAND prefill_fp4_test --no-bench)
   set_tests_properties(prefill_fp4_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 endif()

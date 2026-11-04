@@ -1,4 +1,4 @@
-// include/basalt/plan/plan.hpp - census + memory planner.
+// include/basalt/models/qwen4exp/plan/plan.hpp - census + memory planner.
 //
 // This is the component that makes one binary adapt to the GPU it is running on.  The engine has 33.97 GB of
 // expert weights (has to live in DRAM and be streamed) and a fixed VRAM budget that has to hold the dense

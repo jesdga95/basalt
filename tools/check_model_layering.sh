@@ -34,12 +34,24 @@ for dir in src/models/*/; do
   fi
 done
 
-# 3. CMake: shared libraries do not link a model library
+# 3. relative includes reach a model too
+hits=$(grep -rnE '#[[:space:]]*include[[:space:]]*"[^"]*\.\./[^"]*models/' --include='*.[ch]pp' --include='*.cu' --include='*.cuh' src include \
+         | grep -vE '^(src/models|include/basalt/models)/' || true)
+if [[ -n "${hits}" ]]; then
+  echo "model layering: shared code includes a model by a relative path:" >&2
+  echo "${hits}" >&2
+  status=1
+fi
+
+# 4. CMake: shared libraries do not link a model library
 hits=$(grep -nE 'target_link_libraries\((core|engine|kernels|kernels_cpu|prefill|spec|model|platform|artifact)[[:space:]].*model_(qwen4exp|deepseek41)' CMakeLists.txt || true)
 if [[ -n "${hits}" ]]; then
   echo "model layering: a shared library links a model library:" >&2
   echo "${hits}" >&2
   status=1
 fi
+
+# 5. targets, names and token ids: see the script
+python3 tools/check_model_layering.py || status=1
 
 exit ${status}
