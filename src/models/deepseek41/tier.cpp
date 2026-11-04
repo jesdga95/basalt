@@ -4,6 +4,7 @@
 
 #include "basalt/core/expert_source.hpp"
 #include "basalt/platform/file.hpp"
+#include "basalt/platform/memory.hpp"
 #include "models/deepseek41/model.hpp"
 
 #include <algorithm>
@@ -21,6 +22,7 @@ namespace {
 
 constexpr uint64_t kRamHeadroom = 20ull << 30;   // host memory left to the system beside the RAM tier
 constexpr size_t kMaxPending = 128;              // promotions in flight
+constexpr uint64_t kPrereadBytes = 12ull << 30;  // file-backed experts read ahead into the page cache
 
 // The usual routing order of this model's experts: the RAM and VRAM tiers start from the head of it.
 constexpr int kRankLayers = 40, kRankExperts = 384;
@@ -33,6 +35,8 @@ constexpr uint16_t kExpertRank[kRankLayers][kRankExperts] =
 ExpertTier::ExpertTier(const DsModel& model) : m_(model) {}
 
 ExpertTier::~ExpertTier() {
+    preread_quit_ = true;
+    if (preread_.joinable()) preread_.join();
     if (worker_.joinable()) {
         {
             std::lock_guard<std::mutex> g(mu_);
@@ -180,6 +184,9 @@ bool ExpertTier::load_ram(uint64_t bytes, std::string& err) {
     for (std::thread& t : th) t.join();
     if (failed) return false;
     if (swaps) worker_ = std::thread([this] { swap_worker(); });
+    // the load's copies leave the page cache, and the most routed of the experts left in the file take their place
+    platform::advise_dontneed(m_.experts_fd(), m_.pack().experts_range.offset, m_.pack().experts_range.size());
+    if (swaps) preread_ = std::thread([this] { preread(); });
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     basalt::log::info("basalt deepseek41", "RAM expert tier %.1f GiB (%d of %d experts per layer) loaded in %.1f s",
                  (double) per_layer * cover_ / 1073741824.0, cover_, n_expert_, s);
@@ -257,6 +264,20 @@ void ExpertTier::swap_worker() {
         ++next;
         ++jobs_done_;
         cv_.notify_all();
+    }
+}
+
+void ExpertTier::preread() {
+    uint64_t left = kPrereadBytes;
+    for (int r = cover_; r < n_expert_; ++r) {
+        for (int l = 0; l < n_layers_; ++l) {
+            if (preread_quit_.load(std::memory_order_relaxed)) return;
+            const ExpertLayer& el = m_.pack().experts[(size_t) l];
+            if (left < el.blob_bytes) return;
+            left -= el.blob_bytes;
+            platform::advise_willneed(m_.experts_fd(), m_.pack().experts_range.offset + el.offset + (uint64_t) ranked(l, r) * el.blob_bytes,
+                                      el.blob_bytes);
+        }
     }
 }
 
