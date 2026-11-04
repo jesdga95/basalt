@@ -54,7 +54,7 @@ T=1 calls and require bitwise equality (attn_index_parity, attn_mqa_parity, rout
 | GPU experts, IQ1_S gate/up or down (IQ2_XXS, IQ2_XS and IQ2_S likewise; the same q8_1 and dp4a scheme with each format's grid; decode-once grouped kernels) | q8_1 of the fp32 input and of the fp32 SwiGLU output; per 32 values the grid codes (0..2) against the int8 activation with dp4a, plus the per-32 shift (+-1/8) times the activation's integer sum, times the 3-bit scale (2s+1), the fp16 block scale and the q8_1 scale in fp32. Against a double reference on the dequantized weights and the rounded activation: rel RMS 8e-8 for the dot, 4e-3 for a whole expert (the q8_1 rounding of the SwiGLU output) | src/kernels/cuda/iq_kernels.cu vec_dot_iq1_s_q8_1, Split<19>; src/kernels/iq1s_parity.cpp |
 | Clamped SwiGLU (routed and shared experts) | gate capped at the limit, up clamped to +-limit, then `silu(gate) * up` in fp32 with exact exp. A separate compile-time instantiation of the grouped launches; the unclamped launches are unchanged. The limit rides in the expert layout, so every tier applies it | iq_kernels.cu grouped_impl, swiglu_clamp_q8_1_entries_kernel; native_expert.cpp gu_rows_ggml |
 | CPU experts, IQ1_S | Q8_K of the fp32 input and of the SwiGLU output; integer sums per 32 with the 3-bit scale, the shift term from the activation's group sums. The AVX-512 row kernel is bit for bit ggml's single-token dot; rel RMS 1e-7 against the double reference | src/kernels/cpu/iq_avx512.cpp iq1s_512_gu_rows; ggml_cpu_dots.c ggml_vec_dot_iq1_s_q8_K |
-| Decode, by tier | Each routed expert runs where it sits: from a VRAM slot on the GPU (q8_1, native grouped kernels), or on the CPU pool from the pinned RAM copy or the mapped pack (Q8_K, ggml arithmetic). **The two differ in the last bits**, so a token's output depends on which experts were resident. Residency changes only at token boundaries and follows the routing history, so a fixed prompt on a fixed memory budget repeats exactly; a different RAM-tier size (free memory at start) can change the text. A repeat miss within 64 tokens is promoted to VRAM, half of a layer's misses go to the CPU and half over the bus, and a file-backed expert that misses twice swaps into the pinned tier for the least recently used pinned one (taking effect one token later), so the placement, and with it the last bits of later tokens, differs from the first-miss-promotes policy; the first 16 tokens of the fixture prompts are unchanged. The CPU's rows are read in place from mapped host memory by the weighted sum (same summation order) | tier.cpp lookup, fetch, run_cpu; ops_kernels.cpp routed_experts |
+| Decode, by tier | Each routed expert runs where it sits: from a VRAM slot on the GPU (q8_1, native grouped kernels), or on the CPU pool from the pinned RAM copy or the mapped pack (Q8_K, ggml arithmetic). **The two round activations differently, about 1% of a layer's routed output**, so a token's output depends on which experts were resident. Residency changes only at token boundaries and follows the routing history, so a fixed prompt on a fixed memory budget repeats exactly; a different RAM-tier size (free memory at start) can change the text. A repeat miss within 64 tokens is promoted to VRAM, half of a layer's misses go to the CPU and half over the bus, and a file-backed expert that misses twice swaps into the pinned tier for the least recently used pinned one (taking effect one token later), so the placement, and with it the rounding of later tokens, differs from the first-miss-promotes policy; the first 16 tokens of the fixture prompts are unchanged. The CPU's rows are read in place from mapped host memory by the weighted sum (same summation order) | tier.cpp lookup, fetch, run_cpu; ops_kernels.cpp routed_experts |
 | Prompt chunks (up to 8,192 tokens) | Routed experts on MMQ: q8_1 (per 32, MMQ layout) of the fp32 input and of the fp32 clamped SwiGLU output, int8 mma against the IQ1_S / IQ2_XXS codes (the IQ1_S grid shift rides in the activation block sums), fp32 accumulation, rows summed per token in slot order. **Numerics change against the single-token kernels** (a different int8 reduction order; both round activations to q8_1). Experts are staged from the VRAM and pinned RAM tiers, so the prompt path never mixes in CPU arithmetic | prefill_ffn.cpp routed; prefill_ffn.cu; src/kernels/cuda/mmq_load_tiles.cuh load_tiles_iq1_s |
 | Shared expert in prompts | MMQ GEMMs over 1,024-token sub-chunks (gate, up, clamped SwiGLU, down; q8_1 activations with an fp16 block scale, int8 mma, fp32 accumulation). **Numerics change** against the decode kernel: about 1e-3 per layer. The per-token weighted sum of the routed rows keeps the slot order, bitwise equal to the per-token launch | prefill_ffn.cpp shared; weighted_sum_tokens |
 
@@ -109,17 +109,31 @@ Measured against llama.cpp on the same weights (per-layer tensors from recorded 
 1e-7 (decode), hyper-connection chain 1e-7 (decode) to 5e-5 (prompt), attention inverse-RoPE output 3e-4 to 2e-3,
 `attn_out` 4e-3 to 1.1e-2 (the reference's prompt MMQ noise is the same size), top-512 selection overlap 0.998 on
 average over a 6,250-token prompt. Greedy decoding reproduces llama.cpp's first 16 tokens on two of three fixture
-prompts; on the third it can diverge after a few tokens, because 1.5-bit weights make a near-tie flip under
-last-bit changes.
+prompts; on the third it can diverge after a few tokens (see [Quality](#quality)).
 
 ## Quality
 
 GSQ-RCO IQ2_XXS, 5090 only, against llama.cpp b11870 on the same GGUF, llama's tokens fed one decode step at a time on
-three prompts: Basalt's greedy choice differs at 5 to 8 of 688 generated positions, depending on which tier each expert
-sits in during the run, with 1.0 at most of log-probability between the two tokens at llama's logits. KL against llama's logits on 512 positions of real text: mean
-0.0025, median 0.0007, top-1 agreement 98.2%, position 1 left out: llama's own row at position 1 moves by KL 4.2 between
-a 2-token and a 512-token batch, and Basalt is within 0.07 of its 2-token row. There is no PPL/KLD run against the
-native model on this pack yet.
+three prompts: Basalt's greedy choice differs at 4 to 8 of 688 generated positions, depending on which tier each expert
+sits in during the run. KL against llama's logits on 512 positions of real text: mean 0.0025, median 0.0007, top-1
+agreement 98.2%, position 1 left out: llama's own row at position 1 moves by KL 4.2 between a 2-token and a 512-token
+batch, and Basalt is within 0.07 of its 2-token row. There is no PPL/KLD run against the native model on this pack yet.
+
+Neither engine has one answer to compare. On the same tokens (mean KL over the generated positions of the first prompt):
+
+| Pair | Mean KL | Top-1 differs at |
+|---|---|---|
+| Basalt vs llama, batched | 0.0025 to 0.0030 | 4 to 8 of 319 |
+| Basalt, RAM tier one expert larger | 0.0020 | 5 of 319 |
+| Basalt, VRAM tier of 6 experts per layer | 0.0022 | 5 of 319 |
+| llama serial vs llama batched | top-5 log-probabilities move by 0.32 (median), 2.08 (max) | 4 of 319 |
+
+The largest gap between the two engines' tokens shows it. Log-probability of the first token minus the second, same row:
+llama serial +1.01, llama batched +0.39, Basalt +0.18, -0.64 and -0.59 at three tier settings. The mechanism: with input
+and routing bit-equal, placement alone changes a layer's routed output by 0.9% (median; 1.9% at most), since q8_1 and
+Q8_K round the activations differently. That is enough to move a top-6 choice in a later layer, and a changed choice moves
+the layer's output by about 10%. Reruns at one tier setting are bitwise equal, and asking for logits does not change the
+tokens.
 
 Quality is the quant's, not the engine's. The IQ1_S pack scores, against the native model's logits (teacher: the
 native FP4 checkpoint through the reference code; Lucebox's 8 x 1,024 held-out tokens, KL over the teacher's top-256 ids,
