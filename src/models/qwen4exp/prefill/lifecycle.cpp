@@ -17,7 +17,7 @@
 namespace basalt::prefill {
 using namespace detail;
 
-// src/prefill/lifecycle.cpp - see include/basalt/prefill/prefill.hpp.
+// src/models/qwen4exp/prefill/lifecycle.cpp - see include/basalt/prefill/prefill.hpp.
 Prefill::Prefill() : impl_(new Impl) {}
 Prefill::~Prefill() { release(); }
 

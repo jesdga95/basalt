@@ -495,33 +495,33 @@ endif()
 # ids, so a tokenizer is never on one side of a logit comparison.
 # The prompt path: batched prompt processing (tensor-core GEMMs through cuBLAS).
 add_library(prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/gdn_chunked.cu
-  src/prefill/lifecycle.cpp
-  src/prefill/layout.cpp
-  src/prefill/projection.cpp
-  src/prefill/draft_kv.cpp
-  src/prefill/peer.cpp
-  src/prefill/pipeline.cpp
-  src/prefill/statistics.cpp
-  src/prefill/run.cpp
-  src/prefill/inputs.cpp
-  src/prefill/ple.cpp
-  src/prefill/stream.cpp
-  src/prefill/ahead.cpp
-  src/prefill/layer.cpp
-  src/prefill/gdn.cpp
-  src/prefill/qsa.cpp
-  src/prefill/shared_expert.cpp
-  src/prefill/routing.cpp
-  src/prefill/cpu_experts.cpp
-  src/prefill/experts.cpp
-  src/prefill/expert_fused.cpp
-  src/prefill/expert_mmq.cpp
-  src/prefill/expert_fp4.cpp
-  src/prefill/expert_fp16.cpp
-  src/prefill/peer_experts.cpp
-  src/prefill/expert_stream.cpp
-  src/prefill/combine.cpp
-  src/prefill/handoff.cpp)
+  src/models/qwen4exp/prefill/lifecycle.cpp
+  src/models/qwen4exp/prefill/layout.cpp
+  src/models/qwen4exp/prefill/projection.cpp
+  src/models/qwen4exp/prefill/draft_kv.cpp
+  src/models/qwen4exp/prefill/peer.cpp
+  src/models/qwen4exp/prefill/pipeline.cpp
+  src/models/qwen4exp/prefill/statistics.cpp
+  src/models/qwen4exp/prefill/run.cpp
+  src/models/qwen4exp/prefill/inputs.cpp
+  src/models/qwen4exp/prefill/ple.cpp
+  src/models/qwen4exp/prefill/stream.cpp
+  src/models/qwen4exp/prefill/ahead.cpp
+  src/models/qwen4exp/prefill/layer.cpp
+  src/models/qwen4exp/prefill/gdn.cpp
+  src/models/qwen4exp/prefill/qsa.cpp
+  src/models/qwen4exp/prefill/shared_expert.cpp
+  src/models/qwen4exp/prefill/routing.cpp
+  src/models/qwen4exp/prefill/cpu_experts.cpp
+  src/models/qwen4exp/prefill/experts.cpp
+  src/models/qwen4exp/prefill/expert_fused.cpp
+  src/models/qwen4exp/prefill/expert_mmq.cpp
+  src/models/qwen4exp/prefill/expert_fp4.cpp
+  src/models/qwen4exp/prefill/expert_fp16.cpp
+  src/models/qwen4exp/prefill/peer_experts.cpp
+  src/models/qwen4exp/prefill/expert_stream.cpp
+  src/models/qwen4exp/prefill/combine.cpp
+  src/models/qwen4exp/prefill/handoff.cpp)
 target_include_directories(prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_gpu_include_directories})
 target_link_libraries(prefill PUBLIC engine ${_gpu_blas_target} ${_gpu_runtime_target})
 
