@@ -85,6 +85,7 @@ class ConfigFile(unittest.TestCase):
     def test_errors(self):
         ap = build_parser()
         for obj, msg in (({"spec": 7}, "not the key"),
+                         ({"models": []}, "not the key"),
                          ({"server": {"nope": 1}}, "not a server option"),
                          ({"server": {"spec": 7}}, "not a server option \\(engine flags go under"),
                          ({"server": {"engine-bin": "/x/basalt"}}, "engine-bin is set by basalt serve"),

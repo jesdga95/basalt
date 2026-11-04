@@ -68,6 +68,10 @@ class Service:
     on_loaded = None                                    # called after each weights load or wake this service ran
     boot_error = None                                   # the start-up load's failure, for the requests queued behind it
 
+    def listed_models(self) -> list[str]:
+        """What /v1/models lists: the one model this process runs."""
+        return [self.model]
+
     def served_names(self) -> list[str]:
         """The model names a request may use: the one /v1/models lists, and the model file's own name."""
         names = [self.model]
