@@ -78,16 +78,33 @@ protected:
     Clock::time_point restore_t0{};
     int64_t read_from{};
 
+    // per-request sampling (greedy when temperature is absent)
+    basalt::kernels::SamplerParams req_sp{};
+    bool cancelled{};
+    int64_t yielded_at{};
+    int yielded_slot{};
+    int64_t turn_at{};
+    int64_t root_at{};
+    int64_t at{};
+    int64_t fold_p0{};
+    double prompt_ms{};
     bool starts_with(const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs);
     Flow restore();
     Flow parse();
     Flow prepare_prompt();
     virtual Flow prepare_image() = 0;
-    virtual Flow read_prompt() = 0;
+    Flow read_prompt();
     virtual Flow decode() = 0;
     virtual Flow complete() = 0;
     virtual bool parse_begin() { return true; }
     virtual float default_relax() const { return 0.0f; }
+    // ---- reading the prompt, per part.  read_to: Flow::quit when a stop ended the read.
+    virtual bool prompt_begin() { return true; }
+    virtual Flow set_sampling() = 0;
+    virtual void limit_parts() {}
+    virtual void prompt_parts_begin() {}
+    virtual Flow read_to(int64_t to) = 0;
+    virtual Flow prompt_end() { return Flow::proceed; }
     // ---- restoring a conversation: what it does to the model's sessions.  Per request.
     virtual bool cvec_wanted() const { return true; }
     virtual void set_cvec() {}
