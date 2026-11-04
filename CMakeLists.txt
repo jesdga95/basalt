@@ -274,10 +274,10 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/models/qwen4exp/kernels/qsa_decode_attn.cu
                         src/models/qwen4exp/kernels/qsa_dec_attn.cu
                         src/models/qwen4exp/kernels/qsa_dec_fused.cu
-                        src/kernels/cuda/q5k_head.cu
-                        src/kernels/cuda/q6k_head.cu
-                        src/kernels/cuda/q80_proxy.cu
-                        src/kernels/cuda/q80_vhead.cu
+                        src/models/qwen4exp/kernels/q5k_head.cu
+                        src/models/qwen4exp/kernels/q6k_head.cu
+                        src/models/qwen4exp/kernels/q80_proxy.cu
+                        src/models/qwen4exp/kernels/q80_vhead.cu
                         src/models/qwen4exp/kernels/qsa_prompt_attn.cu
                         src/models/qwen4exp/kernels/fused_gdn.cu
                         src/kernels/cuda/dequant_bf16.cu
@@ -324,10 +324,10 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
     src/models/qwen4exp/kernels/native_qsa_indexer.cu
     src/models/qwen4exp/kernels/native_qsa_score.cu
     src/models/qwen4exp/kernels/qsa_dec_fused.cu
-    src/kernels/cuda/q5k_head.cu
-    src/kernels/cuda/q6k_head.cu
-    src/kernels/cuda/q80_proxy.cu
-    src/kernels/cuda/q80_vhead.cu
+    src/models/qwen4exp/kernels/q5k_head.cu
+    src/models/qwen4exp/kernels/q6k_head.cu
+    src/models/qwen4exp/kernels/q80_proxy.cu
+    src/models/qwen4exp/kernels/q80_vhead.cu
     PROPERTIES COMPILE_OPTIONS "--use_fast_math")
 
 # ---- engine -----------------------------------------------------

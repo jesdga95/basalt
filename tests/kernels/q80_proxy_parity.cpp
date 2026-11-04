@@ -9,8 +9,8 @@
 //      replaces.
 //   q80_proxy_parity [head rows] [trials]
 #include "basalt/kernels/native_mmvq.hpp"
-#include "basalt/kernels/q5k_head.hpp"
-#include "basalt/kernels/q80_proxy.hpp"
+#include "basalt/models/qwen4exp/kernels/q5k_head.hpp"
+#include "basalt/models/qwen4exp/kernels/q80_proxy.hpp"
 #include "basalt/kernels/q80_vhead.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/kernels/verify_kernels.hpp"

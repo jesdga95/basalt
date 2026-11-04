@@ -1,7 +1,7 @@
-// src/kernels/cuda/q80_proxy.cu - see include/basalt/kernels/q80_proxy.hpp.
+// src/models/qwen4exp/kernels/q80_proxy.cu - see include/basalt/models/qwen4exp/kernels/q80_proxy.hpp.
 //
 // Built with --use_fast_math like native_mmvq.cu, whose one-column Q8_0 x q8_1 dot the exact rows repeat.
-#include "basalt/kernels/q80_proxy.hpp"
+#include "basalt/models/qwen4exp/kernels/q80_proxy.hpp"
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "head_proxy.cuh"
