@@ -33,14 +33,7 @@ struct ExpertPlan {
     int32_t tok[8];
 };
 
-// The GPU plan of a window: one group per expert the VRAM tier holds, one entry per (token, routed slot) using it.
-struct WindowPlan {
-    unsigned long long ptr[ExpertTier::kMaxK];
-    int32_t start[ExpertTier::kMaxK + 2];
-    int32_t ng[4];
-    int32_t dst[ExpertTier::kMaxK];
-    int32_t tok[ExpertTier::kMaxK];
-};
+;
 
 // Layer roles: the kv source whose compressed rows a layer reads, and the latest index source at or below it.
 int kv_source(int il) {
@@ -60,8 +53,7 @@ IndexMode index_mode(int il) { return il == 20 ? IndexMode::Level1 : il > 20 ? I
 
 class KernelOps final : public LayerOps {
 public:
-    KernelOps(const DsModel& m, std::unique_ptr<LayerOps> experts)
-        : m_(m), g_(m.geo()), experts_(std::move(experts)), ctx_((int) m.context()) {}
+    explicit KernelOps(const DsModel& m) : m_(m), g_(m.geo()), ctx_((int) m.context()) {}
     ~KernelOps() override {
         for (void* p : allocs_) cudaFree(p);
     }
@@ -171,11 +163,9 @@ public:
         }
         win_n_ = 0;
         cudaMemset(ids_, 0xff, kTopK * 4);
-        if (experts_) experts_->reset();
     }
 
     void begin_token(int64_t pos) override {
-        if (experts_) experts_->begin_token(pos);
         if (tier_) tier_->begin_token();
     }
 
@@ -204,12 +194,10 @@ public:
             return false;
         }
         if (!ensure_positions(pos + 1, err)) return false;
-        if (!experts_ && !ensure_tier(err)) return false;
-        commit_window(pos, stream);
-        windowed_ = false;
+        if (!ensure_tier(err)) return false;
         return stage_positions(pos, 1, stream);
     }
-    bool graph_capable() const override { return !experts_; }
+    bool graph_capable() const override { return true; }
 
     // Backs the compressed caches up to `positions`. When the card is full the expert tier gives back its loan of
     // spare slots and the mapping is tried again.
@@ -277,32 +265,8 @@ public:
         return true;
     }
 
-    bool window_supported() const override { return !experts_; }
 
-    bool stage_window(int64_t pos0, int T, void* stream, std::string& err) override {
-        if (pos0 + T > ctx_) {
-            err = "deepseek41: the position exceeds the context (" + std::to_string(ctx_) + " tokens)";
-            return false;
-        }
-        if (!ensure_positions(pos0 + T, err)) return false;
-        if (!experts_ && !ensure_tier(err)) return false;
-        commit_window(pos0, stream);
-        for (int t = 0; t < T; ++t) begin_token(pos0 + t);
-        windowed_ = true;
-        win_pos0_ = pos0;
-        win_n_ = T;
-        return stage_positions(pos0, T, stream);
-    }
 
-    // The window's compressor rows before `next_pos` join the carried state; the rest never touched it.
-    void commit_window(int64_t next_pos, void* stream) override {
-        if (!win_n_) return;
-        const int q = (int) std::clamp<int64_t>(next_pos - win_pos0_, 0, win_n_);
-        win_n_ = 0;
-        for (int il = 0; il < g_.n_layers; ++il)
-            if (g_.compress_ratio[(size_t) il] && kv_source(il) == il)
-                compress_window_commit(compress_args(il), dpos_ + il * kPosStride, q, cws_l_[il], stream);
-    }
 
     bool attention(int il, int64_t pos, int32_t token, const float* x, float* out, void* stream,
                    std::string& err) override {
@@ -314,13 +278,6 @@ public:
         return attn_impl(il, 1, x, out, stream, err);
     }
 
-    bool attention_window(int il, int T, const float* x, float* out, void* stream, std::string& err) override {
-        if (staged_T_ != T || !windowed_) {
-            err = "deepseek41: window attention called for a window that was not staged";
-            return false;
-        }
-        return attn_impl(il, T, x, out, stream, err);
-    }
 
     CompressArgs compress_args(int il) {
         const int ratio = g_.compress_ratio[(size_t) il];
@@ -380,8 +337,7 @@ public:
                     return false;
                 }
                 const CompressArgs ca = compress_args(il);
-                if (windowed_) compress_window(ca, x, d_pos, T, cws_l_[il], stream);
-                else compress(ca, x, d_pos, 1, cws_, stream);
+                compress(ca, x, d_pos, 1, cws_, stream);
             }
             if (index_source(il) == il) {
                 const DevTensor *iqb = W("indexer.attn_q_b.weight"), *ipj = W("indexer.proj.weight");
@@ -441,12 +397,12 @@ public:
         if (!alloc(&ex_xq_, kernels::native_q8_1_bytes(g_.n_embd, kMaxT)) ||
             !alloc(&ex_scr_, kernels::native_expert_scratch_bytes(kRows, g_.n_ff_exp)) ||
             !alloc((void**) &ex_rows_, (size_t) kRows * g_.n_embd * 4) ||
-            !alloc((void**) &ex_plan_, std::max(sizeof(ExpertPlan), sizeof(WindowPlan))))
+            !alloc((void**) &ex_plan_, sizeof(ExpertPlan)))
             return oom(err);
         // the plan and the CPU's rows are mapped host memory read by kernels: no copy-engine job queues behind the
         // promotion copies, and the host sync at the top of each layer orders their reuse
         constexpr unsigned kMapped = cudaHostAllocPortable | cudaHostAllocMapped;
-        if (cudaHostAlloc((void**) &h_plan_, std::max(sizeof(ExpertPlan), sizeof(WindowPlan)), kMapped) != cudaSuccess ||
+        if (cudaHostAlloc((void**) &h_plan_, sizeof(ExpertPlan), kMapped) != cudaSuccess ||
             cudaHostAlloc((void**) &h_x_, (size_t) kMaxT * g_.n_embd * 4, cudaHostAllocPortable) != cudaSuccess ||
             cudaHostAlloc((void**) &h_ids_, 64 * 4, cudaHostAllocPortable) != cudaSuccess ||
             cudaHostAlloc((void**) &h_rows_, (size_t) kRows * g_.n_embd * 4, kMapped) != cudaSuccess ||
@@ -471,86 +427,10 @@ public:
         kernels::quantize_q8_1_rows(x, 1, g_.n_embd, ex_xq_, stream);
     }
 
-    void routed_stage_window(int T, const float* x, const int32_t* ids, void* stream) override {
-        cudaStream_t st = (cudaStream_t) stream;
-        cudaMemcpyAsync(h_ids_, ids, (size_t) T * g_.n_used * 4, cudaMemcpyDeviceToHost, st);
-        cudaMemcpyAsync(h_x_, x, (size_t) T * g_.n_embd * 4, cudaMemcpyDeviceToHost, st);
-        kernels::quantize_q8_1_rows(x, T, g_.n_embd, ex_xq_, stream);
-    }
 
-    // The routed experts of a window. The tier is asked once per distinct expert of the window; the GPU runs each
-    // resident expert over every token that routed to it, the CPU does the same for the rest.
-    bool routed_shared_window(int il, int T, const float* x, const float* w, float* out, float* shared_out, void* stream,
-                              std::string& err) override {
-        const ExpertLayer& el = m_.pack().experts[(size_t) il];
-        const int K = g_.n_used;
-        const int n = g_.n_embd;
-        const kernels::NativeExpertLayout L = kernels::native_expert_layout(el.gu_type, el.d_type, n, g_.n_ff_exp);
-        if (L.bytes != el.blob_bytes) {
-            err = "deepseek41: layer " + std::to_string(il) + " expert blob size does not match the layout";
-            return false;
-        }
-        cudaStream_t st = (cudaStream_t) stream;
-        cudaStreamSynchronize(st);
-        int32_t uniq[ExpertTier::kMaxK];
-        int nu = 0;
-        int uidx[ExpertTier::kMaxK];   // [t * K + k] -> index in uniq
-        ExpertTier::Use use[ExpertTier::kMaxK];
-        for (int t = 0; t < T; ++t)
-            for (int k = 0; k < K; ++k) {
-                const int32_t e = h_ids_[t * K + k];
-                int u = 0;
-                while (u < nu && uniq[u] != e) ++u;
-                if (u == nu) {
-                    uniq[nu++] = e;
-                    use[u] = ExpertTier::Use{};
-                }
-                ExpertTier::Use& us = use[u];
-                us.tok[us.nt] = t;
-                us.row[us.nt] = t * K + k;
-                ++us.nt;
-                uidx[t * K + k] = u;
-            }
-        ExpertTier::Lookup lk;
-        if (!tier_->lookup(il, uniq, nu, lk, err)) return false;
-        tier_->fetch(il, lk, st);
-
-        WindowPlan& pl = *reinterpret_cast<WindowPlan*>(h_plan_);
-        int ng = 0, ne = 0;
-        for (int i = 0; i < nu; ++i) {
-            if (!lk.dev[i]) continue;
-            pl.ptr[ng] = (unsigned long long) lk.dev[i];
-            pl.start[ng] = ne;
-            for (int j = 0; j < use[i].nt; ++j) {
-                pl.dst[ne] = use[i].row[j];
-                pl.tok[ne] = use[i].tok[j];
-                ++ne;
-            }
-            ++ng;
-        }
-        pl.start[ng] = ne;
-        pl.ng[0] = ng;
-        if (ng) {
-            copy_words(d_plan_host_, ex_plan_, (int) (sizeof(WindowPlan) / 4), stream);
-            WindowPlan* dp = (WindowPlan*) ex_plan_;
-            kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst,
-                                                   dp->tok, ng, ne, ex_xq_, ex_scr_, ex_rows_, stream);
-        }
-        if (shared_out && !shared_impl(il, T, x, shared_out, stream, err)) return false;
-        if (ng < nu) {
-            if (!tier_->run_cpu_window(il, h_x_, lk, use, h_rows_, err)) return false;
-            tier_->promote(il, lk);
-        }
-        WindowRowPtrs rp{};
-        for (int r = 0; r < T * K; ++r)
-            rp.p[r] = lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * n : d_rows_ + (size_t) r * n;
-        weighted_sum_window(rp, w, T, K, n, out, stream, shared_out);
-        return true;
-    }
 
     bool routed_experts(int il, const float* x, const int32_t* ids, const float* w, float* out, void* stream,
                         std::string& err) override {
-        if (experts_) return experts_->routed_experts(il, x, ids, w, out, stream, err);
         if (!ensure_tier(err)) return false;
         routed_stage(il, x, ids, stream);
         return routed_experts_staged(il, x, ids, w, out, stream, err);
@@ -558,13 +438,11 @@ public:
 
     bool routed_experts_staged(int il, const float* x, const int32_t* ids, const float* w, float* out, void* stream,
                                std::string& err) override {
-        if (experts_) return experts_->routed_experts(il, x, ids, w, out, stream, err);
         return routed_run(il, x, w, out, nullptr, stream, err);
     }
 
     bool routed_and_shared_staged(int il, const float* x, const int32_t*, const float* w, float* out, float* shared_out,
                                   void* stream, std::string& err) override {
-        if (experts_) return LayerOps::routed_and_shared_staged(il, x, nullptr, w, out, shared_out, stream, err);
         return routed_run(il, x, w, out, shared_out, stream, err);
     }
 
@@ -653,7 +531,6 @@ private:
 
     const DsModel& m_;
     const Geometry& g_;
-    std::unique_ptr<LayerOps> experts_;
     std::unique_ptr<AttnBatch> batch_;
     std::vector<void*> allocs_;
     std::vector<uint16_t*> ring_, comp_kv_, comp_ik_;
@@ -677,7 +554,6 @@ private:
     void *sh_q1_ = nullptr, *sh_q2_ = nullptr;
     static constexpr int kPosStride = 4 * kMaxT;   // per layer: pos, window start, window rows, visible compressed rows
     std::vector<void*> cws_l_;                      // [layer] compressor workspace of a window, kept until its commit
-    bool windowed_ = false;
     int staged_T_ = 1;
     int win_n_ = 0;
     int64_t win_pos0_ = 0;
@@ -686,8 +562,8 @@ private:
 
 }  // namespace
 
-std::unique_ptr<LayerOps> make_attention_ops(const DsModel& model, std::unique_ptr<LayerOps> experts, std::string& err) {
-    auto o = std::make_unique<KernelOps>(model, std::move(experts));
+std::unique_ptr<LayerOps> make_kernel_ops(const DsModel& model, std::string& err) {
+    auto o = std::make_unique<KernelOps>(model);
     if (!o->init(err)) return nullptr;
     return o;
 }

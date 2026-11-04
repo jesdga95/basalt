@@ -333,33 +333,6 @@ bool ExpertTier::run_cpu(int layer, const float* x, const Lookup& lk, float* row
     return true;
 }
 
-bool ExpertTier::run_cpu_window(int layer, const float* x, const Lookup& lk, const Use* use, float* rows,
-                                std::string& err) {
-    const kernels::cpu::NativeFmt& f = fmt_[(size_t) layer];
-    const size_t n_embd = (size_t) m_.geo().n_embd;
-    kernels::cpu::ExpertJobMulti jobs[kMaxK];
-    bool quantized[kMaxWindow] = {};
-    int n = 0;
-    for (int i = 0; i < lk.k; ++i) {
-        if (lk.dev[i]) continue;
-        jobs[n] = kernels::cpu::ExpertJobMulti{};
-        jobs[n].blob = lk.host[i];
-        jobs[n].nt = use[i].nt;
-        for (int j = 0; j < use[i].nt; ++j) {
-            const int t = use[i].tok[j];
-            if (!quantized[t]) {
-                kernels::cpu::native_quant_act(f, x + (size_t) t * n_embd, act_ + (size_t) t * kernels::cpu::kNativeActBytes);
-                quantized[t] = true;
-            }
-            jobs[n].nact[j] = act_ + (size_t) t * kernels::cpu::kNativeActBytes;
-            jobs[n].out[j] = rows + (size_t) use[i].row[j] * n_embd;
-        }
-        ++n;
-    }
-    if (n) pool_->run_split_multi_native(f, jobs, n);
-    (void) err;
-    return true;
-}
 
 int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t stream) {
     if (pending_.size() >= kMaxPending || free_events_.empty()) {

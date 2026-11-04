@@ -68,45 +68,13 @@ public:
     }
     /// True when attention, routed_stage and shared_expert only enqueue work on the stream (graph capturable).
     virtual bool graph_capable() const { return false; }
-    /// A decode window of T tokens at pos0..: the verify pass of a speculative step. Rows past the next call's position
-    /// are rolled back by that call (see commit_window). The default implementation has no window path.
-    virtual bool window_supported() const { return false; }
-    /// Folds the state of the last window into the conversation: tokens before `next_pos` stay, the rest are dropped.
-    virtual void commit_window(int64_t next_pos, void* stream) { (void) next_pos; (void) stream; }
-    /// Uploads positions and window bounds of the T tokens at pos0.. (after begin_token for each).
-    virtual bool stage_window(int64_t pos0, int T, void* stream, std::string& err) {
-        (void) pos0; (void) T; (void) stream; (void) err;
-        return false;
-    }
-    /// attention() for the staged window: x and out are [T][n_embd].
-    virtual bool attention_window(int layer, int T, const float* x, float* out, void* stream, std::string& err) {
-        (void) layer; (void) T; (void) x; (void) out; (void) stream;
-        err = "deepseek41: this layer ops implementation has no window attention";
-        return false;
-    }
-    /// routed_stage() for T rows: ids [T][k], x [T][n_embd] (device) go to pinned host memory.
-    virtual void routed_stage_window(int T, const float* x, const int32_t* ids, void* stream) {
-        (void) T; (void) x; (void) ids; (void) stream;
-    }
-    /// routed_and_shared_staged() for T rows: weights [T][k]; out and shared_out are [T][n_embd].
-    virtual bool routed_shared_window(int layer, int T, const float* x, const float* weights, float* out,
-                                      float* shared_out, void* stream, std::string& err) {
-        (void) layer; (void) T; (void) x; (void) weights; (void) out; (void) shared_out; (void) stream;
-        err = "deepseek41: this layer ops implementation has no window experts";
-        return false;
-    }
     /// Enqueues the copy of the router's expert ids and the activation to pinned host memory, for routed_experts.
     virtual void routed_stage(int layer, const float* x, const int32_t* ids, void* stream) {
         (void) layer; (void) x; (void) ids; (void) stream;
     }
 };
 
-/// The implementation used until the kernels are wired: every call fails with a message naming the missing piece.
-std::unique_ptr<LayerOps> make_unavailable_ops();
-/// Ops built from the kernel groups' entry points (src/models/deepseek41/ops_kernels.cpp). `fixture` is a diagnostic:
-/// when non-empty, the routed and shared expert outputs are replayed from that recorded fixture (fixture_ops.cpp).
-std::unique_ptr<LayerOps> make_kernel_ops(const DsModel& model, const std::string& fixture, std::string& err);
-/// Dev only: replays recorded outputs; `which` selects what it serves (attention too when `with_attention`).
-std::unique_ptr<LayerOps> make_fixture_ops(const DsModel& model, const std::string& fixture, std::string& err);
+/// Ops built from the kernel groups' entry points (ops_kernels.cpp).
+std::unique_ptr<LayerOps> make_kernel_ops(const DsModel& model, std::string& err);
 
 }  // namespace basalt::models::deepseek41

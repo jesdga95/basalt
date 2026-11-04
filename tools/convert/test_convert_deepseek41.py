@@ -150,35 +150,6 @@ class DeepSeek41Test(unittest.TestCase):
         self.assertEqual(meta["vision"]["mmproj"], "vision/mmproj")
         self.assertEqual(meta["vision"]["mmproj_bytes"], proj.stat().st_size)
 
-    def drafter(self):
-        g = GGUFWriter()
-        g.add("general.architecture", "dflash")
-        g.add("dflash.block_count", 3, "u32")
-        g.add_f32("enc.output_norm.weight", np.arange(64, dtype=np.float32))
-        return g.write(self.t / "dspark.gguf")
-
-    def test_dspark_becomes_its_own_section(self):
-        d = self.drafter()
-        convert.convert(self.args(dspark=str(d)))
-        m = ModelFile(str(self.t / "out.basalt"))
-        self.assertIn("dspark/gguf", m.names())
-        self.assertTrue(m.verify("dspark/gguf"))
-        self.assertEqual(m.section("dspark/gguf")[0] % SECTION_ALIGN, 0)
-        self.assertEqual(m.read("dspark/gguf"), d.read_bytes())
-        meta = json.loads(m.read("meta"))
-        self.assertEqual(meta["dspark"], {"section": "dspark/gguf", "bytes": d.stat().st_size, "architecture": "dflash"})
-        self.assertIn("dspark.gguf", [x["path"] for x in meta["sources"]])
-
-    def test_no_dspark_means_no_section_and_no_meta(self):
-        convert.convert(self.args())
-        m = ModelFile(str(self.t / "out.basalt"))
-        self.assertNotIn("dspark/gguf", m.names())
-        self.assertNotIn("dspark", json.loads(m.read("meta")))
-
-    def test_foreign_dspark_is_refused(self):
-        with self.assertRaises(SystemExit):
-            convert.convert(self.args(dspark=str(self.gguf)))
-
     def test_foreign_mmproj_is_refused(self):
         with self.assertRaises(SystemExit):
             convert.convert(self.args(mmproj=str(self.gguf)))

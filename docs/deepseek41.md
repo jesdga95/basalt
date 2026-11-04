@@ -27,11 +27,6 @@ the pack and picks the chat format, tool-call syntax and thinking switch to matc
   generated) and a checkpoint before the last prompt token. A request whose prompt starts with all the held tokens, or
   with the checkpoint's (a next turn after a thinking reply: the template drops the thinking from the history), reads
   only the new tail; any other request reads its whole prompt again. `pp=N/Mc` in the done line shows how many were kept.
-- **Second GPU:** not used by this model outside `--spec`.
-- **Speculation:** off by default. A pack built with `--dspark` carries the DSpark drafter; `--spec N` (2 to 6) loads it
-  onto the second GPU (about 8.5 GB) and drafts N - 1 tokens per window, verified in one pass. It applies to greedy
-  requests, keeps the output identical to plain decoding up to the numerics of a multi-row window
-  ([precision](precision/deepseek41.md)), and pays only where the second GPU's draft overlaps the verify; on one
-  card it is a loss, so leave it off there. `--spec` on a pack without the section is refused at start.
+- **Second GPU:** not used by this model.
 - **Images:** `--vision dynamic` encodes inside the engine from the pack's `vision/mmproj` section, which exists when the
   pack was built with `--mmproj` ([model file](model-file.md#deepseek-v41-pack)). The sidecar modes do not apply.

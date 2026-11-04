@@ -131,7 +131,6 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
     }
 
     p.vision = p.file.range("vision/mmproj");
-    p.dspark = p.file.range("dspark/gguf");
 
     // the experts section and its per-layer layout
     p.experts_range = p.file.range("experts");

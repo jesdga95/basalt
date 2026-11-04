@@ -72,9 +72,6 @@ public:
     /// The CPU's share: the experts of `lk` without a device blob, over the activation `x` (n_embd floats, host).
     /// Row i of `rows` (n_embd floats each) gets expert i's output.
     bool run_cpu(int layer, const float* x, const Lookup& lk, float* rows, std::string& err);
-    /// run_cpu for a window: `x` holds one activation row per token (n_embd floats each, host), `use[i]` says which
-    /// tokens read expert i of `lk` and where each one's output row goes in `rows`.
-    bool run_cpu_window(int layer, const float* x, const Lookup& lk, const Use* use, float* rows, std::string& err);
     /// Starts the bus copy of the pinned misses of `lk` beyond the CPU's half (policy::bus_count) into the VRAM tier and makes `main` wait for the copies;
     /// those experts get a device blob in `lk`, so the GPU computes them with the hits while the CPU does the rest.
     void fetch(int layer, Lookup& lk, cudaStream_t main);

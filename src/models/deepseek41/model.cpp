@@ -161,7 +161,6 @@ bool DsModel::embedding_row(int32_t token, float* out, std::string& err) const {
 }
 
 bool DsModel::open_mmproj(vision::Mmproj& mp, std::string& err) const {
-    if (!diag_mmproj_.empty()) return mp.open(diag_mmproj_, err, "deepseek41v");
     if (pack_.vision.empty() || pack_.vision.bytes == 0) {
         err = "this pack carries no vision projector (convert with --mmproj)";
         return false;
