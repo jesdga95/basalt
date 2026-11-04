@@ -1,4 +1,5 @@
 // src/models/deepseek41/model.cpp - loads a DeepSeek-V4.1 pack onto the GPU.
+#include "basalt/core/load_progress.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/model.hpp"
 
@@ -51,6 +52,15 @@ bool DsModel::load(const std::string& path, std::string& err) {
     std::vector<uint8_t> staging;
     std::vector<float> wide;
     uint64_t total = 0;
+    uint64_t dense_bytes = 0;
+    for (const auto& [name, t] : pack_.tensors) {
+        if (name == "token_embd.weight" || name == "per_layer_token_embd.weight") continue;
+        const bool wide_gate = t.type == 30 && name.find("ffn_gate_inp.weight") != std::string::npos;
+        dense_bytes += wide_gate ? t.bytes * 2 : t.bytes;
+    }
+    core::LoadProgress::announce_total(dense_bytes + pack_.experts_range.size());
+    core::LoadProgress::plan(core::LoadProgress::cuda(0), dense_bytes);
+    core::LoadProgress dense_load(core::LoadProgress::cuda(0), dense_bytes);
     for (const auto& [name, t] : pack_.tensors) {
         if (name == "token_embd.weight" || name == "per_layer_token_embd.weight") continue;
         DevTensor d;
@@ -86,10 +96,12 @@ bool DsModel::load(const std::string& path, std::string& err) {
                 cudaFree(d.ptr);
                 return false;
             }
+            dense_load.add(widen ? n * 2 : n);
         }
         total += d.bytes;
         dev_.emplace(name, std::move(d));
     }
+    dense_load.finish();
     basalt::log::info("basalt deepseek41", "%zu dense tensors, %.2f GiB on the GPU", dev_.size(),
                  (double) total / (1024.0 * 1024.0 * 1024.0));
 
@@ -140,6 +152,7 @@ bool DsModel::resolve_context(int64_t requested, bool set, std::string& err) {
         return false;
     }
     ctx_ = p.context;
+    core::LoadProgress::kv(core::LoadProgress::cuda(0), ctxp::context_bytes(0, ratios), ctx_, "", ctxp::context_bytes(ctx_, ratios));
     basalt::log::info("basalt deepseek41", "context %lld tokens%s (caches of a full context: %.2f GiB)%s%s", (long long) ctx_,
                  set ? "" : " (the model's maximum within the free memory)",
                  (double) ctxp::context_bytes(ctx_, ratios) / (1024.0 * 1024.0 * 1024.0), p.note.empty() ? "" : "; ",

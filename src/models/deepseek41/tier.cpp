@@ -2,6 +2,9 @@
 #include "basalt/log.hpp"
 #include "models/deepseek41/tier.hpp"
 
+#include "basalt/core/load_progress.hpp"
+#include <optional>
+
 #include "basalt/core/expert_source.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
@@ -163,6 +166,11 @@ bool ExpertTier::open(const Reserve& reserve, const float* h_x, float* h_rows, s
         seed_copies(0, per_layer_);
         promoted_ = 0;
     }
+    // what the start picked by itself, on the server's auto line; the RAM floor the tier left free
+    std::printf("auto flags: resident %.1f GB, pool-workers %d\n",
+                (double) one_each_ram * cover_ / 1e9, pool_->workers());
+    std::fflush(stdout);
+    basalt::log::info("basalt generate", "RAM floor %.1f GiB", (double) (homes_.file > 0 ? kRamHeadroom : kRamHeadroomNoFile) / 1073741824.0);
     basalt::log::info("basalt deepseek41", "expert homes of %d per layer: main card %d, second card %d, RAM %d, file %d; main card copies %lld",
                  n_expert_, homes_.main, homes_.peer, homes_.ram, homes_.file, (long long) (homes_.main > 0 ? ext_per_layer_ : per_layer_));
     basalt::log::info("basalt deepseek41", "VRAM expert tier %.2f GiB, %lld of %d experts per layer (%.0f%%); CPU pool %d workers",
@@ -223,6 +231,18 @@ bool ExpertTier::load_ram(std::string& err) {
     if (swaps)
         for (int l = 0; l < n_layers_; ++l) spare_[(size_t) l] = cover_;
     const auto t0 = std::chrono::steady_clock::now();
+    // what the start places from here on: the file's share never loads, a second card and the RAM tier have their bars
+    const uint64_t ram_bytes = per_layer * (uint64_t) cover_;
+    const uint64_t main_bytes = per_layer * (uint64_t) homes_.main, peer_bytes = per_layer * (uint64_t) homes_.peer;
+    core::LoadProgress::skipped(per_layer * (uint64_t) homes_.file);
+    if (ram_bytes > 0) core::LoadProgress::plan("ram", ram_bytes);
+    std::optional<core::LoadProgress> ram_load, main_load, peer_load;
+    if (ram_bytes > 0) ram_load.emplace("ram", ram_bytes);
+    if (main_bytes > 0) main_load.emplace(core::LoadProgress::cuda(0), main_bytes);
+    if (peer_bytes > 0) {
+        core::LoadProgress::plan(core::LoadProgress::cuda(peer_->device()), peer_bytes);
+        peer_load.emplace(core::LoadProgress::cuda(peer_->device()), peer_bytes);
+    }
     std::atomic<int> next{0};
     std::atomic<bool> failed{false};
     std::mutex mu;
@@ -265,10 +285,14 @@ bool ExpertTier::load_ram(std::string& err) {
                 if (r < 0 && home < 0) continue;
                 const uint8_t* got = read_blob(el.blob_bytes, m_.pack().experts_range.offset + el.offset + (uint64_t) e * el.blob_bytes);
                 bool ok = got != nullptr;
-                if (ok && r >= 0) std::memcpy(p + (uint64_t) r * el.blob_bytes, got, el.blob_bytes);
+                if (ok && r >= 0) {
+                    std::memcpy(p + (uint64_t) r * el.blob_bytes, got, el.blob_bytes);
+                    ram_load->add(el.blob_bytes);
+                }
                 if (ok && home >= 0)
                     ok = res_[idx] >= 0 ? cudaMemcpy(cache_.device_slot(home), got, el.blob_bytes, cudaMemcpyHostToDevice) == cudaSuccess
                                         : peer_->fill(home, got, el.blob_bytes);
+                if (ok && home >= 0) (res_[idx] >= 0 ? main_load : peer_load)->add(el.blob_bytes);
                 if (!ok) {
                     std::lock_guard<std::mutex> g(mu);
                     err = "deepseek41: short read loading the expert tiers";
@@ -284,6 +308,9 @@ bool ExpertTier::load_ram(std::string& err) {
     for (std::thread& t : th) t.join();
     if (direct >= 0) platform::close_fd(direct);
     if (failed) return false;
+    if (ram_load) ram_load->finish();
+    if (main_load) main_load->finish();
+    if (peer_load) peer_load->finish();
     if (swaps) worker_ = std::thread([this] { swap_worker(); });
     // what the load left in the page cache goes, and the most routed of the experts left in the file take its place
     platform::advise_dontneed(m_.experts_fd(), m_.pack().experts_range.offset, m_.pack().experts_range.size());
