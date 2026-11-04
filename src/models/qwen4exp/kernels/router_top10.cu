@@ -1,4 +1,4 @@
-// src/kernels/cuda/router_top10.cu - the MoE router.
+// src/models/qwen4exp/kernels/router_top10.cu - the MoE router.
 //
 // Softmax / top-k / renormalize per the model definition; emits (expert_id, weight) x 10
 // per token.  This is the softmax/top-k/renormalize half; the BF16 GEMV that produces the logits is a
@@ -38,7 +38,7 @@
 //     which IS "stable descending argsort, ties by ascending index" - the same order a repeated-maximum loop
 //     produces - computed in ONE parallel pass over the experts instead of k serial ones.  It is O(n^2)
 //     comparisons and that is the right trade here: n = 512 and every comparison is independent.
-#include "basalt/kernels/router_top10.hpp"
+#include "basalt/models/qwen4exp/kernels/router_top10.hpp"
 
 #include <cuda_runtime.h>
 

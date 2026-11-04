@@ -1,4 +1,4 @@
-// src/kernels/cuda/ple.cu - the PLE block's GPU half.
+// src/models/qwen4exp/kernels/ple.cu - the PLE block's GPU half.
 //
 // See include/basalt/kernels/ple.hpp for the structure and for the `normalized`-is-the-conv-input finding.
 //
@@ -16,9 +16,9 @@
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/kernels/quantize_act.hpp"
-#include "basalt/kernels/s2_gemv_q8.hpp"
+#include "basalt/models/qwen4exp/kernels/s2_gemv_q8.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
-#include "basalt/kernels/native_ple_postops.hpp"
+#include "basalt/models/qwen4exp/kernels/native_ple_postops.hpp"
 
 #include <cuda_runtime.h>
 

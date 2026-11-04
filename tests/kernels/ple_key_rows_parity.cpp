@@ -6,7 +6,7 @@
 //   ple_key_rows_parity [iters]
 #include "basalt/models/qwen4exp/kernels/native_gr_postops.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
-#include "basalt/kernels/native_ple_postops.hpp"
+#include "basalt/models/qwen4exp/kernels/native_ple_postops.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/kernels/ple.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"

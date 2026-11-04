@@ -1,4 +1,4 @@
-// src/kernels/cuda/s2_expert_grouped.cu - R4's grouped GPU expert.  Read the header first.
+// src/models/qwen4exp/kernels/s2_expert_grouped.cu - R4's grouped GPU expert.  Read the header first.
 //
 // THE ARITHMETIC IS `src/kernels/cpu/expert.cpp`'s, over the same bytes, one warp per output row.
 //
