@@ -16,7 +16,6 @@
 
 #ifdef BASALT_IQ1S_GPU
 #include "basalt/kernels/iq_kernels.hpp"
-#include "models/deepseek41/prefill_ffn.hpp"
 #include <cuda_runtime.h>
 #endif
 
@@ -34,7 +33,6 @@ namespace {
 
 namespace kc = basalt::kernels::cpu;
 #ifdef BASALT_IQ1S_GPU
-using basalt::models::deepseek41::weighted_sum_tokens;
 #endif
 
 constexpr int H = 5120, FF = 2304, K = 6;
@@ -562,137 +560,6 @@ void gpu_pair(int gu, int d, bool bench, cudaStream_t s) {
     }
     cudaFree(blobs); cudaFree(dx); cudaFree(xq);
 }
-
-// The prompt path of a layer with an IQ1_M side: one q8_1 pass over the chunk, launches of up to 32 staged experts in
-// expert order at the layer stride, the grouped kernel with entries pair = t * K + slot, the weighted sum per token.
-// Checks: every (token, slot) row bitwise equal to a decode step on that token alone, the same rows at another chunk
-// width and token order, and the weighted output against the CPU double reference.
-void gpu_prefill_pair(int gu, int d, cudaStream_t s) {
-    std::mt19937 rng(300 + gu * 7 + d);
-    const int NB = 40, T = 192, TW = 48, TREF = 24;
-    constexpr int kStage = 32;
-    std::vector<Expert> ex;
-    for (int b = 0; b < NB; ++b) ex.push_back(make_expert(gu, d, rng));
-    const kg::NativeExpertLayout L = kg::native_expert_layout(gu, d, H, FF);
-    check(L.bytes == ex[0].blob.size(), "layout bytes");
-    size_t unit = 1;
-    for (int t : {gu, d}) {
-        const size_t bs = ggml_type_size((ggml_type) t);
-        unit = unit / std::gcd(unit, bs) * bs;
-    }
-    const size_t stride = (L.bytes + unit - 1) / unit * unit;
-
-    std::normal_distribution<float> nd(0.f, 1.f);
-    std::vector<float> x((size_t) T * H);
-    for (auto& v : x) v = nd(rng);
-    std::vector<int> ids((size_t) T * K);
-    std::vector<float> w((size_t) T * K);
-    std::uniform_real_distribution<float> wd(0.01f, 1.f);
-    std::vector<int> all(NB);
-    std::iota(all.begin(), all.end(), 0);
-    for (int t = 0; t < T; ++t) {
-        std::shuffle(all.begin(), all.end(), rng);
-        for (int k = 0; k < K; ++k) {
-            ids[(size_t) t * K + k] = all[k];
-            w[(size_t) t * K + k] = wd(rng);
-        }
-    }
-    const size_t q1 = (size_t) H / 32 * 36;
-    auto* dx = dalloc<float>(x.size());
-    auto* xq = dalloc<uint8_t>(q1 * T);
-    auto* stage = dalloc<uint8_t>(stride * kStage);
-    auto* gptr = dalloc<unsigned long long>(kStage);
-    auto* gcount = dalloc<int32_t>(1);
-    auto* bounds = dalloc<int32_t>(kStage + 1);
-    auto* dtok = dalloc<int32_t>((size_t) T * K);
-    auto* dpair = dalloc<int32_t>((size_t) T * K);
-    auto* scratch = dalloc<uint8_t>(kg::native_expert_scratch_bytes((size_t) T * K, FF));
-    auto* rows = dalloc<float>((size_t) T * K * H);
-
-    // one chunk of the tokens in `order`: its rows come back at the chunk's positions
-    auto chunk = [&](const std::vector<int>& order, std::vector<float>& out) {
-        const int n = (int) order.size();
-        std::vector<float> xc((size_t) n * H);
-        for (int i = 0; i < n; ++i) std::memcpy(&xc[(size_t) i * H], &x[(size_t) order[i] * H], H * 4);
-        up(dx, xc);
-        kg::quantize_q8_1_rows(dx, n, H, xq, s);
-        std::vector<std::vector<int32_t>> by(NB);
-        for (int i = 0; i < n; ++i)
-            for (int k = 0; k < K; ++k) by[ids[(size_t) order[i] * K + k]].push_back(i * K + k);
-        std::vector<int> used;
-        for (int e = 0; e < NB; ++e)
-            if (!by[e].empty()) used.push_back(e);
-        for (size_t b0 = 0; b0 < used.size();) {
-            const int nb = (int) std::min<size_t>(kStage, used.size() - b0);
-            std::vector<unsigned long long> ptr;
-            std::vector<int32_t> tok, pair, bnd{0};
-            for (int q = 0; q < nb; ++q) {
-                ck(cudaMemcpy(stage + stride * q, ex[used[b0 + q]].blob.data(), L.bytes, cudaMemcpyHostToDevice), "blob");
-                ptr.push_back((unsigned long long) (stage + stride * q));
-                for (int32_t p : by[used[b0 + q]]) {
-                    tok.push_back(p / K);
-                    pair.push_back(p);
-                }
-                bnd.push_back((int32_t) tok.size());
-            }
-            up(gptr, ptr); up(dtok, tok); up(dpair, pair); up(bounds, bnd);
-            const int32_t cnt = nb;
-            ck(cudaMemcpy(gcount, &cnt, 4, cudaMemcpyHostToDevice), "count");
-            kg::native_expert_grouped_clamped(L, kLimit, gptr, bounds, gcount, dpair, dtok, nb, (int64_t) tok.size(), xq, scratch, rows, s);
-            ck(cudaStreamSynchronize(s), "sync");
-            b0 += (size_t) nb;
-        }
-        out = down(rows, (size_t) n * K * H);
-    };
-
-    std::vector<int> order(T);
-    std::iota(order.begin(), order.end(), 0);
-    std::vector<float> got;
-    chunk(order, got);
-    const auto xqh = down(xq, q1 * T);
-
-    // the weighted sum against the double reference, whose rows are recomputed from the weights
-    auto* dw = dalloc<float>(w.size());
-    up(dw, w);
-    auto* dsum = dalloc<float>((size_t) T * H);
-    weighted_sum_tokens(rows, dw, T, K, H, dsum, s);
-    ck(cudaStreamSynchronize(s), "sync");
-    const auto sum = down(dsum, (size_t) T * H);
-    Err e;
-    for (int t = 0; t < TREF; ++t) {
-        const auto xh = q81_deq(xqh, t);
-        std::vector<double> acc(H, 0.0);
-        for (int k = 0; k < K; ++k) {
-            const Expert& E = ex[ids[(size_t) t * K + k]];
-            const auto ref = ref_expert(E.wg, E.wu, E.wd, xh, nullptr);
-            for (int r = 0; r < H; ++r) acc[r] += (double) w[(size_t) t * K + k] * ref[r];
-        }
-        for (int r = 0; r < H; ++r) e.add(sum[(size_t) t * H + r], acc[r]);
-    }
-
-    // a decode step: the token alone
-    bool same_step = true;
-    for (int t : {0, 1, 7, T / 2, T - 1}) {
-        std::vector<float> one;
-        chunk({t}, one);
-        same_step = same_step && std::memcmp(one.data(), &got[(size_t) t * K * H], (size_t) K * H * 4) == 0;
-    }
-    // another chunk width and token order
-    std::vector<int> other(order.rbegin(), order.rbegin() + TW);
-    std::vector<float> rev;
-    chunk(other, rev);
-    bool same_chunk = true;
-    for (int i = 0; i < TW; ++i)
-        same_chunk = same_chunk && std::memcmp(&rev[(size_t) i * K * H], &got[(size_t) other[i] * K * H], (size_t) K * H * 4) == 0;
-
-    const bool ok = e.rms() < 2e-2 && same_step && same_chunk;
-    std::printf("gpu %-7s/%-7s prompt path (%d tokens x %d, %d experts, launches of %d): sum rel RMS %.2e, max abs %.2e, max/|ref|max %.2e over %d tokens  equal to a decode step %s  chunk/position-independent %s  %s\n",
-                nm(gu), nm(d), T, K, NB, kStage, e.rms(), e.max_abs, e.rel_max(), TREF, same_step ? "yes" : "NO",
-                same_chunk ? "yes" : "NO", ok ? "ok" : "FAIL");
-    if (!ok) ++g_fail;
-    cudaFree(dx); cudaFree(xq); cudaFree(stage); cudaFree(gptr); cudaFree(gcount); cudaFree(bounds); cudaFree(dtok);
-    cudaFree(dpair); cudaFree(scratch); cudaFree(rows); cudaFree(dw); cudaFree(dsum);
-}
 #endif
 
 }  // namespace
@@ -764,10 +631,6 @@ int main(int argc, char** argv) {
         gpu_pair(17, 29, bench, s);
         gpu_pair(29, 16, bench, s);
         gpu_pair(17, 16, bench, s);
-        gpu_prefill_pair(29, 29, s);
-        gpu_prefill_pair(16, 29, s);
-        gpu_prefill_pair(17, 29, s);
-        gpu_prefill_pair(29, 16, s);
     }
 #else
     (void) cpu_only;
