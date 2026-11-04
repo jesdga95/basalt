@@ -248,6 +248,7 @@ void QfnRequest::draft_begin() {
 }
 
 void QfnRequest::prompt_parts_reset() {
+    runtime_.pp_next_check = resume + runtime_.o.prompt_cache_every;
     {
         std::lock_guard<std::mutex> lk(runtime_.part_mu);
         runtime_.part_at.clear();

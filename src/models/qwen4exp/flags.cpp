@@ -28,6 +28,7 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, program::Options& o
     else if (a == "--yarn-attn-factor") o.yarn_attn_factor = std::atof(args.next("--yarn-attn-factor"));
     else if (a == "--yarn-beta-fast") o.yarn_beta_fast = std::atof(args.next("--yarn-beta-fast"));
     else if (a == "--yarn-beta-slow") o.yarn_beta_slow = std::atof(args.next("--yarn-beta-slow"));
+    else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(args.next("--prompt-cache-every")));
     else if (a == "--dump-residual") o.dump_residual = args.next("--dump-residual");
     else if (a == "--dump-mixed") o.dump_mixed = args.next("--dump-mixed");
     else if (a == "--dump-routing") o.dump_routing = args.next("--dump-routing");
