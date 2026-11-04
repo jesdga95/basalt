@@ -86,6 +86,10 @@ void gated_mlp_clamped(const NativeExpertLayout& L, float swiglu_limit, const vo
 /// kernels even with GU_MMA=1.  Bitwise the same results (native_grouped_parity checks it); kept for A/B
 /// timing.  Set before graph capture; captured graphs keep theirs.
 void native_grouped_set_v1(bool v1);
+/// What those switches say now, for kernels built on this file's device code elsewhere.
+int native_grouped_gu2();
+bool native_grouped_v1();
+int native_expert_phase();
 /// GU_MMA=2: this thread's next grouped calls take the tensor-core gate/up (where it applies) when on
 void native_grouped_set_mma_hint(bool on);
 /// DEC_GU2: 1 the grid formats' gate/up rows on native_gu2_kernel, 2 also the SwiGLU pass inside the down
