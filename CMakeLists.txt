@@ -363,20 +363,20 @@ add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/exper
   src/models/qwen4exp/decode/verify/record_moe.cpp
   src/models/qwen4exp/decode/verify/record_qsa.cpp
   src/models/qwen4exp/decode/verify/sampling.cpp
-  src/core/mtp/helpers.cpp
-  src/core/mtp/lifecycle.cpp
-  src/core/mtp/tensors.cpp
-  src/core/mtp/load.cpp
-  src/core/mtp/head.cpp
-  src/core/mtp/forward.cpp
-  src/core/mtp/graphs.cpp
-  src/core/mtp/branches.cpp
-  src/core/mtp/conditional.cpp
-  src/core/mtp/prefill.cpp
-  src/core/mtp/context.cpp
-  src/core/mtp/draft.cpp
-  src/core/mtp/stores.cpp
-  src/core/mtp/batching.cpp
+  src/models/qwen4exp/decode/mtp/helpers.cpp
+  src/models/qwen4exp/decode/mtp/lifecycle.cpp
+  src/models/qwen4exp/decode/mtp/tensors.cpp
+  src/models/qwen4exp/decode/mtp/load.cpp
+  src/models/qwen4exp/decode/mtp/head.cpp
+  src/models/qwen4exp/decode/mtp/forward.cpp
+  src/models/qwen4exp/decode/mtp/graphs.cpp
+  src/models/qwen4exp/decode/mtp/branches.cpp
+  src/models/qwen4exp/decode/mtp/conditional.cpp
+  src/models/qwen4exp/decode/mtp/prefill.cpp
+  src/models/qwen4exp/decode/mtp/context.cpp
+  src/models/qwen4exp/decode/mtp/draft.cpp
+  src/models/qwen4exp/decode/mtp/stores.cpp
+  src/models/qwen4exp/decode/mtp/batching.cpp
   src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/conversation_store.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp)
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(engine PUBLIC core model kernels kernels_cpu ${_gpu_runtime_target})
