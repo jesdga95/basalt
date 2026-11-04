@@ -595,7 +595,7 @@ def tool_choice_of(tool_choice) -> tuple[str, str | None]:
                      "(Anthropic: any) or a named tool")
 
 
-def forced_call(tool_choice, tools: list[dict] | None) -> tuple[list[dict] | None, str | None]:
+def forced_call(tool_choice, tools: list[dict] | None, opening=None) -> tuple[list[dict] | None, str | None]:
     """`tool_choice` -> (the tools to offer, the text that opens the call the reply must make or None).
     "none" offers no tools.  There is no grammar: the server writes the opening itself, so the model can only go on
     with a call.  "required" / Anthropic "any": any tool (the only one is named); a named tool: that one.  A forced
@@ -613,6 +613,8 @@ def forced_call(tool_choice, tools: list[dict] | None) -> tuple[list[dict] | Non
             name = names[0]
     elif name not in names:
         raise ValueError(f"tool_choice: the request has no tool named {name!r}")
+    if opening is not None:
+        return tools, opening(name)
     return tools, CALL_START + (f"\n<function={name}>\n" if name else "\n<function=")
 
 
