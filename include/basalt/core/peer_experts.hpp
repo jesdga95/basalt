@@ -73,6 +73,8 @@ public:
     /// The device bytes `open` allocates besides the expert slots (buffers and kernel scratch), taken before the
     /// slots are sized from what is left.
     static uint64_t device_overhead_bytes();
+    /// The least scratch a tier opens with, for a model whose experts need more than the native kernels (before any open).
+    static void set_min_scratch(size_t bytes);
     bool valid() const { return device_ >= 0; }
     int device() const { return device_; }
 

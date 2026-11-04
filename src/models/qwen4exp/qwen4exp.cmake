@@ -48,7 +48,7 @@ add_library(model_qwen4exp_kernels STATIC
 target_link_libraries(model_qwen4exp_kernels PUBLIC kernels)
 
 # The composed layer: layer and session, the verify windows, the MTP drafter, the conversation state.
-add_library(model_qwen4exp_engine STATIC src/models/qwen4exp/decode/layer.cpp
+add_library(model_qwen4exp_engine STATIC src/models/qwen4exp/decode/layer.cpp src/models/qwen4exp/decode/expert_dispatch.cpp
   src/models/qwen4exp/decode/session.cpp
   src/core/kv_arena.cpp
   src/core/native_head.cpp
