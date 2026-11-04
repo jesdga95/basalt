@@ -345,6 +345,28 @@ static void test_control_escapes() {
     CHECK(!Grammar::parse("root ::= \"" + std::string(1, '\0') + "\"", err) && err.find("NUL") != std::string::npos);
 }
 
+// A form whose text end has characters of several bytes: the free text is checked by character.
+static void test_multibyte_text_end() {
+    const std::string bar = "\xef\xbd\x9c";
+    ToolForm f = tool_form();
+    const ToolForm saved = f;
+    f.param_mid_text = f.param_mid_value = ">";
+    f.param_close = "</" + bar + "p>\n";
+    f.text_end = "</" + bar + "p>";
+    set_tool_form(f);
+    std::string err;
+    auto g = Grammar::parse(tool_call_gbnf(R"([{"name":"w","parameters":{"type":"object","properties":{"c":{"type":"string"}},"required":["c"]}}])",
+                                           ToolGrammarOptions{}, err), err);
+    set_tool_form(saved);
+    if (!g) std::printf("%s\n", err.c_str());
+    CHECK(g);
+    if (!g) return;
+    const std::string head = "<tool_call>\n<function=w>\n<parameter=c>";
+    const std::string end = "</" + bar + "p>\n</function>\n</tool_call>";
+    CHECK(call_ok(g, head + "Paris" + end));
+    CHECK(call_ok(g, head + "a " + bar + " </ </\xef\xbd\x9d" + end));   // a near match and a neighbour character stay text
+}
+
 int main() {
     set_test_tool_form();
     test_request();
@@ -357,6 +379,7 @@ int main() {
     test_text_unions();
     test_union_parameters();
     test_control_escapes();
+    test_multibyte_text_end();
     if (g_fail) { std::printf("grammar_schema_test: %d failures\n", g_fail); return 1; }
     std::printf("grammar_schema_test: ok\n");
     return 0;

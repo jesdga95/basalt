@@ -124,21 +124,35 @@ std::string hex_escape(unsigned char c) {
     return std::string("\\x") + h[c >> 4] + h[c & 15];
 }
 
-// Text that never contains the closing tag: a KMP automaton over the tag, one rule per matched length. The tag's last
-// character is the one move the automaton refuses.
+// The UTF-8 characters of `s`: a grammar's literals and classes read characters, not bytes.
+std::vector<std::string> utf8_chars(const std::string& s) {
+    std::vector<std::string> out;
+    for (size_t i = 0; i < s.size();) {
+        size_t n = 1;
+        while (i + n < s.size() && ((unsigned char) s[i + n] & 0xC0) == 0x80) ++n;
+        out.push_back(s.substr(i, n));
+        i += n;
+    }
+    return out;
+}
+
+// Text that never contains the closing tag: a KMP automaton over the tag's characters, one rule per matched length.
+// The tag's last character is the one move the automaton refuses.
 std::string add_free_text(SchemaConverter& c, const std::string& tag) {
-    size_t n = tag.size();
-    std::set<unsigned char> alpha(tag.begin(), tag.end());
+    const std::vector<std::string> chars = utf8_chars(tag);
+    size_t n = chars.size();
+    std::set<std::string> alpha(chars.begin(), chars.end());
     std::string excluded;
-    for (unsigned char a : alpha) excluded += hex_escape(a);
+    for (const std::string& a : alpha) excluded += a.size() == 1 ? hex_escape((unsigned char) a[0]) : a;
     for (size_t i = 0; i < n; ++i) {
         std::vector<std::string> alts;
-        for (unsigned char a : alpha) {
-            std::string seen = tag.substr(0, i) + (char) a;
+        for (const std::string& a : alpha) {
+            std::vector<std::string> seen(chars.begin(), chars.begin() + (std::ptrdiff_t) i);
+            seen.push_back(a);
             size_t k = (std::min)(seen.size(), n);
-            while (k > 0 && tag.compare(0, k, seen, seen.size() - k, k) != 0) --k;
+            while (k > 0 && !std::equal(chars.begin(), chars.begin() + (std::ptrdiff_t) k, seen.end() - (std::ptrdiff_t) k)) --k;
             if (k == n) continue;
-            alts.push_back(literal(std::string(1, (char) a)) + " free-text-" + std::to_string(k));
+            alts.push_back(literal(a) + " free-text-" + std::to_string(k));
         }
         alts.push_back("[^" + excluded + "] free-text-0");
         alts.push_back("\"\"");
