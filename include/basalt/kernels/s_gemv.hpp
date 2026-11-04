@@ -59,15 +59,6 @@ void s_gemv(const uint16_t* x, const uint8_t* codes, const float* scales, const 
 void s_gemv_split(const uint16_t* x, const uint8_t* codes, const float* scales, const float* offset,
                   float* y, int64_t n_in, int64_t n_out, const SForm& form, int threads_per_row);
 
-// The same computation as `s_gemv_split` but launched on `stream` (a cudaStream_t passed as void*, so this
-// header stays free of CUDA types) and WITHOUT synchronising.  It exists because the architecture's premise -
-// that the expert stream overlaps with the compute that consumes it - cannot be measured through an entry
-// point that waits for every stream.  The synchronous ones remain the default; this is for the loop that has
-// to overlap, and for the test that establishes whether overlapping is worth building.
-void s_gemv_split_async(const uint16_t* x, const uint8_t* codes, const float* scales, const float* offset,
-                        float* y, int64_t n_in, int64_t n_out, const SForm& form, int threads_per_row,
-                        void* stream);
-
 /// THE SAME GEMV OVER **Q8_K** ACTIVATIONS, which is the contract for every K-quant and IQ-quant weight.
 ///
 /// the activation contract settles this: `ggml_mul_mat` converts the activation to the weight's
@@ -88,8 +79,8 @@ void s_gemv_q8k(const uint8_t* x_q8k, const uint8_t* codes, const float* scales,
 /// The row-split form, for output widths too small to fill the machine.
 ///
 /// **THERE IS NO `threads_per_row` HERE ON PURPOSE.**  This form is WARP per output row, which is what the
-/// shape wants, so there is no such knob to tune.  `s_gemv_split`/`s_gemv_split_async` DO take threads_per_row
-/// and DO use it, if a caller wants to tune that shape.
+/// shape wants, so there is no such knob to tune.  `s_gemv_split` DOES take threads_per_row
+/// and DOES use it, if a caller wants to tune that shape.
 void s_gemv_q8k_split(const uint8_t* x_q8k, const uint8_t* codes, const float* scales, const float* offset,
                       float* y, int64_t n_in, int64_t n_out, const SForm& form, void* stream);
 
