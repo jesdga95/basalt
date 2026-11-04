@@ -22,6 +22,7 @@ class GgufFile;
 namespace basalt::program {
 struct CommonOptions;
 struct GpuCard;
+struct ProbeEnv;
 }
 
 namespace basalt::model {
@@ -134,6 +135,10 @@ public:
     virtual Result restore_cells(const uint8_t* host, int64_t positions) { (void) host; (void) positions; return {Status::NotImplemented, "this model cannot park a conversation"}; }
     /// The tokens the session holds from now on, position by position (a restored conversation's).
     virtual Result set_history(const int32_t* tokens, int64_t n) { (void) tokens; (void) n; return {}; }
+    /// What `PROBE rates` measures this model's paths with (after prepare).
+    virtual Result probe_env(program::ProbeEnv& env) { (void) env; return {Status::NotImplemented, "this model has no probe"}; }
+    /// Facts for the engine's INFO lines once the session is prepared: `key=value` words.
+    virtual std::string info_words() const { return {}; }
     /// An encoded picture: `n_rows` embedding rows of the model's width (the encoder's whole block). Rows with no
     /// vision support leave the default.
     virtual Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows) {

@@ -311,7 +311,7 @@ std::string gpu_identity(size_t n) {
     return s;
 }
 
-std::string gpu_plan_json(const std::vector<GpuCard>& visible, const GpuChoice& c) {
+std::string gpu_plan_json(const std::vector<GpuCard>& visible, const GpuChoice& c, const std::string& arch) {
     std::string devices, cards;
     for (int i : c.cards) {
         const GpuCard g = (size_t) i < visible.size() ? visible[(size_t) i] : unknown_card(i);
@@ -321,7 +321,7 @@ std::string gpu_plan_json(const std::vector<GpuCard>& visible, const GpuChoice& 
     }
     std::string notes;
     for (const std::string& s : c.notes) notes += (notes.empty() ? "" : ",") + json_str(s);
-    return "{\"devices\":" + json_str(devices) + ",\"cards\":[" + cards + "],\"notes\":[" + notes +
+    return "{" + (arch.empty() ? std::string() : "\"arch\":" + json_str(arch) + ",") + "\"devices\":" + json_str(devices) + ",\"cards\":[" + cards + "],\"notes\":[" + notes +
            "],\"warning\":" + json_str(c.warning) + ",\"error\":" + json_str(c.error) + "}";
 }
 

@@ -66,6 +66,7 @@ struct CommonOptions {
     /// --gpu: the cards this run uses (gpu_select.hpp); empty = GPU 0 alone.  --gpu-plan prints the choice and exits.
     std::string gpu;
     bool gpu_plan = false;
+    std::string arch;                  ///< the --model file's architecture
     std::string diag_dump;                 ///< --diag-dump DIR: a model's per-layer tensors, off by default
     int diag_tier_ram = -1, diag_tier_vram = -1;   ///< --diag-tier-ram / --diag-tier-vram: fixed expert-tier sizes
     bool diag_serial_prompt = false;       ///< --diag-serial-prompt: an adapter model reads its prompt one decode step at a time

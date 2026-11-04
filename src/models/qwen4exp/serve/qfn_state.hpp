@@ -55,6 +55,7 @@
 #include "basalt/program/conv_cache.hpp"
 #include "basalt/program/ppl_gate.hpp"
 #include "basalt/program/probe_rates.hpp"
+namespace basalt::models::qwen4exp { std::shared_ptr<basalt::program::ProbePeerPath> make_probe_peer_path(); }
 #include "basalt/spec/draft_policy.hpp"
 #include "basalt/spec/suffix_drafter.hpp"
 #include "basalt/core/progress.hpp"
