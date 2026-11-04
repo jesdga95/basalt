@@ -9,7 +9,7 @@
 
 namespace basalt::program::cli {
 
-std::optional<int> select_gpus(Options& o, std::vector<GpuCard>& chosen_cards, int max_expert_tiers) {
+std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_cards, int max_expert_tiers) {
     namespace bp = basalt::program;
     bp::GpuSpec spec;
     std::string gerr;

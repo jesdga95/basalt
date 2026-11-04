@@ -38,7 +38,6 @@ public:
         d.n_ff_exp = (int64_t) key_u(g, "expert_feed_forward_length");
         d.n_expert_shared = (int64_t) key_u(g, "expert_shared_count");
         d.context_length = (int64_t) key_u(g, "context_length");
-        d.rope_from_model = true;
         if (const MetaValue* t = g.get("tokenizer.ggml.tokens")) d.n_vocab = (int64_t) t->count;
         return d;
     }

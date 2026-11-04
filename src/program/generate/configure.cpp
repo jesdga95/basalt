@@ -7,25 +7,30 @@ int run(int argc, char** argv) {
     basalt::models::register_builtin_models();
     Context context;
 
-    Options o;
-    std::string ppl_base, ppl_out;
-    if (const auto code = cli::start(argc, argv, o, ppl_base, ppl_out)) return *code;
+    std::unique_ptr<basalt::program::CommonOptions> options;
+    const basalt::model::ModelAdapter* adapter = nullptr;
+    if (const auto code = cli::start(argc, argv, options, adapter)) return *code;
+    basalt::program::CommonOptions& common = *options;
     // ---- the GPUs: chosen before any CUDA call, which then sees only them, the main card as device 0
     std::vector<basalt::program::GpuCard> chosen_cards;
-    if (const auto code = cli::select_gpus(o, chosen_cards, basalt::kernels::kDmMaxX + 1)) return *code;
+    if (const auto code = cli::select_gpus(common, chosen_cards, basalt::kernels::kDmMaxX + 1)) return *code;
     // ---- where every loader reads from: the sections of the .basalt file
-    if (const auto code = cli::prepare_model_process(o)) return *code;
+    if (const auto code = cli::prepare_model_process(common)) return *code;
+    // past the common start: Flash-Next's own flags (an adapter model left at run_adapter_model below)
+    Options& o = static_cast<Options&>(common);
+    std::string& ppl_base = o.ppl_base;
+    std::string& ppl_out = o.ppl_out;
     basalt::core::ModelSources srcs;
     basalt::core::ModelFile model_file;
     {
         std::string merr;
-        if (!model_file.open(o.model, merr) || !model_file.load_meta(merr) || !model_file.register_gguf_view(merr)) {
+        if (!model_file.open(common.model, merr) || !model_file.load_meta(merr) || !model_file.register_gguf_view(merr)) {
             return fatal_start_error("--model: " + merr);
         }
         basalt::core::model_sources(model_file, srcs);
         // the source tensors (embedding, PLE table, native projections, head) are served through the GGUF view of the file
-        o.native_shards = {o.model};
-        if (const auto code = run_adapter_model(o, model_file)) return *code;
+        common.native_shards = {common.model};
+        if (const auto code = run_adapter_model(common, model_file)) return *code;
         if (srcs.dense.empty() || srcs.dense_index.empty() || srcs.experts.empty() || srcs.experts_layout.empty() ||
             srcs.hc8.empty()) {
             return fatal_start_error(o.model + " lacks the dense, dense.index, experts, experts.layout or hc8 section");

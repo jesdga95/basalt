@@ -2,10 +2,15 @@
 #include "basalt/model/adapter.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/program/options.hpp"
 
 #include <map>
 
 namespace basalt::model {
+
+std::unique_ptr<program::CommonOptions> ModelAdapter::make_options() const {
+    return std::make_unique<program::CommonOptions>();
+}
 
 namespace {
 std::map<std::string, std::unique_ptr<ModelAdapter>>& table() {

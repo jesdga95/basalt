@@ -466,7 +466,7 @@ int adapter_serve(basalt::model::LoadedModel& loaded, int64_t max_context, int64
 }
 
 
-std::optional<int> run_adapter_model(const Options& o, const basalt::core::ModelFile& model_file) {
+std::optional<int> run_adapter_model(const basalt::program::CommonOptions& o, const basalt::core::ModelFile& model_file) {
     g_diag_serial_prompt = o.diag_serial_prompt;
     if (!o.diag_logits.empty()) g_diag_logits = std::fopen(o.diag_logits.c_str(), "wb");
     const basalt::core::Json* kv = model_file.meta().get("gguf_kv");
@@ -479,15 +479,6 @@ std::optional<int> run_adapter_model(const Options& o, const basalt::core::Model
         std::string err = adapter->validate(model_gguf);
         if (!err.empty()) return fatal_start_error(err);
         const basalt::model::ModelDesc desc = adapter->describe(model_gguf);
-        if (desc.rope_from_model) {
-            // the model's own YaRN extension is part of its weights' contract; a flag cannot change it
-            const bool rope_flag = !o.rope_scaling.empty() || o.rope_scale != 0 || o.rope_freq_base != 0 ||
-                                   o.rope_freq_scale != 0 || o.yarn_orig_ctx != 0 || o.yarn_ext_factor >= 0 ||
-                                   o.yarn_attn_factor != 1.0 || o.yarn_beta_fast != 32.0 || o.yarn_beta_slow != 1.0;
-            if (rope_flag)
-                return fatal_start_error("the --rope-* and --yarn-* flags do not apply to " + desc.arch +
-                                         ": its rotary scaling comes from the model file");
-        }
         g_n_vocab = desc.n_vocab;
         std::unique_ptr<basalt::model::LoadedModel> loaded;
         basalt::model::LoadRequest lreq;
