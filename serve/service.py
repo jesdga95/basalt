@@ -17,7 +17,7 @@ from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
 from serve.prompt import CTX_SLACK, PromptText, overflow_error, room_error
 from serve.util.text import Detokenizer, IM_END, StopMatcher, control_literals, stop_strings
-from serve.engine.image_source import ImageRefused, ImageSources
+from serve.engine.image_source import USAGE as IMAGE_USAGE, ImageRefused, ImageSources
 from serve.engine.vision import IMAGE_WAITING_BYTES, Vision
 from serve.api.grammar import grammar_spec, unenforced
 from serve.config import GRAMMAR_DEFAULT
@@ -750,17 +750,25 @@ class Service:
         prompt.max_new = max_new
         return prompt, kwargs.get("enable_thinking", True) is not False, max_new
 
+    def _check_images(self, messages, images) -> None:
+        """Refuse, before rendering, a request whose images cannot reach the prompt."""
+        if self.vision is None:
+            _refuse_images("this server was started without image input (--vision), so it cannot read images")
+        if images_of(m for m in messages if m.get("role") == "system"):
+            _refuse_images("a system prompt cannot hold an image")
+        if not all(images):
+            _refuse_images(IMAGE_USAGE)
+
     def _prepare(self, messages, tools, kwargs, max_new, force, image_access):
-        if getattr(self.engine, "takes_text", False) and not images_of(messages) and not getattr(self.engine, "batch", 0):
+        images = images_of(messages)
+        if images:
+            self._check_images(messages, images)
+        elif getattr(self.engine, "takes_text", False) and not getattr(self.engine, "batch", 0):
             return self._prepare_text(messages, tools, kwargs, max_new, force)
         ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
-        images = images_of(messages)
         if images:
-            if self.vision is None:
-                raise ValueError("this server was started without image input (--vision), "
-                                 "so it cannot read images")
             pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
             start = self.tok.encode(VISION_START, parse_special=True)[0]
             try:                                        # before the fifo: a slow source must not hold the turn
@@ -796,7 +804,7 @@ class Service:
                 if t == pad and j > 0 and ids[j - 1] == start:
                     # more markers than images
                     if k == len(counts):
-                        raise ValueError("the prompt and its images do not match")
+                        _refuse_images("the prompt and its images do not match")
                     out += [pad] * counts[k]
                     k += 1
                 elif t == pad:
@@ -804,7 +812,7 @@ class Service:
                 else:
                     out.append(t)
             if k != len(counts):
-                raise ValueError("the prompt and its images do not match")
+                _refuse_images("the prompt and its images do not match")
             ids = out
         ctx = self.engine.max_context
         if ctx <= 0:
@@ -1306,6 +1314,12 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
             # draft counts only when reported
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
                if last.get("drafts_offered") is not None else {})}
+
+
+def _refuse_images(why: str):
+    """A request refused for its images: the client gets the 400, the log says why."""
+    print(f"[server] error: {why}", flush=True)
+    raise ValueError(why)
 
 
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
