@@ -335,7 +335,7 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
 # already links `core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
 # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
 # about arithmetic, and this one knows the ORDER the arithmetic happens in.
-add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
+add_library(engine STATIC src/models/qwen4exp/decode/layer.cpp src/models/qwen4exp/decode/session.cpp src/core/expert_source.cpp
   src/core/expert_cache.cpp src/core/vmm.cpp src/core/kv_arena.cpp src/core/native_head.cpp src/core/native_dense.cpp
   src/models/qwen4exp/decode/verify/batch_capture.cpp
   src/models/qwen4exp/decode/verify/batch_execution.cpp
