@@ -1,9 +1,9 @@
 // src/program/serve/request.cpp - ordered execution of one request.
-#include "request.hpp"
+#include "request_base.hpp"
 
 namespace basalt::program::serve {
 
-Flow QfnRequest::execute() {
+Flow Request::execute() {
     struct Scope {   // what tells the idle conversations' parking where this request works, until it ends
         Runtime& r;
         ~Scope() { r.solo_out = nullptr; r.solo_busy = false; r.park_keep = -1; }

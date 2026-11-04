@@ -166,6 +166,12 @@ public:
     virtual void sleep_command(bool down, std::string& e) = 0;
     virtual void between_requests(const std::string& line) = 0;
     virtual Flow run_request() = 0;
+    virtual void solo_draft_back(bool) {}
+    virtual bool capture_admit(uint64_t need, uint64_t floor) = 0;
+    virtual bool park_current(size_t held, int64_t kept) = 0;
+    virtual bool copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) = 0;
+    virtual void ckd_finish() {}
+    virtual void shed_if_low() = 0;
     virtual bool slot0_solo() const = 0;   // slot 0 of the batch windows is the solo session
     virtual void enc_command(const std::string& cmd) = 0;
     virtual size_t spill_to_disk(bool at_exit, size_t limit) = 0;
@@ -315,6 +321,7 @@ public:
     SlotHeld slot_held{};
     std::vector<ImgKey> imgs_below(const std::vector<ImgKey>& all, int64_t L);
     bool next_line(std::string& out);
+    std::vector<int64_t> cur{};
     int next_line_within(std::string& out, int ms);
     bool halted();
     bool batch_on();
@@ -557,10 +564,10 @@ private:
     basalt::core::Verifier& stage_ver(int st);
     int pcie_num_of(double f);
     basalt::core::Verifier& stage_verb(int st);
-    void ckd_finish();
+    void ckd_finish() override;
     bool disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const std::vector<ConvCheckpoint>& cks, bool cvec);
-    bool capture_admit(uint64_t need, uint64_t floor);
-    bool park_current(size_t held, int64_t kept);
+    bool capture_admit(uint64_t need, uint64_t floor) override;
+    bool park_current(size_t held, int64_t kept) override;
     bool gpu_sync_ok();
     bool checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool defer = false,
                        ConvCheckpoint::Source source = ConvCheckpoint::kPeriodic);
@@ -575,7 +582,7 @@ private:
     bool xq_advance(bool wait);
     bool xq_drain();
     void save_profile(const char* why);
-    void shed_if_low();
+    void shed_if_low() override;
     void make_view(basalt::core::SessionState& v, int b);
     int32_t loan_plan(int64_t live, int64_t& chunk);
     void relend();
@@ -600,8 +607,8 @@ private:
     void enc_command(const std::string& cmd) override;
     bool copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& e);
     bool hold_slot(int b, const ConvCheckpoint* at, std::string& e);
-    bool copy_from_slot(int b, const ConvCheckpoint* at, std::string& e);
-    void solo_draft_back(bool keep);
+    bool copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) override;
+    void solo_draft_back(bool keep) override;
     bool slot_digest(int b, int64_t upto, uint64_t* part);
     bool batch_step();
     basalt::core::Verifier& stage_verifier(int k);
