@@ -5,7 +5,7 @@ namespace basalt::program::serve {
 
 // write the learned profile (between requests and at QUIT: a prompt's lent slots are back by then).  A swap
 // still in flight counts as done - its expert is resident once the copy lands.  `why`: for the log.
-void Runtime::save_profile(const char* why) {
+void QfnRuntime::save_profile(const char* why) {
     if (heat.empty()) return;
     std::vector<uint8_t> resident(host_res.size(), 0);
     for (size_t i = 0; i < host_res.size(); ++i) resident[i] = host_res[i] >= 0;
@@ -26,7 +26,7 @@ void Runtime::save_profile(const char* why) {
 // the routing counts, the round counter and the draft policy start again; the session's cached prompts are
 // dropped; the adaptive tier's settings apply to the requests that follow.  Only slots whose expert differs
 // are copied, in rounds of as many as the RAM copy has free places for.
-bool Runtime::probe_adapt(const std::string& cmd, std::string& e) {
+bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
     const auto t0 = Clock::now();
     if (drive.d.usage.empty() || !adapt_fast || host_res.empty()) {
         e = "PROBE adapt: needs the adaptive tier on the main card (--adapt-every and --adapt-swaps above 0, "

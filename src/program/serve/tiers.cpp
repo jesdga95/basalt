@@ -68,7 +68,7 @@ bool resident_spare_swaps(basalt::core::FileExpertSource& src, const std::vector
 }
 
 // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
-void Runtime::res_upload() {
+void QfnRuntime::res_upload() {
     if (d_res != nullptr)
         res_put(d_res);
     for (auto& st : stages) {
@@ -79,7 +79,7 @@ void Runtime::res_upload() {
 
 // the peer tiers take the next most-routed CPU misses: each passes over what the primary (r0) or another tier
 // holds or takes in this round; with one tier r0 is its whole view
-bool Runtime::adapt_peers(const std::vector<int32_t>& r0, std::string& perr) {
+bool QfnRuntime::adapt_peers(const std::vector<int32_t>& r0, std::string& perr) {
     const int swaps_each = o.peer_adapt_swaps >= 0 ? o.peer_adapt_swaps : o.adapt_swaps;
     if (xpeers.empty()) return peer.adapt(drive.d.usage.data(), r0.data(), swaps_each, perr);
     const size_t nt = 1 + xpeers.size();
@@ -100,7 +100,7 @@ bool Runtime::adapt_peers(const std::vector<int32_t>& r0, std::string& perr) {
     return true;
 }
 
-void Runtime::apply_pending(bool wait, bool exchanges) {
+void QfnRuntime::apply_pending(bool wait, bool exchanges) {
     if (peer.valid()) {
         if (!wait) peer.apply_pending(wait);
         else if (peer_landing) { peer.apply_pending(true); peer_landing = false; }
@@ -140,7 +140,7 @@ void Runtime::apply_pending(bool wait, bool exchanges) {
     promoted.clear();
 }
 
-void Runtime::rank_swaps(std::vector<Swap>& swaps, bool across) {
+void QfnRuntime::rank_swaps(std::vector<Swap>& swaps, bool across) {
     swaps.clear();
     if (across) {
         // one ranking over every layer: a layer that routes more experts than its slots hold takes the slots of
@@ -214,7 +214,7 @@ void Runtime::rank_swaps(std::vector<Swap>& swaps, bool across) {
 
 // Up to `room` more swaps over every layer: CPU-tier experts routed about once lately (a count from once_bar up to the
 // main ranking's floor), each against a resident expert at least once_bar below it that no swap of the round takes
-void Runtime::rank_once(std::vector<Swap>& swaps, size_t room) {
+void QfnRuntime::rank_once(std::vector<Swap>& swaps, size_t room) {
     struct Ent { float u; int32_t rank, layer, e; };
     std::vector<Ent> cand, vict;
     std::vector<uint8_t> taken(host_res.size(), 0);
@@ -246,7 +246,7 @@ void Runtime::rank_once(std::vector<Swap>& swaps, size_t room) {
     }
 }
 
-bool Runtime::adapt() {
+bool QfnRuntime::adapt() {
     if (!pending.empty()) return true;   // the previous swaps are still in flight
     std::vector<Swap> swaps;
     rank_swaps(swaps, false);
@@ -319,7 +319,7 @@ bool Runtime::adapt() {
     return true;
 }
 
-void Runtime::xq_settle() {
+void QfnRuntime::xq_settle() {
     if (!xq_unsettled) return;
     cudaEventSynchronize(adapt_ev);
     for (const auto& [l, e] : xq_released) srcp->release(l, e);
@@ -329,7 +329,7 @@ void Runtime::xq_settle() {
 }
 
 // `ranked`: the round's ranking already made (rank_swaps reads nothing xq_settle changes)
-bool Runtime::xq_round(std::vector<Swap>* ranked) {
+bool QfnRuntime::xq_round(std::vector<Swap>* ranked) {
     xq_settle();
     std::vector<Swap> swaps;
     if (ranked != nullptr) swaps.swap(*ranked);
@@ -422,7 +422,7 @@ bool Runtime::xq_round(std::vector<Swap>* ranked) {
 }
 
 // `wait`: step (3) waits for the copies even with the landed words (the batch windows, a drain)
-bool Runtime::xq_advance(bool wait) {
+bool QfnRuntime::xq_advance(bool wait) {
     if (xq_stage == 0) return true;
     if (xq_stage == 2) ver.flush_post_launch();
     const bool nowait = xq_stage == 2 && xq_words && !wait;
@@ -539,14 +539,14 @@ bool Runtime::xq_advance(bool wait) {
     return true;
 }
 
-bool Runtime::xq_drain() {
+bool QfnRuntime::xq_drain() {
     while (xq_stage != 0)
         if (!xq_advance(true)) return false;
     xq_settle();
     return true;
 }
 
-int Runtime::init_tiers() {
+int QfnRuntime::init_tiers() {
     all_experts_resident = !host_res.empty() &&
         std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
     if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)

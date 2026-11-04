@@ -22,7 +22,7 @@ uint64_t serve_growth_bytes(const Options& o, const basalt::core::ModelGeometry&
     return bytes;
 }
 
-void Runtime::shed_if_low() {
+void QfnRuntime::shed_if_low() {
     if (basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok) return;
     const uint64_t drop = basalt::platform::ram_guard_drops();
     if (drop == shed_drop) return;
@@ -48,7 +48,7 @@ void Runtime::shed_if_low() {
 }
 
 // the prompt path's loan with `live` slots: its chunk as large as fits, and the first slot it covers
-int32_t Runtime::loan_plan(int64_t live, int64_t& chunk) {
+int32_t QfnRuntime::loan_plan(int64_t live, int64_t& chunk) {
     PfPart& p = pf_parts[0];
     auto fits = [&](int64_t c) {
         const int64_t k = part_slots(p, c);
@@ -66,7 +66,7 @@ int32_t Runtime::loan_plan(int64_t live, int64_t& chunk) {
     return (int32_t) std::max<int64_t>(0, live - part_slots(p, c));
 }
 
-void Runtime::relend() {   // the prompt path's loan: the end of the slots left, its chunk as large as fits
+void QfnRuntime::relend() {   // the prompt path's loan: the end of the slots left, its chunk as large as fits
     if (pf_parts.empty() || pf_parts[0].first < 0) return;
     PfPart& p = pf_parts[0];
     int64_t c = 0;
@@ -78,7 +78,7 @@ void Runtime::relend() {   // the prompt path's loan: the end of the slots left,
 // The resident RAM mode holds only the experts no slot holds, so an expert in a slot about to go has no RAM
 // copy: it is copied from its slot into a RAM home first and read from there like the compact copy's.  Refused
 // (nothing copied) when the RAM above the floor cannot take them.  `live`: the slots that stay.
-bool Runtime::home_given_up(int64_t live, std::string& e) {
+bool QfnRuntime::home_given_up(int64_t live, std::string& e) {
     if (!src.complement_ready()) return true;
     // the slots the loan will overwrite keep a RAM copy too, so a prompt never costs a file read
     int64_t from = live;
@@ -124,7 +124,7 @@ bool Runtime::home_given_up(int64_t live, std::string& e) {
 // `for_sleep` (SLEEP and WAKE): the cache goes to its smallest size and comes back to the same placement, with no
 // request between the two, so neither --vram-elastic (any segmented cache does) nor a peer card's tier stands in
 // the way
-bool Runtime::vram_command(const std::string& cmd, std::string& e, bool for_sleep, std::string* reply) {
+bool QfnRuntime::vram_command(const std::string& cmd, std::string& e, bool for_sleep, std::string* reply) {
     // `VRAM` alone: the reserve the engine started with (--vram-reserve-mib)
     char* end = nullptr;
     const bool bare = cmd.find_first_not_of(' ', 4) == std::string::npos;
@@ -262,7 +262,7 @@ bool Runtime::vram_command(const std::string& cmd, std::string& e, bool for_slee
     return true;
 }
 
-int Runtime::init_memory() {
+int QfnRuntime::init_memory() {
     // the load's own buffers are gone: RAM still free keeps the next-hottest experts the first sizing left out
     if (srcp == &src && src.complement_ready() && o.resident_budget == 0) {
         int64_t n_top = 0;

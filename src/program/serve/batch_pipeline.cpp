@@ -3,17 +3,17 @@
 
 namespace basalt::program::serve {
 
-basalt::core::Verifier & Runtime::stage_verifier(int k) { return k == 0 ? ver : stages[(size_t) k - 1]->ver; }
+basalt::core::Verifier & QfnRuntime::stage_verifier(int k) { return k == 0 ? ver : stages[(size_t) k - 1]->ver; }
 
-bool Runtime::pipe_inflight() { for (const PGroup& x : pg) if (x.inflight) return true; return false; }
+bool QfnRuntime::pipe_inflight() { for (const PGroup& x : pg) if (x.inflight) return true; return false; }
 
-bool Runtime::group_active(int gi) {
+bool QfnRuntime::group_active(int gi) {
     for (int t = 0; t < GS; ++t) if (bs[(size_t) (gi * GS + t)].active) return true;
     return false;
 }
 
 // one turn: serve every running stage, hand finished groups on, start what can start
-bool Runtime::pump(bool may_start) {
+bool QfnRuntime::pump(bool may_start) {
     ++pipe_tick;
     if (bt_windows == 0 && !pipe_inflight()) {
         bt_start = Clock::now();
@@ -111,7 +111,7 @@ bool Runtime::pump(bool may_start) {
     return true;
 }
 
-bool Runtime::pipe_drain() {
+bool QfnRuntime::pipe_drain() {
     while (pipe_inflight())
         if (!pump(false)) return false;
     return true;

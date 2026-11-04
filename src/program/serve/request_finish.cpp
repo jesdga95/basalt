@@ -3,7 +3,7 @@
 
 namespace basalt::program::serve {
 
-Flow Request::complete() {
+Flow QfnRequest::complete() {
     decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
     // the last commit (set_commit_async): the session is complete before anything reads or copies it
     if (!runtime_.ver.wait_commit(runtime_.err) || (runtime_.pipe_on && !runtime_.ver_b.wait_commit(runtime_.err))) {

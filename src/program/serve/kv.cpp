@@ -5,7 +5,7 @@ namespace basalt::program::serve {
 
 // the expert cache never shrinks below the slots the prompt path's smallest loan needs (a 256-token chunk, and
 // the 128 slots a loan leaves), so the next prompt can always be read
-int64_t Runtime::cache_floor_slots() {
+int64_t QfnRuntime::cache_floor_slots() {
     if (pf_parts.empty() || pf_parts[0].first < 0) return 0;
     const int64_t k = part_slots(pf_parts[0], 256);
     int64_t f = k + 128;
@@ -18,7 +18,7 @@ int64_t Runtime::cache_floor_slots() {
 // copy (a slot keeps its layer's size; the experts from `first` on come back from RAM).  One blob copy per
 // trade; the table is uploaded by the caller.  `why` names the taker for the log.  `lent_out`: entries whose
 // slots a loan still out holds (the prompt path's buffers, no expert), so their experts are copied from RAM.
-bool Runtime::move_routed_below(int64_t first, const char* why, std::string& e,
+bool QfnRuntime::move_routed_below(int64_t first, const char* why, std::string& e,
                                 const std::vector<serve_loans::LentEntry>* lent_out) {
 
     if (drive.d.usage.empty() || srcp != &src || !src.complement_ready() || multi_gpu || first <= 0 ||
@@ -75,7 +75,7 @@ bool Runtime::move_routed_below(int64_t first, const char* why, std::string& e,
     return true;
 }
 
-bool Runtime::kv_drain(std::string& e) {
+bool QfnRuntime::kv_drain(std::string& e) {
     if (!ver.wait_commit(e)) return false;
     apply_pending(true);
     if (!xq_drain()) { e = "elastic KV: an adaptive swap failed"; return false; }
@@ -91,7 +91,7 @@ bool Runtime::kv_drain(std::string& e) {
 // maps the cache's tail again as far as the free VRAM above the reserve allows, and refills the slots it gets
 // back: each with the expert it held, or (when that one is resident again, or has no RAM copy any more) the
 // layer's most-routed expert that no GPU holds and RAM does
-bool Runtime::cache_regrow(std::string& e) {
+bool QfnRuntime::cache_regrow(std::string& e) {
     if (!xcache.segmented() || xcache.mapped_bytes() >= xcache.full_bytes()) return true;
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
@@ -139,7 +139,7 @@ bool Runtime::cache_regrow(std::string& e) {
 // The experts the KV just took CUDA0's slots from take the peer's slots of less-routed experts (by the routing counts,
 // then the profile's rank), so the next most-routed experts stay on a GPU while the KV holds CUDA0's tail.  Between
 // windows: the copies come from the RAM copy and land before it returns.
-bool Runtime::peer_take(const std::vector<int32_t>& off, std::string& e) {
+bool QfnRuntime::peer_take(const std::vector<int32_t>& off, std::string& e) {
     if (off.empty() || !peer.valid() || peer.exclusive() || peer.asleep() || !xpeers.empty()) return true;
     const auto t0 = Clock::now();
     auto used = [&](int32_t i) { return drive.d.usage.empty() ? 0.0f : drive.d.usage[(size_t) i]; };
@@ -186,7 +186,7 @@ bool Runtime::peer_take(const std::vector<int32_t>& off, std::string& e) {
 
 // The prompt split lent the peer's slots `lent` (expert, slot): a due handoff into one of them gives the slot its new
 // expert, so the loan's refill copies that one instead of the old
-void Runtime::peer_due_lent(std::vector<std::pair<int32_t, int32_t>>& lent) {
+void QfnRuntime::peer_due_lent(std::vector<std::pair<int32_t, int32_t>>& lent) {
     if (peer_due.empty()) return;
     std::vector<int32_t> at((size_t) peer.cache().slots(), -1);   // slot -> its entry in `lent`
     for (size_t j = 0; j < lent.size(); ++j)
@@ -205,7 +205,7 @@ void Runtime::peer_due_lent(std::vector<std::pair<int32_t, int32_t>>& lent) {
 }
 
 // before the first window: the due handoffs no loan took are copied now
-bool Runtime::peer_due_apply(std::string& e) {
+bool QfnRuntime::peer_due_apply(std::string& e) {
     peer_defer = false;
     if (peer_due.empty() && peer_due_lent_n == 0) return true;
     const auto t0 = Clock::now();
@@ -228,7 +228,7 @@ bool Runtime::peer_due_apply(std::string& e) {
 // `shrink` false: only VRAM that is free now (a prompt read is running beside the windows, its loan in the
 // cache's last slots) - false with `e` empty when that is not enough
 // `min_cells`: when `cells` would take the cache below its floor, as many as leave it, down to these
-bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& e, bool shrink, int64_t min_cells) {
+bool QfnRuntime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& e, bool shrink, int64_t min_cells) {
     kv_short = false;
     if (kv_floor <= 0) return true;
     cells = std::min<int64_t>(std::max<int64_t>(cells, kv_floor), s.max_cells);
@@ -321,7 +321,7 @@ bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& 
     return true;
 }
 
-bool Runtime::kv_release(basalt::core::SessionState& s, int64_t cells, std::string& e) {
+bool QfnRuntime::kv_release(basalt::core::SessionState& s, int64_t cells, std::string& e) {
     if (kv_floor <= 0) return true;
     cells = std::min<int64_t>(std::max<int64_t>(cells, kv_floor), s.max_cells);
     if (basalt::core::session_kv_bytes_for(s, basalt::core::session_kv_cells(s)) <=
@@ -342,7 +342,7 @@ bool Runtime::kv_release(basalt::core::SessionState& s, int64_t cells, std::stri
 // the elastic KV's spare cells back to the expert cache: every session keeps what it holds (the solo session
 // `ss_keep` cells, a decoding slot its next window too), idle ones first; `skip` and slot `skip_slot` are left
 // alone, and it stops once `enough` (if set) is true
-bool Runtime::kv_give_back(int64_t ss_keep, const basalt::core::SessionState* skip, int skip_slot, const std::function<bool()>& enough, int64_t& given, std::string& e) {
+bool QfnRuntime::kv_give_back(int64_t ss_keep, const basalt::core::SessionState* skip, int skip_slot, const std::function<bool()>& enough, int64_t& given, std::string& e) {
     std::vector<basalt::core::SessionState*> sess;
     std::vector<basalt::program::KvHold> holds;
     auto add = [&](basalt::core::SessionState& s, int64_t keep, bool active) {

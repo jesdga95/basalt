@@ -16,7 +16,7 @@ void sort_small(int* v, int n, Less less) {
 }
 }  // namespace
 
-uint64_t Runtime::row_hash(int t) {
+uint64_t QfnRuntime::row_hash(int t) {
     lh_buf.resize((size_t) n_vocab);
     if (!ver.copy_logits(t, lh_buf.data())) return 0;
     uint64_t h = 1469598103934665603ull;
@@ -27,7 +27,7 @@ uint64_t Runtime::row_hash(int t) {
 
 // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
 // so it keeps the conversation it holds
-bool Runtime::batch_step() {
+bool QfnRuntime::batch_step() {
     constexpr int MR = basalt::kernels::kVerifyMaxT;
     const int MB = std::min(MR, ver.max_t());   // the row budget is this verifier capacity; MR only sizes the arrays
     int S = 0, R = 0;
@@ -431,7 +431,7 @@ bool Runtime::batch_step() {
     return true;
 }
 
-int Runtime::init_batch() {
+int QfnRuntime::init_batch() {
     bs = std::vector<BSlot>((size_t) std::max(o.batch, 0));
     // the real MTP drafts in the batch windows (a draft K/V per slot); the scripted test drive keeps its own
     batch_spec = mtp_on && mtp.main_store() > 0 && o.batch > 0;

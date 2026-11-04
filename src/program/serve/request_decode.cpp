@@ -4,7 +4,7 @@
 
 namespace basalt::program::serve {
 
-Request::DecSnap Request::dec_snap() {
+QfnRequest::DecSnap QfnRequest::dec_snap() {
     return DecSnap{runtime_.ver.ms_wait, runtime_.ver.ms_pool, runtime_.ver.ms_host, runtime_.drive.d.ms_plan, runtime_.drive.d.ms_actq, runtime_.drive.d.ms_jobs,
                    runtime_.drive.d.ms_run, runtime_.drive.d.peer != nullptr ? runtime_.drive.d.peer->ms_wait : 0.0,
                    runtime_.drive.d.multi_misses, runtime_.drive.d.multi_entries, runtime_.drive.d.cache_hits, runtime_.drive.d.pcie_experts,
@@ -12,7 +12,7 @@ Request::DecSnap Request::dec_snap() {
 }
 
 // the verify windows: the first holds the last prompt token, with the rest of the last window
-Flow Request::decode() {
+Flow QfnRequest::decode() {
     if (runtime_.mtp_on && !runtime_.mtp.use_main(runtime_.err)) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }   // the windows between prompt chunks swapped it
     if (!runtime_.peer_due_apply(runtime_.err)) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }
     p = fold_p0;
@@ -219,7 +219,7 @@ Flow Request::decode() {
                     auto ms = [](Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); };
                     const auto ta = Clock::now();
                     basalt::core::decode_events().stamp(8);
-                    std::vector<Runtime::Swap> ranked;
+                    std::vector<QfnRuntime::Swap> ranked;
                     const bool pre = early && runtime_.xq_stage == 0;
                     if (pre) runtime_.rank_swaps(ranked, runtime_.xq_across);
                     const double ms_pre = ms(ta);
