@@ -1,4 +1,4 @@
-// src/kernels/cuda/gdn.cu - the gated delta-net's non-projection parts.
+// src/models/qwen4exp/kernels/gdn.cu - the gated delta-net's non-projection parts.
 //
 // See include/basalt/kernels/gdn.hpp for the state layout (S, h_v, S) and for why the recurrence needs no
 // barrier at all: every line of it touches only one (j, h) column, so one thread owns a column end to end.

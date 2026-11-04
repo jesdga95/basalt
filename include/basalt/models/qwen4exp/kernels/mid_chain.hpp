@@ -1,4 +1,4 @@
-// include/basalt/kernels/mid_chain.hpp - a GDN layer's middle as ONE persistent kernel.
+// include/basalt/models/qwen4exp/kernels/mid_chain.hpp - a GDN layer's middle as ONE persistent kernel.
 //
 // qkv + z projections -> recurrence -> output projection, the same operations (and bits) as dense_tc_pair,
 // dec_gdn_rec and dense_tc in sequence.  It runs between the layer's two hc reads (which stay hc_fused_read): its input

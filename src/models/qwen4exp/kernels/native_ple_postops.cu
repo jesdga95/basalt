@@ -19,7 +19,7 @@
 // SOFTWARE.
 
 #include "basalt/kernels/native_ple_postops.hpp"
-#include "basalt/kernels/native_gr_norm.hpp"
+#include "basalt/models/qwen4exp/kernels/native_gr_norm.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include <cuda_runtime.h>

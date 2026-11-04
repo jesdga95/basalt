@@ -4,7 +4,7 @@
 #include "basalt/core/verify.hpp"
 #include "basalt/core/native_head.hpp"
 #include "basalt/core/on_device.hpp"
-#include "basalt/kernels/fused_gr.hpp"
+#include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
 #include "basalt/kernels/hc_fused.hpp"
 #include "basalt/kernels/cvec.hpp"
 #include "basalt/kernels/native_mmvq.hpp"

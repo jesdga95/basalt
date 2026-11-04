@@ -4,7 +4,7 @@
 // per-row chain (native_gr_post, ple_block, ple_history_advance, the history copy), bitwise, for windows of 1..8 rows;
 // then both forms captured as graphs and timed.
 //   ple_key_rows_parity [iters]
-#include "basalt/kernels/native_gr_postops.hpp"
+#include "basalt/models/qwen4exp/kernels/native_gr_postops.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/native_ple_postops.hpp"
 #include "basalt/kernels/ngram.hpp"

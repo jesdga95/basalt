@@ -1,5 +1,5 @@
-// src/kernels/cuda/fused_gdn.cu - see include/basalt/kernels/fused_gdn.hpp.
-#include "basalt/kernels/fused_gdn.hpp"
+// src/models/qwen4exp/kernels/fused_gdn.cu - see include/basalt/models/qwen4exp/kernels/fused_gdn.hpp.
+#include "basalt/models/qwen4exp/kernels/fused_gdn.hpp"
 
 #include <cuda_runtime.h>
 

@@ -17,7 +17,7 @@
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/elementwise.hpp"
-#include "basalt/kernels/fused_gr.hpp"
+#include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
 #include "basalt/kernels/gr.hpp"
 #include "basalt/kernels/hc_fused.hpp"
 #include "basalt/kernels/kv_q4.hpp"
@@ -42,7 +42,7 @@
 #include "basalt/kernels/shared_expert.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
 #include "basalt/kernels/ngram.hpp"
-#include "basalt/kernels/dense_tc.hpp"
+#include "basalt/models/qwen4exp/kernels/dense_tc.hpp"
 #include "basalt/kernels/pdl.hpp"
 
 #include <memory>

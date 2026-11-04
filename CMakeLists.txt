@@ -247,29 +247,29 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/s2_gemv_q8.cu
   src/kernels/cuda/s2_expert_grouped.cu
                         src/kernels/cuda/shared_expert.cu
-                        src/kernels/cuda/gr.cu
-                        src/kernels/cuda/gdn.cu
+                        src/models/qwen4exp/kernels/gr.cu
+                        src/models/qwen4exp/kernels/gdn.cu
                         src/kernels/cuda/qsa.cu
                         src/kernels/cuda/elementwise.cu
                         src/kernels/cuda/bf16_gemv.cu
                         src/kernels/cuda/native_mmvq.cu
                         src/kernels/cuda/native_bf16.cu
-                        src/kernels/cuda/native_gr_norm.cu
+                        src/models/qwen4exp/kernels/native_gr_norm.cu
                         src/kernels/cuda/native_moe.cu
-                        src/kernels/cuda/native_gdn.cu
-                        src/kernels/cuda/native_gr_postops.cu
+                        src/models/qwen4exp/kernels/native_gdn.cu
+                        src/models/qwen4exp/kernels/native_gr_postops.cu
                         src/kernels/cuda/native_router.cu
-                        src/kernels/cuda/native_gdn_preprocess.cu
+                        src/models/qwen4exp/kernels/native_gdn_preprocess.cu
                         src/kernels/cuda/native_qsa.cu
                         src/kernels/cuda/native_rope.cu
-                        src/kernels/cuda/native_ple_postops.cu
+                        src/models/qwen4exp/kernels/native_ple_postops.cu
                         src/kernels/cuda/native_qsa_indexer.cu
                         src/kernels/cuda/native_qsa_score.cu
                         src/kernels/cuda/ple.cu
                         src/kernels/cuda/kv_q8.cu
                         src/kernels/cuda/kv_stream.cu
                         src/kernels/cuda/kv_q4.cu
-                        src/kernels/cuda/fused_gr.cu
+                        src/models/qwen4exp/kernels/fused_gr.cu
                         src/kernels/cuda/cvec.cu
                         src/kernels/cuda/qsa_decode_attn.cu
                         src/kernels/cuda/qsa_dec_attn.cu
@@ -279,20 +279,20 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/q80_proxy.cu
                         src/kernels/cuda/q80_vhead.cu
                         src/kernels/cuda/qsa_prompt_attn.cu
-                        src/kernels/cuda/fused_gdn.cu
+                        src/models/qwen4exp/kernels/fused_gdn.cu
                         src/kernels/cuda/dequant_bf16.cu
                         src/kernels/cuda/qsa_select.cu
                         src/kernels/cuda/verify_kernels.cu
                         src/kernels/cuda/dec_gdn_rec.cu
-                        src/kernels/cuda/dense_tc.cu
-                        src/kernels/cuda/mid_chain.cu
-                        src/kernels/cuda/qsa_mid.cu
+                        src/models/qwen4exp/kernels/dense_tc.cu
+                        src/models/qwen4exp/kernels/mid_chain.cu
+                        src/models/qwen4exp/kernels/qsa_mid.cu
                         src/kernels/cuda/wait_abort.cu
                         src/kernels/cuda/iq_kernels.cu
                         src/kernels/ngram.cpp
                         src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
-target_sources(kernels PRIVATE src/kernels/cuda/hc_fused.cu src/kernels/cuda/hc8_gr.cu)
+target_sources(kernels PRIVATE src/models/qwen4exp/kernels/hc_fused.cu src/models/qwen4exp/kernels/hc8_gr.cu)
 # the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
 if(BUILD_TESTING)
   add_executable(qsa_prompt_attn_parity tests/kernels/qsa_prompt_attn_parity.cpp)
@@ -312,15 +312,15 @@ if(BUILD_TESTING)
 endif()
 # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
 set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/native_bf16.cu
-    src/kernels/cuda/native_gr_norm.cu
+    src/models/qwen4exp/kernels/native_gr_norm.cu
     src/kernels/cuda/native_moe.cu
-    src/kernels/cuda/native_gdn.cu
-    src/kernels/cuda/native_gr_postops.cu
+    src/models/qwen4exp/kernels/native_gdn.cu
+    src/models/qwen4exp/kernels/native_gr_postops.cu
     src/kernels/cuda/native_router.cu
-    src/kernels/cuda/native_gdn_preprocess.cu
+    src/models/qwen4exp/kernels/native_gdn_preprocess.cu
     src/kernels/cuda/native_qsa.cu
     src/kernels/cuda/native_rope.cu
-    src/kernels/cuda/native_ple_postops.cu
+    src/models/qwen4exp/kernels/native_ple_postops.cu
     src/kernels/cuda/native_qsa_indexer.cu
     src/kernels/cuda/native_qsa_score.cu
     src/kernels/cuda/qsa_dec_fused.cu
@@ -887,7 +887,7 @@ basalt_gpu_test(NAME mid_chain_parity COMMAND mid_chain_parity 20)
 set_tests_properties(mid_chain_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 # mid_chain with one SM held (mid_chain_parity --hold), built with a short wait bound: below it the launch waits for the
 # release and is bitwise, past it the waits give up through the abort word instead of trapping
-add_executable(mid_chain_hold tests/kernels/mid_chain_parity.cpp src/kernels/cuda/mid_chain.cu)
+add_executable(mid_chain_hold tests/kernels/mid_chain_parity.cpp src/models/qwen4exp/kernels/mid_chain.cu)
 target_include_directories(mid_chain_hold PRIVATE ${_gpu_include_directories})
 target_compile_definitions(mid_chain_hold PRIVATE MKB_NS=200000000ull)
 target_link_libraries(mid_chain_hold PRIVATE kernels ${_gpu_runtime_target})
