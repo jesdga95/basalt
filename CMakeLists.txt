@@ -337,32 +337,32 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
 # about arithmetic, and this one knows the ORDER the arithmetic happens in.
 add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
   src/core/expert_cache.cpp src/core/vmm.cpp src/core/kv_arena.cpp src/core/native_head.cpp src/core/native_dense.cpp
-  src/core/verify/batch_capture.cpp
-  src/core/verify/batch_execution.cpp
-  src/core/verify/batch_sessions.cpp
-  src/core/verify/capture.cpp
-  src/core/verify/commit.cpp
-  src/core/verify/cpu_warm.cpp
-  src/core/verify/diagnostics.cpp
-  src/core/verify/execution.cpp
-  src/core/verify/expert_execution.cpp
-  src/core/verify/expert_plan.cpp
-  src/core/verify/expert_resources.cpp
-  src/core/verify/gdn_split.cpp
-  src/core/verify/hc8.cpp
-  src/core/verify/head_split.cpp
-  src/core/verify/lifecycle.cpp
-  src/core/verify/pipeline.cpp
-  src/core/verify/profile.cpp
-  src/core/verify/projection.cpp
-  src/core/verify/record.cpp
-  src/core/verify/record_gdn.cpp
-  src/core/verify/record_head.cpp
-  src/core/verify/record_inputs.cpp
-  src/core/verify/record_layer.cpp
-  src/core/verify/record_moe.cpp
-  src/core/verify/record_qsa.cpp
-  src/core/verify/sampling.cpp
+  src/models/qwen4exp/decode/verify/batch_capture.cpp
+  src/models/qwen4exp/decode/verify/batch_execution.cpp
+  src/models/qwen4exp/decode/verify/batch_sessions.cpp
+  src/models/qwen4exp/decode/verify/capture.cpp
+  src/models/qwen4exp/decode/verify/commit.cpp
+  src/models/qwen4exp/decode/verify/cpu_warm.cpp
+  src/models/qwen4exp/decode/verify/diagnostics.cpp
+  src/models/qwen4exp/decode/verify/execution.cpp
+  src/models/qwen4exp/decode/verify/expert_execution.cpp
+  src/models/qwen4exp/decode/verify/expert_plan.cpp
+  src/models/qwen4exp/decode/verify/expert_resources.cpp
+  src/models/qwen4exp/decode/verify/gdn_split.cpp
+  src/models/qwen4exp/decode/verify/hc8.cpp
+  src/models/qwen4exp/decode/verify/head_split.cpp
+  src/models/qwen4exp/decode/verify/lifecycle.cpp
+  src/models/qwen4exp/decode/verify/pipeline.cpp
+  src/models/qwen4exp/decode/verify/profile.cpp
+  src/models/qwen4exp/decode/verify/projection.cpp
+  src/models/qwen4exp/decode/verify/record.cpp
+  src/models/qwen4exp/decode/verify/record_gdn.cpp
+  src/models/qwen4exp/decode/verify/record_head.cpp
+  src/models/qwen4exp/decode/verify/record_inputs.cpp
+  src/models/qwen4exp/decode/verify/record_layer.cpp
+  src/models/qwen4exp/decode/verify/record_moe.cpp
+  src/models/qwen4exp/decode/verify/record_qsa.cpp
+  src/models/qwen4exp/decode/verify/sampling.cpp
   src/core/mtp/helpers.cpp
   src/core/mtp/lifecycle.cpp
   src/core/mtp/tensors.cpp
