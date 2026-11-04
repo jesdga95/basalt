@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.frontend import ChatTemplate, forced_call, tool_choice_of  # noqa: E402
 from serve.handler import serve  # noqa: E402
-from serve.service import REASONING_WRAP_UP, Service  # noqa: E402
+from serve.service import REASONING_CLOSE, Service  # noqa: E402
 from serve.util.text import ByteTokenizer  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -177,7 +177,7 @@ class OpenAI(Base):
         finish, calls, reasoning = self.call_of(*self.chat(tool_choice="required", reasoning_budget_tokens=20), False)
         self.assertEqual((finish, calls), ("tool_calls", [("search", {"q": "2+2"})]))
         first, second = self.engine.prompts
-        extra = self.tok.encode(REASONING_WRAP_UP + "<tool_call>\n<function=", parse_special=True)
+        extra = self.tok.encode(REASONING_CLOSE + "<tool_call>\n<function=", parse_special=True)
         self.assertEqual(second, first + self.tok.encode(CallingEngine.THOUGHT[:20]) + extra)
 
     def test_auto_absent_and_none_leave_it_to_the_model(self):

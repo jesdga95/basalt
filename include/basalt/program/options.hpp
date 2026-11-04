@@ -1,7 +1,6 @@
 // basalt/program/options.hpp - the `basalt generate` flag set, resolved into one struct.
 #pragma once
 
-#include <array>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -13,7 +12,6 @@ namespace basalt::program {
 
 struct Options {
     std::string model;                ///< --model: the .basalt file every loader reads from
-    std::string dump_hc8;             ///< --dump-hc8: write the 8-bit hyper-connection copies here, then exit
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;
     int64_t max_context = 4096;
@@ -22,8 +20,6 @@ struct Options {
     int top_k = 20;
     float top_p = 0.95f;
     float temperature = 1.0f;
-    std::string dump_logits;          // one line of logits per generated position
-    int64_t logits_stride = 1;        // storage selection; all prompt tokens remain conditioned
     /// THE CONTEXT EXTENSION (rope scaling, rope_scaling.hpp).  These knobs resolve to ONE process config,
     /// set once before `session_init` builds the rope table and the graphs capture the kernels.  There is
     /// deliberately no per-request form: K sits in the cache POST-RoPE, so one cache must never mix two
@@ -51,15 +47,6 @@ struct Options {
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the large GEMV does not.
     std::string dump_mixed;
-    /// One residual snapshot per layer per position: `n_layers * hc * n_embd` floats per position, appended in
-    /// position order.  This is the BISECTION LADDER - it is what `llama-debug --tensor-filter l_last` prints
-    /// for the reference, so the first layer whose `sum` diverges is the layer that holds the bug.  It needs the
-    /// captured path (the expert pool only exists there), so it is refused with `--no-capture`.
-    std::string dump_layers;
-    /// `2 * n_embd + 2 * hc` floats per layer per position: the attention half's block output, the MoE half's,
-    /// and the two injection vectors.  It separates `linear_attn_out-<l>` from `ffn_out-<l>`, which the residual
-    /// ladder cannot.  **CAPTURED INTO THE LAYER GRAPHS**, so it must be armed before `session_capture`.
-    std::string dump_halves;
     /// The routing trace: one record per layer per position: `int32 layer, int32 k, k int32 ids, k float weights`.  It is
     /// what a hit-rate curve for a candidate VRAM expert cache is computed from, and it needs no new kernels - the
     /// doorbell already publishes exactly this much to pinned memory.
@@ -94,10 +81,6 @@ struct Options {
     /// Slots of VRAM-resident experts.  **0 = off, and off is the default.**  Switching the cache on moves work off the
     /// CPU pool (`src/kernels/cuda/s2_expert_grouped.cu`, wired via `expert_hit_run`).
     int expert_cache = 0;
-    std::array<int, 3> expert_cache_remote{}; ///< CUDA1..3 slots; CUDA0 keeps dense/state/MTP
-    std::array<bool, 3> expert_cache_remote_auto{};
-    bool remote_expert_opt = false; ///< optional optimization of the existing remote-expert decode path
-    std::string expert_cache_remote_placement = "stripe"; ///< stripe experts or assign complete layers to CUDA1..3
     /// Multi-GPU: a second expert tier on CUDA device `peer_device` (-1 = off), `peer_reserve_mib` left free
     /// there, `peer_slots` caps its size (0 = as many as fit), `peer_adapt_swaps` per adaptive round
     /// (-1 = adapt_swaps).
@@ -113,11 +96,12 @@ struct Options {
     /// the prompt path's rows per layer the peer computes: -1 = half of chunk x top-k, 0 = the prompt path stays on
     /// the primary
     int64_t peer_prefill_rows = -1;
-    /// Names the model's expert profile when it carries one (the file and `#profile`); empty means none.  A profile
-    /// decides residency by routing frequency instead of by first use.
+    /// The engine's expert profile for the model (--expert-profile, else data/profiles/<key>.prof, cli::profile_key),
+    /// or the --expert-profile-save file a start places from; empty means none.  A profile decides residency by routing
+    /// frequency instead of by first use.
     std::string expert_profile;
     /// --serve (opt-in): where to save what the adaptive tier learned, as a profile (the resident experts first,
-    /// then the routing counted since the start; tools/convert/convert.py reads it as `--profile`); on QUIT and every
+    /// then the routing counted since the start; the format of data/profiles); on QUIT and every
     /// `expert_profile_save_min` minutes between requests.  Empty (the default): nothing is counted or written.
     std::string expert_profile_save;
     double expert_profile_save_min = 10.0;
@@ -159,6 +143,14 @@ struct Options {
     /// own draw differs (0 = exact; the flag alone = kRelaxedDraftingDefault).  This changes the output distribution:
     /// docs/precision/features.md.  Solo decode only; a request's relax=P key overrides it.
     float relaxed_drafting = 0.0f;
+    /// --route-tail-skip [R]: in a decode window an expert no GPU holds is neither copied nor computed when every
+    /// entry of the window that names it ranks R or lower by router weight (0 = off; the flag alone =
+    /// kRouteTailSkipDefault).  The others keep their router weights.  This changes the output: docs/precision/features.md.
+    int route_tail_skip = 0;
+    /// --route-prior [LAMBDA]: a decode window picks its top-10 as if every expert a GPU holds had LAMBDA added to its
+    /// router logit; the weights stay the router's own (0 = off; the flag alone = kRoutePriorDefault). This changes
+    /// the output: docs/precision/routing.md.
+    float route_prior = 0.0f;
     /// --grammar on|off: a request's "grammar" key is enforced on the sampled tokens (the vocabulary is read from the
     /// pack at start).  Off: the key is ignored and the decode loop pays one pointer test per window.
     bool grammar = false;
@@ -221,6 +213,12 @@ struct Options {
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
+    int conversation_cache_min_tokens = 0;   ///< --serve: park only conversations of at least N tokens (0 = park every one)
+    /// --serve: the folder of the disk tier (the server names one inside the model cache folder): a conversation
+    /// that leaves the session or the RAM cache, and every one the process holds when it ends, is written there and
+    /// read back when a prompt starts with it, after a restart too (conversation_store.hpp)
+    std::string conversation_cache_dir;
+    int64_t conversation_cache_disk_mib = 0;   ///< byte budget of the disk tier, least recently used first; above 0 turns it on
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system

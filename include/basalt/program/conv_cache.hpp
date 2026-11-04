@@ -2,7 +2,7 @@
 // leaves when the cache is over its slot budget.
 //
 // The cache holds conversation checkpoints: snapshots of the running state (the GDN recurrence, the PLE
-// history, the QSA indexer tails - `ConvCheckpoint` in generate.cpp) that a request resumes its prompt
+// history, the QSA indexer tails - `ConvCheckpoint` in src/program/serve/state.hpp) that a request resumes its prompt
 // from instead of reading those tokens again.  The request path keeps only the checkpoints whose tokens
 // are a prefix of the current prompt - any other checkpoint's positional cells have been overwritten,
 // because the KV cache is one arena that holds one branch of history at a time - so at any moment the

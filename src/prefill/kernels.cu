@@ -17,7 +17,7 @@ namespace basalt::prefill {
 namespace {
 
 constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
-constexpr int S = 128, HK = 16, HV = 48, C = 10240;
+constexpr int HV = 48, C = 10240;
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -788,7 +788,7 @@ void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, 
 }
 void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
           const basalt::kernels::RopeScaling& scaling, void* stream) {
-    // The engine validates the resolved config at startup with the same rule (generate.cpp), so this only
+    // The engine validates the resolved config at startup with the same rule (src/program/generate/model.cpp), so this only
     // fires for a caller that bypassed it; the prompt path has no error return here, so it stops the process.
     if (const char* why = basalt::kernels::rope_scaling_invalid(scaling)) {
         basalt::log::error("basalt", "prefill rope: invalid rope scaling: %s", why);

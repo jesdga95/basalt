@@ -65,6 +65,8 @@ def check_row(r, err):
             err("submitter must be at most 40 characters")
         elif CONTROL.search(r["submitter"]):
             err("submitter must not contain control characters")
+        elif re.search(r"\s", r["submitter"]):
+            err("submitter must be one name with no spaces")
     if "date" in r:
         d = r["date"]
         ok = isinstance(d, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d)

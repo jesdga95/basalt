@@ -13,7 +13,9 @@ from serve.server import engine_args, gpus_in_play
 from model_file import ModelFile, ModelWriter  # noqa: E402
 
 META = {"name": "tiny-basalt",
-        "sampling": {"temperature": 0.7, "top_p": 0.9}}
+        "gguf_kv": {"general.sampling.temp": 0.699999988079071, "general.sampling.top_p": 0.8999999761581421,
+                    "general.sampling.top_k": 20, "general.sampling.xtc_threshold": 0.1}}
+SAMPLING = {"temperature": 0.7, "top_p": 0.9, "top_k": 20}
 TOKENIZER = {"vocab.json": b'{"a": 0}', "merges.txt": b"a a", "token_type.json": b"[1]",
              "chat_template.jinja": b"{{ messages }}"}
 
@@ -50,7 +52,7 @@ class Derivation(Tmp):
         self.assertEqual(cfg["engine_bin"], str(self.engine_bin))
         self.assertEqual(cfg["args"], ["--model", path])
         self.assertEqual(cfg["model_name"], "tiny-basalt")
-        self.assertEqual(cfg["sampling"], META["sampling"])
+        self.assertEqual(cfg["sampling"], SAMPLING)
         self.assertTrue(cfg["log"].startswith(str(self.dir / "cache")))
         self.assertNotIn("vision", cfg)
         self.assertEqual(engine_args(cfg), cfg["args"])
@@ -60,6 +62,21 @@ class Derivation(Tmp):
         key = ModelFile(path).sections["meta"][2].hex()[:16]
         tok = Path(modelfile.model_config(path, str(self.engine_bin))["tokenizer"])
         self.assertEqual(tok, self.dir / "cache" / key / "tokenizer")
+
+    def test_conversation_dir_follows_the_budget(self):
+        path = self.build()
+        key = ModelFile(path).sections["meta"][2].hex()[:16]
+        conv = str(self.dir / "cache" / key / "conversations")
+
+        def args(*words):
+            return modelfile.model_config(path, str(self.engine_bin), engine_words=list(words))["args"]
+        self.assertEqual(args(), ["--model", path])
+        self.assertEqual(args("--conversation-cache-disk-mib", "0"), ["--model", path, "--conversation-cache-disk-mib", "0"])
+        self.assertEqual(args("--conversation-cache-dir", "/x"), ["--model", path, "--conversation-cache-dir", "/x"])
+        self.assertEqual(args("--conversation-cache-disk-mib", "32768"),
+                         ["--model", path, "--conversation-cache-disk-mib", "32768", "--conversation-cache-dir", conv])
+        self.assertEqual(args("--conversation-cache-disk-mib", "5", "--conversation-cache-dir", "/x"),
+                         ["--model", path, "--conversation-cache-disk-mib", "5", "--conversation-cache-dir", "/x"])
 
     def test_tokenizer_extracted_once_and_reused(self):
         path = self.build()
@@ -114,7 +131,7 @@ class Peer(Tmp):
         path = self.build(meta={**META, "engine_args": ["--spec", "7", "--kv", "int8"]})
         cfg = modelfile.model_config(path, str(self.engine_bin))
         self.assertEqual(cfg["args"], ["--model", path])
-        self.assertEqual(cfg["sampling"], META["sampling"])
+        self.assertEqual(cfg["sampling"], SAMPLING)
 
 
 class Vision(Tmp):
@@ -127,6 +144,15 @@ class Vision(Tmp):
         self.assertEqual(Path(v["mmproj"]).read_bytes(), b"MMPROJ" * 100)
         self.assertEqual(Path(v["model"]).read_bytes(), b"VOCAB")
         self.assertEqual([p.name for p in Path(v["mmproj"]).parent.iterdir() if ".gguf." in p.name], [])
+
+    def test_sidecar_takes_the_engine_bins_suffix(self):
+        path = self.build(vision=True)
+        exe = self.engine_bin.with_name("basalt.exe")
+        exe.write_text("")
+        side = self.engine_bin.parent / "basalt-vision.exe"
+        side.write_text("")
+        v = modelfile.model_config(path, str(exe), vision="cpu")["vision"]
+        self.assertEqual(v["vision_bin"], str(side.resolve()))
 
     def test_off_by_default(self):
         path = self.build(vision=True)
@@ -204,27 +230,30 @@ class Cli(Tmp):
     def test_vision_without_sidecar_is_a_startup_error(self):
         path = self.build(vision=True)
         err = io.StringIO()
-        with mock.patch("sys.stderr", err):
+        with mock.patch("serve.server.gpu_card_name", return_value="GeForce RTX 4090"), mock.patch("sys.stderr", err):
             e = self.run_main("--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0", "--vision", "1")
         self.assertEqual(getattr(e, "code", None), 2)
         self.assertIn("basalt-vision", err.getvalue())
 
-    def test_vision_numbered_card_is_checked_at_startup(self):
+    def test_vision_numbered_card_needs_only_to_exist(self):
         path = self.build(vision=True)
         (self.engine_bin.parent / "basalt-vision").write_text("")
         base = ["--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0"]
 
-        def plan(engine_bin, value):                     # a fake --gpu-plan: card 0 Blackwell, card 9 refused
-            if str(value) == "9":
-                raise ValueError("GPU 9 is sm_86, not sm_120")
+        def plan(engine_bin, value):                     # the engine's own choice for --gpu 0
             return {"devices": [0], "cards": [{"smi": 0}], "notes": [], "warning": None}
-        with mock.patch("serve.server.gpu_plan", side_effect=plan), mock.patch("sys.stderr", io.StringIO()) as err:
-            e = self.run_main(*base, "--vision", "9")
-        self.assertEqual(getattr(e, "code", None), 2)
-        self.assertIn("vision: GPU 9 is sm_86, not sm_120", err.getvalue())
-        with mock.patch("serve.server.gpu_plan", side_effect=plan):
-            e = self.run_main(*base, "--vision", "0")   # a visible card gets through to the Server
+        def name(index):                                 # nvidia-smi knows card 9 (an older card), not card 8
+            return None if index == 8 else "GeForce RTX 3070"
+        with mock.patch("serve.server.gpu_plan", side_effect=plan), \
+                mock.patch("serve.server.gpu_card_name", side_effect=name):
+            e = self.run_main(*base, "--vision", "9")   # a non-Blackwell card gets through to the Server
         self.assertIsInstance(e, RuntimeError)
+        with mock.patch("serve.server.gpu_plan", side_effect=plan), \
+                mock.patch("serve.server.gpu_card_name", side_effect=name), \
+                mock.patch("sys.stderr", io.StringIO()) as err:
+            e = self.run_main(*base, "--vision", "8")   # only a card that is not there fails at startup
+        self.assertEqual(getattr(e, "code", None), 2)
+        self.assertIn("vision: GPU 8 is not found by nvidia-smi", err.getvalue())
 
 
 if __name__ == "__main__":

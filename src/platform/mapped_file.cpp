@@ -22,8 +22,8 @@ std::optional<MappedFile> MappedFile::open_ro(const std::string& path, std::stri
         return std::nullopt;
     };
     // The section is taken on a file handle, so this open is the wide Win32 one: the file seam has no mapping call.
-    HANDLE h = CreateFileW(to_wide(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE h = CreateFileW(to_wide_path(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE |
+                           FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return fail("cannot open");
     LARGE_INTEGER li{};
     if (!GetFileSizeEx(h, &li)) {

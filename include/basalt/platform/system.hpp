@@ -27,9 +27,15 @@ std::string python_interpreter(const std::string& src_dir);
 /// such knob.
 void prefer_oom_victim();
 
-/// Whether a process is given direct GPU-to-GPU access between its devices, which a second GPU holding an expert tier
-/// needs. False where the platform withholds it.
-bool gpu_peer_access();
+/// Asks that this process keep running at full speed while its window is in the background or minimized. Windows
+/// otherwise lowers such a process's quality of service, which on a hybrid CPU keeps its threads on the efficiency
+/// cores, where the CPU expert pool's workers wait on each other. False when the OS refused; true where the OS has no
+/// such knob.
+bool keep_full_speed();
+
+/// Whether the GPU driver pages device memory out to system memory when a card is full, so that an allocation past
+/// the end succeeds and the work using it stalls, instead of failing the allocation.
+bool gpu_memory_pages();
 
 /// Puts the three standard streams in binary mode where the C runtime defaults them to text, which would turn each
 /// "\n" the serve protocol writes into "\r\n" and fold a "\r\n" in a request to "\n". For a process whose standard

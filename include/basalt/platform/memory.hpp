@@ -111,10 +111,9 @@ inline uint64_t ram_floor(uint64_t margin, uint64_t file_bytes, uint64_t complem
     return margin + file_cache_floor(file_bytes, complement_bytes, largest_layer_bytes, prompt_file_bytes);
 }
 
-/// Where a running request stops while serving: the margin plus one prompt chunk's file reads when experts are read
-/// from the file (the margin alone when none are).  Below ram_floor() by the two layers' read-ahead, so the engine's
-/// own growth after the load (conversation cache, an image's buffers) does not end requests on a machine still
-/// sized as asked.
+/// The serve guard's floor (see ram_level): the margin plus one prompt chunk's file reads when experts are read from
+/// the file (the margin alone when none are).  Below ram_floor() by the two layers' read-ahead, so the engine's own
+/// growth after the load (conversation cache, an image's buffers) does not reach it on a machine still sized as asked.
 inline uint64_t ram_guard_floor(uint64_t margin, uint64_t file_bytes, uint64_t prompt_file_bytes) {
     return margin + (file_bytes > 0 ? prompt_file_bytes : 0);
 }
@@ -154,11 +153,94 @@ inline bool reclaim_due(uint64_t avail, uint64_t floor, uint64_t lead, uint64_t 
     return since_ms >= cooldown_ms && avail + refill <= after;
 }
 
-/// While serving: polls available_memory() and keeps whether it is below `floor_bytes`, for ram_guard_low.  The request
-/// that is running then stops with an error instead of the machine swapping; nothing is shrunk or exited.
+/// The guard's judgement of the RAM while serving. `Low`: below its floor, where the engine sheds what it can spare and
+/// a request waits a while before it starts. `Critical`: where a running request stops.
+enum class RamLevel { Ok, Low, Critical };
+
+/// Below this much available RAM a running request stops whatever the stall reading says: what a request still
+/// allocates (its own buffers, a checkpoint) plus room for the OS to compress or drop other programs' idle pages.
+inline constexpr uint64_t kRamHardFloor = 1ull << 30;
+/// The shares of time (percent, averaged over ten seconds) in which some task, or every task, waited on memory, above
+/// which RAM below the guard's floor is critical: tasks then wait on memory most of the time (thrashing). One program
+/// reclaiming into compressed swap stays below them, even when it is the only task running and so stalls `full` too.
+inline constexpr double kStallSomePct = 60.0;
+inline constexpr double kStallFullPct = 40.0;
+/// How long a request that arrives below the guard's floor waits for RAM to come back before it starts.
+inline constexpr uint64_t kRamAdmitWaitMs = 30000;
+
+/// Prompt tokens past the live conversation up to which a request only continues it (the server's wrap-up after a
+/// thinking budget) rather than starting a turn of its own.
+inline constexpr int64_t kRamContinueTokens = 256;
+/// Whether a request that reads `fresh` tokens past the live conversation (`from_live`: it continues that
+/// conversation) skips the admission wait: it adds little RAM and is part of a reply already streaming.
+inline bool ram_continues_live(bool from_live, int64_t fresh) {
+    return from_live && fresh >= 0 && fresh <= kRamContinueTokens;
+}
+
+/// The OS's memory-stall shares over the last ten seconds, in percent. `known` is false where the OS keeps none.
+struct MemoryStalls {
+    bool known = false;
+    double some = 0.0;   ///< time some task waited on memory
+    double full = 0.0;   ///< time every runnable task waited on memory
+};
+/// The stall reading now (Linux: /proc/pressure/memory; none on Windows).
+MemoryStalls memory_stalls();
+/// The `some` and `full` lines' avg10 of a pressure file's text; `known` false when either is missing.
+MemoryStalls parse_memory_stalls(const std::string& text);
+
+/// How long the reading must stay below the guard's floor, where the OS gives no stall reading, before that counts as
+/// critical: the span the stall shares are averaged over, so a brief dip is judged as it is where the OS shows stalls.
+inline constexpr uint64_t kRamSustainedMs = 10000;
+
+/// How long the reading has been continuously below the floor, from the guard's samples (`now_ms` on any steady clock).
+struct BelowFloorClock {
+    int64_t since_ms = -1;   ///< when the current run below the floor began; -1 when not below
+    /// Feeds one sample (`below`: the reading is under the floor) and returns the ms the run has lasted (0 when not below).
+    uint64_t update(int64_t now_ms, bool below) {
+        if (!below) {
+            since_ms = -1;
+            return 0;
+        }
+        if (since_ms < 0) since_ms = now_ms;
+        return now_ms > since_ms ? (uint64_t) (now_ms - since_ms) : 0;
+    }
+};
+
+/// The guard's level for an available-RAM reading `avail` (0 = unknown) against `floor`, the hard floor `hard` and
+/// the stall reading. Without a stall reading, below the floor is critical once the reading has stayed there for
+/// `below_ms` >= kRamSustainedMs; a shorter dip is low. Under the hard floor it is critical at once.
+inline RamLevel ram_level(uint64_t avail, uint64_t floor, uint64_t hard, const MemoryStalls& stalls,
+                          uint64_t below_ms) {
+    if (!ram_below_floor(avail, floor)) return RamLevel::Ok;
+    if (avail < (hard < floor ? hard : floor)) return RamLevel::Critical;
+    if (!stalls.known) return below_ms >= kRamSustainedMs ? RamLevel::Critical : RamLevel::Low;
+    return stalls.some >= kStallSomePct || stalls.full >= kStallFullPct ? RamLevel::Critical : RamLevel::Low;
+}
+
+/// Whether a request that has waited `waited_ms` at admission keeps waiting at `level`.
+inline bool ram_admit_waits(RamLevel level, uint64_t waited_ms, uint64_t limit_ms = kRamAdmitWaitMs) {
+    return level != RamLevel::Ok && waited_ms < limit_ms;
+}
+
+/// The error a request stops with at RamLevel::Critical: the free RAM `avail` against the floor it fell under
+/// (`hard`, or the guard's `floor` with the stalls that made it critical) and who took the RAM since the engine was
+/// ready: `others` bytes by other programs, `own` by the engine. The budget flag is named only when the engine's own
+/// growth is the larger part.
+std::string ram_stop_message(uint64_t avail, uint64_t floor, uint64_t hard, const MemoryStalls& stalls,
+                             uint64_t others, uint64_t own);
+
+/// While serving: polls available_memory() against `floor_bytes` (and, below it, memory_stalls()) and keeps the
+/// level for ram_guard_level. Nothing is shrunk or exited here; the serve loop acts on the level.
 void start_ram_guard(uint64_t floor_bytes);
-/// True while the last reading was below the guard's floor; `avail` and `floor` get that reading and the floor.
-bool ram_guard_low(uint64_t* avail = nullptr, uint64_t* floor = nullptr);
+/// The level of the guard's last reading; `avail`, `floor` and `stalls` get the reading it was judged on.
+RamLevel ram_guard_level(uint64_t* avail = nullptr, uint64_t* floor = nullptr, MemoryStalls* stalls = nullptr);
+/// How many times the reading has gone below the floor since the guard started: the serve loop sheds once per drop.
+uint64_t ram_guard_drops();
+/// Pauses the guard (`paused`): its readings are not judged, and the level stays the last one judged; for a sleeping
+/// engine, whose GPU state the driver holds in RAM until the wake. Unpausing judges a fresh reading before it returns.
+void ram_guard_pause(bool paused);
+/// Hands the heap's free pages back to the OS (best effort).
+void release_free_heap();
 /// A mapped file view the guard gives back (drop_mapped_view) when a reading comes within 1 GiB of its floor, then
 /// reads again; see reclaim_due for when it gives back again.
 /// Windows keeps a view's pages in the process once read and does not count them as available, where Linux counts

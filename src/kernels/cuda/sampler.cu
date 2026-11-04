@@ -20,11 +20,16 @@
 //   - `sampler_one_block_kernel` (the fallback when no split can run): one block per token, `top_k` block-argmax
 //     rounds, each over the logits after the previous pick.
 // `sampled_tail_warp` and `sampled_tail_pair` run top_p / min_p / temperature / draw with the same arithmetic.
+// A list longer than 64 (top_k 0 = the whole vocabulary, or top_k > 64) takes the WIDE PATH: each row's penalised
+// logits sorted in the selection order (`sampler_wide_keys_kernel`, a radix sort), then `sampler_wide_tail_kernel`,
+// the same arithmetic over the sorted list.
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/core/diag.hpp"
 
+#include <cub/device/device_radix_sort.cuh>
 #include <cuda_runtime.h>
 
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -337,13 +342,12 @@ __global__ void __launch_bounds__(kAmThreads) sampler_greedy_top_prob_cluster_ke
 // i picks the i-th logit of the order.  NaN and -inf are never picked (`s > bv` from -inf fails); a round that finds
 // nothing yields the SENTINEL (-inf, n_vocab), stored as id 0.
 
-constexpr int kSelMax = 64;   // the widest top_k list
+constexpr int kSelMax = kSamplerNarrowMax;   // the widest list the top_k kernels keep; a longer one takes the wide path
 constexpr unsigned kFullMask = 0xFFFFFFFFu;
 
-// top_k 1..64 as given; 0 ("off") and anything wider keep 64; never more than the vocabulary
+// the list length: top_k as given, 0 (off) the whole vocabulary, never more than the vocabulary
 __host__ __device__ __forceinline__ int sampled_k(int top_k, int n_vocab) {
-    int k = (top_k > 0 && top_k < kSelMax) ? top_k : kSelMax;
-    return k > n_vocab ? n_vocab : k;
+    return (top_k > 0 && top_k < n_vocab) ? top_k : n_vocab;
 }
 
 // (bv, bi) <- the first of (bv, bi) and (ov, oi) in the selection order
@@ -409,6 +413,8 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
         for (int i = 0; i < n_keep; ++i)
             if (sel_logit[i] < thresh) { n_keep = i; break; }
     }
+    if (p.top_ids != nullptr)
+        for (int i = lane; i < p.n_top; i += 32) p.top_ids[(size_t) t * p.n_top + i] = i < n_keep ? sel_ids[i] : -1;
     // temperature, then one Philox draw
     float smx = sel_logit[0] * inv_t;
     for (int i = 1; i < n_keep; ++i) smx = fmaxf(smx, sel_logit[i] * inv_t);
@@ -480,6 +486,7 @@ sampler_one_block_kernel(const float* __restrict__ logits, int n_vocab, const in
     };
 
     const int k = sampled_k(p.top_k, n_vocab);
+    if (k > kSelMax) __trap();   // a longer list is the wide path's (sample_tokens_impl)
     __shared__ int sel_ids[kSelMax];
     __shared__ float sel_logit[kSelMax];
     __shared__ double ex[kSelMax];
@@ -1015,6 +1022,8 @@ __device__ void sampled_tail_pair(TailShared& ts, int k, const SamplerParams& p,
         const int first = below ? __ffs(below) - 1 : k;
         if (first < n_keep) n_keep = first;
     }
+    if (p.top_ids != nullptr && lane < p.n_top)
+        p.top_ids[(size_t) t * p.n_top + lane] = lane < n_keep ? ts.id[lane] : -1;
     tail_pair_sync();                        // warp 1's terms and prefix sums
     const double sum2 = n_keep > 0 ? ts.pre2[n_keep - 1] : 0.0;
     if (lane < n_keep) ts.e2[lane] = ts.e2[lane] / sum2;
@@ -1212,7 +1221,337 @@ int2* split_scratch(void* stream, size_t entries, unsigned** done) {
     return ptr;
 }
 
+// ---- THE WIDE PATH: a list longer than 64 entries (top_k 0 = the whole vocabulary).  A row's penalised logits become
+// sort keys in the selection order, the ids their values, and a stable radix sort orders them: the key of a value is
+// the complement of its order-preserving bit map, with -0 read as +0 (they compare equal, so a tie falls to the lower
+// id, which the stable sort keeps) and NaN and -inf as -inf, the sentinel no round picks (its terms are 0).  Then the
+// chain of `sampled_tail_warp` over the sorted list - top_p over the list's softmax, min_p, temperature over the kept
+// prefix, one Philox draw at (seed, counter + row) - with the same exp arguments, its sums CHUNKED so that every SM
+// takes a part: chunk c of a length n is [c C, (c + 1) C), C = ceil(n / 1024), summed in order by one thread; the
+// chunk sums are combined by a fixed tree (an inclusive scan of 32 per warp, shuffles up by 1, 2, 4, 8, 16, then the
+// same over the 32 warp totals), and a cumulative value is its chunk's prefix plus its run in the chunk.  A crossing is
+// tested against the threshold times the total (top_p: cum >= top_p S; the draw: u S < cum), so no quotient is formed
+// per entry.  The same chain at every launch, so a seed replays its draws; sampler_parity's mirror runs the same order.
+constexpr int kWideBlockSpan = 4096;   // logits per block of the key pass (its penalty bitmap: 512 bytes)
+constexpr int kWideKeyThreads = 256;
+constexpr int kWideChunks = 1024;      // chunks of a list's sums: 32 blocks of 32 threads, one chunk each
+constexpr int kWideRows = 8;           // rows of one pass (their buffers); more rows take several passes
+
+// a row's scan state between the wide path's launches
+struct WideRow {
+    double total1, total2;   // top_p's sum over the list, the temperature pass's over the kept prefix
+    int cut, below;          // the first entry meeting top_p, the first under min_p's threshold (k: none)
+    int n_keep, pick, qpos;  // the kept prefix, the first entry the draw meets, the query's place (INT_MAX: none)
+};
+
+__device__ __forceinline__ unsigned wide_key(float x) {
+    unsigned u = __float_as_uint(x);
+    if (!(x > __int_as_float(0xff800000))) u = 0xff800000u;   // NaN and -inf: the sentinel
+    else if (x == 0.0f) u = 0u;
+    const unsigned asc = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    return ~asc;
+}
+
+__device__ __forceinline__ float wide_value(unsigned key) {
+    const unsigned asc = ~key;
+    return __uint_as_float((asc & 0x80000000u) ? (asc & 0x7fffffffu) : ~asc);
+}
+
+/// Each row's penalised logits as sort keys, and their ids: grid (blocks of 4,096 logits, rows), the penalties and the
+/// bias as the split kernels apply them.  Block 0 of a row also clears its scan state.
+__global__ void __launch_bounds__(kWideKeyThreads)
+sampler_wide_keys_kernel(const float* __restrict__ logits, int n_vocab, const int* __restrict__ history, int history_len,
+                         const SamplerParams p, int k, unsigned* __restrict__ keys, int* __restrict__ ids,
+                         WideRow* __restrict__ st) {
+    const int t = blockIdx.y;
+    const float* l = logits + (size_t) t * n_vocab;
+    const int blo = (int) blockIdx.x * kWideBlockSpan;
+    if (blockIdx.x == 0 && threadIdx.x == 0) st[t] = WideRow{0.0, 0.0, k, k, k, INT_MAX, INT_MAX};
+    const int* hrow = history ? history + (size_t) t * history_len : nullptr;
+    int hlen = 0;
+    if (hrow) {
+        hlen = p.penalty_last_n < history_len ? p.penalty_last_n : history_len;
+        if (hlen < 0) hlen = 0;
+        hrow += history_len - hlen;          // the window is the TAIL
+    }
+    __shared__ unsigned int bits[kWideBlockSpan / 32];
+    const bool use_bits = hrow != nullptr && hlen > 0;
+    if (use_bits) {
+        for (int w = threadIdx.x; w < kWideBlockSpan / 32; w += blockDim.x) bits[w] = 0u;
+        __syncthreads();
+        for (int i = threadIdx.x; i < hlen; i += blockDim.x) {
+            const int h = hrow[i];
+            if (h >= 0 && h < n_vocab && h >= blo && h - blo < kWideBlockSpan)
+                atomicOr(&bits[(h - blo) >> 5], 1u << ((h - blo) & 31));
+        }
+        __syncthreads();
+    }
+    unsigned* kr = keys + (size_t) t * n_vocab;
+    int* ir = ids + (size_t) t * n_vocab;
+    for (int b = threadIdx.x; b < kWideBlockSpan && blo + b < n_vocab; b += blockDim.x) {
+        const int v = blo + b;
+        float s = p.logit_bias ? l[v] + p.logit_bias[v] : l[v];
+        if (use_bits && (bits[b >> 5] & (1u << (b & 31)))) s = apply_penalties(s, history_count(hrow, hlen, v), p);
+        kr[v] = wide_key(s);
+        ir[v] = v;
+    }
+}
+
+__device__ __forceinline__ int wide_kept(const WideRow& r, int k, int min_keep) {
+    int cut = r.cut < k ? r.cut + 1 : k;
+    if (cut < min_keep) cut = min_keep < k ? min_keep : k;
+    return cut < r.below ? cut : r.below;
+}
+
+/// One pass's terms and chunk sums: grid (32, rows) x 32 threads, thread c the chunk c of the pass's length (pass 1:
+/// the list, k; pass 2: the kept prefix).  Pass 1 holds exp(x - x0), pass 2 exp(x / T - x0 / T); pass 2's block 0
+/// records the kept prefix.
+__global__ void __launch_bounds__(32)
+sampler_wide_terms_kernel(const unsigned* __restrict__ keys, int n_vocab, int k, const SamplerParams p, int pass,
+                          double* __restrict__ e, double* __restrict__ part, WideRow* __restrict__ st) {
+    const int t = blockIdx.y, c = (int) (blockIdx.x * 32 + threadIdx.x);
+    const unsigned* kr = keys + (size_t) t * n_vocab;
+    double* er = e + (size_t) t * n_vocab;
+    const float x0 = wide_value(kr[0]);
+    const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
+    const float smx = x0 * inv_t;            // the list is sorted: its first product is the largest
+    const int n = pass == 1 ? k : wide_kept(st[t], k, p.min_keep);
+    if (pass == 2 && c == 0) st[t].n_keep = n;
+    const int C = (n + kWideChunks - 1) / kWideChunks;
+    const int lo = min(n, c * C), hi = min(n, lo + C);
+    double s = 0.0;
+    for (int i = lo; i < hi; ++i) {
+        const float x = wide_value(kr[i]);
+        const double v = pass == 1 ? exp((double) x - (double) x0) : exp((double) (x * inv_t) - (double) smx);
+        er[i] = v;
+        s += v;
+    }
+    part[(size_t) t * kWideChunks + c] = s;
+}
+
+/// The chunk sums' fixed tree: grid (rows) x 1024 threads; each chunk's prefix (the chunk sums before it) into `pre`,
+/// the total into the row's state.
+__global__ void __launch_bounds__(kWideChunks)
+sampler_wide_scan_kernel(const double* __restrict__ part, double* __restrict__ pre, int pass, WideRow* __restrict__ st) {
+    __shared__ double warp_incl[32];
+    const int t = blockIdx.x, c = (int) threadIdx.x, lane = c & 31, w = c >> 5;
+    const double v = part[(size_t) t * kWideChunks + c];
+    double incl = v;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        const double o = __shfl_up_sync(kFullMask, incl, off);
+        if (lane >= off) incl = incl + o;
+    }
+    const double lane_excl = __shfl_up_sync(kFullMask, incl, 1);
+    if (lane == 31) warp_incl[w] = incl;
+    __syncthreads();
+    if (w == 0) {
+        double x = warp_incl[lane];
+#pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            const double o = __shfl_up_sync(kFullMask, x, off);
+            if (lane >= off) x = x + o;
+        }
+        warp_incl[lane] = x;
+    }
+    __syncthreads();
+    const double warp_excl = w > 0 ? warp_incl[w - 1] : 0.0;
+    pre[(size_t) t * kWideChunks + c] = warp_excl + (lane > 0 ? lane_excl : 0.0);
+    if (c == 0) {
+        if (pass == 1) st[t].total1 = warp_incl[31];
+        else st[t].total2 = warp_incl[31];
+    }
+}
+
+/// One pass's search: grid (32, rows) x 32 threads over the same chunks as its terms.  Pass 1: the first entry whose
+/// cumulative value reaches top_p S, and (min_p) the first entry under the threshold; pass 2: the first entry whose
+/// cumulative value exceeds u S, and the query's place in the kept prefix.
+__global__ void __launch_bounds__(32)
+sampler_wide_search_kernel(const unsigned* __restrict__ keys, const int* __restrict__ ids, int n_vocab, int k,
+                           const SamplerParams p, int pass, const double* __restrict__ e, const double* __restrict__ pre,
+                           const int* __restrict__ query, int nq, WideRow* __restrict__ st) {
+    const int t = blockIdx.y, c = (int) (blockIdx.x * 32 + threadIdx.x);
+    const unsigned* kr = keys + (size_t) t * n_vocab;
+    const double* er = e + (size_t) t * n_vocab;
+    WideRow& r = st[t];
+    const int n = pass == 1 ? k : r.n_keep;
+    const int C = (n + kWideChunks - 1) / kWideChunks;
+    const int lo = min(n, c * C), hi = min(n, lo + C);
+    if (pass == 1) {
+        if (p.min_p > 0.0f) {
+            const float thresh = wide_value(kr[0]) + logf(p.min_p);
+            for (int i = lo; i < hi; ++i)
+                if (wide_value(kr[i]) < thresh) { atomicMin(&r.below, i); break; }
+        }
+        if (p.top_p < 1.0f) {
+            const double thr = (double) p.top_p * r.total1;
+            double cum = pre[(size_t) t * kWideChunks + c];
+            for (int i = lo; i < hi; ++i) {
+                cum += er[i];
+                if (cum >= thr) { atomicMin(&r.cut, i); break; }
+            }
+        }
+        return;
+    }
+    const double thr = (double) philox_uniform(p.seed, p.counter + (uint64_t) t) * r.total2;
+    double cum = pre[(size_t) t * kWideChunks + c];
+    for (int i = lo; i < hi; ++i) {
+        cum += er[i];
+        if (thr < cum) { atomicMin(&r.pick, i); break; }
+    }
+    if (query != nullptr && t < nq) {
+        const int q = query[t];
+        const int* irow = ids + (size_t) t * n_vocab;
+        for (int i = lo; i < hi; ++i)
+            if (irow[i] == q) { r.qpos = i; break; }
+    }
+}
+
+/// The picks and the query probabilities: one thread per row.
+__global__ void sampler_wide_out_kernel(const unsigned* __restrict__ keys, const int* __restrict__ ids, int n_vocab,
+                                        int n_rows, const double* __restrict__ e, const WideRow* __restrict__ st,
+                                        int t0, int* __restrict__ out, int nq, float* __restrict__ qprob) {
+    const int t = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (t >= n_rows) return;
+    const unsigned* kr = keys + (size_t) t * n_vocab;
+    const float ninf = __int_as_float(0xff800000);
+    const WideRow& r = st[t];
+    const bool live = wide_value(kr[0]) > ninf;   // else no selectable logit: the sentinel, id 0
+    const int pi = r.pick < r.n_keep ? r.pick : (r.n_keep > 0 ? r.n_keep - 1 : 0);
+    out[t0 + t] = live && wide_value(kr[pi]) > ninf ? ids[(size_t) t * n_vocab + pi] : 0;
+    if (qprob != nullptr && t0 + t < nq)
+        qprob[t0 + t] = live && r.qpos < r.n_keep ? (float) (e[(size_t) t * n_vocab + r.qpos] / r.total2) : 0.0f;
+}
+
+// The wide path's buffers, one set per (device, stream) as `split_scratch`, for kWideRows rows of the vocabulary:
+// the keys and ids in, which the passes then reuse as their terms (8 bytes an entry), the sorted keys and ids, the
+// chunk sums and prefixes, the rows' scan state and the sort's own storage.  Grown (a grown-out set is retired, as the
+// split's), never shrunk; false when the memory cannot be had.
+struct WideBuffers {
+    unsigned* keys_in;
+    int* ids_in;
+    double* terms;
+    unsigned* keys;
+    int* ids;
+    double* part;
+    double* pre;
+    WideRow* rows;
+    void* temp;
+    size_t temp_bytes;
+};
+
+bool wide_buffers(void* stream, int n_vocab, WideBuffers& out) {
+    struct Slot {
+        int device;
+        void* stream;
+        int n_vocab;
+        void* base;
+        size_t temp_bytes;
+    };
+    static std::mutex mu;
+    static std::vector<Slot> slots;
+    static std::vector<void*> retired;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mu);
+    Slot* slot = nullptr;
+    for (Slot& s : slots)
+        if (s.device == device && s.stream == stream) slot = &s;
+    if (slot == nullptr) {
+        slots.push_back({device, stream, 0, nullptr, 0});
+        slot = &slots.back();
+    }
+    const size_t chunks = (size_t) kWideRows * kWideChunks * sizeof(double);
+    const size_t state = ((size_t) kWideRows * sizeof(WideRow) + 255) / 256 * 256;
+    if (slot->n_vocab < n_vocab) {
+        size_t temp = 0;
+        if (cub::DeviceRadixSort::SortPairs(nullptr, temp, (const unsigned*) nullptr, (unsigned*) nullptr,
+                                            (const int*) nullptr, (int*) nullptr, n_vocab, 0, 32,
+                                            (cudaStream_t) stream) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        const size_t row = (size_t) kWideRows * n_vocab * 4;
+        void* base = nullptr;
+        if (stream_capturing(stream) || cudaMalloc(&base, 4 * row + 2 * chunks + state + temp) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        if (slot->base != nullptr) retired.push_back(slot->base);
+        slot->base = base;
+        slot->n_vocab = n_vocab;
+        slot->temp_bytes = temp;
+    }
+    char* b = (char*) slot->base;
+    const size_t have = (size_t) kWideRows * slot->n_vocab * 4;
+    out.keys_in = (unsigned*) b;
+    out.ids_in = (int*) (b + have);
+    out.terms = (double*) b;                 // row t's terms at t * n_vocab doubles: within keys_in and ids_in
+    out.keys = (unsigned*) (b + 2 * have);
+    out.ids = (int*) (b + 3 * have);
+    out.part = (double*) (b + 4 * have);
+    out.pre = (double*) (b + 4 * have + chunks);
+    out.rows = (WideRow*) (b + 4 * have + 2 * chunks);
+    out.temp = b + 4 * have + 2 * chunks + state;
+    out.temp_bytes = slot->temp_bytes;
+    return true;
+}
+
+void sample_wide(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                 const SamplerParams& p, int k, int* out, const int* query, int n_query, float* qprob, void* stream) {
+    WideBuffers w{};
+    if (!wide_buffers(stream, n_vocab, w)) {
+        basalt::log::error("basalt", "sample_tokens: no memory for a %d-entry list (top_k %d)", k, p.top_k);
+        std::exit(1);
+    }
+    const cudaStream_t cs = (cudaStream_t) stream;
+    const int nb = (n_vocab + kWideBlockSpan - 1) / kWideBlockSpan;
+    const bool hist = history != nullptr && history_len > 0 && p.penalty_last_n > 0;
+    for (int t0 = 0; t0 < n_tokens; t0 += kWideRows) {
+        const int R = n_tokens - t0 < kWideRows ? n_tokens - t0 : kWideRows;
+        SamplerParams pr = p;
+        pr.counter = p.counter + (uint64_t) t0;   // row t0 + t draws Philox(seed, counter + t0 + t)
+        sampler_wide_keys_kernel<<<dim3((unsigned) nb, (unsigned) R), kWideKeyThreads, 0, cs>>>(
+            logits + (size_t) t0 * n_vocab, n_vocab, hist ? history + (size_t) t0 * history_len : nullptr, history_len,
+            pr, k, w.keys_in, w.ids_in, w.rows);
+        for (int t = 0; t < R; ++t) {
+            size_t temp = w.temp_bytes;
+            const size_t o = (size_t) t * n_vocab;
+            const cudaError_t se = cub::DeviceRadixSort::SortPairs(w.temp, temp, w.keys_in + o, w.keys + o, w.ids_in + o,
+                                                                   w.ids + o, n_vocab, 0, 32, cs);
+            if (se != cudaSuccess) {
+                basalt::log::error("basalt", "sample_tokens sort: %s", cudaGetErrorString(se));
+                std::exit(1);
+            }
+        }
+        const dim3 grid(kWideChunks / 32, (unsigned) R);
+        if (p.top_p < 1.0f) {
+            sampler_wide_terms_kernel<<<grid, 32, 0, cs>>>(w.keys, n_vocab, k, pr, 1, w.terms, w.part, w.rows);
+            sampler_wide_scan_kernel<<<(unsigned) R, kWideChunks, 0, cs>>>(w.part, w.pre, 1, w.rows);
+        }
+        if (p.top_p < 1.0f || p.min_p > 0.0f)
+            sampler_wide_search_kernel<<<grid, 32, 0, cs>>>(w.keys, w.ids, n_vocab, k, pr, 1, w.terms, w.pre, nullptr, 0,
+                                                            w.rows);
+        sampler_wide_terms_kernel<<<grid, 32, 0, cs>>>(w.keys, n_vocab, k, pr, 2, w.terms, w.part, w.rows);
+        sampler_wide_scan_kernel<<<(unsigned) R, kWideChunks, 0, cs>>>(w.part, w.pre, 2, w.rows);
+        // the query rows of this pass (row t0 + t asks for query[t0 + t])
+        const int nq = n_query - t0 > 0 ? n_query - t0 : 0;
+        sampler_wide_search_kernel<<<grid, 32, 0, cs>>>(w.keys, w.ids, n_vocab, k, pr, 2, w.terms, w.pre,
+                                                        query != nullptr && nq > 0 ? query + t0 : nullptr, nq, w.rows);
+        sampler_wide_out_kernel<<<1, 32, 0, cs>>>(w.keys, w.ids, n_vocab, R, w.terms, w.rows, t0, out,
+                                                  qprob != nullptr ? n_query : 0, qprob);
+    }
+}
+
 }  // namespace
+
+bool sampler_wide_reserve(int n_vocab, void* stream) {
+    WideBuffers w{};
+    return n_vocab > 0 && wide_buffers(stream, n_vocab, w);
+}
 
 bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* out, void* stream) {
     if (n_tokens <= 0 || n_vocab <= 0) return true;
@@ -1310,7 +1649,8 @@ namespace {
 
 // The sampled path's split: 0 the two launches (block lists, then one warp per row), 1 the one launch with k argmax
 // rounds per warp (`sampler_fused_kernel`), 2 the one launch with bitonic networks (`sampler_sort_kernel`, top_k <= 32;
-// a wider top_k takes 1).  Every one picks the same token.
+// a wider top_k takes 1), 3 the wide path at any length.  Every one picks the same token.  A list longer than 64
+// takes the wide path whatever the split.
 constexpr int kEngineSplit = 2;
 
 void sample_tokens_impl(int split, const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
@@ -1342,12 +1682,14 @@ void sample_tokens_impl(int split, const float* logits, int n_tokens, int n_voca
         const int n_blocks = (n_vocab + kSplitBlockSpan - 1) / kSplitBlockSpan;
         int2* scratch = nullptr;
         unsigned* done = nullptr;
-        if (n_blocks <= kSplitMaxBlocks && n_tokens <= kSplitMaxRows &&
+        if (k <= kSelMax && split != 3 && n_blocks <= kSplitMaxBlocks && n_tokens <= kSplitMaxRows &&
             !stream_capturing(stream))
             // sized for 16 rows and 64 entries at least, so a verify window or a wider top_k does not regrow it
             scratch = split_scratch(stream, (size_t) (n_tokens > 16 ? n_tokens : 16) * n_blocks * kSelMax, &done);
         const dim3 grid((unsigned) n_blocks, (unsigned) n_tokens);
-        if (scratch == nullptr) {
+        if (k > kSelMax || split == 3) {
+            sample_wide(logits, n_tokens, n_vocab, history, history_len, p, k, out, query, n_query, qprob, stream);
+        } else if (scratch == nullptr) {
             sampler_one_block_kernel<<<(unsigned) n_tokens, 1024, shmem, cs>>>(
                 logits, n_vocab, history, history_len, p, out, query, n_query, qprob);
         } else if (split == 2 && k <= kSortSpan) {

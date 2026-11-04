@@ -22,7 +22,7 @@ def row(odd):
                   {"name": "RTX 5060 Ti", "vram_gib": 16, "power_w": 180, "pcie": "5.0 x8", "h2d_gbps": 27.9}],
          "ram_gib": 64, "cpu": "Test CPU 9, 16 cores", "ram_gbps": 78.2, "os": "Linux", "quant": "NVFP4", "prefill_16k_tps": 1234.5, "prefill_64k_tps": 2345.6, "decode_tps": 345.7}
     if odd:
-        r["submitter"] = "Ünï \"q\" \\ ☃ 日本"
+        r["submitter"] = "Ünï\"q\"\\☃日本"
         r["gpus"] = [{"name": "Card \"X\"\tTi", "vram_gib": 24, "power_w": 300}]
         del r["cpu"], r["ram_gbps"]
         r["notes"] = "line\nbreak € \x01\x7f"

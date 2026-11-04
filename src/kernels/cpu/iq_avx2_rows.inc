@@ -1,7 +1,9 @@
 // src/kernels/cpu/iq_avx2_rows.inc - the i-quant expert rows in 256-bit lanes, several tokens at once.
 //
 // Included by iq_avx2.cpp (BASALT_IQ_VNNI 0: `madd` and `add`) and iq_avx2_vnni.cpp (BASALT_IQ_VNNI 1: the AVX-VNNI
-// instruction that does both), which name the exported functions through BASALT_IQ_EXPORT.
+// instruction that does both), which name the exported functions through BASALT_IQ_EXPORT.  BASALT_IQ_BMI2 1 builds the
+// IQ3_S and IQ2_S grid indices with `pdep`; the build without it keeps the scalar index arithmetic, since `pdep` is
+// slow on some AVX2 CPUs.
 // The AVX-512 kernels' (iq_avx512.cpp) multi-token scheme on the CPUs without AVX-512: each 32-value chunk is decoded once - grid lookups, one sign vector,
 // one scale vector - and every token of the verify window applies them with a load, a `sign`, a `maddubs`,
 // a `madd` and an `add`.  ggml-cpu's own AVX2 dot products for these formats are single-token: every token
@@ -23,12 +25,12 @@ inline uint64_t u64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); retur
 // the index of the lowest set bit of a nonzero mask: the compiler's own scan
 inline int lowest_bit(unsigned m) { return platform::ctz32(m); }
 
-// 32 sign bits -> 32 bytes of -1 (bit set) / +1: ggml's bit_selector pattern, shared by all tokens.
+// 32 sign bits -> 32 bytes of -1 (bit set) / +1: ggml's bit_selector pattern, shared by all tokens.  The mask is
+// broadcast to every dword, so one in-lane shuffle spreads bytes 0-1 over the low lane and 2-3 over the high one.
 inline __m256i sgn_vec(uint32_t m) {
-    const __m128i bm = _mm_set1_epi32((int) m);
-    const __m128i lo = _mm_shuffle_epi8(bm, _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1));
-    const __m128i hi = _mm_shuffle_epi8(bm, _mm_setr_epi8(2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3));
-    const __m256i bits = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+    const __m256i bits = _mm256_shuffle_epi8(_mm256_set1_epi32((int) m),
+                                             _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+                                                              2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3));
     const __m256i sel = _mm256_setr_epi8(1, 2, 4, 8, 16, 32, 64, (char) 0x80,
                                          1, 2, 4, 8, 16, 32, 64, (char) 0x80,
                                          1, 2, 4, 8, 16, 32, 64, (char) 0x80,
@@ -148,15 +150,18 @@ template <> struct Fmt32<22> {   // IQ2_S: d, qs[64] (32 grid bytes, 32 sign byt
     static constexpr int bytes = 82;
     static constexpr float K = 0.125f;
     static inline void decode(const uint8_t* b, int j, int half, __m256i& g, __m256i& sgn, __m256i& sc) {
-        const uint8_t* qs = b + 2 + 8 * j;
+        const uint8_t* qs = b + 2 + 8 * j + 4 * half;
         const uint8_t h = b[66 + 2 * j + half];
-        const int o = 4 * half;
-        g = _mm256_set_epi64x((long long) iq2s_grid[qs[o + 3] | ((h << 2) & 0x300)],
-                              (long long) iq2s_grid[qs[o + 2] | ((h << 4) & 0x300)],
-                              (long long) iq2s_grid[qs[o + 1] | ((h << 6) & 0x300)],
-                              (long long) iq2s_grid[qs[o] | ((h << 8) & 0x300)]);
-        const uint64_t m = u64(b + 2 + 32 + 8 * j);
-        sgn = sgn_vec(half ? (uint32_t) (m >> 32) : (uint32_t) m);
+#if BASALT_IQ_BMI2
+        // the four 10-bit indices as 16-bit fields of one register: qs[k] | (bits 2k, 2k+1 of qh) << 8
+        const uint64_t a = _pdep_u64(u32(qs), 0x00FF00FF00FF00FFull) | _pdep_u64(h, 0x0300030003000300ull);
+#define G2(k) (long long) iq2s_grid[(uint16_t) (a >> (16 * (k)))]
+#else
+#define G2(k) (long long) iq2s_grid[qs[k] | ((h << (8 - 2 * (k))) & 0x300)]
+#endif
+        g = _mm256_set_epi64x(G2(3), G2(2), G2(1), G2(0));
+#undef G2
+        sgn = sgn_vec(u32(b + 2 + 32 + 8 * j + 4 * half));
         const uint8_t sb = b[74 + 2 * j + half];
         sc = sc16(2 * (sb & 15) + 1, 2 * (sb >> 4) + 1);
     }
@@ -182,11 +187,18 @@ template <> struct Fmt32<21> {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4
     static inline void decode(const uint8_t* b, int j, int half, __m256i& g, __m256i& sgn, __m256i& sc) {
         const uint8_t* q = b + 2 + 16 * j + 8 * half;
         const uint32_t h = b[66 + 2 * j + half];
-#define G3(k) (int) iq3s_grid[q[k] | (((h >> k) & 1u) << 8)]
+#if BASALT_IQ_BMI2
+        // the eight 9-bit indices as 16-bit fields of two registers: q[k] | (bit k of qh) << 8
+        const uint64_t q8 = u64(q);
+        const uint64_t lo = _pdep_u64(q8, 0x00FF00FF00FF00FFull) | _pdep_u64(h, 0x0100010001000100ull);
+        const uint64_t hi = _pdep_u64(q8 >> 32, 0x00FF00FF00FF00FFull) | _pdep_u64(h >> 4, 0x0100010001000100ull);
+#define G3(k) (int) iq3s_grid[(uint16_t) (((k) < 4 ? lo : hi) >> (16 * ((k) & 3)))]
+#else
+#define G3(k) (int) iq3s_grid[q[k] | ((h << (8 - (k))) & 0x100)]
+#endif
         g = _mm256_set_epi32(G3(7), G3(6), G3(5), G3(4), G3(3), G3(2), G3(1), G3(0));
 #undef G3
-        const uint64_t m = u64(b + 74 + 8 * j);
-        sgn = sgn_vec(half ? (uint32_t) (m >> 32) : (uint32_t) m);
+        sgn = sgn_vec(u32(b + 74 + 8 * j + 4 * half));
         const uint8_t s = b[106 + j];
         sc = sc32(half ? 2 * (s >> 4) + 1 : 2 * (s & 15) + 1);
     }
@@ -392,38 +404,94 @@ void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* 
 
 // ---- IQ4_NL (type 20): 32-value blocks of 18 bytes (f16 d + 16 nibble bytes) against Q8_0 activations.
 // ggml-cpu's own AVX-2 dot (ggml_vec_dot_iq4_nl_q8_0) is single-token: every token redoes the nibble ->
-// kvalues_iq4nl pshufb decode and the |w| half of the signed x signed product.  Here both are computed once
-// per block; every token then costs a sign, a maddubs, a madd and an fmadd.  The arithmetic is ggml's - only
-// the order of the float additions differs.
-template <int NT>
+// kvalues_iq4nl pshufb decode.  Here each block is decoded once for all tokens, and a pass takes several rows at once:
+// the rows share the tokens' activation loads and each row sums on its own chain.  The tokens' scales are converted
+// once per call.  The madd build multiplies |w| by the activation signed like w; the VNNI build takes w + 128 as the
+// unsigned operand and starts each four-wise sum at -128 times the activations' four-wise sum: the same integers for
+// every code the Q8_0 quantizer writes (-127..127), without the two sign steps.  The arithmetic is ggml's - only the
+// order of the float additions differs, and a row adds its blocks in the same order for any pass width and any number
+// of tokens.
+constexpr int iq4nl_max_blocks = 64;
+
+#if BASALT_IQ_VNNI
+// kvalues_iq4nl + 128: the weights as the unsigned operand of the VNNI dot
+alignas(16) constexpr uint8_t iq4nl_values[16] = {1, 24, 45, 63, 79, 93, 106, 118, 129, 141, 153, 166, 181, 197, 217, 241};
+#else
+const int8_t* const iq4nl_values = kvalues_iq4nl;
+#endif
+
+// R rows from row0 against NT tokens.  `pf` walks the call's bytes `prefetch_ahead` ahead of the reads, one prefetch per
+// 64-byte line.
+template <int R, int NT>
+inline void iq4nl_pass(const uint8_t* row0, size_t row_bytes, int nb, const block_q8_0* const* y, const float* dy,
+                       const __m256i* seed, float* const* out, int r, const uint8_t*& pf) {
+    const __m256i values = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*) iq4nl_values));
+    const __m256i m4b = _mm256_set1_epi8(0x0f);
+    const __m256i nibble = _mm256_setr_epi32(0, 0, 0, 0, 4, 4, 4, 4);   // values 0..15 in the low lane, 16..31 high
+#if !BASALT_IQ_VNNI
+    (void) seed;
+#endif
+    __m256 acc[R][NT];
+    for (int i = 0; i < R; ++i)
+        for (int t = 0; t < NT; ++t) acc[i][t] = _mm256_setzero_ps();
+    for (int ib = 0; ib < nb; ++ib) {
+        for (const uint8_t* lim = row0 + (size_t) (ib + 1) * R * sizeof(block_iq4_nl) + prefetch_ahead; pf < lim; pf += 64)
+            _mm_prefetch((const char*) pf, _MM_HINT_T0);
+        __m256i q8[NT];
+        __m256 dyv[NT];
+        for (int t = 0; t < NT; ++t) {
+            q8[t] = _mm256_loadu_si256((const __m256i*) y[t][ib].qs);
+            dyv[t] = _mm256_broadcast_ss(dy + t * iq4nl_max_blocks + ib);
+        }
+        for (int i = 0; i < R; ++i) {
+            const uint8_t* blk = row0 + (size_t) i * row_bytes + (size_t) ib * sizeof(block_iq4_nl);
+            const __m256i bits = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*) (blk + 2)));
+            const __m256i q4 = _mm256_shuffle_epi8(values, _mm256_and_si256(_mm256_srlv_epi32(bits, nibble), m4b));
+            // lane 0 of the conversion is d; the other lanes hold nibble bytes and are not used
+            const __m256 dx = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_loadl_epi64((const __m128i*) blk)));
+#if BASALT_IQ_VNNI
+            for (int t = 0; t < NT; ++t) {
+                const __m256i p = _mm256_dpbusd_avx_epi32(seed[t * iq4nl_max_blocks + ib], q4, q8[t]);
+                acc[i][t] = _mm256_fmadd_ps(_mm256_mul_ps(dx, dyv[t]), _mm256_cvtepi32_ps(p), acc[i][t]);
+            }
+#else
+            const __m256i aq = _mm256_sign_epi8(q4, q4);   // |w|: the unsigned operand of maddubs
+            for (int t = 0; t < NT; ++t) {
+                const __m256i p = iq_dot4(aq, _mm256_sign_epi8(q8[t], q4));
+                acc[i][t] = _mm256_fmadd_ps(_mm256_mul_ps(dx, dyv[t]), _mm256_cvtepi32_ps(p), acc[i][t]);
+            }
+#endif
+        }
+    }
+    for (int i = 0; i < R; ++i)
+        for (int t = 0; t < NT; ++t) out[t][r + i] = hsum8(acc[i][t]);
+}
+
+// Rows [r0, r1) in passes of R; n / 32 <= iq4nl_max_blocks (iq4nl256_fits).
+template <int R, int NT>
 void iq4nl_rows(const uint8_t* w, size_t row_bytes, int n, const block_q8_0* const* y, float* const* out,
                 int r0, int r1) {
-    const __m128i values = _mm_loadu_si128((const __m128i*) kvalues_iq4nl);
-    const __m128i m4b = _mm_set1_epi8(0x0f);
     const int nb = n / QK4_NL;
-    for (int r = r0; r < r1; ++r) {
-        const uint8_t* row = w + (size_t) r * row_bytes;
-        __m256 accf[NT];
-        for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+    alignas(32) float dy[NT * iq4nl_max_blocks];
+#if BASALT_IQ_VNNI
+    __m256i seed[NT * iq4nl_max_blocks];
+    const __m256i bias = _mm256_set1_epi8((char) 0x80);
+#else
+    const __m256i* seed = nullptr;
+#endif
+    for (int t = 0; t < NT; ++t)
         for (int ib = 0; ib < nb; ++ib) {
-            const uint8_t* blk = row + (size_t) ib * sizeof(block_iq4_nl);
-            rows_ahead(blk + prefetch_ahead);
-            const __m128i bits = _mm_loadu_si128((const __m128i*) (blk + 2));
-            const __m128i lo = _mm_and_si128(bits, m4b);                      // values 0..15
-            const __m128i hi = _mm_and_si128(_mm_srli_epi16(bits, 4), m4b);    // values 16..31
-            const __m256i q4 = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_shuffle_epi8(values, lo)),
-                                                       _mm_shuffle_epi8(values, hi), 1);
-            const __m256i aq = _mm256_sign_epi8(q4, q4);   // |w|: the unsigned operand of maddubs
-            const float dx = h2f(u16(blk));
-            for (int t = 0; t < NT; ++t) {
-                const block_q8_0& b = y[t][ib];
-                const __m256i q8 = _mm256_loadu_si256((const __m256i*) b.qs);
-                const __m256i p = iq_dot4(aq, _mm256_sign_epi8(q8, q4));
-                accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * h2f(b.d)), _mm256_cvtepi32_ps(p), accf[t]);
-            }
+            dy[t * iq4nl_max_blocks + ib] = h2f(y[t][ib].d);
+#if BASALT_IQ_VNNI
+            const __m256i q8 = _mm256_loadu_si256((const __m256i*) y[t][ib].qs);
+            seed[t * iq4nl_max_blocks + ib] =
+                _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), bias, q8));
+#endif
         }
-        for (int t = 0; t < NT; ++t) out[t][r] = hsum8(accf[t]);
-    }
+    const uint8_t* pf = (const uint8_t*) ((uintptr_t) (w + (size_t) r0 * row_bytes + prefetch_ahead) & ~(uintptr_t) 63);
+    int r = r0;
+    for (; r + R <= r1; r += R) iq4nl_pass<R, NT>(w + (size_t) r * row_bytes, row_bytes, nb, y, dy, seed, out, r, pf);
+    for (; r < r1; ++r) iq4nl_pass<1, NT>(w + (size_t) r * row_bytes, row_bytes, nb, y, dy, seed, out, r, pf);
 }
 
 }  // namespace
@@ -456,13 +524,19 @@ void BASALT_IQ_EXPORT(iq256_rows)(int type, const uint8_t* w, size_t row_bytes, 
 
 void BASALT_IQ_EXPORT(iq4nl256_down_rows)(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt, float* const* out,
                         int r0, int r1) {
+    // the tokens' block scales are held on the stack: rows of at most iq4nl_max_blocks blocks (iq4nl256_fits)
+    if (n % QK4_NL != 0 || n / QK4_NL > iq4nl_max_blocks) {
+        basalt::log::error("basalt", "iq4nl256_down_rows: rows of %d values; at most %d, in blocks of %d", n,
+                           iq4nl_max_blocks * QK4_NL, QK4_NL);
+        std::exit(1);
+    }
     const block_q8_0* y[8];
     for (int t = 0; t < nt; ++t) y[t] = (const block_q8_0*) hq[t];
     switch (nt) {
-        case 1: iq4nl_rows<1>(w, row_bytes, n, y, out, r0, r1); break;
-        case 2: iq4nl_rows<2>(w, row_bytes, n, y, out, r0, r1); break;
-        case 3: iq4nl_rows<3>(w, row_bytes, n, y, out, r0, r1); break;
-        case 4: iq4nl_rows<4>(w, row_bytes, n, y, out, r0, r1); break;
+        case 1: iq4nl_rows<4, 1>(w, row_bytes, n, y, out, r0, r1); break;
+        case 2: iq4nl_rows<2, 2>(w, row_bytes, n, y, out, r0, r1); break;
+        case 3: iq4nl_rows<2, 3>(w, row_bytes, n, y, out, r0, r1); break;
+        case 4: iq4nl_rows<1, 4>(w, row_bytes, n, y, out, r0, r1); break;
         default: for (int t0 = 0; t0 < nt; t0 += 4) {
             const int k = nt - t0 < 4 ? nt - t0 : 4;
             BASALT_IQ_EXPORT(iq4nl256_down_rows)(w, row_bytes, n, hq + t0, k, out + t0, r0, r1);

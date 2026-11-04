@@ -2,6 +2,7 @@
 #include "basalt/kernels/qsa_dec_attn.hpp"
 #include "basalt/kernels/qsa_seg.hpp"
 #include "basalt/kernels/kv_q8.hpp"
+#include "basalt/kernels/packed_byte.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "smem_opt_in.cuh"
@@ -130,9 +131,8 @@ __device__ __forceinline__ void k8_from(const ChunkSmem<KV_MODE>& sm, int c, int
     } else {
         const float sc = __half2float(__ushort_as_half(sm.ks[c][d0 / KV_Q8_GROUP]));
         const uint2 raw = *reinterpret_cast<const uint2*>(&sm.k[c][d0]);
-        const int8_t* cc = reinterpret_cast<const int8_t*>(&raw);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) out[j] = (float) cc[j] * sc;
+        for (int j = 0; j < 8; ++j) out[j] = (float) packed_s8(j < 4 ? raw.x : raw.y, j & 3) * sc;
     }
 }
 template <int KV_MODE>
@@ -747,7 +747,7 @@ bool qsa_dec_attn_supported(const QsaAttnPools& pools, const QsaShapes& s) {
 
 void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                   const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream, const float* q_full,
-                  float* attn_gated, void* xq) {
+                  float* attn_gated, void* xq, void* merge_after) {
     if (n_q <= 0) return;
     if (!qsa_dec_attn_supported(pools, s) || cap <= 0 || !scratch || !ids || !steps || n_q > 65535) {
         basalt::log::error("basalt", "qsa_dec_attn: unsupported geometry, pools or buffers");
@@ -788,6 +788,7 @@ void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids,
         launch_pdl(attn_chunk_v2<0, false>, grid, dim3(THREADS), bytes, st, a);
     }
     const size_t mbytes = (size_t) (2 * a.n_chunks + WARPS) * sizeof(float);
+    if (merge_after != nullptr) cudaStreamWaitEvent(st, (cudaEvent_t) merge_after, 0);
     if (a.chunk == 0) launch_pdl(draft_merge, dim3((unsigned) s.n_head, (unsigned) n_q), dim3(THREADS), mbytes, st, a);
     else launch_pdl(attn_merge_v2, dim3((unsigned) s.n_head, (unsigned) n_q), dim3(THREADS), mbytes, st, a);
     const cudaError_t e = cudaGetLastError();

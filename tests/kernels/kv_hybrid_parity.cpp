@@ -1,6 +1,6 @@
 // tests/kernels/kv_hybrid_parity.cpp - hybrid K8V4 KV against host references (GPU, no model).
 //
-// Exercises the EXACT composed calls the engine's hybrid path makes (layer.cpp / prefill.cpp): the q8/q4
+// Exercises the EXACT composed calls the engine's hybrid path makes (layer.cpp / src/prefill/qsa.cpp): the q8/q4
 // append and gather kernels invoked with the unused half's pointers folded onto the used pool, and the
 // fused decode attention's KV_MODE 3 (INT8 K, rotated Q4_0 V) followed by the output's inverse Hadamard.
 //   1. K: INT8 codes + FP16 scales bitwise vs the host reference (kv_q8.hpp's rules);
@@ -254,7 +254,7 @@ int main() {
     std::memcpy(Vdq_un.data(), Vdq.data(), Vdq.size() * 4);
     for (int c = 0; c < cells * H; ++c) fwht256_host_reference(Vdq_un.data() + (size_t) c * D);
 
-    // ---- batched form with TWO queries and per-query step arrays (the verify.cpp window's exact call)
+    // ---- batched form with TWO queries and per-query step arrays (the verify window's exact call, record_qsa.cpp)
     {
         const int nq = 2;
         std::vector<float> q2((size_t) nq * QH * D);
@@ -324,7 +324,7 @@ int main() {
     // The tensor-core prompt path (qsa_prompt_attn) takes hybrid pools as KV_MODE 3: INT8 K, and V
     // dequantized from its q4_0 blocks to fp16 at gather. Its summation order differs from the old kernel's
     // (accuracy-level, not bitwise - qsa_prompt_attn.hpp says the same of its int8 mode), so: tolerance check
-    // against the SAME dequant reference, output un-rotated exactly as prefill.cpp does.
+    // against the SAME dequant reference, output un-rotated exactly as src/prefill/qsa.cpp does.
     {
         float* d_at4 = dalloc<float>((size_t) QH * D);
         const bool took = k::qsa_prompt_attn_batch(d_q, pools, d_ids, d_step, cells, s, d_at4, 1, nullptr);

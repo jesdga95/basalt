@@ -3,7 +3,7 @@
 // Turns an image into the embeddings the text model reads in place of its <|image_pad|> tokens, with Basalt's own
 // encoder (src/vision) and the model's mmproj file (vision encoder + projector).  The engine does the rest: it
 // places the rows at the image's pad tokens and gives them their 2-D M-RoPE positions (see --serve GENI in
-// generate.cpp).
+// src/program/serve/commands.cpp).
 //
 //   basalt-vision --mmproj <mmproj.gguf> [--model <text vocab .gguf>] [--gpu] [--threads N] [--max-tokens N]
 //                 [--flash-attn on|off|auto]
@@ -82,6 +82,16 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%s", kUsage);
         return 2;
     }
+#ifdef BASALT_VISION_CUDA
+    if (gpu) {                    // a build made for another card says so here, before it reads any model file
+        std::string perr;
+        if (!probe_device(perr)) {
+            std::printf("ERR this build cannot run on this card: %s\n", perr.c_str());
+            std::fflush(stdout);
+            return 1;
+        }
+    }
+#endif
     const auto load_t0 = std::chrono::steady_clock::now();
     std::string err;
     Mmproj mp;

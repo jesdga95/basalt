@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import struct
 import sys
 import tempfile
 from pathlib import Path
@@ -11,8 +12,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 from model_file import ModelFile  # noqa: E402
+from serve.engine.flags import flag_value  # noqa: E402
 
 VISION_EXE = "basalt-vision"
+# llama.cpp's sampling keys in the GGUF metadata -> the request field each one defaults
+GGUF_SAMPLING = {"general.sampling.temp": "temperature", "general.sampling.top_p": "top_p",
+                 "general.sampling.top_k": "top_k", "general.sampling.min_p": "min_p",
+                 "general.sampling.penalty_repeat": "repetition_penalty",
+                 "general.sampling.penalty_last_n": "penalty_last_n"}
 
 
 def cache_root() -> Path:
@@ -22,6 +29,33 @@ def cache_root() -> Path:
 def cache_dir(mf: ModelFile) -> Path:
     """One cache directory per model, named by the meta section's sha256 prefix."""
     return cache_root() / mf.sections["meta"][2].hex()[:16]
+
+
+def with_conversation_dir(words: list[str], cdir: Path) -> list[str]:
+    """`words` plus the default conversation directory (inside the model cache folder `cdir`) when the disk budget
+    is above zero and no directory is named."""
+    budget = flag_value(words, "--conversation-cache-disk-mib")
+    if budget and budget.isdigit() and int(budget) > 0 and not flag_value(words, "--conversation-cache-dir"):
+        return words + ["--conversation-cache-dir", str(cdir / "conversations")]
+    return words
+
+
+def _short(v):
+    """A GGUF float32 as the shortest decimal that is the same float32 (0.949999988079071 -> 0.95)."""
+    if not isinstance(v, float):
+        return v
+    bits = struct.pack("<f", v)
+    for digits in range(1, 10):
+        s = float(f"{v:.{digits}g}")
+        if struct.pack("<f", s) == bits:
+            return s
+    return v
+
+
+def sampling_defaults(meta: dict) -> dict:
+    """The model's sampling defaults: the general.sampling.* keys of meta.gguf_kv, by request field."""
+    kv = meta.get("gguf_kv") or {}
+    return {field: _short(kv[key]) for key, field in GGUF_SAMPLING.items() if kv.get(key) is not None}
 
 
 def write_section(mf: ModelFile, name: str, dest: Path) -> None:
@@ -71,7 +105,8 @@ def extract_tokenizer(mf: ModelFile) -> Path:
 
 def vision_config(mf: ModelFile, engine_bin: str, sidecar: bool = True) -> dict:
     """The vision sidecar's config (the projector alone without `sidecar`); ValueError names what is missing."""
-    side = Path(engine_bin).resolve().parent / VISION_EXE
+    engine = Path(engine_bin).resolve()
+    side = engine.parent / (VISION_EXE + engine.suffix)   # with the engine's suffix: basalt-vision.exe on Windows
     if "vision/mmproj" not in mf.sections:
         raise ValueError("this model file has no vision projector (vision/mmproj); drop --vision")
     if sidecar and not side.is_file():
@@ -94,13 +129,13 @@ def model_config(path: str, engine_bin: str, vision: bool | str = False,
     mf = ModelFile(path)
     meta = json.loads(mf.read("meta"))
     path = os.path.abspath(path)
-    words = list(engine_words or [])
+    cdir = cache_dir(mf)
+    words = with_conversation_dir(list(engine_words or []), cdir)
     args = ["--model", path]   # settings come from the engine defaults and the server
     args += words
-    cdir = cache_dir(mf)
     cdir.mkdir(parents=True, exist_ok=True)
     cfg = {"engine_bin": os.path.abspath(engine_bin), "args": args, "model_name": meta.get("name") or "basalt",
-           "sampling": dict(meta.get("sampling") or {}), "log": str(cdir / "engine.log"),
+           "sampling": sampling_defaults(meta), "log": str(cdir / "engine.log"),
            "tokenizer": str(extract_tokenizer(mf))}
     v = vision_config(mf, engine_bin, sidecar=vision != "dynamic") if vision else None
     if v:

@@ -24,6 +24,14 @@
 
 namespace basalt::platform {
 
+// MSVC can retain temporary stack copies for vector aggregate assignments even after inlining.
+// Field-wise assignment exposes the values to register allocation.
+#if defined(_MSC_VER) && !defined(__clang__)
+inline constexpr bool kPreferMemberwiseVectorAssignment = true;
+#else
+inline constexpr bool kPreferMemberwiseVectorAssignment = false;
+#endif
+
 /// CPUID leaf `leaf`, subleaf `sub`: r[0..3] = EAX, EBX, ECX, EDX.
 inline void cpuid(unsigned leaf, unsigned sub, unsigned (&r)[4]) {
 #if defined(_MSC_VER)

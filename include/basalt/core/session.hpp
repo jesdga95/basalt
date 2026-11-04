@@ -128,8 +128,8 @@ void prompt_session_carve(const ModelGeometry& g, int64_t max_cells, int64_t k, 
 /// Zeroes a carved prompt session, as `session_zero` a whole one, on `stream`.
 void prompt_session_clear(SessionState& s, const ModelGeometry& g, void* stream);
 /// Copies the state of layers [layer_lo, layer_hi) from `src` into `dst` through `copy`: the GDN rows, the QSA layers'
-/// cells [cell0, cell1) with their indexers, and the PLE history when the range holds layer 1.  Both sessions hold
-/// those layers whole in VRAM.
+/// cells [cell0, cell1) with their indexers, and the PLE history when the range holds layer 1.  A streamed layer's
+/// cells are read from or written to its host copy; the caller resets the residency map of a streamed destination.
 bool session_copy_state(SessionState& dst, const SessionState& src, const ModelGeometry& g, int64_t layer_lo,
                         int64_t layer_hi, int64_t cell0, int64_t cell1, const DeviceCopy& copy, std::string& err);
 

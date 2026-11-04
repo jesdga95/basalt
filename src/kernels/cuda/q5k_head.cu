@@ -3,6 +3,7 @@
 // Built with --use_fast_math like native_mmvq.cu, whose Q5_K x q8_1 dot this repeats.
 #include "basalt/kernels/q5k_head.hpp"
 #include "basalt/kernels/dp4a.hpp"
+#include "basalt/kernels/packed_byte.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "head_proxy.cuh"
 #include "smem_opt_in.cuh"
@@ -77,8 +78,8 @@ __device__ __forceinline__ W5 q5_load(const Q5KBlock* __restrict__ bq5, int iqs)
     uint16_t aux[2];
     aux[0] = uint16_t(((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
     aux[1] = uint16_t(((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
-    const uint8_t* sc = reinterpret_cast<const uint8_t*>(aux);
-    r.sc[0] = sc[0]; r.sc[1] = sc[1]; r.m[0] = sc[2]; r.m[1] = sc[3];
+    const uint32_t scm = pack_scale_min(aux);
+    r.sc[0] = packed_byte(scm, 0); r.sc[1] = packed_byte(scm, 1); r.m[0] = packed_byte(scm, 2); r.m[1] = packed_byte(scm, 3);
     const unsigned dmb = __ldg(reinterpret_cast<const unsigned*>(&bq5->dm));
     r.dm = __half22float2(*reinterpret_cast<const half2*>(&dmb));
     return r;

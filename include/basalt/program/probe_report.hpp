@@ -51,8 +51,14 @@ struct ReportInput {
     std::vector<FixtureSpeed> speeds;
     std::string config;
     std::vector<std::string> suggested;   ///< values measured to beat the defaults here: a flag and its measured reason
+    double wall_s = -1;          ///< total wall time of the run in seconds; negative: not printed
+    std::string adapt_line;      ///< the adaptive-tier settings' sequence rates (format_adapt_line); empty: not run
 };
 
 std::string format_report(const ReportInput& in);
+
+/// The engine arguments as one line for the report, without --model. The engine sees its cards renumbered from 0, so
+/// the --gpu value printed is gpu_given (the user's selection), which stays valid for the server.
+std::string format_config(const std::vector<std::string>& args, const std::string& gpu_given);
 
 }  // namespace basalt::program

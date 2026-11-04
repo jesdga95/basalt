@@ -55,7 +55,40 @@ bool StagedCopy::init(int src_dev, int dst_dev, size_t piece_bytes, std::string&
     return true;
 }
 
+namespace {
+bool is_host(const void* p) {
+    cudaPointerAttributes a{};
+    if (cudaPointerGetAttributes(&a, p) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return a.type == cudaMemoryTypeHost;
+}
+}  // namespace
+
 bool StagedCopy::copy(void* dst, const void* src, uint64_t bytes, std::string& err) {
+    // pinned host memory on one side: one copy over that card's link, ordered on the destination stream
+    if (bytes > 0 && (is_host(src) || is_host(dst))) {
+        bool ok = true;
+        if (is_host(src)) {
+            const OnDevice on(dst_dev_);
+            ok = cudaMemcpyAsync(dst, src, (size_t) bytes, cudaMemcpyHostToDevice, dst_stream_) == cudaSuccess;
+        } else {
+            const int b = next_;
+            next_ = (next_ + 1) % kBufs;
+            {
+                const OnDevice on(src_dev_);
+                ok = cudaMemcpyAsync(dst, src, (size_t) bytes, cudaMemcpyDeviceToHost, src_stream_) == cudaSuccess &&
+                     cudaEventRecord(d2h_[b], src_stream_) == cudaSuccess;
+            }
+            const OnDevice on(dst_dev_);
+            ok = ok && cudaStreamWaitEvent(dst_stream_, d2h_[b], 0) == cudaSuccess &&
+                 cudaEventRecord(h2d_[b], dst_stream_) == cudaSuccess;
+            live_[b] = ok;
+        }
+        if (!ok) err = std::string("a staged copy between two cards: ") + cudaGetErrorString(cudaGetLastError());
+        return ok;
+    }
     for (uint64_t at = 0; at < bytes;) {
         const size_t n = (size_t) std::min<uint64_t>(piece_, bytes - at);
         const int b = next_;

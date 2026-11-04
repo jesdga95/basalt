@@ -222,7 +222,6 @@ std::vector<GpuRole> choose_roles(const RoleInputs& in) {
     std::vector<GpuRole> r(in.cards.size(), GpuRole::Idle);
     if (r.empty()) return r;
     r[0] = GpuRole::Main;
-    if (!in.peer_access) return r;
     int tiers = 0;
     for (size_t i = 1; i < r.size() && tiers < in.max_expert_tiers; ++i, ++tiers) r[i] = GpuRole::ExpertTier;
     return r;
@@ -299,6 +298,13 @@ void apply_gpus(const std::vector<GpuCard>& visible, const std::vector<int>& car
     basalt::platform::set_env("CUDA_VISIBLE_DEVICES", list);
 }
 
+// a card named only by its index
+GpuCard unknown_card(int i) {
+    GpuCard c;
+    c.token = std::to_string(i);
+    return c;
+}
+
 std::string gpu_identity(size_t n) {
     std::string s;
     for (size_t i = 0; i < n; ++i) s += (i ? "," : "") + std::to_string(i);
@@ -308,7 +314,7 @@ std::string gpu_identity(size_t n) {
 std::string gpu_plan_json(const std::vector<GpuCard>& visible, const GpuChoice& c) {
     std::string devices, cards;
     for (int i : c.cards) {
-        const GpuCard g = (size_t) i < visible.size() ? visible[(size_t) i] : GpuCard{std::to_string(i)};
+        const GpuCard g = (size_t) i < visible.size() ? visible[(size_t) i] : unknown_card(i);
         devices += (devices.empty() ? "" : ",") + g.token;
         cards += std::string(cards.empty() ? "" : ",") + "{\"visible\":" + std::to_string(i) + ",\"token\":" +
                  json_str(g.token) + ",\"smi\":" + std::to_string(g.smi) + ",\"name\":" + json_str(g.name) + "}";
@@ -331,7 +337,7 @@ bool select_gpus(const std::string& text, const char* label, std::string& engine
     if (!c.warning.empty()) basalt::log::warn(label, "%s", c.warning.c_str());
     apply_gpus(visible, c.cards);
     used.clear();
-    for (int i : c.cards) used.push_back((size_t) i < visible.size() ? visible[(size_t) i] : GpuCard{std::to_string(i)});
+    for (int i : c.cards) used.push_back((size_t) i < visible.size() ? visible[(size_t) i] : unknown_card(i));
     engine_value = gpu_identity(c.cards.size());
     return true;
 }

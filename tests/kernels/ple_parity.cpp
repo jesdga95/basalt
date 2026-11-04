@@ -103,12 +103,6 @@ std::vector<uint8_t> read_at(const char* path, long long off, size_t n) {
     return v;
 }
 
-/// A whole file; the callers read only the regions they need from large files.
-std::vector<uint8_t> read_path(const char* path) {
-    const long long n = file_size(path);
-    if (n <= 0) return {};
-    return read_at(path, 0, (size_t) n);
-}
 
 /// Dequantize one IQ4_NL row with an INTERLEAVED nibble order, to show the correct split-half order is
 /// observable.  Deliberately shares nothing with the kernel's decoder.

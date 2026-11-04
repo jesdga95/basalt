@@ -22,6 +22,7 @@
 #include "basalt/kernels/rope_scaling.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
 #include "basalt/kernels/ngram.hpp"
+#include "basalt/kernels/wait_abort.hpp"
 
 #include <cuda_runtime.h>
 
@@ -1010,6 +1011,7 @@ void lazy_bench(cudaStream_t s) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    wait_abort_init();   // the finisher's bounded waits report through it
     const std::string mode = argc > 1 ? argv[1] : "";
     cudaStream_t s;
     CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
