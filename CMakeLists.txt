@@ -131,16 +131,64 @@ add_library(model STATIC src/model/registry.cpp)
 target_include_directories(model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(model PUBLIC artifact warnings)
 
-add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwen4exp/flags.cpp)
+add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwen4exp/flags.cpp
+  src/program/engine_local.cpp
+  src/program/probe_rates.cpp
+  src/program/generate/helpers.cpp
+  src/program/generate/model.cpp
+  src/program/generate/layer_plan.cpp
+  src/program/generate/weights.cpp
+  src/program/generate/vision.cpp
+  src/program/generate/sessions.cpp
+  src/program/generate/sources.cpp
+  src/program/generate/cache_size.cpp
+  src/program/generate/cache_fill.cpp
+  src/program/generate/token_path.cpp
+  src/program/generate/resident_plan.cpp
+  src/program/generate/resident_load.cpp
+  src/program/generate/prompt_split.cpp
+  src/program/generate/dispatch.cpp
+  src/program/generate/prefill.cpp
+  src/program/generate/decode.cpp
+  src/program/serve/batch.cpp
+  src/program/serve/batch_pipeline.cpp
+  src/program/serve/qfn_commands.cpp
+  src/program/serve/qfn_restore.cpp
+  src/program/serve/qfn_image.cpp
+  src/program/serve/qfn_prompt.cpp
+  src/program/serve/qfn_finish.cpp
+  src/program/serve/conversation.cpp
+  src/program/serve/kv.cpp
+  src/program/serve/loans.cpp
+  src/program/serve/loan_moves.cpp
+  src/program/serve/memory.cpp
+  src/program/serve/prompt.cpp
+  src/program/serve/prompt_read.cpp
+  src/program/serve/prompt_split.cpp
+  src/program/serve/prompt_windows.cpp
+  src/program/serve/qfn_decode.cpp
+  src/program/serve/slots.cpp
+  src/program/serve/tier_profile.cpp
+  src/program/serve/tiers.cpp
+  src/program/serve/verify.cpp
+  src/program/serve/vision.cpp
+  src/program/measure/gpu_modes.cpp
+  src/program/measure/dump_set.cpp
+  src/program/cli/options.cpp
+  src/program/cli/control_vectors.cpp
+  src/program/cli/report.cpp
+  src/program/generate/qfn_run.cpp)
+target_compile_definitions(model_qwen4exp PRIVATE BASALT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_include_directories(model_qwen4exp PRIVATE ${_gpu_include_directories})
 target_include_directories(model_qwen4exp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
-target_link_libraries(model_qwen4exp PUBLIC model tokenizer)
+target_link_libraries(model_qwen4exp PUBLIC model tokenizer serve_shared model_qwen4exp_engine engine_session grammar tokenizer model_qwen4exp_prefill spec models ${_gpu_runtime_target})
 
 add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models/deepseek41/tokenizer/pretok_joyai.cpp src/models/deepseek41/pack.cpp
   src/models/deepseek41/model.cpp src/models/deepseek41/session.cpp src/models/deepseek41/layer_ops.cpp
   src/models/deepseek41/elastic.cpp src/models/deepseek41/ops_kernels.cpp src/models/deepseek41/tier.cpp src/models/deepseek41/ops.cu
   src/models/deepseek41/prefill.cpp src/models/deepseek41/prefill_ffn.cpp src/models/deepseek41/prefill_ffn.cu src/models/deepseek41/attn_batch.cpp src/models/deepseek41/attn_dense.cu)
 target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
-target_link_libraries(model_deepseek41 PUBLIC model tokenizer deepseek41_kernels deepseek41_attn deepseek41_vision tiers mmq kernels core ${_gpu_runtime_target})
+target_link_libraries(model_deepseek41 PUBLIC model tokenizer serve_shared deepseek41_kernels deepseek41_attn deepseek41_vision tiers mmq kernels core ${_gpu_runtime_target})
 
 add_library(models STATIC src/models/builtin.cpp)
 target_link_libraries(models PUBLIC model_qwen4exp model_deepseek41)
@@ -286,7 +334,7 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
 # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
 # about arithmetic, and this one knows the ORDER the arithmetic happens in.
 # ---- tiers: the storage and transfer tier shared by the models (VRAM slots, RAM and file source, peer card) ----
-add_library(tiers STATIC src/core/expert_source.cpp src/core/expert_cache.cpp src/core/vmm.cpp src/core/peer_experts.cpp)
+add_library(tiers STATIC src/core/expert_source.cpp src/core/expert_cache.cpp src/core/vmm.cpp src/core/peer_experts.cpp src/core/conversation_store.cpp src/core/conversation_memory.cpp)
 target_include_directories(tiers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(tiers PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
 include(src/models/qwen4exp/qwen4exp.cmake)
@@ -405,59 +453,31 @@ endif()
 # ids, so a tokenizer is never on one side of a logit comparison.
 # The prompt path: batched prompt processing (tensor-core GEMMs through cuBLAS).
 
-add_executable(basalt src/program/generate.cpp src/program/engine_local.cpp src/program/probe_rates.cpp
+add_library(serve_shared STATIC src/program/serve/commands.cpp
+            src/program/serve/protocol.cpp
+            src/program/serve/runtime.cpp
+            src/program/serve/request.cpp
+            src/program/serve/request_finish.cpp
+            src/program/serve/request_image.cpp
+            src/program/serve/request_parse.cpp
+            src/program/serve/request_prefill.cpp
+            src/program/serve/request_restore.cpp
+            src/program/serve/session_engine.cpp
+            src/program/cli/tokens.cpp
+            src/program/cli/help.cpp)
+target_include_directories(serve_shared PUBLIC include PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
+target_link_libraries(serve_shared PUBLIC tiers model engine_session grammar tokenizer ${_gpu_runtime_target})
+
+add_executable(basalt src/program/generate.cpp
                        src/program/generate/adapter.cpp
-                       src/program/generate/helpers.cpp
                        src/program/generate/configure.cpp
-                       src/program/generate/model.cpp
-                       src/program/generate/layer_plan.cpp
-                       src/program/generate/weights.cpp
-                       src/program/generate/vision.cpp
-                       src/program/generate/sessions.cpp
-                       src/program/generate/sources.cpp
-                       src/program/generate/cache_size.cpp
-                       src/program/generate/cache_fill.cpp
-                       src/program/generate/token_path.cpp
-                       src/program/generate/resident_plan.cpp
-                       src/program/generate/resident_load.cpp
-                       src/program/generate/prompt_split.cpp
-                       src/program/generate/dispatch.cpp
-                       src/program/generate/prefill.cpp
-                       src/program/generate/decode.cpp
-                       src/program/serve/batch.cpp
-                       src/program/serve/batch_pipeline.cpp
-                       src/program/serve/commands.cpp src/program/serve/qfn_commands.cpp src/program/serve/qfn_restore.cpp src/program/serve/qfn_image.cpp src/program/serve/qfn_prompt.cpp src/program/serve/qfn_finish.cpp src/program/serve/session_engine.cpp
-                       src/program/serve/conversation.cpp
-                       src/program/serve/kv.cpp
-                       src/program/serve/loans.cpp
-                       src/program/serve/loan_moves.cpp
-                       src/program/serve/memory.cpp
-                       src/program/serve/prompt.cpp
-                       src/program/serve/prompt_read.cpp
-                       src/program/serve/prompt_split.cpp
-                       src/program/serve/prompt_windows.cpp
-                       src/program/serve/protocol.cpp
-                       src/program/serve/request.cpp
-                       src/program/serve/qfn_decode.cpp
-                       src/program/serve/request_finish.cpp
-                       src/program/serve/request_image.cpp
-                       src/program/serve/request_parse.cpp
-                       src/program/serve/request_prefill.cpp
-                       src/program/serve/request_restore.cpp
-                       src/program/serve/runtime.cpp
-                       src/program/serve/slots.cpp
-                       src/program/serve/tier_profile.cpp
-                       src/program/serve/tiers.cpp
-                       src/program/serve/verify.cpp
-                       src/program/serve/vision.cpp
-                       src/program/measure/gpu_modes.cpp src/program/measure/dump_set.cpp
-                       src/program/cli/arguments.cpp src/program/cli/help.cpp src/program/cli/serve.cpp
-                       src/program/cli/options.cpp src/program/cli/control_vectors.cpp
-                       src/program/cli/startup.cpp src/program/cli/gpu.cpp src/program/cli/tokens.cpp
-                       src/program/cli/report.cpp)
+                       src/program/cli/arguments.cpp
+                       src/program/cli/serve.cpp
+                       src/program/cli/startup.cpp
+                       src/program/cli/gpu.cpp)
 set_target_properties(basalt PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
-target_link_libraries(basalt PRIVATE model_qwen4exp_engine engine_session grammar tokenizer model_qwen4exp_prefill spec models ${_gpu_runtime_target})
+target_link_libraries(basalt PRIVATE models serve_shared engine_session ${_gpu_runtime_target})
 basalt_embed_manifest(basalt)
 # `basalt serve` runs the Python server from the source tree; the engine reads its expert profiles from data/profiles
 target_compile_definitions(basalt PRIVATE BASALT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -506,7 +526,7 @@ add_executable(basalt-bench src/program/bench_main.cpp)
 set_target_properties(basalt-bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 # the image encoder sidecar, bin/basalt-vision (its own project, built with this one)
 add_subdirectory(tools/vision)
-target_link_libraries(basalt PRIVATE vision_cuda)
+target_link_libraries(model_qwen4exp PUBLIC vision_cuda)
 if(BUILD_TESTING)
   # the host half of the vision library needs no GPU: the decode guard is checked here
   add_executable(vision_preprocess_test tests/vision/preprocess_limit_test.cpp)

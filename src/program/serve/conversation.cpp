@@ -565,6 +565,7 @@ int QfnRuntime::init_conversations() {
         if (o.prompt_cache <= 0 || !stages.empty()) {
             basalt::log::warn("basalt serve", "conversation cache on disk off: %s",
                               o.prompt_cache <= 0 ? "--prompt-cache 0" : "a layer split");
+ disk.set_row_cells(basalt::kernels::qsa_real_shapes().idx_block);
         } else if (!disk.open(o.conversation_cache_dir, conversation_identity(o, g),
                               (uint64_t) o.conversation_cache_disk_mib << 20, de)) {
             basalt::log::warn("basalt serve", "conversation cache on disk off: %s", de.c_str());
