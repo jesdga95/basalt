@@ -138,7 +138,6 @@ def pump_lines(stream, sink) -> None:
 
 
 REQUEST_LINES = False    # --request-lines: echo the engine's per-request summary on stdout
-EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
 PENALTY_LAST_N_DEFAULT = 64  # the penalty window of a request that sets a penalty but no penalty_last_n
 
 
@@ -539,6 +538,10 @@ class ProcessEngine:
             self.asleep = False
             self._silent(why)
             raise EngineDied(why)
+
+    def eos_ids(self) -> set[int]:
+        """The ids the engine ends a reply on (INFO eos_ids=a,b)."""
+        return {int(i) for i in str(self.info.get("eos_ids") or "").split(",") if i}
 
     def _vram_command(self, command: str, timeout: float) -> dict:
         """Send a VRAM, SLEEP or WAKE command and read its VRAM line."""
@@ -1146,7 +1149,7 @@ class ProcessEngine:
                         # the slot holds the prompt and every token fed (all but the last)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
                         again = (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
-                                 and not (out and out[-1] in EOS_IDS))
+                                 and not (out and out[-1] in self.eos_ids()))
                         self._carry_run(carry, first, last0, not again)
                         if again:
                             # continue on the solo path

@@ -10,6 +10,7 @@ class Qwen4Exp(Dialect):
     name = "qwen4exp"
     stop_texts = (IM_END, "<|endoftext|>")
     reasoning_close = "\n</think>\n\n"
+    effort_turn = "<|im_start|>system\n{}<|im_end|>\n"
 
     def template(self, path):
         return frontend.ChatTemplate(path)
