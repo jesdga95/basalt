@@ -1,5 +1,5 @@
 
-// src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
+// src/models/qwen4exp/decode/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "basalt/core/layer.hpp"
 #include "basalt/core/native_head.hpp"
 #include "basalt/core/kv_arena.hpp"

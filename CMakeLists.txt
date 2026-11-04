@@ -335,7 +335,7 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
 # already links `core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
 # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
 # about arithmetic, and this one knows the ORDER the arithmetic happens in.
-add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
+add_library(engine STATIC src/models/qwen4exp/decode/layer.cpp src/models/qwen4exp/decode/session.cpp src/core/expert_source.cpp
   src/core/expert_cache.cpp src/core/vmm.cpp src/core/kv_arena.cpp src/core/native_head.cpp src/core/native_dense.cpp
   src/models/qwen4exp/decode/verify/batch_capture.cpp
   src/models/qwen4exp/decode/verify/batch_execution.cpp
@@ -377,7 +377,7 @@ add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/exper
   src/models/qwen4exp/decode/mtp/draft.cpp
   src/models/qwen4exp/decode/mtp/stores.cpp
   src/models/qwen4exp/decode/mtp/batching.cpp
-  src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/conversation_store.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp)
+  src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/conversation_store.cpp src/models/qwen4exp/decode/peer_experts.cpp src/core/staged_copy.cpp)
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(engine PUBLIC core model kernels kernels_cpu ${_gpu_runtime_target})
 if(BUILD_TESTING)
