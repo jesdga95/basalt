@@ -80,11 +80,14 @@ protected:
 
     bool starts_with(const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs);
     Flow restore();
-    virtual Flow parse() = 0;
+    Flow parse();
+    Flow prepare_prompt();
     virtual Flow prepare_image() = 0;
     virtual Flow read_prompt() = 0;
     virtual Flow decode() = 0;
     virtual Flow complete() = 0;
+    virtual bool parse_begin() { return true; }
+    virtual float default_relax() const { return 0.0f; }
     // ---- restoring a conversation: what it does to the model's sessions.  Per request.
     virtual bool cvec_wanted() const { return true; }
     virtual void set_cvec() {}
