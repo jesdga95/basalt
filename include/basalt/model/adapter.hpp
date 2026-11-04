@@ -5,6 +5,7 @@
 // never includes a model's headers, and models never include each other (tools/check_model_layering.sh).
 #pragma once
 
+#include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/program/grammar/tool_form.hpp"
 
@@ -73,6 +74,14 @@ struct LoadRequest {
     std::vector<int> peer_devices;    ///< CUDA devices of the expert tier cards after the main one
     int64_t max_context = 0;          ///< --max-context (used when max_context_set; else the model picks its own)
     bool max_context_set = false;
+    std::string expert_profile;       ///< the routing order of the experts (empty: the file's own order)
+    int expert_cache = 0;             ///< VRAM expert slots over all layers (0 or -1: from the free memory)
+    uint64_t resident_budget = 0;     ///< bytes the RAM tier may take (0: from the free memory)
+    int pool_workers = 0;             ///< CPU pool workers (0: the machine's physical cores)
+    kernels::cpu::PoolAffinity pool_affinity = kernels::cpu::PoolAffinity::All;
+    bool pool_affinity_given = false;
+    int peer_reserve_mib = 600;       ///< VRAM a second card leaves free
+    int vram_reserve_mib = 0;         ///< VRAM the main card leaves free beyond what the model needs (0: none)
 };
 
 struct DecodeRequest {
@@ -112,6 +121,8 @@ public:
     virtual Result resample_last(const float* bias, int32_t& token) { (void) bias; (void) token; return {Status::NotImplemented, "this model cannot draw again"}; }
     /// The last decoded row's logits (n_vocab floats).
     virtual Result copy_logits(float* out) { (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
+    /// low: the VRAM the session can give back goes back to the driver; else it is taken again. The slots it holds now.
+    virtual Result set_low_memory(bool low, int64_t& expert_slots) { (void) low; (void) expert_slots; return {Status::NotImplemented, "this model cannot give VRAM back"}; }
     /// The running state at position `pos`: what cannot be rewound. Positional state stays valid below it.
     virtual size_t running_bytes() const { return 0; }
     virtual Result save_running(uint8_t* host, int64_t pos) { (void) host; (void) pos; return {Status::NotImplemented, "this model keeps no checkpoint"}; }

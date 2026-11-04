@@ -60,6 +60,9 @@ public:
     int diag_tier_ram() const { return diag_tier_ram_; }
     int diag_tier_vram() const { return diag_tier_vram_; }
     void set_diag_tier(int ram, int vram) { diag_tier_ram_ = ram; diag_tier_vram_ = vram; }
+    /// What the flags ask of the expert tiers.
+    const model::LoadRequest& tiers() const { return tiers_; }
+    void set_tiers(const model::LoadRequest& req) { tiers_ = req; }
     /// The CUDA device of the second card's expert tier, or -1.
     int peer_device() const { return peer_device_; }
     void set_peer_device(int d) { peer_device_ = d; }
@@ -78,6 +81,7 @@ private:
     std::string diag_dump_, path_;
     int diag_tier_ram_ = -1, diag_tier_vram_ = -1;
     int peer_device_ = -1;
+    model::LoadRequest tiers_;
     int64_t ctx_ = 0;
     static int64_t ctxp_default();
     int embd_fd_ = -1;
