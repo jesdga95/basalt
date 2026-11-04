@@ -471,7 +471,7 @@ __global__ void s_gemv_split_kernel(const uint16_t* __restrict__ x, const uint8_
 
 static void s_gemv_split_impl(const uint16_t* x, const uint8_t* codes, const float* scales,
                                const float* offset, float* y, int64_t n_in, int64_t n_out, const SForm& form,
-                               int threads_per_row, cudaStream_t stream, bool sync) {
+                               int threads_per_row, cudaStream_t stream) {
     if (n_in <= 0 || n_out <= 0) return;
     if (threads_per_row < 1 || (threads_per_row & (threads_per_row - 1)) != 0 || threads_per_row > 1024) {
         basalt::log::error("basalt", "s_gemv_split: threads_per_row must be a power of two in 1..1024, got %d",
@@ -515,25 +515,16 @@ static void s_gemv_split_impl(const uint16_t* x, const uint8_t* codes, const flo
             basalt::log::error("basalt", "s_gemv_split: unsupported code_bits %d", form.code_bits);
             std::exit(1);
     }
-    if (sync) {
-        const cudaError_t e = cudaDeviceSynchronize();
-        if (e != cudaSuccess) {
-            basalt::log::error("basalt", "s_gemv_split: %s", cudaGetErrorString(e));
-            std::exit(1);
-        }
+    const cudaError_t e = cudaDeviceSynchronize();
+    if (e != cudaSuccess) {
+        basalt::log::error("basalt", "s_gemv_split: %s", cudaGetErrorString(e));
+        std::exit(1);
     }
 }
 
 void s_gemv_split(const uint16_t* x, const uint8_t* codes, const float* scales, const float* offset,
                   float* y, int64_t n_in, int64_t n_out, const SForm& form, int threads_per_row) {
-    s_gemv_split_impl(x, codes, scales, offset, y, n_in, n_out, form, threads_per_row, (cudaStream_t) 0, true);
-}
-
-void s_gemv_split_async(const uint16_t* x, const uint8_t* codes, const float* scales, const float* offset,
-                        float* y, int64_t n_in, int64_t n_out, const SForm& form, int threads_per_row,
-                        void* stream) {
-    s_gemv_split_impl(x, codes, scales, offset, y, n_in, n_out, form, threads_per_row, (cudaStream_t) stream,
-                      false);
+    s_gemv_split_impl(x, codes, scales, offset, y, n_in, n_out, form, threads_per_row, (cudaStream_t) 0);
 }
 
 // ---- the Q8_K entry points -----------------------------------------------------------------------------

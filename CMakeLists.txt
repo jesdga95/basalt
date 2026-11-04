@@ -225,15 +225,6 @@ target_link_libraries(basalt-device PRIVATE core)
 add_executable(basalt-load src/core/load_main.cpp)
 target_link_libraries(basalt-load PRIVATE core kernels)
 
-add_executable(basalt-concurrent src/core/concurrent_main.cpp)
-target_include_directories(basalt-concurrent PRIVATE ${_gpu_include_directories})
-target_link_libraries(basalt-concurrent PRIVATE core model_qwen4exp_kernels ${_gpu_runtime_target})
-
-add_executable(basalt-overlap src/core/overlap_main.cpp)
-# a .cpp that calls cudaMemcpyAsync itself needs the toolkit headers and cudart explicitly
-target_include_directories(basalt-overlap PRIVATE ${_gpu_include_directories})
-target_link_libraries(basalt-overlap PRIVATE core model_qwen4exp_kernels ${_gpu_runtime_target})
-
 # ---- kernels ----
 # Naive first, each with a parity test against a reference that was itself validated against ggml.  The
 # kernels link `artifact` for the scalar dequantizers, because using the VALIDATED scalar path as the
