@@ -85,6 +85,15 @@ def engine_line(line: str) -> str:
     return line[:-2] + "\n" if line.endswith("\r\n") else line
 
 
+def info_facts(line: str) -> dict:
+    """The key=value facts of an `INFO` line, integers as ints."""
+    facts = {}
+    for kv in line.split()[1:]:
+        k, _, v = kv.partition("=")
+        facts[k] = int(v) if v.lstrip("-").isdigit() else v
+    return facts
+
+
 AUTO_FLAGS = "auto flags: "
 AUTO_NAMES = {"peer-exclusive": "peer-excl", "pool-workers": "pool"}   # the console's short names
 
@@ -295,9 +304,7 @@ class ProcessEngine:
             if relay_auto_flags(line):
                 continue
             if line.startswith("INFO "):
-                for kv in line.split()[1:]:
-                    k, _, v = kv.partition("=")
-                    self.info[k] = int(v) if v.lstrip("-").isdigit() else v
+                self.info.update(info_facts(line))
             if line.startswith("READY"):
                 f = line.split()
                 self.max_context = int(f[1])
@@ -388,6 +395,10 @@ class ProcessEngine:
             line = engine_line(line)
             log_unparsed(line, log)
             if line.startswith(AUTO_FLAGS):             # printed once, before READY; never a reply line
+                continue
+            if line.startswith("INFO "):                # a fact the engine updates as it runs; never a reply line
+                if self.proc is proc:
+                    self.info.update(info_facts(line))
                 continue
             if line.startswith(FATAL_PREFIXES):         # before batch routing
                 if self.proc is proc:
