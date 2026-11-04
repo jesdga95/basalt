@@ -3,6 +3,7 @@
 #include "models/deepseek41/adapter.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/log.hpp"
 #include "models/deepseek41/model.hpp"
 
 namespace basalt::models::deepseek41 {
@@ -50,6 +51,8 @@ public:
         if (!m->resolve_context(req.max_context, req.max_context_set, err)) return {model::Status::Error, err};
         m->set_diag_dump(req.diag_dump);
         m->set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
+        if (!req.peer_devices.empty()) m->set_peer_device(req.peer_devices.front());
+        if (req.peer_devices.size() > 1) basalt::log::warn("basalt deepseek41", "one second card holds experts; later cards idle");
         out = std::move(m);
         return {};
     }

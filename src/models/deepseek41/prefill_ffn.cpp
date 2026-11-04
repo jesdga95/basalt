@@ -14,6 +14,8 @@
 #include "models/deepseek41/model.hpp"
 #include "models/deepseek41/layer_ops.hpp"
 #include "models/deepseek41/ops.hpp"
+#include "models/deepseek41/peer_tier.hpp"
+#include "models/deepseek41/prefill_plan.hpp"
 #include "models/deepseek41/tier.hpp"
 
 #include <cuda_runtime.h>
@@ -35,7 +37,6 @@ constexpr int kReadThreads = 8;     // concurrent blob reads
 constexpr int64_t kMaxRows = 16384; // (token, slot) rows one launch handles
 constexpr int kRing = 5;             // layers of file-read experts held ahead
 constexpr int64_t kPrefetchPairs = 4096;   // (token, slot) pairs from which a chunk reads ahead
-constexpr int kAheadSlots = 6;       // staged groups of experts in flight
 constexpr int kSharedRows = 1024;   // tokens per shared-expert sub-chunk
 
 class Impl final : public PrefillFfn {
@@ -97,7 +98,7 @@ public:
         for (Stage& b : stage_)
             ok = ok && dev(b.blobs, slot_ * kStageExperts) && dev(b.tok, R * 4) && dev(b.pair, R * 4) &&
                  dev(b.bounds, (kStageExperts + 1) * 4) &&
-                 cudaHostAlloc((void**) &b.host, slot_ * kStageExperts, cudaHostAllocDefault) == cudaSuccess &&
+                 cudaHostAlloc((void**) &b.host, slot_ * kStageExperts, cudaHostAllocPortable) == cudaSuccess &&
                  cudaEventCreateWithFlags(&b.copied, cudaEventDisableTiming) == cudaSuccess &&
                  cudaEventCreateWithFlags(&b.done, cudaEventDisableTiming) == cudaSuccess;
         if (any_grouped)
@@ -183,6 +184,7 @@ public:
             cudaEventSynchronize(B.copied);                  // the pinned staging of the launch before last is free
             cudaStreamWaitEvent(copy_, B.done, 0);           // so is its device buffer
             std::vector<int> from_file;
+            bool from_peer = false;
             for (int q = 0; q < nb; ++q) {
                 const int e = used[b0 + (size_t) q];
                 uint8_t* dst = B.blobs + stride_of(el) * (size_t) q;
@@ -192,9 +194,19 @@ public:
                     cudaMemcpyAsync(dst, src.dev, L.bytes, cudaMemcpyDeviceToDevice, copy_);
                 } else if (src.pinned) {
                     cudaMemcpyAsync(dst, src.pinned, L.bytes, cudaMemcpyHostToDevice, copy_);
+                } else if (src.peer) {
+                    tier_->peer()->read(src.peer, B.host + slot_ * (size_t) q, L.bytes);
+                    from_peer = true;
                 } else {
                     from_file.push_back(q);
                 }
+            }
+            if (from_peer) {
+                if (!tier_->peer()->read_wait(err)) return false;
+                for (int q = 0; q < nb; ++q)
+                    if (tier_->locate(il, used[b0 + (size_t) q]).peer)
+                        cudaMemcpyAsync(B.blobs + stride_of(el) * (size_t) q, B.host + slot_ * (size_t) q, L.bytes,
+                                        cudaMemcpyHostToDevice, copy_);
             }
             if (!from_file.empty()) {
                 std::atomic<bool> read_ok{true};
@@ -311,7 +323,8 @@ public:
     }
 
 private:
-    // Reads the experts neither tier holds, layer by layer a few layers ahead of the products, into a pinned ring.
+    // Brings the experts the main card and RAM do not hold, layer by layer a few layers ahead of the products, into a
+    // pinned ring: from the second card, or read from the file.
     bool start_ahead() {
         const int nl = g_.n_layers;
         pf_idx_.assign((size_t) nl, std::vector<int32_t>((size_t) g_.n_expert, -1));
@@ -331,7 +344,7 @@ private:
             if (ring_) cudaFreeHost(ring_);
             ring_ = nullptr;
             pf_max_ = mx;
-            if (cudaHostAlloc((void**) &ring_, (size_t) kRing * pf_max_ * slot_, cudaHostAllocDefault) != cudaSuccess) {
+            if (cudaHostAlloc((void**) &ring_, (size_t) kRing * pf_max_ * slot_, cudaHostAllocPortable) != cudaSuccess) {
                 ring_ = nullptr;
                 return false;
             }
@@ -370,7 +383,7 @@ private:
     bool issue_next(std::string& err) {
         const int G = (g_.n_expert + kStageExperts - 1) / kStageExperts;
         const int l = (int) (issued_ / G), g = (int) (issued_ % G);
-        Stage& D = dstage_[issued_ % kAheadSlots];
+        Stage& D = dstage_[issued_ % prefillp::kAheadSlots];
         const ExpertLayer& el = m_.pack().experts[(size_t) l];
         if (g == 0 && pf_on_) {
             if (l >= 2) {
@@ -446,7 +459,7 @@ private:
         for (int g = 0; g < G; ++g) {
             while (issued_ <= consumed_)
                 if (!issue_next(err)) return false;
-            Stage& D = dstage_[consumed_ % kAheadSlots];
+            Stage& D = dstage_[consumed_ % prefillp::kAheadSlots];
             const int e0 = g * kStageExperts, e1 = std::min(NE, e0 + kStageExperts);
             cudaStreamWaitEvent(st, D.copied, 0);
             // sub-ranges of experts of at most kMaxRows rows (one range unless the routing is very skewed)
@@ -512,7 +525,7 @@ private:
             }
             cudaEventRecord(D.done, st);
             ++consumed_;
-            while (issued_ < std::min<int64_t>(consumed_ + kAheadSlots, (int64_t) g_.n_layers * G))
+            while (issued_ < std::min<int64_t>(consumed_ + prefillp::kAheadSlots, (int64_t) g_.n_layers * G))
                 if (!issue_next(err)) return false;
         }
         weighted_sum_tokens(rows_, w, T, K, g_.n_embd, out, st);
@@ -542,17 +555,33 @@ private:
             const std::vector<int>& list = pf_list_[(size_t) l];
             uint8_t* base = ring_ + (size_t) (l % kRing) * pf_max_ * slot_;
             std::atomic<bool> ok{true};
+            std::vector<size_t> files;
+            bool any_peer = false;
+            for (size_t i = 0; i < list.size(); ++i) {
+                const ExpertTier::Source src = tier_->locate(l, list[i]);
+                if (src.peer) {
+                    tier_->peer()->read(src.peer, base + i * slot_, el.blob_bytes);
+                    any_peer = true;
+                } else {
+                    files.push_back(i);
+                }
+            }
             std::atomic<size_t> next{0};
             auto worker = [&] {
-                for (size_t i; (i = next.fetch_add(1)) < list.size();) {
+                for (size_t n; (n = next.fetch_add(1)) < files.size();) {
+                    const size_t i = files[n];
                     const uint64_t off = m_.pack().experts_range.offset + el.offset + (uint64_t) list[i] * el.blob_bytes;
                     if (!platform::pread_all(m_.experts_fd(), base + i * slot_, el.blob_bytes, off)) ok = false;
                 }
             };
             std::vector<std::thread> th;
-            for (int i = 1; i < std::min<int>(kReadThreads, (int) list.size()); ++i) th.emplace_back(worker);
+            for (int i = 1; i < std::min<int>(kReadThreads, (int) files.size()); ++i) th.emplace_back(worker);
             worker();
             for (std::thread& t : th) t.join();
+            if (any_peer) {
+                std::string e;
+                if (!tier_->peer()->read_wait(e)) ok = false;
+            }
             std::lock_guard<std::mutex> lk(pf_mu_);
             if (!ok) pf_failed_ = true;
             pf_ready_ = l + 1;
@@ -603,7 +632,7 @@ private:
     uint64_t launch_ = 0;
     bool ahead_ = false;
     int64_t issued_ = 0, consumed_ = 0;
-    Stage dstage_[kAheadSlots];
+    Stage dstage_[prefillp::kAheadSlots];
     int32_t *tok_all_ = nullptr, *pair_all_ = nullptr, *bnd_ = nullptr;
     // read-ahead of the experts that only the file has
     std::thread pf_th_;

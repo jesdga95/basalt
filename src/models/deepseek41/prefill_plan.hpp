@@ -17,6 +17,9 @@ constexpr int64_t kKeepPositions = 32768;          // a new sequence keeps the c
 constexpr uint64_t kTrimBytes = 256ull << 20;      // ... and gives back the rest only when it is at least this much
 constexpr int64_t kStageRows = 16384;              // (token, slot) rows one expert launch handles
 constexpr int kStageExperts = 32;                  // experts staged per launch, two launches in flight
+constexpr int kAheadSlots = 6;                     // staged groups of experts in flight in a long chunk
+constexpr int kShortPrompt = 640;                  // a prompt this short takes no staged groups and reads beside a tier's copies
+constexpr int kShortChunk = 1024;                  // ... in a chunk of this many tokens
 
 /// The model sizes the prompt workspaces depend on.
 struct Dims {
@@ -42,6 +45,9 @@ inline uint64_t fixed_bytes(const Dims& d) {
 }
 
 inline uint64_t workspace_bytes(const Dims& d, int chunk) { return fixed_bytes(d) + per_token_bytes(d) * (uint64_t) chunk; }
+
+/// Device bytes of the long chunks' staged groups of experts, ahead of their products.
+inline uint64_t ahead_bytes(const Dims& d) { return kAheadSlots * d.expert_blob_bytes * kStageExperts; }
 
 struct Fit {
     int chunk = 0;       ///< tokens per chunk; 0 when even the least does not fit

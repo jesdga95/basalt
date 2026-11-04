@@ -64,6 +64,7 @@ struct LoadRequest {
     std::string diag_dump;            ///< diagnostic: directory for per-layer tensor dumps (empty = off)
     int diag_tier_ram = -1;           ///< diagnostic: fixed RAM-tier experts per layer (-1 = sized from free memory)
     int diag_tier_vram = -1;          ///< diagnostic: fixed VRAM-tier experts per layer (-1 = sized from free memory)
+    std::vector<int> peer_devices;    ///< CUDA devices of the expert tier cards after the main one
     int64_t max_context = 0;          ///< --max-context (used when max_context_set; else the model picks its own)
     bool max_context_set = false;
 };

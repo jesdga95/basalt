@@ -7,6 +7,7 @@
 #include "basalt/ngram/ple_reader.hpp"
 #include "basalt/vision/mmproj.hpp"
 #include "models/deepseek41/pack.hpp"
+#include "models/deepseek41/prefill_plan.hpp"
 
 #include <map>
 #include <memory>
@@ -59,7 +60,13 @@ public:
     int diag_tier_ram() const { return diag_tier_ram_; }
     int diag_tier_vram() const { return diag_tier_vram_; }
     void set_diag_tier(int ram, int vram) { diag_tier_ram_ = ram; diag_tier_vram_ = vram; }
-    /// Drafter GGUF run on the second GPU beside decode (empty = off).
+    /// The CUDA device of the second card's expert tier, or -1.
+    int peer_device() const { return peer_device_; }
+    void set_peer_device(int d) { peer_device_ = d; }
+    /// The sizes the prompt path's workspaces depend on.
+    prefillp::Dims prompt_dims() const;
+    /// Device bytes of the compressed caches of a full context.
+    uint64_t context_bytes() const;
     /// Opens the image projector: the diagnostic standalone file when set, else the pack's vision section.
     /// False with `err` set when neither exists.
     bool open_mmproj(vision::Mmproj& mp, std::string& err) const;
@@ -70,6 +77,7 @@ private:
     std::map<std::string, DevTensor> dev_;
     std::string diag_dump_, path_;
     int diag_tier_ram_ = -1, diag_tier_vram_ = -1;
+    int peer_device_ = -1;
     int64_t ctx_ = 0;
     static int64_t ctxp_default();
     int embd_fd_ = -1;

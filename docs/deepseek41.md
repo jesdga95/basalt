@@ -3,10 +3,14 @@
 A `deepseek41` pack runs through the same command, `basalt serve PACK`; the server reads the model's architecture from
 the pack and picks the chat format, tool-call syntax and thinking switch to match.
 
-- **First start:** the engine sizes a VRAM expert tier from the free memory, then loads as many experts as fit into a
-  pinned RAM tier, the most routed first; the rest are read from the pack by the CPU, the most routed of them read ahead into the page cache after the load. The load runs once per start and the startup lines
-  `basalt deepseek41: VRAM expert tier ...` and `basalt deepseek41: RAM expert tier ...` give the sizes. Which experts are resident
-  can change the rounding of the output ([precision](precision/deepseek41.md)).
+- **First start:** the engine deals the experts out in routing order and loads them once per start. One card: as many
+  as fit go into a pinned RAM tier, the most routed first, the VRAM slots hold copies of its head, and the rest are read
+  from the pack by the CPU, the most routed of them read ahead into the page cache after the load. Two cards
+  (`--gpu 0,1`): the second card holds experts nowhere else has; when RAM cannot take all the others, the main card
+  holds the most routed of them too, nowhere else, as many as leave room for a prompt at the full context, and its other
+  slots copy the RAM tier. When everything then has a place, nothing is read from the pack after READY but the Engram
+  table and the token embedding. The startup line `basalt deepseek41: expert homes of 384 per layer: ...` gives the split.
+  Which experts are resident can change the rounding of the output ([precision](precision/deepseek41.md)).
 - **Context:** `--max-context N` (or `"max-context"` in the config's `engine` section) sets it, as for every model, up
   to the model's own maximum (1,048,576 tokens, from the pack). Without it the engine takes that maximum, lowered
   until the compressed caches of a full context take at most a quarter of the free VRAM, and prints the result
@@ -17,16 +21,20 @@ the pack and picks the chat format, tool-call syntax and thinking switch to matc
   refused; a prompt that fills the context leaves the tier smaller for the rest of that run. The rotary extension (YaRN) is part of the model: the `--rope-*` and
   `--yarn-*` flags are refused for it.
 - **Long prompts:** each prompt takes the tier's loan back, maps the caches it needs and sizes its workspaces to the
-  memory left: 8192 tokens per chunk, halved down to 256. A read of 4,096 tokens or more gives the whole VRAM tier
-  back for its duration and reads every expert from RAM and the pack; the tier reopens empty, so the first tokens after
-  it decode slower. After a long context, a tail of up to 256 tokens that finds no room for workspaces reads one decode
-  step at a time; a longer one borrows the tier too. If even the smallest chunk does not fit, or the caches cannot grow,
-  the request fails with an error naming the free memory and the next one runs. When a new conversation starts, caches a
-  long one left mapped beyond 32,768 positions are released to the tier.
+  memory left: 8192 tokens per chunk, halved down to 256. A read of 4,096 tokens or more gives the main card's copies
+  back for its duration and streams the experts from the main card's homes, RAM, the second card (through the host) and
+  the pack; the copies reopen after it, from the routing order on two cards, empty on one, where the first tokens after
+  it decode slower. On two cards a prompt of up to 640 tokens reads beside the copies and keeps them. After a long
+  context, a tail of up to 256 tokens that finds no room for workspaces reads one decode step at a time; a longer one
+  borrows the copies too. If even the smallest chunk does not fit, or the caches cannot grow, the request fails with an
+  error naming the free memory and the next one runs. When a new conversation starts, caches a long one left mapped
+  beyond 32,768 positions are released to the tier.
 - **Requests:** one at a time, with no `--parallel` slots. The engine keeps the tokens it holds (the prompt and what it
   generated) and a checkpoint before the last prompt token. A request whose prompt starts with all the held tokens, or
   with the checkpoint's (a next turn after a thinking reply: the template drops the thinking from the history), reads
   only the new tail; any other request reads its whole prompt again. `pp=N/Mc` in the done line shows how many were kept.
-- **Second GPU:** not used by this model.
+- **Second GPU:** `--gpu 0,1` makes the second card an expert tier: it computes its experts with the main card's kernels,
+  so an expert gives the same bits on either card, while the CPU pool computes the misses; the rows come back through
+  mapped host memory. Without it the first card runs alone and a warning names the other. One second card is used.
 - **Images:** `--vision dynamic` encodes inside the engine from the pack's `vision/mmproj` section, which exists when the
   pack was built with `--mmproj` ([model file](model-file.md#deepseek-v41-pack)). The sidecar modes do not apply.
