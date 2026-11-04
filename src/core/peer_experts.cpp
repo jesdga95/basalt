@@ -7,7 +7,6 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/quantize_act.hpp"
-#include "basalt/kernels/s2_expert_grouped.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -90,16 +89,19 @@ void PeerExperts::close() {
 
 namespace {
 
+size_t g_min_scratch = 0;
+
 size_t scratch_bytes() {
     const auto& lay = basalt::kernels::cpu::expert_layout();
     int64_t ff = basalt::kernels::cpu::FF;
     if (lay.native)
         for (const auto& f : lay.fmt) ff = std::max<int64_t>(ff, f.n_ff);
-    return std::max<size_t>((size_t) basalt::kernels::moe_hit_grouped_scratch_bytes(CAP, H, ff),
-                            basalt::kernels::native_expert_scratch_bytes(CAP, ff));
+    return std::max<size_t>(g_min_scratch, basalt::kernels::native_expert_scratch_bytes(CAP, ff));
 }
 
 }  // namespace
+
+void PeerExperts::set_min_scratch(size_t bytes) { g_min_scratch = bytes; }
 
 uint64_t PeerExperts::device_overhead_bytes() {
     return (uint64_t) scratch_bytes() + (uint64_t) CAP * H * sizeof(float) * 2 + sizeof(Meta) +
