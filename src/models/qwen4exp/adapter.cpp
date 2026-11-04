@@ -4,6 +4,7 @@
 
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/layout.hpp"
+#include "basalt/program/options.hpp"
 
 namespace basalt::models::qwen4exp {
 namespace {
@@ -66,6 +67,14 @@ public:
     }
 
     model::TokenizerSpec tokenizer_spec() const override { return {"tokenizer.ggml.tokens", "qwen"}; }
+
+    std::unique_ptr<program::CommonOptions> make_options() const override { return std::make_unique<program::Options>(); }
+    bool parse_flag(const std::string& name, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
+        return qwen4exp::parse_flag(name, args, static_cast<program::Options&>(o), code);
+    }
+    std::optional<int> finish_flags(program::CommonOptions& o) const override {
+        return qwen4exp::finish_flags(static_cast<program::Options&>(o));
+    }
 };
 
 }  // namespace

@@ -8,11 +8,15 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace basalt {
 class GgufFile;
+}
+namespace basalt::program {
+struct CommonOptions;
 }
 
 namespace basalt::model {
@@ -28,7 +32,6 @@ struct ModelDesc {
     int64_t n_ff_exp = 0;        ///< routed expert hidden width
     int64_t n_expert_shared = 0;
     int64_t context_length = 0;  ///< the longest context the model supports (0: not stated)
-    bool rope_from_model = false; ///< the rotary scaling comes from the model file only: the --rope-* flags are refused
     /// ggml type id of the gate/up/down blobs of one routed expert, per layer (empty: read from the tensors).
     std::vector<int32_t> expert_gate_up_type;
     std::vector<int32_t> expert_down_type;
@@ -121,6 +124,8 @@ public:
     virtual Result make_session(std::unique_ptr<ModelSession>& out) = 0;
 };
 
+class FlagArgs;
+
 class ModelAdapter {
 public:
     virtual ~ModelAdapter() = default;
@@ -133,6 +138,15 @@ public:
     virtual Result load(const LoadRequest& req, std::unique_ptr<LoadedModel>& out) const = 0;
     virtual std::vector<SideTableSpec> side_tables(const ModelDesc&) const { return {}; }
     virtual TokenizerSpec tokenizer_spec() const = 0;
+    /// The options object of this model: the common flags and its own.
+    virtual std::unique_ptr<program::CommonOptions> make_options() const;
+    /// Takes a flag outside the common set; false when this model has no such flag. `code`: an exit code for a bad value.
+    virtual bool parse_flag(const std::string& name, FlagArgs& args, program::CommonOptions& o, int& code) const {
+        (void) name; (void) args; (void) o; (void) code;
+        return false;
+    }
+    /// After the last flag: what the model's flags imply; an exit code when they conflict.
+    virtual std::optional<int> finish_flags(program::CommonOptions& o) const { (void) o; return std::nullopt; }
 };
 
 /// Registry of adapters by architecture name. Registration is explicit (`models::register_builtin_models()`
