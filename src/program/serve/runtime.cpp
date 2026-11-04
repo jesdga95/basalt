@@ -3,17 +3,31 @@
 
 namespace basalt::program::serve {
 
-int QfnRuntime::execute() {
+int Runtime::execute() {
+    if (const int code = init_before_input()) return code;
+    if (const int code = init_protocol()) return code;
+    if (const int code = announce()) return code;
+    if (const int code = init_after_input()) return code;
+    return run_requests();
+}
+
+int QfnRuntime::init_before_input() {
     if (const int code = init_prompt()) return code;
     if (const int code = init_verify()) return code;
     if (const int code = init_conversations()) return code;
-    if (const int code = init_tiers()) return code;
-    if (const int code = init_protocol()) return code;
-    if (const int code = announce()) return code;
+    return init_tiers();
+}
+
+int QfnRuntime::init_after_input() {
     if (const int code = init_memory()) return code;
     if (const int code = capture_windows()) return code;
-    if (const int code = init_batch()) return code;
-    return run_requests();
+    return init_batch();
+}
+
+void QfnRuntime::at_exit() {
+    for (int st = 0; st < std::max(n_stages, 1); ++st)
+        for (const std::string& r : stage_ver(st).route_report()) basalt::log::info("basalt serve", "%s", r.c_str());
+    save_profile("exit");   // QUIT, or the server closed stdin
 }
 
 int run(Context& context) {
@@ -21,7 +35,7 @@ int run(Context& context) {
     return runtime.execute();
 }
 
-int QfnRuntime::run_requests() {
+int Runtime::run_requests() {
     for (;;) {
         const Flow flow = dispatch();
         if (flow == Flow::error) {
@@ -36,7 +50,7 @@ int QfnRuntime::run_requests() {
     }
 }
 
-int QfnRuntime::shutdown() {
+int Runtime::shutdown() {
     // the conversations this process holds go to the disk tier before it ends
     if (disk.enabled()) {
         const auto t0 = Clock::now();
@@ -50,9 +64,7 @@ int QfnRuntime::shutdown() {
                           (double) st.whole_bytes / 1073741824.0, st.restored, (double) st.read_bytes / 1073741824.0,
                           st.evicted, st.dropped);
     }
-    for (int st = 0; st < std::max(n_stages, 1); ++st)
-        for (const std::string& r : stage_ver(st).route_report()) basalt::log::info("basalt serve", "%s", r.c_str());
-    save_profile("exit");   // QUIT, or the server closed stdin
+    at_exit();
     return 0;
 }
 

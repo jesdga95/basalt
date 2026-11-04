@@ -108,6 +108,62 @@ void QfnRuntime::between_requests(const std::string& line) {
     if (ba_job) { ba_thr.join(); ba_job = false; }   // (a request runs the same copy steps itself)
 }
 
+void QfnRuntime::after_input_start() { sp.should_stop = [&] { return halted(); }; }
+
+void QfnRuntime::print_info() {
+    // what the server's Monitor tab shows (the server skips unknown lines until READY)
+    {
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        // "Experts in VRAM" is every stage's cache, not one card's.  The caches hold disjoint pairs, so they add.
+        const int64_t slots_primary = (int64_t) xcache.slots();
+        const int64_t mib_primary = (int64_t) (xcache.bytes() >> 20);
+        int64_t slots_all = slots_primary, mib_all = mib_primary;
+        for (const auto& st : stages) {
+            slots_all += (int64_t) st->cache.slots();
+            mib_all += (int64_t) (st->cache.bytes() >> 20);
+        }
+        // the pack's quantization label (the last word of its name, without the publisher's prefixes) and the PCI
+        // bus ids of the cards this engine computes on, primary first: what a benchmark row records
+        std::string quant_label, gpu_ids;
+        {
+            const basalt::core::Json* nm = model_file.meta().get("name");
+            std::string nmv = nm != nullptr && nm->is_string() ? nm->s : std::string();
+            quant_label = nmv.substr(nmv.rfind(' ') == std::string::npos ? 0 : nmv.rfind(' ') + 1);
+            for (const char* pre : {"NVIDIA-", "UD-"})
+                if (quant_label.rfind(pre, 0) == 0) quant_label.erase(0, std::strlen(pre));
+            if (quant_label.empty()) quant_label = "unknown";
+            for (int d : basalt::program::engine_gpu_order(o.peer_device, o.peer_devices,
+                                                           multi_gpu ? split_devs : std::vector<int>())) {
+                char bus[32] = {};
+                if (cudaDeviceGetPCIBusId(bus, sizeof bus, d) == cudaSuccess)
+                    gpu_ids += (gpu_ids.empty() ? "" : ",") + std::string(bus);
+            }
+        }
+        std::printf("INFO logit_bias=%lld context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
+                    "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
+                    "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
+                    "conversation_cache_mib=%lld conversation_cache_slots=%d "
+                    "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%d tail_role_token=%lld vram_elastic=%d%s quant=%s gpus=%s engine=" BASALT_VERSION "\n",
+                    (long long) n_vocab, (long long) o.max_context, o.kv.c_str(),
+                    (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
+                                     ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
+                    (long long) slots_all, (long long) mib_all,
+                    (long long) slots_primary, (long long) mib_primary,
+                    o.spec, o.mtp_max_t,
+                    o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
+                    (long long) ((o.mmap_experts ? src.resident_bytes() : basalt::kernels::cpu::expert_layout().total) >> 20),
+                    pool.workers(), o.pcie_frac,
+                    (long long) o.conversation_cache_mib, o.conversation_cache_slots,
+                    (long long) o.conversation_cache_min_free_mib, o.conversation_cache_min_tokens, (long long) o.tail_role_token, o.vram_elastic && xcache.segmented() ? 1 : 0,
+                    o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
+                                   " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
+                                   " slot0_solo=" + std::to_string(slot0_is_solo ? 1 : 0) +
+                                   " solo_any_slot=" + std::to_string(slot0_is_solo ? 1 : 0)).c_str() : "",
+                    quant_label.c_str(), gpu_ids.c_str());
+    }
+}
+
 Flow QfnRuntime::run_request() {
     QfnRequest request(*this);
     return request.execute();

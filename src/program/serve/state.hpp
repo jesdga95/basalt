@@ -155,7 +155,19 @@ public:
             std::optional<basalt::program::grammar::PackVocab>& vocab_tables)
         : o(options), model_file(file), err(error), n_vocab(vocab), grammar_vocab(vocab_tables) {}
     virtual ~Runtime() = default;
+    int execute();
     Flow dispatch();
+    int run_requests();
+    int shutdown();
+    int init_protocol();
+    int announce();
+    // ---- start and end
+    virtual int init_before_input() = 0;
+    virtual int init_after_input() = 0;
+    virtual void after_input_start() {}
+    virtual void print_info() = 0;   // the INFO line
+    virtual void at_exit() {}
+    virtual bool pack_tokenizer_supported(std::string_view tokenizer_json) const = 0;
     static constexpr int kPenaltyWindowCap = 4096;
     // ---- what a model answers: one call per batch window at most, the rest per command or per request
     virtual bool windows_in_flight() = 0;
@@ -339,7 +351,14 @@ class QfnRuntime final : public Runtime, private Context {
 public:
     explicit QfnRuntime(Context& context)
         : Runtime(context.o, context.model_file, context.err, context.n_vocab, context.grammar_vocab), Context(context) {}
-    int execute();
+    int init_before_input() override;
+    int init_after_input() override;
+    void after_input_start() override;
+    void print_info() override;
+    void at_exit() override;
+    bool pack_tokenizer_supported(std::string_view tokenizer_json) const override {
+        return tokenizer_json.find("\"pre\": \"qwen35\"") != std::string_view::npos;
+    }
 
     bool windows_in_flight() override;
     bool next_batch_window() override;
@@ -627,13 +646,9 @@ private:
     int init_verify();
     int init_conversations();
     int init_tiers();
-    int init_protocol();
-    int announce();
     int init_memory();
     int capture_windows();
     int init_batch();
-    int run_requests();
-    int shutdown();
 };
 
 }  // namespace basalt::program::serve
