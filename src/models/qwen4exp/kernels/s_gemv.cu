@@ -1,4 +1,4 @@
-// src/kernels/cuda/s_gemv.cu - the S-family GEMV, one thread per output row.
+// src/models/qwen4exp/kernels/s_gemv.cu - the S-family GEMV, one thread per output row.
 //
 // Naive per the phase rule: dequantize on the fly, FP32 accumulation inside the row, no shared memory, no
 // vector loads.  The kernel is templated on the code WIDTH (a compile-time property of the unpacking loop) and

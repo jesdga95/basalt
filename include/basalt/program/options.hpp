@@ -79,7 +79,7 @@ struct Options {
     /// (the GGUF shards when the model file has no experts section).  0 = the whole complement (--resident-experts).
     uint64_t resident_budget = 0;
     /// Slots of VRAM-resident experts.  **0 = off, and off is the default.**  Switching the cache on moves work off the
-    /// CPU pool (`src/kernels/cuda/s2_expert_grouped.cu`, wired via `expert_hit_run`).
+    /// CPU pool (`src/models/qwen4exp/kernels/s2_expert_grouped.cu`, wired via `expert_hit_run`).
     int expert_cache = 0;
     /// Multi-GPU: a second expert tier on CUDA device `peer_device` (-1 = off), `peer_reserve_mib` left free
     /// there, `peer_slots` caps its size (0 = as many as fit), `peer_adapt_swaps` per adaptive round

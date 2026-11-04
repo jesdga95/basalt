@@ -1,4 +1,4 @@
-// include/basalt/kernels/router_top10.hpp - the MoE router, host-callable.
+// include/basalt/models/qwen4exp/kernels/router_top10.hpp - the MoE router, host-callable.
 //
 // logits (n_tokens, n_expert) -> the top-k experts per token with renormalised weights.  Semantics are
 // the reference router's: softmax over ALL experts, stable descending argsort (ties break by index), gather,

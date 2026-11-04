@@ -3,7 +3,7 @@
 #include "basalt/core/mtp.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/kernels/ple.hpp"
-#include "basalt/kernels/native_ple_postops.hpp"
+#include "basalt/models/qwen4exp/kernels/native_ple_postops.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
 #include "basalt/prefill/gemm.hpp"
 #include "basalt/core/peer_experts.hpp"

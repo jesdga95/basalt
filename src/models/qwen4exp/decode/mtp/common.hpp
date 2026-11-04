@@ -36,7 +36,7 @@
 #include "basalt/models/qwen4exp/kernels/q80_proxy.hpp"
 #include "basalt/kernels/quantize_act.hpp"
 #include "basalt/kernels/rope.hpp"
-#include "basalt/kernels/router_top10.hpp"
+#include "basalt/models/qwen4exp/kernels/router_top10.hpp"
 #include "basalt/kernels/s2_expert_grouped.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/kernels/shared_expert.hpp"

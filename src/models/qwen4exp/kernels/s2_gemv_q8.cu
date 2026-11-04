@@ -1,4 +1,4 @@
-// src/kernels/cuda/s2_gemv_q8.cu - the S2 GEMV that consumes Q8_0 ACTIVATIONS, as ggml does.
+// src/models/qwen4exp/kernels/s2_gemv_q8.cu - the S2 GEMV that consumes Q8_0 ACTIVATIONS, as ggml does.
 //
 // THE GAP THIS CLOSES.  `ggml_mul_mat` converts src1 - the ACTIVATION - to the weight's
 // `vec_dot_type` before the dot product, and for Q2_0 that is Q8_0.  FP16-activation kernels would differ
@@ -14,7 +14,7 @@
 // Layout: activations are (n_in/32) ggml Q8_0 blocks, 34 bytes each - `fp16 d` then `int8 qs[32]` - produced by
 // `basalt::kernels::quantize_q8_0`.  A quad of four elements lies inside one 32-element block, so the block
 // scale is constant across it and is loaded once.
-#include "basalt/kernels/s2_gemv_q8.hpp"
+#include "basalt/models/qwen4exp/kernels/s2_gemv_q8.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

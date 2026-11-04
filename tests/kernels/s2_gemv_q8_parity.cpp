@@ -11,7 +11,7 @@
 //      rather than one quoted from elsewhere.
 #include "basalt/kernels/quantize_act.hpp"
 #include "basalt/kernels/s_gemv.hpp"
-#include "basalt/kernels/s2_gemv_q8.hpp"
+#include "basalt/models/qwen4exp/kernels/s2_gemv_q8.hpp"
 
 #include <cuda_runtime.h>
 

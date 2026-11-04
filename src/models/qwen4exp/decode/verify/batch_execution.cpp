@@ -7,7 +7,7 @@
 #include "basalt/platform/compiler.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/dec_gdn.hpp"
-#include "basalt/kernels/native_ple_postops.hpp"
+#include "basalt/models/qwen4exp/kernels/native_ple_postops.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/kernels/qsa.hpp"

@@ -1,4 +1,4 @@
-// src/kernels/cuda/shared_expert.cu - the shared expert.
+// src/models/qwen4exp/kernels/shared_expert.cu - the shared expert.
 //
 // the Python reference, transcribed:
 //
@@ -23,7 +23,7 @@
 #include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/kernels/quantize_act.hpp"
-#include "basalt/kernels/s2_gemv_q8.hpp"
+#include "basalt/models/qwen4exp/kernels/s2_gemv_q8.hpp"
 #include "basalt/kernels/s_gemv.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/pdl.hpp"
