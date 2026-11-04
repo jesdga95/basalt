@@ -21,7 +21,6 @@ class Arch:
     side_sections = True
     # only the vision projector section (vision/mmproj), written when --mmproj is given
     mmproj_only = False
-    dspark_ok = False
     projector_type = ""
     # the model's sampling defaults, for a GGUF that does not carry them (llama.cpp's general.sampling.* keys)
     sampling_kv: dict = {}

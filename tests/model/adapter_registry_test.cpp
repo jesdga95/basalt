@@ -51,7 +51,6 @@ int main() {
               "describe() reads the geometry from the metadata");
         std::unique_ptr<model::LoadedModel> lm;
         check(a->load({}, lm).status == model::Status::Error, "deepseek41 load without a path is an error");
-        check(a->drafter() == nullptr, "deepseek41 has no drafter");
     }
     std::filesystem::remove_all(dir);
     return failures ? 1 : 0;

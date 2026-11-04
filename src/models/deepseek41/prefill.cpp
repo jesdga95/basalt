@@ -48,10 +48,8 @@ public:
             return true;
         };
         dump_dir_ = m_.diag_dump();
-        if (m_.diag_fixture().empty()) {   // a replayed fixture serves the experts through the ops instead
-            ffn_ = make_prefill_ffn(m_, ops_, cap_, err);
-            if (!ffn_) return false;
-        }
+        ffn_ = make_prefill_ffn(m_, ops_, cap_, err);
+        if (!ffn_) return false;
         const size_t q8 = std::max<size_t>(kernels::native_q8_1_bytes((int) std::max<size_t>(cols, n), 8), 1 << 16);
         bool ok = buf(x_, C * 4 * n) && buf(x2_, C * 4 * n) && buf(cur_, C * n) && buf(normed_, C * n) &&
                   buf(attn_, C * n) && buf(moe_, C * n) && buf(sh_, C * n) && buf(sum_, C * n) &&

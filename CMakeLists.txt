@@ -137,9 +137,8 @@ target_link_libraries(model_qwen4exp PUBLIC model)
 
 add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models/deepseek41/pack.cpp
   src/models/deepseek41/model.cpp src/models/deepseek41/session.cpp src/models/deepseek41/layer_ops.cpp
-  src/models/deepseek41/fixture_ops.cpp src/models/deepseek41/elastic.cpp src/models/deepseek41/ops_kernels.cpp src/models/deepseek41/tier.cpp src/models/deepseek41/ops.cu
-  src/models/deepseek41/prefill.cpp src/models/deepseek41/prefill_ffn.cpp src/models/deepseek41/prefill_ffn.cu src/models/deepseek41/attn_batch.cpp src/models/deepseek41/attn_dense.cu
-  src/models/deepseek41/dspark.cpp src/models/deepseek41/dspark_kernels.cu)
+  src/models/deepseek41/elastic.cpp src/models/deepseek41/ops_kernels.cpp src/models/deepseek41/tier.cpp src/models/deepseek41/ops.cu
+  src/models/deepseek41/prefill.cpp src/models/deepseek41/prefill_ffn.cpp src/models/deepseek41/prefill_ffn.cu src/models/deepseek41/attn_batch.cpp src/models/deepseek41/attn_dense.cu)
 target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
 target_link_libraries(model_deepseek41 PUBLIC model deepseek41_kernels deepseek41_attn deepseek41_vision engine mmq kernels core ${_gpu_runtime_target})
 
@@ -148,13 +147,6 @@ target_link_libraries(models PUBLIC model_qwen4exp model_deepseek41)
 
 # DeepSeek-V4.1 kernels and their tests (own file)
 include(src/models/deepseek41/kernels/kernels.cmake)
-if(BUILD_TESTING)
-  # the DSpark drafter's kernels against CPU references (GPU)
-  add_executable(ds41_dspark_parity src/models/deepseek41/dspark_parity.cpp)
-  target_include_directories(ds41_dspark_parity PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_link_libraries(ds41_dspark_parity PRIVATE model_deepseek41 ${_gpu_runtime_target})
-  basalt_gpu_test(NAME ds41_dspark_parity COMMAND ds41_dspark_parity)
-endif()
 include(src/models/deepseek41/vision/vision.cmake)
 
 add_executable(basalt-gguf src/artifact/gguf_reader.cpp)
@@ -1472,9 +1464,6 @@ target_link_libraries(iq1s_parity PRIVATE kernels kernels_cpu ${_gpu_runtime_tar
 basalt_gpu_test(NAME iq1s_parity COMMAND iq1s_parity)
 set_tests_properties(iq1s_parity PROPERTIES TIMEOUT 300)
 basalt_cpu_test(NAME iq1s_parity_cpu COMMAND iq1s_parity --cpu)
-add_executable(iq1s_fixture_parity tests/kernels/iq1s_fixture_parity.cpp)   # real DeepSeek weights vs llama.cpp tensors (manual: needs the GGUF and fixtures)
-target_include_directories(iq1s_fixture_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(iq1s_fixture_parity PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})
 # DEC_MOE's kernels on real GGUF experts, bitwise vs the path they replace (--bench: timings)
 add_executable(dec_moe_parity tests/kernels/dec_moe_parity.cpp)
 target_include_directories(dec_moe_parity PRIVATE ${_gpu_include_directories})

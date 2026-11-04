@@ -9,7 +9,7 @@ add_library(deepseek41_kernels STATIC
 target_include_directories(deepseek41_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(deepseek41_kernels PUBLIC ${_gpu_runtime_target})
 
-foreach(_t router_parity norm_parity hc_parity engram_parity attn_index_parity prefill_index_parity attn_index_fixture)
+foreach(_t router_parity norm_parity hc_parity engram_parity attn_index_parity prefill_index_parity)
   if(BUILD_TESTING AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/models/deepseek41/kernels/${_t}.cpp)
     add_executable(ds41_${_t} src/models/deepseek41/kernels/${_t}.cpp)
     target_include_directories(ds41_${_t} PRIVATE ${_gpu_include_directories})

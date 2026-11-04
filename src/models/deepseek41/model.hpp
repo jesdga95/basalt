@@ -53,33 +53,23 @@ public:
     int experts_fd() const { return experts_fd_; }
     const std::string& path() const { return path_; }
     /// Diagnostics (off by default): replay recorded expert outputs; dump per-layer tensors.
-    const std::string& diag_fixture() const { return diag_fixture_; }
     const std::string& diag_dump() const { return diag_dump_; }
-    void set_diag(std::string fixture, std::string dump) { diag_fixture_ = std::move(fixture); diag_dump_ = std::move(dump); }
-    void set_diag_mmproj(std::string path) { diag_mmproj_ = std::move(path); }
+    void set_diag_dump(std::string dump) { diag_dump_ = std::move(dump); }
     /// Fixed expert-tier sizes per layer for repeatable runs (-1 = sized from free memory).
     int diag_tier_ram() const { return diag_tier_ram_; }
     int diag_tier_vram() const { return diag_tier_vram_; }
     void set_diag_tier(int ram, int vram) { diag_tier_ram_ = ram; diag_tier_vram_ = vram; }
     /// Drafter GGUF run on the second GPU beside decode (empty = off).
-    const std::string& diag_dspark() const { return diag_dspark_; }
-    void set_diag_dspark(std::string path) { diag_dspark_ = std::move(path); }
-    /// --spec: 2 or more loads the drafter (the pack's dspark section, or the diagnostic file) and drafts spec - 1 tokens.
-    int spec() const { return spec_; }
-    void set_spec(int n) { spec_ = n; }
     /// Opens the image projector: the diagnostic standalone file when set, else the pack's vision section.
     /// False with `err` set when neither exists.
     bool open_mmproj(vision::Mmproj& mp, std::string& err) const;
-    /// The pack's drafter section (empty when it carries none).
-    const core::FileRange& drafter_range() const { return pack_.dspark; }
 
 private:
     Pack pack_;
     model::ModelDesc desc_;
     std::map<std::string, DevTensor> dev_;
-    std::string diag_fixture_, diag_dump_, diag_mmproj_, diag_dspark_, path_;
+    std::string diag_dump_, path_;
     int diag_tier_ram_ = -1, diag_tier_vram_ = -1;
-    int spec_ = 0;
     int64_t ctx_ = 0;
     static int64_t ctxp_default();
     int embd_fd_ = -1;

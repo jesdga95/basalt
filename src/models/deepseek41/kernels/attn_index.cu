@@ -720,34 +720,7 @@ void compress(const CompressArgs& a, const float* x, const int32_t* pos, int n_t
     }
 }
 
-void compress_window(const CompressArgs& a, const float* x, const int32_t* pos, int n_tokens, void* workspace, void* stream) {
-    if (n_tokens < 1 || n_tokens > kMaxT || (a.ratio != 1 && a.ratio != 2)) throw std::invalid_argument("compress_window: bad args");
-    cudaStream_t s = as_stream(stream);
-    float* ckv = static_cast<float*>(workspace);
-    float* csc = ckv + kMaxT * kLatent;
-    float* pre = csc + kMaxT * kLatent;
-    int32_t* row_of = reinterpret_cast<int32_t*>(pre + kMaxT * kLatent);
-    gemv_bf16(a.w_kv, x, n_tokens, a.n_embd, kLatent, ckv, stream);
-    if (a.ratio > 1) gemv_bf16(a.w_gate, x, n_tokens, a.n_embd, kLatent, csc, stream);
-    compress_batch_kernel<<<n_tokens, kLatent, 0, s>>>(ckv, a.ratio > 1 ? csc : nullptr, pos, a.ratio, a.rms_eps, a.norm_w,
-                                                       a.rope_freq, a.state_kv, a.state_score,
-                                                       reinterpret_cast<__half*>(a.comp_kv), pre, row_of);
-    check_launch("compress_window");
-    if (a.w_idx_k && a.comp_ik) {
-        index_key_kernel<<<n_tokens, 256, 0, s>>>(pre, row_of, pos, a.ratio, a.rms_eps, a.w_idx_k, a.idx_k_norm_w,
-                                                  a.rope_freq, reinterpret_cast<__half*>(a.comp_ik));
-        check_launch("index_key");
-    }
-}
 
-void compress_window_commit(const CompressArgs& a, const int32_t* pos, int n_accepted, void* workspace, void* stream) {
-    if (n_accepted < 1) return;
-    float* ckv = static_cast<float*>(workspace);
-    float* csc = ckv + kMaxT * kLatent;
-    compress_state_kernel<<<1, kLatent, 0, as_stream(stream)>>>(ckv, a.ratio > 1 ? csc : nullptr, pos, n_accepted, a.ratio,
-                                                                a.state_kv, a.state_score);
-    check_launch("compress_window_commit");
-}
 
 namespace {
 struct IdxWs {

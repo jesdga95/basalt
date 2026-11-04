@@ -48,11 +48,8 @@ public:
         std::string err;
         if (!m->load(req.paths.front(), err)) return {model::Status::Error, "deepseek41: " + err};
         if (!m->resolve_context(req.max_context, req.max_context_set, err)) return {model::Status::Error, err};
-        m->set_diag(req.diag_fixture, req.diag_dump);
-        m->set_diag_mmproj(req.diag_mmproj);
+        m->set_diag_dump(req.diag_dump);
         m->set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
-        m->set_diag_dspark(req.diag_dspark);
-        m->set_spec(req.spec);
         out = std::move(m);
         return {};
     }
