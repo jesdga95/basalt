@@ -5,6 +5,7 @@
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/models/qwen4exp/kernels/cpu_geometry.hpp"
 #include "basalt/models/qwen4exp/decode/layer.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/models/qwen4exp/prefill/gemm.hpp"

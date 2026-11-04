@@ -62,7 +62,7 @@ int run() {
         }
         require((bool) out, "could not write the synthetic experts");
     }
-    require(basalt::kernels::cpu::expert_layout_load_text(text.str(), layers, experts, err), err);
+    require(basalt::kernels::cpu::expert_layout_load_text(text.str(), layers, experts, err, 2560, 640), err);
 
     FileExpertSource src;
     require(src.open(FileRange((dir.path / "experts.bin").string()), layers, experts, err), err);

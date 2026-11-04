@@ -17,6 +17,7 @@
 #include "basalt/core/hit_hook.hpp"
 #include "basalt/models/qwen4exp/decode/layer.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/models/qwen4exp/kernels/cpu_geometry.hpp"
 
 #include <cuda_runtime.h>
 

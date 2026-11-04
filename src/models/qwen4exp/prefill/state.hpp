@@ -7,6 +7,7 @@
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/models/qwen4exp/decode/layout.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/models/qwen4exp/kernels/cpu_geometry.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/models/qwen4exp/kernels/kv_stream.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
