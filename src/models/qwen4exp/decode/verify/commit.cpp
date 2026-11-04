@@ -6,7 +6,7 @@
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/models/qwen4exp/kernels/native_qsa_indexer.hpp"
 #include "basalt/kernels/pdl.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 #include <algorithm>

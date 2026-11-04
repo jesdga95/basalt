@@ -1,7 +1,7 @@
 #include "run.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/models/qwen4exp/kernels/ple.hpp"
 #include "basalt/models/qwen4exp/kernels/native_ple_postops.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"

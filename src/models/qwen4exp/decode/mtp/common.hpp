@@ -41,7 +41,7 @@
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/models/qwen4exp/kernels/shared_expert.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/models/qwen4exp/kernels/dense_tc.hpp"
 #include "basalt/kernels/pdl.hpp"
 

@@ -3,7 +3,7 @@
 // The engine must adapt to the GPU it is running on, so the plan is computed from measured free VRAM and the
 // requested context rather than configured by hand.  This tool is that computation on its own, which is what
 // makes it testable without a GPU.
-#include "basalt/plan/plan.hpp"
+#include "basalt/models/qwen4exp/plan/plan.hpp"
 
 #include <cstdio>
 #include <cstdlib>

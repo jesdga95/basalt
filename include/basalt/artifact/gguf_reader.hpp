@@ -491,7 +491,7 @@ inline uint64_t tensor_payload_bytes(const TensorInfo& t) {
 // The shards of one model (basalt::gguf_split_paths), opened together; tensors are looked up across all of them.
 // Split-key validation is a property of the
 // model rather than of one loader: a split GGUF carries the model's metadata (general.architecture and the
-// qwen4exp keys) in its FIRST shard only, and the later shards just declare split.count / split.no /
+// model keys) in its FIRST shard only, and the later shards just declare split.count / split.no /
 // split.tensors.count.  Unsloth's UD-Q4_K_XL is the extreme case: shard 1 holds the metadata and no tensor at
 // all, and output.weight, token_embd.weight and the PLE table live in shard 2.  So the architecture is checked
 // on `meta()` and a tensor is read from the shard that holds it.

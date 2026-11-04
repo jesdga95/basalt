@@ -5,7 +5,7 @@
 #include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 #include "basalt/models/qwen4exp/kernels/gr.hpp"
 #include "basalt/kernels/pdl.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
