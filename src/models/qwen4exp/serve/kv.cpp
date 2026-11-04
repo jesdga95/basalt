@@ -14,6 +14,42 @@ int64_t QfnRuntime::cache_floor_slots() {
     return std::min<int64_t>(f, xcache.full_slots());
 }
 
+// The elastic KV's ceiling: the cells all sessions can back together before the expert cache would go below its
+// floor - what they back now, plus what the free VRAM above the reserve and the cache's tail down to the floor pay
+// for (kv_fit's test; past it a request is refused).  -1 without an elastic KV.
+int64_t QfnRuntime::kv_ceiling() {
+    if (kv_floor <= 0) return -1;
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    int64_t spare = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
+    if (xcache.segmented()) {
+        const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
+        spare += gran * basalt::program::kv_cache_spare_granules(
+                            xcache.mapped_bytes(), gran, cache_floor_slots(),
+                            [&](int64_t keep) { return xcache.slots_after_shrink(keep); });
+    }
+    std::vector<basalt::core::SessionState*> sess = {&ss};
+    for (size_t b = 0; !bslot_ss.empty() && b < bslot_ss[0].size(); ++b)
+        if (bslot_ss[0][b].get() != &ss) sess.push_back(bslot_ss[0][b].get());
+    std::vector<int64_t> backed, max_cells;
+    for (const basalt::core::SessionState* s : sess) {
+        backed.push_back(basalt::core::session_kv_cells(*s));
+        max_cells.push_back(s->max_cells);
+    }
+    return basalt::program::kv_ceiling_cells(backed, max_cells, spare, [&](size_t i, int64_t cells) {
+        return (int64_t) basalt::core::session_kv_grow_bytes(*sess[i], cells);
+    });
+}
+
+// the server's copy of the ceiling, sent again whenever it moves
+void QfnRuntime::kv_ceiling_note() {
+    const int64_t n = kv_ceiling();
+    if (n < 0 || n == kv_ceiling_sent) return;
+    kv_ceiling_sent = n;
+    std::printf("INFO elastic_kv_ceiling=%lld\n", (long long) n);
+    std::fflush(stdout);
+}
+
 // The experts the decoding slots routed lately leave CUDA0's slots from `first` on, which a prompt's loan or the
 // KV is about to take: each trades places with a less-routed expert of its layer below `first` that has a RAM
 // copy (a slot keeps its layer's size; the experts from `first` on come back from RAM).  One blob copy per
@@ -319,6 +355,7 @@ bool QfnRuntime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::strin
                          "slots, in %.1f ms", (long long) basalt::core::session_kv_cells(s),
                  (double) add / 1048576.0, (long long) before, (long long) xcache.slots(),
                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+    kv_ceiling_note();
     return true;
 }
 
@@ -337,6 +374,7 @@ bool QfnRuntime::kv_release(basalt::core::SessionState& s, int64_t cells, std::s
                          "slots, in %.1f ms", (long long) had, (long long) basalt::core::session_kv_cells(s),
                  (long long) before, (long long) xcache.slots(),
                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+    kv_ceiling_note();
     return true;
 }
 

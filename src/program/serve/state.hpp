@@ -124,6 +124,7 @@ public:
     virtual void enc_command(const std::string& cmd) = 0;
     virtual size_t spill_to_disk(bool at_exit, size_t limit) = 0;
     virtual bool park_idle_engine(std::string& e) = 0;
+    virtual void kv_ceiling_note() {}   // a model with an elastic KV sends its ceiling again when it moves
     basalt::program::CommonOptions& o;
     basalt::core::ModelFile& model_file;
     std::string& err;
