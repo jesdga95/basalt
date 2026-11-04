@@ -11,6 +11,7 @@
 #include "models/deepseek41/model.hpp"
 #include "models/deepseek41/prefill_plan.hpp"
 #include "models/deepseek41/ops.hpp"
+#include "models/deepseek41/peer_tier.hpp"
 #include "models/deepseek41/tier.hpp"
 
 #include <cuda_runtime.h>
@@ -24,6 +25,8 @@ namespace basalt::models::deepseek41 {
 namespace {
 
 constexpr uint64_t kTierReserve = 6ull << 30;   // device memory left free beside the expert tier: caches and prompt workspaces
+constexpr uint64_t kModuleRoom = 1ull << 30;    // kernel modules still to load when the tier opens
+constexpr uint64_t kVisionRoom = 3ull << 29;    // the image encoder, when the pack carries one
 // One layer's GPU plan for the grouped expert kernel, uploaded with a single copy.
 struct ExpertPlan {
     unsigned long long ptr[8];
@@ -412,8 +415,14 @@ public:
             return false;
         }
         auto t = std::make_unique<ExpertTier>(m_);
+        const prefillp::Dims d = m_.prompt_dims();
+        ExpertTier::Reserve r;
         // the caches grow into the reserve beside the tier, then into the spare arena the tier gives back
-        if (!t->open(kTierReserve, err)) return false;
+        r.copies = kTierReserve;
+        r.homes = m_.context_bytes() + prefillp::workspace_bytes(d, prefillp::kMaxChunk) + prefillp::ahead_bytes(d) +
+                  prefillp::kMargin + kModuleRoom + (m_.pack().vision.bytes ? kVisionRoom : 0);
+        r.beside_homes = prefillp::workspace_bytes(d, prefillp::kShortChunk) + prefillp::kMargin + kModuleRoom;
+        if (!t->open(r, h_x_, h_rows_, err)) return false;
         tier_ = std::move(t);
         return true;
     }
@@ -464,6 +473,19 @@ public:
         if (!tier_->lookup(il, h_ids_, K, lk, err)) return false;
         tier_->fetch(il, lk, st);
 
+        // the second card's share first: its rows are the last of the two cards' to land
+        PeerTier* peer = tier_->peer();
+        if (peer) {
+            PeerTier::Share sh;
+            for (int k = 0; k < K; ++k) {
+                if (!lk.peer[k]) continue;
+                sh.blob[sh.n] = lk.peer[k];
+                sh.row[sh.n] = k;
+                ++sh.n;
+            }
+            if (!peer->launch(L, g_.clamp_exp[(size_t) il], sh, err)) return false;
+        }
+
         // the GPU's share: the experts the VRAM tier holds, one group each, writing the row of their router index
         ExpertPlan& pl = *h_plan_;
         int nh = 0;
@@ -489,6 +511,7 @@ public:
             if (!tier_->run_cpu(il, h_x_, lk, h_rows_, err)) return false;
             tier_->promote(il, lk);
         }
+        if (peer && !peer->finish(err)) return false;
         RowPtrs rp{};
         for (int k = 0; k < K; ++k)
             rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * g_.n_embd : d_rows_ + (size_t) k * g_.n_embd;

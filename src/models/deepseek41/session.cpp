@@ -121,7 +121,7 @@ public:
             std::string err;
             const int batched = r.n_tokens;
             {
-                open_prompt_path();
+                open_prompt_path(r.n_tokens);
                 if (r.n_tokens >= kLendTierTokens) {
                     std::string te;
                     if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
@@ -205,7 +205,7 @@ public:
     model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos) override {
         sync_rewind(pos);
         std::string err;
-        open_prompt_path();
+        open_prompt_path(n_rows);
         if (!ops_->ensure_positions(pos + n_rows, err)) return prompt_failed(err);
         if (!prefill_ && !make_prefill_fit(err)) {
             std::string te;
@@ -225,16 +225,7 @@ private:
     // The prompt workspaces for the largest chunk the free memory carries (a long context's caches have taken part of
     // the card). The estimate picks the first size to try, and the free memory left after the allocation confirms it.
     bool make_prefill_fit(std::string& err) {
-        prefillp::Dims d;
-        d.n_embd = g_.n_embd;
-        d.n_used = g_.n_used;
-        d.n_expert = g_.n_expert;
-        d.n_ff_exp = g_.n_ff_exp;
-        d.engram_cols = (int64_t) m_.pack().engram.hash.n_cols() * 256;
-        for (const ExpertLayer& e : m_.pack().experts) {
-            d.expert_blob_bytes = std::max<uint64_t>(d.expert_blob_bytes, e.blob_bytes);
-            d.grouped = d.grouped || e.gu_type == GGML_TYPE_IQ1_M || e.d_type == GGML_TYPE_IQ1_M;
-        }
+        const prefillp::Dims d = m_.prompt_dims();
         size_t free_b = 0, total_b = 0;
         if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
             err = "deepseek41: cannot read the free device memory";
@@ -268,16 +259,17 @@ private:
         if (ExpertTier* t = ops_->expert_tier(e)) {
             if (!t->reclaim(e)) basalt::log::warn("basalt deepseek41", "VRAM expert tier stays closed: %s", e.c_str());
             t->grow();
-            tier_grown_ = true;
         }
         return {model::Status::Error, err};
     }
 
-    void open_prompt_path() {
+    void open_prompt_path(int n_tokens) {
         std::string e;
         // the tier opens at its normal size before anything else takes the card; the workspaces size to what is left
         ExpertTier* t = ops_->expert_tier(e);
-        if (t && tier_grown_ && !prefill_) t->shrink();
+        if (!t || prefill_) return;
+        if (t->has_homes() && n_tokens <= prefillp::kShortPrompt) return;   // its workspaces fit beside the copies
+        t->shrink();
     }
     void close_prompt_path() {
         std::string e;
@@ -287,7 +279,6 @@ private:
         prefill_.reset();
         if (!t->reclaim(e)) basalt::log::warn("basalt deepseek41", "VRAM expert tier stays closed: %s", e.c_str());
         t->grow();
-        tier_grown_ = true;
     }
 
     bool fail(const std::string& s) {
@@ -562,7 +553,6 @@ private:
     cudaStream_t stream_ = nullptr;
     std::unique_ptr<LayerOps> ops_;
     std::unique_ptr<Prefill> prefill_;
-    bool tier_grown_ = false;
     std::unique_ptr<VisionEncoder> vis_;
     int vis_merge_ = 3, vis_min_pixels_ = 0;
     std::vector<void*> allocs_;
