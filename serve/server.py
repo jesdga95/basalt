@@ -120,18 +120,17 @@ def main() -> int:
         except ValueError as e:
             fail(str(e))
         mode = a.vision
-        vision_arg = False if a.mock_engine or mode == "off" else mode
+        spec = modelfile.ModelSpec(a.model, alias=a.alias, gpu=a.gpu,
+                                   vision=False if a.mock_engine or mode == "off" else mode,
+                                   engine_words=tuple(file_engine + cli_engine))
         try:
-            cfg.update({k: v for k, v in modelfile.model_config(
-                a.model, a.engine_bin, vision=vision_arg,
-                engine_words=file_engine + cli_engine).items()
-                if k not in cfg})
+            cfg.update({k: v for k, v in modelfile.model_config(spec, a.engine_bin).items() if k not in cfg})
         except (OSError, ValueError, KeyError) as e:
             fail(f"{a.model}: {e}")
         if not a.mock_engine:
             # the engine's own choice, printed once here; the engine then sees only these cards, main first
             try:
-                plan = gpu_plan(a.engine_bin, a.gpu)
+                plan = gpu_plan(a.engine_bin, spec.gpu)
             except ValueError as e:
                 fail(f"gpu: {e}")
             card = vision_card(mode)
@@ -155,7 +154,7 @@ def main() -> int:
         image_sources = image_sources_of(a.image_url_host, a.image_dir, a.image_remote_only)
     except ValueError as e:
         fail(str(e))
-    if a.alias:
+    if a.alias and not a.model:
         cfg["model_name"] = a.alias
     try:                                                # fail fast if the port is taken
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()

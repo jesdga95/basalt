@@ -283,18 +283,22 @@ def make_handler(svc: Service):
                 self._json(200, s)
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
-                    loaded = svc.loaded()
-                    model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
-                             "meta": {"n_ctx": svc.engine.max_context},
-                             "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
-                                              "output_modalities": ["text"]}}
-                    if svc.loading:
-                        model["status"] = {"value": "loading"}
-                        loaded = True
-                    elif not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
-                        model["status"] = {"value": "unloaded"}   # listed, loads on use
-                        loaded = True
-                    self._json(200, {"object": "list", "data": [model] if loaded else []})
+                    data = []
+                    for name in svc.listed_models():
+                        loaded = svc.loaded()
+                        model = {"id": name, "object": "model", "status": {"value": "loaded"},
+                                 "meta": {"n_ctx": svc.engine.max_context},
+                                 "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
+                                                  "output_modalities": ["text"]}}
+                        if svc.loading:
+                            model["status"] = {"value": "loading"}
+                            loaded = True
+                        elif not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
+                            model["status"] = {"value": "unloaded"}   # listed, loads on use
+                            loaded = True
+                        if loaded:
+                            data.append(model)
+                    self._json(200, {"object": "list", "data": data})
             elif path == "/props":
                 if self._authorized():
                     self._props()
