@@ -156,7 +156,8 @@ void act_quant_any(const float* x, int n, ActQ& a) {
 }
 
 
-bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err) {
+bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err,
+                             int64_t n_embd, int64_t n_ff, float swiglu_limit) {
     ExpertLayout L;
     L.n_layers = n_layers;
     L.n_expert = n_expert;
@@ -201,7 +202,7 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
             return false;
         }
         NativeFmt f;
-        if (!native_fmt((int) gt, (int) dt, H, FF, f, err)) return false;
+        if (!native_fmt((int) gt, (int) dt, n_embd, n_ff, f, err, swiglu_limit)) return false;
         if (f.bytes != blob) {
             err = "expert layout: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);

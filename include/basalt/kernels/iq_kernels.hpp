@@ -1,4 +1,4 @@
-// include/basalt/kernels/iq_kernels.hpp - the i-quant formats (IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
+// include/basalt/kernels/iq_kernels.hpp - the i-quant formats (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
 // IQ4_NL) and Q2_0 on the GPU for the IQ2_XS / IQ3_XXS model files, and Q4_K / Q5_K / Q5_1 / Q8_0 for Unsloth's
 // UD-Q4_K_XL (gate/up Q4_K or Q5_K, down Q5_1 or Q8_0, a Q8_0 embedding).
 //
@@ -47,8 +47,11 @@ struct NativeExpertLayout {
     size_t gu_row = 0, d_row = 0;       // bytes per row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob (NVFP4: with its 16-byte FP32 scale tail)
+    float swiglu_limit = 0.0f;          // > 0: native_expert_grouped limits the SwiGLU (gate capped, up clamped to +-limit)
 };
-NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
+/// `swiglu_limit` (DeepSeek's experts) rides in the layout, so every caller of `native_expert_grouped` (the VRAM cache,
+/// the peer card, the remote tier) applies it without a signature change.
+NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, float swiglu_limit = 0.0f);
 /// Whether `native_expert_grouped` has kernels for this gate/up and down type pair at these dimensions, and the
 /// prompt path's dequantizer takes both (checked for every layer at startup, before anything is allocated).
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept;
@@ -66,6 +69,18 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups = 0);
+/// native_expert_grouped with the SwiGLU limited: gate capped above at `swiglu_limit`, up clamped to
+/// [-swiglu_limit, swiglu_limit] before the product (DeepSeek's experts).  Everything else is the same launches.
+void native_expert_grouped_clamped(const NativeExpertLayout& L, float swiglu_limit, const unsigned long long* grp_ptr,
+                                   const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                                   const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
+                                   void* scratch, float* out, void* stream, int64_t grid_groups = 0);
+/// A dense gated MLP with the limited SwiGLU (a shared expert): `blob` (device) is [gate rows | up rows | down rows] as a
+/// native expert's, `n_tok` (<= cap_tok) q8_1 rows go through it, row t of `out` (n_embd floats) is token t's output.
+/// `scratch`: gated_mlp_scratch_bytes(cap_tok, n_ff), caller-owned (nothing is allocated, so it can be captured).
+size_t gated_mlp_scratch_bytes(int64_t cap_tok, int64_t n_ff);
+void gated_mlp_clamped(const NativeExpertLayout& L, float swiglu_limit, const void* blob, int n_tok, int64_t cap_tok,
+                       const void* x_q8_1, void* scratch, float* out, void* stream);
 /// true: `native_expert_grouped`'s launches before the group stride (GROUPED_V1=1 at startup) - a block row
 /// per possible group, SwiGLU and the q8_1 quantization as two kernels over all cap_entries, and gate/up on the dp4a
 /// kernels even with GU_MMA=1.  Bitwise the same results (native_grouped_parity checks it); kept for A/B
