@@ -1,4 +1,4 @@
-// src/kernels/cuda/kv_stream.cu - see include/basalt/kernels/kv_stream.hpp.
+// src/models/qwen4exp/kernels/kv_stream.cu - see include/basalt/kernels/kv_stream.hpp.
 #include "basalt/kernels/kv_stream.hpp"
 #include "basalt/kernels/kv_q4.hpp"
 #include "basalt/kernels/kv_q8.hpp"

@@ -1,4 +1,4 @@
-// src/kernels/cuda/rope.cu - NEOX partial RoPE.
+// src/models/qwen4exp/kernels/rope.cu - NEOX partial RoPE.
 //
 // Semantics from the Python reference (`rope_freqs` + `rope_neox`), validated against the oracle:
 //

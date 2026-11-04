@@ -1,4 +1,4 @@
-// src/kernels/cuda/kv_q8.cu - see include/basalt/kernels/kv_q8.hpp.
+// src/models/qwen4exp/kernels/kv_q8.cu - see include/basalt/kernels/kv_q8.hpp.
 #include "basalt/kernels/kv_q8.hpp"
 #include "basalt/kernels/f16_bits.hpp"
 
