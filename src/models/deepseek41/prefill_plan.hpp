@@ -37,7 +37,7 @@ inline uint64_t per_token_bytes(const Dims& d) {
 inline uint64_t fixed_bytes(const Dims& d) {
     const uint64_t R = (uint64_t) kStageRows;
     const uint64_t q8 = (uint64_t) d.n_embd * R * 36 / 32 + (uint64_t) d.n_ff_exp * R * 36 / 32;
-    const uint64_t grouped = d.grouped ? R * (uint64_t) d.n_ff_exp * 14 + kStageExperts * 8 + 4 : 0;
+    const uint64_t grouped = d.grouped ? R * (uint64_t) d.n_ff_exp * 2 + kStageExperts * 8 + 4 : 0;   // beside gate/up and h
     return q8 + grouped + R * (uint64_t) d.n_ff_exp * 12 + R * 4 + 2 * (d.expert_blob_bytes * kStageExperts + R * 8);
 }
 

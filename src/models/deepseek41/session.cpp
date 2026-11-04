@@ -257,7 +257,10 @@ private:
         for (int cap = fit.chunk; cap >= prefillp::kMinChunk; cap /= 2) {
             std::string e;
             prefill_ = make_prefill(m_, *ops_, stream_, cap, e);
-            if (prefill_ && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= prefillp::kMargin) return true;
+            if (prefill_ && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= prefillp::kMargin) {
+                cudaGetLastError();   // a larger size that did not fit left its error behind
+                return true;
+            }
             prefill_.reset();
             if (!e.empty()) err = e;
         }
