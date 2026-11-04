@@ -15,7 +15,7 @@ slots taking each slot in turn, `VRAM`, `SLEEP`, `WAKE`, `INFO`, `PT` and `GENT`
 
 ## Benchmarks
 
-Fixtures hold token ids, so each model has its own: `basalt-bench --fixtures data/bench/<arch>`. `--quality` needs a BF16 reference; a model without one refuses its flags.
+Fixtures hold token ids, so each model has its own in `data/bench/<arch>`; bench and probe pick that folder when it exists. `--quality` needs a BF16 reference; a model without one refuses its flags.
 
 ## Flags
 
@@ -27,6 +27,19 @@ own tokens, which the adapter names.
 
 Report the load through `core::LoadProgress`: the total, a plan per target, then each phase. The server's bars and the
 `/health` percent read those lines. Auto-picked settings go on one `auto flags:` stdout line.
+
+The RAM tier goes through `core/ram_load`: give it a layout (`ram_arena_runs`, `ram_layer_runs` or your own runs) and it does
+the unbuffered reads, the bar and the pin with its fall-backs. Lookup stays yours.
+
+## Probe
+
+`ModelSession::probe_env` names the CPU pool, the RAM blobs, the expert formats and, with a second card, a `ProbePeerPath`
+timing your own peer launch. The probe asks the engine which tuning flags the model takes and runs only those tests.
+
+## Conversations
+
+`save_cells` and `restore_cells` hand positional state as `core::ConversationKv` entries, a row being `page_size` positions.
+The RAM and disk tiers then work with no more code. A restore gets what a cut at any position left.
 
 ## A model with its own fast path
 
