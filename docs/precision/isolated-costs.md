@@ -129,9 +129,9 @@ Every rounding below the checkpoint's precision on the decode path, and where th
 | fast-math kernel files | approximate division and square root, flush to zero | CMakeLists.txt (`--use_fast_math` list) | yes | lossless |
 | approximate intrinsics in SwiGLU, sigmoid gates, softmax, norms | `__expf`, `__fdividef`, `rsqrtf`, `ex2.approx`, `rcp.approx` | hc_fused.cu, qsa_dec_attn.cu, dec_gdn_rec.cu, shared_expert.cu, iq_kernels.cu, sampler.cu and others | yes | lossless (with fast math) |
 | reduction order (dense_tc, fused kernels, CPU tier) | fp32 sums in another order | dense_tc.cu, mid_chain.cu, pool.cpp | yes | lossless |
-| prompt path | fp16 GEMMs, BF16 hc and router inputs, int8 MMQ experts, fp16-MMA attention, BF16/TF32 chunked GDN | src/prefill | yes, through the prompt's KV and state | lossless |
+| prompt path | fp16 GEMMs, BF16 hc and router inputs, int8 MMQ experts, fp16-MMA attention, BF16/TF32 chunked GDN | src/models/qwen4exp/prefill | yes, through the prompt's KV and state | lossless |
 | two-stage Q8_0 head | six-bit screen with a proven bound | q80_vhead.cu | none | by proof |
-| drafter | Q8_0/Q2_0 weights, fp16 draft attention, 2-bit head screen | src/core/mtp | none | by construction |
+| drafter | Q8_0/Q2_0 weights, fp16 draft attention, 2-bit head screen | src/models/qwen4exp/decode/mtp | none | by construction |
 | GDN mixer split | split-K over two cards | dec_moe.cuh | yes, only with a peer faster than the main card | [gdn-split.md](gdn-split.md); off with the test cards (the peer is slower) |
 
 ³ The head kernels (bit planes, two-stage screen, draft head rows) and the embedding gather read Q8_0; a BF16 head or
