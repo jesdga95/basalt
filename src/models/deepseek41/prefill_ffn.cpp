@@ -69,11 +69,8 @@ public:
         namespace mmq = basalt::prefill::mmq;
         // the products step from expert to expert in whole blocks of the layer's two formats
         uint64_t slot = 0;
-        bool any_grouped = false;
         for (const ExpertLayer& e : m_.pack().experts) {
-            if (grouped_layer(e)) {
-                any_grouped = true;
-            } else if (!mmq::fits(e.gu_type, 2 * g_.n_ff_exp) || !mmq::fits(e.d_type, g_.n_embd)) {
+            if (!mmq::fits(e.gu_type, 2 * g_.n_ff_exp) || !mmq::fits(e.d_type, g_.n_embd)) {
                 err = "deepseek41: the prompt MMQ path does not cover an expert format of this pack";
                 return false;
             }
@@ -85,15 +82,7 @@ public:
         // the largest q8 buffer either product reads
         bool ok = dev(xq1_, mmq::q8_bytes((int64_t) R, g_.n_embd)) &&
                   dev(xq2_, mmq::q8_bytes((int64_t) R, g_.n_ff_exp));
-        if (any_grouped) {
-            // the grouped kernels' scratch is gate, up, h, hq in a row: the products' gate/up and h buffers live in it
-            const size_t fa = (R * ff * 4 + 255) & ~(size_t) 255;
-            ok = ok && dev(gscratch_, kernels::native_expert_scratch_bytes(R, ff));
-            gu_ = (float*) gscratch_;
-            h_ = (float*) (gscratch_ + 2 * fa);
-        } else {
-            ok = ok && dev(gu_, R * 2 * ff * 4) && dev(h_, R * ff * 4);
-        }
+        ok = ok && dev(gu_, R * 2 * ff * 4) && dev(h_, R * ff * 4);
         ok = ok && dev(ident_, R * 4) && dev(rows_, E * n * 4) && dev(sbnd_, 8 * 4);
         for (Stage& b : stage_)
             ok = ok && dev(b.blobs, slot_ * kStageExperts) && dev(b.tok, R * 4) && dev(b.pair, R * 4) &&
@@ -101,8 +90,6 @@ public:
                  cudaHostAlloc((void**) &b.host, slot_ * kStageExperts, cudaHostAllocPortable) == cudaSuccess &&
                  cudaEventCreateWithFlags(&b.copied, cudaEventDisableTiming) == cudaSuccess &&
                  cudaEventCreateWithFlags(&b.done, cudaEventDisableTiming) == cudaSuccess;
-        if (any_grouped)
-            ok = ok && dev(gq_, kernels::native_q8_1_bytes(g_.n_embd, 1) * (size_t) cap_) && dev(gptr_, kStageExperts * 8) && dev(gcount_, 4);
         ok = ok && cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) == cudaSuccess;
         if (!ok) {
             err = "out of memory for the prefill expert buffers";
@@ -111,20 +98,6 @@ public:
         mmq::iota(ident_, (int64_t) R, nullptr);
         cudaDeviceSynchronize();
         return true;
-    }
-
-    // A layer with an IQ1_M side has no MMQ product: it takes the grouped decode kernels, exact to decode's numerics.
-    static bool grouped_layer(const ExpertLayer&) { return false; }
-
-    // `n` staged experts `stride` bytes apart, their rows bounded by `bounds`, on the tokens of `gq_`.
-    void grouped_launch(const kernels::NativeExpertLayout& L, float limit, const uint8_t* blobs, size_t stride, int n,
-                        const int32_t* bounds, const int32_t* tok, const int32_t* pair, int64_t rows, cudaStream_t st) {
-        unsigned long long ptr[kStageExperts];
-        for (int i = 0; i < n; ++i) ptr[i] = (unsigned long long) (blobs + stride * (size_t) i);
-        cudaMemcpyAsync(gptr_, ptr, (size_t) n * 8, cudaMemcpyHostToDevice, st);
-        const int32_t count = n;
-        cudaMemcpyAsync(gcount_, &count, 4, cudaMemcpyHostToDevice, st);
-        kernels::native_expert_grouped_clamped(L, limit, gptr_, bounds, gcount_, pair, tok, n, rows, gq_, gscratch_, rows_, st);
     }
 
     bool routed(int il, int T, const float* x, const int32_t* ids, const float* w, float* out, void* stream,
@@ -148,10 +121,6 @@ public:
             stop_prefetch();
             ahead_ = false;
             if (tier_ && (int64_t) T * K >= kPrefetchPairs) ahead_ = start_ahead();
-        }
-        if (grouped_layer(el)) {
-            cudaGetLastError();   // a workspace size that did not fit left its error behind
-            kernels::quantize_q8_1_rows(x, T, g_.n_embd, gq_, st);
         }
         if (ahead_) return routed_ahead(il, T, x, ids, w, out, st, err);
         std::vector<int32_t> hid((size_t) T * K);
@@ -245,12 +214,6 @@ public:
             cudaMemcpyAsync(B.bounds, bounds.data(), bounds.size() * 4, cudaMemcpyHostToDevice, st);
             cudaStreamWaitEvent(st, B.copied, 0);
 
-            if (grouped_layer(el)) {
-                grouped_launch(L, g_.clamp_exp[(size_t) il], B.blobs, stride_of(el), nb, B.bounds, B.tok, B.pair, rows, st);
-                cudaEventRecord(B.done, st);
-                b0 += (size_t) nb;
-                continue;
-            }
             mmq::quantize(x, B.tok, xq1_, el.gu_type, g_.n_embd, g_.n_embd, rows, stream);
             mmq::Product p;
             p.w = B.blobs;
@@ -482,11 +445,6 @@ private:
                     const int32_t* tk = tok_all_ + start[(size_t) q0];
                     const int32_t* pr = pair_all_ + start[(size_t) q0];
                     uint8_t* blobs = D.blobs + stride_of(el) * (size_t) (q0 - e0);
-                    if (grouped_layer(el)) {
-                        grouped_launch(L, g_.clamp_exp[(size_t) il], blobs, stride_of(el), q1 - q0, bnd_, tk, pr, rows, st);
-                        q0 = q1;
-                        continue;
-                    }
                     mmq::quantize(x, tk, xq1_, el.gu_type, g_.n_embd, g_.n_embd, rows, st);
                     mmq::Product p;
                     p.w = blobs;
@@ -652,10 +610,6 @@ private:
     int32_t *ident_ = nullptr, *sbnd_ = nullptr;
     float *gu_ = nullptr, *h_ = nullptr, *rows_ = nullptr;
     basalt::prefill::mmq::Context ctx_;
-    uint8_t* gq_ = nullptr;           // the chunk's tokens as q8_1, for a grouped layer
-    uint8_t* gscratch_ = nullptr;
-    unsigned long long* gptr_ = nullptr;
-    int32_t* gcount_ = nullptr;
 };
 
 }  // namespace
