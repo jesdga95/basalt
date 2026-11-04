@@ -1,0 +1,109 @@
+// src/program/serve/request_base.hpp - one request's state and the phases every model shares.
+#pragma once
+
+#include "state.hpp"
+
+namespace basalt::program::serve {
+
+class Request {
+public:
+    explicit Request(Runtime& runtime) : runtime_(runtime) {}
+    virtual ~Request() = default;
+    Flow execute();
+
+protected:
+    Runtime& runtime_;
+    using BSlot = Runtime::BSlot;
+    using SlotHeld = Runtime::SlotHeld;
+    bool geni{};
+    char* endp{};
+    long long max_new{};
+    float req_temperature{};
+    float req_top_p{};
+    int req_top_k{};
+    unsigned long long req_seed{};
+    bool req_seed_given{};
+    float req_min_p{};
+    float req_penalty_repeat{};
+    float req_penalty_freq{};
+    float req_penalty_present{};
+    int req_penalty_last_n{};
+    std::string req_bias_text{};   // logit_bias=id:value,...: added to the verifier's logits (see ver.set_logit_bias)
+    bool req_bias_present{};
+    int64_t req_gprompt{};
+    std::string req_grammar_text{};   // grammar=<compact ASCII JSON, spaces as \u0020>: the request's grammar (--grammar on)
+    int req_cvec{};
+    float req_relax{};
+    int req_ppl{};
+    int req_ppl_t{};
+    int req_clip{};
+    std::vector<float> req_bias{};
+    std::string emb_path{};
+    std::vector<int64_t> ids{};
+    std::string pe{};
+    bool ids_ok{};
+    bool from_text{};
+    int64_t n{};
+    std::unique_ptr<basalt::program::grammar::Guard> gguard{};
+    std::vector<float> grammar_bias{};
+    int64_t grammar_resamples{};
+    basalt::program::PplGate* ppl{};
+    bool bad{};
+    std::vector<int32_t> ids32{};
+    Clock::time_point r0{};
+    bool want_cvec{};
+    int slot_b{};
+    bool in_slot{};
+    bool solo_req{};
+    using SoloBook = Runtime::SoloBook;
+    SoloBook solo_book{};
+    bool solo_moved{};
+    bool own_partial{};
+    bool own_partial_from0{};
+    int64_t own_partial_chunk{};
+    int64_t resume{};
+    bool from_live{};
+    int slot_source{};
+    int64_t slot_tokens{};
+    bool resumed_from0{};
+    int64_t resumed_chunk{};
+    const ConvCheckpoint* slot_ck{};
+    int own_slot{};
+    basalt::core::ConversationCache::Match parked{};
+    std::optional<basalt::core::SavedConversation> incoming{};
+    int64_t in_tokens{};
+    bool in_live{};
+    basalt::core::ConversationStore::Match on_disk{};
+    bool from_disk{};
+    Clock::time_point restore_t0{};
+    int64_t read_from{};
+
+    bool starts_with(const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs);
+    Flow restore();
+    virtual Flow parse() = 0;
+    virtual Flow prepare_image() = 0;
+    virtual Flow read_prompt() = 0;
+    virtual Flow decode() = 0;
+    virtual Flow complete() = 0;
+    // ---- restoring a conversation: what it does to the model's sessions.  Per request.
+    virtual bool cvec_wanted() const { return true; }
+    virtual void set_cvec() {}
+    virtual void select_view() {}
+    virtual bool slot_draft_in(int) { return true; }
+    virtual void drop_stale_reuse() {}
+    virtual bool release_room() = 0;
+    virtual bool checkpoint_mount(const ConvCheckpoint& c) = 0;
+    virtual bool restore_begin() { return true; }
+    virtual void slot_draft_out() {}
+    virtual Flow slot_bind() { return Flow::proceed; }
+    virtual void validate_incoming() {}
+    virtual Flow make_room() { return Flow::proceed; }
+    virtual Flow restore_image() { return Flow::proceed; }
+    virtual void adopt_checkpoints() {}
+    virtual void retain_image() {}
+    virtual bool session_reset() { return true; }
+    virtual void draft_begin() {}
+    virtual void prompt_parts_reset() {}
+};
+
+}  // namespace basalt::program::serve

@@ -1,81 +1,18 @@
 // src/program/serve/request.hpp - one request's state and execution phases.
 #pragma once
 
-#include "state.hpp"
+#include "request_base.hpp"
 
 namespace basalt::program::serve {
 
-class QfnRequest {
+class QfnRequest final : public Request {
 public:
-    explicit QfnRequest(QfnRuntime& runtime) : runtime_(runtime) {}
-    Flow execute();
+    explicit QfnRequest(QfnRuntime& runtime) : Request(runtime), runtime_(runtime) {}
 
 private:
     QfnRuntime& runtime_;
     using PfPart = QfnRuntime::PfPart;
-    using BSlot = Runtime::BSlot;
-    using SlotHeld = Runtime::SlotHeld;
-    bool geni{};
-    char* endp{};
-    long long max_new{};
-    float req_temperature{};
-    float req_top_p{};
-    int req_top_k{};
-    unsigned long long req_seed{};
-    bool req_seed_given{};
-    float req_min_p{};
-    float req_penalty_repeat{};
-    float req_penalty_freq{};
-    float req_penalty_present{};
-    int req_penalty_last_n{};
-    std::string req_bias_text{};   // logit_bias=id:value,...: added to the verifier's logits (see ver.set_logit_bias)
-    bool req_bias_present{};
-    int64_t req_gprompt{};
-    std::string req_grammar_text{};   // grammar=<compact ASCII JSON, spaces as \u0020>: the request's grammar (--grammar on)
-    int req_cvec{};
-    float req_relax{};
-    int req_ppl{};
-    int req_ppl_t{};
-    int req_clip{};
-    std::vector<float> req_bias{};
-    std::string emb_path{};
-    std::vector<int64_t> ids{};
-    std::string pe{};
-    bool ids_ok{};
-    bool from_text{};
-    int64_t n{};
-    std::unique_ptr<basalt::program::grammar::Guard> gguard{};
-    std::vector<float> grammar_bias{};
-    int64_t grammar_resamples{};
-    basalt::program::PplGate* ppl{};
-    bool bad{};
-    std::vector<int32_t> ids32{};
-    Clock::time_point r0{};
-    bool want_cvec{};
-    int slot_b{};
-    bool in_slot{};
-    bool solo_req{};
     basalt::core::SessionState* rview{};
-    using SoloBook = Runtime::SoloBook;
-    SoloBook solo_book{};
-    bool solo_moved{};
-    bool own_partial{};
-    bool own_partial_from0{};
-    int64_t own_partial_chunk{};
-    int64_t resume{};
-    bool from_live{};
-    int slot_source{};
-    int64_t slot_tokens{};
-    bool resumed_from0{};
-    int64_t resumed_chunk{};
-    const ConvCheckpoint* slot_ck{};
-    int own_slot{};
-    basalt::core::ConversationCache::Match parked{};
-    std::optional<basalt::core::SavedConversation> incoming{};
-    int64_t in_tokens{};
-    bool in_live{};
-    basalt::core::ConversationStore::Match on_disk{};
-    bool from_disk{};
     int64_t kv_need{};
     struct KeepRouted {   // only this admission's fits, while slots decode
                 bool& on;
@@ -84,8 +21,6 @@ private:
     std::optional<KeepRouted> keep_routed;
     std::optional<KeepRouted> defer_peer;
     bool kv_ok{};
-    Clock::time_point restore_t0{};
-    int64_t read_from{};
     // `copied`: the copies already ran (and were waited for) on the overlapped read's thread, so only the table is left
     bool ov_copied{};
     // --batch: a prompt read while slots are decoding goes one prompt chunk at a time (the same chunks as one
@@ -182,8 +117,6 @@ private:
     bool ram_out{};
     // "12288 of 98179" when cancelled mid-read, the rate from what was read
     char read_txt[64]{};
-
-    bool starts_with(const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs);
     bool windows_ok(int64_t a, int64_t b);
     bool read_windows(int64_t a, int64_t b, std::string& e);
     bool refill_issue(PfPart& p, std::string& e, bool assign = true);
@@ -197,12 +130,29 @@ private:
     bool read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool& ran, std::string& e);
     bool read_part(int64_t a0, int64_t b0, std::string& e);
     DecSnap dec_snap();
-    Flow parse();
-    Flow prepare_image();
-    Flow restore();
-    Flow read_prompt();
-    Flow decode();
-    Flow complete();
+    Flow parse() override;
+    Flow prepare_image() override;
+    Flow read_prompt() override;
+    Flow decode() override;
+    Flow complete() override;
+    bool cvec_wanted() const override;
+    void set_cvec() override;
+    void select_view() override;
+    bool slot_draft_in(int slot) override;
+    void drop_stale_reuse() override;
+    bool release_room() override;
+    bool checkpoint_mount(const ConvCheckpoint& c) override;
+    bool restore_begin() override;
+    void slot_draft_out() override;
+    Flow slot_bind() override;
+    void validate_incoming() override;
+    Flow make_room() override;
+    Flow restore_image() override;
+    void adopt_checkpoints() override;
+    void retain_image() override;
+    bool session_reset() override;
+    void draft_begin() override;
+    void prompt_parts_reset() override;
 };
 
 }  // namespace basalt::program::serve
