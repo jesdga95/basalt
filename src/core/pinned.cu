@@ -48,8 +48,7 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, un
 }
 
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
-                         uint64_t max_pinned_bytes, const std::string& shared_file,
-                         uint64_t shared_hash) : capacity(bytes) {
+                         const std::string& shared_file, uint64_t shared_hash) : capacity(bytes) {
     if (bytes == 0) return;
     basalt::platform::RegionBacking region_backing = basalt::platform::RegionBacking::NormalPages;
     base = basalt::platform::alloc_region(bytes, region_backing, note, shared_file, shared_hash, mapping_base,
@@ -60,31 +59,26 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
     // that has already been faulted in page by page is far more expensive to register and may fail outright.
     if (base) {
-        uint64_t cap = max_pinned_bytes;
-        const std::string cap_why = "by the engine (remote experts)";
-        const bool capped = cap > 0 && cap < bytes && bounds.size() >= 2;
-        const cudaError_t e = capped ? cudaSuccess :
+        const cudaError_t e =
             cudaHostRegister(base, (size_t) bytes, cudaHostRegisterPortable | cudaHostRegisterMapped);
-        if (!capped && e == cudaSuccess) {
+        if (e == cudaSuccess) {
             note = "cudaHostRegister PORTABLE ok; " + note;
             registered_bytes = bytes;
-        } else if (bounds.size() >= 2 && (capped || clear_error())) {
+        } else if (bounds.size() >= 2 && clear_error()) {
             // the whole range is refused, so pin it slice by slice from the start.  The rest stays resident through the
             // working-set lock below.  (Slices may differ in size, one per layer.)
             slice_bytes = 1;   // sliced; the uniform constructor records the size
-            bool limited = capped;
-            uint64_t limit = cap;
+            bool limited = false;
+            uint64_t limit = 0;
             std::string limit_why;
             // Stop below the shared-memory budget rather than at the driver's refusal, and only when the budget is
             // actually smaller than the arena: an arena the segment can hold is pinned whole, as before.
-            if (!capped) {
-                uint64_t seg = 0;
-                std::string seg_why;
-                if (basalt::platform::pin_budget(seg, seg_why) && seg < bytes) {
-                    limited = true;
-                    limit = seg;
-                    limit_why = std::move(seg_why);
-                }
+            uint64_t seg = 0;
+            std::string seg_why;
+            if (basalt::platform::pin_budget(seg, seg_why) && seg < bytes) {
+                limited = true;
+                limit = seg;
+                limit_why = std::move(seg_why);
             }
             for (size_t i = 0; i + 1 < bounds.size(); ++i) {
                 const uint64_t off = bounds[i], n = bounds[i + 1] - bounds[i];
@@ -99,10 +93,8 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             }
             char gib[32];
             std::snprintf(gib, sizeof gib, "%.1f", (double) limit / (double) (1ull << 30));
-            note = (capped ? "cudaHostRegister limited to " + std::to_string(cap >> 30) + " GiB " + cap_why + "; " :
-                             "cudaHostRegister of the whole arena FAILED (" + std::string(cudaGetErrorString(e)) + "); " +
-                             (limited ? "slices capped at " + std::string(gib) + " GiB (" + limit_why +
-                                        "); " : std::string())) +
+            note = "cudaHostRegister of the whole arena FAILED (" + std::string(cudaGetErrorString(e)) + "); " +
+                   (limited ? "slices capped at " + std::string(gib) + " GiB (" + limit_why + "); " : std::string()) +
                    std::to_string(registered_slices) + " slices pinned (" + std::to_string(registered_bytes >> 30) +
                    " GiB); " + note;
             if (registered_bytes < bytes) {

@@ -4,6 +4,7 @@
 // ggml/src/ggml-cuda/vecdotq.cuh.  Copyright (c) 2023-2026 The ggml authors.  MIT licence: see THIRD_PARTY_LICENSES.
 #pragma once
 
+#include "basalt/kernels/packed_byte.hpp"
 #include "mmq_common.cuh"
 
 #include <cstdint>
@@ -15,12 +16,6 @@ static __device__ __forceinline__ int get_int_b2(const void * x, const int & i32
     x32     |= x16[2*i32 + 1] << 16;
 
     return x32;
-}
-
-// Byte `index` of a packed word by shift: the reads below take bytes out of register values, not through a pointer.
-static __device__ __forceinline__ uint32_t packed_byte(uint32_t word, int index) { return (word >> (8 * index)) & 0xffu; }
-static __device__ __forceinline__ uint32_t packed_byte(int2 words, int index) {
-    return packed_byte(index < 4 ? (uint32_t) words.x : (uint32_t) words.y, index & 3);
 }
 
 static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32) {

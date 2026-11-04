@@ -25,12 +25,13 @@ behind one declaration, and a test in `tests/platform/` that runs on both.
 | seam | header | wraps |
 | --- | --- | --- |
 | file I/O | `file.hpp` | UTF-8 paths, open, positional reads, unbuffered descriptors |
+| unbuffered reads | `direct_file.hpp` | asynchronous unbuffered file reads (the n-gram table) |
 | file views | `mapped_file.hpp` | mapped files, prefetch and release hints, locking |
 | memory | `memory.hpp` | RAM probes, page locking, aligned and huge-page allocation |
 | CPU | `cpu.hpp` | topology |
 | processes | `process.hpp` | spawn, wait, terminate, pipes, signals |
 | system | `system.hpp`, `dynlib.hpp` | process memory, disk queries, full speed in the background, the NVML loader |
-| compiler | `compiler.hpp` | CPUID, bit scan, spin hint, fp16 rounding |
+| compiler | `compiler.hpp`, `format_check.hpp` | CPUID, bit scan, spin hint, fp16 rounding, printf-format checking |
 | Win32 | `win.hpp` | the only inclusion of `windows.h` |
 
 Programs that take paths carry a manifest (`src/platform/basalt.exe.manifest`) that makes the

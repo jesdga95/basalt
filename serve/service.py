@@ -17,7 +17,8 @@ from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
 from serve.prompt import CTX_SLACK, PromptText, overflow_error, room_error
 from serve.util.text import Detokenizer, IM_END, StopMatcher, control_literals, stop_strings
-from serve.engine.vision import Vision
+from serve.engine.image_source import ImageRefused, ImageSources
+from serve.engine.vision import IMAGE_WAITING_BYTES, Vision
 from serve.api.grammar import grammar_spec, unenforced
 from serve.config import GRAMMAR_DEFAULT
 
@@ -91,6 +92,9 @@ class Service:
         self.stopping = threading.Event()               # set at shutdown: nothing starts the engine again
         self.embeddings = threading.local()           # this request's image embeddings file
         self.api_key = ""                              # when set, /v1/* requires it
+        self.image_sources = ImageSources()             # --image-url-host and --image-dir; remote, as is any default
+        self.images_lock = threading.Lock()
+        self.images_waiting = 0                         # bytes of read images waiting for their turn to encode
         # put a non-default reasoning effort in a system turn before the answer so the cached prefix survives
         self.effort_end = False
         self.logs = LogBuffer()                         # server and engine output
@@ -713,13 +717,14 @@ class Service:
             return self.tok.encode(prompt, parse_special=True)
         return self.tok.encode(prompt, parse_special=True, plain=plain)
 
-    def prepare(self, messages, tools, kwargs, max_new=None, force=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, force=None, image_access=None):
         """Return (ids, thinking, max_new); an unset or non-positive max_new means the rest of the context.
         `force` (frontend.forced_call): the opening of the call the reply must make.  Without thinking it ends the
-        prompt; with thinking, run() writes it once the thinking is over."""
+        prompt; with thinking, run() writes it once the thinking is over.  `image_access`: what this request's
+        connection may name as an image; without one, the remote policy."""
         self.embeddings.path = None
         try:
-            return self._prepare(messages, tools, kwargs, max_new, force)
+            return self._prepare(messages, tools, kwargs, max_new, force, image_access or self.image_sources)
         except BaseException:
             if self.embeddings.path:
                 Path(self.embeddings.path).unlink(missing_ok=True)
@@ -745,7 +750,7 @@ class Service:
         prompt.max_new = max_new
         return prompt, kwargs.get("enable_thinking", True) is not False, max_new
 
-    def _prepare(self, messages, tools, kwargs, max_new, force):
+    def _prepare(self, messages, tools, kwargs, max_new, force, image_access):
         if getattr(self.engine, "takes_text", False) and not images_of(messages) and not getattr(self.engine, "batch", 0):
             return self._prepare_text(messages, tools, kwargs, max_new, force)
         ids = self.encode_prompt(messages, tools, kwargs)
@@ -758,15 +763,32 @@ class Service:
                                  "so it cannot read images")
             pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
             start = self.tok.encode(VISION_START, parse_special=True)[0]
-            # encode under the fifo: the encoder and a running engine must not use the GPU together
-            with self.fifo:
-                if getattr(self.vision, "in_engine", False):   # the encoder lives in the engine: it must be running
-                    self.ensure_loaded()
-                try:
-                    self.embeddings.path, counts = self.vision.encode(images)
-                except ValueError as e:                 # a refused image: the client gets the 400, the log says why
-                    print(f"[server] error: {e}", flush=True)
-                    raise
+            try:                                        # before the fifo: a slow source must not hold the turn
+                images = self.vision.read(images, image_access)
+            except ImageRefused as e:
+                print(f"[server] error: {e.log_line}", flush=True)
+                raise
+            except ValueError as e:
+                print(f"[server] error: {e}", flush=True)
+                raise
+            held = sum(len(i) for i in {id(i): i for i in images}.values())
+            with self.images_lock:
+                if self.images_waiting + held > IMAGE_WAITING_BYTES:
+                    raise ModelBusy("too many images are waiting to be encoded; try again shortly")
+                self.images_waiting += held
+            try:
+                # encode under the fifo: the encoder and a running engine must not use the GPU together
+                with self.fifo:
+                    if getattr(self.vision, "in_engine", False):   # the encoder lives in the engine: it must be running
+                        self.ensure_loaded()
+                    try:
+                        self.embeddings.path, counts = self.vision.encode(images)
+                    except ValueError as e:             # a refused image: the client gets the 400, the log says why
+                        print(f"[server] error: {e}", flush=True)
+                        raise
+            finally:
+                with self.images_lock:
+                    self.images_waiting -= held
             # expand each image's pad to one per image token; a pad not after <|vision_start|> is message text
             literal = self.tok.encode(IMAGE_PAD, parse_special=False)
             out, k = [], 0

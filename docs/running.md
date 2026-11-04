@@ -29,7 +29,7 @@ share a long system prompt read it once.
 
 Every chat, messages and responses request must name the served model in `model`: the alias (or the model's name) that `/v1/models` lists, or the model file's name. An unknown or missing name is a 404 in the API's own error shape, and replies always carry the served name.
 
-With `--max-context` above 32768 the KV cache is elastic (not with `--kv-resident` or `--vram-elastic`; a peer card is
+With `--max-context` above 32768 the KV cache is elastic (not with `--kv-resident`, `--vram-elastic` or a layer split; a peer card is
 fine): each session backs its first 32768 cells at startup (the K/V pools, the indexer's block keys, the RoPE tables
 and the draft layer's K/V alike), and the rest of that VRAM holds the expert cache's last slots until a request needs
 it. A request backs its prompt plus 16384 cells before the prompt is read (and 16384 more whenever decode runs past
@@ -67,26 +67,6 @@ expert cache, the engine warns (`warning: the N batch slots' sessions ... take X
 cache short of the expert set, or at under half of what it would hold without the slots, and names the remedies: a smaller `--max-context`, no `--slot-full-context`, fewer `--parallel` slots. If a slot's session
 does not fit at all, the engine says which slot (`warning: --batch N: slot K's session does not fit`) and starts with
 the slots that did fit; if fewer than two fit, `--batch is off` and the server runs one request at a time.
-
-- `server` holds the server's options (`python -m serve.server --help`), named as the flags without the dashes:
-  strings or numbers, `true`/`false` for a switch (`lazy`, ...), a list for the repeatable ones
-  (`allowed-host`, `cors-origin`). `model` and `tokenizer` paths are relative to the file.
-- `engine` holds engine flags (`bin/basalt --help`), the same way: a string or number, `true` for a switch, `false` to
-  leave it off, a list for a flag with several values (`"control-vector-layer-range": [4, 44]`). Any flag the engine
-  accepts works, on the command line as well (`--kv int8`, `--resident-experts`). A name the engine does not accept
-  stops the server at startup, as does one in the wrong section.
-- Precedence: command line > config file > built-in defaults.
-- The API key is command line only (`--api-key`); a config file that sets it is refused.
-- `"relaxed-drafting": 0.3` (or `true` for the default 0.5; `--relaxed-drafting [P]` on the command line) trades
-  exactness for speed under sampling: a draft the model gives probability P or more is kept even when the model's own
-  draw would have been another token. Lower P is faster and further from the model's true sampling distribution; the
-  measured speed and cost per value are in [precision/features.md](precision/features.md#relaxed-drafting). Off by
-  default: without it, speculative decoding returns exactly what plain sampling would. Greedy (temperature 0) requests,
-  `logit_bias`, a request with a grammar (JSON `response_format`, tools), control tokens and everything inside a tool
-  call stay exact. A request can set its own value with `"relaxed_drafting": P` (or `false` for exact). Single-stream
-  decoding only; `--parallel` slots stay exact.
-- The startup line `[server] engine ...` lists the settings that came from the file or the command line, then the
-  grammar state; with none it says `defaults`, e.g. `grammar=off (from cli)`.
 
 ## The console log
 
@@ -226,7 +206,7 @@ Basalt refuses settings that would leave the machine without memory, and never s
   sits 1 GiB above the guard's). A running request continues; it stops with an error only when the RAM is critical:
   under 1 GiB free, or below the guard while the kernel's memory pressure (`/proc/pressure/memory`, avg10) shows tasks
   stalled most of the time (some >= 60% or full >= 40%). Without a pressure reading (Windows, or a kernel without PSI)
-  below the guard is critical. The error (`RAM low (... free < ... guard) ...: request stopped` or `RAM critical (...
+  RAM that stays below the guard for 10 s is critical; a shorter dip is not. The error (`RAM low (... free < ... guard) ...: request stopped` or `RAM critical (...
   free < ... hard floor): request stopped`, also returned to the client) names `--resident-budget-gib` only when the
   engine's own growth took the RAM, otherwise how much other programs took. While the model sleeps the guard judges no
   reading (the driver holds the GPU state in RAM until the wake); the wake takes a fresh one. Windows does not count the
@@ -238,6 +218,8 @@ Basalt refuses settings that would leave the machine without memory, and never s
 Image input is one server option, `--vision off | dynamic | cpu | <GPU number>` (config: `"vision": 1` in the
 `server` section). It is `off` by default. The encoder is Basalt's own and shares its kernels in every mode, so all
 of them give bitwise identical embeddings.
+
+What a request may name as an image depends on where it comes from: [image sources](configuration/image-sources.md).
 
 | mode | where the encoder runs | VRAM cost | fresh-image latency (IQ3_S, 400 W, earlier build) |
 | --- | --- | --- | --- |

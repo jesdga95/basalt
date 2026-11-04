@@ -52,7 +52,7 @@ roundings together (BF16 against Q8_0 dense, -0.0014, and the items below).
 Against the earlier llama.cpp Q8_0 base all off and the Q8_0-dense pack read the same (0.0624 against 0.0623): that
 base carries its own rounding, which hid the last 0.003.
 
-Speed, one cold run per row (`bench.sh` fixtures through `basalt-bench`, the default serving flags, 400 W + 180 W, or
+Speed, one cold run per row (the `basalt-bench` fixtures, the default serving flags, 400 W + 180 W, or
 the 5090 alone at 400 W). The all-off decode uses throwaway kernels (a warp-per-row fp32 matrix-vector product and the
 unfused paths), so its cost is an upper bound of what dedicated kernels would cost:
 

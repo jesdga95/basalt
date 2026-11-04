@@ -45,7 +45,7 @@ The server listens on 127.0.0.1 by default.
 
 <p align="center"><img src="docs/assets/basalt-format.png" alt="Inside a .basalt file" width="800"></p>
 
-Ready-to-run packs, with the quality of each measured against Q8_0, are on
+Ready-to-run packs, with the quality of each measured against full precision (a BF16 reference), are on
 [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt):
 `Qwen3.8-FN-NVFP4-DQ6_K`, `-NVFP4-DQ8`, `-UD-Q4_K_XL`, `-UD-Q5_K_XL`, `-UD-Q6_K_XL`, `-Q8_0`, `-GSQ-RCO-IQ3_S`, `-GSQ-RCO-IQ3_XXS` and `-GSQ-RCO-Q2_0` (each `.basalt`).
 The two NVFP4 packs share NVIDIA's NVFP4 experts; `D` names the dense projections' format: DQ6_K is the default and
