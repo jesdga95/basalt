@@ -1,5 +1,5 @@
 // src/program/serve/batch.cpp - batch operations for the persistent engine.
-#include "state.hpp"
+#include "qfn_state.hpp"
 
 namespace basalt::program::serve {
 

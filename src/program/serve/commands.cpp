@@ -21,6 +21,20 @@ struct BusyClock {
 };
 }  // namespace
 
+uint64_t fnv1a(const void* data, size_t n, uint64_t h) {
+    const uint8_t* p = (const uint8_t*) data;
+    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+std::vector<ImgKey> Runtime::imgs_below(const std::vector<ImgKey>& all, int64_t L) {
+    std::vector<ImgKey> v;
+    for (const ImgKey& k : all) if (k.start < L) v.push_back(k);
+    return v;
+}
+
+bool Runtime::batch_on() { for (const BSlot& b : bs) if (b.active) return true; return false; }
+
 Flow Runtime::dispatch() {
     if (batch_on() || windows_in_flight()) {
         if (!try_next_line(line)) {

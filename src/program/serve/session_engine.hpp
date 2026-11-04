@@ -1,7 +1,7 @@
 // src/program/serve/session_engine.hpp - serving a model that offers only a ModelSession.
 #pragma once
 
-#include "request_base.hpp"
+#include "request.hpp"
 #include "basalt/model/adapter.hpp"
 
 namespace basalt::program::serve {
