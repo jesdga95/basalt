@@ -54,6 +54,10 @@ public:
     /// again as positions arrive).
     virtual void trim_positions() {}
     /// Copies the rolling attention state (window rings, compressor partial groups) to the host, and back.
+    /// The compressed caches below `positions`, to and from the host; ensure_positions backs them first.
+    virtual size_t cache_bytes(int64_t positions) const { (void) positions; return 0; }
+    virtual void save_cache(void* stream, int64_t positions, uint8_t* host) { (void) stream; (void) positions; (void) host; }
+    virtual void restore_cache(void* stream, int64_t positions, const uint8_t* host) { (void) stream; (void) positions; (void) host; }
     virtual size_t turn_bytes() const { return 0; }
     virtual void save_turn(void* stream, uint8_t* host) { (void) stream; (void) host; }
     virtual void restore_turn(void* stream, const uint8_t* host) { (void) stream; (void) host; }

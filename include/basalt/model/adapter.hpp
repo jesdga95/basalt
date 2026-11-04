@@ -128,6 +128,12 @@ public:
     virtual size_t running_bytes() const { return 0; }
     virtual Result save_running(uint8_t* host, int64_t pos) { (void) host; (void) pos; return {Status::NotImplemented, "this model keeps no checkpoint"}; }
     virtual Result restore_running(const uint8_t* host, int64_t pos) { (void) host; (void) pos; return {Status::NotImplemented, "this model keeps no checkpoint"}; }
+    /// The positional state below `positions` as one block: what a conversation parked out of VRAM takes along.
+    virtual size_t cells_bytes(int64_t positions) const { (void) positions; return 0; }
+    virtual Result save_cells(uint8_t* host, int64_t positions) { (void) host; (void) positions; return {Status::NotImplemented, "this model cannot park a conversation"}; }
+    virtual Result restore_cells(const uint8_t* host, int64_t positions) { (void) host; (void) positions; return {Status::NotImplemented, "this model cannot park a conversation"}; }
+    /// The tokens the session holds from now on, position by position (a restored conversation's).
+    virtual Result set_history(const int32_t* tokens, int64_t n) { (void) tokens; (void) n; return {}; }
     /// An encoded picture: `n_rows` embedding rows of the model's width (the encoder's whole block). Rows with no
     /// vision support leave the default.
     virtual Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows) {

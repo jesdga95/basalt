@@ -119,6 +119,41 @@ public:
         return true;
     }
 
+    // each kv-source layer's latents and index keys, in layer order
+    template <class Fn>
+    void each_cache(int64_t positions, Fn fn) const {
+        for (int il = 0; il < g_.n_layers; ++il) {
+            if (!el_kv_[(size_t) il]) continue;
+            const uint64_t rows = (uint64_t) positions / (uint64_t) g_.compress_ratio[(size_t) il] + 1;
+            fn(el_kv_[(size_t) il]->data(), rows * ctxp::kLatentRowBytes);
+            fn(el_ik_[(size_t) il]->data(), rows * ctxp::kIndexRowBytes);
+        }
+    }
+
+    size_t cache_bytes(int64_t positions) const override {
+        size_t total = 0;
+        each_cache(positions, [&](uint8_t*, uint64_t bytes) { total += bytes; });
+        return total;
+    }
+
+    void save_cache(void* stream, int64_t positions, uint8_t* host) override {
+        cudaStreamSynchronize((cudaStream_t) stream);
+        size_t at = 0;
+        each_cache(positions, [&](uint8_t* dev, uint64_t bytes) {
+            cudaMemcpy(host + at, dev, bytes, cudaMemcpyDeviceToHost);
+            at += bytes;
+        });
+    }
+
+    void restore_cache(void* stream, int64_t positions, const uint8_t* host) override {
+        cudaStreamSynchronize((cudaStream_t) stream);
+        size_t at = 0;
+        each_cache(positions, [&](uint8_t* dev, uint64_t bytes) {
+            cudaMemcpy(dev, host + at, bytes, cudaMemcpyHostToDevice);
+            at += bytes;
+        });
+    }
+
     size_t turn_bytes() const override {
         const size_t ring_b = (size_t) kWindowSlots * kLatent * 2;
         size_t total = 0;
