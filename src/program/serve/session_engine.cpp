@@ -39,6 +39,25 @@ public:
             slot_sampling_.resize((size_t) o.batch);
         }
         conversations.emplace((size_t) o.conversation_cache_mib << 20, (size_t) o.conversation_cache_slots);
+        if (o.conversation_cache_disk_mib > 0) {
+            const auto t0 = Clock::now();
+            const std::string text = "basalt conversation state " + model_.desc().arch + " mmproj " + o.vision_mmproj;
+            const uint64_t identity = basalt::core::conversation_store_hash_file(
+                o.model, basalt::core::conversation_store_hash(text.data(), text.size(), 1));
+            std::string de;
+            if (o.prompt_cache <= 0) {
+                basalt::log::warn("basalt serve", "conversation cache on disk off: --prompt-cache 0");
+            } else if (!disk.open(o.conversation_cache_dir, identity, (uint64_t) o.conversation_cache_disk_mib << 20, de)) {
+                basalt::log::warn("basalt serve", "conversation cache on disk off: %s", de.c_str());
+            } else {
+                conversations->set_spill(true);
+                const auto st = disk.stats();
+                basalt::log::info("basalt serve", "conversation cache on disk: %s, %zu conversations of this model "
+                                  "(%.2f GiB), budget %lld MiB, indexed in %.0f ms", o.conversation_cache_dir.c_str(),
+                                  st.files, (double) st.bytes / 1073741824.0, (long long) o.conversation_cache_disk_mib,
+                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+            }
+        }
         if (o.grammar) {   // the token texts the grammar walks, read from the pack's tokenizer files
             std::vector<uint8_t> vj, tj;
             std::string gerr;
@@ -62,6 +81,7 @@ public:
                 basalt::log::error("basalt serve", "%s", r.message.c_str());
                 return 1;
             }
+        disk_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), 0, 0) + (1ull << 30);
         if (const std::string words = sessions_[0]->info_words(); !words.empty()) std::printf("INFO %s\n", words.c_str());
         std::printf("READY %lld stop\n", (long long) o.max_context);
         std::fflush(stdout);
@@ -112,31 +132,91 @@ public:
     void between_requests(const std::string&) override {}
     Flow run_request() override;
     void enc_command(const std::string& cmd) override;
-    size_t spill_to_disk(bool, size_t) override { return 0; }
+    // The conversations the engine holds go to the disk tier when no stored copy reaches them: the RAM tier's at exit,
+    // the solo session's and every idle slot's.
+    size_t spill_to_disk(bool at_exit, size_t limit) override {
+        size_t written = 0;
+        if (at_exit)
+            while (conversations->size() > 0) {
+                basalt::core::SavedConversation s = conversations->take(conversations->size() - 1);
+                if (!disk_has(s.live.ids, s.live.imgs, s.checkpoints, s.cvec) && disk.put(std::move(s), kDiskQueueCap)) ++written;
+            }
+        const uint64_t floor = std::max<uint64_t>((uint64_t) o.conversation_cache_min_free_mib << 20, disk_floor);
+        const auto spill = [&](const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const std::vector<ConvCheckpoint>& cks, bool cvec) {
+            if (at_exit) disk.flush();   // one image in RAM at a time
+            const int64_t positions = (int64_t) ids.size();
+            if (!capture_admit(session().running_bytes() + session().cells_bytes(positions), floor)) {
+                basalt::log::info("basalt serve", "conversation cache: %zu tokens not written to disk (physical RAM admission)", ids.size());
+                return;
+            }
+            basalt::core::SavedConversation image;
+            std::string se;
+            if (!capture(image, ids, imgs, cks, cvec, se)) {
+                basalt::log::warn("basalt serve", "conversation cache: not written to disk (%s)", se.c_str());
+                return;
+            }
+            if (disk.put(std::move(image), kDiskQueueCap)) ++written;
+        };
+        const int active = active_;
+        const bool slot0_cached = o.batch > 0 && !bs.empty() && bs[0].cached;
+        if (live_ok && !live.empty() && !slot0_cached && !disk_has(live, live_imgs, checks, cvec_cached)) {
+            set_active(0);
+            spill(live, live_imgs, checks, cvec_cached);
+        }
+        for (int b = 0; b < (int) bs.size() && written < limit; ++b) {
+            BSlot& sl = bs[(size_t) b];
+            if (!sl.cached || sl.active || sl.partial || disk_has(sl.ids, sl.imgs, sl.checks, sl.cvec)) continue;
+            set_active(b);
+            spill(sl.ids, sl.imgs, sl.checks, sl.cvec);
+        }
+        set_active(active);
+        if (at_exit) disk.flush();
+        return written;
+    }
     bool park_idle_engine(std::string&) override { return false; }
     bool capture_admit(uint64_t need, uint64_t floor) override {
         return basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok &&
                basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), need, floor);
     }
-    // The outgoing conversation leaves the session as one block: its running state, then its positional state.
-    bool park_current(size_t, int64_t kept) override {
-        if (!conversations->enabled() || !live_ok || live.empty() || kept > 0) return true;
+    /// The session's conversation as an image: its running state and its positional state by layer.
+    bool capture(basalt::core::SavedConversation& image, const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
+                 const std::vector<ConvCheckpoint>& cks, bool cvec, std::string& e) {
+        const int64_t positions = (int64_t) ids.size();
+        image.live.ids = ids;
+        image.live.imgs = imgs;
+        image.live.state_a.resize(session().running_bytes());
+        basalt::model::Result r = session().save_running(image.live.state_a.data(), positions);
+        if (r.ok()) r = session().save_cells(image.kv, positions);
+        if (!r.ok()) { e = r.message; return false; }
+        image.checkpoints = cks;
+        image.cvec = cvec;
+        return true;
+    }
+    // The outgoing conversation leaves the session for the RAM tier, or the disk tier when there is no room or the
+    // session goes on holding it (`kept`) and only the disk lacks it.
+    bool park_current(size_t held, int64_t kept) override {
+        if ((!conversations->enabled() && !disk.enabled()) || !live_ok || live.empty()) return true;
         if (o.conversation_cache_min_tokens > 0 && (int64_t) live.size() < o.conversation_cache_min_tokens) return true;
+        int64_t deepest = 0;
+        for (const ConvCheckpoint& c : checks) deepest = std::max<int64_t>(deepest, (int64_t) c.ids.size());
+        const bool disk_wants = disk.enabled() && !(kept > 0 && kept >= deepest) && !disk_has(live, live_imgs, checks, cvec_cached);
+        bool to_disk = !conversations->enabled() || kept > 0;
+        if (to_disk && !disk_wants) return true;
         const int64_t positions = (int64_t) live.size();
-        const size_t running = session().running_bytes(), cells = session().cells_bytes(positions);
-        if (!capture_admit(running + cells, (uint64_t) o.conversation_cache_min_free_mib << 20)) {
+        const size_t estimate = session().running_bytes() + session().cells_bytes(positions);
+        const bool ram_room = !to_disk && conversations->make_room(estimate, held);
+        if (!to_disk && !ram_room && disk_wants) to_disk = true;
+        if (to_disk ? disk.queued_bytes() + estimate > kDiskQueueCap : !ram_room) return true;
+        const uint64_t floor = std::max<uint64_t>((uint64_t) o.conversation_cache_min_free_mib << 20, disk.enabled() ? disk_floor : 0);
+        if (!capture_admit(estimate, floor)) {
             basalt::log::info("basalt serve", "conversation cache: %zu tokens not parked (physical RAM admission)", live.size());
             return true;
         }
         basalt::core::SavedConversation image;
-        image.live.ids = live;
-        image.live.imgs = live_imgs;
-        image.live.state_a.resize(running + cells);
-        if (const basalt::model::Result r = session().save_running(image.live.state_a.data(), positions); !r.ok()) { err = r.message; return false; }
-        if (const basalt::model::Result r = session().save_cells(image.live.state_a.data() + running, positions); !r.ok()) { err = r.message; return false; }
-        image.checkpoints = checks;
-        image.cvec = cvec_cached;
-        (void) conversations->put(std::move(image));
+        if (!capture(image, live, live_imgs, checks, cvec_cached, err)) return false;
+        (void) (to_disk ? disk.put(std::move(image), kDiskQueueCap) : conversations->put(std::move(image), held));
+        for (auto& s : conversations->take_spilled())
+            if (!disk_has(s.live.ids, s.live.imgs, s.checkpoints, s.cvec)) disk.put(std::move(s), kDiskQueueCap);
         return true;
     }
     bool copy_from_slot(int, const ConvCheckpoint*, std::string& e) override { e = "this model's slots copy no cells"; return false; }
@@ -291,8 +371,7 @@ private:
     Flow slot_bind() override { rt_.set_active(slot_b); return Flow::proceed; }
     Flow restore_image() override {
         const int64_t positions = (int64_t) incoming->live.ids.size();
-        const size_t running = rt_.session().running_bytes();
-        basalt::model::Result r = rt_.session().restore_cells(incoming->live.state_a.data() + running, positions);
+        basalt::model::Result r = rt_.session().restore_cells(incoming->kv, positions);
         if (r.ok()) r = rt_.session().restore_running(incoming->live.state_a.data(), positions);
         if (r.ok()) r = rt_.session().set_history(incoming->live.ids.data(), positions);
         if (!r.ok()) {

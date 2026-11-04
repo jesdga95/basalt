@@ -118,5 +118,7 @@ private:
 
 /// The 64-bit hash the store's identity and file checks use (XXH64's rounds).
 uint64_t conversation_store_hash(const void* data, size_t n, uint64_t seed);
+/// `seed` hashed on with a file's size and samples of its bytes: what names the model file in a store's identity.
+uint64_t conversation_store_hash_file(const std::string& path, uint64_t seed);
 
 }  // namespace basalt::core

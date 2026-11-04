@@ -45,19 +45,7 @@ uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeomet
     const int64_t geo[] = {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_v_heads, g.n_head_kv,
                            g.head_dim, g.idx_key_dim, g.n_expert, g.n_ff};
     h = conversation_store_hash(geo, sizeof geo, h);
-    uint64_t size = 0;
-    basalt::platform::file_size(o.model, size);
-    h = conversation_store_hash(&size, sizeof size, h);
-    const int fd = basalt::platform::open_fd_utf8(o.model);
-    std::vector<uint8_t> buf((size_t) 64 << 10);
-    const uint64_t n = std::min<uint64_t>(buf.size(), size);
-    for (int i = 0; i < 16 && fd >= 0 && n > 0; ++i) {
-        const uint64_t off = (size - n) / 15 * (uint64_t) i;
-        if (!basalt::platform::pread_all(fd, buf.data(), n, off)) break;
-        h = conversation_store_hash(buf.data(), (size_t) n, h);
-    }
-    basalt::platform::close_fd(fd);
-    return h;
+    return basalt::core::conversation_store_hash_file(o.model, h);
 }
 
 // finishes the in-flight host copy; a failed one drops its checkpoint
@@ -71,18 +59,6 @@ void QfnRuntime::ckd_finish() {
                                 [&](const ConvCheckpoint& k) { return k.state_a.data() == dst; }), checks.end());
 }
 
-// Whether the disk tier needs no new copy of a conversation: it is short (below the disk's minimum, or below
-// --conversation-cache-min-tokens when that is higher), or a stored prefix of it reaches within
-// kDiskStaleTokens of the chain's deepest checkpoint (the point its next turn goes on from; a restore
-// from that copy reads the rest again).  Each turn of a growing conversation is not written again in full.
-bool QfnRuntime::disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const std::vector<ConvCheckpoint>& cks, bool cvec) {
-    if ((int64_t) ids.size() < std::max<int64_t>(kDiskMinTokens, o.conversation_cache_min_tokens)) return true;
-    int64_t deepest = 0;
-    for (const ConvCheckpoint& c : cks) deepest = std::max<int64_t>(deepest, (int64_t) c.ids.size());
-    if (deepest <= 0) deepest = (int64_t) ids.size();
-    const auto m = disk.best(ids.data(), ids.size(), imgs, cvec);
-    return m.tokens > 0 && m.tokens + kDiskStaleTokens >= deepest;
-}
 
 // A capture of a conversation's state, or a read of one from disk, takes `need` bytes of RAM: only while the RAM
 // guard reads its level as ok, and with `floor` left free after it (the disk tier's floor sits above the guard's).

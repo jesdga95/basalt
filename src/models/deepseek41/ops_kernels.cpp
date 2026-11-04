@@ -136,22 +136,58 @@ public:
         return total;
     }
 
-    void save_cache(void* stream, int64_t positions, uint8_t* host) override {
+    // Each kv-source layer as a K/V entry: its latents and index keys by row, a row being `ratio` cells.
+    bool save_cache(void* stream, int64_t positions, std::vector<core::ConversationKv>& kv, std::string& err) override {
         cudaStreamSynchronize((cudaStream_t) stream);
-        size_t at = 0;
-        each_cache(positions, [&](uint8_t* dev, uint64_t bytes) {
-            cudaMemcpy(host + at, dev, bytes, cudaMemcpyDeviceToHost);
-            at += bytes;
-        });
+        kv.clear();
+        for (int il = 0; il < g_.n_layers; ++il) {
+            if (!el_kv_[(size_t) il]) continue;
+            const int64_t ratio = g_.compress_ratio[(size_t) il];
+            if (ctxp::kLatentRowBytes % (uint64_t) ratio || ctxp::kIndexRowBytes % (uint64_t) ratio) {
+                err = "deepseek41: compress ratio " + std::to_string(ratio) + " does not divide a cache row";
+                return false;
+            }
+            const uint64_t rows = ctxp::cache_rows(positions, (int) ratio);
+            core::ConversationKv k;
+            k.page_size = ratio;
+            k.cells = (int64_t) rows * ratio;
+            k.k.resize_for_overwrite(rows * ctxp::kLatentRowBytes);
+            k.v.resize_for_overwrite(rows * ctxp::kIndexRowBytes);
+            const auto down = [&](const uint8_t* dev, core::ConversationBuffer& to) {
+                return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
+                    return cudaMemcpy(p, dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
+                });
+            };
+            if (!down(el_kv_[(size_t) il]->data(), k.k) || !down(el_ik_[(size_t) il]->data(), k.v)) {
+                err = "deepseek41: reading a cache back failed";
+                return false;
+            }
+            kv.push_back(std::move(k));
+        }
+        return true;
     }
 
-    void restore_cache(void* stream, int64_t positions, const uint8_t* host) override {
+    bool restore_cache(void* stream, const std::vector<core::ConversationKv>& kv, std::string& err) override {
         cudaStreamSynchronize((cudaStream_t) stream);
-        size_t at = 0;
-        each_cache(positions, [&](uint8_t* dev, uint64_t bytes) {
-            cudaMemcpy(dev, host + at, bytes, cudaMemcpyHostToDevice);
-            at += bytes;
-        });
+        size_t i = 0;
+        for (int il = 0; il < g_.n_layers; ++il) {
+            if (!el_kv_[(size_t) il]) continue;
+            if (i >= kv.size() || kv[i].page_size != g_.compress_ratio[(size_t) il]) {
+                err = "deepseek41: a parked conversation has other caches";
+                return false;
+            }
+            const auto up = [&](uint8_t* dev, const core::ConversationBuffer& from) {
+                return from.visit(0, from.size(), [&](const uint8_t* p, size_t n, size_t at) {
+                    return cudaMemcpy(dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
+                });
+            };
+            if (!up(el_kv_[(size_t) il]->data(), kv[i].k) || !up(el_ik_[(size_t) il]->data(), kv[i].v)) {
+                err = "deepseek41: writing a cache back failed";
+                return false;
+            }
+            ++i;
+        }
+        return true;
     }
 
     size_t turn_bytes() const override {

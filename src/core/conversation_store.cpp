@@ -1448,4 +1448,20 @@ uint64_t ConversationStore::queued_bytes() const {
     return queue_bytes_;
 }
 
+uint64_t conversation_store_hash_file(const std::string& path, uint64_t seed) {
+    uint64_t h = seed, size = 0;
+    basalt::platform::file_size(path, size);
+    h = conversation_store_hash(&size, sizeof size, h);
+    const int fd = basalt::platform::open_fd_utf8(path);
+    std::vector<uint8_t> buf((size_t) 64 << 10);
+    const uint64_t n = std::min<uint64_t>(buf.size(), size);
+    for (int i = 0; i < 16 && fd >= 0 && n > 0; ++i) {
+        const uint64_t off = (size - n) / 15 * (uint64_t) i;
+        if (!basalt::platform::pread_all(fd, buf.data(), n, off)) break;
+        h = conversation_store_hash(buf.data(), (size_t) n, h);
+    }
+    basalt::platform::close_fd(fd);
+    return h;
+}
+
 }  // namespace basalt::core
