@@ -3,7 +3,7 @@
 
 namespace basalt::program::serve {
 
-Flow Request::prepare_image() {
+Flow QfnRequest::prepare_image() {
     ppl = nullptr;
     if (req_ppl >= 0) {
         std::string pe2;

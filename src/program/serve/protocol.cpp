@@ -96,7 +96,7 @@ bool Runtime::try_next_line(std::string& out) {
     return true;
 }
 
-int Runtime::init_protocol() {
+int QfnRuntime::init_protocol() {
 
     text_tokenizer_note = "this pack has no qwen35 tokenizer tables";
     {
@@ -253,7 +253,7 @@ int Runtime::init_protocol() {
     return 0;
 }
 
-int Runtime::announce() {
+int QfnRuntime::announce() {
     // what the server's Monitor tab shows (the server skips unknown lines until READY)
     {
         size_t free_b = 0, total_b = 0;

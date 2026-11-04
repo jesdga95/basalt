@@ -67,7 +67,7 @@ uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeomet
 }
 
 // finishes the in-flight host copy; a failed one drops its checkpoint
-void Runtime::ckd_finish() {
+void QfnRuntime::ckd_finish() {
     const void* dst = ckd.pending();
     if (dst == nullptr) return;
     std::string ce;
@@ -81,7 +81,7 @@ void Runtime::ckd_finish() {
 // --conversation-cache-min-tokens when that is higher), or a stored prefix of it reaches within
 // kDiskStaleTokens of the chain's deepest checkpoint (the point its next turn goes on from; a restore
 // from that copy reads the rest again).  Each turn of a growing conversation is not written again in full.
-bool Runtime::disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const std::vector<ConvCheckpoint>& cks, bool cvec) {
+bool QfnRuntime::disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const std::vector<ConvCheckpoint>& cks, bool cvec) {
     if ((int64_t) ids.size() < std::max<int64_t>(kDiskMinTokens, o.conversation_cache_min_tokens)) return true;
     int64_t deepest = 0;
     for (const ConvCheckpoint& c : cks) deepest = std::max<int64_t>(deepest, (int64_t) c.ids.size());
@@ -92,7 +92,7 @@ bool Runtime::disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey
 
 // A capture of a conversation's state, or a read of one from disk, takes `need` bytes of RAM: only while the RAM
 // guard reads its level as ok, and with `floor` left free after it (the disk tier's floor sits above the guard's).
-bool Runtime::capture_admit(uint64_t need, uint64_t floor) {
+bool QfnRuntime::capture_admit(uint64_t need, uint64_t floor) {
     return basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok &&
            basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), need, floor);
 }
@@ -101,7 +101,7 @@ bool Runtime::capture_admit(uint64_t need, uint64_t floor) {
 // addresses change: all parked images live in ordinary host vectors.
 // `kept`: the tokens of the outgoing conversation the session goes on holding (the request continues from its
 // own chain), 0 when another conversation takes the session
-bool Runtime::park_current(size_t held, int64_t kept) {
+bool QfnRuntime::park_current(size_t held, int64_t kept) {
     ckd_finish();
     if ((!conversations->enabled() && !disk.enabled()) || !live_ok || live.empty()) return true;
     // below the token minimum: store nothing, evict nothing
@@ -249,7 +249,7 @@ std::vector<ImgKey> Runtime::imgs_below(const std::vector<ImgKey>& all, int64_t 
     return v;
 }
 
-bool Runtime::gpu_sync_ok() {
+bool QfnRuntime::gpu_sync_ok() {
     const cudaError_t e = cudaDeviceSynchronize();
     if (e == cudaSuccess) return true;
     ckpt_why = std::string(": the GPU stopped responding before it (") + cudaGetErrorString(e) +
@@ -259,7 +259,7 @@ bool Runtime::gpu_sync_ok() {
 
 // a checkpoint of the state after `cur[0, L)`, taken for `source`; false only when the copy itself failed.  `parts`: the stages'
 // states saved at L (a split's mid-prompt checkpoint); without, they are read now (everything is at L)
-bool Runtime::checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts, bool defer, ConvCheckpoint::Source source) {
+bool QfnRuntime::checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts, bool defer, ConvCheckpoint::Source source) {
     ckpt_why.clear();
     ckd_finish();
     if (o.prompt_cache <= 0 || L < 1) return true;
@@ -314,7 +314,7 @@ bool Runtime::checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts, bool 
 // requests (no slot decoding) this bounds what a crash or a kill loses; a slot's draft K/V is copied into the main
 // store for the capture, which every request refills from its own store first, so between requests that runs only
 // when the solo session holds no conversation of its own there.  At most `limit` images; returns those queued.
-size_t Runtime::spill_to_disk(bool at_exit, size_t limit) {
+size_t QfnRuntime::spill_to_disk(bool at_exit, size_t limit) {
     ckd_finish();   // a turn checkpoint's state may still be on its way to the host
     size_t written = 0;
     const uint64_t floor = std::max<uint64_t>((uint64_t) o.conversation_cache_min_free_mib << 20, disk_floor);
@@ -391,7 +391,7 @@ uint64_t qsa_kv_mapped(const basalt::core::SessionState& u) {
 // its batch slot, -1 for the solo session's): those whose time is up (kParkAfterBusy), or with `any` every one.
 // Idle: a cached batch slot other than `park_keep`, or the solo session's conversation while no request works
 // there, holding cells beyond the base; not session `s` (null: none is excluded).
-std::vector<std::pair<double, int>> Runtime::idle_list(const basalt::core::SessionState* s, bool any) {
+std::vector<std::pair<double, int>> QfnRuntime::idle_list(const basalt::core::SessionState* s, bool any) {
     std::vector<std::pair<double, int>> idle;
     if (kv_floor <= 0 || bs.empty()) return idle;
     const double now = busy_now();
@@ -415,7 +415,7 @@ std::vector<std::pair<double, int>> Runtime::idle_list(const basalt::core::Sessi
 // The VRAM session `s` is `need` bytes short of comes first from the KV idle conversations hold (idle_list), each
 // moved out whole by park_one.  Returns the bytes given back, -1 when cells could not be given back.  The device is
 // idle.
-int64_t Runtime::park_idle(const basalt::core::SessionState* s, int64_t need, bool any, std::string& e) {
+int64_t QfnRuntime::park_idle(const basalt::core::SessionState* s, int64_t need, bool any, std::string& e) {
     int64_t given = 0;
     for (const auto& idle : idle_list(s, any)) {
         if (given >= need) break;
@@ -433,7 +433,7 @@ int64_t Runtime::park_idle(const basalt::core::SessionState* s, int64_t need, bo
 
 // An idle engine (no request, no slot decoding): one idle conversation whose time is up leaves VRAM and the expert
 // cache maps what it held, while the cache is below its full size.  False when none went (`e` set on a failure).
-bool Runtime::park_idle_engine(std::string& e) {
+bool QfnRuntime::park_idle_engine(std::string& e) {
     if (!xcache.segmented() || xcache.mapped_bytes() >= xcache.full_bytes() || idle_list(nullptr, false).empty())
         return false;
     if (!kv_drain(e)) return false;
@@ -447,7 +447,7 @@ bool Runtime::park_idle_engine(std::string& e) {
 // Idle conversation `b` (a batch slot; -1: the solo session's) out of VRAM, its K/V cells beyond the base back to the
 // driver: into the RAM tier when the RAM a capture must leave admits it, else nothing is copied when the disk tier
 // holds it.  False when it stays in VRAM (`e` empty) or its cells could not be given back (`e` set).
-bool Runtime::park_one(int b, std::string& e) {
+bool QfnRuntime::park_one(int b, std::string& e) {
     const auto t0 = Clock::now();
     basalt::core::SessionState& u = b >= 0 ? *bslot_ss[0][(size_t) b] : ss;
     std::vector<int32_t>& ids = b >= 0 ? bs[(size_t) b].ids : solo_out != nullptr ? solo_out->live : live;
@@ -539,7 +539,7 @@ bool Runtime::park_one(int b, std::string& e) {
     return true;
 }
 
-int Runtime::init_conversations() {
+int QfnRuntime::init_conversations() {
     live_ok = false;
 
     check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it

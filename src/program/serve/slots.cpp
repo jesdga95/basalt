@@ -5,7 +5,7 @@ namespace basalt::program::serve {
 
 // a view of the solo session carrying slot b's state: what the request path and the solo verifier work on for a
 // request that runs in that slot
-void Runtime::make_view(basalt::core::SessionState& v, int b) {
+void QfnRuntime::make_view(basalt::core::SessionState& v, int b) {
     const basalt::core::SessionState& t = *bslot_ss[0][(size_t) b];
     v = ss;
     v.gdn_state = t.gdn_state;
@@ -22,7 +22,7 @@ void Runtime::make_view(basalt::core::SessionState& v, int b) {
 bool Runtime::batch_on() { for (const BSlot& b : bs) if (b.active) return true; return false; }
 
 // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
-bool Runtime::copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& e) {
+bool QfnRuntime::copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& e) {
     const int64_t upto = (int64_t) ids.size();
     for (size_t k = 0; k < bslot_ss.size(); ++k) {
         basalt::core::SessionState& from = k == 0 ? *rsp : stages[k - 1]->ss;
@@ -52,7 +52,7 @@ bool Runtime::copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& 
     return true;
 }
 
-bool Runtime::hold_slot(int b, const ConvCheckpoint* at, std::string& e) {
+bool QfnRuntime::hold_slot(int b, const ConvCheckpoint* at, std::string& e) {
     slot_held = SlotHeld{};
     const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
     slot_held.ck.resize(bslot_ss.size());
@@ -82,7 +82,7 @@ bool Runtime::hold_slot(int b, const ConvCheckpoint* at, std::string& e) {
 // slot b's sessions -> the main ones (the reverse of copy_to_slot): a request that continues the
 // conversation an idle slot holds reads on from there.  Every stage, the same calls.
 // `at`: one of the slot's checkpoints - only the K/V up to it is copied and its state restored instead
-bool Runtime::copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) {
+bool QfnRuntime::copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) {
     const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
     if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
     const bool held = slot_held.b == b;
@@ -121,7 +121,7 @@ bool Runtime::copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) {
 
 // the solo conversation's draft K/V from slot 0's store back into the main sequence once a request in another slot
 // has drafted there; `keep` false: the solo session gave its cells to that request, nothing comes back
-void Runtime::solo_draft_back(bool keep) {
+void QfnRuntime::solo_draft_back(bool keep) {
     if (!solo_draft_in0) return;
     solo_draft_in0 = false;
     std::string e;
@@ -132,7 +132,7 @@ void Runtime::solo_draft_back(bool keep) {
 // hashes of everything slot b's sessions hold for its first `upto` tokens, per part (GDN state, PLE history,
 // indexer tails, dead rows, block positions, K, V, scales, pooled rows), for comparing a slot's state window by
 // window against another run of the same request
-bool Runtime::slot_digest(int b, int64_t upto, uint64_t* part) {
+bool QfnRuntime::slot_digest(int b, int64_t upto, uint64_t* part) {
     for (int i = 0; i < 10; ++i) part[i] = 1469598103934665603ull;
     auto mix = [&](int i, const uint8_t* p, size_t n) {
         uint64_t h = part[i];

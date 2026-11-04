@@ -20,7 +20,7 @@ struct BusyClock {
 };
 }  // namespace
 
-Flow Runtime::dispatch() {
+Flow QfnRuntime::dispatch() {
     if (batch_on() || (piped && pipe_inflight())) {
         if (!try_next_line(line)) {
             const BusyClock busy(busy_s, busy_on, busy_from);
@@ -226,7 +226,7 @@ Flow Runtime::dispatch() {
         ~BusyScope() { basalt::core::progress().busy.store(false); basalt::core::progress_at("idle"); }
     } busy_scope;
     const BusyClock busy(busy_s, busy_on, busy_from);
-    Request request(*this);
+    QfnRequest request(*this);
     return request.execute();
 }
 

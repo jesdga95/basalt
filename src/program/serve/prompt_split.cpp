@@ -3,7 +3,7 @@
 
 namespace basalt::program::serve {
 
-Request::SplitPlan Request::split_plan(int64_t a0, int64_t b0, const char* no_split) {
+QfnRequest::SplitPlan QfnRequest::split_plan(int64_t a0, int64_t b0, const char* no_split) {
     SplitPlan plan;
     if (!runtime_.split_ready) return plan;   // (the start line said why)
     // every part longer than a chunk that is not read across says why, with its numbers
@@ -56,7 +56,7 @@ Request::SplitPlan Request::split_plan(int64_t a0, int64_t b0, const char* no_sp
 // main card keeps the last chunk and reads its later layers once the stages' state is back.  Main's loan is
 // made by `lend`.
 // `ran` stays false when it stopped before reading anything (the caller reads the part on the main card)
-bool Request::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool& ran, std::string& e) {
+bool QfnRequest::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool& ran, std::string& e) {
     ran = false;
     const auto t0 = Clock::now();
     const int64_t n_tok = b0 - a0, chunk = plan.chunk, head = plan.head;

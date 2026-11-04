@@ -3,7 +3,7 @@
 
 namespace basalt::program::serve {
 
-Flow Request::execute() {
+Flow QfnRequest::execute() {
     struct Scope {   // what tells the idle conversations' parking where this request works, until it ends
         Runtime& r;
         ~Scope() { r.solo_out = nullptr; r.solo_busy = false; r.park_keep = -1; }

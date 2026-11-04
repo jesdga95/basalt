@@ -3,7 +3,7 @@
 
 namespace basalt::program::serve {
 
-Flow Request::parse() {
+Flow QfnRequest::parse() {
     runtime_.stop_req.store(false);   // a STOP that arrived between requests is stale
     runtime_.ram_stop.store(false);
     runtime_.err.clear();

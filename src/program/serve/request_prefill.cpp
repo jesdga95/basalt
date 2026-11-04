@@ -3,7 +3,7 @@
 
 namespace basalt::program::serve {
 
-Flow Request::read_prompt() {
+Flow QfnRequest::read_prompt() {
     ov_copied = false;
 
     batch_fatal = false;
