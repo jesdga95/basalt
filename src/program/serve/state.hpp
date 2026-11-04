@@ -2,6 +2,7 @@
 #pragma once
 
 #include "runtime.hpp"
+#include "basalt/model/adapter.hpp"
 #include "../cli/tokens.hpp"
 #include "loans.hpp"
 #include "loan_moves.hpp"
@@ -167,7 +168,8 @@ public:
     virtual void after_input_start() {}
     virtual void print_info() = 0;   // the INFO line
     virtual void at_exit() {}
-    virtual bool pack_tokenizer_supported(std::string_view tokenizer_json) const = 0;
+    /// The pack's tokenizer rule, set before the input starts.
+    basalt::model::ModelAdapter::PreTokenizer pre_{};
     static constexpr int kPenaltyWindowCap = 4096;
     // ---- what a model answers: one call per batch window at most, the rest per command or per request
     virtual bool windows_in_flight() = 0;
@@ -357,10 +359,6 @@ public:
     void after_input_start() override;
     void print_info() override;
     void at_exit() override;
-    bool pack_tokenizer_supported(std::string_view tokenizer_json) const override {
-        return tokenizer_json.find("\"pre\": \"qwen35\"") != std::string_view::npos;
-    }
-
     bool windows_in_flight() override;
     bool next_batch_window() override;
     bool drain_windows() override;

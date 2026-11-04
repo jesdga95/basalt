@@ -132,15 +132,15 @@ target_include_directories(model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(model PUBLIC artifact warnings)
 
 add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwen4exp/flags.cpp)
-target_include_directories(model_qwen4exp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(model_qwen4exp PUBLIC model)
+target_include_directories(model_qwen4exp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
+target_link_libraries(model_qwen4exp PUBLIC model tokenizer)
 
-add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models/deepseek41/pack.cpp
+add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models/deepseek41/tokenizer/pretok_joyai.cpp src/models/deepseek41/pack.cpp
   src/models/deepseek41/model.cpp src/models/deepseek41/session.cpp src/models/deepseek41/layer_ops.cpp
   src/models/deepseek41/elastic.cpp src/models/deepseek41/ops_kernels.cpp src/models/deepseek41/tier.cpp src/models/deepseek41/peer_tier.cpp src/models/deepseek41/ops.cu
   src/models/deepseek41/prefill.cpp src/models/deepseek41/prefill_ffn.cpp src/models/deepseek41/prefill_ffn.cu src/models/deepseek41/attn_batch.cpp src/models/deepseek41/attn_dense.cu)
-target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
-target_link_libraries(model_deepseek41 PUBLIC model deepseek41_kernels deepseek41_attn deepseek41_vision model_qwen4exp_engine mmq kernels core ${_gpu_runtime_target})
+target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
+target_link_libraries(model_deepseek41 PUBLIC model tokenizer deepseek41_kernels deepseek41_attn deepseek41_vision model_qwen4exp_engine mmq kernels core ${_gpu_runtime_target})
 
 add_library(models STATIC src/models/builtin.cpp)
 target_link_libraries(models PUBLIC model_qwen4exp model_deepseek41)
@@ -491,8 +491,9 @@ target_include_directories(tokenizer PUBLIC include PRIVATE src/program/tokenize
 target_link_libraries(tokenizer PRIVATE warnings)
 # built from the tokenizer sources with the standard library range checks on, so an out-of-range index aborts the test
 add_executable(tokenizer_test tests/program/tokenizer_test.cpp src/program/tokenizer/bpe.cpp
-               src/program/tokenizer/pretok_qwen35.cpp src/program/tokenizer/unicode_flags.cpp)
-target_include_directories(tokenizer_test PRIVATE include src/program/tokenizer)
+               src/program/tokenizer/pretok_qwen35.cpp src/program/tokenizer/unicode_flags.cpp
+               src/models/deepseek41/tokenizer/pretok_joyai.cpp)
+target_include_directories(tokenizer_test PRIVATE include src src/program/tokenizer)
 target_compile_definitions(tokenizer_test PRIVATE _GLIBCXX_ASSERTIONS)
 target_link_libraries(tokenizer_test PRIVATE warnings)
 basalt_embed_manifest(tokenizer_test)

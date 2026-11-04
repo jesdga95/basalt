@@ -299,7 +299,7 @@ void Tokenizer::memo_grow() {
 }
 
 bool Tokenizer::encode_plain(std::string_view text, std::vector<int32_t>& out, std::string& err) {
-    tokenizer::pretok_qwen35(text.data(), text.size(), ends_);
+    pretokenize_(text.data(), text.size(), ends_);
     size_t begin = 0;
     for (const size_t end : ends_) {
         const char* p = text.data() + begin;

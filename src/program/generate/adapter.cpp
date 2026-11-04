@@ -264,7 +264,7 @@ std::optional<int> run_adapter_model(basalt::program::CommonOptions& o, basalt::
         std::vector<int64_t> stop;
         if (o.stop_eos) stop = o.eos_ids;
         if (loaded->context() != 0) o.max_context = loaded->context();
-        if (o.serve) return basalt::program::serve::run_session(o, model_file, *loaded);
+        if (o.serve) return basalt::program::serve::run_session(o, model_file, *adapter, *loaded);
         return adapter_generate(*loaded, o.tokens, o.max_new, stop, o.images, o.image_at);
     } catch (const std::exception& e) {
         return fatal_start_error(e.what());

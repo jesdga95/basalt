@@ -1,5 +1,6 @@
 // src/program/serve/runtime.cpp - lifecycle of the persistent engine.
 #include "state.hpp"
+#include "../tokenizer/unicode_flags.hpp"
 
 namespace basalt::program::serve {
 
@@ -32,6 +33,7 @@ void QfnRuntime::at_exit() {
 
 int run(Context& context) {
     QfnRuntime runtime(context);
+    runtime.pre_ = {"qwen35", basalt::program::tokenizer::pretok_qwen35};
     return runtime.execute();
 }
 
