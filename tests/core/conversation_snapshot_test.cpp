@@ -202,10 +202,12 @@ void full_session(int fmt, int mode, int experts) {
           restored.live.dead==a.live.dead && restored.live.block_pos==a.live.block_pos &&
           equal(restored.kv[0],a.kv[0]) && equal(restored.kv[1],a.kv[1]),"whole-session A/B/A exactness including spare key");
     check(ss.ple_prev[0]==64 && ss.ple_prev[1]==65,"PLE token window reconstructed");
-    {   // the disk tier: written from the session a buffer at a time, the same files as the queued capture; read
+    for (bool with_checks : {false,true}) {   // written from the session, the same files as the queued capture; read
         // back with the K/V left in its files and restored from them, the same state as the whole capture
         const std::vector<ConversationCheckpoint> none;   // no checkpoint: the live state is stored
-        const ConversationView flat{ids,images,none,true};
+        auto disk_checks=checkpoints;
+        disk_checks.push_back(a.live);
+        const ConversationView flat{ids,images,with_checks?disk_checks:none,true};
         SavedConversation whole;
         check(conversation_snapshot_save(whole,flat,ss,g,draft.state,err),"capture A for the disk tier");
         const std::string base=basalt::platform::temp_dir()+"/basalt-snapshot-disk-"+
@@ -219,10 +221,17 @@ void full_session(int fmt, int mode, int experts) {
             queued.flush();
             ConversationSource src;
             check(conversation_snapshot_source(src,flat,ss,g,&draft.state,err),"the session as a source");
+            check(src.ids==&flat.ids && src.checkpoints==&flat.checkpoints,"the source borrows tokens and checkpoints");
             check(direct.write(src,err),"write from the session");
+            check(direct.queued_bytes()==0,"a disk-only park retains no queued image");
             std::vector<int32_t> p=ids; p.push_back(1);
             const auto m=direct.best(p.data(),p.size(),images,true);
             check(m.tokens==(int64_t)ids.size(),"the written conversation matches");
+            SavedConversation loaded;
+            check(direct.load(m,loaded,err),"whole-image read of the streamed write");
+            check(conversation_snapshot_restore(b,ss,g,draft.state,err)==ConversationRestore::restored,"restore B over it");
+            check(conversation_snapshot_restore(loaded,ss,g,draft.state,err)==ConversationRestore::restored,
+                  "restore the streamed write through the whole-image read path");
             SavedConversation part;
             std::unique_ptr<ConversationKvRead> kv;
             check(direct.load(m,part,err,&kv) && kv && part.kv.size()==whole.kv.size() && part.kv[0].k.empty(),

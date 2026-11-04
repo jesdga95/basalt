@@ -246,8 +246,8 @@ private:
     static constexpr int64_t kDiskStaleTokens = 4096;   // a stored copy this close to the chain's end is kept
     static constexpr uint64_t kDiskQueueCap = 4ull << 30;   // images waiting for the writer, in RAM
     uint64_t disk_floor{};
-    // a conversation the RAM admission refuses whole is written from the session and read back into it a buffer at a
-    // time (--exp disk_stream: 0 never, 2 every disk write and read; diagnostics)
+    // Disk writes stream from the session; reads stream when whole-image admission fails.
+    // --exp disk_stream: 0 whole writes and reads, 2 streamed writes and reads (diagnostics).
     int disk_stream{1};
     uint64_t ram_seen_cap{};   // --exp conv_ram_mib: the most RAM above its floor a conversation admission sees (tests)
     int64_t pp_total{};

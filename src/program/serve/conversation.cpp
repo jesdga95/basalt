@@ -204,11 +204,10 @@ bool Runtime::park_current(size_t held, int64_t kept) {
                                               disk.enabled() ? disk_floor : 0);
     const size_t retained = reuse.bytes() + stage_retained;
     const size_t additional = estimate > retained ? estimate - retained : 0;
-    // what the RAM admission or the write queue refuses whole, the disk tier writes from the session itself
+    // Disk-only parks stream from the session; a RAM park needs an image unless admission refuses it.
     const bool whole_ok = capture_admit(additional, floor);
     const bool queue_ok = !to_disk || disk.queued_bytes() + estimate <= kDiskQueueCap;
-    if (disk_wants && n_st == 0 && disk_stream > 0 &&
-        (to_disk ? disk_stream == 2 || !whole_ok || !queue_ok : !whole_ok)) {
+    if (disk_wants && n_st == 0 && disk_stream > 0 && (to_disk || !whole_ok)) {
         reuse = {};   // its RAM goes before the write
         const size_t need = basalt::core::ConversationStore::write_bytes(live.size());
         if (!capture_admit(need, floor)) {
@@ -346,7 +345,7 @@ bool Runtime::checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts, bool 
 // them: the RAM tier's (at exit), the solo session's and every idle slot's, each with its draft layer's K/V.  Between
 // requests (no slot decoding) this bounds what a crash or a kill loses; a slot's draft K/V is copied into the main
 // store for the capture, which every request refills from its own store first, so between requests that runs only
-// when the solo session holds no conversation of its own there.  At most `limit` images; returns those queued.
+// when the solo session holds no conversation of its own there.  At most `limit` images; returns those written or queued.
 size_t Runtime::spill_to_disk(bool at_exit, size_t limit) {
     ckd_finish();   // a turn checkpoint's state may still be on its way to the host
     size_t written = 0;
@@ -367,9 +366,8 @@ size_t Runtime::spill_to_disk(bool at_exit, size_t limit) {
             return;
         }
         if (at_exit) disk.flush();   // one image in RAM at a time
-        if (disk_stream == 2 || !capture_admit(bytes, floor)) {
-            // refused whole: written from the session itself
-            if (disk_stream == 0 || !capture_admit(basalt::core::ConversationStore::write_bytes(ids.size()), floor)) {
+        if (disk_stream > 0) {
+            if (!capture_admit(basalt::core::ConversationStore::write_bytes(ids.size()), floor)) {
                 basalt::log::info("basalt serve", "conversation cache: %zu tokens not written to disk (physical RAM "
                                   "admission)", ids.size());
                 return;
@@ -381,6 +379,11 @@ size_t Runtime::spill_to_disk(bool at_exit, size_t limit) {
             if (!at_exit)
                 basalt::log::info("basalt serve", "conversation cache: %zu tokens to disk between requests "
                                   "(written from the session in %.0f ms, %.2f GB)", ids.size(), ms, (double) wrote / 1e9);
+            return;
+        }
+        if (!capture_admit(bytes, floor)) {
+            basalt::log::info("basalt serve", "conversation cache: %zu tokens not written to disk (physical RAM "
+                              "admission)", ids.size());
             return;
         }
         try {
