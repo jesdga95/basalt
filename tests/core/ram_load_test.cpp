@@ -66,7 +66,7 @@ void arena_case(uint64_t base, uint64_t blob, bool unbuffered, int threads) {
     std::mt19937_64 rng(3);
     std::vector<uint64_t> offsets((size_t) (g.n_layers * g.n_expert), kNone);
     std::vector<uint8_t> no_bar(offsets.size(), 0);
-    uint64_t at = 0, bar = 0;
+    uint64_t at = 0, bar = 0, placed = 0;
     for (int64_t l = 0; l < g.n_layers; ++l)
         for (int64_t e = 0; e < g.n_expert; ++e) {
             const size_t i = (size_t) (l * g.n_expert + e);
@@ -76,17 +76,16 @@ void arena_case(uint64_t base, uint64_t blob, bool unbuffered, int threads) {
             }
             offsets[i] = at;
             at += g.blob_bytes[(size_t) l];
+            placed += g.blob_bytes[(size_t) l];
             no_bar[i] = rng() % 5 == 0;
             if (!no_bar[i]) bar += g.blob_bytes[(size_t) l];
         }
     uint8_t* mem = alloc_ram(at);
     std::memset(mem, 0xee, (size_t) at);
-    LoadProgress progress("ram", bar);
     RamLoad L;
     L.fd = f.fd;
     L.unbuffered = unbuffered;
     L.threads = threads;
-    L.progress = &progress;
     L.groups = ram_arena_runs(g, mem, offsets, kNone, no_bar);
     uint64_t run_bar = 0;
     std::vector<uint8_t> blob_seen(offsets.size(), 0);
@@ -101,8 +100,7 @@ void arena_case(uint64_t base, uint64_t blob, bool unbuffered, int threads) {
     RamLoadStats st;
     std::string err;
     check(read_ram_runs(L, st, err), err.c_str());
-    progress.finish();
-    check(st.copied == at, "every placed byte counted");
+    check(st.copied == placed, "every placed byte counted");
     for (int64_t l = 0; l < g.n_layers; ++l)
         for (int64_t e = 0; e < g.n_expert; ++e) {
             const uint64_t off = offsets[(size_t) (l * g.n_expert + e)];
