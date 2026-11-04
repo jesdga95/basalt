@@ -1,6 +1,7 @@
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
 
-namespace basalt::program::generate {
+namespace basalt::models::qwen4exp::generate {
 
 int dispatch(Context& context) {
     auto& o = *context.o;
@@ -124,7 +125,7 @@ int dispatch(Context& context) {
     };
     if (!o.serve) report_expert_tiers();
     if (o.serve) {
-        basalt::program::serve::Context context{
+        basalt::models::qwen4exp::serve::Context context{
             .o = o,
             .ppl_base = ppl_base,
             .ppl_out = ppl_out,
@@ -196,7 +197,7 @@ int dispatch(Context& context) {
             .tier_file_bytes = tier_file_bytes,
             .report_expert_tiers = report_expert_tiers,
         };
-        return basalt::program::serve::run(context);
+        return basalt::models::qwen4exp::serve::run(context);
     }
 
 

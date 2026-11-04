@@ -1,6 +1,7 @@
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "helpers.hpp"
 
-namespace basalt::program::generate {
+namespace basalt::models::qwen4exp::generate {
 
 // A byte count in GiB with one decimal, rounded down (a safe limit must not round up past itself).
 std::string gib_text(uint64_t bytes) {

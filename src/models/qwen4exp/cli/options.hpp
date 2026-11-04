@@ -1,13 +1,14 @@
 #pragma once
 
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include <optional>
 #include <string>
 
 namespace basalt::core { struct Json; }
-namespace basalt::program { struct Options; }
+namespace basalt::models::qwen4exp { struct Options; }
 namespace basalt::kernels { struct RopeScaling; struct SamplerParams; }
 
-namespace basalt::program::cli {
+namespace basalt::models::qwen4exp::cli {
 
 // The name of the engine's expert profile for a model (data/profiles/<key>.prof): "<architecture>-<block_count>x
 // <expert_count>" from meta.gguf_kv; empty when the metadata does not say.
@@ -29,4 +30,4 @@ std::optional<int> validate_generation_options(const Options& o, bool multi_gpu,
                                               basalt::kernels::RopeScaling& rope_cfg);
 basalt::kernels::SamplerParams sampling_options(const Options& o);
 
-}  // namespace basalt::program::cli
+}  // namespace basalt::models::qwen4exp::cli

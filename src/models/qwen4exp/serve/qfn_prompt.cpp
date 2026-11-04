@@ -1,7 +1,8 @@
 // src/models/qwen4exp/serve/qfn_prompt.cpp - how Flash-Next reads a prompt's parts: sampling setup, windows, loans, the split.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 bool QfnRequest::prompt_begin() {
     ov_copied = false;
@@ -167,4 +168,4 @@ Flow QfnRequest::prompt_end() {
     return Flow::proceed;
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

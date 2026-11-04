@@ -1,7 +1,8 @@
 // src/models/qwen4exp/serve/kv.cpp - kv operations.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 // the expert cache never shrinks below the slots the prompt path's smallest loan needs (a 256-token chunk, and
 // the 128 slots a loan leaves), so the next prompt can always be read
@@ -372,4 +373,4 @@ bool QfnRuntime::kv_give_back(int64_t ss_keep, const basalt::core::SessionState*
     return true;
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

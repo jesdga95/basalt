@@ -1,7 +1,8 @@
 // src/models/qwen4exp/serve/vision.cpp - vision operations for the persistent engine.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 // ---- ENC <image> <out> [<image> <out> ...] (--vision-mmproj), between requests and between batch windows.  The
 // images are decoded on the host first; then the encoder borrows the last expert-cache slots (the prompt path's
@@ -167,4 +168,4 @@ void QfnRuntime::enc_command(const std::string& cmd) {
     std::fflush(stdout);
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

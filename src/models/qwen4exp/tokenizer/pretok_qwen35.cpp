@@ -5,9 +5,10 @@
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
 // by hand, without backtracking. Here the code points are decoded once, with their flags, and the pieces come back as
 // byte offsets into the UTF-8 text.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "../../../program/tokenizer/unicode_flags.hpp"
 
-namespace basalt::program::tokenizer {
+namespace basalt::models::qwen4exp::tokenizer {
 
 namespace {
 
@@ -130,4 +131,4 @@ void pretok_qwen35(const char* text, size_t size, std::vector<size_t>& ends) {
     }
 }
 
-}  // namespace basalt::program::tokenizer
+}  // namespace basalt::models::qwen4exp::tokenizer

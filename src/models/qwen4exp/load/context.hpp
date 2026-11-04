@@ -1,8 +1,9 @@
 #pragma once
 
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "helpers.hpp"
 
-namespace basalt::program::generate {
+namespace basalt::models::qwen4exp::generate {
 
 // Startup phases keep their resources on the stack until the following phases return.
 // This view borrows those resources without changing their construction or destruction order.

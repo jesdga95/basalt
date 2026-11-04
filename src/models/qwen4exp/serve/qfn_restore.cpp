@@ -1,7 +1,8 @@
 // src/models/qwen4exp/serve/qfn_restore.cpp - what restoring a conversation does to Flash-Next's sessions.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 bool QfnRequest::cvec_wanted() const { return basalt::kernels::cvec().loaded() ? req_cvec != 0 : true; }
 void QfnRequest::set_cvec() { if (basalt::kernels::cvec().loaded()) basalt::kernels::cvec_set_enabled(want_cvec); }
@@ -256,4 +257,4 @@ void QfnRequest::prompt_parts_reset() {
     }
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

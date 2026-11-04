@@ -1,7 +1,8 @@
 // src/models/qwen4exp/serve/qfn_finish.cpp - what the end of a request does to Flash-Next's verifiers, drafter and tiers.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 Flow QfnRequest::complete_begin() {
     // the last commit (set_commit_async): the session is complete before anything reads or copies it
@@ -151,4 +152,4 @@ void QfnRequest::report_request(const DoneCounts& dc) {
                      (long long) sfx_windows, (long long) sfx_ok, (long long) sfx_drafts);
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

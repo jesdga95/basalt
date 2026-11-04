@@ -1,7 +1,8 @@
 // src/models/qwen4exp/serve/batch_pipeline.cpp - batch pipeline operations.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 basalt::core::Verifier & QfnRuntime::stage_verifier(int k) { return k == 0 ? ver : stages[(size_t) k - 1]->ver; }
 
@@ -117,4 +118,4 @@ bool QfnRuntime::pipe_drain() {
     return true;
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

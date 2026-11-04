@@ -1,6 +1,7 @@
 // src/models/qwen4exp/serve/qfn_runtime.hpp - the persistent driver over startup's loaded engine.
 #pragma once
 
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "../../../program/serve/state.hpp"
 #include "../load/engine_local.hpp"
 #include "basalt/program/grammar/guard.hpp"
@@ -17,7 +18,7 @@ namespace basalt::kernels { class PleTable; }
 namespace basalt::kernels::cpu { class ExpertPool; }
 namespace basalt::vision { class CudaEncoder; }
 
-namespace basalt::program {
+namespace basalt::models::qwen4exp {
 struct Options;
 namespace serve {
 
@@ -105,4 +106,4 @@ uint64_t serve_growth_bytes(const Options& o, const basalt::core::ModelGeometry&
 int run(Context& context);
 
 }  // namespace serve
-}  // namespace basalt::program
+}  // namespace basalt::models::qwen4exp
