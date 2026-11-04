@@ -100,7 +100,8 @@ struct ConversationCheckpoint {
     Source source = kTurnEnd;
     std::vector<int32_t> ids;
     std::vector<ConversationImageKey> imgs;
-    CheckpointBytes gdn, ple, tails, dead, block_pos;
+    /// The model's running state, its parts as the model names them.
+    CheckpointBytes state_a, state_b, state_c, state_d, state_e;
     uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
     // Ordinary layer-split checkpoints retain each device's running state.
     // Whole-session parking is currently single-GPU and rejects these parts.
@@ -108,7 +109,7 @@ struct ConversationCheckpoint {
 
     size_t bytes() const {
         size_t n = ids.capacity() * sizeof(int32_t) + imgs.capacity() * sizeof(ConversationImageKey) +
-               gdn.capacity() + ple.capacity() + tails.capacity() + dead.capacity() + block_pos.capacity() +
+               state_a.capacity() + state_b.capacity() + state_c.capacity() + state_d.capacity() + state_e.capacity() +
                stage_parts.capacity() * sizeof(ConversationCheckpoint);
         for (const auto& part : stage_parts) n += part.bytes();
         return n;
