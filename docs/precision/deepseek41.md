@@ -15,7 +15,7 @@ requantized. Types in the IQ1_S, IQ1_M and GSQ-RCO packs (a GSQ-RCO build assign
 
 | Tensor class | Stored as | Read by |
 |---|---|---|
-| Routed experts, gate/up | IQ1_S (19), IQ1_M (29), IQ2_XXS (16) or IQ2_XS (17), per layer | GPU grouped kernels, MMQ (not IQ1_M), CPU dots |
+| Routed experts, gate/up | IQ1_S (19), IQ1_M (29), IQ2_XXS (16) or IQ2_XS (17), per layer | GPU grouped kernels, MMQ, CPU dots |
 | Routed experts, down | IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS or IQ2_S (22) | the same |
 | Attention wq_a, wq_b, wkv, wo_a, wo_b | Q6_K, Q5_K or Q8_0, as the pack assigns them | native_mmvq (decode), MMQ (prompt) |
 | Shared expert gate/up/down | Q6_K, Q5_K or Q8_0 | dense gated MLP, clamped |
@@ -58,8 +58,11 @@ T=1 calls and require bitwise equality (attn_index_parity, attn_mqa_parity, rout
 | Prompt chunks (up to 8,192 tokens) | Routed experts on MMQ: q8_1 (per 32, MMQ layout) of the fp32 input and of the fp32 clamped SwiGLU output, int8 mma against the IQ1_S / IQ2_XXS codes (the IQ1_S grid shift rides in the activation block sums), fp32 accumulation, rows summed per token in slot order. **Numerics change against the single-token kernels** (a different int8 reduction order; both round activations to q8_1). Experts are staged from the cards' slots and the pinned RAM tier, so the prompt path never mixes in CPU arithmetic | prefill_ffn.cpp routed; prefill_ffn.cu; src/kernels/cuda/mmq_load_tiles.cuh load_tiles_iq1_s |
 | Shared expert in prompts | MMQ GEMMs over 1,024-token sub-chunks (gate, up, clamped SwiGLU, down; q8_1 activations with an fp16 block scale, int8 mma, fp32 accumulation). **Numerics change** against the decode kernel: about 1e-3 per layer. The per-token weighted sum of the routed rows keeps the slot order, bitwise equal to the per-token launch | prefill_ffn.cpp shared; weighted_sum_tokens |
 
-A prompt layer with an IQ1_M side has no MMQ product: it runs the grouped decode kernels (q8_1 activations, fp32
-accumulation), exact to decode's numerics for that layer (prefill_ffn.cpp grouped_launch).
+IQ1_M on MMQ: the int8 weight is 8 * (code - 1) +- 1, which holds the grid code and the +-1/8 shift per eight values
+exactly, and the scale per 16 values is d * (2s + 1) / 8 in fp32 (src/prefill/mmq/mmq_load_tiles.cuh load_tiles_iq1_m).
+Against a double reference on the dequantized weights and the fp32 activations: rel RMS 5.4e-3, as the other formats
+(the activation's q8_1 rounding); against the dp4a matvec 2.2e-4. A row moves by 1.6e-7 relative RMS with the launch or
+the row order, not bitwise, as on the other MMQ formats (prefill_mmq_iq1s_test).
 
 ## Prompt attention
 

@@ -122,7 +122,6 @@ prefillp::Dims DsModel::prompt_dims() const {
     d.engram_cols = (int64_t) pack_.engram.hash.n_cols() * 256;
     for (const ExpertLayer& e : pack_.experts) {
         d.expert_blob_bytes = std::max<uint64_t>(d.expert_blob_bytes, e.blob_bytes);
-        d.grouped = d.grouped || e.gu_type == GGML_TYPE_IQ1_M || e.d_type == GGML_TYPE_IQ1_M;
     }
     return d;
 }

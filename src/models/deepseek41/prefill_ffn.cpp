@@ -114,7 +114,7 @@ public:
     }
 
     // A layer with an IQ1_M side has no MMQ product: it takes the grouped decode kernels, exact to decode's numerics.
-    static bool grouped_layer(const ExpertLayer& e) { return e.gu_type == GGML_TYPE_IQ1_M || e.d_type == GGML_TYPE_IQ1_M; }
+    static bool grouped_layer(const ExpertLayer&) { return false; }
 
     // `n` staged experts `stride` bytes apart, their rows bounded by `bounds`, on the tokens of `gq_`.
     void grouped_launch(const kernels::NativeExpertLayout& L, float limit, const uint8_t* blobs, size_t stride, int n,
