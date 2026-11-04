@@ -233,6 +233,7 @@ class DeepseekParser:
 
 class DeepSeek41(Dialect):
     name = "deepseek41"
+    in_engine_vision = True
     image_pad = enc.IMAGE_PLACEHOLDER
     image_start = ""
     stop_texts = (EOS,)

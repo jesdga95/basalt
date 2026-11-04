@@ -28,7 +28,7 @@ PNG = b"\x89PNG\r\n\x1a\n"
 # each picture has its own row count, so a prompt shows which picture took which marker
 ROWS = {PNG + b"A": 2, PNG + b"B": 3, PNG + b"C": 5}
 A, B, C = ("data:image/png;base64," + base64.b64encode(data).decode() for data in ROWS)
-MODEL = "qwen3.8-flash-next"
+MODEL = "basalt"
 POLICY = "refused by server policy"
 NO_VISION = "this server was started without image input (--vision), so it cannot read images"
 
