@@ -196,10 +196,8 @@ struct Options {
     /// --gpu: the cards this run uses (gpu_select.hpp); empty = GPU 0 alone.  --gpu-plan prints the choice and exits.
     std::string gpu;
     bool gpu_plan = false;
-    std::string diag_fixture, diag_dump;   ///< --diag-fixture / --diag-dump: model diagnostics, off by default
-    std::string diag_mmproj;               ///< --diag-mmproj: image projector file instead of the pack's vision section
+    std::string diag_dump;                 ///< --diag-dump DIR: a model's per-layer tensors, off by default
     int diag_tier_ram = -1, diag_tier_vram = -1;   ///< --diag-tier-ram / --diag-tier-vram: fixed expert-tier sizes
-    std::string diag_dspark;               ///< --diag-dspark: drafter GGUF run on the second GPU beside decode
     bool diag_serial_prompt = false;       ///< --diag-serial-prompt: an adapter model reads its prompt one decode step at a time
     std::string diag_logits;               ///< --diag-logits FILE: an adapter model writes the logits of each decoded row
     std::vector<std::string> images;       ///< --image FILE ... with --image-at N: the picture's block goes before token N

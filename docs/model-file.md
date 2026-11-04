@@ -43,9 +43,6 @@ the pack has no MTP drafter, expert profile or `hc8` section:
   aligned, so a row can be read with `O_DIRECT`.
 - `vision/mmproj` holds the vision projector GGUF as published; it is present only when the pack is built with
   `--mmproj`, and `basalt serve PACK --vision dynamic` reads it from there. Without it the pack is text-only.
-- `dspark/gguf` holds the DSpark drafter GGUF as published (3 stages, 128 MXFP4 experts, Markov and confidence heads),
-  present only when the pack is built with `--dspark FILE`. `meta.dspark` names the section and its size. The engine
-  loads it from the pack when `--spec N` (2 to 6) asks for speculation; without `--spec` the section is not read.
 - `meta.arch` is `deepseek41`. `meta.geometry` copies the architecture's GGUF keys without the `deepseek41.` prefix
   (layers, attention and indexer sizes, RoPE, expert counts and gating, SwiGLU clamps, hyper-connection counts, norm
   epsilon). `meta.engram` records the section, tensor, type, row count, row size and the hash constants

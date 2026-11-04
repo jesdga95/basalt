@@ -42,12 +42,9 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         }
         else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
         else if (a == "--max-context") { o.max_context = std::atoll(next("--max-context")); o.max_context_set = true; }
-        else if (a == "--diag-fixture") o.diag_fixture = next("--diag-fixture");
         else if (a == "--diag-dump") o.diag_dump = next("--diag-dump");
-        else if (a == "--diag-mmproj") o.diag_mmproj = next("--diag-mmproj");
         else if (a == "--diag-tier-ram") o.diag_tier_ram = std::atoi(next("--diag-tier-ram"));
         else if (a == "--diag-tier-vram") o.diag_tier_vram = std::atoi(next("--diag-tier-vram"));
-        else if (a == "--diag-dspark") o.diag_dspark = next("--diag-dspark");
         else if (a == "--diag-serial-prompt") o.diag_serial_prompt = true;
         else if (a == "--diag-logits") o.diag_logits = next("--diag-logits");
         else if (a == "--image") o.images.push_back(next("--image"));

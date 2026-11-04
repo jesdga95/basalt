@@ -61,15 +61,11 @@ struct Result {
 
 struct LoadRequest {
     std::vector<std::string> paths;   ///< pack or GGUF shards
-    std::string diag_fixture;         ///< diagnostic: recorded outputs to replay (model-specific, empty = off)
     std::string diag_dump;            ///< diagnostic: directory for per-layer tensor dumps (empty = off)
-    std::string diag_mmproj;          ///< diagnostic: image projector file used instead of the pack's vision section
     int diag_tier_ram = -1;           ///< diagnostic: fixed RAM-tier experts per layer (-1 = sized from free memory)
     int diag_tier_vram = -1;          ///< diagnostic: fixed VRAM-tier experts per layer (-1 = sized from free memory)
-    std::string diag_dspark;          ///< diagnostic: drafter GGUF to load on the second GPU and run beside decode (empty = off)
     int64_t max_context = 0;          ///< --max-context (used when max_context_set; else the model picks its own)
     bool max_context_set = false;
-    int spec = 0;                     ///< --spec: decode window size; 2 or more asks the model to load its drafter
 };
 
 struct DecodeRequest {
@@ -77,8 +73,7 @@ struct DecodeRequest {
     int n_tokens = 0;
     int64_t pos = 0;
     int32_t* next_token = nullptr;    ///< greedy token after the window's last row (optional)
-    float* logits = nullptr;          ///< n_vocab logits after the window's last row (optional); a window of several rows fills n_tokens rows
-    int32_t* row_tokens = nullptr;    ///< greedy token after each of the n_tokens rows (optional)
+    float* logits = nullptr;          ///< n_vocab logits after the window's last row (optional)
 };
 
 struct PrefillRequest {
@@ -95,12 +90,6 @@ public:
     virtual ~ModelSession() = default;
     virtual Result decode_window(const DecodeRequest& r) = 0;
     virtual Result prefill_chunk(const PrefillRequest& r) = 0;
-    /// Drafts the tokens after `anchor`, the next token to feed at `pos` (up to `max_n`, with the draft's confidence in
-    /// [0,1] each). Features of the rows of a decode window before `pos` are folded into the drafter first.
-    virtual Result draft(int32_t anchor, int64_t pos, int32_t* ids, float* conf, int max_n, int* n_out) {
-        (void) anchor; (void) pos; (void) ids; (void) conf; (void) max_n; (void) n_out;
-        return {Status::NotImplemented, "this model has no drafter"};
-    }
     /// Takes the memory the session will hold (expert tiers), so the first request does not wait for it.
     virtual Result prepare() { return {}; }
     /// Keeps the state at `pos` (the end of the prompt's held text) so a later prompt can restart there. A session that
@@ -131,12 +120,6 @@ public:
     virtual Result make_session(std::unique_ptr<ModelSession>& out) = 0;
 };
 
-/// Optional drafter (speculative decoding). Opaque to shared code until a second model needs one.
-class Drafter {
-public:
-    virtual ~Drafter() = default;
-};
-
 class ModelAdapter {
 public:
     virtual ~ModelAdapter() = default;
@@ -147,8 +130,6 @@ public:
     /// Geometry from the file's metadata.
     virtual ModelDesc describe(const GgufFile& meta) const = 0;
     virtual Result load(const LoadRequest& req, std::unique_ptr<LoadedModel>& out) const = 0;
-    /// Null when the model has no drafter.
-    virtual std::unique_ptr<Drafter> drafter() const { return nullptr; }
     virtual std::vector<SideTableSpec> side_tables(const ModelDesc&) const { return {}; }
     virtual TokenizerSpec tokenizer_spec() const = 0;
 };

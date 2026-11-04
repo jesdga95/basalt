@@ -71,13 +71,6 @@ struct CompressArgs {
 /// Rows are visible to a query at position p when row < (p+1)/ratio.
 void compress(const CompressArgs& a, const float* x, const int32_t* pos, int n_tokens, void* workspace, void* stream);
 
-/// A speculative window: as compress(), but the carried state is only read. The rows of the call stay in `workspace`
-/// (compress_workspace_bytes, one per layer) until compress_window_commit stores the accepted ones into the state, so
-/// a rejected tail leaves no trace. Group rows and index keys are written by position and are simply overwritten when
-/// those positions run again.
-void compress_window(const CompressArgs& a, const float* x, const int32_t* pos, int n_tokens, void* workspace, void* stream);
-/// Folds the first `n_accepted` tokens of the last compress_window call (same `pos`, `workspace`) into the state.
-void compress_window_commit(const CompressArgs& a, const int32_t* pos, int n_accepted, void* workspace, void* stream);
 
 // ---- indexer --------------------------------------------------------------------------------------------------
 

@@ -11,7 +11,6 @@ Inputs
   --sections-from BASE.basalt  with --gguf: the drafter and vision sections are copied from BASE byte for byte (BASE's
                      vocabulary must be the GGUF's); replaces --mmproj, --mtp-* and --draft-vocab
   --mmproj FILE      the vision projector GGUF (required unless --no-vision)
-  --dspark FILE      deepseek41 only: the DSpark drafter GGUF, stored whole as the dspark/gguf section
   --mtp-source DIR   the draft layer's BF16 tensors from `mtp_fetch.py fetch --out DIR`; without it there is no drafter
   --mtp-dense FILE   a tuned `mtp/dense` section (raw bytes, same layout as the source; needs --mtp-source); the packs
                      with a self-distilled MTP layer carry one. Its size is checked and its SHA-256 goes to meta.mtp.
@@ -252,16 +251,6 @@ def convert(a) -> None:
                  if v]
         if given:
             die(f"{arch.name} packs have no drafter or hc8 sections; drop {', '.join(given)}")
-    dspark = Path(a.dspark) if getattr(a, "dspark", None) else None
-    if dspark is not None:
-        if not arch.dspark_ok:
-            die(f"{arch.name} packs take no --dspark drafter")
-        if not dspark.is_file():
-            die(f"missing input: {dspark}")
-        with open(dspark, "rb") as f:
-            head = f.read(1 << 20)
-        if head[:4] != b"GGUF" or b"dflash" not in head:
-            die(f"{dspark} is not a DSpark (dflash) drafter GGUF")
     vision = arch.side_sections and not a.no_vision
     if arch.mmproj_only and a.mmproj and not a.no_vision:
         vision = True
@@ -375,8 +364,6 @@ def convert(a) -> None:
             if arch.side_sections:
                 job.hc8()
             written = {e[0] for e in w.entries}
-            if dspark is not None:
-                job.file("dspark/gguf", dspark)
             if vision and base is None:
                 job.file("vision/mmproj", mmproj)
                 for name, data, src, off, size in vision_extra:
@@ -390,7 +377,7 @@ def convert(a) -> None:
 
             sources = [{"path": p.name, "size": p.stat().st_size,
                         "fingerprint_sha256_first_last_64mib_and_size": fingerprint(p)}
-                       for p in model.paths + ([mmproj] if vision and base is None else []) + ([dspark] if dspark else [])]
+                       for p in model.paths + ([mmproj] if vision and base is None else [])]
             meta = {
                 "format": "basalt", "version": 2, "name": a.name,
                 "converter": {"tool": "tools/convert/convert.py"},
@@ -408,8 +395,6 @@ def convert(a) -> None:
                 "vision": base_meta.get("vision") if base is not None else None if not vision else {"mmproj": "vision/mmproj", "mmproj_bytes": mmproj.stat().st_size,
                                                     "extra": [v[0] for v in vision_extra]},
                 **arch.meta_extra(kv, {n: t for n, _, _, _, t in tensors}, own),
-                **({"dspark": {"section": "dspark/gguf", "bytes": dspark.stat().st_size, "architecture": "dflash"}}
-                   if dspark else {}),
             }
             if base is not None:
                 meta["sections_from"] = {"path": Path(a.sections_from).name, "size": Path(a.sections_from).stat().st_size,
@@ -671,7 +656,6 @@ def main():
     ap.add_argument("--gguf", action="append", metavar="FILE",
                     help="the model's GGUF: shard 1 of a split model (the others are found beside it), or repeat per shard")
     ap.add_argument("--mmproj", help="vision projector GGUF (required unless --no-vision)")
-    ap.add_argument("--dspark", metavar="FILE", help="the DSpark drafter GGUF, stored whole as dspark/gguf (deepseek41 only)")
     ap.add_argument("--out", required=True, help="the .basalt file to write")
     ap.add_argument("--mtp-source", metavar="DIR", help="the drafter's BF16 tensors written by tools/convert/mtp_fetch.py fetch")
     ap.add_argument("--mtp-dense", metavar="FILE", help="a tuned (self-distilled) mtp/dense section to embed (needs --mtp-source)")

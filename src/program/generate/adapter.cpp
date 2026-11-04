@@ -226,7 +226,7 @@ int adapter_generate(basalt::model::LoadedModel& loaded, const std::vector<int64
 // DONE's reuse field); any other prompt starts from an empty sequence. Sampling keys: temperature, top_p,
 // top_k, min_p, seed; the rest are ignored.
 int adapter_serve(basalt::model::LoadedModel& loaded, int64_t max_context, int64_t pad_id,
-                         const std::vector<int64_t>& stop_ids, int spec_k) {
+                         const std::vector<int64_t>& stop_ids) {
     std::unique_ptr<basalt::model::ModelSession> sess;
     const basalt::model::Result mr = loaded.make_session(sess);
     if (!mr.ok()) {
@@ -442,44 +442,6 @@ int adapter_serve(basalt::model::LoadedModel& loaded, int64_t max_context, int64
             if (made >= max_new) break;
             if (stop_seen()) { finish = "stop"; break; }
             cur = next;
-            // greedy with a drafter: the anchor and its drafts verified in one window, the longest agreeing prefix kept
-            const int nd_max = (int) std::min<long long>({(long long) spec_k, max_new - made - 1, (long long) max_context - pos - 1});
-            if (spec_k > 0 && !sample && nd_max > 0) {
-                int32_t d[5], win[6], out[6];
-                float conf[5];
-                int nd = 0;
-                basalt::model::Result rr = sess->draft(cur, pos, d, conf, nd_max, &nd);
-                if (!rr.ok()) { std::printf("ERR %s\n", rr.message.c_str()); failed = true; break; }
-                win[0] = cur;
-                for (int j = 0; j < nd; ++j) win[1 + j] = d[j];
-                dr.tokens = win;
-                dr.n_tokens = 1 + nd;
-                dr.pos = pos;
-                dr.next_token = nullptr;
-                dr.logits = nullptr;
-                dr.row_tokens = out;
-                rr = sess->decode_window(dr);
-                dr.row_tokens = nullptr;
-                if (!rr.ok()) { std::printf("ERR %s\n", rr.message.c_str()); failed = true; break; }
-                int m = 0;
-                while (m < nd && d[m] == out[m]) ++m;
-                pos += m + 1;
-                next = out[m];
-                if (!held.empty()) {
-                    held.push_back(cur);
-                    held.insert(held.end(), d, d + m);
-                }
-                bool leave = false;
-                for (int j = 0; j < m && !leave; ++j) {
-                    std::printf("T %d\n", d[j]);
-                    std::fflush(stdout);
-                    ++made;
-                    for (int64_t s : stop_ids) if (s == d[j]) { finish = "stop"; leave = true; }
-                    if (!leave && made >= max_new) leave = true;
-                }
-                if (leave) break;
-                continue;
-            }
             dr.tokens = &cur;
             dr.n_tokens = 1;
             dr.pos = pos++;
@@ -525,22 +487,21 @@ std::optional<int> run_adapter_model(const Options& o, const basalt::core::Model
         }
         g_n_vocab = desc.n_vocab;
         std::unique_ptr<basalt::model::LoadedModel> loaded;
-        basalt::model::LoadRequest lreq{o.native_shards, o.diag_fixture, o.diag_dump, o.diag_mmproj, o.diag_tier_ram,
-                                        o.diag_tier_vram, o.diag_dspark};
+        basalt::model::LoadRequest lreq;
+        lreq.paths = o.native_shards;
+        lreq.diag_dump = o.diag_dump;
+        lreq.diag_tier_ram = o.diag_tier_ram;
+        lreq.diag_tier_vram = o.diag_tier_vram;
         lreq.max_context = o.max_context;
         lreq.max_context_set = o.max_context_set;
-        lreq.spec = o.spec;
         const basalt::model::Result r = adapter->load(lreq, loaded);
         if (r.status == basalt::model::Status::UseEnginePath) return std::nullopt;
         if (!r.ok() || !loaded) return fatal_start_error(r.message);
         std::vector<int64_t> stop = {1};
         if (o.stop_eos) stop.insert(stop.end(), o.eos_ids.begin(), o.eos_ids.end());
         else stop.clear();
-        // --spec N drafts N - 1 tokens per window (greedy requests)
-        const int spec_k = o.spec >= 2 ? o.spec - 1 : 0;
-        if (spec_k > 5) return fatal_start_error("--spec takes 2..6 for this model");
         if (o.serve)
-            return adapter_serve(*loaded, loaded->context() ? loaded->context() : o.max_context, o.image_pad_id, stop, spec_k);
+            return adapter_serve(*loaded, loaded->context() ? loaded->context() : o.max_context, o.image_pad_id, stop);
         return adapter_generate(*loaded, o.tokens, o.max_new, stop, o.images, o.image_at);
     } catch (const std::exception& e) {
         return fatal_start_error(e.what());
