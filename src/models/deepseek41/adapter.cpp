@@ -50,6 +50,7 @@ public:
         if (!m->resolve_context(req.max_context, req.max_context_set, err)) return {model::Status::Error, err};
         m->set_diag_dump(req.diag_dump);
         m->set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
+        m->set_tiers(req);
         if (!req.peer_devices.empty()) m->set_peer_device(req.peer_devices.front());
         if (req.peer_devices.size() > 1) basalt::log::warn("basalt deepseek41", "one second card holds experts; later cards idle");
         out = std::move(m);

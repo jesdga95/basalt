@@ -180,6 +180,21 @@ public:
         return {};
     }
 
+    model::Result set_low_memory(bool low, int64_t& expert_slots) override {
+        std::string e;
+        ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        if (t == nullptr) return {model::Status::Error, e.empty() ? std::string("this session has no expert tier") : e};
+        cudaStreamSynchronize(stream_);
+        if (low) {
+            t->lend_all();
+        } else {
+            if (!t->reclaim(e)) return {model::Status::Error, e};
+            t->grow();
+        }
+        expert_slots = t->slots();
+        return {};
+    }
+
     void end_prompt() override {
         if (prefill_) close_prompt_path();
     }

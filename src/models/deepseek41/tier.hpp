@@ -102,6 +102,9 @@ public:
     /// The main card holds homes: they stay through a prompt, and a short prompt keeps the copies beside them.
     bool has_homes() const { return homes_.main > 0; }
 
+    /// The VRAM slots open now, every layer's.
+    int64_t slots() const { return (int64_t) n_layers_ * (per_layer_ + ext_per_layer_); }
+
     void report(const char* tag) const;
 
 private:
@@ -115,6 +118,7 @@ private:
     bool load_ram(std::string& err);
     bool open_peer(const float* h_x, float* h_rows, std::string& err);
     int ranked(int layer, int r) const;
+    bool load_rank(std::string& err);
     void seed_copies(int first_rank, int64_t n);
     void preread();
     bool pinned(int layer, int e) const { return ram_idx_[(size_t) layer * n_expert_ + e] >= 0; }
@@ -150,6 +154,7 @@ private:
 
     std::vector<uint8_t*> ram_;             ///< [layer] cover_ + 1 pinned expert slots (the last starts as the spare)
     policy::Homes homes_;
+    std::vector<int32_t> rank_;             ///< [layer * n_expert + rank] expert; empty: the file's order
     int cover_ = 0;                         ///< experts per layer in the RAM tier
     std::vector<int32_t> ram_idx_;          ///< [layer * n_expert + e] pinned slot or -1
     std::vector<int32_t> spare_;            ///< [layer] pinned slot free for a swap, or -1

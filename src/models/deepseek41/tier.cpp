@@ -26,16 +26,11 @@ namespace {
 
 constexpr uint64_t kRamHeadroom = 20ull << 30;   // host memory left to the system beside the RAM tier
 constexpr uint64_t kRamHeadroomNoFile = 16ull << 30;   // ... when no expert is read through the page cache
-constexpr uint64_t kPeerReserve = 600ull << 20;  // second card memory left free beside its slots
 constexpr size_t kMaxPending = 128;              // promotions in flight
 constexpr uint64_t kPrereadBytes = 12ull << 30;  // file-backed experts read ahead into the page cache
 
 // The usual routing order of this model's experts: the RAM and VRAM tiers start from the head of it.
 constexpr int kRankLayers = 40, kRankExperts = 384;
-constexpr uint16_t kExpertRank[kRankLayers][kRankExperts] =
-#include "models/deepseek41/expert_rank.inc"
-;
-
 }  // namespace
 
 ExpertTier::ExpertTier(const DsModel& model) : m_(model) {}
@@ -81,8 +76,15 @@ bool ExpertTier::open(const Reserve& reserve, const float* h_x, float* h_rows, s
     auto slots_in = [&](uint64_t room, uint64_t left_free) {
         return (int) std::min<uint64_t>(room > left_free ? (room - left_free) / one_each : 0, (uint64_t) n_expert_);
     };
-    int copies = slots_in(free_b, reserve.copies);
-    int main_homes = slots_in(free_b, reserve.homes);
+    if (!load_rank(err)) return false;
+    const uint64_t asked_free = (uint64_t) m_.tiers().vram_reserve_mib << 20;
+    int copies = slots_in(free_b, reserve.copies + asked_free);
+    int main_homes = slots_in(free_b, reserve.homes + asked_free);
+    if (m_.tiers().expert_cache > 0) {
+        const int per_layer = m_.tiers().expert_cache / n_layers_;
+        copies = std::min(copies, per_layer);
+        main_homes = std::min(main_homes, per_layer);
+    }
     if (m_.diag_tier_vram() >= 0) {
         copies = std::min(copies, m_.diag_tier_vram());
         main_homes = std::min(main_homes, m_.diag_tier_vram());
@@ -93,7 +95,7 @@ bool ExpertTier::open(const Reserve& reserve, const float* h_x, float* h_rows, s
         peer_ = std::make_unique<PeerTier>();
         std::string pe;
         if (peer_->open(m_.peer_device(), n_layers_, n_expert_, g.n_embd, g.n_ff_exp, h_x, h_rows, pe)) {
-            peer_slots = slots_in(peer_->room(), kPeerReserve);
+            peer_slots = slots_in(peer_->room(), (uint64_t) m_.tiers().peer_reserve_mib << 20);
         } else {
             basalt::log::warn("basalt deepseek41", "second card not used: %s", pe.c_str());
             peer_.reset();
@@ -107,6 +109,11 @@ bool ExpertTier::open(const Reserve& reserve, const float* h_x, float* h_rows, s
         return (int) std::min<uint64_t>(avail > left_free ? (avail - left_free) / one_each_ram : 0, (uint64_t) n_expert_);
     };
     int ram_slots = ram_in(kRamHeadroom), ram_no_file = ram_in(kRamHeadroomNoFile);
+    if (m_.tiers().resident_budget > 0) {
+        const int budget = (int) std::min<uint64_t>(m_.tiers().resident_budget / one_each_ram, (uint64_t) n_expert_);
+        ram_slots = std::min(ram_slots, budget);
+        ram_no_file = std::min(ram_no_file, budget);
+    }
     if (m_.diag_tier_ram() >= 0) ram_slots = ram_no_file = std::min(m_.diag_tier_ram(), n_expert_);
     homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots, ram_no_file);
     if (homes_.peer == 0) peer_.reset();
@@ -157,7 +164,8 @@ bool ExpertTier::open(const Reserve& reserve, const float* h_x, float* h_rows, s
         fmt_.push_back(f);
     }
     act_ = (uint8_t*) platform::alloc_aligned(kernels::cpu::kNativeActBytes * kMaxWindow, 64);
-    pool_ = std::make_unique<kernels::cpu::ExpertPool>((int) kernels::cpu::physical_cores(true).size());
+    const int workers = m_.tiers().pool_workers > 0 ? m_.tiers().pool_workers : (int) kernels::cpu::physical_cores(true).size();
+    pool_ = std::make_unique<kernels::cpu::ExpertPool>(workers, m_.tiers().pool_affinity_given ? m_.tiers().pool_affinity : kernels::cpu::PoolAffinity::All);
 
     if (!load_ram(err)) return false;
     if (homes_.main > 0) {
@@ -168,7 +176,7 @@ bool ExpertTier::open(const Reserve& reserve, const float* h_x, float* h_rows, s
     }
     // what the start picked by itself, on the server's auto line; the RAM floor the tier left free
     std::printf("auto flags: resident %.1f GB, pool-workers %d\n",
-                (double) one_each_ram * cover_ / 1e9, pool_->workers());
+                (double) one_each_ram * cover_ / 1e9, pool_->workers());   // the server keeps the words after the name
     std::fflush(stdout);
     basalt::log::info("basalt generate", "RAM floor %.1f GiB", (double) (homes_.file > 0 ? kRamHeadroom : kRamHeadroomNoFile) / 1073741824.0);
     basalt::log::info("basalt deepseek41", "expert homes of %d per layer: main card %d, second card %d, RAM %d, file %d; main card copies %lld",
@@ -322,7 +330,29 @@ bool ExpertTier::load_ram(std::string& err) {
 }
 
 int ExpertTier::ranked(int layer, int r) const {
-    return n_layers_ == kRankLayers && n_expert_ == kRankExperts ? kExpertRank[layer][r] : r;
+    return rank_.empty() ? r : rank_[(size_t) layer * n_expert_ + r];
+}
+
+// The routing order from the profile file: per layer, the order its pairs come in.
+bool ExpertTier::load_rank(std::string& err) {
+    const std::string& path = m_.tiers().expert_profile;
+    if (path.empty()) return true;
+    uint64_t bytes = 0;
+    if (!platform::file_size(path, bytes)) {
+        err = "cannot read the expert profile " + path;
+        return false;
+    }
+    std::vector<std::pair<int32_t, int32_t>> pairs;
+    int64_t slots = 0;
+    if (!core::read_expert_profile(core::FileRange{path, 0, bytes}, n_layers_, n_expert_, pairs, slots, err)) return false;
+    if (pairs.size() != (size_t) n_layers_ * n_expert_) {
+        err = "the expert profile " + path + " does not rank every expert";
+        return false;
+    }
+    rank_.resize(pairs.size());
+    std::vector<int32_t> next((size_t) n_layers_, 0);
+    for (const auto& [layer, e] : pairs) rank_[(size_t) layer * n_expert_ + next[(size_t) layer]++] = e;
+    return true;
 }
 
 // Copies the most routed RAM tier experts from rank `first_rank` on into `n` slots of each layer.
