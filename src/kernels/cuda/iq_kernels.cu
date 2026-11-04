@@ -612,7 +612,7 @@ __device__ __forceinline__ void tail_scale(float (&s)[NC], float sc) {
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
 #define GU_FMTS(X) X(16) X(17) X(18) X(19) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(8) X(40)
-#define D_FMTS(X) X(14) X(16) X(17) X(19) X(20) X(22) X(23) X(42) X(7) X(6) X(8) X(40)
+#define D_FMTS(X) X(14) X(16) X(17) X(19) X(20) X(22) X(23) X(29) X(42) X(7) X(6) X(8) X(40)
 #define MMVQ_FMTS(X) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8) X(40)
 
 __device__ __forceinline__ float warp_sum(float v) {

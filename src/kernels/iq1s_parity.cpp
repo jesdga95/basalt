@@ -72,6 +72,15 @@ std::vector<uint8_t> random_rows(int type, int64_t rows, int64_t n, float scale,
     for (auto& b : w) b = (uint8_t) byte(rng);
     for (size_t o = 0; o < w.size(); o += bs) {
         const uint16_t h = f16_bits(scale, rng);
+        if (type == GGML_TYPE_IQ1_M) {   // the fp16 scale sits in the top nibbles of the block's last four int16
+            for (int i = 0; i < 4; ++i) {
+                uint16_t sc;
+                std::memcpy(&sc, &w[o + bs - 8 + 2 * (size_t) i], 2);
+                sc = (uint16_t) ((sc & 0x0FFF) | (((h >> (4 * i)) & 0xF) << 12));
+                std::memcpy(&w[o + bs - 8 + 2 * (size_t) i], &sc, 2);
+            }
+            continue;
+        }
         std::memcpy(&w[o], &h, 2);
     }
     return w;
@@ -110,7 +119,7 @@ std::vector<double> ref_expert(const std::vector<float>& wg, const std::vector<f
     return out;
 }
 
-const char* nm(int t) { return t == 19 ? "IQ1_S" : t == 16 ? "IQ2_XXS" : t == 17 ? "IQ2_XS" : t == 22 ? "IQ2_S" : "?"; }
+const char* nm(int t) { return t == 19 ? "IQ1_S" : t == 16 ? "IQ2_XXS" : t == 17 ? "IQ2_XS" : t == 22 ? "IQ2_S" : t == 29 ? "IQ1_M" : "?"; }
 
 struct Expert {
     std::vector<uint8_t> blob;          // [gate | up | down]
@@ -599,6 +608,11 @@ int main(int argc, char** argv) {
     cpu_pair(16, 22, rng);   // the other pairs of the mixed-format packs
     cpu_pair(16, 17, rng);
     cpu_pair(17, 17, rng);
+    cpu_pair(29, 29, rng);   // the GSQ-RCO non-uniform layers
+    cpu_pair(16, 29, rng);
+    cpu_pair(17, 29, rng);
+    cpu_pair(29, 16, rng);
+    cpu_pair(17, 16, rng);
 #ifdef BASALT_IQ1S_GPU
     if (!cpu_only) {
         cudaStream_t s;
@@ -610,6 +624,11 @@ int main(int argc, char** argv) {
         gpu_pair(16, 22, bench, s);
         gpu_pair(16, 17, bench, s);
         gpu_pair(17, 17, bench, s);
+        gpu_pair(29, 29, bench, s);
+        gpu_pair(16, 29, bench, s);
+        gpu_pair(17, 29, bench, s);
+        gpu_pair(29, 16, bench, s);
+        gpu_pair(17, 16, bench, s);
     }
 #else
     (void) cpu_only;

@@ -23,12 +23,13 @@ struct Dims {
     int64_t n_embd = 0, n_used = 0, n_expert = 0, n_ff_exp = 0;
     int64_t hc_coef = 24, hc_splits = 8, engram_cols = 0;
     uint64_t expert_blob_bytes = 0;   // the largest expert
+    bool grouped = false;             // a layer takes the grouped kernels: their scratch and the tokens as q8_1
 };
 
 /// Device bytes that grow with the chunk: streams and scratch rows, router outputs, the expert inputs.
 inline uint64_t per_token_bytes(const Dims& d) {
     const uint64_t n = (uint64_t) d.n_embd;
-    return 4 * (19 * n + (uint64_t) d.hc_coef * 3 + (uint64_t) d.n_expert + 16 + (uint64_t) d.engram_cols +
+    return (d.grouped ? n * 36 / 32 : 0) + 4 * (19 * n + (uint64_t) d.hc_coef * 3 + (uint64_t) d.n_expert + 16 + (uint64_t) d.engram_cols +
                 (uint64_t) d.n_used * n + (uint64_t) d.hc_splits * (uint64_t) (d.hc_coef + 1));
 }
 
@@ -36,7 +37,8 @@ inline uint64_t per_token_bytes(const Dims& d) {
 inline uint64_t fixed_bytes(const Dims& d) {
     const uint64_t R = (uint64_t) kStageRows;
     const uint64_t q8 = (uint64_t) d.n_embd * R * 36 / 32 + (uint64_t) d.n_ff_exp * R * 36 / 32;
-    return q8 + R * (uint64_t) d.n_ff_exp * 12 + R * 4 + 2 * (d.expert_blob_bytes * kStageExperts + R * 8);
+    const uint64_t grouped = d.grouped ? R * (uint64_t) d.n_ff_exp * 14 + kStageExperts * 8 + 4 : 0;
+    return q8 + grouped + R * (uint64_t) d.n_ff_exp * 12 + R * 4 + 2 * (d.expert_blob_bytes * kStageExperts + R * 8);
 }
 
 inline uint64_t workspace_bytes(const Dims& d, int chunk) { return fixed_bytes(d) + per_token_bytes(d) * (uint64_t) chunk; }
