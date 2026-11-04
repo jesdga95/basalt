@@ -564,7 +564,7 @@ private:
                 const DevTensor* kvw = m_.tensor(il, "engram_kv.weight");
                 const DevTensor* gw = m_.tensor(il, "engram_gate.weight");
                 if (!kvw || !gw) return fail("layer " + std::to_string(il) + " has no Engram tensors");
-                kernels::native_q6_k_f32(kvw->ptr, rows_dev_, q8_, kv_dev_, n_cols * 256, (int) (5 * n), T, st);
+                dense_f32(*kvw, rows_dev_, q8_, kv_dev_, n_cols * 256, (int) (5 * n), T, st);
                 EngramArgs ea;
                 ea.n_embd = (int) n;
                 engram_apply(kv_dev_, (const float*) gw->ptr, nullptr, T, ea, x_, st);
@@ -578,7 +578,7 @@ private:
         hc_pre(x_, coef_f_[(g_.n_layers - 1) & 1], kHcCoef, T, (int) n, cur_, st);
         rms_norm(cur_, (const float*) m_.tensor("output_norm.weight")->ptr, T, (int) n, g_.rms_eps, normed_, st);
         const DevTensor* head = m_.tensor("output.weight");
-        kernels::native_q6_k_f32(head->ptr, normed_, q8_, logits_, (int) n, g_.n_vocab, T, st);
+        dense_f32(*head, normed_, q8_, logits_, (int) n, g_.n_vocab, T, st);
         argmax_rows(logits_, T, g_.n_vocab, am_dev_, am_ws_, st);
         DS_CUDA(cudaMemcpyAsync(h_next_, am_dev_, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, stream_));
         if (logits_out)
@@ -663,7 +663,7 @@ private:
                 const DevTensor* gw = m_.tensor(il, "engram_gate.weight");
                 if (!kvw || !gw) return fail("layer " + std::to_string(il) + " has no Engram tensors");
                 dump("engram_rows", il, pos, rows_dev_, rows_f.size() * sizeof(float));
-                kernels::native_q6_k_f32(kvw->ptr, rows_dev_, q8_, kv_dev_, (int) rows_f.size(), (int) (5 * n), 1, st);
+                dense_f32(*kvw, rows_dev_, q8_, kv_dev_, (int) rows_f.size(), (int) (5 * n), 1, st);
                 dump("engram_kv", il, pos, kv_dev_, 5 * n * sizeof(float));
                 EngramArgs ea;
                 ea.n_embd = (int) n;
@@ -693,7 +693,7 @@ private:
         rms_norm(cur_, (const float*) m_.tensor("output_norm.weight")->ptr, T, (int) n, g_.rms_eps, normed_, st);
         dump("result_norm", -1, pos, normed_, n * sizeof(float));
         const DevTensor* head = m_.tensor("output.weight");
-        kernels::native_q6_k_f32(head->ptr, normed_, q8_, logits_, (int) n, g_.n_vocab, 1, st);
+        dense_f32(*head, normed_, q8_, logits_, (int) n, g_.n_vocab, 1, st);
         if (next && !logits_out) {
             // greedy: the id comes back, not the logits
             argmax_index(logits_, g_.n_vocab, am_dev_, am_ws_, st);

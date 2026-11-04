@@ -92,7 +92,7 @@ public:
                  cudaEventCreateWithFlags(&b.copied, cudaEventDisableTiming) == cudaSuccess &&
                  cudaEventCreateWithFlags(&b.done, cudaEventDisableTiming) == cudaSuccess;
         if (any_grouped)
-            ok = ok && dev(gq_, kernels::native_q8_1_bytes(g_.n_embd, cap_)) && dev(gscratch_, kernels::native_expert_scratch_bytes(R, ff)) &&
+            ok = ok && dev(gq_, kernels::native_q8_1_bytes(g_.n_embd, 1) * (size_t) cap_) && dev(gscratch_, kernels::native_expert_scratch_bytes(R, ff)) &&
                  dev(gptr_, kStageExperts * 8) && dev(gcount_, 4);
         ok = ok && cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) == cudaSuccess;
         if (!ok) {
