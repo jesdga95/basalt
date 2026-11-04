@@ -2,6 +2,7 @@
 
 # The model's CUDA kernels: GDN, gated residual, QSA, heads, router, shared expert, verify, KV, control vectors.
 add_library(model_qwen4exp_kernels STATIC
+  src/models/qwen4exp/kernels/dec_moe.cu
   src/models/qwen4exp/kernels/s2_gemv.cu
   src/models/qwen4exp/kernels/s_gemv.cu
   src/models/qwen4exp/kernels/router_top10.cu
