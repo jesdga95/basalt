@@ -81,6 +81,24 @@ protected:
     // per-request sampling (greedy when temperature is absent)
     basalt::kernels::SamplerParams req_sp{};
     bool cancelled{};
+    int64_t p{};
+    int32_t x{};
+    // what the session holds once this request is done: the prompt read so far, then every committed token
+    std::vector<int32_t> consumed{};
+    const char* finish{};
+    std::string kv_stop{};   // the next window could not be backed: the request ends on this error
+    int64_t produced_n{};
+    int64_t draft_offered{};
+    int64_t draft_accepted{};
+    double decode_ms{};
+    Clock::time_point d0{};
+    int64_t fresh{};
+    int64_t read_n{};
+    bool ram_out{};
+    // "12288 of 98179" when cancelled mid-read, the rate from what was read
+    char read_txt[64]{};
+    /// DONE's tier fields.
+    struct DoneCounts { int64_t hits = 0, lookups = 0, ram_blobs = 0, file_blobs = 0; double file_mb = 0; int64_t offloaded = 0; };
     int64_t yielded_at{};
     int yielded_slot{};
     int64_t turn_at{};
@@ -95,9 +113,20 @@ protected:
     virtual Flow prepare_image() = 0;
     Flow read_prompt();
     virtual Flow decode() = 0;
-    virtual Flow complete() = 0;
+    Flow complete();
     virtual bool parse_begin() { return true; }
     virtual float default_relax() const { return 0.0f; }
+    // ---- the end of a request
+    virtual Flow complete_begin() { return Flow::proceed; }
+    virtual DoneCounts done_counts() { return {}; }
+    virtual bool tiers_settle() { return true; }
+    virtual bool admit_draft() { return true; }
+    virtual void slot_state_back(int) {}
+    virtual bool slot_draft_keep(int) { return true; }
+    virtual void slot_set_sampling(int) {}
+    virtual void slot_init(BSlot&) {}
+    virtual bool slot_leave() { return true; }
+    virtual void report_request(const DoneCounts&) {}
     // ---- reading the prompt, per part.  read_to: Flow::quit when a stop ended the read.
     virtual bool prompt_begin() { return true; }
     virtual Flow set_sampling() = 0;
