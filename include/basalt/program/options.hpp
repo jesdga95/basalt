@@ -60,9 +60,9 @@ struct CommonOptions {
     bool resident_budget_given = false;  // --resident-budget-gib on the command line
     bool pool_affinity_given = false;    // --pool-affinity on the command line
     bool pool_workers_given = false;     // --pool-workers on the command line
-    /// Stop when the model emits an end-of-turn token (<|endoftext|> 248044, <|im_end|> 248046, or --eos-ids).
+    /// Stop when the model emits an end-of-turn token (the pack's own, or --eos-ids).
     bool stop_eos = false;
-    std::vector<int64_t> eos_ids = {248044, 248046};
+    std::vector<int64_t> eos_ids;
     /// --gpu: the cards this run uses (gpu_select.hpp); empty = GPU 0 alone.  --gpu-plan prints the choice and exits.
     std::string gpu;
     bool gpu_plan = false;
@@ -72,6 +72,7 @@ struct CommonOptions {
     std::string diag_logits;               ///< --diag-logits FILE: an adapter model writes the logits of each decoded row
     std::vector<std::string> images;       ///< --image FILE ... with --image-at N: the picture's block goes before token N
     std::vector<int64_t> image_at;
+    bool image_pad_given = false;
     int64_t image_pad_id = -1;             ///< --image-pad-id: the prompt token that stands for a picture's rows (--serve)
     bool max_context_set = false;          ///< --max-context was given (a model with its own default picks one otherwise)
     /// Stay resident and take requests on stdin (see the --serve block in main).
@@ -99,9 +100,10 @@ struct CommonOptions {
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
     /// prompt, which every chat of the same client shares - when that is at least N tokens (0 = never)
     int64_t prompt_cache_root = 2048;
-    /// --serve: the token that opens a chat turn (<|im_start|>).  The last one in a prompt is where the chat's
+    /// --serve: the token that opens a chat turn (the pack's own, or --turn-token).  The last one in a prompt is where the chat's
     /// history ends and the new assistant turn begins, which is the checkpoint the next request can reuse.
-    int64_t turn_token = 248045;
+    int64_t turn_token = -1;
+    bool turn_token_given = false;
     /// --serve (opt-in): the role token of a short turn the server puts right before the new assistant turn (the
     /// "system" of a trailing reasoning-effort turn).  When the turn before the last <|im_start|> opens with it,
     /// the checkpoint goes in front of that turn instead, so it holds the conversation and not the effort text.

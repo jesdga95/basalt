@@ -45,6 +45,29 @@ std::optional<int> find_model(int argc, char** argv, const model::ModelAdapter*&
     return std::nullopt;
 }
 
+// What the flags left unset: each id is the pack's own token.
+void pack_tokens(const model::ModelAdapter& adapter, CommonOptions& o) {
+    basalt::core::ModelFile file;
+    std::string err;
+    std::vector<uint8_t> text;
+    basalt::core::Json vocab;
+    if (!file.open(o.model, err) || !file.load_meta(err) || !basalt::core::read_range(file.range("tokenizer/vocab.json"), text, err) ||
+        !basalt::core::parse_json((const char*) text.data(), text.size(), vocab, err)) {
+        basalt::log::warn("basalt", "the pack's vocabulary cannot be read (%s): no end-of-turn or turn token", err.c_str());
+        return;
+    }
+    auto id_of = [&](const std::string& name) -> int64_t {
+        const basalt::core::Json* v = vocab.get(name);
+        return v != nullptr ? (int64_t) v->u64() : -1;
+    };
+    const model::TokenNames names = adapter.token_names();
+    if (o.eos_ids.empty())
+        for (const std::string& name : names.eos)
+            if (const int64_t id = id_of(name); id >= 0) o.eos_ids.push_back(id);
+    if (!o.turn_token_given) o.turn_token = id_of(names.turn);
+    if (!o.image_pad_given) o.image_pad_id = id_of(names.image_pad);
+}
+
 }  // namespace
 
 std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& out, const model::ModelAdapter*& adapter) {
@@ -67,6 +90,7 @@ std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& 
     out = adapter != nullptr ? adapter->make_options() : std::make_unique<CommonOptions>();
     CommonOptions& o = *out;
     if (const auto code = parse_options(argc, argv, o, adapter)) return *code;
+    if (adapter != nullptr) pack_tokens(*adapter, o);
     // Batched serving reads a prompt on its own thread while verify windows run.  A lazy kernel load on that thread
     // synchronizes the context and can wait on a window kernel that waits on the load, so batched serving loads every
     // kernel up front.  An explicit CUDA_MODULE_LOADING wins.
