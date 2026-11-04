@@ -101,6 +101,8 @@ public:
         (void) anchor; (void) pos; (void) ids; (void) conf; (void) max_n; (void) n_out;
         return {Status::NotImplemented, "this model has no drafter"};
     }
+    /// Takes the memory the session will hold (expert tiers), so the first request does not wait for it.
+    virtual Result prepare() { return {}; }
     /// Keeps the state at `pos` (the end of the prompt's held text) so a later prompt can restart there. A session that
     /// cannot rewind leaves the default.
     virtual Result checkpoint(int64_t pos) { (void) pos; return {Status::NotImplemented, "this model keeps no checkpoint"}; }

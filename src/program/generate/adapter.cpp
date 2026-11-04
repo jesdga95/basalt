@@ -24,6 +24,8 @@ namespace {
 
 bool g_diag_serial_prompt = false;   // --diag-serial-prompt
 bool g_serve_quit = false;           // QUIT ended the serve loop
+std::FILE* g_diag_logits = nullptr;  // --diag-logits FILE: each decoded row's logits (the serial prompt and the last prompt token)
+int64_t g_n_vocab = 0;
 
 /// A picture's embedding block, placed before the prompt token at `at`.
 struct AdapterImage {
@@ -86,7 +88,13 @@ bool adapter_prompt(basalt::model::ModelSession& sess, const std::vector<int32_t
                     one.n_tokens = 1;
                     one.pos = pos + t;
                     one.next_token = &row_next;
+                    std::vector<float> row_logits;
+                    if (g_diag_logits) {
+                        row_logits.resize((size_t) g_n_vocab);
+                        one.logits = row_logits.data();
+                    }
                     r = sess.decode_window(one);
+                    if (g_diag_logits) std::fwrite(row_logits.data(), sizeof(float), row_logits.size(), g_diag_logits);
                     std::printf("R %lld %d\n", (long long) (pos + t), row_next);
                 }
                 pos += pr.n_tokens;
@@ -121,8 +129,14 @@ bool adapter_prompt(basalt::model::ModelSession& sess, const std::vector<int32_t
         dr.n_tokens = 1;
         dr.pos = pos;
         dr.next_token = &next;
+        std::vector<float> diag_row;
+        if (g_diag_logits && logits == nullptr) {
+            diag_row.resize((size_t) g_n_vocab);
+            logits = diag_row.data();
+        }
         dr.logits = logits;
         r = sess.decode_window(dr);
+        if (g_diag_logits) std::fwrite(logits, sizeof(float), (size_t) g_n_vocab, g_diag_logits);
         ++pos;
     }
     tm.prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
@@ -251,6 +265,10 @@ int adapter_serve(basalt::model::LoadedModel& loaded, int64_t max_context, int64
             if (*it == "STOP") { lines.erase(it); return true; }
         return false;
     };
+    if (const basalt::model::Result pr = sess->prepare(); !pr.ok()) {
+        basalt::log::error("basalt serve", "%s", pr.message.c_str());
+        return 1;
+    }
     // a kernel failure exits the process from anywhere: end at once so the server sees it, nothing left to wind down
     std::atexit([] {
         if (g_serve_quit) return;
@@ -485,6 +503,7 @@ int adapter_serve(basalt::model::LoadedModel& loaded, int64_t max_context, int64
 
 std::optional<int> run_adapter_model(const Options& o, const basalt::core::ModelFile& model_file) {
     g_diag_serial_prompt = o.diag_serial_prompt;
+    if (!o.diag_logits.empty()) g_diag_logits = std::fopen(o.diag_logits.c_str(), "wb");
     const basalt::core::Json* kv = model_file.meta().get("gguf_kv");
     const basalt::core::Json* arch = kv ? kv->get("general.architecture") : nullptr;
     const std::string name = arch && arch->is_string() ? arch->s : std::string();
@@ -504,6 +523,7 @@ std::optional<int> run_adapter_model(const Options& o, const basalt::core::Model
                 return fatal_start_error("the --rope-* and --yarn-* flags do not apply to " + desc.arch +
                                          ": its rotary scaling comes from the model file");
         }
+        g_n_vocab = desc.n_vocab;
         std::unique_ptr<basalt::model::LoadedModel> loaded;
         basalt::model::LoadRequest lreq{o.native_shards, o.diag_fixture, o.diag_dump, o.diag_mmproj, o.diag_tier_ram,
                                         o.diag_tier_vram, o.diag_dspark};
