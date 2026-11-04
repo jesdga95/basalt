@@ -415,24 +415,39 @@ public:
         // promotion copies, and the host sync at the top of each layer orders their reuse
         constexpr unsigned kMapped = cudaHostAllocPortable | cudaHostAllocMapped;
         if (cudaHostAlloc((void**) &h_plan_, sizeof(ExpertPlan), kMapped) != cudaSuccess ||
-            cudaHostAlloc((void**) &h_x_, (size_t) kMaxT * g_.n_embd * 4, cudaHostAllocPortable) != cudaSuccess ||
             cudaHostAlloc((void**) &h_ids_, 64 * 4, cudaHostAllocPortable) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &d_plan_host_, h_plan_, 0) != cudaSuccess) {
+            err = "deepseek41: cannot allocate the pinned expert staging";
+            return false;
+        }
+        DsModel::SharedTier& shared = m_.shared_tier();
+        if (shared.tier) {   // another session opened it: the sessions run one at a time over the same rows
+            tier_ = shared.tier;
+            h_x_ = shared.h_x;
+            h_rows_ = shared.h_rows;
+            if (cudaHostGetDevicePointer((void**) &d_rows_, h_rows_, 0) != cudaSuccess) {
+                err = "deepseek41: cannot map the expert rows";
+                return false;
+            }
+            return true;
+        }
+        if (cudaHostAlloc((void**) &h_x_, (size_t) kMaxT * g_.n_embd * 4, cudaHostAllocPortable) != cudaSuccess ||
             cudaHostAlloc((void**) &h_rows_, (size_t) kRows * g_.n_embd * 4, kMapped) != cudaSuccess ||
-            cudaHostGetDevicePointer((void**) &d_plan_host_, h_plan_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d_rows_, h_rows_, 0) != cudaSuccess) {
             err = "deepseek41: cannot allocate the pinned expert staging";
             return false;
         }
-        auto t = std::make_unique<ExpertTier>(m_);
+        auto t = std::make_shared<ExpertTier>(m_);
         const prefillp::Dims d = m_.prompt_dims();
         ExpertTier::Reserve r;
         // the caches grow into the reserve beside the tier, then into the spare arena the tier gives back
         r.copies = kTierReserve;
-        r.homes = m_.context_bytes() + prefillp::workspace_bytes(d, prefillp::kHomeChunk) + prefillp::ahead_bytes(d) +
+        r.homes = m_.context_bytes() * (uint64_t) m_.sessions() + prefillp::workspace_bytes(d, prefillp::kHomeChunk) + prefillp::ahead_bytes(d) +
                   prefillp::kMargin + kModuleRoom + (m_.pack().vision.bytes ? kVisionRoom : 0);
         r.beside_homes = prefillp::workspace_bytes(d, prefillp::kShortChunk) + prefillp::kMargin + kModuleRoom;
         if (!t->open(r, h_x_, h_rows_, err)) return false;
-        tier_ = std::move(t);
+        tier_ = t;
+        shared = {std::move(t), h_x_, h_rows_};
         return true;
     }
 
@@ -580,7 +595,7 @@ private:
     float *h_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr;
     int32_t *h_ids_ = nullptr, *h_pos_ = nullptr;
     int64_t staged_pos_ = -1;
-    std::unique_ptr<ExpertTier> tier_;
+    std::shared_ptr<ExpertTier> tier_;
     float *sh_g_ = nullptr, *sh_u_ = nullptr, *sh_h_ = nullptr;
     void *sh_q1_ = nullptr, *sh_q2_ = nullptr;
     static constexpr int kPosStride = 4 * kMaxT;   // per layer: pos, window start, window rows, visible compressed rows

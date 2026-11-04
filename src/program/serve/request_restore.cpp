@@ -95,7 +95,7 @@ Flow Request::restore() {
     own_slot = in_slot ? slot_b : runtime_.slot0_solo() ? 0 : -1;
     // A decoding slot's checkpoints are sources too: the K/V before a checkpoint never changes, so requests that
     // share a start (a system prompt) read it once, whichever slot holds it.
-    if (runtime_.o.prompt_cache > 0)
+    if (runtime_.o.prompt_cache > 0 && runtime_.slots_share_cells())
         for (int b = 0; b < (int) runtime_.bs.size(); ++b) {
             const BSlot& sl = runtime_.bs[(size_t) b];
             if (b == own_slot || (!sl.active && !sl.cached) || sl.cvec != want_cvec) continue;
@@ -113,7 +113,7 @@ Flow Request::restore() {
                 }
         }
     // a request in another slot: the solo session's chain is slot 0's conversation, a source like the rest
-    if (runtime_.o.prompt_cache > 0 && in_slot && runtime_.slot0_solo() && solo_book.cvec == want_cvec)
+    if (runtime_.o.prompt_cache > 0 && runtime_.slots_share_cells() && in_slot && runtime_.slot0_solo() && solo_book.cvec == want_cvec)
         for (const ConvCheckpoint& c : solo_book.checks)
             if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) && starts_with(c.ids, c.imgs)) {
                 slot_source = 0;

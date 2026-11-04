@@ -25,8 +25,16 @@ public:
         : Runtime(options, file, error, model.desc().n_vocab, vocab_), model_(model) {}
 
     int init_before_input() override {
-        const basalt::model::Result r = model_.make_session(session_);
-        if (!r.ok()) { basalt::log::error("basalt serve", "%s", r.message.c_str()); return 1; }
+        const int slots = std::max(o.batch, 1);
+        sessions_.resize((size_t) slots);
+        for (auto& s : sessions_) {
+            const basalt::model::Result r = model_.make_session(s);
+            if (!r.ok()) { basalt::log::error("basalt serve", "%s", r.message.c_str()); return 1; }
+        }
+        if (o.batch > 0) {
+            bs.resize((size_t) o.batch);
+            slot_sampling_.resize((size_t) o.batch);
+        }
         conversations.emplace((size_t) 0, (size_t) 0);
         if (o.grammar) {   // the token texts the grammar walks, read from the pack's tokenizer files
             std::vector<uint8_t> vj, tj;
@@ -46,24 +54,28 @@ public:
         return 0;
     }
     int init_after_input() override {
-        if (const basalt::model::Result r = session_->prepare(); !r.ok()) {
-            basalt::log::error("basalt serve", "%s", r.message.c_str());
-            return 1;
-        }
+        for (auto& s : sessions_)
+            if (const basalt::model::Result r = s->prepare(); !r.ok()) {
+                basalt::log::error("basalt serve", "%s", r.message.c_str());
+                return 1;
+            }
         std::printf("READY %lld stop\n", (long long) o.max_context);
         std::fflush(stdout);
         return 0;
     }
     void print_info() override {
-        std::printf("INFO logit_bias=%lld context=%lld spec=0 mtp_max=0 lookup=0 engine=" BASALT_VERSION "\n",
-                    (long long) n_vocab, (long long) o.max_context);
+        const std::string slots = o.batch > 0 ? " batch_slots=" + std::to_string(o.batch) + " slot_cache=" +
+                                                    std::to_string(o.prompt_cache > 0 ? 1 : 0) + " slot0_solo=1 solo_any_slot=1"
+                                              : std::string();
+        std::printf("INFO logit_bias=%lld context=%lld spec=0 mtp_max=0 lookup=0%s engine=" BASALT_VERSION "\n",
+                    (long long) n_vocab, (long long) o.max_context, slots.c_str());
     }
     bool pack_tokenizer_supported(std::string_view) const override { return false; }
     bool windows_in_flight() override { return false; }
-    bool next_batch_window() override { return true; }
+    bool next_batch_window() override;
     bool drain_windows() override { return true; }
     void script_command(const std::string&) override {
-        std::printf("ERR BSCRIPT: this model has no batch windows\n");
+        std::printf("ERR BSCRIPT: this model's slots draft nothing\n");
         std::fflush(stdout);
     }
     void probe_command(const std::string&, std::string& e) override { e = "PROBE: this model has no probe"; }
@@ -85,13 +97,19 @@ public:
     bool park_idle_engine(std::string&) override { return false; }
     bool capture_admit(uint64_t, uint64_t) override { return false; }
     bool park_current(size_t, int64_t) override { return true; }
-    bool copy_from_slot(int, const ConvCheckpoint*, std::string& e) override { e = "this model has no slots"; return false; }
-    bool copy_to_slot(int, const std::vector<int32_t>&, std::string& e) override { e = "this model has no slots"; return false; }
+    bool copy_from_slot(int, const ConvCheckpoint*, std::string& e) override { e = "this model's slots copy no cells"; return false; }
+    // slot 0 is the solo session, the only way a request reaches this with its state elsewhere
+    bool copy_to_slot(int b, const std::vector<int32_t>&, std::string& e) override {
+        if (b == 0) return true;
+        e = "this model's slots copy no cells";
+        return false;
+    }
+    bool slots_share_cells() const override { return false; }
     void shed_if_low() override {
         if (basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Ok && !checks.empty()) checks.clear();
     }
     int64_t slot_context(int) const override { return o.max_context; }
-    bool slot0_solo() const override { return false; }
+    bool slot0_solo() const override { return o.batch > 0; }
 
     /// The running state at `to`, kept in the chain; the oldest goes first past --prompt-cache.
     bool checkpoint_at(int64_t to, ConvCheckpoint::Source source, const std::vector<int64_t>& prompt) {
@@ -106,8 +124,8 @@ public:
         c.source = source;
         c.ids.assign(prompt.begin(), prompt.begin() + to);
         c.imgs = imgs_below(req_imgs, to);
-        c.gdn.resize(session_->running_bytes());
-        if (const basalt::model::Result r = session_->save_running(c.gdn.data(), to); !r.ok()) {
+        c.gdn.resize(session().running_bytes());
+        if (const basalt::model::Result r = session().save_running(c.gdn.data(), to); !r.ok()) {
             err = r.message;
             return false;
         }
@@ -122,13 +140,15 @@ public:
         return true;
     }
 
-    basalt::model::ModelSession& session() { return *session_; }
+    basalt::model::ModelSession& session() { return *sessions_[(size_t) active_]; }
+    void set_active(int slot) { active_ = slot; }
+    void set_slot_sampling(int slot, const basalt::kernels::SamplerParams& sp) { slot_sampling_[(size_t) slot] = sp; }
     const basalt::model::ModelDesc& desc() const { return model_.desc(); }
 
 private:
     bool set_memory(bool low, long long reserve, std::string& e, std::string* reply) {
         int64_t slots = 0;
-        if (const basalt::model::Result r = session_->set_low_memory(low, slots); !r.ok()) {
+        if (const basalt::model::Result r = session().set_low_memory(low, slots); !r.ok()) {
             e = r.message;
             return false;
         }
@@ -144,7 +164,9 @@ private:
 
     std::optional<basalt::program::grammar::PackVocab> vocab_;
     basalt::model::LoadedModel& model_;
-    std::unique_ptr<basalt::model::ModelSession> session_;
+    std::vector<std::unique_ptr<basalt::model::ModelSession>> sessions_;
+    std::vector<basalt::kernels::SamplerParams> slot_sampling_;
+    int active_ = 0;
 };
 
 class SessionRequest final : public Request {
@@ -224,6 +246,9 @@ private:
         return Flow::proceed;
     }
     Flow read_to(int64_t to) override;
+    Flow slot_bind() override { rt_.set_active(slot_b); return Flow::proceed; }
+    bool slot_leave() override { rt_.set_active(0); return true; }
+    void slot_set_sampling(int slot) override { rt_.set_slot_sampling(slot, req_sp); }
     Flow prompt_end() override {
         rt_.session().end_prompt();
         return Flow::proceed;
@@ -244,6 +269,66 @@ private:
     size_t next_block_ = 0;
     double live_ms_ = -1e9;
 };
+
+// One token of every active slot, one session at a time.
+bool SessionRuntime::next_batch_window() {
+    std::vector<int32_t> history;
+    std::vector<float> grammar_bias;
+    for (int b = 0; b < (int) bs.size(); ++b) {
+        BSlot& sl = bs[(size_t) b];
+        if (!sl.active) continue;
+        set_active(b);
+        const int32_t fed = sl.x;
+        int32_t y = -1;
+        basalt::kernels::SamplerParams& sp = slot_sampling_[(size_t) b];
+        basalt::model::DecodeRequest d;
+        d.tokens = &fed;
+        d.n_tokens = 1;
+        d.pos = sl.p;
+        d.next_token = &y;
+        d.sampling = &sp;
+        if (sl.pen_n > 0) {
+            history.resize((size_t) sl.pen_n);
+            basalt::kernels::penalty_rows(sl.ids.data(), (int64_t) sl.ids.size(), &fed, 1, sl.pen_n, history.data());
+            d.history = history.data();
+            d.history_len = sl.pen_n;
+        }
+        sp.counter = (uint64_t) sl.produced;
+        if (const basalt::model::Result r = session().decode_window(d); !r.ok()) {
+            std::printf("ERR %s\n", r.message.c_str());
+            set_active(0);
+            return false;
+        }
+        if (sl.guard != nullptr && sl.guard->on() && sl.guard->scan(&y, 1) >= 0) {
+            sl.guard->mask_bias({}, grammar_bias);
+            if (const basalt::model::Result r = session().resample_last(grammar_bias.data(), y); !r.ok()) {
+                std::printf("ERR %s\n", r.message.c_str());
+                set_active(0);
+                return false;
+            }
+            if (!sl.guard->take(y)) basalt::log::info("basalt grammar", "slot %d: the masked draw was token %d", b, (int) y);
+        }
+        sl.ids.push_back(fed);
+        ++sl.produced;
+        ++sl.p;
+        sl.x = y;
+        std::printf("BT %d %d\n", b, (int) y);
+        basalt::core::progress_beat();
+        const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+        const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new || sl.p + 2 > o.max_context ? "length" : nullptr;
+        if (fin != nullptr) {
+            std::printf("BDONE %d %lld %s %.1f 0 0\n", b, (long long) sl.produced, fin,
+                        std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count());
+            sl.active = false;
+            sl.cached = o.prompt_cache > 0;
+            sl.idle_busy = busy_now();
+            sl.guard.reset();
+        }
+        std::fflush(stdout);
+    }
+    set_active(0);
+    return true;
+}
 
 Flow SessionRuntime::run_request() {
     SessionRequest request(*this);
@@ -348,7 +433,7 @@ void SessionRuntime::enc_command(const std::string& cmd) {
         int rows_n = 0;
         const auto te = Clock::now();
         const basalt::model::Result er = bytes.empty() ? basalt::model::Result{basalt::model::Status::Error, "cannot read the image " + words[i]}
-                                                       : session_->encode_image(bytes.data(), bytes.size(), rows, rows_n);
+                                                       : session().encode_image(bytes.data(), bytes.size(), rows, rows_n);
         if (!er.ok()) { fail = er.message; break; }
         const int32_t nx = 0, ny = 0, width = (int32_t) (rows.size() / (size_t) rows_n);
         const int32_t hdr[5] = {kEmbeddingsMagic, rows_n, nx, ny, width};

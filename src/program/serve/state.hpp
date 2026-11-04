@@ -188,6 +188,7 @@ public:
     virtual bool pipelined() const { return false; }   // batch groups pipelined through layer split stages
     virtual int64_t slot_context(int slot) const = 0;
     virtual bool copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& e) = 0;
+    virtual bool slots_share_cells() const { return true; }   // one slot's positional state can be copied to another
     virtual bool slot0_solo() const = 0;   // slot 0 of the batch windows is the solo session
     virtual void enc_command(const std::string& cmd) = 0;
     virtual size_t spill_to_disk(bool at_exit, size_t limit) = 0;
