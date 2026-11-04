@@ -1,4 +1,4 @@
-// src/kernels/cuda/qsa_dec_fused.cu - see include/basalt/kernels/qsa_dec_fused.hpp.
+// src/models/qwen4exp/kernels/qsa_dec_fused.cu - see include/basalt/kernels/qsa_dec_fused.hpp.
 //
 // Built with --use_fast_math like native_qsa.cu, native_rope.cu and native_qsa_indexer.cu, whose expressions this
 // repeats; the INT8 append (kv_q8.cu, built without it) uses explicit IEEE instructions.

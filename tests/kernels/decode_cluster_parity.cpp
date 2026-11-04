@@ -16,7 +16,7 @@
 //
 // The one-CTA references are qsa_block_topk_ref and the one-block greedy kernel (greedy_one_block).
 #include "basalt/kernels/qsa.hpp"
-#include "basalt/kernels/qsa_select.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_select.hpp"
 #include "basalt/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>

@@ -1,4 +1,4 @@
-// include/basalt/kernels/qsa_mid.hpp - the QSA query projection in two halves.
+// include/basalt/models/qwen4exp/kernels/qsa_mid.hpp - the QSA query projection in two halves.
 //
 // The query projection's rows come in heads of 512: 256 query rows, then 256 gate rows.  The attention needs only the
 // query rows; the gate rows are read by the merge.  qsa_qproj_half projects one half (the 16-row tiles 32 h .. 32 h + 15

@@ -1,4 +1,4 @@
-// include/basalt/kernels/qsa_select.hpp - the QSA indexer's block scores and top-k selection,
+// include/basalt/models/qwen4exp/kernels/qsa_select.hpp - the QSA indexer's block scores and top-k selection,
 // for many queries at once and at long context.
 //
 // The per-token path scores every pooled block with one FP64 block per row (qsa_index_kernel) and selects with a

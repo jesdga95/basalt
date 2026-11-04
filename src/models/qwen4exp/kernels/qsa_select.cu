@@ -1,7 +1,7 @@
-// src/kernels/cuda/qsa_select.cu - see include/basalt/kernels/qsa_select.hpp.
+// src/models/qwen4exp/kernels/qsa_select.cu - see include/basalt/models/qwen4exp/kernels/qsa_select.hpp.
 #include <cstdlib>
 #include <cstring>
-#include "basalt/kernels/qsa_select.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_select.hpp"
 #include "basalt/kernels/qsa_seg.hpp"
 #include "basalt/kernels/pdl.hpp"
 

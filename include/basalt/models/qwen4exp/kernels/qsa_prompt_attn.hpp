@@ -1,4 +1,4 @@
-// include/basalt/kernels/qsa_prompt_attn.hpp - the prompt path's QSA attention on tensor cores.
+// include/basalt/models/qwen4exp/kernels/qsa_prompt_attn.hpp - the prompt path's QSA attention on tensor cores.
 //
 // `qsa_decode_attn_batch` serves a prompt one query at a time with the decode kernel: FP32 dot products with a warp
 // reduction per head and cell, 64-cell chunks whose partial sums go through global scratch to a second (merge)

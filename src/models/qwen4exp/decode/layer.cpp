@@ -29,7 +29,7 @@
 #include "basalt/kernels/cvec.hpp"
 #include "basalt/kernels/qsa_decode_attn.hpp"
 #include "basalt/models/qwen4exp/kernels/fused_gdn.hpp"
-#include "basalt/kernels/qsa_select.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_select.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <exception>

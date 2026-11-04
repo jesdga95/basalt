@@ -1,4 +1,4 @@
-// include/basalt/kernels/qsa_dec_attn.hpp - decode attention over the selected cells for a few queries (T <= 8),
+// include/basalt/models/qwen4exp/kernels/qsa_dec_attn.hpp - decode attention over the selected cells for a few queries (T <= 8),
 // with the arithmetic of qsa_decode_attn_batch bit for bit (same 64-cell chunks, same per-chunk sums and merge order).
 //
 // One block per (chunk, kv head, query) stages the chunk's K and V rows, their scales and the 12 query heads in

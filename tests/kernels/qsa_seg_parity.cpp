@@ -6,10 +6,10 @@
 //   qsa_seg_parity [iters]
 #include "basalt/kernels/native_qsa_indexer.hpp"
 #include "basalt/kernels/qsa.hpp"
-#include "basalt/kernels/qsa_dec_attn.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_dec_attn.hpp"
 #include "basalt/kernels/qsa_dec_fused.hpp"
 #include "basalt/kernels/qsa_seg.hpp"
-#include "basalt/kernels/qsa_select.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_select.hpp"
 #include "basalt/kernels/rope_scaling.hpp"
 
 #include <cuda_fp16.h>

@@ -29,7 +29,7 @@
 #include "basalt/kernels/native_router.hpp"
 #include "basalt/kernels/qsa.hpp"
 #include "basalt/kernels/qsa_decode_attn.hpp"
-#include "basalt/kernels/qsa_dec_attn.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_dec_attn.hpp"
 #include "basalt/kernels/qsa_dec_fused.hpp"
 #include "basalt/kernels/q5k_head.hpp"
 #include "basalt/kernels/q6k_head.hpp"

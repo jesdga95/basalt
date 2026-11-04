@@ -8,8 +8,8 @@
 #include "basalt/kernels/kv_q4.hpp"
 #include "basalt/core/layer.hpp"
 #include "basalt/kernels/qsa_decode_attn.hpp"
-#include "basalt/kernels/qsa_prompt_attn.hpp"
-#include "basalt/kernels/qsa_select.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_prompt_attn.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_select.hpp"
 #include "basalt/models/qwen4exp/prefill/kernels.hpp"
 #include <algorithm>
 #include <exception>
