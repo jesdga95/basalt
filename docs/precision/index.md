@@ -6,6 +6,8 @@ its quality compares with llama.cpp against the same reference: the original mod
 Test setup: one RTX 5090 at a 400 W power limit, an RTX 5060 Ti as the peer expert tier, 128 GB of system RAM
 (121 GiB visible to the OS). Each section names the build it measured.
 
+DeepSeek-V4.1-Flash has its own page: [deepseek41.md](deepseek41.md).
+
 ## Summary
 
 - **MTP does not change output** (unless `--relaxed-drafting` is set: [details](features.md#relaxed-drafting)). With the expert tiers pinned, 275 of 275 greedy prompts produced identical tokens on

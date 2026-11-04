@@ -31,6 +31,30 @@ python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPRO
 
 `python3 tools/convert/convert.py --help` describes every input.
 
+## DeepSeek-V4.1 pack
+
+`general.architecture` picks the conversion rules (`tools/convert/arch/`). A `deepseek41` GGUF is stored as published, and
+the pack has no MTP drafter, expert profile or `hc8` section:
+
+- `dense` holds the float tensors (F32 and BF16: norms, hyper-connection weights, router, compressor and indexer
+  projections), `gguf` the quantized non-expert tensors (Q6_K, Q5_K, Q8_0), `experts` and `experts.layout` the routed
+  experts per layer (IQ1_S, IQ2_XXS or IQ2_XS gate/up; IQ1_S, IQ2_XXS, IQ2_XS or IQ2_S down, as the GGUF mixes them).
+- `engram` holds the Engram table (`per_layer_token_embd.weight`, rows of 256 IQ4_NL values, 144 bytes) alone, 2 MiB
+  aligned, so a row can be read with `O_DIRECT`.
+- `vision/mmproj` holds the vision projector GGUF as published; it is present only when the pack is built with
+  `--mmproj`, and `basalt serve PACK --vision dynamic` reads it from there. Without it the pack is text-only.
+- `dspark/gguf` holds the DSpark drafter GGUF as published (3 stages, 128 MXFP4 experts, Markov and confidence heads),
+  present only when the pack is built with `--dspark FILE`. `meta.dspark` names the section and its size. The engine
+  loads it from the pack when `--spec N` (2 to 6) asks for speculation; without `--spec` the section is not read.
+- `meta.arch` is `deepseek41`. `meta.geometry` copies the architecture's GGUF keys without the `deepseek41.` prefix
+  (layers, attention and indexer sizes, RoPE, expert counts and gating, SwiGLU clamps, hyper-connection counts, norm
+  epsilon). `meta.engram` records the section, tensor, type, row count, row size and the hash constants
+  (`ple.*`, `engram.*`); the token map stays in `meta.gguf_kv`. `meta.vision` names the projector section and its size when present. The default sampling (temperature 1.0,
+  top-p 1.0, top-k 0 meaning no cut) is fixed by the converter, and `meta.license` carries the model's MIT text.
+
+`--dry-run` prints every section's offset and size without writing. The converter checks the Engram table's type and
+shape against the metadata and refuses a mismatch.
+
 ## Packs
 
 A pack you convert yourself from a GGUF, without the official files' tuned drafter, will be significantly slower than the official `.basalt` files. How precision is handled and how quality is measured: [precision](precision/index.md).
