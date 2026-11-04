@@ -260,7 +260,7 @@ target_link_libraries(basalt-plan PRIVATE plan)
 # Defined in cmake/platform.cmake, included above with `warnings`.
 
 # ---- core (GPU runtime) ---------------------------------------------
-add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
+add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
                              src/core/model_file.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
@@ -1130,6 +1130,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_link_libraries(pinned_shared_test PRIVATE core ${_gpu_runtime_target})
   basalt_cpu_test(NAME pinned_shared_test COMMAND pinned_shared_test)
 endif()
+
+add_executable(ram_load_test tests/core/ram_load_test.cpp)
+target_link_libraries(ram_load_test PRIVATE core ${_gpu_runtime_target})
+basalt_cpu_test(NAME ram_load_test COMMAND ram_load_test)
 
 # the n-gram table read straight from the SSD. The selftest needs only the CPU and a temp file.
 add_executable(ple_reader_test tests/ngram/ple_reader_test.cpp)
