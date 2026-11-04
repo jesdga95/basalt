@@ -1,5 +1,5 @@
 // src/program/serve/request_finish.cpp - request complete operations.
-#include "request_base.hpp"
+#include "request.hpp"
 
 namespace basalt::program::serve {
 

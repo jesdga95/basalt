@@ -1,5 +1,5 @@
 // src/program/serve/qfn_decode.cpp - Flash-Next's side of the window loop: verify windows, drafts, adaptive rounds.
-#include "request.hpp"
+#include "qfn_request.hpp"
 #include "decode_loop.hpp"
 
 namespace basalt::program::serve {

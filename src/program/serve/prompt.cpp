@@ -1,5 +1,5 @@
 // src/program/serve/prompt.cpp - prompt operations for the persistent engine.
-#include "request.hpp"
+#include "qfn_request.hpp"
 
 namespace basalt::program::serve {
 

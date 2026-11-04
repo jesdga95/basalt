@@ -4,7 +4,7 @@
 // adds drafted windows, prompt lookup and pipelined windows; without it every window holds one token.
 #pragma once
 
-#include "request_base.hpp"
+#include "request.hpp"
 #include "reply_rows.hpp"
 
 namespace basalt::program::serve {

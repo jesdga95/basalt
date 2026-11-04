@@ -1,5 +1,5 @@
 // src/program/serve/qfn_prompt.cpp - how Flash-Next reads a prompt's parts: sampling setup, windows, loans, the split.
-#include "request.hpp"
+#include "qfn_request.hpp"
 
 namespace basalt::program::serve {
 

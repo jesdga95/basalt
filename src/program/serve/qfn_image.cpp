@@ -1,5 +1,5 @@
 // src/program/serve/qfn_image.cpp - a request's image positions and the quality gate's chunk.
-#include "request.hpp"
+#include "qfn_request.hpp"
 
 namespace basalt::program::serve {
 

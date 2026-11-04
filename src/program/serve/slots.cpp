@@ -1,5 +1,5 @@
 // src/program/serve/slots.cpp - slots operations.
-#include "request.hpp"
+#include "qfn_request.hpp"
 
 namespace basalt::program::serve {
 
@@ -18,8 +18,6 @@ void QfnRuntime::make_view(basalt::core::SessionState& v, int b) {
     v.ple.token = &v.ple_token;
     v.ple.prev = v.ple_prev;
 }
-
-bool Runtime::batch_on() { for (const BSlot& b : bs) if (b.active) return true; return false; }
 
 // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
 bool QfnRuntime::copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& e) {

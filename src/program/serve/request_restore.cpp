@@ -1,5 +1,5 @@
 // src/program/serve/request_restore.cpp - request restore operations.
-#include "request_base.hpp"
+#include "request.hpp"
 
 namespace basalt::program::serve {
 

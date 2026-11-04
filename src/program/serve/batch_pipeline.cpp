@@ -1,5 +1,5 @@
 // src/program/serve/batch_pipeline.cpp - batch pipeline operations.
-#include "request.hpp"
+#include "qfn_request.hpp"
 
 namespace basalt::program::serve {
 

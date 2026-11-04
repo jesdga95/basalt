@@ -2,7 +2,7 @@
 
 #include "basalt/models/builtin.hpp"
 #include "../engine_local.hpp"
-#include "../serve/runtime.hpp"
+#include "../serve/qfn_runtime.hpp"
 #include "../cli/startup.hpp"
 #include "../cli/options.hpp"
 #include "../cli/tokens.hpp"

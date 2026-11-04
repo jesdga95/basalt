@@ -1,6 +1,7 @@
-// src/program/serve/runtime.hpp - the persistent driver over startup's loaded engine.
+// src/program/serve/qfn_runtime.hpp - the persistent driver over startup's loaded engine.
 #pragma once
 
+#include "state.hpp"
 #include "../engine_local.hpp"
 #include "basalt/program/grammar/guard.hpp"
 #include "basalt/platform/system.hpp"
@@ -19,14 +20,6 @@ namespace basalt::vision { class CudaEncoder; }
 namespace basalt::program {
 struct Options;
 namespace serve {
-
-// Below this much free VRAM a later allocation (a first-used window's buffers, the desktop, another program) can make
-// a driver that pages GPU memory do so, and a verify graph spinning on a host flag then never finishes.  A driver that
-// fails such an allocation instead needs room only for what is allocated after loading (lazily loaded kernels, graphs,
-// a streaming state's residency map).
-inline constexpr int kVramStallMib = 256;
-inline constexpr int kVramFloorMib = 128;
-inline int vram_floor_mib() { return basalt::platform::gpu_memory_pages() ? kVramStallMib : kVramFloorMib; }
 
 // All engine objects belong to startup and outlive run(). Callbacks borrow the same objects.
 struct Context {

@@ -1,5 +1,5 @@
 // src/program/serve/qfn_restore.cpp - what restoring a conversation does to Flash-Next's sessions.
-#include "request.hpp"
+#include "qfn_request.hpp"
 
 namespace basalt::program::serve {
 

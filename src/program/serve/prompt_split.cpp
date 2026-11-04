@@ -1,5 +1,5 @@
 // src/program/serve/prompt_split.cpp - request prompt_split operations.
-#include "request.hpp"
+#include "qfn_request.hpp"
 
 namespace basalt::program::serve {
 

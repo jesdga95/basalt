@@ -1,5 +1,5 @@
 // src/program/serve/qfn_finish.cpp - what the end of a request does to Flash-Next's verifiers, drafter and tiers.
-#include "request.hpp"
+#include "qfn_request.hpp"
 
 namespace basalt::program::serve {
 

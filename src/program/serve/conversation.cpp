@@ -1,14 +1,8 @@
 // src/program/serve/conversation.cpp - conversation operations for the persistent engine.
-#include "state.hpp"
+#include "qfn_state.hpp"
 #include "basalt/core/kv_arena.hpp"
 
 namespace basalt::program::serve {
-
-uint64_t fnv1a(const void* data, size_t n, uint64_t h) {
-    const uint8_t* p = (const uint8_t*) data;
-    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
-    return h;
-}
 
 ConvStateSizes conv_state_sizes(const basalt::core::ModelGeometry& g, const basalt::core::SessionState& ss) {
     ConvStateSizes z;
@@ -241,12 +235,6 @@ bool QfnRuntime::park_current(size_t held, int64_t kept) {
         basalt::log::warn("basalt serve", "conversation cache: allocation failed; skip parking");
     }
     return true;
-}
-
-std::vector<ImgKey> Runtime::imgs_below(const std::vector<ImgKey>& all, int64_t L) {
-    std::vector<ImgKey> v;
-    for (const ImgKey& k : all) if (k.start < L) v.push_back(k);
-    return v;
 }
 
 bool QfnRuntime::gpu_sync_ok() {
