@@ -41,6 +41,9 @@ inline constexpr int64_t kMaxImagePixels = 64ll << 20;
 bool decode_image(const uint8_t* data, size_t len, Image& out, std::string& err,
                   int64_t max_pixels = kMaxImagePixels);
 
+/// `src` resampled to w x h (Pillow-style bicubic).
+Image resize_bicubic_to(const Image& src, int w, int h);
+
 /// The canvas size for a w x h picture: a multiple of patch * merge, within [min_tokens, max_tokens] merged tokens.
 Size fit_size(int w, int h, const Geometry& g);
 

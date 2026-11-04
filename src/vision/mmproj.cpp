@@ -93,23 +93,31 @@ void Mmproj::release() {
 
 Mmproj::~Mmproj() { release(); }
 
-bool Mmproj::open(const std::string& path, std::string& err) {
+bool Mmproj::open(const std::string& path, std::string& err, const char* projector) {
     uint64_t file_bytes = 0;
     if (!platform::file_size(path, file_bytes)) { err = "cannot open " + path; return false; }
-    if (file_bytes < 32) { err = "cannot read " + path; return false; }
+    return open_range(path, 0, file_bytes, err, projector);
+}
+
+bool Mmproj::open_range(const std::string& path, uint64_t offset, uint64_t file_bytes, std::string& err,
+                        const char* projector) {
+    uint64_t whole = 0;
+    if (!platform::file_size(path, whole)) { err = "cannot open " + path; return false; }
+    if (file_bytes < 32 || offset + file_bytes > whole) { err = "cannot read " + path; return false; }
     size_ = (size_t) file_bytes;
+    view_off_ = 0;
     // read whole with block-aligned unbuffered reads, so the file cache neither copies nor keeps it; a file system that
     // refuses them, and a platform with no unbuffered descriptor, is mapped instead
     {
         constexpr size_t kAlign = 4096, kChunk = 16u << 20;
         const int dfd = platform::open_unbuffered(path);
         void* mem = nullptr;
-        if (dfd >= 0) mem = basalt::platform::alloc_aligned((size_t) ((size_ + kAlign - 1) / kAlign * kAlign), kAlign);
+        if (dfd >= 0 && offset % kAlign == 0) mem = basalt::platform::alloc_aligned((size_t) ((size_ + kAlign - 1) / kAlign * kAlign), kAlign);
         if (mem != nullptr) {
             size_t got = 0;
             while (got < size_) {
                 const size_t want = std::min<size_t>(kChunk, (size_ - got + kAlign - 1) / kAlign * kAlign);
-                const int64_t r = basalt::platform::pread(dfd, (uint8_t*) mem + got, want, got);
+                const int64_t r = basalt::platform::pread(dfd, (uint8_t*) mem + got, want, offset + got);
                 if (r <= 0) break;
                 got += (size_t) r;
             }
@@ -125,8 +133,9 @@ bool Mmproj::open(const std::string& path, std::string& err) {
         mapping_ = std::move(*m);
         map_ = const_cast<uint8_t*>(mapping_.data());
         mapped_ = true;
+        view_off_ = (size_t) offset;
     }
-    const uint8_t* base = (const uint8_t*) map_;
+    const uint8_t* base = (const uint8_t*) map_ + view_off_;
     Cursor c{base, base + size_};
     if (c.get<uint32_t>() != 0x46554747u) { err = path + " is not a GGUF file"; return false; }
     if (c.get<uint32_t>() != 3) { err = "unsupported GGUF version"; return false; }
@@ -146,8 +155,8 @@ bool Mmproj::open(const std::string& path, std::string& err) {
         kv[key] = read_value(c, t);
     }
     if (!c.ok) { err = "truncated GGUF metadata"; return false; }
-    if (arch != "clip" || proj_type != "qwen3vl_merger") {
-        err = "not a qwen3vl_merger projector (architecture '" + arch + "', projector '" + proj_type + "')";
+    if (arch != "clip" || proj_type != projector) {
+        err = std::string("not a ") + projector + " projector (architecture '" + arch + "', projector '" + proj_type + "')";
         return false;
     }
     auto num = [&](const char* k, double def, bool must = true) {
@@ -164,7 +173,8 @@ bool Mmproj::open(const std::string& path, std::string& err) {
     hp_.ffn = (int) num("clip.vision.feed_forward_length", 0);
     hp_.layers = (int) num("clip.vision.block_count", 0);
     hp_.heads = (int) num("clip.vision.attention.head_count", 0);
-    hp_.merge = (int) num("clip.vision.spatial_merge_size", 2, false);
+    hp_.merge = (int) num("clip.vision.spatial_merge_size", kv.count("clip.vision.projector.scale_factor") ? num("clip.vision.projector.scale_factor", 2, false) : 2, false);
+    hp_.min_pixels = (int) num("clip.vision.image_min_pixels", 0, false);
     hp_.proj = (int) num("clip.vision.projection_dim", 0);
     hp_.eps = (float) num("clip.vision.attention.layer_norm_epsilon", 1e-6, false);
     if (!err.empty()) return false;
