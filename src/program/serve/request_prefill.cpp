@@ -34,6 +34,7 @@ Flow Request::read_prompt() {
     if (runtime_.o.prompt_cache > 0 && runtime_.o.turn_token >= 0)
         for (int64_t i = n - 1; i > resume; --i)
             if (ids[(size_t) i] == runtime_.o.turn_token) { turn_at = i; break; }
+    if (runtime_.o.prompt_cache > 0 && turn_checkpoint_at_last_token() && n - 1 > resume) turn_at = n - 1;
     // (opt-in) a short turn of --tail-role-token's role right before the new assistant turn (the server's
     // trailing reasoning-effort turn) stays out of the checkpoint, so the next request - another effort, or the
     // next turn of the chat - finds the conversation without it
