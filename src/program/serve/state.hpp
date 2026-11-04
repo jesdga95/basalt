@@ -336,7 +336,6 @@ private:
     int64_t rounds{};
     std::optional<basalt::spec::SuffixDrafter> sfx;
     std::optional<basalt::spec::DraftPolicy> policy;
-    static constexpr int64_t kImagePad = 248056;   // qwen4exp.ple.image_token_id: the PLE hash reads it for image cells
     bool mrope_identity{};
     std::vector<float> img_rows{};
     std::vector<const float*> row_ptr{};

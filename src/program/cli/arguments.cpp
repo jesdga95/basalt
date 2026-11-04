@@ -44,7 +44,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         else if (a == "--diag-logits") o.diag_logits = next("--diag-logits");
         else if (a == "--image") o.images.push_back(next("--image"));
         else if (a == "--image-at") o.image_at.push_back(std::atoll(next("--image-at")));
-        else if (a == "--image-pad-id") o.image_pad_id = std::atoll(next("--image-pad-id"));
+        else if (a == "--image-pad-id") { o.image_pad_id = std::atoll(next("--image-pad-id")); o.image_pad_given = true; }
         else if (a == "--greedy") o.greedy = true;
         else if (a == "--seed") { o.seed = (uint64_t) std::atoll(next("--seed")); o.greedy = false; }
         else if (a == "--top-k") o.top_k = std::atoi(next("--top-k"));
@@ -105,7 +105,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         }
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
-        else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
+        else if (a == "--turn-token") { o.turn_token = std::atoll(next("--turn-token")); o.turn_token_given = true; }
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
         else if (a == "--eos-ids") {
             std::string e;

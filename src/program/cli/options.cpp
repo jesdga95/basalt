@@ -57,7 +57,7 @@ std::optional<int> prepare_input_options(Options& o) {
         o.prefill_chunk = 2048;
     }
     if (!have_tokens && o.serve) {   // requests bring their own tokens
-        o.tokens = {248045};
+        o.tokens = {o.turn_token};
         o.max_new = 1;
         have_tokens = true;
         o.stop_eos = true;

@@ -492,9 +492,8 @@ std::optional<int> run_adapter_model(const basalt::program::CommonOptions& o, co
         const basalt::model::Result r = adapter->load(lreq, loaded);
         if (r.status == basalt::model::Status::UseEnginePath) return std::nullopt;
         if (!r.ok() || !loaded) return fatal_start_error(r.message);
-        std::vector<int64_t> stop = {1};
-        if (o.stop_eos) stop.insert(stop.end(), o.eos_ids.begin(), o.eos_ids.end());
-        else stop.clear();
+        std::vector<int64_t> stop;
+        if (o.stop_eos) stop = o.eos_ids;
         if (o.serve)
             return adapter_serve(*loaded, loaded->context() ? loaded->context() : o.max_context, o.image_pad_id, stop);
         return adapter_generate(*loaded, o.tokens, o.max_new, stop, o.images, o.image_at);
