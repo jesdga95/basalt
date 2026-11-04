@@ -204,7 +204,7 @@ identical with one slot and with four (same expert cache). A read that gives way
 card reading its kept chunk's later layers, as a main-card read does; the rest of the prompt is read later from there in
 its own chunks, as after a main-card read gives way.
 
-**K-quant experts on MMQ.** `tests/cuda/prefill_mmq_kq_test.cpp` runs MMQ and the FP16 dequant + cuBLAS path it
+**K-quant experts on MMQ.** `tests/models/qwen4exp/prefill/prefill_mmq_kq_test.cpp` runs MMQ and the FP16 dequant + cuBLAS path it
 replaced on random zero-centred experts at the model's geometry against a double-precision reference. Relative RMS
 error of the expert outputs, MMQ / FP16 path: 1.08e-2 / 5e-4 with plain activations (Q4_K/Q5_1, Q4_K/Q8_0, Q5_K/Q8_0),
 1.48e-2 to 1.51e-2 / 5e-4 with 0.5% of the activations 12 times larger (Q6_K/Q8_0, MMQ only: 1.17e-2 plain, 1.55e-2 with outliers); with llama.cpp's float partial sums MMQ read
