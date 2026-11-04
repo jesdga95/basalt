@@ -1,5 +1,5 @@
 #pragma once
-#include "basalt/kernels/ple.hpp"
+#include "basalt/models/qwen4exp/kernels/ple.hpp"
 
 namespace basalt::kernels {
 

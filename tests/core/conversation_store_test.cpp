@@ -5,7 +5,7 @@
 // live end is a reply past it, the directory kept to its budget, and only a chat's root and last three turn-end states
 // written (a cut at a state not written goes back to the nearest one before it, refcounts of a shared root kept).
 #include "basalt/core/conversation_store.hpp"
-#include "basalt/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/system.hpp"
 

@@ -2,8 +2,8 @@
 #include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
 #include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/kernels/pdl.hpp"
-#include "basalt/kernels/verify_kernels.hpp"
-#include "../../../kernels/cuda/smem_opt_in.cuh"
+#include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
+#include "smem_opt_in.cuh"
 
 #include <cuda_runtime.h>
 

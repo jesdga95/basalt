@@ -5,7 +5,7 @@
 //      (fused_gr_read with apply), which is what keeps a loaded-but-off vector identical to the stock engine.
 //   4. a layer without a direction is untouched.
 
-#include "basalt/kernels/cvec.hpp"
+#include "basalt/models/qwen4exp/kernels/cvec.hpp"
 #include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
 
 #include <cuda_runtime.h>

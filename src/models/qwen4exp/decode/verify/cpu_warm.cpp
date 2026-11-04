@@ -1,12 +1,12 @@
 #include "cpu_warm.hpp"
-#include "basalt/core/verify.hpp"
-#include "basalt/core/native_head.hpp"
+#include "basalt/models/qwen4exp/decode/verify.hpp"
+#include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/models/qwen4exp/decode/gdn_head_split.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/core/progress.hpp"
-#include "basalt/kernels/verify_kernels.hpp"
-#include "basalt/kernels/dec_moe.hpp"
+#include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
+#include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>
 #include <atomic>

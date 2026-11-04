@@ -1,14 +1,14 @@
 #pragma once
 
 #include "common.hpp"
-#include "basalt/core/verify.hpp"
-#include "basalt/kernels/hc_fused.hpp"
-#include "basalt/kernels/gr.hpp"
+#include "basalt/models/qwen4exp/decode/verify.hpp"
+#include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
+#include "basalt/models/qwen4exp/kernels/gr.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/ngram.hpp"
-#include "basalt/kernels/qsa.hpp"
-#include "basalt/kernels/verify_kernels.hpp"
-#include "basalt/kernels/dec_moe.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
+#include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
 #include <string>
 #include <vector>

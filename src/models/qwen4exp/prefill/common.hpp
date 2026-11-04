@@ -1,8 +1,8 @@
 #pragma once
 
-#include "basalt/prefill/prefill.hpp"
+#include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
-#include "basalt/prefill/gemm.hpp"
+#include "basalt/models/qwen4exp/prefill/gemm.hpp"
 #include <algorithm>
 #include <chrono>
 #include <string>

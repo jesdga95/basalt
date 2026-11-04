@@ -1,7 +1,7 @@
-// src/models/qwen4exp/kernels/kv_stream.cu - see include/basalt/kernels/kv_stream.hpp.
-#include "basalt/kernels/kv_stream.hpp"
-#include "basalt/kernels/kv_q4.hpp"
-#include "basalt/kernels/kv_q8.hpp"
+// src/models/qwen4exp/kernels/kv_stream.cu - see include/basalt/models/qwen4exp/kernels/kv_stream.hpp.
+#include "basalt/models/qwen4exp/kernels/kv_stream.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q8.hpp"
 
 #include <cuda_runtime.h>
 

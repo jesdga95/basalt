@@ -24,7 +24,7 @@
 // host reference of every up row and every down row checks that the fixture computes an expert at all - two
 // kernels agreeing on garbage would otherwise pass.
 #include "basalt/kernels/f16_bits.hpp"
-#include "basalt/kernels/s2_expert_grouped.hpp"
+#include "basalt/models/qwen4exp/kernels/s2_expert_grouped.hpp"
 
 #include <cuda_runtime.h>
 

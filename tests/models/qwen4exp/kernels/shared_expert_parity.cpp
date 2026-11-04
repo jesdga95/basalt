@@ -16,8 +16,8 @@
 #include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/kernels/quantize_act.hpp"
-#include "basalt/kernels/s_gemv.hpp"
-#include "basalt/kernels/shared_expert.hpp"
+#include "basalt/models/qwen4exp/kernels/s_gemv.hpp"
+#include "basalt/models/qwen4exp/kernels/shared_expert.hpp"
 
 #include <cuda_runtime.h>
 

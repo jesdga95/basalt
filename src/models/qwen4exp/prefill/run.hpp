@@ -2,15 +2,15 @@
 
 #include "state.hpp"
 #include "layout.hpp"
-#include "basalt/prefill/prefill.hpp"
-#include "basalt/core/mtp.hpp"
+#include "basalt/models/qwen4exp/prefill/prefill.hpp"
+#include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/core/on_device.hpp"
-#include "basalt/core/layout.hpp"
+#include "basalt/models/qwen4exp/decode/layout.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
-#include "basalt/kernels/qsa.hpp"
-#include "basalt/core/layer.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/decode/layer.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include <algorithm>
 #include <atomic>

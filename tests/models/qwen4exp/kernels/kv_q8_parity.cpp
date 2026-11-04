@@ -7,8 +7,8 @@
 //   3. against the FP16 path, the INT8 values differ by at most half a quantization step of their group plus the
 //      fp16 rounding of both sides (0.624 steps).
 #include "basalt/kernels/f16_bits.hpp"
-#include "basalt/kernels/kv_q8.hpp"
-#include "basalt/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q8.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
 
 #include <cuda_runtime.h>
 

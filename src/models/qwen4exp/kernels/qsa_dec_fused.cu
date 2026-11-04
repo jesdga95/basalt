@@ -1,13 +1,13 @@
-// src/models/qwen4exp/kernels/qsa_dec_fused.cu - see include/basalt/kernels/qsa_dec_fused.hpp.
+// src/models/qwen4exp/kernels/qsa_dec_fused.cu - see include/basalt/models/qwen4exp/kernels/qsa_dec_fused.hpp.
 //
 // Built with --use_fast_math like native_qsa.cu, native_rope.cu and native_qsa_indexer.cu, whose expressions this
 // repeats; the INT8 append (kv_q8.cu, built without it) uses explicit IEEE instructions.
-#include "basalt/kernels/qsa_dec_fused.hpp"
-#include "basalt/kernels/qsa_seg.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_dec_fused.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_seg.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/f16_bits.hpp"
-#include "basalt/kernels/kv_q8.hpp"
-#include "basalt/kernels/mrope.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q8.hpp"
+#include "basalt/models/qwen4exp/kernels/mrope.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

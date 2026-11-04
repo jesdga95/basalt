@@ -1,4 +1,4 @@
-// src/models/qwen4exp/decode/mtp/lifecycle.cpp - see include/basalt/core/mtp.hpp.
+// src/models/qwen4exp/decode/mtp/lifecycle.cpp - see include/basalt/models/qwen4exp/decode/mtp.hpp.
 #include "common.hpp"
 
 namespace basalt::core {

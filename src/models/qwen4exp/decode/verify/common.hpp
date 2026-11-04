@@ -1,8 +1,8 @@
 #pragma once
 
-#include "basalt/core/verify.hpp"
+#include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/core/peer_experts.hpp"
-#include "basalt/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstring>

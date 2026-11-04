@@ -1,8 +1,8 @@
-// src/models/qwen4exp/kernels/verify_kernels.cu - see include/basalt/kernels/verify_kernels.hpp.
+// src/models/qwen4exp/kernels/verify_kernels.cu - see include/basalt/models/qwen4exp/kernels/verify_kernels.hpp.
 //
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
-#include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 #include "basalt/kernels/wait_abort.hpp"
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/kernels/pdl.hpp"

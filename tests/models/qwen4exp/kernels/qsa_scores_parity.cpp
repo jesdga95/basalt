@@ -4,8 +4,8 @@
 // identical to the reference top-k on continuous, tied and equal scores; then a microbench line per kernel with the keys
 // warm in L2 and flushed from it.
 //   qsa_scores_parity [iters]
-#include "basalt/kernels/qsa.hpp"
-#include "basalt/kernels/qsa_seg.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_seg.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_select.hpp"
 
 #include <cuda_runtime.h>

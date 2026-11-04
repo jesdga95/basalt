@@ -1,5 +1,5 @@
 #pragma once
-#include "basalt/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
 
 namespace basalt::kernels {
 

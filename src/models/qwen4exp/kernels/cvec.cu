@@ -1,5 +1,5 @@
-// src/models/qwen4exp/kernels/cvec.cu - see include/basalt/kernels/cvec.hpp.
-#include "basalt/kernels/cvec.hpp"
+// src/models/qwen4exp/kernels/cvec.cu - see include/basalt/models/qwen4exp/kernels/cvec.hpp.
+#include "basalt/models/qwen4exp/kernels/cvec.hpp"
 
 #include <cuda_runtime.h>
 

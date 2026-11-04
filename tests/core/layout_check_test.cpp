@@ -1,6 +1,6 @@
 // check_all over a synthetic weight table (host only): the canonical shapes pass; a wrong dimension, a wrong
 // engine form, a missing tensor and a tensor of the wrong layer family each fail with a message naming it.
-#include "basalt/core/layout.hpp"
+#include "basalt/models/qwen4exp/decode/layout.hpp"
 
 #include <cstdio>
 #include <cstdlib>

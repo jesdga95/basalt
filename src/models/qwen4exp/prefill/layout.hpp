@@ -1,14 +1,14 @@
 #pragma once
 
 #include "common.hpp"
-#include "basalt/core/mtp.hpp"
-#include "basalt/core/layout.hpp"
-#include "basalt/kernels/qsa.hpp"
-#include "basalt/kernels/kv_stream.hpp"
-#include "basalt/kernels/kv_q4.hpp"
-#include "basalt/core/native_head.hpp"
-#include "basalt/kernels/verify_kernels.hpp"
-#include "basalt/kernels/qsa_decode_attn.hpp"
+#include "basalt/models/qwen4exp/decode/mtp.hpp"
+#include "basalt/models/qwen4exp/decode/layout.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_stream.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
+#include "basalt/models/qwen4exp/decode/native_head.hpp"
+#include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_decode_attn.hpp"
 #include <vector>
 
 namespace basalt::prefill::detail {

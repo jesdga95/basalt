@@ -51,9 +51,9 @@ target_link_libraries(model_qwen4exp_kernels PUBLIC kernels)
 # The composed layer: layer and session, the verify windows, the MTP drafter, the conversation state.
 add_library(model_qwen4exp_engine STATIC src/models/qwen4exp/decode/layer.cpp src/models/qwen4exp/decode/expert_dispatch.cpp
   src/models/qwen4exp/decode/session.cpp
-  src/core/kv_arena.cpp
-  src/core/native_head.cpp
-  src/core/native_dense.cpp
+  src/models/qwen4exp/decode/kv_arena.cpp
+  src/models/qwen4exp/decode/native_head.cpp
+  src/models/qwen4exp/decode/native_dense.cpp
   src/models/qwen4exp/decode/verify/batch_capture.cpp
   src/models/qwen4exp/decode/verify/batch_execution.cpp
   src/models/qwen4exp/decode/verify/batch_sessions.cpp
@@ -94,8 +94,8 @@ add_library(model_qwen4exp_engine STATIC src/models/qwen4exp/decode/layer.cpp sr
   src/models/qwen4exp/decode/mtp/draft.cpp
   src/models/qwen4exp/decode/mtp/stores.cpp
   src/models/qwen4exp/decode/mtp/batching.cpp
-  src/core/conversation_snapshot.cpp
-  src/core/conversation_state.cpp
+  src/models/qwen4exp/conversation/conversation_snapshot.cpp
+  src/models/qwen4exp/conversation/conversation_state.cpp
  
  
   src/core/staged_copy.cpp)

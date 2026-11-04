@@ -10,7 +10,7 @@
 //   3. The measured size of that difference is reported, so the number is one this test produces
 //      rather than one quoted from elsewhere.
 #include "basalt/kernels/quantize_act.hpp"
-#include "basalt/kernels/s_gemv.hpp"
+#include "basalt/models/qwen4exp/kernels/s_gemv.hpp"
 #include "basalt/models/qwen4exp/kernels/s2_gemv_q8.hpp"
 
 #include <cuda_runtime.h>

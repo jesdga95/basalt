@@ -3,13 +3,13 @@
 // (session_copy_state through StagedCopy), the range's new cells back, and the range into a whole-model checkpoint
 // (conversation_checkpoint_save_layers). Every byte is checked against the source, the rest against what was there.
 // With KV streaming the whole session's cells are its host copy.
-#include "basalt/core/conversation_snapshot.hpp"
-#include "basalt/core/layer.hpp"
-#include "basalt/core/session.hpp"
+#include "basalt/models/qwen4exp/decode/conversation_snapshot.hpp"
+#include "basalt/models/qwen4exp/decode/layer.hpp"
+#include "basalt/models/qwen4exp/decode/session.hpp"
 #include "basalt/core/staged_copy.hpp"
-#include "basalt/kernels/kv_q4.hpp"
-#include "basalt/kernels/kv_q8.hpp"
-#include "basalt/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q8.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
 
 #include <cuda_runtime.h>
 

@@ -1,8 +1,8 @@
-// src/models/qwen4exp/kernels/kv_q4.cu - see include/basalt/kernels/kv_q4.hpp. Q4_0 KV with Walsh-Hadamard rotation
+// src/models/qwen4exp/kernels/kv_q4.cu - see include/basalt/models/qwen4exp/kernels/kv_q4.hpp. Q4_0 KV with Walsh-Hadamard rotation
 // (with KV-streaming integration and a deterministic group maximum).
-#include "basalt/kernels/kv_q4.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
 #include "basalt/kernels/f16_bits.hpp"
-#include "basalt/kernels/kv_stream.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_stream.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
