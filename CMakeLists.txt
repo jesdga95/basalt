@@ -242,7 +242,7 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/models/qwen4exp/ke
                         src/models/qwen4exp/kernels/s_gemv.cu
                         src/models/qwen4exp/kernels/router_top10.cu
                         src/kernels/cuda/quantize_act.cu
-                        src/kernels/cuda/rope.cu
+                        src/models/qwen4exp/kernels/rope.cu
                         src/kernels/cuda/sampler.cu
                         src/models/qwen4exp/kernels/s2_gemv_q8.cu
   src/models/qwen4exp/kernels/s2_expert_grouped.cu
@@ -266,11 +266,11 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/models/qwen4exp/ke
                         src/models/qwen4exp/kernels/native_qsa_indexer.cu
                         src/models/qwen4exp/kernels/native_qsa_score.cu
                         src/models/qwen4exp/kernels/ple.cu
-                        src/kernels/cuda/kv_q8.cu
-                        src/kernels/cuda/kv_stream.cu
-                        src/kernels/cuda/kv_q4.cu
+                        src/models/qwen4exp/kernels/kv_q8.cu
+                        src/models/qwen4exp/kernels/kv_stream.cu
+                        src/models/qwen4exp/kernels/kv_q4.cu
                         src/models/qwen4exp/kernels/fused_gr.cu
-                        src/kernels/cuda/cvec.cu
+                        src/models/qwen4exp/kernels/cvec.cu
                         src/models/qwen4exp/kernels/qsa_decode_attn.cu
                         src/models/qwen4exp/kernels/qsa_dec_attn.cu
                         src/models/qwen4exp/kernels/qsa_dec_fused.cu

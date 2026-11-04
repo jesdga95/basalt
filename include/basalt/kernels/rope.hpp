@@ -3,7 +3,7 @@
 // Pairing is NEOX: (i, i + n_rot/2), NOT the adjacent pair (2i, 2i+1).  The rotation is PARTIAL - only the
 // first n_rot of head_dim are touched, 64 of 256 in this artifact - and the tail passes through.
 //
-// The cos/sin table is built on the HOST in float64 (see src/kernels/cuda/rope.cu for why) and the kernel is
+// The cos/sin table is built on the HOST in float64 (see src/models/qwen4exp/kernels/rope.cu for why) and the kernel is
 // a pure rotation over it.  The table depends on (n_rot, theta, position) and not on the token, so it is worth
 // caching; `build_rope_table` fills `max_pos` positions of `n_rot/2` pairs each.
 //
