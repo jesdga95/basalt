@@ -234,6 +234,41 @@ static void test_text_unions() {
     CHECK(ref && call_ok(ref, head + "notes/x.txt" + tail));
 }
 
+// Parameters sent as a union of objects ({"properties":{},"oneOf":[...]}): the parameters of every variant are allowed,
+// the discriminator takes every variant's value, and only what all the variants require stays required.
+static void test_union_parameters() {
+    std::string err;
+    auto g = Grammar::parse(tool_call_gbnf(R"([{"name":"automation","parameters":{"type":"object","properties":{},
+        "oneOf":[{"$ref":"#/$defs/view"},{"$ref":"#/$defs/write"}],
+        "$defs":{"id":{"type":"string"},
+                 "view":{"type":"object","properties":{"mode":{"type":"string","enum":["view"]},
+                                                       "id":{"$ref":"#/$defs/id"}},
+                         "required":["mode","id"],"additionalProperties":false},
+                 "write":{"oneOf":[{"$ref":"#/$defs/create"},{"$ref":"#/$defs/delete"}]},
+                 "create":{"type":"object","properties":{"mode":{"type":"string","enum":["create"]},
+                                                         "name":{"type":"string"},"every":{"type":"integer"}},
+                           "required":["mode","name"],"additionalProperties":false},
+                 "delete":{"type":"object","properties":{"mode":{"type":"string","enum":["delete"]},
+                                                         "id":{"$ref":"#/$defs/id"}},
+                           "required":["mode","id"],"additionalProperties":false}}}}])",
+                                           ToolGrammarOptions{}, err), err);
+    if (!g) std::printf("union tool grammar error: %s\n", err.c_str());
+    CHECK(g);
+    if (!g) return;
+    const std::string head = "<tool_call>\n<function=automation>\n";
+    const std::string tail = "</function>\n</tool_call>";
+    auto par = [](const std::string& k, const std::string& v) {
+        return "<parameter=" + k + ">\n" + v + "\n</parameter>\n";
+    };
+    CHECK(call_ok(g, head + par("mode", "create") + par("name", "Disk check") + par("every", "8") + tail));
+    CHECK(call_ok(g, head + par("mode", "view") + par("id", "abc") + tail));
+    CHECK(call_ok(g, head + par("mode", "delete") + par("id", "abc") + tail));
+    CHECK(!pre(g, head + par("mode", "explode")));          // the discriminator is the union of the variants' values
+    CHECK(!pre(g, head + tail));                            // every variant requires mode
+    CHECK(!pre(g, head + par("mode", "view") + "<parameter=bogus>"));
+    CHECK(!pre(g, head + par("mode", "create") + par("every", "x")));   // a merged parameter keeps its type
+}
+
 static void test_request() {
     std::string err;
     auto r = grammar_from_request(R"({"kind":"tools","tool_choice":"auto","tools":[{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}}},{"type":"function","function":{"name":"pong","parameters":{"type":"object","properties":{}}}}]})", err);
@@ -255,6 +290,23 @@ static void test_request() {
     GrammarState o(jo.grammar, jo.triggers);
     CHECK(jo.grammar && o.accept("{\"x\":[1,{\"y\":null}]}") && o.accepting() && !o.allows("[1]"));
     CHECK(!grammar_from_request(R"({"kind":"nope"})", err).grammar && !err.empty());
+    // a JSON format with tools: from the first answer token, tool calls or the JSON value
+    err.clear();
+    auto both = grammar_from_request(R"({"kind":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false},"tools":[{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}}}]})", err);
+    CHECK(both.grammar && err.empty() && !both.triggers.lazy());
+    GrammarState b1(both.grammar, both.triggers);
+    CHECK(b1.active() && b1.accept("{\"title\":\"Fix the build\"}") && b1.accepting());
+    GrammarState b2(both.grammar, both.triggers);
+    CHECK(b2.accept("<tool_call>\n<function=ping>\n<parameter=n>\n5\n</parameter>\n</function>\n</tool_call>") && b2.accepting());
+    GrammarState b3(both.grammar, both.triggers);
+    CHECK(!b3.allows("Sure: {") && !b3.allows("{\"name\":") && !b3.allows("<tool_call>\n<function=pong>"));
+    GrammarState b4(both.grammar, both.triggers);
+    CHECK(!b4.allows("<tool_call>\n<function=ping>\n<parameter=n>\n5\n</parameter>\n</function>\n</tool_call>{"));
+    err.clear();
+    auto obj = grammar_from_request(R"({"kind":"json_object","tools":[{"type":"function","function":{"name":"ping"}}]})", err);
+    GrammarState o2(obj.grammar, obj.triggers);
+    CHECK(obj.grammar && err.empty() && o2.accept("{\"x\":1}") && o2.accepting() && !o2.allows("[1]"));
+    CHECK(!grammar_from_request(R"({"kind":"json_object","tools":{}})", err).grammar && !err.empty());
 }
 
 // A pattern or an enum string can decode (a "\u0000" JSON escape) to raw control bytes. They must reach the
@@ -301,6 +353,7 @@ int main() {
     test_ref();
     test_tools();
     test_text_unions();
+    test_union_parameters();
     test_control_escapes();
     if (g_fail) { std::printf("grammar_schema_test: %d failures\n", g_fail); return 1; }
     std::printf("grammar_schema_test: ok\n");

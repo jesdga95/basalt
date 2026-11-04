@@ -26,6 +26,7 @@
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/kernels/dp4a.hpp"
+#include "basalt/kernels/packed_byte.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -179,7 +180,7 @@ __global__ void native_swiglu_quantize_q8_1_kernel(const float* __restrict__ gat
 // Exact pinned vec_dot_q5_K_q8_1_impl_vmmq expression and integer dot order.
 __device__ __forceinline__ float q5_q8_dot_impl(
     const int* __restrict__ vl, const int* __restrict__ vh, const int* __restrict__ u,
-    const uint8_t* __restrict__ sc, const uint8_t* __restrict__ m, const half2& dm5,
+    const uint32_t scm, const half2& dm5,
     const float* __restrict__ d8) {
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
@@ -193,8 +194,8 @@ __device__ __forceinline__ float q5_q8_dot_impl(
         const int v1i = vl1i | vh1i;
         const int dot1 = DP4A(v0i, u[2 * i], DP4A(v1i, u[2 * i + 1], 0));
         const int dot2 = DP4A(0x01010101, u[2 * i], DP4A(0x01010101, u[2 * i + 1], 0));
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);
+        sumf_d += d8[i] * (dot1 * (int) packed_byte(scm, i));
+        sumf_m += d8[i] * (dot2 * (int) packed_byte(scm, 2 + i));
     }
     const float2 dm5f = __half22float2(dm5);
     return dm5f.x * sumf_d - dm5f.y * sumf_m;
@@ -226,8 +227,7 @@ __device__ __forceinline__ float q5_q8_dot(const Q5KBlock* __restrict__ bq5,
                      ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
     aux[1] = uint16_t(((s2 & 0x3f3f) & ~hi) |
                      ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
-    const uint8_t* sc = reinterpret_cast<const uint8_t*>(aux);
-    const uint8_t* m = sc + 2;
+    const uint32_t scm = pack_scale_min(aux);
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
         const Q81Block* bq8i = bq8 + bq8_offset + i;
@@ -236,7 +236,7 @@ __device__ __forceinline__ float q5_q8_dot(const Q5KBlock* __restrict__ bq5,
         u[2 * i] = q8[0];
         u[2 * i + 1] = q8[4];
     }
-    return q5_q8_dot_impl(vl, vh, u, sc, m, bq5->dm, d8);
+    return q5_q8_dot_impl(vl, vh, u, scm, bq5->dm, d8);
 }
 
 // The generic ncols=1 oracle uses 4 warps and 1 row (or 4 rows for small K),
@@ -521,7 +521,7 @@ __global__ void native_iq4_xs_mmvq_kernel(const IQ4XSBlock* __restrict__ w,
 // Exact pinned vec_dot_q4_K_q8_1_impl_vmmq expression and integer dot order.
 __device__ __forceinline__ float q4_q8_dot_impl(
     const int* __restrict__ v, const int* __restrict__ u,
-    const uint8_t* __restrict__ sc, const uint8_t* __restrict__ m, const half2& dm4,
+    const uint32_t scm, const half2& dm4,
     const float* __restrict__ d8) {
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
@@ -531,8 +531,8 @@ __device__ __forceinline__ float q4_q8_dot_impl(
         const int v1i = (v[1] >> (4 * i)) & 0x0f0f0f0f;
         const int dot1 = DP4A(v1i, u[2 * i + 1], DP4A(v0i, u[2 * i], 0));
         const int dot2 = DP4A(0x01010101, u[2 * i + 1], DP4A(0x01010101, u[2 * i], 0));
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);
+        sumf_d += d8[i] * (dot1 * (int) packed_byte(scm, i));
+        sumf_m += d8[i] * (dot2 * (int) packed_byte(scm, 2 + i));
     }
     const float2 dm4f = __half22float2(dm4);
     return dm4f.x * sumf_d - dm4f.y * sumf_m;
@@ -560,8 +560,7 @@ __device__ __forceinline__ float q4_q8_dot(const Q4KBlock* __restrict__ bq4,
                      ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
     aux[1] = uint16_t(((s2 & 0x3f3f) & ~hi) |
                      ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
-    const uint8_t* sc = reinterpret_cast<const uint8_t*>(aux);
-    const uint8_t* m = sc + 2;
+    const uint32_t scm = pack_scale_min(aux);
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
         const Q81Block* bq8i = bq8 + bq8_offset + i;
@@ -570,7 +569,7 @@ __device__ __forceinline__ float q4_q8_dot(const Q4KBlock* __restrict__ bq4,
         u[2 * i] = q8[0];
         u[2 * i + 1] = q8[4];
     }
-    return q4_q8_dot_impl(v, u, sc, m, bq4->dm, d8);
+    return q4_q8_dot_impl(v, u, scm, bq4->dm, d8);
 }
 
 // The generic ncols=1 oracle uses 4 warps and 1 row (or 4 rows for small K),
@@ -974,8 +973,7 @@ struct Q5KTraits {
             u[2 * i] = q8[0];
             u[2 * i + 1] = q8[4];
         }
-        const uint8_t* sc = reinterpret_cast<const uint8_t*>(r.aux);
-        return q5_q8_dot_impl(r.vl, r.vh, u, sc, sc + 2, r.dm, d8);
+        return q5_q8_dot_impl(r.vl, r.vh, u, pack_scale_min(r.aux), r.dm, d8);
     }
 };
 struct Q4KTraits {
@@ -1012,8 +1010,7 @@ struct Q4KTraits {
             u[2 * i] = q8[0];
             u[2 * i + 1] = q8[4];
         }
-        const uint8_t* sc = reinterpret_cast<const uint8_t*>(r.aux);
-        return q4_q8_dot_impl(r.v, u, sc, sc + 2, r.dm, d8);
+        return q4_q8_dot_impl(r.v, u, pack_scale_min(r.aux), r.dm, d8);
     }
 };
 struct Q20Traits {

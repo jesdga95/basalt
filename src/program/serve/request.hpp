@@ -49,12 +49,6 @@ private:
     int64_t grammar_resamples{};
     basalt::program::PplGate* ppl{};
     bool bad{};
-    std::array<int64_t, 3> remote_before{};
-    std::array<int64_t, 3> launches_before{};
-    std::array<uint64_t, 3> compact_before{};
-    std::array<uint64_t, 3> full_before{};
-    std::array<double, 3> begin_before{};
-    std::array<double, 3> wait_before{};
     std::vector<int32_t> ids32{};
     Clock::time_point r0{};
     bool want_cvec{};
@@ -88,6 +82,7 @@ private:
                 ~KeepRouted() { on = false; }
             };
     std::optional<KeepRouted> keep_routed;
+    std::optional<KeepRouted> defer_peer;
     bool kv_ok{};
     Clock::time_point restore_t0{};
     int64_t read_from{};
