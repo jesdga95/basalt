@@ -1,4 +1,4 @@
-// src/kernels/cuda/qsa.cu - the QSA cache, indexer and attention (see include/basalt/kernels/qsa.hpp).
+// src/models/qwen4exp/kernels/qsa.cu - the QSA cache, indexer and attention (see include/basalt/kernels/qsa.hpp).
 //
 // The header documents the layouts and the scope; this file documents the four decisions that are about the
 // KERNEL rather than about the interface.

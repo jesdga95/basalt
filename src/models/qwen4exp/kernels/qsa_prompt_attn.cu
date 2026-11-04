@@ -1,7 +1,7 @@
-// src/kernels/cuda/qsa_prompt_attn.cu - see include/basalt/kernels/qsa_prompt_attn.hpp.
+// src/models/qwen4exp/kernels/qsa_prompt_attn.cu - see include/basalt/models/qwen4exp/kernels/qsa_prompt_attn.hpp.
 #include <cstdlib>
 #include <cstring>
-#include "basalt/kernels/qsa_prompt_attn.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_prompt_attn.hpp"
 #include "basalt/kernels/kv_q8.hpp"
 #include "basalt/kernels/kv_q4.hpp"
 

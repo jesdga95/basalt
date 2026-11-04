@@ -13,7 +13,7 @@
 // Usage: qsa_prompt_attn_parity [context=32768] [queries=2048] [reps=5]
 #include "basalt/kernels/qsa.hpp"
 #include "basalt/kernels/qsa_decode_attn.hpp"
-#include "basalt/kernels/qsa_prompt_attn.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_prompt_attn.hpp"
 #include "basalt/kernels/kv_q4.hpp"
 
 #include <cuda_fp16.h>

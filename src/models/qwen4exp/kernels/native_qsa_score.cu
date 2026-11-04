@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "basalt/kernels/native_qsa_score.hpp"
+#include "basalt/models/qwen4exp/kernels/native_qsa_score.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cstddef>

@@ -249,7 +249,7 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/shared_expert.cu
                         src/models/qwen4exp/kernels/gr.cu
                         src/models/qwen4exp/kernels/gdn.cu
-                        src/kernels/cuda/qsa.cu
+                        src/models/qwen4exp/kernels/qsa.cu
                         src/kernels/cuda/elementwise.cu
                         src/kernels/cuda/bf16_gemv.cu
                         src/kernels/cuda/native_mmvq.cu
@@ -260,28 +260,28 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/models/qwen4exp/kernels/native_gr_postops.cu
                         src/kernels/cuda/native_router.cu
                         src/models/qwen4exp/kernels/native_gdn_preprocess.cu
-                        src/kernels/cuda/native_qsa.cu
+                        src/models/qwen4exp/kernels/native_qsa.cu
                         src/kernels/cuda/native_rope.cu
                         src/models/qwen4exp/kernels/native_ple_postops.cu
-                        src/kernels/cuda/native_qsa_indexer.cu
-                        src/kernels/cuda/native_qsa_score.cu
+                        src/models/qwen4exp/kernels/native_qsa_indexer.cu
+                        src/models/qwen4exp/kernels/native_qsa_score.cu
                         src/kernels/cuda/ple.cu
                         src/kernels/cuda/kv_q8.cu
                         src/kernels/cuda/kv_stream.cu
                         src/kernels/cuda/kv_q4.cu
                         src/models/qwen4exp/kernels/fused_gr.cu
                         src/kernels/cuda/cvec.cu
-                        src/kernels/cuda/qsa_decode_attn.cu
-                        src/kernels/cuda/qsa_dec_attn.cu
-                        src/kernels/cuda/qsa_dec_fused.cu
+                        src/models/qwen4exp/kernels/qsa_decode_attn.cu
+                        src/models/qwen4exp/kernels/qsa_dec_attn.cu
+                        src/models/qwen4exp/kernels/qsa_dec_fused.cu
                         src/kernels/cuda/q5k_head.cu
                         src/kernels/cuda/q6k_head.cu
                         src/kernels/cuda/q80_proxy.cu
                         src/kernels/cuda/q80_vhead.cu
-                        src/kernels/cuda/qsa_prompt_attn.cu
+                        src/models/qwen4exp/kernels/qsa_prompt_attn.cu
                         src/models/qwen4exp/kernels/fused_gdn.cu
                         src/kernels/cuda/dequant_bf16.cu
-                        src/kernels/cuda/qsa_select.cu
+                        src/models/qwen4exp/kernels/qsa_select.cu
                         src/kernels/cuda/verify_kernels.cu
                         src/kernels/cuda/dec_gdn_rec.cu
                         src/models/qwen4exp/kernels/dense_tc.cu
@@ -318,12 +318,12 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
     src/models/qwen4exp/kernels/native_gr_postops.cu
     src/kernels/cuda/native_router.cu
     src/models/qwen4exp/kernels/native_gdn_preprocess.cu
-    src/kernels/cuda/native_qsa.cu
+    src/models/qwen4exp/kernels/native_qsa.cu
     src/kernels/cuda/native_rope.cu
     src/models/qwen4exp/kernels/native_ple_postops.cu
-    src/kernels/cuda/native_qsa_indexer.cu
-    src/kernels/cuda/native_qsa_score.cu
-    src/kernels/cuda/qsa_dec_fused.cu
+    src/models/qwen4exp/kernels/native_qsa_indexer.cu
+    src/models/qwen4exp/kernels/native_qsa_score.cu
+    src/models/qwen4exp/kernels/qsa_dec_fused.cu
     src/kernels/cuda/q5k_head.cu
     src/kernels/cuda/q6k_head.cu
     src/kernels/cuda/q80_proxy.cu
