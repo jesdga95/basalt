@@ -1,8 +1,10 @@
-// include/basalt/program/image_loan.hpp - the expert-cache room an image encode may borrow, and the order the elastic
-// KV gives its spare cells back in when that room is short.  Host only: no GPU runtime, no model.
+// include/basalt/program/image_loan.hpp - the expert-cache room an image encode may borrow, the order the elastic KV
+// gives its spare cells back in when that room is short, and the elastic KV's ceiling.  Host only: no GPU runtime,
+// no model.
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -25,5 +27,18 @@ struct KvHold {
 /// spare first within each.  Each entry is (session index, cells it keeps), never below its `keep` nor `floor`; a
 /// session with nothing past that is left out.
 std::vector<std::pair<int, int64_t>> kv_giveback_order(const std::vector<KvHold>& holds, int64_t floor);
+
+/// The most granules the elastic KV can take off the expert cache's tail while the cache keeps `floor` slots, as the
+/// KV's own fit tests it: `mapped` is the bytes the cache backs now (whole granules of `gran` bytes), and
+/// `slots_after(keep)` the slots a shrink to `keep` bytes leaves.
+int64_t kv_cache_spare_granules(int64_t mapped, int64_t gran, int64_t floor,
+                                const std::function<int64_t(int64_t)>& slots_after);
+
+/// The elastic KV's ceiling: the cells the sessions can hold together when each in turn backs what it can of `spare`
+/// bytes, on the 256-cell grid and up to its context.  `backed[i]`: the cells session i backs now (negative: it is not
+/// elastic and holds its whole context); `max_cells[i]`: its context; `grow(i, cells)`: the bytes session i would
+/// add to back `cells`.
+int64_t kv_ceiling_cells(const std::vector<int64_t>& backed, const std::vector<int64_t>& max_cells, int64_t spare,
+                         const std::function<int64_t(size_t, int64_t)>& grow);
 
 }  // namespace basalt::program
