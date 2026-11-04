@@ -92,7 +92,7 @@ public:
 
     // The disk tier's records count positional cells; this model's caches keep compressed rows.
     model::TokenNames token_names() const override {
-        return {{"<\xef\xbd\x9cend\xe2\x96\x81of\xe2\x96\x81sentence\xef\xbd\x9c>"}, "<\xef\xbd\x9cUser\xef\xbd\x9c>",
+        return {{"<\xef\xbd\x9c" "end\xe2\x96\x81of\xe2\x96\x81sentence\xef\xbd\x9c>"}, "<\xef\xbd\x9cUser\xef\xbd\x9c>",
                 "<\xef\xbd\x9c" "deepseek_image\xef\xbd\x9c>"};
     }
 };
