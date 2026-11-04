@@ -39,7 +39,7 @@ A take reads the free RAM again right before it pins and pins only when that rea
 keep and the RAM guard. The keep counts what serving can still take: its budget less the checkpoints, the blocks
 their pool keeps for the next ones and the parked conversations it holds now.
 
-A session nearing the crossover (`kv_host_lead`) prefaults its first pool: the registered layout is reserved and its
+A session within 8192 cells below the crossover prefaults its first pool: the registered layout is reserved and its
 first pin's pages are committed and written with zeros on a background thread that makes no device call, under the
 same keep as the take. The take waits for the writer and registers that layout in place. The bytes a pool holds when
 it is first read are unchanged (new pages are zero either way); only when the OS backs them moves. Admission and the

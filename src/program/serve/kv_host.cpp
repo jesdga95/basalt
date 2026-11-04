@@ -6,6 +6,11 @@
 
 namespace basalt::program::serve {
 
+namespace {
+// a session not streamed yet prefaults its first pool from this many cells below kv_host_cross
+constexpr int64_t kKvHostLead = 8192;
+}  // namespace
+
 void Runtime::kv_host_init() {
     // by default only beside the experts' RAM copy: with a file mapping the pin would take the file cache's RAM
     const bool kv_host_ram_copy = srcp == &src && src.complement_ready();
@@ -33,8 +38,6 @@ void Runtime::kv_host_init() {
     // a session not streamed yet takes a pool only for a request that reads at most this many prompt tokens: a long
     // streamed read costs more than its decode wins back, and the conversation's next turn (a short read) streams
     kv_host_fresh = (int64_t) basalt::core::exp_flag("kv_host_fresh", 32768);
-    // a session not streamed yet prefaults its first pool from this many cells below kv_host_cross (0: at the take)
-    kv_host_lead = std::max<int64_t>(0, (int64_t) basalt::core::exp_flag("kv_host_lead", 8192));
 }
 
 // a pin leaves the guard's floor free and what serving can still take: its budget less the part it holds now
@@ -60,7 +63,7 @@ uint64_t Runtime::kv_ram_now() {
 // a session nearing the crossover prefaults its first pool when the take's keep admits it now; one farther from it,
 // or already streamed, holds none
 void Runtime::kv_host_ahead(int64_t need) {
-    if (kv_pool.valid() || kv_host_lead <= 0 || need < kv_host_cross - kv_host_lead) {
+    if (kv_pool.valid() || need < kv_host_cross - kKvHostLead) {
         kv_ahead_drop("shallow");
         return;
     }
