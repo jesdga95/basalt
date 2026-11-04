@@ -9,7 +9,7 @@
 #include "basalt/models/qwen4exp/decode/layout.hpp"
 #include "basalt/models/qwen4exp/decode/session.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
-#include "basalt/models/qwen4exp/kernels/cpu_geometry.hpp"
+#include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 

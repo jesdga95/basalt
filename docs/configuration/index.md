@@ -64,6 +64,8 @@ A config file is one JSON object with two optional blocks:
 
 In the tables, "default" is what applies when the setting is absent everywhere.
 
+Each model takes the common flags and its own; a flag a model lacks is the normal `unknown argument` error. Flags have one default across models; token id flags default to the pack's own tokens.
+
 ## Automatic settings
 
 Four settings are picked by the engine at start when they are left out: `peer-exclusive`, `resident`

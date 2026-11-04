@@ -7,7 +7,7 @@
 #include "basalt/core/on_device.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
-#include "basalt/models/qwen4exp/kernels/cpu_geometry.hpp"
+#include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"

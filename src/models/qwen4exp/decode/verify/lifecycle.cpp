@@ -9,7 +9,7 @@
 #include "basalt/platform/compiler.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
-#include "basalt/models/qwen4exp/kernels/cpu_geometry.hpp"
+#include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
 #include "basalt/models/qwen4exp/kernels/mid_chain.hpp"
