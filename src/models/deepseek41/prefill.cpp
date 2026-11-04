@@ -1,0 +1,318 @@
+// src/models/deepseek41/prefill.cpp - the DeepSeek-V4.1 layer loop over a chunk of prompt tokens.
+//
+// Same per-layer sequence as the single-token loop (session.cpp), with every elementwise, mixing, norm, router and
+// Engram step taken over T tokens at once. Attention and the experts go through the LayerOps batch entries, which
+// keep the causal order inside the chunk.
+#include "basalt/log.hpp"
+#include "models/deepseek41/prefill.hpp"
+
+#include "basalt/artifact/dequant.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/models/deepseek41/kernels.hpp"
+#include "models/deepseek41/layer_ops.hpp"
+#include "models/deepseek41/model.hpp"
+#include "models/deepseek41/ops.hpp"
+#include "models/deepseek41/prefill_ffn.hpp"
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cstdio>
+#include <type_traits>
+
+namespace basalt::models::deepseek41 {
+namespace {
+
+#define DS_CUDA(call)                                                                                   \
+    do {                                                                                                \
+        cudaError_t e_ = (call);                                                                        \
+        if (e_ != cudaSuccess) return fail(std::string(#call) + ": " + cudaGetErrorString(e_));         \
+    } while (0)
+
+class PrefillImpl final : public Prefill {
+public:
+    PrefillImpl(DsModel& m, LayerOps& ops, void* stream, int cap)
+        : m_(m), g_(m.geo()), ops_(ops), stream_((cudaStream_t) stream), cap_(cap) {}
+    ~PrefillImpl() override {
+        for (void* p : allocs_) cudaFree(p);
+    }
+
+    bool init(std::string& err) {
+        const size_t n = (size_t) g_.n_embd, C = (size_t) cap_;
+        const size_t cols = (size_t) m_.pack().engram.hash.n_cols() * 256;
+        auto buf = [&](auto*& p, size_t count) {
+            void* v = nullptr;
+            if (cudaMalloc(&v, count * sizeof(*p)) != cudaSuccess) return false;
+            allocs_.push_back(v);
+            p = (std::remove_reference_t<decltype(p)>) v;
+            return true;
+        };
+        dump_dir_ = m_.diag_dump();
+        if (m_.diag_fixture().empty()) {   // a replayed fixture serves the experts through the ops instead
+            ffn_ = make_prefill_ffn(m_, ops_, cap_, err);
+            if (!ffn_) return false;
+        }
+        const size_t q8 = std::max<size_t>(kernels::native_q8_1_bytes((int) std::max<size_t>(cols, n), 8), 1 << 16);
+        bool ok = buf(x_, C * 4 * n) && buf(x2_, C * 4 * n) && buf(cur_, C * n) && buf(normed_, C * n) &&
+                  buf(attn_, C * n) && buf(moe_, C * n) && buf(sh_, C * n) && buf(sum_, C * n) &&
+                  buf(coef_a_, C * kHcCoef) && buf(coef_f_[0], C * kHcCoef) && buf(coef_f_[1], C * kHcCoef) &&
+                  buf(hc_ws_, hc_mixes_workspace_floats(cap_)) && buf(rlogits_, C * (size_t) g_.n_expert) &&
+                  buf(rw_, C * 8) && buf(ids_, C * 8) &&
+                  buf(kv_dev_, C * 5 * n) && buf(q8_, q8) && buf(rows_all_, C * (cols ? cols : 1));
+        if (!ok) err = "out of device memory for the prefill buffers";
+        return ok;
+    }
+
+    bool run(const int32_t* tokens, int n, int64_t pos0, std::vector<int32_t>& hist, std::string& err) override {
+        return run_rows(tokens, nullptr, n, pos0, hist, err);
+    }
+    bool run_embeddings(const float* rows, int n, int64_t pos0, std::vector<int32_t>& hist, std::string& err) override {
+        return run_rows(nullptr, rows, n, pos0, hist, err);
+    }
+
+    bool run_rows(const int32_t* tokens, const float* embd, int n, int64_t pos0, std::vector<int32_t>& hist,
+                  std::string& err) {
+        if (pos0 == 0) {
+            hist.clear();
+            ops_.reset();
+        }
+        if ((int64_t) hist.size() != pos0) {
+            err = "positions must be consecutive from 0 (the session keeps one sequence)";
+            return false;
+        }
+        for (int off = 0; off < n; off += cap_) {
+            const int T = std::min(cap_, n - off);
+            err_.clear();
+            if (!chunk(tokens ? tokens + off : nullptr, embd ? embd + (size_t) off * g_.n_embd : nullptr, T, pos0 + off,
+                       off, hist)) {
+                cudaStreamSynchronize(stream_);   // the layer ticks queued so far still point at this object
+                err = err_.empty() ? "deepseek41: prefill failed" : err_;
+                return false;
+            }
+            if (progress) progress(off + T);
+        }
+        return true;
+    }
+
+private:
+    struct Tick {
+        const std::function<void(int)>* fn = nullptr;
+        int tokens = 0;
+    };
+    static void CUDART_CB tick(void* p) {
+        const Tick* t = (const Tick*) p;
+        if (t->fn && *t->fn) (*t->fn)(t->tokens);
+    }
+    std::vector<Tick> ticks_;
+
+    bool fail(const std::string& s) {
+        err_ = s;
+        return false;
+    }
+    const float* wf(int layer, const char* suffix) {
+        const DevTensor* t = m_.tensor(layer, suffix);
+        return t ? (const float*) t->ptr : nullptr;
+    }
+
+    // `embd` set: the chunk is input embeddings, not tokens (picture rows).
+    bool chunk(const int32_t* tokens_in, const float* embd, int T, int64_t pos0, int off, std::vector<int32_t>& hist) {
+        const size_t n = (size_t) g_.n_embd;
+        void* st = stream_;
+        std::string err;
+        const std::vector<int32_t> dead((size_t) (embd ? T : 0), -1);
+        const int32_t* tokens = embd ? dead.data() : tokens_in;
+        hist.insert(hist.end(), tokens, tokens + T);
+
+        // embeddings, repeated into the four streams
+        {
+            std::vector<float> emb((size_t) T * 4 * n);
+            for (int t = 0; t < T; ++t) {
+                float* row = emb.data() + (size_t) t * 4 * n;
+                if (embd) std::copy(embd + (size_t) t * n, embd + (size_t) (t + 1) * n, row);
+                else if (!m_.embedding_row(tokens[t], row, err)) return fail(err);
+                for (int s = 1; s < kHcMult; ++s) std::copy(row, row + n, row + (size_t) s * n);
+            }
+            DS_CUDA(cudaMemcpyAsync(x_, emb.data(), emb.size() * sizeof(float), cudaMemcpyHostToDevice, stream_));
+            DS_CUDA(cudaStreamSynchronize(stream_));
+        }
+
+        // Engram rows for every Engram layer, requested now so the SSD reads overlap the first layers
+        const EngramInfo& en = m_.pack().engram;
+        const int n_cols = en.hash.n_cols();
+        std::vector<std::vector<uint8_t>> raw(en.layers.size());
+        std::vector<ngram::PleReader::Ticket> tickets(en.layers.size());
+        if (!en.layers.empty() && !embd) {
+            int32_t prev[8] = {0};
+            const int np = en.hash.n_gram - 1;
+            for (int j = 0; j < np; ++j) {
+                const int64_t q = pos0 - np + j;
+                prev[j] = q >= 0 ? hist[(size_t) q] : 0;
+            }
+            for (size_t k = 0; k < en.layers.size(); ++k) {
+                std::vector<int32_t> ids((size_t) T * n_cols);
+                engram_hash(en.hash, (int) k, tokens, T, pos0, pos0 == 0 ? nullptr : prev, ids.data());
+                std::vector<uint32_t> rows(ids.begin(), ids.end());
+                raw[k].assign(rows.size() * en.row_bytes, 0);
+                tickets[k] = m_.engram_reader().issue(rows.data(), rows.size(), raw[k].data());
+            }
+        }
+
+        const float* pre_prev = nullptr;
+        int fi = 0;
+        HcArgs hca;
+        hca.n_embd = (int) n;
+        hca.rms_eps = 1e-20f;
+        hca.hc_eps = g_.hc_eps;
+        hca.sinkhorn_iters = g_.sinkhorn_iters;
+        RouterArgs ra;
+        ra.n_expert = g_.n_expert;
+        ra.n_embd = (int) n;
+        ra.k = g_.n_used;
+        ra.weight_scale = g_.weight_scale;
+        const int K = g_.n_used;
+
+        // GPU-timeline marks around the attention and FFN of every layer, summed into the split line at the end
+        std::vector<cudaEvent_t> ev((size_t) g_.n_layers * 3 + 1);
+        for (cudaEvent_t& e : ev) cudaEventCreate(&e);
+        cudaEventRecord(ev.back(), stream_);
+
+        // a host function queued after each layer reports the layers done when the GPU gets there: no synchronization
+        ticks_.resize((size_t) g_.n_layers);
+        for (int il = 0; il < g_.n_layers; ++il) {
+            for (size_t k = 0; k < en.layers.size(); ++k) {
+                if (en.layers[k] != il || embd) continue;   // picture rows get no Engram contribution
+                if (!m_.engram_reader().collect(tickets[k], err)) return fail(err);
+                const size_t nr = (size_t) T * n_cols;
+                std::vector<float> rows_f(nr * 256);
+                for (size_t r = 0; r < nr; ++r)
+                    for (int b = 0; b < 256 / 32; ++b)
+                        dequantize_iq4_nl(raw[k].data() + r * en.row_bytes + (size_t) b * 18,
+                                          rows_f.data() + r * 256 + (size_t) b * 32);
+                DS_CUDA(cudaMemcpyAsync(rows_all_, rows_f.data(), rows_f.size() * sizeof(float), cudaMemcpyHostToDevice,
+                                        stream_));
+                DS_CUDA(cudaStreamSynchronize(stream_));
+                const DevTensor* kvw = m_.tensor(il, "engram_kv.weight");
+                const DevTensor* gw = m_.tensor(il, "engram_gate.weight");
+                if (!kvw || !gw) return fail("layer " + std::to_string(il) + " has no Engram tensors");
+                const int in = n_cols * 256;
+                for (int t0 = 0; t0 < T; t0 += 8) {
+                    const int nc = std::min(8, T - t0);
+                    kernels::native_q6_k_f32(kvw->ptr, rows_all_ + (size_t) t0 * in, q8_, kv_dev_ + (size_t) t0 * 5 * n, in,
+                                             (int) (5 * n), nc, st);
+                }
+                EngramArgs ea;
+                ea.n_embd = (int) n;
+                engram_apply(kv_dev_, (const float*) gw->ptr, nullptr, T, ea, x_, st);
+            }
+
+            // attention sublayer
+            hc_mixes(x_, wf(il, "hc_attn_fn.weight"), wf(il, "hc_attn_scale.weight"), wf(il, "hc_attn_base.weight"), T,
+                     hca, hc_ws_, coef_a_, st);
+            if (pre_prev) {
+                hc_pre_rms_norm(x_, pre_prev, kHcCoef, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, cur_, normed_, st);
+            } else {
+                hc_pre_first(T, n);
+                rms_norm(cur_, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, normed_, st);
+            }
+            cudaEventRecord(ev[(size_t) il * 3], stream_);
+            if (!ops_.attention_batch(il, pos0, T, tokens, normed_, attn_, (int) n, st, err)) return fail(err);
+            cudaEventRecord(ev[(size_t) il * 3 + 1], stream_);
+            dump_rows("attn_out", il, pos0, T, attn_, n);
+            hc_post(attn_, x_, coef_a_, kHcCoef, T, (int) n, x2_, st);
+
+            // FFN sublayer
+            float* coef_f = coef_f_[fi];
+            hc_mixes(x2_, wf(il, "hc_ffn_fn.weight"), wf(il, "hc_ffn_scale.weight"), wf(il, "hc_ffn_base.weight"), T,
+                     hca, hc_ws_, coef_f, st);
+            hc_pre_rms_norm(x2_, coef_a_, kHcCoef, wf(il, "ffn_norm.weight"), T, (int) n, g_.rms_eps, cur_, normed_, st);
+            // picture rows select experts with the image bias
+            const float* bias = embd ? wf(il, "exp_probs_b_vl.bias") : nullptr;
+            if (!bias) bias = wf(il, "exp_probs_b.bias");
+            router(normed_, wf(il, "ffn_gate_inp.weight"), bias, T, ra, rlogits_, ids_, rw_, st);
+            const bool ok_r = ffn_ ? ffn_->routed(il, T, normed_, ids_, rw_, moe_, st, err)
+                                   : ops_.routed_experts_batch(il, pos0, T, normed_, ids_, rw_, K, moe_, (int) n, st, err);
+            if (!ok_r) return fail(err);
+            const bool ok_s = ffn_ ? ffn_->shared(il, T, normed_, sh_, st, err)
+                                   : ops_.shared_expert_batch(il, pos0, T, normed_, sh_, (int) n, st, err);
+            if (!ok_s) return fail(err);
+            dump_rows("ffn_moe_out", il, pos0, T, moe_, n);
+            dump_rows("ffn_shexp", il, pos0, T, sh_, n);
+            add(moe_, sh_, sum_, (int) (T * n), st);
+            hc_post(sum_, x2_, coef_f, kHcCoef, T, (int) n, x_, st);
+            dump_rows("l_out", il, pos0, T, x_, 4 * n);
+            pre_prev = coef_f;
+            fi ^= 1;
+            cudaEventRecord(ev[(size_t) il * 3 + 2], stream_);
+            if (live && il + 1 < g_.n_layers) {   // the chunk's end is reported by `progress`
+                ticks_[(size_t) il] = {&live, off + (int) ((int64_t) T * (il + 1) / g_.n_layers)};
+                cudaLaunchHostFunc(stream_, &PrefillImpl::tick, &ticks_[(size_t) il]);
+            }
+        }
+        DS_CUDA(cudaStreamSynchronize(stream_));
+        {
+            float attn_ms = 0, ffn_ms = 0, all_ms = 0, t = 0;
+            for (int il = 0; il < g_.n_layers; ++il) {
+                cudaEventElapsedTime(&t, ev[(size_t) il * 3], ev[(size_t) il * 3 + 1]);
+                attn_ms += t;
+                cudaEventElapsedTime(&t, ev[(size_t) il * 3 + 1], ev[(size_t) il * 3 + 2]);
+                ffn_ms += t;
+            }
+            cudaEventElapsedTime(&all_ms, ev.back(), ev[(size_t) (g_.n_layers - 1) * 3 + 2]);
+            // the first layer also carries the one-time tier load; the rest scale to a whole pass
+            float rest_ms = 0;
+            cudaEventElapsedTime(&rest_ms, ev[2], ev[(size_t) (g_.n_layers - 1) * 3 + 2]);
+            basalt::log::info("basalt deepseek41", "prefill chunk of %d tokens: attention %.0f ms, ffn %.0f ms, other %.0f ms; "
+                         "layers 1.. %.0f ms (%.0f ms per pass)\n", T, attn_ms, ffn_ms, all_ms - attn_ms - ffn_ms, rest_ms,
+                         rest_ms * g_.n_layers / (g_.n_layers - 1));
+        }
+        for (cudaEvent_t e : ev) cudaEventDestroy(e);
+        return true;
+    }
+
+    // dev rows [T][width] -> `<dir>/<name>.<layer>.<pos>.bin` per token, as the single-token loop writes them
+    void dump_rows(const char* name, int layer, int64_t pos0, int T, const float* dev, size_t width) {
+        if (dump_dir_.empty()) return;
+        std::vector<float> h((size_t) T * width);
+        cudaStreamSynchronize(stream_);
+        cudaMemcpy(h.data(), dev, h.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        for (int t = 0; t < T; ++t) {
+            const std::string path = dump_dir_ + "/" + name + "." + std::to_string(layer) + "." +
+                                     std::to_string(pos0 + t) + ".bin";
+            if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(h.data() + (size_t) t * width, sizeof(float), width, f);
+                std::fclose(f);
+            }
+        }
+    }
+
+    // First layer: the collapse input is the stream 0 of each token.
+    void hc_pre_first(int T, size_t n) {
+        cudaMemcpy2DAsync(cur_, n * sizeof(float), x_, 4 * n * sizeof(float), n * sizeof(float), (size_t) T,
+                          cudaMemcpyDeviceToDevice, stream_);
+    }
+
+    DsModel& m_;
+    const Geometry& g_;
+    LayerOps& ops_;
+    cudaStream_t stream_;
+    int cap_;
+    std::vector<void*> allocs_;
+    std::string err_;
+    float *x_ = nullptr, *x2_ = nullptr, *cur_ = nullptr, *normed_ = nullptr, *attn_ = nullptr, *moe_ = nullptr,
+          *sh_ = nullptr, *sum_ = nullptr, *coef_a_ = nullptr, *coef_f_[2] = {nullptr, nullptr}, *hc_ws_ = nullptr,
+          *rlogits_ = nullptr, *rw_ = nullptr, *kv_dev_ = nullptr, *rows_all_ = nullptr;
+    int32_t* ids_ = nullptr;
+    uint8_t* q8_ = nullptr;
+    std::string dump_dir_;
+    std::unique_ptr<PrefillFfn> ffn_;
+};
+
+}  // namespace
+
+std::unique_ptr<Prefill> make_prefill(DsModel& model, LayerOps& ops, void* stream, int max_chunk, std::string& err) {
+    auto p = std::make_unique<PrefillImpl>(model, ops, stream, max_chunk);
+    if (!p->init(err)) return nullptr;
+    return p;
+}
+
+}  // namespace basalt::models::deepseek41

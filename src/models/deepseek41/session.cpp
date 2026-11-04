@@ -1,0 +1,755 @@
+// src/models/deepseek41/session.cpp - the DeepSeek-V4.1 layer loop for one token at a time.
+//
+// Per layer: Engram (on its layers), hyper-connection mixes and collapse, attention, expansion, the FFN's mixes and
+// collapse, router, routed and shared experts, expansion. Prefill runs the same path token by token.
+#include "basalt/log.hpp"
+#include "models/deepseek41/session.hpp"
+
+#include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/models/deepseek41/attn_index.hpp"
+#include "basalt/models/deepseek41/kernels.hpp"
+#include "models/deepseek41/attn_batch.hpp"
+#include "models/deepseek41/dspark.hpp"
+#include "models/deepseek41/dspark_kernels.hpp"
+#include "models/deepseek41/layer_ops.hpp"
+#include "models/deepseek41/model.hpp"
+#include "models/deepseek41/ops.hpp"
+#include "models/deepseek41/prefill.hpp"
+#include "models/deepseek41/prefill_plan.hpp"
+#include "models/deepseek41/tier.hpp"
+#include "basalt/models/deepseek41/vision.hpp"
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+#include "basalt/artifact/dequant.hpp"
+
+namespace basalt::models::deepseek41 {
+namespace {
+
+#define DS_CUDA(call)                                                                                   \
+    do {                                                                                                \
+        cudaError_t e_ = (call);                                                                        \
+        if (e_ != cudaSuccess) return fail(std::string(#call) + ": " + cudaGetErrorString(e_));         \
+    } while (0)
+
+constexpr int kMaxWindow = kMaxT;   // rows one decode window verifies
+
+class Session final : public model::ModelSession {
+public:
+    explicit Session(DsModel& m) : m_(m), g_(m.geo()) {}
+    ~Session() override {
+        for (void* p : allocs_) cudaFree(p);
+        if (h_next_) cudaFreeHost(h_next_);
+        for (cudaGraphExec_t e : head_g_)
+            if (e) cudaGraphExecDestroy(e);
+        for (cudaGraphExec_t e : tail_g_)
+            if (e) cudaGraphExecDestroy(e);
+        if (h_dfeat_) cudaFreeHost(h_dfeat_);
+        if (stream_) cudaStreamDestroy(stream_);
+    }
+
+    bool init(std::string& err) {
+        if (cudaStreamCreate(&stream_) != cudaSuccess) {
+            err = "cannot create a CUDA stream";
+            return false;
+        }
+        const size_t n = (size_t) g_.n_embd;
+        head_g_.assign((size_t) g_.n_layers * 2 * kMaxWindow * 2, nullptr);   // [window][T - 1][layer][with previous tail]
+        tail_g_.assign((size_t) g_.n_layers * kMaxWindow * 2, nullptr);
+        constexpr int W = kMaxWindow;
+        auto buf = [&](float*& p, size_t floats) {
+            void* v = nullptr;
+            if (cudaMalloc(&v, floats * sizeof(float)) != cudaSuccess) return false;
+            allocs_.push_back(v);
+            p = (float*) v;
+            return true;
+        };
+        const size_t cols = (size_t) m_.pack().engram.hash.n_cols() * 256;
+        bool ok = buf(x_, 4 * n * W) && buf(x2_, 4 * n * W) && buf(cur_, n * W) && buf(normed_, n * W) &&
+                  buf(attn_out_, n * W) && buf(moe_out_, n * W) && buf(sh_out_, n * W) && buf(ffn_sum_, n * W) &&
+                  buf(coef_a_, kHcCoef * W) && buf(coef_f_[0], kHcCoef * W) && buf(coef_f_[1], kHcCoef * W) &&
+                  buf(hc_ws_, hc_mixes_workspace_floats(W)) && buf(rlogits_, (size_t) g_.n_expert * W) &&
+                  buf(rw_, 64) && buf(logits_, (size_t) g_.n_vocab * W) && buf(rows_dev_, (cols ? cols : 1) * W) &&
+                  buf(kv_dev_, 5 * n * W);
+        void* v = nullptr;
+        ok = ok && cudaMalloc(&v, 64 * sizeof(int32_t)) == cudaSuccess;
+        ids_ = (int32_t*) v;
+        if (v) allocs_.push_back(v);
+        v = nullptr;
+        ok = ok && cudaMalloc(&v, W * sizeof(int32_t)) == cudaSuccess;
+        am_dev_ = (int32_t*) v;
+        if (v) allocs_.push_back(v);
+        v = nullptr;
+        ok = ok && cudaMalloc(&v, argmax_workspace_bytes()) == cudaSuccess && cudaMemset(v, 0, argmax_workspace_bytes()) == cudaSuccess;
+        am_ws_ = v;
+        if (v) allocs_.push_back(v);
+        ok = ok && cudaHostAlloc((void**) &h_next_, W * sizeof(int32_t), cudaHostAllocPortable) == cudaSuccess;
+        v = nullptr;
+        const size_t q8 = std::max<size_t>(kernels::native_q8_1_bytes((int) std::max<size_t>(cols, n), W), 1 << 16);
+        ok = ok && cudaMalloc(&v, q8) == cudaSuccess;
+        q8_ = v;
+        if (v) allocs_.push_back(v);
+        if (!ok) {
+            err = "out of device memory for the session";
+            return false;
+        }
+        ops_ = make_kernel_ops(m_, m_.diag_fixture(), err);
+        if (!ops_) return false;
+        if (!m_.diag_dspark().empty() || m_.spec() >= 2) {
+            std::string dpath = m_.diag_dspark();
+            uint64_t doff = 0, dbytes = 0;
+            if (dpath.empty()) {
+                const core::FileRange& r = m_.drafter_range();
+                if (r.empty() || r.bytes == 0) {
+                    err = "deepseek41: --spec needs a drafter and this pack carries none (convert with --dspark)";
+                    return false;
+                }
+                dpath = r.path;
+                doff = r.offset;
+                dbytes = r.bytes;
+            }
+            dspark_ = DsparkDrafter::create(m_, dpath, doff, dbytes, kDsparkDevice, err);
+            if (!dspark_) return false;
+            const size_t ff = (size_t) dspark_->feature_floats();
+            if (!buf(dfeat_, ff * W) || cudaHostAlloc((void**) &h_dfeat_, ff * W * sizeof(float), cudaHostAllocPortable) != cudaSuccess) {
+                err = "out of memory for the drafter's feature buffer";
+                return false;
+            }
+        }
+        dump_dir_ = m_.diag_dump();
+        return true;
+    }
+
+    model::Result decode_window(const model::DecodeRequest& r) override {
+        if (r.n_tokens > 1 || (r.row_tokens && ops_->window_supported())) {
+            if (!ops_->window_supported())
+                return {model::Status::NotImplemented, "deepseek41: a decode window of several rows needs the plain layer path"};
+            if (r.n_tokens > kMaxWindow) return {model::Status::Error, "deepseek41: the decode window is too long"};
+            std::string err;
+            int32_t rows[kMaxWindow];
+            if (!step_window(r.tokens, r.n_tokens, r.pos, rows, r.logits, err)) return {model::Status::Error, err};
+            if (dspark_) {
+                feat_pos0_ = r.pos;
+                feat_n_ = r.n_tokens;
+            }
+            if (r.row_tokens) std::copy(rows, rows + r.n_tokens, r.row_tokens);
+            if (r.next_token) *r.next_token = rows[r.n_tokens - 1];
+            return {};
+        }
+        for (int i = 0; i < r.n_tokens; ++i) {
+            const bool last = i + 1 == r.n_tokens;
+            std::string err;
+            if (!step(r.tokens[i], r.pos + i, last, last ? r.next_token : nullptr, last ? r.logits : nullptr, err))
+                return {model::Status::Error, err};
+        }
+        if (dspark_ && r.next_token) {
+            std::string err;
+            DsparkDraft d;
+            const int64_t at = r.pos + r.n_tokens;
+            if (!dspark_->draft(*r.next_token, at, d, err)) return {model::Status::Error, err};
+            basalt::log::info("basalt dspark", "draft pos=%lld anchor=%d ids=%d,%d,%d,%d,%d conf=%.4f,%.4f,%.4f,%.4f,%.4f ms=%.3f",
+                         (long long) at, *r.next_token, d.token[0], d.token[1], d.token[2], d.token[3], d.token[4],
+                         d.conf[0], d.conf[1], d.conf[2], d.conf[3], d.conf[4], d.draft_ms);
+        }
+        return {};
+    }
+
+    model::Result prefill_chunk(const model::PrefillRequest& r) override {
+        sync_rewind(r.pos);
+        if (r.n_tokens > 1) {
+            std::string err;
+            // the drafter's window needs the target features of the last positions, which only the single-token path
+            // produces: the batched pass takes the rest
+            const int tail = dspark_ ? std::min(r.n_tokens, kDsparkWindow) : 0;
+            const int batched = r.n_tokens - tail;
+            if (batched > 0) {
+                open_prompt_path();
+                // the caches take their memory before the prompt workspaces do
+                if (!ops_->ensure_positions(r.pos + r.n_tokens, err)) return prompt_failed(err);
+                if (!prefill_ && !make_prefill_fit(err)) return prompt_failed(err);
+                prefill_->progress = r.progress;
+                prefill_->live = r.live;
+                if (!prefill_->run(r.tokens, batched, r.pos, hist_, err)) return prompt_failed(err);
+                close_prompt_path();
+            }
+            for (int i = batched; i < r.n_tokens; ++i)
+                if (!step(r.tokens[i], r.pos + i, false, nullptr, nullptr, err)) return {model::Status::Error, err};
+            return {};
+        }
+        for (int i = 0; i < r.n_tokens; ++i) {
+            std::string err;
+            if (!step(r.tokens[i], r.pos + i, false, nullptr, nullptr, err)) return {model::Status::Error, err};
+        }
+        return {};
+    }
+
+    model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows) override {
+        std::string err;
+        vision::Image img;
+        if (!vision::decode_image(data, bytes, img, err)) return {model::Status::Error, err};
+        if (!vis_) {
+            std::string te;
+            ops_->expert_tier(te);   // the tier opens before the encoder takes memory
+            vision::Mmproj mp;
+            if (!m_.open_mmproj(mp, err)) return {model::Status::Error, err};
+            const VisionPlan pl = plan_image(img.w, img.h, mp.hp().merge, mp.hp().min_pixels);
+            vis_ = std::make_unique<VisionEncoder>();
+            if (!vis_->init(mp, std::max(pl.n_patches(), 4096), err)) {
+                vis_.reset();
+                return {model::Status::Error, err};
+            }
+            vis_merge_ = mp.hp().merge;
+            vis_min_pixels_ = mp.hp().min_pixels;
+        }
+        const VisionPlan pl = plan_image(img.w, img.h, vis_merge_, vis_min_pixels_);
+        std::vector<float> patches;
+        image_patches(img, pl, patches);
+        if (!vis_->encode(patches, pl, rows, err)) return {model::Status::Error, err};
+        n_rows = pl.n_tokens();
+        return {};
+    }
+
+    model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos) override {
+        sync_rewind(pos);
+        std::string err;
+        open_prompt_path();
+        if (!ops_->ensure_positions(pos + n_rows, err)) return prompt_failed(err);
+        if (!prefill_ && !make_prefill_fit(err)) return prompt_failed(err);
+        if (!prefill_->run_embeddings(rows, n_rows, pos, hist_, err)) return prompt_failed(err);
+        close_prompt_path();
+        return {};
+    }
+
+private:
+    // The prompt path's workspaces and the expert tier share the card. The tier opens first; the workspaces size to
+    // the free memory beside it. Once a prompt has run they are released and the tier takes the memory as extra slots,
+    // which it gives back before the next prompt allocates them again.
+    // The prompt workspaces for the largest chunk the free memory carries (a long context's caches have taken part of
+    // the card). The estimate picks the first size to try, and the free memory left after the allocation confirms it.
+    bool make_prefill_fit(std::string& err) {
+        prefillp::Dims d;
+        d.n_embd = g_.n_embd;
+        d.n_used = g_.n_used;
+        d.n_expert = g_.n_expert;
+        d.n_ff_exp = g_.n_ff_exp;
+        d.engram_cols = (int64_t) m_.pack().engram.hash.n_cols() * 256;
+        for (const ExpertLayer& e : m_.pack().experts) d.expert_blob_bytes = std::max<uint64_t>(d.expert_blob_bytes, e.blob_bytes);
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+            err = "deepseek41: cannot read the free device memory";
+            return false;
+        }
+        const prefillp::Fit fit = prefillp::plan_chunk(d, free_b, prefillp::kMargin);
+        if (!fit.chunk) {
+            err = "deepseek41: " + fit.error;
+            return false;
+        }
+        for (int cap = fit.chunk; cap >= prefillp::kMinChunk; cap /= 2) {
+            std::string e;
+            prefill_ = make_prefill(m_, *ops_, stream_, cap, e);
+            if (prefill_ && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= prefillp::kMargin) return true;
+            prefill_.reset();
+            if (!e.empty()) err = e;
+        }
+        if (err.empty()) err = "deepseek41: not enough free device memory for the prompt workspaces";
+        return false;
+    }
+
+    // A prompt that cannot run gives its workspaces back and lets the tier take the memory again, so the engine holds
+    // nothing for it; the request fails with `err` and the next one starts clean.
+    model::Result prompt_failed(const std::string& err) {
+        cudaStreamSynchronize(stream_);
+        prefill_.reset();
+        std::string e;
+        if (ExpertTier* t = ops_->expert_tier(e)) {
+            t->grow();
+            tier_grown_ = true;
+        }
+        return {model::Status::Error, err};
+    }
+
+    void open_prompt_path() {
+        std::string e;
+        // the tier opens at its normal size before anything else takes the card; the workspaces size to what is left
+        ExpertTier* t = ops_->expert_tier(e);
+        if (t && tier_grown_ && !prefill_) t->shrink();
+    }
+    void close_prompt_path() {
+        std::string e;
+        ExpertTier* t = ops_->expert_tier(e);
+        if (!t) return;
+        cudaStreamSynchronize(stream_);
+        prefill_.reset();
+        t->grow();
+        tier_grown_ = true;
+    }
+
+    bool fail(const std::string& s) {
+        err_ = s;
+        return false;
+    }
+
+    const float* wf(int layer, const char* suffix) {
+        const DevTensor* t = m_.tensor(layer, suffix);
+        return t ? (const float*) t->ptr : nullptr;
+    }
+
+    // dev -> file `<dir>/<name>.<layer>.<pos>.bin` for the parity comparison
+    void dump(const char* name, int layer, int64_t pos, const void* dev, size_t bytes) {
+        if (dump_dir_.empty()) return;
+        std::vector<char> h(bytes);
+        cudaStreamSynchronize(stream_);
+        cudaMemcpy(h.data(), dev, bytes, cudaMemcpyDeviceToHost);
+        const std::string path = dump_dir_ + "/" + name + "." + std::to_string(layer) + "." + std::to_string(pos) + ".bin";
+        if (FILE* f = std::fopen(path.c_str(), "wb")) {
+            std::fwrite(h.data(), 1, bytes, f);
+            std::fclose(f);
+        }
+    }
+
+    model::Result draft(int32_t anchor, int64_t pos, int32_t* ids, float* conf, int max_n, int* n_out) override {
+        if (!dspark_) return {model::Status::NotImplemented, "deepseek41: no drafter is loaded"};
+        std::string err;
+        if (!flush_features(pos, err)) return {model::Status::Error, err};
+        DsparkDraft d;
+        if (!dspark_->draft(anchor, pos, d, err)) return {model::Status::Error, err};
+        const int n = std::min(max_n, kDsparkBlock);
+        for (int i = 0; i < n; ++i) {
+            ids[i] = d.token[i];
+            conf[i] = d.conf[i];
+        }
+        *n_out = n;
+        return {};
+    }
+
+    // The features of the last window's rows before `upto` (the accepted ones) go to the drafter.
+    bool flush_features(int64_t upto, std::string& err) {
+        if (!dspark_ || !feat_n_) return true;
+        const int q = (int) std::clamp<int64_t>(upto - feat_pos0_, 0, feat_n_);
+        const int64_t p0 = feat_pos0_;
+        feat_n_ = 0;
+        if (!q) return true;
+        const size_t ff = (size_t) dspark_->feature_floats();
+        if (cudaMemcpyAsync(h_dfeat_, dfeat_, ff * q * sizeof(float), cudaMemcpyDeviceToHost, stream_) != cudaSuccess ||
+            cudaStreamSynchronize(stream_) != cudaSuccess) {
+            err = "deepseek41: cannot read the window's features";
+            return false;
+        }
+        for (int j = 0; j < q; ++j)
+            if (!dspark_->inject(p0 + j, h_dfeat_ + ff * j, err)) return false;
+        return true;
+    }
+
+    // The step's target features go to the drafter, which turns them into its window latents for this position.
+    bool dspark_inject(int64_t pos) {
+        const size_t ff = (size_t) dspark_->feature_floats();
+        DS_CUDA(cudaMemcpyAsync(h_dfeat_, dfeat_, ff * sizeof(float), cudaMemcpyDeviceToHost, stream_));
+        DS_CUDA(cudaStreamSynchronize(stream_));
+        std::string e;
+        if (!dspark_->inject(pos, h_dfeat_, e)) return fail(e);
+        return true;
+    }
+
+    bool engram_at(int il) const {
+        for (int l : m_.pack().engram.layers)
+            if (l == il) return true;
+        return false;
+    }
+
+    // The layer's work up to the router and the expert inputs' copy to the host, optionally behind the previous
+    // layer's tail. Everything here is capturable: positions are read from device memory.
+    bool enqueue_head(int il, int64_t pos, int32_t token, void* st, bool with_prev_tail, int T = 1) {
+        const size_t n = (size_t) g_.n_embd;
+        if (with_prev_tail && !enqueue_tail(il - 1, pos, st, T)) return false;
+        if (dspark_) {
+            const int slot = dspark_->feature_slot(il);
+            if (slot >= 0)
+                for (int t = 0; t < T; ++t)
+                    dspark_hc_mean(x_ + (size_t) t * kHcMult * n, (int) n,
+                                   dfeat_ + (size_t) t * dspark_->feature_floats() + (size_t) slot * n, st);
+        }
+        const float* pre_prev = il > 0 ? coef_f_[(il - 1) & 1] : nullptr;
+        float* coef_f = coef_f_[il & 1];
+        HcArgs hca;
+        hca.n_embd = (int) n;
+        hca.rms_eps = 1e-20f;
+        hca.hc_eps = g_.hc_eps;
+        hca.sinkhorn_iters = g_.sinkhorn_iters;
+        RouterArgs ra;
+        ra.n_expert = g_.n_expert;
+        ra.n_embd = (int) n;
+        ra.k = g_.n_used;
+        ra.weight_scale = g_.weight_scale;
+
+        hc_mixes(x_, wf(il, "hc_attn_fn.weight"), wf(il, "hc_attn_scale.weight"), wf(il, "hc_attn_base.weight"), T, hca,
+                 hc_ws_, coef_a_, st);
+        if (pre_prev) {
+            hc_pre_rms_norm(x_, pre_prev, kHcCoef, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, cur_, normed_, st);
+        } else {
+            // the collapse of layer 0 is stream 0 of each row
+            for (int t = 0; t < T; ++t)
+                DS_CUDA(cudaMemcpyAsync(cur_ + (size_t) t * n, x_ + (size_t) t * kHcMult * n, n * sizeof(float),
+                                        cudaMemcpyDeviceToDevice, stream_));
+            rms_norm(cur_, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, normed_, st);
+        }
+        dump("hc_attn_pre", il, pos, cur_, n * sizeof(float));
+        if (T == 1 ? !ops_->attention(il, pos, token, normed_, attn_out_, st, err_)
+                   : !ops_->attention_window(il, T, normed_, attn_out_, st, err_))
+            return false;
+        dump("attn_out", il, pos, attn_out_, n * sizeof(float));
+        hc_post(attn_out_, x_, coef_a_, kHcCoef, T, (int) n, x2_, st);
+        dump("hc_attn_post", il, pos, x2_, 4 * n * sizeof(float));
+
+        // FFN sublayer (the collapse uses the attention sublayer's pre-mix: single-pass mHC)
+        hc_mixes(x2_, wf(il, "hc_ffn_fn.weight"), wf(il, "hc_ffn_scale.weight"), wf(il, "hc_ffn_base.weight"), T, hca,
+                 hc_ws_, coef_f, st);
+        hc_pre_rms_norm(x2_, coef_a_, kHcCoef, wf(il, "ffn_norm.weight"), T, (int) n, g_.rms_eps, cur_, normed_, st);
+        dump("hc_ffn_pre", il, pos, cur_, n * sizeof(float));
+        router(normed_, wf(il, "ffn_gate_inp.weight"), wf(il, "exp_probs_b.bias"), T, ra, rlogits_, ids_, rw_, st);
+        dump("ffn_moe_logits", il, pos, rlogits_, (size_t) g_.n_expert * sizeof(float));
+        dump("ffn_moe_topk", il, pos, ids_, (size_t) g_.n_used * sizeof(int32_t));
+        dump("ffn_moe_weights_scaled", il, pos, rw_, (size_t) g_.n_used * sizeof(float));
+        if (T == 1) ops_->routed_stage(il, normed_, ids_, st);
+        else ops_->routed_stage_window(T, normed_, ids_, st);
+        return true;
+    }
+
+    // Shared expert and its sum with the routed result (unless the experts' call already did both), expansion into
+    // the next layer's input.
+    bool enqueue_tail(int il, int64_t pos, void* st, int T = 1) {
+        const size_t n = (size_t) g_.n_embd;
+        dump("ffn_moe_out", il, pos, moe_out_, n * sizeof(float));
+        if (!fused_) {
+            if (!ops_->shared_expert(il, normed_, sh_out_, st, err_)) return false;
+            dump("ffn_shexp", il, pos, sh_out_, n * sizeof(float));
+            add(moe_out_, sh_out_, ffn_sum_, (int) n, st);
+        }
+        hc_post(ffn_sum_, x2_, coef_f_[il & 1], kHcCoef, T, (int) n, x_, st);
+        dump("l_out", il, pos, x_, 4 * n * sizeof(float));
+        return true;
+    }
+
+    // Captures `body` once into a graph and launches it; later calls launch the instance.
+    template <class F>
+    bool run_graph(cudaGraphExec_t& exec, F&& body) {
+        if (!exec) {
+            if (cudaStreamBeginCapture(stream_, cudaStreamCaptureModeRelaxed) != cudaSuccess)
+                return fail("cannot begin a graph capture");
+            const bool ok = body();
+            cudaGraph_t g = nullptr;
+            const cudaError_t ce = cudaStreamEndCapture(stream_, &g);
+            if (!ok || ce != cudaSuccess) {
+                if (g) cudaGraphDestroy(g);
+                return ok ? fail(std::string("graph capture: ") + cudaGetErrorString(ce)) : false;
+            }
+            const cudaError_t ci = cudaGraphInstantiateWithFlags(&exec, g, 0);
+            cudaGraphDestroy(g);
+            if (ci != cudaSuccess) return fail(std::string("graph instantiate: ") + cudaGetErrorString(ci));
+        }
+        DS_CUDA(cudaGraphLaunch(exec, stream_));
+        return true;
+    }
+
+    // A window's graphs differ from the single-token ones even for one row (the compressor keeps its state apart).
+    int graph_row(int T) const { return (in_window_ ? kMaxWindow : 0) + T - 1; }
+
+    bool run_head(int il, int64_t pos, int32_t token, bool with_prev_tail, int T = 1) {
+        return run_graph(head_g_[(((size_t) graph_row(T) * g_.n_layers) + il) * 2 + (with_prev_tail ? 1 : 0)],
+                         [&]() { return enqueue_head(il, pos, token, stream_, with_prev_tail, T); });
+    }
+    bool run_tail(int il, int64_t pos, int T = 1) {
+        return run_graph(tail_g_[(size_t) graph_row(T) * g_.n_layers + il], [&]() { return enqueue_tail(il, pos, stream_, T); });
+    }
+
+    bool step(int32_t token, int64_t pos, bool want_out, int32_t* next, float* logits_out, std::string& err) {
+        err_.clear();
+        bool ok = step_impl(token, pos, want_out, next, logits_out);
+        if (ok && dspark_) ok = dspark_inject(pos);
+        if (!ok) err = err_.empty() ? "deepseek41: step failed" : err_;
+        return ok;
+    }
+
+    // Rows of a window past `pos` were not accepted: the compressor state keeps only the ones before it.
+    void sync_rewind(int64_t pos) {
+        if (ops_) ops_->commit_window(pos, stream_);
+        if (ops_ && pos == 0) ops_->trim_positions();
+        if (pos > 0 && (int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
+    }
+
+    // The verify pass: T tokens at pos0.., the greedy token after each row in row_next[T] (and the last row's logits
+    // when asked). The rows stay in the session until a later call starts at an earlier position.
+    bool step_window(const int32_t* tokens, int T, int64_t pos0, int32_t* row_next, float* logits_out, std::string& err) {
+        err_.clear();
+        const bool ok = window_impl(tokens, T, pos0, row_next, logits_out);
+        if (!ok) err = err_.empty() ? "deepseek41: window step failed" : err_;
+        return ok;
+    }
+
+    bool window_impl(const int32_t* tokens, int T, int64_t pos0, int32_t* row_next, float* logits_out) {
+        const size_t n = (size_t) g_.n_embd;
+        void* st = stream_;
+        if (!flush_features(pos0, err_)) return false;
+        in_window_ = true;
+        if (!dump_dir_.empty()) return fail("deepseek41: a decode window cannot run with tensor dumps");
+        if (pos0 == 0) {
+            hist_.clear();
+            ops_->reset();
+        }
+        if ((int64_t) hist_.size() < pos0) return fail("positions must be consecutive from 0 (the session keeps one sequence)");
+        hist_.resize((size_t) pos0);
+        for (int t = 0; t < T; ++t) hist_.push_back(tokens[t]);
+        {
+            std::string se;
+            if (!ops_->stage_window(pos0, T, st, se)) return fail(se);
+        }
+        fused_ = true;
+
+        emb4_.resize(n * kHcMult * T);
+        for (int t = 0; t < T; ++t) {
+            float* e = emb4_.data() + (size_t) t * kHcMult * n;
+            std::string e_err;
+            if (!m_.embedding_row(tokens[t], e, e_err)) return fail(e_err);
+            for (int s = 1; s < kHcMult; ++s) std::copy(e, e + n, e + (size_t) s * n);
+        }
+        DS_CUDA(cudaMemcpyAsync(x_, emb4_.data(), emb4_.size() * sizeof(float), cudaMemcpyHostToDevice, stream_));
+
+        const EngramInfo& en = m_.pack().engram;
+        const int n_cols = en.hash.n_cols();
+        std::vector<std::vector<uint8_t>> raw(en.layers.size());
+        std::vector<ngram::PleReader::Ticket> tickets(en.layers.size());
+        if (!en.layers.empty()) {
+            int32_t prev[8] = {0};
+            const int np = en.hash.n_gram - 1;
+            for (int j = 0; j < np; ++j) {
+                const int64_t q = pos0 - np + j;   // oldest first
+                prev[j] = q >= 0 ? hist_[(size_t) q] : 0;
+            }
+            for (size_t k = 0; k < en.layers.size(); ++k) {
+                std::vector<int32_t> ids((size_t) n_cols * T);
+                engram_hash(en.hash, (int) k, tokens, T, pos0, pos0 == 0 ? nullptr : prev, ids.data());
+                std::vector<uint32_t> rows(ids.begin(), ids.end());
+                raw[k].assign((size_t) n_cols * T * en.row_bytes, 0);
+                tickets[k] = m_.engram_reader().issue(rows.data(), rows.size(), raw[k].data());
+            }
+        }
+
+        bool tail_pending = false;
+        std::string err;
+        for (int il = 0; il < g_.n_layers; ++il) {
+            for (size_t k = 0; k < en.layers.size(); ++k) {
+                if (en.layers[k] != il) continue;
+                if (tail_pending) {
+                    if (!run_tail(il - 1, pos0, T)) return false;
+                    tail_pending = false;
+                }
+                if (!m_.engram_reader().collect(tickets[k], err)) return fail(err);
+                std::vector<float> rows_f((size_t) n_cols * T * 256);
+                const int blocks = 256 / 32;
+                for (int r = 0; r < n_cols * T; ++r)
+                    for (int b = 0; b < blocks; ++b)
+                        dequantize_iq4_nl(raw[k].data() + (size_t) r * en.row_bytes + (size_t) b * 18,
+                                          rows_f.data() + (size_t) r * 256 + (size_t) b * 32);
+                DS_CUDA(cudaMemcpyAsync(rows_dev_, rows_f.data(), rows_f.size() * sizeof(float), cudaMemcpyHostToDevice, stream_));
+                DS_CUDA(cudaStreamSynchronize(stream_));
+                const DevTensor* kvw = m_.tensor(il, "engram_kv.weight");
+                const DevTensor* gw = m_.tensor(il, "engram_gate.weight");
+                if (!kvw || !gw) return fail("layer " + std::to_string(il) + " has no Engram tensors");
+                kernels::native_q6_k_f32(kvw->ptr, rows_dev_, q8_, kv_dev_, n_cols * 256, (int) (5 * n), T, st);
+                EngramArgs ea;
+                ea.n_embd = (int) n;
+                engram_apply(kv_dev_, (const float*) gw->ptr, nullptr, T, ea, x_, st);
+            }
+            if (!run_head(il, pos0, tokens[0], tail_pending && !engram_at(il), T)) return false;
+            tail_pending = true;
+            if (!ops_->routed_shared_window(il, T, normed_, rw_, ffn_sum_, sh_out_, st, err_)) return false;
+        }
+        if (tail_pending && !run_tail(g_.n_layers - 1, pos0, T)) return false;
+
+        hc_pre(x_, coef_f_[(g_.n_layers - 1) & 1], kHcCoef, T, (int) n, cur_, st);
+        rms_norm(cur_, (const float*) m_.tensor("output_norm.weight")->ptr, T, (int) n, g_.rms_eps, normed_, st);
+        const DevTensor* head = m_.tensor("output.weight");
+        kernels::native_q6_k_f32(head->ptr, normed_, q8_, logits_, (int) n, g_.n_vocab, T, st);
+        argmax_rows(logits_, T, g_.n_vocab, am_dev_, am_ws_, st);
+        DS_CUDA(cudaMemcpyAsync(h_next_, am_dev_, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, stream_));
+        if (logits_out)
+            DS_CUDA(cudaMemcpyAsync(logits_out, logits_, (size_t) T * g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost,
+                                    stream_));
+        DS_CUDA(cudaStreamSynchronize(stream_));
+        std::copy(h_next_, h_next_ + T, row_next);
+        return true;
+    }
+
+    bool step_impl(int32_t token, int64_t pos, bool want_out, int32_t* next, float* logits_out) {
+        const size_t n = (size_t) g_.n_embd;
+        void* st = stream_;
+        if (!flush_features(pos, err_)) return false;
+        in_window_ = false;
+        if (pos == 0) {
+            hist_.clear();
+            ops_->reset();
+        }
+        if ((int64_t) hist_.size() < pos) return fail("positions must be consecutive from 0 (the session keeps one sequence)");
+        hist_.resize((size_t) pos);   // a position before the end drops the rejected rows of a window
+        hist_.push_back(token);
+        ops_->begin_token(pos);
+        {
+            std::string se;
+            if (!ops_->stage_token(pos, st, se)) return fail(se);
+        }
+        const bool graphs = dump_dir_.empty() && ops_->graph_capable();
+        fused_ = graphs;
+
+        // embedding, repeated into the four streams
+        emb4_.resize(n * kHcMult);
+        std::string e;
+        if (!m_.embedding_row(token, emb4_.data(), e)) return fail(e);
+        for (int s = 1; s < kHcMult; ++s) std::copy(emb4_.begin(), emb4_.begin() + n, emb4_.begin() + (size_t) s * n);
+        DS_CUDA(cudaMemcpyAsync(x_, emb4_.data(), emb4_.size() * sizeof(float), cudaMemcpyHostToDevice, stream_));
+        dump("hc_init", -1, pos, x_, 4 * n * sizeof(float));
+
+        // Engram rows for every Engram layer, requested now so the SSD reads overlap layer 0
+        const EngramInfo& en = m_.pack().engram;
+        const int n_cols = en.hash.n_cols();
+        std::vector<std::vector<uint8_t>> raw(en.layers.size());
+        std::vector<ngram::PleReader::Ticket> tickets(en.layers.size());
+        if (!en.layers.empty()) {
+            int32_t prev[8] = {0};
+            const int np = en.hash.n_gram - 1;
+            for (int j = 0; j < np; ++j) {
+                const int64_t q = pos - np + j;   // oldest first
+                prev[j] = q >= 0 ? hist_[(size_t) q] : 0;
+            }
+            for (size_t k = 0; k < en.layers.size(); ++k) {
+                std::vector<int32_t> ids((size_t) n_cols);
+                engram_hash(en.hash, (int) k, &token, 1, pos, pos == 0 ? nullptr : prev, ids.data());
+                std::vector<uint32_t> rows(ids.begin(), ids.end());
+                raw[k].assign((size_t) n_cols * en.row_bytes, 0);
+                tickets[k] = m_.engram_reader().issue(rows.data(), rows.size(), raw[k].data());
+            }
+        }
+
+        const int T = 1;
+        bool tail_pending = false;
+        std::string err;
+
+        for (int il = 0; il < g_.n_layers; ++il) {
+            // Engram
+            for (size_t k = 0; k < en.layers.size(); ++k) {
+                if (en.layers[k] != il) continue;
+                if (tail_pending) {
+                    if (!run_tail(il - 1, pos)) return false;
+                    tail_pending = false;
+                }
+                if (!m_.engram_reader().collect(tickets[k], err)) return fail(err);
+                std::vector<float> rows_f((size_t) n_cols * 256);
+                const int blocks = 256 / 32;
+                for (int r = 0; r < n_cols; ++r)
+                    for (int b = 0; b < blocks; ++b)
+                        dequantize_iq4_nl(raw[k].data() + (size_t) r * en.row_bytes + (size_t) b * 18,
+                                          rows_f.data() + (size_t) r * 256 + (size_t) b * 32);
+                DS_CUDA(cudaMemcpyAsync(rows_dev_, rows_f.data(), rows_f.size() * sizeof(float), cudaMemcpyHostToDevice, stream_));
+                DS_CUDA(cudaStreamSynchronize(stream_));
+                const DevTensor* kvw = m_.tensor(il, "engram_kv.weight");
+                const DevTensor* gw = m_.tensor(il, "engram_gate.weight");
+                if (!kvw || !gw) return fail("layer " + std::to_string(il) + " has no Engram tensors");
+                dump("engram_rows", il, pos, rows_dev_, rows_f.size() * sizeof(float));
+                kernels::native_q6_k_f32(kvw->ptr, rows_dev_, q8_, kv_dev_, (int) rows_f.size(), (int) (5 * n), 1, st);
+                dump("engram_kv", il, pos, kv_dev_, 5 * n * sizeof(float));
+                EngramArgs ea;
+                ea.n_embd = (int) n;
+                engram_apply(kv_dev_, (const float*) gw->ptr, nullptr, T, ea, x_, st);
+                dump("engram_out", il, pos, x_, 4 * n * sizeof(float));
+            }
+
+            if (!graphs) {
+                if (!enqueue_head(il, pos, token, st, false)) return false;
+                if (!ops_->routed_experts_staged(il, normed_, ids_, rw_, moe_out_, st, err_)) return false;
+                if (!enqueue_tail(il, pos, st)) return false;
+            } else {
+                if (!run_head(il, pos, token, tail_pending && !engram_at(il))) return false;
+                tail_pending = true;
+                if (!ops_->routed_and_shared_staged(il, normed_, ids_, rw_, ffn_sum_, sh_out_, st, err_)) return false;
+            }
+        }
+        if (tail_pending && !run_tail(g_.n_layers - 1, pos)) return false;
+        if (!want_out && !next && !logits_out) {
+            DS_CUDA(cudaStreamSynchronize(stream_));
+            return true;
+        }
+
+        // head: collapse with the last FFN's pre-mix, norm, Q6_K output matrix
+        hc_pre(x_, coef_f_[(g_.n_layers - 1) & 1], kHcCoef, T, (int) n, cur_, st);
+        dump("hc_out", -1, pos, cur_, n * sizeof(float));
+        rms_norm(cur_, (const float*) m_.tensor("output_norm.weight")->ptr, T, (int) n, g_.rms_eps, normed_, st);
+        dump("result_norm", -1, pos, normed_, n * sizeof(float));
+        const DevTensor* head = m_.tensor("output.weight");
+        kernels::native_q6_k_f32(head->ptr, normed_, q8_, logits_, (int) n, g_.n_vocab, 1, st);
+        if (next && !logits_out) {
+            // greedy: the id comes back, not the logits
+            argmax_index(logits_, g_.n_vocab, am_dev_, am_ws_, st);
+            DS_CUDA(cudaMemcpyAsync(h_next_, am_dev_, sizeof(int32_t), cudaMemcpyDeviceToHost, stream_));
+            DS_CUDA(cudaStreamSynchronize(stream_));
+            *next = *h_next_;
+            return true;
+        }
+        std::vector<float> host((size_t) g_.n_vocab);
+        DS_CUDA(cudaMemcpyAsync(host.data(), logits_, host.size() * sizeof(float), cudaMemcpyDeviceToHost, stream_));
+        DS_CUDA(cudaStreamSynchronize(stream_));
+        if (logits_out) std::copy(host.begin(), host.end(), logits_out);
+        if (next) {
+            size_t best = 0;
+            for (size_t i = 1; i < host.size(); ++i)
+                if (host[i] > host[best]) best = i;
+            *next = (int32_t) best;
+        }
+        return true;
+    }
+
+    DsModel& m_;
+    const Geometry& g_;
+    std::vector<cudaGraphExec_t> head_g_, tail_g_;
+    cudaStream_t stream_ = nullptr;
+    std::unique_ptr<LayerOps> ops_;
+    std::unique_ptr<Prefill> prefill_;
+    bool tier_grown_ = false;
+    std::unique_ptr<VisionEncoder> vis_;
+    int vis_merge_ = 3, vis_min_pixels_ = 0;
+    std::vector<void*> allocs_;
+    std::vector<int32_t> hist_;
+    std::string dump_dir_, err_;
+    float *x_ = nullptr, *x2_ = nullptr, *cur_ = nullptr, *normed_ = nullptr, *attn_out_ = nullptr, *moe_out_ = nullptr,
+          *sh_out_ = nullptr, *ffn_sum_ = nullptr, *coef_a_ = nullptr, *coef_f_[2] = {nullptr, nullptr},
+          *hc_ws_ = nullptr, *rlogits_ = nullptr, *rw_ = nullptr, *logits_ = nullptr, *rows_dev_ = nullptr,
+          *kv_dev_ = nullptr;
+    int32_t* ids_ = nullptr;
+    int32_t *am_dev_ = nullptr, *h_next_ = nullptr;
+    void* am_ws_ = nullptr;
+    std::vector<float> emb4_;
+    bool fused_ = false;
+    bool in_window_ = false;   // the running step is a verify window
+    void* q8_ = nullptr;
+    // the drafter on the second GPU (diagnostic) and the main model's side of the feature hand-off
+    static constexpr int kDsparkDevice = 1;
+    static constexpr int kDsparkWindow = 128;
+    std::unique_ptr<DsparkDrafter> dspark_;
+    float* dfeat_ = nullptr;
+    float* h_dfeat_ = nullptr;
+    int64_t feat_pos0_ = 0;   // the last window's first position and row count whose features await the drafter
+    int feat_n_ = 0;
+};
+
+}  // namespace
+
+std::unique_ptr<model::ModelSession> make_session_impl(DsModel& model, std::string& err) {
+    auto s = std::make_unique<Session>(model);
+    if (!s->init(err)) return nullptr;
+    return s;
+}
+
+}  // namespace basalt::models::deepseek41
