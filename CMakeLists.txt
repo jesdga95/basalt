@@ -204,7 +204,7 @@ add_library(plan INTERFACE)
 target_include_directories(plan INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(plan INTERFACE warnings)
 
-add_executable(basalt-plan src/plan/plan_main.cpp)
+add_executable(basalt-plan src/models/qwen4exp/plan/plan_main.cpp)
 target_link_libraries(basalt-plan PRIVATE plan)
 
 # ---- platform (host OS boundary) ------------------------------------
