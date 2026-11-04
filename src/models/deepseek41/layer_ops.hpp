@@ -53,6 +53,9 @@ public:
     /// A new sequence starts: gives back the cache memory a long earlier one left mapped (`ensure_positions` maps it
     /// again as positions arrive).
     virtual void trim_positions() {}
+    /// Copies the rolling attention state (window rings, compressor partial groups) to the host, and back.
+    virtual void save_turn(void* stream) { (void) stream; }
+    virtual void restore_turn(void* stream) { (void) stream; }
     /// Forgets the conversation (a new sequence starts at position 0).
     virtual void reset() {}
     /// Called once per token before its layers run.
