@@ -173,6 +173,7 @@ int main() {
     const uint64_t id = 42;
     {
         ConversationStore st;
+        st.set_row_cells(4);
         std::string err;
         CHECK(st.open(dir, id, 1ull << 30, err));
         SavedConversation copy = src;
@@ -206,6 +207,7 @@ int main() {
     {
         // a fresh store on the same directory: the index comes from the file (as after a restart)
         ConversationStore st;
+        st.set_row_cells(4);
         std::string err;
         CHECK(st.open(dir, id, 1ull << 30, err));
         CHECK(st.stats().files == 1);
@@ -218,6 +220,7 @@ int main() {
         check_cut(got, src, 10000, src.live);
         // another identity sees nothing
         ConversationStore other;
+        other.set_row_cells(4);
         CHECK(other.open(dir, id + 1, 1ull << 30, err));
         CHECK(other.best(p.data(), p.size(), {}, true).tokens == 0);
     }
@@ -225,6 +228,7 @@ int main() {
         // the same conversation a turn on, with the bytes it had: only its new state and its tail are written; its live
         // end a reply past the turn's checkpoint, it is stored as of that checkpoint
         ConversationStore st;
+        st.set_row_cells(4);
         std::string err;
         CHECK(st.open(dir, id, 1ull << 30, err));
         std::vector<int32_t> ids2 = ids;
@@ -283,6 +287,7 @@ int main() {
     {
         // a fresh store again: the conversation stored as of its checkpoint reads back from the checkpoint's state file
         ConversationStore st;
+        st.set_row_cells(4);
         std::string err;
         CHECK(st.open(dir, id, 1ull << 30, err));
         std::vector<int32_t> p = ids;
@@ -313,6 +318,7 @@ int main() {
             std::fclose(f);
         }
         ConversationStore st;
+        st.set_row_cells(4);
         std::string err;
         CHECK(st.open(dir, id, 1ull << 30, err));
         CHECK(st.stats().files == 1);
@@ -329,6 +335,7 @@ int main() {
     {
         // the budget: a second conversation pushes the least recently used one out
         ConversationStore st;
+        st.set_row_cells(4);
         std::string err;
         SavedConversation a = src;
         const uint64_t one = a.bytes();
@@ -367,6 +374,7 @@ int main() {
         std::string err;
         {
             ConversationStore st;
+            st.set_row_cells(4);
             CHECK(st.open(d2, id, 1ull << 30, err));
             SavedConversation copy = sa;
             CHECK(st.put(std::move(copy), 1ull << 30));
@@ -401,7 +409,8 @@ int main() {
             CHECK(st.best(p.data(), p.size(), {}, true).tokens == 9000);
         }
         {
-            ConversationStore st;   // after a restart the kinds come from the file
+            ConversationStore st;
+            st.set_row_cells(4);   // after a restart the kinds come from the file
             CHECK(st.open(d2, id, 1ull << 30, err));
             std::vector<int32_t> p(a.begin(), a.begin() + 8200);
             p.push_back(-5);
@@ -428,6 +437,7 @@ int main() {
         }
         const uint64_t one = dir_bytes(d3);
         ConversationStore st;
+        st.set_row_cells(4);
         CHECK(st.open(d3, id, one + one / 4, err));
         CHECK(st.stats().files == 1 && state_files(d3) == 4);
         CHECK(st.put(SavedConversation(sb), 1ull << 30));
