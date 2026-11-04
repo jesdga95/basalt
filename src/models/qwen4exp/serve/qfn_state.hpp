@@ -235,7 +235,6 @@ private:
     bool pipe_on{};
     basalt::core::PoolMultiFn win_pool_fn{};
     void* win_pool_user{};
-    std::vector<int64_t> cur{};
     // A turn-boundary checkpoint's GDN bytes reach the host after the first token (see the deferral class); this
     // is declared after `checks` so it is destroyed, and its copy finished, before the checkpoints are.
     basalt::core::ConversationCheckpointDeferral ckd{};
