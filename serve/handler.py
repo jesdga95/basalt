@@ -535,7 +535,7 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             messages, tools, kw = openai_to_messages(req)
-            tools, force = forced_call(req.get("tool_choice"), tools)   # a bad choice is a 400 before streaming
+            tools, force = forced_call(req.get("tool_choice"), tools, svc.dialect.forced_opening)   # a bad choice is a 400 before streaming
             check_format(req.get("response_format"))
             svc.require_grammar(req.get("response_format"))
             svc.load()
@@ -658,7 +658,7 @@ def make_handler(svc: Service):
             messages = responses_api.input_messages(req)
             tools, names, skipped = responses_api.request_tools(req)
             try:
-                tools, force = forced_call(req.get("tool_choice"), tools)
+                tools, force = forced_call(req.get("tool_choice"), tools, svc.dialect.forced_opening)
             except ValueError as e:
                 raise ResponsesError(str(e), "tool_choice") from None
             kw = responses_api.template_kwargs(req)
@@ -706,14 +706,14 @@ def make_handler(svc: Service):
         def _count_tokens(self, req):
             """Anthropic's token count: the rendered, tokenized prompt, without running the model."""
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
-            tools, _ = forced_call(req.get("tool_choice"), tools)   # same 400 as the request itself ("none": no tools)
+            tools, _ = forced_call(req.get("tool_choice"), tools, svc.dialect.forced_opening)   # same 400 as the request itself ("none": no tools)
             stop_strings(req)                                 # same 400 as the request itself
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
             svc.load()
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
-            tools, force = forced_call(req.get("tool_choice"), tools)   # "any" / {"type": "tool", "name": N}
+            tools, force = forced_call(req.get("tool_choice"), tools, svc.dialect.forced_opening)   # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             response_format = anthropic_format(req)            # structured outputs
             try:

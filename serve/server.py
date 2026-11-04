@@ -33,7 +33,7 @@ from serve.engine.mock import MockEngine  # noqa: E402
 from serve.engine.process import ProcessEngine  # noqa: E402
 from serve.engine.vision import (EngineVision, Vision, check_gpu, child_env, engine_args, gpu_card_name, gpu_plan,  # noqa: E402
                                  gpu_text, gpus_in_play, vision_card, vision_env, vision_line)
-from serve.frontend import ChatTemplate  # noqa: E402
+from serve.models import dialect_for  # noqa: E402
 from serve.handler import Server, serve  # noqa: E402
 from serve.security import (LOOPBACK_NAMES, allowed_hosts_of, api_key_of, exposed_without_key,  # noqa: E402
                             lan_addresses, origins_of)
@@ -175,7 +175,9 @@ def main() -> int:
             tokens[i] = t
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+        pre = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8")).get("pre", "qwen35") \
+            if (tpath / "tokenizer.json").exists() else "qwen35"
+        tok = ST.Tokenizer(tokens, merges, types, pre=pre)
     if not a.mock_engine:
         vision = None
         env = child_env(cfg)
@@ -219,11 +221,12 @@ def main() -> int:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."], batch=a.parallel or 0), None, dict(a.sampling_launch)
     # the model's exported template, else the bundled one
+    dialect = dialect_for(cfg.get("arch"))
     tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+    svc = Service(engine, tok, dialect.template(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
-                  grammar_engine=bool(a.mock_engine or has_grammar))
+                  grammar_engine=bool(a.mock_engine or has_grammar), dialect=dialect)
     svc.logs = logs
     svc.image_sources = image_sources
     if image_sources.url_hosts or image_sources.dirs or image_sources.remote_only:

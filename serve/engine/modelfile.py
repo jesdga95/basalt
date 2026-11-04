@@ -121,6 +121,18 @@ def vision_config(mf: ModelFile, engine_bin: str, sidecar: bool = True) -> dict:
     return {"vision_bin": str(side), "mmproj": str(mmproj), "model": str(vocab)}
 
 
+def deepseek_vision_config(mf: ModelFile, tokenizer_dir: Path, words: list[str]) -> tuple[dict, list[str]]:
+    """The in-engine encoder of a DeepSeek model: the engine reads the pack's vision section (or the --diag-mmproj file)
+    itself. Returns the config and the engine flag naming the prompt token that stands for an image row."""
+    if "vision/mmproj" not in mf.sections and "--diag-mmproj" not in words:
+        raise ValueError("this model file has no vision projector (vision/mmproj); drop --vision")
+    from serve.models.deepseek41_encoding import IMAGE_PLACEHOLDER
+    vocab = json.loads((tokenizer_dir / "vocab.json").read_text(encoding="utf-8"))
+    if IMAGE_PLACEHOLDER not in vocab:
+        raise ValueError(f"the vocabulary has no {IMAGE_PLACEHOLDER} token")
+    return {"mmproj": ""}, ["--image-pad-id", str(vocab[IMAGE_PLACEHOLDER])]
+
+
 def model_config(path: str, engine_bin: str, vision: bool | str = False,
                  engine_words: list[str] | None = None) -> dict:
     """The engine settings the file implies; `engine_words` follow its arguments as given (the engine's parser lets a
@@ -135,8 +147,15 @@ def model_config(path: str, engine_bin: str, vision: bool | str = False,
     args += words
     cdir.mkdir(parents=True, exist_ok=True)
     cfg = {"engine_bin": os.path.abspath(engine_bin), "args": args, "model_name": meta.get("name") or "basalt",
-           "sampling": sampling_defaults(meta), "log": str(cdir / "engine.log"),
+           "sampling": sampling_defaults(meta),
+           "arch": (meta.get("gguf_kv") or {}).get("general.architecture"), "log": str(cdir / "engine.log"),
            "tokenizer": str(extract_tokenizer(mf))}
+    if vision == "dynamic" and cfg["arch"] == "deepseek41":
+        v, extra = deepseek_vision_config(mf, Path(cfg["tokenizer"]), words)
+        args += extra
+        v.update(mode="dynamic", gpu=True)
+        cfg["vision"] = v
+        return cfg
     v = vision_config(mf, engine_bin, sidecar=vision != "dynamic") if vision else None
     if v:
         v["mode"] = vision

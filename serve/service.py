@@ -12,11 +12,12 @@ from typing import Iterator
 
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.engine.mock import Engine
-from serve.frontend import ChatTemplate, Event, OutputParser, images_of, literal_tags, mark_think_literals, unmark_think_literals
+from serve.frontend import ChatTemplate, Event, images_of, mark_think_literals, unmark_think_literals
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
+from serve.models import Dialect, dialect_for
 from serve.prompt import CTX_SLACK, PromptText, overflow_error, room_error
-from serve.util.text import Detokenizer, IM_END, StopMatcher, control_literals, stop_strings
+from serve.util.text import Detokenizer, StopMatcher, control_literals, stop_strings
 from serve.engine.image_source import USAGE as IMAGE_USAGE, ImageRefused, ImageSources
 from serve.engine.vision import IMAGE_WAITING_BYTES, Vision
 from serve.api.grammar import grammar_spec, unenforced
@@ -35,20 +36,17 @@ def available_ram_mib() -> int | None:
     return None
 
 
-IMAGE_PAD = "<|image_pad|>"
 # trailing effort turn (effort_end): sentences for the non-default efforts
 EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"
 EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the "
                       "conclusion without unnecessary elaboration.",
                "medium": "Reasoning effort is set to medium. Think as much as the task needs, without unnecessary "
                          "elaboration."}
-VISION_START = "<|vision_start|>"
+# the Qwen dialect's closer of thinking; other dialects carry their own
+REASONING_CLOSE = "\n</think>\n\n"
 # Reserve output tokens for closing the thinking and the answer above this cap.
 ANSWER_ROOM_MIN_CAP = 1024
 ANSWER_RESERVE_MIN = 512
-# closes the thinking: the template's own end, written when the model ends its turn inside it, reaches the thinking
-# budget or repeats one token
-REASONING_CLOSE = "\n</think>\n\n"
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often
 KEEPALIVE_S = 10.0          # a stream quiet this long (a held-back tool argument) gets a keep-alive
 # live tok/s is a windowed rate: a mean since the first token spikes at the start of an answer
@@ -81,9 +79,11 @@ class Service:
 
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True):
+                 fit_max_tokens: bool = False, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True,
+                 dialect: Dialect | None = None):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
-        self.literals = literal_tags(control_literals(tokenizer))   # control texts that stay text inside a message
+        self.dialect = dialect or dialect_for(None)      # how this model's prompts and replies are written
+        self.literals = self.dialect.literal_tags(control_literals(tokenizer))   # control texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # clamp the output cap instead of a 400
         self.grammar = grammar                        # the `grammar` option: every tool or JSON request gets one
         self.grammar_engine = grammar_engine          # the engine understands the request key
@@ -131,8 +131,7 @@ class Service:
         self.answer_room = True                          # reserve output space when thinking
         self.thinking_loop_tokens = 256                  # one token repeated this often in the thinking ends it (0: off)
         self.anthropic_think_unasked = True               # "anthropic_thinking": "on_request" -> False
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        self.stop_ids = {t for s in self.dialect.stop_texts for t in tokenizer.encode(s, parse_special=True)}
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -767,10 +766,10 @@ class Service:
             return self._prepare_text(messages, tools, kwargs, max_new, force)
         ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
-            ids = ids + self.tok.encode(force, parse_special=True)
+            ids = ids + self.tok.encode(self.dialect.nothink_lead + force, parse_special=True)
         if images:
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-            start = self.tok.encode(VISION_START, parse_special=True)[0]
+            pad = self.tok.encode(self.dialect.image_pad, parse_special=True)[0]
+            start = self.tok.encode(self.dialect.image_start, parse_special=True)[0] if self.dialect.image_start else None
             try:                                        # before the fifo: a slow source must not hold the turn
                 images = self.vision.read(images, image_access)
             except ImageRefused as e:
@@ -798,10 +797,10 @@ class Service:
                 with self.images_lock:
                     self.images_waiting -= held
             # expand each image's pad to one per image token; a pad not after <|vision_start|> is message text
-            literal = self.tok.encode(IMAGE_PAD, parse_special=False)
+            literal = self.tok.encode(self.dialect.image_pad, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
-                if t == pad and j > 0 and ids[j - 1] == start:
+                if t == pad and (start is None or (j > 0 and ids[j - 1] == start)):
                     # more markers than images
                     if k == len(counts):
                         _refuse_images("the prompt and its images do not match")
@@ -920,7 +919,7 @@ class Service:
         if self.sampling_defaults:     # the request's own fields win
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**self.sampling_defaults, **req_values}
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        parser = self.dialect.parser(thinking, tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         thinking_n = 0                                 # tokens written while thinking
         stop_list = stop_strings(sampling)
@@ -944,9 +943,10 @@ class Service:
                     out.append(Event("content", held))
                 out.append(ev)
             return out
+        one_call = self.dialect.forced_call_ends_reply and bool(force) and force.rstrip().endswith(">")     # a named choice: the reply is that one call
         opening = []                                    # without thinking the prompt ends with the forced opening:
         if force and not thinking:                      # the parser reads it as if the model had written it
-            opening, force = parser.feed(force), None
+            opening, force = parser.feed(self.dialect.nothink_lead + force), None
         tail = ""                                       # the last characters written (the newlines before a call)
         reused0 = None                                  # reused prefix of the request's first engine run
         timings, before = None, None                    # this request's timings; the engine's `last` before it
@@ -1090,6 +1090,9 @@ class Service:
                                         and parser.state == "reasoning" and not parser.buf and not detok.pending()):
                                     wrap = looped = True
                                     break
+                                if one_call and any(ev.kind == "tool_call" for ev in evs):
+                                    finish = "stop"         # no second call after a forced one
+                                    break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
                                     # only at a clean point: no held tag or split character
@@ -1131,7 +1134,7 @@ class Service:
                         # one, so the engine keeps its prefix
                         if ended_thinking:
                             closed_early = True
-                            extra = self.tok.encode(REASONING_CLOSE + (force or ""), parse_special=True)
+                            extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
                             force = None
                             if max_new - n - len(extra) < 1:
                                 finish = "stop"
@@ -1139,7 +1142,7 @@ class Service:
                             print("[server] the model ended while thinking, closing it for an answer", flush=True)
                         elif wrap:
                             budget = None
-                            extra = self.tok.encode(REASONING_CLOSE + (force or ""), parse_special=True)
+                            extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
                             force = None
                             if max_new - n - len(extra) < 1:
                                 break                   # no room to answer: "length"

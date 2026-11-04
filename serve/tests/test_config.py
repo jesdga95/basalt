@@ -277,6 +277,9 @@ class SamplingOptions(unittest.TestCase):
             sampling_defaults_from_config({"sampling": {"top_k": -5}})
         self.assertEqual(sampling_defaults_from_config({"sampling": {"top_k": 100}}), {"top_k": 100})
 
+    def test_top_k_zero_in_the_model_file_means_no_cut(self):
+        self.assertEqual(sampling_defaults_from_config({"sampling": {"top_k": 0, "temperature": 1.0}}), {"temperature": 1.0})
+
     def test_startup_line_marks_the_source(self):
         self.assertEqual(sampling_line({"temperature": 0.8, "top_k": 20, "top_p": 0.9}, {"temperature"}, {"top_k"}),
                          "[server] sampling temp=0.8(cli) top_k=20(config) top_p=0.9")
