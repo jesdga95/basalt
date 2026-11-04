@@ -25,7 +25,6 @@ bool peer_portable() { return g_peer_portable; }
 
 namespace {
 
-constexpr int64_t H = basalt::kernels::cpu::H;
 constexpr int64_t CAP = basalt::kernels::cpu::MAXT * 10;   // entries per layer: MAXT tokens x top-10
 
 struct Meta {                           // one block, uploaded with one copy per layer
@@ -91,27 +90,23 @@ namespace {
 
 size_t g_min_scratch = 0;
 
-size_t scratch_bytes() {
-    const auto& lay = basalt::kernels::cpu::expert_layout();
-    int64_t ff = basalt::kernels::cpu::FF;
-    if (lay.native)
-        for (const auto& f : lay.fmt) ff = std::max<int64_t>(ff, f.n_ff);
-    return std::max<size_t>(g_min_scratch, basalt::kernels::native_expert_scratch_bytes(CAP, ff));
+size_t scratch_bytes(int64_t n_ff) {
+    return std::max<size_t>(g_min_scratch, basalt::kernels::native_expert_scratch_bytes(CAP, n_ff));
 }
 
 }  // namespace
 
 void PeerExperts::set_min_scratch(size_t bytes) { g_min_scratch = bytes; }
 
-uint64_t PeerExperts::device_overhead_bytes() {
-    return (uint64_t) scratch_bytes() + (uint64_t) CAP * H * sizeof(float) * 2 + sizeof(Meta) +
-           (uint64_t) CAP * (H / 32) * 36;
+uint64_t PeerExperts::device_overhead_bytes(int64_t n_embd, int64_t n_ff) {
+    return (uint64_t) scratch_bytes(n_ff) + (uint64_t) CAP * n_embd * sizeof(float) * 2 + sizeof(Meta) +
+           (uint64_t) CAP * (n_embd / 32) * 36;
 }
 
 bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
-                       ExpertSource& src, int64_t n_layers, int64_t n_expert, int reserve_mib, int64_t max_slots,
-                       std::string& err, bool exclusive) {
-    if (!prepare(device, src, n_layers, n_expert, err)) return false;
+                       ExpertSource& src, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, int reserve_mib,
+                       int64_t max_slots, std::string& err, bool exclusive) {
+    if (!prepare(device, src, n_layers, n_expert, n_embd, n_ff, err)) return false;
     // the pairs the primary does not hold, in rank order, as many as fit
     On on(device);
     size_t free_b = 0, total_b = 0;
@@ -137,7 +132,8 @@ uint64_t PeerExperts::slot_bytes(int64_t layer) {
     return lay.native ? (b + 255) / 256 * 256 : lay.max_blob;
 }
 
-bool PeerExperts::prepare(int device, ExpertSource& src, int64_t n_layers, int64_t n_expert, std::string& err) {
+bool PeerExperts::prepare(int device, ExpertSource& src, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff,
+                          std::string& err) {
     close();
     int count = 0;
     if (!ck(cudaGetDeviceCount(&count), "cudaGetDeviceCount", err)) return false;
@@ -148,26 +144,26 @@ bool PeerExperts::prepare(int device, ExpertSource& src, int64_t n_layers, int64
     }
     n_layers_ = n_layers;
     n_expert_ = n_expert;
-    n_embd_ = H;
+    n_embd_ = n_embd;
     src_ = &src;
     res_.assign((size_t) (n_layers * n_expert), kNotResident);
     hold_.assign((size_t) (n_layers * n_expert), 0);
     On on(device);
     device_ = device;
     // scratch first, so the slots take what is really left
-    const size_t scratch = scratch_bytes();
+    const size_t scratch = scratch_bytes(n_ff);
     const bool alloc_ok =
         ck(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err) &&
         ck(cudaStreamCreateWithFlags(&refill_, cudaStreamNonBlocking), "refill stream", err) &&
         ck(cudaEventCreateWithFlags(&refill_ev_, cudaEventDisableTiming), "event", err) &&
         ck(cudaEventCreateWithFlags(&evict_ev_, cudaEventDisableTiming), "event", err) &&
-        ck(cudaHostAlloc((void**) &h_x_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging", err) &&
-        ck(cudaHostAlloc((void**) &h_out_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "result staging", err) &&
+        ck(cudaHostAlloc((void**) &h_x_, (size_t) CAP * n_embd * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging", err) &&
+        ck(cudaHostAlloc((void**) &h_out_, (size_t) CAP * n_embd * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "result staging", err) &&
         ck(cudaHostAlloc(&h_meta_, sizeof(Meta), cudaHostAllocPortable | cudaHostAllocMapped), "plan staging", err) &&
-        ck(cudaMalloc((void**) &d_x_, (size_t) CAP * H * sizeof(float)), "input", err) &&
-        ck(cudaMalloc((void**) &d_out_, (size_t) CAP * H * sizeof(float)), "result", err) &&
+        ck(cudaMalloc((void**) &d_x_, (size_t) CAP * n_embd * sizeof(float)), "input", err) &&
+        ck(cudaMalloc((void**) &d_out_, (size_t) CAP * n_embd * sizeof(float)), "result", err) &&
         ck(cudaMalloc(&d_meta_, sizeof(Meta)), "plan", err) &&
-        ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (H / 32) * 36), "activations", err) &&
+        ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (n_embd / 32) * 36), "activations", err) &&
         ck(cudaMalloc(&d_scratch_, scratch), "scratch", err);
     if (!alloc_ok) { close(); return false; }
     return true;

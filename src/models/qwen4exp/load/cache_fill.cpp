@@ -61,7 +61,7 @@ int cache_fill(Context& context) {
             if (cudaSetDevice(dev) == cudaSuccess && cudaMemGetInfo(&pfree, &ptotal) == cudaSuccess) {
                 const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
                                          (dev == o.peer_device ? peer_prompt_bytes() : 0) +
-                                         tiers * basalt::core::PeerExperts::device_overhead_bytes() +
+                                         tiers * basalt::core::PeerExperts::device_overhead_bytes(g.n_embd, g.n_ff) +
                                          (dev == o.peer_device ? (uint64_t) peer_split_bytes(cur) : 0);
                 room += (uint64_t) pfree > reserve ? (uint64_t) pfree - reserve : 0;
             }

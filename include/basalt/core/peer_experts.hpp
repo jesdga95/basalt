@@ -46,11 +46,11 @@ public:
     /// as fit in the card's free memory minus `reserve_mib` (`max_slots` > 0 caps the count).  `exclusive`: no
     /// other tier holds these experts, so the fill is reported as model bytes placed, not as a copy.
     bool open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
-              ExpertSource& src, int64_t n_layers, int64_t n_expert, int reserve_mib, int64_t max_slots,
-              std::string& err, bool exclusive = false);
+              ExpertSource& src, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, int reserve_mib,
+              int64_t max_slots, std::string& err, bool exclusive = false);
     /// `open` in two steps, for several peers sharing out one ranking: `prepare` takes the card's buffers (no slots),
     /// `fill` sizes the slots for exactly `pick` and copies those experts in.
-    bool prepare(int device, ExpertSource& src, int64_t n_layers, int64_t n_expert, std::string& err);
+    bool prepare(int device, ExpertSource& src, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, std::string& err);
     bool fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std::string& err, bool exclusive = false);
     /// A tier whose owner keeps the experts' places and fills the slots itself: no expert source, no adaptation.
     /// `rows`: the pinned, portable, mapped host rows a share lands in.
@@ -72,7 +72,7 @@ public:
     void close();
     /// The device bytes `open` allocates besides the expert slots (buffers and kernel scratch), taken before the
     /// slots are sized from what is left.
-    static uint64_t device_overhead_bytes();
+    static uint64_t device_overhead_bytes(int64_t n_embd, int64_t n_ff);
     /// The least scratch a tier opens with, for a model whose experts need more than the native kernels (before any open).
     static void set_min_scratch(size_t bytes);
     bool valid() const { return device_ >= 0; }

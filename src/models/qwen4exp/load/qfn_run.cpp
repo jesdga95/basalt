@@ -58,6 +58,9 @@ int run_engine(program::Options& o, std::vector<program::GpuCard>& chosen_cards)
     // nothing to choose, and no other card is touched)
     if (chosen_cards.size() >= 2) {
         basalt::program::MgModel mm;
+        mm.layers = 48;
+        mm.blob_bytes = 2760000;
+        mm.exchange_mib_per_token = 2560.0 * 4.0 / 10240.0;
         mm.pairs = (int64_t) mm.layers * 512;
         mm.blob_bytes = srcs.experts.bytes > 0 ? srcs.experts.bytes / (uint64_t) mm.pairs : mm.blob_bytes;
         mm.main_overhead = srcs.dense.bytes + (7ull << 29);

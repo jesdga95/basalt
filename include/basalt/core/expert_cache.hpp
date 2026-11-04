@@ -2,7 +2,7 @@
 //
 // **WHY THIS EXISTS.**  The CPU expert pool is the engine's largest single cost: every token reads hundreds of MB of
 // expert bytes, and the work is exposed because the residual chain is strictly serial.  The only way past it is to
-// stop reading those bytes: put some of the 48 x 512 experts in VRAM and let the GPU compute them, so the CPU reads
+// stop reading those bytes: put some of the experts in VRAM and let the GPU compute them, so the CPU reads
 // only the misses.
 //
 // **THE DESIGN IS SIZED AGAINST MEASUREMENTS.**  The expert hit rate is a held-out figure, the VRAM is what is free on a live run rather than at startup, and only a small share of

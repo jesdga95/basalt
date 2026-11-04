@@ -99,7 +99,7 @@ MgPlan plan_multi_gpu(const std::vector<GpuCard>& cards, const MgModel& m) {
     // exchanges between the cards; the experts stay as in the expert tier
     const double dense_saving = kDenseShare * kGpuGB * (1.0 / bw[0] - 1.0 / total_bw) * 1000.0;
     const double exchange = (double) m.layers * m.tp_exchanges_per_layer * (double) (n - 1) * kExchangeUs *
-                            (m.tokens * 2560.0 * 4.0 / 10240.0) / 1000.0;
+                            m.tokens * m.exchange_mib_per_token / 1000.0;
     MgPrice tp{Mechanism::TensorParallel, false, tier.ms - dense_saving + exchange};
     plan.prices = {tier, split, tp};
     plan.pick = Mechanism::ExpertTier;

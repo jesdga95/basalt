@@ -80,7 +80,7 @@ int resident_plan(Context& context) {
         cudaGetDevice(&d0);
         const int peer_reserve = o.peer_reserve_mib + (int) ((peer_split_bytes(d0) + peer_prompt_bytes() + (1 << 20) - 1) >> 20);
         if (o.peer_devices.size() <= 1) {
-            if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, peer_reserve, o.peer_slots,
+            if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, g.n_embd, g.n_ff, peer_reserve, o.peer_slots,
                            err, exclusive)) {
                 basalt::log::error("basalt generate", "%s", err.c_str());
                 return false;
@@ -98,7 +98,7 @@ int resident_plan(Context& context) {
         for (size_t i = 1; i < np; ++i) xpeers.push_back(std::make_unique<basalt::core::PeerExperts>());
         auto tier = [&](size_t i) -> basalt::core::PeerExperts& { return i == 0 ? peer : *xpeers[i - 1]; };
         for (size_t i = 0; i < np; ++i)
-            if (!tier(i).prepare(o.peer_devices[i], *srcp, g.n_layers, g.n_expert, err)) {
+            if (!tier(i).prepare(o.peer_devices[i], *srcp, g.n_layers, g.n_expert, g.n_embd, g.n_ff, err)) {
                 basalt::log::error("basalt generate", "%s", err.c_str());
                 return false;
             }

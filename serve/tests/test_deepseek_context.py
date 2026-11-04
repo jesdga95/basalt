@@ -76,14 +76,13 @@ class EngineSide(unittest.TestCase):
     def test_the_flag_is_tracked_and_handed_to_the_model(self):
         self.assertIn("o.max_context_set = true;", self.src)
         self.assertIn("lreq.max_context = o.max_context;", self.src)
-        self.assertIn("lreq.max_context_set = o.max_context_set;", self.src)
+        self.assertIn("lreq.max_context_set = true;", self.src)
 
     def test_the_ready_line_reports_the_models_resolved_context(self):
-        self.assertIn("loaded->context() ? loaded->context() : o.max_context", self.src)
+        self.assertIn("if (loaded->context() != 0) o.max_context = loaded->context();", self.src)
 
-    def test_the_rope_flags_are_refused_for_a_model_with_its_own_scaling(self):
-        self.assertIn("if (desc.rope_from_model)", self.src)
-        self.assertIn("do not apply to", self.src)
+    def test_the_rope_flags_are_not_common_flags(self):
+        self.assertNotIn("--rope-scale", self.src)
 
 
 class ReadyContext(unittest.TestCase):
