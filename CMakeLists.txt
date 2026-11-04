@@ -438,7 +438,7 @@ add_executable(basalt src/program/generate.cpp src/program/engine_local.cpp src/
                        src/program/serve/prompt_windows.cpp
                        src/program/serve/protocol.cpp
                        src/program/serve/request.cpp
-                       src/program/serve/request_decode.cpp
+                       src/program/serve/qfn_decode.cpp
                        src/program/serve/request_finish.cpp
                        src/program/serve/request_image.cpp
                        src/program/serve/request_parse.cpp

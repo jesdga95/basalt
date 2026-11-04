@@ -81,6 +81,10 @@ protected:
     // per-request sampling (greedy when temperature is absent)
     basalt::kernels::SamplerParams req_sp{};
     bool cancelled{};
+    std::vector<int32_t> window{};
+    std::vector<int32_t> outv{};
+    bool first_window{};
+    int hist_n{};
     int64_t p{};
     int32_t x{};
     // what the session holds once this request is done: the prompt read so far, then every committed token
@@ -114,6 +118,7 @@ protected:
     Flow read_prompt();
     virtual Flow decode() = 0;
     Flow complete();
+    template <class B> Flow decode_loop(B& b);
     virtual bool parse_begin() { return true; }
     virtual float default_relax() const { return 0.0f; }
     // ---- the end of a request

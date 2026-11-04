@@ -9,8 +9,93 @@ class QfnRequest final : public Request {
 public:
     explicit QfnRequest(QfnRuntime& runtime) : Request(runtime), runtime_(runtime) {}
 
+    static constexpr bool kSpeculates = true;
+    // ---- the window loop's calls; defined in the one file that instantiates it
+    Flow decode_begin();
+    void seed_tiers();
+    void decode_state_begin();
+    void decode_stats_begin();
+    int max_window() const { return runtime_.S; }
+    int draft_window();
+    void lookup_window(int& T, bool& from_sfx, int& sfx_match);
+    void fill_drafts(int T, bool from_sfx);
+    int before_window(int T, int64_t pos);
+    int32_t* history_stage() { return runtime_.hist_stage.data(); }
+    void upload_history(int T) {
+        const basalt::core::OnDevice on_h(runtime_.hist_dev);
+        cudaMemcpy(runtime_.d_hist, runtime_.hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
+                   cudaMemcpyHostToDevice);
+    }
+    void mark_before_run() {
+        basalt::core::decode_gaps().mark(19);
+        basalt::core::decode_events().stamp(3);
+    }
+    void spawn_adapt(bool early);
+    void tier_before(int T, int e0, bool from_sfx);
+    void tier_after_commit();
+    void tier_finish();
+    /// The adaptive step of one window.
+    class TierStep {
+    public:
+        explicit TierStep(QfnRequest& request) : r_(request) {}
+        ~TierStep() { r_.tier_finish(); }
+        void before_window(int T, int e0, bool from_sfx) { r_.tier_before(T, e0, from_sfx); }
+        void after_commit() { r_.tier_after_commit(); }
+        void finish() { r_.tier_finish(); }
+        bool ok() const { return r_.adapt_ok; }
+    private:
+        QfnRequest& r_;
+    };
+    bool run_window(int T, int e0, int& TB);
+    bool take_held(int T);
+    bool window_failed() const { return runtime_.drive.d.failed; }
+    const char* window_error() const {
+        return runtime_.drive.d.failed && runtime_.drive.d.fail ? runtime_.drive.d.fail : runtime_.err.c_str();
+    }
+    void relax_note_forced(int a);
+    int accept_drafts(int T);
+    bool resample_row(int row, int64_t pos, const std::vector<float>& bias, int32_t& tok, std::string& e) {
+        return cv->resample_row(row, pos, bias, tok, e);
+    }
+    bool copy_logits(int row, float* out) { return cv->copy_logits(row, out); }
+    bool after_accept(int T, int& a, int e0, bool from_sfx, bool held_run, bool paired, bool& hold);
+    void note_draft_probs(bool from_sfx);
+    void stamp_before_commit() { basalt::core::decode_events().stamp(9); }
+    bool commit(int keep, std::string& e, int phase) { return cv->commit(keep, e, phase); }
+    void on_token(int32_t tok) { if (runtime_.o.suffix_draft > 0) runtime_.sfx->append(tok); }
+    void count_round() { ++runtime_.rounds; }
+    template <class After>
+    bool draft_next(int T, int a, int e0, int TB, bool from_sfx, bool hold, bool will_draft, After& after_launch);
+    bool draft_fatal() const { return draft_failed; }
+    void window_timing(int T, int a, bool from_sfx, Clock::time_point round0, Clock::time_point tw0,
+                       Clock::time_point tw1, Clock::time_point tw2);
+    void mark_after_window() {
+        basalt::core::decode_events().stamp(1);
+        basalt::core::decode_gaps().mark(16);
+    }
+    void observe_policy(bool from_sfx, int T, int a, int sfx_match, Clock::time_point round0) {
+        runtime_.policy->observe(from_sfx, T, a, sfx_match,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+    }
+    void mark_loop_end() { basalt::core::decode_gaps().mark(17); }
+    void shed_low() { runtime_.QfnRuntime::shed_if_low(); }
+    void stamp_loop_end() { basalt::core::decode_events().stamp(2); }
+    void decode_end();
+
 private:
     QfnRuntime& runtime_;
+    bool try_pair{};
+    bool do_adapt{};
+    bool adapt_ok{true};
+    bool adapt_early{};
+    std::atomic<int> adapt_go{0};
+    void* user_c{};
+    void* user_o{};
+    FILE* draft_log{};
+    FILE* tk_log{};
+    float wprob[16]{};
+    int wprob_n{};
+    bool draft_failed{};
     using PfPart = QfnRuntime::PfPart;
     basalt::core::SessionState* rview{};
     int64_t kv_need{};
@@ -38,14 +123,10 @@ private:
     bool relax_on{};
     bool in_call{};
     int64_t relaxed_kept{};
-    int hist_n{};
     std::vector<int32_t> drafts{};
-    std::vector<int32_t> window{};
-    std::vector<int32_t> outv{};
     std::vector<float> dprob{};
     basalt::core::DraftCumAdapt cum_adapt{};   // this request's draft threshold
     std::vector<int32_t> sbuf{};
-    bool first_window{};
     int64_t sfx_windows{};
     int64_t sfx_drafts{};
     int64_t sfx_ok{};
