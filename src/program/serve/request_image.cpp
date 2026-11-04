@@ -57,7 +57,7 @@ Flow Request::prepare_image() {
             int64_t p = 0, i = 0;
             size_t k = 0;
             while (ve.empty() && i < n) {
-                if (ids[(size_t) i] != runtime_.kImagePad) { put(i, p, p, p); ++p; ++i; continue; }
+                if (ids[(size_t) i] != runtime_.o.image_pad_id) { put(i, p, p, p); ++p; ++i; continue; }
                 if (k >= imgs.size()) { ve = "the prompt has more images than the embeddings file"; break; }
                 const Img& im = imgs[k++];
                 {   // what the conversation cache compares: a picture is its grid and its embeddings
@@ -67,7 +67,7 @@ Flow Request::prepare_image() {
                     runtime_.req_imgs.push_back({i, h});
                 }
                 for (int64_t j = 0; j < im.n && ve.empty(); ++j)
-                    if (i + j >= n || ids[(size_t) (i + j)] != runtime_.kImagePad)
+                    if (i + j >= n || ids[(size_t) (i + j)] != runtime_.o.image_pad_id)
                         ve = "image " + std::to_string(k) + " has " + std::to_string((long long) im.n) +
                              " rows but fewer <|image_pad|> tokens";
                 for (int64_t j = 0; j < im.n && ve.empty(); ++j) {
@@ -79,7 +79,7 @@ Flow Request::prepare_image() {
                 p += std::max(im.nx, im.ny);
             }
             if (ve.empty() && k != imgs.size()) ve = "the embeddings file has more images than the prompt";
-            if (ve.empty() && n > 0 && ids[(size_t) (n - 1)] == runtime_.kImagePad) ve = "the prompt cannot end in an image";
+            if (ve.empty() && n > 0 && ids[(size_t) (n - 1)] == runtime_.o.image_pad_id) ve = "the prompt cannot end in an image";
             for (int64_t c = n; ve.empty() && c < cells; ++c) put(c, p + (c - n), p + (c - n), p + (c - n));
         }
         cudaDeviceSynchronize();

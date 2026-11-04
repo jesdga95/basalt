@@ -68,6 +68,10 @@ public:
 
     model::TokenizerSpec tokenizer_spec() const override { return {"tokenizer.ggml.tokens", "qwen"}; }
 
+    model::TokenNames token_names() const override {
+        return {{"<|endoftext|>", "<|im_end|>"}, "<|im_start|>", "<|image_pad|>"};
+    }
+
     std::unique_ptr<program::CommonOptions> make_options() const override { return std::make_unique<program::Options>(); }
     bool parse_flag(const std::string& name, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
         return qwen4exp::parse_flag(name, args, static_cast<program::Options&>(o), code);

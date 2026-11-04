@@ -124,6 +124,13 @@ public:
     virtual Result make_session(std::unique_ptr<ModelSession>& out) = 0;
 };
 
+/// The texts of the model's own tokens in the pack's vocabulary: the defaults of --eos-ids, --turn-token, --image-pad-id.
+struct TokenNames {
+    std::vector<std::string> eos;
+    std::string turn;
+    std::string image_pad;
+};
+
 class FlagArgs;
 
 class ModelAdapter {
@@ -138,6 +145,7 @@ public:
     virtual Result load(const LoadRequest& req, std::unique_ptr<LoadedModel>& out) const = 0;
     virtual std::vector<SideTableSpec> side_tables(const ModelDesc&) const { return {}; }
     virtual TokenizerSpec tokenizer_spec() const = 0;
+    virtual TokenNames token_names() const = 0;
     /// The options object of this model: the common flags and its own.
     virtual std::unique_ptr<program::CommonOptions> make_options() const;
     /// Takes a flag outside the common set; false when this model has no such flag. `code`: an exit code for a bad value.
