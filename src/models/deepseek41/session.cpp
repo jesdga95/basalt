@@ -33,6 +33,7 @@
 namespace basalt::models::deepseek41 {
 namespace {
 constexpr int kLendTierTokens = 16384;   // a prompt this long reads without the VRAM tier, in larger chunks
+constexpr int kStepTailTokens = 256;     // a tail this short may read one decode step at a time
 
 #define DS_CUDA(call)                                                                                   \
     do {                                                                                                \
@@ -178,7 +179,19 @@ public:
                 }
                 // the caches take their memory before the prompt workspaces do
                 if (!ops_->ensure_positions(r.pos + r.n_tokens, err)) return prompt_failed(err);
-                if (!prefill_ && !make_prefill_fit(err)) return prompt_failed(err);
+                if (!prefill_ && !make_prefill_fit(err)) {
+                    // a long context's caches left no room: a short tail takes the decode path, a longer read the tier's memory
+                    if (r.n_tokens <= kStepTailTokens) {
+                        close_prompt_path();
+                        for (int i = 0; i < r.n_tokens; ++i)
+                            if (!step(r.tokens[i], r.pos + i, false, nullptr, nullptr, err)) return {model::Status::Error, err};
+                        return {};
+                    }
+                    std::string te;
+                    err.clear();
+                    if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
+                    if (!make_prefill_fit(err)) return prompt_failed(err);
+                }
                 prefill_->progress = r.progress;
                 prefill_->live = r.live;
                 if (!prefill_->run(r.tokens, batched, r.pos, hist_, err)) return prompt_failed(err);
@@ -192,6 +205,22 @@ public:
             std::string err;
             if (!step(r.tokens[i], r.pos + i, false, nullptr, nullptr, err)) return {model::Status::Error, err};
         }
+        return {};
+    }
+
+    model::Result checkpoint(int64_t pos) override {
+        sync_rewind(pos);
+        if (!ops_) return {model::Status::NotImplemented, "no state yet"};
+        ops_->save_turn(stream_);
+        ck_pos_ = pos;
+        return {};
+    }
+
+    model::Result rewind_to_checkpoint() override {
+        if (ck_pos_ < 0 || !ops_) return {model::Status::Error, "no checkpoint"};
+        ops_->commit_window(ck_pos_, stream_);
+        ops_->restore_turn(stream_);
+        if ((int64_t) hist_.size() > ck_pos_) hist_.resize((size_t) ck_pos_);
         return {};
     }
 
@@ -226,7 +255,12 @@ public:
         std::string err;
         open_prompt_path();
         if (!ops_->ensure_positions(pos + n_rows, err)) return prompt_failed(err);
-        if (!prefill_ && !make_prefill_fit(err)) return prompt_failed(err);
+        if (!prefill_ && !make_prefill_fit(err)) {
+            std::string te;
+            err.clear();
+            if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
+            if (!make_prefill_fit(err)) return prompt_failed(err);
+        }
         if (!prefill_->run_embeddings(rows, n_rows, pos, hist_, err)) return prompt_failed(err);
         close_prompt_path();
         return {};
@@ -728,6 +762,7 @@ private:
     DsModel& m_;
     const Geometry& g_;
     std::vector<cudaGraphExec_t> head_g_, tail_g_;
+    int64_t ck_pos_ = -1;   // position of the last checkpoint
     cudaStream_t stream_ = nullptr;
     std::unique_ptr<LayerOps> ops_;
     std::unique_ptr<Prefill> prefill_;

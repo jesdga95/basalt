@@ -101,6 +101,11 @@ public:
         (void) anchor; (void) pos; (void) ids; (void) conf; (void) max_n; (void) n_out;
         return {Status::NotImplemented, "this model has no drafter"};
     }
+    /// Keeps the state at `pos` (the end of the prompt's held text) so a later prompt can restart there. A session that
+    /// cannot rewind leaves the default.
+    virtual Result checkpoint(int64_t pos) { (void) pos; return {Status::NotImplemented, "this model keeps no checkpoint"}; }
+    /// Back to the last checkpoint: the next call continues at its position.
+    virtual Result rewind_to_checkpoint() { return {Status::NotImplemented, "this model keeps no checkpoint"}; }
     /// An encoded picture: `n_rows` embedding rows of the model's width (the encoder's whole block). Rows with no
     /// vision support leave the default.
     virtual Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows) {

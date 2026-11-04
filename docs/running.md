@@ -2,6 +2,8 @@
 
 The long-form notes behind the settings in [configuration](configuration/index.md): concurrent requests, the KV cache, memory floors and image input. Diagnostic flags: `bin/basalt --help`.
 
+A `deepseek41` pack has its own notes: [DeepSeek-V4.1 packs](deepseek41.md).
+
 ## Start-up and loading
 
 The server and the page are up at once; the model loads behind them. While it loads (at start, on the first `--lazy`

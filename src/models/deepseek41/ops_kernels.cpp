@@ -125,6 +125,43 @@ public:
         return true;
     }
 
+    void save_turn(void* stream) override {
+        cudaStreamSynchronize((cudaStream_t) stream);
+        const size_t ring_b = (size_t) kWindowSlots * kLatent * 2;
+        turn_.clear();
+        auto put = [&](const void* dev, size_t bytes) {
+            const size_t at = turn_.size();
+            turn_.resize(at + bytes);
+            cudaMemcpy(turn_.data() + at, dev, bytes, cudaMemcpyDeviceToHost);
+        };
+        for (size_t il = 0; il < ring_.size(); ++il) {
+            if (ring_[il]) put(ring_[il], ring_b);
+            if (st_kv_[il]) {
+                const size_t n = (size_t) g_.compress_ratio[il] * kLatent * 4;
+                put(st_kv_[il], n);
+                put(st_sc_[il], n);
+            }
+        }
+    }
+
+    void restore_turn(void* stream) override {
+        cudaStreamSynchronize((cudaStream_t) stream);
+        const size_t ring_b = (size_t) kWindowSlots * kLatent * 2;
+        size_t at = 0;
+        auto get = [&](void* dev, size_t bytes) {
+            cudaMemcpy(dev, turn_.data() + at, bytes, cudaMemcpyHostToDevice);
+            at += bytes;
+        };
+        for (size_t il = 0; il < ring_.size(); ++il) {
+            if (ring_[il]) get(ring_[il], ring_b);
+            if (st_kv_[il]) {
+                const size_t n = (size_t) g_.compress_ratio[il] * kLatent * 4;
+                get(st_kv_[il], n);
+                get(st_sc_[il], n);
+            }
+        }
+    }
+
     void reset() override {
         for (size_t il = 0; il < st_kv_.size(); ++il) {
             if (!st_kv_[il]) continue;
@@ -622,6 +659,7 @@ private:
     std::vector<uint16_t*> ring_, comp_kv_, comp_ik_;
     std::vector<std::unique_ptr<ElasticBuf>> el_kv_, el_ik_;   // backing of comp_kv_ / comp_ik_ per kv-source layer
     int64_t backed_positions_ = 0;
+    std::vector<uint8_t> turn_;   // save_turn's copy
     int ctx_ = 0;
     std::vector<float*> st_kv_, st_sc_;
     float* freq_[2] = {nullptr, nullptr};
