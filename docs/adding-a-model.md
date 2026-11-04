@@ -13,6 +13,10 @@ A model lives in `src/models/<arch>/` and `include/basalt/models/<arch>/`. Share
 The shared server then runs it: the request keys, sampling through `sample_tokens`, grammar, the checkpoint chain, batch
 slots taking each slot in turn, `VRAM`, `SLEEP`, `WAKE`, `INFO`, `PT` and `GENT`.
 
+## Benchmarks
+
+Fixtures hold token ids, so each model has its own: `basalt-bench --fixtures data/bench/<arch>`. `--quality` needs a BF16 reference; a model without one refuses its flags.
+
 ## Flags
 
 The common flags are in `src/program/cli/arguments.cpp`. A model adds its own through `parse_flag`; any other flag is the
