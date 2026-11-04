@@ -54,7 +54,7 @@ ExpertTier::~ExpertTier() {
     if (fetch_stream_) cudaStreamDestroy(fetch_stream_);
     for (uint8_t* p : ram_)
         if (p) cudaFreeHost(p);
-    std::free(act_);
+    platform::free_aligned(act_);
 }
 
 bool ExpertTier::open(uint64_t reserve_bytes, std::string& err) {
@@ -114,7 +114,7 @@ bool ExpertTier::open(uint64_t reserve_bytes, std::string& err) {
             return false;
         fmt_.push_back(f);
     }
-    act_ = (uint8_t*) std::aligned_alloc(64, kernels::cpu::kNativeActBytes * kMaxWindow);
+    act_ = (uint8_t*) platform::alloc_aligned(kernels::cpu::kNativeActBytes * kMaxWindow, 64);
     pool_ = std::make_unique<kernels::cpu::ExpertPool>((int) kernels::cpu::physical_cores(true).size());
 
     core::detail::HostMemory hm;
