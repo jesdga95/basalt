@@ -52,8 +52,11 @@ ExpertTier::~ExpertTier() {
     if (fetch_ev_) cudaEventDestroy(fetch_ev_);
     if (copy_stream_) cudaStreamDestroy(copy_stream_);
     if (fetch_stream_) cudaStreamDestroy(fetch_stream_);
-    for (uint8_t* p : ram_)
-        if (p) cudaFreeHost(p);
+    for (size_t l = 0; l < ram_.size(); ++l) {
+        if (ram_[l] == nullptr) continue;
+        if (l < ram_pins_.size()) core::unpin_ram(ram_[l], ram_pins_[l]);
+        platform::free_aligned(ram_[l]);
+    }
     platform::free_aligned(act_);
 }
 
@@ -250,71 +253,55 @@ bool ExpertTier::load_ram(std::string& err) {
         core::LoadProgress::plan(core::LoadProgress::cuda(peer_->device()), peer_bytes);
         peer_load.emplace(core::LoadProgress::cuda(peer_->device()), peer_bytes);
     }
-    std::atomic<int> next{0};
-    std::atomic<bool> failed{false};
-    std::mutex mu;
-    // reads that bypass the OS cache leave it to the system; ranges that are not block aligned go through a staging buffer
-    constexpr uint64_t kAlign = 4096;
-    const int direct = platform::open_unbuffered(m_.experts_fd());
-    auto work = [&]() {
-        uint8_t* stage = nullptr;
-        if (cudaHostAlloc((void**) &stage, max_blob + 2 * kAlign, cudaHostAllocPortable) != cudaSuccess) {
-            std::lock_guard<std::mutex> g(mu);
-            err = "deepseek41: cannot pin the expert staging";
-            failed = true;
-            return;
+    // the layout: one span per layer, each with its swap spare
+    std::vector<uint64_t> span_bytes((size_t) n_layers_, 0);
+    core::RamGrid grid;
+    grid.n_layers = n_layers_;
+    grid.n_expert = n_expert_;
+    grid.file_base = m_.pack().experts_range.offset;
+    for (int l = 0; l < n_layers_; ++l) {
+        const ExpertLayer& el = m_.pack().experts[(size_t) l];
+        grid.layer_offset.push_back(el.offset);
+        grid.blob_bytes.push_back(el.blob_bytes);
+        if (cover_ <= 0) continue;
+        span_bytes[(size_t) l] = el.blob_bytes * (uint64_t) (cover_ + (swaps ? 1 : 0));
+        ram_[(size_t) l] = core::alloc_ram(span_bytes[(size_t) l]);
+        if (ram_[(size_t) l] == nullptr) {
+            err = "deepseek41: cannot allocate the RAM expert tier";
+            return false;
         }
-        // the blob at `off` in `stage`; the address it landed at
-        auto read_blob = [&](uint64_t bytes, uint64_t off) -> const uint8_t* {
-            const uint64_t a0 = off / kAlign * kAlign, a1 = (off + bytes + kAlign - 1) / kAlign * kAlign;
-            if (direct >= 0 && platform::pread_all(direct, stage, a1 - a0, a0)) return stage + (off - a0);
-            return platform::pread_all(m_.experts_fd(), stage, bytes, off) ? stage : nullptr;
-        };
-        for (;;) {
-            const int l = next++;
-            if (l >= n_layers_ || failed) break;
-            const ExpertLayer& el = m_.pack().experts[(size_t) l];
-            uint8_t* p = nullptr;
-            if (cover_ > 0) {
-                const uint64_t span = el.blob_bytes * (uint64_t) cover_;
-                if (cudaHostAlloc((void**) &p, span + (swaps ? el.blob_bytes : 0), cudaHostAllocPortable) != cudaSuccess) {
-                    std::lock_guard<std::mutex> g(mu);
-                    err = "deepseek41: cannot pin the RAM expert tier";
-                    failed = true;
-                    break;
-                }
-                ram_[(size_t) l] = p;
-            }
-            for (int e = 0; e < n_expert_; ++e) {
-                const size_t idx = (size_t) l * n_expert_ + e;
-                const int32_t r = ram_idx_[idx];
-                const int32_t home = device_home.empty() ? -1 : device_home[idx];
-                if (r < 0 && home < 0) continue;
-                const uint8_t* got = read_blob(el.blob_bytes, m_.pack().experts_range.offset + el.offset + (uint64_t) e * el.blob_bytes);
-                bool ok = got != nullptr;
-                if (ok && r >= 0) {
-                    std::memcpy(p + (uint64_t) r * el.blob_bytes, got, el.blob_bytes);
-                    ram_load->add(el.blob_bytes);
-                }
-                if (ok && home >= 0)
-                    ok = res_[idx] >= 0 ? cudaMemcpy(cache_.device_slot(home), got, el.blob_bytes, cudaMemcpyHostToDevice) == cudaSuccess
-                                        : peer_->fill_slot(home, got, el.blob_bytes);
-                if (ok && home >= 0) (res_[idx] >= 0 ? main_load : peer_load)->add(el.blob_bytes);
-                if (!ok) {
-                    std::lock_guard<std::mutex> g(mu);
-                    err = "deepseek41: short read loading the expert tiers";
-                    failed = true;
-                    break;
-                }
-            }
+    }
+    core::RamLoad load;
+    load.fd = m_.experts_fd();
+    load.stage_pinned = true;
+    load.threads = 8;
+    load.progress = ram_load ? &*ram_load : nullptr;
+    load.groups = core::ram_layer_runs(grid, ram_, ram_idx_, device_home);
+    load.sink = [&](int64_t l, const core::RamRun& r, const uint8_t* bytes, std::string& e) {
+        const size_t idx = (size_t) l * n_expert_ + (size_t) r.first;
+        const int32_t home = device_home[idx];
+        const bool ok = res_[idx] >= 0 ? cudaMemcpy(cache_.device_slot(home), bytes, r.bytes, cudaMemcpyHostToDevice) == cudaSuccess
+                                       : peer_->fill_slot(home, bytes, r.bytes);
+        if (!ok) {
+            e = "cannot place an expert on its card";
+            return false;
         }
-        if (stage) cudaFreeHost(stage);
+        (res_[idx] >= 0 ? main_load : peer_load)->add(r.bytes);
+        return true;
     };
-    std::vector<std::thread> th;
-    for (int i = 0; i < 8; ++i) th.emplace_back(work);
-    for (std::thread& t : th) t.join();
-    if (direct >= 0) platform::close_fd(direct);
-    if (failed) return false;
+    core::RamLoadStats read;
+    if (!core::read_ram_runs(load, read, err)) {
+        err = "deepseek41: loading the expert tiers: " + err;
+        return false;
+    }
+    if (cover_ > 0) {
+        ram_pins_ = core::pin_ram_spans(ram_, span_bytes, /*mapped=*/false);
+        int unpinned = 0;
+        for (const core::RamPin& p : ram_pins_) unpinned += p.registered_bytes == 0;
+        if (unpinned > 0)
+            basalt::log::warn("basalt deepseek41", "RAM expert tier: %d of %d layers not pinned, locked: %s", unpinned, n_layers_,
+                              ram_pins_[(size_t) n_layers_ - 1].lock_note.c_str());
+    }
     if (ram_load) ram_load->finish();
     if (main_load) main_load->finish();
     if (peer_load) peer_load->finish();

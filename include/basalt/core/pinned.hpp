@@ -53,67 +53,8 @@ struct PinnedArena {
     uint8_t* data() const { return (uint8_t*) base; }
 };
 
-struct LoadStats {
-    double seconds = 0.0;
-    // Loader fix: the two halves of `seconds`, both SUMMED OVER THE READER THREADS rather than wall clock, so
-    // either can exceed `seconds` when the threads overlap.  They exist to separate the read from the copy and
-    // the hash: an 8 MiB chunk that reaches the disk as ~2048 4 KiB reads spends its time in the first one.
-    double read_seconds = 0.0;                  // inside the read call only: no seek, no copy, no hash
-    double copy_seconds = 0.0;                  // memcpy + FNV-1a
-    // A short read is not a slow load, it is a WRONG one: the caller must refuse the pack rather than run
-    // on an arena whose tail was never written.  `seconds` alone cannot say that (it is -1.0 on failure, but
-    // the caller's own check is on the REQUESTED byte count, which a refused read does not change).
-    bool ok = true;                             // false: the load failed, see `error`
-    std::string error;                          // why it failed, for the caller's message
-    uint64_t bytes = 0;
-    uint64_t layers = 0;
-    std::vector<uint64_t> layer_checksums;      // one FNV-1a per layer
-    double gib_per_second() const { return seconds > 0 ? (double) bytes / (1024.0 * 1024 * 1024) / seconds : 0.0; }
-    // Aggregate rate of the readers WHILE THEY WERE INSIDE THE READ CALL: `bytes` over the mean per-thread
-    // read time.  `gib_per_second()` above divides the same bytes by the wall clock of the whole loop, which
-    // also contains the copy and the hash, so the two differ by how much of the loop was not I/O.
-    double read_gib_per_second(int threads) const {
-        if (read_seconds <= 0.0 || threads < 1) return 0.0;
-        return (double) bytes / (1024.0 * 1024 * 1024) / (read_seconds / (double) threads);
-    }
-};
-
-// Load `layers` layers of the expert arena into `dst` with `threads` readers, `chunk` bytes at a time.
-// Each thread opens its OWN handle and seeks, which is the portable form of parallel pread: a shared handle needs a
-// lock around the seek and defeats the parallelism.
-//
-// The reads go through `fread()` on a per-thread `FILE*`, not through `std::ifstream`: `fread()` hands a request
-// larger than the stream buffer straight to the read call, which is what `chunk` is for.  The control flow, the copy,
-// the per-layer FNV-1a and therefore the checksums do not depend on the reader, so a pack loaded by either must
-// produce identical `layer_checksums`.
-LoadStats load_experts(const std::string& path, uint8_t* dst, uint64_t blob_bytes, uint64_t blobs_per_layer,
-                       uint64_t layers, int threads, uint64_t chunk);
-/// The same with one byte range per layer (`layer_off[L]`, `layer_bytes[L]`).
-/// `base`: where the experts start in the file (a section of a larger file); `layer_off` stays relative to them.
-LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
-                              const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk, uint64_t base = 0);
-
-/// The same ranges read UNBUFFERED straight into `dst`: no staging buffer and no file-cache copy - the drive's DMA
-/// lands where the experts live. Every range, `dst` and `chunk` must be 4 KiB aligned; returns ok = false with an
-/// empty `error` when they are not (or where unbuffered reads are not available), and the caller falls back to
-/// load_experts_ranges.
-LoadStats load_experts_direct(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
-                              const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk, uint64_t base = 0);
-
-/// Whether the expert files are better read unbuffered (false on this platform): a timed probe of random 64 KiB reads
-/// says they are not in the OS file cache, and the RAM left beside the arena (`arena_bytes`) could not keep them cached
-/// for the next start either - so a warm restart never gets slower, and only a start that reads the drive anyway skips
-/// the cache's copy.  `why` says what decided.
-/// `cache_counts` false (the file tier with a RAM budget): only whether the files could be kept decides - their mapped
-/// pages land in the process's working set, so a partly cached file would still take the RAM the budget was sized for.
-/// `read_bytes`: the bytes the files are read for, when that is less than the files (the file tier reads only the
-/// experts outside its RAM copy); `kAllFileBytes` = every byte of `files`.  See platform::file_cache_keeps.
-constexpr uint64_t kAllFileBytes = ~0ull;
-bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_bytes, std::string& why,
-                        bool cache_counts = true, uint64_t read_bytes = kAllFileBytes);
-
 // FNV-1a 64.  Per layer, so a corrupt or short read names WHICH layer rather than just failing a whole-file
-// comparison - the same reason the Phase 1 tools report the first differing element.
+// comparison.
 uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed = 1469598103934665603ull);
 
 // ---- the expert stream -----------------------------------------------------

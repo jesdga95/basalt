@@ -4,6 +4,8 @@
 // load is to measure a smaller one first and project - and because pinning 34 GB evicts every page of page
 // cache on the machine, which is not something a test should do while other work is running.
 #include "basalt/core/pinned.hpp"
+#include "basalt/core/ram_load.hpp"
+#include "basalt/platform/file.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -63,22 +65,46 @@ int main(int argc, char** argv) {
         std::printf("backing: malloc, NOT pinned (--no-pin)\n");
     }
 
-    const basalt::core::LoadStats st =
-        basalt::core::load_experts(path, dst, blob_bytes, blobs_per_layer, layers, threads, chunk);
-    if (!st.ok) {
-        basalt::log::error("basalt", "loading the experts failed: %s", st.error.empty() ? "unknown" : st.error.c_str());
+    const int fd = basalt::platform::open_fd_utf8(path);
+    if (fd < 0) { basalt::log::error("basalt", "cannot open %s", path.c_str()); return 1; }
+    const uint64_t layer_bytes = blobs_per_layer * blob_bytes;
+    basalt::core::LoadProgress progress("ram", bytes);
+    basalt::core::RamLoad load;
+    load.fd = fd;
+    load.unbuffered = false;
+    load.threads = threads;
+    load.chunk = chunk;
+    load.progress = &progress;
+    load.groups.resize((size_t) layers);
+    for (uint64_t l = 0; l < layers; ++l)
+        for (uint64_t pos = 0; pos < layer_bytes; pos += chunk) {
+            basalt::core::RamRun r;
+            r.dst = dst + (size_t) (l * layer_bytes + pos);
+            r.file_pos = l * layer_bytes + pos;
+            r.bytes = layer_bytes - pos < chunk ? layer_bytes - pos : chunk;
+            r.progress = r.bytes;
+            load.groups[(size_t) l].push_back(r);
+        }
+    basalt::core::RamLoadStats st;
+    std::string err;
+    if (!basalt::core::read_ram_runs(load, st, err)) {
+        basalt::log::error("basalt", "loading the experts failed: %s", err.c_str());
         return 1;
     }
+    progress.finish();
+    basalt::platform::close_fd(fd);
+    const double gib_per_s = st.seconds > 0 ? (double) st.copied / (1024.0 * 1024 * 1024) / st.seconds : 0.0;
 
     std::printf("loaded %.3f GiB in %.3f s with %d threads and %llu MiB chunks  ->  %.2f GiB/s\n",
-                (double) st.bytes / (1024.0 * 1024 * 1024), st.seconds, threads,
-                (unsigned long long) (chunk >> 20), st.gib_per_second());
+                (double) st.copied / (1024.0 * 1024 * 1024), st.seconds, threads,
+                (unsigned long long) (chunk >> 20), gib_per_s);
     std::printf("per-layer checksums (FNV-1a 64):\n");
-    for (size_t i = 0; i < st.layer_checksums.size() && i < 4; ++i) {
-        std::printf("  layer %zu  %016llx\n", i, (unsigned long long) st.layer_checksums[i]);
+    for (uint64_t i = 0; i < layers && i < 4; ++i) {
+        std::printf("  layer %llu  %016llx\n", (unsigned long long) i,
+                    (unsigned long long) basalt::core::fnv1a64(dst + (size_t) (i * layer_bytes), layer_bytes));
     }
-    if (st.layer_checksums.size() > 4) {
-        std::printf("  ... %zu more (all layers loaded)\n", st.layer_checksums.size() - 4);
+    if (layers > 4) {
+        std::printf("  ... %llu more (all layers loaded)\n", (unsigned long long) layers - 4);
     }
     if (stream) {
         // The bus is the ceiling, so measure it at the granularity the engine actually uses.  Printed as a
@@ -116,6 +142,6 @@ int main(int argc, char** argv) {
     // program has NOT loaded the full set.
     const double full = 33973862400.0;
     std::printf("projection for the full %.2f GiB at this rate: %.1f s\n", full / (1024.0 * 1024 * 1024),
-                full / (1024.0 * 1024 * 1024) / (st.gib_per_second() > 0 ? st.gib_per_second() : 1e-9));
+                full / (1024.0 * 1024 * 1024) / (gib_per_s > 0 ? gib_per_s : 1e-9));
     return 0;
 }
