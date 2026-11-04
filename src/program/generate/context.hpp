@@ -131,6 +131,7 @@ struct Context {
     const uint64_t* late = nullptr;
     const uint64_t* resident_headroom_base = nullptr;
     int64_t* lend_from = nullptr;
+    std::function<int64_t(int64_t)> spare_places;
     std::vector<std::pair<int32_t, int32_t>>* stage_held = nullptr;
     basalt::kernels::cpu::ExpertPool* pool = nullptr;
     std::vector<std::pair<int32_t, int32_t>>* peer_only = nullptr;

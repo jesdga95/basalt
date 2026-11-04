@@ -191,6 +191,12 @@ int resident_plan(Context& context) {
     // below it the prompt path's lend region as before: the RAM decides how far down that goes, as it does today
     if (kv_tail_slots > 0)
         lend_from = lend_from >= 0 ? std::max<int64_t>(0, lend_from - kv_tail_slots) : xcache.slots() - kv_tail_slots;
+    // a swap takes a free place only for an evicted expert with no RAM copy: the slots below the lend region keep none,
+    // so the places follow their share of the cache
+    auto spare_places = [&](int64_t full) -> int64_t {
+        if (lend_from < 0 || xcache.slots() <= 0) return full;
+        return (full * lend_from + xcache.slots() - 1) / xcache.slots();
+    };
     // ---- the start-up picks for the settings the user left out (peer-exclusive, resident RAM, pool affinity and
     // size): one pure rule over what this machine and pack have, so a given setting is never replaced.  The pool is
     // built here, with the picks.
@@ -220,7 +226,7 @@ int resident_plan(Context& context) {
         in.complement_peer_excl = in.complement_full - std::min(in.complement_full, peer_expert_room());
         // the RAM copy also holds the free places the adaptive swaps use (see set_spares)
         const uint64_t blob = basalt::kernels::cpu::expert_layout().max_blob;
-        const uint64_t spares_full = adapt_fast_on ? (uint64_t) o.adapt_swaps * kSatBoost * blob : 0;
+        const uint64_t spares_full = adapt_fast_on ? (uint64_t) spare_places(o.adapt_swaps * kSatBoost) * blob : 0;
         const uint64_t spares_excl =
             adapt_fast_on ? (uint64_t) (o.adapt_swaps * kSatBoost + std::max(o.peer_adapt_swaps, o.adapt_swaps)) * blob : 0;
         // the lent slots' copies and the spares are kept as far as RAM allows: they do not decide whether the complement fits
@@ -307,6 +313,7 @@ int resident_plan(Context& context) {
     context.late = &late;
     context.resident_headroom_base = &resident_headroom_base;
     context.lend_from = &lend_from;
+    context.spare_places = spare_places;
     context.stage_held = &stage_held;
     context.pool = &pool;
     context.peer_only = &peer_only;
