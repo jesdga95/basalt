@@ -1,4 +1,4 @@
-// src/kernels/cuda/head_proxy.cuh - the 2-bit copy of a draft head's rows (n_in 2560) that the Q5_K and Q6_K heads
+// src/models/qwen4exp/kernels/head_proxy.cuh - the 2-bit copy of a draft head's rows (n_in 2560) that the Q5_K and Q6_K heads
 // share: its layout, the fit and packing of one 32-weight group, the approximate scoring pass, and the pick among the rows the
 // head's own kernel rescored exactly.  Each including file gets its own copy of these kernels.
 #pragma once

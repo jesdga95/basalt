@@ -1,12 +1,12 @@
-// src/kernels/cuda/q5k_head.cu - see include/basalt/kernels/q5k_head.hpp.
+// src/models/qwen4exp/kernels/q5k_head.cu - see include/basalt/models/qwen4exp/kernels/q5k_head.hpp.
 //
 // Built with --use_fast_math like native_mmvq.cu, whose Q5_K x q8_1 dot this repeats.
-#include "basalt/kernels/q5k_head.hpp"
+#include "basalt/models/qwen4exp/kernels/q5k_head.hpp"
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/kernels/packed_byte.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "head_proxy.cuh"
-#include "smem_opt_in.cuh"
+#include "../../../kernels/cuda/smem_opt_in.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

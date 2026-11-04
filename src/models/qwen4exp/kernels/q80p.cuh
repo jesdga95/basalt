@@ -1,4 +1,4 @@
-// src/kernels/cuda/q80p.cuh - the bit-plane layout of a Q8_0 head row (include/basalt/kernels/q80_vhead.hpp).
+// src/models/qwen4exp/kernels/q80p.cuh - the bit-plane layout of a Q8_0 head row (include/basalt/kernels/q80_vhead.hpp).
 //
 // A row of 80 blocks (n_in 2560) keeps its 2720 bytes: the 80 fp16 scales, then per block 16 bytes of bits 2..5 of
 // u = q + 128 (word p, quarter p of the block: byte j holds the nibbles of values 8p + j and 8p + 4 + j), 8 bytes of
