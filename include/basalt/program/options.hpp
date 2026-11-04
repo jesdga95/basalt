@@ -200,6 +200,7 @@ struct Options {
     std::string diag_mmproj;               ///< --diag-mmproj: image projector file instead of the pack's vision section
     int diag_tier_ram = -1, diag_tier_vram = -1;   ///< --diag-tier-ram / --diag-tier-vram: fixed expert-tier sizes
     std::string diag_dspark;               ///< --diag-dspark: drafter GGUF run on the second GPU beside decode
+    bool diag_serial_prompt = false;       ///< --diag-serial-prompt: an adapter model reads its prompt one decode step at a time
     std::vector<std::string> images;       ///< --image FILE ... with --image-at N: the picture's block goes before token N
     std::vector<int64_t> image_at;
     int64_t image_pad_id = -1;             ///< --image-pad-id: the prompt token that stands for a picture's rows (--serve)

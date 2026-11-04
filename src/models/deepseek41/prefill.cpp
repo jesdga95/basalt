@@ -197,7 +197,7 @@ private:
                 const int in = n_cols * 256;
                 for (int t0 = 0; t0 < T; t0 += 8) {
                     const int nc = std::min(8, T - t0);
-                    kernels::native_q6_k_f32(kvw->ptr, rows_all_ + (size_t) t0 * in, q8_, kv_dev_ + (size_t) t0 * 5 * n, in,
+                    dense_f32(*kvw, rows_all_ + (size_t) t0 * in, q8_, kv_dev_ + (size_t) t0 * 5 * n, in,
                                              (int) (5 * n), nc, st);
                 }
                 EngramArgs ea;

@@ -3,6 +3,7 @@
 #include "models/deepseek41/model.hpp"
 
 #include "basalt/artifact/dequant.hpp"
+#include "basalt/ggml/ggml.h"
 #include "basalt/platform/file.hpp"
 #include "models/deepseek41/context_policy.hpp"
 #include "models/deepseek41/session.hpp"
@@ -48,6 +49,7 @@ bool DsModel::load(const std::string& path, std::string& err) {
 
     // dense tensors to the device; the token embedding and the Engram table stay in the file
     std::vector<uint8_t> staging;
+    std::vector<float> wide;
     uint64_t total = 0;
     for (const auto& [name, t] : pack_.tensors) {
         if (name == "token_embd.weight" || name == "per_layer_token_embd.weight") continue;
@@ -55,7 +57,13 @@ bool DsModel::load(const std::string& path, std::string& err) {
         d.type = t.type;
         d.bytes = t.bytes;
         d.shape = t.shape;
-        if (cudaMalloc(&d.ptr, t.bytes) != cudaSuccess) {
+        // the router reads its gate as F32; BF16 widens exactly (the compressor and indexer kernels read BF16)
+        const bool widen = t.type == 30 && name.find("ffn_gate_inp.weight") != std::string::npos;
+        if (widen) {
+            d.type = 0;
+            d.bytes = t.bytes * 2;
+        }
+        if (cudaMalloc(&d.ptr, d.bytes) != cudaSuccess) {
             err = "out of device memory loading " + name;
             return false;
         }
@@ -68,13 +76,18 @@ bool DsModel::load(const std::string& path, std::string& err) {
                 cudaFree(d.ptr);
                 return false;
             }
-            if (cudaMemcpy((char*) d.ptr + off, staging.data(), n, cudaMemcpyHostToDevice) != cudaSuccess) {
+            if (widen) {
+                wide.resize((size_t) n / 2);
+                dequantize_bf16(staging.data(), wide.data(), (int) (n / 2));
+            }
+            if (cudaMemcpy((char*) d.ptr + off * (widen ? 2 : 1), widen ? (const void*) wide.data() : staging.data(),
+                           widen ? n * 2 : n, cudaMemcpyHostToDevice) != cudaSuccess) {
                 err = "upload of " + name + " failed";
                 cudaFree(d.ptr);
                 return false;
             }
         }
-        total += t.bytes;
+        total += d.bytes;
         dev_.emplace(name, std::move(d));
     }
     basalt::log::info("basalt deepseek41", "%zu dense tensors, %.2f GiB on the GPU", dev_.size(),
@@ -120,8 +133,8 @@ const DevTensor* DsModel::tensor(const std::string& name) const {
 
 bool DsModel::embedding_row(int32_t token, float* out, std::string& err) const {
     const TensorRef* t = pack_.find("token_embd.weight");
-    if (!t || (t->type != 14 && t->type != 8) || t->shape.size() != 2) {
-        err = "token_embd.weight is missing or not Q6_K or Q8_0";
+    if (!t || (t->type != 14 && t->type != 13 && t->type != 8) || t->shape.size() != 2) {
+        err = "token_embd.weight is missing or not Q5_K, Q6_K or Q8_0";
         return false;
     }
     const uint64_t n_embd = t->shape[0];
@@ -130,7 +143,8 @@ bool DsModel::embedding_row(int32_t token, float* out, std::string& err) const {
         return false;
     }
     const bool q8 = t->type == 8;
-    const uint64_t row_bytes = q8 ? n_embd / 32 * 34 : n_embd / 256 * 210;
+    const uint64_t q5_block = 176;
+    const uint64_t row_bytes = q8 ? n_embd / 32 * 34 : n_embd / 256 * (t->type == 13 ? q5_block : 210);
     std::vector<uint8_t> row(row_bytes);
     if (!platform::pread_all(embd_fd_, row.data(), row_bytes, t->offset + (uint64_t) token * row_bytes)) {
         err = "cannot read the embedding row";
@@ -138,6 +152,8 @@ bool DsModel::embedding_row(int32_t token, float* out, std::string& err) const {
     }
     if (q8) {
         for (uint64_t b = 0; b < n_embd / 32; ++b) dequantize_q8_0(row.data() + b * 34, out + b * 32);
+    } else if (t->type == 13) {
+        for (uint64_t b = 0; b < n_embd / 256; ++b) dequantize_q5_K(row.data() + b * q5_block, out + b * 256);
     } else {
         for (uint64_t b = 0; b < n_embd / 256; ++b) dequantize_q6_K(row.data() + b * 210, out + b * 256);
     }
