@@ -128,7 +128,7 @@ public:
                 }
                 // the caches take their memory before the prompt workspaces do
                 if (!ops_->ensure_positions(r.pos + r.n_tokens, err)) return prompt_failed(err);
-                if (!prefill_ && !make_prefill_fit(err)) {
+                if (!prefill_ && !make_prefill_fit(r.n_tokens, err)) {
                     // a long context's caches left no room: a short tail takes the decode path, a longer read the tier's memory
                     if (r.n_tokens <= kStepTailTokens) {
                         close_prompt_path();
@@ -139,7 +139,7 @@ public:
                     std::string te;
                     err.clear();
                     if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
-                    if (!make_prefill_fit(err)) return prompt_failed(err);
+                    if (!make_prefill_fit(r.n_tokens, err)) return prompt_failed(err);
                 }
                 prefill_->progress = r.progress;
                 prefill_->live = r.live;
@@ -207,11 +207,11 @@ public:
         std::string err;
         open_prompt_path(n_rows);
         if (!ops_->ensure_positions(pos + n_rows, err)) return prompt_failed(err);
-        if (!prefill_ && !make_prefill_fit(err)) {
+        if (!prefill_ && !make_prefill_fit(n_rows, err)) {
             std::string te;
             err.clear();
             if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
-            if (!make_prefill_fit(err)) return prompt_failed(err);
+            if (!make_prefill_fit(n_rows, err)) return prompt_failed(err);
         }
         if (!prefill_->run_embeddings(rows, n_rows, pos, hist_, err)) return prompt_failed(err);
         close_prompt_path();
@@ -224,14 +224,14 @@ private:
     // which it gives back before the next prompt allocates them again.
     // The prompt workspaces for the largest chunk the free memory carries (a long context's caches have taken part of
     // the card). The estimate picks the first size to try, and the free memory left after the allocation confirms it.
-    bool make_prefill_fit(std::string& err) {
+    bool make_prefill_fit(int tokens, std::string& err) {
         const prefillp::Dims d = m_.prompt_dims();
         size_t free_b = 0, total_b = 0;
         if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
             err = "deepseek41: cannot read the free device memory";
             return false;
         }
-        const prefillp::Fit fit = prefillp::plan_chunk(d, free_b, prefillp::kMargin);
+        const prefillp::Fit fit = prefillp::plan_chunk(d, free_b, prefillp::kMargin, tokens);
         if (!fit.chunk) {
             err = "deepseek41: " + fit.error;
             return false;
@@ -239,7 +239,8 @@ private:
         for (int cap = fit.chunk; cap >= prefillp::kMinChunk; cap /= 2) {
             std::string e;
             prefill_ = make_prefill(m_, *ops_, stream_, cap, e);
-            if (prefill_ && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= prefillp::kMargin) {
+            const uint64_t after = prefillp::chunk_bytes(d, cap, tokens) - prefillp::workspace_bytes(d, cap) + prefillp::kMargin;
+            if (prefill_ && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= after) {
                 cudaGetLastError();   // a larger size that did not fit left its error behind
                 return true;
             }

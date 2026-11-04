@@ -23,23 +23,36 @@ int main() {
     CHECK(per_token_bytes(d) > 0 && fixed_bytes(d) > 0);
     CHECK(workspace_bytes(d, 2048) - workspace_bytes(d, 1024) == per_token_bytes(d) * 1024);
 
+    constexpr int kLong = 1 << 20;   // tokens of a prompt longer than any chunk
     // plenty of memory: the full chunk
-    Fit f = plan_chunk(d, 24 * GiB, kMargin);
+    Fit f = plan_chunk(d, 24 * GiB, kMargin, kLong);
     CHECK(f.chunk == kMaxChunk && f.error.empty());
-    // less memory: a smaller power-of-two fraction whose workspaces and margin fit
-    const uint64_t w4096 = workspace_bytes(d, 4096) + kMargin;
-    f = plan_chunk(d, w4096, kMargin);
+    // less memory: a smaller power-of-two fraction whose workspaces, staged groups and margin fit
+    const uint64_t w4096 = chunk_bytes(d, 4096, kLong) + kMargin;
+    f = plan_chunk(d, w4096, kMargin, kLong);
     CHECK(f.chunk == 4096);
-    f = plan_chunk(d, w4096 - 1, kMargin);
+    f = plan_chunk(d, w4096 - 1, kMargin, kLong);
     CHECK(f.chunk == 2048);
     // never below the least chunk, with a message naming the memory
-    f = plan_chunk(d, 1 * GiB, kMargin);
+    f = plan_chunk(d, 1 * GiB, kMargin, kLong);
     CHECK(f.chunk == 0 && f.error.find("not enough free device memory") != std::string::npos);
-    f = plan_chunk(d, 0, 0);
+    f = plan_chunk(d, 0, 0, kLong);
     CHECK(f.chunk == 0 && !f.error.empty());
     // an explicit range
-    f = plan_chunk(d, 24 * GiB, kMargin, 1024, 512);
+    f = plan_chunk(d, 24 * GiB, kMargin, kLong, 1024, 512);
     CHECK(f.chunk == 1024);
+    // a prompt a smaller chunk holds takes that one
+    CHECK(plan_chunk(d, 24 * GiB, kMargin, 33).chunk == kMinChunk);
+    CHECK(plan_chunk(d, 24 * GiB, kMargin, 554).chunk == 1024);
+    CHECK(plan_chunk(d, 24 * GiB, kMargin, kMaxChunk / 2).chunk == kMaxChunk / 2);
+    CHECK(plan_chunk(d, 24 * GiB, kMargin, kMaxChunk / 2 + 1).chunk == kMaxChunk);
+    // the staged groups count from the pairs a chunk of this prompt holds
+    CHECK(chunk_bytes(d, 1024, 554) == workspace_bytes(d, 1024));
+    CHECK(chunk_bytes(d, 1024, 5000) == workspace_bytes(d, 1024) + ahead_bytes(d));
+    // a chunk that fits only without its staged groups does not fit
+    const int64_t pairs_chunk = (kAheadPairs + d.n_used - 1) / d.n_used;
+    CHECK(chunk_bytes(d, (int) pairs_chunk, kLong) == workspace_bytes(d, (int) pairs_chunk) + ahead_bytes(d));
+    CHECK(plan_chunk(d, workspace_bytes(d, 8192) + kMargin, kMargin, kLong).chunk < 8192);
 
     // give-back: a short context keeps what it has; a long one drops to the kept positions
     const std::vector<int> ratios = {2, 2, 2, 1};
