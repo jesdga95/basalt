@@ -943,6 +943,13 @@ bool FileExpertSource::pin_cache_complement(
     // a short prompt lends only the last few).  The rest keep the mapped-file fallback.
     int64_t keep_from = n_slots;
     if (lend) {
+        // When every slot's expert fits here without the free places and no expert is held only by a GPU, every
+        // eviction finds its expert's copy already here: the places would never be taken, so none are made.
+        if (spare_bytes > 0 && additional_gpu_pairs.empty() &&
+            detail::choose_resident_keep_from(slot_bytes, bytes, budget, lend_from_slot) == 0) {
+            spare_sizes.clear();
+            spare_bytes = 0;
+        }
         bool spares_fit = false;
         keep_from = detail::choose_resident_room(slot_bytes, bytes, budget, lend_from_slot, spare_bytes, spares_fit);
         if (keep_from < 0) keep_from = n_slots;
