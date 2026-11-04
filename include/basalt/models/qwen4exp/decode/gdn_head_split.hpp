@@ -1,5 +1,5 @@
 #pragma once
-// include/basalt/core/gdn_head_split.hpp - the GDN mixer split by key-head group: the rows, columns and state a card
+// include/basalt/models/qwen4exp/decode/gdn_head_split.hpp - the GDN mixer split by key-head group: the rows, columns and state a card
 // holds when it owns key heads [k0, k0 + nk) of a GDN layer.
 //
 // Value head v reads key head v % h_k, so the card's value heads are the runs [j * h_k + k0, j * h_k + k0 + nk) for

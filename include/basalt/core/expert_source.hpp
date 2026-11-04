@@ -10,7 +10,7 @@
 //      cached by pointer - a cache keyed on `x_f` would quantize layer 0 and reuse it for all the remaining
 //      layers, which is a finite, plausible, completely wrong token.  There is no cache here at all: the
 //      conversion is one 2560-element pass, and a correct answer is worth more than the microseconds.
-//   2. **THE POOL DOES NOT APPLY THE ROUTER WEIGHT.**  `moe_combine` (`src/core/layer.cpp`) sums
+//   2. **THE POOL DOES NOT APPLY THE ROUTER WEIGHT.**  `moe_combine` (`src/models/qwen4exp/decode/layer.cpp`) sums
 //      `w[i] * parts[i]` on the device.  `ExpertJob::weight` is a diagnostic field; setting it here would
 //      apply the weight twice, which is invisible in a single layer and compounds over 48.
 //   3. **THE KERNEL'S GEOMETRY IS FIXED BY THE ARTIFACT** (`H = 2560`, `FF = 640`, `BLOB = 1,382,400`).  A

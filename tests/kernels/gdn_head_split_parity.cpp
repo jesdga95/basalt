@@ -18,7 +18,7 @@
 // --bench: per card, the whole layer and each share's slice as CUDA graphs over eight layers' distinct weights, in
 // microseconds per layer.
 #include "basalt/artifact/dequant.hpp"
-#include "basalt/core/gdn_head_split.hpp"
+#include "basalt/models/qwen4exp/decode/gdn_head_split.hpp"
 #include "basalt/kernels/dec_gdn.hpp"
 #include "basalt/kernels/dec_moe.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
