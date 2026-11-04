@@ -940,6 +940,28 @@
       "prefill_16k_tps": 8824.2,
       "prefill_64k_tps": 9408.5,
       "decode_tps": 927.4
+    },
+    {
+      "submitter": "polygizer",
+      "date": "2026-11-05",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 575,
+          "pcie": "5.0 x16"
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen 7 9700X, 8 cores",
+      "ram_gbps": 64.5,
+      "os": "Windows",
+      "quant": "Q5_K_XL",
+      "prefill_16k_tps": 6788.8,
+      "prefill_64k_tps": 8215.2,
+      "decode_tps": 162.4
     }
   ]
 }
