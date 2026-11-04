@@ -19,6 +19,9 @@
 namespace basalt {
 class GgufFile;
 }
+namespace basalt::core {
+struct ConversationKv;
+}
 namespace basalt::program {
 struct CommonOptions;
 struct GpuCard;
@@ -129,10 +132,12 @@ public:
     virtual size_t running_bytes() const { return 0; }
     virtual Result save_running(uint8_t* host, int64_t pos) { (void) host; (void) pos; return {Status::NotImplemented, "this model keeps no checkpoint"}; }
     virtual Result restore_running(const uint8_t* host, int64_t pos) { (void) host; (void) pos; return {Status::NotImplemented, "this model keeps no checkpoint"}; }
-    /// The positional state below `positions` as one block: what a conversation parked out of VRAM takes along.
+    /// The positional state below `positions`, one entry per layer that holds any, in the store's K/V form: a layer's
+    /// `page_size` is the positions behind one of its rows, `cells` its rows times that.  What a conversation parked
+    /// out of VRAM takes along; a store cuts it at any position, so restore takes what a cut left.
     virtual size_t cells_bytes(int64_t positions) const { (void) positions; return 0; }
-    virtual Result save_cells(uint8_t* host, int64_t positions) { (void) host; (void) positions; return {Status::NotImplemented, "this model cannot park a conversation"}; }
-    virtual Result restore_cells(const uint8_t* host, int64_t positions) { (void) host; (void) positions; return {Status::NotImplemented, "this model cannot park a conversation"}; }
+    virtual Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) { (void) kv; (void) positions; return {Status::NotImplemented, "this model keeps no cells"}; }
+    virtual Result restore_cells(const std::vector<core::ConversationKv>& kv, int64_t positions) { (void) kv; (void) positions; return {Status::NotImplemented, "this model keeps no cells"}; }
     /// The tokens the session holds from now on, position by position (a restored conversation's).
     virtual Result set_history(const int32_t* tokens, int64_t n) { (void) tokens; (void) n; return {}; }
     /// What `PROBE rates` measures this model's paths with (after prepare).
