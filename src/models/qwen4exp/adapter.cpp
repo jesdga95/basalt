@@ -72,6 +72,21 @@ public:
         return {{"<|endoftext|>", "<|im_end|>"}, "<|im_start|>", "<|image_pad|>"};
     }
 
+    program::grammar::ToolForm tool_form() const override {
+        program::grammar::ToolForm f;
+        f.call_open = "<tool_call>\n";
+        f.call_close = "\n</tool_call>";
+        f.fn_open = "<function=";
+        f.fn_mid = ">\n";
+        f.fn_close = "</function>";
+        f.param_open = "<parameter=";
+        f.param_mid_text = f.param_mid_value = ">\n";
+        f.param_close = "\n</parameter>\n";
+        f.text_end = "</parameter>";
+        f.trigger = "<tool_call>";
+        return f;
+    }
+
     std::unique_ptr<program::CommonOptions> make_options() const override { return std::make_unique<program::Options>(); }
     bool parse_flag(const std::string& name, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
         return qwen4exp::parse_flag(name, args, static_cast<program::Options&>(o), code);
