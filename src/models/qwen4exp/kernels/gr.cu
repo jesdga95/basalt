@@ -1,6 +1,6 @@
 // src/models/qwen4exp/kernels/gr.cu - the gated residual / hyper-connection, `gr_read` and `gr_write`.
 //
-// See include/basalt/kernels/gr.hpp for the semantics and for why the weights are bf16.
+// See include/basalt/models/qwen4exp/kernels/gr.hpp for the semantics and for why the weights are bf16.
 //
 // `gr_read` is a weighted RMSNorm, the down MMVF, SiLU, the up MMVF, the gate + mean and the inject MMVF; the
 // projections are the BF16 MMVF taking FP32 activations, and the norm, nonlinearity and combine live in
@@ -10,7 +10,7 @@
 // `w_down[k][i]` with i contiguous - the reference's (hc_lr, hc*n_embd) row-major.  `hc_attn_up.weight` is
 // [320, 10240] so it holds `w_up[i][k]` with k contiguous - the reference's (hc*n_embd, hc_lr) row-major.  Both index
 // with no permutation at all.
-#include "basalt/kernels/gr.hpp"
+#include "basalt/models/qwen4exp/kernels/gr.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
 #include "basalt/models/qwen4exp/kernels/native_gr_norm.hpp"

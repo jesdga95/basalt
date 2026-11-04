@@ -1,13 +1,13 @@
 #pragma once
 
 #include "common.hpp"
-#include "basalt/prefill/prefill.hpp"
-#include "basalt/core/mtp.hpp"
+#include "basalt/models/qwen4exp/prefill/prefill.hpp"
+#include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
-#include "basalt/core/layer.hpp"
-#include "basalt/core/native_head.hpp"
-#include "basalt/prefill/gemm.hpp"
+#include "basalt/models/qwen4exp/decode/layer.hpp"
+#include "basalt/models/qwen4exp/decode/native_head.hpp"
+#include "basalt/models/qwen4exp/prefill/gemm.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/models/qwen4exp/prefill/moe_fp4.hpp"
 #include "basalt/core/peer_experts.hpp"

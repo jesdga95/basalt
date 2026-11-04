@@ -12,7 +12,7 @@
 // --bench: each update timed alone and with a burst of expert-sized host-to-device copies queued ahead of it on
 // another stream of the same card.  The span copy goes through the card's copy queue and finishes only after the
 // burst; the kernels do not wait for it.
-#include "basalt/kernels/dec_moe.hpp"
+#include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 
 #include <cuda_runtime.h>
 

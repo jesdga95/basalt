@@ -1,7 +1,7 @@
 #include "run.hpp"
-#include "basalt/prefill/prefill.hpp"
-#include "basalt/core/mtp.hpp"
-#include "basalt/core/layout.hpp"
+#include "basalt/models/qwen4exp/prefill/prefill.hpp"
+#include "basalt/models/qwen4exp/decode/mtp.hpp"
+#include "basalt/models/qwen4exp/decode/layout.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include <algorithm>

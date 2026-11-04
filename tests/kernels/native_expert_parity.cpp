@@ -12,7 +12,7 @@
 // twice, with the kernels that decode a weight part once for all entries and with the per-entry ones: bitwise equal.
 // (d) the GPU dequantizers of the prompt path and the embedding against `to_float` (Q8_0: bit for bit).
 #include "basalt/artifact/gguf_reader.hpp"
-#include "basalt/core/native_head.hpp"
+#include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/iq_avx512.hpp"

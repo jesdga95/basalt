@@ -1,4 +1,4 @@
-// src/models/qwen4exp/kernels/qsa.cu - the QSA cache, indexer and attention (see include/basalt/kernels/qsa.hpp).
+// src/models/qwen4exp/kernels/qsa.cu - the QSA cache, indexer and attention (see include/basalt/models/qwen4exp/kernels/qsa.hpp).
 //
 // The header documents the layouts and the scope; this file documents the four decisions that are about the
 // KERNEL rather than about the interface.
@@ -40,12 +40,12 @@
 //    Every comparison still passed at any sane tolerance, the spare key landing 0.4 f32 ulp away; only a
 //    BIT-EXACT assertion plus a full-precision probe of the intermediate found it.  That is the strongest
 //    argument in this file for keeping both.
-#include "basalt/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
 
 #include "basalt/kernels/f16_bits.hpp"
-#include "basalt/kernels/kv_stream.hpp"
-#include "basalt/kernels/rope.hpp"
-#include "basalt/kernels/mrope.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_stream.hpp"
+#include "basalt/models/qwen4exp/kernels/rope.hpp"
+#include "basalt/models/qwen4exp/kernels/mrope.hpp"
 
 #include <cuda_runtime.h>
 

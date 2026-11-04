@@ -4,7 +4,7 @@
 #define FZ_DEV_ONLY
 #include "dense_tc.cu"
 #include "basalt/models/qwen4exp/kernels/qsa_mid.hpp"
-#include "../../../kernels/cuda/smem_opt_in.cuh"
+#include "smem_opt_in.cuh"
 
 #include <atomic>
 #include <cstdint>

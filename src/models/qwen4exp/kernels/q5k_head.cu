@@ -6,7 +6,7 @@
 #include "basalt/kernels/packed_byte.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "head_proxy.cuh"
-#include "../../../kernels/cuda/smem_opt_in.cuh"
+#include "smem_opt_in.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

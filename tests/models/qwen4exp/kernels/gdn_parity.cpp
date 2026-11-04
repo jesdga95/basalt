@@ -18,7 +18,7 @@
 // It also checks the STATE LAYOUT, which is the one place these kernels intentionally differ from the
 // reference: (S, h_v, S) with j fastest instead of (S, S, h_v).  A layout mix-up is silent, so the state is
 // filled with a value that encodes its own coordinates.
-#include "basalt/kernels/gdn.hpp"
+#include "basalt/models/qwen4exp/kernels/gdn.hpp"
 
 #include <cuda_runtime.h>
 

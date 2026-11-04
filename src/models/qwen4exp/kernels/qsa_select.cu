@@ -2,7 +2,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "basalt/models/qwen4exp/kernels/qsa_select.hpp"
-#include "basalt/kernels/qsa_seg.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_seg.hpp"
 #include "basalt/kernels/pdl.hpp"
 
 #include <cuda_runtime.h>

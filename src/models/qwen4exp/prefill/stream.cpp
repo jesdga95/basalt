@@ -1,10 +1,10 @@
 #include "run.hpp"
-#include "basalt/prefill/prefill.hpp"
-#include "basalt/core/mtp.hpp"
+#include "basalt/models/qwen4exp/prefill/prefill.hpp"
+#include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
-#include "basalt/core/native_head.hpp"
+#include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>

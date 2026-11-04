@@ -10,12 +10,12 @@
 // expert on a side stream -> dec_moe_wait -> dec_moe_combine.  pk: hc_fused_read -> pk_moe_experts with the shared
 // expert on the side stream and its end flagged to the experts kernel.
 #include "basalt/core/diag.hpp"
-#include "basalt/kernels/dec_moe.hpp"
-#include "basalt/kernels/hc_fused.hpp"
+#include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
+#include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/pdl.hpp"
-#include "basalt/kernels/pk_moe.hpp"
-#include "basalt/kernels/shared_expert.hpp"
+#include "basalt/models/qwen4exp/kernels/pk_moe.hpp"
+#include "basalt/models/qwen4exp/kernels/shared_expert.hpp"
 
 #include <cuda_runtime.h>
 

@@ -18,9 +18,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "basalt/kernels/native_qsa_indexer.hpp"
-#include "basalt/kernels/qsa_seg.hpp"
-#include "basalt/kernels/mrope.hpp"
+#include "basalt/models/qwen4exp/kernels/native_qsa_indexer.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_seg.hpp"
+#include "basalt/models/qwen4exp/kernels/mrope.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cmath>

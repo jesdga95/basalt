@@ -12,9 +12,9 @@
 //
 //     build/hc8_parity [--bench]
 #include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
-#include "basalt/kernels/gr.hpp"
-#include "basalt/kernels/hc_fused.hpp"
-#include "basalt/prefill/gemm.hpp"
+#include "basalt/models/qwen4exp/kernels/gr.hpp"
+#include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
+#include "basalt/models/qwen4exp/prefill/gemm.hpp"
 
 #include <cuda_runtime.h>
 

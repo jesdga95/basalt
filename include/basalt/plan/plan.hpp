@@ -32,7 +32,7 @@ struct Geometry {
     /// `indexer.q_proj.weight` is [2560, 512] = **4 QUERY heads** of 128.  `indexer.k_proj.weight` is
     /// [2560, 128] = **ONE shared KEY head**.  The queries are not cached; only the key is.  So the cache
     /// holds one 128-wide key per TOKEN, pooled to one per `qsa_block`-token block - which
-    /// `include/basalt/kernels/qsa.hpp` states directly: `pooled (max_cells/idx_block + 1, idx_dim)`, and
+    /// `include/basalt/models/qwen4exp/kernels/qsa.hpp` states directly: `pooled (max_cells/idx_block + 1, idx_dim)`, and
     /// its own note that the fp32 store is "50 MiB at 32K" (12 layers x 8192 blocks x 128 x 4 B = 48 MiB).
     ///
     ///   original      indexer_heads(1) * head_dim(256) / 4  = 64 B/token/layer   2x too big

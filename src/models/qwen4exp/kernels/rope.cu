@@ -24,8 +24,8 @@
 // `freq_scale`; YaRN blends extrapolation and interpolation along the pairs (ggml's `rope_yarn`) and folds
 // the mscale magnitude correction into the same cos/sin values.  All of it float64, in the reference's
 // order, so `rope_parity` can hold every variant to a bit-exact float64 transcription of the same spec.
-#include "basalt/kernels/rope.hpp"
-#include "basalt/kernels/mrope.hpp"
+#include "basalt/models/qwen4exp/kernels/rope.hpp"
+#include "basalt/models/qwen4exp/kernels/mrope.hpp"
 
 #include <cuda_runtime.h>
 

@@ -1,5 +1,5 @@
 #include "common.hpp"
-#include "basalt/kernels/q80_vhead.hpp"
+#include "basalt/models/qwen4exp/kernels/q80_vhead.hpp"
 
 namespace basalt::core {
 

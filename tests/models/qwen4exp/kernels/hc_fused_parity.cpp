@@ -12,11 +12,11 @@
 #include "basalt/core/diag.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
-#include "basalt/kernels/hc_fused.hpp"
+#include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
-#include "basalt/kernels/native_router.hpp"
+#include "basalt/models/qwen4exp/kernels/native_router.hpp"
 #include "basalt/kernels/pdl.hpp"
-#include "basalt/kernels/shared_expert.hpp"
+#include "basalt/models/qwen4exp/kernels/shared_expert.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

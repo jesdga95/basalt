@@ -8,9 +8,9 @@
 #include "dense_tc.cu"
 #undef smem
 #define div_approx_ftz div_approx_ftz_rec
-#include "../../../kernels/cuda/dec_gdn_rec.cu"
+#include "dec_gdn_rec.cu"
 #undef div_approx_ftz
-#include "basalt/kernels/hc_fused.hpp"
+#include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 #include "basalt/models/qwen4exp/kernels/mid_chain.hpp"
 
 #include <cstdio>

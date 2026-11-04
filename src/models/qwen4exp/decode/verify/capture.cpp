@@ -1,6 +1,6 @@
 #include "common.hpp"
 #include "basalt/core/load_progress.hpp"
-#include "basalt/core/verify.hpp"
+#include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include <algorithm>
 #include <cmath>

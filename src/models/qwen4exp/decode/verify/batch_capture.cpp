@@ -1,12 +1,12 @@
 #include "common.hpp"
 #include "basalt/core/load_progress.hpp"
-#include "basalt/core/verify.hpp"
+#include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/kernels/elementwise.hpp"
-#include "basalt/kernels/native_qsa_indexer.hpp"
+#include "basalt/models/qwen4exp/kernels/native_qsa_indexer.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/ngram.hpp"
-#include "basalt/kernels/qsa.hpp"
-#include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 #include <cmath>
 #include <exception>
 #include <string>

@@ -1,7 +1,7 @@
-// src/models/qwen4exp/prefill/gemm.cu - see include/basalt/prefill/gemm.hpp.
-#include "basalt/prefill/gemm.hpp"
+// src/models/qwen4exp/prefill/gemm.cu - see include/basalt/models/qwen4exp/prefill/gemm.hpp.
+#include "basalt/models/qwen4exp/prefill/gemm.hpp"
 #include "basalt/kernels/dequant_bf16.hpp"
-#include "basalt/kernels/hc_fused.hpp"
+#include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>

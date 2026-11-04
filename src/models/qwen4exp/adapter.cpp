@@ -3,8 +3,8 @@
 #include "models/qwen4exp/adapter.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
-#include "basalt/core/layout.hpp"
-#include "basalt/kernels/dec_moe.hpp"
+#include "basalt/models/qwen4exp/decode/layout.hpp"
+#include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "unicode_flags.hpp"
 #include "basalt/program/options.hpp"
 

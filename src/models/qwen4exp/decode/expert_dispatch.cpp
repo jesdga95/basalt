@@ -10,7 +10,7 @@
 #include "basalt/platform/system.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/quantize_act.hpp"
-#include "basalt/kernels/s2_expert_grouped.hpp"
+#include "basalt/models/qwen4exp/kernels/s2_expert_grouped.hpp"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <atomic>

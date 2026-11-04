@@ -13,12 +13,12 @@
 // partials are reduced through shuffle; the CPU walks every chunk in order with its own accumulator shape.
 // The two agree to float rounding and not to the bit, which is the same contract `s_gemv_parity` carries for
 // the same reason.  `moe_hit_parity` is the check.
-#include "basalt/kernels/s2_expert_grouped.hpp"
+#include "basalt/models/qwen4exp/kernels/s2_expert_grouped.hpp"
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/kernels/packed_byte.hpp"
 
 #include "basalt/kernels/quantize_act.hpp"
-#include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

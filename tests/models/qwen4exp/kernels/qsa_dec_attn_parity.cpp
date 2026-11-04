@@ -2,10 +2,10 @@
 // on random INT8 and FP16 pools through a permuted page table with masked pages; then a microbench of both.
 //   qsa_dec_attn_parity [iters]
 #include "basalt/kernels/native_mmvq.hpp"
-#include "basalt/kernels/native_qsa.hpp"
-#include "basalt/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/native_qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_dec_attn.hpp"
-#include "basalt/kernels/qsa_decode_attn.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_decode_attn.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

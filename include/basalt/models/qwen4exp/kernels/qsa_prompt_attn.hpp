@@ -21,7 +21,7 @@
 // exactly as int8 and its scale (one per 32 values) in FP32, as int8 KV's do (PROMPT_ATTN_Q4=0: the old kernel).
 #pragma once
 
-#include "basalt/kernels/qsa_decode_attn.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_decode_attn.hpp"
 
 #include <cstdint>
 

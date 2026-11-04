@@ -14,9 +14,9 @@
 // it ends only after the release.  Held for less than the wait bound (MKB_NS) it has the bits of a free launch; held
 // longer, its waits give up at the bound and set the abort word (wait_abort.hpp) instead of trapping, the resident CTAs
 // leave, the last one runs on an SM they free, the launch ends cleanly, and the next launch is bitwise again.  The mid_chain_hold build has a short bound for this.
-#include "basalt/kernels/dec_gdn.hpp"
+#include "basalt/models/qwen4exp/kernels/dec_gdn.hpp"
 #include "basalt/models/qwen4exp/kernels/dense_tc.hpp"
-#include "basalt/kernels/hc_fused.hpp"
+#include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 #include "basalt/models/qwen4exp/kernels/mid_chain.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/wait_abort.hpp"

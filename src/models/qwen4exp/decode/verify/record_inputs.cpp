@@ -1,11 +1,11 @@
 #include "common.hpp"
 #include "record.hpp"
 #include "expert_plan.hpp"
-#include "basalt/core/verify.hpp"
-#include "basalt/core/native_head.hpp"
+#include "basalt/models/qwen4exp/decode/verify.hpp"
+#include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/elementwise.hpp"
-#include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>
 #include <exception>

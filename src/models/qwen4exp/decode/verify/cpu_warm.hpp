@@ -1,8 +1,8 @@
 #pragma once
 
 #include "common.hpp"
-#include "basalt/core/verify.hpp"
-#include "basalt/core/native_head.hpp"
+#include "basalt/models/qwen4exp/decode/verify.hpp"
+#include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include <atomic>

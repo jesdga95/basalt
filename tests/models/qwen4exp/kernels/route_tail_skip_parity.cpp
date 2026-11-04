@@ -11,7 +11,7 @@
 // --bench: one launch of the window kernel at the largest window, timed over many launches.
 #include <cstddef>
 
-#include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 

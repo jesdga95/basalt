@@ -5,8 +5,8 @@
 #include "basalt/models/qwen4exp/kernels/native_gr_postops.hpp"
 #include "basalt/models/qwen4exp/kernels/native_ple_postops.hpp"
 #include "basalt/kernels/ngram.hpp"
-#include "basalt/kernels/ple.hpp"
-#include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/models/qwen4exp/kernels/ple.hpp"
+#include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

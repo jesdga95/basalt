@@ -3,14 +3,14 @@
 // for windows of 1..8 rows at every block phase; then a microbench of both forms.
 //   qsa_dec_fused_parity [iters]
 #include "basalt/kernels/elementwise.hpp"
-#include "basalt/kernels/kv_q8.hpp"
-#include "basalt/kernels/kv_stream.hpp"
-#include "basalt/kernels/native_qsa.hpp"
-#include "basalt/kernels/native_qsa_indexer.hpp"
-#include "basalt/kernels/native_rope.hpp"
-#include "basalt/kernels/qsa.hpp"
-#include "basalt/kernels/qsa_dec_fused.hpp"
-#include "basalt/kernels/rope_scaling.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q8.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_stream.hpp"
+#include "basalt/models/qwen4exp/kernels/native_qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/native_qsa_indexer.hpp"
+#include "basalt/models/qwen4exp/kernels/native_rope.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_dec_fused.hpp"
+#include "basalt/models/qwen4exp/kernels/rope_scaling.hpp"
 
 #include <cuda_runtime.h>
 

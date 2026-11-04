@@ -1,9 +1,9 @@
 #include "common.hpp"
 #include "expert_plan.hpp"
 #include "basalt/core/load_progress.hpp"
-#include "basalt/core/verify.hpp"
+#include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/core/diag.hpp"
-#include "basalt/core/native_head.hpp"
+#include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/models/qwen4exp/decode/gdn_head_split.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/platform/compiler.hpp"
@@ -13,8 +13,8 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/core/progress.hpp"
-#include "basalt/kernels/verify_kernels.hpp"
-#include "basalt/kernels/dec_moe.hpp"
+#include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
+#include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>
 #include <cmath>

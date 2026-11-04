@@ -24,8 +24,8 @@
 // Check 5 holds the TWO PATHS together: the table path's float64 host trig and the native path's float32
 // fast-math device trig must answer to the same `RopeScaling`, yarn and none alike, so one cache never
 // mixes two rotations.
-#include "basalt/kernels/rope.hpp"
-#include "basalt/kernels/native_rope.hpp"
+#include "basalt/models/qwen4exp/kernels/rope.hpp"
+#include "basalt/models/qwen4exp/kernels/native_rope.hpp"
 
 #include <cuda_runtime.h>
 

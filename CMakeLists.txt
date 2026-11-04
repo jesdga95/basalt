@@ -132,52 +132,52 @@ target_include_directories(model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(model PUBLIC artifact warnings)
 
 add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwen4exp/flags.cpp
-  src/program/engine_local.cpp
-  src/program/probe_rates.cpp
-  src/program/generate/helpers.cpp
-  src/program/generate/model.cpp
-  src/program/generate/layer_plan.cpp
-  src/program/generate/weights.cpp
-  src/program/generate/vision.cpp
-  src/program/generate/sessions.cpp
-  src/program/generate/sources.cpp
-  src/program/generate/cache_size.cpp
-  src/program/generate/cache_fill.cpp
-  src/program/generate/token_path.cpp
-  src/program/generate/resident_plan.cpp
-  src/program/generate/resident_load.cpp
-  src/program/generate/prompt_split.cpp
-  src/program/generate/dispatch.cpp
-  src/program/generate/prefill.cpp
-  src/program/generate/decode.cpp
-  src/program/serve/batch.cpp
-  src/program/serve/batch_pipeline.cpp
-  src/program/serve/qfn_commands.cpp
-  src/program/serve/qfn_restore.cpp
-  src/program/serve/qfn_image.cpp
-  src/program/serve/qfn_prompt.cpp
-  src/program/serve/qfn_finish.cpp
-  src/program/serve/conversation.cpp
-  src/program/serve/kv.cpp
-  src/program/serve/loans.cpp
-  src/program/serve/loan_moves.cpp
-  src/program/serve/memory.cpp
-  src/program/serve/prompt.cpp
-  src/program/serve/prompt_read.cpp
-  src/program/serve/prompt_split.cpp
-  src/program/serve/prompt_windows.cpp
-  src/program/serve/qfn_decode.cpp
-  src/program/serve/slots.cpp
-  src/program/serve/tier_profile.cpp
-  src/program/serve/tiers.cpp
-  src/program/serve/verify.cpp
-  src/program/serve/vision.cpp
-  src/program/measure/gpu_modes.cpp
-  src/program/measure/dump_set.cpp
-  src/program/cli/options.cpp
-  src/program/cli/control_vectors.cpp
-  src/program/cli/report.cpp
-  src/program/generate/qfn_run.cpp)
+  src/models/qwen4exp/load/engine_local.cpp
+  src/models/qwen4exp/serve/probe_rates.cpp
+  src/models/qwen4exp/load/helpers.cpp
+  src/models/qwen4exp/load/model.cpp
+  src/models/qwen4exp/load/layer_plan.cpp
+  src/models/qwen4exp/load/weights.cpp
+  src/models/qwen4exp/load/vision.cpp
+  src/models/qwen4exp/load/sessions.cpp
+  src/models/qwen4exp/load/sources.cpp
+  src/models/qwen4exp/load/cache_size.cpp
+  src/models/qwen4exp/load/cache_fill.cpp
+  src/models/qwen4exp/load/token_path.cpp
+  src/models/qwen4exp/load/resident_plan.cpp
+  src/models/qwen4exp/load/resident_load.cpp
+  src/models/qwen4exp/load/prompt_split.cpp
+  src/models/qwen4exp/load/dispatch.cpp
+  src/models/qwen4exp/load/prefill.cpp
+  src/models/qwen4exp/load/decode.cpp
+  src/models/qwen4exp/serve/batch.cpp
+  src/models/qwen4exp/serve/batch_pipeline.cpp
+  src/models/qwen4exp/serve/qfn_commands.cpp
+  src/models/qwen4exp/serve/qfn_restore.cpp
+  src/models/qwen4exp/serve/qfn_image.cpp
+  src/models/qwen4exp/serve/qfn_prompt.cpp
+  src/models/qwen4exp/serve/qfn_finish.cpp
+  src/models/qwen4exp/serve/conversation.cpp
+  src/models/qwen4exp/serve/kv.cpp
+  src/models/qwen4exp/serve/loans.cpp
+  src/models/qwen4exp/serve/loan_moves.cpp
+  src/models/qwen4exp/serve/memory.cpp
+  src/models/qwen4exp/serve/prompt.cpp
+  src/models/qwen4exp/serve/prompt_read.cpp
+  src/models/qwen4exp/serve/prompt_split.cpp
+  src/models/qwen4exp/serve/prompt_windows.cpp
+  src/models/qwen4exp/serve/qfn_decode.cpp
+  src/models/qwen4exp/serve/slots.cpp
+  src/models/qwen4exp/serve/tier_profile.cpp
+  src/models/qwen4exp/serve/tiers.cpp
+  src/models/qwen4exp/serve/verify.cpp
+  src/models/qwen4exp/serve/vision.cpp
+  src/models/qwen4exp/measure/gpu_modes.cpp
+  src/models/qwen4exp/measure/dump_set.cpp
+  src/models/qwen4exp/cli/options.cpp
+  src/models/qwen4exp/cli/control_vectors.cpp
+  src/models/qwen4exp/cli/report.cpp
+  src/models/qwen4exp/load/qfn_run.cpp)
 target_compile_definitions(model_qwen4exp PRIVATE BASALT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_include_directories(model_qwen4exp PRIVATE ${_gpu_include_directories})
 target_include_directories(model_qwen4exp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
@@ -260,7 +260,7 @@ target_link_libraries(basalt-plan PRIVATE plan)
 
 # ---- core (GPU runtime) ---------------------------------------------
 add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
-                             src/core/layout.cpp src/core/model_file.cpp)
+                             src/models/qwen4exp/decode/layout.cpp src/core/model_file.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
 # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
@@ -285,7 +285,7 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu
                         src/kernels/cuda/native_mmvq.cu
                         src/kernels/cuda/native_bf16.cu
                         src/kernels/cuda/dequant_bf16.cu
-                        src/kernels/cuda/dec_gdn_rec.cu
+                        src/models/qwen4exp/kernels/dec_gdn_rec.cu
                         src/kernels/cuda/wait_abort.cu
                         src/kernels/cuda/iq_kernels.cu
                         src/kernels/ngram.cpp
@@ -505,13 +505,13 @@ target_include_directories(grammar PUBLIC include)
 target_link_libraries(grammar PRIVATE warnings)
 
 # the C++ byte-level BPE tokenizer the engine runs on request text (CPU only)
-add_library(tokenizer STATIC src/program/tokenizer/bpe.cpp src/program/tokenizer/pretok_qwen35.cpp
+add_library(tokenizer STATIC src/program/tokenizer/bpe.cpp src/models/qwen4exp/tokenizer/pretok_qwen35.cpp
             src/program/tokenizer/unicode_flags.cpp)
 target_include_directories(tokenizer PUBLIC include PRIVATE src/program/tokenizer)
 target_link_libraries(tokenizer PRIVATE warnings)
 # built from the tokenizer sources with the standard library range checks on, so an out-of-range index aborts the test
 add_executable(tokenizer_test tests/program/tokenizer_test.cpp src/program/tokenizer/bpe.cpp
-               src/program/tokenizer/pretok_qwen35.cpp src/program/tokenizer/unicode_flags.cpp
+               src/models/qwen4exp/tokenizer/pretok_qwen35.cpp src/program/tokenizer/unicode_flags.cpp
                src/models/deepseek41/tokenizer/pretok_joyai.cpp)
 target_include_directories(tokenizer_test PRIVATE include src src/program/tokenizer)
 target_compile_definitions(tokenizer_test PRIVATE _GLIBCXX_ASSERTIONS)
@@ -1076,7 +1076,7 @@ basalt_embed_manifest(image_loan_test)
 basalt_cpu_test(NAME image_loan_test COMMAND image_loan_test)
 set_tests_properties(image_loan_test PROPERTIES TIMEOUT 60)
 # a prompt loan's table work: the re-lend split and the routed experts' trades, on a model of the cache (CPU only)
-add_executable(loan_moves_test tests/program/loan_moves_test.cpp src/program/serve/loan_moves.cpp)
+add_executable(loan_moves_test tests/program/loan_moves_test.cpp src/models/qwen4exp/serve/loan_moves.cpp)
 target_include_directories(loan_moves_test PRIVATE src/program/serve)
 target_link_libraries(loan_moves_test PRIVATE warnings)
 basalt_embed_manifest(loan_moves_test)

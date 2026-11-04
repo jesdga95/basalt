@@ -1,11 +1,11 @@
 #include "state.hpp"
 #include "layout.hpp"
-#include "basalt/prefill/prefill.hpp"
-#include "basalt/core/mtp.hpp"
+#include "basalt/models/qwen4exp/prefill/prefill.hpp"
+#include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/core/on_device.hpp"
-#include "basalt/core/layout.hpp"
+#include "basalt/models/qwen4exp/decode/layout.hpp"
 #include "basalt/kernels/ngram.hpp"
-#include "basalt/prefill/gemm.hpp"
+#include "basalt/models/qwen4exp/prefill/gemm.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>
@@ -17,7 +17,7 @@
 namespace basalt::prefill {
 using namespace detail;
 
-// src/models/qwen4exp/prefill/lifecycle.cpp - see include/basalt/prefill/prefill.hpp.
+// src/models/qwen4exp/prefill/lifecycle.cpp - see include/basalt/models/qwen4exp/prefill/prefill.hpp.
 Prefill::Prefill() : impl_(new Impl) {}
 Prefill::~Prefill() { release(); }
 

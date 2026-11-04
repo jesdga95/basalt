@@ -6,11 +6,11 @@
 // expert source, a resident and a streamed KV, and the ring depths.  The expert layout is process-wide, so the layout
 // is the argument: nvfp4 (every layer NVFP4 with a tail: the FP4 path), mixed (NVFP4 and K-quant layers),
 // kquant (Q4_K / Q5_1) and q2 (no native layout, as in the IQ and Q2_0 packs).  Needs a CUDA device for the MMQ plan (exit 77 without).
-#include "basalt/core/layout.hpp"
-#include "basalt/core/session.hpp"
+#include "basalt/models/qwen4exp/decode/layout.hpp"
+#include "basalt/models/qwen4exp/decode/session.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
-#include "basalt/prefill/prefill.hpp"
+#include "basalt/models/qwen4exp/prefill/prefill.hpp"
 
 #include <cuda_runtime.h>
 

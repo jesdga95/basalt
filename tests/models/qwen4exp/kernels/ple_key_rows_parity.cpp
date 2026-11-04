@@ -8,9 +8,9 @@
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/qwen4exp/kernels/native_ple_postops.hpp"
 #include "basalt/kernels/ngram.hpp"
-#include "basalt/kernels/ple.hpp"
+#include "basalt/models/qwen4exp/kernels/ple.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
-#include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

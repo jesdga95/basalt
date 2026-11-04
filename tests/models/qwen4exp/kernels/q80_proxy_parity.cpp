@@ -11,9 +11,9 @@
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/qwen4exp/kernels/q5k_head.hpp"
 #include "basalt/models/qwen4exp/kernels/q80_proxy.hpp"
-#include "basalt/kernels/q80_vhead.hpp"
+#include "basalt/models/qwen4exp/kernels/q80_vhead.hpp"
 #include "basalt/kernels/sampler.hpp"
-#include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

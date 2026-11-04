@@ -1,12 +1,12 @@
 #include "common.hpp"
 #include "record.hpp"
 #include "expert_plan.hpp"
-#include "basalt/core/verify.hpp"
-#include "basalt/kernels/dec_gdn.hpp"
+#include "basalt/models/qwen4exp/decode/verify.hpp"
+#include "basalt/models/qwen4exp/kernels/dec_gdn.hpp"
 #include "basalt/models/qwen4exp/kernels/dense_tc.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/pdl.hpp"
-#include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 
 namespace basalt::core {
 using namespace verify_detail;

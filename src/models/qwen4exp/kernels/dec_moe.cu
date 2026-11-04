@@ -4,7 +4,7 @@
 #undef IQ_DEV_ONLY
 
 #define FZ_DEV_ONLY
-#include "../../../kernels/cuda/dec_gdn_rec.cu"   // the peer mixer item's recurrence (device code only)
+#include "dec_gdn_rec.cu"   // the peer mixer item's recurrence (device code only)
 #undef FZ_DEV_ONLY
-#include "../../../kernels/cuda/dec_moe.cuh"   // DEC_MOE: the decode MoE tail's kernels, on the shared row dots
-#include "../../../kernels/cuda/pk_moe.cuh"   // persistent experts + combine, on the same device code
+#include "dec_moe.cuh"   // DEC_MOE: the decode MoE tail's kernels, on the shared row dots
+#include "pk_moe.cuh"   // persistent experts + combine, on the same device code

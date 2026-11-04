@@ -11,8 +11,8 @@
 // --bench: one launch at the largest window, timed over many launches, beside the native router.
 #include <cstddef>
 
-#include "basalt/kernels/native_router.hpp"
-#include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/models/qwen4exp/kernels/native_router.hpp"
+#include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 

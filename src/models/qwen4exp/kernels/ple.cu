@@ -1,6 +1,6 @@
 // src/models/qwen4exp/kernels/ple.cu - the PLE block's GPU half.
 //
-// See include/basalt/kernels/ple.hpp for the structure and for the `normalized`-is-the-conv-input finding.
+// See include/basalt/models/qwen4exp/kernels/ple.hpp for the structure and for the `normalized`-is-the-conv-input finding.
 //
 // The arithmetic follows the captured CPU ggml graph (captured input and output vectors):
 //
@@ -11,7 +11,7 @@
 //   * the gate's `sqrt` and `sigmoid` are f32.
 //
 // ple_value is the single-token BF16/F32 MMVF, and the post-projection arithmetic is `native_ple_postops`.
-#include "basalt/kernels/ple.hpp"
+#include "basalt/models/qwen4exp/kernels/ple.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/kernels/ngram.hpp"

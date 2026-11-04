@@ -13,7 +13,7 @@
 // (with its gathers, and its products alone), microseconds per expert and the achieved int8/fp16 TFLOP/s.
 // --no-ref, --bench.  Exit 77 without a CUDA device.
 #include "basalt/kernels/iq_kernels.hpp"
-#include "basalt/prefill/gemm.hpp"
+#include "basalt/models/qwen4exp/prefill/gemm.hpp"
 #include "basalt/models/qwen4exp/prefill/kernels.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 

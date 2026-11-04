@@ -1,13 +1,13 @@
 #include "common.hpp"
 #include "expert_plan.hpp"
-#include "basalt/core/verify.hpp"
-#include "basalt/core/native_head.hpp"
+#include "basalt/models/qwen4exp/decode/verify.hpp"
+#include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/core/on_device.hpp"
-#include "basalt/kernels/cvec.hpp"
+#include "basalt/models/qwen4exp/kernels/cvec.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/models/qwen4exp/kernels/q5k_head.hpp"
-#include "basalt/kernels/q80_vhead.hpp"
+#include "basalt/models/qwen4exp/kernels/q80_vhead.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cmath>

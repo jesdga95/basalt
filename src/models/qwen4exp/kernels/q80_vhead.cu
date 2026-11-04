@@ -1,11 +1,11 @@
-// src/models/qwen4exp/kernels/q80_vhead.cu - see include/basalt/kernels/q80_vhead.hpp.
+// src/models/qwen4exp/kernels/q80_vhead.cu - see include/basalt/models/qwen4exp/kernels/q80_vhead.hpp.
 //
 // Built with --use_fast_math like native_mmvq.cu, whose Q8_0 x q8_1 dot the exact rows repeat.
-#include "basalt/kernels/q80_vhead.hpp"
+#include "basalt/models/qwen4exp/kernels/q80_vhead.hpp"
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "q80p.cuh"
-#include "../../../kernels/cuda/smem_opt_in.cuh"
+#include "smem_opt_in.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

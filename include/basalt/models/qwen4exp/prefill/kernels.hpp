@@ -5,8 +5,8 @@
 // the kernel walks the chunk's tokens in order inside one launch.
 #pragma once
 
-#include "basalt/kernels/kv_stream.hpp"
-#include "basalt/kernels/rope_scaling.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_stream.hpp"
+#include "basalt/models/qwen4exp/kernels/rope_scaling.hpp"
 
 #include <cstdint>
 

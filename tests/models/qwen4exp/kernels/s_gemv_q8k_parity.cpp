@@ -11,7 +11,7 @@
 //      A K-quant weight is a third case and it is the one the dense projections use.
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/kernels/quantize_act.hpp"
-#include "basalt/kernels/s_gemv.hpp"
+#include "basalt/models/qwen4exp/kernels/s_gemv.hpp"
 
 #include <cuda_runtime.h>
 

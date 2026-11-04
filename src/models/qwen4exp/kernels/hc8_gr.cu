@@ -8,7 +8,7 @@
 //
 // Every token's values come from the same operations in the same order whatever the token count.
 #include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
-#include "basalt/kernels/hc_fused.hpp"
+#include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

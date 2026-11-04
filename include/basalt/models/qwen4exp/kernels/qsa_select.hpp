@@ -17,7 +17,7 @@
 // Queries carry their own step record (pos, n_kv, n_bid, width) as everywhere else in QSA.
 #pragma once
 
-#include "basalt/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
 
 #include <cstdint>
 
