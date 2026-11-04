@@ -13,6 +13,8 @@
 // repeatable: the construction of llama.cpp's Qwen3-Coder parser.
 #pragma once
 
+#include "basalt/program/grammar/tool_form.hpp"
+
 #include <memory>
 #include <string>
 
@@ -25,16 +27,13 @@ std::string json_schema_to_gbnf(const std::string& schema_json, std::string& err
 
 struct ToolGrammarOptions {
     size_t max_permute = 6;          ///< required parameters are permuted up to this many; more keep the declared order
-    bool multiple_calls = true;      ///< more than one <tool_call> block
+    bool multiple_calls = true;      ///< more than one call
     std::string answer_schema;       ///< a JSON schema: the root also takes one JSON value of it instead of calls
 };
 
 /// `tools_json` is an array of {name, parameters:{properties, required}} (or the OpenAI {type:"function",
 /// function:{...}} wrapper). Empty with `err` set on bad input or an empty list.
 std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptions& opt, std::string& err);
-
-/// The text that starts a tool call: the lazy trigger for tool_call_gbnf.
-inline const char* tool_call_trigger() { return "<tool_call>"; }
 
 /// What the engine needs for one request: the parsed grammar and when it starts.
 struct RequestGrammar {

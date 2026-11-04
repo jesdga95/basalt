@@ -1,4 +1,5 @@
 // tests/program/grammar_guard_test.cpp - the pack vocabulary reader and the per-request window check (CPU only).
+#include "tool_form_fixture.hpp"
 #include "basalt/program/grammar/guard.hpp"
 
 #include <cmath>
@@ -31,6 +32,7 @@ static PackVocab load() {
 }
 
 int main() {
+    set_test_tool_form();
     const PackVocab pv = load();
     CHECK(pv.vocab->bytes(0) == "{");
     CHECK(pv.vocab->bytes(2) == "\"a\"");

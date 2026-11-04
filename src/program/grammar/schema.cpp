@@ -250,7 +250,19 @@ bool flatten_union(const JsonValue* params, JsonValue& out) {
 
 }  // namespace
 
+namespace {
+ToolForm g_tool_form;
+}
+
+void set_tool_form(const ToolForm& form) { g_tool_form = form; }
+const ToolForm& tool_form() { return g_tool_form; }
+
 std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptions& opt, std::string& err) {
+    const ToolForm& form = tool_form();
+    if (form.call_open.empty()) {
+        err = "tools: this model has no tool-call grammar";
+        return "";
+    }
     JsonValue tools;
     if (!read_json(tools_json, tools, err)) return "";
     if (!tools.is(Type::Array) || tools.items.empty()) {
@@ -311,7 +323,7 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
                     raw = true;
                 }
                 if (raw && value.empty()) {
-                    if (text_rule.empty()) text_rule = add_free_text(c, "</parameter>");
+                    if (text_rule.empty()) text_rule = add_free_text(c, form.text_end);
                     value = text_rule;
                 }
                 if (!raw) {
@@ -328,7 +340,7 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
                     return "";
                 }
                 (required.count(m.first) ? req_items : opt_items)
-                    .push_back(literal("<parameter=" + m.first + ">\n") + " " + value + " " + literal("\n</parameter>\n"));
+                    .push_back(literal(form.param_open + m.first + (raw ? form.param_mid_text : form.param_mid_value)) + " " + value + " " + literal(form.param_close));
             }
         }
         // As llama.cpp's Qwen3-Coder parser (common/chat-peg-parser.cpp permute, parsers/qwen3-coder.cpp): the required
@@ -352,10 +364,12 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
             body = rule_of(((size_t) 1 << n) - 1) + " ";
         }
         if (!opt_items.empty()) body += "(" + c.add_rule(fn_id + "-opt", join(opt_items, " | ")) + ")* ";
-        fns.push_back(c.add_rule(fn_id, literal("<function=" + nm->s + ">\n") + " " + body + literal("</function>")));
+        fns.push_back(c.add_rule(fn_id, literal(form.fn_open + nm->s + form.fn_mid) + " " + body + literal(form.fn_close)));
     }
-    c.add_rule("call", literal("<tool_call>\n") + " (" + join(fns, " | ") + ") " + literal("\n</tool_call>"));
-    std::string root = opt.multiple_calls ? "call ([ \\t\\n]* call)*" : "call";
+    const std::string one = "(" + join(fns, " | ") + ")";
+    const bool shared_block = form.calls_share_block && opt.multiple_calls;
+    c.add_rule("call", literal(form.call_open) + " " + (shared_block ? one + " (" + literal("\n") + " " + one + ")*" : one) + " " + literal(form.call_close));
+    std::string root = opt.multiple_calls && !form.calls_share_block ? "call ([ \\t\\n]* call)*" : "call";
     if (!opt.answer_schema.empty()) {
         JsonValue answer;
         if (!read_json(opt.answer_schema, answer, err)) return "";
@@ -433,7 +447,7 @@ RequestGrammar grammar_from_request(const std::string& grammar_json, std::string
             }
         }
         gbnf = tool_call_gbnf(list.dump(), ToolGrammarOptions{}, err);
-        out.triggers.words = {tool_call_trigger()};
+        out.triggers.words = {tool_form().trigger};
     } else {
         err = "grammar: unknown kind '" + kind->s + "'";
         return out;

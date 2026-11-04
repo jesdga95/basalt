@@ -6,6 +6,7 @@
 #pragma once
 
 #include "basalt/kernels/sampler.hpp"
+#include "basalt/program/grammar/tool_form.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -160,6 +161,7 @@ public:
     virtual std::vector<SideTableSpec> side_tables(const ModelDesc&) const { return {}; }
     virtual TokenizerSpec tokenizer_spec() const = 0;
     virtual TokenNames token_names() const = 0;
+    virtual program::grammar::ToolForm tool_form() const = 0;
     /// The options object of this model: the common flags and its own.
     virtual std::unique_ptr<program::CommonOptions> make_options() const;
     /// Takes a flag outside the common set; false when this model has no such flag. `code`: an exit code for a bad value.

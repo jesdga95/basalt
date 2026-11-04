@@ -28,6 +28,21 @@ public:
         const basalt::model::Result r = model_.make_session(session_);
         if (!r.ok()) { basalt::log::error("basalt serve", "%s", r.message.c_str()); return 1; }
         conversations.emplace((size_t) 0, (size_t) 0);
+        if (o.grammar) {   // the token texts the grammar walks, read from the pack's tokenizer files
+            std::vector<uint8_t> vj, tj;
+            std::string gerr;
+            basalt::program::grammar::PackVocab pv;
+            std::vector<int32_t> ends(o.eos_ids.begin(), o.eos_ids.end());
+            if (!basalt::core::read_range(model_file.range("tokenizer/vocab.json"), vj, gerr) ||
+                !basalt::core::read_range(model_file.range("tokenizer/token_type.json"), tj, gerr) ||
+                !basalt::program::grammar::vocab_from_pack(std::string_view((const char*) vj.data(), vj.size()),
+                                                           std::string_view((const char*) tj.data(), tj.size()),
+                                                           (size_t) n_vocab, ends, pv, gerr)) {
+                basalt::log::error("basalt serve", "--grammar on: %s", gerr.c_str());
+                return 2;
+            }
+            vocab_ = std::move(pv);
+        }
         return 0;
     }
     int init_after_input() override {

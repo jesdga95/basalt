@@ -63,6 +63,25 @@ public:
 
     model::TokenizerSpec tokenizer_spec() const override { return {"tokenizer.ggml.tokens", "deepseek"}; }
 
+    // <｜DSML｜ calls>, <｜DSML｜ invoke name="N">, <｜DSML｜ parameter name="P" string="true|false">
+    program::grammar::ToolForm tool_form() const override {
+        const std::string dsml = "\xef\xbd\x9c" "DSML\xef\xbd\x9c";
+        program::grammar::ToolForm f;
+        f.call_open = "<" + dsml + " calls>\n";
+        f.call_close = "\n</" + dsml + " calls>";
+        f.fn_open = "<" + dsml + " invoke name=\"";
+        f.fn_mid = "\">\n";
+        f.fn_close = "</" + dsml + " invoke>";
+        f.param_open = "<" + dsml + " parameter name=\"";
+        f.param_mid_text = "\" string=\"true\">";
+        f.param_mid_value = "\" string=\"false\">";
+        f.param_close = "</" + dsml + " parameter>\n";
+        f.text_end = "</" + dsml + " parameter>";
+        f.calls_share_block = true;
+        f.trigger = "<" + dsml + " calls>";
+        return f;
+    }
+
     model::TokenNames token_names() const override {
         return {{"<\xef\xbd\x9cend\xe2\x96\x81of\xe2\x96\x81sentence\xef\xbd\x9c>"}, "<\xef\xbd\x9cUser\xef\xbd\x9c>",
                 "<\xef\xbd\x9c" "deepseek_image\xef\xbd\x9c>"};
