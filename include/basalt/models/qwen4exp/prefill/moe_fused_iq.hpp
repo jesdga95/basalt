@@ -1,4 +1,4 @@
-// include/basalt/prefill/moe_fused_iq.hpp - the fused int8 prompt experts (moe_fused.hpp) for the native GGUF
+// include/basalt/models/qwen4exp/prefill/moe_fused_iq.hpp - the fused int8 prompt experts (moe_fused.hpp) for the native GGUF
 // experts (an expert is its raw GGUF slices [gate rows | up rows | down rows], formats per layer in
 // expert_layout().fmt), used wherever available (devices with int8 MMA; others use MMQ).
 //
@@ -12,7 +12,7 @@
 // IQ3_XXS and IQ3_S packs but the IQ1_M ones (which MMQ does not cover either).  Other layers keep MMQ.
 #pragma once
 
-#include "basalt/prefill/moe_fused.hpp"
+#include "basalt/models/qwen4exp/prefill/moe_fused.hpp"
 
 #include <cstddef>
 #include <cstdint>

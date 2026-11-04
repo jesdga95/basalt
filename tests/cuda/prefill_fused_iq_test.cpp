@@ -16,7 +16,7 @@
 // (the v2 kernels: IQ3_XXS gate/up, IQ4_NL down) in both parts where a pair has them: against the reference as
 // above, within a tenth of the fused path's own error of its outputs, and timed next to it.  --no-ref, --no-timing,
 // --only=NAME, --chunks=A,B.  Exit 77 without a CUDA device with int8 tensor cores.
-#include "basalt/prefill/moe_fused_iq.hpp"
+#include "basalt/models/qwen4exp/prefill/moe_fused_iq.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 
 #include "basalt/ggml/ggml.h"

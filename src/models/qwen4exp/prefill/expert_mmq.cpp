@@ -4,8 +4,8 @@
 #include "basalt/core/native_head.hpp"
 #include "basalt/prefill/gemm.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
-#include "basalt/prefill/moe_fp4.hpp"
-#include "basalt/prefill/kernels.hpp"
+#include "basalt/models/qwen4exp/prefill/moe_fp4.hpp"
+#include "basalt/models/qwen4exp/prefill/kernels.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>
 #include <cstring>

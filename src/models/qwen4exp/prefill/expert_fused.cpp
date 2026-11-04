@@ -1,8 +1,8 @@
 #include "experts.hpp"
 #include "basalt/prefill/prefill.hpp"
 #include "basalt/core/mtp.hpp"
-#include "basalt/prefill/moe_fused.hpp"
-#include "basalt/prefill/moe_fused_iq.hpp"
+#include "basalt/models/qwen4exp/prefill/moe_fused.hpp"
+#include "basalt/models/qwen4exp/prefill/moe_fused_iq.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include <algorithm>
 #include <cmath>

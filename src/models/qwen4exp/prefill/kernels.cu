@@ -1,5 +1,5 @@
-// src/prefill/kernels.cu - see include/basalt/prefill/kernels.hpp.
-#include "basalt/prefill/kernels.hpp"
+// src/models/qwen4exp/prefill/kernels.cu - see include/basalt/models/qwen4exp/prefill/kernels.hpp.
+#include "basalt/models/qwen4exp/prefill/kernels.hpp"
 #include "basalt/kernels/mrope.hpp"
 #include "basalt/kernels/router_top10.hpp"
 

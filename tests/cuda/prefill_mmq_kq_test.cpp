@@ -14,7 +14,7 @@
 // --no-ref, --bench.  Exit 77 without a CUDA device.
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/prefill/gemm.hpp"
-#include "basalt/prefill/kernels.hpp"
+#include "basalt/models/qwen4exp/prefill/kernels.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 
 #include "basalt/ggml/ggml.h"

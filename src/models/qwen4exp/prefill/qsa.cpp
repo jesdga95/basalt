@@ -10,7 +10,7 @@
 #include "basalt/kernels/qsa_decode_attn.hpp"
 #include "basalt/kernels/qsa_prompt_attn.hpp"
 #include "basalt/kernels/qsa_select.hpp"
-#include "basalt/prefill/kernels.hpp"
+#include "basalt/models/qwen4exp/prefill/kernels.hpp"
 #include <algorithm>
 #include <exception>
 #include <string>

@@ -1,5 +1,5 @@
 // tests/prefill/gdn_chunk_parity.cu - the prompt path's chunked DeltaNet recurrence (gdn_recurrence,
-// src/prefill/gdn_chunked.cu) against the token-serial FP32 kernel it replaced and a double-precision CPU reference.
+// src/models/qwen4exp/prefill/gdn_chunked.cu) against the token-serial FP32 kernel it replaced and a double-precision CPU reference.
 //
 // Synthetic inputs of the model's shape (16 key heads, 48 value heads, head size 128, q/k not yet normalized), a
 // non-zero state as after an earlier chunk.  Checked: the output before the norm and the state after the chunk, for
@@ -10,7 +10,7 @@
 // and state must be finite.
 //   gdn_chunk_parity [seed]          the checks
 //   gdn_chunk_parity --bench         and the timings at T = 4096, 16384 and 32768 (one layer), old and new alternating
-#include "basalt/prefill/kernels.hpp"
+#include "basalt/models/qwen4exp/prefill/kernels.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

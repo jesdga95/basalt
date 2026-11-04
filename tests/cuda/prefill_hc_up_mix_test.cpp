@@ -11,7 +11,7 @@
 //     build/prefill_hc_up_mix_test [--no-bench]
 #include "basalt/kernels/hc_fused.hpp"
 #include "basalt/prefill/gemm.hpp"
-#include "basalt/prefill/kernels.hpp"
+#include "basalt/models/qwen4exp/prefill/kernels.hpp"
 
 #include <cuda_runtime.h>
 

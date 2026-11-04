@@ -9,11 +9,11 @@
 #include "basalt/core/native_head.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
 #include "basalt/prefill/gemm.hpp"
-#include "basalt/prefill/moe_fused.hpp"
+#include "basalt/models/qwen4exp/prefill/moe_fused.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
-#include "basalt/prefill/moe_fp4.hpp"
+#include "basalt/models/qwen4exp/prefill/moe_fp4.hpp"
 #include "basalt/core/peer_experts.hpp"
-#include "basalt/prefill/kernels.hpp"
+#include "basalt/models/qwen4exp/prefill/kernels.hpp"
 #include <algorithm>
 #include <string>
 #include <vector>

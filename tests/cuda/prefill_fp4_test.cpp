@@ -19,7 +19,7 @@
 // device, the peer card's share of a streamed chunk (its experts' rows in pieces of a row cap, each group planned on
 // its own copy of the activations) must equal the primary's whole-layer rows bit for bit, at 512 experts and top 10,
 // with a timing line for the peer.  Exit 77 without a CUDA device.
-#include "basalt/prefill/moe_fp4.hpp"
+#include "basalt/models/qwen4exp/prefill/moe_fp4.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 
 #include "basalt/ggml/ggml.h"
