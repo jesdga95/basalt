@@ -582,7 +582,9 @@ bool vm_commit(void* p, uint64_t bytes) {
     return VirtualAlloc(p, (SIZE_T) bytes, MEM_COMMIT, PAGE_READWRITE) == p;
 #else
     if (mprotect(p, (size_t) bytes, PROT_READ | PROT_WRITE) != 0) return false;
-    (void) madvise(p, (size_t) bytes, MADV_HUGEPAGE);
+    // ordinary pages: with most of the RAM pinned, a huge-page fault compacts and reclaims memory in the faulting
+    // thread, which costs far more than the page faults it saves
+    (void) madvise(p, (size_t) bytes, MADV_NOHUGEPAGE);
     return true;
 #endif
 }

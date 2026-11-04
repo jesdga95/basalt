@@ -28,10 +28,11 @@ and that the residency map and its counters survive growth.
 
 The runtime check is greedy identity against the preceding build with pinned expert tiers across a pin crossing.
 `kv_host_grow_test --bench POWER_W` compares streamed decode windows from registered ordinary pages and mapped host
-allocations; the argument records the GPU power limit. Transparent huge pages are requested for committed ranges;
-disable them for the benchmark process when measuring ordinary pages. Host-page backing and captured pointer validity
-after re-registration are driver-sensitive. Re-pinning the full prefix may cost as much as pinning a new pool; net RAM
-growth equals the newly committed tails.
+allocations; the argument records the GPU power limit. Committed ranges use ordinary pages, never transparent huge
+pages: with most of the RAM pinned, a huge-page fault compacts and reclaims memory in the faulting thread, which costs
+a pin far more than its page faults and slows decode beside a background prefault. Host-page backing and captured
+pointer validity after re-registration are driver-sensitive. Re-pinning the full prefix may cost as much as pinning a
+new pool; net RAM growth equals the newly committed tails.
 
 ## The pin and the RAM homes
 

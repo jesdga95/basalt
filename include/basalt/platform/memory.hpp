@@ -45,7 +45,7 @@ bool drop_mapped_view(const void* base, uint64_t view_bytes, uint64_t off, uint6
 uint64_t vm_page_size();
 /// Reserves `bytes` of inaccessible address space without taking physical RAM. Page multiples only; null on refusal.
 void* vm_reserve(uint64_t bytes);
-/// Makes a page-aligned subrange readable and writable, asking for transparent huge pages where available.
+/// Makes a page-aligned subrange readable and writable, backed by ordinary pages (never transparent huge pages).
 bool vm_commit(void* p, uint64_t bytes);
 /// Discards a committed subrange's contents and makes it inaccessible, keeping its address space reserved.
 /// The caller must unregister any device mapping first.
