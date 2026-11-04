@@ -22,6 +22,8 @@ namespace basalt::program::generate {
 
 namespace {
 
+bool g_diag_serial_prompt = false;   // --diag-serial-prompt
+
 /// A picture's embedding block, placed before the prompt token at `at`.
 struct AdapterImage {
     int64_t at = 0;
@@ -74,12 +76,27 @@ bool adapter_prompt(basalt::model::ModelSession& sess, const std::vector<int32_t
             pr.tokens = toks.data() + done;
             pr.n_tokens = (int) (end - done);
             pr.pos = pos;
+            if (g_diag_serial_prompt) {   // one token per step, through the decode path
+                for (int t = 0; r.ok() && t < pr.n_tokens; ++t) {
+                    int32_t row_next = -1;
+                    basalt::model::DecodeRequest one;
+                    one.tokens = pr.tokens + t;
+                    one.n_tokens = 1;
+                    one.pos = pos + t;
+                    one.next_token = &row_next;
+                    r = sess.decode_window(one);
+                    std::printf("R %lld %d\n", (long long) (pos + t), row_next);
+                }
+                pos += pr.n_tokens;
+                done = end;
+                continue;
+            }
             const int64_t base = pos;
             if (report) pr.progress = [&, base](int n) { report_at(base + n); };
             if (report) pr.live = [&, base](int n) { live_at(base + n); };
             const auto tp = Clock::now();
             r = sess.prefill_chunk(pr);
-            basalt::log::error("basalt generate", "batched prefill %d tokens in %.0f ms", pr.n_tokens,
+            basalt::log::info("basalt generate", "batched prefill %d tokens in %.0f ms", pr.n_tokens,
                          std::chrono::duration<double, std::milli>(Clock::now() - tp).count());
             pos += pr.n_tokens;
             done = end;
@@ -88,7 +105,7 @@ bool adapter_prompt(basalt::model::ModelSession& sess, const std::vector<int32_t
         if (r.ok() && i < images.size()) {
             const auto tp = Clock::now();
             r = sess.prefill_embeddings(images[i].rows.data(), images[i].n_rows, pos);
-            basalt::log::error("basalt generate", "image prefill %d rows in %.0f ms", images[i].n_rows,
+            basalt::log::info("basalt generate", "image prefill %d rows in %.0f ms", images[i].n_rows,
                          std::chrono::duration<double, std::milli>(Clock::now() - tp).count());
             pos += images[i].n_rows;
             if (r.ok()) report_at(pos);
@@ -180,7 +197,7 @@ int adapter_generate(basalt::model::LoadedModel& loaded, const std::vector<int64
         }
     }
     const auto t2 = Clock::now();
-    basalt::log::error("basalt generate", "prompt %.0f ms, %lld tokens in %.0f ms",
+    basalt::log::info("basalt generate", "prompt %.0f ms, %lld tokens in %.0f ms",
                  std::chrono::duration<double, std::milli>(t1 - t0).count(), (long long) made,
                  std::chrono::duration<double, std::milli>(t2 - t1).count());
     return 0;
@@ -445,6 +462,7 @@ int adapter_serve(basalt::model::LoadedModel& loaded, int64_t max_context, int64
 
 
 std::optional<int> run_adapter_model(const Options& o, const basalt::core::ModelFile& model_file) {
+    g_diag_serial_prompt = o.diag_serial_prompt;
     const basalt::core::Json* kv = model_file.meta().get("gguf_kv");
     const basalt::core::Json* arch = kv ? kv->get("general.architecture") : nullptr;
     const std::string name = arch && arch->is_string() ? arch->s : std::string();

@@ -2,6 +2,7 @@
 // Engram table as file ranges.
 #pragma once
 
+#include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/ngram/ple_reader.hpp"
 #include "basalt/vision/mmproj.hpp"
@@ -20,6 +21,13 @@ struct DevTensor {
     uint64_t bytes = 0;
     std::vector<uint64_t> shape;
 };
+
+/// y[c][r] = W[r] . x[c] for `ncols` float columns, quantized through `scratch_q8_1`, whatever W's type.
+inline void dense_f32(const DevTensor& w, const float* x, void* scratch_q8_1, float* y, int n_in, int n_out, int ncols,
+                      void* stream) {
+    kernels::native_quantize_q8_1(x, scratch_q8_1, n_in, ncols, stream);
+    kernels::native_mmvq(w.type, w.ptr, scratch_q8_1, y, n_in, n_out, ncols, stream);
+}
 
 class DsModel final : public model::LoadedModel {
 public:
