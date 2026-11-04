@@ -26,6 +26,9 @@ basalt-probe --model PACK.basalt -- ENGINE FLAGS...
    speeds: the first request after load counts, nothing is discarded, and nothing is repeated.
 5. Measures the values it suggests (below), the adaptive tier's last.
 
+It asks the engine which of the tuning flags the model takes and skips the tests of the others. A model's own folder in
+the fixtures directory is used when there is one.
+
 The token budget is part of what "cold" means: the engine keeps adapting its expert tiers as it decodes, so a longer
 request reads faster. The speeds are at the engine's context. The fixtures are short prompts, so they are measured at
 the fixture depth with the context allocated, not with the KV filled to it.
