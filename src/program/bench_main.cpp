@@ -737,6 +737,17 @@ int main(int argc, char** argv) {
         fs::remove(plan_log, rm_ec);
         o.fixtures = fixtures_for(BASALT_BENCH_FIXTURES, answer);
     }
+    if (do_quality && !o.model.empty()) {   // an engine that takes the gate's base flag has a reference for this model
+        std::string answer;
+        const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id()) + ".log";
+        const int asked = engine_plan(engine_bin, {"--model", fs::absolute(o.model).string(), "--gpu", "0", "--ppl-base", o.kld_base}, plan_log, answer);
+        std::error_code rm_ec;
+        fs::remove(plan_log, rm_ec);
+        if (asked != 0) {
+            basalt::log::error("basalt-bench", "--quality: no reference for this model");
+            return 1;
+        }
+    }
     for (const auto& kv : o.sets) set_arg(args, kv.first, kv.second);
     if (!o.spec.empty()) set_arg(args, "--spec", o.spec);
     if (o.model.empty()) for (const auto& a : o.passthrough) args.push_back(a);
