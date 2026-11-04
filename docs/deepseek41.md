@@ -12,10 +12,8 @@ the pack and picks the chat format, tool-call syntax and thinking switch to matc
   table and the token embedding. The startup line `basalt deepseek41: expert homes of 384 per layer: ...` gives the split.
   Which experts are resident can change the rounding of the output ([precision](precision/deepseek41.md)).
 - **Context:** `--max-context N` (or `"max-context"` in the config's `engine` section) sets it, as for every model, up
-  to the model's own maximum (1,048,576 tokens, from the pack). Without it the engine takes that maximum, lowered
-  until the compressed caches of a full context take at most a quarter of the free VRAM, and prints the result
-  (`basalt deepseek41: context N tokens`); the server's `context N tokens` line, its Monitor and its request checks use that
-  number. A value above the model's maximum, or whose caches need more than half the free VRAM, is refused at start.
+  to the model's own maximum (1,048,576 tokens, from the pack); without it the context is 4,096 tokens. A value above the
+  model's maximum, or whose caches need more than half the free VRAM, is refused at start.
   The caches grow with the position: a short chat maps a few MiB and a 1M-token context about 3.2 GiB. They
   grow into the memory the tier leaves free, then into the tier's spare slots, and a prompt that does not fit is
   refused; a prompt that fills the context leaves the tier smaller for the rest of that run. The rotary extension (YaRN) is part of the model: the `--rope-*` and
@@ -29,7 +27,7 @@ the pack and picks the chat format, tool-call syntax and thinking switch to matc
   borrows the copies too. If even the smallest chunk does not fit, or the caches cannot grow, the request fails with an
   error naming the free memory and the next one runs. When a new conversation starts, caches a long one left mapped
   beyond 32,768 positions are released to the tier.
-- **Requests:** one at a time, with no `--parallel` slots. The engine keeps the tokens it holds (the prompt and what it
+- **Requests:** one at a time, or `--parallel N` slots with `--slot-full-context` as for any model. The engine keeps the tokens it holds (the prompt and what it
   generated) and a checkpoint before the last prompt token. A request whose prompt starts with all the held tokens, or
   with the checkpoint's (a next turn after a thinking reply: the template drops the thinking from the history), reads
   only the new tail; any other request reads its whole prompt again. `pp=N/Mc` in the done line shows how many were kept.
