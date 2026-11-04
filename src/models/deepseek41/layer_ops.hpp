@@ -2,6 +2,8 @@
 // experts and the shared expert. The layer loop calls these; the default implementation reports what is missing.
 #pragma once
 
+#include "basalt/core/conversation_cache.hpp"
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -56,8 +58,8 @@ public:
     /// Copies the rolling attention state (window rings, compressor partial groups) to the host, and back.
     /// The compressed caches below `positions`, to and from the host; ensure_positions backs them first.
     virtual size_t cache_bytes(int64_t positions) const { (void) positions; return 0; }
-    virtual void save_cache(void* stream, int64_t positions, uint8_t* host) { (void) stream; (void) positions; (void) host; }
-    virtual void restore_cache(void* stream, int64_t positions, const uint8_t* host) { (void) stream; (void) positions; (void) host; }
+    virtual bool save_cache(void* stream, int64_t positions, std::vector<core::ConversationKv>& kv, std::string& err) { (void) stream; (void) positions; (void) kv; (void) err; return true; }
+    virtual bool restore_cache(void* stream, const std::vector<core::ConversationKv>& kv, std::string& err) { (void) stream; (void) kv; (void) err; return true; }
     virtual size_t turn_bytes() const { return 0; }
     virtual void save_turn(void* stream, uint8_t* host) { (void) stream; (void) host; }
     virtual void restore_turn(void* stream, const uint8_t* host) { (void) stream; (void) host; }

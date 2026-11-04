@@ -26,6 +26,19 @@ int Runtime::run_requests() {
     }
 }
 
+// Whether the disk tier needs no new copy of a conversation: it is short (below the disk's minimum, or below
+// --conversation-cache-min-tokens when that is higher), or a stored prefix of it reaches within
+// kDiskStaleTokens of the chain's deepest checkpoint (the point its next turn goes on from; a restore
+// from that copy reads the rest again).  Each turn of a growing conversation is not written again in full.
+bool Runtime::disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const std::vector<ConvCheckpoint>& cks, bool cvec) {
+    if ((int64_t) ids.size() < std::max<int64_t>(kDiskMinTokens, o.conversation_cache_min_tokens)) return true;
+    int64_t deepest = 0;
+    for (const ConvCheckpoint& c : cks) deepest = std::max<int64_t>(deepest, (int64_t) c.ids.size());
+    if (deepest <= 0) deepest = (int64_t) ids.size();
+    const auto m = disk.best(ids.data(), ids.size(), imgs, cvec);
+    return m.tokens > 0 && m.tokens + kDiskStaleTokens >= deepest;
+}
+
 int Runtime::shutdown() {
     // the conversations this process holds go to the disk tier before it ends
     if (disk.enabled()) {

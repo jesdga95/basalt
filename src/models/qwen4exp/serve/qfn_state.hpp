@@ -385,7 +385,6 @@ private:
     int pcie_num_of(double f);
     basalt::core::Verifier& stage_verb(int st);
     void ckd_finish() override;
-    bool disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const std::vector<ConvCheckpoint>& cks, bool cvec);
     bool capture_admit(uint64_t need, uint64_t floor) override;
     bool park_current(size_t held, int64_t kept) override;
     bool gpu_sync_ok();

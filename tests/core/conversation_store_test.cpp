@@ -160,6 +160,75 @@ void remove_dir(const std::string& dir) {
 }
 }  // namespace
 
+// A model with compressed caches: its layers hold rows of `page_size` cells, no scales or pooled rows, and only one
+// part of running state.
+void compressed_rows(const std::string& dir) {
+    constexpr uint64_t kLatentRow = 1024, kKeyRow = 256;
+    std::vector<int32_t> ids(9000);
+    for (size_t i = 0; i < ids.size(); ++i) ids[i] = (int32_t) (i * 11 + 5);
+    const auto running = [&](size_t len) {
+        ConversationCheckpoint c;
+        c.ids.assign(ids.begin(), ids.begin() + (std::ptrdiff_t) len);
+        fill(c.state_a, 1u << 20);
+        return c;
+    };
+    SavedConversation src;
+    src.live = running(ids.size());
+    src.checkpoints.push_back(running(4097));
+    src.checkpoints.back().source = ConversationCheckpoint::kRoot;
+    src.checkpoints.push_back(running(5000));
+    for (int ratio : {1, 2, 2, 1}) {
+        ConversationKv k;
+        const int64_t rows = (int64_t) ids.size() / ratio + 1;
+        k.page_size = ratio;
+        k.cells = rows * ratio;
+        fill(k.k, (size_t) rows * kLatentRow);
+        fill(k.v, (size_t) rows * kKeyRow);
+        src.kv.push_back(std::move(k));
+    }
+    const auto check_at = [&](const SavedConversation& got, int64_t at, const ConversationCheckpoint& c) {
+        CHECK((int64_t) got.live.ids.size() == at);
+        CHECK(got.live.state_a == c.state_a);
+        CHECK(got.kv.size() == src.kv.size());
+        for (size_t i = 0; i < got.kv.size() && i < src.kv.size(); ++i) {
+            const int64_t r = src.kv[i].page_size, rows = (at + r - 1) / r;
+            CHECK(got.kv[i].page_size == r);
+            CHECK(got.kv[i].cells == rows * r);
+            CHECK(got.kv[i].k.size() == (size_t) rows * kLatentRow);
+            CHECK(got.kv[i].v.size() == (size_t) rows * kKeyRow);
+            CHECK(prefix_of(got.kv[i].k, src.kv[i].k));
+            CHECK(prefix_of(got.kv[i].v, src.kv[i].v));
+        }
+    };
+    std::string err;
+    {
+        ConversationStore st;
+        st.set_row_cells(1);
+        CHECK(st.open(dir, 77, 1ull << 30, err));
+        SavedConversation copy = src;
+        CHECK(st.put(std::move(copy), 1ull << 30));
+        st.flush();
+        CHECK(st.stats().written == 1);
+    }
+    ConversationStore st;   // a restart: only the files
+    st.set_row_cells(1);
+    CHECK(st.open(dir, 77, 1ull << 30, err));
+    std::vector<int32_t> p(ids.begin(), ids.begin() + 4200);
+    p.push_back(-5);
+    auto m = st.best(p.data(), p.size(), {}, true);
+    CHECK(m.tokens == 4097);
+    SavedConversation got;
+    CHECK(st.load(m, got, err));   // odd: the last row of a ratio 2 layer is only half under the match
+    check_at(got, 4097, src.checkpoints[0]);
+    p.assign(ids.begin(), ids.begin() + 7000);
+    p.push_back(-5);
+    m = st.best(p.data(), p.size(), {}, true);
+    CHECK(m.tokens == 5000);
+    SavedConversation got2;
+    CHECK(st.load(m, got2, err));
+    check_at(got2, 5000, src.checkpoints[1]);
+}
+
 int main() {
     const std::string dir = basalt::platform::temp_dir() + "/basalt-store-test-" +
                             std::to_string((long long) basalt::platform::process_id());
@@ -452,6 +521,14 @@ int main() {
         CHECK(st.load(m, got, err));
         CHECK(same_state(got.live, sb.checkpoints[1]) && same_state(got.checkpoints[0], sa.checkpoints[0]));
         remove_dir(d3);
+    }
+    {
+        const std::string dir2 = dir + "-rows";
+        compressed_rows(dir2);
+        std::vector<basalt::platform::DirFile> rows_left;
+        if (basalt::platform::list_files(dir2, rows_left))
+            for (const auto& f : rows_left) basalt::platform::remove_file(dir2 + "/" + f.name);
+        basalt::platform::remove_file(dir2);
     }
     std::vector<basalt::platform::DirFile> left;
     if (basalt::platform::list_files(dir, left))

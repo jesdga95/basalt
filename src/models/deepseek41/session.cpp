@@ -212,18 +212,18 @@ public:
 
     size_t cells_bytes(int64_t positions) const override { return ops_ ? ops_->cache_bytes(positions) : 0; }
 
-    model::Result save_cells(uint8_t* host, int64_t positions) override {
+    model::Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
         if (!ops_) return {model::Status::Error, "no state yet"};
-        ops_->save_cache(stream_, positions, host);
+        std::string e;
+        if (!ops_->save_cache(stream_, positions, kv, e)) return {model::Status::Error, e};
         return {};
     }
 
     // The tokens below `positions` come back with them, so the n-gram history is the caller's `tokens`.
-    model::Result restore_cells(const uint8_t* host, int64_t positions) override {
+    model::Result restore_cells(const std::vector<core::ConversationKv>& kv, int64_t positions) override {
         if (!ops_) return {model::Status::Error, "no state yet"};
         std::string e;
-        if (!ops_->ensure_positions(positions, e)) return {model::Status::Error, e};
-        ops_->restore_cache(stream_, positions, host);
+        if (!ops_->ensure_positions(positions, e) || !ops_->restore_cache(stream_, kv, e)) return {model::Status::Error, e};
         return {};
     }
 

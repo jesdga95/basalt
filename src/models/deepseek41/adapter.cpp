@@ -91,14 +91,6 @@ public:
     int max_expert_cards() const override { return 1; }
 
     // The disk tier's records count positional cells; this model's caches keep compressed rows.
-    std::optional<int> finish_flags(program::CommonOptions& o) const override {
-        if (o.conversation_cache_disk_mib > 0 || !o.conversation_cache_dir.empty()) {
-            basalt::log::error("basalt", "--conversation-cache-disk-mib and --conversation-cache-dir do not apply to this model");
-            return 2;
-        }
-        return std::nullopt;
-    }
-
     model::TokenNames token_names() const override {
         return {{"<\xef\xbd\x9cend\xe2\x96\x81of\xe2\x96\x81sentence\xef\xbd\x9c>"}, "<\xef\xbd\x9cUser\xef\xbd\x9c>",
                 "<\xef\xbd\x9c" "deepseek_image\xef\xbd\x9c>"};
