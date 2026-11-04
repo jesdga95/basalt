@@ -18,7 +18,9 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <thread>
 #include <type_traits>
+#include <utility>
 
 namespace basalt::models::deepseek41 {
 namespace {
@@ -34,6 +36,7 @@ public:
     PrefillImpl(DsModel& m, LayerOps& ops, void* stream, int cap)
         : m_(m), g_(m.geo()), ops_(ops), stream_((cudaStream_t) stream), cap_(cap) {}
     ~PrefillImpl() override {
+        finish_reads(ahead_);
         for (void* p : allocs_) cudaFree(p);
     }
 
@@ -81,8 +84,9 @@ public:
         for (int off = 0; off < n; off += cap_) {
             const int T = std::min(cap_, n - off);
             err_.clear();
+            const int next_T = std::min(cap_, n - off - T);
             if (!chunk(tokens ? tokens + off : nullptr, embd ? embd + (size_t) off * g_.n_embd : nullptr, T, pos0 + off,
-                       off, hist)) {
+                       off, hist, tokens ? tokens + off + T : nullptr, next_T)) {
                 cudaStreamSynchronize(stream_);   // the layer ticks queued so far still point at this object
                 err = err_.empty() ? "deepseek41: prefill failed" : err_;
                 return false;
@@ -93,6 +97,45 @@ public:
     }
 
 private:
+    // The Engram rows of a chunk, requested ahead of it. A ticket left open holds the reader's pointer into `raw`.
+    struct EngramReads {
+        int64_t pos0 = -1;
+        int T = 0;
+        std::vector<std::vector<uint8_t>> raw;
+        std::vector<ngram::PleReader::Ticket> tickets;
+        std::vector<uint8_t> open;
+    };
+
+    void issue_reads(EngramReads& r, const int32_t* tokens, int T, int64_t pos0, const std::vector<int32_t>& hist) {
+        const EngramInfo& en = m_.pack().engram;
+        const int n_cols = en.hash.n_cols();
+        r.pos0 = pos0;
+        r.T = T;
+        r.raw.assign(en.layers.size(), {});
+        r.tickets.assign(en.layers.size(), {});
+        r.open.assign(en.layers.size(), 1);
+        int32_t prev[8] = {0};
+        const int np = en.hash.n_gram - 1;
+        for (int j = 0; j < np; ++j) {
+            const int64_t q = pos0 - np + j;
+            prev[j] = q >= 0 ? hist[(size_t) q] : 0;
+        }
+        for (size_t k = 0; k < en.layers.size(); ++k) {
+            std::vector<int32_t> ids((size_t) T * n_cols);
+            engram_hash(en.hash, (int) k, tokens, T, pos0, pos0 == 0 ? nullptr : prev, ids.data());
+            std::vector<uint32_t> rows(ids.begin(), ids.end());
+            r.raw[k].assign(rows.size() * en.row_bytes, 0);
+            r.tickets[k] = m_.engram_reader().issue(rows.data(), rows.size(), r.raw[k].data());
+        }
+    }
+
+    void finish_reads(EngramReads& r) {
+        std::string ignored;
+        for (size_t k = 0; k < r.open.size(); ++k)
+            if (r.open[k]) m_.engram_reader().collect(r.tickets[k], ignored);
+        r.open.clear();
+    }
+
     struct Tick {
         const std::function<void(int)>* fn = nullptr;
         int tokens = 0;
@@ -102,6 +145,8 @@ private:
         if (t->fn && *t->fn) (*t->fn)(t->tokens);
     }
     std::vector<Tick> ticks_;
+    EngramReads ahead_;
+    static constexpr size_t kEngramThreads = 8;
 
     bool fail(const std::string& s) {
         err_ = s;
@@ -113,7 +158,9 @@ private:
     }
 
     // `embd` set: the chunk is input embeddings, not tokens (picture rows).
-    bool chunk(const int32_t* tokens_in, const float* embd, int T, int64_t pos0, int off, std::vector<int32_t>& hist) {
+    // `next` and `next_T`: the chunk after this one, whose Engram reads start now.
+    bool chunk(const int32_t* tokens_in, const float* embd, int T, int64_t pos0, int off, std::vector<int32_t>& hist,
+               const int32_t* next, int next_T) {
         const size_t n = (size_t) g_.n_embd;
         void* st = stream_;
         std::string err;
@@ -134,25 +181,23 @@ private:
             DS_CUDA(cudaStreamSynchronize(stream_));
         }
 
-        // Engram rows for every Engram layer, requested now so the SSD reads overlap the first layers
+        // Engram rows for every Engram layer: this chunk's were requested a chunk ago, so their SSD reads overlapped it
         const EngramInfo& en = m_.pack().engram;
         const int n_cols = en.hash.n_cols();
-        std::vector<std::vector<uint8_t>> raw(en.layers.size());
-        std::vector<ngram::PleReader::Ticket> tickets(en.layers.size());
+        EngramReads cur;
+        struct Close {
+            PrefillImpl* s;
+            EngramReads* r;
+            ~Close() { s->finish_reads(*r); }
+        } close_reads{this, &cur};
         if (!en.layers.empty() && !embd) {
-            int32_t prev[8] = {0};
-            const int np = en.hash.n_gram - 1;
-            for (int j = 0; j < np; ++j) {
-                const int64_t q = pos0 - np + j;
-                prev[j] = q >= 0 ? hist[(size_t) q] : 0;
+            if (ahead_.pos0 == pos0 && ahead_.T == T) {
+                cur = std::move(ahead_);
+                ahead_ = EngramReads{};
+            } else {
+                issue_reads(cur, tokens, T, pos0, hist);
             }
-            for (size_t k = 0; k < en.layers.size(); ++k) {
-                std::vector<int32_t> ids((size_t) T * n_cols);
-                engram_hash(en.hash, (int) k, tokens, T, pos0, pos0 == 0 ? nullptr : prev, ids.data());
-                std::vector<uint32_t> rows(ids.begin(), ids.end());
-                raw[k].assign(rows.size() * en.row_bytes, 0);
-                tickets[k] = m_.engram_reader().issue(rows.data(), rows.size(), raw[k].data());
-            }
+            if (next && next_T > 0) issue_reads(ahead_, next, next_T, pos0 + T, hist);
         }
 
         const float* pre_prev = nullptr;
@@ -179,13 +224,23 @@ private:
         for (int il = 0; il < g_.n_layers; ++il) {
             for (size_t k = 0; k < en.layers.size(); ++k) {
                 if (en.layers[k] != il || embd) continue;   // picture rows get no Engram contribution
-                if (!m_.engram_reader().collect(tickets[k], err)) return fail(err);
+                cur.open[k] = 0;
+                if (!m_.engram_reader().collect(cur.tickets[k], err)) return fail(err);
                 const size_t nr = (size_t) T * n_cols;
                 std::vector<float> rows_f(nr * 256);
-                for (size_t r = 0; r < nr; ++r)
-                    for (int b = 0; b < 256 / 32; ++b)
-                        dequantize_iq4_nl(raw[k].data() + r * en.row_bytes + (size_t) b * 18,
-                                          rows_f.data() + r * 256 + (size_t) b * 32);
+                auto dequant = [&](size_t r0, size_t r1) {
+                    for (size_t r = r0; r < r1; ++r)
+                        for (int b = 0; b < 256 / 32; ++b)
+                            dequantize_iq4_nl(cur.raw[k].data() + r * en.row_bytes + (size_t) b * 18,
+                                              rows_f.data() + r * 256 + (size_t) b * 32);
+                };
+                {
+                    std::vector<std::thread> th;
+                    const size_t step = nr / kEngramThreads + 1;
+                    for (size_t r0 = step; r0 < nr; r0 += step) th.emplace_back(dequant, r0, std::min(nr, r0 + step));
+                    dequant(0, std::min(nr, step));
+                    for (std::thread& t : th) t.join();
+                }
                 DS_CUDA(cudaMemcpyAsync(rows_all_, rows_f.data(), rows_f.size() * sizeof(float), cudaMemcpyHostToDevice,
                                         stream_));
                 DS_CUDA(cudaStreamSynchronize(stream_));
