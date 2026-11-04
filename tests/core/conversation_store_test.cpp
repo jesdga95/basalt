@@ -41,11 +41,11 @@ void fill(ConversationBuffer& b, size_t n) {
 ConversationCheckpoint state(const std::vector<int32_t>& ids, size_t len) {
     ConversationCheckpoint c;
     c.ids.assign(ids.begin(), ids.begin() + (std::ptrdiff_t) len);
-    fill(c.gdn, (3u << 20) + 123);
-    fill(c.ple, 1024);
-    fill(c.tails, 12 * 3 * 512);
-    fill(c.dead, 12 * 512);
-    fill(c.block_pos, 12 * 4);
+    fill(c.state_a, (3u << 20) + 123);
+    fill(c.state_b, 1024);
+    fill(c.state_c, 12 * 3 * 512);
+    fill(c.state_d, 12 * 512);
+    fill(c.state_e, 12 * 4);
     return c;
 }
 
@@ -97,7 +97,7 @@ uint64_t dir_bytes(const std::string& dir, size_t* count = nullptr) {
 }
 
 bool same_state(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
-    return a.gdn == b.gdn && a.ple == b.ple && a.tails == b.tails && a.dead == b.dead && a.block_pos == b.block_pos;
+    return a.state_a == b.state_a && a.state_b == b.state_b && a.state_c == b.state_c && a.state_d == b.state_d && a.state_e == b.state_e;
 }
 
 // the checks every cut image passes: live = the state at `at`, K/V the prefix up to it
@@ -140,7 +140,7 @@ SavedConversation chat(const std::vector<int32_t>& ids, const std::vector<std::p
 }
 
 void copy_state_bytes(ConversationCheckpoint& to, const ConversationCheckpoint& from) {
-    to.gdn = from.gdn; to.ple = from.ple; to.tails = from.tails; to.dead = from.dead; to.block_pos = from.block_pos;
+    to.state_a = from.state_a; to.state_b = from.state_b; to.state_c = from.state_c; to.state_d = from.state_d; to.state_e = from.state_e;
 }
 
 // state files in `dir` ("<identity>-s<key>.bcs")
@@ -236,11 +236,11 @@ int main() {
         SavedConversation next = src;
         next.live = state(ids2, ids2.size());
         next.checkpoints.push_back(state(ids2, ids.size()));
-        next.checkpoints.back().gdn = src.live.gdn;   // the turn's checkpoint: the state the conversation had
-        next.checkpoints.back().ple = src.live.ple;
-        next.checkpoints.back().tails = src.live.tails;
-        next.checkpoints.back().dead = src.live.dead;
-        next.checkpoints.back().block_pos = src.live.block_pos;
+        next.checkpoints.back().state_a = src.live.state_a;   // the turn's checkpoint: the state the conversation had
+        next.checkpoints.back().state_b = src.live.state_b;
+        next.checkpoints.back().state_c = src.live.state_c;
+        next.checkpoints.back().state_d = src.live.state_d;
+        next.checkpoints.back().state_e = src.live.state_e;
         next.live.ids = ids2;
         SavedConversation longer = image(ids2, {});
         for (size_t i = 0; i < next.kv.size(); ++i) {   // the old cells' bytes, then new ones
@@ -262,7 +262,7 @@ int main() {
         const auto s = st.stats();
         CHECK(s.files == 1 && s.written == 1);
         // the turn's checkpoint and its tail; no live state, no block and no old checkpoint again
-        CHECK(s.written_bytes < (uint64_t) (keep.live.gdn.size() + 3 * (2u << 20)));
+        CHECK(s.written_bytes < (uint64_t) (keep.live.state_a.size() + 3 * (2u << 20)));
         CHECK(dir_bytes(dir) < before + s.written_bytes);   // the old conversation file is gone
         std::vector<int32_t> p = ids2;
         p.push_back(1);

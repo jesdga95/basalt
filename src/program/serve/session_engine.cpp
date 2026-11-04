@@ -111,9 +111,9 @@ public:
         basalt::core::SavedConversation image;
         image.live.ids = live;
         image.live.imgs = live_imgs;
-        image.live.gdn.resize(running + cells);
-        if (const basalt::model::Result r = session().save_running(image.live.gdn.data(), positions); !r.ok()) { err = r.message; return false; }
-        if (const basalt::model::Result r = session().save_cells(image.live.gdn.data() + running, positions); !r.ok()) { err = r.message; return false; }
+        image.live.state_a.resize(running + cells);
+        if (const basalt::model::Result r = session().save_running(image.live.state_a.data(), positions); !r.ok()) { err = r.message; return false; }
+        if (const basalt::model::Result r = session().save_cells(image.live.state_a.data() + running, positions); !r.ok()) { err = r.message; return false; }
         image.checkpoints = checks;
         image.cvec = cvec_cached;
         (void) conversations->put(std::move(image));
@@ -146,8 +146,8 @@ public:
         c.source = source;
         c.ids.assign(prompt.begin(), prompt.begin() + to);
         c.imgs = imgs_below(req_imgs, to);
-        c.gdn.resize(session().running_bytes());
-        if (const basalt::model::Result r = session().save_running(c.gdn.data(), to); !r.ok()) {
+        c.state_a.resize(session().running_bytes());
+        if (const basalt::model::Result r = session().save_running(c.state_a.data(), to); !r.ok()) {
             err = r.message;
             return false;
         }
@@ -254,7 +254,7 @@ private:
     Flow decode() override { return decode_loop(*this); }
     bool release_room() override { return true; }
     bool checkpoint_mount(const ConvCheckpoint& c) override {
-        const basalt::model::Result r = rt_.session().restore_running(c.gdn.data(), (int64_t) c.ids.size());
+        const basalt::model::Result r = rt_.session().restore_running(c.state_a.data(), (int64_t) c.ids.size());
         if (!r.ok()) runtime_.err = r.message;
         return r.ok();
     }
@@ -272,8 +272,8 @@ private:
     Flow restore_image() override {
         const int64_t positions = (int64_t) incoming->live.ids.size();
         const size_t running = rt_.session().running_bytes();
-        basalt::model::Result r = rt_.session().restore_cells(incoming->live.gdn.data() + running, positions);
-        if (r.ok()) r = rt_.session().restore_running(incoming->live.gdn.data(), positions);
+        basalt::model::Result r = rt_.session().restore_cells(incoming->live.state_a.data() + running, positions);
+        if (r.ok()) r = rt_.session().restore_running(incoming->live.state_a.data(), positions);
         if (r.ok()) r = rt_.session().set_history(incoming->live.ids.data(), positions);
         if (!r.ok()) {
             basalt::log::warn("basalt serve", "conversation cache: restoring a parked conversation failed (%s); reading the prompt from the start", r.message.c_str());

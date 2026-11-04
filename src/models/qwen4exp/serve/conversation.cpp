@@ -68,7 +68,7 @@ void QfnRuntime::ckd_finish() {
     if (ckd.finish(ce)) return;
     basalt::log::error("basalt serve", "%s", ce.c_str());
     checks.erase(std::remove_if(checks.begin(), checks.end(),
-                                [&](const ConvCheckpoint& k) { return k.gdn.data() == dst; }), checks.end());
+                                [&](const ConvCheckpoint& k) { return k.state_a.data() == dst; }), checks.end());
 }
 
 // Whether the disk tier needs no new copy of a conversation: it is short (below the disk's minimum, or below
@@ -263,11 +263,11 @@ bool QfnRuntime::checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts, bo
     c.imgs = imgs_below(req_imgs, L);
     if (parts != nullptr) {
         if (parts->size() != stages.size() + 1) return false;
-        c.gdn = std::move((*parts)[0].gdn);
-        c.ple = std::move((*parts)[0].ple);
-        c.tails = std::move((*parts)[0].tails);
-        c.dead = std::move((*parts)[0].dead);
-        c.block_pos = std::move((*parts)[0].block_pos);
+        c.state_a = std::move((*parts)[0].state_a);
+        c.state_b = std::move((*parts)[0].state_b);
+        c.state_c = std::move((*parts)[0].state_c);
+        c.state_d = std::move((*parts)[0].state_d);
+        c.state_e = std::move((*parts)[0].state_e);
         for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
     } else {
         if (!gpu_sync_ok()) return false;
@@ -291,7 +291,7 @@ bool QfnRuntime::checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts, bo
         for (const ConvCheckpoint& k : checks) stamps.push_back(k.used);
         const size_t victim = basalt::program::conv_cache::eviction_victim(stamps.data(), stamps.size(),
                                                                            o.prompt_cache);
-        if (checks[victim].gdn.data() == ckd.pending()) ckd_finish();
+        if (checks[victim].state_a.data() == ckd.pending()) ckd_finish();
         checks.erase(checks.begin() + (std::ptrdiff_t) victim);
     }
     return true;
@@ -536,9 +536,9 @@ int QfnRuntime::init_conversations() {
         ConvCheckpoint warm;   // one set of pooled blocks, page-faulted now instead of on the first request
         const ConvStateSizes zw = conv_state_sizes(g, ss);
         if (o.prompt_cache > 0) {
-            warm.gdn.resize(zw.gdn);
-            std::memset(warm.gdn.data(), 0, warm.gdn.size());
-            if (ss.ple_hist) { warm.ple.resize(zw.ple); std::memset(warm.ple.data(), 0, warm.ple.size()); }
+            warm.state_a.resize(zw.gdn);
+            std::memset(warm.state_a.data(), 0, warm.state_a.size());
+            if (ss.ple_hist) { warm.state_b.resize(zw.ple); std::memset(warm.state_b.data(), 0, warm.state_b.size()); }
         }
         if (o.prompt_cache > 0 && !multi_gpu) {
             std::string ce;
@@ -633,7 +633,7 @@ int QfnRuntime::init_conversations() {
                     part_at.erase(part_at.begin(), part_at.upper_bound(done));
                 }
                 bool complete = parts.size() == stages.size() + 1;
-                for (const ConvCheckpoint& k : parts) complete = complete && !k.gdn.empty();
+                for (const ConvCheckpoint& k : parts) complete = complete && !k.state_a.empty();
                 saved = !complete || checkpoint_at(done, &parts);   // an incomplete set: no checkpoint here
             } else {
                 saved = checkpoint_at(done);

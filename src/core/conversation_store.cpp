@@ -194,7 +194,7 @@ Section& add_kv(Srcs& v, uint32_t kind, uint32_t index, uint64_t n, const Conver
 }
 
 void add_state(Srcs& v, const ConversationCheckpoint& c, uint32_t index) {
-    const CheckpointBytes* f[5] = {&c.gdn, &c.ple, &c.tails, &c.dead, &c.block_pos};
+    const CheckpointBytes* f[5] = {&c.state_a, &c.state_b, &c.state_c, &c.state_d, &c.state_e};
     for (int k = 0; k < 5; ++k) {
         const CheckpointBytes* b = f[k];
         add(v, kGdn + k, index, b->size(), [b](uint64_t o, uint8_t* d, uint64_t n) { std::memcpy(d, b->data() + o, n); },
@@ -774,7 +774,7 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
         if (P != n_ids && cut.live < 0) { error = "conversation store: no state at the match"; return false; }
         const ConversationCheckpoint& state = cut.live < 0 ? src.live : src.checkpoints[(size_t) cut.live];
         auto copy_state = [&](const ConversationCheckpoint& from, ConversationCheckpoint& to) {
-            to.gdn = from.gdn; to.ple = from.ple; to.tails = from.tails; to.dead = from.dead; to.block_pos = from.block_pos;
+            to.state_a = from.state_a; to.state_b = from.state_b; to.state_c = from.state_c; to.state_d = from.state_d; to.state_e = from.state_e;
         };
         copy_state(state, img.live);
         img.geometry = src.geometry;
@@ -886,11 +886,11 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
     std::vector<Part> parts;
     auto state_field = [](ConversationCheckpoint& c, uint32_t kind) -> CheckpointBytes& {
         switch (kind) {
-            case kGdn: return c.gdn;
-            case kPle: return c.ple;
-            case kTails: return c.tails;
-            case kDead: return c.dead;
-            default: return c.block_pos;
+            case kGdn: return c.state_a;
+            case kPle: return c.state_b;
+            case kTails: return c.state_c;
+            case kDead: return c.state_d;
+            default: return c.state_e;
         }
     };
     auto read_state = [&](size_t file, uint32_t index, ConversationCheckpoint& c) {
@@ -1026,8 +1026,8 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
     if (cut.live >= 0) {
         at.ids = img.live.ids;
         at.imgs = img.live.imgs;
-        at.gdn = img.live.gdn; at.ple = img.live.ple; at.tails = img.live.tails; at.dead = img.live.dead;
-        at.block_pos = img.live.block_pos;
+        at.state_a = img.live.state_a; at.state_b = img.live.state_b; at.state_c = img.live.state_c; at.state_d = img.live.state_d;
+        at.state_e = img.live.state_e;
         img.checkpoints.push_back(std::move(at));
     }
     out = std::move(img);
@@ -1076,11 +1076,11 @@ bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap) {
     if (deepest >= 2 && deepest < image.live.ids.size() && image.live.ids.size() - deepest <= (size_t) kLiveSlack) {
         image.live.ids.resize(deepest);
         image.live.imgs = imgs_below(image.live.imgs, (int64_t) deepest);
-        image.live.gdn = {};
-        image.live.ple = {};
-        image.live.tails = {};
-        image.live.dead = {};
-        image.live.block_pos = {};
+        image.live.state_a = {};
+        image.live.state_b = {};
+        image.live.state_c = {};
+        image.live.state_d = {};
+        image.live.state_e = {};
     }
     const uint64_t bytes = image.bytes();
     std::lock_guard<std::mutex> lk(mu_);
