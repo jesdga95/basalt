@@ -9,6 +9,7 @@
 #include "basalt/platform/memory.hpp"
 #include "basalt/platform/process.hpp"
 #include "basalt/platform/system.hpp"
+#include "basalt/program/grammar/tool_form.hpp"
 #include "basalt/program/options.hpp"
 
 #include <cstdio>
@@ -90,7 +91,10 @@ std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& 
     out = adapter != nullptr ? adapter->make_options() : std::make_unique<CommonOptions>();
     CommonOptions& o = *out;
     if (const auto code = parse_options(argc, argv, o, adapter)) return *code;
-    if (adapter != nullptr) pack_tokens(*adapter, o);
+    if (adapter != nullptr) {
+        pack_tokens(*adapter, o);
+        basalt::program::grammar::set_tool_form(adapter->tool_form());
+    }
     // Batched serving reads a prompt on its own thread while verify windows run.  A lazy kernel load on that thread
     // synchronizes the context and can wait on a window kernel that waits on the load, so batched serving loads every
     // kernel up front.  An explicit CUDA_MODULE_LOADING wins.

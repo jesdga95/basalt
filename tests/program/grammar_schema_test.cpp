@@ -1,5 +1,6 @@
 // tests/program/grammar_schema_test.cpp - schema-to-GBNF and the tool-call grammar, checked by running JSON text and
 // tool-call text through the parsed grammar.
+#include "tool_form_fixture.hpp"
 #include "basalt/program/grammar/grammar.hpp"
 #include "basalt/program/grammar/schema.hpp"
 
@@ -160,7 +161,7 @@ static void test_tools() {
     CHECK(call_ok(g, "<tool_call>\n<function=ping>\n</function>\n</tool_call>\n<tool_call>\n<function=ping>\n</function>\n</tool_call>"));
     // stays inactive until the trigger
     Triggers tr;
-    tr.words = {tool_call_trigger()};
+    tr.words = {basalt::program::grammar::tool_form().trigger};
     GrammarState s(g, tr);
     CHECK(!s.active());
     CHECK(s.accept("I will check the weather. Let me <call"));
@@ -345,6 +346,7 @@ static void test_control_escapes() {
 }
 
 int main() {
+    set_test_tool_form();
     test_request();
     test_scalars();
     test_enum_const();
