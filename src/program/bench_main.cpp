@@ -419,6 +419,12 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
             err = "--community needs --submitter NAME, the name shown in the table";
             return false;
         }
+        if (o.submitter.size() > 40) { err = "--submitter must be at most 40 characters"; return false; }
+        for (unsigned char c : o.submitter)
+            if (c < 0x20 || c == 0x7f || std::isspace(c)) {
+                err = "--submitter must be one name with no spaces or control characters";
+                return false;
+            }
     }
     if (!o.community_file.empty() && !o.community) { err = "--community-file needs --community"; return false; }
     if (o.reps < 1) { err = "-r needs N >= 1"; return false; }
@@ -1262,6 +1268,9 @@ int main(int argc, char** argv) {
                 j.key("tokens_per_pass"); j.num(r.d.generated > r.d.accepted ? (double) r.d.generated / (double) (r.d.generated - r.d.accepted) : 0.0);
                 j.key("mean_draft_len"); j.num(r.d.offered > 0 ? (double) r.d.offered / window_count(r) : 0.0);
                 j.key("finish"); j.str(r.d.finish);
+                j.key("hit_pct"); j.num(r.d.lookups > 0 ? 100.0 * (double) r.d.hits / (double) r.d.lookups : 0.0);
+                j.key("hits"); j.integer(r.d.hits);
+                j.key("lookups"); j.integer(r.d.lookups);
                 if (r.name == "struct") { j.key("checksum_ok"); j.boolean(!r.checksum_bad); }
                 if (r.win.present) {
                     j.key("windows"); j.integer(r.win.windows);

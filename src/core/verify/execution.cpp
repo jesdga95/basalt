@@ -4,7 +4,6 @@
 #include "diagnostics.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/verify.hpp"
-#include "basalt/core/remote_expert_opt.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
@@ -130,6 +129,9 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
         cudaStreamWaitEvent(cs_, wait_ev_, 0);
         wait_ev_ = nullptr;
     }
+    *(volatile int32_t*) h_head_from_ = head_sampling_ ? std::clamp(head_from_, 0, T) : T;
+    head_from_ = 0;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     set_head_keep(head_keep());
     if (!hs_launch(T, err)) return false;
     const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
@@ -140,7 +142,7 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     // a sampled or penalized request's head sampling queued behind the window now, not after a sync
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     const bool biased = sampling_.logit_bias != nullptr;
-    const bool early_sample = chain_on() && le_ >= g.n_layers && head_sampling_ && (sampled || hist_d_ != nullptr || biased);
+    const bool early_sample = le_ >= g.n_layers && head_sampling_ && (sampled || hist_d_ != nullptr || biased);
     // the draft probe: row t asks for the probability of the window's token t + 1
     const bool probe = draft_probe_ && head_sampling_ && sampled && T > 1 && le_ >= g.n_layers;
     // the sampled rows' kept lists; the wide path keeps none
@@ -160,7 +162,6 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     (void) cudaStreamQuery(cs_);
     if (post_launch_) { auto f = std::move(post_launch_); post_launch_ = nullptr; f(); }
     gm.mark(15);
-    volatile uint32_t* const flag = h_flag_;
     fl_.T = T;
     fl_.pos0 = pos0;
     fl_.k = 0;
@@ -174,15 +175,9 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
         if (do_ple) {
             const Clock::time_point tp = Clock::now();
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            _mm_sfence();
-            *flag = 1;
-            *(volatile uint32_t*) (h_flag_ + 8) = 1;
             ms_host += ms_since(tp);
-        } else {
-            *flag = 1;
-            *(volatile uint32_t*) (h_flag_ + 8) = 1;
         }
+        ar_handoff();
     } else {
     // the side branch of layer 1's PLE projections waits for the rows alone
     const bool ple_early = ple_side_ && do_ple;
@@ -258,7 +253,6 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
         set_plan_slot();
         const int n = T;
         progress_at("verify window: the CPU experts of layer", l);
-        if (remote_opt_) remote_opt_->begin(h_w_, 0, n);
         if (dm_ != nullptr) {   // the ring's own rows and tiers: the pool computes the CPU's entries only
             const basalt::kernels::DmRing& R = dm_->h_ring[k];
             sink_.ext_kind = R.kind;
@@ -268,7 +262,6 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
         } else if (pool != nullptr)
             pool(user, h_x_, h_ids_, n, ss.k,
                  h_ymiss_, l);
-        if (remote_opt_) remote_opt_->end();
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
@@ -323,6 +316,22 @@ bool Verifier::window_intact(std::string& err) {
     return false;
 }
 
+// The zero-doorbell graph plans every layer on the device and never rings h_seq_: the host raises the hand-off once,
+// after the window's PLE rows are in h_ple_, and then only waits for the window's end.
+void Verifier::ar_handoff() {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+    *(volatile uint32_t*) h_flag_ = 1;
+    *(volatile uint32_t*) (h_flag_ + 8) = 1;
+}
+
+bool Verifier::ar_plan_intact(std::string& err) {
+    if (!ar_on() || ar_forced_ || h_plan_err_ == nullptr || *(volatile uint32_t*) h_plan_err_ == 0) return true;
+    *(volatile uint32_t*) h_plan_err_ = 0;   // the table changed under the window
+    err = "verify: the zero-doorbell plan met an expert that is not in VRAM (the residency table changed during the window)";
+    return false;
+}
+
 // The window's end: the GPU's finish, the profile, and on the last stage the head's picks.
 bool Verifier::run_end(int32_t* out, std::string& err) {
     using namespace basalt::kernels;
@@ -346,11 +355,7 @@ bool Verifier::run_end(int32_t* out, std::string& err) {
         return false;
     }
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
-    if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // the table changed under the window
-        *(volatile uint32_t*) h_plan_err_ = 0;
-        err = "verify: the zero-doorbell plan met an expert that is not in VRAM (the residency table changed during the window)";
-        return false;
-    }
+    if (!ar_plan_intact(err)) return false;
     constexpr int64_t wstat_every = 200;   // windows per report
     if (dm_ != nullptr && dm_->wstat != nullptr && (dm_->wstat_t += T, ++dm_->wstat_windows == wstat_every)) {
         // --wait-stats: the last wstat_every windows' counters

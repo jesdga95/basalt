@@ -357,7 +357,7 @@ class EveryOption(unittest.TestCase):
             return 0.5 if SAMPLING_KEYS[act.dest][0] is float else 7
         # a path the config file resolves against its own directory: absolute in this platform's own form, so the
         # resolution leaves it as it is
-        return str(Path(TMP.name) / "x") if act.dest in ("model", "tokenizer") else "x"
+        return str(Path(TMP.name) / "x") if act.dest in ("model", "tokenizer", "image_dir") else "x"
 
     def test_every_server_option_by_both_paths(self):
         ap = build_parser()
@@ -367,7 +367,7 @@ class EveryOption(unittest.TestCase):
                 continue
             v = "localhost" if name == "host" else self.sample(act)
             if isinstance(act, argparse._AppendAction):
-                cli, cfgv = ["--" + name, "x"], ["x"]
+                cli, cfgv = ["--" + name, str(v)], [v]
             elif v is True:
                 cli, cfgv = ["--" + name], True
             else:

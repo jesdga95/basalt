@@ -148,12 +148,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const block_iq2_xxs * bxi = (const block_iq2_xxs *) x + kbx0 + i*stride;
 
         const int q2 = get_int_b2(bxi->qs, 2*kqsx+0);
-        const uint8_t * aux8 = (const uint8_t *) &q2;
         const uint32_t aux32 = get_int_b2(bxi->qs, 2*kqsx+1);
 
 #pragma unroll
         for (int l = 0; l < QR2_XXS; ++l) {
-            const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[l]];
+            const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[packed_byte(q2, l)];
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * l));
 
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
@@ -245,19 +244,18 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const block_iq2_s * bxi = (const block_iq2_s *) x + kbx0 + i*stride;
 
         const int       qs_packed = get_int_b2(bxi->qs, kqsx);
-        const uint8_t * qs        = (const uint8_t *) &qs_packed;
 
         const int qh = bxi->qh[kqsx];
 
         const int       signs_packed_32 = get_int_b2(bxi->qs, QK_K/32 + kqsx);
-        const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
 
 #pragma unroll
         for (int l = 0; l < QR2_S; ++l) {
-            const int * grid_pos = (const int *)(iq2s_grid + (qs[l] | ((qh << (8-2*l)) & 0x300)));
+            const int * grid_pos = (const int *)(iq2s_grid + (packed_byte(qs_packed, l) | ((qh << (8-2*l)) & 0x300)));
 
-            const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
-            const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
+            const uint32_t sgn = packed_byte(signs_packed_32, l);
+            const int signs0 = __vcmpne4(((sgn & 0x03) << 7) | ((sgn & 0x0C) << 21), 0x00000000);
+            const int signs1 = __vcmpne4(((sgn & 0x30) << 3) | ((sgn & 0xC0) << 17), 0x00000000);
 
             const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
             const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
@@ -298,12 +296,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const block_iq3_xxs * bxi = (const block_iq3_xxs *) x + kbx0 + i*stride;
 
         const int2 q3_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
-        const uint8_t * q3 = (const uint8_t *) &q3_packed;
         const uint32_t aux32 = get_int_b2(bxi->qs, QK_K/16 + kqsx);
 
 #pragma unroll
         for (int l = 0; l < QR3_XXS; ++l) {
-            const int2 grid_pos = make_int2(iq3xxs_grid[q3[2*l+0]], iq3xxs_grid[q3[2*l+1]]);
+            const int2 grid_pos = make_int2(iq3xxs_grid[packed_byte(q3_packed, 2*l+0)], iq3xxs_grid[packed_byte(q3_packed, 2*l+1)]);
             const uint32_t signs = unpack_ksigns(aux32 >> (7*l));
 
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
@@ -347,21 +344,20 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const block_iq3_s * bxi = (const block_iq3_s *) x + kbx0 + i*stride;
 
         const int2      qs_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
-        const uint8_t * qs        = (const uint8_t *) &qs_packed;
 
         const int qh = bxi->qh[kqsx];
 
         const int       signs_packed_32 = get_int_b2(bxi->signs, kqsx);
-        const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
 
 #pragma unroll
         for (int l = 0; l < QR3_S; ++l) {
             const int2 grid_pos = make_int2(
-                iq3s_grid[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
-                iq3s_grid[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
+                iq3s_grid[packed_byte(qs_packed, 2*l+0) | ((qh << (8 - 2*l)) & 0x100)],
+                iq3s_grid[packed_byte(qs_packed, 2*l+1) | ((qh << (7 - 2*l)) & 0x100)]);
 
-            const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
-            const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
+            const uint32_t sgn = packed_byte(signs_packed_32, l);
+            const int signs0 = __vcmpne4(((sgn & 0x03) << 7) | ((sgn & 0x0C) << 21), 0x00000000);
+            const int signs1 = __vcmpne4(((sgn & 0x30) << 3) | ((sgn & 0xC0) << 17), 0x00000000);
 
             const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
             const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
@@ -652,14 +648,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const int sc32 = unpack_scales_q45_K(scales, ksc + 0);
         const int  m32 = unpack_scales_q45_K(scales, ksc + 2);
 
-        const uint8_t * sc8 = (const uint8_t *) &sc32;
-        const uint8_t *  m8 = (const uint8_t *)  &m32;
-
         const half2 dm = bxi->dm * make_half2(1.0f, -1.0f);
 
 #pragma unroll
         for (int l = 0; l < int(sizeof(int)); ++l) {
-            x_dm[i*sram_stride + sizeof(int)*ksc + l] = dm*make_half2(sc8[l], m8[l]);
+            x_dm[i*sram_stride + sizeof(int)*ksc + l] = dm*make_half2((int) packed_byte(sc32, l), (int) packed_byte(m32, l));
         }
     }
 }
@@ -721,14 +714,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const int sc32 = unpack_scales_q45_K(scales, ksc + 0);
         const int  m32 = unpack_scales_q45_K(scales, ksc + 2);
 
-        const uint8_t * sc8 = (const uint8_t *) &sc32;
-        const uint8_t *  m8 = (const uint8_t *)  &m32;
-
         const half2 dm = bxi->dm * make_half2(1.0f, -1.0f);
 
 #pragma unroll
         for (int l = 0; l < int(sizeof(int)); ++l) {
-            x_dm[i*sram_stride + sizeof(int)*ksc + l] = dm*make_half2(sc8[l], m8[l]);
+            x_dm[i*sram_stride + sizeof(int)*ksc + l] = dm*make_half2((int) packed_byte(sc32, l), (int) packed_byte(m32, l));
         }
     }
 }

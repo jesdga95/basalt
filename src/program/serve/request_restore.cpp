@@ -13,23 +13,6 @@ bool Request::starts_with(const std::vector<int32_t>& pre, const std::vector<Img
 }
 
 Flow Request::restore() {
-    remote_before = {};
-    launches_before = {};
-    compact_before = {};
-    full_before = {};
-    // ms_begin/ms_wait are cumulative since boot; take deltas here like every other column, so the host time
-    // reads as belonging to this request.
-    begin_before = {};
-    wait_before = {};
-    for (int r = 0; r < 3; ++r) if (runtime_.o.expert_cache_remote[(size_t) r] > 0)
-    {
-        remote_before[(size_t) r] = runtime_.remote_experts[(size_t) r].computed();
-        launches_before[(size_t) r] = runtime_.remote_experts[(size_t) r].launched_layers();
-        compact_before[(size_t) r] = runtime_.remote_experts[(size_t) r].returned_bytes();
-        full_before[(size_t) r] = runtime_.remote_experts[(size_t) r].full_row_bytes();
-        begin_before[(size_t) r] = runtime_.remote_experts[(size_t) r].ms_begin();
-        wait_before[(size_t) r] = runtime_.remote_experts[(size_t) r].ms_wait();
-    }
     runtime_.cur = ids;
     // The conversation cache's keys are int32: one narrow view per request, so a parked entry or a checkpoint
     // is matched by one bulk compare over the slice instead of a per-token scan.
@@ -289,6 +272,10 @@ Flow Request::restore() {
     runtime_.park_keep = slot_source;   // the conversation this request continues stays where it is
     keep_routed.emplace(runtime_.kv_keep_routed);
     runtime_.kv_keep_routed = runtime_.batch_on();
+    runtime_.peer_due.clear();
+    runtime_.peer_due_off = runtime_.peer_due_lent_n = 0;
+    defer_peer.emplace(runtime_.peer_defer);
+    runtime_.peer_defer = !in_slot;
     kv_ok = runtime_.kv_fit(*runtime_.rsp, kv_need + runtime_.kKvGrowCells, runtime_.err, true, kv_need + runtime_.kKvWindowCells);
     if (!kv_ok && runtime_.kv_short) {   // the other sessions' spare cells first
         int64_t given = 0;

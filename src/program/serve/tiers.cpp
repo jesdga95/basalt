@@ -156,7 +156,7 @@ void Runtime::rank_swaps(std::vector<Swap>& swaps, bool across) {
             for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                 const int32_t rk = prof_rank[(size_t) (l * g.n_expert + e)];
                 if (r[e] >= 0) vict.push_back({u[e], rk, (int32_t) l, e});
-                else if (u[e] >= 1.5f && !(remote_opt && remote_opt->owns(l, e)))
+                else if (u[e] >= 1.5f)
                     cand.push_back({peer.valid() && peer.has(l, e) ? u[e] - promote_margin : u[e], rk, (int32_t) l, e});
             }
         }
@@ -194,7 +194,7 @@ void Runtime::rank_swaps(std::vector<Swap>& swaps, bool across) {
         for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
             if (r[e] < 0) {
                 const bool on_peer = peer.valid() && peer.has(l, e);
-                if (u[e] >= 2.0f && !(remote_opt && remote_opt->owns(l, e)))
+                if (u[e] >= 2.0f)
                     cand.emplace_back(on_peer ? u[e] - margin : u[e], e);
             }
             else vict.emplace_back(u[e], e);
@@ -226,8 +226,7 @@ void Runtime::rank_once(std::vector<Swap>& swaps, size_t room) {
             const size_t i = (size_t) (l * g.n_expert + e);
             if (r[e] >= 0) {
                 if (!taken[i] && u[e] < 1.5f - once_bar) vict.push_back({u[e], prof_rank[i], (int32_t) l, e});
-            } else if (u[e] >= once_bar && u[e] < 1.5f && !(peer.valid() && peer.has(l, e)) &&
-                       !(remote_opt && remote_opt->owns(l, e))) {
+            } else if (u[e] >= once_bar && u[e] < 1.5f && !(peer.valid() && peer.has(l, e))) {
                 cand.push_back({u[e], prof_rank[i], (int32_t) l, e});
             }
         }
@@ -249,7 +248,6 @@ void Runtime::rank_once(std::vector<Swap>& swaps, size_t room) {
 
 bool Runtime::adapt() {
     if (!pending.empty()) return true;   // the previous swaps are still in flight
-    if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
     std::vector<Swap> swaps;
     rank_swaps(swaps, false);
     if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
@@ -477,7 +475,7 @@ bool Runtime::xq_advance(bool wait) {
             pw = w;
         }
         if (deferred) {   // the RAM copies are queued once the next window is launched, and run beside it
-            ver.set_post_launch([&, pw] {
+            auto copies = [&, pw] {
                 const auto& lay2 = basalt::kernels::cpu::expert_layout();
                 std::vector<uint32_t> ord;   // layer order: a layer's word goes up right after its own copies
                 for (uint32_t i = 0; i < (uint32_t) xq.size(); ++i)
@@ -497,7 +495,13 @@ bool Runtime::xq_advance(bool wait) {
                                      cudaGetErrorString(cudaGetLastError()));
                 }
                 cudaEventRecord(adapt_ev, adapt_stream);
-            });
+            };
+            // a copy from pageable RAM holds the calling thread until the copy runs, and a window launched ahead of it
+            // waits for that thread to serve its rings: such a round's copies are queued here, before the window
+            if (std::all_of(xq.begin(), xq.end(), [&](const XSwap& x) { return x.p2p || srcp->pinned(x.layer, x.in); }))
+                ver.set_post_launch(std::move(copies));
+            else
+                copies();
         } else {
             cudaEventRecord(adapt_ev, adapt_stream);
         }
@@ -585,7 +589,7 @@ int Runtime::init_tiers() {
     // are resident and their RAM places free.  Step (2) waits for the eviction copies; at step (3) the next
     // window's gate/up launches wait for their own layer's incoming copies (the landed words below), so the loop
     // does not, and where an expert runs depends only on the window count, as with the plain rounds.
-    adapt_fast = !multi_gpu && !remote_opt;
+    adapt_fast = !multi_gpu;
     // Its rounds come every --adapt-every windows, so the counts decay less per round than the plain default
     // (--adapt-decay when given, else 0.85): the routing counts stay large enough for the thresholds and the peer
     // margin.

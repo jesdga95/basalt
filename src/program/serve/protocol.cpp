@@ -258,8 +258,7 @@ int Runtime::announce() {
     {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        // "Experts in VRAM" is every tier, not one card's.  The tiers are disjoint by construction
-        // (remote_experts.cpp skips any pair a stage already claimed), so they add.
+        // "Experts in VRAM" is every stage's cache, not one card's.  The caches hold disjoint pairs, so they add.
         const int64_t slots_primary = (int64_t) xcache.slots();
         const int64_t mib_primary = (int64_t) (xcache.bytes() >> 20);
         int64_t slots_all = slots_primary, mib_all = mib_primary;
@@ -267,11 +266,6 @@ int Runtime::announce() {
             slots_all += (int64_t) st->cache.slots();
             mib_all += (int64_t) (st->cache.bytes() >> 20);
         }
-        for (int r = 0; r < 3; ++r)
-            if (o.expert_cache_remote[(size_t) r] > 0) {
-                slots_all += remote_experts[(size_t) r].resident();
-                mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
-            }
         // the pack's quantization label (the last word of its name, without the publisher's prefixes) and the PCI
         // bus ids of the cards this engine computes on, primary first: what a benchmark row records
         std::string quant_label, gpu_ids;
@@ -293,7 +287,7 @@ int Runtime::announce() {
                     "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                     "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                     "conversation_cache_mib=%lld conversation_cache_slots=%d "
-                    "conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d%s quant=%s gpus=%s engine=" BASALT_VERSION "\n",
+                    "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%d tail_role_token=%lld vram_elastic=%d%s quant=%s gpus=%s engine=" BASALT_VERSION "\n",
                     (long long) n_vocab, (long long) o.max_context, o.kv.c_str(),
                     (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                      ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -304,7 +298,7 @@ int Runtime::announce() {
                     (long long) ((o.mmap_experts ? src.resident_bytes() : basalt::kernels::cpu::expert_layout().total) >> 20),
                     pool.workers(), o.pcie_frac,
                     (long long) o.conversation_cache_mib, o.conversation_cache_slots,
-                    (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token, o.vram_elastic && xcache.segmented() ? 1 : 0,
+                    (long long) o.conversation_cache_min_free_mib, o.conversation_cache_min_tokens, (long long) o.tail_role_token, o.vram_elastic && xcache.segmented() ? 1 : 0,
                     o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                    " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                    " slot0_solo=" + std::to_string(slot0_is_solo ? 1 : 0) +

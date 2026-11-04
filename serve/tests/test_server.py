@@ -231,6 +231,9 @@ class ImageMarkers(unittest.TestCase):
             self.rows = self.dir / "img.sve"
             self.rows.write_bytes(b"rows")
 
+        def read(self, sources, allowed=None):
+            return sources
+
         def encode(self, sources):
             return self.rows, [3] * len(sources)
 
@@ -265,6 +268,9 @@ class ImageMarkers(unittest.TestCase):
         tok = ByteTokenizer()
 
         class Refuses:
+            def read(self, sources, allowed=None):
+                return sources
+
             def encode(self, sources):
                 raise ValueError("the image could not be read: the image needs 528 expert-cache slots and 454 can be lent")
 
@@ -1025,10 +1031,8 @@ class ClientShapes(unittest.TestCase):
         v = Vision.__new__(Vision)
         v.dir, v.lock, v.cache, v.cache_bytes, v.pinned = Path(tempfile.mkdtemp(prefix="basalt-vision-test-")), threading.Lock(), {}, 0, {}
         v.proc = mock.Mock(stdin=Gone())
-        with mock.patch.object(Vision, "load", return_value=b""), mock.patch.object(Vision, "normalize",
-                                                                                   return_value=b"png"):
-            with self.assertRaises(BrokenPipeError):
-                v.encode(["x"])
+        with self.assertRaises(BrokenPipeError):
+            v.encode([b"png"])
         self.assertEqual(list(v.dir.iterdir()), [])
         v.dir.rmdir()
 
@@ -1181,16 +1185,14 @@ class GpuChoice(unittest.TestCase):
         v = EngineVision({})
         v.attach(Eng())
         try:
-            with mock.patch.object(EngineVision, "load", side_effect=lambda s: s.encode()), \
-                    mock.patch.object(EngineVision, "normalize", side_effect=lambda d: d):
-                _, first = v.encode(["a", "b", "a"])
-                self.assertEqual(len(sent), 1)
-                self.assertEqual(len(sent[0]), 2)                       # the repeat is one image
-                self.assertEqual(first, [10, 11, 10])
-                v.encode(["b", "a"])                               # cached: the engine is not asked again
-                self.assertEqual(len(sent), 1)
-                self.assertEqual(v.encode(["c"])[1], [10])
-                self.assertEqual(len(sent), 2)
+            _, first = v.encode([b"a", b"b", b"a"])
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(len(sent[0]), 2)                       # the repeat is one image
+            self.assertEqual(first, [10, 11, 10])
+            v.encode([b"b", b"a"])                             # cached: the engine is not asked again
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(v.encode([b"c"])[1], [10])
+            self.assertEqual(len(sent), 2)
             self.assertEqual(list(v.dir.glob("*.img")), [])             # the temporary images are removed
             self.assertTrue(v.alive())
         finally:
