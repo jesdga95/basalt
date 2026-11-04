@@ -681,18 +681,21 @@ int main() {
         clear_dir(d2);
     }
     {
-        // Staged files are never removed without ownership proof and still count toward the disk budget.
+        // A stage untouched for an hour belongs to a dead write and is removed at open; this process's own stage and a
+        // fresh one are kept and count toward the disk budget.
         const std::string d2 = dir + "-stages";
         CHECK(basalt::platform::make_dirs(d2));
         const std::string base = "000000000000002a-0000000000000001.bcs.direct.";
         const std::string dead = base + "9223372036854775807.123";
         const std::string live = base + std::to_string((long long) basalt::platform::process_id()) + ".123";
+        const std::string fresh = base + "9223372036854775806.7";
         const std::string other = "000000000000002b-0000000000000001.bcs.direct.9223372036854775807.123";
         const std::string malformed = base + "bad.123.tmp";
-        for (const auto& name : {dead, dead + ".9223372036854775807.tmp", live, other, malformed}) {
+        for (const auto& name : {dead, dead + ".9223372036854775807.tmp", live, other, malformed, fresh}) {
             std::FILE* f = basalt::platform::open_file_utf8(d2 + "/" + name, "wb");
             CHECK(f != nullptr);
             if (f) { std::fputc(1, f); std::fclose(f); }
+            if (name == fresh) continue;
             std::error_code ec;
             const std::string utf8_path = d2 + "/" + name;
             const std::filesystem::path path(std::u8string(utf8_path.begin(), utf8_path.end()));
@@ -705,14 +708,15 @@ int main() {
             std::string err;
             CHECK(d.open(d2, id, 1, err));
             uint64_t bytes = 0;
-            CHECK(d.stats().bytes == 4);
-            CHECK(basalt::platform::file_size(d2 + "/" + dead, bytes));
-            CHECK(basalt::platform::file_size(d2 + "/" + dead + ".9223372036854775807.tmp", bytes));
+            CHECK(d.stats().bytes == 2);
+            CHECK(!basalt::platform::file_size(d2 + "/" + dead, bytes));
+            CHECK(!basalt::platform::file_size(d2 + "/" + dead + ".9223372036854775807.tmp", bytes));
+            CHECK(!basalt::platform::file_size(d2 + "/" + other, bytes));
+            CHECK(!basalt::platform::file_size(d2 + "/" + malformed, bytes));
             CHECK(basalt::platform::file_size(d2 + "/" + live, bytes));
-            CHECK(basalt::platform::file_size(d2 + "/" + other, bytes));
-            CHECK(basalt::platform::file_size(d2 + "/" + malformed, bytes));
-            CHECK(basalt::platform::remove_file(d2 + "/" + dead));
-            CHECK(d.stats().bytes == 3);
+            CHECK(basalt::platform::file_size(d2 + "/" + fresh, bytes));
+            CHECK(basalt::platform::remove_file(d2 + "/" + fresh));
+            CHECK(d.stats().bytes == 1);
         }
         clear_dir(d2);
     }

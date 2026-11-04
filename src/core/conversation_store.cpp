@@ -610,7 +610,13 @@ bool ConversationStore::open(const std::string& dir, uint64_t identity, uint64_t
             bool identity = f.name.size() >= 17 && f.name[16] == '-';
             for (size_t i = 0; identity && i < 16; ++i)
                 identity = (f.name[i] >= '0' && f.name[i] <= '9') || (f.name[i] >= 'a' && f.name[i] <= 'f');
-            if (identity && direct_stage(f.name, f.name.substr(0, 17), pid)) stages_.push_back(f.name);
+            const bool staged = identity && direct_stage(f.name, f.name.substr(0, 17), pid);
+            // a stage untouched for an hour belongs to a write that died (this process's own stage is live)
+            if (now - f.mtime >= 3600 && !(staged && pid == basalt::platform::process_id())) {
+                basalt::platform::remove_file(path);
+                continue;
+            }
+            if (staged) stages_.push_back(f.name);
             continue;
         }
         if (f.name.size() > 4 && f.name.compare(f.name.size() - 4, 4, ".tmp") == 0) {
