@@ -11,18 +11,18 @@ with a two-level top-512 indexer, and an Engram table on two layers.
 ## Weights as stored
 
 The pack keeps every GGUF tensor as published ([model file](../model-file.md#deepseek-v41-pack)); nothing is
-requantized. Types in the IQ1_S and IQ1_M packs:
+requantized. Types in the IQ1_S, IQ1_M and GSQ-RCO packs (a GSQ-RCO build assigns gate/up and down per layer):
 
 | Tensor class | Stored as | Read by |
 |---|---|---|
-| Routed experts, gate/up | IQ1_S (19), IQ2_XXS (16) or IQ2_XS (17), per layer | GPU grouped kernels, MMQ, CPU dots |
-| Routed experts, down | IQ1_S, IQ2_XXS, IQ2_XS or IQ2_S (22) | the same |
-| Attention wq_a, wq_b, wkv, wo_a, wo_b | Q6_K on most layers, Q5_K on the rest | native_mmvq (decode), MMQ (prompt) |
-| Shared expert gate/up/down | Q6_K on most layers, Q8_0 on the rest | dense gated MLP, clamped |
-| Token embedding, output head, Engram `engram_kv` | Q6_K | per-row lookup, Q6_K matvec |
+| Routed experts, gate/up | IQ1_S (19), IQ1_M (29), IQ2_XXS (16) or IQ2_XS (17), per layer | GPU grouped kernels, MMQ (not IQ1_M), CPU dots |
+| Routed experts, down | IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS or IQ2_S (22) | the same |
+| Attention wq_a, wq_b, wkv, wo_a, wo_b | Q6_K, Q5_K or Q8_0, as the pack assigns them | native_mmvq (decode), MMQ (prompt) |
+| Shared expert gate/up/down | Q6_K, Q5_K or Q8_0 | dense gated MLP, clamped |
+| Token embedding, output head, Engram `engram_kv` | Q6_K or Q5_K | per-row lookup, matvec by type |
 | Engram table | IQ4_NL, rows of 256 values (144 bytes) | host row read, `dequantize_iq4_nl` |
 | Compressor kv/gate, indexer q/k/weight projections | BF16 | `gemv_bf16` (decode), `gemm_bf16` (prompt) (attn_index.cu) |
-| Router gate, router bias (and the picture bias), hyper-connection fn/scale/base, all norm weights, attention sinks, Engram gate | F32 | fp32 kernels |
+| Router gate (F32, or BF16 widened exactly at load), router bias (and the picture bias), hyper-connection fn/scale/base, all norm weights, attention sinks, Engram gate | F32 | fp32 kernels |
 | Vision projector (optional `vision/mmproj` section) | BF16 | vision/encoder.cu (cuBLAS) |
 
 ## Activations and accumulation
@@ -57,6 +57,9 @@ T=1 calls and require bitwise equality (attn_index_parity, attn_mqa_parity, rout
 | Decode, by tier | Each routed expert runs where it sits: from a VRAM slot on the GPU (q8_1, native grouped kernels), or on the CPU pool from the pinned RAM copy or the mapped pack (Q8_K, ggml arithmetic). **The two differ in the last bits**, so a token's output depends on which experts were resident. Residency changes only at token boundaries and follows the routing history, so a fixed prompt on a fixed memory budget repeats exactly; a different RAM-tier size (free memory at start) can change the text. A repeat miss within 64 tokens is promoted to VRAM, half of a layer's misses go to the CPU and half over the bus, and a file-backed expert that misses twice swaps into the pinned tier for the least recently used pinned one (taking effect one token later), so the placement, and with it the last bits of later tokens, differs from the first-miss-promotes policy; the first 16 tokens of the fixture prompts are unchanged. The CPU's rows are read in place from mapped host memory by the weighted sum (same summation order) | tier.cpp lookup, fetch, run_cpu; ops_kernels.cpp routed_experts |
 | Prompt chunks (up to 8,192 tokens) | Routed experts on MMQ: q8_1 (per 32, MMQ layout) of the fp32 input and of the fp32 clamped SwiGLU output, int8 mma against the IQ1_S / IQ2_XXS codes (the IQ1_S grid shift rides in the activation block sums), fp32 accumulation, rows summed per token in slot order. **Numerics change against the single-token kernels** (a different int8 reduction order; both round activations to q8_1). Experts are staged from the VRAM and pinned RAM tiers, so the prompt path never mixes in CPU arithmetic | prefill_ffn.cpp routed; prefill_ffn.cu; src/kernels/cuda/mmq_load_tiles.cuh load_tiles_iq1_s |
 | Shared expert in prompts | MMQ GEMMs over 1,024-token sub-chunks (gate, up, clamped SwiGLU, down; q8_1 activations with an fp16 block scale, int8 mma, fp32 accumulation). **Numerics change** against the decode kernel: about 1e-3 per layer. The per-token weighted sum of the routed rows keeps the slot order, bitwise equal to the per-token launch | prefill_ffn.cpp shared; weighted_sum_tokens |
+
+A prompt layer with an IQ1_M side has no MMQ product: it runs the grouped decode kernels (q8_1 activations, fp32
+accumulation), exact to decode's numerics for that layer (prefill_ffn.cpp grouped_launch).
 
 ## Prompt attention
 
@@ -110,6 +113,10 @@ prompts; on the third it can diverge after a few tokens, because 1.5-bit weights
 last-bit changes.
 
 ## Quality
+
+GSQ-RCO IQ2_XXS, 5090 only, against llama.cpp b11870 on the same GGUF, llama's tokens fed one decode step at a time on
+three prompts: Basalt's greedy choice differs at 8 of 688 generated positions, each one a near-tie (at most 0.33 of
+log-probability between the two tokens at llama's logits). There is no Basalt PPL/KLD run on this pack yet.
 
 Quality is the quant's, not the engine's. The IQ1_S pack scores, against the native model's logits (teacher: the
 native FP4 checkpoint through the reference code; Lucebox's 8 x 1,024 held-out tokens, KL over the teacher's top-256 ids,

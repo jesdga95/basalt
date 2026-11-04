@@ -32,6 +32,7 @@
 
 namespace basalt::models::deepseek41 {
 namespace {
+constexpr int kLendTierTokens = 16384;   // a prompt this long reads without the VRAM tier, in larger chunks
 
 #define DS_CUDA(call)                                                                                   \
     do {                                                                                                \
@@ -171,6 +172,10 @@ public:
             const int batched = r.n_tokens - tail;
             if (batched > 0) {
                 open_prompt_path();
+                if (r.n_tokens >= kLendTierTokens) {
+                    std::string te;
+                    if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
+                }
                 // the caches take their memory before the prompt workspaces do
                 if (!ops_->ensure_positions(r.pos + r.n_tokens, err)) return prompt_failed(err);
                 if (!prefill_ && !make_prefill_fit(err)) return prompt_failed(err);
@@ -275,6 +280,7 @@ private:
         prefill_.reset();
         std::string e;
         if (ExpertTier* t = ops_->expert_tier(e)) {
+            if (!t->reclaim(e)) basalt::log::warn("basalt deepseek41", "VRAM expert tier stays closed: %s", e.c_str());
             t->grow();
             tier_grown_ = true;
         }
@@ -293,6 +299,7 @@ private:
         if (!t) return;
         cudaStreamSynchronize(stream_);
         prefill_.reset();
+        if (!t->reclaim(e)) basalt::log::warn("basalt deepseek41", "VRAM expert tier stays closed: %s", e.c_str());
         t->grow();
         tier_grown_ = true;
     }
