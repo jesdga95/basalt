@@ -6,7 +6,7 @@
 #include "basalt/core/progress.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
-#include "basalt/models/qwen4exp/kernels/cpu_geometry.hpp"
+#include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/models/qwen4exp/decode/layer.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"

@@ -6,7 +6,7 @@
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
-#include "basalt/models/qwen4exp/kernels/cpu_geometry.hpp"
+#include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/models/qwen4exp/kernels/native_router.hpp"
 #include "basalt/kernels/elementwise.hpp"

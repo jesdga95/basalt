@@ -152,3 +152,7 @@ native FP4 checkpoint through the reference code; Lucebox's 8 x 1,024 held-out t
 llama.cpp with the same GGUF): KL 0.362, top-1 agreement 75.3%, PPL 10.75 (teacher 8.56). Lucebox's own files score KL
 0.19 to 0.27. Basalt is held to the same weights by the per-layer agreement above; there is no Basalt PPL/KLD run for this
 model yet.
+
+## Sampling
+
+Draws run on the shared `sample_tokens` kernel, the same chain as the other models: a seed gives other text than the earlier host sampler did. Greedy decoding keeps its argmax, so its tokens do not change.
