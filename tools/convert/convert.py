@@ -11,6 +11,7 @@ Inputs
   --sections-from BASE.basalt  with --gguf: the drafter and vision sections are copied from BASE byte for byte (BASE's
                      vocabulary must be the GGUF's); replaces --mmproj, --mtp-* and --draft-vocab
   --mmproj FILE      the vision projector GGUF (required unless --no-vision)
+  --dspark FILE      deepseek41 only: the DSpark drafter GGUF, stored whole as the dspark/gguf section
   --mtp-source DIR   the draft layer's BF16 tensors from `mtp_fetch.py fetch --out DIR`; without it there is no drafter
   --mtp-dense FILE   a tuned `mtp/dense` section (raw bytes, same layout as the source; needs --mtp-source); the packs
                      with a self-distilled MTP layer carry one. Its size is checked and its SHA-256 goes to meta.mtp.
@@ -62,23 +63,19 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))   # for model_file, gguf_reader, tokenizer
+import arch as A  # noqa: E402
 import hc8 as H  # noqa: E402
 import model_sections as S  # noqa: E402
-from model_file import TENSOR_ALIGN, ModelFile, ModelWriter, Stream  # noqa: E402
+from model_file import SECTION_ALIGN, TENSOR_ALIGN, ModelFile, ModelWriter, Stream  # noqa: E402
 
 FINGERPRINT_BYTES = 64 << 20
 
-# the model's sampling defaults, for a GGUF that does not carry them (llama.cpp's general.sampling.* keys)
-SAMPLING_KV = {"general.sampling.temp": 1.0, "general.sampling.top_p": 0.95, "general.sampling.top_k": 20}
-LICENSE_TEXT = (HERE / "qwen-community-license-1.0.txt").read_text(encoding="utf-8")
+QWEN = A.for_architecture("qwen4exp")
 
 
 def model_license(kv: dict) -> dict:
-    """The model's license, with its full text (the license requires it in every copy)."""
-    lic = {"name": "Qwen Community License 1.0", "text": LICENSE_TEXT}
-    if kv.get("general.quantized_by"):
-        lic["quantized_by"] = kv["general.quantized_by"]
-    return lic
+    """Flash-Next's license, with its full text (the license requires it in every copy)."""
+    return QWEN.license(kv)
 
 
 def die(msg: str):
@@ -119,14 +116,21 @@ def export_tokenizer(first_gguf: Path, out_dir: Path) -> list[Path]:
     return sorted(p for p in (out_dir / "tokenizer").iterdir() if p.is_file())
 
 
-def source_tensors(model: S.SourceModel):
-    """(kv, [(name, shard path, absolute offset, size, TensorInfo)]) over every shard, expert tensors excluded."""
+def source_architecture(first_gguf: Path) -> str | None:
+    """`general.architecture` from the first shard's header."""
+    from gguf_reader import GGUFFile
+    return GGUFFile(first_gguf).metadata.get("general.architecture")
+
+
+def source_tensors(model: S.SourceModel, own_sections=()):
+    """(kv, [(name, shard path, absolute offset, size, TensorInfo)]) over every shard, expert tensors and the tensors
+    that get a section of their own (`own_sections`) excluded."""
     kv, tensors = {}, []
     for p, g in zip(model.paths, model.files):
         for k, v in g.metadata.items():
             kv.setdefault(k, json_safe(v))
     for name, (g, t, p) in model.where.items():
-        if S.is_expert(name):
+        if S.is_expert(name) or name in own_sections:
             continue
         a, n = g.data_start + t.offset, t.expected_bytes()
         tensors.append((name, p, a, n, t))
@@ -136,11 +140,53 @@ def source_tensors(model: S.SourceModel):
 
 
 # ------------------------------------------------------------------ the conversion
+class DryWriter:
+    """ModelWriter's interface without writing: sections get the offsets and sizes a real build would give them."""
+
+    def __init__(self):
+        self.pos = 64 << 10
+        self.entries: list[tuple[str, int, int, bytes]] = []
+
+    def _start(self, name):
+        if any(e[0] == name for e in self.entries):
+            raise ValueError(f"duplicate section: {name}")
+        self.pos = (self.pos + SECTION_ALIGN - 1) // SECTION_ALIGN * SECTION_ALIGN
+        return self.pos
+
+    def add_size(self, name, size):
+        off = self._start(name)
+        self.pos = off + size
+        self.entries.append((name, off, size, b""))
+        return size
+
+    def add_bytes(self, name, data):
+        self.add_size(name, len(data))
+
+    def add_file(self, name, src, offset=0, size=None):
+        self.add_size(name, os.path.getsize(src) - offset if size is None else size)
+
+    def add_chunks(self, name, chunks):
+        return self.add_size(name, sum(len(b) for b in chunks))
+
+    def add_parts(self, name, parts, align=TENSOR_ALIGN):
+        pos, offsets = 0, []
+        for part in parts:
+            pos += (-pos) % align
+            offsets.append(pos)
+            pos += len(part) if isinstance(part, (bytes, bytearray)) else part.size if isinstance(part, Stream) else part[2]
+        self.add_size(name, pos)
+        return offsets
+
+    def close(self):
+        pass
+
+
 class Job:
     def __init__(self, writer: ModelWriter):
         self.w = writer
         self.rows: list[tuple[str, int]] = []
         self.t0 = time.time()
+        self.dry = isinstance(writer, DryWriter)
 
     def _report(self, name, nbytes, secs):
         mbs = nbytes / (1 << 20) / secs if secs > 0 else float("inf")
@@ -157,9 +203,9 @@ class Job:
         self.w.add_file(name, str(src), offset, size)
         self._report(name, self.w.entries[-1][2], time.time() - t)
 
-    def chunks(self, name, chunks):
+    def chunks(self, name, chunks, size=None):
         t = time.time()
-        n = self.w.add_chunks(name, chunks)
+        n = self.w.add_size(name, size) if size is not None and self.dry else self.w.add_chunks(name, chunks)
         self._report(name, n, time.time() - t)
 
     def hc8(self):
@@ -194,6 +240,35 @@ def convert(a) -> None:
     if out.exists() and not a.force:
         die(f"{out} exists (use --force to overwrite)")
     base = None
+    dry = getattr(a, "dry_run", False)
+    try:
+        paths = source_paths(a.gguf)
+    except S.ConvertError as e:
+        die(str(e))
+    arch = A.for_architecture(source_architecture(paths[0]))
+    if not arch.side_sections:
+        given = [o for o, v in (("--mmproj", a.mmproj and not arch.mmproj_only), ("--mtp-source", a.mtp_source), ("--mtp-dense", a.mtp_dense),
+                                ("--draft-vocab", a.draft_vocab), ("--sections-from", a.sections_from))
+                 if v]
+        if given:
+            die(f"{arch.name} packs have no drafter or hc8 sections; drop {', '.join(given)}")
+    dspark = Path(a.dspark) if getattr(a, "dspark", None) else None
+    if dspark is not None:
+        if not arch.dspark_ok:
+            die(f"{arch.name} packs take no --dspark drafter")
+        if not dspark.is_file():
+            die(f"missing input: {dspark}")
+        with open(dspark, "rb") as f:
+            head = f.read(1 << 20)
+        if head[:4] != b"GGUF" or b"dflash" not in head:
+            die(f"{dspark} is not a DSpark (dflash) drafter GGUF")
+    vision = arch.side_sections and not a.no_vision
+    if arch.mmproj_only and a.mmproj and not a.no_vision:
+        vision = True
+        with open(a.mmproj, "rb") as f:
+            head = f.read(1 << 20)
+        if head[:4] != b"GGUF" or arch.projector_type.encode() not in head:
+            die(f"{a.mmproj} is not a {arch.projector_type} projector GGUF")
     if a.sections_from:
         base = ModelFile(a.sections_from) if Path(a.sections_from).is_file() else die(f"missing input: {a.sections_from}")
         if a.mtp_source or a.mtp_dense or a.draft_vocab or a.mmproj or a.no_vision:
@@ -202,7 +277,7 @@ def convert(a) -> None:
         base_meta = json.loads(base.read("meta"))
     mmproj = Path(a.mmproj) if a.mmproj else None
     side = [Path(x) for x in (a.draft_vocab, a.mtp_dense) if x]
-    if not a.no_vision and base is None:
+    if vision and base is None:
         side.append(mmproj if mmproj else Path("<--mmproj>"))
     for p in side:
         if not p.is_file():
@@ -215,11 +290,14 @@ def convert(a) -> None:
     err = None
     try:
         print("reading the source GGUFs ...", flush=True)
-        model = S.SourceModel(source_paths(a.gguf))
-        kv, tensors = source_tensors(model)
-        for k, v in SAMPLING_KV.items():
+        model = S.SourceModel(paths)
+        kv, tensors = source_tensors(model, arch.own_sections)
+        own = {n: model.where[n][1] for n in arch.own_sections if n in model.where}
+        if not arch.side_sections:
+            arch.check(kv, own)
+        for k, v in arch.sampling_kv.items():
             kv.setdefault(k, v)
-        dense = S.Dense(model, a.compat_bf16)
+        dense = S.Dense(model, a.compat_bf16, arch)
         experts = S.Experts(model)
         mtp = S.Mtp(a.mtp_source, a.mtp_dense) if a.mtp_source else None
         n_vocab = len(kv.get("tokenizer.ggml.tokens") or []) or None
@@ -236,7 +314,7 @@ def convert(a) -> None:
         die(err)
 
     vision_extra = []
-    if not a.no_vision and base is None:
+    if vision and base is None and not arch.mmproj_only:
         fn = load_vision_helper()
         if fn is None:
             print("note: pack_vision.py (vision_sections) not found; only vision/mmproj is written")
@@ -247,22 +325,29 @@ def convert(a) -> None:
         die(f"{out.parent} does not exist")
     if partial.exists():
         partial.unlink()
-    w = ModelWriter(str(partial))
+    w = DryWriter() if dry else ModelWriter(str(partial))
     job = Job(w)
     ok = False
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            print("writing sections:", flush=True)
+            print("planning sections:" if dry else "writing sections:", flush=True)
             for p in export_tokenizer(model.paths[0], Path(tmp)):
                 job.file(f"tokenizer/{p.name}", p)
             job.chunks("dense", dense.chunks())
             job.bytes("dense.index", dense.index_text())
-            job.chunks("experts", experts.chunks())
+            job.chunks("experts", experts.chunks(), experts.total)
             job.bytes("experts.layout", experts.layout_text())
             t = time.time()
             offs = w.add_parts("gguf", [(src, off, size) for _, src, off, size, _ in tensors], TENSOR_ALIGN)
             job._report("gguf", w.entries[-1][2], time.time() - t)
             tensor_offsets = dict(zip((x[0] for x in tensors), offs))
+            own_entries = {}
+            for name, section in arch.own_sections.items():
+                src, off, size = model.abs_range(name)
+                job.file(section, src, off, size)
+                t = own[name]
+                own_entries[name] = {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.shape],
+                                     "bytes": size, "offset": 0, "section": section}
             copied = []
             if base is not None:
                 for name in base.names():
@@ -287,9 +372,12 @@ def convert(a) -> None:
                 job.chunks("mtp/experts", mtp.expert_chunks())
                 if draft_vocab is not None:
                     job.bytes("mtp/draft_vocab", draft_vocab)
-            job.hc8()
+            if arch.side_sections:
+                job.hc8()
             written = {e[0] for e in w.entries}
-            if not a.no_vision and base is None:
+            if dspark is not None:
+                job.file("dspark/gguf", dspark)
+            if vision and base is None:
                 job.file("vision/mmproj", mmproj)
                 for name, data, src, off, size in vision_extra:
                     if name in written or name == "vision/mmproj":
@@ -302,23 +390,26 @@ def convert(a) -> None:
 
             sources = [{"path": p.name, "size": p.stat().st_size,
                         "fingerprint_sha256_first_last_64mib_and_size": fingerprint(p)}
-                       for p in model.paths + ([mmproj] if not a.no_vision and base is None else [])]
+                       for p in model.paths + ([mmproj] if vision and base is None else []) + ([dspark] if dspark else [])]
             meta = {
                 "format": "basalt", "version": 2, "name": a.name,
                 "converter": {"tool": "tools/convert/convert.py"},
                 "sources": sources,
                 "gguf_kv": kv,
-                "tensors": {n: {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.shape],
-                                "bytes": nb, "offset": tensor_offsets[n]}
-                            for n, _, _, nb, t in tensors},
+                "tensors": {**{n: {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.shape],
+                                   "bytes": nb, "offset": tensor_offsets[n]}
+                               for n, _, _, nb, t in tensors}, **own_entries},
                 "conversions": {"compat_bf16": a.compat_bf16, "tensors": dense.records},
-                "license": model_license(kv),
+                "license": arch.license(kv),
                 "mtp": base_meta.get("mtp") if base is not None else None if mtp is None else {"source_sha256": mtp.source_sha256(),
                                                   "expert_format": "q2_0", "draft_vocab": draft_vocab is not None,
                                                   "dense": ({"tuning": "self_distilled", "sha256": mtp.tuned_sha256}
                                                             if mtp.tuned else {"tuning": None})},
-                "vision": base_meta.get("vision") if base is not None else None if a.no_vision else {"mmproj": "vision/mmproj", "mmproj_bytes": mmproj.stat().st_size,
+                "vision": base_meta.get("vision") if base is not None else None if not vision else {"mmproj": "vision/mmproj", "mmproj_bytes": mmproj.stat().st_size,
                                                     "extra": [v[0] for v in vision_extra]},
+                **arch.meta_extra(kv, {n: t for n, _, _, _, t in tensors}, own),
+                **({"dspark": {"section": "dspark/gguf", "bytes": dspark.stat().st_size, "architecture": "dflash"}}
+                   if dspark else {}),
             }
             if base is not None:
                 meta["sections_from"] = {"path": Path(a.sections_from).name, "size": Path(a.sections_from).stat().st_size,
@@ -330,7 +421,7 @@ def convert(a) -> None:
     except S.ConvertError as e:
         err = str(e)
     finally:
-        if not ok:
+        if not ok and not dry:
             try:
                 w.f.close()
             except OSError:
@@ -340,6 +431,13 @@ def convert(a) -> None:
         model = dense = experts = mtp = job = None
         gc.collect()
         die(err)
+    if dry:
+        end = w.pos
+        print(f"dry run: {'section':<28} {'offset':>16} {'bytes':>16}")
+        for name, off, size, _ in w.entries:
+            print(f"         {name:<28} {off:>16} {size:>16}")
+        print(f"dry run: {len(w.entries)} sections, {end} bytes ({end / (1 << 30):.3f} GiB) -> {out}")
+        return
     os.replace(partial, out)
     total = out.stat().st_size
     print(f"done: {len(job.rows)} sections, {total / (1 << 30):.3f} GiB, {time.time() - job.t0:.1f} s -> {out}")
@@ -573,6 +671,7 @@ def main():
     ap.add_argument("--gguf", action="append", metavar="FILE",
                     help="the model's GGUF: shard 1 of a split model (the others are found beside it), or repeat per shard")
     ap.add_argument("--mmproj", help="vision projector GGUF (required unless --no-vision)")
+    ap.add_argument("--dspark", metavar="FILE", help="the DSpark drafter GGUF, stored whole as dspark/gguf (deepseek41 only)")
     ap.add_argument("--out", required=True, help="the .basalt file to write")
     ap.add_argument("--mtp-source", metavar="DIR", help="the drafter's BF16 tensors written by tools/convert/mtp_fetch.py fetch")
     ap.add_argument("--mtp-dense", metavar="FILE", help="a tuned (self-distilled) mtp/dense section to embed (needs --mtp-source)")
@@ -590,6 +689,8 @@ def main():
                     help="with --checkpoint and --sections-from: Q8_0 projections instead of Q6_K")
     ap.add_argument("--workers", type=int, default=16, help="with --checkpoint: converter processes")
     ap.add_argument("--force", action="store_true", help="overwrite --out")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="with --gguf: print every section's offset and size and write nothing")
     a = ap.parse_args()
     if a.requant_dense_q6k:
         if a.sections_from or a.gguf or a.dense_q8_0:
@@ -609,11 +710,17 @@ def main():
         ap.error("--dense-q8-0 needs --checkpoint and --sections-from")
     if not a.gguf:
         ap.error("--gguf is required")
-    a.name = a.name or ("Qwen3.8-Flash-Next " + Path(a.gguf[0]).name.split("Next-")[-1].split("-0000")[0] if a.sections_from
-                        else "Qwen3.8-Flash-Next IQ3_XXS")
-    if not a.no_vision and not a.mmproj and not a.sections_from:
-        ap.error("--mmproj is required unless --no-vision")
-    warn_unofficial()
+    if not Path(a.gguf[0]).is_file():
+        ap.error(f"missing input: {a.gguf[0]}")
+    arch = A.for_architecture(source_architecture(Path(a.gguf[0])))
+    if arch.side_sections:
+        a.name = a.name or arch.default_name(a.gguf[0], {}, bool(a.sections_from))
+        if not a.no_vision and not a.mmproj and not a.sections_from:
+            ap.error("--mmproj is required unless --no-vision")
+        warn_unofficial()
+    else:
+        from gguf_reader import GGUFFile
+        a.name = a.name or arch.default_name(a.gguf[0], GGUFFile(Path(a.gguf[0])).metadata)
     convert(a)
 
 

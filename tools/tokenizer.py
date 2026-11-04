@@ -43,6 +43,16 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
+# The `joyai-llm` pre-tokenizer (llama.cpp LLAMA_VOCAB_PRE_TYPE_JOYAI_LLM): the regexes apply in turn, each one
+# splitting the pieces the previous left; text a regex does not match stays a piece for the next.
+JOYAI_PATTERNS = [
+    r"\p{N}{1,3}",
+    "[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+",
+    r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
+    r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+]
+PRE_PATTERNS = {"joyai-llm": JOYAI_PATTERNS}
+
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
@@ -64,7 +74,7 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(QWEN35_PATTERN)
+        self._res = [regex.compile(p) for p in PRE_PATTERNS.get(pre, [QWEN35_PATTERN])]
 
         # Literals matched directly instead of through BPE (GGUF token types):
         #   * type 4 (USER_DEFINED: `<think>`, `<tool_call>`, ...) always matches, with or without parse_special;
@@ -165,12 +175,31 @@ class Tokenizer:
 
     PIECE_CACHE_MAX = 200_000    # pre-tokenizer pieces remembered; bounds the memo's memory
 
+    def _split(self, text: str) -> list[str]:
+        if len(self._res) == 1:
+            return self._res[0].findall(text)
+        pieces = [text]
+        for rx in self._res:
+            nxt = []
+            for p in pieces:
+                pos = 0
+                for m in rx.finditer(p):
+                    if m.start() > pos:
+                        nxt.append(p[pos:m.start()])
+                    if m.end() > m.start():
+                        nxt.append(m.group(0))
+                    pos = m.end()
+                if pos < len(p):
+                    nxt.append(p[pos:])
+            pieces = nxt
+        return pieces
+
     def _encode_plain(self, text: str) -> list[int]:
         out: list[int] = []
         # A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
         # instead of merged again. Same ids as running _bpe each time. Idea from Strata f346dc6 (MIT).
         cache = self.__dict__.setdefault("_piece_ids", {})
-        for piece in self._re.findall(text):
+        for piece in self._split(text):
             got = cache.get(piece)
             if got is None:
                 mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
@@ -219,6 +248,9 @@ class Tokenizer:
             for ch in self.tokens[i]:
                 v = UNICODE_TO_BYTE.get(ch)
                 if v is None:
+                    if self.special_tokens.get(self.tokens[i]) == i:    # a special's text is the literal itself
+                        raw = bytearray(self.tokens[i].encode("utf-8"))
+                        break
                     raise KeyError("token %d contains a character outside the byte alphabet: %r" % (i, ch))
                 raw.append(v)
             b = cache[i] = bytes(raw)
@@ -253,9 +285,13 @@ def extract_metadata(md: dict, out_dir) -> dict:
         "special_ids": tk.special_ids,
         "add_bos_token": False,
         # shipped rather than re-derived by readers, so a port cannot lose the `\p{M}` classes
-        "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
     }
+    if tk.pre in PRE_PATTERNS:
+        cfg["pre_patterns"] = PRE_PATTERNS[tk.pre]
+        cfg["pre_pattern_source"] = "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_JOYAI_LLM), applied in order"
+    else:
+        cfg["pre_pattern"] = QWEN35_PATTERN
+        cfg["pre_pattern_source"] = "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_QWEN35)"
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
                                               sorted(tk.ranks.items(), key=lambda kv: kv[1])), encoding="utf-8",

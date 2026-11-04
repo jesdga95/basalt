@@ -20,7 +20,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from gguf_reader import GGUF_MAGIC, GGUFFile  # noqa: E402
 
 # writable ggml_type ids, matching GGML_TYPES in gguf_reader.py
-TYPE_IDS = {"F32": 0, "F16": 1, "Q5_K": 13, "Q6_K": 14, "Q8_0": 8, "Q2_0": 42}
+TYPE_IDS = {"F32": 0, "F16": 1, "Q5_K": 13, "Q6_K": 14, "Q8_0": 8, "Q2_0": 42, "IQ2_XXS": 16, "IQ1_S": 19, "IQ4_NL": 20, "BF16": 30}
 DEFAULT_ALIGNMENT = 32
 
 _META_IDS = {"u8": 0, "i8": 1, "u16": 2, "i16": 3, "u32": 4, "i32": 5, "f32": 6,
