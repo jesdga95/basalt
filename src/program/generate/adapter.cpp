@@ -5,13 +5,15 @@
 #include "basalt/core/model_file.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/adapter.hpp"
+#include "basalt/platform/process.hpp"
 #include "basalt/program/prefix_reuse.hpp"
 
 #include <atomic>
+#include <cerrno>
+#include <cstddef>
 #include <condition_variable>
 #include <deque>
 #include <fstream>
-#include <iostream>
 #include <iterator>
 #include <mutex>
 #include <random>
@@ -23,7 +25,6 @@ namespace basalt::program::generate {
 namespace {
 
 bool g_diag_serial_prompt = false;   // --diag-serial-prompt
-bool g_serve_quit = false;           // QUIT ended the serve loop
 std::FILE* g_diag_logits = nullptr;  // --diag-logits FILE: each decoded row's logits (the serial prompt and the last prompt token)
 int64_t g_n_vocab = 0;
 
@@ -238,14 +239,25 @@ int adapter_serve(basalt::model::LoadedModel& loaded, int64_t max_context, int64
     std::condition_variable cv;
     std::deque<std::string> lines;
     bool eof = false;
+    // read(2) on the descriptor, not std::cin: exit() flushes every stdio stream and waits for stdin's lock, which
+    // getline holds while it waits for input, so an engine ending on a kernel failure would hang in exit()
     std::thread reader([&] {
-        std::string l;
-        while (std::getline(std::cin, l)) {
+        std::string buf;
+        char chunk[4096];
+        auto push = [&](std::string l) {
             if (!l.empty() && l.back() == '\r') l.pop_back();
             std::lock_guard<std::mutex> lk(mu);
-            lines.push_back(l);
+            lines.push_back(std::move(l));
             cv.notify_all();
+        };
+        for (;;) {
+            const std::ptrdiff_t n = (std::ptrdiff_t) basalt::platform::pipe_read(0, chunk, sizeof chunk);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            buf.append(chunk, (size_t) n);
+            for (size_t nl; (nl = buf.find('\n')) != std::string::npos; buf.erase(0, nl + 1)) push(buf.substr(0, nl));
         }
+        if (!buf.empty()) push(buf);
         std::lock_guard<std::mutex> lk(mu);
         eof = true;
         cv.notify_all();
@@ -269,12 +281,6 @@ int adapter_serve(basalt::model::LoadedModel& loaded, int64_t max_context, int64
         basalt::log::error("basalt serve", "%s", pr.message.c_str());
         return 1;
     }
-    // a kernel failure exits the process from anywhere: end at once so the server sees it, nothing left to wind down
-    std::atexit([] {
-        if (g_serve_quit) return;
-        std::fflush(nullptr);
-        std::_Exit(1);
-    });
     std::printf("READY %lld stop\n", (long long) max_context);
     std::fflush(stdout);
     std::string line;
@@ -284,10 +290,7 @@ int adapter_serve(basalt::model::LoadedModel& loaded, int64_t max_context, int64
         std::istringstream in(line);
         std::string cmd;
         in >> cmd;
-        if (cmd == "QUIT") {
-            g_serve_quit = true;
-            break;
-        }
+        if (cmd == "QUIT") break;
         if (cmd == "ENC") {
             std::vector<std::string> words;
             for (std::string w; in >> w;) words.push_back(w);
