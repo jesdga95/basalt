@@ -54,7 +54,7 @@ BASALT_TARGET_AVX2_FMA_F16C void warm_logits(CpuWarm& c, int e0, int e1, const s
     }
 }
 
-// every token's top k (softmax weights over them), summed per predicted expert only the CPU holds; the likeliest
+// every token's top k (softmax weights over them), summed per predicted expert only the CPU holds; the kPicks likeliest
 void warm_select(CpuWarm& c) {
     const int NE = c.n_expert, K = std::min(c.k, 16);
     float score[512] = {};
@@ -79,10 +79,15 @@ void warm_select(CpuWarm& c) {
             score[e] += w[j] / sum;
         }
     }
-    int best = -1;
-    for (int e = 0; e < NE; ++e)
-        if (score[e] > 0.0f && (best < 0 || score[e] > score[best])) best = e;
-    c.blob = best >= 0 ? c.src->resident_blob(c.layer, best) : nullptr;
+    // an expert without a RAM copy is passed over, so it does not end the read before the next likeliest
+    for (int r = 0; r < CpuWarm::kPicks;) {
+        int best = -1;
+        for (int e = 0; e < NE; ++e)
+            if (score[e] > 0.0f && (best < 0 || score[e] > score[best])) best = e;
+        if (best < 0) break;
+        score[best] = 0.0f;
+        if (const uint8_t* b = c.src->resident_blob(c.layer, best)) c.blob[r++] = b;
+    }
 }
 
 void warm_job(void* ctx, int w, int W, const std::atomic<bool>& stop) {
@@ -97,21 +102,22 @@ void warm_job(void* ctx, int w, int W, const std::atomic<bool>& stop) {
             _mm_pause();
         }
     }
-    // this worker's share of the blob, one load per line: the gate and up rows first (computed first), then the down
-    // rows, so a read the doorbell cuts short has warmed the start of the computation
-    if (c.blob == nullptr) return;
+    // this worker's share of each blob, one load per line, the likeliest blob first: the gate and up rows first
+    // (computed first), then the down rows, so a read the doorbell cuts short has warmed the start of the computation
     uint64_t x = 0;
-    for (int part = 0; part < 2; ++part) {
-        const size_t r0 = part == 0 ? 0 : c.down_off, r1 = part == 0 ? c.down_off : c.bytes;
-        const size_t per = ((r1 - r0 + (size_t) W - 1) / (size_t) W + 63) & ~(size_t) 63;
-        const size_t b0 = std::min(r1, r0 + per * (size_t) w), b1 = std::min(r1, b0 + per);
-        for (size_t o = b0; o < b1; o += 4096) {
-            if (stop.load(std::memory_order_relaxed)) { part = 2; break; }
-            const uint8_t* p = c.blob + o;
-            const size_t n = std::min<size_t>(4096, b1 - o);
-            for (size_t q = 0; q + 8 <= n; q += 64) x += *(const volatile uint64_t*) (p + q);
+    bool stopped = false;
+    for (int r = 0; r < CpuWarm::kPicks && !stopped && c.blob[r] != nullptr; ++r)
+        for (int part = 0; part < 2 && !stopped; ++part) {
+            const size_t r0 = part == 0 ? 0 : c.down_off, r1 = part == 0 ? c.down_off : c.bytes;
+            const size_t per = ((r1 - r0 + (size_t) W - 1) / (size_t) W + 63) & ~(size_t) 63;
+            const size_t b0 = std::min(r1, r0 + per * (size_t) w), b1 = std::min(r1, b0 + per);
+            for (size_t o = b0; o < b1; o += 4096) {
+                if (stop.load(std::memory_order_relaxed)) { stopped = true; break; }
+                const uint8_t* p = c.blob[r] + o;
+                const size_t n = std::min<size_t>(4096, b1 - o);
+                for (size_t q = 0; q + 8 <= n; q += 64) x += *(const volatile uint64_t*) (p + q);
+            }
         }
-    }
     if (x == 0x9e3779b97f4a7c15ull) c.sink.fetch_add(x, std::memory_order_relaxed);   // keeps the loads
 }
 
