@@ -1,4 +1,4 @@
-// include/basalt/kernels/s2_gemv_q8.hpp - the S2 GEMV over Q8_0-QUANTIZED activations.
+// include/basalt/models/qwen4exp/kernels/s2_gemv_q8.hpp - the S2 GEMV over Q8_0-QUANTIZED activations.
 //
 // `ggml_mul_mat` converts src1 to the weight's `vec_dot_type`, which for Q2_0 is Q8_0.  The other CUDA kernels
 // here take FP16 activations, and the CPU expert path already quantizes to int8 - so this is the missing GPU

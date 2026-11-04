@@ -10,7 +10,7 @@
 // what it actually is, and prints the number - 1e-3 is allowed for FP16 paths, and if the measured
 // error were near that the tolerance would be hiding something rather than bounding rounding.
 #include "basalt/artifact/dequant.hpp"
-#include "basalt/kernels/s2_gemv.hpp"
+#include "basalt/models/qwen4exp/kernels/s2_gemv.hpp"
 
 #include <cuda_runtime.h>
 

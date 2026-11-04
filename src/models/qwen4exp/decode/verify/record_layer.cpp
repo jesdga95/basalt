@@ -16,7 +16,7 @@
 #include "basalt/kernels/dec_gdn.hpp"
 #include "basalt/models/qwen4exp/kernels/dense_tc.hpp"
 #include "basalt/kernels/gr.hpp"
-#include "basalt/kernels/native_ple_postops.hpp"
+#include "basalt/models/qwen4exp/kernels/native_ple_postops.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/ple.hpp"

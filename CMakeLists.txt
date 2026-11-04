@@ -238,15 +238,15 @@ target_link_libraries(basalt-overlap PRIVATE core kernels ${_gpu_runtime_target}
 # Naive first, each with a parity test against a reference that was itself validated against ggml.  The
 # kernels link `artifact` for the scalar dequantizers, because using the VALIDATED scalar path as the
 # reference is the whole point - a kernel checked against another copy of itself proves nothing.
-add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_gemv.cu
-                        src/kernels/cuda/s_gemv.cu
-                        src/kernels/cuda/router_top10.cu
+add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/models/qwen4exp/kernels/s2_gemv.cu
+                        src/models/qwen4exp/kernels/s_gemv.cu
+                        src/models/qwen4exp/kernels/router_top10.cu
                         src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/rope.cu
                         src/kernels/cuda/sampler.cu
-                        src/kernels/cuda/s2_gemv_q8.cu
-  src/kernels/cuda/s2_expert_grouped.cu
-                        src/kernels/cuda/shared_expert.cu
+                        src/models/qwen4exp/kernels/s2_gemv_q8.cu
+  src/models/qwen4exp/kernels/s2_expert_grouped.cu
+                        src/models/qwen4exp/kernels/shared_expert.cu
                         src/models/qwen4exp/kernels/gr.cu
                         src/models/qwen4exp/kernels/gdn.cu
                         src/models/qwen4exp/kernels/qsa.cu
@@ -255,17 +255,17 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/native_mmvq.cu
                         src/kernels/cuda/native_bf16.cu
                         src/models/qwen4exp/kernels/native_gr_norm.cu
-                        src/kernels/cuda/native_moe.cu
+                        src/models/qwen4exp/kernels/native_moe.cu
                         src/models/qwen4exp/kernels/native_gdn.cu
                         src/models/qwen4exp/kernels/native_gr_postops.cu
-                        src/kernels/cuda/native_router.cu
+                        src/models/qwen4exp/kernels/native_router.cu
                         src/models/qwen4exp/kernels/native_gdn_preprocess.cu
                         src/models/qwen4exp/kernels/native_qsa.cu
-                        src/kernels/cuda/native_rope.cu
+                        src/models/qwen4exp/kernels/native_rope.cu
                         src/models/qwen4exp/kernels/native_ple_postops.cu
                         src/models/qwen4exp/kernels/native_qsa_indexer.cu
                         src/models/qwen4exp/kernels/native_qsa_score.cu
-                        src/kernels/cuda/ple.cu
+                        src/models/qwen4exp/kernels/ple.cu
                         src/kernels/cuda/kv_q8.cu
                         src/kernels/cuda/kv_stream.cu
                         src/kernels/cuda/kv_q4.cu
@@ -282,7 +282,7 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/models/qwen4exp/kernels/fused_gdn.cu
                         src/kernels/cuda/dequant_bf16.cu
                         src/models/qwen4exp/kernels/qsa_select.cu
-                        src/kernels/cuda/verify_kernels.cu
+                        src/models/qwen4exp/kernels/verify_kernels.cu
                         src/kernels/cuda/dec_gdn_rec.cu
                         src/models/qwen4exp/kernels/dense_tc.cu
                         src/models/qwen4exp/kernels/mid_chain.cu
@@ -313,13 +313,13 @@ endif()
 # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
 set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/native_bf16.cu
     src/models/qwen4exp/kernels/native_gr_norm.cu
-    src/kernels/cuda/native_moe.cu
+    src/models/qwen4exp/kernels/native_moe.cu
     src/models/qwen4exp/kernels/native_gdn.cu
     src/models/qwen4exp/kernels/native_gr_postops.cu
-    src/kernels/cuda/native_router.cu
+    src/models/qwen4exp/kernels/native_router.cu
     src/models/qwen4exp/kernels/native_gdn_preprocess.cu
     src/models/qwen4exp/kernels/native_qsa.cu
-    src/kernels/cuda/native_rope.cu
+    src/models/qwen4exp/kernels/native_rope.cu
     src/models/qwen4exp/kernels/native_ple_postops.cu
     src/models/qwen4exp/kernels/native_qsa_indexer.cu
     src/models/qwen4exp/kernels/native_qsa_score.cu

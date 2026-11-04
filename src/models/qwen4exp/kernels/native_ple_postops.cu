@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "basalt/kernels/native_ple_postops.hpp"
+#include "basalt/models/qwen4exp/kernels/native_ple_postops.hpp"
 #include "basalt/models/qwen4exp/kernels/native_gr_norm.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
 #include "basalt/kernels/ngram.hpp"

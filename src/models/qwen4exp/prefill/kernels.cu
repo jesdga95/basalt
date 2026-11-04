@@ -1,7 +1,7 @@
 // src/models/qwen4exp/prefill/kernels.cu - see include/basalt/models/qwen4exp/prefill/kernels.hpp.
 #include "basalt/models/qwen4exp/prefill/kernels.hpp"
 #include "basalt/kernels/mrope.hpp"
-#include "basalt/kernels/router_top10.hpp"
+#include "basalt/models/qwen4exp/kernels/router_top10.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
