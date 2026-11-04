@@ -278,7 +278,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int n = fused_n_, pg = fused_gu_parts_, pd = fused_d_parts_;
             if ((int) i < n * pg) {
                 const int e = (int) i / pg, part = (int) i % pg;
-                native_gu_range(e, FF * part / pg, FF * (part + 1) / pg);
+                native_gu_range(e, (int) nfmt_->n_ff * part / pg, (int) nfmt_->n_ff * (part + 1) / pg);
                 FusedExpert& fe = fused_[(size_t) e];
                 if (fe.gu_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     native_quantize(e);
@@ -288,7 +288,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const int k = (int) i - n * pg, e = k / pd, part = k % pd;
                 // every gate/up task is claimed before any down task, so this waits only for tasks already running
                 if (fused_[(size_t) e].ready.load(std::memory_order_acquire) == 0) wait_ready(e);
-                native_down_range(e, H * part / pd, H * (part + 1) / pd);
+                native_down_range(e, (int) nfmt_->n_embd * part / pd, (int) nfmt_->n_embd * (part + 1) / pd);
             }
         } else {
             // an equal range of the phase's rows across ALL its experts (a range may span two)
@@ -354,7 +354,7 @@ void ExpertPool::native_down_range(int e, int r0, int r1) {
 void ExpertPool::native_quantize(int e) {
     SplitBufMulti& sb = split_multi_[(size_t) e];
     for (int t = 0; t < mjobs_[e].nt; ++t)
-        if (q2_native_kernels(nfmt_->d_type)) act_quant_any(sb.ff[t], FF, sb.a2[t]);
+        if (q2_native_kernels(nfmt_->d_type)) act_quant_any(sb.ff[t], (int) nfmt_->n_ff, sb.a2[t]);
         else native_quant_h(*nfmt_, sb.ff[t], sb.hq[t]);
 }
 
@@ -473,10 +473,10 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         // One batch for the whole layer: an expert's down rows start once its own gate/up rows are done and quantized,
         // so there is no barrier between the three steps and the cores' speed differences cost one tail, not two.
         // The share of tasks follows the share of bytes of the two projections.
-        const double gu_share = (double) (2 * f.up_off) / (double) (2 * f.up_off + f.d_row * (size_t) H);
+        const double gu_share = (double) (2 * f.up_off) / (double) (2 * f.up_off + f.d_row * (size_t) f.n_embd);
         fused_n_ = nb;
-        fused_gu_parts_ = (std::min)(FF, (std::max)(1, (int) std::lround(kTasksPerThread * threads * gu_share / nb)));
-        fused_d_parts_ = (std::min)(H, (std::max)(1, (int) std::lround(kTasksPerThread * threads * (1.0 - gu_share) / nb)));
+        fused_gu_parts_ = (std::min)((int) f.n_ff, (std::max)(1, (int) std::lround(kTasksPerThread * threads * gu_share / nb)));
+        fused_d_parts_ = (std::min)((int) f.n_embd, (std::max)(1, (int) std::lround(kTasksPerThread * threads * (1.0 - gu_share) / nb)));
         for (int e = 0; e < nb; ++e) {
             fused_[(size_t) e].gu_left.store(fused_gu_parts_, std::memory_order_relaxed);
             fused_[(size_t) e].ready.store(0, std::memory_order_relaxed);
