@@ -39,8 +39,6 @@ private:
     bool in_call{};
     int64_t relaxed_kept{};
     int hist_n{};
-    int64_t p{};
-    int32_t x{};
     std::vector<int32_t> drafts{};
     std::vector<int32_t> window{};
     std::vector<int32_t> outv{};
@@ -48,16 +46,9 @@ private:
     basalt::core::DraftCumAdapt cum_adapt{};   // this request's draft threshold
     std::vector<int32_t> sbuf{};
     bool first_window{};
-    int64_t produced_n{};
     int64_t sfx_windows{};
     int64_t sfx_drafts{};
     int64_t sfx_ok{};
-    int64_t draft_offered{};
-    int64_t draft_accepted{};
-    // what the session holds once this request is done: the prompt read so far, then every committed token
-    std::vector<int32_t> consumed{};
-    const char* finish{};
-    std::string kv_stop{};   // the elastic KV could not back the next window: the request ends on this error
     basalt::core::Verifier* cv{};
     basalt::core::Verifier* ov{};
     struct HeldWindow { bool on = false; int T = 0; std::vector<int32_t> win, out; };
@@ -69,7 +60,6 @@ private:
     bool pair_req{};
     int64_t pair_runs{};
     int64_t pair_holds{};
-    Clock::time_point d0{};
     bool dec_timing{};
     struct DecSnap {
         double wait, pool, host, plan, actq, jobs, run, peer_wait;
@@ -98,15 +88,9 @@ private:
     struct TkStep { int n = 0; int32_t id[4] = {}; float p[4] = {}; };
     TkStep tk_prev[16]{};
     bool tk_valid{};
-    double decode_ms{};
     int64_t req_hits{};
     int64_t req_look{};
     int64_t req_offload{};
-    int64_t fresh{};
-    int64_t read_n{};
-    bool ram_out{};
-    // "12288 of 98179" when cancelled mid-read, the rate from what was read
-    char read_txt[64]{};
     bool windows_ok(int64_t a, int64_t b);
     bool read_windows(int64_t a, int64_t b, std::string& e);
     bool refill_issue(PfPart& p, std::string& e, bool assign = true);
@@ -129,7 +113,16 @@ private:
     Flow read_to(int64_t to) override;
     Flow prompt_end() override;
     Flow decode() override;
-    Flow complete() override;
+    Flow complete_begin() override;
+    DoneCounts done_counts() override;
+    bool tiers_settle() override;
+    bool admit_draft() override;
+    void slot_state_back(int slot) override;
+    bool slot_draft_keep(int slot) override;
+    void slot_set_sampling(int slot) override;
+    void slot_init(BSlot& sl) override;
+    bool slot_leave() override;
+    void report_request(const DoneCounts& dc) override;
     bool cvec_wanted() const override;
     void set_cvec() override;
     void select_view() override;
