@@ -49,6 +49,7 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         else if (a == "--diag-tier-vram") o.diag_tier_vram = std::atoi(next("--diag-tier-vram"));
         else if (a == "--diag-dspark") o.diag_dspark = next("--diag-dspark");
         else if (a == "--diag-serial-prompt") o.diag_serial_prompt = true;
+        else if (a == "--diag-logits") o.diag_logits = next("--diag-logits");
         else if (a == "--image") o.images.push_back(next("--image"));
         else if (a == "--image-at") o.image_at.push_back(std::atoll(next("--image-at")));
         else if (a == "--image-pad-id") o.image_pad_id = std::atoll(next("--image-pad-id"));

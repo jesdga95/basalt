@@ -32,7 +32,7 @@
 
 namespace basalt::models::deepseek41 {
 namespace {
-constexpr int kLendTierTokens = 16384;   // a prompt this long reads without the VRAM tier, in larger chunks
+constexpr int kLendTierTokens = 4096;   // a prompt this long reads without the VRAM tier, in larger chunks
 constexpr int kStepTailTokens = 256;     // a tail this short may read one decode step at a time
 
 #define DS_CUDA(call)                                                                                   \
@@ -205,6 +205,12 @@ public:
             std::string err;
             if (!step(r.tokens[i], r.pos + i, false, nullptr, nullptr, err)) return {model::Status::Error, err};
         }
+        return {};
+    }
+
+    model::Result prepare() override {
+        std::string e;
+        if (ops_ && !ops_->expert_tier(e) && !e.empty()) return {model::Status::Error, e};
         return {};
     }
 
