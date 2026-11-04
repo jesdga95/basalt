@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-using namespace basalt::program::serve;
+using namespace basalt::models::qwen4exp::serve;
 
 static int g_fail = 0;
 #define CHECK(c)                                                                         \
