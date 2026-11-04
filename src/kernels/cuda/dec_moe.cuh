@@ -2186,8 +2186,8 @@ bool dec_moe_glue_ok(const NativeExpertLayout& L) {
         default: break;
     }
     const bool t1 = L.gu_type == 40;   // NVFP4 gate/up: dm_glue_gu1_kernel
-    return (tg || t1) && td && (t1 || gu2_usable(L)) && L.n_ff == 640 && g_gu2 >= 2 && !g_old_kernels && !g_grouped_v1 &&
-           g_exp_phase == 0;
+    return (tg || t1) && td && (t1 || gu2_usable(L)) && L.n_ff == 640 && native_grouped_gu2() >= 2 && !iq_old_kernels() && !native_grouped_v1() &&
+           native_expert_phase() == 0;
 }
 
 void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scratch, float* out, int cap, void* stream) {
@@ -2399,7 +2399,7 @@ bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
 #undef DM_PAIR_OK
         default: break;
     }
-    return pair && gu && d && n_ff == 640 && n_embd % 256 == 0 && !g_old_kernels && !g_grouped_v1;
+    return pair && gu && d && n_ff == 640 && n_embd % 256 == 0 && !iq_old_kernels() && !native_grouped_v1();
 }
 
 static const void* dm_peer_fn(bool q2, bool mix = false) {

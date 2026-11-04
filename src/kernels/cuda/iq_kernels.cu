@@ -2762,7 +2762,10 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
 
 }  // namespace
 
+#ifndef IQ_DEV_ONLY   // host side: another translation unit takes only the device code above
+
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
+int native_grouped_gu2() { return g_gu2; }
 void native_grouped_set_gu2(int mode) { g_gu2 = mode; }
 bool iq_old_kernels() { return g_old_kernels; }
 void iq_set_mmvq_mma(bool on) { g_mmvq_mma = on; g_mmvq_mma_min_t = 1; }   // tests: every column count
@@ -2902,6 +2905,8 @@ bool g_grouped_v1 = false;
 }  // namespace
 
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
+bool native_grouped_v1() { return g_grouped_v1; }
+int native_expert_phase() { return g_exp_phase; }
 void native_grouped_set_mma_hint(bool on) {
     t_gu_mma_hint = on ? 1 : 0;
 }
@@ -3048,10 +3053,6 @@ void gated_mlp_clamped(const NativeExpertLayout& L, float swiglu_limit, const vo
     grouped_impl<true>(L, ptr, start, ng, dst, tok, 1, n_tok, x_q8_1, scratch, out, stream, 0, swiglu_limit);
 }
 
-}  // namespace basalt::kernels
+#endif  // IQ_DEV_ONLY
 
-#define FZ_DEV_ONLY
-#include "dec_gdn_rec.cu"   // the peer mixer item's recurrence (device code only)
-#undef FZ_DEV_ONLY
-#include "dec_moe.cuh"   // DEC_MOE: the decode MoE tail's kernels, on this file's row dots
-#include "pk_moe.cuh"   // persistent experts + combine, on the same device code
+}  // namespace basalt::kernels
