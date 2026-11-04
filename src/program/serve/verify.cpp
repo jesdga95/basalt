@@ -3,15 +3,15 @@
 
 namespace basalt::program::serve {
 
-basalt::core::Verifier & Runtime::stage_ver(int st) {
+basalt::core::Verifier & QfnRuntime::stage_ver(int st) {
     return st == 0 ? ver : split_same ? ver_same : stages[(size_t) st - 1]->ver;
 }
 
-int Runtime::pcie_num_of(double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); }
+int QfnRuntime::pcie_num_of(double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); }
 
-basalt::core::Verifier & Runtime::stage_verb(int st) { return st == 0 ? ver_b : stages[(size_t) st - 1]->ver_b; }
+basalt::core::Verifier & QfnRuntime::stage_verb(int st) { return st == 0 ? ver_b : stages[(size_t) st - 1]->ver_b; }
 
-int Runtime::init_verify() {
+int QfnRuntime::init_verify() {
 
     d_hist = nullptr;
     hist_stage = std::vector<int32_t>(kHistSlots, -1);
@@ -164,7 +164,7 @@ int Runtime::init_verify() {
     return 0;
 }
 
-int Runtime::capture_windows() {
+int QfnRuntime::capture_windows() {
 
     // every window width's graph is captured before READY, not by the first request that needs it
     if (o.serve && stages.empty() && !ver.warm_graphs(err)) {

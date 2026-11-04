@@ -5,14 +5,14 @@ namespace basalt::program::serve {
 
 // ---- where this request starts reading: the live session, or a checkpoint, whose tokens and pictures are
 // exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
-bool Request::starts_with(const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) {
+bool QfnRequest::starts_with(const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) {
     const int64_t L = (int64_t) pre.size();
     if (L < 1 || L > n - 1) return false;
     if (!basalt::core::conversation_ids_equal(pre.data(), pre.size(), ids32.data())) return false;
     return runtime_.imgs_below(runtime_.req_imgs, L) == pre_imgs;
 }
 
-Flow Request::restore() {
+Flow QfnRequest::restore() {
     runtime_.cur = ids;
     // The conversation cache's keys are int32: one narrow view per request, so a parked entry or a checkpoint
     // is matched by one bulk compare over the slice instead of a per-token scan.

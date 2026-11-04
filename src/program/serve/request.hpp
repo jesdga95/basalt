@@ -5,14 +5,14 @@
 
 namespace basalt::program::serve {
 
-class Request {
+class QfnRequest {
 public:
-    explicit Request(Runtime& runtime) : runtime_(runtime) {}
+    explicit QfnRequest(QfnRuntime& runtime) : runtime_(runtime) {}
     Flow execute();
 
 private:
-    Runtime& runtime_;
-    using PfPart = Runtime::PfPart;
+    QfnRuntime& runtime_;
+    using PfPart = QfnRuntime::PfPart;
     using BSlot = Runtime::BSlot;
     using SlotHeld = Runtime::SlotHeld;
     bool geni{};

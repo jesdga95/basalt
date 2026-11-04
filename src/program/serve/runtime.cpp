@@ -3,7 +3,7 @@
 
 namespace basalt::program::serve {
 
-int Runtime::execute() {
+int QfnRuntime::execute() {
     if (const int code = init_prompt()) return code;
     if (const int code = init_verify()) return code;
     if (const int code = init_conversations()) return code;
@@ -17,11 +17,11 @@ int Runtime::execute() {
 }
 
 int run(Context& context) {
-    Runtime runtime(context);
+    QfnRuntime runtime(context);
     return runtime.execute();
 }
 
-int Runtime::run_requests() {
+int QfnRuntime::run_requests() {
     for (;;) {
         const Flow flow = dispatch();
         if (flow == Flow::error) {
@@ -36,7 +36,7 @@ int Runtime::run_requests() {
     }
 }
 
-int Runtime::shutdown() {
+int QfnRuntime::shutdown() {
     // the conversations this process holds go to the disk tier before it ends
     if (disk.enabled()) {
         const auto t0 = Clock::now();
