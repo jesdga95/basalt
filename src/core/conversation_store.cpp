@@ -16,7 +16,6 @@
 // turn ends; the checkpoints a stride inside a long prompt and older turn ends are not written.
 #include "basalt/core/conversation_store.hpp"
 
-#include "basalt/kernels/qsa.hpp"
 #include "basalt/log.hpp"
 #include "basalt/platform/direct_file.hpp"
 #include "basalt/platform/file.hpp"
@@ -721,7 +720,7 @@ uint64_t ConversationStore::load_bytes(const Match& m) const {
         if (s.kind == kKvRate) {   // the cells up to the match, at most the stored ones
             const int64_t cells = std::min<int64_t>(m.tokens + 4, s.meta[5]);
             n += (s.meta[0] + s.meta[1] + s.meta[2] + s.meta[3]) * (uint64_t) cells +
-                 (uint64_t) s.meta[4] * (uint64_t) (cells / std::max<int64_t>(1, basalt::kernels::qsa_real_shapes().idx_block) + 1);
+                 (uint64_t) s.meta[4] * (uint64_t) (cells / std::max<int64_t>(1, row_cells_) + 1);
         }
     }
     if (state == 0)   // stored as of a checkpoint: its state file's size
@@ -795,13 +794,12 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
             copy_state(state, at);
             img.checkpoints.push_back(std::move(at));
         }
-        const auto& shapes = basalt::kernels::qsa_real_shapes();
         for (const ConversationKv& kv : src.kv) {
             ConversationKv k;
             k.format = kv.format; k.heads = kv.heads; k.head_dim = kv.head_dim; k.page_size = kv.page_size;
             k.idx_dim = kv.idx_dim;
             k.cells = kv.page_size > 0 ? (P + kv.page_size - 1) / kv.page_size * kv.page_size : 0;
-            k.pooled_rows = kv.pooled_rows > 0 ? P / shapes.idx_block + 1 : 0;
+            k.pooled_rows = kv.pooled_rows > 0 ? P / row_cells_ + 1 : 0;
             const ConversationBuffer* from[5] = {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale, &kv.pooled};
             ConversationBuffer* to[5] = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
             for (int b = 0; b < 5; ++b) {
@@ -924,7 +922,6 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
     std::vector<int64_t> kv_cells((size_t) h.n_kv, -1), kv_rows((size_t) h.n_kv, -1);
     std::vector<Rate> rates((size_t) h.n_kv);
     std::vector<uint8_t> rated((size_t) h.n_kv, 0);
-    const auto& shapes = basalt::kernels::qsa_real_shapes();
     const int64_t B = h.block_cells, tail_from = h.n_blocks * h.block_cells;
     for (const Section& s : opened[0].tab) {
         if (s.kind == kKvHead) {
@@ -936,7 +933,7 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
             kv_rows[s.index] = s.meta[5];
             if (k.page_size <= 0 || s.meta[1] < tail_from || s.meta[5] < 0 || k.idx_dim < 0) return fail("bad K/V extents", SIZE_MAX);
             k.cells = (P + k.page_size - 1) / k.page_size * k.page_size;
-            k.pooled_rows = s.meta[5] > 0 ? P / shapes.idx_block + 1 : 0;
+            k.pooled_rows = s.meta[5] > 0 ? P / row_cells_ + 1 : 0;
             if (k.cells > s.meta[1] || k.pooled_rows > s.meta[5]) return fail("K/V shorter than the match", SIZE_MAX);
         } else if (s.kind == kKvRate) {
             if (s.index >= (uint32_t) h.n_kv) return fail("a K/V layer out of range", SIZE_MAX);
@@ -949,7 +946,7 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
     for (int64_t i = 0; i < h.n_kv; ++i)
         if (kv_cells[(size_t) i] < 0 || !rated[(size_t) i]) return fail("a K/V layer without its shapes", SIZE_MAX);
     if (B <= 0 && h.n_blocks > 0) return fail("blocks of no size", SIZE_MAX);
-    if (h.n_blocks > 0 && (B % shapes.idx_block != 0 || (int64_t) blocks.size() != h.n_blocks))
+    if (h.n_blocks > 0 && (B % row_cells_ != 0 || (int64_t) blocks.size() != h.n_blocks))
         return fail("inconsistent blocks", SIZE_MAX);
     // the destination of each layer's buffer, sized for the match
     std::vector<std::array<ConversationBuffer*, 5>> dsts((size_t) h.n_kv);
@@ -978,7 +975,7 @@ bool ConversationStore::load(const Match& m, SavedConversation& out, std::string
                          }});
         return true;
     };
-    const int64_t ib = std::max<int64_t>(1, shapes.idx_block);
+    const int64_t ib = std::max<int64_t>(1, row_cells_);
     for (int64_t b = 0; b < h.n_blocks; ++b) {
         // whether the match reaches into this block (cells, or the pooled row past the last whole one)
         const int64_t c0 = b * B;
@@ -1265,8 +1262,7 @@ void ConversationStore::writer() {
 bool ConversationStore::write_job(Job& job, uint64_t& wrote, uint64_t& whole, std::string& error) {
     const SavedConversation& img = job.image;
     const int64_t n_ids = (int64_t) img.live.ids.size();
-    const auto& shapes = basalt::kernels::qsa_real_shapes();
-    const int64_t ib = std::max<int64_t>(1, shapes.idx_block);
+    const int64_t ib = std::max<int64_t>(1, row_cells_);
     // each layer's bytes per cell and per pooled row; whole blocks need every layer's buffers to divide evenly
     std::vector<Rate> rates(img.kv.size());
     bool blocky = !img.kv.empty() && kBlockCells % ib == 0;

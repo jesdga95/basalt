@@ -4,6 +4,7 @@
 
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/layout.hpp"
+#include "basalt/kernels/dec_moe.hpp"
 #include "unicode_flags.hpp"
 #include "basalt/program/options.hpp"
 
@@ -60,8 +61,14 @@ public:
     }
 
     model::Result load(const model::LoadRequest&, std::unique_ptr<model::LoadedModel>&) const override {
-        return {model::Status::UseEnginePath, "Flash-Next loads through the engine's own path"};
+        return {model::Status::NotImplemented, "Flash-Next runs its own start"};
     }
+
+    std::optional<int> run(program::CommonOptions& o, std::vector<program::GpuCard>& cards) const override {
+        return run_engine(static_cast<program::Options&>(o), cards);
+    }
+
+    int max_expert_cards() const override { return kernels::kDmMaxX; }
 
     std::vector<model::SideTableSpec> side_tables(const model::ModelDesc&) const override {
         return {{model::SideTableSpec::Kind::Ple, "per_layer_token_embd.weight", 0, 0}};

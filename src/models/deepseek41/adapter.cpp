@@ -85,6 +85,8 @@ public:
 
     PreTokenizer pretokenizer() const override { return {"joyai-llm", pretok_joyai}; }
 
+    int max_expert_cards() const override { return 1; }
+
     model::TokenNames token_names() const override {
         return {{"<\xef\xbd\x9cend\xe2\x96\x81of\xe2\x96\x81sentence\xef\xbd\x9c>"}, "<\xef\xbd\x9cUser\xef\xbd\x9c>",
                 "<\xef\xbd\x9c" "deepseek_image\xef\xbd\x9c>"};

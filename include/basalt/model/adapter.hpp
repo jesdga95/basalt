@@ -21,6 +21,7 @@ class GgufFile;
 }
 namespace basalt::program {
 struct CommonOptions;
+struct GpuCard;
 }
 
 namespace basalt::model {
@@ -56,9 +57,8 @@ struct TokenizerSpec {
     std::string chat_format;     ///< server-side chat format name
 };
 
-/// Outcome of a model operation. `UseEnginePath` means the call is served by the built-in engine path that
-/// predates the adapter seam; the caller continues there unchanged.
-enum class Status { Ok, NotImplemented, UseEnginePath, Error };
+/// Outcome of a model operation.
+enum class Status { Ok, NotImplemented, Error };
 
 struct Result {
     Status status = Status::Ok;
@@ -172,6 +172,13 @@ public:
     virtual Result load(const LoadRequest& req, std::unique_ptr<LoadedModel>& out) const = 0;
     virtual std::vector<SideTableSpec> side_tables(const ModelDesc&) const { return {}; }
     virtual TokenizerSpec tokenizer_spec() const = 0;
+    /// A model with its own start and serving runs them here to the exit code; nullopt: the shared server runs load()'s sessions.
+    virtual std::optional<int> run(program::CommonOptions& o, std::vector<program::GpuCard>& cards) const {
+        (void) o; (void) cards;
+        return std::nullopt;
+    }
+    /// The cards that may hold experts beside the main one.
+    virtual int max_expert_cards() const = 0;
     virtual TokenNames token_names() const = 0;
     /// The pre-tokenizer's name in the pack's tokenizer.json and its rule.
     struct PreTokenizer {
@@ -197,6 +204,8 @@ void register_adapter(std::unique_ptr<ModelAdapter> a);
 /// Null when no adapter has that architecture.
 const ModelAdapter* find_adapter(const std::string& arch);
 std::vector<std::string> adapter_names();
+/// The most expert cards any registered model takes: a card plan before a model is known.
+int max_expert_cards();
 /// The adapter for a file's `general.architecture`, or null with `err` set.
 const ModelAdapter* adapter_for(const GgufFile& meta, std::string& err);
 /// Replaces the old architecture guard: empty when the file belongs to a registered model and validates.

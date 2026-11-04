@@ -30,8 +30,6 @@ using engine_local::peer_hot_share_order;
 
 std::string gib_text(uint64_t bytes);
 int fatal_start_error(const std::string& text);
-/// A model the engine serves through its adapter session runs here to its exit code; nullopt: the built-in engine path.
-std::optional<int> run_adapter_model(basalt::program::CommonOptions& o, basalt::core::ModelFile& model_file);
 std::string vram_free_note();
 bool for_each_index_name(const basalt::core::FileRange& index, const std::function<void(const std::string&)>& f);
 int argmax(const std::vector<float>& v);

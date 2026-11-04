@@ -4,6 +4,7 @@
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/program/options.hpp"
 
+#include <algorithm>
 #include <map>
 
 namespace basalt::model {
@@ -27,6 +28,12 @@ void register_adapter(std::unique_ptr<ModelAdapter> a) {
 const ModelAdapter* find_adapter(const std::string& arch) {
     const auto it = table().find(arch);
     return it == table().end() ? nullptr : it->second.get();
+}
+
+int max_expert_cards() {
+    int most = 0;
+    for (const std::string& name : adapter_names()) most = std::max(most, find_adapter(name)->max_expert_cards());
+    return most;
 }
 
 std::vector<std::string> adapter_names() {
