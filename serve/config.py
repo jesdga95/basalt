@@ -10,6 +10,7 @@ from pathlib import Path
 
 from serve import ROOT
 from serve.engine.flags import flag_index
+from serve.engine.image_source import parse_url_host
 from serve.engine.vision import VISION_MODES, VISION_USAGE, vision_mode
 from serve.util.console import tagged
 
@@ -17,7 +18,7 @@ from serve.util.console import tagged
 MIN_SLOT_CONTEXT = 256          # the least context a slot is given when --max-context is shared
 ENGINE_DEFAULT_CONTEXT = 4096     # the engine's context without --max-context
 PARALLEL_MAX = 8                            # the engine's batch slots
-CONFIG_PATHS = ("model", "tokenizer")       # relative to the config file
+CONFIG_PATHS = ("model", "tokenizer", "image-dir")       # relative to the config file
 GRAMMAR_DEFAULT = True                      # the `grammar` option when neither the file nor the command line sets it
 
 
@@ -332,6 +333,15 @@ def vision_setting(text: str) -> str:
         raise argparse.ArgumentTypeError(str(e)) from None
 
 
+def image_url_host(text: str) -> str:
+    """argparse type: HOST or HOST:PORT an image URL from another machine may name."""
+    try:
+        parse_url_host(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+    return text.strip()
+
+
 def parallel_count(text: str) -> int:
     """argparse type: a whole number of request slots, 1..PARALLEL_MAX."""
     try:
@@ -379,6 +389,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="image input: off (default), dynamic (inside the engine: it borrows expert-cache slots "
                          "on the main GPU while it reads an image, no standing VRAM), cpu (no VRAM, slow) or a "
                          "GPU number, as nvidia-smi numbers them: the encoder sidecar, always on that card")
+    ap.add_argument("--image-url-host", action="append", default=[], metavar="HOST[:PORT]", type=image_url_host,
+                    help="let requests from other machines name http(s) image URLs on exactly this host (repeatable; "
+                         "without a port, 80 and 443). A name must resolve to public addresses; an IP address is "
+                         "taken as written. Requests from this machine need no flag")
+    ap.add_argument("--image-dir", action="append", default=[], metavar="DIR",
+                    help="let requests from other machines name image files under this directory (repeatable). "
+                         "Requests from this machine need no flag")
+    ap.add_argument("--image-remote-only", action="store_true",
+                    help="treat requests from this machine as remote too, so they get only data: URLs and what "
+                         "--image-url-host and --image-dir allow. For a server behind anything on this machine that "
+                         "forwards other people's requests")
     ap.add_argument("--host", default="127.0.0.1",
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other "
                          "devices on your network (give --api-key)")

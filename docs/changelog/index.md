@@ -4,5 +4,6 @@ Releases, newest first. Versions are 0.x: a minor release adds features or chang
 
 | Release | Date | Summary |
 | --- | --- | --- |
+| [0.2.1](0.2.1.md) | 2026-11-03 | Image sources follow where a request comes from, quality measured against a BF16 reference, an NVFP4 pack with Q8_0 dense projections. |
 | [0.2.0](0.2.0.md) | 2026-11-01 | `.basalt` format version 2, about 13% faster cold decode, opt-in lossy routing flags, a thinking-loop safeguard. |
 | [0.1.0](0.1.0.md) | 2026-10-29 | First tagged release: the engine as it stands, and the changes since 2026-10-15. |

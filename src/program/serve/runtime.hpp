@@ -5,15 +5,12 @@
 #include "basalt/program/grammar/guard.hpp"
 #include "basalt/platform/system.hpp"
 
-#include <array>
 #include <functional>
 #include <optional>
 
 namespace basalt::core {
 class ModelFile;
 class MtpDrafter;
-class RemoteExperts;
-class RemoteExpertOpt;
 }  // namespace basalt::core
 namespace basalt::kernels { class PleTable; }
 namespace basalt::kernels::cpu { class ExpertPool; }
@@ -79,8 +76,6 @@ struct Context {
     basalt::core::FileExpertSource& src;
     basalt::core::ExpertSource*& srcp;
     basalt::core::ExpertCache& xcache;
-    std::array<basalt::core::RemoteExperts, 3>& remote_experts;
-    std::unique_ptr<basalt::core::RemoteExpertOpt>& remote_opt;
     basalt::core::PeerExperts& peer;
     std::vector<std::unique_ptr<basalt::core::PeerExperts>>& xpeers;
     engine_local::Drive& drive;

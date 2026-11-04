@@ -1,7 +1,6 @@
 // basalt/program/options.hpp - the `basalt generate` flag set, resolved into one struct.
 #pragma once
 
-#include <array>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -82,10 +81,6 @@ struct Options {
     /// Slots of VRAM-resident experts.  **0 = off, and off is the default.**  Switching the cache on moves work off the
     /// CPU pool (`src/kernels/cuda/s2_expert_grouped.cu`, wired via `expert_hit_run`).
     int expert_cache = 0;
-    std::array<int, 3> expert_cache_remote{}; ///< CUDA1..3 slots; CUDA0 keeps dense/state/MTP
-    std::array<bool, 3> expert_cache_remote_auto{};
-    bool remote_expert_opt = false; ///< optional optimization of the existing remote-expert decode path
-    std::string expert_cache_remote_placement = "stripe"; ///< stripe experts or assign complete layers to CUDA1..3
     /// Multi-GPU: a second expert tier on CUDA device `peer_device` (-1 = off), `peer_reserve_mib` left free
     /// there, `peer_slots` caps its size (0 = as many as fit), `peer_adapt_swaps` per adaptive round
     /// (-1 = adapt_swaps).
@@ -101,8 +96,8 @@ struct Options {
     /// the prompt path's rows per layer the peer computes: -1 = half of chunk x top-k, 0 = the prompt path stays on
     /// the primary
     int64_t peer_prefill_rows = -1;
-    /// The engine's expert profile for the model (data/profiles/<key>.prof, cli::profile_key), or the
-    /// --expert-profile-save file a start places from; empty means none.  A profile decides residency by routing
+    /// The engine's expert profile for the model (--expert-profile, else data/profiles/<key>.prof, cli::profile_key),
+    /// or the --expert-profile-save file a start places from; empty means none.  A profile decides residency by routing
     /// frequency instead of by first use.
     std::string expert_profile;
     /// --serve (opt-in): where to save what the adaptive tier learned, as a profile (the resident experts first,

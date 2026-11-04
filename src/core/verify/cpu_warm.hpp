@@ -2,7 +2,6 @@
 
 #include "common.hpp"
 #include "basalt/core/verify.hpp"
-#include "basalt/core/remote_expert_opt.hpp"
 #include "basalt/core/native_head.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"

@@ -34,24 +34,17 @@ std::optional<int> resolve_model_options(Options& o, bool multi_gpu) {
         o.prefill_auto_max = 32768;
         o.prefill_chunk = o.prefill_auto_max;
     }
-    if (!o.mmap_experts && !o.resident_cpu_experts && o.shared_expert_arena.empty() && !o.expert_profile.empty() &&
-        o.expert_cache_remote[0] <= 0 && o.expert_cache_remote[1] <= 0 && o.expert_cache_remote[2] <= 0) {
+    if (!o.mmap_experts && !o.resident_cpu_experts && o.shared_expert_arena.empty() && !o.expert_profile.empty()) {
         o.mmap_experts = o.resident_cpu_experts = o.resident_pin = o.resident_soft = true;
         o.resident_headroom = 0;
     }
-    if (!o.adapt_every_given && o.serve && !multi_gpu && !o.remote_expert_opt) o.adapt_every = 1;
+    if (!o.adapt_every_given && o.serve && !multi_gpu) o.adapt_every = 1;
     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
         basalt::log::error("basalt generate", "--shared-expert-arena backs the resident arena and cannot be used with --mmap-experts");
         return 2;
     }
-    if (o.resident_cpu_experts && (!o.mmap_experts || o.expert_profile.empty())) {
-        basalt::log::error("basalt generate", "--resident-cpu-experts requires --mmap-experts and a model with an expert profile");
-        return 2;
-    }
-    const bool remote_caches = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
-                               o.expert_cache_remote[2] > 0;
-    if (o.resident_cpu_experts && remote_caches) {
-        basalt::log::error("basalt generate", "--resident-cpu-experts does not support remote expert caches");
+    if (o.resident_cpu_experts && !o.mmap_experts) {
+        basalt::log::error("basalt generate", "--resident-cpu-experts requires --mmap-experts");
         return 2;
     }
     return std::nullopt;
@@ -142,10 +135,7 @@ std::optional<int> validate_generation_options(const Options& o, bool multi_gpu,
     }
     if (!std::isfinite(o.temperature) || o.temperature < 0 || !std::isfinite(o.top_p) ||
         o.top_p <= 0 || o.top_p > 1 || o.top_k < 0 || o.expert_cache < -1 ||
-        o.pool_workers < 0 || std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
-                                           [](int slots) { return slots < 0; }) ||
-        (o.expert_cache_remote[1] > 0 && o.expert_cache_remote[0] == 0) ||
-        (o.expert_cache_remote[2] > 0 && o.expert_cache_remote[1] == 0)) {
+        o.pool_workers < 0) {
         basalt::log::error("basalt generate", "invalid sampling or resource parameter");
         return 2;
     }
@@ -158,14 +148,6 @@ std::optional<int> validate_generation_options(const Options& o, bool multi_gpu,
                              "everything is loaded; the smallest safe value is %d", o.vram_reserve_mib, min_vram_reserve_mib);
         return 2;
     }
-    if (o.expert_cache_remote_placement != "stripe" && o.expert_cache_remote_placement != "layer") {
-        basalt::log::error("basalt generate", "--expert-cache-remote-placement must be stripe or layer");
-        return 2;
-    }
-    if (o.remote_expert_opt && !o.serve) {
-        basalt::log::error("basalt generate", "--remote-expert-opt requires --serve");
-        return 2;
-    }
     if (o.peer_exclusive && (o.peer_device < 1 || !o.resident_cpu_experts || !o.serve)) {
         basalt::log::error("basalt generate", "--peer-exclusive needs a second GPU (--gpu 0,1), --resident-experts and --serve");
         return 2;
@@ -174,12 +156,9 @@ std::optional<int> validate_generation_options(const Options& o, bool multi_gpu,
         basalt::log::error("basalt generate", "--peer-exclusive runs with one expert tier card (--gpu 0,1)");
         return 2;
     }
-    // the peer tier is the second card's only user: a layer split or a remote expert cache would put a second engine
-    // part (and a second copy of the same experts) on it
-    if (o.peer_device >= 1 && (!o.layer_split.empty() || o.expert_cache_remote[0] > 0)) {
-        basalt::log::error("basalt generate", "--peer-device cannot be combined with %s",
-                     !o.layer_split.empty() ? "--layer-split (use one or the other)"
-                                            : "--expert-cache-device1..3 (the peer tier already caches experts there)");
+    // the peer tier is the second card's only user: a layer split would put a second engine part on it
+    if (o.peer_device >= 1 && !o.layer_split.empty()) {
+        basalt::log::error("basalt generate", "--peer-device cannot be combined with --layer-split (use one or the other)");
         return 2;
     }
 

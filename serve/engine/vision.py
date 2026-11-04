@@ -1,19 +1,18 @@
 """The image encoder process, and the GPU helpers the engine and encoder environments are built from."""
 from __future__ import annotations
 
-import base64
 import hashlib
 import os
 import subprocess
 import tempfile
 import threading
 import time
-import urllib.request
 import uuid
 import queue
 from pathlib import Path
 
 from serve.engine import lifeline
+from serve.engine.image_source import ImageSources, load_image
 from serve.engine.process import frame_pipes
 from serve.util.console import tagged
 
@@ -24,6 +23,13 @@ VISION_READY_S = 300.0
 VISION_ENCODE_S = 300.0
 VISION_CACHE_BYTES = 1 << 30                    # room for about 64 images
 IMAGE_MAX_PIXELS = 64 << 20                     # matches the decoder's kMaxImagePixels
+IMAGE_REQUEST_BYTES = 1 << 30                   # one request's images, as the encoder will get them
+IMAGE_WAITING_BYTES = 2 << 30                   # all requests' read images waiting for their turn to encode
+# what Pillow decodes for a client: formats whose header gives the size that decoding will produce, and whose cost is
+# in proportion. Out: EPS (runs Ghostscript), ICO (the size checked is not the size decoded), JPEG 2000 (seconds of
+# work that stall the server).
+PILLOW_FORMATS = ("JPEG", "PNG", "BMP", "GIF", "WEBP", "TIFF", "AVIF", "HEIF", "TGA", "PPM", "QOI")
+_decodes = threading.Semaphore(4)               # reads run outside the request turn: this bounds Pillow's memory
 
 
 class Vision:
@@ -95,18 +101,20 @@ class Vision:
             pass
         self._start()
 
-    @staticmethod
-    def load(source: str) -> bytes:
-        if source.startswith("data:"):
-            return base64.b64decode(source.split(",", 1)[1])
-        if source.startswith(("http://", "https://")):
-            req = urllib.request.Request(source, headers={"User-Agent": "local-server"})
-            with urllib.request.urlopen(req, timeout=60) as r:
-                return r.read()
-        path = source[7:] if source.startswith("file://") else source
-        if path and os.path.isfile(path):
-            return Path(path).read_bytes()
-        raise ValueError("an image must be a data: URL, an http(s) URL or a local file path")
+    def read(self, sources: list, allowed: ImageSources | None = None) -> list[bytes]:
+        """The request's images, read under its policy and normalized, each source once. Called outside the request
+        turn, so a slow source holds up only its own request."""
+        seen: dict[str, bytes] = {}
+        out, total = [], 0
+        for source in sources:
+            if not isinstance(source, str) or source not in seen:
+                data = self.normalize(load_image(source, allowed))
+                total += len(data)
+                if total > IMAGE_REQUEST_BYTES:
+                    raise ValueError(f"the request's images are larger than {IMAGE_REQUEST_BYTES >> 20} MiB")
+                seen[source] = data
+            out.append(seen[source])
+        return out
 
     @staticmethod
     def _exif_rotated(data: bytes) -> bool:
@@ -115,7 +123,7 @@ class Vision:
         try:
             import io
             from PIL import Image
-            with Image.open(io.BytesIO(data)) as im:
+            with Image.open(io.BytesIO(data), formats=["JPEG"]) as im:
                 return im.getexif().get(0x0112, 1) not in (None, 0, 1)
         except Exception:  # noqa: BLE001 - any failure leaves the image as it was sent
             return False
@@ -129,14 +137,21 @@ class Vision:
         if (jpeg and not Vision._exif_rotated(data)) or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"BM" or \
                 data[:6] in (b"GIF87a", b"GIF89a"):
             return data
+        with _decodes:
+            return Vision._converted(data)
+
+    @staticmethod
+    def _converted(data: bytes) -> bytes:
+        """The image through Pillow, as a PNG."""
         try:
             import io
-            from PIL import Image
+            from PIL import Image, UnidentifiedImageError
         except ImportError:
             raise ValueError("this image format needs Pillow (python -m pip install pillow); JPEG, PNG, BMP and "
                              "GIF work without it") from None
         try:
-            im = Image.open(io.BytesIO(data))
+            Image.init()                                 # plugin sets differ between builds
+            im = Image.open(io.BytesIO(data), formats=[f for f in PILLOW_FORMATS if f in Image.OPEN])
             width, height = im.size
             if width * height > IMAGE_MAX_PIXELS:
                 raise ValueError(f"the image is {width}x{height} pixels; the limit is "
@@ -148,6 +163,8 @@ class Vision:
             raise                                        # the pixel budget's own message
         except Image.DecompressionBombError:
             raise ValueError(f"the image is larger than {IMAGE_MAX_PIXELS >> 20} megapixels") from None
+        except UnidentifiedImageError:
+            raise ValueError("the image could not be read: not a format this server decodes") from None
         except Exception as e:
             raise ValueError(f"the image could not be read ({e})") from None
         if im.mode in ("RGBA", "LA", "P") and "transparency" in im.info or im.mode in ("RGBA", "LA"):
@@ -161,11 +178,11 @@ class Vision:
         im.save(out, format="PNG")
         return out.getvalue()
 
-    def encode(self, sources: list[str]) -> tuple[Path, list[int]]:
-        """Encode a request's images into one embeddings file; return it and each image's token count."""
+    def encode(self, images: list[bytes]) -> tuple[Path, list[int]]:
+        """Encode a request's images (from read) into one embeddings file; return it and each image's token count."""
         pins = []
         try:
-            encoded = self._encode_pinned(sources, pins)
+            encoded = self._encode_pinned(images, pins)
             combined = self.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
             try:
                 with open(combined, "wb") as f:
@@ -189,11 +206,10 @@ class Vision:
         if key in self.cache:
             self.cache[key] = self.cache.pop(key)
 
-    def _encode_pinned(self, sources: list[str], pins: list[str]) -> list[tuple[Path, int, int]]:
-        return [self._encode_one(src, pins) for src in sources]
+    def _encode_pinned(self, images: list[bytes], pins: list[str]) -> list[tuple[Path, int, int]]:
+        return [self._encode_one(data, pins) for data in images]
 
-    def _encode_one(self, source: str, pins: list[str]) -> tuple[Path, int, int]:
-        data = self.normalize(self.load(source))
+    def _encode_one(self, data: bytes, pins: list[str]) -> tuple[Path, int, int]:
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
             self._pin(key, pins)
@@ -274,11 +290,10 @@ class EngineVision(Vision):
     def close(self):
         pass
 
-    def _encode_pinned(self, sources: list[str], pins: list[str]) -> list[tuple[Path, int, int]]:
+    def _encode_pinned(self, images: list[bytes], pins: list[str]) -> list[tuple[Path, int, int]]:
         """Every image not cached yet goes to the engine in one ENC, so it borrows its slots once."""
         keys, datas = [], {}
-        for src in sources:
-            data = self.normalize(self.load(src))
+        for data in images:
             key = hashlib.sha256(data).hexdigest()[:32]
             keys.append(key)
             datas[key] = data

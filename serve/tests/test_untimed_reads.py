@@ -65,11 +65,9 @@ class UntimedReads(unittest.TestCase):
         v.proc = SimpleNamespace(stdin=io.StringIO(), stdout=silent, kill=silent.kill,
                                  poll=lambda: 1 if silent.killed else None)
         try:
-            with mock.patch.object(vision, "VISION_ENCODE_S", 0.3), \
-                    mock.patch.object(Vision, "load", return_value=b""), \
-                    mock.patch.object(Vision, "normalize", return_value=b"png"):
+            with mock.patch.object(vision, "VISION_ENCODE_S", 0.3):
                 with self.assertRaises(ValueError) as cm:
-                    v.encode(["x"])
+                    v.encode([b"png"])
             self.assertIn("said nothing for", str(cm.exception))
             self.assertTrue(silent.killed)                      # ended: the next request starts a fresh one
             self.assertFalse(v.alive())
