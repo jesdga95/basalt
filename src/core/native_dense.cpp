@@ -1,4 +1,5 @@
 #include "basalt/core/native_dense.hpp"
+#include "basalt/model/adapter.hpp"
 #include "basalt/core/direct_upload.hpp"
 #include "basalt/core/load_progress.hpp"
 #include <cstdlib>
@@ -186,7 +187,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             const auto* number = gguf.get("split.no");
             const auto* tensors = gguf.get("split.tensors.count");
             if (gguf.get("general.architecture")) {
-                err = basalt::check_architecture(gguf);
+                err = basalt::model::check_architecture(gguf);
                 if (!err.empty()) return false;
                 have_architecture = true;
                 if (count && number && tensors && number->u == 0 && count->u > 1) {

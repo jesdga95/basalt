@@ -4,6 +4,7 @@
 namespace basalt::program::generate {
 
 int run(int argc, char** argv) {
+    basalt::models::register_builtin_models();
     Context context;
 
     Options o;
@@ -22,12 +23,13 @@ int run(int argc, char** argv) {
             return fatal_start_error("--model: " + merr);
         }
         basalt::core::model_sources(model_file, srcs);
+        // the source tensors (embedding, PLE table, native projections, head) are served through the GGUF view of the file
+        o.native_shards = {o.model};
+        if (const auto code = run_adapter_model(o, model_file)) return *code;
         if (srcs.dense.empty() || srcs.dense_index.empty() || srcs.experts.empty() || srcs.experts_layout.empty() ||
             srcs.hc8.empty()) {
             return fatal_start_error(o.model + " lacks the dense, dense.index, experts, experts.layout or hc8 section");
         }
-        // the source tensors (embedding, PLE table, native projections, head) are served through the GGUF view of the file
-        o.native_shards = {o.model};
         if (!srcs.mtp_dense.empty() && !srcs.mtp_dense_index.empty() && !srcs.mtp_experts.empty()) o.mtp = o.model;
         // the expert profile: the one --expert-profile names, else the engine's for this model when it has one
         uint64_t prof_bytes = 0;

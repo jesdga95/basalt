@@ -399,10 +399,19 @@ bool ModelFile::register_gguf_view(std::string& err) const {
         ti.name = name;
         for (const Json& d : shape->items) ti.shape.push_back(d.u64());
         ti.type = (uint32_t) type_id->u64();
-        ti.offset = gg->offset + off->u64();
+        // a tensor may name another section (the Engram table); its offset is relative to that section
+        const Section* sec = gg;
+        if (const Json* sn = t.get("section"); sn != nullptr && sn->is_string()) {
+            sec = find(sn->s);
+            if (sec == nullptr) {
+                err = path_ + ": tensor " + name + " names a missing section " + sn->s;
+                return false;
+            }
+        }
+        ti.offset = sec->offset + off->u64();
         if (const Json* nb = t.get("bytes"))
-            if (off->u64() > gg->bytes || nb->u64() > gg->bytes - off->u64()) {
-                err = path_ + ": tensor " + name + " runs past the end of the gguf section";
+            if (off->u64() > sec->bytes || nb->u64() > sec->bytes - off->u64()) {
+                err = path_ + ": tensor " + name + " runs past the end of its section";
                 return false;
             }
         view->tensors.push_back(std::move(ti));

@@ -1,4 +1,5 @@
 #include "basalt/core/native_head.hpp"
+#include "basalt/model/adapter.hpp"
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/direct_upload.hpp"
 #include "basalt/core/load_progress.hpp"
@@ -52,7 +53,7 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         // The architecture is the metadata shard's; output.weight comes from whichever shard holds it (shard 2
         // of Unsloth's UD-Q4_K_XL, whose shard 1 holds no tensor).  GgufModel refuses a duplicate across shards.
         const basalt::GgufModel model(shards);
-        err = basalt::check_architecture(model.meta());
+        err = basalt::model::check_architecture(model.meta());
         if (!err.empty()) return false;
         size_t at = 0;
         const basalt::TensorInfo* tensor = model.find("output.weight", &at);
@@ -165,7 +166,7 @@ NativeEmbed::~NativeEmbed() {
 bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err) {
     try {
         const basalt::GgufModel model(shards);
-        err = basalt::check_architecture(model.meta());
+        err = basalt::model::check_architecture(model.meta());
         if (!err.empty()) { err = "native embedding: " + err; return false; }
         size_t at = 0;
         const basalt::TensorInfo* t = model.find("token_embd.weight", &at);

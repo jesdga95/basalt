@@ -2,9 +2,12 @@
 // include/basalt/artifact/gguf_reader.hpp; this file is just the entry point, so it cannot drift
 // from the library it exercises.
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/model/adapter.hpp"
+#include "basalt/models/builtin.hpp"
 
 #ifndef GGUF_MAIN_DISABLED
 int main(int argc, char** argv) {
+    basalt::models::register_builtin_models();
     if (argc < 2) {
         std::printf("usage: gguf_reader <file.gguf> [--check]\n");
         return 2;
@@ -53,7 +56,7 @@ int main(int argc, char** argv) {
                 if (!(nb <= end && end < nb + 32)) ++bad;
             }
             std::printf("  geometry bracket: %zu out of range, %zu types unknown\n", bad, unknown);
-            const std::string err = basalt::check_architecture(g);
+            const std::string err = basalt::model::check_architecture(g);
             std::printf("  architecture guard: %s\n", err.empty() ? "PASS" : ("FAIL - " + err).c_str());
             if (bad) return 1;
         }

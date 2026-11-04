@@ -196,6 +196,14 @@ struct Options {
     /// --gpu: the cards this run uses (gpu_select.hpp); empty = GPU 0 alone.  --gpu-plan prints the choice and exits.
     std::string gpu;
     bool gpu_plan = false;
+    std::string diag_fixture, diag_dump;   ///< --diag-fixture / --diag-dump: model diagnostics, off by default
+    std::string diag_mmproj;               ///< --diag-mmproj: image projector file instead of the pack's vision section
+    int diag_tier_ram = -1, diag_tier_vram = -1;   ///< --diag-tier-ram / --diag-tier-vram: fixed expert-tier sizes
+    std::string diag_dspark;               ///< --diag-dspark: drafter GGUF run on the second GPU beside decode
+    std::vector<std::string> images;       ///< --image FILE ... with --image-at N: the picture's block goes before token N
+    std::vector<int64_t> image_at;
+    int64_t image_pad_id = -1;             ///< --image-pad-id: the prompt token that stands for a picture's rows (--serve)
+    bool max_context_set = false;          ///< --max-context was given (a model with its own default picks one otherwise)
     /// Stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
