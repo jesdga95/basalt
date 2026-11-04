@@ -23,6 +23,7 @@ namespace basalt::program::generate {
 namespace {
 
 bool g_diag_serial_prompt = false;   // --diag-serial-prompt
+bool g_serve_quit = false;           // QUIT ended the serve loop
 
 /// A picture's embedding block, placed before the prompt token at `at`.
 struct AdapterImage {
@@ -247,6 +248,12 @@ int adapter_serve(basalt::model::LoadedModel& loaded, int64_t max_context, int64
             if (*it == "STOP") { lines.erase(it); return true; }
         return false;
     };
+    // a kernel failure exits the process from anywhere: end at once so the server sees it, nothing left to wind down
+    std::atexit([] {
+        if (g_serve_quit) return;
+        std::fflush(nullptr);
+        std::_Exit(1);
+    });
     std::printf("READY %lld stop\n", (long long) max_context);
     std::fflush(stdout);
     std::string line;
@@ -255,7 +262,10 @@ int adapter_serve(basalt::model::LoadedModel& loaded, int64_t max_context, int64
         std::istringstream in(line);
         std::string cmd;
         in >> cmd;
-        if (cmd == "QUIT") break;
+        if (cmd == "QUIT") {
+            g_serve_quit = true;
+            break;
+        }
         if (cmd == "ENC") {
             std::vector<std::string> words;
             for (std::string w; in >> w;) words.push_back(w);
