@@ -7,11 +7,11 @@ values are the fastest measured here; this page says what each one trades and wh
 ## How a round works
 
 The engine counts how often each expert is routed to. A round ranks the experts that are not in VRAM by their count
-and swaps the most-routed ones in for the least-routed resident ones, when the count clears the resident's by `adapt-margin`. On a server a round has
-three steps, one per decode window: the leaving experts are copied to RAM, the incoming ones are copied into their
-slots on a side stream, and the next window uses them (each layer waits only for its own copies). A new round starts
-only once the last one has landed, so "every window" means one round about every three windows. After each round
-every count is multiplied by the decay, so recent routing outweighs old.
+and swaps the most-routed ones in for the least-routed resident ones, when the count clears the resident's by
+`adapt-margin`. On a server a round has three steps, one per decode window: the leaving experts are copied to RAM, the
+incoming ones are copied into their slots on a side stream, and the next window uses them (each layer waits only for
+its own copies). A new round starts only once the last one has landed, so "every window" means one round about every
+three windows. After each round every count is multiplied by the decay, so recent routing outweighs old.
 
 The main card's round ranks every layer together, so a layer that routes to more experts takes slots from the layers
 that route to fewer; an expert the peer card holds needs a larger count to move to the main card, and the expert the
