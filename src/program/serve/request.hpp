@@ -32,23 +32,13 @@ private:
     bool batch_fatal{};
     int64_t il_parts{};
     double il_ms{};
-    int64_t yielded_at{};
-    int yielded_slot{};
     // ---- the prompt-time layer split: a long part of the prompt is read across the cards when its price there
     // (split_price) beats the main card's alone; the chunk, its head chunk, the stage count and the cuts, or none
     struct SplitPlan { int64_t chunk = 0, head = 0; int stages = 0; std::vector<int> cuts; };
-    // per-request sampling for the verify window's head (greedy when temperature is absent)
-    basalt::kernels::SamplerParams req_sp{};
     bool relax_on{};
     bool in_call{};
     int64_t relaxed_kept{};
     int hist_n{};
-    bool cancelled{};
-    int64_t turn_at{};
-    int64_t root_at{};
-    int64_t at{};
-    int64_t fold_p0{};
-    double prompt_ms{};
     int64_t p{};
     int32_t x{};
     std::vector<int32_t> drafts{};
@@ -133,7 +123,11 @@ private:
     bool parse_begin() override;
     float default_relax() const override;
     Flow prepare_image() override;
-    Flow read_prompt() override;
+    bool prompt_begin() override;
+    Flow set_sampling() override;
+    void limit_parts() override;
+    Flow read_to(int64_t to) override;
+    Flow prompt_end() override;
     Flow decode() override;
     Flow complete() override;
     bool cvec_wanted() const override;
