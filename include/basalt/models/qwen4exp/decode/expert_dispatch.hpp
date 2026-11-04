@@ -3,7 +3,7 @@
 
 #include "basalt/core/expert_source.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
-#include "basalt/models/qwen4exp/kernels/cpu_geometry.hpp"
+#include "basalt/models/qwen4exp/geometry.hpp"
 
 namespace basalt::core {
 

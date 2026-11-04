@@ -17,6 +17,7 @@ from serve.util.console import tagged
 
 MIN_SLOT_CONTEXT = 256          # the least context a slot is given when --max-context is shared
 ENGINE_DEFAULT_CONTEXT = 4096     # the engine's context without --max-context
+CONFIG_VERSION = 1                          # the config file's optional "v"
 PARALLEL_MAX = 8                            # the engine's batch slots
 CONFIG_PATHS = ("model", "tokenizer", "image-dir")       # relative to the config file
 GRAMMAR_DEFAULT = True                      # the `grammar` option when neither the file nor the command line sets it
@@ -89,9 +90,11 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> tuple[list[str],
         raise ValueError(f"cannot read: {e.strerror or e}") from None
     except json.JSONDecodeError as e:
         raise ValueError(f"not valid JSON: {e}") from None
-    if not isinstance(raw, dict) or set(raw) - {"server", "engine"}:
+    if isinstance(raw, dict) and raw.get("v", CONFIG_VERSION) != CONFIG_VERSION:
+        raise ValueError(f'"v" must be {CONFIG_VERSION}')
+    if not isinstance(raw, dict) or set(raw) - {"v", "server", "engine"}:
         raise ValueError('expected {"server": {...}, "engine": {...}}'
-                         + (f", not the key {sorted(set(raw) - {'server', 'engine'})[0]!r}" if isinstance(raw, dict) else ""))
+                         + (f", not the key {sorted(set(raw) - {'v', 'server', 'engine'})[0]!r}" if isinstance(raw, dict) else ""))
     sections = {k: raw.get(k, {}) for k in ("server", "engine")}
     for k, v in sections.items():
         if not isinstance(v, dict):

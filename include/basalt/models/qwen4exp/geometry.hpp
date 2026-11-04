@@ -1,10 +1,11 @@
-// basalt/models/qwen4exp/kernels/cpu_geometry.hpp - Flash-Next's expert widths and its blob's layout.
+// basalt/models/qwen4exp/geometry.hpp - Flash-Next's expert widths and its blob's layout.
 #pragma once
 
 #include "basalt/kernels/cpu/expert.hpp"
 
 namespace basalt::kernels::cpu {
 
+inline constexpr int K = 10;        // experts the router picks per token
 inline constexpr int H = 2560;      // n_embd
 inline constexpr int FF = 640;      // expert intermediate width
 inline constexpr int NE = 512;      // routed experts per layer

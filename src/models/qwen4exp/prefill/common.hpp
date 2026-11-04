@@ -2,7 +2,8 @@
 
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
-#include "basalt/models/qwen4exp/kernels/cpu_geometry.hpp"
+#include "basalt/models/qwen4exp/geometry.hpp"
+#include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/models/qwen4exp/prefill/gemm.hpp"
 #include <algorithm>
 #include <chrono>
@@ -12,7 +13,7 @@ namespace basalt::prefill::detail {
 
 using Clock = std::chrono::steady_clock;
 constexpr float EPS = 1e-6f;
-constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10, NE = 512;
+constexpr int64_t N = basalt::kernels::cpu::H, HC = 4, D = N * HC, LR = 320, K = basalt::kernels::cpu::K, NE = basalt::kernels::cpu::NE;
 constexpr int64_t C = 10240, ZV = 6144, HV = 48;
 // staging holds the largest blob of the pack (a native pack's blobs differ per layer)
 inline int64_t MAXBLOB() { return (int64_t) basalt::kernels::cpu::expert_layout().max_blob; }
