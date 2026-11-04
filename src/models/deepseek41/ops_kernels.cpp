@@ -120,14 +120,23 @@ public:
         return true;
     }
 
-    void save_turn(void* stream) override {
+    size_t turn_bytes() const override {
+        const size_t ring_b = (size_t) kWindowSlots * kLatent * 2;
+        size_t total = 0;
+        for (size_t il = 0; il < ring_.size(); ++il) {
+            if (ring_[il]) total += ring_b;
+            if (st_kv_[il]) total += 2 * (size_t) g_.compress_ratio[il] * kLatent * 4;
+        }
+        return total;
+    }
+
+    void save_turn(void* stream, uint8_t* host) override {
         cudaStreamSynchronize((cudaStream_t) stream);
         const size_t ring_b = (size_t) kWindowSlots * kLatent * 2;
-        turn_.clear();
+        size_t at = 0;
         auto put = [&](const void* dev, size_t bytes) {
-            const size_t at = turn_.size();
-            turn_.resize(at + bytes);
-            cudaMemcpy(turn_.data() + at, dev, bytes, cudaMemcpyDeviceToHost);
+            cudaMemcpy(host + at, dev, bytes, cudaMemcpyDeviceToHost);
+            at += bytes;
         };
         for (size_t il = 0; il < ring_.size(); ++il) {
             if (ring_[il]) put(ring_[il], ring_b);
@@ -139,12 +148,12 @@ public:
         }
     }
 
-    void restore_turn(void* stream) override {
+    void restore_turn(void* stream, const uint8_t* host) override {
         cudaStreamSynchronize((cudaStream_t) stream);
         const size_t ring_b = (size_t) kWindowSlots * kLatent * 2;
         size_t at = 0;
         auto get = [&](void* dev, size_t bytes) {
-            cudaMemcpy(dev, turn_.data() + at, bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(dev, host + at, bytes, cudaMemcpyHostToDevice);
             at += bytes;
         };
         for (size_t il = 0; il < ring_.size(); ++il) {
@@ -559,7 +568,6 @@ private:
     std::vector<uint16_t*> ring_, comp_kv_, comp_ik_;
     std::vector<std::unique_ptr<ElasticBuf>> el_kv_, el_ik_;   // backing of comp_kv_ / comp_ik_ per kv-source layer
     int64_t backed_positions_ = 0;
-    std::vector<uint8_t> turn_;   // save_turn's copy
     int ctx_ = 0;
     std::vector<float*> st_kv_, st_sc_;
     float* freq_[2] = {nullptr, nullptr};

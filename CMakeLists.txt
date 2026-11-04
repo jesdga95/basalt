@@ -426,7 +426,7 @@ add_executable(basalt src/program/generate.cpp src/program/engine_local.cpp src/
                        src/program/generate/decode.cpp
                        src/program/serve/batch.cpp
                        src/program/serve/batch_pipeline.cpp
-                       src/program/serve/commands.cpp src/program/serve/qfn_commands.cpp src/program/serve/qfn_restore.cpp src/program/serve/qfn_image.cpp src/program/serve/qfn_prompt.cpp src/program/serve/qfn_finish.cpp
+                       src/program/serve/commands.cpp src/program/serve/qfn_commands.cpp src/program/serve/qfn_restore.cpp src/program/serve/qfn_image.cpp src/program/serve/qfn_prompt.cpp src/program/serve/qfn_finish.cpp src/program/serve/session_engine.cpp
                        src/program/serve/conversation.cpp
                        src/program/serve/kv.cpp
                        src/program/serve/loans.cpp

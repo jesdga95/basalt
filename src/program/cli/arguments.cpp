@@ -103,7 +103,6 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = (int) number;
             else o.conversation_cache_slots = (int) number;
         }
-        else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
         else if (a == "--turn-token") { o.turn_token = std::atoll(next("--turn-token")); o.turn_token_given = true; }
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
