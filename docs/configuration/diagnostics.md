@@ -52,6 +52,14 @@ All CLI, all off.
 | `--decode-timing` | serve | One line per request: where its decode time went. |
 | `--draft-log` | serve | Path. One line per verify window (width, accepted, time), for studying the draft policy. |
 
+Without a flag, the engine log has one line per served request, `to the first token N ms: ...`, that splits the time
+from the request's start to its first window's tokens into phases: the last request's final commit (`wait`), finding
+the conversation it continues (`match`), the RAM guard's wait (`ram`), a stored conversation's read (`disk`), fitting
+the K/V cache (`kv`), parking the current conversation (`park`), the restore (`restore`), the adaptive swaps' drain
+(`adapt`), the per-layer n-gram rows' warm-up (`ple`), the verify windows that read the prompt's last part (`windows`,
+their count in parentheses, then `commit` and the draft layer's rows, `mtp`), checkpoints (`checkpoint`), a batched
+read (`batched`), refilling lent slots (`refill`) and the rest (`other`); then the decode setup and the first window.
+
 ## Speculation tests
 
 | Flag | Binary | Value | What it does |

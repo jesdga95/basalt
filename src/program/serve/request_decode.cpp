@@ -13,6 +13,7 @@ Request::DecSnap Request::dec_snap() {
 
 // the verify windows: the first holds the last prompt token, with the rest of the last window
 Flow Request::decode() {
+    ph_mark(ph_other);
     if (runtime_.mtp_on && !runtime_.mtp.use_main(runtime_.err)) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }   // the windows between prompt chunks swapped it
     if (!runtime_.peer_due_apply(runtime_.err)) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }
     p = fold_p0;
@@ -63,7 +64,8 @@ Flow Request::decode() {
     if (runtime_.pipe_on) runtime_.mtp.set_max_drafts((pair_req ? basalt::core::kMtpChainMax : runtime_.S_mtp) - 1);
     pair_runs = 0;
     pair_holds = 0;
-    d0 = Clock::now();
+    ph_mark(ph_prep);
+    d0 = ph_t;
     // --decode-timing: where a request's decode time goes (one line per request)
     dec_timing = basalt::core::diagnostics().decode_timing;
 
@@ -444,6 +446,7 @@ Flow Request::decode() {
         for (int i = 0; i < keep; ++i) consumed.push_back(window[(size_t) i]);
         draft_offered += T - 1 - e0;
         draft_accepted += a - e0;
+        if (first_window) ph_mark(ph_first);
         first_window = false;
         bool commit_ok = true, after_ran = false, eos = false;
         std::string cerr;

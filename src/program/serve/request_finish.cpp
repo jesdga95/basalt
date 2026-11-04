@@ -3,6 +3,19 @@
 
 namespace basalt::program::serve {
 
+// the request's time from its start to its first window's tokens, by phase
+void Request::ph_log() const {
+    double total = 0;
+    for (const double v : ph_ms) total += v;
+    auto m = [&](Phase k) { return ph_ms[(size_t) k]; };
+    basalt::log::info("basalt serve", "to the first token %.0f ms: wait %.1f, match %.1f, ram %.1f, disk %.1f, kv %.1f, "
+                      "park %.1f, restore %.1f, adapt %.1f, ple %.1f, windows %.1f (%lld), commit %.1f, mtp %.1f, "
+                      "checkpoint %.1f, batched %.1f, refill %.1f, other %.1f; decode setup %.1f, first window %.1f",
+                      total, m(ph_wait), m(ph_match), m(ph_ram), m(ph_disk), m(ph_kv), m(ph_park), m(ph_restore),
+                      m(ph_adapt), m(ph_ple), m(ph_windows), (long long) ph_windows_n, m(ph_commit), m(ph_mtp),
+                      m(ph_checkpoint), m(ph_batched), m(ph_refill), m(ph_other), m(ph_prep), m(ph_first));
+}
+
 Flow Request::complete() {
     decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
     // the last commit (set_commit_async): the session is complete before anything reads or copies it
@@ -206,6 +219,7 @@ Flow Request::complete() {
         std::snprintf(read_txt, sizeof(read_txt), "%lld of %lld", (long long) read_n, (long long) fresh);
     else
         std::snprintf(read_txt, sizeof(read_txt), "%lld", (long long) fresh);
+    ph_log();
     basalt::log::info("basalt serve", "prompt %lld tokens = %lld reused + %s read in %.0f ms (%.1f tok/s), "
                          "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, %zu checkpoints%s",
                  (long long) n, (long long) resume, read_txt, prompt_ms,

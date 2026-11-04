@@ -12,11 +12,13 @@ Flow Request::read_prompt() {
     yielded_at = -1;   // BYIELD: the read stopped here and its slot holds it
     yielded_slot = -1;
 
+    ph_mark(ph_other);
     runtime_.apply_pending(true);
     if (!runtime_.xq_drain()) {
         std::printf("ERR an adaptive refill failed\n");
         return Flow::error;
     }
+    ph_mark(ph_adapt);
 
     req_sp.greedy = req_temperature <= 0.0f;
     req_sp.temperature = req_temperature;
@@ -115,7 +117,9 @@ Flow Request::read_prompt() {
         int64_t first_to = 0;
         for (const int64_t to : {root_at, turn_at, n - 1})
             if (to > read_from) { first_to = to; break; }
+        ph_mark(ph_other);
         runtime_.sp.set_ple_warm(ids.data(), read_from, first_to, n - 1);
+        ph_mark(ph_ple);
     }
     at = read_from;
     // the last window of the last windowed part carries the last prompt token too: the first generated
@@ -133,10 +137,12 @@ Flow Request::read_prompt() {
             const int64_t p0 = at + (int64_t) runtime_.S * ((to - at) / runtime_.S);
             if (!runtime_.mtp_on || n - p0 <= runtime_.S_mtp) { rto = p0; fold_p0 = p0; }
         }
+        ph_mark(ph_other);
         if (win && !refill(runtime_.err)) {
             std::printf("ERR refilling a lent slot failed: %s\n", runtime_.err.c_str());
             return Flow::error;
         }
+        ph_mark(ph_refill);
         const SplitPlan split = split_plan(at, to, win ? "a windowed read" : resumed_chunk > 0 ? "a resumed chunked read" : nullptr);
         const int64_t split_c = split.chunk;
         if (!win && !lend(to - at, runtime_.err, split_c, split.head)) {
@@ -166,6 +172,7 @@ Flow Request::read_prompt() {
         };
         runtime_.pp_part_ckpt = (to == turn_at || to == root_at) ? to : -1;
         bool split_ran = true;
+        ph_mark(ph_other);
         bool sp_ok = win ? (rto <= at || read_windows(at, rto, runtime_.err))
                    : split_c > 0 ? read_split(at, to, split, split_ran, runtime_.err)
                                  : read_part(at, to, runtime_.err);
@@ -174,6 +181,7 @@ Flow Request::read_prompt() {
             runtime_.err.clear();
             sp_ok = read_part(at, to, runtime_.err);
         }
+        if (!win) ph_mark(ph_batched);
         runtime_.pp_part_ckpt = -1;
         if (sp_ok && win && !ov_window()) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }
         if (!sp_ok) {
@@ -194,19 +202,24 @@ Flow Request::read_prompt() {
         at = to;
         resumed_chunk = 0;   // the later parts are planned as the read they continue planned them
         runtime_.ov_post = nullptr;
+        ph_mark(ph_other);
         if ((to == turn_at || to == root_at) && !runtime_.ov_post_done && !runtime_.checkpoint_at(to, nullptr, !in_slot && !runtime_.batch_on(), source_at(to))) {
             std::printf("ERR saving a conversation checkpoint failed%s\n", runtime_.ckpt_why.c_str());
             return Flow::error;
         }
+        ph_mark(ph_checkpoint);
     }
+    ph_mark(ph_other);
     if (!refill(runtime_.err)) {
         std::printf("ERR refilling a lent slot failed: %s\n", runtime_.err.c_str());
         return Flow::error;
     }
+    ph_mark(ph_refill);
     if (il_parts > 0)
         basalt::log::info("basalt batch", "the prompt was read in %lld parts, the slots decoding %.0f ms between "
                              "them", (long long) il_parts + 1, il_ms);
-    prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
+    ph_mark(ph_other);
+    prompt_ms = std::chrono::duration<double, std::milli>(ph_t - r0).count();
     std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
     std::fflush(stdout);
 
