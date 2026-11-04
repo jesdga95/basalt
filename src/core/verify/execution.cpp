@@ -4,7 +4,6 @@
 #include "diagnostics.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/verify.hpp"
-#include "basalt/core/remote_expert_opt.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
@@ -254,7 +253,6 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
         set_plan_slot();
         const int n = T;
         progress_at("verify window: the CPU experts of layer", l);
-        if (remote_opt_) remote_opt_->begin(h_w_, 0, n);
         if (dm_ != nullptr) {   // the ring's own rows and tiers: the pool computes the CPU's entries only
             const basalt::kernels::DmRing& R = dm_->h_ring[k];
             sink_.ext_kind = R.kind;
@@ -264,7 +262,6 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
         } else if (pool != nullptr)
             pool(user, h_x_, h_ids_, n, ss.k,
                  h_ymiss_, l);
-        if (remote_opt_) remote_opt_->end();
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();

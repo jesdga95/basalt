@@ -29,12 +29,26 @@ int run(int argc, char** argv) {
         // the source tensors (embedding, PLE table, native projections, head) are served through the GGUF view of the file
         o.native_shards = {o.model};
         if (!srcs.mtp_dense.empty() && !srcs.mtp_dense_index.empty() && !srcs.mtp_experts.empty()) o.mtp = o.model;
-        // the engine's expert profile for this model, when it has one
-        const std::string key = cli::profile_key(model_file.meta());
-        const std::string prof = std::string(BASALT_SOURCE_DIR) + "/data/profiles/" + key + ".prof";
+        // the expert profile: the one --expert-profile names, else the engine's for this model when it has one
         uint64_t prof_bytes = 0;
-        if (!key.empty() && basalt::platform::file_size(prof, prof_bytes) && prof_bytes > 0) o.expert_profile = prof;
-        else basalt::log::info("basalt generate", "no expert profile for %s", key.empty() ? "this model" : key.c_str());
+        if (!o.expert_profile.empty()) {
+            if (!basalt::platform::file_size(o.expert_profile, prof_bytes) || prof_bytes == 0) {
+                return fatal_start_error("--expert-profile " + o.expert_profile + ": no such file, or it is empty");
+            }
+        } else {
+            const std::string key = cli::profile_key(model_file.meta());
+            const std::string prof = std::string(BASALT_SOURCE_DIR) + "/data/profiles/" + key + ".prof";
+            if (!key.empty() && basalt::platform::file_size(prof, prof_bytes) && prof_bytes > 0) o.expert_profile = prof;
+            else {
+                basalt::log::info("basalt generate", "no expert profile for %s", key.empty() ? "this model" : key.c_str());
+                if (o.resident_cpu_experts) {
+                    basalt::log::error("basalt generate", "expert profile not found: %s; ship data/profiles with the engine "
+                                       "(or pass --mmap-experts without --resident-experts)",
+                                       key.empty() ? "the model names no architecture or layer and expert counts" : prof.c_str());
+                    return 2;
+                }
+            }
+        }
         // the 8-bit hyper-connection copies
         std::map<std::string, basalt::core::Hc8Copy> table;
         if (!basalt::core::hc8_read(srcs.hc8, table, merr)) {
@@ -92,7 +106,7 @@ int run(int argc, char** argv) {
     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
     // the next visible ones); "auto" places the K from each GPU's free VRAM once the weights are in (below).  KV
     // streaming and images (the server's GPU encoder) run across a split, also with parking and --batch.  Across
-    // GPUs, not supported: control vectors, the helper caches (--expert-cache-remote), and lending cache slots to the
+    // GPUs, not supported: control vectors and lending cache slots to the
     // prompt path (each stage's prompt path has its own buffers).
     std::vector<int64_t> split_at;
     std::vector<int> split_devs;
@@ -154,9 +168,6 @@ int run(int argc, char** argv) {
     if (pipe_want) o.vram_reserve_mib += kPairMib0;
     if (const auto code = cli::resolve_model_options(o, multi_gpu)) return *code;
     if (o.serve) basalt::platform::watch_resident_ram(o.resident_cpu_experts, 0);
-    // the helper-GPU expert caches (--expert-cache-remote): CUDA1..3 on one GPU; with a layer
-    // split, the visible GPUs no stage runs on, in order
-    int remote_dev[3] = {1, 2, 3};
     if (multi_gpu) {
         if (o.expert_profile.empty()) {
             basalt::log::error("basalt generate", "a layer split across GPUs needs a model with an expert profile");
@@ -165,21 +176,6 @@ int run(int argc, char** argv) {
         // A stage's prompt path borrows from that stage's own expert cache: the loan is the tail of the stage's own
         // cache (see `PfPart` in the serve block), and outside the prompt that tail is expert cache, so a large chunk
         // costs a stage nothing permanent.
-        int n_vis = 1;
-        if (cudaGetDeviceCount(&n_vis) != cudaSuccess || n_vis < 1) n_vis = 1;
-        cudaGetLastError();
-        int next_free = 1;
-        for (int r = 0; r < 3; ++r) {
-            if (o.expert_cache_remote[(size_t) r] <= 0) continue;
-            while (next_free < n_vis &&
-                   std::find(split_devs.begin(), split_devs.end(), next_free) != split_devs.end()) ++next_free;
-            if (next_free >= n_vis) {
-                basalt::log::error("basalt generate", "--expert-cache-remote with a layer split needs a GPU that runs no "
-                                     "stage (%d visible, %zu used by the split)", n_vis, split_devs.size() + 1);
-                return 2;
-            }
-            remote_dev[r] = next_free++;
-        }
         std::string devs;
         for (const int d : split_devs) devs += (devs.empty() ? "" : ",") + std::to_string(d);
         basalt::log::info("basalt generate", "layer split across %zu GPUs: CUDA0, then CUDA%s (split %s)",
@@ -278,17 +274,6 @@ int run(int argc, char** argv) {
             l = e + 1;
         }
     }
-    // Only CUDA1's context is created here, before the large allocations: the later helpers' come after the arena.
-    for (int r = 0; r < 1; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
-        // Keep CUDA1's proven startup order: initialise its context before
-        // allocating GPU0 weights or mapping the large host expert arena.
-        double free_gib = 0;
-        if (!basalt::core::RemoteExperts::preflight(remote_dev[r], free_gib, err)) {
-            return fatal_start_error(err);
-        }
-        basalt::log::info("basalt generate", "CUDA%d context ready, %.2f GiB free before expert arena registration",
-                     remote_dev[r], free_gib);
-    }
     // The PCIe share of the missed experts.  The GPU's SMs read that share over the link (the copy kernel), so on a
     // slower link it must shrink or the window waits for it.  The real H2D bandwidth is probed once; from 20 GB/s up
     // the default stays.
@@ -331,7 +316,6 @@ int run(int argc, char** argv) {
     context.multi_gpu = &multi_gpu;
     context.pipe_want = &pipe_want;
     context.kPairMibLater = &kPairMibLater;
-    context.remote_dev = &remote_dev;
     context.no_spec = &no_spec;
     context.rope_cfg = &rope_cfg;
     context.err = &err;

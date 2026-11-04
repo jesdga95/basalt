@@ -1,6 +1,6 @@
 # The elastic KV cache
 
-With `--max-context` above 32768 the KV cache is elastic (not with `--kv-resident` or `--vram-elastic`; a peer card is
+With `--max-context` above 32768 the KV cache is elastic (not with `--kv-resident`, `--vram-elastic` or a layer split; a peer card is
 fine): each session backs its first 32768 cells at startup (the K/V pools, the indexer's block keys, the RoPE tables
 and the draft layer's K/V alike), and the rest of that VRAM holds the expert cache's last slots until a request needs
 it. A request backs its prompt plus 16384 cells before the prompt is read (and 16384 more whenever decode runs past

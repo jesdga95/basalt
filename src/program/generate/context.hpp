@@ -26,7 +26,6 @@ struct Context {
     bool* multi_gpu = nullptr;
     const bool* pipe_want = nullptr;
     const int* kPairMibLater = nullptr;
-    int (*remote_dev)[3] = nullptr;
     const bool* no_spec = nullptr;
     basalt::kernels::RopeScaling* rope_cfg = nullptr;
     std::string* err = nullptr;
@@ -90,8 +89,6 @@ struct Context {
     uint64_t* cache_fill_bytes = nullptr;
     std::function<int64_t(int)> peer_split_bytes;
     std::function<uint64_t()> peer_expert_room;
-    std::array<basalt::core::RemoteExperts, 3>* remote_experts = nullptr;
-    std::unique_ptr<basalt::core::RemoteExpertOpt>* remote_opt = nullptr;
     basalt::core::PeerExperts* peer = nullptr;
     std::vector<std::unique_ptr<basalt::core::PeerExperts>>* xpeers = nullptr;
     Drive* drive = nullptr;

@@ -4,12 +4,14 @@ Clone, requirements and the build commands are in the [README](../README.md). Th
 
 ## What is in the repository
 
-- `src/`, `include/`: the C++/CUDA engine (one binary, `basalt`).
+- `src/`, `include/`: the C++/CUDA engine (`basalt`, `basalt-bench`, `basalt-probe` and the image encoder `basalt-vision`).
 - `serve/`: a Python server with an OpenAI- and Anthropic-compatible API, and a stats page.
 - `tools/convert/`: the model-file converter (`convert.py`), its section builders and the drafter fetcher (`mtp_fetch.py`).
 - `tools/`: the .basalt reader and writer (`model_file.py`), the PPL/KLD quality gate (`ppl_gate.py`), the greedy-identity
   check and the tokenizer.
 - `tests/`: parity and unit tests.
+- `data/`: files the engine reads at run time, among them the expert profiles (`data/profiles`, which experts start in
+  VRAM). A custom install or container image ships `data/` with the binaries, `serve/` and `tools/`.
 
 ## Warnings
 
@@ -44,12 +46,12 @@ with their MIT licence in `THIRD_PARTY_LICENSES`.
 
 `basalt-bench --community` runs the fixed preset `community-1` for the public table in [community runs](community.md):
 the three decode fixtures, a 16384-token prefill and a 65536-token prefill, each once, with int8 KV cache and the
-engine's own defaults otherwise (drafting included). The decode fixtures and each prefill run in their own fresh engine
-process, with no warm-up pass and no repetition, so every number is the cold first run. It
+engine's own defaults otherwise (drafting included). The decode fixtures run in one fresh engine process and each prefill in its own,
+with no warm-up pass and no repetition, so every number is the cold first run. It
 prints the usual table, adds its row to `docs/community/benchmarks.json` of the checkout the build came from (`--community-file PATH` picks another file) and prints it. Review the row, commit it and open a pull request:
 
 ```sh
-bin/basalt-bench --community --model Qwen3.8-FN-NVFP4-DQ6_K.basalt --submitter "Your Name"
+bin/basalt-bench --community --model Qwen3.8-FN-NVFP4-DQ6_K.basalt --submitter YourName
 ```
 
 `prefill_16k_tps` and `prefill_64k_tps` are the engine tokens per second of those two prompts; `decode_tps` is the generated tokens of conv, struct and prose over their summed decode time (token-weighted). The row
