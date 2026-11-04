@@ -5,7 +5,9 @@ The precision tables are in [index.md](index.md).
 `basalt-bench --quality` (`tools/ppl_gate.py`) scores wikitext-2 (`wiki.test.raw`) in 512-token chunks. The first half
 of each chunk is prefilled and the second half (rows 256 to 510) is scored through the decode path, against a llama.cpp
 base file written by `llama-perplexity --kl-divergence-base`, read in llama.cpp's own `.kld` format. The base is the
-original model in BF16 ([below](#the-bf16-reference)).
+original model in BF16 ([below](#the-bf16-reference)). Its 256-token prompts run MMQ, so it does not exercise the NVFP4
+prompt path's 4-bit activations, which start at chunks of 1,024 tokens and are measured on their own
+([index.md](index.md)).
 
 The harness (`include/basalt/program/ppl_gate.hpp` (the KLD function)) computes KL(base ‖ test) over the full vocabulary from the
 fp32 log-softmax of the head logits; the base is decoded as scale*u16+min, and terms with base log-prob ≤ -16 are
