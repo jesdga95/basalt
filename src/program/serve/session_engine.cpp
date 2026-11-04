@@ -584,6 +584,7 @@ void SessionRuntime::enc_command(const std::string& cmd) {
         replies.push_back("ENC OK " + std::to_string(rows_n) + " " + std::to_string(nx) + " " + std::to_string(ny) + " " +
                           std::to_string((int) std::chrono::duration<double, std::milli>(Clock::now() - te).count()));
     }
+    session().images_done();
     if (!fail.empty()) std::printf("ENC ERR %s\n", fail.c_str());
     else for (const std::string& r : replies) std::printf("%s\n", r.c_str());
     std::fflush(stdout);

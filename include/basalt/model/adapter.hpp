@@ -150,6 +150,8 @@ public:
         (void) data; (void) bytes; (void) rows; (void) n_rows;
         return {Status::NotImplemented, "this model takes no images"};
     }
+    /// A request's pictures are encoded: the encoder gives its memory back.
+    virtual void images_done() {}
     /// Feeds `n_rows` embedding rows (from encode_image) at positions pos.. instead of token embeddings.
     virtual Result prefill_embeddings(const float* rows, int n_rows, int64_t pos) {
         (void) rows; (void) n_rows; (void) pos;
