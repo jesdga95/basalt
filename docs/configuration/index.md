@@ -137,7 +137,7 @@ Server options. Command line `--name`, config `server` block `"name"`.
 A server with `max-context` above 32768 has an elastic KV cache: each session backs its first 32768 cells at startup and
 takes more from the expert cache only when a request needs it. With `parallel`, each slot whose share is above 4096
 tokens does the same from 4096 cells, growing by 4096, and an idle conversation's KV moves to RAM once requests beside
-it have run 15 s. It is off with `kv-resident`, `vram-elastic` or a layer split. See [running](../running.md#concurrent-requests---parallel-n).
+it have run 15 s. It is off with `kv-resident`, `vram-elastic` or a layer split. See [elastic KV](../elastic-kv.md).
 
 ## Expert cache and memory
 

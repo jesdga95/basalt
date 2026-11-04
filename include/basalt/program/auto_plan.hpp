@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -68,6 +69,11 @@ int auto_pool_workers(const AutoInputs& in, AutoAffinity affinity);
 AutoPlan choose_auto(const AutoInputs& in);
 
 const char* auto_affinity_name(AutoAffinity a);
+
+/// Whether cutting the expert cache to its first `cut` slots gives up an expert RAM holds no copy of: `res[i]` is the
+/// slot of expert i = layer * n_expert + expert (negative: none), `has_copy(layer, expert)` whether RAM holds it.
+bool cut_gives_up_bare(const std::vector<int32_t>& res, int64_t cut, int64_t n_expert,
+                       const std::function<bool(int64_t, int64_t)>& has_copy);
 
 /// "auto flags: peer-exclusive off, resident 51.2 GB, pool-affinity all, pool-workers 15", only the auto-picked keys;
 /// empty when none was.

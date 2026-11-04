@@ -29,19 +29,8 @@ share a long system prompt read it once.
 
 Every chat, messages and responses request must name the served model in `model`: the alias (or the model's name) that `/v1/models` lists, or the model file's name. An unknown or missing name is a 404 in the API's own error shape, and replies always carry the served name.
 
-With `--max-context` above 32768 the KV cache is elastic (not with `--kv-resident`, `--vram-elastic` or a layer split; a peer card is
-fine): each session backs its first 32768 cells at startup (the K/V pools, the indexer's block keys, the RoPE tables
-and the draft layer's K/V alike), and the rest of that VRAM holds the expert cache's last slots until a request needs
-it. A request backs its prompt plus 16384 cells before the prompt is read (and 16384 more whenever decode runs past
-that) by taking those slots back; their experts become CPU misses (a long prompt's go to a peer card). The next request
-that needs less gives the cells back and the cache refills the slots from RAM, so a short request decodes with the cache
-a 32k context would have. With `--parallel` a slot whose share is above 4096 tokens backs 4096 cells at startup and
-grows by 4096. An idle conversation's KV stays until requests beside it have run 15 s, then moves to RAM (outside
-`--conversation-cache-mib`, above the RAM floors; else only to the disk tier holding it) when a request needs VRAM or
-the engine is idle; its next turn reads it back. The startup line and each move say `elastic KV: ...` (a move out:
-`slot N's idle conversation ...`). The cache never goes below the slots a prompt chunk needs: a request whose KV would
-take it there even after the other sessions and idle conversations give back what they can is refused with that error,
-and a reply that grows past it ends with it (a `--parallel` slot ends as at its length limit); the engine keeps running.
+With `--max-context` above 32768 the KV cache is elastic: a session takes VRAM from the expert cache's last slots only
+when a request needs it, and gives it back after ([elastic KV](elastic-kv.md)).
 
 While other slots are decoding, a new prompt of up to 16384 tokens is read at once: the slots wait for it (a few
 seconds at most), and it is read as in the single-stream path: the same chunks and streamed ring, the CPU pool's

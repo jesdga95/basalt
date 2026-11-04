@@ -77,8 +77,10 @@ void Runtime::relend() {   // the prompt path's loan: the end of the slots left,
 
 // The resident RAM mode holds only the experts no slot holds, so an expert in a slot about to go has no RAM
 // copy: it is copied from its slot into a RAM home first and read from there like the compact copy's.  Refused
-// (nothing copied) when the RAM above the floor cannot take them.  `live`: the slots that stay.
-bool Runtime::home_given_up(int64_t live, std::string& e) {
+// (nothing copied) when the RAM above the floor cannot take them, or with `partial` as many as leave the serving
+// budget free too, the slots that go before the loan's (false: the others are read from the file).  `live`: the
+// slots that stay.
+bool Runtime::home_given_up(int64_t live, std::string& e, bool partial) {
     if (!src.complement_ready()) return true;
     // the slots the loan will overwrite keep a RAM copy too, so a prompt never costs a file read
     int64_t from = live;
@@ -88,14 +90,30 @@ bool Runtime::home_given_up(int64_t live, std::string& e) {
     }
     std::vector<std::pair<int32_t, int32_t>> give;
     std::vector<int32_t> slots;
-    for (size_t i = 0; i < host_res.size(); ++i) {
-        const int64_t layer = (int64_t) i / g.n_expert, ex = (int64_t) i % g.n_expert;
-        if (host_res[i] >= from && !src.has_resident(layer, ex)) {
+    // the slots that go first, then the loan's
+    for (int pass = 0; pass < 2; ++pass) {
+        for (size_t i = 0; i < host_res.size(); ++i) {
+            const int64_t layer = (int64_t) i / g.n_expert, ex = (int64_t) i % g.n_expert;
+            const int32_t slot = host_res[i];
+            if (slot < from || (pass == 0 ? slot < live : slot >= live) || src.has_resident(layer, ex)) continue;
             give.emplace_back((int32_t) layer, (int32_t) ex);
-            slots.push_back(host_res[i]);
+            slots.push_back(slot);
         }
     }
     if (give.empty()) return true;
+    const size_t wanted = give.size();
+    if (partial) {
+        std::vector<uint64_t> sizes;
+        sizes.reserve(wanted);
+        for (const auto& entry : give)
+            sizes.push_back(basalt::kernels::cpu::expert_layout().blob_bytes(entry.first));
+        // a request's own growth (the serving budget) stays free beside the guard's floor
+        const uint64_t room = src.homes_room(), serving = serve_growth_bytes(o, g);
+        const size_t fit = basalt::core::detail::home_prefix_fit(sizes, room > serving ? room - serving : 0);
+        give.resize(fit);
+        slots.resize(fit);
+        if (fit == 0) { e = "the RAM above the floor holds none of their " + std::to_string(wanted); return false; }
+    }
     std::vector<uint8_t*> dst;
     if (!src.homes_take(give, e, dst)) return false;
     for (size_t k = 0; k < give.size(); ++k) {
@@ -118,6 +136,10 @@ bool Runtime::home_given_up(int64_t live, std::string& e) {
     src.homes_commit();
     basalt::log::info("basalt serve", "VRAM: %zu experts moved from the cache to RAM (%.0f MiB held)", give.size(),
                  (double) src.homes_bytes() / 1048576.0);
+    if (give.size() != wanted) {
+        e = "the RAM above the floor holds " + std::to_string(give.size()) + " of their " + std::to_string(wanted);
+        return false;
+    }
     return true;
 }
 
