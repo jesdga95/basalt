@@ -19,6 +19,7 @@ constexpr uint64_t kTrimBytes = 256ull << 20;      // ... and gives back the res
 constexpr int64_t kStageRows = 16384;              // (token, slot) rows one expert launch handles
 constexpr int kStageExperts = 32;                  // experts staged per launch, two launches in flight
 constexpr int kAheadSlots = 6;                     // staged groups of experts in flight in a long chunk
+constexpr int64_t kAheadPairs = 4096;              // (token, slot) pairs from which a chunk stages its groups ahead
 constexpr int kShortPrompt = 640;                  // a prompt this short takes no staged groups and reads beside a tier's copies
 constexpr int kShortChunk = 1024;                  // ... in a chunk of this many tokens
 
@@ -53,17 +54,24 @@ struct Fit {
     std::string error;
 };
 
-/// The largest chunk (halving from `max_chunk`, never below `min_chunk`) whose workspaces leave `margin` free.
-inline Fit plan_chunk(const Dims& d, uint64_t free_bytes, uint64_t margin, int max_chunk = kMaxChunk, int min_chunk = kMinChunk) {
+/// What a chunk of `chunk` tokens takes on the device for a prompt of `tokens`: its workspaces and, in a long one, the staged groups.
+inline uint64_t chunk_bytes(const Dims& d, int chunk, int tokens) {
+    const int64_t pairs = (int64_t) (chunk < tokens ? chunk : tokens) * d.n_used;
+    return workspace_bytes(d, chunk) + (pairs >= kAheadPairs ? ahead_bytes(d) : 0);
+}
+
+/// The largest chunk a prompt of `tokens` can use (halving from `max_chunk`, never below `min_chunk`) that leaves `margin` free.
+inline Fit plan_chunk(const Dims& d, uint64_t free_bytes, uint64_t margin, int tokens, int max_chunk = kMaxChunk, int min_chunk = kMinChunk) {
     Fit f;
     for (int c = max_chunk; c >= min_chunk; c /= 2) {
-        if (workspace_bytes(d, c) + margin <= free_bytes) {
+        if (c / 2 >= tokens && c / 2 >= min_chunk) continue;   // half of it holds the prompt
+        if (chunk_bytes(d, c, tokens) + margin <= free_bytes) {
             f.chunk = c;
             return f;
         }
     }
     f.error = "not enough free device memory to read this prompt: " + std::to_string(free_bytes >> 20) +
-              " MiB free, the prompt workspaces need " + std::to_string((workspace_bytes(d, min_chunk) + margin) >> 20) +
+              " MiB free, the prompt workspaces need " + std::to_string((chunk_bytes(d, min_chunk, tokens) + margin) >> 20) +
               " MiB at the smallest chunk (a smaller --max-context or a smaller expert tier leaves more)";
     return f;
 }

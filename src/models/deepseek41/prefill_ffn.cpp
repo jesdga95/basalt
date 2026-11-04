@@ -36,7 +36,6 @@ constexpr int kStageExperts = 32;   // experts staged on the device per launch
 constexpr int kReadThreads = 8;     // concurrent blob reads
 constexpr int64_t kMaxRows = 16384; // (token, slot) rows one launch handles
 constexpr int kRing = 5;             // layers of file-read experts held ahead
-constexpr int64_t kPrefetchPairs = 4096;   // (token, slot) pairs from which a chunk reads ahead
 constexpr int kSharedRows = 1024;   // tokens per shared-expert sub-chunk
 
 class Impl final : public PrefillFfn {
@@ -120,7 +119,7 @@ public:
         if (il == 0) {
             stop_prefetch();
             ahead_ = false;
-            if (tier_ && (int64_t) T * K >= kPrefetchPairs) ahead_ = start_ahead();
+            if (tier_ && (int64_t) T * K >= prefillp::kAheadPairs) ahead_ = start_ahead();
         }
         if (ahead_) return routed_ahead(il, T, x, ids, w, out, st, err);
         std::vector<int32_t> hid((size_t) T * K);
