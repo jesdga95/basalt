@@ -206,6 +206,7 @@ int adapter_generate(basalt::model::LoadedModel& loaded, const std::vector<int64
         basalt::log::info("basalt generate", "image %s -> %d rows in %.0f ms", images[i].c_str(), blocks[i].n_rows,
                      std::chrono::duration<double, std::milli>(Clock::now() - te).count());
     }
+    if (!images.empty()) sess->images_done();
     int32_t next = -1;
     int64_t pos = 0;
     AdapterTimes tm;

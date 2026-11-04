@@ -269,25 +269,46 @@ public:
         vision::Image img;
         if (!vision::decode_image(data, bytes, img, err)) return {model::Status::Error, err};
         if (!vis_) {
+            // the encoder takes the memory of the tier's extra copies, and of all its copies when that is short;
+            // images_done gives it back
             std::string te;
-            ops_->expert_tier(te);   // the tier opens before the encoder takes memory
+            ExpertTier* t = ops_->expert_tier(te);
+            cudaStreamSynchronize(stream_);
+            vis_borrowed_ = true;
+            if (t) t->shrink();
             vision::Mmproj mp;
-            if (!m_.open_mmproj(mp, err)) return {model::Status::Error, err};
+            if (!m_.open_mmproj(mp, err)) { images_done(); return {model::Status::Error, err}; }
             const VisionPlan pl = plan_image(img.w, img.h, mp.hp().merge, mp.hp().min_pixels);
             vis_ = std::make_unique<VisionEncoder>();
-            if (!vis_->init(mp, std::max(pl.n_patches(), 4096), err)) {
-                vis_.reset();
-                return {model::Status::Error, err};
+            bool opened = vis_->init(mp, std::max(pl.n_patches(), 4096), err);
+            if (!opened && t) {
+                vis_ = std::make_unique<VisionEncoder>();
+                t->lend_all();
+                err.clear();
+                opened = vis_->init(mp, std::max(pl.n_patches(), 4096), err);
             }
+            if (!opened) { images_done(); return {model::Status::Error, err}; }
             vis_merge_ = mp.hp().merge;
             vis_min_pixels_ = mp.hp().min_pixels;
         }
         const VisionPlan pl = plan_image(img.w, img.h, vis_merge_, vis_min_pixels_);
         std::vector<float> patches;
         image_patches(img, pl, patches);
-        if (!vis_->encode(patches, pl, rows, err)) return {model::Status::Error, err};
+        if (!vis_->encode(patches, pl, rows, err)) { images_done(); return {model::Status::Error, err}; }
         n_rows = pl.n_tokens();
         return {};
+    }
+
+    void images_done() override {
+        if (!vis_borrowed_) return;
+        vis_borrowed_ = false;
+        cudaStreamSynchronize(stream_);
+        vis_.reset();
+        std::string e;
+        if (ExpertTier* t = ops_->expert_tier(e)) {
+            if (!t->reclaim(e)) basalt::log::warn("basalt deepseek41", "VRAM expert tier stays closed: %s", e.c_str());
+            t->grow();
+        }
     }
 
     model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos) override {
@@ -698,6 +719,7 @@ private:
     std::unique_ptr<Prefill> prefill_;
     std::unique_ptr<VisionEncoder> vis_;
     int vis_merge_ = 3, vis_min_pixels_ = 0;
+    bool vis_borrowed_ = false;
     std::vector<void*> allocs_;
     std::vector<int32_t> hist_;
     std::string dump_dir_, err_;
