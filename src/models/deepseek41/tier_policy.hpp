@@ -16,6 +16,39 @@ inline bool repeat_miss(uint64_t last, uint64_t token, int window) {
     return last != 0 && token + 1 - last <= (uint64_t) window;
 }
 
+/// How many experts of every layer each place holds.
+struct Homes {
+    int main = 0;   ///< on the main card and nowhere else; 0 when its slots are only copies of the RAM tier
+    int peer = 0;   ///< on the second card and nowhere else
+    int ram = 0;    ///< pinned in RAM
+    int file = 0;   ///< read from the pack
+};
+
+/// `main_slots`: what the main card can hold through a prompt at the full context; `peer_slots`: the room on the second
+/// card; `ram_slots`: the room in RAM beside the page cache file reads need, `ram_slots_no_file` without it. Only with a
+/// second card does the main card give up its copies for homes, and only when RAM cannot take what the second card does not.
+inline Homes plan_homes(int n_expert, int main_slots, int peer_slots, int ram_slots, int ram_slots_no_file) {
+    Homes h;
+    h.peer = peer_slots < n_expert ? peer_slots : n_expert;
+    const int left = n_expert - h.peer;
+    if (h.peer > 0 && ram_slots_no_file < left) h.main = main_slots < left ? main_slots : left;
+    const int rest = left - h.main;
+    h.ram = h.peer > 0 && ram_slots_no_file >= rest ? rest : ram_slots < rest ? ram_slots : rest;
+    h.file = rest - h.ram;
+    return h;
+}
+
+/// Where the expert at routing rank `r` lives: the main card's homes first, then the head of the RAM tier when the
+/// main card's slots copy it (`copies` slots), the second card's homes, the rest of the RAM tier, the file.
+enum class Place { Main, Peer, Ram, File };
+inline Place place_of_rank(const Homes& h, int copies, int r) {
+    if (r < h.main) return Place::Main;
+    const int lead = h.main > 0 ? 0 : copies < h.ram ? copies : h.ram;
+    if (r - h.main < lead) return Place::Ram;
+    if (r - h.main - lead < h.peer) return Place::Peer;
+    return r < h.main + h.peer + h.ram ? Place::Ram : Place::File;
+}
+
 /// Misses of a layer go half to the CPU (rounded up) and the rest to the bus; the file-backed ones can only go to the
 /// CPU. Returns how many of the `pinned` misses the bus fetches, given `file` file-backed misses.
 inline int bus_count(int pinned, int file) {

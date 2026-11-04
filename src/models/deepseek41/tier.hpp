@@ -1,9 +1,10 @@
 // src/models/deepseek41/tier.hpp - where the routed experts of a DeepSeek-V4.1 pack live while a token runs.
 //
-// Three places hold an expert: a slot of the VRAM tier (shared core::ExpertCache storage, per-layer LRU), the pinned
-// RAM tier (a prefix of every layer's experts), and the pack file mapped read-only. The GPU computes the experts that
-// sit in VRAM; the CPU pool computes the rest from RAM or the mapped file while the GPU works, and the experts it
-// computed are copied into the VRAM tier on a side stream so the next token finds them there.
+// An expert's home is a slot of the main card, a slot of a second card, the pinned RAM tier or the pack file mapped
+// read-only (policy::Homes); the routing order deals them out at the start and they stay. The main card's other slots
+// (shared core::ExpertCache storage, per-layer LRU) hold copies of pinned experts. The GPUs compute the experts they
+// hold; the CPU pool computes the rest from RAM or the mapped file while the GPUs work, and the pinned experts it
+// computed are copied into the main card's LRU on a side stream so the next token finds them there.
 #pragma once
 
 #include "basalt/core/expert_cache.hpp"
@@ -26,6 +27,7 @@
 namespace basalt::models::deepseek41 {
 
 class DsModel;
+class PeerTier;
 
 class ExpertTier {
 public:
@@ -36,6 +38,7 @@ public:
     struct Lookup {
         int k = 0;
         const uint8_t* dev[kMaxK] = {};    ///< device blob of an expert the VRAM tier holds, else null
+        const uint8_t* peer[kMaxK] = {};   ///< device blob of an expert the second card holds, else null
         const uint8_t* host[kMaxK] = {};   ///< host blob of the others
         int experts[kMaxK] = {};
         bool again[kMaxK] = {};            ///< a miss that repeats one from the last kPromoteWindow tokens
@@ -53,15 +56,22 @@ public:
     ExpertTier(const ExpertTier&) = delete;
     ExpertTier& operator=(const ExpertTier&) = delete;
 
-    /// Sizes the VRAM tier from the free memory less `reserve_bytes`, loads the RAM tier and starts the CPU pool.
-    bool open(uint64_t reserve_bytes, std::string& err);
+    /// Main card bytes each arrangement leaves free.
+    struct Reserve {
+        uint64_t copies = 0;       ///< beside slots that are all copies, which a long prompt borrows
+        uint64_t homes = 0;        ///< beside homes, which stay through a prompt at the full context
+        uint64_t beside_homes = 0; ///< beside homes and the copies next to them, where a short prompt's workspaces fit
+    };
+    /// Sizes the tiers and loads them. `h_x` and `h_rows`: the pinned activation and mapped rows a second card shares
+    /// with the CPU pool.
+    bool open(const Reserve& reserve, const float* h_x, float* h_rows, std::string& err);
 
     /// Gives the VRAM slots that the prompt path's workspaces occupy back to the driver (call before they are
     /// allocated); `grow` takes the memory freed after them as extra slots. Residency in those slots is dropped.
     void shrink();
     void grow();
-    /// A long prompt streams every expert from RAM and needs the card for its chunks: the VRAM slots go back whole, and
-    /// reclaim() opens them again empty.
+    /// A long prompt streams every expert to the main card and needs the card for its chunks: the slots that are
+    /// copies go back whole, and reclaim() opens them again empty. Homes stay.
     void lend_all();
     bool reclaim(std::string& err);
 
@@ -80,13 +90,17 @@ public:
     /// VRAM tier (side stream, off the token path, in pieces).
     void promote(int layer, const Lookup& lk);
 
-    /// Where a resident copy of (layer, e) lives: a VRAM tier slot, or the pinned RAM tier; both null when only the
-    /// file has it. Read-only: no stamp, no promotion.
+    /// Where a resident copy of (layer, e) lives: a main card slot, a second card slot or the pinned RAM tier; all null
+    /// when only the file has it. Read-only: no stamp, no promotion.
     struct Source {
         const uint8_t* dev = nullptr;
+        const uint8_t* peer = nullptr;
         const uint8_t* pinned = nullptr;
     };
     Source locate(int layer, int e) const;
+    PeerTier* peer() const { return peer_.get(); }
+    /// The main card holds homes: they stay through a prompt, and a short prompt keeps the copies beside them.
+    bool has_homes() const { return homes_.main > 0; }
 
     void report(const char* tag) const;
 
@@ -98,9 +112,10 @@ private:
     struct Swap {
         int layer, expert, victim;
     };
-    bool load_ram(uint64_t bytes, std::string& err);
+    bool load_ram(std::string& err);
+    bool open_peer(const float* h_x, float* h_rows, std::string& err);
     int ranked(int layer, int r) const;
-    void seed_vram();
+    void seed_copies(int first_rank, int64_t n);
     void preread();
     bool pinned(int layer, int e) const { return ram_idx_[(size_t) layer * n_expert_ + e] >= 0; }
     const uint8_t* blob_of(int layer, int e) const;
@@ -134,6 +149,7 @@ private:
     uint64_t one_each_ = 0, reserve_ = 0;
 
     std::vector<uint8_t*> ram_;             ///< [layer] cover_ + 1 pinned expert slots (the last starts as the spare)
+    policy::Homes homes_;
     int cover_ = 0;                         ///< experts per layer in the RAM tier
     std::vector<int32_t> ram_idx_;          ///< [layer * n_expert + e] pinned slot or -1
     std::vector<int32_t> spare_;            ///< [layer] pinned slot free for a swap, or -1
@@ -152,11 +168,12 @@ private:
     uint64_t token_ = 0;
     int64_t swapped_ = 0;
     platform::MappedFile file_;             ///< the experts section
+    std::unique_ptr<PeerTier> peer_;
     std::vector<kernels::cpu::NativeFmt> fmt_;   ///< [layer]
     std::unique_ptr<kernels::cpu::ExpertPool> pool_;
     uint8_t* act_ = nullptr;                ///< the quantized activation the CPU jobs share
 
-    int64_t hits_ = 0, cpu_ = 0, ram_hits_ = 0, promoted_ = 0, fetched_ = 0, dropped_ = 0;
+    int64_t hits_ = 0, cpu_ = 0, ram_hits_ = 0, promoted_ = 0, fetched_ = 0, dropped_ = 0, peer_hits_ = 0, file_hits_ = 0;
 };
 
 }  // namespace basalt::models::deepseek41

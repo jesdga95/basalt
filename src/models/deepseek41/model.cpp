@@ -103,11 +103,33 @@ bool DsModel::load(const std::string& path, std::string& err) {
 
 int64_t DsModel::ctxp_default() { return ctxp::kLegacyContext; }
 
-bool DsModel::resolve_context(int64_t requested, bool set, std::string& err) {
-    const Geometry& g = pack_.geo;
+static std::vector<int> cache_ratios(const Geometry& g) {
     std::vector<int> ratios;
     for (int il = 0; il < g.n_layers; ++il)
         if (ctxp::owns_cache(il, g.compress_ratio[(size_t) il])) ratios.push_back(g.compress_ratio[(size_t) il]);
+    return ratios;
+}
+
+uint64_t DsModel::context_bytes() const { return ctxp::context_bytes(context(), cache_ratios(pack_.geo)); }
+
+prefillp::Dims DsModel::prompt_dims() const {
+    const Geometry& g = pack_.geo;
+    prefillp::Dims d;
+    d.n_embd = g.n_embd;
+    d.n_used = g.n_used;
+    d.n_expert = g.n_expert;
+    d.n_ff_exp = g.n_ff_exp;
+    d.engram_cols = (int64_t) pack_.engram.hash.n_cols() * 256;
+    for (const ExpertLayer& e : pack_.experts) {
+        d.expert_blob_bytes = std::max<uint64_t>(d.expert_blob_bytes, e.blob_bytes);
+        d.grouped = d.grouped || e.gu_type == GGML_TYPE_IQ1_M || e.d_type == GGML_TYPE_IQ1_M;
+    }
+    return d;
+}
+
+bool DsModel::resolve_context(int64_t requested, bool set, std::string& err) {
+    const Geometry& g = pack_.geo;
+    const std::vector<int> ratios = cache_ratios(g);
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
         err = "deepseek41: cannot query the free device memory";

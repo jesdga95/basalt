@@ -495,6 +495,7 @@ std::optional<int> run_adapter_model(const Options& o, const basalt::core::Model
         lreq.diag_dump = o.diag_dump;
         lreq.diag_tier_ram = o.diag_tier_ram;
         lreq.diag_tier_vram = o.diag_tier_vram;
+        lreq.peer_devices = o.peer_devices;
         lreq.max_context = o.max_context;
         lreq.max_context_set = o.max_context_set;
         const basalt::model::Result r = adapter->load(lreq, loaded);
