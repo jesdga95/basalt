@@ -140,7 +140,7 @@ add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models
   src/models/deepseek41/elastic.cpp src/models/deepseek41/ops_kernels.cpp src/models/deepseek41/tier.cpp src/models/deepseek41/ops.cu
   src/models/deepseek41/prefill.cpp src/models/deepseek41/prefill_ffn.cpp src/models/deepseek41/prefill_ffn.cu src/models/deepseek41/attn_batch.cpp src/models/deepseek41/attn_dense.cu)
 target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
-target_link_libraries(model_deepseek41 PUBLIC model tokenizer deepseek41_kernels deepseek41_attn deepseek41_vision model_qwen4exp_engine mmq kernels core ${_gpu_runtime_target})
+target_link_libraries(model_deepseek41 PUBLIC model tokenizer deepseek41_kernels deepseek41_attn deepseek41_vision tiers mmq kernels core ${_gpu_runtime_target})
 
 add_library(models STATIC src/models/builtin.cpp)
 target_link_libraries(models PUBLIC model_qwen4exp model_deepseek41)
@@ -288,7 +288,7 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
 # ---- tiers: the storage and transfer tier shared by the models (VRAM slots, RAM and file source, peer card) ----
 add_library(tiers STATIC src/core/expert_source.cpp src/core/expert_cache.cpp src/core/vmm.cpp src/core/peer_experts.cpp)
 target_include_directories(tiers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(tiers PUBLIC core kernels_cpu model_qwen4exp_kernels ${_gpu_runtime_target})
+target_link_libraries(tiers PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
 include(src/models/qwen4exp/qwen4exp.cmake)
 if(BUILD_TESTING)
   add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)
