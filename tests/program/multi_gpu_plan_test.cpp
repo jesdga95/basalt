@@ -33,6 +33,10 @@ static GpuCard card(int smi, const char* name, double gbps, uint64_t gib) {
 
 static MgModel model() {
     MgModel m;
+    m.layers = 48;
+    m.pairs = 48 * 512;
+    m.blob_bytes = 2760000;
+    m.exchange_mib_per_token = 2560.0 * 4.0 / 10240.0;
     m.main_overhead = 4300ull * (1 << 20) + 7ull * GiB / 2;
     m.peer_overhead = 1280ull * (1 << 20);
     return m;

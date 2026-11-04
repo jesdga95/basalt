@@ -271,7 +271,7 @@ target_link_libraries(core PUBLIC artifact platform warnings ${_gpu_runtime_targ
 add_executable(basalt-device src/models/qwen4exp/plan/device_main.cpp)
 target_link_libraries(basalt-device PRIVATE core)
 
-add_executable(basalt-load src/core/load_main.cpp)
+add_executable(basalt-load src/models/qwen4exp/plan/load_main.cpp)
 target_link_libraries(basalt-load PRIVATE core kernels)
 
 # ---- kernels ----
@@ -363,7 +363,7 @@ endif()
 if(BUILD_TESTING)
   # the shape check over a synthetic weight table: the canonical shapes pass, one wrong dimension or form fails
   add_executable(layout_check_test tests/core/layout_check_test.cpp)
-  target_link_libraries(layout_check_test PRIVATE core)
+  target_link_libraries(layout_check_test PRIVATE model_qwen4exp_engine core)
   basalt_cpu_test(NAME layout_check_test COMMAND layout_check_test)
   # the expert layout text: real models' layouts and the refusals
   add_executable(expert_layout_test tests/core/expert_layout_test.cpp)
@@ -1076,7 +1076,7 @@ basalt_cpu_test(NAME image_loan_test COMMAND image_loan_test)
 set_tests_properties(image_loan_test PROPERTIES TIMEOUT 60)
 # a prompt loan's table work: the re-lend split and the routed experts' trades, on a model of the cache (CPU only)
 add_executable(loan_moves_test tests/program/loan_moves_test.cpp src/models/qwen4exp/serve/loan_moves.cpp)
-target_include_directories(loan_moves_test PRIVATE src/program/serve)
+target_include_directories(loan_moves_test PRIVATE src/models/qwen4exp/serve)
 target_link_libraries(loan_moves_test PRIVATE warnings)
 basalt_embed_manifest(loan_moves_test)
 basalt_cpu_test(NAME loan_moves_test COMMAND loan_moves_test)
@@ -1134,7 +1134,7 @@ endif()
 # the n-gram table read straight from the SSD. The selftest needs only the CPU and a temp file.
 add_executable(ple_reader_test tests/ngram/ple_reader_test.cpp)
 target_include_directories(ple_reader_test PRIVATE ${_gpu_include_directories})
-target_link_libraries(ple_reader_test PRIVATE kernels core ${_gpu_runtime_target})
+target_link_libraries(ple_reader_test PRIVATE model_qwen4exp_kernels kernels core ${_gpu_runtime_target})
 basalt_embed_manifest(ple_reader_test)
 basalt_gpu_test(NAME ple_reader_selftest COMMAND ple_reader_test --selftest)
 
@@ -1402,7 +1402,7 @@ endif()
 # real-weight checks: test programs, not part of a release
 if(BUILD_TESTING)
   add_executable(ple_q5_parity tests/kernels/ple_q5_parity.cpp)
-  target_link_libraries(ple_q5_parity PRIVATE kernels artifact ggml_quants ${_gpu_runtime_target})
+  target_link_libraries(ple_q5_parity PRIVATE model_qwen4exp_kernels kernels artifact ggml_quants ${_gpu_runtime_target})
   add_executable(q5_projection_parity tests/kernels/q5_projection_parity.cpp)
   target_include_directories(q5_projection_parity PRIVATE ${_gpu_include_directories})
   target_link_libraries(q5_projection_parity PRIVATE kernels artifact ggml_quants ${_gpu_runtime_target})

@@ -20,13 +20,14 @@ const char* mechanism_name(Mechanism m);
 
 /// What the model costs a window.
 struct MgModel {
-    int layers = 48;
-    int64_t pairs = 48 * 512;           ///< (layer, expert) pairs the experts section holds
-    uint64_t blob_bytes = 2760000;      ///< one expert's bytes
+    int layers = 0;
+    int64_t pairs = 0;                  ///< (layer, expert) pairs the experts section holds
+    uint64_t blob_bytes = 0;            ///< one expert's bytes
     uint64_t main_overhead = 0;         ///< bytes the main card spends before any expert: dense weights, session, graphs, reserve
     uint64_t peer_overhead = 0;         ///< the same on a card after the main one
     int tp_exchanges_per_layer = 2;     ///< all-reduces a layer needs when each layer is split across the cards
     double tokens = 3.0;                ///< rows in a decode window
+    double exchange_mib_per_token = 1;  ///< what one all-reduce of a tensor-parallel layer moves for a row
 };
 
 /// The mechanism's figure for a card set.

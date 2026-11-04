@@ -53,7 +53,7 @@ int cache_size(Context& context) {
             ? basalt::core::Verifier::hs_peer_bytes(native_head.row_bytes(), native_head.type(), n_vocab, g.n_embd, max_t,
                                                     d0, o.peer_device) : 0;
         const int64_t peer_room = (int64_t) f1 - (((int64_t) std::max(o.peer_reserve_mib, 128) << 20) +
-                                                  (int64_t) basalt::core::PeerExperts::device_overhead_bytes() + hs +
+                                                  (int64_t) basalt::core::PeerExperts::device_overhead_bytes(g.n_embd, g.n_ff) + hs +
                                                   (int64_t) peer_prompt_bytes());
         // CUDA0's cache: its free memory less the reserve and what loads after the cache
         const int64_t cache0 = std::max<int64_t>(0, (int64_t) f0 - (((int64_t) o.vram_reserve_mib + 1024) << 20));

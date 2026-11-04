@@ -9,14 +9,10 @@
 //   1. **`x_f` IS THE SAME PINNED BUFFER EVERY LAYER.**  Its ADDRESS never changes, so the `ActQ` cannot be
 //      cached by pointer - a cache keyed on `x_f` would quantize layer 0 and reuse it for all the remaining
 //      layers, which is a finite, plausible, completely wrong token.  There is no cache here at all: the
-//      conversion is one 2560-element pass, and a correct answer is worth more than the microseconds.
+//      conversion is one pass over the activation, and a correct answer is worth more than the microseconds.
 //   2. **THE POOL DOES NOT APPLY THE ROUTER WEIGHT.**  `moe_combine` sums
 //      `w[i] * parts[i]` on the device.  `ExpertJob::weight` is a diagnostic field; setting it here would
-//      apply the weight twice, which is invisible in a single layer and compounds over 48.
-//   3. **THE KERNEL'S GEOMETRY IS FIXED BY THE ARTIFACT** (`H = 2560`, `FF = 640`, `BLOB = 1,382,400`).  A
-//      different `n_embd` or a different expert width is REFUSED rather than mis-indexed, because the blob's
-//      internal offsets are compile-time constants and reading a 640-wide expert as a 2560-wide one walks off
-//      the end into the next expert's bytes without faulting.
+//      apply the weight twice, which is invisible in a single layer and compounds over the model.
 #pragma once
 
 #include "basalt/core/expert_cache.hpp"
