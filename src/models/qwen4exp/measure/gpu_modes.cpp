@@ -2,6 +2,7 @@
 //
 // The three replay modes and the per-stage event names were lifted out of `main()` unchanged; the aliases at the top
 // of each function are what the surrounding function used to provide, so the moved code reads as it did.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "gpu_modes.hpp"
 
 #include "basalt/models/qwen4exp/decode/layer.hpp"      // Doorbell, stage_timing_*, is_qsa_layer
@@ -14,7 +15,7 @@
 #include <string>
 #include <vector>
 
-namespace basalt::program::measure {
+namespace basalt::models::qwen4exp::measure {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -302,4 +303,4 @@ int run_gpu_modes(const GpuModeContext& c) {
     return kNotRequested;
 }
 
-}  // namespace basalt::program::measure
+}  // namespace basalt::models::qwen4exp::measure

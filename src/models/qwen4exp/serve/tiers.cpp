@@ -1,7 +1,8 @@
 // src/models/qwen4exp/serve/tiers.cpp - tiers operations for the persistent engine.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 // Seeds the adaptive tier's usage counts from the routing of the prompt just read, so the first adaptation rounds
 // of a request already move the experts the new topic uses toward the GPUs.  The earlier usage decays to kSeedKeep and
@@ -624,4 +625,4 @@ int QfnRuntime::init_tiers() {
     return 0;
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

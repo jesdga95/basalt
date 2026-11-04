@@ -1,7 +1,8 @@
 // src/models/qwen4exp/serve/prompt_windows.cpp - request prompt_windows operations.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 // A short part of the prompt - the new message of a chat that continues from a checkpoint, the assistant
 // header - goes through the verify windows, S tokens at a time, as decode reads them.  The batched path has
@@ -55,4 +56,4 @@ bool QfnRequest::read_windows(int64_t a, int64_t b, std::string& e) {
     return true;
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

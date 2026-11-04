@@ -1,6 +1,7 @@
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
 
-namespace basalt::program::generate {
+namespace basalt::models::qwen4exp::generate {
 
 int token_path(Context& context) {
     auto& o = *context.o;
@@ -86,7 +87,7 @@ int token_path(Context& context) {
     // ---- PER-STAGE TIMING.  `--no-capture` only: an event recorded inside a stream capture is silently dropped, so a
     // captured graph cannot carry these events and the numbers would be zeros that read as "every stage is free".
     // Refusing is the fix.
-    if (const int rc = basalt::program::measure::arm_stage_timing(o); rc != 0) return rc;
+    if (const int rc = basalt::models::qwen4exp::measure::arm_stage_timing(o); rc != 0) return rc;
     std::FILE* routing = nullptr;
     if (!o.dump_routing.empty()) {
         if (o.no_pool) {
@@ -179,7 +180,7 @@ int token_path(Context& context) {
     // ---- THE GPU-ONLY MEASUREMENT MODES.  `--gpu-stages`, `--graph-only` and `--gpu-only-full` replay the captured
     // graphs and print a table instead of decoding; they live in measure/gpu_modes.cpp.
     {
-        basalt::program::measure::GpuModeContext mc;
+        basalt::models::qwen4exp::measure::GpuModeContext mc;
         mc.o = &o;
         mc.g = &g;
         mc.ss = &ss;
@@ -189,8 +190,8 @@ int token_path(Context& context) {
         mc.d_next = d_next;
         mc.run_head = run_head;
         mc.err = &err;
-        const int rc = basalt::program::measure::run_gpu_modes(mc);
-        if (rc != basalt::program::measure::kNotRequested) return rc;
+        const int rc = basalt::models::qwen4exp::measure::run_gpu_modes(mc);
+        if (rc != basalt::models::qwen4exp::measure::kNotRequested) return rc;
     }
 
     // ---- THE TOKEN PATH ALLOCATES NOTHING.

@@ -1,6 +1,7 @@
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
 
-namespace basalt::program::generate {
+namespace basalt::models::qwen4exp::generate {
 
 namespace {
 // Creates the stage device's context before the host arena registers pinned memory; spin scheduling and mapped host

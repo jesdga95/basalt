@@ -1,3 +1,4 @@
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "options.hpp"
 #include "../../../program/cli/help.hpp"
 
@@ -10,7 +11,7 @@
 #include <algorithm>
 #include <cmath>
 
-namespace basalt::program::cli {
+namespace basalt::models::qwen4exp::cli {
 
 std::string profile_key(const basalt::core::Json& meta) {
     using T = basalt::core::Json::Type;
@@ -227,4 +228,4 @@ basalt::kernels::SamplerParams sampling_options(const Options& o) {
     return sp;
 }
 
-}  // namespace basalt::program::cli
+}  // namespace basalt::models::qwen4exp::cli

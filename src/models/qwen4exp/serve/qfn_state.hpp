@@ -1,6 +1,7 @@
 // src/models/qwen4exp/serve/qfn_state.hpp - Flash-Next's serving state, ordered by resource lifetime.
 #pragma once
 
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "../../../program/serve/state.hpp"
 #include "qfn_runtime.hpp"
 #include "basalt/model/adapter.hpp"
@@ -99,8 +100,8 @@ namespace basalt::models::qwen4exp { std::shared_ptr<basalt::program::ProbePeerP
 #include <vector>
 #include "basalt/log.hpp"
 
-namespace basalt::program::serve {
-namespace serve_loans = basalt::program::serve;
+namespace basalt::models::qwen4exp::serve {
+namespace serve_loans = basalt::models::qwen4exp::serve;
 using engine_local::Drive;
 using engine_local::GpuStage;
 using engine_local::JobRunner;
@@ -446,4 +447,4 @@ private:
     int init_batch();
 };
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

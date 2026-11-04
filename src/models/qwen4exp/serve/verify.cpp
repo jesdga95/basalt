@@ -1,7 +1,8 @@
 // src/models/qwen4exp/serve/verify.cpp - verify operations for the persistent engine.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 basalt::core::Verifier & QfnRuntime::stage_ver(int st) {
     return st == 0 ? ver : split_same ? ver_same : stages[(size_t) st - 1]->ver;
@@ -239,4 +240,4 @@ int QfnRuntime::capture_windows() {
     return 0;
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

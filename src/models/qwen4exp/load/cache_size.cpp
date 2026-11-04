@@ -1,6 +1,7 @@
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
 
-namespace basalt::program::generate {
+namespace basalt::models::qwen4exp::generate {
 
 int cache_size(Context& context) {
     auto& o = *context.o;

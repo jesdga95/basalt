@@ -8,6 +8,7 @@
 // headers pull CUDA in.  The one translation unit that needs the definitions includes them.
 #pragma once
 
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include <functional>
 #include <string>
 
@@ -18,7 +19,7 @@ struct SessionGraphs;
 struct Doorbell;
 }  // namespace basalt::core
 
-namespace basalt::program {
+namespace basalt::models::qwen4exp {
 
 struct Options;
 
@@ -50,4 +51,4 @@ int run_gpu_modes(const GpuModeContext& c);
 int arm_stage_timing(const Options& o);
 
 }  // namespace measure
-}  // namespace basalt::program
+}  // namespace basalt::models::qwen4exp

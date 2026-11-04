@@ -1,6 +1,7 @@
 // basalt/program/measure/dump_set.cpp - see dump_set.hpp.
 //
 // Lifted out of `main()` unchanged: same reads, same headers, same report lines, same log text.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "dump_set.hpp"
 
 #include "basalt/models/qwen4exp/decode/layout.hpp"     // ModelGeometry
@@ -12,7 +13,7 @@
 #include <cstdio>
 #include <vector>
 
-namespace basalt::program::measure {
+namespace basalt::models::qwen4exp::measure {
 
 int write_host_dumps(const HostDumpContext& c, std::string& err) {
     const Options& o = *c.o;
@@ -69,4 +70,4 @@ int write_host_dumps(const HostDumpContext& c, std::string& err) {
     return 0;
 }
 
-}  // namespace basalt::program::measure
+}  // namespace basalt::models::qwen4exp::measure
