@@ -1,5 +1,5 @@
 // src/program/serve/prompt_read.cpp - request prompt_read operations.
-#include "request.hpp"
+#include "qfn_request.hpp"
 
 namespace basalt::program::serve {
 

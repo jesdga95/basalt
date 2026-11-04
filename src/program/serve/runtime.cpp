@@ -1,6 +1,5 @@
 // src/program/serve/runtime.cpp - lifecycle of the persistent engine.
 #include "state.hpp"
-#include "../tokenizer/unicode_flags.hpp"
 
 namespace basalt::program::serve {
 
@@ -10,31 +9,6 @@ int Runtime::execute() {
     if (const int code = announce()) return code;
     if (const int code = init_after_input()) return code;
     return run_requests();
-}
-
-int QfnRuntime::init_before_input() {
-    if (const int code = init_prompt()) return code;
-    if (const int code = init_verify()) return code;
-    if (const int code = init_conversations()) return code;
-    return init_tiers();
-}
-
-int QfnRuntime::init_after_input() {
-    if (const int code = init_memory()) return code;
-    if (const int code = capture_windows()) return code;
-    return init_batch();
-}
-
-void QfnRuntime::at_exit() {
-    for (int st = 0; st < std::max(n_stages, 1); ++st)
-        for (const std::string& r : stage_ver(st).route_report()) basalt::log::info("basalt serve", "%s", r.c_str());
-    save_profile("exit");   // QUIT, or the server closed stdin
-}
-
-int run(Context& context) {
-    QfnRuntime runtime(context);
-    runtime.pre_ = {"qwen35", basalt::program::tokenizer::pretok_qwen35};
-    return runtime.execute();
 }
 
 int Runtime::run_requests() {

@@ -1,5 +1,5 @@
 // src/program/serve/request_prefill.cpp - request read_prompt operations.
-#include "request_base.hpp"
+#include "request.hpp"
 
 namespace basalt::program::serve {
 

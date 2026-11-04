@@ -1,5 +1,5 @@
 // src/program/serve/request.cpp - ordered execution of one request.
-#include "request_base.hpp"
+#include "request.hpp"
 
 namespace basalt::program::serve {
 
