@@ -9,7 +9,7 @@ tests and the quality gate run on a machine with a card.
 | | Linux | Windows |
 | --- | --- | --- |
 | OS | x86-64, AVX2 (AVX-512 used when present) | Windows 10 1903 or later, x64 |
-| Compiler | C++20 (GCC or Clang) | Visual Studio 2022 (MSVC 19.44) |
+| Compiler | GCC 13 or newer | Visual Studio 2022 (MSVC 19.44) |
 | CUDA | 13 | 13 |
 | Build | CMake 3.24+ | CMake 3.24+ and Ninja |
 | Python | 3.10+ | 3.10+ |
