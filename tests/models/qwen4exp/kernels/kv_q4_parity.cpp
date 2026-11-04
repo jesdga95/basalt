@@ -7,8 +7,8 @@
 // 4. Invariance of dot products under Walsh-Hadamard rotation: (H*q) . (H*k) == q . k.
 
 #include "basalt/kernels/f16_bits.hpp"
-#include "basalt/kernels/kv_q4.hpp"
-#include "basalt/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
 
 #include <cuda_runtime.h>
 

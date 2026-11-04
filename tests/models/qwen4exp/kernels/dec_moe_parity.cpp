@@ -19,11 +19,11 @@
 // route + wait with and without peer entries, alone and behind the VRAM call (what CUDA0 waits for the peer), and the
 // staged share's copy (us, GB/s over the link).
 #include "basalt/artifact/gguf_reader.hpp"
-#include "basalt/kernels/dec_moe.hpp"
+#include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
-#include "basalt/kernels/native_moe.hpp"
-#include "basalt/kernels/s2_expert_grouped.hpp"
+#include "basalt/models/qwen4exp/kernels/native_moe.hpp"
+#include "basalt/models/qwen4exp/kernels/s2_expert_grouped.hpp"
 
 #include <cuda_runtime.h>
 

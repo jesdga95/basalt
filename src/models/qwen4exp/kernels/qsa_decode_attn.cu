@@ -1,8 +1,8 @@
-// src/models/qwen4exp/kernels/qsa_decode_attn.cu - see include/basalt/kernels/qsa_decode_attn.hpp.
-#include "basalt/kernels/qsa_decode_attn.hpp"
-#include "basalt/kernels/kv_q8.hpp"
+// src/models/qwen4exp/kernels/qsa_decode_attn.cu - see include/basalt/models/qwen4exp/kernels/qsa_decode_attn.hpp.
+#include "basalt/models/qwen4exp/kernels/qsa_decode_attn.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q8.hpp"
 #include "basalt/kernels/packed_byte.hpp"
-#include "basalt/kernels/kv_q4.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

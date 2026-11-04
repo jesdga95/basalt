@@ -10,7 +10,7 @@
 #include "basalt/models/builtin.hpp"
 #include "gguf_fixture.hpp"
 
-#include "basalt/core/native_dense.hpp"
+#include "basalt/models/qwen4exp/decode/native_dense.hpp"
 #include "basalt/core/weights.hpp"
 
 #include <cuda_runtime.h>

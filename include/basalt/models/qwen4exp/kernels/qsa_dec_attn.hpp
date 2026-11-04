@@ -7,8 +7,8 @@
 // the gated rows (native_qsa_gate_apply's arithmetic) next to the plain output.
 #pragma once
 
-#include "basalt/kernels/qsa.hpp"
-#include "basalt/kernels/qsa_decode_attn.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_decode_attn.hpp"
 
 #include <cstdint>
 

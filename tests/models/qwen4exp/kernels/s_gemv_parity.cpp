@@ -18,7 +18,7 @@
 // canonical is the inverse of what the converter does, and it is written here independently of the converter so the
 // two are not the same code.
 #include "basalt/artifact/dequant.hpp"
-#include "basalt/kernels/s_gemv.hpp"
+#include "basalt/models/qwen4exp/kernels/s_gemv.hpp"
 
 #include <cuda_runtime.h>
 

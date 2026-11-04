@@ -2,11 +2,11 @@
 
 #include "common.hpp"
 #include "cpu_warm.hpp"
-#include "basalt/core/verify.hpp"
+#include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
-#include "basalt/kernels/dec_moe.hpp"
+#include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include <vector>
 
 namespace basalt::core {

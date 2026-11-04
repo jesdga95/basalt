@@ -9,7 +9,7 @@
 #include "basalt/model/adapter.hpp"
 #include "basalt/platform/process.hpp"
 #include "basalt/program/options.hpp"
-#include "../cli/options.hpp"
+#include "../../models/qwen4exp/cli/options.hpp"
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstdio>

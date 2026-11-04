@@ -11,7 +11,7 @@
 // margin, as a prompt row folded into a window can); then a cold microbench of both kernels per set.
 //   q6k_vhead_parity [rows] [iters] [spread|flat]     (iters 0: no microbench, e.g. under compute-sanitizer)
 #include "basalt/kernels/native_mmvq.hpp"
-#include "basalt/kernels/q6k_head.hpp"
+#include "basalt/models/qwen4exp/kernels/q6k_head.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

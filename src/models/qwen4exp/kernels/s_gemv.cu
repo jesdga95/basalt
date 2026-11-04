@@ -4,7 +4,7 @@
 // vector loads.  The kernel is templated on the code WIDTH (a compile-time property of the unpacking loop) and
 // takes the rest of the per-type attributes as run-time arguments, because the manifest supplies them per
 // tensor and a 13-way switch inside the inner loop would be the naive-but-wrong kind of naive.
-#include "basalt/kernels/s_gemv.hpp"
+#include "basalt/models/qwen4exp/kernels/s_gemv.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

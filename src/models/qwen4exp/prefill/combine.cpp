@@ -1,6 +1,6 @@
 #include "experts.hpp"
-#include "basalt/prefill/prefill.hpp"
-#include "basalt/core/mtp.hpp"
+#include "basalt/models/qwen4exp/prefill/prefill.hpp"
+#include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/models/qwen4exp/prefill/kernels.hpp"
 

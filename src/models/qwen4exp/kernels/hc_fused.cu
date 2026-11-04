@@ -1,10 +1,10 @@
-// src/models/qwen4exp/kernels/hc_fused.cu - see include/basalt/kernels/hc_fused.hpp.
+// src/models/qwen4exp/kernels/hc_fused.cu - see include/basalt/models/qwen4exp/kernels/hc_fused.hpp.
 //
 // Built WITHOUT fast math, like fused_gr.cu, so the hc arithmetic below is fused_gr.cu's expressions compiled the
 // same way.  The router part reproduces kernels built WITH fast math (the MMVF GEMV and the native top-10): those
 // operations are spelled out as the flush-to-zero PTX instructions that build emits.
 #include "basalt/core/diag.hpp"
-#include "basalt/kernels/hc_fused.hpp"
+#include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 

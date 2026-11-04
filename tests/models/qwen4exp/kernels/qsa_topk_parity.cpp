@@ -9,7 +9,7 @@
 //
 // Usage: qsa_topk_parity --selftest
 //        qsa_topk_parity CONTEXT [QUERIES=256] [REPS=10] [CAPACITY=CONTEXT] [COUNT=1]   (COUNT=0: no block count)
-#include "basalt/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_select.hpp"
 
 #include <cuda_runtime.h>

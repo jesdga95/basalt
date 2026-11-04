@@ -1,6 +1,6 @@
 // Capacity 262144, live prefill up to the register boundary, and the legacy fallbacks.
 // Compare selected IDs only: unused output padding is not part of the API contract.
-#include "basalt/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_select.hpp"
 #include <cuda_runtime.h>
 #include <algorithm>

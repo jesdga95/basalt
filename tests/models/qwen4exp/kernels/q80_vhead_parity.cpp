@@ -16,7 +16,7 @@
 // a head's spread of near-top logits, and random columns quantized by native_quantize_q8_1.
 //   q80_vhead_parity [rows] [iters]
 #include "basalt/kernels/native_mmvq.hpp"
-#include "basalt/kernels/q80_vhead.hpp"
+#include "basalt/models/qwen4exp/kernels/q80_vhead.hpp"
 #include "basalt/kernels/sampler.hpp"
 
 #include <cuda_fp16.h>

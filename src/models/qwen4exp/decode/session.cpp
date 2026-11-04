@@ -1,13 +1,13 @@
 // src/models/qwen4exp/decode/session.cpp - one token through all 48 layers.  See the header for why the graphs are per-layer.
-#include "basalt/core/session.hpp"
-#include "basalt/kernels/mrope.hpp"
+#include "basalt/models/qwen4exp/decode/session.hpp"
+#include "basalt/models/qwen4exp/kernels/mrope.hpp"
 #include "basalt/core/progress.hpp"
-#include "basalt/core/kv_arena.hpp"
+#include "basalt/models/qwen4exp/decode/kv_arena.hpp"
 
-#include "basalt/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/quantize_act.hpp"
-#include "basalt/kernels/s2_expert_grouped.hpp"
+#include "basalt/models/qwen4exp/kernels/s2_expert_grouped.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/platform/compiler.hpp"

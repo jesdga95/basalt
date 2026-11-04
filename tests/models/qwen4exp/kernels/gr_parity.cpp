@@ -18,7 +18,7 @@
 //      order, and graph replay must reproduce the captured result.
 //   6. `gr_write`'s `2*sigmoid`, which centres the gate on 1 so a ZERO injection is a plain residual add.
 //      Asserted as a property, not as a value, because that is what the source comment claims.
-#include "basalt/kernels/gr.hpp"
+#include "basalt/models/qwen4exp/kernels/gr.hpp"
 #include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
 
 #include <cuda_runtime.h>

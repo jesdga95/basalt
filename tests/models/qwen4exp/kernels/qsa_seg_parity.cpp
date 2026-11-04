@@ -4,13 +4,13 @@
 // mixed row counts at different positions, segment order shuffled against slot order; INT8 and FP16 pools; then a
 // microbench line per kernel (one segment call vs one call per segment).
 //   qsa_seg_parity [iters]
-#include "basalt/kernels/native_qsa_indexer.hpp"
-#include "basalt/kernels/qsa.hpp"
+#include "basalt/models/qwen4exp/kernels/native_qsa_indexer.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_dec_attn.hpp"
-#include "basalt/kernels/qsa_dec_fused.hpp"
-#include "basalt/kernels/qsa_seg.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_dec_fused.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_seg.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_select.hpp"
-#include "basalt/kernels/rope_scaling.hpp"
+#include "basalt/models/qwen4exp/kernels/rope_scaling.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

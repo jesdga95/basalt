@@ -1,11 +1,11 @@
 // src/models/qwen4exp/kernels/qsa_dec_attn.cu - see include/basalt/models/qwen4exp/kernels/qsa_dec_attn.hpp.
 #include "basalt/models/qwen4exp/kernels/qsa_dec_attn.hpp"
-#include "basalt/kernels/qsa_seg.hpp"
-#include "basalt/kernels/kv_q8.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_seg.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q8.hpp"
 #include "basalt/kernels/packed_byte.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
-#include "../../../kernels/cuda/smem_opt_in.cuh"
+#include "smem_opt_in.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

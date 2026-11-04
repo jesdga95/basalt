@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common.hpp"
-#include "basalt/core/verify.hpp"
+#include "basalt/models/qwen4exp/decode/verify.hpp"
 #include <atomic>
 #include <cstdio>
 #include <string>
