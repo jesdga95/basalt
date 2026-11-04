@@ -97,7 +97,7 @@ bool metadata_bytes(const ConversationCheckpoint& c, size_t& total) {
     size_t ids = 0, images = 0;
     if (!product(ids, {c.ids.size(), sizeof(int32_t)}) ||
         !product(images, {c.imgs.size(), sizeof(ConversationImageKey)})) return false;
-    for (size_t n : {ids, images, c.gdn.size(), c.ple.size(), c.tails.size(), c.dead.size(), c.block_pos.size()})
+    for (size_t n : {ids, images, c.state_a.size(), c.state_b.size(), c.state_c.size(), c.state_d.size(), c.state_e.size()})
         if (!add(total, n)) return false;
     return true;
 }
@@ -144,9 +144,9 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const Ses
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss);
-    if (c.gdn.size() != z.gdn || c.ple.size() != (ss.ple_hist ? z.ple : 0) ||
-        c.tails.size() != layers * z.tail || c.dead.size() != layers * z.dead ||
-        c.block_pos.size() != layers * z.block_pos || !image_keys(c.imgs, c.ids.size()))
+    if (c.state_a.size() != z.gdn || c.state_b.size() != (ss.ple_hist ? z.ple : 0) ||
+        c.state_c.size() != layers * z.tail || c.state_d.size() != layers * z.dead ||
+        c.state_e.size() != layers * z.block_pos || !image_keys(c.imgs, c.ids.size()))
         return fail(error, "invalid checkpoint running-state payload");
     return true;
 }
@@ -156,15 +156,15 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss);
-    c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
-    c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
-    if (!copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error) ||
-        !copy(c.ple.data(), ss.ple_hist, c.ple.size(), error)) return false;
+    c.state_a.resize(z.gdn); c.state_b.resize(ss.ple_hist ? z.ple : 0);
+    c.state_c.resize(layers * z.tail); c.state_d.resize(layers * z.dead); c.state_e.resize(layers * z.block_pos);
+    if (!copy(c.state_a.data(), ss.gdn_state, c.state_a.size(), error) ||
+        !copy(c.state_b.data(), ss.ple_hist, c.state_b.size(), error)) return false;
     for (size_t j = 0; j < layers; ++j) {
         const auto& st = owned(ss, j);
-        if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error) ||
-            !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error) ||
-            !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
+        if (!copy(c.state_c.data() + j * z.tail, st.idx_tail, z.tail, error) ||
+            !copy(c.state_d.data() + j * z.dead, st.idx_dead, z.dead, error) ||
+            !copy(c.state_e.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
     }
     return true;
 }
@@ -177,21 +177,21 @@ bool conversation_checkpoint_save_layers(ConversationCheckpoint& c, const Sessio
     const int64_t g0 = layer_lo - layer_lo / I, g1 = layer_hi - layer_hi / I;   // the range's GDN ordinals
     const int64_t q0 = layer_lo / I, q1 = layer_hi / I;                         // and its QSA ones
     const size_t n_qsa = (size_t) g.n_qsa_layers();
-    if (layer_lo < 0 || layer_hi > g.n_layers || layer_lo >= layer_hi || c.gdn.size() != z.gdn ||
-        c.tails.size() != n_qsa * z.tail || c.dead.size() != n_qsa * z.dead || c.block_pos.size() != n_qsa * z.block_pos ||
+    if (layer_lo < 0 || layer_hi > g.n_layers || layer_lo >= layer_hi || c.state_a.size() != z.gdn ||
+        c.state_c.size() != n_qsa * z.tail || c.state_d.size() != n_qsa * z.dead || c.state_e.size() != n_qsa * z.block_pos ||
         g0 < part.gdn_ord0 || g1 > part.gdn_ord0 + part.gdn_alloc || q0 < part.qsa_ord0 ||
         q1 > part.qsa_ord0 + part.qsa_alloc || (q1 > q0 && !part.qsa_states))
         return fail(error, "a layer range's running state outside the checkpoint or the session");
     const size_t row = g.n_gdn_layers() > 0 ? z.gdn / (size_t) g.n_gdn_layers() : 0;
-    if (g1 > g0 && !copy(c.gdn.data() + (size_t) g0 * row,
+    if (g1 > g0 && !copy(c.state_a.data() + (size_t) g0 * row,
                          reinterpret_cast<const uint8_t*>(part.gdn_state) + (size_t) (g0 - part.gdn_ord0) * row,
                          (size_t) (g1 - g0) * row, error))
         return false;
     for (int64_t q = q0; q < q1; ++q) {
         const QsaState& st = part.qsa_states[q];
-        if (!copy(c.tails.data() + (size_t) q * z.tail, st.idx_tail, z.tail, error) ||
-            !copy(c.dead.data() + (size_t) q * z.dead, st.idx_dead, z.dead, error) ||
-            !copy(c.block_pos.data() + (size_t) q * z.block_pos, st.idx_block_pos, z.block_pos, error))
+        if (!copy(c.state_c.data() + (size_t) q * z.tail, st.idx_tail, z.tail, error) ||
+            !copy(c.state_d.data() + (size_t) q * z.dead, st.idx_dead, z.dead, error) ||
+            !copy(c.state_e.data() + (size_t) q * z.block_pos, st.idx_block_pos, z.block_pos, error))
             return false;
     }
     return true;
@@ -228,19 +228,19 @@ bool ConversationCheckpointDeferral::save(ConversationCheckpoint& c, const Sessi
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     if (!spare_ || z.gdn > cap_ || !z.gdn) return conversation_checkpoint_save(c, ss, g, error);
     const size_t layers = owned_qsa(ss);
-    c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
-    c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
+    c.state_a.resize(z.gdn); c.state_b.resize(ss.ple_hist ? z.ple : 0);
+    c.state_c.resize(layers * z.tail); c.state_d.resize(layers * z.dead); c.state_e.resize(layers * z.block_pos);
     if (!copy(spare_, ss.gdn_state, z.gdn, error) ||
-        !copy(c.ple.data(), ss.ple_hist, c.ple.size(), error)) return false;
+        !copy(c.state_b.data(), ss.ple_hist, c.state_b.size(), error)) return false;
     for (size_t j = 0; j < layers; ++j) {
         const auto& st = owned(ss, j);
-        if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error) ||
-            !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error) ||
-            !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
+        if (!copy(c.state_c.data() + j * z.tail, st.idx_tail, z.tail, error) ||
+            !copy(c.state_d.data() + j * z.dead, st.idx_dead, z.dead, error) ||
+            !copy(c.state_e.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
     }
     int dev = 0;
     cudaGetDevice(&dev);
-    dst_ = c.gdn.data();
+    dst_ = c.state_a.data();
     status_ = cudaSuccess;
     worker_ = std::thread([this, dev, n = z.gdn] {
         cudaSetDevice(dev);
@@ -266,16 +266,16 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     if (!conversation_checkpoint_validate(c, ss, g, error)) return false;
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
-    if (!copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error) ||
-        !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
+    if (!copy(ss.gdn_state, c.state_a.data(), c.state_a.size(), error) ||
+        !copy(ss.ple_hist, c.state_b.data(), c.state_b.size(), error)) return false;
     for (size_t j = 0; j < owned_qsa(ss); ++j) {
         const auto& st = owned(ss, j);
-        if (!copy(st.idx_tail, c.tails.data() + j * z.tail, z.tail, error) ||
-            !copy(st.idx_dead, c.dead.data() + j * z.dead, z.dead, error) ||
-            !copy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, error)) return false;
+        if (!copy(st.idx_tail, c.state_c.data() + j * z.tail, z.tail, error) ||
+            !copy(st.idx_dead, c.state_d.data() + j * z.dead, z.dead, error) ||
+            !copy(st.idx_block_pos, c.state_e.data() + j * z.block_pos, z.block_pos, error)) return false;
         if (!c.ids.empty()) {
             const size_t row = c.ids.size() / basalt::kernels::qsa_real_shapes().idx_block;
-            if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error)) return false;
+            if (!copy(st.idx_pooled + row * g.idx_key_dim, c.state_d.data() + j * z.dead, z.dead, error)) return false;
         }
     }
     const size_t tokens = c.ids.size();
