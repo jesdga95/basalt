@@ -45,7 +45,6 @@ struct ExpertLayout;
 namespace basalt::core {
 
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
-class RemoteExperts;
 struct LoadStats;
 
 namespace detail {
@@ -136,10 +135,9 @@ struct HomeRegion {
     const uint8_t* device = nullptr;   ///< the mapped device alias when page-locked through the driver
     uint64_t locked = 0;               ///< bytes held in the working set (a malloc'd region)
     bool pinned = false;
-    bool registered = false;           ///< pinned by registering an alloc_region region (else allocated by the driver)
-    void* map_base = nullptr;          ///< what free_region releases for a registered region
-    uint64_t map_bytes = 0;
 };
+/// How many of the experts sized `bytes`, taken in order, fit in `room`.
+size_t home_prefix_fit(const std::vector<uint64_t>& bytes, uint64_t room);
 /// The region holding the `bytes` at `off`, or -1.
 int home_region_find(const std::vector<HomeRegion>& regions, uint64_t off, uint64_t bytes);
 /// Whether any expert's place lies in the region.
@@ -264,8 +262,6 @@ struct GpuPlanSink {
 struct ExpertDispatch {
     basalt::kernels::cpu::ExpertPool* pool = nullptr;
     ExpertSource* src = nullptr;
-    RemoteExperts* remote[3] = {}; ///< optional CUDA1..3 tiers for otherwise CPU-served rows
-    int remote_count = 0;
     int64_t n_expert = basalt::kernels::cpu::NE;
 
     /// Counters, for the driver to report rather than for control flow.
@@ -533,12 +529,14 @@ public:
     void homes_abort();
     bool home_release(int64_t layer, int64_t expert);
     uint64_t homes_reclaim();
-    /// Moves the experts still in homes into fresh regions and frees the old ones (bytes freed; 0 when it would
+    /// Moves the experts still in homes into fresh regions and frees the old ones (net bytes freed; 0 when it would
     /// free less than a region or the RAM cannot take the copy).  Only with no exchange in flight.
     uint64_t homes_compact();
     uint64_t homes_bytes() const;
     /// RAM above the margin that a take leaves free (the server's guard floor and the engine's later allocations).
     void set_homes_reserve(uint64_t bytes) { homes_reserve_ = bytes; }
+    /// The RAM a take can use now: the budget above that reserve.
+    uint64_t homes_room() const;
     /// Debug: whether `bytes` equal the expert's bytes in the model files.
     bool equals_file(int64_t layer, int64_t expert, const uint8_t* bytes) const;
     /// With the compact copy ready: blobs read from the mapped file since (what the plain mmap mode may read from
@@ -563,8 +561,9 @@ public:
     uint64_t places_generation() const override { return places_gen_; }
     bool pcie_layer(int64_t layer) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
-    /// Each blob read from the file with block-aligned unbuffered reads into small pinned staging buffers; a blob that
-    /// cannot be read that way, or a file system without unbuffered reads, takes the mapped copy.
+    /// Overlaps block-aligned unbuffered reads through small pinned stages.  A blob whose read comes back short or
+    /// failed, and a file system without unbuffered reads, take the mapped copy instead, whose pages are given back
+    /// once the sink has them so a full fill does not leave the pack resident.  A sink that fails stops the read.
     bool read_blobs(const std::pair<int32_t, int32_t>* pairs, int64_t n, const BlobSink& sink, std::string& err) override;
 
     /// Blobs touched, for the driver to report.  With `h = 0` this is `48 * k` per token and the number is only
@@ -638,6 +637,7 @@ private:
     std::atomic<int64_t> file_reads_{0};
     int64_t reads_ = 0;
     int fd_ = -1;
+    std::string path_;   ///< the mapped file, which the bulk reads open unbuffered
 };
 
 // ================================ THE RESIDENT ARENA ================================
@@ -659,7 +659,7 @@ public:
     /// Allocates and loads the model's `experts` section.  Prints nothing; the caller reports `note()` and the load
     /// rate, because those are the two numbers that say whether the arena is the one that was asked for.
     bool open(const ExpertFiles& files, int64_t n_layers, int64_t n_expert, int threads, std::string& err,
-              uint64_t max_pinned_bytes = 0, const std::string& shared_arena_file = {});
+              const std::string& shared_arena_file = {});
     void close();
 
     bool mapped() const { return base_ != nullptr; }

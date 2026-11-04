@@ -22,6 +22,7 @@ private:
     float req_top_p{};
     int req_top_k{};
     unsigned long long req_seed{};
+    bool req_seed_given{};
     float req_min_p{};
     float req_penalty_repeat{};
     float req_penalty_freq{};
@@ -48,12 +49,6 @@ private:
     int64_t grammar_resamples{};
     basalt::program::PplGate* ppl{};
     bool bad{};
-    std::array<int64_t, 3> remote_before{};
-    std::array<int64_t, 3> launches_before{};
-    std::array<uint64_t, 3> compact_before{};
-    std::array<uint64_t, 3> full_before{};
-    std::array<double, 3> begin_before{};
-    std::array<double, 3> wait_before{};
     std::vector<int32_t> ids32{};
     Clock::time_point r0{};
     bool want_cvec{};
@@ -61,12 +56,7 @@ private:
     bool in_slot{};
     bool solo_req{};
     basalt::core::SessionState* rview{};
-    struct SoloBook {
-        std::vector<int32_t> live;
-        std::vector<ImgKey> live_imgs;
-        bool live_ok = false, cvec = true;
-        std::vector<ConvCheckpoint> checks;
-    };
+    using SoloBook = Runtime::SoloBook;
     SoloBook solo_book{};
     bool solo_moved{};
     bool own_partial{};
@@ -92,6 +82,7 @@ private:
                 ~KeepRouted() { on = false; }
             };
     std::optional<KeepRouted> keep_routed;
+    std::optional<KeepRouted> defer_peer;
     bool kv_ok{};
     Clock::time_point restore_t0{};
     int64_t read_from{};
@@ -166,6 +157,8 @@ private:
     int64_t dec_windows{};
     int64_t dec_T{};
     int64_t decode_hits0{};
+    int64_t swapped0{};
+    int64_t noplace0{};
     int64_t ram0{};
     int64_t files0{};
     uint64_t file_bytes0{};
@@ -204,7 +197,6 @@ private:
     bool read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool& ran, std::string& e);
     bool read_part(int64_t a0, int64_t b0, std::string& e);
     DecSnap dec_snap();
-    bool loan_homes();
     Flow parse();
     Flow prepare_image();
     Flow restore();

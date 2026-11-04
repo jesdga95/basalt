@@ -13,7 +13,6 @@
 #include "basalt/core/device.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/draft_cum.hpp"
-#include "basalt/core/remote_expert_opt.hpp"
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/conversation_snapshot.hpp"
 #include "basalt/core/conversation_memory.hpp"
@@ -25,7 +24,6 @@
 #include "basalt/platform/memory.hpp"
 #include "basalt/platform/process.hpp"
 #include "basalt/platform/system.hpp"
-#include "basalt/core/remote_experts.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/core/layer.hpp"
@@ -289,6 +287,11 @@ private:
     // CUDA0 (from their RAM copy, as any other swap) and its coldest go to the CPU
     // routings a peer expert needs above CUDA0's victim before it moves
     static constexpr float promote_margin = 10.0f;
+    // the count at which a CPU-tier expert routed about once lately takes a slot the round leaves unused
+    static constexpr float once_bar = 1.0f;
+    // at most this many of them a round: more copies cost the CPU tier host memory bandwidth on routing that rarely
+    // comes back (JSON output)
+    static constexpr size_t kOnceSwaps = 16;
     // the round's swaps, best first: the most-routed missing experts against the least-routed resident ones, per
     // layer, or over all layers (`across`: the incoming expert takes a slot of the outgoing one's layer `lout`)
     struct Swap { float gain; int32_t layer, in, out, lout; };
@@ -304,6 +307,9 @@ private:
     std::vector<XSwap> xq{};
     int xq_stage{};
     bool xq_saturated{};
+    // since the start: the swaps the rounds queued, and those a round left for a later one (no free RAM place)
+    int64_t xq_swapped{};
+    int64_t xq_noplace{};
     // The landed words (Verifier::landed_words): a round's incoming copies are queued in layer order, each layer's
     // followed by a 4-byte copy of the round's number into the layer's word.  The copies' sources are a pinned
     // ring of rounds (every layer's word, then the round's number).
@@ -348,6 +354,7 @@ private:
     int64_t chunk_full{};
     int64_t kKvGrowCells{};
     static constexpr int64_t kKvWindowCells = 2* basalt::kernels::kVerifyMaxT + 64;   // a decoding session's next window
+    static constexpr int64_t kPeerTakeCells = 32768;   // a fit backing this many new cells hands its experts to the peer
     int64_t kv_moves{};
     bool kv_short{};
     bool kv_keep_routed{};   // an admission while slots decode: a shrink keeps their routed experts
@@ -366,6 +373,11 @@ private:
     // it keeps once the outgoing conversation is parked (kv_host_back)
     bool kv_host_late{};
     int64_t kv_host_fresh{};        // a session not streamed yet takes a pool only for a read of at most this many tokens
+    // a solo request's fits before its prompt read leave their handoffs to the peer to that read: (peer slot, its
+    // expert, the expert it takes), done by the split's loan of the slot or else before the first window
+    bool peer_defer{};
+    std::vector<std::array<int32_t, 3>> peer_due{};
+    int64_t peer_due_off{}, peer_due_lent_n{};
     // ---- --batch: the slots of the batch windows
     struct BSlot {
         bool active = false, stop = false;
@@ -378,6 +390,8 @@ private:
         // instead of reading its history again (see `slot_source` in the request path).
         std::vector<int32_t> ids;
         bool cached = false;           ///< idle, and its sessions still hold `ids`
+        double idle_busy = 0;          ///< the busy clock (busy_now) when it last became idle holding `ids`
+        double park_noted = -1;        ///< the idle_busy whose stay in VRAM for want of RAM was logged
         bool cvec = true;              ///< the control vector setting `ids` were read with
         std::vector<ImgKey> imgs;      ///< the pictures in `ids`: a later request reuses them only with the same ones
         // the checkpoint its prompt read took at the last turn boundary (the history before the new turn's header): a
@@ -406,6 +420,7 @@ private:
         std::unique_ptr<basalt::spec::SuffixDrafter> sfx;
         int32_t sbuf[16] = {};
         int sk = 0, smatch = 0;
+        int pen_n = 0;                 ///< the request's penalty window (penalty_last_n; 0: no penalties)
         bool from_sfx = false;
         double acc = 0.6;          ///< drafts accepted per offered, smoothed: who gets the free rows
         int64_t since_draft = 0;   ///< windows since the slot last drafted
@@ -414,6 +429,36 @@ private:
     };
     std::vector<BSlot> bs{};
     bool batch_spec{};
+    /// the solo conversation's draft K/V waits in slot 0's store while a request in another slot holds the main one
+    bool solo_draft_in0{};
+    // ---- idle conversations out of VRAM.  An idle conversation (a cached batch slot's, or the solo session's while
+    // no request works there) keeps its KV in VRAM until the work beside it has run kParkAfterBusy seconds: the
+    // expert-cache slots its cells hold have then cost that work about what moving it out and back costs, both
+    // in proportion to its tokens.  From then on, the VRAM a session is short of comes from it before the expert
+    // cache's slots, and an idle engine moves it out to regrow the cache.  It goes to the RAM tier outside its
+    // budget when RAM admits it, else it stays only on the disk tier when that holds it, else in VRAM; its next
+    // turn reads it back like any parked conversation.  Before a prompt is refused for want of VRAM, any idle
+    // conversation goes.
+    static constexpr double kParkAfterBusy = 15.0;
+    /// the solo session's conversation while a request works in another slot (that request's, moved out of `live`)
+    struct SoloBook {
+        std::vector<int32_t> live;
+        std::vector<ImgKey> live_imgs;
+        bool live_ok = false, cvec = true;
+        std::vector<ConvCheckpoint> checks;
+    };
+    SoloBook* solo_out{};
+    bool solo_busy{};                    ///< a request reads or decodes in the solo session
+    double solo_idle_busy{};             ///< the busy clock when the solo conversation last became idle
+    double solo_park_noted = -1;         ///< as BSlot::park_noted
+    int park_keep = -1;                  ///< the slot whose conversation the request being admitted continues
+    // the busy clock: seconds some request or batch slot ran (dispatch counts them)
+    double busy_s{};
+    Clock::time_point busy_from{};
+    bool busy_on{};
+    double busy_now() const {
+        return busy_s + (busy_on ? std::chrono::duration<double>(Clock::now() - busy_from).count() : 0.0);
+    }
     int S_all{};
     std::optional<basalt::spec::DraftPolicy> bpolicy;
     double bt_draft{};
@@ -433,6 +478,7 @@ private:
     int64_t ba_rounds_l{};
     int64_t ba_h_l{};
     int64_t ba_m_l{};
+    int64_t ba_noplace{};   // the batch rounds' swaps deferred for want of a free RAM place
     double ba_ms{};
     JobRunner ba_thr{};   // queues the adaptive copies beside the windows
     bool ba_job{};
@@ -490,14 +536,16 @@ private:
     bool park_current(size_t held, int64_t kept);
     std::vector<ImgKey> imgs_below(const std::vector<ImgKey>& all, int64_t L);
     bool gpu_sync_ok();
-    bool checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool defer = false);
+    bool checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool defer = false,
+                       ConvCheckpoint::Source source = ConvCheckpoint::kPeriodic);
     void res_upload();
     bool adapt_peers(const std::vector<int32_t>& r0, std::string& perr);
     void apply_pending(bool wait, bool exchanges = true);
     void rank_swaps(std::vector<Swap>& swaps, bool across);
+    void rank_once(std::vector<Swap>& swaps, size_t room);
     bool adapt();
     void xq_settle();
-    bool xq_round();
+    bool xq_round(std::vector<Swap>* ranked = nullptr);
     bool xq_advance(bool wait);
     bool xq_drain();
     void save_profile(const char* why);
@@ -508,14 +556,16 @@ private:
     void make_view(basalt::core::SessionState& v, int b);
     int32_t loan_plan(int64_t live, int64_t& chunk);
     void relend();
-    void homes_wanted(int64_t live, std::vector<std::pair<int32_t, int32_t>>& give, std::vector<int32_t>& slots);
-    bool home_given_up(int64_t live, std::string& e);
+    bool home_given_up(int64_t live, std::string& e, bool partial = false);
     bool vram_command(const std::string& cmd, std::string& e, bool for_sleep, std::string* reply = nullptr);
     int64_t cache_floor_slots();
     bool move_routed_below(int64_t first, const char* why, std::string& e,
                            const std::vector<serve_loans::LentEntry>* lent_out = nullptr);
     bool kv_drain(std::string& e);
     bool cache_regrow(std::string& e);
+    bool peer_take(const std::vector<int32_t>& off, std::string& e);
+    void peer_due_lent(std::vector<std::pair<int32_t, int32_t>>& lent);
+    bool peer_due_apply(std::string& e);
     bool kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& e, bool shrink = true, int64_t min_cells = -1);
     bool kv_release(basalt::core::SessionState& s, int64_t cells, std::string& e);
     int64_t kv_keep_cells(const basalt::core::SessionState& s);
@@ -525,7 +575,6 @@ private:
     uint64_t kv_ram_now();
     int kv_host_regrow(int64_t cells, int64_t live_c, std::string& pe, std::string& e);
     int kv_host_to_vram(int64_t at, int64_t live_c, std::string& pe, std::string& e);
-    uint64_t loan_home_bytes();
     int kv_host_admit(int64_t need, int64_t new_tokens, int64_t live_cells, int64_t read, std::string& e);
     int kv_host_back(int64_t need, int64_t keep, std::string& e);
     int kv_host_more(int64_t p, int64_t need, int64_t left, int64_t live_c, std::string& e);
@@ -533,10 +582,15 @@ private:
     bool batch_on();
     bool try_next_line(std::string& out);
     bool kv_give_back(int64_t ss_keep, const basalt::core::SessionState* skip, int skip_slot, const std::function<bool()>& enough, int64_t& given, std::string& e);
+    std::vector<std::pair<double, int>> idle_list(const basalt::core::SessionState* s, bool any);
+    int64_t park_idle(const basalt::core::SessionState* s, int64_t need, bool any, std::string& e);
+    bool park_one(int b, std::string& e);
+    bool park_idle_engine(std::string& e);
     void enc_command(const std::string& cmd);
     bool copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& e);
     bool hold_slot(int b, const ConvCheckpoint* at, std::string& e);
     bool copy_from_slot(int b, const ConvCheckpoint* at, std::string& e);
+    void solo_draft_back(bool keep);
     bool slot_digest(int b, int64_t upto, uint64_t* part);
     bool batch_step();
     basalt::core::Verifier& stage_verifier(int k);

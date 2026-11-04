@@ -26,6 +26,11 @@ namespace basalt::platform {
 /// Bytes that are not valid UTF-8 become the replacement character rather than an error, so a name that came from
 /// somewhere broken fails at the open that follows rather than here.
 std::wstring to_wide(const std::string& utf8);
+
+/// `to_wide` for a path the OS is asked to open, create or query. A path past the length the plain Win32 calls
+/// accept is made absolute and given the `\\?\` prefix, so it opens whether or not the system's long-path policy is
+/// on (the manifest's `longPathAware` only takes effect where it is). Shorter paths convert as `to_wide` does.
+std::wstring to_wide_path(const std::string& utf8);
 #endif
 
 /// Opens `path` as `mode` spells it ("rb", "wb", "ab"). nullptr on failure. `mode` is passed through as given: text
@@ -105,7 +110,9 @@ int open_unbuffered(int fd);
 /// instead.
 int open_unbuffered(const std::string& path);
 
-/// Creates or truncates `path` for writing, binary. A descriptor for `pwrite_all`; -1 on failure.
+/// Creates or truncates `path` for writing, binary, readable and writable by its owner only where the platform has
+/// file modes (a new Windows file takes its folder's inherited access list). A descriptor for `pwrite_all`; -1 on
+/// failure.
 int open_write_utf8(const std::string& path);
 
 /// The same with writes that bypass the OS cache: buffer address, offset and count aligned to 4096. -1 where the
@@ -118,7 +125,8 @@ bool pwrite_all(int fd, const void* src, uint64_t n, uint64_t off);
 /// Waits until what was written through `fd` is on the device. False when the OS reports a failure.
 bool sync_fd(int fd);
 
-/// Creates `path` and its missing parents. True when the directory exists afterwards.
+/// Creates `path` and its missing parents, each one owner-only where the platform has file modes (on Windows they take
+/// the parent's inherited access list); existing directories keep theirs. True when the directory exists afterwards.
 bool make_dirs(const std::string& path);
 
 /// A regular file in a directory: its name (no directory part), size and last write time (seconds on the file

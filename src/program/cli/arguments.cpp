@@ -14,6 +14,8 @@
 namespace basalt::program::cli {
 namespace {
 constexpr float kRelaxedDraftingDefault = 0.5f;
+constexpr int kRouteTailSkipDefault = 9;
+constexpr float kRoutePriorDefault = 0.5f;
 }
 
 std::optional<int> parse_options(int argc, char** argv, Options& o, std::string& ppl_base, std::string& ppl_out) {
@@ -27,7 +29,6 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         bool parsed = true;
         if (a == "--help" || a == "-h") { usage(); return 0; }
         else if (a == "--model") o.model = next("--model");
-        else if (a == "--dump-hc8") o.dump_hc8 = next("--dump-hc8");
         else if (a == "--tokens") {
             if (have_tokens) { basalt::log::error("basalt", "supply one token input only"); return 2; }
             std::string e;
@@ -126,6 +127,30 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
                 }
             }
         }
+        else if (a == "--route-tail-skip") {   // the value is optional: an integer 1..9 when one follows
+            o.route_tail_skip = kRouteTailSkipDefault;
+            if (i + 1 < argc) {
+                char* e = nullptr;
+                const long v = std::strtol(argv[i + 1], &e, 10);
+                if (e != argv[i + 1] && *e == '\0') {
+                    ++i;
+                    if (v < 1 || v > 9) { basalt::log::error("basalt", "--route-tail-skip: R must be 1..9"); return 2; }
+                    o.route_tail_skip = (int) v;
+                }
+            }
+        }
+        else if (a == "--route-prior") {   // the value is optional: a number in (0, 16] when one follows
+            o.route_prior = kRoutePriorDefault;
+            if (i + 1 < argc) {
+                char* e = nullptr;
+                const float v = std::strtof(argv[i + 1], &e);
+                if (e != argv[i + 1] && *e == '\0') {
+                    ++i;
+                    if (!(v > 0.0f && v <= 16.0f)) { basalt::log::error("basalt", "--route-prior: LAMBDA must be in (0, 16]"); return 2; }
+                    o.route_prior = v;
+                }
+            }
+        }
         else if (a == "--grammar") {
             const std::string v = next("--grammar");
             if (v != "on" && v != "off") { basalt::log::error("basalt", "--grammar: on or off"); return 2; }
@@ -138,11 +163,13 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-dir") o.conversation_cache_dir = next("--conversation-cache-dir");
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
-                 a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-disk-mib") {
+                 a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-disk-mib" ||
+                 a == "--conversation-cache-min-tokens") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
-            const int64_t limit = a == "--conversation-cache-slots" ? INT32_MAX : INT64_MAX / (1024 * 1024);
+            const int64_t limit = a == "--conversation-cache-slots" || a == "--conversation-cache-min-tokens"
+                                  ? INT32_MAX : INT64_MAX / (1024 * 1024);
             if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
                 basalt::log::error("basalt", "%s needs a nonnegative integer within range", a.c_str());
                 return 2;
@@ -150,6 +177,7 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
             if (a == "--conversation-cache-mib") o.conversation_cache_mib = number;
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
             else if (a == "--conversation-cache-disk-mib") o.conversation_cache_disk_mib = number;
+            else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = (int) number;
             else o.conversation_cache_slots = (int) number;
         }
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
@@ -201,6 +229,7 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib"));
         else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
         else if (a == "--peer-prefill-rows") o.peer_prefill_rows = std::atoll(next("--peer-prefill-rows"));
+        else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--expert-profile-save") o.expert_profile_save = next("--expert-profile-save");
         else if (a == "--expert-profile-save-every")
             o.expert_profile_save_min = std::atof(next("--expert-profile-save-every"));
@@ -223,6 +252,7 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         else if (a == "--stats") o.stats = true;
         else if (a == "--profile") basalt::core::diagnostics().profile = true;
         else if (a == "--wait-stats") basalt::core::diagnostics().wait_stats = true;
+        else if (a == "--force-zero-doorbell") basalt::core::diagnostics().zero_doorbell = true;
         else if (a == "--decode-timing") basalt::core::diagnostics().decode_timing = true;
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = next("--draft-log");
         else if (a == "--exp") {
@@ -247,6 +277,15 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
             return 2;
         }
         }
+    }
+    if (o.route_tail_skip > 0 || o.route_prior > 0.0f || o.relaxed_drafting > 0.0f) {
+        basalt::log::warn("basalt", "lossy flags enabled, these flags will affect the accuracy of the served model");
+        if (o.relaxed_drafting > 0.0f)
+            basalt::log::warn("basalt", "--relaxed-drafting %g accepts draft tokens the model would not pick", (double) o.relaxed_drafting);
+        if (o.route_prior > 0.0f)
+            basalt::log::warn("basalt", "--route-prior %g changes expert routing", (double) o.route_prior);
+        if (o.route_tail_skip > 0)
+            basalt::log::warn("basalt", "--route-tail-skip %d drops low-ranked missed experts", o.route_tail_skip);
     }
     return std::nullopt;
 }

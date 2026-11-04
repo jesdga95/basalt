@@ -55,19 +55,14 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
             if (v_.ar_on() || dm) wait_flag_ge(v_.m_flag_, 1, cs);
             copy_from_mapped(v_.ple_, v_.m_ple_, (int64_t) T * N, cs);
         }
-        float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
-        const bool ple_batch_kv = n > 1 && ss.ple.w.key_bf16 != nullptr &&
-                                  ss.ple.w.value_bf16 != nullptr;
-        // the rows' write, post-ops, history advance and snapshots in two launches, the value
-        // projection on the side stream beside the key's
-        // (one row too: there the multi-row GEMVs are ple_block's own)
-        const bool ple_win = ple_batch_kv || (n == 1 && ss.ple.w.key_bf16 != nullptr && ss.ple.w.value_bf16 != nullptr);
-        if (v_.batch_rec_) v_.batch_seg_ple_ = ple_win;
+        // the rows' write, post-ops, history advance and snapshots in two launches, the value projection on the side
+        // stream beside the key's
         cudaStream_t pside = v_.sh_hi_ != nullptr ? v_.sh_hi_ : v_.sh_cs_;
-        const bool ple_fork = ple_win && pside != nullptr && v_.ev_fork_ != nullptr && v_.ev_join_ != nullptr;
+        const bool ple_fork = pside != nullptr && v_.ev_fork_ != nullptr && v_.ev_join_ != nullptr;
         if (ple_side) {
             cudaStreamWaitEvent(cs, v_.ev_ple_join_, 0);
-        } else if (ple_batch_kv || ple_win) {
+            ple_open = false;
+        } else {
             try {
                 if (ple_fork) {
                     cudaEventRecord(v_.ev_fork_, cs);
@@ -76,8 +71,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
                                               v_.z_, N, N, N, n, pside);
                     cudaEventRecord(v_.ev_join_, pside);
                 }
-                bf16_gemv_fp32_mmvf_multi(v_.ple_, N, ss.ple.w.key_bf16,
-                                          v_.xn_, HC * N, N, HC * N, n, cs);
+                ple_key_rows(v_.ple_, n, ss.ple.w, v_.xn_, v_.ple_q8_, cs);
                 if (ple_fork) cudaStreamWaitEvent(cs, v_.ev_join_, 0);
                 else bf16_gemv_fp32_mmvf_multi(v_.ple_, N, ss.ple.w.value_bf16,
                                                v_.z_, N, N, N, n, cs);
@@ -86,39 +80,17 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
                 return false;
             }
         }
-        if (ple_win) {
-            PleWindowArgs pa;
-            pa.R = Rt(0); pa.block_out = v_.bo_; pa.inject = v_.inj2_;
-            pa.key = ple_side ? v_.ple_key_ : v_.xn_;
-            pa.value = ple_side ? v_.ple_val_ : v_.z_;
-            pa.history = v_.batch_rec_ ? v_.ple_work_ : ss.ple.hist; pa.segs = v_.batch_rec_ ? v_.segb_ : nullptr;
-            pa.hist_snap = v_.hist_snap_; pa.scratch = v_.ple_win_; pa.T = n;
-            try {
-                native_ple_window(pa, ss.ple.w, cs);
-            } catch (const std::exception& e) {
-                err = std::string("verify PLE window: ") + e.what();
-                return false;
-            }
-        }
-        for (int t = 0; t < T && !ple_win; ++t) {
-            gr_write(Rt(t), v_.bo_ + t * N, v_.inj2_ + t * HC, gs, Rt(t), cs);
-            PleOut po;
-            po.normalized = normalized;
-            po.result = Rt(t);
-            float* hist = v_.batch_rec_ ? v_.ple_work_ + (size_t) t * HS : ss.ple.hist;   // the row's own history
-            try {
-                if (ple_batch_kv) {
-                    ple_block_projected(v_.xn_ + (size_t) t * HC * N, v_.z_ + (size_t) t * N, Rt(t), hist,
-                                        ss.ple.w, po, ss.ple.scratch, cs);
-                } else {
-                    ple_block(v_.ple_ + t * N, Rt(t), hist, ss.ple.w, po, ss.ple.scratch, cs);
-                }
-                ple_history_advance(hist, normalized, cs);
-            } catch (const std::exception& e) {
-                err = std::string("verify PLE: ") + e.what();
-                return false;
-            }
-            copy_from_mapped(v_.hist_snap_ + (size_t) t * HS, hist, HS, cs);
+        PleWindowArgs pa;
+        pa.R = Rt(0); pa.block_out = v_.bo_; pa.inject = v_.inj2_;
+        pa.key = ple_side ? v_.ple_key_ : v_.xn_;
+        pa.value = ple_side ? v_.ple_val_ : v_.z_;
+        pa.history = v_.batch_rec_ ? v_.ple_work_ : ss.ple.hist; pa.segs = v_.batch_rec_ ? v_.segb_ : nullptr;
+        pa.hist_snap = v_.hist_snap_; pa.scratch = v_.ple_win_; pa.T = n;
+        try {
+            native_ple_window(pa, ss.ple.w, cs);
+        } catch (const std::exception& e) {
+            err = std::string("verify PLE window: ") + e.what();
+            return false;
         }
         pending = false;
     }
@@ -158,7 +130,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
     bool mid_ok = false;
     MidChainArgs ma;
     if (dec_hc && read_q8 && router_multi && !is_qsa_layer(g, l) && !v_.prof_on_ && !v_.batch_rec_ && !gs_split &&
-        n <= kMidChainMaxT && N == 2560 && dec_gdnf_mode() != 0 && (dense_tc_mask() & 4)) {
+        n <= v_.mid_max_t_ && N == 2560 && dec_gdnf_mode() != 0 && (dense_tc_mask() & 4)) {
         const WeightRef *wqkv = v.get("attn_qkv.weight"), *wg = v.get("attn_gate.weight"),
                         *wout = v.get("ssm_out.weight"), *wa = v.get("ssm_alpha.weight"),
                         *wb = v.get("ssm_beta.weight"), *wc = v.get("ssm_conv1d.weight"),
@@ -220,6 +192,10 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         cudaStreamWaitEvent(cs, v_.lz_join_, 0);
         lz_open = false;
     }
+    if (mid_ok && (ple_open || lz_open)) {   // the mid chain needs every SM: no side branch may run beside it
+        err = "verify layer " + std::to_string(l) + ": the mid chain was recorded beside an open side branch";
+        return false;
+    }
     if (mid_ok) {
         // the first read's dependent: its first pair tiles are already issued by the time the read ends (PDL)
         PdlScope ps(pdl, mid_ord == 0);
@@ -243,6 +219,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         dec_moe_mix_combine(v_.dm_->m_w + 52, (uint32_t) (l - v_.lb_ + 1), v_.gs_m_part_, v_.bo_, n * (int) N, cs);
     else if (gs_ring)
         dec_moe_mix_wait(v_.dm_->m_w + 52, (uint32_t) (l - v_.lb_ + 1), cs);
+    if (ple_side && l == 0 && !ple_fork()) return false;   // after layer 0's middle: no mid chain before layer 1's join
     stamp(l, 16);
     bool routed = false;   // the fused read ran the router too
     const bool sh_fork = !v_.prof_on_ && v_.sh_cs_ != nullptr && v_.ev_fork_ != nullptr &&
@@ -311,6 +288,20 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         mb.logits = v_.logits_ + t * NE; mb.ids = v_.ids_ + t * K; mb.weights = v_.w_ + t * K;
         if (!moe_route(wt, g, l, K, mb, v_.mixed_ + t * N, cs, err, nullptr)) return false;
     }
+    if (dm && (v_.route_prior_ > 0.0f || v_.route_tail_skip_ > 0) && n * (int) K <= kDmCap) {   // opt-in routing changes
+        ResidentTabs held;
+        held.add(v_.dm_->res0 + l * g.n_expert);
+        if (v_.dm_->pdev >= 0) held.add(v_.dm_->res1 + l * g.n_expert);
+        for (const DecMoe::XPeer& x : v_.dm_->xp) held.add(x.res + l * g.n_expert);
+        PdlScope pt(false);
+        try {
+            if (v_.route_prior_ > 0.0f && NE == 512 && K == 10)   // the selection again, biased toward the held experts
+                route_prior_top10(v_.logits_, held, v_.route_prior_, v_.ids_, v_.w_, n, v_.dm_->route_counts, cs);
+        } catch (const std::exception& e) { err = "verify route-prior: " + std::string(e.what()); return false; }
+        if (v_.route_tail_skip_ > 0)   // then drop the tail experts no GPU holds
+            route_tail_skip(v_.ids_, v_.w_, held, n * (int) K, (int) K, v_.route_tail_skip_, (int) g.n_expert,
+                            v_.dm_->route_counts, cs);
+    }
     if (dm) {   // the tiers, CUDA0's plan, the q8_1 rows and the rings in one launch
         DmRouteArgs ra;
         ra.ids = v_.ids_; ra.x = xm; ra.n_tok = n; ra.k = (int) K; ra.n_embd = (int) N;
@@ -376,14 +367,9 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
                           v_.hits_.cache_base, v_.slot_off_d_, (long long) v_.hits_.blob,
                           v_.plan_, (long long) v_.max_t_ * K, v_.skip_,
                           (uint32_t) (l - v_.lb_ + 1), cs);
-        if (v_.remote_opt_)   // the helper GPUs reduce with the routing weights - publish them
-            doorbell_publish(xm, v_.ids_, v_.w_, (int64_t) n * N, (int64_t) n * K, v_.m_x_,
-                             v_.m_ids_, v_.m_w_, v_.m_seq_, cs);
-        else {
-            const int32_t* layer_res = v_.hits_.d_res != nullptr ? (v_.hits_.d_res + l * g.n_expert) : nullptr;
-            doorbell_publish_res(xm, v_.ids_, layer_res, (int) g.n_expert, (int64_t) n * N, (int64_t) n * K,
-                                 v_.m_x_, v_.m_ids_, v_.m_seq_, cs);
-        }
+        const int32_t* layer_res = v_.hits_.d_res != nullptr ? (v_.hits_.d_res + l * g.n_expert) : nullptr;
+        doorbell_publish_res(xm, v_.ids_, layer_res, (int) g.n_expert, (int64_t) n * N, (int64_t) n * K,
+                             v_.m_x_, v_.m_ids_, v_.m_seq_, cs);
     }
     stamp(l, 17);
     {

@@ -528,7 +528,7 @@ void check_q8_1_finite(cudaStream_t s, std::mt19937& rng) {
                 const float fd = k::f32_from_f16(gd), fs = k::f32_from_f16(gs);
                 bool ok = std::isfinite(fd) && std::isfinite(fs) && fd > 0.0f &&
                           ((os & 0x7c00) != 0x7c00 ? gs == os : std::fabs(fs) == 65504.0f && (fs < 0) == (sum < 0));
-                for (int i = 0; i < 32; ++i) ok = ok && (int8_t) g[4 + i] >= -127 && (int8_t) g[4 + i] <= 127;
+                for (int i = 0; i < 32; ++i) ok = ok && (int8_t) g[4 + i] >= -127;
                 if (ok) ++clamped;
                 else { ++bad; std::printf("  q8_1 path %d block %d: d %g sum %g not finite and clamped\n", path, b, fd, fs); }
             }

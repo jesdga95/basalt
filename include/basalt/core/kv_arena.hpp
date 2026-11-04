@@ -6,6 +6,7 @@
 // layout is page-major ([page][kv_head][page_size][...]), so the first `n` pages of every array are a prefix of it.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -32,6 +33,10 @@ public:
     /// the rows that follow the depth keep growing); `pages <= 0` lifts the cap.  A lower cap gives its excess back
     /// at the next `unmap`.  `cells()` counts a capped array as covering every cell once its cap is backed.
     void cap(size_t i, int64_t pages);
+    /// `map` splits each array's new backing at the grid lines of `cells` cells (0: one mapping per call), so a mapping
+    /// starts on a grid line or where an earlier `map` stopped; `unmap` gives back every mapping that starts at or above
+    /// its cut, however few calls backed it.
+    void set_extent_cells(int64_t cells) { extent_cells_ = std::max<int64_t>(cells, 0); }
     void close();
     bool valid() const { return !arrays_.empty(); }
 
@@ -72,6 +77,7 @@ private:
     int64_t pages_ = 0;
     int64_t page_cells_ = 0;
     int64_t cells_ = 0;
+    int64_t extent_cells_ = 0;
     uint64_t gran_ = 0;
 };
 

@@ -16,6 +16,7 @@ from serve.engine.mock import MockEngine
 from serve.engine.process import ProcessEngine
 from serve.frontend import ChatTemplate
 from serve.handler import serve
+from serve.server import open_when_ready
 from serve.service import Service
 from serve.util.text import ByteTokenizer
 
@@ -123,7 +124,8 @@ class Loading(unittest.TestCase):
 
     def test_start_up_load_serves_the_page_and_holds_requests_until_loaded(self):
         ready = threading.Event()
-        self.svc.start_load(ready.set)
+        self.svc.on_loaded = ready.set
+        self.svc.start_load()
         t, out = self.in_thread(self.chat)               # sent during the load
         self.wait_loading()
         with urllib.request.urlopen(self.base + "/", timeout=5) as r:     # the page is up
@@ -131,6 +133,36 @@ class Loading(unittest.TestCase):
         self.assertTrue(t.is_alive())                    # held, not answered
         self.finish(t, out)
         self.assertTrue(ready.wait(5))
+
+    def test_open_waits_for_the_load_and_fires_once(self):
+        opened, ready = [], threading.Event()
+        self.svc.on_loaded = ready.set
+        open_when_ready(self.svc, "http://x/", opener=opened.append)
+        self.svc.start_load()
+        self.assertTrue(self.engine.entered.wait(5))
+        self.assertEqual(opened, [])                     # still loading
+        self.engine.go.set()
+        self.assertTrue(ready.wait(5))
+        self.svc.on_loaded()                             # a later load or wake does not open it again
+        self.assertEqual(opened, ["http://x/"])
+
+    def test_open_does_not_fire_when_the_load_fails(self):
+        opened = []
+        open_when_ready(self.svc, "http://x/", opener=opened.append)
+        self.engine.fail = "no model"
+        self.svc.start_load()
+        self.assertTrue(self.engine.entered.wait(5))
+        self.engine.go.set()
+        deadline = time.time() + 5
+        while self.svc.boot_error is None and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertIsNotNone(self.svc.boot_error)
+        self.assertEqual(opened, [])
+
+    def test_open_is_immediate_without_a_start_up_load(self):
+        opened = []
+        open_when_ready(self.svc, "http://x/", now=True, opener=opened.append)
+        self.assertEqual(opened, ["http://x/"])
 
     def test_start_up_load_streams_after_the_wait(self):
         self.svc.start_load()
@@ -153,6 +185,8 @@ class Loading(unittest.TestCase):
 
     def test_failed_start_up_load_answers_waiting_requests_in_each_apis_shape(self):
         self.engine.fail = "the engine exited before it was ready"
+        loaded = []
+        self.svc.on_loaded = lambda: loaded.append(1)
         self.svc.start_load()
         results = {}
 
@@ -175,14 +209,19 @@ class Loading(unittest.TestCase):
             self.assertEqual(code, 503, name)
             self.assertIn("before it was ready", json.dumps(body), name)
         self.assertIsNotNone(self.svc.boot_error)
+        self.assertEqual(loaded, [])                     # a failed load announces nothing
         self.assertEqual(self.engine.restarts, 0)        # waiters did not start it again
         self.assertEqual(self.engine.tries, 1)           # the start-up load tries once
 
     def test_lazy_first_request_loads_through_the_same_state(self):
+        loaded = []
+        self.svc.on_loaded = lambda: loaded.append(1)
         t, out = self.in_thread(self.chat)               # no start_load: the request loads it
         self.wait_loading()
         self.assertEqual(self.engine.tries, 3)           # a reload keeps the retries
+        self.assertEqual(loaded, [])                     # the weights line waits for the load to end
         self.finish(t, out)
+        self.assertEqual(loaded, [1])
 
     def test_post_load_waits_in_the_same_state(self):
         t, out = self.in_thread(lambda: self.post("/load", {}))

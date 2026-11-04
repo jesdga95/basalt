@@ -3,9 +3,27 @@
 
 namespace basalt::program::serve {
 
+namespace {
+// the busy clock runs while a request or a batch window does
+struct BusyClock {
+    double& total;
+    bool& on;
+    Clock::time_point t0;
+    BusyClock(double& total_, bool& on_, Clock::time_point& from) : total(total_), on(on_), t0(Clock::now()) {
+        from = t0;
+        on = true;
+    }
+    ~BusyClock() {
+        total += std::chrono::duration<double>(Clock::now() - t0).count();
+        on = false;
+    }
+};
+}  // namespace
+
 Flow Runtime::dispatch() {
     if (batch_on() || (piped && pipe_inflight())) {
         if (!try_next_line(line)) {
+            const BusyClock busy(busy_s, busy_on, busy_from);
             if (!(piped ? pump(true) : batch_step())) return Flow::error;
             return Flow::next;
         }
@@ -13,13 +31,19 @@ Flow Runtime::dispatch() {
         if (piped && line.rfind("BSTOP ", 0) != 0 && !pipe_drain()) return Flow::error;
     } else {
         // idle: once no line has come for a second (a client's next turn usually comes sooner), what a crash would
-        // lose goes to disk, one conversation at a time while no line waits
-        bool got = false;
-        if (disk.enabled()) {
+        // lose goes to disk, then the idle conversations whose time is up leave VRAM, one at a time while no line
+        // waits
+        bool got = false, parking = true;
+        std::string pe;
+        while (!got && (disk.enabled() || parking)) {
             const int r = next_line_within(line, 1000);
             if (r < 0) return Flow::quit;
             got = r == 1;
-            while (!got && !(got = try_next_line(line)) && spill_to_disk(false, 1) > 0) {}
+            while (!got && !(got = try_next_line(line)) && disk.enabled() && spill_to_disk(false, 1) > 0) {}
+            if (got) break;
+            parking = parking && park_idle_engine(pe);
+            if (!pe.empty()) { std::printf("ERR %s\n", pe.c_str()); return Flow::error; }
+            if (!parking) break;
         }
         if (!got && !next_line(line)) return Flow::quit;
     }
@@ -201,6 +225,7 @@ Flow Runtime::dispatch() {
         BusyScope() { basalt::core::progress().busy.store(true); basalt::core::progress_at("request"); }
         ~BusyScope() { basalt::core::progress().busy.store(false); basalt::core::progress_at("idle"); }
     } busy_scope;
+    const BusyClock busy(busy_s, busy_on, busy_from);
     Request request(*this);
     return request.execute();
 }

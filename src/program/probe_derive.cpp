@@ -94,7 +94,7 @@ std::string suggest_saved_profile(const std::string& file, double base_tps, doub
     if (saved_tps > base_tps * (1.0 + band))
         return fmt("--expert-profile-save %s (adapt test %+.0f%%)", file.c_str(), (saved_tps / base_tps - 1.0) * 100.0);
     if (base_tps > saved_tps * (1.0 + band))
-        return fmt("no --expert-profile-save (adapt test %+.0f%% on the model's profile)", (base_tps / saved_tps - 1.0) * 100.0);
+        return fmt("no --expert-profile-save (adapt test %+.0f%% on the engine's profile)", (base_tps / saved_tps - 1.0) * 100.0);
     return "";
 }
 

@@ -86,20 +86,6 @@ int Runtime::kv_host_to_vram(int64_t at, int64_t live_c, std::string& pe, std::s
     return 1;
 }
 
-// the RAM homes the request's loan takes at its admission (Request::loan_homes), with the cache as it is now
-uint64_t Runtime::loan_home_bytes() {
-    int64_t c = 0;
-    if (kv_tail_copies || kv_floor <= 0 || lend_from <= 0 || pf_parts.empty() || pf_parts[0].first < 0 ||
-        !src.complement_ready() || loan_plan(xcache.slots(), c) >= lend_from)
-        return 0;
-    std::vector<std::pair<int32_t, int32_t>> give;
-    std::vector<int32_t> slots;
-    homes_wanted(xcache.slots(), give, slots);
-    uint64_t bytes = 0;
-    for (const auto& x : give) bytes += (uint64_t) basalt::kernels::cpu::expert_layout().blob_bytes(x.first);
-    return bytes;
-}
-
 // 1 admitted (in either mode), 0 refused (`e`, the engine stays up), -1 failed
 int Runtime::kv_host_admit(int64_t need, int64_t new_tokens, int64_t live_cells, int64_t read, std::string& e) {
     kv_host_late = false;
@@ -155,7 +141,6 @@ int Runtime::kv_host_admit(int64_t need, int64_t new_tokens, int64_t live_cells,
             basalt::log::warn("basalt serve", "host K/V: %s; the request keeps its K/V in VRAM", pe.c_str());
             return 1;
         }
-        const uint64_t homes0 = src.homes_bytes();
         if (!kv_pool.reserve(ss, g, plan.cells, pe) ||
             !basalt::core::session_kv_set_mode(ss, g, 1, &kv_pool, live_c, nullptr, pe)) {
             kv_pool.release();
@@ -167,26 +152,6 @@ int Runtime::kv_host_admit(int64_t need, int64_t new_tokens, int64_t live_cells,
             !cache_regrow(e) || !ver.sync_kv_mode(e))
             return -1;
         relend();   // the prompt path's layout follows the mode: its loan now carries the staging pool
-        // the RAM homes that loan takes next are charged, less those the take freed; short of RAM for them the
-        // request goes back to the VRAM tail
-        {
-            const uint64_t now = src.homes_bytes(), need_b = loan_home_bytes();
-            const uint64_t freed = homes0 > now ? homes0 - now : 0;
-            basalt::program::KvHostInputs got = in;
-            got.ram_kept += need_b > freed ? need_b - freed : 0;
-            if (got.ram_kept > in.ram_kept && !basalt::program::choose_kv_host(got).host) {
-                const int r = kv_host_to_vram(at, live_c, pe, e);
-                if (r < 0) return -1;
-                if (r > 0) {
-                    basalt::log::info("basalt serve", "host K/V: kept in VRAM (no RAM for the loan's RAM homes), "
-                                      "%lld cells, %.0f MiB of homes, %.2f GiB free, %.2f GiB kept free",
-                                      (long long) cells, (double) (need_b - freed) / 1048576.0,
-                                      (double) in.ram_available / 1073741824.0, (double) got.ram_kept / 1073741824.0);
-                    return 1;
-                }
-                basalt::log::warn("basalt serve", "host K/V: %s; the request streams from the pool it has", pe.c_str());
-            }
-        }
         if (!ver.warm_session(&ss, e)) return -1;
         said("streamed");
         return 1;

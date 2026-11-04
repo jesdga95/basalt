@@ -27,8 +27,7 @@ expert tier`:
   2,559 rows when it is slower (a slower card costs a longer chunk more than the experts it saves the main card's link).
   When its memory is faster than the main card's it takes a share of each GDN mixer and of the head (one start line
   each; see [the GDN split](../precision/gdn-split.md)).
-- **Idle.** Where a process gets no GPU-to-GPU access (Windows), the cards after the main one stay idle and a warning
-  says so. The engine runs up to three expert tiers: a fifth card and later ones stay idle.
+- **Idle.** The engine runs up to three expert tiers: a fifth card and later ones stay idle.
 
 Three or more cards are community-tested: the path is checked here on two cards, with two expert tiers sharing the
 second one. Reports from machines with three or four cards are welcome (see [community](../community.md)).
@@ -109,4 +108,4 @@ it holds.
 
 The server writes the engine's output, the `basalt ...` lines the engine prints at start and while it runs, to
 `~/.cache/basalt/<id>/engine.log`, one folder per model file (`<id>` is 16 hex digits taken from the model file).
-`[server] engine log: PATH` names it when the engine stops. The `[server]` lines are the server's own and go to its terminal.
+`[server] engine log: PATH` names it when the engine fails to start. The `[server]` lines are the server's own and go to its terminal.

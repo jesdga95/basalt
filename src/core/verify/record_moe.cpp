@@ -2,7 +2,6 @@
 #include "record.hpp"
 #include "expert_plan.hpp"
 #include "basalt/core/verify.hpp"
-#include "basalt/core/remote_expert_opt.hpp"
 #include "basalt/core/native_head.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/core/peer_experts.hpp"
@@ -73,7 +72,9 @@ bool Verifier::WindowRecorder::post(int64_t l) {
                 const int nr = qsa ? 6 : 3;
                 int r = 0;
                 auto add = [&](const void* p, uint64_t b) {
-                    if (p != nullptr && (b & ~15ull) != 0 && r < kLazyPfRanges) { pf.p[r] = p; pf.n[r++] = b & ~15ull; }
+                    if (p == nullptr || (b & ~15ull) == 0) return;
+                    if (r == kLazyPfRanges) { note_fallback("lazy L2 prefetch list full: a range is left out", kLazyPfRanges, qsa ? 1 : 0); return; }
+                    pf.p[r] = p; pf.n[r++] = b & ~15ull;
                 };
                 for (int i = 0; i < nr; ++i) {
                     const WeightRef* w = nv.get(qsa ? names_qsa[i] : names_gdn[i]);
@@ -82,6 +83,17 @@ bool Verifier::WindowRecorder::post(int64_t l) {
                         add(w->native_data, (uint64_t) iq_row_bytes(w->native_type, w->ne0) * (uint64_t) w->ne1);
                     else
                         add(w->data, w->bytes);
+                }
+                // then the FFN read's matrices: its 8-bit copies (codes and scales are one range), the router and
+                // the shared expert's gate row
+                for (const char* nm : {"hc_ffn_down.weight", "hc_ffn_inject.weight", "hc_ffn_up.weight"}) {
+                    const WeightRef* w = nv.get(nm);
+                    basalt::kernels::Hc8View hv;
+                    if (w != nullptr && basalt::kernels::hc8_view(w->data, hv)) add(hv.q, hv.bytes);
+                }
+                for (const char* nm : {"ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight"}) {
+                    const WeightRef* w = nv.get(nm);
+                    if (w != nullptr) add(w->data, w->bytes);
                 }
                 pf.ids = v_.ids_; pf.n_ids = n * (int) K; pf.n_expert = (int) g.n_expert; pf.ptab = v_.dm_->ptab0 + l * g.n_expert;
             }
@@ -158,11 +170,9 @@ bool Verifier::WindowRecorder::post(int64_t l) {
         } else {
             wait_flag_ge(v_.m_flag_, ring, cs);               // the CPU's share is in the mapped rows
             stamp(l, 23);
-            if (v_.remote_opt_)   // the helper's rows come back reduced; skip them as well
-                v_.remote_opt_->copy_rows(parts_out, v_.m_ymiss_, 0, n, p_dst, p_counts + 1, cs);
-            else   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
-                copy_rows_from_mapped(parts_out, v_.m_ymiss_, (int64_t) n * K, N,
-                                      p_dst, p_counts + 1, cs);
+            // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
+            copy_rows_from_mapped(parts_out, v_.m_ymiss_, (int64_t) n * K, N,
+                                  p_dst, p_counts + 1, cs);
         }
         moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
     }
@@ -196,8 +206,6 @@ bool Verifier::WindowRecorder::post(int64_t l) {
         mb.weights = v_.w_ + t * K; mb.shared = v_.shared_ + t * N;
         if (!moe_combine_parts(g, l, K, mb, v_.parts_ + (size_t) t * K * N, v_.bo_ + t * N, cs, err)) return false;
     }
-    if (v_.remote_opt_) v_.remote_opt_->combine(v_.bo_, v_.y_dummy_, 0, n,
-                          v_.device_plan_ ? v_.skip_ : nullptr, ring, cs);
     stamp(l, 24);
     if (l == g.n_layers - 1) {
         if (!fuse_head_gr) {

@@ -1,4 +1,5 @@
 // src/program/serve/request_decode.cpp - request decode operations.
+#include "reply_rows.hpp"
 #include "request.hpp"
 
 namespace basalt::program::serve {
@@ -13,6 +14,7 @@ Request::DecSnap Request::dec_snap() {
 // the verify windows: the first holds the last prompt token, with the rest of the last window
 Flow Request::decode() {
     if (runtime_.mtp_on && !runtime_.mtp.use_main(runtime_.err)) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }   // the windows between prompt chunks swapped it
+    if (!runtime_.peer_due_apply(runtime_.err)) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }
     p = fold_p0;
     x = (int32_t) ids[(size_t) fold_p0];
     {   // a request decoded here starts its adaptation from the experts its own prompt routed to
@@ -72,13 +74,14 @@ Flow Request::decode() {
     dec_windows = 0;
     dec_T = 0;
     decode_hits0 = runtime_.drive.d.cache_hits;
+    swapped0 = runtime_.xq_swapped;
+    noplace0 = runtime_.xq_noplace;
     // the RAM and file tiers of this request (the mmap source; 0 with the arena)
     ram0 = runtime_.src.ram_reads();
     files0 = runtime_.src.file_reads();
     file_bytes0 = runtime_.src.file_read_bytes();
     decode_look0 = runtime_.drive.d.cache_hits + runtime_.drive.d.cache_admitted + runtime_.drive.d.cache_refused;
     offload0 = runtime_.drive.d.offload_entries;
-    static const bool chain = basalt::core::Verifier::chain_on();
     adapt_age = 2;   // loop tops since the last adaptive round
     applied_early = false;
 
@@ -165,7 +168,7 @@ Flow Request::decode() {
             copy_live = false;
         }
         ++adapt_age;
-        if (!chain || (adapt_age >= 2 && !(applied_early && adapt_age == 2))) {
+        if (adapt_age >= 2 && !(applied_early && adapt_age == 2)) {
             if (!runtime_.pending.empty()) basalt::core::decode_events().tag(1u << 1);
             runtime_.apply_pending(true);
         }
@@ -211,9 +214,82 @@ Flow Request::decode() {
         }
         basalt::core::decode_gaps().mark(19);
         basalt::core::decode_events().stamp(3);
+        // the window's adaptive step, decided before it runs (the window changes none of its inputs)
+        bool adapt_ok = true;
+        const bool do_adapt = !runtime_.drive.d.usage.empty() && ((runtime_.rounds + 1) % runtime_.o.adapt_every) == 0 &&
+                              (runtime_.adapt_fast ? runtime_.xq_stage == 0
+                                          : (runtime_.pending.empty() && !copy_live && !runtime_.src.exchanges_staged()));
+        // A fast step starts once the window's last layer is served (`early`): a round ranks its swaps then, from the
+        // window's routing counts and host tables that nothing else changes before the step ends; the step's copies
+        // and residency changes wait for adapt_go, given after the draft's launch.
+        bool adapt_early = false;
+        std::atomic<int> adapt_go{0};   // 1 go, 2 dropped (the window failed)
+        auto spawn_adapt = [&](bool early) {
+            if (runtime_.adapt_fast) {   // a round, or the next step of the one in flight, beside the draft
+                if (!do_adapt && runtime_.xq_stage == 0) return;
+                if (do_adapt) adapt_age = 0;
+                basalt::core::decode_events().tag(1u << 0);
+                basalt::core::decode_events().tag(1u << (6 + runtime_.xq_stage));
+                adapt_early = early;
+                adapt_thr.run([&, early] {
+                    auto ms = [](Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); };
+                    const auto ta = Clock::now();
+                    basalt::core::decode_events().stamp(8);
+                    std::vector<Runtime::Swap> ranked;
+                    const bool pre = early && runtime_.xq_stage == 0;
+                    if (pre) runtime_.rank_swaps(ranked, runtime_.xq_across);
+                    const double ms_pre = ms(ta);
+                    for (unsigned spins = 0; early && adapt_go.load(std::memory_order_acquire) == 0; ++spins) {
+                        if (spins < 20000) basalt::platform::cpu_relax();
+                        else std::this_thread::yield();
+                    }
+                    if (early && adapt_go.load(std::memory_order_acquire) != 1) return;
+                    const auto tb = Clock::now();
+                    adapt_ok = runtime_.xq_stage != 0 ? runtime_.xq_advance(false) : runtime_.xq_round(pre ? &ranked : nullptr);
+                    basalt::core::decode_events().stamp(6);
+                    std::string perr;
+                    if (adapt_ok && !runtime_.ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
+                    basalt::core::decode_events().stamp(7);
+                    basalt::core::decode_gaps().hms[20] += ms_pre + ms(tb);
+                });
+                return;
+            }
+            if (!do_adapt) return;
+            adapt_age = 0;
+            adapt_thr.run([&] {
+                const auto ta = Clock::now();
+                adapt_ok = runtime_.adapt();
+                if (adapt_ok) {   // the evictions' residency, uploaded beside the draft
+                    std::string perr;
+                    if (!runtime_.ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
+                }
+                basalt::core::decode_gaps().hms[20] += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
+            });
+        };
+        // the step's end: an early step not given its go by then is dropped; it refers to this scope, so every way out
+        // of the window ends it
+        struct AdaptEnd {
+            JobRunner& thr;
+            std::atomic<int>& go;
+            const bool& early;
+            void operator()() {
+                int wait = 0;
+                if (early) go.compare_exchange_strong(wait, 2);
+                if (thr.joinable()) thr.join();
+            }
+            ~AdaptEnd() { (*this)(); }
+        } adapt_end{adapt_thr, adapt_go, adapt_early};
+        // the plain rounds copy into the slots at once, so they start after the window; a paired window is held or not
+        // only once it has run
+        if (runtime_.adapt_fast && !held.on && !try_pair) cv->set_served_hook([&] { spawn_adapt(true); });
         const Clock::time_point tw0 = Clock::now();
         void* const user_c = cv == &runtime_.ver ? runtime_.win_pool_user : (void*) &runtime_.split_drive_b;
         void* const user_o = cv == &runtime_.ver ? (void*) &runtime_.split_drive_b : runtime_.win_pool_user;
+        // the prompt rows the first window folds in send no pick: the head scores them only roughly (exact logits
+        // are kept where something reads them: a scored chunk, the logit-hash diagnostic, and a sampled window's
+        // kept lists, which the drafter notes as candidates)
+        if (first_window && e0 > 0 && ppl == nullptr && !runtime_.logit_hash && req_temperature <= 0.0f)
+            cv->set_head_from(e0);
         const bool ran = held.on ? true
             : try_pair ? cv->run_pair(*ov, T, window.data(), p, guess, win_b.data(), TB, runtime_.win_pool_fn, user_c, user_o,
                                       outv.data(), runtime_.err)
@@ -319,7 +395,7 @@ Flow Request::decode() {
                 // top_k, top_p, then temperature over the survivors: the sampler chain without penalties
                 std::vector<int> ord((size_t) runtime_.n_vocab);
                 for (int i = 0; i < runtime_.n_vocab; ++i) ord[(size_t) i] = i;
-                const int K = std::max(1, std::min<int>(req_top_k > 0 ? req_top_k : 20, (int) runtime_.n_vocab));
+                const int K = basalt::kernels::sampler_list_len(req_top_k, (int) runtime_.n_vocab);
                 std::partial_sort(ord.begin(), ord.begin() + K, ord.end(), [&](int x, int y) {
                     return lg[(size_t) x] > lg[(size_t) y] || (lg[(size_t) x] == lg[(size_t) y] && x < y);
                 });
@@ -343,229 +419,138 @@ Flow Request::decode() {
         }
         tk_valid = false;
         const Clock::time_point tw1 = Clock::now();
-        bool adapt_ok = true;
-        const bool do_adapt = !runtime_.drive.d.usage.empty() && ((runtime_.rounds + 1) % runtime_.o.adapt_every) == 0 &&
-                              (runtime_.adapt_fast ? runtime_.xq_stage == 0
-                                          : (!chain || (runtime_.pending.empty() && !copy_live && !runtime_.src.exchanges_staged())));
-        auto spawn_adapt = [&] {
-            if (runtime_.adapt_fast) {   // a round, or the next step of the one in flight, beside the draft
-                if (!do_adapt && runtime_.xq_stage == 0) return;
-                if (do_adapt) adapt_age = 0;
-                basalt::core::decode_events().tag(1u << 0);
-                basalt::core::decode_events().tag(1u << (6 + runtime_.xq_stage));
-                adapt_thr.run([&] {
-                    const auto ta = Clock::now();
-                    basalt::core::decode_events().stamp(8);
-                    adapt_ok = runtime_.xq_stage != 0 ? runtime_.xq_advance(false) : runtime_.xq_round();
-                    basalt::core::decode_events().stamp(6);
-                    std::string perr;
-                    if (adapt_ok && !runtime_.ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
-                    basalt::core::decode_events().stamp(7);
-                    basalt::core::decode_gaps().hms[20] += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
+        // the picks this window sends and the rows it keeps: a window that ends the reply keeps no row past its
+        // last pick, and that pick is the next token, as at any window's end
+        const ReplyRows rr = reply_rows(outv.data(), e0, a, produced_n, max_new, runtime_.o.eos_ids, ppl != nullptr);
+        const int keep = rr.keep;
+        // the draft launches first; the commit, the adaptive round and the output go in its shadow
+        const bool will_draft = !rr.ends && produced_n + rr.emit < max_new;
+        float wprob[16];
+        const int wprob_n = std::min(runtime_.S_mtp, 16);
+        if (draft_log != nullptr)
+            for (int i = 0; i < wprob_n; ++i) wprob[i] = first_window || from_sfx ? -1.0f : dprob[(size_t) i];
+        // the adaptive round and the swaps' residency, beside the commit and the draft
+        auto adapt_side = [&] {
+            if (adapt_early) adapt_go.store(1, std::memory_order_release);
+            else spawn_adapt(false);
+            // the swaps' residency at the next window, then their RAM copies a share per draft
+            applied_early = adapt_age == 1 && !do_adapt && !runtime_.pending.empty();
+            if (applied_early || copy_live) {
+                const bool boundary = applied_early, copies = applied_early || copy_live;
+                if (copies) {
+                    copy_live = true;
+                    copy_done = false;
+                }
+                basalt::core::decode_events().tag(1u << 2);
+                apply_thr.run([&, boundary, copies] {
+                    if (boundary) {
+                        runtime_.apply_pending(true, false);
+                        std::string perr;
+                        if (!runtime_.ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
+                    }
+                    if (copies) copy_done = !runtime_.src.exchanges_staged() || runtime_.src.copy_exchanges(8ull << 20);
                 });
-                return;
             }
-            if (!do_adapt) return;
-            adapt_age = 0;
-            adapt_thr.run([&] {
-                const auto ta = Clock::now();
-                adapt_ok = runtime_.adapt();
-                if (chain && adapt_ok) {   // the evictions' residency, uploaded beside the draft
-                    std::string perr;
-                    if (!runtime_.ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
-                }
-                basalt::core::decode_gaps().hms[20] += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
-            });
         };
-        if (chain) {
-            // the draft launches first; the commit, the adaptive round and the output go in its shadow
-            int n_emit = 0;
-            bool eos_pre = false;
-            for (int i = e0; i <= a && produced_n + n_emit < max_new && !eos_pre; ++i) {
-                ++n_emit;
-                eos_pre = ppl == nullptr &&
-                          std::find(runtime_.o.eos_ids.begin(), runtime_.o.eos_ids.end(), (int64_t) outv[(size_t) i]) != runtime_.o.eos_ids.end();
-            }
-            const bool will_draft = !eos_pre && produced_n + n_emit < max_new;
-            float wprob[16];
-            const int wprob_n = std::min(runtime_.S_mtp, 16);
-            if (draft_log != nullptr)
-                for (int i = 0; i < wprob_n; ++i) wprob[i] = first_window || from_sfx ? -1.0f : dprob[(size_t) i];
-            // the adaptive round and the swaps' residency, beside the commit and the draft
-            auto adapt_side = [&] {
-                spawn_adapt();
-                // the swaps' residency at the next window, then their RAM copies a share per draft
-                applied_early = adapt_age == 1 && !do_adapt && !runtime_.pending.empty();
-                if (applied_early || copy_live) {
-                    const bool boundary = applied_early, copies = applied_early || copy_live;
-                    if (copies) {
-                        copy_live = true;
-                        copy_done = false;
-                    }
-                    basalt::core::decode_events().tag(1u << 2);
-                    apply_thr.run([&, boundary, copies] {
-                        if (boundary) {
-                            runtime_.apply_pending(true, false);
-                            std::string perr;
-                            if (!runtime_.ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
-                        }
-                        if (copies) copy_done = !runtime_.src.exchanges_staged() || runtime_.src.copy_exchanges(8ull << 20);
-                    });
-                }
-            };
-            basalt::core::decode_events().stamp(9);
-            if (!hold && !cv->commit(a + 1, runtime_.err, 2)) {
-                std::printf("ERR %s\n", runtime_.err.c_str());
-                return Flow::error;
-            }
-            for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
-            draft_offered += T - 1 - e0;
-            draft_accepted += a - e0;
-            first_window = false;
-            bool commit_ok = true, after_ran = false, eos = false;
-            std::string cerr;
-            auto after_launch = [&] {
-                after_ran = true;
-                commit_ok = hold ? true : cv->commit(a + 1, cerr, 1);
-                if (!hold) adapt_side();
-                for (int i = e0; i <= a && produced_n < max_new && !eos; ++i) {
-                    std::printf("T %d\n", (int) outv[(size_t) i]);
-                    basalt::core::progress_beat();
-                    ++produced_n;
-                    if (runtime_.o.suffix_draft > 0) runtime_.sfx->append(outv[(size_t) i]);
-                    eos = ppl == nullptr &&
-                          std::find(runtime_.o.eos_ids.begin(), runtime_.o.eos_ids.end(), (int64_t) outv[(size_t) i]) != runtime_.o.eos_ids.end();
-                }
-                std::fflush(stdout);
-            };
-            ++runtime_.rounds;
-            const Clock::time_point tw2 = Clock::now();
-            basalt::core::decode_gaps().mark(5);
-            if (!from_sfx && e0 == 0) cum_adapt.observe(dprob.data(), T - 1, a);
-            runtime_.mtp.set_cum_th(cum_adapt.th());
-            bool drafted = true;
-            if (hold) {
-                // the tokens go out; the next window's last stage runs behind this window's commit while its first
-                // stage finishes, and the drafter (on the first card) takes this window's rows once that card is
-                // free
-                ++pair_holds;
-                if (!cv->pair_hold_commit(T, runtime_.err)) {
-                    std::printf("ERR %s\n", runtime_.err.c_str());
-                    return Flow::error;
-                }
-                after_launch();
-                const float* staged = nullptr;
-                drafted = runtime_.mtp.stage_rows(cv->final_R_all(), T, &staged, runtime_.err);   // before the last card is busy again
-                if (!drafted || !cv->pair_hold_begin(*ov, T, p, TB, win_b.data(), runtime_.err) ||
-                    !cv->pair_hold_finish_first(*ov, runtime_.win_pool_fn, user_o, runtime_.err) ||
-                    !(drafted = runtime_.mtp.prefill(staged, outv.data(), T, p, runtime_.err))) {
-                    std::printf("ERR %s\n", runtime_.err.c_str());
-                    return Flow::error;
-                }
-                if (!cv->pair_hold_finish(*ov, runtime_.win_pool_fn, user_o, held.out.data(), runtime_.err) || runtime_.drive.d.failed) {
-                    std::printf("ERR %s\n", runtime_.drive.d.failed && runtime_.drive.d.fail ? runtime_.drive.d.fail : runtime_.err.c_str());
-                    return Flow::error;
-                }
-                held.on = true;
-                held.T = TB;
-                for (int i = 0; i < TB; ++i) held.win[(size_t) i] = win_b[(size_t) i];
-                std::swap(cv, ov);
-            } else if (will_draft && runtime_.mtp_on) {
-                runtime_.mtp.set_launch_hook(after_launch);
-                pair_hint = pair_req && full_ema >= kPairFull;
-                runtime_.mtp.set_cum_th(pair_hint ? cum_adapt.th() * kPairChainScale : cum_adapt.th());
-                runtime_.mtp.set_host_th(cum_adapt.th());
-                drafted = runtime_.mtp.draft_from(cv->final_R_all(), T, outv.data(), p, a, drafts.data(), runtime_.err, dprob.data(), &n_chain);
-                runtime_.mtp.set_launch_hook(nullptr);
-                if (drafted && runtime_.pipe_on) {   // the next window's first stage starts after the chain's kernels
-                    const cudaEvent_t ev = runtime_.mtp.done_event();
-                    runtime_.ver.set_wait_event(ev);
-                    runtime_.ver_b.set_wait_event(ev);
-                }
-                if (tk_log != nullptr && drafted) {
-                    for (int j = 0; j < 16 && j < runtime_.S_mtp; ++j) {
-                        tk_prev[j].n = runtime_.mtp.diag_top(j, 4, tk_prev[j].id, tk_prev[j].p);
-                    }
-                    tk_valid = true;
-                }
-            }
-            if (!after_ran) after_launch();
-            basalt::core::decode_events().stamp(0);
-            {
-                const Clock::time_point tw3 = Clock::now();
-                auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
-                dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
-                ++dec_windows; dec_T += T;
-                if (draft_log != nullptr) {
-                    std::fprintf(draft_log, "W %d %d %d %.3f %.3f %.3f", T, a, from_sfx ? 1 : 0, msd(round0, tw0),
-                                 msd(tw0, tw1), msd(tw1, tw3));
-                    for (int i = 0; i < wprob_n; ++i) std::fprintf(draft_log, " %.4f", wprob[i]);
-                    std::fputc('\n', draft_log);
-                }
-            }
-            if (adapt_thr.joinable()) adapt_thr.join();
-            basalt::core::decode_events().stamp(1);
-            basalt::core::decode_gaps().mark(16);
-            if (!commit_ok) {
-                std::printf("ERR %s\n", cerr.c_str());
-                return Flow::error;
-            }
-            if (!adapt_ok) {
-                std::printf("ERR an adaptive refill failed\n");
-                return Flow::error;
-            }
-            if (!drafted) {
-                std::printf("ERR %s\n", runtime_.err.c_str());
-                return Flow::error;
-            }
-            if (timed_round && !eos)
-                runtime_.policy->observe(from_sfx, T, a, sfx_match,
-                               std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
-            basalt::core::decode_gaps().mark(17);
-            if (eos) { finish = "stop"; break; }
-            runtime_.shed_if_low();
-            if (runtime_.halted()) { finish = "cancel"; break; }
-            x = outv[(size_t) a];
-            p += a + 1;
-            basalt::core::decode_events().stamp(2);
-            continue;
-        }
-        spawn_adapt();
-        if (!runtime_.ver.commit(a + 1, runtime_.err)) {
-            if (adapt_thr.joinable()) adapt_thr.join();
+        basalt::core::decode_events().stamp(9);
+        if (!hold && !cv->commit(keep, runtime_.err, 2)) {
             std::printf("ERR %s\n", runtime_.err.c_str());
             return Flow::error;
         }
-        // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
-        for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+        for (int i = 0; i < keep; ++i) consumed.push_back(window[(size_t) i]);
         draft_offered += T - 1 - e0;
         draft_accepted += a - e0;
         first_window = false;
-        bool eos = false;
-        for (int i = e0; i <= a && produced_n < max_new && !eos; ++i) {
-            std::printf("T %d\n", (int) outv[(size_t) i]);
-            basalt::core::progress_beat();
-            ++produced_n;
-            if (runtime_.o.suffix_draft > 0) runtime_.sfx->append(outv[(size_t) i]);
-            eos = ppl == nullptr &&
-                  std::find(runtime_.o.eos_ids.begin(), runtime_.o.eos_ids.end(), (int64_t) outv[(size_t) i]) != runtime_.o.eos_ids.end();
-        }
-        std::fflush(stdout);
+        bool commit_ok = true, after_ran = false, eos = false;
+        std::string cerr;
+        auto after_launch = [&] {
+            after_ran = true;
+            commit_ok = hold ? true : cv->commit(keep, cerr, 1);
+            if (!hold) adapt_side();
+            for (int i = e0; i <= a && produced_n < max_new && !eos; ++i) {
+                std::printf("T %d\n", (int) outv[(size_t) i]);
+                basalt::core::progress_beat();
+                ++produced_n;
+                if (runtime_.o.suffix_draft > 0) runtime_.sfx->append(outv[(size_t) i]);
+                eos = ppl == nullptr &&
+                      std::find(runtime_.o.eos_ids.begin(), runtime_.o.eos_ids.end(), (int64_t) outv[(size_t) i]) != runtime_.o.eos_ids.end();
+            }
+            std::fflush(stdout);
+        };
         ++runtime_.rounds;
         const Clock::time_point tw2 = Clock::now();
         basalt::core::decode_gaps().mark(5);
         if (!from_sfx && e0 == 0) cum_adapt.observe(dprob.data(), T - 1, a);
         runtime_.mtp.set_cum_th(cum_adapt.th());
-        const bool drafted = eos || produced_n >= max_new || !runtime_.mtp_on ||
-                             runtime_.mtp.draft(T, outv.data(), p, a, drafts.data(), runtime_.err, dprob.data());
+        bool drafted = true;
+        if (hold) {
+            // the tokens go out; the next window's last stage runs behind this window's commit while its first
+            // stage finishes, and the drafter (on the first card) takes this window's rows once that card is
+            // free
+            ++pair_holds;
+            if (!cv->pair_hold_commit(T, runtime_.err)) {
+                std::printf("ERR %s\n", runtime_.err.c_str());
+                return Flow::error;
+            }
+            after_launch();
+            const float* staged = nullptr;
+            drafted = runtime_.mtp.stage_rows(cv->final_R_all(), T, &staged, runtime_.err);   // before the last card is busy again
+            if (!drafted || !cv->pair_hold_begin(*ov, T, p, TB, win_b.data(), runtime_.err) ||
+                !cv->pair_hold_finish_first(*ov, runtime_.win_pool_fn, user_o, runtime_.err) ||
+                !(drafted = runtime_.mtp.prefill(staged, outv.data(), T, p, runtime_.err))) {
+                std::printf("ERR %s\n", runtime_.err.c_str());
+                return Flow::error;
+            }
+            if (!cv->pair_hold_finish(*ov, runtime_.win_pool_fn, user_o, held.out.data(), runtime_.err) || runtime_.drive.d.failed) {
+                std::printf("ERR %s\n", runtime_.drive.d.failed && runtime_.drive.d.fail ? runtime_.drive.d.fail : runtime_.err.c_str());
+                return Flow::error;
+            }
+            held.on = true;
+            held.T = TB;
+            for (int i = 0; i < TB; ++i) held.win[(size_t) i] = win_b[(size_t) i];
+            std::swap(cv, ov);
+        } else if (will_draft && runtime_.mtp_on) {
+            runtime_.mtp.set_launch_hook(after_launch);
+            pair_hint = pair_req && full_ema >= kPairFull;
+            runtime_.mtp.set_cum_th(pair_hint ? cum_adapt.th() * kPairChainScale : cum_adapt.th());
+            runtime_.mtp.set_host_th(cum_adapt.th());
+            if (const int32_t* top = cv->top_ids())
+                runtime_.mtp.note_candidates(top, (a + 1) * basalt::core::Verifier::kTopIds);
+            drafted = runtime_.mtp.draft_from(cv->final_R_all(), T, outv.data(), p, a, drafts.data(), runtime_.err, dprob.data(), &n_chain);
+            runtime_.mtp.set_launch_hook(nullptr);
+            if (drafted && runtime_.pipe_on) {   // the next window's first stage starts after the chain's kernels
+                const cudaEvent_t ev = runtime_.mtp.done_event();
+                runtime_.ver.set_wait_event(ev);
+                runtime_.ver_b.set_wait_event(ev);
+            }
+            if (tk_log != nullptr && drafted) {
+                for (int j = 0; j < 16 && j < runtime_.S_mtp; ++j) {
+                    tk_prev[j].n = runtime_.mtp.diag_top(j, 4, tk_prev[j].id, tk_prev[j].p);
+                }
+                tk_valid = true;
+            }
+        }
+        if (!after_ran) after_launch();
+        basalt::core::decode_events().stamp(0);
         {
             const Clock::time_point tw3 = Clock::now();
             auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
             dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
             ++dec_windows; dec_T += T;
+            if (draft_log != nullptr) {
+                std::fprintf(draft_log, "W %d %d %d %.3f %.3f %.3f", T, a, from_sfx ? 1 : 0, msd(round0, tw0),
+                             msd(tw0, tw1), msd(tw1, tw3));
+                for (int i = 0; i < wprob_n; ++i) std::fprintf(draft_log, " %.4f", wprob[i]);
+                std::fputc('\n', draft_log);
+            }
         }
-        if (adapt_thr.joinable()) adapt_thr.join();
+        adapt_end();
+        basalt::core::decode_events().stamp(1);
         basalt::core::decode_gaps().mark(16);
+        if (!commit_ok) {
+            std::printf("ERR %s\n", cerr.c_str());
+            return Flow::error;
+        }
         if (!adapt_ok) {
             std::printf("ERR an adaptive refill failed\n");
             return Flow::error;
@@ -581,8 +566,9 @@ Flow Request::decode() {
         if (eos) { finish = "stop"; break; }
         runtime_.shed_if_low();
         if (runtime_.halted()) { finish = "cancel"; break; }
-        x = outv[(size_t) a];
-        p += a + 1;
+        x = outv[(size_t) keep - 1];
+        p += keep;
+        basalt::core::decode_events().stamp(2);
     }
     if (gguard != nullptr)
         basalt::log::info("basalt grammar", "%lld windows checked, %lld masked resamples, %.3f ms in grammar code (%.2f us/window)",

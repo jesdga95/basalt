@@ -19,7 +19,8 @@ target_compile_options(warnings INTERFACE
 if(WERROR)
   target_compile_options(warnings INTERFACE
     $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/WX>
-    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Werror>)
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Werror>
+    $<$<COMPILE_LANGUAGE:CUDA>:SHELL:--Werror all-warnings>)
 endif()
 
 # The file, memory and process calls the engine makes, so the Win32 and POSIX spellings live in one place.

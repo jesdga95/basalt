@@ -13,9 +13,20 @@ slots on a side stream, and the next window uses them (each layer waits only for
 only once the last one has landed, so "every window" means one round about every three windows. After each round
 every count is multiplied by the decay, so recent routing outweighs old.
 
-On one card without a peer tier the round ranks every layer together, so a layer that routes to more experts takes
-slots from the layers that route to fewer. With a peer card the main card takes its share first and the peer card then
-takes the next most-routed experts the main card does not hold. A layer split ranks each stage's own layers.
+The main card's round ranks every layer together, so a layer that routes to more experts takes slots from the layers
+that route to fewer; an expert the peer card holds needs a larger count to move to the main card, and the expert the
+main card gives up for it takes its peer slot, whatever its layer, so no expert sits on both cards. With a peer card
+the main card takes its share first and the peer card then takes the next most-routed experts the main card does not
+hold, layer by layer. Exclusive peer placement and a layer split rank layer by layer. On two cards (400 W + 180 W, cold
+prose, four seeds) ranking every layer together cut the window cost by 1.9% at the same window widths, and by 6-15% in
+a request's first 50 windows. A promotion that kept its peer copy cost the GPUs one expert each: after a long JSON
+reply a fifth of the peer's slots held such copies, and in the standard bench order on one server (conv, struct,
+prose; four seeds) prose ran 269 tok/s and struct 562, against 284 and 573 with the slot handed over.
+A round that ranks fewer swaps than `adapt-swaps` spends up to 16 of the rest on CPU-tier experts routed about once
+lately (a count from 1 up to the ranking's floor), each against a resident expert at least one routing below it: prose touches
+many experts a few times each, and those stay on the CPU under the main ranking. On two cards (400 W + 180 W, cold
+prose, two seeds) it cut the window cost at the same window widths by about 3% after the first 150 windows; without
+the limit of 16 a JSON reply ran 1.2% slower.
 
 Moving an expert changes which tier computes its rows (the CPU rounds differently from the GPU), so output with
 adaptation on is not bit-identical from run to run; see [precision](../precision/index.md).

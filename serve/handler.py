@@ -8,6 +8,7 @@ import socket
 import sys
 import threading
 import time
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -15,14 +16,15 @@ from serve.api import responses as responses_api
 from serve.api.responses import error_body as responses_error_body
 from serve import ROOT
 from serve.api.anthropic import anthropic_collect, anthropic_events
-from serve.engine.errors import EngineDied, EngineStarting, EngineStuck, GpuBusy, ModelBusy
+from serve.engine.errors import EngineDied, EngineError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, checked as checked_bias
+from serve.config import checked_sampling
 from serve.frontend import anthropic_to_messages, forced_call, openai_to_messages
 from serve.api.openai import openai_chunks, openai_collect
 from serve.api.responses import ResponsesError
 from serve.prompt import primed
-from serve.security import host_allowed, host_names_for, key_matches, origin_allowed
+from serve.security import host_allowed, host_names_for, key_matches, origin_allowed, peer_of, remote_reason
 from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, Service, _debug_req
 from serve.api.structured import anthropic_format, check_format
 from serve.util.text import stop_strings
@@ -142,6 +144,11 @@ def make_handler(svc: Service):
                 self._json(415, {"error": {"message": "send application/json"}})
                 return True
             return False
+
+        def _image_access(self):
+            """What this request may name as an image, from its own connection."""
+            why = "remote-only" if svc.image_sources.remote_only else remote_reason(self.client_address, self.headers)
+            return replace(svc.image_sources, local=not why, why=why, peer=peer_of(self.client_address))
 
         def _watch_client(self, cancel: threading.Event) -> None:
             """Cancel the request when its client hangs up, polling every 0.5 s: a readable socket with nothing to
@@ -389,6 +396,11 @@ def make_handler(svc: Service):
                     self._count_tokens(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
+            except EngineError as e:                         # the engine failed: not the request's fault
+                if path == "/v1/responses":
+                    self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
+                else:
+                    self._json(500, {"error": {"type": "server_error", "message": str(e)}})
             except BadBody as e:
                 if path == "/v1/responses":
                     self._json(e.status, responses_error_body(str(e)))
@@ -524,17 +536,18 @@ def make_handler(svc: Service):
         def _openai(self, req):
             messages, tools, kw = openai_to_messages(req)
             tools, force = forced_call(req.get("tool_choice"), tools)   # a bad choice is a 400 before streaming
-            if check_format(req.get("response_format")) and tools:
-                raise ValueError("structured response_format with tools is not supported")
+            check_format(req.get("response_format"))
             svc.require_grammar(req.get("response_format"))
             svc.load()
+            checked_sampling(req)                             # a sampling value out of range is a 400 likewise
             req[BIAS_KEY] = checked_bias(req, svc.engine)     # a bad logit_bias is a 400 before streaming
             req[GRAMMAR_KEY] = svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"),
                                                req.get("response_format"))
             max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             stop_strings(req)                                 # likewise a bad stop
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force,
+                                                 image_access=self._image_access())
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)
@@ -587,6 +600,8 @@ def make_handler(svc: Service):
                     yield from asm.finish(done)
             try:
                 items = primed(events(), ids)
+            except EngineError:
+                raise
             except ValueError as e:                          # too long for the context: found when the engine counted
                 err = ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None)
                 return self._json(err.status, err.body())
@@ -596,8 +611,11 @@ def make_handler(svc: Service):
                 except EngineDied as e:
                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
                                                                 code="server_error"))
-                except ValueError as e:                      # the engine's ERR line
+                except EngineError as e:                     # the engine failed
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
+                except ValueError as e:                      # the engine refused the request
+                    err = ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None)
+                    return self._json(err.status, err.body())
                 return self._json(200, result)
             self._sse()
             last = time.monotonic()
@@ -645,12 +663,9 @@ def make_handler(svc: Service):
                 raise ResponsesError(str(e), "tool_choice") from None
             kw = responses_api.template_kwargs(req)
             try:
-                structured = check_format(responses_api.text_format(req))
+                check_format(responses_api.text_format(req))
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
-            if structured and tools:
-                raise ResponsesError("a JSON text.format with tools is not supported", "text.format",
-                                     "unsupported_parameter")
             try:
                 svc.require_grammar(responses_api.text_format(req))
             except ValueError as e:
@@ -666,12 +681,17 @@ def make_handler(svc: Service):
             except ValueError as e:
                 raise ResponsesError(str(e), "reasoning_budget_tokens") from None
             try:
+                checked_sampling(req)
+            except ValueError as e:
+                raise ResponsesError(str(e), str(e).split(":")[0]) from None
+            try:
                 stop_strings(req)
             except ValueError as e:
                 raise ResponsesError(str(e), "stop") from None
             svc.load()
             try:
-                ids, thinking, max_new = svc.prepare(messages, tools, kw, req.get("max_output_tokens") or 0, force=force)
+                ids, thinking, max_new = svc.prepare(messages, tools, kw, req.get("max_output_tokens") or 0, force=force,
+                                                     image_access=self._image_access())
             except ResponsesError:
                 raise
             except ValueError as e:                          # too long for the context, or an image without vision
@@ -696,16 +716,16 @@ def make_handler(svc: Service):
             tools, force = forced_call(req.get("tool_choice"), tools)   # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             response_format = anthropic_format(req)            # structured outputs
-            if response_format and tools:
-                raise ValueError("a JSON output format with tools is not supported")
             try:
                 svc.require_grammar(response_format)
             except ValueError as e:
                 raise ValueError(str(e).replace("response_format json_schema and json_object", "output_config.format json_schema")) from None
             req[GRAMMAR_KEY] = svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"), response_format)
             svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
+            checked_sampling(req)                             # likewise a sampling value out of range
             stop_strings(req)                                 # likewise a bad stop
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force,
+                                                 image_access=self._image_access())
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)

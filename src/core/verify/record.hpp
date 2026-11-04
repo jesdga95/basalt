@@ -20,6 +20,7 @@ struct Verifier::WindowRecorder {
 
     bool run();
     bool inputs();
+    bool ple_fork();
     bool pre(int64_t l);
     bool gdn(int64_t l, const LayerView& v, bool read_q8, bool gs_split);
     bool qsa(int64_t l, const LayerView& v, bool read_q8);
@@ -60,6 +61,7 @@ struct Verifier::WindowRecorder {
     const int hrow0 = v_.batch_rec_ ? v_.row_base_ : 0;   // a slot group's own hand-off rows
 
     bool ple_side = false;
+    bool ple_open = false;   // the PLE side branch is forked and not joined yet
     const int32_t* pos_k = nullptr;
     const int32_t* pos_i = nullptr;
     const int64_t HB = Verifier::handoff_floats(g);

@@ -58,26 +58,6 @@ cache short of the expert set, or at under half of what it would hold without th
 does not fit at all, the engine says which slot (`warning: --batch N: slot K's session does not fit`) and starts with
 the slots that did fit; if fewer than two fit, `--batch is off` and the server runs one request at a time.
 
-- `server` holds the server's options (`python -m serve.server --help`), named as the flags without the dashes:
-  strings or numbers, `true`/`false` for a switch (`lazy`, ...), a list for the repeatable ones
-  (`allowed-host`, `cors-origin`). `model` and `tokenizer` paths are relative to the file.
-- `engine` holds engine flags (`bin/basalt --help`), the same way: a string or number, `true` for a switch, `false` to
-  leave it off, a list for a flag with several values (`"control-vector-layer-range": [4, 44]`). Any flag the engine
-  accepts works, on the command line as well (`--kv int8`, `--resident-experts`). A name the engine does not accept
-  stops the server at startup, as does one in the wrong section.
-- Precedence: command line > config file > built-in defaults.
-- The API key is command line only (`--api-key`); a config file that sets it is refused.
-- `"relaxed-drafting": 0.3` (or `true` for the default 0.5; `--relaxed-drafting [P]` on the command line) trades
-  exactness for speed under sampling: a draft the model gives probability P or more is kept even when the model's own
-  draw would have been another token. Lower P is faster and further from the model's true sampling distribution; the
-  measured speed and cost per value are in [precision/features.md](precision/features.md#relaxed-drafting). Off by
-  default: without it, speculative decoding returns exactly what plain sampling would. Greedy (temperature 0) requests,
-  `logit_bias`, a request with a grammar (JSON `response_format`, tools), control tokens and everything inside a tool
-  call stay exact. A request can set its own value with `"relaxed_drafting": P` (or `false` for exact). Single-stream
-  decoding only; `--parallel` slots stay exact.
-- The startup line `[server] engine ...` lists the settings that came from the file or the command line, then the
-  grammar state; with none it says `defaults`, e.g. `grammar=off (from cli)`.
-
 ## The console log
 
 Every server line starts with `[server]` and a label padded to a column; values are `key=value`. Rates are `t/s`,
@@ -89,11 +69,11 @@ sizes `GiB`/`MiB`, times `s`. Startup prints one block, starting with a legend:
 [server] sampling temp=1.0 top_p=0.95 top_k=20 min_p=0.0 pres=0.0
 [server] vision   mode=dynamic gpu=0 (RTX 5090) load=per-image
 [server] auto     peer-excl=off resident=64.0GB pool-affinity=auto
-[server] stats    http://127.0.0.1:8080/
+[server] ready    http://127.0.0.1:8080/v1  openai+anthropic  stats http://127.0.0.1:8080/
 [server] loaded   68.4GiB 37.5s  cuda0=26.6GiB ram=41.2GiB cuda1=0.6GiB cuda1-copy=14.2GiB
 [server] kv       2.6/16.3GiB cuda0 elastic slots=4
 [server] slots    par=4 ctx/slot=262144 (slot-full-context), others queue
-[server] ready    http://127.0.0.1:8080/v1  openai+anthropic  ctx=262144 images=on
+[server] weights  loaded, ctx=262144 images=on
 ```
 
 `sampling` marks a value set on the command line `(cli)` or in the config file `(config)`; `auto` is the engine's
@@ -132,7 +112,7 @@ Each request ends with one slot-tagged `done` line:
 
 ## The stats page
 
-The server's own address (`[server] stats` above) serves one page that reads `/metrics`, `/slots` and `/api/logs`
+The server's own address (`stats` on the `[server] ready` line above) serves one page that reads `/metrics`, `/slots` and `/api/logs`
 once a second:
 
 - GPUs: every card the engine uses, with VRAM and 60 s charts of load and power (one card adds temperature; three or
@@ -154,16 +134,17 @@ per slot, `gpus` with `util`, `power` and `temp` per card) and the fastest reque
 `--conversation-cache-disk-mib N` (an engine flag, also `"conversation-cache-disk-mib"` in the config's `engine`
 section) parks conversations on disk under the RAM cache, in at most N MiB. It is off at 0, the default. It writes to
 the folder `conversations` inside the model's cache folder (`~/.cache/basalt/<hash>/`, where the engine log is);
-`--conversation-cache-dir DIR` only names another folder, and does nothing on its own. When the tier is on the server
+`--conversation-cache-dir DIR` only names another folder, and does nothing on its own. On Linux the folders the engine
+creates for the tier and the files it writes there are its user's only (0700, 0600); on Windows they take the parent folder's access list. When the tier is on the server
 prints `[disk] conversations=DIR disk-mib=N` at start. A conversation of at least 8192 tokens that leaves its session
 (another one takes its slot), that the RAM cache evicts, or that the engine still holds when it ends (a stop, an idle
 unload) is written to DIR: one file for its tokens and running state, and shared files for its K/V cache (one per 4096
-cells) and for each checkpoint's state, each named by the tokens it covers and its bytes, so the same conversation
-written again, or another that starts the same way, writes only the blocks and states that are new. A conversation whose
-last checkpoint (the end of its last prompt) is at most 4096 tokens behind is stored as of that checkpoint, with no
-running state of its own: the next turn goes on from there, and a reply sent back as it was is read
-again. A later
-prompt that starts with a stored conversation (its tokens, or one of its checkpoints) reads it back cut at that point
+cells) and for its checkpoint states, each named by the tokens it covers and its bytes, so the same conversation
+written again, or another that starts the same way, writes only the blocks and states that are new. Only the system prompt's
+and the last 3 turn ends' states are written (other checkpoints stay in RAM); a cut at an unstored one goes on from the
+nearest stored state before it. A conversation whose last checkpoint (the end of its last prompt) is at most 4096 tokens
+behind is stored as of that checkpoint, with no running state of its own: the next turn goes on from there, and a reply sent
+back as it was is read again. A later prompt that starts with a stored conversation (its tokens, or one of its checkpoints) reads it back cut at that point
 and goes on from there, after a restart too: the wait is the drive reading the K/V cache. A file is bound to the model file, the stored-conversation format and the settings that change the state
 (the KV type, the rope, the draft layer, control vectors); every part of it carries a hash, and a file that does not
 check out is deleted, never restored. After a second without input (no slot decoding) the engine writes each conversation that has grown 4096 tokens past its
@@ -189,8 +170,9 @@ longer time.
 
 Basalt refuses settings that would leave the machine without memory, and never shrinks what you asked for:
 
-- `--vram-reserve-mib` below 256 is refused at startup: with less VRAM free once everything is loaded, a later
-  allocation can make the driver page GPU memory and requests stall.
+- `--vram-reserve-mib` below 256 is refused at startup on Windows and WSL2: with less VRAM free once everything is
+  loaded, a later allocation can make the driver page GPU memory and requests stall. On Linux, where the driver fails
+  such an allocation instead, the floor is 128.
 - When some experts are read from the SSD (they fit in neither the GPUs nor the RAM copy), the RAM copy leaves a
   floor free for the OS file cache: the RAM margin (2 GiB or 5% of the RAM, the larger) plus the larger of 4 GiB and
   what one prompt chunk reads from the file (up to 3.5 GiB for the lent GPU slots, plus the SSD-held experts of two
@@ -209,12 +191,12 @@ Basalt refuses settings that would leave the machine without memory, and never s
   the one the next request continues): with the disk tier on they go to disk (those it holds no copy of yet), otherwise
   they are dropped. The engine also frees the checkpoint blocks it keeps for reuse and returns its free heap to the OS,
   and a request that arrives waits up to 30 s for the RAM to come back before it starts; one that adds at most 256
-  tokens to the live conversation (the server's wrap-up after a thinking budget) does not wait. Below the guard nothing
+  tokens to the live conversation (the server closing the thinking at its budget) does not wait. Below the guard nothing
   new is parked, and the disk tier neither writes a conversation still in a session nor reads one back (its own floor
   sits 1 GiB above the guard's). A running request continues; it stops with an error only when the RAM is critical:
   under 1 GiB free, or below the guard while the kernel's memory pressure (`/proc/pressure/memory`, avg10) shows tasks
   stalled most of the time (some >= 60% or full >= 40%). Without a pressure reading (Windows, or a kernel without PSI)
-  below the guard is critical. The error (`RAM low (... free < ... guard) ...: request stopped` or `RAM critical (...
+  RAM that stays below the guard for 10 s is critical; a shorter dip is not. The error (`RAM low (... free < ... guard) ...: request stopped` or `RAM critical (...
   free < ... hard floor): request stopped`, also returned to the client) names `--resident-budget-gib` only when the
   engine's own growth took the RAM, otherwise how much other programs took. While the model sleeps the guard judges no
   reading (the driver holds the GPU state in RAM until the wake); the wake takes a fresh one. Windows does not count the
@@ -226,6 +208,8 @@ Basalt refuses settings that would leave the machine without memory, and never s
 Image input is one server option, `--vision off | dynamic | cpu | <GPU number>` (config: `"vision": 1` in the
 `server` section). It is `off` by default. The encoder is Basalt's own and shares its kernels in every mode, so all
 of them give bitwise identical embeddings.
+
+What a request may name as an image depends on where it comes from: [image sources](configuration/image-sources.md).
 
 | mode | where the encoder runs | VRAM cost | fresh-image latency (IQ3_S, 400 W, earlier build) |
 | --- | --- | --- | --- |

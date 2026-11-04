@@ -27,6 +27,7 @@ from serve.config import (build_parser, check_engine_flags,  # noqa: E402
                           sampling_line)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
+from serve.engine.image_source import image_sources_of  # noqa: E402
 from serve.engine.flags import flag_index, flag_value  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.engine.process import ProcessEngine  # noqa: E402
@@ -67,6 +68,25 @@ def grammar_entry(on: bool, cli: list[str], used: list[str]) -> tuple[bool, str]
     names = ("--grammar", "--no-grammar")
     origin = "cli" if any(w in names for w in cli) else "config" if any(w in names for w in used) else ""
     return (on, origin) if origin else None
+
+
+def open_when_ready(svc, url, now=False, opener=None):
+    """Open the page once, after the first weights load; at once when no load is under way (mock, lazy)."""
+    if opener is None:
+        import webbrowser
+        opener = webbrowser.open
+    if now:
+        opener(url)
+        return
+    done, previous = [], svc.on_loaded
+
+    def loaded():
+        if previous is not None:
+            previous()
+        if not done:
+            done.append(1)
+            opener(url)
+    svc.on_loaded = loaded
 
 
 def main() -> int:
@@ -129,6 +149,12 @@ def main() -> int:
             print(engine_line(file_engine, cli_engine,
                                     (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None,
                                     grammar_entry(a.grammar, sys.argv[1:], used_argv)), flush=True)
+    if (a.image_url_host or a.image_dir) and a.vision == "off" and not a.mock_engine:
+        fail("--image-url-host and --image-dir need --vision (image input is off)")
+    try:
+        image_sources = image_sources_of(a.image_url_host, a.image_dir, a.image_remote_only)
+    except ValueError as e:
+        fail(str(e))
     if a.alias:
         cfg["model_name"] = a.alias
     try:                                                # fail fast if the port is taken
@@ -199,6 +225,11 @@ def main() -> int:
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
                   grammar_engine=bool(a.mock_engine or has_grammar))
     svc.logs = logs
+    svc.image_sources = image_sources
+    if image_sources.url_hosts or image_sources.dirs or image_sources.remote_only:
+        print(tagged("images", f"from other machines{' and this one' if image_sources.remote_only else ''}: "
+                               f"url-hosts={','.join(a.image_url_host) or '-'} "
+                               f"dirs={','.join(image_sources.dirs) or '-'}"), flush=True)
     if any(x == "--api-key" and i + 1 < len(used_argv) and not used_argv[i + 1].strip() or x.strip() == "--api-key="
            for i, x in enumerate(used_argv)):
         # an empty key would silently disable authentication
@@ -226,24 +257,32 @@ def main() -> int:
     svc.min_free_vram_mib = a.min_free_vram_mib or 0
     svc.reasoning_budget_tokens = a.reasoning_budget_tokens or 0
     svc.answer_room = a.answer_room
+    svc.thinking_loop_tokens = a.thinking_loop_tokens
     svc.gpu_indices = gpus_in_play(cfg, engine_args(cfg) if not a.mock_engine else [])   # the cards /metrics reads
     svc.gpu_index = svc.gpu_indices[0]
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
     svc.start_idle_sleep()
+    svc.on_loaded = lambda: announce()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
 
-    def announce():
-        if not a.mock_engine and not lazy:
-            warn_tight_ram(engine.info.get("arena_mib"))
-        if getattr(engine, "batch", 0):
-            print(tagged("slots", f"par={engine.batch} ctx/slot={engine.max_context}"
-                         + (" (slot-full-context)" if a.slot_full_context else "") + ", others queue"), flush=True)
-        tail = f"ctx={engine.max_context} images={'on' if vision else 'off'}" + (" api-key=on" if svc.api_key else "")
-        print(tagged("ready", f"http://{here}:{a.port}/v1  openai+anthropic  {tail}"), flush=True)
+    first_load = [True]
 
-    print(tagged("stats", f"http://{here}:{a.port}/"), flush=True)
-    if a.mock_engine or lazy:
+    def announce():
+        """After every weights load: the slot table once, then the weights line (no URL)."""
+        if first_load[0]:
+            first_load[0] = False
+            if not a.mock_engine:
+                warn_tight_ram(engine.info.get("arena_mib"))
+            if getattr(engine, "batch", 0):
+                print(tagged("slots", f"par={engine.batch} ctx/slot={engine.max_context}"
+                             + (" (slot-full-context)" if a.slot_full_context else "") + ", others queue"), flush=True)
+        print(tagged("weights", f"loaded, ctx={engine.max_context} images={'on' if vision else 'off'}"), flush=True)
+
+    # the one place the addresses and the APIs are printed: the server listens before the model loads
+    print(tagged("ready", f"http://{here}:{a.port}/v1  openai+anthropic  stats http://{here}:{a.port}/"
+                 + (" api-key=on" if svc.api_key else "")), flush=True)
+    if a.mock_engine:
         announce()
     if a.host not in LOOPBACK_NAMES:
         # reachable from other devices: print the addresses
@@ -255,10 +294,10 @@ def main() -> int:
         if exposed_without_key(a.host, svc.api_key):
             print(tagged("warning", "no api key, open to the network (--api-key KEY)"), flush=True)
     if not a.mock_engine and not lazy:
-        svc.start_load(announce)                        # the page and the API are up; requests wait for the load
+        svc.start_load()                                # the page and the API are up; requests wait for the load
     if a.open:
-        import webbrowser
-        webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
+        open_when_ready(svc, f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/",
+                        now=bool(a.mock_engine or lazy))
     # SIGTERM takes Ctrl+C's path (QUIT to the engine) so a container stop does not orphan it
     def on_sigterm(signum, frame):
         raise KeyboardInterrupt

@@ -1,4 +1,4 @@
-// prefill_cpu_share_test - a small prompt chunk's experts on the CPU pool (prefill.cpp's CPU share) against the GPU's
+// prefill_cpu_share_test - a small prompt chunk's experts on the CPU pool (cpu_experts.cpp's CPU share) against the GPU's
 // MMQ path (gather, q8_1 activations, gate/up, SwiGLU, q8_1 of H, down) and a double-precision reference (the weights
 // dequantized by ggml's own to_float, times the FP32 activations), on random native expert blobs at the model's
 // geometry (2560 x 640) and random routing in which every expert has at most MAXT rows - the experts the share takes.
@@ -144,7 +144,7 @@ Routing sort_rows(const std::vector<int32_t>& ids, int E) {
     return r;
 }
 
-// MMQ, as prefill.cpp runs a native layer: per group of 16 routed experts a gather, gate/up, SwiGLU (gate rows, then
+// MMQ, as expert_mmq.cpp runs a native layer: per group of 16 routed experts a gather, gate/up, SwiGLU (gate rows, then
 // up rows), q8_1 of H, down.  Returns Dm [rows][N] in sorted-row order.
 struct MmqBufs {
     Dev xq, gu, h, hq, dm, ident, bounds, grp_gu, grp_d;
@@ -237,11 +237,6 @@ Err compare(const std::vector<float>& a, RA row_a, const std::vector<float>& b, 
 
 std::vector<float> download(const Dev& d, size_t n) {
     std::vector<float> h(n);
-    ck(cudaMemcpy(h.data(), d.p, n * 4, cudaMemcpyDeviceToHost), "download");
-    return h;
-}
-std::vector<int32_t> download_i(const Dev& d, size_t n) {
-    std::vector<int32_t> h(n);
     ck(cudaMemcpy(h.data(), d.p, n * 4, cudaMemcpyDeviceToHost), "download");
     return h;
 }

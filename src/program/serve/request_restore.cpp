@@ -12,40 +12,7 @@ bool Request::starts_with(const std::vector<int32_t>& pre, const std::vector<Img
     return runtime_.imgs_below(runtime_.req_imgs, L) == pre_imgs;
 }
 
-// the tail without RAM copies: the loan follows the cache's end down as the KV grows, so the experts it reaches
-// below the slots that keep a copy take a home before the prompt is read
-bool Request::loan_homes() {
-    int64_t loan_chunk = 0;
-    if (!runtime_.kv_tail_copies && runtime_.kv_floor > 0 && !in_slot && runtime_.lend_from > 0 &&
-        !runtime_.pf_parts.empty() && runtime_.pf_parts[0].first >= 0 &&
-        runtime_.loan_plan(runtime_.xcache.slots(), loan_chunk) < runtime_.copies_from) {
-        if (!runtime_.kv_drain(runtime_.err)) return false;
-        std::string he;
-        if (!runtime_.home_given_up(runtime_.xcache.slots(), he))
-            basalt::log::warn("basalt serve", "elastic KV: no RAM homes for the loan's experts without a copy "
-                              "(%s): the prompt reads them from the file", he.c_str());
-    }
-    return true;
-}
-
 Flow Request::restore() {
-    remote_before = {};
-    launches_before = {};
-    compact_before = {};
-    full_before = {};
-    // ms_begin/ms_wait are cumulative since boot; take deltas here like every other column, so the host time
-    // reads as belonging to this request.
-    begin_before = {};
-    wait_before = {};
-    for (int r = 0; r < 3; ++r) if (runtime_.o.expert_cache_remote[(size_t) r] > 0)
-    {
-        remote_before[(size_t) r] = runtime_.remote_experts[(size_t) r].computed();
-        launches_before[(size_t) r] = runtime_.remote_experts[(size_t) r].launched_layers();
-        compact_before[(size_t) r] = runtime_.remote_experts[(size_t) r].returned_bytes();
-        full_before[(size_t) r] = runtime_.remote_experts[(size_t) r].full_row_bytes();
-        begin_before[(size_t) r] = runtime_.remote_experts[(size_t) r].ms_begin();
-        wait_before[(size_t) r] = runtime_.remote_experts[(size_t) r].ms_wait();
-    }
     runtime_.cur = ids;
     // The conversation cache's keys are int32: one narrow view per request, so a parked entry or a checkpoint
     // is matched by one bulk compare over the slice instead of a per-token scan.
@@ -74,7 +41,16 @@ Flow Request::restore() {
     own_partial_from0 = false;   // the slot holds a read that gave way (BYIELD)
     own_partial_chunk = 0;
     if (in_slot) {
+        // this request drafts on the main sequence: the solo conversation's draft K/V waits in slot 0's store (the
+        // solo session's) until the request ends, unless that store holds slot 0's own cached conversation
+        if (runtime_.batch_spec && !runtime_.solo_draft_in0 && runtime_.live_ok && !runtime_.live.empty() &&
+            !runtime_.bs[0].cached) {
+            if (runtime_.mtp.copy_store(runtime_.mtp.main_store(), 0, (int64_t) runtime_.live.size(), runtime_.err))
+                runtime_.solo_draft_in0 = true;
+            runtime_.err.clear();
+        }
         solo_book = {std::move(runtime_.live), std::move(runtime_.live_imgs), runtime_.live_ok, runtime_.cvec_cached, std::move(runtime_.checks)};
+        runtime_.solo_out = &solo_book;   // idle while this request works in its slot
         BSlot& sb = runtime_.bs[(size_t) slot_b];
         runtime_.live.clear();
         runtime_.live_imgs.clear();
@@ -106,6 +82,8 @@ Flow Request::restore() {
         runtime_.sp.set_session((*rview));
         if (runtime_.mtp_on) runtime_.mtp.set_ple_session(&(*rview));
     }
+    if (!in_slot) runtime_.solo_draft_back(true);   // when a request in another slot ended before it gave them back
+    runtime_.solo_busy = !in_slot;
     // slot 0 is the solo session: what an idle slot 0 holds is the live conversation, in place
     if (runtime_.slot0_is_solo && !in_slot && !runtime_.bs.empty() && runtime_.bs[0].cached && !runtime_.bs[0].active) {
         BSlot& s0 = runtime_.bs[0];
@@ -204,7 +182,8 @@ Flow Request::restore() {
             // would continue goes back to the cache, the live one stays as it is (a batch slot's request ends
             // in its prompt read, which hands the slot back)
             if ((runtime_.stop_req.load() || runtime_.stdin_lost.load()) && !in_slot && runtime_.admit_slot < 0) {
-                if (incoming) (void) runtime_.conversations->put(std::move(*incoming));
+                if (incoming && incoming->from_slot) runtime_.conversations->put_slot(std::move(*incoming), runtime_.bs.size());
+                else if (incoming) (void) runtime_.conversations->put(std::move(*incoming));
                 basalt::log::info("basalt serve", "RAM wait: the request was stopped after %.1f s",
                                   waited() / 1000.0);
                 basalt::log::info("basalt serve", "prompt %lld tokens = 0 reused + 0 of %lld read in 0 ms "
@@ -290,6 +269,7 @@ Flow Request::restore() {
     // read) writes it
     // (a restore writes the snapshot's whole live K/V, which can be longer than this prompt)
     kv_need = std::max<int64_t>(n, incoming ? (int64_t) incoming->live.ids.size() : 0);
+    runtime_.park_keep = slot_source;   // the conversation this request continues stays where it is
     // the host K/V: this request's mode, before anything writes the cells.  The session's cells move with it:
     // the live conversation's, which its checkpoints (no K/V of their own) are prefixes of
     {
@@ -314,6 +294,10 @@ Flow Request::restore() {
     }
     keep_routed.emplace(runtime_.kv_keep_routed);
     runtime_.kv_keep_routed = runtime_.batch_on();
+    runtime_.peer_due.clear();
+    runtime_.peer_due_off = runtime_.peer_due_lent_n = 0;
+    defer_peer.emplace(runtime_.peer_defer);
+    runtime_.peer_defer = !in_slot;
     kv_ok = runtime_.kv_fit(*runtime_.rsp, kv_need + runtime_.kKvGrowCells, runtime_.err, true, kv_need + runtime_.kKvWindowCells);
     if (!kv_ok && runtime_.kv_short) {   // the other sessions' spare cells first
         int64_t given = 0;
@@ -338,6 +322,7 @@ Flow Request::restore() {
         if (runtime_.hold_slot(slot_source, slot_ck, he) && runtime_.kv_release(from, 0, he)) {
             runtime_.bs[(size_t) slot_source].cached = false;   // its cells are this request's now
             solo_moved = &from == &runtime_.ss;
+            if (solo_moved) runtime_.solo_out = nullptr;
             basalt::log::info("basalt batch", "slot %d's conversation waits in RAM while its %lld KV cells back "
                               "this request", slot_source, (long long) (had - basalt::core::session_kv_cells(from)));
             runtime_.err.clear();
@@ -364,6 +349,7 @@ Flow Request::restore() {
             runtime_.rsp = &runtime_.ss;
             runtime_.sp.set_session(runtime_.ss);
             if (runtime_.mtp_on) runtime_.mtp.set_ple_session(&runtime_.ss);
+            runtime_.solo_out = nullptr;
             runtime_.live = std::move(solo_book.live);
             runtime_.live_imgs = std::move(solo_book.live_imgs);
             runtime_.live_ok = solo_book.live_ok;
@@ -375,15 +361,12 @@ Flow Request::restore() {
                 runtime_.live_ok = false;
                 runtime_.checks.clear();
             }
+            runtime_.solo_draft_back(!solo_moved);
         }
         runtime_.admit_slot = -1;
         return Flow::next;
     }
     if (!kv_ok) {
-        std::printf("ERR %s\n", runtime_.err.c_str());
-        return Flow::error;
-    }
-    if (!loan_homes()) {
         std::printf("ERR %s\n", runtime_.err.c_str());
         return Flow::error;
     }
@@ -432,11 +415,18 @@ Flow Request::restore() {
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
         }
     }
+    runtime_.park_keep = -1;
     restore_t0 = Clock::now();
     if (incoming) {
+        // the draft layer's K/V goes to the main sequence, which then holds it as written
+        if (runtime_.mtp_on && !runtime_.mtp.use_main(runtime_.err)) {
+            std::printf("ERR %s\n", runtime_.err.c_str());
+            return Flow::error;
+        }
         // a snapshot that cannot be restored is dropped and the prompt read from the start
         bool restored = basalt::core::conversation_snapshot_restore(*incoming, *runtime_.rsp,
                 runtime_.g, runtime_.mtp_kv, runtime_.err) == basalt::core::ConversationRestore::restored;
+        if (restored && runtime_.mtp_on) runtime_.mtp.wrote(0, (int64_t) incoming->live.ids.size());
         int failed_stage = -1;
         for (size_t i = 0; restored && i < runtime_.stages.size(); ++i) {   // the later stages' parts
             const basalt::core::OnDevice on(runtime_.stages[i]->dev);
@@ -505,7 +495,7 @@ Flow Request::restore() {
     // now that the outgoing conversation is parked
     if (runtime_.kv_host_late) {
         runtime_.kv_host_late = false;
-        if (runtime_.kv_host_back(kv_need, resume, runtime_.err) < 0 || !loan_homes()) {
+        if (runtime_.kv_host_back(kv_need, resume, runtime_.err) < 0) {
             std::printf("ERR %s\n", runtime_.err.c_str());
             return Flow::error;
         }

@@ -1,9 +1,9 @@
 #include "common.hpp"
+#include "basalt/kernels/q80_vhead.hpp"
 #include "expert_plan.hpp"
 #include "diagnostics.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/verify.hpp"
-#include "basalt/core/remote_expert_opt.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
@@ -13,6 +13,7 @@
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/kernels/wait_abort.hpp"
 #include "basalt/kernels/dec_moe.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>
@@ -57,6 +58,8 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
 // predecessor's graph raises), then the host serves each stage's rings in turn.
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
+    const std::function<void()> served = std::move(served_hook_);
+    served_hook_ = nullptr;
     for (Verifier* v = this; v != nullptr; v = v->next_)
         if (v->lb_ > 0 && v->h_flag_ != nullptr) *(volatile uint32_t*) (v->h_flag_ + 12) = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -64,7 +67,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         if (!v->run_begin(T, tokens, pos0, err)) return false;
     void* u = user;
     for (Verifier* v = this; v != nullptr; v = v->next_) {
-        if (!v->run_serve(pool, u, err) || !v->run_end(v->next_ == nullptr ? out : nullptr, err)) return false;
+        if (!v->run_serve(pool, u, err)) return false;
+        if (v->next_ == nullptr && served) served();
+        if (!v->run_end(v->next_ == nullptr ? out : nullptr, err)) return false;
         u = v->next_user_;
     }
     return true;
@@ -77,6 +82,7 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     last_batch_ = false;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU; restart the engine"; return false; }
+    if (wait_abort_code() != 0) { err = "verify: a device wait timed out in an earlier window; restart the engine"; return false; }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
@@ -123,6 +129,11 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
         cudaStreamWaitEvent(cs_, wait_ev_, 0);
         wait_ev_ = nullptr;
     }
+    *(volatile int32_t*) h_head_from_ = head_sampling_ ? std::clamp(head_from_, 0, T) : T;
+    head_from_ = 0;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    set_head_keep(head_keep());
+    if (!hs_launch(T, err)) return false;
     const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
     if (next_ == nullptr) dev.record(DecodeEvents::kVerifyPost, cs_);
     ms_launch += ms_since(tl);
@@ -131,21 +142,26 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     // a sampled or penalized request's head sampling queued behind the window now, not after a sync
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     const bool biased = sampling_.logit_bias != nullptr;
-    const bool early_sample = chain_on() && le_ >= g.n_layers && head_sampling_ && (sampled || hist_d_ != nullptr || biased);
+    const bool early_sample = le_ >= g.n_layers && head_sampling_ && (sampled || hist_d_ != nullptr || biased);
     // the draft probe: row t asks for the probability of the window's token t + 1
     const bool probe = draft_probe_ && head_sampling_ && sampled && T > 1 && le_ >= g.n_layers;
+    // the sampled rows' kept lists; the wide path keeps none
+    top_valid_ = head_sampling_ && sampled && le_ >= g.n_layers &&
+                 sampler_list_len(sampling_.top_k, (int) n_vocab_) <= kSamplerNarrowMax;
     if (probe)
         for (int t = 0; t + 1 < T; ++t) h_q_[t] = tokens[t + 1];
     if (early_sample) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
+        if (sampled) { sp.top_ids = m_top_; sp.n_top = kTopIds; }
+        if (sampler_list_len(sp.top_k, (int) n_vocab_) > kSamplerNarrowMax && sampled && !exact_head_rows(T, err))
+            return false;
         sample_tokens_probe(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, probe ? m_q_ : nullptr,
                             probe ? T - 1 : 0, probe ? m_qp_ : nullptr, cs_);
     }
     (void) cudaStreamQuery(cs_);
     if (post_launch_) { auto f = std::move(post_launch_); post_launch_ = nullptr; f(); }
     gm.mark(15);
-    volatile uint32_t* const flag = h_flag_;
     fl_.T = T;
     fl_.pos0 = pos0;
     fl_.k = 0;
@@ -159,15 +175,9 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
         if (do_ple) {
             const Clock::time_point tp = Clock::now();
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            _mm_sfence();
-            *flag = 1;
-            *(volatile uint32_t*) (h_flag_ + 8) = 1;
             ms_host += ms_since(tp);
-        } else {
-            *flag = 1;
-            *(volatile uint32_t*) (h_flag_ + 8) = 1;
         }
+        ar_handoff();
     } else {
     // the side branch of layer 1's PLE projections waits for the rows alone
     const bool ple_early = ple_side_ && do_ple;
@@ -243,7 +253,6 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
         set_plan_slot();
         const int n = T;
         progress_at("verify window: the CPU experts of layer", l);
-        if (remote_opt_) remote_opt_->begin(h_w_, 0, n);
         if (dm_ != nullptr) {   // the ring's own rows and tiers: the pool computes the CPU's entries only
             const basalt::kernels::DmRing& R = dm_->h_ring[k];
             sink_.ext_kind = R.kind;
@@ -253,7 +262,6 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
         } else if (pool != nullptr)
             pool(user, h_x_, h_ids_, n, ss.k,
                  h_ymiss_, l);
-        if (remote_opt_) remote_opt_->end();
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
@@ -300,6 +308,30 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
     return 1;
 }
 
+// The window's results are garbage when one of its bounded device waits timed out (wait_abort.hpp).
+bool Verifier::window_intact(std::string& err) {
+    const unsigned long long code = basalt::kernels::wait_abort_code();
+    if (code == 0) return true;
+    err = "verify: a device wait timed out (" + basalt::kernels::wait_abort_text(code) + "); the window is discarded; restart the engine";
+    return false;
+}
+
+// The zero-doorbell graph plans every layer on the device and never rings h_seq_: the host raises the hand-off once,
+// after the window's PLE rows are in h_ple_, and then only waits for the window's end.
+void Verifier::ar_handoff() {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+    *(volatile uint32_t*) h_flag_ = 1;
+    *(volatile uint32_t*) (h_flag_ + 8) = 1;
+}
+
+bool Verifier::ar_plan_intact(std::string& err) {
+    if (!ar_on() || ar_forced_ || h_plan_err_ == nullptr || *(volatile uint32_t*) h_plan_err_ == 0) return true;
+    *(volatile uint32_t*) h_plan_err_ = 0;   // the table changed under the window
+    err = "verify: the zero-doorbell plan met an expert that is not in VRAM (the residency table changed during the window)";
+    return false;
+}
+
 // The window's end: the GPU's finish, the profile, and on the last stage the head's picks.
 bool Verifier::run_end(int32_t* out, std::string& err) {
     using namespace basalt::kernels;
@@ -316,13 +348,14 @@ bool Verifier::run_end(int32_t* out, std::string& err) {
     // with cudaStreamQuery here would cost decode time (a core calling the driver beside the expert workers).
     const cudaError_t se = cudaStreamSynchronize(cs_);
     gm.mark(-1);
-    if (!dm_end(err)) return false;
-    if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
-    if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // the table changed under the window
-        *(volatile uint32_t*) h_plan_err_ = 0;
-        err = "verify: the zero-doorbell plan met an expert that is not in VRAM (the residency table changed during the window)";
+    const bool dm_ok = dm_end(err);
+    if (!window_intact(err) || !dm_ok) return false;
+    if (hs_two_ && head_screened_ && basalt::kernels::q80p_vhead_link_failed(hs_link_)) {
+        err = "verify: the peer's share of the head did not answer; the window is discarded; restart the engine";
         return false;
     }
+    if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    if (!ar_plan_intact(err)) return false;
     constexpr int64_t wstat_every = 200;   // windows per report
     if (dm_ != nullptr && dm_->wstat != nullptr && (dm_->wstat_t += T, ++dm_->wstat_windows == wstat_every)) {
         // --wait-stats: the last wstat_every windows' counters
@@ -353,6 +386,9 @@ bool Verifier::run_end(int32_t* out, std::string& err) {
     if (head_sampling_ && (sampled || hist_d_ != nullptr || biased) && !early_sample) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
+        if (sampled) { sp.top_ids = m_top_; sp.n_top = kTopIds; }
+        if (sampler_list_len(sp.top_k, (int) n_vocab_) > kSamplerNarrowMax && sampled && !exact_head_rows(T, err))
+            return false;
         sample_tokens_probe(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, probe ? m_q_ : nullptr,
                             probe ? T - 1 : 0, probe ? m_qp_ : nullptr, cs_);
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable

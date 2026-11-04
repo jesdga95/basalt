@@ -81,8 +81,23 @@ bool cpu_avxvnni_ok() {
         if (r[0] < 7) return false;
         platform::cpuid(7, 0, r);
         if (r[0] < 1) return false;                        // leaf 7 has no sub-leaf 1
+        if (!((r[1] >> 8) & 1u)) return false;             // BMI2 (the i-quant rows' grid indices)
         platform::cpuid(7, 1, r);
         return ((r[0] >> 4) & 1u) != 0;                    // AVX-VNNI
+    }();
+    return ok;
+}
+
+bool cpu_avxvnni_int8_ok() {
+    static const bool ok = [] {
+        if (!cpu_avx2_ok()) return false;
+        unsigned r[4] = {0, 0, 0, 0};
+        platform::cpuid(0, 0, r);
+        if (r[0] < 7) return false;
+        platform::cpuid(7, 0, r);
+        if (r[0] < 1) return false;                        // leaf 7 has no sub-leaf 1
+        platform::cpuid(7, 1, r);
+        return ((r[3] >> 4) & 1u) != 0;                    // AVX-VNNI-INT8
     }();
     return ok;
 }
@@ -112,13 +127,11 @@ bool cpu_sse42_ok() {
 
 std::string cpu_name() {
     unsigned r[12] = {};
-    unsigned a = 0, b = 0, c = 0, d = 0;
     {
         unsigned x[4];
         platform::cpuid(0x80000000u, 0, x);
-        a = x[0]; b = x[1]; c = x[2]; d = x[3];
+        if (x[0] < 0x80000004u) return "unknown";
     }
-    if (a < 0x80000004u) return "unknown";
     for (unsigned i = 0; i < 3; ++i) {
         unsigned x[4];
         platform::cpuid(0x80000002u + i, 0, x);

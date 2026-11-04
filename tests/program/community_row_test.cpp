@@ -34,7 +34,7 @@ CommunityRow plain_row() {
 // quotes, a backslash, a control character, 0x7f and non-ASCII text
 CommunityRow odd_row() {
     CommunityRow r = plain_row();
-    r.submitter = "\xC3\x9Cn\xC3\xAF \"q\" \\ \xE2\x98\x83 \xE6\x97\xA5\xE6\x9C\xAC";
+    r.submitter = "\xC3\x9Cn\xC3\xAF\"q\"\\\xE2\x98\x83\xE6\x97\xA5\xE6\x9C\xAC";
     r.gpus = {{"Card \"X\"\tTi", 24, 300, "", 0}};   // no link figures: the optional keys are left out
     r.cpu.clear(); r.ram_gbps = 0;
     r.notes = "line\nbreak \xE2\x82\xAC \x01\x7f";

@@ -392,8 +392,8 @@ std::vector<size_t> PeerExperts::incoming() const {
     return v;
 }
 
-bool PeerExperts::reassign(int64_t layer, int32_t in, int32_t out, const uint8_t* blob, std::string& err) {
-    const size_t i_in = (size_t) (layer * n_expert_ + in), i_out = (size_t) (layer * n_expert_ + out);
+bool PeerExperts::reassign(int64_t layer, int32_t in, int64_t lout, int32_t out, const uint8_t* blob, std::string& err) {
+    const size_t i_in = (size_t) (layer * n_expert_ + in), i_out = (size_t) (lout * n_expert_ + out);
     const int32_t slot = res_[i_in];
     hold_[i_in] = 0;
     if (slot < 0) return true;
@@ -405,7 +405,7 @@ bool PeerExperts::reassign(int64_t layer, int32_t in, int32_t out, const uint8_t
         if (x.slot == slot) return true;
     const auto& lay = basalt::kernels::cpu::expert_layout();
     On on(device_);
-    if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), blob, (size_t) lay.blob_bytes(layer), cudaMemcpyHostToDevice,
+    if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), blob, (size_t) lay.blob_bytes(lout), cudaMemcpyHostToDevice,
                             refill_), "reassign", err))
         return false;
     pending_.emplace_back((int32_t) i_out, slot);

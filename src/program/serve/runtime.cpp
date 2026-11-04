@@ -24,7 +24,14 @@ int run(Context& context) {
 int Runtime::run_requests() {
     for (;;) {
         const Flow flow = dispatch();
-        if (flow == Flow::error) return 1;
+        if (flow == Flow::error) {
+            if (basalt::core::gpu_left_running().load()) {   // the teardown would wait for the stuck window forever
+                basalt::log::error("basalt serve", "the GPU did not finish a released window: ending without the CUDA teardown");
+                std::fflush(stdout);
+                std::_Exit(1);
+            }
+            return 1;
+        }
         if (flow == Flow::quit) return shutdown();
     }
 }
@@ -43,6 +50,8 @@ int Runtime::shutdown() {
                           (double) st.whole_bytes / 1073741824.0, st.restored, (double) st.read_bytes / 1073741824.0,
                           st.evicted, st.dropped);
     }
+    for (int st = 0; st < std::max(n_stages, 1); ++st)
+        for (const std::string& r : stage_ver(st).route_report()) basalt::log::info("basalt serve", "%s", r.c_str());
     save_profile("exit");   // QUIT, or the server closed stdin
     return 0;
 }

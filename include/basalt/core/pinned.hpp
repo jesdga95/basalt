@@ -36,12 +36,11 @@ struct PinnedArena {
     explicit PinnedArena(uint64_t bytes, uint64_t slice = 0);
     /// slices of different sizes (one per layer of a native pack), given as their start offsets followed by the end of
     /// the last one.  `slice_starts` holds the registered ones.
-    /// `max_pinned_bytes`: optional cap on CUDA registration. 0 preserves the normal unrestricted path.
     /// `shared_file`: use a file-backed MAP_SHARED mapping instead of anonymous memory.
     /// `shared_hash` identifies the model that is allowed to populate that backing.  The file carries a small
     /// header and is refused when its stored hash does not match.  Empty `shared_file` preserves the existing
     /// allocation path.  Population/coordination and backing-file lifetime remain the caller's job.
-    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes = 0,
+    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                 const std::string& shared_file = {}, uint64_t shared_hash = 0);
     std::vector<uint64_t> slice_starts;
     void* mapping_base = nullptr;     ///< actual mapping start; differs from base when a shared-file header exists
@@ -125,7 +124,7 @@ uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed = 14695981039346656
 //     miss fraction (1 - h) x E / measured bandwidth = milliseconds per token
 //
 // So `h` (the VRAM hit rate) is only worth anything if a per-expert transfer can actually
-// reach the bus's bandwidth.  A 1,382,400-byte copy is SMALL, and if small copies run at a fraction of large
+// reach the bus's bandwidth.  One expert's copy is SMALL, and if small copies run at a fraction of large
 // ones then the architecture's central constant is wrong and no kernel optimisation can fix it.  That is what
 // this measures: the same total bytes at several granularities, so the difference is visible.
 struct StreamStats {
