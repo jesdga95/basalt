@@ -195,6 +195,21 @@ public:
         return {};
     }
 
+    model::Result probe_env(program::ProbeEnv& env) override {
+        std::string e;
+        ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        if (t == nullptr) return {model::Status::Error, e.empty() ? std::string("this session has no expert tier") : e};
+        cudaStreamSynchronize(stream_);
+        t->probe_env(env);
+        return {};
+    }
+
+    std::string info_words() const override {
+        std::string e;
+        ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        return t == nullptr ? std::string("kv=fp16") : "expert_slots=" + std::to_string(t->slots()) + " kv=fp16";
+    }
+
     size_t cells_bytes(int64_t positions) const override { return ops_ ? ops_->cache_bytes(positions) : 0; }
 
     model::Result save_cells(uint8_t* host, int64_t positions) override {

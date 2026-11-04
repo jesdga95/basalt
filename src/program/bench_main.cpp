@@ -228,7 +228,7 @@ private:
 // ---------------------------------------------------------------------------------------------- options
 
 struct Options {
-    std::string engine, model, fixtures = BASALT_BENCH_FIXTURES, format = "md", logs, kld_base, power_label;
+    std::string engine, model, fixtures, format = "md", logs, kld_base, power_label;
     std::vector<std::pair<std::string, std::string>> sets;
     std::vector<std::string> passthrough;
     std::string spec;                    // --spec N: the engine argument of the same name
@@ -728,6 +728,14 @@ int main(int argc, char** argv) {
     if (engine_bin.empty() || !fs::exists(engine_bin)) {
         basalt::log::error("basalt-bench", "the engine binary %s does not exist (--engine BIN)", engine_bin.c_str());
         return 2;
+    }
+    if (o.fixtures.empty()) {   // the model's own, when it has them
+        std::string answer;
+        const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id());
+        if (!o.model.empty()) (void) engine_plan(engine_bin, {"--model", fs::absolute(o.model).string(), "--gpu", "0"}, plan_log, answer);
+        std::error_code rm_ec;
+        fs::remove(plan_log, rm_ec);
+        o.fixtures = fixtures_for(BASALT_BENCH_FIXTURES, answer);
     }
     for (const auto& kv : o.sets) set_arg(args, kv.first, kv.second);
     if (!o.spec.empty()) set_arg(args, "--spec", o.spec);

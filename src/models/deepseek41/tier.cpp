@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -181,11 +182,72 @@ bool ExpertTier::open(const Reserve& reserve, const float* h_x, float* h_rows, s
                 (double) one_each_ram * cover_ / 1e9, pool_->workers());   // the server keeps the words after the name
     std::fflush(stdout);
     basalt::log::info("basalt generate", "RAM floor %.1f GiB", (double) (homes_.file > 0 ? kRamHeadroom : kRamHeadroomNoFile) / 1073741824.0);
+    if (peer_) basalt::log::info("basalt deepseek41", "peer GPU %d: %lld experts", peer_->device(), (long long) n_layers_ * homes_.peer);
     basalt::log::info("basalt deepseek41", "expert homes of %d per layer: main card %d, second card %d, RAM %d, file %d; main card copies %lld",
                  n_expert_, homes_.main, homes_.peer, homes_.ram, homes_.file, (long long) (homes_.main > 0 ? ext_per_layer_ : per_layer_));
     basalt::log::info("basalt deepseek41", "VRAM expert tier %.2f GiB, %lld of %d experts per layer (%.0f%%); CPU pool %d workers",
                  cache_.gib(), (long long) per_layer_, n_expert_, 100.0 * (double) per_layer_ / n_expert_, pool_->workers());
     return true;
+}
+
+namespace {
+
+// The second card's real path: launches over the homes of the layer it holds most of, one token at a time.
+class PeerPath final : public program::ProbePeerPath {
+public:
+    PeerPath(core::PeerExperts& peer, int top_k) : peer_(peer), k_(top_k) {}
+    bool setup(const program::ProbeEnv& env, const kernels::cpu::NativeFmt& f, std::string& why) override {
+        L_ = kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+        for (int64_t e = 0; e < env.n_expert && (int) ids_.size() < 8; ++e)
+            if (peer_.slot_ptr(0, e) != nullptr) ids_.push_back((int32_t) e);
+        if (ids_.empty()) { why = "no_experts_on_peer"; return false; }
+        if (!x_.alloc((size_t) f.n_embd * sizeof(float), cudaHostAllocPortable)) { why = "alloc_failed"; return false; }
+        std::mt19937 rng(5);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        for (int64_t i = 0; i < f.n_embd; ++i) ((float*) x_.p)[i] = nd(rng);
+        return true;
+    }
+    int max_entries() const override { return (int) ids_.size(); }
+    int rings() const override { return 24; }
+    int blocks() const override { return 0; }
+    void fill(int n) override { n_ = n; }
+    bool window(const kernels::cpu::NativeFmt&, const std::function<void(int)>& before, std::vector<double>& rt,
+                std::string& err) override {
+        int32_t ids[ExpertTier::kMaxK] = {}, kind[ExpertTier::kMaxK] = {};
+        const int k = std::max(k_, n_);
+        for (int i = 0; i < n_; ++i) { ids[i] = ids_[(size_t) i]; kind[i] = 2; }
+        rt.clear();
+        bool ok = true;
+        for (int r = 0; r < rings() && ok; ++r) {
+            before(r);
+            const auto t0 = program::ProbeClock::now();
+            ok = peer_.launch_plain(0, L_, (const float*) x_.p, ids, k, kind, err) && peer_.finish(nullptr, err);
+            rt.push_back(program::us_since(t0));
+        }
+        return ok;
+    }
+
+private:
+    core::PeerExperts& peer_;
+    program::HostBuf x_;
+    int k_, n_ = 1;
+    kernels::NativeExpertLayout L_;
+    std::vector<int32_t> ids_;
+};
+
+}  // namespace
+
+void ExpertTier::probe_env(program::ProbeEnv& env) {
+    env.pool = pool_.get();
+    env.ram_blob = [this](int64_t l, int64_t e) { return locate((int) l, (int) e).pinned; };
+    env.fmt = fmt_;
+    env.n_layers = n_layers_;
+    env.n_expert = n_expert_;
+    env.top_k = m_.geo().n_used;
+    if (peer_) {
+        env.peer_device = peer_->device();
+        env.peer_path = std::make_shared<PeerPath>(*peer_, m_.geo().n_used);
+    }
 }
 
 bool ExpertTier::load_ram(std::string& err) {
