@@ -4,6 +4,7 @@
 // collapse, router, routed and shared experts, expansion. Prefill runs the same path token by token.
 #include "basalt/log.hpp"
 #include "models/deepseek41/session.hpp"
+#include "basalt/ggml/ggml.h"
 
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/deepseek41/attn_index.hpp"
@@ -239,7 +240,10 @@ private:
         d.n_expert = g_.n_expert;
         d.n_ff_exp = g_.n_ff_exp;
         d.engram_cols = (int64_t) m_.pack().engram.hash.n_cols() * 256;
-        for (const ExpertLayer& e : m_.pack().experts) d.expert_blob_bytes = std::max<uint64_t>(d.expert_blob_bytes, e.blob_bytes);
+        for (const ExpertLayer& e : m_.pack().experts) {
+            d.expert_blob_bytes = std::max<uint64_t>(d.expert_blob_bytes, e.blob_bytes);
+            d.grouped = d.grouped || e.gu_type == GGML_TYPE_IQ1_M || e.d_type == GGML_TYPE_IQ1_M;
+        }
         size_t free_b = 0, total_b = 0;
         if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
             err = "deepseek41: cannot read the free device memory";
