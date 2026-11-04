@@ -1,7 +1,8 @@
 // src/models/qwen4exp/serve/tier_profile.cpp - tier profile operations.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 // write the learned profile (between requests and at QUIT: a prompt's lent slots are back by then).  A swap
 // still in flight counts as done - its expert is resident once the copy lands.  `why`: for the log.
@@ -269,4 +270,4 @@ bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
     return true;
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

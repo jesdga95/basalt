@@ -1,8 +1,9 @@
 // src/models/qwen4exp/serve/conversation.cpp - conversation operations for the persistent engine.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
 #include "basalt/models/qwen4exp/decode/kv_arena.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 ConvStateSizes conv_state_sizes(const basalt::core::ModelGeometry& g, const basalt::core::SessionState& ss) {
     ConvStateSizes z;
@@ -644,4 +645,4 @@ int QfnRuntime::init_conversations() {
     return 0;
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

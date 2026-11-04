@@ -2,6 +2,7 @@
 // Private to src/program: nothing here is part of the engine's public surface.
 #pragma once
 
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -32,7 +33,7 @@
 
 #include "basalt/program/multi_gpu_plan.hpp"   // PsPrice
 
-namespace basalt::program::engine_local {
+namespace basalt::models::qwen4exp::engine_local {
 
 // Spare RAM places for a saturated adaptation round.
 inline constexpr int kSatBoost = 4;
@@ -201,4 +202,4 @@ void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t 
 // Shares the hottest profile pairs between the main and peer expert tiers.
 size_t peer_hot_share_order(std::vector<std::pair<int32_t, int32_t>>& profile, size_t& at, size_t& fill);
 
-}  // namespace basalt::program::engine_local
+}  // namespace basalt::models::qwen4exp::engine_local

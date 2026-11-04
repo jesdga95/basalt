@@ -18,7 +18,7 @@ constexpr int kRouteTailSkipDefault = 9;
 constexpr float kRoutePriorDefault = 0.5f;
 }  // namespace
 
-bool parse_flag(const std::string& a, model::FlagArgs& args, program::Options& o, int& code) {
+bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& code) {
     if (a == "--rope-scaling") o.rope_scaling = args.next("--rope-scaling");
     else if (a == "--rope-scale") o.rope_scale = std::atof(args.next("--rope-scale"));
     else if (a == "--rope-freq-base") o.rope_freq_base = std::atof(args.next("--rope-freq-base"));
@@ -174,7 +174,7 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, program::Options& o
     return true;
 }
 
-std::optional<int> finish_flags(program::Options& o) {
+std::optional<int> finish_flags(Options& o) {
     if (o.resident_budget_given) {   // the resident mode with a RAM budget
         o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
         o.resident_headroom = 0;

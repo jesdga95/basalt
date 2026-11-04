@@ -40,6 +40,5 @@ uint32_t decode_cp(const uint8_t* s, size_t n, size_t i, size_t& len) {
 const uint16_t* cpt_flag_table();
 
 /// Splits `text` (UTF-8) into the pieces the qwen35 pre-tokenizer yields and appends each piece's end byte offset.
-void pretok_qwen35(const char* text, size_t size, std::vector<size_t>& ends);
 
 }  // namespace basalt::program::tokenizer

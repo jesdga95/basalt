@@ -1,12 +1,13 @@
 // The whole start of a Flash-Next engine, in order: its stack frames hold the resources while the server runs.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
 #include "../../../program/generate/run.hpp"
 #include "models/qwen4exp/adapter.hpp"
 
 namespace basalt::models::qwen4exp {
 
-int run_engine(program::Options& o, std::vector<program::GpuCard>& chosen_cards) {
-    using namespace basalt::program::generate;
+int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
+    using namespace basalt::models::qwen4exp::generate;
     Context context;
     std::string& ppl_base = o.ppl_base;
     std::string& ppl_out = o.ppl_out;
@@ -320,7 +321,7 @@ int run_engine(program::Options& o, std::vector<program::GpuCard>& chosen_cards)
     context.rope_cfg = &rope_cfg;
     context.err = &err;
     context.main_link_gbps = &main_link_gbps;
-    return basalt::program::generate::model(context);
+    return basalt::models::qwen4exp::generate::model(context);
 }
 
 }  // namespace basalt::models::qwen4exp

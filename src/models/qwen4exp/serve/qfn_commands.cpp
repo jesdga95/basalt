@@ -1,9 +1,11 @@
 // src/models/qwen4exp/serve/qfn_commands.cpp - the protocol commands that reach Flash-Next's tiers.
+#include "models/qwen4exp/adapter.hpp"
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
 #include "../../../program/tokenizer/unicode_flags.hpp"
 #include "../../../program/cli/tokens.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 bool QfnRuntime::windows_in_flight() { return piped && pipe_inflight(); }
 bool QfnRuntime::next_batch_window() { return piped ? pump(true) : batch_step(); }
@@ -193,8 +195,8 @@ void QfnRuntime::at_exit() {
 
 int run(Context& context) {
     QfnRuntime runtime(context);
-    runtime.pre_ = {"qwen35", basalt::program::tokenizer::pretok_qwen35};
+    runtime.pre_ = {"qwen35", basalt::models::qwen4exp::tokenizer::pretok_qwen35};
     return runtime.execute();
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

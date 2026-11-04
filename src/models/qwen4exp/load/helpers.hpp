@@ -1,20 +1,21 @@
 #pragma once
 
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "dependencies.hpp"
 
-namespace basalt::program::generate {
+namespace basalt::models::qwen4exp::generate {
 
-using basalt::program::serve::vram_floor_mib;
-using basalt::program::serve::serve_growth_bytes;
-using basalt::program::engine_local::kSatBoost;
+using basalt::models::qwen4exp::serve::vram_floor_mib;
+using basalt::models::qwen4exp::serve::serve_growth_bytes;
+using basalt::models::qwen4exp::engine_local::kSatBoost;
 
 
 using Clock = std::chrono::steady_clock;
 
-using basalt::program::Options;
-namespace cli = basalt::program::cli;
-namespace engine_local = basalt::program::engine_local;
-namespace serve_loans = basalt::program::serve;
+using basalt::models::qwen4exp::Options;
+namespace cli = basalt::models::qwen4exp::cli;
+namespace engine_local = basalt::models::qwen4exp::engine_local;
+namespace serve_loans = basalt::models::qwen4exp::serve;
 using engine_local::Drive;
 using engine_local::GpuStage;
 using engine_local::JobRunner;

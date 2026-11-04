@@ -6,11 +6,12 @@
 // so a trade never reads it: that expert comes from its RAM copy.  Plain tables in, decisions out; no engine state.
 #pragma once
 
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include <cstdint>
 #include <utility>
 #include <vector>
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 /// A residency-table entry the prompt path borrowed: (layer * n_expert + expert, cache slot).
 using LentEntry = std::pair<int32_t, int32_t>;
@@ -39,4 +40,4 @@ struct RoutedTrade {
 int64_t plan_routed_trades(const float* use, const int32_t* slot, const uint8_t* in_ram, const uint8_t* lent_out,
                            int32_t n, int64_t first, std::vector<RoutedTrade>& out);
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

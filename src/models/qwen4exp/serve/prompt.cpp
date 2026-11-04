@@ -1,7 +1,8 @@
 // src/models/qwen4exp/serve/prompt.cpp - prompt operations for the persistent engine.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 int64_t QfnRuntime::part_slots(const PfPart& p, int64_t c) {
     return serve_loans::cache_slots_for(*p.cache, basalt::prefill::Prefill::bytes_needed(g, *p.ses, c));
@@ -552,4 +553,4 @@ int QfnRuntime::init_prompt() {
     return 0;
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

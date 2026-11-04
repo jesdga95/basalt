@@ -65,7 +65,7 @@ public:
     }
 
     std::optional<int> run(program::CommonOptions& o, std::vector<program::GpuCard>& cards) const override {
-        return run_engine(static_cast<program::Options&>(o), cards);
+        return run_engine(static_cast<Options&>(o), cards);
     }
 
     int max_expert_cards() const override { return kernels::kDmMaxX; }
@@ -76,7 +76,7 @@ public:
 
     model::TokenizerSpec tokenizer_spec() const override { return {"tokenizer.ggml.tokens", "qwen"}; }
 
-    PreTokenizer pretokenizer() const override { return {"qwen35", program::tokenizer::pretok_qwen35}; }
+    PreTokenizer pretokenizer() const override { return {"qwen35", tokenizer::pretok_qwen35}; }
 
     model::TokenNames token_names() const override {
         return {{"<|endoftext|>", "<|im_end|>"}, "<|im_start|>", "<|image_pad|>"};
@@ -97,12 +97,12 @@ public:
         return f;
     }
 
-    std::unique_ptr<program::CommonOptions> make_options() const override { return std::make_unique<program::Options>(); }
+    std::unique_ptr<program::CommonOptions> make_options() const override { return std::make_unique<Options>(); }
     bool parse_flag(const std::string& name, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
-        return qwen4exp::parse_flag(name, args, static_cast<program::Options&>(o), code);
+        return qwen4exp::parse_flag(name, args, static_cast<Options&>(o), code);
     }
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
-        return qwen4exp::finish_flags(static_cast<program::Options&>(o));
+        return qwen4exp::finish_flags(static_cast<Options&>(o));
     }
 };
 

@@ -5,6 +5,7 @@
 // geometry and the session arrive as arguments; nothing here reads or holds engine state.
 #pragma once
 
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -13,7 +14,7 @@
 #include "basalt/models/qwen4exp/decode/layout.hpp"         // ModelGeometry
 #include "basalt/models/qwen4exp/decode/session.hpp"        // SessionState
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 /// How many of `xc`'s slots `need` bytes take, measured from the end (sized slots) or in whole blobs.
 int64_t cache_slots_for(const basalt::core::ExpertCache& xc, uint64_t need);
@@ -37,4 +38,4 @@ std::vector<int64_t> chunk_list(int64_t tokens, int64_t chunk, int64_t head);
 int64_t plan_lend(int64_t& chunk, const basalt::core::ExpertCache& xc, const basalt::core::ModelGeometry& g,
                   const basalt::core::SessionState& ss, bool prefill_auto, int64_t auto_ceiling, int auto_lend_pct);
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

@@ -1,7 +1,8 @@
 // src/models/qwen4exp/serve/memory.cpp - memory operations for the persistent engine.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 uint64_t serve_growth_bytes(const Options& o, const basalt::core::ModelGeometry& g) {
     if (!o.serve) return 0;
@@ -305,4 +306,4 @@ int QfnRuntime::init_memory() {
     return 0;
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

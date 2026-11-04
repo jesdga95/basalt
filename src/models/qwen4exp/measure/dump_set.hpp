@@ -5,6 +5,7 @@
 // They run at the end of a request, touch nothing else, and are the last of the dump modes to leave `generate.cpp`.
 #pragma once
 
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include <string>
 
 namespace basalt::core {
@@ -12,7 +13,7 @@ struct ModelGeometry;
 struct SessionState;
 }  // namespace basalt::core
 
-namespace basalt::program {
+namespace basalt::models::qwen4exp {
 
 struct Options;
 
@@ -29,4 +30,4 @@ struct HostDumpContext {
 int write_host_dumps(const HostDumpContext& c, std::string& err);
 
 }  // namespace measure
-}  // namespace basalt::program
+}  // namespace basalt::models::qwen4exp

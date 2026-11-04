@@ -1,7 +1,8 @@
 // src/models/qwen4exp/serve/qfn_image.cpp - a request's image positions and the quality gate's chunk.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 bool QfnRequest::parse_begin() { return !runtime_.mtp_on || runtime_.mtp.use_main(runtime_.err); }
 float QfnRequest::default_relax() const { return runtime_.o.relaxed_drafting; }
@@ -114,4 +115,4 @@ Flow QfnRequest::prepare_image() {
     return Flow::proceed;
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

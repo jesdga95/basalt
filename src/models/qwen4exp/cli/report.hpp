@@ -1,11 +1,12 @@
 #pragma once
 
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include <cstdint>
 #include <string>
 #include <vector>
 
-namespace basalt::program { struct Options; }
-namespace basalt::program::engine_local { struct Drive; }
+namespace basalt::models::qwen4exp { struct Options; }
+namespace basalt::models::qwen4exp::engine_local { struct Drive; }
 namespace basalt::core {
 struct ModelGeometry;
 struct TokenGraph;
@@ -21,7 +22,7 @@ class PleTable;
 namespace cpu { class ExpertPool; }
 }
 
-namespace basalt::program::cli {
+namespace basalt::models::qwen4exp::cli {
 
 struct StatsReport {
     const Options& o;
@@ -78,4 +79,4 @@ void print_routing_dump(const std::string& path, int64_t records);
 double print_generation(const Options& o, const std::vector<int64_t>& produced, int64_t n_prompt,
                         double total_ms, double prefill_ms, double ttft_ms);
 
-}  // namespace basalt::program::cli
+}  // namespace basalt::models::qwen4exp::cli

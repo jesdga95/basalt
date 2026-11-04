@@ -1,11 +1,12 @@
 // src/models/qwen4exp/load/engine_local.cpp - shared pool adapters and expert-tier ordering.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "engine_local.hpp"
 #include "basalt/log.hpp"
 
 #include <algorithm>
 #include <chrono>
 
-namespace basalt::program::engine_local {
+namespace basalt::models::qwen4exp::engine_local {
 
 using Clock = std::chrono::steady_clock;
 
@@ -95,4 +96,4 @@ size_t peer_hot_share_order(std::vector<std::pair<int32_t, int32_t>>& profile, s
     return n_moved;
 }
 
-}  // namespace basalt::program::engine_local
+}  // namespace basalt::models::qwen4exp::engine_local

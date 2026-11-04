@@ -1,9 +1,10 @@
 // basalt/program/serve/loan_moves.cpp - see loan_moves.hpp.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "loan_moves.hpp"
 
 #include <algorithm>
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 LoanSplit split_loan(const std::vector<LentEntry>& lent, int64_t first) {
     LoanSplit s;
@@ -34,4 +35,4 @@ int64_t plan_routed_trades(const float* use, const int32_t* slot, const uint8_t*
     return routed;
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

@@ -1,4 +1,5 @@
 // basalt/program/serve/loans.cpp - see loans.hpp.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "loans.hpp"
 
 #include <algorithm>
@@ -11,7 +12,7 @@
 
 #include "../load/engine_local.hpp"   // biggest_chunk
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 int64_t cache_slots_for(const basalt::core::ExpertCache& xc, uint64_t need) {
     if (xc.slot_offsets() != nullptr) {   // sized slots: from the end until they hold `need`
@@ -53,7 +54,7 @@ int64_t plan_lend(int64_t& chunk, const basalt::core::ExpertCache& xc, const bas
         // The scan bisects on the 256-token grid `request_chunk` rounds to: `bytes_needed` is a sum of (T x positive
         // constant) terms plus a max of such sums, so it rises monotonically with T and so does every test below.
 
-        const int64_t c = basalt::program::engine_local::biggest_chunk(auto_ceiling, [&](int64_t t) -> bool {
+        const int64_t c = basalt::models::qwen4exp::engine_local::biggest_chunk(auto_ceiling, [&](int64_t t) -> bool {
             const int64_t k = slots_for(t);
             return k + 128 <= xc.slots() && k * 100 <= auto_lend_pct * xc.slots();
         });
@@ -67,4 +68,4 @@ int64_t plan_lend(int64_t& chunk, const basalt::core::ExpertCache& xc, const bas
     return 0;
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

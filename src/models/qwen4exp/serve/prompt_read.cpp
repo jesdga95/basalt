@@ -1,7 +1,8 @@
 // src/models/qwen4exp/serve/prompt_read.cpp - request prompt_read operations.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 bool QfnRequest::read_part(int64_t a0, int64_t b0, std::string& e) {
     // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
@@ -196,4 +197,4 @@ bool QfnRequest::read_part(int64_t a0, int64_t b0, std::string& e) {
     return true;
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

@@ -51,7 +51,16 @@ if [[ -n "${hits}" ]]; then
   status=1
 fi
 
-# 5. targets, names and token ids: see the script
+# 5. a model's host code lives in its own namespace
+hits=$(grep -rnE 'namespace basalt::program' --include='*.[ch]pp' src/models/qwen4exp include/basalt/models/qwen4exp \
+         | grep -v 'shared_names.hpp' || true)
+if [[ -n "${hits}" ]]; then
+  echo "model layering: a model's code opens a shared namespace:" >&2
+  echo "${hits}" >&2
+  status=1
+fi
+
+# 6. targets, names and token ids: see the script
 python3 tools/check_model_layering.py || status=1
 
 exit ${status}

@@ -1,7 +1,8 @@
 // src/models/qwen4exp/serve/prompt_split.cpp - request prompt_split operations.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 QfnRequest::SplitPlan QfnRequest::split_plan(int64_t a0, int64_t b0, const char* no_split) {
     SplitPlan plan;
@@ -472,4 +473,4 @@ bool QfnRequest::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool&
     return true;
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

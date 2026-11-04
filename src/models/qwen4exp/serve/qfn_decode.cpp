@@ -1,8 +1,9 @@
 // src/models/qwen4exp/serve/qfn_decode.cpp - Flash-Next's side of the window loop: verify windows, drafts, adaptive rounds.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
 #include "../../../program/serve/decode_loop.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 namespace {
 // --draft-log FILE: one line per window (T, accepted, draft probabilities, ms) for draft-policy study
@@ -482,4 +483,4 @@ void QfnRequest::decode_end() {
 
 Flow QfnRequest::decode() { return decode_loop(*this); }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

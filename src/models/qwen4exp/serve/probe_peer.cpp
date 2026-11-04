@@ -1,5 +1,6 @@
 // src/models/qwen4exp/serve/probe_peer.cpp - the peer path `PROBE rates` measures: dec_moe_parity's host-rung rings on a
 // small synthetic expert set on the peer card, so no tier's residency or cache is read or written.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "basalt/program/probe_rates.hpp"
 
 #include "basalt/kernels/iq_kernels.hpp"
@@ -10,7 +11,7 @@
 
 namespace basalt::models::qwen4exp {
 
-using namespace basalt::program;
+using namespace basalt::models::qwen4exp;
 namespace K = basalt::kernels;
 namespace C = basalt::kernels::cpu;
 

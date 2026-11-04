@@ -1,10 +1,11 @@
 // src/models/qwen4exp/serve/qfn_request.hpp - a Flash-Next request: its state and its phases.
 #pragma once
 
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "../../../program/serve/request.hpp"
 #include "qfn_state.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 class QfnRequest final : public Request {
 public:
@@ -225,4 +226,4 @@ private:
     void prompt_parts_reset() override;
 };
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

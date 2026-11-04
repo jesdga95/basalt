@@ -1,6 +1,7 @@
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
 
-namespace basalt::program::generate {
+namespace basalt::models::qwen4exp::generate {
 
 int decode(Context& context) {
     auto& o = *context.o;
@@ -333,7 +334,7 @@ int decode(Context& context) {
     if (o.stage_timing) basalt::core::stage_timing_report(g.n_layers);
 
     const double decode_ms = cli::print_generation(o, produced, n_prompt, total_ms, prefill_ms, ttft_ms);
-    if (const int rc = basalt::program::measure::write_host_dumps({&o, &g, &ss}, err); rc != 0) return rc;
+    if (const int rc = basalt::models::qwen4exp::measure::write_host_dumps({&o, &g, &ss}, err); rc != 0) return rc;
 
     cli::print_stats({
         .o = o, .g = g, .drive = drive,

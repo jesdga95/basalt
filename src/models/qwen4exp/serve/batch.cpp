@@ -1,7 +1,8 @@
 // src/models/qwen4exp/serve/batch.cpp - batch operations for the persistent engine.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 namespace {
 // stable insertion sort for the few slots a window holds
@@ -492,4 +493,4 @@ int QfnRuntime::init_batch() {
     return 0;
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

@@ -1,9 +1,10 @@
 // basalt/models/qwen4exp/options.hpp - Flash-Next's flags on top of the common ones.
 #pragma once
 
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "basalt/program/options.hpp"
 
-namespace basalt::program {
+namespace basalt::models::qwen4exp {
 
 struct Options : CommonOptions {
     /// THE CONTEXT EXTENSION (rope scaling, rope_scaling.hpp).  These knobs resolve to ONE process config,
@@ -164,4 +165,4 @@ struct Options : CommonOptions {
     std::string ppl_base, ppl_out;    ///< --ppl-base, --ppl-out
 };
 
-}  // namespace basalt::program
+}  // namespace basalt::models::qwen4exp

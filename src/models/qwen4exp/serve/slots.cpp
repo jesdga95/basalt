@@ -1,7 +1,8 @@
 // src/models/qwen4exp/serve/slots.cpp - slots operations.
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
 
-namespace basalt::program::serve {
+namespace basalt::models::qwen4exp::serve {
 
 // a view of the solo session carrying slot b's state: what the request path and the solo verifier work on for a
 // request that runs in that slot
@@ -165,4 +166,4 @@ bool QfnRuntime::slot_digest(int b, int64_t upto, uint64_t* part) {
     return true;
 }
 
-}  // namespace basalt::program::serve
+}  // namespace basalt::models::qwen4exp::serve

@@ -1,3 +1,4 @@
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "report.hpp"
 
 #include "../load/engine_local.hpp"
@@ -9,7 +10,7 @@
 #include <algorithm>
 #include <cstdio>
 
-namespace basalt::program::cli {
+namespace basalt::models::qwen4exp::cli {
 
 void print_routing_dump(const std::string& path, int64_t records) {
     std::printf("%-24s %s (%lld records of layer, k, ids, weights)\n", "routing dumped",
@@ -166,4 +167,4 @@ double print_generation(const Options& o, const std::vector<int64_t>& produced, 
     return decode_ms;
 }
 
-}  // namespace basalt::program::cli
+}  // namespace basalt::models::qwen4exp::cli

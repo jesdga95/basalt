@@ -1,3 +1,4 @@
+#include "basalt/models/qwen4exp/shared_names.hpp"
 #include "control_vectors.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
@@ -11,7 +12,7 @@
 #include <cstdlib>
 #include <vector>
 
-namespace basalt::program::cli {
+namespace basalt::models::qwen4exp::cli {
 
 // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
 // summed; layer 0 has none) and `llama_adapter_cvec::apply` with the projection-mode patch (project: the unit
@@ -87,4 +88,4 @@ bool load_control_vectors(const Options& o, const basalt::core::ModelGeometry& g
     return true;
 }
 
-}  // namespace basalt::program::cli
+}  // namespace basalt::models::qwen4exp::cli
