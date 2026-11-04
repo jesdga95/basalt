@@ -1,4 +1,4 @@
-// src/plan/plan_main.cpp - the `basalt-plan` CLI: print the memory plan, or say why it does not close.
+// src/models/qwen4exp/plan/plan_main.cpp - the `basalt-plan` CLI: print the memory plan, or say why it does not close.
 //
 // The engine must adapt to the GPU it is running on, so the plan is computed from measured free VRAM and the
 // requested context rather than configured by hand.  This tool is that computation on its own, which is what
