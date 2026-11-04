@@ -5,6 +5,8 @@
 // never includes a model's headers, and models never include each other (tools/check_model_layering.sh).
 #pragma once
 
+#include "basalt/kernels/sampler.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -78,6 +80,9 @@ struct DecodeRequest {
     int64_t pos = 0;
     int32_t* next_token = nullptr;    ///< greedy token after the window's last row (optional)
     float* logits = nullptr;          ///< n_vocab logits after the window's last row (optional)
+    const kernels::SamplerParams* sampling = nullptr;   ///< how next_token is drawn (null: greedy)
+    const int32_t* history = nullptr; ///< the last `history_len` tokens the pick follows (host), for the penalties
+    int history_len = 0;
 };
 
 struct PrefillRequest {
@@ -86,6 +91,8 @@ struct PrefillRequest {
     int64_t pos = 0;
     std::function<void(int)> progress;   ///< optional: called with the tokens of this request read so far
     std::function<void(int)> live;       ///< optional: an estimate of the same, from a driver thread, inside a chunk
+    int total_tokens = 0;                ///< what the whole prompt still has to read, this part included: sizes the workspaces
+    bool more = false;                   ///< another part follows: the workspaces stay until end_prompt()
 };
 
 /// Model-owned per-conversation state (recurrent state, KV, windows).
@@ -96,11 +103,18 @@ public:
     virtual Result prefill_chunk(const PrefillRequest& r) = 0;
     /// Takes the memory the session will hold (expert tiers), so the first request does not wait for it.
     virtual Result prepare() { return {}; }
-    /// Keeps the state at `pos` (the end of the prompt's held text) so a later prompt can restart there. A session that
-    /// cannot rewind leaves the default.
-    virtual Result checkpoint(int64_t pos) { (void) pos; return {Status::NotImplemented, "this model keeps no checkpoint"}; }
-    /// Back to the last checkpoint: the next call continues at its position.
-    virtual Result rewind_to_checkpoint() { return {Status::NotImplemented, "this model keeps no checkpoint"}; }
+    /// The prompt is read: workspaces a part kept with `more` go back.
+    virtual void end_prompt() {}
+    /// A logit bias (device copy, n_vocab floats) for the next draws; null clears it.
+    virtual Result set_logit_bias(const float* bias) { (void) bias; return {Status::NotImplemented, "this model takes no logit bias"}; }
+    /// Draws the last decoded row's token again under `bias` (n_vocab floats): the grammar's mask.
+    virtual Result resample_last(const float* bias, int32_t& token) { (void) bias; (void) token; return {Status::NotImplemented, "this model cannot draw again"}; }
+    /// The last decoded row's logits (n_vocab floats).
+    virtual Result copy_logits(float* out) { (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
+    /// The running state at position `pos`: what cannot be rewound. Positional state stays valid below it.
+    virtual size_t running_bytes() const { return 0; }
+    virtual Result save_running(uint8_t* host, int64_t pos) { (void) host; (void) pos; return {Status::NotImplemented, "this model keeps no checkpoint"}; }
+    virtual Result restore_running(const uint8_t* host, int64_t pos) { (void) host; (void) pos; return {Status::NotImplemented, "this model keeps no checkpoint"}; }
     /// An encoded picture: `n_rows` embedding rows of the model's width (the encoder's whole block). Rows with no
     /// vision support leave the default.
     virtual Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows) {

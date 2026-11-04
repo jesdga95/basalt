@@ -318,7 +318,6 @@ Flow Request::restore() {
     runtime_.pp_from = read_from;
     runtime_.pp_reached = read_from;
     runtime_.pp_t0 = r0;
-    runtime_.pp_next_check = resume + runtime_.o.prompt_cache_every;
     prompt_parts_reset();
     // the cells past this request's room hold nothing it reads (the outgoing conversation is parked by now):
     // a longer one before it gives them back to the expert cache

@@ -7,6 +7,7 @@
 #include "basalt/ggml/ggml.h"
 
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/sampler.hpp"
 #include "basalt/models/deepseek41/attn_index.hpp"
 #include "basalt/models/deepseek41/kernels.hpp"
 #include "models/deepseek41/attn_batch.hpp"
@@ -109,6 +110,7 @@ public:
         for (int i = 0; i < r.n_tokens; ++i) {
             const bool last = i + 1 == r.n_tokens;
             std::string err;
+            if (last && !prepare_draw(r, err)) return {model::Status::Error, err};
             if (!step(r.tokens[i], r.pos + i, last, last ? r.next_token : nullptr, last ? r.logits : nullptr, err))
                 return {model::Status::Error, err};
         }
@@ -120,15 +122,16 @@ public:
         if (r.n_tokens > 1) {
             std::string err;
             const int batched = r.n_tokens;
+            const int plan_tokens = std::max(r.total_tokens, r.n_tokens);
             {
-                open_prompt_path(r.n_tokens);
-                if (r.n_tokens >= kLendTierTokens) {
+                open_prompt_path(plan_tokens);
+                if (plan_tokens >= kLendTierTokens) {
                     std::string te;
                     if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
                 }
                 // the caches take their memory before the prompt workspaces do
                 if (!ops_->ensure_positions(r.pos + r.n_tokens, err)) return prompt_failed(err);
-                if (!prefill_ && !make_prefill_fit(r.n_tokens, err)) {
+                if (!prefill_ && !make_prefill_fit(plan_tokens, err)) {
                     // a long context's caches left no room: a short tail takes the decode path, a longer read the tier's memory
                     if (r.n_tokens <= kStepTailTokens) {
                         close_prompt_path();
@@ -139,12 +142,12 @@ public:
                     std::string te;
                     err.clear();
                     if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
-                    if (!make_prefill_fit(r.n_tokens, err)) return prompt_failed(err);
+                    if (!make_prefill_fit(plan_tokens, err)) return prompt_failed(err);
                 }
                 prefill_->progress = r.progress;
                 prefill_->live = r.live;
                 if (!prefill_->run(r.tokens, batched, r.pos, hist_, err)) return prompt_failed(err);
-                close_prompt_path();
+                if (!r.more) close_prompt_path();
             }
             return {};
         }
@@ -161,18 +164,51 @@ public:
         return {};
     }
 
-    model::Result checkpoint(int64_t pos) override {
+    size_t running_bytes() const override { return ops_ ? ops_->turn_bytes() : 0; }
+
+    model::Result save_running(uint8_t* host, int64_t pos) override {
         sync_rewind(pos);
         if (!ops_) return {model::Status::NotImplemented, "no state yet"};
-        ops_->save_turn(stream_);
-        ck_pos_ = pos;
+        ops_->save_turn(stream_, host);
         return {};
     }
 
-    model::Result rewind_to_checkpoint() override {
-        if (ck_pos_ < 0 || !ops_) return {model::Status::Error, "no checkpoint"};
-        ops_->restore_turn(stream_);
-        if ((int64_t) hist_.size() > ck_pos_) hist_.resize((size_t) ck_pos_);
+    model::Result restore_running(const uint8_t* host, int64_t pos) override {
+        if (!ops_) return {model::Status::Error, "no state yet"};
+        ops_->restore_turn(stream_, host);
+        if ((int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
+        return {};
+    }
+
+    void end_prompt() override {
+        if (prefill_) close_prompt_path();
+    }
+
+    model::Result set_logit_bias(const float* bias) override {
+        bias_on_ = bias != nullptr;
+        if (!bias_on_) return {};
+        std::string e;
+        if (!device_bias(d_bias_, bias, e)) return {model::Status::Error, e};
+        return {};
+    }
+
+    model::Result resample_last(const float* bias, int32_t& token) override {
+        std::string e;
+        if (!device_bias(d_mask_, bias, e)) return {model::Status::Error, e};
+        kernels::SamplerParams sp = sampling_;
+        sp.logit_bias = d_mask_;
+        kernels::sample_tokens(logits_, 1, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sp, am_dev_, stream_);
+        if (cudaMemcpyAsync(h_next_, am_dev_, sizeof(int32_t), cudaMemcpyDeviceToHost, stream_) != cudaSuccess ||
+            cudaStreamSynchronize(stream_) != cudaSuccess)
+            return {model::Status::Error, "the masked draw failed"};
+        token = *h_next_;
+        return {};
+    }
+
+    model::Result copy_logits(float* out) override {
+        cudaStreamSynchronize(stream_);
+        if (cudaMemcpy(out, logits_, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+            return {model::Status::Error, "the head logits copy failed"};
         return {};
     }
 
@@ -280,6 +316,47 @@ private:
         prefill_.reset();
         if (!t->reclaim(e)) basalt::log::warn("basalt deepseek41", "VRAM expert tier stays closed: %s", e.c_str());
         t->grow();
+    }
+
+    bool device_bias(float*& dev, const float* host, std::string& err) {
+        const size_t bytes = (size_t) g_.n_vocab * sizeof(float);
+        if (dev == nullptr) {
+            void* v = nullptr;
+            if (cudaMalloc(&v, bytes) != cudaSuccess) { err = "out of device memory for a logit bias"; return false; }
+            allocs_.push_back(v);
+            dev = (float*) v;
+        }
+        if (cudaMemcpy(dev, host, bytes, cudaMemcpyHostToDevice) != cudaSuccess) { err = "the logit bias upload failed"; return false; }
+        return true;
+    }
+
+    // How the next pick is drawn: the shared sampler when the request samples, biases or penalizes, else the argmax.
+    bool prepare_draw(const model::DecodeRequest& r, std::string& err) {
+        history_len_ = 0;
+        draw_kernel_ = false;
+        if (r.sampling == nullptr) return true;
+        sampling_ = *r.sampling;
+        sampling_.logit_bias = bias_on_ ? d_bias_ : nullptr;
+        history_len_ = r.history != nullptr ? r.history_len : 0;
+        draw_kernel_ = !sampling_.greedy || bias_on_ || history_len_ > 0;
+        if (!sampling_.greedy && kernels::sampler_list_len(sampling_.top_k, g_.n_vocab) > kernels::kSamplerNarrowMax &&
+            !kernels::sampler_wide_reserve(g_.n_vocab, stream_)) {
+            err = "out of device memory for the sampler";
+            return false;
+        }
+        if (history_len_ > 0) {
+            if (d_hist_ == nullptr) {
+                void* v = nullptr;
+                if (cudaMalloc(&v, (size_t) kHistoryCap * sizeof(int32_t)) != cudaSuccess) { err = "out of device memory for the penalties"; return false; }
+                allocs_.push_back(v);
+                d_hist_ = (int32_t*) v;
+            }
+            if (cudaMemcpy(d_hist_, r.history, (size_t) history_len_ * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = "the penalty history upload failed";
+                return false;
+            }
+        }
+        return true;
     }
 
     bool fail(const std::string& s) {
@@ -526,6 +603,13 @@ private:
         dump("result_norm", -1, pos, normed_, n * sizeof(float));
         const DevTensor* head = m_.tensor("output.weight");
         dense_f32(*head, normed_, q8_, logits_, (int) n, g_.n_vocab, 1, st);
+        if (next && !logits_out && draw_kernel_) {
+            kernels::sample_tokens(logits_, 1, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sampling_, am_dev_, st);
+            DS_CUDA(cudaMemcpyAsync(h_next_, am_dev_, sizeof(int32_t), cudaMemcpyDeviceToHost, stream_));
+            DS_CUDA(cudaStreamSynchronize(stream_));
+            *next = *h_next_;
+            return true;
+        }
         if (next && !logits_out) {
             // greedy: the id comes back, not the logits
             argmax_index(logits_, g_.n_vocab, am_dev_, am_ws_, st);
@@ -550,7 +634,13 @@ private:
     DsModel& m_;
     const Geometry& g_;
     std::vector<cudaGraphExec_t> head_g_, tail_g_;
-    int64_t ck_pos_ = -1;   // position of the last checkpoint
+    static constexpr int kHistoryCap = 4096;
+    kernels::SamplerParams sampling_{};
+    bool draw_kernel_ = false, bias_on_ = false;
+    int history_len_ = 0;
+    float* d_bias_ = nullptr;
+    float* d_mask_ = nullptr;
+    int32_t* d_hist_ = nullptr;
     cudaStream_t stream_ = nullptr;
     std::unique_ptr<LayerOps> ops_;
     std::unique_ptr<Prefill> prefill_;
