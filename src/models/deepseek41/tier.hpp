@@ -59,6 +59,10 @@ public:
     /// allocated); `grow` takes the memory freed after them as extra slots. Residency in those slots is dropped.
     void shrink();
     void grow();
+    /// A long prompt streams every expert from RAM and needs the card for its chunks: the VRAM slots go back whole, and
+    /// reclaim() opens them again empty.
+    void lend_all();
+    bool reclaim(std::string& err);
 
     /// Called before each token: the promotions queued during the previous token finish and become resident, so what a
     /// lookup finds depends only on the routing history.
@@ -114,6 +118,7 @@ private:
     int64_t per_layer_ = 0;                 ///< VRAM slots each layer owns in the base arena
     core::ExpertCache ext_;                 ///< slots beside the base arena, open only while no prompt workspace is
     int64_t ext_per_layer_ = 0;             ///< slots each layer owns in `ext_`
+    int64_t lent_per_layer_ = 0;            ///< base slots given up by lend_all(), 0 when none
     std::vector<int32_t> res_;              ///< [layer * n_expert + e] VRAM slot or -1
     std::vector<uint64_t> stamp_;           ///< [layer * n_expert + e] last use
     std::vector<int32_t> owner_;            ///< [slot] expert it holds or is receiving, or -1

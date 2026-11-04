@@ -445,6 +445,33 @@ void ExpertTier::shrink() {
     ext_per_layer_ = 0;
 }
 
+void ExpertTier::lend_all() {
+    if (lent_per_layer_ > 0 || !cache_.valid()) return;
+    shrink();
+    cudaStreamSynchronize(copy_stream_);
+    cudaStreamSynchronize(fetch_stream_);
+    drain();
+    std::fill(res_.begin(), res_.end(), -1);
+    owner_.clear();
+    busy_.clear();
+    lent_per_layer_ = per_layer_;
+    per_layer_ = 0;
+    cache_.close();
+}
+
+bool ExpertTier::reclaim(std::string& err) {
+    if (lent_per_layer_ == 0) return true;
+    std::vector<int64_t> slot_bytes;
+    for (int l = 0; l < n_layers_; ++l)
+        for (int64_t s = 0; s < lent_per_layer_; ++s) slot_bytes.push_back((int64_t) m_.pack().experts[(size_t) l].blob_bytes);
+    if (!cache_.open_sized(slot_bytes, n_layers_, n_expert_, err)) return false;
+    per_layer_ = lent_per_layer_;
+    lent_per_layer_ = 0;
+    owner_.assign(slot_bytes.size(), -1);
+    busy_.assign(slot_bytes.size(), 0);
+    return true;
+}
+
 void ExpertTier::grow() {
     if (ext_per_layer_ > 0 || per_layer_ >= n_expert_ || !cache_.valid()) return;
     size_t free_b = 0, total_b = 0;

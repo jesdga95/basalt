@@ -2,7 +2,7 @@
 //
 // Replays the attention, routed-expert and shared-expert outputs recorded from the reference implementation, so the
 // rest of the layer loop (embedding, Engram, hyper-connections, norms, router, head) is checked against the same
-// recording without those kernels. `BASALT_DS_FIXTURE=<prefix>` reads `<prefix>.bin` and `<prefix>.idx`; the index
+// recording without those kernels. `--diag-fixture <prefix>` reads `<prefix>.bin` and `<prefix>.idx`; the index
 // has a first line `n_prompt N` and then one `step name layer offset nbytes` line per recorded tensor.
 #include "models/deepseek41/layer_ops.hpp"
 #include "models/deepseek41/model.hpp"
