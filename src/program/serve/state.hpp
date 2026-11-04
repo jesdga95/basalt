@@ -155,6 +155,21 @@ public:
             std::optional<basalt::program::grammar::PackVocab>& vocab_tables)
         : o(options), model_file(file), err(error), n_vocab(vocab), grammar_vocab(vocab_tables) {}
     virtual ~Runtime() = default;
+    Flow dispatch();
+    // ---- what a model answers: one call per batch window at most, the rest per command or per request
+    virtual bool windows_in_flight() = 0;
+    virtual bool next_batch_window() = 0;
+    virtual bool drain_windows() = 0;
+    virtual void script_command(const std::string& line) = 0;
+    virtual void probe_command(const std::string& line, std::string& e) = 0;
+    virtual bool vram_command(const std::string& cmd, std::string& e, bool for_sleep, std::string* reply = nullptr) = 0;
+    virtual void sleep_command(bool down, std::string& e) = 0;
+    virtual void between_requests(const std::string& line) = 0;
+    virtual Flow run_request() = 0;
+    virtual bool slot0_solo() const = 0;   // slot 0 of the batch windows is the solo session
+    virtual void enc_command(const std::string& cmd) = 0;
+    virtual size_t spill_to_disk(bool at_exit, size_t limit) = 0;
+    virtual bool park_idle_engine(std::string& e) = 0;
     basalt::program::CommonOptions& o;
     basalt::core::ModelFile& model_file;
     std::string& err;
@@ -314,6 +329,16 @@ public:
     explicit QfnRuntime(Context& context)
         : Runtime(context.o, context.model_file, context.err, context.n_vocab, context.grammar_vocab), Context(context) {}
     int execute();
+
+    bool windows_in_flight() override;
+    bool next_batch_window() override;
+    bool drain_windows() override;
+    void script_command(const std::string& line) override;
+    void probe_command(const std::string& line, std::string& e) override;
+    void sleep_command(bool down, std::string& e) override;
+    void between_requests(const std::string& line) override;
+    Flow run_request() override;
+    bool slot0_solo() const override { return slot0_is_solo; }
 
 private:
     friend class QfnRequest;
@@ -555,7 +580,7 @@ private:
     int32_t loan_plan(int64_t live, int64_t& chunk);
     void relend();
     bool home_given_up(int64_t live, std::string& e);
-    bool vram_command(const std::string& cmd, std::string& e, bool for_sleep, std::string* reply = nullptr);
+    bool vram_command(const std::string& cmd, std::string& e, bool for_sleep, std::string* reply = nullptr) override;
     int64_t cache_floor_slots();
     bool move_routed_below(int64_t first, const char* why, std::string& e,
                            const std::vector<serve_loans::LentEntry>* lent_out = nullptr);
@@ -571,8 +596,8 @@ private:
     std::vector<std::pair<double, int>> idle_list(const basalt::core::SessionState* s, bool any);
     int64_t park_idle(const basalt::core::SessionState* s, int64_t need, bool any, std::string& e);
     bool park_one(int b, std::string& e);
-    bool park_idle_engine(std::string& e);
-    void enc_command(const std::string& cmd);
+    bool park_idle_engine(std::string& e) override;
+    void enc_command(const std::string& cmd) override;
     bool copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& e);
     bool hold_slot(int b, const ConvCheckpoint* at, std::string& e);
     bool copy_from_slot(int b, const ConvCheckpoint* at, std::string& e);
@@ -584,7 +609,7 @@ private:
     bool group_active(int gi);
     bool pump(bool may_start);
     bool pipe_drain();
-    size_t spill_to_disk(bool at_exit, size_t limit);
+    size_t spill_to_disk(bool at_exit, size_t limit) override;
     bool probe_adapt(const std::string& cmd, std::string& e);
     int init_prompt();
     int init_verify();
@@ -596,7 +621,6 @@ private:
     int capture_windows();
     int init_batch();
     int run_requests();
-    Flow dispatch();
     int shutdown();
 };
 
