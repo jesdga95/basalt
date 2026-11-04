@@ -695,7 +695,9 @@ class Service:
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
-            "context": {"native": ctx, "max_positions": ctx},
+            # the cells of K/V all sessions together can hold before a request is refused (None: no elastic KV)
+            "context": {"native": ctx, "max_positions": ctx,
+                        "elastic_kv_ceiling": (getattr(self.engine, "info", {}) or {}).get("elastic_kv_ceiling")},
             "concurrency": {"serving": max(1, int(getattr(self.engine, "batch", 0) or 0)),
                             "requested": max(1, int(getattr(self.engine, "batch", 0) or 0))},
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
