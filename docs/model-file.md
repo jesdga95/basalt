@@ -38,7 +38,7 @@ the pack has no MTP drafter, expert profile or `hc8` section:
 
 - `dense` holds the float tensors (F32 and BF16: norms, hyper-connection weights, router, compressor and indexer
   projections), `gguf` the quantized non-expert tensors (Q6_K, Q5_K, Q8_0), `experts` and `experts.layout` the routed
-  experts per layer (IQ1_S, IQ2_XXS or IQ2_XS gate/up; IQ1_S, IQ2_XXS, IQ2_XS or IQ2_S down, as the GGUF mixes them).
+  experts per layer (IQ1_S, IQ1_M, IQ2_XXS or IQ2_XS gate/up; the same or IQ2_S down, as the GGUF mixes them).
 - `engram` holds the Engram table (`per_layer_token_embd.weight`, rows of 256 IQ4_NL values, 144 bytes) alone, 2 MiB
   aligned, so a row can be read with `O_DIRECT`.
 - `vision/mmproj` holds the vision projector GGUF as published; it is present only when the pack is built with
