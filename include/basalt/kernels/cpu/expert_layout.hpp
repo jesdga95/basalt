@@ -16,16 +16,16 @@ namespace basalt::kernels::cpu {
 
 struct ExpertLayout {
     bool native = false;
-    int64_t n_layers = 0, n_expert = NE;
+    int64_t n_layers = 0, n_expert = 0;
     std::vector<NativeFmt> fmt;           ///< per layer
     std::vector<uint64_t> offset, bytes;  ///< per layer: where its 512 blobs start, bytes per blob
     int version = 0;                      ///< the layout header's version (0 = none given)
-    uint64_t max_blob = BLOB;
+    uint64_t max_blob = 0;
     uint64_t total = 0;                   ///< the experts section's size
 
-    uint64_t blob_bytes(int64_t layer) const { return native ? bytes[(size_t) layer] : (uint64_t) BLOB; }
+    uint64_t blob_bytes(int64_t layer) const { return bytes[(size_t) layer]; }
     uint64_t layer_offset(int64_t layer) const {
-        return native ? offset[(size_t) layer] : (uint64_t) layer * (uint64_t) n_expert * (uint64_t) BLOB;
+        return offset[(size_t) layer];
     }
     uint64_t blob_offset(int64_t layer, int64_t expert) const {
         return layer_offset(layer) + (uint64_t) expert * blob_bytes(layer);
@@ -65,7 +65,7 @@ const ExpertLayout& expert_layout();
 /// `layer gu_type d_type offset blob_bytes`; further columns are ignored).  A newer version is refused.
 /// `n_embd` / `n_ff` / `swiglu_limit`: the model's expert geometry.
 bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err,
-                             int64_t n_embd = H, int64_t n_ff = FF, float swiglu_limit = 0.f);
+                             int64_t n_embd, int64_t n_ff, float swiglu_limit = 0.f);
 /// The newest layout version this engine reads.
 inline constexpr int kExpertLayoutVersion = 6;   // v6: NVFP4 blobs end in a 16-byte scale tail
 

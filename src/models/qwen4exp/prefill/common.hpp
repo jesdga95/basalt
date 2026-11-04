@@ -2,6 +2,7 @@
 
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/models/qwen4exp/kernels/cpu_geometry.hpp"
 #include "basalt/models/qwen4exp/prefill/gemm.hpp"
 #include <algorithm>
 #include <chrono>

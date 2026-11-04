@@ -7,6 +7,7 @@
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/models/qwen4exp/kernels/cpu_geometry.hpp"
 #include "basalt/models/qwen4exp/kernels/native_moe.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/models/qwen4exp/kernels/cvec.hpp"

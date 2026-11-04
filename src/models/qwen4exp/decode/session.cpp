@@ -9,6 +9,7 @@
 #include "basalt/kernels/quantize_act.hpp"
 #include "basalt/models/qwen4exp/kernels/s2_expert_grouped.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/models/qwen4exp/kernels/cpu_geometry.hpp"
 #include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/platform/compiler.hpp"
 

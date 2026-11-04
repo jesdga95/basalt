@@ -1,8 +1,10 @@
 // src/models/qwen4exp/decode/expert_dispatch.cpp - the pool's side of a layer: which routed experts go where.
 #include "basalt/core/expert_source.hpp"
+#include "basalt/models/qwen4exp/decode/expert_dispatch.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/models/qwen4exp/kernels/cpu_geometry.hpp"
 #include "basalt/core/pinned.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/direct_file.hpp"
@@ -67,78 +69,10 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
         d.fail_layer = d.layers;
         return;
     }
-    if (expert_layout().native) {
-        // a native pack runs its experts in verify windows only (the driver guarantees it)
-        d.failed = true;
-        d.fail = "the single-token expert path does not take a native (IQ) pack";
-        d.fail_layer = d.layers;
-        return;
-    }
-    advise_routed(d, ids, k);
-    if (k > (int64_t) d.jobs.size()) d.jobs.resize((size_t) k);
-
-    // Clause 1: rebuilt from `x_f` on EVERY call.  `x_f` is mapped pinned memory whose address never changes,
-    // so anything cached against it would be layer 0's activation reused 48 times.
-    act_quant_q8_1(x_f, H, d.act);
-
-    // ---- THE POOL'S HALF OF THE SPLIT.  **IT DOES NOT DECIDE ANYTHING - `Launch` ALREADY DID.**
-    //
-    // The decision has to be made on THIS layer's ids, and `Launch` is the only callback that runs before the
-    // pool while the ids are known (the doorbell publishes them when the ring fires).  So `expert_hit_run`
-    // decides, and this consumes `d.is_hit`.  Deciding here instead would make `Launch` compute the PREVIOUS
-    // layer's experts into this layer's rows.
-    //
-    // `njobs` indexes the JOB ARRAY and `i` indexes the OUTPUT - they are the same only when nothing is a hit.
-    const bool graph_hits = d.host_res != nullptr;
-    const bool use_hits = graph_hits || (d.hits_ready() && d.decided);
-    int64_t njobs = 0;
-
-    for (int64_t i = 0; i < k; ++i) {
-        const int64_t e = ids[i];
-        if (e < 0 || e >= d.n_expert) {
-            d.failed = true;
-            d.fail = "a routed expert id is out of range";
-            d.fail_layer = d.layers;
-            d.fail_expert = e;
-            return;
-        }
-        const uint8_t* b = d.src->blob(d.layers, e);
-        if (b == nullptr) {
-            // The one failure the loop cannot see.  Leaving `out` at its previous contents would feed the NEXT
-            // layer a stale expert vector, which `moe_combine` would weight and add - the token would still be
-            // finite and would still be wrong, 48 layers deep.
-            d.failed = true;
-            d.fail = "the expert source could not produce a blob";
-            d.fail_layer = d.layers;
-            d.fail_expert = e;
-            ++d.missing;
-            return;
-        }
-        // A hit's row was zeroed by `Launch` and belongs to the GPU; the pool must not touch it.
-        if (use_hits && (graph_hits ? d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0
-                                    : d.is_hit[(size_t) i] != 0)) {
-            if (graph_hits) ++d.cache_hits;
-            // The GPU owns this row and `hit_out` is zeroed, so the CPU's contribution is zero - but
-            // `y_miss` is a REUSED pinned buffer, so the row must be written, not merely skipped.
-            std::memset(out + (size_t) i * (size_t) n_embd, 0, (size_t) n_embd * sizeof(float));
-            continue;
-        }
-        if (graph_hits) ++d.cache_refused;   // token graph: a miss (nothing is admitted during a token)
-
-        // `njobs` indexes the JOB ARRAY and `i` indexes the OUTPUT - they are the same only when nothing is a
-        // hit, and using one for the other is how a hit's row would get two experts summed into it.
-        ExpertJob& j = d.jobs[(size_t) njobs++];
-        j.blob = b;
-        j.act = &d.act;             // SHARED across the batch: one conversion serves all ten experts
-        j.out = out + (size_t) i * (size_t) n_embd;
-        j.weight = 1.0f;            // clause 2: a diagnostic field, NOT the router weight
-        j.slot = (int) i;
-    }
-
-    // rows of every expert across all threads (bitwise the same as `run`).
-    d.pool->run_split(d.jobs.data(), (int) njobs);
-    ++d.layers;
-    d.experts += k;
+    // a native pack runs its experts in verify windows only (the driver guarantees it)
+    d.failed = true;
+    d.fail = "the single-token expert path does not take a native (IQ) pack";
+    d.fail_layer = d.layers;
 }
 
 namespace {
@@ -355,8 +289,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     const auto c3 = std::chrono::steady_clock::now();
     if (njobs > 0) {
-        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
-        else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+        d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
     }
     if (d.peer != nullptr && !ext) {         // multi-GPU: the second GPU's rows, into the same mapped rows
         std::string perr;

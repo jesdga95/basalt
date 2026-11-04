@@ -393,51 +393,33 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
         err = "FileExpertSource: the loaded expert layout has an invalid size";
         return false;
     }
-    if (!layout.native) {
-        if (blob_count > std::numeric_limits<uint64_t>::max() / (uint64_t) basalt::kernels::cpu::BLOB) {
-            err = "FileExpertSource: the canonical expert size overflows";
+    if (layout.offset.size() != (size_t) n_layers || layout.bytes.size() != (size_t) n_layers ||
+        layout.fmt.size() != (size_t) n_layers) {
+        err = "FileExpertSource: the native expert layout is incomplete";
+        return false;
+    }
+    uint64_t at = 0;
+    for (int64_t layer = 0; layer < n_layers; ++layer) {
+        const size_t i = (size_t) layer;
+        const uint64_t bytes = (uint64_t) layout.fmt[i].bytes;
+        if (layout.offset[i] != at || bytes == 0 || layout.bytes[i] != bytes ||
+            bytes > std::numeric_limits<uint64_t>::max() / (uint64_t) n_expert) {
+            err = "FileExpertSource: the native expert layout is invalid at layer " + std::to_string(layer);
             return false;
         }
-        const uint64_t canonical_size = blob_count * (uint64_t) basalt::kernels::cpu::BLOB;
-        if (want != canonical_size) {
-            err = "FileExpertSource: the canonical expert layout has an inconsistent size";
+        const uint64_t layer_bytes = bytes * (uint64_t) n_expert;
+        if (at > want || layer_bytes > want - at) {
+            err = "FileExpertSource: the native expert layout exceeds its declared size at layer " +
+                  std::to_string(layer);
             return false;
         }
-        const uint64_t bytes = (uint64_t) basalt::kernels::cpu::BLOB;
-        const uint64_t layer_bytes = (uint64_t) n_expert * bytes;
-        for (int64_t layer = 0; layer < n_layers; ++layer) {
-            layer_offsets[(size_t) layer] = (uint64_t) layer * layer_bytes;
-            layer_blob_bytes[(size_t) layer] = bytes;
-        }
-    } else {
-        if (layout.offset.size() != (size_t) n_layers || layout.bytes.size() != (size_t) n_layers ||
-            layout.fmt.size() != (size_t) n_layers) {
-            err = "FileExpertSource: the native expert layout is incomplete";
-            return false;
-        }
-        uint64_t at = 0;
-        for (int64_t layer = 0; layer < n_layers; ++layer) {
-            const size_t i = (size_t) layer;
-            const uint64_t bytes = (uint64_t) layout.fmt[i].bytes;
-            if (layout.offset[i] != at || bytes == 0 || layout.bytes[i] != bytes ||
-                bytes > std::numeric_limits<uint64_t>::max() / (uint64_t) n_expert) {
-                err = "FileExpertSource: the native expert layout is invalid at layer " + std::to_string(layer);
-                return false;
-            }
-            const uint64_t layer_bytes = bytes * (uint64_t) n_expert;
-            if (at > want || layer_bytes > want - at) {
-                err = "FileExpertSource: the native expert layout exceeds its declared size at layer " +
-                      std::to_string(layer);
-                return false;
-            }
-            layer_offsets[i] = layout.offset[i];
-            layer_blob_bytes[i] = bytes;
-            at += layer_bytes;
-        }
-        if (at != want) {
-            err = "FileExpertSource: the native expert layout has an inconsistent size";
-            return false;
-        }
+        layer_offsets[i] = layout.offset[i];
+        layer_blob_bytes[i] = bytes;
+        at += layer_bytes;
+    }
+    if (at != want) {
+        err = "FileExpertSource: the native expert layout has an inconsistent size";
+        return false;
     }
     const std::string& path = experts.path;
     uint64_t fsize = 0;
