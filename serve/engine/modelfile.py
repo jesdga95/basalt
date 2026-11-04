@@ -7,6 +7,7 @@ import shutil
 import struct
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -122,20 +123,46 @@ def vision_config(mf: ModelFile, engine_bin: str, sidecar: bool = True) -> dict:
     return {"vision_bin": str(side), "mmproj": str(mmproj), "model": str(vocab)}
 
 
-def model_config(path: str, engine_bin: str, vision: bool | str = False,
-                 engine_words: list[str] | None = None) -> dict:
-    """The engine settings the file implies; `engine_words` follow its arguments as given (the engine's parser lets a
-    later flag win), `vision` (a GPU number as a string, or "cpu") adds the sidecar and "dynamic" the in-engine
-    encoder (ValueError if it cannot be set up)."""
+@dataclass(frozen=True)
+class ModelSpec:
+    """One model the server runs. `engine_words` are its engine flags as given; its KV, context and slots are read
+    from them, so the engine's parser stays the one that decides. `vision`: a GPU number as a string, "cpu" or
+    "dynamic". `gpu`: as --gpu."""
+    path: str
+    alias: str | None = None
+    gpu: object = None
+    vision: bool | str = False
+    engine_words: tuple[str, ...] = ()
+
+    @property
+    def kv(self) -> str | None:
+        return flag_value(list(self.engine_words), "--kv")
+
+    @property
+    def max_context(self) -> int | None:
+        v = flag_value(list(self.engine_words), "--max-context")
+        return int(v) if v else None
+
+    @property
+    def parallel(self) -> int | None:
+        v = flag_value(list(self.engine_words), "--batch")
+        return int(v) if v else None
+
+
+def model_config(spec: ModelSpec, engine_bin: str) -> dict:
+    """The engine settings a model implies; its `engine_words` follow its arguments as given (the engine's parser lets
+    a later flag win), its `vision` adds the sidecar or, "dynamic", the in-engine encoder (ValueError if it cannot be
+    set up)."""
+    path, vision = spec.path, spec.vision
     mf = ModelFile(path)
     meta = json.loads(mf.read("meta"))
     path = os.path.abspath(path)
     cdir = cache_dir(mf)
-    words = with_conversation_dir(list(engine_words or []), cdir)
+    words = with_conversation_dir(list(spec.engine_words), cdir)
     args = ["--model", path]   # settings come from the engine defaults and the server
     args += words
     cdir.mkdir(parents=True, exist_ok=True)
-    cfg = {"engine_bin": os.path.abspath(engine_bin), "args": args, "model_name": meta.get("name") or "basalt",
+    cfg = {"engine_bin": os.path.abspath(engine_bin), "args": args, "model_name": spec.alias or meta.get("name") or "basalt",
            "sampling": sampling_defaults(meta),
            "arch": (meta.get("gguf_kv") or {}).get("general.architecture"), "log": str(cdir / "engine.log"),
            "tokenizer": str(extract_tokenizer(mf))}
