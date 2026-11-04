@@ -392,6 +392,7 @@ private:
         rt_.session().end_prompt();
         return Flow::proceed;
     }
+    bool turn_checkpoint_at_last_token() const override { return true; }
 
     void progress_line(const char* tag, int64_t at_pos) {
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();

@@ -139,6 +139,8 @@ protected:
     virtual void prompt_parts_begin() {}
     virtual Flow read_to(int64_t to) = 0;
     virtual Flow prompt_end() { return Flow::proceed; }
+    /// A template whose turn token opens the user's turn: the turn's checkpoint sits before the prompt's last token.
+    virtual bool turn_checkpoint_at_last_token() const { return false; }
     // ---- restoring a conversation: what it does to the model's sessions.  Per request.
     virtual bool cvec_wanted() const { return true; }
     virtual void set_cvec() {}
