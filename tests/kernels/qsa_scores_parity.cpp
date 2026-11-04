@@ -6,7 +6,7 @@
 //   qsa_scores_parity [iters]
 #include "basalt/kernels/qsa.hpp"
 #include "basalt/kernels/qsa_seg.hpp"
-#include "basalt/kernels/qsa_select.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_select.hpp"
 
 #include <cuda_runtime.h>
 

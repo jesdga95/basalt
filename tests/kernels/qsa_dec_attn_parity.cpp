@@ -4,7 +4,7 @@
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/native_qsa.hpp"
 #include "basalt/kernels/qsa.hpp"
-#include "basalt/kernels/qsa_dec_attn.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_dec_attn.hpp"
 #include "basalt/kernels/qsa_decode_attn.hpp"
 
 #include <cuda_fp16.h>

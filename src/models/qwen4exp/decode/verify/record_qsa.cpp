@@ -13,10 +13,10 @@
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/qsa.hpp"
 #include "basalt/kernels/qsa_decode_attn.hpp"
-#include "basalt/kernels/qsa_dec_attn.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_dec_attn.hpp"
 #include "basalt/kernels/qsa_dec_fused.hpp"
-#include "basalt/kernels/qsa_mid.hpp"
-#include "basalt/kernels/qsa_select.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_mid.hpp"
+#include "basalt/models/qwen4exp/kernels/qsa_select.hpp"
 
 namespace basalt::core {
 using namespace verify_detail;

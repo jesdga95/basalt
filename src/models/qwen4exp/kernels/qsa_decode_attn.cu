@@ -1,4 +1,4 @@
-// src/kernels/cuda/qsa_decode_attn.cu - see include/basalt/kernels/qsa_decode_attn.hpp.
+// src/models/qwen4exp/kernels/qsa_decode_attn.cu - see include/basalt/kernels/qsa_decode_attn.hpp.
 #include "basalt/kernels/qsa_decode_attn.hpp"
 #include "basalt/kernels/kv_q8.hpp"
 #include "basalt/kernels/packed_byte.hpp"
