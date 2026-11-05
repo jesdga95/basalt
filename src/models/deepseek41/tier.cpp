@@ -47,6 +47,10 @@ ExpertTier::~ExpertTier() {
         worker_.join();
     }
     report("final");
+    if (peer_ && !peer_moves_.empty()) {
+        std::string e;
+        peer_->read_wait(e);
+    }
     if (copy_stream_) cudaStreamSynchronize(copy_stream_);
     if (fetch_stream_) cudaStreamSynchronize(fetch_stream_);
     for (cudaEvent_t e : events_) cudaEventDestroy(e);
@@ -265,6 +269,7 @@ bool ExpertTier::load_ram(std::string& err) {
     std::vector<int32_t> device_home;   // [layer * n_expert + e] the slot of a home on either card, or -1
     if (homes_.main > 0 || homes_.peer > 0) device_home.assign((size_t) n_layers_ * n_expert_, -1);
     if (peer_) {
+        peer_owner_.assign((size_t) n_layers_ * homes_.peer, -1);
         std::vector<int64_t> sizes;
         for (int l = 0; l < n_layers_; ++l)
             for (int s = 0; s < homes_.peer; ++s) sizes.push_back((int64_t) m_.pack().experts[(size_t) l].blob_bytes);
@@ -287,6 +292,7 @@ bool ExpertTier::load_ram(std::string& err) {
                 case policy::Place::Peer: {
                     const int32_t slot = (int32_t) ((int64_t) l * homes_.peer + n_peer++);
                     peer_->admit(l, e, slot);
+                    peer_owner_[(size_t) slot] = e;
                     device_home[idx] = slot;
                     break;
                 }
@@ -448,6 +454,18 @@ void ExpertTier::drain() {
         }
     }
     pending_.clear();
+    if (peer_moves_.empty()) return;
+    std::string err;
+    peer_->read_wait(err);
+    for (const PeerMove& m : peer_moves_) {
+        const size_t base = (size_t) m.layer * n_expert_;
+        peer_->admit(m.layer, m.out, -1);
+        peer_->admit(m.layer, m.in, m.slot);
+        ram_idx_[base + m.out] = m.place;
+        spare_[(size_t) m.layer] = ram_idx_[base + m.in];
+        ram_idx_[base + m.in] = -1;
+    }
+    peer_moves_.clear();
 }
 
 void ExpertTier::settle() {
@@ -621,13 +639,9 @@ bool ExpertTier::run_cpu(int layer, const float* x, const Lookup& lk, float* row
 }
 
 
-int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too) {
-    if (pending_.size() >= kMaxPending || free_events_.empty()) {
-        ++dropped_;
-        return -1;
-    }
+int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best) const {
     int32_t slot = -1;
-    uint64_t best = ~0ull;
+    best = ~0ull;
     auto scan = [&](int64_t lo, int64_t n) {
         for (int64_t s = lo; s < lo + n; ++s) {
             if (busy_[(size_t) s]) continue;
@@ -642,6 +656,41 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
     if (homes_.main == 0 || (homes_too && homes_.file == 0 && spare_[(size_t) layer] >= 0))
         scan((int64_t) layer * per_layer_, per_layer_);
     if (ext_per_layer_) scan((int64_t) n_layers_ * per_layer_ + (int64_t) layer * ext_per_layer_, ext_per_layer_);
+    return slot;
+}
+
+bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
+    if (homes_.peer == 0 || homes_.file > 0 || spare_[(size_t) layer] < 0) return false;
+    const size_t base = (size_t) layer * n_expert_;
+    int32_t slot = -1;
+    uint64_t oldest = ~0ull;
+    for (int64_t s = (int64_t) layer * homes_.peer; s < (int64_t) (layer + 1) * homes_.peer; ++s) {
+        const uint64_t st = stamp_[base + peer_owner_[(size_t) s]];
+        if (st != tick_ && st < oldest) {   // not in use by this very lookup
+            oldest = st;
+            slot = (int32_t) s;
+        }
+    }
+    uint64_t on_main = ~0ull;
+    oldest_slot(layer, /*homes_too=*/true, on_main);
+    if (slot < 0 || oldest >= on_main) return false;
+    const int32_t place = spare_[(size_t) layer];
+    spare_[(size_t) layer] = -1;
+    const uint64_t bytes = m_.pack().experts[(size_t) layer].blob_bytes;
+    peer_->exchange_slot(slot, ram_[(size_t) layer] + (size_t) place * bytes, src, bytes);
+    peer_moves_.push_back({layer, e, peer_owner_[(size_t) slot], slot, place});
+    peer_owner_[(size_t) slot] = e;
+    ++promoted_;
+    return true;
+}
+
+int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too) {
+    if (pending_.size() >= kMaxPending || free_events_.empty()) {
+        ++dropped_;
+        return -1;
+    }
+    uint64_t best = ~0ull;
+    const int32_t slot = oldest_slot(layer, homes_too, best);
     if (slot < 0 || best == tick_) return -1;   // every slot is in use by this very lookup
     const int32_t o = owner_[(size_t) slot];
     if (o >= 0) res_[(size_t) layer * n_expert_ + o] = -1;
@@ -697,7 +746,7 @@ void ExpertTier::await_fetch(cudaStream_t main) { cudaStreamWaitEvent(main, fetc
 void ExpertTier::promote(int layer, const Lookup& lk) {
     for (int i = 0; i < lk.k; ++i) {
         if (lk.dev[i] || !lk.again[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
-        claim(layer, lk.experts[i], lk.host[i], copy_stream_, /*homes_too=*/true);
+        if (!move_to_peer(layer, lk.experts[i], lk.host[i])) claim(layer, lk.experts[i], lk.host[i], copy_stream_, /*homes_too=*/true);
     }
 }
 
