@@ -3,6 +3,44 @@
 
 namespace basalt::program::serve {
 
+void Runtime::start_guard(uint64_t file_bytes, uint64_t prompt_file_bytes) {
+    basalt::platform::stop_memory_watchdog();
+    guard_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), file_bytes, prompt_file_bytes);
+    if (!o.no_ram_guard) basalt::platform::start_ram_guard(guard_floor);
+    disk_floor = guard_floor + (1ull << 30);
+    // what a stop's error compares against, to tell the engine's own growth from other programs'
+    ready_avail = basalt::platform::available_memory();
+    ready_rss = (uint64_t) basalt::platform::process_memory().rss_mib << 20;
+    shed_drop = 0;
+}
+
+void Runtime::shed_if_low() {
+    if (basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok) return;
+    const uint64_t drop = basalt::platform::ram_guard_drops();
+    if (drop == shed_drop) return;
+    shed_drop = drop;
+    if (conversations) {
+        const size_t parked = conversations->size();
+        const size_t freed = conversations->clear();
+        size_t to_disk = 0;
+        for (auto& sc : conversations->take_spilled())
+            if (disk.enabled() && !disk_has(sc.live.ids, sc.live.imgs, sc.checkpoints, sc.cvec) &&
+                disk.put(std::move(sc), kDiskQueueCap))
+                ++to_disk;
+        if (freed > 0)
+            basalt::log::info("basalt serve", "RAM guard: %zu parked conversations (%zu MiB) leave RAM, %zu of them "
+                              "to disk", parked, freed >> 20, to_disk);
+    }
+    if (const size_t pooled = basalt::core::CheckpointBytes::allocator_type::release_pooled(); pooled > 0)
+        basalt::log::info("basalt serve", "RAM guard: freed %zu MiB of checkpoint blocks kept for reuse",
+                          pooled >> 20);
+    const uint64_t before = basalt::platform::available_memory();
+    basalt::platform::release_free_heap();
+    const uint64_t after = basalt::platform::available_memory();
+    basalt::log::info("basalt serve", "RAM guard: free heap returned to the OS, %lld MiB free now (%+lld MiB)",
+                      (long long) (after >> 20), ((long long) after - (long long) before) / (1ll << 20));
+}
+
 int Runtime::execute() {
     if (const int code = init_before_input()) return code;
     if (const int code = init_protocol()) return code;
