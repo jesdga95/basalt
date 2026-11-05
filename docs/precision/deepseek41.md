@@ -28,7 +28,9 @@ requantized. Types in the IQ1_S, IQ1_M and GSQ-RCO packs (a GSQ-RCO build assign
 ## Paths
 
 A prompt reads through the MMQ products in chunks; a prompt of up to 32 tokens reads through the decode kernels, one step at a
-time, as the single-token tail always did. Both round as their kernels do, inside the placement spread the quality section gives.
+time, as the single-token tail always did. In a short read the second card's experts of up to 16 rows use the decode kernels and RAM experts of up to 2 rows the CPU dots.
+Both round as their kernels do, inside the placement spread the quality section gives: against MMQ alone, on reads of 100, 500
+and 1,000 tokens, the last prompt row's KL is 1.8e-3, 1.3e-3 and 4.7e-3, its top-1 the same.
 
 ## Activations and accumulation
 

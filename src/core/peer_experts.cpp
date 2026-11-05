@@ -172,7 +172,6 @@ bool PeerExperts::prepare(int device, ExpertSource& src, int64_t n_layers, int64
 bool PeerExperts::open_plain(int device, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, float* rows,
                              std::string& err) {
     close();
-    constexpr int64_t kRows = 8;   // the most entries one token's share holds
     n_layers_ = n_layers;
     n_expert_ = n_expert;
     n_embd_ = n_embd;
@@ -187,10 +186,10 @@ bool PeerExperts::open_plain(int device, int64_t n_layers, int64_t n_expert, int
         ck(cudaHostGetDevicePointer((void**) &rows_map_, rows, 0), "mapped rows", err) &&
         ck(cudaHostAlloc(&h_meta_, sizeof(Meta), cudaHostAllocPortable), "plan staging", err) &&
         ck(cudaMalloc(&d_meta_, sizeof(Meta)), "plan", err) &&
-        ck(cudaMalloc((void**) &d_x_, row_bytes), "activation", err) &&
-        ck(cudaMalloc((void**) &d_out_, row_bytes * kRows), "rows", err) &&
-        ck(cudaMalloc((void**) &d_q8_, basalt::kernels::native_q8_1_bytes((int) n_embd, 1)), "q8_1 rows", err) &&
-        ck(cudaMalloc(&d_scratch_, basalt::kernels::native_expert_scratch_bytes(kRows, n_ff)), "scratch", err);
+        ck(cudaMalloc((void**) &d_x_, row_bytes * kRowBatch), "activation", err) &&
+        ck(cudaMalloc((void**) &d_out_, row_bytes * kRowBatch), "rows", err) &&
+        ck(cudaMalloc((void**) &d_q8_, (size_t) kRowBatch * (size_t) (n_embd / 32) * 36), "q8_1 rows", err) &&
+        ck(cudaMalloc(&d_scratch_, basalt::kernels::native_expert_scratch_bytes((int) kRowBatch, n_ff)), "scratch", err);
     if (!ok) close();
     return ok;
 }
@@ -289,6 +288,21 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
 bool PeerExperts::launch_plain(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids,
                                int64_t k, const int32_t* kind, std::string& err) {
     return launch_layout(layer, L, x, ids, 1, k, kind, err, rows_map_);
+}
+
+bool PeerExperts::launch_rows(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n,
+                              float* out, std::string& err) {
+    static_assert(kRowBatch == CAP, "a row batch fills a launch's entries");
+    int32_t kind[CAP];
+    for (int64_t i = 0; i < n; ++i) kind[i] = 2;
+    return launch_layout(layer, L, x, ids, n, 1, kind, err, out);
+}
+
+float* PeerExperts::map_rows(float* host, std::string& err) {
+    On on(device_);
+    void* p = nullptr;
+    if (!ck(cudaHostGetDevicePointer(&p, host, 0), "mapping rows", err)) return nullptr;
+    return (float*) p;
 }
 
 bool PeerExperts::launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids,

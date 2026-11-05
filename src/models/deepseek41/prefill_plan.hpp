@@ -20,6 +20,7 @@ constexpr uint64_t kTrimBytes = 256ull << 20;      // ... and gives back the res
 constexpr int64_t kStageRows = 16384;              // (token, slot) rows one expert launch handles
 constexpr int kStageExperts = 32;                  // experts staged per launch, two launches in flight
 constexpr int kAheadSlots = 6;                     // staged groups of experts in flight in a long chunk
+constexpr int kShareRows = 2048;                   // rows a layer of a short read may compute on the CPU and the second card
 constexpr int kStepPrompt = 32;                    // a prompt this short reads one decode step at a time, faster than a chunk's bus copies
 constexpr int kShortPrompt = 1024;                 // a prompt this short takes no staged groups and reads beside a tier's copies
 constexpr int kShortChunk = kShortPrompt;          // ... in a chunk of this many tokens
@@ -49,7 +50,8 @@ inline int64_t stage_rows(int64_t n_used, int chunk) {
 inline uint64_t fixed_bytes(const Dims& d, int chunk) {
     const uint64_t R = (uint64_t) stage_rows(d.n_used, chunk);
     const uint64_t q8 = (uint64_t) d.n_embd * R * 36 / 32 + (uint64_t) d.n_ff_exp * R * 36 / 32;
-    return q8 + R * (uint64_t) d.n_ff_exp * 12 + R * 4 + 2 * (d.expert_blob_bytes * kStageExperts + R * 8);
+    return q8 + R * (uint64_t) d.n_ff_exp * 12 + R * 4 + 2 * (d.expert_blob_bytes * kStageExperts + R * 8) +
+           (uint64_t) kShareRows * ((uint64_t) d.n_embd * 4 + 4);
 }
 
 inline uint64_t workspace_bytes(const Dims& d, int chunk) { return fixed_bytes(d, chunk) + per_token_bytes(d) * (uint64_t) chunk; }
