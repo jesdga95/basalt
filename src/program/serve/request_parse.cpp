@@ -158,7 +158,8 @@ Flow Request::parse() {
     n = (int64_t) ids.size();
     // ---- Jev: validate before the request can overwrite session state ----
     if (!score_ids.empty()) {
-        if (geni || runtime_.batch_on() || runtime_.admit_slot >= 0 || runtime_.solo_slot >= 0 || score_ids.size() > 255 ||
+        // an image prompt scores from its own prefill: prepare_image has already written its rows and positions
+        if (runtime_.batch_on() || runtime_.admit_slot >= 0 || runtime_.solo_slot >= 0 || score_ids.size() > 255 ||
             req_bias_present || !req_grammar_text.empty() || req_ppl >= 0 ||
             std::any_of(score_ids.begin(), score_ids.end(), [&](int64_t t) { return t < 0 || t >= runtime_.n_vocab; }) ||
             score_frontiers.size() > 32 || std::any_of(score_frontiers.begin(), score_frontiers.end(),

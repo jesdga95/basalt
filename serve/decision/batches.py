@@ -20,8 +20,8 @@ class BatchControl:
 
 
 class Job:
-    def __init__(self, rows, control):
-        self.rows, self.control = rows, control
+    def __init__(self, rows, control, embeddings=None):
+        self.rows, self.control, self.embeddings = rows, control, embeddings
         self.values = [None] * len(rows)
         self.done = threading.Event()
         self.error = None
@@ -34,11 +34,11 @@ class Batches:
         self.pending = collections.deque()
         self.running = False
 
-    def score(self, rows, control):
+    def score(self, rows, control, embeddings=None):
         control.check()
         if not rows:
             return []
-        job = Job(rows, control)
+        job = Job(rows, control, embeddings)
         with self.lock:
             self.pending.append(job)
             if not self.running:
@@ -66,6 +66,7 @@ class Batches:
                     with self.lock:
                         while (self.pending and not any(row[3] for row in first.rows) and
                                not any(row[3] for row in self.pending[0].rows) and
+                               first.embeddings == self.pending[0].embeddings and
                                count + len(self.pending[0].rows) <= 256):
                             job = self.pending.popleft()
                             jobs.append(job)
@@ -87,11 +88,11 @@ class Batches:
                     if rows:
                         control = BatchControl(live)
                         if callable(getattr(engine, "score_many", None)):
-                            engine.score_many(rows, control, completed=completed)
+                            engine.score_many(rows, control, completed=completed, embeddings=first.embeddings)
                         else:
                             for i, row in enumerate(rows):
                                 control.check()
-                                values, stats = engine.score(*row, control)
+                                values, stats = engine.score(*row, control, embeddings=first.embeddings)
                                 completed(i, (values, dict(stats, batch_size=1, scored_windows=1, workspace_bytes=0)))
             except Exception as error:
                 for job in jobs:

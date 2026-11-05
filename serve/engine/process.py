@@ -1365,8 +1365,8 @@ class ProcessEngine:
                     if not self.can_stop:
                         heard = time.monotonic()
 
-    # ---- Jev: exclusive, zero-output target-head transactions ----
-    def score_many(self, rows, control, completed=None):
+    # ---- Jev: exclusive, zero-output target-head transactions (GENI when the prompt carries image embeddings) ----
+    def score_many(self, rows, control, completed=None, embeddings=None):
         from serve.decision.trie import common_size
         result = [None] * len(rows)
         pending = sorted(range(len(rows)), key=lambda i: rows[i][0])
@@ -1390,7 +1390,7 @@ class ProcessEngine:
                     prefix = trial
             if len(group) == 1:
                 i = group[0]
-                values, stats = self.score(*rows[i], control)
+                values, stats = self.score(*rows[i], control, embeddings=embeddings)
                 result[i] = values, dict(stats, batch_size=1, scored_windows=1, workspace_bytes=0)
                 publish(group)
                 continue
@@ -1398,7 +1398,7 @@ class ProcessEngine:
             branches = [(rows[i][0][prefix:], rows[i][1]) for i in group]
             points = sorted({prefix} | {p for i in group for p in rows[i][2] if 0 < p <= prefix})
             values, stats = self.score(ids, rows[group[0]][1], points, any(rows[i][3] for i in group), control,
-                                       _branches=branches)
+                                       _branches=branches, embeddings=embeddings)
             if values is None:
                 middle = len(group) // 2
                 for subset in (group[:middle], group[middle:]):
@@ -1411,7 +1411,7 @@ class ProcessEngine:
                             first["decode_ms"] = first.get("decode_ms", 0) + stats.get("decode_ms", 0)
                             first["reused"] = min(first.get("reused", 0), stats.get("reused", 0))
                         publish([i])
-                    self.score_many([rows[i] for i in subset], control, completed=retried)
+                    self.score_many([rows[i] for i in subset], control, completed=retried, embeddings=embeddings)
                 continue
             for j, i in enumerate(group):
                 st = dict(stats, reused=min(prefix, stats.get("reused", 0)) if j == 0 else prefix,
@@ -1422,7 +1422,7 @@ class ProcessEngine:
             publish(group)
         return result
 
-    def score(self, ids, candidates, frontiers, fresh, control, _branches=None):
+    def score(self, ids, candidates, frontiers, fresh, control, _branches=None, embeddings=None):
         if not self.alive() or self.info.get("jev", 0) < 1:
             raise EngineError("this engine has no Jev scoring capability; rebuild basalt with this server")
         if not ids or len(ids) + 9 > self.max_context:
@@ -1450,7 +1450,8 @@ class ProcessEngine:
             if _branches:
                 keys += " score_branches=" + "/".join(
                     ",".join(map(str, tokens)) + ":" + ",".join(map(str, options)) for tokens, options in _branches)
-            self._send(f"GEN 1{keys} " + ",".join(map(str, ids)))
+            head = f"GENI 1{keys} {embeddings}" if embeddings else f"GEN 1{keys}"
+            self._send(head + " " + ",".join(map(str, ids)))
             sent = True
             while True:
                 if control.is_set() and stop_at is None:

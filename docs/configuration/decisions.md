@@ -27,7 +27,7 @@ The engine requires a version 2 `.basalt` pack. An existing version 1 pack can b
 | Prompt cache | Shared prefixes use existing checkpoints, including recurrent state, indexer tails and PLE history. Their count remains bounded by `prompt-cache`; `0` works by recomputing prefixes. More checkpoints improve reuse at the existing RAM cost. |
 | Conversation cache | Follows the existing RAM/disk policy; chat conversations can be parked or evicted as with other requests. Enabling Jev reserves no extra conversation pool. |
 | Sampling and grammar | Chat settings remain unchanged. Decision rows use allowed-token probabilities, independently of chat temperature, top-k, penalties, relaxed drafting and output grammar. |
-| Vision | Chat vision stays configured as before. Decision inputs are text/state JSON; these routes do not encode images. |
+| Vision | Chat vision stays configured as before. SystemOne questions may carry `images` when `vision` is on: the picture is encoded once per request, leads the prompt and stays inside the reused prefix; without `--vision` an image request is refused. `/v1/decision` contexts stay text. |
 
 `jev` is a numeric decision lane limit, `0..8`, separate from `parallel`. `1` uses the solo target scorer with
 zero dedicated GPU KV storage. Higher values allow independent suffixes to advance together through native batch
@@ -149,17 +149,41 @@ Oversized prompts receive HTTP 400 rather than truncation.
 model input. A single question's rubric precedes the changing state for prefix reuse; multiple questions share
 the state and carry isolated rubrics.
 
+`images` (up to 8 sources, in the forms chat accepts) attaches a picture to the state. It is encoded once for the
+whole request, whatever the number of scored rows, placed before the state text, and each `<|image_pad|>` the
+template wrote is expanded to the encoder's row count: the picture is inside the prefix every row and every later
+request reuses. Reuse is keyed by the encoded picture, so the same text over a different image rebuilds its own
+prefill. A `box` question is asked of a picture and is refused without one; any `images` request without
+`--vision` is refused too.
+
 The response has `model`, `answers`, input/output usage, `execution` and `timings`; output tokens are zero.
 Execution reports actual width and workspace, while timings separate target prefill and native scoring.
 Shared physical-group costs are accounted once, on the group's first row; caller elapsed time includes waiting.
 
 Answer shapes:
 
-- `noul`: `noul` is always `P(true)`, including when false is more likely. Optional criteria keys are `true`/`false`.
+- `noul`: `noul` is always `P(true)`, including when false is more likely, and `confidence` carries the same
+  number, as Jev's picture answers do. Optional criteria keys are `true`/`false`.
 - `choice`: `choice`, a probability map and confidence `(N * P(winner) - 1) / (N - 1)`; a singleton has confidence 1.
 - `score`: 2..10 ordered criteria, zero-based expected `score`, probability map and index-to-criterion `legend`.
   Confidence is one minus expected distance from the modal index divided by uniform distance from the center,
   floored at zero. It is a distribution-shape measure, not a correctness guarantee.
+- `box`: `box.top/bottom/left/right`, normalized coordinates with 0 at the picture's top-left and 1 at its
+  bottom-right, each the mean of its edge's distribution; `confidence` is the least certain edge's, and `edges`
+  reports each edge's `modal` value, its `probability` and `moved`, true when sorting a pair kept the box right
+  side up. `criteria: {"step": ...}` replaces the default 0.01 grid. The four edges are scored on their own over
+  their whole grid, so an edge costs about one scoring row per grid point: a 0.05 grid costs a fifth of a 0.01 one.
+
+```json
+{
+  "state": "a checkout screen",
+  "images": ["screenshot.png"],
+  "questions": {
+    "warning": { "type": "noul", "instructions": "Is a warning visible?" },
+    "cta": { "type": "box", "instructions": "Where is the primary button?" }
+  }
+}
+```
 
 All SystemOne questions use exhaustive tree scoring. `/v1/decision` uses the same native scoring seam.
 

@@ -3,12 +3,22 @@ from __future__ import annotations
 
 import contextlib
 import time
+from pathlib import Path
+from typing import NamedTuple
 
 from serve.decision.admission import Control, Gate
 from serve.decision.batches import Batches
 from serve.decision import schema, systemone
 from serve.decision.trie import Trie, common_size, probabilities, summary
 from serve.engine.errors import EngineError
+
+
+class Picture(NamedTuple):
+    """One decision request's encoded input: its sources, the rows each produced and the embeddings file that
+    carries them to the engine. The file is removed when the request is over."""
+    sources: tuple
+    counts: tuple
+    embeddings: Path
 
 
 class Decisions:
@@ -32,8 +42,8 @@ class Decisions:
                 finally:
                     self.svc.last_request_at = time.time()
 
-    def _score(self, rows, control):
-        return self.batches.score(rows, control)
+    def _score(self, rows, control, embeddings=None):
+        return self.batches.score(rows, control, embeddings)
 
     def run(self, body, cancel, system_one=False):
         started = time.monotonic()
@@ -45,11 +55,22 @@ class Decisions:
             if not self.svc.loaded() or getattr(self.svc.engine, "asleep", False) is True:
                 with self.lease(control):
                     pass
-            result = self.evaluate(parsed[:6], control, started, system_one)
+            images = parsed[7] if system_one else ()
+            picture = None
+            if images:
+                counts = self.svc.vision_encode(list(images))
+                picture = Picture(images, tuple(counts), self.svc.embeddings.path)
+            try:
+                result = self.evaluate(parsed[:6], control, started, system_one, picture)
+            finally:
+                self.svc.drop_embeddings(picture and picture.embeddings)
             return systemone.format_response(result, parsed[1], parsed[6], self.svc.model) if system_one else result
 
-    def evaluate(self, parsed, control, started, retain=False):
+    def evaluate(self, parsed, control, started, retain=False, picture=None):
         instructions, fields, contexts, mode, threshold, cache = parsed
+        images = picture.sources if picture else ()
+        counts = picture.counts if picture else ()
+        embeddings = picture.embeddings if picture else None
         if not retain:
             catalogue = [{"name": f.name, "description": f.description, "values": f.values} for f in fields]
             instructions += "\nAnswer each field independently as JSON, using its allowed values.\n" + schema.dump(catalogue)
@@ -59,7 +80,11 @@ class Decisions:
 
         def render(context):
             control.check()
-            messages = [{"role": "system", "content": instructions}, {"role": "user", "content": context}]
+            # the picture leads the user turn: the state that changes follows it, so the encoded prefix stays shared
+            content = [{"type": "image", "source": source} for source in images]
+            content += [{"type": "text", "text": context}] if context else []
+            messages = [{"role": "system", "content": instructions},
+                        {"role": "user", "content": content if images else context}]
             return self.svc.render_text(messages, None, {"enable_thinking": False})
 
         def tokenize(prompt, tail):
@@ -67,6 +92,8 @@ class Decisions:
             rendered, plain = prompt
             # Complete continuations are encoded together: BPE may cross the JSON value boundary.
             tokens = self.svc.tok.encode(rendered + tail, parse_special=True, plain=plain)
+            if counts:
+                tokens = self.svc.expand_image_pads(tokens, counts)
             schema.require(bool(tokens) and len(tokens) + 9 <= self.svc.engine.max_context,
                            "decision prompt exceeds the context; requests are never truncated")
             return tokens
@@ -125,12 +152,12 @@ class Decisions:
             # Cache opt-out establishes its fresh prefix before any dependent rows can be reordered.
             scored = []
             if ready[0][3]:
-                scored.extend(self._score(ready[:1], control))
+                scored.extend(self._score(ready[:1], control, embeddings))
                 ready_tail = ready[1:]
             else:
                 ready_tail = ready
             if ready_tail:
-                scored.extend(self._score(ready_tail, control))
+                scored.extend(self._score(ready_tail, control, embeddings))
             for row, (state, index), (values, stats) in zip(ready, owners, scored):
                 ids = row[0]
                 state["scores"][index] = values

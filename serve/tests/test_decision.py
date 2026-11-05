@@ -5,6 +5,8 @@ import io
 import json
 import math
 import queue
+import shutil
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -80,7 +82,7 @@ class Finite(unittest.TestCase):
         p = systemone.parse({"state": None, "questions": {"private": {"type": "noul"}}})
         result = {"results": [{"fields": {"private": {"probabilities": [0.1, 0.9]}}}], "usage": {"prompt_tokens": 13}}
         out = systemone.format_response(result, p[1], p[6], "model")
-        self.assertEqual(out["answers"], {"private": {"type": "noul", "noul": 0.1}})
+        self.assertEqual(out["answers"], {"private": {"type": "noul", "noul": 0.1, "confidence": 0.1}})
         self.assertEqual(out["usage"]["output_tokens"], 0)
 
     def test_config_does_not_raise_chat_parallelism(self):
@@ -116,6 +118,43 @@ class Finite(unittest.TestCase):
         result["results"][0]["fields"]["q"]["probabilities"] = [float("nan"), 0, 1]
         with self.assertRaises(EngineError):
             systemone.format_response(result, p[1], p[6], "model")
+
+    def test_systemone_box_sorts_its_four_grid_edges(self):
+        req = {"state": "a screenshot", "images": ["shot.png"],
+               "questions": {"cta": {"type": "box", "instructions": "Where is the primary button?"}}}
+        p = systemone.parse(req)
+        self.assertEqual([f.name for f in p[1]], [f"cta\u0000{edge}" for edge in systemone.EDGES])
+        self.assertTrue(all(f.values[0] == 0.0 and f.values[-1] == 1.0 and len(f.values) == 101 for f in p[1]))
+        self.assertEqual(p[7], ("shot.png",))
+
+        def edge(at):
+            return [1.0 if i == at else 0.0 for i in range(101)]
+
+        # top is asked below bottom: the answer sorts each pair so the box is never inverted
+        fields = {f.name: {"probabilities": edge(at)} for f, at in zip(p[1], (60, 20, 24, 74))}
+        answer = systemone.format_response({"results": [{"fields": fields}], "usage": {"prompt_tokens": 9}},
+                                           p[1], p[6], "model")["answers"]["cta"]
+        self.assertEqual(answer["box"], {"top": 0.2, "bottom": 0.6, "left": 0.24, "right": 0.74})
+        self.assertEqual(answer["confidence"], 1.0)                 # every edge is one grid point
+        self.assertEqual(answer["edges"]["top"], {"probability": 1.0, "modal": 0.6, "moved": True})
+        self.assertFalse(answer["edges"]["left"]["moved"])
+        fields[p[1][2].name]["probabilities"] = [0.5 if i in (20, 28) else 0.0 for i in range(101)]
+        spread = systemone.format_response({"results": [{"fields": fields}], "usage": {"prompt_tokens": 9}},
+                                           p[1], p[6], "model")["answers"]["cta"]
+        self.assertLess(spread["confidence"], 1.0)                  # the least certain edge decides
+        self.assertAlmostEqual(spread["edges"]["left"]["modal"], 0.2)
+
+    def test_systemone_images_and_grid_are_validated(self):
+        base = {"state": "s", "questions": {"q": {"type": "noul"}}}
+        for patch in ({"images": "shot.png"}, {"images": [None]}, {"images": [""]}, {"images": ["p"] * 9},
+                      {"box": 1}, {"questions": {"q": {"type": "box"}}}):
+            with self.subTest(patch=patch), self.assertRaises(ValueError):
+                systemone.parse({**base, **patch})       # a box without a picture asks where nothing is
+        self.assertEqual(systemone.parse({**base, "images": []})[7], ())
+        for criteria in ({"step": 0.03}, {"step": 0.01, "unit": "px"}, {"step": "0.01"}, {"edge": 1}):
+            with self.subTest(criteria=criteria), self.assertRaises(ValueError):
+                systemone.parse({"state": "s", "images": ["shot.png"],
+                                 "questions": {"q": {"type": "box", "criteria": criteria}}})
 
 
 class Admission(unittest.TestCase):
@@ -195,9 +234,9 @@ class Scorer(MockEngine):
         super().__init__(tok, "ok", max_context=16384)
         self.calls = []
 
-    def score(self, ids, candidates, points, fresh, control):
+    def score(self, ids, candidates, points, fresh, control, embeddings=None):
         control.check()
-        self.calls.append((tuple(ids), list(candidates), list(points), fresh))
+        self.calls.append((tuple(ids), list(candidates), list(points), fresh, embeddings))
         return [float(-i) for i in range(len(candidates))], {"reused": 0, "prompt_ms": 0.0}
 
 
@@ -226,6 +265,30 @@ class Waves(unittest.TestCase):
         self.assertEqual(sent.count("GEN 1"), 1)
         self.assertIn("score_branches=4:8,9/5:6,7", sent)
 
+    def test_an_image_prompt_asks_through_the_image_verb(self):
+        for case, embeddings in (("text", None), ("picture", "/tmp/basalt-vision/emb.bin")):
+            with self.subTest(case=case):
+                engine = self.wire(["JLOGITS 1.5 -0.5", "DONE 0 3 1.0 0.0 length 0 0 1"])
+                values, stats = engine.score([1, 2, 3], [4, 5], [], False, Control(threading.Event(), 2),
+                                             embeddings=embeddings)
+                self.assertEqual(values, [1.5, -0.5])
+                self.assertEqual(stats["generated"], 0)
+                self.assertTrue(engine.lines.empty())
+                sent = "".join(c.args[0] for c in engine.proc.stdin.write.call_args_list)
+                self.assertIn(("GENI 1 score=4,5 /tmp/basalt-vision/emb.bin 1,2,3" if embeddings
+                               else "GEN 1 score=4,5 1,2,3"), sent)
+                self.assertEqual(sent.count("GEN 1 "), 0 if embeddings else 1)
+
+    def test_a_wave_carries_its_prompt_picture(self):
+        engine = self.wire(["JWAVE 2 1000", "JLOGITS 3 1", "JLOGITS 4 2", "JTIME 0.015250",
+                            "DONE 0 4 1.0 0.0 length 0 0 2"])
+        values = engine.score_many([([1, 2, 3, 4], [8, 9], [1, 3], False), ([1, 2, 3, 5], [6, 7], [1, 3], False)],
+                                   Control(threading.Event(), 2), embeddings="/tmp/emb.bin")
+        self.assertEqual([v for v, _ in values], [[3, 1], [4, 2]])
+        sent = "".join(c.args[0] for c in engine.proc.stdin.write.call_args_list)
+        self.assertEqual(sent.count("GENI 1"), 1)                   # one image prefill, two scored suffixes
+        self.assertIn("score_branches=4:8,9/5:6,7 /tmp/emb.bin 1,2,3", sent)
+
     def test_memory_fallback_drains_before_serial_scoring(self):
         engine = self.wire(["JFALLBACK", "DONE 0 3 1.0 0 length 0 0 1",
                             "JLOGITS 1 2", "DONE 0 3 0 1 length 0 0 2",
@@ -239,7 +302,7 @@ class Waves(unittest.TestCase):
     def test_wave_planner_respects_suffix_sum_and_output_order(self):
         engine = self.wire([], window=3)
         calls = []
-        def score(ids, options, points, fresh, control, _branches=None):
+        def score(ids, options, points, fresh, control, _branches=None, embeddings=None):
             calls.append((ids, _branches))
             if _branches:
                 self.assertLessEqual(sum(len(t) for t, _ in _branches), 3)
@@ -280,7 +343,7 @@ class Waves(unittest.TestCase):
         engine = self.wire([], window=2)
         engine.info.update(jev_lanes=2, jev_sequence=1)
         published = []
-        def score(ids, options, points, fresh, control, _branches=None):
+        def score(ids, options, points, fresh, control, _branches=None, embeddings=None):
             if _branches and _branches[0][0][-1] == 5:
                 self.assertEqual(published, [0, 1])
             return [[float(t[-1])] for t, _ in _branches], {"reused": 1}
@@ -327,7 +390,7 @@ class Integration(unittest.TestCase):
         self.engine.info = {"jev": 2, "jev_lanes": 2, "jev_window": 7, "jev_sequence": 1}
         self.engine.score_many = ProcessEngine.score_many.__get__(self.engine)
         waves, original = [], self.engine.score
-        def score(ids, options, points, fresh, control, _branches=None):
+        def score(ids, options, points, fresh, control, _branches=None, embeddings=None):
             if not _branches:
                 return original(ids, options, points, fresh, control)
             control.check()
@@ -352,12 +415,12 @@ class Integration(unittest.TestCase):
         completed = [threading.Event(), threading.Event()]
         original = self.engine.score
         calls = 0
-        def score(*args):
+        def score(*args, **kw):
             nonlocal calls
             i, calls = calls, calls + 1
             entered[i].set()
             self.assertTrue(release[i].wait(3))
-            return original(*args)
+            return original(*args, **kw)
         self.engine.score = score
         output, errors = [], []
         def run(i):
@@ -399,7 +462,7 @@ class Integration(unittest.TestCase):
         entered, release = threading.Event(), threading.Event()
         done = [threading.Event() for _ in range(3)]
         values, errors, sizes = [None] * 3, [], []
-        def score_many(rows, control, completed=None):
+        def score_many(rows, control, completed=None, embeddings=None):
             sizes.append(len(rows))
             for i, row in enumerate(rows):
                 if i == 2:
@@ -533,6 +596,104 @@ class Integration(unittest.TestCase):
         b = self.engine.calls[0]
         self.assertGreater(a[2][0], 0)
         self.assertEqual(a[0][:a[2][0]], b[0][:b[2][0]])
+
+    def picture(self, counts=(3,), vision=True):
+        """A service with a scripted vision encoder: real embeddings file, invented rows."""
+        tok = ByteTokenizer()
+        directory = tempfile.mkdtemp(prefix="basalt-jev-vision-")
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+
+        class Eyes:
+            calls, path = 0, None
+
+            def encode(self, sources):
+                self.calls += 1
+                self.path = Path(directory) / f"emb-{self.calls}.bin"
+                self.path.write_bytes(b"rows")
+                return self.path, list(counts) * len(sources)
+
+        eyes = Eyes()
+        svc = Service(Scorer(tok), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
+                      vision=eyes if vision else None)
+        svc.jev = Decisions(svc)
+        return svc, tok, eyes
+
+    def test_a_picture_is_encoded_once_for_every_scored_row(self):
+        svc, tok, eyes = self.picture()
+        pad = tok.encode("<|image_pad|>", parse_special=True)[0]
+        request = {"state": "a settings screen", "images": ["settings.png"],
+                   "questions": {"warn": {"type": "noul", "instructions": "Is a warning visible?"},
+                                 "cta": {"type": "box", "instructions": "Where is the primary button?"}}}
+        out = svc.jev.run(request, threading.Event(), True)
+        self.assertEqual(set(out["answers"]), {"warn", "cta"})
+        self.assertEqual(out["answers"]["warn"]["type"], "noul")
+        self.assertEqual(set(out["answers"]["cta"]["box"]), set(systemone.EDGES))
+        box = out["answers"]["cta"]["box"]
+        self.assertTrue(box["top"] <= box["bottom"] and box["left"] <= box["right"])
+        self.assertEqual(out["usage"]["output_tokens"], 0)
+        self.assertEqual(eyes.calls, 1)                             # one encode, whatever the row count
+        self.assertEqual({call[4] for call in svc.engine.calls}, {eyes.path})
+        self.assertTrue(all(call[0].count(pad) == 3 for call in svc.engine.calls))
+        self.assertIsNone(svc.embeddings.path)                      # the request took its embeddings with it
+        self.assertFalse(eyes.path.exists())
+
+    def test_a_picture_stays_in_the_reused_prefix(self):
+        svc, tok, eyes = self.picture()
+        pad = tok.encode("<|image_pad|>", parse_special=True)[0]
+        request = {"state": "a settings screen", "images": ["settings.png"],
+                   "questions": {"warn": {"type": "noul", "instructions": "Is a warning visible?"}}}
+        svc.jev.run(request, threading.Event(), True)
+        a, svc.engine.calls = svc.engine.calls[0], []
+        request["state"] = "a checkout screen"
+        svc.jev.run(request, threading.Event(), True)
+        b = svc.engine.calls[0]
+        self.assertGreater(a[2][0], 0)
+        self.assertEqual(a[0][:a[2][0]], b[0][:b[2][0]])
+        self.assertEqual(a[0][:a[2][0]].count(pad), 3)              # the picture is what the next ask reuses
+        self.assertEqual(eyes.calls, 2)                             # a new state re-encodes only its own picture
+
+    def test_a_picture_asked_without_a_vision_encoder_is_refused(self):
+        svc, _, _ = self.picture(vision=False)
+        with self.assertRaises(ValueError) as got:
+            svc.jev.run({"state": "s", "images": ["shot.png"], "questions": {"q": {"type": "noul"}}},
+                        threading.Event(), True)
+        self.assertIn("without image input", str(got.exception))
+
+    def test_two_pictures_never_share_one_scoring_transaction(self):
+        sizes, seen, errors = [], [], []
+
+        def score_many(rows, control, completed=None, embeddings=None):
+            sizes.append(len(rows))
+            seen.append(embeddings)
+            for i, row in enumerate(rows):
+                completed(i, ([row[0][-1]], {"reused": 0}))
+
+        self.engine.score_many = score_many
+
+        def run(path):
+            try:
+                self.svc.jev._score([([1, 2], [7], [], False)], Control(threading.Event(), 3), path)
+            except Exception as error:                              # noqa: BLE001 - reported below
+                errors.append(error)
+
+        threads = [threading.Thread(target=run, args=(path,)) for path in ("/tmp/a.bin", "/tmp/b.bin")]
+        try:
+            with self.svc.jev.gate.shared(threading.Event()):        # hold the lane: both requests queue
+                for thread in threads:
+                    thread.start()
+                for _ in range(200):
+                    with self.svc.jev.batches.lock:
+                        if len(self.svc.jev.batches.pending) == 1:   # the second request waits behind the first
+                            break
+                    threading.Event().wait(0.01)
+                self.assertEqual(len(self.svc.jev.batches.pending), 1)
+        finally:
+            for thread in threads:
+                if thread.ident is not None:
+                    thread.join(3)
+        self.assertEqual(errors, [])
+        self.assertEqual(sizes, [1, 1])                             # a transaction scores one picture only
+        self.assertEqual(seen, ["/tmp/a.bin", "/tmp/b.bin"])
 
 
 if __name__ == "__main__":
