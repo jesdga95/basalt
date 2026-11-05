@@ -2,6 +2,7 @@
 // (window ring, compressor, indexer, query path, sparse MQA, grouped output) with per-layer state owned here.
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/platform/compiler.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/models/deepseek41/attn.hpp"
 #include "basalt/models/deepseek41/attn_index.hpp"
@@ -16,6 +17,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <map>
 #include <vector>
@@ -497,6 +499,7 @@ public:
             err = "deepseek41: cannot allocate the pinned expert staging";
             return false;
         }
+        for (int k = 0; k < g_.n_used; ++k) h_ids_[k] = -1;
         DsModel::SharedTier& shared = m_.shared_tier();
         if (shared.tier) {   // another session opened it: the sessions run one at a time over the same rows
             tier_ = shared.tier;
@@ -535,9 +538,9 @@ public:
 
     // Kernels write the mapped ids and activation: no copy-engine job queues behind the copies of experts.
     void routed_stage(int, const float* x, const int32_t* ids, void* stream) override {
-        copy_words(ids, d_ids_host_, g_.n_used, stream);
         copy_row(x, d_x_host_, g_.n_embd, stream);
         kernels::quantize_q8_1_rows(x, 1, g_.n_embd, ex_xq_, stream);
+        copy_words(ids, d_ids_host_, g_.n_used, stream);   // last: the host goes on once all of them landed
     }
 
 
@@ -549,19 +552,35 @@ public:
         return routed_experts_staged(il, x, ids, w, out, stream, err);
     }
 
-    bool routed_experts_staged(int il, const float* x, const int32_t*, const float* w, float* out, void* stream,
+    bool routed_experts_staged(int il, const float*, const int32_t*, const float* w, float* out, void* stream,
                                std::string& err) override {
-        return routed_run(il, x, w, out, nullptr, stream, err);
+        return routed_run(il, w, out, nullptr, stream, err);
     }
 
-    bool routed_and_shared_staged(int il, const float* x, const int32_t*, const float* w, float* out, float* shared_out,
+    bool routed_and_shared_staged(int il, const float*, const int32_t*, const float* w, float* out, float* shared_out,
                                   void* stream, std::string& err) override {
-        return routed_run(il, x, w, out, shared_out, stream, err);
+        return routed_run(il, w, out, shared_out, stream, err);
     }
 
-    // With `shared_out` set, the shared expert is queued behind the GPU's experts, so it runs while the host waits on
-    // the CPU's share, and the weighted sum adds its result.
-    bool routed_run(int il, const float* x, const float* w, float* out, float* shared_out, void* stream,
+    // Every id of the layer landed in the mapped ids (routed_stage writes them last); the stream goes on meanwhile. A launch
+    // that failed never writes them.
+    void await_ids(cudaStream_t st) {
+        constexpr int kSpins = 1 << 22;
+        const volatile int32_t* ids = h_ids_;
+        for (int s = 0; s < kSpins; ++s) {
+            bool all = true;
+            for (int k = 0; k < g_.n_used; ++k) all = all && ids[k] >= 0;
+            if (all) {
+                std::atomic_thread_fence(std::memory_order_acquire);
+                return;
+            }
+            platform::cpu_relax();
+        }
+        cudaStreamSynchronize(st);
+    }
+
+    // With `shared_out` set, the head has queued the shared expert, and the weighted sum adds its result.
+    bool routed_run(int il, const float* w, float* out, float* shared_out, void* stream,
                     std::string& err) {
         const ExpertLayer& el = m_.pack().experts[(size_t) il];
         const int K = g_.n_used;
@@ -572,7 +591,8 @@ public:
             return false;
         }
         cudaStream_t st = (cudaStream_t) stream;
-        cudaStreamSynchronize(st);
+        if (shared_out) await_ids(st);
+        else cudaStreamSynchronize(st);
         ExpertTier::Lookup lk;
         if (!tier_->lookup(il, h_ids_, K, lk, err)) return false;
         const int n_fetched = tier_->fetch(il, lk);
@@ -606,15 +626,12 @@ public:
         const int nhits = make_plan(*h_plan_, false);
         const int nh = nhits + n_fetched;
         const auto gpu_share = [&] {
-            if (nhits) {
-                copy_words(d_plan_host_, ex_plan_, (int) (sizeof(ExpertPlan) / 4), stream);
-                ExpertPlan* dp = (ExpertPlan*) ex_plan_;
-                kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst,
-                                                       dp->tok, nhits, nhits, ex_xq_, ex_scr_, ex_rows_, stream);
-            }
-            return !shared_out || shared_expert(il, x, shared_out, stream, err);
+            copy_words(d_plan_host_, ex_plan_, (int) (sizeof(ExpertPlan) / 4), stream);
+            ExpertPlan* dp = (ExpertPlan*) ex_plan_;
+            kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst,
+                                                   dp->tok, nhits, nhits, ex_xq_, ex_scr_, ex_rows_, stream);
         };
-        if (shared_out) {
+        if (shared_out && nhits) {
             cudaGraphExec_t& exec = share_g_[(size_t) il * (kMaxK + 1) + (size_t) nhits];
             if (!exec) {
                 cudaGraph_t g = nullptr;
@@ -622,12 +639,12 @@ public:
                     err = "deepseek41: cannot capture a layer's experts";
                     return false;
                 }
-                const bool ok = gpu_share();
+                gpu_share();
                 const cudaError_t ce = cudaStreamEndCapture(st, &g);
-                const cudaError_t ci = ok && ce == cudaSuccess ? cudaGraphInstantiateWithFlags(&exec, g, 0) : ce;
+                const cudaError_t ci = ce == cudaSuccess ? cudaGraphInstantiateWithFlags(&exec, g, 0) : ce;
                 if (g) cudaGraphDestroy(g);
-                if (!ok || ci != cudaSuccess) {
-                    if (ok) err = std::string("deepseek41: capturing a layer's experts: ") + cudaGetErrorString(ci);
+                if (ci != cudaSuccess) {
+                    err = std::string("deepseek41: capturing a layer's experts: ") + cudaGetErrorString(ci);
                     return false;
                 }
             }
@@ -635,8 +652,8 @@ public:
                 err = "deepseek41: launching a layer's experts failed";
                 return false;
             }
-        } else if (!gpu_share()) {
-            return false;
+        } else if (!shared_out && nhits) {
+            gpu_share();
         }
         if (n_fetched) {
             make_plan(*h_plan2_, true);
@@ -656,6 +673,7 @@ public:
         for (int k = 0; k < K; ++k)
             rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * g_.n_embd : d_rows_ + (size_t) k * g_.n_embd;
         weighted_sum_row_ptrs(rp, w, K, g_.n_embd, out, stream, shared_out);
+        for (int k = 0; k < K; ++k) h_ids_[k] = -1;
         return true;
     }
     bool shared_expert(int il, const float* x, float* out, void* stream, std::string& err) override {
