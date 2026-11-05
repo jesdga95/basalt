@@ -16,7 +16,7 @@ download or any re-quantizing.
   quantize them (about half a second).
 - **Removed `profile`:** the expert profile decides which experts start in VRAM. It is placement policy that improves
   independently of the weights, so it moved to the engine (`data/profiles`), where a better profile needs no new file.
-- **Added `dspark/gguf`, optional, no version change:** a DeepSeek V4.1 pack's DSpark drafter. The engine ignores sections it
+- **Added `dspark/gguf`, optional, no version change:** a DeepSeek pack's DSpark drafter. The engine ignores sections it
   does not name, so an engine from before it runs such a pack plain, and a pack without it runs plain on any engine.
 - **Trimmed `meta`:** no `sampling` (the server reads the GGUF metadata's `general.sampling.*` keys), no `profile` or
   `hc8` records and no converter revision, provenance that changed whenever a section was replaced.
