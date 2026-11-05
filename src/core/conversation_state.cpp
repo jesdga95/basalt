@@ -366,7 +366,8 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 }
 
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss,
-                                    const ModelGeometry& g, const QsaState* draft, std::string& error) {
+                                    const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                    const ConversationKvRead* kv) {
     if (!image.live.stage_parts.empty())
         return fail(error, "a running checkpoint's stage parts belong in the stage images, not in live.stage_parts");
     if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
@@ -378,15 +379,57 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     const size_t layers = owned_qsa(ss);
     if (image.kv.size() != layers + (draft ? 1 : 0)) return fail(error, "invalid K/V layer count");
     const int64_t upto = (int64_t) image.live.ids.size();
+    if (kv && kv->layers() != image.kv.size()) return fail(error, "invalid K/V layer count in the file");
+    auto layer_ok = [&](size_t j, const QsaState& st, bool index) {
+        if (!kv) return conversation_kv_validate(image.kv[j], st, g, upto, index, error);
+        std::array<uint64_t, 5> payload{};
+        for (int b = 0; b < 5; ++b) payload[(size_t) b] = kv->bytes(j, b);
+        return conversation_kv_validate(image.kv[j], payload, st, g, upto, index, error);
+    };
     for (size_t j = 0; j < layers; ++j)
-        if (!conversation_kv_validate(image.kv[j], owned(ss, j), g, upto, true, error)) return false;
-    return !draft || conversation_kv_validate(image.kv.back(), *draft, g, upto, false, error);
+        if (!layer_ok(j, owned(ss, j), true)) return false;
+    return !draft || layer_ok(image.kv.size() - 1, *draft, false);
 }
 
+namespace {
+// Reads the K/V of `kv` into the session's buffers (and the draft's), each piece copied as it arrives.
+bool restore_kv_from(ConversationKvRead& kv, const SavedConversation& image, const SessionState& ss,
+                     const ModelGeometry& g, const QsaState* draft, std::string& error) {
+    const int64_t upto = (int64_t) image.live.ids.size();
+    const size_t layers = owned_qsa(ss), n = layers + (draft ? 1 : 0);
+    std::vector<std::array<void*, 5>> dst(n);
+    std::vector<std::array<uint64_t, 5>> sizes(n);
+    for (size_t j = 0; j < n; ++j)
+        if (!conversation_kv_targets(j < layers ? owned(ss, j) : *draft, g, upto, j < layers, dst[j], sizes[j], error))
+            return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return fail(error, "no current device");
+    const ConversationKvSink sink = [&](size_t layer, int part, uint64_t offset, const uint8_t* src, uint64_t bytes) {
+        if (layer >= n || part < 0 || part >= 5 || offset > sizes[layer][(size_t) part] ||
+            bytes > sizes[layer][(size_t) part] - offset)
+            return false;
+        // the reader threads copy into this device's buffers
+        return cudaSetDevice(dev) == cudaSuccess &&
+               cudaMemcpy(static_cast<uint8_t*>(dst[layer][(size_t) part]) + offset, src, bytes, cudaMemcpyDefault) ==
+                   cudaSuccess;
+    };
+    if (!kv.read(sink, error) || !sync(error)) return false;
+    for (size_t j = 0; j < n; ++j)
+        if (!conversation_kv_settle(j < layers ? owned(ss, j) : *draft, g, upto, error)) return false;
+    return true;
+}
+}  // namespace
+
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
-                                                   const ModelGeometry& g, const QsaState* draft, std::string& error) {
-    if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
+                                                   const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                                   ConversationKvRead* kv) {
+    if (!conversation_snapshot_validate(image, ss, g, draft, error, kv)) return ConversationRestore::invalid;
     if (!sync(error)) return ConversationRestore::transfer_failed;
+    if (kv) {
+        if (!restore_kv_from(*kv, image, ss, g, draft, error) || !conversation_checkpoint_restore(image.live, ss, g, error))
+            return ConversationRestore::transfer_failed;
+        return ConversationRestore::restored;
+    }
     const int64_t upto = (int64_t) image.live.ids.size();
     for (size_t j = 0; j < owned_qsa(ss); ++j)
         if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, error))
@@ -394,6 +437,62 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
     if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error)) ||
         !conversation_checkpoint_restore(image.live, ss, g, error)) return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;
+}
+
+namespace {
+// device (or device-mapped) bytes, copied out on the caller's thread
+ConversationBytes device_bytes(const void* data, uint64_t n) {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    ConversationBytes b;
+    b.size = n;
+    b.read = [p](uint64_t o, uint8_t* d, uint64_t c) { return cudaMemcpy(d, p + o, c, cudaMemcpyDefault) == cudaSuccess; };
+    return b;
+}
+
+// one buffer of `unit` bytes per owned QSA layer, read as their concatenation (a checkpoint's tails, dead, block_pos)
+ConversationBytes layer_bytes(const SessionState& ss, uint64_t unit, const void* (*at)(const QsaState&)) {
+    ConversationBytes b;
+    b.size = unit * owned_qsa(ss);
+    b.read = [&ss, unit, at](uint64_t o, uint8_t* d, uint64_t c) {
+        while (c > 0) {
+            const uint64_t j = o / unit, in = o % unit, n = std::min(c, unit - in);
+            if (cudaMemcpy(d, static_cast<const uint8_t*>(at(owned(ss, (size_t) j))) + in, n, cudaMemcpyDefault) !=
+                cudaSuccess)
+                return false;
+            o += n; d += n; c -= n;
+        }
+        return true;
+    };
+    return b;
+}
+}  // namespace
+
+bool conversation_snapshot_source(ConversationSource& out, const ConversationView& view, const SessionState& ss,
+                                  const ModelGeometry& g, const QsaState* draft, std::string& error) {
+    if (!view_validate(view, ss, g, error)) return false;
+    ConversationStateSizes z;
+    if (!checkpoint_targets(ss, g, view.ids.size(), z, error)) return false;
+    if (!sync(error)) return false;
+    ConversationSource s;
+    s.geometry = geometry_key(g);
+    s.layer_lo = ss.layer_lo;
+    s.layer_hi = ss.layer_hi;
+    s.cvec = view.cvec;
+    s.ids = &view.ids;
+    s.imgs = &view.images;
+    s.checkpoints = &view.checkpoints;
+    s.live = {device_bytes(ss.gdn_state, z.gdn), device_bytes(ss.ple_hist, ss.ple_hist ? z.ple : 0),
+              layer_bytes(ss, z.tail, [](const QsaState& st) -> const void* { return st.idx_tail; }),
+              layer_bytes(ss, z.dead, [](const QsaState& st) -> const void* { return st.idx_dead; }),
+              layer_bytes(ss, z.block_pos, [](const QsaState& st) -> const void* { return st.idx_block_pos; })};
+    const int64_t upto = (int64_t) view.ids.size();
+    const size_t layers = owned_qsa(ss);
+    s.kv.resize(layers + (draft ? 1 : 0));
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_source(s.kv[j], owned(ss, j), g, upto, true, error)) return false;
+    if (draft && !conversation_kv_source(s.kv.back(), *draft, g, upto, false, error)) return false;
+    out = std::move(s);
+    return true;
 }
 
 // the draft layer's K/V included (the stage that owns the draft head, or no layer split)

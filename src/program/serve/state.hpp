@@ -244,6 +244,10 @@ private:
     static constexpr int64_t kDiskStaleTokens = 4096;   // a stored copy this close to the chain's end is kept
     static constexpr uint64_t kDiskQueueCap = 4ull << 30;   // images waiting for the writer, in RAM
     uint64_t disk_floor{};
+    // Disk writes stream from the session; reads stream when whole-image admission fails.
+    // --exp disk_stream: 0 whole writes and reads, 2 streamed writes and reads (diagnostics).
+    int disk_stream{1};
+    uint64_t ram_seen_cap{};   // --exp conv_ram_mib: the most RAM above its floor a conversation admission sees (tests)
     int64_t pp_total{};
     int64_t pp_from{};
     int64_t pp_next_check{};
@@ -508,6 +512,8 @@ private:
     void ckd_finish();
     bool disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const std::vector<ConvCheckpoint>& cks, bool cvec);
     bool capture_admit(uint64_t need, uint64_t floor);
+    bool disk_write_direct(const basalt::core::ConversationView& view, const basalt::core::SessionState& s,
+                           size_t& bytes, double& ms);
     bool park_current(size_t held, int64_t kept);
     std::vector<ImgKey> imgs_below(const std::vector<ImgKey>& all, int64_t L);
     bool gpu_sync_ok();
