@@ -94,19 +94,17 @@ class Finite(unittest.TestCase):
         self.assertEqual(parse_settings(build_parser(), [])[0].jev, 0)
 
     def test_json_opt_in_preserves_engine_settings(self):
-        from serve.tests.test_config import conf
+        from serve.tests.test_config import parse       # the v2 config file, read the way the router reads it
         engine = {"kv": "fp16", "expert-cache": "auto", "prefill": "auto", "spec": 7, "resident-experts": True}
-        plain = conf({"server": {"parallel": 1}, "engine": engine})
-        enabled = conf({"server": {"parallel": 1, "jev": 1}, "engine": engine})
-        a, _, fw, cw = parse_settings(build_parser(), ["--config", plain])
-        b, _, jfw, jcw = parse_settings(build_parser(), ["--config", enabled])
+        a, _, fw, cw = parse([], {"server": {"parallel": 1}, "engine": engine})
+        b, _, jfw, jcw = parse([], {"server": {"parallel": 1, "jev": 1}, "engine": engine})
         self.assertEqual((fw, cw, a.parallel), (jfw, jcw, b.parallel))
         self.assertEqual(b.jev, 1)
-        self.assertEqual(parse_settings(build_parser(), ["--config", enabled, "--jev", "0"])[0].jev, 0)
-        with self.assertRaisesRegex(ValueError, 'expected a string or number'):
-            parse_settings(build_parser(), ["--config", conf({"server": {"jev": True}})])
-        with self.assertRaisesRegex(ValueError, 'server option'):
-            parse_settings(build_parser(), ["--config", conf({"engine": {"jev": True}})])
+        self.assertEqual(parse(["--jev", "0"], {"server": {"parallel": 1, "jev": 1}, "engine": engine})[0].jev, 0)
+        with self.assertRaisesRegex(ValueError, "expected a string or number"):
+            parse([], {"server": {"jev": True}})
+        with self.assertRaisesRegex(ValueError, "server option"):
+            parse([], {"engine": {"jev": True}})
 
     def test_systemone_score_and_choice_math(self):
         req = {"state": "text", "questions": {"q": {"type": "score", "criteria": ["low", "mid", "high"]}}}
