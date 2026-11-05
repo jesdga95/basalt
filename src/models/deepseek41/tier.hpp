@@ -83,14 +83,17 @@ public:
     void set_free_floor(int64_t mib);
     uint64_t free_floor() const { return free_floor_; }
 
-    /// Called before each token: the promotions queued during the previous token finish and become resident, so what a
-    /// lookup finds depends only on the routing history.
-    void begin_token();
+    /// Called before each token or window: the promotions queued during the previous one finish and become resident, so
+    /// what a lookup finds depends only on the routing history.
+    void begin_token(int n_tokens = 1);
     /// Looks up `ids[0..k)` of `layer` and stamps them as used.
     bool lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::string& err);
     /// The CPU's share: the experts of `lk` without a device blob, over the activation `x` (n_embd floats, host).
     /// Row i of `rows` (n_embd floats each) gets expert i's output.
     bool run_cpu(int layer, const float* x, const Lookup& lk, float* rows, std::string& err);
+    /// The same over a window: `x` holds a row per token and each expert i runs over the rows `use[i]` names, into those
+    /// rows of `rows`.
+    bool run_cpu_window(int layer, const float* x, const Lookup& lk, const Use* use, float* rows, std::string& err);
     /// Starts the bus copy of the pinned misses of `lk` beyond the CPU's half (policy::bus_count) into the VRAM tier; those
     /// experts get a device blob in `lk`, marked `fetched`, so the GPU computes them while the CPU does the rest. How many
     /// started; `await_fetch` makes `main` wait for them.

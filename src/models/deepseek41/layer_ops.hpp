@@ -72,14 +72,26 @@ public:
     virtual void restore_turn(void* stream, const uint8_t* host) { (void) stream; (void) host; }
     /// Forgets the conversation (a new sequence starts at position 0).
     virtual void reset() {}
-    /// Called once per token before its layers run.
-    virtual void begin_token(int64_t pos) { (void) pos; }
-    /// Uploads what the layers read from device memory for the token at `pos` (positions and window bounds), so the
-    /// per-layer calls need no host input and can be captured into graphs. Called after begin_token.
-    virtual bool stage_token(int64_t pos, void* stream, std::string& err) {
-        (void) pos; (void) stream; (void) err;
+    /// Called once per token, or per window of `n_tokens`, before its layers run.
+    virtual void begin_token(int64_t pos, int n_tokens = 1) { (void) pos; (void) n_tokens; }
+    /// Uploads what the layers read from device memory for the `n_tokens` tokens at `pos` (positions and window bounds),
+    /// so the per-layer calls need no host input and can be captured into graphs. Called after begin_token. The rows of
+    /// an earlier window before `pos` are kept; the rest are dropped.
+    virtual bool stage_token(int64_t pos, int n_tokens, void* stream, std::string& err) {
+        (void) pos; (void) n_tokens; (void) stream; (void) err;
         return true;
     }
+    /// The rows of the last window before `next_pos` join the carried state; the rest leave no trace.
+    virtual void commit_window(int64_t next_pos, void* stream) { (void) next_pos; (void) stream; }
+    /// A verify window: attention of the `n_tokens` staged rows; `x`, `out`: [n_tokens][n_embd].
+    virtual bool attention_window(int layer, int n_tokens, const float* x, float* out, void* stream, std::string& err) = 0;
+    /// routed_stage for the rows of a window: ids [n_tokens][k], x [n_tokens][n_embd].
+    virtual void routed_stage_window(int n_tokens, const float* x, const int32_t* ids, void* stream) = 0;
+    /// The shared expert over the rows of a window.
+    virtual bool shared_expert_window(int layer, int n_tokens, const float* x, float* out, void* stream, std::string& err) = 0;
+    /// routed_and_shared_staged for the rows of a window: each distinct expert runs once over the rows that routed to it.
+    virtual bool routed_shared_window(int layer, int n_tokens, const float* weights, float* out, float* shared_out, void* stream,
+                                      std::string& err) = 0;
     /// True when attention, routed_stage and shared_expert only enqueue work on the stream (graph capturable).
     virtual bool graph_capable() const { return false; }
     /// Enqueues the copy of the router's expert ids and the activation to pinned host memory, for routed_experts.

@@ -8,11 +8,13 @@
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/log.hpp"
+#include "basalt/model/flags.hpp"
 #include "models/deepseek41/context_policy.hpp"
 #include "models/deepseek41/meta.hpp"
 #include "models/deepseek41/model.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 
 namespace basalt::models::deepseek41 {
 namespace {
@@ -75,6 +77,16 @@ public:
     PreTokenizer pretokenizer() const override { return {"joyai-llm", pretok_joyai}; }
 
     int max_expert_cards() const override { return 1; }
+
+    bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
+        (void) code;
+        if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
+        else if (a == "--spec-oracle") o.spec_oracle = args.next("--spec-oracle");
+        else if (a == "--diag-teacher") o.diag_teacher = true;
+        else if (a == "--diag-tier-frozen") o.diag_tier_frozen = true;
+        else return false;
+        return true;
+    }
 
     // A context the pack refuses is refused with the flags, before anything loads; the memory check needs the card.
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
