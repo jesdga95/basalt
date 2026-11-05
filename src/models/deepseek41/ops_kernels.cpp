@@ -57,6 +57,8 @@ class KernelOps final : public LayerOps {
 public:
     explicit KernelOps(const DsModel& m) : m_(m), g_(m.geo()), ctx_((int) m.context()) {}
     ~KernelOps() override {
+        for (cudaGraphExec_t e : share_g_)
+            if (e) cudaGraphExecDestroy(e);
         for (void* p : allocs_) cudaFree(p);
     }
 
@@ -477,6 +479,7 @@ public:
     bool ensure_tier(std::string& err) {
         if (tier_) return true;
         constexpr int kRows = ExpertTier::kMaxK;   // routed outputs of a window: tokens x slots
+        share_g_.assign((size_t) g_.n_layers * (kMaxK + 1), nullptr);
         if (!alloc(&ex_xq_, kernels::native_q8_1_bytes(g_.n_embd, kMaxT)) ||
             !alloc(&ex_scr_, kernels::native_expert_scratch_bytes(kRows, g_.n_ff_exp)) ||
             !alloc((void**) &ex_rows_, (size_t) kRows * g_.n_embd * 4) ||
@@ -595,13 +598,39 @@ public:
         }
         pl.start[nh] = nh;
         pl.ng[0] = nh;
-        if (nh) {
-            copy_words(d_plan_host_, ex_plan_, (int) (sizeof(ExpertPlan) / 4), stream);
-            ExpertPlan* dp = (ExpertPlan*) ex_plan_;
-            kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst,
-                                                   dp->tok, nh, nh, ex_xq_, ex_scr_, ex_rows_, stream);
+        const auto gpu_share = [&] {
+            if (nh) {
+                copy_words(d_plan_host_, ex_plan_, (int) (sizeof(ExpertPlan) / 4), stream);
+                ExpertPlan* dp = (ExpertPlan*) ex_plan_;
+                kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst,
+                                                       dp->tok, nh, nh, ex_xq_, ex_scr_, ex_rows_, stream);
+            }
+            return !shared_out || shared_expert(il, x, shared_out, stream, err);
+        };
+        if (shared_out) {
+            cudaGraphExec_t& exec = share_g_[(size_t) il * (kMaxK + 1) + (size_t) nh];
+            if (!exec) {
+                cudaGraph_t g = nullptr;
+                if (cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
+                    err = "deepseek41: cannot capture a layer's experts";
+                    return false;
+                }
+                const bool ok = gpu_share();
+                const cudaError_t ce = cudaStreamEndCapture(st, &g);
+                const cudaError_t ci = ok && ce == cudaSuccess ? cudaGraphInstantiateWithFlags(&exec, g, 0) : ce;
+                if (g) cudaGraphDestroy(g);
+                if (!ok || ci != cudaSuccess) {
+                    if (ok) err = std::string("deepseek41: capturing a layer's experts: ") + cudaGetErrorString(ci);
+                    return false;
+                }
+            }
+            if (cudaGraphLaunch(exec, st) != cudaSuccess) {
+                err = "deepseek41: launching a layer's experts failed";
+                return false;
+            }
+        } else if (!gpu_share()) {
+            return false;
         }
-        if (shared_out && !shared_expert(il, x, shared_out, stream, err)) return false;
         // the CPU's share runs while the GPU works; its rows land in the router index's row
         if (nh < K) {
             if (!tier_->run_cpu(il, h_x_, lk, h_rows_, err)) return false;
@@ -668,6 +697,8 @@ private:
     int32_t *h_ids_ = nullptr, *h_pos_ = nullptr, *d_ids_host_ = nullptr;
     int64_t staged_pos_ = -1;
     std::shared_ptr<ExpertTier> tier_;
+    static constexpr int kMaxK = 8;                 // routed experts of a token
+    std::vector<cudaGraphExec_t> share_g_;          // [layer * (kMaxK + 1) + experts on the card]: their launch and the shared expert's
     float *sh_g_ = nullptr, *sh_u_ = nullptr, *sh_h_ = nullptr;
     void *sh_q1_ = nullptr, *sh_q2_ = nullptr;
     static constexpr int kPosStride = 4 * kMaxT;   // per layer: pos, window start, window rows, visible compressed rows
