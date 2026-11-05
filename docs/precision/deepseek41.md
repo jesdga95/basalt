@@ -147,7 +147,7 @@ prompts; on the third it can diverge after a few tokens (see [Quality](#quality)
 
 ## Quality
 
-GSQ-RCO IQ2_XXS, 5090 only, against llama.cpp b11870 on the same GGUF, llama's tokens fed one decode step at a time on
+GSQ-RCO IQ2_XXS (a pack tested and not shipped), 5090 only, against llama.cpp b11870 on the same GGUF, llama's tokens fed one decode step at a time on
 three prompts: Basalt's greedy choice differs from llama's at 8 of 688 generated positions at the default tier state
 (5, 2 and 1 on the three prompts), 10 with the RAM tier one expert larger and 11 with a VRAM tier of 6 experts per layer.
 The count moves with which tier each expert sits in. KL against llama's logits on 512 positions of real text: mean
@@ -187,7 +187,7 @@ Basalt reads the first half of each chunk and scores the rest one row per window
 
 | Pack | PPL | KLD mean | KLD median | KLD p99 | Rows above 2 | Top-1 |
 |---|---|---|---|---|---|---|
-| GSQ-RCO IQ2_XXS (an earlier pack) | 3.6353 | 0.4311 | 0.0894 | 4.39 | 5.06% | 79.97% |
+| GSQ-RCO IQ2_XXS (tested, not shipped) | 3.6353 | 0.4311 | 0.0894 | 4.39 | 5.06% | 79.97% |
 | UD-IQ1_M (the published pack, Unsloth's GGUF) | 3.0334 | 0.2779 | 0.0550 | 2.86 | 2.26% | 83.88% |
 
 Both carry the same IQ4_NL Engram table. On the first 5 chunks of the IQ2_XXS pack, the same rows are worst whatever the

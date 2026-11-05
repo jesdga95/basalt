@@ -77,7 +77,7 @@ RAM cannot take them, the last experts of the routing order stay in the file.
 
 ### What it costs
 
-Measured on the earlier GSQ-RCO IQ2_XXS pack. Measured with a 400 W RTX 5090 and a 180 W RTX 5060 Ti, 121 GiB of RAM, `--pool-workers 8`, the Q8_0 drafter on the main card.
+Measured on a pack tested and not shipped, with the same drafter, a 400 W RTX 5090 and a 180 W RTX 5060 Ti, 121 GiB of RAM, `--pool-workers 8`, the Q8_0 drafter on the main card.
 It takes 7.47 GiB there, and the start line goes from `main card 34, second card 46, RAM 304, file 0` to `main card 10, second
 card 46, RAM 303, file 25`. A block takes 2.24 ms (8.63 ms with `--diag-drafter-gpu 1`).
 
