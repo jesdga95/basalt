@@ -52,7 +52,8 @@ int main() {
     CHECK(plan_chunk(d, 24 * GiB, kMargin, kMaxChunk / 2 + 1).chunk == kMaxChunk);
     // the staged groups count from the pairs a chunk of this prompt holds
     CHECK(chunk_bytes(d, 1024, 554) == workspace_bytes(d, 1024));
-    CHECK(chunk_bytes(d, 1024, 5000) == workspace_bytes(d, 1024) + ahead_bytes(d));
+    CHECK(chunk_bytes(d, 1024, 5000) == workspace_bytes(d, 1024));
+    CHECK(chunk_bytes(d, 2048, 5000) == workspace_bytes(d, 2048) + ahead_bytes(d));
     // a chunk that fits only without its staged groups does not fit
     const int64_t pairs_chunk = (kAheadPairs + d.n_used - 1) / d.n_used;
     CHECK(chunk_bytes(d, (int) pairs_chunk, kLong) == workspace_bytes(d, (int) pairs_chunk) + ahead_bytes(d));

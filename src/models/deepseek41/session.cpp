@@ -32,7 +32,7 @@
 namespace basalt::models::deepseek41 {
 namespace {
 constexpr int kLendTierTokens = 4096;   // a prompt this long reads without the VRAM tier, in larger chunks
-constexpr int kStepTailTokens = 256;     // a tail this short may read one decode step at a time
+constexpr int kStepTailTokens = 256;     // a tail this short may read one decode step at a time when no workspaces fit
 
 #define DS_CUDA(call)                                                                                   \
     do {                                                                                                \
@@ -119,7 +119,7 @@ public:
 
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
         sync_rewind(r.pos);
-        if (r.n_tokens > 1) {
+        if (r.n_tokens > 1 && std::max(r.total_tokens, r.n_tokens) > prefillp::kStepPrompt) {
             std::string err;
             const int batched = r.n_tokens;
             const int plan_tokens = std::max(r.total_tokens, r.n_tokens);
