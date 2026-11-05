@@ -9,6 +9,7 @@
 #include "basalt/core/model_file.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/context_policy.hpp"
+#include "models/deepseek41/meta.hpp"
 #include "models/deepseek41/model.hpp"
 
 #include <cstdint>
@@ -16,38 +17,13 @@
 namespace basalt::models::deepseek41 {
 namespace {
 
-uint64_t key_u(const GgufFile& g, const char* suffix) {
-    const MetaValue* v = g.get(std::string("deepseek41.") + suffix);
-    return v ? v->u : 0;
-}
-
 class Adapter final : public model::ModelAdapter {
 public:
     const char* arch() const override { return "deepseek41"; }
 
-    std::string validate(const GgufFile& g) const override {
-        const MetaValue* arch = g.get("general.architecture");
-        if (!arch) return "missing general.architecture";
-        if (arch->s != "deepseek41") return "architecture is '" + arch->s + "', this adapter requires 'deepseek41'";
-        for (const char* k : {"block_count", "embedding_length", "expert_count", "expert_used_count",
-                              "expert_feed_forward_length"})
-            if (key_u(g, k) == 0) return std::string("missing or zero deepseek41.") + k;
-        return {};
-    }
+    std::string validate(const GgufFile& g) const override { return validate_meta(g); }
 
-    model::ModelDesc describe(const GgufFile& g) const override {
-        model::ModelDesc d;
-        d.arch = "deepseek41";
-        d.n_layers = (int64_t) key_u(g, "block_count");
-        d.n_embd = (int64_t) key_u(g, "embedding_length");
-        d.n_expert = (int64_t) key_u(g, "expert_count");
-        d.n_expert_used = (int64_t) key_u(g, "expert_used_count");
-        d.n_ff_exp = (int64_t) key_u(g, "expert_feed_forward_length");
-        d.n_expert_shared = (int64_t) key_u(g, "expert_shared_count");
-        d.context_length = (int64_t) key_u(g, "context_length");
-        if (const MetaValue* t = g.get("tokenizer.ggml.tokens")) d.n_vocab = (int64_t) t->count;
-        return d;
-    }
+    model::ModelDesc describe(const GgufFile& g) const override { return describe_meta(g); }
 
     model::Result load(const model::LoadRequest& req, std::unique_ptr<model::LoadedModel>& out) const override {
         if (req.paths.empty()) return {model::Status::Error, "deepseek41: no model path"};

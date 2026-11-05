@@ -9,7 +9,7 @@
 
 #include "basalt/artifact/gguf_split.hpp"
 #include "basalt/model/adapter.hpp"
-#include "basalt/models/builtin.hpp"
+#include "../model/meta_adapters.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -115,7 +115,7 @@ int real_model(const std::string& any) {
 }
 
 int main(int argc, char** argv) {
-    basalt::models::register_builtin_models();
+    basalt::test::register_meta_adapters();
     if (argc == 3 && std::string(argv[1]) == "--real") return real_model(argv[2]);
     std::printf("gguf_split_test\n");
     {
