@@ -7,6 +7,8 @@
 // quantization, the down rows).  The check runs the formats of the i-quant and NVFP4 packs on random blobs, 1 to 130
 // experts (more than the pool's buffers too), 1 to 8 tokens per expert, at several active worker counts, with a
 // pause longer than the workers' spin in the middle, and fails on the first differing word or untouched output.
+// With the pool's timing on (--pool-timing) the outputs stay the same, the totals add up, and a park that began
+// before the totals' start counts from it.
 // `--bench` prints the time and rate of one layer of 15 experts.
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/cpu/expert.hpp"
@@ -228,6 +230,66 @@ int main(int argc, char** argv) {
                         e = n;
                         break;
                     }
+        }
+    }
+    // the timed batches: the same outputs, and totals that add up (one batch per call of up to 96 experts)
+    {
+        const Format& fm = formats.front();
+        const int n = 15, calls = 40;
+        std::vector<cpu::ExpertJobMulti> jobs((size_t) n);
+        std::vector<std::vector<float>> want((size_t) n * 2, std::vector<float>(H)), got((size_t) n * 2, std::vector<float>(H));
+        for (int e = 0; e < n; ++e) {
+            cpu::ExpertJobMulti& j = jobs[(size_t) e];
+            j.blob = fm.blobs[(size_t) e].data();
+            j.nt = 2;
+            float* o[MAXT];
+            for (int t = 0; t < 2; ++t) {
+                j.nact[t] = fm.nact[(size_t) t].data();
+                j.act[t] = &fm.actq[(size_t) t];
+                j.out[t] = got[(size_t) e * 2 + (size_t) t].data();
+                o[t] = want[(size_t) e * 2 + (size_t) t].data();
+            }
+            serial_expert(fm, j.blob, 2, o);
+        }
+        pool.set_timing(true);
+        (void) pool.take_timing();
+        int timed_bad = 0;
+        for (int c = 0; c < calls; ++c) {
+            for (auto& v : got) std::fill(v.begin(), v.end(), kSentinel);
+            pool.run_split_multi_native(fm.f, jobs.data(), n);
+            for (int r = 0; r < n * 2; ++r)
+                if (std::memcmp(want[(size_t) r].data(), got[(size_t) r].data(), H * sizeof(float)) != 0) { ++timed_bad; break; }
+        }
+        const cpu::ExpertPool::Timing t = pool.take_timing();
+        const cpu::ExpertPool::Timing t2 = pool.take_timing();
+        pool.set_timing(false);
+        const bool sums = t.batches == calls && t.tasks == t.tasks_p + t.tasks_e && t.tasks >= calls &&
+                          t.threads_p + t.threads_e >= calls && t.busy_p_ms + t.busy_e_ms > 0.0 &&
+                          t.span_ms >= t.tail_first_ms && t.tail_first_ms >= t.tail_med_ms && t.tail_med_ms >= 0.0 &&
+                          t.last_e <= t.batches && t.host_wait_ms >= 0.0 && t.wakes >= t.sleeps;
+        const bool reset = t2.batches == 0 && t2.tasks == 0 && t2.span_ms == 0.0;
+        std::printf("pool_native_test: timed: %d calls, %lld batches, %lld tasks, %d mismatches, totals %s, reset %s\n", calls,
+                    (long long) t.batches, (long long) t.tasks, timed_bad, sums ? "add up" : "WRONG", reset ? "ok" : "WRONG");
+        bad += timed_bad + (sums ? 0 : 1) + (reset ? 0 : 1);
+
+        // a park that began before the totals' start counts from it: the workers sleep through a long pause, with the
+        // timing off and then with it on, and one batch after a fresh start wakes them
+        const auto pause = cpu::ExpertPool::kSpinBeforeSleep * 10;
+        for (int on_before = 0; on_before < 2; ++on_before) {
+            pool.set_timing(on_before != 0);
+            std::this_thread::sleep_for(pause);
+            pool.set_timing(true);
+            (void) pool.take_timing();
+            pool.run_split_multi_native(fm.f, jobs.data(), n);
+            const cpu::ExpertPool::Timing pt = pool.take_timing();
+            pool.set_timing(false);
+            const double parked = pt.park_spin_ms + pt.park_sleep_ms;
+            const double limit = std::chrono::duration<double, std::milli>(pause).count() / 2;
+            const bool clipped = parked < limit;
+            std::printf("pool_native_test: timed after a %lld ms pause (timing %s before): parked %.3f ms over %d "
+                        "workers -> %s\n", (long long) pause.count(), on_before ? "on" : "off", parked, pool.workers(),
+                        clipped ? "clipped" : "WRONG (counted from before the start)");
+            bad += clipped ? 0 : 1;
         }
     }
     std::printf("pool_native_test: %d runs over %zu formats, %d mismatches\n", checked, formats.size(), bad);

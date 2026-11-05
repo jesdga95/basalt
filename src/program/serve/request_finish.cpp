@@ -34,6 +34,25 @@ Flow Request::complete() {
         const std::string pr = runtime_.ver.profile_report();
         if (!pr.empty()) basalt::log::raw("basalt decode GPU stages (ms/window):%s\n", pr.c_str());
     }
+    if (pool_timing) {
+        const basalt::kernels::cpu::ExpertPool::Timing t = runtime_.pool.take_timing();
+        runtime_.pool.set_timing(false);   // the prompt reads between requests run untimed
+        const double b = (double) std::max<int64_t>(t.batches, 1), w = (double) dec_windows;
+        auto per_task = [](double ms, int64_t n) { return n > 0 ? 1000.0 * ms / (double) n : 0.0; };
+        if (dec_windows > 0)
+            basalt::log::info("basalt decode pool", "%lld batches (%.1f per window, %lld more untimed); per batch: "
+                              "%.1f tasks (P %.1f, E %.1f) on %.1f threads (P %.1f, E %.1f), span %.3f ms, tail %.3f "
+                              "ms after the median thread, %.3f ms after the first, task time P %.3f ms (%.1f us/task) "
+                              "E %.3f ms (%.1f us/task), host waits %.3f ms; last task on an E-core in %.1f%%; per "
+                              "window parked: spin %.2f ms, asleep %.2f ms, %.1f wakes (%.2f from sleep)",
+                              (long long) t.batches, (double) t.batches / w, (long long) t.untimed,
+                              (double) t.tasks / b, (double) t.tasks_p / b, (double) t.tasks_e / b,
+                              (double) (t.threads_p + t.threads_e) / b, (double) t.threads_p / b,
+                              (double) t.threads_e / b, t.span_ms / b, t.tail_med_ms / b, t.tail_first_ms / b,
+                              t.busy_p_ms / b, per_task(t.busy_p_ms, t.tasks_p), t.busy_e_ms / b,
+                              per_task(t.busy_e_ms, t.tasks_e), t.host_wait_ms / b, 100.0 * (double) t.last_e / b,
+                              t.park_spin_ms / w, t.park_sleep_ms / w, (double) t.wakes / w, (double) t.sleeps / w);
+    }
     if (!cancelled) {
         // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
         // (the checkpoints taken while reading it are still good)

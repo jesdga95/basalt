@@ -66,6 +66,12 @@ Flow Request::decode() {
     d0 = Clock::now();
     // --decode-timing: where a request's decode time goes (one line per request)
     dec_timing = basalt::core::diagnostics().decode_timing;
+    // --pool-timing: the CPU pool's critical path over this request's decode
+    pool_timing = basalt::core::diagnostics().pool_timing && !runtime_.o.no_pool;
+    if (pool_timing) {
+        runtime_.pool.set_timing(true);
+        (void) runtime_.pool.take_timing();   // new totals: what the prompt read ran is not counted
+    }
 
     ds0 = dec_snap();
     dt_run = 0;

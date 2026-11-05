@@ -254,6 +254,7 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         else if (a == "--wait-stats") basalt::core::diagnostics().wait_stats = true;
         else if (a == "--force-zero-doorbell") basalt::core::diagnostics().zero_doorbell = true;
         else if (a == "--decode-timing") basalt::core::diagnostics().decode_timing = true;
+        else if (a == "--pool-timing") basalt::core::diagnostics().pool_timing = true;
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = next("--draft-log");
         else if (a == "--exp") {
             const std::string list = next("--exp");   // NAME=VALUE[,NAME=VALUE...]

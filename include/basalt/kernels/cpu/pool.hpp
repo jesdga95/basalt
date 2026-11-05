@@ -128,6 +128,28 @@ public:
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
 
+    /// --pool-timing: the row-split batches' critical path.  Every thread times its own tasks into its own record; the
+    /// host folds a batch's records into these totals while the workers run the next batch.  A task counts on the core
+    /// it started on.  Park time counts from the totals' start: a park that began before it is clipped to it.
+    struct Timing {
+        int64_t batches = 0, tasks = 0;
+        int64_t threads_p = 0, threads_e = 0;     ///< threads that ran a task, by the core of their last one, summed
+        int64_t tasks_p = 0, tasks_e = 0;         ///< tasks run on a performance / an efficient core
+        double busy_p_ms = 0, busy_e_ms = 0;      ///< their run time
+        double span_ms = 0;                       ///< the batch's publish to its last task's end
+        double tail_med_ms = 0;                   ///< the last task's end after the median thread's last end
+        double tail_first_ms = 0;                 ///< ... after the first thread's last end
+        int64_t last_e = 0;                       ///< batches whose last task ended on an efficient core
+        double host_wait_ms = 0;                  ///< the host waiting for the other threads after its own share
+        double park_spin_ms = 0, park_sleep_ms = 0;   ///< the workers parked between batches: spinning, asleep
+        int64_t wakes = 0, sleeps = 0;            ///< how often a worker left the park, and how often it had slept
+        int64_t untimed = 0;                      ///< unsplit batches (`run`), counted but not timed
+    };
+    /// Host thread, between batches.
+    void set_timing(bool on);
+    /// The totals since the last take, and starts new ones.  Host thread, between batches.
+    Timing take_timing();
+
     /// Total `_mm_pause` iterations spent waiting are not counted - see the note on the
     /// atomics below.  Counting needs a LOCKED read-modify-write in the park loop, which would add to the
     /// contention being measured.
@@ -160,7 +182,8 @@ private:
     /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
     int claim(uint32_t epoch);
     /// Publish the batch whose description the caller has just written: reset `done`, then `head`, then the epoch.
-    uint32_t begin_batch(int n);
+    /// `timed`: its threads time their tasks (--pool-timing).
+    uint32_t begin_batch(int n, bool timed = false);
     /// The host's waits, bounded by `kStall`.
     void wait_parked(const char* what);
     void wait_done(int n);
@@ -168,6 +191,8 @@ private:
     void wait_ready(int e);
     /// After a stall was logged: release the GPU's waits, then stop the process.
     [[noreturn]] static void stalled();
+    /// --pool-timing: the pending batch's records into the totals.
+    void fold_timing();
     /// Bump `epoch_`, and wake the workers that went to sleep.  Every publish goes through here.
     void publish();
 
@@ -240,6 +265,31 @@ private:
     std::vector<SplitBufMulti> split_multi_;
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;
+
+    // --pool-timing.  A timed batch's threads write records [slot * (n_ + 1) + thread] (the host is thread n_), the
+    // slot alternating per timed batch, so the host reads the previous batch's while the next one runs.
+    struct alignas(64) TaskRecord {
+        uint32_t epoch = 0;                       // the batch the record holds
+        int64_t last_ns = 0, busy_p_ns = 0, busy_e_ns = 0;
+        int32_t tasks_p = 0, tasks_e = 0;
+        bool last_e = false;                      // the thread's last task ran on an efficient core
+    };
+    struct alignas(64) ParkRecord {
+        std::atomic<int64_t> spin_ns{0}, sleep_ns{0}, wakes{0}, sleeps{0};
+    };
+    std::atomic<bool> timing_{false};
+    std::atomic<int64_t> timing_since_ns_{0};     // the totals' start (steady clock); parks before it are clipped
+    bool timed_batch_ = false;                    // the batch being published is timed (read after a claim)
+    int timed_slot_ = 0;
+    std::unique_ptr<TaskRecord[]> trec_;
+    std::unique_ptr<ParkRecord[]> park_;
+    std::vector<char> efficient_cpu_;             // by processor number
+    bool pending_ = false;                        // a timed batch whose records are not folded yet
+    uint32_t pending_epoch_ = 0;
+    int pending_slot_ = 0;
+    int64_t pending_t0_ = 0;
+    std::vector<int64_t> fold_ends_;
+    Timing timing_sum_;
 };
 
 }  // namespace basalt::kernels::cpu

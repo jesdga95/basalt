@@ -137,6 +137,7 @@ void usage() {
                  "  --profile            GPU stage times of the decode windows (serve path)\n"
                  "  --wait-stats         the host's wait times in the decode loop (serve path)\n"
                  "  --decode-timing      one line per request: where its decode time went (serve path)\n"
+                 "  --pool-timing        one line per request: the CPU pool's critical path in decode (serve path)\n"
                  "  --draft-log FILE     one line per decode window for draft-policy study\n"
                  "  --force-zero-doorbell  TEST: every decode window on the zero-doorbell graph; the routed\n"
                  "                       experts not in VRAM drop out, so the output is wrong (serve path)\n"
