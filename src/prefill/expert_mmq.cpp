@@ -50,7 +50,7 @@ void Prefill::Run::Chunk::Experts::Group::flush() {
     if (gg.n <= gg.first) return;
     const auto& f = lay.fmt[(size_t) l];
     if (gg_nslots > 0) {   // the copies land in order: the last one covers the others
-        cudaStreamWaitEvent(m.cs, m.copied[gg_slots[gg_nslots - 1]], 0);
+        wait_copy(m.tl, m.cs, m.copied[gg_slots[gg_nslots - 1]]);
     }
     float* sc = f.tail ? grp_scales(m.grp_d) : nullptr;
     if (!mmq::gather_native_group(gg, f.up_off, mmq_gub / 2, f.down_off, mmq_db, m.grp_gu, mmq_gub,

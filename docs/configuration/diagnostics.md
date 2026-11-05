@@ -50,7 +50,34 @@ All CLI, all off.
 | `--profile` | serve | GPU stage times of the decode windows, per request. Turns programmatic dependent launch off, so not for A/B timing. |
 | `--wait-stats` | serve | The host's wait times in the decode loop, one report per 200 windows. |
 | `--decode-timing` | serve | One line per request: where its decode time went. |
+| `--prefill-timing` | engine | One line per batched prompt read: its GPU time by stage, host waits, and the streamed expert bytes by source. Adds host time, so not for A/B timing. Not with a layer split. |
+| `--prefill-timing-log` | engine | Path. Also one JSON line per prompt chunk with the same split; implies `--prefill-timing`. |
 | `--draft-log` | serve | Path. One line per verify window (width, accepted, time), for studying the draft policy. |
+
+`--prefill-timing` records an event on the prompt path's compute stream at each stage boundary and reads them after
+syncs the read makes anyway (each layer's routing read-back, the chunk's and the read's end), so it adds no wait. The
+records and reads still add host time: `event reads` is the reads' share, and it shows in `routing`. Each interval goes
+to the stage it ends, so the stages add up to the stream's whole timeline, idle gaps included:
+
+| Stage | What the interval holds |
+| --- | --- |
+| `inputs` | The embeddings, the step records and the chunk's set-up, from the previous chunk's end. |
+| `ple` | Layer 1's n-gram block, with the wait for its rows. |
+| `hc` | The hyper-connection reads and writes. |
+| `gdn`, `qsa` | The mixers; `qsa` without its K/V appends. |
+| `kv` | The K/V appends (VRAM and the host copy), and a streamed layer's K/V staged from the host copy. |
+| `router`, `shared` | The router with the next layer's guessed routing; the shared expert. |
+| `routing` | The routing's read-back, and the GPU idle while the host groups the rows. |
+| `experts` | The routed experts on the GPU, and the wait for a peer card's rows. |
+| `ring` | The GPU waiting for a streamed expert's copy (only waits queued while the copy ran are marked). |
+| `cpu` | The GPU waiting for the CPU share's rows, and their upload. |
+| `combine` | The combine and the copies ahead of the next layer's routing. |
+| `callback` | The chunk's end: the last wait and the caller's callback (the draft layer's K/V, checkpoints). |
+
+The host part counts the host's waits for the stream (`sync`), the callback with the draft layer's K/V inside it,
+the copy issuer's waits for unpinned blobs (`stager`), the CPU share, and the event reads. Streamed bytes are by source: `pinned`
+(DMA from the arena), `ram` (copied from pageable memory first), `file` (read from the model file), `card` (another
+GPU); `resident` counts the expert-layers read from the VRAM tier.
 
 ## Speculation tests
 

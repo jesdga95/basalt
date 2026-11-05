@@ -16,10 +16,12 @@ bool Prefill::Run::Chunk::layer(int64_t l) {
     if (owner.on_layer && LB == 0 && owner.next_ == nullptr) owner.on_layer(l, g.n_layers, T, p0);
     core::progress_at("reading the prompt (batched): layer", l, p0);   // a stall names layer and chunk
     const core::LayerView v(*m.wt, l);
+    if (l == 1 && ple_on) m.tl.mark(Span::Hc, m.cs);   // layer 0's last write; the n-gram block follows
     if (l == std::max<int64_t>(LB, 1) && !ple_land()) return false;   // the PLE rows, read from layer 1 on
     if (l == 1 && LB == 0 && ple_on) copy_ahead(1);
     // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
     if (!ple_layer(l)) return false;
+    if (l == 1 && ple_on) m.tl.mark(Span::Ple, m.cs);
     for (int half = 0; half < 2; ++half) {
         // ---- the hyper-connection read of this half
         const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
@@ -40,11 +42,14 @@ bool Prefill::Run::Chunk::layer(int64_t l) {
         up_mix(m.gemm, (const uint16_t*) wu->data, m.lo16, m.gated, m.R, m.grs, (const float*) wn->data,
                half == 0 ? nullptr : m.mixed, m.mixed_bf, m.mixed_h, T, m.cs);
         if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err)) return false;
+        m.tl.mark(Span::Hc, m.cs);
 
         if (half == 0 && !core::is_qsa_layer(g, l)) {
             if (!gdn(v)) return false;
+            m.tl.mark(Span::Gdn, m.cs);
         } else if (half == 0) {
             if (!qsa(v)) return false;
+            m.tl.mark(Span::Qsa, m.cs);
         } else {
             if (!moe(l, v)) return false;
         }

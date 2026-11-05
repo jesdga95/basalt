@@ -39,13 +39,14 @@ bool Prefill::Run::Chunk::Experts::fused() {
                 // counted whether routed or not (the routing stays on the GPU): at a streamed
                 // chunk's size (>= 1024 tokens x 10 of 512) nearly every expert is routed
                 ++owner.stats_.experts_resident;
+                m.tl.resident((uint64_t) lay.blob_bytes(l));
             }
         }
         b.e1 = e;
         if (k > k0) {
             // one copy stream, in order: the batch's last blob covers the others
             wait_issued(k - 1);
-            cudaStreamWaitEvent(m.cs, m.copied[(k - 1) % (size_t) m.ring], 0);
+            wait_copy(m.tl, m.cs, m.copied[(k - 1) % (size_t) m.ring]);
         }
         if (fused_nat) {
             const auto& f = lay.fmt[(size_t) l];

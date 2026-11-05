@@ -10,17 +10,28 @@ using namespace detail;
 bool Prefill::Run::Chunk::Experts::finish() {
     if (cpu_fut.valid()) {   // CPU share: its rows into Dm's tail
         cudaEventRecord(m.cpu_gev[1], m.cs);   // after the GPU's expert work
-        if (!cpu_fut.get()) { err = "prefill: a CPU expert has no blob"; return false; }
+        m.tl.mark(Span::Experts, m.cs);
+        bool cpu_ok = false;
+        {
+            const HostTimer wait(m.tl, Host::CpuWait);
+            cpu_ok = cpu_fut.get();
+        }
+        if (!cpu_ok) { err = "prefill: a CPU expert has no blob"; return false; }
         cudaMemcpyAsync(m.Dm + (size_t) (T * K - rows_cpu) * N, m.cpu_rows, (size_t) rows_cpu * N * sizeof(float),
                         cudaMemcpyHostToDevice, m.cs);
+        m.tl.mark(Span::Cpu, m.cs);
+        m.tl.add(Host::CpuPool, cpu_ms);
+        m.tl.cpu_experts(n_cpu);
         owner.stats_.experts_cpu += n_cpu;
         owner.stats_.cpu_share = m.cpu_share_now;
     }
     if (peer_now) {   // multi-GPU: the peer's rows are in Dm (or in host memory)
         cudaStreamWaitEvent(m.cs, peer_fp4 ? ppc->ev_res : ppc->ev_done, 0);
     }
+    m.tl.mark(Span::Experts, m.cs);
     if (!(l == 0 && ple_on)) copy_ahead(l + 1);   // layer 1's upload of its PLE rows goes first
     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+    m.tl.mark(Span::Combine, m.cs);
     return true;
 }
 

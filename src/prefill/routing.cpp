@@ -36,7 +36,9 @@ bool Prefill::Run::Chunk::moe(int64_t l, const core::LayerView& v) {
             guess_for = l + 1;
         }
     }
+    m.tl.mark(Span::Router, m.cs);
     if (!shared_expert(v, wgi, wsg, wsu, wsd)) return false;
+    m.tl.mark(Span::Shared, m.cs);
     Experts experts(*this, l);
     return experts.execute();
 }
@@ -54,7 +56,12 @@ bool Prefill::Run::Chunk::Experts::Group::group() {
     // work), not the host: the watchdog's report says so (only its text changes)
     core::progress_at("reading the prompt (batched): waiting for the GPU (attention, router) at layer",
                       l, p0);
-    cudaStreamSynchronize(m.cs);
+    m.tl.mark(Span::Routing, m.cs);
+    {
+        const HostTimer wait(m.tl, Host::Sync);
+        cudaStreamSynchronize(m.cs);
+    }
+    m.tl.fold();
     core::progress_at("reading the prompt (batched): layer", l, p0);
     if (guess_for == l + 1) {   // the guessed rows per expert of the next layer
         m.guess_rows.assign((size_t) m.g->n_expert, 0);
@@ -106,6 +113,7 @@ bool Prefill::Run::Chunk::Experts::Group::group() {
         slot_h[(size_t) i] = p;
         src_h[(size_t) p] = (int32_t) (i / K);
     }
+    m.tl.mark(Span::Routing, m.cs);   // the GPU idled while the host grouped the rows
     if (grp_mapped) {
         copy_i32(m.slot_dev, m.grp_dev + m.grp_tk, T * K, m.cs);
         copy_i32(m.src_dev, m.grp_dev + 2 * m.grp_tk, T * K, m.cs);
