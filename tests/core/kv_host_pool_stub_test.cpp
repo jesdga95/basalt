@@ -200,9 +200,25 @@ void run(bool int8, bool q4) {
     CHECK(ahead.reserve(ss, g, 1001, err) && !ahead.grows_in_place() && pins.empty() && allocated == 1);
     fail_on = 0;
     ahead.release();
+    // A prefault larger than the pin gives back the pages past the registered prefixes: a mark written there reads
+    // zero once the pool grows over it again.
     CHECK(ahead.prefault(ss, g, 16387, err));
-    CHECK(ahead.reserve(ss, g, 1001, err) && ahead.cells() == 1004 && ahead.grow(12000, err) && ahead.cells() == 12000);
+    (void) ahead.prefault_wait();
+    for (int64_t j = 0; j < ahead.layers(); ++j) {
+        const auto a = c::arrays_of(ahead.layer(j));
+        for (size_t i = 0; i < a.size(); ++i) a[i][4096 * runs[i]] = 0x5a;   // the last page of cells
+    }
+    CHECK(ahead.reserve(ss, g, 1001, err) && ahead.cells() == 1004);
+    pinned = 0;
+    for (const auto& pin : pins) pinned += pin.n;
+    CHECK(pinned == ahead.bytes() && pinned == written);   // the 1004-cell prefixes alone
+    CHECK(ahead.grow(16387, err) && ahead.cells() == 16388);
+    for (int64_t j = 0; j < ahead.layers(); ++j) {
+        const auto a = c::arrays_of(ahead.layer(j));
+        for (size_t i = 0; i < a.size(); ++i) CHECK(a[i][4096 * runs[i]] == 0);
+    }
     ahead.release();
+    // A release while the writer may still run waits for it and frees everything.
     CHECK(ahead.prefault(ss, g, 16387, err));
     ahead.release();
     CHECK(!ahead.prefaulting() && !ahead.valid() && pins.empty() && ahead.prefault_bytes() == 0);
@@ -229,6 +245,21 @@ int main(int argc, char** argv) {
         return 0;   // The failed restoration must stop the engine before this return.
     }
     if (argc != 1) return 1;
+    {   // the writer reads its stop flag before each step: set, it writes nothing; clear, every committed byte
+        const uint64_t page = basalt::platform::vm_page_size();
+        const uint64_t span = 3 * (2ull << 20) + page;   // three whole steps and part of a fourth
+        uint8_t* base = (uint8_t*) basalt::platform::vm_reserve(span);
+        CHECK(base != nullptr && basalt::platform::vm_commit(base, span));
+        std::atomic<bool> stop{true};
+        std::atomic<uint64_t> wrote{0};
+        double ms = -1;
+        c::write_pages(&stop, &wrote, &ms, {{base, span}}, page);
+        CHECK(wrote.load() == 0 && ms >= 0);
+        stop = false;
+        c::write_pages(&stop, &wrote, &ms, {{base, span}, {base, page}}, page);
+        CHECK(wrote.load() == span + page);
+        basalt::platform::vm_release(base, span);
+    }
     run(true, false);
     run(false, true);
     run(false, false);
