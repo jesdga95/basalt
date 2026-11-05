@@ -64,9 +64,8 @@ public:
         uint64_t homes = 0;        ///< beside homes, which stay through a prompt at the full context
         uint64_t beside_homes = 0; ///< beside homes and the copies next to them, where a short prompt's workspaces fit
     };
-    /// Sizes the tiers and loads them. `h_x` and `h_rows`: the pinned activation and mapped rows a second card shares
-    /// with the CPU pool.
-    bool open(const Reserve& reserve, const float* h_x, float* h_rows, std::string& err);
+    /// Sizes the tiers and loads them. `h_rows`: the mapped rows a second card shares with the CPU pool.
+    bool open(const Reserve& reserve, float* h_rows, std::string& err);
 
     /// Gives the VRAM slots that the prompt path's workspaces occupy back to the driver (call before they are
     /// allocated); `grow` takes the memory freed after them as extra slots. Residency in those slots is dropped.
@@ -124,7 +123,6 @@ private:
         int layer, expert, victim;
     };
     bool load_ram(std::string& err);
-    bool open_peer(const float* h_x, float* h_rows, std::string& err);
     int ranked(int layer, int r) const;
     bool load_rank(std::string& err);
     void seed_copies(int first_rank, int64_t n);
