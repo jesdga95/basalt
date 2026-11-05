@@ -20,6 +20,9 @@
   --accent: #FF7A3D;
   --warn: #E9C341;
   --err: #D93A5B;
+  /* tints derived from the palette, so a hover or a ring follows the fg and accent instead of restating a hex */
+  --hover: color-mix(in oklab, var(--fg) 7%, transparent);
+  --accent-soft: color-mix(in oklab, var(--accent) 18%, transparent);
   color-scheme: dark;
 }
 
@@ -28,8 +31,11 @@ html { -webkit-text-size-adjust: 100%; }
 body { margin: 0; background: var(--bg); color: var(--fg); font: 400 14px/1.5 var(--font-sans); }
 button, input { font: inherit; color: inherit; }
 button { background: none; border: 0; padding: 0; cursor: pointer; }
-:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; box-shadow: 0 0 0 3px var(--accent-soft); }
 [hidden] { display: none !important; }
+/* a stale dashboard behind the API key form */
+.lay.frozen { opacity: .5; }
+.noscript { margin: 0; padding: 18px 28px; color: var(--fg-2); font: 400 13px/1.5 var(--font-mono); }
 td, th, .v, .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 .u { color: var(--fg-3); font-weight: 400; }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
@@ -43,6 +49,7 @@ td, th, .v, .num { font-family: var(--font-mono); font-variant-numeric: tabular-
 .brand img { width: 30px; height: 30px; display: block; }
 .wordmark { font: 700 24px/1 var(--font-sans); letter-spacing: -.035em; }
 .model { font: 400 13px/1 var(--font-mono); color: var(--fg-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.ident { font: 400 12.5px/1 var(--font-mono); color: var(--fg-3); opacity: .8; white-space: nowrap; }
 .grow { flex: 1; }
 .state { font: 500 13px/1 var(--font-mono); color: var(--fg-2); white-space: nowrap; }
 .state[data-s="generating"], .state[data-s="reading"] { color: var(--accent); }
@@ -57,13 +64,84 @@ td, th, .v, .num { font-family: var(--font-mono); font-variant-numeric: tabular-
 .auth button { padding: 9px 16px; border-radius: 6px; background: var(--raised); }
 
 /* Page: the hardware sidebar at full height, Speed across the top, the slots and the logs below */
+/* The last row may shrink: the card inside scrolls its own content, so a short window never clips it */
 .lay { display: grid; gap: 16px; padding: 0 28px 16px; grid-template-columns: 320px minmax(0, 1.3fr) minmax(0, 1fr);
-  grid-template-rows: auto minmax(0, 1fr); grid-template-areas: "side hero hero" "side main logs"; }
+  grid-template-rows: auto auto minmax(0, 1fr) minmax(0, auto); grid-template-areas: "state state state" "side hero hero" "side main logs" "side main conv"; }
+.a-state { grid-area: state; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 28px; padding: 12px 20px; }
 .a-side { grid-area: side; }
-.a-hero { grid-area: hero; }
-.a-main { grid-area: main; display: flex; flex-direction: column; }
+.a-hero { grid-area: hero; container-type: inline-size; }
+.a-main { grid-area: main; display: flex; flex-direction: column; container-type: inline-size; }
 .a-logs { grid-area: logs; display: flex; flex-direction: column; }
-.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; min-width: 0; min-height: 0; }
+.a-conv { grid-area: conv; display: flex; flex-direction: column; }
+
+/* A card answers to its own width, not the window's: the grid's columns change size without the viewport doing so. */
+@container (max-width: 720px) {
+  .a-main .col-ep { display: none; }        /* the endpoint is the first column to go */
+}
+@container (max-width: 640px) {
+  .a-main .col-cache { display: none; }
+}
+@container (max-width: 600px) {
+  .a-main .col-pcie, .a-main .col-hit { display: none; }
+}
+@container (max-width: 560px) {
+  .a-hero .trio, .a-hero .hfoot { grid-template-columns: 1fr; }
+  .a-hero .trio > div + div, .a-hero .hfoot > div + div { border-left: 0; border-top: 1px solid var(--line); }
+}
+
+/* Model state strip: every state named, the current one lit, and what it is doing now */
+.st-l { display: flex; align-items: center; gap: 16px; white-space: nowrap; }
+.st-k { font: 600 14px/1 var(--font-sans); }
+.st-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { font: 400 12.5px/1 var(--font-mono); color: var(--fg-3); background: var(--surface); border: 1px solid transparent; border-radius: 999px; padding: 6px 10px; white-space: nowrap; }
+.chip:hover { border-color: var(--line); }
+.chip[data-on="true"] { color: var(--basalt-950); background: var(--accent); font-weight: 600; }
+.st-r { display: grid; gap: 8px; min-width: 0; }
+.st-top { display: flex; justify-content: space-between; gap: 16px; font: 400 13px/1 var(--font-mono); color: var(--fg-2); white-space: nowrap; overflow: hidden; text-wrap: balance; }
+.st-top .u { margin-left: 6px; }
+.st-bar { height: 6px; border-radius: 3px; background: var(--raised); overflow: hidden; }
+.st-bar i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 3px; transition: width .3s linear; }
+
+/* Context fill: a donut of the fullest slot, then the bars behind it */
+.sb-ctx { flex: none; }
+.donut { display: flex; align-items: center; gap: 16px; }
+.donut svg { width: 84px; height: 84px; flex: none; }
+.donut .dv { font: 600 24px/1 var(--font-sans); }
+.donut .dv small { font: 400 12.5px/1 var(--font-mono); color: var(--fg-3); margin-left: 4px; }
+.donut .dk { font: 400 12.5px/1 var(--font-mono); color: var(--fg-3); margin-top: 6px; }
+
+/* Requests footer: what has been served since the server started */
+.totals { flex: none; border-top: 1px solid var(--line); padding: 10px 20px; font: 400 12.5px/1.6 var(--font-mono); color: var(--fg-3); overflow: hidden; text-wrap: pretty; }
+.totals b { color: var(--fg-2); font-weight: 500; }
+
+/* Conversation cache: budget, the last request's reuse, and the reuse of recent ones */
+.cv { display: flex; flex-direction: column; gap: 12px; padding: 14px 20px 16px; min-height: 0; overflow: auto; scrollbar-gutter: stable; }
+.cv .spark { height: 44px; flex: none; }
+.cv .sb-row { line-height: 1.2; }
+.cv-note { font: 400 12.5px/1.4 var(--font-mono); color: var(--fg-3); }
+
+/* Logs: a level filter, and the count of a message repeated in a row */
+.lf { display: flex; gap: 4px; flex: none; }
+.lf button { padding: 4px 9px; border-radius: 5px; color: var(--fg-3); font: 500 12px/1.2 var(--font-mono); }
+.lf button:hover { color: var(--fg); }
+.lf button[aria-pressed="true"] { background: var(--surface); color: var(--fg); }
+.logs b.ln { color: var(--fg-3); font-weight: 500; }
+
+/* Requests: a row opens the full timings below the table */
+tbody tr.req { cursor: pointer; }
+tbody tr.req:hover td { background: var(--hover); }
+tbody tr.req.on td { background: var(--surface); }
+tbody tr.req:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+.reqdet { border-top: 1px solid var(--line); background: var(--bg); padding: 12px 20px; flex: none; display: flex; align-items: baseline; gap: 18px;
+  transition: opacity .12s ease-out, transform .12s ease-out; }
+@starting-style { .reqdet { opacity: 0; transform: translateY(-3px); } }
+.reqdet .dl { flex: 1 1 auto; }
+.reqdet .copy { flex: none; font: 500 12px/1 var(--font-mono); color: var(--fg-3); border: 1px solid var(--line); border-radius: 5px; padding: 5px 9px; }
+.reqdet .copy:hover { color: var(--fg); border-color: var(--fg-3); }
+.dl { display: flex; flex-wrap: wrap; gap: 6px 26px; font: 400 12.5px/1.6 var(--font-mono); color: var(--fg-3); }
+.dl > span { white-space: nowrap; }
+.dl b { color: var(--fg); font-weight: 500; margin-left: 6px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: clip; min-width: 0; min-height: 0; }
 .hd { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 14px 20px; font-size: 13px; color: var(--fg-3); border-bottom: 1px solid var(--line); flex: none; }
 .hd b { color: var(--fg); font-weight: 600; font-size: 14px; }
 .lh { height: 54px; align-items: center; padding: 0 20px; }
@@ -76,15 +154,19 @@ td, th, .v, .num { font-family: var(--font-mono); font-variant-numeric: tabular-
 .mid { font-size: 44px; margin-top: 12px; }
 
 /* Sidebar: GPUs, System, Experts pinned to the bottom */
-.sb { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; min-height: 0; }
+.sb { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden auto; display: flex; flex-direction: column; min-height: 0; }
 .sb-h { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 16px 20px 0; font: 600 14.5px/1 var(--font-sans); white-space: nowrap; }
 .sb-h span { font: 400 12.5px/1 var(--font-mono); color: var(--fg-3); overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-.sb-gpus { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
-.sb-gpu { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; gap: 12px; padding: 14px 20px 16px; }
+.sb-gpus { flex: 1 0 auto; min-height: 0; display: flex; flex-direction: column; }
+.sb-gpu { flex: 1 1 0; min-height: 260px; display: flex; flex-direction: column; gap: 12px; padding: 14px 20px 16px; }
 .sb-gpu + .sb-gpu { border-top: 1px solid var(--line-soft); }
 .sb-gt { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; font: 500 14px/1 var(--font-sans); white-space: nowrap; }
 .sb-gt > span:first-child { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .sb-gt .num { font-size: 12.5px; color: var(--fg-3); }
+.sb-gt .bus { font: 400 11.5px/1 var(--font-mono); color: var(--fg-3); margin-left: 8px; }
+.sb-bus { font: 400 11.5px/1 var(--font-mono); color: var(--fg-3); margin-top: -6px; }
+.sb-vram { height: 34px; flex: none; position: relative; }
+.sb-vram > .spark, .sb-vram > .sb-ch { height: 100%; }
 .sb-gt .num b { color: var(--fg); font-weight: 500; font-size: 13.5px; margin-right: 4px; }
 .sb-met { display: flex; flex-direction: column; gap: 8px; }
 .sb-met.grow { flex: 1 1 0; min-height: 0; }
@@ -113,6 +195,8 @@ td, th, .v, .num { font-family: var(--font-mono); font-variant-numeric: tabular-
 .sb-foot { font: 400 11.5px/1 var(--font-mono); color: var(--fg-3); white-space: nowrap; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; }
 .sb-exp .sb-body { display: block; padding: 14px 20px 18px; }
 .sb-stack { display: flex; height: 8px; border-radius: 4px; overflow: hidden; gap: 2px; background: var(--raised); }
+.sb-cap { margin-bottom: 12px; }
+.sb-cap2 { font: 400 11.5px/1.4 var(--font-mono); color: var(--fg-3); margin: -4px 0 12px; }
 .sb-stack i { display: block; height: 100%; }
 .sb-leg { display: flex; justify-content: space-between; margin-top: 14px; }
 .sb-leg > div { display: grid; grid-template-columns: 8px auto; column-gap: 7px; row-gap: 7px; align-items: center; white-space: nowrap; }
@@ -150,13 +234,15 @@ td, th, .v, .num { font-family: var(--font-mono); font-variant-numeric: tabular-
 .tabs button { padding: 6px 14px; border-radius: 6px; color: var(--fg-3); font-weight: 500; line-height: 1.5; }
 .tabs button:hover { color: var(--fg); }
 .tabs button[aria-selected="true"] { background: var(--surface); color: var(--fg); }
-.pane { flex: 1 1 auto; min-height: 0; overflow: auto; display: flex; flex-direction: column; }
+.pane { flex: 1 1 auto; min-height: 0; overflow: auto; display: flex; flex-direction: column; scrollbar-gutter: stable; }
+/* the header of a long request list stays put */
+.pane thead th { position: sticky; top: 0; z-index: 1; background: var(--panel); }
 .empty { padding: 14px 20px; color: var(--fg-3); font-size: 13px; }
 table { width: 100%; border-collapse: collapse; }
 th { font-weight: 400; color: var(--fg-3); text-align: left; white-space: nowrap; border-bottom: 1px solid var(--line); }
 td { white-space: nowrap; border-bottom: 1px solid var(--line-soft); }
 tr:last-child td { border-bottom: 0; }
-th, td { padding: 5px 14px; font-size: 12.5px; line-height: 1.5; }
+th, td { padding: 5px 10px; font-size: 12.5px; line-height: 1.5; }
 th { padding-top: 7px; padding-bottom: 7px; }
 th:first-child, td:first-child { padding-left: 20px; }
 th:last-child, td:last-child { padding-right: 20px; }
@@ -192,7 +278,7 @@ tr.live td { color: var(--accent); }
 .sl.dense .rw .spark { margin: 7px 0; }
 
 /* Logs: wrapped, continuation lines indented past the time */
-.logs { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 12px 20px; font: 12.5px/1.8 var(--font-mono); color: var(--fg-2); white-space: pre-wrap; overflow-x: hidden; }
+.logs { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 12px 20px; font: 12.5px/1.8 var(--font-mono); color: var(--fg-2); white-space: pre-wrap; overflow-x: hidden; scrollbar-gutter: stable; }
 .logs div { padding-left: 10ch; text-indent: -10ch; overflow-wrap: anywhere; }
 .logs i { font-style: normal; color: var(--fg-3); }
 .logs .warn { color: var(--warn); }
@@ -211,6 +297,29 @@ tr.live td { color: var(--accent); }
   .sb-tbl .t { padding-top: 9px; }
   .sb-tbl .c { padding: 7px 0 9px; }
   .sb-agg .sb-met + .sb-met { display: none; }
+  .sb-gpu { min-height: 240px; }
+  .donut svg { width: 60px; height: 60px; }
+}
+/* A short window has no room for the cache card's chart: the log is what gets read then */
+@media (min-width: 901px) and (max-height: 1040px) {
+  .a-conv { max-height: 190px; }
+  .cv .spark { display: none; }
+}
+/* The charts are data, not chrome: keep their colours in Windows' high-contrast mode */
+@media (forced-colors: active) {
+  .sb-ch svg, .spark svg, .cw svg, .pcw svg, .donut svg { forced-color-adjust: none; }
+}
+/* The data is the point here, so a still strip still moves; only the easing goes */
+@media (prefers-reduced-motion: reduce) {
+  .st-bar i, .reqdet { transition: none; }
+}
+/* More contrast: lines and secondary text step up; nothing else moves */
+@media (prefers-contrast: more) {
+  :root {
+    --line: color-mix(in oklab, var(--fg) 30%, transparent);
+    --line-soft: color-mix(in oklab, var(--fg) 18%, transparent);
+    --fg-3: color-mix(in oklab, var(--fg) 65%, var(--basalt-900));
+  }
 }
 /* Phone and narrow windows: one column (header, Speed, slots, logs, hardware) */
 @media (max-width: 900px) {
@@ -218,9 +327,8 @@ tr.live td { color: var(--accent); }
   .bar { padding: 0 16px; gap: 12px; flex-wrap: wrap; height: auto; min-height: 56px; }
   .where { display: none; }
   .auth { margin: 0 16px 16px; }
-  .lay { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; grid-template-areas: "hero" "main" "logs" "side"; padding: 0 16px 16px; }
-  .trio, .hfoot { grid-template-columns: 1fr; }
-  .trio > div + div, .hfoot > div + div { border-left: 0; border-top: 1px solid var(--line); }
+  .lay { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; grid-template-areas: "state" "hero" "main" "logs" "side"; padding: 0 16px 16px; }
+  .a-state { grid-template-columns: minmax(0, 1fr); gap: 12px; }
   .cw { min-height: 120px; }
   .big { font-size: 52px; }
   .mid { font-size: 38px; }

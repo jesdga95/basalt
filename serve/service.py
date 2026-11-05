@@ -2,16 +2,17 @@
 from __future__ import annotations
 
 import collections
+import collections.abc
 import contextlib
 import ctypes
+import re
 import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Iterator
+from typing import Any
 
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
-from serve.engine.mock import Engine
 from serve.frontend import ChatTemplate, Event, OutputParser, images_of, literal_tags, mark_think_literals, unmark_think_literals
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
@@ -21,6 +22,10 @@ from serve.engine.image_source import USAGE as IMAGE_USAGE, ImageRefused, ImageS
 from serve.engine.vision import IMAGE_WAITING_BYTES, Vision
 from serve.api.grammar import grammar_spec, unenforced
 from serve.config import GRAMMAR_DEFAULT
+
+# The conversation cache's figures, as the engine logs them beside a request (not in the DONE line)
+_CACHE_FIGURES = re.compile(r"parked=(\d+) bytes=(\d+)(?: evictions=(\d+))?")
+_CACHE_RESTORED = re.compile(r"restored (\d+) tokens")
 
 
 def available_ram_mib() -> int | None:
@@ -68,7 +73,7 @@ DEBUG = False            # --debug: one line per request plus the raw model text
 class Service:
     loading = booting = False                      # a load or wake runs; the start-up load runs
     load_kind = "weights"                               # what the running load is: "weights" or "wake"
-    on_loaded = None                                    # called after each weights load or wake this service ran
+    on_loaded: collections.abc.Callable[[], None] | None = None   # after each weights load or wake this service ran
     boot_error = None                                   # the start-up load's failure, for the requests queued behind it
 
     def served_names(self) -> list[str]:
@@ -79,7 +84,7 @@ class Service:
             names.append(path.replace("\\", "/").rsplit("/", 1)[-1])
         return names
 
-    def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
+    def __init__(self, engine: Any, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
@@ -115,6 +120,12 @@ class Service:
         self.best: dict[str, dict] = {}                 # fastest whole request since start: "decode", "prefill"
         self.history = collections.deque(maxlen=500)    # finished requests, newest last
         self.requests_done = 0                           # finished requests since start
+        self.gpu_indices: list[int] = [0]                # the cards /metrics reads (nvidia-smi numbers), engine card first
+        self.gpu_index: int = 0                          # the engine's main card
+        # what has been served since start: the requests card's footer
+        self.totals = {"since": time.time(), "requests": 0, "prompt": 0, "reused": 0, "written": 0,
+                       "prompt_ms": 0.0, "decode_ms": 0.0}
+        self.conversation: dict = {}                     # the conversation cache's own figures, from the engine's log
         self.last_timings = None                         # last request's timings
         self.last_request_at = None                      # last request start or finish
         self.started_at = time.time()
@@ -186,7 +197,8 @@ class Service:
             if not nv.ok():
                 return None
             m = nv.Mem()
-            if nv.lib.nvmlDeviceGetMemoryInfo(nv.dev, ctypes.byref(m)) != 0:
+            fn = nv._fn("nvmlDeviceGetMemoryInfo")
+            if fn is None or fn(nv.dev, ctypes.byref(m)) != 0:
                 return None
             return int(m.free >> 20)
         except Exception:
@@ -259,9 +271,10 @@ class Service:
             if free is not None and free < self.min_free_vram_mib:
                 raise GpuBusy(f"the GPU is in use by another program: {free} MiB of VRAM free, the model needs "
                               f"{self.min_free_vram_mib} (min_free_vram_mib) - it stays unloaded until that is free")
-        if self._vision_down():                         # first: a GPU encoder takes its VRAM before the engine sizes its cache
+        vision = self.vision
+        if vision is not None and self._vision_down():   # first: a GPU encoder takes its VRAM before the engine sizes its cache
             print("[server] restarting the vision encoder", flush=True)
-            self.vision.restart()
+            vision.restart()
         if self.loaded():
             return
         if self.stopping.is_set():                      # shutdown began while the hook or the VRAM wait ran
@@ -421,7 +434,8 @@ class Service:
                 if not nv.ok():
                     return None
                 m = nv.Mem()
-                if nv.lib.nvmlDeviceGetMemoryInfo(nv.dev, ctypes.byref(m)) != 0:
+                fn = nv._fn("nvmlDeviceGetMemoryInfo")
+                if fn is None or fn(nv.dev, ctypes.byref(m)) != 0:
                     return None
                 total += int(m.used >> 20)
             return total
@@ -620,15 +634,39 @@ class Service:
                 "generated": s.get("generated") if busy else None,
                 "elapsed_s": round(time.time() - s["started"], 1) if busy and s.get("started") else None,
                 "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
+                "phase": s.get("phase") if busy else None,          # thinking, answering, a tool call being written
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if busy else None}
         engine = {"model": self.model, "max_context": self.engine.max_context,
+                  "path": getattr(self.engine, "model_path", None) or None,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else \
             {"now": {"gpus": []}, "history": {}, "static": {"gpus": []}}
         with self.status_lock:
             best = {k: dict(v) for k, v in self.best.items()}
+            totals = dict(self.totals)
+            conversation = dict(self.conversation)
         return {"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN], "best": best,
+                "totals": totals, "conversation": conversation,
                 "hardware": tel["now"], "hardware_static": tel["static"], "history": tel["history"]}
+
+    def note_engine_line(self, line: str) -> None:
+        """Keep the conversation cache's own figures. The engine logs them beside a request, not inside its DONE
+        line, and a cache that evicts is the reason a prompt reads again instead of being reused."""
+        if "conversation cache" not in line:
+            return
+        park, back = _CACHE_FIGURES.search(line), _CACHE_RESTORED.search(line)
+        if park is None and back is None:
+            return
+        with self.status_lock:
+            c = dict(self.conversation)
+            if park is not None:
+                c.update(parked=int(park[1]), bytes=int(park[2]))
+                if park[3] is not None:
+                    c["evictions"] = int(park[3])
+            if back is not None:
+                c["restored"] = int(back[1])
+            c["at"] = round(time.time(), 1)
+            self.conversation = c
 
     def _note_best(self, r: dict) -> None:
         """Keep finished request `r` as the best decode or prefill when it is the fastest big enough one.
@@ -911,7 +949,7 @@ class Service:
                 print(line, flush=True)
         return now
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> collections.abc.Iterator[tuple[str, object]]:
         """Yield ("event", Event) as text arrives, ("ping", None) as heartbeat, then ("done", {...}).
         `force`: the opening of the call the reply must make (see prepare)."""
         budget = self.reasoning_budget(sampling) if thinking else None
@@ -1150,7 +1188,7 @@ class Service:
                         else:
                             # the thinking closed itself: the call opens after the blank line the template puts
                             # before a call
-                            text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
+                            text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + (force or "")
                             force = None
                             extra = self.tok.encode(text, parse_special=True)
                             if max_new - n - len(extra) < 1:
@@ -1189,6 +1227,12 @@ class Service:
                                 if last.get("offloaded") is not None and routed else None
                             seen = prompt_tokens_seen(len(ids), last)   # less than len(ids) when cancelled mid-read
                             self.requests_done += 1
+                            self.totals["requests"] += 1
+                            self.totals["prompt"] += seen
+                            self.totals["reused"] += last.get("reused") or 0
+                            self.totals["written"] += n
+                            self.totals["prompt_ms"] += last.get("prompt_ms") or 0.0
+                            self.totals["decode_ms"] += last.get("decode_ms") or 0.0
                             if st.get("slot") is not None:
                                 self.slot_last[st["slot"]] = {"ctx": seen + n, "offered": last.get("drafts_offered"),
                                                               "accepted": last.get("drafts_accepted"), "at": time.time()}
