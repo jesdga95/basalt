@@ -38,3 +38,6 @@ At layer 0, computed in numpy from llama.cpp's own hc_norm output and the GGUF Q
 with no activation quantization: Basalt's mixed stream has relative error 0.00000 and llama.cpp's 1.06%. llama.cpp
 against an emulation of Q8_0 activation quantization differs by 0.009%. This is the main reason llama.cpp running the
 Q8_0 GGUF scores KLD 0.0325 against BF16 where the Basalt Q8_0 pack scores 0.0200 (table above).
+
+DeepSeek-V4.1-Flash is scored the same way against its own BF16 reference, one row per window, as its session keeps
+one row of logits ([DeepSeek-V4.1 precision](deepseek41.md#against-the-bf16-reference)).
