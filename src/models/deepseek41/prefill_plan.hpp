@@ -24,7 +24,7 @@ constexpr int kShareRows = 2048;                   // rows a layer of a short re
 constexpr int kStepPrompt = 12;                    // a prompt this short reads one decode step at a time, faster than a chunk's bus copies
 constexpr int kShortPrompt = 2048;                 // a prompt this short takes no staged groups and reads beside a tier's copies
 constexpr int kShortChunk = 1024;                  // ... in chunks of this many tokens
-constexpr int64_t kAheadPairs = 6150;              // (token, slot) pairs from which a chunk stages its groups ahead: past a short chunk
+constexpr int64_t kAheadPairs = 50000;              // (token, slot) pairs from which a chunk stages its groups ahead: past a short chunk
 
 /// The first position that stops a read's rows short of the last layers. Each layer past `skip_layer` looks one window further
 /// back through its own window rows, and every row reaches the compressed rows of `skip_layer` anyway.

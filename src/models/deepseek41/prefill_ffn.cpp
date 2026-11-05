@@ -41,7 +41,7 @@ constexpr int kStageExperts = 32;   // experts staged on the device per launch
 constexpr int kReadThreads = 8;     // concurrent blob reads
 constexpr int kRing = 5;             // layers of file-read experts held ahead
 constexpr int kSharedRows = 1024;   // tokens per shared-expert sub-chunk
-constexpr int kCpuRows = 2;         // a RAM expert with this few rows in a short chunk may stay on the CPU
+constexpr int kCpuRows = 8;         // a RAM expert with this few rows in a short chunk may stay on the CPU
 constexpr int kPeerRows = 16;       // a second card's expert with this few rows computes there; a copy through the host costs more
 
 class Impl final : public PrefillFfn {

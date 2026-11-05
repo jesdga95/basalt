@@ -71,11 +71,11 @@ int main() {
     // the staged groups count from the pairs a chunk of this prompt holds
     CHECK(chunk_bytes(d, 1024, 554) == workspace_bytes(d, 1024));
     CHECK(chunk_bytes(d, 1024, 5000) == workspace_bytes(d, 1024));
-    CHECK(chunk_bytes(d, 2048, 5000) == workspace_bytes(d, 2048) + ahead_bytes(d));
+    CHECK(chunk_bytes(d, 16384, 20000) == workspace_bytes(d, 16384) + ahead_bytes(d));
     // a chunk that fits only without its staged groups does not fit
     const int64_t pairs_chunk = (kAheadPairs + d.n_used - 1) / d.n_used;
     CHECK(chunk_bytes(d, (int) pairs_chunk, kLong) == workspace_bytes(d, (int) pairs_chunk) + ahead_bytes(d));
-    CHECK(plan_chunk(d, workspace_bytes(d, 8192) + kMargin, kMargin, kLong).chunk < 8192);
+    CHECK(plan_chunk(d, workspace_bytes(d, 16384) + kMargin, kMargin, kLong).chunk < 16384);
 
     // give-back: a short context keeps what it has; a long one drops to the kept positions
     const std::vector<int> ratios = {2, 2, 2, 1};

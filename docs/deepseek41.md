@@ -24,7 +24,7 @@ the pack and picks the chat format, tool-call syntax and thinking switch to matc
   memory left: 16,384 tokens per chunk, halved down to 256. A read of 4,096 tokens or more (on two cards, more than 2,048) gives the main card's copies
   back for its duration and streams the experts from the main card's homes, RAM, the second card (through the host) and
   the pack; the copies reopen after it, from the routing order on two cards, empty on one, where the first tokens after
-  it decode slower. On two cards a prompt of up to 2,048 tokens reads beside the copies and keeps them, in chunks of 1,024 and workspaces that stay for the next one, and up to 12 tokens read one decode step at a time. In such a read the second card computes its own experts of up to 16 rows and the CPU the RAM experts of up to 2 rows, beside the bus copies of the rest. After a long
+  it decode slower. On two cards a prompt of up to 2,048 tokens reads beside the copies and keeps them, in chunks of 1,024 and workspaces that stay for the next one, and up to 12 tokens read one decode step at a time. A chunk under 8,334 tokens stages only the experts it routes; in it the second card computes its own experts of up to 16 rows and the CPU the RAM experts of up to 8 rows, beside the bus copies of the rest. A longer chunk stages every expert ahead of its routing. After a long
   context, a tail of up to 256 tokens that finds no room for workspaces reads one decode step at a time; a longer one
   borrows the copies too. If even the smallest chunk does not fit, or the caches cannot grow, the request fails with an
   error naming the free memory and the next one runs. When a new conversation starts, caches a long one left mapped
