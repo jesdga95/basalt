@@ -120,8 +120,8 @@ int decode(Context& context) {
                 res_put(d_res);
         };
         // The VRAM tier follows the conversation.  Candidates are missing experts routed at least twice (decayed); each
-        // is paired with its layer's least-routed resident expert and swapped when it was routed clearly more often.
-        // Copies run between rounds, when the GPU is idle.
+        // is paired with its layer's least-routed resident expert and swapped when its count is at least the resident's
+        // plus --adapt-margin.  Copies run between rounds, when the GPU is idle.
         auto adapt = [&]() -> bool {
             const Clock::time_point ta = Clock::now();
             ++adapt_rounds;
@@ -146,7 +146,7 @@ int decode(Context& context) {
                 std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                                   [](auto& a, auto& b) { return a.first < b.first; });
                 for (size_t i = 0; i < nc; ++i) {
-                    if (cand[i].first < vict[i].first + 1.5f) break;
+                    if (cand[i].first < vict[i].first + o.adapt_margin) break;
                     swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
                 }
             }

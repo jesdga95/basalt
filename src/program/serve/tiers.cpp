@@ -140,6 +140,7 @@ void Runtime::apply_pending(bool wait, bool exchanges) {
     promoted.clear();
 }
 
+// A candidate swaps in for the least-routed resident left when its count is at least that one's plus --adapt-margin.
 void Runtime::rank_swaps(std::vector<Swap>& swaps, bool across) {
     swaps.clear();
     if (across) {
@@ -170,7 +171,7 @@ void Runtime::rank_swaps(std::vector<Swap>& swaps, bool across) {
             return a.u != b.u ? a.u < b.u : key(a) > key(b);
         });
         for (size_t i = 0; i < nc; ++i) {
-            if (cand[i].u < vict[i].u + 1.5f) break;
+            if (cand[i].u < vict[i].u + o.adapt_margin) break;
             swaps.push_back({cand[i].u - vict[i].u, cand[i].layer, cand[i].e, vict[i].e, vict[i].layer});
         }
         std::stable_sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
@@ -205,7 +206,7 @@ void Runtime::rank_swaps(std::vector<Swap>& swaps, bool across) {
         std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                           [](auto& a, auto& b) { return a.first < b.first; });
         for (size_t i = 0; i < nc; ++i) {
-            if (cand[i].first < vict[i].first + 1.5f) break;
+            if (cand[i].first < vict[i].first + o.adapt_margin) break;
             swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second, (int32_t) l});
         }
     }
@@ -353,7 +354,7 @@ bool Runtime::xq_round(std::vector<Swap>* ranked) {
         const bool p2p = peer_excl && peer.has(s.layer, s.in) && !src.has_resident(s.layer, s.in);
         if (p2p && src.has_resident(s.layer, s.out)) {
             // a lent slot's expert keeps its RAM place, which the incoming one would not have: the layer's
-            // least-routed expert without one goes instead, if that is still a gain
+            // least-routed expert without one goes instead, if the incoming one still clears it by --adapt-margin
             const float* u = drive.d.usage.data() + (size_t) s.layer * g.n_expert;
             int32_t best = -1;
             for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
@@ -361,7 +362,7 @@ bool Runtime::xq_round(std::vector<Swap>* ranked) {
                 if (host_res[k] < 0 || src.has_resident(s.layer, e) || taken.count(k)) continue;
                 if (best < 0 || u[e] < u[best]) best = e;
             }
-            if (best < 0 || u[s.in] - promote_margin < u[best] + 1.5f) return true;
+            if (best < 0 || u[s.in] - promote_margin < u[best] + o.adapt_margin) return true;
             taken.insert((size_t) s.layer * g.n_expert + best);
             s.out = best;
         }

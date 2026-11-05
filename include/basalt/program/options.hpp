@@ -183,6 +183,9 @@ struct Options {
     bool pool_workers_given = false;     // --pool-workers on the command line
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
     bool adapt_decay_set = false;
+    /// A missing expert swaps in when its count is at least its victim's plus this (--adapt-margin); above 0, so a
+    /// pair cannot swap back and forth every round
+    float adapt_margin = 1.5f;
     double prefill_cpu_share = 0.6;   ///< the share of the streamed prompt experts the CPU computes (--prefill-cpu-share)
     /// Stop when the model emits an end-of-turn token (<|endoftext|> 248044, <|im_end|> 248046, or --eos-ids).
     bool stop_eos = false;

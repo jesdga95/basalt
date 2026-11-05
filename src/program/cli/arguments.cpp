@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstdlib>
 #include <sstream>
 
@@ -114,6 +115,11 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--adapt-every") { o.adapt_every = std::atoi(next("--adapt-every")); o.adapt_every_given = true; }
         else if (a == "--adapt-decay") { o.adapt_decay = (float) std::atof(next("--adapt-decay")); o.adapt_decay_set = true; }
+        else if (a == "--adapt-margin") {
+            const double m = std::atof(next("--adapt-margin"));
+            if (!(m > 0.0 && std::isfinite(m))) { basalt::log::error("basalt", "--adapt-margin needs M > 0"); return 2; }
+            o.adapt_margin = (float) m;
+        }
         else if (a == "--prefill-cpu-share") o.prefill_cpu_share = std::atof(next("--prefill-cpu-share"));
         else if (a == "--relaxed-drafting") {   // the value is optional: a number in (0, 1] when one follows
             o.relaxed_drafting = kRelaxedDraftingDefault;

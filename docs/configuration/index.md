@@ -161,10 +161,11 @@ The model's experts live in VRAM (the expert cache), in RAM, or in the file. The
 | `adapt-swaps` | engine | integer | 96 (`0` = off) | Most experts one adaptive round swaps into the main GPU; a server round after a large backlog swaps four times as many, and the RAM copy keeps four times N free places for them. [Adaptive tier](adaptive.md). |
 | `peer-adapt-swaps` | engine | integer | the value of `adapt-swaps` | Most experts one round swaps into the peer card. Only with a peer card. |
 | `adapt-decay` | engine | number | 0.85 on a server, 0.7 with a layer split | The factor the routing counts are multiplied by after each round; lower forgets sooner. [Adaptive tier](adaptive.md). |
+| `adapt-margin` | engine | number above 0 | 1.5 | A round swaps a missing expert into the main GPU when its routing count is at least the replaced resident's plus this; higher = fewer, surer swaps. [Adaptive tier](adaptive.md). |
 
 ### The adaptive tier
 
-The engine moves the experts the conversation routes to most into VRAM, in rounds beside decode. What the four
+The engine moves the experts the conversation routes to most into VRAM, in rounds beside decode. What the five
 settings above do, what they trade and the measured numbers: [adaptive tier](adaptive.md).
 
 The startup lines `RAM floor ...` and `RAM ... free, guard ...` give the figures behind the memory floors. See the

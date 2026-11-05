@@ -167,6 +167,8 @@ void usage() {
                  "  --adapt-decay F      factor the routing counts are multiplied by after each round (default\n"
                  "                       0.85 on a server with or without the peer tier, 0.7 with the layers\n"
                  "                       split over GPUs and outside --serve); lower forgets sooner\n"
+                 "  --adapt-margin M     a missing expert swaps in when its count is at least the replaced\n"
+                 "                       resident's plus M (default 1.5; above 0); higher = fewer, surer swaps\n"
                  "  --prefill-cpu-share F  share of the streamed prompt experts the CPU computes, 0 to 1 (default\n"
                  "                       0.6; 0 = the GPU streams them all).  Fixed, so the output is the same\n"
                  "                       from run to run; a weaker CPU may prefer a lower value\n"
