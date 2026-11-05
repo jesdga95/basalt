@@ -53,6 +53,8 @@ PP_SLACK = 3.0
 # for good (the engine sits idle, so no watchdog fires). Generous: a cold model load is not a hang. A process that
 # says nothing for this long is ended, and the next request starts it again.
 ENGINE_READY_S = 900.0
+QUIT_S = 20.0            # an engine's time to end after QUIT
+QUIT_DISK_S = 300.0      # ... with a disk tier: it writes the conversations it holds first
 ENGINE_REQUEST = re.compile(
     # "+ 12288 of 98179 read": a request cancelled during its prompt read
     r"prompt (?P<prompt>\d+) tokens = (?P<reused>\d+) reused \+ \d+(?: of \d+)? read in (?P<read>[\d.]+) ms "
@@ -168,6 +170,7 @@ class ProcessEngine:
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
     takes_text = True                    # generate() accepts a PromptText (sent as GENT when the engine can tokenize)
     stderr_sink = None                   # callable(line): engine stderr when there is no log file
+    quit_s = QUIT_S
 
     # `last`: figures of the last DONE line; per thread with batch slots, since requests run concurrently.
     @property
@@ -217,6 +220,7 @@ class ProcessEngine:
                  env: dict | None = None, lazy: bool = False):
         self.spawn = (engine_bin, list(args), cwd, log, env)   # to start it again
         self.model_path = flag_value(args, "--model") or ""
+        self.quit_s = QUIT_DISK_S if (flag_value(args, "--conversation-cache-disk-mib") or "0") != "0" else QUIT_S
         self.log_path = log
         self.proc, self.pump, self.log = None, None, None
         if "slot_cv" not in self.__dict__:               # restart() wakes waiters even when the start failed
@@ -1394,7 +1398,7 @@ class ProcessEngine:
                     self.proc.stdin.write("QUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # the engine must see EOF before shutdown
-                    self.proc.wait(timeout=20)
+                    self.proc.wait(timeout=self.quit_s)
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     self.proc.terminate()
                     self.proc.wait(timeout=20)
