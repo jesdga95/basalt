@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Basalt is a local inference engine for mixture-of-experts models, built for NVIDIA Blackwell (sm_120) on Linux and Windows x64. It runs Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash on an NVIDIA Blackwell GPU, optionally with a second GPU as a peer expert tier, and system RAM holding the rest. It is a fork of Strata (MIT): the C++/CUDA engine is in `src/` and `include/`, each model's own code under `src/models/<model>`, and the Python server with an OpenAI- and Anthropic-compatible API is in `serve/`.
+Basalt is a local inference engine for mixture-of-experts models, built for NVIDIA Blackwell (sm_120) on Linux and Windows x64. It runs Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash on an NVIDIA Blackwell GPU, optionally with more GPUs as peer expert tiers (up to three for Flash-Next, one for DeepSeek), and system RAM holding the rest. It is a fork of Strata (MIT): the C++/CUDA engine is in `src/` and `include/`, each model's own code under `src/models/<model>`, and the Python server with an OpenAI- and Anthropic-compatible API is in `serve/`.
 
 ## Working rules
 
