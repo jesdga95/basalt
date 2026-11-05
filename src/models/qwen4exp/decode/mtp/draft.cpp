@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "basalt/core/spin_wait.hpp"
 
 namespace basalt::core {
 
@@ -95,9 +96,12 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
         prefetch_ple(tokens[a]);
         auto wait_step = [&](int j) {
             uint32_t spins = 0;
+            SpinWait spin;
             while (((volatile int32_t*) h_out_)[j] < 0) {
-                basalt::platform::cpu_relax();
-                if ((++spins & 1023u) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
+                spin();
+                // the stream is the fallback when the graph ends without writing the step: query it more often
+                // once the wait yields, since each check then takes a scheduler round trip
+                if ((++spins & (spin.yielding() ? 63u : 1023u)) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
             }
         };
         wait_step(0);
