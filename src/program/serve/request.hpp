@@ -146,6 +146,7 @@ private:
     int64_t pair_holds{};
     Clock::time_point d0{};
     bool dec_timing{};
+    bool pool_timing{};
     struct DecSnap {
         double wait, pool, host, plan, actq, jobs, run, peer_wait;
         int64_t misses, entries, hits, pcie, peer;

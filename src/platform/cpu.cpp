@@ -95,6 +95,7 @@ CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
                 topo.p_threads += (int) c.lps.size();
             } else {
                 topo.e_cores++;
+                for (int lp : c.lps) topo.efficient.push_back(lp);
             }
         }
     } else {
@@ -135,6 +136,12 @@ CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
         for (int cpu : e_cores) topo.worker_cores.push_back(cpu);
     }
     return topo;
+}
+
+int current_cpu() {
+    PROCESSOR_NUMBER pn{};
+    GetCurrentProcessorNumberEx(&pn);
+    return (int) pn.Group * 64 + (int) pn.Number;
 }
 
 CpuInfo cpu_info() {
@@ -239,6 +246,7 @@ CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
                 topo.p_threads++;
             } else {
                 if (!cl.is_sibling) topo.e_cores++;
+                topo.efficient.push_back(cl.cpu);
             }
         }
     } else {
@@ -286,6 +294,8 @@ CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
     }
     return topo;
 }
+
+int current_cpu() { return sched_getcpu(); }
 
 CpuInfo cpu_info() {
     CpuInfo info;

@@ -56,6 +56,13 @@ int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
+int64_t now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+int64_t ns_of(std::chrono::steady_clock::duration d) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(d).count();
+}
 }  // namespace
 
 void ExpertPool::diag(std::FILE* f) const {
@@ -140,6 +147,7 @@ void ExpertPool::worker(int id) {
         // After `kSpinBeforeYield` the worker yields its core on every check, and after `kSpinBeforeSleep` with no
         // work it sleeps.  The clock is read once every 64 checks.
         const auto parked_at = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point slept_at{};
         uint32_t spins = 0;
         bool yielding = false;
         while (epoch_.load(std::memory_order_acquire) == seen) {
@@ -150,6 +158,7 @@ void ExpertPool::worker(int id) {
             const auto waited = std::chrono::steady_clock::now() - parked_at;
             yielding = waited >= kSpinBeforeYield;
             if (waited < spin_before_sleep_) continue;
+            slept_at = parked_at + waited;
             std::unique_lock<std::mutex> lk(sleep_mu_);
             wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
             sleepers_.fetch_add(1, std::memory_order_seq_cst);
@@ -160,6 +169,20 @@ void ExpertPool::worker(int id) {
             wstate_[(size_t) id].store(kParked, std::memory_order_relaxed);
         }
         if (stop_.load(std::memory_order_acquire)) return;
+        if (timing_.load(std::memory_order_acquire)) {   // the park just ended: spinning, then asleep, since the start
+            const int64_t since = timing_since_ns_.load(std::memory_order_relaxed);
+            const int64_t woke = now_ns();
+            const bool slept = slept_at != std::chrono::steady_clock::time_point{};
+            const int64_t p0 = std::max(ns_of(parked_at.time_since_epoch()), since);
+            const int64_t s0 = slept ? std::max(ns_of(slept_at.time_since_epoch()), since) : woke;
+            ParkRecord& pr = park_[(size_t) id];
+            pr.spin_ns.fetch_add(std::max<int64_t>(0, std::min(s0, woke) - p0), std::memory_order_relaxed);
+            if (slept) {
+                pr.sleep_ns.fetch_add(std::max<int64_t>(0, woke - s0), std::memory_order_relaxed);
+                pr.sleeps.fetch_add(1, std::memory_order_relaxed);
+            }
+            pr.wakes.fetch_add(1, std::memory_order_relaxed);
+        }
         // acquire: the batch this epoch published (`head`, and the description before it) is visible from here
         seen = epoch_.load(std::memory_order_acquire);
         // An inactive worker stays counted as parked and claims nothing; it just waits for the next epoch.
@@ -187,11 +210,12 @@ int ExpertPool::claim(uint32_t epoch) {
     }
 }
 
-uint32_t ExpertPool::begin_batch(int n) {
+uint32_t ExpertPool::begin_batch(int n, bool timed) {
     if (n < 0 || n > 0xffff) {
         basalt::log::error("basalt", "expert pool batch of %d jobs is out of range", n);
         std::abort();
     }
+    timed_batch_ = timed;
     // Every job of the previous batch has completed (`wait_done`), and a claim of it can no longer succeed, so
     // nothing adds to `done` until this batch's first claim - which the release below orders after the reset.
     done_.store(0, std::memory_order_relaxed);
@@ -253,11 +277,24 @@ void ExpertPool::wait_ready(int e) {
 }
 
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
-    (void) id;
+    // --pool-timing: a timed batch's tasks into this thread's record (the batch's description is read only once a claim
+    // has succeeded: the host cannot publish the next one before this task is done)
+    TaskRecord* rec = nullptr;
+    bool described = false;
     for (;;) {
         const int ci = claim(epoch);
         if (ci < 0) break;
         const uint32_t i = (uint32_t) ci;
+        if (!described) {
+            described = true;
+            if (timed_batch_) {
+                rec = &trec_[(size_t) timed_slot_ * (size_t) (n_ + 1) + (size_t) (id < 0 ? n_ : id)];
+                *rec = TaskRecord{};
+                rec->epoch = epoch;
+            }
+        }
+        const int64_t t0 = rec ? now_ns() : 0;
+        const int cpu = rec ? platform::current_cpu() : -1;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
         if (mode_ == 7) {
@@ -309,6 +346,14 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 }
                 r += r1 - r0;
             }
+        }
+        if (rec) {
+            const int64_t t1 = now_ns();
+            const bool e = cpu >= 0 && (size_t) cpu < efficient_cpu_.size() && efficient_cpu_[(size_t) cpu];
+            (e ? rec->busy_e_ns : rec->busy_p_ns) += t1 - t0;
+            ++(e ? rec->tasks_e : rec->tasks_p);
+            rec->last_ns = t1;
+            rec->last_e = e;
         }
         done_.fetch_add(1, std::memory_order_release);
     }
@@ -402,11 +447,83 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
     idle_stop();
     mode_ = mode;
     njobs_ = n_tasks;
-    const uint32_t e = begin_batch(n_tasks);
+    const bool timed = timing_.load(std::memory_order_relaxed);
+    if (timed && pending_) timed_slot_ = pending_slot_ ^ 1;   // the pending batch's records stay put
+    const int64_t t0 = timed ? now_ns() : 0;
+    const uint32_t e = begin_batch(n_tasks, timed);
+    if (timed) {   // the previous timed batch, while the workers start on this one
+        fold_timing();
+        pending_ = true;
+        pending_epoch_ = e;
+        pending_slot_ = timed_slot_;
+        pending_t0_ = t0;
+    }
     drain(-1, host_scratch_, e);
+    const int64_t th = timed ? now_ns() : 0;
     wait_done(n_tasks);
+    if (timed) timing_sum_.host_wait_ms += (double) (now_ns() - th) * 1e-6;
     hstate_.store(kIdle, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+}
+
+void ExpertPool::set_timing(bool on) {
+    if (on && !trec_) {
+        trec_.reset(new TaskRecord[2 * (size_t) (n_ + 1)]);
+        park_.reset(new ParkRecord[(size_t) n_]);
+        for (int cpu : topo_.efficient) {
+            if (cpu < 0) continue;
+            if ((size_t) cpu >= efficient_cpu_.size()) efficient_cpu_.resize((size_t) cpu + 1, 0);
+            efficient_cpu_[(size_t) cpu] = 1;
+        }
+        fold_ends_.reserve((size_t) n_ + 1);
+    }
+    if (on) timing_since_ns_.store(now_ns(), std::memory_order_relaxed);
+    else fold_timing();
+    timing_.store(on, std::memory_order_release);   // the records are there before a worker reads the flag
+}
+
+void ExpertPool::fold_timing() {
+    if (!pending_) return;
+    pending_ = false;
+    Timing& t = timing_sum_;
+    fold_ends_.clear();
+    int64_t last = 0;
+    bool last_e = false;
+    for (int i = 0; i <= n_; ++i) {
+        const TaskRecord& r = trec_[(size_t) pending_slot_ * (size_t) (n_ + 1) + (size_t) i];
+        if (r.epoch != pending_epoch_ || r.tasks_p + r.tasks_e == 0) continue;
+        fold_ends_.push_back(r.last_ns);
+        if (r.last_ns > last) { last = r.last_ns; last_e = r.last_e; }
+        t.tasks_p += r.tasks_p;
+        t.tasks_e += r.tasks_e;
+        t.busy_p_ms += (double) r.busy_p_ns * 1e-6;
+        t.busy_e_ms += (double) r.busy_e_ns * 1e-6;
+        ++(r.last_e ? t.threads_e : t.threads_p);
+    }
+    if (fold_ends_.empty()) return;
+    ++t.batches;
+    t.span_ms += (double) (last - pending_t0_) * 1e-6;
+    const size_t mid = fold_ends_.size() / 2;
+    std::nth_element(fold_ends_.begin(), fold_ends_.begin() + (std::ptrdiff_t) mid, fold_ends_.end());
+    t.tail_med_ms += (double) (last - fold_ends_[mid]) * 1e-6;
+    t.tail_first_ms += (double) (last - *std::min_element(fold_ends_.begin(), fold_ends_.end())) * 1e-6;
+    t.last_e += last_e ? 1 : 0;
+}
+
+ExpertPool::Timing ExpertPool::take_timing() {
+    fold_timing();
+    Timing t = timing_sum_;
+    t.tasks = t.tasks_p + t.tasks_e;
+    timing_sum_ = Timing{};
+    timing_since_ns_.store(now_ns(), std::memory_order_relaxed);   // a park in progress counts from here
+    for (int i = 0; park_ && i < n_; ++i) {
+        ParkRecord& pr = park_[(size_t) i];
+        t.park_spin_ms += (double) pr.spin_ns.exchange(0, std::memory_order_relaxed) * 1e-6;
+        t.park_sleep_ms += (double) pr.sleep_ns.exchange(0, std::memory_order_relaxed) * 1e-6;
+        t.wakes += pr.wakes.exchange(0, std::memory_order_relaxed);
+        t.sleeps += pr.sleeps.exchange(0, std::memory_order_relaxed);
+    }
+    return t;
 }
 
 void ExpertPool::run_split(ExpertJob* jobs, int n) {
@@ -498,6 +615,7 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
         return;
     }
     idle_stop();
+    if (timing_.load(std::memory_order_relaxed)) ++timing_sum_.untimed;
     jobs_ = jobs;
     njobs_ = n;
     mode_ = 0;

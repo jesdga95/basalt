@@ -50,7 +50,12 @@ All CLI, all off.
 | `--profile` | serve | GPU stage times of the decode windows, per request. Turns programmatic dependent launch off, so not for A/B timing. |
 | `--wait-stats` | serve | The host's wait times in the decode loop, one report per 200 windows. |
 | `--decode-timing` | serve | One line per request: where its decode time went. |
+| `--pool-timing` | serve | One line per request: the CPU expert pool's critical path in decode (span, tail, P- and E-core task time, park time). |
 | `--draft-log` | serve | Path. One line per verify window (width, accepted, time), for studying the draft policy. |
+
+`--pool-timing` times the pool's row-split batches: one or two per layer and window, by expert format. The batches it
+runs unsplit (more experts than its split buffers) are counted as untimed. Each task counts on the core it started on;
+the workers are not pinned, so a task the OS moves counts on its first core. Park time counts from the decode's start.
 
 ## Speculation tests
 
