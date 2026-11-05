@@ -313,7 +313,7 @@ public:
     Flow decode_begin() { return Flow::proceed; }
     void seed_tiers() {}
     void decode_state_begin() { draws_ = 0; }
-    void decode_stats_begin() {}
+    void decode_stats_begin() { counts0_ = rt_.session().expert_counts(); }
     int max_window() const { return 1; }
     int before_window(int, int64_t) { return 0; }
     int32_t* history_stage() {
@@ -399,6 +399,15 @@ private:
         return Flow::proceed;
     }
     bool turn_checkpoint_at_last_token() const override { return true; }
+    DoneCounts done_counts() override {
+        const basalt::model::ModelSession::ExpertCounts c = rt_.session().expert_counts();
+        DoneCounts dc;
+        dc.hits = c.hits - counts0_.hits;
+        dc.lookups = c.lookups - counts0_.lookups;
+        dc.offloaded = c.offloaded - counts0_.offloaded;
+        return dc;
+    }
+    void report_request(const DoneCounts& dc) override { report_expert_counts(dc); }
 
     void progress_line(const char* tag, int64_t at_pos) {
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
@@ -411,6 +420,7 @@ private:
     std::vector<Block> blocks_;
     std::vector<int32_t> history_;
     uint64_t draws_ = 0;
+    basalt::model::ModelSession::ExpertCounts counts0_;
     std::string error_;
     size_t next_block_ = 0;
     double live_ms_ = -1e9;

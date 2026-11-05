@@ -40,6 +40,8 @@ the pack and picks the chat format, tool-call syntax and thinking switch to matc
 - **Second GPU:** `--gpu 0,1` makes the second card an expert tier: it computes its experts with the main card's kernels,
   so an expert gives the same bits on either card, while the CPU pool computes the misses; the rows come back through
   mapped host memory. Without it the first card runs alone and a warning names the other. One second card is used.
+- **Counters:** the `done` line and the stats page show the same `hit=` and `pcie=` as any model: `hit` is the main card's
+  share of what it and the CPU served, `pcie` the share a bus copy or the second card served.
 - **Images:** `--vision dynamic` encodes inside the engine from the pack's `vision/mmproj` section, which exists when the
   pack was built with `--mmproj` ([model file](model-file.md#deepseek-v41-pack)). The sidecar modes do not apply. It holds no
   memory at rest: for the pictures of a request the encoder takes the memory of the extra copies, of all copies on one

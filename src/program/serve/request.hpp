@@ -132,6 +132,8 @@ protected:
     virtual void slot_init(BSlot&) {}
     virtual bool slot_leave() { return true; }
     virtual void report_request(const DoneCounts&) {}
+    /// The decode's expert cache line; the server's Experts panel shows the same counts from DONE.
+    void report_expert_counts(const DoneCounts& dc) const;
     // ---- reading the prompt, per part.  read_to: Flow::quit when a stop ended the read.
     virtual bool prompt_begin() { return true; }
     virtual Flow set_sampling() = 0;

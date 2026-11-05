@@ -145,6 +145,10 @@ public:
     virtual Result set_history(const int32_t* tokens, int64_t n) { (void) tokens; (void) n; return {}; }
     /// What `PROBE rates` measures this model's paths with (after prepare).
     virtual Result probe_env(program::ProbeEnv& env) { (void) env; return {Status::NotImplemented, "this model has no probe"}; }
+    /// The routed experts of decode so far: `lookups` the main card or the CPU served, `hits` the main card's share of
+    /// those, `offloaded` what a bus copy or another card served.
+    struct ExpertCounts { int64_t hits = 0, lookups = 0, offloaded = 0; };
+    virtual ExpertCounts expert_counts() const { return {}; }
     /// Facts for the engine's INFO lines once the session is prepared: `key=value` words.
     virtual std::string info_words() const { return {}; }
     /// An encoded picture: `n_rows` embedding rows of the model's width (the encoder's whole block). Rows with no

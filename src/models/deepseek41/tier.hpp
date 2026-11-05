@@ -111,6 +111,10 @@ public:
     int64_t slots() const { return (int64_t) n_layers_ * (per_layer_ + ext_per_layer_); }
 
     void report(const char* tag) const;
+    /// The routed experts so far: hits of the main card's slots, those plus the CPU's, a bus copy's or the second card's.
+    int64_t hits() const { return hits_; }
+    int64_t lookups() const { return hits_ + cpu_; }
+    int64_t offloaded() const { return fetched_ + peer_hits_; }
     /// What `PROBE rates` measures: this tier's pool, RAM blobs, formats and second card.
     void probe_env(program::ProbeEnv& env);
 

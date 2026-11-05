@@ -3,6 +3,20 @@
 
 namespace basalt::program::serve {
 
+// the VRAM share of the experts looked up while decoding; experts a bus copy or another GPU served are in neither
+// count, so that share is said beside it
+void Request::report_expert_counts(const DoneCounts& dc) const {
+    if (dc.lookups <= 0) return;
+    char off[160] = "";
+    if (dc.offloaded > 0)
+        std::snprintf(off, sizeof off, "; %lld more read by the GPU over PCIe or from another GPU (%.1f%% of "
+                      "all %lld routed)", (long long) dc.offloaded,
+                      100.0 * (double) dc.offloaded / (double) (dc.lookups + dc.offloaded),
+                      (long long) (dc.lookups + dc.offloaded));
+    basalt::log::info("basalt serve", "decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)%s",
+                      100.0 * (double) dc.hits / (double) dc.lookups, (long long) dc.hits, (long long) dc.lookups, off);
+}
+
 Flow Request::complete() {
     decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
     if (const Flow flow = complete_begin(); flow != Flow::proceed) return flow;
