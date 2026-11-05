@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <numeric>
+#include <random>
 
 using namespace dstest;
 using namespace basalt::models::deepseek41;
@@ -337,6 +338,63 @@ void test_indexer(Verdict& v) {
     }
 }
 
+// The many-block top-k against the one-block kernel, bit for bit: random scores, ties across the cut, rows that are not
+// valid, fewer rows than K, and a capacity above the visible rows.
+void test_top_rows(Verdict& v) {
+    std::mt19937 rng(77);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    int cases = 0;
+    for (int n : {1, 3, 255, 256, 257, 1000, 4096, 32768, 65536, 200000}) {
+        for (int K : {1, 16, kTopK, 2048}) {
+            for (int kind = 0; kind < 5; ++kind) {
+                std::vector<float> s((size_t) n);
+                for (int i = 0; i < n; ++i) {
+                    const float x = nd(rng);
+                    switch (kind) {
+                        case 0: s[(size_t) i] = x; break;
+                        case 1: s[(size_t) i] = std::floor(x * 8.f) / 8.f; break;                  // many ties
+                        case 2: s[(size_t) i] = (i % 16) ? -INFINITY : x; break;                   // sparse rows
+                        case 3: s[(size_t) i] = 0.f; break;                                        // all equal
+                        default: s[(size_t) i] = (x > 0.f ? 1e30f : 1.f) * std::fabs(x) * (i & 1 ? -1.f : 1.f); break;   // a wide range, both signs
+                    }
+                }
+                const int cap = n + 300;
+                std::vector<float> full((size_t) cap, -INFINITY);
+                std::copy(s.begin(), s.end(), full.begin());
+                Dev<float> ds(full);
+                Dev<int32_t> a((size_t) std::max(K, 2048)), b((size_t) std::max(K, 2048)), na(1), nb(1);
+                Dev<int32_t> pos(std::vector<int32_t>{n - 1});
+                Dev<char> ws(top_rows_workspace_bytes(cap));
+                top_rows(ds.p, cap, K, a.p, std::max(K, 2048), na.p, pos.p, 1, 0, nullptr, nullptr);
+                top_rows(ds.p, cap, K, b.p, std::max(K, 2048), nb.p, pos.p, 1, 0, ws.p, nullptr);
+                check(cudaDeviceSynchronize(), "top_rows");
+                const auto ga = a.down(), gb = b.down(), gna = na.down(), gnb = nb.down();
+                if (ga != gb || gna != gnb) std::printf("  top_rows differs: n=%d K=%d kind=%d (%d vs %d)\n", n, K, kind, gna[0], gnb[0]);
+                v.expect(ga == gb && gna == gnb, "top_rows many blocks = one block");
+                ++cases;
+            }
+        }
+    }
+    std::printf("top_rows: %d cases, ids bit for bit against the one-block kernel\n", cases);
+}
+
+void bench_top_rows() {
+    std::mt19937 rng(78);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (int n : {32768, 65536, 131072, 524288}) {
+        std::vector<float> s((size_t) n);
+        for (float& x : s) x = nd(rng);
+        Dev<float> ds(s);
+        Dev<int32_t> a(kTopK), na(1), pos(std::vector<int32_t>{n - 1});
+        Dev<char> ws(top_rows_workspace_bytes(n));
+        char name[64];
+        std::snprintf(name, sizeof name, "top_rows one block n=%d K=%d", n, kTopK);
+        bench_line(name, bench_us([&] { top_rows(ds.p, n, kTopK, a.p, kTopK, na.p, pos.p, 1, 0, nullptr, nullptr); }, 50), (double) n * 4);
+        std::snprintf(name, sizeof name, "top_rows many blocks n=%d K=%d", n, kTopK);
+        bench_line(name, bench_us([&] { top_rows(ds.p, n, kTopK, a.p, kTopK, na.p, pos.p, 1, 0, ws.p, nullptr); }, 50), (double) n * 4 * 5);
+    }
+}
+
 void bench() {
     const int n_comp = 16384;
     const auto freq = make_table(true);
@@ -383,7 +441,9 @@ int main(int argc, char** argv) {
     test_kv_window(v);
     test_compress(v);
     test_indexer(v);
+    test_top_rows(v);
     bench();
+    bench_top_rows();
     (void) argc; (void) argv;
     std::printf(v.failures ? "FAILED (%d)\n" : "PASS\n", v.failures);
     return v.failures ? 1 : 0;
