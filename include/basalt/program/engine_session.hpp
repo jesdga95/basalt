@@ -59,6 +59,8 @@ private:
 /// A flag this model does not take is a nonzero code. stderr goes to `log_path`.
 int engine_plan(const std::string& engine_bin, const std::vector<std::string>& args, const std::string& log_path,
                 std::string& answer);
+/// A string field of the plan's answer; empty without it.
+std::string plan_field(const std::string& plan_answer, const std::string& name);
 /// `dir`/<arch> when the model has its own fixtures there, else `dir`.
 std::string fixtures_for(const std::string& dir, const std::string& plan_answer);
 

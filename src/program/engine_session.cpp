@@ -230,14 +230,19 @@ int engine_plan(const std::string& engine_bin, const std::vector<std::string>& a
     return code;
 }
 
-std::string fixtures_for(const std::string& dir, const std::string& plan_answer) {
-    const std::string key = "\"arch\":\"";
+std::string plan_field(const std::string& plan_answer, const std::string& name) {
+    const std::string key = "\"" + name + "\":\"";
     const size_t at = plan_answer.find(key);
-    if (at == std::string::npos) return dir;
+    if (at == std::string::npos) return {};
     const size_t b = at + key.size(), e = plan_answer.find('"', b);
-    if (e == std::string::npos) return dir;
+    return e == std::string::npos ? std::string() : plan_answer.substr(b, e - b);
+}
+
+std::string fixtures_for(const std::string& dir, const std::string& plan_answer) {
+    const std::string arch = plan_field(plan_answer, "arch");
+    if (arch.empty()) return dir;
     std::error_code ec;
-    const std::filesystem::path own = std::filesystem::path(dir) / plan_answer.substr(b, e - b);
+    const std::filesystem::path own = std::filesystem::path(dir) / arch;
     return std::filesystem::is_directory(own, ec) ? own.string() : dir;
 }
 

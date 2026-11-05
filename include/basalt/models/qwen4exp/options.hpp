@@ -156,7 +156,6 @@ struct Options : CommonOptions {
     int cvec_single = -1;                  ///< --cvec-dir single:L (project mode): layer L's direction everywhere
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
-    std::string ppl_base, ppl_out;    ///< --ppl-base, --ppl-out
 };
 
 }  // namespace basalt::models::qwen4exp

@@ -68,6 +68,9 @@ struct CommonOptions {
     std::string gpu;
     bool gpu_plan = false;
     std::string arch;                  ///< the --model file's architecture
+    std::string ppl_base, ppl_out;     ///< --ppl-base, --ppl-out
+    std::string quality_flags;         ///< the flags the quality gate starts this model with, for --gpu-plan
+    int quality_window = 1;            ///< the widest window the gate scores on this model (0: as the request asks)
     /// Speculative decoding with a verify window of this many tokens (the last accepted token and spec-1 drafts);
     /// 0 = plain decode.  `spec_oracle` drafts from a token file (the expected continuation, for the exactness test).
     int spec = 0;

@@ -71,6 +71,8 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         }
         else if (a == "--gpu") o.gpu = next("--gpu");
         else if (a == "--gpu-plan") o.gpu_plan = true;
+        else if (a == "--ppl-base") o.ppl_base = next("--ppl-base");
+        else if (a == "--ppl-out") o.ppl_out = next("--ppl-out");
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
         else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch

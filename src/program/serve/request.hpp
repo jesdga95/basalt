@@ -115,6 +115,8 @@ protected:
     Flow parse();
     Flow prepare_prompt();
     virtual Flow prepare_image() = 0;
+    /// `ppl=K`: opens chunk K of the gate's base, with at most `most_rows` scored per window.
+    Flow begin_quality_gate(const std::string& base, const std::string& out, int most_rows);
     Flow read_prompt();
     virtual Flow decode() = 0;
     Flow complete();

@@ -3,6 +3,21 @@
 
 namespace basalt::program::serve {
 
+Flow Request::begin_quality_gate(const std::string& base, const std::string& out, int most_rows) {
+    ppl = nullptr;
+    if (req_ppl < 0) return Flow::proceed;
+    std::string pe2;
+    PplGate::configure(base, out);
+    ppl = &PplGate::get();
+    if (geni || !ppl->begin(req_ppl, ids.data(), n, runtime_.n_vocab, pe2)) {
+        std::printf("ERR %s\n", geni ? "ppl: text only" : pe2.c_str());
+        return Flow::next;
+    }
+    req_temperature = 0.0f;
+    req_ppl_t = std::clamp(req_ppl_t, 1, most_rows);
+    return Flow::proceed;
+}
+
 Flow Request::prepare_prompt() {
     if (const Flow flow = prepare_image(); flow != Flow::proceed) return flow;
     if (from_text && req_clip && runtime_.admit_slot < 0) {
