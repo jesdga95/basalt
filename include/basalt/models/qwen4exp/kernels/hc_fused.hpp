@@ -118,8 +118,6 @@ void hc_fused_init();
 bool hc_fused_supported();
 /// Enqueue the read on `stream` (a PdlScope applies).  Aborts on invalid arguments.
 void hc_fused_read(const HcFusedArgs& a, void* stream);
-/// Prefetch byte ranges into L2 with a one-CTA kernel (bulk prefetches; no data moves to the SMs).
-void hc_l2_prefetch(const void* const* ptrs, const size_t* bytes, int n, void* stream);
 /// The bench only: per-CTA phase times (globaltimer ns) into dbg[nb][16]: start, after the dependency wait, down/up
 /// input ready, down/up done, router input ready, router rows done, top-10 done (last CTA), exit; [15] = 1 for a CTA
 /// that ran a down item, 2 for an up item.  nullptr = off.

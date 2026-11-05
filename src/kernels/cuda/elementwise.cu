@@ -315,14 +315,6 @@ __global__ void doorbell_publish_value_kernel(const float* __restrict__ x, const
     }
 }
 
-void doorbell_publish_value(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k,
-                            float* x_out, int32_t* ids_out, float* weights_out, uint32_t* d_seq, uint32_t value,
-                            void* stream) {
-    if (k > 1024) { basalt::log::error("basalt", "doorbell_publish: k too large"); std::exit(1); }
-    doorbell_publish_value_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, ids, weights, (int) n, (int) k, x_out,
-                                                                          ids_out, weights_out, d_seq, value);
-}
-
 void doorbell_publish(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k, float* x_out,
                       int32_t* ids_out, float* weights_out, uint32_t* d_seq, void* stream) {
     if (k > 1024) { basalt::log::error("basalt", "doorbell_publish: k too large"); std::exit(1); }

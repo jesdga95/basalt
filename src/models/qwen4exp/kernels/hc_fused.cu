@@ -1141,19 +1141,6 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
     }
 }
 
-__global__ void hc_l2_prefetch_kernel(const void* p0, size_t n0, const void* p1, size_t n1, const void* p2, size_t n2,
-                                      const void* p3, size_t n3) {
-    if (threadIdx.x != 0) return;
-    const void* p[4] = {p0, p1, p2, p3};
-    const size_t n[4] = {n0, n1, n2, n3};
-#pragma unroll
-    for (int r = 0; r < 4; ++r) {
-        if (p[r] == nullptr || n[r] < 16) continue;
-        const size_t n16 = n[r] / 16, lo16 = (size_t) blockIdx.x * n16 / gridDim.x, hi16 = (size_t) (blockIdx.x + 1) * n16 / gridDim.x;
-        if (hi16 > lo16) prefetch_l2((const char*) p[r] + lo16 * 16, (hi16 - lo16) * 16);
-    }
-}
-
 #ifndef FZ_DEV_ONLY   // host side: another translation unit (the mid chain) takes only the device code
 using KernelFn = void (*)(HcLaunch);
 constexpr KernelFn kKernels[2][MAXT] = {
@@ -1565,13 +1552,6 @@ void hc_test_hold_sms(int k, int* go, int* started, void* stream) {
     constexpr int bytes = 64 * 1024;
     cudaFuncSetAttribute(hold_sms_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
     hold_sms_kernel<<<k, 32, bytes, (cudaStream_t) stream>>>(go, started);
-}
-
-void hc_l2_prefetch(const void* const* ptrs, const size_t* bytes, int n, void* stream) {
-    const void* p[4] = {nullptr, nullptr, nullptr, nullptr};
-    size_t b[4] = {0, 0, 0, 0};
-    for (int i = 0; i < n && i < 4; ++i) { p[i] = ptrs[i]; b[i] = bytes[i]; }
-    hc_l2_prefetch_kernel<<<8, 32, 0, (cudaStream_t) stream>>>(p[0], b[0], p[1], b[1], p[2], b[2], p[3], b[3]);
 }
 
 #endif
