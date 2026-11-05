@@ -59,6 +59,9 @@ All CLI, all off.
 | `--spec-oracle` | CLI | path | With `--spec N` on a pack without a drafter: draft from a token file (the expected continuation), the exactness test of the verify path. Prompt lookup windows still take precedence. |
 | `--prefill-until` | CLI | tokens, 0 | Batch only the first P prompt positions and run the rest through the token path, teacher-forced, so later positions can be scored against an oracle. `0`: the whole prompt but the last position. |
 | `--spec-corrupt` | CLI | integer, 0 | Replace every Nth draft with a wrong token, to test rejection. |
+| `--diag-teacher` | CLI | | DeepSeek V4.1, with `--spec-oracle`: the file's tokens go on whatever the picks, so every row of a window runs on the expected text, and the picks that differ are counted. |
+| `--diag-tier-frozen` | CLI, serve | | DeepSeek V4.1: the VRAM tier keeps what it holds, no bus copy and no promotion, so a row's placement does not depend on the windows before it. The exactness test of the verify windows. |
+| `--diag-drafter-gpu` | CLI, serve | device | DeepSeek V4.1: the card the pack's drafter runs on, for an A/B. Default the main card. |
 
 ## Scheduling tests
 

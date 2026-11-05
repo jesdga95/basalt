@@ -54,3 +54,52 @@ the pack and picks the chat format, tool-call syntax and thinking switch to matc
   pack was built with `--mmproj` ([model file](model-file.md#deepseek-v41-pack)). The sidecar modes do not apply. It holds no
   memory at rest: for the pictures of a request the encoder takes the memory of the extra copies, of all copies on one
   card when that is short, and gives it back before the prompt reads.
+
+## Drafting
+
+Off by default. A pack built with `--dspark` carries DeepSeek's DSpark drafter in its `dspark/gguf` section
+([model file](model-file.md#deepseek-v41-pack)), and `--spec N` (`"spec"` in the config's `engine` section) runs it. A window
+holds the last accepted token and up to N-1 drafts, as on any model; a block proposes 5 tokens, so at most 6. Without `--spec`,
+or with `--spec 0` or `1`, the section stays unread. `--spec` on a pack without the section decodes plain with a warning, and so
+do `--parallel` slots, which draft nothing. One engine line says what started: `basalt deepseek41: drafter on GPU 0: 7.47 GiB,
+windows of at most 6 tokens`.
+
+The drafts stay in a window while the drafter's own chance that all of them are accepted holds against a threshold adapted per
+request. The model verifies every row and a rejected row leaves no trace, so the output is plain decode's within the
+rounding of where experts sit ([precision](precision/deepseek41.md#verify-windows)).
+
+It runs on the main card and borrows the model's token embedding and output matrix. Its memory is taken before the tiers size
+themselves and stays through `SLEEP` and `POST /v1/vram`. What moves first is the second card's or the main card's homes; when
+RAM cannot take them, the last experts of the routing order stay in the file.
+
+### What it costs
+
+Measured with a 400 W RTX 5090 and a 180 W RTX 5060 Ti, 121 GiB of RAM, `--pool-workers 8`, the Q8_0 drafter on the main card.
+It takes 7.47 GiB there, and the start line goes from `main card 34, second card 46, RAM 304, file 0` to `main card 10, second
+card 46, RAM 303, file 25`. A block takes 2.24 ms (8.63 ms with `--diag-drafter-gpu 1`).
+
+A long conversation, 125-141K tokens of context, thinking and tools on, temperature 1, 600 tokens per turn, `--spec 8`, the turns
+after the first, one cold server run each:
+
+| | tok/s | Tokens generated | Tokens per window | Prompt reads |
+| --- | --- | --- | --- | --- |
+| Plain | 64.06 | 4,239 | 1 | 30.2 s |
+| Drafter | 51.62 | 9,015 | 1.97 | 39.9 s |
+
+It loses here. With the drafter in memory a window took 17.9, 29.0, 38.3, 49.1, 63.0 and 81.9 ms at 1 to 6 rows, and the draft 2.5
+ms more, against 15.6 ms for a plain token, so a window of 3 rows has to keep 2.6 tokens to break even. The first draft of a window
+was accepted 65% of the time.
+
+Greedy, every window full, 800 tokens, short context:
+
+| `--spec` | Prose tok/s | Tokens per window | Code tok/s | Tokens per window |
+| --- | --- | --- | --- | --- |
+| Plain | 72.9 | 1 | 75.1 | 1 |
+| 3 | 55.1 | 1.95 | 87.8 | 2.76 |
+| 5 | 46.3 | 2.18 | 88.4 | 4.28 |
+| 8 (6 rows) | 40.3 | 2.17 | 64.1 | 3.83 |
+
+**When it can pay off:** on text it predicts well, as the code above, and with memory to spare. Most of what a window costs beyond
+its rows is the memory. The same 378 windows of 5 rows replayed, 800 tokens: 28.6 ms each with no drafter in memory, 44.5 with it
+on the main card, 34.6 with it there and RAM raised by `--diag-tier-ram` so that no expert stays in the file. No machine with more
+VRAM has been measured.
