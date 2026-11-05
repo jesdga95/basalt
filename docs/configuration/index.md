@@ -5,6 +5,7 @@ the model file's sampling defaults. For what a setting does to speed, memory and
 [running](../running.md) and [precision](../precision/index.md).
 
 - [How settings are given](#how-settings-are-given)
+- [Models and the router](models.md)
 - [Server](#server)
 - [Model and GPUs](#model-and-gpus)
 - [Context and KV cache](#context-and-kv-cache)
@@ -42,12 +43,15 @@ There are two kinds of setting:
   startup on a flag name it does not know. It adds `--serve` itself, and `--vision` (with `--vision-mmproj` for
   `vision dynamic`) when `vision` is on.
 
-A config file is one JSON object with two optional blocks:
+A config file is one JSON object. `models` names each model; `engine` applies to every model that takes it; `server` is what the
+whole server shares ([models and the router](models.md)):
 
 ```json
 {
-  "server": { "model": "model.basalt", "port": 8080 },
-  "engine": { "kv": "int8", "resident-experts": true, "control-vector-layer-range": [4, 44] }
+  "version": 2,
+  "models": [{ "model": "model.basalt", "kv": "int8", "control-vector-layer-range": [4, 44] }],
+  "engine": { "resident-experts": true },
+  "server": { "port": 8080 }
 }
 ```
 
@@ -56,7 +60,7 @@ A config file is one JSON object with two optional blocks:
 - `model` and `tokenizer` paths are relative to the config file.
 - **Precedence:** command line > config file > built-in defaults. The engine receives the config file's flags, then
   the command line's, and a flag given twice takes its last value.
-- An engine flag in `server`, or a server option in `engine`, stops the server at startup, as does an unknown name.
+- A setting in the wrong block stops the server at startup, as does an unknown name.
 - `api-key` cannot be set in a config file; a file that sets it is refused.
 - The built-in defaults pick the fastest settings that need no knowledge of the machine (speculation 8 with a drafter,
   expert cache auto, prefill auto, resident experts when the RAM holds them, adaptive rounds every window on a server), and keep

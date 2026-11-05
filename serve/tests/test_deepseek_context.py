@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from serve.config import build_parser, parse_settings
+from serve.config import build_parser, model_settings
 from serve.engine.mock import MockEngine
 from serve.engine.process import ProcessEngine
 from serve.frontend import ChatTemplate
@@ -40,9 +40,9 @@ def settings(cli, cfg=None):
         argv = list(cli)
         if cfg is not None:
             p = Path(d) / "c.json"
-            p.write_text(json.dumps(cfg), encoding="utf-8")
+            p.write_text(json.dumps({**cfg, "models": [{"model": "m"}]}), encoding="utf-8")
             argv = ["--config", str(p)] + argv
-        return parse_settings(build_parser(), argv)
+        return model_settings(build_parser(), argv)[0]
 
 
 class FlagPlumbing(unittest.TestCase):

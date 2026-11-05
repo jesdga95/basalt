@@ -10,6 +10,8 @@ A model lives in `src/models/<arch>/` and `include/basalt/models/<arch>/`. Share
 - A `ModelSession`: `decode_window`, `prefill_chunk`, and the state calls it supports.
 - A dialect in `serve/models/`: prompt rendering, output parsing, stop texts.
 
+A config's `models` gets one entry and the router needs nothing more: nothing in the server names a model.
+
 The shared server then runs it: the request keys, sampling through `sample_tokens`, grammar, the checkpoint chain, batch
 slots taking each slot in turn, `VRAM`, `SLEEP`, `WAKE`, `INFO`, `PT` and `GENT`.
 
@@ -20,7 +22,8 @@ Fixtures hold token ids, so each model has its own in `data/bench/<arch>`; bench
 ## Flags
 
 The common flags are in `src/program/cli/arguments.cpp`. A model adds its own through `parse_flag`; any other flag is the
-normal `unknown argument` error for that model. No flag's default differs by model. Token id flags default to the pack's
+normal `unknown argument` error for that model. A router config's checks ask `--gpu-plan` with the flags at start, so whatever a
+model can refuse without loading goes in `parse_flag` and `finish_flags`, a context past its maximum too. No flag's default differs by model. Token id flags default to the pack's
 own tokens, which the adapter names.
 
 ## Loading

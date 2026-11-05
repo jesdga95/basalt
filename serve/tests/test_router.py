@@ -586,5 +586,94 @@ class OneModel(unittest.TestCase):
         self.assertFalse(router.multi)
 
 
+class Startup(unittest.TestCase):
+    """main() over a config of two models: what each entry's checks do, with no engine and no weights."""
+
+    def run_main(self, cfg, plan=None, refused=None, argv=()):
+        import io
+        import sys
+        import tempfile
+        from serve import server
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            eng = Path(d) / "eng"
+            eng.write_bytes(b"\0--kv\0--max-context\0--spec\0--pool-workers\0")
+            conf = Path(d) / "c.json"
+            conf.write_text(json.dumps(cfg))
+            args = ["server", "--config", str(conf), "--engine-bin", str(eng), *argv]
+            with mock.patch.object(sys, "argv", args), mock.patch.object(sys, "stderr", err), mock.patch.object(sys, "stdout", sys.stdout), \
+                    mock.patch("serve.engine.modelfile.model_config", return_value={"args": [], "engine_bin": str(eng), "log": None, "tokenizer": "/x", "model_name": "m"}), \
+                    mock.patch.object(server, "model_plan", side_effect=plan or (lambda *a: {"devices": "0", "cards": [{"smi": 0}]})) as p, \
+                    mock.patch.object(server, "flag_refused", side_effect=refused or (lambda *a: False)), \
+                    mock.patch.object(server, "Server", side_effect=RuntimeError("past the checks")):
+                try:
+                    server.main()
+                    code = None
+                except SystemExit as e:
+                    code = e.code
+                except RuntimeError as e:
+                    code = str(e)
+        return code, err.getvalue(), p.call_args_list
+
+    def test_every_entry_is_checked_with_its_own_words(self):
+        code, _, calls = self.run_main({"engine": {"pool-workers": 8},
+                                        "models": [{"model": "a.basalt", "gpu": "auto", "kv": "int8", "max-context": 262144},
+                                                   {"model": "b.basalt", "gpu": "auto", "kv": "int8", "max-context": 1048576}]})
+        self.assertEqual(code, "past the checks")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].args[2], "auto")
+        self.assertEqual(calls[0].args[3], ["--pool-workers", "8", "--kv", "int8", "--max-context", "262144"])
+        self.assertEqual(calls[1].args[3], ["--pool-workers", "8", "--kv", "int8", "--max-context", "1048576"])
+
+    def test_a_flag_an_entry_refuses_stops_the_start(self):
+        def plan(engine_bin, path, gpu, words):
+            if path.endswith("b.basalt"):
+                raise ValueError("unknown argument: --spec")
+            return {"devices": "0", "cards": []}
+        code, err, _ = self.run_main({"models": [{"model": "a.basalt", "spec": 7}, {"model": "b.basalt", "spec": 7}]}, plan)
+        self.assertEqual(code, 2)
+        self.assertIn("b.basalt: unknown argument: --spec", err)
+
+    def test_a_context_past_the_maximum_stops_the_start(self):
+        def plan(engine_bin, path, gpu, words):
+            raise ValueError("--max-context 2097152 is past the model's maximum context of 1048576 tokens")
+        code, err, _ = self.run_main({"models": [{"model": "b.basalt", "max-context": 2097152}]}, plan)
+        self.assertEqual(code, 2)
+        self.assertIn("past the model's maximum", err)
+
+    def test_a_top_level_flag_a_model_refuses_is_left_out(self):
+        code, _, calls = self.run_main({"engine": {"spec": 7},
+                                        "models": [{"model": "a.basalt"}, {"model": "b.basalt"}]},
+                                       refused=lambda bin_, path, group: path.endswith("b.basalt") and group[0] == "--spec")
+        self.assertEqual(code, "past the checks")
+        self.assertEqual(calls[0].args[3], ["--spec", "7"])
+        self.assertEqual(calls[1].args[3], [])
+
+    def test_a_flag_no_model_has_stops_the_start(self):
+        code, err, _ = self.run_main({"engine": {"spc": 7}, "models": [{"model": "a.basalt"}]})
+        self.assertEqual(code, 2)
+        self.assertIn("--spc is not an engine flag", err)
+
+
+class Names(unittest.TestCase):
+    def service(self, tok, name, args=()):
+        engine = MockEngine(tok, "x")
+        engine.spawn = (None, list(args))
+        return Service(engine, tok, ChatTemplate(TEMPLATE), model_name=name)
+
+    def test_two_entries_cannot_share_a_name_or_a_conversation_folder(self):
+        import io
+        from serve import server
+        tok = ByteTokenizer()
+        with mock.patch("sys.stderr", io.StringIO()) as err, self.assertRaises(SystemExit):
+            server.check_models([self.service(tok, "A"), self.service(tok, "A")])
+        self.assertIn("names two models", err.getvalue())
+        shared = ["--conversation-cache-disk-mib", "100", "--conversation-cache-dir", "/x"]
+        with mock.patch("sys.stderr", io.StringIO()) as err, self.assertRaises(SystemExit):
+            server.check_models([self.service(tok, "A", shared), self.service(tok, "B", shared)])
+        self.assertIn("share the conversation folder", err.getvalue())
+        server.check_models([self.service(tok, "A", shared), self.service(tok, "B")])
+
+
 if __name__ == "__main__":
     unittest.main()
