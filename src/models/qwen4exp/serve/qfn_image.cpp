@@ -8,18 +8,7 @@ bool QfnRequest::parse_begin() { return !runtime_.mtp_on || runtime_.mtp.use_mai
 float QfnRequest::default_relax() const { return runtime_.o.relaxed_drafting; }
 
 Flow QfnRequest::prepare_image() {
-    ppl = nullptr;
-    if (req_ppl >= 0) {
-        std::string pe2;
-        basalt::program::PplGate::configure(runtime_.ppl_base, runtime_.ppl_out);
-        ppl = &basalt::program::PplGate::get();
-        if (geni || !ppl->begin(req_ppl, ids.data(), n, runtime_.n_vocab, pe2)) {
-            std::printf("ERR %s\n", geni ? "ppl: text only" : pe2.c_str());
-            return Flow::next;
-        }
-        req_temperature = 0.0f;
-        req_ppl_t = std::clamp(req_ppl_t, 1, runtime_.S);
-    }
+    if (const Flow flow = begin_quality_gate(runtime_.ppl_base, runtime_.ppl_out, runtime_.S); flow != Flow::proceed) return flow;
     if (geni || !runtime_.mrope_identity) {
         // positions for every cell this request can reach; the identity again for a text request
         std::string ve;

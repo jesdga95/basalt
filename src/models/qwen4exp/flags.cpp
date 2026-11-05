@@ -168,8 +168,6 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
             basalt::core::diagnostics().exp[kv.substr(0, eq)] = std::atof(kv.c_str() + eq + 1);
         }
     }
-    else if (a == "--ppl-base") o.ppl_base = args.next("--ppl-base");
-    else if (a == "--ppl-out") o.ppl_out = args.next("--ppl-out");
     else return false;
     return true;
 }

@@ -222,6 +222,10 @@ public:
         (void) o; (void) cards;
         return std::nullopt;
     }
+    /// The flags the quality gate starts this model with, space separated.
+    virtual const char* quality_flags() const { return ""; }
+    /// The widest window the gate scores on this model; 0 takes what the request asks.
+    virtual int quality_window() const { return 1; }
     /// The cards that may hold experts beside the main one.
     virtual int max_expert_cards() const = 0;
     virtual TokenNames token_names() const = 0;

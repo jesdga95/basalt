@@ -90,7 +90,11 @@ std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& 
     if (const auto code = find_model(argc, argv, adapter)) return *code;
     out = adapter != nullptr ? adapter->make_options() : std::make_unique<CommonOptions>();
     CommonOptions& o = *out;
-    if (adapter != nullptr) o.arch = adapter->arch();
+    if (adapter != nullptr) {
+        o.arch = adapter->arch();
+        o.quality_flags = adapter->quality_flags();
+        o.quality_window = adapter->quality_window();
+    }
     if (const auto code = parse_options(argc, argv, o, adapter)) return *code;
     if (adapter != nullptr) {
         pack_tokens(*adapter, o);
