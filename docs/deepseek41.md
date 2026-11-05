@@ -69,7 +69,8 @@ request. The model verifies every row and a rejected row leaves no trace, so the
 rounding of where experts sit ([precision](precision/deepseek41.md#verify-windows)).
 
 It runs on the main card and borrows the model's token embedding and output matrix. Its memory is taken before the tiers size
-themselves and stays through `SLEEP` and `POST /v1/vram`. What moves first is the second card's or the main card's homes; when
+themselves and stays through `POST /v1/vram`; an idle sleep frees it with the rest of the model's VRAM and the wake restores it.
+What moves first is the second card's or the main card's homes; when
 RAM cannot take them, the last experts of the routing order stay in the file.
 
 ### What it costs
@@ -90,7 +91,7 @@ It loses here. With the drafter in memory a window took 17.9, 29.0, 38.3, 49.1, 
 ms more, against 15.6 ms for a plain token, so a window of 3 rows has to keep 2.6 tokens to break even. The first draft of a window
 was accepted 65% of the time.
 
-Greedy, every window full, 800 tokens, short context:
+Greedy, every window full, 800 tokens, short context, one cold run each:
 
 | `--spec` | Prose tok/s | Tokens per window | Code tok/s | Tokens per window |
 | --- | --- | --- | --- | --- |
