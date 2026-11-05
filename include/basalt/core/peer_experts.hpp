@@ -67,6 +67,12 @@ public:
     /// One token's share over the pinned activation `x`, in the layout given; the rows land in open_plain's rows.
     bool launch_plain(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t k,
                       const int32_t* kind, std::string& err);
+    /// `n` rows, each with its own activation in `x` (pinned, portable): entry i computes expert ids[i] over x[i] and its row
+    /// lands at out[i], `out` as this card addresses mapped host memory (`map_rows`). At most kRowBatch entries; `finish` waits.
+    static constexpr int64_t kRowBatch = 80;
+    bool launch_rows(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n, float* out,
+                     std::string& err);
+    float* map_rows(float* host, std::string& err);
     /// A slot's bytes for an expert of `layer`.
     static uint64_t slot_bytes(int64_t layer);
     void close();

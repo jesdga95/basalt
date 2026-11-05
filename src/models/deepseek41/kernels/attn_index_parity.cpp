@@ -419,6 +419,15 @@ void bench() {
         std::snprintf(name, sizeof name, "indexer Full T=%d n=%d", T, n_comp);
         bench_line(name, bench_us([&] { indexer_select(a, qr.p, x.p, pos.p + (4 - T), T, ws.p, nullptr); }, 100), (double) kIdxHeads * kIdxDim * 1280 * 2 + ikb);
     }
+    {
+        // buffers for a long context, few rows visible: what the idle blocks of the capped grid cost
+        Dev<char> big(indexer_workspace_bytes(524288));
+        IndexerArgs a;
+        a.mode = IndexMode::Full; a.ratio = 1; a.n_comp = 524288; a.w_q = wq.p; a.w_proj = wp.p; a.rope_freq = dfreq.p;
+        a.comp_ik = dik.p; a.cand_ids = cand.p; a.cand_n = cn.p; a.out_ids = ids.p; a.out_n = nn.p;
+        bench_line("indexer Full T=1 n=16384, buffers for 524288", bench_us([&] { indexer_select(a, qr.p, x.p, pos.p + 3, 1, big.p, nullptr); }, 100),
+                   (double) kIdxHeads * kIdxDim * 1280 * 2 + (double) n_comp * kIdxDim * 2);
+    }
     Dev<uint16_t> wkv(rand_bf16((size_t) kLatent * D, 46, 0.02f)), wg(rand_bf16((size_t) kLatent * D, 47, 0.02f)), wik(rand_bf16((size_t) kIdxDim * kLatent, 48, 0.05f));
     Dev<float> nw(randn(kLatent, 49, 1.f, 1.f)), nk(randn(kIdxDim, 50, 1.f, 1.f));
     CompState st(2, 64);

@@ -105,6 +105,8 @@ public:
     };
     Source locate(int layer, int e) const;
     core::PeerExperts* peer() const { return peer_.get(); }
+    kernels::cpu::ExpertPool* pool() const { return pool_.get(); }
+    const kernels::cpu::NativeFmt& fmt(int layer) const { return fmt_[(size_t) layer]; }
     /// The main card holds homes: they stay through a prompt, and a short prompt keeps the copies beside them.
     bool has_homes() const { return homes_.main > 0; }
 
