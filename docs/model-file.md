@@ -12,8 +12,8 @@ The layout diagram is in the [README](../README.md#models).
 - **Sections:** `meta` (JSON: the source GGUF metadata with its `general.sampling.*` defaults, every tensor's type,
   shape and offset, provenance and license), `tokenizer/*`, `dense` and `dense.index`, `experts` and `experts.layout` (the routed
   experts, laid out per layer), `gguf` (every non-expert source tensor), `mtp/*` (the drafter), `hc8` (the int8 copies
-  of the hyper-connection matrices the decode reads, computed by the converter so a start reads them as they are) and
-  `vision/*`. The authoritative description is [include/basalt/core/model_format.hpp](../include/basalt/core/model_format.hpp).
+  of the hyper-connection matrices the decode reads, computed by the converter so a start reads them as they are),
+  `dspark/gguf` (a DeepSeek pack's drafter) and `vision/*`. The authoritative description is [include/basalt/core/model_format.hpp](../include/basalt/core/model_format.hpp).
 - **Versions:** the engine reads version 2 and refuses any other. A version 1 file becomes a version 2 file with
   [tools/migrations/basalt_v1_to_v2.py](../tools/migrations/README.md), without a download. What changed:
   [the file format changelog](basalt-file-changelog.md).
@@ -43,6 +43,10 @@ the pack has no MTP drafter, expert profile or `hc8` section:
   aligned, so a row can be read with `O_DIRECT`.
 - `vision/mmproj` holds the vision projector GGUF as published; it is present only when the pack is built with
   `--mmproj`, and `basalt serve PACK --vision dynamic` reads it from there. Without it the pack is text-only.
+- `dspark/gguf` holds DeepSeek's DSpark drafter GGUF as published; it is present only when the pack is built with `--dspark`
+  (`dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf` in `unsloth/DeepSeek-V4.1-Flash-1017-GGUF`, 8 GB; its BF16 file is refused, no
+  decode kernel reads those dense tensors), and `--spec N` reads it ([drafting](deepseek41.md#drafting)). Without it the pack
+  decodes plain. `meta.dspark` records the section and its size.
 - `meta.arch` is `deepseek41`. `meta.geometry` copies the architecture's GGUF keys without the `deepseek41.` prefix
   (layers, attention and indexer sizes, RoPE, expert counts and gating, SwiGLU clamps, hyper-connection counts, norm
   epsilon). `meta.engram` records the section, tensor, type, row count, row size and the hash constants
@@ -51,6 +55,16 @@ the pack has no MTP drafter, expert profile or `hc8` section:
 
 `--dry-run` prints every section's offset and size without writing. The converter checks the Engram table's type and
 shape against the metadata and refuses a mismatch.
+
+A pack that exists takes the drafter without a second copy of its weights:
+
+```sh
+python3 tools/convert/convert.py --dspark DRAFTER.gguf --into PACK.basalt --undo-dir DIR
+```
+
+The section and a new `meta` go past the file's end and one write replaces the header and table: no other section moves or
+changes, and the old `meta` becomes zeros between sections. `DIR`, which must not exist, keeps the old header and `meta`;
+`--roll-back --into PACK.basalt --undo-dir DIR` puts them back and cuts the file to its old size.
 
 ## Packs
 
