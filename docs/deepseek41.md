@@ -39,6 +39,7 @@ the pack and picks the chat format, tool-call syntax and thinking switch to matc
   generated) and a checkpoint before the last prompt token. A request whose prompt starts with all the held tokens, or
   with the checkpoint's (a next turn after a thinking reply: the template drops the thinking from the history), reads
   only the new tail; any other request reads its whole prompt again. `pp=N/Mc` in the done line shows how many were kept.
+  A cancel stops a long read at the end of its chunk.
 - **Second GPU:** `--gpu 0,1` makes the second card an expert tier: it computes its experts with the main card's kernels,
   so an expert gives the same bits on either card, while the CPU pool computes the misses; the rows come back through
   mapped host memory. Without it the first card runs alone and a warning names the other. One second card is used.

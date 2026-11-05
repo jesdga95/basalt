@@ -149,6 +149,7 @@ public:
                 }
                 prefill_->progress = r.progress;
                 prefill_->live = r.live;
+                prefill_->stop = r.stop;
                 if (!prefill_->run(r.tokens, batched, r.pos, hist_, err)) return prompt_failed(err);
                 if (!r.more) close_prompt_path();
             }

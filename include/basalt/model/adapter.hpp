@@ -106,6 +106,7 @@ struct PrefillRequest {
     int64_t pos = 0;
     std::function<void(int)> progress;   ///< optional: called with the tokens of this request read so far
     std::function<void(int)> live;       ///< optional: an estimate of the same, from a driver thread, inside a chunk
+    std::function<bool()> stop;          ///< optional: true ends the read at a chunk's end; nothing can continue from there
     int total_tokens = 0;                ///< what the whole prompt still has to read, this part included: sizes the workspaces
     bool more = false;                   ///< another part follows: the workspaces stay until end_prompt()
 };
