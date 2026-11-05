@@ -522,31 +522,6 @@ __global__ void hit_select_kernel(const int32_t* __restrict__ ids, const int32_t
     if (lane == 0) *count = __popc(hit);
 }
 
-// Plan v0.3 P6: the same for up to 128 routed entries (a verify window of T tokens x k): four warps, ballots
-// compacted in entry order.
-__global__ void hit_select_multi_kernel(const int32_t* __restrict__ ids, const int32_t* __restrict__ res_row, int n,
-                                        int n_expert, int32_t* __restrict__ slot, int32_t* __restrict__ dst,
-                                        int32_t* __restrict__ count) {
-    __shared__ int warp_count[4];
-    const int i = threadIdx.x, lane = i & 31, warp = i >> 5;
-    int s = -1;
-    if (i < n) {
-        const int e = ids[i];
-        if (e >= 0 && e < n_expert) s = res_row[e];
-    }
-    const unsigned hit = __ballot_sync(0xffffffffu, s >= 0);
-    if (lane == 0) warp_count[warp] = __popc(hit);
-    __syncthreads();
-    int before = 0;
-    for (int w = 0; w < warp; ++w) before += warp_count[w];
-    if (s >= 0) {
-        const int at = before + __popc(hit & ((1u << lane) - 1u));
-        slot[at] = s;
-        dst[at] = i;
-    }
-    if (i == 0) *count = warp_count[0] + warp_count[1] + warp_count[2] + warp_count[3];
-}
-
 __global__ void add_hits_kernel(float* __restrict__ parts, const float* __restrict__ hit_out,
                                 const int32_t* __restrict__ dst, const int32_t* __restrict__ count, int n_embd) {
     const int h = blockIdx.y;
@@ -591,43 +566,6 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
         launch_hit_down(fast, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
                         x_scales != nullptr ? h_scales : nullptr, out, cap, d_count, cs);
         check("moe_hit_grouped_s2_dev/down", stream);
-    }
-}
-
-void moe_hit_select_multi(const int32_t* ids, const int32_t* res_row, int n, int n_expert, int32_t* slot, int32_t* dst,
-                          int32_t* count, void* stream) {
-    if (n < 1 || n > 128) { basalt::log::error("basalt", "moe_hit_select_multi: n must be 1..128"); std::exit(1); }
-    hit_select_multi_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ids, res_row, n, n_expert, slot, dst, count);
-    check("moe_hit_select_multi", stream);
-}
-
-void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,
-                              const int32_t* d_count, int64_t cap, int64_t blob_bytes, const uint8_t* x_q8_0,
-                              const float* x_scales, int k_per_token, void* scratch, float* out, void* stream) {
-    if (cap <= 0) return;
-    cudaStream_t cs = (cudaStream_t) stream;
-    const bool fast = new_hit(blob_base, blob_bytes, x_q8_0, scratch, cap);
-    const uint64_t gu_bytes = ((uint64_t) cap * (uint64_t) (2 * FF) * 4 + 15) & ~15ull;
-    const uint64_t q8_bytes = ((uint64_t) cap * (uint64_t) (FF / 32) * 34 + 15) & ~15ull;
-    float* gate_up = (float*) scratch;
-    uint8_t* h_q8_0 = (uint8_t*) scratch + gu_bytes;
-    float* h_scales = (float*) ((uint8_t*) scratch + gu_bytes + q8_bytes);
-    {
-        launch_hit_gu(fast, blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, cap, d_count, dst_index,
-                      k_per_token, cs);
-        check("moe_hit_grouped_s2_multi/gu", stream);
-    }
-    {
-        const long long pairs = cap * (long long) FF;
-        swiglu_kernel<<<(unsigned) ((pairs + THREADS - 1) / THREADS), THREADS, 0, cs>>>(gate_up, pairs);
-        check("moe_hit_grouped_s2_multi/swiglu", stream);
-    }
-    if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, cap * (int64_t) FF, stream);
-    else quantize_q8_0(gate_up, h_q8_0, cap * (int64_t) FF, stream);
-    {
-        launch_hit_down(fast, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
-                        x_scales != nullptr ? h_scales : nullptr, out, cap, d_count, cs);
-        check("moe_hit_grouped_s2_multi/down", stream);
     }
 }
 

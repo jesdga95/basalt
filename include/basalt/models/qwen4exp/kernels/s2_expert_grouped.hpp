@@ -103,11 +103,6 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
 void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t* base, int64_t blob,
                         unsigned long long* grp_ptr, int32_t* grp_start, int32_t* counts, int32_t* ent_dst,
                         int32_t* ent_tok, void* stream);
-void moe_hit_select_multi(const int32_t* ids, const int32_t* res_row, int n, int n_expert, int32_t* slot, int32_t* dst,
-                          int32_t* count, void* stream);
-void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,
-                              const int32_t* d_count, int64_t cap, int64_t blob_bytes, const uint8_t* x_q8_0,
-                              const float* x_scales, int k_per_token, void* scratch, float* out, void* stream);
 /// The per-hit kernels (`moe_hit_grouped_s2`, `_dev`, `_multi`) and the grouped ones (`moe_grouped_s2`)
 /// were rewritten with bitwise-identical outputs: conflict-free staged activations, `hx` once per chunk, wide loads,
 /// two rows per warp.  The previous kernels stay for A/B: `OLD_GROUPED=1` in the environment selects them,
