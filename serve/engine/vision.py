@@ -452,21 +452,14 @@ def gpu_card_name(index: int) -> str | None:
     return name.removeprefix("NVIDIA GeForce ").removeprefix("NVIDIA ") or None
 
 
-def vision_line(vision: dict | None, cfg: dict, ready_s: float = 0.0, name=gpu_card_name) -> str:
-    """The startup line about the encoder: off, or where it runs and its ready time."""
+def vision_item(vision: dict | None, cfg: dict) -> str | None:
+    """The startup item for image input: where the encoder runs; None when it is off."""
     if not vision:
-        return tagged("vision", "mode=off")
-    took = f"ready={ready_s:.1f}s"
-    mode = vision.get("mode") or "cpu"
-    listed = gpu_list(cfg)
-    main = listed[0] if listed else 0
-
-    def card(i):
-        n = name(i)
-        return f"gpu={i}{f' ({n})' if n else ''}"
-    gpu = vision_card(mode)
+        return None
+    gpu = vision_card(vision.get("mode") or "cpu")
     if gpu is not None:
-        return tagged("vision", f"mode=gpu {card(gpu)} {took}")
-    if mode == "dynamic":
-        return tagged("vision", f"mode=dynamic {card(main)} load=per-image")
-    return tagged("vision", f"mode=cpu threads={max(1, (os.cpu_count() or 2) // 2)} {took}")
+        return f"vision=gpu{gpu}"
+    if vision.get("mode") == "dynamic":
+        listed = gpu_list(cfg)
+        return f"vision=gpu{listed[0] if listed else 0}"
+    return "vision=cpu"

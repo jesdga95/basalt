@@ -328,13 +328,13 @@ class EngineStart(unittest.TestCase):
         out = io.StringIO()
         with redirect_stdout(out):
             self.engine_args(block, cli)
-        return next(x for x in out.getvalue().splitlines() if x.startswith("[server] engine "))
+        return next(x for x in out.getvalue().splitlines() if x.startswith("[server] m.basalt"))
 
     def test_startup_line(self):
-        self.assertEqual(self.line({}), "[server] engine   defaults")
-        self.assertEqual(self.line({"grammar": True}), "[server] engine   grammar=on (from config)")
-        self.assertEqual(self.line({"grammar": True}, ["--no-grammar"]), "[server] engine   grammar=off (from cli)")
-        self.assertEqual(self.line({}, ["--grammar"]), "[server] engine   grammar=on (from cli)")
+        self.assertEqual(self.line({}), "[server] m.basalt")
+        self.assertEqual(self.line({"grammar": True}), "[server] m.basalt  grammar=on")
+        self.assertEqual(self.line({"grammar": True}, ["--no-grammar"]), "[server] m.basalt  grammar=off")
+        self.assertEqual(self.line({}, ["--grammar"]), "[server] m.basalt  grammar=on")
 
     def test_command_line(self):
         self.assertEqual(self.engine_args({}, ["--grammar"]), ["--serve", "--gpu", "0", "--grammar", "on"])
