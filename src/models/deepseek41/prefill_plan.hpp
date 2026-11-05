@@ -21,9 +21,9 @@ constexpr int64_t kStageRows = 16384;              // (token, slot) rows one exp
 constexpr int kStageExperts = 32;                  // experts staged per launch, two launches in flight
 constexpr int kAheadSlots = 6;                     // staged groups of experts in flight in a long chunk
 constexpr int kShareRows = 2048;                   // rows a layer of a short read may compute on the CPU and the second card
-constexpr int kStepPrompt = 32;                    // a prompt this short reads one decode step at a time, faster than a chunk's bus copies
-constexpr int kShortPrompt = 1024;                 // a prompt this short takes no staged groups and reads beside a tier's copies
-constexpr int kShortChunk = kShortPrompt;          // ... in a chunk of this many tokens
+constexpr int kStepPrompt = 12;                    // a prompt this short reads one decode step at a time, faster than a chunk's bus copies
+constexpr int kShortPrompt = 2048;                 // a prompt this short takes no staged groups and reads beside a tier's copies
+constexpr int kShortChunk = 1024;                  // ... in chunks of this many tokens
 constexpr int64_t kAheadPairs = 6150;              // (token, slot) pairs from which a chunk stages its groups ahead: past a short chunk
 
 /// The model sizes the prompt workspaces depend on.
