@@ -53,20 +53,27 @@ int main() {
 
     // homes: one card keeps its copies and the file the rest; two cards leave nothing in the file when the rest fits
     {
-        Homes h = plan_homes(384, 34, 0, 305, 320);
+        Homes h = plan_homes(384, 34, 0, 305);
         CHECK(h.main == 0 && h.peer == 0 && h.ram == 305 && h.file == 79);
-        h = plan_homes(384, 34, 46, 300, 320);
+        h = plan_homes(384, 34, 46, 320);
         CHECK(h.main == 34 && h.peer == 46 && h.ram == 304 && h.file == 0);
-        h = plan_homes(384, 34, 46, 400, 420);
+        h = plan_homes(384, 34, 46, 420);
         CHECK(h.main == 0 && h.peer == 46 && h.ram == 338 && h.file == 0);
-        h = plan_homes(384, 34, 46, 200, 220);
-        CHECK(h.main == 34 && h.peer == 46 && h.ram == 200 && h.file == 104);
-        h = plan_homes(384, 34, 500, 10, 12);
+        h = plan_homes(384, 34, 46, 220);
+        CHECK(h.main == 34 && h.peer == 46 && h.ram == 220 && h.file == 84);
+        h = plan_homes(384, 34, 500, 10);
         CHECK(h.main == 0 && h.peer == 384 && h.ram == 0 && h.file == 0);
+        // a shortfall of n places puts n experts in the file, never more
+        for (int n : {1, 2, 13}) {
+            h = plan_homes(384, 34, 46, 304 - n);
+            CHECK(h.main == 34 && h.ram == 304 - n && h.file == n);
+            h = plan_homes(384, 34, 0, 384 - n);
+            CHECK(h.file == n);
+        }
         for (int mp : {0, 10, 80})
             for (int pp : {0, 7, 46})
                 for (int rp : {0, 100, 384}) {
-                    h = plan_homes(384, mp, pp, rp, rp + 13);
+                    h = plan_homes(384, mp, pp, rp);
                     CHECK(h.main + h.peer + h.ram + h.file == 384);
                     CHECK(h.main >= 0 && h.peer >= 0 && h.ram >= 0 && h.file >= 0);
                     // every rank has one place and the places hold what the plan says
@@ -76,11 +83,11 @@ int main() {
                           n[(int) Place::Ram] == h.ram && n[(int) Place::File] == h.file);
                 }
         // one card: the RAM tier is the head of the order; two: its copies' head stays in RAM ahead of the second card
-        h = plan_homes(384, 34, 0, 305, 320);
+        h = plan_homes(384, 34, 0, 305);
         CHECK(place_of_rank(h, 59, 0) == Place::Ram && place_of_rank(h, 59, 304) == Place::Ram && place_of_rank(h, 59, 305) == Place::File);
-        h = plan_homes(384, 34, 46, 400, 420);
+        h = plan_homes(384, 34, 46, 420);
         CHECK(place_of_rank(h, 59, 58) == Place::Ram && place_of_rank(h, 59, 59) == Place::Peer && place_of_rank(h, 59, 105) == Place::Ram);
-        h = plan_homes(384, 34, 46, 300, 320);
+        h = plan_homes(384, 34, 46, 320);
         CHECK(place_of_rank(h, 59, 33) == Place::Main && place_of_rank(h, 59, 34) == Place::Peer && place_of_rank(h, 59, 80) == Place::Ram);
     }
 

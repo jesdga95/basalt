@@ -24,8 +24,9 @@
 namespace basalt::models::deepseek41 {
 namespace {
 
-constexpr uint64_t kRamHeadroom = 20ull << 30;   // host memory left to the system beside the RAM tier
-constexpr uint64_t kRamHeadroomNoFile = 16ull << 30;   // ... when no expert is read through the page cache
+// Host memory left to the system beside the RAM tier: what serving takes after the start, and the page cache that
+// file-held experts and the load read through.
+constexpr uint64_t kRamHeadroom = 16ull << 30;
 constexpr size_t kMaxPending = 128;              // promotions in flight
 constexpr uint64_t kPrereadBytes = 12ull << 30;  // file-backed experts read ahead into the page cache
 
@@ -113,14 +114,11 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     auto ram_in = [&](uint64_t left_free) {
         return (int) std::min<uint64_t>(avail > left_free ? (avail - left_free) / one_each_ram : 0, (uint64_t) n_expert_);
     };
-    int ram_slots = ram_in(kRamHeadroom), ram_no_file = ram_in(kRamHeadroomNoFile);
-    if (m_.tiers().resident_budget > 0) {
-        const int budget = (int) std::min<uint64_t>(m_.tiers().resident_budget / one_each_ram, (uint64_t) n_expert_);
-        ram_slots = std::min(ram_slots, budget);
-        ram_no_file = std::min(ram_no_file, budget);
-    }
-    if (m_.diag_tier_ram() >= 0) ram_slots = ram_no_file = std::min(m_.diag_tier_ram(), n_expert_);
-    homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots, ram_no_file);
+    int ram_slots = ram_in(kRamHeadroom);
+    if (m_.tiers().resident_budget > 0)
+        ram_slots = std::min(ram_slots, (int) std::min<uint64_t>(m_.tiers().resident_budget / one_each_ram, (uint64_t) n_expert_));
+    if (m_.diag_tier_ram() >= 0) ram_slots = std::min(m_.diag_tier_ram(), n_expert_);
+    homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots);
     if (homes_.peer == 0) peer_.reset();
 
     reserve_ = homes_.main > 0 ? reserve.beside_homes : reserve.copies;
@@ -184,7 +182,8 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     std::printf("auto flags: resident %.1f GB, pool-workers %d\n",
                 (double) one_each_ram * cover_ / 1e9, pool_->workers());   // the server keeps the words after the name
     std::fflush(stdout);
-    basalt::log::info("basalt generate", "RAM floor %.1f GiB", (double) (homes_.file > 0 ? kRamHeadroom : kRamHeadroomNoFile) / 1073741824.0);
+    basalt::log::info("basalt generate", "RAM floor %.1f GiB of %.1f GiB free", (double) kRamHeadroom / 1073741824.0,
+                      (double) avail / 1073741824.0);
     if (peer_) basalt::log::info("basalt deepseek41", "peer GPU %d: %lld experts", peer_->device(), (long long) n_layers_ * homes_.peer);
     basalt::log::info("basalt deepseek41", "expert homes of %d per layer: main card %d, second card %d, RAM %d, file %d; main card copies %lld",
                  n_expert_, homes_.main, homes_.peer, homes_.ram, homes_.file, (long long) (homes_.main > 0 ? ext_per_layer_ : per_layer_));
