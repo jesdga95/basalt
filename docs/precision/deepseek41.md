@@ -25,6 +25,11 @@ requantized. Types in the IQ1_S, IQ1_M and GSQ-RCO packs (a GSQ-RCO build assign
 | Router gate (F32, or BF16 widened exactly at load), router bias (and the picture bias), hyper-connection fn/scale/base, all norm weights, attention sinks, Engram gate | F32 | fp32 kernels |
 | Vision projector (optional `vision/mmproj` section) | BF16 | vision/encoder.cu (cuBLAS) |
 
+## Paths
+
+A prompt reads through the MMQ products in chunks; a prompt of up to 32 tokens reads through the decode kernels, one step at a
+time, as the single-token tail always did. Both round as their kernels do, inside the placement spread the quality section gives.
+
 ## Activations and accumulation
 
 All activations between stages are fp32: the four-stream residual, norms, router logits and weights, hyper-connection
