@@ -195,7 +195,8 @@ plain decoding would give.
 
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
-| `spec` | engine | integer | 8 with an MTP drafter, else 0 | Verify windows of at most N tokens: the last accepted token plus up to N-1 drafts. `0` or `1` turns speculation off. A DeepSeek V4.1 pack's DSpark drafter runs only when this is set ([DeepSeek-V4.1 packs](../deepseek41.md#drafting)). |
+| `spec` | engine | integer | 8 with an MTP drafter, 3 with a DSpark drafter, else 0 | Verify windows of at most N tokens: the last accepted token plus up to N-1 drafts. `0` or `1` turns speculation off ([DeepSeek-V4.1 packs](../deepseek41.md#drafting)). |
+| `draft-experts` | engine | integer | 32 | DeepSeek V4.1: the DSpark drafter's routed experts each stage keeps, its most routed by the ranking in `data/profiles` (32, 64, 96 or 128; `0` = all 128). Without that file every expert loads. |
 | `suffix-draft` | engine | integer tokens | 3 (`0` = MTP only) | Prompt lookup: when the text repeats an earlier stretch of the context by at least N tokens, the window may be filled from what followed it there, where the draft policy expects it to pay; such a window may be up to 2 tokens longer than `spec`, at most 8. |
 | `mtp-max-t` | engine | integer | 0 (= `spec`) | Caps the MTP's own windows; longer ones then come only from prompt lookup. |
 | `mtp-window` | engine | integer cells | 32768 (`0` = all) | The drafter attends to the last N cells. With `parallel`, each slot's draft K/V keeps only those and the 16384 before them (a turn rolled back), not the slot's whole context, and the rest of that VRAM holds expert slots. |

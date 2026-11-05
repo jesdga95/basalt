@@ -78,6 +78,7 @@ public:
         if (a == "--no-prompt-skip") o.no_prompt_skip = true;
         else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
         else if (a == "--spec-oracle") o.spec_oracle = args.next("--spec-oracle");
+        else if (a == "--draft-experts") o.draft_experts = std::atoi(args.next("--draft-experts"));
         else if (a == "--diag-drafter-gpu") o.drafter_device = std::atoi(args.next("--diag-drafter-gpu"));
         else if (a == "--diag-teacher") o.diag_teacher = true;
         else if (a == "--diag-tier-frozen") o.diag_tier_frozen = true;
@@ -88,12 +89,21 @@ public:
 
     // A context the pack refuses is refused with the flags, before anything loads; the memory check needs the card.
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
+        if (o.draft_experts < 0 || o.draft_experts > 128 || o.draft_experts % 32 != 0) {
+            basalt::log::error("basalt deepseek41", "--draft-experts %d: 32, 64, 96 or 128, or 0 for all", o.draft_experts);
+            return 2;
+        }
         core::ModelFile file;
         std::string err;
         const bool opened = !o.model.empty() && file.open(o.model, err);
-        // --spec asks for the pack's drafter; a token file drafts in its place
+        const bool drafter = opened && file.find("dspark/gguf") != nullptr;
+        // the pack's drafter runs in windows of 3 unless --spec says otherwise; a token file drafts in its place
+        if (!o.spec_given) {
+            o.spec = drafter && o.batch <= 1 ? 3 : 0;
+            if (opened && !drafter) basalt::log::info("basalt deepseek41", "no dspark/gguf section: plain decode");
+        }
         if (o.spec >= 2 && o.spec_oracle.empty()) {
-            const char* off = o.batch > 1 ? "--parallel slots draft nothing" : !opened || !file.find("dspark/gguf") ? "the pack has no dspark/gguf section" : nullptr;
+            const char* off = o.batch > 1 ? "--parallel slots draft nothing" : !drafter ? "the pack has no dspark/gguf section" : nullptr;
             if (off != nullptr) {
                 basalt::log::warn("basalt deepseek41", "--spec %d off: %s", o.spec, off);
                 o.spec = 0;

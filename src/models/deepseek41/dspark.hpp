@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace basalt::models::deepseek41 {
@@ -24,19 +25,28 @@ struct DsparkDraft {
     float conf[kDsparkBlock];      ///< the confidence head's estimate that token[i] is accepted
 };
 
+/// The experts each of `stages` stages keeps: its first `keep` in the ranked (stage, expert) pairs, topped up in index order
+/// when the ranking names fewer, in ascending order.
+std::vector<std::vector<int>> dspark_kept_experts(const std::vector<std::pair<int32_t, int32_t>>& ranked, int stages, int experts,
+                                                  int keep);
+
 class DsparkDrafter {
 public:
     ~DsparkDrafter();
 
     /// Loads the pack's dspark/gguf section onto `device` (weights, a window ring per stage, scratch). Null with `err` set
     /// on failure.
-    static std::unique_ptr<DsparkDrafter> create(const DsModel& main, int device, std::string& err);
+    /// `ranking` (the format of data/profiles, a pair per stage and expert, most routed first): each stage keeps its `keep`
+    /// most routed experts (0: all) and the router picks among them; without the file every expert loads.
+    static std::unique_ptr<DsparkDrafter> create(const DsModel& main, int device, const std::string& ranking, int keep,
+                                                 std::string& err);
 
     /// Slot (0..n_target_layers) the main model's layer `il` fills in the feature rows, or -1.
     int feature_slot(int il) const;
     int feature_floats() const;   ///< n_target_layers * n_embd
     int device() const;
     uint64_t device_bytes() const;   ///< what it took on its card
+    const std::string& kept() const;   ///< how many experts each stage kept, and why all when that was not asked
 
     /// Window latents of positions pos0.. from `n_rows` rows of target features (host, feature_floats() each).
     bool inject(int64_t pos0, int n_rows, const float* features, std::string& err);

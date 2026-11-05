@@ -110,9 +110,13 @@ public:
         if (m_.tiers().draft && !m_.pack().dspark.empty() && m_.sessions() == 1) {
             // the drafter takes its memory before the tiers size themselves to what is left
             const int device = m_.tiers().drafter_device >= 0 ? m_.tiers().drafter_device : m_.device();
-            drafter_ = DsparkDrafter::create(m_, device, err);
+            // the ranking that says which experts each stage keeps ships beside the expert profiles
+            const std::string ranking = m_.tiers().profile_dir.empty() ? std::string()
+                : m_.tiers().profile_dir + "/deepseek41-" + std::to_string(g_.n_layers) + "x" + std::to_string(g_.n_expert) + "-dspark.prof";
+            drafter_ = DsparkDrafter::create(m_, device, ranking, m_.tiers().draft_experts, err);
             if (!drafter_) return false;
-            basalt::log::info("basalt deepseek41", "drafter on GPU %d: %.2f GiB, windows of at most %d tokens", device, (double) drafter_->device_bytes() / (1ull << 30),
+            basalt::log::info("basalt deepseek41", "drafter on GPU %d: %.2f GiB, %s, windows of at most %d tokens (--spec 0: off)", device,
+                              (double) drafter_->device_bytes() / (1ull << 30), drafter_->kept().c_str(),
                               std::min(max_window(), kDsparkBlock + 1));
             const size_t ff = (size_t) drafter_->feature_floats();
             if (!buf(dfeat_, ff * kDsparkWindow) ||

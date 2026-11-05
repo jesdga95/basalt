@@ -6,9 +6,11 @@
 #include "models/deepseek41/dspark.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/core/expert_cache.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/log.hpp"
+#include "basalt/platform/file.hpp"
 #include "basalt/models/deepseek41/attn.hpp"
 #include "basalt/models/deepseek41/attn_index.hpp"
 #include "basalt/models/deepseek41/kernels.hpp"
@@ -70,6 +72,7 @@ struct Stage {
     float *hc_ffn_fn = nullptr, *hc_ffn_scale = nullptr, *hc_ffn_base = nullptr;
     float *router = nullptr, *router_bias = nullptr;
     uint16_t* ring = nullptr;   ///< [kWindowSlots][512] fp16
+    int n_exp = kExperts;       ///< routed experts kept, the router's choices
 };
 
 }  // namespace
@@ -112,6 +115,7 @@ struct DsparkDrafter::Impl {
     // which position each ring slot holds
     std::vector<int64_t> ring_pos;
     bool block_live = false;
+    std::string kept_note;
     uint64_t bytes_taken = 0;
     int64_t blocks = 0;
     double ms_body = 0, ms_head = 0;
@@ -150,16 +154,31 @@ struct DsparkDrafter::Impl {
         return cudaMemcpy(*dst, src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
     }
 
-    bool load(const core::FileRange& section, std::string& err) {
+    bool load(const core::FileRange& section, const std::string& ranking, int keep, std::string& err) {
         size_t free0 = 0, free1 = 0, total_b = 0;
         cudaMemGetInfo(&free0, &total_b);
-        const bool ok = read(section, err);
+        const bool ok = read(section, ranking, keep, err);
         cudaMemGetInfo(&free1, &total_b);
         bytes_taken = free0 > free1 ? (uint64_t) (free0 - free1) : 0;
         return ok;
     }
 
-    bool read(const core::FileRange& section, std::string& err) {
+    // The experts each stage keeps: the ranking's most routed, every one without a ranking that reads.
+    std::vector<std::vector<int>> kept_experts(const std::string& ranking, int asked) {
+        std::vector<std::pair<int32_t, int32_t>> ranked;
+        int64_t slots = 0;
+        uint64_t bytes = 0;
+        std::string why;
+        if (asked > 0 && asked < kExperts) {
+            if (ranking.empty() || !platform::file_size(ranking, bytes) || bytes == 0) why = "no ranking at " + ranking;
+            else core::read_expert_profile(core::FileRange{ranking, 0, bytes}, kStages, kExperts, ranked, slots, why);
+        }
+        const int keep = why.empty() && asked > 0 && asked < kExperts ? asked : kExperts;
+        kept_note = std::to_string(keep) + " of " + std::to_string(kExperts) + " experts per stage" + (why.empty() ? "" : " (" + why + ")");
+        return dspark_kept_experts(ranked, kStages, kExperts, keep);
+    }
+
+    bool read(const core::FileRange& section, const std::string& ranking, int keep_asked, std::string& err) {
         std::unique_ptr<GgufFile> g;
         try {
             g = std::make_unique<GgufFile>(section.path, section.offset, section.bytes);
@@ -198,22 +217,48 @@ struct DsparkDrafter::Impl {
             }
             return upload(g->tensor_data(*t), bytes_of(*t), (void**) &p);
         };
+        // a stage's kept experts, and their router rows and biases, in ascending order
+        const std::vector<std::vector<int>> keep = kept_experts(ranking, keep_asked);
+        auto experts_of = [&](const std::string& n, W& w, const std::vector<int>& k) {
+            const TensorInfo* t = find(n);
+            if (!t) return false;
+            w.type = (int) t->type;
+            const size_t one = bytes_of(*t) / kExperts;
+            std::vector<uint8_t> h(one * k.size());
+            const uint8_t* src = (const uint8_t*) g->tensor_data(*t);
+            for (size_t i = 0; i < k.size(); ++i) std::memcpy(h.data() + i * one, src + (size_t) k[i] * one, one);
+            return upload(h.data(), h.size(), &w.p, kMxfp4Pad);
+        };
+        auto rows_of = [&](const std::string& n, float*& p, size_t row_floats, const std::vector<int>& k) {
+            const TensorInfo* t = find(n);
+            if (!t) return false;
+            if (t->type != 0 || t->elements() != row_floats * kExperts) {
+                err = "dspark: " + n + " is not the expected fp32 tensor";
+                return false;
+            }
+            std::vector<float> h(row_floats * k.size());
+            const float* src = (const float*) g->tensor_data(*t);
+            for (size_t i = 0; i < k.size(); ++i) std::memcpy(h.data() + i * row_floats, src + (size_t) k[i] * row_floats, row_floats * 4);
+            return upload(h.data(), h.size() * 4, (void**) &p);
+        };
         for (int l = 0; l < kStages; ++l) {
             Stage& s = stage[l];
             const std::string b = "blk." + std::to_string(l) + ".";
+            const std::vector<int>& kp = keep[(size_t) l];
+            s.n_exp = (int) kp.size();
             bool ok = wt(b + "attn_q_a.weight", s.wq_a) && wt(b + "attn_q_b.weight", s.wq_b) &&
                       wt(b + "attn_kv.weight", s.wkv) && wt(b + "attn_output_a.weight", s.wo_a) &&
                       wt(b + "attn_output_b.weight", s.wo_b) && wt(b + "ffn_gate_shexp.weight", s.sh_gate) &&
                       wt(b + "ffn_up_shexp.weight", s.sh_up) && wt(b + "ffn_down_shexp.weight", s.sh_down) &&
-                      wt(b + "ffn_gate_exps.weight", s.gate_exps) && wt(b + "ffn_up_exps.weight", s.up_exps) &&
-                      wt(b + "ffn_down_exps.weight", s.down_exps);
+                      experts_of(b + "ffn_gate_exps.weight", s.gate_exps, kp) && experts_of(b + "ffn_up_exps.weight", s.up_exps, kp) &&
+                      experts_of(b + "ffn_down_exps.weight", s.down_exps, kp);
             ok = ok && ft(b + "attn_q_a_norm.weight", s.q_norm, 1280) && ft(b + "attn_kv_a_norm.weight", s.kv_norm, 512) &&
                  ft(b + "attn_sinks.weight", s.sinks, 64) && ft(b + "attn_norm.weight", s.attn_norm, kN) &&
                  ft(b + "ffn_norm.weight", s.ffn_norm, kN) && ft(b + "hc_attn_fn.weight", s.hc_attn_fn, 20480 * 24) &&
                  ft(b + "hc_attn_scale.weight", s.hc_attn_scale, 3) && ft(b + "hc_attn_base.weight", s.hc_attn_base, 24) &&
                  ft(b + "hc_ffn_fn.weight", s.hc_ffn_fn, 20480 * 24) && ft(b + "hc_ffn_scale.weight", s.hc_ffn_scale, 3) &&
-                 ft(b + "hc_ffn_base.weight", s.hc_ffn_base, 24) && ft(b + "ffn_gate_inp.weight", s.router, (size_t) kExperts * kN) &&
-                 ft(b + "exp_probs_b.bias", s.router_bias, kExperts);
+                 ft(b + "hc_ffn_base.weight", s.hc_ffn_base, 24) && rows_of(b + "ffn_gate_inp.weight", s.router, (size_t) kN, kp) &&
+                 rows_of(b + "exp_probs_b.bias", s.router_bias, 1, kp);
             if (!ok) {
                 if (err.empty()) err = "dspark: cannot upload stage " + std::to_string(l);
                 return false;
@@ -393,6 +438,7 @@ struct DsparkDrafter::Impl {
 
             hc_mixes(x2, s.hc_ffn_fn, s.hc_ffn_scale, s.hc_ffn_base, kT, hca, hc_ws, coef_f[l & 1], st);
             hc_pre_rms_norm(x2, coef_a, kHcCoef, s.ffn_norm, kT, kN, kEps, cur, normed, st);
+            ra.n_expert = s.n_exp;
             router(normed, s.router, s.router_bias, kT, ra, rlogits, ids, rw, st);
             dspark_moe_gate_up(s.gate_exps.p, s.up_exps.p, kN, kFF, normed, ids, kT, kUsed, 10.f, moe_h, st);
             dspark_moe_down(s.down_exps.p, kFF, kN, moe_h, ids, kT, kUsed, moe_d, st);
@@ -426,12 +472,32 @@ struct DsparkDrafter::Impl {
 DsparkDrafter::DsparkDrafter(std::unique_ptr<Impl> i) : p_(std::move(i)) {}
 DsparkDrafter::~DsparkDrafter() = default;
 
-std::unique_ptr<DsparkDrafter> DsparkDrafter::create(const DsModel& main, int device, std::string& err) {
+std::vector<std::vector<int>> dspark_kept_experts(const std::vector<std::pair<int32_t, int32_t>>& ranked, int stages, int experts,
+                                                  int keep) {
+    std::vector<std::vector<int>> out((size_t) stages);
+    std::vector<uint8_t> taken((size_t) stages * (size_t) experts, 0);
+    const auto take = [&](int s, int e) {
+        if (s < 0 || s >= stages || e < 0 || e >= experts || (int) out[(size_t) s].size() >= keep) return;
+        uint8_t& t = taken[(size_t) s * (size_t) experts + (size_t) e];
+        if (t) return;
+        t = 1;
+        out[(size_t) s].push_back(e);
+    };
+    for (const auto& [s, e] : ranked) take(s, e);
+    for (int s = 0; s < stages; ++s) {
+        for (int e = 0; e < experts; ++e) take(s, e);
+        std::sort(out[(size_t) s].begin(), out[(size_t) s].end());
+    }
+    return out;
+}
+
+std::unique_ptr<DsparkDrafter> DsparkDrafter::create(const DsModel& main, int device, const std::string& ranking, int keep,
+                                                     std::string& err) {
     core::OnDevice g(device);
     auto i = std::make_unique<Impl>(main);
     i->device = device;
     try {
-        if (!i->load(main.pack().dspark, err)) return nullptr;
+        if (!i->load(main.pack().dspark, ranking, keep, err)) return nullptr;
     } catch (const std::exception& e) {
         err = std::string("dspark: ") + e.what();
         return nullptr;
@@ -447,6 +513,7 @@ int DsparkDrafter::feature_slot(int il) const {
 }
 int DsparkDrafter::device() const { return p_->device; }
 uint64_t DsparkDrafter::device_bytes() const { return p_->bytes_taken; }
+const std::string& DsparkDrafter::kept() const { return p_->kept_note; }
 
 void DsparkDrafter::forget_from(int64_t pos) {
     for (int64_t& rp : p_->ring_pos)

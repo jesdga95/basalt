@@ -59,12 +59,13 @@ UD-IQ1_M GGUF (Dynamic V3.1) with `convert.py --sections-from` ([model file](mod
 
 ## Drafting
 
-Off by default. A pack built with `--dspark` carries DeepSeek's DSpark drafter in its `dspark/gguf` section
-([model file](model-file.md#deepseek-v41-pack)), and `--spec N` (`"spec"` in the config's `engine` section) runs it. A window
-holds the last accepted token and up to N-1 drafts, as on any model; a block proposes 5 tokens, so at most 6. Without `--spec`,
-or with `--spec 0` or `1`, the section stays unread. `--spec` on a pack without the section decodes plain with a warning, and so
-do `--parallel` slots, which draft nothing. One engine line says what started: `basalt deepseek41: drafter on GPU 0: 7.47 GiB,
-windows of at most 6 tokens`.
+On by default when the pack carries DeepSeek's DSpark drafter in its `dspark/gguf` section
+([model file](model-file.md#deepseek-v41-pack)): windows of at most 3 tokens, the last accepted one and up to 2 drafts. `--spec N`
+(`"spec"` in the config's `engine` section) sets another width, at most 6 since a block proposes 5 tokens, and `--spec 0` turns it
+off. A pack without the section decodes plain and says so in one line; `--parallel` slots draft nothing. Each stage of the drafter
+keeps its 32 most routed experts (`--draft-experts`), by a ranking counted on live runs of the model that ships as
+`data/profiles/deepseek41-40x384-dspark.prof`; without that file every expert loads. One engine line says what started:
+`basalt deepseek41: drafter on GPU 0: 2.41 GiB, 32 of 128 experts per stage, windows of at most 3 tokens (--spec 0: off)`.
 
 The drafts stay in a window while the drafter's own chance that all of them are accepted holds against a threshold adapted per
 request. The model verifies every row and a rejected row leaves no trace, so the output is plain decode's within the
@@ -77,32 +78,23 @@ RAM cannot take them, the last experts of the routing order stay in the file.
 
 ### What it costs
 
-Measured on a pack tested and not shipped, with the same drafter, a 400 W RTX 5090 and a 180 W RTX 5060 Ti, 121 GiB of RAM, `--pool-workers 8`, the Q8_0 drafter on the main card.
-It takes 7.47 GiB there, and the start line goes from `main card 34, second card 46, RAM 304, file 0` to `main card 10, second
-card 46, RAM 303, file 25`. A block takes 2.24 ms (8.63 ms with `--diag-drafter-gpu 1`).
+Measured on the UD-IQ1_M pack with a 400 W RTX 5090 and a 180 W RTX 5060 Ti, 121 GiB of RAM, `--pool-workers 8`, the drafter on the
+main card. With 32 experts per stage it takes 2.41 GiB there, and the start line goes from `main card 30, second card 46, RAM 308,
+file 0` to `main card 23, second card 46, RAM 315, file 0`; with all 128 it takes 7.47 GiB and leaves 28 to 29 experts per layer in
+the file. A block takes 2.3 ms.
 
-A long conversation, 125-141K tokens of context, thinking and tools on, temperature 1, 600 tokens per turn, `--spec 8`, the turns
-after the first, one cold server run each:
+Greedy, every window full, 800 tokens, short context, one cold run each, tok/s and tokens per window:
 
-| | tok/s | Tokens generated | Tokens per window | Prompt reads |
-| --- | --- | --- | --- | --- |
-| Plain | 64.06 | 4,239 | 1 | 30.2 s |
-| Drafter | 51.62 | 9,015 | 1.97 | 39.9 s |
+| | Code | Conversation | Prose |
+| --- | --- | --- | --- |
+| Plain | 62.2 | 64.7 | 65.2 |
+| `--spec 3`, 32 experts | 82.6 (2.64) | 78.1 (2.26) | 69.6 (1.96) |
+| `--spec 3`, all 128 | 56.4 (2.69) | | 51.8 (1.89) |
 
-It loses here. With the drafter in memory a window took 17.9, 29.0, 38.3, 49.1, 63.0 and 81.9 ms at 1 to 6 rows, and the draft 2.5
-ms more, against 15.6 ms for a plain token, so a window of 3 rows has to keep 2.6 tokens to break even. The first draft of a window
-was accepted 65% of the time.
+A long conversation, 125-141K tokens of context, thinking and tools on, temperature 1, 600 tokens per turn, the turns after the
+first, one cold server run each: plain 62.15 tok/s on 12,000 generated, `--spec 3` with 32 experts 63.15 on 10,209; prose turns
+60.6 against 62.7 (1.62 tokens per window), code turns 67.3 against 61.6 (2.10).
 
-Greedy, every window full, 800 tokens, short context, one cold run each:
-
-| `--spec` | Prose tok/s | Tokens per window | Code tok/s | Tokens per window |
-| --- | --- | --- | --- | --- |
-| Plain | 72.9 | 1 | 75.1 | 1 |
-| 3 | 55.1 | 1.95 | 87.8 | 2.76 |
-| 5 | 46.3 | 2.18 | 88.4 | 4.28 |
-| 8 (6 rows) | 40.3 | 2.17 | 64.1 | 3.83 |
-
-**When it can pay off:** on text it predicts well, as the code above, and with memory to spare. Most of what a window costs beyond
-its rows is the memory. The same 378 windows of 5 rows replayed, 800 tokens: 28.6 ms each with no drafter in memory, 44.5 with it
-on the main card, 34.6 with it there and RAM raised by `--diag-tier-ram` so that no expert stays in the file. No machine with more
-VRAM has been measured.
+**Where it pays:** on text the drafter predicts well, such as code and structured output; on long prose at temperature 1 it is
+about even. Keeping 32 experts cost little acceptance (a draft of greedy code was accepted 82% of the time against 85% with all
+128) and gives their memory to the expert tier, where most of a window's cost goes.
