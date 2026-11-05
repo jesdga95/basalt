@@ -124,6 +124,7 @@ public:
             const int batched = r.n_tokens;
             const int plan_tokens = std::max(r.total_tokens, r.n_tokens);
             {
+                if (plan_tokens > prefillp::kShortPrompt) release_short_prompt();
                 open_prompt_path(plan_tokens);
                 if (plan_tokens >= kLendTierTokens) {
                     std::string te;
@@ -141,6 +142,7 @@ public:
                     }
                     std::string te;
                     err.clear();
+                    short_prompt_ = false;
                     if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
                     if (!make_prefill_fit(plan_tokens, err)) return prompt_failed(err);
                 }
@@ -185,6 +187,7 @@ public:
         ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
         if (t == nullptr) return {model::Status::Error, e.empty() ? std::string("this session has no expert tier") : e};
         cudaStreamSynchronize(stream_);
+        release_short_prompt();
         if (low) {
             t->lend_all();
         } else {
@@ -200,6 +203,7 @@ public:
         ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
         if (t == nullptr) return {model::Status::Error, e.empty() ? std::string("this session has no expert tier") : e};
         cudaStreamSynchronize(stream_);
+        release_short_prompt();
         t->set_free_floor(mib);
         t->lend_all();
         if (!t->reclaim(e)) return {model::Status::Error, e};
@@ -288,6 +292,7 @@ public:
         vision::Image img;
         if (!vision::decode_image(data, bytes, img, err)) return {model::Status::Error, err};
         if (!vis_) {
+            release_short_prompt();
             // the encoder takes the memory of the tier's extra copies, and of all its copies when that is short;
             // images_done gives it back
             std::string te;
@@ -341,11 +346,13 @@ public:
     model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos) override {
         sync_rewind(pos);
         std::string err;
+        if (n_rows > prefillp::kShortPrompt) release_short_prompt();
         open_prompt_path(n_rows);
         if (!ops_->ensure_positions(pos + n_rows, err)) return prompt_failed(err);
         if (!prefill_ && !make_prefill_fit(n_rows, err)) {
             std::string te;
             err.clear();
+            short_prompt_ = false;
             if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
             if (!make_prefill_fit(n_rows, err)) return prompt_failed(err);
         }
@@ -370,7 +377,9 @@ private:
         // the reserve stays free through the read: the chunk halves to fit above it
         std::string te;
         const ExpertTier* tier = ops_->expert_tier(te);
-        const uint64_t margin = std::max(prefillp::kMargin, tier ? tier->free_floor() : 0);
+        const bool beside = short_prompt_;
+        const uint64_t margin = std::max(beside ? prefillp::kShortMargin : prefillp::kMargin, tier ? tier->free_floor() : 0);
+        if (beside) tokens = prefillp::kShortChunk;   // these workspaces stay for the next short read, whatever its size
         const prefillp::Fit fit = prefillp::plan_chunk(d, free_b, margin, tokens);
         if (!fit.chunk) {
             err = "deepseek41: " + fit.error;
@@ -396,6 +405,7 @@ private:
     model::Result prompt_failed(const std::string& err) {
         cudaStreamSynchronize(stream_);
         prefill_.reset();
+        short_prompt_ = false;
         std::string e;
         if (ExpertTier* t = ops_->expert_tier(e)) {
             if (!t->reclaim(e)) basalt::log::warn("basalt deepseek41", "VRAM expert tier stays closed: %s", e.c_str());
@@ -409,13 +419,21 @@ private:
         // the tier opens at its normal size before anything else takes the card; the workspaces size to what is left
         ExpertTier* t = ops_->expert_tier(e);
         if (!t || prefill_) return;
-        if (t->has_homes() && n_tokens <= prefillp::kShortPrompt) return;   // its workspaces fit beside the copies
-        t->shrink();
+        short_prompt_ = t->has_homes() && n_tokens <= prefillp::kShortPrompt;   // its workspaces fit beside the copies
+        if (!short_prompt_) t->shrink();
     }
+    void release_short_prompt() {
+        if (!short_prompt_) return;
+        cudaStreamSynchronize(stream_);
+        prefill_.reset();
+        short_prompt_ = false;
+    }
+    // A short read's workspaces stay for the next one: the tier planned for them.
     void close_prompt_path() {
         std::string e;
         ExpertTier* t = ops_->expert_tier(e);
         if (!t) return;
+        if (short_prompt_) return;
         cudaStreamSynchronize(stream_);
         prefill_.reset();
         if (!t->reclaim(e)) basalt::log::warn("basalt deepseek41", "VRAM expert tier stays closed: %s", e.c_str());
@@ -748,6 +766,7 @@ private:
     cudaStream_t stream_ = nullptr;
     std::unique_ptr<LayerOps> ops_;
     std::unique_ptr<Prefill> prefill_;
+    bool short_prompt_ = false;   // prefill_ is a short read's and stays between reads
     std::unique_ptr<VisionEncoder> vis_;
     int vis_merge_ = 3, vis_min_pixels_ = 0;
     bool vis_borrowed_ = false;

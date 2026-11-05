@@ -13,7 +13,8 @@ namespace basalt::models::deepseek41::prefillp {
 constexpr int kMaxChunk = 16384;
 constexpr int kHomeChunk = 8192;                   // the chunk a prompt keeps at the full context beside a tier's homes
 constexpr int kMinChunk = 256;
-constexpr uint64_t kMargin = 1ull << 30;           // left free after the workspaces (kernel modules load lazily)
+constexpr uint64_t kMargin = 1ull << 30;           // left free after a long prompt's workspaces
+constexpr uint64_t kShortMargin = 1ull << 28;      // ... and after a short one's, whose memory the tier plans for
 constexpr int64_t kKeepPositions = 32768;          // a new sequence keeps the caches of this many positions
 constexpr uint64_t kTrimBytes = 256ull << 20;      // ... and gives back the rest only when it is at least this much
 constexpr int64_t kStageRows = 16384;              // (token, slot) rows one expert launch handles
@@ -37,14 +38,20 @@ inline uint64_t per_token_bytes(const Dims& d) {
                 (uint64_t) d.n_used * n + (uint64_t) d.hc_splits * (uint64_t) (d.hc_coef + 1));
 }
 
+/// (token, slot) rows one expert launch of a chunk handles.
+inline int64_t stage_rows(int64_t n_used, int chunk) {
+    const int64_t rows = (int64_t) chunk * n_used, least = (int64_t) kShortChunk * n_used;
+    return rows < least ? least : rows > kStageRows ? kStageRows : rows;
+}
+
 /// Device bytes that do not: the expert launch buffers and the staged blobs.
-inline uint64_t fixed_bytes(const Dims& d) {
-    const uint64_t R = (uint64_t) kStageRows;
+inline uint64_t fixed_bytes(const Dims& d, int chunk) {
+    const uint64_t R = (uint64_t) stage_rows(d.n_used, chunk);
     const uint64_t q8 = (uint64_t) d.n_embd * R * 36 / 32 + (uint64_t) d.n_ff_exp * R * 36 / 32;
     return q8 + R * (uint64_t) d.n_ff_exp * 12 + R * 4 + 2 * (d.expert_blob_bytes * kStageExperts + R * 8);
 }
 
-inline uint64_t workspace_bytes(const Dims& d, int chunk) { return fixed_bytes(d) + per_token_bytes(d) * (uint64_t) chunk; }
+inline uint64_t workspace_bytes(const Dims& d, int chunk) { return fixed_bytes(d, chunk) + per_token_bytes(d) * (uint64_t) chunk; }
 
 /// Device bytes of the long chunks' staged groups of experts, ahead of their products.
 inline uint64_t ahead_bytes(const Dims& d) { return kAheadSlots * d.expert_blob_bytes * kStageExperts; }

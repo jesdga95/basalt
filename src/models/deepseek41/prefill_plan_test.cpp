@@ -20,8 +20,12 @@ int main() {
     d.n_embd = 5120; d.n_used = 6; d.n_expert = 256; d.n_ff_exp = 2304; d.engram_cols = 8 * 256;
     d.expert_blob_bytes = 6ull << 20;
 
-    CHECK(per_token_bytes(d) > 0 && fixed_bytes(d) > 0);
-    CHECK(workspace_bytes(d, 2048) - workspace_bytes(d, 1024) == per_token_bytes(d) * 1024);
+    CHECK(per_token_bytes(d) > 0 && fixed_bytes(d, 1024) > 0);
+    CHECK(workspace_bytes(d, 8192) - workspace_bytes(d, 4096) == per_token_bytes(d) * 4096);
+    // a short chunk's launches hold its rows only; the long ones are capped
+    CHECK(stage_rows(6, 256) == kShortChunk * 6 && stage_rows(6, 1024) == kShortChunk * 6);
+    CHECK(stage_rows(6, 2048) == 2048 * 6 && stage_rows(6, 16384) == kStageRows);
+    CHECK(fixed_bytes(d, 1024) < fixed_bytes(d, 4096));
 
     constexpr int kLong = 1 << 20;   // tokens of a prompt longer than any chunk
     // plenty of memory: the full chunk

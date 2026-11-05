@@ -63,6 +63,7 @@ public:
         uint64_t copies = 0;       ///< beside slots that are all copies, which a long prompt borrows
         uint64_t homes = 0;        ///< beside homes, which stay through a prompt at the full context
         uint64_t beside_homes = 0; ///< beside homes and the copies next to them, where a short prompt's workspaces fit
+        uint64_t modules = 0;      ///< ... until a first token has loaded the kernel modules
     };
     /// Sizes the tiers and loads them. `h_rows`: the mapped rows a second card shares with the CPU pool.
     bool open(const Reserve& reserve, float* h_rows, std::string& err);
@@ -160,7 +161,7 @@ private:
     cudaStream_t fetch_stream_ = nullptr;   ///< copies a layer waits for (high priority)
     cudaEvent_t fetch_ev_ = nullptr;
     uint64_t tick_ = 0;
-    uint64_t one_each_ = 0, reserve_ = 0;
+    uint64_t one_each_ = 0, reserve_ = 0, modules_ = 0;
     uint64_t start_floor_ = 0, free_floor_ = 0;
     int64_t cap_per_layer_ = -1;            ///< --expert-cache or the diagnostic's slots per layer, -1 when neither
 
