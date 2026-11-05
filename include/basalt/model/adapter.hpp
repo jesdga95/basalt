@@ -76,8 +76,7 @@ struct LoadRequest {
     int diag_tier_ram = -1;           ///< diagnostic: fixed RAM-tier experts per layer (-1 = sized from free memory)
     int diag_tier_vram = -1;          ///< diagnostic: fixed VRAM-tier experts per layer (-1 = sized from free memory)
     std::vector<int> peer_devices;    ///< CUDA devices of the expert tier cards after the main one
-    int64_t max_context = 0;          ///< --max-context (used when max_context_set; else the model picks its own)
-    bool max_context_set = false;
+    int64_t max_context = 0;          ///< --max-context, or the default every model shares
     int sessions = 1;                 ///< sessions the model will be asked for (--batch)
     std::string expert_profile;       ///< the routing order of the experts (empty: the file's own order)
     int expert_cache = 0;             ///< VRAM expert slots over all layers (0 or -1: from the free memory)

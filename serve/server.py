@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable a
 from serve import ROOT, service  # noqa: E402
 from serve.config import (build_parser, check_engine_flags,  # noqa: E402
                           engine_flags_of, grammar_words, model_line, model_settings, sampling_defaults_from_config,
-                          sampling_items, shared_line, start_items, with_spec)
+                          sampling_items, shared_line, slot_share, start_items, with_spec)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
 from serve.engine.image_source import image_sources_of  # noqa: E402
@@ -141,6 +141,12 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
                 lines.append(f"[server] warning: {plan['warning']}")
             cfg["gpu"] = plan["devices"]
             cfg["spec"] = plan.get("spec")
+            if getattr(a, "split_default", False) and plan.get("max_context"):
+                # the engine's default context, shared by the slots
+                a.shared_context = int(plan["max_context"])
+                part = ["--max-context", str(slot_share(a.shared_context, a.parallel))]
+                cfg["args"] += part
+                cli_engine += part
             cfg["gpu_smi"] = [c.get("smi", -1) for c in plan.get("cards") or []]
             cfg["args"] += ["--gpu", ",".join(str(i) for i in range(len(plan.get("cards") or [])))]
     for flag in a.skipped:

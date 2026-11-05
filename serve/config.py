@@ -17,7 +17,6 @@ from serve.util.console import tagged
 
 
 MIN_SLOT_CONTEXT = 256          # the least context a slot is given when --max-context is shared
-ENGINE_DEFAULT_CONTEXT = 4096     # the engine's context without --max-context
 CONFIG_VERSION = 2                          # the config file's "version"; a file without one is this format's first
 PARALLEL_MAX = 8                            # the engine's batch slots
 CONFIG_PATHS = ("model", "tokenizer", "image-dir")       # relative to the config file
@@ -264,18 +263,18 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str], server_argv=(), 
         (cli_words if a_cli.parallel else file_words).extend(["--batch", str(a.parallel)])
         if not a.slot_full_context:
             # --max-context is shared by the slots, as in llama.cpp: each holds an equal part (the solo path, used while
-            # a request is alone, has the same length, so a request never outgrows its slot)
+            # a request is alone, has the same length, so a request never outgrows its slot). Without the flag the
+            # engine's default is shared, once the server has asked the engine for it (split_default).
             src = cli_words if "--max-context" in cli_words or "--max-context" not in file_words else file_words
             at = flag_index(src, "--max-context")
             if at is not None and at + 1 >= len(src):
                 raise ValueError("--max-context needs a value")
-            ctx = int(src[at + 1]) if at is not None else ENGINE_DEFAULT_CONTEXT
-            part = str(max(MIN_SLOT_CONTEXT, ctx // a.parallel))
             if at is None:
-                src += ["--max-context", part]
+                a.split_default = True
             else:
-                src[at + 1] = part
-            a.shared_context = ctx                         # the total, for the startup line
+                ctx = int(src[at + 1])
+                src[at + 1] = str(slot_share(ctx, a.parallel))
+                a.shared_context = ctx                     # the total, for the startup line
     return a, file_argv + cli, file_words, cli_words
 
 
@@ -332,6 +331,11 @@ def start_items(file_words: list[str], cli_words: list[str], shared: tuple[int, 
     if grammar is not None:
         items.append(f"grammar={'on' if grammar[0] else 'off'}")
     return items
+
+
+def slot_share(total: int, parallel: int) -> int:
+    """Each of `parallel` slots' part of a shared --max-context."""
+    return max(MIN_SLOT_CONTEXT, total // parallel)
 
 
 def with_spec(items: list[str], spec) -> list[str]:

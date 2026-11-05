@@ -31,7 +31,7 @@ A config file is one JSON object. `models` lists the models; `engine` applies to
 - A row marked Flash-Next only or DeepSeek only is an unknown flag for the other model, and stops its start.
 - Precedence: command line, then config file, then defaults. A wrong block or an unknown name stops the start. `api-key` cannot be in
   a file.
-- The defaults are the fastest settings that need no knowledge of the machine. The keys that change output or memory (4,096 context,
+- The defaults are the fastest settings that need no knowledge of the machine. The keys that change output or memory (8,192 context,
   fp16 KV) are kept for you to set.
 
 ## Automatic settings
@@ -85,7 +85,7 @@ Command line `--name`, config `server` block `"name"`.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `max-context` | engine | tokens | 4096 (DeepSeek: the pack's maximum, lowered to fit memory) | Longest context. Shared by `parallel` slots. The KV cache grows with it. |
+| `max-context` | engine | tokens | 8192 | Longest context. Shared by `parallel` slots. The KV cache grows with it. |
 | `kv` | engine | `fp16`, `int8`, `q4_0`, `k8v4` | `fp16` | Flash-Next only. KV storage. `int8` halves VRAM. `q4_0` is 4-bit after rotation; `k8v4` keeps K int8 and V 4-bit (816 bytes per cell against `int8`'s 1,056). Not with `kv-resident`. |
 | `kv-resident` | engine | cells (min 20,480) or `0` | 0 | Flash-Next only. Keep N cells of KV in VRAM and the rest in pinned RAM. |
 | `rope-scaling` | engine | `none`, `linear`, `yarn` | model's, else `none` | Flash-Next only. Extend past the trained length. Fixed for the run. |

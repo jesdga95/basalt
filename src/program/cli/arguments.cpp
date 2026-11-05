@@ -36,7 +36,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
             have_tokens = true;
         }
         else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
-        else if (a == "--max-context") { o.max_context = std::atoll(next("--max-context")); o.max_context_set = true; }
+        else if (a == "--max-context") { o.max_context = std::atoll(next("--max-context")); }
         else if (a == "--diag-dump") o.diag_dump = next("--diag-dump");
         else if (a == "--diag-tier-ram") o.diag_tier_ram = std::atoi(next("--diag-tier-ram"));
         else if (a == "--diag-tier-vram") o.diag_tier_vram = std::atoi(next("--diag-tier-vram"));

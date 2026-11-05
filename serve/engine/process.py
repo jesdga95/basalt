@@ -232,7 +232,7 @@ class ProcessEngine:
             self.loading, self.load_status = False, {}
         self.asleep = False              # its GPU state suspended by the driver (sleep/wake)
         self.restore_s = 0.0             # the driver's part of the last wake
-        self.max_context = int(flag_value(args, "--max-context") or 4096)
+        self.max_context = int(flag_value(args, "--max-context") or 0)   # the engine's own at READY
         self.can_stop = False            # READY <ctx> stop
         self.last = {}
         self.slot_drafts = {}

@@ -274,7 +274,7 @@ int main(int argc, char** argv) {
 
     // fixtures
     std::vector<std::vector<int64_t>> ids(3);
-    long long need = 4096;
+    long long need = basalt::program::kDefaultContext;
     for (size_t i = 0; i < 3; ++i) {
         std::vector<std::vector<int64_t>> lines;
         if (!read_id_lines((fs::path(o.fixtures) / kFixtures[i].file).string(), lines, err) || lines.empty()) {

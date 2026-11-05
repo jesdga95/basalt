@@ -17,9 +17,9 @@ from Unsloth's UD-IQ1_M GGUF. Its layout and the DSpark section: [model file](..
 - **RAM:** the RAM tier leaves 16 GiB free (`RAM floor 16.0 GiB of N GiB free`) for the OS, serving and the page cache of
   the pack's reads. N places short puts the last N experts of every layer in the file, with a warning naming the RAM to free.
 - **Slots follow routing:** an expert that keeps missing takes the slot used longest ago, on either card.
-- **Context:** `--max-context` from 1,024 up to the pack's 1,048,576. Left out, it is the pack's maximum, lowered until the caches
-  take at most a quarter of the free memory. Caches grow with position (a short chat maps a few MiB, a 1M context about 3.2 GiB)
-  into the memory the tier leaves free. A value past the maximum, or whose caches need more than half the free memory, is refused.
+- **Context:** `--max-context` from 1,024 up to the pack's 1,048,576, default 8,192. Caches grow with position (a short chat maps
+  a few MiB, a 1M context about 3.2 GiB) into the memory the tier leaves free. A value past the maximum, or whose caches need more
+  than half the free memory, is refused; a quarter or more gives a warning.
 - **VRAM:** `--expert-cache` caps the slots; `--vram-reserve-mib` or `POST /v1/vram` sets what stays free. Prompts take the tier's
   copies first and halve their chunks to fit above the reserve.
 - **Refused flags:** `--kv` (fp16 only), `--rope-*`, `--yarn-*` (YaRN is part of the model).
