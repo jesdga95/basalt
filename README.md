@@ -30,8 +30,10 @@ Put your settings in `basalt_config.json`, with `model` pointing at the download
 
 ```json
 {
-  "server": { "model": "models/Qwen3.8-FN-NVFP4-DQ6_K.basalt", "gpu": "0,1", "port": 8080 },
-  "engine": { "expert-cache": "auto", "prefill": "auto", "kv": "int8", "resident-experts": true }
+  "version": 2,
+  "models": [{ "model": "models/Qwen3.8-FN-NVFP4-DQ6_K.basalt", "gpu": "0,1", "kv": "int8" }],
+  "engine": { "expert-cache": "auto", "prefill": "auto", "resident-experts": true },
+  "server": { "port": 8080 }
 }
 ```
 

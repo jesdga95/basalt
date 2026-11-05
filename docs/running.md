@@ -1,5 +1,7 @@
 # Running the server
 
+Several models on one server, swapped by a request's `model` field: [models and the router](configuration/models.md).
+
 The long-form notes behind the settings in [configuration](configuration/index.md): concurrent requests, the KV cache, memory floors and image input. Diagnostic flags: `bin/basalt --help`.
 
 A `deepseek41` pack has its own notes: [DeepSeek-V4.1 packs](deepseek41.md).
@@ -241,7 +243,7 @@ encoder cache in tens of milliseconds in every mode. The sidecar's card is named
 works, whether or not it runs the engine, and the startup line names it.
 
 ```json
-{ "server": { "gpu": "0,1", "vision": 1 } }
+{ "models": [{ "model": "model.basalt", "gpu": "0,1", "vision": 1 }] }
 ```
 
 A GPU number uses the sidecar, which the main build also produces (`tools/vision` builds on its own too). The server

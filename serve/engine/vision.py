@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import tempfile
@@ -32,16 +33,53 @@ PILLOW_FORMATS = ("JPEG", "PNG", "BMP", "GIF", "WEBP", "TIFF", "AVIF", "HEIF", "
 _decodes = threading.Semaphore(4)               # reads run outside the request turn: this bounds Pillow's memory
 
 
+def model_plan(engine_bin: str, path: str, value, words: list[str]) -> dict:
+    """The engine's choice for the gpu setting (`basalt --gpu-plan`) for a model with its flags: the cards, main first, as
+    "devices" (their CUDA_VISIBLE_DEVICES spelling) and "cards", plus the lines to print once. The engine parses the flags
+    by the model's own rules first and loads nothing. ValueError with the engine's reason."""
+    text = gpu_text(value)
+    cmd = [engine_bin, "--model", path, *words, "--gpu-plan"] + (["--gpu", text] if text else [])
+    try:
+        run = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        raise ValueError(f"{engine_bin} could not check this model's flags") from None
+    errors = [ln.split("error: ", 1)[1].strip() for ln in run.stderr.splitlines() if "error: " in ln]
+    try:
+        plan = json.loads(run.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        plan = {}
+    if plan.get("error"):
+        raise ValueError(plan["error"])
+    if run.returncode != 0 or not plan:
+        raise ValueError("; ".join(errors) or f"{engine_bin} could not check this model's flags (exit code {run.returncode})")
+    return plan
+
+
+def flag_refused(engine_bin: str, path: str, group: list[str]) -> bool:
+    """Whether the model in the file `path` has no such flag; `group` is the flag and its values."""
+    try:
+        run = subprocess.run([engine_bin, "--model", path, *group, "--gpu-plan"], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return f"unknown argument: {group[0]}" in run.stderr
+
+
 class Vision:
     """The resident `basalt-vision` encoder: `ENC <image> <out>` lines in, embeddings out, cached by image hash."""
 
-    def __init__(self, cfg: dict, log=None, env: dict | None = None):
+    def __init__(self, cfg: dict, log=None, env: dict | None = None, start: bool = True):
+        """`start` false: down until the service restarts it, as an unloaded encoder is."""
         args = [cfg["vision_bin"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]] + (["--gpu"] if cfg.get("gpu") else [])
         self.dir = Path(tempfile.mkdtemp(prefix="basalt-vision-"))
         self.spawn = (args, log, env)                   # to start again
         self.stopped = False
         self.ready_s = 0.0                              # last start's time to READY
-        self._start()
+        self.proc = None
+        if start:
+            self._start()
+        else:
+            self.stopped = True
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int, int]] = {}  # LRU cache: file, image tokens, bytes
         self.cache_bytes = 0
@@ -96,7 +134,8 @@ class Vision:
     def restart(self):
         """Start the encoder again, keeping the cache."""
         try:
-            self.proc.kill()
+            if self.proc is not None:
+                self.proc.kill()
         except OSError:
             pass
         self._start()
@@ -252,6 +291,8 @@ class Vision:
             self.cache_bytes -= size
 
     def close(self):
+        if self.proc is None:
+            return
         try:
             self.proc.stdin.write("QUIT\n")
             self.proc.stdin.flush()
@@ -332,22 +373,6 @@ def check_gpu(value) -> None:
     items = [x.strip() for x in text.split(",")]
     if not all(x.isdigit() for x in items) or len(set(int(x) for x in items)) != len(items):
         raise ValueError(text)
-
-
-def gpu_plan(engine_bin: str, value) -> dict:
-    """The engine's choice for the gpu setting (`basalt --gpu-plan`): the cards, main first, as "devices" (their
-    CUDA_VISIBLE_DEVICES spelling) and "cards", plus the lines to print once. ValueError with the engine's reason."""
-    import json
-    text = gpu_text(value)
-    cmd = [engine_bin, "--gpu-plan"] + (["--gpu", text] if text else [])
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout
-        plan = json.loads(out.strip().splitlines()[-1])
-    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
-        raise ValueError(f"{engine_bin} could not report its GPU choice (--gpu-plan)") from None
-    if plan.get("error"):
-        raise ValueError(plan["error"])
-    return plan
 
 
 def gpu_list(cfg: dict) -> list:
