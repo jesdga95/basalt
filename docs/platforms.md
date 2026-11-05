@@ -10,7 +10,7 @@ run on a machine with a card.
 | | Linux | Windows | Windows on Arm |
 | --- | --- | --- | --- |
 | OS | x86-64, AVX2 (AVX-512 used when present) | Windows 10 1903 or later, x64 | Windows 11 on Arm64, NEON with the dot product |
-| Compiler | C++20 (GCC or Clang) | Visual Studio 2022 (MSVC 19.44) | Visual Studio 2026 Build Tools, Arm64 (MSVC 19.51) |
+| Compiler | GCC 13 or newer | Visual Studio 2022 (MSVC 19.44) | Visual Studio 2026 Build Tools, Arm64 (MSVC 19.51) |
 | CUDA | 13 | 13 | 13.4 (the Arm64 toolkit) |
 | Build | CMake 3.24+ | CMake 3.24+ and Ninja | CMake 3.24+ and Ninja |
 | Python | 3.10+ | 3.10+ | 3.10+ (Arm64) |

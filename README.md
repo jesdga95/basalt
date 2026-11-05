@@ -15,7 +15,7 @@ A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compa
 
 - Linux x86-64 with AVX2 (AVX-512 is used when present), and an NVIDIA Blackwell GPU (compute capability 12.0) with CUDA 13.
   Windows x64, and Windows on Arm64 with an RTX Spark (compute capability 12.1): see [platforms](docs/platforms.md).
-- CMake 3.24 or newer, a C++20 compiler, and Python 3.10 or newer.
+- CMake 3.24 or newer, GCC 13 or newer on Linux (MSVC on Windows; see [platforms](docs/platforms.md)), and Python 3.10 or newer.
 - Enough system RAM to hold the experts that do not fit in VRAM.
 
 ## Quick start

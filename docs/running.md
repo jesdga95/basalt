@@ -220,6 +220,8 @@ Image input is one server option, `--vision off | dynamic | cpu | <GPU number>` 
 of them give bitwise identical embeddings.
 
 What a request may name as an image depends on where it comes from: [image sources](configuration/image-sources.md).
+An image in a tool result stays in its place in the prompt on all three APIs. A system prompt cannot hold one: that
+request is refused.
 
 | mode | where the encoder runs | VRAM cost | fresh-image latency (IQ3_S, 400 W, earlier build) |
 | --- | --- | --- | --- |
