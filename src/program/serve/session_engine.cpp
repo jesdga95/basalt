@@ -2,6 +2,8 @@
 #include "session_engine.hpp"
 
 #include "decode_loop.hpp"
+#include "basalt/core/diag.hpp"
+#include "basalt/core/draft_cum.hpp"
 #include "basalt/program/conv_cache.hpp"
 #include "basalt/program/probe_rates.hpp"
 
@@ -91,8 +93,8 @@ public:
         const std::string slots = o.batch > 0 ? " batch_slots=" + std::to_string(o.batch) + " slot_cache=" +
                                                     std::to_string(o.prompt_cache > 0 ? 1 : 0) + " slot0_solo=1 solo_any_slot=1"
                                               : std::string();
-        std::printf("INFO logit_bias=%lld context=%lld spec=0 mtp_max=0 lookup=0%s engine=" BASALT_VERSION "\n",
-                    (long long) n_vocab, (long long) o.max_context, slots.c_str());
+        std::printf("INFO logit_bias=%lld context=%lld spec=%d mtp_max=0 lookup=0%s engine=" BASALT_VERSION "\n",
+                    (long long) n_vocab, (long long) o.max_context, o.spec, slots.c_str());
     }
     bool windows_in_flight() override { return false; }
     bool next_batch_window() override;
@@ -278,6 +280,11 @@ public:
     void set_active(int slot) { active_ = slot; }
     void set_slot_sampling(int slot, const basalt::kernels::SamplerParams& sp) { slot_sampling_[(size_t) slot] = sp; }
     const basalt::model::ModelDesc& desc() const { return model_.desc(); }
+    /// --draft-log FILE, opened once.
+    FILE* draft_log() {
+        static FILE* const f = std::fopen(basalt::core::diagnostics().draft_log.c_str(), "a");
+        return f;
+    }
 
 private:
     bool memory_reply(long long reserve, int64_t slots, std::string* reply) {
@@ -302,7 +309,7 @@ class SessionRequest final : public Request {
 public:
     explicit SessionRequest(SessionRuntime& runtime) : Request(runtime), rt_(runtime) {}
 
-    static constexpr bool kSpeculates = false;
+    static constexpr bool kSpeculates = true;
     /// No adaptive step: the model's tiers move by themselves.
     struct TierStep {
         explicit TierStep(SessionRequest&) {}
@@ -313,12 +320,41 @@ public:
     };
     Flow decode_begin() { return Flow::proceed; }
     void seed_tiers() {}
-    void decode_state_begin() { draws_ = 0; }
-    void decode_stats_begin() { counts0_ = rt_.session().expert_counts(); }
-    int max_window() const { return 1; }
+    void decode_state_begin() {
+        draws_ = 0;
+        n_draft_ = 0;
+        cum_ = basalt::core::DraftCumAdapt{};
+        drafts_.assign((size_t) max_window(), 0);
+        conf_.assign((size_t) max_window(), 0.0f);
+    }
+    void decode_stats_begin() {
+        counts0_ = rt_.session().expert_counts();
+        draft_log_ = basalt::core::diagnostics().draft_log.empty() ? nullptr : rt_.draft_log();
+        if (draft_log_ != nullptr) {
+            std::fprintf(draft_log_, "R temp=%g S=%d\n", (double) req_temperature, max_window());
+            std::fflush(draft_log_);
+        }
+    }
+    int max_window() const { return rt_.session().max_window(); }
+    // The drafts stay while the drafter's chance that all of them so far are accepted holds.
+    int draft_window() {
+        int T = 1;
+        float all = 1.0f;
+        const int most = (int) std::min<int64_t>(max_window(), runtime_.o.max_context - p);
+        while (T < most && T - 1 < n_draft_) {
+            all *= conf_[(size_t) T - 1];
+            if (all < cum_.th()) break;
+            ++T;
+        }
+        return T;
+    }
+    void lookup_window(int&, bool&, int&) {}
+    void fill_drafts(int T, bool) {
+        for (int i = 1; i < T; ++i) window[(size_t) i] = drafts_[(size_t) i - 1];
+    }
     int before_window(int, int64_t) { return 0; }
     int32_t* history_stage() {
-        history_.resize((size_t) hist_n);
+        history_.resize((size_t) max_window() * hist_n);
         return history_.data();
     }
     void upload_history(int) {}
@@ -328,28 +364,72 @@ public:
         d.tokens = window.data();
         d.n_tokens = T;
         d.pos = p;
-        d.next_token = outv.data();
+        (T > 1 ? d.row_tokens : d.next_token) = outv.data();
         d.sampling = &req_sp;
         d.history = hist_n > 0 ? history_.data() : nullptr;
         d.history_len = hist_n;
-        req_sp.counter = draws_++;
+        req_sp.counter = draws_;
         const basalt::model::Result r = rt_.session().decode_window(d);
         if (!r.ok()) error_ = r.message;
         return r.ok();
     }
+    bool take_held(int) { return false; }
     bool window_failed() const { return false; }
     const char* window_error() const { return error_.c_str(); }
+    void relax_note_forced(int) {}
+    int accept_drafts(int T) {
+        int a = 0;
+        while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+        return a;
+    }
     bool resample_row(int row, int64_t, const std::vector<float>& bias, int32_t& tok, std::string& e) {
         const basalt::model::Result r = rt_.session().resample_row(row, bias.data(), tok);
         if (!r.ok()) e = r.message;
         return r.ok();
     }
     bool copy_logits(int, float* out) { return rt_.session().copy_logits(out).ok(); }
+    bool after_accept(int, int&, int, bool, bool, bool, bool& hold) {
+        hold = false;
+        return true;
+    }
+    void note_draft_probs(bool) {
+        window_conf_.assign(conf_.begin(), conf_.begin() + n_draft_);
+    }
     void stamp_before_commit() {}
-    bool commit(int, std::string&, int) { return true; }
+    // each row's pick is the draw of its own index, whatever the width of the window
+    bool commit(int keep, std::string&, int phase) {
+        if (phase == 2) draws_ += (uint64_t) keep;
+        return true;
+    }
     void on_token(int32_t) {}
     void count_round() {}
-    void window_timing(int, int, bool, Clock::time_point, Clock::time_point, Clock::time_point, Clock::time_point) {}
+    // The next window's drafts start before this window's tokens go out, which run in their shadow.
+    template <class After>
+    bool draft_next(int T, int a, int, int, bool, bool, bool will_draft, After& after_launch) {
+        cum_.observe_chances(conf_.data(), T - 1, a);
+        n_draft_ = 0;
+        if (!will_draft || max_window() < 2) return true;
+        if (basalt::model::Result r = rt_.session().draft_begin(outv[(size_t) a], p + a + 1); !r.ok()) {
+            if (r.status == basalt::model::Status::NotImplemented) return true;
+            runtime_.err = r.message;
+            return false;
+        }
+        after_launch();
+        if (basalt::model::Result r = rt_.session().draft_end(drafts_.data(), conf_.data(), max_window() - 1, n_draft_); !r.ok()) {
+            runtime_.err = r.message;
+            return false;
+        }
+        return true;
+    }
+    bool draft_fatal() const { return false; }
+    void window_timing(int T, int a, bool, Clock::time_point round0, Clock::time_point tw0, Clock::time_point tw1, Clock::time_point) {
+        if (draft_log_ == nullptr) return;
+        const auto msd = [](Clock::time_point x, Clock::time_point y) { return std::chrono::duration<double, std::milli>(y - x).count(); };
+        std::fprintf(draft_log_, "W %d %d 0 %.3f %.3f %.3f", T, a, msd(round0, tw0), msd(tw0, tw1), msd(tw1, Clock::now()));
+        for (float c : window_conf_) std::fprintf(draft_log_, " %.4f", (double) c);
+        std::fputc('\n', draft_log_);
+    }
+    void observe_policy(bool, int, int, int, Clock::time_point) {}
     void mark_after_window() {}
     void mark_loop_end() {}
     void shed_low() { rt_.SessionRuntime::shed_if_low(); }
@@ -421,6 +501,11 @@ private:
     std::vector<Block> blocks_;
     std::vector<int32_t> history_;
     uint64_t draws_ = 0;
+    std::vector<int32_t> drafts_;
+    std::vector<float> conf_, window_conf_;
+    int n_draft_ = 0;
+    basalt::core::DraftCumAdapt cum_;
+    FILE* draft_log_ = nullptr;
     basalt::model::ModelSession::ExpertCounts counts0_;
     std::string error_;
     size_t next_block_ = 0;
