@@ -37,23 +37,6 @@ bool cpu_avx512_ok() {
     return ok;
 }
 
-bool cpu_avx512bw_ok() {
-    static const bool ok = [] {
-        unsigned r[4] = {0, 0, 0, 0};
-        auto cpuid = [&](unsigned leaf, unsigned sub) { platform::cpuid(leaf, sub, r); };
-        cpuid(0, 0);
-        if (r[0] < 7) return false;
-        cpuid(1, 0);
-        if (!((r[2] >> 27) & 1u)) return false;             // OSXSAVE
-        const unsigned long long xcr0 = platform::xgetbv0();
-        if ((xcr0 & 0xE6) != 0xE6) return false;          // the OS saves the AVX-512 state
-        cpuid(7, 0);
-        const unsigned ebx = r[1];
-        return ((ebx >> 16) & 1u) && ((ebx >> 17) & 1u) && ((ebx >> 30) & 1u) && ((ebx >> 31) & 1u);
-    }();
-    return ok;
-}
-
 bool cpu_avx2_ok() {
     static const bool ok = [] {
         if (cpu_isa_cap() < 2) return false;
@@ -112,15 +95,6 @@ bool cpu_avx1_ok() {
         if (!((r[2] >> 27) & 1u) || !((r[2] >> 28) & 1u)) return false;   // OSXSAVE, AVX
         const unsigned long long xcr0 = platform::xgetbv0();
         return (xcr0 & 0x6) == 0x6;
-    }();
-    return ok;
-}
-
-bool cpu_sse42_ok() {
-    static const bool ok = [] {
-        unsigned r[4] = {0, 0, 0, 0};
-        platform::cpuid(1, 0, r);
-        return ((r[2] >> 20) & 1u) && ((r[2] >> 23) & 1u);   // SSE4.2, POPCNT
     }();
     return ok;
 }

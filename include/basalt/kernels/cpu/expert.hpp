@@ -63,10 +63,6 @@ struct CpuFeatures {
 };
 CpuFeatures cpu_features();
 
-/// Exits with a clear message if the CPU cannot run `s2_expert_vnni`.  Called once at startup, so a user on an
-/// older CPU learns why at second zero instead of seeing an illegal instruction at token 4000.
-void cpu_require_expert_support();
-
 /// `x` -> `a` in the configured contract. The function name is historical;
 /// `n` must be a multiple of QKA and at most H. No allocation occurs.
 void act_quant_q8_1(const float* x, int n, ActQ& a);

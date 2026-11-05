@@ -336,7 +336,6 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
     src/models/qwen4exp/kernels/native_rope.cu
     src/models/qwen4exp/kernels/native_ple_postops.cu
     src/models/qwen4exp/kernels/native_qsa_indexer.cu
-    src/models/qwen4exp/kernels/native_qsa_score.cu
     src/models/qwen4exp/kernels/qsa_dec_fused.cu
     src/models/qwen4exp/kernels/q5k_head.cu
     src/models/qwen4exp/kernels/q6k_head.cu

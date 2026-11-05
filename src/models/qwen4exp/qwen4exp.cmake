@@ -24,7 +24,6 @@ add_library(model_qwen4exp_kernels STATIC
   src/models/qwen4exp/kernels/native_rope.cu
   src/models/qwen4exp/kernels/native_ple_postops.cu
   src/models/qwen4exp/kernels/native_qsa_indexer.cu
-  src/models/qwen4exp/kernels/native_qsa_score.cu
   src/models/qwen4exp/kernels/ple.cu
   src/models/qwen4exp/kernels/kv_q8.cu
   src/models/qwen4exp/kernels/kv_stream.cu

@@ -33,8 +33,6 @@ struct NativeFmt {
     float swiglu_limit = 0.f;           ///< > 0: gate capped at it and up clamped to +-it before the product
 };
 
-/// Whether this build has the ggml dot-product path.
-bool native_experts_available() noexcept;
 /// Fills `f` for a layer (`swiglu_limit`: the model's SwiGLU limit, 0 for none); false (with a reason) when there is no
 /// dot product for a type.
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err,
