@@ -19,7 +19,7 @@ class Dialect:
     def effort_level(self, level):
         """The frontend's reasoning level (low, medium, high, max or a number) as this model's template takes it."""
         if isinstance(level, int):
-            raise ValueError(f"unknown reasoning effort {level!r}: use none, low, medium or high")
+            raise ValueError(f"unknown reasoning effort {level!r}: use none, low, medium, high or max")
         return "xhigh" if level in ("high", "max") else level
 
     def template(self, path):

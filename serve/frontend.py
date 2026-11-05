@@ -73,7 +73,7 @@ def effort_kwargs(value) -> dict:
     if key.isdigit() and 1 <= int(key) <= 100:   # the dialect takes a number or refuses it
         return {"reasoning_effort": int(key)}
     if key not in EFFORT:
-        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high")
+        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium, high or max")
     level = EFFORT[key]
     return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
 
