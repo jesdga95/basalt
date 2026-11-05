@@ -60,6 +60,10 @@ __global__ void k_copy_words(const int* src, int* dst, int n) {
     for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
 }
 
+__global__ void k_copy_row(const float4* __restrict__ src, float4* __restrict__ dst, int n) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
+}
+
 constexpr int kArgmaxBlocks = 64;
 struct ArgmaxWs {
     float val[kArgmaxBlocks];
@@ -139,6 +143,10 @@ void argmax_rows(const float* x, int n_rows, int n, int32_t* out, void* ws, void
 
 void copy_words(const void* src, void* dst, int n_words, void* stream) {
     k_copy_words<<<1, 64, 0, (cudaStream_t) stream>>>((const int*) src, (int*) dst, n_words);
+}
+
+void copy_row(const float* src, float* dst, int n, void* stream) {
+    k_copy_row<<<1, 256, 0, (cudaStream_t) stream>>>(reinterpret_cast<const float4*>(src), reinterpret_cast<float4*>(dst), n / 4);
 }
 
 void weighted_sum_row_ptrs(const RowPtrs& rows, const float* w, int n_rows, int n, float* out, void* stream,

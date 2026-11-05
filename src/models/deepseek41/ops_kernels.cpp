@@ -486,8 +486,9 @@ public:
         // promotion copies, and the host sync at the top of each layer orders their reuse
         constexpr unsigned kMapped = cudaHostAllocPortable | cudaHostAllocMapped;
         if (cudaHostAlloc((void**) &h_plan_, sizeof(ExpertPlan), kMapped) != cudaSuccess ||
-            cudaHostAlloc((void**) &h_ids_, 64 * 4, cudaHostAllocPortable) != cudaSuccess ||
-            cudaHostGetDevicePointer((void**) &d_plan_host_, h_plan_, 0) != cudaSuccess) {
+            cudaHostAlloc((void**) &h_ids_, 64 * 4, kMapped) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &d_plan_host_, h_plan_, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &d_ids_host_, h_ids_, 0) != cudaSuccess) {
             err = "deepseek41: cannot allocate the pinned expert staging";
             return false;
         }
@@ -496,15 +497,17 @@ public:
             tier_ = shared.tier;
             h_x_ = shared.h_x;
             h_rows_ = shared.h_rows;
-            if (cudaHostGetDevicePointer((void**) &d_rows_, h_rows_, 0) != cudaSuccess) {
+            if (cudaHostGetDevicePointer((void**) &d_rows_, h_rows_, 0) != cudaSuccess ||
+                cudaHostGetDevicePointer((void**) &d_x_host_, h_x_, 0) != cudaSuccess) {
                 err = "deepseek41: cannot map the expert rows";
                 return false;
             }
             return true;
         }
-        if (cudaHostAlloc((void**) &h_x_, (size_t) kMaxT * g_.n_embd * 4, cudaHostAllocPortable) != cudaSuccess ||
+        if (cudaHostAlloc((void**) &h_x_, (size_t) kMaxT * g_.n_embd * 4, kMapped) != cudaSuccess ||
             cudaHostAlloc((void**) &h_rows_, (size_t) kRows * g_.n_embd * 4, kMapped) != cudaSuccess ||
-            cudaHostGetDevicePointer((void**) &d_rows_, h_rows_, 0) != cudaSuccess) {
+            cudaHostGetDevicePointer((void**) &d_rows_, h_rows_, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &d_x_host_, h_x_, 0) != cudaSuccess) {
             err = "deepseek41: cannot allocate the pinned expert staging";
             return false;
         }
@@ -525,10 +528,10 @@ public:
 
     ExpertTier* expert_tier(std::string& err) override { return ensure_tier(err) ? tier_.get() : nullptr; }
 
+    // Kernels write the mapped ids and activation: no copy-engine job queues behind the copies of experts.
     void routed_stage(int, const float* x, const int32_t* ids, void* stream) override {
-        cudaStream_t st = (cudaStream_t) stream;
-        cudaMemcpyAsync(h_ids_, ids, (size_t) g_.n_used * 4, cudaMemcpyDeviceToHost, st);
-        cudaMemcpyAsync(h_x_, x, (size_t) g_.n_embd * 4, cudaMemcpyDeviceToHost, st);
+        copy_words(ids, d_ids_host_, g_.n_used, stream);
+        copy_row(x, d_x_host_, g_.n_embd, stream);
         kernels::quantize_q8_1_rows(x, 1, g_.n_embd, ex_xq_, stream);
     }
 
@@ -661,8 +664,8 @@ private:
     void *ex_plan_ = nullptr, *d_plan_host_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr;
     float* ex_rows_ = nullptr;
     ExpertPlan* h_plan_ = nullptr;
-    float *h_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr;
-    int32_t *h_ids_ = nullptr, *h_pos_ = nullptr;
+    float *h_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr, *d_x_host_ = nullptr;
+    int32_t *h_ids_ = nullptr, *h_pos_ = nullptr, *d_ids_host_ = nullptr;
     int64_t staged_pos_ = -1;
     std::shared_ptr<ExpertTier> tier_;
     float *sh_g_ = nullptr, *sh_u_ = nullptr, *sh_h_ = nullptr;
