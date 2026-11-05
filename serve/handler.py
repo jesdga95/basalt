@@ -284,17 +284,32 @@ def make_handler(svc: Service):
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
                     loaded = svc.loaded()
-                    model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
-                             "meta": {"n_ctx": svc.engine.max_context},
-                             "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
-                                              "output_modalities": ["text"]}}
-                    if svc.loading:
-                        model["status"] = {"value": "loading"}
-                        loaded = True
-                    elif not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
-                        model["status"] = {"value": "unloaded"}   # listed, loads on use
-                        loaded = True
-                    self._json(200, {"object": "list", "data": [model] if loaded else []})
+                    modalities = ["text", "image"] if svc.vision is not None else ["text"]
+
+                    def entry(model_id, served, ctx=None):
+                        m = {"id": model_id, "object": "model", "status": {"value": "loaded"},
+                             "architecture": {"input_modalities": modalities, "output_modalities": ["text"]}}
+                        if ctx is not None:
+                            m["meta"] = {"n_ctx": ctx}
+                        if served and svc.loading:
+                            m["status"] = {"value": "loading"}
+                        elif served and not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
+                            m["status"] = {"value": "unloaded"}   # listed, loads on use
+                        elif not served:
+                            m["status"] = {"value": "unloaded"}   # a catalog pack: sent here, it loads on use
+                        return m
+
+                    if svc.catalog:                             # every pack on disk, the running one first
+                        data = [entry(e["id"], e["id"] == svc.model,
+                                      svc.engine.max_context if e["id"] == svc.model else None)
+                                for e in svc.catalog]
+                        if svc.model not in [e["id"] for e in svc.catalog]:
+                            data.insert(0, entry(svc.model, True, svc.engine.max_context))
+                    elif loaded or svc.loading or svc.idle_unload_s or getattr(svc.engine, "unloaded", False):
+                        data = [entry(svc.model, True, svc.engine.max_context)]
+                    else:
+                        data = []
+                    self._json(200, {"object": "list", "data": data})
             elif path == "/props":
                 if self._authorized():
                     self._props()
@@ -381,7 +396,7 @@ def make_handler(svc: Service):
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 requested = req.get("model")
-                if not (isinstance(requested, str) and requested in svc.served_names()):
+                if not svc.accept_model(requested):          # a catalog pack is loaded right here, before the request
                     self._unknown_model(path, requested)
                     return
                 svc.request_ctx.path = path

@@ -370,6 +370,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--mock-engine", action="store_true",
                     help="run a scripted engine instead of the model, for clients and tests (no --model needed)")
     ap.add_argument("--model", help="the .basalt model file: the engine, tokenizer, sampling and vision come from it")
+    ap.add_argument("--no-catalog", dest="catalog", action="store_false",
+                    help="serve only --model; by default every .basalt file next to it is listed in /v1/models "
+                         "and a request naming another one swaps the engine to that pack")
     ap.add_argument("--engine-bin", help=argparse.SUPPRESS)      # set by `basalt serve`
     ap.add_argument("--alias", help="the model name the API reports (default: the name stored in the model file)")
     ap.add_argument("--parallel", type=parallel_count, metavar="N",

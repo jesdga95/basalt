@@ -260,6 +260,52 @@ def main() -> int:
     svc.thinking_loop_tokens = a.thinking_loop_tokens
     svc.gpu_indices = gpus_in_play(cfg, engine_args(cfg) if not a.mock_engine else [])   # the cards /metrics reads
     svc.gpu_index = svc.gpu_indices[0]
+    # ── pack catalog: every .basalt next to --model is offered, and naming another one swaps the engine ──
+    if a.model and not a.mock_engine and a.catalog:
+        from serve import catalog as pack_catalog
+        pack_dir = Path(a.model).resolve().parent
+        svc.catalog = pack_catalog.scan(pack_dir)
+        if svc.catalog:
+            print(tagged("catalog", f"{len(svc.catalog)} packs in {pack_dir.name}/: "
+                                    + " | ".join(e["id"] for e in svc.catalog)), flush=True)
+        else:
+            print(tagged("catalog", f"no readable packs in {pack_dir}"), flush=True)
+
+        def prepare_model(path: str) -> dict:
+            """The start-up kit for another pack, built by this start's own rules (model file + GPU + grammar)."""
+            c2 = modelfile.model_config(path, a.engine_bin, vision=vision_arg, engine_words=file_engine + cli_engine)
+            if cfg.get("gpu") is not None:
+                c2["gpu"] = cfg["gpu"]
+                c2["args"] += ["--gpu", ",".join(str(i) for i in range(len(cfg["gpu"])))]
+            if lazy:                                   # the start's lazy rule: text only
+                while (at := flag_index(c2["args"], "--vision-mmproj")) is not None:
+                    del c2["args"][at:at + 2]
+                c2.pop("vision", None)
+            t2 = Path(c2["tokenizer"])
+            if not (t2 / "vocab.json").exists():
+                fail(f"{path}: tokenizer missing ({t2 / 'vocab.json'})")
+            import tokenizer as ST
+            vocab = json.loads((t2 / "vocab.json").read_text(encoding="utf-8"))
+            tokens = [None] * len(vocab)
+            for t, i in vocab.items():
+                tokens[i] = t
+            tok2 = ST.Tokenizer(tokens, (t2 / "merges.txt").read_text(encoding="utf-8").split("\n"),
+                                json.loads((t2 / "token_type.json").read_text()))
+            tpl2 = t2 / "chat_template.jinja"
+            env2, vis2 = child_env(c2), None
+            if c2.get("vision"):
+                mode2 = c2["vision"].get("mode")
+                vis2 = (EngineVision(c2["vision"]) if mode2 == "dynamic"
+                        else Vision(c2["vision"], log=open(c2["log"], "a", encoding="utf-8") if c2.get("log") else None,
+                                    env=vision_env(env2, mode2)))
+            args2 = engine_args(c2) + gwords
+            return {"engine_bin": c2["engine_bin"], "args": args2, "tokenizer": tok2,
+                    "template": ChatTemplate(tpl2 if tpl2.exists() else ROOT / "serve/chat_template.jinja"),
+                    "name": c2.get("model_name") or Path(path).stem, "vision": vis2,
+                    "model_path": path, "log": c2.get("log"), "env": env2,
+                    "max_context": int(flag_value(args2, "--max-context") or 4096)}
+
+        svc.prepare_model = prepare_model
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
     svc.start_idle_sleep()

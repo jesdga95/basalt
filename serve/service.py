@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Iterator
 
+from serve import catalog
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.engine.mock import Engine
 from serve.frontend import ChatTemplate, Event, OutputParser, images_of, literal_tags, mark_think_literals, unmark_think_literals
@@ -70,6 +71,8 @@ class Service:
     load_kind = "weights"                               # what the running load is: "weights" or "wake"
     on_loaded = None                                    # called after each weights load or wake this service ran
     boot_error = None                                   # the start-up load's failure, for the requests queued behind it
+    catalog: list = []                                  # every pack on disk: serve --catalog fills it
+    prepare_model = None                                # path -> that pack's start-up kit; server.py injects it
 
     def served_names(self) -> list[str]:
         """The model names a request may use: the one /v1/models lists, and the model file's own name."""
@@ -78,6 +81,68 @@ class Service:
         if isinstance(path, str) and path:
             names.append(path.replace("\\", "/").rsplit("/", 1)[-1])
         return names
+
+    def accept_model(self, name) -> bool:
+        """True when a request may use this model name. A different pack in the catalog is loaded first."""
+        if isinstance(name, str) and name in self.served_names():
+            return True
+        if not isinstance(name, str) or not name or self.prepare_model is None:
+            return False
+        if catalog.find(self.catalog, name) is None:
+            return False
+        try:
+            self.switch_model(name)
+            return True
+        except Exception as e:
+            print(f"[server] switch to {name!r} failed: {e}", flush=True)
+            return False
+
+    def switch_model(self, name: str) -> str:
+        """Load another pack from the catalog, swapping the one engine this server runs. One pack at a time:
+        the old engine is unloaded first, so the swap costs a full weights load."""
+        target = catalog.find(self.catalog, name)
+        if target is None or target["id"] == self.model:
+            return self.model
+        with self.fifo:
+            if target["id"] == self.model:              # a request we waited behind already switched
+                return self.model
+            with self.status_lock:
+                if self.status.get("busy") or self.status.get("queued"):
+                    raise ModelBusy("a request is running or queued")
+            spec = self.prepare_model(target["path"])
+            old, old_spawn = self.model, self.engine.spawn
+            print(f"[server] switching the model: {old} -> {spec['name']}", flush=True)
+            try:
+                if self.engine.alive():
+                    self.engine.unload()                # give the VRAM back before the next pack takes it
+            except Exception as e:
+                print(f"[server] couldn't unload {old} first ({e}); carrying on", flush=True)
+            if self.vision is not None and hasattr(self.vision, "unload"):
+                try:
+                    self.vision.unload()
+                except Exception:
+                    pass
+            self.engine.spawn = (spec["engine_bin"], list(spec["args"]), old_spawn[2],
+                                 spec.get("log") or old_spawn[3], spec.get("env") or old_spawn[4])
+            self.engine.model_path = spec["model_path"]
+            self.engine.max_context = spec["max_context"]
+            self.tok, self.template = spec["tokenizer"], spec["template"]
+            self.vision = spec.get("vision")
+            self.model = spec["name"]
+            self.stop_ids = set(self.tok.encode(IM_END, parse_special=True) +
+                                self.tok.encode("<|endoftext|>", parse_special=True))
+            try:
+                self.engine.restart(tries=1)            # blocks until READY: tens of seconds to minutes
+            except Exception:
+                self.engine.spawn, self.model = old_spawn, old
+                raise
+            print(f"[server] switch done: {self.model}", flush=True)
+            if self.on_loaded:
+                try:
+                    self.on_loaded()
+                except Exception:
+                    pass
+        return self.model
 
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
