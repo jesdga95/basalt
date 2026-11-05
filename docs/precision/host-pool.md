@@ -44,8 +44,9 @@ A session within 8192 cells below the crossover prefaults its first pool: the re
 first pin's pages are committed and written with zeros on a background thread that makes no device call, under the
 same keep as the take. The take waits for the writer and registers that layout in place. The bytes a pool holds when
 it is first read are unchanged (new pages are zero either way); only when the OS backs them moves. Admission and the
-take count the prefaulted bytes as free, since the pin reuses them; the RAM guard's shed, a shallower request, a deep
-request refused for RAM and RAM homes that would not fit release them. `kv_host_pool_stub_test` covers the layout
+take count the prefaulted bytes as free, since the pin reuses them; the RAM homes count the bytes the writer has not
+reached yet as taken. The RAM guard's shed, a shallower request, a deep request refused for RAM and RAM homes that
+would not fit beside the whole pool release them. `kv_host_pool_stub_test` covers the layout
 reuse, a refused pin's fallback and a release while writing; `kv_host_grow_test` runs its checks over a prefaulted
 pool too, and `--pin-bench POWER_W` times the first pin of a 131072-cell pool from fresh and prefaulted pages.
 

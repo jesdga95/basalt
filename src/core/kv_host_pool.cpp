@@ -24,6 +24,7 @@ struct KvHostPool::Ahead {
     std::thread writer;
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> written{0};
+    uint64_t bytes = 0;                 // the committed total the writer writes
     double ms = 0;                      // the writer's own time, set before it returns
     std::vector<std::pair<uint8_t*, uint64_t>> committed;   // per registration, in its order
     const QsaState* first = nullptr;    // the layers it was laid out for
@@ -217,6 +218,7 @@ bool KvHostPool::prefault(const SessionState& s, const ModelGeometry& g, int64_t
     ahead_->layers = s.qsa_alloc;
     ahead_->max_cells = s.max_cells;
     ahead_->committed = ranges;
+    for (const auto& r : ranges) ahead_->bytes += r.second;
     try {
         ahead_->writer = std::thread(write_pages, &ahead_->stop, &ahead_->written, &ahead_->ms, std::move(ranges),
                                      page_bytes_);
@@ -232,6 +234,8 @@ bool KvHostPool::prefault(const SessionState& s, const ModelGeometry& g, int64_t
 uint64_t KvHostPool::prefaulted_bytes() const {
     return ahead_ != nullptr ? ahead_->written.load(std::memory_order_relaxed) : 0;
 }
+
+uint64_t KvHostPool::prefault_bytes() const { return ahead_ != nullptr ? ahead_->bytes : 0; }
 
 double KvHostPool::prefault_wait() {
     if (ahead_ == nullptr) return 0;

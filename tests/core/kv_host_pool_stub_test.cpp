@@ -176,6 +176,7 @@ void run(bool int8, bool q4) {
     CHECK(ahead.prefault(ss, g, 1001, err) && ahead.prefaulting() && !ahead.valid() && pins.empty());
     (void) ahead.prefault_wait();
     const uint64_t written = ahead.prefaulted_bytes();
+    CHECK(written == ahead.prefault_bytes() && written > 0);   // the writer reached the committed total
     const auto laid = c::arrays_of(ahead.layer(0));
     c::KvHostPool taken(std::move(ahead));
     CHECK(!ahead.prefaulting() && taken.prefaulting());
@@ -202,7 +203,7 @@ void run(bool int8, bool q4) {
     ahead.release();
     CHECK(ahead.prefault(ss, g, 16387, err));
     ahead.release();
-    CHECK(!ahead.prefaulting() && !ahead.valid() && pins.empty());
+    CHECK(!ahead.prefaulting() && !ahead.valid() && pins.empty() && ahead.prefault_bytes() == 0);
     identity = 0;
     CHECK(!ahead.prefault(ss, g, 1001, err) && !ahead.prefaulting());
     identity = 1;

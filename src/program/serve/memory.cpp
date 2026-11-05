@@ -126,11 +126,14 @@ bool Runtime::home_given_up(int64_t live, std::string& e, bool partial) {
     }
     if (give.empty()) return true;
     const size_t wanted = give.size();
-    // a prefaulted host K/V pool gives its RAM to the homes when they need it
+    // a prefaulted host K/V pool gives its RAM to the homes when they need it; the pages its writer has not reached
+    // yet still read as free, so they count as taken (the counter first: a room read after it is not higher)
     if (kv_ahead.prefaulting()) {
+        const uint64_t written = kv_ahead.prefaulted_bytes(), total = kv_ahead.prefault_bytes();
+        const uint64_t unwritten = total - std::min(total, written);
         uint64_t need = 0;
         for (const auto& entry : give) need += basalt::kernels::cpu::expert_layout().blob_bytes(entry.first);
-        if (need + serve_growth_bytes(o, g) > src.homes_room()) kv_ahead_drop("RAM homes");
+        if (need + serve_growth_bytes(o, g) + unwritten > src.homes_room()) kv_ahead_drop("RAM homes");
     }
     if (partial) {
         // the highest slots first: the slots that go come before the loan's, and a short read lends the last ones

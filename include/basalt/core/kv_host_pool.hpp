@@ -42,6 +42,8 @@ public:
     bool prefaulting() const { return ahead_ != nullptr; }
     /// RAM a prefault has written so far.
     uint64_t prefaulted_bytes() const;
+    /// RAM a prefault writes in all (its committed pages); 0 without a prefault.
+    uint64_t prefault_bytes() const;
     /// Waits for a prefault's writer; its own time in ms (0 without a prefault).
     double prefault_wait();
     /// Re-registers longer array prefixes at their existing addresses, without moving bytes.
