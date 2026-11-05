@@ -43,7 +43,7 @@ void rope_freq_table(const RopeParams& p, float* out) {
     float low = 0.f, high = (float) (n_dims - 1);
     if (p.ext_factor != 0.f) {
         const auto corr = [&](float n_rot) {
-            return n_dims * logf(p.n_ctx_orig / (n_rot * 2 * (float) M_PI)) / (2 * logf(p.freq_base));
+            return n_dims * logf(p.n_ctx_orig / (n_rot * 2 * 3.14159265358979323846f)) / (2 * logf(p.freq_base));
         };
         low = std::max(0.f, floorf(corr(p.beta_fast)));
         high = std::min((float) (n_dims - 1), ceilf(corr(p.beta_slow)));
