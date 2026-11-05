@@ -1,7 +1,8 @@
 # DeepSeek-V4.1 packs
 
 A `deepseek41` pack runs through the same command, `basalt serve PACK`; the server reads the model's architecture from
-the pack and picks the chat format, tool-call syntax and thinking switch to match.
+the pack and picks the chat format, tool-call syntax and thinking switch to match. The pack is
+`DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS.basalt` on [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt).
 
 - **First start:** the engine deals the experts out in routing order and loads them once per start. One card: as many
   as fit go into a pinned RAM tier, the most routed first, the VRAM slots hold copies of its head, and the rest are read
