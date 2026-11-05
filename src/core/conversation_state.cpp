@@ -1,8 +1,11 @@
 #include "basalt/core/conversation_snapshot.hpp"
+#include "basalt/log.hpp"
+#include "basalt/platform/memory.hpp"
 #include "conversation_checked.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
 
 namespace basalt::core {
@@ -201,9 +204,10 @@ ConversationCheckpointDeferral::~ConversationCheckpointDeferral() {
     if (worker_.joinable()) worker_.join();
     if (stream_) cudaStreamDestroy(static_cast<cudaStream_t>(stream_));
     if (spare_) cudaFree(spare_);
+    if (pinned_) cudaFreeHost(pinned_);
 }
 
-bool ConversationCheckpointDeferral::reserve(size_t bytes, std::string& error) {
+bool ConversationCheckpointDeferral::reserve(size_t bytes, std::string& error, std::optional<uint64_t> pin_budget) {
     if (spare_ || !bytes) return true;
     cudaStream_t s = nullptr;
     if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) {
@@ -216,6 +220,22 @@ bool ConversationCheckpointDeferral::reserve(size_t bytes, std::string& error) {
         cudaStreamDestroy(s);
         return fail(error, "cannot allocate the deferred checkpoint buffer");
     }
+    // The host copy goes through page-locked memory: a copy into a pageable vector holds the CUDA driver for its whole
+    // duration and stalls the next call of the request thread.  Like every page-locked allocation it is taken only
+    // from the RAM beyond the margin; without it the copy goes to the pageable bytes.
+    bool known = true;
+    const uint64_t budget = pin_budget ? *pin_budget : basalt::platform::ram_budget(&known);
+    const char* refused = nullptr;
+    if (known && bytes > budget) {
+        refused = "the RAM budget does not cover it";
+    } else if (cudaHostAlloc(&pinned_, bytes, cudaHostAllocDefault) != cudaSuccess) {
+        cudaGetLastError();
+        pinned_ = nullptr;
+        refused = "the driver refused it";
+    }
+    if (refused != nullptr)
+        basalt::log::warn("basalt serve", "the deferred checkpoint copy has no page-locked buffer (%s): it copies "
+                          "into pageable memory", refused);
     stream_ = s;
     cap_ = bytes;
     return true;
@@ -238,6 +258,8 @@ bool ConversationCheckpointDeferral::save(ConversationCheckpoint& c, const Sessi
             !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error) ||
             !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
     }
+    // the helper's stream is non-blocking: the copy into the spare buffer is complete before it reads it
+    if (!sync(error)) return false;
     int dev = 0;
     cudaGetDevice(&dev);
     dst_ = c.gdn.data();
@@ -245,8 +267,9 @@ bool ConversationCheckpointDeferral::save(ConversationCheckpoint& c, const Sessi
     worker_ = std::thread([this, dev, n = z.gdn] {
         cudaSetDevice(dev);
         auto s = static_cast<cudaStream_t>(stream_);
-        int st = cudaMemcpyAsync(const_cast<void*>(dst_), spare_, n, cudaMemcpyDeviceToHost, s);
+        int st = cudaMemcpyAsync(pinned_ ? pinned_ : const_cast<void*>(dst_), spare_, n, cudaMemcpyDeviceToHost, s);
         if (st == cudaSuccess) st = cudaStreamSynchronize(s);
+        if (st == cudaSuccess && pinned_) std::memcpy(const_cast<void*>(dst_), pinned_, n);
         status_ = st;
     });
     return true;

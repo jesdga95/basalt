@@ -104,8 +104,9 @@ struct Context {
 
 // Host RAM a server takes while it serves, beyond what it holds once ready: the conversation checkpoints (the solo
 // session's and those a batch slot keeps, each the whole running state), the parked conversations, one image's
-// host buffers at the largest canvas and a running request's own buffers.  The RAM copy of the experts leaves this
-// free beside the margin, so serving stays above the RAM guard.
+// host buffers at the largest canvas, a running request's own buffers and the page-locked buffer the deferred
+// checkpoint copy goes through.  The RAM copy of the experts leaves this free beside the margin, so serving stays
+// above the RAM guard.
 uint64_t serve_growth_bytes(const Options& o, const basalt::core::ModelGeometry& g);
 
 // Serves until QUIT or stdin closes; returns the process exit code.
