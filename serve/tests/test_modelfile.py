@@ -114,11 +114,6 @@ class Peer(Tmp):
         self.assertIn("vision", cfg)
         self.assertIn("--vision", cfg["args"])
 
-    def test_a_spec_reads_its_settings_from_its_words(self):
-        spec = modelfile.ModelSpec("m", engine_words=("--kv", "q8", "--max-context", "8192", "--batch", "4"))
-        self.assertEqual((spec.kv, spec.max_context, spec.parallel), ("q8", 8192, 4))
-        self.assertEqual(modelfile.ModelSpec("m").max_context, None)
-
     def test_a_spec_alias_names_the_model(self):
         cfg = modelfile.model_config(modelfile.ModelSpec(self.build(), alias="mine"), str(self.engine_bin))
         self.assertEqual(cfg["model_name"], "mine")

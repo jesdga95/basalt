@@ -125,28 +125,13 @@ def vision_config(mf: ModelFile, engine_bin: str, sidecar: bool = True) -> dict:
 
 @dataclass(frozen=True)
 class ModelSpec:
-    """One model the server runs. `engine_words` are its engine flags as given; its KV, context and slots are read
-    from them, so the engine's parser stays the one that decides. `vision`: a GPU number as a string, "cpu" or
-    "dynamic". `gpu`: as --gpu."""
+    """One model the server runs. `engine_words` are its engine flags as given. `vision`: a GPU number as a string, "cpu"
+    or "dynamic". `gpu`: as --gpu."""
     path: str
     alias: str | None = None
     gpu: object = None
     vision: bool | str = False
     engine_words: tuple[str, ...] = ()
-
-    @property
-    def kv(self) -> str | None:
-        return flag_value(list(self.engine_words), "--kv")
-
-    @property
-    def max_context(self) -> int | None:
-        v = flag_value(list(self.engine_words), "--max-context")
-        return int(v) if v else None
-
-    @property
-    def parallel(self) -> int | None:
-        v = flag_value(list(self.engine_words), "--batch")
-        return int(v) if v else None
 
 
 def model_config(spec: ModelSpec, engine_bin: str) -> dict:
