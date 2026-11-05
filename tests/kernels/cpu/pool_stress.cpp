@@ -47,7 +47,6 @@ int main(int argc, char** argv) {
     // the AVX-512 path: whole experts and row parts of one token
     std::vector<std::vector<uint8_t>> blobs(NJ);
     std::vector<float> x(kWidth, 0.25f);
-    cpu::ActQ act;
     // the native path: an IQ2_S gate/up + IQ4_NL down layer, two tokens on the odd experts
     cpu::NativeFmt fmt;
     std::vector<uint8_t> nact((size_t) 2 * cpu::kNativeActBytes);

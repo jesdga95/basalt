@@ -44,7 +44,6 @@ int run(int type, int T, bool bench, dstest::Verdict& v) {
     Dev<uint8_t> dw(w.size());
     dw.up(w);
     Dev<float> da(attn);
-    AttnOutWeights aw{dw.p, type, nullptr, 0};
     const size_t xq_bytes = attn_out_scratch_bytes(T);
     Dev<uint8_t> xq(xq_bytes);
     Dev<float> oa_new((size_t) T * kAttnGroups * kAttnOutRank), oa_ref((size_t) T * kAttnGroups * kAttnOutRank);
