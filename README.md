@@ -68,6 +68,7 @@ It runs through the same command; what it supports and how it uses the memory: [
 ## Docs
 
 - [Configuration](docs/configuration/index.md): every setting.
+- [Models](docs/models.md): what each model supports and its limits.
 - [Models and the router](docs/configuration/models.md): one model or several behind one address.
 - [Running](docs/running.md): parallel requests, prompt chunks, memory floors, image input.
 - [DeepSeek-V4.1](docs/deepseek41.md): memory, long prompts, drafting.
