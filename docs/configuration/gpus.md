@@ -1,5 +1,7 @@
 # GPUs
 
+Flash-Next uses every mechanism on this page. DeepSeek takes one second card as an expert tier and nothing else.
+
 One setting picks the cards: `gpu`. It means the same in the server (`"gpu"` in the config's `server` section, or
 `--gpu`), in `basalt` itself, in `basalt-bench` and in `basalt-probe`.
 
@@ -26,7 +28,7 @@ expert tier`:
   computes its experts' share of each prompt chunk: of any chunk when it is as fast as the main card, of chunks up to
   2,559 rows when it is slower (a slower card costs a longer chunk more than the experts it saves the main card's link).
   When its memory is faster than the main card's it takes a share of each GDN mixer and of the head (one start line
-  each; see [the GDN split](../precision/gdn-split.md)).
+  each; see [the GDN split](../precision/qwen38-flash-next.md#gdn-split-across-two-cards)).
 - **Idle.** The engine runs up to three expert tiers: a fifth card and later ones stay idle.
 
 Three or more cards are community-tested: the path is checked here on two cards, with two expert tiers sharing the
@@ -48,51 +50,41 @@ there is no choice: nothing is priced and no other card is used or even visible 
   of each window; the last card holds the head. The experts no card holds are read from one pinned RAM copy that all
   stages share (the resident RAM mode, as in the tier), and each card's adaptive swaps stay within its own layers.
 - **Layer split of alike cards, overlapped windows**: with two cards, a server and the drafter, one conversation at a
-  time, the split also overlaps consecutive windows. Once the first card has served window K and the drafter's chain
-  holds a draft past it, the first card commits K as if every row were kept and starts window K+1 from the guess that K
-  is accepted whole, while the second card still verifies K. A guess that holds sends K+1 on to the second card at once;
-  one that fails puts the first card's state back and runs the window again, so the text is the same either way. The
-  price of the split does not count the overlap. The engine log prints `pipelined windows: N launched, M held` per
-  request.
+  time, the split also overlaps consecutive windows. The first card starts window K+1 from the
+  guess that K is accepted whole while the second card still verifies K. A guess that holds sends K+1 on at once; one that fails
+  puts the first card's state back and runs the window again, so the text is the same either way. The price of the split does not
+  count the overlap. The engine log prints `pipelined windows: N launched, M held` per request.
 - **Tensor parallel**: every layer is split across the cards. It is priced and not built: the dense part is a third of
   a window's bytes, so splitting it saves about 2 ms between two cards and the exchanges between the cards (host-staged,
   about 5.4 us per 10 KiB) cost about as much; the expert tier already shares the experts.
 
 Only cards that match (memory bandwidth and VRAM within 10%) may pick a mechanism other than the expert tier, and only
 when it prices at least 5% below it. Unlike cards always use the expert tier. The prices are estimates fitted to
-measured windows (a 5090 with a 5060 Ti: tier 7.9 ms, plain layer split 13.4-13.7 ms measured at the cuts
-tried; two 5080s: 147 tok/s reported against 141 priced), good for the choice and not for forecasting a rate.
+measured windows (an RTX 5090 with an RTX 5060 Ti: tier 7.9 ms, plain layer split 13.4-13.7 ms measured at the cuts
+tried; two RTX 5080s: 147 tok/s reported against 141 priced), good for the choice and not for forecasting a rate.
 
 ## Long prompts across the cards
 
-In the expert tier, a long fresh part of a prompt can be read as a pipeline over the main card and the tier cards while
-no other conversation decodes (with `--parallel`, while every other slot is idle). The main card reads the first layers
-of each chunk and hands the chunk on; each tier card reads the next block of layers of it while the cards before it read
-the next chunks, the last one ending at the last layer. The main card reads the last chunk's later layers itself once
-the tier cards have given their layers' state back and got their experts back. A tier card's weights, prompt state and
-buffers go into its tier's last slots for the read (its weights from a pinned RAM copy made at start), so outside a
-prompt the tiers hold what they held before and decode does not change. The engine prices each part on the main card
-alone and over every number of stages and every set of cuts, from each card's memory bandwidth, the probed link rates
-(each card's alone and all the cards' at once, which a shared switch or the RAM can hold below their sum) and the
-experts each card holds, and reads it across the cards only when that is at least 5% cheaper. Tier cards join in
-order of memory bandwidth, the fastest reading the last layers. At start each card gets the layers the stage counts
-worth it for a prompt of the context's length (up to 131,072 tokens) give it, plus a few. The start and request lines
-begin with `prompt split:` and print the prices; a part longer than one chunk that stays on the main card says why
-(`prompt split: N tokens read on CUDA0 (...)`). The chunks are the main card's own, so a part of one chunk (up to
-32,768 tokens) stays on the main card. The draft layer's rows of the prompt's last cells come back from the last card in
-the hand-off buffers (the last two chunks handed on where they came in, earlier ones past the chunk in both), so the
-smaller chunks of a deep prompt, whose KV leaves the main card fewer slots to lend, still split. With a slower tier card, a chunk short enough to be read
-routed-only with that card computing its experts' rows of it in a main-card read stays on the main card (the split would
-give that share up); with matched cards, a chunk under 4,096 tokens does. On three or more cards it runs when they all match (memory bandwidth and VRAM
-within 10%); on three or more unlike cards it is off until measured on such a set, and the start line prints what it
-would cost. Off with `--peer-exclusive`, without the RAM copy of the experts, a
-control vector, experts other than NVFP4 (the price is fitted to those), when RAM or a tier's slots are short, or when a
-tier card keeps under 256 MiB free beside its stage (a read loads its kernels there; `peer-reserve-mib` sets the room).
-Everything that grows with the prompt sits in the lent slots, so a longer prompt that does not fit them is read on the
-main card. A
-prompt that arrives while other slots decode is read on the main card beside them, as before. A much shorter request
-that arrives during a read across the cards gets its turn at the end of the main card's current chunk: the main card
-reads that chunk's later layers itself and the rest of the prompt is read later, as with a main-card read.
+In the expert tier, a long fresh part of a prompt is read as a pipeline over the main card and the tier cards while no other
+conversation decodes (with `--parallel`, while every other slot is idle). The main card reads the first layers of each chunk and
+hands it on; each tier card reads the next block of layers while the cards before it read the next chunks. The main card reads the
+last chunk's later layers itself.
+
+- **Memory:** a tier card's weights (from a pinned RAM copy made at start), prompt state and buffers go into its tier's last slots
+  for the read, so outside a prompt the tiers hold what they held and decode does not change. A prompt too long for the lent slots
+  is read on the main card.
+- **Choice:** the engine prices the main card alone against every number of stages and set of cuts, from each card's memory
+  bandwidth, the probed link rates and the experts each card holds, and splits only when that is at least 5% cheaper. Tier cards
+  join in order of memory bandwidth, the fastest reading the last layers. The start and request lines begin with `prompt split:`
+  and print the prices, and say why a part stays on the main card.
+- **Stays on the main card:** a part of one chunk (up to 32,768 tokens); with a slower tier card, a chunk short enough to be read
+  routed-only; with matched cards, a chunk under 4,096 tokens; a prompt that arrives while other slots decode.
+- **Three or more cards:** it runs when they all match (memory bandwidth and VRAM within 10%). On unlike cards it is off, and the
+  start line prints what it would cost.
+- **Off with** `--peer-exclusive`, without the RAM copy of the experts, with a control vector, with experts other than NVFP4 (the
+  price is fitted to those), when RAM or a tier's slots are short, or when a tier card keeps under 256 MiB free beside its stage
+  (`peer-reserve-mib` sets the room).
+- **A shorter request** that arrives during a read gets its turn at the end of the main card's current chunk.
 
 ## Two 16 GB cards
 
@@ -103,9 +95,3 @@ room for the buffers of that share (about 200 MiB, the size is computed, not a s
 `prefill peer: the peer's buffers do not fit`, raise `peer-reserve-mib` (the card shows a display or another program using
 its VRAM) and the second card's experts shrink by the same amount. The start line `peer GPU 1: N experts` says how many
 it holds.
-
-## The engine log
-
-The server writes the engine's output, the `basalt ...` lines the engine prints at start and while it runs, to
-`~/.cache/basalt/<id>/engine.log`, one folder per model file (`<id>` is 16 hex digits taken from the model file).
-`[server] engine log: PATH` names it when the engine fails to start. The `[server]` lines are the server's own and go to its terminal.
