@@ -60,6 +60,7 @@ struct Pack {
     core::FileRange experts_range;
     EngramInfo engram;
     core::FileRange vision;   ///< the vision/mmproj section (empty when the pack carries none)
+    core::FileRange dspark;   ///< the dspark/gguf section (empty when the pack carries none)
 
     const TensorRef* find(const std::string& n) const {
         auto it = tensors.find(n);

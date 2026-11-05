@@ -89,7 +89,7 @@ struct LoadRequest {
     bool prompt_skip = true;          ///< a prompt's far rows may stop at the layer a model says is the last they matter to
     int vram_reserve_mib = 0;         ///< VRAM the main card leaves free beyond what the model needs (0: none)
     int spec = 0;                     ///< rows a decode window may hold (0 or 1: one)
-    std::string drafter;              ///< the drafter's file (empty: none)
+    bool draft = false;               ///< run the drafter the pack carries, if any
     int drafter_device = -1;          ///< diagnostic: the CUDA device it runs on (-1: the main card)
     bool diag_tier_frozen = false;    ///< diagnostic: the VRAM tier keeps what it holds, no bus copy and no promotion
 };

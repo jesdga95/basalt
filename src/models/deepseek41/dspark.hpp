@@ -24,15 +24,13 @@ struct DsparkDraft {
     float conf[kDsparkBlock];      ///< the confidence head's estimate that token[i] is accepted
 };
 
-/// What makes the GGUF at `path` no drafter this build runs; empty when it is one. Reads the header only.
-std::string drafter_file_problem(const std::string& path);
-
 class DsparkDrafter {
 public:
     ~DsparkDrafter();
 
-    /// Loads the GGUF at `path` onto `device` (weights, a window ring per stage, scratch). Null with `err` set on failure.
-    static std::unique_ptr<DsparkDrafter> create(const DsModel& main, const std::string& path, int device, std::string& err);
+    /// Loads the pack's dspark/gguf section onto `device` (weights, a window ring per stage, scratch). Null with `err` set
+    /// on failure.
+    static std::unique_ptr<DsparkDrafter> create(const DsModel& main, int device, std::string& err);
 
     /// Slot (0..n_target_layers) the main model's layer `il` fills in the feature rows, or -1.
     int feature_slot(int il) const;

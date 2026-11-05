@@ -350,7 +350,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.prompt_skip = !o.no_prompt_skip;
         lreq.vram_reserve_mib = o.vram_reserve_given ? o.vram_reserve_mib : 0;
         lreq.spec = o.spec;
-        lreq.drafter = o.drafter;
+        lreq.draft = o.spec >= 2 && o.spec_oracle.empty();
         lreq.drafter_device = o.drafter_device;
         lreq.diag_tier_frozen = o.diag_tier_frozen;
         const basalt::model::Result r = adapter->load(lreq, loaded);
