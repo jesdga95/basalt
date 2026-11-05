@@ -225,6 +225,8 @@ public:
         (void) o; (void) cards;
         return std::nullopt;
     }
+    /// The verify window a start with these flags runs (0: plain decode), once finish_flags() has run.
+    virtual int planned_spec(const program::CommonOptions& o) const;
     /// The flags the quality gate starts this model with, space separated.
     virtual const char* quality_flags() const { return ""; }
     /// The widest window the gate scores on this model; 0 takes what the request asks.
