@@ -1,8 +1,9 @@
 // src/models/deepseek41/tier.hpp - where the routed experts of a DeepSeek-V4.1 pack live while a token runs.
 //
 // An expert's home is a slot of the main card, a slot of a second card, the pinned RAM tier or the pack file mapped
-// read-only (policy::Homes); the routing order deals them out at the start and they stay. The main card's other slots
-// (shared core::ExpertCache storage, per-layer LRU) hold copies of pinned experts. The GPUs compute the experts they
+// read-only (policy::Homes); the routing order deals them out at the start. The main card's other slots (shared
+// core::ExpertCache storage) hold copies of pinned experts; its homes and copies share a per-layer LRU, and a home that
+// loses its slot goes to RAM, into the place of the expert taking the slot. The GPUs compute the experts they
 // hold; the CPU pool computes the rest from RAM or the mapped file while the GPUs work, and the pinned experts it
 // computed are copied into the main card's LRU on a side stream so the next token finds them there.
 #pragma once
@@ -99,6 +100,8 @@ public:
     /// VRAM tier (side stream, off the token path, in pieces).
     void promote(int layer, const Lookup& lk);
 
+    /// The copies under way land: every expert is in its place. A prompt reads the places, so it comes first.
+    void settle();
     /// Where a resident copy of (layer, e) lives: a main card slot, a second card slot or the pinned RAM tier; all null
     /// when only the file has it. Read-only: no stamp, no promotion.
     struct Source {
@@ -125,8 +128,10 @@ public:
     void probe_env(program::ProbeEnv& env);
 
 private:
+    /// A slot's copy on its way. `out` >= 0: the home it replaces is on its way to RAM place `place`.
     struct Pending {
         int layer, expert, slot, event;
+        int out = -1, place = -1;
     };
     /// A cold pinned expert (victim) replaced by a hot file-backed one (expert), read into the layer's spare slot.
     struct Swap {
@@ -145,8 +150,9 @@ private:
     void finish_swaps();
     void start_swaps();
     void swap_worker();
-    /// Copies (layer, e) from `src` into the least recently used free slot of the layer; the slot, or -1.
-    int32_t claim(int layer, int e, const uint8_t* src, cudaStream_t stream);
+    /// Copies (layer, e) from `src` into the least recently used free slot of the layer; the slot, or -1. With `homes_too`
+    /// that slot may be a home's, when the layer has a free RAM place for it.
+    int32_t claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too = false);
 
     const DsModel& m_;
     core::ExpertCache cache_;

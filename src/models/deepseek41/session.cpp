@@ -119,6 +119,7 @@ public:
 
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
         sync_rewind(r.pos);
+        settle_tier();
         if (r.n_tokens > 1 && std::max(r.total_tokens, r.n_tokens) > prefillp::kStepPrompt) {
             std::string err;
             const int batched = r.n_tokens;
@@ -348,6 +349,7 @@ public:
 
     model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos) override {
         sync_rewind(pos);
+        settle_tier();
         std::string err;
         if (n_rows > prefillp::kShortPrompt) release_short_prompt();
         open_prompt_path(n_rows);
@@ -424,6 +426,10 @@ private:
         if (!t || prefill_) return;
         short_prompt_ = t->has_homes() && n_tokens <= prefillp::kShortPrompt;   // its workspaces fit beside the copies
         if (!short_prompt_) t->shrink();
+    }
+    void settle_tier() {
+        std::string e;
+        if (ExpertTier* t = ops_->expert_tier(e)) t->settle();
     }
     void release_short_prompt() {
         if (!short_prompt_) return;
