@@ -436,6 +436,7 @@ private:
     bool pump(bool may_start);
     bool pipe_drain();
     size_t spill_to_disk(bool at_exit, size_t limit) override;
+    int64_t disk_min_tokens() const override { return 8192; }
     bool probe_adapt(const std::string& cmd, std::string& e);
     int init_prompt();
     int init_verify();

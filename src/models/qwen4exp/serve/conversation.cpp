@@ -443,7 +443,7 @@ bool QfnRuntime::park_one(int b, std::string& e) {
     const bool keep = o.conversation_cache_min_tokens <= 0 ||
                       (int64_t) ids.size() >= o.conversation_cache_min_tokens;
     bool to_ram = keep && capture_admit(est > moved ? est - moved : 0, floor);
-    const bool on_disk = keep && !to_ram && disk.enabled() && (int64_t) ids.size() >= kDiskMinTokens &&
+    const bool on_disk = keep && !to_ram && disk.enabled() && (int64_t) ids.size() >= disk_min_tokens() &&
                          disk_has(ids, imgs, cks, cvec);
     if (!to_ram && !on_disk && keep) {   // said once per idle stretch
         double& noted = b >= 0 ? bs[(size_t) b].park_noted : solo_park_noted;

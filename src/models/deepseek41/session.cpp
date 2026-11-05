@@ -221,6 +221,9 @@ public:
         return {};
     }
 
+    // a read of a few thousand tokens streams every expert over the bus
+    int64_t disk_min_tokens() const override { return 2048; }
+
     ExpertCounts expert_counts() const override {
         std::string e;
         const ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;

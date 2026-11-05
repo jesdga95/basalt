@@ -145,6 +145,7 @@ public:
     void enc_command(const std::string& cmd) override;
     // The conversations the engine holds go to the disk tier when no stored copy reaches them: the RAM tier's at exit,
     // the solo session's and every idle slot's.
+    int64_t disk_min_tokens() const override { return sessions_[0]->disk_min_tokens(); }
     size_t spill_to_disk(bool at_exit, size_t limit) override {
         size_t written = 0;
         if (at_exit)
