@@ -5,7 +5,6 @@ add_library(model_qwen4exp_kernels STATIC
   src/models/qwen4exp/kernels/ngram.cpp
   src/models/qwen4exp/kernels/dec_gdn_rec.cu
   src/models/qwen4exp/kernels/dec_moe.cu
-  src/models/qwen4exp/kernels/s2_gemv.cu
   src/models/qwen4exp/kernels/s_gemv.cu
   src/models/qwen4exp/kernels/router_top10.cu
   src/models/qwen4exp/kernels/rope.cu

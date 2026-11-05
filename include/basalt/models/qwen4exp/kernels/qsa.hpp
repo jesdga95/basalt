@@ -2,7 +2,7 @@
 //
 // Transcribed from `build_layer_attn` / `build_attn_qsa` in the source.  The
 // projections are NOT here: `attn_q`, `attn_k`, `attn_v`, `attn_output`, `indexer.q_proj` and
-// `indexer.k_proj` are the existing `s_gemv`/`s2_gemv` kernels, exactly as `gdn_step` leaves them.  What lives
+// `indexer.k_proj` are the existing `s_gemv` kernels, exactly as `gdn_step` leaves them.  What lives
 // here is everything BETWEEN the projections:
 //
 //     kv_append            the new token's K and V into the paged cache

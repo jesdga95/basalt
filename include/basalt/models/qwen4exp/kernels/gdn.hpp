@@ -2,7 +2,7 @@
 //
 // Transcribed from `build_layer_attn_linear` and
 // `build_delta_net_autoregressive`.  The projections (`wqkv`, `wqkv_gate`, `ssm_out`) are the existing
-// `s_gemv`/`s2_gemv` kernels; what lives here is everything BETWEEN them.
+// `s_gemv` kernels; what lives here is everything BETWEEN them.
 //
 // Geometry of the real artifact (48 layers are GDN, 12 are QSA):
 //

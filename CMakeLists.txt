@@ -296,8 +296,7 @@ target_link_libraries(basalt-load PRIVATE core kernels)
 # Naive first, each with a parity test against a reference that was itself validated against ggml.  The
 # kernels link `artifact` for the scalar dequantizers, because using the VALIDATED scalar path as the
 # reference is the whole point - a kernel checked against another copy of itself proves nothing.
-add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu
-                        src/kernels/cuda/quantize_act.cu
+add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/sampler.cu
                         src/kernels/cuda/elementwise.cu
                         src/kernels/cuda/bf16_gemv.cu
@@ -603,19 +602,6 @@ if(BASALT_GRAMMAR_MODEL AND Python3_Interpreter_FOUND)
   set_property(TEST grammar_batch_test APPEND PROPERTY LABELS gpu)
   set_tests_properties(grammar_batch_test PROPERTIES TIMEOUT 1500)
 endif()
-
-add_executable(dequant_s2_parity tests/kernels/dequant_s2_parity.cpp)
-# The tests are HOST C++ files that call cudaMalloc/cudaMemcpy themselves, so they need the toolkit headers
-# and cudart explicitly: enabling the CUDA language gives those to .cu sources automatically, but a .cpp
-# target is just a C++ target and gets neither.
-target_include_directories(dequant_s2_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(dequant_s2_parity PRIVATE kernels ${_gpu_runtime_target})
-basalt_gpu_test(NAME dequant_s2_parity COMMAND dequant_s2_parity --selftest)
-
-add_executable(s2_gemv_parity tests/models/qwen4exp/kernels/s2_gemv_parity.cpp)
-target_include_directories(s2_gemv_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(s2_gemv_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
-basalt_gpu_test(NAME s2_gemv_parity COMMAND s2_gemv_parity --selftest)
 
 add_executable(iq_parity tests/kernels/iq_parity.cpp)
 target_include_directories(iq_parity PRIVATE ${_gpu_include_directories})
