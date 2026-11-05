@@ -366,6 +366,7 @@ def main() -> int:
                         now=bool(a.mock_engine or a.lazy))
     # SIGTERM takes Ctrl+C's path (QUIT to the engine) so a container stop does not orphan it
     def on_sigterm(signum, frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)   # one stop: a later TERM must not cut the engine's QUIT short
         raise KeyboardInterrupt
     try:
         signal.signal(signal.SIGTERM, on_sigterm)
