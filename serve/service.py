@@ -128,6 +128,8 @@ class Service:
             self.engine.max_context = spec["max_context"]
             self.tok, self.template = spec["tokenizer"], spec["template"]
             self.vision = spec.get("vision")
+            if getattr(self.vision, "in_engine", False):     # dynamic: the new encoder needs the engine's pipe
+                self.vision.attach(self.engine)
             self.model = spec["name"]
             self.stop_ids = set(self.tok.encode(IM_END, parse_special=True) +
                                 self.tok.encode("<|endoftext|>", parse_special=True))
