@@ -92,6 +92,11 @@ public:
                 return false;
             }
             if (progress) progress(off + T);
+            if (stop && stop()) {
+                finish_reads(ahead_);
+                ahead_ = EngramReads{};
+                break;
+            }
         }
         return true;
     }
