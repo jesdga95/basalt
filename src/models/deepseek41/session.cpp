@@ -118,6 +118,7 @@ public:
     }
 
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
+        if (!prefillp::may_resume(r.pos, (int64_t) hist_.size(), whole_from_)) return {model::Status::Error, kSkippedRows};
         sync_rewind(r.pos);
         settle_tier();
         if (r.n_tokens > 1 && std::max(r.total_tokens, r.n_tokens) > prefillp::kStepPrompt) {
@@ -150,7 +151,8 @@ public:
                 prefill_->progress = r.progress;
                 prefill_->live = r.live;
                 prefill_->stop = r.stop;
-                if (!prefill_->run(r.tokens, batched, r.pos, hist_, err)) return prompt_failed(err);
+                if (!prefill_->run(r.tokens, batched, r.pos, r.rows_after, hist_, err)) return prompt_failed(err);
+                if (prefill_->left_rows()) whole_from_ = prefillp::whole_from(r.pos + r.n_tokens + r.rows_after, kWindow);
                 if (!r.more) close_prompt_path();
             }
             return {};
@@ -171,6 +173,7 @@ public:
     size_t running_bytes() const override { return ops_ ? ops_->turn_bytes() : 0; }
 
     model::Result save_running(uint8_t* host, int64_t pos) override {
+        if (!prefillp::may_save(pos, whole_from_)) return {model::Status::Error, kSkippedRows};
         sync_rewind(pos);
         if (!ops_) return {model::Status::NotImplemented, "no state yet"};
         ops_->save_turn(stream_, host);
@@ -180,6 +183,7 @@ public:
     model::Result restore_running(const uint8_t* host, int64_t pos) override {
         if (!ops_) return {model::Status::Error, "no state yet"};
         ops_->restore_turn(stream_, host);
+        whole_from_ = 0;
         if ((int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
         return {};
     }
@@ -349,6 +353,7 @@ public:
     }
 
     model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos) override {
+        if (!prefillp::may_resume(pos, (int64_t) hist_.size(), whole_from_)) return {model::Status::Error, kSkippedRows};
         sync_rewind(pos);
         settle_tier();
         std::string err;
@@ -627,6 +632,7 @@ private:
 
     // A later position than `pos` drops out of the n-gram history.
     void sync_rewind(int64_t pos) {
+        if (pos == 0) whole_from_ = 0;
         if (ops_ && pos == 0) ops_->trim_positions();
         if (pos > 0 && (int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
     }
@@ -636,8 +642,10 @@ private:
     bool step_impl(int32_t token, int64_t pos, bool want_out, int32_t* next, float* logits_out) {
         const size_t n = (size_t) g_.n_embd;
         void* st = stream_;
+        if (!prefillp::may_resume(pos, (int64_t) hist_.size(), whole_from_)) return fail(kSkippedRows);
         if (pos == 0) {
             hist_.clear();
+            whole_from_ = 0;
             ops_->reset();
         }
         if ((int64_t) hist_.size() < pos) return fail("positions must be consecutive from 0 (the session keeps one sequence)");
@@ -784,6 +792,8 @@ private:
     std::vector<void*> allocs_;
     std::vector<int32_t> hist_;
     std::string dump_dir_, err_;
+    int64_t whole_from_ = 0;   ///< the first position to save at or go back to, after a read that left rows short (prefillp::whole_from)
+    static constexpr const char* kSkippedRows = "deepseek41: that position's rows were left short by a prompt read: state is saved or resumed only at a read's stop";
     float *x_ = nullptr, *x2_ = nullptr, *cur_ = nullptr, *normed_ = nullptr, *attn_out_ = nullptr, *moe_out_ = nullptr,
           *sh_out_ = nullptr, *ffn_sum_ = nullptr, *coef_a_ = nullptr, *coef_f_[2] = {nullptr, nullptr},
           *hc_ws_ = nullptr, *rlogits_ = nullptr, *rw_ = nullptr, *logits_ = nullptr, *rows_dev_ = nullptr,

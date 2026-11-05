@@ -257,21 +257,27 @@ public:
 
     bool attention_batch(int il, int64_t pos0, int n_tokens, const int32_t*, const float* x, float* out, int,
                          void* stream, std::string& err) override {
-        if (!ensure_positions(pos0 + n_tokens, err)) return false;
-        if (!batch_) {
-            AttnCaches c;
-            c.ring = &ring_;
-            c.comp_kv = &comp_kv_;
-            c.comp_ik = &comp_ik_;
-            c.st_kv = &st_kv_;
-            c.st_sc = &st_sc_;
-            c.freq[0] = freq_[0];
-            c.freq[1] = freq_[1];
-            c.rope = rope_;
-            batch_ = make_attn_batch(m_, c, kMaxChunk, ctx_, err);
-            if (!batch_) return false;
-        }
+        if (!ensure_positions(pos0 + n_tokens, err) || !ensure_batch(err)) return false;
         return batch_->run(il, pos0, n_tokens, x, out, stream, err);
+    }
+
+    bool ensure_batch(std::string& err) {
+        if (batch_) return true;
+        AttnCaches c;
+        c.ring = &ring_;
+        c.comp_kv = &comp_kv_;
+        c.comp_ik = &comp_ik_;
+        c.st_kv = &st_kv_;
+        c.st_sc = &st_sc_;
+        c.freq[0] = freq_[0];
+        c.freq[1] = freq_[1];
+        c.rope = rope_;
+        batch_ = make_attn_batch(m_, c, kMaxChunk, ctx_, err);
+        return batch_ != nullptr;
+    }
+
+    bool compress_batch(int il, int64_t pos0, int n_tokens, const float* x, void* stream, std::string& err) override {
+        return ensure_positions(pos0 + n_tokens, err) && ensure_batch(err) && batch_->compress_only(il, pos0, n_tokens, x, stream, err);
     }
 
     bool stage_token(int64_t pos, void* stream, std::string& err) override {

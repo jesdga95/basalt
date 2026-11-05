@@ -32,6 +32,8 @@ public:
     /// Attention of `layer` over T tokens at pos0.. (x: normed input [T][n_embd]; out: [T][n_embd]). Layers run in order
     /// 0..n-1 for one chunk; the layer-0 call starts a chunk.
     virtual bool run(int layer, int64_t pos0, int n_tokens, const float* x, float* out, void* stream, std::string& err) = 0;
+    /// Only the compressor of a kv-source layer over T tokens: their compressed latents and index keys.
+    virtual bool compress_only(int layer, int64_t pos0, int n_tokens, const float* x, void* stream, std::string& err) = 0;
 };
 
 std::unique_ptr<AttnBatch> make_attn_batch(const DsModel& model, const AttnCaches& caches, int max_tokens, int max_positions,

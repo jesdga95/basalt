@@ -44,6 +44,13 @@ public:
                                       std::string& err);
     virtual bool shared_expert_batch(int layer, int64_t pos0, int n_tokens, const float* x, float* out, int n_embd,
                                      void* stream, std::string& err);
+    /// Only what later layers read of T tokens' attention at `layer`: the compressed latents and index keys, in place of
+    /// attention_batch for rows no later token's attention can reach.
+    virtual bool compress_batch(int layer, int64_t pos0, int n_tokens, const float* x, void* stream, std::string& err) {
+        (void) layer; (void) pos0; (void) n_tokens; (void) x; (void) stream;
+        err = "deepseek41: this layer ops implementation has no batched compressor";
+        return false;
+    }
     /// The expert tier (VRAM slots and the pinned RAM copy), opened on first use; null when this implementation has none.
     virtual ExpertTier* expert_tier(std::string& err) { (void) err; return nullptr; }
     /// Backs the per-position state (the compressed caches) for positions below `positions`; the layer calls need it

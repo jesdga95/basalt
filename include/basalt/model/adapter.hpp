@@ -86,6 +86,7 @@ struct LoadRequest {
     kernels::cpu::PoolAffinity pool_affinity = kernels::cpu::PoolAffinity::All;
     bool pool_affinity_given = false;
     int peer_reserve_mib = 600;       ///< VRAM a second card leaves free
+    bool prompt_skip = true;          ///< a prompt's far rows may stop at the layer a model says is the last they matter to
     int vram_reserve_mib = 0;         ///< VRAM the main card leaves free beyond what the model needs (0: none)
 };
 
@@ -104,6 +105,9 @@ struct PrefillRequest {
     const int32_t* tokens = nullptr;
     int n_tokens = 0;
     int64_t pos = 0;
+    /// Positions between these tokens and the read's stop, -1 unknown. State is saved or resumed only at that stop: a model
+    /// may leave rows further back short of its last layers.
+    int64_t rows_after = -1;
     std::function<void(int)> progress;   ///< optional: called with the tokens of this request read so far
     std::function<void(int)> live;       ///< optional: an estimate of the same, from a driver thread, inside a chunk
     std::function<bool()> stop;          ///< optional: true ends the read at a chunk's end; nothing can continue from there

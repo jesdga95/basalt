@@ -70,6 +70,8 @@ void usage() {
                  "  --vision             --serve takes images too (GENI requests; embeddings from basalt-vision)\n"
                  "  --vision-mmproj PATH --vision, with the image encoder in this process: ENC requests borrow\n"
                  "                       expert-cache slots for the encoder and give them back refilled\n"
+                 "  --no-prompt-skip     a model that stops far prompt rows short runs them through every layer: slower\n"
+                 "                       reads, the same math from the last prompt token on, another batch shape's rounding\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"

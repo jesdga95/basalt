@@ -47,6 +47,12 @@ public:
 
     model::TokenizerSpec tokenizer_spec() const override { return {"tokenizer.ggml.tokens", "deepseek"}; }
 
+    bool parse_flag(const std::string& name, model::FlagArgs&, program::CommonOptions& o, int&) const override {
+        if (name != "--no-prompt-skip") return false;
+        o.no_prompt_skip = true;
+        return true;
+    }
+
     // <｜DSML｜ calls>, <｜DSML｜ invoke name="N">, <｜DSML｜ parameter name="P" string="true|false">
     program::grammar::ToolForm tool_form() const override {
         const std::string dsml = "\xef\xbd\x9c" "DSML\xef\xbd\x9c";

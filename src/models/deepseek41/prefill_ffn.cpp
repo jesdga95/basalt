@@ -110,6 +110,8 @@ public:
         return true;
     }
 
+    void chunk_layers(int n_layers) override { run_layers_ = n_layers; }
+
     bool routed(int il, int T, const float* x, const int32_t* ids, const float* w, float* out, void* stream,
                 std::string& err) override {
         namespace mmq = basalt::prefill::mmq;
@@ -468,7 +470,7 @@ private:
         issued_ = consumed_ = 0;
         if (mx > 0) {
             pf_on_ = true;
-            pf_th_ = std::thread([this, nl] { prefetch_loop(nl); });
+            pf_th_ = std::thread([this] { prefetch_loop(run_layers_); });
         }
         return true;
     }
@@ -628,7 +630,7 @@ private:
             }
             cudaEventRecord(D.done, st);
             ++consumed_;
-            while (issued_ < std::min<int64_t>(consumed_ + prefillp::kAheadSlots, (int64_t) g_.n_layers * G))
+            while (issued_ < std::min<int64_t>(consumed_ + prefillp::kAheadSlots, (int64_t) run_layers_ * G))
                 if (!issue_next(err)) return false;
         }
         weighted_sum_tokens(rows_, w, T, K, g_.n_embd, out, st);
@@ -734,6 +736,7 @@ private:
     cudaStream_t copy_ = nullptr;
     uint64_t launch_ = 0;
     bool ahead_ = false;
+    int run_layers_ = 0;
     int64_t issued_ = 0, consumed_ = 0;
     Stage dstage_[prefillp::kAheadSlots];
     int32_t *tok_all_ = nullptr, *pair_all_ = nullptr, *bnd_ = nullptr;

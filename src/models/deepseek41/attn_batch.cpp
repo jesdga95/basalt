@@ -86,25 +86,7 @@ public:
             err = "deepseek41: the chunk exceeds the compressed cache capacity";
             return false;
         }
-        if (il == 0 || chunk_pos0_ != pos0 || chunk_n_ != T) {
-            // positions, window bounds and visible compressed rows of the whole chunk
-            std::vector<int32_t> pos((size_t) T), start((size_t) T), n((size_t) T), l1((size_t) T), l2((size_t) T);
-            for (int t = 0; t < T; ++t) {
-                const int32_t p = (int32_t) (pos0 + t);
-                pos[(size_t) t] = p;
-                start[(size_t) t] = std::max<int32_t>(0, p - (kWindow - 1));
-                n[(size_t) t] = p - start[(size_t) t] + 1;
-                l1[(size_t) t] = p + 1;
-                l2[(size_t) t] = (p + 1) / 2;
-            }
-            cudaMemcpyAsync(d_pos_, pos.data(), (size_t) T * 4, cudaMemcpyHostToDevice, st);
-            cudaMemcpyAsync(d_start_, start.data(), (size_t) T * 4, cudaMemcpyHostToDevice, st);
-            cudaMemcpyAsync(d_n_, n.data(), (size_t) T * 4, cudaMemcpyHostToDevice, st);
-            cudaMemcpyAsync(d_lim_[0], l1.data(), (size_t) T * 4, cudaMemcpyHostToDevice, st);
-            cudaMemcpyAsync(d_lim_[1], l2.data(), (size_t) T * 4, cudaMemcpyHostToDevice, st);
-            chunk_pos0_ = pos0;
-            chunk_n_ = T;
-        }
+        if (il == 0 || chunk_pos0_ != pos0 || chunk_n_ != T) upload_positions(pos0, T, st);
         for (int s0 = 0; s0 < T; s0 += kSub) {
             const int S = std::min(kSub, T - s0);
             const float* xs = x + (size_t) s0 * kAttnEmbd;
@@ -116,7 +98,38 @@ public:
         return true;
     }
 
+    bool compress_only(int il, int64_t pos0, int T, const float* x, void* stream, std::string& err) override {
+        if (pos0 + T > max_pos_ || T > cap_) {
+            err = "deepseek41: the chunk exceeds the compressed cache capacity";
+            return false;
+        }
+        if (chunk_pos0_ != pos0 || chunk_n_ != T) upload_positions(pos0, T, (cudaStream_t) stream);
+        for (int s0 = 0; s0 < T; s0 += kSub)
+            if (!compress_sub(il, x + (size_t) s0 * kAttnEmbd, d_pos_ + s0, std::min(kSub, T - s0), stream, err)) return false;
+        return true;
+    }
+
 private:
+    // positions, window bounds and visible compressed rows of the whole chunk
+    void upload_positions(int64_t pos0, int T, cudaStream_t st) {
+        std::vector<int32_t> pos((size_t) T), start((size_t) T), n((size_t) T), l1((size_t) T), l2((size_t) T);
+        for (int t = 0; t < T; ++t) {
+            const int32_t p = (int32_t) (pos0 + t);
+            pos[(size_t) t] = p;
+            start[(size_t) t] = std::max<int32_t>(0, p - (kWindow - 1));
+            n[(size_t) t] = p - start[(size_t) t] + 1;
+            l1[(size_t) t] = p + 1;
+            l2[(size_t) t] = (p + 1) / 2;
+        }
+        cudaMemcpyAsync(d_pos_, pos.data(), (size_t) T * 4, cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(d_start_, start.data(), (size_t) T * 4, cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(d_n_, n.data(), (size_t) T * 4, cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(d_lim_[0], l1.data(), (size_t) T * 4, cudaMemcpyHostToDevice, st);
+        cudaMemcpyAsync(d_lim_[1], l2.data(), (size_t) T * 4, cudaMemcpyHostToDevice, st);
+        chunk_pos0_ = pos0;
+        chunk_n_ = T;
+    }
+
     struct Fixed {
         int32_t *dev = nullptr, *host = nullptr;
         int S = -1;
@@ -210,6 +223,35 @@ private:
         return true;
     }
 
+    // The compressed latents and index keys of S tokens of a kv-source layer.
+    bool compress_sub(int il, const float* x, const int32_t* d_pos, int S, void* stream, std::string& err) {
+        const int ratio = g_.compress_ratio[(size_t) il];
+        auto Tn = [&](const char* s) { return m_.tensor(il, s); };
+        const DevTensor *wc = Tn("attn_compressor_kv.weight"), *cn = Tn("attn_compressor_norm.weight");
+        const DevTensor *wg = ratio == 2 ? Tn("attn_compressor_gate.weight") : nullptr;
+        const DevTensor *ik = Tn("indexer.attn_k.weight"), *ikn = Tn("indexer.k_norm.weight");
+        if (!wc || !cn || (ratio == 2 && !wg)) {
+            err = "deepseek41: layer " + std::to_string(il) + " lacks compressor tensors";
+            return false;
+        }
+        CompressArgs ca;
+        ca.ratio = ratio;
+        ca.rms_eps = g_.rms_eps;
+        ca.n_embd = kAttnEmbd;
+        ca.w_kv = (const uint16_t*) wc->ptr;
+        ca.w_gate = wg ? (const uint16_t*) wg->ptr : nullptr;
+        ca.norm_w = (const float*) cn->ptr;
+        ca.w_idx_k = ik ? (const uint16_t*) ik->ptr : nullptr;
+        ca.idx_k_norm_w = ikn ? (const float*) ikn->ptr : nullptr;
+        ca.rope_freq = c_.freq[1];
+        ca.state_kv = (*c_.st_kv)[(size_t) il];
+        ca.state_score = (*c_.st_sc)[(size_t) il];
+        ca.comp_kv = (*c_.comp_kv)[(size_t) il];
+        ca.comp_ik = (*c_.comp_ik)[(size_t) il];
+        compress_batch(ca, x, d_pos, S, cws_, stream);
+        return true;
+    }
+
     // One sub-chunk of S tokens starting at token s0 of the chunk: window, compressor, indexer, sparse attention.
     bool sub(int il, int64_t pos0, int s0, int S, const float* x, void* stream, std::string& err) {
         const int ratio = g_.compress_ratio[(size_t) il];
@@ -234,28 +276,7 @@ private:
         if (ratio) {
             const int ks = kv_source(il);
             if (ks == il) {
-                const DevTensor *wc = Tn("attn_compressor_kv.weight"), *cn = Tn("attn_compressor_norm.weight");
-                const DevTensor *wg = ratio == 2 ? Tn("attn_compressor_gate.weight") : nullptr;
-                const DevTensor *ik = Tn("indexer.attn_k.weight"), *ikn = Tn("indexer.k_norm.weight");
-                if (!wc || !cn || (ratio == 2 && !wg)) {
-                    err = "deepseek41: layer " + std::to_string(il) + " lacks compressor tensors";
-                    return false;
-                }
-                CompressArgs ca;
-                ca.ratio = ratio;
-                ca.rms_eps = g_.rms_eps;
-                ca.n_embd = kAttnEmbd;
-                ca.w_kv = (const uint16_t*) wc->ptr;
-                ca.w_gate = wg ? (const uint16_t*) wg->ptr : nullptr;
-                ca.norm_w = (const float*) cn->ptr;
-                ca.w_idx_k = ik ? (const uint16_t*) ik->ptr : nullptr;
-                ca.idx_k_norm_w = ikn ? (const float*) ikn->ptr : nullptr;
-                ca.rope_freq = c_.freq[1];
-                ca.state_kv = (*c_.st_kv)[(size_t) il];
-                ca.state_score = (*c_.st_sc)[(size_t) il];
-                ca.comp_kv = (*c_.comp_kv)[(size_t) il];
-                ca.comp_ik = (*c_.comp_ik)[(size_t) il];
-                compress_batch(ca, x, d_pos, S, cws_, stream);
+                if (!compress_sub(il, x, d_pos, S, stream, err)) return false;
             }
             if (index_source(il) == il) {
                 const DevTensor *iqb = Tn("indexer.attn_q_b.weight"), *ipj = Tn("indexer.proj.weight");

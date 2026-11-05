@@ -29,6 +29,11 @@ the pack and picks the chat format, tool-call syntax and thinking switch to matc
   borrows the copies too. If even the smallest chunk does not fit, or the caches cannot grow, the request fails with an
   error naming the free memory and the next one runs. When a new conversation starts, caches a long one left mapped
   beyond 32,768 positions are released to the tier.
+- **Prompt skip:** in a long read, rows further than 2,668 positions from the read's end (the end of the system prompt, the
+  last prompt token) stop at layer 20's compressor, which is all a later token reads of them. From the last prompt token on
+  the math is a full read's; a real run differs from a full read by the rounding of another batch shape, as another chunk size
+  does ([precision](precision/deepseek41.md#prompt-skip)). State is saved or resumed only at a read's end, which every
+  checkpoint and conversation image is. `--no-prompt-skip` runs every row through every layer.
 - **KV format:** the caches are fp16, the only format this model has; `--kv` is the normal `unknown argument` error.
 - **VRAM limits:** `--expert-cache` caps the VRAM slots and `--vram-reserve-mib` or `POST /v1/vram` sets what stays free, through
   prompts, images and the tier reopening after them. A prompt that wants more memory takes the copies first and halves its chunk

@@ -91,6 +91,30 @@ The prompt path batches a chunk per layer call.
   path is bitwise equal when the compressor runs the old kernels). The distance of the first fifteen positions to the
   llama.cpp fixture is unchanged at layers 2 to 4 (kernels/attn_index.cu; ds41_prefill_index_parity).
 
+## Prompt skip
+
+Past layer 20 a row reads its own layer's window, 127 positions back, and layer 20's compressed rows and index keys. A row
+further than 20 * 127 + 128 = 2,668 positions from the read's end therefore stops at layer 20's compressor: no token from
+that end on can read what it would compute past it. The compressor and every layer before it run for every row, so the
+compressed rows are all there. `--no-prompt-skip` runs every row through every layer. On when no Engram layer sits at or past
+layer 20 (prefill.cpp `skip_layer`).
+
+- **The math is the same.** An 8K prompt with the near rows one decode step each and the tier frozen, so no batch or
+  placement ties two rows together; 111,788 hashes of layer outputs and logits. Two full reads: none differ. Full against
+  skip: layers 0 to 19 none; from layer 20 on only rows inside the skipped rows' reach, 127 more per layer, and none past it.
+  The last prompt token and 60 generated tokens are bit-identical.
+- **Numerics change.** In a real read the near rows share batches with the rows inside the reach, whose routing differs, so
+  the expert groups and their MMQ rounding move (inferred from the test above: without the batch, the differences are gone).
+  The last prompt row against a full read: KL 2.4e-6, 1.7e-4, 7.7e-5 at 8K, 32K, 64K, top-1 the same, greedy 31, 210, 204
+  of 210 tokens. Another chunk size on a full read moves the same row by KL 3.2e-5, 8.4e-4, 1.2e-3 and the tokens part at 50,
+  158, 72 of 210. There is no BF16 reference for this model to measure either against.
+- **What holds wrong values.** After a skipped read, rows inside the reach hold wrong values past layer 20 until the window
+  rings move past them, and the rings keep only clean rows by the read's end. So state is saved or resumed only at a read's
+  end, and one window back at most (`prefillp::may_save`, `may_resume`; prefill_plan_test): the session refuses anything else.
+  Requests that diverge inside a skipped read read again from the last checkpoint on their path. With the skipped rows
+  overwritten with NaN, 44 server requests (edits at seven depths, a system prompt edited inside, cancels, pictures, a restart
+  from the disk tier, two slots) read none; moving the cut 300 rows towards the end turns the last row all NaN.
+
 ## Pictures
 
 The projector (BF16 weights, fp32 activations, cuBLAS) turns the picture into a block of embedding rows that replace the

@@ -105,6 +105,7 @@ bool adapter_prompt(basalt::model::ModelSession& sess, const std::vector<int32_t
             pr.tokens = toks.data() + done;
             pr.n_tokens = (int) (end - done);
             pr.pos = pos;
+            pr.rows_after = total - 1 - (pos + pr.n_tokens);
             if (g_diag_serial_prompt) {   // one token per step, through the decode path
                 for (int t = 0; r.ok() && t < pr.n_tokens; ++t) {
                     int32_t row_next = -1;
@@ -285,6 +286,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.pool_affinity = o.pool_affinity;
         lreq.pool_affinity_given = o.pool_affinity_given;
         lreq.peer_reserve_mib = o.peer_reserve_mib;
+        lreq.prompt_skip = !o.no_prompt_skip;
         lreq.vram_reserve_mib = o.vram_reserve_given ? o.vram_reserve_mib : 0;
         const basalt::model::Result r = adapter->load(lreq, loaded);
         if (!r.ok() || !loaded) return fatal_start_error(r.message);
