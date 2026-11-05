@@ -114,6 +114,18 @@ private:
     int64_t at{};
     int64_t fold_p0{};
     double prompt_ms{};
+    // where the time to the first token goes (one log line): a mark gives the time since the last mark to a phase
+    enum Phase : int { ph_wait, ph_match, ph_ram, ph_disk, ph_kv, ph_park, ph_restore, ph_adapt, ph_ple, ph_windows,
+                       ph_commit, ph_mtp, ph_checkpoint, ph_batched, ph_refill, ph_other, ph_prep, ph_first, ph_count };
+    std::array<double, ph_count> ph_ms{};
+    int64_t ph_windows_n{};
+    Clock::time_point ph_t{};
+    void ph_mark(Phase k) {
+        const Clock::time_point t = Clock::now();
+        ph_ms[(size_t) k] += std::chrono::duration<double, std::milli>(t - ph_t).count();
+        ph_t = t;
+    }
+    void ph_log() const;
     int64_t p{};
     int32_t x{};
     std::vector<int32_t> drafts{};

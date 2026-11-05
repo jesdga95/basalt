@@ -18,6 +18,7 @@ Flow Request::restore() {
     // is matched by one bulk compare over the slice instead of a per-token scan.
     ids32 = std::vector<int32_t>(ids.begin(), ids.end());
     r0 = Clock::now();
+    ph_t = r0;
     if (!runtime_.drive.d.usage.empty()) runtime_.sp.route_hist_reset();   // counts this request's prompt rows for the usage seed
 
     want_cvec = basalt::kernels::cvec().loaded() ? req_cvec != 0 : true;
@@ -28,6 +29,7 @@ Flow Request::restore() {
         std::printf("ERR %s\n", runtime_.err.c_str());
         return Flow::error;
     }
+    ph_mark(ph_wait);
     // A request for a slot other than 0 reads its prompt in that slot: the request path works on a view of the
     // solo session that carries the slot's state, with the slot's own conversation bookkeeping swapped in
     // for the request (the solo one is put back after it)
@@ -155,6 +157,7 @@ Flow Request::restore() {
                        : basalt::core::ConversationStore::Match{};
     from_disk = on_disk.tokens > std::max({resume, slot_tokens, parked.tokens});
     if (!from_disk && parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(runtime_.conversations->take(parked.index));
+    ph_mark(ph_match);
     // RAM below the guard's floor (another program's peak): shed (after the conversation this request
     // continues is taken out of the cache), then let it come back before the request starts; a STOP ends the
     // wait, and the request then ends as cancelled.  A request that only continues the live conversation by a
@@ -204,6 +207,7 @@ Flow Request::restore() {
             basalt::core::progress_at("request");
         }
     }
+    ph_mark(ph_ram);
     if (from_disk) {
         const uint64_t need = runtime_.disk.load_bytes(on_disk);
         const uint64_t floor = std::max<uint64_t>((uint64_t) runtime_.o.conversation_cache_min_free_mib << 20, runtime_.disk_floor);
@@ -234,6 +238,7 @@ Flow Request::restore() {
             }
         }
     }
+    ph_mark(ph_disk);
     if (incoming) slot_source = -1;
     // a read that gave way in this slot, the same request again: on with it as if it had not stopped
     if (own_partial && from_live && !incoming && slot_source < 0) {
@@ -346,11 +351,13 @@ Flow Request::restore() {
         std::printf("ERR %s\n", runtime_.err.c_str());
         return Flow::error;
     }
+    ph_mark(ph_kv);
     if ((!from_live || incoming || slot_source >= 0) &&
         !runtime_.park_current(incoming ? incoming->bytes() : 0, incoming || slot_source >= 0 ? 0 : resume)) {
         std::printf("ERR %s\n", runtime_.err.c_str());
         return Flow::error;
     }
+    ph_mark(ph_park);
     if (slot_source >= 0) {
         const auto t0 = Clock::now();
         if (!runtime_.copy_from_slot(slot_source, slot_ck, runtime_.err)) {
@@ -499,6 +506,7 @@ Flow Request::restore() {
         runtime_.mtp.set_prompt_len(n);
         runtime_.mtp.begin_request(ids.data(), (int64_t) ids.size());
     }
+    ph_mark(ph_restore);
     read_from = resume;
     runtime_.conversations->drop_reuse_unless(runtime_.rsp);   // another session may have overwritten the cells since
     runtime_.conversations->limit_reuse(read_from);
@@ -518,6 +526,7 @@ Flow Request::restore() {
         std::printf("ERR %s\n", runtime_.err.c_str());
         return Flow::error;
     }
+    ph_mark(ph_kv);
     std::printf("RESUME %lld\n", (long long) resume);   // before reading: this many prompt tokens are reused
     basalt::core::progress_at("reading the prompt, from token", read_from);
     std::fflush(stdout);

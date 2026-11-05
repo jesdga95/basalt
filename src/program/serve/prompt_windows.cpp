@@ -37,16 +37,23 @@ bool Request::read_windows(int64_t a, int64_t b, std::string& e) {
         runtime_.drive.d.layers = 0;
         runtime_.drive.d.experts = 0;
         runtime_.drive.d.failed = false;
+        ph_mark(ph_other);
         if (!runtime_.ver.run(T, win.data(), q, runtime_.win_pool_fn, runtime_.win_pool_user, outw.data(), e) || runtime_.drive.d.failed) {
             if (runtime_.drive.d.failed && runtime_.drive.d.fail) e = runtime_.drive.d.fail;
             return false;
         }
-        if (!runtime_.ver.commit(T, e) || (runtime_.mtp_on && !runtime_.mtp.prefill(runtime_.ver.final_R_all(), nxt.data(), T, q, e))) return false;
+        ph_mark(ph_windows);
+        ++ph_windows_n;
+        if (!runtime_.ver.commit(T, e)) return false;
+        ph_mark(ph_commit);
+        if (runtime_.mtp_on && !runtime_.mtp.prefill(runtime_.ver.final_R_all(), nxt.data(), T, q, e)) return false;
+        ph_mark(ph_mtp);
         q += T;
         runtime_.pp_reached = q;
     }
     // the batched prompt path (other streams), checkpoints and snapshots may follow: the last commit first
     if (!runtime_.ver.wait_commit(e)) return false;
+    ph_mark(ph_commit);
     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - runtime_.pp_t0).count();
     std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) runtime_.pp_total, ms,
                 ms > 0.0 ? 1000.0 * (double) (b - runtime_.pp_from) / ms : 0.0);

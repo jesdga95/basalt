@@ -115,8 +115,9 @@ Each request ends with one slot-tagged `done` line:
   counts newly read tokens only.
 - `tg=<tokens> <rate>`. `acc` is drafts accepted over drafts offered for the request, `dl` the average tokens per
   window; both are left out when the request did not draft.
-- `ttft` is the time to the first token; `end` is the finish reason (`stop`, `length`, `cancelled`, `disconnect`,
-  `error`).
+- `ttft` is the time to the first token, split by phase in the engine log's `to the first token` line
+  ([diagnostics](configuration/diagnostics.md#timing-and-profiles)); `end` is the finish reason (`stop`, `length`,
+  `cancelled`, `disconnect`, `error`).
 - `hit` is the expert cache hit rate and `pcie` the share of routed experts read over PCIe; both appear when the
   engine reports them.
 
