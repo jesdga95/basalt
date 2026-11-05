@@ -27,4 +27,13 @@ void iq1s_512_gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, 
 void iq1s_512_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                    int r0, int r1);
 
+/// IQ2_XXS (16), IQ2_XS (17) and IQ1_M (29) rows, one token's dot at a time, bit for bit ggml's single-token dot.
+bool iq_exact_512_supported(int ggml_type) noexcept;
+/// As iq1s_512_gu_rows, for a supported type.
+void iq_exact_512_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg, float su,
+                          bool scaled, float limit, const void* const* act, int nt, float* const* ff, int r0, int r1);
+/// out[t][r] = w_r . a[t], for a supported type.
+void iq_exact_512_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                       float* const* out, int r0, int r1);
+
 }  // namespace basalt::kernels::cpu
