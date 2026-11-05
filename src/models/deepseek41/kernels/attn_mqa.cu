@@ -37,7 +37,7 @@ namespace basalt::models::deepseek41 {
 namespace {
 
 float yarn_corr_dim(int n_dims, int n_ctx_orig, float n_rot, float base) {
-    return n_dims * std::log((float) n_ctx_orig / (n_rot * 2.0f * (float) M_PI)) / (2.0f * std::log(base));
+    return n_dims * std::log((float) n_ctx_orig / (n_rot * 2.0f * 3.14159265358979323846f)) / (2.0f * std::log(base));
 }
 
 }  // namespace
