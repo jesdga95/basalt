@@ -32,6 +32,10 @@ class EngineError(ValueError):
     request's fault. A ValueError, so every path that ends a request on the engine's ERR line still does."""
 
 
+class ClientGone(Exception):
+    """The client left while its request waited for its model's turn."""
+
+
 class EngineStuck(RuntimeError):
     """The engine survived QUIT, terminate and kill."""
 
