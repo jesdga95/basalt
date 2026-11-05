@@ -96,24 +96,11 @@ bool QfnRequest::slot_leave() {
 }
 
 void QfnRequest::report_request(const DoneCounts& dc) {
-    (void) dc;
     if (runtime_.drive.routing != nullptr) std::fflush(runtime_.drive.routing);   // the routing trace survives a crash and is watchable mid-session
     if (relax_on)
         basalt::log::info("basalt serve", "relaxed drafting %.2f: %lld of the %lld accepted drafts were kept by it",
                      (double) req_relax, (long long) relaxed_kept, (long long) draft_accepted);
-    // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU to
-    // read are in neither count, so that share is said beside it
-    if (req_look > 0) {
-        char off[160] = "";
-        if (req_offload > 0)
-            std::snprintf(off, sizeof off, "; %lld more read by the GPU over PCIe or from another GPU (%.1f%% of "
-                          "all %lld routed)", (long long) req_offload,
-                          100.0 * (double) req_offload / (double) (req_look + req_offload),
-                          (long long) (req_look + req_offload));
-        basalt::log::info("basalt serve", "decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)%s",
-                     100.0 * (double) req_hits / (double) req_look,
-                     (long long) req_hits, (long long) req_look, off);
-    }
+    report_expert_counts(dc);
     // the adaptive swaps this request queued: the resident RAM line's exchanges count only swaps through the
     // exchange buffers, not those whose evicted expert takes a free place in the RAM copy
     if (runtime_.adapt_fast && !runtime_.drive.d.usage.empty())

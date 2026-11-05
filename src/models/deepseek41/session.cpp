@@ -217,6 +217,12 @@ public:
         return {};
     }
 
+    ExpertCounts expert_counts() const override {
+        std::string e;
+        const ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        return t == nullptr ? ExpertCounts{} : ExpertCounts{t->hits(), t->lookups(), t->offloaded()};
+    }
+
     std::string info_words() const override {
         std::string e;
         ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
