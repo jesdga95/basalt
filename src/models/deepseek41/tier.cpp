@@ -544,6 +544,7 @@ bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::s
         }
         lk.experts[i] = e;
         lk.again[i] = false;
+        lk.fetched[i] = false;
         const size_t idx = (size_t) layer * n_expert_ + e;
         stamp_[idx] = now;
         const int32_t s = res_[idx];
@@ -646,12 +647,12 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
     return slot;
 }
 
-void ExpertTier::fetch(int layer, Lookup& lk, cudaStream_t main) {
+int ExpertTier::fetch(int layer, Lookup& lk) {
     int np = 0, nf = 0;
     for (int i = 0; i < lk.k; ++i)
         if (!lk.dev[i] && !lk.peer[i]) ++(pinned(layer, lk.experts[i]) ? np : nf);
     int left = policy::bus_count(np, nf);
-    bool any = false;
+    int started = 0;
     for (int i = lk.k - 1; i >= 0 && left > 0; --i) {
         if (lk.dev[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
         --left;
@@ -659,15 +660,16 @@ void ExpertTier::fetch(int layer, Lookup& lk, cudaStream_t main) {
         if (slot < 0) continue;
         lk.dev[i] = slot_ptr(slot);
         lk.host[i] = nullptr;
+        lk.fetched[i] = true;
         --cpu_;
         ++fetched_;
-        any = true;
+        ++started;
     }
-    if (any) {
-        cudaEventRecord(fetch_ev_, fetch_stream_);
-        cudaStreamWaitEvent(main, fetch_ev_, 0);
-    }
+    if (started) cudaEventRecord(fetch_ev_, fetch_stream_);
+    return started;
 }
+
+void ExpertTier::await_fetch(cudaStream_t main) { cudaStreamWaitEvent(main, fetch_ev_, 0); }
 
 void ExpertTier::promote(int layer, const Lookup& lk) {
     for (int i = 0; i < lk.k; ++i) {

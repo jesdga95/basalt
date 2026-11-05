@@ -483,14 +483,16 @@ public:
         if (!alloc(&ex_xq_, kernels::native_q8_1_bytes(g_.n_embd, kMaxT)) ||
             !alloc(&ex_scr_, kernels::native_expert_scratch_bytes(kRows, g_.n_ff_exp)) ||
             !alloc((void**) &ex_rows_, (size_t) kRows * g_.n_embd * 4) ||
-            !alloc((void**) &ex_plan_, sizeof(ExpertPlan)))
+            !alloc((void**) &ex_plan_, sizeof(ExpertPlan)) || !alloc((void**) &ex_plan2_, sizeof(ExpertPlan)))
             return oom(err);
         // the plan and the CPU's rows are mapped host memory read by kernels: no copy-engine job queues behind the
         // promotion copies, and the host sync at the top of each layer orders their reuse
         constexpr unsigned kMapped = cudaHostAllocPortable | cudaHostAllocMapped;
         if (cudaHostAlloc((void**) &h_plan_, sizeof(ExpertPlan), kMapped) != cudaSuccess ||
+            cudaHostAlloc((void**) &h_plan2_, sizeof(ExpertPlan), kMapped) != cudaSuccess ||
             cudaHostAlloc((void**) &h_ids_, 64 * 4, kMapped) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d_plan_host_, h_plan_, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &d_plan2_host_, h_plan2_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d_ids_host_, h_ids_, 0) != cudaSuccess) {
             err = "deepseek41: cannot allocate the pinned expert staging";
             return false;
@@ -573,7 +575,7 @@ public:
         cudaStreamSynchronize(st);
         ExpertTier::Lookup lk;
         if (!tier_->lookup(il, h_ids_, K, lk, err)) return false;
-        tier_->fetch(il, lk, st);
+        const int n_fetched = tier_->fetch(il, lk);
 
         // the second card's share first: its rows are the last of the two cards' to land
         core::PeerExperts* peer = tier_->peer();
@@ -585,30 +587,35 @@ public:
             if (!peer->launch_plain(il, limited, h_x_, lk.experts, K, kind, err)) return false;
         }
 
-        // the GPU's share: the experts the VRAM tier holds, one group each, writing the row of their router index
-        ExpertPlan& pl = *h_plan_;
-        int nh = 0;
-        for (int k = 0; k < K; ++k) {
-            if (!lk.dev[k]) continue;
-            pl.ptr[nh] = (unsigned long long) lk.dev[k];
-            pl.start[nh] = nh;
-            pl.dst[nh] = k;
-            pl.tok[nh] = 0;
-            ++nh;
-        }
-        pl.start[nh] = nh;
-        pl.ng[0] = nh;
+        // the GPU's share: the experts the VRAM tier holds, one group each, writing the row of their router index; the
+        // fetched ones in a second plan, once their copies landed, so the hits and the shared expert do not wait for them
+        const auto make_plan = [&](ExpertPlan& pl, bool fetched) {
+            int m = 0;
+            for (int k = 0; k < K; ++k) {
+                if (!lk.dev[k] || lk.fetched[k] != fetched) continue;
+                pl.ptr[m] = (unsigned long long) lk.dev[k];
+                pl.start[m] = m;
+                pl.dst[m] = k;
+                pl.tok[m] = 0;
+                ++m;
+            }
+            pl.start[m] = m;
+            pl.ng[0] = m;
+            return m;
+        };
+        const int nhits = make_plan(*h_plan_, false);
+        const int nh = nhits + n_fetched;
         const auto gpu_share = [&] {
-            if (nh) {
+            if (nhits) {
                 copy_words(d_plan_host_, ex_plan_, (int) (sizeof(ExpertPlan) / 4), stream);
                 ExpertPlan* dp = (ExpertPlan*) ex_plan_;
                 kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst,
-                                                       dp->tok, nh, nh, ex_xq_, ex_scr_, ex_rows_, stream);
+                                                       dp->tok, nhits, nhits, ex_xq_, ex_scr_, ex_rows_, stream);
             }
             return !shared_out || shared_expert(il, x, shared_out, stream, err);
         };
         if (shared_out) {
-            cudaGraphExec_t& exec = share_g_[(size_t) il * (kMaxK + 1) + (size_t) nh];
+            cudaGraphExec_t& exec = share_g_[(size_t) il * (kMaxK + 1) + (size_t) nhits];
             if (!exec) {
                 cudaGraph_t g = nullptr;
                 if (cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
@@ -630,6 +637,14 @@ public:
             }
         } else if (!gpu_share()) {
             return false;
+        }
+        if (n_fetched) {
+            make_plan(*h_plan2_, true);
+            tier_->await_fetch(st);
+            copy_words(d_plan2_host_, ex_plan2_, (int) (sizeof(ExpertPlan) / 4), stream);
+            ExpertPlan* dp = (ExpertPlan*) ex_plan2_;
+            kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok, n_fetched,
+                                                   n_fetched, ex_xq_, ex_scr_, ex_rows_, stream);
         }
         // the CPU's share runs while the GPU works; its rows land in the router index's row
         if (nh < K) {
@@ -691,6 +706,8 @@ private:
     void *xq_ = nullptr, *xq2_ = nullptr, *cws_ = nullptr, *iws_ = nullptr;
     float *kvraw_ = nullptr, *qr_ = nullptr, *q_ = nullptr, *attn_ = nullptr, *oa_ = nullptr, *mws_ = nullptr;
     void *ex_plan_ = nullptr, *d_plan_host_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr;
+    void *ex_plan2_ = nullptr, *d_plan2_host_ = nullptr;
+    ExpertPlan* h_plan2_ = nullptr;
     float* ex_rows_ = nullptr;
     ExpertPlan* h_plan_ = nullptr;
     float *h_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr, *d_x_host_ = nullptr;
