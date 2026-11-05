@@ -451,7 +451,7 @@ struct Fixture {
     double temperature;   // 0: greedy
 };
 
-// Same content and order as the standard decode set; sampling keys as the daily server config sends them.
+// Same content and order as the standard decode set; sampling keys as a server config sends them.
 const Fixture kDecode[] = {
     {"conv", "conv.ids", 1200, 0.6},
     {"struct", "struct.ids", 8192, 0.0},
