@@ -39,7 +39,7 @@ constexpr int kSharedRows = 1024;   // tokens per shared-expert sub-chunk
 
 class Impl final : public PrefillFfn {
 public:
-    Impl(const DsModel& m, LayerOps& ops, int cap) : m_(m), ops_(ops), g_(m.geo()), cap_(cap) {}
+    Impl(const DsModel& m, LayerOps& ops, int cap) : m_(m), g_(m.geo()), ops_(ops), cap_(cap) {}
     ~Impl() override {
         stop_prefetch();
         if (ring_) cudaFreeHost(ring_);
