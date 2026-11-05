@@ -565,6 +565,11 @@ public:
     // Every id of the layer landed in the mapped ids (routed_stage writes them last); the stream goes on meanwhile. A launch
     // that failed never writes them.
     void await_ids(cudaStream_t st) {
+        if (ids_read_) {   // a layer that failed left its ids behind
+            cudaStreamSynchronize(st);
+            return;
+        }
+        ids_read_ = true;
         constexpr int kSpins = 1 << 22;
         const volatile int32_t* ids = h_ids_;
         for (int s = 0; s < kSpins; ++s) {
@@ -674,6 +679,7 @@ public:
             rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * g_.n_embd : d_rows_ + (size_t) k * g_.n_embd;
         weighted_sum_row_ptrs(rp, w, K, g_.n_embd, out, stream, shared_out);
         for (int k = 0; k < K; ++k) h_ids_[k] = -1;
+        ids_read_ = false;
         return true;
     }
     bool shared_expert(int il, const float* x, float* out, void* stream, std::string& err) override {
@@ -725,6 +731,7 @@ private:
     float *kvraw_ = nullptr, *qr_ = nullptr, *q_ = nullptr, *attn_ = nullptr, *oa_ = nullptr, *mws_ = nullptr;
     void *ex_plan_ = nullptr, *d_plan_host_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr;
     void *ex_plan2_ = nullptr, *d_plan2_host_ = nullptr;
+    bool ids_read_ = false;   ///< this layer took the mapped ids and has not cleared them yet
     ExpertPlan* h_plan2_ = nullptr;
     float* ex_rows_ = nullptr;
     ExpertPlan* h_plan_ = nullptr;
