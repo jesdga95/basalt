@@ -89,6 +89,8 @@ struct LoadRequest {
     bool prompt_skip = true;          ///< a prompt's far rows may stop at the layer a model says is the last they matter to
     int vram_reserve_mib = 0;         ///< VRAM the main card leaves free beyond what the model needs (0: none)
     int spec = 0;                     ///< rows a decode window may hold (0 or 1: one)
+    std::string drafter;              ///< the drafter's file (empty: none)
+    int drafter_device = -1;          ///< diagnostic: the CUDA device it runs on (-1: the main card)
     bool diag_tier_frozen = false;    ///< diagnostic: the VRAM tier keeps what it holds, no bus copy and no promotion
 };
 
@@ -134,8 +136,12 @@ public:
     virtual Result set_logit_bias(const float* bias) { (void) bias; return {Status::NotImplemented, "this model takes no logit bias"}; }
     /// Draws the token of row `row` of the last decoded window again under `bias` (n_vocab floats): the grammar's mask.
     virtual Result resample_row(int row, const float* bias, int32_t& token) { (void) row; (void) bias; (void) token; return {Status::NotImplemented, "this model cannot draw again"}; }
-    /// The rows a decode window may hold.
+    /// The rows a decode window may hold; 1 when the session drafts nothing.
     virtual int max_window() const { return 1; }
+    /// Starts the drafts after `anchor`, the token at position `pos`. The rows of the last window before `pos` were accepted.
+    virtual Result draft_begin(int32_t anchor, int64_t pos) { (void) anchor; (void) pos; return {Status::NotImplemented, "this model has no drafter"}; }
+    /// The drafts draft_begin started: `n` tokens and each one's estimated chance of acceptance, at most `max_n`.
+    virtual Result draft_end(int32_t* ids, float* conf, int max_n, int& n) { (void) ids; (void) conf; (void) max_n; (void) n; return {Status::NotImplemented, "this model has no drafter"}; }
     /// The last decoded row's logits (n_vocab floats).
     virtual Result copy_logits(float* out) { (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
     /// low: the VRAM the session can give back goes back to the driver; else it is taken again. The slots it holds now.

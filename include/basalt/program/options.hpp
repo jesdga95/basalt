@@ -73,6 +73,8 @@ struct CommonOptions {
     int spec = 0;
     bool spec_given = false;           ///< --spec on the command line
     std::string spec_oracle;
+    std::string drafter;               ///< --drafter FILE: the drafter of a model that keeps it outside the pack
+    int drafter_device = -1;           ///< --diag-drafter-gpu N: the CUDA device it runs on (-1: the main card)
     bool diag_teacher = false;         ///< --diag-teacher: --spec-oracle's tokens go on whatever the picks
     bool diag_tier_frozen = false;     ///< --diag-tier-frozen: the VRAM tier keeps what it holds
     std::string diag_dump;                 ///< --diag-dump DIR: a model's per-layer tensors, off by default

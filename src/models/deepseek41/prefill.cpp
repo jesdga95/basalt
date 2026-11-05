@@ -299,6 +299,7 @@ private:
             const int r0 = yl > 0 && il > yl ? cut : 0;
             const int r1 = yl > 0 && il >= yl ? cut : 0;
             const int Ta = T - r0, Tf = T - r1;
+            if (layer_tap) layer_tap(il, x_ + (size_t) r0 * 4 * n, Ta, st);
             // attention sublayer
             hc_mixes(x_ + (size_t) r0 * 4 * n, wf(il, "hc_attn_fn.weight"), wf(il, "hc_attn_scale.weight"), wf(il, "hc_attn_base.weight"), Ta,
                      hca, hc_ws_, coef_a_ + (size_t) r0 * kHcCoef, st);
@@ -350,6 +351,7 @@ private:
             }
         }
         DS_CUDA(cudaStreamSynchronize(stream_));
+        if (chunk_done && !chunk_done(T, pos0, err)) return fail(err);
         {
             float attn_ms = 0, ffn_ms = 0, all_ms = 0, t = 0;
             for (int il = 0; il < n_run; ++il) {

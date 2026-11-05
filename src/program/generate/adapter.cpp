@@ -219,9 +219,10 @@ int adapter_generate(basalt::model::LoadedModel& loaded, const std::vector<int64
         return 1;
     }
     const auto t1 = Clock::now();
-    // A window holds the last pick and the drafts after it, from the expected continuation.
+    // A window holds the last pick and the drafts after it, from the drafter or from the expected continuation.
     const int cap = sess->max_window();
     std::vector<int32_t> window((size_t) cap), rows((size_t) cap), drafts((size_t) cap);
+    std::vector<float> conf((size_t) cap);
     std::vector<float> diag_rows;
     int64_t made = 0, windows = 0, offered = 0, accepted = 0, differ = 0;
     double ms_draft = 0, ms_verify = 0;
@@ -241,6 +242,13 @@ int adapter_generate(basalt::model::LoadedModel& loaded, const std::vector<int64
             while (n_draft < cap - 1 && made + n_draft < (int64_t) oracle.size()) {
                 drafts[(size_t) n_draft] = (int32_t) oracle[(size_t) (made + n_draft)];
                 ++n_draft;
+            }
+        } else if (cap > 1) {
+            basalt::model::Result dres = sess->draft_begin(next, pos);
+            if (dres.ok()) dres = sess->draft_end(drafts.data(), conf.data(), cap - 1, n_draft);
+            if (!dres.ok() && dres.status != basalt::model::Status::NotImplemented) {
+                basalt::log::error("basalt generate", "%s", dres.message.c_str());
+                return 1;
             }
         }
         const int T = 1 + n_draft;
@@ -342,6 +350,8 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.prompt_skip = !o.no_prompt_skip;
         lreq.vram_reserve_mib = o.vram_reserve_given ? o.vram_reserve_mib : 0;
         lreq.spec = o.spec;
+        lreq.drafter = o.drafter;
+        lreq.drafter_device = o.drafter_device;
         lreq.diag_tier_frozen = o.diag_tier_frozen;
         const basalt::model::Result r = adapter->load(lreq, loaded);
         if (!r.ok() || !loaded) return fatal_start_error(r.message);

@@ -11,6 +11,8 @@
 #include "basalt/models/deepseek41/attn_index.hpp"
 #include "basalt/models/deepseek41/kernels.hpp"
 #include "models/deepseek41/attn_batch.hpp"
+#include "models/deepseek41/dspark.hpp"
+#include "models/deepseek41/dspark_kernels.hpp"
 #include "models/deepseek41/layer_ops.hpp"
 #include "models/deepseek41/model.hpp"
 #include "models/deepseek41/ops.hpp"
@@ -46,8 +48,10 @@ class Session final : public model::ModelSession {
 public:
     explicit Session(DsModel& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
+        if (drafter_) drafter_->report();
         for (void* p : allocs_) cudaFree(p);
         if (h_next_) cudaFreeHost(h_next_);
+        if (h_dfeat_) cudaFreeHost(h_dfeat_);
         for (cudaGraphExec_t e : head_g_)
             if (e) cudaGraphExecDestroy(e);
         for (cudaGraphExec_t e : tail_g_)
@@ -103,10 +107,43 @@ public:
         ops_ = make_kernel_ops(m_, err);
         if (!ops_) return false;
         dump_dir_ = m_.diag_dump();
+        if (!m_.tiers().drafter.empty() && m_.sessions() == 1) {
+            // the drafter takes its memory before the tiers size themselves to what is left
+            const int device = m_.tiers().drafter_device >= 0 ? m_.tiers().drafter_device : m_.device();
+            drafter_ = DsparkDrafter::create(m_, m_.tiers().drafter, device, err);
+            if (!drafter_) return false;
+            basalt::log::info("basalt deepseek41", "drafter on GPU %d: %.2f GiB, windows of at most %d tokens", device, (double) drafter_->device_bytes() / (1ull << 30),
+                              std::min(max_window(), kDsparkBlock + 1));
+            const size_t ff = (size_t) drafter_->feature_floats();
+            if (!buf(dfeat_, ff * kDsparkWindow) ||
+                cudaHostAlloc((void**) &h_dfeat_, ff * kDsparkWindow * sizeof(float), cudaHostAllocPortable) != cudaSuccess) {
+                err = "out of memory for the drafter's feature rows";
+                return false;
+            }
+        }
         return true;
     }
 
     int max_window() const override { return m_.sessions() > 1 ? 1 : std::clamp(m_.tiers().spec, 1, kMaxWindow); }
+
+    model::Result draft_begin(int32_t anchor, int64_t pos) override {
+        if (!drafter_) return {model::Status::NotImplemented, "deepseek41: no drafter is loaded"};
+        std::string err;
+        ops_->commit_window(pos, stream_);
+        if (!flush_features(pos, err) || !drafter_->draft_begin(anchor, pos, err)) return {model::Status::Error, err};
+        return {};
+    }
+
+    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override {
+        if (!drafter_) return {model::Status::NotImplemented, "deepseek41: no drafter is loaded"};
+        std::string err;
+        DsparkDraft d;
+        if (!drafter_->draft_end(d, err)) return {model::Status::Error, err};
+        n = std::min(max_n, kDsparkBlock);
+        std::copy(d.token, d.token + n, ids);
+        std::copy(d.conf, d.conf + n, conf);
+        return {};
+    }
 
     model::Result decode_window(const model::DecodeRequest& r) override {
         if (r.row_tokens) {
@@ -130,6 +167,10 @@ public:
         if (!prefillp::may_resume(r.pos, (int64_t) hist_.size(), whole_from_)) return {model::Status::Error, kSkippedRows};
         sync_rewind(r.pos);
         settle_tier();
+        {
+            std::string fe;
+            if (!flush_features(r.pos, fe)) return {model::Status::Error, fe};
+        }
         if (r.n_tokens > 1 && std::max(r.total_tokens, r.n_tokens) > prefillp::kStepPrompt) {
             std::string err;
             const int batched = r.n_tokens;
@@ -160,6 +201,7 @@ public:
                 prefill_->progress = r.progress;
                 prefill_->live = r.live;
                 prefill_->stop = r.stop;
+                tap_features();
                 if (!prefill_->run(r.tokens, batched, r.pos, r.rows_after, hist_, err)) return prompt_failed(err);
                 if (prefill_->left_rows()) whole_from_ = prefillp::whole_from(r.pos + r.n_tokens + r.rows_after, kWindow);
                 if (!r.more) close_prompt_path();
@@ -194,6 +236,8 @@ public:
         ops_->restore_turn(stream_, host);
         whole_from_ = 0;
         if ((int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
+        feat_n_ = 0;
+        if (drafter_) drafter_->forget_from(pos);
         return {};
     }
 
@@ -265,6 +309,8 @@ public:
         if (!ops_) return {model::Status::Error, "no state yet"};
         std::string e;
         if (!ops_->ensure_positions(positions, e) || !ops_->restore_cache(stream_, kv, e)) return {model::Status::Error, e};
+        feat_n_ = 0;
+        if (drafter_) drafter_->reset();
         return {};
     }
 
@@ -378,6 +424,7 @@ public:
             if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
             if (!make_prefill_fit(n_rows, err)) return prompt_failed(err);
         }
+        tap_features();
         if (!prefill_->run_embeddings(rows, n_rows, pos, hist_, err)) return prompt_failed(err);
         close_prompt_path();
         return {};
@@ -466,6 +513,39 @@ private:
         t->grow();
     }
 
+    // A chunk hands the drafter the target features of its last rows: the window a draft after it attends.
+    void tap_features() {
+        if (!drafter_) return;
+        prefill_->layer_tap = [this](int il, const float* x, int T, void* st) {
+            const int slot = drafter_->feature_slot(il);
+            if (slot < 0) return;
+            tap_rows_ = std::min(T, kDsparkWindow);
+            const size_t n = (size_t) g_.n_embd;
+            dspark_hc_mean(x + (size_t) (T - tap_rows_) * kHcMult * n, tap_rows_, (int) n, dfeat_ + (size_t) slot * n, drafter_->feature_floats(), st);
+        };
+        prefill_->chunk_done = [this](int T, int64_t pos0, std::string& err) {
+            feat_pos0_ = pos0 + T - tap_rows_;
+            feat_n_ = tap_rows_;
+            tap_rows_ = 0;
+            return flush_features(pos0 + T, err);
+        };
+    }
+
+    // The features of the last rows before `upto` (the accepted ones) go to the drafter.
+    bool flush_features(int64_t upto, std::string& err) {
+        if (!drafter_ || !feat_n_) return true;
+        const int q = (int) std::clamp<int64_t>(upto - feat_pos0_, 0, feat_n_);
+        feat_n_ = 0;
+        if (!q) return true;
+        const size_t ff = (size_t) drafter_->feature_floats();
+        if (cudaMemcpyAsync(h_dfeat_, dfeat_, ff * q * sizeof(float), cudaMemcpyDeviceToHost, stream_) != cudaSuccess ||
+            cudaStreamSynchronize(stream_) != cudaSuccess) {
+            err = "deepseek41: cannot read the drafter's features";
+            return false;
+        }
+        return drafter_->inject(feat_pos0_, q, h_dfeat_, err);
+    }
+
     bool device_bias(float*& dev, const float* host, std::string& err) {
         const size_t bytes = (size_t) g_.n_vocab * sizeof(float);
         if (dev == nullptr) {
@@ -544,6 +624,10 @@ private:
     bool enqueue_head(int il, int64_t pos, int32_t token, void* st, bool with_prev_tail, int T = 1) {
         const size_t n = (size_t) g_.n_embd;
         if (with_prev_tail && !enqueue_tail(il - 1, pos, st, T)) return false;
+        if (drafter_) {
+            const int slot = drafter_->feature_slot(il);
+            if (slot >= 0) dspark_hc_mean(x_, T, (int) n, dfeat_ + (size_t) slot * n, drafter_->feature_floats(), st);
+        }
         const float* pre_prev = il > 0 ? coef_f_[(il - 1) & 1] : nullptr;
         float* coef_f = coef_f_[il & 1];
         HcArgs hca;
@@ -640,7 +724,11 @@ private:
 
     bool step(const int32_t* tokens, int T, int64_t pos, bool want_out, int32_t* next, float* logits_out, std::string& err) {
         err_.clear();
-        bool ok = step_impl(tokens, T, pos, want_out, next, logits_out);
+        bool ok = flush_features(pos, err_) && step_impl(tokens, T, pos, want_out, next, logits_out);
+        if (ok && drafter_) {
+            feat_pos0_ = pos;
+            feat_n_ = T;
+        }
         if (!ok) err = err_.empty() ? "deepseek41: step failed" : err_;
         return ok;
     }
@@ -651,6 +739,7 @@ private:
         if (pos == 0) whole_from_ = 0;
         if (ops_) ops_->commit_window(pos, stream_);
         if (ops_ && pos == 0) ops_->trim_positions();
+        if (pos == 0 && drafter_) drafter_->reset();
         if (pos > 0 && (int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
     }
 
@@ -666,6 +755,7 @@ private:
             hist_.clear();
             whole_from_ = 0;
             ops_->reset();
+            if (drafter_) drafter_->reset();
         }
         if ((int64_t) hist_.size() < pos) return fail("positions must be consecutive from 0 (the session keeps one sequence)");
         hist_.resize((size_t) pos);   // a position before the end drops the rejected rows of a window
@@ -837,6 +927,13 @@ private:
     std::vector<float> emb4_;
     bool fused_ = false;
     void* q8_ = nullptr;
+    // the drafter and the main model's side of its feature hand-off
+    std::unique_ptr<DsparkDrafter> drafter_;
+    float* dfeat_ = nullptr;     // [rows][target layers][n_embd]
+    float* h_dfeat_ = nullptr;
+    int64_t feat_pos0_ = 0;      // the first position of the rows in dfeat_ that await the drafter, and how many
+    int feat_n_ = 0;
+    int tap_rows_ = 0;           // the rows the running prompt chunk leaves in dfeat_
 };
 
 }  // namespace

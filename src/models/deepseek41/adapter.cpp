@@ -6,10 +6,12 @@
 #include "basalt/program/options.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/core/diag.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
 #include "models/deepseek41/context_policy.hpp"
+#include "models/deepseek41/dspark.hpp"
 #include "models/deepseek41/meta.hpp"
 #include "models/deepseek41/model.hpp"
 
@@ -49,12 +51,6 @@ public:
 
     model::TokenizerSpec tokenizer_spec() const override { return {"tokenizer.ggml.tokens", "deepseek"}; }
 
-    bool parse_flag(const std::string& name, model::FlagArgs&, program::CommonOptions& o, int&) const override {
-        if (name != "--no-prompt-skip") return false;
-        o.no_prompt_skip = true;
-        return true;
-    }
-
     // <｜DSML｜ calls>, <｜DSML｜ invoke name="N">, <｜DSML｜ parameter name="P" string="true|false">
     program::grammar::ToolForm tool_form() const override {
         const std::string dsml = "\xef\xbd\x9c" "DSML\xef\xbd\x9c";
@@ -80,16 +76,39 @@ public:
 
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
         (void) code;
-        if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
+        if (a == "--no-prompt-skip") o.no_prompt_skip = true;
+        else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
         else if (a == "--spec-oracle") o.spec_oracle = args.next("--spec-oracle");
+        else if (a == "--drafter") o.drafter = args.next("--drafter");
+        else if (a == "--diag-drafter-gpu") o.drafter_device = std::atoi(args.next("--diag-drafter-gpu"));
         else if (a == "--diag-teacher") o.diag_teacher = true;
         else if (a == "--diag-tier-frozen") o.diag_tier_frozen = true;
+        else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
         else return false;
         return true;
     }
 
     // A context the pack refuses is refused with the flags, before anything loads; the memory check needs the card.
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
+        // a drafter is off unless named; named, it runs with windows of the usual width unless --spec says otherwise
+        if (!o.drafter.empty() && !o.spec_given) o.spec = 8;
+        if (o.spec < 2) o.drafter.clear();
+        if (!o.drafter.empty() && o.batch > 1) {
+            basalt::log::warn("basalt deepseek41", "drafter off: --parallel slots draft nothing");
+            o.drafter.clear();
+            o.spec = 0;
+        }
+        if (o.spec >= 2 && o.drafter.empty() && o.spec_oracle.empty()) {
+            basalt::log::warn("basalt deepseek41", "--spec %d without --drafter: nothing drafts", o.spec);
+            o.spec = 0;
+        }
+        if (!o.drafter.empty()) {
+            const std::string why = drafter_file_problem(o.drafter);
+            if (!why.empty()) {
+                basalt::log::error("basalt deepseek41", "--drafter %s: %s", o.drafter.c_str(), why.c_str());
+                return 2;
+            }
+        }
         if (!o.max_context_set || o.model.empty()) return std::nullopt;
         core::ModelFile file;
         std::string err;

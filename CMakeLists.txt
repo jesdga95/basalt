@@ -187,7 +187,8 @@ target_link_libraries(model_qwen4exp PUBLIC model tokenizer serve_shared model_q
 add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models/deepseek41/tokenizer/pretok_joyai.cpp src/models/deepseek41/pack.cpp
   src/models/deepseek41/model.cpp src/models/deepseek41/session.cpp src/models/deepseek41/layer_ops.cpp
   src/models/deepseek41/elastic.cpp src/models/deepseek41/ops_kernels.cpp src/models/deepseek41/tier.cpp src/models/deepseek41/ops.cu
-  src/models/deepseek41/prefill.cpp src/models/deepseek41/prefill_ffn.cpp src/models/deepseek41/prefill_ffn.cu src/models/deepseek41/attn_batch.cpp src/models/deepseek41/attn_dense.cu)
+  src/models/deepseek41/prefill.cpp src/models/deepseek41/prefill_ffn.cpp src/models/deepseek41/prefill_ffn.cu src/models/deepseek41/attn_batch.cpp src/models/deepseek41/attn_dense.cu
+  src/models/deepseek41/dspark.cpp src/models/deepseek41/dspark_kernels.cu)
 target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
 target_link_libraries(model_deepseek41 PUBLIC model tokenizer serve_shared deepseek41_kernels deepseek41_attn deepseek41_vision tiers mmq kernels core ${_gpu_runtime_target})
 
@@ -196,6 +197,13 @@ target_link_libraries(models PUBLIC model_qwen4exp model_deepseek41)
 
 # DeepSeek-V4.1 kernels and their tests (own file)
 include(src/models/deepseek41/kernels/kernels.cmake)
+if(BUILD_TESTING)
+  # the DSpark drafter's kernels against CPU references (GPU)
+  add_executable(ds41_dspark_parity src/models/deepseek41/dspark_parity.cpp)
+  target_include_directories(ds41_dspark_parity PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(ds41_dspark_parity PRIVATE model_deepseek41 ${_gpu_runtime_target})
+  basalt_gpu_test(NAME ds41_dspark_parity COMMAND ds41_dspark_parity)
+endif()
 include(src/models/deepseek41/vision/vision.cmake)
 
 add_executable(basalt-gguf src/artifact/gguf_reader.cpp)

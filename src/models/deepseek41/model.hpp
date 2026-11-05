@@ -77,6 +77,8 @@ public:
     /// The CUDA device of the second card's expert tier, or -1.
     int peer_device() const { return peer_device_; }
     void set_peer_device(int d) { peer_device_ = d; }
+    /// The CUDA device the dense tensors live on.
+    int device() const { return device_; }
     /// The sizes the prompt path's workspaces depend on.
     prefillp::Dims prompt_dims() const;
     /// Device bytes of the compressed caches of a full context.
@@ -92,6 +94,7 @@ private:
     std::string diag_dump_, path_;
     int diag_tier_ram_ = -1, diag_tier_vram_ = -1;
     int peer_device_ = -1;
+    int device_ = 0;
     model::LoadRequest tiers_;
     mutable SharedTier shared_tier_;
     int64_t ctx_ = 0;

@@ -26,6 +26,7 @@ DsModel::~DsModel() {
 bool DsModel::load(const std::string& path, std::string& err) {
     if (!open_pack(path, pack_, err)) return false;
     path_ = path;
+    cudaGetDevice(&device_);
     const Geometry& g = pack_.geo;
     desc_.arch = "deepseek41";
     desc_.n_layers = g.n_layers;
