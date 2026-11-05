@@ -3,7 +3,8 @@
 Basalt is a local inference engine for mixture-of-experts models: **Qwen3.8-Flash-Next** and **DeepSeek-V4.1-Flash**.
 It runs on Linux and Windows with an NVIDIA Blackwell GPU (sm_120); see [platforms](docs/platforms.md) for limitations.
 
-Experts that do not fit in VRAM live in system RAM, and optionally on a second GPU used as a peer expert tier.
+Experts that do not fit in VRAM live in system RAM, and optionally on more GPUs used as peer expert tiers (up to three
+for Flash-Next, one for DeepSeek; see [GPUs](docs/configuration/gpus.md)).
 A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compatible API.
 
 **Help wanted:** have some spare compute to lend for testing? See [Contributing](CONTRIBUTING.md#other-ways-to-help).
@@ -63,8 +64,6 @@ The pack is `DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt` on
 [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt), built from Unsloth's UD-IQ1_M GGUF (Dynamic V3.1), with images and a
 context of up to 1M tokens.
 It runs through the same command; what it supports and how it uses the memory: [DeepSeek-V4.1](docs/deepseek41.md).
-
-<!-- MAINTAINER: DeepSeek headline numbers go here, from your own runs. Remove this comment before release. -->
 
 ## Docs
 
