@@ -564,6 +564,56 @@ void gpu_pair(int gu, int d, bool bench, cudaStream_t s) {
 
 }  // namespace
 
+// The single-token AVX-512 kernels against ggml's dot, bit for bit: both row lengths of an expert, random and extreme
+// codes, ordinary and saturating activations.  A row's bits do not depend on the row range of the call.
+void cpu_exact_dots() {
+    if (!kc::cpu_avx512_ok()) return;
+    for (int type : {16, 17, 29}) {
+        const ggml_type_traits_cpu* tr = ggml_get_type_traits_cpu((ggml_type) type);
+        const size_t bs = ggml_type_size((ggml_type) type);
+        for (int n : {H, FF}) {
+            std::mt19937 rng(40 + type + n);
+            const int rows = 400;
+            const size_t rb = (size_t) n / 256 * bs;
+            size_t diff = 0, total = 0;
+            for (int mode = 0; mode < 4; ++mode) {
+                std::vector<uint8_t> w(rb * rows);
+                for (auto& b : w) b = mode == 1 ? 0 : mode == 2 ? 0xff : (uint8_t) rng();
+                // a finite fp16 block scale wherever the format stores one
+                for (int r = 0; r < rows; ++r)
+                    for (int b = 0; b < n / 256; ++b) {
+                        uint8_t* blk = w.data() + (size_t) r * rb + (size_t) b * bs;
+                        const uint16_t h = (uint16_t) (0x3800 + (rng() & 0x3ff));
+                        if (type == 29) {
+                            for (int k = 0; k < 4; ++k) blk[48 + 2 * k + 1] = (uint8_t) ((blk[48 + 2 * k + 1] & 0x0f) | (((h >> (4 * k)) & 15) << 4));
+                        } else {
+                            std::memcpy(blk, &h, 2);
+                        }
+                    }
+                std::vector<float> x(n);
+                std::normal_distribution<float> nd(0.f, 1.f);
+                for (auto& v : x) v = mode == 3 ? ((rng() & 1) ? 1e4f : -1e4f) : nd(rng);
+                std::vector<uint8_t> act((size_t) n / 256 * ggml_type_size(GGML_TYPE_Q8_K));
+                ggml_get_type_traits_cpu(GGML_TYPE_Q8_K)->from_float(x.data(), act.data(), n);
+                const void* ap = act.data();
+                std::vector<float> o(rows), o2(rows), ref(rows);
+                float* op = o.data();
+                float* op2 = o2.data();
+                kc::iq_exact_512_rows(type, w.data(), rb, n, &ap, 1, &op, 0, rows);
+                for (int r = 0; r < rows; ++r) tr->vec_dot(n, &ref[r], 0, w.data() + (size_t) r * rb, 0, act.data(), 0, 1);
+                kc::iq_exact_512_rows(type, w.data(), rb, n, &ap, 1, &op2, 17, 18);
+                diff += std::memcmp(&o2[17], &o[17], 4) != 0;
+                for (int r = 0; r < rows; ++r) {
+                    diff += std::memcmp(&o[r], &ref[r], 4) != 0;
+                    ++total;
+                }
+            }
+            std::printf("cpu %-7s avx512 dot vs ggml, n %d: %zu of %zu rows differ\n", nm(type), n, diff, total);
+            check(diff == 0, "exact avx512 dot");
+        }
+    }
+}
+
 // single-thread streaming rate of the IQ1_S row dot, ggml's against the AVX-512 kernel, over a buffer well past L2
 void cpu_bench() {
     std::mt19937 rng(3);
@@ -593,6 +643,25 @@ void cpu_bench() {
     };
     run("ggml avx2", [&] { for (int r = 0; r < rows; ++r) tr->vec_dot(H, &o[r], 0, w.data() + (size_t) r * f.gu_row, 0, act.data(), 0, 1); });
     if (kc::cpu_avx512_ok()) run("avx512", [&] { kc::iq1s_512_rows(w.data(), f.gu_row, H, &ap, 1, &op, 0, rows); });
+    for (int type : {16, 17, 29}) {
+        const size_t rb = (size_t) H / 256 * ggml_type_size((ggml_type) type);
+        const int nr = (int) (131072000ull / rb);
+        auto wt = random_rows(type, nr, H, 0.01f, rng);
+        const auto* tt = ggml_get_type_traits_cpu((ggml_type) type);
+        std::vector<float> ot(nr);
+        float* otp = ot.data();
+        auto timed = [&](const char* name, auto&& fn) {
+            double best = 1e30;
+            for (int it = 0; it < 12; ++it) {
+                const auto t0 = std::chrono::steady_clock::now();
+                fn();
+                best = std::min(best, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            }
+            std::printf("bench cpu %s row dot, 1 thread, %s: %.2f us/row, %.1f GB/s\n", nm(type), name, best * 1e6 / nr, (double) nr * rb / best / 1e9);
+        };
+        timed("ggml avx2", [&] { for (int r = 0; r < nr; ++r) tt->vec_dot(H, &ot[r], 0, wt.data() + (size_t) r * rb, 0, act.data(), 0, 1); });
+        if (kc::cpu_avx512_ok()) timed("avx512", [&] { kc::iq_exact_512_rows(type, wt.data(), rb, H, &ap, 1, &otp, 0, nr); });
+    }
 }
 
 int main(int argc, char** argv) {
@@ -603,6 +672,7 @@ int main(int argc, char** argv) {
     }
     std::mt19937 rng(5);
     cpu_dot();
+    cpu_exact_dots();
     if (bench) cpu_bench();
     cpu_pair(19, 19, rng);
     cpu_pair(16, 16, rng);
