@@ -53,9 +53,7 @@ static void advise_routed(ExpertDispatch& d, const int32_t* ids, int64_t n) {
     if (m > 0) d.src->advise_cpu(d.layers, want, m);
 }
 
-void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
-                          int64_t k, float* out) {
-    (void) weights;   // clause 2: `moe_combine` applies it on the device.  Not an oversight.
+void expert_pool_dispatch(void* user, const float*, const int32_t*, const float*, int64_t n_embd, int64_t, float*) {
     ExpertDispatch& d = *(ExpertDispatch*) user;
     if (d.failed) return;   // a previous layer already failed; do not make it worse
 
