@@ -153,7 +153,8 @@ three prompts: Basalt's greedy choice differs from llama's at 8 of 688 generated
 The count moves with which tier each expert sits in. KL against llama's logits on 512 positions of real text: mean
 0.0025, median 0.0007, top-1 agreement 98.0%, position 1 left out: llama's own row at position 1 moves by KL 4.2
 between a 2-token and a 512-token batch, and Basalt is within 0.04 of its 2-token row. There is no PPL/KLD run against
-the native model on this pack yet.
+the native model on this pack yet. On two cards as a server runs them, with slots that follow the routing and a context of
+8,192: 8 of 688 positions (7, 1 and 0), KL mean 0.0030, median 0.0007, top-1 agreement 97.5%, position 1 left out.
 
 Neither engine has one answer to compare. On the same tokens of the first prompt (319 generated positions; each row
 names the two runs compared, KL over the full vocabulary):
