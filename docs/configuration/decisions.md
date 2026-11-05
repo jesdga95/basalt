@@ -149,12 +149,12 @@ Oversized prompts receive HTTP 400 rather than truncation.
 model input. A single question's rubric precedes the changing state for prefix reuse; multiple questions share
 the state and carry isolated rubrics.
 
-`images` (up to 8 sources, in the forms chat accepts) attaches a picture to the state. It is encoded once for the
-whole request, whatever the number of scored rows, placed before the state text, and each `<|image_pad|>` the
-template wrote is expanded to the encoder's row count: the picture is inside the prefix every row and every later
-request reuses. Reuse is keyed by the encoded picture, so the same text over a different image rebuilds its own
-prefill. A `box` question is asked of a picture and is refused without one; any `images` request without
-`--vision` is refused too.
+`images` (up to 8 sources, each a `data:` URL, an `http(s)` URL or a local file path, as chat accepts them) attaches
+a picture to the state. It is encoded once for the whole request, whatever the number of scored rows, placed
+before the state text, and each `<|image_pad|>` the template wrote is expanded to the encoder's row count: the
+picture is inside the prefix every row and every later request reuses. Reuse is keyed by the encoded picture, so
+the same text over a different image rebuilds its own prefill. A `box` question is asked of a picture and is
+refused without one; any `images` request without `--vision` is refused too.
 
 The response has `model`, `answers`, input/output usage, `execution` and `timings`; output tokens are zero.
 Execution reports actual width and workspace, while timings separate target prefill and native scoring.
