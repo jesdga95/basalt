@@ -169,10 +169,13 @@ Answer shapes:
   Confidence is one minus expected distance from the modal index divided by uniform distance from the center,
   floored at zero. It is a distribution-shape measure, not a correctness guarantee.
 - `box`: `box.top/bottom/left/right`, normalized coordinates with 0 at the picture's top-left and 1 at its
-  bottom-right, each the mean of its edge's distribution; `confidence` is the least certain edge's, and `edges`
-  reports each edge's `modal` value, its `probability` and `moved`, true when sorting a pair kept the box right
-  side up. `criteria: {"step": ...}` replaces the default 0.01 grid. The four edges are scored on their own over
-  their whole grid, so an edge costs about one scoring row per grid point: a 0.05 grid costs a fifth of a 0.01 one.
+  bottom-right, always a grid point; `aggregate` says which estimate was taken. `mode` (default) is the peak grid
+  point; `mean`/`median` average the edge's distribution and snap to the nearest grid point, which can pull a
+  coordinate off the peak. `criteria: {"step": ..., "aggregate": ...}` changes the 0.01 grid or the estimate.
+  `confidence` is the least certain edge's, and `edges` reports each edge's `probability`, all three estimates and
+  `moved`, true when sorting a pair kept the box right side up. The four edges share the picture's prefix, so cost
+  follows the grid's token shape rather than its value count: coarsening 0.05 from 0.01 barely changes it, while
+  a 0.25 grid scores in a quarter of the windows.
 
 ```json
 {

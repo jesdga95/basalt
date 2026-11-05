@@ -136,13 +136,35 @@ class Finite(unittest.TestCase):
                                            p[1], p[6], "model")["answers"]["cta"]
         self.assertEqual(answer["box"], {"top": 0.2, "bottom": 0.6, "left": 0.24, "right": 0.74})
         self.assertEqual(answer["confidence"], 1.0)                 # every edge is one grid point
-        self.assertEqual(answer["edges"]["top"], {"probability": 1.0, "modal": 0.6, "moved": True})
+        self.assertEqual(answer["aggregate"], "mode")
+        self.assertEqual(answer["edges"]["top"],
+                         {"probability": 1.0, "modal": 0.6, "mean": 0.6, "median": 0.6, "moved": True})
         self.assertFalse(answer["edges"]["left"]["moved"])
         fields[p[1][2].name]["probabilities"] = [0.5 if i in (20, 28) else 0.0 for i in range(101)]
         spread = systemone.format_response({"results": [{"fields": fields}], "usage": {"prompt_tokens": 9}},
                                            p[1], p[6], "model")["answers"]["cta"]
         self.assertLess(spread["confidence"], 1.0)                  # the least certain edge decides
         self.assertAlmostEqual(spread["edges"]["left"]["modal"], 0.2)
+
+    def test_systemone_box_aggregate_choice(self):
+        def ask(criteria):
+            p = systemone.parse({"state": "s", "images": ["shot.png"],
+                                 "questions": {"q": {"type": "box", "criteria": criteria}}})
+            # one edge's mass: 0.6 on the peak, 0.4 two fifths of the way down
+            fields = {f.name: {"probabilities": [0.6 if i == 60 else 0.4 if i == 20 else 0.0 for i in range(101)]}
+                      for f in p[1]}
+            return systemone.format_response({"results": [{"fields": fields}], "usage": {"prompt_tokens": 9}},
+                                             p[1], p[6], "model")["answers"]["q"]
+
+        peak, average, middle = ask(None), ask({"aggregate": "mean"}), ask({"aggregate": "median"})
+        self.assertEqual((peak["aggregate"], peak["box"]["bottom"]), ("mode", 0.6))
+        self.assertEqual((average["aggregate"], average["box"]["bottom"]), ("mean", 0.44))
+        self.assertEqual((middle["aggregate"], middle["box"]["bottom"]), ("median", 0.6))
+        self.assertEqual(average["edges"]["bottom"]["modal"], 0.6)  # the peak stays visible under an average
+        for criteria in ({"aggregate": "middle"}, {"aggregate": "mode", "steps": 2}):
+            with self.subTest(criteria=criteria), self.assertRaises(ValueError):
+                systemone.parse({"state": "s", "images": ["shot.png"],
+                                 "questions": {"q": {"type": "box", "criteria": criteria}}})
 
     def test_systemone_images_and_grid_are_validated(self):
         base = {"state": "s", "questions": {"q": {"type": "noul"}}}

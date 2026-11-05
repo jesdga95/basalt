@@ -6,9 +6,12 @@ import math
 from serve.decision.schema import TEXT_MAX, dump, field, keys, require, text
 from serve.engine.errors import EngineError
 
-# A Box answer is four grid coordinates scored on their own; 0.01 is the precision Jev reports them at.
+# A Box answer is four grid coordinates scored on their own; 0.01 is the precision Jev reports them at, and the
+# peak grid point is the answer unless the question asks for an average of the distribution.
 EDGES = ("top", "bottom", "left", "right")
 BOX_STEP = 0.01
+AGGREGATES = ("mode", "mean", "median")
+BOX_AGGREGATE = "mode"
 IMAGES_MAX = 8
 
 
@@ -34,6 +37,7 @@ def parse(body):
     for name, q in qs.items():
         keys(q, ("type", "instructions", "criteria"), "question")
         kind, criteria = q.get("type"), q.get("criteria")
+        aggregate = None
         entry(q.get("instructions"))
         if kind == "choice":
             require(isinstance(criteria, dict) and 1 <= len(criteria) <= 255, "choice: 1..255 named criteria")
@@ -54,11 +58,14 @@ def parse(body):
             spec, edges = {"type": "integer", "minimum": 0, "maximum": len(criteria) - 1}, (None,)
         elif kind == "box":
             require(bool(images), "box questions are asked of an image: send images")
-            if criteria in (None, {}):
-                spec = {"type": "number", "minimum": 0.0, "maximum": 1.0, "step": BOX_STEP}
-            else:
-                keys(criteria, ("step",), "box criteria")
-                spec = {"type": "number", "minimum": 0.0, "maximum": 1.0, "step": criteria["step"]}
+            spec, aggregate = {"type": "number", "minimum": 0.0, "maximum": 1.0, "step": BOX_STEP}, BOX_AGGREGATE
+            if criteria not in (None, {}):
+                keys(criteria, ("step", "aggregate"), "box criteria")
+                if "step" in criteria:
+                    spec["step"] = criteria["step"]
+                if "aggregate" in criteria:
+                    aggregate = criteria["aggregate"]
+                    require(aggregate in AGGREGATES, "box aggregate: mode, mean or median")
             edges = EDGES
         else:
             raise ValueError("question type: choice, noul, score or box")
@@ -72,31 +79,39 @@ def parse(body):
                              f"bottom-right one, on a {spec['step']} grid"})
             size += len(f.question.encode("utf-8"))
             fields.append(f)
-        questions.append((name, kind, criteria, edges))
+        questions.append((name, kind, criteria, edges, aggregate))
     require(size <= TEXT_MAX, "state and questions: exceeds 1 MiB")
     instruction = ("Evaluate each isolated question against the state and its instructions and criteria. Return its "
                    "label, true/false or zero-based level as the JSON answer.")
-    if any(kind == "box" for _, kind, _, _ in questions):
+    if any(kind == "box" for _, kind, _, _, _ in questions):
         instruction += " A coordinate answer names where the asked-for thing sits in the picture, 0 at its "\
                        "top-left and 1 at its bottom-right."
     return instruction, fields, ["State:\n" + state], "tree", 255, True, questions, tuple(images)
 
 
-def edge_summary(values, ps):
-    """One grid coordinate: its distribution's mean, and a confidence that is one minus the expected distance from
-    the modal value divided by the uniform distance from the grid's centre, floored at zero."""
-    modal = values[max(range(len(ps)), key=ps.__getitem__)]
+def edge_summary(values, ps, aggregate):
+    """One grid coordinate: its peak, its mean and its median, each a grid point (an average is snapped to the
+    nearest one), `value` the one the question asked for, and a confidence that is one minus the expected distance
+    from the peak divided by the uniform distance from the grid's centre, floored at zero."""
+    peak = values[max(range(len(ps)), key=ps.__getitem__)]
+    mean = min(values, key=lambda v: abs(v - math.fsum(v * p for v, p in zip(values, ps))))
+    half, median, walked = 0.5, values[0], 0.0
+    for v, p in zip(values, ps):
+        walked += p
+        if walked >= half:
+            median = v
+            break
     centre = (values[0] + values[-1]) / 2
     uniform = sum(abs(v - centre) for v in values) / len(values)
-    spread = sum(p * abs(v - modal) for v, p in zip(values, ps))
-    return {"value": math.fsum(v * p for v, p in zip(values, ps)), "modal": modal,
-            "confidence": max(0.0, 1 - spread / uniform)}
+    spread = sum(p * abs(v - peak) for v, p in zip(values, ps))
+    return {"value": {"mode": peak, "mean": mean, "median": median}[aggregate], "modal": peak, "mean": mean,
+            "median": median, "confidence": max(0.0, 1 - spread / uniform)}
 
 
 def format_response(result, fields, questions, model):
     answers, details = {}, result["results"][0]["fields"]
     at = 0
-    for name, kind, criteria, edges in questions:
+    for name, kind, criteria, edges, aggregate in questions:
         group, at = fields[at:at + len(edges)], at + len(edges)
         require(at <= len(fields), "Jev returned fewer fields than the questions")
         distributions = []
@@ -111,17 +126,18 @@ def format_response(result, fields, questions, model):
             continue
         if kind == "box":
             # the four edges are scored on their own, so each pair is sorted: an answer never inverts the box
-            summary = {edge: edge_summary(f.values, ps) for edge, f, ps in zip(EDGES, group, distributions)}
+            summary = {edge: edge_summary(f.values, ps, aggregate)
+                       for edge, f, ps in zip(EDGES, group, distributions)}
             pair = {edge: sorted((summary[a]["value"], summary[b]["value"]))
                     for edge, (a, b) in (("top", ("top", "bottom")), ("left", ("left", "right")))}
-            answer = {"type": kind,
-                      "box": {"top": pair["top"][0], "bottom": pair["top"][1],
-                              "left": pair["left"][0], "right": pair["left"][1]},
-                      "confidence": min(s["confidence"] for s in summary.values())}
-            answer["edges"] = {edge: {"probability": max(ps), "modal": summary[edge]["modal"],
-                                      "moved": summary[edge]["value"] != answer["box"][edge]}
-                               for edge, ps in zip(EDGES, distributions)}
-            answers[name] = answer
+            box = {"top": pair["top"][0], "bottom": pair["top"][1],
+                   "left": pair["left"][0], "right": pair["left"][1]}
+            answers[name] = {"type": kind, "aggregate": aggregate, "box": box,
+                             "confidence": min(s["confidence"] for s in summary.values()),
+                             "edges": {edge: {"probability": max(ps), "modal": summary[edge]["modal"],
+                                              "mean": summary[edge]["mean"], "median": summary[edge]["median"],
+                                              "moved": summary[edge]["value"] != box[edge]}
+                                       for edge, ps in zip(EDGES, distributions)}}
             continue
         f, ps, winner = group[0], distributions[0], max(range(len(distributions[0])), key=distributions[0].__getitem__)
         n = len(ps)
