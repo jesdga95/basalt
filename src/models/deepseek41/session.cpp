@@ -567,10 +567,11 @@ private:
         dump("ffn_moe_topk", il, pos, ids_, (size_t) g_.n_used * sizeof(int32_t));
         dump("ffn_moe_weights_scaled", il, pos, rw_, (size_t) g_.n_used * sizeof(float));
         ops_->routed_stage(il, normed_, ids_, st);
-        return true;
+        // it needs no routing: it runs while the host finds the routed experts' places
+        return !fused_ || ops_->shared_expert(il, normed_, sh_out_, st, err_);
     }
 
-    // Shared expert and its sum with the routed result (unless the experts' call already did both), expansion into
+    // Shared expert and its sum with the routed result (unless the head and the experts' call already did both), expansion into
     // the next layer's input.
     bool enqueue_tail(int il, int64_t pos, void* st, int T = 1) {
         const size_t n = (size_t) g_.n_embd;
