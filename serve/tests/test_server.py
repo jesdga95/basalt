@@ -1240,8 +1240,8 @@ class GpuChoice(unittest.TestCase):
         self.assertIsNone(vision_card("off"))
         self.assertEqual(vision_card("3"), 3)
 
-    def test_gpu_plan(self):
-        from serve.engine.vision import check_gpu, gpu_plan, gpu_text
+    def test_model_plan(self):
+        from serve.engine.vision import check_gpu, gpu_text, model_plan
         self.assertEqual(gpu_text([0, 1]), "0,1")
         self.assertEqual(gpu_text(1), "1")
         self.assertEqual(gpu_text(None), "")
@@ -1250,17 +1250,21 @@ class GpuChoice(unittest.TestCase):
         for bad in ("a,b", "0,0", "-1", "0,"):
             with self.assertRaises(ValueError):
                 check_gpu(bad)
-        ok = mock.Mock(stdout='{"devices":"1,0","cards":[{"smi":1},{"smi":0}],"notes":[],"warning":"","error":""}\n')
+        ok = mock.Mock(returncode=0, stderr="",
+                       stdout='{"devices":"1,0","cards":[{"smi":1},{"smi":0}],"notes":[],"warning":"","error":""}\n')
         with mock.patch("subprocess.run", return_value=ok) as run:
-            self.assertEqual(gpu_plan("/x/basalt", "1,0")["devices"], "1,0")
-            self.assertEqual(run.call_args.args[0], ["/x/basalt", "--gpu-plan", "--gpu", "1,0"])
-            gpu_plan("/x/basalt", None)
-            self.assertEqual(run.call_args.args[0], ["/x/basalt", "--gpu-plan"])
-        bad = mock.Mock(stdout='{"devices":"","cards":[],"notes":[],"warning":"","error":"gpu 2: 2 GPUs are visible (0-1)"}')
+            self.assertEqual(model_plan("/x/basalt", "/m.basalt", "1,0", ["--kv", "int8"])["devices"], "1,0")
+            self.assertEqual(run.call_args.args[0], ["/x/basalt", "--model", "/m.basalt", "--kv", "int8", "--gpu-plan", "--gpu", "1,0"])
+            model_plan("/x/basalt", "/m.basalt", None, [])
+            self.assertEqual(run.call_args.args[0], ["/x/basalt", "--model", "/m.basalt", "--gpu-plan"])
+        bad = mock.Mock(returncode=2, stderr="", stdout='{"devices":"","cards":[],"notes":[],"warning":"","error":"gpu 2: 2 GPUs are visible (0-1)"}')
         with mock.patch("subprocess.run", return_value=bad), self.assertRaisesRegex(ValueError, "2 GPUs are visible"):
-            gpu_plan("/x/basalt", "2")
-        with mock.patch("subprocess.run", side_effect=OSError), self.assertRaisesRegex(ValueError, "--gpu-plan"):
-            gpu_plan("/x/basalt", "auto")
+            model_plan("/x/basalt", "/m.basalt", "2", [])
+        refused = mock.Mock(returncode=2, stdout="", stderr="basalt: error: unknown argument: --kv\nusage: basalt\n")
+        with mock.patch("subprocess.run", return_value=refused), self.assertRaisesRegex(ValueError, "unknown argument: --kv"):
+            model_plan("/x/basalt", "/m.basalt", None, ["--kv", "int8"])
+        with mock.patch("subprocess.run", side_effect=OSError), self.assertRaisesRegex(ValueError, "could not check"):
+            model_plan("/x/basalt", "/m.basalt", "auto", [])
 
     def test_vision_modes(self):
         from serve.engine.vision import vision_mode

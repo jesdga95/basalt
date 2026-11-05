@@ -247,15 +247,15 @@ class Cli(Tmp):
         (self.engine_bin.parent / "basalt-vision").write_text("")
         base = ["--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0"]
 
-        def plan(engine_bin, value):                     # the engine's own choice for --gpu 0
+        def plan(engine_bin, path, value, words):        # the engine's own choice for --gpu 0
             return {"devices": [0], "cards": [{"smi": 0}], "notes": [], "warning": None}
         def name(index):                                 # nvidia-smi knows card 9 (an older card), not card 8
             return None if index == 8 else "GeForce RTX 3070"
-        with mock.patch("serve.server.gpu_plan", side_effect=plan), \
+        with mock.patch("serve.server.model_plan", side_effect=plan), \
                 mock.patch("serve.server.gpu_card_name", side_effect=name):
             e = self.run_main(*base, "--vision", "9")   # a non-Blackwell card gets through to the Server
         self.assertIsInstance(e, RuntimeError)
-        with mock.patch("serve.server.gpu_plan", side_effect=plan), \
+        with mock.patch("serve.server.model_plan", side_effect=plan), \
                 mock.patch("serve.server.gpu_card_name", side_effect=name), \
                 mock.patch("sys.stderr", io.StringIO()) as err:
             e = self.run_main(*base, "--vision", "8")   # only a card that is not there fails at startup

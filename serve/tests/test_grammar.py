@@ -260,7 +260,7 @@ class Wire(unittest.TestCase):
         self.assertEqual(grammar_words({"--grammar"}), ["--grammar", "on"])
 
     def test_off_forms(self):
-        from serve.config import load_config_file, parse_settings
+        from serve.config import model_settings, parse_settings
         ap = build_parser()
         self.assertTrue(parse_settings(ap, ["--grammar"])[0].grammar)
         self.assertFalse(parse_settings(ap, ["--no-grammar"])[0].grammar)
@@ -268,8 +268,8 @@ class Wire(unittest.TestCase):
             for value, cli, want in ((True, [], True), (False, [], False), (True, ["--no-grammar"], False),
                                      (False, ["--grammar"], True)):
                 p = Path(d) / "c.json"
-                p.write_text(json.dumps({"server": {"grammar": value}}))
-                self.assertEqual(parse_settings(build_parser(), ["--config", str(p)] + cli)[0].grammar, want)
+                p.write_text(json.dumps({"models": [{"model": "m.basalt", "grammar": value}]}))
+                self.assertEqual(model_settings(build_parser(), ["--config", str(p)] + cli)[0][0].grammar, want)
 
 
 def free_port():
@@ -299,7 +299,7 @@ class EngineStart(unittest.TestCase):
             eng = Path(d) / "eng"
             eng.write_bytes(flags)
             conf = Path(d) / "c.json"
-            conf.write_text(json.dumps({"server": {"model": "m.basalt", **server_block}}))
+            conf.write_text(json.dumps({"models": [{"model": "m.basalt", **server_block}]}))
             argv = ["x", "--config", str(conf), "--engine-bin", str(eng), "--port", str(free_port()), *cli]
             tokdir = Path(d) / "tok"
             tokdir.mkdir()
@@ -311,7 +311,7 @@ class EngineStart(unittest.TestCase):
                     mock.patch("serve.engine.modelfile.model_config", return_value=cfg), \
                     mock.patch.dict(sys.modules, {"tokenizer": types.SimpleNamespace(Tokenizer=lambda *a, **k: ByteTokenizer())}), \
                     mock.patch.object(server, "ProcessEngine", fake), \
-                    mock.patch.object(server, "gpu_plan", return_value=ONE_CARD):
+                    mock.patch.object(server, "model_plan", return_value=ONE_CARD):
                 try:
                     server.main()
                 except Stop:

@@ -14,6 +14,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from serve.config import (  # noqa: E402
+    CONFIG_VERSION,
+    ENTRY_OPTIONS,
+    MODEL_OPTIONS,
     SAMPLING_KEYS,
     budget_count,
     build_parser,
@@ -21,6 +24,7 @@ from serve.config import (  # noqa: E402
     engine_flags_of,
     engine_line,
     load_config_file,
+    model_settings,
     parallel_count,
     parse_settings,
     sampling_defaults_from_config,
@@ -48,8 +52,22 @@ def conf(obj) -> str:
     return write(json.dumps(obj))
 
 
+def v2(cfg: dict) -> dict:
+    """`cfg`'s settings as one model entry and the blocks they belong in: {"server": ..., "engine": ...} by kind."""
+    server, entry, shared = {}, {"model": "m.basalt"}, dict(cfg.get("engine", {}))
+    for key, value in cfg.get("server", {}).items():
+        name = key.replace("_", "-").removeprefix("--")
+        if name in ENTRY_OPTIONS or name in MODEL_OPTIONS:
+            entry[key] = value
+        else:
+            server[key] = value
+    return {"version": CONFIG_VERSION, "models": [entry], "server": server, "engine": shared}
+
+
 def parse(cli: list[str], cfg=None):
-    return parse_settings(build_parser(), (["--config", conf(cfg)] if cfg is not None else []) + cli)
+    if cfg is None:
+        return parse_settings(build_parser(), cli)
+    return model_settings(build_parser(), ["--config", conf(v2(cfg))] + cli)[0]
 
 
 def engine_parser_flags() -> dict:
@@ -66,43 +84,117 @@ def engine_parser_flags() -> dict:
 
 
 class ConfigFile(unittest.TestCase):
-    def test_server_and_engine_sections(self):
-        ap = build_parser()
-        argv, engine = load_config_file(conf({"server": {"port": 9000, "vision": 2, "lazy": False,
-                                                         "allowed-host": ["a", "b"], "--gpu": "0,1"},
-                                              "engine": {"max-context": 32768, "--kv": "int8",
-                                                         "resident-experts": True}}), ap)
-        self.assertEqual(argv, ["--port", "9000", "--vision", "2", "--allowed-host", "a", "--allowed-host", "b",
-                                "--gpu", "0,1"])
-        self.assertEqual(engine, ["--max-context", "32768", "--kv", "int8", "--resident-experts"])
+    def test_blocks(self):
+        cfg = load_config_file(conf({"version": 2, "server": {"port": 9000, "lazy": False, "allowed-host": ["a", "b"]},
+                                     "engine": {"--kv": "int8", "resident-experts": True, "vision": 2},
+                                     "models": [{"model": "m.basalt", "max-context": 32768, "--gpu": "0,1"}]}), build_parser())
+        self.assertEqual(cfg.server_argv, ["--port", "9000", "--allowed-host", "a", "--allowed-host", "b"])
+        entry = cfg.models[0]
+        self.assertEqual(entry.argv[:2], ["--vision", "2"])
+        self.assertEqual(entry.argv[-2:], ["--gpu", "0,1"])
+        self.assertEqual(entry.shared_words, ["--kv", "int8", "--resident-experts"])
+        self.assertEqual(entry.own_words, ["--max-context", "32768"])
 
     def test_paths_are_relative_to_the_file(self):
-        p = conf({"server": {"model": "m/x.basalt", "tokenizer": "tok"}})
-        argv, _ = load_config_file(p, build_parser())
+        p = conf({"server": {"tokenizer": "tok"}, "models": [{"model": "m/x.basalt"}]})
+        cfg = load_config_file(p, build_parser())
         here = Path(p).resolve().parent
-        self.assertEqual(argv, ["--model", str(here / "m" / "x.basalt"), "--tokenizer", str(here / "tok")])
+        self.assertEqual(cfg.server_argv, ["--tokenizer", str(here / "tok")])
+        self.assertEqual(cfg.models[0].argv, ["--model", str(here / "m" / "x.basalt")])
+        self.assertEqual(cfg.models[0].path, str(here / "m" / "x.basalt"))
+
+    def test_the_exact_shape(self):
+        p = conf({"engine": {"conversation-cache-disk-mib": 32768, "idle-sleep": 300, "pool-workers": 8, "vram-reserve-mib": 500},
+                  "models": [{"alias": "Qwen 3.8 FN", "gpu": "auto", "kv": "int8", "max-context": 262144,
+                              "model": "a.basalt", "parallel": 4, "slot-full-context": True, "vision": "dynamic"},
+                             {"alias": "DeepSeek V4.1 Flash", "gpu": "auto", "kv": "int8", "max-context": 1048576,
+                              "model": "b.basalt", "vision": "dynamic"}],
+                  "server": {"host": "0.0.0.0", "port": 8080}})
+        (qwen, _, qfile, _), (ds, _, dfile, _) = model_settings(build_parser(), ["--config", p])
+        self.assertEqual((qwen.alias, qwen.parallel, qwen.gpu, qwen.vision, qwen.idle_sleep, qwen.host, qwen.port),
+                         ("Qwen 3.8 FN", 4, "auto", "dynamic", 300, "0.0.0.0", 8080))
+        self.assertEqual((ds.alias, ds.parallel, ds.gpu, ds.vision, ds.idle_sleep, ds.host, ds.port),
+                         ("DeepSeek V4.1 Flash", None, "auto", "dynamic", 300, "0.0.0.0", 8080))
+        for words in (qfile, dfile):
+            self.assertEqual(flag_value(words, "--pool-workers"), "8")
+            self.assertEqual(flag_value(words, "--vram-reserve-mib"), "500")
+            self.assertEqual(flag_value(words, "--conversation-cache-disk-mib"), "32768")
+            self.assertEqual(flag_value(words, "--kv"), "int8")
+        self.assertEqual(flag_value(qfile, "--batch"), "4")
+        self.assertEqual(flag_value(qfile, "--max-context"), "262144")     # slot-full-context
+        self.assertEqual(flag_value(dfile, "--max-context"), "1048576")
+
+    def test_version(self):
+        ap = build_parser()
+        entry = [{"model": "m.basalt"}]
+        load_config_file(conf({"models": entry}), ap)                   # no key: this format
+        load_config_file(conf({"version": 2, "models": entry}), ap)
+        for old in ({"server": {"model": "m.basalt"}, "engine": {"kv": "int8"}}, {"v": 1, "models": entry},
+                    {"version": 1, "models": entry}, {}):
+            with self.assertRaisesRegex(ValueError, "Basalt requires v2 config, please upgrade", msg=str(old)):
+                load_config_file(conf(old), ap)
+        with self.assertRaisesRegex(ValueError, "this is a v3 config; this Basalt reads v2"):
+            load_config_file(conf({"version": 3, "models": entry}), ap)
+        for bad in ("2", True, 2.5):
+            with self.assertRaisesRegex(ValueError, "whole number"):
+                load_config_file(conf({"version": bad, "models": entry}), ap)
+
+    def test_top_level_settings_a_model_lacks_are_left_out_for_it(self):
+        p = conf({"engine": {"kv": "int8", "spec": 7, "pool-workers": 8},
+                  "models": [{"model": "a.basalt"}, {"model": "b.basalt", "route-prior": 1}]})
+
+        def refused(path, group):
+            return path.endswith("b.basalt") and group[0] in ("--spec", "--route-prior")
+        (a, _, afile, _), (b, _, bfile, _) = model_settings(build_parser(), ["--config", p], refused)
+        self.assertEqual(afile, ["--kv", "int8", "--spec", "7", "--pool-workers", "8"])
+        self.assertEqual(a.skipped, [])
+        # an entry's own flag is not asked here: the engine's check refuses it at start
+        self.assertEqual(bfile, ["--kv", "int8", "--pool-workers", "8", "--route-prior", "1"])
+        self.assertEqual(b.skipped, ["--spec"])
+
+    def test_model_and_alias_do_not_go_with_a_config(self):
+        p = conf({"models": [{"model": "a.basalt"}]})
+        for extra in (["--model", "b.basalt"], ["--alias", "x"]):
+            with self.assertRaisesRegex(ValueError, "set in a model entry"):
+                model_settings(build_parser(), ["--config", p, *extra])
+
+    def test_the_command_line_applies_to_every_model(self):
+        p = conf({"models": [{"model": "a.basalt", "parallel": 2, "max-context": 8192}, {"model": "b.basalt"}]})
+        (a, _, afile, acli), (b, _, _, bcli) = model_settings(build_parser(), ["--config", p, "--vision", "cpu", "--kv", "int8"])
+        self.assertEqual((a.vision, b.vision), ("cpu", "cpu"))
+        self.assertEqual(acli, ["--kv", "int8"])
+        self.assertEqual(bcli, ["--kv", "int8"])
+        self.assertEqual(flag_value(afile, "--max-context"), "4096")
 
     def test_errors(self):
         ap = build_parser()
-        for obj, msg in (({"spec": 7}, "not the key"),
-                         ({"models": []}, "not the key"),
-                         ({"server": {"nope": 1}}, "not a server option"),
-                         ({"server": {"spec": 7}}, "not a server option \\(engine flags go under"),
-                         ({"server": {"engine-bin": "/x/basalt"}}, "engine-bin is set by basalt serve"),
-                         ({"server": {"vision": "yes"}}, "vision: use one of off, dynamic, cpu or a GPU number"),
-                         ({"server": {"vision": True}}, "vision: use one of off, dynamic, cpu or a GPU number"),
-                         ({"server": {"vision": False}}, "vision: use one of off, dynamic, cpu or a GPU number"),
-                         ({"server": {"port": [1]}}, "one value"),
-                         ({"server": {"config": "x"}}, "not a server option"),
-                         ({"engine": {"port": 1}}, "a server option"),
-                         ({"engine": {"model": "x"}}, "a server option"),
-                         ({"engine": {"spec": None}}, "expected a string or number"),
-                         ({"engine": {"spec": ""}}, "expected a string or number"),
-                         ({"engine": {"control-vector-layer-range": []}}, "empty list"),
-                         ({"engine": {"control-vector-layer-range": [4, [44]]}}, "expected a string or number"),
-                         ({"engine": {"control-vector-layer-range": [4, True]}}, "expected a string or number"),
-                         ({"engine": {"kv": {"a": 1}}}, "expected a string or number"),
-                         ({"engine": []}, "must be an object")):
+        entry = {"model": "m.basalt"}
+        for obj, msg in (({"spec": 7, "models": [entry]}, "unexpected key"),
+                         ({"models": []}, "at least one"),
+                         ({"models": [1]}, "at least one"),
+                         ({"models": {}}, "at least one"),
+                         ({"models": [{"alias": "x"}]}, 'models\\[0\\]: "model" names'),
+                         ({"models": [{"model": 3}]}, 'models\\[0\\]: "model" names'),
+                         ({"models": [entry, {"model": "b", "port": 1}]}, "models\\[1\\].port: a server option"),
+                         ({"models": [{"model": "b", "vision": True}]}, "vision: use one of"),
+                         ({"models": [{"model": "b", "parallel": [1]}]}, "one value"),
+                         ({"models": [{"model": "b", "slot-full-context": 1}]}, "true or false"),
+                         ({"models": [entry], "server": {"nope": 1}}, "not a server option"),
+                         ({"models": [entry], "server": {"spec": 7}}, "not a server option \\(engine flags go under"),
+                         ({"models": [entry], "server": {"engine-bin": "/x/basalt"}}, "engine-bin is set by basalt serve"),
+                         ({"models": [entry], "server": {"parallel": 2}}, "a model setting"),
+                         ({"models": [entry], "server": {"model": "m"}}, "a model setting"),
+                         ({"models": [entry], "server": {"port": [1]}}, "one value"),
+                         ({"models": [entry], "server": {"config": "x"}}, "not a server option"),
+                         ({"models": [entry], "engine": {"port": 1}}, "a server option"),
+                         ({"models": [entry], "engine": {"model": "x"}}, "in a model entry"),
+                         ({"models": [entry], "engine": {"spec": None}}, "expected a string or number"),
+                         ({"models": [entry], "engine": {"spec": ""}}, "expected a string or number"),
+                         ({"models": [entry], "engine": {"control-vector-layer-range": []}}, "empty list"),
+                         ({"models": [entry], "engine": {"control-vector-layer-range": [4, [44]]}}, "expected a string or number"),
+                         ({"models": [entry], "engine": {"control-vector-layer-range": [4, True]}}, "expected a string or number"),
+                         ({"models": [entry], "engine": {"kv": {"a": 1}}}, "expected a string or number"),
+                         ({"models": [entry], "engine": []}, "must be an object")):
             with self.assertRaisesRegex(ValueError, msg, msg=str(obj)):
                 load_config_file(conf(obj), ap)
         for text in ("[1]", "{"):
@@ -113,7 +205,7 @@ class ConfigFile(unittest.TestCase):
 
     def test_unknown_engine_key(self):
         known = {"--spec", "--kv"}
-        _, engine = load_config_file(conf({"engine": {"spc": 1}}), build_parser())
+        engine = load_config_file(conf({"engine": {"spc": 1}, "models": [{"model": "m"}]}), build_parser()).models[0].shared_words
         with self.assertRaisesRegex(ValueError, "--spc is not an engine flag"):
             check_engine_flags(engine, known, "--config c.json")
         check_engine_flags(["--kv", "int8"], known, "x")
@@ -123,9 +215,9 @@ class ConfigFile(unittest.TestCase):
             check_engine_flags(["--kv", "int8", "--kvv", "1"], known, "command line")
 
     def test_list_values_become_words(self):
-        _, engine = load_config_file(conf({"engine": {"control-vector-layer-range": [4, 44], "kv": "int8",
-                                                      "resident_experts": True, "no-x": False, "rate": 0.5,
-                                                      "offset": ["-1", -2]}}), build_parser())
+        engine = load_config_file(conf({"models": [{"model": "m"}], "engine": {
+            "control-vector-layer-range": [4, 44], "kv": "int8", "resident_experts": True, "no-x": False, "rate": 0.5,
+            "offset": ["-1", -2]}}), build_parser()).models[0].shared_words
         self.assertEqual(engine, ["--control-vector-layer-range", "4", "44", "--kv", "int8", "--resident-experts",
                                   "--rate", "0.5", "--offset", "-1", "-2"])
 
@@ -254,9 +346,8 @@ class SamplingOptions(unittest.TestCase):
         self.assertEqual(a.sampling_launch, {"temperature": 0.9, "top_k": 10, "min_p": 0.1})
         self.assertEqual(a.sampling_cli, {"temperature"})
 
-    def test_under_engine_in_the_config_is_refused(self):
-        with self.assertRaisesRegex(ValueError, "a server option"):
-            parse([], {"engine": {"temperature": 0.5}})
+    def test_under_engine_in_the_config_applies_to_every_model(self):
+        self.assertEqual(parse([], {"engine": {"temperature": 0.5}})[0].temperature, 0.5)
 
     def test_bad_values(self):
         for flag, bad in (("--temperature", "-1"), ("--temperature", "hot"), ("--temperature", "nan"),
@@ -421,7 +512,9 @@ class ApiKey(unittest.TestCase):
         for obj in ({"server": {"api-key": "k"}}, {"server": {"--api_key": "k"}}, {"server": {"API-KEY": "k"}},
                     {"engine": {"api-key": "k"}}):
             with self.assertRaisesRegex(ValueError, "api-key can't be set in a config file"):
-                load_config_file(conf(obj), build_parser())
+                load_config_file(conf({**obj, "models": [{"model": "m"}]}), build_parser())
+        with self.assertRaisesRegex(ValueError, "api-key can't be set in a config file"):
+            load_config_file(conf({"models": [{"model": "m", "api-key": "k"}]}), build_parser())
 
     def test_a_network_host_from_the_config_starts_without_a_key(self):
         cfg = {"server": {"host": "0.0.0.0"}}
@@ -452,24 +545,23 @@ class Startup(unittest.TestCase):
         return r.returncode, r.stderr
 
     def test_requirements_apply_to_the_file(self):
+        entry = {"model": "m.basalt"}
         code, err = self.run_server({})
         self.assertEqual(code, 2)
+        self.assertIn("Basalt requires v2 config", err)
+        code, err = self.run_server({"models": [entry]})
         self.assertIn("the server needs --model and the engine binary", err)
-        code, err = self.run_server({"server": {"model": "m.basalt"}})
-        self.assertIn("the server needs --model and the engine binary", err)
-        code, err = self.run_server({"server": {"gpu": "a,b", "mock-engine": True}})
+        code, err = self.run_server({"models": [{**entry, "gpu": "a,b"}], "server": {"mock-engine": True}})
         self.assertIn("--gpu a,b: expected numbers", err)
-        code, err = self.run_server({"server": {"mock-engine": True}, "engine": {"spec": 7}})
-        self.assertIn("engine flags need --model", err)
-        code, err = self.run_server({}, "--mock-engine", "--api-key", "")
+        code, err = self.run_server({"models": [entry]}, "--mock-engine", "--api-key", "")
         self.assertEqual(code, 2)
         self.assertIn("--api-key is empty", err)
-        code, err = self.run_server({"server": {"api-key": "k"}})
+        code, err = self.run_server({"models": [entry], "server": {"api-key": "k"}})
         self.assertEqual(code, 2)
         self.assertIn("api-key can't be set in a config file", err)
-        code, err = self.run_server({"server": {"nope": 1}})
+        code, err = self.run_server({"models": [entry], "server": {"nope": 1}})
         self.assertIn("not a server option", err)
-        code, err = self.run_server({"server": {"port": "abc"}})
+        code, err = self.run_server({"models": [entry], "server": {"port": "abc"}})
         self.assertEqual(code, 2)
 
 

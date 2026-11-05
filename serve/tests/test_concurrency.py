@@ -7,7 +7,7 @@ import unittest
 import urllib.request
 from pathlib import Path
 
-from serve.config import build_parser, parse_settings
+from serve.config import build_parser, model_settings
 from serve.engine.mock import MockEngine
 from serve.engine.slots import AdmissionQueue
 from serve.frontend import ChatTemplate
@@ -325,7 +325,7 @@ class Admission(unittest.TestCase):
 
 class ParallelOption(unittest.TestCase):
     def parse(self, *argv):
-        return parse_settings(build_parser(), list(argv))
+        return model_settings(build_parser(), list(argv))[0]
 
     def test_default_is_one_and_adds_no_engine_flag(self):
         a, _, file_engine, cli_engine = self.parse("--mock-engine")
@@ -347,12 +347,12 @@ class ParallelOption(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "c.json"
-            p.write_text(json.dumps({"server": {"parallel": 3}}))
+            p.write_text(json.dumps({"models": [{"model": "m", "parallel": 3}]}))
             a, _, file_engine, cli_engine = self.parse("--config", str(p))
             self.assertEqual((a.parallel, file_engine[:2], "--batch" in cli_engine), (3, ["--batch", "3"], False))
             _, _, file_engine, cli_engine = self.parse("--config", str(p), "--parallel", "2")
             self.assertEqual(cli_engine[:2], ["--batch", "2"])
-            p.write_text(json.dumps({"server": {"parallel": 3}, "engine": {"batch": 2}}))
+            p.write_text(json.dumps({"models": [{"model": "m", "parallel": 3}], "engine": {"batch": 2}}))
             with self.assertRaises(ValueError):
                 self.parse("--config", str(p))
 
