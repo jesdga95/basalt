@@ -22,6 +22,10 @@ public:
     std::function<void(int)> live;
     /// Optional: asked after each chunk; true ends the read there, and the state is good for nothing.
     std::function<bool()> stop;
+    /// Optional: queued at the start of each layer with its streams [T][4][n_embd], on the chunk's stream.
+    std::function<void(int layer, const float* x, int T, void* stream)> layer_tap;
+    /// Optional: a chunk of T tokens at pos0 has run; false with `err` fails the read.
+    std::function<bool(int T, int64_t pos0, std::string& err)> chunk_done;
     /// Runs tokens[0..n) at positions pos0.. through the layers, chunk by chunk, leaving the layer state exactly as
     /// n single-token steps would for what any token from the read's stop on reads. `rows_after`: positions between these
     /// tokens and the stop (-1 unknown): rows further from it than the layers past the first ratio-1 layer can see stop at

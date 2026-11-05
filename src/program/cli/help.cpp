@@ -99,6 +99,7 @@ void usage() {
                  "                       token plus up to N-1 MTP drafts, sized per window by the drafts' joint chance\n"
                  "                       of acceptance against a threshold adapted per request); 0 or 1 = no\n"
                  "                       speculation (default 8 when the pack has a drafter, else 0)\n"
+                 "  --drafter FILE       a model whose drafter is a file of its own: load it and draft (off without it)\n"
                  "  --relaxed-drafting [P]  sampled requests keep a draft the target gives probability >= P even when\n"
                  "                       the target's own draw differs: faster, but NOT the exact sampling distribution\n"
                  "                       (docs/precision/features.md).  P in (0, 1]; lower is faster and further from exact;\n"
