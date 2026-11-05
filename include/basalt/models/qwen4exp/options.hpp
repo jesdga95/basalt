@@ -95,15 +95,17 @@ struct Options : CommonOptions {
     std::string dump_final_r;
     /// --relaxed-drafting [P]: under sampling, a draft the target gives probability >= P is kept even when the target's
     /// own draw differs (0 = exact; the flag alone = kRelaxedDraftingDefault).  This changes the output distribution:
-    /// docs/precision/features.md.  Solo decode only; a request's relax=P key overrides it.
+    /// docs/precision/qwen38-flash-next.md#relaxed-drafting.  Solo decode only; a request's relax=P key overrides it.
     float relaxed_drafting = 0.0f;
     /// --route-tail-skip [R]: in a decode window an expert no GPU holds is neither copied nor computed when every
     /// entry of the window that names it ranks R or lower by router weight (0 = off; the flag alone =
-    /// kRouteTailSkipDefault).  The others keep their router weights.  This changes the output: docs/precision/features.md.
+    /// kRouteTailSkipDefault).  The others keep their router weights.  This changes the output:
+    /// docs/precision/qwen38-flash-next.md#lossy-routing-flags.
     int route_tail_skip = 0;
     /// --route-prior [LAMBDA]: a decode window picks its top-10 as if every expert a GPU holds had LAMBDA added to its
     /// router logit; the weights stay the router's own (0 = off; the flag alone = kRoutePriorDefault). This changes
-    /// the output: docs/precision/routing.md.
+    /// the output:
+    /// docs/precision/qwen38-flash-next.md#lossy-routing-flags.
     float route_prior = 0.0f;
     /// Never relaxed: the added tokens (control and tool tags, ids from relax_special_from on) and every token
     /// between the tool-call tags, so tool calls are sampled exactly.
