@@ -23,11 +23,16 @@ struct CpuTopology {
     int e_cores = 0;                ///< Efficient cores
     std::vector<int> worker_cores;  ///< Ordered CPU IDs, one per physical core unless the affinity adds siblings
     int host_core = -1;             ///< Logical core reserved for host thread
+    /// The efficient class's logical processors, empty unless hybrid.  Linux lists the allowed ones, Windows every one.
+    std::vector<int> efficient;
 };
 
 /// The processors this process may run on, one per physical core (SMT siblings share a core's load/store bandwidth),
 /// ordered for `affinity`. `skip_first` takes the first one out of `worker_cores` and names it `host_core`.
 CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity = CpuAffinity::All);
+
+/// The processor the calling thread runs on at this moment, in the numbering above; -1 when the OS does not say.
+int current_cpu();
 
 /// What the machine's processor is called and how many physical cores it has, for a benchmark row. `name` is the
 /// vendor string as the OS gives it (empty when it gives none); `physical_cores` counts every core the OS lists,
