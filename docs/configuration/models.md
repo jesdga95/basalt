@@ -90,8 +90,8 @@ the queue.
 ## Progress
 
 `/health` has `model` (the model loading, else the loaded one), `percent` and `swap` (`from`, `to`, `phase`, `elapsed_s`, `waiting`). `/metrics`
-and `/v1/status` have `swap` and `models`. The stats page has a picker: it chooses whose numbers the page shows, and Load swaps to
-it. The console prints the load bars of each swap, and:
+and `/v1/status` have `swap` and `models`. The stats page has a picker: choosing a model loads it, and the
+header shows the load's progress. The console prints the load bars of each swap, and:
 
 ```
 [server] swap: Qwen -> DeepSeek, 2 waiting
