@@ -187,9 +187,16 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     if (peer_) basalt::log::info("basalt deepseek41", "peer GPU %d: %lld experts", peer_->device(), (long long) n_layers_ * homes_.peer);
     basalt::log::info("basalt deepseek41", "expert homes of %d per layer: main card %d, second card %d, RAM %d, file %d; main card copies %lld",
                  n_expert_, homes_.main, homes_.peer, homes_.ram, homes_.file, (long long) (homes_.main > 0 ? ext_per_layer_ : per_layer_));
+    program::warn_spill(spill(), peer_ ? "" : ", or --gpu 0,1");
     basalt::log::info("basalt deepseek41", "VRAM expert tier %.2f GiB, %lld of %d experts per layer (%.0f%%); CPU pool %d workers",
                  cache_.gib(), (long long) per_layer_, n_expert_, 100.0 * (double) per_layer_ / n_expert_, pool_->workers());
     return true;
+}
+
+program::ExpertSpill ExpertTier::spill() const {
+    uint64_t one_each = 0;
+    for (const ExpertLayer& e : m_.pack().experts) one_each += e.blob_bytes;
+    return {(int64_t) n_layers_ * homes_.file, (int64_t) n_layers_ * n_expert_, one_each * (uint64_t) homes_.file};
 }
 
 namespace {

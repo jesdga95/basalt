@@ -1473,6 +1473,30 @@ class PcieShare(unittest.TestCase):
         self.assertIn("end=length  hit=60.0%  pcie=20.0%", out.getvalue())
 
 
+class SsdShare(unittest.TestCase):
+    """The decode's lookups read from the expert file are their own share of everything routed."""
+
+    def test_history(self):
+        tok = ByteTokenizer()
+        engine = DoneLineEngine(tok, "</think>\n\nok", max_context=CTX, done_lines=[
+            "DONE 4 20 40.0 30.0 stop 3 5 0 60 100 0 5 0.0 20 25",     # 5 of 125 routed from the file: 4%
+            "DONE 4 20 40.0 30.0 stop 3 5 0 60 100 0 0 0.0 20 25"])
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            for _ in range(2):
+                list(svc.run(tok.encode("hi"), False, None, 10, {}, threading.Event()))
+        self.assertEqual([r["ssd_share"] for r in svc.history], [0.04, None])
+        self.assertIn("pcie=20.0%  ssd=4.0%", out.getvalue())
+
+    def test_spill_in_metrics(self):
+        from serve.service import spill_of
+        info = {"expert_slots": 9, "spill_experts": 320, "spill_total": 15360, "spill_bytes": 2751463424}
+        self.assertEqual(spill_of(info), {"experts": 320, "total": 15360, "bytes": 2751463424})
+        self.assertEqual(info, {"expert_slots": 9})                 # the raw words leave the engine block
+        self.assertIsNone(spill_of({"spill_experts": 0, "spill_total": 15360, "spill_bytes": 0}))
+        self.assertIsNone(spill_of({}))                              # an engine that reports no spill
+
+
 class RepeatedToken(unittest.TestCase):
     """A reply that repeats one token is served as the model writes it: "length" only at max_tokens."""
 

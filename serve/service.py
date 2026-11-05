@@ -642,8 +642,9 @@ class Service:
                 "elapsed_s": round(time.time() - s["started"], 1) if busy and s.get("started") else None,
                 "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if busy else None}
-        engine = {"model": self.model, "max_context": self.engine.max_context,
-                  **dict(getattr(self.engine, "info", {}) or {})}
+        info = dict(getattr(self.engine, "info", {}) or {})
+        spill = spill_of(info)
+        engine = {"model": self.model, "max_context": self.engine.max_context, **info, "spill": spill}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else \
             {"now": {"gpus": []}, "history": {}, "static": {"gpus": []}}
         with self.status_lock:
@@ -1214,6 +1215,7 @@ class Service:
                             routed = (last.get("lookups") or 0) + (last.get("offloaded") or 0)
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
+                            ssd_share = round(last["file_reads"] / routed, 3) if last.get("file_reads") and routed else None
                             seen = prompt_tokens_seen(len(ids), last)   # less than len(ids) when cancelled mid-read
                             self.requests_done += 1
                             if st.get("slot") is not None:
@@ -1230,7 +1232,7 @@ class Service:
                                 "prompt_ms": last.get("prompt_ms"),
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                                 if n and last.get("generated") and last.get("decode_ms") else None,
-                                "hit_rate": hit_rate, "pcie_share": pcie_share,
+                                "hit_rate": hit_rate, "pcie_share": pcie_share, "ssd_share": ssd_share,
                                 "drafts_offered": last.get("drafts_offered"),
                                 "drafts_accepted": last.get("drafts_accepted"),
                                 "ttft_s": round(ttft, 2) if ttft is not None else None,
@@ -1244,7 +1246,7 @@ class Service:
                             now = time.time()
                             rate = n / max(1e-6, now - ft) if ft else 0.0
                             print(done_line(self._slot_of(st), seen, n, finish, cancel.is_set(), timings, ttft, rate,
-                                            dl, hit_rate, pcie_share), flush=True)
+                                            dl, hit_rate, pcie_share, ssd_share), flush=True)
                             if finish == "length" and parser.state == "reasoning":
                                 print("[server] warning: max tokens reached while thinking, no answer "
                                       "(set reasoning_budget_tokens, or start with --reasoning-budget-tokens)",
@@ -1296,9 +1298,15 @@ def slot_tag(slot: int | None) -> str:
     return "s?" if slot is None else f"s{slot + 1}"
 
 
+def spill_of(info: dict) -> dict | None:
+    """The experts only the file holds, from the engine's INFO words: {experts, total, bytes}, None when none are."""
+    words = {k: info.pop(f"spill_{k}", None) for k in ("experts", "total", "bytes")}
+    return words if isinstance(words["experts"], int) and words["experts"] > 0 else None
+
+
 def done_line(slot: int | None, prompt_total: int, generated: int, finish: str, cancelled: bool,
               timings: dict | None, ttft: float | None, wall_rate: float, dl: float | None = None,
-              hit: float | None = None, pcie: float | None = None) -> str:
+              hit: float | None = None, pcie: float | None = None, ssd: float | None = None) -> str:
     """The request's closing log line: slot, prompt (total, cached, read time, read rate), reply (count, rate,
     drafts accepted, tokens per window), time to the first token, end, expert cache hit and PCIe share.
     `timings` is request_timings(); None when the engine gave no clock."""
@@ -1322,6 +1330,8 @@ def done_line(slot: int | None, prompt_total: int, generated: int, finish: str, 
         groups.append(f"hit={hit * 100:.1f}%")
         if pcie is not None:
             groups.append(f"pcie={pcie * 100:.1f}%")
+        if ssd:
+            groups.append(f"ssd={ssd * 100:.1f}%")
     return f"[server] {slot_tag(slot)} done  " + "  ".join(groups)
 
 

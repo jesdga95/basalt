@@ -486,6 +486,7 @@ private:
         dc.hits = c.hits - counts0_.hits;
         dc.lookups = c.lookups - counts0_.lookups;
         dc.offloaded = c.offloaded - counts0_.offloaded;
+        dc.file_blobs = c.files - counts0_.files;
         return dc;
     }
     void report_request(const DoneCounts& dc) override { report_expert_counts(dc); }
