@@ -29,7 +29,7 @@ and [DeepSeek-V4.1 precision](precision/deepseek41.md). Both are served by the s
 | Grammar and strict tools | yes ([`grammar`](configuration/index.md#server)) | yes |
 | Thinking | yes | yes |
 | Reasoning effort | `none`, `low`, `medium`, `high`, `max`; `high` and `max` are the same; a number is refused | `none`, `low` (50), `medium` and `high` (75), `max` (100), or a number 1 to 100 |
-| Drafting | MTP drafter in the pack, on by default (`--spec`, default 8) | DSpark in the pack, off unless `--spec N` |
+| Drafting | MTP drafter in the pack, on by default (`--spec`, default 8) | DSpark in the pack, on by default (`--spec`, default 3) |
 | Parallel slots (`--parallel`) | yes | yes; draft nothing |
 | Conversation cache in RAM and on disk | yes | yes |
 | Idle sleep and wake | yes (Linux) | yes (Linux); see limits |
@@ -67,10 +67,10 @@ How it uses the memory, long prompts and drafting: [DeepSeek-V4.1 packs](deepsee
 - **Prompt skip and read shape.** A real run differs from a full read by the rounding of another batch shape, as another chunk
   size does ([prompt skip](precision/deepseek41.md#prompt-skip)). `--no-prompt-skip` reads every row through every layer and
   is slower.
-- **DSpark is a loss in most cases measured.** On one 400 W card and one 180 W card, on long agentic conversations
-  (125-141K tokens, thinking and tools), `--spec 8` gave 51.62 tok/s against 64.06 plain; on short greedy prose it also
-  lost, and on short code it won. It takes 7.47 GiB of the main card, which the expert tier then lacks. Numbers and the one
-  case where it paid: [what it costs](deepseek41.md#what-it-costs).
+- **DSpark pays on code, about even on long prose.** On one 400 W card and one 180 W card, greedy 800 tokens: code 82.6 tok/s
+  against 62.2 plain, a conversation 78.1 against 64.7, prose 69.6 against 65.2; a long agentic conversation (125-141K tokens,
+  thinking and tools, temperature 1) 63.15 against 62.15. It keeps 32 experts per stage, 2.41 GiB of the main card:
+  [what it costs](deepseek41.md#what-it-costs).
 - **Parallel slots add no throughput.** At 400 W + 180 W, one stream gave 60.1 tok/s, two slots 58.4 and four 54.9 in
   total. Slots share one decode stream and draft nothing.
 - **Two-card idle sleep may not happen.** The server sleeps only when the GPU state fits in the free RAM with 8 GiB to spare.

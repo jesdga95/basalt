@@ -1,9 +1,12 @@
 // src/models/deepseek41/dspark_parity.cpp - parity of the DSpark drafter's kernels against plain CPU references, at the
 // drafter's geometry (5120 -> 2304 -> 5120 MXFP4 experts, 512-wide latents, a 129280-row rank-256 Markov table), with
-// a microbench line for the expert kernels.
+// a microbench line for the expert kernels; and a drafter that keeps some experts computes what the whole one does on them.
+#include "basalt/models/deepseek41/kernels.hpp"
+#include "models/deepseek41/dspark.hpp"
 #include "models/deepseek41/dspark_kernels.hpp"
 #include "models/deepseek41/kernels/test_util.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <cstdio>
@@ -201,6 +204,80 @@ int main() {
     for (int i = 0; i < 5120; ++i) s += (double) cw[i] * hh[i];
     for (int i = 0; i < 256; ++i) s += (double) cw[5120 + i] * p_ref[i];
     verdict("confidence", dstest::compare(dcf.down(), std::vector<float>{(float) (1.0 / (1.0 + std::exp(-s)))}, 1e-3), 1e-5);
+
+    // ---- kept experts: the ranking's first per stage, topped up in index order, ascending
+    {
+        std::vector<std::pair<int32_t, int32_t>> ranked;
+        for (int e = 127; e >= 0; --e) ranked.push_back({0, e});                  // stage 0: most routed is the highest index
+        for (int e = 0; e < 20; ++e) ranked.push_back({1, (e * 37) % 128});      // stage 1: names fewer than it keeps
+        ranked.push_back({7, 3});                                               // out of range: ignored
+        const auto kept = dspark_kept_experts(ranked, 3, 128, 32);
+        bool ok = kept.size() == 3;
+        for (const auto& k : kept) ok = ok && k.size() == 32 && std::is_sorted(k.begin(), k.end());
+        ok = ok && kept[0].front() == 96 && kept[0].back() == 127;               // 96..127
+        for (int e = 0; e < 20 && ok; ++e) ok = std::binary_search(kept[1].begin(), kept[1].end(), (e * 37) % 128);
+        ok = ok && kept[2].front() == 0 && kept[2].back() == 31;                 // no ranking: the first 32
+        std::printf("%-22s %s\n", "kept experts", ok ? "ok" : "FAIL");
+        if (!ok) ++failures;
+    }
+
+    // ---- a kept subset against the whole: the experts by remapped ids, the router with the rest's bias at -inf, bit for bit
+    {
+        const std::vector<int> keep = {1, 4, 5, 9, 12, 13, 14, 15};
+        const size_t gu_one = (size_t) kFF * mxfp4_row_bytes(kIn), d_one = (size_t) kOut * mxfp4_row_bytes(kFF);
+        std::vector<uint8_t> kg(keep.size() * gu_one + kMxfp4Pad), ku(keep.size() * gu_one + kMxfp4Pad), kd(keep.size() * d_one + kMxfp4Pad);
+        for (size_t i = 0; i < keep.size(); ++i) {
+            std::memcpy(&kg[i * gu_one], &gate[(size_t) keep[i] * gu_one], gu_one);
+            std::memcpy(&ku[i * gu_one], &up[(size_t) keep[i] * gu_one], gu_one);
+            std::memcpy(&kd[i * d_one], &down[(size_t) keep[i] * d_one], d_one);
+        }
+        std::vector<int32_t> cid(kT * kK), fid(kT * kK);
+        for (int p = 0; p < kT * kK; ++p) {
+            cid[p] = (int32_t) (rng() % keep.size());
+            fid[p] = keep[(size_t) cid[p]];
+        }
+        Dev<uint8_t> dkg(kg), dku(ku), dkd(kd);
+        Dev<int32_t> dcid(cid), dfid(fid);
+        Dev<float> h1((size_t) kT * kK * kFF), h2((size_t) kT * kK * kFF), o1((size_t) kT * kK * kOut), o2((size_t) kT * kK * kOut);
+        dspark_moe_gate_up(dg.p, du.p, kIn, kFF, dx.p, dfid.p, kT, kK, 10.f, h1.p, nullptr);
+        dspark_moe_down(dd.p, kFF, kOut, h1.p, dfid.p, kT, kK, o1.p, nullptr);
+        dspark_moe_gate_up(dkg.p, dku.p, kIn, kFF, dx.p, dcid.p, kT, kK, 10.f, h2.p, nullptr);
+        dspark_moe_down(dkd.p, kFF, kOut, h2.p, dcid.p, kT, kK, o2.p, nullptr);
+        check(cudaDeviceSynchronize(), "kept experts");
+        const bool same_e = o1.down() == o2.down() && h1.down() == h2.down();
+
+        constexpr int kAll = 128, kKeep = 32;
+        std::vector<float> rw((size_t) kAll * kIn), rb(kAll);
+        for (float& v : rw) v = 0.02f * nd(rng);
+        for (float& v : rb) v = 0.1f * nd(rng);
+        std::vector<int> rk;
+        for (int e = 0; e < kAll; ++e)
+            if (rng() % 4 == 0 && (int) rk.size() < kKeep) rk.push_back(e);
+        for (int e = 0; (int) rk.size() < kKeep; ++e)
+            if (!std::binary_search(rk.begin(), rk.end(), e)) { rk.push_back(e); std::sort(rk.begin(), rk.end()); }
+        std::vector<float> masked = rb, krw((size_t) kKeep * kIn), krb(kKeep);
+        for (int e = 0; e < kAll; ++e)
+            if (!std::binary_search(rk.begin(), rk.end(), e)) masked[(size_t) e] = -INFINITY;
+        for (int i = 0; i < kKeep; ++i) {
+            std::memcpy(&krw[(size_t) i * kIn], &rw[(size_t) rk[(size_t) i] * kIn], (size_t) kIn * 4);
+            krb[(size_t) i] = rb[(size_t) rk[(size_t) i]];
+        }
+        Dev<float> drw(rw), dmb(masked), dkrw(krw), dkrb(krb), l1((size_t) kT * kAll), l2((size_t) kT * kKeep), w1(kT * kK), w2(kT * kK);
+        Dev<int32_t> i1(kT * kK), i2(kT * kK);
+        RouterArgs ra;
+        ra.n_embd = kIn;
+        ra.k = kK;
+        ra.n_expert = kAll;
+        router(dx.p, drw.p, dmb.p, kT, ra, l1.p, i1.p, w1.p, nullptr);
+        ra.n_expert = kKeep;
+        router(dx.p, dkrw.p, dkrb.p, kT, ra, l2.p, i2.p, w2.p, nullptr);
+        check(cudaDeviceSynchronize(), "kept router");
+        const auto gi1 = i1.down(), gi2 = i2.down();
+        bool same_r = w1.down() == w2.down();
+        for (int p = 0; p < kT * kK; ++p) same_r = same_r && gi2[p] >= 0 && gi2[p] < kKeep && gi1[p] == rk[(size_t) gi2[p]];
+        std::printf("%-22s experts %s, router %s\n", "kept against whole", same_e ? "bit for bit" : "DIFFER", same_r ? "bit for bit" : "DIFFER");
+        if (!same_e || !same_r) ++failures;
+    }
 
     // ---- microbench: one layer's expert work for a 5-row block (bytes are what the kernels touch)
     float ms = 0;
