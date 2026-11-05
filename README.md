@@ -59,8 +59,9 @@ profile ships with the engine ([data/profiles](data/profiles)).
 
 ### DeepSeek-V4.1-Flash
 
-The pack is `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS.basalt` on
-[Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt), with images and a context of up to 1M tokens.
+The pack is `DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt` on
+[Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt), built from Unsloth's UD-IQ1_M GGUF (Dynamic V3.1), with images and a
+context of up to 1M tokens.
 It runs through the same command; what it supports and how it uses the memory: [DeepSeek-V4.1](docs/deepseek41.md).
 
 <!-- MAINTAINER: DeepSeek headline numbers go here, from your own runs. Remove this comment before release. -->
@@ -83,8 +84,9 @@ It runs through the same command; what it supports and how it uses the memory: [
 - [Strata](https://github.com/Niko1221/Strata): the project Basalt forks (MIT).
 - [Qwen](https://huggingface.co/Qwen/Qwen3.8-Flash-Next): the model. The packs are under the [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE), not Basalt's MIT license.
 - [DeepSeek](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017): the model and the DSpark drafter. Its pack is under the model's own license, not Basalt's MIT license.
-- [unsloth](https://huggingface.co/unsloth): the UD and Q8_0 GGUFs the packs are built from.
-- IST Austria DAS Lab: the GSQ-RCO quants; please cite [GSQ](https://arxiv.org/abs/2604.18556) and [RCO](https://arxiv.org/abs/2605.00649).
+- [unsloth](https://huggingface.co/unsloth): the UD and Q8_0 GGUFs the Flash-Next packs are built from, and the
+  [UD-IQ1_M GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (Dynamic V3.1) the DeepSeek pack is built from.
+- IST Austria DAS Lab: the GSQ-RCO quants of the Flash-Next packs; please cite [GSQ](https://arxiv.org/abs/2604.18556) and [RCO](https://arxiv.org/abs/2605.00649).
 - [NVIDIA](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4): the NVFP4 experts.
 - [ggml and llama.cpp](https://github.com/ggml-org/llama.cpp): quantization formats and kernels extracted into `src/` (MIT, see [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)).
 

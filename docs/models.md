@@ -8,10 +8,10 @@ file and picks the chat format, tool-call syntax and thinking switch to match. S
 
 | | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash |
 | --- | --- | --- |
-| Packs | [jesdga/Qwen3.8-Flash-Next-Basalt](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt): nine, from NVFP4 to Q2_0 (names in the [README](../README.md#qwen38-flash-next)) | [jesdga/DeepSeek-V4.1-Flash-1017-Basalt](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt): one, `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS.basalt`, with the DSpark drafter and the vision projector in the file |
+| Packs | [jesdga/Qwen3.8-Flash-Next-Basalt](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt): nine, from NVFP4 to Q2_0 (names in the [README](../README.md#qwen38-flash-next)) | [jesdga/DeepSeek-V4.1-Flash-1017-Basalt](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt): one, `DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt`, with the DSpark drafter and the vision projector in the file |
 | Layers | 48 (36 GDN, 12 QSA) | 40 |
 | Experts | 512 per layer, top-10 | 384 per layer, top-6, plus one shared |
-| Pack size | per pack on the Hugging Face card | about 240 GiB |
+| Pack size | per pack on the Hugging Face card | about 242 GiB |
 | Context | `--max-context`, default 4,096; the YaRN flags apply | `--max-context` up to 1,048,576 (from the pack), default 4,096; the YaRN flags are refused |
 | Architecture id | `qwen4exp` | `deepseek41` |
 
@@ -59,9 +59,8 @@ Reasoning effort in the config and on the API: [sampling](configuration/sampling
 
 How it uses the memory, long prompts and drafting: [DeepSeek-V4.1 packs](deepseek41.md).
 
-- **Quality:** `basalt-bench --quality` scores it against a BF16 reference of the model made by @giveen. The published
-  GSQ-RCO IQ2_XXS pack: KLD 0.431, top-1 79.97%, PPL 3.635 against 2.731; a heavier tail than Flash-Next's IQ3_S
-  (KLD 0.149) ([quality](precision/deepseek41.md#against-the-bf16-reference)).
+- **Quality:** `basalt-bench --quality` scores it against a BF16 reference of the model made by @giveen: KLD 0.278,
+  top-1 83.88%, PPL 3.033 against 2.731 ([quality](precision/deepseek41.md#against-the-bf16-reference)).
 - **Output depends on placement.** Experts on the card and experts on the CPU round their activations differently, so which
   experts are resident can change a token. A fixed prompt on a fixed memory budget repeats exactly; a different RAM tier
   size can change the text ([precision](precision/deepseek41.md#routed-and-shared-experts)).

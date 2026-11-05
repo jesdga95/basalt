@@ -187,8 +187,8 @@ Basalt reads the first half of each chunk and scores the rest one row per window
 
 | Pack | PPL | KLD mean | KLD median | KLD p99 | Rows above 2 | Top-1 |
 |---|---|---|---|---|---|---|
-| GSQ-RCO IQ2_XXS (the published pack) | 3.6353 | 0.4311 | 0.0894 | 4.39 | 5.06% | 79.97% |
-| UD-IQ1_M (Unsloth's GGUF, converted here) | 3.0334 | 0.2779 | 0.0550 | 2.86 | 2.26% | 83.88% |
+| GSQ-RCO IQ2_XXS (an earlier pack) | 3.6353 | 0.4311 | 0.0894 | 4.39 | 5.06% | 79.97% |
+| UD-IQ1_M (the published pack, Unsloth's GGUF) | 3.0334 | 0.2779 | 0.0550 | 2.86 | 2.26% | 83.88% |
 
 Both carry the same IQ4_NL Engram table. On the first 5 chunks of the IQ2_XXS pack, the same rows are worst whatever the
 engine does: in reverse chunk order 59 of the 64 worst rows are the same (KLD correlation 0.996), on one card 61, with the

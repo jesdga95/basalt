@@ -2,7 +2,8 @@
 
 A `deepseek41` pack runs through the same command, `basalt serve PACK`; the server reads the model's architecture from
 the pack and picks the chat format, tool-call syntax and thinking switch to match. The pack is
-`DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS.basalt` on [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt).
+`DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt` on [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt), built from Unsloth's
+UD-IQ1_M GGUF (Dynamic V3.1) with `convert.py --sections-from` ([model file](model-file.md#deepseek-v41-pack)).
 
 - **First start:** the engine deals the experts out in routing order and loads them once per start. One card: as many
   as fit go into a pinned RAM tier, the most routed first, the VRAM slots hold copies of its head, and the rest are read
@@ -76,7 +77,7 @@ RAM cannot take them, the last experts of the routing order stay in the file.
 
 ### What it costs
 
-Measured with a 400 W RTX 5090 and a 180 W RTX 5060 Ti, 121 GiB of RAM, `--pool-workers 8`, the Q8_0 drafter on the main card.
+Measured on the earlier GSQ-RCO IQ2_XXS pack. Measured with a 400 W RTX 5090 and a 180 W RTX 5060 Ti, 121 GiB of RAM, `--pool-workers 8`, the Q8_0 drafter on the main card.
 It takes 7.47 GiB there, and the start line goes from `main card 34, second card 46, RAM 304, file 0` to `main card 10, second
 card 46, RAM 303, file 25`. A block takes 2.24 ms (8.63 ms with `--diag-drafter-gpu 1`).
 
