@@ -106,12 +106,21 @@ public:
         return true;
     }
 
+    int max_window() const override { return m_.sessions() > 1 ? 1 : std::clamp(m_.tiers().spec, 1, kMaxWindow); }
+
     model::Result decode_window(const model::DecodeRequest& r) override {
+        if (r.row_tokens) {
+            if (r.n_tokens > kMaxWindow) return {model::Status::Error, "deepseek41: the decode window is too long"};
+            std::string err;
+            if (!prepare_draw(r, err)) return {model::Status::Error, err};
+            if (!step(r.tokens, r.n_tokens, r.pos, true, r.row_tokens, r.logits, err)) return {model::Status::Error, err};
+            return {};
+        }
         for (int i = 0; i < r.n_tokens; ++i) {
             const bool last = i + 1 == r.n_tokens;
             std::string err;
             if (last && !prepare_draw(r, err)) return {model::Status::Error, err};
-            if (!step(r.tokens[i], r.pos + i, last, last ? r.next_token : nullptr, last ? r.logits : nullptr, err))
+            if (!step(r.tokens + i, 1, r.pos + i, last, last ? r.next_token : nullptr, last ? r.logits : nullptr, err))
                 return {model::Status::Error, err};
         }
         return {};
@@ -139,7 +148,7 @@ public:
                     if (r.n_tokens <= kStepTailTokens) {
                         close_prompt_path();
                         for (int i = 0; i < r.n_tokens; ++i)
-                            if (!step(r.tokens[i], r.pos + i, false, nullptr, nullptr, err)) return {model::Status::Error, err};
+                            if (!step(r.tokens + i, 1, r.pos + i, false, nullptr, nullptr, err)) return {model::Status::Error, err};
                         return {};
                     }
                     std::string te;
@@ -159,7 +168,7 @@ public:
         }
         for (int i = 0; i < r.n_tokens; ++i) {
             std::string err;
-            if (!step(r.tokens[i], r.pos + i, false, nullptr, nullptr, err)) return {model::Status::Error, err};
+            if (!step(r.tokens + i, 1, r.pos + i, false, nullptr, nullptr, err)) return {model::Status::Error, err};
         }
         return {};
     }
@@ -276,12 +285,14 @@ public:
         return {};
     }
 
-    model::Result resample_last(const float* bias, int32_t& token) override {
+    model::Result resample_row(int row, const float* bias, int32_t& token) override {
         std::string e;
         if (!device_bias(d_mask_, bias, e)) return {model::Status::Error, e};
         kernels::SamplerParams sp = sampling_;
         sp.logit_bias = d_mask_;
-        kernels::sample_tokens(logits_, 1, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sp, am_dev_, stream_);
+        sp.counter += (uint64_t) row;
+        kernels::sample_tokens(logits_ + (size_t) row * g_.n_vocab, 1, g_.n_vocab, history_len_ > 0 ? d_hist_ + (size_t) row * history_len_ : nullptr,
+                               history_len_, sp, am_dev_, stream_);
         if (cudaMemcpyAsync(h_next_, am_dev_, sizeof(int32_t), cudaMemcpyDeviceToHost, stream_) != cudaSuccess ||
             cudaStreamSynchronize(stream_) != cudaSuccess)
             return {model::Status::Error, "the masked draw failed"};
@@ -484,11 +495,11 @@ private:
         if (history_len_ > 0) {
             if (d_hist_ == nullptr) {
                 void* v = nullptr;
-                if (cudaMalloc(&v, (size_t) kHistoryCap * sizeof(int32_t)) != cudaSuccess) { err = "out of device memory for the penalties"; return false; }
+                if (cudaMalloc(&v, (size_t) kHistoryCap * kMaxWindow * sizeof(int32_t)) != cudaSuccess) { err = "out of device memory for the penalties"; return false; }
                 allocs_.push_back(v);
                 d_hist_ = (int32_t*) v;
             }
-            if (cudaMemcpy(d_hist_, r.history, (size_t) history_len_ * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+            if (cudaMemcpy(d_hist_, r.history, (size_t) r.n_tokens * history_len_ * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
                 err = "the penalty history upload failed";
                 return false;
             }
@@ -558,7 +569,9 @@ private:
             rms_norm(cur_, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, normed_, st);
         }
         dump("hc_attn_pre", il, pos, cur_, n * sizeof(float));
-        if (!ops_->attention(il, pos, token, normed_, attn_out_, st, err_)) return false;
+        if (T == 1 ? !ops_->attention(il, pos, token, normed_, attn_out_, st, err_)
+                   : !ops_->attention_window(il, T, normed_, attn_out_, st, err_))
+            return false;
         dump("attn_out", il, pos, attn_out_, n * sizeof(float));
         hc_post(attn_out_, x_, coef_a_, kHcCoef, T, (int) n, x2_, st);
         dump("hc_attn_post", il, pos, x2_, 4 * n * sizeof(float));
@@ -572,9 +585,11 @@ private:
         dump("ffn_moe_logits", il, pos, rlogits_, (size_t) g_.n_expert * sizeof(float));
         dump("ffn_moe_topk", il, pos, ids_, (size_t) g_.n_used * sizeof(int32_t));
         dump("ffn_moe_weights_scaled", il, pos, rw_, (size_t) g_.n_used * sizeof(float));
-        ops_->routed_stage(il, normed_, ids_, st);
+        if (T == 1) ops_->routed_stage(il, normed_, ids_, st);
+        else ops_->routed_stage_window(T, normed_, ids_, st);
         // it needs no routing: it runs while the host finds the routed experts' places
-        return !fused_ || ops_->shared_expert(il, normed_, sh_out_, st, err_);
+        if (!fused_) return true;
+        return T == 1 ? ops_->shared_expert(il, normed_, sh_out_, st, err_) : ops_->shared_expert_window(il, T, normed_, sh_out_, st, err_);
     }
 
     // Shared expert and its sum with the routed result (unless the head and the experts' call already did both), expansion into
@@ -623,26 +638,30 @@ private:
         return run_graph(tail_g_[(size_t) graph_row(T) * g_.n_layers + il], [&]() { return enqueue_tail(il, pos, stream_, T); });
     }
 
-    bool step(int32_t token, int64_t pos, bool want_out, int32_t* next, float* logits_out, std::string& err) {
+    bool step(const int32_t* tokens, int T, int64_t pos, bool want_out, int32_t* next, float* logits_out, std::string& err) {
         err_.clear();
-        bool ok = step_impl(token, pos, want_out, next, logits_out);
+        bool ok = step_impl(tokens, T, pos, want_out, next, logits_out);
         if (!ok) err = err_.empty() ? "deepseek41: step failed" : err_;
         return ok;
     }
 
-    // A later position than `pos` drops out of the n-gram history.
+    // Rows of a window past `pos` were not accepted: the compressor state keeps only the ones before it. A later position
+    // than `pos` drops out of the n-gram history.
     void sync_rewind(int64_t pos) {
         if (pos == 0) whole_from_ = 0;
+        if (ops_) ops_->commit_window(pos, stream_);
         if (ops_ && pos == 0) ops_->trim_positions();
         if (pos > 0 && (int64_t) hist_.size() > pos) hist_.resize((size_t) pos);
     }
 
 
 
-    bool step_impl(int32_t token, int64_t pos, bool want_out, int32_t* next, float* logits_out) {
+    // `T` rows at pos..; with T > 1 every row's pick lands in next[T] and the rows stay until a later call drops those past it.
+    bool step_impl(const int32_t* tokens, int T, int64_t pos, bool want_out, int32_t* next, float* logits_out) {
         const size_t n = (size_t) g_.n_embd;
         void* st = stream_;
         if (!prefillp::may_resume(pos, (int64_t) hist_.size(), whole_from_)) return fail(kSkippedRows);
+        if (T > 1 && !dump_dir_.empty()) return fail("deepseek41: a decode window cannot run with tensor dumps");
         if (pos == 0) {
             hist_.clear();
             whole_from_ = 0;
@@ -650,20 +669,23 @@ private:
         }
         if ((int64_t) hist_.size() < pos) return fail("positions must be consecutive from 0 (the session keeps one sequence)");
         hist_.resize((size_t) pos);   // a position before the end drops the rejected rows of a window
-        hist_.push_back(token);
-        ops_->begin_token(pos);
+        hist_.insert(hist_.end(), tokens, tokens + T);
+        ops_->begin_token(pos, T);
         {
             std::string se;
-            if (!ops_->stage_token(pos, st, se)) return fail(se);
+            if (!ops_->stage_token(pos, T, st, se)) return fail(se);
         }
         const bool graphs = dump_dir_.empty() && ops_->graph_capable();
         fused_ = graphs;
 
-        // embedding, repeated into the four streams
-        emb4_.resize(n * kHcMult);
-        std::string e;
-        if (!m_.embedding_row(token, emb4_.data(), e)) return fail(e);
-        for (int s = 1; s < kHcMult; ++s) std::copy(emb4_.begin(), emb4_.begin() + n, emb4_.begin() + (size_t) s * n);
+        // embeddings, each repeated into the four streams
+        emb4_.resize(n * kHcMult * T);
+        for (int t = 0; t < T; ++t) {
+            float* row = emb4_.data() + (size_t) t * kHcMult * n;
+            std::string e;
+            if (!m_.embedding_row(tokens[t], row, e)) return fail(e);
+            for (int s = 1; s < kHcMult; ++s) std::copy(row, row + n, row + (size_t) s * n);
+        }
         DS_CUDA(cudaMemcpyAsync(x_, emb4_.data(), emb4_.size() * sizeof(float), cudaMemcpyHostToDevice, stream_));
         dump("hc_init", -1, pos, x_, 4 * n * sizeof(float));
 
@@ -680,15 +702,15 @@ private:
                 prev[j] = q >= 0 ? hist_[(size_t) q] : 0;
             }
             for (size_t k = 0; k < en.layers.size(); ++k) {
-                std::vector<int32_t> ids((size_t) n_cols);
-                engram_hash(en.hash, (int) k, &token, 1, pos, pos == 0 ? nullptr : prev, ids.data());
+                std::vector<int32_t> ids((size_t) n_cols * T);
+                engram_hash(en.hash, (int) k, tokens, T, pos, pos == 0 ? nullptr : prev, ids.data());
                 std::vector<uint32_t> rows(ids.begin(), ids.end());
-                raw[k].assign((size_t) n_cols * en.row_bytes, 0);
+                raw[k].assign((size_t) n_cols * T * en.row_bytes, 0);
                 tickets[k] = m_.engram_reader().issue(rows.data(), rows.size(), raw[k].data());
             }
         }
 
-        const int T = 1;
+        const int32_t token = tokens[0];
         bool tail_pending = false;
         std::string err;
 
@@ -697,13 +719,13 @@ private:
             for (size_t k = 0; k < en.layers.size(); ++k) {
                 if (en.layers[k] != il) continue;
                 if (tail_pending) {
-                    if (!run_tail(il - 1, pos)) return false;
+                    if (!run_tail(il - 1, pos, T)) return false;
                     tail_pending = false;
                 }
                 if (!m_.engram_reader().collect(tickets[k], err)) return fail(err);
-                std::vector<float> rows_f((size_t) n_cols * 256);
+                std::vector<float> rows_f((size_t) n_cols * T * 256);
                 const int blocks = 256 / 32;
-                for (int r = 0; r < n_cols; ++r)
+                for (int r = 0; r < n_cols * T; ++r)
                     for (int b = 0; b < blocks; ++b)
                         dequantize_iq4_nl(raw[k].data() + (size_t) r * en.row_bytes + (size_t) b * 18,
                                           rows_f.data() + (size_t) r * 256 + (size_t) b * 32);
@@ -713,7 +735,7 @@ private:
                 const DevTensor* gw = m_.tensor(il, "engram_gate.weight");
                 if (!kvw || !gw) return fail("layer " + std::to_string(il) + " has no Engram tensors");
                 dump("engram_rows", il, pos, rows_dev_, rows_f.size() * sizeof(float));
-                dense_f32(*kvw, rows_dev_, q8_, kv_dev_, (int) rows_f.size(), (int) (5 * n), 1, st);
+                dense_f32(*kvw, rows_dev_, q8_, kv_dev_, n_cols * 256, (int) (5 * n), T, st);
                 dump("engram_kv", il, pos, kv_dev_, 5 * n * sizeof(float));
                 EngramArgs ea;
                 ea.n_embd = (int) n;
@@ -726,12 +748,14 @@ private:
                 if (!ops_->routed_experts_staged(il, normed_, ids_, rw_, moe_out_, st, err_)) return false;
                 if (!enqueue_tail(il, pos, st)) return false;
             } else {
-                if (!run_head(il, pos, token, tail_pending && !engram_at(il))) return false;
+                if (!run_head(il, pos, token, tail_pending && !engram_at(il), T)) return false;
                 tail_pending = true;
-                if (!ops_->routed_and_shared_staged(il, normed_, ids_, rw_, ffn_sum_, sh_out_, st, err_)) return false;
+                if (T == 1 ? !ops_->routed_and_shared_staged(il, normed_, ids_, rw_, ffn_sum_, sh_out_, st, err_)
+                           : !ops_->routed_shared_window(il, T, rw_, ffn_sum_, sh_out_, st, err_))
+                    return false;
             }
         }
-        if (tail_pending && !run_tail(g_.n_layers - 1, pos)) return false;
+        if (tail_pending && !run_tail(g_.n_layers - 1, pos, T)) return false;
         if (!want_out && !next && !logits_out) {
             DS_CUDA(cudaStreamSynchronize(stream_));
             return true;
@@ -743,7 +767,16 @@ private:
         rms_norm(cur_, (const float*) m_.tensor("output_norm.weight")->ptr, T, (int) n, g_.rms_eps, normed_, st);
         dump("result_norm", -1, pos, normed_, n * sizeof(float));
         const DevTensor* head = m_.tensor("output.weight");
-        dense_f32(*head, normed_, q8_, logits_, (int) n, g_.n_vocab, 1, st);
+        dense_f32(*head, normed_, q8_, logits_, (int) n, g_.n_vocab, T, st);
+        if (T > 1) {
+            if (draw_kernel_) kernels::sample_tokens(logits_, T, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sampling_, am_dev_, st);
+            else argmax_rows(logits_, T, g_.n_vocab, am_dev_, am_ws_, st);
+            DS_CUDA(cudaMemcpyAsync(h_next_, am_dev_, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, stream_));
+            if (logits_out) DS_CUDA(cudaMemcpyAsync(logits_out, logits_, (size_t) T * g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, stream_));
+            DS_CUDA(cudaStreamSynchronize(stream_));
+            std::copy(h_next_, h_next_ + T, next);
+            return true;
+        }
         if (next && !logits_out && draw_kernel_) {
             kernels::sample_tokens(logits_, 1, g_.n_vocab, history_len_ > 0 ? d_hist_ : nullptr, history_len_, sampling_, am_dev_, st);
             DS_CUDA(cudaMemcpyAsync(h_next_, am_dev_, sizeof(int32_t), cudaMemcpyDeviceToHost, stream_));

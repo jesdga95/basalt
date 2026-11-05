@@ -68,6 +68,13 @@ struct CommonOptions {
     std::string gpu;
     bool gpu_plan = false;
     std::string arch;                  ///< the --model file's architecture
+    /// Speculative decoding with a verify window of this many tokens (the last accepted token and spec-1 drafts);
+    /// 0 = plain decode.  `spec_oracle` drafts from a token file (the expected continuation, for the exactness test).
+    int spec = 0;
+    bool spec_given = false;           ///< --spec on the command line
+    std::string spec_oracle;
+    bool diag_teacher = false;         ///< --diag-teacher: --spec-oracle's tokens go on whatever the picks
+    bool diag_tier_frozen = false;     ///< --diag-tier-frozen: the VRAM tier keeps what it holds
     std::string diag_dump;                 ///< --diag-dump DIR: a model's per-layer tensors, off by default
     int diag_tier_ram = -1, diag_tier_vram = -1;   ///< --diag-tier-ram / --diag-tier-vram: fixed expert-tier sizes
     bool diag_serial_prompt = false;       ///< --diag-serial-prompt: an adapter model reads its prompt one decode step at a time

@@ -297,6 +297,11 @@ bool PeerExperts::launch_plain(int64_t layer, const kernels::NativeExpertLayout&
     return launch_layout(layer, L, x, ids, 1, k, kind, err, rows_map_);
 }
 
+bool PeerExperts::launch_window(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids,
+                                int64_t n_tok, int64_t k, const int32_t* kind, std::string& err) {
+    return launch_layout(layer, L, x, ids, n_tok, k, kind, err, rows_map_);
+}
+
 bool PeerExperts::launch_rows(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n,
                               float* out, std::string& err) {
     static_assert(kRowBatch == CAP, "a row batch fills a launch's entries");

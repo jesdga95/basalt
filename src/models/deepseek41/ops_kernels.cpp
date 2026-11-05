@@ -37,7 +37,14 @@ struct ExpertPlan {
     int32_t tok[8];
 };
 
-;
+// A window's plan: the distinct experts of its rows, each with the rows it computes.
+struct WindowPlan {
+    unsigned long long ptr[ExpertTier::kMaxK];
+    int32_t start[ExpertTier::kMaxK + 2];
+    int32_t ng[4];
+    int32_t dst[ExpertTier::kMaxK];
+    int32_t tok[ExpertTier::kMaxK];
+};
 
 // Layer roles: the kv source whose compressed rows a layer reads, and the latest index source at or below it.
 int kv_source(int il) {
@@ -224,6 +231,7 @@ public:
 
     void restore_turn(void* stream, const uint8_t* host) override {
         cudaStreamSynchronize((cudaStream_t) stream);
+        win_n_ = 0;
         const size_t ring_b = (size_t) kWindowSlots * kLatent * 2;
         size_t at = 0;
         auto get = [&](void* dev, size_t bytes) {
@@ -248,11 +256,11 @@ public:
             cudaMemset(st_sc_[il], 0, n);
         }
         win_n_ = 0;
-        cudaMemset(ids_, 0xff, kTopK * 4);
+        cudaMemset(ids_, 0xff, (size_t) kMaxT * kTopK * 4);
     }
 
-    void begin_token(int64_t) override {
-        if (tier_) tier_->begin_token();
+    void begin_token(int64_t, int n_tokens) override {
+        if (tier_) tier_->begin_token(n_tokens);
     }
 
     bool attention_batch(int il, int64_t pos0, int n_tokens, const int32_t*, const float* x, float* out, int,
@@ -280,14 +288,40 @@ public:
         return ensure_positions(pos0 + n_tokens, err) && ensure_batch(err) && batch_->compress_only(il, pos0, n_tokens, x, stream, err);
     }
 
-    bool stage_token(int64_t pos, void* stream, std::string& err) override {
-        if (pos >= ctx_) {
+    bool stage_token(int64_t pos, int T, void* stream, std::string& err) override {
+        if (pos + T > ctx_) {
             err = "deepseek41: the position exceeds the context (" + std::to_string(ctx_) + " tokens)";
             return false;
         }
-        if (!ensure_positions(pos + 1, err)) return false;
+        if (!ensure_positions(pos + T, err)) return false;
         if (!ensure_tier(err)) return false;
-        return stage_positions(pos, 1, stream);
+        commit_window(pos, stream);
+        if (T > 1) {
+            win_pos0_ = pos;
+            win_n_ = T;
+        }
+        return stage_positions(pos, T, stream);
+    }
+
+    void commit_window(int64_t next_pos, void* stream) override {
+        if (!win_n_) return;
+        const int q = (int) std::clamp<int64_t>(next_pos - win_pos0_, 0, win_n_);
+        win_n_ = 0;
+        for (int il = 0; il < g_.n_layers; ++il)
+            if (g_.compress_ratio[(size_t) il] && kv_source(il) == il)
+                compress_window_commit(compress_args(il), dpos_ + il * kPosStride, q, cws_l_[il], stream);
+    }
+
+    bool attention_window(int il, int T, const float* x, float* out, void* stream, std::string& err) override {
+        if (T > staged_T_) {
+            err = "deepseek41: window attention called for a window that was not staged";
+            return false;
+        }
+        return attn_impl(il, T, x, out, stream, err);
+    }
+
+    bool shared_expert_window(int il, int T, const float* x, float* out, void* stream, std::string& err) override {
+        return shared_impl(il, T, x, out, stream, err);
     }
     bool graph_capable() const override { return true; }
 
@@ -430,7 +464,8 @@ public:
                     return false;
                 }
                 const CompressArgs ca = compress_args(il);
-                compress(ca, x, d_pos, 1, cws_, stream);
+                if (T > 1) compress_window(ca, x, d_pos, T, cws_l_[il], stream);
+                else compress(ca, x, d_pos, 1, cws_, stream);
             }
             if (index_source(il) == il) {
                 const DevTensor *iqb = W("indexer.attn_q_b.weight"), *ipj = W("indexer.proj.weight");
@@ -487,17 +522,18 @@ public:
     bool ensure_tier(std::string& err) {
         if (tier_) return true;
         constexpr int kRows = ExpertTier::kMaxK;   // routed outputs of a window: tokens x slots
+        constexpr size_t kPlanBytes = std::max(sizeof(ExpertPlan), sizeof(WindowPlan));
         share_g_.assign((size_t) g_.n_layers * (kMaxK + 1), nullptr);
         if (!alloc(&ex_xq_, kernels::native_q8_1_bytes(g_.n_embd, kMaxT)) ||
             !alloc(&ex_scr_, kernels::native_expert_scratch_bytes(kRows, g_.n_ff_exp)) ||
             !alloc((void**) &ex_rows_, (size_t) kRows * g_.n_embd * 4) ||
-            !alloc((void**) &ex_plan_, sizeof(ExpertPlan)) || !alloc((void**) &ex_plan2_, sizeof(ExpertPlan)))
+            !alloc((void**) &ex_plan_, kPlanBytes) || !alloc((void**) &ex_plan2_, kPlanBytes))
             return oom(err);
         // the plan and the CPU's rows are mapped host memory read by kernels: no copy-engine job queues behind the
         // promotion copies, and the host sync at the top of each layer orders their reuse
         constexpr unsigned kMapped = cudaHostAllocPortable | cudaHostAllocMapped;
-        if (cudaHostAlloc((void**) &h_plan_, sizeof(ExpertPlan), kMapped) != cudaSuccess ||
-            cudaHostAlloc((void**) &h_plan2_, sizeof(ExpertPlan), kMapped) != cudaSuccess ||
+        if (cudaHostAlloc((void**) &h_plan_, kPlanBytes, kMapped) != cudaSuccess ||
+            cudaHostAlloc((void**) &h_plan2_, kPlanBytes, kMapped) != cudaSuccess ||
             cudaHostAlloc((void**) &h_ids_, 64 * 4, kMapped) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d_plan_host_, h_plan_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d_plan2_host_, h_plan2_, 0) != cudaSuccess ||
@@ -505,7 +541,7 @@ public:
             err = "deepseek41: cannot allocate the pinned expert staging";
             return false;
         }
-        for (int k = 0; k < g_.n_used; ++k) h_ids_[k] = -1;
+        for (int k = 0; k < 64; ++k) h_ids_[k] = -1;
         DsModel::SharedTier& shared = m_.shared_tier();
         if (shared.tier) {   // another session opened it: the sessions run one at a time over the same rows
             tier_ = shared.tier;
@@ -568,9 +604,110 @@ public:
         return routed_run(il, w, out, shared_out, stream, err);
     }
 
+    void routed_stage_window(int T, const float* x, const int32_t* ids, void* stream) override {
+        for (int t = 0; t < T; ++t) copy_row(x + (size_t) t * g_.n_embd, d_x_host_ + (size_t) t * g_.n_embd, g_.n_embd, stream);
+        kernels::quantize_q8_1_rows(x, T, g_.n_embd, ex_xq_, stream);
+        copy_words(ids, d_ids_host_, T * g_.n_used, stream);   // last: the host goes on once all of them landed
+    }
+
+    // The routed experts of a window. The tier is asked once per distinct expert of the window; each card runs what it holds
+    // over every row that routed to it, the CPU does the same for the rest.
+    bool routed_shared_window(int il, int T, const float* w, float* out, float* shared_out, void* stream,
+                              std::string& err) override {
+        const ExpertLayer& el = m_.pack().experts[(size_t) il];
+        const int K = g_.n_used;
+        const int n = g_.n_embd;
+        const kernels::NativeExpertLayout L = kernels::native_expert_layout(el.gu_type, el.d_type, n, g_.n_ff_exp);
+        if (L.bytes != el.blob_bytes) {
+            err = "deepseek41: layer " + std::to_string(il) + " expert blob size does not match the layout";
+            return false;
+        }
+        cudaStream_t st = (cudaStream_t) stream;
+        await_ids(st, T * K);
+        int32_t uniq[ExpertTier::kMaxK];
+        int nu = 0;
+        int uidx[ExpertTier::kMaxK];   // [t * K + k] -> index in uniq
+        ExpertTier::Use use[ExpertTier::kMaxK];
+        for (int t = 0; t < T; ++t)
+            for (int k = 0; k < K; ++k) {
+                const int32_t e = h_ids_[t * K + k];
+                int u = 0;
+                while (u < nu && uniq[u] != e) ++u;
+                if (u == nu) {
+                    uniq[nu++] = e;
+                    use[u] = ExpertTier::Use{};
+                }
+                ExpertTier::Use& us = use[u];
+                us.tok[us.nt] = t;
+                us.row[us.nt] = t * K + k;
+                ++us.nt;
+                uidx[t * K + k] = u;
+            }
+        ExpertTier::Lookup lk;
+        if (!tier_->lookup(il, uniq, nu, lk, err)) return false;
+        const int n_fetched = tier_->fetch(il, lk);
+
+        // the second card's share first: its rows are the last of the two cards' to land
+        core::PeerExperts* peer = tier_->peer();
+        if (peer) {
+            int32_t kind[ExpertTier::kMaxK] = {};
+            for (int r = 0; r < T * K; ++r) kind[r] = lk.peer[uidx[r]] ? 2 : 0;
+            kernels::NativeExpertLayout limited = L;
+            limited.swiglu_limit = g_.clamp_exp[(size_t) il];
+            if (!peer->launch_window(il, limited, h_x_, h_ids_, T, K, kind, err)) return false;
+        }
+
+        // the GPU's share: the experts the VRAM tier holds; the fetched ones in a second plan, once their copies landed
+        const auto make_plan = [&](WindowPlan& pl, bool fetched, int& entries) {
+            int ng = 0, ne = 0;
+            for (int i = 0; i < nu; ++i) {
+                if (!lk.dev[i] || lk.fetched[i] != fetched) continue;
+                pl.ptr[ng] = (unsigned long long) lk.dev[i];
+                pl.start[ng] = ne;
+                for (int j = 0; j < use[i].nt; ++j) {
+                    pl.dst[ne] = use[i].row[j];
+                    pl.tok[ne] = use[i].tok[j];
+                    ++ne;
+                }
+                ++ng;
+            }
+            pl.start[ng] = ne;
+            pl.ng[0] = ng;
+            entries = ne;
+            return ng;
+        };
+        const auto gpu_share = [&](const void* host_plan, void* dev_plan, int ng, int ne) {
+            copy_words(host_plan, dev_plan, (int) (sizeof(WindowPlan) / 4), stream);
+            WindowPlan* dp = (WindowPlan*) dev_plan;
+            kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok, ng, ne,
+                                                   ex_xq_, ex_scr_, ex_rows_, stream);
+        };
+        int entries = 0;
+        const int nhits = make_plan(*(WindowPlan*) h_plan_, false, entries);
+        if (nhits) gpu_share(d_plan_host_, ex_plan_, nhits, entries);
+        if (n_fetched) {
+            const int ng = make_plan(*(WindowPlan*) h_plan2_, true, entries);
+            tier_->await_fetch(st);
+            gpu_share(d_plan2_host_, ex_plan2_, ng, entries);
+        }
+        // the CPU's share runs while the GPU works; its rows land in their rows
+        if (nhits + n_fetched < nu) {
+            if (!tier_->run_cpu_window(il, h_x_, lk, use, h_rows_, err)) return false;
+            tier_->promote(il, lk);
+        }
+        if (peer && !peer->finish(nullptr, err)) return false;
+        WindowRowPtrs rp{};
+        for (int r = 0; r < T * K; ++r)
+            rp.p[r] = lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * n : d_rows_ + (size_t) r * n;
+        weighted_sum_window(rp, w, T, K, n, out, stream, shared_out);
+        for (int r = 0; r < T * K; ++r) h_ids_[r] = -1;
+        ids_read_ = false;
+        return true;
+    }
+
     // Every id of the layer landed in the mapped ids (routed_stage writes them last); the stream goes on meanwhile. A launch
     // that failed never writes them.
-    void await_ids(cudaStream_t st) {
+    void await_ids(cudaStream_t st, int n_ids) {
         if (ids_read_) {   // a layer that failed left its ids behind
             cudaStreamSynchronize(st);
             return;
@@ -580,7 +717,7 @@ public:
         const volatile int32_t* ids = h_ids_;
         for (int s = 0; s < kSpins; ++s) {
             bool all = true;
-            for (int k = 0; k < g_.n_used; ++k) all = all && ids[k] >= 0;
+            for (int k = 0; k < n_ids; ++k) all = all && ids[k] >= 0;
             if (all) {
                 std::atomic_thread_fence(std::memory_order_acquire);
                 return;
@@ -602,7 +739,7 @@ public:
             return false;
         }
         cudaStream_t st = (cudaStream_t) stream;
-        if (shared_out) await_ids(st);
+        if (shared_out) await_ids(st, K);
         else cudaStreamSynchronize(st);
         ExpertTier::Lookup lk;
         if (!tier_->lookup(il, h_ids_, K, lk, err)) return false;

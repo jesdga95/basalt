@@ -474,8 +474,8 @@ void ExpertTier::settle() {
     drain();
 }
 
-void ExpertTier::begin_token() {
-    ++token_;
+void ExpertTier::begin_token(int n_tokens) {
+    token_ += (uint64_t) n_tokens;
     drain();
     finish_swaps();
     start_swaps();
@@ -536,7 +536,7 @@ void ExpertTier::finish_swaps() {
 }
 
 void ExpertTier::start_swaps() {
-    if (homes_.file == 0 || want_.empty()) {
+    if (homes_.file == 0 || want_.empty() || m_.tiers().diag_tier_frozen) {
         want_.clear();
         return;
     }
@@ -638,6 +638,32 @@ bool ExpertTier::run_cpu(int layer, const float* x, const Lookup& lk, float* row
     return true;
 }
 
+bool ExpertTier::run_cpu_window(int layer, const float* x, const Lookup& lk, const Use* use, float* rows, std::string& err) {
+    const kernels::cpu::NativeFmt& f = fmt_[(size_t) layer];
+    const size_t n_embd = (size_t) m_.geo().n_embd;
+    kernels::cpu::ExpertJobMulti jobs[kMaxK];
+    bool quantized[kMaxWindow] = {};
+    int n = 0;
+    for (int i = 0; i < lk.k; ++i) {
+        if (lk.dev[i] || lk.peer[i]) continue;
+        jobs[n] = kernels::cpu::ExpertJobMulti{};
+        jobs[n].blob = lk.host[i];
+        jobs[n].nt = use[i].nt;
+        for (int j = 0; j < use[i].nt; ++j) {
+            const int t = use[i].tok[j];
+            if (!quantized[t]) {
+                kernels::cpu::native_quant_act(f, x + (size_t) t * n_embd, act_ + (size_t) t * kernels::cpu::kNativeActBytes);
+                quantized[t] = true;
+            }
+            jobs[n].nact[j] = act_ + (size_t) t * kernels::cpu::kNativeActBytes;
+            jobs[n].out[j] = rows + (size_t) use[i].row[j] * n_embd;
+        }
+        ++n;
+    }
+    if (n) pool_->run_split_multi_native(f, jobs, n);
+    (void) err;
+    return true;
+}
 
 int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best) const {
     int32_t slot = -1;
@@ -720,6 +746,7 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
 }
 
 int ExpertTier::fetch(int layer, Lookup& lk) {
+    if (m_.tiers().diag_tier_frozen) return 0;
     int np = 0, nf = 0;
     for (int i = 0; i < lk.k; ++i)
         if (!lk.dev[i] && !lk.peer[i]) ++(pinned(layer, lk.experts[i]) ? np : nf);
@@ -744,6 +771,7 @@ int ExpertTier::fetch(int layer, Lookup& lk) {
 void ExpertTier::await_fetch(cudaStream_t main) { cudaStreamWaitEvent(main, fetch_ev_, 0); }
 
 void ExpertTier::promote(int layer, const Lookup& lk) {
+    if (m_.tiers().diag_tier_frozen) return;
     for (int i = 0; i < lk.k; ++i) {
         if (lk.dev[i] || !lk.again[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
         if (!move_to_peer(layer, lk.experts[i], lk.host[i])) claim(layer, lk.experts[i], lk.host[i], copy_stream_, /*homes_too=*/true);

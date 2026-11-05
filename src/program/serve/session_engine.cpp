@@ -339,8 +339,8 @@ public:
     }
     bool window_failed() const { return false; }
     const char* window_error() const { return error_.c_str(); }
-    bool resample_row(int, int64_t, const std::vector<float>& bias, int32_t& tok, std::string& e) {
-        const basalt::model::Result r = rt_.session().resample_last(bias.data(), tok);
+    bool resample_row(int row, int64_t, const std::vector<float>& bias, int32_t& tok, std::string& e) {
+        const basalt::model::Result r = rt_.session().resample_row(row, bias.data(), tok);
         if (!r.ok()) e = r.message;
         return r.ok();
     }
@@ -458,7 +458,7 @@ bool SessionRuntime::next_batch_window() {
         }
         if (sl.guard != nullptr && sl.guard->on() && sl.guard->scan(&y, 1) >= 0) {
             sl.guard->mask_bias({}, grammar_bias);
-            if (const basalt::model::Result r = session().resample_last(grammar_bias.data(), y); !r.ok()) {
+            if (const basalt::model::Result r = session().resample_row(0, grammar_bias.data(), y); !r.ok()) {
                 std::printf("ERR %s\n", r.message.c_str());
                 set_active(0);
                 return false;

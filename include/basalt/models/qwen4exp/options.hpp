@@ -93,11 +93,6 @@ struct Options : CommonOptions {
     /// After every processed position, append the residual after the last layer (hc x n_embd floats, the MTP draft
     /// head's input) to this file.  Token path only.
     std::string dump_final_r;
-    /// Speculative decoding with a verify window of this many tokens (the last accepted token and spec-1 drafts);
-    /// 0 = plain decode.  `spec_oracle` drafts from a token file (the expected continuation, for the exactness test);
-    /// `spec_corrupt` N > 0 replaces every Nth draft with a wrong token.
-    int spec = 0;
-    bool spec_given = false;      // --spec on the command line
     /// --relaxed-drafting [P]: under sampling, a draft the target gives probability >= P is kept even when the target's
     /// own draw differs (0 = exact; the flag alone = kRelaxedDraftingDefault).  This changes the output distribution:
     /// docs/precision/features.md.  Solo decode only; a request's relax=P key overrides it.
@@ -117,8 +112,7 @@ struct Options : CommonOptions {
     /// The --batch slots in this many groups pipelined through the stages of a layer split (stage k
     /// runs one group while stage k+1 runs another).  1 = every slot in one window, stage after stage.
     int batch_groups = 1;
-    std::string spec_oracle;
-    int spec_corrupt = 0;
+    int spec_corrupt = 0;         // --spec-corrupt N > 0 replaces every Nth draft with a wrong token
     /// Names the model's draft layer when it has one (the file); empty means no drafter.
     std::string mtp;
     int64_t mtp_window = 32768;   ///< the draft layer attends to the last N cells (0 = every cell)

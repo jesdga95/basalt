@@ -147,6 +147,25 @@ void test_compress(Verdict& v) {
         }
         v.expect(outs[0] == outs[1] && outs[0] == outs[2], "compress independent of call split (latents)");
         v.expect(outk[0] == outk[1] && outk[0] == outk[2], "compress independent of call split (index keys)");
+        {
+            // speculative windows of several widths: the rows of a rejected tail leave no trace
+            CompState st(ratio, cap);
+            CompressArgs a;
+            a.ratio = ratio; a.w_kv = dwkv.p; a.w_gate = ratio > 1 ? dwg.p : nullptr; a.norm_w = dnw.p;
+            a.w_idx_k = dwik.p; a.idx_k_norm_w = dnk.p; a.rope_freq = dfreq.p;
+            a.state_kv = st.skv.p; a.state_score = st.ssc.p; a.comp_kv = st.ckv.p; a.comp_ik = st.cik.p;
+            const int width[] = {4, 2, 5, 8, 3, 1}, kept[] = {2, 2, 1, 3, 3, 1};
+            int off = 0;
+            for (int i = 0; off < N; i = (i + 1) % 6) {
+                const int T = std::min(width[i], N - off), q = std::min(kept[i], T);
+                compress_window(a, dx.p + (size_t) off * D, dpos.p + off, T, ws.p, nullptr);
+                compress_window_commit(a, dpos.p + off, q, ws.p, nullptr);
+                off += q;
+            }
+            check(cudaDeviceSynchronize(), "compress_window");
+            v.expect(st.ckv.down() == outs[0], "compress_window with rejected tails equals compress (latents)");
+            v.expect(st.cik.down() == outk[0], "compress_window with rejected tails equals compress (index keys)");
+        }
 
         // reference: state carried through positions P0..P0+N-1 starting from zero (rows before P0 are not part of it)
         std::vector<std::vector<double>> kvs(N, std::vector<double>(kLatent)), scs(N, std::vector<double>(kLatent));
