@@ -6,8 +6,13 @@
 #include "basalt/program/options.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/model/flags.hpp"
+#include "basalt/core/model_file.hpp"
 #include "basalt/log.hpp"
+#include "models/deepseek41/context_policy.hpp"
 #include "models/deepseek41/model.hpp"
+
+#include <cstdint>
 
 namespace basalt::models::deepseek41 {
 namespace {
@@ -89,6 +94,33 @@ public:
     PreTokenizer pretokenizer() const override { return {"joyai-llm", pretok_joyai}; }
 
     int max_expert_cards() const override { return 1; }
+
+    // The caches are fp16 whatever is asked: --kv names a format every model's config may carry, and output stays the model's.
+    bool parse_flag(const std::string& name, model::FlagArgs& args, program::CommonOptions&, int& code) const override {
+        if (name != "--kv") return false;
+        const std::string v = args.next("--kv");
+        if (v != "fp16" && v != "int8" && v != "q4_0" && v != "k8v4") {
+            basalt::log::error("basalt deepseek41", "--kv %s: expected fp16, int8, q4_0 or k8v4", v.c_str());
+            code = 2;
+        } else if (v != "fp16") {
+            basalt::log::warn("basalt deepseek41", "--kv %s: this model's caches stay fp16", v.c_str());
+        }
+        return true;
+    }
+
+    // A context the pack refuses is refused with the flags, before anything loads; the memory check needs the card.
+    std::optional<int> finish_flags(program::CommonOptions& o) const override {
+        if (!o.max_context_set || o.model.empty()) return std::nullopt;
+        core::ModelFile file;
+        std::string err;
+        if (!file.open(o.model, err) || !file.load_meta(err)) return std::nullopt;
+        const core::Json* kv = file.meta().get("gguf_kv");
+        const core::Json* native = kv ? kv->get("deepseek41.context_length") : nullptr;
+        const ctxp::Plan p = ctxp::plan_context(o.max_context, true, native ? (int64_t) native->u64() : 0, UINT64_MAX, {});
+        if (p.error.empty()) return std::nullopt;
+        basalt::log::error("basalt deepseek41", "%s", p.error.c_str());
+        return 2;
+    }
 
     // The disk tier's records count positional cells; this model's caches keep compressed rows.
     model::TokenNames token_names() const override {
