@@ -63,9 +63,20 @@ class Render(unittest.TestCase):
 
     def test_effort_words(self):
         m = [{"role": "user", "content": "hi"}]
-        for word, budget in (("low", 50), ("medium", 75), ("xhigh", 100), (None, 75)):
+        for word, budget in (("low", 50), ("medium", 75), ("high", 75), ("max", 100), (None, 75), (30, 30), (100, 100)):
             with self.subTest(word=word):
                 self.assertIn(f"Reasoning Effort: {budget} ", self.t.render(m, reasoning_effort=word))
+
+    def test_effort_levels_by_dialect(self):
+        from serve.models import Dialect
+        from serve.models.deepseek41 import DeepSeek41
+        self.assertEqual(Dialect().effort_level("high"), "xhigh")
+        self.assertEqual(Dialect().effort_level("max"), "xhigh")
+        self.assertEqual(Dialect().effort_level("low"), "low")
+        with self.assertRaises(ValueError):
+            Dialect().effort_level(30)
+        self.assertEqual(DeepSeek41().effort_level("high"), "high")
+        self.assertEqual(DeepSeek41().effort_level(30), 30)
 
     def test_effort_is_not_written_without_thinking(self):
         out = self.t.render([{"role": "user", "content": "hi"}], enable_thinking=False, reasoning_effort="low")

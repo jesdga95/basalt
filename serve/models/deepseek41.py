@@ -28,8 +28,8 @@ INVOKE_HEAD = re.compile(r'^' + re.escape(INVOKE_START) + r' name="([^"]*)">')
 PARAM_HEAD = re.compile(r'^' + re.escape(PARAM_START) + r' name="([^"]*)" string="(true|false)">')
 DSML_MARK = "\U000F2000"                # stands for the DSML marker while a message is rendered
 
-# the client's effort words (frontend.EFFORT) -> the encoder's scale (low, high, max or 1-100); medium is its default
-EFFORTS = {"low": "low", "medium": None, "xhigh": "max", "high": "high"}
+# the frontend's levels -> the encoder's scale (low, high, max or 1-100); medium is its default
+EFFORTS = {"low": "low", "medium": None, "high": "high", "max": "max"}
 
 
 class DeepseekTemplate:
@@ -232,6 +232,9 @@ class DeepseekParser:
 
 
 class DeepSeek41(Dialect):
+    def effort_level(self, level):
+        return level
+
     name = "deepseek41"
     in_engine_vision = True
     image_pad = enc.IMAGE_PLACEHOLDER

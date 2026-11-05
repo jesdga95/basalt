@@ -16,6 +16,12 @@ class Dialect:
     in_engine_vision = False                # the image encoder always lives in the engine (only --vision dynamic)
     effort_turn = ""                        # a trailing turn that states the reasoning effort ("{}" for its text)
 
+    def effort_level(self, level):
+        """The frontend's reasoning level (low, medium, high, max or a number) as this model's template takes it."""
+        if isinstance(level, int):
+            raise ValueError(f"unknown reasoning effort {level!r}: use none, low, medium or high")
+        return "xhigh" if level in ("high", "max") else level
+
     def template(self, path):
         """The prompt renderer: an object with `render(messages, tools=, add_generation_prompt=, **kwargs)` and
         `source`. `path` is the model's exported template file, which a dialect may ignore."""

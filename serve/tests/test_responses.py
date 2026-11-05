@@ -126,7 +126,9 @@ class Parsing(unittest.TestCase):
 
     def test_effort_and_text_format(self):
         self.assertEqual(template_kwargs({"reasoning": {"effort": "minimal"}}), {"enable_thinking": False})
-        self.assertEqual(template_kwargs({"reasoning": {"effort": "high"}}), {"reasoning_effort": "xhigh"})
+        self.assertEqual(template_kwargs({"reasoning": {"effort": "high"}}), {"reasoning_effort": "high"})
+        self.assertEqual(template_kwargs({"reasoning": {"effort": "max"}}), {"reasoning_effort": "max"})
+        self.assertEqual(template_kwargs({"reasoning": {"effort": 40}}), {"reasoning_effort": 40})
         self.assertEqual(template_kwargs({"reasoning": {"summary": "auto"}}), {})      # the default
         with self.assertRaises(ResponsesError):
             template_kwargs({"reasoning": {"effort": "huge"}})
