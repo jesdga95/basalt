@@ -79,7 +79,7 @@ twice, for VRAM another process is still releasing. With one model configured, a
 | Conversations on disk | Kept, in each model's own folder; they restore when the model returns. |
 | Conversations in RAM (`conversation-cache-mib`) and in slots | Written to the disk tier at the engine's exit when `conversation-cache-disk-mib` is on, else lost and read again. |
 | A sleeping engine | Gets its GPU state back to exit, without refilling its caches. Idle sleep and idle unload apply to whichever model is loaded. |
-| `POST /v1/vram` | The machine's: it applies to the loaded model and to each model loaded later. |
+| `POST /v1/vram` | The machine's: it applies to the loaded model and, once loaded, to each model loaded later that can resize its tier; for one that cannot, a warning says so. |
 | Finished requests, best speeds | Per model; `GET /metrics?model=NAME` shows that model. |
 | Vision | Per model. A numbered sidecar runs only while its model is loaded. |
 | Hardware readings | One sampler over the cards of every model. |
