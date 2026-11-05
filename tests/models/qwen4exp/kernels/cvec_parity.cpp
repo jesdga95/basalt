@@ -218,6 +218,45 @@ int main() {
         check(same, "add is h + d in every stream (bitwise)");
     }
 
+    // ---- 5. a prompt split's stage on another card: cvec_replicate puts the tables there, and the per-request switch
+    // reaches that card too
+    int devices = 0;
+    ck(cudaGetDeviceCount(&devices), "device count");
+    std::printf("replicate\n");
+    if (devices < 2) {
+        std::printf("  one device, skipped\n");
+    } else {
+        for (int d = 1; d < devices; ++d) {
+            ck(cudaSetDevice(d), "set the stage's device");
+            if (!k::cvec_replicate(err)) {
+                std::fprintf(stderr, "cvec_replicate: %s\n", err.c_str());
+                check(false, "cvec_replicate puts the tables on the stage's device");
+                break;
+            }
+            check(true, "cvec_replicate puts the tables on the stage's device");
+            float* dr = dalloc<float>(R.size());
+            up(dr, R);
+            k::cvec_apply(dr, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
+            ck(cudaDeviceSynchronize(), "apply on the stage's device");
+            {
+                const auto got = down(dr, R.size());
+                bool same = true;
+                for (size_t i = 0; i < R.size(); ++i)
+                    same = same && got[i] == R[i] + dir[(size_t) (kLayer * N + i % (size_t) N)];
+                check(same, "the stage's device applies the same add");
+            }
+            k::cvec_set_enabled(false);
+            up(dr, R);
+            k::cvec_apply(dr, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
+            ck(cudaDeviceSynchronize(), "apply off on the stage's device");
+            check(std::memcmp(down(dr, R.size()).data(), R.data(), R.size() * 4) == 0,
+                  "the switch reaches the stage's device (off: unchanged)");
+            k::cvec_set_enabled(true);
+            ck(cudaFree(dr), "free the stage device's buffer");
+        }
+        ck(cudaSetDevice(0), "back to the first device");
+    }
+
     std::printf(g_fail ? "cvec_parity: %d FAILED\n" : "cvec_parity: all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

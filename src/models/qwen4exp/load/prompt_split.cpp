@@ -1,6 +1,8 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
 
+#include "basalt/models/qwen4exp/kernels/cvec.hpp"
+
 namespace basalt::models::qwen4exp::generate {
 
 int split_plan(Context& context) {
@@ -21,8 +23,7 @@ int split_plan(Context& context) {
     double split_host_gbps = 0;   // the host's bandwidth to the main card and every tier card at once
     if (split_want) {
         const char* off = o.peer_exclusive ? "the tier's experts have no RAM copy (--peer-exclusive)"
-                        : !o.resident_cpu_experts ? "no RAM copy of the experts"
-                        : !o.cvec_files.empty() ? "a control vector" : nullptr;
+                        : !o.resident_cpu_experts ? "no RAM copy of the experts" : nullptr;
         if (off == nullptr && main_link_gbps <= 0) main_link_gbps = probe_pcie_h2d_gbps();   // (a set --pcie-frac skips it)
         if (off == nullptr) {
             std::vector<double> bw;
@@ -34,7 +35,15 @@ int split_plan(Context& context) {
                 st->mem_gbps = bw[j];
                 const basalt::core::OnDevice on(st->dev);
                 st->link_gbps = probe_pcie_h2d_gbps();
-                if (st->link_gbps <= 0) off = "a link probe failed";
+                if (st->link_gbps <= 0) {
+                    off = "a link probe failed";
+                } else if (!basalt::kernels::cvec_replicate(err)) {   // this stage applies the vector on its card
+                    basalt::log::warn("basalt generate", "prompt split: off (CUDA%d's control vector: %s)", st->dev,
+                                      err.c_str());
+                    err.clear();
+                    off = "the control vector's tables on a tier card";
+                }
+                if (off != nullptr) break;
                 pstages.push_back(std::move(st));
             }
         }
