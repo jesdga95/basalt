@@ -20,10 +20,10 @@
 
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/native_head.hpp"
-#include "basalt/platform/compiler.hpp"
 #include "basalt/core/native_dense.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/core/session.hpp"
+#include "basalt/core/spin_wait.hpp"
 #include "basalt/core/staged_copy.hpp"
 #include "basalt/core/verify.hpp"
 #include "basalt/core/weights.hpp"
@@ -87,10 +87,8 @@ public:
     void join() {
         if (!busy_) return;
         // the caller has nothing else to do: poll rather than sleep, so the job's end is seen at once
-        for (unsigned spins = 0; !done_.load(std::memory_order_acquire); ++spins) {
-            if (spins < 20000) basalt::platform::cpu_relax();
-            else std::this_thread::yield();
-        }
+        basalt::core::SpinWait spin;
+        while (!done_.load(std::memory_order_acquire)) spin();
         busy_ = false;
     }
 private:
