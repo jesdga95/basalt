@@ -29,6 +29,21 @@ Flow Request::complete() {
                      runtime_.drive.d.peer == nullptr ? "" : (", peer GPU " + fmt2((d1.peer - ds0.peer) / (w * L)) +
                                                      " (the pool waits " + fmt2((d1.peer_wait - ds0.peer_wait) / w) +
                                                      " ms/window for it)").c_str());
+        // the loop's host phases outside verify (each the time since the mark before it), and the swaps' copies
+        const basalt::core::DecodeGaps& dg = basalt::core::decode_gaps();
+        std::string hp;
+        char b[96];
+        for (int i = 0; i + 1 < basalt::core::DecodeGaps::kHostPhases; ++i) {
+            if (!basalt::core::DecodeGaps::name(i)[0]) continue;
+            std::snprintf(b, sizeof b, "%s%s %.3f", hp.empty() ? "" : ", ", basalt::core::DecodeGaps::name(i),
+                          (dg.hms[i] - hms0[i]) / w);
+            hp += b;
+        }
+        const int at = basalt::core::DecodeGaps::kHostPhases - 1;
+        basalt::log::info("basalt decode host", "ms/window: %s; %s %.3f; swaps copied %.1f MiB in, %.1f MiB out",
+                          hp.c_str(), basalt::core::DecodeGaps::name(at), (dg.hms[at] - hms0[at]) / w,
+                          (double) (runtime_.xq_in_bytes - swap_in0) / 1048576.0,
+                          (double) (runtime_.xq_out_bytes - swap_out0) / 1048576.0);
         const std::string evr = basalt::core::decode_events().report();
         if (!evr.empty()) basalt::log::raw("%s\n", evr.c_str());
         const std::string pr = runtime_.ver.profile_report();

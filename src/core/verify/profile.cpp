@@ -50,15 +50,10 @@ std::string Verifier::profile_report() {
         out += b;
     }
     if (dg.host_on) {
-        static const char* hn[32] = {"peer/copy sync", "profile read", "host sample", "run tail", "commit", "emit",
-                                     "draft stage", "draft launch", "draft wait", "draft sync", "draft prof read",
-                                     "run entry", "stage+ple", "dm_sync", "peer launch", "graph launch",
-                                     "adapt join", "observe", "apply_pending", "window/penalty", "adapt thread", "", "", "", "", "", "", "", "commit GPU",
-                                     "commit>draft", "verify>commit", ""};
         out += " | host ms/window:";
         for (int i = 0; i < 31; ++i) {
-            if (!hn[i][0]) continue;
-            std::snprintf(b, sizeof b, " %s %.3f", hn[i], dg.hms[i] / (double) prof_windows_);
+            if (!DecodeGaps::name(i)[0]) continue;
+            std::snprintf(b, sizeof b, " %s %.3f", DecodeGaps::name(i), dg.hms[i] / (double) prof_windows_);
             out += b;
             dg.hms[i] = 0;
         }
@@ -77,6 +72,15 @@ std::string Verifier::profile_report() {
 DecodeGaps& decode_gaps() {
     static DecodeGaps g;
     return g;
+}
+
+const char* DecodeGaps::name(int i) {
+    static const char* const hn[32] = {"peer/copy sync", "profile read", "host sample", "run tail", "commit", "emit",
+                                       "draft stage", "draft launch", "draft wait", "draft sync", "draft prof read",
+                                       "run entry", "stage+ple", "dm_sync", "peer launch", "graph launch",
+                                       "adapt join", "observe", "apply_pending", "window/penalty", "adapt thread", "",
+                                       "", "", "", "", "", "", "commit GPU", "commit>draft", "verify>commit", ""};
+    return i >= 0 && i < 32 ? hn[i] : "";
 }
 
 DecodeEvents& decode_events() {

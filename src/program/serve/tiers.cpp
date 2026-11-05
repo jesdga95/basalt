@@ -257,9 +257,12 @@ bool Runtime::adapt() {
         GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
         const basalt::core::OnDevice on(gs ? gs->dev : -1);
         staged_on.push_back(gs ? gs->dev : -1);
-        return cudaMemcpyAsync(dst, gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot),
-                               (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer),
-                               cudaMemcpyDeviceToHost, gs ? gs->adapt_stream : adapt_stream) == cudaSuccess;
+        const size_t bytes = (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer);
+        if (cudaMemcpyAsync(dst, gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), bytes,
+                            cudaMemcpyDeviceToHost, gs ? gs->adapt_stream : adapt_stream) != cudaSuccess)
+            return false;
+        xq_out_bytes += bytes;
+        return true;
     };
     const auto wait_copies = [&]() -> bool {
         bool ok = true;
@@ -289,6 +292,7 @@ bool Runtime::adapt() {
                          (int) s.layer, (int) slot, cudaGetErrorString(cudaGetLastError()));
             return false;
         }
+        xq_in_bytes += (uint64_t) basalt::kernels::cpu::expert_layout().blob_bytes(s.layer);
         if (gs) gs->adapt_live = true;
         else main_live = true;
         host_res[out] = basalt::core::kNotResident;   // evicted now: the CPU computes it meanwhile
@@ -413,6 +417,10 @@ bool Runtime::xq_round(std::vector<Swap>* ranked) {
     }
     xq_swapped += (int64_t) xq.size();
     xq_noplace += (int64_t) n_noplace;
+    for (const XSwap& x : xq) {
+        xq_in_bytes += (uint64_t) lay.blob_bytes(x.layer);
+        if (x.xchg) xq_out_bytes += (uint64_t) lay.blob_bytes(x.lout);
+    }
     if (!xq.empty()) {
         cudaEventRecord(adapt_ev, adapt_stream);
         xq_stage = 1;
@@ -606,6 +614,7 @@ int Runtime::init_tiers() {
     xq_saturated = false;   // the last round had at least kSatRatio times --adapt-swaps misses to swap
     xq_swapped = 0;
     xq_noplace = 0;
+    xq_in_bytes = xq_out_bytes = 0;
 
     xq_no = 0;
     xq_words = false;   // the round in flight writes the landed words

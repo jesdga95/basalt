@@ -49,8 +49,14 @@ All CLI, all off.
 | `--gpu-stages` | CLI | Capture each layer as three graphs (mixer, FFN and router, post), time them from outside the capture, print and exit. Not with a layer split. |
 | `--profile` | serve | GPU stage times of the decode windows, per request. Turns programmatic dependent launch off, so not for A/B timing. |
 | `--wait-stats` | serve | The host's wait times in the decode loop, one report per 200 windows. |
-| `--decode-timing` | serve | One line per request: where its decode time went. |
+| `--decode-timing` | serve | Per request: where its decode time went, and the decode loop's host phases outside verify with the bytes the adaptive swaps copied. |
 | `--draft-log` | serve | Path. One line per verify window (width, accepted, time), for studying the draft policy. |
+
+`--decode-timing` prints two lines per request. The second, `basalt decode host`, splits the decode loop's host time
+outside verify at the marks `--profile` uses: each phase is the time since the mark before it, so `profile read` and
+`draft prof read` hold `--profile`'s reads and are near zero without it. `adapt thread` is the adaptive round's time
+on its own thread, beside the loop. `swaps copied` is the bytes the adaptive swaps copied into the VRAM tiers of the
+cards that run layers, and the evicted experts' copies back to RAM; the peer tiers' copies are not counted.
 
 ## Speculation tests
 

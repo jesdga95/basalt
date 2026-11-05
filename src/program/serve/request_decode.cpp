@@ -66,6 +66,14 @@ Flow Request::decode() {
     d0 = Clock::now();
     // --decode-timing: where a request's decode time goes (one line per request)
     dec_timing = basalt::core::diagnostics().decode_timing;
+    if (dec_timing) {   // and the loop's host phases outside verify, with the swaps' bytes
+        basalt::core::DecodeGaps& dg = basalt::core::decode_gaps();
+        dg.host_on = true;
+        dg.mark(-1);   // the next mark counts from here
+        std::copy(std::begin(dg.hms), std::end(dg.hms), std::begin(hms0));
+        swap_in0 = runtime_.xq_in_bytes;
+        swap_out0 = runtime_.xq_out_bytes;
+    }
 
     ds0 = dec_snap();
     dt_run = 0;
