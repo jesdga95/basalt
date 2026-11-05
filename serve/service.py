@@ -714,6 +714,52 @@ class Service:
             return self.tok.encode(prompt, parse_special=True)
         return self.tok.encode(prompt, parse_special=True, plain=plain)
 
+    def vision_encode(self, images: list[str]) -> list[int]:
+        """Encode image sources: one row count per image, the combined embeddings file left in
+        self.embeddings.path for the engine request that follows (no images, no counts)."""
+        if not images:
+            return []
+        if self.vision is None:
+            raise ValueError("this server was started without image input (--vision), "
+                             "so it cannot read images")
+        # encode under the fifo: the encoder and a running engine must not use the GPU together
+        with self.fifo:
+            if getattr(self.vision, "in_engine", False):   # the encoder lives in the engine: it must be running
+                self.ensure_loaded()
+            try:
+                self.embeddings.path, counts = self.vision.encode(images)
+            except ValueError as e:                 # a refused image: the client gets the 400, the log says why
+                print(f"[server] error: {e}", flush=True)
+                raise
+        return counts
+
+    def expand_image_pads(self, ids: list[int], counts: list[int]) -> list[int]:
+        """Expand each image's pad to one per image token; a pad not after <|vision_start|> is message text."""
+        pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
+        start = self.tok.encode(VISION_START, parse_special=True)[0]
+        literal = self.tok.encode(IMAGE_PAD, parse_special=False)
+        out, k = [], 0
+        for j, t in enumerate(ids):
+            if t == pad and j > 0 and ids[j - 1] == start:
+                if k == len(counts):                    # more markers than images
+                    raise ValueError("the prompt and its images do not match")
+                out += [pad] * counts[k]
+                k += 1
+            elif t == pad:
+                out += literal
+            else:
+                out.append(t)
+        if k != len(counts):
+            raise ValueError("the prompt and its images do not match")
+        return out
+
+    def drop_embeddings(self, path) -> None:
+        """Remove the embeddings file once the engine work it feeds is over."""
+        if path:
+            Path(path).unlink(missing_ok=True)
+            if getattr(self.embeddings, "path", None) == path:
+                self.embeddings.path = None
+
     def prepare(self, messages, tools, kwargs, max_new=None, force=None):
         """Return (ids, thinking, max_new); an unset or non-positive max_new means the rest of the context.
         `force` (frontend.forced_call): the opening of the call the reply must make.  Without thinking it ends the
@@ -753,38 +799,9 @@ class Service:
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
         images = images_of(messages)
-        if images:
-            if self.vision is None:
-                raise ValueError("this server was started without image input (--vision), "
-                                 "so it cannot read images")
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-            start = self.tok.encode(VISION_START, parse_special=True)[0]
-            # encode under the fifo: the encoder and a running engine must not use the GPU together
-            with self.fifo:
-                if getattr(self.vision, "in_engine", False):   # the encoder lives in the engine: it must be running
-                    self.ensure_loaded()
-                try:
-                    self.embeddings.path, counts = self.vision.encode(images)
-                except ValueError as e:                 # a refused image: the client gets the 400, the log says why
-                    print(f"[server] error: {e}", flush=True)
-                    raise
-            # expand each image's pad to one per image token; a pad not after <|vision_start|> is message text
-            literal = self.tok.encode(IMAGE_PAD, parse_special=False)
-            out, k = [], 0
-            for j, t in enumerate(ids):
-                if t == pad and j > 0 and ids[j - 1] == start:
-                    # more markers than images
-                    if k == len(counts):
-                        raise ValueError("the prompt and its images do not match")
-                    out += [pad] * counts[k]
-                    k += 1
-                elif t == pad:
-                    out += literal
-                else:
-                    out.append(t)
-            if k != len(counts):
-                raise ValueError("the prompt and its images do not match")
-            ids = out
+        counts = self.vision_encode(images)
+        if counts:
+            ids = self.expand_image_pads(ids, counts)
         ctx = self.engine.max_context
         if ctx <= 0:
             if getattr(self.engine, "starting", False):   # starting, not an oversized prompt
