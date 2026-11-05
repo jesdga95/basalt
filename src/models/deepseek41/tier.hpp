@@ -76,6 +76,10 @@ public:
     /// copies go back whole, and reclaim() opens them again empty. Homes stay.
     void lend_all();
     bool reclaim(std::string& err);
+    /// Main card bytes the tier, the caches and the prompt path leave free: --vram-reserve-mib, or `mib` once set
+    /// (`mib` < 0: back to the start's). The arena is not resized here.
+    void set_free_floor(int64_t mib);
+    uint64_t free_floor() const { return free_floor_; }
 
     /// Called before each token: the promotions queued during the previous token finish and become resident, so what a
     /// lookup finds depends only on the routing history.
@@ -155,6 +159,8 @@ private:
     cudaEvent_t fetch_ev_ = nullptr;
     uint64_t tick_ = 0;
     uint64_t one_each_ = 0, reserve_ = 0;
+    uint64_t start_floor_ = 0, free_floor_ = 0;
+    int64_t cap_per_layer_ = -1;            ///< --expert-cache or the diagnostic's slots per layer, -1 when neither
 
     std::vector<core::RamPin> ram_pins_;    ///< [layer] what each span's pin got
     std::vector<uint8_t*> ram_;             ///< [layer] cover_ + 1 pinned expert slots (the last starts as the spare)

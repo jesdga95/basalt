@@ -27,6 +27,11 @@ the pack and picks the chat format, tool-call syntax and thinking switch to matc
   borrows the copies too. If even the smallest chunk does not fit, or the caches cannot grow, the request fails with an
   error naming the free memory and the next one runs. When a new conversation starts, caches a long one left mapped
   beyond 32,768 positions are released to the tier.
+- **VRAM limits:** `--expert-cache` caps the VRAM slots and `--vram-reserve-mib` or `POST /v1/vram` sets what stays free, through
+  prompts, images and the tier reopening after them. A prompt that wants more memory takes the copies first and halves its chunk
+  to fit above the reserve; the caches map only above it. If the smallest chunk or the caches do not fit there, the request
+  fails with an error naming the memory and the next one runs: the reserve is not spent. `POST /v1/vram` resizes the copies at
+  once; homes stay.
 - **Requests:** one at a time, or `--parallel N` slots with `--slot-full-context` as for any model. The engine keeps the tokens it holds (the prompt and what it
   generated) and a checkpoint before the last prompt token. A request whose prompt starts with all the held tokens, or
   with the checkpoint's (a next turn after a thinking reply: the template drops the thinking from the history), reads

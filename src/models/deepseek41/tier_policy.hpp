@@ -61,6 +61,27 @@ inline int bus_count(int pinned, int file) {
 /// Copies of at most kPieceBytes needed for `bytes`.
 inline int pieces(uint64_t bytes) { return (int) ((bytes + kPieceBytes - 1) / kPieceBytes); }
 
+/// Slots per layer that fit in `free_bytes` with `keep` left free; at most `most`.
+inline int64_t slots_beside(uint64_t free_bytes, uint64_t keep, uint64_t one_each, int64_t most) {
+    if (free_bytes <= keep || one_each == 0 || most <= 0) return 0;
+    const uint64_t n = (free_bytes - keep) / one_each;
+    return n < (uint64_t) most ? (int64_t) n : most;
+}
+
+/// Extra slots per layer beside `per_layer` open ones: what `free_bytes` holds above the tier's own room (`room`) and the
+/// reserve (`floor`), within the expert count and the slot cap (`cap` < 0: none).
+inline int64_t grow_slots(uint64_t free_bytes, uint64_t room, uint64_t floor, uint64_t one_each, int64_t per_layer, int n_expert, int64_t cap) {
+    const int64_t limit = cap >= 0 && cap < n_expert ? cap : n_expert;
+    return slots_beside(free_bytes, room + floor, one_each, limit - per_layer);
+}
+
+/// Slots per layer a lent arena opens again with: all `lent` when they fit above the reserve, else what fits above the
+/// tier's own room and the reserve.
+inline int64_t reclaim_slots(uint64_t free_bytes, uint64_t room, uint64_t floor, uint64_t one_each, int64_t lent) {
+    const int64_t whole = slots_beside(free_bytes, floor, one_each, lent);
+    return whole == lent ? lent : slots_beside(free_bytes, room + floor, one_each, lent);
+}
+
 /// The pinned expert of a layer to give up: the least recently used one not in `busy[0..n_busy)`; ties to the lowest id.
 /// `idx[e] >= 0` marks pinned experts, `stamp[e]` the last use. Returns -1 when none qualifies.
 inline int pick_victim(const int32_t* idx, const uint64_t* stamp, int n_expert, const int* busy, int n_busy) {

@@ -292,10 +292,11 @@ public:
         for (int attempt = 0; attempt < 2; ++attempt) {
             std::string e;
             bool ok = true;
+            const uint64_t keep = tier_ ? tier_->free_floor() : 0;
             for (int il = 0; il < g_.n_layers && ok; ++il) {
                 if (!el_kv_[(size_t) il]) continue;
                 const uint64_t rows = (uint64_t) positions / (uint64_t) g_.compress_ratio[(size_t) il] + 1;
-                ok = el_kv_[(size_t) il]->ensure(rows * kLatent * 2, e) && el_ik_[(size_t) il]->ensure(rows * kIdxDim * 2, e);
+                ok = el_kv_[(size_t) il]->ensure(rows * kLatent * 2, keep, e) && el_ik_[(size_t) il]->ensure(rows * kIdxDim * 2, keep, e);
             }
             if (ok) {
                 backed_positions_ = positions;

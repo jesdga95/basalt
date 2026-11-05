@@ -127,6 +127,24 @@ int main() {
         for (int s : seen) CHECK(s == 1);
     }
 
+    // the slot cap and the reserve hold when the tier grows and when it opens again
+    {
+        constexpr uint64_t one = 100, room = 1000;
+        CHECK(slots_beside(500, 600, one, 8) == 0);
+        CHECK(slots_beside(1000, 600, one, 2) == 2);
+        CHECK(grow_slots(3000, room, 0, one, 4, 384, -1) == 20);
+        CHECK(grow_slots(3000, room, 500, one, 4, 384, -1) == 15);
+        CHECK(grow_slots(3000, room, 0, one, 4, 384, 10) == 6);
+        CHECK(grow_slots(3000, room, 0, one, 10, 384, 10) == 0);
+        CHECK(grow_slots(3000, room, 0, one, 12, 384, 10) == 0);
+        CHECK(grow_slots(100000, room, 0, one, 4, 16, -1) == 12);
+        CHECK(reclaim_slots(3000, room, 0, one, 8) == 8);
+        CHECK(reclaim_slots(3000, room, 2300, one, 8) == 0);
+        CHECK(reclaim_slots(3000, room, 2200, one, 8) == 8);
+        CHECK(reclaim_slots(3000, room, 1500, one, 30) == 5);
+        CHECK(reclaim_slots(3000, room, 2500, one, 30) == 0);
+    }
+
     if (g_fail) return 1;
     std::printf("tier_policy_test: ok\n");
     return 0;

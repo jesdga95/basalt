@@ -83,14 +83,12 @@ bool ExpertTier::open(const Reserve& reserve, const float* h_x, float* h_rows, s
     const uint64_t asked_free = (uint64_t) m_.tiers().vram_reserve_mib << 20;
     int copies = slots_in(free_b, reserve.copies + asked_free);
     int main_homes = slots_in(free_b, reserve.homes + asked_free);
-    if (m_.tiers().expert_cache > 0) {
-        const int per_layer = m_.tiers().expert_cache / n_layers_;
-        copies = std::min(copies, per_layer);
-        main_homes = std::min(main_homes, per_layer);
-    }
-    if (m_.diag_tier_vram() >= 0) {
-        copies = std::min(copies, m_.diag_tier_vram());
-        main_homes = std::min(main_homes, m_.diag_tier_vram());
+    start_floor_ = free_floor_ = asked_free;
+    if (m_.tiers().expert_cache > 0) cap_per_layer_ = m_.tiers().expert_cache / n_layers_;
+    if (m_.diag_tier_vram() >= 0) cap_per_layer_ = cap_per_layer_ >= 0 ? std::min<int64_t>(cap_per_layer_, m_.diag_tier_vram()) : m_.diag_tier_vram();
+    if (cap_per_layer_ >= 0) {
+        copies = (int) std::min<int64_t>(copies, cap_per_layer_);
+        main_homes = (int) std::min<int64_t>(main_homes, cap_per_layer_);
     }
 
     int peer_slots = 0;
@@ -709,11 +707,18 @@ void ExpertTier::lend_all() {
 
 bool ExpertTier::reclaim(std::string& err) {
     if (lent_per_layer_ == 0) return true;
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        err = "deepseek41: cannot query the free device memory";
+        return false;
+    }
+    const int64_t n = policy::reclaim_slots(free_b, reserve_, free_floor_, one_each_, lent_per_layer_);
+    if (n < 1) return true;   // nothing fits above the reserve: the slots stay lent
     std::vector<int64_t> slot_bytes;
     for (int l = 0; l < n_layers_; ++l)
-        for (int64_t s = 0; s < lent_per_layer_; ++s) slot_bytes.push_back((int64_t) m_.pack().experts[(size_t) l].blob_bytes);
+        for (int64_t s = 0; s < n; ++s) slot_bytes.push_back((int64_t) m_.pack().experts[(size_t) l].blob_bytes);
     if (!cache_.open_sized(slot_bytes, n_layers_, n_expert_, err)) return false;
-    per_layer_ = lent_per_layer_;
+    per_layer_ = n;
     lent_per_layer_ = 0;
     owner_.assign(slot_bytes.size(), -1);
     busy_.assign(slot_bytes.size(), 0);
@@ -723,9 +728,8 @@ bool ExpertTier::reclaim(std::string& err) {
 void ExpertTier::grow() {
     if (ext_per_layer_ > 0 || per_layer_ >= n_expert_ || !cache_.valid()) return;
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b <= reserve_) return;
-    int64_t n = std::min<int64_t>((int64_t) ((free_b - reserve_) / one_each_), n_expert_ - per_layer_);
-    if (m_.diag_tier_vram() >= 0) n = std::min<int64_t>(n, m_.diag_tier_vram() - per_layer_);   // the total stays at the fixed size
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return;
+    const int64_t n = policy::grow_slots(free_b, reserve_, free_floor_, one_each_, per_layer_, n_expert_, cap_per_layer_);
     if (n < 1) return;
     std::vector<int64_t> slot_bytes;
     for (int l = 0; l < n_layers_; ++l)
@@ -747,6 +751,8 @@ void ExpertTier::grow() {
         promoted_ = promoted;
     }
 }
+
+void ExpertTier::set_free_floor(int64_t mib) { free_floor_ = mib < 0 ? start_floor_ : (uint64_t) mib << 20; }
 
 void ExpertTier::report(const char* tag) const {
     const int64_t n = hits_ + cpu_ + fetched_ + peer_hits_;
