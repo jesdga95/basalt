@@ -247,7 +247,7 @@ public:
         cudaMemset(ids_, 0xff, kTopK * 4);
     }
 
-    void begin_token(int64_t pos) override {
+    void begin_token(int64_t) override {
         if (tier_) tier_->begin_token();
     }
 
@@ -516,7 +516,7 @@ public:
         r.homes = m_.context_bytes() * (uint64_t) m_.sessions() + prefillp::workspace_bytes(d, prefillp::kHomeChunk) + prefillp::ahead_bytes(d) +
                   prefillp::kMargin + kModuleRoom + (m_.pack().vision.bytes ? kVisionRoom : 0);
         r.beside_homes = prefillp::workspace_bytes(d, prefillp::kShortChunk) + prefillp::kMargin + kModuleRoom;
-        if (!t->open(r, h_x_, h_rows_, err)) return false;
+        if (!t->open(r, h_rows_, err)) return false;
         tier_ = t;
         shared = {std::move(t), h_x_, h_rows_};
         return true;
@@ -540,7 +540,7 @@ public:
         return routed_experts_staged(il, x, ids, w, out, stream, err);
     }
 
-    bool routed_experts_staged(int il, const float* x, const int32_t* ids, const float* w, float* out, void* stream,
+    bool routed_experts_staged(int il, const float* x, const int32_t*, const float* w, float* out, void* stream,
                                std::string& err) override {
         return routed_run(il, x, w, out, nullptr, stream, err);
     }
