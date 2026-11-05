@@ -83,7 +83,7 @@ public:
                 basalt::log::error("basalt serve", "%s", r.message.c_str());
                 return 1;
             }
-        disk_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), 0, 0) + (1ull << 30);
+        start_guard(0, 0);   // the margin alone: no prompt chunk is sized to reads of the file
         if (const std::string words = sessions_[0]->info_words(); !words.empty()) std::printf("INFO %s\n", words.c_str());
         std::printf("READY %lld stop\n", (long long) o.max_context);
         std::fflush(stdout);
@@ -241,9 +241,6 @@ public:
         return false;
     }
     bool slots_share_cells() const override { return false; }
-    void shed_if_low() override {
-        if (basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Ok && !checks.empty()) checks.clear();
-    }
     int64_t slot_context(int) const override { return o.max_context; }
     bool slot0_solo() const override { return o.batch > 0; }
 
@@ -432,7 +429,7 @@ public:
     void observe_policy(bool, int, int, int, Clock::time_point) {}
     void mark_after_window() {}
     void mark_loop_end() {}
-    void shed_low() { rt_.SessionRuntime::shed_if_low(); }
+    void shed_low() { rt_.shed_if_low(); }
     void stamp_loop_end() {}
     void decode_end() {}
 
