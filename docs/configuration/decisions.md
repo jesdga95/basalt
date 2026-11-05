@@ -196,4 +196,4 @@ All SystemOne questions use exhaustive tree scoring. `/v1/decision` uses the sam
 - [Codacus parallel-decision](https://github.com/thecodacus/llama.cpp/tree/parallel-decision): finite domains,
   complete-continuation tokenization, compressed tries and constrained target probabilities.
 - [NInfer Jev](https://github.com/Neroued/ninfer/pull/387): SystemOne contracts and bounded shared-model admission.
-- [Precision](../precision/decisions.md): the target head and stored weight formats.
+- [Precision](../precision/qwen38-flash-next.md#jev-target-scores): the target head and stored weight formats.
