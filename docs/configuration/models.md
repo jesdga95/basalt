@@ -12,7 +12,7 @@ time. A swap ends one engine process and starts the next.
   "models": [
     { "alias": "Qwen", "model": "qwen.basalt", "gpu": "auto", "kv": "int8", "max-context": 262144, "parallel": 4,
       "slot-full-context": true, "vision": "dynamic" },
-    { "alias": "DeepSeek", "model": "deepseek.basalt", "gpu": "auto", "kv": "int8", "max-context": 1048576, "vision": "dynamic" }
+    { "alias": "DeepSeek", "model": "deepseek.basalt", "gpu": "auto", "max-context": 1048576, "vision": "dynamic" }
   ],
   "server": { "host": "127.0.0.1", "port": 8080 }
 }
@@ -43,8 +43,8 @@ rules. No flag's default differs by model.
 | A value the model refuses (`max-context` past its maximum) | stops the start | stops the start |
 | A name no model has | stops the start | stops the start |
 
-`kv` is a flag every model takes. A model whose KV format is fixed keeps that format and warns; see
-[DeepSeek](../deepseek41.md). `gpu: auto` is the engine's choice for each model.
+`kv` belongs in the entries of models that have a choice of KV format: [DeepSeek](../deepseek41.md) has none, so `kv` in its entry
+stops the start. `gpu: auto` is the engine's choice for each model.
 
 Two names that answer for two entries, and two entries sharing a `conversation-cache-dir`, stop the start too.
 

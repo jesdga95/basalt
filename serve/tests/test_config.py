@@ -107,7 +107,7 @@ class ConfigFile(unittest.TestCase):
         p = conf({"engine": {"conversation-cache-disk-mib": 32768, "idle-sleep": 300, "pool-workers": 8, "vram-reserve-mib": 500},
                   "models": [{"alias": "Qwen 3.8 FN", "gpu": "auto", "kv": "int8", "max-context": 262144,
                               "model": "a.basalt", "parallel": 4, "slot-full-context": True, "vision": "dynamic"},
-                             {"alias": "DeepSeek V4.1 Flash", "gpu": "auto", "kv": "int8", "max-context": 1048576,
+                             {"alias": "DeepSeek V4.1 Flash", "gpu": "auto", "max-context": 1048576,
                               "model": "b.basalt", "vision": "dynamic"}],
                   "server": {"host": "0.0.0.0", "port": 8080}})
         (qwen, _, qfile, _), (ds, _, dfile, _) = model_settings(build_parser(), ["--config", p])
@@ -119,7 +119,8 @@ class ConfigFile(unittest.TestCase):
             self.assertEqual(flag_value(words, "--pool-workers"), "8")
             self.assertEqual(flag_value(words, "--vram-reserve-mib"), "500")
             self.assertEqual(flag_value(words, "--conversation-cache-disk-mib"), "32768")
-            self.assertEqual(flag_value(words, "--kv"), "int8")
+        self.assertEqual(flag_value(qfile, "--kv"), "int8")
+        self.assertIsNone(flag_value(dfile, "--kv"))
         self.assertEqual(flag_value(qfile, "--batch"), "4")
         self.assertEqual(flag_value(qfile, "--max-context"), "262144")     # slot-full-context
         self.assertEqual(flag_value(dfile, "--max-context"), "1048576")
@@ -133,6 +134,13 @@ class ConfigFile(unittest.TestCase):
                     {"version": 1, "models": entry}, {}):
             with self.assertRaisesRegex(ValueError, "Basalt requires v2 config, please upgrade", msg=str(old)):
                 load_config_file(conf(old), ap)
+        p = conf({"server": {"model": "m.basalt"}})
+        with self.assertRaises(ValueError) as cm:
+            load_config_file(p, ap)
+        words = str(cm.exception).split("upgrade: ", 1)[1].split()       # a command that runs as printed
+        self.assertEqual((words[0], words[2], words[3]), ("python3", str(Path(p).resolve()), "-o"))
+        self.assertTrue(Path(words[1]).is_file())
+        self.assertTrue(words[4].endswith(".v2.json"))
         with self.assertRaisesRegex(ValueError, "this is a v3 config; this Basalt reads v2"):
             load_config_file(conf({"version": 3, "models": entry}), ap)
         for bad in ("2", True, 2.5):

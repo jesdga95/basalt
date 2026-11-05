@@ -618,12 +618,12 @@ class Startup(unittest.TestCase):
     def test_every_entry_is_checked_with_its_own_words(self):
         code, _, calls = self.run_main({"engine": {"pool-workers": 8},
                                         "models": [{"model": "a.basalt", "gpu": "auto", "kv": "int8", "max-context": 262144},
-                                                   {"model": "b.basalt", "gpu": "auto", "kv": "int8", "max-context": 1048576}]})
+                                                   {"model": "b.basalt", "gpu": "auto", "max-context": 1048576}]})
         self.assertEqual(code, "past the checks")
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0].args[2], "auto")
         self.assertEqual(calls[0].args[3], ["--pool-workers", "8", "--kv", "int8", "--max-context", "262144"])
-        self.assertEqual(calls[1].args[3], ["--pool-workers", "8", "--kv", "int8", "--max-context", "1048576"])
+        self.assertEqual(calls[1].args[3], ["--pool-workers", "8", "--max-context", "1048576"])
 
     def test_a_flag_an_entry_refuses_stops_the_start(self):
         def plan(engine_bin, path, gpu, words):
@@ -633,6 +633,20 @@ class Startup(unittest.TestCase):
         code, err, _ = self.run_main({"models": [{"model": "a.basalt", "spec": 7}, {"model": "b.basalt", "spec": 7}]}, plan)
         self.assertEqual(code, 2)
         self.assertIn("b.basalt: unknown argument: --spec", err)
+
+    def test_a_kv_the_entry_cannot_take_stops_the_start_and_a_top_level_one_is_skipped(self):
+        def plan(engine_bin, path, gpu, words):
+            if path.endswith("b.basalt") and "--kv" in words:
+                raise ValueError("unknown argument: --kv")
+            return {"devices": "0", "cards": []}
+        code, err, _ = self.run_main({"models": [{"model": "a.basalt", "kv": "int8"}, {"model": "b.basalt", "kv": "int8"}]}, plan)
+        self.assertEqual(code, 2)
+        self.assertIn("b.basalt: unknown argument: --kv", err)
+        code, _, calls = self.run_main({"engine": {"kv": "int8"}, "models": [{"model": "a.basalt"}, {"model": "b.basalt"}]}, plan,
+                                       refused=lambda bin_, path, group: path.endswith("b.basalt") and group[0] == "--kv")
+        self.assertEqual(code, "past the checks")
+        self.assertEqual(calls[0].args[3], ["--kv", "int8"])
+        self.assertEqual(calls[1].args[3], [])
 
     def test_a_context_past_the_maximum_stops_the_start(self):
         def plan(engine_bin, path, gpu, words):
