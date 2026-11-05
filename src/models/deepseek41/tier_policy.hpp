@@ -25,15 +25,16 @@ struct Homes {
 };
 
 /// `main_slots`: what the main card can hold through a prompt at the full context; `peer_slots`: the room on the second
-/// card; `ram_slots`: the room in RAM beside the page cache file reads need, `ram_slots_no_file` without it. Only with a
-/// second card does the main card give up its copies for homes, and only when RAM cannot take what the second card does not.
-inline Homes plan_homes(int n_expert, int main_slots, int peer_slots, int ram_slots, int ram_slots_no_file) {
+/// card; `ram_slots`: the room in RAM above the floor. Only with a second card does the main card give up its copies for
+/// homes, and only when RAM cannot take what the second card does not. What RAM cannot take stays in the file, so a
+/// shortfall of N places puts N experts there.
+inline Homes plan_homes(int n_expert, int main_slots, int peer_slots, int ram_slots) {
     Homes h;
     h.peer = peer_slots < n_expert ? peer_slots : n_expert;
     const int left = n_expert - h.peer;
-    if (h.peer > 0 && ram_slots_no_file < left) h.main = main_slots < left ? main_slots : left;
+    if (h.peer > 0 && ram_slots < left) h.main = main_slots < left ? main_slots : left;
     const int rest = left - h.main;
-    h.ram = h.peer > 0 && ram_slots_no_file >= rest ? rest : ram_slots < rest ? ram_slots : rest;
+    h.ram = ram_slots < rest ? ram_slots : rest;
     h.file = rest - h.ram;
     return h;
 }
