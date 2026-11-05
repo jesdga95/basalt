@@ -284,6 +284,28 @@ function drawMain(live, hist, reqs, slots, total) {
   html($("#pane"), h);
 }
 
+/* ---- several models: the picker chooses whose numbers the page shows, and Load swaps to it ---- */
+let picked = null;       // the model the page follows; null: whichever is loaded
+function drawModels(models, shown) {
+  const sel = $("#models"), load = $("#load-model"), many = models.length > 1;
+  sel.hidden = !many; $("#model").hidden = many;
+  const row = many ? models.find(m => m.id === shown) : null;
+  load.hidden = !row || row.status.value === "loaded" || row.status.value === "loading";
+  if (!many || document.activeElement === sel) return;
+  const opts = models.map(m => `${m.id} · ${m.status.value}${m.asleep ? " · asleep" : ""}`);
+  if ([...sel.options].map(o => o.textContent).join() !== opts.join()) {
+    sel.replaceChildren(...models.map((m, i) => { const o = new Option(opts[i], m.id); return o; }));
+  }
+  sel.value = shown;
+}
+$("#models").onchange = e => { picked = e.target.value; e.target.blur(); };
+$("#load-model").onclick = () => {
+  const model = $("#models").value;
+  fetch("v1/load", { method: "POST", headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
+                     body: JSON.stringify({ model }) }).catch(() => {});
+  picked = null;
+};
+
 /* ---- the whole page ---- */
 function draw() {
   if (!M) return;
@@ -296,6 +318,7 @@ function draw() {
     : live.queued > 0 ? `${name} · ${live.queued} queued` : name);
   text($("#detail"), gib); $("#detail").hidden = !gib;
   text($("#model"), eng.model || "");
+  drawModels(M.models || [], eng.model);
   drawSide(M.hardware || {}, M.hardware_static || {}, hist, eng, reqs[0]);
   drawHero(live, hist, reqs, M.best || {}, slots, total);
   drawMain(live, hist, reqs, slots, total);
@@ -328,7 +351,7 @@ function clearLog(note) {
 let lastLog = 0;
 async function pollMetrics() {
   try {
-    const m = await get("metrics");
+    const m = await get(picked ? `metrics?model=${encodeURIComponent(picked)}` : "metrics");
     m.slots = await get("slots").catch(() => []);
     M = m; $("#auth").hidden = true; draw();
   } catch (e) {

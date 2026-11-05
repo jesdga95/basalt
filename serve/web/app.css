@@ -44,6 +44,8 @@ td, th, .v, .num { font-family: var(--font-mono); font-variant-numeric: tabular-
 .wordmark { font: 700 24px/1 var(--font-sans); letter-spacing: -.035em; }
 .model { font: 400 13px/1 var(--font-mono); color: var(--fg-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .grow { flex: 1; }
+.models, .load { font: 400 13px/1 var(--font-mono); color: var(--fg-2); background: none; border: 1px solid var(--fg-3); border-radius: 4px; padding: 3px 6px; min-width: 0; max-width: 40vw; }
+.load { cursor: pointer; }
 .state { font: 500 13px/1 var(--font-mono); color: var(--fg-2); white-space: nowrap; }
 .state[data-s="generating"], .state[data-s="reading"] { color: var(--accent); }
 .state[data-s="offline"] { color: var(--err); }
