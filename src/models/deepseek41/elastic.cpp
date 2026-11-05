@@ -42,7 +42,7 @@ bool ElasticBuf::open(uint64_t bytes, std::string& err) {
     return true;
 }
 
-bool ElasticBuf::ensure(uint64_t bytes, std::string& err) {
+bool ElasticBuf::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) {
     if (bytes <= backed_) return true;
     if (bytes > reserved_) {
         err = "the compressed cache is full";
@@ -52,6 +52,13 @@ bool ElasticBuf::ensure(uint64_t bytes, std::string& err) {
     const uint64_t step = gran_ * 4;
     const uint64_t want = std::min(reserved_, (bytes + step - 1) / step * step);
     const uint64_t n = want - backed_;
+    if (keep_free > 0) {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < n + keep_free) {
+            err = "the VRAM reserve of " + std::to_string(keep_free >> 20) + " MiB stays free";
+            return false;
+        }
+    }
     const unsigned long long h = core::vmm::map(base_ + backed_, n);
     if (!h) {
         err = "out of device memory for the compressed caches";

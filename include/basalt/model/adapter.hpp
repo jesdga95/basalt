@@ -128,6 +128,9 @@ public:
     virtual Result copy_logits(float* out) { (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
     /// low: the VRAM the session can give back goes back to the driver; else it is taken again. The slots it holds now.
     virtual Result set_low_memory(bool low, int64_t& expert_slots) { (void) low; (void) expert_slots; return {Status::NotImplemented, "this model cannot give VRAM back"}; }
+    /// What the session leaves free on the main card from now on (`mib` < 0: the start's reserve), through prompts and
+    /// images too; its VRAM use is resized to that now. The slots it holds now.
+    virtual Result set_vram_reserve(int64_t mib, int64_t& expert_slots) { (void) mib; (void) expert_slots; return {Status::NotImplemented, "this model cannot give VRAM back"}; }
     /// The running state at position `pos`: what cannot be rewound. Positional state stays valid below it.
     virtual size_t running_bytes() const { return 0; }
     virtual Result save_running(uint8_t* host, int64_t pos) { (void) host; (void) pos; return {Status::NotImplemented, "this model keeps no checkpoint"}; }

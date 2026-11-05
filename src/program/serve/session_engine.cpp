@@ -118,16 +118,27 @@ public:
             e = "PROBE: expected PROBE rates or PROBE set";
         }
     }
-    // VRAM <mib>: what the session can give back goes; VRAM alone: it is taken again.  One reply line.
+    // VRAM <mib>: the session leaves that much free from now on; VRAM alone: the start's reserve.  One reply line.
     bool vram_command(const std::string& cmd, std::string& e, bool, std::string* reply) override {
         char* end = nullptr;
         const long long reserve = cmd.size() > 4 ? std::strtoll(cmd.c_str() + 4, &end, 10) : -1;
         if (cmd.size() > 4 && (end == cmd.c_str() + 4 || reserve < 0)) { e = "expected: VRAM [reserve_mib]"; return false; }
-        return set_memory(reserve >= 0, reserve, e, reply);
+        int64_t slots = 0;
+        if (const basalt::model::Result r = session().set_vram_reserve(reserve, slots); !r.ok()) {
+            e = r.message;
+            return false;
+        }
+        return memory_reply(reserve, slots, reply);
     }
     void sleep_command(bool down, std::string& e) override {
         std::string reply;
-        if (set_memory(down, -1, e, &reply)) std::fputs(reply.c_str(), stdout);
+        int64_t slots = 0;
+        if (const basalt::model::Result r = session().set_low_memory(down, slots); !r.ok()) {
+            e = r.message;
+            return;
+        }
+        memory_reply(-1, slots, &reply);
+        std::fputs(reply.c_str(), stdout);
     }
     void between_requests(const std::string&) override {}
     Flow run_request() override;
@@ -268,12 +279,7 @@ public:
     const basalt::model::ModelDesc& desc() const { return model_.desc(); }
 
 private:
-    bool set_memory(bool low, long long reserve, std::string& e, std::string* reply) {
-        int64_t slots = 0;
-        if (const basalt::model::Result r = session().set_low_memory(low, slots); !r.ok()) {
-            e = r.message;
-            return false;
-        }
+    bool memory_reply(long long reserve, int64_t slots, std::string* reply) {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         char line[160];
