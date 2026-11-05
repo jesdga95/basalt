@@ -46,8 +46,10 @@ same keep as the take. The take waits for the writer and registers that layout i
 it is first read are unchanged (new pages are zero either way); only when the OS backs them moves. Admission and the
 take count the prefaulted bytes as free, since the pin reuses them; the RAM homes count the bytes the writer has not
 reached yet as taken. The RAM guard's shed, a shallower request, a deep request refused for RAM and RAM homes that
-would not fit beside the whole pool release them. `kv_host_pool_stub_test` covers the layout
-reuse, a refused pin's fallback and a release while writing; `kv_host_grow_test` runs its checks over a prefaulted
+would not fit beside the whole pool release them. `auto_plan_test` covers when a request starts, holds or drops a
+prefault (`plan_kv_ahead`: the band, the take's RAM rule, a streamed session, the host K/V off) and when RAM homes
+push one out (`kv_ahead_yields`). `kv_host_pool_stub_test` covers the layout reuse, a refused pin's fallback and a
+release while writing; `kv_host_grow_test` runs its checks over a prefaulted
 pool too, and `--pin-bench POWER_W` times the first pin of a 131072-cell pool from fresh and prefaulted pages.
 
 The RAM homes a prompt's loan takes (experts without a RAM copy in the slots it lends) follow the admitted request's

@@ -60,23 +60,34 @@ uint64_t Runtime::kv_ram_now() {
     return kv_host_ram >= 0 ? (uint64_t) kv_host_ram << 20 : kv_ram_free();
 }
 
-// a session nearing the crossover prefaults its first pool when the take's keep admits it now; one farther from it,
-// or already streamed, holds none
+// the prefault of the session's first pool for a request that starts decoding at `need` cells (plan_kv_ahead)
 void Runtime::kv_host_ahead(int64_t need) {
-    if (kv_pool.valid() || need < kv_host_cross - kKvHostLead) {
+    basalt::program::KvAheadInputs a;
+    a.on = kv_host_live;
+    a.need = need;
+    a.crossover_cells = kv_host_cross;
+    a.lead_cells = kKvHostLead;
+    a.streamed = kv_pool.valid();
+    a.held = kv_ahead.prefaulting();
+    basalt::program::KvHostInputs in;
+    if (basalt::program::kv_ahead_due(a)) {
+        in.cells = kv_host_pin_cells(kv_host_cross, kv_host_out);
+        in.crossover_cells = kv_host_cross;
+        in.bytes_per_cell = (basalt::core::KvHostPool::bytes_for(ss, g, in.cells) + (uint64_t) in.cells - 1) /
+                            (uint64_t) std::max<int64_t>(in.cells, 1);
+        in.ram_available = kv_ram_now();
+        in.ram_kept = kv_host_kept();
+        in.ram_low = basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Ok;
+    }
+    switch (basalt::program::plan_kv_ahead(a, in)) {
+    case basalt::program::KvAheadAct::drop:
         kv_ahead_drop("shallow");
         return;
+    case basalt::program::KvAheadAct::start:
+        break;
+    default:
+        return;
     }
-    if (kv_ahead.prefaulting()) return;
-    basalt::program::KvHostInputs in;
-    in.cells = kv_host_pin_cells(kv_host_cross, kv_host_out);
-    in.crossover_cells = kv_host_cross;
-    in.bytes_per_cell = (basalt::core::KvHostPool::bytes_for(ss, g, in.cells) + (uint64_t) in.cells - 1) /
-                        (uint64_t) std::max<int64_t>(in.cells, 1);
-    in.ram_available = kv_ram_now();
-    in.ram_kept = kv_host_kept();
-    in.ram_low = basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Ok;
-    if (!basalt::program::choose_kv_host(in).host) return;
     std::string pe;
     if (!kv_ahead.prefault(ss, g, in.cells, pe)) return;
     basalt::log::info("basalt serve", "host K/V: prefaulting a %lld-cell pool at %lld cells, %.2f GiB, %.2f GiB free, "
@@ -131,13 +142,13 @@ int Runtime::kv_host_to_vram(int64_t at, int64_t live_c, std::string& pe, std::s
 // 1 admitted (in either mode), 0 refused (`e`, the engine stays up), -1 failed
 int Runtime::kv_host_admit(int64_t need, int64_t new_tokens, int64_t live_cells, int64_t read, std::string& e) {
     kv_host_late = false;
+    kv_host_ahead(need);
     if (!kv_host_live) return 1;
     const int64_t live_c = std::min<int64_t>(std::max<int64_t>(live_cells, 0), ss.max_cells);
     const int64_t at = std::max(need, live_c);
     // shallow (the depth it starts decoding at): the VRAM tail (a streamed session moves there after the park)
     if (need < kv_host_cross) {
         kv_host_late = kv_pool.valid();
-        kv_host_ahead(need);
         return 1;
     }
     const int64_t cells = kv_host_pin_cells(at, new_tokens);

@@ -329,6 +329,62 @@ int main() {
         CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
         CHECK(plan_kv_host(in, 147456).pin_bytes == (uint64_t) in.cells * in.bytes_per_cell);
     }
+    {   // the prefault of a session's first pool: within the lead below the crossover, under the take's RAM rule
+        const uint64_t M = 1ull << 20;
+        KvHostInputs pool;
+        pool.crossover_cells = 99328;
+        pool.cells = kv_host_cells(99328, 16384, 4096, 16384, 262144);
+        CHECK(pool.cells == 131072);
+        pool.bytes_per_cell = 12672;
+        pool.ram_kept = 4 * G;
+        pool.ram_available = pool.ram_kept + (uint64_t) pool.cells * pool.bytes_per_cell;   // exactly what fits
+        KvAheadInputs a;
+        a.on = true;
+        a.crossover_cells = 99328;
+        a.lead_cells = 8192;
+        a.need = 99328 - 8192 - 1;                // below the band
+        CHECK(!kv_ahead_due(a) && plan_kv_ahead(a, pool) == KvAheadAct::none);
+        a.held = true;
+        CHECK(plan_kv_ahead(a, pool) == KvAheadAct::drop);
+        a.held = false;
+        a.need = 99328 - 8192;                    // the band's first cell
+        CHECK(kv_ahead_due(a) && plan_kv_ahead(a, pool) == KvAheadAct::start);
+        a.need = 99327;                           // its last
+        CHECK(kv_ahead_due(a) && plan_kv_ahead(a, pool) == KvAheadAct::start);
+        a.held = true;                            // one held stays; the RAM is not read again
+        CHECK(!kv_ahead_due(a) && plan_kv_ahead(a, KvHostInputs{}) == KvAheadAct::hold);
+        a.need = 99328;                           // at the crossover: held for the take
+        CHECK(!kv_ahead_due(a) && plan_kv_ahead(a, pool) == KvAheadAct::hold);
+        a.held = false;                           // none held: the take pins as it would without
+        CHECK(!kv_ahead_due(a) && plan_kv_ahead(a, pool) == KvAheadAct::none);
+        a.need = 95000;
+        a.streamed = true;                        // a session that holds a pool prefaults none ...
+        CHECK(!kv_ahead_due(a) && plan_kv_ahead(a, pool) == KvAheadAct::none);
+        a.held = true;                            // ... and gives one back
+        CHECK(plan_kv_ahead(a, pool) == KvAheadAct::drop);
+        a.streamed = a.held = false;
+        --pool.ram_available;                     // the take's RAM rule: one byte short
+        CHECK(kv_ahead_due(a) && plan_kv_ahead(a, pool) == KvAheadAct::none);
+        ++pool.ram_available;
+        pool.ram_low = true;                      // the RAM guard below Ok
+        CHECK(plan_kv_ahead(a, pool) == KvAheadAct::none);
+        pool.ram_low = false;
+        a.on = false;                             // the host K/V off: none at any depth
+        for (int64_t need : {0, 95000, 99327, 99328, 200000}) {
+            a.need = need;
+            CHECK(!kv_ahead_due(a) && plan_kv_ahead(a, pool) == KvAheadAct::none);
+        }
+        a.on = true;
+        a.crossover_cells = pool.crossover_cells = 4096;   // a crossover below the lead: the band starts at 0
+        a.need = 0;
+        CHECK(kv_ahead_due(a) && plan_kv_ahead(a, pool) == KvAheadAct::start);
+        a.crossover_cells = 0;                    // every request deep: the take pins
+        CHECK(!kv_ahead_due(a) && plan_kv_ahead(a, pool) == KvAheadAct::none);
+        // RAM homes push a prefault out when they, serving and its unwritten pages exceed the room
+        CHECK(!kv_ahead_yields(1 * G, 512 * M, 0, 2 * G));
+        CHECK(!kv_ahead_yields(1 * G, 512 * M, 512 * M, 2 * G));   // exactly fits
+        CHECK(kv_ahead_yields(1 * G, 512 * M, 512 * M + 1, 2 * G));
+    }
     {   // a pool that cannot grow still serves a request when it holds the prompt and the next decode window
         CHECK(kv_host_pool_serves(131072, 120000, 2112));
         CHECK(kv_host_pool_serves(131072, 128960, 2112));

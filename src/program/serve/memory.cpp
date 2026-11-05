@@ -1,5 +1,6 @@
 // src/program/serve/memory.cpp - memory operations for the persistent engine.
 #include "state.hpp"
+#include "basalt/program/auto_plan.hpp"
 
 namespace basalt::program::serve {
 
@@ -133,7 +134,8 @@ bool Runtime::home_given_up(int64_t live, std::string& e, bool partial) {
         const uint64_t unwritten = total - std::min(total, written);
         uint64_t need = 0;
         for (const auto& entry : give) need += basalt::kernels::cpu::expert_layout().blob_bytes(entry.first);
-        if (need + serve_growth_bytes(o, g) + unwritten > src.homes_room()) kv_ahead_drop("RAM homes");
+        if (basalt::program::kv_ahead_yields(need, serve_growth_bytes(o, g), unwritten, src.homes_room()))
+            kv_ahead_drop("RAM homes");
     }
     if (partial) {
         // the highest slots first: the slots that go come before the loan's, and a short read lends the last ones

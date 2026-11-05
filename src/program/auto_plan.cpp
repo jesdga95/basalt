@@ -161,6 +161,23 @@ const char* kv_host_act_name(KvHostAct a) {
     }
 }
 
+bool kv_ahead_due(const KvAheadInputs& in) {
+    return in.on && !in.streamed && !in.held && in.need < in.crossover_cells &&
+           in.need >= in.crossover_cells - in.lead_cells;
+}
+
+KvAheadAct plan_kv_ahead(const KvAheadInputs& in, const KvHostInputs& pool) {
+    if (in.on && in.need >= in.crossover_cells) return in.held ? KvAheadAct::hold : KvAheadAct::none;
+    if (!in.on || in.streamed || in.need < in.crossover_cells - in.lead_cells)
+        return in.held ? KvAheadAct::drop : KvAheadAct::none;
+    if (in.held) return KvAheadAct::hold;
+    return choose_kv_host(pool).host ? KvAheadAct::start : KvAheadAct::none;
+}
+
+bool kv_ahead_yields(uint64_t homes, uint64_t serving, uint64_t unwritten, uint64_t room) {
+    return homes + serving + unwritten > room;
+}
+
 bool cut_gives_up_bare(const std::vector<int32_t>& res, int64_t cut, int64_t n_expert,
                        const std::function<bool(int64_t, int64_t)>& has_copy) {
     if (n_expert <= 0) return false;

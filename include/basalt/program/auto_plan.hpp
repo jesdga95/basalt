@@ -129,6 +129,34 @@ KvHostPlan plan_kv_host(const KvHostInputs& in, int64_t pool_cells);
 bool kv_host_pool_serves(int64_t pool_cells, int64_t at, int64_t window);
 const char* kv_host_act_name(KvHostAct a);
 
+/// What a request does with the prefault of its session's first host K/V pool (KvHostPool::prefault).
+enum class KvAheadAct {
+    none,   ///< none held, none started
+    start,  ///< prefaults the first pool now
+    hold,   ///< the prefault held stays for a take
+    drop,   ///< the prefault held is released
+};
+
+struct KvAheadInputs {
+    bool on = false;                      ///< the host K/V runs
+    int64_t need = 0;                     ///< the depth the request starts decoding at, cells
+    int64_t crossover_cells = 0;          ///< a request this deep goes through plan_kv_host
+    int64_t lead_cells = 0;               ///< the band below the crossover where a session prefaults
+    bool streamed = false;                ///< the session holds a pool
+    bool held = false;                    ///< a prefault is held now
+};
+
+/// Whether the request starts a prefault when the RAM admits it: the host K/V on, the session not streamed, none
+/// held, and `need` within `lead_cells` below the crossover.
+bool kv_ahead_due(const KvAheadInputs& in);
+/// `pool`: the first pool (kv_host_cells at the crossover) as its take would see it now, read only when due; it starts
+/// when choose_kv_host admits it.  A deep request holds a prefault for its take; one below the band, on a streamed
+/// session or with the host K/V off drops it.
+KvAheadAct plan_kv_ahead(const KvAheadInputs& in, const KvHostInputs& pool);
+/// Whether RAM homes of `homes` bytes push out a prefault: they, serving's `serving` bytes and the `unwritten` bytes
+/// the prefault's writer has still to write exceed the `room` free above the RAM floor.
+bool kv_ahead_yields(uint64_t homes, uint64_t serving, uint64_t unwritten, uint64_t room);
+
 /// Whether cutting the expert cache to its first `cut` slots gives up an expert RAM holds no copy of: `res[i]` is the
 /// slot of expert i = layer * n_expert + expert (negative: none), `has_copy(layer, expert)` whether RAM holds it.
 bool cut_gives_up_bare(const std::vector<int32_t>& res, int64_t cut, int64_t n_expert,
