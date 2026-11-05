@@ -1979,19 +1979,6 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
     }
 }
 
-__device__ __forceinline__ unsigned int ld_acquire_gpu(const unsigned int* p) {
-    unsigned int v;
-    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
-    return v;
-}
-__device__ __forceinline__ void st_release_gpu(unsigned int* p, unsigned int v) {
-    asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
-}
-
-__device__ __forceinline__ void red_release_add_gpu(unsigned int* p, unsigned int v) {
-    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
-}
-
 // native_down_kernel with the entries taken GRP_NC at a time.  DEP: launched as a programmatic dependent - the
 // block's first group's weight rows are prefetched into L2 before the wait (and, for IQ4_NL, loaded into registers).
 template<int TD, bool DEP = false>
