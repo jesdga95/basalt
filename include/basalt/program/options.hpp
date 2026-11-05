@@ -98,6 +98,7 @@ struct Options {
     int peer_adapt_swaps = -1;
     /// The peer's experts are held only on the peer, not also in the RAM complement (needs --resident-experts).
     bool peer_exclusive = false;
+    bool prompt_split_any_experts = false;   // --prompt-split-any-experts: price the prompt split for non-NVFP4 expert builds too
     /// the prompt path's rows per layer the peer computes: -1 = half of chunk x top-k, 0 = the prompt path stays on
     /// the primary
     int64_t peer_prefill_rows = -1;
@@ -183,6 +184,7 @@ struct Options {
     int adapt_every = 4;
     bool adapt_every_given = false;   // --adapt-every on the command line
     bool peer_exclusive_given = false;   // --peer-exclusive on the command line
+    bool prompt_split_any_experts_given = false;
     bool resident_budget_given = false;  // --resident-budget-gib on the command line
     bool pool_affinity_given = false;    // --pool-affinity on the command line
     bool pool_workers_given = false;     // --pool-workers on the command line

@@ -32,7 +32,7 @@ int prompt_split(Context& context) {
         const char* off = o.peer_exclusive ? "the tier's experts have no RAM copy (--peer-exclusive)"
                         : !src.complement_ready() ? "no RAM copy of the experts"
                         : !o.cvec_files.empty() ? "a control vector"
-                        : !basalt::prefill::Prefill::fp4_experts() ? "priced for NVFP4 experts only" : nullptr;
+                        : (!o.prompt_split_any_experts && !basalt::prefill::Prefill::fp4_experts()) ? "priced for NVFP4 experts only" : nullptr;
         if (off == nullptr && main_link_gbps <= 0) main_link_gbps = probe_pcie_h2d_gbps();   // (a set --pcie-frac skips it)
         if (off == nullptr) {
             std::vector<double> bw;
