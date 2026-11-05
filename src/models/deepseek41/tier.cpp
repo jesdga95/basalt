@@ -298,8 +298,8 @@ bool ExpertTier::load_ram(std::string& err) {
         for (size_t i = 0; i < held.size(); ++i) ram_idx_[(size_t) l * n_expert_ + held[i]] = (int32_t) i;
     }
     if (cover_ <= 0 && device_home.empty()) return true;
-    const bool swaps = homes_.file > 0 && cover_ > 0;   // one more RAM place per layer takes the experts swapped in
-    if (swaps)
+    const bool swaps = homes_.file > 0 && cover_ > 0;   // the file's experts swap into RAM from a thread
+    if (cover_ > 0)                                     // one more RAM place per layer takes the experts on the move
         for (int l = 0; l < n_layers_; ++l) spare_[(size_t) l] = cover_;
     const auto t0 = std::chrono::steady_clock::now();
     // what the start places from here on: the file's share never loads, a second card and the RAM tier have their bars
@@ -325,7 +325,7 @@ bool ExpertTier::load_ram(std::string& err) {
         grid.layer_offset.push_back(el.offset);
         grid.blob_bytes.push_back(el.blob_bytes);
         if (cover_ <= 0) continue;
-        span_bytes[(size_t) l] = el.blob_bytes * (uint64_t) (cover_ + (swaps ? 1 : 0));
+        span_bytes[(size_t) l] = el.blob_bytes * (uint64_t) (cover_ + 1);
         ram_[(size_t) l] = core::alloc_ram(span_bytes[(size_t) l]);
         if (ram_[(size_t) l] == nullptr) {
             err = "deepseek41: cannot allocate the RAM expert tier";
@@ -437,11 +437,23 @@ const uint8_t* ExpertTier::slot_ptr(int32_t slot) const {
 void ExpertTier::drain() {
     for (const Pending& p : pending_) {
         cudaEventSynchronize(events_[(size_t) p.event]);
-        res_[(size_t) p.layer * n_expert_ + p.expert] = p.slot;
+        const size_t in = (size_t) p.layer * n_expert_ + p.expert;
+        res_[in] = p.slot;
         busy_[(size_t) p.slot] = 0;
         free_events_.push_back(p.event);
+        if (p.out >= 0) {   // the home that left has its RAM place, and the one that came gives its own up
+            ram_idx_[(size_t) p.layer * n_expert_ + p.out] = p.place;
+            spare_[(size_t) p.layer] = ram_idx_[in];
+            ram_idx_[in] = -1;
+        }
     }
     pending_.clear();
+}
+
+void ExpertTier::settle() {
+    cudaStreamSynchronize(copy_stream_);
+    cudaStreamSynchronize(fetch_stream_);
+    drain();
 }
 
 void ExpertTier::begin_token() {
@@ -609,7 +621,7 @@ bool ExpertTier::run_cpu(int layer, const float* x, const Lookup& lk, float* row
 }
 
 
-int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t stream) {
+int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too) {
     if (pending_.size() >= kMaxPending || free_events_.empty()) {
         ++dropped_;
         return -1;
@@ -627,7 +639,8 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
             }
         }
     };
-    if (homes_.main == 0) scan((int64_t) layer * per_layer_, per_layer_);   // homes do not move
+    if (homes_.main == 0 || (homes_too && homes_.file == 0 && spare_[(size_t) layer] >= 0))
+        scan((int64_t) layer * per_layer_, per_layer_);
     if (ext_per_layer_) scan((int64_t) n_layers_ * per_layer_ + (int64_t) layer * ext_per_layer_, ext_per_layer_);
     if (slot < 0 || best == tick_) return -1;   // every slot is in use by this very lookup
     const int32_t o = owner_[(size_t) slot];
@@ -637,12 +650,22 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
     stamp_[(size_t) layer * n_expert_ + e] = tick_;
     const uint64_t bytes = m_.pack().experts[(size_t) layer].blob_bytes;
     uint8_t* dst = const_cast<uint8_t*>(slot_ptr(slot));
-    for (uint64_t off = 0; off < bytes; off += policy::kPieceBytes)
-        cudaMemcpyAsync(dst + off, src + off, std::min(policy::kPieceBytes, bytes - off), cudaMemcpyHostToDevice, stream);
+    const bool home = homes_.main > 0 && slot < (int64_t) n_layers_ * per_layer_;
+    int32_t place = -1;
+    const auto pieces = [&](uint8_t* to, const uint8_t* from, cudaMemcpyKind kind) {
+        for (uint64_t off = 0; off < bytes; off += policy::kPieceBytes)
+            cudaMemcpyAsync(to + off, from + off, std::min(policy::kPieceBytes, bytes - off), kind, stream);
+    };
+    if (home) {   // the home's bytes first: the stream keeps the order
+        place = spare_[(size_t) layer];
+        spare_[(size_t) layer] = -1;
+        pieces(ram_[(size_t) layer] + (size_t) place * bytes, dst, cudaMemcpyDeviceToHost);
+    }
+    pieces(dst, src, cudaMemcpyHostToDevice);
     const int ev = free_events_.back();
     free_events_.pop_back();
     cudaEventRecord(events_[(size_t) ev], stream);
-    pending_.push_back({layer, e, slot, ev});
+    pending_.push_back({layer, e, slot, ev, home ? o : -1, place});
     ++promoted_;
     return slot;
 }
@@ -674,7 +697,7 @@ void ExpertTier::await_fetch(cudaStream_t main) { cudaStreamWaitEvent(main, fetc
 void ExpertTier::promote(int layer, const Lookup& lk) {
     for (int i = 0; i < lk.k; ++i) {
         if (lk.dev[i] || !lk.again[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
-        claim(layer, lk.experts[i], lk.host[i], copy_stream_);
+        claim(layer, lk.experts[i], lk.host[i], copy_stream_, /*homes_too=*/true);
     }
 }
 
