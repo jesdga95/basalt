@@ -22,13 +22,14 @@ from serve.config import (  # noqa: E402
     build_parser,
     check_engine_flags,
     engine_flags_of,
-    engine_line,
     load_config_file,
     model_settings,
     parallel_count,
     parse_settings,
     sampling_defaults_from_config,
-    sampling_line,
+    sampling_items,
+    start_items,
+    model_line,
     server_options,
     split_engine_extras,
     vision_setting,
@@ -318,15 +319,21 @@ class Precedence(unittest.TestCase):
         self.assertIsNone(flag_value(["--spec"], "--spec"))
         self.assertIsNone(flag_value([], "--spec"))
 
-    def test_startup_line(self):
-        self.assertEqual(engine_line(["--max-context", "32768", "--resident-experts", "--kv", "int8",
-                                      "--control-vector-layer-range", "4", "44"], ["--spec", "7"]),
-                         "[server] engine   ctx=32768 resident-experts kv=int8 control-vector-layer-range=4,44 "
-                         "(from config)  spec=7 (from cli)")
-        self.assertEqual(engine_line([], ["--spec", "7"]), "[server] engine   spec=7 (from cli)")
-        self.assertEqual(engine_line([], [], grammar=(False, "cli")),
-                         "[server] engine   grammar=off (from cli)")
-        self.assertEqual(engine_line([], []), "[server] engine   defaults")
+    def test_startup_items(self):
+        self.assertEqual(start_items(["--max-context", "32768", "--resident-experts", "--kv", "int8",
+                                      "--control-vector-layer-range", "4", "44", "--pool-workers", "8",
+                                      "--vram-reserve-mib", "500", "--conversation-cache-disk-mib", "32768"],
+                                     ["--spec", "7", "--pool-workers", "12"]),
+                         ["ctx=32768", "resident-experts", "kv=int8", "control-vector-layer-range=4,44", "reserve=500MiB",
+                          "disk-cache=32768MiB", "spec=7", "pool=12"])
+        self.assertEqual(start_items([], [], grammar=(False, "cli")), ["grammar=off"])
+        self.assertEqual(start_items([], []), [])
+        self.assertEqual(start_items(["--conversation-cache-dir", "/x"], []), [])
+        self.assertEqual(start_items(["--conversation-cache-dir", "/x"], [], debug=True), ["conversation-cache-dir=/x"])
+
+    def test_model_line_pads_the_name(self):
+        self.assertEqual(model_line("Qwen", 12, ["kv=int8", "ctx=8192"]), "[server] Qwen         kv=int8 ctx=8192")
+        self.assertEqual(model_line("Qwen", 4, []), "[server] Qwen")
 
 
 class SamplingOptions(unittest.TestCase):
@@ -380,9 +387,11 @@ class SamplingOptions(unittest.TestCase):
     def test_top_k_zero_in_the_model_file_means_no_cut(self):
         self.assertEqual(sampling_defaults_from_config({"sampling": {"top_k": 0, "temperature": 1.0}}), {"temperature": 1.0})
 
-    def test_startup_line_marks_the_source(self):
-        self.assertEqual(sampling_line({"temperature": 0.8, "top_k": 20, "top_p": 0.9}, {"temperature"}, {"top_k"}),
-                         "[server] sampling temp=0.8(cli) top_k=20(config) top_p=0.9")
+    def test_startup_items_leave_out_what_changes_nothing(self):
+        self.assertEqual(sampling_items({"temperature": 0.8, "top_k": 20, "top_p": 0.9, "min_p": 0.0,
+                                         "presence_penalty": 0.0, "repetition_penalty": 1.0}),
+                         ["temp=0.8", "top_k=20", "top_p=0.9"])
+        self.assertEqual(sampling_items({"top_k": 0, "presence_penalty": 1.5}), ["pres=1.5"])
 
 
 class ThinkingBudget(unittest.TestCase):
@@ -426,10 +435,10 @@ class SlotContext(unittest.TestCase):
     def test_engine_line_shows_the_division(self):
         ap = build_parser()
         a, _, file_words, cli_words = parse_settings(ap, ["--parallel", "4", "--max-context", "65536"])
-        line = engine_line(file_words, cli_words, (a.shared_context, a.parallel))
+        items = start_items(file_words, cli_words, (a.shared_context, a.parallel))
         self.assertEqual(flag_value(cli_words, "--max-context"), "16384")
-        self.assertIn("ctx=16384 (65536/4 slots)", line)
-        self.assertNotIn("slots", engine_line(file_words, cli_words))
+        self.assertIn("ctx=16384 (65536/4 slots)", items)
+        self.assertNotIn("slots", " ".join(start_items(file_words, cli_words)))
 
     def test_slot_full_context_keeps_the_whole(self):
         self.assertEqual(self.context(["--parallel", "4", "--max-context", "262144", "--slot-full-context"]), 262144)

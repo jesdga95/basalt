@@ -23,8 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable as a script
 from serve import ROOT, service  # noqa: E402
 from serve.config import (build_parser, check_engine_flags,  # noqa: E402
-                          engine_flags_of, engine_line, grammar_words, model_settings, sampling_defaults_from_config,
-                          sampling_line)
+                          engine_flags_of, grammar_words, model_line, model_settings, sampling_defaults_from_config,
+                          sampling_items, start_items)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
 from serve.engine.image_source import image_sources_of  # noqa: E402
@@ -32,7 +32,7 @@ from serve.engine.flags import flag_index, flag_value  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.engine.process import ProcessEngine  # noqa: E402
 from serve.engine.vision import (EngineVision, Vision, check_gpu, child_env, engine_args, flag_refused, gpu_card_name,  # noqa: E402
-                                 gpu_text, gpus_in_play, model_plan, vision_card, vision_env, vision_line)
+                                 gpu_text, gpus_in_play, model_plan, vision_card, vision_env, vision_item)
 from serve.models import dialect_for  # noqa: E402
 from serve.handler import Server, serve  # noqa: E402
 from serve.security import (LOOPBACK_NAMES, allowed_hosts_of, api_key_of, exposed_without_key,  # noqa: E402
@@ -144,10 +144,9 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
             cfg["args"] += ["--gpu", ",".join(str(i) for i in range(len(plan.get("cards") or [])))]
     for flag in a.skipped:
         lines.append(tagged("engine", f"{flag[2:]} from the top level: this model has no such flag, skipped"))
-    if pack and not a.mock_engine:
-        lines.append(engine_line(file_engine, cli_engine,
-                                 (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None,
-                                 grammar_entry(a.grammar, sys.argv[1:], used_argv)))
+    cfg["items"] = start_items(file_engine, cli_engine,
+                               (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None,
+                               grammar_entry(a.grammar, sys.argv[1:], used_argv), a.debug) if pack and not a.mock_engine else []
     if a.alias and not pack:
         cfg["model_name"] = a.alias
     if not cfg.get("model_name") and a.model:
@@ -169,10 +168,6 @@ def drop_sidecar_vision(cfg: dict) -> None:
 def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
     """The Service of one checked model, unloaded. With several models a numbered vision sidecar waits for its model's
     turn too."""
-    if multi:
-        print(tagged("model", cfg["model_name"]), flush=True)
-    for line in cfg["start_lines"]:
-        print(line, flush=True)
     tokenizer = cfg.get("tokenizer") or a.tokenizer
     tok = ByteTokenizer()
     tpath = Path(tokenizer)
@@ -194,10 +189,13 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
         vision = None
         env = child_env(cfg)
         sampling_defaults = {**sampling_defaults_from_config(cfg), **a.sampling_launch}
-        if sampling_defaults:
-            print(sampling_line(sampling_defaults, a.sampling_cli, set(a.sampling_launch) - a.sampling_cli), flush=True)
         if a.lazy and not multi:
             drop_sidecar_vision(cfg)
+        shown = [x for x in cfg["items"] if x not in cfg.get("shared_items", ())]
+        shown += sampling_items(sampling_defaults) + [x for x in [vision_item(cfg.get("vision"), cfg)] if x]
+        print(model_line(cfg["model_name"], cfg.get("name_width", 0), shown), flush=True)
+        for line in cfg["start_lines"]:
+            print(line, flush=True)
         if cfg.get("vision"):
             mode = cfg["vision"].get("mode")
             if mode == "dynamic":
@@ -205,7 +203,6 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
             else:
                 vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                                 env=vision_env(env, mode), start=not multi)
-        print(vision_line(cfg.get("vision"), cfg, vision.ready_s if vision else 0.0), flush=True)
         if a.lazy and not multi:
             print(tagged("model", "unloaded, the first request loads it"), flush=True)
         if cfg.get("log"):                              # follow the engine's log file
@@ -292,6 +289,12 @@ def main() -> int:
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError:
         fail(f"port {a.port} is in use (--port N)")
+    width = max(len(c.get("model_name") or "") for c in cfgs) + 1
+    shared = [x for x in cfgs[0].get("items", []) if all(x in c.get("items", []) for c in cfgs[1:])] if multi else []
+    if shared:
+        print(tagged("engine", " ".join(shared)), flush=True)
+    for c in cfgs:
+        c["shared_items"], c["name_width"] = shared, width
     services = [build_model(m[0], cfg, logs, multi, known) for m, cfg in zip(settings, cfgs)]
     check_models(services)
     router = Router(services)

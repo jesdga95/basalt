@@ -1214,18 +1214,12 @@ class GpuChoice(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot read the image /x"):
             e.encode_images([("/x", "/x.sve")])
 
-    def test_vision_startup_line(self):
-        from serve.engine.vision import vision_line
-        name = lambda i: f"card{i}"
-        self.assertEqual(vision_line(None, {}), "[server] vision   mode=off")
-        cpu = vision_line({"gpu": False, "mode": "cpu"}, {}, 2.34)
-        self.assertRegex(cpu, r"^\[server\] vision   mode=cpu threads=\d+ ready=2\.3s$")
-        self.assertEqual(vision_line({"gpu": True, "mode": "1"}, {"gpu": "0,1"}, 5.0, name=name),
-                         "[server] vision   mode=gpu gpu=1 (card1) ready=5.0s")
-        self.assertEqual(vision_line({"gpu": True, "mode": "2"}, {"gpu": "0"}, 5.0, name=lambda i: None),
-                         "[server] vision   mode=gpu gpu=2 ready=5.0s")
-        self.assertEqual(vision_line({"gpu": True, "mode": "dynamic"}, {"gpu": "0,1"}, 0.0, name=name),
-                         "[server] vision   mode=dynamic gpu=0 (card0) load=per-image")
+    def test_vision_startup_item(self):
+        from serve.engine.vision import vision_item
+        self.assertIsNone(vision_item(None, {}))
+        self.assertEqual(vision_item({"gpu": False, "mode": "cpu"}, {}), "vision=cpu")
+        self.assertEqual(vision_item({"gpu": True, "mode": "1"}, {"gpu": "0,1"}), "vision=gpu1")
+        self.assertEqual(vision_item({"gpu": True, "mode": "dynamic"}, {"gpu": "0,1"}), "vision=gpu0")
 
     def test_vision_device(self):
         from serve.engine.vision import child_env, vision_card, vision_env

@@ -300,38 +300,43 @@ def engine_groups(words: list[str]) -> list[list[str]]:
     return groups
 
 
-ENGINE_NAMES = {"max-context": "ctx", "pool-workers": "pool"}      # flag -> the console's name
+# flag -> the console's name; a -mib or -gib flag's unit follows its value
+ENGINE_NAMES = {"max-context": "ctx", "pool-workers": "pool", "conversation-cache-disk-mib": "disk-cache",
+                "conversation-cache-mib": "ram-cache", "vram-reserve-mib": "reserve"}
 UNIT_SUFFIXES = {"-mib": "MiB", "-gib": "GiB"}
 
 
 def engine_item(group: list[str]) -> str:
     """One engine flag with its values as `name=value`; a switch is its bare name."""
-    name, values = group[0][2:], group[1:]
-    for suffix, unit in UNIT_SUFFIXES.items():
-        if name.endswith(suffix) and len(values) == 1:
-            return f"{name[:-len(suffix)]}={values[0]}{unit}"
-    name = ENGINE_NAMES.get(name, name)
-    return f"{name}={','.join(values)}" if values else name
+    flag, values = group[0][2:], group[1:]
+    unit = next((u for suffix, u in UNIT_SUFFIXES.items() if flag.endswith(suffix) and len(values) == 1), "")
+    name = ENGINE_NAMES.get(flag, flag[:-4] if unit else flag)
+    return f"{name}={','.join(values)}{unit}" if values else name
 
 
-def engine_line(file_words: list[str], cli_words: list[str],
-                shared: tuple[int, int] | None = None, grammar: tuple[bool, str] | None = None) -> str:
-    """The startup line listing the engine words from --config and the command line as key=value items, each origin's
-    items followed by `(from config)` or `(from cli)`; with none it says `defaults`. `shared` is (total, slots)
-    when --max-context was divided among the slots. `grammar` is (on, origin) with origin "config" or "cli", None when
-    left at its default (no entry)."""
-    groups = [(g, "config") for g in engine_groups(file_words)] + [(g, "cli") for g in engine_groups(cli_words)]
-    last_ctx = max((i for i, (g, _) in enumerate(groups) if g[0] == "--max-context"), default=None)
-    items: dict[str, list[str]] = {"config": [], "cli": []}
-    for i, (g, src) in enumerate(groups):
+def start_items(file_words: list[str], cli_words: list[str], shared: tuple[int, int] | None = None,
+                grammar: tuple[bool, str] | None = None, debug: bool = False) -> list[str]:
+    """The engine words from --config and the command line as key=value items for a model's startup line, a flag given
+    twice shown once with the value that wins. `shared` is (total, slots) when --max-context was divided among the slots;
+    `grammar` is (on, origin), None when left at its default. The conversation folder shows only with --debug."""
+    groups = engine_groups(file_words) + engine_groups(cli_words)
+    last = {g[0]: i for i, g in enumerate(groups)}
+    items = []
+    for i, g in enumerate(groups):
+        if last[g[0]] != i or (g[0] == "--conversation-cache-dir" and not debug):
+            continue
         item = engine_item(g)
-        if shared and i == last_ctx:
+        if shared and g[0] == "--max-context":
             item += f" ({shared[0]}/{shared[1]} slots)"
-        items[src].append(item)
+        items.append(item)
     if grammar is not None:
-        items[grammar[1]].append(f"grammar={'on' if grammar[0] else 'off'}")
-    shown = "  ".join(f"{' '.join(v)} (from {src})" for src, v in items.items() if v)
-    return tagged("engine", shown or "defaults")
+        items.append(f"grammar={'on' if grammar[0] else 'off'}")
+    return items
+
+
+def model_line(name: str, width: int, items: list[str]) -> str:
+    """A model's startup line: its name padded to the column of the longest name, then its items."""
+    return f"[server] {name:<{width}} {' '.join(items)}".rstrip()
 
 
 def _num(v):
@@ -413,15 +418,13 @@ def sampling_option(key: str):
 
 SAMPLING_NAMES = {"temperature": "temp", "presence_penalty": "pres", "frequency_penalty": "freq",
                   "repetition_penalty": "rep"}      # the console's short names
+SAMPLING_OFF = {"min_p": 0, "presence_penalty": 0, "frequency_penalty": 0, "repetition_penalty": 1, "top_k": -1}
 
 
-def sampling_line(effective: dict, cli: set[str], config: set[str]) -> str:
-    """The startup line for the effective sampling defaults, each marked with where it came from: the keys in
-    `cli` were typed on the command line, those in `config` come from the config file; the rest are the model
-    file's."""
-    mark = lambda k: "(cli)" if k in cli else "(config)" if k in config else ""
-    shown = " ".join(f"{SAMPLING_NAMES.get(k, k)}={v}{mark(k)}" for k, v in effective.items())
-    return tagged("sampling", shown)
+def sampling_items(effective: dict) -> list[str]:
+    """The effective sampling defaults as items, leaving out those that change nothing."""
+    return [f"{SAMPLING_NAMES.get(k, k)}={v}" for k, v in effective.items()
+            if not (k in SAMPLING_OFF and v == SAMPLING_OFF[k]) and not (k == "top_k" and v == 0)]
 
 
 def vision_setting(text: str) -> str:

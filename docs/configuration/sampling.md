@@ -58,6 +58,6 @@ The server takes them as the defaults of these request fields:
 A float key is read as the shortest decimal with the same float32 value (0.95, not 0.949999988).
 
 A bad value stops the server at startup; other `general.sampling.*` keys are ignored. The defaults in effect
-are printed at startup as `[server] sampling ...`, each marked `(cli)` or `(config)` when a launch
-option set it and unmarked when it comes from the model file. A launch option overrides the model file's value for
+are printed at startup on the model's line (`temp=1.0 top_p=0.95 ...`), leaving out those that change nothing. A
+launch option overrides the model file's value for
 that key; the others stay.
