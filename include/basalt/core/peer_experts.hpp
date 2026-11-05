@@ -63,6 +63,9 @@ public:
     bool fill_slot(int32_t slot, const uint8_t* src, uint64_t bytes);
     /// Queues a copy of a blob of this card into pinned, portable host memory; `read_wait` waits for those queued.
     void read_slot(const uint8_t* blob, uint8_t* dst, uint64_t bytes);
+    /// Queues, in this order, a copy of a slot's blob into `out` and of `in` into the slot (both pinned, portable host
+    /// memory); `read_wait` waits for those queued too.
+    void exchange_slot(int32_t slot, uint8_t* out, const uint8_t* in, uint64_t bytes);
     bool read_wait(std::string& err);
     /// One token's share over the pinned activation `x`, in the layout given; the rows land in open_plain's rows.
     bool launch_plain(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t k,

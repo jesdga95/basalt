@@ -10,8 +10,8 @@ the pack and picks the chat format, tool-call syntax and thinking switch to matc
   holds the most routed of them too, nowhere else, as many as leave room for a prompt at the full context, and its other
   slots copy the RAM tier. When everything then has a place, nothing is read from the pack after READY but the Engram
   table and the token embedding. The startup line `basalt deepseek41: expert homes of 384 per layer: ...` gives the split.
-  While the model runs, the main card's slots follow the routing: an expert that keeps missing takes the slot used longest
-  ago, and a home that loses its slot goes to RAM, into the place the new expert leaves.
+  While the model runs, both cards' slots follow the routing: an expert that keeps missing takes the slot used longest ago,
+  on either card, and a home that loses its slot goes to RAM, into the place the new expert leaves.
   Which experts are resident can change the rounding of the output ([precision](precision/deepseek41.md)).
 - **Context:** `--max-context N` (or `"max-context"` in the config's `engine` section) sets it, as for every model, up
   to the model's own maximum (1,048,576 tokens, from the pack); without it the context is 4,096 tokens. A value above the

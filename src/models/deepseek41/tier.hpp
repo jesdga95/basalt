@@ -3,7 +3,7 @@
 // An expert's home is a slot of the main card, a slot of a second card, the pinned RAM tier or the pack file mapped
 // read-only (policy::Homes); the routing order deals them out at the start. The main card's other slots (shared
 // core::ExpertCache storage) hold copies of pinned experts; its homes and copies share a per-layer LRU, and a home that
-// loses its slot goes to RAM, into the place of the expert taking the slot. The GPUs compute the experts they
+// loses its slot, on either card, goes to RAM, into the place of the expert taking the slot. The GPUs compute the experts they
 // hold; the CPU pool computes the rest from RAM or the mapped file while the GPUs work, and the pinned experts it
 // computed are copied into the main card's LRU on a side stream so the next token finds them there.
 #pragma once
@@ -133,6 +133,10 @@ private:
         int layer, expert, slot, event;
         int out = -1, place = -1;
     };
+    /// `in` on its way into the second card's `slot`; `out`, which held it, on its way to RAM place `place`.
+    struct PeerMove {
+        int layer, in, out, slot, place;
+    };
     /// A cold pinned expert (victim) replaced by a hot file-backed one (expert), read into the layer's spare slot.
     struct Swap {
         int layer, expert, victim;
@@ -153,6 +157,10 @@ private:
     /// Copies (layer, e) from `src` into the least recently used free slot of the layer; the slot, or -1. With `homes_too`
     /// that slot may be a home's, when the layer has a free RAM place for it.
     int32_t claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too = false);
+    /// The least recently used free slot of the layer's main card share, or -1; `best` gets its last use.
+    int32_t oldest_slot(int layer, bool homes_too, uint64_t& best) const;
+    /// Moves (layer, e) into the second card when the expert it replaces there was used before any on the main card.
+    bool move_to_peer(int layer, int e, const uint8_t* src);
 
     const DsModel& m_;
     core::ExpertCache cache_;
@@ -166,6 +174,8 @@ private:
     std::vector<int32_t> owner_;            ///< [slot] expert it holds or is receiving, or -1
     std::vector<uint8_t> busy_;             ///< [slot] a promotion is copying into it
     std::vector<Pending> pending_;
+    std::vector<PeerMove> peer_moves_;
+    std::vector<int32_t> peer_owner_;       ///< [second card slot] expert it holds or is receiving
     std::vector<cudaEvent_t> events_;
     std::vector<int> free_events_;
     cudaStream_t copy_stream_ = nullptr;    ///< promotions, off the token path

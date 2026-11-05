@@ -216,6 +216,13 @@ void PeerExperts::read_slot(const uint8_t* blob, uint8_t* dst, uint64_t bytes) {
     cudaMemcpyAsync(dst, blob, bytes, cudaMemcpyDeviceToHost, refill_);
 }
 
+void PeerExperts::exchange_slot(int32_t slot, uint8_t* out, const uint8_t* in, uint64_t bytes) {
+    On on(device_);
+    uint8_t* blob = const_cast<uint8_t*>(cache_.device_slot(slot));
+    cudaMemcpyAsync(out, blob, bytes, cudaMemcpyDeviceToHost, refill_);
+    cudaMemcpyAsync(blob, in, bytes, cudaMemcpyHostToDevice, refill_);
+}
+
 bool PeerExperts::read_wait(std::string& err) {
     On on(device_);
     return ck(cudaStreamSynchronize(refill_), "reading experts", err);
