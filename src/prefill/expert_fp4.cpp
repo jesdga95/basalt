@@ -9,7 +9,7 @@ using namespace detail;
 
 void Prefill::Run::Chunk::Experts::Group::fp4_flush() {
     if (fp4_n == 0) return;
-    if (gg_nslots > 0) cudaStreamWaitEvent(m.cs, m.copied[gg_slots[gg_nslots - 1]], 0);
+    if (gg_nslots > 0) wait_copy(m.tl, m.cs, m.copied[gg_slots[gg_nslots - 1]]);
     const Fp4Ptrs fp = fp4_ptrs(m.Xq, m.Hq, m.T, m.g->n_expert);
     // runs of consecutive experts of at most the rows H holds: H indexes a run's own rows, the
     // layer's Dm and row -> token table the absolute ones

@@ -16,6 +16,8 @@ int Prefill::Run::Chunk::finish() {
         owner.stats_.ms_experts_host += iss_ms;
         owner.stats_.experts_streamed += iss_streamed;
         owner.stats_.experts_dma += iss_dma;
+        for (size_t s = 0; s < (size_t) Src::Count; ++s) m.tl.streamed((Src) s, iss_bytes[s], iss_copies[s]);
+        m.tl.add(Host::Stager, iss_stager_ms);
     }
     owner.stats_.tokens += T;
     core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
@@ -47,10 +49,17 @@ int Prefill::Run::Chunk::finish() {
         return 0;   // the last stage reports the chunk (on_chunk)
     }
     if (owner.on_chunk || owner.on_stage_chunk) {
-        if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+        cudaError_t se = cudaSuccess;
+        {
+            const HostTimer wait(m.tl, Host::Sync);
+            se = cudaStreamSynchronize(m.cs);
+        }
+        if (se != cudaSuccess) {
             err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
             return -1;
         }
+        m.tl.fold();
+        const HostTimer callback(m.tl, Host::Callback);
         if (owner.on_stage_chunk && !owner.on_stage_chunk(p0 + T, err)) return -1;
         if (owner.on_chunk && !owner.on_chunk(m.R, T, p0, err)) return -1;
     }

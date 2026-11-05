@@ -168,7 +168,9 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         return false;
     }
     mtp.wrote(cell0 + r0, cell0 + n);
-    mtp.ms_prefill += ms_since(t0);
+    const double ms = ms_since(t0);
+    mtp.ms_prefill += ms;
+    m.tl.add(Host::DraftKv, ms);
     return true;
 }
 

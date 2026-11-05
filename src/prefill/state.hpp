@@ -2,6 +2,7 @@
 
 #include "common.hpp"
 #include "staging.hpp"
+#include "timing.hpp"
 #include "peer.hpp"
 #include "basalt/prefill/prefill.hpp"
 #include "basalt/core/mtp.hpp"
@@ -118,6 +119,7 @@ struct Prefill::Impl {
     uint8_t* region = nullptr;               // the attention/MoE scratch region (idle while the PLE block runs)
     uint64_t region_bytes = 0;
     PrefillStats* stats = nullptr;
+    Timeline tl;                             // --prefill-timing
     // KV streaming: one layer's whole K/V, staged from the host copy per layer and chunk (identity layout)
     basalt::kernels::KvHostPools stage;
     int32_t* ident_table = nullptr;

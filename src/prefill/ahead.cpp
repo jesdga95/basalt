@@ -58,6 +58,7 @@ void Prefill::Run::Chunk::copy_ahead(int64_t L) {
         slot_of[(size_t) e] = sl;
         ++owner.stats_.experts_streamed;
         ++owner.stats_.experts_dma;
+        m.tl.streamed(Src::Pinned, (uint64_t) lay0.blob_bytes(L));
     }
 }
 

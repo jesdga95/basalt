@@ -73,14 +73,22 @@ bool Prefill::Run::Chunk::Experts::Group::stage_one(size_t j) {
         else cudaMemcpyPeerAsync(m.stage_dev[sl], m.device, via, remote_device,
                                  (size_t) lay.blob_bytes(l), m.copy);
         ++owner.stats_.experts_dma;
+        m.tl.streamed(Src::Card, (uint64_t) lay.blob_bytes(l));
     } else if (pinned) {
         // DMA straight from the page-locked arena: the copy stream only waits for the slot
         if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
         cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
         ++owner.stats_.experts_dma;
+        m.tl.streamed(Src::Pinned, (uint64_t) lay.blob_bytes(l));
     } else {
         // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
-        const uint8_t* hb = m.stager->wait(job_of[j]);
+        if (m.tl.on())
+            m.tl.streamed(m.stager->jobs[(size_t) job_of[j]].fd >= 0 ? Src::File : Src::Ram, (uint64_t) lay.blob_bytes(l));
+        const uint8_t* hb = nullptr;
+        {
+            const HostTimer wait(m.tl, Host::Stager);
+            hb = m.stager->wait(job_of[j]);
+        }
         if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
         cudaMemcpyAsync(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
         m.stager->issued_one(job_of[j], m.copy);
@@ -107,11 +115,12 @@ bool Prefill::Run::Chunk::Experts::Group::walk() {
             const int32_t e = order[j];
             if (stage_of[j] < 0) {
                 ++owner.stats_.experts_resident;
+                m.tl.resident((uint64_t) lay.blob_bytes(l));
                 const int32_t rs = m.host_res ? m.host_res[(size_t) l * m.g->n_expert + e] : -1;
                 const uint8_t* bd = rs >= 0 && m.cache ? m.cache->device_slot(rs) : m.ring_peer->slot_ptr(l, e);
                 if (!compute(j, bd, -1)) return false;
             } else {
-                cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
+                wait_copy(m.tl, m.cs, m.copied[stage_of[j]]);
                 if (!compute(j, m.stage_dev[stage_of[j]], stage_of[j])) return false;
             }
         }
@@ -137,7 +146,7 @@ bool Prefill::Run::Chunk::Experts::Group::walk() {
                 const int sl = (int) (k % (size_t) m.ring);
                 wait_issued(k);
                 if (!group_gather) {
-                    cudaStreamWaitEvent(m.cs, m.copied[sl], 0);
+                    wait_copy(m.tl, m.cs, m.copied[sl]);
                 }
                 if (!compute(j, m.stage_dev[sl], sl)) return false;
                 consumed = ++k;
@@ -148,6 +157,7 @@ bool Prefill::Run::Chunk::Experts::Group::walk() {
                                        : nullptr;
                 if (bp == nullptr) { err = "prefill: an expert is neither resident, streamed nor on the peer"; return false; }
                 ++owner.stats_.experts_resident;
+                m.tl.resident((uint64_t) lay.blob_bytes(l));
                 if (!compute(j, bp, -1)) return false;
                 if (group_gather && gg_nslots == 0) give_back(consumed);
             }

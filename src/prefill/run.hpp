@@ -144,6 +144,10 @@ struct Prefill::Run::Chunk {
     std::atomic<bool> a_stop{false};
     double iss_ms = 0;
     int64_t iss_streamed = 0, iss_dma = 0;
+    // --prefill-timing: the issuer's bytes and copies by source and its waits for the stager, folded in at the end
+    uint64_t iss_bytes[(size_t) Src::Count] = {};
+    int64_t iss_copies[(size_t) Src::Count] = {};
+    double iss_stager_ms = 0;
     std::thread issuer;
     struct IssuerJoin {
         std::atomic<bool>* stop;

@@ -472,7 +472,8 @@ add_library(prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefil
   src/prefill/peer_experts.cpp
   src/prefill/expert_stream.cpp
   src/prefill/combine.cpp
-  src/prefill/handoff.cpp)
+  src/prefill/handoff.cpp
+  src/prefill/timing.cpp)
 target_include_directories(prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_gpu_include_directories})
 target_link_libraries(prefill PUBLIC engine ${_gpu_blas_target} ${_gpu_runtime_target})
 

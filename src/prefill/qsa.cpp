@@ -36,6 +36,7 @@ bool Prefill::Run::Chunk::qsa(const core::LayerView& v) {
     if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err)) return false;
     rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
     rope(m.Kc, T, 2, 256, 512, p0, basalt::kernels::rope_scaling(), m.cs);
+    m.tl.mark(Span::Qsa, m.cs);
     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
     // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
     const bool staged = st.kv_mode == 1;
@@ -65,6 +66,7 @@ bool Prefill::Run::Chunk::qsa(const core::LayerView& v) {
                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
                       host_w, staged ? &m.stage : nullptr);
     }
+    m.tl.mark(Span::Kv, m.cs);
     split_q(m.Qf, m.q, T, m.cs);
     rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
     rope(m.q, T, 24, 256, 6144, p0, basalt::kernels::rope_scaling(), m.cs);

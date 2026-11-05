@@ -1,5 +1,6 @@
 #include "run.hpp"
 #include "basalt/prefill/prefill.hpp"
+#include "basalt/core/diag.hpp"
 #include "basalt/core/mtp.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/core/layout.hpp"
@@ -26,6 +27,14 @@ bool Prefill::Run::execute() {
     // the MMQ row table lives in the borrowed cache slots, which the refill after a prompt overwrites with experts:
     // write it again for every prompt (a layout is reused as long as the chunk and the slots are the same)
     if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, m.T * K, m.cs);
+    // --prefill-timing times a read on one card; a layer split's stages (and the kept chunk) are not timed
+    const bool timed = owner.next_ == nullptr && LB == 0 && first_stage;
+    if (core::diagnostics().prefill_timing && !timed) {
+        static bool said = false;
+        if (!said) basalt::log::info("basalt prefill", "--prefill-timing: a layer split's reads are not timed");
+        said = true;
+    }
+    m.tl.open(core::diagnostics().prefill_timing && timed, cs, pos0, n);
     // The PLE rows of a chunk are read from the model file on the host (an SSD read per missed row): the chunk
     // after this one is read on a thread while the GPU runs this one, into the other of two buffers.  The rows
     // depend only on the tokens (the two before a position name its n-grams), so this is the same data.
@@ -34,6 +43,8 @@ bool Prefill::Run::execute() {
         Chunk chunk(*this, c0);
         if (!chunk.execute()) return false;
         const int flow = chunk.finish();
+        m.tl.mark(Span::Callback, cs);
+        m.tl.chunk_end();
         if (flow < 0) return false;
         if (flow > 0) break;
     }
@@ -55,18 +66,22 @@ bool Prefill::Run::finish() {
         return false;
     }
     owner.stats_.ms_total += ms_since(t_start);
+    m.tl.close(ms_since(t_start));
     return true;
 }
 
 bool Prefill::Run::Chunk::execute() {
     core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);
     ++owner.stats_.chunks;
+    m.tl.chunk_begin(p0, T, stream_all);
     if (!inputs()) return false;
     if (!start_stream()) return false;
+    m.tl.mark(Span::Inputs, cs);
     m.ahead_layer[0] = m.ahead_layer[1] = m.guess_layer = -1;
     for (int64_t l = LB; l < LE; ++l) {
         if (!layer(l)) return false;
     }
+    m.tl.mark(Span::Hc, cs);
     return true;
 }
 

@@ -53,7 +53,7 @@ bool Prefill::Run::Chunk::start_stream() {
     chunk_stager_done.st = stream_all ? m.stager.get() : nullptr;
     peer_async = remote_device >= 0 && m.peer_stage.setup(remote_device, (size_t) MAXBLOB());
     if (threaded_issue) {
-        issuer = std::thread([this] {
+        issuer = std::thread([this, timed = m.tl.on()] {
             const core::OnDevice od(m.device);
             for (size_t idx = 0; idx < seq.size(); ++idx) {
                 while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
@@ -72,6 +72,12 @@ bool Prefill::Run::Chunk::start_stream() {
                 const auto th = Clock::now();
                 const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
+                if (timed) {
+                    const Src from = en.pdev != nullptr ? Src::Card : en.job < 0 ? Src::Pinned
+                                   : m.stager->jobs[(size_t) en.job].fd >= 0 ? Src::File : Src::Ram;
+                    iss_bytes[(size_t) from] += bytes;
+                    ++iss_copies[(size_t) from];
+                }
                 if (en.pdev != nullptr) {
                     if (peer_async) m.peer_stage.copy(m.stage_dev[sl], en.pdev, bytes, m.copy);
                     else cudaMemcpyPeerAsync(m.stage_dev[sl], m.device, en.pdev, remote_device, bytes, m.copy);
@@ -80,7 +86,9 @@ bool Prefill::Run::Chunk::start_stream() {
                     cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
                     ++iss_dma;
                 } else {
+                    const auto tw = timed ? Clock::now() : Clock::time_point{};
                     const uint8_t* hb = m.stager->wait(en.job);
+                    if (timed) iss_stager_ms += ms_since(tw);
                     cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
                     m.stager->issued_one(en.job, m.copy);
                 }
