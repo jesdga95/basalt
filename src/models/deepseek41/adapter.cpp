@@ -6,7 +6,6 @@
 #include "basalt/program/options.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
-#include "basalt/model/flags.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/context_policy.hpp"
@@ -94,19 +93,6 @@ public:
     PreTokenizer pretokenizer() const override { return {"joyai-llm", pretok_joyai}; }
 
     int max_expert_cards() const override { return 1; }
-
-    // The caches are fp16 whatever is asked: --kv names a format every model's config may carry, and output stays the model's.
-    bool parse_flag(const std::string& name, model::FlagArgs& args, program::CommonOptions&, int& code) const override {
-        if (name != "--kv") return false;
-        const std::string v = args.next("--kv");
-        if (v != "fp16" && v != "int8" && v != "q4_0" && v != "k8v4") {
-            basalt::log::error("basalt deepseek41", "--kv %s: expected fp16, int8, q4_0 or k8v4", v.c_str());
-            code = 2;
-        } else if (v != "fp16") {
-            basalt::log::warn("basalt deepseek41", "--kv %s: this model's caches stay fp16", v.c_str());
-        }
-        return true;
-    }
 
     // A context the pack refuses is refused with the flags, before anything loads; the memory check needs the card.
     std::optional<int> finish_flags(program::CommonOptions& o) const override {

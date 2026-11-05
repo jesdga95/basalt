@@ -19,7 +19,6 @@ from serve.util.console import tagged
 MIN_SLOT_CONTEXT = 256          # the least context a slot is given when --max-context is shared
 ENGINE_DEFAULT_CONTEXT = 4096     # the engine's context without --max-context
 CONFIG_VERSION = 2                          # the config file's "version"; a file without one is this format's first
-CONFIG_UPGRADE = "python3 tools/migrations/config_v1_to_v2.py FILE"
 PARALLEL_MAX = 8                            # the engine's batch slots
 CONFIG_PATHS = ("model", "tokenizer", "image-dir")       # relative to the config file
 # a model entry's own, and what it may also inherit from the top-level "engine"; other server options are the server's
@@ -150,7 +149,10 @@ def read_config(path: str) -> dict:
     if version > CONFIG_VERSION:
         raise ValueError(f"this is a v{version} config; this Basalt reads v{CONFIG_VERSION}")
     if version < CONFIG_VERSION or "models" not in raw or "v" in raw:
-        raise ValueError(f"Basalt requires v{CONFIG_VERSION} config, please upgrade: {CONFIG_UPGRADE}")
+        old = Path(path).resolve()
+        new = old.with_name(f"{old.stem}.v{CONFIG_VERSION}{old.suffix}")
+        raise ValueError(f"Basalt requires v{CONFIG_VERSION} config, please upgrade: "
+                         f"python3 {ROOT / 'tools/migrations/config_v1_to_v2.py'} {old} -o {new}")
     extra = set(raw) - {"version", "server", "engine", "models"}
     if extra:
         raise ValueError(f"unexpected key {sorted(extra)[0]!r}")
