@@ -27,6 +27,13 @@ class _Nvml:
     def __init__(self, index=0):
         self.lib = self.dev = None
         names = ["libnvidia-ml.so.1", "libnvidia-ml.so"]
+        if sys.platform == "win32":
+            # Windows ships NVML as nvml.dll (System32); the .so names never load there, which left
+            # /metrics with an empty gpus list and the dashboard showing "No GPU readings".
+            names = ["nvml.dll"]
+            nvml_dll = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "System32", "nvml.dll")
+            if os.path.exists(nvml_dll):
+                names.insert(0, nvml_dll)
         for n in names:
             try:
                 self.lib = ctypes.CDLL(n)
