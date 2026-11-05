@@ -155,6 +155,17 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
     return cfg
 
 
+def drop_sidecar_vision(cfg: dict) -> None:
+    """Only a sidecar encoder holds VRAM before the first request; `dynamic` encodes inside the engine, which the
+    request loads first anyway."""
+    if not cfg.get("vision") or cfg["vision"].get("mode") == "dynamic":
+        return
+    print(tagged("warning", "lazy loading drops a sidecar image encoder, vision off; --vision dynamic stays on"), flush=True)
+    while (at := flag_index(cfg["args"], "--vision-mmproj")) is not None:
+        del cfg["args"][at:at + 2]
+    del cfg["vision"]
+
+
 def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
     """The Service of one checked model, unloaded. With several models a numbered vision sidecar waits for its model's
     turn too."""
@@ -185,11 +196,8 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
         sampling_defaults = {**sampling_defaults_from_config(cfg), **a.sampling_launch}
         if sampling_defaults:
             print(sampling_line(sampling_defaults, a.sampling_cli, set(a.sampling_launch) - a.sampling_cli), flush=True)
-        if a.lazy and cfg.get("vision") and not multi:
-            print(tagged("warning", "lazy loading is text-only, vision off"), flush=True)
-            while (at := flag_index(cfg["args"], "--vision-mmproj")) is not None:
-                del cfg["args"][at:at + 2]
-            del cfg["vision"]
+        if a.lazy and not multi:
+            drop_sidecar_vision(cfg)
         if cfg.get("vision"):
             mode = cfg["vision"].get("mode")
             if mode == "dynamic":
