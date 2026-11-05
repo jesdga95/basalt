@@ -512,7 +512,7 @@ __global__ void __launch_bounds__(kTopkThreads) topk_kernel(const float* __restr
 
 constexpr int kSelThreads = 256;     // rows per group
 constexpr int kSelBlocks = 128;      // the passes' grid; each block walks the groups beyond the grid
-constexpr int kSelGroups = 2052;     // groups the final block can list
+constexpr int kSelGroups = 2052;     // groups the final block can list: each of them keeps a row
 
 struct SelState {
     uint32_t hist[4][256];
@@ -640,15 +640,18 @@ __global__ void __launch_bounds__(kTopkThreads) select_final_kernel(int n, int32
                                                                     const uint32_t* __restrict__ gc) {
     __shared__ int list[kSelGroups], cgt[kSelGroups], ceq[kSelGroups], at[kSelGroups];
     __shared__ int wsum[32];
-    __shared__ int s_cnt, s_total;
+    __shared__ int s_cnt, s_total, s_left;
     n = sel_rows(n, pos, ratio, block_size);
     const int ng = (n + kSelThreads - 1) / kSelThreads;
-    if (threadIdx.x == 0) { s_cnt = 0; s_total = 0; }
+    if (threadIdx.x == 0) { s_cnt = 0; s_total = 0; s_left = st->all ? 0 : st->need_eq; }
     __syncthreads();
     for (int i0 = 0; i0 < ng; i0 += blockDim.x) {
         const int g = i0 + threadIdx.x;
         const int a = g < ng ? (int) gc[(size_t) g * 2] : 0, b = g < ng ? (int) gc[(size_t) g * 2 + 1] : 0;
-        const bool ok = (a | b) != 0;
+        // a group with equal rows counts only while lower groups cannot have supplied all of them
+        int tot_eq;
+        const int eq_before = block_scan(b != 0 ? 1 : 0, tot_eq, wsum);
+        const bool ok = a != 0 || (b != 0 && eq_before < s_left);
         int tot;
         const int r = block_scan(ok ? 1 : 0, tot, wsum);
         if (ok) {
@@ -657,7 +660,10 @@ __global__ void __launch_bounds__(kTopkThreads) select_final_kernel(int n, int32
             ceq[s_cnt + r] = b;
         }
         __syncthreads();
-        if (threadIdx.x == 0) s_cnt += tot;
+        if (threadIdx.x == 0) {
+            s_cnt += tot;
+            s_left = max(0, s_left - tot_eq);
+        }
         __syncthreads();
     }
     if (threadIdx.x == 0) {
@@ -990,7 +996,7 @@ void indexer_select(const IndexerArgs& a, const float* qr, const float* x, const
     if (a.mode == IndexMode::Level1) {
         dim3 g((n_blk + 127) / 128, n_tokens);
         block_max_kernel<<<g, 128, 0, s>>>(w.scores, pos, a.n_comp, a.ratio, a.block_size, w.bscore);
-        if (n_tokens == 1 && n_blk <= kSelGroups * kSelThreads) {
+        if (n_tokens == 1) {
             select_top(w.bscore, n_blk, std::min(a.cand_blocks, kMaxCandBlocks), a.cand_ids, kMaxCandBlocks, a.cand_n, pos,
                        a.ratio, a.block_size, w.sel, s);
         } else {
@@ -999,7 +1005,7 @@ void indexer_select(const IndexerArgs& a, const float* qr, const float* x, const
         }
         check_launch("cand_blocks");
     }
-    if (n_tokens == 1 && a.n_comp <= kSelGroups * kSelThreads) {
+    if (n_tokens == 1) {
         select_top(w.scores, a.n_comp, kTopK, a.out_ids, kTopK, a.out_n, pos, a.ratio, 0, w.sel, s);
     } else {
         topk_kernel<<<n_tokens, kTopkThreads, 0, s>>>(w.scores, a.n_comp, kTopK, a.out_ids, kTopK, a.out_n, pos, a.ratio, 0);

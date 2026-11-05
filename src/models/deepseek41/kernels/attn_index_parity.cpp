@@ -344,7 +344,7 @@ void test_top_rows(Verdict& v) {
     std::mt19937 rng(77);
     std::normal_distribution<float> nd(0.f, 1.f);
     int cases = 0;
-    for (int n : {1, 3, 255, 256, 257, 1000, 4096, 32768, 65536, 200000}) {
+    for (int n : {1, 3, 255, 256, 257, 1000, 4096, 32768, 65536, 200000, 600000, 1048576}) {
         for (int K : {1, 16, kTopK, 2048}) {
             for (int kind = 0; kind < 5; ++kind) {
                 std::vector<float> s((size_t) n);
@@ -358,7 +358,7 @@ void test_top_rows(Verdict& v) {
                         default: s[(size_t) i] = (x > 0.f ? 1e30f : 1.f) * std::fabs(x) * (i & 1 ? -1.f : 1.f); break;   // a wide range, both signs
                     }
                 }
-                const int cap = n + 300;
+                const int cap = kind == 0 ? 1048577 : n + 300;   // a full context's capacity, whatever is visible
                 std::vector<float> full((size_t) cap, -INFINITY);
                 std::copy(s.begin(), s.end(), full.begin());
                 Dev<float> ds(full);
@@ -381,7 +381,7 @@ void test_top_rows(Verdict& v) {
 void bench_top_rows() {
     std::mt19937 rng(78);
     std::normal_distribution<float> nd(0.f, 1.f);
-    for (int n : {32768, 65536, 131072, 524288}) {
+    for (int n : {32768, 65536, 131072, 524288, 1048576}) {
         std::vector<float> s((size_t) n);
         for (float& x : s) x = nd(rng);
         Dev<float> ds(s);
@@ -393,6 +393,15 @@ void bench_top_rows() {
         std::snprintf(name, sizeof name, "top_rows many blocks n=%d K=%d", n, kTopK);
         bench_line(name, bench_us([&] { top_rows(ds.p, n, kTopK, a.p, kTopK, na.p, pos.p, 1, 0, ws.p, nullptr); }, 50), (double) n * 4 * 5);
     }
+    // the rows a long conversation sees, in a full context's capacity
+    const int cap = 1048577, seen = 131072;
+    std::vector<float> s((size_t) cap, -INFINITY);
+    for (int i = 0; i < seen; ++i) s[(size_t) i] = nd(rng);
+    Dev<float> ds(s);
+    Dev<int32_t> a(kTopK), na(1), pos(std::vector<int32_t>{seen - 1});
+    Dev<char> ws(top_rows_workspace_bytes(cap));
+    bench_line("top_rows one block n=131072 cap=1048577", bench_us([&] { top_rows(ds.p, cap, kTopK, a.p, kTopK, na.p, pos.p, 1, 0, nullptr, nullptr); }, 50), (double) seen * 4);
+    bench_line("top_rows many blocks n=131072 cap=1048577", bench_us([&] { top_rows(ds.p, cap, kTopK, a.p, kTopK, na.p, pos.p, 1, 0, ws.p, nullptr); }, 50), (double) seen * 4 * 5);
 }
 
 void bench() {
