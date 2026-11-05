@@ -107,8 +107,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
     // the next visible ones); "auto" places the K from each GPU's free VRAM once the weights are in (below).  KV
     // streaming and images (the server's GPU encoder) run across a split, also with parking and --batch.  Across
-    // GPUs, not supported: control vectors and lending cache slots to the
-    // prompt path (each stage's prompt path has its own buffers).
+    // GPUs, not supported: lending cache slots to the prompt path (each stage's prompt path has its own buffers).
     std::vector<int64_t> split_at;
     std::vector<int> split_devs;
     bool split_auto = false, split_same = false;
