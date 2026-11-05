@@ -42,15 +42,21 @@ their pool keeps for the next ones and the parked conversations it holds now.
 
 A session within 8192 cells below the crossover prefaults its first pool: the registered layout is reserved and its
 first pin's pages are committed and written with zeros on a background thread that makes no device call, under the
-same keep as the take. The take waits for the writer and registers that layout in place. The bytes a pool holds when
-it is first read are unchanged (new pages are zero either way); only when the OS backs them moves. Admission and the
-take count the prefaulted bytes as free, since the pin reuses them; the RAM homes count the bytes the writer has not
-reached yet as taken. The RAM guard's shed, a shallower request, a deep request refused for RAM and RAM homes that
-would not fit beside the whole pool release them. `auto_plan_test` covers when a request starts, holds or drops a
-prefault (`plan_kv_ahead`: the band, the take's RAM rule, a streamed session, the host K/V off) and when RAM homes
-push one out (`kv_ahead_yields`). `kv_host_pool_stub_test` covers the layout reuse, a refused pin's fallback and a
-release while writing; `kv_host_grow_test` runs its checks over a prefaulted
-pool too, and `--pin-bench POWER_W` times the first pin of a 131072-cell pool from fresh and prefaulted pages.
+same keep as the take. The take waits for the writer and registers that layout in place; prefaulted pages past the
+pin go back. The bytes a pool holds when it is first read are unchanged (new pages are zero either way); only when the
+OS backs them moves. Admission and the take count the prefaulted bytes as free, since the pin reuses them; the RAM
+homes count the bytes the writer has not reached yet as taken. The RAM guard's shed, a shallower request, a deep
+request refused for RAM and RAM homes that would not fit beside the whole pool release it. A deep request kept in VRAM
+for another reason (a prompt read longer than a first take allows, or a slot pool that does not fit) leaves it for the
+next turn.
+
+`auto_plan_test` covers when a request starts, holds or drops a prefault (`plan_kv_ahead`: the band's edges, the
+take's RAM rule, the guard, a streamed session, the host K/V off) and when RAM homes push one out
+(`kv_ahead_yields`). `kv_host_pool_stub_test` covers the layout reuse, a refused pin's fallback, the pages past the
+pin going back, the writer's stop flag (read before each 2 MiB step) and a release that frees everything while the
+writer may still run. `kv_host_grow_test` runs its checks over a prefaulted pool too, and `--pin-bench POWER_W` times
+the first pin of a 131072-cell pool from fresh and prefaulted pages. No test drives the serve-level releases under
+real RAM pressure.
 
 The RAM homes a prompt's loan takes (experts without a RAM copy in the slots it lends) follow the admitted request's
 own loan: its read's chunk laid out from the cache's end, never below the full chunk's loan (`homes_from`). When the

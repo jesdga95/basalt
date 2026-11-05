@@ -36,7 +36,8 @@ the next ones, and the parked conversations) and the RAM copies
 the prompt path's loan then needs; otherwise the request keeps its K/V in VRAM (`host K/V: kept in VRAM ...`). A
 session within 8192 cells below the crossover prefaults its first pool in the background when that rule admits it
 then, so the take does not wait for the OS to back the pin (`host K/V: prefaulting ...`); the RAM guard, a shallower
-request, a deep one refused for RAM and RAM homes that need the room give it back. It is
+request, a deep one refused for RAM and RAM homes that need the room give it back, and a deep one kept in VRAM for a
+long prompt read or a slot pool that does not fit leaves it for the next turn. It is
 on by default with one GPU, the experts' RAM copy, a prompt path that lends cache slots and a KV other than `k8v4`; not
 with `--parallel`, a layer split, `--kv-resident` or `--vram-elastic`, where the K/V stays in VRAM.
 `"exp": "kv_host=0"` in the config's `engine` section turns it off. A streamed request decodes as from the VRAM tail
