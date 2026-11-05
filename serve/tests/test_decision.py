@@ -628,11 +628,14 @@ class Integration(unittest.TestCase):
         class Eyes:
             calls, path = 0, None
 
-            def encode(self, sources):
+            def read(self, sources, allowed=None):
+                return [f"pixels:{s}".encode() for s in sources]      # what a real encoder reads back per source
+
+            def encode(self, images):
                 self.calls += 1
                 self.path = Path(directory) / f"emb-{self.calls}.bin"
                 self.path.write_bytes(b"rows")
-                return self.path, list(counts) * len(sources)
+                return self.path, list(counts) * len(images)
 
         eyes = Eyes()
         svc = Service(Scorer(tok), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),

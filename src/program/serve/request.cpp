@@ -17,7 +17,7 @@ Flow Request::execute() {
     if (!runtime_.expire_jev(runtime_.err, !runtime_.jev_scoring)) {
         std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error;
     }
-    if (!runtime_.jev_scoring) runtime_.ver.release_score_workspace();
+    if (!runtime_.jev_scoring) runtime_.release_score_workspace();
     if (!runtime_.jev_scoring && runtime_.jev_draft_prefix >= 0) {
         runtime_.ckd_finish();
         std::erase_if(runtime_.checks, [&](const ConvCheckpoint& c) {
@@ -26,7 +26,7 @@ Flow Request::execute() {
         runtime_.jev_draft_prefix = -1;
     }
     // ---- end Jev ----
-    if (const Flow flow = prepare_image(); flow != Flow::proceed) return flow;
+    if (const Flow flow = prepare_prompt(); flow != Flow::proceed) return flow;
     if (const Flow flow = restore(); flow != Flow::proceed) return flow;
     if (runtime_.jev_scoring) runtime_.jev_cache.touch();
     if (const Flow flow = read_prompt(); flow != Flow::proceed) return flow;

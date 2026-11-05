@@ -1,6 +1,10 @@
 # Running the server
 
+Several models on one server, swapped by a request's `model` field: [models and the router](configuration/models.md).
+
 The long-form notes behind the settings in [configuration](configuration/index.md): concurrent requests, the KV cache, memory floors and image input. Diagnostic flags: `bin/basalt --help`.
+
+A `deepseek41` pack has its own notes: [DeepSeek-V4.1 packs](deepseek41.md).
 
 ## Start-up and loading
 
@@ -75,9 +79,7 @@ sizes `GiB`/`MiB`, times `s`. Startup prints one block, starting with a legend:
 
 ```
 [server] legend   pp=prompt read  tg=generation  c=cached  acc=drafts accepted  dl=tokens per window  hit=expert cache  pcie=routed experts over PCIe
-[server] engine   ctx=262144 kv=int8 vram-reserve=500MiB pool=8 batch=4 (from config)
-[server] sampling temp=1.0 top_p=0.95 top_k=20 min_p=0.0 pres=0.0
-[server] vision   mode=dynamic gpu=0 (RTX 5090) load=per-image
+[server] Qwen3.8-FN-NVFP4-DQ6_K.basalt ctx=262144 kv=int8 reserve=500MiB pool=8 batch=4 temp=1.0 top_p=0.95 top_k=20 vision=gpu0
 [server] auto     peer-excl=off resident=64.0GB pool-affinity=auto
 [server] ready    http://127.0.0.1:8080/v1  openai+anthropic  stats http://127.0.0.1:8080/
 [server] loaded   68.4GiB 37.5s  cuda0=26.6GiB ram=41.2GiB cuda1=0.6GiB cuda1-copy=14.2GiB
@@ -86,7 +88,9 @@ sizes `GiB`/`MiB`, times `s`. Startup prints one block, starting with a legend:
 [server] weights  loaded, ctx=262144 images=on
 ```
 
-`sampling` marks a value set on the command line `(cli)` or in the config file `(config)`; `auto` is the engine's
+Each model gets one line: its name, then the engine settings it was given, its sampling defaults and where images are
+encoded; settings that change nothing are left out. With several models, a first `engine` line holds what every model
+shares, and the names are padded to one column. `auto` is the engine's
 picked settings (see [configuration](configuration/index.md)). A warning or error that comes later reads
 `[server] warning: text` or `[server] error: text`.
 
@@ -219,6 +223,10 @@ Image input is one server option, `--vision off | dynamic | cpu | <GPU number>` 
 `server` section). It is `off` by default. The encoder is Basalt's own and shares its kernels in every mode, so all
 of them give bitwise identical embeddings.
 
+What a request may name as an image depends on where it comes from: [image sources](configuration/image-sources.md).
+An image in a tool result stays in its place in the prompt on all three APIs. A system prompt cannot hold one: that
+request is refused.
+
 | mode | where the encoder runs | VRAM cost | fresh-image latency (IQ3_S, 400 W, earlier build) |
 | --- | --- | --- | --- |
 | `off` | no image input | none | |
@@ -235,7 +243,7 @@ encoder cache in tens of milliseconds in every mode. The sidecar's card is named
 works, whether or not it runs the engine, and the startup line names it.
 
 ```json
-{ "server": { "gpu": "0,1", "vision": 1 } }
+{ "models": [{ "model": "model.basalt", "gpu": "0,1", "vision": 1 }] }
 ```
 
 A GPU number uses the sidecar, which the main build also produces (`tools/vision` builds on its own too). The server

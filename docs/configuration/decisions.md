@@ -149,7 +149,8 @@ Oversized prompts receive HTTP 400 rather than truncation.
 model input. A single question's rubric precedes the changing state for prefix reuse; multiple questions share
 the state and carry isolated rubrics.
 
-`images` (up to 8 sources, each a `data:` URL, an `http(s)` URL or a local file path, as chat accepts them) attaches
+`images` (up to 8 sources, each a `data:` URL, an `http(s)` URL or a local file path, as chat accepts them - the
+same `--image-url-host` / `--image-dir` source policy, and the same waiting-bytes limit before the encoder) attaches
 a picture to the state. It is encoded once for the whole request, whatever the number of scored rows, placed
 before the state text, and each `<|image_pad|>` the template wrote is expanded to the encoder's row count: the
 picture is inside the prefix every row and every later request reuses. Reuse is keyed by the encoded picture, so

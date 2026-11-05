@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <span>
+#include <vector>
 
 namespace basalt::core {
 
@@ -27,6 +28,15 @@ struct DecisionCacheDeadline {
 struct DecisionWindow {
     std::array<int, 8> slots{}, lengths{};
     int size = 0, rows = 0;
+};
+
+/// One decision lane, as the request states it and as the model answers it: the tokens past the prefix every lane
+/// shares, the candidate tokens it asks about, the exact target rows the run wrote, and the windows it cost.  The
+/// request layer holds these; the model that scores fills them (its verifier takes them by reference).
+struct ScoreBranch {
+    std::vector<int32_t> tokens, candidates;
+    std::vector<float> logits;
+    int windows = 0;
 };
 
 inline DecisionWindow decision_window(std::span<const int> remaining, int capacity) {

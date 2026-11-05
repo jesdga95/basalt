@@ -24,7 +24,7 @@ void check(bool ok, const std::string& what) {
 
 bool load(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err) {
     err.clear();
-    return basalt::kernels::cpu::expert_layout_load_text(text, n_layers, n_expert, err);
+    return basalt::kernels::cpu::expert_layout_load_text(text, n_layers, n_expert, err, 2560, 640);
 }
 
 std::string read_file(const std::string& path) {

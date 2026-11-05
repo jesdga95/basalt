@@ -1,5 +1,6 @@
 // src/program/serve/request_parse.cpp - request parse operations.
 #include "request.hpp"
+#include "../cli/tokens.hpp"
 
 namespace basalt::program::serve {
 
@@ -7,7 +8,7 @@ Flow Request::parse() {
     runtime_.stop_req.store(false);   // a STOP that arrived between requests is stale
     runtime_.ram_stop.store(false);
     runtime_.err.clear();
-    if (runtime_.mtp_on && !runtime_.mtp.use_main(runtime_.err)) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }   // (batch windows swap the draft K/V)
+    if (!parse_begin()) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }   // (batch windows swap the draft K/V)
     geni = runtime_.line.rfind("GENI ", 0) == 0;
     if (!geni && runtime_.line.rfind("GEN ", 0) != 0) {
         std::printf("ERR expected: GEN <max_new> <id,id,...>, GENI <max_new> <file> <id,id,...> or GENT <max_new> <nbytes> + text\n");
@@ -31,7 +32,7 @@ Flow Request::parse() {
     req_bias_present = false;
     req_gprompt = -1;       // gprompt=N: the first N ids are the prompt, the rest tokens the request has already generated
     req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
-    req_relax = runtime_.o.relaxed_drafting;   // relax=P: this request's --relaxed-drafting (0 = exact)
+    req_relax = default_relax();   // relax=P: this request's --relaxed-drafting (0 = exact)
     // ppl=K [ppl_t=T]: quality gate (basalt/program/ppl_gate.hpp) - chunk K of --ppl-base, the rest of
     // the chunk teacher-forced through verify windows of T tokens, every token committed
     req_ppl = -1;
@@ -70,7 +71,7 @@ Flow Request::parse() {
                         tokens.empty() || candidates.empty() || candidates.size() > 255 || score_branches.size() >= 8) {
                         std::printf("ERR bad request: invalid Jev branch\n"); return Flow::next;
                     }
-                    basalt::core::Verifier::ScoreBranch b;
+                    basalt::core::ScoreBranch b;
                     b.tokens.assign(tokens.begin(), tokens.end()); b.candidates.assign(candidates.begin(), candidates.end());
                     if (std::any_of(tokens.begin(), tokens.end(), [&](int64_t t) { return t < 0 || t >= runtime_.n_vocab; }) ||
                         std::any_of(candidates.begin(), candidates.end(), [&](int64_t t) { return t < 0 || t >= runtime_.n_vocab; })) {
@@ -112,7 +113,7 @@ Flow Request::parse() {
     else if (!std::isfinite(req_penalty_freq) || !std::isfinite(req_penalty_present))
         bad = "penalty_freq, penalty_present: numbers";
     else if (!(req_relax >= 0.0f && req_relax <= 1.0f)) bad = "relax: 0..1";
-    if (bad == nullptr && runtime_.o.batch > 0 && runtime_.piped && req_penalty_last_n > 0 &&
+    if (bad == nullptr && runtime_.o.batch > 0 && runtime_.pipelined() && req_penalty_last_n > 0 &&
         (req_penalty_repeat != 1.0f || req_penalty_freq != 0.0f || req_penalty_present != 0.0f))
         bad = "penalties: pipelined batch groups are not supported";
     if (bad != nullptr) {
@@ -173,7 +174,7 @@ Flow Request::parse() {
         size_t longest = 0;
         for (const auto& b : score_branches) longest = std::max(longest, b.tokens.size());
         if (!score_branches.empty() && (score_branches.size() < 2 || score_branches.size() > (size_t) runtime_.o.jev ||
-            score_branches.size() > (size_t) runtime_.ver.max_t() || n - 1 + (int64_t) longest + 9 > runtime_.o.max_context)) {
+            score_branches.size() > (size_t) runtime_.score_lanes_window() || n - 1 + (int64_t) longest + 9 > runtime_.o.max_context)) {
             std::printf("ERR bad request: Jev branch wave exceeds its lane or context budget\n"); return Flow::next;
         }
     } else if (score_fresh || !score_frontiers.empty() || !score_branches.empty()) {
@@ -184,7 +185,7 @@ Flow Request::parse() {
 
     if (!req_grammar_text.empty() && runtime_.grammar_vocab) {
         std::string gerr;
-        if (runtime_.o.batch > 0 && runtime_.piped) gerr = "pipelined batch groups are not supported";
+        if (runtime_.o.batch > 0 && runtime_.pipelined()) gerr = "pipelined batch groups are not supported";
         else {
             gguard = std::make_unique<basalt::program::grammar::Guard>(*runtime_.grammar_vocab);
             const size_t gp = req_gprompt > 0 && (size_t) req_gprompt < ids.size() ? (size_t) req_gprompt : ids.size();

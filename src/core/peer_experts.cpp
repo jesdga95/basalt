@@ -5,8 +5,8 @@
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/quantize_act.hpp"
-#include "basalt/kernels/s2_expert_grouped.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -25,7 +25,6 @@ bool peer_portable() { return g_peer_portable; }
 
 namespace {
 
-constexpr int64_t H = basalt::kernels::cpu::H;
 constexpr int64_t CAP = basalt::kernels::cpu::MAXT * 10;   // entries per layer: MAXT tokens x top-10
 
 struct Meta {                           // one block, uploaded with one copy per layer
@@ -81,6 +80,7 @@ void PeerExperts::close() {
     stream_ = refill_ = nullptr;
     refill_ev_ = evict_ev_ = nullptr;
     fsrc_ = nullptr;
+    rows_map_ = nullptr;
     evicting_.clear();
     pending_.clear();
     device_ = -1;
@@ -88,26 +88,25 @@ void PeerExperts::close() {
 
 namespace {
 
-size_t scratch_bytes() {
-    const auto& lay = basalt::kernels::cpu::expert_layout();
-    int64_t ff = basalt::kernels::cpu::FF;
-    if (lay.native)
-        for (const auto& f : lay.fmt) ff = std::max<int64_t>(ff, f.n_ff);
-    return std::max<size_t>((size_t) basalt::kernels::moe_hit_grouped_scratch_bytes(CAP, H, ff),
-                            basalt::kernels::native_expert_scratch_bytes(CAP, ff));
+size_t g_min_scratch = 0;
+
+size_t scratch_bytes(int64_t n_ff) {
+    return std::max<size_t>(g_min_scratch, basalt::kernels::native_expert_scratch_bytes(CAP, n_ff));
 }
 
 }  // namespace
 
-uint64_t PeerExperts::device_overhead_bytes() {
-    return (uint64_t) scratch_bytes() + (uint64_t) CAP * H * sizeof(float) * 2 + sizeof(Meta) +
-           (uint64_t) CAP * (H / 32) * 36;
+void PeerExperts::set_min_scratch(size_t bytes) { g_min_scratch = bytes; }
+
+uint64_t PeerExperts::device_overhead_bytes(int64_t n_embd, int64_t n_ff) {
+    return (uint64_t) scratch_bytes(n_ff) + (uint64_t) CAP * n_embd * sizeof(float) * 2 + sizeof(Meta) +
+           (uint64_t) CAP * (n_embd / 32) * 36;
 }
 
 bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
-                       ExpertSource& src, int64_t n_layers, int64_t n_expert, int reserve_mib, int64_t max_slots,
-                       std::string& err, bool exclusive) {
-    if (!prepare(device, src, n_layers, n_expert, err)) return false;
+                       ExpertSource& src, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, int reserve_mib,
+                       int64_t max_slots, std::string& err, bool exclusive) {
+    if (!prepare(device, src, n_layers, n_expert, n_embd, n_ff, err)) return false;
     // the pairs the primary does not hold, in rank order, as many as fit
     On on(device);
     size_t free_b = 0, total_b = 0;
@@ -133,7 +132,8 @@ uint64_t PeerExperts::slot_bytes(int64_t layer) {
     return lay.native ? (b + 255) / 256 * 256 : lay.max_blob;
 }
 
-bool PeerExperts::prepare(int device, ExpertSource& src, int64_t n_layers, int64_t n_expert, std::string& err) {
+bool PeerExperts::prepare(int device, ExpertSource& src, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff,
+                          std::string& err) {
     close();
     int count = 0;
     if (!ck(cudaGetDeviceCount(&count), "cudaGetDeviceCount", err)) return false;
@@ -144,28 +144,88 @@ bool PeerExperts::prepare(int device, ExpertSource& src, int64_t n_layers, int64
     }
     n_layers_ = n_layers;
     n_expert_ = n_expert;
+    n_embd_ = n_embd;
     src_ = &src;
     res_.assign((size_t) (n_layers * n_expert), kNotResident);
     hold_.assign((size_t) (n_layers * n_expert), 0);
     On on(device);
     device_ = device;
     // scratch first, so the slots take what is really left
-    const size_t scratch = scratch_bytes();
+    const size_t scratch = scratch_bytes(n_ff);
     const bool alloc_ok =
         ck(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err) &&
         ck(cudaStreamCreateWithFlags(&refill_, cudaStreamNonBlocking), "refill stream", err) &&
         ck(cudaEventCreateWithFlags(&refill_ev_, cudaEventDisableTiming), "event", err) &&
         ck(cudaEventCreateWithFlags(&evict_ev_, cudaEventDisableTiming), "event", err) &&
-        ck(cudaHostAlloc((void**) &h_x_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging", err) &&
-        ck(cudaHostAlloc((void**) &h_out_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "result staging", err) &&
+        ck(cudaHostAlloc((void**) &h_x_, (size_t) CAP * n_embd * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging", err) &&
+        ck(cudaHostAlloc((void**) &h_out_, (size_t) CAP * n_embd * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "result staging", err) &&
         ck(cudaHostAlloc(&h_meta_, sizeof(Meta), cudaHostAllocPortable | cudaHostAllocMapped), "plan staging", err) &&
-        ck(cudaMalloc((void**) &d_x_, (size_t) CAP * H * sizeof(float)), "input", err) &&
-        ck(cudaMalloc((void**) &d_out_, (size_t) CAP * H * sizeof(float)), "result", err) &&
+        ck(cudaMalloc((void**) &d_x_, (size_t) CAP * n_embd * sizeof(float)), "input", err) &&
+        ck(cudaMalloc((void**) &d_out_, (size_t) CAP * n_embd * sizeof(float)), "result", err) &&
         ck(cudaMalloc(&d_meta_, sizeof(Meta)), "plan", err) &&
-        ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (H / 32) * 36), "activations", err) &&
+        ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (n_embd / 32) * 36), "activations", err) &&
         ck(cudaMalloc(&d_scratch_, scratch), "scratch", err);
     if (!alloc_ok) { close(); return false; }
     return true;
+}
+
+bool PeerExperts::open_plain(int device, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, float* rows,
+                             std::string& err) {
+    close();
+    n_layers_ = n_layers;
+    n_expert_ = n_expert;
+    n_embd_ = n_embd;
+    res_.assign((size_t) (n_layers * n_expert), kNotResident);
+    hold_.assign((size_t) (n_layers * n_expert), 0);
+    On on(device);
+    device_ = device;
+    const size_t row_bytes = (size_t) n_embd * sizeof(float);
+    const bool ok =
+        ck(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err) &&
+        ck(cudaStreamCreateWithFlags(&refill_, cudaStreamNonBlocking), "read stream", err) &&
+        ck(cudaHostGetDevicePointer((void**) &rows_map_, rows, 0), "mapped rows", err) &&
+        ck(cudaHostAlloc(&h_meta_, sizeof(Meta), cudaHostAllocPortable), "plan staging", err) &&
+        ck(cudaMalloc(&d_meta_, sizeof(Meta)), "plan", err) &&
+        ck(cudaMalloc((void**) &d_x_, row_bytes * kRowBatch), "activation", err) &&
+        ck(cudaMalloc((void**) &d_out_, row_bytes * kRowBatch), "rows", err) &&
+        ck(cudaMalloc((void**) &d_q8_, (size_t) kRowBatch * (size_t) (n_embd / 32) * 36), "q8_1 rows", err) &&
+        ck(cudaMalloc(&d_scratch_, basalt::kernels::native_expert_scratch_bytes((int) kRowBatch, n_ff)), "scratch", err);
+    if (!ok) close();
+    return ok;
+}
+
+uint64_t PeerExperts::room() const {
+    On on(device_);
+    size_t free_b = 0, total_b = 0;
+    return cudaMemGetInfo(&free_b, &total_b) == cudaSuccess ? (uint64_t) free_b : 0;
+}
+
+bool PeerExperts::open_slots(const std::vector<int64_t>& slot_bytes, std::string& err) {
+    On on(device_);
+    if (!cache_.open_sized(slot_bytes, n_layers_, n_expert_, err)) return false;
+    return ck(cudaDeviceSynchronize(), "slots", err);
+}
+
+bool PeerExperts::fill_slot(int32_t slot, const uint8_t* src, uint64_t bytes) {
+    On on(device_);
+    return cudaMemcpy(cache_.device_slot(slot), src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+}
+
+void PeerExperts::read_slot(const uint8_t* blob, uint8_t* dst, uint64_t bytes) {
+    On on(device_);
+    cudaMemcpyAsync(dst, blob, bytes, cudaMemcpyDeviceToHost, refill_);
+}
+
+void PeerExperts::exchange_slot(int32_t slot, uint8_t* out, const uint8_t* in, uint64_t bytes) {
+    On on(device_);
+    uint8_t* blob = const_cast<uint8_t*>(cache_.device_slot(slot));
+    cudaMemcpyAsync(out, blob, bytes, cudaMemcpyDeviceToHost, refill_);
+    cudaMemcpyAsync(blob, in, bytes, cudaMemcpyHostToDevice, refill_);
+}
+
+bool PeerExperts::read_wait(std::string& err) {
+    On on(device_);
+    return ck(cudaStreamSynchronize(refill_), "reading experts", err);
 }
 
 bool PeerExperts::fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std::string& err, bool exclusive) {
@@ -222,6 +282,43 @@ bool PeerExperts::fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std
 
 bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k,
                          const int32_t* kind, std::string& err, float* out) {
+    const auto& lay = basalt::kernels::cpu::expert_layout();
+    if (!lay.native) {
+        err = "peer experts: only native packs are supported";
+        return false;
+    }
+    const auto& f = lay.fmt[(size_t) layer];
+    const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.swiglu_limit);
+    return launch_layout(layer, L, x, ids, n_tok, k, kind, err, out);
+}
+
+bool PeerExperts::launch_plain(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids,
+                               int64_t k, const int32_t* kind, std::string& err) {
+    return launch_layout(layer, L, x, ids, 1, k, kind, err, rows_map_);
+}
+
+bool PeerExperts::launch_window(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids,
+                                int64_t n_tok, int64_t k, const int32_t* kind, std::string& err) {
+    return launch_layout(layer, L, x, ids, n_tok, k, kind, err, rows_map_);
+}
+
+bool PeerExperts::launch_rows(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n,
+                              float* out, std::string& err) {
+    static_assert(kRowBatch == CAP, "a row batch fills a launch's entries");
+    int32_t kind[CAP];
+    for (int64_t i = 0; i < n; ++i) kind[i] = 2;
+    return launch_layout(layer, L, x, ids, n, 1, kind, err, out);
+}
+
+float* PeerExperts::map_rows(float* host, std::string& err) {
+    On on(device_);
+    void* p = nullptr;
+    if (!ck(cudaHostGetDevicePointer(&p, host, 0), "mapping rows", err)) return nullptr;
+    return (float*) p;
+}
+
+bool PeerExperts::launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids,
+                                int64_t n_tok, int64_t k, const int32_t* kind, std::string& err, float* out) {
     const bool direct = out != nullptr;
     launched_direct_ = false;
     launched_rows_ = 0;
@@ -259,34 +356,26 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     entries_ += rows;
     launched_rows_ = rows;
     // direct: x is the verifier's pinned (portable) doorbell row block - copied from where it is
-    if (!direct) std::memcpy(h_x_, x, (size_t) (n_tok * H) * sizeof(float));
+    if (!direct) std::memcpy(h_x_, x, (size_t) (n_tok * n_embd_) * sizeof(float));
     On on(device_);
     const cudaStream_t s = stream_;
-    if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * H) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
+    if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * n_embd_) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
         !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
         return false;
     Meta* dm = (Meta*) d_meta_;
-    const auto& lay = basalt::kernels::cpu::expert_layout();
-    if (lay.native) {
-        basalt::kernels::quantize_q8_1_rows(d_x_, n_tok, H, d_q8_, s);
-        const auto& f = lay.fmt[(size_t) layer];
-        const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
-        basalt::kernels::native_grouped_set_mma_hint(rows >= 2 * groups);   // several entries per expert
-        basalt::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
-                                               d_scratch_, d_out_, s);
-        basalt::kernels::native_grouped_set_mma_hint(false);
-    } else {
-        err = "peer experts: only native packs are supported";
-        return false;
-    }
+    basalt::kernels::quantize_q8_1_rows(d_x_, n_tok, n_embd_, d_q8_, s);
+    basalt::kernels::native_grouped_set_mma_hint(rows >= 2 * groups);   // several entries per expert
+    basalt::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
+                                           d_scratch_, d_out_, s);
+    basalt::kernels::native_grouped_set_mma_hint(false);
     if (direct) {   // the rows straight into the host `out` (zero-copy, coalesced float4 writes)
         try {
-            basalt::kernels::scatter_rows_f32(d_out_, out, dm->out_row, rows, H, s);
+            basalt::kernels::scatter_rows_f32(d_out_, out, dm->out_row, rows, n_embd_, s);
         } catch (const std::exception& e) { err = std::string("peer experts: scatter: ") + e.what(); return false; }
         launched_direct_ = true;
         return true;
     }
-    return ck(cudaMemcpyAsync(h_out_, d_out_, (size_t) rows * H * sizeof(float), cudaMemcpyDeviceToHost, s),
+    return ck(cudaMemcpyAsync(h_out_, d_out_, (size_t) rows * n_embd_ * sizeof(float), cudaMemcpyDeviceToHost, s),
               "results", err);
 }
 
@@ -304,7 +393,7 @@ bool PeerExperts::finish(float* out, std::string& err) {
     ms_wait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (launched_direct_) { launched_rows_ = 0; return true; }
     for (size_t r = 0; r < row_of_.size(); ++r)
-        std::memcpy(out + (size_t) row_of_[r] * H, h_out_ + r * H, (size_t) H * sizeof(float));
+        std::memcpy(out + (size_t) row_of_[r] * n_embd_, h_out_ + r * n_embd_, (size_t) n_embd_ * sizeof(float));
     launched_rows_ = 0;
     return true;
 }

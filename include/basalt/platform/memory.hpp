@@ -67,11 +67,6 @@ uint64_t total_physical_memory();
 /// The RAM the OS can hand out without paging, in bytes (0 when unknown).
 uint64_t available_memory();
 
-/// What the OS could still commit, in bytes. A page-locked or fully reserved region is charged against RAM and the
-/// page file together, so on Windows this is the free part of that pair - the reading a refused allocation names.
-/// Linux keeps no separate charge, so there it is the available-RAM reading (0 when unknown).
-uint64_t commit_headroom();
-
 /// The RAM left alone by anything that locks or fills memory: the larger of 2 GiB and 5% of the machine's RAM.
 uint64_t ram_margin();
 

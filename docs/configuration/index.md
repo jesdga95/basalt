@@ -5,6 +5,7 @@ the model file's sampling defaults. For what a setting does to speed, memory and
 [running](../running.md) and [precision](../precision/index.md).
 
 - [How settings are given](#how-settings-are-given)
+- [Models and the router](models.md)
 - [Server](#server)
 - [Model and GPUs](#model-and-gpus)
 - [Context and KV cache](#context-and-kv-cache)
@@ -43,27 +44,32 @@ There are two kinds of setting:
   startup on a flag name it does not know. It adds `--serve` itself, and `--vision` (with `--vision-mmproj` for
   `vision dynamic`) when `vision` is on.
 
-A config file is one JSON object with two optional blocks:
+A config file is one JSON object. `models` names each model; `engine` applies to every model that takes it; `server` is what the
+whole server shares ([models and the router](models.md)):
 
 ```json
 {
-  "server": { "model": "model.basalt", "port": 8080 },
-  "engine": { "kv": "int8", "resident-experts": true, "control-vector-layer-range": [4, 44] }
+  "version": 2,
+  "models": [{ "model": "model.basalt", "kv": "int8", "control-vector-layer-range": [4, 44] }],
+  "engine": { "resident-experts": true },
+  "server": { "port": 8080 }
 }
 ```
 
 - Keys are the flag names without the dashes (`_` works for `-`). Values are strings or numbers; a switch is `true`, and
-  `false` leaves it off. A repeatable option (`allowed-host`, `cors-origin`) takes a list.
+  `false` leaves it off. A repeatable option (`allowed-host`, `cors-origin`, `image-url-host`, `image-dir`) takes a list.
 - `model` and `tokenizer` paths are relative to the config file.
 - **Precedence:** command line > config file > built-in defaults. The engine receives the config file's flags, then
   the command line's, and a flag given twice takes its last value.
-- An engine flag in `server`, or a server option in `engine`, stops the server at startup, as does an unknown name.
+- A setting in the wrong block stops the server at startup, as does an unknown name.
 - `api-key` cannot be set in a config file; a file that sets it is refused.
 - The built-in defaults pick the fastest settings that need no knowledge of the machine (speculation 8 with a drafter,
   expert cache auto, prefill auto, resident experts when the RAM holds them, adaptive rounds every window on a server), and keep
   the settings that change output or memory use (4096 context, fp16 KV). A config file sets those. The startup line `[server] engine ...` lists what came from the file or the command line.
 
 In the tables, "default" is what applies when the setting is absent everywhere.
+
+Each model takes the common flags and its own; a flag a model lacks is the normal `unknown argument` error. Flags have one default across models; token id flags default to the pack's own tokens.
 
 ## Automatic settings
 
@@ -101,7 +107,7 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | `cors-origin` | string, repeatable | none | Let web pages from this origin call `/v1/*`. |
 | `fit-max-tokens` | switch | off | Clamp a request's `max_tokens` to the context that remains instead of rejecting it with 400. |
 | `open` | switch | off | Open the local web page in the browser once the model is ready. |
-| `lazy` | switch | off | Start the text-only API unloaded and load the model on the first request. Turns vision off. |
+| `lazy` | switch | off | Start the API unloaded and load the model on the first request. Drops a sidecar image encoder; `--vision dynamic` stays on. |
 | `idle-unload` | seconds | off | Unload the model after this long without requests; the next request loads it again. Frees VRAM for other programs. |
 | `idle-sleep` | seconds | off | Put the model to sleep after this long without requests: its VRAM is freed, the process keeps its RAM copy, conversations and learned expert placement, and the next request wakes it in seconds. Linux only (the driver suspends the engine's GPU state); it stays awake when that state would not fit in the free RAM. [running](../running.md#sleep---idle-sleep) |
 | `min-free-vram-mib` | integer | off | Load an unloaded model only when this much VRAM is free, otherwise answer 503. Pairs with `lazy` and `idle-unload`. |
@@ -182,6 +188,7 @@ The prompt is read in batched chunks. These settings set the chunk size and how 
 | `prefill` | engine | `auto`, `auto:N` (N = 8192, 16384 or 32768), or a chunk size in tokens | `auto` | Read the prompt in chunks of this many tokens. `auto` takes the largest chunk the expert cache can lend, up to a ceiling; `auto:N` sets that ceiling. |
 | `prefill-cpu-share` | engine | number from 0 to 1 | 0.6 | Share of the streamed prompt experts the CPU computes; `0` has the GPU stream them all. Fixed, so the output is the same from run to run. A weaker CPU may prefer a lower value. |
 | `short-read` | engine | integer tokens | 64 (`0` = off) | A fresh part of a prompt of at most N tokens (a chat message, a short tool result) is read through the decode windows instead of the batched prompt path. |
+| `no-prompt-skip` | engine | switch | off (the skip is on) | DeepSeek-V4.1 only: every row of a long prompt runs every layer, instead of rows further than 2,668 positions from the read's end stopping at layer 20's compressor. Reads are slower. The math from the last prompt token on is the same; a skipped read differs from a full one by the rounding of another batch shape ([precision](../precision/deepseek41.md#prompt-skip)). A model without the flag treats it as any flag it lacks ([models](models.md)). |
 | `peer-prefill-rows` | engine | integer rows per layer | half of chunk x top-k | Prompt rows per layer the peer card computes. `0` keeps the prompt path on the main card. |
 
 ## Speculative decoding (MTP)
@@ -191,7 +198,8 @@ plain decoding would give.
 
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
-| `spec` | engine | integer | 8 with a drafter, else 0 | Verify windows of at most N tokens: the last accepted token plus up to N-1 drafts. `0` or `1` turns speculation off. |
+| `spec` | engine | integer | 8 with an MTP drafter, 3 with a DSpark drafter, else 0 | Verify windows of at most N tokens: the last accepted token plus up to N-1 drafts. `0` or `1` turns speculation off ([DeepSeek-V4.1 packs](../deepseek41.md#drafting)). |
+| `draft-experts` | engine | integer | 32 | DeepSeek V4.1: the DSpark drafter's routed experts each stage keeps, its most routed by the ranking in `data/profiles` (32, 64, 96 or 128; `0` = all 128). Without that file every expert loads. |
 | `suffix-draft` | engine | integer tokens | 3 (`0` = MTP only) | Prompt lookup: when the text repeats an earlier stretch of the context by at least N tokens, the window may be filled from what followed it there, where the draft policy expects it to pay; such a window may be up to 2 tokens longer than `spec`, at most 8. |
 | `mtp-max-t` | engine | integer | 0 (= `spec`) | Caps the MTP's own windows; longer ones then come only from prompt lookup. |
 | `mtp-window` | engine | integer cells | 32768 (`0` = all) | The drafter attends to the last N cells. With `parallel`, each slot's draft K/V keeps only those and the 16384 before them (a turn rolled back), not the slot's whole context, and the rest of that VRAM holds expert slots. |
@@ -227,7 +235,10 @@ plain decoding would give.
 
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
-| `vision` | server | `off`, `dynamic`, `cpu`, a GPU number | `off` | Image input; booleans are refused. A GPU number, as `gpu` numbers them: encoder sidecar always on that card (about 2.2 GiB of its expert cache), whatever the engine's cards are and no engine role needed. `dynamic`: inside the engine, borrowing expert-cache slots only while it reads an image. `cpu`: sidecar on the CPU, no VRAM, slow. Latencies: [running](../running.md#vision---vision). A GPU number needs the `basalt-vision` binary next to `bin/basalt`. Needs a model file with a vision projector. One image is capped at 64 megapixels before it is decoded. |
+| `vision` | server | `off`, `dynamic`, `cpu`, a GPU number | `off` | Image input; booleans are refused. A GPU number, as `gpu` numbers them: encoder sidecar always on that card (about 2.2 GiB of its expert cache), whatever the engine's cards are and no engine role needed. `dynamic`: inside the engine, borrowing expert-cache slots only while it reads an image. `cpu`: sidecar on the CPU, no VRAM, slow. Latencies: [running](../running.md#vision---vision). A GPU number needs the `basalt-vision` binary next to `bin/basalt`. Needs a model file with a vision projector. One image is capped at 32 MiB and 64 megapixels before it is decoded. |
+| `image-url-host` | server | `HOST` or `HOST:PORT`, repeatable | none | Let requests from other machines name `http(s)` image URLs on exactly this host. Requests from this machine need no flag. [image sources](image-sources.md) |
+| `image-dir` | server | directory, repeatable | none | Let requests from other machines name image files under this directory. Requests from this machine need no flag. [image sources](image-sources.md) |
+| `image-remote-only` | server | switch | off | Treat requests from this machine as remote too. Set it when anything on this machine forwards other people's requests to the server. [image sources](image-sources.md) |
 
 Diagnostic flags: [diagnostics](diagnostics.md)
 

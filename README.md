@@ -1,9 +1,10 @@
 <p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png"><img src="assets/basalt-lockup-light.png" alt="Basalt" width="480"></picture></p>
 
-Basalt is a local inference engine for the **Qwen3.8-Flash-Next** mixture-of-experts model.
+Basalt is a local inference engine for mixture-of-experts models: **Qwen3.8-Flash-Next** and **DeepSeek-V4.1-Flash**.
 It runs on Linux and Windows with an NVIDIA Blackwell GPU (sm_120); see [platforms](docs/platforms.md) for limitations.
 
-Experts that do not fit in VRAM live in system RAM, and optionally on a second GPU used as a peer expert tier.
+Experts that do not fit in VRAM live in system RAM, and optionally on more GPUs used as peer expert tiers (up to three
+for Flash-Next, one for DeepSeek; see [GPUs](docs/configuration/gpus.md)).
 A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compatible API.
 
 **Help wanted:** have some spare compute to lend for testing? See [Contributing](CONTRIBUTING.md#other-ways-to-help).
@@ -13,7 +14,7 @@ A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compa
 ## Requirements
 
 - Linux x86-64 with AVX2 (AVX-512 is used when present), and an NVIDIA Blackwell GPU (compute capability 12.0) with CUDA 13.
-- CMake 3.24 or newer, a C++20 compiler, and Python 3.10 or newer.
+- CMake 3.24 or newer, GCC 13 or newer, and Python 3.10 or newer.
 - Enough system RAM to hold the experts that do not fit in VRAM.
 
 ## Quick start
@@ -30,8 +31,10 @@ Put your settings in `basalt_config.json`, with `model` pointing at the download
 
 ```json
 {
-  "server": { "model": "models/Qwen3.8-FN-NVFP4-DQ6_K.basalt", "gpu": "0,1", "port": 8080 },
-  "engine": { "expert-cache": "auto", "prefill": "auto", "kv": "int8", "resident-experts": true }
+  "version": 2,
+  "models": [{ "model": "models/Qwen3.8-FN-NVFP4-DQ6_K.basalt", "gpu": "0,1", "kv": "int8" }],
+  "engine": { "expert-cache": "auto", "prefill": "auto", "resident-experts": true },
+  "server": { "port": 8080 }
 }
 ```
 
@@ -39,11 +42,13 @@ Put your settings in `basalt_config.json`, with `model` pointing at the download
 bin/basalt serve --config basalt_config.json
 ```
 
-The server listens on 127.0.0.1 by default.
+The server listens on 127.0.0.1 by default. To run several models behind one address, list them in `models`: a request's `model` field picks one, and one is loaded at a time ([models and the router](docs/configuration/models.md)).
 
 ## Models
 
 <p align="center"><img src="docs/assets/basalt-format.png" alt="Inside a .basalt file" width="800"></p>
+
+### Qwen3.8-Flash-Next
 
 Ready-to-run packs, with the quality of each measured against full precision (a BF16 reference), are on
 [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt):
@@ -53,22 +58,34 @@ faster, DQ8 is about 7% slower on prose with a lower KLD ([precision](docs/preci
 A model is one file: weights, tokenizer, MTP drafter, 8-bit hyper-connection copies and vision projector. The expert
 profile ships with the engine ([data/profiles](data/profiles)).
 
+### DeepSeek-V4.1-Flash
+
+The pack is `DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt` on
+[Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt), built from Unsloth's UD-IQ1_M GGUF (Dynamic V3.1), with images and a
+context of up to 1M tokens.
+It runs through the same command; what it supports and how it uses the memory: [DeepSeek-V4.1](docs/deepseek41.md).
+
 ## Docs
 
 - [Configuration](docs/configuration/index.md): every setting.
+- [Models](docs/models.md): what each model supports and its limits.
+- [Models and the router](docs/configuration/models.md): one model or several behind one address.
 - [Running](docs/running.md): parallel requests, prompt chunks, memory floors, image input.
+- [DeepSeek-V4.1](docs/deepseek41.md): memory, long prompts, drafting.
 - [basalt-probe](docs/probe.md): measures the machine, the cold decode speed, and suggests values.
 - [The .basalt model file](docs/model-file.md): the layout, and building a pack yourself (including NVFP4).
 - [Platforms](docs/platforms.md): Linux and Windows requirements, the build steps and the Windows limitations.
 - [Changelog](docs/changelog/index.md): what each release changed.
-- [Building and testing](docs/building.md), [Precision and quality](docs/precision/index.md), [Contributing](CONTRIBUTING.md).
+- [Building and testing](docs/building.md), [Precision and quality](docs/precision/index.md), [Adding a model](docs/adding-a-model.md), [Contributing](CONTRIBUTING.md).
 
 ## Credits
 
 - [Strata](https://github.com/Niko1221/Strata): the project Basalt forks (MIT).
 - [Qwen](https://huggingface.co/Qwen/Qwen3.8-Flash-Next): the model. The packs are under the [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE), not Basalt's MIT license.
-- [unsloth](https://huggingface.co/unsloth): the UD and Q8_0 GGUFs the packs are built from.
-- IST Austria DAS Lab: the GSQ-RCO quants; please cite [GSQ](https://arxiv.org/abs/2604.18556) and [RCO](https://arxiv.org/abs/2605.00649).
+- [DeepSeek](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017): the model and the DSpark drafter. Its pack is under the model's own license, not Basalt's MIT license.
+- [unsloth](https://huggingface.co/unsloth): the UD and Q8_0 GGUFs the Flash-Next packs are built from, and the
+  [UD-IQ1_M GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (Dynamic V3.1) the DeepSeek pack is built from.
+- IST Austria DAS Lab: the GSQ-RCO quants of the Flash-Next packs; please cite [GSQ](https://arxiv.org/abs/2604.18556) and [RCO](https://arxiv.org/abs/2605.00649).
 - [NVIDIA](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4): the NVFP4 experts.
 - [ggml and llama.cpp](https://github.com/ggml-org/llama.cpp): quantization formats and kernels extracted into `src/` (MIT, see [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)).
 

@@ -12,12 +12,14 @@ from typing import Iterator
 
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.engine.mock import Engine
-from serve.frontend import ChatTemplate, Event, OutputParser, images_of, literal_tags, mark_think_literals, unmark_think_literals
+from serve.frontend import ChatTemplate, Event, images_of, mark_think_literals, unmark_think_literals
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
+from serve.models import Dialect, dialect_for
 from serve.prompt import CTX_SLACK, PromptText, overflow_error, room_error
-from serve.util.text import Detokenizer, IM_END, StopMatcher, control_literals, stop_strings
-from serve.engine.vision import Vision
+from serve.util.text import Detokenizer, StopMatcher, control_literals, stop_strings
+from serve.engine.image_source import USAGE as IMAGE_USAGE, ImageRefused, ImageSources
+from serve.engine.vision import IMAGE_WAITING_BYTES, Vision
 from serve.api.grammar import grammar_spec, unenforced
 from serve.config import GRAMMAR_DEFAULT
 
@@ -34,20 +36,16 @@ def available_ram_mib() -> int | None:
     return None
 
 
-IMAGE_PAD = "<|image_pad|>"
 # trailing effort turn (effort_end): sentences for the non-default efforts
-EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"
 EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the "
                       "conclusion without unnecessary elaboration.",
                "medium": "Reasoning effort is set to medium. Think as much as the task needs, without unnecessary "
                          "elaboration."}
-VISION_START = "<|vision_start|>"
+# the Qwen dialect's closer of thinking; other dialects carry their own
+REASONING_CLOSE = "\n</think>\n\n"
 # Reserve output tokens for closing the thinking and the answer above this cap.
 ANSWER_ROOM_MIN_CAP = 1024
 ANSWER_RESERVE_MIN = 512
-# closes the thinking: the template's own end, written when the model ends its turn inside it, reaches the thinking
-# budget or repeats one token
-REASONING_CLOSE = "\n</think>\n\n"
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often
 KEEPALIVE_S = 10.0          # a stream quiet this long (a held-back tool argument) gets a keep-alive
 # live tok/s is a windowed rate: a mean since the first token spikes at the start of an answer
@@ -69,6 +67,16 @@ class Service:
     load_kind = "weights"                               # what the running load is: "weights" or "wake"
     on_loaded = None                                    # called after each weights load or wake this service ran
     boot_error = None                                   # the start-up load's failure, for the requests queued behind it
+    start_tries = None                                  # tries of a load other than the start-up's (None: the engine's)
+
+    def model_entry(self) -> dict:
+        """This model's row in /v1/models."""
+        value = "loading" if self.loading else "loaded" if self.loaded() else "unloaded"
+        return {"id": self.model, "object": "model", "status": {"value": value},
+                "asleep": getattr(self.engine, "asleep", False) is True,
+                "meta": {"n_ctx": self.engine.max_context},
+                "architecture": {"input_modalities": ["text", "image"] if self.vision is not None else ["text"],
+                                 "output_modalities": ["text"]}}
 
     def served_names(self) -> list[str]:
         """The model names a request may use: the one /v1/models lists, and the model file's own name."""
@@ -78,11 +86,13 @@ class Service:
             names.append(path.replace("\\", "/").rsplit("/", 1)[-1])
         return names
 
-    def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
+    def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "basalt",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True):
+                 fit_max_tokens: bool = False, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True,
+                 dialect: Dialect | None = None):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
-        self.literals = literal_tags(control_literals(tokenizer))   # control texts that stay text inside a message
+        self.dialect = dialect or dialect_for(None)      # how this model's prompts and replies are written
+        self.literals = self.dialect.literal_tags(control_literals(tokenizer))   # control texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # clamp the output cap instead of a 400
         self.grammar = grammar                        # the `grammar` option: every tool or JSON request gets one
         self.grammar_engine = grammar_engine          # the engine understands the request key
@@ -92,6 +102,9 @@ class Service:
         self.stopping = threading.Event()               # set at shutdown: nothing starts the engine again
         self.embeddings = threading.local()           # this request's image embeddings file
         self.api_key = ""                              # when set, /v1/* requires it
+        self.image_sources = ImageSources()             # --image-url-host and --image-dir; remote, as is any default
+        self.images_lock = threading.Lock()
+        self.images_waiting = 0                         # bytes of read images waiting for their turn to encode
         # put a non-default reasoning effort in a system turn before the answer so the cached prefix survives
         self.effort_end = False
         self.logs = LogBuffer()                         # server and engine output
@@ -128,8 +141,7 @@ class Service:
         self.answer_room = True                          # reserve output space when thinking
         self.thinking_loop_tokens = 256                  # one token repeated this often in the thinking ends it (0: off)
         self.anthropic_think_unasked = True               # "anthropic_thinking": "on_request" -> False
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        self.stop_ids = {t for s in self.dialect.stop_texts for t in tokenizer.encode(s, parse_special=True)}
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -272,7 +284,8 @@ class Service:
             code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
             print(f"[server] warning: the engine stopped (exit code {code}), restarting it", flush=True)
         try:
-            self.engine.restart(tries=1) if self.booting else self.engine.restart()   # the start-up load tries once
+            tries = 1 if self.booting else self.start_tries   # the start-up load tries once
+            self.engine.restart(tries=tries) if tries else self.engine.restart()
         except EngineStartError as e:                   # a line, not a traceback
             print(f"[server] error: {e}", flush=True)
             if e.log:
@@ -307,8 +320,9 @@ class Service:
                         "note": "applied when the model loads"}
             out = self.engine.vram(reserve_mib)
             self.vram_reserve = reserve_mib
-            print(f"[server] vram: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
-                  f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
+            cache = f"expert cache {out['expert_cache_mib']} of {out.get('expert_cache_full_mib')} MiB " \
+                if out.get("expert_cache_mib") is not None else ""
+            print(f"[server] vram: {out.get('vram_free_mib')} MiB free, {cache}({out.get('expert_slots')} experts)", flush=True)
             return {"status": "ok", **out}
         finally:
             if ctl is not None:
@@ -348,6 +362,15 @@ class Service:
         if self.loading:
             self.load()
 
+    def swap_out(self):
+        """End the engine for another model's turn: no request runs (the router drained them). A sleeping engine gets
+        its GPU state back for its exit, without refilling its caches."""
+        with self.fifo:
+            if hasattr(self.engine, "unload"):
+                self.engine.unload()
+            if self.vision is not None and hasattr(self.vision, "unload"):
+                self.vision.unload()
+
     def _wake(self):
         """Wake a sleeping engine (caller holds fifo); a failed wake ends it and the next start loads it again."""
         t = time.time()
@@ -359,6 +382,7 @@ class Service:
         print(f"[server] model awake in {time.time() - t:.1f} s (driver restore {self.engine.restore_s:.1f} s)",
               flush=True)
 
+    sleep_refused_at = None                              # the request an idle sleep was last refused after
     SLEEP_RAM_MARGIN_MIB = 8192                          # RAM left free once the GPU state is in host memory
 
     def sleep(self, idle_for: float | None = None) -> str:
@@ -384,10 +408,15 @@ class Service:
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
+            # an idle sleep the engine refused is tried again after the next request, not on every round
+            if idle_for is not None and self.sleep_refused_at == (self.last_request_at or self.started_at):
+                return "unsupported"
             t = time.time()
             try:
                 self.engine.sleep(ram_check=self._sleep_fits)
             except ValueError as e:
+                if idle_for is not None:
+                    self.sleep_refused_at = self.last_request_at or self.started_at
                 print(f"[server] warning: the model stays awake ({e})", flush=True)
                 return "no ram" if "RAM" in str(e) else "unsupported"
             print(f"[server] model asleep{f' after {idle_for:.0f} s idle' if idle_for else ''} in {time.time() - t:.1f} s: "
@@ -481,14 +510,10 @@ class Service:
                     print(f"[server] warning: idle unload failed ({e})", flush=True)
         threading.Thread(target=loop, daemon=True).start()
 
-    def start_telemetry(self):
-        """Start the hardware sampler behind GET /metrics, including this server's speeds."""
-        if getattr(self, "telemetry", None) is None:
-            from serve.util.telemetry import Telemetry
-            self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(),
-                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean(),
-                                                    "slot_tok_s": [r["tok_s"] for r in self.slot_table()[0]]},
-                                       gpu_indices=getattr(self, "gpu_indices", None) or [0])
+    def telemetry_extra(self) -> dict:
+        """This model's speeds, for the hardware sampler behind GET /metrics."""
+        return {"tok_s": self._tok_s(), "prefill_tok_s_mean": self._prefill_tok_s_mean(),
+                "slot_tok_s": [r["tok_s"] for r in self.slot_table()[0]]}
 
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S (summed over parallel requests); 0.0 when idle."""
@@ -685,9 +710,11 @@ class Service:
     def render_prompt(self, messages, tools, kwargs) -> str:
         """Render the template. With `effort_end`, a non-default effort is rendered as the default up to the answer
         (same prefix, cache kept) and follows as a short system turn right before it."""
+        if kwargs.get("reasoning_effort") not in (None, ""):
+            kwargs = dict(kwargs, reasoning_effort=self.dialect.effort_level(kwargs["reasoning_effort"]))
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
-        if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
+        if not self.effort_end or not self.dialect.effort_turn or (not off and effort in (None, "", "xhigh", "high")):
             return self.template.render(messages, tools=tools, **kwargs)
         base = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
         history = self.template.render(messages, tools=tools, add_generation_prompt=False, **base)
@@ -695,7 +722,7 @@ class Service:
         mine = self.template.render(messages, tools=tools, add_generation_prompt=False, **kwargs)
         if not full.startswith(mine):                  # a template that cannot be split: render as asked
             return full
-        tail = "" if off else EFFORT_TURN.format(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
+        tail = "" if off else self.dialect.effort_turn.format(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
         return history + tail + full[len(mine):]
 
     def render_text(self, messages, tools, kwargs) -> tuple[str, list]:
@@ -714,35 +741,53 @@ class Service:
             return self.tok.encode(prompt, parse_special=True)
         return self.tok.encode(prompt, parse_special=True, plain=plain)
 
-    def vision_encode(self, images: list[str]) -> list[int]:
-        """Encode image sources: one row count per image, the combined embeddings file left in
-        self.embeddings.path for the engine request that follows (no images, no counts)."""
-        if not images:
+    def vision_encode(self, sources: list[str], image_access: ImageSources | None = None) -> list[int]:
+        """Encode a request's image sources: one row count per image, the combined embeddings file left in
+        self.embeddings.path for the engine request that follows (no images, no counts).  The sources are read
+        under `image_access` - this service's own policy when the caller brings none - so what a connection may
+        name as an image answers the same here as in a chat request."""
+        if not sources:
             return []
         if self.vision is None:
-            raise ValueError("this server was started without image input (--vision), "
-                             "so it cannot read images")
-        # encode under the fifo: the encoder and a running engine must not use the GPU together
-        with self.fifo:
-            if getattr(self.vision, "in_engine", False):   # the encoder lives in the engine: it must be running
-                self.ensure_loaded()
-            try:
-                self.embeddings.path, counts = self.vision.encode(images)
-            except ValueError as e:                 # a refused image: the client gets the 400, the log says why
-                print(f"[server] error: {e}", flush=True)
-                raise
+            _refuse_images("this server was started without image input (--vision), so it cannot read images")
+        try:                                        # before the fifo: a slow source must not hold the turn
+            images = self.vision.read(sources, image_access or self.image_sources)
+        except ImageRefused as e:
+            print(f"[server] error: {e.log_line}", flush=True)
+            raise
+        except ValueError as e:
+            print(f"[server] error: {e}", flush=True)
+            raise
+        held = sum(len(i) for i in {id(i): i for i in images}.values())
+        with self.images_lock:
+            if self.images_waiting + held > IMAGE_WAITING_BYTES:
+                raise ModelBusy("too many images are waiting to be encoded; try again shortly")
+            self.images_waiting += held
+        try:
+            # encode under the fifo: the encoder and a running engine must not use the GPU together
+            with self.fifo:
+                if getattr(self.vision, "in_engine", False):   # the encoder lives in the engine: it must be running
+                    self.ensure_loaded()
+                try:
+                    self.embeddings.path, counts = self.vision.encode(images)
+                except ValueError as e:             # a refused image: the client gets the 400, the log says why
+                    print(f"[server] error: {e}", flush=True)
+                    raise
+        finally:
+            with self.images_lock:
+                self.images_waiting -= held
         return counts
 
-    def expand_image_pads(self, ids: list[int], counts: list[int]) -> list[int]:
-        """Expand each image's pad to one per image token; a pad not after <|vision_start|> is message text."""
-        pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-        start = self.tok.encode(VISION_START, parse_special=True)[0]
-        literal = self.tok.encode(IMAGE_PAD, parse_special=False)
+    def expand_image_pads(self, ids: list[int], counts) -> list[int]:
+        """Expand each image's pad to one per image token; a pad not after the dialect's image start is message text."""
+        pad = self.tok.encode(self.dialect.image_pad, parse_special=True)[0]
+        start = self.tok.encode(self.dialect.image_start, parse_special=True)[0] if self.dialect.image_start else None
+        literal = self.tok.encode(self.dialect.image_pad, parse_special=False)
         out, k = [], 0
         for j, t in enumerate(ids):
-            if t == pad and j > 0 and ids[j - 1] == start:
+            if t == pad and (start is None or (j > 0 and ids[j - 1] == start)):
                 if k == len(counts):                    # more markers than images
-                    raise ValueError("the prompt and its images do not match")
+                    _refuse_images("the prompt and its images do not match")
                 out += [pad] * counts[k]
                 k += 1
             elif t == pad:
@@ -750,7 +795,7 @@ class Service:
             else:
                 out.append(t)
         if k != len(counts):
-            raise ValueError("the prompt and its images do not match")
+            _refuse_images("the prompt and its images do not match")
         return out
 
     def drop_embeddings(self, path) -> None:
@@ -760,13 +805,14 @@ class Service:
             if getattr(self.embeddings, "path", None) == path:
                 self.embeddings.path = None
 
-    def prepare(self, messages, tools, kwargs, max_new=None, force=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, force=None, image_access=None):
         """Return (ids, thinking, max_new); an unset or non-positive max_new means the rest of the context.
         `force` (frontend.forced_call): the opening of the call the reply must make.  Without thinking it ends the
-        prompt; with thinking, run() writes it once the thinking is over."""
+        prompt; with thinking, run() writes it once the thinking is over.  `image_access`: what this request's
+        connection may name as an image; without one, the remote policy."""
         self.embeddings.path = None
         try:
-            return self._prepare(messages, tools, kwargs, max_new, force)
+            return self._prepare(messages, tools, kwargs, max_new, force, image_access or self.image_sources)
         except BaseException:
             if self.embeddings.path:
                 Path(self.embeddings.path).unlink(missing_ok=True)
@@ -792,15 +838,26 @@ class Service:
         prompt.max_new = max_new
         return prompt, kwargs.get("enable_thinking", True) is not False, max_new
 
-    def _prepare(self, messages, tools, kwargs, max_new, force):
-        if getattr(self.engine, "takes_text", False) and not images_of(messages) and not getattr(self.engine, "batch", 0):
+    def _check_images(self, messages, images) -> None:
+        """Refuse, before rendering, a request whose images cannot reach the prompt."""
+        if self.vision is None:
+            _refuse_images("this server was started without image input (--vision), so it cannot read images")
+        if images_of(m for m in messages if m.get("role") == "system"):
+            _refuse_images("a system prompt cannot hold an image")
+        if not all(images):
+            _refuse_images(IMAGE_USAGE)
+
+    def _prepare(self, messages, tools, kwargs, max_new, force, image_access):
+        images = images_of(messages)
+        if images:
+            self._check_images(messages, images)
+        elif getattr(self.engine, "takes_text", False) and not getattr(self.engine, "batch", 0):
             return self._prepare_text(messages, tools, kwargs, max_new, force)
         ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
-            ids = ids + self.tok.encode(force, parse_special=True)
-        images = images_of(messages)
-        counts = self.vision_encode(images)
-        if counts:
+            ids = ids + self.tok.encode(self.dialect.nothink_lead + force, parse_special=True)
+        if images:
+            counts = self.vision_encode(images, image_access)
             ids = self.expand_image_pads(ids, counts)
         ctx = self.engine.max_context
         if ctx <= 0:
@@ -917,7 +974,7 @@ class Service:
         if self.sampling_defaults:     # the request's own fields win
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**self.sampling_defaults, **req_values}
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        parser = self.dialect.parser(thinking, tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         thinking_n = 0                                 # tokens written while thinking
         stop_list = stop_strings(sampling)
@@ -941,9 +998,10 @@ class Service:
                     out.append(Event("content", held))
                 out.append(ev)
             return out
+        one_call = self.dialect.forced_call_ends_reply and bool(force) and force.rstrip().endswith(">")     # a named choice: the reply is that one call
         opening = []                                    # without thinking the prompt ends with the forced opening:
         if force and not thinking:                      # the parser reads it as if the model had written it
-            opening, force = parser.feed(force), None
+            opening, force = parser.feed(self.dialect.nothink_lead + force), None
         tail = ""                                       # the last characters written (the newlines before a call)
         reused0 = None                                  # reused prefix of the request's first engine run
         timings, before = None, None                    # this request's timings; the engine's `last` before it
@@ -1087,6 +1145,9 @@ class Service:
                                         and parser.state == "reasoning" and not parser.buf and not detok.pending()):
                                     wrap = looped = True
                                     break
+                                if one_call and any(ev.kind == "tool_call" for ev in evs):
+                                    finish = "stop"         # no second call after a forced one
+                                    break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
                                     # only at a clean point: no held tag or split character
@@ -1128,7 +1189,7 @@ class Service:
                         # one, so the engine keeps its prefix
                         if ended_thinking:
                             closed_early = True
-                            extra = self.tok.encode(REASONING_CLOSE + (force or ""), parse_special=True)
+                            extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
                             force = None
                             if max_new - n - len(extra) < 1:
                                 finish = "stop"
@@ -1136,7 +1197,7 @@ class Service:
                             print("[server] the model ended while thinking, closing it for an answer", flush=True)
                         elif wrap:
                             budget = None
-                            extra = self.tok.encode(REASONING_CLOSE + (force or ""), parse_special=True)
+                            extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
                             force = None
                             if max_new - n - len(extra) < 1:
                                 break                   # no room to answer: "length"
@@ -1311,6 +1372,12 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
             # draft counts only when reported
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
                if last.get("drafts_offered") is not None else {})}
+
+
+def _refuse_images(why: str):
+    """A request refused for its images: the client gets the 400, the log says why."""
+    print(f"[server] error: {why}", flush=True)
+    raise ValueError(why)
 
 
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
