@@ -9,8 +9,10 @@
 
 Inputs
   --gguf FILE        the model's GGUF: shard 1 of a split model (the others are found beside it) or --gguf per shard
-  --sections-from BASE.basalt  with --gguf: the drafter and vision sections are copied from BASE byte for byte (BASE's
-                     vocabulary must be the GGUF's); replaces --mmproj, --mtp-* and --draft-vocab
+  --sections-from BASE.basalt  with --gguf: the drafter, DSpark and vision sections are copied from BASE byte for byte
+                     (BASE's vocabulary must be the GGUF's); replaces --mmproj, --mtp-*, --draft-vocab and --dspark. A
+                     tensor with a section of its own (the Engram table) whose shard stops after its header is copied
+                     from BASE's section of the same tensor
   --mmproj FILE      the vision projector GGUF (required unless --no-vision)
   --dspark FILE      deepseek41 only: the DSpark drafter GGUF, stored whole as the dspark/gguf section
   --mtp-source DIR   the draft layer's BF16 tensors from `mtp_fetch.py fetch --out DIR`; without it there is no drafter
@@ -307,7 +309,7 @@ def convert(a) -> None:
     arch = A.for_architecture(source_architecture(paths[0]))
     if not arch.side_sections:
         given = [o for o, v in (("--mmproj", a.mmproj and not arch.mmproj_only), ("--mtp-source", a.mtp_source), ("--mtp-dense", a.mtp_dense),
-                                ("--draft-vocab", a.draft_vocab), ("--sections-from", a.sections_from))
+                                ("--draft-vocab", a.draft_vocab))
                  if v]
         if given:
             die(f"{arch.name} packs have no MTP drafter or hc8 sections; drop {', '.join(given)}")
@@ -325,9 +327,9 @@ def convert(a) -> None:
             die(f"{a.mmproj} is not a {arch.projector_type} projector GGUF")
     if a.sections_from:
         base = ModelFile(a.sections_from) if Path(a.sections_from).is_file() else die(f"missing input: {a.sections_from}")
-        if a.mtp_source or a.mtp_dense or a.draft_vocab or a.mmproj or a.no_vision:
+        if a.mtp_source or a.mtp_dense or a.draft_vocab or a.mmproj or a.no_vision or getattr(a, "dspark", None):
             die("--sections-from supplies the drafter and vision sections; do not combine it with "
-                "--mtp-source, --mtp-dense, --draft-vocab, --mmproj or --no-vision")
+                "--mtp-source, --mtp-dense, --draft-vocab, --mmproj, --dspark or --no-vision")
         base_meta = json.loads(base.read("meta"))
     mmproj = Path(a.mmproj) if a.mmproj else None
     side = [Path(x) for x in (a.draft_vocab, a.mtp_dense) if x]
@@ -344,7 +346,7 @@ def convert(a) -> None:
     err = None
     try:
         print("reading the source GGUFs ...", flush=True)
-        model = S.SourceModel(paths)
+        model = S.SourceModel(paths, frozenset(arch.own_sections) if base is not None else frozenset())
         kv, tensors = source_tensors(model, arch.own_sections)
         own = {n: model.where[n][1] for n in arch.own_sections if n in model.where}
         if not arch.side_sections:
@@ -396,16 +398,28 @@ def convert(a) -> None:
             job._report("gguf", w.entries[-1][2], time.time() - t)
             tensor_offsets = dict(zip((x[0] for x in tensors), offs))
             own_entries = {}
+            copied = []
             for name, section in arch.own_sections.items():
-                src, off, size = model.abs_range(name)
-                job.file(section, src, off, size)
                 t = own[name]
+                if name in model.short:   # its shard stops after the header: the same tensor's section in the base
+                    size = t.expected_bytes()
+                    bt = base_meta.get("tensors", {}).get(name, {})
+                    if (bt.get("section"), bt.get("type_id"), bt.get("shape"), bt.get("bytes")) != \
+                            (section, t.type_id, [int(d) for d in t.shape], size) or section not in base.sections:
+                        die(f"{name}: its shard holds only the header, and {a.sections_from} has no section of that tensor")
+                    off, _ = base.section(section)
+                    job.file(section, a.sections_from, off, size)
+                    if w.entries[-1][3] != base.sections[section][2]:
+                        die(f"section {section}: the copy's SHA-256 differs from {a.sections_from}'s")
+                    copied.append(section)
+                else:
+                    src, off, size = model.abs_range(name)
+                    job.file(section, src, off, size)
                 own_entries[name] = {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.shape],
                                      "bytes": size, "offset": 0, "section": section}
-            copied = []
             if base is not None:
                 for name in base.names():
-                    if name != "vision/text_vocab" and name.startswith(("mtp/", "vision/")):
+                    if name != "vision/text_vocab" and name.startswith(("mtp/", "vision/", "dspark/")):
                         off, size = base.section(name)
                         job.file(name, a.sections_from, off, size)
                         if w.entries[-1][3] != base.sections[name][2]:
@@ -461,6 +475,7 @@ def convert(a) -> None:
                                                     "extra": [v[0] for v in vision_extra]},
                 **arch.meta_extra(kv, {n: t for n, _, _, _, t in tensors}, own),
                 **({"dspark": dspark_record(dspark)} if dspark else {}),
+                **({"dspark": base_meta["dspark"]} if base is not None and "dspark" in base_meta else {}),
             }
             if base is not None:
                 meta["sections_from"] = {"path": Path(a.sections_from).name, "size": Path(a.sections_from).stat().st_size,
