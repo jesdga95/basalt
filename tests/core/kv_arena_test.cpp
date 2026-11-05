@@ -113,6 +113,31 @@ int main() {
         if (!b.map(b.max_cells(), err) || b.cells() != b.max_cells() || !all(b.array(1), (kPages + 2) * kRow, 0))
             return fail("map all with a tail", err);
     }
+    // a capped array (a streamed state's slot pool) stops at its cap while the others follow the depth; lifting the
+    // cap lets it follow again, lowering it gives the excess back at the next unmap
+    {
+        basalt::core::KvArena c;
+        if (!c.open(page_bytes, kPages, kPage, err)) return fail("open cap", err);
+        constexpr int64_t kCap = 3;
+        c.cap(0, kCap);
+        c.cap(1, kCap);
+        const int64_t want = 100 * kPage;
+        if (!c.map(want, err) || c.cells() < want) return fail("map capped", err);
+        const uint64_t mapped0 = c.mapped_bytes();
+        if (mapped0 != c.bytes_for(want)) return fail("capped bytes");
+        // arrays 0 and 1 hold only the cap's granules, arrays 2 and 3 the whole depth
+        basalt::core::KvArena ref;
+        if (!ref.open(page_bytes, kPages, kPage, err) || !ref.map(want, err)) return fail("open ref", err);
+        if (mapped0 >= ref.mapped_bytes()) return fail("cap saves VRAM");
+        if (!all(c.array(0), kCap * page_bytes[0], 0) || !all(c.array(2), (uint64_t) want / kPage * page_bytes[2], 0))
+            return fail("capped arrays zeroed");
+        c.cap(0, 0);
+        c.cap(1, 0);
+        if (!c.map(want, err) || c.mapped_bytes() != ref.mapped_bytes()) return fail("cap lifted", err);
+        c.cap(0, 1);
+        c.cap(1, 1);
+        if (!c.unmap(want, err) || c.mapped_bytes() >= ref.mapped_bytes() || c.cells() < want) return fail("cap lowered", err);
+    }
     // on a grid, one deep map is given back to the first grid line at or above the cut, the cells below kept
     {
         constexpr int64_t kGrid = 128 * kPage;
@@ -129,7 +154,7 @@ int main() {
             !one.unmap(2 * kGrid + 1, err) || one.mapped_bytes() != one.bytes_for(8 * kGrid))
             return fail("one mapping per call stays", err);
     }
-    std::puts("kv arena: whole pages backed and zeroed on demand, given back past the cut, addresses fixed, mappings "
-              "on a grid");
+    std::puts("kv arena: whole pages backed and zeroed on demand, given back past the cut, addresses fixed, caps per "
+              "array, mappings on a grid");
     return 0;
 }

@@ -1,5 +1,6 @@
 // src/program/serve/request_prefill.cpp - request read_prompt operations.
 #include "request.hpp"
+#include "basalt/program/auto_plan.hpp"
 
 namespace basalt::program::serve {
 
@@ -16,6 +17,31 @@ Flow Request::read_prompt() {
     if (!runtime_.xq_drain()) {
         std::printf("ERR an adaptive refill failed\n");
         return Flow::error;
+    }
+
+    // the loan's experts that RAM holds no copy of (the RAM plan kept the lent copies only as far as RAM allowed)
+    // take RAM homes before the read, once the work in flight has drained
+    int64_t loan_chunk = 0;
+    if (runtime_.kv_floor > 0 && runtime_.src.complement_ready() &&
+        !runtime_.pf_parts.empty() && runtime_.pf_parts[0].first >= 0 &&
+        basalt::program::cut_gives_up_bare(
+            runtime_.host_res, runtime_.loan_plan(runtime_.xcache.slots(), loan_chunk), runtime_.g.n_expert,
+            [&](int64_t l, int64_t x) { return runtime_.src.has_resident(l, x); })) {
+        const bool loan_active = std::any_of(runtime_.pf_parts.begin(), runtime_.pf_parts.end(),
+                                             [](const auto& part) { return !part.lent.empty(); });
+        if (loan_active) {
+            basalt::log::warn("basalt serve", "elastic KV: a prompt loan is out: the loan's experts without a RAM "
+                              "copy are read from the file");
+        } else {
+            if (!runtime_.kv_drain(runtime_.err)) {
+                std::printf("ERR %s\n", runtime_.err.c_str());
+                return Flow::error;
+            }
+            std::string he;
+            if (!runtime_.home_given_up(runtime_.xcache.slots(), he, true))
+                basalt::log::warn("basalt serve", "elastic KV: RAM homes for the loan's experts without a RAM copy: "
+                                  "%s; the prompt reads the others from the file", he.c_str());
+        }
     }
 
     req_sp.greedy = req_temperature <= 0.0f;

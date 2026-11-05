@@ -17,6 +17,26 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
 }
 
 bool Prefill::Run::execute() {
+    // a session switched to streaming since init: its layout must carry the staging pool, and the identity table
+    // comes with the first streamed read
+    if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {
+        if (!m.stage.present()) { err = "prefill: a streamed session's staging pool is not laid out"; return false; }
+        if (m.ident_table == nullptr) {
+            const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
+            std::vector<int32_t> ident((size_t) pages);
+            for (int64_t i = 0; i < pages; ++i) ident[(size_t) i] = (int32_t) i;
+            if (cudaMalloc((void**) &m.ident_table, ident.size() * 4) != cudaSuccess) {
+                m.ident_table = nullptr;
+                err = "prefill: the staging pool's page table does not fit in VRAM";
+                return false;
+            }
+            m.owned.push_back(m.ident_table);
+            if (cudaMemcpy(m.ident_table, ident.data(), ident.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = "prefill: the staging pool's page table could not be written";
+                return false;
+            }
+        }
+    }
     // The direct successor's future lives on the Prefill object. Intermediate
     // stages therefore do not drain the complete remaining GPU chain here.
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;

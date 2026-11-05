@@ -150,7 +150,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         }
         for (int b = 0; b < 2; ++b) m.ahead_slot[b].assign((size_t) m.g->n_expert, -1);
     }
-    if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
+    // KV streaming: the staging pool's identity page table (a session that switches to streaming later makes it then)
+    if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {
         const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
         std::vector<int32_t> ident((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) ident[(size_t) i] = (int32_t) i;

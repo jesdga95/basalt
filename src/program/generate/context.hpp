@@ -65,6 +65,8 @@ struct Context {
     std::function<int(int64_t)> stage_of;
     std::vector<std::pair<int32_t, int32_t>>* profile_all = nullptr;
     const int64_t* kv_floor = nullptr;
+    const bool* kv_host_on = nullptr;
+    const bool* kv_host_forced = nullptr;
     std::vector<std::vector<SlotSession>>* bslot_ss = nullptr;
     std::vector<int64_t>* slot_cap = nullptr;
     uint64_t* slot_kv_cuda0 = nullptr;
@@ -129,6 +131,7 @@ struct Context {
     const uint64_t* late = nullptr;
     const uint64_t* resident_headroom_base = nullptr;
     int64_t* lend_from = nullptr;
+    std::function<int64_t(int64_t)> spare_places;
     std::vector<std::pair<int32_t, int32_t>>* stage_held = nullptr;
     basalt::kernels::cpu::ExpertPool* pool = nullptr;
     std::vector<std::pair<int32_t, int32_t>>* peer_only = nullptr;

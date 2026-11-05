@@ -27,6 +27,7 @@ serving; `Flow::quit` runs shutdown and flushes the disk cache.
 | Verify setup and graph capture | `verify.cpp` |
 | RAM admission and VRAM controls | `memory.cpp` |
 | Elastic KV and cache resizing | `kv.cpp` |
+| Per-request host K/V | `kv_host.cpp` |
 | Expert adaptation and exchanges | `tiers.cpp` |
 | Profile persistence and probe adaptation | `tier_profile.cpp` |
 | Batch windows and initialization | `batch.cpp` |

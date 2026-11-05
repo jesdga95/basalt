@@ -20,6 +20,9 @@ namespace basalt::program {
 struct Options;
 namespace serve {
 
+// The host K/V's slot pool in cells: the K/V arrays' first pages, backed while a session streams.
+inline constexpr int64_t kKvHostSlotCells = 32768;
+
 // Below this much free VRAM a later allocation (a first-used window's buffers, the desktop, another program) can make
 // a driver that pages GPU memory do so, and a verify graph spinning on a host flag then never finishes.  A driver that
 // fails such an allocation instead needs room only for what is allocated after loading (lazily loaded kernels, graphs,
@@ -63,6 +66,8 @@ struct Context {
     std::function<int(int64_t)> stage_of;
     std::vector<std::pair<int32_t, int32_t>>& profile_all;
     const int64_t& kv_floor;
+    const bool& kv_host_on;
+    const bool& kv_host_forced;
     std::vector<std::vector<engine_local::SlotSession>>& bslot_ss;
     std::vector<int64_t>& slot_cap;
     bool& slot0_is_solo;

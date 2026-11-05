@@ -180,6 +180,21 @@ int sessions(Context& context) {
     const int64_t kv_floor = o.serve && !multi_gpu && o.kv_resident == 0 && !o.vram_elastic &&
                              o.max_context > kv_base ? kv_base : 0;
     basalt::core::qsa_set_kv_elastic(kv_floor);
+    // ---- THE PER-REQUEST HOST K/V (on by default; --exp kv_host=0 turns it off): the solo session's elastic states can
+    // also stream, a slot pool of kKvHostSlotCells in VRAM and the request's K/V in a pinned host pool; each request is
+    // admitted to one mode (kv_host_admit in serve/kv_host.cpp).  One GPU, one request at a time, INT8/FP16/Q4_0 K/V.
+    // Where it cannot apply every request keeps its K/V in VRAM, said only when kv_host=1 asked for it.
+    const int kv_host_exp = (int) basalt::core::exp_flag("kv_host", -1);
+    const bool kv_host_forced = kv_host_exp > 0;
+    const char* kv_host_off = kv_host_exp == 0 ? "--exp kv_host=0"
+                            : kv_floor <= 0 ? "it needs the elastic KV (--serve on one GPU, no --kv-resident or --vram-elastic)"
+                            : !split_devs.empty() ? "not with --layer-split"
+                            : o.batch != 0 ? "not with --batch"
+                            : o.kv == "k8v4" ? "not with --kv k8v4"
+                            : nullptr;
+    if (kv_host_off != nullptr && kv_host_forced) basalt::log::warn("basalt generate", "host K/V is off: %s", kv_host_off);
+    const bool kv_host_on = kv_host_off == nullptr;
+    basalt::core::qsa_set_kv_host(kv_host_on ? basalt::program::serve::kKvHostSlotCells : 0);
     // ---- CUDA0's session, and the stages' sessions: sized to each device's own layer range (the carve).  A
     // stage that runs [lb, le) carves only those layers' GDN rows and QSA pools - before the carve every stage
     // held all 48 layers' state whatever layers it ran, which is the same disease the chunked-QSA-prefill PR
@@ -352,8 +367,10 @@ int sessions(Context& context) {
         }
     }
 
-    // the drafter's K/V is elastic like the sessions' (MtpDrafter::load keeps it whole with a K/V per batch slot)
+    // the drafter's K/V is elastic like the sessions' (MtpDrafter::load keeps it whole with a K/V per batch slot); it
+    // stays in VRAM in every mode
     basalt::core::qsa_set_kv_elastic(kv_floor);
+    basalt::core::qsa_set_kv_host(0);
     if (!slot0_is_solo)
         basalt::core::LoadProgress::kv(basalt::core::LoadProgress::cuda(0),
                                        solo_kv_bytes + basalt::core::session_kv_mapped_bytes(ss), o.max_context, "",
@@ -433,6 +450,8 @@ int sessions(Context& context) {
     context.stage_of = stage_of;
     context.profile_all = &profile_all;
     context.kv_floor = &kv_floor;
+    context.kv_host_on = &kv_host_on;
+    context.kv_host_forced = &kv_host_forced;
     context.bslot_ss = &bslot_ss;
     context.slot_cap = &slot_cap;
     context.slot_kv_cuda0 = &slot_kv_cuda0;

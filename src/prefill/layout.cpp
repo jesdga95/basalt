@@ -49,9 +49,11 @@ bool fused_ring() {
     return all;
 }
 
-// the staging pool of a streamed session: every page of one layer (same sequence in init and bytes_needed)
+// the staging pool of a streamed session: every page of one layer (same sequence in init and bytes_needed).  A session
+// that switches modes between requests is laid out again after each switch, so a layout follows the mode it reads in.
 void take_stage(Alloc& o, const core::SessionState& ss, const basalt::kernels::QsaShapes& s,
                 basalt::kernels::KvHostPools& st, bool& ok) {
+    st = basalt::kernels::KvHostPools{};
     const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
     if (q0.kv_mode != 1) return;
     const size_t rows = (size_t) q0.n_pages * s.n_head_kv * s.page_size;

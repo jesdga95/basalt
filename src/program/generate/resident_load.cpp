@@ -30,6 +30,7 @@ int resident_load(Context& context) {
     auto& late = *context.late;
     auto& resident_headroom_base = *context.resident_headroom_base;
     auto& lend_from = *context.lend_from;
+    auto& spare_places = context.spare_places;
     auto& stage_held = *context.stage_held;
     auto& peer_only = *context.peer_only;
     auto& peer_only_bytes = *context.peer_only_bytes;
@@ -52,7 +53,7 @@ int resident_load(Context& context) {
         // --peer-exclusive: peer swaps take places too (an evicted peer expert goes to one)
         if (adapt_fast_on)
             src.set_spares(o.peer_exclusive ? o.adapt_swaps * kSatBoost + std::max(o.peer_adapt_swaps, o.adapt_swaps)
-                                            : o.adapt_swaps * kSatBoost);
+                                            : spare_places(o.adapt_swaps * kSatBoost));
         uint64_t resident_headroom = resident_headroom_base;
         // The experts no GPU tier holds, and the RAM there is for them: when the copy cannot hold them all, the rest
         // are read from the file through the OS file cache, so the copy leaves that cache its floor beside the margin.

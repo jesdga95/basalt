@@ -383,6 +383,7 @@ int main() {
         // a large checkpoint buffer returns to the pool and comes back at the same size, with its contents intact
         const size_t big = (size_t(3) << 20) + 5;
         const uint8_t* first = nullptr;
+        const size_t pooled0 = CheckpointBytes::allocator_type::pooled_bytes();
         {
             CheckpointBytes a;
             a.resize(big);
@@ -390,8 +391,10 @@ int main() {
             a[0] = 9;
             a[big - 1] = 4;
         }
+        check(CheckpointBytes::allocator_type::pooled_bytes() == pooled0 + big, "the pool counts the block it keeps");
         CheckpointBytes b;
         b.resize(big);
+        check(CheckpointBytes::allocator_type::pooled_bytes() == pooled0, "a block handed out again leaves the count");
         check(b.data() == first, "a freed large checkpoint buffer is handed out again");
         {
             CheckpointBytes c;
@@ -399,6 +402,7 @@ int main() {
         }
         check(CheckpointBytes::allocator_type::release_pooled() >= big, "the kept blocks are freed");
         check(CheckpointBytes::allocator_type::release_pooled() == 0, "none is kept after that");
+        check(CheckpointBytes::allocator_type::pooled_bytes() == 0, "none is kept after that");
         check(b[0] == 9 && b[big - 1] == 4, "a reused buffer is not zeroed");
         CheckpointBytes small(100, 3), copy = small;
         check(copy.size() == 100 && copy[99] == 3, "small buffers still copy and fill");

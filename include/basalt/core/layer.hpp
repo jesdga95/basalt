@@ -231,7 +231,12 @@ struct QsaState {
     /// pages at `block % n_slots`, with the host copy for a resume. The pool pointers above point at the slots.
     int kv_mode = 0;
     int64_t n_slots = 0;
+    /// An elastic state that can switch to streaming in place (qsa_set_kv_host): the VRAM pages its slot pool keeps
+    /// then, the first pages of its K/V arrays; 0: it cannot.
+    int64_t host_slots = 0;
+    void* host_map = nullptr;        ///< the residency map's VRAM while a switchable state streams (owned)
     basalt::kernels::KvHostPools host;
+    int64_t host_cells = 0;          ///< the cells `host` holds (whole pages)
     basalt::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
 
@@ -288,6 +293,29 @@ void qsa_set_kv_elastic(int64_t floor_cells);
 int64_t qsa_kv_elastic();
 /// Frees a state's elastic KV (no-op without one).
 void qsa_state_release(QsaState& st);
+/// Per-request host K/V: elastic states initialized while `slot_cells` > 0 also carve a residency map of
+/// `slot_cells` cells (whole pages; the caller keeps them backed while the state streams), so qsa_state_set_mode can
+/// switch them between whole-in-VRAM and streamed between requests; 0 turns it off.  A pool smaller than
+/// qsa_kv_resident_min() leaves the states unable to stream.
+void qsa_set_kv_host(int64_t slot_cells);
+int64_t qsa_kv_host();
+/// Bytes of the host copy of `cells` cells of one layer of `st`'s format (the identity layout, every array).
+uint64_t qsa_kv_host_layer_bytes(const QsaState& st, const ModelGeometry& g, int64_t cells);
+/// Lays a host copy of `cells` cells out over `base` (a device-mapped pointer, qsa_kv_host_layer_bytes long).
+basalt::kernels::KvHostPools qsa_kv_host_carve(const QsaState& st, const ModelGeometry& g, void* base, int64_t cells);
+/// Caps (`capped`) or uncaps the K/V arrays of a switchable state at its slot pool's pages; the indexer's pooled keys
+/// and the rope rows keep following the depth.  A switch to mode 0 uncaps first, so the arrays can be backed to the
+/// depth (session_kv_map) before qsa_state_set_mode copies the cells in.
+void qsa_state_kv_cap(QsaState& st, bool capped);
+/// Switches a switchable state between whole-in-VRAM (`mode` 0) and streamed (1) in place, keeping its first
+/// `live_cells` cells: 0 -> 1 copies them from VRAM to `host` (`host_cells` long), caps the arrays and empties the
+/// residency map; 1 -> 0 needs the arrays uncapped and backed to `live_cells`, copies them from the host copy and
+/// writes the identity table.  1 -> 1 points the state at another host copy (the cells already in it) and empties
+/// the map.  The pool addresses do not change; graphs captured in the other mode do not fit (kv_stream_resolve).
+/// Queued on `stream`; false with `err` (nothing changed) when the state or the extents do not allow it; a device error
+/// after the state changed stops the engine.
+bool qsa_state_set_mode(QsaState& st, const ModelGeometry& g, int mode, const basalt::kernels::KvHostPools& host,
+                        int64_t host_cells, int64_t live_cells, void* stream, std::string& err);
 bool qsa_kv_int8();
 /// Store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
 void qsa_set_kv_q4(bool enabled);
