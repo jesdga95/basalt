@@ -106,7 +106,7 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | `cors-origin` | string, repeatable | none | Let web pages from this origin call `/v1/*`. |
 | `fit-max-tokens` | switch | off | Clamp a request's `max_tokens` to the context that remains instead of rejecting it with 400. |
 | `open` | switch | off | Open the local web page in the browser once the model is ready. |
-| `lazy` | switch | off | Start the text-only API unloaded and load the model on the first request. Turns vision off. |
+| `lazy` | switch | off | Start the API unloaded and load the model on the first request. Drops a sidecar image encoder; `--vision dynamic` stays on. |
 | `idle-unload` | seconds | off | Unload the model after this long without requests; the next request loads it again. Frees VRAM for other programs. |
 | `idle-sleep` | seconds | off | Put the model to sleep after this long without requests: its VRAM is freed, the process keeps its RAM copy, conversations and learned expert placement, and the next request wakes it in seconds. Linux only (the driver suspends the engine's GPU state); it stays awake when that state would not fit in the free RAM. [running](../running.md#sleep---idle-sleep) |
 | `min-free-vram-mib` | integer | off | Load an unloaded model only when this much VRAM is free, otherwise answer 503. Pairs with `lazy` and `idle-unload`. |
