@@ -43,16 +43,11 @@ bool Verifier::WindowRecorder::post(int64_t l) {
     // the VRAM groups now; the PCIe groups once the copy engine has landed them in staging.
     // `gy`: the native launch's groups side by side (0: cap, one block row per possible group).
     auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t gy, float* dst_buf) {
-        if (lay.native) {
-            // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
-            const auto& f = lay.fmt[(size_t) l];
-            const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
-            native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
-                                  v_.nat_xq_, v_.hit_scratch_, dst_buf, cs, gy);
-        } else {
-            moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, v_.hit_xq_,
-                           v_.hit_xs_, v_.hit_scratch_, dst_buf, cs);
-        }
+        // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
+        const auto& f = lay.fmt[(size_t) l];
+        const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+        native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
+                              v_.nat_xq_, v_.hit_scratch_, dst_buf, cs, gy);
     };
     if (dm) {   // CUDA0's entries straight into their parts rows; the other tiers are read by the combine
         stamp(l, 19);

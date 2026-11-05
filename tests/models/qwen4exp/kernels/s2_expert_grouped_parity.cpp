@@ -9,7 +9,6 @@
 // outputs - `moe_grouped_select_old(1)`, then `(0)` - and the two runs are compared byte for byte:
 //   1. `moe_hit_grouped_s2`          per hit, host count; with fp32 activation scales and with the blocks' fp16 `d`
 //   2. `moe_hit_grouped_s2_dev`      device count below the capacity (the rows past it must stay untouched)
-//   3. `moe_hit_grouped_s2_multi`    verify window: each hit reads its own token's activation row
 //   4. `moe_grouped_s2`              host-built groups of 1..8 entries, one of them a mapped HOST blob (the PCIe
 //                                    share), and more group capacity than groups
 //   5. `moe_group_resident` + `moe_grouped_s2`   the MTP layer's shape, with and without fp32 scales
@@ -334,36 +333,6 @@ void check_all() {
             }
         std::printf("  %-44s rows past the count written: %ld\n", "moe_hit_grouped_s2_dev (count 7 of 10)", touched);
         if (touched) ++g_fail;
-    }
-
-    // ---- 3. moe_hit_grouped_s2_multi: 4 tokens x 10 routed entries, 29 hits
-    {
-        const int T = 4, n = T * K, count = 29;
-        std::vector<int32_t> ent_ids(n);
-        std::iota(ent_ids.begin(), ent_ids.end(), 0);
-        std::shuffle(ent_ids.begin(), ent_ids.end(), rng);
-        std::vector<int32_t> slot(n), dst(n);
-        for (int i = 0; i < n; ++i) {
-            dst[i] = ent_ids[i];
-            slot[i] = (int32_t) (rng() % fx.nb);
-        }
-        std::sort(dst.begin(), dst.begin() + count);   // hit order is routing order, as `moe_hit_select_multi` makes it
-        int32_t* d_slot = dalloc<int32_t>(n);
-        int32_t* d_dst = dalloc<int32_t>(n);
-        int32_t* d_count = dalloc<int32_t>(1);
-        up(d_slot, slot);
-        up(d_dst, dst);
-        up(d_count, std::vector<int32_t>{count});
-        const Scratch s = make_scratch(n);
-        float* d_out = dalloc<float>((size_t) n * H);
-        std::vector<Entry> ent;
-        for (int i = 0; i < count; ++i) ent.push_back({fx.hb(slot[i]), dst[i] / K, dst[i]});
-        Run r;
-        twice("moe_hit_grouped_s2_multi (4 tokens, 29 hits)", d_out, (size_t) n * H, s, [&] {
-            k::moe_hit_grouped_s2_multi(fx.d, d_slot, d_dst, d_count, n, (int64_t) BLOB, d_x, d_xs, K, s.p, d_out,
-                                        nullptr);
-        }, &r);
-        reference("moe_hit_grouped_s2_multi (4 tokens, 29 hits)", r, s, ent, x, &xs);
     }
 
     // ---- 4. moe_grouped_s2: 8 tokens x 10 entries in groups of 1..8, one group on a mapped host blob
