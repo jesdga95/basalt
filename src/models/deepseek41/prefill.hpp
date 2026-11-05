@@ -22,9 +22,14 @@ public:
     std::function<void(int)> live;
     /// Optional: asked after each chunk; true ends the read there, and the state is good for nothing.
     std::function<bool()> stop;
-    /// Runs tokens[0..n) at positions pos0.. through every layer, chunk by chunk, leaving the layer state exactly as
-    /// n single-token steps would. `hist` is the session's token history (extended here).
-    virtual bool run(const int32_t* tokens, int n, int64_t pos0, std::vector<int32_t>& hist, std::string& err) = 0;
+    /// Runs tokens[0..n) at positions pos0.. through the layers, chunk by chunk, leaving the layer state exactly as
+    /// n single-token steps would for what any token from the read's stop on reads. `rows_after`: positions between these
+    /// tokens and the stop (-1 unknown): rows further from it than the layers past the first ratio-1 layer can see stop at
+    /// that layer's compressor. `hist` is the session's token history (extended here).
+    virtual bool run(const int32_t* tokens, int n, int64_t pos0, int64_t rows_after, std::vector<int32_t>& hist,
+                     std::string& err) = 0;
+    /// The last run left rows short of the last layers.
+    virtual bool left_rows() const = 0;
     /// The same for n rows of input embeddings [n][n_embd] (an encoded picture) in place of token embeddings. The
     /// rows take the image router bias and no Engram; they enter `hist` as -1 (a dead id for the n-gram hash).
     virtual bool run_embeddings(const float* rows, int n, int64_t pos0, std::vector<int32_t>& hist, std::string& err) = 0;

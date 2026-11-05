@@ -26,6 +26,18 @@ constexpr int kShortPrompt = 2048;                 // a prompt this short takes 
 constexpr int kShortChunk = 1024;                  // ... in chunks of this many tokens
 constexpr int64_t kAheadPairs = 6150;              // (token, slot) pairs from which a chunk stages its groups ahead: past a short chunk
 
+/// The first position that stops a read's rows short of the last layers. Each layer past `skip_layer` looks one window further
+/// back through its own window rows, and every row reaches the compressed rows of `skip_layer` anyway.
+inline int64_t far_below(int64_t stop, int n_layers, int skip_layer, int window) {
+    return stop - (int64_t) (n_layers - skip_layer) * (window - 1) - window;
+}
+/// Rows from here on hold what a full read would at every layer's window, for any token from here on: the state is saved or
+/// resumed only at a read's stop, and one window back from it at most.
+inline int64_t whole_from(int64_t stop, int window) { return stop > window ? stop - window : 0; }
+inline bool may_save(int64_t pos, int64_t whole) { return pos >= whole; }
+/// `held`: the positions read. Forward and the start need nothing behind them.
+inline bool may_resume(int64_t pos, int64_t held, int64_t whole) { return pos == 0 || pos >= held || pos >= whole; }
+
 /// The model sizes the prompt workspaces depend on.
 struct Dims {
     int64_t n_embd = 0, n_used = 0, n_expert = 0, n_ff_exp = 0;

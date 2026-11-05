@@ -23,6 +23,8 @@ public:
     /// [T][k] device). Each expert the chunk routes to is staged once, from the ops' expert tier when it has one.
     virtual bool routed(int layer, int n_tokens, const float* x, const int32_t* ids, const float* weights, float* out,
                         void* stream, std::string& err) = 0;
+    /// The layers with routed experts in the chunk about to start, 0.. in order.
+    virtual void chunk_layers(int n_layers) = 0;
     /// The shared expert over T tokens.
     virtual bool shared(int layer, int n_tokens, const float* x, float* out, void* stream, std::string& err) = 0;
 };

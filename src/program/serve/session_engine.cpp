@@ -545,6 +545,7 @@ Flow SessionRequest::read_to(int64_t to) {
             pr.n_tokens = (int) (end - at);
             pr.pos = at;
             pr.total_tokens = (int) (n - 1 - at);
+            pr.rows_after = to - end;
             pr.more = end < n - 1;
             const int64_t base = at;
             pr.progress = [this, base](int k) { progress_line("PP", base + k); basalt::core::progress_beat(); };

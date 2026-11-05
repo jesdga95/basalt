@@ -16,6 +16,24 @@ static int g_fail = 0;
 
 int main() {
     constexpr uint64_t GiB = 1ull << 30;
+    // a read's rows left short: nothing from one window before its stop on reads one, at the last layer either
+    {
+        constexpr int kLayers = 40, kSkip = 20, kWin = 128;
+        constexpr int64_t kStop = 100000;
+        const int64_t cut = far_below(kStop, kLayers, kSkip, kWin);
+        const int64_t whole = whole_from(kStop, kWin);
+        CHECK(cut == kStop - 2668);
+        // the last layer's input is wrong below this; a token at `whole` reads its window from whole - (kWin - 1)
+        CHECK(whole - (kWin - 1) >= cut + (kLayers - 1 - kSkip) * (kWin - 1));
+        CHECK(whole_from(50, kWin) == 0);
+        // saves and resumes: at the stop and past it, not inside the part
+        CHECK(may_save(kStop, whole) && may_save(kStop + 7, whole) && may_save(whole, whole));
+        CHECK(!may_save(whole - 1, whole) && !may_save(cut, whole) && !may_save(cut - 1, whole));
+        CHECK(may_resume(kStop, kStop, whole) && may_resume(whole, kStop, whole));
+        CHECK(!may_resume(whole - 1, kStop, whole) && !may_resume(cut, kStop, whole) && !may_resume(1, kStop, whole));
+        // forward through the part, and a new sequence, need nothing behind them
+        CHECK(may_resume(cut, cut, whole) && may_resume(0, kStop, whole));
+    }
     Dims d;
     d.n_embd = 5120; d.n_used = 6; d.n_expert = 256; d.n_ff_exp = 2304; d.engram_cols = 8 * 256;
     d.expert_blob_bytes = 6ull << 20;

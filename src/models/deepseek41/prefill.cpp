@@ -8,6 +8,7 @@
 
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/models/deepseek41/attn_index.hpp"
 #include "basalt/models/deepseek41/kernels.hpp"
 #include "models/deepseek41/layer_ops.hpp"
 #include "models/deepseek41/model.hpp"
@@ -64,11 +65,34 @@ public:
         return ok;
     }
 
-    bool run(const int32_t* tokens, int n, int64_t pos0, std::vector<int32_t>& hist, std::string& err) override {
+    bool run(const int32_t* tokens, int n, int64_t pos0, int64_t rows_after, std::vector<int32_t>& hist, std::string& err) override {
+        // the layers past the first ratio-1 layer read earlier positions through its compressed rows only, and each looks
+        // back one window more than the one before: rows further from the prompt's last token than that need nothing else
+        const int yl = skip_layer();
+        cut_ = yl > 0 && rows_after >= 0 ? prefillp::far_below(pos0 + n + rows_after, g_.n_layers, yl, kWindow) : 0;
+        left_rows_ = cut_ > pos0;
         return run_rows(tokens, nullptr, n, pos0, hist, err);
     }
     bool run_embeddings(const float* rows, int n, int64_t pos0, std::vector<int32_t>& hist, std::string& err) override {
+        cut_ = 0;
+        left_rows_ = false;
         return run_rows(nullptr, rows, n, pos0, hist, err);
+    }
+
+    bool left_rows() const override { return left_rows_; }
+
+    // The first ratio-1 layer when it is the last to own compressed rows and no Engram sits past it, else -1.
+    int skip_layer() const {
+        if (!m_.tiers().prompt_skip) return -1;
+        int yl = -1;
+        for (int il = 0; il < g_.n_layers && yl < 0; ++il)
+            if (g_.compress_ratio[(size_t) il] == 1) yl = il;
+        if (yl <= 0) return -1;
+        for (int il = yl; il < g_.n_layers; ++il)
+            if (g_.compress_ratio[(size_t) il] != 1) return -1;
+        for (int l : m_.pack().engram.layers)
+            if (l >= yl) return -1;
+        return yl;
     }
 
     bool run_rows(const int32_t* tokens, const float* embd, int n, int64_t pos0, std::vector<int32_t>& hist,
@@ -151,6 +175,8 @@ private:
     }
     std::vector<Tick> ticks_;
     EngramReads ahead_;
+    int64_t cut_ = 0;   ///< positions before this one stop at skip_layer()'s compressor
+    bool left_rows_ = false;
     static constexpr size_t kEngramThreads = 8;
 
     bool fail(const std::string& s) {
@@ -205,6 +231,12 @@ private:
             if (next && next_T > 0) issue_reads(ahead_, next, next_T, pos0 + T, hist);
         }
 
+        // rows before `cut` stop at layer yl's compressor; with every row before it the chunk ends there
+        const int yl = skip_layer();
+        const int cut = yl > 0 && cut_ > pos0 ? (int) std::min<int64_t>(cut_ - pos0, T) : 0;
+        const int n_run = cut == T ? yl + 1 : g_.n_layers;
+        if (ffn_) ffn_->chunk_layers(cut == T ? yl : g_.n_layers);
+
         const float* pre_prev = nullptr;
         int fi = 0;
         HcArgs hca;
@@ -226,7 +258,7 @@ private:
 
         // a host function queued after each layer reports the layers done when the GPU gets there: no synchronization
         ticks_.resize((size_t) g_.n_layers);
-        for (int il = 0; il < g_.n_layers; ++il) {
+        for (int il = 0; il < n_run; ++il) {
             for (size_t k = 0; k < en.layers.size(); ++k) {
                 if (en.layers[k] != il || embd) continue;   // picture rows get no Engram contribution
                 cur.open[k] = 0;
@@ -263,65 +295,78 @@ private:
                 engram_apply(kv_dev_, (const float*) gw->ptr, nullptr, T, ea, x_, st);
             }
 
+            // past layer yl only the rows from the cut on; at it every row reaches the attention sublayer's input
+            const int r0 = yl > 0 && il > yl ? cut : 0;
+            const int r1 = yl > 0 && il >= yl ? cut : 0;
+            const int Ta = T - r0, Tf = T - r1;
             // attention sublayer
-            hc_mixes(x_, wf(il, "hc_attn_fn.weight"), wf(il, "hc_attn_scale.weight"), wf(il, "hc_attn_base.weight"), T,
-                     hca, hc_ws_, coef_a_, st);
+            hc_mixes(x_ + (size_t) r0 * 4 * n, wf(il, "hc_attn_fn.weight"), wf(il, "hc_attn_scale.weight"), wf(il, "hc_attn_base.weight"), Ta,
+                     hca, hc_ws_, coef_a_ + (size_t) r0 * kHcCoef, st);
             if (pre_prev) {
-                hc_pre_rms_norm(x_, pre_prev, kHcCoef, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, cur_, normed_, st);
+                hc_pre_rms_norm(x_ + (size_t) r0 * 4 * n, pre_prev + (size_t) r0 * kHcCoef, kHcCoef, wf(il, "attn_norm.weight"), Ta, (int) n, g_.rms_eps,
+                                cur_ + (size_t) r0 * n, normed_ + (size_t) r0 * n, st);
             } else {
                 hc_pre_first(T, n);
                 rms_norm(cur_, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, normed_, st);
             }
             cudaEventRecord(ev[(size_t) il * 3], stream_);
-            if (!ops_.attention_batch(il, pos0, T, tokens, normed_, attn_, (int) n, st, err)) return fail(err);
+            if (il == yl && cut > 0 && !ops_.compress_batch(il, pos0, cut, normed_, st, err)) return fail(err);
+            if (Tf > 0 && !ops_.attention_batch(il, pos0 + r1, Tf, tokens + r1, normed_ + (size_t) r1 * n, attn_ + (size_t) r1 * n, (int) n, st, err))
+                return fail(err);
             cudaEventRecord(ev[(size_t) il * 3 + 1], stream_);
-            dump_rows("attn_out", il, pos0, T, attn_, n);
-            hc_post(attn_, x_, coef_a_, kHcCoef, T, (int) n, x2_, st);
+            if (Tf > 0) {
+                dump_rows("attn_out", il, pos0 + r1, Tf, attn_ + (size_t) r1 * n, n);
+                hc_post(attn_ + (size_t) r1 * n, x_ + (size_t) r1 * 4 * n, coef_a_ + (size_t) r1 * kHcCoef, kHcCoef, Tf, (int) n, x2_ + (size_t) r1 * 4 * n, st);
 
-            // FFN sublayer
-            float* coef_f = coef_f_[fi];
-            hc_mixes(x2_, wf(il, "hc_ffn_fn.weight"), wf(il, "hc_ffn_scale.weight"), wf(il, "hc_ffn_base.weight"), T,
-                     hca, hc_ws_, coef_f, st);
-            hc_pre_rms_norm(x2_, coef_a_, kHcCoef, wf(il, "ffn_norm.weight"), T, (int) n, g_.rms_eps, cur_, normed_, st);
-            // picture rows select experts with the image bias
-            const float* bias = embd ? wf(il, "exp_probs_b_vl.bias") : nullptr;
-            if (!bias) bias = wf(il, "exp_probs_b.bias");
-            router(normed_, wf(il, "ffn_gate_inp.weight"), bias, T, ra, rlogits_, ids_, rw_, st);
-            const bool ok_r = ffn_ ? ffn_->routed(il, T, normed_, ids_, rw_, moe_, st, err)
-                                   : ops_.routed_experts_batch(il, pos0, T, normed_, ids_, rw_, K, moe_, (int) n, st, err);
-            if (!ok_r) return fail(err);
-            const bool ok_s = ffn_ ? ffn_->shared(il, T, normed_, sh_, st, err)
-                                   : ops_.shared_expert_batch(il, pos0, T, normed_, sh_, (int) n, st, err);
-            if (!ok_s) return fail(err);
-            dump_rows("ffn_moe_out", il, pos0, T, moe_, n);
-            dump_rows("ffn_shexp", il, pos0, T, sh_, n);
-            add(moe_, sh_, sum_, (int) (T * n), st);
-            hc_post(sum_, x2_, coef_f, kHcCoef, T, (int) n, x_, st);
-            dump_rows("l_out", il, pos0, T, x_, 4 * n);
-            pre_prev = coef_f;
-            fi ^= 1;
+                // FFN sublayer
+                float* coef_f = coef_f_[fi];
+                hc_mixes(x2_ + (size_t) r1 * 4 * n, wf(il, "hc_ffn_fn.weight"), wf(il, "hc_ffn_scale.weight"), wf(il, "hc_ffn_base.weight"), Tf,
+                         hca, hc_ws_, coef_f + (size_t) r1 * kHcCoef, st);
+                hc_pre_rms_norm(x2_ + (size_t) r1 * 4 * n, coef_a_ + (size_t) r1 * kHcCoef, kHcCoef, wf(il, "ffn_norm.weight"), Tf, (int) n, g_.rms_eps,
+                                cur_ + (size_t) r1 * n, normed_ + (size_t) r1 * n, st);
+                // picture rows select experts with the image bias
+                const float* bias = embd ? wf(il, "exp_probs_b_vl.bias") : nullptr;
+                if (!bias) bias = wf(il, "exp_probs_b.bias");
+                const float* nx = normed_ + (size_t) r1 * n;
+                router(nx, wf(il, "ffn_gate_inp.weight"), bias, Tf, ra, rlogits_, ids_, rw_, st);
+                const bool ok_r = ffn_ ? ffn_->routed(il, Tf, nx, ids_, rw_, moe_, st, err)
+                                       : ops_.routed_experts_batch(il, pos0 + r1, Tf, nx, ids_, rw_, K, moe_, (int) n, st, err);
+                if (!ok_r) return fail(err);
+                const bool ok_s = ffn_ ? ffn_->shared(il, Tf, nx, sh_, st, err)
+                                       : ops_.shared_expert_batch(il, pos0 + r1, Tf, nx, sh_, (int) n, st, err);
+                if (!ok_s) return fail(err);
+                dump_rows("ffn_moe_out", il, pos0 + r1, Tf, moe_, n);
+                dump_rows("ffn_shexp", il, pos0 + r1, Tf, sh_, n);
+                add(moe_, sh_, sum_, (int) (Tf * n), st);
+                hc_post(sum_, x2_ + (size_t) r1 * 4 * n, coef_f + (size_t) r1 * kHcCoef, kHcCoef, Tf, (int) n, x_ + (size_t) r1 * 4 * n, st);
+                dump_rows("l_out", il, pos0 + r1, Tf, x_ + (size_t) r1 * 4 * n, 4 * n);
+                pre_prev = coef_f;
+                fi ^= 1;
+            }
             cudaEventRecord(ev[(size_t) il * 3 + 2], stream_);
-            if (live && il + 1 < g_.n_layers) {   // the chunk's end is reported by `progress`
-                ticks_[(size_t) il] = {&live, off + (int) ((int64_t) T * (il + 1) / g_.n_layers)};
+            if (live && il + 1 < n_run) {   // the chunk's end is reported by `progress`
+                ticks_[(size_t) il] = {&live, off + (int) ((int64_t) T * (il + 1) / n_run)};
                 cudaLaunchHostFunc(stream_, &PrefillImpl::tick, &ticks_[(size_t) il]);
             }
         }
         DS_CUDA(cudaStreamSynchronize(stream_));
         {
             float attn_ms = 0, ffn_ms = 0, all_ms = 0, t = 0;
-            for (int il = 0; il < g_.n_layers; ++il) {
+            for (int il = 0; il < n_run; ++il) {
                 cudaEventElapsedTime(&t, ev[(size_t) il * 3], ev[(size_t) il * 3 + 1]);
                 attn_ms += t;
                 cudaEventElapsedTime(&t, ev[(size_t) il * 3 + 1], ev[(size_t) il * 3 + 2]);
                 ffn_ms += t;
             }
-            cudaEventElapsedTime(&all_ms, ev.back(), ev[(size_t) (g_.n_layers - 1) * 3 + 2]);
+            cudaEventElapsedTime(&all_ms, ev.back(), ev[(size_t) (n_run - 1) * 3 + 2]);
             // the first layer also carries the one-time tier load; the rest scale to a whole pass
             float rest_ms = 0;
-            cudaEventElapsedTime(&rest_ms, ev[2], ev[(size_t) (g_.n_layers - 1) * 3 + 2]);
-            basalt::log::info("basalt deepseek41", "prefill chunk of %d tokens: attention %.0f ms, ffn %.0f ms, other %.0f ms; "
-                         "layers 1.. %.0f ms (%.0f ms per pass)\n", T, attn_ms, ffn_ms, all_ms - attn_ms - ffn_ms, rest_ms,
-                         rest_ms * g_.n_layers / (g_.n_layers - 1));
+            cudaEventElapsedTime(&rest_ms, ev[2], ev[(size_t) (n_run - 1) * 3 + 2]);
+            char far[48] = "";
+            if (cut > 0) std::snprintf(far, sizeof far, ", %d of them to layer %d", cut, yl);
+            basalt::log::info("basalt deepseek41", "prefill chunk of %d tokens%s: attention %.0f ms, ffn %.0f ms, other %.0f ms; "
+                         "layers 1.. %.0f ms (%.0f ms per pass)\n", T, far, attn_ms, ffn_ms, all_ms - attn_ms - ffn_ms, rest_ms,
+                         rest_ms * n_run / (n_run - 1));
         }
         for (cudaEvent_t e : ev) cudaEventDestroy(e);
         return true;
