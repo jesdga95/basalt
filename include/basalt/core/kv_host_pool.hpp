@@ -40,6 +40,8 @@ public:
     bool prefault(const SessionState& s, const ModelGeometry& g, int64_t cells, std::string& err);
     /// Whether this holds a prefault (laid out, not registered).
     bool prefaulting() const { return ahead_ != nullptr; }
+    /// Whether this holds a prefault laid out for `s`'s layers, which `reserve` registers in place.
+    bool prefaulted_for(const SessionState& s) const;
     /// RAM a prefault has written so far.
     uint64_t prefaulted_bytes() const;
     /// RAM a prefault writes in all (its committed pages); 0 without a prefault.

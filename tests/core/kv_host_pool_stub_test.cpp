@@ -173,6 +173,7 @@ void run(bool int8, bool q4) {
     CHECK(allocated == 0);
     // A prefault writes the layout's pages and registers nothing; the take registers that layout in place.
     c::KvHostPool ahead;
+    CHECK(!ahead.prefaulted_for(ss));
     CHECK(ahead.prefault(ss, g, 1001, err) && ahead.prefaulting() && !ahead.valid() && pins.empty());
     (void) ahead.prefault_wait();
     const uint64_t written = ahead.prefaulted_bytes();
@@ -191,6 +192,7 @@ void run(bool int8, bool q4) {
     CHECK(ahead.prefault(ss, g, 1001, err));
     c::SessionState other = ss;
     other.qsa_alloc = 2;
+    CHECK(ahead.prefaulted_for(ss) && !ahead.prefaulted_for(other));
     CHECK(ahead.reserve(other, g, 1001, err) && ahead.valid() && ahead.layers() == 2 && !ahead.prefaulting());
     ahead.release();
     CHECK(ahead.prefault(ss, g, 1001, err));

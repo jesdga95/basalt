@@ -129,8 +129,7 @@ uint64_t KvHostPool::bytes_for(const SessionState& s, const ModelGeometry& g, in
 }
 
 bool KvHostPool::reserve(const SessionState& s, const ModelGeometry& g, int64_t cells, std::string& err) {
-    const bool laid_out = ahead_ != nullptr && s.qsa_states != nullptr && ahead_->first == s.qsa_states + s.qsa_ord0 &&
-                          ahead_->layers == s.qsa_alloc && ahead_->max_cells == s.max_cells;
+    const bool laid_out = prefaulted_for(s);
     std::vector<std::pair<uint8_t*, uint64_t>> committed;
     if (laid_out) {
         (void) prefault_wait();
@@ -229,6 +228,11 @@ bool KvHostPool::prefault(const SessionState& s, const ModelGeometry& g, int64_t
         return false;
     }
     return true;
+}
+
+bool KvHostPool::prefaulted_for(const SessionState& s) const {
+    return ahead_ != nullptr && s.qsa_states != nullptr && ahead_->first == s.qsa_states + s.qsa_ord0 &&
+           ahead_->layers == s.qsa_alloc && ahead_->max_cells == s.max_cells;
 }
 
 uint64_t KvHostPool::prefaulted_bytes() const {

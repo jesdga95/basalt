@@ -228,7 +228,7 @@ int Runtime::kv_host_admit(int64_t need, int64_t new_tokens, int64_t live_cells,
         }
         const uint64_t cache_homes0 = src.homes_bytes();
         // a prefaulted pool is registered in place: the pin finds its pages in RAM
-        const bool ahead = kv_ahead.prefaulting();
+        const bool ahead = kv_ahead.prefaulting(), ahead_fits = kv_ahead.prefaulted_for(ss);
         double ahead_ms = 0, ahead_wait = 0;
         uint64_t ahead_bytes = 0;
         if (ahead) {
@@ -240,9 +240,13 @@ int Runtime::kv_host_admit(int64_t need, int64_t new_tokens, int64_t live_cells,
         }
         bool moved = kv_pool.reserve(ss, g, plan.cells, pe);
         lap(2);
-        if (ahead)
+        // the prefault is used only when its layout was registered in place
+        if (ahead && ahead_fits && moved && kv_pool.grows_in_place())
             basalt::log::info("basalt serve", "host K/V: the take pins a prefaulted pool, %.2f GiB written in %.1f ms, "
                               "%.1f ms of it waited", (double) ahead_bytes / 1073741824.0, ahead_ms, ahead_wait);
+        else if (ahead)
+            basalt::log::info("basalt serve", "host K/V: the prefaulted pool released (%s), %.2f GiB",
+                              ahead_fits ? "the pin fell back" : "other layers", (double) ahead_bytes / 1073741824.0);
         moved = moved && basalt::core::session_kv_set_mode(ss, g, 1, &kv_pool, live_c, nullptr, pe);
         if (!moved) {
             kv_pool.release();
