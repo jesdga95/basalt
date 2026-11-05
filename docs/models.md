@@ -59,8 +59,9 @@ Reasoning effort in the config and on the API: [sampling](configuration/sampling
 
 How it uses the memory, long prompts and drafting: [DeepSeek-V4.1 packs](deepseek41.md).
 
-- **Quality:** `basalt-bench --quality` scores it against a BF16 reference of the model made by @giveen (100 chunks of 512,
-  base PPL 2.7394), through the plain decode path, one row per window ([quality](precision/deepseek41.md#quality)).
+- **Quality:** `basalt-bench --quality` scores it against a BF16 reference of the model made by @giveen. The published
+  GSQ-RCO IQ2_XXS pack: KLD 0.431, top-1 79.97%, PPL 3.635 against 2.731; a heavier tail than Flash-Next's IQ3_S
+  (KLD 0.149) ([quality](precision/deepseek41.md#against-the-bf16-reference)).
 - **Output depends on placement.** Experts on the card and experts on the CPU round their activations differently, so which
   experts are resident can change a token. A fixed prompt on a fixed memory budget repeats exactly; a different RAM tier
   size can change the text ([precision](precision/deepseek41.md#routed-and-shared-experts)).

@@ -107,7 +107,7 @@ layer 20 (prefill.cpp `skip_layer`).
   the expert groups and their MMQ rounding move (inferred from the test above: without the batch, the differences are gone).
   The last prompt row against a full read: KL 2.4e-6, 1.7e-4, 7.7e-5 at 8K, 32K, 64K, top-1 the same, greedy 31, 210, 204
   of 210 tokens. Another chunk size on a full read moves the same row by KL 3.2e-5, 8.4e-4, 1.2e-3 and the tokens part at 50,
-  158, 72 of 210. There is no BF16 reference for this model to measure either against.
+  158, 72 of 210. The BF16 reference scores 512-token chunks, which a skipped read never reaches.
 - **What holds wrong values.** After a skipped read, rows inside the reach hold wrong values past layer 20 until the window
   rings move past them, and the rings keep only clean rows by the read's end. So state is saved or resumed only at a read's
   end, and one window back at most (`prefillp::may_save`, `may_resume`; prefill_plan_test): the session refuses anything else.
@@ -152,8 +152,7 @@ three prompts: Basalt's greedy choice differs from llama's at 8 of 688 generated
 (5, 2 and 1 on the three prompts), 10 with the RAM tier one expert larger and 11 with a VRAM tier of 6 experts per layer.
 The count moves with which tier each expert sits in. KL against llama's logits on 512 positions of real text: mean
 0.0025, median 0.0007, top-1 agreement 98.0%, position 1 left out: llama's own row at position 1 moves by KL 4.2
-between a 2-token and a 512-token batch, and Basalt is within 0.04 of its 2-token row. There is no PPL/KLD run against
-the native model on this pack yet. On two cards as a server runs them, with slots that follow the routing and a context of
+between a 2-token and a 512-token batch, and Basalt is within 0.04 of its 2-token row. On two cards as a server runs them, with slots that follow the routing and a context of
 8,192: 8 of 688 positions (7, 1 and 0), KL mean 0.0030, median 0.0007, top-1 agreement 97.5%, position 1 left out.
 
 Neither engine has one answer to compare. On the same tokens of the first prompt (319 generated positions; each row
@@ -179,11 +178,28 @@ round the activations differently. That is enough to move a top-6 choice in a la
 traced a changed choice moved the layer's output by about 10%; that is a single observation, not a spread. Reruns at
 one tier setting are bitwise equal, and asking for logits does not change the tokens.
 
-Quality is the quant's, not the engine's. The IQ1_S pack scores, against the native model's logits (teacher: the
-native FP4 checkpoint through the reference code; Lucebox's 8 x 1,024 held-out tokens, KL over the teacher's top-256 ids,
-llama.cpp with the same GGUF): KL 0.362, top-1 agreement 75.3%, PPL 10.75 (teacher 8.56). Lucebox's own files score KL
-0.19 to 0.27. Basalt is held to the same weights by the per-layer agreement above; there is no Basalt PPL/KLD run for this
-model yet.
+### Against the BF16 reference
+
+`basalt-bench --quality` scores the model against a BF16 reference made by @giveen: llama.cpp 330f0189, a plain
+`convert_hf_to_gguf --outtype bf16`, wikitext-2, 100 chunks of 512 tokens, base PPL 2.7394 (2.7314 from the stored rows).
+Basalt reads the first half of each chunk and scores the rest one row per window through the plain decode path. Two cards,
+400 W + 180 W, 25,500 rows each:
+
+| Pack | PPL | KLD mean | KLD median | KLD p99 | Rows above 2 | Top-1 |
+|---|---|---|---|---|---|---|
+| GSQ-RCO IQ2_XXS (the published pack) | 3.6353 | 0.4311 | 0.0894 | 4.39 | 5.06% | 79.97% |
+| UD-IQ1_M (Unsloth's GGUF, converted here) | 3.0334 | 0.2779 | 0.0550 | 2.86 | 2.26% | 83.88% |
+
+Both carry the same IQ4_NL Engram table. On the first 5 chunks of the IQ2_XXS pack, the same rows are worst whatever the
+engine does: in reverse chunk order 59 of the 64 worst rows are the same (KLD correlation 0.996), on one card 61, with the
+second card's and the CPU's prompt rows off 62 (KLD 0.4080 against 0.4088). The Engram add moves the stream by 64% of its
+norm at layer 1 and 19% at layer 14 (medians), and the worst rows move no more than the rest. Prompt skip cannot be scored
+this way (512-token chunks): on a 64K prompt, on against `--no-prompt-skip`, the 200 tokens after it are the same, KL mean
+6.2e-4 between the two runs.
+
+Earlier, the IQ1_S pack against the native model's logits (teacher: the native FP4 checkpoint through the reference
+code; Lucebox's 8 x 1,024 held-out tokens, KL over the teacher's top-256 ids, llama.cpp with the same GGUF): KL 0.362,
+top-1 agreement 75.3%, PPL 10.75 (teacher 8.56).
 
 ## Verify windows
 
@@ -202,8 +218,7 @@ and code, short context:
 
 With the tiers moving, which experts are resident follows the windows, whose rows route to more of them than one token does. A
 row then rounds as under any other placement: forced through the plain run's text in windows of 2, 3, 4, 5 and 8 rows, of 800 tokens,
-15 to 25 prose picks and 1 to 6 code picks differ from the plain run's. There is no BF16 reference for this model to measure them
-against.
+15 to 25 prose picks and 1 to 6 code picks differ from the plain run's. The BF16 reference was not run with windows wider than one row.
 
 ## Sampling
 
