@@ -185,6 +185,26 @@ llama.cpp with the same GGUF): KL 0.362, top-1 agreement 75.3%, PPL 10.75 (teach
 0.19 to 0.27. Basalt is held to the same weights by the per-layer agreement above; there is no Basalt PPL/KLD run for this
 model yet.
 
+## Verify windows
+
+`--spec` with a drafter, or `--spec-oracle`, runs T rows (at most 8) through the decode kernels at once. A kernel's output does
+not depend on T or on a row's place, and each distinct expert of a layer runs once, on the card that holds it or on the CPU,
+over the rows that routed to it. The compressor keeps its carried state until the window commits: the rows past the first
+rejected one write nothing a later row reads. A row's pick is the draw of its own index, seed and position as in plain decode.
+
+With placement fixed (`--diag-tier-frozen --diag-tier-ram 304`: no bus copy, promotion or swap), 400 W + 180 W, 300 tokens, prose
+and code, short context:
+
+- **Windows of the expected text**, 2, 3, 5 and 8 rows, every draft accepted: every row's logits equal plain decode's, bit for bit.
+- **The drafter**, on either card, against plain decode with the same memory reserved so that the expert homes match: every
+  accepted row's logits equal plain's, bit for bit.
+- **Sampled**, temperature 1, two seeds, the drafter on the second card: the same text as plain decode.
+
+With the tiers moving, which experts are resident follows the windows, whose rows route to more of them than one token does. A
+row then rounds as under any other placement: forced through the plain run's text in windows of 2, 3, 4, 5 and 8 rows, of 800 tokens,
+15 to 25 prose picks and 1 to 6 code picks differ from the plain run's. There is no BF16 reference for this model to measure them
+against.
+
 ## Sampling
 
 Draws run on the shared `sample_tokens` kernel, the same chain as the other models: a seed gives other text than the earlier host sampler did. Greedy decoding keeps its argmax, so its tokens do not change.
