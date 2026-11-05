@@ -300,7 +300,8 @@ private:
     // since the start: the swaps the rounds queued, and those a round left for a later one (no free RAM place)
     int64_t xq_swapped{};
     int64_t xq_noplace{};
-    uint64_t xq_in_bytes{}, xq_out_bytes{};   // the swaps' copies into the VRAM tier, and the evictions' copies to RAM
+    // the adaptive swaps' copies into the VRAM tiers, and the evictions' copies to RAM
+    uint64_t xq_in_bytes{}, xq_out_bytes{};
     // The landed words (Verifier::landed_words): a round's incoming copies are queued in layer order, each layer's
     // followed by a 4-byte copy of the round's number into the layer's word.  The copies' sources are a pinned
     // ring of rounds (every layer's word, then the round's number).

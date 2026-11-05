@@ -257,9 +257,12 @@ bool Runtime::adapt() {
         GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
         const basalt::core::OnDevice on(gs ? gs->dev : -1);
         staged_on.push_back(gs ? gs->dev : -1);
-        return cudaMemcpyAsync(dst, gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot),
-                               (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer),
-                               cudaMemcpyDeviceToHost, gs ? gs->adapt_stream : adapt_stream) == cudaSuccess;
+        const size_t bytes = (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer);
+        if (cudaMemcpyAsync(dst, gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), bytes,
+                            cudaMemcpyDeviceToHost, gs ? gs->adapt_stream : adapt_stream) != cudaSuccess)
+            return false;
+        xq_out_bytes += bytes;
+        return true;
     };
     const auto wait_copies = [&]() -> bool {
         bool ok = true;
@@ -289,6 +292,7 @@ bool Runtime::adapt() {
                          (int) s.layer, (int) slot, cudaGetErrorString(cudaGetLastError()));
             return false;
         }
+        xq_in_bytes += (uint64_t) basalt::kernels::cpu::expert_layout().blob_bytes(s.layer);
         if (gs) gs->adapt_live = true;
         else main_live = true;
         host_res[out] = basalt::core::kNotResident;   // evicted now: the CPU computes it meanwhile
