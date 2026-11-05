@@ -141,7 +141,7 @@ public:
     // the disk tier under it (--conversation-cache-dir): what leaves the session or the RAM cache is written there,
     // and a prompt that starts with a stored conversation reads it back, after a restart too
     basalt::core::ConversationStore disk{};
-    static constexpr int64_t kDiskMinTokens = 8192;   // shorter ones are cheaper to read again
+    virtual int64_t disk_min_tokens() const = 0;
     static constexpr int64_t kDiskStaleTokens = 4096;   // a stored copy this close to the chain's end is kept
     static constexpr uint64_t kDiskQueueCap = 4ull << 30;   // images waiting for the writer, in RAM
     uint64_t disk_floor{};

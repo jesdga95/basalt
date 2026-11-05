@@ -31,7 +31,7 @@ int Runtime::run_requests() {
 // kDiskStaleTokens of the chain's deepest checkpoint (the point its next turn goes on from; a restore
 // from that copy reads the rest again).  Each turn of a growing conversation is not written again in full.
 bool Runtime::disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const std::vector<ConvCheckpoint>& cks, bool cvec) {
-    if ((int64_t) ids.size() < std::max<int64_t>(kDiskMinTokens, o.conversation_cache_min_tokens)) return true;
+    if ((int64_t) ids.size() < std::max<int64_t>(disk_min_tokens(), o.conversation_cache_min_tokens)) return true;
     int64_t deepest = 0;
     for (const ConvCheckpoint& c : cks) deepest = std::max<int64_t>(deepest, (int64_t) c.ids.size());
     if (deepest <= 0) deepest = (int64_t) ids.size();
