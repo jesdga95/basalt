@@ -44,6 +44,7 @@ public:
         const uint8_t* host[kMaxK] = {};   ///< host blob of the others
         int experts[kMaxK] = {};
         bool again[kMaxK] = {};            ///< a miss that repeats one from the last kPromoteWindow tokens
+        bool fetched[kMaxK] = {};          ///< `dev` is being copied in by `fetch`
     };
 
     /// The window rows that use one looked-up expert: row i of token tok[i] is `row[i]` of the output rows.
@@ -89,9 +90,11 @@ public:
     /// The CPU's share: the experts of `lk` without a device blob, over the activation `x` (n_embd floats, host).
     /// Row i of `rows` (n_embd floats each) gets expert i's output.
     bool run_cpu(int layer, const float* x, const Lookup& lk, float* rows, std::string& err);
-    /// Starts the bus copy of the pinned misses of `lk` beyond the CPU's half (policy::bus_count) into the VRAM tier and makes `main` wait for the copies;
-    /// those experts get a device blob in `lk`, so the GPU computes them with the hits while the CPU does the rest.
-    void fetch(int layer, Lookup& lk, cudaStream_t main);
+    /// Starts the bus copy of the pinned misses of `lk` beyond the CPU's half (policy::bus_count) into the VRAM tier; those
+    /// experts get a device blob in `lk`, marked `fetched`, so the GPU computes them while the CPU does the rest. How many
+    /// started; `await_fetch` makes `main` wait for them.
+    int fetch(int layer, Lookup& lk);
+    void await_fetch(cudaStream_t main);
     /// Queues the pinned misses the CPU computed that missed before within kPromoteWindow tokens for a copy into the
     /// VRAM tier (side stream, off the token path, in pieces).
     void promote(int layer, const Lookup& lk);
