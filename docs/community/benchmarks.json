@@ -952,6 +952,29 @@
           "name": "RTX 5090",
           "vram_gib": 32,
           "power_w": 575,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 57.7
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen 7 9700X, 8 cores",
+      "ram_gbps": 64.6,
+      "os": "Windows",
+      "quant": "Q4_K_XL",
+      "prefill_16k_tps": 7277.6,
+      "prefill_64k_tps": 8410.7,
+      "decode_tps": 219.6
+    },
+    {
+      "submitter": "polygizer",
+      "date": "2026-11-05",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 575,
           "pcie": "5.0 x16"
         }
       ],
