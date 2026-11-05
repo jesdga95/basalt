@@ -109,6 +109,13 @@ struct IndexerArgs {
 void indexer_select(const IndexerArgs& a, const float* qr, const float* x, const int32_t* pos, int n_tokens,
                     void* workspace, void* stream);
 
+/// The K highest finite scores of one token (ties to the lower row), row ids ascending, `out` padded with -1 to out_ld.
+/// `n` rows are the buffer's capacity and pos[0] says how many are visible, as for the indexer. With `workspace`
+/// (top_rows_workspace_bytes) the rows are read over many blocks; without it over one, as the prompt path does.
+void top_rows(const float* scores, int n, int K, int32_t* out, int out_ld, int32_t* out_n, const int32_t* pos, int ratio,
+              int block_size, void* workspace, void* stream);
+size_t top_rows_workspace_bytes(int max_rows);
+
 /// y[t][o] = dot(w[o][0..in), x[t][0..in)) with bf16 weights, in a multiple of 8, T <= kMaxT.
 void gemv_bf16(const uint16_t* w, const float* x, int n_tokens, int in, int out, float* y, void* stream);
 
