@@ -24,7 +24,7 @@ namespace basalt::models::deepseek41 {
 namespace {
 
 constexpr uint64_t kTierReserve = 6ull << 30;   // device memory left free beside the expert tier: caches and prompt workspaces
-constexpr uint64_t kModuleRoom = 1ull << 30;    // kernel modules still to load when the tier opens
+constexpr uint64_t kModuleRoom = 7ull << 27;    // kernel modules still to load when the tier opens
 constexpr uint64_t kVisionRoom = 3ull << 29;    // the image encoder, when the pack carries one
 // One layer's GPU plan for the grouped expert kernel, uploaded with a single copy.
 struct ExpertPlan {
@@ -515,7 +515,8 @@ public:
         r.copies = kTierReserve;
         r.homes = m_.context_bytes() * (uint64_t) m_.sessions() + prefillp::workspace_bytes(d, prefillp::kHomeChunk) + prefillp::ahead_bytes(d) +
                   prefillp::kMargin + kModuleRoom + (m_.pack().vision.bytes ? kVisionRoom : 0);
-        r.beside_homes = prefillp::workspace_bytes(d, prefillp::kShortChunk) + prefillp::kMargin + kModuleRoom;
+        r.beside_homes = prefillp::workspace_bytes(d, prefillp::kShortChunk) + prefillp::kShortMargin;
+        r.modules = kModuleRoom;
         if (!t->open(r, h_rows_, err)) return false;
         tier_ = t;
         shared = {std::move(t), h_x_, h_rows_};

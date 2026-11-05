@@ -33,7 +33,6 @@ namespace {
 
 constexpr int kStageExperts = 32;   // experts staged on the device per launch
 constexpr int kReadThreads = 8;     // concurrent blob reads
-constexpr int64_t kMaxRows = 16384; // (token, slot) rows one launch handles
 constexpr int kRing = 5;             // layers of file-read experts held ahead
 constexpr int kSharedRows = 1024;   // tokens per shared-expert sub-chunk
 
@@ -76,7 +75,8 @@ public:
         }
         slot_ = (size_t) slot;
         const size_t K = (size_t) g_.n_used, n = (size_t) g_.n_embd;
-        const size_t E = (size_t) cap_ * K, R = (size_t) kMaxRows, ff = (size_t) g_.n_ff_exp;
+        max_rows_ = prefillp::stage_rows(K, cap_);
+        const size_t E = (size_t) cap_ * K, R = (size_t) max_rows_, ff = (size_t) g_.n_ff_exp;
         // the largest q8 buffer either product reads
         bool ok = dev(xq1_, mmq::q8_bytes((int64_t) R, g_.n_embd)) &&
                   dev(xq2_, mmq::q8_bytes((int64_t) R, g_.n_ff_exp));
@@ -137,12 +137,12 @@ public:
             if (!by[(size_t) e].empty()) used.push_back(e);
 
         for (size_t b0 = 0; b0 < used.size();) {
-            // experts of this launch: up to kStageExperts, up to kMaxRows rows
+            // experts of this launch: up to kStageExperts, up to max_rows_ rows
             int nb = 0;
             int64_t rows = 0, max_rows = 0;
             while (b0 + (size_t) nb < used.size() && nb < kStageExperts) {
                 const int64_t c = (int64_t) by[(size_t) used[b0 + (size_t) nb]].size();
-                if (nb > 0 && rows + c > kMaxRows) break;
+                if (nb > 0 && rows + c > max_rows_) break;
                 rows += c;
                 max_rows = std::max(max_rows, c);
                 ++nb;
@@ -423,7 +423,7 @@ private:
             Stage& D = dstage_[consumed_ % prefillp::kAheadSlots];
             const int e0 = g * kStageExperts, e1 = std::min(NE, e0 + kStageExperts);
             cudaStreamWaitEvent(st, D.copied, 0);
-            // sub-ranges of experts of at most kMaxRows rows (one range unless the routing is very skewed)
+            // sub-ranges of experts of at most max_rows_ rows (one range unless the routing is very skewed)
             for (int q0 = e0; q0 < e1;) {
                 if (by[(size_t) q0].empty()) {   // runs of experts that have rows
                     ++q0;
@@ -431,7 +431,7 @@ private:
                 }
                 int q1 = q0;
                 int64_t rows = 0, max_rows = 0;
-                while (q1 < e1 && !by[(size_t) q1].empty() && (q1 == q0 || rows + (int64_t) by[(size_t) q1].size() <= kMaxRows)) {
+                while (q1 < e1 && !by[(size_t) q1].empty() && (q1 == q0 || rows + (int64_t) by[(size_t) q1].size() <= max_rows_)) {
                     rows += (int64_t) by[(size_t) q1].size();
                     max_rows = std::max<int64_t>(max_rows, (int64_t) by[(size_t) q1].size());
                     ++q1;
@@ -602,6 +602,7 @@ private:
     std::vector<std::vector<int32_t>> pf_idx_;
     std::vector<std::vector<int>> pf_list_;
     int cap_;
+    int64_t max_rows_ = 0;               // (token, slot) rows one launch handles
     size_t slot_ = 0;
     std::vector<void*> dev_;
     void *xq1_ = nullptr, *xq2_ = nullptr;
