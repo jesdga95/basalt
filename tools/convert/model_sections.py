@@ -84,17 +84,21 @@ def check_split(files) -> None:
 class SourceModel:
     """All shards of one model: name -> (GGUFFile, TensorInfo, shard path), in file order."""
 
-    def __init__(self, paths):
+    def __init__(self, paths, described=frozenset()):
+        """`described`: tensors whose shard may stop after its header; their names land in `short`."""
         self.paths = [pathlib.Path(p) for p in paths]
         self.files = [GGUFFile(p) for p in self.paths]
         self.sizes = [p.stat().st_size for p in self.paths]
         check_split(self.files)
         self._maps: dict[pathlib.Path, np.ndarray] = {}
         self.where: dict[str, tuple] = {}
+        self.short: set[str] = set()
         for p, g, size in zip(self.paths, self.files, self.sizes):
             for t in g.tensors:
                 n = t.expected_bytes()
-                if n is None or g.data_start + t.offset + n > size:
+                if n is not None and g.data_start + t.offset + n > size and t.name in described:
+                    self.short.add(t.name)
+                elif n is None or g.data_start + t.offset + n > size:
                     raise ConvertError(f"{p.name}: unsupported or truncated tensor {t.name}")
                 if t.name in self.where:
                     raise ConvertError(f"{p.name}: duplicate tensor {t.name}")

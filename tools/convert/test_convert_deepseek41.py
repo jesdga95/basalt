@@ -244,3 +244,57 @@ class DeepSeek41Test(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FromBaseTest(DeepSeek41Test):
+    """--sections-from: a shard that stops after its header takes the table from the base, and the drafter comes along."""
+
+    def write_gguf(self, path, table_last=True):
+        rng = np.random.default_rng(5)
+        g = GGUFWriter()
+        P = "deepseek41."
+        g.add("general.architecture", "deepseek41")
+        g.add("general.name", "Tiny-DS")
+        g.add(P + "block_count", N_LAYERS, "u32")
+        g.add(P + "embedding_length", 256, "u32")
+        g.add(P + "expert_count", N_EXPERT, "u32")
+        g.add(P + "expert_used_count", 2, "u32")
+        g.add(P + "embedding_length_per_layer_input", 256, "u32")
+        g.add(P + "ple.layer_multipliers", [7, 11], "array:u64")
+        g.add(P + "ple.head_offsets", [0, 2], "array:u64")
+        g.add(P + "ple.head_vocab_sizes", [2, 3], "array:u64")
+        g.add(P + "engram.vocab_size", 16, "u32")
+        g.add(P + "engram.token_map", [0, 1, 2, 3], "array:u32")
+        g.add("tokenizer.ggml.tokens", TOKENS)
+        g.add_raw("token_embd.weight", [256, 3], "Q6_K", self.raw["token_embd.weight"])
+        for l in range(N_LAYERS):
+            g.add_f32(f"blk.{l}.ffn_gate_inp.weight", np.ones((8, N_EXPERT)))
+            g.add_f32(f"blk.{l}.attn_norm.weight", np.ones(8))
+            g.add_raw(f"blk.{l}.attn_q_a.weight", [256, 2], "Q6_K", self.raw[f"blk.{l}.attn_q_a.weight"])
+            for role, ty in (("gate", GU[l]), ("up", GU[l]), ("down", DOWN[l])):
+                n = f"blk.{l}.ffn_{role}_exps.weight"
+                g.add_raw(n, [256, 2, N_EXPERT], ty, self.raw[n])
+        g.add_raw("per_layer_token_embd.weight", [256, ROWS], "IQ4_NL", self.raw["per_layer_token_embd.weight"])
+        return g.write(path)
+
+    def test_header_only_table_comes_from_the_base(self):
+        full = self.write_gguf(self.t / "full-00001-of-00001.gguf")
+        d = self.drafter()
+        convert.convert(self.args(gguf=[str(full)], dspark=str(d), out=str(self.t / "base.basalt")))
+        short = self.t / "short-00001-of-00001.gguf"
+        short.write_bytes(full.read_bytes()[:-len(self.raw["per_layer_token_embd.weight"])])
+        convert.convert(self.args(gguf=[str(short)], sections_from=str(self.t / "base.basalt"), out=str(self.t / "new.basalt")))
+        base, new = ModelFile(str(self.t / "base.basalt")), ModelFile(str(self.t / "new.basalt"))
+        for n in ("engram", "dspark/gguf", "experts", "dense", "gguf"):
+            self.assertEqual(new.read(n), base.read(n), n)
+            self.assertTrue(new.verify(n), n)
+        meta = json.loads(new.read("meta"))
+        self.assertEqual(meta["dspark"], json.loads(base.read("meta"))["dspark"])
+        self.assertEqual(set(meta["sections_from"]["copied"]), {"engram", "dspark/gguf"})
+
+    def test_header_only_table_without_a_base_is_refused(self):
+        full = self.write_gguf(self.t / "full-00001-of-00001.gguf")
+        short = self.t / "short-00001-of-00001.gguf"
+        short.write_bytes(full.read_bytes()[:-len(self.raw["per_layer_token_embd.weight"])])
+        with self.assertRaises(SystemExit):
+            convert.convert(self.args(gguf=[str(short)]))
