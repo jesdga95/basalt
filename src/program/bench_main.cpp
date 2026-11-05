@@ -32,6 +32,7 @@
 #include "basalt/program/host_rates.hpp"
 #include "basalt/program/engine_session.hpp"
 #include "basalt/program/gpu_select.hpp"
+#include "basalt/program/options.hpp"
 
 #include <errno.h>
 
@@ -791,7 +792,7 @@ int main(int argc, char** argv) {
 
     // the context the fixtures need, unless the command line gives one
     if (!has_arg(args, "--max-context")) {
-        long long need = 4096;
+        long long need = basalt::program::kDefaultContext;
         for (size_t i = 0; i < 3; ++i)
             if (!decode_ids[i].empty()) need = std::max(need, (long long) decode_ids[i].size() + kDecode[i].max_new + 16);
         if (do_prefill)

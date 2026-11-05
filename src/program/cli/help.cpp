@@ -1,6 +1,7 @@
 #include "help.hpp"
 
 #include "basalt/log.hpp"
+#include "basalt/program/options.hpp"
 
 namespace basalt::program::cli {
 
@@ -48,7 +49,7 @@ void usage() {
                  "  --prompt-cache-root N  --serve: checkpoint a prompt's first turn boundary when it is at least N tokens\n"
                  "                       long (default 2048, 0 = never)\n"
                  "  --max-new N          tokens to generate (default 16)\n"
-                 "  --max-context N      KV/state capacity (default 4096)\n"
+                 "  --max-context N      KV/state capacity (default %lld)\n"
                  "  --rope-scaling T     extend the context past the trained one: none, linear\n"
                  "                       (position interpolation) or yarn - llama.cpp's types and names.\n"
                  "                       Default: the model file's rope keys, else none. Fixed at startup:\n"
@@ -210,7 +211,7 @@ void usage() {
                  "  --resident-budget-gib N  the resident mode with at most N GiB of experts in RAM (hottest first;\n"
                  "                       auto when not set: what fits);\n"
                  "                       a budget that would leave less than the RAM floor free is refused, naming\n"
-                 "                       the largest safe value.\n");
+                 "                       the largest safe value.\n", (long long) basalt::program::kDefaultContext);
 }
 
 }  // namespace basalt::program::cli

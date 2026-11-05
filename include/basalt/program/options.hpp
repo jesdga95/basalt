@@ -10,13 +10,16 @@
 
 namespace basalt::program {
 
+/// The context of every model without --max-context.
+inline constexpr int64_t kDefaultContext = 8192;
+
 /// The flags every model takes.
 struct CommonOptions {
     virtual ~CommonOptions() = default;
     std::string model;                ///< --model: the .basalt file every loader reads from
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;
-    int64_t max_context = 4096;
+    int64_t max_context = kDefaultContext;
     bool greedy = true;
     uint64_t seed = 0;
     int top_k = 20;
@@ -91,7 +94,6 @@ struct CommonOptions {
     std::vector<int64_t> image_at;
     bool image_pad_given = false;
     int64_t image_pad_id = -1;             ///< --image-pad-id: the prompt token that stands for a picture's rows (--serve)
-    bool max_context_set = false;          ///< --max-context was given (a model with its own default picks one otherwise)
     /// Stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
     bool generates = true;             ///< false: this run produces no tokens (a model flag says so)

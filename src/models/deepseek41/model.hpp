@@ -42,7 +42,7 @@ public:
     int64_t context() const override { return ctx_ ? ctx_ : ctxp_default(); }
     /// Fixes the context from --max-context (`set`) or the model's maximum, bounded by the free device memory. Call
     /// once after load(), before a session is made. False with `err` when the request cannot be honoured.
-    bool resolve_context(int64_t requested, bool set, std::string& err);
+    bool resolve_context(int64_t requested, std::string& err);
     model::Result make_session(std::unique_ptr<model::ModelSession>& out) override;
 
     const Pack& pack() const { return pack_; }

@@ -424,9 +424,16 @@ class SlotContext(unittest.TestCase):
         self.assertEqual(self.context(["--parallel", "2", "--max-context", "262144"]), 131072)
         self.assertEqual(self.context(["--max-context", "262144"]), 262144)                  # solo: whole
         self.assertEqual(self.context(["--parallel", "4"], {"engine": {"max-context": 8192}}), 2048)
-        self.assertEqual(self.context(["--parallel", "4"]), 1024)                            # the default, shared
         self.assertEqual(self.context(["--parallel", "2", "--max-context", "65536"],
                                       {"engine": {"max-context": 8192}}), 32768)
+
+    def test_the_default_is_shared_once_the_engine_names_it(self):
+        from serve.config import slot_share
+        a, _, file_words, cli_words = parse(["--parallel", "4"])
+        self.assertIsNone(flag_value(file_words + cli_words, "--max-context"))      # the engine's plan gives the total
+        self.assertTrue(a.split_default)
+        self.assertEqual(slot_share(8192, 4), 2048)
+        self.assertEqual(slot_share(512, 4), 256)                                     # never under the least slot
 
     def test_parallel_conflicts_with_batch_and_slots(self):
         for flag in ("--batch", "--slots"):

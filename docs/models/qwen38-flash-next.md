@@ -16,7 +16,7 @@ Sizes are on the card. The layout, and how to build a pack: [model file](../mode
 
 ## Memory
 
-- **Context:** `--max-context`, default 4,096. The KV cache grows with it. `--kv fp16` (default), `int8` (half the VRAM), `q4_0`
+- **Context:** `--max-context`, default 8,192. The KV cache grows with it. `--kv fp16` (default), `int8` (half the VRAM), `q4_0`
   and `k8v4` trade precision for VRAM ([precision](../precision/qwen38-flash-next.md#measured-costs)).
 - **Experts:** the main card's cache holds the most routed ones, system RAM the rest, and an adaptive tier moves them as the
   conversation changes ([adaptive tier](../configuration/adaptive.md)).
