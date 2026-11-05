@@ -246,8 +246,11 @@ if(BUILD_TESTING)
   basalt_embed_manifest(prefill_plan_test)
   basalt_cpu_test(NAME prefill_plan_test COMMAND prefill_plan_test)
   # shared code must not include a model; models must not include each other
-  add_test(NAME model_layering COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_model_layering.sh)
-  set_property(TEST model_layering APPEND PROPERTY LABELS cpu)
+  # a check of the tree's text, in bash and python3: Linux's run covers it for every platform
+  if(NOT WIN32)
+    add_test(NAME model_layering COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_model_layering.sh)
+    set_property(TEST model_layering APPEND PROPERTY LABELS cpu)
+  endif()
   # the logit_bias protocol key: what parses and what is refused (host only)
   add_executable(logit_bias_test tests/core/logit_bias_test.cpp)
   target_include_directories(logit_bias_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
