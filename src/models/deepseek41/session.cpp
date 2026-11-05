@@ -107,10 +107,10 @@ public:
         ops_ = make_kernel_ops(m_, err);
         if (!ops_) return false;
         dump_dir_ = m_.diag_dump();
-        if (!m_.tiers().drafter.empty() && m_.sessions() == 1) {
+        if (m_.tiers().draft && !m_.pack().dspark.empty() && m_.sessions() == 1) {
             // the drafter takes its memory before the tiers size themselves to what is left
             const int device = m_.tiers().drafter_device >= 0 ? m_.tiers().drafter_device : m_.device();
-            drafter_ = DsparkDrafter::create(m_, m_.tiers().drafter, device, err);
+            drafter_ = DsparkDrafter::create(m_, device, err);
             if (!drafter_) return false;
             basalt::log::info("basalt deepseek41", "drafter on GPU %d: %.2f GiB, windows of at most %d tokens", device, (double) drafter_->device_bytes() / (1ull << 30),
                               std::min(max_window(), kDsparkBlock + 1));

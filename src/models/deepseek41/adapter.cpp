@@ -11,7 +11,6 @@
 #include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
 #include "models/deepseek41/context_policy.hpp"
-#include "models/deepseek41/dspark.hpp"
 #include "models/deepseek41/meta.hpp"
 #include "models/deepseek41/model.hpp"
 
@@ -79,7 +78,6 @@ public:
         if (a == "--no-prompt-skip") o.no_prompt_skip = true;
         else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
         else if (a == "--spec-oracle") o.spec_oracle = args.next("--spec-oracle");
-        else if (a == "--drafter") o.drafter = args.next("--drafter");
         else if (a == "--diag-drafter-gpu") o.drafter_device = std::atoi(args.next("--diag-drafter-gpu"));
         else if (a == "--diag-teacher") o.diag_teacher = true;
         else if (a == "--diag-tier-frozen") o.diag_tier_frozen = true;
@@ -90,29 +88,18 @@ public:
 
     // A context the pack refuses is refused with the flags, before anything loads; the memory check needs the card.
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
-        // a drafter is off unless named; named, it runs with windows of the usual width unless --spec says otherwise
-        if (!o.drafter.empty() && !o.spec_given) o.spec = 8;
-        if (o.spec < 2) o.drafter.clear();
-        if (!o.drafter.empty() && o.batch > 1) {
-            basalt::log::warn("basalt deepseek41", "drafter off: --parallel slots draft nothing");
-            o.drafter.clear();
-            o.spec = 0;
-        }
-        if (o.spec >= 2 && o.drafter.empty() && o.spec_oracle.empty()) {
-            basalt::log::warn("basalt deepseek41", "--spec %d without --drafter: nothing drafts", o.spec);
-            o.spec = 0;
-        }
-        if (!o.drafter.empty()) {
-            const std::string why = drafter_file_problem(o.drafter);
-            if (!why.empty()) {
-                basalt::log::error("basalt deepseek41", "--drafter %s: %s", o.drafter.c_str(), why.c_str());
-                return 2;
-            }
-        }
-        if (!o.max_context_set || o.model.empty()) return std::nullopt;
         core::ModelFile file;
         std::string err;
-        if (!file.open(o.model, err) || !file.load_meta(err)) return std::nullopt;
+        const bool opened = !o.model.empty() && file.open(o.model, err);
+        // --spec asks for the pack's drafter; a token file drafts in its place
+        if (o.spec >= 2 && o.spec_oracle.empty()) {
+            const char* off = o.batch > 1 ? "--parallel slots draft nothing" : !opened || !file.find("dspark/gguf") ? "the pack has no dspark/gguf section" : nullptr;
+            if (off != nullptr) {
+                basalt::log::warn("basalt deepseek41", "--spec %d off: %s", o.spec, off);
+                o.spec = 0;
+            }
+        }
+        if (!o.max_context_set || !opened || !file.load_meta(err)) return std::nullopt;
         const core::Json* kv = file.meta().get("gguf_kv");
         const core::Json* native = kv ? kv->get("deepseek41.context_length") : nullptr;
         const ctxp::Plan p = ctxp::plan_context(o.max_context, true, native ? (int64_t) native->u64() : 0, UINT64_MAX, {});

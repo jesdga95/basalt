@@ -53,7 +53,7 @@ std::string gguf_problem(const GgufFile& g) {
                              "blk.0.attn_output_b.weight", "blk.0.ffn_gate_shexp.weight"}) {
         const TensorInfo* t = g.find(name);
         if (!t) return std::string("no tensor ") + name;
-        if (!kernels::native_mmvq_supported((int) t->type)) return std::string(name) + " has a type no decode kernel reads; take the Q8_0 file";
+        if (!kernels::native_mmvq_supported((int) t->type)) return std::string(name) + " has a type no decode kernel reads";
     }
     return {};
 }
@@ -150,19 +150,19 @@ struct DsparkDrafter::Impl {
         return cudaMemcpy(*dst, src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
     }
 
-    bool load(const std::string& path, std::string& err) {
+    bool load(const core::FileRange& section, std::string& err) {
         size_t free0 = 0, free1 = 0, total_b = 0;
         cudaMemGetInfo(&free0, &total_b);
-        const bool ok = read(path, err);
+        const bool ok = read(section, err);
         cudaMemGetInfo(&free1, &total_b);
         bytes_taken = free0 > free1 ? (uint64_t) (free0 - free1) : 0;
         return ok;
     }
 
-    bool read(const std::string& path, std::string& err) {
+    bool read(const core::FileRange& section, std::string& err) {
         std::unique_ptr<GgufFile> g;
         try {
-            g = std::make_unique<GgufFile>(path);
+            g = std::make_unique<GgufFile>(section.path, section.offset, section.bytes);
         } catch (const std::exception& e) {
             err = std::string("dspark: ") + e.what();
             return false;
@@ -426,12 +426,12 @@ struct DsparkDrafter::Impl {
 DsparkDrafter::DsparkDrafter(std::unique_ptr<Impl> i) : p_(std::move(i)) {}
 DsparkDrafter::~DsparkDrafter() = default;
 
-std::unique_ptr<DsparkDrafter> DsparkDrafter::create(const DsModel& main, const std::string& path, int device, std::string& err) {
+std::unique_ptr<DsparkDrafter> DsparkDrafter::create(const DsModel& main, int device, std::string& err) {
     core::OnDevice g(device);
     auto i = std::make_unique<Impl>(main);
     i->device = device;
     try {
-        if (!i->load(path, err)) return nullptr;
+        if (!i->load(main.pack().dspark, err)) return nullptr;
     } catch (const std::exception& e) {
         err = std::string("dspark: ") + e.what();
         return nullptr;
@@ -447,15 +447,6 @@ int DsparkDrafter::feature_slot(int il) const {
 }
 int DsparkDrafter::device() const { return p_->device; }
 uint64_t DsparkDrafter::device_bytes() const { return p_->bytes_taken; }
-
-std::string drafter_file_problem(const std::string& path) {
-    try {
-        const GgufFile g(path);
-        return gguf_problem(g);
-    } catch (const std::exception& e) {
-        return e.what();
-    }
-}
 
 void DsparkDrafter::forget_from(int64_t pos) {
     for (int64_t& rp : p_->ring_pos)
