@@ -195,6 +195,19 @@ public:
         return {};
     }
 
+    model::Result set_vram_reserve(int64_t mib, int64_t& expert_slots) override {
+        std::string e;
+        ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        if (t == nullptr) return {model::Status::Error, e.empty() ? std::string("this session has no expert tier") : e};
+        cudaStreamSynchronize(stream_);
+        t->set_free_floor(mib);
+        t->lend_all();
+        if (!t->reclaim(e)) return {model::Status::Error, e};
+        t->grow();
+        expert_slots = t->slots();
+        return {};
+    }
+
     model::Result probe_env(program::ProbeEnv& env) override {
         std::string e;
         ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
@@ -280,12 +293,20 @@ public:
             if (!m_.open_mmproj(mp, err)) { images_done(); return {model::Status::Error, err}; }
             const VisionPlan pl = plan_image(img.w, img.h, mp.hp().merge, mp.hp().min_pixels);
             vis_ = std::make_unique<VisionEncoder>();
-            bool opened = vis_->init(mp, std::max(pl.n_patches(), 4096), err);
+            const auto above_floor = [&] {
+                size_t free_b = 0, total_b = 0;
+                return !t || cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b >= t->free_floor();
+            };
+            bool opened = vis_->init(mp, std::max(pl.n_patches(), 4096), err) && above_floor();
             if (!opened && t) {
                 vis_ = std::make_unique<VisionEncoder>();
                 t->lend_all();
                 err.clear();
                 opened = vis_->init(mp, std::max(pl.n_patches(), 4096), err);
+                if (opened && !above_floor()) {
+                    opened = false;
+                    err = "not enough free device memory for the image encoder above the VRAM reserve";
+                }
             }
             if (!opened) { images_done(); return {model::Status::Error, err}; }
             vis_merge_ = mp.hp().merge;
@@ -340,7 +361,11 @@ private:
             err = "deepseek41: cannot read the free device memory";
             return false;
         }
-        const prefillp::Fit fit = prefillp::plan_chunk(d, free_b, prefillp::kMargin, tokens);
+        // the reserve stays free through the read: the chunk halves to fit above it
+        std::string te;
+        const ExpertTier* tier = ops_->expert_tier(te);
+        const uint64_t margin = std::max(prefillp::kMargin, tier ? tier->free_floor() : 0);
+        const prefillp::Fit fit = prefillp::plan_chunk(d, free_b, margin, tokens);
         if (!fit.chunk) {
             err = "deepseek41: " + fit.error;
             return false;
@@ -348,7 +373,7 @@ private:
         for (int cap = fit.chunk; cap >= prefillp::kMinChunk; cap /= 2) {
             std::string e;
             prefill_ = make_prefill(m_, *ops_, stream_, cap, e);
-            const uint64_t after = prefillp::chunk_bytes(d, cap, tokens) - prefillp::workspace_bytes(d, cap) + prefillp::kMargin;
+            const uint64_t after = prefillp::chunk_bytes(d, cap, tokens) - prefillp::workspace_bytes(d, cap) + margin;
             if (prefill_ && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= after) {
                 cudaGetLastError();   // a larger size that did not fit left its error behind
                 return true;
