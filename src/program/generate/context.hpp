@@ -22,7 +22,6 @@ struct Context {
     std::vector<int64_t>* split_at = nullptr;
     std::vector<int>* split_devs = nullptr;
     bool* split_auto = nullptr;
-    bool* split_same = nullptr;
     bool* multi_gpu = nullptr;
     const bool* pipe_want = nullptr;
     const int* kPairMibLater = nullptr;

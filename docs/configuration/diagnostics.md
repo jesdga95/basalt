@@ -34,7 +34,6 @@ All CLI, all off.
 | `--dump-residual` | path | The residual at the end of the run (hc x n_embd, f32), for bisecting the head. |
 | `--dump-mixed` | path | The post-attention residual the head reads, at the end of the run (n_embd, f32). |
 | `--dump-routing` | path | The routed expert ids and weights per layer per position. Not with `--no-pool`. |
-| `--dump-final-r` | path | After every position, the residual after the last layer (hc x n_embd, f32; the drafter's input). Token path only. |
 
 ## Timing and profiles
 
@@ -57,7 +56,6 @@ All CLI, all off.
 | Flag | Binary | Value | What it does |
 | --- | --- | --- | --- |
 | `--spec-oracle` | CLI | path | With `--spec N` on a pack without a drafter: draft from a token file (the expected continuation), the exactness test of the verify path. Prompt lookup windows still take precedence. |
-| `--prefill-until` | CLI | tokens, 0 | Batch only the first P prompt positions and run the rest through the token path, teacher-forced, so later positions can be scored against an oracle. `0`: the whole prompt but the last position. |
 | `--spec-corrupt` | CLI | integer, 0 | Replace every Nth draft with a wrong token, to test rejection. |
 
 ## Scheduling tests
@@ -74,7 +72,7 @@ The per-layer n-gram (PLE) table stays on disk and its rows are read as needed.
 | --- | --- | --- | --- |
 | `--ple-io` | engine | `direct`, `ram`; `direct` | `direct`: unbuffered reads, the table never enters RAM or the file cache. `ram`: map the file with the whole table locked in RAM at start. |
 | `--ple-row-cache` | engine | rows, 1048576 | A bounded cache of fetched rows, 90 B each; `0` turns it off. |
-| `--ple-inflight` | engine | integer, 256 | Outstanding reads. |
+| `--ple-inflight` | engine | 1..1024, 256 | Outstanding reads. |
 | `--ple-delay-us` | engine | microseconds, 0 | Fault injection: each row read completes no earlier than this. |
 
 ## Quality gate

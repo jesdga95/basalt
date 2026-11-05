@@ -156,11 +156,6 @@ std::optional<int> validate_generation_options(const Options& o, bool multi_gpu,
         basalt::log::error("basalt generate", "--peer-exclusive runs with one expert tier card (--gpu 0,1)");
         return 2;
     }
-    // the peer tier is the second card's only user: a layer split would put a second engine part on it
-    if (o.peer_device >= 1 && !o.layer_split.empty()) {
-        basalt::log::error("basalt generate", "--peer-device cannot be combined with --layer-split (use one or the other)");
-        return 2;
-    }
 
     // The whole-model graph measurements replay every layer through CUDA0's session, which a layer split carves to
     // CUDA0's own range - the answer would read another stage's state.  Refused here rather than at the call, so
