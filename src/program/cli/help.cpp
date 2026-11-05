@@ -77,6 +77,7 @@ void usage() {
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking (default 2560)\n"
+                 "  --no-ram-guard       --serve: no RAM guard; low RAM never sheds, delays or stops a request\n"
                  "  --conversation-cache-min-tokens N  --serve: park only conversations of at least N tokens (default 0 = park every one)\n"
                  "  --conversation-cache-disk-mib N  --serve: park conversations on disk, at most N MiB, and read them back\n"
                  "                       when a prompt starts with one, also after a restart (default 0 = off)\n"

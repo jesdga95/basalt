@@ -63,6 +63,8 @@ struct CommonOptions {
     bool pool_workers_given = false;     // --pool-workers on the command line
     /// Stop when the model emits an end-of-turn token (the pack's own, or --eos-ids).
     bool stop_eos = false;
+    /// --no-ram-guard: serving never sheds, delays admission or stops a request for low RAM.
+    bool no_ram_guard = false;
     std::vector<int64_t> eos_ids;
     /// --gpu: the cards this run uses (gpu_select.hpp); empty = GPU 0 alone.  --gpu-plan prints the choice and exits.
     std::string gpu;
