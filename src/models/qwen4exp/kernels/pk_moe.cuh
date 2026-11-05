@@ -30,6 +30,18 @@ __device__ __forceinline__ unsigned long long pk_now() {
 __device__ __forceinline__ void pk_tmin(unsigned long long* t, int slot) { atomicMin(t + slot, pk_now()); }
 __device__ __forceinline__ void pk_tmax(unsigned long long* t, int slot) { atomicMax(t + slot, pk_now()); }
 
+__device__ __forceinline__ unsigned int ld_acquire_gpu(const unsigned int* p) {
+    unsigned int v;
+    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+__device__ __forceinline__ void st_release_gpu(unsigned int* p, unsigned int v) {
+    asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+__device__ __forceinline__ void red_release_add_gpu(unsigned int* p, unsigned int v) {
+    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+
 __device__ __forceinline__ unsigned int pk_arrive(unsigned int* p) {
     unsigned int v;
     asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(v) : "l"(p) : "memory");
