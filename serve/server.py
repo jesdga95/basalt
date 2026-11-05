@@ -183,7 +183,9 @@ def main() -> int:
         if sampling_defaults:
             print(sampling_line(sampling_defaults, a.sampling_cli, set(a.sampling_launch) - a.sampling_cli), flush=True)
         lazy = a.lazy
-        if lazy and cfg.get("vision"):
+        # only a sidecar encoder needs dropping: it holds VRAM before the first request. `dynamic` encodes inside the
+        # engine, which the request loads first anyway (Service._prepare's in_engine branch).
+        if lazy and cfg.get("vision") and cfg["vision"].get("mode") != "dynamic":
             print(tagged("warning", "lazy loading is text-only, vision off"), flush=True)
             while (at := flag_index(cfg["args"], "--vision-mmproj")) is not None:
                 del cfg["args"][at:at + 2]
