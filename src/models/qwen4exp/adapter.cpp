@@ -4,6 +4,7 @@
 #include "models/qwen4exp/meta.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/core/model_file.hpp"
 #include "basalt/models/qwen4exp/decode/layout.hpp"
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "unicode_flags.hpp"
@@ -66,6 +67,16 @@ public:
     std::unique_ptr<program::CommonOptions> make_options() const override { return std::make_unique<Options>(); }
     bool parse_flag(const std::string& name, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
         return qwen4exp::parse_flag(name, args, static_cast<Options&>(o), code);
+    }
+    // the pack's drafter runs in windows of 8 unless --spec says otherwise (resolve_model_options)
+    int planned_spec(const program::CommonOptions& o) const override {
+        if (o.spec_given) return o.spec >= 2 ? o.spec : 0;
+        core::ModelFile file;
+        std::string err;
+        if (o.model.empty() || !file.open(o.model, err)) return 0;
+        core::ModelSources srcs;
+        core::model_sources(file, srcs);
+        return !srcs.mtp_dense.empty() && !srcs.mtp_dense_index.empty() && !srcs.mtp_experts.empty() ? 8 : 0;
     }
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
         return qwen4exp::finish_flags(static_cast<Options&>(o));

@@ -334,6 +334,19 @@ def start_items(file_words: list[str], cli_words: list[str], shared: tuple[int, 
     return items
 
 
+def with_spec(items: list[str], spec) -> list[str]:
+    """A model's items with `spec=N` the window the engine will run (its --gpu-plan answer), not the flag as given."""
+    return items if not isinstance(spec, int) else [x for x in items if not x.startswith("spec=")] + [f"spec={spec}"]
+
+
+def shared_line(shared: list[str], sleeps: list) -> tuple[str, bool]:
+    """The items every model shares, with the idle sleep when all of several models sleep after the same time; and
+    whether it took the sleep (the models then do not say it each)."""
+    s = {x or 0 for x in sleeps}
+    sleep = len(sleeps) > 1 and len(s) == 1 and next(iter(s)) > 0
+    return " ".join(shared + ([f"sleep={next(iter(s)):g}s"] if sleep else [])), sleep
+
+
 def model_line(name: str, width: int, items: list[str]) -> str:
     """A model's startup line: its name padded to the column of the longest name, then its items."""
     return f"[server] {name:<{width}} {' '.join(items)}".rstrip()

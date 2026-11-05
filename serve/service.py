@@ -453,14 +453,16 @@ class Service:
         except Exception:
             return None
 
-    def start_idle_sleep(self):
+    def start_idle_sleep(self, announce: bool = True, name: str | None = None):
+        """Put the model to sleep after idle_sleep_s; `announce` prints the line, naming `name` when given."""
         if not self.idle_sleep_s or not hasattr(self.engine, "sleep"):
             return
         if not self.engine.can_sleep():
             print("[server] warning: idle sleep is not available here (the driver cannot suspend a process); "
                   "use idle_unload", flush=True)
             return
-        print(f"[server] model sleeps after {self.idle_sleep_s:g} s idle", flush=True)
+        if announce:
+            print(f"[server] {name or 'model'} sleeps after {self.idle_sleep_s:g} s idle", flush=True)
 
         def loop():
             while True:
