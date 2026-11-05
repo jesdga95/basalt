@@ -61,7 +61,7 @@ ExpertTier::~ExpertTier() {
     platform::free_aligned(act_);
 }
 
-bool ExpertTier::open(const Reserve& reserve, const float* h_x, float* h_rows, std::string& err) {
+bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     const Geometry& g = m_.geo();
     n_layers_ = g.n_layers;
     n_expert_ = g.n_expert;
