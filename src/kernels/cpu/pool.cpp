@@ -403,14 +403,15 @@ int ExpertPool::split_multi_batch(const NativeFmt& f, ExpertJobMulti* jobs, int 
     mjobs_ = jobs;
     nfmt_ = &f;
     const int threads = active_.load(std::memory_order_relaxed) + 1;
+    const int tpt = cpu_avx512_ok() ? kTasksPerThread : kTasksPerThreadAvx2;
     // One batch for the whole layer: an expert's down rows start once its own gate/up rows are done and quantized,
     // so there is no barrier between the three steps and the cores' speed differences cost one tail, not two.
     // The share of tasks follows the share of bytes of the two projections.
     gu_share = (double) f.down_off / (double) (f.down_off + f.d_row * (size_t) f.n_embd);
     fused_n_ = nb;
     fused_tail_ = threads;
-    fused_gu_parts_ = (std::min)((int) f.n_ff, (std::max)(1, (int) std::lround(kTasksPerThread * threads * gu_share / nb)));
-    fused_d_parts_ = (std::min)((int) f.n_embd, (std::max)(1, (int) std::lround(kTasksPerThread * threads * (1.0 - gu_share) / nb)));
+    fused_gu_parts_ = (std::min)((int) f.n_ff, (std::max)(1, (int) std::lround(tpt * threads * gu_share / nb)));
+    fused_d_parts_ = (std::min)((int) f.n_embd, (std::max)(1, (int) std::lround(tpt * threads * (1.0 - gu_share) / nb)));
     for (int e = 0; e < nb; ++e) {
         fused_[(size_t) e].gu_left.store(fused_gu_parts_, std::memory_order_relaxed);
         fused_[(size_t) e].ready.store(0, std::memory_order_relaxed);
