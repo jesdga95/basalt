@@ -67,10 +67,16 @@ class Service:
     load_kind = "weights"                               # what the running load is: "weights" or "wake"
     on_loaded = None                                    # called after each weights load or wake this service ran
     boot_error = None                                   # the start-up load's failure, for the requests queued behind it
+    start_tries = None                                  # tries of a load other than the start-up's (None: the engine's)
 
-    def listed_models(self) -> list[str]:
-        """What /v1/models lists: the one model this process runs."""
-        return [self.model]
+    def model_entry(self) -> dict:
+        """This model's row in /v1/models."""
+        value = "loading" if self.loading else "loaded" if self.loaded() else "unloaded"
+        return {"id": self.model, "object": "model", "status": {"value": value},
+                "asleep": getattr(self.engine, "asleep", False) is True,
+                "meta": {"n_ctx": self.engine.max_context},
+                "architecture": {"input_modalities": ["text", "image"] if self.vision is not None else ["text"],
+                                 "output_modalities": ["text"]}}
 
     def served_names(self) -> list[str]:
         """The model names a request may use: the one /v1/models lists, and the model file's own name."""
@@ -277,7 +283,8 @@ class Service:
             code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
             print(f"[server] warning: the engine stopped (exit code {code}), restarting it", flush=True)
         try:
-            self.engine.restart(tries=1) if self.booting else self.engine.restart()   # the start-up load tries once
+            tries = 1 if self.booting else self.start_tries   # the start-up load tries once
+            self.engine.restart(tries=tries) if tries else self.engine.restart()
         except EngineStartError as e:                   # a line, not a traceback
             print(f"[server] error: {e}", flush=True)
             if e.log:
@@ -312,8 +319,9 @@ class Service:
                         "note": "applied when the model loads"}
             out = self.engine.vram(reserve_mib)
             self.vram_reserve = reserve_mib
-            print(f"[server] vram: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
-                  f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
+            cache = f"expert cache {out['expert_cache_mib']} of {out.get('expert_cache_full_mib')} MiB " \
+                if out.get("expert_cache_mib") is not None else ""
+            print(f"[server] vram: {out.get('vram_free_mib')} MiB free, {cache}({out.get('expert_slots')} experts)", flush=True)
             return {"status": "ok", **out}
         finally:
             if ctl is not None:
@@ -352,6 +360,15 @@ class Service:
         """Hold the caller until a running load or wake ends, on the same fifo as a request; raises the load's error."""
         if self.loading:
             self.load()
+
+    def swap_out(self):
+        """End the engine for another model's turn: no request runs (the router drained them). A sleeping engine gets
+        its GPU state back for its exit, without refilling its caches."""
+        with self.fifo:
+            if hasattr(self.engine, "unload"):
+                self.engine.unload()
+            if self.vision is not None and hasattr(self.vision, "unload"):
+                self.vision.unload()
 
     def _wake(self):
         """Wake a sleeping engine (caller holds fifo); a failed wake ends it and the next start loads it again."""
@@ -492,14 +509,10 @@ class Service:
                     print(f"[server] warning: idle unload failed ({e})", flush=True)
         threading.Thread(target=loop, daemon=True).start()
 
-    def start_telemetry(self):
-        """Start the hardware sampler behind GET /metrics, including this server's speeds."""
-        if getattr(self, "telemetry", None) is None:
-            from serve.util.telemetry import Telemetry
-            self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(),
-                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean(),
-                                                    "slot_tok_s": [r["tok_s"] for r in self.slot_table()[0]]},
-                                       gpu_indices=getattr(self, "gpu_indices", None) or [0])
+    def telemetry_extra(self) -> dict:
+        """This model's speeds, for the hardware sampler behind GET /metrics."""
+        return {"tok_s": self._tok_s(), "prefill_tok_s_mean": self._prefill_tok_s_mean(),
+                "slot_tok_s": [r["tok_s"] for r in self.slot_table()[0]]}
 
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S (summed over parallel requests); 0.0 when idle."""
