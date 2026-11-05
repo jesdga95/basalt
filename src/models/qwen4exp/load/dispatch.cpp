@@ -1,5 +1,6 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
+#include "basalt/program/expert_spill.hpp"
 
 namespace basalt::models::qwen4exp::generate {
 
@@ -39,7 +40,6 @@ int dispatch(Context& context) {
     auto& kv_floor = *context.kv_floor;
     auto& bslot_ss = *context.bslot_ss;
     auto& slot_cap = *context.slot_cap;
-    auto& slot_kv_cuda0 = *context.slot_kv_cuda0;
     auto& slot0_is_solo = *context.slot0_is_solo;
     auto& mtp = *context.mtp;
     auto& mtp_on = *context.mtp_on;
@@ -75,11 +75,12 @@ int dispatch(Context& context) {
     auto& split_stages_text = context.split_stages_text;
     auto& split_stages = *context.split_stages;
 
-    // Where the routed experts live, fastest tier first, and a warning when a share of them is only in the file (decode
+    // Where the routed experts live, fastest tier first, and a warning when any of them is only in the file (decode
     // reads those from the SSD).  Called once the tiers are final.
-    uint64_t tier_file_bytes = 0;   // the experts only the file holds, once the tiers are final
+    basalt::program::ExpertSpill tier_spill;   // the experts only the file holds, once the tiers are final
     auto report_expert_tiers = [&]() {
         uint64_t b_vram = 0, b_peer = 0, b_ram = 0, b_top = 0, b_file = 0;
+        int64_t n_file = 0;
         const bool ram_ok = srcp == &src && src.complement_ready();
         // the arena holds every expert in RAM (opening it fails when it cannot), so nothing it serves is file-backed
         const bool arena_ok = srcp == &arena_src && arena_src.mapped();
@@ -95,10 +96,13 @@ int dispatch(Context& context) {
                 else if (on_peer) b_peer += blob;
                 else if (arena_ok) b_ram += blob;
                 else if (ram_ok && src.has_resident(l, e)) (src.resident_in_top_up(l, e) ? b_top : b_ram) += blob;
-                else b_file += blob;
+                else {
+                    b_file += blob;
+                    ++n_file;
+                }
             }
         }
-        tier_file_bytes = b_file;
+        tier_spill = {n_file, g.n_layers * g.n_expert, b_file};
         const double total = (double) (b_vram + b_peer + b_ram + b_top + b_file);
         if (total <= 0.0) return;
         basalt::core::draft_cum_cpu_mb() = (float) ((double) (b_ram + b_top) / (double) (g.n_layers * g.n_expert) / 1e6);
@@ -111,17 +115,11 @@ int dispatch(Context& context) {
                              "%.1f GiB%s (%.0f%%), file (SSD) %.1f GiB (%.0f%%); %.1f GiB in all",
                      (double) b_vram / kGiB, pct(b_vram), (double) b_peer / kGiB, pct(b_peer), (double) b_ram / kGiB, top,
                      pct(b_ram + b_top), (double) b_file / kGiB, pct(b_file), total / kGiB);
-        // The file holds the coldest experts (the tiers fill in profile order), so its share of the bytes is well above
-        // its share of the reads; 2% is where a decode window starts to meet SSD reads that cost far more than a RAM hit.
-        if (pct(b_file) < 2.0) return;
-        std::string levers = "a smaller quant, more RAM";
+        std::string levers = ", or a smaller quant";
         if (!o.resident_cpu_experts) levers += ", --resident-experts";
-        if (o.peer_device < 1) levers += ", a second GPU as the peer tier (--gpu 0,1)";
-        if (o.batch > 1) levers += ", fewer --parallel slots or no --slot-full-context (the slots hold " +
-                                   std::to_string((slot_kv_cuda0 + (1u << 29)) >> 30) + " GiB of KV beyond the solo one)";
-        basalt::log::warn("basalt", "%.0f%% of the experts (%.1f GiB) are only in the file: decode reads them "
-                             "from the SSD and may be much slower. To fit them: %s",
-                     pct(b_file), (double) b_file / kGiB, levers.c_str());
+        if (o.peer_device < 1) levers += ", --gpu 0,1";
+        if (o.batch > 1) levers += ", fewer --parallel slots";
+        basalt::program::warn_spill(tier_spill, levers);
     };
     if (!o.serve) report_expert_tiers();
     if (o.serve) {
@@ -194,7 +192,7 @@ int dispatch(Context& context) {
             .split_layers_text = split_layers_text,
             .split_stages_text = split_stages_text,
             .split_stages = split_stages,
-            .tier_file_bytes = tier_file_bytes,
+            .tier_spill = tier_spill,
             .report_expert_tiers = report_expert_tiers,
         };
         return basalt::models::qwen4exp::serve::run(context);

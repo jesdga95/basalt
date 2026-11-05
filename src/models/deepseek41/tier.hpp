@@ -10,6 +10,7 @@
 
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/ram_load.hpp"
+#include "basalt/program/expert_spill.hpp"
 #include "basalt/program/probe_rates.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
@@ -127,6 +128,10 @@ public:
     int64_t hits() const { return hits_; }
     int64_t lookups() const { return hits_ + cpu_; }
     int64_t offloaded() const { return fetched_ + peer_hits_; }
+    /// Of the CPU's, those read from the file.
+    int64_t file_lookups() const { return file_hits_; }
+    /// The experts only the file holds.
+    program::ExpertSpill spill() const;
     /// What `PROBE rates` measures: this tier's pool, RAM blobs, formats and second card.
     void probe_env(program::ProbeEnv& env);
 

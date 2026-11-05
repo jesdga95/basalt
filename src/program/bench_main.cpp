@@ -898,7 +898,7 @@ int main(int argc, char** argv) {
         }
         if (o.community) {
             // every expert must sit in VRAM, the peer GPU or RAM: reads from the file would make the row incomparable
-            const char* k = "file_experts_bytes";
+            const char* k = "spill_bytes";
             const double spill = eng.info.count(k) ? std::atof(eng.info[k].c_str()) / 1073741824.0 : -1.0;
             if (spill != 0.0) {
                 eng.stop();

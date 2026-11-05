@@ -290,13 +290,14 @@ public:
     ExpertCounts expert_counts() const override {
         std::string e;
         const ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
-        return t == nullptr ? ExpertCounts{} : ExpertCounts{t->hits(), t->lookups(), t->offloaded()};
+        return t == nullptr ? ExpertCounts{} : ExpertCounts{t->hits(), t->lookups(), t->offloaded(), t->file_lookups()};
     }
 
     std::string info_words() const override {
         std::string e;
         ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
-        return t == nullptr ? std::string("kv=fp16") : "expert_slots=" + std::to_string(t->slots()) + " kv=fp16";
+        return t == nullptr ? std::string("kv=fp16")
+                            : "expert_slots=" + std::to_string(t->slots()) + " kv=fp16 " + program::spill_words(t->spill());
     }
 
     size_t cells_bytes(int64_t positions) const override { return ops_ ? ops_->cache_bytes(positions) : 0; }

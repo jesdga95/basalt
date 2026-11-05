@@ -285,7 +285,7 @@ int QfnRuntime::init_memory() {
     basalt::platform::stop_memory_watchdog();
     // from here the RAM guard watches: below its floor the engine sheds and new requests wait, and a running
     // request stops only once the RAM is critical
-    guard_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), tier_file_bytes, prompt_file_bytes);
+    guard_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), tier_spill.bytes, prompt_file_bytes);
     basalt::platform::start_ram_guard(guard_floor);
     disk_floor = guard_floor + (1ull << 30);   // a disk-tier capture or read stays a GiB above the guard
     // what a stop's error compares against, to tell the engine's own growth from other programs'

@@ -497,6 +497,8 @@ class ProcessEngine:
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
         if len(f) >= 11:                                  # decode hit rate
             self.last.update(hits=int(f[9]), lookups=int(f[10]))
+        if len(f) >= 13:                                  # decode lookups read from the expert file
+            self.last.update(file_reads=int(f[12]))
         if len(f) >= 15:                                  # prompt tokens actually read
             self.last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # experts read over PCIe
