@@ -27,6 +27,7 @@
 //   mtp/dense, mtp/dense.index, mtp/experts, mtp/draft_vocab
 //                            the drafter (the files of an mtp runtime directory)
 //   hc8                      the 8-bit copies of the hyper-connection matrices (model_file.hpp), required
+//   dspark/gguf              a DeepSeek V4.1 pack's DSpark drafter GGUF, whole; optional, meta.dspark records it
 //   vision/mmproj            the vision projector GGUF, whole
 //   vision/<name>            anything else the vision sidecar reads
 #include <cstdint>

@@ -3,6 +3,7 @@
     python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPROJ.gguf --out MODEL.basalt \\
         [--mtp-source DIR] [--mtp-dense FILE] [--draft-vocab FILE] [--name NAME] [--compat-bf16] [--no-vision] [--force]
     python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --sections-from BASE.basalt --out MODEL.basalt [--name NAME] [--force]
+    python3 tools/convert/convert.py --dspark FILE --into PACK.basalt --undo-dir DIR
     python3 tools/convert/convert.py --sections-from BASE.basalt --checkpoint DIR --out MODEL.basalt [--dense-q8-0] [--mtp-dense FILE] \\
         [--name NAME] [--workers N] [--force]
 
@@ -11,6 +12,7 @@ Inputs
   --sections-from BASE.basalt  with --gguf: the drafter and vision sections are copied from BASE byte for byte (BASE's
                      vocabulary must be the GGUF's); replaces --mmproj, --mtp-* and --draft-vocab
   --mmproj FILE      the vision projector GGUF (required unless --no-vision)
+  --dspark FILE      deepseek41 only: the DSpark drafter GGUF, stored whole as the dspark/gguf section
   --mtp-source DIR   the draft layer's BF16 tensors from `mtp_fetch.py fetch --out DIR`; without it there is no drafter
   --mtp-dense FILE   a tuned `mtp/dense` section (raw bytes, same layout as the source; needs --mtp-source); the packs
                      with a self-distilled MTP layer carry one. Its size is checked and its SHA-256 goes to meta.mtp.
@@ -33,6 +35,13 @@ Dense requantization
   Every Q8_0 dense projection whose rows are whole 256-value blocks (GDN qkv/z/out, attention q/k/v/o, the shared
   experts' gate and up) is written as Q6_K; everything else is copied byte for byte. --checkpoint DIR quantizes from the
   BF16 shards (each tensor is checked against the Q8_0 copy in PACK); without it the Q8_0 values are requantized.
+
+Adding the drafter to a deepseek41 pack that exists
+  --dspark FILE --into PACK.basalt --undo-dir DIR
+                     writes dspark/gguf and a new meta past the file's end and replaces the header in one write: no other
+                     section moves or changes. DIR (new) keeps the old header and meta;
+  --roll-back --into PACK.basalt --undo-dir DIR
+                     puts them back and cuts the file to its old size.
 
 Options
   --name NAME        the model's name, reported by the server
@@ -65,7 +74,7 @@ sys.path.insert(0, str(HERE.parent))   # for model_file, gguf_reader, tokenizer
 import arch as A  # noqa: E402
 import hc8 as H  # noqa: E402
 import model_sections as S  # noqa: E402
-from model_file import SECTION_ALIGN, TENSOR_ALIGN, ModelFile, ModelWriter, Stream  # noqa: E402
+from model_file import SECTION_ALIGN, TENSOR_ALIGN, ModelFile, ModelWriter, Stream, append_section, undo_append  # noqa: E402
 
 FINGERPRINT_BYTES = 64 << 20
 
@@ -92,6 +101,57 @@ def fingerprint(path: Path) -> str:
         h.update(f.read(FINGERPRINT_BYTES))
     h.update(struct.pack("<Q", size))
     return h.hexdigest()
+
+
+def source_record(path: Path) -> dict:
+    return {"path": path.name, "size": path.stat().st_size, "fingerprint_sha256_first_last_64mib_and_size": fingerprint(path)}
+
+
+def check_dspark(path: Path) -> None:
+    """Stops on what the engine's drafter cannot read: another architecture, or dense tensors no decode kernel reads."""
+    from gguf_reader import GGUFFile
+    if not path.is_file():
+        die(f"missing input: {path}")
+    try:
+        g = GGUFFile(path)
+    except (ValueError, KeyError, struct.error) as e:
+        die(f"{path}: {e}")
+    if g.metadata.get("general.architecture") != "dflash":
+        die(f"{path} is not a DSpark (dflash) drafter GGUF")
+    for t in g.tensors:
+        if t.name == "fc.weight" and t.type_name in ("BF16", "F16", "F32"):
+            die(f"{path}: {t.name} is {t.type_name}, which no decode kernel reads; take the Q8_0 drafter")
+
+
+def dspark_record(path: Path) -> dict:
+    return {"section": "dspark/gguf", "bytes": path.stat().st_size, "architecture": "dflash"}
+
+
+def add_dspark(a) -> None:
+    """--dspark with --into: the drafter joins a pack that exists, whose other sections stay where and as they are."""
+    pack = Path(a.into)
+    if not pack.is_file():
+        die(f"missing input: {pack}")
+    if a.roll_back:
+        undo_append(str(pack), a.undo_dir)
+        print(f"done: {pack} is back to {pack.stat().st_size} bytes")
+        return
+    dspark = Path(a.dspark)
+    check_dspark(dspark)
+    m = ModelFile(str(pack))
+    meta = json.loads(m.read("meta"))
+    if meta.get("arch") != "deepseek41":
+        die(f"{pack} is no deepseek41 pack")
+    meta["dspark"] = dspark_record(dspark)
+    meta["sources"].append(source_record(dspark))
+    try:
+        append_section(str(pack), "dspark/gguf", str(dspark), json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), a.undo_dir)
+    except (ValueError, FileExistsError) as e:
+        die(str(e))
+    m = ModelFile(str(pack))
+    if not m.verify("dspark/gguf") or not m.verify("meta"):
+        die(f"{pack}: the new sections do not read back as written; --roll-back puts the file back")
+    print(f"done: {pack} is {pack.stat().st_size} bytes, {len(m.names())} sections")
 
 
 def json_safe(v):
@@ -250,7 +310,12 @@ def convert(a) -> None:
                                 ("--draft-vocab", a.draft_vocab), ("--sections-from", a.sections_from))
                  if v]
         if given:
-            die(f"{arch.name} packs have no drafter or hc8 sections; drop {', '.join(given)}")
+            die(f"{arch.name} packs have no MTP drafter or hc8 sections; drop {', '.join(given)}")
+    dspark = Path(a.dspark) if getattr(a, "dspark", None) else None
+    if dspark is not None:
+        if not arch.dspark_ok:
+            die(f"{arch.name} packs take no --dspark drafter")
+        check_dspark(dspark)
     vision = arch.side_sections and not a.no_vision
     if arch.mmproj_only and a.mmproj and not a.no_vision:
         vision = True
@@ -374,10 +439,10 @@ def convert(a) -> None:
                         job.bytes(name, data)
                     else:
                         job.file(name, src, off, size)
+            if dspark is not None:
+                job.file("dspark/gguf", dspark)
 
-            sources = [{"path": p.name, "size": p.stat().st_size,
-                        "fingerprint_sha256_first_last_64mib_and_size": fingerprint(p)}
-                       for p in model.paths + ([mmproj] if vision and base is None else [])]
+            sources = [source_record(p) for p in model.paths + ([mmproj] if vision and base is None else []) + ([dspark] if dspark else [])]
             meta = {
                 "format": "basalt", "version": 2, "name": a.name,
                 "converter": {"tool": "tools/convert/convert.py"},
@@ -395,6 +460,7 @@ def convert(a) -> None:
                 "vision": base_meta.get("vision") if base is not None else None if not vision else {"mmproj": "vision/mmproj", "mmproj_bytes": mmproj.stat().st_size,
                                                     "extra": [v[0] for v in vision_extra]},
                 **arch.meta_extra(kv, {n: t for n, _, _, _, t in tensors}, own),
+                **({"dspark": dspark_record(dspark)} if dspark else {}),
             }
             if base is not None:
                 meta["sections_from"] = {"path": Path(a.sections_from).name, "size": Path(a.sections_from).stat().st_size,
@@ -656,7 +722,11 @@ def main():
     ap.add_argument("--gguf", action="append", metavar="FILE",
                     help="the model's GGUF: shard 1 of a split model (the others are found beside it), or repeat per shard")
     ap.add_argument("--mmproj", help="vision projector GGUF (required unless --no-vision)")
-    ap.add_argument("--out", required=True, help="the .basalt file to write")
+    ap.add_argument("--dspark", metavar="FILE", help="deepseek41: the DSpark drafter GGUF, stored whole as dspark/gguf")
+    ap.add_argument("--into", metavar="PACK.basalt", help="with --dspark: add it to this pack, whose other sections stay as they are")
+    ap.add_argument("--undo-dir", metavar="DIR", help="with --into: a new directory for what --roll-back restores")
+    ap.add_argument("--roll-back", action="store_true", help="with --into and --undo-dir: restore the pack as it was")
+    ap.add_argument("--out", help="the .basalt file to write")
     ap.add_argument("--mtp-source", metavar="DIR", help="the drafter's BF16 tensors written by tools/convert/mtp_fetch.py fetch")
     ap.add_argument("--mtp-dense", metavar="FILE", help="a tuned (self-distilled) mtp/dense section to embed (needs --mtp-source)")
     ap.add_argument("--draft-vocab", metavar="FILE", help="int32 token ids the draft head may propose (needs --mtp-source)")
@@ -676,6 +746,15 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="with --gguf: print every section's offset and size and write nothing")
     a = ap.parse_args()
+    if a.into or a.roll_back or a.undo_dir:
+        if not a.into or not a.undo_dir or bool(a.dspark) == a.roll_back or a.out or a.gguf or a.sections_from or a.checkpoint or a.requant_dense_q6k:
+            ap.error("--into takes --undo-dir and either --dspark or --roll-back, and nothing else")
+        add_dspark(a)
+        return
+    if not a.out:
+        ap.error("--out is required")
+    if a.dspark and (a.checkpoint or a.requant_dense_q6k or a.sections_from):
+        ap.error("--dspark goes with --gguf")
     if a.requant_dense_q6k:
         if a.sections_from or a.gguf or a.dense_q8_0:
             ap.error("--requant-dense-q6k takes only --checkpoint, --out, --workers and --force")

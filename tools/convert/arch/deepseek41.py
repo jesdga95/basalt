@@ -3,7 +3,7 @@
 Every tensor is stored as published: the float tensors in `dense`, the quantized non-expert tensors in `gguf`, the routed
 experts in `experts`, and the Engram table (`per_layer_token_embd.weight`, rows of 256 IQ4_NL values) in a section of its
 own so it can be read by row with O_DIRECT. There is no hc8 section. `--mmproj` adds the vision
-projector GGUF as the `vision/mmproj` section.
+projector GGUF as the `vision/mmproj` section, `--dspark` the DSpark drafter GGUF as `dspark/gguf` (meta.dspark).
 """
 from __future__ import annotations
 
@@ -70,6 +70,7 @@ class DeepSeek41(Arch):
     own_sections = {ENGRAM_TENSOR: ENGRAM_SECTION}
     side_sections = False
     mmproj_only = True
+    dspark_ok = True
     projector_type = "deepseek41v"
     sampling_kv = {"general.sampling.temp": 1.0, "general.sampling.top_p": 1.0, "general.sampling.top_k": 0}
 

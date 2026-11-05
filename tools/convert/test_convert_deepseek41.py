@@ -150,6 +150,79 @@ class DeepSeek41Test(unittest.TestCase):
         self.assertEqual(meta["vision"]["mmproj"], "vision/mmproj")
         self.assertEqual(meta["vision"]["mmproj_bytes"], proj.stat().st_size)
 
+    def drafter(self, fc="Q8_0"):
+        g = GGUFWriter()
+        g.add("general.architecture", "dflash")
+        g.add("dflash.block_count", 3, "u32")
+        g.add_raw("fc.weight", [32, 2], fc, b"\7" * (68 if fc == "Q8_0" else 128))
+        g.add_f32("enc.output_norm.weight", np.arange(64, dtype=np.float32))
+        return g.write(self.t / "dspark.gguf")
+
+    def test_dspark_becomes_its_own_section(self):
+        d = self.drafter()
+        convert.convert(self.args(dspark=str(d)))
+        m = ModelFile(str(self.t / "out.basalt"))
+        self.assertIn("dspark/gguf", m.names())
+        self.assertTrue(m.verify("dspark/gguf"))
+        self.assertEqual(m.section("dspark/gguf")[0] % SECTION_ALIGN, 0)
+        self.assertEqual(m.read("dspark/gguf"), d.read_bytes())
+        meta = json.loads(m.read("meta"))
+        self.assertEqual(meta["dspark"], {"section": "dspark/gguf", "bytes": d.stat().st_size, "architecture": "dflash"})
+        self.assertIn("dspark.gguf", [x["path"] for x in meta["sources"]])
+
+    def test_no_dspark_means_no_section_and_no_meta(self):
+        convert.convert(self.args())
+        m = ModelFile(str(self.t / "out.basalt"))
+        self.assertNotIn("dspark/gguf", m.names())
+        self.assertNotIn("dspark", json.loads(m.read("meta")))
+
+    def test_foreign_or_bf16_dspark_is_refused(self):
+        with self.assertRaises(SystemExit):
+            convert.convert(self.args(dspark=str(self.gguf)))
+        with self.assertRaises(SystemExit):
+            convert.convert(self.args(dspark=str(self.drafter(fc="BF16"))))
+
+    def into_args(self, **kw):
+        d = dict(into=str(self.t / "out.basalt"), dspark=None, undo_dir=str(self.t / "undo"), roll_back=False)
+        d.update(kw)
+        return type("A", (), d)()
+
+    def test_adding_to_a_pack_leaves_every_other_section_alone(self):
+        d = self.drafter()
+        convert.convert(self.args(dspark=str(d), out=str(self.t / "whole.basalt")))
+        convert.convert(self.args())
+        pack = self.t / "out.basalt"
+        before = pack.read_bytes()
+        old = ModelFile(str(pack))
+        convert.add_dspark(self.into_args(dspark=str(d)))
+        m = ModelFile(str(pack))
+        after = pack.read_bytes()
+        for name in old.names():
+            self.assertTrue(m.verify(name), name)
+            if name != "meta":
+                self.assertEqual(m.section(name), old.section(name), name)
+                self.assertEqual(m.read(name), old.read(name), name)
+        # past the header only the old meta, zeroed, and what lies past the old end differ
+        off, size = old.section("meta")
+        self.assertEqual(after[off:off + size], b"\0" * size)
+        self.assertEqual(after[1 << 16:off], before[1 << 16:off])
+        self.assertEqual(m.section("dspark/gguf")[0] % SECTION_ALIGN, 0)
+        self.assertEqual(m.section("meta")[0] % SECTION_ALIGN, 0)
+        self.assertEqual(m.read("dspark/gguf"), d.read_bytes())
+        # the same records a whole conversion writes
+        whole = ModelFile(str(self.t / "whole.basalt"))
+        self.assertEqual(json.loads(m.read("meta")), json.loads(whole.read("meta")))
+        self.assertEqual(sorted(m.names()), sorted(whole.names()))
+        convert.add_dspark(self.into_args(roll_back=True))
+        self.assertEqual(pack.read_bytes(), before)
+
+    def test_adding_refuses_what_does_not_fit(self):
+        d = self.drafter()
+        convert.convert(self.args(dspark=str(d)))
+        with self.assertRaises(SystemExit):   # it has one already
+            convert.add_dspark(self.into_args(dspark=str(d)))
+        self.assertFalse((self.t / "undo").exists())
+
     def test_foreign_mmproj_is_refused(self):
         with self.assertRaises(SystemExit):
             convert.convert(self.args(mmproj=str(self.gguf)))
