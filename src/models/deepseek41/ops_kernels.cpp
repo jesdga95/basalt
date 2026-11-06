@@ -45,6 +45,7 @@ struct WindowPlan {
     int32_t dst[ExpertTier::kMaxK];
     int32_t tok[ExpertTier::kMaxK];
 };
+static_assert(sizeof(WindowPlan) <= 4 * kPutWords && sizeof(ExpertPlan) <= 4 * kPutWords, "a plan fits put_words");
 
 // Layer roles: the kv source whose compressed rows a layer reads, and the latest index source at or below it.
 int kv_source(int il) {
@@ -529,14 +530,13 @@ public:
             !alloc((void**) &ex_rows_, (size_t) kRows * g_.n_embd * 4) ||
             !alloc((void**) &ex_plan_, kPlanBytes) || !alloc((void**) &ex_plan2_, kPlanBytes))
             return oom(err);
-        // the plan and the CPU's rows are mapped host memory read by kernels: no copy-engine job queues behind the
-        // promotion copies, and the host sync at the top of each layer orders their reuse
+        // the hits plan of a token and the CPU's rows are mapped host memory read by kernels (a captured launch reads
+        // the plan at replay): no copy-engine job queues behind the promotion copies, and the host sync at the top of
+        // each layer orders their reuse; the other plans travel in a kernel's parameters
         constexpr unsigned kMapped = cudaHostAllocPortable | cudaHostAllocMapped;
-        if (cudaHostAlloc((void**) &h_plan_, kPlanBytes, kMapped) != cudaSuccess ||
-            cudaHostAlloc((void**) &h_plan2_, kPlanBytes, kMapped) != cudaSuccess ||
+        if (cudaHostAlloc((void**) &h_plan_, sizeof(ExpertPlan), kMapped) != cudaSuccess ||
             cudaHostAlloc((void**) &h_ids_, 64 * 4, kMapped) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d_plan_host_, h_plan_, 0) != cudaSuccess ||
-            cudaHostGetDevicePointer((void**) &d_plan2_host_, h_plan2_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d_ids_host_, h_ids_, 0) != cudaSuccess) {
             err = "deepseek41: cannot allocate the pinned expert staging";
             return false;
@@ -676,19 +676,20 @@ public:
             entries = ne;
             return ng;
         };
-        const auto gpu_share = [&](const void* host_plan, void* dev_plan, int ng, int ne) {
-            copy_words(host_plan, dev_plan, (int) (sizeof(WindowPlan) / 4), stream);
+        const auto gpu_share = [&](const WindowPlan& pl, void* dev_plan, int ng, int ne) {
+            put_words(&pl, dev_plan, (int) (sizeof(WindowPlan) / 4), stream);
             WindowPlan* dp = (WindowPlan*) dev_plan;
             kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok, ng, ne,
                                                    ex_xq_, ex_scr_, ex_rows_, stream);
         };
+        WindowPlan plan;
         int entries = 0;
-        const int nhits = make_plan(*(WindowPlan*) h_plan_, false, entries);
-        if (nhits) gpu_share(d_plan_host_, ex_plan_, nhits, entries);
+        const int nhits = make_plan(plan, false, entries);
+        if (nhits) gpu_share(plan, ex_plan_, nhits, entries);
         if (n_fetched) {
-            const int ng = make_plan(*(WindowPlan*) h_plan2_, true, entries);
+            const int ng = make_plan(plan, true, entries);
             tier_->await_fetch(st);
-            gpu_share(d_plan2_host_, ex_plan2_, ng, entries);
+            gpu_share(plan, ex_plan2_, ng, entries);
         }
         // the CPU's share runs while the GPU works; its rows land in their rows
         if (nhits + n_fetched < nu) {
@@ -804,9 +805,10 @@ public:
             gpu_share();
         }
         if (n_fetched) {
-            make_plan(*h_plan2_, true);
+            ExpertPlan plan2;
+            make_plan(plan2, true);
             tier_->await_fetch(st);
-            copy_words(d_plan2_host_, ex_plan2_, (int) (sizeof(ExpertPlan) / 4), stream);
+            put_words(&plan2, ex_plan2_, (int) (sizeof(ExpertPlan) / 4), stream);
             ExpertPlan* dp = (ExpertPlan*) ex_plan2_;
             kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok, n_fetched,
                                                    n_fetched, ex_xq_, ex_scr_, ex_rows_, stream);
@@ -873,9 +875,8 @@ private:
     void *xq_ = nullptr, *xq2_ = nullptr, *cws_ = nullptr, *iws_ = nullptr;
     float *kvraw_ = nullptr, *qr_ = nullptr, *q_ = nullptr, *attn_ = nullptr, *oa_ = nullptr, *mws_ = nullptr;
     void *ex_plan_ = nullptr, *d_plan_host_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr;
-    void *ex_plan2_ = nullptr, *d_plan2_host_ = nullptr;
+    void* ex_plan2_ = nullptr;
     bool ids_read_ = false;   ///< this layer took the mapped ids and has not cleared them yet
-    ExpertPlan* h_plan2_ = nullptr;
     float* ex_rows_ = nullptr;
     ExpertPlan* h_plan_ = nullptr;
     float *h_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr, *d_x_host_ = nullptr;
