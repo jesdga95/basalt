@@ -93,10 +93,16 @@ means it excludes 0.
 | prompt path against decode | -0.0000 [-0.0010, +0.0009] | +0.13 | lossless |
 | verify window width, T 1 against T 3 | 0 | 0 | lossless, 5,100 of 5,100 rows bitwise equal |
 | fp16 against fp32 indexer keys (below 2,048 tokens) | 0 | 0 | no effect, 25,500 of 25,500 rows equal |
+| Q5_0 down layers on MMQ prefill and the device-planned decode tail, against the dequant GEMM and the host-planned tail: UD-Q3_K_XL (20 such layers) | -0.0005 [-0.0014, +0.0005] | +0.17 | lossless |
+| the same on UD-Q2_K_XL (one such layer) | +0.0004 [-0.0006, +0.0013] | -0.03 | lossless |
 
 All roundings off at once (BF16 dense, fp32 activations everywhere, fp16 KV, exact math): PPL 3.2866 against 3.2975 default,
 KLD 0.05308 against 0.06213, top-1 92.55% against 91.59%. Removing every rounding lowers KLD by about 0.009 (15%). The Q8_0-dense
 pack alone gives -0.0059 of that. The Q8_0-dense pack is about 7% slower on prose and 3% on struct than the default.
+
+The Q5_0 rows: KLD 0.0943 against 0.0948 on UD-Q3_K_XL, 0.1520 against 0.1517 on UD-Q2_K_XL, tiers auto-sized. The
+device-planned tail runs only when every layer's expert formats are in it, so on these packs the decode rounding moves as well as
+the prompt's.
 
 ## 6-bit dense projections
 
