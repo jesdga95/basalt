@@ -58,12 +58,15 @@ const char* name_of(int t) {
         case 16: return "IQ2_XXS";
         case 17: return "IQ2_XS";
         case 18: return "IQ3_XXS";
+        case 19: return "IQ1_S";
         case 20: return "IQ4_NL";
         case 21: return "IQ3_S";
         case 22: return "IQ2_S";
         case 23: return "IQ4_XS";
         case 29: return "IQ1_M";
         case 42: return "Q2_0";
+        case 10: return "Q2_K";
+        case 11: return "Q3_K";
         case 12: return "Q4_K";
         case 13: return "Q5_K";
         case 14: return "Q6_K";
@@ -99,6 +102,13 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
             // exponent's top bits in the last: 0x1 / 0x2 there (0x9 / 0xA negative) keeps it in 2^-11 .. 2^-3
             const uint8_t nib = (uint8_t) ((sgn(rng) ? 0x8 : 0x0) | (1 + (byte(rng) & 1)));
             w[o + 55] = (uint8_t) ((w[o + 55] & 0x0F) | (nib << 4));
+        } else if (t == 10 || t == 11) {
+            // Q2_K {d, dmin} at offset 80, Q3_K {d} at 108: the fp16 scales end the block, 2^-14 .. 2^-11
+            const size_t at = t == 10 ? 80 : 108;
+            for (int j = 0; j < (t == 10 ? 2 : 1); ++j) {
+                const uint16_t h = (uint16_t) ((sgn(rng) ? 0x8000 : 0) | ((1 + ex(rng) % 4) << 10) | man(rng));
+                std::memcpy(&w[o + at + 2 * j], &h, 2);
+            }
         } else if (t == 14) {
             // Q6_K: the fp16 scale ends the block (offset 208); the codes and the int8 sub-scales stay random
             const uint16_t h = (uint16_t) ((sgn(rng) ? 0x8000 : 0) | ((1 + ex(rng) % 4) << 10) | man(rng));
@@ -569,10 +579,12 @@ int main(int argc, char** argv) {
         std::printf("native_grouped_parity: %d failures\n", g_fail);
         return g_fail ? 1 : 0;
     }
-    for (int gu : {16, 17, 18, 21, 22, 23, 29, 42, 12, 13, 14, 8})        // GU_FMTS
-        for (int dt : {20, 23, 42, 7, 6, 8}) check(gu, dt, 512, 256, s, rng);   // D_FMTS; IQ4_XS: n_ff % 256
+    for (int gu : {16, 17, 18, 21, 22, 23, 29, 42, 10, 11, 12, 13, 14, 8})        // GU_FMTS
+        for (int dt : {20, 23, 42, 7, 6, 8, 10, 11, 18}) check(gu, dt, 512, 256, s, rng);   // D_FMTS; 256-value blocks: n_ff % 256
     check(14, 8, 2560, 640, s, rng);                                    // Q6_K gate/up, a model's shape
     for (int gu : {22, 18, 23}) check(gu, 6, 2560, 640, s, rng);        // Q5_0 down at a model's shape
+    for (int dt : {10, 11, 18, 22}) check(19, dt, 5120, 2304, s, rng);  // 5120 x 2304 experts: IQ1_S gate/up, K-quant / i-quant down
+    check(16, 10, 5120, 2304, s, rng);
     check(40, 40, 512, 256, s, rng);                                    // NVFP4: its own pair, with the scale tail
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(40, 40, 2560, 640, s, rng);
