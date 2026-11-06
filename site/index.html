@@ -179,6 +179,7 @@ p.lede code { font-family: var(--font-mono); color: var(--fg); background: var(-
     <input id="q" type="search" placeholder="Search GPU, quant, submitter…" aria-label="Search">
     <div class="ms" id="f-gpu"></div>
     <div class="ms" id="f-n"></div>
+    <div class="ms" id="f-model"></div>
     <div class="ms" id="f-quant"></div>
     <div class="ms" id="f-os"></div>
     <div class="sort"><div class="ms" id="f-sort"></div><button id="sortdir" type="button"></button></div>
@@ -229,12 +230,13 @@ const SORTS = [
   { key: "_power", label: "Total power", num: true },
   { key: "ram_gib", label: "RAM", num: true },
   { key: "_rig", label: "GPUs" },
+  { key: "model", label: "Model" },
   { key: "quant", label: "Quant" },
   { key: "os", label: "System" },
   { key: "date", label: "Date" },
   { key: "submitter", label: "Submitter" },
 ];
-const SEARCH = ["_rig", "cpu", "quant", "os", "submitter", "commit", "date", "preset", "notes"];
+const SEARCH = ["_rig", "cpu", "model", "quant", "kv", "os", "submitter", "commit", "date", "preset", "notes"];
 
 const filters = {};
 function multiSelect(id, all, options) {
@@ -368,6 +370,7 @@ function rig(r, i) {
   return r;
 }
 
+function modelPill(r) { const p = el("span", "pill", r.model); p.title = r.model; return p; }
 function quantPill(r, cls) { const p = el("span", "pill " + (cls || ""), r.quant); p.title = r.quant; return p; }
 
 // Notes: clamped to two lines; the toggle appears only when the text overflows.
@@ -401,7 +404,7 @@ function render(keepPage) {
   const q = $("q").value.trim().toLowerCase();
   const shown = runs.filter(r =>
     any("f-gpu", v => r._names.includes(v)) && any("f-n", v => v === String(Math.min(r._n, 3))) &&
-    any("f-quant", v => r.quant === v) && any("f-os", v => r.os === v) &&
+    any("f-model", v => r.model === v) && any("f-quant", v => r.quant === v) && any("f-os", v => r.os === v) &&
     (!q || SEARCH.some(k => String(r[k] ?? "").toLowerCase().includes(q))));
   shown.sort((a, b) => {
     const x = a[sort.key], y = b[sort.key];
@@ -482,6 +485,7 @@ fetch("benchmarks.json").then(r => r.json()).then(data => {
   multiSelect("f-gpu", "All GPUs", countBy(runs.flatMap(r => [...new Set(r._names)])));
   multiSelect("f-n", "Any GPU count", countBy(runs.map(r => String(Math.min(r._n, 3))))
     .map(o => ({ ...o, label: o.value === "1" ? "1 GPU" : o.value === "3" ? "3+ GPUs" : o.value + " GPUs" })));
+  multiSelect("f-model", "All models", countBy(runs.map(r => r.model)));
   multiSelect("f-quant", "All quants", countBy(runs.map(r => r.quant)));
   multiSelect("f-os", "All systems", countBy(runs.map(r => r.os)));
   setupSort(); render();
@@ -495,7 +499,7 @@ function buildHead(r) {
   const m = el("div", "m2");
   const sub = el("span", "sub");
   rich(sub, [...(r._n > 1 ? [r._n + " GPUs · "] : []), [f0(r._vram) + " GiB"], " · ", [f0(r._power) + " W"]]);
-  m.append(quantPill(r), sub);
+  m.append(modelPill(r), quantPill(r), sub);
   id.append(gpu, m);
   const stats = el("div", "stats");
   stats.append(st("Prefill 16K", f0(r.prefill_16k_tps)), st("Prefill 64K", f0(r.prefill_64k_tps)), st("Decode tok/s", f1(r.decode_tps), true));
@@ -517,7 +521,7 @@ function buildDetail(r) {
   });
   bars.append(segs, labels);
   d.append(bars);
-  const hw = [];
+  const hw = [["Model", r.model], ["KV cache", r.kv]];
   if (r.cpu) hw.push(["CPU", r.cpu]);
   if (r.ram_gbps != null) hw.push(["RAM read", f1(r.ram_gbps) + " GB/s"]);
   r.gpus.forEach(x => {
