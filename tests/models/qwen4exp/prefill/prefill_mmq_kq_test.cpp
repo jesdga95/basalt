@@ -1,5 +1,5 @@
-// prefill_mmq_kq_test - llama.cpp's MMQ for the K-quant expert formats (gate/up Q4_K, Q5_K or Q6_K, down Q5_1 or Q8_0: the
-// UD-Q4_K_XL pack's layers) on random native expert blobs at the model's geometry (2560 x 640), against
+// prefill_mmq_kq_test - llama.cpp's MMQ for the K-quant expert formats (gate/up Q4_K, Q5_K or Q6_K, down Q5_1, Q5_0 or
+// Q8_0: the UD packs' layers) on random native expert blobs at the model's geometry (2560 x 640), against
 //   - a double-precision reference: the weights dequantized by ggml's own to_float, times the FP32 activations, and
 //   - the path these formats took before: each expert dequantized to FP16 (iq_dequant_gu_f16 / iq_dequant_f16), FP16
 //     activations, two cuBLAS products and the FP16 SwiGLU, as expert_mmq.cpp runs it.
@@ -68,7 +68,7 @@ struct Geo {
     }
 };
 
-// random blocks with sane fp16 scales: Q6_K (scales and d set below), Q4_K/Q5_K {d, dmin} at the block's start, Q5_1 {d, m}, Q8_0 {d}; sized so
+// random blocks with sane fp16 scales: Q6_K (scales and d set below), Q4_K/Q5_K {d, dmin} at the block's start, Q5_1 {d, m}, Q5_0 / Q8_0 {d}; sized so
 // the weights' typical magnitude is that of a 4-5 bit expert (a few hundredths), and with the minimum at about the
 // codes' mean times the scale, so the weights are centred on zero as a trained matrix's are
 void fill_matrix(uint8_t* m, ggml_type t, int64_t rows, int64_t cols, std::mt19937& rng) {
@@ -546,6 +546,7 @@ int main(int argc, char** argv) {
             else throw std::runtime_error(std::string("unknown argument ") + argv[i]);
         }
         const Pair pairs[] = {{GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, "Q4_K / Q5_1"},
+                              {GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, "Q4_K / Q5_0"},
                               {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, "Q4_K / Q8_0"},
                               {GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, "Q5_K / Q8_0"},
                               {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, "Q6_K / Q8_0"}};
