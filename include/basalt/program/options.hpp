@@ -74,6 +74,7 @@ struct CommonOptions {
     bool gpu_plan = false;
     std::string arch;                  ///< the --model file's architecture
     std::string ppl_base, ppl_out;     ///< --ppl-base, --ppl-out
+    std::string model_name;            ///< the adapter's community-row name, for --gpu-plan
     std::string quality_flags;         ///< the flags the quality gate starts this model with, for --gpu-plan
     int quality_window = 1;            ///< the widest window the gate scores on this model (0: as the request asks)
     int plan_spec = 0;                 ///< the verify window this start would run, for --gpu-plan (0: plain decode)
