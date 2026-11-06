@@ -134,7 +134,8 @@ public:
         if (!drafter_) return {model::Status::NotImplemented, "deepseek41: no drafter is loaded"};
         std::string err;
         ops_->commit_window(pos, stream_);
-        if (!flush_features(pos, err) || !drafter_->draft_begin(anchor, pos, err)) return {model::Status::Error, err};
+        if (!flush_features(pos, err) || !drafter_->draft_begin(anchor, pos, std::min(max_window() - 1, kDsparkBlock), err))
+            return {model::Status::Error, err};
         return {};
     }
 
@@ -143,7 +144,7 @@ public:
         std::string err;
         DsparkDraft d;
         if (!drafter_->draft_end(d, err)) return {model::Status::Error, err};
-        n = std::min(max_n, kDsparkBlock);
+        n = std::min(max_n, d.n);
         std::copy(d.token, d.token + n, ids);
         std::copy(d.conf, d.conf + n, conf);
         return {};
