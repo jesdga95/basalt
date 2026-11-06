@@ -124,11 +124,11 @@ std::vector<uint8_t> nvfp4_blobs(const K::NativeExpertLayout& L, int nx, std::mt
 }
 
 // NX synthetic blobs of the K-quant, i-quant and Q8_0 formats (Q4_K / Q5_K / Q8_0 / IQ3_S / IQ4_XS gate/up,
-// Q5_1 / Q8_0 down): random bytes, then finite small fp16 block scales (the first two halves of each block; Q8_0
-// and the two i-quants have one, the i-quants' at the super-block's end)
+// Q5_1 / Q8_0 / Q5_0 down): random bytes, then finite small fp16 block scales (the first two halves of each block;
+// Q8_0 and Q5_0 have one at the block's head, the two i-quants' at the super-block's end)
 void kq_fix_scales(uint8_t* p, size_t bytes, int type, std::mt19937& rng) {
     const size_t bs = type == 12 ? 144 : type == 13 ? 176 : type == 14 ? 210 : type == 21 ? 130 : type == 23 ? 146
-                      : type == 7 ? 24 : 34;
+                      : type == 7 ? 24 : type == 6 ? 22 : 34;
     std::uniform_int_distribution<int> ex(2, 5), man(0, 1023);
     for (size_t o = 0; o + bs <= bytes; o += bs) {
         if (type == 14 || type == 21 || type == 23) {   // Q6_K / IQ3_S / IQ4_XS: the fp16 scale ends the block
@@ -136,7 +136,7 @@ void kq_fix_scales(uint8_t* p, size_t bytes, int type, std::mt19937& rng) {
             std::memcpy(p + o + bs - 2, &h, 2);
             continue;
         }
-        for (int j = 0; j < (type == 8 ? 1 : 2); ++j) {
+        for (int j = 0; j < (type == 8 || type == 6 ? 1 : 2); ++j) {
             const uint16_t h = (uint16_t) ((ex(rng) << 10) | man(rng));
             std::memcpy(p + o + 2 * j, &h, 2);
         }
@@ -542,8 +542,8 @@ int main(int argc, char** argv) {
     if (nvfp4) { fmt[0] = {40, 40}; auto_layers.push_back(0); layers.clear(); }
     if (kq) {
         fmt[0] = {12, 7}; fmt[1] = {12, 8}; fmt[2] = {13, 8}; fmt[3] = {8, 8}; fmt[4] = {14, 8};
-        fmt[5] = {21, 8}; fmt[6] = {23, 8};
-        auto_layers = {0, 1, 2, 3, 4, 5, 6}; stress_n = 0;
+        fmt[5] = {21, 8}; fmt[6] = {23, 8}; fmt[7] = {18, 6}; fmt[8] = {23, 6};
+        auto_layers = {0, 1, 2, 3, 4, 5, 6, 7, 8}; stress_n = 0;
     }
     for (int l = 0; !synth && l < 64; ++l) {
         const basalt::GgufFile& gguf = *gguf_p;

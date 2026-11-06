@@ -1140,6 +1140,47 @@ template<> struct Split<7> {   // Q5_1
         return sumi * (r.dm.x * d8) + sumu * (r.dm.y * d8);
     }
 };
+template<> inline constexpr bool kSplit<6> = true;
+template<> struct Split<6> {   // Q5_0: vec_dot_q5_0_q8_1's arithmetic, the nibbles cached in W.  block_q5_0 here is the
+                               // 22-byte 32-value sub-block, so the weight loads are get_int_b2 like the production dot
+    struct W { int vi0[VDR_Q5_0], vi1[VDR_Q5_0]; float d5; };
+    template<bool STAGE_GRID = false>
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
+        const block_q5_0* bq5_0 = (const block_q5_0*) vbq + kbx;
+        W r;
+#pragma unroll
+        for (int i = 0; i < VDR_Q5_0; ++i) {
+            const int vl = get_int_b2(bq5_0->qs, iqs + i);
+            const int vh = get_int_b2(bq5_0->qh, 0) >> (4 * (iqs + i));
+            int vi0 = (vl >> 0) & 0x0F0F0F0F;
+            vi0 |= (vh << 4) & 0x00000010;
+            vi0 |= (vh << 11) & 0x00001000;
+            vi0 |= (vh << 18) & 0x00100000;
+            vi0 |= (vh << 25) & 0x10000000;
+            int vi1 = (vl >> 4) & 0x0F0F0F0F;
+            vi1 |= (vh >> 12) & 0x00000010;
+            vi1 |= (vh >> 5) & 0x00001000;
+            vi1 |= (vh << 2) & 0x00100000;
+            vi1 |= (vh << 9) & 0x10000000;
+            r.vi0[i] = vi0;
+            r.vi1[i] = vi1;
+        }
+        r.d5 = __half2float(bq5_0->d);
+        return r;
+    }
+    __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
+        int sumi = 0;
+#pragma unroll
+        for (int i = 0; i < VDR_Q5_0; ++i) {
+            const int u0 = get_int_b4(bq8_1->qs, iqs + i), u1 = get_int_b4(bq8_1->qs, iqs + i + QI5_0);
+            sumi = ggml_cuda_dp4a(r.vi0[i], u0, sumi);
+            sumi = ggml_cuda_dp4a(r.vi1[i], u1, sumi);
+        }
+        const float d8 = __low2float(bq8_1->ds);
+        const float s8 = __high2float(bq8_1->ds);
+        return r.d5 * (sumi * d8 - (16.0f * VDR_Q5_0 / QI5_0) * s8);
+    }
+};
 template<> inline constexpr bool kSplit<8> = true;
 template<> struct Split<8> {   // Q8_0
     struct W { int q[VDR_Q8_0]; float d; };
@@ -1188,8 +1229,8 @@ template<> struct Split<40> {   // NVFP4: vec_dot_nvfp4_q8_1 split; the per-expe
 
 // Down formats whose row is K = 40 calls (n_ff 640): IQ4_NL, Q5_1 (32-value blocks, two calls) and NVFP4 (64-value
 // blocks, four): eight lanes a row.
-template<int TD> inline constexpr bool kDown40 = TD == 20 || TD == 40 || TD == 7;
-__host__ __device__ constexpr bool kDown40Type(int t) { return t == 20 || t == 40 || t == 7; }
+template<int TD> inline constexpr bool kDown40 = TD == 20 || TD == 40 || TD == 7 || TD == 6;
+__host__ __device__ constexpr bool kDown40Type(int t) { return t == 20 || t == 40 || t == 7 || t == 6; }
 
 // One row against the n <= NC activations x + off[0..n) (n >= 1, warp-uniform; offsets in q8_1 blocks, 32-bit to
 // spare registers), the whole warp.  Per activation this is row_dot: the same calls k, lane-strided the same way,
