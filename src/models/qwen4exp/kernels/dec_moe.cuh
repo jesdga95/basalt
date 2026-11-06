@@ -2178,7 +2178,7 @@ void dec_moe_stage(const DmRouteArgs& a, uint8_t* staging, int64_t stride, int64
 
 bool dec_moe_glue_ok(const NativeExpertLayout& L) {
     const bool tg = L.gu_type == 16 || L.gu_type == 17 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 ||
-                    L.gu_type == 42;
+                    L.gu_type == 23 || L.gu_type == 42;
     bool td = false;
     switch (L.d_type) {
 #define DM_OK(T) case T: td = kSplit<T>; break;
@@ -2218,6 +2218,7 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scr
         case 18: go(dm_glue_gu_kernel<18>, dm_glue_blocks<18>()); break;
         case 21: go(dm_glue_gu_kernel<21>, dm_glue_blocks<21>()); break;
         case 22: go(dm_glue_gu_kernel<22>, dm_glue_blocks<22>()); break;
+        case 23: go(dm_glue_gu_kernel<23>, dm_glue_blocks<23>()); break;
         case 42: go(dm_glue_gu_kernel<42>, dm_glue_blocks<42>()); break;
         default: basalt::log::error("basalt", "dec_moe_glue: gate/up %d", L.gu_type); std::exit(1);
     }
