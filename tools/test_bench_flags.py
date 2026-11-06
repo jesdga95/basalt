@@ -45,7 +45,9 @@ class BenchFlags(unittest.TestCase):
         # Every flag the help lists is one the engine parser accepts; an empty or cut-short list would make the
         # per-flag test vacuous.
         flags = engine_flags()
-        parsed = set(re.findall(r'a == "(--[a-z0-9-]+)"', (ROOT / "src/program/cli/arguments.cpp").read_text()))
+        sources = [ROOT / "src/program/cli/arguments.cpp", *sorted((ROOT / "src/models").glob("*/flags.cpp")),
+                   *sorted((ROOT / "src/models").glob("*/adapter.cpp"))]
+        parsed = {f for s in sources for f in re.findall(r'a == "(--[a-z0-9-]+)"', s.read_text())}
         self.assertTrue(parsed)
         self.assertEqual(sorted(set(flags) - parsed), [])
         for known in ("--spec", "--kv", "--max-context", "--gpu"):

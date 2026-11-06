@@ -55,6 +55,15 @@ private:
     size_t rpos_ = 0;
 };
 
+/// Asks the engine about `args` without starting it (--gpu-plan): its exit code and answer line, -1 when it cannot run.
+/// A flag this model does not take is a nonzero code. stderr goes to `log_path`.
+int engine_plan(const std::string& engine_bin, const std::vector<std::string>& args, const std::string& log_path,
+                std::string& answer);
+/// A string field of the plan's answer; empty without it.
+std::string plan_field(const std::string& plan_answer, const std::string& name);
+/// `dir`/<arch> when the model has its own fixtures there, else `dir`.
+std::string fixtures_for(const std::string& dir, const std::string& plan_answer);
+
 std::vector<std::string> split(const std::string& s, char sep);
 bool all_digits(const std::string& s);
 /// "16384", "32k" to tokens: k is 1024, except a number that rounds in thousands to a power of two is that power

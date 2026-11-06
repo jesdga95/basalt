@@ -920,6 +920,98 @@
       "decode_tps": 186.8
     },
     {
+      "submitter": "Redhot-Local",
+      "date": "2026-11-04",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.8
+        }
+      ],
+      "ram_gib": 62,
+      "cpu": "AMD Ryzen 9 9900X, 12 cores",
+      "ram_gbps": 75.2,
+      "os": "Linux",
+      "quant": "IQ3_S",
+      "prefill_16k_tps": 2531.6,
+      "prefill_64k_tps": 2521.6,
+      "decode_tps": 159.0,
+      "notes": "Single RTX 5060 Ti 16GB, 2x32GB DDR5-6000, no desktop environment"
+    },
+    {
+      "submitter": "Serpov",
+      "date": "2026-11-04",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 250,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.7
+        },
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 250,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.8
+        },
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 250,
+          "pcie": "4.0 x4",
+          "h2d_gbps": 6.5
+        },
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 250,
+          "pcie": "4.0 x4",
+          "h2d_gbps": 7.0
+        }
+      ],
+      "ram_gib": 92,
+      "cpu": "Intel Core Ultra 7 270K Plus, 24 cores",
+      "ram_gbps": 101.0,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 4841.8,
+      "prefill_64k_tps": 5023.2,
+      "decode_tps": 315.6,
+      "notes": "4x RTX 5070 Ti at a 250 W limit (300 W default); two cards on chipset 4.0 x4 slots; resident experts, 0 SSD spill"
+    },
+    {
+      "submitter": "WenbinHuang",
+      "date": "2026-11-05",
+      "commit": "dc047a77be",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 43.1
+        }
+      ],
+      "ram_gib": 64,
+      "cpu": "13th Gen Intel Core i7-13700K, 16 cores",
+      "ram_gbps": 70.2,
+      "os": "Windows",
+      "quant": "IQ3_S",
+      "prefill_16k_tps": 3976.2,
+      "prefill_64k_tps": 4589.6,
+      "decode_tps": 137.5
+    },
+    {
       "submitter": "wadeubuntu",
       "date": "2026-11-05",
       "commit": "dc047a77be",

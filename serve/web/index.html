@@ -14,10 +14,16 @@
 
 <header class="bar">
   <div class="brand"><img src="web/mark.svg" alt=""><span class="wordmark">Basalt</span></div>
-  <span class="model" id="model"></span>
+  <div class="crumb">
+    <span class="crumb-sep" id="crumb-sep" hidden>/</span>
+    <span class="model" id="model"></span>
+    <div class="ms" id="models" hidden></div>
+  </div>
   <span class="grow"></span>
-  <span class="state" id="state" data-s="offline">Connecting</span>
-  <span class="where detail" id="detail" hidden></span>
+  <span class="sp">
+    <span class="lab"><span class="state" id="state" data-s="offline">Connecting</span><span class="state" id="pct" data-s="loading" hidden></span></span>
+    <span class="pbar" id="pbar" hidden><i></i></span>
+  </span>
   <span class="where" id="host"></span>
   <span class="where" id="keyed" hidden>API key</span>
 </header>
@@ -37,7 +43,7 @@
       <div class="sb-body" id="sys"></div>
     </div>
     <div class="sb-exp">
-      <div class="sb-h">Experts<span>Last request</span></div>
+      <div class="sb-h">Experts<span id="exp-note">Last request</span></div>
       <div class="sb-body" id="experts"></div>
     </div>
   </aside>

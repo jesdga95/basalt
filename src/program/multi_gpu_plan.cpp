@@ -8,7 +8,7 @@
 namespace basalt::program {
 
 namespace {
-// Window model, fitted to cold decode windows of the daily pack on one card, on two unlike cards and on the layer split:
+// Window model, fitted to cold decode windows of one pack on one card, on two unlike cards and on the layer split:
 //   ms = gpu bytes / bandwidth  +  host tail of the experts no card holds
 // The experts are ranked by use, and the share of reads the hottest `c` of all pairs serve is taken as c^kHitExponent.
 constexpr double kGpuGB = 11.9;          // bytes a window moves on its GPUs at the rate the kernels reach, per window
@@ -99,7 +99,7 @@ MgPlan plan_multi_gpu(const std::vector<GpuCard>& cards, const MgModel& m) {
     // exchanges between the cards; the experts stay as in the expert tier
     const double dense_saving = kDenseShare * kGpuGB * (1.0 / bw[0] - 1.0 / total_bw) * 1000.0;
     const double exchange = (double) m.layers * m.tp_exchanges_per_layer * (double) (n - 1) * kExchangeUs *
-                            (m.tokens * 2560.0 * 4.0 / 10240.0) / 1000.0;
+                            (m.tokens * m.exchange_mib_per_token) / 1000.0;
     MgPrice tp{Mechanism::TensorParallel, false, tier.ms - dense_saving + exchange};
     plan.prices = {tier, split, tp};
     plan.pick = Mechanism::ExpertTier;

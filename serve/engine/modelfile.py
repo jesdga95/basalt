@@ -7,11 +7,13 @@ import shutil
 import struct
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 from model_file import ModelFile  # noqa: E402
+from serve.models import dialect_for  # noqa: E402
 from serve.engine.flags import flag_value  # noqa: E402
 
 VISION_EXE = "basalt-vision"
@@ -121,22 +123,42 @@ def vision_config(mf: ModelFile, engine_bin: str, sidecar: bool = True) -> dict:
     return {"vision_bin": str(side), "mmproj": str(mmproj), "model": str(vocab)}
 
 
-def model_config(path: str, engine_bin: str, vision: bool | str = False,
-                 engine_words: list[str] | None = None) -> dict:
-    """The engine settings the file implies; `engine_words` follow its arguments as given (the engine's parser lets a
-    later flag win), `vision` (a GPU number as a string, or "cpu") adds the sidecar and "dynamic" the in-engine
-    encoder (ValueError if it cannot be set up)."""
+@dataclass(frozen=True)
+class ModelSpec:
+    """One model the server runs. `engine_words` are its engine flags as given. `vision`: a GPU number as a string, "cpu"
+    or "dynamic". `gpu`: as --gpu."""
+    path: str
+    alias: str | None = None
+    gpu: object = None
+    vision: bool | str = False
+    engine_words: tuple[str, ...] = ()
+
+
+def model_config(spec: ModelSpec, engine_bin: str) -> dict:
+    """The engine settings a model implies; its `engine_words` follow its arguments as given (the engine's parser lets
+    a later flag win), its `vision` adds the sidecar or, "dynamic", the in-engine encoder (ValueError if it cannot be
+    set up)."""
+    path, vision = spec.path, spec.vision
     mf = ModelFile(path)
     meta = json.loads(mf.read("meta"))
     path = os.path.abspath(path)
     cdir = cache_dir(mf)
-    words = with_conversation_dir(list(engine_words or []), cdir)
+    words = with_conversation_dir(list(spec.engine_words), cdir)
     args = ["--model", path]   # settings come from the engine defaults and the server
     args += words
     cdir.mkdir(parents=True, exist_ok=True)
-    cfg = {"engine_bin": os.path.abspath(engine_bin), "args": args, "model_name": meta.get("name") or "basalt",
-           "sampling": sampling_defaults(meta), "log": str(cdir / "engine.log"),
+    cfg = {"engine_bin": os.path.abspath(engine_bin), "args": args, "model_name": spec.alias or meta.get("name") or "basalt",
+           "sampling": sampling_defaults(meta),
+           "arch": (meta.get("gguf_kv") or {}).get("general.architecture"), "log": str(cdir / "engine.log"),
            "tokenizer": str(extract_tokenizer(mf))}
+    if vision and dialect_for(cfg["arch"]).in_engine_vision:
+        if vision != "dynamic":
+            raise ValueError(f"this model's images are encoded in the engine: --vision dynamic, not {vision}")
+        if "vision/mmproj" not in mf.sections:
+            raise ValueError("this model file has no vision projector (vision/mmproj); drop --vision")
+        args.append("--vision")
+        cfg["vision"] = {"mmproj": "", "mode": "dynamic", "gpu": True}
+        return cfg
     v = vision_config(mf, engine_bin, sidecar=vision != "dynamic") if vision else None
     if v:
         v["mode"] = vision

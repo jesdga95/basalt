@@ -9,7 +9,7 @@
 
 namespace basalt::program::cli {
 
-std::optional<int> select_gpus(Options& o, std::vector<GpuCard>& chosen_cards, int max_expert_tiers) {
+std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_cards, int max_expert_tiers) {
     namespace bp = basalt::program;
     bp::GpuSpec spec;
     std::string gerr;
@@ -27,7 +27,7 @@ std::optional<int> select_gpus(Options& o, std::vector<GpuCard>& chosen_cards, i
     const std::vector<bp::GpuCard> visible = bp::visible_gpus(known);
     const bp::GpuChoice choice = bp::choose_gpus(spec, visible, known);
     if (o.gpu_plan) {
-        std::printf("%s\n", bp::gpu_plan_json(visible, choice).c_str());
+        std::printf("%s\n", bp::gpu_plan_json(visible, choice, o.arch, o.quality_flags, o.quality_window, o.plan_spec, o.max_context).c_str());
         return choice.error.empty() ? 0 : 2;
     }
     if (!choice.error.empty()) { basalt::log::error("basalt", "%s", choice.error.c_str()); return 2; }

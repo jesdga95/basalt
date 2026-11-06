@@ -1,0 +1,474 @@
+// src/models/qwen4exp/kernels/ngram.cpp - the PLE n-gram hash and the IQ4_NL table read.
+//
+// See include/basalt/models/qwen4exp/kernels/ngram.hpp for the semantics, the rival readings, and the note on MADV_RANDOM.
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
+#include "basalt/core/load_progress.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/artifact/dequant.hpp"
+#include "basalt/kernels/f16_bits.hpp"
+#include "basalt/ngram/ple_reader.hpp"
+#include "basalt/platform/mapped_file.hpp"
+#include "basalt/platform/memory.hpp"
+
+#include <cerrno>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <atomic>
+#include <mutex>
+#include <vector>
+#include <stdexcept>
+#include "basalt/log.hpp"
+
+
+namespace basalt::kernels {
+
+PleConsts ple_artifact_consts() {
+    // the GGUF metadata, verbatim.  Written once here rather than derived, because `head_offsets` is
+    // ALSO in the metadata as its own array - and deriving one from the other would hide a mismatch between
+    // them instead of surfacing it.  The parity test checks the two agree.
+    PleConsts c{};
+    c.mult[0] = 23703573157769ull;
+    c.mult[1] = 20109073645365ull;
+    c.mult[2] = 8052911324071ull;
+    const uint64_t vocab[PLE_N_HEADS] = {
+        20000003, 20000023, 20000033, 20000047, 20000059, 20000063, 20000069, 20000077,
+        20000081, 20000093, 20000107, 20000147, 20000153, 20000159, 20000161, 20000171};
+    const uint64_t offset[PLE_N_HEADS] = {
+        0,        20000003, 40000026, 60000059, 80000106, 100000165, 120000228, 140000297,
+        160000374, 180000455, 200000548, 220000655, 240000802, 260000955, 280001114, 300001275};
+    for (int i = 0; i < PLE_N_HEADS; ++i) {
+        c.vocab[i] = vocab[i];
+        c.offset[i] = offset[i];
+    }
+    return c;
+}
+
+uint64_t ngram_mixed(const int64_t* ctx, const uint64_t* mult, int n) {
+    // The first term is an ASSIGNMENT and the rest are XORed into it, which is how the source writes it
+    // (`uint64_t mixed = ctx[0]*m[0]; for j=1.. mixed ^= ctx[j]*m[j];`).  Every product wraps mod 2^64,
+    // which is what the `(uint64_t)` casts in the source make explicit.
+    uint64_t mixed = (uint64_t) ctx[0] * mult[0];
+    for (int j = 1; j < n; ++j) mixed ^= (uint64_t) ctx[j] * mult[j];
+    return mixed;
+}
+
+void ngram_rows(const int32_t* tokens, const int32_t* prev, int n_tokens, const PleConsts& c, uint32_t* out) {
+    const int n_prev = NGRAM_SIZE - 1;
+    for (int i = 0; i < n_tokens; ++i) {
+        int64_t ctx[NGRAM_SIZE];
+        ctx[0] = tokens[i];
+        bool cut = false;
+        for (int s = 1; s < NGRAM_SIZE; ++s) {
+            // `prev` is OLDEST FIRST, so predecessor `s` positions back is entry (n_prev - s): s=1 reads the
+            // NEWEST.  Reading index (s-1) instead walks the window backwards, which still produces indices
+            // in range and so cannot be caught by a range check - only by an oracle.
+            const int32_t t = cut ? TOKEN_NULL : prev[i * n_prev + (n_prev - s)];
+            // The cut is evaluated BEFORE the value is stored, so the position whose predecessor was EOS is
+            // itself EOS.  Storing first and then cutting would leave position s holding the real token while
+            // position s+1 became EOS - one token of history too much.
+            cut = cut || t < 0 || t == PLE_EOS_TOKEN_ID;
+            ctx[s] = cut ? PLE_EOS_TOKEN_ID : t;
+        }
+        for (int n = 2; n <= NGRAM_SIZE; ++n) {
+            const uint64_t mixed = ngram_mixed(ctx, c.mult, n);
+            const int base = (n - 2) * HEADS_PER_NGRAM;
+            for (int g = 0; g < HEADS_PER_NGRAM; ++g) {
+                const int h = base + g;
+                out[i * PLE_N_HEADS + h] = (uint32_t) (mixed % c.vocab[h] + c.offset[h]);
+            }
+        }
+    }
+}
+
+namespace {
+const int8_t kIq4Nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+}
+
+int iq4nl_code(int code) { return kIq4Nl[code & 15]; }
+
+void iq4nl_dequant_row(const uint8_t* row, float* out160) {
+    for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) {
+        const uint8_t* blk = row + (size_t) b * 18;
+        uint16_t dbits;
+        std::memcpy(&dbits, blk, 2);
+        const float d = f32_from_f16(dbits);
+        const uint8_t* qs = blk + 2;
+        // SPLIT HALVES: qs[j] holds elements j and j+16, not 2j and 2j+1.
+        for (int j = 0; j < 16; ++j) {
+            out160[b * 32 + j] = d * (float) kIq4Nl[qs[j] & 0x0F];
+            out160[b * 32 + j + 16] = d * (float) kIq4Nl[qs[j] >> 4];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
+enum class PleFormat { IQ4_NL, Q5_0, Q8_0 };
+
+struct PleTable::Impl {
+    GgufFile* file = nullptr;
+    const uint8_t* data = nullptr;
+    uint64_t n_rows = 0;
+    PleFormat fmt = PleFormat::IQ4_NL;
+    mutable std::atomic<uint64_t> bytes_read{0};
+    // Direct mode: the mapping above is released after the header parse and every row comes
+    // from an SSD read into `raw` (see PleReader).
+    PleIo mode = PleIo::Mmap;
+    basalt::ngram::PleReader reader;
+    // `ring_mu` guards the single-token slot (ticket, pending, rows) and the prefetch ring (n_prefetch,
+    // prefetch_tickets, prefetch_keys). It is held only to read or change those fields, never across a reader
+    // wait or an SSD read. The ring and the slot belong to the decode path; the prompt path uses `gather_rows`.
+    std::mutex ring_mu;
+    basalt::ngram::PleReader::Ticket ticket;
+    bool pending = false;
+    bool locked = false;
+    uint32_t rows[PLE_N_HEADS] = {};
+    uint8_t raw[PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
+    static constexpr size_t kMaxPrefetch = 16;
+    size_t n_prefetch = 0;
+    basalt::ngram::PleReader::Ticket prefetch_tickets[kMaxPrefetch] = {};
+    uint32_t prefetch_keys[kMaxPrefetch][PLE_N_HEADS] = {};
+    uint8_t prefetch_raw[kMaxPrefetch][PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
+    uint32_t rb = PLE_ROW_BYTES;      // bytes per row
+    void decode(const uint8_t* row, float* out160) const {
+        switch (fmt) {
+        case PleFormat::Q5_0:
+            for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) basalt::dequantize_q5_0(row + (size_t) b * 22, out160 + b * 32);
+            break;
+        case PleFormat::Q8_0:
+            for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) basalt::dequantize_q8_0(row + (size_t) b * 34, out160 + b * 32);
+            break;
+        default: iq4nl_dequant_row(row, out160); break;
+        }
+    }
+};
+
+PleTable::PleTable() : impl_(new Impl) {}
+PleTable::~PleTable() { close(); delete impl_; }
+
+bool PleTable::open(const std::string& gguf_path, std::string& err) {
+    return open(gguf_path, err, PleIoOptions{});
+}
+
+bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoOptions& io) {
+    close();
+    try {
+        impl_->file = new GgufFile(gguf_path);
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+    const TensorInfo* t = impl_->file->find("per_layer_token_embd.weight");
+    if (t == nullptr) {
+        err = "per_layer_token_embd.weight is not in " + gguf_path;
+        close();
+        return false;
+    }
+    // [160, 320001536]: ne0 = 160 is the FAST axis, so the ROW index is shape[1] and a row is contiguous.
+    if (t->shape.size() != 2 || t->shape[0] != (uint64_t) PLE_HEAD_DIM) {
+        err = "per_layer_token_embd.weight has an unexpected shape";
+        close();
+        return false;
+    }
+    // IQ4_NL, Q5_0 or Q8_0 rows
+    if (std::strcmp(t->type_name(), "IQ4_NL") == 0) impl_->fmt = PleFormat::IQ4_NL;
+    else if (std::strcmp(t->type_name(), "Q5_0") == 0) impl_->fmt = PleFormat::Q5_0;
+    else if (std::strcmp(t->type_name(), "Q8_0") == 0) impl_->fmt = PleFormat::Q8_0;
+    else {
+        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL, Q5_0 or Q8_0";
+        close();
+        return false;
+    }
+    impl_->rb = impl_->fmt == PleFormat::Q8_0 ? PLE_ROW_BYTES_Q8_0
+              : impl_->fmt == PleFormat::Q5_0 ? PLE_ROW_BYTES_Q5_0 : PLE_ROW_BYTES;
+    // PleReader's row_bytes is a runtime parameter: every format's rows go through the same generic path
+    // (ple_reader_test --selftest covers straddling, caching, in-flight tickets, keep-alive).
+    impl_->n_rows = t->shape[1];
+    impl_->data = impl_->file->tensor_data(*t);
+
+    // THE CHECK THAT MAKES THE OFFSET FALSIFIABLE.  The manifest's `shard2_tensor.offset` is 0, but that is
+    // the offset within the GGUF's DATA SECTION: the file's first 192 bytes are a header, and reading at 0
+    // would decode the header plus 192 bytes of shifted rows - still plausible IQ4_NL, and wrong for every
+    // row.  `GgufFile` parses the header, so `tensor_data` is already correct; this asserts the tensor
+    // exactly fills the file from there, which is what makes the whole arrangement checkable rather than
+    // assumed.  A wrong data offset would leave a different remainder.
+    // A shard may hold other tensors too (Swift 1.5's shard 1 holds layers 0-12 and the table): the table must
+    // then fit inside the file at its own offset; alone in its shard (the original's shard 2) it fills it exactly.
+    const uint64_t need = impl_->n_rows * (uint64_t) impl_->rb;
+    const uint64_t have = impl_->file->file_size() - impl_->file->data_start();
+    const bool alone = impl_->file->tensors().size() == 1;
+    if (alone ? need != have : t->offset + need > have) {
+        char buf[256];
+        std::snprintf(buf, sizeof buf,
+                      "PLE table size mismatch: %llu rows x %d B = %llu at offset %llu, but the file holds %llu from "
+                      "data_start %llu",
+                      (unsigned long long) impl_->n_rows, (int) impl_->rb, (unsigned long long) need,
+                      (unsigned long long) t->offset, (unsigned long long) have,
+                      (unsigned long long) impl_->file->data_start());
+        err = buf;
+        close();
+        return false;
+    }
+    if (io.mode == PleIo::Direct) {
+        // The parse above is the validated source of the offset; the mapping itself is not kept, so no page of
+        // the table can enter this process's working set or the file cache through it.
+        const uint64_t table_offset = impl_->file->data_start() + t->offset;
+        const uint64_t n_rows = impl_->n_rows;
+        delete impl_->file;
+        impl_->file = nullptr;
+        impl_->data = nullptr;
+        if (!impl_->reader.open(gguf_path, table_offset, n_rows, io.max_inflight, io.cache_rows, err,
+                                impl_->rb)) {
+            close();
+            return false;
+        }
+        impl_->reader.set_keepalive(io.keepalive_ms, io.keepalive_window_s);
+        impl_->n_rows = n_rows;
+    }
+    if (io.mode == PleIo::Mmap && io.lock && impl_->data != nullptr) {
+        const uint64_t page = 4096;
+        const uintptr_t a0 = (uintptr_t) impl_->data & ~(uintptr_t) (page - 1);
+        const uintptr_t a1 = (uintptr_t) impl_->data + (uintptr_t) need;
+        // The pages are asked for ahead and locked; where the OS refuses, touching them gets them resident, which is
+        // what the decode path needs.
+        // The bytes placed go out as the engine's load lines, under their own target (outside the model total).
+        basalt::core::LoadProgress prog("ngram", a1 - a0);
+        uint64_t reported = 0;
+        const basalt::platform::LockResult lr = basalt::platform::lock_view(
+            (void*) a0, a1 - a0, [&](uint64_t done) { prog.add(done - reported); reported = done; });
+        impl_->locked = lr.ok && lr.locked_bytes >= a1 - a0;
+        if (!impl_->locked) {
+            basalt::log::warn("basalt", "PLE table lock incomplete (%s): touching its pages instead",
+                         lr.note.c_str());
+            volatile uint8_t sink = 0;
+            for (uintptr_t p = a0 + (uintptr_t) reported; p < a1; p += page) {
+                sink = sink + *(const volatile uint8_t*) p;
+                if (((p - a0) & ((256u << 20) - 1)) == 0) { prog.add((p - a0) - reported); reported = p - a0; }
+            }
+            (void) sink;
+        }
+        prog.finish();
+    }
+    impl_->mode = io.mode;
+    return true;
+}
+
+void PleTable::wait_prefetches() {
+    basalt::ngram::PleReader::Ticket claimed[Impl::kMaxPrefetch];
+    size_t n = 0;
+    {
+        std::lock_guard<std::mutex> lk(impl_->ring_mu);
+        n = impl_->n_prefetch;
+        std::memcpy(claimed, impl_->prefetch_tickets, n * sizeof(claimed[0]));
+        impl_->n_prefetch = 0;
+    }
+    std::string dummy;
+    for (size_t i = 0; i < n; ++i) (void) impl_->reader.collect(claimed[i], dummy);
+}
+
+void PleTable::prefetch_rows(const uint32_t* rows16) {
+    if (impl_->mode != PleIo::Direct || !impl_->reader.is_open()) return;
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(impl_->ring_mu);
+            for (size_t i = 0; i < impl_->n_prefetch; ++i)
+                if (std::memcmp(impl_->prefetch_keys[i], rows16, sizeof(uint32_t) * PLE_N_HEADS) == 0) return;
+            if (impl_->n_prefetch < Impl::kMaxPrefetch) {
+                const size_t slot = impl_->n_prefetch++;
+                std::memcpy(impl_->prefetch_keys[slot], rows16, sizeof(uint32_t) * PLE_N_HEADS);
+                impl_->prefetch_tickets[slot] = impl_->reader.issue(impl_->prefetch_keys[slot], PLE_N_HEADS, impl_->prefetch_raw[slot]);
+                return;
+            }
+        }
+        wait_prefetches();    // the ring is full: drain it outside the lock, then take a slot
+    }
+}
+
+void PleTable::close() {
+    wait_prefetches();
+    impl_->reader.close();
+    impl_->pending = false;
+    impl_->locked = false;   // the unmap below releases the lock
+    impl_->mode = PleIo::Mmap;
+    delete impl_->file;
+    impl_->file = nullptr;
+    impl_->data = nullptr;
+    impl_->n_rows = 0;
+    impl_->rb = PLE_ROW_BYTES;
+    impl_->fmt = PleFormat::IQ4_NL;
+}
+
+bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
+bool PleTable::locked() const { return impl_->locked; }
+const char* PleTable::format() const {
+    return impl_->fmt == PleFormat::Q8_0 ? "Q8_0" : impl_->fmt == PleFormat::Q5_0 ? "Q5_0" : "IQ4_NL";
+}
+PleIo PleTable::mode() const { return impl_->mode; }
+uint64_t PleTable::rows() const { return impl_->n_rows; }
+uint64_t PleTable::bytes_read() const { return impl_->bytes_read; }
+
+void PleTable::read_row(uint32_t row, float* out160) const {
+    if (impl_->mode == PleIo::Direct && impl_->reader.is_open()) {
+        uint8_t raw[PLE_ROW_BYTES_MAX];
+        std::string err;
+        const auto t = impl_->reader.issue(&row, 1, raw);
+        if (!impl_->reader.collect(t, err)) {
+            std::memset(out160, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
+            return;
+        }
+        impl_->decode(raw, out160);
+        impl_->bytes_read += impl_->rb;
+        return;
+    }
+    if (impl_->data == nullptr || row >= impl_->n_rows) {
+        std::memset(out160, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
+        return;
+    }
+    impl_->decode(impl_->data + (size_t) row * impl_->rb, out160);
+    impl_->bytes_read += impl_->rb;
+}
+
+bool PleTable::issue(const uint32_t* rows16) {
+    wait_prefetches();
+    std::lock_guard<std::mutex> lk(impl_->ring_mu);
+    std::memcpy(impl_->rows, rows16, sizeof impl_->rows);
+    if (impl_->mode == PleIo::Direct) {
+        if (impl_->pending) return false;              // one token in flight per table
+        impl_->ticket = impl_->reader.issue(impl_->rows, PLE_N_HEADS, impl_->raw);
+        impl_->pending = true;
+        return true;
+    }
+    impl_->pending = true;
+    return true;
+}
+
+bool PleTable::collect(float* out2560, std::string& err) {
+    basalt::ngram::PleReader::Ticket t;
+    {
+        std::lock_guard<std::mutex> lk(impl_->ring_mu);
+        if (!impl_->pending) { err = "PleTable::collect without issue"; return false; }
+        impl_->pending = false;
+        t = impl_->ticket;
+    }
+    if (impl_->mode == PleIo::Direct) {
+        if (!impl_->reader.collect(t, err)) return false;
+        for (int h = 0; h < PLE_N_HEADS; ++h)
+            impl_->decode(impl_->raw + (size_t) h * impl_->rb, out2560 + (size_t) h * PLE_HEAD_DIM);
+        impl_->bytes_read += (uint64_t) PLE_N_HEADS * impl_->rb;
+        return true;
+    }
+    for (int h = 0; h < PLE_N_HEADS; ++h) read_row(impl_->rows[h], out2560 + (size_t) h * PLE_HEAD_DIM);
+    return true;
+}
+
+bool PleTable::gather_rows(const uint32_t* rows, size_t n_tokens, float* out, std::string& err) {
+    const size_t n = n_tokens * (size_t) PLE_N_HEADS;
+    if (impl_->mode == PleIo::Direct) {
+        // own ticket and own buffer: nothing here touches the decode path's ring or single-token slot
+        std::vector<uint8_t> raw(n * impl_->rb);
+        const auto ticket = impl_->reader.issue(rows, n, raw.data());
+        if (!impl_->reader.collect(ticket, err)) return false;
+        for (size_t i = 0; i < n; ++i) impl_->decode(raw.data() + i * impl_->rb, out + i * PLE_HEAD_DIM);
+        impl_->bytes_read += (uint64_t) n * impl_->rb;
+        return true;
+    }
+    for (size_t i = 0; i < n; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
+    return true;
+}
+
+bool PleTable::warm_rows(const uint32_t* rows, size_t n_tokens, std::string& err) {
+    if (impl_->mode != PleIo::Direct) return true;
+    std::vector<uint8_t> raw(n_tokens * (size_t) PLE_N_HEADS * impl_->rb);
+    return impl_->reader.collect(impl_->reader.issue(rows, n_tokens * (size_t) PLE_N_HEADS, raw.data()), err);
+}
+
+uint64_t PleTable::cache_rows() const {
+    return impl_->mode == PleIo::Direct && impl_->reader.is_open() ? impl_->reader.cache_capacity() : 0;
+}
+
+bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err) {
+    const size_t n = n_tokens * (size_t) PLE_N_HEADS;
+    if (impl_->mode != PleIo::Direct) {
+        if (impl_->pending) { err = "PleTable::gather_batch while a token is in flight"; return false; }
+        return gather_rows(rows, n_tokens, out, err);
+    }
+    // Fast path: the requested tokens are exactly the in-flight prefetches, so collect those instead of issuing
+    // a second request. The tickets are claimed under the lock and collected outside it.
+    basalt::ngram::PleReader::Ticket claimed[Impl::kMaxPrefetch];
+    size_t n_claimed = 0;
+    {
+        std::lock_guard<std::mutex> lk(impl_->ring_mu);
+        if (impl_->pending) { err = "PleTable::gather_batch while a token is in flight"; return false; }
+        if (impl_->n_prefetch >= n_tokens && n_tokens <= Impl::kMaxPrefetch) {
+            bool exact_match = true;
+            for (size_t t = 0; t < n_tokens && exact_match; ++t)
+                exact_match = std::memcmp(impl_->prefetch_keys[t], rows + t * PLE_N_HEADS, sizeof(uint32_t) * PLE_N_HEADS) == 0;
+            if (exact_match) {
+                n_claimed = impl_->n_prefetch;
+                std::memcpy(claimed, impl_->prefetch_tickets, n_claimed * sizeof(claimed[0]));
+                impl_->n_prefetch = 0;
+            }
+        }
+    }
+    if (n_claimed > 0) {
+        bool ok = true;
+        for (size_t i = 0; i < n_claimed; ++i) ok = impl_->reader.collect(claimed[i], err) && ok;
+        if (!ok) return false;
+        for (size_t t = 0; t < n_tokens; ++t)
+            for (int h = 0; h < PLE_N_HEADS; ++h)
+                impl_->decode(impl_->prefetch_raw[t] + (size_t) h * impl_->rb, out + (t * PLE_N_HEADS + (size_t) h) * PLE_HEAD_DIM);
+        impl_->bytes_read += (uint64_t) n * impl_->rb;
+        return true;
+    }
+    wait_prefetches();
+    return gather_rows(rows, n_tokens, out, err);
+}
+
+void PleTable::set_injected_delay_us(double us) { impl_->reader.set_injected_delay_us(us); }
+void PleTable::rearm_keepalive() { impl_->reader.rearm_keepalive(); }
+
+std::string PleTable::io_report() const {
+    if (impl_->mode != PleIo::Direct || !impl_->reader.is_open()) return {};
+    const basalt::ngram::ReaderStats s = impl_->reader.snapshot();
+    char buf[400];
+    int n = std::snprintf(buf, sizeof buf,
+                  "ple io: %llu rows, %.1f%% row-cache hits, %llu SSD reads (%.1f MB), read p50 %.0f us p99 %.0f us, "
+                  "blocked %.3f ms total (submit %.3f ms), cache %llu/%llu rows",
+                  (unsigned long long) s.requests, s.requests ? 100.0 * (double) s.cache_hits / (double) s.requests : 0.0,
+                  (unsigned long long) s.reads, (double) s.bytes / 1e6, s.percentile(0.5), s.percentile(0.99),
+                  s.wait_us / 1000.0, s.submit_us / 1000.0, (unsigned long long) impl_->reader.cache_size(),
+                  (unsigned long long) impl_->reader.cache_capacity());
+    if (s.keepalive_reads > 0 && n > 0 && n < (int) sizeof buf)
+        std::snprintf(buf + n, sizeof buf - (size_t) n, ", SSD kept awake by %llu reads (slowest %.1f ms)",
+                      (unsigned long long) s.keepalive_reads, s.keepalive_us_max / 1000.0);
+    return buf;
+}
+
+void PleTable::gather(const uint32_t* rows16, float* out2560) const {
+    if (impl_->mode == PleIo::Direct) {
+        // `gather` stays const for its existing callers; the reader's state is the table's I/O state.
+        PleTable* self = const_cast<PleTable*>(this);
+        std::string err;
+        if (!self->issue(rows16) || !self->collect(out2560, err)) {
+            basalt::log::error("basalt", "PleTable::gather: %s", err.empty() ? "a token is already in flight" : err.c_str());
+            std::memset(out2560, 0, (size_t) NG_N_EMBD * sizeof(float));
+        }
+        return;
+    }
+    // ================================ SIXTEEN SERIAL PAGE FAULTS ================================
+    //
+    // **THIS COSTS MILLISECONDS PER TOKEN.**  The table is 320,001,536 rows of `PLE_ROW_BYTES` = 90 B in a 26.8 GB
+    // mapping, so the sixteen rows a token needs are 1,440 B.  That is not bandwidth, it is latency: sixteen reads
+    // into sixteen different 4 KB pages scattered across 26.8 GB, taken ONE AT A TIME, and the table is not in
+    // the OS cache when the expert arena competes for RAM.  Sixteen serial NVMe reads add up to milliseconds.
+    //
+    // A prefetch issues all sixteen in ONE call and lets them complete in parallel.  It is a hint
+    // and cannot change the answer - a range it does not fetch is simply faulted in by the read that follows -
+    // so the only risk is that it does nothing.
+    // HEAD-SLOWEST, which is what `ggml_get_rows` does and what the source's own comment says: head h's 160
+    // values occupy [h*160, (h+1)*160).  A head-fastest layout would put element (d, h) at d*16 + h and needs
+    // a real transpose - a reshape of the same flat buffer compares equal and would make the check vacuous.
+    for (int h = 0; h < PLE_N_HEADS; ++h) read_row(rows16[h], out2560 + (size_t) h * PLE_HEAD_DIM);
+}
+
+}  // namespace basalt::kernels

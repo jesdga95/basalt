@@ -2,6 +2,8 @@
 #include "basalt/log.hpp"
 #include "basalt/program/engine_session.hpp"
 
+#include <filesystem>
+
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/system.hpp"
 #include "basalt/program/load_summary.hpp"
@@ -207,6 +209,41 @@ bool Engine::read_line(std::string& line) {
         if (n <= 0) return false;
         buf_.append(tmp, (size_t) n);
     }
+}
+
+int engine_plan(const std::string& engine_bin, const std::vector<std::string>& args, const std::string& log_path,
+                std::string& answer) {
+    std::vector<std::string> argv = {engine_bin};
+    argv.insert(argv.end(), args.begin(), args.end());
+    argv.push_back("--gpu-plan");
+    basalt::platform::PipedChild child;
+    std::string err;
+    if (!basalt::platform::spawn_piped(argv, log_path, child, err)) return -1;
+    basalt::platform::close_fd(child.in_fd);
+    char buf[4096];
+    answer.clear();
+    for (int64_t n; (n = basalt::platform::pipe_read(child.out_fd, buf, sizeof buf)) > 0;) answer.append(buf, (size_t) n);
+    basalt::platform::close_fd(child.out_fd);
+    const int code = basalt::platform::child_wait(child.child, 20000);
+    if (code < 0) basalt::platform::child_terminate(child.child);
+    basalt::platform::child_close(child.child);
+    return code;
+}
+
+std::string plan_field(const std::string& plan_answer, const std::string& name) {
+    const std::string key = "\"" + name + "\":\"";
+    const size_t at = plan_answer.find(key);
+    if (at == std::string::npos) return {};
+    const size_t b = at + key.size(), e = plan_answer.find('"', b);
+    return e == std::string::npos ? std::string() : plan_answer.substr(b, e - b);
+}
+
+std::string fixtures_for(const std::string& dir, const std::string& plan_answer) {
+    const std::string arch = plan_field(plan_answer, "arch");
+    if (arch.empty()) return dir;
+    std::error_code ec;
+    const std::filesystem::path own = std::filesystem::path(dir) / arch;
+    return std::filesystem::is_directory(own, ec) ? own.string() : dir;
 }
 
 void Engine::reap() {

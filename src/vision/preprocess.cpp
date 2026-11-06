@@ -176,6 +176,8 @@ Image resize_bicubic(const Image& s, int ow, int oh) {
 
 }  // namespace
 
+Image resize_bicubic_to(const Image& src, int w, int h) { return resize_bicubic(src, w, h); }
+
 Image to_canvas(const Image& src, Size target) {
     if (src.w == target.w && src.h == target.h) return src;
     const float sw = (float) target.w / src.w, sh = (float) target.h / src.h;

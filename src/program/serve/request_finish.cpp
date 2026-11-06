@@ -3,37 +3,23 @@
 
 namespace basalt::program::serve {
 
+// the VRAM share of the experts looked up while decoding; experts a bus copy or another GPU served are in neither
+// count, so that share is said beside it
+void Request::report_expert_counts(const DoneCounts& dc) const {
+    if (dc.lookups <= 0) return;
+    char off[160] = "";
+    if (dc.offloaded > 0)
+        std::snprintf(off, sizeof off, "; %lld more read by the GPU over PCIe or from another GPU (%.1f%% of "
+                      "all %lld routed)", (long long) dc.offloaded,
+                      100.0 * (double) dc.offloaded / (double) (dc.lookups + dc.offloaded),
+                      (long long) (dc.lookups + dc.offloaded));
+    basalt::log::info("basalt serve", "decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)%s",
+                      100.0 * (double) dc.hits / (double) dc.lookups, (long long) dc.hits, (long long) dc.lookups, off);
+}
+
 Flow Request::complete() {
     decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
-    // the last commit (set_commit_async): the session is complete before anything reads or copies it
-    if (!runtime_.ver.wait_commit(runtime_.err) || (runtime_.pipe_on && !runtime_.ver_b.wait_commit(runtime_.err))) {
-        std::printf("ERR %s\n", runtime_.err.c_str());
-        return Flow::error;
-    }
-    if (runtime_.pipe_on)
-        basalt::log::info("basalt serve", "pipelined windows: %lld launched, %lld held", (long long) pair_runs,
-                          (long long) pair_holds);
-    if (dec_timing && dec_windows > 0) {
-        const DecSnap d1 = dec_snap();
-        const double w = (double) dec_windows, L = (double) runtime_.g.n_layers;
-        auto fmt2 = [](double v) { char b[32]; std::snprintf(b, sizeof b, "%.2f", v); return std::string(b); };
-        basalt::log::info("basalt decode timing", "%lld windows, avg T %.2f, %.2f tokens/window, %.2f ms/window = "
-                             "verify %.2f (GPU-reach wait %.2f + per-layer host %.2f [plan %.2f actq %.2f jobs %.2f "
-                             "CPU %.2f] + stage %.2f) + commit/emit %.2f + draft %.2f; per layer-window: CPU experts "
-                             "%.2f (%.2f entries), VRAM hits %.2f, PCIe %.2f%s",
-                     (long long) dec_windows, dec_T / w, produced_n / w, decode_ms / w, dt_run / w,
-                     (d1.wait - ds0.wait) / w, (d1.pool - ds0.pool) / w, (d1.plan - ds0.plan) / w,
-                     (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
-                     (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
-                     (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L),
-                     runtime_.drive.d.peer == nullptr ? "" : (", peer GPU " + fmt2((d1.peer - ds0.peer) / (w * L)) +
-                                                     " (the pool waits " + fmt2((d1.peer_wait - ds0.peer_wait) / w) +
-                                                     " ms/window for it)").c_str());
-        const std::string evr = basalt::core::decode_events().report();
-        if (!evr.empty()) basalt::log::raw("%s\n", evr.c_str());
-        const std::string pr = runtime_.ver.profile_report();
-        if (!pr.empty()) basalt::log::raw("basalt decode GPU stages (ms/window):%s\n", pr.c_str());
-    }
+    if (const Flow flow = complete_begin(); flow != Flow::proceed) return flow;
     if (!cancelled) {
         // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
         // (the checkpoints taken while reading it are still good)
@@ -42,9 +28,7 @@ Flow Request::complete() {
         runtime_.live_ok = runtime_.o.prompt_cache > 0;
     }
     runtime_.ckd_finish();
-    req_hits = runtime_.drive.d.cache_hits - decode_hits0;
-    req_look = (runtime_.drive.d.cache_hits + runtime_.drive.d.cache_admitted + runtime_.drive.d.cache_refused) - decode_look0;
-    req_offload = runtime_.drive.d.offload_entries - offload0;
+    const DoneCounts dc = done_counts();
     // the prompt tokens this request read - all the fresh ones, or as far as the prompt pass got when a cancel
     // stopped it part-way
     fresh = n - resume;
@@ -77,33 +61,28 @@ Flow Request::complete() {
     if (!ram_out) std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld\n",
                 (long long) produced_n,
                 (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
-                (long long) resume, (long long) req_hits, (long long) req_look,
-                (long long) (runtime_.src.ram_reads() - ram0), (long long) (runtime_.src.file_reads() - files0),
-                (double) (runtime_.src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
-                (long long) req_offload);
+                (long long) resume, (long long) dc.hits, (long long) dc.lookups,
+                (long long) dc.ram_blobs, (long long) dc.file_blobs, dc.file_mb, (long long) read_n,
+                (long long) dc.offloaded);
     std::fflush(stdout);
     // no swap stays in flight between requests: the last round's copies land once the reply is out
-    if (!runtime_.xq_drain()) {
+    if (!tiers_settle()) {
         std::printf("ERR an adaptive refill failed\n");
         return Flow::error;
     }
-    runtime_.xq_saturated = false;   // the next request starts at the base cap
     if (runtime_.admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
         bool cont = ram_out ? false : in_slot ? !cancelled && (int64_t) runtime_.live.size() == p
                             : !cancelled && produced_n == 1 && runtime_.admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                               (int64_t) runtime_.live.size() == p;
         const auto tc0 = Clock::now();
         // the draft layer's cell for the prompt's last token (it pairs with the first generated one), then its K/V
-        if (cont && !in_slot && runtime_.batch_spec && !runtime_.mtp.prefill(runtime_.ver.final_R_all(), &x, 1, p - 1, runtime_.err)) {
+        if (cont && !in_slot && !admit_draft()) {
             basalt::log::error("basalt serve", "batch admission failed: %s", runtime_.err.c_str());
             cont = false;
         }
         if (cont && in_slot) {   // the slot holds the prompt already; only its draft K/V is staged
-            basalt::core::SessionState& t = *runtime_.bslot_ss[0][(size_t) runtime_.admit_slot];
-            t.ple_prev[0] = (*rview).ple_prev[0];
-            t.ple_prev[1] = (*rview).ple_prev[1];
-            t.ple_token = (*rview).ple_token;
-            if (runtime_.batch_spec && !runtime_.mtp.copy_store(runtime_.mtp.main_store(), runtime_.admit_slot, (int64_t) runtime_.live.size(), runtime_.err)) {
+            slot_state_back(runtime_.admit_slot);
+            if (!slot_draft_keep(runtime_.admit_slot)) {
                 basalt::log::error("basalt serve", "batch admission failed: %s", runtime_.err.c_str());
                 cont = false;
             }
@@ -113,21 +92,13 @@ Flow Request::complete() {
             cont = false;
         }
         if (cont) {
-            if (runtime_.slot0_is_solo && runtime_.admit_slot == 0) runtime_.live_ok = false;   // the batch windows move the state on
-            runtime_.ver.set_slot_sampling(runtime_.admit_slot, req_sp);   // the request's own sampling, row by row
+            if (runtime_.slot0_solo() && runtime_.admit_slot == 0) runtime_.live_ok = false;   // the batch windows move the state on
+            slot_set_sampling(runtime_.admit_slot);   // the request's own sampling, row by row
             BSlot& sl = runtime_.bs[(size_t) runtime_.admit_slot];
             sl = BSlot{};
             sl.active = true;
             sl.pen_n = req_sp.penalty_last_n;
-            sl.script = std::move(runtime_.bscript[(size_t) runtime_.admit_slot].first);
-            sl.rng.seed(runtime_.bscript[(size_t) runtime_.admit_slot].second);
-            runtime_.bscript[(size_t) runtime_.admit_slot].first.clear();
-            if (runtime_.batch_spec && runtime_.o.suffix_draft > 0) {
-                sl.sfx = std::make_unique<basalt::spec::SuffixDrafter>(std::max(1, runtime_.o.suffix_draft), 64,
-                                                                       (size_t) runtime_.o.max_context + 4096);
-                for (int32_t t : runtime_.live) sl.sfx->append(t);
-                sl.sfx->append(x);
-            }
+            slot_init(sl);
             sl.x = x;
             sl.p = p;
             sl.produced = in_slot ? 0 : 1;
@@ -157,10 +128,7 @@ Flow Request::complete() {
         runtime_.admit_slot = -1;
     }
     if (solo_req) {   // the conversation stays in the slot it ran in
-        basalt::core::SessionState& t = *runtime_.bslot_ss[0][(size_t) slot_b];
-        t.ple_prev[0] = (*rview).ple_prev[0];
-        t.ple_prev[1] = (*rview).ple_prev[1];
-        t.ple_token = (*rview).ple_token;
+        slot_state_back(slot_b);
         if (yielded_at < 0) {   // (a read that gave way was parked in the slot already)
             BSlot& sb = runtime_.bs[(size_t) slot_b];
             sb = BSlot{};
@@ -170,20 +138,17 @@ Flow Request::complete() {
             sb.cached = runtime_.live_ok && runtime_.o.prompt_cache > 0;
             sb.idle_busy = runtime_.busy_now();
             if (sb.cached) sb.checks = std::move(runtime_.checks);
-            if (sb.cached && runtime_.batch_spec && !runtime_.mtp.copy_store(runtime_.mtp.main_store(), slot_b, (int64_t) runtime_.live.size(), runtime_.err)) {
+            if (sb.cached && !slot_draft_keep(slot_b)) {
                 runtime_.err.clear();
                 sb.cached = false;
             }
         }
     }
     if (in_slot) {   // the solo session and its bookkeeping again
-        if (solo_req && !runtime_.ver.bind_session(&runtime_.ss, runtime_.err)) {
+        if (!slot_leave()) {
             std::printf("ERR %s\n", runtime_.err.c_str());
             return Flow::error;
         }
-        runtime_.rsp = &runtime_.ss;
-        runtime_.sp.set_session(runtime_.ss);
-        if (runtime_.mtp_on) runtime_.mtp.set_ple_session(&runtime_.ss);
         runtime_.solo_out = nullptr;
         runtime_.live = std::move(solo_book.live);
         runtime_.live_imgs = std::move(solo_book.live_imgs);
@@ -200,8 +165,6 @@ Flow Request::complete() {
     } else {
         runtime_.solo_idle_busy = runtime_.busy_now();
     }
-    if (runtime_.drive.routing != nullptr) std::fflush(runtime_.drive.routing);   // the routing trace survives a crash and is watchable mid-session
-
     if (cancelled)
         std::snprintf(read_txt, sizeof(read_txt), "%lld of %lld", (long long) read_n, (long long) fresh);
     else
@@ -212,58 +175,7 @@ Flow Request::complete() {
                  prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                  decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                  (long long) draft_offered, runtime_.checks.size(), cancelled ? " (cancelled)" : "");
-    if (relax_on)
-        basalt::log::info("basalt serve", "relaxed drafting %.2f: %lld of the %lld accepted drafts were kept by it",
-                     (double) req_relax, (long long) relaxed_kept, (long long) draft_accepted);
-    // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU to
-    // read are in neither count, so that share is said beside it
-    if (req_look > 0) {
-        char off[160] = "";
-        if (req_offload > 0)
-            std::snprintf(off, sizeof off, "; %lld more read by the GPU over PCIe or from another GPU (%.1f%% of "
-                          "all %lld routed)", (long long) req_offload,
-                          100.0 * (double) req_offload / (double) (req_look + req_offload),
-                          (long long) (req_look + req_offload));
-        basalt::log::info("basalt serve", "decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)%s",
-                     100.0 * (double) req_hits / (double) req_look,
-                     (long long) req_hits, (long long) req_look, off);
-    }
-    // the adaptive swaps this request queued: the resident RAM line's exchanges count only swaps through the
-    // exchange buffers, not those whose evicted expert takes a free place in the RAM copy
-    if (runtime_.adapt_fast && !runtime_.drive.d.usage.empty())
-        basalt::log::info("basalt serve", "adaptive swaps: %lld into the VRAM tier this request, %lld deferred "
-                          "(no free RAM place)", (long long) (runtime_.xq_swapped - swapped0),
-                          (long long) (runtime_.xq_noplace - noplace0));
-    // the resident RAM mode, cumulative: experts read from the experts section since the copy was made (what the plain
-    // mmap mode reads through the OS file cache, from the SSD when the RAM could not keep it)
-    if (runtime_.src.complement_ready())
-        basalt::log::info("basalt serve", "resident RAM: %.2f GiB of experts in RAM, %lld exchanged with the "
-                             "VRAM tier, %lld blob reads from the file",
-                     (double) runtime_.src.resident_bytes() / 1073741824.0, (long long) runtime_.src.exchanges(),
-                     (long long) runtime_.src.file_reads());
-    // the tiers, cumulative - GPU cache hits (the decode lookups above), RAM copy, files (SSD / OS cache)
-    if (runtime_.srcp == &runtime_.src)
-        basalt::log::info("basalt serve", "expert tiers: GPU %lld hits this request; since the start RAM %lld blobs, files %lld blobs "
-                             "%.1f MB read", (long long) req_hits, (long long) runtime_.src.ram_reads(),
-                     (long long) runtime_.src.file_reads(), (double) runtime_.src.file_read_bytes() / 1e6);
-    if (runtime_.g.n_qsa_layers() > 0 && runtime_.ss.qsa_states[runtime_.ss.qsa_primary()].kv_mode == 1) {
-        // KV streaming, cumulative over the process: blocks the selections named vs blocks read from RAM
-        // (this device's owned ordinals; a split's other stages hold theirs)
-        uint64_t miss = 0, look = 0;
-        bool over = false;
-        for (int64_t j = 0; j < runtime_.ss.qsa_alloc; ++j) {
-            const basalt::kernels::KvStreamCounters c =
-                basalt::kernels::kv_stream_counters(runtime_.ss.qsa_states[runtime_.ss.qsa_ord0 + j].map);
-            miss += c.misses; look += c.lookups; over = over || c.overflow;
-        }
-        basalt::log::info("basalt serve", "KV streaming: %.2f%% of %llu block reads hit VRAM, %.1f MiB read "
-                             "from RAM%s", look ? 100.0 * (double) (look - miss) / (double) look : 100.0,
-                     (unsigned long long) look, (double) miss * 4224.0 / 1048576.0,
-                     over ? " - OVERFLOW (too few resident cells)" : "");
-    }
-    if (sfx_windows > 0)
-        basalt::log::info("basalt serve", "suffix drafts: %lld windows, %lld of %lld drafts accepted",
-                     (long long) sfx_windows, (long long) sfx_ok, (long long) sfx_drafts);
+    report_request(dc);
 
     return Flow::next;
 }

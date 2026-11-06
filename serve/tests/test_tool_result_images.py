@@ -18,6 +18,8 @@ from serve.engine.mock import MockEngine
 from serve.engine.vision import Vision
 from serve.frontend import ChatTemplate, anthropic_to_messages, images_of, mark_think_literals, openai_to_messages
 from serve.handler import serve
+from serve.models import deepseek41_encoding as enc
+from serve.models.deepseek41 import DeepSeek41, DeepseekTemplate
 from serve.service import Service
 from serve.util.text import ByteTokenizer
 
@@ -26,7 +28,7 @@ PNG = b"\x89PNG\r\n\x1a\n"
 # each picture has its own row count, so a prompt shows which picture took which marker
 ROWS = {PNG + b"A": 2, PNG + b"B": 3, PNG + b"C": 5}
 A, B, C = ("data:image/png;base64," + base64.b64encode(data).decode() for data in ROWS)
-MODEL = "qwen3.8-flash-next"
+MODEL = "basalt"
 POLICY = "refused by server policy"
 NO_VISION = "this server was started without image input (--vision), so it cannot read images"
 
@@ -41,7 +43,22 @@ class Qwen:
     service_args = {}
 
 
-DIALECTS = [Qwen]
+class DeepseekTokenizer(ByteTokenizer):
+    SPECIALS = ByteTokenizer.SPECIALS + [enc.IMAGE_PLACEHOLDER, enc.bos_token, enc.eos_token, enc.USER_SP_TOKEN,
+                                         enc.ASSISTANT_SP_TOKEN, enc.SYSTEM_SP_TOKEN]
+
+
+class Deepseek:
+    name = "deepseek41"
+    tok = DeepseekTokenizer()
+    pad = enc.IMAGE_PLACEHOLDER
+    quoted = pad + pad
+    result_open, result_close = "<tool_result>", "</tool_result>"
+    template = DeepseekTemplate()
+    service_args = {"dialect": DeepSeek41()}
+
+
+DIALECTS = [Qwen, Deepseek]
 
 
 class RecordingVision(Vision):

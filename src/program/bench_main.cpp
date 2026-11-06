@@ -32,6 +32,7 @@
 #include "basalt/program/host_rates.hpp"
 #include "basalt/program/engine_session.hpp"
 #include "basalt/program/gpu_select.hpp"
+#include "basalt/program/options.hpp"
 
 #include <errno.h>
 
@@ -228,7 +229,7 @@ private:
 // ---------------------------------------------------------------------------------------------- options
 
 struct Options {
-    std::string engine, model, fixtures = BASALT_BENCH_FIXTURES, format = "md", logs, kld_base, power_label;
+    std::string engine, model, fixtures, format = "md", logs, kld_base, power_label;
     std::vector<std::pair<std::string, std::string>> sets;
     std::vector<std::string> passthrough;
     std::string spec;                    // --spec N: the engine argument of the same name
@@ -451,7 +452,7 @@ struct Fixture {
     double temperature;   // 0: greedy
 };
 
-// Same content and order as the standard decode set; sampling keys as the daily server config sends them.
+// Same content and order as the standard decode set; sampling keys as a server config sends them.
 const Fixture kDecode[] = {
     {"conv", "conv.ids", 1200, 0.6},
     {"struct", "struct.ids", 8192, 0.0},
@@ -729,6 +730,29 @@ int main(int argc, char** argv) {
         basalt::log::error("basalt-bench", "the engine binary %s does not exist (--engine BIN)", engine_bin.c_str());
         return 2;
     }
+    if (o.fixtures.empty()) {   // the model's own, when it has them
+        std::string answer;
+        const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id());
+        if (!o.model.empty()) (void) engine_plan(engine_bin, {"--model", fs::absolute(o.model).string(), "--gpu", "0"}, plan_log, answer);
+        std::error_code rm_ec;
+        fs::remove(plan_log, rm_ec);
+        o.fixtures = fixtures_for(BASALT_BENCH_FIXTURES, answer);
+    }
+    std::vector<std::string> quality_flags;
+    if (do_quality && !o.model.empty()) {   // what the gate starts this model with, and the window it scores
+        std::string answer;
+        const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id()) + ".log";
+        const int asked = engine_plan(engine_bin, {"--model", fs::absolute(o.model).string(), "--gpu", "0", "--ppl-base", o.kld_base}, plan_log, answer);
+        std::error_code rm_ec;
+        fs::remove(plan_log, rm_ec);
+        if (asked != 0) {
+            basalt::log::error("basalt-bench", "--quality: the engine cannot plan this model");
+            return 1;
+        }
+        quality_flags = split(basalt::program::plan_field(answer, "quality_flags"), ' ');
+        const int window = std::atoi(basalt::program::plan_field(answer, "quality_window").c_str());
+        if (window > 0) o.quality_t = std::min(o.quality_t, window);
+    }
     for (const auto& kv : o.sets) set_arg(args, kv.first, kv.second);
     if (!o.spec.empty()) set_arg(args, "--spec", o.spec);
     if (o.model.empty()) for (const auto& a : o.passthrough) args.push_back(a);
@@ -768,7 +792,7 @@ int main(int argc, char** argv) {
 
     // the context the fixtures need, unless the command line gives one
     if (!has_arg(args, "--max-context")) {
-        long long need = 4096;
+        long long need = basalt::program::kDefaultContext;
         for (size_t i = 0; i < 3; ++i)
             if (!decode_ids[i].empty()) need = std::max(need, (long long) decode_ids[i].size() + kDecode[i].max_new + 16);
         if (do_prefill)
@@ -875,7 +899,7 @@ int main(int argc, char** argv) {
         }
         if (o.community) {
             // every expert must sit in VRAM, the peer GPU or RAM: reads from the file would make the row incomparable
-            const char* k = "file_experts_bytes";
+            const char* k = "spill_bytes";
             const double spill = eng.info.count(k) ? std::atof(eng.info[k].c_str()) / 1073741824.0 : -1.0;
             if (spill != 0.0) {
                 eng.stop();
@@ -983,11 +1007,15 @@ int main(int argc, char** argv) {
             basalt::log::error("basalt-bench", "%s", quality.err.c_str());
         } else {
             std::vector<std::string> qa = args;
-            set_arg(qa, "--spec", "5");
-            set_arg(qa, "--adapt-swaps", "0");
-            set_arg(qa, "--peer-adapt-swaps", "0");
-            // the gate must run on every pack: without this a pack larger than free RAM is refused
-            if (!has_arg(qa, "--resident-experts") && !has_arg(qa, "--mmap-experts")) qa.push_back("--resident-experts");
+            for (size_t f = 0; f < quality_flags.size(); ++f) {
+                const std::string& a = quality_flags[f];
+                if (a.empty()) continue;
+                if (f + 1 < quality_flags.size() && quality_flags[f + 1].rfind("--", 0) != 0) {
+                    set_arg(qa, a, quality_flags[++f]);
+                } else if (!has_arg(qa, a) && !(a == "--resident-experts" && has_arg(qa, "--mmap-experts"))) {
+                    qa.push_back(a);
+                }
+            }
             const std::string rows = (fs::path(work) / "rows.tsv").string();
             std::remove(rows.c_str());
             set_arg(qa, "--ppl-base", o.kld_base);

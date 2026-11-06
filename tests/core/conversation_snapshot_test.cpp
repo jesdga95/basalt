@@ -1,7 +1,7 @@
 #include <algorithm>
-#include "basalt/core/conversation_snapshot.hpp"
-#include "basalt/core/kv_arena.hpp"
-#include "basalt/kernels/kv_q4.hpp"
+#include "basalt/models/qwen4exp/decode/conversation_snapshot.hpp"
+#include "basalt/models/qwen4exp/decode/kv_arena.hpp"
+#include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
 #include <cuda_runtime.h>
 
 #include <array>
@@ -144,16 +144,16 @@ void full_session(int fmt, int mode, int experts) {
         check(deferral.reserve(sizes.gdn,err),"reserve the deferred checkpoint buffer");
         ConversationCheckpoint deferred;
         deferred.ids=checkpoint.ids;
-        check(deferral.save(deferred,ss,g,err) && deferral.pending()==deferred.gdn.data(),"issue deferred checkpoint save");
+        check(deferral.save(deferred,ss,g,err) && deferral.pending()==deferred.state_a.data(),"issue deferred checkpoint save");
         cuda_check(cudaMemset(ss.gdn_state,0x5a,sizes.gdn));
         cuda_check(cudaDeviceSynchronize());
         check(deferral.finish(err) && deferral.pending()==nullptr,"finish deferred checkpoint save");
-        check(deferred.gdn.size()==checkpoint.gdn.size() &&
-              std::equal(deferred.gdn.begin(),deferred.gdn.end(),checkpoint.gdn.begin()) &&
-              std::equal(deferred.ple.begin(),deferred.ple.end(),checkpoint.ple.begin()) &&
-              std::equal(deferred.tails.begin(),deferred.tails.end(),checkpoint.tails.begin()) &&
-              std::equal(deferred.dead.begin(),deferred.dead.end(),checkpoint.dead.begin()) &&
-              std::equal(deferred.block_pos.begin(),deferred.block_pos.end(),checkpoint.block_pos.begin()),
+        check(deferred.state_a.size()==checkpoint.state_a.size() &&
+              std::equal(deferred.state_a.begin(),deferred.state_a.end(),checkpoint.state_a.begin()) &&
+              std::equal(deferred.state_b.begin(),deferred.state_b.end(),checkpoint.state_b.begin()) &&
+              std::equal(deferred.state_c.begin(),deferred.state_c.end(),checkpoint.state_c.begin()) &&
+              std::equal(deferred.state_d.begin(),deferred.state_d.end(),checkpoint.state_d.begin()) &&
+              std::equal(deferred.state_e.begin(),deferred.state_e.end(),checkpoint.state_e.begin()),
               "deferred checkpoint bytes match the plain save");
         cuda_check(cudaMemset(ss.gdn_state,13,sizes.gdn));
         cuda_check(cudaDeviceSynchronize());
@@ -166,17 +166,17 @@ void full_session(int fmt, int mode, int experts) {
     check(a.checkpoints[0].used == 17,"upstream checkpoint LRU stamp survives capture");
     fill(177);
     check(conversation_snapshot_save(b,view,ss,g,draft.state,err),"capture complete B");
-    check(a.live.dead!=b.live.dead,"different opening-state spare keys in regression fixture");
+    check(a.live.state_d!=b.live.state_d,"different opening-state spare keys in regression fixture");
     auto bad=a; bad.kv.back().k.pop_back();
     check(conversation_snapshot_restore(bad,ss,g,draft.state,err)==ConversationRestore::invalid,
           "reject invalid late draft before any main-layer write");
     check(conversation_snapshot_save(restored,view,ss,g,draft.state,err),"capture B after refused restore");
-    check(restored.live.gdn==b.live.gdn && restored.live.dead==b.live.dead &&
+    check(restored.live.state_a==b.live.state_a && restored.live.state_d==b.live.state_d &&
           equal(restored.kv[0],b.kv[0]) && equal(restored.kv[1],b.kv[1]),"refusal preserves all tested state");
     check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore complete A");
     check(conversation_snapshot_save(restored,view,ss,g,draft.state,err),"capture restored A");
-    check(restored.live.gdn==a.live.gdn && restored.live.ple==a.live.ple && restored.live.tails==a.live.tails &&
-          restored.live.dead==a.live.dead && restored.live.block_pos==a.live.block_pos &&
+    check(restored.live.state_a==a.live.state_a && restored.live.state_b==a.live.state_b && restored.live.state_c==a.live.state_c &&
+          restored.live.state_d==a.live.state_d && restored.live.state_e==a.live.state_e &&
           equal(restored.kv[0],a.kv[0]) && equal(restored.kv[1],a.kv[1]),"whole-session A/B/A exactness including spare key");
     check(ss.ple_prev[0]==64 && ss.ple_prev[1]==65,"PLE token window reconstructed");
     for (int64_t dirty : {65, 3, 0}) {
@@ -196,8 +196,8 @@ void full_session(int fmt, int mode, int experts) {
         check(conversation_snapshot_capture_bytes(reuse,view,ss,g,draft.state,peak,err),"admit incremental capture peak");
         check(conversation_snapshot_save(incremental,view,ss,g,draft.state,err,std::move(reuse),&reused),"capture with retained pages");
         check(incremental.bytes() <= peak,"incremental allocation stays within admitted bound");
-        check(incremental.live.gdn==fresh.live.gdn && incremental.live.ple==fresh.live.ple &&
-              incremental.live.dead==fresh.live.dead && equal(incremental.kv[0],fresh.kv[0]) &&
+        check(incremental.live.state_a==fresh.live.state_a && incremental.live.state_b==fresh.live.state_b &&
+              incremental.live.state_d==fresh.live.state_d && equal(incremental.kv[0],fresh.kv[0]) &&
               equal(incremental.kv[1],fresh.kv[1]),"incremental capture equals full capture after growth or rewind");
         check((dirty>=4)==(reused>0),"only complete unchanged pages or rows are retained");
         incremental.kv[0].k.visit(0,1,[&](const uint8_t* p,size_t,size_t){
@@ -217,7 +217,7 @@ void full_session(int fmt, int mode, int experts) {
               "a stage image's estimate leaves the draft out");
         SavedConversation stage,stage_b,stage_back;
         check(conversation_snapshot_save(stage,view,ss,g,nullptr,err),"capture a stage image");
-        check(stage.kv.size()==a.kv.size()-1 && equal(stage.kv[0],a.kv[0]) && stage.live.gdn==a.live.gdn,
+        check(stage.kv.size()==a.kv.size()-1 && equal(stage.kv[0],a.kv[0]) && stage.live.state_a==a.live.state_a,
               "a stage image holds the session's own layers, no draft");
         check(stage.bytes()<a.bytes(),"a stage image is smaller by the draft ring");
         check(conversation_snapshot_validate(stage,ss,g,nullptr,err),"validate a stage image without a draft");
@@ -227,11 +227,11 @@ void full_session(int fmt, int mode, int experts) {
         check(conversation_snapshot_save(stage_b,view,ss,g,nullptr,err),"capture another stage state");
         check(conversation_snapshot_restore(a,ss,g,nullptr,err)==ConversationRestore::invalid,
               "restoring a draft image as a stage image is refused before any write");
-        check(conversation_snapshot_save(stage_back,view,ss,g,nullptr,err) && stage_back.live.gdn==stage_b.live.gdn &&
+        check(conversation_snapshot_save(stage_back,view,ss,g,nullptr,err) && stage_back.live.state_a==stage_b.live.state_a &&
               equal(stage_back.kv[0],stage_b.kv[0]),"the refusal left the stage untouched");
         check(conversation_snapshot_restore(stage,ss,g,nullptr,err)==ConversationRestore::restored,"restore a stage image");
-        check(conversation_snapshot_save(stage_back,view,ss,g,nullptr,err) && stage_back.live.gdn==stage.live.gdn &&
-              stage_back.live.dead==stage.live.dead && equal(stage_back.kv[0],stage.kv[0]),"stage A/B/A exactness");
+        check(conversation_snapshot_save(stage_back,view,ss,g,nullptr,err) && stage_back.live.state_a==stage.live.state_a &&
+              stage_back.live.state_d==stage.live.state_d && equal(stage_back.kv[0],stage.kv[0]),"stage A/B/A exactness");
         // its retained K/V: the next park copies only what changed, and equals a full capture
         ConversationKvReuse reuse{stage.kv,65,65,{}};
         SavedConversation fresh,incremental;
@@ -240,7 +240,7 @@ void full_session(int fmt, int mode, int experts) {
         check(conversation_snapshot_capture_bytes(reuse,view,ss,g,nullptr,peak,err),"admit an incremental stage capture");
         check(conversation_snapshot_save(incremental,view,ss,g,nullptr,err,std::move(reuse),&reused),"incremental stage capture");
         check(reused>0 && incremental.bytes()<=peak && equal(incremental.kv[0],fresh.kv[0]) &&
-              incremental.live.gdn==fresh.live.gdn,"an incremental stage capture reuses pages and equals a full one");
+              incremental.live.state_a==fresh.live.state_a,"an incremental stage capture reuses pages and equals a full one");
         SavedConversation split_image=stage;
         split_image.stage_images.push_back(stage);
         check(!conversation_snapshot_validate(split_image,ss,g,draft.state,err),
@@ -252,7 +252,7 @@ void full_session(int fmt, int mode, int experts) {
     check(conversation_checkpoint_restore(a.checkpoints[0],ss,g,err),"restore early running checkpoint");
     std::vector<uint8_t> spare(sizes.dead);
     cuda_check(cudaMemcpy(spare.data(),main.state.idx_pooled,sizes.dead,cudaMemcpyDeviceToHost));
-    check(std::equal(spare.begin(),spare.end(),a.checkpoints[0].dead.begin(),a.checkpoints[0].dead.end()),"checkpoint rebuilds spare row over a later completed block");
+    check(std::equal(spare.begin(),spare.end(),a.checkpoints[0].state_d.begin(),a.checkpoints[0].state_d.end()),"checkpoint rebuilds spare row over a later completed block");
     check(ss.ple_prev[0]==2 && ss.ple_prev[1]==3,"checkpoint PLE token window");
 }
 

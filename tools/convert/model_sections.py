@@ -21,7 +21,9 @@ import os
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE))
 import ggufq  # noqa: E402
+from arch import for_architecture  # noqa: E402
 from gguf_reader import GGUFFile  # noqa: E402
 
 
@@ -33,37 +35,12 @@ FLOAT = {"BF16", "F32", "F16"}
 ROLES = ("gate", "up", "down")
 ALIGN = 64                      # between the tensors of `dense`
 EXPERT_RE = re.compile(r"^blk\.\d+\.ffn_(gate|up|down|gate_up)_exps\.(weight|scale|input_scale)$")
-# the PLE table comes from the `gguf` section, never the dense pool
-NOT_IN_DENSE = {"per_layer_token_embd.weight"}
-
-# float form the engine reads each dense tensor in (name without `blk.N.`); other forms are converted and recorded
-# in meta.conversions:
-#   F32 -> BF16 when exactly BF16 (low 16 bits zero)              exact, by default
-#   other F32, F16 or quantized -> BF16                           rounds (nearest-even): only with --compat-bf16
-#   F32 -> F16 (ple_conv1d)                                       index kind 3, narrowed by the loader
-#   F16 / BF16 -> F32                                             exact widening
-# tensors not listed are written as stored (floats) or served from the `gguf` section (quantized)
-FORM = {
-    "ffn_gate_inp.weight": "BF16", "ffn_gate_inp_shexp.weight": "BF16",
-    "hc_attn_down.weight": "BF16", "hc_attn_up.weight": "BF16", "hc_attn_inject.weight": "BF16",
-    "hc_ffn_down.weight": "BF16", "hc_ffn_up.weight": "BF16", "hc_ffn_inject.weight": "BF16",
-    "output_hc_down.weight": "BF16", "output_hc_up.weight": "BF16",
-    "indexer.k_proj.weight": "BF16", "indexer.q_proj.weight": "BF16",
-    "ssm_alpha.weight": "BF16", "ssm_beta.weight": "BF16",
-    "ple_key.weight": "BF16", "ple_value.weight": "BF16", "ple_conv1d.weight": "F16",
-    "attn_q_norm.weight": "F32", "attn_k_norm.weight": "F32", "hc_attn_norm.weight": "F32",
-    "hc_ffn_norm.weight": "F32", "output_hc_norm.weight": "F32", "indexer.q_norm.weight": "F32",
-    "indexer.k_norm.weight": "F32", "ple_norm_conv.weight": "F32", "ple_norm_key.weight": "F32",
-    "ple_norm_query.weight": "F32", "ssm_a": "F32", "ssm_conv1d.weight": "F32", "ssm_dt.bias": "F32",
-    "ssm_norm.weight": "F32",
-}
-# PLE key encodings the engine reads natively; other quantized keys need --compat-bf16
-NATIVE_PLE_KEY = {"Q2_0", "Q8_0"}
 KIND = {"BF16": "4", "F16": "5", "F32": "2"}
+QWEN = for_architecture("qwen4exp")
 
 
-def form_of(name: str):
-    return FORM.get(re.sub(r"^blk\.\d+\.", "", name))
+def form_of(name: str, arch=QWEN):
+    return arch.form_of(name)
 
 
 # ------------------------------------------------------------------ the source model
@@ -107,17 +84,21 @@ def check_split(files) -> None:
 class SourceModel:
     """All shards of one model: name -> (GGUFFile, TensorInfo, shard path), in file order."""
 
-    def __init__(self, paths):
+    def __init__(self, paths, described=frozenset()):
+        """`described`: tensors whose shard may stop after its header; their names land in `short`."""
         self.paths = [pathlib.Path(p) for p in paths]
         self.files = [GGUFFile(p) for p in self.paths]
         self.sizes = [p.stat().st_size for p in self.paths]
         check_split(self.files)
         self._maps: dict[pathlib.Path, np.ndarray] = {}
         self.where: dict[str, tuple] = {}
+        self.short: set[str] = set()
         for p, g, size in zip(self.paths, self.files, self.sizes):
             for t in g.tensors:
                 n = t.expected_bytes()
-                if n is None or g.data_start + t.offset + n > size:
+                if n is not None and g.data_start + t.offset + n > size and t.name in described:
+                    self.short.add(t.name)
+                elif n is None or g.data_start + t.offset + n > size:
                     raise ConvertError(f"{p.name}: unsupported or truncated tensor {t.name}")
                 if t.name in self.where:
                     raise ConvertError(f"{p.name}: duplicate tensor {t.name}")
@@ -171,10 +152,10 @@ def f16_values(values: np.ndarray, name: str) -> np.ndarray:
     return h
 
 
-def convert_tensor(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool):
+def convert_tensor(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool, arch=QWEN):
     """The dense form of one tensor: (index kind, stored bytes, destination bytes, record or None), or an error string.
         `record` describes a conversion for meta.conversions."""
-    form = form_of(name)
+    form = arch.form_of(name)
     if form is None or form == type_name:
         return KIND[type_name], raw.tobytes(), raw.nbytes, None
     values = _dequantize(raw, type_name)
@@ -222,8 +203,9 @@ class Dense:
     """The `dense` section: `plan` validates every tensor first, `chunks` streams the pool and fills `rows` and `records`,
         `index_text` is the `dense.index`."""
 
-    def __init__(self, model: SourceModel, compat_bf16: bool = False):
+    def __init__(self, model: SourceModel, compat_bf16: bool = False, arch=QWEN):
         self.model = model
+        self.arch = arch
         self.compat_bf16 = compat_bf16
         self.todo = []
         self.rows: list[list[str]] = []
@@ -231,14 +213,13 @@ class Dense:
         self.pool_bytes = 0
         problems = []
         for name, (g, t, p) in model.where.items():
-            if is_expert(name) or name in NOT_IN_DENSE:
+            if is_expert(name) or name in arch.not_in_dense:
                 continue
             if len(t.shape) > 2:
                 raise ConvertError(f"tensor {name} has {len(t.shape)} dimensions; the index holds two")
-            form = form_of(name)
+            form = arch.form_of(name)
             # quantized tensors are served from the source unless the pool needs them dequantized (--compat-bf16)
-            native = t.type_name not in FLOAT and (
-                form is None or (name == "blk.1.ple_key.weight" and t.type_name in NATIVE_PLE_KEY))
+            native = t.type_name not in FLOAT and arch.native(name, t.type_name)
             if t.type_name not in FLOAT and not native and not compat_bf16:
                 problems.append(f"{name} is {t.type_name}, but the engine requires {form}; use --compat-bf16")
             self.todo.append((name, t, p, native))
@@ -256,7 +237,7 @@ class Dense:
                 continue
             raw = self.model.bytes(name)
             try:
-                got = convert_tensor(name, t.type_name, raw, self.compat_bf16)
+                got = convert_tensor(name, t.type_name, raw, self.compat_bf16, self.arch)
             except ValueError as e:
                 got = str(e)
             if isinstance(got, str):

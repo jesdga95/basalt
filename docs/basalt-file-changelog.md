@@ -10,12 +10,14 @@ The current version. The engine refuses version 1 files and names
 download or any re-quantizing.
 
 - **Contains:** `meta`, `tokenizer/*`, `dense`, `dense.index`, `experts`, `experts.layout`, `gguf`, `mtp/*`, `hc8`,
-  `vision/*`.
+  `dspark/gguf`, `vision/*`.
 - **Added `hc8`, now required:** the int8 copies of the hyper-connection matrices the decode reads, the bits the
   engine used to compute at every start. A start reads them as they are and skips reading the BF16 matrices to
   quantize them (about half a second).
 - **Removed `profile`:** the expert profile decides which experts start in VRAM. It is placement policy that improves
   independently of the weights, so it moved to the engine (`data/profiles`), where a better profile needs no new file.
+- **Added `dspark/gguf`, optional, no version change:** a DeepSeek pack's DSpark drafter. The engine ignores sections it
+  does not name, so an engine from before it runs such a pack plain, and a pack without it runs plain on any engine.
 - **Trimmed `meta`:** no `sampling` (the server reads the GGUF metadata's `general.sampling.*` keys), no `profile` or
   `hc8` records and no converter revision, provenance that changed whenever a section was replaced.
 

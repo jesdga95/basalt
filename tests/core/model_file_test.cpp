@@ -150,10 +150,10 @@ int main() {
         std::vector<uint8_t> text;
         check(m.read("experts.layout", text, err), "read the layout section");
         // a header of the .basalt spelling with no rows is refused as incomplete, not for its header
-        const bool ok = basalt::kernels::cpu::expert_layout_load_text(std::string(text.begin(), text.end()), 2, 2, err);
+        const bool ok = basalt::kernels::cpu::expert_layout_load_text(std::string(text.begin(), text.end()), 2, 2, err, 2560, 640);
         check(!ok && err.find("missing or not contiguous") != std::string::npos,
               "\"# experts v5\" is read as a layout header: " + err);
-        check(!basalt::kernels::cpu::expert_layout_load_text(std::string(), 2, 2, err), "empty text is refused");
+        check(!basalt::kernels::cpu::expert_layout_load_text(std::string(), 2, 2, err, 2560, 640), "empty text is refused");
     }
     {
         std::map<std::string, Hc8Copy> back;
