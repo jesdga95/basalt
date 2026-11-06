@@ -918,6 +918,30 @@
       "prefill_16k_tps": 4876.9,
       "prefill_64k_tps": 4961.0,
       "decode_tps": 186.8
+    },
+    {
+      "submitter": "Redhot-Local",
+      "date": "2026-11-04",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.8
+        }
+      ],
+      "ram_gib": 62,
+      "cpu": "AMD Ryzen 9 9900X, 12 cores",
+      "ram_gbps": 75.2,
+      "os": "Linux",
+      "quant": "IQ3_S",
+      "prefill_16k_tps": 2531.6,
+      "prefill_64k_tps": 2521.6,
+      "decode_tps": 159.0,
+      "notes": "Single RTX 5060 Ti 16GB, 2x32GB DDR5-6000, no desktop environment"
     }
   ]
 }
