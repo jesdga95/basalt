@@ -68,12 +68,13 @@ const char* name_of(int t) {
         case 13: return "Q5_K";
         case 14: return "Q6_K";
         case 7: return "Q5_1";
+        case 6: return "Q5_0";
         case 8: return "Q8_0";
         case 40: return "NVFP4";
         default: return "?";
     }
 }
-int block_values(int t) { return t == 20 || t == 7 || t == 8 ? 32 : t == 42 || t == 40 ? 64 : 256; }
+int block_values(int t) { return t == 20 || t == 7 || t == 6 || t == 8 ? 32 : t == 42 || t == 40 ? 64 : 256; }
 // NVFP4 experts end in {s_gate, s_up, s_down, 0}: FP32 scales in 0.5 .. 2
 void append_nvfp4_tail(std::vector<uint8_t>& b, std::mt19937& rng) {
     std::uniform_real_distribution<float> u(0.5f, 2.0f);
@@ -561,7 +562,7 @@ int main(int argc, char** argv) {
             glue_bench(s, rng, bo.gu, bo.down, bo.ff, glue_t, glue_pool, 60);
         } else {   // every format pair the launches cover, every window width
             for (int gu : {16, 17, 18, 21, 22, 42})
-                for (int dt : {20, 42})
+                for (int dt : {20, 42, 6})
                     for (int T = 1; T <= k::kVerifyMaxT; ++T) glue_bench(s, rng, gu, dt, 640, T, glue_pool, 20);
             for (int T = 1; T <= k::kVerifyMaxT; ++T) glue_bench(s, rng, 21, 20, 640, T, glue_pool, 20, true);   // odd ids
         }
@@ -569,8 +570,9 @@ int main(int argc, char** argv) {
         return g_fail ? 1 : 0;
     }
     for (int gu : {16, 17, 18, 21, 22, 23, 29, 42, 12, 13, 14, 8})        // GU_FMTS
-        for (int dt : {20, 23, 42, 7, 8}) check(gu, dt, 512, 256, s, rng);   // D_FMTS; IQ4_XS: n_ff % 256
+        for (int dt : {20, 23, 42, 7, 6, 8}) check(gu, dt, 512, 256, s, rng);   // D_FMTS; IQ4_XS: n_ff % 256
     check(14, 8, 2560, 640, s, rng);                                    // Q6_K gate/up, a model's shape
+    for (int gu : {22, 18, 23}) check(gu, 6, 2560, 640, s, rng);        // Q5_0 down at a model's shape
     check(40, 40, 512, 256, s, rng);                                    // NVFP4: its own pair, with the scale tail
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(40, 40, 2560, 640, s, rng);
@@ -580,7 +582,7 @@ int main(int argc, char** argv) {
     {   // --gu2: the new launches take native_gu2_kernel (2560-value rows only), v1 the multi kernel
         if (gu2) {
             for (int gu : {16, 17, 18, 21, 22, 42})
-                for (int dt : {20, 42}) check(gu, dt, 2560, 640, s, rng, gu == 18 ? 8 : 6);
+                for (int dt : {20, 42, 6}) check(gu, dt, 2560, 640, s, rng, gu == 18 ? 8 : 6);
             check(22, 20, 2560, 512, s, rng, 3);
         }
     }
