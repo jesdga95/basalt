@@ -28,9 +28,9 @@ A config file is one JSON object. `models` lists the models; `engine` applies to
 
 - Keys are flag names without dashes. Switches are `true`. A repeatable option (`allowed-host`, `cors-origin`, `image-url-host`,
   `image-dir`) takes a list. `model` paths are relative to the file.
-- A row marked Flash-Next only or DeepSeek only is an unknown flag for the other model, and stops its start.
-- Precedence: command line, then config file, then defaults. A wrong block or an unknown name stops the start. `api-key` cannot be in
-  a file.
+- A row marked Flash-Next only or DeepSeek only stops the start in a model entry or on the command line of the other model; in the top-level `engine` it is left out for that model, with a start line ([checks at start](models.md#checks-at-start)).
+- Precedence: command line, then config file, then defaults; `--model` and `--alias` do not go with `--config` (its entries name the models).
+  A wrong block or an unknown name stops the start. `api-key` cannot be in a file.
 - The defaults are the fastest settings that need no knowledge of the machine. The keys that change output or memory (8,192 context,
   fp16 KV) are kept for you to set.
 

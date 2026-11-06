@@ -168,8 +168,11 @@ class ConfigFile(unittest.TestCase):
 
     def test_model_and_alias_do_not_go_with_a_config(self):
         p = conf({"models": [{"model": "a.basalt"}]})
-        for extra in (["--model", "b.basalt"], ["--alias", "x"]):
-            with self.assertRaisesRegex(ValueError, "set in a model entry"):
+        for extra, text in ((["--model", "b.basalt"], "^--model is not supported when using a config file$"),
+                            (["--alias", "x"], "^--alias is not supported when using a config file$"),
+                            (["--model", "b.basalt", "--alias", "x"],
+                             "^--model and --alias are not supported when using a config file$")):
+            with self.assertRaisesRegex(ValueError, text):
                 model_settings(build_parser(), ["--config", p, *extra])
 
     def test_the_command_line_applies_to_every_model(self):
