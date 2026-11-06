@@ -1033,6 +1033,97 @@
       "prefill_16k_tps": 4730.4,
       "prefill_64k_tps": 5045.3,
       "decode_tps": 192.3
+    },
+    {
+      "submitter": "polygizer",
+      "date": "2026-11-05",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 575,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 57.8
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen 7 9700X, 8 cores",
+      "ram_gbps": 64.6,
+      "os": "Windows",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 7922.8,
+      "prefill_64k_tps": 9865.8,
+      "decode_tps": 369.3
+    },
+    {
+      "submitter": "polygizer",
+      "date": "2026-11-05",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 575,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 57.7
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen 7 9700X, 8 cores",
+      "ram_gbps": 64.6,
+      "os": "Windows",
+      "quant": "Q4_K_XL",
+      "prefill_16k_tps": 7277.6,
+      "prefill_64k_tps": 8410.7,
+      "decode_tps": 219.6
+    },
+    {
+      "submitter": "polygizer",
+      "date": "2026-11-05",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 575,
+          "pcie": "5.0 x16"
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen 7 9700X, 8 cores",
+      "ram_gbps": 64.5,
+      "os": "Windows",
+      "quant": "Q5_K_XL",
+      "prefill_16k_tps": 6788.8,
+      "prefill_64k_tps": 8215.2,
+      "decode_tps": 162.4
+    },
+    {
+      "submitter": "polygizer",
+      "date": "2026-11-05",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 575,
+          "pcie": "5.0 x16",
+          "h2d_gbps": 57.8
+        }
+      ],
+      "ram_gib": 125,
+      "cpu": "AMD Ryzen 7 9700X, 8 cores",
+      "ram_gbps": 63.3,
+      "os": "Windows",
+      "quant": "IQ3_S",
+      "prefill_16k_tps": 7910.8,
+      "prefill_64k_tps": 9180.7,
+      "decode_tps": 431.1
     }
   ]
 }
