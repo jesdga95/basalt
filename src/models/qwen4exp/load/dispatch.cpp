@@ -69,6 +69,7 @@ int dispatch(Context& context) {
     auto& read_cap = context.read_cap;
     auto& kSplitRefCells = *context.kSplitRefCells;
     auto& split_hand_rows = *context.split_hand_rows;
+    auto& split_chunk_cap = *context.split_chunk_cap;
     auto& split_peer_rows = *context.split_peer_rows;
     auto& split_price = context.split_price;
     auto& split_layers_text = context.split_layers_text;
@@ -187,6 +188,7 @@ int dispatch(Context& context) {
             .read_cap = read_cap,
             .kSplitRefCells = kSplitRefCells,
             .split_hand_rows = split_hand_rows,
+            .split_chunk_cap = split_chunk_cap,
             .split_peer_rows = split_peer_rows,
             .split_price = split_price,
             .split_layers_text = split_layers_text,
