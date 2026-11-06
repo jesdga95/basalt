@@ -625,19 +625,21 @@ public:
 
     ExpertTier* expert_tier(std::string& err) override { return ensure_tier(err) ? tier_.get() : nullptr; }
 
-    // Kernels write the mapped ids and activation: no copy-engine job queues behind the copies of experts.
-    void routed_stage(int, const float* x, const int32_t* ids, void* stream) override {
-        copy_row(x, d_x_host_, g_.n_embd, stream);
-        kernels::quantize_q8_1_rows(x, 1, g_.n_embd, ex_xq_, stream);
-        copy_words(ids, d_ids_host_, g_.n_used, stream);   // last: the host goes on once all of them landed
+    // Kernels write the mapped activation and ids: no copy-engine job queues behind the copies of experts.
+    void stage_rows(int T, const float* x, void* stream) override {
+        copy_rows(x, d_x_host_, T * g_.n_embd, stream);
+        kernels::quantize_q8_1_rows(x, T, g_.n_embd, ex_xq_, stream);
     }
 
-
+    void stage_ids(int T, const int32_t* ids, void* stream) override {
+        copy_words(ids, d_ids_host_, T * g_.n_used, stream);   // after the rows: the host goes on once all of them landed
+    }
 
     bool routed_experts(int il, const float* x, const int32_t* ids, const float* w, float* out, void* stream,
                         std::string& err) override {
         if (!ensure_tier(err)) return false;
-        routed_stage(il, x, ids, stream);
+        stage_rows(1, x, stream);
+        stage_ids(1, ids, stream);
         return routed_experts_staged(il, x, ids, w, out, stream, err);
     }
 
@@ -649,12 +651,6 @@ public:
     bool routed_and_shared_staged(int il, const float*, const int32_t*, const float* w, float* out, float* shared_out,
                                   void* stream, std::string& err) override {
         return routed_run(il, w, out, shared_out, stream, err);
-    }
-
-    void routed_stage_window(int T, const float* x, const int32_t* ids, void* stream) override {
-        for (int t = 0; t < T; ++t) copy_row(x + (size_t) t * g_.n_embd, d_x_host_ + (size_t) t * g_.n_embd, g_.n_embd, stream);
-        kernels::quantize_q8_1_rows(x, T, g_.n_embd, ex_xq_, stream);
-        copy_words(ids, d_ids_host_, T * g_.n_used, stream);   // last: the host goes on once all of them landed
     }
 
     // The routed experts of a window. The tier is asked once per distinct expert of the window; each card runs what it holds
@@ -763,8 +759,8 @@ public:
         return true;
     }
 
-    // Every id of the layer landed in the mapped ids (routed_stage writes them last); the stream goes on meanwhile. A launch
-    // that failed never writes them.
+    // Every id of the layer landed in the mapped ids (stage_ids writes them after the rows); the stream goes on meanwhile.
+    // A launch that failed never writes them.
     void await_ids(cudaStream_t st, int n_ids) {
         if (ids_read_) {   // a layer that failed left its ids behind
             cudaStreamSynchronize(st);
