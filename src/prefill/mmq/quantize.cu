@@ -6,14 +6,16 @@
 #include <cstdint>
 
 // One thread quantizes 4 consecutive floats; the 8 threads of a 32-value block share one scale (and, for DS4, the
-// sum of its rounded values times the scale).  Row i of the output is row ids[i] of the input (row i without `ids`).
+// sum of its rounded values times the scale); for D2S6 the 16 threads of 64 values share one scale, and each 16 values
+// keep the sum of their rounded values times it.  Row i of the output is row ids[i] of the input (row i without `ids`).
 template <mmq_q8_1_ds_layout ds_layout>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int ne1, const int ne2) {
 
-    constexpr int vals_per_scale = 32;
+    constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
+    constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
 
     const int64_t i0 = ((int64_t)blockDim.x*blockIdx.y + threadIdx.x)*4;
 
@@ -58,10 +60,10 @@ static __global__ void quantize_mmq_q8_1(
 
     // DS4: the block's sum of the rounded values times d, so the minimum's term meets the same activations as the codes
     float sum = 0.0f;
-    if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
         int isum = (int) q.x + (int) q.y + (int) q.z + (int) q.w;
 #pragma unroll
-        for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
+        for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
             isum += __shfl_xor_sync(0xFFFFFFFF, isum, offset, WARP_SIZE);
         }
         sum = d * (float) isum;
@@ -74,7 +76,14 @@ static __global__ void quantize_mmq_q8_1(
     char4 * yqs4 = (char4 *) y[ib].qs;
     yqs4[iqs/4] = q;
 
-    if (iqs % 32 == 0) {
+    if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+        if (iqs % 16 == 0 && iqs < 96) {
+            y[ib].d2s6[2 + iqs/16] = sum;
+            if (iqs % 64 == 0) {
+                y[ib].d2s6[iqs/64] = d;
+            }
+        }
+    } else if (iqs % 32 == 0) {
         if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
             y[ib].ds4[iqs/32] = make_half2(d, sum);
         } else {
@@ -101,6 +110,10 @@ void quantize_mmq_q8_1_cuda(
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4><<<num_blocks, block_size, 0, stream>>>(
+                x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6:
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6><<<num_blocks, block_size, 0, stream>>>(
                 x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
             break;
     }
