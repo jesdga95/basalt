@@ -942,6 +942,51 @@
       "prefill_64k_tps": 2521.6,
       "decode_tps": 159.0,
       "notes": "Single RTX 5060 Ti 16GB, 2x32GB DDR5-6000, no desktop environment"
+    },
+    {
+      "submitter": "Serpov",
+      "date": "2026-11-04",
+      "commit": "1b3f69641c",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 250,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.7
+        },
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 250,
+          "pcie": "5.0 x8",
+          "h2d_gbps": 28.8
+        },
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 250,
+          "pcie": "4.0 x4",
+          "h2d_gbps": 6.5
+        },
+        {
+          "name": "RTX 5070 Ti",
+          "vram_gib": 16,
+          "power_w": 250,
+          "pcie": "4.0 x4",
+          "h2d_gbps": 7.0
+        }
+      ],
+      "ram_gib": 92,
+      "cpu": "Intel Core Ultra 7 270K Plus, 24 cores",
+      "ram_gbps": 101.0,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 4841.8,
+      "prefill_64k_tps": 5023.2,
+      "decode_tps": 315.6,
+      "notes": "4x RTX 5070 Ti at a 250 W limit (300 W default); two cards on chipset 4.0 x4 slots; resident experts, 0 SSD spill"
     }
   ]
 }
