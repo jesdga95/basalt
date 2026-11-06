@@ -1214,6 +1214,32 @@
       "prefill_16k_tps": 7910.8,
       "prefill_64k_tps": 9180.7,
       "decode_tps": 431.1
+    },
+    {
+      "submitter": "gpu-node-inferno",
+      "date": "2026-11-06",
+      "commit": "86005088f4",
+      "preset": "community-1",
+      "model": "Qwen3.8-Flash-Next",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 600,
+          "pcie": "4.0 x16",
+          "h2d_gbps": 28.9
+        }
+      ],
+      "ram_gib": 121,
+      "cpu": "AMD Ryzen 9 9950X, 16 cores",
+      "ram_gbps": 58.8,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "kv": "int8",
+      "prefill_16k_tps": 7248.2,
+      "prefill_64k_tps": 9408.0,
+      "decode_tps": 374.2,
+      "notes": "single RTX 5090 at its 600 W limit, 121 GiB DDR5 dual-channel; resident experts, 0 SSD spill"
     }
   ]
 }
