@@ -73,6 +73,8 @@ public:
 
     int max_expert_cards() const override { return 1; }
 
+    const char* model_name() const override { return "DeepSeek-V4.1-Flash"; }
+
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
         (void) code;
         if (a == "--no-prompt-skip") o.no_prompt_skip = true;

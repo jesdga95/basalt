@@ -37,6 +37,8 @@ public:
     const char* quality_flags() const override { return "--spec 5 --adapt-swaps 0 --peer-adapt-swaps 0 --resident-experts"; }
     int quality_window() const override { return 0; }
 
+    const char* model_name() const override { return "Qwen3.8-Flash-Next"; }
+
     std::vector<model::SideTableSpec> side_tables(const model::ModelDesc&) const override {
         return {{model::SideTableSpec::Kind::Ple, "per_layer_token_embd.weight", 0, 0}};
     }

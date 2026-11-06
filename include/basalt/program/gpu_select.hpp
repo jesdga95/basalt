@@ -93,7 +93,8 @@ std::string gpu_identity(size_t n);
 /// `arch`: the model's architecture when one was given; `spec` the verify window and `max_context` the context the start
 /// would run (0: no model given).
 std::string gpu_plan_json(const std::vector<GpuCard>& visible, const GpuChoice& c, const std::string& arch = {},
-                          const std::string& quality_flags = {}, int quality_window = 1, int spec = 0, int64_t max_context = 0);
+                          const std::string& quality_flags = {}, int quality_window = 1, int spec = 0, int64_t max_context = 0,
+                          const std::string& model_name = {});
 
 /// For a launcher (basalt-bench, basalt-probe): resolves `text` ("" = unset), prints its lines under `label`, narrows
 /// the environment the engine inherits, and returns the engine's `gpu` value in `engine_value` and the chosen cards in
