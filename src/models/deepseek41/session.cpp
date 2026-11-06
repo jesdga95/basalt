@@ -56,14 +56,22 @@ public:
             if (e) cudaGraphExecDestroy(e);
         for (cudaGraphExec_t e : tail_g_)
             if (e) cudaGraphExecDestroy(e);
+        for (cudaEvent_t e : mix_ev_)
+            if (e) cudaEventDestroy(e);
+        if (mix_st_) cudaStreamDestroy(mix_st_);
         if (stream_) cudaStreamDestroy(stream_);
     }
 
     bool init(std::string& err) {
-        if (cudaStreamCreate(&stream_) != cudaSuccess) {
+        if (cudaStreamCreate(&stream_) != cudaSuccess || cudaStreamCreateWithFlags(&mix_st_, cudaStreamNonBlocking) != cudaSuccess) {
             err = "cannot create a CUDA stream";
             return false;
         }
+        for (cudaEvent_t& e : mix_ev_)
+            if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) {
+                err = "cannot create a CUDA event";
+                return false;
+            }
         const size_t n = (size_t) g_.n_embd;
         head_g_.assign((size_t) g_.n_layers * 2 * kMaxWindow, nullptr);   // [T - 1][layer][with previous tail]
         tail_g_.assign((size_t) g_.n_layers * kMaxWindow, nullptr);
@@ -647,8 +655,12 @@ private:
         ra.k = g_.n_used;
         ra.weight_scale = g_.weight_scale;
 
+        // each sublayer's mixes run beside its collapse: only its expansion reads them
+        DS_CUDA(cudaEventRecord(mix_ev_[0], stream_));
+        DS_CUDA(cudaStreamWaitEvent(mix_st_, mix_ev_[0], 0));
         hc_mixes(x_, wf(il, "hc_attn_fn.weight"), wf(il, "hc_attn_scale.weight"), wf(il, "hc_attn_base.weight"), T, hca,
-                 hc_ws_, coef_a_, st);
+                 hc_ws_, coef_a_, mix_st_);
+        DS_CUDA(cudaEventRecord(mix_ev_[1], mix_st_));
         if (pre_prev) {
             hc_pre_rms_norm(x_, pre_prev, kHcCoef, wf(il, "attn_norm.weight"), T, (int) n, g_.rms_eps, cur_, normed_, st);
         } else {
@@ -663,12 +675,17 @@ private:
                    : !ops_->attention_window(il, T, normed_, attn_out_, st, err_))
             return false;
         dump("attn_out", il, pos, attn_out_, n * sizeof(float));
+        DS_CUDA(cudaStreamWaitEvent(stream_, mix_ev_[1], 0));
         hc_post(attn_out_, x_, coef_a_, kHcCoef, T, (int) n, x2_, st);
         dump("hc_attn_post", il, pos, x2_, 4 * n * sizeof(float));
 
-        // FFN sublayer (the collapse uses the attention sublayer's pre-mix: single-pass mHC)
+        // FFN sublayer (the collapse uses the attention sublayer's pre-mix: single-pass mHC); its mixes are read by the
+        // next layer, so they join at the end of the head
+        DS_CUDA(cudaEventRecord(mix_ev_[2], stream_));
+        DS_CUDA(cudaStreamWaitEvent(mix_st_, mix_ev_[2], 0));
         hc_mixes(x2_, wf(il, "hc_ffn_fn.weight"), wf(il, "hc_ffn_scale.weight"), wf(il, "hc_ffn_base.weight"), T, hca,
-                 hc_ws_, coef_f, st);
+                 hc_ws_, coef_f, mix_st_);
+        DS_CUDA(cudaEventRecord(mix_ev_[3], mix_st_));
         hc_pre_rms_norm(x2_, coef_a_, kHcCoef, wf(il, "ffn_norm.weight"), T, (int) n, g_.rms_eps, cur_, normed_, st);
         dump("hc_ffn_pre", il, pos, cur_, n * sizeof(float));
         router(normed_, wf(il, "ffn_gate_inp.weight"), wf(il, "exp_probs_b.bias"), T, ra, rlogits_, ids_, rw_, st);
@@ -677,6 +694,7 @@ private:
         dump("ffn_moe_weights_scaled", il, pos, rw_, (size_t) g_.n_used * sizeof(float));
         if (T == 1) ops_->routed_stage(il, normed_, ids_, st);
         else ops_->routed_stage_window(T, normed_, ids_, st);
+        DS_CUDA(cudaStreamWaitEvent(stream_, mix_ev_[3], 0));
         // it needs no routing: it runs while the host finds the routed experts' places
         if (!fused_) return true;
         return T == 1 ? ops_->shared_expert(il, normed_, sh_out_, st, err_) : ops_->shared_expert_window(il, T, normed_, sh_out_, st, err_);
@@ -912,6 +930,8 @@ private:
     float* d_mask_ = nullptr;
     int32_t* d_hist_ = nullptr;
     cudaStream_t stream_ = nullptr;
+    cudaStream_t mix_st_ = nullptr;   // the hyper-connection mixes, a branch of the head
+    cudaEvent_t mix_ev_[4] = {};      // its fork and join points: attention sublayer, FFN sublayer
     std::unique_ptr<LayerOps> ops_;
     std::unique_ptr<Prefill> prefill_;
     bool short_prompt_ = false;   // prefill_ is a short read's and stays between reads

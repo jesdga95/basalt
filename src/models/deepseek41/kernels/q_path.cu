@@ -51,14 +51,24 @@ __global__ void __launch_bounds__(256) rms_norm_rows_kernel(float* x, const floa
 
 size_t q_path_scratch_bytes(int n_tokens) { return kernels::native_q8_1_bytes(kAttnQRank, n_tokens); }
 
-void q_path(const void* x_q8_1, const QPathWeights& w, int n_tokens, const int32_t* pos, const RopeTable& rope,
-            void* xq_scratch, float* qr, float* q, void* stream) {
-    if (n_tokens < 1 || n_tokens > kAttnMaxTokens) throw std::invalid_argument("q_path: n_tokens");
+void q_latent(const void* x_q8_1, const QPathWeights& w, int n_tokens, float* qr, void* stream) {
+    if (n_tokens < 1 || n_tokens > kAttnMaxTokens) throw std::invalid_argument("q_latent: n_tokens");
     kernels::native_mmvq(w.wq_a_type, w.wq_a, x_q8_1, qr, kAttnEmbd, kAttnQRank, n_tokens, stream);
     rms_norm_rows_kernel<<<n_tokens, 256, 0, (cudaStream_t) stream>>>(qr, w.q_norm, kAttnQRank, w.rms_eps);
+}
+
+void q_heads(const QPathWeights& w, int n_tokens, const int32_t* pos, const RopeTable& rope, void* xq_scratch,
+             const float* qr, float* q, void* stream) {
+    if (n_tokens < 1 || n_tokens > kAttnMaxTokens) throw std::invalid_argument("q_heads: n_tokens");
     kernels::native_quantize_q8_1(qr, xq_scratch, kAttnQRank, n_tokens, stream);
     kernels::native_mmvq(w.wq_b_type, w.wq_b, xq_scratch, q, kAttnQRank, kAttnHeads * kAttnHeadDim, n_tokens, stream);
     rope_rows(q, n_tokens * kAttnHeads, kAttnHeadDim, kAttnHeads, pos, rope, false, stream);
+}
+
+void q_path(const void* x_q8_1, const QPathWeights& w, int n_tokens, const int32_t* pos, const RopeTable& rope,
+            void* xq_scratch, float* qr, float* q, void* stream) {
+    q_latent(x_q8_1, w, n_tokens, qr, stream);
+    q_heads(w, n_tokens, pos, rope, xq_scratch, qr, q, stream);
 }
 
 }  // namespace basalt::models::deepseek41

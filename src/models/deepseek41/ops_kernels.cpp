@@ -79,11 +79,25 @@ public:
     ~KernelOps() override {
         for (cudaGraphExec_t e : share_g_)
             if (e) cudaGraphExecDestroy(e);
+        for (cudaEvent_t e : br_ev_)
+            if (e) cudaEventDestroy(e);
+        for (cudaStream_t s : br_)
+            if (s) cudaStreamDestroy(s);
         for (void* p : allocs_) cudaFree(p);
     }
 
     bool init(std::string& err) {
         const int nl = g_.n_layers;
+        for (cudaStream_t& s : br_)
+            if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) {
+                err = "deepseek41: cannot create the attention's streams";
+                return false;
+            }
+        for (cudaEvent_t& e : br_ev_)
+            if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) {
+                err = "deepseek41: cannot create the attention's events";
+                return false;
+            }
         ring_.assign((size_t) nl, nullptr);
         comp_kv_.assign((size_t) nl, nullptr);
         comp_ik_.assign((size_t) nl, nullptr);
@@ -455,52 +469,68 @@ public:
 
         const int32_t *d_pos = dpos_ + il * kPosStride, *d_start = d_pos + kMaxT, *d_n = d_pos + 2 * kMaxT,
                       *d_lim = d_pos + 3 * kMaxT;
+        cudaStream_t ms = (cudaStream_t) stream;
+        const auto failed = [&](const char* what) {
+            err = std::string("deepseek41: ") + what + ": " + cudaGetErrorString(cudaGetLastError());
+            return false;
+        };
 
-        // window latent
+        // window latent, beside the query path
         kernels::native_quantize_q8_1(x, xq_, kAttnEmbd, T, stream);
-        kernels::native_mmvq(wkv->type, wkv->ptr, xq_, kvraw_, kAttnEmbd, kLatent, T, stream);
-        kv_window(kvraw_, (const float*) kvn->ptr, d_pos, T, g_.rms_eps, freq_[kind], nullptr, ring_[il], stream);
+        if (!after(ms, br_[0], br_ev_[0])) return failed("attention branch");
+        kernels::native_mmvq(wkv->type, wkv->ptr, xq_, kvraw_, kAttnEmbd, kLatent, T, br_[0]);
+        kv_window(kvraw_, (const float*) kvn->ptr, d_pos, T, g_.rms_eps, freq_[kind], nullptr, ring_[il], br_[0]);
 
-        // query path (also yields the indexer's input)
-        QPathWeights qw{qa->ptr, qa->type, (const float*) qan->ptr, qb->ptr, qb->type, g_.rms_eps};
-        q_path(xq_, qw, T, d_pos, rope_[kind], xq2_, qr_, q_, stream);
-
-        int sel = 0;
-        if (ratio) {
-            const int ks = kv_source(il);
-            if (ks == il) {
-                if (!W("attn_compressor_kv.weight") || !W("attn_compressor_norm.weight") ||
-                    (ratio == 2 && !W("attn_compressor_gate.weight"))) {
-                    err = "deepseek41: layer " + std::to_string(il) + " lacks compressor tensors";
-                    return false;
-                }
-                const CompressArgs ca = compress_args(il);
-                if (T > 1) compress_window(ca, x, d_pos, T, cws_l_[il], stream);
-                else compress(ca, x, d_pos, 1, cws_, stream);
-            }
-            if (index_source(il) == il) {
-                const DevTensor *iqb = W("indexer.attn_q_b.weight"), *ipj = W("indexer.proj.weight");
-                if (!iqb || !ipj) {
-                    err = "deepseek41: layer " + std::to_string(il) + " lacks indexer tensors";
-                    return false;
-                }
-                IndexerArgs ia;
-                ia.mode = index_mode(il);
-                ia.ratio = ratio;
-                ia.n_embd = kAttnEmbd;
-                ia.n_comp = ctx_ / ratio + 1;   // the buffers' row capacity; only the visible rows are scored
-                ia.w_q = (const uint16_t*) iqb->ptr;
-                ia.w_proj = (const uint16_t*) ipj->ptr;
-                ia.rope_freq = freq_[1];
-                ia.comp_ik = comp_ik_[ks];
-                ia.cand_ids = cand_;
-                ia.cand_n = cand_n_;
-                ia.out_ids = ids_;
-                ia.out_n = idn_;
-                indexer_select(ia, qr_, x, d_pos, T, iws_, stream);
-            }
-            sel = kTopK;
+        // the compressor and the indexer's head weights read only x: beside the query path as well
+        const int ks = ratio ? kv_source(il) : -1;
+        const bool compressing = ratio && ks == il, indexing = ratio && index_source(il) == il;
+        IndexerArgs ia;
+        if (compressing || indexing) {
+            if (!after(ms, br_[1], br_ev_[1])) return failed("attention branch");
         }
+        if (compressing) {
+            if (!W("attn_compressor_kv.weight") || !W("attn_compressor_norm.weight") ||
+                (ratio == 2 && !W("attn_compressor_gate.weight"))) {
+                err = "deepseek41: layer " + std::to_string(il) + " lacks compressor tensors";
+                return false;
+            }
+            const CompressArgs ca = compress_args(il);
+            if (T > 1) compress_window(ca, x, d_pos, T, cws_l_[il], br_[1]);
+            else compress(ca, x, d_pos, 1, cws_, br_[1]);
+        }
+        if (indexing) {
+            const DevTensor *iqb = W("indexer.attn_q_b.weight"), *ipj = W("indexer.proj.weight");
+            if (!iqb || !ipj) {
+                err = "deepseek41: layer " + std::to_string(il) + " lacks indexer tensors";
+                return false;
+            }
+            ia.mode = index_mode(il);
+            ia.ratio = ratio;
+            ia.n_embd = kAttnEmbd;
+            ia.n_comp = ctx_ / ratio + 1;   // the buffers' row capacity; only the visible rows are scored
+            ia.w_q = (const uint16_t*) iqb->ptr;
+            ia.w_proj = (const uint16_t*) ipj->ptr;
+            ia.rope_freq = freq_[1];
+            ia.comp_ik = comp_ik_[ks];
+            ia.cand_ids = cand_;
+            ia.cand_n = cand_n_;
+            ia.out_ids = ids_;
+            ia.out_n = idn_;
+            indexer_weights(ia, x, T, iws_, br_[1]);
+        }
+
+        // query path; its latent is also the indexer's input
+        QPathWeights qw{qa->ptr, qa->type, (const float*) qan->ptr, qb->ptr, qb->type, g_.rms_eps};
+        q_latent(xq_, qw, T, qr_, stream);
+        if (indexing) {
+            // the selection waits for the latent, the head weights and the layer's index keys
+            if (!after(ms, br_[0], br_ev_[2]) || !after(br_[1], br_[0], br_ev_[3])) return failed("attention branch");
+            indexer_rank(ia, qr_, d_pos, T, iws_, br_[0]);
+        }
+        q_heads(qw, T, d_pos, rope_[kind], xq2_, qr_, q_, stream);
+        if (!after(br_[0], ms, br_ev_[4]) || ((compressing || indexing) && !after(br_[1], ms, br_ev_[5])))
+            return failed("attention branch");
+        const int sel = ratio ? kTopK : 0;
 
         MqaArgs a;
         a.n_tokens = T;
@@ -873,6 +903,10 @@ public:
     }
 
 private:
+    /// What `to` queues from now on runs after what `from` has queued so far (a branch's fork or join).
+    static bool after(cudaStream_t from, cudaStream_t to, cudaEvent_t ev) {
+        return cudaEventRecord(ev, from) == cudaSuccess && cudaStreamWaitEvent(to, ev, 0) == cudaSuccess;
+    }
     bool alloc(void** p, size_t bytes) {
         void* v = nullptr;
         if (cudaMalloc(&v, bytes) != cudaSuccess) return false;
@@ -897,6 +931,10 @@ private:
     std::vector<float*> st_kv_, st_sc_;
     float* freq_[2] = {nullptr, nullptr};
     RopeTable rope_[2];
+    // the attention's branches beside the query path: the window latent then the selection; the compressor and the
+    // indexer's head weights
+    cudaStream_t br_[2] = {nullptr, nullptr};
+    cudaEvent_t br_ev_[6] = {};
     void *xq_ = nullptr, *xq2_ = nullptr, *cws_ = nullptr, *iws_ = nullptr;
     float *kvraw_ = nullptr, *qr_ = nullptr, *q_ = nullptr, *attn_ = nullptr, *oa_ = nullptr, *mws_ = nullptr;
     void *ex_plan_ = nullptr, *d_plan_host_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr;

@@ -1027,14 +1027,23 @@ void top_rows(const float* scores, int n, int K, int32_t* out, int out_ld, int32
 
 size_t top_rows_workspace_bytes(int max_rows) { return sel_bytes(max_rows); }
 
+void indexer_weights(const IndexerArgs& a, const float* x, int n_tokens, void* workspace, void* stream) {
+    if (n_tokens < 1 || n_tokens > kMaxT || a.n_comp < 1) throw std::invalid_argument("indexer_weights: bad args");
+    gemv_bf16(a.w_proj, x, n_tokens, a.n_embd, kIdxHeads, carve(workspace, a.n_comp).iw, stream);
+}
+
 void indexer_select(const IndexerArgs& a, const float* qr, const float* x, const int32_t* pos, int n_tokens,
                     void* workspace, void* stream) {
-    if (n_tokens < 1 || n_tokens > kMaxT || a.n_comp < 1) throw std::invalid_argument("indexer_select: bad args");
+    indexer_weights(a, x, n_tokens, workspace, stream);
+    indexer_rank(a, qr, pos, n_tokens, workspace, stream);
+}
+
+void indexer_rank(const IndexerArgs& a, const float* qr, const int32_t* pos, int n_tokens, void* workspace, void* stream) {
+    if (n_tokens < 1 || n_tokens > kMaxT || a.n_comp < 1) throw std::invalid_argument("indexer_rank: bad args");
     cudaStream_t s = as_stream(stream);
     const IdxWs w = carve(workspace, a.n_comp);
     gemv_bf16(a.w_q, qr, n_tokens, 1280, kIdxHeads * kIdxDim, w.iq, stream);
     idx_rope_kernel<<<n_tokens, 256, 0, s>>>(w.iq, pos, a.rope_freq);
-    gemv_bf16(a.w_proj, x, n_tokens, a.n_embd, kIdxHeads, w.iw, stream);
     const int n_blk = (a.n_comp + a.block_size - 1) / a.block_size;
     const float w_scale = 1.0f / sqrtf((float) (kIdxHeads * kIdxDim));
     if (a.mode == IndexMode::Level2) {
