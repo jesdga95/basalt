@@ -3,7 +3,9 @@
 
 #include "decode_loop.hpp"
 #include "basalt/core/diag.hpp"
+#include "basalt/core/device.hpp"
 #include "basalt/core/draft_cum.hpp"
+#include "basalt/program/community_row.hpp"
 #include "basalt/program/conv_cache.hpp"
 #include "basalt/program/probe_rates.hpp"
 
@@ -77,6 +79,18 @@ public:
         }
         return 0;
     }
+    // the pack's quantization label and the PCI bus ids of the cards this engine computes on, primary first: what a
+    // benchmark row records
+    std::string identity_words() const {
+        const basalt::core::Json* nm = model_file.meta().get("name");
+        std::string ids;
+        for (int d : basalt::program::engine_gpu_order(o.peer_device, o.peer_devices, {})) {
+            std::string bus;
+            if (basalt::core::device_pci_bus_id(d, bus)) ids += (ids.empty() ? "" : ",") + bus;
+        }
+        return "quant=" + basalt::program::pack_quant_label(nm != nullptr && nm->is_string() ? nm->s : std::string()) +
+               " gpus=" + ids + " ";
+    }
     int init_after_input() override {
         for (auto& s : sessions_)
             if (const basalt::model::Result r = s->prepare(); !r.ok()) {
@@ -84,7 +98,7 @@ public:
                 return 1;
             }
         start_guard(0, 0);   // the margin alone: no prompt chunk is sized to reads of the file
-        if (const std::string words = sessions_[0]->info_words(); !words.empty()) std::printf("INFO %s\n", words.c_str());
+        std::printf("INFO %s\n", (identity_words() + sessions_[0]->info_words()).c_str());
         std::printf("READY %lld stop\n", (long long) o.max_context);
         std::fflush(stdout);
         return 0;

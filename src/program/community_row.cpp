@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 
 #include "basalt/platform/file.hpp"
 
@@ -67,12 +68,20 @@ std::string cpu_label(const std::string& raw_name, int physical_cores) {
     return out;
 }
 
+std::string pack_quant_label(const std::string& name) {
+    std::string q = name.substr(name.rfind(' ') == std::string::npos ? 0 : name.rfind(' ') + 1);
+    for (const char* pre : {"NVIDIA-", "UD-"})
+        if (q.rfind(pre, 0) == 0) q.erase(0, std::strlen(pre));
+    return q.empty() ? "unknown" : q;
+}
+
 std::string community_row_text(const CommunityRow& r) {
     std::string t = "    {\n";
     t += "      \"submitter\": " + json_quote(r.submitter) + ",\n";
     t += "      \"date\": " + json_quote(r.date) + ",\n";
     t += "      \"commit\": " + json_quote(r.commit) + ",\n";
     t += "      \"preset\": " + json_quote(r.preset) + ",\n";
+    t += "      \"model\": " + json_quote(r.model) + ",\n";
     t += "      \"gpus\": [\n";
     for (size_t i = 0; i < r.gpus.size(); ++i) {
         const CommunityGpu& g = r.gpus[i];
@@ -91,6 +100,7 @@ std::string community_row_text(const CommunityRow& r) {
     if (r.ram_gbps > 0) t += "      \"ram_gbps\": " + num(r.ram_gbps, 1) + ",\n";
     t += "      \"os\": " + json_quote(r.os) + ",\n";
     t += "      \"quant\": " + json_quote(r.quant) + ",\n";
+    t += "      \"kv\": " + json_quote(r.kv) + ",\n";
     t += "      \"prefill_16k_tps\": " + num(r.prefill_16k_tps, 1) + ",\n";
     t += "      \"prefill_64k_tps\": " + num(r.prefill_64k_tps, 1) + ",\n";
     t += "      \"decode_tps\": " + num(r.decode_tps, 1);

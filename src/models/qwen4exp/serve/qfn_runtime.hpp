@@ -88,6 +88,7 @@ struct Context {
     std::function<int64_t()> read_cap;
     const int64_t& kSplitRefCells;
     int64_t& split_hand_rows;
+    int64_t& split_chunk_cap;
     int64_t& split_peer_rows;
     std::function<engine_local::SplitPricing(int64_t, int64_t, int64_t, int)> split_price;
     std::function<std::string(int, const std::vector<int>&)> split_layers_text;
