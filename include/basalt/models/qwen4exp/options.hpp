@@ -50,7 +50,7 @@ struct Options : CommonOptions {
     std::string shared_expert_arena; ///< optional file backing for the resident arena shared by processes
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
     /// `--resident-experts` (the low-RAM resident mode): `--resident-cpu-experts` with the copy
-    /// page-locked when the driver allows (else locked in the working set), the RAM margin as headroom, and plain mmap
+    /// page-locked when the driver allows (else locked in the working set), the RAM reserve as headroom, and plain mmap
     /// (with a warning) when even the experts no slot holds do not fit.
     bool resident_pin = false;
     uint64_t resident_headroom = 8ull << 30;

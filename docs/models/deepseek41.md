@@ -14,8 +14,11 @@ from Unsloth's UD-IQ1_M GGUF. Its layout and the DSpark section: [model file](..
   most routed first; VRAM slots copy the tier's head; the rest are read from the pack by the CPU. Two cards (`--gpu 0,1`): the second
   card holds experts nowhere else has. One second card is used; later cards idle. The start line
   `expert homes of 384 per layer: ...` gives the split.
-- **RAM:** the RAM tier leaves 16 GiB free (`RAM floor 16.0 GiB of N GiB free`) for the OS, serving and the page cache of
-  the pack's reads. N places short puts the last N experts of every layer in the file, with a warning naming the RAM to free.
+- **RAM:** the prompt path's and the images' host buffers are allocated at start, before the RAM tier: the pinned ring of
+  second-card and file reads (five layers of the second card's homes, at most 240 experts), the staging of a short read, a chunk's
+  Engram reads, and each slot's largest image. The tier then leaves `--ram-reserve-mib` free beside the driver's tracking of its
+  pinned pages (`RAM floor X GiB of N GiB free`). N places short puts N experts of every layer in the file, with a warning naming
+  the RAM to free.
 - **Slots follow routing:** an expert that keeps missing takes the slot used longest ago, on either card.
 - **Context:** `--max-context` from 1,024 up to the pack's 1,048,576, default 8,192. Caches grow with position (a short chat maps
   a few MiB, a 1M context about 3.2 GiB) into the memory the tier leaves free. A value past the maximum, or whose caches need more

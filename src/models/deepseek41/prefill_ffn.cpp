@@ -8,14 +8,12 @@
 #include "basalt/log.hpp"
 #include "models/deepseek41/prefill_ffn.hpp"
 
-#include "basalt/ggml/ggml.h"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/platform/file.hpp"
-#include "basalt/platform/memory.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "models/deepseek41/model.hpp"
 #include "models/deepseek41/layer_ops.hpp"
@@ -28,18 +26,17 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <cstdio>
-#include <numeric>
 #include <thread>
 #include <vector>
 
 namespace basalt::models::deepseek41 {
 namespace {
 
-constexpr int kStageExperts = 32;   // experts staged on the device per launch
+using prefillp::kStageExperts;
 constexpr int kReadThreads = 8;     // concurrent blob reads
-constexpr int kRing = 5;             // layers of file-read experts held ahead
 constexpr int kSharedRows = 1024;   // tokens per shared-expert sub-chunk
 constexpr int kCpuRows = 8;         // a RAM expert with this few rows in a short chunk may stay on the CPU
 constexpr int kPeerRows = 16;       // a second card's expert with this few rows computes there; a copy through the host costs more
@@ -49,43 +46,32 @@ public:
     Impl(const DsModel& m, LayerOps& ops, int cap) : m_(m), g_(m.geo()), ops_(ops), cap_(cap) {}
     ~Impl() override {
         stop_prefetch();
-        if (hx_) cudaFreeHost(hx_);
-        if (hrows_) cudaFreeHost(hrows_);
-        if (xb_) cudaFreeHost(xb_);
-        platform::free_aligned(act_);
-        if (ring_) cudaFreeHost(ring_);
-        for (cudaEvent_t e : ring_ev_) if (e) cudaEventDestroy(e);
+        for (cudaEvent_t e : pf_events_) cudaEventDestroy(e);
+        for (const auto& o : pf_out_) cudaEventDestroy(o.first);
         for (void* p : dev_) cudaFree(p);
         for (Stage& b : stage_) {
-            if (b.host) cudaFreeHost(b.host);
             if (b.copied) cudaEventDestroy(b.copied);
             if (b.done) cudaEventDestroy(b.done);
         }
         if (copy_) cudaStreamDestroy(copy_);
     }
 
-    // Bytes between experts in a staging buffer: the layer's blob rounded up to whole blocks of its two formats.
-    static uint64_t stride_of(const ExpertLayer& e) {
-        uint64_t unit = 1;
-        for (int t : {e.gu_type, e.d_type}) {
-            const uint64_t bs = ggml_type_size((ggml_type) t);
-            unit = unit / std::gcd(unit, bs) * bs;
-        }
-        return (e.blob_bytes + unit - 1) / unit * unit;
-    }
-
     bool init(std::string& err) {
         namespace mmq = basalt::prefill::mmq;
-        // the products step from expert to expert in whole blocks of the layer's two formats
-        uint64_t slot = 0;
-        for (const ExpertLayer& e : m_.pack().experts) {
+        for (const ExpertLayer& e : m_.pack().experts)
             if (!mmq::fits(e.gu_type, 2 * g_.n_ff_exp) || !mmq::fits(e.d_type, g_.n_embd)) {
                 err = "deepseek41: the prompt MMQ path does not cover an expert format of this pack";
                 return false;
             }
-            slot = std::max(slot, stride_of(e));
+        // the host buffers were allocated with the tier, before it took the free RAM
+        tier_tried_ = true;
+        tier_ = ops_.expert_tier(err);
+        if (!tier_) {
+            if (err.empty()) err = "deepseek41: the prompt path needs the expert tier";
+            return false;
         }
-        slot_ = (size_t) slot;
+        PromptHost& host = tier_->host();
+        slot_ = host.slot;   // the products step from expert to expert in whole blocks of the layer's two formats
         const size_t K = (size_t) g_.n_used, n = (size_t) g_.n_embd;
         max_rows_ = prefillp::stage_rows(K, cap_);
         const size_t E = (size_t) cap_ * K, R = (size_t) max_rows_, ff = (size_t) g_.n_ff_exp;
@@ -94,12 +80,14 @@ public:
                   dev(xq2_, mmq::q8_bytes((int64_t) R, g_.n_ff_exp));
         ok = ok && dev(gu_, R * 2 * ff * 4) && dev(h_, R * ff * 4);
         ok = ok && dev(ident_, R * 4) && dev(rows_, E * n * 4) && dev(sbnd_, 8 * 4);
-        for (Stage& b : stage_)
+        for (int i = 0; i < 2; ++i) {
+            Stage& b = stage_[i];
+            b.host = host.stage[i];
             ok = ok && dev(b.blobs, slot_ * kStageExperts) && dev(b.tok, R * 4) && dev(b.pair, R * 4) &&
                  dev(b.bounds, (kStageExperts + 1) * 4) &&
-                 cudaHostAlloc((void**) &b.host, slot_ * kStageExperts, cudaHostAllocPortable) == cudaSuccess &&
                  cudaEventCreateWithFlags(&b.copied, cudaEventDisableTiming) == cudaSuccess &&
                  cudaEventCreateWithFlags(&b.done, cudaEventDisableTiming) == cudaSuccess;
+        }
         ok = ok && cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) == cudaSuccess;
         if (!ok) {
             err = "out of memory for the prefill expert buffers";
@@ -170,7 +158,7 @@ public:
             bool from_peer = false;
             for (int q = 0; q < nb; ++q) {
                 const int e = used[b0 + (size_t) q];
-                uint8_t* dst = B.blobs + stride_of(el) * (size_t) q;
+                uint8_t* dst = B.blobs + staged_stride(el) * (size_t) q;
                 ExpertTier::Source src;
                 if (tier_) src = tier_->locate(il, e);
                 if (src.dev) {
@@ -188,7 +176,7 @@ public:
                 if (!tier_->peer()->read_wait(err)) return false;
                 for (int q = 0; q < nb; ++q)
                     if (tier_->locate(il, used[b0 + (size_t) q]).peer)
-                        cudaMemcpyAsync(B.blobs + stride_of(el) * (size_t) q, B.host + slot_ * (size_t) q, L.bytes,
+                        cudaMemcpyAsync(B.blobs + staged_stride(el) * (size_t) q, B.host + slot_ * (size_t) q, L.bytes,
                                         cudaMemcpyHostToDevice, copy_);
             }
             if (!from_file.empty()) {
@@ -211,7 +199,7 @@ public:
                     return false;
                 }
                 for (int q : from_file)
-                    cudaMemcpyAsync(B.blobs + stride_of(el) * (size_t) q, B.host + slot_ * (size_t) q, L.bytes,
+                    cudaMemcpyAsync(B.blobs + staged_stride(el) * (size_t) q, B.host + slot_ * (size_t) q, L.bytes,
                                     cudaMemcpyHostToDevice, copy_);
             }
             cudaEventRecord(B.copied, copy_);
@@ -234,7 +222,7 @@ public:
             p.type = el.gu_type;
             p.w_rows = 2 * (int64_t) g_.n_ff_exp;
             p.w_cols = g_.n_embd;
-            p.expert_bytes = stride_of(el);
+            p.expert_bytes = staged_stride(el);
             p.n = nb;
             p.xq = xq1_;
             p.bounds = B.bounds;
@@ -251,7 +239,7 @@ public:
             d.type = el.d_type;
             d.w_rows = g_.n_embd;
             d.w_cols = g_.n_ff_exp;
-            d.expert_bytes = stride_of(el);
+            d.expert_bytes = staged_stride(el);
             d.n = nb;
             d.xq = xq2_;
             d.bounds = B.bounds;
@@ -319,13 +307,12 @@ private:
     bool share_buffers(std::string& err) {
         if (hrows_) return true;
         const size_t n = (size_t) g_.n_embd, R = (size_t) prefillp::kShareRows;
-        constexpr unsigned kMapped = cudaHostAllocPortable | cudaHostAllocMapped;
-        bool ok = dev(drows_, R * n * 4) && dev(dpair_, R * 4) &&
-                  cudaHostAlloc((void**) &hx_, (size_t) cap_ * n * 4, cudaHostAllocPortable) == cudaSuccess &&
-                  cudaHostAlloc((void**) &hrows_, R * n * 4, kMapped) == cudaSuccess &&
-                  cudaHostAlloc((void**) &xb_, (size_t) core::PeerExperts::kRowBatch * n * 4, cudaHostAllocPortable) == cudaSuccess;
-        act_ = ok ? (uint8_t*) platform::alloc_aligned(kernels::cpu::kNativeActBytes * (size_t) cap_, 64) : nullptr;
-        ok = ok && act_ != nullptr;
+        bool ok = dev(drows_, R * n * 4) && dev(dpair_, R * 4);
+        const PromptHost& host = tier_->host();
+        hx_ = host.hx;
+        hrows_ = host.hrows;
+        xb_ = host.xb;
+        act_ = host.act;
         if (ok && tier_->peer()) ok = (peer_rows_ = tier_->peer()->map_rows(hrows_, err)) != nullptr;
         if (!ok && err.empty()) err = "out of memory for a short read's rows";
         return ok;
@@ -433,13 +420,14 @@ private:
         return true;
     }
 
-    // Brings the experts the main card and RAM do not hold, layer by layer a few layers ahead of the products, into a
-    // pinned ring: from the second card, or read from the file.
+    // Brings the experts the main card and RAM do not hold, in the order the products take them, a ring's worth ahead
+    // of them into the pinned ring: from the second card, or read from the file. Piece `seq` of that order sits in
+    // ring slot seq % ring_pieces_; a slot is read again once the copy out of it is done.
     bool start_ahead() {
         const int nl = g_.n_layers;
         pf_idx_.assign((size_t) nl, std::vector<int32_t>((size_t) g_.n_expert, -1));
         pf_list_.assign((size_t) nl, {});
-        size_t mx = 0;
+        pf_base_.assign((size_t) nl + 1, 0);
         for (int l = 0; l < nl; ++l) {
             for (int e = 0; e < g_.n_expert; ++e) {
                 const ExpertTier::Source src = tier_->locate(l, e);
@@ -447,32 +435,67 @@ private:
                 pf_idx_[(size_t) l][(size_t) e] = (int32_t) pf_list_[(size_t) l].size();
                 pf_list_[(size_t) l].push_back(e);
             }
-            mx = std::max(mx, pf_list_[(size_t) l].size());
+            pf_base_[(size_t) l + 1] = pf_base_[(size_t) l] + (int64_t) pf_list_[(size_t) l].size();
         }
         pf_on_ = false;
-        if (mx > 0 && (!ring_ || mx > pf_max_)) {
-            if (ring_) cudaFreeHost(ring_);
-            ring_ = nullptr;
-            pf_max_ = mx;
-            if (cudaHostAlloc((void**) &ring_, (size_t) kRing * pf_max_ * slot_, cudaHostAllocPortable) != cudaSuccess) {
-                ring_ = nullptr;
-                return false;
-            }
-        }
+        const PromptHost& host = tier_->host();
+        ring_ = host.ring;
+        ring_pieces_ = host.ring_pieces;
+        if (pf_base_.back() > 0 && ring_pieces_ < kStageExperts) return false;   // a launch's pieces must fit at once
         if (!ahead_buffers()) return false;
-        for (cudaEvent_t& e : ring_ev_)
-            if (!e) cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
+        cudaStreamSynchronize(copy_);
+        for (const auto& o : pf_out_) pf_events_.push_back(o.first);
+        pf_out_.clear();
         pf_ready_ = 0;
-        pf_released_ = kRing - 1;
+        pf_released_ = 0;
         pf_failed_ = false;
         pf_stop_ = false;
-        cudaStreamSynchronize(copy_);
         issued_ = consumed_ = 0;
-        if (mx > 0) {
+        if (pf_base_.back() > 0) {
             pf_on_ = true;
             pf_th_ = std::thread([this] { prefetch_loop(run_layers_); });
         }
         return true;
+    }
+
+    // Hands the reader the slots whose copies are done: those already done, or with `wait_oldest` the oldest one too.
+    void release_done(bool wait_oldest) {
+        int64_t upto = -1;
+        while (!pf_out_.empty()) {
+            const auto [ev, end] = pf_out_.front();
+            if (wait_oldest) {
+                cudaEventSynchronize(ev);
+                wait_oldest = false;
+            } else if (cudaEventQuery(ev) != cudaSuccess) {
+                break;
+            }
+            upto = end;
+            pf_events_.push_back(ev);
+            pf_out_.pop_front();
+        }
+        if (upto < 0) return;
+        std::lock_guard<std::mutex> lk(pf_mu_);
+        pf_released_ = upto;
+        pf_cv_.notify_all();
+    }
+
+    // Waits until ring piece `seq` is read. While it waits, the slots of finished copies go back to the reader, which may
+    // be waiting for one.
+    bool wait_ready(int64_t seq, std::string& err) {
+        for (;;) {
+            release_done(false);
+            {
+                std::unique_lock<std::mutex> lk(pf_mu_);
+                if (!pf_failed_ && pf_ready_ <= seq && pf_out_.empty())
+                    pf_cv_.wait(lk, [&] { return pf_ready_ > seq || pf_failed_; });
+                if (pf_failed_) {
+                    err = "deepseek41: short read of an expert blob";
+                    return false;
+                }
+                if (pf_ready_ > seq) return true;
+            }
+            release_done(true);
+        }
     }
 
     bool ahead_buffers() {
@@ -495,37 +518,39 @@ private:
         const int l = (int) (issued_ / G), g = (int) (issued_ % G);
         Stage& D = dstage_[issued_ % prefillp::kAheadSlots];
         const ExpertLayer& el = m_.pack().experts[(size_t) l];
-        if (g == 0 && pf_on_) {
-            if (l >= 2) {
-                cudaEventSynchronize(ring_ev_[(l - 2) % kRing]);
-                std::lock_guard<std::mutex> lk(pf_mu_);
-                pf_released_ = l - 2 + kRing;
-                pf_cv_.notify_all();
-            }
-            std::unique_lock<std::mutex> lk(pf_mu_);
-            pf_cv_.wait(lk, [&] { return pf_ready_ > l || pf_failed_; });
-            if (pf_failed_) {
-                err = "deepseek41: short read of an expert blob";
-                return false;
-            }
-        }
+        int64_t last = -1;   // the group's last ring piece
+        if (pf_on_)
+            for (int q = 0; q < kStageExperts && g * kStageExperts + q < g_.n_expert; ++q)
+                if (const int32_t i = pf_idx_[(size_t) l][(size_t) (g * kStageExperts + q)]; i >= 0) last = pf_base_[(size_t) l] + i;
+        if (last >= 0 && !wait_ready(last, err)) return false;
         cudaStreamWaitEvent(copy_, D.done, 0);
         for (int q = 0; q < kStageExperts; ++q) {
             const int e = g * kStageExperts + q;
             if (e >= g_.n_expert) break;
-            uint8_t* dst = D.blobs + stride_of(el) * (size_t) q;
+            uint8_t* dst = D.blobs + staged_stride(el) * (size_t) q;
             const ExpertTier::Source src = tier_->locate(l, e);
             if (src.dev) {
                 cudaMemcpyAsync(dst, src.dev, el.blob_bytes, cudaMemcpyDeviceToDevice, copy_);
             } else if (src.pinned) {
                 cudaMemcpyAsync(dst, src.pinned, el.blob_bytes, cudaMemcpyHostToDevice, copy_);
             } else {
-                cudaMemcpyAsync(dst, ring_ + ((size_t) (l % kRing) * pf_max_ + (size_t) pf_idx_[(size_t) l][(size_t) e]) * slot_,
-                                el.blob_bytes, cudaMemcpyHostToDevice, copy_);
+                const int64_t seq = pf_base_[(size_t) l] + pf_idx_[(size_t) l][(size_t) e];
+                cudaMemcpyAsync(dst, ring_ + (size_t) (seq % ring_pieces_) * slot_, el.blob_bytes, cudaMemcpyHostToDevice, copy_);
             }
         }
         cudaEventRecord(D.copied, copy_);
-        if (g == G - 1 && pf_on_) cudaEventRecord(ring_ev_[l % kRing], copy_);
+        if (last >= 0) {
+            cudaEvent_t ev = nullptr;
+            if (!pf_events_.empty()) {
+                ev = pf_events_.back();
+                pf_events_.pop_back();
+            } else if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+                err = "deepseek41: cannot create a ring event";
+                return false;
+            }
+            cudaEventRecord(ev, copy_);
+            pf_out_.emplace_back(ev, last + 1);
+        }
         ++issued_;
         return true;
     }
@@ -591,14 +616,14 @@ private:
                     cudaMemcpyAsync(bnd_, b, (size_t) (q1 - q0 + 1) * 4, cudaMemcpyHostToDevice, st);
                     const int32_t* tk = tok_all_ + start[(size_t) q0];
                     const int32_t* pr = pair_all_ + start[(size_t) q0];
-                    uint8_t* blobs = D.blobs + stride_of(el) * (size_t) (q0 - e0);
+                    uint8_t* blobs = D.blobs + staged_stride(el) * (size_t) (q0 - e0);
                     mmq::quantize(x, tk, xq1_, el.gu_type, g_.n_embd, g_.n_embd, rows, st);
                     mmq::Product p;
                     p.w = blobs;
                     p.type = el.gu_type;
                     p.w_rows = 2 * (int64_t) g_.n_ff_exp;
                     p.w_cols = g_.n_embd;
-                    p.expert_bytes = stride_of(el);
+                    p.expert_bytes = staged_stride(el);
                     p.n = q1 - q0;
                     p.xq = xq1_;
                     p.bounds = bnd_;
@@ -615,7 +640,7 @@ private:
                     d.type = el.d_type;
                     d.w_rows = g_.n_embd;
                     d.w_cols = g_.n_ff_exp;
-                    d.expert_bytes = stride_of(el);
+                    d.expert_bytes = staged_stride(el);
                     d.n = q1 - q0;
                     d.xq = xq2_;
                     d.bounds = bnd_;
@@ -651,46 +676,53 @@ private:
 
     void prefetch_loop(int nl) {
         for (int l = 0; l < nl; ++l) {
-            {
-                std::unique_lock<std::mutex> lk(pf_mu_);
-                pf_cv_.wait(lk, [&] { return pf_stop_ || l <= pf_released_; });
-                if (pf_stop_) return;
-            }
             const ExpertLayer& el = m_.pack().experts[(size_t) l];
             const std::vector<int>& list = pf_list_[(size_t) l];
-            uint8_t* base = ring_ + (size_t) (l % kRing) * pf_max_ * slot_;
-            std::atomic<bool> ok{true};
-            std::vector<size_t> files;
-            bool any_peer = false;
-            for (size_t i = 0; i < list.size(); ++i) {
-                const ExpertTier::Source src = tier_->locate(l, list[i]);
-                if (src.peer) {
-                    tier_->peer()->read_slot(src.peer, base + i * slot_, el.blob_bytes);
-                    any_peer = true;
-                } else {
-                    files.push_back(i);
+            for (size_t i0 = 0; i0 < list.size();) {
+                const int64_t s0 = pf_base_[(size_t) l] + (int64_t) i0;
+                int64_t room = 0;
+                {
+                    std::unique_lock<std::mutex> lk(pf_mu_);
+                    pf_cv_.wait(lk, [&] { return pf_stop_ || s0 < pf_released_ + ring_pieces_; });
+                    if (pf_stop_) return;
+                    room = pf_released_ + ring_pieces_ - s0;
                 }
-            }
-            std::atomic<size_t> next{0};
-            auto worker = [&] {
-                for (size_t n; (n = next.fetch_add(1)) < files.size();) {
-                    const size_t i = files[n];
-                    const uint64_t off = m_.pack().experts_range.offset + el.offset + (uint64_t) list[i] * el.blob_bytes;
-                    if (!platform::pread_all(m_.experts_fd(), base + i * slot_, el.blob_bytes, off)) ok = false;
+                const size_t i1 = std::min(list.size(), i0 + (size_t) room);
+                auto at = [&](size_t i) { return ring_ + (size_t) ((pf_base_[(size_t) l] + (int64_t) i) % ring_pieces_) * slot_; };
+                std::atomic<bool> ok{true};
+                std::vector<size_t> files;
+                bool any_peer = false;
+                for (size_t i = i0; i < i1; ++i) {
+                    const ExpertTier::Source src = tier_->locate(l, list[i]);
+                    if (src.peer) {
+                        tier_->peer()->read_slot(src.peer, at(i), el.blob_bytes);
+                        any_peer = true;
+                    } else {
+                        files.push_back(i);
+                    }
                 }
-            };
-            std::vector<std::thread> th;
-            for (int i = 1; i < std::min<int>(kReadThreads, (int) files.size()); ++i) th.emplace_back(worker);
-            worker();
-            for (std::thread& t : th) t.join();
-            if (any_peer) {
-                std::string e;
-                if (!tier_->peer()->read_wait(e)) ok = false;
+                std::atomic<size_t> next{0};
+                auto worker = [&] {
+                    for (size_t n; (n = next.fetch_add(1)) < files.size();) {
+                        const size_t i = files[n];
+                        const uint64_t off = m_.pack().experts_range.offset + el.offset + (uint64_t) list[i] * el.blob_bytes;
+                        if (!platform::pread_all(m_.experts_fd(), at(i), el.blob_bytes, off)) ok = false;
+                    }
+                };
+                std::vector<std::thread> th;
+                for (int i = 1; i < std::min<int>(kReadThreads, (int) files.size()); ++i) th.emplace_back(worker);
+                worker();
+                for (std::thread& t : th) t.join();
+                if (any_peer) {
+                    std::string e;
+                    if (!tier_->peer()->read_wait(e)) ok = false;
+                }
+                std::lock_guard<std::mutex> lk(pf_mu_);
+                if (!ok) pf_failed_ = true;
+                pf_ready_ = pf_base_[(size_t) l] + (int64_t) i1;
+                pf_cv_.notify_all();
+                i0 = i1;
             }
-            std::lock_guard<std::mutex> lk(pf_mu_);
-            if (!ok) pf_failed_ = true;
-            pf_ready_ = l + 1;
-            pf_cv_.notify_all();
         }
     }
 
@@ -744,13 +776,15 @@ private:
     std::thread pf_th_;
     std::mutex pf_mu_;
     std::condition_variable pf_cv_;
-    int pf_ready_ = 0, pf_released_ = 0;
+    int64_t pf_ready_ = 0, pf_released_ = 0;   // ring pieces read; pieces whose copies are done
     bool pf_on_ = false, pf_stop_ = false, pf_failed_ = false;
-    size_t pf_max_ = 0;
-    uint8_t* ring_ = nullptr;
-    cudaEvent_t ring_ev_[kRing] = {};
+    uint8_t* ring_ = nullptr;                  // the tier's PromptHost ring
+    int64_t ring_pieces_ = 0;
+    std::deque<std::pair<cudaEvent_t, int64_t>> pf_out_;   // copies out of the ring in flight: event, pieces done after it
+    std::vector<cudaEvent_t> pf_events_;                  // events free for reuse
     std::vector<std::vector<int32_t>> pf_idx_;
     std::vector<std::vector<int>> pf_list_;
+    std::vector<int64_t> pf_base_;             // [layer] the ring order's first piece of the layer
     int cap_;
     int64_t max_rows_ = 0;               // (token, slot) rows one launch handles
     size_t slot_ = 0;
