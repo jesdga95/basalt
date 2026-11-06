@@ -90,11 +90,13 @@ public:
     /// Looks up `ids[0..k)` of `layer` and stamps them as used.
     bool lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::string& err);
     /// The CPU's share: the experts of `lk` without a device blob, over the activation `x` (n_embd floats, host).
-    /// Row i of `rows` (n_embd floats each) gets expert i's output.
-    bool run_cpu(int layer, const float* x, const Lookup& lk, float* rows, std::string& err);
+    /// Row i of `rows` (n_embd floats each) gets expert i's output. Started here, it runs on the pool's workers while
+    /// the caller launches the GPUs' shares; finish_cpu joins it. `lk` and `rows` stay as they are until then.
+    void start_cpu(int layer, const float* x, const Lookup& lk, float* rows);
     /// The same over a window: `x` holds a row per token and each expert i runs over the rows `use[i]` names, into those
     /// rows of `rows`.
-    bool run_cpu_window(int layer, const float* x, const Lookup& lk, const Use* use, float* rows, std::string& err);
+    void start_cpu_window(int layer, const float* x, const Lookup& lk, const Use* use, float* rows);
+    void finish_cpu();
     /// Starts the bus copy of the pinned misses of `lk` beyond the CPU's half (policy::bus_count) into the VRAM tier; those
     /// experts get a device blob in `lk`, marked `fetched`, so the GPU computes them while the CPU does the rest. How many
     /// started; `await_fetch` makes `main` wait for them.
@@ -163,8 +165,9 @@ private:
     void start_swaps();
     void swap_worker();
     /// Copies (layer, e) from `src` into the least recently used free slot of the layer; the slot, or -1. With `homes_too`
-    /// that slot may be a home's, when the layer has a free RAM place for it.
-    int32_t claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too = false);
+    /// that slot may be a home's, when the layer has a free RAM place for it. `whole`: one copy, for a layer that waits
+    /// on it; else pieces, which let a waited copy pass.
+    int32_t claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too = false, bool whole = false);
     /// The least recently used free slot of the layer's main card share, or -1; `best` gets its last use.
     int32_t oldest_slot(int layer, bool homes_too, uint64_t& best) const;
     /// Moves (layer, e) into the second card when the expert it replaces there was used before any on the main card.
@@ -221,6 +224,7 @@ private:
     std::vector<kernels::cpu::NativeFmt> fmt_;   ///< [layer]
     std::unique_ptr<kernels::cpu::ExpertPool> pool_;
     uint8_t* act_ = nullptr;                ///< the quantized activation the CPU jobs share
+    kernels::cpu::ExpertJobMulti cpu_jobs_[kMaxK];   ///< the CPU share started and not yet joined
 
     int64_t hits_ = 0, cpu_ = 0, ram_hits_ = 0, promoted_ = 0, fetched_ = 0, dropped_ = 0, peer_hits_ = 0, file_hits_ = 0;
 };
