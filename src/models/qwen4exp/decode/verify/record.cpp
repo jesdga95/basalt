@@ -34,7 +34,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 bool Verifier::WindowRecorder::run() {
     using namespace basalt::kernels;
     if (!inputs()) return false;
-    fuse_head_gr = (v_.le_ == g.n_layers) && (v_.head_ != nullptr && v_.head_->loaded()) &&
+    fuse_head_gr = !v_.score_prefill_ && (v_.le_ == g.n_layers) && (v_.head_ != nullptr && v_.head_->loaded()) &&
                               !cvec().covers(g.n_layers - 1);
     if (!pre(v_.lb_)) return false;
     for (int64_t l = v_.lb_; l < v_.le_; ++l) {
@@ -50,6 +50,9 @@ bool Verifier::WindowRecorder::run() {
         if (!v_.batch_rec_ && v_.next_ != nullptr && v_.next_->m_flag_ != nullptr) signal_flag(v_.next_->m_flag_ + 12, 1, cs);
         return true;
     }
+    // ---- Jev: intermediate sequence windows only advance target state ----
+    if (v_.score_prefill_) { stamp(g.n_layers, 0); stamp(g.n_layers, 1); return true; }
+    // ---- end Jev ----
     return head();
 }
 

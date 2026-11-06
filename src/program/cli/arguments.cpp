@@ -76,6 +76,18 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
         else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
+        // ---- Jev: no additional sessions or weights at startup ----
+        else if (a == "--jev") {
+            const char* value = next("--jev");
+            char* end = nullptr;
+            const long count = std::strtol(value, &end, 10);
+            if (end == value || *end != '\0' || count < 0 || count > 8) {
+                basalt::log::error("basalt", "--jev: 0..8 decision lanes");
+                return 2;
+            }
+            o.jev = (int) count;
+        }
+        // ---- end Jev ----
         else if (a == "--grammar") {
             const std::string v = next("--grammar");
             if (v != "on" && v != "off") { basalt::log::error("basalt", "--grammar: on or off"); return 2; }

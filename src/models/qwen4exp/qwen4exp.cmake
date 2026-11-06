@@ -58,6 +58,7 @@ add_library(model_qwen4exp_engine STATIC src/models/qwen4exp/decode/layer.cpp sr
   src/models/qwen4exp/decode/verify/batch_capture.cpp
   src/models/qwen4exp/decode/verify/batch_execution.cpp
   src/models/qwen4exp/decode/verify/batch_sessions.cpp
+  src/models/qwen4exp/decode/verify/score_branches.cpp
   src/models/qwen4exp/decode/verify/capture.cpp
   src/models/qwen4exp/decode/verify/commit.cpp
   src/models/qwen4exp/decode/verify/cpu_warm.cpp

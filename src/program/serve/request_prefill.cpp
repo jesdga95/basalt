@@ -1,7 +1,19 @@
 // src/program/serve/request_prefill.cpp - request read_prompt operations.
 #include "request.hpp"
+#include <algorithm>
 
 namespace basalt::program::serve {
+
+std::vector<int64_t> Request::part_stops() const {
+    if (score_ids.empty()) return {root_at, turn_at, n - 1};
+    // ---- Jev: stop at exact shared-token frontiers, inside the existing checkpoint budget ----
+    std::vector<int64_t> stops{n - 1};
+    stops.insert(stops.end(), score_frontiers.begin(), score_frontiers.end());
+    std::sort(stops.begin(), stops.end());
+    stops.erase(std::unique(stops.begin(), stops.end()), stops.end());
+    return stops;
+    // ---- end Jev ----
+}
 
 Flow Request::read_prompt() {
     yielded_at = -1;   // BYIELD: the read stopped here and its slot holds it
@@ -62,7 +74,7 @@ Flow Request::read_prompt() {
     // token is sampled from it, and the draft layer takes its rows like any accepted window
     fold_p0 = n - 1;
     prompt_parts_begin();
-    for (const int64_t to : {root_at, turn_at, n - 1}) {
+    for (const int64_t to : part_stops()) {
         if (to <= at) continue;
         const Flow flow = read_to(to);
         if (flow == Flow::quit) break;   // stopped while reading: the rest of the request runs, and ends as cancelled

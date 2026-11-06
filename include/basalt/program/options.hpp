@@ -16,6 +16,9 @@ inline constexpr int64_t kDefaultContext = 8192;
 /// The flags every model takes.
 struct CommonOptions {
     virtual ~CommonOptions() = default;
+    // ---- Jev: opt-in resident-model scoring ----
+    int jev = 0;                ///< --jev: N decision lanes scored over one resident prefix (0 = off)
+    // ---- end Jev ----
     std::string model;                ///< --model: the .basalt file every loader reads from
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;

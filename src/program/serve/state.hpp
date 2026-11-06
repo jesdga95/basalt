@@ -3,6 +3,7 @@
 
 #include "../cli/tokens.hpp"
 #include "basalt/core/conversation_cache.hpp"
+#include "basalt/core/decision_schedule.hpp"
 #include "basalt/core/conversation_memory.hpp"
 #include "basalt/core/conversation_store.hpp"
 #include "basalt/core/device.hpp"
@@ -125,6 +126,14 @@ public:
     virtual void enc_command(const std::string& cmd) = 0;
     virtual size_t spill_to_disk(bool at_exit, size_t limit) = 0;
     virtual bool park_idle_engine(std::string& e) = 0;
+    // ---- Jev: what the model answers for a scoring request; a model that cannot score takes the defaults ----
+    virtual bool expire_jev(std::string&, bool = false) { return true; }   // release what the scoring request borrowed
+    virtual void release_score_workspace() {}    // drop the extra verify workspace a scoring request reserved
+    virtual bool adaptive_window(std::string&) { return true; }   // tier maintenance between decision windows
+    virtual bool score_lanes_supported() const { return false; }   // the model scores N branches over one prefix
+    virtual int score_lanes_window() const { return 0; }           // the window a scoring request runs
+    virtual bool drafting() const { return false; }                // the model's draft layer is running
+    // ---- end Jev ----
     basalt::program::CommonOptions& o;
     basalt::core::ModelFile& model_file;
     std::string& err;
@@ -141,6 +150,11 @@ public:
     std::vector<ImgKey> live_imgs{};
     std::vector<ImgKey> req_imgs{};
     bool live_ok{};
+    // ---- Jev: target-only checkpoints can extend beyond the untouched draft cache ----
+    bool jev_scoring{};
+    int64_t jev_draft_prefix = -1;
+    basalt::core::DecisionCacheDeadline jev_cache{};
+    // ---- end Jev ----
     std::vector<ConvCheckpoint> checks{};
     uint64_t check_clock{};
     bool cvec_cached{};

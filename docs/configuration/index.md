@@ -6,7 +6,7 @@ Every setting: server options, engine flags, and the sampling fields. Effects on
 - [How settings are given](#how-settings-are-given) · [Automatic settings](#automatic-settings) · [Server](#server) · [Model and GPUs](#model-and-gpus)
 - [Context and KV](#context-and-kv-cache) · [Expert cache](#expert-cache-and-memory) · [Prompt](#prompt-processing) · [Drafting](#drafting)
 - [Slots](#parallel-slots) · [Conversation cache](#conversation-cache) · [Vision](#vision) · [Control vectors](#control-vectors)
-- Pages: [models and the router](models.md), [sampling](sampling.md), [adaptive tier](adaptive.md), [examples](examples.md), [diagnostics](diagnostics.md)
+- Pages: [models and the router](models.md), [Jev decisions](decisions.md), [sampling](sampling.md), [adaptive tier](adaptive.md), [examples](examples.md), [diagnostics](diagnostics.md)
 
 ## How settings are given
 
@@ -75,6 +75,8 @@ Command line `--name`; the Where column says which config block takes it.
 | `thinking-loop-tokens` | entry | integer | `256` | End thinking when one token repeats this many times in a row; `0` turns it off. |
 | `answer-room` | entry | switch (`--no-answer-room`) | on | Reserve room for closing the thinking and the answer (caps of 1,024 tokens or more). |
 | `config` | command line | path | none | The config file. Command line only. |
+| `jev` | server | integer `0..8` | `0` (off) | Decision lane limit on the resident model, independent of chat slots. `1` enables the solo scorer. [Settings and API](decisions.md). |
+| `jev-max-pending`, `jev-timeout`, `jev-max-nodes`, `jev-tree-max` | server | integer | `16`, `300`, `8192`, `128` | Decision queue, deadline, compiled trie budget and automatic exhaustive-domain limit. [Ranges](decisions.md#runtime-and-settings). |
 
 ## Model and GPUs
 

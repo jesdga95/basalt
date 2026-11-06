@@ -83,6 +83,9 @@ public:
     void shed_low() { runtime_.shed_if_low(); }
     void stamp_loop_end() { basalt::core::decode_events().stamp(2); }
     void decode_end();
+    // ---- Jev: one request's decision lanes, scored on the resident model ----
+    Flow score() override;
+    // ---- end Jev ----
 
 private:
     QfnRuntime& runtime_;

@@ -30,6 +30,13 @@ protected:
     int req_penalty_last_n{};
     std::string req_bias_text{};   // logit_bias=id:value,...: added to the verifier's logits (see ver.set_logit_bias)
     bool req_bias_present{};
+    // ---- Jev: candidate logits, checkpoints and exact-root refresh ----
+    std::vector<int64_t> score_ids{}, score_frontiers{};
+    std::vector<basalt::core::ScoreBranch> score_branches{};
+    bool score_fresh{};
+    /// The model scores what the parse asked for; a model without scoring lanes takes nothing of it.
+    virtual Flow score() { return Flow::proceed; }
+    // ---- end Jev ----
     int64_t req_gprompt{};
     std::string req_grammar_text{};   // grammar=<compact ASCII JSON, spaces as \u0020>: the request's grammar (--grammar on)
     int req_cvec{};
@@ -139,6 +146,9 @@ protected:
     // ---- reading the prompt, per part.  read_to: Flow::quit when a stop ended the read.
     virtual bool prompt_begin() { return true; }
     virtual Flow set_sampling() = 0;
+    /// The token positions this read stops at, in order: the chain's root and turn checkpoints, or - for a
+    /// scoring request - the exact frontiers every candidate shares, so their checkpoints land on each other.
+    std::vector<int64_t> part_stops() const;
     virtual void limit_parts() {}
     virtual void prompt_parts_begin() {}
     virtual Flow read_to(int64_t to) = 0;

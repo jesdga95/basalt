@@ -1,5 +1,6 @@
 // src/program/serve/request_restore.cpp - request restore operations.
 #include "request.hpp"
+#include "basalt/core/decision_schedule.hpp"
 
 namespace basalt::program::serve {
 
@@ -76,7 +77,7 @@ Flow Request::restore() {
     }
     resume = 0;
     from_live = false;
-    if (runtime_.o.prompt_cache > 0 && want_cvec == runtime_.cvec_cached) {
+    if (!score_fresh && runtime_.o.prompt_cache > 0 && want_cvec == runtime_.cvec_cached) {
         if (runtime_.live_ok && starts_with(runtime_.live, runtime_.live_imgs)) { resume = (int64_t) runtime_.live.size(); from_live = true; }
         for (const ConvCheckpoint& c : runtime_.checks)
             if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
@@ -95,7 +96,7 @@ Flow Request::restore() {
     own_slot = in_slot ? slot_b : runtime_.slot0_solo() ? 0 : -1;
     // A decoding slot's checkpoints are sources too: the K/V before a checkpoint never changes, so requests that
     // share a start (a system prompt) read it once, whichever slot holds it.
-    if (runtime_.o.prompt_cache > 0 && runtime_.slots_share_cells())
+    if (!score_fresh && runtime_.o.prompt_cache > 0 && runtime_.slots_share_cells())
         for (int b = 0; b < (int) runtime_.bs.size(); ++b) {
             const BSlot& sl = runtime_.bs[(size_t) b];
             if (b == own_slot || (!sl.active && !sl.cached) || sl.cvec != want_cvec) continue;
@@ -113,20 +114,20 @@ Flow Request::restore() {
                 }
         }
     // a request in another slot: the solo session's chain is slot 0's conversation, a source like the rest
-    if (runtime_.o.prompt_cache > 0 && runtime_.slots_share_cells() && in_slot && runtime_.slot0_solo() && solo_book.cvec == want_cvec)
+    if (!score_fresh && runtime_.o.prompt_cache > 0 && runtime_.slots_share_cells() && in_slot && runtime_.slot0_solo() && solo_book.cvec == want_cvec)
         for (const ConvCheckpoint& c : solo_book.checks)
             if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) && starts_with(c.ids, c.imgs)) {
                 slot_source = 0;
                 slot_tokens = (int64_t) c.ids.size();
                 slot_ck = &c;
             }
-    parked = runtime_.conversations->best(ids32, runtime_.req_imgs, want_cvec);
+    parked = score_fresh ? basalt::core::ConversationCache::Match{} : runtime_.conversations->best(ids32, runtime_.req_imgs, want_cvec);
 
     in_tokens = parked.tokens;   // where the incoming image continues: the RAM tier's match or the disk's
     in_live = parked.live;
     // the disk tier, when it holds a longer start than every other source: read back cut at its match, after the
     // RAM guard's wait below (the read takes RAM)
-    on_disk = runtime_.disk.enabled() ? runtime_.disk.best(ids32.data(), ids32.size(), runtime_.req_imgs, want_cvec)
+    on_disk = !score_fresh && runtime_.disk.enabled() ? runtime_.disk.best(ids32.data(), ids32.size(), runtime_.req_imgs, want_cvec)
                        : basalt::core::ConversationStore::Match{};
     from_disk = on_disk.tokens > std::max({resume, slot_tokens, parked.tokens});
     if (!from_disk && parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(runtime_.conversations->take(parked.index));
@@ -200,7 +201,7 @@ Flow Request::restore() {
             in_tokens = on_disk.tokens;
             in_live = true;
         }
-        if (!incoming) {   // not read: the RAM tier's match, when the shed left one
+        if (!incoming && !score_fresh) {   // not read: the RAM tier's match, when the shed left one
             const auto again = runtime_.conversations->best(ids32, runtime_.req_imgs, want_cvec);
             if (again.tokens > std::max(resume, slot_tokens)) {
                 incoming.emplace(runtime_.conversations->take(again.index));
@@ -268,6 +269,7 @@ Flow Request::restore() {
     }
     runtime_.park_keep = -1;
     restore_t0 = Clock::now();
+    const bool draft_replaced = incoming.has_value() || slot_source >= 0;
     if (incoming) {
         if (const Flow flow = restore_image(); flow != Flow::proceed) return flow;
     }
@@ -310,7 +312,13 @@ Flow Request::restore() {
             return Flow::error;
         }
     }
-    draft_begin();
+    // ---- Jev: keep a draft-valid watermark while target-only checkpoints advance ----
+    if (runtime_.jev_scoring && runtime_.drafting()) {
+        runtime_.jev_draft_prefix = basalt::core::decision_draft_prefix(runtime_.jev_draft_prefix, resume,
+                                                                      draft_replaced);
+    }
+    // ---- end Jev ----
+    if (!runtime_.jev_scoring) draft_begin();
     read_from = resume;
     drop_stale_reuse();   // another session may have overwritten the cells since
     runtime_.conversations->limit_reuse(read_from);

@@ -221,6 +221,12 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
         if a.grammar and not has_grammar:
             print(tagged("warning", "grammar is on but this engine has no --grammar; requests go without one"), flush=True)
         gwords = grammar_words(known)
+        # ---- Jev: explicit native capability; no implied --parallel change ----
+        if a.jev:
+            if known is None or "--jev" not in known:
+                fail("--jev requires rebuilding the Basalt binary with this checkout")
+            gwords += ["--jev", str(a.jev)]
+        # ---- end Jev ----
         cdir = flag_value(engine_args(cfg), "--conversation-cache-dir")
         cmib = flag_value(engine_args(cfg), "--conversation-cache-disk-mib") or "0"
         if cdir and cmib != "0" and a.debug:
@@ -240,6 +246,11 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
                   grammar_engine=bool(a.mock_engine or has_grammar), dialect=dialect)
     svc.logs = logs
+    # ---- Jev: construct no decision gate or service when disabled ----
+    if a.jev:
+        from serve.decision.engine import Decisions
+        svc.jev = Decisions(svc, a.jev_max_pending, a.jev_timeout, a.jev_max_nodes, a.jev_tree_max)
+    # ---- end Jev ----
     svc.idle_unload_s = a.idle_unload or 0
     svc.idle_sleep_s = a.idle_sleep or 0
     svc.min_free_vram_mib = a.min_free_vram_mib or 0
@@ -280,6 +291,14 @@ def main() -> int:
     a = settings[0][0]                                  # the options every model shares read the same in each
     multi = len(settings) > 1
     service.DEBUG, engine_process.REQUEST_LINES = a.debug, a.request_lines
+    # ---- Jev: reject unusable settings before loading weights ----
+    for name, lo, hi in (("jev", 0, 8), ("jev_max_pending", 0, 256), ("jev_timeout", 1, 3600),
+                         ("jev_max_nodes", 1, 65536), ("jev_tree_max", 1, 255)):
+        if not lo <= getattr(a, name) <= hi:
+            fail(f"--{name.replace('_', '-')}: expected {lo}..{hi}")
+    if a.jev and a.mock_engine:
+        fail("--jev requires the native target-head scorer")
+    # ---- end Jev ----
     logs = LogBuffer()                                  # this process's and the engine's output
     sys.stdout, sys.stderr = (TeeStream(ColorStream.wrap(sys.stdout), logs, "srv"),
                               TeeStream(ColorStream.wrap(sys.stderr), logs, "srv"))

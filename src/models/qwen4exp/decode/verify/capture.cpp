@@ -28,7 +28,7 @@ void Verifier::refresh_ar() {
 }
 
 bool Verifier::capture(int T, std::string& err) {
-    cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[T] : exec_[T];
+    cudaGraphExec_t& exec_t = window_graph(T);
     if (exec_t != nullptr) return true;
     const bool pdl_try = basalt::kernels::pdl_requested() && !pdl_off_;
     // a window that does not capture or instantiate with programmatic dependent launch is captured again without it

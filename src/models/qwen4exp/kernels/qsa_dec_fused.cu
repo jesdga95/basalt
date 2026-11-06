@@ -179,9 +179,25 @@ __device__ __forceinline__ void kv_post_dev(const QsaDecKvPost& a, int n, int n_
         rope_row<TAB>(row, a.pos_k[t * (a.pos_stride > 0 ? a.pos_stride : n_kv) + h], d, ra);
         const float y = row[d];
         kp[d] = y;
-        append_q8_row(y, d, pos, h, n_kv, page_size, a.page_table, a.k_q, a.k_scale, a.host.k_q, a.host.k_scale, sums);
         const float v = a.vcur[((size_t) t * n_kv + h) * HD + d];
-        append_q8_row(v, d, pos, h, n_kv, page_size, a.page_table, a.v_q, a.v_scale, a.host.v_q, a.host.v_scale, sums);
+        // ---- Jev: match kv_append_step for a private FP16 branch ----
+        if (a.k_pool != nullptr) {
+            const long long page = (long long) a.page_table[pos / page_size];
+            if (page >= 0) {
+                const long long at = ((page * n_kv + h) * page_size + pos % page_size) * HD + d;
+                a.k_pool[at] = f16_from_f32(y);
+                a.v_pool[at] = f16_from_f32(v);
+            }
+            if (a.host.k_pool != nullptr) {
+                const long long at = (((pos / page_size) * n_kv + h) * page_size + pos % page_size) * HD + d;
+                a.host.k_pool[at] = f16_from_f32(y);
+                a.host.v_pool[at] = f16_from_f32(v);
+            }
+        } else {
+            append_q8_row(y, d, pos, h, n_kv, page_size, a.page_table, a.k_q, a.k_scale, a.host.k_q, a.host.k_scale, sums);
+            append_q8_row(v, d, pos, h, n_kv, page_size, a.page_table, a.v_q, a.v_scale, a.host.v_q, a.host.v_scale, sums);
+        }
+        // ---- end Jev ----
         return;
     }
     if (a.tail_snap != nullptr)
@@ -228,6 +244,7 @@ __global__ void __launch_bounds__(THREADS) kv_post_kernel(QsaDecKvPost a, int n,
 }
 // the per-sequence fields of a post call, from a slot
 __device__ __forceinline__ void take_slot(QsaDecKvPost& a, const QsaSegSlot& sl) {
+    if (a.k_pool != nullptr) { a.k_pool = sl.k_pool; a.v_pool = sl.v_pool; }
     a.k_q = sl.k_q; a.v_q = sl.v_q; a.k_scale = sl.k_scale; a.v_scale = sl.v_scale; a.page_table = sl.page_table;
     a.host = sl.host; a.tail = sl.tail; a.dead = sl.dead; a.pooled = sl.pooled; a.block_pos = sl.block_pos;
     a.max_cells = sl.max_cells;

@@ -168,6 +168,14 @@ public:
     bool slot0_solo() const override { return slot0_is_solo; }
     bool pipelined() const override { return piped; }
     int64_t slot_context(int slot) const override { return slot_cap[(size_t) slot]; }
+    // ---- Jev: decision lanes over the one resident prefix ----
+    bool expire_jev(std::string& e, bool force) override;
+    void release_score_workspace() override { ver.release_score_workspace(); }
+    bool adaptive_window(std::string& e) override;
+    bool score_lanes_supported() const override { return ver.score_branches_supported(); }
+    int score_lanes_window() const override { return ver.max_t(); }
+    bool drafting() const override { return mtp_on; }
+    // ---- end Jev ----
 
 private:
     friend class QfnRequest;

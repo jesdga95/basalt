@@ -1,0 +1,63 @@
+// ---- Jev: bounded sequence scheduling and target-only draft ownership ----
+#pragma once
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <span>
+#include <vector>
+
+namespace basalt::core {
+
+struct DecisionCacheDeadline {
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point until{};
+    bool armed = false;
+
+    void touch(Clock::time_point now = Clock::now()) {
+        until = now + std::chrono::seconds(60);
+        armed = true;
+    }
+    void clear() { armed = false; }
+    int remaining_ms(Clock::time_point now = Clock::now()) const {
+        return !armed || now >= until ? 0 : (int) std::chrono::ceil<std::chrono::milliseconds>(until - now).count();
+    }
+    bool expired(Clock::time_point now = Clock::now()) const { return armed && now >= until; }
+};
+
+struct DecisionWindow {
+    std::array<int, 8> slots{}, lengths{};
+    int size = 0, rows = 0;
+};
+
+/// One decision lane, as the request states it and as the model answers it: the tokens past the prefix every lane
+/// shares, the candidate tokens it asks about, the exact target rows the run wrote, and the windows it cost.  The
+/// request layer holds these; the model that scores fills them (its verifier takes them by reference).
+struct ScoreBranch {
+    std::vector<int32_t> tokens, candidates;
+    std::vector<float> logits;
+    int windows = 0;
+};
+
+inline DecisionWindow decision_window(std::span<const int> remaining, int capacity) {
+    DecisionWindow out;
+    if (remaining.size() > out.slots.size() || capacity < (int) remaining.size() || capacity > 8) return out;
+    for (int i = 0; i < (int) remaining.size(); ++i)
+        if (remaining[i] > 0) out.slots[out.size++] = i;
+    for (int j = 0; j < out.size; ++j) {
+        out.lengths[j] = std::min(remaining[out.slots[j]], (capacity - out.rows) / (out.size - j));
+        out.rows += out.lengths[j];
+    }
+    for (int j = 0; j < out.size && out.rows < capacity; ++j) {
+        const int extra = std::min(remaining[out.slots[j]] - out.lengths[j], capacity - out.rows);
+        out.lengths[j] += extra; out.rows += extra;
+    }
+    return out;
+}
+
+inline int64_t decision_draft_prefix(int64_t previous, int64_t resumed, bool replaced) {
+    return replaced || previous < 0 ? resumed : std::min(previous, resumed);
+}
+
+} // namespace basalt::core
+// ---- end Jev ----

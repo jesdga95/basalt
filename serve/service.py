@@ -98,6 +98,7 @@ class Service:
         self.grammar_engine = grammar_engine          # the engine understands the request key
         self.sampling_defaults = dict(sampling_defaults or {})   # the model file's sampling defaults
         self.fifo = threading.Lock()
+        self.jev = None  # Jev is installed only by the explicit server opt-in.
         self.stopping = threading.Event()               # set at shutdown: nothing starts the engine again
         self.embeddings = threading.local()           # this request's image embeddings file
         self.api_key = ""                              # when set, /v1/* requires it
@@ -743,6 +744,70 @@ class Service:
             return self.tok.encode(prompt, parse_special=True)
         return self.tok.encode(prompt, parse_special=True, plain=plain)
 
+    def vision_encode(self, sources: list[str], image_access: ImageSources | None = None) -> list[int]:
+        """Encode a request's image sources: one row count per image, the combined embeddings file left in
+        self.embeddings.path for the engine request that follows (no images, no counts).  The sources are read
+        under `image_access` - this service's own policy when the caller brings none - so what a connection may
+        name as an image answers the same here as in a chat request."""
+        if not sources:
+            return []
+        if self.vision is None:
+            _refuse_images("this server was started without image input (--vision), so it cannot read images")
+        try:                                        # before the fifo: a slow source must not hold the turn
+            images = self.vision.read(sources, image_access or self.image_sources)
+        except ImageRefused as e:
+            print(f"[server] error: {e.log_line}", flush=True)
+            raise
+        except ValueError as e:
+            print(f"[server] error: {e}", flush=True)
+            raise
+        held = sum(len(i) for i in {id(i): i for i in images}.values())
+        with self.images_lock:
+            if self.images_waiting + held > IMAGE_WAITING_BYTES:
+                raise ModelBusy("too many images are waiting to be encoded; try again shortly")
+            self.images_waiting += held
+        try:
+            # encode under the fifo: the encoder and a running engine must not use the GPU together
+            with self.fifo:
+                if getattr(self.vision, "in_engine", False):   # the encoder lives in the engine: it must be running
+                    self.ensure_loaded()
+                try:
+                    self.embeddings.path, counts = self.vision.encode(images)
+                except ValueError as e:             # a refused image: the client gets the 400, the log says why
+                    print(f"[server] error: {e}", flush=True)
+                    raise
+        finally:
+            with self.images_lock:
+                self.images_waiting -= held
+        return counts
+
+    def expand_image_pads(self, ids: list[int], counts) -> list[int]:
+        """Expand each image's pad to one per image token; a pad not after the dialect's image start is message text."""
+        pad = self.tok.encode(self.dialect.image_pad, parse_special=True)[0]
+        start = self.tok.encode(self.dialect.image_start, parse_special=True)[0] if self.dialect.image_start else None
+        literal = self.tok.encode(self.dialect.image_pad, parse_special=False)
+        out, k = [], 0
+        for j, t in enumerate(ids):
+            if t == pad and (start is None or (j > 0 and ids[j - 1] == start)):
+                if k == len(counts):                    # more markers than images
+                    _refuse_images("the prompt and its images do not match")
+                out += [pad] * counts[k]
+                k += 1
+            elif t == pad:
+                out += literal
+            else:
+                out.append(t)
+        if k != len(counts):
+            _refuse_images("the prompt and its images do not match")
+        return out
+
+    def drop_embeddings(self, path) -> None:
+        """Remove the embeddings file once the engine work it feeds is over."""
+        if path:
+            Path(path).unlink(missing_ok=True)
+            if getattr(self.embeddings, "path", None) == path:
+                self.embeddings.path = None
+
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, image_access=None):
         """Return (ids, thinking, max_new); an unset or non-positive max_new means the rest of the context.
         `force` (frontend.forced_call): the opening of the call the reply must make.  Without thinking it ends the
@@ -795,51 +860,8 @@ class Service:
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(self.dialect.nothink_lead + force, parse_special=True)
         if images:
-            pad = self.tok.encode(self.dialect.image_pad, parse_special=True)[0]
-            start = self.tok.encode(self.dialect.image_start, parse_special=True)[0] if self.dialect.image_start else None
-            try:                                        # before the fifo: a slow source must not hold the turn
-                images = self.vision.read(images, image_access)
-            except ImageRefused as e:
-                print(f"[server] error: {e.log_line}", flush=True)
-                raise
-            except ValueError as e:
-                print(f"[server] error: {e}", flush=True)
-                raise
-            held = sum(len(i) for i in {id(i): i for i in images}.values())
-            with self.images_lock:
-                if self.images_waiting + held > IMAGE_WAITING_BYTES:
-                    raise ModelBusy("too many images are waiting to be encoded; try again shortly")
-                self.images_waiting += held
-            try:
-                # encode under the fifo: the encoder and a running engine must not use the GPU together
-                with self.fifo:
-                    if getattr(self.vision, "in_engine", False):   # the encoder lives in the engine: it must be running
-                        self.ensure_loaded()
-                    try:
-                        self.embeddings.path, counts = self.vision.encode(images)
-                    except ValueError as e:             # a refused image: the client gets the 400, the log says why
-                        print(f"[server] error: {e}", flush=True)
-                        raise
-            finally:
-                with self.images_lock:
-                    self.images_waiting -= held
-            # expand each image's pad to one per image token; a pad not after <|vision_start|> is message text
-            literal = self.tok.encode(self.dialect.image_pad, parse_special=False)
-            out, k = [], 0
-            for j, t in enumerate(ids):
-                if t == pad and (start is None or (j > 0 and ids[j - 1] == start)):
-                    # more markers than images
-                    if k == len(counts):
-                        _refuse_images("the prompt and its images do not match")
-                    out += [pad] * counts[k]
-                    k += 1
-                elif t == pad:
-                    out += literal
-                else:
-                    out.append(t)
-            if k != len(counts):
-                _refuse_images("the prompt and its images do not match")
-            ids = out
+            counts = self.vision_encode(images, image_access)
+            ids = self.expand_image_pads(ids, counts)
         ctx = self.engine.max_context
         if ctx <= 0:
             if getattr(self.engine, "starting", False):   # starting, not an oversized prompt
@@ -938,6 +960,15 @@ class Service:
         return now
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+        # ---- Jev: finish existing chat work before leasing the solo verifier ----
+        if self.jev is None:
+            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force)
+        else:
+            with self.jev.gate.shared(cancel):
+                yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force)
+        # ---- end Jev ----
+
+    def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """Yield ("event", Event) as text arrives, ("ping", None) as heartbeat, then ("done", {...}).
         `force`: the opening of the call the reply must make (see prepare)."""
         budget = self.reasoning_budget(sampling) if thinking else None

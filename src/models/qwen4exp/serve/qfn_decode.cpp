@@ -481,6 +481,11 @@ void QfnRequest::decode_end() {
     copy_live = false;
 }
 
-Flow QfnRequest::decode() { return decode_loop(*this); }
+Flow QfnRequest::decode() {
+    // ---- Jev: one target-head read, no sampled completion or drafter ----
+    if (!score_ids.empty()) return score();
+    // ---- end Jev ----
+    return decode_loop(*this);
+}
 
 }  // namespace basalt::models::qwen4exp::serve

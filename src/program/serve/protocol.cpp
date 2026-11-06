@@ -262,6 +262,12 @@ int Runtime::announce() {
         std::printf("INFO eos_ids=%s\n", ends.c_str());
     }
     if (text_tokenizer_note.empty()) std::printf("INFO text_prompt=1\n");
+    // ---- Jev: capability negotiation, separate from the unchanged READY contract ----
+    if (o.jev > 0) {
+        std::printf("INFO jev=%d jev_lanes=%d jev_window=%d jev_sequence=1\n", o.jev,
+                    score_lanes_supported() ? std::min(o.jev, score_lanes_window()) : 1, score_lanes_window());
+    }
+    // ---- end Jev ----
     // a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on a flag nobody
     // will raise - end the engine with where it was, so the server starts it again instead of the GPU spinning
     // forever.  Before it does, it reports what every part was doing (stall_report), so one occurrence says where

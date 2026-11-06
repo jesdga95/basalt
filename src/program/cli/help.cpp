@@ -120,6 +120,7 @@ void usage() {
                  "                       ACCURATE than the model (docs/precision/qwen38-flash-next.md#lossy-routing-flags).\n"
                  "                       LAMBDA in (0, 16], higher routes harder toward held experts; the flag alone = 0.5.\n"
                  "                       Needs the device-planned MoE tail.  Default off (exact)\n"
+                 "  --jev N             decision lane limit, 0..8 (default 0: off; independent of chat slots)\n"
                  "  --grammar on|off     --serve: enforce a request's \"grammar\" (tool-call, JSON-schema or JSON-object\n"
                  "                       grammar) on the sampled tokens; the vocabulary comes from the pack.  Default off\n"
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
