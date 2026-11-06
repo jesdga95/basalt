@@ -1,5 +1,5 @@
 // src/kernels/cuda/gu2.cuh - DEC_GU2=1: the grouped gate/up rows of the grid formats (IQ2_XXS, IQ2_XS,
-// IQ2_S, IQ3_XXS, IQ3_S) and Q2_0 with n_embd 2560, two rows a warp.  Included by iq_kernels.cu (its Split / Fmt / grid
+// IQ2_S, IQ3_XXS, IQ3_S), Q2_0 and IQ4_XS with n_embd 2560, two rows a warp.  Included by iq_kernels.cu (its Split / Fmt / grid
 // helpers).
 //
 // Bitwise native_gu_multi_kernel's: each lane sums the calls k = lane, lane + 32, lane + 64 of a row in that order
@@ -220,6 +220,24 @@ template<> struct Fmt2<21> {   // IQ3_S: 110-byte blocks (d, 64 grid bytes, qh[8
     }
 };
 
+template<> struct Fmt2<23> {   // IQ4_XS: 136-byte blocks of 256 values (d, scales_h, scales_l[4], qs[128]).  No grid:
+                               // the 16-entry codebook is Split<23>'s table lookup, the sub-block scale its integer sum
+    static constexpr int kGridWords = 4;   // no grid
+    using W = Split<23>::W;
+    __device__ static W load(const uint8_t* row, int k, const uint32_t*) { return Split<23>::load(row, k >> 3, 4 * (k & 7)); }
+    __device__ static void apply(const W& r, const block_q8_1* __restrict__ x, float& d, float& f) {
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            sumi = ggml_cuda_dp4a(r.v[j].x, get_int_b4(x->qs, j), sumi);
+            sumi = ggml_cuda_dp4a(r.v[j].y, get_int_b4(x->qs, j + 4), sumi);
+        }
+        sumi *= r.ls - 32;
+        d = r.dw * __low2float(x->ds);
+        f = (float) sumi;
+    }
+};
+
 template<> struct Fmt2<42> {   // Q2_0: 18-byte blocks of 64 values, two calls a block; Split<42>'s words
     static constexpr int kGridWords = 4;   // no grid
     using W = Split<42>::W;
@@ -238,7 +256,7 @@ template<> struct Fmt2<42> {   // Q2_0: 18-byte blocks of 64 values, two calls a
 
 template<int TY>
 __device__ __forceinline__ const uint32_t* stage_grid(uint32_t* s, int tid) {
-    if constexpr (TY == 42) {
+    if constexpr (TY == 42 || TY == 23) {   // Q2_0 and IQ4_XS: no grid to stage
         return s;
     } else if constexpr (TY == 21) {
         for (int i = tid; i < 512; i += 256) s[i] = iq3s_grid[i];
