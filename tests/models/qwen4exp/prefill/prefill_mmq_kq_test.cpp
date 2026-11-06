@@ -1,5 +1,6 @@
-// prefill_mmq_kq_test - llama.cpp's MMQ for the K-quant expert formats (gate/up Q4_K, Q5_K or Q6_K, down Q5_1 or Q8_0: the
-// UD-Q4_K_XL pack's layers) on random native expert blobs at the model's geometry (2560 x 640), against
+// prefill_mmq_kq_test - llama.cpp's MMQ for the K-quant and Q5_0 expert formats (gate/up Q4_K, Q5_K, Q6_K, IQ3_XXS or
+// IQ4_XS, down Q5_1, Q8_0 or Q5_0: the UD-Q4_K_XL and UD-IQ4_XS packs' layers) on random native expert blobs at the
+// model's geometry (2560 x 640), against
 //   - a double-precision reference: the weights dequantized by ggml's own to_float, times the FP32 activations, and
 //   - the path these formats took before: each expert dequantized to FP16 (iq_dequant_gu_f16 / iq_dequant_f16), FP16
 //     activations, two cuBLAS products and the FP16 SwiGLU, as expert_mmq.cpp runs it.
@@ -80,6 +81,7 @@ void fill_matrix(uint8_t* m, ggml_type t, int64_t rows, int64_t cols, std::mt199
         case GGML_TYPE_Q4_K: lo = 0.0002f; mid = 7.5f; break;    // times 6-bit sub-scales and sub-minima
         case GGML_TYPE_Q5_K: lo = 0.0001f; mid = 15.5f; break;
         case GGML_TYPE_Q5_1: lo = 0.002f; mid = -15.5f; break;   // the minimum is added: negative
+        case GGML_TYPE_IQ4_XS: lo = 0.00008f; break;             // times the two-level int sub-scales, up to ~4000
         default: break;
     }
     std::uniform_real_distribution<float> sc(lo, 4.0f * lo);
@@ -93,6 +95,8 @@ void fill_matrix(uint8_t* m, ggml_type t, int64_t rows, int64_t cols, std::mt199
         }
         return;
     }
+    // IQ3_XXS and IQ4_XS need no branch: block_iq3_xxs and block_iq4_xs both lead with d, which the
+    // loop below writes. IQ3_XXS has no sub-scales at all; IQ4_XS's are fine random once d is small.
     for (size_t b = 0; b < nb; ++b) {
         const float d = sc(rng);
         const ggml_fp16_t h = ggml_fp32_to_fp16(d);
@@ -548,7 +552,10 @@ int main(int argc, char** argv) {
         const Pair pairs[] = {{GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, "Q4_K / Q5_1"},
                               {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, "Q4_K / Q8_0"},
                               {GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, "Q5_K / Q8_0"},
-                              {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, "Q6_K / Q8_0"}};
+                              {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, "Q6_K / Q8_0"},
+                              {GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, "Q4_K / Q5_0"},
+                              {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q5_0, "IQ3_XXS / Q5_0"},   // the UD-IQ4_XS pack's
+                              {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_0, "IQ4_XS / Q5_0"}};    // (18, 6) and (23, 6) pairs
         for (const Pair& p : pairs)
             if (!mmq::fits((int) p.gu, 1280) || !mmq::fits((int) p.d, N))
                 throw std::runtime_error(std::string(p.name) + ": MMQ does not take this pair");
