@@ -51,10 +51,13 @@ int main() {
             CHECK(p + f - b >= f);   // the CPU always takes every file-backed miss
         }
 
-    // homes: one card keeps its copies and the file the rest; two cards leave nothing in the file when the rest fits
+    // homes: a RAM shortfall puts homes on the main card, with or without a second card; RAM that takes the rest leaves
+    // the main card all copies
     {
         Homes h = plan_homes(384, 34, 0, 305);
-        CHECK(h.main == 0 && h.peer == 0 && h.ram == 305 && h.file == 79);
+        CHECK(h.main == 34 && h.peer == 0 && h.ram == 305 && h.file == 45);
+        h = plan_homes(384, 34, 0, 384);
+        CHECK(h.main == 0 && h.peer == 0 && h.ram == 384 && h.file == 0);
         h = plan_homes(384, 34, 46, 320);
         CHECK(h.main == 34 && h.peer == 46 && h.ram == 304 && h.file == 0);
         h = plan_homes(384, 34, 46, 420);
@@ -67,8 +70,8 @@ int main() {
         for (int n : {1, 2, 13}) {
             h = plan_homes(384, 34, 46, 304 - n);
             CHECK(h.main == 34 && h.ram == 304 - n && h.file == n);
-            h = plan_homes(384, 34, 0, 384 - n);
-            CHECK(h.file == n);
+            h = plan_homes(384, 34, 0, 350 - n);
+            CHECK(h.main == 34 && h.file == n);
         }
         for (int mp : {0, 10, 80})
             for (int pp : {0, 7, 46})
@@ -82,9 +85,13 @@ int main() {
                     CHECK(n[(int) Place::Main] == h.main && n[(int) Place::Peer] == h.peer &&
                           n[(int) Place::Ram] == h.ram && n[(int) Place::File] == h.file);
                 }
-        // one card: the RAM tier is the head of the order; two: its copies' head stays in RAM ahead of the second card
+        // one card: the main card's homes head the order, then RAM and the file; RAM that takes all is the head when the
+        // main card holds copies; two cards: the copies' head stays in RAM ahead of the second card
         h = plan_homes(384, 34, 0, 305);
-        CHECK(place_of_rank(h, 59, 0) == Place::Ram && place_of_rank(h, 59, 304) == Place::Ram && place_of_rank(h, 59, 305) == Place::File);
+        CHECK(place_of_rank(h, 59, 33) == Place::Main && place_of_rank(h, 59, 34) == Place::Ram && place_of_rank(h, 59, 338) == Place::Ram &&
+              place_of_rank(h, 59, 339) == Place::File);
+        h = plan_homes(384, 34, 0, 384);
+        CHECK(place_of_rank(h, 59, 0) == Place::Ram && place_of_rank(h, 59, 383) == Place::Ram);
         h = plan_homes(384, 34, 46, 420);
         CHECK(place_of_rank(h, 59, 58) == Place::Ram && place_of_rank(h, 59, 59) == Place::Peer && place_of_rank(h, 59, 105) == Place::Ram);
         h = plan_homes(384, 34, 46, 320);
