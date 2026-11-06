@@ -10,9 +10,11 @@ from Unsloth's UD-IQ1_M GGUF. Its layout and the DSpark section: [model file](..
 
 ## Memory
 
-- **Start:** experts are dealt out in routing order and loaded once per start. One card: as many as fit go to a pinned RAM tier,
-  most routed first; VRAM slots copy the tier's head; the rest are read from the pack by the CPU. Two cards (`--gpu 0,1`): the second
-  card holds experts nowhere else has. One second card is used; later cards idle. The start line
+- **Start:** experts are dealt out in routing order and loaded once per start, the same way on one card and two. A second card
+  (`--gpu 0,1`) holds experts nowhere else has; one second card is used, later cards idle. When RAM cannot take the rest, the main
+  card holds the most routed ones too (homes, sized to stay through a prompt at the full context); then RAM, most routed first; the
+  rest are read from the pack by the CPU. When RAM takes them all, the main card's slots copy the RAM tier's head instead. Either way
+  the main card fills the rest of its memory with copies, down to what a short prompt needs. The start line
   `expert homes of 384 per layer: ...` gives the split.
 - **RAM:** the prompt path's and the images' host buffers are allocated at start, before the RAM tier: the pinned ring of
   second-card and file reads (five layers of the second card's homes, at most 240 experts), the staging of a short read, a chunk's
@@ -23,15 +25,15 @@ from Unsloth's UD-IQ1_M GGUF. Its layout and the DSpark section: [model file](..
 - **Context:** `--max-context` from 1,024 up to the pack's 1,048,576, default 8,192. Caches grow with position (a short chat maps
   a few MiB, a 1M context about 3.2 GiB) into the memory the tier leaves free. A value past the maximum, or whose caches need more
   than half the free memory, is refused; a quarter or more gives a warning.
-- **VRAM:** `--expert-cache` caps the slots; `--vram-reserve-mib` or `POST /v1/vram` sets what stays free. Prompts take the tier's
-  copies first and halve their chunks to fit above the reserve.
+- **VRAM:** `--expert-cache` caps the slots; `--vram-reserve-mib` or `POST /v1/vram` sets what stays free. The caches, prompts and
+  images take the tier's copies first (homes stay) and halve their chunks to fit above the reserve.
 - **Refused flags:** `--kv` (fp16 only), `--rope-*`, `--yarn-*` (YaRN is part of the model).
 
 ## Long prompts
 
 - Chunks are 16,384 tokens, halved down to 256 to fit memory.
-- A read of 4,096 tokens or more (2,048 on two cards) gives the main card's copies back for its duration. They reopen afterwards:
-  from routing order on two cards, empty on one, so the first tokens after a long prompt decode slower on one card.
+- A read of more than 2,048 tokens gives back the copies the main card grew into its spare memory; from 4,096 tokens, a main card
+  without homes gives back all its slots. Afterwards the grown copies reopen from routing order, the other slots empty.
 - `--no-prompt-skip` runs every row through every layer. Without it, rows further than 2,668 positions from the read's end stop
   at layer 20 (the math is the same; rounding differs; [precision](../precision/deepseek41.md#prompt-skip)).
 - A next turn that starts with the held tokens (or the checkpoint) reads only the new tail. `pp=N/Mc` in the `done` line shows how many
