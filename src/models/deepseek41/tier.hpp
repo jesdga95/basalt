@@ -97,6 +97,13 @@ public:
     /// rows of `rows`.
     void start_cpu_window(int layer, const float* x, const Lookup& lk, const Use* use, float* rows);
     void finish_cpu();
+    /// The promotions' copies wait for the bus to idle: mark_gap notes the point of `main` (a layer's sum) they start
+    /// behind, and pump issues up to `pieces` of them there, after the next launches went out (the next layer's head;
+    /// at the window's end, its output). begin_token issues the rest, so every promotion still lands before the next
+    /// lookup, as if it had been copied at once.
+    void mark_gap(cudaStream_t main);
+    void pump(int pieces);
+    static constexpr int kAllPieces = 1 << 20;
     /// Starts the bus copy of the pinned misses of `lk` beyond the CPU's half (policy::bus_count) into the VRAM tier; those
     /// experts get a device blob in `lk`, marked `fetched`, so the GPU computes them while the CPU does the rest. How many
     /// started; `await_fetch` makes `main` wait for them.
@@ -143,6 +150,16 @@ private:
         int layer, expert, slot, event;
         int out = -1, place = -1;
     };
+    /// A promotion whose copies wait for an idle bus: the home's bytes out to `home_to` first, then `src` into `dst`.
+    struct Queued {
+        Pending p;
+        uint8_t* dst;
+        const uint8_t* src;
+        uint8_t* home_to;
+        uint64_t bytes, off = 0, home_off = 0;
+    };
+    /// Issues every queued promotion's remaining copies.
+    void flush_queue();
     /// `in` on its way into the second card's `slot`; `out`, which held it, on its way to RAM place `place`.
     struct PeerMove {
         int layer, in, out, slot, place;
@@ -166,8 +183,9 @@ private:
     void swap_worker();
     /// Copies (layer, e) from `src` into the least recently used free slot of the layer; the slot, or -1. With `homes_too`
     /// that slot may be a home's, when the layer has a free RAM place for it. `whole`: one copy, for a layer that waits
-    /// on it; else pieces, which let a waited copy pass.
-    int32_t claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too = false, bool whole = false);
+    /// on it; else pieces, which let a waited copy pass. With `later` the pieces wait in the queue for pump.
+    int32_t claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too = false, bool whole = false,
+                  bool later = false);
     /// The least recently used free slot of the layer's main card share, or -1; `best` gets its last use.
     int32_t oldest_slot(int layer, bool homes_too, uint64_t& best) const;
     /// Moves (layer, e) into the second card when the expert it replaces there was used before any on the main card.
@@ -185,6 +203,7 @@ private:
     std::vector<int32_t> owner_;            ///< [slot] expert it holds or is receiving, or -1
     std::vector<uint8_t> busy_;             ///< [slot] a promotion is copying into it
     std::vector<Pending> pending_;
+    std::vector<Queued> queue_;             ///< promotions not yet fully issued, oldest first
     std::vector<PeerMove> peer_moves_;
     std::vector<int32_t> peer_owner_;       ///< [second card slot] expert it holds or is receiving
     std::vector<cudaEvent_t> events_;
@@ -192,6 +211,8 @@ private:
     cudaStream_t copy_stream_ = nullptr;    ///< promotions, off the token path
     cudaStream_t fetch_stream_ = nullptr;   ///< copies a layer waits for (high priority)
     cudaEvent_t fetch_ev_ = nullptr;
+    cudaEvent_t gap_ev_ = nullptr;          ///< the main stream's point the pumped pieces start behind
+    bool gap_marked_ = false;               ///< gap_ev_ was recorded for the next pump
     uint64_t tick_ = 0;
     uint64_t one_each_ = 0, reserve_ = 0, modules_ = 0;
     uint64_t start_floor_ = 0, free_floor_ = 0;

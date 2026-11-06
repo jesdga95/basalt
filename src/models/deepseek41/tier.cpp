@@ -52,10 +52,14 @@ ExpertTier::~ExpertTier() {
         std::string e;
         peer_->read_wait(e);
     }
-    if (copy_stream_) cudaStreamSynchronize(copy_stream_);
+    if (copy_stream_) {
+        flush_queue();
+        cudaStreamSynchronize(copy_stream_);
+    }
     if (fetch_stream_) cudaStreamSynchronize(fetch_stream_);
     for (cudaEvent_t e : events_) cudaEventDestroy(e);
     if (fetch_ev_) cudaEventDestroy(fetch_ev_);
+    if (gap_ev_) cudaEventDestroy(gap_ev_);
     if (copy_stream_) cudaStreamDestroy(copy_stream_);
     if (fetch_stream_) cudaStreamDestroy(fetch_stream_);
     for (size_t l = 0; l < ram_.size(); ++l) {
@@ -139,6 +143,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     int lo_prio = 0, hi_prio = 0;
     cudaDeviceGetStreamPriorityRange(&lo_prio, &hi_prio);
     if (cudaEventCreateWithFlags(&fetch_ev_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&gap_ev_, cudaEventDisableTiming) != cudaSuccess ||
         cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithPriority(&fetch_stream_, cudaStreamNonBlocking, hi_prio) != cudaSuccess) {
         err = "deepseek41: cannot create the promotion stream";
@@ -476,6 +481,7 @@ void ExpertTier::drain() {
 }
 
 void ExpertTier::settle() {
+    flush_queue();
     cudaStreamSynchronize(copy_stream_);
     cudaStreamSynchronize(fetch_stream_);
     drain();
@@ -483,6 +489,7 @@ void ExpertTier::settle() {
 
 void ExpertTier::begin_token(int n_tokens) {
     token_ += (uint64_t) n_tokens;
+    flush_queue();
     drain();
     finish_swaps();
     start_swaps();
@@ -713,8 +720,8 @@ bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
     return true;
 }
 
-int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too, bool whole) {
-    if (pending_.size() >= kMaxPending || free_events_.empty()) {
+int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too, bool whole, bool later) {
+    if (pending_.size() + queue_.size() >= kMaxPending || free_events_.empty()) {
         ++dropped_;
         return -1;
     }
@@ -738,16 +745,47 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
     if (home) {   // the home's bytes first: the stream keeps the order
         place = spare_[(size_t) layer];
         spare_[(size_t) layer] = -1;
-        pieces(ram_[(size_t) layer] + (size_t) place * bytes, dst, cudaMemcpyDeviceToHost);
     }
-    pieces(dst, src, cudaMemcpyHostToDevice);
     const int ev = free_events_.back();
     free_events_.pop_back();
+    ++promoted_;
+    if (later) {
+        Queued q{{layer, e, slot, ev, home ? o : -1, place}, dst, src, home ? ram_[(size_t) layer] + (size_t) place * bytes : nullptr, bytes};
+        queue_.push_back(q);
+        return slot;
+    }
+    if (home) pieces(ram_[(size_t) layer] + (size_t) place * bytes, dst, cudaMemcpyDeviceToHost);
+    pieces(dst, src, cudaMemcpyHostToDevice);
     cudaEventRecord(events_[(size_t) ev], stream);
     pending_.push_back({layer, e, slot, ev, home ? o : -1, place});
-    ++promoted_;
     return slot;
 }
+
+void ExpertTier::mark_gap(cudaStream_t main) {
+    gap_marked_ = !queue_.empty() && cudaEventRecord(gap_ev_, main) == cudaSuccess;
+}
+
+void ExpertTier::pump(int pieces) {
+    if (gap_marked_) cudaStreamWaitEvent(copy_stream_, gap_ev_, 0);
+    gap_marked_ = false;
+    if (queue_.empty()) return;
+    size_t done = 0;
+    for (; done < queue_.size() && pieces > 0; ++done) {
+        Queued& q = queue_[done];
+        for (; q.home_to && q.home_off < q.bytes && pieces > 0; q.home_off += policy::kPieceBytes, --pieces)
+            cudaMemcpyAsync(q.home_to + q.home_off, q.dst + q.home_off, std::min(policy::kPieceBytes, q.bytes - q.home_off),
+                            cudaMemcpyDeviceToHost, copy_stream_);
+        for (; (!q.home_to || q.home_off >= q.bytes) && q.off < q.bytes && pieces > 0; q.off += policy::kPieceBytes, --pieces)
+            cudaMemcpyAsync(q.dst + q.off, q.src + q.off, std::min(policy::kPieceBytes, q.bytes - q.off), cudaMemcpyHostToDevice,
+                            copy_stream_);
+        if (q.off < q.bytes) break;
+        cudaEventRecord(events_[(size_t) q.p.event], copy_stream_);
+        pending_.push_back(q.p);
+    }
+    queue_.erase(queue_.begin(), queue_.begin() + (std::ptrdiff_t) done);
+}
+
+void ExpertTier::flush_queue() { pump(kAllPieces); }
 
 int ExpertTier::fetch(int layer, Lookup& lk) {
     if (m_.tiers().diag_tier_frozen) return 0;
@@ -778,12 +816,14 @@ void ExpertTier::promote(int layer, const Lookup& lk) {
     if (m_.tiers().diag_tier_frozen) return;
     for (int i = 0; i < lk.k; ++i) {
         if (lk.dev[i] || !lk.again[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
-        if (!move_to_peer(layer, lk.experts[i], lk.host[i])) claim(layer, lk.experts[i], lk.host[i], copy_stream_, /*homes_too=*/true);
+        if (!move_to_peer(layer, lk.experts[i], lk.host[i]))
+            claim(layer, lk.experts[i], lk.host[i], copy_stream_, /*homes_too=*/true, /*whole=*/false, /*later=*/true);
     }
 }
 
 void ExpertTier::shrink() {
     if (ext_per_layer_ == 0) return;
+    flush_queue();
     cudaStreamSynchronize(copy_stream_);
     cudaStreamSynchronize(fetch_stream_);
     drain();
@@ -801,6 +841,7 @@ void ExpertTier::shrink() {
 void ExpertTier::lend_all() {
     shrink();
     if (lent_per_layer_ > 0 || !cache_.valid() || homes_.main > 0) return;
+    flush_queue();
     cudaStreamSynchronize(copy_stream_);
     cudaStreamSynchronize(fetch_stream_);
     drain();

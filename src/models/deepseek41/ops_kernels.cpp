@@ -287,6 +287,11 @@ public:
     void begin_token(int64_t, int n_tokens) override {
         if (tier_) tier_->begin_token(n_tokens);
     }
+    void end_window(bool all) override {
+        // the pieces that land while the window's output and the drafter's inputs are on their way
+        constexpr int kEndPieces = 8;
+        if (tier_) tier_->pump(all ? ExpertTier::kAllPieces : kEndPieces);
+    }
 
     bool attention_batch(int il, int64_t pos0, int n_tokens, const int32_t*, const float* x, float* out, int,
                          void* stream, std::string& err) override {
@@ -663,6 +668,7 @@ public:
             return false;
         }
         cudaStream_t st = (cudaStream_t) stream;
+        tier_->pump(2 + T);   // what this layer's head leaves the bus of the promotions queued before it
         await_ids(st, T * K);
         int32_t uniq[ExpertTier::kMaxK];
         int nu = 0;
@@ -749,6 +755,7 @@ public:
         for (int r = 0; r < T * K; ++r)
             rp.p[r] = lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * n : d_rows_ + (size_t) r * n;
         weighted_sum_window(rp, w, T, K, n, out, stream, shared_out);
+        tier_->mark_gap(st);   // the promotions' copies start behind the sum
         for (int r = 0; r < T * K; ++r) h_ids_[r] = -1;
         ids_read_ = false;
         return true;
@@ -788,6 +795,7 @@ public:
             return false;
         }
         cudaStream_t st = (cudaStream_t) stream;
+        tier_->pump(3);
         if (shared_out) await_ids(st, K);
         else cudaStreamSynchronize(st);
         ExpertTier::Lookup lk;
@@ -878,6 +886,7 @@ public:
         for (int k = 0; k < K; ++k)
             rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * g_.n_embd : d_rows_ + (size_t) k * g_.n_embd;
         weighted_sum_row_ptrs(rp, w, K, g_.n_embd, out, stream, shared_out);
+        tier_->mark_gap(st);
         for (int k = 0; k < K; ++k) h_ids_[k] = -1;
         ids_read_ = false;
         return true;
