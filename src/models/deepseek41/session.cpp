@@ -68,7 +68,12 @@ public:
     }
 
     bool init(std::string& err) {
-        if (cudaStreamCreate(&stream_) != cudaSuccess || cudaStreamCreateWithFlags(&mix_st_, cudaStreamNonBlocking) != cudaSuccess) {
+        // the layer's chain runs ahead of the mixes branch, one step below the attention's branches, which hold the chain
+        // up on the compressor's layers (graph nodes keep their stream's priority)
+        int least = 0, greatest = 0;
+        if (cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess ||
+            cudaStreamCreateWithPriority(&stream_, cudaStreamDefault, greatest < least ? greatest + 1 : greatest) != cudaSuccess ||
+            cudaStreamCreateWithPriority(&mix_st_, cudaStreamNonBlocking, least) != cudaSuccess) {
             err = "cannot create a CUDA stream";
             return false;
         }
@@ -763,7 +768,7 @@ private:
                 if (g) cudaGraphDestroy(g);
                 return ok ? fail(std::string("graph capture: ") + cudaGetErrorString(ce)) : false;
             }
-            const cudaError_t ci = cudaGraphInstantiateWithFlags(&exec, g, 0);
+            const cudaError_t ci = cudaGraphInstantiateWithFlags(&exec, g, cudaGraphInstantiateFlagUseNodePriority);
             cudaGraphDestroy(g);
             if (ci != cudaSuccess) return fail(std::string("graph instantiate: ") + cudaGetErrorString(ci));
         }

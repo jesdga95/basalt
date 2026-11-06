@@ -88,8 +88,10 @@ public:
 
     bool init(std::string& err) {
         const int nl = g_.n_layers;
+        int least = 0, greatest = 0;   // the branches can hold the chain up (the compressor, the selection): the top priority
+        cudaDeviceGetStreamPriorityRange(&least, &greatest);
         for (cudaStream_t& s : br_)
-            if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) {
+            if (cudaStreamCreateWithPriority(&s, cudaStreamNonBlocking, greatest) != cudaSuccess) {
                 err = "deepseek41: cannot create the attention's streams";
                 return false;
             }
