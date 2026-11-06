@@ -26,6 +26,7 @@ enum ggml_type {
     GGML_TYPE_Q5_1 = 7,
     GGML_TYPE_Q8_0 = 8,
     GGML_TYPE_Q8_1 = 9,
+    GGML_TYPE_Q2_K = 10,
     GGML_TYPE_Q3_K = 11,
     GGML_TYPE_Q4_K = 12,
     GGML_TYPE_Q5_K = 13,
