@@ -15,7 +15,8 @@ struct CommunityGpu {
 };
 
 struct CommunityRow {
-    std::string submitter, date, commit, preset, os, quant, notes;   // notes is omitted when empty
+    std::string submitter, date, commit, preset, model, os, quant, kv, notes;   // notes is omitted when empty
+    // model: the adapter's model_name; kv: the KV cache format the engine reported ("int8", "fp16")
     std::vector<CommunityGpu> gpus;
     std::string cpu;           ///< "AMD Ryzen 9 9950X, 16 cores"; omitted when empty
     double ram_gib = 0, ram_gbps = 0;   ///< ram_gbps (host read speed) is omitted when 0
@@ -25,6 +26,9 @@ struct CommunityRow {
 /// The cpu field from the OS's processor string and physical core count: trademark marks, the clock, "N-Core
 /// Processor" and the like are dropped, then ", N cores" is added. Empty when the name is empty.
 std::string cpu_label(const std::string& raw_name, int physical_cores);
+
+/// The quant label of a pack from its name: the last word, without the publisher's prefixes; "unknown" when empty.
+std::string pack_quant_label(const std::string& pack_name);
 
 /// A JSON string literal, quoted the way json.dumps(ensure_ascii=False) does.
 std::string json_quote(const std::string& s);
