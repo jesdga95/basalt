@@ -319,6 +319,9 @@ def main() -> int:
         # an empty key would silently disable authentication
         print("[server] error: --api-key is empty (give a key, or leave it out)", file=sys.stderr)
         return 2
+    if a.max_payload_mib < 1:
+        fail(f"--max-payload-mib {a.max_payload_mib} must be at least 1")
+    svc.max_payload = a.max_payload_mib << 20
     try:
         svc.api_key = api_key_of(a.api_key)
     except ValueError as e:

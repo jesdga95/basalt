@@ -92,24 +92,35 @@ class ChunkedBody(unittest.TestCase):
         self.assertEqual(status, 400, body)
 
     def test_an_oversized_chunked_body_is_a_413_and_is_never_allocated(self):
-        old = handler.BODY_MAX
-        handler.BODY_MAX = 1000
+        old = self.svc.max_payload
+        self.svc.max_payload = 1000
         try:
             status, body = self.chat(b"Transfer-Encoding: chunked" + CRLF, b"FFFFFFFF" + CRLF)   # announces 4 GiB
             self.assertEqual(status, 413, body)
             status, body = self.chat(b"Transfer-Encoding: chunked" + CRLF, chunked(b"x" * 3000, size=500))
             self.assertEqual(status, 413, body)
         finally:
-            handler.BODY_MAX = old
+            self.svc.max_payload = old
 
     def test_an_oversized_content_length_body_is_a_413(self):
-        old = handler.BODY_MAX
-        handler.BODY_MAX = 1000
+        old = self.svc.max_payload
+        self.svc.max_payload = 1000
         try:
             status, body = self.chat(b"Content-Length: 5000" + CRLF, b"{}")
             self.assertEqual(status, 413, body)
         finally:
-            handler.BODY_MAX = old
+            self.svc.max_payload = old
+
+    def test_the_body_cap_defaults_to_256_mib_and_the_413_names_a_custom_one(self):
+        self.assertEqual(self.svc.max_payload, 256 << 20)
+        old = self.svc.max_payload
+        self.svc.max_payload = 3 << 20
+        try:
+            status, body = self.chat(b"Content-Length: " + str(4 << 20).encode() + CRLF, b"{}")
+            self.assertEqual(status, 413, body)
+            self.assertIn("larger than 3 MiB", body["error"]["message"])
+        finally:
+            self.svc.max_payload = old
 
     def test_a_bad_content_length_is_a_400(self):
         for value in (b"abc", b"-5"):

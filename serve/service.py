@@ -109,6 +109,7 @@ class Service:
         self.logs = LogBuffer()                         # server and engine output
         # origins allowed to call /v1/* (CORS; "*" = any); empty: no CORS headers
         self.cors_origins: list[str] = []
+        self.max_payload = 256 << 20                     # the most a JSON request body may hold, in bytes
         # origins treated as the server's own page for the load/unload/VRAM controls (no wildcard)
         self.trusted_origins: list[str] = []
         # DNS-rebinding guard: extra Host names ("*" = any) and all names answered, set by serve()
