@@ -377,27 +377,63 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
 }
 
+int ExpertPool::split_multi_batch(const NativeFmt& f, ExpertJobMulti* jobs, int nb, double& gu_share) {
+    mjobs_ = jobs;
+    nfmt_ = &f;
+    const int threads = active_.load(std::memory_order_relaxed) + 1;
+    // One batch for the whole layer: an expert's down rows start once its own gate/up rows are done and quantized,
+    // so there is no barrier between the three steps and the cores' speed differences cost one tail, not two.
+    // The share of tasks follows the share of bytes of the two projections.
+    gu_share = (double) (2 * f.up_off) / (double) (2 * f.up_off + f.d_row * (size_t) f.n_embd);
+    fused_n_ = nb;
+    fused_gu_parts_ = (std::min)((int) f.n_ff, (std::max)(1, (int) std::lround(kTasksPerThread * threads * gu_share / nb)));
+    fused_d_parts_ = (std::min)((int) f.n_embd, (std::max)(1, (int) std::lround(kTasksPerThread * threads * (1.0 - gu_share) / nb)));
+    for (int e = 0; e < nb; ++e) {
+        fused_[(size_t) e].gu_left.store(fused_gu_parts_, std::memory_order_relaxed);
+        fused_[(size_t) e].ready.store(0, std::memory_order_relaxed);
+    }
+    return nb * (fused_gu_parts_ + fused_d_parts_);
+}
+
+void ExpertPool::start_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
+    pend_tasks_ = 0;
+    if (n <= 0) return;
+    if (n > kMaxSplitMulti) {
+        run_split_multi_native(f, jobs, n);
+        return;
+    }
+    pend_t0_ = std::chrono::steady_clock::now();
+    const int tasks = split_multi_batch(f, jobs, n, pend_gu_share_);
+    idle_stop();
+    mode_ = 8;
+    njobs_ = tasks;
+    pend_epoch_ = begin_batch(tasks);
+    pend_tasks_ = tasks;
+    pend_n_ = n;
+}
+
+void ExpertPool::finish_split_multi_native() {
+    if (pend_tasks_ <= 0) return;
+    drain(-1, pend_epoch_);
+    wait_done(pend_tasks_);
+    hstate_.store(kIdle, std::memory_order_relaxed);
+    hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pend_t0_).count();
+    ms_multi_gu += ms * pend_gu_share_;
+    ms_multi_down += ms * (1.0 - pend_gu_share_);
+    multi_bytes += (int64_t) pend_n_ * (int64_t) nfmt_->bytes;
+    mode_ = 0;
+    pend_tasks_ = 0;
+}
+
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
         const auto a = std::chrono::steady_clock::now();
-        mjobs_ = jobs + b0;
-        nfmt_ = &f;
-        const int threads = active_.load(std::memory_order_relaxed) + 1;
-        // One batch for the whole layer: an expert's down rows start once its own gate/up rows are done and quantized,
-        // so there is no barrier between the three steps and the cores' speed differences cost one tail, not two.
-        // The share of tasks follows the share of bytes of the two projections.
-        const double gu_share = (double) (2 * f.up_off) / (double) (2 * f.up_off + f.d_row * (size_t) f.n_embd);
-        fused_n_ = nb;
-        fused_gu_parts_ = (std::min)((int) f.n_ff, (std::max)(1, (int) std::lround(kTasksPerThread * threads * gu_share / nb)));
-        fused_d_parts_ = (std::min)((int) f.n_embd, (std::max)(1, (int) std::lround(kTasksPerThread * threads * (1.0 - gu_share) / nb)));
-        for (int e = 0; e < nb; ++e) {
-            fused_[(size_t) e].gu_left.store(fused_gu_parts_, std::memory_order_relaxed);
-            fused_[(size_t) e].ready.store(0, std::memory_order_relaxed);
-        }
-        run_phase(8, nb * (fused_gu_parts_ + fused_d_parts_));
+        double gu_share = 0;
+        run_phase(8, split_multi_batch(f, jobs + b0, nb, gu_share));
         // the three steps are not timed apart: the batch's time is shared out by the bytes of the two projections
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
         ms_multi_gu += ms * gu_share;

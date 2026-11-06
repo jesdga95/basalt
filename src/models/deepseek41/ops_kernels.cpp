@@ -37,6 +37,16 @@ struct ExpertPlan {
     int32_t tok[8];
 };
 
+// Joins a started CPU share on every way out of a layer's experts.
+struct CpuJoin {
+    ExpertTier* tier = nullptr;
+    ~CpuJoin() { now(); }
+    void now() {
+        if (tier) tier->finish_cpu();
+        tier = nullptr;
+    }
+};
+
 // A window's plan: the distinct experts of its rows, each with the rows it computes.
 struct WindowPlan {
     unsigned long long ptr[ExpertTier::kMaxK];
@@ -646,6 +656,14 @@ public:
         ExpertTier::Lookup lk;
         if (!tier_->lookup(il, uniq, nu, lk, err)) return false;
         const int n_fetched = tier_->fetch(il, lk);
+        // the CPU's share starts first: it takes longest, and the pool's workers run it while the cards' shares launch
+        bool cpu = false;
+        for (int i = 0; i < nu; ++i) cpu = cpu || (!lk.dev[i] && !lk.peer[i]);
+        CpuJoin join;
+        if (cpu) {
+            tier_->start_cpu_window(il, h_x_, lk, use, h_rows_);
+            join.tier = tier_.get();
+        }
 
         // the second card's share first: its rows are the last of the two cards' to land
         core::PeerExperts* peer = tier_->peer();
@@ -691,9 +709,9 @@ public:
             tier_->await_fetch(st);
             gpu_share(plan, ex_plan2_, ng, entries);
         }
-        // the CPU's share runs while the GPU works; its rows land in their rows
-        if (nhits + n_fetched < nu) {
-            if (!tier_->run_cpu_window(il, h_x_, lk, use, h_rows_, err)) return false;
+        // the CPU's share ran while the GPU works; its rows land in their rows
+        if (cpu) {
+            join.now();
             tier_->promote(il, lk);
         }
         if (peer && !peer->finish(nullptr, err)) return false;
@@ -745,6 +763,14 @@ public:
         ExpertTier::Lookup lk;
         if (!tier_->lookup(il, h_ids_, K, lk, err)) return false;
         const int n_fetched = tier_->fetch(il, lk);
+        // the CPU's share starts first: it takes longest, and the pool's workers run it while the cards' shares launch
+        bool cpu = false;
+        for (int k = 0; k < K; ++k) cpu = cpu || (!lk.dev[k] && !lk.peer[k]);
+        CpuJoin join;
+        if (cpu) {
+            tier_->start_cpu(il, h_x_, lk, h_rows_);
+            join.tier = tier_.get();
+        }
 
         // the second card's share first: its rows are the last of the two cards' to land
         core::PeerExperts* peer = tier_->peer();
@@ -773,7 +799,6 @@ public:
             return m;
         };
         const int nhits = make_plan(*h_plan_, false);
-        const int nh = nhits + n_fetched;
         const auto gpu_share = [&] {
             copy_words(d_plan_host_, ex_plan_, (int) (sizeof(ExpertPlan) / 4), stream);
             ExpertPlan* dp = (ExpertPlan*) ex_plan_;
@@ -813,9 +838,9 @@ public:
             kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok, n_fetched,
                                                    n_fetched, ex_xq_, ex_scr_, ex_rows_, stream);
         }
-        // the CPU's share runs while the GPU works; its rows land in the router index's row
-        if (nh < K) {
-            if (!tier_->run_cpu(il, h_x_, lk, h_rows_, err)) return false;
+        // the CPU's share ran while the GPU works; its rows land in the router index's row
+        if (cpu) {
+            join.now();
             tier_->promote(il, lk);
         }
         if (peer && !peer->finish(nullptr, err)) return false;
