@@ -113,10 +113,9 @@ public:
     /// when it is on and holds no copy of them yet, the others are dropped), the checkpoint blocks kept for reuse are
     /// freed and the heap's free pages return to the OS. The checkpoints stay: a request may already resume from one.
     void shed_if_low();
-    /// From READY on the RAM guard watches MemAvailable against the margin, plus one prompt chunk's file reads
-    /// (`prompt_file_bytes`) while `file_bytes` of experts are read from the file; --no-ram-guard: it never starts.
-    /// The disk tier keeps a GiB above that floor either way.
-    void start_guard(uint64_t file_bytes, uint64_t prompt_file_bytes);
+    /// From READY on the RAM guard watches MemAvailable against the reserve (--ram-reserve-mib); with 0 it never
+    /// starts. The disk tier keeps a GiB above that floor either way.
+    void start_guard();
     virtual bool pipelined() const { return false; }   // batch groups pipelined through layer split stages
     virtual int64_t slot_context(int slot) const = 0;
     virtual bool copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& e) = 0;

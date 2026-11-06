@@ -67,59 +67,17 @@ uint64_t total_physical_memory();
 /// The RAM the OS can hand out without paging, in bytes (0 when unknown).
 uint64_t available_memory();
 
-/// The RAM left alone by anything that locks or fills memory: the larger of 2 GiB and 5% of the machine's RAM.
-uint64_t ram_margin();
-
-/// Host RAM the engine takes after the resident expert copy is sized and before it serves: the GPU libraries' own
-/// host memory, the prompt path's and the verifier's staging.  A resident copy leaves this much beside the margin.
-inline constexpr uint64_t kLateHostBytes = 2ull << 30;
-
-/// Host RAM one running request allocates beside its checkpoints and images: token lists, the reply, the server
-/// process's own buffers.
-inline constexpr uint64_t kRequestHostBytes = 256ull << 20;
+/// The RAM left free for the rest of the system (--ram-reserve-mib): the expert tiers leave it, and while serving the
+/// RAM guard holds that line.  0: nothing is kept and the guard is off.
+uint64_t ram_reserve();
+void set_ram_reserve(uint64_t bytes);
+inline constexpr uint64_t kDefaultRamReserveBytes = 2ull << 30;
 
 /// The expert bytes one prompt chunk may read from the expert file for the slots it borrows from the GPU cache (the
 /// chunk is sized to stay within it).
 inline constexpr uint64_t kPromptFileReadBytes = 3584ull << 20;
 
-/// The least RAM kept for the OS file cache while any expert is read from the file.
-inline constexpr uint64_t kMinFileCacheBytes = 4ull << 30;
-
-/// The RAM the OS file cache needs beside ram_margin() while `file_bytes` of the `complement_bytes` experts no GPU
-/// tier holds are read from the file through it (0: nothing is read from the file).  A prompt chunk reads
-/// `prompt_file_bytes` for the lent slots whose experts the RAM copy does not keep (at most kPromptFileReadBytes),
-/// plus the file-held experts of the layer it computes and of the next one it reads ahead: two layers' file-held
-/// share (`largest_layer_bytes`, every expert of the largest layer, scaled by file_bytes / complement_bytes).
-/// Pages evicted before that pass is over are read again, and the reclaim then runs at drive speed.
-inline uint64_t file_cache_floor(uint64_t file_bytes, uint64_t complement_bytes, uint64_t largest_layer_bytes,
-                                 uint64_t prompt_file_bytes) {
-    if (file_bytes == 0) return 0;
-    const double share = complement_bytes > file_bytes ? (double) file_bytes / (double) complement_bytes : 1.0;
-    const uint64_t layer_file = (uint64_t) ((double) largest_layer_bytes * share) + 1;
-    const uint64_t pass = prompt_file_bytes + 2 * layer_file;
-    return pass > kMinFileCacheBytes ? pass : kMinFileCacheBytes;
-}
-
-/// The RAM left free once the experts are placed: `margin` (ram_margin()) plus the file cache's floor.
-inline uint64_t ram_floor(uint64_t margin, uint64_t file_bytes, uint64_t complement_bytes, uint64_t largest_layer_bytes,
-                          uint64_t prompt_file_bytes) {
-    return margin + file_cache_floor(file_bytes, complement_bytes, largest_layer_bytes, prompt_file_bytes);
-}
-
-/// The serve guard's floor (see ram_level): the margin plus one prompt chunk's file reads when experts are read from
-/// the file (the margin alone when none are).  Below ram_floor() by the two layers' read-ahead, so the engine's own
-/// growth after the load (conversation cache, an image's buffers) does not reach it on a machine still sized as asked.
-inline uint64_t ram_guard_floor(uint64_t margin, uint64_t file_bytes, uint64_t prompt_file_bytes) {
-    return margin + (file_bytes > 0 ? prompt_file_bytes : 0);
-}
-
-/// The largest RAM copy that leaves `floor` free, with `avail` bytes available and `late` bytes still to be taken by
-/// the engine after the copy.
-inline uint64_t max_safe_copy(uint64_t avail, uint64_t late, uint64_t floor) {
-    return avail > late + floor ? avail - late - floor : 0;
-}
-
-/// The RAM a page-locked or fully resident allocation may take now: available_memory() less ram_margin().  `known`
+/// The RAM a page-locked or fully resident allocation may take now: available_memory() less ram_reserve().  `known`
 /// is false when the OS gives no reading (nothing is refused then).
 uint64_t ram_budget(bool* known = nullptr);
 
@@ -130,8 +88,8 @@ void start_memory_watchdog(uint64_t floor_bytes);
 /// its error names the copy's cap instead of the resident mode.
 void watch_resident_ram(bool resident, uint64_t copy_bytes);
 /// The line the watchdog prints when RAM runs out: `avail` bytes free, `resident` for the resident-copy mode with a
-/// copy of `copy_bytes`, `margin` the free RAM to keep. A budget flag is named only when it could shrink the copy.
-std::string ram_exhausted_message(uint64_t avail, bool resident, uint64_t copy_bytes, uint64_t margin);
+/// copy of `copy_bytes`, `reserve` the free RAM to keep. A budget flag is named only when it could shrink the copy.
+std::string ram_exhausted_message(uint64_t avail, bool resident, uint64_t copy_bytes, uint64_t reserve);
 void stop_memory_watchdog();
 
 /// Whether an available-RAM reading of `avail` is below `floor` (a reading of 0, unknown, is not).

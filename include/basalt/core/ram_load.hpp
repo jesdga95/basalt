@@ -100,6 +100,18 @@ RamPin pin_ram(void* base, uint64_t register_bytes, uint64_t lock_bytes, const s
                const uint8_t** device = nullptr);
 void unpin_ram(void* base, const RamPin& pin);
 
+/// Kernel memory the GPU driver keeps beside `pinned` bytes of page-locked host memory (its per-page tracking): a plan
+/// that pins counts it with them.
+inline uint64_t pin_tracking_bytes(uint64_t pinned) { return pinned / 36; }
+
+/// The bytes a RAM tier or copy of experts may take with `avail` bytes available: everything above `reserve`, less the
+/// driver's tracking of its pages when it is `pinned`.  Every model sizes its tier with this, after it has allocated
+/// (or held the RAM of) the host buffers it takes later.
+inline uint64_t ram_tier_room(uint64_t avail, uint64_t reserve, bool pinned) {
+    const uint64_t above = avail > reserve ? avail - reserve : 0;
+    return pinned ? above - (above + 36) / 37 : above;
+}
+
 /// Memory a pin takes whole large pages of: aligned to and padded to 2 MiB.
 uint64_t ram_padded(uint64_t bytes);
 uint8_t* alloc_ram(uint64_t bytes);

@@ -157,12 +157,6 @@ uint64_t available_memory() {
     memory_status(avail, total);
     return avail;
 }
-
-uint64_t ram_margin() {
-    uint64_t avail = 0, total = 0;
-    memory_status(avail, total);
-    return std::max<uint64_t>(2ull << 30, total / 20);
-}
 #else
 namespace {
 // One "<key>: <n> kB" line of /proc/meminfo in bytes (0 when absent).
@@ -177,18 +171,22 @@ uint64_t meminfo_bytes(const char* key) {
 }  // namespace
 
 uint64_t available_memory() { return meminfo_bytes("MemAvailable"); }
-
-uint64_t ram_margin() {
-    return std::max<uint64_t>(2ull << 30, meminfo_bytes("MemTotal") / 20);
-}
 #endif
+
+namespace {
+std::atomic<uint64_t> g_ram_reserve{kDefaultRamReserveBytes};
+}  // namespace
+
+uint64_t ram_reserve() { return g_ram_reserve.load(); }
+
+void set_ram_reserve(uint64_t bytes) { g_ram_reserve = bytes; }
 
 uint64_t ram_budget(bool* known) {
     const uint64_t avail = available_memory();
     if (known) *known = avail > 0;
     if (avail == 0) return UINT64_MAX;
-    const uint64_t margin = ram_margin();
-    return avail > margin ? avail - margin : 0;
+    const uint64_t reserve = ram_reserve();
+    return avail > reserve ? avail - reserve : 0;
 }
 
 namespace {
@@ -198,7 +196,7 @@ std::atomic<bool> g_resident_mode{false};
 std::atomic<uint64_t> g_resident_copy{0};
 }  // namespace
 
-std::string ram_exhausted_message(uint64_t avail, bool resident, uint64_t copy_bytes, uint64_t margin) {
+std::string ram_exhausted_message(uint64_t avail, bool resident, uint64_t copy_bytes, uint64_t reserve) {
     const unsigned long long mib = (unsigned long long) (avail >> 20);
     char buf[384];
     if (!resident) {
@@ -210,8 +208,8 @@ std::string ram_exhausted_message(uint64_t avail, bool resident, uint64_t copy_b
                                        "%llu MiB, so something else is holding the memory (other programs, or file "
                                        "pages read while loading)", mib, (unsigned long long) (copy_bytes >> 20));
     } else {
-        // the copy shrunk by what the margin is short of leaves the margin free again
-        const uint64_t keep = copy_bytes - std::min(copy_bytes, margin > avail ? margin - avail : 0);
+        // the copy shrunk by what the reserve is short of leaves the reserve free again
+        const uint64_t keep = copy_bytes - std::min(copy_bytes, reserve > avail ? reserve - avail : 0);
         std::snprintf(buf, sizeof buf, "basalt error: RAM ran out loading (%llu MiB free); use --resident-budget-gib %llu",
                       mib, (unsigned long long) std::max<uint64_t>(1, keep >> 30));
     }
@@ -231,7 +229,7 @@ void start_memory_watchdog(uint64_t floor_bytes) {
             const uint64_t avail = available_memory();
             if (avail > 0 && avail < floor_bytes) {
                 basalt::log::error("basalt", "%s", ram_exhausted_message(avail, g_resident_mode.load(), g_resident_copy.load(),
-                                                                   ram_margin()).c_str());
+                                                                   ram_reserve()).c_str());
                 _exit(1);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));

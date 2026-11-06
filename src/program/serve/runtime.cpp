@@ -3,10 +3,10 @@
 
 namespace basalt::program::serve {
 
-void Runtime::start_guard(uint64_t file_bytes, uint64_t prompt_file_bytes) {
+void Runtime::start_guard() {
     basalt::platform::stop_memory_watchdog();
-    guard_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), file_bytes, prompt_file_bytes);
-    if (!o.no_ram_guard) basalt::platform::start_ram_guard(guard_floor);
+    guard_floor = basalt::platform::ram_reserve();
+    if (guard_floor > 0) basalt::platform::start_ram_guard(guard_floor);
     disk_floor = guard_floor + (1ull << 30);
     // what a stop's error compares against, to tell the engine's own growth from other programs'
     ready_avail = basalt::platform::available_memory();

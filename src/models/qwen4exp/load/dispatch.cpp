@@ -62,9 +62,7 @@ int dispatch(Context& context) {
     auto& graph_hits = *context.graph_hits;
     auto& auto_lend_pct = *context.auto_lend_pct;
     auto& auto_ceiling = *context.auto_ceiling;
-    auto& prompt_file_bytes = *context.prompt_file_bytes;
     auto& pool = *context.pool;
-    auto& ram_floor_bytes = *context.ram_floor_bytes;
     auto& pstages = *context.pstages;
     auto& read_cap = context.read_cap;
     auto& kSplitRefCells = *context.kSplitRefCells;
@@ -181,9 +179,7 @@ int dispatch(Context& context) {
             .graph_hits = graph_hits,
             .auto_lend_pct = auto_lend_pct,
             .auto_ceiling = auto_ceiling,
-            .prompt_file_bytes = prompt_file_bytes,
             .pool = pool,
-            .ram_floor_bytes = ram_floor_bytes,
             .pstages = pstages,
             .read_cap = read_cap,
             .kSplitRefCells = kSplitRefCells,

@@ -14,6 +14,7 @@
 #include "models/deepseek41/model.hpp"
 #include "models/deepseek41/ops.hpp"
 #include "models/deepseek41/prefill_ffn.hpp"
+#include "models/deepseek41/tier.hpp"
 
 #include <cuda_runtime.h>
 
@@ -54,6 +55,9 @@ public:
         dump_dir_ = m_.diag_dump();
         ffn_ = make_prefill_ffn(m_, ops_, cap_, err);
         if (!ffn_) return false;
+        ExpertTier* tier = ops_.expert_tier(err);   // the FFN has it open by now
+        if (!tier) return false;
+        host_ = &tier->host();
         const size_t q8 = std::max<size_t>(kernels::native_q8_1_bytes((int) std::max<size_t>(cols, n), 8), 1 << 16);
         bool ok = buf(x_, C * 4 * n) && buf(x2_, C * 4 * n) && buf(cur_, C * n) && buf(normed_, C * n) &&
                   buf(attn_, C * n) && buf(moe_, C * n) && buf(sh_, C * n) && buf(sum_, C * n) &&
@@ -126,21 +130,28 @@ public:
     }
 
 private:
-    // The Engram rows of a chunk, requested ahead of it. A ticket left open holds the reader's pointer into `raw`.
+    // The Engram rows of a chunk, requested ahead of it into one of the host's two read sets (`set`). A ticket left open
+    // holds the reader's pointer into it.
     struct EngramReads {
         int64_t pos0 = -1;
         int T = 0;
-        std::vector<std::vector<uint8_t>> raw;
+        int set = -1;
         std::vector<ngram::PleReader::Ticket> tickets;
         std::vector<uint8_t> open;
     };
+    uint8_t* raw(const EngramReads& r, size_t layer) const {
+        return host_->engram_raw[r.set].data() + layer * host_->engram_layer;
+    }
 
-    void issue_reads(EngramReads& r, const int32_t* tokens, int T, int64_t pos0, const std::vector<int32_t>& hist) {
+    // Reads into the set `other` does not hold.
+    void issue_reads(EngramReads& r, const EngramReads& other, const int32_t* tokens, int T, int64_t pos0,
+                     const std::vector<int32_t>& hist) {
         const EngramInfo& en = m_.pack().engram;
         const int n_cols = en.hash.n_cols();
+        finish_reads(r);
         r.pos0 = pos0;
         r.T = T;
-        r.raw.assign(en.layers.size(), {});
+        r.set = other.set == 0 ? 1 : 0;
         r.tickets.assign(en.layers.size(), {});
         r.open.assign(en.layers.size(), 1);
         int32_t prev[8] = {0};
@@ -153,8 +164,7 @@ private:
             std::vector<int32_t> ids((size_t) T * n_cols);
             engram_hash(en.hash, (int) k, tokens, T, pos0, pos0 == 0 ? nullptr : prev, ids.data());
             std::vector<uint32_t> rows(ids.begin(), ids.end());
-            r.raw[k].assign(rows.size() * en.row_bytes, 0);
-            r.tickets[k] = m_.engram_reader().issue(rows.data(), rows.size(), r.raw[k].data());
+            r.tickets[k] = m_.engram_reader().issue(rows.data(), rows.size(), raw(r, k));
         }
     }
 
@@ -175,6 +185,7 @@ private:
     }
     std::vector<Tick> ticks_;
     EngramReads ahead_;
+    PromptHost* host_ = nullptr;   ///< the tier's: embedding and Engram pieces, the two Engram read sets
     int64_t cut_ = 0;   ///< positions before this one stop at skip_layer()'s compressor
     bool left_rows_ = false;
     static constexpr size_t kEngramThreads = 8;
@@ -199,17 +210,23 @@ private:
         const int32_t* tokens = embd ? dead.data() : tokens_in;
         hist.insert(hist.end(), tokens, tokens + T);
 
-        // embeddings, repeated into the four streams
+        // embeddings, repeated into the four streams, kEmbedRows tokens at a time
         {
-            std::vector<float> emb((size_t) T * 4 * n);
-            for (int t = 0; t < T; ++t) {
-                float* row = emb.data() + (size_t) t * 4 * n;
-                if (embd) std::copy(embd + (size_t) t * n, embd + (size_t) (t + 1) * n, row);
-                else if (!m_.embedding_row(tokens[t], row, err)) return fail(err);
-                for (int s = 1; s < kHcMult; ++s) std::copy(row, row + n, row + (size_t) s * n);
+            const int rows = prefillp::kEmbedRows;
+            float* const emb = host_->embed.data();
+            for (int t0 = 0; t0 < T; t0 += rows) {
+                const int nt = std::min(rows, T - t0);
+                for (int i = 0; i < nt; ++i) {
+                    const int t = t0 + i;
+                    float* row = emb + (size_t) i * kHcMult * n;
+                    if (embd) std::copy(embd + (size_t) t * n, embd + (size_t) (t + 1) * n, row);
+                    else if (!m_.embedding_row(tokens[t], row, err)) return fail(err);
+                    for (int s = 1; s < kHcMult; ++s) std::copy(row, row + n, row + (size_t) s * n);
+                }
+                DS_CUDA(cudaMemcpyAsync(x_ + (size_t) t0 * kHcMult * n, emb, (size_t) nt * kHcMult * n * sizeof(float),
+                                        cudaMemcpyHostToDevice, stream_));
+                DS_CUDA(cudaStreamSynchronize(stream_));
             }
-            DS_CUDA(cudaMemcpyAsync(x_, emb.data(), emb.size() * sizeof(float), cudaMemcpyHostToDevice, stream_));
-            DS_CUDA(cudaStreamSynchronize(stream_));
         }
 
         // Engram rows for every Engram layer: this chunk's were requested a chunk ago, so their SSD reads overlapped it
@@ -226,9 +243,9 @@ private:
                 cur = std::move(ahead_);
                 ahead_ = EngramReads{};
             } else {
-                issue_reads(cur, tokens, T, pos0, hist);
+                issue_reads(cur, ahead_, tokens, T, pos0, hist);
             }
-            if (next && next_T > 0) issue_reads(ahead_, next, next_T, pos0 + T, hist);
+            if (next && next_T > 0) issue_reads(ahead_, cur, next, next_T, pos0 + T, hist);
         }
 
         // rows before `cut` stop at layer yl's compressor; with every row before it the chunk ends there
@@ -263,24 +280,28 @@ private:
                 if (en.layers[k] != il || embd) continue;   // picture rows get no Engram contribution
                 cur.open[k] = 0;
                 if (!m_.engram_reader().collect(cur.tickets[k], err)) return fail(err);
-                const size_t nr = (size_t) T * n_cols;
-                std::vector<float> rows_f(nr * 256);
-                auto dequant = [&](size_t r0, size_t r1) {
-                    for (size_t r = r0; r < r1; ++r)
-                        for (int b = 0; b < 256 / 32; ++b)
-                            dequantize_iq4_nl(cur.raw[k].data() + r * en.row_bytes + (size_t) b * 18,
-                                              rows_f.data() + r * 256 + (size_t) b * 32);
-                };
-                {
-                    std::vector<std::thread> th;
-                    const size_t step = nr / kEngramThreads + 1;
-                    for (size_t r0 = step; r0 < nr; r0 += step) th.emplace_back(dequant, r0, std::min(nr, r0 + step));
-                    dequant(0, std::min(nr, step));
-                    for (std::thread& t : th) t.join();
+                // dequantized kEngramRows tokens at a time into one host piece, each piece copied on
+                const size_t nr = (size_t) T * n_cols, piece = (size_t) prefillp::kEngramRows * n_cols;
+                float* const rows_f = host_->engram_rows.data();
+                for (size_t p0 = 0; p0 < nr; p0 += piece) {
+                    const size_t np = std::min(piece, nr - p0);
+                    auto dequant = [&](size_t r0, size_t r1) {
+                        for (size_t r = r0; r < r1; ++r)
+                            for (int b = 0; b < 256 / 32; ++b)
+                                dequantize_iq4_nl(raw(cur, k) + (p0 + r) * en.row_bytes + (size_t) b * 18,
+                                                  rows_f + r * 256 + (size_t) b * 32);
+                    };
+                    {
+                        std::vector<std::thread> th;
+                        const size_t step = np / kEngramThreads + 1;
+                        for (size_t r0 = step; r0 < np; r0 += step) th.emplace_back(dequant, r0, std::min(np, r0 + step));
+                        dequant(0, std::min(np, step));
+                        for (std::thread& t : th) t.join();
+                    }
+                    DS_CUDA(cudaMemcpyAsync(rows_all_ + p0 * 256, rows_f, np * 256 * sizeof(float),
+                                            cudaMemcpyHostToDevice, stream_));
+                    DS_CUDA(cudaStreamSynchronize(stream_));
                 }
-                DS_CUDA(cudaMemcpyAsync(rows_all_, rows_f.data(), rows_f.size() * sizeof(float), cudaMemcpyHostToDevice,
-                                        stream_));
-                DS_CUDA(cudaStreamSynchronize(stream_));
                 const DevTensor* kvw = m_.tensor(il, "engram_kv.weight");
                 const DevTensor* gw = m_.tensor(il, "engram_gate.weight");
                 if (!kvw || !gw) return fail("layer " + std::to_string(il) + " has no Engram tensors");

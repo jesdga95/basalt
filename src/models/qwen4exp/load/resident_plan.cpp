@@ -14,7 +14,6 @@ int resident_plan(Context& context) {
     auto& stages = *context.stages;
     auto& srcp = *context.srcp;
     auto& pool_store = *context.pool_store;
-    auto& ram_available_at_plan = *context.ram_available_at_plan;
     auto& auto_resident_bytes = *context.auto_resident_bytes;
     auto& peer_prompt_bytes = context.peer_prompt_bytes;
     auto& xcache = *context.xcache;
@@ -143,27 +142,33 @@ int resident_plan(Context& context) {
                           (long long) xcache.slots(), (long long) held, (long long) (g.n_layers * g.n_expert));
         return true;
     };
-    // every expert of the largest layer: what one prompt layer can read from the file (see platform::file_cache_floor)
-    uint64_t largest_layer_bytes = 0;
-    for (int64_t l = 0; l < g.n_layers; ++l)
-        largest_layer_bytes = std::max<uint64_t>(largest_layer_bytes,
-                                                 (uint64_t) g.n_expert * basalt::kernels::cpu::expert_layout().blob_bytes(l));
-    // what a prompt chunk reads from the file for the lent slots the RAM copy leaves out (see platform::file_cache_floor)
-    uint64_t prompt_file_bytes = 0;
     // --serve: free places in the RAM copy take the evicted experts (no exchange buffers)
     const bool adapt_fast_on = o.serve && o.adapt_every > 0 && o.adapt_swaps > 0;
-    // A server also leaves room for what it allocates after the RAM copy, before it is ready (the top-up below takes
-    // back whatever that does not use), and for what it takes while serving.
-    // Exchange buffers are reserved after the copy when the adaptive swaps do not use spares; the copy leaves them room.
-    const uint64_t exchange_bytes =
-        (o.adapt_every > 0 && o.adapt_swaps > 0 && !adapt_fast_on)
-            ? (uint64_t) std::min<int64_t>(o.adapt_swaps, 96) * basalt::kernels::cpu::expert_layout().max_blob
-            : 0;
-    const uint64_t late = (o.serve ? basalt::platform::kLateHostBytes + serve_growth_bytes(o, g) : 0) + exchange_bytes;
-    const uint64_t resident_headroom_base =
-        o.serve ? std::max(o.resident_headroom, basalt::platform::ram_margin() + late)
-                : std::max(o.resident_headroom, basalt::platform::ram_margin() + basalt::platform::kLateHostBytes) +
-                      exchange_bytes;   // what loads after the copy, and the buffers, fit beside the margin
+    // ---- the host buffers serving takes at its peak, before the RAM copy reads the free memory: RAM held for the prompt
+    // path's two PLE row buffers and a layer split's hand-off buffers at the largest chunk a prompt may be read in, and
+    // the checkpoint blocks of every slot holding all the checkpoints it keeps
+    {
+        const int64_t chunk_max = o.prefill_auto ? auto_ceiling : o.prefill_chunk;
+        bool ok = true;
+        if (o.serve && chunk_max > 0) {
+            for (int b = 0; ok && b < 2; ++b) ok = basalt::core::host_plan((size_t) chunk_max * (size_t) g.n_embd * sizeof(float));
+            for (size_t i = 0; ok && i < stages.size(); ++i)   // the main card and every stage but the last hand rows on
+                for (int b = 0; ok && b < 2; ++b)
+                    ok = basalt::core::host_plan((size_t) chunk_max * (size_t) (g.hc * g.n_embd) * sizeof(float));
+        }
+        if (ok && o.serve && o.prompt_cache > 0) {
+            const size_t keep = (size_t) (o.prompt_cache + 1) * (size_t) std::max(o.batch, 1);
+            auto reserve = [&](const basalt::core::SessionState& u) {
+                basalt::core::ConversationStateSizes z;
+                std::string ze;
+                return !basalt::core::conversation_session_sizes(g, u, z, ze) ||
+                       basalt::core::CheckpointBytes::allocator_type::reserve(z.gdn, keep);
+            };
+            ok = reserve(ss);
+            for (size_t i = 0; ok && i < stages.size(); ++i) ok = reserve(stages[i]->ss);
+        }
+        if (!ok) return fatal_start_error("out of host memory for the prompt path's and the checkpoints' buffers");
+    }
     // the GPU cache's last slots are lent to the prompt path (and the elastic KV): their experts are kept in RAM too
     int64_t lend_from = -1;
     int64_t lend_chunk = o.prefill_chunk;
@@ -212,8 +217,6 @@ int resident_plan(Context& context) {
         in.e_cores = topo.e_cores;
         in.hybrid = topo.is_hybrid;
         in.cpu_quota = cpu::cgroup_cpu_quota();
-        const uint64_t margin = basalt::platform::ram_margin();
-        const uint64_t head = std::max(resident_headroom_base, margin);
         const uint64_t lent_bytes =
             (lend_from >= 0 ? (uint64_t) (xcache.slots() - lend_from) * basalt::kernels::cpu::expert_layout().max_blob : 0) +
             stage_lent_bytes;
@@ -227,13 +230,11 @@ int resident_plan(Context& context) {
         // the lent slots' copies and the spares are kept as far as RAM allows: they do not decide whether the complement fits
         in.extra_full = lent_bytes + spares_full;
         in.extra_peer_excl = lent_bytes + spares_excl;
-        // the floor when the whole complement is placed is the headroom; with experts left on the SSD the plan adds the file cache's
-        in.floor_bytes = head;
-        in.margin_bytes = margin;
-        in.late_bytes = late;
-        in.layer_bytes = largest_layer_bytes;
-        prompt_file_bytes = std::min<uint64_t>(lent_bytes, basalt::platform::kPromptFileReadBytes);
-        in.prompt_file_bytes = prompt_file_bytes;
+        in.floor_bytes = in.ram_available - basalt::core::ram_tier_room(
+            in.ram_available,
+            std::max(o.resident_headroom, basalt::platform::ram_reserve()) +
+                basalt::core::pin_tracking_bytes(basalt::core::host_plan_bytes()),
+            o.resident_pin);
         bp::AutoGiven& gv = in.given;
         if (!(in.peer && in.serve) || o.peer_exclusive_given) {   // not applicable, or given
             gv.peer_exclusive = true;
@@ -255,7 +256,6 @@ int resident_plan(Context& context) {
         }
         const bp::AutoPlan plan = bp::choose_auto(in);
         auto_resident_bytes = plan.resident_bytes;
-        ram_available_at_plan = in.ram_available;
         if (plan.peer_exclusive_src == bp::AutoSource::Auto && plan.peer_exclusive != o.peer_exclusive) {
             o.peer_exclusive = plan.peer_exclusive;
             set_stream_all_min();
@@ -302,17 +302,13 @@ int resident_plan(Context& context) {
     context.kMaxAutoChunk = &kMaxAutoChunk;
     context.auto_ceiling = &auto_ceiling;
     context.open_peer = open_peer;
-    context.largest_layer_bytes = &largest_layer_bytes;
-    context.prompt_file_bytes = &prompt_file_bytes;
     context.adapt_fast_on = &adapt_fast_on;
-    context.late = &late;
-    context.resident_headroom_base = &resident_headroom_base;
     context.lend_from = &lend_from;
     context.stage_held = &stage_held;
     context.pool = &pool;
     context.peer_only = &peer_only;
     context.peer_only_bytes = &peer_only_bytes;
-    return resident_load(context);
+    return split_plan(context);
 }
 
 }

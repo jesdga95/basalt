@@ -97,7 +97,7 @@ public:
                 basalt::log::error("basalt serve", "%s", r.message.c_str());
                 return 1;
             }
-        start_guard(0, 0);   // the margin alone: no prompt chunk is sized to reads of the file
+        start_guard();
         std::printf("INFO %s\n", (identity_words() + sessions_[0]->info_words()).c_str());
         std::printf("READY %lld stop\n", (long long) o.max_context);
         std::fflush(stdout);

@@ -82,7 +82,6 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
             o.grammar = v == "on";
         }
         else if (a == "--stop-eos") o.stop_eos = true;
-        else if (a == "--no-ram-guard") o.no_ram_guard = true;
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
         else if (a == "--vision-mmproj") { o.vision_mmproj = next("--vision-mmproj"); o.vision = true; }
@@ -90,7 +89,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         else if (a == "--conversation-cache-dir") o.conversation_cache_dir = next("--conversation-cache-dir");
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-disk-mib" ||
-                 a == "--conversation-cache-min-tokens") {
+                 a == "--conversation-cache-min-tokens" || a == "--ram-reserve-mib") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
@@ -104,6 +103,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
             else if (a == "--conversation-cache-disk-mib") o.conversation_cache_disk_mib = number;
             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = (int) number;
+            else if (a == "--ram-reserve-mib") o.ram_reserve_mib = number;
             else o.conversation_cache_slots = (int) number;
         }
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
@@ -136,8 +136,9 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         }
         }
     }
-    if (o.serve && o.no_ram_guard && !o.gpu_plan)
-        basalt::log::warn("basalt", "RAM guard off (--no-ram-guard): low RAM can stop the engine or the machine");
+    basalt::platform::set_ram_reserve((uint64_t) o.ram_reserve_mib << 20);
+    if (o.serve && o.ram_reserve_mib == 0 && !o.gpu_plan)
+        basalt::log::warn("basalt", "RAM guard off (--ram-reserve-mib 0): low RAM can stop the engine or the machine");
     if (adapter != nullptr) return adapter->finish_flags(o);
     return std::nullopt;
 }

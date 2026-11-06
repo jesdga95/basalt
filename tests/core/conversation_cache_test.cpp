@@ -404,6 +404,20 @@ int main() {
         check(copy.size() == 100 && copy[99] == 3, "small buffers still copy and fill");
     }
     {
+        // reserved blocks are handed out, come back, and stay through a release
+        const size_t big = (size_t(2) << 20) + 7;
+        (void) CheckpointBytes::allocator_type::release_pooled();
+        check(CheckpointBytes::allocator_type::reserve(big, 6), "six blocks reserved");
+        std::vector<CheckpointBytes> held(6);
+        for (auto& h : held) h.resize(big);
+        check(held[0].data() != held[5].data() && held[5][big - 1] == 0, "each takes a reserved block, written once");
+        held.clear();
+        check(CheckpointBytes::allocator_type::release_pooled() == 0, "a release keeps the reserved blocks");
+        CheckpointBytes again;
+        again.resize(big);
+        check(again.size() == big, "a reserved block is taken again");
+    }
+    {
         // The bulk (memcmp) key compare against the element-wise reference: every divergence index, a full match, and
         // the lengths around a page boundary.  A key is int32; a prompt may be either width, and the prefix has to
         // answer the same for both.

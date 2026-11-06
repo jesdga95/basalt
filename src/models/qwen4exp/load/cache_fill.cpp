@@ -85,9 +85,8 @@ int cache_fill(Context& context) {
             cache_bytes_now = std::min(cache_bytes_now, expert_total_bytes);
             const uint64_t vram = cuda0_fixed_bytes + cache_bytes_now;
             uint64_t outside = expert_total_bytes - cache_bytes_now;   // the experts no cache on the primary holds
-            const uint64_t late = o.serve ? basalt::platform::kLateHostBytes + serve_growth_bytes(o, g) : 0;
-            const uint64_t headroom = std::max(o.resident_headroom, basalt::platform::ram_margin() + late);
-            uint64_t ram = *free_ram > headroom ? *free_ram - headroom : 0;
+            uint64_t ram = basalt::core::ram_tier_room(
+                *free_ram, std::max(o.resident_headroom, basalt::platform::ram_reserve()), o.resident_pin);
             if (o.resident_cpu_experts && (o.resident_budget > 0 || o.resident_soft)) {
                 const uint64_t margin = 256ull << 20;
                 ram = ram > margin ? ram - margin : 0;
@@ -97,20 +96,7 @@ int cache_fill(Context& context) {
             uint64_t peer_vram = peer_expert_room();
             peer_vram = std::min(peer_vram, outside);
             outside -= peer_vram;
-            uint64_t file_headroom = headroom;
             if (model_bytes > vram + peer_vram + ram) {
-                // experts read from the SSD: the RAM copy also leaves the file cache its floor, as the loader does
-                uint64_t largest = 0;
-                for (int64_t l = 0; l < g.n_layers; ++l)
-                    largest = std::max<uint64_t>(largest, (uint64_t) g.n_expert *
-                                                              basalt::kernels::cpu::expert_layout().blob_bytes(l));
-                if (o.resident_cpu_experts && o.resident_budget == 0) {
-                    file_headroom =
-                        std::max(headroom, basalt::platform::ram_floor(basalt::platform::ram_margin(), outside, outside, largest,
-                                                    basalt::platform::kPromptFileReadBytes) + late);
-                    ram = *free_ram > file_headroom ? *free_ram - file_headroom : 0;
-                    if (o.resident_soft) ram = ram > (256ull << 20) ? ram - (256ull << 20) : 0;
-                }
                 ram = std::min(ram, outside);
                 if (model_bytes > vram + peer_vram + ram)
                     basalt::log::warn("basalt", "model %.1f GiB, free VRAM + RAM %.1f GiB: the rest is read from "

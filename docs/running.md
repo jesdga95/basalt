@@ -61,13 +61,16 @@ free RAM with 8 GiB to spare. `--idle-unload` ends the process instead.
 Basalt refuses settings that would leave the machine without memory, and never shrinks what you asked for:
 
 - `--vram-reserve-mib` below 256 is refused on Windows and WSL2 (128 on Linux): less free VRAM makes the driver page GPU memory.
-- With experts on the SSD, the RAM copy keeps a floor free for the OS file cache (`RAM floor ...` in the start log).
-- While serving, the RAM guard parks conversations to disk or drops them when free RAM falls. A request waits up to 30 s for RAM to
-  return. A running request stops with an error only when RAM is critical (under 1 GiB free, or below the guard under memory pressure).
+- `--ram-reserve-mib` (default 2048) is the RAM left free for the rest of the system. The engine allocates its host buffers
+  first, or holds their RAM when it page-locks them later; the expert tiers then take the free RAM less the reserve and less
+  the driver's tracking of the pages they pin (`RAM floor ...` in the start log). Programs left idle beside a small reserve
+  may be swapped out.
+- While serving, the RAM guard holds the reserve: below it, it parks conversations to disk or drops them. A request waits up to 30 s
+  for RAM to return. A running request stops with an error only when RAM is critical (under 1 GiB free, or below the reserve under
+  memory pressure). `--ram-reserve-mib 0` turns the guard off.
 - Experts on the SSD give one warning, the same for every model: `N experts on SSD (X GiB) · free X GiB RAM`. The console
   repeats it and the stats page turns its Experts block amber.
-- `--no-ram-guard` turns the guard off: nothing is shed, delayed or stopped for low RAM. The disk tier keeps its floor a GiB
-  above where the guard would sit.
+- The disk tier keeps its floor a GiB above the reserve.
 - `--resident-budget-gib` that would leave less than the floor is refused with the largest safe value.
 
 ## Vision: `--vision`

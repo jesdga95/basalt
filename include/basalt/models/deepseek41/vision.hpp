@@ -17,6 +17,7 @@ namespace basalt::models::deepseek41 {
 
 constexpr int kVisionPatch = 14;
 constexpr int kVisionPatchValues = 3 * kVisionPatch * kVisionPatch;   ///< one patch row: channel, y, x
+constexpr int kVisionMaxTokens = 1024;                                ///< merged tokens of the largest image
 
 struct VisionPlan {
     int width = 0, height = 0;   ///< canvas in pixels (multiples of the patch size)
@@ -28,7 +29,7 @@ struct VisionPlan {
 };
 
 /// Canvas for a w x h picture: at least `min_pixels` area, at most `max_tokens` block rows, aspect preserved.
-VisionPlan plan_image(int w, int h, int merge, int min_pixels, int max_tokens = 1024);
+VisionPlan plan_image(int w, int h, int merge, int min_pixels, int max_tokens = kVisionMaxTokens);
 
 /// Patch rows [n_patches][588] in raster order: the picture resized to fit the canvas, centred on grey 127, scaled to
 /// [-1, 1] and rounded to bf16.

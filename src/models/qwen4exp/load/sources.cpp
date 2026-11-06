@@ -73,14 +73,12 @@ int sources(Context& context) {
     }
     // the pool is built once the start-up picks are known (below, with the resident RAM plan)
     std::optional<basalt::kernels::cpu::ExpertPool> pool_store;
-    uint64_t ram_available_at_plan = 0;   // the available RAM the start-up plan was sized from
     uint64_t auto_resident_bytes = 0;   // the start-up pick for the RAM copy (used when no budget is given)
 
     context.src = &src;
     context.arena_src = &arena_src;
     context.srcp = &srcp;
     context.pool_store = &pool_store;
-    context.ram_available_at_plan = &ram_available_at_plan;
     context.auto_resident_bytes = &auto_resident_bytes;
     return cache_size(context);
 }

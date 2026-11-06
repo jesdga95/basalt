@@ -21,6 +21,8 @@
 #include "basalt/models/qwen4exp/decode/conversation_snapshot.hpp"
 #include "basalt/core/conversation_memory.hpp"
 #include "basalt/core/expert_source.hpp"
+#include "basalt/core/host_plan.hpp"
+#include "basalt/core/ram_load.hpp"
 #include "basalt/core/pinned.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/platform/cpu.hpp"
