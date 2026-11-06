@@ -1,24 +1,12 @@
 # Configuration reference
 
-Every setting a user can pass to Basalt: the server options, the engine flags, the per-request sampling fields and
-the model file's sampling defaults. For what a setting does to speed, memory and output precision see the
-[running](../running.md) and [precision](../precision/index.md).
+Every setting: server options, engine flags, and the sampling fields. Effects on speed and precision: [running](../running.md),
+[precision](../precision/index.md).
 
-- [How settings are given](#how-settings-are-given)
-- [Server](#server)
-- [Model and GPUs](#model-and-gpus)
-- [Context and KV cache](#context-and-kv-cache)
-- [Expert cache and memory](#expert-cache-and-memory)
-- [Prompt processing](#prompt-processing)
-- [Speculative decoding (MTP)](#speculative-decoding-mtp)
-- [Parallel slots](#parallel-slots)
-- [Conversation cache](#conversation-cache)
-- [Vision](#vision)
-- [Control vectors](#control-vectors)
-- [Sampling and thinking](sampling.md)
-- [The adaptive tier](adaptive.md)
-- [Example configurations](examples.md)
-- [Diagnostics, measurement and `--exp` flags](diagnostics.md)
+- [How settings are given](#how-settings-are-given) · [Automatic settings](#automatic-settings) · [Server](#server) · [Model and GPUs](#model-and-gpus)
+- [Context and KV](#context-and-kv-cache) · [Expert cache](#expert-cache-and-memory) · [Prompt](#prompt-processing) · [Drafting](#drafting)
+- [Slots](#parallel-slots) · [Conversation cache](#conversation-cache) · [Vision](#vision) · [Control vectors](#control-vectors)
+- Pages: [models and the router](models.md), [sampling](sampling.md), [adaptive tier](adaptive.md), [examples](examples.md), [diagnostics](diagnostics.md)
 
 ## How settings are given
 
@@ -27,224 +15,173 @@ bin/basalt serve --config basalt_config.json [options]
 bin/basalt serve MODEL.basalt [--python PY] [options]
 ```
 
-`basalt serve` runs the Python server (`serve/`) over the engine binary. `MODEL.basalt` as the first argument stands for
-`--model MODEL.basalt`; `--python` picks the interpreter (default: `.venv/bin/python` in the source tree, else
-`python3`; on Windows `.venv/Scripts/python.exe`, else `python`). Everything else goes to the server.
+- **Server options** (the Python server): model, address, port, slots, vision, logging. `--name value` on the command line.
+- **Engine flags** (`bin/basalt --help`): context, KV, expert cache, prefill, speculation. Given like any flag; the server passes them
+  on in order and asks the engine which it accepts.
 
-There are two kinds of setting:
-
-- **Server options** belong to the Python server: model path, address, port, slots, vision, logging. On the command line
-  they are `--name value`.
-- **Engine flags** belong to the engine binary (`bin/basalt --help`): context, KV format, expert cache, prefill,
-  speculation. The server passes them on. Put them on the command line like any other flag (`--kv int8`). The server passes
-  them to the engine as typed, in order, and does not interpret their values, so a flag that takes several values
-  works too (`--control-vector-layer-range 4 44`). It asks the engine binary which flags it accepts, and stops at
-  startup on a flag name it does not know. It adds `--serve` itself, and `--vision` (with `--vision-mmproj` for
-  `vision dynamic`) when `vision` is on.
-
-A config file is one JSON object with two optional blocks:
+A config file is one JSON object. `models` lists the models; `engine` applies to every model that takes it; `server` is shared:
 
 ```json
-{
-  "server": { "model": "model.basalt", "port": 8080 },
-  "engine": { "kv": "int8", "resident-experts": true, "control-vector-layer-range": [4, 44] }
-}
+{ "version": 2, "models": [{ "model": "model.basalt", "kv": "int8" }],
+  "engine": { "resident-experts": true }, "server": { "port": 8080 } }
 ```
 
-- Keys are the flag names without the dashes (`_` works for `-`). Values are strings or numbers; a switch is `true`, and
-  `false` leaves it off. A repeatable option (`allowed-host`, `cors-origin`, `image-url-host`, `image-dir`) takes a list.
-- `model` and `tokenizer` paths are relative to the config file.
-- **Precedence:** command line > config file > built-in defaults. The engine receives the config file's flags, then
-  the command line's, and a flag given twice takes its last value.
-- An engine flag in `server`, or a server option in `engine`, stops the server at startup, as does an unknown name.
-- `api-key` cannot be set in a config file; a file that sets it is refused.
-- The built-in defaults pick the fastest settings that need no knowledge of the machine (speculation 8 with a drafter,
-  expert cache auto, prefill auto, resident experts when the RAM holds them, adaptive rounds every window on a server), and keep
-  the settings that change output or memory use (4096 context, fp16 KV). A config file sets those. The startup line `[server] engine ...` lists what came from the file or the command line.
-
-In the tables, "default" is what applies when the setting is absent everywhere.
+- Keys are flag names without dashes. Switches are `true`. A repeatable option (`allowed-host`, `cors-origin`, `image-url-host`,
+  `image-dir`) takes a list. `model` paths are relative to the file.
+- A row marked Flash-Next only or DeepSeek only is an unknown flag for the other model, and stops its start.
+- Precedence: command line, then config file, then defaults. A wrong block or an unknown name stops the start. `api-key` cannot be in
+  a file.
+- The defaults are the fastest settings that need no knowledge of the machine. The keys that change output or memory (8,192 context,
+  fp16 KV) are kept for you to set.
 
 ## Automatic settings
 
-Four settings are picked by the engine at start when they are left out: `peer-exclusive`, `resident`
-(`resident-budget-gib`), `pool-affinity` and `pool-workers`. A value in the config file or on the command line always
-wins and is never changed.
+When left out, the engine picks `peer-exclusive`, `resident` (`resident-budget-gib`), `pool-affinity` and `pool-workers`. A given value
+always wins. It prints one `[server] auto` line:
 
-| setting | rule |
+| Setting | Rule |
 | --- | --- |
-| `peer-exclusive` | on only with a peer card and `--serve`, when the full expert set does not fit in free RAM but the set without the peer card's share does; otherwise off. |
-| `resident` | the free RAM above the safety floor, capped at the experts the GPUs do not hold. |
-| `pool-affinity` | `auto`. |
-| `pool-workers` | the physical cores minus the host thread; on a hybrid CPU with `auto`, the P-cores minus one plus half the E-cores, with `p-cores` the P-cores minus one; fitted to a container CPU quota. |
-
-The engine prints one line naming only the picked settings, in the order above, and the server relays it once per start:
-
-```
-[server] auto     peer-excl=off resident=51.2GB pool-affinity=auto pool=15
-```
-
-When every setting is given, no line is printed.
+| `peer-exclusive` | Flash-Next only. On only with a peer card, when the full expert set does not fit in free RAM but the set without the peer's share does |
+| `resident` | Flash-Next only. Free RAM above the safety floor, capped at the experts the GPUs do not hold |
+| `pool-affinity` | `auto` |
+| `pool-workers` | physical cores minus the host thread; on hybrid CPUs, P-cores minus one plus half the E-cores |
 
 ## Server
 
-Server options. Command line `--name`, config `server` block `"name"`.
+Command line `--name`, config `server` block `"name"`.
 
-| Setting | Type, values | Default | What it does and when to change it |
+| Setting | Type, values | Default | What it does |
 | --- | --- | --- | --- |
-| `model` | path | none (required) | The `.basalt` model file. The weights, tokenizer, chat template, drafter, vision projector and default sampling all come from it. |
-| `alias` | string | the name stored in the model file | The model name the API reports. Change it when a client expects a particular name. |
-| `host` | address | `127.0.0.1` | The address to listen on. `127.0.0.1` is this machine only; `0.0.0.0` also serves the network. Never listen beyond `127.0.0.1` without `api-key`. |
-| `port` | integer | `8080` | The TCP port. |
-| `api-key` | string | none | Require this key on `/v1/*` (`Authorization: Bearer ...` or `x-api-key`). Command line only. Set it whenever `host` is not `127.0.0.1`. |
-| `allowed-host` | string, repeatable | none | Also answer to this `Host` name; `"*"` turns the check off. Needed when clients reach the server by a name other than its address. |
+| `model` | path | required | The `.basalt` file: weights, tokenizer, chat template, drafter, vision projector and default sampling. |
+| `alias` | string | name in the file | The model name the API reports. |
+| `host` | address | `127.0.0.1` | Listen address. `0.0.0.0` serves the network; never without `api-key`. |
+| `port` | integer | `8080` | TCP port. |
+| `api-key` | string | none | Require this key on `/v1/*` (`Authorization: Bearer` or `x-api-key`). Command line only. |
+| `allowed-host` | string, repeatable | none | Also answer to this `Host` name; `"*"` turns the check off. |
 | `cors-origin` | string, repeatable | none | Let web pages from this origin call `/v1/*`. |
-| `fit-max-tokens` | switch | off | Clamp a request's `max_tokens` to the context that remains instead of rejecting it with 400. |
-| `open` | switch | off | Open the local web page in the browser once the model is ready. |
-| `lazy` | switch | off | Start the text-only API unloaded and load the model on the first request. Turns vision off. |
-| `idle-unload` | seconds | off | Unload the model after this long without requests; the next request loads it again. Frees VRAM for other programs. |
-| `idle-sleep` | seconds | off | Put the model to sleep after this long without requests: its VRAM is freed, the process keeps its RAM copy, conversations and learned expert placement, and the next request wakes it in seconds. Linux only (the driver suspends the engine's GPU state); it stays awake when that state would not fit in the free RAM. [running](../running.md#sleep---idle-sleep) |
-| `min-free-vram-mib` | integer | off | Load an unloaded model only when this much VRAM is free, otherwise answer 503. Pairs with `lazy` and `idle-unload`. |
-| `grammar` | switch (`--no-grammar` or `grammar: false` turns it off) | on | Hold every tool call and JSON response format (`json_object`, `json_schema`) to its schema inside the engine, so a malformed call or object cannot be produced (as in llama.cpp's Qwen3-Coder parser, a call's required parameters may come in any order, each once, with up to six required ones permuted and more kept in declared order, followed by the optional ones in any order, which may repeat); the model's JSON is returned as it is generated, with no check after the fact. A JSON format sent together with tools (`tool_choice` auto) holds the answer to tool calls or the JSON value; a forced call holds it to the call. A request with `strict: true` gets the grammar even when this is off; with it off, any other JSON `response_format` (or Responses `text.format`, or Anthropic `output_config.format`) is refused with HTTP 400. Needs an engine that has `--grammar`; the server turns the engine's grammar support on whenever it has the flag. Works in batch slots: a slot's first pick the grammar refuses is resampled under the mask (the solo rule) and its window ends there. |
-| `debug` | switch | off | One log line per request and the raw model text after each reply. |
-| `request-lines` | switch | off | Echo the engine's per-request summary on stdout, for a supervisor that sees only that output. |
-| `temperature`, `top-p`, `top-k`, `min-p`, `presence-penalty`, `frequency-penalty`, `repetition-penalty`, `penalty-last-n`, `seed` | number (`top-k`, `penalty-last-n`, `seed`: integer) | the model file's `sampling` value, else the engine's | The sampling default for a request that leaves that field out, over the model file's. Same meaning and allowed values as the [model file's sampling keys](sampling.md#the-model-files-sampling-defaults). The server applies them to each request; the engine never sees them. |
-| `reasoning-budget-tokens` | integer | `0` (none) | The thinking budget for a request that names none (see [sampling](sampling.md)). At the budget the thinking is closed and the answer starts. A request's own field wins, and `0` there disables budgeting. Positive budgets are also limited by `answer-room`. |
-| `thinking-loop-tokens` | integer | `256` | End the thinking, and let the model answer, when it repeats one token this many times in a row inside the thinking; `0` turns it off. See [Thinking loops](sampling.md#thinking-loops). |
-| `answer-room` | switch (`--no-answer-room` or `answer-room: false` turns it off) | on | Reserve space for closing the thinking and for the answer when the effective output cap is at least 1024 tokens. Applies to missing budgets and clamps positive budgets; an explicit request budget of `0` opts out. |
-| `tokenizer` | path | `pack/full/tokenizer` in the source tree (a byte tokenizer if absent) | Tokenizer directory. Mock engine only. |
-| `mock-engine`, `script` | switch, string (repeatable) | off, a short greeting | Testing: run a scripted engine instead of the model, for clients and tests (no `model` needed); `script` is its answer, and given more than once, requests get them in turn. |
+| `fit-max-tokens` | switch | off | Clamp `max_tokens` to the remaining context instead of a 400. |
+| `open` | switch | off | Open the web page when ready. |
+| `lazy` | switch | off | Start unloaded; load on the first request. Drops a sidecar encoder. |
+| `idle-unload` | seconds | off | Unload after this long idle. Frees VRAM for other programs. |
+| `idle-sleep` | seconds | off | Sleep after this long idle: VRAM freed, RAM kept, wake in seconds. Linux only. [running](../running.md#sleep---idle-sleep) |
+| `min-free-vram-mib` | integer | off | Load an unloaded model only when this much VRAM is free; else 503. |
+| `grammar` | switch (`--no-grammar`) | on | Hold tool calls and JSON formats (`json_object`, `json_schema`) to their schema inside the engine. Without it, other JSON formats are refused with 400. |
+| `debug` | switch | off | One log line per request, and the raw model text. |
+| `request-lines` | switch | off | Echo the per-request summary on stdout. |
+| `temperature`, `top-p`, `top-k`, `min-p`, `presence-penalty`, `frequency-penalty`, `repetition-penalty`, `penalty-last-n`, `seed` | number (`top-k`, `penalty-last-n`, `seed`: integer) | the model file's `sampling`, else the engine's | Default for a request that leaves the field out. See [sampling](sampling.md). |
+| `reasoning-budget-tokens` | integer | `0` | Thinking budget for requests that name none. A request's own value wins. |
+| `thinking-loop-tokens` | integer | `256` | End thinking when one token repeats this many times in a row; `0` turns it off. |
+| `answer-room` | switch (`--no-answer-room`) | on | Reserve room for closing the thinking and the answer (caps of 1,024 tokens or more). |
 | `config` | path | none | The config file. Command line only. |
 
 ## Model and GPUs
 
-| Setting | Where | Type, values | Default | What it does and when to change it |
+| Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `gpu` | server (also `basalt`, `basalt-bench`, `basalt-probe`) | GPU numbers, e.g. `"0"` or `"0,1"`, or `"auto"` | GPU 0 alone (a warning names the other visible cards) | The cards to use, numbered as `nvidia-smi` numbers them: exactly these, the first is the main card. `auto` takes every Blackwell card and makes the fastest the main one. The engine gives the other cards their roles (a second card becomes the peer expert tier). See [GPUs](gpus.md). |
-| `peer-reserve-mib` | engine | integer MiB | 600 | VRAM the second card leaves free after its experts and the buffers of its prompt share, which the engine sizes itself. Raise it when the start prints `prefill peer: the peer's buffers do not fit`. See [GPUs](gpus.md#two-16-gb-cards). |
+| `gpu` | server, `basalt`, `basalt-bench`, `basalt-probe` | `"0"`, `"0,1"`, `"auto"` | GPU 0 alone | Cards, numbered as `nvidia-smi`. The first is the main card. `auto` takes every Blackwell card and makes the fastest main. [GPUs](gpus.md) |
+| `peer-reserve-mib` | engine | MiB | 600 | VRAM the second card keeps free after its experts and prompt buffers. Raise it when the start says the peer's buffers do not fit. [GPUs](gpus.md#two-16-gb-cards) |
 
 ## Context and KV cache
 
-| Setting | Where | Type, values | Default | What it does and when to change it |
+| Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `max-context` | engine | integer tokens | 4096 | The longest context the engine allows. Raise it for long prompts; the KV cache grows with it. With `parallel`, this is shared by the slots. |
-| `kv` | engine | `fp16`, `int8`, `q4_0`, `k8v4` | `fp16` | KV storage. `int8` halves the VRAM. `q4_0` is 4-bit after a Hadamard rotation, half of `int8` again, slightly lower precision. `k8v4` keeps K in int8 and V in rotated 4-bit (816 B per cell against `int8`'s 1056); not with `kv-resident`. Use `int8` for long contexts; go lower when VRAM is short. See [precision](../precision/index.md). |
-| `kv-resident` | engine | integer cells, minimum 20480, or `0` | 0 (all KV in VRAM) | Keep only this many cells of each attention layer's KV in VRAM and the whole K/V in pinned RAM; the freed VRAM goes to expert slots. A context that fits in N cells is not streamed. For very long contexts on a small card. |
-| `rope-scaling` | engine | `none`, `linear`, `yarn` | the model file's, else `none` | Extend the context past the trained length. Fixed for the run: K in the cache is stored after RoPE. |
-| `rope-scale` | engine | number | the model file's, else 1 | The extension factor for `linear` and `yarn`. |
-| `rope-freq-base`, `rope-freq-scale` | engine | number | 0 (the model's own) | Raw frequency base and angle shrink. Leave at 0 unless you know the values you want. |
-| `yarn-orig-ctx`, `yarn-ext-factor`, `yarn-attn-factor`, `yarn-beta-fast`, `yarn-beta-slow` | engine | number | 0 (262144), auto, 1, 32, 1 | YaRN's own parameters, as in llama.cpp. |
-
-A server with `max-context` above 32768 has an elastic KV cache: each session backs its first 32768 cells at startup and
-takes more from the expert cache only when a request needs it. With `parallel`, each slot whose share is above 4096
-tokens does the same from 4096 cells, growing by 4096, and an idle conversation's KV moves to RAM once requests beside
-it have run 15 s. It is off with `kv-resident`, `vram-elastic` or a layer split. See [running](../running.md#concurrent-requests---parallel-n).
+| `max-context` | engine | tokens | 8192 | Longest context. Shared by `parallel` slots. The KV cache grows with it. |
+| `kv` | engine | `fp16`, `int8`, `q4_0`, `k8v4` | `fp16` | Flash-Next only. KV storage. `int8` halves VRAM. `q4_0` is 4-bit after rotation; `k8v4` keeps K int8 and V 4-bit (816 bytes per cell against `int8`'s 1,056). Not with `kv-resident`. |
+| `kv-resident` | engine | cells (min 20,480) or `0` | 0 | Flash-Next only. Keep N cells of KV in VRAM and the rest in pinned RAM. |
+| `rope-scaling` | engine | `none`, `linear`, `yarn` | model's, else `none` | Flash-Next only. Extend past the trained length. Fixed for the run. |
+| `rope-scale` | engine | number | model's, else 1 | Flash-Next only. Factor for `linear` and `yarn`. |
+| `rope-freq-base`, `rope-freq-scale` | engine | number | 0 (model's own) | Flash-Next only. Raw RoPE values. Leave at 0 unless you know them. |
+| `yarn-orig-ctx`, `yarn-ext-factor`, `yarn-attn-factor`, `yarn-beta-fast`, `yarn-beta-slow` | engine | number | 0 (262144), auto, 1, 32, 1 | Flash-Next only. YaRN parameters, as in llama.cpp. |
 
 ## Expert cache and memory
 
-The model's experts live in VRAM (the expert cache), in RAM, or in the file. These settings decide where.
-
-| Setting | Where | Type, values | Default | What it does and when to change it |
+| Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `vram-reserve-mib` | engine | integer MiB, at least 256 (128 on Linux) | 700 (lowered automatically, down to 300, on a card that would otherwise get too few slots; a value you give is kept unless it is raised as described here) | VRAM left free on the main card for graphs, scratch and the head when `expert-cache auto` sizes the cache. A server's kernels and window graphs that load after the cache (96 MiB, plus 24 MiB per slot with `--parallel`) load into it; a reserve too small to hold them and keep the floor free is raised to that: on Linux with `--parallel 4`, any value below 320 MiB (128 + 96 + 4 x 24) becomes 320, and the `expert cache auto` start line gives both (`320 MiB reserved (150 asked, ...)`). Below the floor is refused. Raise it if the machine pages GPU memory or other programs need VRAM. |
-| `resident-experts` | engine | switch | on when the engine has an expert profile for the model | Keep the experts the GPU does not hold in page-locked RAM, so none is read from the file again. Leaves a RAM floor free for the OS; when the RAM cannot hold them it falls back to a plain file mapping. `mmap-experts` turns it off. |
-| `resident-budget-gib` | engine | number GiB | auto when not set | Like `resident-experts` but with at most N GiB of experts in RAM, hottest first. Refused when it would leave less than the RAM floor free; the error names the largest safe value. |
-| `mmap-experts` | engine | switch | off | Opt out of the default resident RAM copy and back to a file mapping. Speed then depends on the OS page cache. |
-| `shared-expert-arena` | engine | file path | off | Back the resident arena with one shared file so several processes use one copy. Put it on `/dev/shm`. |
-| `expert-profile` | engine | file path | the engine's (`data/profiles/<model>.prof` in the source tree it was built from) | The expert profile a start places, in the format of `data/profiles`: which experts go to VRAM first. Set it to keep a binary's placement independent of its build folder, or to try another profile. A missing or empty file stops the start. |
-| `expert-profile-save` | engine | file path | off | Save what the adaptive tier learned (experts in VRAM and routing counts) to this file on exit and periodically. A start that finds the file places it instead of the engine's profile, so the first request runs on what the last run learned: faster when the workload continues, slower when it changes ([adaptive tier](adaptive.md)). Needs the adaptive tier on. |
-| `expert-profile-save-every` | engine | minutes | 10 (`0` = on exit only) | How often the profile is saved. |
-| `resident-cpu-experts` | engine | switch | off (implied by `resident-experts`) | With `mmap-experts` and an expert profile: keep the experts the GPU does not hold in ordinary RAM, so none is read from the file again. `resident-experts` is this with the copy page-locked when possible and the file mapping as a fallback when it does not fit. |
-| `vram-elastic` | engine | switch | off | Hold the expert cache in segments so `POST /v1/vram` can lend VRAM to other programs between requests. Works with `resident-experts`: a shrink first copies the experts it gives back into RAM, so none is read from the file, and is refused (nothing changed) when the RAM above the floor cannot hold them; a grow frees those copies. |
-| `vram-segment-mib` | engine | integer MiB, at least 64 | 512 | The segment size of `vram-elastic`'s expert cache: the step VRAM is lent and taken back in. Below 64 turns `vram-elastic` off with a warning. |
-| `expert-cache` | engine | `auto`, or an integer count of expert blobs | `auto` (with an expert profile) | Keep this many expert blobs in VRAM and compute their rows on the GPU. `auto` takes as many as fit in the VRAM left after the weights, the session and `vram-reserve-mib`. |
-| `adapt-every` | engine | integer windows | 1 on a server, 4 with a layer split (`0` = off) | An adaptive round every N decode windows. [Adaptive tier](adaptive.md). |
-| `adapt-swaps` | engine | integer | 96 (`0` = off) | Most experts one adaptive round swaps into the main GPU; a server round after a large backlog swaps four times as many, and the RAM copy keeps four times N free places for them. [Adaptive tier](adaptive.md). |
-| `peer-adapt-swaps` | engine | integer | the value of `adapt-swaps` | Most experts one round swaps into the peer card. Only with a peer card. |
-| `adapt-decay` | engine | number | 0.85 on a server, 0.7 with a layer split | The factor the routing counts are multiplied by after each round; lower forgets sooner. [Adaptive tier](adaptive.md). |
-
-### The adaptive tier
-
-The engine moves the experts the conversation routes to most into VRAM, in rounds beside decode. What the four
-settings above do, what they trade and the measured numbers: [adaptive tier](adaptive.md).
-
-The startup lines `RAM floor ...` and `RAM ... free, guard ...` give the figures behind the memory floors. See the
-[running](../running.md#memory-floors).
+| `vram-reserve-mib` | engine | MiB, at least 256 (128 on Linux) | 700 (lowered to 300 on a card with too few slots) | VRAM kept free on the main card for graphs, scratch and the head. Raised to the floor the kernels need (`--parallel 4` on Linux: at least 320). |
+| `resident-experts` | engine | switch | on with a profile | Flash-Next only. Keep experts the GPU does not hold in page-locked RAM. Falls back to a file mapping when RAM is short. |
+| `resident-budget-gib` | engine | GiB | auto | At most N GiB of experts in RAM, hottest first. |
+| `mmap-experts` | engine | switch | off | Flash-Next only. Use a file mapping instead of the RAM copy. |
+| `shared-expert-arena` | engine | file path | off | Flash-Next only. One shared file for the resident arena across processes (put it on `/dev/shm`). |
+| `expert-profile` | engine | file | `data/profiles/<arch>-<layers>x<experts>.prof` | Which experts start in VRAM. |
+| `expert-profile-save` | engine | file | off | Flash-Next only. Save the learned placement on exit and periodically; a start places from it. Needs the adaptive tier. |
+| `expert-profile-save-every` | engine | minutes | 10 (`0` = on exit only) | Flash-Next only. Save period. |
+| `resident-cpu-experts` | engine | switch | off (implied by `resident-experts`) | Flash-Next only. With `mmap-experts`: keep RAM-resident experts in ordinary RAM. |
+| `vram-elastic` | engine | switch | off | Flash-Next only. Hold the expert cache in segments so `POST /v1/vram` can lend VRAM between requests. |
+| `vram-segment-mib` | engine | MiB, at least 64 | 512 | Flash-Next only. Segment size for `vram-elastic`. |
+| `expert-cache` | engine | `auto` or a count | `auto` | Expert blobs kept in VRAM. `auto` takes what fits after weights, session and reserve. |
+| `adapt-every` | engine | windows | 1 on a server, 4 with a layer split (`0` = off) | Flash-Next only. An adaptive round every N windows. [adaptive](adaptive.md) |
+| `adapt-swaps` | engine | integer | 96 (`0` = off) | Flash-Next only. Most experts one round swaps into the main GPU. [adaptive](adaptive.md) |
+| `peer-adapt-swaps` | engine | integer | `adapt-swaps` | Flash-Next only. Most experts one round swaps into the peer card. |
+| `adapt-decay` | engine | number | 0.85 (0.7 with a layer split) | Flash-Next only. Factor applied to routing counts after each round. [adaptive](adaptive.md) |
 
 ## Prompt processing
 
-The prompt is read in batched chunks. These settings set the chunk size and how the streamed experts are shared.
-
-| Setting | Where | Type, values | Default | What it does and when to change it |
+| Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `prefill` | engine | `auto`, `auto:N` (N = 8192, 16384 or 32768), or a chunk size in tokens | `auto` | Read the prompt in chunks of this many tokens. `auto` takes the largest chunk the expert cache can lend, up to a ceiling; `auto:N` sets that ceiling. |
-| `prefill-cpu-share` | engine | number from 0 to 1 | 0.6 | Share of the streamed prompt experts the CPU computes; `0` has the GPU stream them all. Fixed, so the output is the same from run to run. A weaker CPU may prefer a lower value. |
-| `short-read` | engine | integer tokens | 64 (`0` = off) | A fresh part of a prompt of at most N tokens (a chat message, a short tool result) is read through the decode windows instead of the batched prompt path. |
-| `peer-prefill-rows` | engine | integer rows per layer | half of chunk x top-k | Prompt rows per layer the peer card computes. `0` keeps the prompt path on the main card. |
+| `prefill` | engine | `auto`, `auto:N` (N = 8192, 16384 or 32768), or tokens | `auto` | Flash-Next only. Prompt chunk size. |
+| `prefill-cpu-share` | engine | 0 to 1 | 0.6 | Flash-Next only. Share of streamed prompt experts the CPU computes. Fixed, so output is the same run to run. |
+| `short-read` | engine | tokens | 64 (`0` = off) | Flash-Next only. A fresh part of at most N tokens is read through decode windows. |
+| `no-prompt-skip` | engine | switch | off | DeepSeek only. Run every row through every layer. Slower; the same math. [precision](../precision/deepseek41.md#prompt-skip) |
+| `peer-prefill-rows` | engine | rows per layer | half of chunk x top-k | Flash-Next only. Prompt rows per layer the peer card computes. `0` keeps the prompt on the main card. |
 
-## Speculative decoding (MTP)
+## Drafting
 
-The drafter proposes tokens and the model verifies them. Unless `relaxed-drafting` is on, the output is exactly what
-plain decoding would give.
-
-| Setting | Where | Type, values | Default | What it does and when to change it |
-| --- | --- | --- | --- | --- |
-| `spec` | engine | integer | 8 with a drafter, else 0 | Verify windows of at most N tokens: the last accepted token plus up to N-1 drafts. `0` or `1` turns speculation off. |
-| `suffix-draft` | engine | integer tokens | 3 (`0` = MTP only) | Prompt lookup: when the text repeats an earlier stretch of the context by at least N tokens, the window may be filled from what followed it there, where the draft policy expects it to pay; such a window may be up to 2 tokens longer than `spec`, at most 8. |
-| `mtp-max-t` | engine | integer | 0 (= `spec`) | Caps the MTP's own windows; longer ones then come only from prompt lookup. |
-| `mtp-window` | engine | integer cells | 32768 (`0` = all) | The drafter attends to the last N cells. With `parallel`, each slot's draft K/V keeps only those and the 16384 before them (a turn rolled back), not the slot's whole context, and the rest of that VRAM holds expert slots. |
-| `relaxed-drafting` | engine (`[P]`) | `true`, or a number in (0, 1] | off | Optional, and it changes output. Under sampling, a draft the model gives probability P or more is kept even when the model's own draw would have been another token. Faster, but no longer the model's exact sampling distribution; lower P is faster and further from exact. Bare `true` or flag alone is 0.5. Greedy requests, `logit_bias`, JSON `response_format`, control tokens and tool calls stay exact. Single-stream only. Numbers: [precision](../precision/features.md#relaxed-drafting). |
-| `route-tail-skip` | engine (`[R]`) | `true`, or an integer 1 to 9 | off | Optional, and it **changes the output: less accurate than the model.** In a decode window, an expert no GPU holds is neither copied nor computed when every entry naming it ranks R or lower by router weight within its token (0-based of 10); it adds zero and the other experts keep their weights. Lower R drops more. Bare `true` or flag alone is 9. Needs the device-planned MoE tail, else it stays off and says so at start. Listed in the start warning of lossy flags. Numbers: [precision](../precision/routing.md#route-tail-skip). |
-| `route-prior` | engine (`[LAMBDA]`) | `true`, or a number in (0, 16] | off | Optional, and it **changes the output: less accurate than the model.** A decode window picks its ten experts as if each expert a GPU holds had LAMBDA added to its router logit; the weights stay the router's own. Higher routes harder toward held experts. Bare `true` or flag alone is 0.5. Needs the device-planned MoE tail, else it stays off and says so at start. Listed in the start warning of lossy flags. Numbers: [precision](../precision/routing.md#route-prior). |
-
-## Parallel slots
-
-| Setting | Where | Type, values | Default | What it does and when to change it |
-| --- | --- | --- | --- | --- |
-| `parallel` | server | integer 1..8 | 1 | Serve N requests at once in batch slots; further requests wait their turn. `max-context` is shared: each slot holds `max-context / N` tokens. The slots' KV cache comes out of the expert cache. Sets the engine's `batch`. |
-| `slot-full-context` | server | switch | off | With `parallel`, give every slot the whole `max-context` instead of an equal share. Costs N times the KV cache. |
-| `batch` / `slots` | engine | integer 2..8 | off | The engine flag `parallel` sets. Use `parallel`; setting both is an error. |
-
-## Conversation cache
-
-| Setting | Where | Type, values | Default | What it does and when to change it |
-| --- | --- | --- | --- | --- |
-| `prompt-cache` | engine | integer | 6 | Conversation checkpoints kept between requests, about 118 MB of RAM each. `0` reads every prompt from the start. More checkpoints let more chats resume without re-reading. |
-| `prompt-cache-every` | engine | integer tokens | 16384 (`0` = off) | Also checkpoint every N freshly read prompt tokens (RAM only: the disk tier does not store them). |
-| `prompt-cache-root` | engine | integer tokens | 2048 (`0` = never) | Checkpoint a prompt's first turn boundary (the end of the system prompt) when it is at least this long. |
-| `turn-token` | engine | token id | 248045 (`<\|im_start\|>`) | The token that opens a chat turn; the last one in a prompt is where the conversation checkpoint goes. |
-| `tail-role-token` | engine | token id | -1 (off) | When the turn right before the last one opens with this role token (a short trailing turn such as a reasoning-effort note), the checkpoint goes in front of that turn, so it holds the conversation and not the note. |
-| `conversation-cache-mib` | engine | integer MiB | 0 (off) | RAM budget for parked conversations, so separate chats can come back without re-reading. |
-| `conversation-cache-slots` | engine | integer | 4 | At most this many parked conversations. |
-| `conversation-cache-min-free-mib` | engine | integer MiB | 2560 | Physical RAM floor kept free when parking a conversation. |
-| `conversation-cache-min-tokens` | engine | integer tokens | 0 (park every one) | Park only conversations of at least this many tokens, in the RAM tier, on disk, and when an idle conversation leaves VRAM. Below the minimum a conversation stores nothing and evicts nothing: the one-shot side requests of agent traffic stop taking slots from the long conversations whose reuse pays. |
-| `conversation-cache-disk-mib` | engine | integer MiB | 0 (off) | Park conversations on disk, at most this much (the least recently used go first), and read them back when a prompt starts with one, after a restart too. Above 0 turns it on; the folder is `conversations` in the model's cache folder. [running](../running.md#conversations-on-disk---conversation-cache-disk-mib) |
-| `conversation-cache-dir` | engine | directory | model cache folder | Another folder for the disk tier. Does nothing while the budget is 0. |
-
-## Vision
-
-| Setting | Where | Type, values | Default | What it does and when to change it |
-| --- | --- | --- | --- | --- |
-| `vision` | server | `off`, `dynamic`, `cpu`, a GPU number | `off` | Image input; booleans are refused. A GPU number, as `gpu` numbers them: encoder sidecar always on that card (about 2.2 GiB of its expert cache), whatever the engine's cards are and no engine role needed. `dynamic`: inside the engine, borrowing expert-cache slots only while it reads an image. `cpu`: sidecar on the CPU, no VRAM, slow. Latencies: [running](../running.md#vision---vision). A GPU number needs the `basalt-vision` binary next to `bin/basalt`. Needs a model file with a vision projector. One image is capped at 32 MiB and 64 megapixels before it is decoded. |
-| `image-url-host` | server | `HOST` or `HOST:PORT`, repeatable | none | Let requests from other machines name `http(s)` image URLs on exactly this host. Requests from this machine need no flag. [image sources](image-sources.md) |
-| `image-dir` | server | directory, repeatable | none | Let requests from other machines name image files under this directory. Requests from this machine need no flag. [image sources](image-sources.md) |
-| `image-remote-only` | server | switch | off | Treat requests from this machine as remote too. Set it when anything on this machine forwards other people's requests to the server. [image sources](image-sources.md) |
-
-Diagnostic flags: [diagnostics](diagnostics.md)
-
-## Control vectors
-
-A control vector (a GGUF in llama.cpp's format) is added to the residual stream; with the server, a request switches it
-with `experimental_speed_projection` (`true` or `false`).
+Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `control-vector` | engine | file path | off | A control vector at scale 1. |
-| `control-vector-scaled` | engine | `FILE:SCALE[,...]` | off | Control vectors with their scales. |
-| `control-vector-layer-range` | engine | two layer numbers, `A B` | 1 to the last layer | The layers it follows, inclusive. |
-| `cvec-mode` | engine | `add`, `project` | `add` | `add`: h += s v. `project`: h -= s (h.v) v with v a unit vector. |
-| `cvec-dir` | engine | `per-layer`, `single:L` | `per-layer` | Each layer's own direction, or layer L's direction everywhere (`project`). |
+| `spec` | engine | integer | 8 (MTP), 3 (DSpark), else 0 | Verify windows of at most N tokens. `0` or `1` turns it off. |
+| `draft-experts` | engine | 32, 64, 96, 128, or 0 | 32 | DeepSeek only. Experts each drafter stage keeps (`0` = all 128). |
+| `suffix-draft` | engine | tokens | 3 (`0` = MTP only) | Flash-Next only. Prompt lookup: fill a window from an earlier repeat of at least N tokens. |
+| `mtp-max-t` | engine | integer | 0 (= `spec`) | Flash-Next only. Caps the MTP's own windows. |
+| `mtp-window` | engine | cells | 32768 (`0` = all) | Flash-Next only. The drafter attends to the last N cells. |
+| `relaxed-drafting` | engine (`[P]`) | `true` or 0 to 1 | off | Flash-Next only. **Changes output.** Under sampling, keeps a draft the model gives probability P or more. Greedy, `logit_bias`, JSON and tool calls stay exact. [precision](../precision/qwen38-flash-next.md#relaxed-drafting) |
+| `route-tail-skip` | engine (`[R]`) | `true` or 1 to 9 | off | Flash-Next only. **Changes output.** Skips experts no GPU holds when they rank R or lower in every window entry. Needs the device MoE tail. [precision](../precision/qwen38-flash-next.md#lossy-routing-flags) |
+| `route-prior` | engine (`[LAMBDA]`) | `true` or 0 to 16 | off | Flash-Next only. **Changes output.** Adds LAMBDA to held experts' router logits. Needs the device MoE tail. [precision](../precision/qwen38-flash-next.md#lossy-routing-flags) |
 
-## Sampling
+## Parallel slots
 
-The request fields, the defaults a request inherits, the thinking budget and the loop safeguard are in
-[sampling](sampling.md).
+| Setting | Where | Type, values | Default | What it does |
+| --- | --- | --- | --- | --- |
+| `parallel` | server | 1..8 | 1 | Serve N requests at once. Sets the engine's `batch`. |
+| `slot-full-context` | server | switch | off | Give every slot the whole `max-context`, at N times the KV. |
+
+## Conversation cache
+
+| Setting | Where | Type, values | Default | What it does |
+| --- | --- | --- | --- | --- |
+| `prompt-cache` | engine | integer | 6 | Conversation checkpoints kept, about 118 MB of RAM each. `0` reads every prompt from the start. |
+| `prompt-cache-every` | engine | tokens | 16384 (`0` = off) | Flash-Next only. Also checkpoint every N freshly read tokens (RAM only). |
+| `prompt-cache-root` | engine | tokens | 2048 (`0` = never) | Checkpoint the end of the system prompt when it is at least this long. |
+| `turn-token` | engine | token id | 248045 | The token that opens a chat turn; checkpoints go at the last one. |
+| `tail-role-token` | engine | token id | -1 (off) | A short trailing turn that opens with this token keeps the checkpoint in front of it. |
+| `conversation-cache-mib` | engine | MiB | 0 (off) | RAM budget for parked conversations. |
+| `conversation-cache-slots` | engine | integer | 4 | Most parked conversations. |
+| `conversation-cache-min-free-mib` | engine | MiB | 2560 | Physical RAM kept free when parking. |
+| `no-ram-guard` | engine | switch | off | Serving never sheds, delays or stops a request for low RAM ([memory floors](../running.md#memory-floors)). For machines where the guard stops work that would fit; low RAM can then stop the engine or the machine. |
+| `conversation-cache-min-tokens` | engine | tokens | 0 | Park only conversations of at least this many tokens. |
+| `conversation-cache-disk-mib` | engine | MiB | 0 (off) | Disk budget for parked conversations. [running](../running.md#conversations-on-disk---conversation-cache-disk-mib) |
+| `conversation-cache-dir` | engine | directory | model cache folder | Another folder for the disk tier. |
+
+## Vision
+
+| Setting | Where | Type, values | Default | What it does |
+| --- | --- | --- | --- | --- |
+| `vision` | server | `off`, `dynamic`, `cpu`, GPU number | `off` | Image input. A GPU number runs a sidecar on that card (about 2.2 GiB of its expert cache). `cpu` is slow. Needs a model with a vision projector. 32 MiB and 64 megapixels per image. [running](../running.md#vision---vision) |
+| `image-url-host` | server | `HOST` or `HOST:PORT`, repeatable | none | Allow `http(s)` image URLs on this host from other machines. [image sources](image-sources.md) |
+| `image-dir` | server | directory, repeatable | none | Allow image files under this directory from other machines. [image sources](image-sources.md) |
+| `image-remote-only` | server | switch | off | Treat this machine's requests as remote too. [image sources](image-sources.md) |
+
+Diagnostic flags: [diagnostics](diagnostics.md).
+
+## Control vectors
+
+A GGUF control vector added to the residual stream. A request switches it with `experimental_speed_projection`.
+
+| Setting | Where | Type, values | Default | What it does |
+| --- | --- | --- | --- | --- |
+| `control-vector` | engine | file | off | Flash-Next only. A vector at scale 1. |
+| `control-vector-scaled` | engine | `FILE:SCALE[,...]` | off | Flash-Next only. Vectors with their scales. |
+| `control-vector-layer-range` | engine | `A B` | 1 to last layer | Flash-Next only. Layers it applies to, inclusive. |
+| `cvec-mode` | engine | `add`, `project` | `add` | Flash-Next only. `add`: h += s v. `project`: h -= s (h.v) v. |
+| `cvec-dir` | engine | `per-layer`, `single:L` | `per-layer` | Flash-Next only. Each layer's own direction, or layer L's everywhere. |

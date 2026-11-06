@@ -216,26 +216,6 @@ void bf16_rows_dot_multi(const uint16_t* w, int rows, int cols, const float* x, 
     }
 }
 
-void bf16_rows_dot(const uint16_t* w, int rows, int cols, const float* x, float* out) {
-    for (int r = 0; r < rows; ++r) {
-        const uint16_t* wr = w + (size_t) r * (size_t) cols;
-        __m256 acc = _mm256_setzero_ps();
-        int c = 0;
-        for (; c + 8 <= cols; c += 8) {
-            const __m256i h = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*) (wr + c)));
-            acc = _mm256_fmadd_ps(_mm256_castsi256_ps(_mm256_slli_epi32(h, 16)), _mm256_loadu_ps(x + c), acc);
-        }
-        float s = hsum_float_8(acc);
-        for (; c < cols; ++c) {
-            const uint32_t b = (uint32_t) wr[c] << 16;
-            float f;
-            std::memcpy(&f, &b, 4);
-            s += f * x[c];
-        }
-        out[r] = s;
-    }
-}
-
 void kq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
                    float* const* ff, int r0, int r1) {
     for (int t0 = 0; t0 < nt; t0 += MAXT) {

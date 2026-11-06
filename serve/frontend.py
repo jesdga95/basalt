@@ -58,9 +58,9 @@ def _text_of(content) -> str:
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
 
-# client spellings of a thinking level -> the template's low, medium, xhigh (default) or none
+# client spellings of a thinking level -> low, medium, high, max or none; a dialect says what its template takes for each
 EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
-          "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
+          "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
 
 
 def effort_kwargs(value) -> dict:
@@ -70,8 +70,10 @@ def effort_kwargs(value) -> dict:
     if value is False:
         return {"enable_thinking": False}
     key = str(value).strip().lower()
+    if key.isdigit() and 1 <= int(key) <= 100:   # the dialect takes a number or refuses it
+        return {"reasoning_effort": int(key)}
     if key not in EFFORT:
-        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high")
+        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium, high or max")
     level = EFFORT[key]
     return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
 
@@ -82,7 +84,7 @@ def budget_effort(tokens) -> dict:
         n = int(tokens)
     except (TypeError, ValueError):
         return {}
-    return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else "xhigh"}
+    return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else "high"}
 
 
 def _has_image(content) -> bool:
@@ -595,7 +597,7 @@ def tool_choice_of(tool_choice) -> tuple[str, str | None]:
                      "(Anthropic: any) or a named tool")
 
 
-def forced_call(tool_choice, tools: list[dict] | None) -> tuple[list[dict] | None, str | None]:
+def forced_call(tool_choice, tools: list[dict] | None, opening=None) -> tuple[list[dict] | None, str | None]:
     """`tool_choice` -> (the tools to offer, the text that opens the call the reply must make or None).
     "none" offers no tools.  There is no grammar: the server writes the opening itself, so the model can only go on
     with a call.  "required" / Anthropic "any": any tool (the only one is named); a named tool: that one.  A forced
@@ -613,6 +615,8 @@ def forced_call(tool_choice, tools: list[dict] | None) -> tuple[list[dict] | Non
             name = names[0]
     elif name not in names:
         raise ValueError(f"tool_choice: the request has no tool named {name!r}")
+    if opening is not None:
+        return tools, opening(name)
     return tools, CALL_START + (f"\n<function={name}>\n" if name else "\n<function=")
 
 

@@ -69,10 +69,10 @@ class MaxTokens(unittest.TestCase):
         """-> (status, body, prompt tokens, completion tokens); `budget` is merged into the request as given."""
         msgs = [{"role": "user", "content": text}]
         if api == "openai":
-            s, b = self.post("/v1/chat/completions", {"model": "qwen3.8-flash-next", "messages": msgs, **budget})
+            s, b = self.post("/v1/chat/completions", {"model": "basalt", "messages": msgs, **budget})
             u = b.get("usage", {})
             return s, b, u.get("prompt_tokens"), u.get("completion_tokens")
-        s, b = self.post("/v1/messages", {"model": "qwen3.8-flash-next", "messages": msgs, **budget})
+        s, b = self.post("/v1/messages", {"model": "basalt", "messages": msgs, **budget})
         u = b.get("usage", {})
         return s, b, u.get("input_tokens"), u.get("output_tokens")
 
@@ -93,7 +93,7 @@ class MaxTokens(unittest.TestCase):
     def test_count_tokens_is_the_prompt_messages_reads(self):
         # /v1/messages/count_tokens renders and tokenizes the same prompt /v1/messages would read, without running it
         msgs = [{"role": "user", "content": "how many tokens is this?"}]
-        s, b = self.post("/v1/messages/count_tokens", {"model": "qwen3.8-flash-next", "messages": msgs})
+        s, b = self.post("/v1/messages/count_tokens", {"model": "basalt", "messages": msgs})
         self.assertEqual(s, 200)
         s2, _, n_in, _ = self.call("anthropic", "how many tokens is this?", max_tokens=8)
         self.assertEqual(s2, 200)
@@ -537,7 +537,7 @@ class StopStrings(unittest.TestCase):
     def post(self, api, stream, **extra):
         """-> (status, text, finish or stop_reason, stop_sequence, the streamed text pieces)"""
         path = "/v1/chat/completions" if api == "openai" else "/v1/messages"
-        body = {"model": "qwen3.8-flash-next", "max_tokens": 200, "stream": stream, "messages": [{"role": "user", "content": "hi"}],
+        body = {"model": "basalt", "max_tokens": 200, "stream": stream, "messages": [{"role": "user", "content": "hi"}],
                 **extra}
         req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(), headers={
             "Content-Type": "application/json", "anthropic-version": "2023-06-01"})
@@ -809,7 +809,7 @@ class UnfinishedToolCall(unittest.TestCase):
         try:
             for api, path in (("openai", "/v1/chat/completions"), ("anthropic", "/v1/messages")):
                 for stream in (False, True):
-                    body = {"model": "qwen3.8-flash-next", "max_tokens": max_tokens, "stream": stream, "tools": tools[api],
+                    body = {"model": "basalt", "max_tokens": max_tokens, "stream": stream, "tools": tools[api],
                             "messages": [{"role": "user", "content": "save my notes"}]}
                     req = urllib.request.Request(base + path, data=json.dumps(body).encode(), headers={
                         "Content-Type": "application/json", "anthropic-version": "2023-06-01"})
@@ -905,7 +905,7 @@ class ClientShapes(unittest.TestCase):
         return bytes(i for i in self.engine.last_ids if i < 256).decode("utf-8", "replace")
 
     def test_query_string(self):
-        body = {"model": "qwen3.8-flash-next", "max_tokens": 20, "messages": [{"role": "user", "content": "hi"}]}
+        body = {"model": "basalt", "max_tokens": 20, "messages": [{"role": "user", "content": "hi"}]}
         for path in ("/v1/messages?beta=true", "/v1/chat/completions?api-version=1", "/v1/messages/?beta=true"):
             status, b = self.post(path, body)
             self.assertEqual(status, 200, (path, b))
@@ -914,7 +914,7 @@ class ClientShapes(unittest.TestCase):
 
     def test_anthropic_mid_conversation_system(self):
         status, b = self.post("/v1/messages?beta=true", {
-            "model": "qwen3.8-flash-next", "max_tokens": 50,
+            "model": "basalt", "max_tokens": 50,
             "system": [{"type": "text", "text": "You are terse."}],
             "messages": [
                 {"role": "user", "content": [{"type": "text", "text": "1+1? digits only"}]},
@@ -928,7 +928,7 @@ class ClientShapes(unittest.TestCase):
 
     def test_openai_late_developer_and_system(self):
         status, b = self.post("/v1/chat/completions", {
-            "model": "qwen3.8-flash-next", "max_tokens": 50,
+            "model": "basalt", "max_tokens": 50,
             "messages": [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "hello"},
                          {"role": "assistant", "content": "hi"}, {"role": "developer", "content": "Now use digits."},
                          {"role": "system", "content": "Also this."}, {"role": "user", "content": "1+1?"}]})
@@ -947,12 +947,12 @@ class ClientShapes(unittest.TestCase):
             template, self.svc.template = self.svc.template, ChatTemplate(tpl)
             try:
                 status, b = self.post("/v1/chat/completions", {
-                    "model": "qwen3.8-flash-next", "max_tokens": 20, "messages": [{"role": "system", "content": "Only a system."}]})
+                    "model": "basalt", "max_tokens": 20, "messages": [{"role": "system", "content": "Only a system."}]})
                 self.assertEqual(status, 400, b)
                 self.assertIn("No user query found", b["error"]["message"])
             finally:
                 self.svc.template = template
-        status, b = self.post("/v1/chat/completions", {"model": "qwen3.8-flash-next", "max_tokens": 20,
+        status, b = self.post("/v1/chat/completions", {"model": "basalt", "max_tokens": 20,
                                                        "messages": [{"role": "user", "content": "hi"}]})
         self.assertEqual(status, 200, b)                            # the server goes on
 
@@ -961,10 +961,10 @@ class ClientShapes(unittest.TestCase):
         encoded = json.dumps([{"role": "user", "content": "1+1?"}])
         for path in ("/v1/chat/completions", "/v1/messages"):
             with self.subTest(path=path):
-                status, b = self.post(path, {"model": "qwen3.8-flash-next", "max_tokens": 20, "messages": encoded})
+                status, b = self.post(path, {"model": "basalt", "max_tokens": 20, "messages": encoded})
                 self.assertEqual(status, 200, b)
                 self.assertIn("1+1?", self.prompt_text())
-                status, b = self.post(path, {"model": "qwen3.8-flash-next", "max_tokens": 20, "messages": ["hi"]})
+                status, b = self.post(path, {"model": "basalt", "max_tokens": 20, "messages": ["hi"]})
                 self.assertEqual(status, 400, b)
                 self.assertIn("messages must be a list of objects", b["error"]["message"])
 
@@ -977,10 +977,10 @@ class ClientShapes(unittest.TestCase):
         for path in ("/v1/chat/completions", "/v1/messages"):
             for tools in bad:
                 with self.subTest(path=path, tools=tools):
-                    status, b = self.post(path, {"model": "qwen3.8-flash-next", "max_tokens": 8, "messages": msgs, "tools": tools})
+                    status, b = self.post(path, {"model": "basalt", "max_tokens": 8, "messages": msgs, "tools": tools})
                     self.assertEqual(status, 400, b)
                     self.assertIn("tools", b["error"]["message"])
-        status, b = self.post("/v1/chat/completions", {"model": "qwen3.8-flash-next", "max_tokens": 8, "messages": msgs})
+        status, b = self.post("/v1/chat/completions", {"model": "basalt", "max_tokens": 8, "messages": msgs})
         self.assertEqual(status, 200, b)                            # the server goes on
 
     def test_a_tool_schema_that_is_not_an_object_is_a_400(self):
@@ -994,7 +994,7 @@ class ClientShapes(unittest.TestCase):
         for path, shapes in bad.items():
             for tools in shapes:
                 with self.subTest(path=path, tools=tools):
-                    status, b = self.post(path, {"model": "qwen3.8-flash-next", "max_tokens": 8, "messages": msgs, "tools": tools})
+                    status, b = self.post(path, {"model": "basalt", "max_tokens": 8, "messages": msgs, "tools": tools})
                     self.assertEqual(status, 400, b)
                     self.assertIn("tools[0] (f)", b["error"]["message"])
                     self.assertIn("must be an object", b["error"]["message"])
@@ -1002,7 +1002,7 @@ class ClientShapes(unittest.TestCase):
                             ("/v1/chat/completions", [{"name": "f", "parameters": None}]),
                             ("/v1/messages", [{"name": "f", "input_schema": {}}])):
             with self.subTest(path=path, tools=tools):
-                status, b = self.post(path, {"model": "qwen3.8-flash-next", "max_tokens": 8, "messages": msgs, "tools": tools})
+                status, b = self.post(path, {"model": "basalt", "max_tokens": 8, "messages": msgs, "tools": tools})
                 self.assertEqual(status, 200, b)
 
     def test_well_formed_tools_still_work(self):
@@ -1015,7 +1015,7 @@ class ClientShapes(unittest.TestCase):
                             ("/v1/messages", [{"name": "get_weather", "input_schema": {"type": "object"}}]),
                             ("/v1/messages", [])):
             with self.subTest(path=path, tools=tools):
-                status, b = self.post(path, {"model": "qwen3.8-flash-next", "max_tokens": 8, "messages": msgs, "tools": tools})
+                status, b = self.post(path, {"model": "basalt", "max_tokens": 8, "messages": msgs, "tools": tools})
                 self.assertEqual(status, 200, b)
                 if tools:
                     self.assertIn("get_weather", self.prompt_text())
@@ -1064,7 +1064,7 @@ class ClientShapes(unittest.TestCase):
             for fn in (openai_to_messages, anthropic_to_messages):
                 with self.subTest(bad=bad, fn=fn.__name__):
                     with self.assertRaisesRegex(ValueError, "messages must be a list of objects"):
-                        fn({"model": "qwen3.8-flash-next", "messages": bad})
+                        fn({"model": "basalt", "messages": bad})
         for calls in (["f"], "[1]", [{"function": "f"}], "{"):
             with self.subTest(calls=calls), self.assertRaisesRegex(ValueError, "tool_calls must be a list of objects"):
                 openai_to_messages({"messages": [{"role": "assistant", "content": "", "tool_calls": calls}]})
@@ -1129,7 +1129,7 @@ class SamplingChecked(unittest.TestCase):
                                ("/v1/responses", {"input": "hi"})):
                 for stream in (False, True):
                     with self.subTest(path=path, stream=stream):
-                        data = {"model": "qwen3.8-flash-next", "max_tokens": 4, "top_k": -3, "stream": stream, **body}
+                        data = {"model": "basalt", "max_tokens": 4, "top_k": -3, "stream": stream, **body}
                         req = urllib.request.Request(base + path, headers={"Content-Type": "application/json"},
                                                      data=json.dumps(data).encode())
                         with self.assertRaises(urllib.error.HTTPError) as cm:
@@ -1138,7 +1138,7 @@ class SamplingChecked(unittest.TestCase):
                             self.assertEqual(e.code, 400)
                             self.assertIn("top_k", e.read().decode())
             self.assertEqual(engine.requests, [])
-            data = {"model": "qwen3.8-flash-next", "max_tokens": 4, "top_k": 1000, "seed": 0,
+            data = {"model": "basalt", "max_tokens": 4, "top_k": 1000, "seed": 0,
                     "messages": [{"role": "user", "content": "hi"}]}
             req = urllib.request.Request(base + "/v1/chat/completions", headers={"Content-Type": "application/json"},
                                          data=json.dumps(data).encode())
@@ -1214,18 +1214,12 @@ class GpuChoice(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot read the image /x"):
             e.encode_images([("/x", "/x.sve")])
 
-    def test_vision_startup_line(self):
-        from serve.engine.vision import vision_line
-        name = lambda i: f"card{i}"
-        self.assertEqual(vision_line(None, {}), "[server] vision   mode=off")
-        cpu = vision_line({"gpu": False, "mode": "cpu"}, {}, 2.34)
-        self.assertRegex(cpu, r"^\[server\] vision   mode=cpu threads=\d+ ready=2\.3s$")
-        self.assertEqual(vision_line({"gpu": True, "mode": "1"}, {"gpu": "0,1"}, 5.0, name=name),
-                         "[server] vision   mode=gpu gpu=1 (card1) ready=5.0s")
-        self.assertEqual(vision_line({"gpu": True, "mode": "2"}, {"gpu": "0"}, 5.0, name=lambda i: None),
-                         "[server] vision   mode=gpu gpu=2 ready=5.0s")
-        self.assertEqual(vision_line({"gpu": True, "mode": "dynamic"}, {"gpu": "0,1"}, 0.0, name=name),
-                         "[server] vision   mode=dynamic gpu=0 (card0) load=per-image")
+    def test_vision_startup_item(self):
+        from serve.engine.vision import vision_item
+        self.assertIsNone(vision_item(None, {}))
+        self.assertEqual(vision_item({"gpu": False, "mode": "cpu"}, {}), "vision=cpu")
+        self.assertEqual(vision_item({"gpu": True, "mode": "1"}, {"gpu": "0,1"}), "vision=gpu1")
+        self.assertEqual(vision_item({"gpu": True, "mode": "dynamic"}, {"gpu": "0,1"}), "vision=gpu0")
 
     def test_vision_device(self):
         from serve.engine.vision import child_env, vision_card, vision_env
@@ -1240,8 +1234,8 @@ class GpuChoice(unittest.TestCase):
         self.assertIsNone(vision_card("off"))
         self.assertEqual(vision_card("3"), 3)
 
-    def test_gpu_plan(self):
-        from serve.engine.vision import check_gpu, gpu_plan, gpu_text
+    def test_model_plan(self):
+        from serve.engine.vision import check_gpu, gpu_text, model_plan
         self.assertEqual(gpu_text([0, 1]), "0,1")
         self.assertEqual(gpu_text(1), "1")
         self.assertEqual(gpu_text(None), "")
@@ -1250,17 +1244,21 @@ class GpuChoice(unittest.TestCase):
         for bad in ("a,b", "0,0", "-1", "0,"):
             with self.assertRaises(ValueError):
                 check_gpu(bad)
-        ok = mock.Mock(stdout='{"devices":"1,0","cards":[{"smi":1},{"smi":0}],"notes":[],"warning":"","error":""}\n')
+        ok = mock.Mock(returncode=0, stderr="",
+                       stdout='{"devices":"1,0","cards":[{"smi":1},{"smi":0}],"notes":[],"warning":"","error":""}\n')
         with mock.patch("subprocess.run", return_value=ok) as run:
-            self.assertEqual(gpu_plan("/x/basalt", "1,0")["devices"], "1,0")
-            self.assertEqual(run.call_args.args[0], ["/x/basalt", "--gpu-plan", "--gpu", "1,0"])
-            gpu_plan("/x/basalt", None)
-            self.assertEqual(run.call_args.args[0], ["/x/basalt", "--gpu-plan"])
-        bad = mock.Mock(stdout='{"devices":"","cards":[],"notes":[],"warning":"","error":"gpu 2: 2 GPUs are visible (0-1)"}')
+            self.assertEqual(model_plan("/x/basalt", "/m.basalt", "1,0", ["--kv", "int8"])["devices"], "1,0")
+            self.assertEqual(run.call_args.args[0], ["/x/basalt", "--model", "/m.basalt", "--kv", "int8", "--gpu-plan", "--gpu", "1,0"])
+            model_plan("/x/basalt", "/m.basalt", None, [])
+            self.assertEqual(run.call_args.args[0], ["/x/basalt", "--model", "/m.basalt", "--gpu-plan"])
+        bad = mock.Mock(returncode=2, stderr="", stdout='{"devices":"","cards":[],"notes":[],"warning":"","error":"gpu 2: 2 GPUs are visible (0-1)"}')
         with mock.patch("subprocess.run", return_value=bad), self.assertRaisesRegex(ValueError, "2 GPUs are visible"):
-            gpu_plan("/x/basalt", "2")
-        with mock.patch("subprocess.run", side_effect=OSError), self.assertRaisesRegex(ValueError, "--gpu-plan"):
-            gpu_plan("/x/basalt", "auto")
+            model_plan("/x/basalt", "/m.basalt", "2", [])
+        refused = mock.Mock(returncode=2, stdout="", stderr="basalt: error: unknown argument: --kv\nusage: basalt\n")
+        with mock.patch("subprocess.run", return_value=refused), self.assertRaisesRegex(ValueError, "unknown argument: --kv"):
+            model_plan("/x/basalt", "/m.basalt", None, ["--kv", "int8"])
+        with mock.patch("subprocess.run", side_effect=OSError), self.assertRaisesRegex(ValueError, "could not check"):
+            model_plan("/x/basalt", "/m.basalt", "auto", [])
 
     def test_vision_modes(self):
         from serve.engine.vision import vision_mode
@@ -1332,7 +1330,7 @@ class ClientHangUp(unittest.TestCase):
 
     def hang_up(self, stream):
         import socket as so
-        body = json.dumps({"model": "qwen3.8-flash-next", "max_tokens": 20, "stream": stream,
+        body = json.dumps({"model": "basalt", "max_tokens": 20, "stream": stream,
                            "messages": [{"role": "user", "content": "a long prompt"}]}).encode()
         c = so.create_connection(("127.0.0.1", self.port))
         c.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
@@ -1372,13 +1370,13 @@ class EngineDeath(unittest.TestCase):
                     with e:
                         return e.code, e.read().decode()
             msgs = [{"role": "user", "content": "hi"}]
-            code, text = post({"model": "qwen3.8-flash-next", "messages": msgs, "max_tokens": 50, "stream": True})
+            code, text = post({"model": "basalt", "messages": msgs, "max_tokens": 50, "stream": True})
             self.assertEqual(code, 200)
             self.assertIn('"error"', text)
             self.assertIn("stopped unexpectedly", text)
             self.assertTrue(text.rstrip().endswith("data: [DONE]"))
             self.assertEqual(svc.metrics()["requests"][0]["finish"], "error")
-            code, text = post({"model": "qwen3.8-flash-next", "messages": msgs, "max_tokens": 50})
+            code, text = post({"model": "basalt", "messages": msgs, "max_tokens": 50})
             self.assertEqual(code, 200, text)
             self.assertEqual(eng.restarts, 1)
             self.assertEqual(json.loads(text)["usage"]["completion_tokens"], 50)
@@ -1398,9 +1396,9 @@ class EngineDeath(unittest.TestCase):
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         try:
-            for path, body in [("/v1/chat/completions", {"model": "qwen3.8-flash-next", "stream": True, "max_tokens": 20,
+            for path, body in [("/v1/chat/completions", {"model": "basalt", "stream": True, "max_tokens": 20,
                                                           "messages": [{"role": "user", "content": "hi"}]}),
-                               ("/v1/messages", {"model": "qwen3.8-flash-next", "stream": True, "max_tokens": 20,
+                               ("/v1/messages", {"model": "basalt", "stream": True, "max_tokens": 20,
                                                  "messages": [{"role": "user", "content": "hi"}]})]:
                 req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
                                              headers={"Content-Type": "application/json"})
@@ -1442,7 +1440,7 @@ class DraftCounts(unittest.TestCase):
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         try:
             for _ in range(3):
-                body = json.dumps({"model": "qwen3.8-flash-next", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]})
+                body = json.dumps({"model": "basalt", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]})
                 with urllib.request.urlopen(urllib.request.Request(base + "/v1/chat/completions", data=body.encode(),
                                                                    headers={"Content-Type": "application/json"}),
                                             timeout=30) as r:
@@ -1473,6 +1471,30 @@ class PcieShare(unittest.TestCase):
         self.assertEqual([r["hit_rate"] for r in rows], [0.6, 0.6, 0.6])
         self.assertEqual([r["pcie_share"] for r in rows], [0.2, 0.0, None])
         self.assertIn("end=length  hit=60.0%  pcie=20.0%", out.getvalue())
+
+
+class SsdShare(unittest.TestCase):
+    """The decode's lookups read from the expert file are their own share of everything routed."""
+
+    def test_history(self):
+        tok = ByteTokenizer()
+        engine = DoneLineEngine(tok, "</think>\n\nok", max_context=CTX, done_lines=[
+            "DONE 4 20 40.0 30.0 stop 3 5 0 60 100 0 5 0.0 20 25",     # 5 of 125 routed from the file: 4%
+            "DONE 4 20 40.0 30.0 stop 3 5 0 60 100 0 0 0.0 20 25"])
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            for _ in range(2):
+                list(svc.run(tok.encode("hi"), False, None, 10, {}, threading.Event()))
+        self.assertEqual([r["ssd_share"] for r in svc.history], [0.04, None])
+        self.assertIn("pcie=20.0%  ssd=4.0%", out.getvalue())
+
+    def test_spill_in_metrics(self):
+        from serve.service import spill_of
+        info = {"expert_slots": 9, "spill_experts": 320, "spill_total": 15360, "spill_bytes": 2751463424}
+        self.assertEqual(spill_of(info), {"experts": 320, "total": 15360, "bytes": 2751463424})
+        self.assertEqual(info, {"expert_slots": 9})                 # the raw words leave the engine block
+        self.assertIsNone(spill_of({"spill_experts": 0, "spill_total": 15360, "spill_bytes": 0}))
+        self.assertIsNone(spill_of({}))                              # an engine that reports no spill
 
 
 class RepeatedToken(unittest.TestCase):
@@ -2004,7 +2026,7 @@ class CancelledRead(unittest.TestCase):
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         try:
             for _ in range(3):
-                body = json.dumps({"model": "qwen3.8-flash-next", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]})
+                body = json.dumps({"model": "basalt", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]})
                 with urllib.request.urlopen(urllib.request.Request(base + "/v1/chat/completions", data=body.encode(),
                                                                    headers={"Content-Type": "application/json"}),
                                             timeout=30) as r:
@@ -2197,7 +2219,7 @@ class LiveRate(unittest.TestCase):
                     live_samples.append((live["generated"], live["tok_s"]))
                 time.sleep(0.01)
 
-        body = json.dumps({"model": "qwen3.8-flash-next", "max_tokens": self.TOKENS, "temperature": 0,
+        body = json.dumps({"model": "basalt", "max_tokens": self.TOKENS, "temperature": 0,
                            "messages": [{"role": "user", "content": "hi"}]}).encode()
         watcher = threading.Thread(target=poll, daemon=True)
         watcher.start()
@@ -2235,7 +2257,7 @@ class LiveRate(unittest.TestCase):
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         try:
-            body = json.dumps({"model": "qwen3.8-flash-next", "max_tokens": self.TOKENS, "stream": True,
+            body = json.dumps({"model": "basalt", "max_tokens": self.TOKENS, "stream": True,
                                "messages": [{"role": "user", "content": "hi"}]}).encode()
             with urllib.request.urlopen(urllib.request.Request(base + "/v1/chat/completions", data=body,
                                                                headers={"Content-Type": "application/json"}),
@@ -2360,7 +2382,7 @@ class WebApp(unittest.TestCase):
                 self.assertEqual(self.get(path)[0], 404)
 
     def test_metrics(self):
-        data = json.dumps({"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}).encode()
+        data = json.dumps({"model": "basalt", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}).encode()
         urllib.request.urlopen(urllib.request.Request(self.base + "/v1/chat/completions", data=data,
                                                       headers={"Content-Type": "application/json"}), timeout=10).read()
         code, ctype, body = self.get("/metrics")
@@ -2446,7 +2468,7 @@ class WebApp(unittest.TestCase):
             for path in ("/models", "/v1/models"):
                 code, _, body = self.get(path)
                 self.assertEqual(code, 200)
-                self.assertEqual(json.loads(body)["data"], [])
+                self.assertEqual(json.loads(body)["data"][0]["status"]["value"], "unloaded")
             self.assertEqual(self.get("/props")[0], 503)
             self.assertEqual(json.loads(self.get("/slots")[2]), [])
         finally:
@@ -2500,7 +2522,7 @@ class UsageAndStatus(unittest.TestCase):
             return r.status, r.read()
 
     def chat(self, path, stream=False):
-        body = {"model": "qwen3.8-flash-next", "max_tokens": 20, "messages": [{"role": "user", "content": "hi"}], "stream": stream}
+        body = {"model": "basalt", "max_tokens": 20, "messages": [{"role": "user", "content": "hi"}], "stream": stream}
         status, raw = self.request(path, body)
         self.assertEqual(status, 200)
         if not stream:
@@ -2545,7 +2567,7 @@ class UsageAndStatus(unittest.TestCase):
 
     def test_sse_is_not_buffered_by_proxies(self):
         req = urllib.request.Request(self.base + "/v1/chat/completions", headers={"Content-Type": "application/json"},
-                                     data=json.dumps({"model": "qwen3.8-flash-next", "stream": True,
+                                     data=json.dumps({"model": "basalt", "stream": True,
                                                       "messages": [{"role": "user", "content": "hi"}]}).encode())
         with urllib.request.urlopen(req, timeout=30) as r:
             self.assertEqual(r.headers.get("X-Accel-Buffering"), "no")
@@ -2602,7 +2624,7 @@ class UsageAndStatus(unittest.TestCase):
                       ChatTemplate(ROOT / "serve/chat_template.jinja"))
         httpd = serve(svc, port=0)
         try:
-            data = json.dumps({"model": "qwen3.8-flash-next", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}).encode()
+            data = json.dumps({"model": "basalt", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}).encode()
             req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions", data=data,
                                          headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=30) as r:
@@ -2670,7 +2692,7 @@ class SharingTheGpu(unittest.TestCase):
                 return e.code, json.loads(e.read())
 
     def chat(self):
-        return self.req("/v1/chat/completions", {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": "hi"}]})
+        return self.req("/v1/chat/completions", {"model": "basalt", "messages": [{"role": "user", "content": "hi"}]})
 
     def test_unload_then_the_next_request_loads(self):
         self.assertEqual(self.req("/unload", {}), (200, {"status": "unloaded"}))
@@ -2827,7 +2849,7 @@ class ThinkingBudget(unittest.TestCase):
                 return e.code, json.loads(e.read())
 
     def openai(self, **extra):
-        return self.post("/v1/chat/completions", {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": "2+2?"}],
+        return self.post("/v1/chat/completions", {"model": "basalt", "messages": [{"role": "user", "content": "2+2?"}],
                                                   "max_tokens": 400, **extra})
 
     def test_off_by_default(self):
@@ -3054,7 +3076,7 @@ class ThinkingBudget(unittest.TestCase):
 
     def test_anthropic_stream(self):
         from serve.service import REASONING_CLOSE
-        code, raw = self.post("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 400, "stream": True,
+        code, raw = self.post("/v1/messages", {"model": "basalt", "max_tokens": 400, "stream": True,
                                                "reasoning_budget_tokens": 30,
                                                "messages": [{"role": "user", "content": "2+2?"}]})
         self.assertEqual(code, 200)
@@ -3090,7 +3112,7 @@ class ThinkingBudget(unittest.TestCase):
 
     def test_the_launch_default_applies_on_the_anthropic_path_too(self):
         self.svc.reasoning_budget_tokens = 20
-        code, raw = self.post("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 400, "stream": True,
+        code, raw = self.post("/v1/messages", {"model": "basalt", "max_tokens": 400, "stream": True,
                                                 "messages": [{"role": "user", "content": "2+2?"}]})
         self.assertEqual(code, 200)
         self.assertEqual(self.anthropic_thinking(raw).startswith(ThinkingEngine.THOUGHT[:20]), True)
@@ -3102,7 +3124,7 @@ class ThinkingBudget(unittest.TestCase):
     def test_anthropics_budget_tokens_is_the_same_budget(self):
         from serve.service import REASONING_CLOSE
         wrap = REASONING_CLOSE.split("</think>")[0]
-        body = {"model": "qwen3.8-flash-next", "max_tokens": 400, "stream": True,
+        body = {"model": "basalt", "max_tokens": 400, "stream": True,
                 "messages": [{"role": "user", "content": "2+2?"}]}
         code, raw = self.post("/v1/messages", {**body, "thinking": {"type": "enabled", "budget_tokens": 30}})
         self.assertEqual(code, 200)
@@ -3327,7 +3349,7 @@ class RestartWindow(unittest.TestCase):
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         try:
             req = urllib.request.Request(base + "/v1/chat/completions",
-                                         data=json.dumps({"model": "qwen3.8-flash-next", "max_tokens": 16,
+                                         data=json.dumps({"model": "basalt", "max_tokens": 16,
                                                           "messages": [{"role": "user", "content": "hi"}]}).encode(),
                                          headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=30) as r:
@@ -3342,9 +3364,9 @@ class RestartWindow(unittest.TestCase):
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         try:
-            for path, body in (("/v1/chat/completions", {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": "hi"}],
+            for path, body in (("/v1/chat/completions", {"model": "basalt", "messages": [{"role": "user", "content": "hi"}],
                                                          "max_tokens": 16}),
-                               ("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 16,
+                               ("/v1/messages", {"model": "basalt", "max_tokens": 16,
                                                  "messages": [{"role": "user", "content": "hi"}]})):
                 req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
                                              headers={"Content-Type": "application/json"})
@@ -3467,7 +3489,7 @@ class LostStep(unittest.TestCase):
                 svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
                 httpd = serve(svc, port=0)
                 base = f"http://127.0.0.1:{httpd.server_address[1]}"
-                body = {"model": "qwen3.8-flash-next", "max_tokens": 2, "reasoning_effort": "none", "stream": stream,
+                body = {"model": "basalt", "max_tokens": 2, "reasoning_effort": "none", "stream": stream,
                         "messages": [{"role": "user", "content": "hi"}]}
                 try:
                     first = eng.proc

@@ -1,16 +1,11 @@
 // src/program/probe_rates.cpp - the `PROBE rates` serve command (see the header).
 //
-// Each step reuses the code the microbenches use: the startup PCIe probe's burst timing, avx_bench's cold-expert pool
-// loop and its idle read, and dec_moe_parity's host-rung peer rings.  The peer rings run on a small synthetic expert
-// set on the peer card, so no tier's residency or cache is read or written.
+// Each step reuses the code the microbenches use: the startup PCIe probe's burst timing and avx_bench's cold-expert
+// pool loop and its idle read.  A model's own peer path is measured through its ProbePeerPath.
 #include "basalt/program/probe_rates.hpp"
 
-#include "basalt/core/on_device.hpp"
-#include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
-#include "basalt/kernels/dec_moe.hpp"
-#include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/platform/dynlib.hpp"
 #include "basalt/platform/memory.hpp"
 
@@ -28,76 +23,12 @@
 namespace basalt::program {
 namespace {
 
-namespace K = basalt::kernels;
 namespace C = basalt::kernels::cpu;
-using Clock = std::chrono::steady_clock;
-
-double us_since(Clock::time_point t0) { return std::chrono::duration<double, std::micro>(Clock::now() - t0).count(); }
-
 double median(std::vector<double> v) {
     if (v.empty()) return 0.0;
     std::sort(v.begin(), v.end());
     return v[v.size() / 2];
 }
-
-// ------------------------------------------------------------------------------------------------ CUDA holders
-
-struct DevBuf {
-    void* p = nullptr;
-    int dev = 0;
-    DevBuf() = default;
-    DevBuf(const DevBuf&) = delete;
-    DevBuf& operator=(const DevBuf&) = delete;
-    bool alloc(int d, size_t n) {
-        dev = d;
-        core::OnDevice od(d);
-        if (cudaMalloc(&p, n) == cudaSuccess) return true;
-        (void) cudaGetLastError();
-        p = nullptr;
-        return false;
-    }
-    ~DevBuf() {
-        if (p == nullptr) return;
-        core::OnDevice od(dev);
-        cudaFree(p);
-    }
-};
-
-struct HostBuf {
-    void* p = nullptr;
-    HostBuf() = default;
-    HostBuf(const HostBuf&) = delete;
-    HostBuf& operator=(const HostBuf&) = delete;
-    bool alloc(size_t n, unsigned flags) {
-        if (cudaHostAlloc(&p, n, flags) == cudaSuccess) {
-            std::memset(p, 0, n);
-            return true;
-        }
-        (void) cudaGetLastError();
-        p = nullptr;
-        return false;
-    }
-    ~HostBuf() { if (p != nullptr) cudaFreeHost(p); }
-};
-
-struct Stream {
-    cudaStream_t s = nullptr;
-    int dev = 0;
-    Stream() = default;
-    Stream(const Stream&) = delete;
-    Stream& operator=(const Stream&) = delete;
-    bool make(int d) {
-        dev = d;
-        core::OnDevice od(d);
-        return cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess;
-    }
-    ~Stream() {
-        if (s == nullptr) return;
-        core::OnDevice od(dev);
-        cudaStreamSynchronize(s);
-        cudaStreamDestroy(s);
-    }
-};
 
 struct Event {
     cudaEvent_t e = nullptr;
@@ -335,7 +266,7 @@ void step_host_mem(Probe& P) {
         double best = -1.0;
         for (int rep = 0; rep < 3; ++rep) {
             rd.done.store(0);
-            const auto t0 = Clock::now();
+            const auto t0 = ProbeClock::now();
             pool.idle_start(read_fn, &rd);
             while (rd.done.load() < pool.active_workers()) {}
             const double us = us_since(t0);
@@ -380,7 +311,7 @@ void step_cpu_expert(Probe& P, int original_workers) {
                     jobs[j].nact[0] = act.data();
                     jobs[j].out[0] = outs[(size_t) j].data();
                 }
-                const auto t0 = Clock::now();
+                const auto t0 = ProbeClock::now();
                 pool.run_split_multi_native(f, jobs, n);
                 if (it >= 2) us.push_back(us_since(t0));
             }
@@ -391,130 +322,29 @@ void step_cpu_expert(Probe& P, int original_workers) {
     }
 }
 
-// the peer rings of dec_moe_parity's host rung, on a synthetic expert set on the peer card
-struct PeerRings {
-    static constexpr int kRings = 24, kExperts = 8, kTok = 3;   // entries spread over kTok tokens of a window
-    int dev = 0, k = 10, n_expert = 0;
-    K::NativeExpertLayout L;
-    int blocks = 0;
-    bool q2 = false;
-    DevBuf blob, ptab, lay, scr, arr;
-    HostBuf rings, xq, words, rows, diag;
-    Stream st;
-    size_t xq_stride = 0;
-    std::string why;
-
-    bool setup(const ProbeEnv& env, const C::NativeFmt& f) {
-        dev = env.peer->device();
-        k = std::max(env.top_k, kExperts);
-        n_expert = (int) env.n_expert;
-        L = K::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
-        if (!K::dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff)) { why = "format_not_covered"; return false; }
-        q2 = f.gu_type == 42;
-        core::OnDevice od(dev);
-        blocks = K::dec_moe_peer_blocks(q2);
-        if (blocks <= 0) { why = "no_peer_kernel"; return false; }
-        const size_t nexp = (size_t) env.n_expert;
-        xq_stride = (size_t) f.n_embd / 32 * 36 * kTok + 64;
-        std::vector<unsigned long long> pt(nexp, 0ull);
-        bool ok = blob.alloc(dev, L.bytes * kExperts) && ptab.alloc(dev, nexp * 8) && lay.alloc(dev, sizeof L) &&
-                  scr.alloc(dev, K::dec_moe_peer_scratch_bytes((int) f.n_embd, (int) f.n_ff)) && arr.alloc(dev, 64) &&
-                  st.make(dev);
-        if (ok) {
-            for (int e = 0; e < kExperts && (size_t) e < nexp; ++e)
-                pt[(size_t) e] = (unsigned long long) ((uint8_t*) blob.p + (size_t) e * L.bytes);
-            ok = cudaMemset(blob.p, 0, L.bytes * kExperts) == cudaSuccess &&
-                 cudaMemset(scr.p, 0, K::dec_moe_peer_scratch_bytes((int) f.n_embd, (int) f.n_ff)) == cudaSuccess &&
-                 cudaMemcpy(ptab.p, pt.data(), nexp * 8, cudaMemcpyHostToDevice) == cudaSuccess &&
-                 cudaMemcpy(lay.p, &L, sizeof L, cudaMemcpyHostToDevice) == cudaSuccess;
-        }
-        const unsigned fl = cudaHostAllocMapped | cudaHostAllocPortable;
-        ok = ok && rings.alloc(sizeof(K::DmRing) * kRings + 256, fl) && xq.alloc(xq_stride * kRings + 256, fl) &&
-             words.alloc(256, fl) && rows.alloc((size_t) K::kDmCap * (size_t) f.n_embd * 4 + 256, fl) &&
-             diag.alloc(K::kDmDiagWords * 4 + 64, fl);
-        if (!ok) { (void) cudaGetLastError(); why = "alloc_failed"; return false; }
-        return true;
-    }
-
-    void fill(int n) {
-        K::DmRing* R = (K::DmRing*) rings.p;
-        for (int r = 0; r < kRings; ++r) {
-            R[r] = K::DmRing{};
-            R[r].n_tok = kTok;
-            R[r].n_peer = n;
-            for (int j = 0; j < n; ++j) {
-                const int i = (j % kTok) * k + j / kTok;
-                R[r].ids[i] = j % kExperts;
-                R[r].kind[i] = 2;
-            }
-        }
-    }
-
-    // One window of kRings doorbells rung from the host; `before(r)` runs ahead of ring r.  Returns each ring's round
-    // trip in us (empty on a hang, after the release).
-    template <class F>
-    bool window(const C::NativeFmt& f, F&& before, std::vector<double>& rt, std::string& err) {
-        volatile uint32_t* w = (volatile uint32_t*) words.p;
-        std::memset(words.p, 0, 256);
-        std::memset(diag.p, 0, K::kDmDiagWords * 4);
-        {
-            core::OnDevice od(dev);
-            cudaMemsetAsync(arr.p, 0, 64, st.s);
-            K::DmPeerArgs pa;
-            pa.rings_m = (const K::DmRing*) rings.p; pa.xq_m = (const uint8_t*) xq.p; pa.xq_stride = xq_stride;
-            pa.seq_m = (const volatile uint32_t*) ((uint32_t*) words.p + 16);
-            pa.done_m = (uint32_t*) words.p + 32; pa.rows_m = (float*) rows.p;
-            pa.ptr = (const unsigned long long*) ptab.p; pa.lay = (const K::NativeExpertLayout*) lay.p;
-            pa.n_expert = n_expert;
-            pa.k = k; pa.n_embd = (int) f.n_embd; pa.n_ff = (int) f.n_ff; pa.steps = kRings;
-            pa.scratch = scr.p; pa.arrive = (unsigned int*) arr.p; pa.diag_m = (uint32_t*) diag.p;
-            if (!K::dec_moe_peer_launch(pa, blocks, st.s, q2)) { err = "peer launch failed"; return false; }
-        }
-        rt.clear();
-        bool ok = true;
-        for (int r = 0; r < kRings && ok; ++r) {
-            before(r);
-            const auto t0 = Clock::now();
-            w[16] = ((uint32_t) r + 1) | (uint32_t) kTok << 16 | 1u << 28;
-            while (w[32] < (uint32_t) r + 1) {
-                if (us_since(t0) > 500000.0) { ok = false; break; }
-            }
-            rt.push_back(us_since(t0));
-        }
-        if (!ok) {
-            w[16] = UINT32_MAX;
-            w[32] = UINT32_MAX;
-            err = "peer ring hang: " + K::dec_moe_peer_diag((const uint32_t*) diag.p);
-        }
-        core::OnDevice od(dev);
-        cudaStreamSynchronize(st.s);
-        return ok;
-    }
-};
-
 // 6 and 7: the peer's round trip by entry count, and the copy costs into each tier
 void step_peer_and_copies(Probe& P) {
     const ProbeEnv& env = P.env;
-    const bool peer = env.peer != nullptr && env.peer->valid();
-    PeerRings pr;
-    std::string err;
+    const bool peer = env.peer_device >= 0;
+    ProbePeerPath* pr = env.peer_path.get();
+    std::string why, err;
     bool peer_ok = false;
     if (!P.have_layout) {
         P.line("peer", "rt_us=n/a reason=not_native");
     } else if (!peer) {
         P.line("peer", "rt_us=n/a reason=no_peer");
-    } else if (!pr.setup(env, P.fmt)) {
-        P.line("peer", "rt_us=n/a reason=%s", pr.why.c_str());
+    } else if (pr == nullptr || !pr->setup(env, P.fmt, why)) {
+        P.line("peer", "rt_us=n/a reason=%s", pr == nullptr ? "no_peer_kernel" : why.c_str());
     } else {
         peer_ok = true;
         double sx = 0, sy = 0, sxx = 0, sxy = 0;
         int cnt = 0;
         std::vector<double> rt;
-        for (int n = 1; n <= 8 && peer_ok; ++n) {
-            pr.fill(n);
+        for (int n = 1; n <= pr->max_entries() && peer_ok; ++n) {
+            pr->fill(n);
             std::vector<double> all;
             for (int rep = 0; rep < 2 && peer_ok; ++rep) {
-                peer_ok = pr.window(P.fmt, [](int) {}, rt, err);
+                peer_ok = pr->window(P.fmt, [](int) {}, rt, err);
                 for (size_t i = 2; i < rt.size() && peer_ok; ++i) all.push_back(rt[i]);
             }
             if (!peer_ok) break;
@@ -524,7 +354,7 @@ void step_peer_and_copies(Probe& P) {
         }
         if (peer_ok) {
             const double b = (cnt * sxy - sx * sy) / (cnt * sxx - sx * sx);
-            P.line("peer", "fit base_us=%.1f per_entry_us=%.2f peer_blocks=%d", (sy - b * sx) / cnt, b, pr.blocks);
+            P.line("peer", "fit base_us=%.1f per_entry_us=%.2f peer_blocks=%d", (sy - b * sx) / cnt, b, pr->blocks());
         } else {
             P.line("peer", "rt_us=n/a reason=%s", err.c_str());
         }
@@ -560,17 +390,17 @@ void step_peer_and_copies(Probe& P) {
 
     // the peer's rings with one such copy running into the peer beside them
     if (!peer_ok) return;
-    const int d = env.peer->device();
+    const int d = env.peer_device;
     DevBuf dst;
     Stream cs;
     Event ce;
     if (!(dst.alloc(d, bytes) && cs.make(d) && ce.make(d))) return;
-    pr.fill(3);
+    pr->fill(std::min(3, pr->max_entries()));
     std::vector<double> during, idle, rt;
     for (int launch = 0; launch < 30 && peer_ok; ++launch) {
         bool active = false;
-        std::vector<char> busy_at(PeerRings::kRings, 0);
-        peer_ok = pr.window(P.fmt, [&](int r) {
+        std::vector<char> busy_at((size_t) pr->rings(), 0);
+        peer_ok = pr->window(P.fmt, [&](int r) {
             if (active && cudaEventQuery(ce.e) != cudaErrorNotReady) active = false;
             busy_at[(size_t) r] = active ? 1 : 0;
             if (r == 4) {
@@ -591,23 +421,22 @@ void step_peer_and_copies(Probe& P) {
 }  // namespace
 
 bool probe_rates(const ProbeEnv& env, std::FILE* out, std::string& err) {
-    if (env.pool == nullptr || env.src == nullptr) { err = "PROBE: no CPU pool or expert source"; return false; }
-    const auto t_all = Clock::now();
+    if (env.pool == nullptr || !env.ram_blob) { err = "PROBE: no CPU pool or expert source"; return false; }
+    const auto t_all = ProbeClock::now();
     cudaDeviceSynchronize();   // between requests: nothing of the engine's is in flight
     Probe P{env, out, {}, false, {}, {}, {}};
     int cur = 0;
     cudaGetDevice(&cur);
     P.devs.push_back(cur);
-    if (env.peer != nullptr && env.peer->valid()) P.devs.push_back(env.peer->device());
+    if (env.peer_device >= 0) P.devs.push_back(env.peer_device);
 
-    const C::ExpertLayout& lay = C::expert_layout();
-    if (lay.native && !lay.fmt.empty() && env.n_layers > 0) {
-        P.fmt = lay.fmt[0];
+    if (!env.fmt.empty() && env.n_layers > 0) {
+        P.fmt = env.fmt[0];
         P.have_layout = true;
         std::mt19937 rng(777);
         std::vector<std::pair<int, int>> all;
-        for (int l = 0; l < env.n_layers && l < (int) lay.fmt.size(); ++l) {
-            const C::NativeFmt& f = lay.fmt[(size_t) l];
+        for (int l = 0; l < env.n_layers && l < (int) env.fmt.size(); ++l) {
+            const C::NativeFmt& f = env.fmt[(size_t) l];
             if (f.gu_type != P.fmt.gu_type || f.d_type != P.fmt.d_type || f.bytes != P.fmt.bytes ||
                 f.down_off != P.fmt.down_off)
                 continue;
@@ -615,7 +444,7 @@ bool probe_rates(const ProbeEnv& env, std::FILE* out, std::string& err) {
         }
         std::shuffle(all.begin(), all.end(), rng);
         for (const auto& le : all) {
-            const uint8_t* b = env.src->resident_blob(le.first, le.second);
+            const uint8_t* b = env.ram_blob(le.first, le.second);
             if (b != nullptr) P.blobs.push_back(b);
             if (P.blobs.size() >= 1024) break;
         }
@@ -624,7 +453,7 @@ bool probe_rates(const ProbeEnv& env, std::FILE* out, std::string& err) {
     const int original = env.pool->active_workers();
     std::fprintf(out, "PROBE begin rates v1\n");
     auto timed = [&](const char* name, auto&& fn) {
-        const auto t0 = Clock::now();
+        const auto t0 = ProbeClock::now();
         fn();
         P.line("step", "name=%s ms=%.0f", name, us_since(t0) / 1e3);
     };

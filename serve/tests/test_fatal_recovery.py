@@ -67,7 +67,7 @@ class FatalRecovery(unittest.TestCase):
     def test_http_health_and_next_request_recovery(self):
         old=self.engine();svc=self.service(old);http=serve(svc,port=0)
         base=f'http://127.0.0.1:{http.server_address[1]}'
-        body={"model":"qwen3.8-flash-next","messages":[{'role':'user','content':'hi'}],'max_tokens':8,
+        body={"model":"basalt","messages":[{'role':'user','content':'hi'}],'max_tokens':8,
               'chat_template_kwargs':{'enable_thinking':False},'stream':True}
         try:
             def post():

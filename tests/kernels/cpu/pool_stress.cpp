@@ -3,7 +3,7 @@
 // With most experts resident on the GPU, many layers hand the pool nothing, the workers go to sleep in the middle
 // of a request, and the next tiny batch (one or two experts) is often finished by the host and the awake workers
 // before a sleeper has even woken.  That late wake-up is what the park/claim protocol has to survive.  This drives
-// hundreds of thousands of such batches - 0-4 jobs, run() and run_split(), with pauses long enough for the workers
+// hundreds of thousands of such batches - 0-4 jobs, run_split_multi_native(), with pauses long enough for the workers
 // to sleep - and checks that every batch returns, with every job's output written and equal to a first run's.  On a
 // CPU without the AVX-512 kernels the batches go through run_split_multi_native() on an i-quant format instead.  Idle
 // work (idle_start) runs between half of the batches, with a barrier across the workers like the warm-up's, and must
@@ -33,30 +33,28 @@
 
 namespace cpu = basalt::kernels::cpu;
 
+constexpr int kWidth = 2560, kFF = 640;
+
 int main(int argc, char** argv) {
     const double seconds = argc > 1 ? std::atof(argv[1]) : 20.0;
     const int workers = argc > 2 ? std::atoi(argv[2]) : (int) cpu::physical_cores(true).size();
-    const cpu::CpuFeatures feat = cpu::cpu_features();
-    const bool native = !feat.usable();
-    if (native && !cpu::cpu_avx2_ok()) {
-        std::printf("CPU lacks %s and AVX2: pool_stress SKIPPED\n", feat.reason());
+    if (!cpu::cpu_avx2_ok()) {
+        std::printf("CPU lacks AVX2: pool_stress SKIPPED\n");
         return 0;
     }
     constexpr int NJ = 4;
-    std::vector<float> out((size_t) NJ * cpu::H);
+    std::vector<float> out((size_t) NJ * kWidth);
     // the AVX-512 path: whole experts and row parts of one token
-    std::vector<std::vector<uint8_t>> blobs(NJ, std::vector<uint8_t>(cpu::BLOB, 0));
-    std::vector<float> x(cpu::H, 0.25f);
-    cpu::ActQ act;
-    std::vector<cpu::ExpertJob> jobs(NJ);
+    std::vector<std::vector<uint8_t>> blobs(NJ);
+    std::vector<float> x(kWidth, 0.25f);
     // the native path: an IQ2_S gate/up + IQ4_NL down layer, two tokens on the odd experts
     cpu::NativeFmt fmt;
     std::vector<uint8_t> nact((size_t) 2 * cpu::kNativeActBytes);
-    std::vector<float> out2((size_t) NJ * cpu::H);
+    std::vector<float> out2((size_t) NJ * kWidth);
     std::vector<cpu::ExpertJobMulti> mjobs(NJ);
-    if (native) {
+    {
         std::string err;
-        if (!cpu::native_fmt(GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL, cpu::H, cpu::FF, fmt, err)) {
+        if (!cpu::native_fmt(GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL, kWidth, kFF, fmt, err)) {
             std::printf("pool_stress: native_fmt: %s\n", err.c_str());
             return 1;
         }
@@ -76,7 +74,7 @@ int main(int argc, char** argv) {
             scales(fmt.down_off, fmt.bytes - fmt.down_off, fmt.d_type);
         }
         for (int t = 0; t < 2; ++t) {
-            for (int i = 0; i < cpu::H; ++i) x[(size_t) i] = 0.25f * (float) ((i * (t + 3)) % 17 - 8);
+            for (int i = 0; i < kWidth; ++i) x[(size_t) i] = 0.25f * (float) ((i * (t + 3)) % 17 - 8);
             cpu::native_quant_act(fmt, x.data(), nact.data() + (size_t) t * cpu::kNativeActBytes);
         }
         for (int e = 0; e < NJ; ++e) {
@@ -85,24 +83,15 @@ int main(int argc, char** argv) {
             j.nt = 1 + (e & 1);
             for (int t = 0; t < j.nt; ++t) {
                 j.nact[t] = nact.data() + (size_t) t * cpu::kNativeActBytes;
-                j.out[t] = (t == 0 ? out.data() : out2.data()) + (size_t) e * cpu::H;
+                j.out[t] = (t == 0 ? out.data() : out2.data()) + (size_t) e * kWidth;
             }
-        }
-    } else {
-        cpu::act_quant_q8_1(x.data(), cpu::H, act);
-        for (int e = 0; e < NJ; ++e) {
-            jobs[(size_t) e].blob = blobs[(size_t) e].data();
-            jobs[(size_t) e].act = &act;
-            jobs[(size_t) e].out = out.data() + (size_t) e * cpu::H;
-            jobs[(size_t) e].slot = e;
         }
     }
 
     cpu::ExpertPool pool((std::max)(1, workers));
     std::printf("pool_stress: %d workers + host, %.0f s, %s\n", pool.workers(), seconds,
-                native ? "run_split_multi_native" : "run and run_split");
-    if (native) pool.run_split_multi_native(fmt, mjobs.data(), NJ);
-    else pool.run(jobs.data(), NJ);
+                "run_split_multi_native");
+    pool.run_split_multi_native(fmt, mjobs.data(), NJ);
     const std::vector<float> ref = out, ref2 = out2;
 
     // the idle work: every worker index arrives at a barrier, then spins until stopped
@@ -167,17 +156,15 @@ int main(int argc, char** argv) {
         const int n = (int) (rng() % (NJ + 1));
         std::fill(out.begin(), out.end(), SENTINEL);
         std::fill(out2.begin(), out2.end(), SENTINEL);
-        if (native) pool.run_split_multi_native(fmt, mjobs.data(), n);
-        else if (rng() % 2) pool.run(jobs.data(), n);
-        else pool.run_split(jobs.data(), n);
+        pool.run_split_multi_native(fmt, mjobs.data(), n);
         if (n > 0 && idle.active.load() != 0) ++overlaps;
         for (int e = 0; e < n; ++e) {
-            const size_t o = (size_t) e * cpu::H;
-            if (out[o] == SENTINEL || out[o + cpu::H - 1] == SENTINEL) ++missed;
-            else if (std::memcmp(out.data() + o, ref.data() + o, cpu::H * sizeof(float)) != 0) ++wrong;
-            if (!native || (e & 1) == 0) continue;
-            if (out2[o] == SENTINEL || out2[o + cpu::H - 1] == SENTINEL) ++missed;
-            else if (std::memcmp(out2.data() + o, ref2.data() + o, cpu::H * sizeof(float)) != 0) ++wrong;
+            const size_t o = (size_t) e * kWidth;
+            if (out[o] == SENTINEL || out[o + kWidth - 1] == SENTINEL) ++missed;
+            else if (std::memcmp(out.data() + o, ref.data() + o, kWidth * sizeof(float)) != 0) ++wrong;
+            if ((e & 1) == 0) continue;
+            if (out2[o] == SENTINEL || out2[o + kWidth - 1] == SENTINEL) ++missed;
+            else if (std::memcmp(out2.data() + o, ref2.data() + o, kWidth * sizeof(float)) != 0) ++wrong;
         }
         beat.fetch_add(1);
         ++batches;

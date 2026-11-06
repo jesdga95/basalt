@@ -5,13 +5,13 @@
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
 #include "basalt/core/pinned.hpp"
+#include "basalt/core/ram_load.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/direct_file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/platform/system.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/quantize_act.hpp"
-#include "basalt/kernels/s2_expert_grouped.hpp"
 
 #include <cuda_runtime.h>
 
@@ -394,51 +394,33 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
         err = "FileExpertSource: the loaded expert layout has an invalid size";
         return false;
     }
-    if (!layout.native) {
-        if (blob_count > std::numeric_limits<uint64_t>::max() / (uint64_t) basalt::kernels::cpu::BLOB) {
-            err = "FileExpertSource: the canonical expert size overflows";
+    if (layout.offset.size() != (size_t) n_layers || layout.bytes.size() != (size_t) n_layers ||
+        layout.fmt.size() != (size_t) n_layers) {
+        err = "FileExpertSource: the native expert layout is incomplete";
+        return false;
+    }
+    uint64_t at = 0;
+    for (int64_t layer = 0; layer < n_layers; ++layer) {
+        const size_t i = (size_t) layer;
+        const uint64_t bytes = (uint64_t) layout.fmt[i].bytes;
+        if (layout.offset[i] != at || bytes == 0 || layout.bytes[i] != bytes ||
+            bytes > std::numeric_limits<uint64_t>::max() / (uint64_t) n_expert) {
+            err = "FileExpertSource: the native expert layout is invalid at layer " + std::to_string(layer);
             return false;
         }
-        const uint64_t canonical_size = blob_count * (uint64_t) basalt::kernels::cpu::BLOB;
-        if (want != canonical_size) {
-            err = "FileExpertSource: the canonical expert layout has an inconsistent size";
+        const uint64_t layer_bytes = bytes * (uint64_t) n_expert;
+        if (at > want || layer_bytes > want - at) {
+            err = "FileExpertSource: the native expert layout exceeds its declared size at layer " +
+                  std::to_string(layer);
             return false;
         }
-        const uint64_t bytes = (uint64_t) basalt::kernels::cpu::BLOB;
-        const uint64_t layer_bytes = (uint64_t) n_expert * bytes;
-        for (int64_t layer = 0; layer < n_layers; ++layer) {
-            layer_offsets[(size_t) layer] = (uint64_t) layer * layer_bytes;
-            layer_blob_bytes[(size_t) layer] = bytes;
-        }
-    } else {
-        if (layout.offset.size() != (size_t) n_layers || layout.bytes.size() != (size_t) n_layers ||
-            layout.fmt.size() != (size_t) n_layers) {
-            err = "FileExpertSource: the native expert layout is incomplete";
-            return false;
-        }
-        uint64_t at = 0;
-        for (int64_t layer = 0; layer < n_layers; ++layer) {
-            const size_t i = (size_t) layer;
-            const uint64_t bytes = (uint64_t) layout.fmt[i].bytes;
-            if (layout.offset[i] != at || bytes == 0 || layout.bytes[i] != bytes ||
-                bytes > std::numeric_limits<uint64_t>::max() / (uint64_t) n_expert) {
-                err = "FileExpertSource: the native expert layout is invalid at layer " + std::to_string(layer);
-                return false;
-            }
-            const uint64_t layer_bytes = bytes * (uint64_t) n_expert;
-            if (at > want || layer_bytes > want - at) {
-                err = "FileExpertSource: the native expert layout exceeds its declared size at layer " +
-                      std::to_string(layer);
-                return false;
-            }
-            layer_offsets[i] = layout.offset[i];
-            layer_blob_bytes[i] = bytes;
-            at += layer_bytes;
-        }
-        if (at != want) {
-            err = "FileExpertSource: the native expert layout has an inconsistent size";
-            return false;
-        }
+        layer_offsets[i] = layout.offset[i];
+        layer_blob_bytes[i] = bytes;
+        at += layer_bytes;
+    }
+    if (at != want) {
+        err = "FileExpertSource: the native expert layout has an inconsistent size";
+        return false;
     }
     const std::string& path = experts.path;
     uint64_t fsize = 0;
@@ -985,8 +967,7 @@ bool FileExpertSource::pin_cache_complement(
             // Ordinary memory, aligned and padded to 2 MiB (whole large pages, so the registered range ends on a page
             // boundary), registered with the driver once it is filled: the reads fault the pages in while the drive
             // works, instead of the driver zeroing and locking all of it before the first read.
-            const size_t padded = ((size_t) bytes + kArenaAlign - 1) / kArenaAlign * kArenaAlign;
-            arena = basalt::platform::alloc_aligned(padded, kArenaAlign);
+            arena = alloc_ram(bytes);
             if (arena != nullptr) {
                 register_after = true;
             } else {
@@ -1016,24 +997,20 @@ bool FileExpertSource::pin_cache_complement(
     }
 
     const double alloc_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - pin_t0).count();
-    // Experts are read straight into the arena with unbuffered reads, so the file cache neither copies them nor
-    // evicts anything; ranges that are not block-aligned, or a file system without unbuffered reads, take the mapped copy.
-    constexpr uint64_t kDirectAlign = 4096, kDirectChunk = 16ull << 20;
-    // A descriptor whose reads bypass the OS cache, or -1 where the platform offers none: the copy then comes from
-    // the mapping for every range, which is what the file's pages were read through before.
-    int direct_fd = -1;
-    if (bytes > 0) direct_fd = basalt::platform::open_unbuffered(fd_);
-    // Copied layer by layer on a few threads; the layer's contiguous experts are read as one range.
-    std::atomic<int64_t> next_layer{0}, layers_done{0};
-    std::atomic<uint64_t> copied{0};
-    std::atomic<uint64_t> direct_bytes{0};
     // Progress counts the experts the GPU cache does not hold (those it holds, kept here for the prompt path's
     // loan, are already counted by its fill); experts left on the file are not placed at all.
     uint64_t progress_total = 0;
     for (int64_t layer = 0; layer < n_layers_; ++layer)
         for (int64_t expert = 0; expert < n_expert_; ++expert) {
             const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
-            if (offsets[index] != kNoComplement && !on_gpu[index]) progress_total += layer_blob_bytes_[(size_t) layer];
+            if (offsets[index] == kNoComplement) continue;
+            const uint64_t blob_bytes = layer_blob_bytes_[(size_t) layer];
+            if (offsets[index] > bytes || blob_bytes > bytes - offsets[index] || mapped_blob(layer, expert) == nullptr) {
+                err = "FileExpertSource: invalid blob bounds while building the cache complement";
+                release();
+                return false;
+            }
+            if (!on_gpu[index]) progress_total += blob_bytes;
         }
     // experts another GPU holds alone are placed by that tier's own phase
     uint64_t extra_gpu_bytes = 0;
@@ -1043,150 +1020,75 @@ bool FileExpertSource::pin_cache_complement(
         LoadProgress::skipped(all_experts - gpu_bytes - extra_gpu_bytes - progress_total);
     LoadProgress::plan("ram", progress_total);
     LoadProgress progress("ram", progress_total);
-    std::atomic<bool> failed{false};
-    std::mutex fail_mu;
+    // Experts are read straight into the arena with unbuffered reads, so the file cache neither copies them nor
+    // evicts anything; ranges that are not block-aligned, or a file system without unbuffered reads, take the mapped copy.
+    RamGrid grid;
+    grid.n_layers = n_layers_;
+    grid.n_expert = n_expert_;
+    grid.file_base = file_off_;
+    grid.layer_offset.assign(layer_offsets_.begin(), layer_offsets_.end());
+    grid.blob_bytes.assign(layer_blob_bytes_.begin(), layer_blob_bytes_.end());
     const auto copy_t0 = std::chrono::steady_clock::now();
-    std::string fail_msg;
-    auto fail = [&](const std::string& m) {
-        std::lock_guard<std::mutex> lock(fail_mu);
-        if (fail_msg.empty()) fail_msg = m;
-        failed.store(true);
+    RamLoad load;
+    load.fd = fd_;
+    load.unbuffered = bytes > 0;
+    load.threads = (int) std::max<int64_t>(1, std::min<int64_t>(6, n_layers_));
+    load.progress = &progress;
+    load.groups = ram_arena_runs(grid, (uint8_t*) host, offsets, kNoComplement, on_gpu);
+    load.read_ahead = [&](int64_t layer, const std::vector<RamRun>& runs) {
+        std::vector<std::pair<int32_t, int32_t>> ahead;
+        for (const RamRun& r : runs)
+            for (int64_t k = 0; k < r.count; ++k) ahead.emplace_back((int32_t) layer, (int32_t) (r.first + k));
+        (void) advise_pairs(ahead.data(), (int64_t) ahead.size());
     };
-    auto worker = [&]() {
-        uint8_t* stage = nullptr;   // staging for ranges that are not block-aligned
-        struct StageFree { uint8_t*& p; ~StageFree() { basalt::platform::free_aligned(p); } } stage_free{stage};
-        for (;;) {
-            const int64_t layer = next_layer.fetch_add(1);
-            if (layer >= n_layers_ || failed.load()) return;
-            const uint64_t blob_bytes = layer_blob_bytes_[(size_t) layer];
-            bool mapped_used = false;
-            // one run: consecutive experts adjacent in both the file and the arena
-            struct Run { uint64_t file_pos, dst_off, len; int64_t first, count; };
-            std::vector<Run> runs;
-            for (int64_t expert = 0; expert < n_expert_; ++expert) {
-                const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
-                const uint64_t offset = offsets[index];
-                if (offset == kNoComplement) continue;
-                if (offset > bytes || blob_bytes > bytes - offset || mapped_blob(layer, expert) == nullptr) {
-                    fail("FileExpertSource: invalid blob bounds while building the cache complement");
-                    return;
-                }
-                const uint64_t fpos = file_off_ + layer_offsets_[(size_t) layer] + (uint64_t) expert * blob_bytes;
-                if (!runs.empty() && runs.back().file_pos + runs.back().len == fpos &&
-                    runs.back().dst_off + runs.back().len == offset) {
-                    runs.back().len += blob_bytes;
-                    ++runs.back().count;
-                } else {
-                    runs.push_back(Run{fpos, offset, blob_bytes, expert, 1});
-                }
+    load.fallback = [&](int64_t layer, const RamRun& r, uint64_t done, std::string& e) {
+        for (int64_t k = (int64_t) (done / r.blob_bytes); k < r.count; ++k)
+            if (!copy_from_files(layer, r.first + k, r.dst + (size_t) k * (size_t) r.blob_bytes)) {
+                e = "FileExpertSource: invalid blob bounds while building the cache complement";
+                return false;
             }
-            if (direct_fd < 0 || !basalt::platform::read_ahead_enabled()) {
-                // mapped copy: ask for the layer's blobs before copying them
-                std::vector<std::pair<int32_t, int32_t>> ahead;
-                for (const Run& r : runs)
-                    for (int64_t k = 0; k < r.count; ++k) ahead.emplace_back((int32_t) layer, (int32_t) (r.first + k));
-                (void) advise_pairs(ahead.data(), (int64_t) ahead.size());
+        return true;
+    };
+    load.after_group = [&](int64_t layer, int64_t done, uint64_t copied, bool mapped_used, std::string& e) {
+        if (mapped_used) {   // the layer's pages are not kept in the file cache once copied
+            const uint64_t layer_offset = layer_offsets_[(size_t) layer];
+            const uint64_t layer_bytes = layer_blob_bytes_[(size_t) layer] * (uint64_t) n_expert_;
+            if (!basalt::platform::drop_mapped_view(base_, mapped_bytes_, layer_offset, layer_bytes)) {
+                e = "FileExpertSource: could not release mapped expert layer " + std::to_string(layer);
+                return false;
             }
-            for (const Run& r : runs) {
-                uint8_t* dst = (uint8_t*) host + (size_t) r.dst_off;
-                uint64_t done_bytes = 0;
-                if (direct_fd >= 0) {
-                    const bool aligned = r.file_pos % kDirectAlign == 0 && ((uintptr_t) dst) % kDirectAlign == 0 &&
-                                         r.len % kDirectAlign == 0;
-                    if (aligned) {   // straight into the arena
-                        while (done_bytes < r.len) {
-                            const uint64_t n = std::min<uint64_t>(kDirectChunk, r.len - done_bytes);
-                            const int64_t got = basalt::platform::pread(direct_fd, dst + done_bytes, (size_t) n,
-                                                                        r.file_pos + done_bytes);
-                            if (got <= 0 || (uint64_t) got % kDirectAlign != 0) break;   // the rest takes the mapped copy
-                            done_bytes += (uint64_t) got;
-                        }
-                    } else {   // block-aligned reads into a staging buffer, then the wanted bytes are copied out
-                        if (stage == nullptr)
-                            stage = (uint8_t*) basalt::platform::alloc_aligned(kDirectChunk + 2 * kDirectAlign,
-                                                                              kDirectAlign);
-                        while (stage != nullptr && done_bytes < r.len) {
-                            const uint64_t pos = r.file_pos + done_bytes;
-                            const uint64_t n = std::min<uint64_t>(kDirectChunk, r.len - done_bytes);
-                            const uint64_t a0 = pos - pos % kDirectAlign;
-                            const uint64_t a1 = (pos + n + kDirectAlign - 1) / kDirectAlign * kDirectAlign;
-                            const int64_t got = basalt::platform::pread(direct_fd, stage, (size_t) (a1 - a0), a0);
-                            if (got <= 0 || (uint64_t) got < pos + n - a0) break;
-                            std::memcpy(dst + done_bytes, stage + (pos - a0), (size_t) n);
-                            done_bytes += n;
-                        }
-                    }
-                    direct_bytes.fetch_add(done_bytes);
-                }
-                // whatever the unbuffered reads did not place, per expert from the mapped file
-                for (int64_t k = done_bytes / blob_bytes; k < r.count; ++k) {
-                    if (!copy_from_files(layer, r.first + k, dst + (size_t) k * (size_t) blob_bytes)) {
-                        fail("FileExpertSource: invalid blob bounds while building the cache complement");
-                        return;
-                    }
-                    mapped_used = true;
-                }
-                for (int64_t k = 0; k < r.count; ++k) {
-                    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) (r.first + k);
-                    copied.fetch_add(blob_bytes);
-                    if (!on_gpu[index]) progress.add(blob_bytes);
-                }
-            }
-            if (mapped_used) {   // the layer's pages are not kept in the file cache once copied
-                const uint64_t layer_offset = layer_offsets_[(size_t) layer];
-                const uint64_t layer_bytes = blob_bytes * (uint64_t) n_expert_;
-                if (!basalt::platform::drop_mapped_view(base_, mapped_bytes_, layer_offset, layer_bytes)) {
-                    fail("FileExpertSource: could not release mapped expert layer " + std::to_string(layer));
-                    return;
-                }
-                basalt::platform::advise_dontneed(fd_, file_off_ + layer_offset, layer_bytes);
-            }
-            const int64_t done = layers_done.fetch_add(1) + 1;
-            if (done % 8 == 0 || done == n_layers_)
-                basalt::log::info("basalt", "FileExpertSource: copied cache complement through layer %lld/%lld (%.2f GiB, %.0f s)",
-                             (long long) done, (long long) n_layers_, (double) copied.load() / 1073741824.0,
-                             std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count());
+            basalt::platform::advise_dontneed(fd_, file_off_ + layer_offset, layer_bytes);
         }
+        if (done % 8 == 0 || done == n_layers_)
+            basalt::log::info("basalt", "FileExpertSource: copied cache complement through layer %lld/%lld (%.2f GiB, %.0f s)",
+                         (long long) done, (long long) n_layers_, (double) copied / 1073741824.0,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count());
+        return true;
     };
-    {
-        const int threads = (int) std::max<int64_t>(1, std::min<int64_t>(6, n_layers_));
-        std::vector<std::thread> pool;
-        for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
-        worker();
-        for (auto& t : pool) t.join();
+    RamLoadStats read;
+    if (!read_ram_runs(load, read, err)) {
+        release();
+        return false;
     }
-    if (direct_fd >= 0) basalt::platform::close_fd(direct_fd);
     const double read_done_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count();
-    if (register_after && !failed.load()) {
-        constexpr size_t kHuge = 2ull << 20;
-        const size_t padded = ((size_t) bytes + kHuge - 1) / kHuge * kHuge;
-        const cudaError_t reg = cudaHostRegister(arena, padded, cudaHostRegisterMapped | cudaHostRegisterPortable);
-        void* alias = nullptr;
-        if (reg == cudaSuccess && cudaHostGetDevicePointer(&alias, arena, 0) == cudaSuccess && alias != nullptr) {
-            device = (const uint8_t*) alias;
+    if (register_after) {
+        const RamPin rp = pin_ram(arena, ram_padded(bytes), bytes, {}, /*mapped=*/true, &device);
+        if (device != nullptr) {
             partial_pin = bytes;   // released through the registered-prefix path
             lock_off = bytes;
             note = "page-locked and mapped";
         } else {
-            if (reg == cudaSuccess) (void) cudaHostUnregister(arena);
-            note = std::string("page-locking refused (") + cudaGetErrorString(reg) + ")";
-            (void) cudaGetLastError();
-            const basalt::platform::LockResult lr = basalt::platform::lock_resident(arena, bytes);
-            locked = lr.locked_bytes;
-            note += "; " + lr.note;
+            note = "page-locking refused (" + rp.refused + ")";
+            locked = rp.locked_bytes;
+            note += "; " + rp.lock_note;
         }
-    }
-    if (failed.load()) {
-        err = fail_msg;
-        release();
-        return false;
     }
     progress.finish();
     {
         const double read_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count();
         basalt::log::info("basalt", "FileExpertSource: cache complement: allocation %.1f s, read %.1f s (%.2f GB/s, %.1f%% unbuffered), registration %.1f s",
-                     alloc_s, read_done_s, read_done_s > 0 ? (double) copied.load() / 1e9 / read_done_s : 0.0,
-                     copied.load() > 0 ? 100.0 * (double) direct_bytes.load() / (double) copied.load() : 0.0,
+                     alloc_s, read_done_s, read_done_s > 0 ? (double) read.copied / 1e9 / read_done_s : 0.0,
+                     read.copied > 0 ? 100.0 * (double) read.unbuffered / (double) read.copied : 0.0,
                      read_s - read_done_s);
     }
 
@@ -1457,20 +1359,21 @@ uint64_t FileExpertSource::top_up(const std::vector<std::pair<int32_t, int32_t>>
         if (arena == nullptr) return 0;
         if (pin) locked = basalt::platform::lock_resident(arena, total).locked_bytes;
     }
-    std::atomic<size_t> next{0};
-    std::atomic<bool> failed{false};
-    auto worker = [&]() {
-        for (size_t k; (k = next.fetch_add(1)) < pick.size() && !failed.load();)
-            if (!copy_from_files(pick[k].first, pick[k].second, (uint8_t*) arena + (size_t) at[k])) failed.store(true);
-    };
-    {
-        const size_t threads = std::min<size_t>(6, pick.size());
-        std::vector<std::thread> pool;
-        for (size_t i = 1; i < threads; ++i) pool.emplace_back(worker);
-        worker();
-        for (auto& t : pool) t.join();
+    RamLoad load;
+    load.fd = fd_;
+    load.unbuffered = false;
+    load.threads = (int) std::min<size_t>(6, pick.size());
+    load.groups.resize(pick.size());
+    for (size_t k = 0; k < pick.size(); ++k) {
+        const uint64_t b = layer_blob_bytes_[(size_t) pick[k].first];
+        add_ram_blob(load.groups[k], (uint8_t*) arena + (size_t) at[k], 0, b, pick[k].second, 0);
     }
-    if (failed.load()) {
+    load.fallback = [&](int64_t k, const RamRun& r, uint64_t, std::string&) {
+        return copy_from_files(pick[(size_t) k].first, r.first, r.dst);
+    };
+    RamLoadStats read;
+    std::string read_err;
+    if (!read_ram_runs(load, read, read_err)) {
         if (pinned_ok) (void) cudaFreeHost(arena);
         else {
             if (locked > 0) basalt::platform::unlock_resident(arena, locked);
@@ -1846,462 +1749,6 @@ bool FileExpertSource::pcie_layer(int64_t layer) const {
     return device_alias(layer, 0) != nullptr;
 }
 
-// ================================ THE ADAPTER ================================
-
-// Read-ahead for what the CPU tier may read from the file: every routed id that no GPU holds.
-static void advise_routed(ExpertDispatch& d, const int32_t* ids, int64_t n) {
-    int32_t want[128];
-    int64_t m = 0;
-    for (int64_t i = 0; i < n && m < 128; ++i) {
-        const int32_t e = ids[i];
-        if (e < 0 || e >= d.n_expert) continue;
-        if (d.host_res != nullptr && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;
-        if (d.peer != nullptr && d.peer->has(d.layers, e)) continue;
-        bool seen = false;
-        for (int64_t j = 0; j < m && !seen; ++j) seen = want[j] == e;
-        if (!seen) want[m++] = e;
-    }
-    if (m > 0) d.src->advise_cpu(d.layers, want, m);
-}
-
-void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
-                          int64_t k, float* out) {
-    (void) weights;   // clause 2: `moe_combine` applies it on the device.  Not an oversight.
-    ExpertDispatch& d = *(ExpertDispatch*) user;
-    if (d.failed) return;   // a previous layer already failed; do not make it worse
-
-    using namespace basalt::kernels::cpu;
-    // Clause 3: the blob's internal offsets are compile-time constants, so a mismatched geometry does not
-    // produce a wrong answer - it produces a walk off the end of the blob into the next expert's bytes, which
-    // is finite and plausible.  Refuse, name the number, and let the driver report it.
-    if (n_embd != H) {
-        d.failed = true;
-        d.fail = "the expert kernel is compiled for a 2560-wide activation";
-        d.fail_layer = d.layers;
-        return;
-    }
-    if (expert_layout().native) {
-        // a native pack runs its experts in verify windows only (the driver guarantees it)
-        d.failed = true;
-        d.fail = "the single-token expert path does not take a native (IQ) pack";
-        d.fail_layer = d.layers;
-        return;
-    }
-    advise_routed(d, ids, k);
-    if (k > (int64_t) d.jobs.size()) d.jobs.resize((size_t) k);
-
-    // Clause 1: rebuilt from `x_f` on EVERY call.  `x_f` is mapped pinned memory whose address never changes,
-    // so anything cached against it would be layer 0's activation reused 48 times.
-    act_quant_q8_1(x_f, H, d.act);
-
-    // ---- THE POOL'S HALF OF THE SPLIT.  **IT DOES NOT DECIDE ANYTHING - `Launch` ALREADY DID.**
-    //
-    // The decision has to be made on THIS layer's ids, and `Launch` is the only callback that runs before the
-    // pool while the ids are known (the doorbell publishes them when the ring fires).  So `expert_hit_run`
-    // decides, and this consumes `d.is_hit`.  Deciding here instead would make `Launch` compute the PREVIOUS
-    // layer's experts into this layer's rows.
-    //
-    // `njobs` indexes the JOB ARRAY and `i` indexes the OUTPUT - they are the same only when nothing is a hit.
-    const bool graph_hits = d.host_res != nullptr;
-    const bool use_hits = graph_hits || (d.hits_ready() && d.decided);
-    int64_t njobs = 0;
-
-    for (int64_t i = 0; i < k; ++i) {
-        const int64_t e = ids[i];
-        if (e < 0 || e >= d.n_expert) {
-            d.failed = true;
-            d.fail = "a routed expert id is out of range";
-            d.fail_layer = d.layers;
-            d.fail_expert = e;
-            return;
-        }
-        const uint8_t* b = d.src->blob(d.layers, e);
-        if (b == nullptr) {
-            // The one failure the loop cannot see.  Leaving `out` at its previous contents would feed the NEXT
-            // layer a stale expert vector, which `moe_combine` would weight and add - the token would still be
-            // finite and would still be wrong, 48 layers deep.
-            d.failed = true;
-            d.fail = "the expert source could not produce a blob";
-            d.fail_layer = d.layers;
-            d.fail_expert = e;
-            ++d.missing;
-            return;
-        }
-        // A hit's row was zeroed by `Launch` and belongs to the GPU; the pool must not touch it.
-        if (use_hits && (graph_hits ? d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0
-                                    : d.is_hit[(size_t) i] != 0)) {
-            if (graph_hits) ++d.cache_hits;
-            // The GPU owns this row and `hit_out` is zeroed, so the CPU's contribution is zero - but
-            // `y_miss` is a REUSED pinned buffer, so the row must be written, not merely skipped.
-            std::memset(out + (size_t) i * (size_t) n_embd, 0, (size_t) n_embd * sizeof(float));
-            continue;
-        }
-        if (graph_hits) ++d.cache_refused;   // token graph: a miss (nothing is admitted during a token)
-
-        // `njobs` indexes the JOB ARRAY and `i` indexes the OUTPUT - they are the same only when nothing is a
-        // hit, and using one for the other is how a hit's row would get two experts summed into it.
-        ExpertJob& j = d.jobs[(size_t) njobs++];
-        j.blob = b;
-        j.act = &d.act;             // SHARED across the batch: one conversion serves all ten experts
-        j.out = out + (size_t) i * (size_t) n_embd;
-        j.weight = 1.0f;            // clause 2: a diagnostic field, NOT the router weight
-        j.slot = (int) i;
-    }
-
-    // rows of every expert across all threads (bitwise the same as `run`).
-    d.pool->run_split(d.jobs.data(), (int) njobs);
-    ++d.layers;
-    d.experts += k;
-}
-
-namespace {
-// the verify window's per-entry tables in `expert_pool_dispatch_multi` (`kind`, `distinct`, `first_of`)
-// are fixed arrays of this many entries: MAXT tokens of the model's 10 routed experts must fit, and a larger k is
-// refused at run time rather than written past them.
-constexpr int64_t kMaxWindowEntries = 128;
-static_assert(basalt::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
-}  // namespace
-
-void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
-                                float* out) {
-    using namespace basalt::kernels::cpu;
-    if (d.failed) return;
-    if (n_tok < 1 || n_tok > MAXT) {
-        d.failed = true;
-        d.fail = "a verify window has more tokens than the multi-token expert kernel takes";
-        d.fail_layer = d.layers;
-        return;
-    }
-    if (k < 1 || n_tok * k > kMaxWindowEntries) {
-        d.failed = true;
-        d.fail = "a verify window routes more entries than the expert pool's window tables hold";
-        d.fail_layer = d.layers;
-        return;
-    }
-    if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) MAXT);
-    const ExpertLayout& lay = expert_layout();
-    const bool native = lay.native;
-    if (native && d.nact_multi.size() < (size_t) MAXT * kNativeActBytes) d.nact_multi.resize((size_t) MAXT * kNativeActBytes);
-    if (d.job_of.size() != (size_t) d.n_expert) d.job_of.assign((size_t) d.n_expert, (int16_t) -1);
-    if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (MAXT * k));
-    const auto c0 = std::chrono::steady_clock::now();
-    if (!d.usage.empty())
-        for (int64_t i = 0; i < n_tok * k; ++i)
-            if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
-    // ---- the GPU's share, decided and published FIRST so the GPU starts while the CPU works.  Distinct experts in
-    // routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
-    const int64_t n = n_tok * k;
-    if (n <= kMaxWindowEntries) advise_routed(d, ids, n);
-    int32_t kind[kMaxWindowEntries];       // per entry: -1 CPU, 0 VRAM, 1 PCIe
-    // the device planned the layer; only its CPU entries are the pool's
-    const bool ext = d.plan != nullptr && d.plan->ext_kind != nullptr && n <= kMaxWindowEntries;
-    if (ext) {
-        for (int64_t i = 0; i < n; ++i) kind[i] = d.plan->ext_kind[i];
-    } else if (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) {
-        int64_t distinct[kMaxWindowEntries], first_of[kMaxWindowEntries];
-        int nd = 0, nmiss = 0;
-        for (int64_t i = 0; i < n; ++i) {
-            first_of[i] = i;
-            for (int64_t j = 0; j < i; ++j)
-                if (ids[j] == ids[i]) { first_of[i] = first_of[j]; break; }
-            if (first_of[i] == i) {
-                distinct[nd++] = i;
-                const int32_t e = ids[i];
-                if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
-                    !(d.peer != nullptr && d.peer->has(d.layers, e))) ++nmiss;
-            }
-        }
-        const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_layer(d.layers);
-        const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
-        int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
-        GpuPlanSink& P = *d.plan;
-        int64_t pcie_i0[64];
-        for (int q = 0; q < nd; ++q) {
-            const int64_t i0 = distinct[q];
-            const int32_t e = ids[i0];
-            int kd = -1;
-            unsigned long long ptr = 0;
-            if (e >= 0 && e < d.n_expert) {
-                const int32_t slot = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
-                if (slot >= 0) {
-                    kd = 0;
-                    ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
-                                                                                 : (size_t) slot * (size_t) d.cache_blob));
-                } else if (d.peer != nullptr && d.peer->has(d.layers, e)) {
-                    kd = 2;                        // multi-GPU: the second GPU computes it
-                } else {
-                    if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
-                        const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
-                        if (src != nullptr) {
-                            kd = 1;
-                            pcie_i0[fetches] = i0;
-                            ++fetches;
-                        }
-                    }
-                    ++miss_rank;
-                }
-            }
-            for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) kind[i] = kd;
-            if (kd != 0) continue;                 // the VRAM groups first; the PCIe groups below
-            P.ptr[groups] = ptr;
-            P.start[groups] = entries;
-            for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) {
-                    P.dst[entries] = (int32_t) i;
-                    P.tok[entries] = (int32_t) (i / k);
-                    ++entries;
-                }
-            ++groups;
-        }
-        P.start[groups] = entries;
-        for (int q = 0; q < fetches; ++q) {       // the PCIe groups: the arena alias, entries after the VRAM ones
-            const int64_t i0 = pcie_i0[q];
-            P.ptr2[q] = (unsigned long long) d.src->device_alias(d.layers, ids[i0]);
-            P.start2[q] = entries;
-            for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) {
-                    P.dst[entries] = (int32_t) i;
-                    P.tok[entries] = (int32_t) (i / k);
-                    ++entries;
-                }
-            ++d.pcie_experts;
-        }
-        P.start2[fetches] = entries;
-        P.counts[0] = groups;
-        P.counts[1] = entries;
-        P.counts[2] = fetches;
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (P.publish) P.publish(P.ctx);
-        if (P.staged) P.staged(P.ctx);
-    } else {
-        for (int64_t i = 0; i < n; ++i) {
-            const int32_t e = ids[i];
-            kind[i] = (e >= 0 && e < d.n_expert && d.host_res != nullptr &&
-                       d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) ? 0
-                    : (e >= 0 && e < d.n_expert && d.peer != nullptr && d.peer->has(d.layers, e)) ? 2 : -1;
-        }
-    }
-    if (d.peer != nullptr && !ext) {         // multi-GPU: start the second GPU's share before the CPU's own work
-        std::string perr;
-        if (!d.peer->launch(d.layers, x_f, ids, n_tok, k, kind, perr, out)) {
-            basalt::log::error("basalt", "%s (layer %lld)", perr.c_str(), (long long) d.layers);
-            d.failed = true;
-            d.fail = "the peer GPU's experts could not be launched";
-            d.fail_layer = d.layers;
-            return;
-        }
-    }
-    // the GPU's copy_rows_from_mapped zeroes the rows it computed itself
-    const bool gpu_zeroes_hits = (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap);
-    bool any_cpu = false;
-    for (int64_t i = 0; i < n; ++i)
-        if (kind[i] < 0) { any_cpu = true; break; }
-    const auto c1 = std::chrono::steady_clock::now();
-    if (any_cpu) {
-        // a token whose experts all run on a GPU (CUDA0 or the peer) needs no CPU activation
-        for (int64_t t = 0; t < n_tok; ++t) {
-            bool cpu = false;   // an id of -1 (dropped by the route tail skip) needs no activation
-            for (int64_t j = t * k; j < (t + 1) * k; ++j) cpu |= kind[j] < 0 && ids[j] >= 0;
-            if (!cpu) continue;
-            if (native && basalt::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
-                act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
-            else if (native)
-                native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
-            else
-                act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
-        }
-    }
-    const auto c2 = std::chrono::steady_clock::now();
-    int njobs = 0;
-    for (int64_t t = 0; t < n_tok; ++t)
-        for (int64_t j = 0; j < k; ++j) {
-            const int64_t i = t * k + j;
-            const int64_t e = ids[i];
-            float* row = out + (size_t) i * H;
-            if (e < 0 && ext) {             // dropped by the route tail skip: no work, no contribution
-                std::memset(row, 0, (size_t) H * sizeof(float));
-                continue;
-            }
-            if (e < 0 || e >= d.n_expert) {
-                d.failed = true;
-                d.fail = "a routed expert id is out of range";
-                d.fail_layer = d.layers;
-                d.fail_expert = e;
-                return;
-            }
-            if (kind[i] >= 0) {             // CUDA0, PCIe, or a peer result staged into this row below
-                if (kind[i] == 0) ++d.cache_hits;
-                else ++d.offload_entries;   // PCIe or another GPU
-                if (kind[i] == 2 && d.peer != nullptr) ++d.peer_entries;
-                // multi-GPU: a direct peer launch is writing this row right now - zeroing it would race it;
-                // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU;
-                // ext: the GPU reads only the CPU rows
-                if (!(ext || (kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()) ||
-                      (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1))))
-                    std::memset(row, 0, (size_t) H * sizeof(float));
-                continue;
-            }
-            ++d.cache_refused;
-            int16_t& jo = d.job_of[(size_t) e];
-            if (jo < 0) {
-                const uint8_t* b = d.src->blob(d.layers, e);
-                if (b == nullptr) {
-                    d.failed = true;
-                    d.fail = "the expert source could not produce a blob";
-                    d.fail_layer = d.layers;
-                    d.fail_expert = e;
-                    ++d.missing;
-                    return;
-                }
-                jo = (int16_t) njobs++;
-                ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
-                nj.blob = b;
-                nj.nt = 0;
-            }
-            ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
-            jb.act[jb.nt] = &d.act_multi[(size_t) t];
-            jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
-            jb.out[jb.nt] = row;
-            ++jb.nt;
-            ++d.multi_entries;
-        }
-    const auto c3 = std::chrono::steady_clock::now();
-    if (njobs > 0) {
-        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
-        else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
-    }
-    if (d.peer != nullptr && !ext) {         // multi-GPU: the second GPU's rows, into the same mapped rows
-        std::string perr;
-        if (!d.peer->finish(out, perr)) {
-            basalt::log::error("basalt", "%s (layer %lld)", perr.c_str(), (long long) d.layers);
-            d.failed = true;
-            d.fail = "the peer GPU's experts failed";
-            d.fail_layer = d.layers;
-            return;
-        }
-    }
-    const auto c4 = std::chrono::steady_clock::now();
-    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-    d.ms_plan += ms(c0, c1);
-    d.ms_actq += ms(c1, c2);
-    d.ms_jobs += ms(c2, c3);
-    d.ms_run += ms(c3, c4);
-    for (int64_t i = 0; i < n_tok * k; ++i) {
-        const int64_t e = ids[i];
-        if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
-    }
-    d.multi_misses += njobs;
-    ++d.layers;
-    d.experts += n_tok * k;
-}
-
-void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids, int64_t k) {
-    ExpertDispatch& d = *(ExpertDispatch*) user;
-    if (d.failed) return;
-    cudaStream_t cs = (cudaStream_t) stream;
-
-    if (phase == HitPhase::Launch) {
-        d.decided = false;
-        d.hit_pending = false;
-        if (!d.hits_ready() || ids == nullptr || k <= 0) return;
-        if ((int64_t) d.is_hit.size() < k) d.is_hit.resize((size_t) k);
-
-        // ================================ THE DECISION, ONCE, ON THIS LAYER'S IDS ================================
-        //
-        // Every routed expert is asked of the cache.  Resident -> the GPU computes it.  Not resident -> it is
-        // admitted and filled if there is room (which makes it a hit on THIS call, because the fill and the
-        // kernel are on one stream in that order), and otherwise it stays a miss for the CPU.
-        d.n_hits = 0;
-        for (int64_t i = 0; i < k; ++i) {
-            const int64_t e = ids[i];
-            d.is_hit[(size_t) i] = 0;
-            if (e < 0 || e >= d.n_expert) continue;   // out of range: the pool refuses it, with a message
-            int32_t slot = d.cache->slot_of(d.layers, e);
-            if (slot == kNotResident) {
-                const int32_t cand = d.cache->admit(d.layers, e);
-                if (cand == kNotResident) {
-                    ++d.cache_refused;
-                    continue;
-                }
-                // `blob` is asked ONLY for an expert about to be filled, so the source's read counter stays a
-                // count of distinct experts moved rather than of looks.
-                const uint8_t* b = d.src->blob(d.layers, e);
-                std::string ferr;
-                if (b == nullptr || !d.cache->fill_slot(cand, b, cs, ferr, (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(d.layers))) {
-                    d.failed = true;
-                    d.fail = "the expert cache could not fill a slot";
-                    d.fail_layer = d.layers;
-                    d.fail_expert = e;
-                    return;
-                }
-                ++d.cache_admitted;
-                slot = cand;
-            } else {
-                ++d.cache_hits;
-            }
-            d.is_hit[(size_t) i] = 1;
-            d.h_slot[(size_t) d.n_hits] = slot;
-            d.h_dst[(size_t) d.n_hits] = (int32_t) i;
-            ++d.n_hits;
-        }
-        d.decided = true;
-        if (d.n_hits <= 0) return;   // nothing resident yet: no GPU work, and nothing for `Combine` to add
-
-        const size_t list_bytes = (size_t) d.n_hits * sizeof(int32_t);
-        // `hit_out` is ZEROED rather than overwritten: the kernel writes only the rows this layer's hits own,
-        // so a row that was a hit last layer and a miss this one would still hold last layer's expert and
-        // `add_inplace` would sum it in.  Finite, plausible, wrong.
-        if (cudaMemsetAsync(d.hit_out, 0, (size_t) d.parts_elems * sizeof(float), cs) != cudaSuccess ||
-            cudaMemcpyAsync(d.d_slot, d.h_slot.data(), list_bytes, cudaMemcpyHostToDevice, cs) != cudaSuccess ||
-            cudaMemcpyAsync(d.d_dst, d.h_dst.data(), list_bytes, cudaMemcpyHostToDevice, cs) != cudaSuccess) {
-            d.hit_fail = "the hit list could not be staged";
-            d.failed = true;
-            d.fail = d.hit_fail;
-            return;
-        }
-        // The activation is quantized HERE rather than reused from `s.moe.x_q8_0`, which `post[l-1]` wrote from
-        // the PREVIOUS layer's `mixed`.  `pre[l]` has since overwritten `mixed`, so that buffer is a layer stale
-        // - and a stale activation produces a perfectly finite expert for the wrong input.
-        // **THE SCALED QUANTIZER, SO A HIT REPRODUCES A MISS.**  The CPU pool quantizes this same
-        // activation with `act_quant_q8_1` and multiplies by the fp32 `ActQ::scale`; `quantize_q8_0` writes
-        // an fp16 `d` instead, which differs by up to 2^-11 relative per chunk.  `quantize_q8_0_scaled` adopts
-        // the CPU's rule and scale, and the kernel takes the fp32 array.  Falling back to fp16 `d` would
-        // reintroduce the divergence, so the scales are required here rather than optional.
-        if (d.x_q8_0_hit_scale == nullptr) {
-            d.failed = true;
-            d.fail = "the hit path has no fp32 activation scales";
-            return;
-        }
-        basalt::kernels::quantize_q8_0_scaled(d.mixed, d.x_q8_0_hit, d.x_q8_0_hit_scale, basalt::kernels::cpu::H,
-                                              cs);
-        basalt::kernels::moe_hit_grouped_s2(d.cache_base, d.d_slot, d.d_dst, d.n_hits, d.cache_blob,
-                d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
-        d.hit_pending = true;
-        if (d.hit_done != nullptr) {
-            cudaEventRecord((cudaEvent_t) d.hit_done, cs);
-            // ONE driver entry here: if the work was waiting for the host to enter the driver, this is what lets it
-            // start while the pool runs.
-            (void) cudaEventQuery((cudaEvent_t) d.hit_done);
-        }
-        return;
-    }
-
-    // Combine: `parts += hit_out`, stream-ordered after the misses were copied into `parts`.
-    if (!d.hit_pending) return;
-    d.hit_pending = false;
-    // Did the GPU get the hit work done while the CPU was in the pool?  This query is itself a driver entry,
-    // so it is the LAST chance to observe a late start: a NOT-READY here means the work had not finished by the
-    // time the pool returned, and with no poke in front of it that can only be because it began after.
-    if (d.hit_done != nullptr) {
-        if (cudaEventQuery((cudaEvent_t) d.hit_done) == cudaSuccess) ++d.hit_ready;
-        else ++d.hit_late;
-    }
-    basalt::kernels::add_inplace(d.parts_out, d.hit_out, d.parts_elems, cs);
-}
-
-// ================================ THE RESIDENT ARENA ================================
-
 namespace {
 
 void hash_u64(uint64_t& h, uint64_t v) {
@@ -2441,30 +1888,42 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
               (why.empty() ? std::string{} : ": " + why);
         return false;
     }
-    // unbuffered when the drive is read anyway and the file cache could not keep the experts for the next start
-    // either; otherwise the buffered readers, which a warm restart serves from the cache
-    std::vector<std::string> files{path};
-    std::string why;
-    const bool unbuffered = experts_unbuffered(files, want + (uint64_t) blob, why);
-    const int readers = unbuffered ? std::max(threads, 16) : threads;   // 16 keep a PCIe 5 drive's queue full
-    LoadStats st;
-    if (unbuffered) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20,
-                                             files_in.experts.offset);
-    if (!unbuffered || (!st.ok && st.error.empty()))   // unaligned ranges: the buffered reader
-        st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20,
-                                 files_in.experts.offset);
-    basalt::log::info("basalt generate", "expert arena read %s (%s)", unbuffered ? "unbuffered" : "through the file cache",
-                 why.c_str());
-    if (!st.ok) {
+    // read through the file cache, which a warm restart serves from
+    const int fd = basalt::platform::open_fd_utf8(path);
+    if (fd < 0) {
         delete a;
-        err = "ArenaExpertSource: the expert load was refused: " + (st.error.empty() ? std::string("unknown") : st.error);
+        err = "ArenaExpertSource: cannot open " + path;
         return false;
     }
-    if (st.bytes != want) {
+    constexpr uint64_t kChunk = 8ull << 20;
+    LoadProgress progress("ram", want);
+    RamLoad load;
+    load.fd = fd;
+    load.unbuffered = false;
+    load.threads = std::max(threads, 1);
+    load.chunk = kChunk;
+    load.progress = &progress;
+    load.groups.resize((size_t) n_layers);
+    for (size_t l = 0; l < (size_t) n_layers; ++l)
+        for (uint64_t pos = 0; pos < lbytes[l]; pos += kChunk) {
+            RamRun r;
+            r.dst = a->data() + (size_t) (loff[l] + pos);
+            r.file_pos = files_in.experts.offset + loff[l] + pos;
+            r.bytes = std::min(kChunk, lbytes[l] - pos);
+            r.progress = r.bytes;
+            load.groups[l].push_back(r);
+        }
+    RamLoadStats st;
+    std::string read_err;
+    const bool read_ok = read_ram_runs(load, st, read_err);
+    basalt::platform::close_fd(fd);
+    basalt::log::info("basalt generate", "expert arena read through the file cache (buffered)");
+    if (!read_ok) {
         delete a;
-        err = "ArenaExpertSource: the load read " + std::to_string(st.bytes) + " B of " + std::to_string(want);
+        err = "ArenaExpertSource: the expert load was refused: " + read_err;
         return false;
     }
+    progress.finish();
     arena_ = a;
     base_ = a->data();
     pinned_bytes_ = a->registered_bytes;
@@ -2487,10 +1946,7 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
     n_expert_ = n_expert;
     reads_ = 0;
     note_ = a->note;
-    gib_per_s_ = st.gib_per_second();
-    load_seconds_ = st.seconds;
-    load_read_s_ = st.read_seconds;
-    load_copy_s_ = st.copy_seconds;
+    gib_per_s_ = st.seconds > 0 ? (double) st.copied / 1073741824.0 / st.seconds : 0.0;
     return true;
 }
 

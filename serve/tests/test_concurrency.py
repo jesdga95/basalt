@@ -7,7 +7,7 @@ import unittest
 import urllib.request
 from pathlib import Path
 
-from serve.config import build_parser, parse_settings
+from serve.config import build_parser, model_settings
 from serve.engine.mock import MockEngine
 from serve.engine.slots import AdmissionQueue
 from serve.frontend import ChatTemplate
@@ -69,7 +69,7 @@ class Slots(unittest.TestCase):
             return json.loads(r.read())
 
     def chat(self, word, **extra):
-        out = self.post("/v1/chat/completions", {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": word}],
+        out = self.post("/v1/chat/completions", {"model": "basalt", "messages": [{"role": "user", "content": word}],
                                                  "max_tokens": 200, **extra})
         return out["choices"][0]["message"]["content"]
 
@@ -113,7 +113,7 @@ class Concurrent(Slots):
     def test_openai_and_anthropic_run_together(self):
         self.start({"red": "Red answer.", "blue": "Blue answer."})
         def anth():
-            out = self.post("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 200,
+            out = self.post("/v1/messages", {"model": "basalt", "max_tokens": 200,
                                              "messages": [{"role": "user", "content": "blue"}]})
             return "".join(b.get("text", "") for b in out["content"])
         ts, res = self.run_all([lambda: self.chat("red"), anth])
@@ -187,15 +187,15 @@ class SlotRows(Slots):
 
     def test_each_slot_names_its_request(self):
         self.start({"go": "word " * 80}, delay=0.03)
-        ts, _ = self.run_all([lambda: self.chat("go a", model="qwen3.8-flash-next"),
-                              lambda: self.post("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 200,
+        ts, _ = self.run_all([lambda: self.chat("go a", model="basalt"),
+                              lambda: self.post("/v1/messages", {"model": "basalt", "max_tokens": 200,
                                                                  "messages": [{"role": "user", "content": "go b"}]})])
         self.wait_for(lambda: sum(r["state"] == "decoding" and r["generated"] > 0 for r in self.get("/slots")) == 2,
                       "both decoding")
         rows = self.get("/slots")
         busy = [r for r in rows if r["is_processing"]]
         self.assertEqual(sorted(r["id"] for r in busy), sorted(set(r["id"] for r in busy)))
-        self.assertEqual(sorted((r["api"], r["model"]) for r in busy), [("anthropic", "qwen3.8-flash-next"), ("openai", "qwen3.8-flash-next")])
+        self.assertEqual(sorted((r["api"], r["model"]) for r in busy), [("anthropic", "basalt"), ("openai", "basalt")])
         for r in busy:
             self.assertEqual(r["state"], "decoding")
             self.assertEqual(r["max_tokens"], 200)
@@ -249,8 +249,8 @@ class SlotRows(Slots):
         self.start({"go": "word " * 60}, n=2, delay=0.03)
         ts = []
         for i, kind in enumerate(("openai", "anthropic", "openai", "anthropic")):
-            job = (lambda i=i: self.chat(f"go {i}", model="qwen3.8-flash-next", max_tokens=80)) if kind == "openai" else \
-                  (lambda i=i: self.post("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 80,
+            job = (lambda i=i: self.chat(f"go {i}", model="basalt", max_tokens=80)) if kind == "openai" else \
+                  (lambda i=i: self.post("/v1/messages", {"model": "basalt", "max_tokens": 80,
                                                           "messages": [{"role": "user", "content": f"go {i}"}]}))
             t, _ = self.run_all([job])
             ts += t
@@ -260,7 +260,7 @@ class SlotRows(Slots):
         live = self.get("/metrics")["live"]
         self.assertEqual(live["queued"], 2)
         q = live["queue"]
-        self.assertEqual([(w["api"], w["model"]) for w in q], [("openai", "qwen3.8-flash-next"), ("anthropic", "qwen3.8-flash-next")])
+        self.assertEqual([(w["api"], w["model"]) for w in q], [("openai", "basalt"), ("anthropic", "basalt")])
         for w in q:
             self.assertEqual(set(w), {"api", "model", "prompt_tokens", "waited_s"})
             self.assertGreater(w["prompt_tokens"], 0)
@@ -275,7 +275,7 @@ class SlotRows(Slots):
 class Leaving(Slots):
     def stream(self, word):
         s = socket.create_connection(("127.0.0.1", self.port), timeout=10)
-        body = json.dumps({"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": word}], "max_tokens": 200, "stream": True})
+        body = json.dumps({"model": "basalt", "messages": [{"role": "user", "content": word}], "max_tokens": 200, "stream": True})
         s.sendall((f"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
                    f"Content-Length: {len(body)}\r\n\r\n{body}").encode())
         return s
@@ -325,7 +325,7 @@ class Admission(unittest.TestCase):
 
 class ParallelOption(unittest.TestCase):
     def parse(self, *argv):
-        return parse_settings(build_parser(), list(argv))
+        return model_settings(build_parser(), list(argv))[0]
 
     def test_default_is_one_and_adds_no_engine_flag(self):
         a, _, file_engine, cli_engine = self.parse("--mock-engine")
@@ -347,12 +347,12 @@ class ParallelOption(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "c.json"
-            p.write_text(json.dumps({"server": {"parallel": 3}}))
+            p.write_text(json.dumps({"models": [{"model": "m", "parallel": 3}]}))
             a, _, file_engine, cli_engine = self.parse("--config", str(p))
             self.assertEqual((a.parallel, file_engine[:2], "--batch" in cli_engine), (3, ["--batch", "3"], False))
             _, _, file_engine, cli_engine = self.parse("--config", str(p), "--parallel", "2")
             self.assertEqual(cli_engine[:2], ["--batch", "2"])
-            p.write_text(json.dumps({"server": {"parallel": 3}, "engine": {"batch": 2}}))
+            p.write_text(json.dumps({"models": [{"model": "m", "parallel": 3}], "engine": {"batch": 2}}))
             with self.assertRaises(ValueError):
                 self.parse("--config", str(p))
 

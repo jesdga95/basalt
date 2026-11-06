@@ -1,4 +1,4 @@
-// src/program/serve/request.hpp - one request's state and execution phases.
+// src/program/serve/request_base.hpp - one request's state and the phases every model shares.
 #pragma once
 
 #include "state.hpp"
@@ -8,11 +8,11 @@ namespace basalt::program::serve {
 class Request {
 public:
     explicit Request(Runtime& runtime) : runtime_(runtime) {}
+    virtual ~Request() = default;
     Flow execute();
 
-private:
+protected:
     Runtime& runtime_;
-    using PfPart = Runtime::PfPart;
     using BSlot = Runtime::BSlot;
     using SlotHeld = Runtime::SlotHeld;
     bool geni{};
@@ -55,7 +55,6 @@ private:
     int slot_b{};
     bool in_slot{};
     bool solo_req{};
-    basalt::core::SessionState* rview{};
     using SoloBook = Runtime::SoloBook;
     SoloBook solo_book{};
     bool solo_moved{};
@@ -76,133 +75,95 @@ private:
     bool in_live{};
     basalt::core::ConversationStore::Match on_disk{};
     bool from_disk{};
-    int64_t kv_need{};
-    struct KeepRouted {   // only this admission's fits, while slots decode
-                bool& on;
-                ~KeepRouted() { on = false; }
-            };
-    std::optional<KeepRouted> keep_routed;
-    std::optional<KeepRouted> defer_peer;
-    bool kv_ok{};
     Clock::time_point restore_t0{};
     int64_t read_from{};
-    // `copied`: the copies already ran (and were waited for) on the overlapped read's thread, so only the table is left
-    bool ov_copied{};
-    // --batch: a prompt read while slots are decoding goes one prompt chunk at a time (the same chunks as one
-    // run: each run starts where the last ended, at a multiple of the chunk), and between two chunks the slots
-    // decode for a share of the time the chunk took (half), so a long prompt does not stop the others.  The
-    // slots' windows then see the cache without the slots this prompt borrowed (marked missing: those experts
-    // run on the CPU), never a prompt buffer.
-    static constexpr double decode_share = 0.5;
-    bool batch_fatal{};
-    int64_t il_parts{};
-    double il_ms{};
-    int64_t yielded_at{};
-    int yielded_slot{};
-    // ---- the prompt-time layer split: a long part of the prompt is read across the cards when its price there
-    // (split_price) beats the main card's alone; the chunk, its head chunk, the stage count and the cuts, or none
-    struct SplitPlan { int64_t chunk = 0, head = 0; int stages = 0; std::vector<int> cuts; };
-    // per-request sampling for the verify window's head (greedy when temperature is absent)
+
+    // per-request sampling (greedy when temperature is absent)
     basalt::kernels::SamplerParams req_sp{};
-    bool relax_on{};
-    bool in_call{};
-    int64_t relaxed_kept{};
-    int hist_n{};
     bool cancelled{};
-    int64_t turn_at{};
-    int64_t root_at{};
-    int64_t at{};
-    int64_t fold_p0{};
-    double prompt_ms{};
-    int64_t p{};
-    int32_t x{};
-    std::vector<int32_t> drafts{};
     std::vector<int32_t> window{};
     std::vector<int32_t> outv{};
-    std::vector<float> dprob{};
-    basalt::core::DraftCumAdapt cum_adapt{};   // this request's draft threshold
-    std::vector<int32_t> sbuf{};
     bool first_window{};
-    int64_t produced_n{};
-    int64_t sfx_windows{};
-    int64_t sfx_drafts{};
-    int64_t sfx_ok{};
-    int64_t draft_offered{};
-    int64_t draft_accepted{};
+    int hist_n{};
+    int64_t p{};
+    int32_t x{};
     // what the session holds once this request is done: the prompt read so far, then every committed token
     std::vector<int32_t> consumed{};
     const char* finish{};
-    std::string kv_stop{};   // the elastic KV could not back the next window: the request ends on this error
-    basalt::core::Verifier* cv{};
-    basalt::core::Verifier* ov{};
-    struct HeldWindow { bool on = false; int T = 0; std::vector<int32_t> win, out; };
-    HeldWindow held{};
-    std::vector<int32_t> win_b{};
-    int n_chain{};
-    double full_ema{};
-    bool pair_hint{};
-    bool pair_req{};
-    int64_t pair_runs{};
-    int64_t pair_holds{};
-    Clock::time_point d0{};
-    bool dec_timing{};
-    struct DecSnap {
-        double wait, pool, host, plan, actq, jobs, run, peer_wait;
-        int64_t misses, entries, hits, pcie, peer;
-    };
-    DecSnap ds0{};
-    double dt_run{};
-    double dt_commit{};
-    double dt_draft{};
-    int64_t dec_windows{};
-    int64_t dec_T{};
-    int64_t decode_hits0{};
-    int64_t swapped0{};
-    int64_t noplace0{};
-    int64_t ram0{};
-    int64_t files0{};
-    uint64_t file_bytes0{};
-    int64_t decode_look0{};
-    int64_t offload0{};
-    int adapt_age{};
-    bool applied_early{};
-    JobRunner apply_thr{};
-    JobRunner adapt_thr{};
-    bool copy_live{};
-    bool copy_done{};
-    struct TkStep { int n = 0; int32_t id[4] = {}; float p[4] = {}; };
-    TkStep tk_prev[16]{};
-    bool tk_valid{};
+    std::string kv_stop{};   // the next window could not be backed: the request ends on this error
+    int64_t produced_n{};
+    int64_t draft_offered{};
+    int64_t draft_accepted{};
     double decode_ms{};
-    int64_t req_hits{};
-    int64_t req_look{};
-    int64_t req_offload{};
+    Clock::time_point d0{};
     int64_t fresh{};
     int64_t read_n{};
     bool ram_out{};
     // "12288 of 98179" when cancelled mid-read, the rate from what was read
     char read_txt[64]{};
-
+    /// DONE's tier fields.
+    struct DoneCounts { int64_t hits = 0, lookups = 0, ram_blobs = 0, file_blobs = 0; double file_mb = 0; int64_t offloaded = 0; };
+    int64_t yielded_at{};
+    int yielded_slot{};
+    int64_t turn_at{};
+    int64_t root_at{};
+    int64_t at{};
+    int64_t fold_p0{};
+    double prompt_ms{};
     bool starts_with(const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs);
-    bool windows_ok(int64_t a, int64_t b);
-    bool read_windows(int64_t a, int64_t b, std::string& e);
-    bool refill_issue(PfPart& p, std::string& e, bool assign = true);
-    bool refill_wait(PfPart& p, std::string& e);
-    bool refill_one(PfPart& p, std::string& e);
-    bool refill(std::string& e);
-    bool lend(int64_t tokens, std::string& e, int64_t chunk = 0, int64_t head = 0);
-    bool can_yield(int64_t q, int64_t b0, int ys, bool beside = false);
-    bool park_read(int64_t q, int ys, std::string& ye, int64_t chunk = 0);
-    SplitPlan split_plan(int64_t a0, int64_t b0, const char* no_split);
-    bool read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool& ran, std::string& e);
-    bool read_part(int64_t a0, int64_t b0, std::string& e);
-    DecSnap dec_snap();
-    Flow parse();
-    Flow prepare_image();
     Flow restore();
+    Flow parse();
+    Flow prepare_prompt();
+    virtual Flow prepare_image() = 0;
+    /// `ppl=K`: opens chunk K of the gate's base, with at most `most_rows` scored per window.
+    Flow begin_quality_gate(const std::string& base, const std::string& out, int most_rows);
     Flow read_prompt();
-    Flow decode();
+    virtual Flow decode() = 0;
     Flow complete();
+    template <class B> Flow decode_loop(B& b);
+    virtual bool parse_begin() { return true; }
+    virtual float default_relax() const { return 0.0f; }
+    // ---- the end of a request
+    virtual Flow complete_begin() { return Flow::proceed; }
+    virtual DoneCounts done_counts() { return {}; }
+    virtual bool tiers_settle() { return true; }
+    virtual bool admit_draft() { return true; }
+    virtual void slot_state_back(int) {}
+    virtual bool slot_draft_keep(int) { return true; }
+    virtual void slot_set_sampling(int) {}
+    virtual void slot_init(BSlot&) {}
+    virtual bool slot_leave() { return true; }
+    virtual void report_request(const DoneCounts&) {}
+    /// The decode's expert cache line; the server's Experts panel shows the same counts from DONE.
+    void report_expert_counts(const DoneCounts& dc) const;
+    // ---- reading the prompt, per part.  read_to: Flow::quit when a stop ended the read.
+    virtual bool prompt_begin() { return true; }
+    virtual Flow set_sampling() = 0;
+    virtual void limit_parts() {}
+    virtual void prompt_parts_begin() {}
+    virtual Flow read_to(int64_t to) = 0;
+    virtual Flow prompt_end() { return Flow::proceed; }
+    /// A template whose turn token opens the user's turn: the turn's checkpoint sits before the prompt's last token.
+    virtual bool turn_checkpoint_at_last_token() const { return false; }
+    // ---- restoring a conversation: what it does to the model's sessions.  Per request.
+    virtual bool cvec_wanted() const { return true; }
+    virtual void set_cvec() {}
+    virtual void select_view() {}
+    virtual bool slot_draft_in(int) { return true; }
+    virtual void drop_stale_reuse() {}
+    virtual bool release_room() = 0;
+    virtual bool checkpoint_mount(const ConvCheckpoint& c) = 0;
+    virtual bool restore_begin() { return true; }
+    virtual void slot_draft_out() {}
+    virtual Flow slot_bind() { return Flow::proceed; }
+    virtual void validate_incoming() {}
+    virtual Flow make_room() { return Flow::proceed; }
+    virtual Flow restore_image() { return Flow::proceed; }
+    virtual void adopt_checkpoints() {}
+    virtual void retain_image() {}
+    virtual bool session_reset() { return true; }
+    virtual void draft_begin() {}
+    virtual void prompt_parts_reset() {}
 };
 
 }  // namespace basalt::program::serve
