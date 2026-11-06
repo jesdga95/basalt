@@ -269,6 +269,7 @@ bool ExpertTier::load_ram(std::string& err) {
     ram_.assign((size_t) n_layers_, nullptr);
     ram_idx_.assign((size_t) n_layers_ * n_expert_, -1);
     spare_.assign((size_t) n_layers_, -1);
+    swapping_.assign((size_t) n_layers_, 0);
     spare_since_.assign((size_t) n_layers_, 0);
     last_miss_.assign((size_t) n_layers_ * n_expert_, 0);
     const int64_t copies = homes_.main > 0 ? 0 : per_layer_;
@@ -496,7 +497,7 @@ void ExpertTier::swap_worker() {
         const Swap sw = jobs_[next];
         lk.unlock();
         const ExpertLayer& el = m_.pack().experts[(size_t) sw.layer];
-        uint8_t* dst = ram_[(size_t) sw.layer] + (size_t) spare_[(size_t) sw.layer] * el.blob_bytes;
+        uint8_t* dst = ram_[(size_t) sw.layer] + (size_t) sw.place * el.blob_bytes;
         const bool ok = platform::pread_all(m_.experts_fd(), dst, el.blob_bytes,
                                             m_.pack().experts_range.offset + el.offset + (uint64_t) sw.expert * el.blob_bytes);
         lk.lock();
@@ -529,10 +530,11 @@ void ExpertTier::finish_swaps() {
         for (size_t i = 0; i < flight_.size(); ++i) flight_[i].expert = jobs_[jobs_.size() - flight_.size() + i].expert;
     }
     for (const Swap& sw : flight_) {
+        swapping_[(size_t) sw.layer] = 0;
         if (sw.expert < 0) continue;
         const size_t base = (size_t) sw.layer * n_expert_;
         const int32_t v = ram_idx_[base + sw.victim];
-        ram_idx_[base + sw.expert] = spare_[(size_t) sw.layer];
+        ram_idx_[base + sw.expert] = sw.place;
         ram_idx_[base + sw.victim] = -1;
         spare_[(size_t) sw.layer] = v;
         spare_since_[(size_t) sw.layer] = token_;
@@ -557,7 +559,7 @@ void ExpertTier::start_swaps() {
         const int v = policy::pick_victim(&ram_idx_[(size_t) l * n_expert_], &stamp_[(size_t) l * n_expert_], n_expert_, nullptr, 0);
         // a victim used in the last 16 tokens stays
         if (v < 0 || stamp_[(size_t) l * n_expert_ + v] + 16ull * (uint64_t) n_layers_ >= tick_) continue;
-        batch.push_back({l, e, v});
+        batch.push_back({l, e, v, spare_[(size_t) l]});
     }
     want_.clear();
     if (batch.empty()) return;
@@ -566,6 +568,7 @@ void ExpertTier::start_swaps() {
         jobs_.insert(jobs_.end(), batch.begin(), batch.end());
     }
     cv_.notify_all();
+    for (const Swap& sw : batch) swapping_[(size_t) sw.layer] = 1;
     flight_ = std::move(batch);
 }
 
@@ -685,14 +688,14 @@ int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best) const
             }
         }
     };
-    if (homes_.main == 0 || (homes_too && homes_.file == 0 && spare_[(size_t) layer] >= 0))
+    if (homes_.main == 0 || (homes_too && spare_[(size_t) layer] >= 0 && !swapping_[(size_t) layer]))
         scan((int64_t) layer * per_layer_, per_layer_);
     if (ext_per_layer_) scan((int64_t) n_layers_ * per_layer_ + (int64_t) layer * ext_per_layer_, ext_per_layer_);
     return slot;
 }
 
 bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
-    if (homes_.peer == 0 || homes_.file > 0 || spare_[(size_t) layer] < 0) return false;
+    if (homes_.peer == 0 || spare_[(size_t) layer] < 0 || swapping_[(size_t) layer]) return false;
     const size_t base = (size_t) layer * n_expert_;
     int32_t slot = -1;
     uint64_t oldest = ~0ull;

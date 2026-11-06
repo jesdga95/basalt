@@ -147,7 +147,7 @@ private:
     };
     /// A cold pinned expert (victim) replaced by a hot file-backed one (expert), read into the layer's spare slot.
     struct Swap {
-        int layer, expert, victim;
+        int layer, expert, victim, place;
     };
     bool load_ram(std::string& err);
     int ranked(int layer, int r) const;
@@ -201,6 +201,7 @@ private:
     int cover_ = 0;                         ///< experts per layer in the RAM tier
     std::vector<int32_t> ram_idx_;          ///< [layer * n_expert + e] pinned slot or -1
     std::vector<int32_t> spare_;            ///< [layer] pinned slot free for a swap, or -1
+    std::vector<uint8_t> swapping_;         ///< [layer] a file expert is being read into its spare
     std::vector<uint64_t> spare_since_;     ///< [layer] token at which the spare became free
     std::vector<uint64_t> last_miss_;       ///< [layer * n_expert + e] token + 1 of the last miss
     std::vector<std::pair<int, int>> want_; ///< file-backed experts that missed twice, in lookup order
