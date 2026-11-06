@@ -186,7 +186,7 @@ target_link_libraries(model_qwen4exp PUBLIC model tokenizer serve_shared model_q
 
 add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models/deepseek41/tokenizer/pretok_joyai.cpp src/models/deepseek41/pack.cpp
   src/models/deepseek41/model.cpp src/models/deepseek41/session.cpp src/models/deepseek41/layer_ops.cpp
-  src/models/deepseek41/elastic.cpp src/models/deepseek41/ops_kernels.cpp src/models/deepseek41/tier.cpp src/models/deepseek41/ops.cu
+  src/models/deepseek41/elastic.cpp src/models/deepseek41/ops_kernels.cpp src/models/deepseek41/tier.cpp src/models/deepseek41/prompt_host.cpp src/models/deepseek41/ops.cu
   src/models/deepseek41/prefill.cpp src/models/deepseek41/prefill_ffn.cpp src/models/deepseek41/prefill_ffn.cu src/models/deepseek41/attn_batch.cpp src/models/deepseek41/attn_dense.cu
   src/models/deepseek41/dspark.cpp src/models/deepseek41/dspark_kernels.cu)
 target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
@@ -284,7 +284,7 @@ target_link_libraries(basalt-plan PRIVATE plan)
 
 # ---- core (GPU runtime) ---------------------------------------------
 add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
-                             src/core/model_file.cpp)
+                             src/core/model_file.cpp src/core/host_plan.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
 # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
@@ -1278,7 +1278,7 @@ if(BUILD_TESTING)
 endif()
 # MMQ (ggml-cuda) for the prompt path's experts: the kernel, one instance per format the packs use, and the
 # activation quantizer; mmq_host.cu holds its few host symbols
-set(_mmq_types q2_0 iq1_s iq1_m iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 q5_1 q4_k q5_k q6_k nvfp4)
+set(_mmq_types q2_0 iq1_s iq1_m iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 q5_0 q5_1 q2_k q3_k q4_k q5_k q6_k nvfp4)
 # the Q2_0 pack's prompt experts on the engine's own int8 kernels (moe_fused.cu)
 add_library(mmq STATIC src/prefill/moe_mmq.cu
             src/prefill/mmq/mmq_host.cu src/prefill/mmq/quantize.cu)
@@ -1394,16 +1394,19 @@ add_executable(dec_moe_parity tests/models/qwen4exp/kernels/dec_moe_parity.cpp)
 target_include_directories(dec_moe_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(dec_moe_parity PRIVATE model_qwen4exp_kernels artifact ${_gpu_runtime_target})
 basalt_gpu_test(NAME dec_moe_parity_nvfp4 COMMAND dec_moe_parity --nvfp4)   # synthetic experts: no GGUF needed
-basalt_gpu_test(NAME dec_moe_parity_kq COMMAND dec_moe_parity --kq)   # synthetic K-quant experts at the real geometry (Q5_K and Q6_K gate/up, Q8_0 down)
+basalt_gpu_test(NAME dec_moe_parity_kq COMMAND dec_moe_parity --kq)   # synthetic experts at the real geometry (K-quant gate/up with Q5_1 / Q8_0 down, i-quant gate/up with Q5_0 down)
 if(BUILD_TESTING)
   # native expert pairs on synthetic ggml-quantized weights at 2560/640: GPU and CPU experts against the float
   # reference, GPU dequantizers against to_float.
-  foreach(_pair q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q6_K/q8_0 q8_0/q8_0 q4_K/q5_0 q5_0/q8_0)
+  foreach(_pair q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q6_K/q8_0 q8_0/q8_0 q4_K/q5_0 q5_0/q8_0 q2_K/q8_0 q3_K/q8_0)
     string(REPLACE "/" "_" _name "${_pair}")
     basalt_gpu_test(NAME native_expert_parity_${_name} COMMAND native_expert_parity --synthetic ${_pair})
     set_tests_properties(native_expert_parity_${_name} PROPERTIES TIMEOUT 120)
   endforeach()
-  basalt_cpu_test(NAME native_expert_parity_cpu_q6_K_q8_0 COMMAND native_expert_parity --cpu-synthetic q6_K/q8_0)
+  foreach(_pair q6_K/q8_0 q2_K/q8_0 q3_K/q8_0)
+    string(REPLACE "/" "_" _name "${_pair}")
+    basalt_cpu_test(NAME native_expert_parity_cpu_${_name} COMMAND native_expert_parity --cpu-synthetic ${_pair})
+  endforeach()
   basalt_gpu_test(NAME native_expert_parity_q5_1_min COMMAND native_expert_parity --q5_1-min)
   # the AVX-512 Q8_K activation quantizer bit for bit against ggml's reference
   basalt_cpu_test(NAME native_expert_parity_q8k_quant COMMAND native_expert_parity --q8k-quant)
