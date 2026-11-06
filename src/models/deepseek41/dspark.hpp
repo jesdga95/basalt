@@ -21,6 +21,7 @@ constexpr int kDsparkBlock = 5;     ///< rows of a block: the anchor and four ma
 constexpr int kDsparkWindow = 128;  ///< positions before the block a stage attends
 
 struct DsparkDraft {
+    int n = 0;                     ///< the drafts the block made
     int32_t token[kDsparkBlock];   ///< token[i] proposes the position i + 1 after the anchor
     float conf[kDsparkBlock];      ///< the confidence head's estimate that token[i] is accepted
 };
@@ -50,8 +51,8 @@ public:
 
     /// Window latents of positions pos0.. from `n_rows` rows of target features (host, feature_floats() each).
     bool inject(int64_t pos0, int n_rows, const float* features, std::string& err);
-    /// Starts the block for the anchor token `anchor` at position `pos`.
-    bool draft_begin(int32_t anchor, int64_t pos, std::string& err);
+    /// Starts the block for the anchor token `anchor` at position `pos`; its first `n_out` rows become drafts.
+    bool draft_begin(int32_t anchor, int64_t pos, int n_out, std::string& err);
     /// Waits for the block.
     bool draft_end(DsparkDraft& out, std::string& err);
     /// Forgets the window rows at or above `pos`: another conversation's rows are not to be read.
