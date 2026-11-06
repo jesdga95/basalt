@@ -213,17 +213,74 @@ wo_a_grouped_kernel(const typename F::Block* __restrict__ w, const Q81Block* __r
     if (threadIdx.x == 0) y[(size_t) (tg / kAttnGroups) * (kAttnGroups * kAttnOutRank) + (size_t) g * kAttnOutRank + row] = tmp;
 }
 
+// grid (rows per group, groups); block (32, 4): one output row of one group for all NT tokens, each weight block read
+// once. A token's sums run in the one-token kernel's order, so its row is bitwise that kernel's.
+template <typename F, int NT>
+__global__ void __launch_bounds__(WARPS * WARP, 1)
+wo_a_grouped_tokens_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y) {
+    constexpr int kGroupIn = kAttnGroupIn;
+    constexpr int blocks_per_row = kGroupIn / QK;
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row = int(blockIdx.x);
+    const int g = int(blockIdx.y);
+    const typename F::Block* wg = w + (size_t) g * kAttnOutRank * blocks_per_row;
+    float tmp[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) tmp[t] = 0.0f;
+    for (int kbx = F::kbx0(tid); kbx < blocks_per_row; kbx += F::kBlocksPerIter) {
+        const typename F::Block* wb = wg + (size_t) row * blocks_per_row + kbx;
+#pragma unroll
+        for (int t = 0; t < NT; ++t)
+            tmp[t] += F::dot(wb, x + (size_t) (t * kAttnGroups + g) * (kGroupIn / 32) + kbx * (QK / 32), F::kqs(tid));
+    }
+    __shared__ float partial[WARPS - 1][NT][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int t = 0; t < NT; ++t) partial[threadIdx.y - 1][t][threadIdx.x] = tmp[t];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+#pragma unroll
+        for (int l = 0; l < WARPS - 1; ++l) tmp[t] += partial[l][t][threadIdx.x];
+        tmp[t] = warp_sum(tmp[t]);
+        if (threadIdx.x == 0) y[(size_t) t * (kAttnGroups * kAttnOutRank) + (size_t) g * kAttnOutRank + row] = tmp[t];
+    }
+}
+
+template <typename F>
+void launch_tokens(const void* wo_a, const void* xq, float* oa, int n_tokens, cudaStream_t s) {
+    const dim3 grid(kAttnOutRank, kAttnGroups), block(WARP, WARPS);
+    const auto* w = static_cast<const typename F::Block*>(wo_a);
+    const auto* x = static_cast<const Q81Block*>(xq);
+    switch (n_tokens) {
+        case 2: wo_a_grouped_tokens_kernel<F, 2><<<grid, block, 0, s>>>(w, x, oa); break;
+        case 3: wo_a_grouped_tokens_kernel<F, 3><<<grid, block, 0, s>>>(w, x, oa); break;
+        case 4: wo_a_grouped_tokens_kernel<F, 4><<<grid, block, 0, s>>>(w, x, oa); break;
+        case 5: wo_a_grouped_tokens_kernel<F, 5><<<grid, block, 0, s>>>(w, x, oa); break;
+        case 6: wo_a_grouped_tokens_kernel<F, 6><<<grid, block, 0, s>>>(w, x, oa); break;
+        case 7: wo_a_grouped_tokens_kernel<F, 7><<<grid, block, 0, s>>>(w, x, oa); break;
+        default: wo_a_grouped_tokens_kernel<F, 8><<<grid, block, 0, s>>>(w, x, oa); break;
+    }
+}
+
 }  // namespace
 
 bool wo_a_grouped(int type, const void* wo_a, const void* xq, float* oa, int n_tokens, void* stream) {
-    const dim3 grid(kAttnOutRank, (unsigned) (n_tokens * kAttnGroups)), block(WARP, WARPS);
     const auto s = static_cast<cudaStream_t>(stream);
-    if (type == 14) {
-        wo_a_grouped_kernel<Q6Fmt><<<grid, block, 0, s>>>(static_cast<const Q6KBlock*>(wo_a), static_cast<const Q81Block*>(xq), oa);
-    } else if (type == 13) {
-        wo_a_grouped_kernel<Q5Fmt><<<grid, block, 0, s>>>(static_cast<const Q5KBlock*>(wo_a), static_cast<const Q81Block*>(xq), oa);
+    if (type != 14 && type != 13) return false;
+    if (n_tokens < 1 || n_tokens > 8) throw std::invalid_argument("wo_a_grouped: tokens");
+    if (n_tokens > 1) {
+        if (type == 14) launch_tokens<Q6Fmt>(wo_a, xq, oa, n_tokens, s);
+        else launch_tokens<Q5Fmt>(wo_a, xq, oa, n_tokens, s);
     } else {
-        return false;
+        const dim3 grid(kAttnOutRank, kAttnGroups), block(WARP, WARPS);
+        if (type == 14) {
+            wo_a_grouped_kernel<Q6Fmt><<<grid, block, 0, s>>>(static_cast<const Q6KBlock*>(wo_a), static_cast<const Q81Block*>(xq), oa);
+        } else {
+            wo_a_grouped_kernel<Q5Fmt><<<grid, block, 0, s>>>(static_cast<const Q5KBlock*>(wo_a), static_cast<const Q81Block*>(xq), oa);
+        }
     }
     if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("wo_a_grouped: launch failed");
     return true;

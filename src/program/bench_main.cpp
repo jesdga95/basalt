@@ -270,7 +270,8 @@ void usage(const std::string& engine) {
         "community row\n"
         "  --community        the fixed preset \"community-1\" for the public benchmark table: the three decode\n"
         "                     fixtures, a 16384-token prefill and a 65536-token prefill, once each, with int8 KV cache\n"
-        "                     and the engine's own defaults otherwise (no warm-up, no repetition, drafting at its\n"
+        "                     where the model accepts --kv and its own KV format otherwise (the row records the model and the\n"
+        "                     KV format used), and the engine's own defaults otherwise (no warm-up, no repetition, drafting at its\n"
         "                     default). The decode fixtures and each prefill run in their own fresh engine process, so\n"
         "                     every number is cold. Prints the table, adds the row to benchmarks.json and prints it. prefill_16k_tps and\n"
         "                     prefill_64k_tps = engine tokens/s of those requests; the row also records the CPU, the RAM read speed and, per GPU, the\n"
@@ -730,13 +731,23 @@ int main(int argc, char** argv) {
         basalt::log::error("basalt-bench", "the engine binary %s does not exist (--engine BIN)", engine_bin.c_str());
         return 2;
     }
-    if (o.fixtures.empty()) {   // the model's own, when it has them
+    std::string community_model, community_arch;
+    bool community_kv_int8 = false;
+    if (o.fixtures.empty() || o.community) {   // the model's own fixtures, when it has them; the community row's model name
         std::string answer;
         const std::string plan_log = basalt::platform::temp_dir() + "/basalt-bench-plan-" + std::to_string((long long) basalt::platform::process_id());
-        if (!o.model.empty()) (void) engine_plan(engine_bin, {"--model", fs::absolute(o.model).string(), "--gpu", "0"}, plan_log, answer);
+        const std::string abs_model = fs::absolute(o.model).string();
+        const int asked = o.model.empty() ? 0 : engine_plan(engine_bin, {"--model", abs_model, "--gpu", "0"}, plan_log, answer);
+        if (o.community) {
+            community_model = asked == 0 ? basalt::program::plan_field(answer, "model") : std::string();
+            community_arch = basalt::program::plan_field(answer, "arch");
+            // the cache format users run, when the engine accepts the flag for this model
+            std::string unused;
+            community_kv_int8 = engine_plan(engine_bin, {"--model", abs_model, "--gpu", "0", "--kv", "int8"}, plan_log, unused) == 0;
+        }
         std::error_code rm_ec;
         fs::remove(plan_log, rm_ec);
-        o.fixtures = fixtures_for(BASALT_BENCH_FIXTURES, answer);
+        if (o.fixtures.empty()) o.fixtures = fixtures_for(BASALT_BENCH_FIXTURES, answer);
     }
     std::vector<std::string> quality_flags;
     if (do_quality && !o.model.empty()) {   // what the gate starts this model with, and the window it scores
@@ -803,12 +814,17 @@ int main(int argc, char** argv) {
             }
         set_arg(args, "--max-context", std::to_string(need));
     }
-    if (o.community) set_arg(args, "--kv", "int8");   // the cache format users run
+    if (community_kv_int8) set_arg(args, "--kv", "int8");
     if (o.print_command) {
         std::printf("%s --serve", engine_bin.c_str());
         for (const auto& a : args) std::printf(" %s", a.c_str());
         std::printf("\n");
         return 0;
+    }
+    if (o.community && community_model.empty()) {
+        basalt::log::error("basalt-bench", "--community: the engine reports no community model name for %s (architecture '%s'); "
+                           "no row was written", o.model.c_str(), community_arch.c_str());
+        return 1;
     }
 
     // scratch files
@@ -946,7 +962,9 @@ int main(int argc, char** argv) {
                 const auto& post = prefill_parts[2];
                 const size_t n_body = std::max<size_t>(1, (size_t) std::llround((double) body.size() * (double) depth / (double) kPrefillBase));
                 std::vector<int64_t> ids(pre);
-                std::uniform_int_distribution<int64_t> nonce(1000, 150000);
+                // a nonce below the vocabulary (the engine reports its size as logit_bias), so no prompt prefix repeats
+                const int64_t n_vocab = eng.info.count("logit_bias") ? std::atoll(eng.info["logit_bias"].c_str()) : 0;
+                std::uniform_int_distribution<int64_t> nonce(1000, n_vocab > 1000 ? std::min<int64_t>(150000, n_vocab - 1) : 150000);
                 for (int k = 0; k < 4; ++k) ids.push_back(nonce(rng));
                 ids.reserve(ids.size() + n_body + post.size());
                 for (size_t k = 0; k < n_body; ++k) ids.push_back(body[k % body.size()]);
@@ -1201,6 +1219,12 @@ int main(int argc, char** argv) {
         crow.date = day;
         crow.commit = BASALT_BENCH_GIT;
         crow.preset = "community-1";
+        crow.model = community_model;
+        if (!info.count("kv") || info["kv"].empty()) {
+            basalt::log::error("basalt-bench", "cannot write the community row: the engine did not report its KV cache format");
+            return 1;
+        }
+        crow.kv = info["kv"];
         crow.ram_gib = (double) ram_b / (double) (1ull << 30);
         crow.cpu = hw.cpu;
         crow.ram_gbps = hw.ram_gbps;

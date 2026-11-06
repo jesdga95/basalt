@@ -504,11 +504,13 @@ __global__ void __launch_bounds__(kTopkThreads) topk_kernel(const float* __restr
 }
 
 
-// ---- top-k of one token over many blocks ----------------------------------------------------------------------
+// ---- top-k of each token over many blocks ----------------------------------------------------------------------
 //
 // The same result as topk_kernel, which walks every row from one block. Each pass narrows the threshold by one byte of the
 // order key over all the blocks: a pass reads the previous pass's histogram, so every block picks the same prefix. A mask
-// then marks the rows above the threshold and those equal to it, and one block lists them in row order.
+// then marks the rows above the threshold and those equal to it, and one block lists them in row order. The grid's y is
+// the token: each token has its scores, its position, its state and its row bits, and its result does not depend on the
+// others.
 
 constexpr int kSelThreads = 256;     // rows per group
 constexpr int kSelBlocks = 128;      // the passes' grid; each block walks the groups beyond the grid
@@ -528,7 +530,13 @@ __device__ __forceinline__ int sel_rows(int n, const int32_t* pos, int ratio, in
     return block_size ? (rows + block_size - 1) / block_size : rows;
 }
 
-__global__ void select_begin_kernel(SelState* st) {
+// token blockIdx.y's state: the regions follow each other `stride` bytes apart
+__device__ __forceinline__ SelState* sel_state(SelState* st, size_t stride) {
+    return reinterpret_cast<SelState*>(reinterpret_cast<char*>(st) + stride * blockIdx.y);
+}
+
+__global__ void select_begin_kernel(SelState* st, size_t stride) {
+    st = sel_state(st, stride);
     for (int p = 0; p < 4; ++p) st->hist[p][threadIdx.x] = 0;
 }
 
@@ -552,10 +560,13 @@ __device__ __forceinline__ void sel_pick(SelState* st, int done, int K, uint32_t
 
 __global__ void __launch_bounds__(kSelThreads) select_pass_kernel(const float* __restrict__ s, int n, int K,
                                                                   const int32_t* __restrict__ pos, int ratio, int block_size,
-                                                                  int pass, SelState* st) {
+                                                                  int pass, SelState* st, size_t stride) {
     __shared__ uint32_t h[256], lh[256];
     __shared__ uint32_t s_prefix;
     __shared__ int s_need;
+    s += (size_t) n * blockIdx.y;
+    pos += blockIdx.y;
+    st = sel_state(st, stride);
     n = sel_rows(n, pos, ratio, block_size);
     if (blockIdx.x * kSelThreads >= n) return;
     if (threadIdx.x == 0) { s_prefix = 0; s_need = K; }
@@ -583,11 +594,17 @@ __global__ void __launch_bounds__(kSelThreads) select_pass_kernel(const float* _
 // Row bits per group: above the threshold in `gt`, equal to it in `eq`; `gc` counts both.
 __global__ void __launch_bounds__(kSelThreads) select_mask_kernel(const float* __restrict__ s, int n, int K,
                                                                   const int32_t* __restrict__ pos, int ratio, int block_size,
-                                                                  SelState* st, uint32_t* __restrict__ gt, uint32_t* __restrict__ eq,
-                                                                  uint32_t* __restrict__ gc) {
+                                                                  SelState* st, size_t stride) {
     __shared__ uint32_t lh[256], w_gt[8], w_eq[8];
     __shared__ uint32_t s_thr;
     __shared__ int s_need;
+    const size_t groups = (size_t) (n + kSelThreads - 1) / kSelThreads + 1;
+    s += (size_t) n * blockIdx.y;
+    pos += blockIdx.y;
+    st = sel_state(st, stride);
+    uint32_t* gt = reinterpret_cast<uint32_t*>(st + 1);
+    uint32_t* eq = gt + groups * 8;
+    uint32_t* gc = eq + groups * 8;
     n = sel_rows(n, pos, ratio, block_size);
     if (blockIdx.x * kSelThreads >= n) return;
     sel_pick(st, 3, K, lh, s_thr, s_need);
@@ -635,12 +652,18 @@ __global__ void __launch_bounds__(kSelThreads) select_mask_kernel(const float* _
 
 __global__ void __launch_bounds__(kTopkThreads) select_final_kernel(int n, int32_t* __restrict__ out, int out_ld,
                                                                     int32_t* __restrict__ out_n, const int32_t* __restrict__ pos,
-                                                                    int ratio, int block_size, const SelState* st,
-                                                                    const uint32_t* __restrict__ gt, const uint32_t* __restrict__ eq,
-                                                                    const uint32_t* __restrict__ gc) {
+                                                                    int ratio, int block_size, SelState* st, size_t stride) {
     __shared__ int list[kSelGroups], cgt[kSelGroups], ceq[kSelGroups], at[kSelGroups];
     __shared__ int wsum[32];
     __shared__ int s_cnt, s_total, s_left;
+    const size_t groups = (size_t) (n + kSelThreads - 1) / kSelThreads + 1;
+    out += (size_t) out_ld * blockIdx.y;
+    out_n += blockIdx.y;
+    pos += blockIdx.y;
+    st = sel_state(st, stride);
+    const uint32_t* gt = reinterpret_cast<const uint32_t*>(st + 1);
+    const uint32_t* eq = gt + groups * 8;
+    const uint32_t* gc = eq + groups * 8;
     n = sel_rows(n, pos, ratio, block_size);
     const int ng = (n + kSelThreads - 1) / kSelThreads;
     if (threadIdx.x == 0) { s_cnt = 0; s_total = 0; s_left = st->all ? 0 : st->need_eq; }
@@ -961,6 +984,8 @@ size_t sel_bytes(int max_rows) {
     const size_t groups = (size_t) (max_rows + kSelThreads - 1) / kSelThreads + 1;
     return sizeof(SelState) + groups * (16 + 2) * sizeof(uint32_t);
 }
+// one token's state region in a window's run of them
+size_t sel_stride(int max_rows) { return (sel_bytes(max_rows) + 255) / 256 * 256; }
 IdxWs carve(void* base, int max_comp) {
     IdxWs w;
     float* p = static_cast<float*>(base);
@@ -969,48 +994,56 @@ IdxWs carve(void* base, int max_comp) {
     w.scores = p;  p += (size_t) kMaxT * max_comp;
     w.bscore = p;  p += (size_t) kMaxT * max_comp;
     w.sel = reinterpret_cast<SelState*>(p);
-    w.blk_ok = reinterpret_cast<uint8_t*>(p) + sel_bytes(max_comp);
+    w.blk_ok = reinterpret_cast<uint8_t*>(p) + (size_t) kMaxT * sel_stride(max_comp);
     return w;
 }
 
-// The top-k of one token over many blocks; `cap` rows are the buffers' capacity, `pos` says how many it sees.
+// The top-k of each of `n_tok` tokens over many blocks: token t's scores at t * n, its position pos[t], its list at
+// out + t * out_ld, its state t * sel_stride(n) bytes after `st`. `n` rows are the buffers' capacity, the positions say
+// how many each token sees.
 void select_top(const float* scores, int n, int K, int32_t* out, int out_ld, int32_t* out_n, const int32_t* pos, int ratio,
-                int block_size, SelState* st, cudaStream_t s) {
-    uint32_t* gt = reinterpret_cast<uint32_t*>(st + 1);
-    const size_t groups = (size_t) (n + kSelThreads - 1) / kSelThreads + 1;
-    uint32_t* eq = gt + groups * 8;
-    uint32_t* gc = eq + groups * 8;
+                int block_size, SelState* st, int n_tok, cudaStream_t s) {
+    const size_t stride = sel_stride(n);
     const int grid = std::min((n + kSelThreads - 1) / kSelThreads, kSelBlocks);
-    select_begin_kernel<<<1, 256, 0, s>>>(st);
+    select_begin_kernel<<<dim3(1, n_tok), 256, 0, s>>>(st, stride);
     for (int pass = 0; pass < 4; ++pass)
-        select_pass_kernel<<<grid, kSelThreads, 0, s>>>(scores, n, K, pos, ratio, block_size, pass, st);
-    select_mask_kernel<<<grid, kSelThreads, 0, s>>>(scores, n, K, pos, ratio, block_size, st, gt, eq, gc);
-    select_final_kernel<<<1, kTopkThreads, 0, s>>>(n, out, out_ld, out_n, pos, ratio, block_size, st, gt, eq, gc);
+        select_pass_kernel<<<dim3(grid, n_tok), kSelThreads, 0, s>>>(scores, n, K, pos, ratio, block_size, pass, st, stride);
+    select_mask_kernel<<<dim3(grid, n_tok), kSelThreads, 0, s>>>(scores, n, K, pos, ratio, block_size, st, stride);
+    select_final_kernel<<<dim3(1, n_tok), kTopkThreads, 0, s>>>(n, out, out_ld, out_n, pos, ratio, block_size, st, stride);
 }
 }  // namespace
 
 size_t indexer_workspace_bytes(int max_comp) {
     return (size_t) kMaxT * (kIdxHeads * kIdxDim + kIdxHeads) * sizeof(float) +
-           (size_t) kMaxT * max_comp * (2 * sizeof(float) + 1) + sel_bytes(max_comp) + 256;
+           (size_t) kMaxT * max_comp * (2 * sizeof(float) + 1) + (size_t) kMaxT * sel_stride(max_comp) + 256;
 }
 
 void top_rows(const float* scores, int n, int K, int32_t* out, int out_ld, int32_t* out_n, const int32_t* pos, int ratio,
               int block_size, void* workspace, void* stream) {
     cudaStream_t s = as_stream(stream);
-    if (workspace) select_top(scores, n, K, out, out_ld, out_n, pos, ratio, block_size, static_cast<SelState*>(workspace), s);
+    if (workspace) select_top(scores, n, K, out, out_ld, out_n, pos, ratio, block_size, static_cast<SelState*>(workspace), 1, s);
     else topk_kernel<<<1, kTopkThreads, 0, s>>>(scores, n, K, out, out_ld, out_n, pos, ratio, block_size);
 }
 
 size_t top_rows_workspace_bytes(int max_rows) { return sel_bytes(max_rows); }
 
+void indexer_weights(const IndexerArgs& a, const float* x, int n_tokens, void* workspace, void* stream) {
+    if (n_tokens < 1 || n_tokens > kMaxT || a.n_comp < 1) throw std::invalid_argument("indexer_weights: bad args");
+    gemv_bf16(a.w_proj, x, n_tokens, a.n_embd, kIdxHeads, carve(workspace, a.n_comp).iw, stream);
+}
+
 void indexer_select(const IndexerArgs& a, const float* qr, const float* x, const int32_t* pos, int n_tokens,
                     void* workspace, void* stream) {
-    if (n_tokens < 1 || n_tokens > kMaxT || a.n_comp < 1) throw std::invalid_argument("indexer_select: bad args");
+    indexer_weights(a, x, n_tokens, workspace, stream);
+    indexer_rank(a, qr, pos, n_tokens, workspace, stream);
+}
+
+void indexer_rank(const IndexerArgs& a, const float* qr, const int32_t* pos, int n_tokens, void* workspace, void* stream) {
+    if (n_tokens < 1 || n_tokens > kMaxT || a.n_comp < 1) throw std::invalid_argument("indexer_rank: bad args");
     cudaStream_t s = as_stream(stream);
     const IdxWs w = carve(workspace, a.n_comp);
     gemv_bf16(a.w_q, qr, n_tokens, 1280, kIdxHeads * kIdxDim, w.iq, stream);
     idx_rope_kernel<<<n_tokens, 256, 0, s>>>(w.iq, pos, a.rope_freq);
-    gemv_bf16(a.w_proj, x, n_tokens, a.n_embd, kIdxHeads, w.iw, stream);
     const int n_blk = (a.n_comp + a.block_size - 1) / a.block_size;
     const float w_scale = 1.0f / sqrtf((float) (kIdxHeads * kIdxDim));
     if (a.mode == IndexMode::Level2) {
@@ -1025,20 +1058,11 @@ void indexer_select(const IndexerArgs& a, const float* qr, const float* x, const
     if (a.mode == IndexMode::Level1) {
         dim3 g((n_blk + 127) / 128, n_tokens);
         block_max_kernel<<<g, 128, 0, s>>>(w.scores, pos, a.n_comp, a.ratio, a.block_size, w.bscore);
-        if (n_tokens == 1) {
-            select_top(w.bscore, n_blk, std::min(a.cand_blocks, kMaxCandBlocks), a.cand_ids, kMaxCandBlocks, a.cand_n, pos,
-                       a.ratio, a.block_size, w.sel, s);
-        } else {
-            topk_kernel<<<n_tokens, kTopkThreads, 0, s>>>(w.bscore, n_blk, std::min(a.cand_blocks, kMaxCandBlocks), a.cand_ids,
-                                                          kMaxCandBlocks, a.cand_n, pos, a.ratio, a.block_size);
-        }
+        select_top(w.bscore, n_blk, std::min(a.cand_blocks, kMaxCandBlocks), a.cand_ids, kMaxCandBlocks, a.cand_n, pos, a.ratio,
+                   a.block_size, w.sel, n_tokens, s);
         check_launch("cand_blocks");
     }
-    if (n_tokens == 1) {
-        select_top(w.scores, a.n_comp, kTopK, a.out_ids, kTopK, a.out_n, pos, a.ratio, 0, w.sel, s);
-    } else {
-        topk_kernel<<<n_tokens, kTopkThreads, 0, s>>>(w.scores, a.n_comp, kTopK, a.out_ids, kTopK, a.out_n, pos, a.ratio, 0);
-    }
+    select_top(w.scores, a.n_comp, kTopK, a.out_ids, kTopK, a.out_n, pos, a.ratio, 0, w.sel, n_tokens, s);
     check_launch("idx_topk");
 }
 

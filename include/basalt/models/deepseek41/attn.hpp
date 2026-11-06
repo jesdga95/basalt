@@ -74,6 +74,10 @@ size_t q_path_scratch_bytes(int n_tokens);
 /// device array of the T absolute token positions.
 void q_path(const void* x_q8_1, const QPathWeights& w, int n_tokens, const int32_t* pos, const RopeTable& rope,
             void* xq_scratch, float* qr, float* q, void* stream);
+/// The two halves of q_path: the normed latent qr, then the heads q from it.
+void q_latent(const void* x_q8_1, const QPathWeights& w, int n_tokens, float* qr, void* stream);
+void q_heads(const QPathWeights& w, int n_tokens, const int32_t* pos, const RopeTable& rope, void* xq_scratch,
+             const float* qr, float* q, void* stream);
 
 // ---- sparse MQA -------------------------------------------------------------------------------------------------
 

@@ -228,6 +228,8 @@ public:
     virtual int planned_spec(const program::CommonOptions& o) const;
     /// The flags the quality gate starts this model with, space separated.
     virtual const char* quality_flags() const { return ""; }
+    /// The model's name as a community benchmark row records it; empty for a model that has none.
+    virtual const char* model_name() const { return ""; }
     /// The widest window the gate scores on this model; 0 takes what the request asks.
     virtual int quality_window() const { return 1; }
     /// The cards that may hold experts beside the main one.

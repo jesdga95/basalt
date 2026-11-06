@@ -79,6 +79,12 @@ int run(int type, int T, bool bench, dstest::Verdict& v) {
     const double rel = std::sqrt(se / sr);
     std::printf("  CPU reference rel RMS %.4f (q8_1 activation)\n", rel);
     v.expect(rel < 0.03, "CPU reference");
+    if (bench && T > 1) {
+        const double us_t = dstest::bench_stream_us([&](void* s) { wo_a_grouped(type, dw.p, xq.p, oa_new.p, T, s); });
+        char name[64];
+        std::snprintf(name, sizeof name, "wo_a grouped %s T=%d", type == 14 ? "q6_k" : "q5_k", T);
+        dstest::bench_line(name, us_t, (double) w.size());
+    }
     if (bench && T == 1) {
         const double us_new = dstest::bench_stream_us([&](void* s) { wo_a_grouped(type, dw.p, xq.p, oa_new.p, T, s); });
         const double us_old = dstest::bench_stream_us([&](void* s) {
@@ -99,7 +105,7 @@ int main() {
     dstest::check(cudaStreamCreate(&g_stream), "stream");
     dstest::Verdict v;
     for (int type : {14, 13})
-        for (int T : {1, 2, 4}) run(type, T, true, v);
+        for (int T : {1, 2, 3, 4, 8}) run(type, T, true, v);
     std::printf(v.failures ? "FAILED\n" : "PASS\n");
     return v.failures ? 1 : 0;
 }

@@ -37,6 +37,16 @@ struct ExpertPlan {
     int32_t tok[8];
 };
 
+// Joins a started CPU share on every way out of a layer's experts.
+struct CpuJoin {
+    ExpertTier* tier = nullptr;
+    ~CpuJoin() { now(); }
+    void now() {
+        if (tier) tier->finish_cpu();
+        tier = nullptr;
+    }
+};
+
 // A window's plan: the distinct experts of its rows, each with the rows it computes.
 struct WindowPlan {
     unsigned long long ptr[ExpertTier::kMaxK];
@@ -45,6 +55,7 @@ struct WindowPlan {
     int32_t dst[ExpertTier::kMaxK];
     int32_t tok[ExpertTier::kMaxK];
 };
+static_assert(sizeof(WindowPlan) <= 4 * kPutWords && sizeof(ExpertPlan) <= 4 * kPutWords, "a plan fits put_words");
 
 // Layer roles: the kv source whose compressed rows a layer reads, and the latest index source at or below it.
 int kv_source(int il) {
@@ -68,11 +79,27 @@ public:
     ~KernelOps() override {
         for (cudaGraphExec_t e : share_g_)
             if (e) cudaGraphExecDestroy(e);
+        for (cudaEvent_t e : br_ev_)
+            if (e) cudaEventDestroy(e);
+        for (cudaStream_t s : br_)
+            if (s) cudaStreamDestroy(s);
         for (void* p : allocs_) cudaFree(p);
     }
 
     bool init(std::string& err) {
         const int nl = g_.n_layers;
+        int least = 0, greatest = 0;   // the branches can hold the chain up (the compressor, the selection): the top priority
+        cudaDeviceGetStreamPriorityRange(&least, &greatest);
+        for (cudaStream_t& s : br_)
+            if (cudaStreamCreateWithPriority(&s, cudaStreamNonBlocking, greatest) != cudaSuccess) {
+                err = "deepseek41: cannot create the attention's streams";
+                return false;
+            }
+        for (cudaEvent_t& e : br_ev_)
+            if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) {
+                err = "deepseek41: cannot create the attention's events";
+                return false;
+            }
         ring_.assign((size_t) nl, nullptr);
         comp_kv_.assign((size_t) nl, nullptr);
         comp_ik_.assign((size_t) nl, nullptr);
@@ -262,6 +289,11 @@ public:
     void begin_token(int64_t, int n_tokens) override {
         if (tier_) tier_->begin_token(n_tokens);
     }
+    void end_window(bool all) override {
+        // the pieces that land while the window's output and the drafter's inputs are on their way
+        constexpr int kEndPieces = 8;
+        if (tier_) tier_->pump(all ? ExpertTier::kAllPieces : kEndPieces);
+    }
 
     bool attention_batch(int il, int64_t pos0, int n_tokens, const int32_t*, const float* x, float* out, int,
                          void* stream, std::string& err) override {
@@ -444,52 +476,68 @@ public:
 
         const int32_t *d_pos = dpos_ + il * kPosStride, *d_start = d_pos + kMaxT, *d_n = d_pos + 2 * kMaxT,
                       *d_lim = d_pos + 3 * kMaxT;
+        cudaStream_t ms = (cudaStream_t) stream;
+        const auto failed = [&](const char* what) {
+            err = std::string("deepseek41: ") + what + ": " + cudaGetErrorString(cudaGetLastError());
+            return false;
+        };
 
-        // window latent
+        // window latent, beside the query path
         kernels::native_quantize_q8_1(x, xq_, kAttnEmbd, T, stream);
-        kernels::native_mmvq(wkv->type, wkv->ptr, xq_, kvraw_, kAttnEmbd, kLatent, T, stream);
-        kv_window(kvraw_, (const float*) kvn->ptr, d_pos, T, g_.rms_eps, freq_[kind], nullptr, ring_[il], stream);
+        if (!after(ms, br_[0], br_ev_[0])) return failed("attention branch");
+        kernels::native_mmvq(wkv->type, wkv->ptr, xq_, kvraw_, kAttnEmbd, kLatent, T, br_[0]);
+        kv_window(kvraw_, (const float*) kvn->ptr, d_pos, T, g_.rms_eps, freq_[kind], nullptr, ring_[il], br_[0]);
 
-        // query path (also yields the indexer's input)
-        QPathWeights qw{qa->ptr, qa->type, (const float*) qan->ptr, qb->ptr, qb->type, g_.rms_eps};
-        q_path(xq_, qw, T, d_pos, rope_[kind], xq2_, qr_, q_, stream);
-
-        int sel = 0;
-        if (ratio) {
-            const int ks = kv_source(il);
-            if (ks == il) {
-                if (!W("attn_compressor_kv.weight") || !W("attn_compressor_norm.weight") ||
-                    (ratio == 2 && !W("attn_compressor_gate.weight"))) {
-                    err = "deepseek41: layer " + std::to_string(il) + " lacks compressor tensors";
-                    return false;
-                }
-                const CompressArgs ca = compress_args(il);
-                if (T > 1) compress_window(ca, x, d_pos, T, cws_l_[il], stream);
-                else compress(ca, x, d_pos, 1, cws_, stream);
-            }
-            if (index_source(il) == il) {
-                const DevTensor *iqb = W("indexer.attn_q_b.weight"), *ipj = W("indexer.proj.weight");
-                if (!iqb || !ipj) {
-                    err = "deepseek41: layer " + std::to_string(il) + " lacks indexer tensors";
-                    return false;
-                }
-                IndexerArgs ia;
-                ia.mode = index_mode(il);
-                ia.ratio = ratio;
-                ia.n_embd = kAttnEmbd;
-                ia.n_comp = ctx_ / ratio + 1;   // the buffers' row capacity; only the visible rows are scored
-                ia.w_q = (const uint16_t*) iqb->ptr;
-                ia.w_proj = (const uint16_t*) ipj->ptr;
-                ia.rope_freq = freq_[1];
-                ia.comp_ik = comp_ik_[ks];
-                ia.cand_ids = cand_;
-                ia.cand_n = cand_n_;
-                ia.out_ids = ids_;
-                ia.out_n = idn_;
-                indexer_select(ia, qr_, x, d_pos, T, iws_, stream);
-            }
-            sel = kTopK;
+        // the compressor and the indexer's head weights read only x: beside the query path as well
+        const int ks = ratio ? kv_source(il) : -1;
+        const bool compressing = ratio && ks == il, indexing = ratio && index_source(il) == il;
+        IndexerArgs ia;
+        if (compressing || indexing) {
+            if (!after(ms, br_[1], br_ev_[1])) return failed("attention branch");
         }
+        if (compressing) {
+            if (!W("attn_compressor_kv.weight") || !W("attn_compressor_norm.weight") ||
+                (ratio == 2 && !W("attn_compressor_gate.weight"))) {
+                err = "deepseek41: layer " + std::to_string(il) + " lacks compressor tensors";
+                return false;
+            }
+            const CompressArgs ca = compress_args(il);
+            if (T > 1) compress_window(ca, x, d_pos, T, cws_l_[il], br_[1]);
+            else compress(ca, x, d_pos, 1, cws_, br_[1]);
+        }
+        if (indexing) {
+            const DevTensor *iqb = W("indexer.attn_q_b.weight"), *ipj = W("indexer.proj.weight");
+            if (!iqb || !ipj) {
+                err = "deepseek41: layer " + std::to_string(il) + " lacks indexer tensors";
+                return false;
+            }
+            ia.mode = index_mode(il);
+            ia.ratio = ratio;
+            ia.n_embd = kAttnEmbd;
+            ia.n_comp = ctx_ / ratio + 1;   // the buffers' row capacity; only the visible rows are scored
+            ia.w_q = (const uint16_t*) iqb->ptr;
+            ia.w_proj = (const uint16_t*) ipj->ptr;
+            ia.rope_freq = freq_[1];
+            ia.comp_ik = comp_ik_[ks];
+            ia.cand_ids = cand_;
+            ia.cand_n = cand_n_;
+            ia.out_ids = ids_;
+            ia.out_n = idn_;
+            indexer_weights(ia, x, T, iws_, br_[1]);
+        }
+
+        // query path; its latent is also the indexer's input
+        QPathWeights qw{qa->ptr, qa->type, (const float*) qan->ptr, qb->ptr, qb->type, g_.rms_eps};
+        q_latent(xq_, qw, T, qr_, stream);
+        if (indexing) {
+            // the selection waits for the latent, the head weights and the layer's index keys
+            if (!after(ms, br_[0], br_ev_[2]) || !after(br_[1], br_[0], br_ev_[3])) return failed("attention branch");
+            indexer_rank(ia, qr_, d_pos, T, iws_, br_[0]);
+        }
+        q_heads(qw, T, d_pos, rope_[kind], xq2_, qr_, q_, stream);
+        if (!after(br_[0], ms, br_ev_[4]) || ((compressing || indexing) && !after(br_[1], ms, br_ev_[5])))
+            return failed("attention branch");
+        const int sel = ratio ? kTopK : 0;
 
         MqaArgs a;
         a.n_tokens = T;
@@ -529,14 +577,13 @@ public:
             !alloc((void**) &ex_rows_, (size_t) kRows * g_.n_embd * 4) ||
             !alloc((void**) &ex_plan_, kPlanBytes) || !alloc((void**) &ex_plan2_, kPlanBytes))
             return oom(err);
-        // the plan and the CPU's rows are mapped host memory read by kernels: no copy-engine job queues behind the
-        // promotion copies, and the host sync at the top of each layer orders their reuse
+        // the hits plan of a token and the CPU's rows are mapped host memory read by kernels (a captured launch reads
+        // the plan at replay): no copy-engine job queues behind the promotion copies, and the host sync at the top of
+        // each layer orders their reuse; the other plans travel in a kernel's parameters
         constexpr unsigned kMapped = cudaHostAllocPortable | cudaHostAllocMapped;
-        if (cudaHostAlloc((void**) &h_plan_, kPlanBytes, kMapped) != cudaSuccess ||
-            cudaHostAlloc((void**) &h_plan2_, kPlanBytes, kMapped) != cudaSuccess ||
+        if (cudaHostAlloc((void**) &h_plan_, sizeof(ExpertPlan), kMapped) != cudaSuccess ||
             cudaHostAlloc((void**) &h_ids_, 64 * 4, kMapped) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d_plan_host_, h_plan_, 0) != cudaSuccess ||
-            cudaHostGetDevicePointer((void**) &d_plan2_host_, h_plan2_, 0) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d_ids_host_, h_ids_, 0) != cudaSuccess) {
             err = "deepseek41: cannot allocate the pinned expert staging";
             return false;
@@ -578,19 +625,21 @@ public:
 
     ExpertTier* expert_tier(std::string& err) override { return ensure_tier(err) ? tier_.get() : nullptr; }
 
-    // Kernels write the mapped ids and activation: no copy-engine job queues behind the copies of experts.
-    void routed_stage(int, const float* x, const int32_t* ids, void* stream) override {
-        copy_row(x, d_x_host_, g_.n_embd, stream);
-        kernels::quantize_q8_1_rows(x, 1, g_.n_embd, ex_xq_, stream);
-        copy_words(ids, d_ids_host_, g_.n_used, stream);   // last: the host goes on once all of them landed
+    // Kernels write the mapped activation and ids: no copy-engine job queues behind the copies of experts.
+    void stage_rows(int T, const float* x, void* stream) override {
+        copy_rows(x, d_x_host_, T * g_.n_embd, stream);
+        kernels::quantize_q8_1_rows(x, T, g_.n_embd, ex_xq_, stream);
     }
 
-
+    void stage_ids(int T, const int32_t* ids, void* stream) override {
+        copy_words(ids, d_ids_host_, T * g_.n_used, stream);   // after the rows: the host goes on once all of them landed
+    }
 
     bool routed_experts(int il, const float* x, const int32_t* ids, const float* w, float* out, void* stream,
                         std::string& err) override {
         if (!ensure_tier(err)) return false;
-        routed_stage(il, x, ids, stream);
+        stage_rows(1, x, stream);
+        stage_ids(1, ids, stream);
         return routed_experts_staged(il, x, ids, w, out, stream, err);
     }
 
@@ -602,12 +651,6 @@ public:
     bool routed_and_shared_staged(int il, const float*, const int32_t*, const float* w, float* out, float* shared_out,
                                   void* stream, std::string& err) override {
         return routed_run(il, w, out, shared_out, stream, err);
-    }
-
-    void routed_stage_window(int T, const float* x, const int32_t* ids, void* stream) override {
-        for (int t = 0; t < T; ++t) copy_row(x + (size_t) t * g_.n_embd, d_x_host_ + (size_t) t * g_.n_embd, g_.n_embd, stream);
-        kernels::quantize_q8_1_rows(x, T, g_.n_embd, ex_xq_, stream);
-        copy_words(ids, d_ids_host_, T * g_.n_used, stream);   // last: the host goes on once all of them landed
     }
 
     // The routed experts of a window. The tier is asked once per distinct expert of the window; each card runs what it holds
@@ -623,6 +666,7 @@ public:
             return false;
         }
         cudaStream_t st = (cudaStream_t) stream;
+        tier_->pump(2 + T);   // what this layer's head leaves the bus of the promotions queued before it
         await_ids(st, T * K);
         int32_t uniq[ExpertTier::kMaxK];
         int nu = 0;
@@ -646,6 +690,14 @@ public:
         ExpertTier::Lookup lk;
         if (!tier_->lookup(il, uniq, nu, lk, err)) return false;
         const int n_fetched = tier_->fetch(il, lk);
+        // the CPU's share starts first: it takes longest, and the pool's workers run it while the cards' shares launch
+        bool cpu = false;
+        for (int i = 0; i < nu; ++i) cpu = cpu || (!lk.dev[i] && !lk.peer[i]);
+        CpuJoin join;
+        if (cpu) {
+            tier_->start_cpu_window(il, h_x_, lk, use, h_rows_);
+            join.tier = tier_.get();
+        }
 
         // the second card's share first: its rows are the last of the two cards' to land
         core::PeerExperts* peer = tier_->peer();
@@ -676,23 +728,24 @@ public:
             entries = ne;
             return ng;
         };
-        const auto gpu_share = [&](const void* host_plan, void* dev_plan, int ng, int ne) {
-            copy_words(host_plan, dev_plan, (int) (sizeof(WindowPlan) / 4), stream);
+        const auto gpu_share = [&](const WindowPlan& pl, void* dev_plan, int ng, int ne) {
+            put_words(&pl, dev_plan, (int) (sizeof(WindowPlan) / 4), stream);
             WindowPlan* dp = (WindowPlan*) dev_plan;
             kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok, ng, ne,
                                                    ex_xq_, ex_scr_, ex_rows_, stream);
         };
+        WindowPlan plan;
         int entries = 0;
-        const int nhits = make_plan(*(WindowPlan*) h_plan_, false, entries);
-        if (nhits) gpu_share(d_plan_host_, ex_plan_, nhits, entries);
+        const int nhits = make_plan(plan, false, entries);
+        if (nhits) gpu_share(plan, ex_plan_, nhits, entries);
         if (n_fetched) {
-            const int ng = make_plan(*(WindowPlan*) h_plan2_, true, entries);
+            const int ng = make_plan(plan, true, entries);
             tier_->await_fetch(st);
-            gpu_share(d_plan2_host_, ex_plan2_, ng, entries);
+            gpu_share(plan, ex_plan2_, ng, entries);
         }
-        // the CPU's share runs while the GPU works; its rows land in their rows
-        if (nhits + n_fetched < nu) {
-            if (!tier_->run_cpu_window(il, h_x_, lk, use, h_rows_, err)) return false;
+        // the CPU's share ran while the GPU works; its rows land in their rows
+        if (cpu) {
+            join.now();
             tier_->promote(il, lk);
         }
         if (peer && !peer->finish(nullptr, err)) return false;
@@ -700,13 +753,14 @@ public:
         for (int r = 0; r < T * K; ++r)
             rp.p[r] = lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * n : d_rows_ + (size_t) r * n;
         weighted_sum_window(rp, w, T, K, n, out, stream, shared_out);
+        tier_->mark_gap(st);   // the promotions' copies start behind the sum
         for (int r = 0; r < T * K; ++r) h_ids_[r] = -1;
         ids_read_ = false;
         return true;
     }
 
-    // Every id of the layer landed in the mapped ids (routed_stage writes them last); the stream goes on meanwhile. A launch
-    // that failed never writes them.
+    // Every id of the layer landed in the mapped ids (stage_ids writes them after the rows); the stream goes on meanwhile.
+    // A launch that failed never writes them.
     void await_ids(cudaStream_t st, int n_ids) {
         if (ids_read_) {   // a layer that failed left its ids behind
             cudaStreamSynchronize(st);
@@ -739,11 +793,20 @@ public:
             return false;
         }
         cudaStream_t st = (cudaStream_t) stream;
+        tier_->pump(3);
         if (shared_out) await_ids(st, K);
         else cudaStreamSynchronize(st);
         ExpertTier::Lookup lk;
         if (!tier_->lookup(il, h_ids_, K, lk, err)) return false;
         const int n_fetched = tier_->fetch(il, lk);
+        // the CPU's share starts first: it takes longest, and the pool's workers run it while the cards' shares launch
+        bool cpu = false;
+        for (int k = 0; k < K; ++k) cpu = cpu || (!lk.dev[k] && !lk.peer[k]);
+        CpuJoin join;
+        if (cpu) {
+            tier_->start_cpu(il, h_x_, lk, h_rows_);
+            join.tier = tier_.get();
+        }
 
         // the second card's share first: its rows are the last of the two cards' to land
         core::PeerExperts* peer = tier_->peer();
@@ -772,7 +835,6 @@ public:
             return m;
         };
         const int nhits = make_plan(*h_plan_, false);
-        const int nh = nhits + n_fetched;
         const auto gpu_share = [&] {
             copy_words(d_plan_host_, ex_plan_, (int) (sizeof(ExpertPlan) / 4), stream);
             ExpertPlan* dp = (ExpertPlan*) ex_plan_;
@@ -804,16 +866,17 @@ public:
             gpu_share();
         }
         if (n_fetched) {
-            make_plan(*h_plan2_, true);
+            ExpertPlan plan2;
+            make_plan(plan2, true);
             tier_->await_fetch(st);
-            copy_words(d_plan2_host_, ex_plan2_, (int) (sizeof(ExpertPlan) / 4), stream);
+            put_words(&plan2, ex_plan2_, (int) (sizeof(ExpertPlan) / 4), stream);
             ExpertPlan* dp = (ExpertPlan*) ex_plan2_;
             kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok, n_fetched,
                                                    n_fetched, ex_xq_, ex_scr_, ex_rows_, stream);
         }
-        // the CPU's share runs while the GPU works; its rows land in the router index's row
-        if (nh < K) {
-            if (!tier_->run_cpu(il, h_x_, lk, h_rows_, err)) return false;
+        // the CPU's share ran while the GPU works; its rows land in the router index's row
+        if (cpu) {
+            join.now();
             tier_->promote(il, lk);
         }
         if (peer && !peer->finish(nullptr, err)) return false;
@@ -821,6 +884,7 @@ public:
         for (int k = 0; k < K; ++k)
             rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * g_.n_embd : d_rows_ + (size_t) k * g_.n_embd;
         weighted_sum_row_ptrs(rp, w, K, g_.n_embd, out, stream, shared_out);
+        tier_->mark_gap(st);
         for (int k = 0; k < K; ++k) h_ids_[k] = -1;
         ids_read_ = false;
         return true;
@@ -846,6 +910,10 @@ public:
     }
 
 private:
+    /// What `to` queues from now on runs after what `from` has queued so far (a branch's fork or join).
+    static bool after(cudaStream_t from, cudaStream_t to, cudaEvent_t ev) {
+        return cudaEventRecord(ev, from) == cudaSuccess && cudaStreamWaitEvent(to, ev, 0) == cudaSuccess;
+    }
     bool alloc(void** p, size_t bytes) {
         void* v = nullptr;
         if (cudaMalloc(&v, bytes) != cudaSuccess) return false;
@@ -870,12 +938,15 @@ private:
     std::vector<float*> st_kv_, st_sc_;
     float* freq_[2] = {nullptr, nullptr};
     RopeTable rope_[2];
+    // the attention's branches beside the query path: the window latent then the selection; the compressor and the
+    // indexer's head weights
+    cudaStream_t br_[2] = {nullptr, nullptr};
+    cudaEvent_t br_ev_[6] = {};
     void *xq_ = nullptr, *xq2_ = nullptr, *cws_ = nullptr, *iws_ = nullptr;
     float *kvraw_ = nullptr, *qr_ = nullptr, *q_ = nullptr, *attn_ = nullptr, *oa_ = nullptr, *mws_ = nullptr;
     void *ex_plan_ = nullptr, *d_plan_host_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr;
-    void *ex_plan2_ = nullptr, *d_plan2_host_ = nullptr;
+    void* ex_plan2_ = nullptr;
     bool ids_read_ = false;   ///< this layer took the mapped ids and has not cleared them yet
-    ExpertPlan* h_plan2_ = nullptr;
     float* ex_rows_ = nullptr;
     ExpertPlan* h_plan_ = nullptr;
     float *h_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr, *d_x_host_ = nullptr;

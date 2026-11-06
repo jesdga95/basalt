@@ -81,9 +81,12 @@ last chunk's later layers itself.
   routed-only; with matched cards, a chunk under 4,096 tokens; a prompt that arrives while other slots decode.
 - **Three or more cards:** it runs when they all match (memory bandwidth and VRAM within 10%). On unlike cards it is off, and the
   start line prints what it would cost.
-- **Off with** `--peer-exclusive`, without the RAM copy of the experts, with a control vector, with experts other than NVFP4 (the
-  price is fitted to those), when RAM or a tier's slots are short, or when a tier card keeps under 256 MiB free beside its stage
-  (`peer-reserve-mib` sets the room).
+- **Every expert format** is priced from the pack's own expert bytes per layer. A tier card whose lent slots cannot hold the main
+  card's chunk (the prompt buffers of the GGUF expert formats are larger than NVFP4's) reads shorter chunks, and the start prints
+  `prompt split: chunks of at most N tokens fit the tier cards' slots`.
+- **Off with** `--peer-exclusive`, without the RAM copy of the experts, with a control vector, when RAM or a tier's slots are short,
+  when the context is too short for a split to pay (the start line says so), or when a tier card keeps under 256 MiB free beside
+  its stage (`peer-reserve-mib` sets the room).
 - **A shorter request** that arrives during a read gets its turn at the end of the main card's current chunk.
 
 ## Two 16 GB cards
