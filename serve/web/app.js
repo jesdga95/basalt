@@ -220,7 +220,7 @@ $("#chips").addEventListener("click", e => {
   draw();
 });
 
-/* ---- main card: Slots | Requests | Queue ---- */
+/* ---- main card: Slots (Context for one slot) | Requests | Queue ---- */
 let tab = sessionStorage.getItem("basalt.tab") || "slots";
 $("#tabs").addEventListener("click", e => {
   const b = e.target.closest("button[data-t]"); if (!b) return;
@@ -278,16 +278,47 @@ function queuePane(live) {
     + q.map(r => `<tr><td>${esc(API[r.api] || r.api || "-")}</td><td class="r">${num(r.prompt_tokens) ? fmt(r.prompt_tokens) : "-"}</td><td class="r">${mss(r.waited_s || 0)}</td></tr>`).join("")
     + `</tbody></table>`;
 }
+/* ---- Context: one slot's window, used against free, and the tokens of each recent request ---- */
+const kc = n => n >= 1048576 ? `${n / 1048576 >= 10 ? Math.round(n / 1048576) : +(n / 1048576).toFixed(1)}M` : kt(n).replace("k", "K");
+const pctOf = (a, b) => b ? Math.round(a / b * 100) : 0;
+// stacked columns, one per recent request, oldest first: prompt read (the uncached part) / generated, scaled to the largest
+function ctxHistory(reqs) {
+  const h = reqs.slice(0, 24).reverse().map(r => { return { p: (r.prompt_tokens || 0) - clamp(r.reused || 0, 0, r.prompt_tokens || 0), g: r.output_tokens || 0 }; });
+  if (!h.length) return "";
+  const W = 480, H = 100, step = W / h.length, bw = step * .68;
+  const top = nice(Math.max(1, ...h.map(r => r.p + r.g)) / 1.15);
+  let g = "";
+  h.forEach((r, i) => {
+    let y = H; const x = i * step + (step - bw) / 2;
+    [["p", "rgba(154, 164, 173, .5)"], ["g", "var(--accent)"]].forEach(([k, col]) => {
+      const hh = r[k] / top * H; y -= hh;
+      g += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${hh.toFixed(1)}" fill="${col}"/>`;
+    });
+  });
+  return `<div class="cx-hist"><div class="hh"><b>Tokens per request</b><span>Last ${h.length} requests</span></div><div class="cx-chart">`
+    + `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Tokens per request">`
+    + `<line x1="0" x2="${W}" y1="${H}" y2="${H}" stroke="var(--line)"/><line x1="0" x2="${W}" y1="${H / 2}" y2="${H / 2}" stroke="var(--line-soft)" stroke-dasharray="2 4"/>${g}</svg>`
+    + `<span class="tk" style="top:0">${kc(top)}</span><span class="tk" style="top:50%">${kc(top / 2)}</span><span class="tk" style="top:100%">0</span>`
+    + `<div class="xl"><span>Oldest</span><span>Latest</span></div></div></div>`;
+}
+function contextPane(s, reqs, eng) {
+  const n = s.n_ctx || eng.context || 0, used = s.ctx_used || 0;
+  return `<div class="cx1"><div class="cx-head"><div class="v">${kc(used)}<small>/ ${kc(n)} · ${pctOf(used, n)}%</small></div></div>`
+    + `<div class="cx-bar"><i style="width:${n ? clamp(used / n * 100, 0, 100).toFixed(2) : 0}%"></i></div>`
+    + `<div class="cx-scale"><span>0</span><span>${kc(n / 2)}</span><span>${kc(n)}</span></div>`
+    + ctxHistory(reqs) + `</div>`;
+}
 function drawMain(live, hist, reqs, slots, total) {
   const multi = total > 1, n = live.queued || 0;
-  const T = (multi ? [["slots", "Slots"]] : []).concat([["req", "Requests"], ["queue", `Queue (${n})`]]);
+  const T = (multi ? [["slots", "Slots"]] : reqs.length || (slots[0] && slots[0].ctx_used > 0) ? [["ctx", "Context"]] : []).concat([["req", "Requests"], ["queue", `Queue (${n})`]]);
   const cur = T.some(t => t[0] === tab) ? tab : T[0][0];
   html($("#tabs"), T.map(t => `<button type="button" role="tab" data-t="${t[0]}" aria-selected="${t[0] === cur}">${t[1]}</button>`).join(""));
   let h;
   if (cur === "slots") {
     const series = slots.map((_, k) => tail((hist.slot_tok_s || [])[k]));
     h = slotRows(slots, series);
-  } else h = cur === "req" ? requestsPane(live, reqs, multi) : queuePane(live);
+  } else if (cur === "ctx") h = contextPane(slots[0] || {}, reqs, M.engine || {});
+  else h = cur === "req" ? requestsPane(live, reqs, multi) : queuePane(live);
   html($("#pane"), h);
 }
 

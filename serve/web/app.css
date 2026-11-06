@@ -236,6 +236,20 @@ tr.live td { color: var(--accent); }
 .logs .err { color: var(--err); }
 .logs .empty { padding: 0; text-indent: 0; }
 
+/* Context (one slot): what the window holds, and per recent request */
+.cx1 { padding: 20px; display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.cx-head .v { font-size: 44px; }
+.cx-head .v small { font-size: .38em; }
+.cx-bar { display: flex; gap: 2px; margin-top: 14px; height: 8px; border-radius: 4px; overflow: hidden; background: var(--raised); }
+.cx-bar i { display: block; height: 100%; background: var(--fg-2); }
+.cx-scale { display: flex; justify-content: space-between; margin-top: 8px; font: 11.5px/1 var(--font-mono); color: var(--fg-3); }
+.cx-hist { flex: 1 1 0; min-height: 110px; margin-top: 22px; border-top: 1px solid var(--line-soft); padding-top: 16px; display: flex; flex-direction: column; }
+.cx-hist .hh { display: flex; justify-content: space-between; font-size: 13px; color: var(--fg-3); }
+.cx-hist .hh b { color: var(--fg); font-weight: 600; font-size: 14px; }
+.cx-chart { position: relative; flex: 1; margin-top: 12px; margin-bottom: 18px; min-height: 70px; }
+.cx-chart svg { position: absolute; left: 0; top: 0; width: calc(100% - 40px); height: 100%; overflow: visible; }
+.cx-chart .xl { position: absolute; left: 0; bottom: -18px; width: calc(100% - 40px); display: flex; justify-content: space-between; font: 10px/1 var(--font-mono); color: var(--fg-3); }
+
 /* Desktop: one screen, nothing scrolls but the panes */
 @media (min-width: 901px) {
   html, body { height: 100%; overflow: hidden; }
