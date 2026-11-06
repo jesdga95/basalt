@@ -116,6 +116,10 @@ struct IndexerArgs {
 /// Reuse layers do nothing: they read the ids of the latest index-source layer.
 void indexer_select(const IndexerArgs& a, const float* qr, const float* x, const int32_t* pos, int n_tokens,
                     void* workspace, void* stream);
+/// The two parts of indexer_select on the same workspace: the head weights iw from x, then the scores and the
+/// selection from qr and iw.
+void indexer_weights(const IndexerArgs& a, const float* x, int n_tokens, void* workspace, void* stream);
+void indexer_rank(const IndexerArgs& a, const float* qr, const int32_t* pos, int n_tokens, void* workspace, void* stream);
 
 /// The K highest finite scores of one token (ties to the lower row), row ids ascending, `out` padded with -1 to out_ld.
 /// `n` rows are the buffer's capacity and pos[0] says how many are visible, as for the indexer. With `workspace`
