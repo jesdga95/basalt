@@ -52,10 +52,14 @@ ExpertTier::~ExpertTier() {
         std::string e;
         peer_->read_wait(e);
     }
-    if (copy_stream_) cudaStreamSynchronize(copy_stream_);
+    if (copy_stream_) {
+        flush_queue();
+        cudaStreamSynchronize(copy_stream_);
+    }
     if (fetch_stream_) cudaStreamSynchronize(fetch_stream_);
     for (cudaEvent_t e : events_) cudaEventDestroy(e);
     if (fetch_ev_) cudaEventDestroy(fetch_ev_);
+    if (gap_ev_) cudaEventDestroy(gap_ev_);
     if (copy_stream_) cudaStreamDestroy(copy_stream_);
     if (fetch_stream_) cudaStreamDestroy(fetch_stream_);
     for (size_t l = 0; l < ram_.size(); ++l) {
@@ -139,6 +143,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     int lo_prio = 0, hi_prio = 0;
     cudaDeviceGetStreamPriorityRange(&lo_prio, &hi_prio);
     if (cudaEventCreateWithFlags(&fetch_ev_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&gap_ev_, cudaEventDisableTiming) != cudaSuccess ||
         cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithPriority(&fetch_stream_, cudaStreamNonBlocking, hi_prio) != cudaSuccess) {
         err = "deepseek41: cannot create the promotion stream";
@@ -269,6 +274,7 @@ bool ExpertTier::load_ram(std::string& err) {
     ram_.assign((size_t) n_layers_, nullptr);
     ram_idx_.assign((size_t) n_layers_ * n_expert_, -1);
     spare_.assign((size_t) n_layers_, -1);
+    swapping_.assign((size_t) n_layers_, 0);
     spare_since_.assign((size_t) n_layers_, 0);
     last_miss_.assign((size_t) n_layers_ * n_expert_, 0);
     const int64_t copies = homes_.main > 0 ? 0 : per_layer_;
@@ -475,6 +481,7 @@ void ExpertTier::drain() {
 }
 
 void ExpertTier::settle() {
+    flush_queue();
     cudaStreamSynchronize(copy_stream_);
     cudaStreamSynchronize(fetch_stream_);
     drain();
@@ -482,6 +489,7 @@ void ExpertTier::settle() {
 
 void ExpertTier::begin_token(int n_tokens) {
     token_ += (uint64_t) n_tokens;
+    flush_queue();
     drain();
     finish_swaps();
     start_swaps();
@@ -496,7 +504,7 @@ void ExpertTier::swap_worker() {
         const Swap sw = jobs_[next];
         lk.unlock();
         const ExpertLayer& el = m_.pack().experts[(size_t) sw.layer];
-        uint8_t* dst = ram_[(size_t) sw.layer] + (size_t) spare_[(size_t) sw.layer] * el.blob_bytes;
+        uint8_t* dst = ram_[(size_t) sw.layer] + (size_t) sw.place * el.blob_bytes;
         const bool ok = platform::pread_all(m_.experts_fd(), dst, el.blob_bytes,
                                             m_.pack().experts_range.offset + el.offset + (uint64_t) sw.expert * el.blob_bytes);
         lk.lock();
@@ -529,10 +537,11 @@ void ExpertTier::finish_swaps() {
         for (size_t i = 0; i < flight_.size(); ++i) flight_[i].expert = jobs_[jobs_.size() - flight_.size() + i].expert;
     }
     for (const Swap& sw : flight_) {
+        swapping_[(size_t) sw.layer] = 0;
         if (sw.expert < 0) continue;
         const size_t base = (size_t) sw.layer * n_expert_;
         const int32_t v = ram_idx_[base + sw.victim];
-        ram_idx_[base + sw.expert] = spare_[(size_t) sw.layer];
+        ram_idx_[base + sw.expert] = sw.place;
         ram_idx_[base + sw.victim] = -1;
         spare_[(size_t) sw.layer] = v;
         spare_since_[(size_t) sw.layer] = token_;
@@ -557,7 +566,7 @@ void ExpertTier::start_swaps() {
         const int v = policy::pick_victim(&ram_idx_[(size_t) l * n_expert_], &stamp_[(size_t) l * n_expert_], n_expert_, nullptr, 0);
         // a victim used in the last 16 tokens stays
         if (v < 0 || stamp_[(size_t) l * n_expert_ + v] + 16ull * (uint64_t) n_layers_ >= tick_) continue;
-        batch.push_back({l, e, v});
+        batch.push_back({l, e, v, spare_[(size_t) l]});
     }
     want_.clear();
     if (batch.empty()) return;
@@ -566,6 +575,7 @@ void ExpertTier::start_swaps() {
         jobs_.insert(jobs_.end(), batch.begin(), batch.end());
     }
     cv_.notify_all();
+    for (const Swap& sw : batch) swapping_[(size_t) sw.layer] = 1;
     flight_ = std::move(batch);
 }
 
@@ -622,54 +632,48 @@ ExpertTier::Source ExpertTier::locate(int layer, int e) const {
     return r;
 }
 
-bool ExpertTier::run_cpu(int layer, const float* x, const Lookup& lk, float* rows, std::string& err) {
+void ExpertTier::start_cpu(int layer, const float* x, const Lookup& lk, float* rows) {
     const kernels::cpu::NativeFmt& f = fmt_[(size_t) layer];
-    kernels::cpu::ExpertJobMulti jobs[kMaxK];
     int n = 0;
-    bool any = false;
     for (int i = 0; i < lk.k; ++i) {
         if (lk.dev[i] || lk.peer[i]) continue;
-        any = true;
-        jobs[n] = kernels::cpu::ExpertJobMulti{};
-        jobs[n].blob = lk.host[i];
-        jobs[n].nt = 1;
-        jobs[n].nact[0] = act_;
-        jobs[n].out[0] = rows + (size_t) i * (size_t) m_.geo().n_embd;
+        cpu_jobs_[n] = kernels::cpu::ExpertJobMulti{};
+        cpu_jobs_[n].blob = lk.host[i];
+        cpu_jobs_[n].nt = 1;
+        cpu_jobs_[n].nact[0] = act_;
+        cpu_jobs_[n].out[0] = rows + (size_t) i * (size_t) m_.geo().n_embd;
         ++n;
     }
-    if (!any) return true;
+    if (!n) return;
     kernels::cpu::native_quant_act(f, x, act_);
-    pool_->run_split_multi_native(f, jobs, n);
-    (void) err;
-    return true;
+    pool_->start_split_multi_native(f, cpu_jobs_, n);
 }
 
-bool ExpertTier::run_cpu_window(int layer, const float* x, const Lookup& lk, const Use* use, float* rows, std::string& err) {
+void ExpertTier::start_cpu_window(int layer, const float* x, const Lookup& lk, const Use* use, float* rows) {
     const kernels::cpu::NativeFmt& f = fmt_[(size_t) layer];
     const size_t n_embd = (size_t) m_.geo().n_embd;
-    kernels::cpu::ExpertJobMulti jobs[kMaxK];
     bool quantized[kMaxWindow] = {};
     int n = 0;
     for (int i = 0; i < lk.k; ++i) {
         if (lk.dev[i] || lk.peer[i]) continue;
-        jobs[n] = kernels::cpu::ExpertJobMulti{};
-        jobs[n].blob = lk.host[i];
-        jobs[n].nt = use[i].nt;
+        cpu_jobs_[n] = kernels::cpu::ExpertJobMulti{};
+        cpu_jobs_[n].blob = lk.host[i];
+        cpu_jobs_[n].nt = use[i].nt;
         for (int j = 0; j < use[i].nt; ++j) {
             const int t = use[i].tok[j];
             if (!quantized[t]) {
                 kernels::cpu::native_quant_act(f, x + (size_t) t * n_embd, act_ + (size_t) t * kernels::cpu::kNativeActBytes);
                 quantized[t] = true;
             }
-            jobs[n].nact[j] = act_ + (size_t) t * kernels::cpu::kNativeActBytes;
-            jobs[n].out[j] = rows + (size_t) use[i].row[j] * n_embd;
+            cpu_jobs_[n].nact[j] = act_ + (size_t) t * kernels::cpu::kNativeActBytes;
+            cpu_jobs_[n].out[j] = rows + (size_t) use[i].row[j] * n_embd;
         }
         ++n;
     }
-    if (n) pool_->run_split_multi_native(f, jobs, n);
-    (void) err;
-    return true;
+    if (n) pool_->start_split_multi_native(f, cpu_jobs_, n);
 }
+
+void ExpertTier::finish_cpu() { pool_->finish_split_multi_native(); }
 
 int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best) const {
     int32_t slot = -1;
@@ -685,14 +689,14 @@ int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best) const
             }
         }
     };
-    if (homes_.main == 0 || (homes_too && homes_.file == 0 && spare_[(size_t) layer] >= 0))
+    if (homes_.main == 0 || (homes_too && spare_[(size_t) layer] >= 0 && !swapping_[(size_t) layer]))
         scan((int64_t) layer * per_layer_, per_layer_);
     if (ext_per_layer_) scan((int64_t) n_layers_ * per_layer_ + (int64_t) layer * ext_per_layer_, ext_per_layer_);
     return slot;
 }
 
 bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
-    if (homes_.peer == 0 || homes_.file > 0 || spare_[(size_t) layer] < 0) return false;
+    if (homes_.peer == 0 || spare_[(size_t) layer] < 0 || swapping_[(size_t) layer]) return false;
     const size_t base = (size_t) layer * n_expert_;
     int32_t slot = -1;
     uint64_t oldest = ~0ull;
@@ -716,8 +720,8 @@ bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
     return true;
 }
 
-int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too) {
-    if (pending_.size() >= kMaxPending || free_events_.empty()) {
+int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too, bool whole, bool later) {
+    if (pending_.size() + queue_.size() >= kMaxPending || free_events_.empty()) {
         ++dropped_;
         return -1;
     }
@@ -733,23 +737,55 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
     uint8_t* dst = const_cast<uint8_t*>(slot_ptr(slot));
     const bool home = homes_.main > 0 && slot < (int64_t) n_layers_ * per_layer_;
     int32_t place = -1;
+    const uint64_t piece = whole ? bytes : policy::kPieceBytes;
     const auto pieces = [&](uint8_t* to, const uint8_t* from, cudaMemcpyKind kind) {
-        for (uint64_t off = 0; off < bytes; off += policy::kPieceBytes)
-            cudaMemcpyAsync(to + off, from + off, std::min(policy::kPieceBytes, bytes - off), kind, stream);
+        for (uint64_t off = 0; off < bytes; off += piece)
+            cudaMemcpyAsync(to + off, from + off, std::min(piece, bytes - off), kind, stream);
     };
     if (home) {   // the home's bytes first: the stream keeps the order
         place = spare_[(size_t) layer];
         spare_[(size_t) layer] = -1;
-        pieces(ram_[(size_t) layer] + (size_t) place * bytes, dst, cudaMemcpyDeviceToHost);
     }
-    pieces(dst, src, cudaMemcpyHostToDevice);
     const int ev = free_events_.back();
     free_events_.pop_back();
+    ++promoted_;
+    if (later) {
+        Queued q{{layer, e, slot, ev, home ? o : -1, place}, dst, src, home ? ram_[(size_t) layer] + (size_t) place * bytes : nullptr, bytes};
+        queue_.push_back(q);
+        return slot;
+    }
+    if (home) pieces(ram_[(size_t) layer] + (size_t) place * bytes, dst, cudaMemcpyDeviceToHost);
+    pieces(dst, src, cudaMemcpyHostToDevice);
     cudaEventRecord(events_[(size_t) ev], stream);
     pending_.push_back({layer, e, slot, ev, home ? o : -1, place});
-    ++promoted_;
     return slot;
 }
+
+void ExpertTier::mark_gap(cudaStream_t main) {
+    gap_marked_ = !queue_.empty() && cudaEventRecord(gap_ev_, main) == cudaSuccess;
+}
+
+void ExpertTier::pump(int pieces) {
+    if (gap_marked_) cudaStreamWaitEvent(copy_stream_, gap_ev_, 0);
+    gap_marked_ = false;
+    if (queue_.empty()) return;
+    size_t done = 0;
+    for (; done < queue_.size() && pieces > 0; ++done) {
+        Queued& q = queue_[done];
+        for (; q.home_to && q.home_off < q.bytes && pieces > 0; q.home_off += policy::kPieceBytes, --pieces)
+            cudaMemcpyAsync(q.home_to + q.home_off, q.dst + q.home_off, std::min(policy::kPieceBytes, q.bytes - q.home_off),
+                            cudaMemcpyDeviceToHost, copy_stream_);
+        for (; (!q.home_to || q.home_off >= q.bytes) && q.off < q.bytes && pieces > 0; q.off += policy::kPieceBytes, --pieces)
+            cudaMemcpyAsync(q.dst + q.off, q.src + q.off, std::min(policy::kPieceBytes, q.bytes - q.off), cudaMemcpyHostToDevice,
+                            copy_stream_);
+        if (q.off < q.bytes) break;
+        cudaEventRecord(events_[(size_t) q.p.event], copy_stream_);
+        pending_.push_back(q.p);
+    }
+    queue_.erase(queue_.begin(), queue_.begin() + (std::ptrdiff_t) done);
+}
+
+void ExpertTier::flush_queue() { pump(kAllPieces); }
 
 int ExpertTier::fetch(int layer, Lookup& lk) {
     if (m_.tiers().diag_tier_frozen) return 0;
@@ -761,7 +797,7 @@ int ExpertTier::fetch(int layer, Lookup& lk) {
     for (int i = lk.k - 1; i >= 0 && left > 0; --i) {
         if (lk.dev[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
         --left;
-        const int32_t slot = claim(layer, lk.experts[i], lk.host[i], fetch_stream_);
+        const int32_t slot = claim(layer, lk.experts[i], lk.host[i], fetch_stream_, false, /*whole=*/true);
         if (slot < 0) continue;
         lk.dev[i] = slot_ptr(slot);
         lk.host[i] = nullptr;
@@ -780,12 +816,14 @@ void ExpertTier::promote(int layer, const Lookup& lk) {
     if (m_.tiers().diag_tier_frozen) return;
     for (int i = 0; i < lk.k; ++i) {
         if (lk.dev[i] || !lk.again[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
-        if (!move_to_peer(layer, lk.experts[i], lk.host[i])) claim(layer, lk.experts[i], lk.host[i], copy_stream_, /*homes_too=*/true);
+        if (!move_to_peer(layer, lk.experts[i], lk.host[i]))
+            claim(layer, lk.experts[i], lk.host[i], copy_stream_, /*homes_too=*/true, /*whole=*/false, /*later=*/true);
     }
 }
 
 void ExpertTier::shrink() {
     if (ext_per_layer_ == 0) return;
+    flush_queue();
     cudaStreamSynchronize(copy_stream_);
     cudaStreamSynchronize(fetch_stream_);
     drain();
@@ -803,6 +841,7 @@ void ExpertTier::shrink() {
 void ExpertTier::lend_all() {
     shrink();
     if (lent_per_layer_ > 0 || !cache_.valid() || homes_.main > 0) return;
+    flush_queue();
     cudaStreamSynchronize(copy_stream_);
     cudaStreamSynchronize(fetch_stream_);
     drain();
