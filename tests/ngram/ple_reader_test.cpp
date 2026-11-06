@@ -8,7 +8,7 @@
 // dedup slot mixed up shows as a mismatch rather than as plausible data.
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/core/model_file.hpp"
-#include "basalt/kernels/ngram.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/ngram/ple_reader.hpp"
 #include "basalt/platform/direct_file.hpp"
 

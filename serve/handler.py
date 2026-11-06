@@ -16,7 +16,7 @@ from serve.api import responses as responses_api
 from serve.api.responses import error_body as responses_error_body
 from serve import ROOT
 from serve.api.anthropic import anthropic_collect, anthropic_events
-from serve.engine.errors import EngineDied, EngineError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
+from serve.engine.errors import ClientGone, EngineDied, EngineError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, checked as checked_bias
 from serve.config import checked_sampling
@@ -25,13 +25,15 @@ from serve.api.openai import openai_chunks, openai_collect
 from serve.api.responses import ResponsesError
 from serve.prompt import primed
 from serve.security import host_allowed, host_names_for, key_matches, origin_allowed, peer_of, remote_reason
-from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, Service, _debug_req
+from serve.router import Router
+from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, QUEUE_BEAT_S, Service, _debug_req
 from serve.api.structured import anthropic_format, check_format
 from serve.util.text import stop_strings
 
 
 BODY_MAX = 256 << 20                        # the most a JSON request body may hold (read into memory)
 CONTROL_BODY_MAX = 64 << 10                 # the unused body of /load and /unload
+TURN_POLL_S = 0.5                           # how soon a request waiting for its turn notices its client left
 
 
 class BadBody(Exception):
@@ -46,11 +48,17 @@ def _size_text(n: int) -> str:
     return f"{n >> 20} MiB" if n >= 1 << 20 else f"{n >> 10} KiB"
 
 
-def make_handler(svc: Service):
+def make_handler(target: Service | Router):
+    router = target if isinstance(target, Router) else Router([target])
+    svc = router.front                                      # the settings every model shares
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
 
         watch_done = None                                   # stops this request's disconnect watcher
+        cancel = None                                       # set when the client left
+        turn = None                                         # this request's router turn
+        sse_open = False                                    # the stream's headers went out
 
         def log_message(self, fmt, *args):
             pass
@@ -150,6 +158,32 @@ def make_handler(svc: Service):
             why = "remote-only" if svc.image_sources.remote_only else remote_reason(self.client_address, self.headers)
             return replace(svc.image_sources, local=not why, why=why, peer=peer_of(self.client_address))
 
+        def _client_cancel(self) -> threading.Event:
+            """The event set when this request's client hangs up, watched from the first call."""
+            if self.cancel is None:
+                self.cancel = threading.Event()
+                self._watch_client(self.cancel)
+            return self.cancel
+
+        def _take_turn(self, stream: bool = False) -> None:
+            """Wait for this request's model to be loaded and its turn to come, which may take a swap. A stream gets
+            its headers and keep-alives while it waits; a client that leaves gives its place up (ClientGone)."""
+            self.turn = router.join(self.svc)
+            if router.wait(self.turn, 0):
+                return
+            cancel, beat = self._client_cancel(), time.monotonic()
+            while not router.wait(self.turn, TURN_POLL_S):
+                if cancel.is_set():
+                    raise ClientGone
+                if stream and time.monotonic() - beat >= QUEUE_BEAT_S:
+                    beat = time.monotonic()
+                    try:
+                        self._sse()
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                    except OSError:
+                        raise ClientGone from None
+
         def _watch_client(self, cancel: threading.Event) -> None:
             """Cancel the request when its client hangs up, polling every 0.5 s: a readable socket with nothing to
             read is EOF (the request is fully read, so data is not a hang-up)."""
@@ -198,7 +232,22 @@ def make_handler(svc: Service):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
+        def _stream_error(self, obj) -> None:
+            """An error after the stream's headers went out (a request that waited for a swap), in the API's own form."""
+            path = self.path.split("?")[0].rstrip("/")
+            err = obj.get("error") if isinstance(obj.get("error"), dict) else {"message": str(obj)}
+            if path == "/v1/messages":
+                data = b"event: error\ndata: " + json.dumps({"type": "error", "error": err}, ensure_ascii=False).encode() + b"\n\n"
+            elif path == "/v1/responses":
+                data = b"event: error\ndata: " + json.dumps({"type": "error", "code": err.get("code"), "message": err.get("message")},
+                                                            ensure_ascii=False).encode() + b"\n\n"
+            else:
+                data = b"data: " + json.dumps({"error": err}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
+            self.wfile.write(data)
+
         def _json(self, code, obj):
+            if self.sse_open:
+                return self._stream_error(obj)
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
@@ -252,7 +301,12 @@ def make_handler(svc: Service):
                 return
             if path == "/metrics":
                 if self._authorized():
-                    self._json(200, svc.metrics())
+                    name = parse_qs(urlsplit(self.path).query).get("model", [None])[0]
+                    shown = router.shown() if name is None else router.service_for(name)
+                    if shown is None:
+                        self._json(404, {"error": {"message": "model not found"}})
+                    else:
+                        self._json(200, router.metrics(shown))
             elif path == "/api/logs":
                 if self._authorized():
                     self._logs()
@@ -264,47 +318,41 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
             elif path in ("/health", "/api/health"):
-                self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
-                                 "images": svc.vision is not None, "api_key": bool(svc.api_key),
-                                 "loaded": svc.loaded(), "loading": svc.loading, "service": "basalt"})
+                shown = router.shown()
+                load = shown.load_progress()
+                self._json(200, {"status": "ok", "max_context": shown.engine.max_context, "model": shown.model,
+                                 "images": shown.vision is not None, "api_key": bool(svc.api_key),
+                                 "loaded": shown.loaded(), "loading": shown.loading, "service": "basalt",
+                                 "percent": load.get("percent") if load else None, "swap": router.swap_status()})
             elif path == "/status":
                 if not self._authorized():                  # it shows the last answer's tail
                     return
-                with svc.status_lock:
-                    s = dict(svc.status)
+                shown = router.shown()
+                with shown.status_lock:
+                    s = dict(shown.status)
                 now = time.time()
                 if s.get("busy"):
                     s["elapsed_s"] = round(now - s["started"], 1)
                     if s.get("first_token"):
-                        s["tokens_per_s"] = round(svc._tok_s(), 1)
-                        s["tokens_per_s_mean"] = round(svc._tok_s_mean(), 1)
+                        s["tokens_per_s"] = round(shown._tok_s(), 1)
+                        s["tokens_per_s_mean"] = round(shown._tok_s_mean(), 1)
                 for k in ("started", "first_token"):
                     s.pop(k, None)
                 self._json(200, s)
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
-                    loaded = svc.loaded()
-                    model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
-                             "meta": {"n_ctx": svc.engine.max_context},
-                             "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
-                                              "output_modalities": ["text"]}}
-                    if svc.loading:
-                        model["status"] = {"value": "loading"}
-                        loaded = True
-                    elif not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
-                        model["status"] = {"value": "unloaded"}   # listed, loads on use
-                        loaded = True
-                    self._json(200, {"object": "list", "data": [model] if loaded else []})
+                    self._json(200, {"object": "list", "data": router.models()})
             elif path == "/props":
                 if self._authorized():
                     self._props()
             elif path == "/slots":
                 if self._authorized():
-                    loaded = not hasattr(svc.engine, "alive") or svc.engine.alive()
-                    self._json(200, svc.slot_table()[0] if loaded else [])
+                    shown = router.shown()
+                    loaded = not hasattr(shown.engine, "alive") or shown.engine.alive()
+                    self._json(200, shown.slot_table()[0] if loaded else [])
             elif path == "/v1/status":
                 if self._authorized():
-                    self._json(200, svc.v1_status())
+                    self._json(200, {**router.shown().v1_status(), "models": router.models(), "swap": router.swap_status()})
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
@@ -321,18 +369,24 @@ def make_handler(svc: Service):
                 return
             if path == "/unload":                            # unload between requests
                 try:
-                    r = svc.unload()
+                    r = router.shown().unload()
                 except EngineStuck as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 self._json(409 if r == "busy" else 200, {"status": r})
                 return
             if path == "/load":                              # load ahead of a request
+                self.svc = router.shown()
                 try:
-                    svc.load()
+                    self._take_turn()
+                    self.svc.load()
                     self._json(200, {"status": "loaded"})
                 except (GpuBusy, EngineDied) as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                except ClientGone:
+                    pass
+                finally:
+                    self._end_request()
                 return
             try:
                 req = json.loads(self._body() or b"{}")
@@ -345,29 +399,33 @@ def make_handler(svc: Service):
                 if path in ("/v1/load", "/v1/unload"):
                     if not self._own_page("the model can be loaded or unloaded"):
                         return
-                    if req.get("model") not in (None, *svc.served_names()):
+                    target = router.shown() if req.get("model") is None else router.service_for(req["model"])
+                    if target is None:
                         self._json(404, {"error": {"message": "model not found"}})
                         return
+                    self.svc = target
                     if path == "/v1/unload":
-                        result = svc.unload()
+                        result = target.unload()
                         if result == "busy":
                             raise ModelBusy("a request is running or queued")
-                    elif svc.loading:                    # a load in progress: wait for it like any request
-                        svc.load()
+                    elif target.loading:                 # a load in progress: wait for it like any request
+                        self._take_turn()
+                        target.load()
                         result = "loaded"
                     else:
-                        if not svc.fifo.acquire(blocking=False):
+                        self._take_turn()                # another model's turn: this load waits for it
+                        if not target.fifo.acquire(blocking=False):
                             raise ModelBusy("a request is running or queued")
                         try:
-                            with svc.status_lock:
-                                if svc.status.get("busy") or svc.status.get("queued"):
+                            with target.status_lock:
+                                if target.status.get("busy") or target.status.get("queued"):
                                     raise ModelBusy("a request is running or queued")
-                            svc.ensure_loaded()
-                            svc.last_request_at = time.time()
+                            target.ensure_loaded()
+                            target.last_request_at = time.time()
                         finally:
-                            svc.fifo.release()
+                            target.fifo.release()
                         result = "loaded"
-                    self._json(200, {"status": result, **svc.v1_status()})
+                    self._json(200, {"status": result, **target.v1_status()})
                     return
                 if path == "/v1/vram":                       # resize the VRAM reserve
                     if not self._own_page("the VRAM reserve can be changed"):
@@ -376,16 +434,17 @@ def make_handler(svc: Service):
                     if r is not None and (isinstance(r, bool) or not isinstance(r, int) or r < 0):
                         raise ValueError("reserve_mib: a whole number of MiB (0 or more), or null for the start's")
                     try:
-                        self._json(200, svc.vram(r))
+                        self._json(200, router.vram(r))
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 requested = req.get("model")
-                if not (isinstance(requested, str) and requested in svc.served_names()):
+                self.svc = router.service_for(requested)
+                if self.svc is None:
                     self._unknown_model(path, requested)
                     return
-                svc.request_ctx.path = path
-                svc.request_ctx.model = svc.model            # always the served name, never the requested one
+                self.svc.request_ctx.path = path
+                self.svc.request_ctx.model = self.svc.model  # always the served name, never the requested one
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path == "/v1/chat/completions":
@@ -419,18 +478,27 @@ def make_handler(svc: Service):
                 self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
             except EngineStuck as e:                         # the engine could not be ended
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
-
+            except ClientGone:                               # it left while queued
+                pass
             finally:
-                if self.watch_done is not None:
-                    self.watch_done.set()
+                self._end_request()
+
+        def _end_request(self) -> None:
+            if self.turn is not None:
+                router.leave(self.turn)
+                self.turn = None
+            if self.watch_done is not None:
+                self.watch_done.set()
 
         def _props(self):
-            model = parse_qs(urlsplit(self.path).query).get("model", [svc.model])[0]
-            if model != svc.model:
+            name = parse_qs(urlsplit(self.path).query).get("model", [None])[0]
+            svc = router.shown() if name is None else router.service_for(name)
+            if svc is None:
                 self._json(404, {"error": {"message": "model not found"}})
                 return
             try:
-                svc.wait_load()                              # a load in progress is waited for, not refused
+                if not router.multi:
+                    svc.wait_load()                          # a load in progress is waited for, not refused
             except (GpuBusy, EngineDied) as e:
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
@@ -514,6 +582,9 @@ def make_handler(svc: Service):
             self._json(200, {"lines": lines, "last": last})
 
         def _sse(self):
+            if self.sse_open:
+                return
+            self.sse_open = True
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -535,23 +606,23 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             messages, tools, kw = openai_to_messages(req)
-            tools, force = forced_call(req.get("tool_choice"), tools)   # a bad choice is a 400 before streaming
+            tools, force = forced_call(req.get("tool_choice"), tools, self.svc.dialect.forced_opening)   # a bad choice is a 400 before streaming
             check_format(req.get("response_format"))
-            svc.require_grammar(req.get("response_format"))
-            svc.load()
+            self.svc.require_grammar(req.get("response_format"))
             checked_sampling(req)                             # a sampling value out of range is a 400 likewise
-            req[BIAS_KEY] = checked_bias(req, svc.engine)     # a bad logit_bias is a 400 before streaming
-            req[GRAMMAR_KEY] = svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"),
+            self._take_turn(bool(req.get("stream")))
+            self.svc.load()
+            req[BIAS_KEY] = checked_bias(req, self.svc.engine)     # a bad logit_bias is a 400 before streaming
+            req[GRAMMAR_KEY] = self.svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"),
                                                req.get("response_format"))
             max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest of the context
-            svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
+            self.svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             stop_strings(req)                                 # likewise a bad stop
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force,
+            ids, thinking, max_new = self.svc.prepare(messages, tools, kw, max_new, force=force,
                                                  image_access=self._image_access())
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
-            cancel = threading.Event()
-            self._watch_client(cancel)
-            chunks = primed(openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, force=force), ids)
+            cancel = self._client_cancel()
+            chunks = primed(openai_chunks(self.svc, req, ids, thinking, tools, max_new, cancel, force=force), ids)
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
             self._sse()
@@ -583,13 +654,12 @@ def make_handler(svc: Service):
                 return self._json(409, responses_error_body(str(e), "server_error", code="model_busy"))
             except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
                 return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
-            cancel = threading.Event()
-            self._watch_client(cancel)
+            cancel = self._client_cancel()
 
             def events():
                 yield from asm.start()
                 done = None
-                for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
+                for kind, x in self.svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
                     if kind == "ping":
                         yield None
                     elif kind == "event":
@@ -658,7 +728,7 @@ def make_handler(svc: Service):
             messages = responses_api.input_messages(req)
             tools, names, skipped = responses_api.request_tools(req)
             try:
-                tools, force = forced_call(req.get("tool_choice"), tools)
+                tools, force = forced_call(req.get("tool_choice"), tools, self.svc.dialect.forced_opening)
             except ValueError as e:
                 raise ResponsesError(str(e), "tool_choice") from None
             kw = responses_api.template_kwargs(req)
@@ -667,17 +737,17 @@ def make_handler(svc: Service):
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
             try:
-                svc.require_grammar(responses_api.text_format(req))
+                self.svc.require_grammar(responses_api.text_format(req))
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
-            req[GRAMMAR_KEY] = svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"),
+            req[GRAMMAR_KEY] = self.svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"),
                                                responses_api.text_format(req))
-            noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # once per tool
+            noted = self.svc.__dict__.setdefault("hosted_tools_noted", set())   # once per tool
             if set(skipped) - noted:
                 print(f"[server] warning: /v1/responses ignores hosted tools {', '.join(sorted(set(skipped) - noted))}", flush=True)
                 noted.update(skipped)
             try:
-                svc.reasoning_budget(req)                    # a bad value is a 400 before streaming
+                self.svc.reasoning_budget(req)                    # a bad value is a 400 before streaming
             except ValueError as e:
                 raise ResponsesError(str(e), "reasoning_budget_tokens") from None
             try:
@@ -688,9 +758,10 @@ def make_handler(svc: Service):
                 stop_strings(req)
             except ValueError as e:
                 raise ResponsesError(str(e), "stop") from None
-            svc.load()
+            self._take_turn(bool(req.get("stream")))
+            self.svc.load()
             try:
-                ids, thinking, max_new = svc.prepare(messages, tools, kw, req.get("max_output_tokens") or 0, force=force,
+                ids, thinking, max_new = self.svc.prepare(messages, tools, kw, req.get("max_output_tokens") or 0, force=force,
                                                      image_access=self._image_access())
             except ResponsesError:
                 raise
@@ -699,37 +770,37 @@ def make_handler(svc: Service):
                     from None
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             include = req.get("include") if isinstance(req.get("include"), list) else []
-            asm = responses_api.Assembler(req, svc.model, len(ids), names,
+            asm = responses_api.Assembler(req, self.svc.model, len(ids), names,
                                           "reasoning.encrypted_content" in include)
             return ids, thinking, tools, max_new, asm, req, force
 
         def _count_tokens(self, req):
             """Anthropic's token count: the rendered, tokenized prompt, without running the model."""
-            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
-            tools, _ = forced_call(req.get("tool_choice"), tools)   # same 400 as the request itself ("none": no tools)
+            messages, tools, kw = anthropic_to_messages(req, self.svc.anthropic_think_unasked)
+            tools, _ = forced_call(req.get("tool_choice"), tools, self.svc.dialect.forced_opening)   # same 400 as the request itself ("none": no tools)
             stop_strings(req)                                 # same 400 as the request itself
-            self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
+            self._json(200, {"input_tokens": len(self.svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
-            svc.load()
-            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
-            tools, force = forced_call(req.get("tool_choice"), tools)   # "any" / {"type": "tool", "name": N}
+            messages, tools, kw = anthropic_to_messages(req, self.svc.anthropic_think_unasked)
+            tools, force = forced_call(req.get("tool_choice"), tools, self.svc.dialect.forced_opening)   # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             response_format = anthropic_format(req)            # structured outputs
             try:
-                svc.require_grammar(response_format)
+                self.svc.require_grammar(response_format)
             except ValueError as e:
                 raise ValueError(str(e).replace("response_format json_schema and json_object", "output_config.format json_schema")) from None
-            req[GRAMMAR_KEY] = svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"), response_format)
-            svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
+            req[GRAMMAR_KEY] = self.svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"), response_format)
+            self.svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             checked_sampling(req)                             # likewise a sampling value out of range
             stop_strings(req)                                 # likewise a bad stop
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force,
+            self._take_turn(bool(req.get("stream")))
+            self.svc.load()
+            ids, thinking, max_new = self.svc.prepare(messages, tools, kw, max_new, force=force,
                                                  image_access=self._image_access())
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
-            cancel = threading.Event()
-            self._watch_client(cancel)
-            events = primed(anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force), ids)
+            cancel = self._client_cancel()
+            events = primed(anthropic_events(self.svc, req, ids, thinking, tools, max_new, cancel, force=force), ids)
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
             self._sse()
@@ -764,9 +835,11 @@ class Server(ThreadingHTTPServer):
             super().handle_error(request, client_address)
 
 
-def serve(svc: Service, host="127.0.0.1", port=8080) -> ThreadingHTTPServer:
+def serve(target: Service | Router, host="127.0.0.1", port=8080) -> ThreadingHTTPServer:
+    router = target if isinstance(target, Router) else Router([target])
+    svc = router.front
     svc.host_names = host_names_for(host, svc.allowed_hosts, svc.trusted_origins)
-    svc.start_telemetry()
-    httpd = Server((host, port), make_handler(svc))
+    router.start_telemetry()
+    httpd = Server((host, port), make_handler(router))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd

@@ -32,7 +32,7 @@ TOOLS = [{"type": "function", "name": "exec_command", "description": "Runs a com
 # ------------------------------------------------------------------------------------------------ parsing
 class Parsing(unittest.TestCase):
     def test_a_string_input_is_one_user_message(self):
-        self.assertEqual(input_messages({"model": "qwen3.8-flash-next", "input": "hi", "instructions": "Be brief."}),
+        self.assertEqual(input_messages({"model": "basalt", "input": "hi", "instructions": "Be brief."}),
                          [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "hi"}])
 
     def test_leading_developer_messages_join_the_system_message_later_ones_become_user(self):
@@ -126,7 +126,9 @@ class Parsing(unittest.TestCase):
 
     def test_effort_and_text_format(self):
         self.assertEqual(template_kwargs({"reasoning": {"effort": "minimal"}}), {"enable_thinking": False})
-        self.assertEqual(template_kwargs({"reasoning": {"effort": "high"}}), {"reasoning_effort": "xhigh"})
+        self.assertEqual(template_kwargs({"reasoning": {"effort": "high"}}), {"reasoning_effort": "high"})
+        self.assertEqual(template_kwargs({"reasoning": {"effort": "max"}}), {"reasoning_effort": "max"})
+        self.assertEqual(template_kwargs({"reasoning": {"effort": 40}}), {"reasoning_effort": 40})
         self.assertEqual(template_kwargs({"reasoning": {"summary": "auto"}}), {})      # the default
         with self.assertRaises(ResponsesError):
             template_kwargs({"reasoning": {"effort": "huge"}})
@@ -178,7 +180,7 @@ class Server(unittest.TestCase):
 
 class OverHttp(Server):
     def test_non_streaming_text_with_reasoning(self):
-        code, r = self.post({"model": "qwen3.8-flash-next", "input": "hi", "store": False})
+        code, r = self.post({"model": "basalt", "input": "hi", "store": False})
         self.assertEqual(code, 200)
         self.assertEqual((r["object"], r["status"], r["error"]), ("response", "completed", None))
         rs, msg = r["output"]
@@ -195,7 +197,7 @@ class OverHttp(Server):
         self.assertEqual(r["store"], False)
 
     def test_stream_event_order(self):
-        code, events = self.post({"model": "qwen3.8-flash-next", "input": "hi", "stream": True,
+        code, events = self.post({"model": "basalt", "input": "hi", "stream": True,
                                   "include": ["reasoning.encrypted_content"]})
         self.assertEqual(code, 200)
         types = [e["type"] for e in events]
@@ -226,25 +228,25 @@ class OverHttp(Server):
         self.assertEqual(replay[1]["reasoning_content"], "Read it.\n")
 
     def test_max_output_tokens_ends_incomplete(self):
-        code, r = self.post({"model": "qwen3.8-flash-next", "input": "hi", "max_output_tokens": 5})
+        code, r = self.post({"model": "basalt", "input": "hi", "max_output_tokens": 5})
         self.assertEqual(code, 200)
         self.assertEqual(r["status"], "incomplete")
         self.assertEqual(r["incomplete_details"], {"reason": "max_output_tokens"})
         self.assertEqual(r["output"][0]["status"], "incomplete")
-        code, events = self.post({"model": "qwen3.8-flash-next", "input": "hi", "max_output_tokens": 5, "stream": True})
+        code, events = self.post({"model": "basalt", "input": "hi", "max_output_tokens": 5, "stream": True})
         self.assertEqual(events[-1]["type"], "response.incomplete")
 
     def test_effort_none_does_not_think(self):
         self.engine.scripts = [self.tok.encode("Hello.<|im_end|>", parse_special=True)]
         self.engine.script = self.engine.scripts[0]
-        code, r = self.post({"model": "qwen3.8-flash-next", "input": "hi", "reasoning": {"effort": "none"}})
+        code, r = self.post({"model": "basalt", "input": "hi", "reasoning": {"effort": "none"}})
         self.assertEqual([o["type"] for o in r["output"]], ["message"])
         self.assertIn("<think>\n\n</think>", self.tok.decode(self.engine.last_prompt))
 
     def test_errors_use_the_responses_format(self):
-        for body, param in (({"model": "qwen3.8-flash-next"}, "input"), ({"model": "qwen3.8-flash-next", "input": "x", "previous_response_id": "r"},
+        for body, param in (({"model": "basalt"}, "input"), ({"model": "basalt", "input": "x", "previous_response_id": "r"},
                                                          "previous_response_id"),
-                            ({"model": "qwen3.8-flash-next", "input": "x", "reasoning": {"effort": "huge"}}, "reasoning.effort")):
+                            ({"model": "basalt", "input": "x", "reasoning": {"effort": "huge"}}, "reasoning.effort")):
             code, r = self.post(body)
             self.assertEqual(code, 400)
             self.assertEqual(set(r["error"]), {"message", "type", "param", "code"})
@@ -260,16 +262,16 @@ class OverHttp(Server):
         self.assertEqual((r.status, err["type"], err["param"]), (400, "invalid_request_error", None))
 
     def test_too_long_for_the_context(self):
-        code, r = self.post({"model": "qwen3.8-flash-next", "input": "x" * 20000})
+        code, r = self.post({"model": "basalt", "input": "x" * 20000})
         self.assertEqual(code, 400)
         self.assertEqual(r["error"]["code"], "context_length_exceeded")
 
     def test_api_key_and_foreign_pages(self):
         self.svc.api_key = "s3cret"
-        self.assertEqual(self.post({"model": "qwen3.8-flash-next", "input": "hi"})[0], 401)
-        self.assertEqual(self.post({"model": "qwen3.8-flash-next", "input": "hi"}, headers={"Authorization": "Bearer s3cret"})[0], 200)
+        self.assertEqual(self.post({"model": "basalt", "input": "hi"})[0], 401)
+        self.assertEqual(self.post({"model": "basalt", "input": "hi"}, headers={"Authorization": "Bearer s3cret"})[0], 200)
         self.svc.api_key = None
-        code, r = self.post({"model": "qwen3.8-flash-next", "input": "hi"}, headers={"Origin": "https://evil.example.com"})
+        code, r = self.post({"model": "basalt", "input": "hi"}, headers={"Origin": "https://evil.example.com"})
         self.assertEqual(code, 403)
 
     def test_json_schema_text_format(self):
@@ -277,15 +279,15 @@ class OverHttp(Server):
         self.engine.script = self.engine.scripts[0]
         fmt = {"type": "json_schema", "name": "num", "strict": True,
                "schema": {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}}
-        code, r = self.post({"model": "qwen3.8-flash-next", "input": "a number", "text": {"format": fmt}})
+        code, r = self.post({"model": "basalt", "input": "a number", "text": {"format": fmt}})
         self.assertEqual(code, 200, r)
         self.assertEqual(r["output"][-1]["content"][0]["text"], "{\"n\": 3}")
-        code, events = self.post({"model": "qwen3.8-flash-next", "input": "a number", "text": {"format": fmt}, "stream": True})
+        code, events = self.post({"model": "basalt", "input": "a number", "text": {"format": fmt}, "stream": True})
         self.assertEqual("".join(e["delta"] for e in events if e["type"] == "response.output_text.delta"), "{\"n\": 3}")
         self.assertEqual(events[-1]["type"], "response.completed")
 
     def test_status_lists_the_dialect(self):
-        self.post({"model": "qwen3.8-flash-next", "input": "hi", "stream": True})
+        self.post({"model": "basalt", "input": "hi", "stream": True})
         self.assertIn("/v1/responses", self.svc.v1_status()["dialects"])
         self.assertEqual(self.svc.history[-1]["path"], "/v1/responses")
 
@@ -295,7 +297,7 @@ class ToolRoundTrip(Server):
 
     def test_function_call_round_trip(self):
         user = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "what is in a.txt?"}]}
-        code, events = self.post({"model": "qwen3.8-flash-next", "instructions": "You are a coding agent.", "input": [user],
+        code, events = self.post({"model": "basalt", "instructions": "You are a coding agent.", "input": [user],
                                   "tools": TOOLS, "store": False, "stream": True,
                                   "include": ["reasoning.encrypted_content"], "reasoning": {"summary": "auto"},
                                   "parallel_tool_calls": True, "tool_choice": "auto"})
@@ -319,7 +321,7 @@ class ToolRoundTrip(Server):
                      and e["item"]["type"] == "function_call")
         self.assertEqual((added["item"]["call_id"], added["item"]["arguments"]), (fc["call_id"], ""))
         # the client sends everything back plus the result: the prompt continues where the model stopped
-        code, r = self.post({"model": "qwen3.8-flash-next", "instructions": "You are a coding agent.", "tools": TOOLS, "store": False,
+        code, r = self.post({"model": "basalt", "instructions": "You are a coding agent.", "tools": TOOLS, "store": False,
                              "input": [user, *output, {"type": "function_call_output", "call_id": fc["call_id"],
                                                        "output": "before"}]})
         self.assertEqual(code, 200, r)
@@ -338,7 +340,7 @@ class ToolRoundTrip(Server):
             {"type": "function", "name": "spawn_agent", "strict": False,
              "parameters": {"type": "object", "properties": {"message": {"type": "string"}}}}]},
             {"type": "custom", "name": "apply_patch", "description": "Edit files."}]
-        code, r = self.post({"model": "qwen3.8-flash-next", "input": "go", "tools": tools})
+        code, r = self.post({"model": "basalt", "input": "go", "tools": tools})
         self.assertEqual(code, 200, r)
         ns, custom = r["output"]
         self.assertEqual((ns["type"], ns["namespace"], ns["name"], json.loads(ns["arguments"])),

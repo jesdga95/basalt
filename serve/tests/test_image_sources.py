@@ -21,7 +21,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from serve.config import build_parser, parse_settings  # noqa: E402
+from serve.config import build_parser, model_settings, parse_settings  # noqa: E402
 from serve.engine import image_source  # noqa: E402
 from serve.engine.image_source import (ImageRefused, ImageSources, file_url_path, image_sources_of,  # noqa: E402
                                        is_public_address, load_image, parse_url_host, windows_path_refused)
@@ -36,7 +36,7 @@ from serve.util.text import ByteTokenizer  # noqa: E402
 ROOT = Path(__file__).resolve().parents[2]
 PNG = b"\x89PNG\r\n\x1a\n" + b"pixels"
 DATA = "data:image/png;base64," + base64.b64encode(PNG).decode()
-MODEL = "qwen3.8-flash-next"
+MODEL = "basalt"
 LOCAL = ImageSources(local=True, why="")
 POLICY = "refused by server policy"
 posix_only = unittest.skipUnless(os.name == "posix", "POSIX paths and special files")
@@ -1787,7 +1787,7 @@ class Leaks(ImageServer):
 
 class Options(unittest.TestCase):
     def parse(self, *words):
-        return parse_settings(build_parser(), ["--mock-engine", *words])[0]
+        return model_settings(build_parser(), ["--mock-engine", *words])[0][0]
 
     def test_flags(self):
         a = self.parse("--image-url-host", "a.example", "--image-url-host", "b.example:81", "--image-dir", "/tmp")
@@ -1806,7 +1806,7 @@ class Options(unittest.TestCase):
     def test_config_keys(self):
         with tempfile.TemporaryDirectory() as d:
             cfg = Path(d, "c.json")
-            cfg.write_text(json.dumps({"server": {"image-url-host": ["a.example", "b.example:81"], "image_dir": ["pics", "/abs"]}}))
+            cfg.write_text(json.dumps({"models": [{"model": "m"}], "server": {"image-url-host": ["a.example", "b.example:81"], "image_dir": ["pics", "/abs"]}}))
             a = self.parse("--config", str(cfg))
             self.assertEqual(a.image_url_host, ["a.example", "b.example:81"])
             self.assertEqual(a.image_dir, [str(Path(d).resolve() / "pics"), "/abs"])
@@ -1823,9 +1823,9 @@ class Options(unittest.TestCase):
         self.assertTrue(self.parse("--image-remote-only").image_remote_only)
         with tempfile.TemporaryDirectory() as d:
             cfg = Path(d, "c.json")
-            cfg.write_text(json.dumps({"server": {"image-remote-only": True}}))
+            cfg.write_text(json.dumps({"models": [{"model": "m"}], "server": {"image-remote-only": True}}))
             self.assertTrue(self.parse("--config", str(cfg)).image_remote_only)
-            cfg.write_text(json.dumps({"server": {"image_remote_only": False}}))
+            cfg.write_text(json.dumps({"models": [{"model": "m"}], "server": {"image_remote_only": False}}))
             self.assertFalse(self.parse("--config", str(cfg)).image_remote_only)
 
     def test_a_listener_is_ipv4(self):

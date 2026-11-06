@@ -15,7 +15,7 @@ void check(bool value, const char* description) {
 SavedConversation image(std::initializer_list<int32_t> ids, bool cvec = true) {
     SavedConversation s;
     s.live.ids = ids;
-    s.live.gdn.resize(64, 7);
+    s.live.state_a.resize(64, 7);
     s.cvec = cvec;
     return s;
 }
@@ -176,7 +176,7 @@ int main() {
         check(cache.bytes()+held.bytes() <= one*2, "exchange obeys byte budget");
         check(!cache.make_room(one+1, one), "oversized exchange rejected");
         check(cache.size() == 1, "oversized snapshot does not evict useful entries");
-        auto huge = image({1}); huge.live.gdn.resize(one*3);
+        auto huge = image({1}); huge.live.state_a.resize(one*3);
         check(!cache.put(std::move(huge)), "oversized image rejected");
         check(cache.size() == 1, "oversized put leaves cache unchanged");
         check(!cache.make_room(0, one*2+1), "held larger than budget cannot underflow");
@@ -238,7 +238,7 @@ int main() {
               "the live state equal to an entry's deepest checkpoint supersedes it");
         SavedConversation huge = image({1, 2, 3, 4, 60, 80});
         huge.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 60})};
-        huge.live.gdn.resize(2 << 20);
+        huge.live.state_a.resize(2 << 20);
         check(!cache.put(std::move(huge)) && cache.size() == 5 && cache.superseded() == 1,
               "an oversized put drops nothing");
     }
@@ -293,12 +293,12 @@ int main() {
         auto running = [](std::initializer_list<int32_t> ids, uint8_t salt, size_t parts) {
             ConversationCheckpoint c;
             c.ids = ids;
-            c.gdn.assign(256, salt);
-            c.tails.assign(32, uint8_t(salt + 1));
+            c.state_a.assign(256, salt);
+            c.state_c.assign(32, uint8_t(salt + 1));
             c.used = salt;
             for (size_t k = 0; k < parts; ++k) {
                 ConversationCheckpoint p;
-                p.gdn.assign(128, uint8_t(salt + 10 + k));
+                p.state_a.assign(128, uint8_t(salt + 10 + k));
                 c.stage_parts.push_back(std::move(p));
             }
             return c;
@@ -308,28 +308,28 @@ int main() {
         checks.push_back(running({1, 2, 3}, 5, 1));       // an incomplete set: kept aside, put back in place
         checks.push_back(running({1, 2, 3, 4}, 7, 2));
         const auto original = checks;
-        const uint8_t* gdn0 = checks[0].gdn.data();
-        const uint8_t* part1 = checks[2].stage_parts[1].gdn.data();
+        const uint8_t* gdn0 = checks[0].state_a.data();
+        const uint8_t* part1 = checks[2].stage_parts[1].state_a.data();
         auto split = conversation_checkpoints_split(std::move(checks), 2);
         check(checks.empty() && split.stage0.size() == 2 && split.rest.size() == 1 && split.parts.size() == 2 &&
               split.parts[0].size() == 2 && split.parts[1].size() == 2, "split: complete checkpoints apart, the other aside");
         check(split.stage0[0].stage_parts.empty() && split.parts[1][1].ids == original[2].ids &&
-              split.parts[1][1].used == original[2].used && split.parts[0][0].gdn == original[0].stage_parts[0].gdn,
+              split.parts[1][1].used == original[2].used && split.parts[0][0].state_a == original[0].stage_parts[0].state_a,
               "split: every stage part carries its checkpoint's ids and LRU stamp");
-        check(split.stage0[0].gdn.data() == gdn0 && split.parts[1][1].gdn.data() == part1,
+        check(split.stage0[0].state_a.data() == gdn0 && split.parts[1][1].state_a.data() == part1,
               "split moves the running state (same buffers, no copy)");
         std::vector<ConversationCheckpoint> back;
         check(conversation_checkpoints_merge(std::move(split), back) && back.size() == 3, "merge puts them back");
         bool same = true;
         for (size_t j = 0; j < back.size(); ++j) {
-            same = same && back[j].ids == original[j].ids && back[j].gdn == original[j].gdn &&
-                   back[j].tails == original[j].tails && back[j].used == original[j].used &&
+            same = same && back[j].ids == original[j].ids && back[j].state_a == original[j].state_a &&
+                   back[j].state_c == original[j].state_c && back[j].used == original[j].used &&
                    back[j].stage_parts.size() == original[j].stage_parts.size();
             for (size_t k = 0; same && k < back[j].stage_parts.size(); ++k)
-                same = back[j].stage_parts[k].gdn == original[j].stage_parts[k].gdn;
+                same = back[j].stage_parts[k].state_a == original[j].stage_parts[k].state_a;
         }
         check(same, "merge(split(x)) == x, in the original order");
-        check(back[0].gdn.data() == gdn0 && back[2].stage_parts[1].gdn.data() == part1, "merge moves them back too");
+        check(back[0].state_a.data() == gdn0 && back[2].stage_parts[1].state_a.data() == part1, "merge moves them back too");
 
         auto torn = conversation_checkpoints_split(std::vector<ConversationCheckpoint>(original), 2);
         torn.parts[1].pop_back();

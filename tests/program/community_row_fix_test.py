@@ -17,10 +17,10 @@ real = os.path.join(root, "docs", "community", "benchmarks.json")
 
 
 def row(odd):
-    r = {"submitter": "tester", "date": "2026-10-24", "commit": "abc1234", "preset": "community-1",
+    r = {"submitter": "tester", "date": "2026-10-24", "commit": "abc1234", "preset": "community-1", "model": "Qwen3.8-Flash-Next",
          "gpus": [{"name": "RTX 5090", "vram_gib": 32, "power_w": 400, "pcie": "5.0 x16", "h2d_gbps": 55.3},
                   {"name": "RTX 5060 Ti", "vram_gib": 16, "power_w": 180, "pcie": "5.0 x8", "h2d_gbps": 27.9}],
-         "ram_gib": 64, "cpu": "Test CPU 9, 16 cores", "ram_gbps": 78.2, "os": "Linux", "quant": "NVFP4", "prefill_16k_tps": 1234.5, "prefill_64k_tps": 2345.6, "decode_tps": 345.7}
+         "ram_gib": 64, "cpu": "Test CPU 9, 16 cores", "ram_gbps": 78.2, "os": "Linux", "quant": "NVFP4", "kv": "int8", "prefill_16k_tps": 1234.5, "prefill_64k_tps": 2345.6, "decode_tps": 345.7}
     if odd:
         r["submitter"] = "Ünï\"q\"\\☃日本"
         r["gpus"] = [{"name": "Card \"X\"\tTi", "vram_gib": 24, "power_w": 300}]
@@ -77,5 +77,19 @@ with tempfile.TemporaryDirectory() as d:
     fixed = subprocess.run([sys.executable, checker, "--fix", crlf], capture_output=True, text=True)
     ok = bad.returncode == 1 and fixed.returncode == 0 and b"\r" not in read(crlf)
     print("community_row_fix crlf checker: " + ("ok" if ok else "FAILED"))
+    failed |= not ok
+# the model and the KV format are required and checked against the names the engine uses
+for key, bad in (("model", "Qwen"), ("kv", "int4"), ("model", None), ("kv", None)):
+    data = load(real)
+    if bad is None:
+        del data["runs"][0][key]
+    else:
+        data["runs"][0][key] = bad
+    p = os.path.join(tempfile.gettempdir(), "cb_bad_row.json")
+    write(p, json.dumps(data, indent=2, ensure_ascii=False))
+    r = subprocess.run([sys.executable, checker, p], capture_output=True, text=True)
+    os.remove(p)
+    ok = r.returncode == 1 and key in r.stdout
+    print(f"community_row_fix bad {key}={bad}: " + ("ok" if ok else "FAILED"))
     failed |= not ok
 sys.exit(failed)

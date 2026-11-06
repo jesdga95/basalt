@@ -6,7 +6,7 @@
 //
 //     "true (default): the ncols == 1 layout, every column bitwise equal to a single-column call"
 //
-// and `include/basalt/core/verify.hpp` counts "multi-column MMVQ in exact mode" among the reasons the verify window
+// and `include/basalt/models/qwen4exp/decode/verify.hpp` counts "multi-column MMVQ in exact mode" among the reasons the verify window
 // produces what greedy decode would, bit for bit.  Nothing tested that sentence: `iq_parity` calls `native_mmvq`
 // with two columns and compares against a float64 reference at 2e-2, which cannot see a difference between one
 // column and T columns.

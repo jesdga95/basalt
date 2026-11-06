@@ -284,7 +284,7 @@ class Loading(unittest.TestCase):
 
     def test_ui_shows_the_loading_text(self):
         js = (ROOT / "serve/web/app.js").read_text(encoding="utf-8")
-        self.assertIn("Loading weights", js)
+        self.assertIn("\"Loading\"", js)
         self.assertIn("Waking up", js)
         self.assertIsNone(re.search(r"—", js))      # no em dashes in UI text
         self.assertIn('data-s="loading"', (ROOT / "serve/web/app.css").read_text(encoding="utf-8").replace(

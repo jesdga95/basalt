@@ -61,7 +61,7 @@ class TextService(unittest.TestCase):
             c.close()
 
     def chat(self, content, **kw):
-        return {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": content}], **kw}
+        return {"model": "basalt", "messages": [{"role": "user", "content": content}], **kw}
 
     def test_usage_carries_the_engines_count_and_the_text_is_what_the_template_rendered(self):
         status, body = self.post("/v1/chat/completions", self.chat("hi", max_tokens=8))
@@ -72,7 +72,7 @@ class TextService(unittest.TestCase):
         self.assertIn("<|im_start|>user\nhi<|im_end|>", self.engine.seen_text)
 
     def test_anthropic_message_start_has_the_counted_input_tokens(self):
-        status, body = self.post("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 8, "stream": True,
+        status, body = self.post("/v1/messages", {"model": "basalt", "max_tokens": 8, "stream": True,
                                                   "messages": [{"role": "user", "content": "hi"}]})
         self.assertEqual(status, 200, body)
         start = [json.loads(line[5:]) for line in body.splitlines() if line.startswith("data:")][0]

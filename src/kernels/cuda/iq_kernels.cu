@@ -256,6 +256,32 @@ __device__ __forceinline__ float vec_dot_iq1_m_q8_1(const void* __restrict__ vbq
     return d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1);
 }
 
+// IQ1_S: 32 values per call (one q8_1 block), one 3-bit scale and one grid shift per 32.  The shift term uses the
+// activation's integer sum (as IQ1_M above), so it is exact.
+__device__ __forceinline__ float vec_dot_iq1_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                    const int& kbx, const int& iqs) {
+    const block_iq1_s* bq1 = (const block_iq1_s*) vbq + kbx;
+    const int qs_packed = get_int_b2(bq1->qs, iqs);
+    const uint8_t* qs = (const uint8_t*) &qs_packed;
+    const int qh = bq1->qh[iqs];
+    int sumi = 0, sumy = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int grid = iq1s_grid_gpu[qs[l0 / 2] | (((qh >> 3 * (l0 / 2)) & 0x07) << 8)];
+        const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+        const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+        const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs].qs, l0 + 1);
+        sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+        sumy = ggml_cuda_dp4a(u0, 0x01010101, sumy);
+        sumy = ggml_cuda_dp4a(u1, 0x01010101, sumy);
+    }
+    const float d1q = __half2float(bq1->d) * (((qh >> 11) & 0x0E) + 1);
+    const float delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f * IQ1S_DELTA / 0x8000);
+    return d1q * __low2float(bq8_1[iqs].ds) * ((float) sumi + delta * (float) sumy);
+}
+
 __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
                                                      const int& kbx, const int& iqs) {
     const block_iq4_nl* bq4 = (const block_iq4_nl*) vbq + kbx;
@@ -544,6 +570,8 @@ template<> struct Fmt<22> { static constexpr int qk = 256, ipb = 8, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq2_s_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<29> { static constexpr int qk = 256, ipb = 8, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq1_m_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<19> { static constexpr int qk = 256, ipb = 8, step = 1;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq1_s_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<42> { static constexpr int qk = 64, ipb = 2, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_0_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<12> { static constexpr int qk = 256, ipb = QI4_K / VDR_Q4_K, step = VDR_Q4_K;
@@ -583,9 +611,9 @@ __device__ __forceinline__ void tail_scale(float (&s)[NC], float sc) {
 
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
-#define GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(8) X(40)
-#define D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(8) X(40)
-#define MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8) X(40)
+#define GU_FMTS(X) X(16) X(17) X(18) X(19) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(8) X(40)
+#define D_FMTS(X) X(14) X(16) X(17) X(19) X(20) X(22) X(23) X(29) X(42) X(7) X(6) X(8) X(40)
+#define MMVQ_FMTS(X) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8) X(40)
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -634,7 +662,7 @@ template<int TY> struct Split;
 // per-entry ones, which call Fmt<TY>::dot per column (the launchers test kSplit at compile time, so the multi kernels
 // are never instantiated for a type without a Split).
 template<int TY> inline constexpr bool kSplit = false;
-template<int TY> inline constexpr bool kStageIqGrid = (TY == 16 || TY == 17 || TY == 18 || TY == 22 || TY == 29);
+template<int TY> inline constexpr bool kStageIqGrid = (TY == 16 || TY == 17 || TY == 18 || TY == 19 || TY == 22 || TY == 29);
 
 template<> inline constexpr bool kSplit<16> = true;
 template<> struct Split<16> {   // IQ2_XXS
@@ -848,6 +876,45 @@ template<> struct Split<29> {   // IQ1_M
         }
         const float d = r.dw * __low2float(bq8_1[iqs].ds);
         return d * ((sumi[0] + sumf[0]) * r.sc0 + (sumi[1] + sumf[1]) * r.sc1);
+    }
+};
+template<> inline constexpr bool kSplit<19> = true;
+template<> struct Split<19> {   // IQ1_S
+    struct W { int g[8]; float delta; int ls; float dw; };
+    template<bool STAGE_GRID = false>
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
+        const block_iq1_s* bq1 = (const block_iq1_s*) vbq + kbx;
+        const int qs_packed = get_int_b2(bq1->qs, iqs);
+        const uint8_t* qs = (const uint8_t*) &qs_packed;
+        const int qh = bq1->qh[iqs];
+        const uint32_t* grid_lut;
+        if constexpr (STAGE_GRID) grid_lut = s_grid;
+        else grid_lut = iq1s_grid_gpu;
+        W r;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const int grid = grid_lut[qs[l0 / 2] | (((qh >> 3 * (l0 / 2)) & 0x07) << 8)];
+            r.g[l0 + 0] = (grid >> 0) & 0x0F0F0F0F;
+            r.g[l0 + 1] = (grid >> 4) & 0x0F0F0F0F;
+        }
+        r.ls = ((qh >> 11) & 0x0E) + 1;
+        r.delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f * IQ1S_DELTA / 0x8000);
+        r.dw = __half2float(bq1->d);
+        return r;
+    }
+    __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
+        int sumi = 0, sumy = 0;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
+            const int u1 = get_int_b4(bq8_1[iqs].qs, l0 + 1);
+            sumi = ggml_cuda_dp4a(r.g[l0 + 0], u0, sumi);
+            sumi = ggml_cuda_dp4a(r.g[l0 + 1], u1, sumi);
+            sumy = ggml_cuda_dp4a(u0, 0x01010101, sumy);
+            sumy = ggml_cuda_dp4a(u1, 0x01010101, sumy);
+        }
+        const float d1q = r.dw * r.ls;
+        return d1q * __low2float(bq8_1[iqs].ds) * ((float) sumi + r.delta * (float) sumy);
     }
 };
 template<> inline constexpr bool kSplit<20> = true;
@@ -1268,7 +1335,7 @@ __device__ __forceinline__ const uint32_t* stage_iq_grid(uint32_t* s_buf, int ti
         for (int i = tid; i < 256; i += nthreads) s_buf[i] = iq3xxs_grid[i];
         __syncthreads();
         return s_buf;
-    } else if constexpr (TY == 29) {
+    } else if constexpr (TY == 29 || TY == 19) {
         uint2* dst = (uint2*) s_buf;
         const uint2* src = (const uint2*) iq1s_grid_gpu;
         for (int i = tid; i < 1024; i += nthreads) dst[i] = src[i];
@@ -1281,7 +1348,7 @@ __device__ __forceinline__ const uint32_t* stage_iq_grid(uint32_t* s_buf, int ti
 
 template<int TY, bool STAGE_GRID = kStageIqGrid<TY>>
 struct IqGridWords {
-    static constexpr int value = !STAGE_GRID ? 4 : (TY == 22 || TY == 29) ? 2048 : (TY == 17) ? 1024 : (TY == 16) ? 512 :
+    static constexpr int value = !STAGE_GRID ? 4 : (TY == 22 || TY == 29 || TY == 19) ? 2048 : (TY == 17) ? 1024 : (TY == 16) ? 512 :
                                  (TY == 18) ? 256 : 4;
 };
 
@@ -1912,19 +1979,6 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
     }
 }
 
-__device__ __forceinline__ unsigned int ld_acquire_gpu(const unsigned int* p) {
-    unsigned int v;
-    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
-    return v;
-}
-__device__ __forceinline__ void st_release_gpu(unsigned int* p, unsigned int v) {
-    asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
-}
-
-__device__ __forceinline__ void red_release_add_gpu(unsigned int* p, unsigned int v) {
-    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
-}
-
 // native_down_kernel with the entries taken GRP_NC at a time.  DEP: launched as a programmatic dependent - the
 // block's first group's weight rows are prefetched into L2 before the wait (and, for IQ4_NL, loaded into registers).
 template<int TD, bool DEP = false>
@@ -2261,6 +2315,21 @@ __device__ void dq_iq1_m(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>(d * (packed_s8(grid32[j >> 2], j & 3) + delta));
 }
 template<typename dst_t>
+__device__ void dq_iq1_s(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_iq1_s* x = (const block_iq1_s*) vx;
+    const int64_t il = tid / 8, ib = tid % 8;
+    dst_t* y = yy + 32 * ib + 8 * il;
+    const int qh = x[ibs].qh[ib];
+    const float delta = qh & 0x8000 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA;
+    const float d = (float) x[ibs].d * (2 * ((qh >> 12) & 7) + 1);
+    uint32_t grid32[2];
+    const int8_t* q = (const int8_t*) grid32;
+    grid32[0] = iq1s_grid_gpu[x[ibs].qs[4 * ib + il] | (((qh >> 3 * il) & 7) << 8)];
+    grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
+    grid32[0] &= 0x0f0f0f0f;
+    for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>(d * (q[j] + delta));
+}
+template<typename dst_t>
 __device__ void dq_iq4_nl(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const block_iq4_nl* x = (const block_iq4_nl*) vx + ibs * (QK_K / QK4_NL);
     const int64_t il = tid / 8, ib = tid % 8;
@@ -2462,6 +2531,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 21: dq_iq3_s(vx, ibs, y, tid); break;
         case 22: dq_iq2_s(vx, ibs, y, tid); break;
         case 29: dq_iq1_m(vx, ibs, y, tid); break;
+        case 19: dq_iq1_s(vx, ibs, y, tid); break;
         case 23: dq_iq4_xs(vx, ibs, y, tid); break;
         case 11: dq_q3_k(vx, ibs, y, tid); break;
         case 42: dq_q2_0(vx, ibs, y, tid); break;
@@ -2495,7 +2565,7 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
-    return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
+    return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 19 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
            t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 8 || t == 40;
 }
 // values per block of the types the grouped expert kernels take (0 = none)
@@ -2679,7 +2749,10 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
 
 }  // namespace
 
+#ifndef IQ_DEV_ONLY   // host side: another translation unit takes only the device code above
+
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
+int native_grouped_gu2() { return g_gu2; }
 void native_grouped_set_gu2(int mode) { g_gu2 = mode; }
 bool iq_old_kernels() { return g_old_kernels; }
 void iq_set_mmvq_mma(bool on) { g_mmvq_mma = on; g_mmvq_mma_min_t = 1; }   // tests: every column count
@@ -2699,6 +2772,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 21: return (size_t) (n / 256) * sizeof(block_iq3_s);
         case 22: return (size_t) (n / 256) * sizeof(block_iq2_s);
         case 29: return (size_t) (n / 256) * sizeof(block_iq1_m);
+        case 19: return (size_t) (n / 256) * sizeof(block_iq1_s);
         case 23: return (size_t) (n / 256) * sizeof(block_iq4_xs);
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
@@ -2785,8 +2859,9 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
            n_embd % 256 == 0 && (n_ff * n_embd) % 256 == 0;
 }
 
-NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
+NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, float swiglu_limit) {
     NativeExpertLayout L;
+    L.swiglu_limit = swiglu_limit;
     L.gu_type = gu_type;
     L.d_type = d_type;
     L.n_embd = n_embd;
@@ -2817,14 +2892,41 @@ bool g_grouped_v1 = false;
 }  // namespace
 
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
+bool native_grouped_v1() { return g_grouped_v1; }
+int native_expert_phase() { return g_exp_phase; }
 void native_grouped_set_mma_hint(bool on) {
     t_gu_mma_hint = on ? 1 : 0;
 }
 
-void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
-                           const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
-                           int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
-                           int64_t grid_groups) {
+namespace {
+
+// SwiGLU with a limit, then the q8_1 blocks (the same pass as swiglu_q8_1_entries_kernel): gate is capped above at
+// `limit`, up is clamped to [-limit, limit], silu is expf-exact.
+template<bool PDL>
+__global__ void __launch_bounds__(256) swiglu_clamp_q8_1_entries_kernel(const float* __restrict__ gate,
+                                                                        const float* __restrict__ up,
+                                                                        const int32_t* __restrict__ grp_start,
+                                                                        const int32_t* __restrict__ n_groups, int n_ff,
+                                                                        float limit, block_q8_1* __restrict__ hq) {
+    if constexpr (PDL) pdl_trigger();
+    const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
+    if constexpr (PDL) pdl_wait();
+    for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
+         i += (long long) gridDim.x * blockDim.x) {
+        const float g = fminf(gate[i], limit);
+        const float u = fmaxf(fminf(up[i], limit), -limit);
+        const float h = __fmul_rn(g / (1.0f + expf(-g)), u);
+        q8_1_store(h, hq, i);
+    }
+}
+
+// native_expert_grouped's body; CLAMP selects the limited SwiGLU at compile time, so the unclamped instantiation is
+// the original launch sequence.
+template<bool CLAMP>
+void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                  const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
+                  int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
+                  int64_t grid_groups, [[maybe_unused]] float limit) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
     if (L.n_ff % 32 != 0) { basalt::log::error("basalt", "native_expert_grouped: n_ff %lld", (long long) L.n_ff); std::exit(1); }
     cudaStream_t s = (cudaStream_t) stream;
@@ -2849,7 +2951,14 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     check("native_expert_grouped/gu");
     const long long nh = (long long) cap_entries * L.n_ff;
     const bool sw_v1 = v1;
-    if (sw_v1) {
+    if constexpr (CLAMP) {
+        if (chain)
+            launch_dependent(swiglu_clamp_q8_1_entries_kernel<true>, dim3((unsigned) ((nh + 255) / 256)), s,
+                             (const float*) gate, (const float*) up, grp_start, n_groups, (int) L.n_ff, limit, hq);
+        else
+            swiglu_clamp_q8_1_entries_kernel<false><<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(
+                gate, up, grp_start, n_groups, (int) L.n_ff, limit, hq);
+    } else if (sw_v1) {
         swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
         quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
     } else if (chain) {
@@ -2873,10 +2982,64 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     check("native_expert_grouped/down");
 }
 
-}  // namespace basalt::kernels
+}  // namespace
 
-#define FZ_DEV_ONLY
-#include "dec_gdn_rec.cu"   // the peer mixer item's recurrence (device code only)
-#undef FZ_DEV_ONLY
-#include "dec_moe.cuh"   // DEC_MOE: the decode MoE tail's kernels, on this file's row dots
-#include "pk_moe.cuh"   // persistent experts + combine, on the same device code
+void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                           const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
+                           int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
+                           int64_t grid_groups) {
+    if (L.swiglu_limit > 0.0f)
+        grouped_impl<true>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch,
+                           out, stream, grid_groups, L.swiglu_limit);
+    else
+        grouped_impl<false>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch,
+                            out, stream, grid_groups, 0.0f);
+}
+
+void native_expert_grouped_clamped(const NativeExpertLayout& L, float swiglu_limit, const unsigned long long* grp_ptr,
+                                   const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                                   const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
+                                   void* scratch, float* out, void* stream, int64_t grid_groups) {
+    grouped_impl<true>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch,
+                       out, stream, grid_groups, swiglu_limit);
+}
+
+namespace {
+__global__ void gated_mlp_plan_kernel(const void* blob, int n_tok, unsigned long long* ptr, int32_t* start, int32_t* n_groups,
+                                      int32_t* dst, int32_t* tok) {
+    for (int i = threadIdx.x; i < n_tok; i += blockDim.x) {
+        dst[i] = i;
+        tok[i] = i;
+    }
+    if (threadIdx.x == 0) {
+        ptr[0] = (unsigned long long) blob;
+        start[0] = 0;
+        start[1] = n_tok;
+        n_groups[0] = 1;
+    }
+}
+size_t plan_offset(int64_t cap_tok, int64_t n_ff) { return (native_expert_scratch_bytes(cap_tok, n_ff) + 255) & ~(size_t) 255; }
+}  // namespace
+
+size_t gated_mlp_scratch_bytes(int64_t cap_tok, int64_t n_ff) {
+    return plan_offset(cap_tok, n_ff) + 256 + (size_t) cap_tok * 8;
+}
+
+void gated_mlp_clamped(const NativeExpertLayout& L, float swiglu_limit, const void* blob, int n_tok, int64_t cap_tok,
+                       const void* x_q8_1, void* scratch, float* out, void* stream) {
+    if (n_tok <= 0) return;
+    cudaStream_t s = (cudaStream_t) stream;
+    uint8_t* plan = (uint8_t*) scratch + plan_offset(cap_tok, L.n_ff);
+    auto* ptr = (unsigned long long*) plan;
+    auto* start = (int32_t*) (plan + 8);
+    auto* ng = start + 2;
+    auto* dst = ng + 1;
+    auto* tok = dst + cap_tok;
+    gated_mlp_plan_kernel<<<1, 128, 0, s>>>(blob, n_tok, ptr, start, ng, dst, tok);
+    check("gated_mlp_clamped/plan");
+    grouped_impl<true>(L, ptr, start, ng, dst, tok, 1, n_tok, x_q8_1, scratch, out, stream, 0, swiglu_limit);
+}
+
+#endif  // IQ_DEV_ONLY
+
+}  // namespace basalt::kernels

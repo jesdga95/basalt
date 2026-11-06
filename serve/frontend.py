@@ -58,9 +58,9 @@ def _text_of(content) -> str:
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
 
-# client spellings of a thinking level -> the template's low, medium, xhigh (default) or none
+# client spellings of a thinking level -> low, medium, high, max or none; a dialect says what its template takes for each
 EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
-          "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
+          "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
 
 
 def effort_kwargs(value) -> dict:
@@ -70,8 +70,10 @@ def effort_kwargs(value) -> dict:
     if value is False:
         return {"enable_thinking": False}
     key = str(value).strip().lower()
+    if key.isdigit() and 1 <= int(key) <= 100:   # the dialect takes a number or refuses it
+        return {"reasoning_effort": int(key)}
     if key not in EFFORT:
-        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high")
+        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium, high or max")
     level = EFFORT[key]
     return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
 
@@ -82,7 +84,7 @@ def budget_effort(tokens) -> dict:
         n = int(tokens)
     except (TypeError, ValueError):
         return {}
-    return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else "xhigh"}
+    return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else "high"}
 
 
 def _has_image(content) -> bool:
@@ -103,7 +105,10 @@ def _image_source(part: dict) -> str:
 
 
 def _parts_of(content):
-    """Message content for the template: a string without images, else its list of text and image items."""
+    """The one form of message and tool result content in every API: a string without images, else its list of text
+    and image items."""
+    if isinstance(content, dict):
+        content = [content]
     if not _has_image(content):
         return _text_of(content)
     items = []
@@ -193,10 +198,10 @@ def _keep_tool_result_wrap(content, tags: dict[str, str]):
 
     if isinstance(content, str):
         return wrap(content, True, True) if wrapped(content) else None
-    if not (isinstance(content, list) and content and all(isinstance(x, dict) and isinstance(x.get("text"), str)
-                                                          for x in content)):
+    if not (isinstance(content, list) and content and all(
+            isinstance(x, dict) and (isinstance(x.get("text"), str) or x.get("type") == "image") for x in content)):
         return None
-    texts = [x["text"] for x in content]
+    texts = [x.get("text", "") for x in content]
     if not wrapped("".join(texts)) or not (texts[0].lstrip().startswith(o) and texts[-1].rstrip().endswith(c)):
         return None          # the pair is split inside a part: mark it all
     if len(content) == 1:
@@ -366,7 +371,7 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
         role = m.get("role")
         if role == "developer":
             role = "system"
-        out = {"role": role, "content": _parts_of(m.get("content")) if role in ("user", "tool", "assistant") else _text_of(m.get("content"))}
+        out = {"role": role, "content": _parts_of(m.get("content"))}
         if role == "tool":
             out["_call_id"] = m.get("tool_call_id")
         if m.get("reasoning_content"):
@@ -432,29 +437,26 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     messages = []
     system = req.get("system")
     if system:
-        messages.append({"role": "system", "content": pin_billing_stamp(_text_of(system))})
+        system = _parts_of(system)
+        messages.append({"role": "system", "content": pin_billing_stamp(system) if isinstance(system, str) else system})
     for m in _object_list(req.get("messages"), "messages"):
         content = m.get("content")
         if isinstance(content, str):
             messages.append({"role": m["role"], "content": content})
             continue
-        if m.get("role") == "user" and _has_image(content) and not any(
-                isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
-            messages.append({"role": "user", "content": _parts_of(content)})
-            continue
-        text, reasoning, calls = [], [], []
+        parts, reasoning, calls = [], [], []
         for block in content or []:
             kind = block.get("type")
-            if kind == "text":
-                text.append(block.get("text", ""))
+            if kind in ("text", "input_text", None) or kind in IMAGE_PARTS:
+                parts.append(block)
             elif kind == "thinking":
                 reasoning.append(block.get("thinking", ""))
             elif kind == "tool_use":
                 calls.append({"function": {"name": block.get("name"), "arguments": block.get("input") or {}}})
             elif kind == "tool_result":
-                messages.append({"role": "tool", "content": _text_of(block.get("content"))})
-        if text or calls or reasoning:
-            out = {"role": m["role"], "content": "".join(text)}
+                messages.append({"role": "tool", "content": _parts_of(block.get("content"))})
+        if parts or calls or reasoning:
+            out = {"role": m["role"], "content": _parts_of(parts)}
             if reasoning:
                 out["reasoning_content"] = "".join(reasoning)
             if calls:
@@ -595,7 +597,7 @@ def tool_choice_of(tool_choice) -> tuple[str, str | None]:
                      "(Anthropic: any) or a named tool")
 
 
-def forced_call(tool_choice, tools: list[dict] | None) -> tuple[list[dict] | None, str | None]:
+def forced_call(tool_choice, tools: list[dict] | None, opening=None) -> tuple[list[dict] | None, str | None]:
     """`tool_choice` -> (the tools to offer, the text that opens the call the reply must make or None).
     "none" offers no tools.  There is no grammar: the server writes the opening itself, so the model can only go on
     with a call.  "required" / Anthropic "any": any tool (the only one is named); a named tool: that one.  A forced
@@ -613,6 +615,8 @@ def forced_call(tool_choice, tools: list[dict] | None) -> tuple[list[dict] | Non
             name = names[0]
     elif name not in names:
         raise ValueError(f"tool_choice: the request has no tool named {name!r}")
+    if opening is not None:
+        return tools, opening(name)
     return tools, CALL_START + (f"\n<function={name}>\n" if name else "\n<function=")
 
 
